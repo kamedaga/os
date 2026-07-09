@@ -29,6 +29,7 @@ mkdir -p "${build_dir}"
   -pthread \
   -I"${repo_root}/userland/filed/include" \
   -I"${repo_root}/userland/koboxd/include" \
+  -I"${repo_root}/userland/libipc/include" \
   "${repo_root}/userland/filed/src/tmpfs/backend.c" \
   "${repo_root}/userland/filed/src/tmpfs/dir.c" \
   "${repo_root}/userland/filed/src/tmpfs/file.c" \

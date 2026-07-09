@@ -1,6 +1,6 @@
 #include "private.h"
 
-int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id, koboxd_wire_fs_statx_t *out_stat)
+int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id, storage_v2_statx_reply_t *out_stat)
 {
     if (backend == NULL || out_stat == NULL) {
         return -22;

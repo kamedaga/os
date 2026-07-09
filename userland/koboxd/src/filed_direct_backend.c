@@ -42,7 +42,7 @@ static int direct_lookup(
     return status;
 }
 
-static int direct_statx(void *ctx, uint64_t object_id, koboxd_wire_fs_statx_t *out_stat)
+static int direct_statx(void *ctx, uint64_t object_id, storage_v2_statx_reply_t *out_stat)
 {
     koboxd_fs_backend_t *backend = direct_backend(ctx);
     if (backend == NULL || out_stat == NULL) {
@@ -297,19 +297,19 @@ static int direct_getdents(
     void *ctx,
     uint64_t dir_object_id,
     uint64_t offset,
-    koboxd_wire_fs_getdents_t *out_entries)
+    storage_v2_getdents_request_t *out_entries)
 {
     koboxd_fs_backend_t *backend = direct_backend(ctx);
     if (backend == NULL || out_entries == NULL) {
         return -22;
     }
 
-    koboxd_fs_object_t entries[KOBOXD_WIRE_FS_DIRENT_CAPACITY];
+    koboxd_fs_object_t entries[STORAGE_V2_DIRENT_CAPACITY];
     memset(entries, 0, sizeof(entries));
     size_t count = 0;
     size_t capacity = (size_t)out_entries->capacity;
-    if (capacity > KOBOXD_WIRE_FS_DIRENT_CAPACITY) {
-        capacity = KOBOXD_WIRE_FS_DIRENT_CAPACITY;
+    if (capacity > STORAGE_V2_DIRENT_CAPACITY) {
+        capacity = STORAGE_V2_DIRENT_CAPACITY;
     }
 
     koboxd_fs_backend_lock(backend);

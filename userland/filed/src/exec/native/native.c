@@ -256,7 +256,7 @@ static int filed_exec_lookup_and_open_component(
 {
     filed_vfs_io_decision_t parent_decision;
     uint64_t object_id = 0;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
     filed_status_t status;
 
     if (runtime == NULL || name == NULL || out_open == NULL) {
@@ -318,7 +318,7 @@ static int filed_exec_open_absolute_path(
     current_handle = runtime->root_handle_id;
 
     for (;;) {
-        char component[FILED_WIRE_NAME_BYTES];
+        char component[FILED_V2_NAME_BYTES];
         const char *component_start;
         const char *after_slashes;
         size_t component_len;
@@ -450,7 +450,7 @@ static void filed_exec_discard_process_fd(int process_fd)
 }
 
 static int filed_exec_prepare_inherit_fds(
-    const filed_wire_exec_path_t *request,
+    const filed_v2_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
@@ -462,14 +462,14 @@ static int filed_exec_prepare_inherit_fds(
         return -22;
     }
 
-    if (inherit_fd_count > FILED_WIRE_EXEC_MAX_INHERIT_FDS) {
+    if (inherit_fd_count > FILED_V2_EXEC_MAX_INHERIT_FDS) {
         return -22;
     }
     if (inherit_fd_count != 0 && inherit_fds == NULL) {
         return -22;
     }
 
-    if ((request->flags & FILED_WIRE_EXEC_INHERIT_FDS) != 0) {
+    if ((request->flags & FILED_V2_EXEC_INHERIT_FDS) != 0) {
         for (uint64_t i = 0; i < inherit_fd_count; ++i) {
             const int fd = inherit_fds[i];
             if (fd < 0) {
@@ -484,7 +484,7 @@ static int filed_exec_prepare_inherit_fds(
         return -22;
     }
 
-    if ((request->flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0) {
+    if ((request->flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0) {
         if (bootstrap_fd < 16) {
             return -22;
         }
@@ -583,7 +583,7 @@ static int filed_exec_read_image(
 {
     filed_vfs_io_decision_t stat_decision;
     filed_vfs_stat_snapshot_t snapshot;
-    koboxd_wire_fs_statx_t stat;
+    storage_v2_statx_reply_t stat;
     filed_status_t vfs_status;
     unsigned char ehdr[FILED_EXEC_ELF64_EHDR_BYTES];
     unsigned char *image;
@@ -1112,7 +1112,7 @@ static int filed_exec_copy_stack_string(
     return 0;
 }
 
-static uint64_t filed_exec_request_argc(const filed_wire_exec_path_t *request)
+static uint64_t filed_exec_request_argc(const filed_v2_exec_path_t *request)
 {
     if (request == NULL) {
         return 0;
@@ -1121,28 +1121,28 @@ static uint64_t filed_exec_request_argc(const filed_wire_exec_path_t *request)
 }
 
 static const char *filed_exec_request_arg(
-    const filed_wire_exec_path_t *request,
+    const filed_v2_exec_path_t *request,
     uint64_t index)
 {
     if (request == NULL) {
         return "";
     }
     if (request->argc != 0 && index < request->argc) {
-        return filed_wire_exec_string(request, request->argv[index]);
+        return filed_v2_exec_string(request, request->argv[index]);
     }
     return request->path;
 }
 
 static int filed_exec_start_plan(
     filed_exec_plan_t *plan,
-    const filed_wire_exec_path_t *request,
+    const filed_v2_exec_path_t *request,
     int bootstrap_fd)
 {
     if (plan == NULL || request == NULL || plan->process_fd < 16) {
         return -22;
     }
 
-    if (request->argc > FILED_WIRE_EXEC_MAX_ARGS || request->envc > FILED_WIRE_EXEC_MAX_ENVS) {
+    if (request->argc > FILED_V2_EXEC_MAX_ARGS || request->envc > FILED_V2_EXEC_MAX_ENVS) {
         return -22;
     }
 
@@ -1185,8 +1185,8 @@ static int filed_exec_start_plan(
     uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
     const uint64_t argc = filed_exec_request_argc(request);
     const uint64_t envc = request->envc;
-    uint64_t argv_va[FILED_WIRE_EXEC_MAX_ARGS];
-    uint64_t envp_va[FILED_WIRE_EXEC_MAX_ENVS];
+    uint64_t argv_va[FILED_V2_EXEC_MAX_ARGS];
+    uint64_t envp_va[FILED_V2_EXEC_MAX_ENVS];
     memset(argv_va, 0, sizeof(argv_va));
     memset(envp_va, 0, sizeof(envp_va));
 
@@ -1195,7 +1195,7 @@ static int filed_exec_start_plan(
             stack,
             &sp,
             stack_base,
-            filed_wire_exec_string(request, request->envp[i - 1u]),
+            filed_v2_exec_string(request, request->envp[i - 1u]),
             &envp_va[i - 1u]);
         if (status != 0) {
             (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
@@ -1229,7 +1229,7 @@ static int filed_exec_start_plan(
     sp &= ~15ull;
 
     const int has_bootstrap =
-        (request->flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0 && bootstrap_fd >= 16;
+        (request->flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0 && bootstrap_fd >= 16;
     if (filed_exec_push_u64(stack, &sp, 0) != 0 ||
         filed_exec_push_u64(stack, &sp, FILED_EXEC_AT_NULL) != 0 ||
         (has_bootstrap &&
@@ -1320,7 +1320,7 @@ static int filed_exec_start_plan(
 int filed_exec_native_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
-    const filed_wire_exec_path_t *request,
+    const filed_v2_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
@@ -1329,7 +1329,7 @@ int filed_exec_native_handle(
 {
     filed_exec_image_t image;
     filed_exec_plan_t plan;
-    int prepared[FILED_WIRE_EXEC_MAX_INHERIT_FDS + 1];
+    int prepared[FILED_V2_EXEC_MAX_INHERIT_FDS + 1];
     uint64_t prepared_count = 0;
 
     if (out_process_fd != NULL) *out_process_fd = -1;

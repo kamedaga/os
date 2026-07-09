@@ -805,7 +805,7 @@ trusted client の `client <-> filed` fast path は pkey ring を使えるが、
 
 ### filed session fast path
 
-現状の `FILED_WIRE_OP_CONNECT` session は shared page を使って payload copy は減らしているが、request metadata と completion は still normal IPC である。
+現状の `FILED_V2_OP_SESSION_OPEN` session は shared page を使って payload copy は減らしているが、request metadata と completion は still normal IPC である。
 
 ```text
 client:
@@ -909,7 +909,7 @@ request ring と completion ring は固定 slot 数にするが、batch 回数�
 初期実装は kernel ABI を変えない。
 
 1. client が request ring に 1 個以上 enqueue する
-2. client が session channel に `FILED_WIRE_OP_FAST_DOORBELL` を 1 回送る
+2. client が session channel に `FILED_V2_OP_SESSION_DOORBELL` を 1 回送る
 3. filed が ring を drain し、completion ring に結果を書く
 4. filed が session channel に completion notification を 1 回送る
 5. client が completion ring を読む

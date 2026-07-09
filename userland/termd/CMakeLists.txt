@@ -104,6 +104,7 @@ set(KOBOX_RUNTIME_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/null_device_backend.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/termd_service.c"
 )
 
 string(REPLACE ";" " " TERMD_EXTRA_SOURCES_ENV "${KOBOX_RUNTIME_SOURCES}")
@@ -119,8 +120,8 @@ add_custom_command(
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${TERMD_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/boot_config.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol.h"
-    "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol_v2.h"
+    "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol_v2.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/error_conveyor.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.c"
@@ -128,6 +129,8 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/null_device_backend.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/null_device_backend.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/termd_service.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/termd_service.h"
     "${REPO_ROOT}/third_party/linux-6.8-tty/README.md"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}

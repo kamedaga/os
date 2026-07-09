@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #include "filed/runtime.h"
-#include "koboxd/ipc_protocol.h"
+#include "koboxd/storage_protocol_v2.h"
 
 int filed_runtime_backend_lookup(
     filed_runtime_t *runtime,
@@ -14,7 +14,7 @@ int filed_runtime_backend_lookup(
 int filed_runtime_backend_statx(
     filed_runtime_t *runtime,
     uint64_t object_id,
-    koboxd_wire_fs_statx_t *out_stat);
+    storage_v2_statx_reply_t *out_stat);
 
 int filed_runtime_backend_pread(
     filed_runtime_t *runtime,

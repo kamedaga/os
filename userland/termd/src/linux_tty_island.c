@@ -345,16 +345,16 @@ static termd_linux_tty_owner_ids_t termd_linux_tty_merge_ids(
 
 static void termd_linux_tty_record_owner(
     termd_linux_tty_handle_t *handle,
-    const termd_wire_open_t *request)
+    const termd_v2_open_request_t *request)
 {
     if (handle == NULL || request == NULL) {
         return;
     }
     const termd_linux_tty_owner_ids_t ids = termd_linux_tty_merge_ids(
         NULL,
-        request->session_id,
-        request->process_id,
-        request->pgrp_id);
+        request->tty.session_id,
+        request->tty.process_id,
+        request->tty.pgrp_id);
     handle->session_id = ids.session_id;
     handle->process_id = ids.process_id;
     handle->pgrp_id = ids.pgrp_id;
@@ -805,7 +805,7 @@ int termd_linux_tty_island_open_ptmx(
 
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
-    const termd_wire_open_t *request,
+    const termd_v2_open_request_t *request,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL) {
@@ -868,8 +868,8 @@ int termd_linux_tty_island_open_pts(
         termd_linux_tty_handle_ids(handle),
         0,
         handle->open,
-        request->signal_mask,
-        request->signal_ignored);
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
 
     int result = call_handle_open(handle);
     if (result != 0) {
@@ -890,8 +890,8 @@ int termd_linux_tty_island_open_pts(
         termd_linux_tty_handle_ids(handle),
         1,
         handle->open,
-        request->signal_mask,
-        request->signal_ignored);
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
     *out_handle = handle->handle;
     printf(
         "[termd] linux tty pts open ready index=%llu handle=%llu\n",
@@ -902,7 +902,7 @@ int termd_linux_tty_island_open_pts(
 
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
-    const termd_wire_open_t *request,
+    const termd_v2_open_request_t *request,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL) {
@@ -953,8 +953,8 @@ int termd_linux_tty_island_open_hvc(
         termd_linux_tty_handle_ids(handle),
         0,
         handle->open,
-        request->signal_mask,
-        request->signal_ignored);
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
 
     int result = call_handle_open(handle);
     drain_linux_tty_work();
@@ -974,8 +974,8 @@ int termd_linux_tty_island_open_hvc(
         termd_linux_tty_handle_ids(handle),
         1,
         handle->open,
-        request->signal_mask,
-        request->signal_ignored);
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
     *out_handle = handle->handle;
     printf(
         "[termd] linux tty hvc open ready index=%llu handle=%llu\n",
@@ -986,20 +986,20 @@ int termd_linux_tty_island_open_hvc(
 
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
-    const termd_wire_open_t *request,
+    const termd_v2_open_request_t *request,
     uint64_t *out_handle)
 {
     if (request == NULL) {
         return -22;
     }
-    termd_wire_open_t hvc_request = *request;
+    termd_v2_open_request_t hvc_request = *request;
     hvc_request.pts_index = 0;
     return termd_linux_tty_island_open_hvc(island, &hvc_request, out_handle);
 }
 
 int termd_linux_tty_island_take_signal(
     struct termd_linux_tty_island *island,
-    termd_wire_signal_t *request,
+    termd_v2_signal_request_t *request,
     uint64_t *out_result)
 {
     if (island == NULL || request == NULL || out_result == NULL) {
@@ -1103,7 +1103,7 @@ static void termd_write_u16(void *data, size_t offset, uint16_t value)
 
 int termd_linux_tty_island_ioctl(
     struct termd_linux_tty_island *island,
-    termd_wire_ioctl_t *request)
+    termd_v2_ioctl_request_t *request)
 {
     if (island == NULL || request == NULL) {
         return -22;
@@ -1117,9 +1117,9 @@ int termd_linux_tty_island_ioctl(
     }
     termd_linux_tty_owner_ids_t caller_ids = termd_linux_tty_merge_ids(
         handle,
-        request->session_id,
-        request->process_id,
-        request->pgrp_id);
+        request->tty.session_id,
+        request->tty.process_id,
+        request->tty.pgrp_id);
     if (request->request == TERMD_LINUX_TIOCSPGRP && request->arg0 > 0 && request->arg0 <= UINT32_MAX) {
         termd_linux_tty_owner_ids_t target_ids = caller_ids;
         target_ids.process_id = (uint32_t)request->arg0;
@@ -1129,16 +1129,16 @@ int termd_linux_tty_island_ioctl(
             target_ids,
             0,
             handle->ioctl,
-            request->signal_mask,
-            request->signal_ignored);
+            request->tty.signal_mask,
+            request->tty.signal_ignored);
     }
     termd_linux_tty_sync_current_state(
         handle,
         caller_ids,
         0,
         handle->ioctl,
-        request->signal_mask,
-        request->signal_ignored);
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
 
     if (request->request == TERMD_LINUX_TIOCSWINSZ) {
         memset(request->data, 0, 8u);
@@ -1178,23 +1178,23 @@ static uint32_t termd_linux_poll_mask_to_wire(uint32_t mask)
 {
     uint32_t revents = 0;
     if ((mask & (TERMD_LINUX_EPOLLIN | TERMD_LINUX_EPOLLRDNORM | TERMD_LINUX_EPOLLPRI)) != 0) {
-        revents |= TERMD_WIRE_POLLIN;
+        revents |= TERMD_V2_POLLIN;
     }
     if ((mask & (TERMD_LINUX_EPOLLOUT | TERMD_LINUX_EPOLLWRNORM)) != 0) {
-        revents |= TERMD_WIRE_POLLOUT;
+        revents |= TERMD_V2_POLLOUT;
     }
     if ((mask & TERMD_LINUX_EPOLLERR) != 0) {
-        revents |= TERMD_WIRE_POLLERR;
+        revents |= TERMD_V2_POLLERR;
     }
     if ((mask & TERMD_LINUX_EPOLLHUP) != 0) {
-        revents |= TERMD_WIRE_POLLHUP;
+        revents |= TERMD_V2_POLLHUP;
     }
     return revents;
 }
 
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
-    termd_wire_poll_t *request)
+    termd_v2_poll_request_t *request)
 {
     if (island == NULL || request == NULL) {
         return -22;
@@ -1210,15 +1210,15 @@ int termd_linux_tty_island_poll(
         handle,
         termd_linux_tty_merge_ids(
             handle,
-            request->session_id,
-            request->process_id,
-            request->pgrp_id),
+            request->tty.session_id,
+            request->tty.process_id,
+            request->tty.pgrp_id),
         0,
         handle->poll,
-        request->signal_mask,
-        request->signal_ignored);
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
     if (handle->poll == NULL) {
-        request->revents = TERMD_WIRE_POLLERR;
+        request->revents = TERMD_V2_POLLERR;
         return 0;
     }
 
@@ -1231,15 +1231,15 @@ int termd_linux_tty_island_poll(
     }
     request->revents = termd_linux_poll_mask_to_wire(mask) & (
         request->events |
-        TERMD_WIRE_POLLERR |
-        TERMD_WIRE_POLLHUP);
+        TERMD_V2_POLLERR |
+        TERMD_V2_POLLHUP);
     return 0;
 }
 
 int termd_linux_tty_island_io(
     struct termd_linux_tty_island *island,
     int write,
-    termd_wire_io_t *request,
+    termd_v2_io_request_t *request,
     uint64_t *out_result)
 {
     if (island == NULL || request == NULL || out_result == NULL) {
@@ -1261,15 +1261,15 @@ int termd_linux_tty_island_io(
         handle,
         termd_linux_tty_merge_ids(
             handle,
-            request->session_id,
-            request->process_id,
-            request->pgrp_id),
+            request->tty.session_id,
+            request->tty.process_id,
+            request->tty.pgrp_id),
         0,
         iter_fn,
-        request->signal_mask,
-        request->signal_ignored);
-    if (request->length > TERMD_WIRE_IO_BYTES) {
-        request->length = TERMD_WIRE_IO_BYTES;
+        request->tty.signal_mask,
+        request->tty.signal_ignored);
+    if (request->length > TERMD_V2_IO_BYTES) {
+        request->length = TERMD_V2_IO_BYTES;
     }
     if (request->length == 0) {
         return 0;

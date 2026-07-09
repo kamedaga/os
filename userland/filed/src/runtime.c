@@ -1,9 +1,11 @@
 #include "filed/runtime.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "filed/dispatch.h"
 #include "filed/fd_ipc.h"
+#include "filed/page_cache.h"
 #include "filed_direct_backend.h"
 #include "storage_runtime.h"
 #include "bootstrap.h"
@@ -12,7 +14,72 @@
 
 enum {
     FILED_RUNTIME_EXEC_ENDPOINT_FD = 240,
+    FILED_RUNTIME_SYNCER_INTERVAL_NS = 1000000000ull,
+    FILED_RUNTIME_SYNCER_INTERVAL_TICKS = 100,
 };
+
+static int filed_runtime_open_syncer_timer(filed_runtime_t *runtime)
+{
+    if (runtime == NULL || runtime->syncer_timer_fd >= 16) {
+        return 0;
+    }
+
+    const uint64_t rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ;
+    const int fd = pacha_timerfd_create(
+        FILED_RUNTIME_SYNCER_INTERVAL_NS,
+        FILED_RUNTIME_SYNCER_INTERVAL_NS,
+        rights,
+        PACHA_FD_FLAG_CLOEXEC);
+    if (fd < 16) {
+        return fd;
+    }
+    runtime->syncer_timer_fd = fd;
+    return 0;
+}
+
+static void filed_runtime_drain_syncer_timer(filed_runtime_t *runtime)
+{
+    if (runtime == NULL || runtime->syncer_timer_fd < 16) {
+        return;
+    }
+    uint64_t expirations = 0;
+    (void)pacha_fd_read(runtime->syncer_timer_fd, &expirations, sizeof(expirations));
+}
+
+static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
+{
+    if (runtime == NULL) {
+        return;
+    }
+
+    runtime->syncer_ticks++;
+    const uint64_t dirty_count = filed_page_cache_dirty_count();
+    const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
+    if (dirty_count == 0 && backend_dirty_hint == 0) {
+        return;
+    }
+
+    const int status = filed_dispatch_sync_all(runtime);
+    runtime->syncer_last_status = status;
+    if (status != 0) {
+        runtime->syncer_errors++;
+        printf(
+            "[filed] syncer status=%d page_dirty=%llu backend_dirty_hint=%llu errors=%llu\n",
+            status,
+            (unsigned long long)dirty_count,
+            (unsigned long long)backend_dirty_hint,
+            (unsigned long long)runtime->syncer_errors);
+        fflush(stdout);
+        return;
+    }
+
+    runtime->syncer_flushes++;
+}
 
 static int filed_clear_inherit_flag(int fd)
 {
@@ -167,6 +234,7 @@ void filed_runtime_init(filed_runtime_t *runtime)
     memset(runtime, 0, sizeof(*runtime));
     runtime->bootstrap_fd = -1;
     runtime->client_endpoint_fd = -1;
+    runtime->syncer_timer_fd = -1;
     runtime->netd_socket_endpoint_fd = -1;
     runtime->termd_tty_endpoint_fd = -1;
     for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
@@ -266,7 +334,7 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
 
 int filed_runtime_mount_root(filed_runtime_t *runtime)
 {
-    koboxd_wire_fs_statx_t root_stat;
+    storage_v2_statx_reply_t root_stat;
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root_open;
     filed_status_t vfs_status;
@@ -378,7 +446,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         runtime->tmpfs_root_handle_id = tmp_open.handle_id;
         runtime->tmpfs_root_handle_valid = 1u;
         {
-            koboxd_wire_fs_statx_t tmp_stat;
+            storage_v2_statx_reply_t tmp_stat;
             filed_vfs_stat_snapshot_t tmp_snapshot;
             memset(&tmp_stat, 0, sizeof(tmp_stat));
             status = filed_tmpfs_backend_statx(&runtime->tmpfs, tmpfs_root, &tmp_stat);
@@ -417,28 +485,51 @@ int filed_runtime_serve(filed_runtime_t *runtime)
         return -1;
     }
 
+    int syncer_timer_status = filed_runtime_open_syncer_timer(runtime);
+    if (syncer_timer_status != 0) {
+        printf("[filed] syncer timer unavailable status=%d fallback=tick-timeout\n", syncer_timer_status);
+        fflush(stdout);
+    }
+
     for (;;) {
-        struct pacha_pollfd fds[1 + FILED_RUNTIME_MAX_SESSIONS];
-        uint64_t session_indices[FILED_RUNTIME_MAX_SESSIONS];
+        struct pacha_pollfd fds[2 + FILED_RUNTIME_MAX_SESSIONS];
+        uint64_t session_indices[2 + FILED_RUNTIME_MAX_SESSIONS];
         uint64_t count = 0;
         fds[count++] = (struct pacha_pollfd){
             .fd = runtime->client_endpoint_fd,
             .events = PACHA_FD_EVENT_READABLE,
             .revents = 0,
         };
+        session_indices[0] = UINT64_MAX;
+        if (runtime->syncer_timer_fd >= 16) {
+            session_indices[count] = UINT64_MAX;
+            fds[count++] = (struct pacha_pollfd){
+                .fd = runtime->syncer_timer_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+                .revents = 0,
+            };
+        }
         for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
             if (!runtime->sessions[i].active) {
                 continue;
             }
+            session_indices[count] = i;
             fds[count++] = (struct pacha_pollfd){
                 .fd = runtime->sessions[i].channel_fd,
                 .events = PACHA_FD_EVENT_READABLE,
                 .revents = 0,
             };
-            session_indices[count - 2u] = i;
         }
 
-        const long wait_status = pacha_fd_wait_many(fds, count, PACHA_FD_WAIT_FOREVER);
+        const uint64_t wait_timeout =
+            runtime->syncer_timer_fd >= 16 ?
+                PACHA_FD_WAIT_FOREVER :
+                FILED_RUNTIME_SYNCER_INTERVAL_TICKS;
+        const long wait_status = pacha_fd_wait_many(fds, count, wait_timeout);
+        if (wait_status == PACHA_ERR_NOT_READY) {
+            filed_runtime_syncer_tick(runtime);
+            continue;
+        }
         if (wait_status < 0) {
             return (int)wait_status;
         }
@@ -458,7 +549,15 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             if ((fds[pos].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) == 0) {
                 continue;
             }
-            const uint64_t session_index = session_indices[pos - 1u];
+            if (runtime->syncer_timer_fd >= 16 && fds[pos].fd == runtime->syncer_timer_fd) {
+                filed_runtime_drain_syncer_timer(runtime);
+                filed_runtime_syncer_tick(runtime);
+                continue;
+            }
+            const uint64_t session_index = session_indices[pos];
+            if (session_index == UINT64_MAX) {
+                continue;
+            }
             const int status = filed_dispatch_session_once(runtime, session_index);
             if (status != 0 &&
                 status != PACHA_ERR_EMPTY &&

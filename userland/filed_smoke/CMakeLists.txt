@@ -20,14 +20,17 @@ add_custom_command(
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_SMOKE_EXTRA_SOURCES_ENV}"
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
-      bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_SMOKE_ELF}"
+      bash "${REPO_ROOT}/musl/pachaos/build/build-app-dynamic.sh" "${FILED_SMOKE_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed_smoke/bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
+    "${REPO_ROOT}/userland/filed/include/filed/payload_v2.h"
+    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol_v2.h"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
+    "${REPO_ROOT}/userland/libipc/include/pacha/service_abi.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
-    "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+    "${REPO_ROOT}/musl/pachaos/build/build-app-dynamic.sh"
+    "${REPO_ROOT}/musl/pachaos/build/build-runtime.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

@@ -55,3 +55,13 @@ path instead of `-nostdlib`; PachaOS-specific code is limited to the
 .artifacts/musl-pachaos-runtime/rootfs/lib/libc.so
 .artifacts/musl-pachaos-runtime/rootfs/lib/ld-musl-x86_64.so.1
 ```
+
+`build/build-app-dynamic.sh` links a PachaOS native dynamic executable against
+that runtime without rebuilding libc for every server change. It uses the
+installed crt objects and `libc.so`, emits PT_INTERP for
+`/lib/ld-musl-x86_64.so.1`, and compiles only the app/server sources passed via
+`PACHAOS_MUSL_APP_SOURCE` and `PACHAOS_MUSL_EXTRA_SOURCES`.
+
+Bootstrap binaries loaded by hand-written early loaders should stay static
+until that loader path explicitly supports PT_INTERP and `AT_BASE`. Services
+started through filed native exec can move first.

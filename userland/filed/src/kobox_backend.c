@@ -5,6 +5,7 @@
 #include <time.h>
 
 #include "filed/fd_ipc.h"
+#include "koboxd/control_protocol_v2.h"
 #include "pacha/abi.h"
 
 static int filed_kobox_call_with_fd(
@@ -38,25 +39,72 @@ static uint64_t filed_kobox_backend_read_tsc(void)
 static const char *filed_kobox_backend_op_name(uint64_t op)
 {
     switch (op) {
-    case KOBOXD_WIRE_FS_MOUNT_ROOT: return "mount_root";
-    case KOBOXD_WIRE_FS_LOOKUP: return "lookup";
-    case KOBOXD_WIRE_FS_OPEN: return "open";
-    case KOBOXD_WIRE_FS_PREAD: return "pread";
-    case KOBOXD_WIRE_FS_PWRITE: return "pwrite";
-    case KOBOXD_WIRE_FS_STATX: return "statx";
-    case KOBOXD_WIRE_FS_GETDENTS: return "getdents";
-    case KOBOXD_WIRE_FS_FSYNC: return "fsync";
-    case KOBOXD_WIRE_FS_UTIMENS: return "utimens";
-    case KOBOXD_WIRE_FS_CHMOD: return "chmod";
-    case KOBOXD_WIRE_FS_CREATE: return "create";
-    case KOBOXD_WIRE_FS_TRUNCATE: return "truncate";
-    case KOBOXD_WIRE_FS_UNLINK: return "unlink";
-    case KOBOXD_WIRE_FS_RENAME: return "rename";
-    case KOBOXD_WIRE_FS_MKDIR: return "mkdir";
-    case KOBOXD_WIRE_FS_RMDIR: return "rmdir";
-    case KOBOXD_WIRE_FS_RELEASE_OBJECT: return "release_object";
-    case KOBOXD_WIRE_FS_SYNC_ALL: return "sync_all";
+    case STORAGE_V2_OP_MOUNT_ROOT: return "mount_root";
+    case STORAGE_V2_OP_LOOKUP: return "lookup";
+    case STORAGE_V2_OP_PREAD: return "pread";
+    case STORAGE_V2_OP_PWRITE: return "pwrite";
+    case STORAGE_V2_OP_STATX: return "statx";
+    case STORAGE_V2_OP_GETDENTS: return "getdents";
+    case STORAGE_V2_OP_FSYNC: return "fsync";
+    case STORAGE_V2_OP_UTIMENS: return "utimens";
+    case STORAGE_V2_OP_CHMOD: return "chmod";
+    case STORAGE_V2_OP_CREATE: return "create";
+    case STORAGE_V2_OP_TRUNCATE: return "truncate";
+    case STORAGE_V2_OP_UNLINK: return "unlink";
+    case STORAGE_V2_OP_RENAME: return "rename";
+    case STORAGE_V2_OP_MKDIR: return "mkdir";
+    case STORAGE_V2_OP_RMDIR: return "rmdir";
+    case STORAGE_V2_OP_RELEASE_OBJECT: return "release_object";
+    case STORAGE_V2_OP_SYNC_ALL: return "sync_all";
     default: return "unknown";
+    }
+}
+
+static uint64_t filed_kobox_backend_metric_slot(uint64_t op)
+{
+    switch (op) {
+    case STORAGE_V2_OP_MOUNT_ROOT: return 1;
+    case STORAGE_V2_OP_LOOKUP: return 2;
+    case STORAGE_V2_OP_STATX: return 3;
+    case STORAGE_V2_OP_GETDENTS: return 4;
+    case STORAGE_V2_OP_PREAD: return 5;
+    case STORAGE_V2_OP_PWRITE: return 6;
+    case STORAGE_V2_OP_FSYNC: return 7;
+    case STORAGE_V2_OP_CREATE: return 8;
+    case STORAGE_V2_OP_TRUNCATE: return 9;
+    case STORAGE_V2_OP_UTIMENS: return 10;
+    case STORAGE_V2_OP_CHMOD: return 11;
+    case STORAGE_V2_OP_UNLINK: return 12;
+    case STORAGE_V2_OP_RENAME: return 13;
+    case STORAGE_V2_OP_MKDIR: return 14;
+    case STORAGE_V2_OP_RMDIR: return 15;
+    case STORAGE_V2_OP_RELEASE_OBJECT: return 16;
+    case STORAGE_V2_OP_SYNC_ALL: return 17;
+    default: return 0;
+    }
+}
+
+static uint64_t filed_kobox_backend_metric_op(uint64_t slot)
+{
+    switch (slot) {
+    case 1: return STORAGE_V2_OP_MOUNT_ROOT;
+    case 2: return STORAGE_V2_OP_LOOKUP;
+    case 3: return STORAGE_V2_OP_STATX;
+    case 4: return STORAGE_V2_OP_GETDENTS;
+    case 5: return STORAGE_V2_OP_PREAD;
+    case 6: return STORAGE_V2_OP_PWRITE;
+    case 7: return STORAGE_V2_OP_FSYNC;
+    case 8: return STORAGE_V2_OP_CREATE;
+    case 9: return STORAGE_V2_OP_TRUNCATE;
+    case 10: return STORAGE_V2_OP_UTIMENS;
+    case 11: return STORAGE_V2_OP_CHMOD;
+    case 12: return STORAGE_V2_OP_UNLINK;
+    case 13: return STORAGE_V2_OP_RENAME;
+    case 14: return STORAGE_V2_OP_MKDIR;
+    case 15: return STORAGE_V2_OP_RMDIR;
+    case 16: return STORAGE_V2_OP_RELEASE_OBJECT;
+    case 17: return STORAGE_V2_OP_SYNC_ALL;
+    default: return 0;
     }
 }
 
@@ -69,14 +117,16 @@ static void filed_kobox_backend_record_metric(
     uint64_t end_cycles,
     int status)
 {
+    const uint64_t slot = filed_kobox_backend_metric_slot(op);
     if (backend == NULL ||
-        op >= FILED_KOBOX_BACKEND_METRIC_OP_MAX ||
+        slot == 0 ||
+        slot >= FILED_KOBOX_BACKEND_METRIC_OP_MAX ||
         start_ns == 0 ||
         end_ns < start_ns)
     {
         return;
     }
-    filed_kobox_backend_metric_t *metric = &backend->metrics[op];
+    filed_kobox_backend_metric_t *metric = &backend->metrics[slot];
     const uint64_t elapsed_ns = end_ns - start_ns;
     metric->count++;
     metric->total_ns += elapsed_ns;
@@ -126,6 +176,18 @@ static int filed_kobox_backend_is_direct(const filed_kobox_backend_t *backend)
     return backend != NULL && backend->direct_ctx != NULL && backend->direct_ops != NULL;
 }
 
+static void filed_kobox_backend_mark_dirty(filed_kobox_backend_t *backend)
+{
+    if (backend != NULL) {
+        backend->dirty_hint++;
+    }
+}
+
+uint64_t filed_kobox_backend_dirty_hint(const filed_kobox_backend_t *backend)
+{
+    return backend != NULL ? backend->dirty_hint : 0;
+}
+
 void filed_kobox_backend_dump_metrics(const filed_kobox_backend_t *backend)
 {
     if (backend == NULL) {
@@ -138,7 +200,7 @@ void filed_kobox_backend_dump_metrics(const filed_kobox_backend_t *backend)
         }
         printf(
             "[filed] metric scope=kobox_client op=%s count=%llu avg_ns=%llu max_ns=%llu avg_cycles=%llu max_cycles=%llu errors=%llu\n",
-            filed_kobox_backend_op_name(op),
+            filed_kobox_backend_op_name(filed_kobox_backend_metric_op(op)),
             (unsigned long long)metric->count,
             (unsigned long long)(metric->total_ns / metric->count),
             (unsigned long long)metric->max_ns,
@@ -156,14 +218,14 @@ void filed_kobox_backend_dump_metrics(const filed_kobox_backend_t *backend)
 
 static int filed_kobox_wire_page(
     filed_kobox_backend_t *backend,
-    filed_wire_page_t **out_page)
+    filed_v2_page_t **out_page)
 {
     if (backend == NULL || out_page == NULL) {
         return -1;
     }
 
     if (!backend->wire_page_ready) {
-        int status = filed_ipc_create_wire_page(KOBOXD_WIRE_FS_PAGE_BYTES, &backend->wire_page);
+        int status = filed_ipc_create_wire_page(STORAGE_V2_PAGE_BYTES, &backend->wire_page);
         if (status != 0) {
             return status;
         }
@@ -175,7 +237,7 @@ static int filed_kobox_wire_page(
     return 0;
 }
 
-static int filed_kobox_wire_page_fd(const filed_kobox_backend_t *backend, const filed_wire_page_t *page)
+static int filed_kobox_wire_page_fd(const filed_kobox_backend_t *backend, const filed_v2_page_t *page)
 {
     (void)backend;
     return page != NULL ? page->fd : -1;
@@ -206,7 +268,7 @@ static int filed_kobox_call_with_fd(
 
     const uint64_t request_id = ++backend->calls;
     const struct pacha_ipc_msg request = {
-        .word0 = KOBOXD_WIRE_ENDPOINT_MAGIC,
+        .word0 = KOBOXD_V2_ENDPOINT_MAGIC,
         .word1 = op,
         .word2 = object_id,
         .word3 = request_id,
@@ -245,7 +307,7 @@ static int filed_kobox_call_with_fd(
                 status);
             return status;
         }
-        if (reply.word0 == KOBOXD_WIRE_REPLY_MAGIC &&
+        if (reply.word0 == KOBOXD_V2_REPLY_MAGIC &&
             reply.word3 == request_id)
         {
             if ((int64_t)reply.word1 < 0) {
@@ -292,7 +354,7 @@ void filed_kobox_backend_init(filed_kobox_backend_t *backend, int fs_fd)
 
     memset(backend, 0, sizeof(*backend));
     backend->fs_fd = fs_fd;
-    backend->root_object_id = KOBOXD_WIRE_FS_ROOT_OBJECT_ID;
+    backend->root_object_id = STORAGE_V2_ROOT_OBJECT_ID;
 }
 
 void filed_kobox_backend_init_direct(
@@ -308,7 +370,7 @@ void filed_kobox_backend_init_direct(
     backend->fs_fd = -1;
     backend->direct_ctx = direct_ctx;
     backend->direct_ops = direct_ops;
-    backend->root_object_id = KOBOXD_WIRE_FS_ROOT_OBJECT_ID;
+    backend->root_object_id = STORAGE_V2_ROOT_OBJECT_ID;
 }
 
 int filed_kobox_backend_mount_root(filed_kobox_backend_t *backend)
@@ -326,20 +388,20 @@ int filed_kobox_backend_mount_root(filed_kobox_backend_t *backend)
         const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
         const int status = backend->direct_ops->mount_root(backend->direct_ctx, &magic);
         if (status != 0) {
-            return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_MOUNT_ROOT, start_ns, start_cycles, status);
+            return filed_kobox_direct_finish(backend, STORAGE_V2_OP_MOUNT_ROOT, start_ns, start_cycles, status);
         }
         backend->ext4_magic = magic;
         return filed_kobox_direct_finish(
             backend,
-            KOBOXD_WIRE_FS_MOUNT_ROOT,
+            STORAGE_V2_OP_MOUNT_ROOT,
             start_ns,
             start_cycles,
             magic == 0xef53u ? 0 : -3);
     }
 
-    const int status = filed_kobox_call_with_fd(
+    int status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_MOUNT_ROOT,
+        STORAGE_V2_OP_MOUNT_ROOT,
         0,
         -1,
         &magic);
@@ -357,7 +419,7 @@ int filed_kobox_backend_lookup(
     const char *name,
     uint64_t *out_object_id)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t object_id = 0;
 
     if (backend == NULL || parent_object_id == 0 || name == NULL || out_object_id == NULL) {
@@ -374,7 +436,7 @@ int filed_kobox_backend_lookup(
             parent_object_id,
             name,
             out_object_id);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_LOOKUP, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_LOOKUP, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -382,13 +444,13 @@ int filed_kobox_backend_lookup(
         return status;
     }
 
-    koboxd_wire_fs_lookup_t *lookup = (koboxd_wire_fs_lookup_t *)page->addr;
+    storage_v2_lookup_request_t *lookup = (storage_v2_lookup_request_t *)page->addr;
     lookup->parent_object_id = parent_object_id;
     snprintf(lookup->name, sizeof(lookup->name), "%s", name);
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_LOOKUP,
+        STORAGE_V2_OP_LOOKUP,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &object_id);
@@ -403,9 +465,9 @@ int filed_kobox_backend_lookup(
 int filed_kobox_backend_statx(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
-    koboxd_wire_fs_statx_t *out_stat)
+    storage_v2_statx_reply_t *out_stat)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || object_id == 0 || out_stat == NULL) {
@@ -418,7 +480,7 @@ int filed_kobox_backend_statx(
         uint64_t start_cycles = 0;
         const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
         const int status = backend->direct_ops->statx(backend->direct_ctx, object_id, out_stat);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_STATX, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_STATX, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -428,12 +490,12 @@ int filed_kobox_backend_statx(
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_STATX,
+        STORAGE_V2_OP_STATX,
         object_id,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
     if (status == 0) {
-        *out_stat = *(koboxd_wire_fs_statx_t *)page->addr;
+        *out_stat = *(storage_v2_statx_reply_t *)page->addr;
     }
     return status;
 }
@@ -446,7 +508,7 @@ int filed_kobox_backend_pread(
     uint64_t length,
     uint64_t *out_bytes)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t bytes = 0;
 
     if (backend == NULL || object_id == 0 || buffer == NULL || out_bytes == NULL) {
@@ -474,7 +536,7 @@ int filed_kobox_backend_pread(
             backend->bytes_read += bytes;
             *out_bytes = bytes;
         }
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_PREAD, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_PREAD, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -482,14 +544,14 @@ int filed_kobox_backend_pread(
         return status;
     }
 
-    koboxd_wire_fs_io_t *io = (koboxd_wire_fs_io_t *)page->addr;
+    storage_v2_io_request_t *io = (storage_v2_io_request_t *)page->addr;
     io->object_id = object_id;
     io->offset = offset;
-    io->length = length > KOBOXD_WIRE_FS_IO_BYTES ? KOBOXD_WIRE_FS_IO_BYTES : length;
+    io->length = length > STORAGE_V2_IO_BYTES ? STORAGE_V2_IO_BYTES : length;
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_PREAD,
+        STORAGE_V2_OP_PREAD,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &bytes);
@@ -513,7 +575,7 @@ int filed_kobox_backend_pwrite(
     uint64_t length,
     uint64_t *out_bytes)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t bytes = 0;
 
     if (backend == NULL || object_id == 0 || out_bytes == NULL) {
@@ -546,8 +608,11 @@ int filed_kobox_backend_pwrite(
             }
             backend->bytes_written += bytes;
             *out_bytes = bytes;
+            if (bytes != 0) {
+                filed_kobox_backend_mark_dirty(backend);
+            }
         }
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_PWRITE, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_PWRITE, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -555,15 +620,15 @@ int filed_kobox_backend_pwrite(
         return status;
     }
 
-    koboxd_wire_fs_io_t *io = (koboxd_wire_fs_io_t *)page->addr;
+    storage_v2_io_request_t *io = (storage_v2_io_request_t *)page->addr;
     io->object_id = object_id;
     io->offset = offset;
-    io->length = length > KOBOXD_WIRE_FS_IO_BYTES ? KOBOXD_WIRE_FS_IO_BYTES : length;
+    io->length = length > STORAGE_V2_IO_BYTES ? STORAGE_V2_IO_BYTES : length;
     memcpy(io->data, buffer, (size_t)io->length);
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_PWRITE,
+        STORAGE_V2_OP_PWRITE,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &bytes);
@@ -573,6 +638,9 @@ int filed_kobox_backend_pwrite(
         }
         backend->bytes_written += bytes;
         *out_bytes = bytes;
+        if (bytes != 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
     }
 
     return status;
@@ -594,12 +662,12 @@ int filed_kobox_backend_fsync(
         uint64_t start_cycles = 0;
         const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
         const int status = backend->direct_ops->fsync(backend->direct_ctx, object_id);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_FSYNC, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_FSYNC, start_ns, start_cycles, status);
     }
 
     return filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_FSYNC,
+        STORAGE_V2_OP_FSYNC,
         object_id,
         -1,
         &ignored);
@@ -612,7 +680,7 @@ int filed_kobox_backend_create(
     uint64_t mode,
     uint64_t *out_object_id)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t object_id = 0;
 
     if (backend == NULL || parent_object_id == 0 || name == NULL || out_object_id == NULL) {
@@ -631,7 +699,10 @@ int filed_kobox_backend_create(
             name,
             mode,
             out_object_id);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_CREATE, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_CREATE, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -639,14 +710,14 @@ int filed_kobox_backend_create(
         return status;
     }
 
-    koboxd_wire_fs_create_t *create = (koboxd_wire_fs_create_t *)page->addr;
+    storage_v2_create_request_t *create = (storage_v2_create_request_t *)page->addr;
     create->parent_object_id = parent_object_id;
     create->mode = mode;
     snprintf(create->name, sizeof(create->name), "%s", name);
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_CREATE,
+        STORAGE_V2_OP_CREATE,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &object_id);
@@ -655,6 +726,7 @@ int filed_kobox_backend_create(
     }
 
     *out_object_id = object_id;
+    filed_kobox_backend_mark_dirty(backend);
     return 0;
 }
 
@@ -663,7 +735,7 @@ int filed_kobox_backend_truncate(
     uint64_t object_id,
     uint64_t size)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || object_id == 0) {
@@ -676,7 +748,10 @@ int filed_kobox_backend_truncate(
         uint64_t start_cycles = 0;
         const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
         const int status = backend->direct_ops->truncate(backend->direct_ctx, object_id, size);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_TRUNCATE, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_TRUNCATE, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -684,16 +759,19 @@ int filed_kobox_backend_truncate(
         return status;
     }
 
-    koboxd_wire_fs_truncate_t *truncate = (koboxd_wire_fs_truncate_t *)page->addr;
+    storage_v2_truncate_request_t *truncate = (storage_v2_truncate_request_t *)page->addr;
     truncate->object_id = object_id;
     truncate->size = size;
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_TRUNCATE,
+        STORAGE_V2_OP_TRUNCATE,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
+    if (status == 0) {
+        filed_kobox_backend_mark_dirty(backend);
+    }
     return status;
 }
 
@@ -706,7 +784,7 @@ int filed_kobox_backend_utimens(
     int64_t mtime_sec,
     int64_t mtime_nsec)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || object_id == 0) {
@@ -726,7 +804,10 @@ int filed_kobox_backend_utimens(
             atime_nsec,
             mtime_sec,
             mtime_nsec);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_UTIMENS, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_UTIMENS, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -734,7 +815,7 @@ int filed_kobox_backend_utimens(
         return status;
     }
 
-    koboxd_wire_fs_utimens_t *utimens = (koboxd_wire_fs_utimens_t *)page->addr;
+    storage_v2_utimens_request_t *utimens = (storage_v2_utimens_request_t *)page->addr;
     utimens->object_id = object_id;
     utimens->mask = mask;
     utimens->atime_sec = atime_sec;
@@ -742,12 +823,16 @@ int filed_kobox_backend_utimens(
     utimens->mtime_sec = mtime_sec;
     utimens->mtime_nsec = mtime_nsec;
 
-    return filed_kobox_call_with_fd(
+    status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_UTIMENS,
+        STORAGE_V2_OP_UTIMENS,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
+    if (status == 0) {
+        filed_kobox_backend_mark_dirty(backend);
+    }
+    return status;
 }
 
 int filed_kobox_backend_chmod(
@@ -755,7 +840,7 @@ int filed_kobox_backend_chmod(
     uint64_t object_id,
     uint64_t mode)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || object_id == 0) {
@@ -771,7 +856,10 @@ int filed_kobox_backend_chmod(
             backend->direct_ctx,
             object_id,
             mode);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_CHMOD, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_CHMOD, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -779,16 +867,20 @@ int filed_kobox_backend_chmod(
         return status;
     }
 
-    koboxd_wire_fs_chmod_t *chmod_req = (koboxd_wire_fs_chmod_t *)page->addr;
+    storage_v2_chmod_request_t *chmod_req = (storage_v2_chmod_request_t *)page->addr;
     chmod_req->object_id = object_id;
     chmod_req->mode = mode;
 
-    return filed_kobox_call_with_fd(
+    status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_CHMOD,
+        STORAGE_V2_OP_CHMOD,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
+    if (status == 0) {
+        filed_kobox_backend_mark_dirty(backend);
+    }
+    return status;
 }
 
 int filed_kobox_backend_unlink(
@@ -796,7 +888,7 @@ int filed_kobox_backend_unlink(
     uint64_t parent_object_id,
     const char *name)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || parent_object_id == 0 || name == NULL) {
@@ -812,7 +904,10 @@ int filed_kobox_backend_unlink(
             backend->direct_ctx,
             parent_object_id,
             name);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_UNLINK, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_UNLINK, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -820,16 +915,19 @@ int filed_kobox_backend_unlink(
         return status;
     }
 
-    koboxd_wire_fs_unlink_t *unlink = (koboxd_wire_fs_unlink_t *)page->addr;
+    storage_v2_unlink_request_t *unlink = (storage_v2_unlink_request_t *)page->addr;
     unlink->parent_object_id = parent_object_id;
     snprintf(unlink->name, sizeof(unlink->name), "%s", name);
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_UNLINK,
+        STORAGE_V2_OP_UNLINK,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
+    if (status == 0) {
+        filed_kobox_backend_mark_dirty(backend);
+    }
     return status;
 }
 
@@ -840,7 +938,7 @@ int filed_kobox_backend_mkdir(
     uint64_t mode,
     uint64_t *out_object_id)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t object_id = 0;
 
     if (backend == NULL || parent_object_id == 0 || name == NULL || out_object_id == NULL) {
@@ -859,7 +957,10 @@ int filed_kobox_backend_mkdir(
             name,
             mode,
             out_object_id);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_MKDIR, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_MKDIR, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -867,14 +968,14 @@ int filed_kobox_backend_mkdir(
         return status;
     }
 
-    koboxd_wire_fs_mkdir_t *mkdir = (koboxd_wire_fs_mkdir_t *)page->addr;
+    storage_v2_mkdir_request_t *mkdir = (storage_v2_mkdir_request_t *)page->addr;
     mkdir->parent_object_id = parent_object_id;
     mkdir->mode = mode;
     snprintf(mkdir->name, sizeof(mkdir->name), "%s", name);
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_MKDIR,
+        STORAGE_V2_OP_MKDIR,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &object_id);
@@ -883,6 +984,7 @@ int filed_kobox_backend_mkdir(
     }
 
     *out_object_id = object_id;
+    filed_kobox_backend_mark_dirty(backend);
     return 0;
 }
 
@@ -891,7 +993,7 @@ int filed_kobox_backend_rmdir(
     uint64_t parent_object_id,
     const char *name)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || parent_object_id == 0 || name == NULL) {
@@ -907,7 +1009,10 @@ int filed_kobox_backend_rmdir(
             backend->direct_ctx,
             parent_object_id,
             name);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_RMDIR, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_RMDIR, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -915,16 +1020,19 @@ int filed_kobox_backend_rmdir(
         return status;
     }
 
-    koboxd_wire_fs_rmdir_t *rmdir = (koboxd_wire_fs_rmdir_t *)page->addr;
+    storage_v2_rmdir_request_t *rmdir = (storage_v2_rmdir_request_t *)page->addr;
     rmdir->parent_object_id = parent_object_id;
     snprintf(rmdir->name, sizeof(rmdir->name), "%s", name);
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_RMDIR,
+        STORAGE_V2_OP_RMDIR,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
+    if (status == 0) {
+        filed_kobox_backend_mark_dirty(backend);
+    }
     return status;
 }
 
@@ -936,7 +1044,7 @@ int filed_kobox_backend_rename(
     const char *new_name,
     uint64_t *out_object_id)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t object_id = 0;
 
     if (backend == NULL ||
@@ -962,7 +1070,10 @@ int filed_kobox_backend_rename(
             new_parent_object_id,
             new_name,
             out_object_id);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_RENAME, start_ns, start_cycles, status);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_RENAME, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -970,7 +1081,7 @@ int filed_kobox_backend_rename(
         return status;
     }
 
-    koboxd_wire_fs_rename_t *rename = (koboxd_wire_fs_rename_t *)page->addr;
+    storage_v2_rename_request_t *rename = (storage_v2_rename_request_t *)page->addr;
     rename->old_parent_object_id = old_parent_object_id;
     rename->new_parent_object_id = new_parent_object_id;
     snprintf(rename->old_name, sizeof(rename->old_name), "%s", old_name);
@@ -978,7 +1089,7 @@ int filed_kobox_backend_rename(
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_RENAME,
+        STORAGE_V2_OP_RENAME,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &object_id);
@@ -986,6 +1097,7 @@ int filed_kobox_backend_rename(
         return status;
     }
     *out_object_id = object_id;
+    filed_kobox_backend_mark_dirty(backend);
     return 0;
 }
 
@@ -1005,12 +1117,12 @@ int filed_kobox_backend_release_object(
         uint64_t start_cycles = 0;
         const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
         const int status = backend->direct_ops->release_object(backend->direct_ctx, object_id);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_RELEASE_OBJECT, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_RELEASE_OBJECT, start_ns, start_cycles, status);
     }
 
     return filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_RELEASE_OBJECT,
+        STORAGE_V2_OP_RELEASE_OBJECT,
         object_id,
         -1,
         &ignored);
@@ -1020,9 +1132,9 @@ int filed_kobox_backend_getdents(
     filed_kobox_backend_t *backend,
     uint64_t dir_object_id,
     uint64_t offset,
-    koboxd_wire_fs_getdents_t *out_entries)
+    storage_v2_getdents_request_t *out_entries)
 {
-    filed_wire_page_t *page = NULL;
+    filed_v2_page_t *page = NULL;
     uint64_t ignored = 0;
 
     if (backend == NULL || dir_object_id == 0 || out_entries == NULL) {
@@ -1039,7 +1151,7 @@ int filed_kobox_backend_getdents(
             dir_object_id,
             offset,
             out_entries);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_GETDENTS, start_ns, start_cycles, status);
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_GETDENTS, start_ns, start_cycles, status);
     }
 
     int status = filed_kobox_wire_page(backend, &page);
@@ -1047,14 +1159,14 @@ int filed_kobox_backend_getdents(
         return status;
     }
 
-    koboxd_wire_fs_getdents_t *request = (koboxd_wire_fs_getdents_t *)page->addr;
+    storage_v2_getdents_request_t *request = (storage_v2_getdents_request_t *)page->addr;
     request->dir_object_id = dir_object_id;
     request->offset = offset;
-    request->capacity = KOBOXD_WIRE_FS_DIRENT_CAPACITY;
+    request->capacity = STORAGE_V2_DIRENT_CAPACITY;
 
     status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_GETDENTS,
+        STORAGE_V2_OP_GETDENTS,
         0,
         filed_kobox_wire_page_fd(backend, page),
         &ignored);
@@ -1079,13 +1191,20 @@ int filed_kobox_backend_sync_all(filed_kobox_backend_t *backend)
         uint64_t start_cycles = 0;
         const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
         const int status = backend->direct_ops->sync_all(backend->direct_ctx);
-        return filed_kobox_direct_finish(backend, KOBOXD_WIRE_FS_SYNC_ALL, start_ns, start_cycles, status);
+        if (status == 0) {
+            backend->dirty_hint = 0;
+        }
+        return filed_kobox_direct_finish(backend, STORAGE_V2_OP_SYNC_ALL, start_ns, start_cycles, status);
     }
 
-    return filed_kobox_call_with_fd(
+    const int status = filed_kobox_call_with_fd(
         backend,
-        KOBOXD_WIRE_FS_SYNC_ALL,
+        STORAGE_V2_OP_SYNC_ALL,
         0,
         -1,
         &ignored);
+    if (status == 0) {
+        backend->dirty_hint = 0;
+    }
+    return status;
 }

@@ -10,6 +10,7 @@
 - [Phase 4 FD passing IPC](./phase4-fd-passing-ipc.md)
 - [Phase 5 fast IPC / pkey threat model](./phase5-fast-ipc-pkey-threat-model.md)
 - [filed VFS design](./filed-vfs-design.md)
+- [Userland service ABI v2](./userland-service-abi-v2.md)
 - [FD ABI spec draft](./fd-abi-spec.md)
 - [IPC ABI spec draft](./ipc-abi-spec.md)
 - [Memory ABI spec draft](./memory-abi-spec.md)

@@ -199,7 +199,9 @@ static char *lpr_append_u64(char *out, const char *end, uint64_t value)
     }
     return out;
 }
+#endif
 
+#if LPR_TRACE_PATCH_MAPPING || LPR_TRACE_SYSCALL_METRICS || LPR_TRACE_MMAP_LOADS || LPR_TRACE_MMAP_CALLS || LPR_TRACE_ENOSYS || LPR_TRACE_BAD_RETURN || LPR_TRACE_SOCKET_SYSCALLS
 static char *lpr_append_i64(char *out, const char *end, int64_t value)
 {
     if (value < 0) {
@@ -401,6 +403,7 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_PSELECT6 },
     { .nr = LPR_LINUX_SYS_FSYNC },
     { .nr = LPR_LINUX_SYS_FDATASYNC },
+    { .nr = LPR_LINUX_SYS_SYNC },
     { .nr = LPR_LINUX_SYS_GETCWD },
     { .nr = LPR_LINUX_SYS_CHDIR },
     { .nr = LPR_LINUX_SYS_FCHDIR },
@@ -514,6 +517,7 @@ static char *lpr_trace_append_syscall_name(char *out, const char *end, uint64_t 
     case LPR_LINUX_SYS_PSELECT6: return lpr_append_literal(out, end, "pselect6");
     case LPR_LINUX_SYS_FSYNC: return lpr_append_literal(out, end, "fsync");
     case LPR_LINUX_SYS_FDATASYNC: return lpr_append_literal(out, end, "fdatasync");
+    case LPR_LINUX_SYS_SYNC: return lpr_append_literal(out, end, "sync");
     case LPR_LINUX_SYS_GETCWD: return lpr_append_literal(out, end, "getcwd");
     case LPR_LINUX_SYS_CHDIR: return lpr_append_literal(out, end, "chdir");
     case LPR_LINUX_SYS_FCHDIR: return lpr_append_literal(out, end, "fchdir");
@@ -1342,6 +1346,8 @@ static int64_t lpr_dispatch_syscall_inner(uint64_t nr,
     case LPR_LINUX_SYS_FSYNC:
     case LPR_LINUX_SYS_FDATASYNC:
         return lpr_linux_fsync(a0);
+    case LPR_LINUX_SYS_SYNC:
+        return lpr_linux_sync();
     case LPR_LINUX_SYS_PREAD64:
         return lpr_linux_pread64(a0, a1, a2, a3);
     case LPR_LINUX_SYS_READV:

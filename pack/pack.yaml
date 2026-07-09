@@ -177,6 +177,15 @@ apps:
         - "tools/build_wsl_curl.sh"
     out: "CURLROOT"
     rootfs: "/"
+  coreutils_mini:
+    file:
+      path: ".artifacts/userland-fixtures/coreutils-mini-root"
+      rebuild: ["bash", "tools/build_wsl_coreutils_mini.sh"]
+      input:
+        - "tools/build_wsl_coreutils_mini.sh"
+        - "userland/fixtures/src/wsl_musl/coreutils_mini.c"
+    out: "COREMINIROOT"
+    rootfs: "/"
   dash:
     file: "userland/fixtures/shell/dash.elf"
     out: "DASH.ELF"
@@ -514,12 +523,24 @@ apps:
     file:
       path: ".artifacts/musl-pachaos-runtime/rootfs/lib/libc.so"
       rebuild: ["bash", "musl/pachaos/build/build-runtime.sh"]
+      input:
+        - "musl/pachaos/build/build-runtime.sh"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos"
+        - "musl/upstream/src/thread/pachaos"
+        - "musl/upstream/src/setjmp/pachaos"
     out: "PAMUSLLC.SO"
     rootfs: "/lib/libc.so"
   pachaos_musl_ldso:
     file:
       path: ".artifacts/musl-pachaos-runtime/rootfs/lib/ld-musl-x86_64.so.1"
       rebuild: ["bash", "musl/pachaos/build/build-runtime.sh"]
+      input:
+        - "musl/pachaos/build/build-runtime.sh"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos"
+        - "musl/upstream/src/thread/pachaos"
+        - "musl/upstream/src/setjmp/pachaos"
     out: "PAMUSLLD.SO"
     rootfs: "/lib/ld-musl-x86_64.so.1"
   linux_lpr_runtime:
@@ -595,7 +616,7 @@ apps:
       input:
         - "pack/scripts/download_lpr_busybox_dynamic.sh"
     out: "BUSYBOX.ELF"
-    rootfs: ["/cmd/busybox", "/bin/stty", "/bin/sleep"]
+    rootfs: "/cmd/busybox"
   lpr_bash_dynamic:
     file:
       path: ".artifacts/userland-fixtures/lpr-bash-dynamic-root/bin/bash"
@@ -811,6 +832,7 @@ apps:
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/filed/include"
         - "userland/netd/src"
@@ -834,6 +856,7 @@ apps:
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "TERMD.ELF"
     bootfs: "/srv/termd.elf"
@@ -928,6 +951,7 @@ apps:
         - "_kobox/include"
         - "_kobox/src"
         - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/personality/include"
         - "userland/personality/linux/hde"
@@ -942,6 +966,8 @@ apps:
         - "userland/lpr_supervisor/CMakeLists.txt"
         - "userland/lpr_supervisor/include"
         - "userland/lpr_supervisor/src"
+        - "musl/pachaos/build/build-app-dynamic.sh"
+        - "musl/pachaos/build/build-runtime.sh"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
@@ -1046,7 +1072,7 @@ apps:
       path: ".artifacts/userland-fixtures/uutils-shim.elf"
       rebuild: ["bash", "tools/build_wsl_uutils_shim.sh"]
     out: "UUTILSHM.ELF"
-    rootfs: ["/cmd/uutils-shim.elf", "/bin/[", "/usr/lib/uutils/arch", "/usr/lib/uutils/b2sum", "/usr/lib/uutils/base32", "/usr/lib/uutils/base64", "/usr/bin/basename", "/usr/lib/uutils/basenc", "/bin/cat", "/usr/lib/uutils/chgrp", "/bin/chmod", "/usr/lib/uutils/chown", "/usr/lib/uutils/chroot", "/usr/lib/uutils/cksum", "/usr/lib/uutils/comm", "/bin/cp", "/usr/lib/uutils/csplit", "/bin/cut", "/bin/date", "/bin/dd", "/usr/bin/df", "/usr/bin/dir", "/usr/lib/uutils/dircolors", "/usr/bin/dirname", "/usr/lib/uutils/du", "/bin/echo", "/bin/env", "/usr/lib/uutils/expand", "/usr/bin/expr", "/usr/lib/uutils/factor", "/bin/false", "/usr/lib/uutils/fmt", "/usr/lib/uutils/fold", "/usr/lib/uutils/groups", "/usr/lib/uutils/hashsum", "/bin/head", "/usr/lib/uutils/hostid", "/usr/bin/hostname", "/usr/bin/id", "/usr/lib/uutils/install", "/usr/lib/uutils/join", "/usr/bin/kill", "/usr/lib/uutils/link", "/usr/bin/ln", "/usr/lib/uutils/logname", "/bin/ls", "/usr/bin/md5sum", "/bin/mkdir", "/usr/bin/mkfifo", "/usr/bin/mknod", "/usr/bin/mktemp", "/usr/bin/more", "/bin/mv", "/usr/lib/uutils/nice", "/usr/lib/uutils/nl", "/usr/lib/uutils/nohup", "/usr/bin/nproc", "/usr/lib/uutils/numfmt", "/usr/lib/uutils/od", "/usr/bin/paste", "/usr/lib/uutils/pathchk", "/usr/lib/uutils/pinky", "/usr/lib/uutils/pr", "/usr/bin/printenv", "/bin/printf", "/usr/lib/uutils/ptx", "/bin/pwd", "/usr/bin/readlink", "/usr/bin/realpath", "/bin/rm", "/bin/rmdir", "/bin/seq", "/usr/bin/sha1sum", "/usr/lib/uutils/sha224sum", "/usr/bin/sha256sum", "/usr/lib/uutils/sha384sum", "/usr/bin/sha512sum", "/usr/lib/uutils/shred", "/usr/lib/uutils/shuf", "/bin/sleep", "/bin/sort", "/usr/lib/uutils/split", "/usr/bin/stat", "/usr/lib/uutils/stty", "/usr/lib/uutils/sum", "/usr/lib/uutils/sync", "/usr/lib/uutils/tac", "/bin/tail", "/bin/tee", "/bin/test", "/usr/lib/uutils/timeout", "/bin/touch", "/bin/tr", "/bin/true", "/usr/lib/uutils/truncate", "/usr/lib/uutils/tsort", "/usr/bin/tty", "/bin/uname", "/usr/lib/uutils/unexpand", "/usr/bin/uniq", "/usr/bin/unlink", "/usr/bin/uptime", "/usr/lib/uutils/users", "/usr/lib/uutils/vdir", "/bin/wc", "/usr/lib/uutils/who", "/usr/bin/whoami", "/usr/lib/uutils/yes"]
+    rootfs: ["/cmd/uutils-shim.elf", "/bin/[", "/usr/lib/uutils/arch", "/usr/lib/uutils/b2sum", "/usr/lib/uutils/base32", "/usr/lib/uutils/base64", "/usr/bin/basename", "/usr/lib/uutils/basenc", "/bin/cat", "/usr/lib/uutils/chgrp", "/bin/chmod", "/usr/lib/uutils/chown", "/usr/lib/uutils/chroot", "/usr/lib/uutils/cksum", "/usr/lib/uutils/comm", "/bin/cp", "/usr/lib/uutils/csplit", "/bin/cut", "/bin/date", "/bin/dd", "/usr/bin/df", "/usr/bin/dir", "/usr/lib/uutils/dircolors", "/usr/bin/dirname", "/usr/lib/uutils/du", "/bin/echo", "/bin/env", "/usr/lib/uutils/expand", "/usr/bin/expr", "/usr/lib/uutils/factor", "/bin/false", "/usr/lib/uutils/fmt", "/usr/lib/uutils/fold", "/usr/lib/uutils/groups", "/usr/lib/uutils/hashsum", "/bin/head", "/usr/lib/uutils/hostid", "/usr/bin/hostname", "/usr/bin/id", "/usr/lib/uutils/install", "/usr/lib/uutils/join", "/usr/bin/kill", "/usr/lib/uutils/link", "/usr/bin/ln", "/usr/lib/uutils/logname", "/bin/ls", "/usr/bin/md5sum", "/bin/mkdir", "/usr/bin/mkfifo", "/usr/bin/mknod", "/usr/bin/mktemp", "/usr/bin/more", "/bin/mv", "/usr/lib/uutils/nice", "/usr/lib/uutils/nl", "/usr/lib/uutils/nohup", "/usr/bin/nproc", "/usr/lib/uutils/numfmt", "/usr/lib/uutils/od", "/usr/bin/paste", "/usr/lib/uutils/pathchk", "/usr/lib/uutils/pinky", "/usr/lib/uutils/pr", "/usr/bin/printenv", "/bin/printf", "/usr/lib/uutils/ptx", "/bin/pwd", "/usr/bin/readlink", "/usr/bin/realpath", "/bin/rm", "/bin/rmdir", "/bin/seq", "/usr/bin/sha1sum", "/usr/lib/uutils/sha224sum", "/usr/bin/sha256sum", "/usr/lib/uutils/sha384sum", "/usr/bin/sha512sum", "/usr/lib/uutils/shred", "/usr/lib/uutils/shuf", "/bin/sleep", "/bin/sort", "/usr/lib/uutils/split", "/usr/bin/stat", "/bin/stty", "/usr/lib/uutils/stty", "/usr/lib/uutils/sum", "/usr/lib/uutils/sync", "/usr/lib/uutils/tac", "/bin/tail", "/bin/tee", "/bin/test", "/usr/lib/uutils/timeout", "/bin/touch", "/bin/tr", "/bin/true", "/usr/lib/uutils/truncate", "/usr/lib/uutils/tsort", "/usr/bin/tty", "/bin/uname", "/usr/lib/uutils/unexpand", "/usr/bin/uniq", "/usr/bin/unlink", "/usr/bin/uptime", "/usr/lib/uutils/users", "/usr/lib/uutils/vdir", "/bin/wc", "/usr/lib/uutils/who", "/usr/bin/whoami", "/usr/lib/uutils/yes"]
   virtio_console:
     role: "service"
     file:

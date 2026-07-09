@@ -3,9 +3,9 @@
 #include "lpr_filed.h"
 #include "support/string.h"
 #include "support/syscall.h"
-#include <netd/ipc_protocol.h>
 #include <pacha/ipc.h>
 #include <pachaos/abi.h>
+#include <personality/lpr_client_abi.h>
 #include <personality/linux_lpr.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -242,7 +242,7 @@ static void lpr_socket_debug_connect(const char *phase, uint32_t addr_be, uint16
 
 static void lpr_netd_debug_call(const char *phase, uint64_t op, uint64_t request_id, int64_t status, uint64_t result)
 {
-    if (op != NETD_WIRE_OP_POLL && op != NETD_WIRE_OP_CONNECT) {
+    if (op != NETD_V2_OP_POLL && op != NETD_V2_OP_CONNECT) {
         return;
     }
     char line[192];
@@ -429,7 +429,7 @@ static int lpr_netd_create_page(void **out_page)
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int64_t fd = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE, NETD_WIRE_PAGE_BYTES, rights, 0);
+    const int64_t fd = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE, NETD_V2_PAGE_BYTES, rights, 0);
     if (fd < 16) {
         return (int)lpr_negative_status(fd);
     }
@@ -437,7 +437,7 @@ static int lpr_netd_create_page(void **out_page)
         PACHAOS_SYSCALL_MMAP,
         (uint64_t)(uint32_t)fd,
         0,
-        NETD_WIRE_PAGE_BYTES,
+        NETD_V2_PAGE_BYTES,
         PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
         PACHAOS_MMAP_SHARED,
         0);
@@ -461,7 +461,7 @@ static void lpr_netd_destroy_page(int fd, void *page)
         return;
     }
     if (page != 0) {
-        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)page, NETD_WIRE_PAGE_BYTES);
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)page, NETD_V2_PAGE_BYTES);
     }
     if (fd >= 16) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
@@ -486,7 +486,7 @@ static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t 
 
     const uint64_t request_id = ++lpr_netd_request_id;
     const struct pacha_ipc_msg request = {
-        .word0 = NETD_WIRE_REQUEST_MAGIC,
+        .word0 = NETD_V2_REQUEST_MAGIC,
         .word1 = op,
         .word2 = word2,
         .word3 = request_id,
@@ -517,7 +517,7 @@ static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t 
     if (recv_status != 0) {
         return lpr_negative_status(recv_status);
     }
-    if (reply.word0 != NETD_WIRE_REPLY_MAGIC || reply.word3 != request_id) {
+    if (reply.word0 != NETD_V2_REPLY_MAGIC || reply.word3 != request_id) {
         return -LPR_LINUX_EIO;
     }
     if (out_result != 0) {
@@ -596,12 +596,12 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     type &= ~(LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC);
     uint64_t netd_type = 0;
     if (type == LPR_LINUX_SOCK_STREAM) {
-        netd_type = NETD_WIRE_SOCK_STREAM;
+        netd_type = NETD_V2_SOCK_STREAM;
         if (protocol == 0) {
             protocol = LPR_LINUX_IPPROTO_TCP;
         }
     } else if (type == LPR_LINUX_SOCK_DGRAM) {
-        netd_type = NETD_WIRE_SOCK_DGRAM;
+        netd_type = NETD_V2_SOCK_DGRAM;
         if (protocol == 0) {
             protocol = LPR_LINUX_IPPROTO_UDP;
         }
@@ -618,14 +618,14 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     if (page_fd < 0) {
         return page_fd;
     }
-    lpr_memset(page, 0, NETD_WIRE_PAGE_BYTES);
-    netd_wire_socket_t *req = (netd_wire_socket_t *)page;
-    req->domain = NETD_WIRE_AF_INET;
+    lpr_memset(page, 0, NETD_V2_PAGE_BYTES);
+    netd_v2_socket_t *req = (netd_v2_socket_t *)page;
+    req->domain = NETD_V2_AF_INET;
     req->type = netd_type;
     req->protocol = protocol;
     req->flags = flags;
     uint64_t handle = 0;
-    const int64_t status = lpr_netd_call(NETD_WIRE_OP_SOCKET, page_fd, 0, &handle);
+    const int64_t status = lpr_netd_call(NETD_V2_OP_SOCKET, page_fd, 0, &handle);
     lpr_netd_destroy_page(page_fd, page);
     if (status != 0) {
 #if LPR_TRACE_SOCKET
@@ -636,7 +636,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
 
     const int fd = lpr_socket_alloc_fd();
     if (fd < 0) {
-        (void)lpr_netd_call(NETD_WIRE_OP_CLOSE, -1, handle, 0);
+        (void)lpr_netd_call(NETD_V2_OP_CLOSE, -1, handle, 0);
 #if LPR_TRACE_SOCKET
         lpr_socket_trace_socket(domain, type, protocol, fd);
 #endif
@@ -674,7 +674,7 @@ int64_t lpr_linux_socket_close(uint64_t fd)
     }
     const uint64_t handle = lpr_sockets[fd].handle;
     lpr_memset(&lpr_sockets[fd], 0, sizeof(lpr_sockets[fd]));
-    return lpr_netd_call(NETD_WIRE_OP_CLOSE, -1, handle, 0);
+    return lpr_netd_call(NETD_V2_OP_CLOSE, -1, handle, 0);
 }
 
 int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
@@ -701,13 +701,13 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     if (page_fd < 0) {
         return page_fd;
     }
-    lpr_memset(page, 0, NETD_WIRE_PAGE_BYTES);
-    netd_wire_connect_t *req = (netd_wire_connect_t *)page;
+    lpr_memset(page, 0, NETD_V2_PAGE_BYTES);
+    netd_v2_connect_t *req = (netd_v2_connect_t *)page;
     req->handle = lpr_sockets[fd].handle;
     req->addr.addr_be = addr->addr_be;
     req->addr.port_be = addr->port_be;
     lpr_socket_debug_connect("begin", addr->addr_be, addr->port_be, 0);
-    const int64_t status = lpr_netd_call(NETD_WIRE_OP_CONNECT, page_fd, 0, 0);
+    const int64_t status = lpr_netd_call(NETD_V2_OP_CONNECT, page_fd, 0, 0);
     lpr_socket_debug_connect("end", addr->addr_be, addr->port_be, status);
     lpr_netd_destroy_page(page_fd, page);
     if (status == 0) {
@@ -780,16 +780,16 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
     const uint8_t *src = (const uint8_t *)(uintptr_t)buf;
     while (sent_total < len) {
         uint64_t chunk = len - sent_total;
-        if (chunk > NETD_WIRE_IO_BYTES) {
-            chunk = NETD_WIRE_IO_BYTES;
+        if (chunk > NETD_V2_IO_BYTES) {
+            chunk = NETD_V2_IO_BYTES;
         }
         void *page = 0;
         const int page_fd = lpr_netd_create_page(&page);
         if (page_fd < 0) {
             return sent_total != 0 ? (int64_t)sent_total : page_fd;
         }
-        lpr_memset(page, 0, NETD_WIRE_PAGE_BYTES);
-        netd_wire_io_t *req = (netd_wire_io_t *)page;
+        lpr_memset(page, 0, NETD_V2_PAGE_BYTES);
+        netd_v2_io_t *req = (netd_v2_io_t *)page;
         req->handle = lpr_sockets[fd].handle;
         req->length = chunk;
         req->flags = flags;
@@ -806,7 +806,7 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
         }
         lpr_memcpy(req->data, src + sent_total, (size_t)chunk);
         uint64_t sent = 0;
-        const int64_t status = lpr_netd_call(NETD_WIRE_OP_SEND, page_fd, 0, &sent);
+        const int64_t status = lpr_netd_call(NETD_V2_OP_SEND, page_fd, 0, &sent);
         lpr_netd_destroy_page(page_fd, page);
         if (status != 0) {
             if (status == -LPR_LINUX_EAGAIN && !lpr_socket_op_nonblocking(fd, flags)) {
@@ -842,13 +842,13 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
     if (page_fd < 0) {
         return page_fd;
     }
-    lpr_memset(page, 0, NETD_WIRE_PAGE_BYTES);
-    netd_wire_io_t *req = (netd_wire_io_t *)page;
+    lpr_memset(page, 0, NETD_V2_PAGE_BYTES);
+    netd_v2_io_t *req = (netd_v2_io_t *)page;
     req->handle = lpr_sockets[fd].handle;
-    req->length = len < NETD_WIRE_IO_BYTES ? len : NETD_WIRE_IO_BYTES;
+    req->length = len < NETD_V2_IO_BYTES ? len : NETD_V2_IO_BYTES;
     req->flags = flags;
     uint64_t received = 0;
-    const int64_t status = lpr_netd_call(NETD_WIRE_OP_RECV, page_fd, 0, &received);
+    const int64_t status = lpr_netd_call(NETD_V2_OP_RECV, page_fd, 0, &received);
     if (status == 0 && received != 0) {
         lpr_memcpy((void *)(uintptr_t)buf, req->data, (size_t)received);
         if (src_addr != 0 && addrlen_raw != 0) {
@@ -1282,12 +1282,12 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
     if (page_fd < 0) {
         return page_fd;
     }
-    lpr_memset(page, 0, NETD_WIRE_PAGE_BYTES);
-    netd_wire_poll_t *req = (netd_wire_poll_t *)page;
+    lpr_memset(page, 0, NETD_V2_PAGE_BYTES);
+    netd_v2_poll_t *req = (netd_v2_poll_t *)page;
     req->handle = lpr_sockets[fd].handle;
-    req->events = events & (NETD_WIRE_POLLIN | NETD_WIRE_POLLOUT | NETD_WIRE_POLLERR);
+    req->events = events & (NETD_V2_POLLIN | NETD_V2_POLLOUT | NETD_V2_POLLERR);
     uint64_t revents = 0;
-    const int64_t status = lpr_netd_call(NETD_WIRE_OP_POLL, page_fd, 0, &revents);
+    const int64_t status = lpr_netd_call(NETD_V2_OP_POLL, page_fd, 0, &revents);
     if (status == 0) {
         const int32_t socket_error = req->error;
         *out_revents = req->revents != 0 ? req->revents : (uint32_t)revents;
@@ -1295,7 +1295,7 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
             lpr_sockets[fd].last_error = socket_error;
             lpr_sockets[fd].connecting = 0;
             lpr_sockets[fd].connected = 0;
-        } else if (lpr_sockets[fd].connecting && (*out_revents & NETD_WIRE_POLLOUT) != 0) {
+        } else if (lpr_sockets[fd].connecting && (*out_revents & NETD_V2_POLLOUT) != 0) {
             lpr_sockets[fd].last_error = 0;
             lpr_sockets[fd].connecting = 0;
             lpr_sockets[fd].connected = 1;

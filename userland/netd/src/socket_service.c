@@ -1,7 +1,7 @@
 #include "socket_service.h"
 
 #include "libuinet_backend.h"
-#include "netd/ipc_protocol.h"
+#include "netd/ipc_protocol_v2.h"
 #include "pacha/ipc.h"
 
 #include <stddef.h>
@@ -17,9 +17,9 @@ static uint64_t g_netd_socket_recv_bytes;
 
 static void netd_socket_trace_data_op(uint64_t op, int status, uint64_t result)
 {
-    if (op == NETD_WIRE_OP_CONNECT || op == NETD_WIRE_OP_SEND ||
-        op == NETD_WIRE_OP_RECV || op == NETD_WIRE_OP_POLL) {
-        if (op == NETD_WIRE_OP_RECV && status == 0) {
+    if (op == NETD_V2_OP_CONNECT || op == NETD_V2_OP_SEND ||
+        op == NETD_V2_OP_RECV || op == NETD_V2_OP_POLL) {
+        if (op == NETD_V2_OP_RECV && status == 0) {
             g_netd_socket_recv_bytes += result;
             if (result == 0 || g_netd_socket_recv_bytes <= 4096 ||
                 (g_netd_socket_recv_bytes % (128u * 1024u)) < result) {
@@ -30,7 +30,7 @@ static void netd_socket_trace_data_op(uint64_t op, int status, uint64_t result)
             }
             return;
         }
-        if (op == NETD_WIRE_OP_CONNECT || (status != 0 && status != -11)) {
+        if (op == NETD_V2_OP_CONNECT || (status != 0 && status != -11)) {
             printf("[netd] socket op=%llu status=%d result=%llu\n",
                 (unsigned long long)op,
                 status,
@@ -42,12 +42,12 @@ static void netd_socket_trace_data_op(uint64_t op, int status, uint64_t result)
 static int netd_socket_send_reply(uint64_t op, int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
     const struct pacha_ipc_msg reply = {
-        .word0 = NETD_WIRE_REPLY_MAGIC,
+        .word0 = NETD_V2_REPLY_MAGIC,
         .word1 = (uint64_t)status,
         .word2 = result,
         .word3 = request_id,
     };
-    if (g_netd_socket_trace && (op == NETD_WIRE_OP_CONNECT || op == NETD_WIRE_OP_POLL)) {
+    if (g_netd_socket_trace && (op == NETD_V2_OP_CONNECT || op == NETD_V2_OP_POLL)) {
         printf("[netd] socket reply begin op=%llu status=%lld result=%llu reply_fd=%d\n",
             (unsigned long long)op,
             (long long)status,
@@ -56,7 +56,7 @@ static int netd_socket_send_reply(uint64_t op, int reply_fd, uint64_t request_id
         fflush(stdout);
     }
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
-    if (g_netd_socket_trace && (op == NETD_WIRE_OP_CONNECT || op == NETD_WIRE_OP_POLL)) {
+    if (g_netd_socket_trace && (op == NETD_V2_OP_CONNECT || op == NETD_V2_OP_POLL)) {
         printf("[netd] socket reply end op=%llu status=%d result=%llu reply_fd=%d\n",
             (unsigned long long)op,
             reply_status,
@@ -75,7 +75,7 @@ static void *netd_socket_map_page(int page_fd)
     }
     return pacha_mmap(
         page_fd,
-        NETD_WIRE_PAGE_BYTES,
+        NETD_V2_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -88,30 +88,30 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
     }
 
     switch (op) {
-    case NETD_WIRE_OP_HELLO:
+    case NETD_V2_OP_HELLO:
         *out_result = 0;
         return 0;
-    case NETD_WIRE_OP_SOCKET: {
+    case NETD_V2_OP_SOCKET: {
         if (page == NULL) {
             return -22;
         }
-        const netd_wire_socket_t *req = (const netd_wire_socket_t *)page;
+        const netd_v2_socket_t *req = (const netd_v2_socket_t *)page;
         return netd_libuinet_socket_open(req->domain, req->type, req->protocol, out_result);
     }
-    case NETD_WIRE_OP_CONNECT: {
+    case NETD_V2_OP_CONNECT: {
         if (page == NULL) {
             return -22;
         }
-        const netd_wire_connect_t *req = (const netd_wire_connect_t *)page;
+        const netd_v2_connect_t *req = (const netd_v2_connect_t *)page;
         *out_result = 0;
         return netd_libuinet_socket_connect(req->handle, req->addr.addr_be, req->addr.port_be, req->flags);
     }
-    case NETD_WIRE_OP_SEND: {
+    case NETD_V2_OP_SEND: {
         if (page == NULL) {
             return -22;
         }
-        const netd_wire_io_t *req = (const netd_wire_io_t *)page;
-        if (req->length > NETD_WIRE_IO_BYTES) {
+        const netd_v2_io_t *req = (const netd_v2_io_t *)page;
+        if (req->length > NETD_V2_IO_BYTES) {
             return -22;
         }
         size_t sent = 0;
@@ -126,14 +126,14 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         *out_result = sent;
         return status;
     }
-    case NETD_WIRE_OP_RECV: {
+    case NETD_V2_OP_RECV: {
         if (page == NULL) {
             return -22;
         }
-        netd_wire_io_t *req = (netd_wire_io_t *)page;
+        netd_v2_io_t *req = (netd_v2_io_t *)page;
         size_t capacity = (size_t)req->length;
-        if (capacity > NETD_WIRE_IO_BYTES) {
-            capacity = NETD_WIRE_IO_BYTES;
+        if (capacity > NETD_V2_IO_BYTES) {
+            capacity = NETD_V2_IO_BYTES;
         }
         size_t received = 0;
         int status = netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
@@ -141,11 +141,11 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         *out_result = received;
         return status;
     }
-    case NETD_WIRE_OP_POLL: {
+    case NETD_V2_OP_POLL: {
         if (page == NULL) {
             return -22;
         }
-        netd_wire_poll_t *req = (netd_wire_poll_t *)page;
+        netd_v2_poll_t *req = (netd_v2_poll_t *)page;
         uint32_t revents = 0;
         int32_t error = 0;
         int status = netd_libuinet_socket_poll(req->handle, req->events, &revents, &error);
@@ -154,7 +154,7 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         *out_result = revents;
         return status;
     }
-    case NETD_WIRE_OP_CLOSE:
+    case NETD_V2_OP_CLOSE:
         {
             uint64_t handle = *out_result;
             *out_result = 0;
@@ -175,7 +175,7 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     }
 
     const int reply_fd = (int)fds[request->fd_count - 1].fd;
-    if (request->word0 != NETD_WIRE_REQUEST_MAGIC || request->word3 == 0) {
+    if (request->word0 != NETD_V2_REQUEST_MAGIC || request->word3 == 0) {
         return netd_socket_send_reply(request->word1, reply_fd, request->word3, -22, 0);
     }
     int page_fd = -1;
@@ -205,7 +205,7 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
             (unsigned long long)request->fd_count);
     }
     if (page != NULL) {
-        (void)pacha_munmap(page, NETD_WIRE_PAGE_BYTES);
+        (void)pacha_munmap(page, NETD_V2_PAGE_BYTES);
     }
     if (page_fd >= 16 && page_fd != reply_fd) {
         (void)pacha_fd_close(page_fd);

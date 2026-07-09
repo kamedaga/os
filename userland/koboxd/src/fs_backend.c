@@ -113,13 +113,16 @@ enum {
     KOBOXD_TIME_UPDATE_MTIME = 1u << 1,
     KOBOXD_OBJECT_DIRTY_METADATA = 1u << 0,
     KOBOXD_OBJECT_DIRTY_DATA = 1u << 1,
+    KOBOXD_EXT4_DIRENT_HEADER_BYTES = 8,
+    KOBOXD_EXT4_DIRENT_READ_CHUNK_BYTES = 4096,
+    KOBOXD_EXT4_DIRENT_SCAN_MAX_BYTES = 4u * 1024u * 1024u,
+    KOBOXD_READDIR_SCAN_MAX_ENTRIES = 128,
 };
 
 typedef struct koboxd_ext4_operations {
     void *dir_operations;
     void *file_operations;
     void *dir_inode_operations;
-    void *readdir;
     void *file_read_iter;
     void *file_write_iter;
     void *file_fsync;
@@ -142,8 +145,25 @@ typedef enum koboxd_ext4_child_create_kind {
     KOBOXD_EXT4_CREATE_DIRECTORY,
 } koboxd_ext4_child_create_kind_t;
 
+typedef struct koboxd_readdir_scan_entry {
+    char name[KOBOXD_FS_BACKEND_NAME_BYTES];
+} koboxd_readdir_scan_entry_t;
+
+typedef struct koboxd_readdir_scan {
+    koboxd_readdir_scan_entry_t entries[KOBOXD_READDIR_SCAN_MAX_ENTRIES];
+    size_t count;
+    int overflow;
+} koboxd_readdir_scan_t;
+
 static int fs_file_writeback_inode(const koboxd_ext4_operations_t *ops, void *inode, int commit_metadata);
 static int fs_file_fsync(const koboxd_ext4_operations_t *ops, void *inode);
+static int fs_file_read(
+    const koboxd_ext4_operations_t *ops,
+    void *inode,
+    uint64_t offset,
+    void *buffer,
+    size_t length,
+    size_t buffer_capacity);
 
 static void koboxd_fs_lock_init(koboxd_fs_lock_t *lock)
 {
@@ -446,7 +466,6 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
     if (!(module_symbol(module, "ext4_dir_operations", &out_ops->dir_operations) &&
         module_symbol(module, "ext4_file_operations", &out_ops->file_operations) &&
         module_symbol(module, "ext4_dir_inode_operations", &out_ops->dir_inode_operations) &&
-        module_symbol(module, "ext4_readdir", &out_ops->readdir) &&
         module_symbol(module, "ext4_file_read_iter", &out_ops->file_read_iter) &&
         module_symbol(module, "ext4_file_write_iter", &out_ops->file_write_iter) &&
         module_symbol(module, "ext4_sync_file", &out_ops->file_fsync) &&
@@ -782,6 +801,136 @@ static int fs_create_child_object(
         return status;
     }
     fs_mark_metadata_dirty(backend);
+    return 0;
+}
+
+static int fs_readdir_scan_add(koboxd_readdir_scan_t *scan, const char *name, size_t name_len)
+{
+    if (scan == NULL || name == NULL || name_len == 0) {
+        return 1;
+    }
+    if ((name_len == 1 && name[0] == '.') ||
+        (name_len == 2 && name[0] == '.' && name[1] == '.'))
+    {
+        return 1;
+    }
+
+    if (scan->count >= KOBOXD_READDIR_SCAN_MAX_ENTRIES) {
+        scan->overflow = 1;
+        return 0;
+    }
+
+    size_t copy_len = name_len;
+    if (copy_len >= KOBOXD_FS_BACKEND_NAME_BYTES) {
+        copy_len = KOBOXD_FS_BACKEND_NAME_BYTES - 1u;
+    }
+    memcpy(scan->entries[scan->count].name, name, copy_len);
+    scan->entries[scan->count].name[copy_len] = '\0';
+    scan->count++;
+    return 1;
+}
+
+static int fs_scan_ext4_dirent_block(
+    koboxd_readdir_scan_t *scan,
+    const uint8_t *block,
+    size_t bytes)
+{
+    size_t offset = 0;
+    while (offset + KOBOXD_EXT4_DIRENT_HEADER_BYTES <= bytes) {
+        const uint32_t ino = read_u32_field(block + offset, 0);
+        const uint16_t rec_len = read_u16_field(block + offset, 4);
+        const uint8_t name_len = block[offset + 6];
+        if (rec_len < KOBOXD_EXT4_DIRENT_HEADER_BYTES ||
+            offset + rec_len > bytes)
+        {
+            return -5;
+        }
+        if (ino != 0 && name_len > 0 &&
+            (size_t)name_len <= rec_len - KOBOXD_EXT4_DIRENT_HEADER_BYTES)
+        {
+            if (!fs_readdir_scan_add(
+                    scan,
+                    (const char *)block + offset + KOBOXD_EXT4_DIRENT_HEADER_BYTES,
+                    name_len))
+            {
+                return scan->overflow ? -12 : 0;
+            }
+        }
+        offset += rec_len;
+    }
+    return 0;
+}
+
+static int fs_scan_ext4_dir_names(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *dir,
+    koboxd_readdir_scan_t *scan)
+{
+    if (ops == NULL || dir == NULL || dir->inode == NULL || scan == NULL) {
+        return -22;
+    }
+
+    memset(scan, 0, sizeof(*scan));
+
+    /*
+     * Directory entries are ext4 state; the object table is only filed's
+     * capability/cache view.  Read the directory file through the same stable
+     * page-cache path used for normal file I/O and parse ext4_dir_entry_2
+     * records, instead of calling ext4_readdir with an incomplete fake file.
+     */
+    uint64_t size = read_u64_field(dir->inode, KOBOXD_INODE_SIZE_OFFSET);
+    if (size == 0) {
+        return 0;
+    }
+    if (size > KOBOXD_EXT4_DIRENT_SCAN_MAX_BYTES) {
+        return -75;
+    }
+
+    uint8_t block[KOBOXD_EXT4_DIRENT_READ_CHUNK_BYTES];
+    for (uint64_t offset = 0; offset < size; offset += sizeof(block)) {
+        size_t request = sizeof(block);
+        if (request > size - offset) {
+            request = (size_t)(size - offset);
+        }
+        memset(block, 0, sizeof(block));
+        int got = fs_file_read(ops, dir->inode, offset, block, request, sizeof(block));
+        if (got < 0) {
+            return got;
+        }
+        if (got == 0) {
+            break;
+        }
+        int status = fs_scan_ext4_dirent_block(scan, block, (size_t)got);
+        if (status != 0) {
+            return status;
+        }
+        if ((size_t)got < request) {
+            break;
+        }
+    }
+    return scan->overflow ? -12 : 0;
+}
+
+static int fs_populate_dir_cache_from_ext4(
+    koboxd_fs_backend_t *backend,
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *dir)
+{
+    if (backend == NULL || ops == NULL || dir == NULL) {
+        return -22;
+    }
+    koboxd_readdir_scan_t scan;
+    int status = fs_scan_ext4_dir_names(ops, dir, &scan);
+    if (status != 0) {
+        return status;
+    }
+    for (size_t i = 0; i < scan.count; i++) {
+        koboxd_fs_object_t *object = NULL;
+        status = fs_lookup_or_cache_child(backend, ops, dir, scan.entries[i].name, &object);
+        if (status != 0 && status != -2) {
+            return status;
+        }
+    }
     return 0;
 }
 
@@ -1680,10 +1829,22 @@ int koboxd_fs_backend_pwrite(
         (unsigned long long)object_id,
         (unsigned long long)offset,
         length);
+    const uint64_t old_object_size = object->size;
     const uint64_t write_start_ns = fs_now_ns();
     int status = fs_file_write(&ops, object->inode, offset, buffer, length);
     const uint64_t write_end_ns = fs_now_ns();
     if (status >= 0) {
+        uint64_t write_end = offset;
+        if (!__builtin_add_overflow(offset, (uint64_t)status, &write_end)) {
+            if (write_end > old_object_size) {
+                write_u64_field(object->inode, KOBOXD_INODE_SIZE_OFFSET, write_end);
+                write_u64_field(
+                    (uint8_t *)object->inode - KOBOXD_INODE_EXT4_DISKSIZE_BACK_OFFSET,
+                    0,
+                    write_end);
+                fs_mark_object_metadata_dirty(backend, object);
+            }
+        }
         fs_mark_object_data_dirty(object);
         fs_object_refresh(object);
     }
@@ -1725,14 +1886,20 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
         return -22;
     }
     int has_dirty_objects = 0;
+    uint64_t dirty_object_count = 0;
     for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
         const koboxd_fs_object_t *object = &backend->objects[i];
         if (object->used && object->dirty && object->inode != NULL) {
             has_dirty_objects = 1;
-            break;
+            dirty_object_count++;
         }
     }
+    (void)dirty_object_count;
+    KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all begin metadata_dirty=%u dirty_objects=%llu\n",
+        backend->metadata_dirty,
+        (unsigned long long)dirty_object_count);
     if (!backend->metadata_dirty && !has_dirty_objects) {
+        KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all clean\n");
         return 0;
     }
 
@@ -1771,6 +1938,8 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
             return status;
         }
         backend->metadata_dirty = 0;
+        KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done flush_count=%llu status=0\n",
+            (unsigned long long)flush_count);
         KOBOXD_FS_STAGE("[koboxd-fs-stage] op=sync_all flush_count=%llu flush_us=%llu drain_us=%llu commit_us=%llu status=0\n",
             (unsigned long long)flush_count,
             (unsigned long long)flush_us,
@@ -1818,6 +1987,15 @@ int koboxd_fs_backend_getdents(
     }
     if ((dir->mode & KOBOXD_MODE_TYPE_MASK) != 0040000u) {
         return -20;
+    }
+
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+        return -5;
+    }
+    int populate_status = fs_populate_dir_cache_from_ext4(backend, &ops, dir);
+    if (populate_status != 0) {
+        return populate_status;
     }
 
     size_t skipped = 0;

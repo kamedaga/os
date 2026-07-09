@@ -21,6 +21,7 @@ int filed_cached_pwrite(
     uint64_t *out_bytes);
 
 void filed_page_cache_configure(uint64_t active_slots);
+uint64_t filed_page_cache_dirty_count(void);
 int filed_page_cache_flush_object(struct filed_runtime *runtime, uint64_t backend_object);
 void filed_page_cache_invalidate_object(struct filed_runtime *runtime, uint64_t backend_object);
 void filed_dump_cache_metrics(const struct filed_runtime *runtime);

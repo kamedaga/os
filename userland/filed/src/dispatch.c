@@ -8,7 +8,8 @@
 #include "filed/fd_ipc.h"
 #include "filed/exec.h"
 #include "filed/exec_linux_lpr.h"
-#include "filed/ipc_protocol.h"
+#include "filed/payload_v2.h"
+#include "filed/ipc_protocol_v2.h"
 #include "filed/page_cache.h"
 #include "filed/tmpfs_backend.h"
 #include "pacha/abi.h"
@@ -16,7 +17,7 @@
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "personality/linux_lpr.h"
-#include "termd/ipc_protocol.h"
+#include "termd/ipc_protocol_v2.h"
 
 enum {
     FILED_BOOTSTRAP_PATCH_BYTES = 4096,
@@ -25,7 +26,7 @@ enum {
     FILED_EXEC_NETD_SOCKET_ENDPOINT_FD = 241,
     FILED_EXEC_TERMD_TTY_ENDPOINT_FD = 242,
     FILED_EXEC_LPR_BOOTSTRAP_FD = LPR_BOOTSTRAP_FD,
-    FILED_METRIC_OP_MAX = 64,
+    FILED_METRIC_OP_MAX = 0x8000u,
     FILED_PAGE_CACHE_BYTES = 16384,
     FILED_PAGE_CACHE_SLOTS = 64,
     FILED_DIR_CACHE_SLOTS = 32,
@@ -103,7 +104,7 @@ typedef struct filed_dir_cache_slot {
     uint64_t backend_object;
     uint64_t offset;
     uint64_t last_used;
-    koboxd_wire_fs_getdents_t entries;
+    storage_v2_getdents_request_t entries;
 } filed_dir_cache_slot_t;
 
 typedef struct filed_dir_cache {
@@ -120,7 +121,7 @@ typedef struct filed_negative_lookup_cache_slot {
     filed_generation_t parent_dir_generation;
     uint64_t last_used;
     int64_t status;
-    char name[FILED_WIRE_NAME_BYTES];
+    char name[FILED_V2_NAME_BYTES];
 } filed_negative_lookup_cache_slot_t;
 
 typedef struct filed_negative_lookup_cache {
@@ -170,7 +171,7 @@ static int filed_backend_lookup(
 static int filed_backend_statx(
     filed_runtime_t *runtime,
     uint64_t object_id,
-    koboxd_wire_fs_statx_t *out_stat)
+    storage_v2_statx_reply_t *out_stat)
 {
     if (filed_tmpfs_backend_is_object(object_id)) {
         return filed_tmpfs_backend_statx(&runtime->tmpfs, object_id, out_stat);
@@ -435,7 +436,7 @@ static int filed_backend_getdents(
     filed_runtime_t *runtime,
     uint64_t dir_object_id,
     uint64_t offset,
-    koboxd_wire_fs_getdents_t *out_entries)
+    storage_v2_getdents_request_t *out_entries)
 {
     if (filed_tmpfs_backend_is_object(dir_object_id)) {
         return filed_tmpfs_backend_getdents(&runtime->tmpfs, dir_object_id, offset, out_entries);
@@ -532,50 +533,50 @@ static uint64_t filed_read_tsc(void)
 static const char *filed_op_name(uint64_t op)
 {
     switch (op) {
-    case FILED_WIRE_OP_HELLO: return "hello";
-    case FILED_WIRE_OP_ROOT_STAT: return "root_stat";
-    case FILED_WIRE_OP_ROOT_GETDENTS: return "root_getdents";
-    case FILED_WIRE_OP_OPENAT: return "openat";
-    case FILED_WIRE_OP_STAT: return "stat";
-    case FILED_WIRE_OP_UTIMENS: return "utimens";
-    case FILED_WIRE_OP_CHMOD: return "chmod";
-    case FILED_WIRE_OP_PREAD: return "pread";
-    case FILED_WIRE_OP_GETDENTS: return "getdents";
-    case FILED_WIRE_OP_CLOSE: return "close";
-    case FILED_WIRE_OP_EXEC_PATH: return "exec_path";
-    case FILED_WIRE_OP_READ: return "read";
-    case FILED_WIRE_OP_DUP: return "dup";
-    case FILED_WIRE_OP_GET_FLAGS: return "get_flags";
-    case FILED_WIRE_OP_SET_FLAGS: return "set_flags";
-    case FILED_WIRE_OP_PWRITE: return "pwrite";
-    case FILED_WIRE_OP_WRITE: return "write";
-    case FILED_WIRE_OP_FSYNC: return "fsync";
-    case FILED_WIRE_OP_TRUNCATE: return "truncate";
-    case FILED_WIRE_OP_UNLINK: return "unlink";
-    case FILED_WIRE_OP_RENAME: return "rename";
-    case FILED_WIRE_OP_MKDIR: return "mkdir";
-    case FILED_WIRE_OP_RMDIR: return "rmdir";
-    case FILED_WIRE_OP_SYMLINK: return "symlink";
-    case FILED_WIRE_OP_READLINK: return "readlink";
-    case FILED_WIRE_OP_LINK: return "link";
-    case FILED_WIRE_OP_SEEK: return "seek";
-    case FILED_WIRE_OP_DUMP_METRICS: return "dump_metrics";
-    case FILED_WIRE_OP_SET_CACHE_SLOTS: return "set_cache_slots";
-    case FILED_WIRE_OP_CONNECT: return "connect";
-    case FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT: return "set_netd_socket_endpoint";
-    case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT: return "set_termd_tty_endpoint";
-    case FILED_WIRE_OP_PING: return "ping";
-    case FILED_WIRE_OP_FAST_DOORBELL: return "fast_doorbell";
-    case FILED_WIRE_OP_VALIDATE_OPEN_CACHE: return "validate_open_cache";
-    case FILED_WIRE_OP_PWRITE_BATCH: return "pwrite_batch";
-    case FILED_WIRE_OP_WRITE_BATCH: return "write_batch";
-    case FILED_WIRE_OP_PREAD_TO_VMO: return "pread_to_vmo";
-    case FILED_WIRE_OP_FILE_VMO: return "file_vmo";
-    case FILED_WIRE_OP_SYNC_ALL: return "sync_all";
-    case FILED_WIRE_OP_EXEC_SELF: return "exec_self";
-    case FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR:
+    case FILED_V2_OP_HELLO: return "hello";
+    case FILED_V2_OP_VFS_ROOT_STAT: return "root_stat";
+    case FILED_V2_OP_VFS_ROOT_GETDENTS: return "root_getdents";
+    case FILED_V2_OP_VFS_OPENAT: return "openat";
+    case FILED_V2_OP_VFS_STAT: return "stat";
+    case FILED_V2_OP_VFS_UTIMENS: return "utimens";
+    case FILED_V2_OP_VFS_CHMOD: return "chmod";
+    case FILED_V2_OP_VFS_PREAD: return "pread";
+    case FILED_V2_OP_VFS_GETDENTS: return "getdents";
+    case FILED_V2_OP_VFS_CLOSE: return "close";
+    case FILED_V2_OP_EXEC_PATH: return "exec_path";
+    case FILED_V2_OP_VFS_READ: return "read";
+    case FILED_V2_OP_VFS_DUP: return "dup";
+    case FILED_V2_OP_VFS_GET_FLAGS: return "get_flags";
+    case FILED_V2_OP_VFS_SET_FLAGS: return "set_flags";
+    case FILED_V2_OP_VFS_PWRITE: return "pwrite";
+    case FILED_V2_OP_VFS_WRITE: return "write";
+    case FILED_V2_OP_VFS_FSYNC: return "fsync";
+    case FILED_V2_OP_VFS_TRUNCATE: return "truncate";
+    case FILED_V2_OP_VFS_UNLINK: return "unlink";
+    case FILED_V2_OP_VFS_RENAME: return "rename";
+    case FILED_V2_OP_VFS_MKDIR: return "mkdir";
+    case FILED_V2_OP_VFS_RMDIR: return "rmdir";
+    case FILED_V2_OP_VFS_SYMLINK: return "symlink";
+    case FILED_V2_OP_VFS_READLINK: return "readlink";
+    case FILED_V2_OP_VFS_LINK: return "link";
+    case FILED_V2_OP_VFS_SEEK: return "seek";
+    case FILED_V2_OP_DIAG_DUMP_METRICS: return "dump_metrics";
+    case FILED_V2_OP_DIAG_SET_CACHE_SLOTS: return "set_cache_slots";
+    case FILED_V2_OP_SESSION_OPEN: return "connect";
+    case FILED_V2_OP_SERVICE_SET_NETD_SOCKET: return "set_netd_socket_endpoint";
+    case FILED_V2_OP_SERVICE_SET_TERMD_TTY: return "set_termd_tty_endpoint";
+    case FILED_V2_OP_DIAG_PING: return "ping";
+    case FILED_V2_OP_SESSION_DOORBELL: return "fast_doorbell";
+    case FILED_V2_OP_VFS_VALIDATE_OPEN_CACHE: return "validate_open_cache";
+    case FILED_V2_OP_VFS_PWRITE_BATCH: return "pwrite_batch";
+    case FILED_V2_OP_VFS_WRITE_BATCH: return "write_batch";
+    case FILED_V2_OP_VFS_PREAD_TO_VMO: return "pread_to_vmo";
+    case FILED_V2_OP_VFS_FILE_VMO: return "file_vmo";
+    case FILED_V2_OP_VFS_SYNC_ALL: return "sync_all";
+    case FILED_V2_OP_EXEC_SELF: return "exec_self";
+    case FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR:
         return "register_termd_signal_supervisor";
-    case FILED_WIRE_OP_ERROR_GET:
+    case FILED_V2_OP_DIAG_ERROR_GET:
         return "error_get";
     default: return "unknown";
     }
@@ -657,20 +658,20 @@ static void filed_record_fast_op_metric_cycles(
     }
 }
 
-static filed_wire_generation_entry_t *filed_session_generation_entries(
+static filed_v2_generation_entry_t *filed_session_generation_entries(
     const filed_session_t *session,
-    const filed_wire_fast_header_t *header)
+    const filed_v2_fast_header_t *header)
 {
     if (session == NULL ||
         header == NULL ||
         session->page == NULL ||
-        header->generation_offset != FILED_WIRE_FAST_GENERATION_OFFSET ||
-        header->generation_capacity != FILED_WIRE_FAST_GENERATION_CAPACITY ||
-        header->generation_offset + header->generation_capacity * sizeof(filed_wire_generation_entry_t) > session->page_size)
+        header->generation_offset != FILED_V2_FAST_GENERATION_OFFSET ||
+        header->generation_capacity != FILED_V2_FAST_GENERATION_CAPACITY ||
+        header->generation_offset + header->generation_capacity * sizeof(filed_v2_generation_entry_t) > session->page_size)
     {
         return NULL;
     }
-    return (filed_wire_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
+    return (filed_v2_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
 }
 
 static void filed_session_publish_generation(
@@ -687,8 +688,8 @@ static void filed_session_publish_generation(
         return;
     }
 
-    filed_wire_fast_header_t *header = (filed_wire_fast_header_t *)session->page;
-    filed_wire_generation_entry_t *entries =
+    filed_v2_fast_header_t *header = (filed_v2_fast_header_t *)session->page;
+    filed_v2_generation_entry_t *entries =
         filed_session_generation_entries(session, header);
     if (entries == NULL) {
         return;
@@ -708,7 +709,7 @@ static void filed_session_publish_generation(
         free_slot = ((uint64_t)handle_id) % header->generation_capacity;
     }
 
-    filed_wire_generation_entry_t *entry = &entries[free_slot];
+    filed_v2_generation_entry_t *entry = &entries[free_slot];
     ++entry->seq;
     __sync_synchronize();
     entry->handle = handle_id;
@@ -960,7 +961,7 @@ static size_t filed_lookup_name_len(const char *name)
     if (name == NULL) {
         return 0;
     }
-    return strnlen(name, FILED_WIRE_NAME_BYTES);
+    return strnlen(name, FILED_V2_NAME_BYTES);
 }
 
 static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_find(
@@ -972,7 +973,7 @@ static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_find(
     if (parent_backend_object == 0 ||
         name == NULL ||
         name_len == 0 ||
-        name_len >= FILED_WIRE_NAME_BYTES)
+        name_len >= FILED_V2_NAME_BYTES)
     {
         return NULL;
     }
@@ -981,7 +982,7 @@ static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_find(
         if (slot->valid &&
             slot->parent_backend_object == parent_backend_object &&
             slot->parent_dir_generation == parent_dir_generation &&
-            strncmp(slot->name, name, FILED_WIRE_NAME_BYTES) == 0)
+            strncmp(slot->name, name, FILED_V2_NAME_BYTES) == 0)
         {
             return slot;
         }
@@ -1042,7 +1043,7 @@ static void filed_negative_lookup_cache_store(
     if (parent_backend_object == 0 ||
         name == NULL ||
         name_len == 0 ||
-        name_len >= FILED_WIRE_NAME_BYTES ||
+        name_len >= FILED_V2_NAME_BYTES ||
         status == 0)
     {
         return;
@@ -1110,7 +1111,7 @@ static filed_dir_cache_slot_t *filed_dir_cache_choose_slot(void)
 static int filed_dir_cache_get(
     uint64_t backend_object,
     uint64_t offset,
-    koboxd_wire_fs_getdents_t *out_entries)
+    storage_v2_getdents_request_t *out_entries)
 {
     filed_dir_cache_slot_t *slot;
     if (out_entries == NULL) {
@@ -1135,7 +1136,7 @@ static int filed_dir_cache_get(
 static void filed_dir_cache_store(
     uint64_t backend_object,
     uint64_t offset,
-    const koboxd_wire_fs_getdents_t *entries)
+    const storage_v2_getdents_request_t *entries)
 {
     filed_dir_cache_slot_t *slot;
     if (backend_object == 0 || entries == NULL) {
@@ -1211,6 +1212,19 @@ static bool filed_page_cache_object_dirty(uint64_t backend_object)
         }
     }
     return false;
+}
+
+uint64_t filed_page_cache_dirty_count(void)
+{
+    uint64_t count = 0;
+    filed_page_cache_ensure_configured();
+    for (size_t i = 0; i < filed_page_cache.active_slots; ++i) {
+        const filed_page_cache_slot_t *slot = &filed_page_cache.slots[i];
+        if (slot->valid && slot->dirty) {
+            count++;
+        }
+    }
+    return count;
 }
 
 static int filed_page_cache_flush_slot(
@@ -1803,101 +1817,68 @@ static uint64_t filed_error_token(
         text);
 }
 
-static int filed_send_reply_with_error(
+static int filed_send_reply_v2_payload(
     int reply_fd,
-    uint64_t request_id,
+    void *page,
+    const pacha_service_request_header_t *header,
     int64_t status,
     uint64_t result,
-    uint64_t error_token)
+    uint64_t error_token,
+    uint32_t payload_size)
 {
+    const uint64_t reply_result = status < 0 ? error_token : result;
+    if (page != NULL) {
+        pacha_service_reply_header_init(
+            (pacha_service_reply_header_t *)page,
+            header,
+            status,
+            PACHA_SERVICE_ERROR_FILED_VFS,
+            reply_result,
+            status == 0 ? payload_size : 0);
+    }
     const struct pacha_ipc_msg reply = {
-        .word0 = FILED_WIRE_REPLY_MAGIC,
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
-        .word2 = status < 0 ? error_token : result,
-        .word3 = request_id,
+        .word2 = reply_result,
+        .word3 = header != NULL ? header->request_id : 0,
     };
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
     (void)pacha_fd_close(reply_fd);
     return reply_status;
 }
 
-static int filed_send_reply(int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
+static int filed_send_reply_v2(
+    int reply_fd,
+    void *page,
+    const pacha_service_request_header_t *header,
+    int64_t status,
+    uint64_t result,
+    uint64_t error_token)
 {
-    const uint64_t token = status < 0 ?
-        filed_error_token(
-            status,
-            0,
-            PACHA_ERRCONV_STAGE_STATUS_MAP,
-            status,
-            request_id,
-            0,
-            0,
-            0,
-            "filed negative reply") :
-        0;
-    return filed_send_reply_with_error(reply_fd, request_id, status, result, token);
+    return filed_send_reply_v2_payload(reply_fd, page, header, status, result, error_token, 0);
 }
 
-static int filed_send_session_reply(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
+static int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
     const uint64_t token = status < 0 ?
         filed_error_token(
             status,
-            0,
+            FILED_V2_OP_SESSION_DOORBELL,
             PACHA_ERRCONV_STAGE_STATUS_MAP,
             status,
             request_id,
             0,
             0,
             0,
-            "filed session negative reply") :
+            "filed v2 session negative reply") :
         0;
     const struct pacha_ipc_msg reply = {
-        .word0 = FILED_WIRE_REPLY_MAGIC,
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
         .word2 = status < 0 ? token : result,
         .word3 = request_id,
     };
     return filed_ipc_send_wait(channel_fd, &reply);
-}
-
-static int filed_send_vmo_reply(
-    int reply_fd,
-    uint64_t request_id,
-    int64_t status,
-    uint64_t result,
-    int vmo_fd)
-{
-    struct pacha_ipc_fd fd = {
-        .fd = (uint64_t)(uint32_t)vmo_fd,
-        .rights =
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_MAP_READ,
-        .flags = 0,
-        .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
-    };
-    struct pacha_ipc_msg reply = {
-        .word0 = FILED_WIRE_REPLY_MAGIC,
-        .word1 = (uint64_t)status,
-        .word2 = status < 0 ?
-            filed_error_token(
-                status,
-                0,
-                PACHA_ERRCONV_STAGE_STATUS_MAP,
-                status,
-                request_id,
-                0,
-                0,
-                0,
-                "filed vmo negative reply") :
-            result,
-        .word3 = request_id,
-        .fds = status == 0 && vmo_fd >= 16 ? &fd : NULL,
-        .fd_count = status == 0 && vmo_fd >= 16 ? 1u : 0u,
-    };
-    const int reply_status = pacha_ipc_reply(reply_fd, &reply);
-    (void)pacha_fd_close(reply_fd);
-    return reply_status;
 }
 
 static void filed_file_vmo_cache_clear_entry(filed_file_vmo_cache_entry_t *entry)
@@ -1971,7 +1952,7 @@ static filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *
     return &runtime->file_vmo_cache[slot];
 }
 
-static int filed_send_exec_reply(
+static int filed_send_exec_reply_v2(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
@@ -2006,7 +1987,7 @@ static int filed_send_exec_reply(
         },
     };
     struct pacha_ipc_msg reply = {
-        .word0 = FILED_WIRE_REPLY_MAGIC,
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = 0,
         .word2 = (uint64_t)(uint32_t)process_fd,
         .word3 = request_id,
@@ -2026,7 +2007,7 @@ static int filed_send_exec_reply(
     return status;
 }
 
-static int filed_send_exec_self_reply(
+static int filed_send_exec_self_reply_v2(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
@@ -2072,7 +2053,7 @@ static int filed_send_exec_self_reply(
         },
     };
     struct pacha_ipc_msg reply = {
-        .word0 = FILED_WIRE_REPLY_MAGIC,
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = 0,
         .word2 = (uint64_t)(uint32_t)process_fd,
         .word3 = request_id,
@@ -2189,40 +2170,41 @@ static void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved
     filed_dispatch_saved_fd_init(saved);
 }
 
-static int filed_dispatch_exec_default_stdio_valid(const filed_wire_exec_path_t *exec)
+static int filed_dispatch_exec_default_stdio_valid(const filed_v2_exec_path_t *exec)
 {
     if (exec == NULL) {
         return 0;
     }
     const int wants_default_stdio =
-        (exec->flags & FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO) != 0;
+        (exec->flags & FILED_V2_EXEC_LINUX_DEFAULT_STDIO) != 0;
     if (!wants_default_stdio) {
-        return filed_wire_exec_string_ref_empty(exec->ctty);
+        return filed_v2_exec_string_ref_empty(exec->ctty);
     }
-    if ((exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) !=
-        (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    if ((exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) !=
+        (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
     {
         return 0;
     }
-    return filed_wire_exec_string_ref_valid(exec, exec->ctty);
+    return filed_v2_exec_string_ref_valid(exec, exec->ctty);
 }
 
-static const filed_wire_exec_lpr_fd_t *filed_dispatch_lpr_fd_table_entries(
-    const filed_wire_exec_lpr_fd_table_t *table)
+static const filed_v2_exec_lpr_fd_t *filed_dispatch_lpr_fd_table_entries(
+    const filed_v2_exec_lpr_fd_table_t *table)
 {
-    return (const filed_wire_exec_lpr_fd_t *)((const unsigned char *)table + sizeof(*table));
+    return (const filed_v2_exec_lpr_fd_t *)((const unsigned char *)table + sizeof(*table));
 }
 
-static int filed_dispatch_lpr_fd_desc_valid(const filed_wire_exec_lpr_fd_t *fd)
+static int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
 {
     if (fd == NULL || fd->fd > LPR_LINUX_FD_MAX) {
         return 0;
     }
     switch (fd->kind) {
-    case FILED_WIRE_EXEC_LPR_FD_FILED:
-    case FILED_WIRE_EXEC_LPR_FD_TTY:
+    case FILED_V2_EXEC_LPR_FD_FILED:
+    case FILED_V2_EXEC_LPR_FD_TTY:
         return fd->handle != 0;
-    case FILED_WIRE_EXEC_LPR_FD_EVENT:
+    case FILED_V2_EXEC_LPR_FD_PIPE:
+    case FILED_V2_EXEC_LPR_FD_EVENT:
         return 1;
     default:
         return 0;
@@ -2230,27 +2212,27 @@ static int filed_dispatch_lpr_fd_desc_valid(const filed_wire_exec_lpr_fd_t *fd)
 }
 
 static int filed_dispatch_exec_lpr_fd_table_valid(
-    const filed_wire_exec_path_t *exec,
-    const filed_wire_exec_lpr_fd_table_t *table,
+    const filed_v2_exec_path_t *exec,
+    const filed_v2_exec_lpr_fd_table_t *table,
     int allow_table)
 {
     if (exec == NULL) {
         return 0;
     }
-    const int wants_table = (exec->flags & FILED_WIRE_EXEC_LPR_FD_TABLE) != 0;
+    const int wants_table = (exec->flags & FILED_V2_EXEC_LPR_FD_TABLE) != 0;
     if (!wants_table) {
         return exec->lpr_fd_table_bytes == 0 && table == NULL;
     }
     if (!allow_table ||
         table == NULL ||
         exec->lpr_fd_table_bytes < sizeof(*table) ||
-        (exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) !=
-            (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+        (exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) !=
+            (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
     {
         return 0;
     }
-    if (table->magic != FILED_WIRE_EXEC_LPR_FD_TABLE_MAGIC ||
-        table->version != FILED_WIRE_EXEC_LPR_FD_TABLE_VERSION ||
+    if (table->magic != FILED_V2_EXEC_LPR_FD_TABLE_MAGIC ||
+        table->version != FILED_V2_EXEC_LPR_FD_TABLE_VERSION ||
         table->reserved0 != 0 ||
         table->reserved1 != 0 ||
         table->byte_size < sizeof(*table) ||
@@ -2259,16 +2241,16 @@ static int filed_dispatch_exec_lpr_fd_table_valid(
         return 0;
     }
     if (table->fd_count > LPR_LINUX_FD_LIMIT ||
-        table->fd_count > (UINT64_MAX - sizeof(*table)) / sizeof(filed_wire_exec_lpr_fd_t))
+        table->fd_count > (UINT64_MAX - sizeof(*table)) / sizeof(filed_v2_exec_lpr_fd_t))
     {
         return 0;
     }
     const uint64_t expected_size =
-        sizeof(*table) + table->fd_count * sizeof(filed_wire_exec_lpr_fd_t);
+        sizeof(*table) + table->fd_count * sizeof(filed_v2_exec_lpr_fd_t);
     if (table->byte_size != expected_size) {
         return 0;
     }
-    const filed_wire_exec_lpr_fd_t *entries = filed_dispatch_lpr_fd_table_entries(table);
+    const filed_v2_exec_lpr_fd_t *entries = filed_dispatch_lpr_fd_table_entries(table);
     for (uint64_t i = 0; i < table->fd_count; ++i) {
         if (!filed_dispatch_lpr_fd_desc_valid(&entries[i])) {
             return 0;
@@ -2281,8 +2263,8 @@ static int filed_dispatch_exec_lpr_fd_table_valid(
 }
 
 static int filed_dispatch_create_lpr_bootstrap_fd(
-    const filed_wire_exec_path_t *exec,
-    const filed_wire_exec_lpr_fd_table_t *fd_table)
+    const filed_v2_exec_path_t *exec,
+    const filed_v2_exec_lpr_fd_table_t *fd_table)
 {
     if (exec == NULL) {
         return -22;
@@ -2336,7 +2318,7 @@ static int filed_dispatch_create_lpr_bootstrap_fd(
         bootstrap->flags |= LPR_BOOTSTRAP_FLAG_SUPERVISOR;
     }
     if (fd_table != NULL && local_fd_count != 0) {
-        const filed_wire_exec_lpr_fd_t *in = filed_dispatch_lpr_fd_table_entries(fd_table);
+        const filed_v2_exec_lpr_fd_t *in = filed_dispatch_lpr_fd_table_entries(fd_table);
         lpr_bootstrap_fd_t *out =
             (lpr_bootstrap_fd_t *)((unsigned char *)bootstrap + bootstrap->local_fd_table_offset);
         for (uint64_t i = 0; i < local_fd_count; ++i) {
@@ -2347,15 +2329,15 @@ static int filed_dispatch_create_lpr_bootstrap_fd(
             out[i].offset_or_counter = in[i].offset_or_counter;
         }
     }
-    if ((exec->flags & FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO) != 0) {
+    if ((exec->flags & FILED_V2_EXEC_LINUX_DEFAULT_STDIO) != 0) {
         bootstrap->flags |= LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO;
-        const char *ctty = filed_wire_exec_string(exec, exec->ctty);
+        const char *ctty = filed_v2_exec_string(exec, exec->ctty);
         if (ctty != NULL) {
             snprintf(bootstrap->ctty, sizeof(bootstrap->ctty), "%s", ctty);
         }
     }
-    if (!filed_wire_exec_string_ref_empty(exec->cwd)) {
-        const char *cwd = filed_wire_exec_string(exec, exec->cwd);
+    if (!filed_v2_exec_string_ref_empty(exec->cwd)) {
+        const char *cwd = filed_v2_exec_string(exec, exec->cwd);
         if (cwd != NULL) {
             snprintf(bootstrap->cwd, sizeof(bootstrap->cwd), "%s", cwd);
         }
@@ -2634,47 +2616,47 @@ static filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind)
     }
 }
 
-static uint32_t filed_wire_rights_to_vfs(uint64_t rights)
+static uint32_t filed_v2_rights_to_vfs(uint64_t rights)
 {
     const uint64_t known =
-        FILED_WIRE_RIGHT_LOOKUP |
-        FILED_WIRE_RIGHT_READ |
-        FILED_WIRE_RIGHT_WRITE |
-        FILED_WIRE_RIGHT_EXEC |
-        FILED_WIRE_RIGHT_STAT |
-        FILED_WIRE_RIGHT_GETDENTS |
-        FILED_WIRE_RIGHT_CREATE |
-        FILED_WIRE_RIGHT_REMOVE |
-        FILED_WIRE_RIGHT_RENAME;
+        FILED_V2_RIGHT_LOOKUP |
+        FILED_V2_RIGHT_READ |
+        FILED_V2_RIGHT_WRITE |
+        FILED_V2_RIGHT_EXEC |
+        FILED_V2_RIGHT_STAT |
+        FILED_V2_RIGHT_GETDENTS |
+        FILED_V2_RIGHT_CREATE |
+        FILED_V2_RIGHT_REMOVE |
+        FILED_V2_RIGHT_RENAME;
     return (uint32_t)(rights & known);
 }
 
-static uint32_t filed_wire_open_flags_to_vfs(uint64_t flags)
+static uint32_t filed_v2_open_flags_to_vfs(uint64_t flags)
 {
     const uint64_t known =
-        FILED_WIRE_OPEN_CREATE |
-        FILED_WIRE_OPEN_EXCLUSIVE |
-        FILED_WIRE_OPEN_TRUNCATE |
-        FILED_WIRE_OPEN_DIRECTORY |
-        FILED_WIRE_OPEN_NOFOLLOW |
-        FILED_WIRE_OPEN_CLOEXEC |
-        FILED_WIRE_OPEN_APPEND |
-        FILED_WIRE_OPEN_NONBLOCK |
-        FILED_WIRE_OPEN_SYNC;
+        FILED_V2_OPEN_CREATE |
+        FILED_V2_OPEN_EXCLUSIVE |
+        FILED_V2_OPEN_TRUNCATE |
+        FILED_V2_OPEN_DIRECTORY |
+        FILED_V2_OPEN_NOFOLLOW |
+        FILED_V2_OPEN_CLOEXEC |
+        FILED_V2_OPEN_APPEND |
+        FILED_V2_OPEN_NONBLOCK |
+        FILED_V2_OPEN_SYNC;
     return (uint32_t)(flags & known);
 }
 
-static uint32_t filed_wire_fd_flags_to_vfs(uint64_t flags)
+static uint32_t filed_v2_fd_flags_to_vfs(uint64_t flags)
 {
-    return (uint32_t)(flags & FILED_WIRE_FD_CLOEXEC);
+    return (uint32_t)(flags & FILED_V2_FD_CLOEXEC);
 }
 
-static uint32_t filed_wire_file_status_flags_to_vfs(uint64_t flags)
+static uint32_t filed_v2_file_status_flags_to_vfs(uint64_t flags)
 {
     const uint64_t known =
-        FILED_WIRE_FILE_APPEND |
-        FILED_WIRE_FILE_NONBLOCK |
-        FILED_WIRE_FILE_SYNC;
+        FILED_V2_FILE_APPEND |
+        FILED_V2_FILE_NONBLOCK |
+        FILED_V2_FILE_SYNC;
     return (uint32_t)(flags & known);
 }
 
@@ -2692,13 +2674,13 @@ static uint64_t filed_vfs_file_status_flags_to_wire(uint32_t flags)
     return (uint64_t)(flags & known);
 }
 
-static int filed_wire_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
+static int filed_v2_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
 {
-    const uint64_t known_fd = FILED_WIRE_FD_CLOEXEC;
+    const uint64_t known_fd = FILED_V2_FD_CLOEXEC;
     const uint64_t known_status =
-        FILED_WIRE_FILE_APPEND |
-        FILED_WIRE_FILE_NONBLOCK |
-        FILED_WIRE_FILE_SYNC;
+        FILED_V2_FILE_APPEND |
+        FILED_V2_FILE_NONBLOCK |
+        FILED_V2_FILE_SYNC;
     return (fd_flags & ~known_fd) == 0 && (status_flags & ~known_status) == 0;
 }
 
@@ -2744,8 +2726,8 @@ static filed_page_dispatch_result_t filed_page_result(int64_t status, uint64_t r
 }
 
 static int filed_write_stat_from_backend(
-    filed_wire_statx_t *out,
-    const koboxd_wire_fs_statx_t *stat,
+    filed_v2_statx_t *out,
+    const storage_v2_statx_reply_t *stat,
     uint64_t handle_id,
     uint64_t object_generation,
     uint64_t dir_generation)
@@ -2772,7 +2754,7 @@ static int filed_write_stat_from_backend(
 }
 
 static filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
-    const koboxd_wire_fs_statx_t *stat,
+    const storage_v2_statx_reply_t *stat,
     uint64_t handle_id,
     uint64_t object_generation,
     uint64_t dir_generation)
@@ -2844,7 +2826,7 @@ static filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(
 }
 
 static int filed_write_stat_from_snapshot(
-    filed_wire_statx_t *out,
+    filed_v2_statx_t *out,
     const filed_vfs_stat_snapshot_t *snapshot,
     uint64_t handle_id)
 {
@@ -2881,159 +2863,6 @@ static int filed_backend_object_for_handle(
     }
     filed_status_t status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, out_decision);
     return filed_status_to_wire(status);
-}
-
-static int filed_dispatch_root_stat(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    filed_wire_statx_t *stat = (filed_wire_statx_t *)page;
-    filed_vfs_io_decision_t decision;
-    filed_vfs_stat_snapshot_t snapshot;
-    koboxd_wire_fs_statx_t backend_stat;
-    filed_status_t vfs_status = filed_vfs_stat_prepare(
-        &runtime->vfs,
-        runtime->root_handle_id,
-        &decision);
-    int64_t reply_status = filed_status_to_wire(vfs_status);
-    uint64_t result = 0;
-    if (vfs_status == FILED_OK) {
-        memset(&snapshot, 0, sizeof(snapshot));
-        vfs_status = filed_vfs_get_stat_snapshot(
-            &runtime->vfs,
-            runtime->root_handle_id,
-            &snapshot);
-        reply_status = filed_status_to_wire(vfs_status);
-        if (vfs_status == FILED_OK && snapshot.valid) {
-            (void)filed_write_stat_from_snapshot(stat, &snapshot, runtime->root_handle_id);
-            result = snapshot.size;
-        } else if (vfs_status == FILED_OK) {
-        memset(&backend_stat, 0, sizeof(backend_stat));
-        reply_status = filed_backend_statx(
-            runtime,
-            decision.backend_object,
-            &backend_stat);
-        if (reply_status == 0) {
-            snapshot = filed_stat_snapshot_from_backend(
-                &backend_stat,
-                runtime->root_handle_id,
-                decision.object_generation,
-                decision.dir_generation);
-            (void)filed_vfs_update_stat_snapshot(
-                &runtime->vfs,
-                decision.backend_object,
-                &snapshot);
-            (void)filed_write_stat_from_backend(
-                stat,
-                &backend_stat,
-                runtime->root_handle_id,
-                decision.object_generation,
-                decision.dir_generation);
-            result = backend_stat.size;
-        }
-        }
-    }
-
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, result);
-}
-
-static int filed_dispatch_root_getdents(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    filed_wire_getdents_t *out = (filed_wire_getdents_t *)page;
-    koboxd_wire_fs_getdents_t backend_entries;
-    memset(&backend_entries, 0, sizeof(backend_entries));
-    backend_entries.capacity = FILED_WIRE_DIRENT_CAPACITY;
-
-    filed_vfs_io_decision_t decision;
-    filed_status_t vfs_status = filed_vfs_getdents_prepare(
-        &runtime->vfs,
-        runtime->root_handle_id,
-        &decision);
-    bool splice_tmpfs = false;
-    uint64_t backend_offset = 0;
-    if (vfs_status == FILED_OK) {
-        splice_tmpfs = filed_root_getdents_splices_tmpfs(runtime, decision.backend_object);
-        backend_offset = filed_root_getdents_backend_offset(
-            runtime,
-            decision.backend_object,
-            decision.offset);
-    }
-    int64_t reply_status = filed_status_to_wire(vfs_status);
-    uint64_t result = 0;
-    if (vfs_status == FILED_OK &&
-        !filed_dir_cache_get(decision.backend_object, backend_offset, &backend_entries))
-    {
-        reply_status = filed_backend_getdents(
-            runtime,
-            decision.backend_object,
-            backend_offset,
-            &backend_entries);
-        if (reply_status == 0) {
-            filed_dir_cache_store(decision.backend_object, backend_offset, &backend_entries);
-        }
-    }
-    if (reply_status == 0) {
-        const uint64_t backend_start = splice_tmpfs && decision.offset == 0 ? 1u : 0u;
-        const uint64_t backend_capacity = FILED_WIRE_DIRENT_CAPACITY - backend_start;
-        const uint64_t backend_count =
-            backend_entries.count > backend_capacity ?
-                backend_capacity :
-                backend_entries.count;
-        const uint64_t count = backend_start + backend_count;
-        memset(out, 0, sizeof(*out));
-        out->dir_handle = runtime->root_handle_id;
-        out->offset = decision.offset;
-        out->count = count;
-        out->dir_generation = decision.dir_generation;
-        if (backend_start != 0) {
-            out->entries[0].handle = 0;
-            out->entries[0].kind = 0040000u;
-            out->entries[0].name_len = 3;
-            snprintf(
-                out->entries[0].name,
-                sizeof(out->entries[0].name),
-                "%s",
-                "tmp");
-        }
-        for (uint64_t i = 0; i < backend_count; ++i) {
-            const uint64_t out_index = backend_start + i;
-            out->entries[out_index].handle = 0;
-            out->entries[out_index].kind = backend_entries.entries[i].kind;
-            out->entries[out_index].name_len = backend_entries.entries[i].name_len;
-            snprintf(
-                out->entries[out_index].name,
-                sizeof(out->entries[out_index].name),
-                "%s",
-                backend_entries.entries[i].name);
-        }
-        result = count;
-        vfs_status = filed_vfs_getdents_commit(&runtime->vfs, runtime->root_handle_id, count);
-        if (vfs_status != FILED_OK) {
-            reply_status = filed_status_to_wire(vfs_status);
-        }
-    }
-
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, reply_status, result);
 }
 
 static int filed_name_is_terminated(const char *name, size_t capacity)
@@ -3105,7 +2934,7 @@ static int64_t filed_lookup_component_stat(
     filed_handle_id_t parent_handle,
     const char *name,
     uint64_t *out_object_id,
-    koboxd_wire_fs_statx_t *out_stat)
+    storage_v2_statx_reply_t *out_stat)
 {
     filed_vfs_io_decision_t parent_decision;
     filed_status_t status;
@@ -3135,7 +2964,7 @@ static int64_t filed_splice_symlink_target(
     char *out_path,
     size_t out_path_size)
 {
-    char target[FILED_WIRE_SYMLINK_TARGET_BYTES];
+    char target[FILED_V2_SYMLINK_TARGET_BYTES];
     uint64_t target_length = 0;
     int64_t reply_status;
     size_t rest_length;
@@ -3191,7 +3020,7 @@ static int64_t filed_resolve_parent_path(
     filed_handle_id_t current_handle;
     int current_owned = 0;
     unsigned int symlink_budget = 16;
-    char symlink_path[FILED_WIRE_PATH_BYTES];
+    char symlink_path[FILED_V2_PATH_BYTES];
 
     if (runtime == NULL ||
         path == NULL ||
@@ -3222,7 +3051,7 @@ static int64_t filed_resolve_parent_path(
     }
 
     for (;;) {
-        char component[FILED_WIRE_NAME_BYTES];
+        char component[FILED_V2_NAME_BYTES];
         const char *component_start;
         const char *after_slashes;
         size_t component_len;
@@ -3317,7 +3146,7 @@ static int64_t filed_resolve_parent_path(
             filed_vfs_open_result_t next_open;
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
-            koboxd_wire_fs_statx_t stat;
+            storage_v2_statx_reply_t stat;
             int64_t symlink_status;
             if (filed_path_is_single_component(after_slashes)) {
                 next_rights |= parent_rights;
@@ -3384,7 +3213,7 @@ static int64_t filed_lookup_and_open_component(
 {
     filed_vfs_io_decision_t parent_decision;
     uint64_t object_id = 0;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
     filed_status_t status;
     int64_t reply_status;
     const bool can_use_negative_lookup_cache =
@@ -3562,11 +3391,11 @@ static int64_t filed_lookup_and_open_component(
 
 static int64_t filed_openat_path(
     filed_runtime_t *runtime,
-    const filed_wire_openat_t *openat,
+    const filed_v2_openat_t *openat,
     filed_vfs_open_result_t *out_open)
 {
-    const uint32_t rights = filed_wire_rights_to_vfs(openat->rights);
-    const uint32_t open_flags = filed_wire_open_flags_to_vfs(openat->open_flags);
+    const uint32_t rights = filed_v2_rights_to_vfs(openat->rights);
+    const uint32_t open_flags = filed_v2_open_flags_to_vfs(openat->open_flags);
     const char *path = openat->name;
     const int absolute = path[0] == '/';
     filed_handle_id_t current_handle =
@@ -3575,7 +3404,7 @@ static int64_t filed_openat_path(
             (filed_handle_id_t)(uint32_t)openat->dir_handle;
     int current_owned = 0;
     unsigned int symlink_budget = 16;
-    char symlink_path[FILED_WIRE_PATH_BYTES];
+    char symlink_path[FILED_V2_PATH_BYTES];
 
     if (path[0] == '\0') {
         return filed_status_to_wire(FILED_ERR_INVALID);
@@ -3595,7 +3424,7 @@ static int64_t filed_openat_path(
     }
 
     for (;;) {
-        char component[FILED_WIRE_NAME_BYTES];
+        char component[FILED_V2_NAME_BYTES];
         const char *component_start;
         const char *after_slashes;
         size_t component_len;
@@ -3686,7 +3515,7 @@ static int64_t filed_openat_path(
             filed_vfs_open_result_t next_open;
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
-            koboxd_wire_fs_statx_t stat;
+            storage_v2_statx_reply_t stat;
             int64_t symlink_status;
             if ((open_flags & FILED_OPEN_CREATE) != 0 &&
                 filed_path_is_single_component(after_slashes))
@@ -3749,7 +3578,7 @@ static filed_page_dispatch_result_t filed_dispatch_openat_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_openat_t *openat = (filed_wire_openat_t *)page;
+    filed_v2_openat_t *openat = (filed_v2_openat_t *)page;
     filed_vfs_open_result_t open_result;
     int64_t reply_status = -22;
     uint64_t result = 0;
@@ -3776,11 +3605,11 @@ static filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_validate_open_cache_t *validate =
-        (filed_wire_validate_open_cache_t *)page;
+    filed_v2_validate_open_cache_t *validate =
+        (filed_v2_validate_open_cache_t *)page;
     filed_vfs_io_decision_t cached_decision;
     filed_vfs_open_result_t fresh_open;
-    filed_wire_openat_t openat;
+    filed_v2_openat_t openat;
     uint64_t valid = 0;
 
     if (runtime == NULL || validate == NULL) {
@@ -3832,7 +3661,7 @@ static filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
         fresh_open.object_generation == validate->object_generation &&
         cached_decision.object_generation == validate->object_generation)
     {
-        if ((validate->open_flags & FILED_WIRE_OPEN_DIRECTORY) == 0 ||
+        if ((validate->open_flags & FILED_V2_OPEN_DIRECTORY) == 0 ||
             (validate->dir_generation != 0 &&
                 fresh_open.dir_generation == validate->dir_generation &&
                 cached_decision.dir_generation == validate->dir_generation))
@@ -3847,49 +3676,14 @@ static filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
     return filed_page_result(0, valid);
 }
 
-static int filed_dispatch_openat(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_openat_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
-static int filed_dispatch_validate_open_cache(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result =
-        filed_dispatch_validate_open_cache_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_stat_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_statx_t *wire_stat = (filed_wire_statx_t *)page;
+    filed_v2_statx_t *wire_stat = (filed_v2_statx_t *)page;
     filed_vfs_io_decision_t decision;
     filed_vfs_stat_snapshot_t snapshot;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
     const uint64_t handle_id = wire_stat->handle;
     filed_status_t status = filed_vfs_stat_prepare(
         &runtime->vfs,
@@ -3959,32 +3753,15 @@ static filed_page_dispatch_result_t filed_dispatch_stat_page(
     return filed_page_result(reply_status, result);
 }
 
-static int filed_dispatch_stat(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_stat_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_utimens_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_utimens_t *utimens = (filed_wire_utimens_t *)page;
+    filed_v2_utimens_t *utimens = (filed_v2_utimens_t *)page;
     if (runtime == NULL || utimens == NULL) {
         return filed_page_result(-22, 0);
     }
-    if ((utimens->mask & ~((uint64_t)FILED_WIRE_UTIMENS_ATIME | (uint64_t)FILED_WIRE_UTIMENS_MTIME)) != 0) {
+    if ((utimens->mask & ~((uint64_t)FILED_V2_UTIMENS_ATIME | (uint64_t)FILED_V2_UTIMENS_MTIME)) != 0) {
         return filed_page_result(-22, 0);
     }
     filed_vfs_io_decision_t decision;
@@ -4017,30 +3794,13 @@ static filed_page_dispatch_result_t filed_dispatch_utimens_page(
     return filed_page_result(filed_status_to_wire(status), 0);
 }
 
-static int filed_dispatch_utimens(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_utimens_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static int filed_ensure_stat_snapshot(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id)
 {
     filed_vfs_io_decision_t decision;
     filed_vfs_stat_snapshot_t snapshot;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
     filed_status_t status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, &decision);
     if (status != FILED_OK) {
         return filed_status_to_wire(status);
@@ -4077,7 +3837,7 @@ static filed_page_dispatch_result_t filed_dispatch_chmod_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_chmod_t *chmod_req = (filed_wire_chmod_t *)page;
+    filed_v2_chmod_t *chmod_req = (filed_v2_chmod_t *)page;
     if (runtime == NULL || chmod_req == NULL || chmod_req->reserved0 != 0 || chmod_req->reserved1 != 0) {
         return filed_page_result(-22, 0);
     }
@@ -4109,28 +3869,11 @@ static filed_page_dispatch_result_t filed_dispatch_chmod_page(
     return filed_page_result(filed_status_to_wire(vfs_status), 0);
 }
 
-static int filed_dispatch_chmod(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_chmod_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_pread_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    filed_v2_io_t *io = (filed_v2_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_pread_prepare(
@@ -4142,8 +3885,8 @@ static filed_page_dispatch_result_t filed_dispatch_pread_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_WIRE_IO_BYTES) {
-            length = FILED_WIRE_IO_BYTES;
+        if (length > FILED_V2_IO_BYTES) {
+            length = FILED_V2_IO_BYTES;
         }
         reply_status = filed_cached_pread(
             runtime,
@@ -4164,29 +3907,12 @@ static filed_page_dispatch_result_t filed_dispatch_pread_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static int filed_dispatch_pread(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_pread_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
     filed_runtime_t *runtime,
     void *page,
     int vmo_fd)
 {
-    filed_wire_pread_vmo_t *pread_vmo = (filed_wire_pread_vmo_t *)page;
+    filed_v2_pread_vmo_t *pread_vmo = (filed_v2_pread_vmo_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
 
@@ -4243,33 +3969,6 @@ static filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
             decision.dir_generation);
     }
     return filed_page_result(reply_status, bytes);
-}
-
-static int filed_dispatch_pread_to_vmo(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    if (request == NULL ||
-        request->fd_count < 1 ||
-        request->fds == NULL ||
-        request->fds[1].fd < 16)
-    {
-        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
-    }
-
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const int vmo_fd = (int)request->fds[1].fd;
-    const filed_page_dispatch_result_t result = filed_dispatch_pread_to_vmo_page(runtime, page, vmo_fd);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    (void)pacha_fd_close(vmo_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
 static filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
@@ -4331,22 +4030,27 @@ static filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
     return filed_page_result(0, bytes);
 }
 
-static int filed_dispatch_file_vmo(
+static int filed_dispatch_file_vmo_v2(
     filed_runtime_t *runtime,
     int reply_fd,
-    const struct pacha_ipc_msg *request)
+    const struct pacha_ipc_msg *request,
+    void *reply_page,
+    const pacha_service_request_header_t *header)
 {
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
+    if (runtime == NULL ||
+        request == NULL ||
+        reply_page == NULL ||
+        header == NULL ||
+        header->payload_size < sizeof(filed_v2_file_vmo_request_t))
+    {
+        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    filed_wire_file_vmo_t *file_vmo = (filed_wire_file_vmo_t *)page;
+    const filed_v2_file_vmo_request_t *file_vmo =
+        (const filed_v2_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
     filed_page_dispatch_result_t result = filed_page_result(-22, 0);
     filed_file_vmo_cache_entry_t *entry = NULL;
-    if (runtime != NULL &&
-        file_vmo->length != 0 &&
+    if (file_vmo->length != 0 &&
         file_vmo->length <= FILED_FILE_VMO_MAX_BYTES &&
         file_vmo->reserved0 == 0 &&
         file_vmo->reserved1 == 0 &&
@@ -4389,21 +4093,54 @@ static int filed_dispatch_file_vmo(
         }
     }
 
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_vmo_reply(
-        reply_fd,
-        request->word3,
+    pacha_service_reply_header_init(
+        (pacha_service_reply_header_t *)reply_page,
+        header,
         result.status,
-        result.result,
-        entry != NULL ? entry->vmo_fd : -1);
+        PACHA_SERVICE_ERROR_FILED_VFS,
+        result.status < 0 ? 0 : result.result,
+        0);
+    struct pacha_ipc_fd fd = {
+        .fd = (uint64_t)(uint32_t)(entry != NULL ? entry->vmo_fd : -1),
+        .rights =
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ,
+        .flags = 0,
+        .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
+    };
+    struct pacha_ipc_msg reply = {
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
+        .word1 = (uint64_t)result.status,
+        .word2 = result.status < 0 ? 0 : result.result,
+        .word3 = header->request_id,
+        .fds = result.status == 0 && entry != NULL && entry->vmo_fd >= 16 ? &fd : NULL,
+        .fd_count = result.status == 0 && entry != NULL && entry->vmo_fd >= 16 ? 1u : 0u,
+    };
+    if (result.status < 0) {
+        const uint64_t token = filed_error_token(
+            result.status,
+            header->op,
+            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            result.status,
+            header->request_id,
+            request->fd_count,
+            file_vmo->handle,
+            0,
+            "filed v2 file-vmo negative reply");
+        pacha_service_reply_header_t *reply_header = (pacha_service_reply_header_t *)reply_page;
+        reply_header->result = token;
+        reply.word2 = token;
+    }
+    const int reply_status = pacha_ipc_reply(reply_fd, &reply);
+    (void)pacha_fd_close(reply_fd);
+    return reply_status;
 }
 
 static filed_page_dispatch_result_t filed_dispatch_read_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    filed_v2_io_t *io = (filed_v2_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_read_prepare(
@@ -4414,8 +4151,8 @@ static filed_page_dispatch_result_t filed_dispatch_read_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_WIRE_IO_BYTES) {
-            length = FILED_WIRE_IO_BYTES;
+        if (length > FILED_V2_IO_BYTES) {
+            length = FILED_V2_IO_BYTES;
         }
         reply_status = filed_cached_pread(
             runtime,
@@ -4444,28 +4181,11 @@ static filed_page_dispatch_result_t filed_dispatch_read_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static int filed_dispatch_read(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_read_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    filed_v2_io_t *io = (filed_v2_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_pwrite_prepare(
@@ -4477,12 +4197,12 @@ static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_WIRE_IO_BYTES) {
-            length = FILED_WIRE_IO_BYTES;
+        if (length > FILED_V2_IO_BYTES) {
+            length = FILED_V2_IO_BYTES;
         }
         if (decision.offset == UINT64_MAX) {
             filed_vfs_stat_snapshot_t snapshot;
-            koboxd_wire_fs_statx_t backend_stat;
+            storage_v2_statx_reply_t backend_stat;
             memset(&snapshot, 0, sizeof(snapshot));
             status = filed_vfs_get_stat_snapshot(
                 &runtime->vfs,
@@ -4542,28 +4262,11 @@ static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static int filed_dispatch_pwrite(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_pwrite_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_write_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_io_t *io = (filed_wire_io_t *)page;
+    filed_v2_io_t *io = (filed_v2_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_write_prepare(
@@ -4574,12 +4277,12 @@ static filed_page_dispatch_result_t filed_dispatch_write_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_WIRE_IO_BYTES) {
-            length = FILED_WIRE_IO_BYTES;
+        if (length > FILED_V2_IO_BYTES) {
+            length = FILED_V2_IO_BYTES;
         }
         if (decision.offset == UINT64_MAX) {
             filed_vfs_stat_snapshot_t snapshot;
-            koboxd_wire_fs_statx_t backend_stat;
+            storage_v2_statx_reply_t backend_stat;
             memset(&snapshot, 0, sizeof(snapshot));
             status = filed_vfs_get_stat_snapshot(
                 &runtime->vfs,
@@ -4646,28 +4349,11 @@ static filed_page_dispatch_result_t filed_dispatch_write_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static int filed_dispatch_write(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_write_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_seek_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_seek_t *seek = (filed_wire_seek_t *)page;
+    filed_v2_seek_t *seek = (filed_v2_seek_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t file_size = 0;
     int64_t new_offset = 0;
@@ -4693,7 +4379,7 @@ static filed_page_dispatch_result_t filed_dispatch_seek_page(
             if (status == FILED_OK && snapshot.valid) {
                 file_size = snapshot.size;
             } else if (status == FILED_OK) {
-                koboxd_wire_fs_statx_t backend_stat;
+                storage_v2_statx_reply_t backend_stat;
                 memset(&backend_stat, 0, sizeof(backend_stat));
                 reply_status = filed_backend_statx(
                     runtime,
@@ -4730,23 +4416,6 @@ static filed_page_dispatch_result_t filed_dispatch_seek_page(
     return filed_page_result(reply_status, reply_status == 0 ? (uint64_t)new_offset : 0);
 }
 
-static int filed_dispatch_seek(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_seek_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_fsync_page(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request)
@@ -4769,20 +4438,39 @@ static filed_page_dispatch_result_t filed_dispatch_fsync_page(
     return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_fsync(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
+int filed_dispatch_sync_all(filed_runtime_t *runtime)
 {
-    const filed_page_dispatch_result_t result = filed_dispatch_fsync_page(runtime, request);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
+    if (runtime == NULL) {
+        return -22;
+    }
+
+    const uint64_t dirty_count = filed_page_cache_dirty_count();
+    const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
+    const int flush_status = filed_page_cache_flush_object(runtime, 0);
+    if (flush_status != 0) {
+        printf(
+            "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu status=%d\n",
+            (unsigned long long)dirty_count,
+            (unsigned long long)backend_dirty_hint,
+            flush_status);
+        fflush(stdout);
+        return flush_status;
+    }
+    const int backend_status = filed_kobox_backend_sync_all(&runtime->backend);
+    printf(
+        "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu backend_status=%d\n",
+        (unsigned long long)dirty_count,
+        (unsigned long long)backend_dirty_hint,
+        backend_status);
+    fflush(stdout);
+    return backend_status;
 }
 
 static filed_page_dispatch_result_t filed_dispatch_truncate_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_truncate_t *truncate = (filed_wire_truncate_t *)page;
+    filed_v2_truncate_t *truncate = (filed_v2_truncate_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -4815,23 +4503,6 @@ static filed_page_dispatch_result_t filed_dispatch_truncate_page(
     }
 
     return filed_page_result(reply_status, 0);
-}
-
-static int filed_dispatch_truncate(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_truncate_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
 }
 
 static uint64_t filed_lookup_cache_target_object(
@@ -4890,7 +4561,7 @@ static filed_page_dispatch_result_t filed_dispatch_unlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_unlink_t *unlink = (filed_wire_unlink_t *)page;
+    filed_v2_unlink_t *unlink = (filed_v2_unlink_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -4900,7 +4571,7 @@ static filed_page_dispatch_result_t filed_dispatch_unlink_page(
     {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_WIRE_NAME_BYTES];
+        char name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t base_dir =
             unlink->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -4963,28 +4634,11 @@ static filed_page_dispatch_result_t filed_dispatch_unlink_page(
     return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_unlink(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_unlink_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_mkdir_t *mkdir = (filed_wire_mkdir_t *)page;
+    filed_v2_mkdir_t *mkdir = (filed_v2_mkdir_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -4992,7 +4646,7 @@ static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     if (filed_name_is_terminated(mkdir->name, sizeof(mkdir->name))) {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_WIRE_NAME_BYTES];
+        char name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t base_dir =
             mkdir->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -5061,28 +4715,11 @@ static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_mkdir(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_mkdir_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_symlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_symlink_t *symlink = (filed_wire_symlink_t *)page;
+    filed_v2_symlink_t *symlink = (filed_v2_symlink_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -5094,7 +4731,7 @@ static filed_page_dispatch_result_t filed_dispatch_symlink_page(
     {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_WIRE_NAME_BYTES];
+        char name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t base_dir =
             symlink->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -5159,37 +4796,20 @@ static filed_page_dispatch_result_t filed_dispatch_symlink_page(
     return filed_page_result(reply_status, object_id);
 }
 
-static int filed_dispatch_symlink(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_symlink_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_readlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_readlink_t *readlink = (filed_wire_readlink_t *)page;
+    filed_v2_readlink_t *readlink = (filed_v2_readlink_t *)page;
     filed_vfs_io_decision_t parent_decision;
     uint64_t object_id = 0;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
     int64_t reply_status = -22;
     uint64_t target_length = 0;
     if (filed_name_is_terminated(readlink->name, sizeof(readlink->name))) {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_WIRE_NAME_BYTES];
+        char name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t base_dir =
             readlink->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -5245,32 +4865,15 @@ static filed_page_dispatch_result_t filed_dispatch_readlink_page(
     return filed_page_result(reply_status, target_length);
 }
 
-static int filed_dispatch_readlink(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_readlink_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_link_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_link_t *link = (filed_wire_link_t *)page;
+    filed_v2_link_t *link = (filed_v2_link_t *)page;
     filed_vfs_io_decision_t old_parent;
     filed_vfs_io_decision_t new_parent;
     filed_vfs_open_result_t opened;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
     uint64_t old_object_id = 0;
     uint64_t linked_object_id = 0;
     int64_t reply_status = -22;
@@ -5282,8 +4885,8 @@ static filed_page_dispatch_result_t filed_dispatch_link_page(
         filed_handle_id_t new_dir_handle = 0;
         int old_dir_owned = 0;
         int new_dir_owned = 0;
-        char old_name[FILED_WIRE_NAME_BYTES];
-        char new_name[FILED_WIRE_NAME_BYTES];
+        char old_name[FILED_V2_NAME_BYTES];
+        char new_name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t old_base_dir =
             link->old_dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -5359,7 +4962,7 @@ static filed_page_dispatch_result_t filed_dispatch_link_page(
                 &opened);
             reply_status = filed_status_to_wire(status);
             if (status == FILED_OK) {
-                koboxd_wire_fs_statx_t linked_stat;
+                storage_v2_statx_reply_t linked_stat;
                 memset(&linked_stat, 0, sizeof(linked_stat));
                 if (filed_backend_statx(runtime, linked_object_id, &linked_stat) == 0) {
                     filed_vfs_stat_snapshot_t snapshot;
@@ -5398,28 +5001,11 @@ static filed_page_dispatch_result_t filed_dispatch_link_page(
     return filed_page_result(reply_status, linked_object_id);
 }
 
-static int filed_dispatch_link(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_link_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_rmdir_t *rmdir = (filed_wire_rmdir_t *)page;
+    filed_v2_rmdir_t *rmdir = (filed_v2_rmdir_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -5429,7 +5015,7 @@ static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_WIRE_NAME_BYTES];
+        char name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t base_dir =
             rmdir->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -5492,28 +5078,11 @@ static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_rmdir(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_rmdir_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_rename_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_rename_t *rename = (filed_wire_rename_t *)page;
+    filed_v2_rename_t *rename = (filed_v2_rename_t *)page;
     filed_vfs_io_decision_t old_parent;
     filed_vfs_io_decision_t new_parent;
     filed_status_t status = FILED_ERR_INVALID;
@@ -5527,8 +5096,8 @@ static filed_page_dispatch_result_t filed_dispatch_rename_page(
         filed_handle_id_t new_dir_handle = 0;
         int old_dir_owned = 0;
         int new_dir_owned = 0;
-        char old_name[FILED_WIRE_NAME_BYTES];
-        char new_name[FILED_WIRE_NAME_BYTES];
+        char old_name[FILED_V2_NAME_BYTES];
+        char new_name[FILED_V2_NAME_BYTES];
         const filed_handle_id_t old_base_dir =
             rename->old_dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -5649,29 +5218,12 @@ static filed_page_dispatch_result_t filed_dispatch_rename_page(
     return filed_page_result(reply_status, object_id);
 }
 
-static int filed_dispatch_rename(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_rename_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_getdents_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_getdents_t *out = (filed_wire_getdents_t *)page;
-    koboxd_wire_fs_getdents_t backend_entries;
+    filed_v2_getdents_t *out = (filed_v2_getdents_t *)page;
+    storage_v2_getdents_request_t backend_entries;
     filed_vfs_io_decision_t decision;
     filed_status_t status = filed_vfs_getdents_prepare(
         &runtime->vfs,
@@ -5689,7 +5241,7 @@ static filed_page_dispatch_result_t filed_dispatch_getdents_page(
     int64_t reply_status = filed_status_to_wire(status);
     uint64_t result = 0;
     memset(&backend_entries, 0, sizeof(backend_entries));
-    backend_entries.capacity = FILED_WIRE_DIRENT_CAPACITY;
+    backend_entries.capacity = FILED_V2_DIRENT_CAPACITY;
     if (status == FILED_OK &&
         !filed_dir_cache_get(decision.backend_object, backend_offset, &backend_entries))
     {
@@ -5704,7 +5256,7 @@ static filed_page_dispatch_result_t filed_dispatch_getdents_page(
     }
     if (reply_status == 0) {
         const uint64_t backend_start = splice_tmpfs && decision.offset == 0 ? 1u : 0u;
-        const uint64_t backend_capacity = FILED_WIRE_DIRENT_CAPACITY - backend_start;
+        const uint64_t backend_capacity = FILED_V2_DIRENT_CAPACITY - backend_start;
         const uint64_t backend_count =
             backend_entries.count > backend_capacity ?
                 backend_capacity :
@@ -5755,35 +5307,6 @@ static filed_page_dispatch_result_t filed_dispatch_getdents_page(
     return filed_page_result(reply_status, result);
 }
 
-static int filed_dispatch_getdents(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_getdents_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
-static int filed_dispatch_close(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    const filed_handle_id_t handle_id = (filed_handle_id_t)(uint32_t)request->word2;
-    if (handle_id == runtime->root_handle_id) {
-        return filed_send_reply(reply_fd, request->word3, -13, 0);
-    }
-    return filed_send_reply(reply_fd, request->word3, filed_close_handle_runtime(runtime, handle_id), 0);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_close_page(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request)
@@ -5799,17 +5322,17 @@ static filed_page_dispatch_result_t filed_dispatch_dup_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_handle_flags_t *wire_flags = (filed_wire_handle_flags_t *)page;
+    filed_v2_handle_flags_t *wire_flags = (filed_v2_handle_flags_t *)page;
     filed_handle_id_t dup_handle = 0;
     int64_t reply_status = -22;
     uint64_t result = 0;
     if (wire_flags->reserved0 == 0 &&
-        filed_wire_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
+        filed_v2_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
     {
         const filed_status_t status = filed_vfs_dup_handle(
             &runtime->vfs,
             (filed_handle_id_t)(uint32_t)wire_flags->handle,
-            filed_wire_fd_flags_to_vfs(wire_flags->fd_flags),
+            filed_v2_fd_flags_to_vfs(wire_flags->fd_flags),
             &dup_handle);
         reply_status = filed_status_to_wire(status);
         if (status == FILED_OK) {
@@ -5828,28 +5351,11 @@ static filed_page_dispatch_result_t filed_dispatch_dup_page(
     return filed_page_result(reply_status, result);
 }
 
-static int filed_dispatch_dup(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_dup_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_get_flags_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_handle_flags_t *wire_flags = (filed_wire_handle_flags_t *)page;
+    filed_v2_handle_flags_t *wire_flags = (filed_v2_handle_flags_t *)page;
     filed_vfs_handle_flags_t flags;
     const uint64_t handle = wire_flags->handle;
     uint64_t result = 0;
@@ -5870,36 +5376,19 @@ static filed_page_dispatch_result_t filed_dispatch_get_flags_page(
     return filed_page_result(filed_status_to_wire(status), result);
 }
 
-static int filed_dispatch_get_flags(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_get_flags_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_set_flags_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_handle_flags_t *wire_flags = (filed_wire_handle_flags_t *)page;
+    filed_v2_handle_flags_t *wire_flags = (filed_v2_handle_flags_t *)page;
     filed_vfs_handle_flags_t flags;
     filed_status_t status = FILED_ERR_INVALID;
     if (wire_flags->reserved0 == 0 &&
-        filed_wire_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
+        filed_v2_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
     {
-        flags.fd_flags = filed_wire_fd_flags_to_vfs(wire_flags->fd_flags);
+        flags.fd_flags = filed_v2_fd_flags_to_vfs(wire_flags->fd_flags);
         flags.status_flags =
-            filed_wire_file_status_flags_to_vfs(wire_flags->status_flags);
+            filed_v2_file_status_flags_to_vfs(wire_flags->status_flags);
         status = filed_vfs_set_handle_flags(
             &runtime->vfs,
             (filed_handle_id_t)(uint32_t)wire_flags->handle,
@@ -5908,34 +5397,17 @@ static filed_page_dispatch_result_t filed_dispatch_set_flags_page(
     return filed_page_result(filed_status_to_wire(status), 0);
 }
 
-static int filed_dispatch_set_flags(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
-    if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
-    }
-
-    const filed_page_dispatch_result_t result = filed_dispatch_set_flags_page(runtime, page);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return filed_send_reply(reply_fd, request->word3, result.status, result.result);
-}
-
 static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_WIRE_EXEC_INHERIT_HANDLES |
-        FILED_WIRE_EXEC_LINUX_LPR |
-        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
-        FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO |
-        FILED_WIRE_EXEC_TRANSFER_PROCESS_FD;
+        FILED_V2_EXEC_INHERIT_HANDLES |
+        FILED_V2_EXEC_LINUX_LPR |
+        FILED_V2_EXEC_LINUX_BOOTSTRAP |
+        FILED_V2_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_V2_EXEC_TRANSFER_PROCESS_FD;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
@@ -5947,36 +5419,36 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
     filed_dispatch_saved_fd_t lpr_bootstrap_saved;
-    filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
+    filed_handle_id_t inherit_handles[FILED_V2_EXEC_MAX_INHERIT_HANDLES];
     filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec->flags & ~known_flags) != 0 ||
         exec->inherit_fd_count != 0 ||
         exec->fd_patch_count != 0 ||
-        exec->inherit_handle_count > FILED_WIRE_EXEC_MAX_INHERIT_HANDLES ||
-        exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
-        exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
-        exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        exec->inherit_handle_count > FILED_V2_EXEC_MAX_INHERIT_HANDLES ||
+        exec->argc > FILED_V2_EXEC_MAX_ARGS ||
+        exec->envc > FILED_V2_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_V2_EXEC_STRING_BYTES ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_wire_exec_string_ref_empty(exec->cwd) &&
-            !filed_wire_exec_string_ref_valid(exec, exec->cwd)) ||
+        (!filed_v2_exec_string_ref_empty(exec->cwd) &&
+            !filed_v2_exec_string_ref_valid(exec, exec->cwd)) ||
         !filed_dispatch_exec_default_stdio_valid(exec) ||
         !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
     {
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_wire_exec_string_ref_valid(exec, exec->argv[i])) {
+        if (!filed_v2_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_wire_exec_string_ref_valid(exec, exec->envp[i])) {
+        if (!filed_v2_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
-    if ((exec->flags & FILED_WIRE_EXEC_INHERIT_HANDLES) == 0 &&
+    if ((exec->flags & FILED_V2_EXEC_INHERIT_HANDLES) == 0 &&
         exec->inherit_handle_count != 0)
     {
         goto out;
@@ -6005,7 +5477,7 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
-    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+    if ((exec->flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
         runtime->netd_socket_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -6017,7 +5489,7 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
-    if ((exec->flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+    if ((exec->flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
         runtime->termd_tty_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -6029,8 +5501,8 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
-    if ((exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) ==
-        (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    if ((exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) ==
+        (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
     {
         const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
         if (bootstrap_source_fd < 16) {
@@ -6048,13 +5520,13 @@ static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         }
     }
 
-    filed_wire_openat_t openat;
+    filed_v2_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
     openat.rights =
-        FILED_WIRE_RIGHT_READ |
-        FILED_WIRE_RIGHT_EXEC |
-        FILED_WIRE_RIGHT_STAT;
+        FILED_V2_RIGHT_READ |
+        FILED_V2_RIGHT_EXEC |
+        FILED_V2_RIGHT_STAT;
     snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
 
     filed_vfs_open_result_t open_result;
@@ -6090,7 +5562,7 @@ out:
         filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     }
     if (reply_status != 0) {
-        for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_HANDLES; ++i) {
+        for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
                 (void)filed_vfs_close_handle(&runtime->vfs, inherit_handles[i]);
             }
@@ -6110,22 +5582,32 @@ static int filed_dispatch_exec_path(
     int reply_fd,
     const struct pacha_ipc_msg *request)
 {
+    pacha_service_request_header_t v2_header;
+    memset(&v2_header, 0, sizeof(v2_header));
+    v2_header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+    v2_header.abi_version = PACHA_SERVICE_ABI_VERSION;
+    v2_header.service_id = FILED_V2_SERVICE_ID;
+    v2_header.op = FILED_V2_OP_EXEC_PATH;
+    v2_header.request_id = request->word3;
+    v2_header.trace_id = request->word3;
+    v2_header.payload_size = sizeof(filed_v2_exec_path_t);
+
     int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    void *page = filed_map_request_page(request, FILED_V2_PAGE_BYTES, &page_fd);
     if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
+        return filed_send_reply_v2(reply_fd, NULL, &v2_header, -22, 0, 0);
     }
 
-    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_WIRE_EXEC_BOOTSTRAP_FD |
-        FILED_WIRE_EXEC_INHERIT_FDS |
-        FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS |
-        FILED_WIRE_EXEC_INHERIT_HANDLES |
-        FILED_WIRE_EXEC_LINUX_LPR |
-        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
-        FILED_WIRE_EXEC_LINUX_DEFAULT_STDIO |
-        FILED_WIRE_EXEC_TRANSFER_PROCESS_FD;
+        FILED_V2_EXEC_BOOTSTRAP_FD |
+        FILED_V2_EXEC_INHERIT_FDS |
+        FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS |
+        FILED_V2_EXEC_INHERIT_HANDLES |
+        FILED_V2_EXEC_LINUX_LPR |
+        FILED_V2_EXEC_LINUX_BOOTSTRAP |
+        FILED_V2_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_V2_EXEC_TRANSFER_PROCESS_FD;
     const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
     int process_fd = -1;
@@ -6138,27 +5620,27 @@ static int filed_dispatch_exec_path(
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
-    int inherit_fds[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
-    filed_dispatch_saved_fd_t inherit_saved[FILED_WIRE_EXEC_MAX_INHERIT_FDS];
+    int inherit_fds[FILED_V2_EXEC_MAX_INHERIT_FDS];
+    filed_dispatch_saved_fd_t inherit_saved[FILED_V2_EXEC_MAX_INHERIT_FDS];
     filed_dispatch_saved_fd_t lpr_bootstrap_saved;
-    filed_handle_id_t inherit_handles[FILED_WIRE_EXEC_MAX_INHERIT_HANDLES];
+    filed_handle_id_t inherit_handles[FILED_V2_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_fds, 0xff, sizeof(inherit_fds));
-    for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_FDS; ++i) {
+    for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_FDS; ++i) {
         filed_dispatch_saved_fd_init(&inherit_saved[i]);
     }
     filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec_flags & ~known_flags) != 0 ||
-        exec->inherit_fd_count > FILED_WIRE_EXEC_MAX_INHERIT_FDS ||
-        exec->inherit_handle_count > FILED_WIRE_EXEC_MAX_INHERIT_HANDLES ||
-        exec->fd_patch_count > FILED_WIRE_EXEC_MAX_FD_PATCHES ||
-        exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
-        exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
-        exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        exec->inherit_fd_count > FILED_V2_EXEC_MAX_INHERIT_FDS ||
+        exec->inherit_handle_count > FILED_V2_EXEC_MAX_INHERIT_HANDLES ||
+        exec->fd_patch_count > FILED_V2_EXEC_MAX_FD_PATCHES ||
+        exec->argc > FILED_V2_EXEC_MAX_ARGS ||
+        exec->envc > FILED_V2_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_V2_EXEC_STRING_BYTES ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_wire_exec_string_ref_empty(exec->cwd) &&
-            !filed_wire_exec_string_ref_valid(exec, exec->cwd)) ||
+        (!filed_v2_exec_string_ref_empty(exec->cwd) &&
+            !filed_v2_exec_string_ref_valid(exec, exec->cwd)) ||
         !filed_dispatch_exec_default_stdio_valid(exec) ||
         !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
     {
@@ -6176,12 +5658,12 @@ static int filed_dispatch_exec_path(
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_wire_exec_string_ref_valid(exec, exec->argv[i])) {
+        if (!filed_v2_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_wire_exec_string_ref_valid(exec, exec->envp[i])) {
+        if (!filed_v2_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
@@ -6189,17 +5671,17 @@ static int filed_dispatch_exec_path(
     const uint64_t inherit_handle_count = exec->inherit_handle_count;
 
     const uint64_t has_bootstrap =
-        (exec_flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0 ? 1u : 0u;
-    if ((exec_flags & FILED_WIRE_EXEC_INHERIT_FDS) == 0 && inherit_fd_count != 0) {
+        (exec_flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0 ? 1u : 0u;
+    if ((exec_flags & FILED_V2_EXEC_INHERIT_FDS) == 0 && inherit_fd_count != 0) {
         goto out;
     }
-    if ((exec_flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) == 0 && exec->fd_patch_count != 0) {
+    if ((exec_flags & FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS) == 0 && exec->fd_patch_count != 0) {
         goto out;
     }
-    if ((exec_flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
+    if ((exec_flags & FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
         goto out;
     }
-    if ((exec_flags & FILED_WIRE_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
+    if ((exec_flags & FILED_V2_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
         goto out;
     }
 
@@ -6230,7 +5712,7 @@ static int filed_dispatch_exec_path(
         }
     }
 
-    if ((exec_flags & FILED_WIRE_EXEC_BOOTSTRAP_FD) != 0) {
+    if ((exec_flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0) {
         const uint64_t fd_index = 1u + inherit_fd_count;
         if (request->fds[fd_index].fd < 16) {
             goto out;
@@ -6262,7 +5744,7 @@ static int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec_flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+    if ((exec_flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
         runtime->netd_socket_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -6274,7 +5756,7 @@ static int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec_flags & FILED_WIRE_EXEC_LINUX_LPR) != 0 &&
+    if ((exec_flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
         runtime->termd_tty_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -6286,8 +5768,8 @@ static int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec_flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP)) ==
-        (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP))
+    if ((exec_flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) ==
+        (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
     {
         const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
         if (bootstrap_source_fd < 16) {
@@ -6305,7 +5787,7 @@ static int filed_dispatch_exec_path(
         }
     }
 
-    if ((exec_flags & FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
+    if ((exec_flags & FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
         void *bootstrap_page = pacha_mmap(
             bootstrap_fd,
             FILED_BOOTSTRAP_PATCH_BYTES,
@@ -6317,25 +5799,25 @@ static int filed_dispatch_exec_path(
         }
         reply_status = 0;
         for (uint64_t i = 0; i < exec->fd_patch_count; ++i) {
-            const filed_wire_exec_fd_patch_t *patch = &exec->fd_patches[i];
+            const filed_v2_exec_fd_patch_t *patch = &exec->fd_patches[i];
             uint64_t value = 0;
             if (patch->reserved0 != 0 || patch->offset > FILED_BOOTSTRAP_PATCH_BYTES - 8u) {
                 reply_status = -22;
                 break;
             }
-            if (patch->kind == FILED_WIRE_EXEC_PATCH_INHERIT_FD) {
+            if (patch->kind == FILED_V2_EXEC_PATCH_INHERIT_FD) {
                 if (patch->index >= inherit_fd_count) {
                     reply_status = -22;
                     break;
                 }
                 value = (uint64_t)(uint32_t)inherit_fds[patch->index];
-            } else if (patch->kind == FILED_WIRE_EXEC_PATCH_BOOTSTRAP_FD) {
+            } else if (patch->kind == FILED_V2_EXEC_PATCH_BOOTSTRAP_FD) {
                 if (patch->index != 0) {
                     reply_status = -22;
                     break;
                 }
                 value = (uint64_t)(uint32_t)bootstrap_fd;
-            } else if (patch->kind == FILED_WIRE_EXEC_PATCH_INHERIT_HANDLE) {
+            } else if (patch->kind == FILED_V2_EXEC_PATCH_INHERIT_HANDLE) {
                 if (patch->index >= inherit_handle_count) {
                     reply_status = -22;
                     break;
@@ -6354,13 +5836,13 @@ static int filed_dispatch_exec_path(
         }
     }
 
-    filed_wire_openat_t openat;
+    filed_v2_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
     openat.rights =
-        FILED_WIRE_RIGHT_READ |
-        FILED_WIRE_RIGHT_EXEC |
-        FILED_WIRE_RIGHT_STAT;
+        FILED_V2_RIGHT_READ |
+        FILED_V2_RIGHT_EXEC |
+        FILED_V2_RIGHT_STAT;
     snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
 
     filed_vfs_open_result_t open_result;
@@ -6406,12 +5888,35 @@ out:
         (void)pacha_fd_close(lpr_bootstrap_saved.fd);
         filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     }
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    uint64_t v2_error_token = 0;
+    const uint64_t reply_result = reply_status == 0 ?
+        (uint64_t)(uint32_t)process_fd :
+        filed_error_token(
+            reply_status,
+            FILED_V2_OP_EXEC_PATH,
+            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            reply_status,
+            request->word3,
+            0,
+            0,
+            0,
+            "filed exec_path negative reply");
+    if (reply_status != 0) {
+        v2_error_token = reply_result;
+    }
+    pacha_service_reply_header_init(
+        (pacha_service_reply_header_t *)page,
+        &v2_header,
+        reply_status,
+        PACHA_SERVICE_ERROR_FILED_EXEC,
+        reply_result,
+        0);
+    (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (bootstrap_fd >= 16) {
         (void)pacha_fd_close(bootstrap_fd);
     }
-    for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_FDS; ++i) {
+    for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_FDS; ++i) {
         if (inherit_fds[i] >= 0) {
             if (inherit_saved[i].fd >= 0) {
                 filed_dispatch_restore_target_fd(inherit_fds[i], &inherit_saved[i]);
@@ -6424,21 +5929,21 @@ out:
         }
     }
     if (reply_status != 0) {
-        for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_HANDLES; ++i) {
+        for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
                 (void)filed_vfs_close_handle(&runtime->vfs, inherit_handles[i]);
             }
         }
     }
     if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16) {
-        const int send_status = filed_send_exec_reply(
+        const int send_status = filed_send_exec_reply_v2(
             reply_fd,
             request->word3,
             process_fd,
             thread_fd,
-            (exec_flags & FILED_WIRE_EXEC_TRANSFER_PROCESS_FD) != 0);
+            (exec_flags & FILED_V2_EXEC_TRANSFER_PROCESS_FD) != 0);
         if (send_status != 0) {
-            for (uint64_t i = 0; i < FILED_WIRE_EXEC_MAX_INHERIT_HANDLES; ++i) {
+            for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_HANDLES; ++i) {
                 if (inherit_handles[i] != 0) {
                     (void)filed_vfs_close_handle(&runtime->vfs, inherit_handles[i]);
                 }
@@ -6446,7 +5951,7 @@ out:
         }
         return send_status;
     }
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    return filed_send_reply_v2(reply_fd, NULL, &v2_header, reply_status, 0, v2_error_token);
 }
 
 static int filed_dispatch_exec_self(
@@ -6454,45 +5959,55 @@ static int filed_dispatch_exec_self(
     int reply_fd,
     const struct pacha_ipc_msg *request)
 {
+    pacha_service_request_header_t v2_header;
+    memset(&v2_header, 0, sizeof(v2_header));
+    v2_header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+    v2_header.abi_version = PACHA_SERVICE_ABI_VERSION;
+    v2_header.service_id = FILED_V2_SERVICE_ID;
+    v2_header.op = FILED_V2_OP_EXEC_SELF;
+    v2_header.request_id = request->word3;
+    v2_header.trace_id = request->word3;
+    v2_header.payload_size = sizeof(filed_v2_exec_path_t);
+
     int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_WIRE_PAGE_BYTES, &page_fd);
+    void *page = filed_map_request_page(request, FILED_V2_PAGE_BYTES, &page_fd);
     if (page == NULL) {
-        return filed_send_reply(reply_fd, request->word3, -22, 0);
+        return filed_send_reply_v2(reply_fd, NULL, &v2_header, -22, 0, 0);
     }
 
-    filed_wire_exec_path_t *exec = (filed_wire_exec_path_t *)page;
+    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_WIRE_EXEC_LINUX_LPR |
-        FILED_WIRE_EXEC_LINUX_BOOTSTRAP |
-        FILED_WIRE_EXEC_SELF |
-        FILED_WIRE_EXEC_LPR_FD_TABLE;
+        FILED_V2_EXEC_LINUX_LPR |
+        FILED_V2_EXEC_LINUX_BOOTSTRAP |
+        FILED_V2_EXEC_SELF |
+        FILED_V2_EXEC_LPR_FD_TABLE;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
     int lpr_fd_table_fd = -1;
     void *lpr_fd_table_page = NULL;
-    const filed_wire_exec_lpr_fd_table_t *lpr_fd_table = NULL;
-    const int wants_lpr_fd_table = (exec->flags & FILED_WIRE_EXEC_LPR_FD_TABLE) != 0;
+    const filed_v2_exec_lpr_fd_table_t *lpr_fd_table = NULL;
+    const int wants_lpr_fd_table = (exec->flags & FILED_V2_EXEC_LPR_FD_TABLE) != 0;
     const uint64_t expected_request_fd_count = wants_lpr_fd_table ? 3u : 2u;
 
     if ((exec->flags & ~known_flags) != 0 ||
-        (exec->flags & (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP | FILED_WIRE_EXEC_SELF)) !=
-            (FILED_WIRE_EXEC_LINUX_LPR | FILED_WIRE_EXEC_LINUX_BOOTSTRAP | FILED_WIRE_EXEC_SELF) ||
+        (exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP | FILED_V2_EXEC_SELF)) !=
+            (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP | FILED_V2_EXEC_SELF) ||
         exec->inherit_fd_count != 0 ||
         exec->inherit_handle_count != 0 ||
         exec->fd_patch_count != 0 ||
-        exec->argc > FILED_WIRE_EXEC_MAX_ARGS ||
-        exec->envc > FILED_WIRE_EXEC_MAX_ENVS ||
-        exec->string_bytes > FILED_WIRE_EXEC_STRING_BYTES ||
+        exec->argc > FILED_V2_EXEC_MAX_ARGS ||
+        exec->envc > FILED_V2_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_V2_EXEC_STRING_BYTES ||
         request->fd_count != expected_request_fd_count ||
         request->fds == NULL ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_wire_exec_string_ref_empty(exec->cwd) &&
-            !filed_wire_exec_string_ref_valid(exec, exec->cwd)) ||
-        !filed_wire_exec_string_ref_empty(exec->ctty) ||
+        (!filed_v2_exec_string_ref_empty(exec->cwd) &&
+            !filed_v2_exec_string_ref_valid(exec, exec->cwd)) ||
+        !filed_v2_exec_string_ref_empty(exec->ctty) ||
         (wants_lpr_fd_table &&
-            (exec->lpr_fd_table_bytes < sizeof(filed_wire_exec_lpr_fd_table_t) ||
+            (exec->lpr_fd_table_bytes < sizeof(filed_v2_exec_lpr_fd_table_t) ||
                 request->fds[1].fd < 16)) ||
         (!wants_lpr_fd_table &&
             !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 1)))
@@ -6500,12 +6015,12 @@ static int filed_dispatch_exec_self(
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_wire_exec_string_ref_valid(exec, exec->argv[i])) {
+        if (!filed_v2_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_wire_exec_string_ref_valid(exec, exec->envp[i])) {
+        if (!filed_v2_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
@@ -6521,7 +6036,7 @@ static int filed_dispatch_exec_self(
         if (lpr_fd_table_page == NULL) {
             goto out;
         }
-        lpr_fd_table = (const filed_wire_exec_lpr_fd_table_t *)lpr_fd_table_page;
+        lpr_fd_table = (const filed_v2_exec_lpr_fd_table_t *)lpr_fd_table_page;
         if (!filed_dispatch_exec_lpr_fd_table_valid(exec, lpr_fd_table, 1)) {
             goto out;
         }
@@ -6534,13 +6049,13 @@ static int filed_dispatch_exec_self(
         goto out;
     }
 
-    filed_wire_openat_t openat;
+    filed_v2_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
     openat.rights =
-        FILED_WIRE_RIGHT_READ |
-        FILED_WIRE_RIGHT_EXEC |
-        FILED_WIRE_RIGHT_STAT;
+        FILED_V2_RIGHT_READ |
+        FILED_V2_RIGHT_EXEC |
+        FILED_V2_RIGHT_STAT;
     snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
 
     filed_vfs_open_result_t open_result;
@@ -6576,10 +6091,10 @@ out:
     if (lpr_fd_table_fd >= 16) {
         (void)pacha_fd_close(lpr_fd_table_fd);
     }
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
+    (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16 && bootstrap_fd >= 16) {
-        return filed_send_exec_self_reply(reply_fd, request->word3, process_fd, thread_fd, bootstrap_fd);
+        return filed_send_exec_self_reply_v2(reply_fd, request->word3, process_fd, thread_fd, bootstrap_fd);
     }
     if (process_fd >= 16) {
         (void)pacha_syscall2(
@@ -6594,55 +6109,72 @@ out:
     if (bootstrap_fd >= 16) {
         (void)pacha_fd_close(bootstrap_fd);
     }
-    return filed_send_reply(reply_fd, request->word3, reply_status, 0);
+    const struct pacha_ipc_msg reply = {
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
+        .word1 = (uint64_t)reply_status,
+        .word2 = 0,
+        .word3 = request->word3,
+    };
+    const int send_status = pacha_ipc_reply(reply_fd, &reply);
+    (void)pacha_fd_close(reply_fd);
+    return send_status;
 }
 
-static int filed_dispatch_connect(
+static int filed_dispatch_session_open_v2(
     filed_runtime_t *runtime,
     int reply_fd,
-    const struct pacha_ipc_msg *request)
+    const struct pacha_ipc_msg *request,
+    void *reply_page,
+    const pacha_service_request_header_t *header,
+    int *out_keep_fd,
+    int *out_keep_fd2)
 {
+    if (out_keep_fd != NULL) {
+        *out_keep_fd = -1;
+    }
+    if (out_keep_fd2 != NULL) {
+        *out_keep_fd2 = -1;
+    }
     if (runtime == NULL ||
         request == NULL ||
+        reply_page == NULL ||
+        header == NULL ||
         request->fds == NULL ||
-        request->fd_count < 3 ||
-        request->fds[0].fd < 16 ||
-        request->fds[1].fd < 16)
+        request->fd_count < 4 ||
+        request->fds[1].fd < 16 ||
+        request->fds[2].fd < 16)
     {
-        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
+        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
     }
 
     int64_t reply_status = -24;
     uint64_t result = 0;
-    const int channel_fd = (int)request->fds[0].fd;
-    const int page_fd = (int)request->fds[1].fd;
-    void *page = pacha_mmap(
+    const int channel_fd = (int)request->fds[1].fd;
+    const int page_fd = (int)request->fds[2].fd;
+    void *session_page = pacha_mmap(
         page_fd,
-        FILED_WIRE_SESSION_PAGE_BYTES,
+        FILED_V2_SESSION_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
-    if (page == NULL) {
-        (void)pacha_fd_close(channel_fd);
-        (void)pacha_fd_close(page_fd);
-        return filed_send_reply(reply_fd, request->word3, -14, 0);
+    if (session_page == NULL) {
+        return filed_send_reply_v2(reply_fd, reply_page, header, -14, 0, 0);
     }
-    filed_wire_fast_header_t *header = (filed_wire_fast_header_t *)page;
-    if (header->magic != FILED_WIRE_FAST_MAGIC ||
-        header->version != FILED_WIRE_FAST_VERSION ||
-        header->request_capacity != FILED_WIRE_FAST_REQUEST_CAPACITY ||
-        header->completion_capacity != FILED_WIRE_FAST_COMPLETION_CAPACITY ||
-        header->payload_slot_count != FILED_WIRE_FAST_PAYLOAD_SLOT_COUNT ||
-        header->payload_slot_size != FILED_WIRE_PAGE_BYTES ||
-        header->payload_offset != FILED_WIRE_FAST_PAYLOAD_OFFSET ||
-        header->generation_offset != FILED_WIRE_FAST_GENERATION_OFFSET ||
-        header->generation_capacity != FILED_WIRE_FAST_GENERATION_CAPACITY ||
-        header->payload_offset + header->payload_slot_count * header->payload_slot_size > FILED_WIRE_SESSION_PAGE_BYTES)
+
+    filed_v2_fast_header_t *fast = (filed_v2_fast_header_t *)session_page;
+    if (fast->magic != FILED_V2_FAST_MAGIC ||
+        fast->version != FILED_V2_FAST_VERSION ||
+        fast->request_capacity != FILED_V2_FAST_REQUEST_CAPACITY ||
+        fast->completion_capacity != FILED_V2_FAST_COMPLETION_CAPACITY ||
+        fast->payload_slot_count != FILED_V2_FAST_PAYLOAD_SLOT_COUNT ||
+        fast->payload_slot_size != FILED_V2_PAGE_BYTES ||
+        fast->payload_offset != FILED_V2_FAST_PAYLOAD_OFFSET ||
+        fast->generation_offset != FILED_V2_FAST_GENERATION_OFFSET ||
+        fast->generation_capacity != FILED_V2_FAST_GENERATION_CAPACITY ||
+        fast->payload_offset + fast->payload_slot_count * fast->payload_slot_size > FILED_V2_SESSION_PAGE_BYTES)
     {
-        (void)pacha_munmap(page, FILED_WIRE_SESSION_PAGE_BYTES);
-        (void)pacha_fd_close(channel_fd);
-        (void)pacha_fd_close(page_fd);
-        return filed_send_reply(reply_fd, request->word3, -71, 0);
+        (void)pacha_munmap(session_page, FILED_V2_SESSION_PAGE_BYTES);
+        return filed_send_reply_v2(reply_fd, reply_page, header, -71, 0, 0);
     }
 
     for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
@@ -6652,64 +6184,24 @@ static int filed_dispatch_connect(
         }
         session->channel_fd = channel_fd;
         session->page_fd = page_fd;
-        session->page = page;
-        session->page_size = FILED_WIRE_SESSION_PAGE_BYTES;
+        session->page = session_page;
+        session->page_size = FILED_V2_SESSION_PAGE_BYTES;
         session->active = 1;
+        if (out_keep_fd != NULL) {
+            *out_keep_fd = channel_fd;
+        }
+        if (out_keep_fd2 != NULL) {
+            *out_keep_fd2 = page_fd;
+        }
         reply_status = 0;
         result = i + 1u;
         break;
     }
 
     if (reply_status != 0) {
-        (void)pacha_munmap(page, FILED_WIRE_SESSION_PAGE_BYTES);
-        (void)pacha_fd_close(channel_fd);
-        (void)pacha_fd_close(page_fd);
+        (void)pacha_munmap(session_page, FILED_V2_SESSION_PAGE_BYTES);
     }
-    return filed_send_reply(reply_fd, request->word3, reply_status, result);
-}
-
-static int filed_dispatch_set_netd_socket_endpoint(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    if (runtime == NULL ||
-        request == NULL ||
-        request->fds == NULL ||
-        request->fd_count < 1 ||
-        request->fds[0].fd < 16)
-    {
-        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
-    }
-
-    const int endpoint_fd = (int)request->fds[0].fd;
-    if (runtime->netd_socket_endpoint_fd >= 16) {
-        (void)pacha_fd_close(runtime->netd_socket_endpoint_fd);
-    }
-    runtime->netd_socket_endpoint_fd = endpoint_fd;
-    return filed_send_reply(reply_fd, request->word3, 0, (uint64_t)(uint32_t)endpoint_fd);
-}
-
-static int filed_dispatch_set_termd_tty_endpoint(
-    filed_runtime_t *runtime,
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    if (runtime == NULL ||
-        request == NULL ||
-        request->fds == NULL ||
-        request->fd_count < 1 ||
-        request->fds[0].fd < 16)
-    {
-        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
-    }
-
-    const int endpoint_fd = (int)request->fds[0].fd;
-    if (runtime->termd_tty_endpoint_fd >= 16) {
-        (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
-    }
-    runtime->termd_tty_endpoint_fd = endpoint_fd;
-    return filed_send_reply(reply_fd, request->word3, 0, (uint64_t)(uint32_t)endpoint_fd);
+    return filed_send_reply_v2(reply_fd, reply_page, header, reply_status, result, 0);
 }
 
 static uint64_t filed_import_termd_error(
@@ -6725,7 +6217,7 @@ static uint64_t filed_import_termd_error(
     memset(&parent, 0, sizeof(parent));
     parent.domain = PACHA_ERRCONV_DOMAIN_TERMD_STATUS;
     parent.component = PACHA_ERRCONV_COMPONENT_FILED;
-    parent.op = FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR;
+    parent.op = FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR;
     parent.stage = PACHA_ERRCONV_STAGE_CHILD_STATUS;
     parent.status = status;
     parent.raw_status = status;
@@ -6744,14 +6236,14 @@ static uint64_t filed_import_termd_error(
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int page_fd = pacha_vmo_create(TERMD_WIRE_PAGE_BYTES, rights, 0);
+    const int page_fd = pacha_vmo_create(TERMD_V2_PAGE_BYTES, rights, 0);
     if (page_fd < 16) {
         const uint64_t token = pacha_errconv_begin(filed_errors(), status, &parent);
         pacha_errconv_frame_t frame;
         memset(&frame, 0, sizeof(frame));
         frame.domain = PACHA_ERRCONV_DOMAIN_KERNEL_STATUS;
         frame.component = PACHA_ERRCONV_COMPONENT_FILED;
-        frame.op = TERMD_WIRE_OP_ERROR_GET;
+        frame.op = TERMD_V2_OP_DIAG_ERROR_GET;
         frame.stage = PACHA_ERRCONV_STAGE_KERNEL_SYSCALL;
         frame.status = page_fd;
         frame.raw_status = page_fd;
@@ -6764,7 +6256,7 @@ static uint64_t filed_import_termd_error(
 
     void *page = pacha_mmap(
         page_fd,
-        TERMD_WIRE_PAGE_BYTES,
+        TERMD_V2_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -6774,7 +6266,7 @@ static uint64_t filed_import_termd_error(
         memset(&frame, 0, sizeof(frame));
         frame.domain = PACHA_ERRCONV_DOMAIN_KERNEL_STATUS;
         frame.component = PACHA_ERRCONV_COMPONENT_FILED;
-        frame.op = TERMD_WIRE_OP_ERROR_GET;
+        frame.op = TERMD_V2_OP_DIAG_ERROR_GET;
         frame.stage = PACHA_ERRCONV_STAGE_MAP_PAGE;
         frame.status = -5;
         frame.raw_status = -5;
@@ -6785,7 +6277,20 @@ static uint64_t filed_import_termd_error(
         (void)pacha_fd_close(page_fd);
         return token;
     }
-    memset(page, 0, TERMD_WIRE_PAGE_BYTES);
+    memset(page, 0, TERMD_V2_PAGE_BYTES);
+    const uint64_t get_request_id = request_id ^ 0x45524745545f5445ull;
+    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
+    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->service_id = TERMD_V2_SERVICE_ID;
+    header->op = TERMD_V2_OP_DIAG_ERROR_GET;
+    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD | PACHA_SERVICE_FLAG_DIAGNOSTIC;
+    header->request_id = get_request_id;
+    header->trace_id = request_id;
+    header->payload_size = sizeof(termd_v2_handle_request_t);
+    termd_v2_handle_request_t *payload =
+        (termd_v2_handle_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    payload->arg0 = child_token;
 
     struct pacha_ipc_fd fd_item;
     memset(&fd_item, 0, sizeof(fd_item));
@@ -6795,10 +6300,10 @@ static uint64_t filed_import_termd_error(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
     const struct pacha_ipc_msg get_request = {
-        .word0 = TERMD_WIRE_REQUEST_MAGIC,
-        .word1 = TERMD_WIRE_OP_ERROR_GET,
-        .word2 = child_token,
-        .word3 = request_id ^ 0x45524745545f5445ull,
+        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word1 = 0,
+        .word2 = 0,
+        .word3 = get_request_id,
         .fds = &fd_item,
         .fd_count = 1,
     };
@@ -6809,13 +6314,19 @@ static uint64_t filed_import_termd_error(
         memset(&get_reply, 0, sizeof(get_reply));
         get_status = pacha_ipc_recv_wait(error_reply_fd, &get_reply, PACHA_FD_WAIT_FOREVER);
         (void)pacha_fd_close(error_reply_fd);
+        const pacha_service_reply_header_t *reply_header =
+            (const pacha_service_reply_header_t *)page;
         if (get_status == 0 &&
-            (get_reply.word0 != TERMD_WIRE_REPLY_MAGIC ||
-             get_reply.word3 != get_request.word3))
+            (get_reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
+             get_reply.word3 != get_request.word3 ||
+             reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+             reply_header->service_id != TERMD_V2_SERVICE_ID ||
+             reply_header->op != TERMD_V2_OP_DIAG_ERROR_GET ||
+             reply_header->request_id != get_request.word3))
         {
             get_status = -5;
         } else if (get_status == 0) {
-            get_status = (int64_t)get_reply.word1;
+            get_status = reply_header->status;
         }
     }
 
@@ -6825,15 +6336,15 @@ static uint64_t filed_import_termd_error(
             filed_errors(),
             status,
             &parent,
-            page,
-            TERMD_WIRE_PAGE_BYTES);
+            (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
+            TERMD_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
     } else {
         token = pacha_errconv_begin(filed_errors(), status, &parent);
         pacha_errconv_frame_t frame;
         memset(&frame, 0, sizeof(frame));
         frame.domain = PACHA_ERRCONV_DOMAIN_TERMD_STATUS;
         frame.component = PACHA_ERRCONV_COMPONENT_FILED;
-        frame.op = TERMD_WIRE_OP_ERROR_GET;
+        frame.op = TERMD_V2_OP_DIAG_ERROR_GET;
         frame.stage = PACHA_ERRCONV_STAGE_ERROR_GET;
         frame.status = get_status;
         frame.raw_status = get_status;
@@ -6843,89 +6354,114 @@ static uint64_t filed_import_termd_error(
         (void)pacha_errconv_append(filed_errors(), token, &frame);
     }
 
-    (void)pacha_munmap(page, TERMD_WIRE_PAGE_BYTES);
+    (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     return token;
 }
 
-static int filed_dispatch_error_get(
-    int reply_fd,
-    const struct pacha_ipc_msg *request)
-{
-    if (request == NULL ||
-        request->fds == NULL ||
-        request->fd_count < 1 ||
-        request->fds[0].fd < 16)
-    {
-        return filed_send_reply_with_error(
-            reply_fd,
-            request != NULL ? request->word3 : 0,
-            -22,
-            0,
-            0);
-    }
-    const int page_fd = (int)(uint32_t)request->fds[0].fd;
-    void *page = pacha_mmap(
-        page_fd,
-        FILED_WIRE_PAGE_BYTES,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        PACHA_MMAP_SHARED,
-        0);
-    if (page == NULL) {
-        return filed_send_reply_with_error(reply_fd, request->word3, -14, 0, 0);
-    }
-    const int status =
-        pacha_errconv_export(filed_errors(), request->word2, page, FILED_WIRE_PAGE_BYTES);
-    (void)pacha_munmap(page, FILED_WIRE_PAGE_BYTES);
-    return filed_send_reply_with_error(reply_fd, request->word3, status, 0, 0);
-}
-
-static int filed_dispatch_register_termd_signal_supervisor(
+static int filed_dispatch_register_termd_signal_supervisor_v2(
     filed_runtime_t *runtime,
     int reply_fd,
-    const struct pacha_ipc_msg *request)
+    const struct pacha_ipc_msg *request,
+    void *reply_page,
+    const pacha_service_request_header_t *header)
 {
     if (runtime == NULL ||
         request == NULL ||
         request->fds == NULL ||
-        request->fd_count < 1 ||
-        request->fds[0].fd < 16 ||
-        runtime->termd_tty_endpoint_fd < 16)
+        request->fd_count < 3 ||
+        request->fds[1].fd < 16 ||
+        runtime->termd_tty_endpoint_fd < 16 ||
+        header == NULL ||
+        header->payload_size < sizeof(filed_v2_service_endpoint_request_t))
     {
-        return filed_send_reply(reply_fd, request != NULL ? request->word3 : 0, -22, 0);
+        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const int supervisor_endpoint_fd = (int)(uint32_t)request->fds[0].fd;
-    struct pacha_ipc_fd termd_fd;
-    memset(&termd_fd, 0, sizeof(termd_fd));
-    termd_fd.fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
-    termd_fd.rights =
+    const int supervisor_endpoint_fd = (int)(uint32_t)request->fds[1].fd;
+    const uint64_t page_rights =
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int page_fd = pacha_vmo_create(TERMD_V2_PAGE_BYTES, page_rights, 0);
+    if (page_fd < 16) {
+        const uint64_t token = filed_error_token(
+            page_fd,
+            header->op,
+            PACHA_ERRCONV_STAGE_KERNEL_SYSCALL,
+            page_fd,
+            header->request_id,
+            request->fd_count,
+            0,
+            0,
+            "termd signal supervisor page create failed");
+        return filed_send_reply_v2(reply_fd, reply_page, header, page_fd, 0, token);
+    }
+    void *page = pacha_mmap(
+        page_fd,
+        TERMD_V2_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        const uint64_t token = filed_error_token(
+            -5,
+            header->op,
+            PACHA_ERRCONV_STAGE_MAP_PAGE,
+            -5,
+            header->request_id,
+            request->fd_count,
+            (uint64_t)(uint32_t)page_fd,
+            0,
+            "termd signal supervisor page map failed");
+        (void)pacha_fd_close(page_fd);
+        return filed_send_reply_v2(reply_fd, reply_page, header, -5, 0, token);
+    }
+
+    memset(page, 0, TERMD_V2_PAGE_BYTES);
+    pacha_service_request_header_t *termd_header = (pacha_service_request_header_t *)page;
+    termd_header->magic = PACHA_SERVICE_REQUEST_MAGIC;
+    termd_header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    termd_header->service_id = TERMD_V2_SERVICE_ID;
+    termd_header->op = TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR;
+    termd_header->request_id = header->request_id;
+    termd_header->trace_id = header->trace_id != 0 ? header->trace_id : header->request_id;
+    termd_header->fd_count = 1;
+
+    struct pacha_ipc_fd termd_fds[2];
+    memset(termd_fds, 0, sizeof(termd_fds));
+    termd_fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    termd_fds[0].rights = page_rights;
+    termd_fds[1].fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
+    termd_fds[1].rights =
         PACHA_FD_RIGHT_CALL |
         PACHA_FD_RIGHT_CLOSE;
 
     const struct pacha_ipc_msg termd_request = {
-        .word0 = TERMD_WIRE_REQUEST_MAGIC,
-        .word1 = TERMD_WIRE_OP_REGISTER_SIGNAL_SUPERVISOR,
+        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word1 = 0,
         .word2 = 0,
-        .word3 = request->word3,
-        .fds = &termd_fd,
-        .fd_count = 1,
+        .word3 = header->request_id,
+        .fds = termd_fds,
+        .fd_count = 2,
     };
     const int termd_reply_fd =
         pacha_ipc_call(runtime->termd_tty_endpoint_fd, &termd_request);
     if (termd_reply_fd < 16) {
         const uint64_t token = filed_error_token(
             termd_reply_fd,
-            FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+            header->op,
             PACHA_ERRCONV_STAGE_CHILD_RPC_CALL,
             termd_reply_fd,
-            request->word3,
+            header->request_id,
             request->fd_count,
             (uint64_t)(uint32_t)runtime->termd_tty_endpoint_fd,
             0,
             "termd signal supervisor call failed");
-        (void)pacha_fd_close(supervisor_endpoint_fd);
-        return filed_send_reply_with_error(reply_fd, request->word3, termd_reply_fd, 0, token);
+        (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
+        (void)pacha_fd_close(page_fd);
+        return filed_send_reply_v2(reply_fd, reply_page, header, termd_reply_fd, 0, token);
     }
 
     struct pacha_ipc_msg termd_reply;
@@ -6933,53 +6469,61 @@ static int filed_dispatch_register_termd_signal_supervisor(
     const int recv_status =
         pacha_ipc_recv_wait(termd_reply_fd, &termd_reply, PACHA_FD_WAIT_FOREVER);
     (void)pacha_fd_close(termd_reply_fd);
-    (void)pacha_fd_close(supervisor_endpoint_fd);
+    const pacha_service_reply_header_t *reply_header =
+        (const pacha_service_reply_header_t *)page;
 
     int64_t status = recv_status;
     uint64_t result = 0;
     uint64_t error_token = 0;
     if (recv_status == 0) {
-        if (termd_reply.word0 != TERMD_WIRE_REPLY_MAGIC ||
-            termd_reply.word3 != termd_request.word3)
+        if (termd_reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
+            termd_reply.word3 != termd_request.word3 ||
+            reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+            reply_header->service_id != TERMD_V2_SERVICE_ID ||
+            reply_header->op != TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR ||
+            reply_header->request_id != termd_request.word3)
         {
             status = -5;
             error_token = filed_error_token(
                 status,
-                FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+                header->op,
                 PACHA_ERRCONV_STAGE_REPLY_MAGIC,
                 (int64_t)termd_reply.word0,
-                request->word3,
+                header->request_id,
                 request->fd_count,
                 termd_reply.word3,
                 0,
                 "termd signal supervisor reply mismatch");
         } else {
-            status = (int64_t)termd_reply.word1;
-            result = termd_reply.word2;
+            status = reply_header->status;
+            result = reply_header->result;
             if (status < 0) {
                 error_token = filed_import_termd_error(
                     runtime,
-                    termd_reply.word2,
-                    request->word3,
+                    reply_header->result,
+                    header->request_id,
                     status,
                     request->fd_count,
-                    TERMD_WIRE_OP_REGISTER_SIGNAL_SUPERVISOR,
+                    TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR,
                     "termd signal supervisor returned error");
             }
         }
     } else {
         error_token = filed_error_token(
             status,
-            FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+            header->op,
             PACHA_ERRCONV_STAGE_CHILD_RPC_RECV,
             status,
-            request->word3,
+            header->request_id,
             request->fd_count,
             (uint64_t)(uint32_t)termd_reply_fd,
             0,
             "termd signal supervisor reply recv failed");
     }
-    return filed_send_reply_with_error(reply_fd, request->word3, status, result, error_token);
+
+    (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
+    return filed_send_reply_v2(reply_fd, reply_page, header, status, result, error_token);
 }
 
 static filed_page_dispatch_result_t filed_dispatch_session_page(
@@ -6988,66 +6532,66 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
     void *page)
 {
     switch (request->word1) {
-    case FILED_WIRE_OP_PING:
+    case FILED_V2_OP_DIAG_PING:
         return filed_page_result(0, request->word2);
-    case FILED_WIRE_OP_OPENAT:
+    case FILED_V2_OP_VFS_OPENAT:
         return filed_dispatch_openat_page(runtime, page);
-    case FILED_WIRE_OP_VALIDATE_OPEN_CACHE:
+    case FILED_V2_OP_VFS_VALIDATE_OPEN_CACHE:
         return filed_dispatch_validate_open_cache_page(runtime, page);
-    case FILED_WIRE_OP_STAT:
+    case FILED_V2_OP_VFS_STAT:
         return filed_dispatch_stat_page(runtime, page);
-    case FILED_WIRE_OP_UTIMENS:
+    case FILED_V2_OP_VFS_UTIMENS:
         return filed_dispatch_utimens_page(runtime, page);
-    case FILED_WIRE_OP_CHMOD:
+    case FILED_V2_OP_VFS_CHMOD:
         return filed_dispatch_chmod_page(runtime, page);
-    case FILED_WIRE_OP_PREAD:
+    case FILED_V2_OP_VFS_PREAD:
         return filed_dispatch_pread_page(runtime, page);
-    case FILED_WIRE_OP_READ:
+    case FILED_V2_OP_VFS_READ:
         return filed_dispatch_read_page(runtime, page);
-    case FILED_WIRE_OP_PREAD_TO_VMO:
+    case FILED_V2_OP_VFS_PREAD_TO_VMO:
         return filed_page_result(-95, 0);
-    case FILED_WIRE_OP_PWRITE:
+    case FILED_V2_OP_VFS_PWRITE:
         return filed_dispatch_pwrite_page(runtime, page);
-    case FILED_WIRE_OP_WRITE:
+    case FILED_V2_OP_VFS_WRITE:
         return filed_dispatch_write_page(runtime, page);
-    case FILED_WIRE_OP_TRUNCATE:
+    case FILED_V2_OP_VFS_TRUNCATE:
         return filed_dispatch_truncate_page(runtime, page);
-    case FILED_WIRE_OP_UNLINK:
+    case FILED_V2_OP_VFS_UNLINK:
         return filed_dispatch_unlink_page(runtime, page);
-    case FILED_WIRE_OP_RENAME:
+    case FILED_V2_OP_VFS_RENAME:
         return filed_dispatch_rename_page(runtime, page);
-    case FILED_WIRE_OP_MKDIR:
+    case FILED_V2_OP_VFS_MKDIR:
         return filed_dispatch_mkdir_page(runtime, page);
-    case FILED_WIRE_OP_RMDIR:
+    case FILED_V2_OP_VFS_RMDIR:
         return filed_dispatch_rmdir_page(runtime, page);
-    case FILED_WIRE_OP_SYMLINK:
+    case FILED_V2_OP_VFS_SYMLINK:
         return filed_dispatch_symlink_page(runtime, page);
-    case FILED_WIRE_OP_READLINK:
+    case FILED_V2_OP_VFS_READLINK:
         return filed_dispatch_readlink_page(runtime, page);
-    case FILED_WIRE_OP_LINK:
+    case FILED_V2_OP_VFS_LINK:
         return filed_dispatch_link_page(runtime, page);
-    case FILED_WIRE_OP_GETDENTS:
+    case FILED_V2_OP_VFS_GETDENTS:
         return filed_dispatch_getdents_page(runtime, page);
-    case FILED_WIRE_OP_DUP:
+    case FILED_V2_OP_VFS_DUP:
         return filed_dispatch_dup_page(runtime, page);
-    case FILED_WIRE_OP_GET_FLAGS:
+    case FILED_V2_OP_VFS_GET_FLAGS:
         return filed_dispatch_get_flags_page(runtime, page);
-    case FILED_WIRE_OP_SET_FLAGS:
+    case FILED_V2_OP_VFS_SET_FLAGS:
         return filed_dispatch_set_flags_page(runtime, page);
-    case FILED_WIRE_OP_FSYNC:
+    case FILED_V2_OP_VFS_FSYNC:
         return filed_dispatch_fsync_page(runtime, request);
-    case FILED_WIRE_OP_SEEK:
+    case FILED_V2_OP_VFS_SEEK:
         return filed_dispatch_seek_page(runtime, page);
-    case FILED_WIRE_OP_EXEC_PATH:
+    case FILED_V2_OP_EXEC_PATH:
         return filed_dispatch_exec_path_session_page(runtime, page);
-    case FILED_WIRE_OP_EXEC_SELF:
+    case FILED_V2_OP_EXEC_SELF:
         return filed_page_result(-95, 0);
-    case FILED_WIRE_OP_CLOSE:
+    case FILED_V2_OP_VFS_CLOSE:
         return filed_dispatch_close_page(runtime, request);
-    case FILED_WIRE_OP_SYNC_ALL:
-        return filed_page_result(filed_kobox_backend_sync_all(&runtime->backend), 0);
-    case FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT:
-    case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT:
+    case FILED_V2_OP_VFS_SYNC_ALL:
+        return filed_page_result(filed_dispatch_sync_all(runtime), 0);
+    case FILED_V2_OP_SERVICE_SET_NETD_SOCKET:
+    case FILED_V2_OP_SERVICE_SET_TERMD_TTY:
         return filed_page_result(-95, 0);
     default:
         return filed_page_result(-95, 0);
@@ -7056,13 +6600,13 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
 
 static int filed_session_fast_validate(
     const filed_session_t *session,
-    filed_wire_fast_header_t **out_header,
-    filed_wire_fast_request_t **out_requests,
-    filed_wire_fast_completion_t **out_completions)
+    filed_v2_fast_header_t **out_header,
+    filed_v2_fast_request_t **out_requests,
+    filed_v2_fast_completion_t **out_completions)
 {
     if (session == NULL ||
         session->page == NULL ||
-        session->page_size < FILED_WIRE_SESSION_PAGE_BYTES ||
+        session->page_size < FILED_V2_SESSION_PAGE_BYTES ||
         out_header == NULL ||
         out_requests == NULL ||
         out_completions == NULL)
@@ -7070,42 +6614,42 @@ static int filed_session_fast_validate(
         return -22;
     }
 
-    filed_wire_fast_header_t *header = (filed_wire_fast_header_t *)session->page;
-    if (header->magic != FILED_WIRE_FAST_MAGIC ||
-        header->version != FILED_WIRE_FAST_VERSION ||
-        header->request_capacity != FILED_WIRE_FAST_REQUEST_CAPACITY ||
-        header->completion_capacity != FILED_WIRE_FAST_COMPLETION_CAPACITY ||
-        header->payload_slot_count != FILED_WIRE_FAST_PAYLOAD_SLOT_COUNT ||
-        header->payload_slot_size != FILED_WIRE_PAGE_BYTES ||
-        header->payload_offset != FILED_WIRE_FAST_PAYLOAD_OFFSET ||
-        header->generation_offset != FILED_WIRE_FAST_GENERATION_OFFSET ||
-        header->generation_capacity != FILED_WIRE_FAST_GENERATION_CAPACITY ||
+    filed_v2_fast_header_t *header = (filed_v2_fast_header_t *)session->page;
+    if (header->magic != FILED_V2_FAST_MAGIC ||
+        header->version != FILED_V2_FAST_VERSION ||
+        header->request_capacity != FILED_V2_FAST_REQUEST_CAPACITY ||
+        header->completion_capacity != FILED_V2_FAST_COMPLETION_CAPACITY ||
+        header->payload_slot_count != FILED_V2_FAST_PAYLOAD_SLOT_COUNT ||
+        header->payload_slot_size != FILED_V2_PAGE_BYTES ||
+        header->payload_offset != FILED_V2_FAST_PAYLOAD_OFFSET ||
+        header->generation_offset != FILED_V2_FAST_GENERATION_OFFSET ||
+        header->generation_capacity != FILED_V2_FAST_GENERATION_CAPACITY ||
         header->payload_offset + header->payload_slot_count * header->payload_slot_size > session->page_size)
     {
         return -71;
     }
 
     *out_header = header;
-    *out_requests = (filed_wire_fast_request_t *)((uint8_t *)session->page + sizeof(*header));
-    *out_completions = (filed_wire_fast_completion_t *)((uint8_t *)(*out_requests) +
+    *out_requests = (filed_v2_fast_request_t *)((uint8_t *)session->page + sizeof(*header));
+    *out_completions = (filed_v2_fast_completion_t *)((uint8_t *)(*out_requests) +
         sizeof(**out_requests) * header->request_capacity);
     return 0;
 }
 
 static void *filed_session_fast_payload(
     const filed_session_t *session,
-    const filed_wire_fast_header_t *header,
+    const filed_v2_fast_header_t *header,
     uint64_t payload_slot)
 {
     if (session == NULL ||
         header == NULL ||
         payload_slot >= header->payload_slot_count ||
-        header->payload_slot_size != FILED_WIRE_PAGE_BYTES)
+        header->payload_slot_size != FILED_V2_PAGE_BYTES)
     {
         return NULL;
     }
     const uint64_t offset = header->payload_offset + payload_slot * header->payload_slot_size;
-    if (offset + FILED_WIRE_PAGE_BYTES > session->page_size) {
+    if (offset + FILED_V2_PAGE_BYTES > session->page_size) {
         return NULL;
     }
     return (uint8_t *)session->page + offset;
@@ -7114,7 +6658,7 @@ static void *filed_session_fast_payload(
 static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
     filed_runtime_t *runtime,
     filed_session_t *session,
-    filed_wire_fast_header_t *header,
+    filed_v2_fast_header_t *header,
     uint64_t batch_count,
     bool append)
 {
@@ -7124,7 +6668,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
 
     uint64_t total = 0;
     int64_t status = 0;
-    const uint64_t op = append ? FILED_WIRE_OP_WRITE : FILED_WIRE_OP_PWRITE;
+    const uint64_t op = append ? FILED_V2_OP_VFS_WRITE : FILED_V2_OP_VFS_PWRITE;
     for (uint64_t slot = 0; slot < batch_count; slot++) {
         void *payload = filed_session_fast_payload(session, header, slot);
         if (payload == NULL) {
@@ -7132,7 +6676,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
             break;
         }
 
-        filed_wire_io_t *io = (filed_wire_io_t *)payload;
+        filed_v2_io_t *io = (filed_v2_io_t *)payload;
         const uint64_t requested = io->length;
         const uint64_t start_cycles = filed_read_tsc();
         const filed_page_dispatch_result_t result = append ?
@@ -7161,9 +6705,9 @@ static uint64_t filed_dispatch_session_fast_drain(
     filed_session_t *session,
     int *out_status)
 {
-    filed_wire_fast_header_t *header = NULL;
-    filed_wire_fast_request_t *requests = NULL;
-    filed_wire_fast_completion_t *completions = NULL;
+    filed_v2_fast_header_t *header = NULL;
+    filed_v2_fast_request_t *requests = NULL;
+    filed_v2_fast_completion_t *completions = NULL;
     uint64_t completed = 0;
     int status = filed_session_fast_validate(session, &header, &requests, &completions);
     if (status != 0) {
@@ -7179,7 +6723,7 @@ static uint64_t filed_dispatch_session_fast_drain(
             break;
         }
 
-        filed_wire_fast_request_t *fast_request =
+        filed_v2_fast_request_t *fast_request =
             &requests[header->request_head % header->request_capacity];
         const uint64_t fast_op_start_cycles = filed_read_tsc();
         void *payload = filed_session_fast_payload(session, header, fast_request->payload_slot);
@@ -7187,21 +6731,21 @@ static uint64_t filed_dispatch_session_fast_drain(
         if (payload != NULL && fast_request->request_id != 0) {
             struct pacha_ipc_msg pseudo_request;
             memset(&pseudo_request, 0, sizeof(pseudo_request));
-            pseudo_request.word0 = FILED_WIRE_REQUEST_MAGIC;
+            pseudo_request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
             pseudo_request.word1 = fast_request->opcode;
             pseudo_request.word2 = fast_request->word2;
             pseudo_request.word3 = fast_request->request_id;
 
             const uint64_t start_cycles = filed_read_tsc();
-            if (fast_request->opcode == FILED_WIRE_OP_PWRITE_BATCH ||
-                fast_request->opcode == FILED_WIRE_OP_WRITE_BATCH)
+            if (fast_request->opcode == FILED_V2_OP_VFS_PWRITE_BATCH ||
+                fast_request->opcode == FILED_V2_OP_VFS_WRITE_BATCH)
             {
                 result = filed_dispatch_session_write_batch(
                     runtime,
                     session,
                     header,
                     fast_request->word2,
-                    fast_request->opcode == FILED_WIRE_OP_WRITE_BATCH);
+                    fast_request->opcode == FILED_V2_OP_VFS_WRITE_BATCH);
                 filed_record_dispatch_metric_cycles(
                     pseudo_request.word1,
                     start_cycles,
@@ -7217,7 +6761,7 @@ static uint64_t filed_dispatch_session_fast_drain(
             }
         }
 
-        filed_wire_fast_completion_t *completion =
+        filed_v2_fast_completion_t *completion =
             &completions[header->completion_tail % header->completion_capacity];
         memset(completion, 0, sizeof(*completion));
         completion->request_id = fast_request->request_id;
@@ -7267,11 +6811,12 @@ int filed_dispatch_session_once(filed_runtime_t *runtime, uint64_t session_index
     if (recv_status != 0) {
         return recv_status;
     }
-    if (request.word0 != FILED_WIRE_REQUEST_MAGIC ||
-        request.word1 != FILED_WIRE_OP_FAST_DOORBELL ||
-        request.word3 == 0)
-    {
-        return filed_send_session_reply(session->channel_fd, request.word3, -22, 0);
+    const int request_is_v2 =
+        request.word0 == PACHA_SERVICE_REQUEST_MAGIC &&
+        request.word1 == FILED_V2_OP_SESSION_DOORBELL &&
+        request.word3 != 0;
+    if (!request_is_v2) {
+        return filed_send_session_reply_v2(session->channel_fd, request.word3, -22, 0);
     }
 
     int drain_status = 0;
@@ -7282,7 +6827,7 @@ int filed_dispatch_session_once(filed_runtime_t *runtime, uint64_t session_index
     const uint64_t drain_end_ns = filed_now_ns();
     const uint64_t reply_start_ns = filed_now_ns();
     const uint64_t reply_start_cycles = filed_read_tsc();
-    const int reply_status = filed_send_session_reply(
+    const int reply_status = filed_send_session_reply_v2(
         session->channel_fd,
         request.word3,
         drain_status,
@@ -7336,6 +6881,613 @@ int filed_dispatch_session_once(filed_runtime_t *runtime, uint64_t session_index
     return reply_status;
 }
 
+static void filed_close_received_fds_except3(
+    const struct pacha_ipc_msg *request,
+    int keep_fd,
+    int keep_fd2,
+    int keep_fd3)
+{
+    if (request == NULL || request->fds == NULL) {
+        return;
+    }
+    for (uint64_t i = 0; i < request->fd_count; i++) {
+        const int fd = (int)(uint32_t)request->fds[i].fd;
+        if (fd >= 16 && fd != keep_fd && fd != keep_fd2 && fd != keep_fd3) {
+            (void)pacha_fd_close(fd);
+        }
+    }
+}
+
+static void filed_close_received_fds_except(
+    const struct pacha_ipc_msg *request,
+    int keep_fd,
+    int keep_fd2)
+{
+    filed_close_received_fds_except3(request, keep_fd, keep_fd2, -1);
+}
+
+typedef struct filed_v2_route_result {
+    int replied;
+    int reply_status;
+    int keep_fd;
+    int64_t status;
+    uint64_t result;
+} filed_v2_route_result_t;
+
+static filed_v2_route_result_t filed_v2_route_pending(void)
+{
+    filed_v2_route_result_t result;
+    memset(&result, 0, sizeof(result));
+    result.keep_fd = -1;
+    return result;
+}
+
+static filed_v2_route_result_t filed_v2_route_replied(int reply_status)
+{
+    filed_v2_route_result_t result = filed_v2_route_pending();
+    result.replied = 1;
+    result.reply_status = reply_status;
+    return result;
+}
+
+static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request,
+    void *page,
+    const pacha_service_request_header_t *header)
+{
+    filed_v2_route_result_t route = filed_v2_route_pending();
+    void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
+
+    switch (header->op) {
+    case FILED_V2_OP_VFS_OPENAT:
+        if (header->payload_size < sizeof(filed_v2_path_request_t)) {
+            route.status = -22;
+        } else {
+            filed_v2_path_request_t *path = (filed_v2_path_request_t *)payload;
+            filed_v2_openat_t openat;
+            memset(&openat, 0, sizeof(openat));
+            openat.dir_handle = path->dir_handle;
+            openat.rights = path->rights;
+            openat.open_flags = path->flags;
+            memcpy(openat.name, path->path, sizeof(openat.name));
+            const filed_page_dispatch_result_t open_result =
+                filed_dispatch_openat_page(runtime, &openat);
+            route.status = open_result.status;
+            route.result = open_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_CLOSE:
+        if (header->payload_size < sizeof(filed_v2_handle_request_t)) {
+            route.status = -22;
+        } else {
+            const filed_v2_handle_request_t *handle = (const filed_v2_handle_request_t *)payload;
+            const filed_handle_id_t handle_id = (filed_handle_id_t)(uint32_t)handle->handle;
+            route.status = handle_id == runtime->root_handle_id ?
+                -13 :
+                filed_close_handle_runtime(runtime, handle_id);
+        }
+        break;
+    case FILED_V2_OP_VFS_STAT:
+        if (header->payload_size < sizeof(filed_v2_statx_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_stat_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_READ:
+        if (header->payload_size < sizeof(filed_v2_io_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_read_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_PREAD:
+        if (header->payload_size < sizeof(filed_v2_io_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_pread_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_WRITE:
+        if (header->payload_size < sizeof(filed_v2_io_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_write_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_PWRITE:
+        if (header->payload_size < sizeof(filed_v2_io_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_pwrite_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_GETDENTS:
+        if (header->payload_size < sizeof(filed_v2_getdents_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_getdents_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_SEEK:
+        if (header->payload_size < sizeof(filed_v2_seek_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_seek_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_DUP:
+        if (header->payload_size < sizeof(filed_v2_handle_flags_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_dup_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_GET_FLAGS:
+        if (header->payload_size < sizeof(filed_v2_handle_flags_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_get_flags_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_SET_FLAGS:
+        if (header->payload_size < sizeof(filed_v2_handle_flags_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_set_flags_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_FSYNC:
+        if (header->payload_size < sizeof(filed_v2_handle_request_t)) {
+            route.status = -22;
+        } else {
+            const filed_v2_handle_request_t *handle = (const filed_v2_handle_request_t *)payload;
+            struct pacha_ipc_msg pseudo_request;
+            memset(&pseudo_request, 0, sizeof(pseudo_request));
+            pseudo_request.word2 = handle->handle;
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_fsync_page(runtime, &pseudo_request);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_TRUNCATE:
+        if (header->payload_size < sizeof(filed_v2_truncate_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_truncate_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_UNLINK:
+        if (header->payload_size < sizeof(filed_v2_unlink_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_unlink_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_RENAME:
+        if (header->payload_size < sizeof(filed_v2_rename_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_rename_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_MKDIR:
+        if (header->payload_size < sizeof(filed_v2_mkdir_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_mkdir_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_RMDIR:
+        if (header->payload_size < sizeof(filed_v2_rmdir_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_rmdir_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_SYMLINK:
+        if (header->payload_size < sizeof(filed_v2_symlink_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_symlink_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_READLINK:
+        if (header->payload_size < sizeof(filed_v2_readlink_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_readlink_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_LINK:
+        if (header->payload_size < sizeof(filed_v2_link_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_link_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_UTIMENS:
+        if (header->payload_size < sizeof(filed_v2_utimens_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_utimens_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_CHMOD:
+        if (header->payload_size < sizeof(filed_v2_chmod_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_chmod_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_FILE_VMO: {
+        const int reply_status = filed_dispatch_file_vmo_v2(
+            runtime,
+            reply_fd,
+            request,
+            page,
+            header);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        filed_close_received_fds_except(request, reply_fd, -1);
+        return filed_v2_route_replied(reply_status);
+    }
+    case FILED_V2_OP_VFS_PREAD_TO_VMO:
+        if (header->payload_size < sizeof(filed_v2_pread_vmo_t) ||
+            request->fd_count < 2 ||
+            request->fds == NULL ||
+            request->fds[1].fd < 16)
+        {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_pread_to_vmo_page(runtime, payload, (int)request->fds[1].fd);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_V2_OP_VFS_SYNC_ALL:
+        route.status = filed_dispatch_sync_all(runtime);
+        break;
+    default:
+        route.status = -95;
+        break;
+    }
+    return route;
+}
+
+static int filed_dispatch_client_v2(
+    filed_runtime_t *runtime,
+    int reply_fd,
+    const struct pacha_ipc_msg *request)
+{
+    if (runtime == NULL ||
+        request == NULL ||
+        request->fds == NULL ||
+        request->fd_count < 2 ||
+        request->fds[0].fd < 16 ||
+        request->fds[0].fd == (uint64_t)(uint32_t)reply_fd)
+    {
+        pacha_service_request_header_t header;
+        memset(&header, 0, sizeof(header));
+        header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+        header.abi_version = PACHA_SERVICE_ABI_VERSION;
+        header.service_id = FILED_V2_SERVICE_ID;
+        header.request_id = request != NULL ? request->word3 : 0;
+        header.trace_id = request != NULL ? request->word3 : 0;
+        filed_close_received_fds_except(request, reply_fd, -1);
+        return filed_send_reply_v2(reply_fd, NULL, &header, -22, 0, 0);
+    }
+
+    const int page_fd = (int)(uint32_t)request->fds[0].fd;
+    void *page = pacha_mmap(
+        page_fd,
+        PACHA_SERVICE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        filed_close_received_fds_except(request, reply_fd, -1);
+        const uint64_t token = filed_error_token(
+            -5,
+            0,
+            PACHA_ERRCONV_STAGE_MAP_PAGE,
+            -5,
+            request->word3,
+            request->fd_count,
+            (uint64_t)(uint32_t)page_fd,
+            0,
+            "filed v2 request page map failed");
+        pacha_service_request_header_t header;
+        memset(&header, 0, sizeof(header));
+        header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+        header.abi_version = PACHA_SERVICE_ABI_VERSION;
+        header.service_id = FILED_V2_SERVICE_ID;
+        header.request_id = request->word3;
+        header.trace_id = request->word3;
+        return filed_send_reply_v2(reply_fd, NULL, &header, -5, 0, token);
+    }
+
+    pacha_service_request_header_t header;
+    memcpy(&header, page, sizeof(header));
+    if (!pacha_service_request_header_is_v2(&header, FILED_V2_SERVICE_ID) ||
+        header.request_id == 0 ||
+        header.request_id != request->word3)
+    {
+        pacha_service_reply_header_init(
+            (pacha_service_reply_header_t *)page,
+            &header,
+            -22,
+            PACHA_SERVICE_ERROR_ABI,
+            0,
+            0);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        filed_close_received_fds_except(request, reply_fd, -1);
+        return filed_send_reply_v2(reply_fd, NULL, &header, -22, 0, 0);
+    }
+
+    int keep_fd = -1;
+    int64_t status = 0;
+    uint64_t result = 0;
+    uint64_t error_token = 0;
+    switch (header.op) {
+    case FILED_V2_OP_HELLO:
+        result = PACHA_SERVICE_ABI_VERSION;
+        break;
+    case FILED_V2_OP_SESSION_OPEN: {
+        int keep_session_channel_fd = -1;
+        int keep_session_page_fd = -1;
+        const int reply_status = filed_dispatch_session_open_v2(
+            runtime,
+            reply_fd,
+            request,
+            page,
+            &header,
+            &keep_session_channel_fd,
+            &keep_session_page_fd);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        filed_close_received_fds_except3(
+            request,
+            keep_session_channel_fd,
+            keep_session_page_fd,
+            reply_fd);
+        return reply_status;
+    }
+    case FILED_V2_OP_DIAG_ERROR_GET:
+        if (header.payload_size < sizeof(filed_v2_diag_request_t)) {
+            status = -22;
+        } else {
+            filed_v2_diag_request_t *diag =
+                (filed_v2_diag_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+            status = pacha_errconv_export(
+                filed_errors(),
+                diag->subject,
+                diag,
+                PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
+            if (status == 0) {
+                const int reply_status = filed_send_reply_v2_payload(
+                    reply_fd,
+                    page,
+                    &header,
+                    status,
+                    0,
+                    0,
+                    PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
+                (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+                filed_close_received_fds_except(request, reply_fd, -1);
+                return reply_status;
+            }
+        }
+        break;
+    case FILED_V2_OP_VFS_OPENAT:
+    case FILED_V2_OP_VFS_CLOSE:
+    case FILED_V2_OP_VFS_STAT:
+    case FILED_V2_OP_VFS_READ:
+    case FILED_V2_OP_VFS_PREAD:
+    case FILED_V2_OP_VFS_WRITE:
+    case FILED_V2_OP_VFS_PWRITE:
+    case FILED_V2_OP_VFS_GETDENTS:
+    case FILED_V2_OP_VFS_SEEK:
+    case FILED_V2_OP_VFS_DUP:
+    case FILED_V2_OP_VFS_GET_FLAGS:
+    case FILED_V2_OP_VFS_SET_FLAGS:
+    case FILED_V2_OP_VFS_FSYNC:
+    case FILED_V2_OP_VFS_TRUNCATE:
+    case FILED_V2_OP_VFS_UNLINK:
+    case FILED_V2_OP_VFS_RENAME:
+    case FILED_V2_OP_VFS_MKDIR:
+    case FILED_V2_OP_VFS_RMDIR:
+    case FILED_V2_OP_VFS_SYMLINK:
+    case FILED_V2_OP_VFS_READLINK:
+    case FILED_V2_OP_VFS_LINK:
+    case FILED_V2_OP_VFS_UTIMENS:
+    case FILED_V2_OP_VFS_CHMOD:
+    case FILED_V2_OP_VFS_FILE_VMO:
+    case FILED_V2_OP_VFS_PREAD_TO_VMO:
+    case FILED_V2_OP_VFS_SYNC_ALL: {
+        const filed_v2_route_result_t route = filed_dispatch_client_vfs_v2(
+            runtime,
+            reply_fd,
+            request,
+            page,
+            &header);
+        if (route.replied) {
+            return route.reply_status;
+        }
+        keep_fd = route.keep_fd;
+        status = route.status;
+        result = route.result;
+        break;
+    }
+    case FILED_V2_OP_EXEC_PATH:
+        if (header.payload_size < sizeof(filed_v2_exec_path_t)) {
+            status = -22;
+        } else {
+            memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_v2_exec_path_t));
+            struct pacha_ipc_msg exec_request = *request;
+            exec_request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
+            exec_request.word1 = FILED_V2_OP_EXEC_PATH;
+            exec_request.word2 = 0;
+            exec_request.word3 = header.request_id;
+            (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+            return filed_dispatch_exec_path(runtime, reply_fd, &exec_request);
+        }
+        break;
+    case FILED_V2_OP_EXEC_SELF:
+        if (header.payload_size < sizeof(filed_v2_exec_path_t)) {
+            status = -22;
+        } else {
+            memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_v2_exec_path_t));
+            struct pacha_ipc_msg exec_request = *request;
+            exec_request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
+            exec_request.word1 = FILED_V2_OP_EXEC_SELF;
+            exec_request.word2 = 0;
+            exec_request.word3 = header.request_id;
+            (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+            return filed_dispatch_exec_self(runtime, reply_fd, &exec_request);
+        }
+        break;
+    case FILED_V2_OP_DIAG_DUMP_METRICS:
+        filed_dump_dispatch_metrics();
+        filed_dump_cache_metrics(runtime);
+        filed_exec_linux_lpr_dump_metrics();
+        filed_kobox_backend_dump_metrics(&runtime->backend);
+        break;
+    case FILED_V2_OP_DIAG_SET_CACHE_SLOTS: {
+        const filed_v2_diag_request_t *diag =
+            (const filed_v2_diag_request_t *)((const uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+        if (header.payload_size < sizeof(*diag)) {
+            status = -22;
+        } else {
+            status = filed_page_cache_flush_object(runtime, 0);
+            if (status == 0) {
+                filed_page_cache_configure(diag->subject);
+                result = filed_page_cache.active_slots;
+            }
+        }
+        break;
+    }
+    case FILED_V2_OP_SERVICE_SET_NETD_SOCKET:
+    case FILED_V2_OP_SERVICE_SET_TERMD_TTY:
+        if (header.payload_size < sizeof(filed_v2_service_endpoint_request_t) ||
+            request->fd_count < 3 ||
+            request->fds[1].fd < 16)
+        {
+            status = -22;
+        } else {
+            const int endpoint_fd = (int)(uint32_t)request->fds[1].fd;
+            if (header.op == FILED_V2_OP_SERVICE_SET_NETD_SOCKET) {
+                if (runtime->netd_socket_endpoint_fd >= 16) {
+                    (void)pacha_fd_close(runtime->netd_socket_endpoint_fd);
+                }
+                runtime->netd_socket_endpoint_fd = endpoint_fd;
+            } else {
+                if (runtime->termd_tty_endpoint_fd >= 16) {
+                    (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
+                }
+                runtime->termd_tty_endpoint_fd = endpoint_fd;
+            }
+            keep_fd = endpoint_fd;
+            result = (uint64_t)(uint32_t)endpoint_fd;
+        }
+        break;
+    case FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR: {
+        const int reply_status = filed_dispatch_register_termd_signal_supervisor_v2(
+            runtime,
+            reply_fd,
+            request,
+            page,
+            &header);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        filed_close_received_fds_except(request, reply_fd, -1);
+        return reply_status;
+    }
+    default:
+        status = -95;
+        break;
+    }
+
+    if (status < 0) {
+        error_token = filed_error_token(
+            status,
+            header.op,
+            PACHA_ERRCONV_STAGE_DISPATCH_ENTRY,
+            status,
+            header.request_id,
+            request->fd_count,
+            0,
+            0,
+            "filed v2 dispatch failed");
+    }
+    filed_close_received_fds_except(request, reply_fd, keep_fd);
+    const int reply_status =
+        filed_send_reply_v2(reply_fd, page, &header, status, result, error_token);
+    (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+    return reply_status;
+}
+
 int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
 {
     struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
@@ -7358,167 +7510,15 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
         return -22;
     }
     const int reply_fd = (int)fds[request.fd_count - 1].fd;
-    if (request.word0 != FILED_WIRE_REQUEST_MAGIC ||
-        request.word3 == 0)
-    {
-        return filed_send_reply(reply_fd, request.word3, -22, 0);
+    if (request.word0 != PACHA_SERVICE_REQUEST_MAGIC) {
+        pacha_service_request_header_t header;
+        memset(&header, 0, sizeof(header));
+        header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+        header.abi_version = PACHA_SERVICE_ABI_VERSION;
+        header.service_id = FILED_V2_SERVICE_ID;
+        header.request_id = request.word3;
+        header.trace_id = request.word3;
+        return filed_send_reply_v2(reply_fd, NULL, &header, -22, 0, 0);
     }
-
-    const uint64_t start_ns = filed_now_ns();
-    const uint64_t start_cycles = filed_read_tsc();
-    int dispatch_status = 0;
-
-    switch (request.word1) {
-    case FILED_WIRE_OP_HELLO:
-        dispatch_status = filed_send_reply(reply_fd, request.word3, 0, FILED_WIRE_VERSION);
-        break;
-    case FILED_WIRE_OP_ROOT_STAT:
-        dispatch_status = filed_dispatch_root_stat(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_ROOT_GETDENTS:
-        dispatch_status = filed_dispatch_root_getdents(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_OPENAT:
-        dispatch_status = filed_dispatch_openat(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_VALIDATE_OPEN_CACHE:
-        dispatch_status = filed_dispatch_validate_open_cache(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_STAT:
-        dispatch_status = filed_dispatch_stat(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_UTIMENS:
-        dispatch_status = filed_dispatch_utimens(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_CHMOD:
-        dispatch_status = filed_dispatch_chmod(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_PREAD:
-        dispatch_status = filed_dispatch_pread(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_READ:
-        dispatch_status = filed_dispatch_read(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_PREAD_TO_VMO:
-        dispatch_status = filed_dispatch_pread_to_vmo(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_FILE_VMO:
-        dispatch_status = filed_dispatch_file_vmo(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_PWRITE:
-        dispatch_status = filed_dispatch_pwrite(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_WRITE:
-        dispatch_status = filed_dispatch_write(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_SEEK:
-        dispatch_status = filed_dispatch_seek(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_FSYNC:
-        dispatch_status = filed_dispatch_fsync(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_TRUNCATE:
-        dispatch_status = filed_dispatch_truncate(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_UNLINK:
-        dispatch_status = filed_dispatch_unlink(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_RENAME:
-        dispatch_status = filed_dispatch_rename(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_MKDIR:
-        dispatch_status = filed_dispatch_mkdir(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_RMDIR:
-        dispatch_status = filed_dispatch_rmdir(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_SYMLINK:
-        dispatch_status = filed_dispatch_symlink(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_READLINK:
-        dispatch_status = filed_dispatch_readlink(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_LINK:
-        dispatch_status = filed_dispatch_link(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_GETDENTS:
-        dispatch_status = filed_dispatch_getdents(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_CLOSE:
-        dispatch_status = filed_dispatch_close(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_DUP:
-        dispatch_status = filed_dispatch_dup(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_GET_FLAGS:
-        dispatch_status = filed_dispatch_get_flags(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_SET_FLAGS:
-        dispatch_status = filed_dispatch_set_flags(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_EXEC_PATH:
-        dispatch_status = filed_dispatch_exec_path(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_EXEC_SELF:
-        dispatch_status = filed_dispatch_exec_self(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_DUMP_METRICS:
-        filed_dump_dispatch_metrics();
-        filed_dump_cache_metrics(runtime);
-        filed_exec_linux_lpr_dump_metrics();
-        filed_kobox_backend_dump_metrics(&runtime->backend);
-        dispatch_status = filed_send_reply(reply_fd, request.word3, 0, 0);
-        break;
-    case FILED_WIRE_OP_SET_CACHE_SLOTS:
-        dispatch_status = filed_page_cache_flush_object(runtime, 0);
-        if (dispatch_status == 0) {
-            filed_page_cache_configure(request.word2);
-            dispatch_status = filed_send_reply(
-                reply_fd,
-                request.word3,
-                0,
-                filed_page_cache.active_slots);
-        } else {
-            dispatch_status = filed_send_reply(reply_fd, request.word3, dispatch_status, 0);
-        }
-        break;
-    case FILED_WIRE_OP_SYNC_ALL:
-        dispatch_status = filed_send_reply(
-            reply_fd,
-            request.word3,
-            filed_kobox_backend_sync_all(&runtime->backend),
-            0);
-        break;
-    case FILED_WIRE_OP_CONNECT:
-        dispatch_status = filed_dispatch_connect(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT:
-        dispatch_status = filed_dispatch_set_netd_socket_endpoint(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT:
-        dispatch_status = filed_dispatch_set_termd_tty_endpoint(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_REGISTER_TERMD_SIGNAL_SUPERVISOR:
-        dispatch_status =
-            filed_dispatch_register_termd_signal_supervisor(runtime, reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_ERROR_GET:
-        dispatch_status = filed_dispatch_error_get(reply_fd, &request);
-        break;
-    case FILED_WIRE_OP_PING:
-        dispatch_status = filed_send_reply(reply_fd, request.word3, 0, request.word2);
-        break;
-    default:
-        dispatch_status = filed_send_reply(reply_fd, request.word3, -95, 0);
-        break;
-    }
-
-    filed_record_dispatch_metric(
-        request.word1,
-        start_ns,
-        filed_now_ns(),
-        start_cycles,
-        filed_read_tsc(),
-        dispatch_status);
-    return dispatch_status;
+    return filed_dispatch_client_v2(runtime, reply_fd, &request);
 }

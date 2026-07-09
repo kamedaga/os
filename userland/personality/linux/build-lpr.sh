@@ -37,6 +37,10 @@ clang \
   "$repo_root/userland/personality/linux/runtime/lpr_syscall_catalog.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_memory.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs_local.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_fd/table.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_error.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_process/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_process/supervisor_fd_snapshot.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_filed.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_socket.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_dispatch.c" \

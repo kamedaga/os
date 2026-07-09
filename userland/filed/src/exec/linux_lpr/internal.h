@@ -6,7 +6,7 @@
 
 #include <personality/zpoline.h>
 
-#include "filed/ipc_protocol.h"
+#include "filed/payload_v2.h"
 #include "filed/runtime.h"
 #include "filed/vfs.h"
 #include "pacha/abi.h"
@@ -273,12 +273,12 @@ int lpr_exec_prepare_file_into_map_batch(
     lpr_exec_loaded_t *loaded);
 
 int lpr_exec_prepare_inherit_fds(
-    const filed_wire_exec_path_t *request,
+    const filed_v2_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
     int *prepared,
     uint64_t *out_prepared_count);
 void lpr_exec_clear_prepared_inherit_fds(const int *prepared, uint64_t count);
-int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_wire_exec_path_t *request, int bootstrap_fd, int start_thread);
+int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *request, int bootstrap_fd, int start_thread);
 void lpr_exec_discard_process_fd(int process_fd);

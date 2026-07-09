@@ -794,7 +794,7 @@ static int lookup_and_open_component(
 {
     filed_vfs_io_decision_t parent_decision;
     uint64_t object_id = 0;
-    koboxd_wire_fs_statx_t backend_stat;
+    storage_v2_statx_reply_t backend_stat;
 
     if (runtime == NULL || name == NULL || out_open == NULL) {
         return -22;
@@ -859,7 +859,7 @@ static int open_absolute_path(
     current_handle = runtime->root_handle_id;
 
     for (;;) {
-        char component[FILED_WIRE_NAME_BYTES];
+        char component[FILED_V2_NAME_BYTES];
         const char *component_start;
         const char *after_slashes;
         size_t component_len;
@@ -1165,7 +1165,7 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
 {
     filed_vfs_io_decision_t stat_decision;
     filed_vfs_stat_snapshot_t snapshot;
-    koboxd_wire_fs_statx_t stat;
+    storage_v2_statx_reply_t stat;
 
     if (runtime == NULL || out_file == NULL || handle_id == 0) {
         return -22;

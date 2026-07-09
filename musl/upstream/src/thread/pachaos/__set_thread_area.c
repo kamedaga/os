@@ -1,7 +1,5 @@
 #include <stdint.h>
-
-#define PACHAOS_SYSCALL_THREAD_SET_FS_BASE 11
-#define PACHAOS_SYSCALL_OK 0
+#include "pachaos/abi.h"
 
 static long pachaos_raw_syscall1(uint64_t nr, uint64_t a0)
 {

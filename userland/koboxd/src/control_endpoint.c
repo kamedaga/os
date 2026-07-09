@@ -1,7 +1,8 @@
 #include "control_endpoint.h"
 
 #include "ipc_wire.h"
-#include "koboxd/ipc_protocol.h"
+#include "koboxd/control_protocol_v2.h"
+#include "pacha/service_abi.h"
 
 #include <stdio.h>
 
@@ -16,10 +17,10 @@ int koboxd_control_serve_get_endpoint(
         fprintf(stderr, "[koboxd] control recv failed status=%d\n", status);
         return status;
     }
-    if (request.word0 != KOBOXD_WIRE_CONTROL_MAGIC ||
-        request.word1 != KOBOXD_WIRE_CONTROL_GET_ENDPOINT ||
+    if (request.word0 != KOBOXD_V2_CONTROL_MAGIC ||
+        request.word1 != KOBOXD_V2_CONTROL_GET_ENDPOINT ||
         request.word2 != expected_kind ||
-        request.word3 != KOBOXD_WIRE_VERSION)
+        request.word3 != PACHA_SERVICE_ABI_VERSION)
     {
         fprintf(stderr,
             "[koboxd] control request invalid word0=0x%llx op=%llu kind=%llu version=%llu\n",
@@ -36,7 +37,7 @@ int koboxd_control_serve_get_endpoint(
         return -3;
     }
     int client_fd = -1;
-    if (expected_kind == KOBOXD_WIRE_ENDPOINT_FILED) {
+    if (expected_kind == KOBOXD_V2_ENDPOINT_FILED) {
         const int endpoint_fd = pacha_ipc_endpoint_create(koboxd_service_channel_rights, 0);
         if (endpoint_fd < 16) {
             fprintf(stderr, "[koboxd] filed endpoint create failed status=%d\n", endpoint_fd);
@@ -94,7 +95,7 @@ int koboxd_block_serve_identify(
     if (status != 0) {
         return status;
     }
-    if (request.word0 != KOBOXD_WIRE_ENDPOINT_MAGIC || request.word1 != KOBOXD_WIRE_BLOCK_IDENTIFY) {
+    if (request.word0 != KOBOXD_V2_ENDPOINT_MAGIC || request.word1 != KOBOXD_V2_BLOCK_IDENTIFY) {
         return -2;
     }
     return koboxd_send_status_reply(

@@ -10,6 +10,14 @@ install_dir="${artifact_dir}/install"
 rootfs_lib_dir="${artifact_dir}/rootfs/lib"
 build_log="${artifact_dir}/build.log"
 jobs="${PACHAOS_MUSL_JOBS:-$(nproc)}"
+builtins_archive="${PACHAOS_MUSL_LIBCC:-}"
+
+if [ -z "${builtins_archive}" ]; then
+  builtins_archive="$(find /usr/lib/llvm-* /usr/lib/clang -path '*libclang_rt.builtins-x86_64.a' 2>/dev/null | sort -V | tail -n 1 || true)"
+fi
+if [ -z "${builtins_archive}" ] || [ ! -f "${builtins_archive}" ]; then
+  builtins_archive=""
+fi
 
 rm -rf "${artifact_dir}"
 mkdir -p "${build_dir}" "${install_dir}/usr/lib" "${rootfs_lib_dir}"
@@ -21,7 +29,7 @@ make_common=(
   "CC=clang"
   "AR=ar"
   "RANLIB=ranlib"
-  "LIBCC="
+  "LIBCC=${builtins_archive}"
   "CFLAGS=-target x86_64-linux-musl -mno-red-zone -fno-stack-protector -I${repo_root}/musl/pachaos/include -D__pachaos__ -O2"
   "LDFLAGS_AUTO=-Wl,--sort-section,alignment -Wl,--sort-common -Wl,--gc-sections -Wl,--hash-style=both -Wl,--exclude-libs=ALL -Wl,--dynamic-list=${repo_root}/musl/upstream/dynamic.list"
   "LDFLAGS=-fuse-ld=lld"

@@ -1,13 +1,14 @@
 #pragma once
 
+#include "pacha/service_abi.h"
 #include "pacha/ipc.h"
 
 #include <stdint.h>
 #include <stdio.h>
 
 enum {
-    KOBOXD_IPC_PROTOCOL_MAGIC = 0x314950494458424bull,
-    KOBOXD_IPC_PROTOCOL_VERSION = 1,
+    KOBOXD_IPC_PROTOCOL_MAGIC = 0x324950494458424bull,
+    KOBOXD_IPC_PROTOCOL_VERSION = PACHA_SERVICE_ABI_VERSION,
     KOBOXD_IPC_QUEUE_CAPACITY = 64,
     KOBOXD_IPC_INLINE_BYTES = 128,
     KOBOXD_IPC_INVALID_REQUEST_ID = 0,
@@ -33,40 +34,39 @@ typedef enum koboxd_ipc_request_flags {
 } koboxd_ipc_request_flags_t;
 
 typedef enum koboxd_control_op {
-    KOBOXD_CONTROL_HELLO = 1,
-    KOBOXD_CONTROL_GET_ENDPOINT = 2,
-    KOBOXD_CONTROL_SETUP_PKEY_DATA_PLANE = 3,
-    KOBOXD_CONTROL_CANCEL = 4,
-    KOBOXD_CONTROL_GET_METRICS = 5,
-    KOBOXD_CONTROL_DEBUG_DUMP = 6,
+    KOBOXD_CONTROL_HELLO = 0x0101u,
+    KOBOXD_CONTROL_GET_ENDPOINT = 0x0102u,
+    KOBOXD_CONTROL_SETUP_PKEY_DATA_PLANE = 0x0103u,
+    KOBOXD_CONTROL_CANCEL = 0x0104u,
+    KOBOXD_CONTROL_GET_METRICS = 0x0105u,
+    KOBOXD_CONTROL_DEBUG_DUMP = 0x7f01u,
 } koboxd_control_op_t;
 
 typedef enum koboxd_block_op {
-    KOBOXD_BLOCK_IDENTIFY = 1,
-    KOBOXD_BLOCK_READ = 2,
-    KOBOXD_BLOCK_WRITE = 3,
-    KOBOXD_BLOCK_FLUSH = 4,
+    KOBOXD_BLOCK_IDENTIFY = 0x0201u,
+    KOBOXD_BLOCK_READ = 0x0202u,
+    KOBOXD_BLOCK_WRITE = 0x0203u,
+    KOBOXD_BLOCK_FLUSH = 0x0204u,
 } koboxd_block_op_t;
 
 typedef enum koboxd_fs_backend_op {
-    KOBOXD_FS_MOUNT_ROOT = 1,
-    KOBOXD_FS_LOOKUP = 2,
-    KOBOXD_FS_OPEN = 3,
-    KOBOXD_FS_PREAD = 4,
-    KOBOXD_FS_PWRITE = 5,
-    KOBOXD_FS_STATX = 6,
-    KOBOXD_FS_GETDENTS = 7,
-    KOBOXD_FS_FSYNC = 8,
-    KOBOXD_FS_CREATE = 9,
-    KOBOXD_FS_TRUNCATE = 10,
-    KOBOXD_FS_UNLINK = 11,
-    KOBOXD_FS_RENAME = 12,
+    KOBOXD_FS_MOUNT_ROOT = 0x0101u,
+    KOBOXD_FS_LOOKUP = 0x0201u,
+    KOBOXD_FS_STATX = 0x0202u,
+    KOBOXD_FS_GETDENTS = 0x0203u,
+    KOBOXD_FS_PREAD = 0x0301u,
+    KOBOXD_FS_PWRITE = 0x0302u,
+    KOBOXD_FS_FSYNC = 0x0303u,
+    KOBOXD_FS_CREATE = 0x0401u,
+    KOBOXD_FS_TRUNCATE = 0x0402u,
+    KOBOXD_FS_UNLINK = 0x0403u,
+    KOBOXD_FS_RENAME = 0x0404u,
 } koboxd_fs_backend_op_t;
 
 typedef enum koboxd_event_op {
-    KOBOXD_EVENT_SUBSCRIBE = 1,
-    KOBOXD_EVENT_UNSUBSCRIBE = 2,
-    KOBOXD_EVENT_NEXT = 3,
+    KOBOXD_EVENT_SUBSCRIBE = 0x0601u,
+    KOBOXD_EVENT_UNSUBSCRIBE = 0x0602u,
+    KOBOXD_EVENT_NEXT = 0x0603u,
 } koboxd_event_op_t;
 
 typedef struct koboxd_ipc_header {

@@ -1,6 +1,6 @@
 #include "ipc_wire.h"
 
-#include "koboxd/ipc_protocol.h"
+#include "koboxd/control_protocol_v2.h"
 #include "pacha/abi.h"
 
 const uint64_t koboxd_service_channel_rights =
@@ -70,7 +70,7 @@ int koboxd_send_endpoint_fd(int control_fd, uint64_t request_id, uint64_t endpoi
         .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_CLOEXEC,
     };
     struct pacha_ipc_msg reply = {
-        .word0 = KOBOXD_WIRE_REPLY_MAGIC,
+        .word0 = KOBOXD_V2_REPLY_MAGIC,
         .word1 = 0,
         .word2 = endpoint_kind,
         .word3 = request_id,
@@ -83,7 +83,7 @@ int koboxd_send_endpoint_fd(int control_fd, uint64_t request_id, uint64_t endpoi
 int koboxd_send_status_reply(int fd, uint64_t request_id, uint64_t word2)
 {
     const struct pacha_ipc_msg reply = {
-        .word0 = KOBOXD_WIRE_REPLY_MAGIC,
+        .word0 = KOBOXD_V2_REPLY_MAGIC,
         .word1 = 0,
         .word2 = word2,
         .word3 = request_id,
@@ -94,7 +94,7 @@ int koboxd_send_status_reply(int fd, uint64_t request_id, uint64_t word2)
 int koboxd_send_status_reply_ex(int fd, uint64_t request_id, int64_t status, uint64_t result)
 {
     const struct pacha_ipc_msg reply = {
-        .word0 = KOBOXD_WIRE_REPLY_MAGIC,
+        .word0 = KOBOXD_V2_REPLY_MAGIC,
         .word1 = (uint64_t)status,
         .word2 = result,
         .word3 = request_id,

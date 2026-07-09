@@ -2,7 +2,7 @@
 #define TERMD_LINUX_TTY_ISLAND_H
 
 #include "termd/boot_config.h"
-#include "termd/ipc_protocol.h"
+#include "termd/ipc_protocol_v2.h"
 
 #include <stdint.h>
 
@@ -50,15 +50,15 @@ int termd_linux_tty_island_open_ptmx(
     uint64_t *out_handle);
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
-    const termd_wire_open_t *request,
+    const termd_v2_open_request_t *request,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
-    const termd_wire_open_t *request,
+    const termd_v2_open_request_t *request,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
-    const termd_wire_open_t *request,
+    const termd_v2_open_request_t *request,
     uint64_t *out_handle);
 int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t handle);
 int termd_linux_tty_island_dup(
@@ -67,19 +67,19 @@ int termd_linux_tty_island_dup(
     uint64_t *out_handle);
 int termd_linux_tty_island_ioctl(
     struct termd_linux_tty_island *island,
-    termd_wire_ioctl_t *request);
+    termd_v2_ioctl_request_t *request);
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
-    termd_wire_poll_t *request);
+    termd_v2_poll_request_t *request);
 void termd_linux_tty_island_pump(struct termd_linux_tty_island *island);
 int termd_linux_tty_island_io(
     struct termd_linux_tty_island *island,
     int write,
-    termd_wire_io_t *request,
+    termd_v2_io_request_t *request,
     uint64_t *out_result);
 int termd_linux_tty_island_take_signal(
     struct termd_linux_tty_island *island,
-    termd_wire_signal_t *request,
+    termd_v2_signal_request_t *request,
     uint64_t *out_result);
 
 #endif

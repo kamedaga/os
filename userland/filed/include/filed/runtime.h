@@ -39,12 +39,17 @@ typedef struct filed_runtime {
     filed_tmpfs_backend_t tmpfs;
     int bootstrap_fd;
     int client_endpoint_fd;
+    int syncer_timer_fd;
     int netd_socket_endpoint_fd;
     int termd_tty_endpoint_fd;
     filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
     filed_file_vmo_cache_entry_t file_vmo_cache[FILED_RUNTIME_FILE_VMO_CACHE_SLOTS];
     uint64_t request_sequence;
     uint64_t file_vmo_cache_clock;
+    uint64_t syncer_ticks;
+    uint64_t syncer_flushes;
+    uint64_t syncer_errors;
+    int syncer_last_status;
     uint64_t root_size;
     filed_mount_id_t root_mount_id;
     filed_handle_id_t root_handle_id;

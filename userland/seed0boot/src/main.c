@@ -5,9 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "filed/ipc_protocol.h"
+#include "filed/ipc_protocol_v2.h"
 #include "termd/boot_config.h"
-#include "termd/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pachaos_capsule_launcher.h"
 
@@ -45,37 +44,92 @@ enum {
     SEED0_SERVICES_READY_MAGIC = 0x3159445256533053ull,
 };
 
-static int seed0_register_netd_socket_endpoint(int filed_endpoint_fd, int netd_socket_endpoint_fd)
+static void *seed0_filed_v2_payload(void *page)
 {
-    if (filed_endpoint_fd < 16 || netd_socket_endpoint_fd < 16) {
+    return page == NULL ? NULL : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
+}
+
+static int seed0_filed_v2_call(
+    int filed_endpoint_fd,
+    uint32_t op,
+    uint64_t request_id,
+    int transfer_fd)
+{
+    if (filed_endpoint_fd < 16 || request_id == 0) {
         return -22;
     }
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)netd_socket_endpoint_fd;
-    fd_item.rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_DUP |
-        PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL |
+    const uint64_t page_rights =
         PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_SEND |
-        PACHA_FD_RIGHT_RECV |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CALL |
-        PACHA_FD_RIGHT_TRANSFER;
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    const int page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, page_rights, 0);
+    if (page_fd < 16) {
+        return page_fd;
+    }
+    void *page = pacha_mmap(
+        page_fd,
+        PACHA_SERVICE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        (void)pacha_fd_close(page_fd);
+        return -5;
+    }
+    memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
+    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->service_id = FILED_V2_SERVICE_ID;
+    header->op = op;
+    const int has_service_payload =
+        op == FILED_V2_OP_SERVICE_SET_NETD_SOCKET ||
+        op == FILED_V2_OP_SERVICE_SET_TERMD_TTY;
+    header->flags = has_service_payload ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
+    header->request_id = request_id;
+    header->trace_id = request_id;
+    header->payload_size = has_service_payload ? sizeof(filed_v2_service_endpoint_request_t) : 0;
+    header->fd_count = transfer_fd >= 16 ? 1u : 0u;
+    if (has_service_payload) {
+        filed_v2_service_endpoint_request_t *payload =
+            (filed_v2_service_endpoint_request_t *)seed0_filed_v2_payload(page);
+        payload->endpoint_kind = op;
+    }
 
-    const uint64_t request_id = 0x53454544304e4554ull;
+    struct pacha_ipc_fd fds[2];
+    memset(fds, 0, sizeof(fds));
+    fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    fds[0].rights = page_rights;
+    uint64_t fd_count = 1;
+    if (transfer_fd >= 16) {
+        fds[1].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[1].rights =
+            PACHA_FD_RIGHT_INSPECT |
+            PACHA_FD_RIGHT_DUP |
+            PACHA_FD_RIGHT_WAIT |
+            PACHA_FD_RIGHT_POLL |
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_SEND |
+            PACHA_FD_RIGHT_RECV |
+            PACHA_FD_RIGHT_SET_FLAGS |
+            PACHA_FD_RIGHT_CALL |
+            PACHA_FD_RIGHT_TRANSFER;
+        fd_count = 2;
+    }
+
     const struct pacha_ipc_msg request = {
-        .word0 = FILED_WIRE_REQUEST_MAGIC,
-        .word1 = FILED_WIRE_OP_SET_NETD_SOCKET_ENDPOINT,
+        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word1 = 0,
         .word2 = 0,
         .word3 = request_id,
-        .fds = &fd_item,
-        .fd_count = 1,
+        .fds = fds,
+        .fd_count = fd_count,
     };
     const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
     if (reply_fd < 16) {
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        (void)pacha_fd_close(page_fd);
         return reply_fd;
     }
 
@@ -84,99 +138,57 @@ static int seed0_register_netd_socket_endpoint(int filed_endpoint_fd, int netd_s
     const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
     (void)pacha_fd_close(reply_fd);
     if (recv_status != 0) {
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        (void)pacha_fd_close(page_fd);
         return recv_status;
     }
-    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
+    const pacha_service_reply_header_t *reply_header =
+        (const pacha_service_reply_header_t *)page;
+    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
-        (int64_t)reply.word1 != 0)
+        reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->op != op ||
+        reply_header->request_id != request_id ||
+        reply_header->status != 0)
     {
-        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+        const int status = reply_header->status != 0 ?
+            (int)reply_header->status :
+            (reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        (void)pacha_fd_close(page_fd);
+        return status;
     }
+    (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+    (void)pacha_fd_close(page_fd);
     return 0;
+}
+
+static int seed0_register_netd_socket_endpoint(int filed_endpoint_fd, int netd_socket_endpoint_fd)
+{
+    return seed0_filed_v2_call(
+        filed_endpoint_fd,
+        FILED_V2_OP_SERVICE_SET_NETD_SOCKET,
+        0x53454544304e4554ull,
+        netd_socket_endpoint_fd);
 }
 
 static int seed0_register_termd_tty_endpoint(int filed_endpoint_fd, int termd_tty_endpoint_fd)
 {
-    if (filed_endpoint_fd < 16 || termd_tty_endpoint_fd < 16) {
-        return -22;
-    }
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)termd_tty_endpoint_fd;
-    fd_item.rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_DUP |
-        PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_SEND |
-        PACHA_FD_RIGHT_RECV |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CALL |
-        PACHA_FD_RIGHT_TRANSFER;
-
-    const uint64_t request_id = 0x5345454430545459ull;
-    const struct pacha_ipc_msg request = {
-        .word0 = FILED_WIRE_REQUEST_MAGIC,
-        .word1 = FILED_WIRE_OP_SET_TERMD_TTY_ENDPOINT,
-        .word2 = 0,
-        .word3 = request_id,
-        .fds = &fd_item,
-        .fd_count = 1,
-    };
-    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
-    if (reply_fd < 16) {
-        return reply_fd;
-    }
-
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    if (recv_status != 0) {
-        return recv_status;
-    }
-    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
-        reply.word3 != request_id ||
-        (int64_t)reply.word1 != 0)
-    {
-        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
-    }
-    return 0;
+    return seed0_filed_v2_call(
+        filed_endpoint_fd,
+        FILED_V2_OP_SERVICE_SET_TERMD_TTY,
+        0x5345454430545459ull,
+        termd_tty_endpoint_fd);
 }
 
 static int seed0_wait_filed_ready(int filed_endpoint_fd)
 {
-    if (filed_endpoint_fd < 16) {
-        return -22;
-    }
-
-    const uint64_t request_id = 0x534545443046494cull;
-    const struct pacha_ipc_msg request = {
-        .word0 = FILED_WIRE_REQUEST_MAGIC,
-        .word1 = FILED_WIRE_OP_HELLO,
-        .word2 = 0,
-        .word3 = request_id,
-    };
-    const int reply_fd = pacha_ipc_call(filed_endpoint_fd, &request);
-    if (reply_fd < 16) {
-        return reply_fd;
-    }
-
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    if (recv_status != 0) {
-        return recv_status;
-    }
-    if (reply.word0 != FILED_WIRE_REPLY_MAGIC ||
-        reply.word3 != request_id ||
-        (int64_t)reply.word1 != 0)
-    {
-        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
-    }
-    return 0;
+    return seed0_filed_v2_call(
+        filed_endpoint_fd,
+        FILED_V2_OP_HELLO,
+        0x534545443046494cull,
+        -1);
 }
 
 static int seed0_wait_termd_ready(int termd_ready_channel_fd)

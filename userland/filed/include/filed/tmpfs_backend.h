@@ -4,10 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "koboxd/ipc_protocol.h"
+#include "koboxd/storage_protocol_v2.h"
 
 enum {
-    FILED_TMPFS_NAME_BYTES = KOBOXD_WIRE_FS_NAME_BYTES,
+    FILED_TMPFS_NAME_BYTES = STORAGE_V2_NAME_BYTES,
     FILED_TMPFS_PAGE_BYTES = 4096,
     FILED_TMPFS_NODE_MAX_PAGES = 4096,
     FILED_TMPFS_MAX_FILE_BYTES = FILED_TMPFS_PAGE_BYTES * FILED_TMPFS_NODE_MAX_PAGES,
@@ -20,7 +20,7 @@ bool filed_tmpfs_backend_is_object(uint64_t object_id);
 uint64_t filed_tmpfs_backend_root_object(const filed_tmpfs_backend_t *backend);
 int filed_tmpfs_backend_mount_root(filed_tmpfs_backend_t *backend, uint64_t *out_root_object_id);
 int filed_tmpfs_backend_lookup(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
-int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id, koboxd_wire_fs_statx_t *out_stat);
+int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id, storage_v2_statx_reply_t *out_stat);
 int filed_tmpfs_backend_pread(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_tmpfs_backend_pwrite(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_tmpfs_backend_fsync(filed_tmpfs_backend_t *backend, uint64_t object_id);
@@ -36,4 +36,4 @@ int filed_tmpfs_backend_mkdir(filed_tmpfs_backend_t *backend, uint64_t parent_ob
 int filed_tmpfs_backend_rmdir(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name);
 int filed_tmpfs_backend_rename(filed_tmpfs_backend_t *backend, uint64_t old_parent_object_id, const char *old_name, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
 int filed_tmpfs_backend_release_object(filed_tmpfs_backend_t *backend, uint64_t object_id);
-int filed_tmpfs_backend_getdents(filed_tmpfs_backend_t *backend, uint64_t dir_object_id, uint64_t offset, koboxd_wire_fs_getdents_t *out_entries);
+int filed_tmpfs_backend_getdents(filed_tmpfs_backend_t *backend, uint64_t dir_object_id, uint64_t offset, storage_v2_getdents_request_t *out_entries);
