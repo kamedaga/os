@@ -55,6 +55,7 @@ pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
+pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
 pub const syscall_munmap: u64 = vm_abi.syscall_munmap;
 pub const syscall_mprotect: u64 = vm_abi.syscall_mprotect;
@@ -80,7 +81,7 @@ pub const syscall_capsule_pci_config_write: u64 = capsule_abi.syscall_capsule_pc
 pub const syscall_capsule_pci_bar_info: u64 = capsule_abi.syscall_capsule_pci_bar_info;
 pub const syscall_capsule_irq_poll: u64 = capsule_abi.syscall_capsule_irq_poll;
 
-pub const syscall_last: u64 = syscall_capsule_irq_poll;
+pub const syscall_last: u64 = syscall_vmo_revoke;
 
 pub const user_log_max_bytes: usize = 256;
 
@@ -163,6 +164,7 @@ test "native syscall numbers are contiguous" {
         syscall_capsule_pci_config_write,
         syscall_capsule_pci_bar_info,
         syscall_capsule_irq_poll,
+        syscall_vmo_revoke,
     };
     try std.testing.expectEqual(@as(usize, syscall_last), expected.len);
     for (expected, 1..) |nr, index| {

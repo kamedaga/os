@@ -631,9 +631,32 @@ fn defaultVmoRights(rights: kernel.FdRights) kernel.FdRights {
             .close = true,
             .map_read = true,
             .map_write = true,
+            .revoke = true,
         };
     }
     return out;
+}
+
+const VmoRevokeUnmapper = struct {
+    pub fn unmap(_: VmoRevokeUnmapper, owner: kernel.PrincipalId, start_va: u64, size_bytes: u64) bool {
+        if (size_bytes > @import("std").math.maxInt(usize)) return false;
+        return user_vm.unmapPresentUserLinearRegion(owner, start_va, @intCast(size_bytes));
+    }
+};
+
+fn revokeVmoFd(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    fd: kernel.Fd,
+    free_list: *kernel.FreePageList,
+) u64 {
+    user_vm.lockAddressSpaces();
+    defer user_vm.unlockAddressSpaces();
+    _ = state.revokeVmoFdWithFreeList(proc, fd, free_list, VmoRevokeUnmapper{}) catch |err| switch (err) {
+        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+        else => return sc.syscall_err_invalid,
+    };
+    return sc.syscall_ok;
 }
 
 fn mapVmoFd(
@@ -989,6 +1012,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             first_dynamic_fd,
             h.free_list,
         ) catch sc.syscall_err_alloc,
+        sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
             if (frame.rsi == 0 or (frame.rdi & 0xFFF) != 0) break :blk sc.syscall_err_invalid;

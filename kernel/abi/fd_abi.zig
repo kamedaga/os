@@ -21,6 +21,7 @@ pub const syscall_timerfd_create: u64 = 43;
 pub const syscall_timerfd_settime: u64 = 44;
 pub const syscall_timerfd_gettime: u64 = 45;
 pub const syscall_vmo_create: u64 = 46;
+pub const syscall_vmo_revoke: u64 = 69;
 pub const syscall_fd_last: u64 = syscall_vmo_create;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -43,6 +44,7 @@ pub const right_set_flags: u64 = 1 << 5;
 pub const right_close: u64 = 1 << 6;
 pub const right_read: u64 = 1 << 42;
 pub const right_write: u64 = 1 << 43;
+pub const right_revoke: u64 = 1 << 44;
 pub const right_map_read: u64 = 1 << 13;
 pub const right_map_write: u64 = 1 << 14;
 pub const right_map_exec: u64 = 1 << 15;
@@ -66,7 +68,8 @@ pub const known_common_rights_mask: u64 =
     right_resize |
     right_share |
     right_pager_attach |
-    right_pager_fault;
+    right_pager_fault |
+    right_revoke;
 
 pub const fd_kind_none: u64 = 0;
 pub const fd_kind_process: u64 = 1;

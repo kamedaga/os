@@ -54,6 +54,12 @@ fn mmapFlags(comptime fields: anytype) kernel.MmapFlags {
     return flags;
 }
 
+const NoopUnmapper = struct {
+    pub fn unmap(_: NoopUnmapper, _: PrincipalId, _: u64, _: u64) bool {
+        return true;
+    }
+};
+
 test "fd install allocates lowest slots and close releases object" {
     var s = try initFdState();
     const obj0 = try createTestFdObject(&s, 1);
@@ -556,6 +562,189 @@ test "native vmo pages return to free list after vma and fd release" {
     try s.munmapRangeWithFreeList(p0, 0x4400_0000, 8192, &free_list);
     try std.testing.expectEqual(original_free, free_list.len);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+}
+
+test "mprotect split and mremap keep vmo refs until final munmap" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x30_0000, 8);
+    const original_free = free_list.len;
+
+    const fd = try s.createAnonymousVmoFdWithPages(
+        p0,
+        12288,
+        fdRights(.{ .close = true, .map_read = true, .map_write = true }),
+        .{},
+        16,
+        &free_list,
+    );
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    _ = try s.mmapFd(
+        p0,
+        fd,
+        0x4800_0000,
+        12288,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .anonymous = true }),
+        0,
+    );
+    try s.setVmaProtRange(p0, 0x4800_1000, 4096, vmaProt(.{ .read = true }));
+    try std.testing.expectEqual(@as(?u32, 4), s.nativeVmoRefCount(vmo));
+
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(?u32, 3), s.nativeVmoRefCount(vmo));
+    try s.munmapRangeWithFreeList(p0, 0x4800_0000, 12288, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+    try std.testing.expectEqual(original_free, free_list.len);
+
+    const fd2 = try s.createAnonymousVmoFdWithPages(
+        p0,
+        4096,
+        fdRights(.{ .close = true, .map_read = true, .map_write = true }),
+        .{},
+        16,
+        &free_list,
+    );
+    const vmo2 = s.nativeVmoRefForFd(p0, fd2) orelse unreachable;
+    _ = try s.mmapFd(
+        p0,
+        fd2,
+        0x4810_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .anonymous = true }),
+        0,
+    );
+    const moved = try s.mremapRangeWithFreeList(p0, 0x4810_0000, 4096, 4096, 0x4820_0000, true, true, &free_list);
+    try std.testing.expectEqual(@as(u64, 0x4820_0000), moved);
+    try s.closeFdWithFreeList(p0, fd2, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo2));
+    try s.munmapRangeWithFreeList(p0, 0x4820_0000, 4096, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo2));
+    try std.testing.expectEqual(original_free, free_list.len);
+}
+
+test "fork fd and vma clones release vmo pages only after child cleanup" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x40_0000, 4);
+    const original_free = free_list.len;
+
+    const rights = fdRights(.{ .close = true, .map_read = true, .map_write = true });
+    const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, rights, .{}, 16, &free_list);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    _ = try s.mmapFd(p0, fd, 0x4900_0000, 8192, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+    try s.cloneFdTableForFork(p0, p1);
+    try s.cloneVmaTableForFork(p0, p1);
+    try std.testing.expectEqual(@as(?u32, 3), s.nativeVmoRefCount(vmo));
+
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try s.munmapRangeWithFreeList(p0, 0x4900_0000, 8192, &free_list);
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(vmo));
+    try std.testing.expectEqual(original_free - 2, free_list.len);
+
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+    try std.testing.expectEqual(original_free, free_list.len);
+}
+
+test "exec vma replacement releases old mappings and moves staged mappings" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x60_0000, 4);
+    const original_free = free_list.len;
+
+    const old_fd = try s.createAnonymousVmoFdWithPages(
+        p0,
+        4096,
+        fdRights(.{ .close = true, .map_read = true }),
+        .{},
+        16,
+        &free_list,
+    );
+    const old_vmo = s.nativeVmoRefForFd(p0, old_fd) orelse unreachable;
+    _ = try s.mmapFd(p0, old_fd, 0x4c00_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+
+    const staged_fd = try s.createAnonymousVmoFdWithPages(
+        p1,
+        4096,
+        fdRights(.{ .close = true, .map_read = true }),
+        .{},
+        16,
+        &free_list,
+    );
+    const staged_vmo = s.nativeVmoRefForFd(p1, staged_fd) orelse unreachable;
+    _ = try s.mmapFd(p1, staged_fd, 0x4d00_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+
+    try s.replaceVmaTableForExec(p0, p1, &free_list);
+    try std.testing.expect(s.vmaEntryConst(p0, 0x4c00_0000) == null);
+    try std.testing.expect((s.vmaEntryConst(p0, 0x4d00_0000) orelse unreachable).vmo.index == staged_vmo.index);
+    try std.testing.expect(s.vmaEntryConst(p1, 0x4d00_0000) == null);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(old_vmo));
+
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(staged_vmo));
+    try s.closeFdWithFreeList(p0, old_fd, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(old_vmo));
+    try s.munmapRangeWithFreeList(p0, 0x4d00_0000, 4096, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(staged_vmo));
+    try std.testing.expectEqual(original_free, free_list.len);
+}
+
+test "vmo revoke removes all fd vma and pending ipc references" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x50_0000, 6);
+    const original_free = free_list.len;
+
+    const owner_rights = fdRights(.{
+        .inspect = true,
+        .dup = true,
+        .transfer = true,
+        .close = true,
+        .map_read = true,
+        .map_write = true,
+        .revoke = true,
+    });
+    const fd = try s.createAnonymousVmoFdWithPages(p0, 8192, owner_rights, .{}, 16, &free_list);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    const dup_fd = try s.dupFd(p0, fd, 16, fdRights(.{ .close = true, .map_read = true }), .{});
+    const child_fd = try s.transferFd(
+        p0,
+        p1,
+        fd,
+        16,
+        fdRights(.{ .transfer = true, .close = true, .map_read = true }),
+        .{},
+        .copy,
+    );
+
+    _ = try s.mmapFd(p0, fd, 0x4a00_0000, 8192, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+    _ = try s.mmapFd(p1, child_fd, 0x4b00_0000, 4096, vmaProt(.{ .read = true }), mmapFlags(.{ .anonymous = true }), 0);
+
+    const endpoint = try s.createIpcEndpointFd(p2, fdRights(.{ .send = true, .recv = true, .transfer = true, .close = true }), .{}, 16);
+    const remote_endpoint = try s.transferFd(p2, p1, endpoint, 16, fdRights(.{ .send = true, .close = true }), .{}, .copy);
+    const send_fds = [_]kernel.IpcSendFd{.{
+        .fd = child_fd,
+        .rights = fdRights(.{ .map_read = true, .close = true }),
+        .move = true,
+    }};
+    try s.ipcSend(p1, remote_endpoint, .{ .words = .{ 7, 0, 0, 0 }, .fds = send_fds[0..] }, &free_list);
+    try std.testing.expect(s.fdEntryConst(p1, child_fd) == null);
+    try std.testing.expectError(KernelError.InvalidState, s.revokeVmoFdWithFreeList(p0, dup_fd, &free_list, NoopUnmapper{}));
+
+    _ = try s.revokeVmoFdWithFreeList(p0, fd, &free_list, NoopUnmapper{});
+    try std.testing.expect(s.fdEntryConst(p0, fd) == null);
+    try std.testing.expect(s.fdEntryConst(p0, dup_fd) == null);
+    try std.testing.expect(s.vmaEntryConst(p0, 0x4a00_0000) == null);
+    try std.testing.expect(s.vmaEntryConst(p1, 0x4b00_0000) == null);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+    try std.testing.expectEqual(original_free, free_list.len);
+    try std.testing.expectError(KernelError.InvalidState, s.closeFdWithFreeList(p0, fd, &free_list));
+
+    const received = try s.ipcRecv(p2, endpoint, 1, 16, &free_list);
+    try std.testing.expectEqual(@as(usize, 0), received.fd_count);
+    try std.testing.expectEqual(@as(u64, 7), received.words[0]);
 }
 
 test "shared vmo fd pages survive munmap while fd remains open" {
