@@ -1010,7 +1010,7 @@ static int lpr_exec_read_file_range_ex(
     {
         uint64_t direct_got = 0;
         stage_start = lpr_exec_image_now_ns();
-        const int flush_status = filed_page_cache_flush_object(runtime, file->backend_object);
+        const int flush_status = filed_cache_flush_object(runtime, file->backend_object);
         lpr_exec_image_metric("bulk_flush", stage_start, lpr_exec_image_now_ns(), length);
         if (flush_status != 0) {
             return flush_status;
@@ -1117,7 +1117,7 @@ int lpr_exec_read_file_range_for_load(
     {
         uint64_t direct_got = 0;
         stage_start = lpr_exec_image_now_ns();
-        const int flush_status = filed_page_cache_flush_object(runtime, file->backend_object);
+        const int flush_status = filed_cache_flush_object(runtime, file->backend_object);
         lpr_exec_image_metric("bulk_flush", stage_start, lpr_exec_image_now_ns(), length);
         if (flush_status != 0) {
             free(buffer);

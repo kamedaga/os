@@ -1,4 +1,6 @@
-static int64_t filed_status_to_wire(filed_status_t status)
+#include "common.h"
+
+int64_t filed_status_to_wire(filed_status_t status)
 {
     switch (status) {
     case FILED_OK:
@@ -36,7 +38,7 @@ static int64_t filed_status_to_wire(filed_status_t status)
     return -PACHA_LINUX_EINVAL;
 }
 
-static int filed_release_reclaimed_object(
+int filed_release_reclaimed_object(
     filed_runtime_t *runtime,
     const filed_vfs_reclaim_result_t *reclaim)
 {
@@ -46,7 +48,7 @@ static int filed_release_reclaimed_object(
     return filed_backend_release_object(runtime, reclaim->backend_object);
 }
 
-static int64_t filed_close_handle_runtime(
+int64_t filed_close_handle_runtime(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id)
 {
@@ -61,7 +63,7 @@ static int64_t filed_close_handle_runtime(
         return filed_status_to_wire(status);
     }
     if (reclaim.released && reclaim.backend_object != 0) {
-        const int flush_status = filed_page_cache_flush_object(runtime, reclaim.backend_object);
+        const int flush_status = filed_cache_flush_object(runtime, reclaim.backend_object);
         if (flush_status != 0) {
             return flush_status;
         }
@@ -69,7 +71,7 @@ static int64_t filed_close_handle_runtime(
     return filed_release_reclaimed_object(runtime, &reclaim);
 }
 
-static void filed_write_u64_le(void *base, uint64_t offset, uint64_t value)
+void filed_write_u64_le(void *base, uint64_t offset, uint64_t value)
 {
     unsigned char *p = (unsigned char *)base + offset;
     for (unsigned int i = 0; i < 8; ++i) {
@@ -77,7 +79,7 @@ static void filed_write_u64_le(void *base, uint64_t offset, uint64_t value)
     }
 }
 
-static filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind)
+filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind)
 {
     switch (kind & 0170000u) {
     case 0040000u:
@@ -96,7 +98,7 @@ static filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind)
     }
 }
 
-static uint32_t filed_v2_rights_to_vfs(uint64_t rights)
+uint32_t filed_v2_rights_to_vfs(uint64_t rights)
 {
     const uint64_t known =
         FILED_V2_RIGHT_LOOKUP |
@@ -111,7 +113,7 @@ static uint32_t filed_v2_rights_to_vfs(uint64_t rights)
     return (uint32_t)(rights & known);
 }
 
-static uint32_t filed_v2_open_flags_to_vfs(uint64_t flags)
+uint32_t filed_v2_open_flags_to_vfs(uint64_t flags)
 {
     const uint64_t known =
         FILED_V2_OPEN_CREATE |
@@ -126,12 +128,12 @@ static uint32_t filed_v2_open_flags_to_vfs(uint64_t flags)
     return (uint32_t)(flags & known);
 }
 
-static uint32_t filed_v2_fd_flags_to_vfs(uint64_t flags)
+uint32_t filed_v2_fd_flags_to_vfs(uint64_t flags)
 {
     return (uint32_t)(flags & FILED_V2_FD_CLOEXEC);
 }
 
-static uint32_t filed_v2_file_status_flags_to_vfs(uint64_t flags)
+uint32_t filed_v2_file_status_flags_to_vfs(uint64_t flags)
 {
     const uint64_t known =
         FILED_V2_FILE_APPEND |
@@ -140,12 +142,12 @@ static uint32_t filed_v2_file_status_flags_to_vfs(uint64_t flags)
     return (uint32_t)(flags & known);
 }
 
-static uint64_t filed_vfs_fd_flags_to_wire(uint32_t flags)
+uint64_t filed_vfs_fd_flags_to_wire(uint32_t flags)
 {
     return (uint64_t)(flags & FILED_FD_CLOEXEC);
 }
 
-static uint64_t filed_vfs_file_status_flags_to_wire(uint32_t flags)
+uint64_t filed_vfs_file_status_flags_to_wire(uint32_t flags)
 {
     const uint32_t known =
         FILED_FILE_APPEND |
@@ -154,7 +156,7 @@ static uint64_t filed_vfs_file_status_flags_to_wire(uint32_t flags)
     return (uint64_t)(flags & known);
 }
 
-static int filed_v2_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
+int filed_v2_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
 {
     const uint64_t known_fd = FILED_V2_FD_CLOEXEC;
     const uint64_t known_status =
@@ -164,7 +166,7 @@ static int filed_v2_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
     return (fd_flags & ~known_fd) == 0 && (status_flags & ~known_status) == 0;
 }
 
-static void *filed_map_request_page(
+void *filed_map_request_page(
     const struct pacha_ipc_msg *request,
     uint64_t size,
     int *out_fd)
@@ -187,14 +189,7 @@ static void *filed_map_request_page(
         0);
 }
 
-typedef struct filed_page_dispatch_result {
-    int64_t status;
-    uint64_t result;
-    int process_fd;
-    int thread_fd;
-} filed_page_dispatch_result_t;
-
-static filed_page_dispatch_result_t filed_page_result(int64_t status, uint64_t result)
+filed_page_dispatch_result_t filed_page_result(int64_t status, uint64_t result)
 {
     filed_page_dispatch_result_t out;
     memset(&out, 0, sizeof(out));
@@ -205,7 +200,7 @@ static filed_page_dispatch_result_t filed_page_result(int64_t status, uint64_t r
     return out;
 }
 
-static int filed_write_stat_from_backend(
+int filed_write_stat_from_backend(
     filed_v2_statx_t *out,
     const storage_v2_statx_reply_t *stat,
     uint64_t handle_id,
@@ -233,7 +228,7 @@ static int filed_write_stat_from_backend(
     return 0;
 }
 
-static filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
+filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
     const storage_v2_statx_reply_t *stat,
     uint64_t handle_id,
     uint64_t object_generation,
@@ -263,7 +258,7 @@ static filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
     return snapshot;
 }
 
-static filed_vfs_stat_snapshot_t filed_directory_snapshot_from_create(
+filed_vfs_stat_snapshot_t filed_directory_snapshot_from_create(
     uint64_t handle_id,
     uint64_t mode,
     uint64_t object_generation,
@@ -284,7 +279,7 @@ static filed_vfs_stat_snapshot_t filed_directory_snapshot_from_create(
     return snapshot;
 }
 
-static filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(
+filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(
     uint64_t handle_id,
     uint64_t target_length,
     uint64_t object_generation,
@@ -305,7 +300,7 @@ static filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(
     return snapshot;
 }
 
-static int filed_write_stat_from_snapshot(
+int filed_write_stat_from_snapshot(
     filed_v2_statx_t *out,
     const filed_vfs_stat_snapshot_t *snapshot,
     uint64_t handle_id)
@@ -333,7 +328,7 @@ static int filed_write_stat_from_snapshot(
     return 0;
 }
 
-static int filed_backend_object_for_handle(
+int filed_backend_object_for_handle(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id,
     filed_vfs_io_decision_t *out_decision)
@@ -345,7 +340,7 @@ static int filed_backend_object_for_handle(
     return filed_status_to_wire(status);
 }
 
-static int filed_name_is_terminated(const char *name, size_t capacity)
+int filed_name_is_terminated(const char *name, size_t capacity)
 {
     return name != NULL && memchr(name, '\0', capacity) != NULL;
 }
@@ -357,7 +352,7 @@ enum {
         FILED_RIGHT_GETDENTS,
 };
 
-static const char *filed_skip_slashes(const char *path)
+const char *filed_skip_slashes(const char *path)
 {
     while (path != NULL && *path == '/') {
         ++path;
@@ -365,7 +360,7 @@ static const char *filed_skip_slashes(const char *path)
     return path;
 }
 
-static int filed_path_is_single_component(const char *path)
+int filed_path_is_single_component(const char *path)
 {
     path = filed_skip_slashes(path);
     if (path == NULL || *path == '\0') {
@@ -378,7 +373,7 @@ static int filed_path_is_single_component(const char *path)
     return path != NULL && *path == '\0';
 }
 
-static int filed_path_component_is_tmp(const char *component, size_t len)
+int filed_path_component_is_tmp(const char *component, size_t len)
 {
     return len == 3u &&
         component[0] == 't' &&
@@ -386,7 +381,7 @@ static int filed_path_component_is_tmp(const char *component, size_t len)
         component[2] == 'p';
 }
 
-static void filed_close_walk_handle(
+void filed_close_walk_handle(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id,
     int owned)
@@ -401,7 +396,7 @@ static void filed_close_walk_handle(
     }
 }
 
-static int64_t filed_lookup_and_open_component(
+int64_t filed_lookup_and_open_component(
     filed_runtime_t *runtime,
     filed_handle_id_t parent_handle,
     const char *name,
@@ -409,7 +404,7 @@ static int64_t filed_lookup_and_open_component(
     uint32_t open_flags,
     filed_vfs_open_result_t *out_open);
 
-static int64_t filed_lookup_component_stat(
+int64_t filed_lookup_component_stat(
     filed_runtime_t *runtime,
     filed_handle_id_t parent_handle,
     const char *name,
@@ -437,7 +432,7 @@ static int64_t filed_lookup_component_stat(
     return filed_backend_statx(runtime, *out_object_id, out_stat);
 }
 
-static int64_t filed_splice_symlink_target(
+int64_t filed_splice_symlink_target(
     filed_runtime_t *runtime,
     uint64_t object_id,
     const char *rest,
@@ -486,7 +481,7 @@ static int64_t filed_splice_symlink_target(
     return 0;
 }
 
-static int64_t filed_resolve_parent_path(
+int64_t filed_resolve_parent_path(
     filed_runtime_t *runtime,
     filed_handle_id_t base_dir_handle,
     const char *path,
@@ -683,7 +678,7 @@ static int64_t filed_resolve_parent_path(
     }
 }
 
-static int64_t filed_lookup_and_open_component(
+int64_t filed_lookup_and_open_component(
     filed_runtime_t *runtime,
     filed_handle_id_t parent_handle,
     const char *name,
@@ -748,7 +743,7 @@ static int64_t filed_lookup_and_open_component(
         if (reply_status != 0) {
             return reply_status;
         }
-        filed_dir_cache_invalidate_dir(runtime, parent_decision.backend_object);
+        filed_cache_invalidate(runtime, parent_decision.backend_object);
         memset(&backend_stat, 0, sizeof(backend_stat));
         reply_status = filed_backend_statx(
             runtime,
@@ -817,7 +812,7 @@ static int64_t filed_lookup_and_open_component(
     if (status == FILED_OK) {
         filed_vfs_stat_snapshot_t current_snapshot;
         memset(&current_snapshot, 0, sizeof(current_snapshot));
-        if (filed_page_cache_object_dirty(runtime, object_id) &&
+        if (filed_cache_object_dirty(runtime, object_id) &&
             filed_vfs_get_stat_snapshot(
                 &runtime->vfs,
                 out_open->handle_id,
@@ -840,7 +835,7 @@ static int64_t filed_lookup_and_open_component(
         }
     }
     if (status == FILED_OK && (open_flags & FILED_OPEN_TRUNCATE) != 0) {
-        reply_status = filed_page_cache_flush_object(runtime, object_id);
+        reply_status = filed_cache_flush_object(runtime, object_id);
         if (reply_status != 0) {
             (void)filed_vfs_close_handle(&runtime->vfs, out_open->handle_id);
             memset(out_open, 0, sizeof(*out_open));
@@ -855,7 +850,7 @@ static int64_t filed_lookup_and_open_component(
             memset(out_open, 0, sizeof(*out_open));
             return reply_status;
         }
-        filed_page_cache_invalidate_object(runtime, object_id);
+        filed_cache_invalidate(runtime, object_id);
         (void)filed_vfs_note_truncate(&runtime->vfs, out_open->handle_id, 0);
         {
             filed_vfs_stat_snapshot_t snapshot;
@@ -869,7 +864,7 @@ static int64_t filed_lookup_and_open_component(
     return filed_status_to_wire(status);
 }
 
-static int64_t filed_openat_path(
+int64_t filed_openat_path(
     filed_runtime_t *runtime,
     const filed_v2_openat_t *openat,
     filed_vfs_open_result_t *out_open)
@@ -1053,4 +1048,3 @@ static int64_t filed_openat_path(
         }
     }
 }
-

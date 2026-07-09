@@ -1,3 +1,5 @@
+#include "common.h"
+
 void filed_dump_cache_metrics(const filed_runtime_t *runtime)
 {
     (void)runtime;
@@ -14,7 +16,7 @@ void filed_dump_cache_metrics(const filed_runtime_t *runtime)
     pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 11, filed_dir_cache.evictions);
 }
 
-static uint64_t filed_error_token(
+uint64_t filed_error_token(
     int64_t status,
     uint64_t op,
     uint64_t stage,
@@ -46,7 +48,7 @@ static uint64_t filed_error_token(
     return 0;
 }
 
-static int filed_send_reply_v2_payload(
+int filed_send_reply_v2_payload(
     int reply_fd,
     void *page,
     const pacha_service_request_header_t *header,
@@ -77,7 +79,7 @@ static int filed_send_reply_v2_payload(
     return reply_status;
 }
 
-static int filed_send_reply_v2(
+int filed_send_reply_v2(
     int reply_fd,
     void *page,
     const pacha_service_request_header_t *header,
@@ -88,7 +90,7 @@ static int filed_send_reply_v2(
     return filed_send_reply_v2_payload(reply_fd, page, header, status, result, error_token, 0);
 }
 
-static int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
+int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
     if (status < 0) {
         (void)filed_error_token(
@@ -111,7 +113,7 @@ static int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int6
     return filed_ipc_send_wait(channel_fd, &reply);
 }
 
-static int filed_send_exec_reply_v2(
+int filed_send_exec_reply_v2(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
@@ -166,7 +168,7 @@ static int filed_send_exec_reply_v2(
     return status;
 }
 
-static int filed_send_exec_self_reply_v2(
+int filed_send_exec_self_reply_v2(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
@@ -233,7 +235,7 @@ static int filed_send_exec_self_reply_v2(
     return status;
 }
 
-static int filed_dispatch_set_inherit(int fd, int enabled)
+int filed_dispatch_set_inherit(int fd, int enabled)
 {
     if (fd < 0 || fd >= FILED_EXEC_MAX_FDS) {
         return -22;
@@ -246,13 +248,7 @@ static int filed_dispatch_set_inherit(int fd, int enabled)
     return status == 0 ? 0 : -22;
 }
 
-typedef struct filed_dispatch_saved_fd {
-    int fd;
-    uint64_t rights;
-    uint64_t flags;
-} filed_dispatch_saved_fd_t;
-
-static void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved)
+void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved)
 {
     if (saved == NULL) {
         return;
@@ -262,7 +258,7 @@ static void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved)
     saved->flags = 0;
 }
 
-static void filed_dispatch_close_owned_fd(int *fd)
+void filed_dispatch_close_owned_fd(int *fd)
 {
     if (fd == NULL || *fd < 0) {
         return;
@@ -271,7 +267,7 @@ static void filed_dispatch_close_owned_fd(int *fd)
     *fd = -1;
 }
 
-static int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved)
+int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved)
 {
     if (saved == NULL || target_fd < 0 || target_fd >= FILED_EXEC_MAX_FDS) {
         return -22;
@@ -298,7 +294,7 @@ static int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_
     return 0;
 }
 
-static void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved)
+void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved)
 {
     if (saved == NULL || target_fd < 0 || target_fd >= FILED_EXEC_MAX_FDS) {
         return;
@@ -329,7 +325,7 @@ static void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved
     filed_dispatch_saved_fd_init(saved);
 }
 
-static int filed_dispatch_exec_default_stdio_valid(const filed_v2_exec_path_t *exec)
+int filed_dispatch_exec_default_stdio_valid(const filed_v2_exec_path_t *exec)
 {
     if (exec == NULL) {
         return 0;
@@ -353,7 +349,7 @@ static const filed_v2_exec_lpr_fd_t *filed_dispatch_lpr_fd_table_entries(
     return (const filed_v2_exec_lpr_fd_t *)((const unsigned char *)table + sizeof(*table));
 }
 
-static int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
+int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
 {
     if (fd == NULL || fd->fd > LPR_LINUX_FD_MAX) {
         return 0;
@@ -370,7 +366,7 @@ static int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
     }
 }
 
-static int filed_dispatch_exec_lpr_fd_table_valid(
+int filed_dispatch_exec_lpr_fd_table_valid(
     const filed_v2_exec_path_t *exec,
     const filed_v2_exec_lpr_fd_table_t *table,
     int allow_table)
@@ -421,7 +417,7 @@ static int filed_dispatch_exec_lpr_fd_table_valid(
     return 1;
 }
 
-static int filed_dispatch_create_lpr_bootstrap_fd(
+int filed_dispatch_create_lpr_bootstrap_fd(
     const filed_v2_exec_path_t *exec,
     const filed_v2_exec_lpr_fd_table_t *fd_table)
 {
@@ -505,7 +501,7 @@ static int filed_dispatch_create_lpr_bootstrap_fd(
     return fd;
 }
 
-static int filed_dispatch_prepare_inherit_fd_to_target(
+int filed_dispatch_prepare_inherit_fd_to_target(
     int source_fd,
     uint64_t target_raw,
     int *out_fd,
@@ -585,7 +581,7 @@ static int filed_dispatch_prepare_inherit_fd_to_target(
     return 0;
 }
 
-static int filed_dispatch_dup_endpoint_to_fixed(
+int filed_dispatch_dup_endpoint_to_fixed(
     int source_fd,
     int target_fd,
     int *out_fd)
@@ -638,7 +634,7 @@ static int filed_dispatch_dup_endpoint_to_fixed(
     return 0;
 }
 
-static int filed_dispatch_prepare_endpoint_to_fixed(
+int filed_dispatch_prepare_endpoint_to_fixed(
     int source_fd,
     int target_fd,
     int *out_fd,
@@ -665,7 +661,7 @@ static int filed_dispatch_prepare_endpoint_to_fixed(
     return filed_dispatch_dup_endpoint_to_fixed(source_fd, target_fd, out_fd);
 }
 
-static void filed_dispatch_close_prepared_endpoint(int *fd, int borrowed)
+void filed_dispatch_close_prepared_endpoint(int *fd, int borrowed)
 {
     if (fd == NULL || *fd < 16) {
         return;
@@ -676,4 +672,3 @@ static void filed_dispatch_close_prepared_endpoint(int *fd, int borrowed)
     }
     *fd = -1;
 }
-

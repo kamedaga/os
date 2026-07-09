@@ -1,4 +1,6 @@
-static filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
+#include "common.h"
+
+filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -178,7 +180,7 @@ out:
     return filed_page_result(reply_status, 0);
 }
 
-static int filed_dispatch_exec_path(
+int filed_dispatch_exec_path(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request)
@@ -552,7 +554,7 @@ out:
     return filed_send_reply_v2(reply_fd, NULL, &v2_header, reply_status, 0, 0);
 }
 
-static int filed_dispatch_exec_self(
+int filed_dispatch_exec_self(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request)
@@ -718,7 +720,7 @@ out:
     return send_status;
 }
 
-static int filed_dispatch_session_open_v2(
+int filed_dispatch_session_open_v2(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
@@ -802,7 +804,7 @@ static int filed_dispatch_session_open_v2(
     return filed_send_reply_v2(reply_fd, reply_page, header, reply_status, result, 0);
 }
 
-static uint64_t filed_import_termd_error(
+uint64_t filed_import_termd_error(
     filed_runtime_t *runtime,
     uint64_t child_token,
     uint64_t request_id,
@@ -824,7 +826,7 @@ static uint64_t filed_import_termd_error(
         text);
 }
 
-static int filed_dispatch_register_termd_signal_supervisor_v2(
+int filed_dispatch_register_termd_signal_supervisor_v2(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
@@ -990,4 +992,3 @@ static int filed_dispatch_register_termd_signal_supervisor_v2(
     (void)pacha_fd_close(page_fd);
     return filed_send_reply_v2(reply_fd, reply_page, header, status, result, error_token);
 }
-

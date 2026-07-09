@@ -1,5 +1,7 @@
 
-static void filed_dispatch_lock_acquire(filed_lock_t *lock)
+#include "dispatch/common.h"
+
+void filed_dispatch_lock_acquire(filed_lock_t *lock)
 {
     if (lock == NULL) {
         return;
@@ -8,7 +10,7 @@ static void filed_dispatch_lock_acquire(filed_lock_t *lock)
     }
 }
 
-static void filed_dispatch_lock_release(filed_lock_t *lock)
+void filed_dispatch_lock_release(filed_lock_t *lock)
 {
     if (lock == NULL) {
         return;
@@ -16,7 +18,7 @@ static void filed_dispatch_lock_release(filed_lock_t *lock)
     atomic_flag_clear_explicit(&lock->flag, memory_order_release);
 }
 
-static uint64_t filed_now_ns(void)
+uint64_t filed_now_ns(void)
 {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -25,7 +27,7 @@ static uint64_t filed_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static uint64_t filed_read_tsc(void)
+uint64_t filed_read_tsc(void)
 {
 #if defined(__x86_64__) || defined(__i386__)
     uint32_t lo = 0;
@@ -37,7 +39,7 @@ static uint64_t filed_read_tsc(void)
 #endif
 }
 
-static const char *filed_op_name(uint64_t op)
+const char *filed_op_name(uint64_t op)
 {
     switch (op) {
     case FILED_V2_OP_HELLO: return "hello";
@@ -89,7 +91,7 @@ static const char *filed_op_name(uint64_t op)
     }
 }
 
-static void filed_record_dispatch_metric(
+void filed_record_dispatch_metric(
     filed_runtime_t *runtime,
     uint64_t op,
     uint64_t start_ns,
@@ -120,7 +122,7 @@ static void filed_record_dispatch_metric(
     }
 }
 
-static void filed_record_dispatch_metric_cycles(
+void filed_record_dispatch_metric_cycles(
     filed_runtime_t *runtime,
     uint64_t op,
     uint64_t start_cycles,
@@ -144,7 +146,7 @@ static void filed_record_dispatch_metric_cycles(
     }
 }
 
-static void filed_record_fast_op_metric_cycles(
+void filed_record_fast_op_metric_cycles(
     filed_runtime_t *runtime,
     uint64_t op,
     uint64_t start_cycles,
@@ -168,7 +170,7 @@ static void filed_record_fast_op_metric_cycles(
     }
 }
 
-static filed_v2_generation_entry_t *filed_session_generation_entries(
+filed_v2_generation_entry_t *filed_session_generation_entries(
     const filed_session_t *session,
     const filed_v2_fast_header_t *header)
 {
@@ -184,7 +186,7 @@ static filed_v2_generation_entry_t *filed_session_generation_entries(
     return (filed_v2_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
 }
 
-static void filed_session_publish_generation(
+void filed_session_publish_generation(
     filed_session_t *session,
     filed_handle_id_t handle_id,
     filed_generation_t object_generation,
@@ -229,7 +231,7 @@ static void filed_session_publish_generation(
     ++entry->seq;
 }
 
-static void filed_runtime_publish_generation(
+void filed_runtime_publish_generation(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id,
     filed_generation_t object_generation,
@@ -247,7 +249,7 @@ static void filed_runtime_publish_generation(
     }
 }
 
-static filed_vnode_t *filed_dispatch_find_vnode_by_id(
+filed_vnode_t *filed_dispatch_find_vnode_by_id(
     filed_vfs_t *vfs,
     filed_vnode_id_t vnode_id)
 {
@@ -262,7 +264,7 @@ static filed_vnode_t *filed_dispatch_find_vnode_by_id(
     return NULL;
 }
 
-static filed_open_file_t *filed_dispatch_find_file_by_id(
+filed_open_file_t *filed_dispatch_find_file_by_id(
     filed_vfs_t *vfs,
     filed_file_id_t file_id)
 {
@@ -277,7 +279,7 @@ static filed_open_file_t *filed_dispatch_find_file_by_id(
     return NULL;
 }
 
-static filed_vnode_t *filed_dispatch_handle_vnode(
+filed_vnode_t *filed_dispatch_handle_vnode(
     filed_vfs_t *vfs,
     const filed_handle_t *handle)
 {
@@ -298,7 +300,7 @@ static filed_vnode_t *filed_dispatch_handle_vnode(
     return NULL;
 }
 
-static void filed_runtime_publish_backend_object_generation(
+void filed_runtime_publish_backend_object_generation(
     filed_runtime_t *runtime,
     filed_backend_object_id_t backend_object)
 {
@@ -306,7 +308,6 @@ static void filed_runtime_publish_backend_object_generation(
         return;
     }
     filed_exec_invalidate_backend_object(runtime, backend_object);
-    filed_file_vmo_cache_invalidate_object(runtime, backend_object);
     for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
         filed_handle_t *handle = &runtime->vfs.handles[i];
         filed_vnode_t *vnode = filed_dispatch_handle_vnode(&runtime->vfs, handle);
@@ -325,7 +326,7 @@ static void filed_runtime_publish_backend_object_generation(
     }
 }
 
-static void filed_dump_dispatch_metrics(filed_runtime_t *runtime)
+void filed_dump_dispatch_metrics(filed_runtime_t *runtime)
 {
     for (uint64_t op = 0; op < FILED_METRIC_OP_MAX; ++op) {
         const filed_dispatch_metric_t *metric = &filed_dispatch_metrics[op];
@@ -418,4 +419,3 @@ static void filed_dump_dispatch_metrics(filed_runtime_t *runtime)
     pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO, PACHA_TRACE_CLASS_METRIC, 3, filed_file_vmo_cache_stores);
     pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO, PACHA_TRACE_CLASS_METRIC, 4, filed_file_vmo_cache_evictions);
 }
-

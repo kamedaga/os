@@ -1,3 +1,5 @@
+#include "common.h"
+
 int filed_dispatch_runtime_init(filed_runtime_t *runtime)
 {
     if (runtime == NULL) {
@@ -888,9 +890,9 @@ static int filed_dispatch_client_v2(
         if (header.payload_size < sizeof(*diag)) {
             status = -22;
         } else {
-            status = filed_page_cache_flush_object(runtime, 0);
+            status = filed_cache_flush_object(runtime, 0);
             if (status == 0) {
-                filed_page_cache_configure(runtime, diag->subject);
+                filed_cache_configure(runtime, diag->subject);
                 result = filed_page_cache.active_slots;
             }
         }

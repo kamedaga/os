@@ -29,6 +29,7 @@ mkdir -p "${build_dir}"
   -pthread \
   -I"${repo_root}/userland/filed/include" \
   -I"${repo_root}/userland/koboxd/include" \
+  -I"${repo_root}/userland/termd/include" \
   -I"${repo_root}/userland/libipc/include" \
   "${repo_root}/userland/filed/src/tmpfs/backend.c" \
   "${repo_root}/userland/filed/src/tmpfs/dir.c" \
@@ -40,3 +41,31 @@ mkdir -p "${build_dir}"
   -o "${build_dir}/tmpfs_backend_test"
 
 "${build_dir}/tmpfs_backend_test"
+
+"${cc_bin}" \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -pthread \
+  -I"${repo_root}/userland/filed/include" \
+  -I"${repo_root}/userland/filed/src" \
+  -I"${repo_root}/userland/koboxd/include" \
+  -I"${repo_root}/userland/termd/include" \
+  -I"${repo_root}/userland/libipc/include" \
+  -I"${repo_root}/userland/libpacha/include" \
+  -I"${repo_root}/userland/personality/include" \
+  "${repo_root}/userland/filed/src/backend.c" \
+  "${repo_root}/userland/filed/src/cache/cache.c" \
+  "${repo_root}/userland/filed/src/tmpfs/backend.c" \
+  "${repo_root}/userland/filed/src/tmpfs/dir.c" \
+  "${repo_root}/userland/filed/src/tmpfs/file.c" \
+  "${repo_root}/userland/filed/src/tmpfs/meta.c" \
+  "${repo_root}/userland/filed/src/tmpfs/node.c" \
+  "${repo_root}/userland/filed/src/tmpfs/page.c" \
+  "${repo_root}/userland/libipc/src/ipc.c" \
+  "${repo_root}/userland/libpacha/src/syscall.c" \
+  "${repo_root}/userland/filed/tests/cache_consistency_test.c" \
+  -o "${build_dir}/cache_consistency_test"
+
+"${build_dir}/cache_consistency_test"

@@ -1,9 +1,11 @@
-static bool filed_backend_object_is_tmpfs(uint64_t backend_object)
+#include "dispatch/common.h"
+
+bool filed_backend_object_is_tmpfs(uint64_t backend_object)
 {
     return backend_object != 0 && filed_tmpfs_backend_is_object(backend_object);
 }
 
-static int filed_backend_lookup(
+int filed_backend_lookup(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
     const char *name,
@@ -15,7 +17,7 @@ static int filed_backend_lookup(
     return filed_kobox_backend_lookup(&runtime->backend, parent_object_id, name, out_object_id);
 }
 
-static int filed_backend_statx(
+int filed_backend_statx(
     filed_runtime_t *runtime,
     uint64_t object_id,
     storage_v2_statx_reply_t *out_stat)
@@ -26,7 +28,7 @@ static int filed_backend_statx(
     return filed_kobox_backend_statx(&runtime->backend, object_id, out_stat);
 }
 
-static int filed_backend_pread(
+int filed_backend_pread(
     filed_runtime_t *runtime,
     uint64_t object_id,
     uint64_t offset,
@@ -40,7 +42,7 @@ static int filed_backend_pread(
     return filed_kobox_backend_pread(&runtime->backend, object_id, offset, buffer, length, out_bytes);
 }
 
-static int filed_backend_pwrite(
+int filed_backend_pwrite(
     filed_runtime_t *runtime,
     uint64_t object_id,
     uint64_t offset,
@@ -54,7 +56,7 @@ static int filed_backend_pwrite(
     return filed_kobox_backend_pwrite(&runtime->backend, object_id, offset, buffer, length, out_bytes);
 }
 
-static int filed_backend_fsync(filed_runtime_t *runtime, uint64_t object_id)
+int filed_backend_fsync(filed_runtime_t *runtime, uint64_t object_id)
 {
     if (filed_tmpfs_backend_is_object(object_id)) {
         return filed_tmpfs_backend_fsync(&runtime->tmpfs, object_id);
@@ -62,7 +64,7 @@ static int filed_backend_fsync(filed_runtime_t *runtime, uint64_t object_id)
     return filed_kobox_backend_fsync(&runtime->backend, object_id);
 }
 
-static int filed_backend_create(
+int filed_backend_create(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
     const char *name,
@@ -75,7 +77,7 @@ static int filed_backend_create(
     return filed_kobox_backend_create(&runtime->backend, parent_object_id, name, mode, out_object_id);
 }
 
-static int filed_backend_truncate(
+int filed_backend_truncate(
     filed_runtime_t *runtime,
     uint64_t object_id,
     uint64_t size)
@@ -86,7 +88,7 @@ static int filed_backend_truncate(
     return filed_kobox_backend_truncate(&runtime->backend, object_id, size);
 }
 
-static int filed_backend_utimens(
+int filed_backend_utimens(
     filed_runtime_t *runtime,
     uint64_t object_id,
     uint32_t mask,
@@ -115,7 +117,7 @@ static int filed_backend_utimens(
         mtime_nsec);
 }
 
-static int filed_backend_chmod(
+int filed_backend_chmod(
     filed_runtime_t *runtime,
     uint64_t object_id,
     uint64_t mode)
@@ -126,7 +128,7 @@ static int filed_backend_chmod(
     return filed_kobox_backend_chmod(&runtime->backend, object_id, mode);
 }
 
-static int filed_backend_unlink(
+int filed_backend_unlink(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
     const char *name)
@@ -137,7 +139,7 @@ static int filed_backend_unlink(
     return filed_kobox_backend_unlink(&runtime->backend, parent_object_id, name);
 }
 
-static int filed_backend_link(
+int filed_backend_link(
     filed_runtime_t *runtime,
     uint64_t old_object_id,
     uint64_t new_parent_object_id,
@@ -167,7 +169,7 @@ static int filed_backend_link(
     return -95;
 }
 
-static int filed_backend_mkdir(
+int filed_backend_mkdir(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
     const char *name,
@@ -180,7 +182,7 @@ static int filed_backend_mkdir(
     return filed_kobox_backend_mkdir(&runtime->backend, parent_object_id, name, mode, out_object_id);
 }
 
-static int filed_backend_symlink(
+int filed_backend_symlink(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
     const char *name,
@@ -206,7 +208,7 @@ static int filed_backend_symlink(
     return -95;
 }
 
-static int filed_backend_readlink(
+int filed_backend_readlink(
     filed_runtime_t *runtime,
     uint64_t object_id,
     char *out_target,
@@ -229,7 +231,7 @@ static int filed_backend_readlink(
     return -95;
 }
 
-static int filed_backend_rmdir(
+int filed_backend_rmdir(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,
     const char *name)
@@ -240,7 +242,7 @@ static int filed_backend_rmdir(
     return filed_kobox_backend_rmdir(&runtime->backend, parent_object_id, name);
 }
 
-static int filed_backend_rename(
+int filed_backend_rename(
     filed_runtime_t *runtime,
     uint64_t old_parent_object_id,
     const char *old_name,
@@ -271,7 +273,7 @@ static int filed_backend_rename(
         out_object_id);
 }
 
-static int filed_backend_release_object(filed_runtime_t *runtime, uint64_t object_id)
+int filed_backend_release_object(filed_runtime_t *runtime, uint64_t object_id)
 {
     if (filed_tmpfs_backend_is_object(object_id)) {
         return filed_tmpfs_backend_release_object(&runtime->tmpfs, object_id);
@@ -279,7 +281,7 @@ static int filed_backend_release_object(filed_runtime_t *runtime, uint64_t objec
     return filed_kobox_backend_release_object(&runtime->backend, object_id);
 }
 
-static int filed_backend_getdents(
+int filed_backend_getdents(
     filed_runtime_t *runtime,
     uint64_t dir_object_id,
     uint64_t offset,
@@ -291,7 +293,7 @@ static int filed_backend_getdents(
     return filed_kobox_backend_getdents(&runtime->backend, dir_object_id, offset, out_entries);
 }
 
-static bool filed_root_getdents_splices_tmpfs(
+bool filed_root_getdents_splices_tmpfs(
     filed_runtime_t *runtime,
     uint64_t dir_object_id)
 {
@@ -305,7 +307,7 @@ static bool filed_root_getdents_splices_tmpfs(
     return true;
 }
 
-static uint64_t filed_root_getdents_backend_offset(
+uint64_t filed_root_getdents_backend_offset(
     filed_runtime_t *runtime,
     uint64_t dir_object_id,
     uint64_t logical_offset)

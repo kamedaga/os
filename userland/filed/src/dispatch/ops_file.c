@@ -1,4 +1,6 @@
-static filed_page_dispatch_result_t filed_dispatch_openat_page(
+#include "common.h"
+
+filed_page_dispatch_result_t filed_dispatch_openat_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -25,7 +27,7 @@ static filed_page_dispatch_result_t filed_dispatch_openat_page(
     return filed_page_result(reply_status, result);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
+filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -100,7 +102,7 @@ static filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
     return filed_page_result(0, valid);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_stat_page(
+filed_page_dispatch_result_t filed_dispatch_stat_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -177,7 +179,7 @@ static filed_page_dispatch_result_t filed_dispatch_stat_page(
     return filed_page_result(reply_status, result);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_utimens_page(
+filed_page_dispatch_result_t filed_dispatch_utimens_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -218,7 +220,7 @@ static filed_page_dispatch_result_t filed_dispatch_utimens_page(
     return filed_page_result(filed_status_to_wire(status), 0);
 }
 
-static int filed_ensure_stat_snapshot(
+int filed_ensure_stat_snapshot(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id)
 {
@@ -257,7 +259,7 @@ static int filed_ensure_stat_snapshot(
     return filed_status_to_wire(status);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_chmod_page(
+filed_page_dispatch_result_t filed_dispatch_chmod_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -293,7 +295,7 @@ static filed_page_dispatch_result_t filed_dispatch_chmod_page(
     return filed_page_result(filed_status_to_wire(vfs_status), 0);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_pread_page(
+filed_page_dispatch_result_t filed_dispatch_pread_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -331,7 +333,7 @@ static filed_page_dispatch_result_t filed_dispatch_pread_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
+filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
     filed_runtime_t *runtime,
     void *page,
     int vmo_fd)
@@ -395,7 +397,7 @@ static filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
+filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
     filed_runtime_t *runtime,
     const filed_vfs_io_decision_t *decision,
     uint64_t file_offset,
@@ -448,13 +450,14 @@ static filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
     entry->object_generation = decision->object_generation;
     entry->file_offset = file_offset;
     entry->length = length;
-    entry->clock = ++runtime->dispatch_state->file_vmo_cache_clock;
+    entry->clock = ++filed_file_vmo_cache.clock;
+    filed_cache_note_attachment(runtime, decision->backend_object, FILED_CACHE_ATTACHMENT_VMO);
     filed_file_vmo_cache_stores++;
     *out_entry = entry;
     return filed_page_result(0, bytes);
 }
 
-static int filed_dispatch_file_vmo_v2(
+int filed_dispatch_file_vmo_v2(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
@@ -557,7 +560,7 @@ static int filed_dispatch_file_vmo_v2(
     return reply_status;
 }
 
-static filed_page_dispatch_result_t filed_dispatch_read_page(
+filed_page_dispatch_result_t filed_dispatch_read_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -602,7 +605,7 @@ static filed_page_dispatch_result_t filed_dispatch_read_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
+filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -683,7 +686,7 @@ static filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_write_page(
+filed_page_dispatch_result_t filed_dispatch_write_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -770,7 +773,7 @@ static filed_page_dispatch_result_t filed_dispatch_write_page(
     return filed_page_result(reply_status, bytes);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_seek_page(
+filed_page_dispatch_result_t filed_dispatch_seek_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -837,7 +840,7 @@ static filed_page_dispatch_result_t filed_dispatch_seek_page(
     return filed_page_result(reply_status, reply_status == 0 ? (uint64_t)new_offset : 0);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_fsync_page(
+filed_page_dispatch_result_t filed_dispatch_fsync_page(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request)
 {
@@ -849,7 +852,7 @@ static filed_page_dispatch_result_t filed_dispatch_fsync_page(
         &decision);
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
-        reply_status = filed_page_cache_flush_object(runtime, decision.backend_object);
+        reply_status = filed_cache_flush_object(runtime, decision.backend_object);
         if (reply_status == 0) {
             reply_status = filed_backend_fsync(
                 runtime,
@@ -865,9 +868,9 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
         return -22;
     }
 
-    const uint64_t dirty_count = filed_page_cache_dirty_count(runtime);
+    const uint64_t dirty_count = filed_cache_dirty_count(runtime);
     const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
-    const int flush_status = filed_page_cache_flush_object(runtime, 0);
+    const int flush_status = filed_cache_flush_object(runtime, 0);
     if (flush_status != 0) {
         printf(
             "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu status=%d\n",
@@ -887,7 +890,7 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
     return backend_status;
 }
 
-static filed_page_dispatch_result_t filed_dispatch_truncate_page(
+filed_page_dispatch_result_t filed_dispatch_truncate_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -903,14 +906,14 @@ static filed_page_dispatch_result_t filed_dispatch_truncate_page(
             &decision);
         reply_status = filed_status_to_wire(status);
         if (status == FILED_OK) {
-            reply_status = filed_page_cache_flush_object(runtime, decision.backend_object);
+            reply_status = filed_cache_flush_object(runtime, decision.backend_object);
             if (reply_status == 0) {
                 reply_status = filed_backend_truncate(
                     runtime,
                     decision.backend_object,
                     truncate->size);
                 if (reply_status == 0) {
-                    filed_page_cache_invalidate_object(runtime, decision.backend_object);
+                    filed_cache_invalidate(runtime, decision.backend_object);
                     (void)filed_vfs_note_truncate(
                         &runtime->vfs,
                         (filed_handle_id_t)(uint32_t)truncate->handle,
@@ -926,7 +929,7 @@ static filed_page_dispatch_result_t filed_dispatch_truncate_page(
     return filed_page_result(reply_status, 0);
 }
 
-static uint64_t filed_lookup_cache_target_object(
+uint64_t filed_lookup_cache_target_object(
     filed_runtime_t *runtime,
     filed_handle_id_t parent_handle,
     uint64_t parent_backend_object,
@@ -964,17 +967,16 @@ static uint64_t filed_lookup_cache_target_object(
     return object_id;
 }
 
-static void filed_invalidate_mutated_object(
+void filed_invalidate_mutated_object(
     filed_runtime_t *runtime,
     uint64_t backend_object)
 {
-    filed_page_cache_invalidate_object(runtime, backend_object);
+    filed_cache_invalidate(runtime, backend_object);
 }
 
-static int filed_flush_mutated_object(
+int filed_flush_mutated_object(
     filed_runtime_t *runtime,
     uint64_t backend_object)
 {
-    return filed_page_cache_flush_object(runtime, backend_object);
+    return filed_cache_flush_object(runtime, backend_object);
 }
-

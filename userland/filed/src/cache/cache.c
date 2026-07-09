@@ -1,4 +1,58 @@
-void filed_page_cache_configure(filed_runtime_t *runtime, uint64_t active_slots)
+#include "../dispatch/common.h"
+#include "internal.h"
+
+static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object);
+
+static uint64_t filed_cache_next_object_clock(filed_runtime_t *runtime)
+{
+    if (filed_cache.object_clock == UINT64_MAX) {
+        filed_cache.object_clock = 0;
+    }
+    ++filed_cache.object_clock;
+    if (filed_cache.object_clock == 0) {
+        filed_cache.object_clock = 1;
+    }
+    return filed_cache.object_clock;
+}
+
+void filed_cache_note_attachment(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint32_t attachment)
+{
+    filed_cache_object_entry_t *oldest = NULL;
+    if (runtime == NULL || backend_object == 0 || attachment == 0) {
+        return;
+    }
+    for (size_t i = 0; i < FILED_CACHE_OBJECT_SLOTS; ++i) {
+        filed_cache_object_entry_t *entry = &filed_cache.objects[i];
+        if (entry->valid && entry->backend_object == backend_object) {
+            entry->attachment_mask |= attachment;
+            entry->last_used = filed_cache_next_object_clock(runtime);
+            return;
+        }
+        if (!entry->valid) {
+            memset(entry, 0, sizeof(*entry));
+            entry->valid = true;
+            entry->backend_object = backend_object;
+            entry->attachment_mask = attachment;
+            entry->last_used = filed_cache_next_object_clock(runtime);
+            return;
+        }
+        if (oldest == NULL || entry->last_used < oldest->last_used) {
+            oldest = entry;
+        }
+    }
+    if (oldest != NULL) {
+        memset(oldest, 0, sizeof(*oldest));
+        oldest->valid = true;
+        oldest->backend_object = backend_object;
+        oldest->attachment_mask = attachment;
+        oldest->last_used = filed_cache_next_object_clock(runtime);
+    }
+}
+
+void filed_cache_configure(filed_runtime_t *runtime, uint64_t active_slots)
 {
     if (active_slots > FILED_PAGE_CACHE_SLOTS) {
         active_slots = FILED_PAGE_CACHE_SLOTS;
@@ -17,7 +71,7 @@ void filed_page_cache_configure(filed_runtime_t *runtime, uint64_t active_slots)
 static void filed_page_cache_ensure_configured(filed_runtime_t *runtime)
 {
     if (!filed_page_cache.configured) {
-        filed_page_cache_configure(runtime, FILED_PAGE_CACHE_SLOTS);
+        filed_cache_configure(runtime, FILED_PAGE_CACHE_SLOTS);
     }
 }
 
@@ -56,7 +110,7 @@ static filed_page_cache_slot_t *filed_page_cache_find(
     return NULL;
 }
 
-static bool filed_page_cache_object_dirty(filed_runtime_t *runtime, uint64_t backend_object)
+bool filed_cache_object_dirty(filed_runtime_t *runtime, uint64_t backend_object)
 {
     filed_page_cache_ensure_configured(runtime);
     if (filed_backend_object_is_tmpfs(backend_object)) {
@@ -74,7 +128,7 @@ static bool filed_page_cache_object_dirty(filed_runtime_t *runtime, uint64_t bac
     return false;
 }
 
-uint64_t filed_page_cache_dirty_count(filed_runtime_t *runtime)
+uint64_t filed_cache_dirty_count(filed_runtime_t *runtime)
 {
     uint64_t count = 0;
     filed_page_cache_ensure_configured(runtime);
@@ -129,7 +183,7 @@ static int filed_page_cache_flush_slot(
     return 0;
 }
 
-int filed_page_cache_flush_object(filed_runtime_t *runtime, uint64_t backend_object)
+int filed_cache_flush_object(filed_runtime_t *runtime, uint64_t backend_object)
 {
     filed_page_cache_ensure_configured(runtime);
     if (filed_backend_object_is_tmpfs(backend_object)) {
@@ -217,9 +271,10 @@ static void filed_page_cache_store(
     slot->dirty_start = 0;
     slot->dirty_end = 0;
     slot->last_used = filed_page_cache_next_clock(runtime);
+    filed_cache_note_attachment(runtime, backend_object, FILED_CACHE_ATTACHMENT_PAGE);
 }
 
-void filed_page_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object)
+static void filed_page_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object)
 {
     (void)runtime;
     filed_page_cache_ensure_configured(runtime);
@@ -313,6 +368,7 @@ static int filed_page_cache_try_dirty_write(
             slot->page_index = page_index;
             slot->valid_start = (uint32_t)page_offset;
             slot->bytes = (uint32_t)page_offset;
+            filed_cache_note_attachment(runtime, backend_object, FILED_CACHE_ATTACHMENT_PAGE);
         }
         if (page_offset < slot->valid_start ||
             page_offset > slot->bytes ||
@@ -423,7 +479,7 @@ int filed_cached_pread(
     }
     filed_page_cache_ensure_configured(runtime);
     if (length >= 65536u) {
-        const int flush_status = filed_page_cache_flush_object(runtime, backend_object);
+        const int flush_status = filed_cache_flush_object(runtime, backend_object);
         if (flush_status != 0) {
             return flush_status;
         }
@@ -529,7 +585,7 @@ int filed_cached_pread(
     return 0;
 }
 
-static int filed_cached_pwrite_ex(
+int filed_cached_pwrite_ex(
     filed_runtime_t *runtime,
     uint64_t backend_object,
     uint64_t offset,
@@ -565,11 +621,12 @@ static int filed_cached_pwrite_ex(
             length,
             allow_extend_slot))
     {
+        filed_file_vmo_cache_invalidate_object(runtime, backend_object);
         *out_bytes = length;
         return 0;
     }
 
-    int status = filed_page_cache_flush_object(runtime, backend_object);
+    int status = filed_cache_flush_object(runtime, backend_object);
     if (status != 0) {
         return status;
     }
@@ -582,6 +639,7 @@ static int filed_cached_pwrite_ex(
         length,
         out_bytes);
     if (status == 0) {
+        filed_file_vmo_cache_invalidate_object(runtime, backend_object);
         filed_page_cache_note_write(runtime, backend_object, offset, buffer, *out_bytes);
     }
     return status;
@@ -605,3 +663,353 @@ int filed_cached_pwrite(
         false);
 }
 
+
+static uint64_t filed_dir_cache_next_clock(filed_runtime_t *runtime)
+{
+    if (filed_dir_cache.clock == UINT64_MAX) {
+        filed_dir_cache.clock = 0;
+    }
+    ++filed_dir_cache.clock;
+    if (filed_dir_cache.clock == 0) {
+        filed_dir_cache.clock = 1;
+    }
+    return filed_dir_cache.clock;
+}
+
+static filed_dir_cache_slot_t *filed_dir_cache_find(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t offset)
+{
+    if (backend_object == 0) {
+        return NULL;
+    }
+    for (size_t i = 0; i < FILED_DIR_CACHE_SLOTS; ++i) {
+        filed_dir_cache_slot_t *slot = &filed_dir_cache.slots[i];
+        if (slot->valid &&
+            slot->backend_object == backend_object &&
+            slot->offset == offset)
+        {
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static filed_dir_cache_slot_t *filed_dir_cache_choose_slot(filed_runtime_t *runtime)
+{
+    filed_dir_cache_slot_t *oldest = NULL;
+    for (size_t i = 0; i < FILED_DIR_CACHE_SLOTS; ++i) {
+        filed_dir_cache_slot_t *slot = &filed_dir_cache.slots[i];
+        if (!slot->valid) {
+            return slot;
+        }
+        if (oldest == NULL || slot->last_used < oldest->last_used) {
+            oldest = slot;
+        }
+    }
+    if (oldest != NULL) {
+        filed_dir_cache.evictions++;
+    }
+    return oldest;
+}
+
+int filed_dir_cache_get(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t offset,
+    storage_v2_getdents_request_t *out_entries)
+{
+    filed_dir_cache_slot_t *slot;
+    if (out_entries == NULL) {
+        return 0;
+    }
+    slot = filed_dir_cache_find(runtime, backend_object, offset);
+    if (slot == NULL) {
+        filed_dir_cache.misses++;
+        return 0;
+    }
+    if (offset == 0 && slot->entries.count == 0) {
+        memset(slot, 0, sizeof(*slot));
+        filed_dir_cache.misses++;
+        return 0;
+    }
+    *out_entries = slot->entries;
+    slot->last_used = filed_dir_cache_next_clock(runtime);
+    filed_dir_cache.hits++;
+    return 1;
+}
+
+void filed_dir_cache_store(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t offset,
+    const storage_v2_getdents_request_t *entries)
+{
+    filed_dir_cache_slot_t *slot;
+    if (backend_object == 0 || entries == NULL) {
+        return;
+    }
+    if (offset == 0 && entries->count == 0) {
+        return;
+    }
+    slot = filed_dir_cache_find(runtime, backend_object, offset);
+    if (slot == NULL) {
+        slot = filed_dir_cache_choose_slot(runtime);
+    }
+    if (slot == NULL) {
+        return;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->valid = true;
+    slot->backend_object = backend_object;
+    slot->offset = offset;
+    slot->last_used = filed_dir_cache_next_clock(runtime);
+    slot->entries = *entries;
+    filed_cache_note_attachment(runtime, backend_object, FILED_CACHE_ATTACHMENT_DIRENT);
+}
+
+static void filed_dir_cache_invalidate_dir(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (backend_object == 0) {
+        return;
+    }
+    for (size_t i = 0; i < FILED_DIR_CACHE_SLOTS; ++i) {
+        filed_dir_cache_slot_t *slot = &filed_dir_cache.slots[i];
+        if (slot->valid && slot->backend_object == backend_object) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+}
+
+static uint64_t filed_negative_lookup_cache_next_clock(filed_runtime_t *runtime)
+{
+    if (filed_negative_lookup_cache.clock == UINT64_MAX) {
+        filed_negative_lookup_cache.clock = 0;
+    }
+    ++filed_negative_lookup_cache.clock;
+    if (filed_negative_lookup_cache.clock == 0) {
+        filed_negative_lookup_cache.clock = 1;
+    }
+    return filed_negative_lookup_cache.clock;
+}
+
+static size_t filed_lookup_name_len(const char *name)
+{
+    size_t len = 0;
+    if (name == NULL) {
+        return 0;
+    }
+    while (len < FILED_V2_NAME_BYTES && name[len] != '\0') {
+        ++len;
+    }
+    return len;
+}
+
+static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_find(
+    filed_runtime_t *runtime,
+    uint64_t parent_backend_object,
+    filed_generation_t parent_dir_generation,
+    const char *name,
+    size_t name_len)
+{
+    if (parent_backend_object == 0 ||
+        name == NULL ||
+        name_len == 0 ||
+        name_len >= FILED_V2_NAME_BYTES)
+    {
+        return NULL;
+    }
+    for (size_t i = 0; i < FILED_NEGATIVE_LOOKUP_CACHE_SLOTS; ++i) {
+        filed_negative_lookup_cache_slot_t *slot = &filed_negative_lookup_cache.slots[i];
+        if (slot->valid &&
+            slot->parent_backend_object == parent_backend_object &&
+            slot->parent_dir_generation == parent_dir_generation &&
+            strncmp(slot->name, name, FILED_V2_NAME_BYTES) == 0)
+        {
+            return slot;
+        }
+    }
+    return NULL;
+}
+
+static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_choose_slot(filed_runtime_t *runtime)
+{
+    filed_negative_lookup_cache_slot_t *oldest = NULL;
+    for (size_t i = 0; i < FILED_NEGATIVE_LOOKUP_CACHE_SLOTS; ++i) {
+        filed_negative_lookup_cache_slot_t *slot = &filed_negative_lookup_cache.slots[i];
+        if (!slot->valid) {
+            return slot;
+        }
+        if (oldest == NULL || slot->last_used < oldest->last_used) {
+            oldest = slot;
+        }
+    }
+    if (oldest != NULL) {
+        filed_negative_lookup_cache.evictions++;
+    }
+    return oldest;
+}
+
+bool filed_negative_lookup_cache_get(
+    filed_runtime_t *runtime,
+    uint64_t parent_backend_object,
+    filed_generation_t parent_dir_generation,
+    const char *name,
+    int64_t *out_status)
+{
+    const size_t name_len = filed_lookup_name_len(name);
+    filed_negative_lookup_cache_slot_t *slot = filed_negative_lookup_cache_find(
+        runtime,
+        parent_backend_object,
+        parent_dir_generation,
+        name,
+        name_len);
+    if (slot == NULL) {
+        filed_negative_lookup_cache.misses++;
+        return false;
+    }
+    slot->last_used = filed_negative_lookup_cache_next_clock(runtime);
+    if (out_status != NULL) {
+        *out_status = slot->status;
+    }
+    filed_negative_lookup_cache.hits++;
+    return true;
+}
+
+void filed_negative_lookup_cache_store(
+    filed_runtime_t *runtime,
+    uint64_t parent_backend_object,
+    filed_generation_t parent_dir_generation,
+    const char *name,
+    int64_t status)
+{
+    const size_t name_len = filed_lookup_name_len(name);
+    filed_negative_lookup_cache_slot_t *slot;
+    if (parent_backend_object == 0 ||
+        name == NULL ||
+        name_len == 0 ||
+        name_len >= FILED_V2_NAME_BYTES ||
+        status == 0)
+    {
+        return;
+    }
+    slot = filed_negative_lookup_cache_find(
+        runtime,
+        parent_backend_object,
+        parent_dir_generation,
+        name,
+        name_len);
+    if (slot == NULL) {
+        slot = filed_negative_lookup_cache_choose_slot(runtime);
+    }
+    if (slot == NULL) {
+        return;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+    slot->valid = true;
+    slot->parent_backend_object = parent_backend_object;
+    slot->parent_dir_generation = parent_dir_generation;
+    slot->last_used = filed_negative_lookup_cache_next_clock(runtime);
+    slot->status = status;
+    memcpy(slot->name, name, name_len);
+    slot->name[name_len] = '\0';
+    filed_negative_lookup_cache.stores++;
+    filed_cache_note_attachment(runtime, parent_backend_object, FILED_CACHE_ATTACHMENT_NEGATIVE);
+}
+
+static void filed_file_vmo_cache_clear_entry(filed_file_vmo_cache_entry_t *entry)
+{
+    if (entry == NULL || !entry->active) {
+        return;
+    }
+    if (entry->vmo_fd >= 16) {
+        (void)pacha_fd_close(entry->vmo_fd);
+    }
+    memset(entry, 0, sizeof(*entry));
+    entry->vmo_fd = -1;
+}
+
+static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) {
+        return;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active && entry->backend_object == backend_object) {
+            filed_file_vmo_cache_clear_entry(entry);
+        }
+    }
+}
+
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t object_generation,
+    uint64_t file_offset,
+    uint64_t length)
+{
+    if (runtime == NULL || backend_object == 0 || length == 0) {
+        return NULL;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active &&
+            entry->backend_object == backend_object &&
+            entry->object_generation == object_generation &&
+            entry->file_offset == file_offset &&
+            entry->length == length)
+        {
+            entry->clock = ++filed_file_vmo_cache.clock;
+            filed_file_vmo_cache_hits++;
+            return entry;
+        }
+    }
+    filed_file_vmo_cache_misses++;
+    return NULL;
+}
+
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime)
+{
+    uint64_t slot = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (!entry->active) {
+            return entry;
+        }
+        if (entry->clock < oldest) {
+            oldest = entry->clock;
+            slot = i;
+        }
+    }
+    filed_file_vmo_cache_evictions++;
+    filed_file_vmo_cache_clear_entry(&filed_file_vmo_cache.entries[slot]);
+    return &filed_file_vmo_cache.entries[slot];
+}
+
+void filed_cache_invalidate(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) {
+        return;
+    }
+    filed_page_cache_invalidate_object(runtime, backend_object);
+    filed_dir_cache_invalidate_dir(runtime, backend_object);
+    for (size_t i = 0; i < FILED_NEGATIVE_LOOKUP_CACHE_SLOTS; ++i) {
+        filed_negative_lookup_cache_slot_t *slot = &filed_negative_lookup_cache.slots[i];
+        if (slot->valid && slot->parent_backend_object == backend_object) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
+    filed_file_vmo_cache_invalidate_object(runtime, backend_object);
+    for (size_t i = 0; i < FILED_CACHE_OBJECT_SLOTS; ++i) {
+        filed_cache_object_entry_t *entry = &filed_cache.objects[i];
+        if (entry->valid && entry->backend_object == backend_object) {
+            memset(entry, 0, sizeof(*entry));
+            return;
+        }
+    }
+}

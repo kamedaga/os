@@ -1,4 +1,6 @@
-static filed_page_dispatch_result_t filed_dispatch_unlink_page(
+#include "common.h"
+
+filed_page_dispatch_result_t filed_dispatch_unlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -45,7 +47,7 @@ static filed_page_dispatch_result_t filed_dispatch_unlink_page(
                         name);
                 }
                 if (reply_status == 0) {
-                    filed_dir_cache_invalidate_dir(runtime, decision.backend_object);
+                    filed_cache_invalidate(runtime, decision.backend_object);
                     filed_invalidate_mutated_object(runtime, target_object);
                     filed_vfs_reclaim_result_t reclaim;
                     memset(&reclaim, 0, sizeof(reclaim));
@@ -75,7 +77,7 @@ static filed_page_dispatch_result_t filed_dispatch_unlink_page(
     return filed_page_result(reply_status, 0);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
+filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -114,7 +116,7 @@ static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
                     mkdir->mode,
                     &object_id);
                 if (reply_status == 0 && object_id != 0) {
-                    filed_dir_cache_invalidate_dir(runtime, decision.backend_object);
+                    filed_cache_invalidate(runtime, decision.backend_object);
                     filed_vfs_open_result_t opened;
                     memset(&opened, 0, sizeof(opened));
                     if (filed_vfs_create_backend_child(
@@ -156,7 +158,7 @@ static filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     return filed_page_result(reply_status, 0);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_symlink_page(
+filed_page_dispatch_result_t filed_dispatch_symlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -200,7 +202,7 @@ static filed_page_dispatch_result_t filed_dispatch_symlink_page(
                     symlink->target_length,
                     &object_id);
                 if (reply_status == 0 && object_id != 0) {
-                    filed_dir_cache_invalidate_dir(runtime, decision.backend_object);
+                    filed_cache_invalidate(runtime, decision.backend_object);
                     filed_vfs_open_result_t opened;
                     memset(&opened, 0, sizeof(opened));
                     if (filed_vfs_create_backend_child(
@@ -237,7 +239,7 @@ static filed_page_dispatch_result_t filed_dispatch_symlink_page(
     return filed_page_result(reply_status, object_id);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_readlink_page(
+filed_page_dispatch_result_t filed_dispatch_readlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -306,7 +308,7 @@ static filed_page_dispatch_result_t filed_dispatch_readlink_page(
     return filed_page_result(reply_status, target_length);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_link_page(
+filed_page_dispatch_result_t filed_dispatch_link_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -390,7 +392,7 @@ static filed_page_dispatch_result_t filed_dispatch_link_page(
                 &linked_object_id);
         }
         if (reply_status == 0 && linked_object_id != 0) {
-            filed_dir_cache_invalidate_dir(runtime, new_parent.backend_object);
+            filed_cache_invalidate(runtime, new_parent.backend_object);
             memset(&opened, 0, sizeof(opened));
             filed_status_t status = filed_vfs_link_commit(
                 &runtime->vfs,
@@ -442,7 +444,7 @@ static filed_page_dispatch_result_t filed_dispatch_link_page(
     return filed_page_result(reply_status, linked_object_id);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
+filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -489,7 +491,7 @@ static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
                         name);
                 }
                 if (reply_status == 0) {
-                    filed_dir_cache_invalidate_dir(runtime, decision.backend_object);
+                    filed_cache_invalidate(runtime, decision.backend_object);
                     filed_invalidate_mutated_object(runtime, target_object);
                     filed_vfs_reclaim_result_t reclaim;
                     memset(&reclaim, 0, sizeof(reclaim));
@@ -519,7 +521,7 @@ static filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     return filed_page_result(reply_status, 0);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_rename_page(
+filed_page_dispatch_result_t filed_dispatch_rename_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -606,9 +608,9 @@ static filed_page_dispatch_result_t filed_dispatch_rename_page(
                         &object_id);
                 }
                 if (reply_status == 0) {
-                    filed_dir_cache_invalidate_dir(runtime, old_parent.backend_object);
+                    filed_cache_invalidate(runtime, old_parent.backend_object);
                     if (new_parent.backend_object != old_parent.backend_object) {
-                        filed_dir_cache_invalidate_dir(runtime, new_parent.backend_object);
+                        filed_cache_invalidate(runtime, new_parent.backend_object);
                     }
                     if (replaced_object_id != 0 && replaced_object_id != object_id) {
                         filed_invalidate_mutated_object(runtime, replaced_object_id);
@@ -659,7 +661,7 @@ static filed_page_dispatch_result_t filed_dispatch_rename_page(
     return filed_page_result(reply_status, object_id);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_getdents_page(
+filed_page_dispatch_result_t filed_dispatch_getdents_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -748,7 +750,7 @@ static filed_page_dispatch_result_t filed_dispatch_getdents_page(
     return filed_page_result(reply_status, result);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_close_page(
+filed_page_dispatch_result_t filed_dispatch_close_page(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request)
 {
@@ -759,7 +761,7 @@ static filed_page_dispatch_result_t filed_dispatch_close_page(
     return filed_page_result(filed_close_handle_runtime(runtime, handle_id), 0);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_dup_page(
+filed_page_dispatch_result_t filed_dispatch_dup_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -792,7 +794,7 @@ static filed_page_dispatch_result_t filed_dispatch_dup_page(
     return filed_page_result(reply_status, result);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_get_flags_page(
+filed_page_dispatch_result_t filed_dispatch_get_flags_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -817,7 +819,7 @@ static filed_page_dispatch_result_t filed_dispatch_get_flags_page(
     return filed_page_result(filed_status_to_wire(status), result);
 }
 
-static filed_page_dispatch_result_t filed_dispatch_set_flags_page(
+filed_page_dispatch_result_t filed_dispatch_set_flags_page(
     filed_runtime_t *runtime,
     void *page)
 {
@@ -837,4 +839,3 @@ static filed_page_dispatch_result_t filed_dispatch_set_flags_page(
     }
     return filed_page_result(filed_status_to_wire(status), 0);
 }
-

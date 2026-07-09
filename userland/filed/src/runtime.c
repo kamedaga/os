@@ -60,7 +60,7 @@ static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
     }
 
     runtime->syncer_ticks++;
-    const uint64_t dirty_count = filed_page_cache_dirty_count(runtime);
+    const uint64_t dirty_count = filed_cache_dirty_count(runtime);
     const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
     if (dirty_count == 0 && backend_dirty_hint == 0) {
         return;
