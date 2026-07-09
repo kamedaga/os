@@ -74,6 +74,7 @@ kernel 側には `thread_create/thread_start/futex_wait/futex_wake` が既にあ
 4. **互換を作らない**。境界単位で caller/server を一括変換。`_v2` のような世代 suffix も最終的に廃止。
 5. **トレースは全層共通の 1 形式**。手書き文字列アペンダと ad-hoc metric slot を廃止。
 6. **kernel は機構のみ**。今回の kernel 変更は「意味論の修正 (refcount/revoke 分離)」と「構造の分割」に限定。機能追加・userland 知識の混入はしない (AGENTS.md 準拠)。
+6b. **syscall 番号はジャンル帯に正しく配置する**。fd / vm / process / ipc / capsule / runtime のジャンル別番号帯を維持し、追加はジャンル内の正しい位置へ。互換性維持は不要なので後続番号は全部ずらす。「めんどいから末尾に追加」は禁止 (AGENTS.md)。ずらした際は kernel/abi/ と userland 側 abi ヘッダ (musl/pachaos, libpacha) を同一コミットで追随させる。
 7. 各タスクは「挙動を変えない移動」か「挙動を変える修正」のどちらかに寄せ、混ぜない。
 
 ---
