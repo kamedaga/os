@@ -65,6 +65,43 @@ static lpr_fd_table_file_t *lpr_fd_table_file_for_fd(lpr_fd_table_t *table, uint
     return file;
 }
 
+static void lpr_fd_table_fill_payload(
+    lpr_fd_table_file_t *file,
+    const lpr_fd_table_install_t *install)
+{
+    if (file == 0 || install == 0) {
+        return;
+    }
+    switch (install->kind) {
+    case LPR_FD_TABLE_KIND_FILED:
+        file->payload.filed.active = 1;
+        file->payload.filed.offset_valid = 1;
+        file->payload.filed.flags =
+            (install->status_flags & LPR_FD_TABLE_STATUS_NONBLOCK ? 00004000u : 0u) |
+            (install->status_flags & LPR_FD_TABLE_STATUS_APPEND ? 00002000u : 0u);
+        file->payload.filed.handle = install->backend_id;
+        file->payload.filed.offset = install->offset;
+        break;
+    case LPR_FD_TABLE_KIND_TTY:
+        file->payload.tty.active = 1;
+        file->payload.tty.handle = install->backend_id;
+        break;
+    case LPR_FD_TABLE_KIND_PIPE:
+        file->payload.pipe.active = 1;
+        file->payload.pipe.flags =
+            (install->status_flags & LPR_FD_TABLE_STATUS_NONBLOCK ? 00004000u : 0u);
+        break;
+    case LPR_FD_TABLE_KIND_EVENT:
+        file->payload.eventfd.active = 1;
+        file->payload.eventfd.counter = install->offset;
+        file->payload.eventfd.flags =
+            (install->status_flags & LPR_FD_TABLE_STATUS_NONBLOCK ? 00004000u : 0u);
+        break;
+    default:
+        break;
+    }
+}
+
 static const lpr_fd_table_file_t *lpr_fd_table_file_for_fd_const(
     const lpr_fd_table_t *table,
     uint32_t fd)
@@ -111,6 +148,7 @@ void lpr_fd_table_init(
     table->slot_count = slot_count;
     table->files = files;
     table->file_count = file_count;
+    table->generation = 1;
     if (slots != 0) {
         lpr_fd_table_zero(slots, (uint64_t)slot_count * sizeof(slots[0]));
     }
@@ -138,9 +176,12 @@ int lpr_fd_table_install_at(
     file->rights = install->rights;
     file->backend_id = install->backend_id;
     file->offset = install->offset;
+    file->generation = ++table->generation;
+    lpr_fd_table_fill_payload(file, install);
     slot->active = 1;
     slot->fd_flags = install->fd_flags;
     slot->file_index = file_index;
+    table->generation++;
     return 0;
 }
 
@@ -181,6 +222,7 @@ int lpr_fd_table_close(lpr_fd_table_t *table, uint32_t fd)
         lpr_fd_table_zero(file, sizeof(*file));
     }
     lpr_fd_table_zero(slot, sizeof(*slot));
+    table->generation++;
     return 0;
 }
 
@@ -202,6 +244,7 @@ int lpr_fd_table_dup(
             table->slots[fd].fd_flags = new_fd_flags;
             table->slots[fd].file_index = old_slot->file_index;
             file->refcount++;
+            table->generation++;
             *out_fd = fd;
             return 0;
         }
@@ -222,7 +265,6 @@ int lpr_fd_table_dup2(
         return -1;
     }
     if (old_fd == new_fd) {
-        new_slot->fd_flags = new_fd_flags;
         return 0;
     }
     if (new_slot->active && lpr_fd_table_close(table, new_fd) != 0) {
@@ -232,6 +274,7 @@ int lpr_fd_table_dup2(
     new_slot->fd_flags = new_fd_flags;
     new_slot->file_index = old_slot->file_index;
     file->refcount++;
+    table->generation++;
     return 0;
 }
 
@@ -256,6 +299,7 @@ int lpr_fd_table_close_range(
         }
         if (cloexec_only) {
             table->slots[fd].fd_flags |= LPR_FD_TABLE_FD_CLOEXEC;
+            table->generation++;
         } else {
             (void)lpr_fd_table_close(table, fd);
         }
@@ -280,6 +324,7 @@ int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, uint32_t fd, uint16_t flags
         return -1;
     }
     slot->fd_flags = flags;
+    table->generation++;
     return 0;
 }
 
@@ -300,6 +345,7 @@ int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t f
         return -1;
     }
     file->status_flags = flags;
+    table->generation++;
     return 0;
 }
 
@@ -320,6 +366,37 @@ int lpr_fd_table_set_offset(lpr_fd_table_t *table, uint32_t fd, uint64_t offset)
         return -1;
     }
     file->offset = offset;
+    table->generation++;
+    return 0;
+}
+
+lpr_fd_object_t *lpr_fd_table_object_for_fd(lpr_fd_table_t *table, uint32_t fd)
+{
+    return lpr_fd_table_file_for_fd(table, fd);
+}
+
+const lpr_fd_object_t *lpr_fd_table_object_for_fd_const(const lpr_fd_table_t *table, uint32_t fd)
+{
+    return lpr_fd_table_file_for_fd_const(table, fd);
+}
+
+int lpr_fd_table_get_kind(const lpr_fd_table_t *table, uint32_t fd, uint8_t *out_kind)
+{
+    const lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd_const(table, fd);
+    if (file == 0 || out_kind == 0) {
+        return -1;
+    }
+    *out_kind = file->kind;
+    return 0;
+}
+
+int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_refcount)
+{
+    const lpr_fd_table_file_t *file = lpr_fd_table_file_for_fd_const(table, fd);
+    if (file == 0 || out_refcount == 0) {
+        return -1;
+    }
+    *out_refcount = file->refcount;
     return 0;
 }
 

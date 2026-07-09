@@ -2,8 +2,7 @@
 
 int lpr_pipe_fd_is_active(uint64_t fd)
 {
-    lpr_fd_arrays_init();
-    return fd < lpr_fd_table_capacity && lpr_pipe_fds[fd].active != 0;
+    return lpr_fd_pipe_payload(fd) != 0;
 }
 
 int lpr_linux_pipe_fd_active(uint64_t fd)
@@ -318,6 +317,5 @@ int64_t lpr_native_pipe_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count
 
 int lpr_linux_eventfd_active(uint64_t fd)
 {
-    lpr_fd_arrays_init();
-    return fd < lpr_fd_table_capacity && lpr_event_fds[fd].active != 0;
+    return lpr_fd_event_payload(fd) != 0;
 }

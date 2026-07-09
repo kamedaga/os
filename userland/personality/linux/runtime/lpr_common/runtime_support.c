@@ -84,10 +84,6 @@ void lpr_fd_arrays_init(void)
     if (lpr_fd_table_capacity != 0) {
         return;
     }
-    lpr_fds = lpr_fds_initial;
-    lpr_pipe_fds = lpr_pipe_fds_initial;
-    lpr_event_fds = lpr_event_fds_initial;
-    lpr_tty_fds = lpr_tty_fds_initial;
     lpr_control_slots = lpr_control_slots_initial;
     lpr_control_files = lpr_control_files_initial;
     lpr_fd_table_capacity = LPR_FD_TABLE_INITIAL_SIZE;
@@ -123,56 +119,31 @@ int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, uint64_
 
 int lpr_fd_table_layout(
     uint64_t capacity,
-    uint64_t *filed_offset,
-    uint64_t *pipe_offset,
-    uint64_t *event_offset,
-    uint64_t *tty_offset,
     uint64_t *control_slot_offset,
     uint64_t *control_file_offset,
     uint64_t *total_bytes)
 {
     if (capacity < LPR_FD_TABLE_INITIAL_SIZE ||
         capacity > LPR_FD_TABLE_MAX_SIZE ||
-        filed_offset == 0 ||
-        pipe_offset == 0 ||
-        event_offset == 0 ||
-        tty_offset == 0 ||
         control_slot_offset == 0 ||
         control_file_offset == 0 ||
         total_bytes == 0)
     {
         return 0;
     }
-    uint64_t filed_bytes = 0;
-    uint64_t pipe_bytes = 0;
-    uint64_t event_bytes = 0;
-    uint64_t tty_bytes = 0;
     uint64_t control_slot_bytes = 0;
     uint64_t control_file_bytes = 0;
-    if (!lpr_fd_table_segment_bytes(capacity, sizeof(lpr_filed_fd_t), &filed_bytes) ||
-        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_pipe_fd_t), &pipe_bytes) ||
-        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_event_fd_t), &event_bytes) ||
-        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_tty_fd_t), &tty_bytes) ||
-        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_fd_table_slot_t), &control_slot_bytes) ||
+    if (!lpr_fd_table_segment_bytes(capacity, sizeof(lpr_fd_table_slot_t), &control_slot_bytes) ||
         !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_fd_table_file_t), &control_file_bytes))
     {
         return 0;
     }
-    if (filed_bytes > UINT64_MAX - pipe_bytes ||
-        filed_bytes + pipe_bytes > UINT64_MAX - event_bytes ||
-        filed_bytes + pipe_bytes + event_bytes > UINT64_MAX - tty_bytes ||
-        filed_bytes + pipe_bytes + event_bytes + tty_bytes > UINT64_MAX - control_slot_bytes ||
-        filed_bytes + pipe_bytes + event_bytes + tty_bytes + control_slot_bytes > UINT64_MAX - control_file_bytes)
-    {
+    if (control_slot_bytes > UINT64_MAX - control_file_bytes) {
         return 0;
     }
-    *filed_offset = 0;
-    *pipe_offset = filed_bytes;
-    *event_offset = filed_bytes + pipe_bytes;
-    *tty_offset = filed_bytes + pipe_bytes + event_bytes;
-    *control_slot_offset = filed_bytes + pipe_bytes + event_bytes + tty_bytes;
-    *control_file_offset = filed_bytes + pipe_bytes + event_bytes + tty_bytes + control_slot_bytes;
-    *total_bytes = filed_bytes + pipe_bytes + event_bytes + tty_bytes + control_slot_bytes + control_file_bytes;
+    *control_slot_offset = 0;
+    *control_file_offset = control_slot_bytes;
+    *total_bytes = control_slot_bytes + control_file_bytes;
     return 1;
 }
 
@@ -209,19 +180,11 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
     if (new_capacity == 0) {
         return -LPR_LINUX_EMFILE;
     }
-    uint64_t filed_offset = 0;
-    uint64_t pipe_offset = 0;
-    uint64_t event_offset = 0;
-    uint64_t tty_offset = 0;
     uint64_t control_slot_offset = 0;
     uint64_t control_file_offset = 0;
     uint64_t total_bytes = 0;
     if (!lpr_fd_table_layout(
             new_capacity,
-            &filed_offset,
-            &pipe_offset,
-            &event_offset,
-            &tty_offset,
             &control_slot_offset,
             &control_file_offset,
             &total_bytes))
@@ -240,18 +203,10 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
         return (int)lpr_pacha_status_to_errno(mapped);
     }
     unsigned char *base = (unsigned char *)(uintptr_t)mapped;
-    lpr_filed_fd_t *new_filed = (lpr_filed_fd_t *)(void *)(base + filed_offset);
-    lpr_pipe_fd_t *new_pipe = (lpr_pipe_fd_t *)(void *)(base + pipe_offset);
-    lpr_event_fd_t *new_event = (lpr_event_fd_t *)(void *)(base + event_offset);
-    lpr_tty_fd_t *new_tty = (lpr_tty_fd_t *)(void *)(base + tty_offset);
     lpr_fd_table_slot_t *new_control_slots =
         (lpr_fd_table_slot_t *)(void *)(base + control_slot_offset);
     lpr_fd_table_file_t *new_control_files =
         (lpr_fd_table_file_t *)(void *)(base + control_file_offset);
-    lpr_memcpy(new_filed, lpr_fds, (size_t)(lpr_fd_table_capacity * sizeof(*lpr_fds)));
-    lpr_memcpy(new_pipe, lpr_pipe_fds, (size_t)(lpr_fd_table_capacity * sizeof(*lpr_pipe_fds)));
-    lpr_memcpy(new_event, lpr_event_fds, (size_t)(lpr_fd_table_capacity * sizeof(*lpr_event_fds)));
-    lpr_memcpy(new_tty, lpr_tty_fds, (size_t)(lpr_fd_table_capacity * sizeof(*lpr_tty_fds)));
     lpr_memcpy(
         new_control_slots,
         lpr_control_slots,
@@ -266,10 +221,6 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
             (uint64_t)(uintptr_t)lpr_fd_table_dynamic_base,
             lpr_fd_table_dynamic_bytes);
     }
-    lpr_fds = new_filed;
-    lpr_pipe_fds = new_pipe;
-    lpr_event_fds = new_event;
-    lpr_tty_fds = new_tty;
     lpr_control_slots = new_control_slots;
     lpr_control_files = new_control_files;
     lpr_control_fd_table.slots = lpr_control_slots;
@@ -324,6 +275,9 @@ void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t 
         a,
         b,
         (uint64_t)status);
+    if (event != 0 && lpr_strcmp(event, "execve_begin") == 0) {
+        lpr_state_dump(event);
+    }
 }
 
 void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset)
@@ -369,4 +323,3 @@ int64_t lpr_pacha_status_to_errno(int64_t status)
 {
     return pacha_kernel_status_to_errno(status);
 }
-

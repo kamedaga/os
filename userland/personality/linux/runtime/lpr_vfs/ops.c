@@ -88,7 +88,7 @@ int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
     if (!lpr_fd_is_filed(dirfd)) {
         return -LPR_LINUX_EBADF;
     }
-    *out = lpr_fds[dirfd].handle;
+    *out = lpr_fd_filed_payload(dirfd)->handle;
     return 0;
 }
 
@@ -132,7 +132,7 @@ int64_t lpr_linux_fsync(uint64_t fd)
         return -LPR_LINUX_EINVAL;
     }
     uint64_t ignored = 0;
-    return lpr_filed_call(FILED_V2_OP_VFS_FSYNC, -1, lpr_fds[fd].handle, &ignored);
+    return lpr_filed_call(FILED_V2_OP_VFS_FSYNC, -1, lpr_fd_filed_payload(fd)->handle, &ignored);
 }
 
 int64_t lpr_linux_sync(void)
@@ -773,7 +773,7 @@ int64_t lpr_linux_fchdir(uint64_t fd)
         return -LPR_LINUX_ENOTDIR;
     }
     uint64_t dup_handle = 0;
-    const int64_t dup_status = lpr_filed_dup_handle(lpr_fds[fd].handle, 0, &dup_handle);
+    const int64_t dup_status = lpr_filed_dup_handle(lpr_fd_filed_payload(fd)->handle, 0, &dup_handle);
     if (dup_status != 0) {
         return dup_status;
     }

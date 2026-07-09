@@ -240,23 +240,28 @@ void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
 {
     lpr_memset(desc, 0, sizeof(*desc));
     desc->fd = fd;
+    const uint32_t status_flags = (uint32_t)lpr_control_status_flags_to_linux(
+        lpr_control_status_flags_from_linux(
+            (uint64_t)lpr_control_get_status_flags(fd, 0)));
+    const uint32_t fd_flags =
+        lpr_control_get_fd_flags(fd) == LPR_LINUX_FD_CLOEXEC ? LPR_LINUX_O_CLOEXEC : 0;
     if (lpr_fd_is_filed(fd)) {
         desc->kind = FILED_V2_EXEC_LPR_FD_FILED;
-        desc->flags = lpr_fds[fd].flags;
-        desc->handle = lpr_fds[fd].handle;
+        desc->flags = (lpr_fd_filed_payload(fd)->flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
+        desc->handle = lpr_fd_filed_payload(fd)->handle;
         desc->offset_or_counter = lpr_filed_control_offset(fd);
     } else if (lpr_linux_tty_fd_active(fd)) {
         desc->kind = FILED_V2_EXEC_LPR_FD_TTY;
-        desc->flags = lpr_tty_fds[fd].flags;
-        desc->handle = lpr_tty_fds[fd].handle;
+        desc->flags = (lpr_fd_tty_payload(fd)->flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
+        desc->handle = lpr_fd_tty_payload(fd)->handle;
     } else if (lpr_pipe_fd_is_active(fd)) {
         desc->kind = FILED_V2_EXEC_LPR_FD_PIPE;
-        desc->flags = lpr_pipe_fds[fd].flags;
+        desc->flags = (lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = fd;
     } else if (lpr_linux_eventfd_active(fd)) {
         desc->kind = FILED_V2_EXEC_LPR_FD_EVENT;
-        desc->flags = lpr_event_fds[fd].flags;
-        desc->offset_or_counter = lpr_event_fds[fd].counter;
+        desc->flags = (lpr_fd_event_payload(fd)->flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
+        desc->offset_or_counter = lpr_fd_event_payload(fd)->counter;
     }
 }
 
@@ -406,7 +411,7 @@ void lpr_close_local_state_before_self_exec(void)
             continue;
         }
         if (lpr_pipe_fd_is_active(fd)) {
-            lpr_memset(&lpr_pipe_fds[fd], 0, sizeof(lpr_pipe_fds[fd]));
+            lpr_control_close_fd(fd);
             continue;
         }
         if (lpr_linux_socket_fd_active(fd)) {
@@ -414,23 +419,27 @@ void lpr_close_local_state_before_self_exec(void)
             continue;
         }
         if (lpr_linux_tty_fd_active(fd)) {
-            const uint64_t handle = lpr_tty_fds[fd].handle;
-            const uint32_t flags = lpr_tty_fds[fd].flags;
-            lpr_memset(&lpr_tty_fds[fd], 0, sizeof(lpr_tty_fds[fd]));
-            if ((flags & LPR_LINUX_O_CLOEXEC) != 0 && handle != 0) {
+            uint32_t refcount = 0;
+            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+            const uint64_t handle = lpr_fd_tty_payload(fd)->handle;
+            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
+            lpr_control_close_fd(fd);
+            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && handle != 0) {
                 (void)lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, handle, 0);
             }
             continue;
         }
         if (lpr_linux_eventfd_active(fd)) {
-            lpr_memset(&lpr_event_fds[fd], 0, sizeof(lpr_event_fds[fd]));
+            lpr_control_close_fd(fd);
             continue;
         }
         if (lpr_fd_is_filed(fd)) {
-            const uint64_t handle = lpr_fds[fd].handle;
-            const uint32_t flags = lpr_fds[fd].flags;
-            lpr_memset(&lpr_fds[fd], 0, sizeof(lpr_fds[fd]));
-            if ((flags & LPR_LINUX_O_CLOEXEC) != 0 && handle != 0) {
+            uint32_t refcount = 0;
+            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+            const uint64_t handle = lpr_fd_filed_payload(fd)->handle;
+            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
+            lpr_control_close_fd(fd);
+            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && handle != 0) {
                 (void)lpr_filed_close_handle(handle);
             }
         }
@@ -604,4 +613,3 @@ int64_t lpr_filed_exec_self(
     *out_bootstrap_fd = (int)(uint32_t)reply_fds[2].fd;
     return 0;
 }
-

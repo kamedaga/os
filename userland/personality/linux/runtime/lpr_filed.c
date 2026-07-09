@@ -6,19 +6,11 @@ void *memset(void *dst, int c, size_t n)
     return lpr_memset(dst, c, n);
 }
 
-lpr_filed_fd_t lpr_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
-lpr_pipe_fd_t lpr_pipe_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
-lpr_event_fd_t lpr_event_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
-lpr_tty_fd_t lpr_tty_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
 lpr_fd_table_slot_t lpr_control_slots_initial[LPR_FD_TABLE_INITIAL_SIZE];
 lpr_fd_table_file_t lpr_control_files_initial[LPR_FD_TABLE_INITIAL_SIZE];
-lpr_filed_fd_t *lpr_fds;
-lpr_pipe_fd_t *lpr_pipe_fds;
-lpr_event_fd_t *lpr_event_fds;
-lpr_tty_fd_t *lpr_tty_fds;
 lpr_fd_table_slot_t *lpr_control_slots;
 lpr_fd_table_file_t *lpr_control_files;
-lpr_fd_table_t lpr_control_fd_table;
+lpr_state_t lpr_state;
 uint64_t lpr_fd_table_capacity;
 void *lpr_fd_table_dynamic_base;
 uint64_t lpr_fd_table_dynamic_bytes;

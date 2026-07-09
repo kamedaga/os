@@ -160,9 +160,6 @@ int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags)
     if (fd < 0) {
         return fd;
     }
-    lpr_tty_fds[fd].active = 1;
-    lpr_tty_fds[fd].flags = (uint32_t)flags;
-    lpr_tty_fds[fd].handle = handle;
     const int control_status = lpr_control_install_fd(
         (uint64_t)fd,
         LPR_FD_TABLE_KIND_TTY,
@@ -170,9 +167,16 @@ int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags)
         handle,
         0);
     if (control_status != 0) {
-        lpr_memset(&lpr_tty_fds[fd], 0, sizeof(lpr_tty_fds[fd]));
         return control_status;
     }
+    lpr_tty_fd_t *tty = lpr_fd_tty_payload((uint64_t)fd);
+    if (tty == 0) {
+        lpr_control_close_fd((uint64_t)fd);
+        return -LPR_LINUX_EIO;
+    }
+    tty->active = 1;
+    tty->flags = (uint32_t)flags;
+    tty->handle = handle;
     return fd;
 }
 

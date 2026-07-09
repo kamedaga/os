@@ -2,15 +2,15 @@
 
 void lpr_pipe_close_fd(uint64_t fd)
 {
-    if (lpr_pipe_fd_is_active(fd)) {
+    lpr_pipe_fd_t *pipe = lpr_fd_pipe_payload(fd);
+    if (pipe != 0) {
         const uint64_t mode =
-            (lpr_pipe_fds[fd].readable ? 1u : 0u) |
-            (lpr_pipe_fds[fd].writable ? 2u : 0u) |
-            ((uint64_t)lpr_pipe_fds[fd].flags << 8u);
+            (pipe->readable ? 1u : 0u) |
+            (pipe->writable ? 2u : 0u) |
+            ((uint64_t)pipe->flags << 8u);
         const int64_t status = lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fd);
         lpr_trace_process_event("pipe_close", fd, mode, status);
     }
-    lpr_memset(&lpr_pipe_fds[fd], 0, sizeof(lpr_pipe_fds[fd]));
     lpr_control_close_fd(fd);
 }
 
@@ -26,37 +26,41 @@ void lpr_pipe_after_fork_child(void)
             lpr_cwd_handle = dup_handle;
         }
     }
-    lpr_fd_arrays_init();
-    for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
-        if (lpr_linux_tty_fd_active(fd)) {
+    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; index += 1) {
+        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
+        if (!object->active) {
+            continue;
+        }
+        if (object->kind == LPR_FD_TABLE_KIND_TTY) {
             uint64_t dup_handle = 0;
             const int64_t status = lpr_termd_call_handle(
                 TERMD_V2_OP_HANDLE_DUP,
-                lpr_tty_fds[fd].handle,
+                object->payload.tty.handle,
                 &dup_handle);
-            lpr_trace_process_event("fork_dup_tty", fd, dup_handle, status);
+            lpr_trace_process_event("fork_dup_tty", index, dup_handle, status);
             if (status == 0 && dup_handle != 0) {
-                lpr_tty_fds[fd].handle = dup_handle;
+                object->payload.tty.handle = dup_handle;
+                object->backend_id = dup_handle;
             }
         }
-        if (lpr_fd_is_filed(fd)) {
+        if (object->kind == LPR_FD_TABLE_KIND_FILED) {
             void *page = 0;
             const int page_fd = lpr_create_wire_page(&page);
             if (page_fd < 0) {
-                lpr_trace_process_event("fork_dup_filed_page", fd, 0, page_fd);
+                lpr_trace_process_event("fork_dup_filed_page", index, 0, page_fd);
                 continue;
             }
             filed_v2_handle_flags_t *flags = (filed_v2_handle_flags_t *)page;
             lpr_memset(flags, 0, sizeof(*flags));
-            flags->handle = lpr_fds[fd].handle;
-            flags->fd_flags =
-                (lpr_fds[fd].flags & LPR_LINUX_O_CLOEXEC) != 0 ? FILED_V2_FD_CLOEXEC : 0;
+            flags->handle = object->payload.filed.handle;
+            flags->fd_flags = 0;
             uint64_t dup_handle = 0;
             const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_DUP, page_fd, 0, &dup_handle);
             lpr_destroy_wire_page(page_fd, page);
-            lpr_trace_process_event("fork_dup_filed", fd, dup_handle, status);
+            lpr_trace_process_event("fork_dup_filed", index, dup_handle, status);
             if (status == 0 && dup_handle != 0) {
-                lpr_fds[fd].handle = dup_handle;
+                object->payload.filed.handle = dup_handle;
+                object->backend_id = dup_handle;
             }
         }
     }
@@ -130,12 +134,8 @@ int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
     if (write_track != 0) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, read_fd);
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, write_fd);
-        if (read_fd < lpr_fd_table_capacity) {
-            lpr_memset(&lpr_pipe_fds[read_fd], 0, sizeof(lpr_pipe_fds[read_fd]));
-        }
-        if (write_fd < lpr_fd_table_capacity) {
-            lpr_memset(&lpr_pipe_fds[write_fd], 0, sizeof(lpr_pipe_fds[write_fd]));
-        }
+        lpr_control_close_fd(read_fd);
+        lpr_control_close_fd(write_fd);
         return write_track;
     }
 
@@ -156,9 +156,6 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
     if (fd < 0) {
         return fd;
     }
-    lpr_event_fds[fd].active = 1;
-    lpr_event_fds[fd].flags = (uint32_t)flags;
-    lpr_event_fds[fd].counter = initval;
     const int control_status = lpr_control_install_fd(
         (uint64_t)fd,
         LPR_FD_TABLE_KIND_EVENT,
@@ -166,9 +163,16 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
         (uint64_t)fd,
         initval);
     if (control_status != 0) {
-        lpr_memset(&lpr_event_fds[fd], 0, sizeof(lpr_event_fds[fd]));
         return control_status;
     }
+    lpr_event_fd_t *event = lpr_fd_event_payload((uint64_t)fd);
+    if (event == 0) {
+        lpr_control_close_fd((uint64_t)fd);
+        return -LPR_LINUX_EIO;
+    }
+    event->active = 1;
+    event->flags = (uint32_t)flags;
+    event->counter = initval;
     return fd;
 }
 
@@ -205,20 +209,15 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
         if (control_status != 0) {
             return control_status;
         }
-        lpr_event_fds[dup_fd] = lpr_event_fds[fd];
-        if (cloexec) {
-            lpr_event_fds[dup_fd].flags |= LPR_LINUX_O_CLOEXEC;
-        } else {
-            lpr_event_fds[dup_fd].flags &= ~LPR_LINUX_O_CLOEXEC;
-        }
+        lpr_control_sync_legacy_flags((uint64_t)(uint32_t)dup_fd);
         return dup_fd;
     }
     if (lpr_pipe_fd_is_active(fd)) {
-        uint64_t dup_flags = lpr_pipe_flags_to_pacha(lpr_pipe_fds[fd].flags & LPR_LINUX_O_NONBLOCK);
+        uint64_t dup_flags = lpr_pipe_flags_to_pacha(lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_NONBLOCK);
         if (cloexec) {
             dup_flags |= PACHA_FD_FLAG_CLOEXEC;
         }
-        const uint64_t rights = lpr_pipe_rights(lpr_pipe_fds[fd].readable != 0);
+        const uint64_t rights = lpr_pipe_rights(lpr_fd_pipe_payload(fd)->readable != 0);
         const int64_t native_dup = lpr_pacha_syscall4(
             PACHAOS_SYSCALL_FD_DUP,
             fd,
@@ -246,65 +245,50 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, native_dup_fd);
             return track_status;
         }
-        const int control_status = lpr_control_dup_fd(fd, native_dup_fd, cloexec);
-        if (control_status != 0) {
-            lpr_pipe_close_fd(native_dup_fd);
-            return control_status;
-        }
-        lpr_control_sync_legacy_flags(native_dup_fd);
+        (void)lpr_control_set_fd_flags(
+            native_dup_fd,
+            cloexec ? LPR_LINUX_FD_CLOEXEC : 0);
+        (void)lpr_control_set_status_flags(native_dup_fd, lpr_fd_pipe_payload(fd)->flags);
         return (int64_t)native_dup_fd;
     }
     if (lpr_linux_tty_fd_active(fd)) {
         uint64_t dup_handle = 0;
         const int64_t status = lpr_termd_call_handle(
             TERMD_V2_OP_HANDLE_DUP,
-            lpr_tty_fds[fd].handle,
+            lpr_fd_tty_payload(fd)->handle,
             &dup_handle);
         if (status != 0) {
             return status;
         }
-        const int control_status = lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
-        if (control_status != 0) {
-            (void)lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, dup_handle, 0);
-            return control_status;
-        }
-        lpr_tty_fds[dup_fd].active = 1;
-        lpr_tty_fds[dup_fd].flags =
-            (lpr_tty_fds[fd].flags & ~LPR_LINUX_O_CLOEXEC) |
+        const uint64_t dup_flags =
+            (lpr_fd_tty_payload(fd)->flags & ~LPR_LINUX_O_CLOEXEC) |
             (cloexec ? LPR_LINUX_O_CLOEXEC : 0);
-        lpr_tty_fds[dup_fd].handle = dup_handle;
+        const int install_status = lpr_control_install_fd(
+            (uint64_t)(uint32_t)dup_fd,
+            LPR_FD_TABLE_KIND_TTY,
+            dup_flags,
+            dup_handle,
+            0);
+        if (install_status != 0) {
+            (void)lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, dup_handle, 0);
+            return install_status;
+        }
+        lpr_tty_fd_t *tty = lpr_fd_tty_payload((uint64_t)(uint32_t)dup_fd);
+        if (tty == 0) {
+            lpr_control_close_fd((uint64_t)(uint32_t)dup_fd);
+            (void)lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, dup_handle, 0);
+            return -LPR_LINUX_EIO;
+        }
+        tty->active = 1;
+        tty->flags = (uint32_t)dup_flags;
+        tty->handle = dup_handle;
         return dup_fd;
     }
     if (lpr_fd_is_filed(fd)) {
-        void *page = 0;
-        const int page_fd = lpr_create_wire_page(&page);
-        if (page_fd < 0) {
-            return page_fd;
-        }
-        filed_v2_handle_flags_t *flags = (filed_v2_handle_flags_t *)page;
-        lpr_memset(flags, 0, sizeof(*flags));
-        flags->handle = lpr_fds[fd].handle;
-        flags->fd_flags = cloexec ? FILED_V2_FD_CLOEXEC : 0;
-        uint64_t dup_handle = 0;
-        const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_DUP, page_fd, 0, &dup_handle);
-        lpr_destroy_wire_page(page_fd, page);
-        if (status != 0) {
-            return status;
-        }
         const int control_status = lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
         if (control_status != 0) {
-            (void)lpr_filed_close_handle(dup_handle);
             return control_status;
         }
-        lpr_fds[dup_fd].active = 1;
-        lpr_fds[dup_fd].offset_valid = lpr_fds[fd].offset_valid;
-        lpr_fds[dup_fd].pread_active = lpr_fds[fd].pread_active;
-        lpr_fds[dup_fd].flags =
-            (lpr_fds[fd].flags & ~LPR_LINUX_O_CLOEXEC) |
-            (cloexec ? LPR_LINUX_O_CLOEXEC : 0);
-        lpr_fds[dup_fd].handle = dup_handle;
-        lpr_fds[dup_fd].offset = lpr_filed_control_offset(fd);
-        lpr_control_sync_legacy_flags((uint64_t)(uint32_t)dup_fd);
         return dup_fd;
     }
     {
@@ -341,12 +325,10 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
                 (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, native_dup_fd);
                 return track_status;
             }
-            const int control_status = lpr_control_dup_fd(fd, native_dup_fd, cloexec);
-            if (control_status != 0) {
-                lpr_pipe_close_fd(native_dup_fd);
-                return control_status;
-            }
-            lpr_control_sync_legacy_flags(native_dup_fd);
+            (void)lpr_control_set_fd_flags(
+                native_dup_fd,
+                cloexec ? LPR_LINUX_FD_CLOEXEC : 0);
+            (void)lpr_control_set_status_flags(native_dup_fd, lpr_pipe_flags_from_info(&dup_info));
             return (int64_t)native_dup_fd;
         }
     }
@@ -420,4 +402,3 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
     lpr_trace_process_event("dup2_end", old_fd, new_fd, dup_status);
     return dup_status;
 }
-

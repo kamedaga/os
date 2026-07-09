@@ -120,40 +120,6 @@
 #define LPR_LINUX_DT_LNK 10u
 #define LPR_LINUX_DT_SOCK 12u
 
-typedef struct lpr_filed_fd {
-    uint8_t active;
-    uint8_t offset_valid;
-    uint8_t pread_active;
-    uint8_t reserved1;
-    uint32_t flags;
-    uint64_t handle;
-    uint64_t offset;
-} lpr_filed_fd_t;
-
-typedef struct lpr_pipe_fd {
-    uint8_t active;
-    uint8_t pipe_id;
-    uint8_t readable;
-    uint8_t writable;
-    uint32_t flags;
-} lpr_pipe_fd_t;
-
-typedef struct lpr_event_fd {
-    uint8_t active;
-    uint8_t reserved0;
-    uint16_t reserved1;
-    uint32_t flags;
-    uint64_t counter;
-} lpr_event_fd_t;
-
-typedef struct lpr_tty_fd {
-    uint8_t active;
-    uint8_t reserved0;
-    uint16_t reserved1;
-    uint32_t flags;
-    uint64_t handle;
-} lpr_tty_fd_t;
-
 typedef struct lpr_exec_local_fd_table {
     int fd;
     uint64_t map_bytes;
@@ -241,19 +207,17 @@ enum {
     LPR_READLINK_CACHE_ENTRIES = 8,
 };
 
-extern lpr_filed_fd_t lpr_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
-extern lpr_pipe_fd_t lpr_pipe_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
-extern lpr_event_fd_t lpr_event_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
-extern lpr_tty_fd_t lpr_tty_fds_initial[LPR_FD_TABLE_INITIAL_SIZE];
+typedef struct lpr_state {
+    lpr_fd_table_t fd_table;
+    uint64_t generation;
+} lpr_state_t;
+
 extern lpr_fd_table_slot_t lpr_control_slots_initial[LPR_FD_TABLE_INITIAL_SIZE];
 extern lpr_fd_table_file_t lpr_control_files_initial[LPR_FD_TABLE_INITIAL_SIZE];
-extern lpr_filed_fd_t *lpr_fds;
-extern lpr_pipe_fd_t *lpr_pipe_fds;
-extern lpr_event_fd_t *lpr_event_fds;
-extern lpr_tty_fd_t *lpr_tty_fds;
 extern lpr_fd_table_slot_t *lpr_control_slots;
 extern lpr_fd_table_file_t *lpr_control_files;
-extern lpr_fd_table_t lpr_control_fd_table;
+extern lpr_state_t lpr_state;
+#define lpr_control_fd_table (lpr_state.fd_table)
 extern uint64_t lpr_fd_table_capacity;
 extern void *lpr_fd_table_dynamic_base;
 extern uint64_t lpr_fd_table_dynamic_bytes;
@@ -328,6 +292,7 @@ void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user_frame 
 void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t status);
 void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset);
 void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status);
+void lpr_state_dump(const char *reason);
 
 int lpr_pipe_fd_is_active(uint64_t fd);
 int lpr_native_pipe_fd_info(uint64_t fd, struct pacha_fd_info *out);
@@ -429,14 +394,21 @@ int lpr_fd_table_dup2( lpr_fd_table_t *table, uint32_t old_fd, uint32_t new_fd, 
 int lpr_fd_table_ensure_capacity(uint64_t required_capacity);
 int lpr_fd_table_ensure_fd(uint64_t fd);
 int lpr_fd_table_get_fd_flags(const lpr_fd_table_t *table, uint32_t fd, uint16_t *out_flags);
+int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_refcount);
 int lpr_fd_table_get_offset(const lpr_fd_table_t *table, uint32_t fd, uint64_t *out_offset);
 int lpr_fd_table_get_status_flags(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_flags);
 int lpr_fd_table_install_at( lpr_fd_table_t *table, uint32_t fd, const lpr_fd_table_install_t *install);
-int lpr_fd_table_layout( uint64_t capacity, uint64_t *filed_offset, uint64_t *pipe_offset, uint64_t *event_offset, uint64_t *tty_offset, uint64_t *control_slot_offset, uint64_t *control_file_offset, uint64_t *total_bytes);
+int lpr_fd_table_layout( uint64_t capacity, uint64_t *control_slot_offset, uint64_t *control_file_offset, uint64_t *total_bytes);
 int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, uint64_t *out);
 int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, uint32_t fd, uint16_t flags);
 int lpr_fd_table_set_offset(lpr_fd_table_t *table, uint32_t fd, uint64_t offset);
 int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t flags);
+const lpr_fd_object_t *lpr_fd_object_for_fd_const(uint64_t fd);
+lpr_event_fd_t *lpr_fd_event_payload(uint64_t fd);
+lpr_fd_object_t *lpr_fd_object_for_fd(uint64_t fd);
+lpr_filed_fd_t *lpr_fd_filed_payload(uint64_t fd);
+lpr_pipe_fd_t *lpr_fd_pipe_payload(uint64_t fd);
+lpr_tty_fd_t *lpr_fd_tty_payload(uint64_t fd);
 int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
 int lpr_install_exec_bootstrap_fd(int bootstrap_fd);
 int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t count);

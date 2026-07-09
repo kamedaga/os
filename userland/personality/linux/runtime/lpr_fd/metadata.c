@@ -21,7 +21,7 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, u
     filed_v2_file_vmo_request_t *file_vmo =
         (filed_v2_file_vmo_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
     lpr_memset(page, 0, FILED_V2_PAGE_BYTES);
-    file_vmo->handle = lpr_fds[fd].handle;
+    file_vmo->handle = lpr_fd_filed_payload(fd)->handle;
     file_vmo->file_offset = file_offset;
     file_vmo->length = length;
 
@@ -118,14 +118,14 @@ int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
             return -LPR_LINUX_EFAULT;
         }
         const uint64_t value = *(const uint64_t *)(uintptr_t)buf;
-        if (value == UINT64_MAX || lpr_event_fds[fd].counter > UINT64_MAX - value) {
+        if (value == UINT64_MAX || lpr_fd_event_payload(fd)->counter > UINT64_MAX - value) {
             return -LPR_LINUX_EAGAIN;
         }
-        lpr_event_fds[fd].counter += value;
+        lpr_fd_event_payload(fd)->counter += value;
         return (int64_t)sizeof(uint64_t);
     }
     if (lpr_pipe_fd_is_active(fd)) {
-        if (!lpr_pipe_fds[fd].writable) {
+        if (!lpr_fd_pipe_payload(fd)->writable) {
             return -LPR_LINUX_EBADF;
         }
         if (count == 0) {
@@ -145,7 +145,7 @@ int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
                 return err;
             }
             if (err != -LPR_LINUX_EAGAIN ||
-                (lpr_pipe_fds[fd].flags & LPR_LINUX_O_NONBLOCK) != 0)
+                (lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
             {
                 return err;
             }
@@ -158,7 +158,7 @@ int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
     }
     if (lpr_fd_is_filed(fd)) {
         if (count != 0) {
-            lpr_page_cache_invalidate_handle(lpr_fds[fd].handle);
+            lpr_page_cache_invalidate_handle(lpr_fd_filed_payload(fd)->handle);
         }
         return lpr_filed_io(FILED_V2_OP_VFS_WRITE, fd, buf, count, 0);
     }
@@ -181,7 +181,7 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
     }
     if (!lpr_fd_is_filed(fd)) {
         if (lpr_pipe_fd_is_active(fd)) {
-            if (!lpr_pipe_fds[fd].writable) {
+            if (!lpr_fd_pipe_payload(fd)->writable) {
                 return -LPR_LINUX_EBADF;
             }
             for (;;) {
@@ -195,7 +195,7 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                     return err;
                 }
                 if (err != -LPR_LINUX_EAGAIN ||
-                    (lpr_pipe_fds[fd].flags & LPR_LINUX_O_NONBLOCK) != 0)
+                    (lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
                 {
                     return err;
                 }
@@ -230,7 +230,7 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         return -LPR_LINUX_EBADF;
     }
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
-    lpr_page_cache_invalidate_handle(lpr_fds[fd].handle);
+    lpr_page_cache_invalidate_handle(lpr_fd_filed_payload(fd)->handle);
     int64_t total = 0;
     for (uint64_t i = 0; i < iov_count; i += 1) {
         if (iov[i].len == 0) {
@@ -251,13 +251,13 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 int64_t lpr_linux_close(uint64_t fd)
 {
     if (lpr_linux_tty_fd_active(fd)) {
-        const uint64_t handle = lpr_tty_fds[fd].handle;
-        lpr_memset(&lpr_tty_fds[fd], 0, sizeof(lpr_tty_fds[fd]));
+        uint32_t refcount = 0;
+        (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+        const uint64_t handle = lpr_fd_tty_payload(fd)->handle;
         lpr_control_close_fd(fd);
-        return lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, handle, 0);
+        return refcount <= 1 ? lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, handle, 0) : 0;
     }
     if (lpr_linux_eventfd_active(fd)) {
-        lpr_memset(&lpr_event_fds[fd], 0, sizeof(lpr_event_fds[fd]));
         lpr_control_close_fd(fd);
         return 0;
     }
@@ -272,10 +272,11 @@ int64_t lpr_linux_close(uint64_t fd)
         }
     }
     if (lpr_fd_is_filed(fd)) {
-        const uint64_t handle = lpr_fds[fd].handle;
-        lpr_memset(&lpr_fds[fd], 0, sizeof(lpr_fds[fd]));
+        uint32_t refcount = 0;
+        (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+        const uint64_t handle = lpr_fd_filed_payload(fd)->handle;
         lpr_control_close_fd(fd);
-        return lpr_filed_close_handle(handle);
+        return refcount <= 1 ? lpr_filed_close_handle(handle) : 0;
     }
     if (fd >= 3 && fd < LPR_FD_TABLE_MAX_SIZE) {
         return -LPR_LINUX_EBADF;
@@ -370,7 +371,7 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
         return -LPR_LINUX_ESPIPE;
     }
     if (lpr_fd_shadow_offset_eligible(fd) &&
-        lpr_fds[fd].offset_valid &&
+        lpr_fd_filed_payload(fd)->offset_valid &&
         whence <= 1)
     {
         const int64_t signed_offset = (int64_t)offset;
@@ -397,7 +398,7 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
             }
         }
         lpr_filed_control_set_offset(fd, new_offset);
-        lpr_fds[fd].pread_active = 1;
+        lpr_fd_filed_payload(fd)->pread_active = 1;
         return (int64_t)new_offset;
     }
     void *page = 0;
@@ -407,7 +408,7 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     }
     filed_v2_seek_t *seek = (filed_v2_seek_t *)page;
     lpr_memset(seek, 0, sizeof(*seek));
-    seek->handle = lpr_fds[fd].handle;
+    seek->handle = lpr_fd_filed_payload(fd)->handle;
     seek->offset = (int64_t)offset;
     seek->whence = whence;
     uint64_t result = 0;
@@ -415,8 +416,8 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     lpr_destroy_wire_page(page_fd, page);
     if (status == 0 && lpr_fd_shadow_offset_eligible(fd)) {
         lpr_filed_control_set_offset(fd, result);
-        lpr_fds[fd].offset_valid = 1;
-        lpr_fds[fd].pread_active = 1;
+        lpr_fd_filed_payload(fd)->offset_valid = 1;
+        lpr_fd_filed_payload(fd)->pread_active = 1;
     }
     return status == 0 ? (int64_t)result : status;
 }
@@ -430,7 +431,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         case LPR_LINUX_F_SETFD:
             return lpr_control_set_fd_flags(fd, arg);
         case LPR_LINUX_F_GETFL:
-            return lpr_control_get_status_flags(fd, lpr_tty_fds[fd].flags & LPR_LINUX_O_ACCMODE);
+            return lpr_control_get_status_flags(fd, lpr_fd_tty_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
         case LPR_LINUX_F_SETFL:
             return lpr_control_set_status_flags(fd, arg);
         case LPR_LINUX_F_DUPFD:
@@ -447,7 +448,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         case LPR_LINUX_F_SETFD:
             return lpr_control_set_fd_flags(fd, arg);
         case LPR_LINUX_F_GETFL:
-            return lpr_control_get_status_flags(fd, lpr_event_fds[fd].flags & LPR_LINUX_O_ACCMODE);
+            return lpr_control_get_status_flags(fd, lpr_fd_event_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
         case LPR_LINUX_F_SETFL:
             return lpr_control_set_status_flags(fd, arg);
         case LPR_LINUX_F_DUPFD:
@@ -474,7 +475,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             return lpr_control_set_fd_flags(fd, arg);
         }
         case LPR_LINUX_F_GETFL:
-            return lpr_control_get_status_flags(fd, lpr_pipe_fds[fd].flags & LPR_LINUX_O_ACCMODE);
+            return lpr_control_get_status_flags(fd, lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
         case LPR_LINUX_F_SETFL: {
             const uint64_t pacha_flags = (arg & LPR_LINUX_O_NONBLOCK) != 0 ? PACHA_FD_FLAG_NONBLOCK : 0;
             const int64_t status = lpr_pacha_syscall3(
@@ -549,7 +550,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case LPR_LINUX_F_SETFD:
         return lpr_control_set_fd_flags(fd, arg);
     case LPR_LINUX_F_GETFL:
-        return lpr_control_get_status_flags(fd, lpr_fds[fd].flags & LPR_LINUX_O_ACCMODE);
+        return lpr_control_get_status_flags(fd, lpr_fd_filed_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
     case LPR_LINUX_F_SETFL:
         return lpr_control_set_status_flags(fd, arg);
     case LPR_LINUX_F_GETLK:
@@ -696,7 +697,7 @@ int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf)
     lpr_trace_process_event("fstat_filed_begin", fd, (uint64_t)(uint32_t)page_fd, 0);
     filed_v2_statx_t *stat = (filed_v2_statx_t *)page;
     lpr_memset(stat, 0, sizeof(*stat));
-    stat->handle = lpr_fds[fd].handle;
+    stat->handle = lpr_fd_filed_payload(fd)->handle;
     uint64_t ignored = 0;
     const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_STAT, page_fd, 0, &ignored);
     lpr_trace_process_event("fstat_filed_end", fd, (uint64_t)(uint32_t)page_fd, status);
@@ -770,7 +771,7 @@ int64_t lpr_linux_fchmod(uint64_t fd, uint64_t mode)
     }
     filed_v2_chmod_t *chmod_req = (filed_v2_chmod_t *)page;
     lpr_memset(chmod_req, 0, sizeof(*chmod_req));
-    chmod_req->handle = lpr_fds[fd].handle;
+    chmod_req->handle = lpr_fd_filed_payload(fd)->handle;
     chmod_req->mode = mode & 07777ull;
     uint64_t ignored = 0;
     const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_CHMOD, page_fd, 0, &ignored);
@@ -908,7 +909,7 @@ int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, u
         if (!lpr_fd_is_filed(dirfd)) {
             return -LPR_LINUX_EBADF;
         }
-        return lpr_filed_utimens_handle(lpr_fds[dirfd].handle, times);
+        return lpr_filed_utimens_handle(lpr_fd_filed_payload(dirfd)->handle, times);
     }
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
@@ -917,7 +918,7 @@ int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, u
     if (fd < 0) {
         return fd;
     }
-    const int64_t status = lpr_filed_utimens_handle(lpr_fds[(uint64_t)fd].handle, times);
+    const int64_t status = lpr_filed_utimens_handle(lpr_fd_filed_payload((uint64_t)fd)->handle, times);
     (void)lpr_linux_close((uint64_t)fd);
     return status;
 }
@@ -986,7 +987,7 @@ int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     }
     filed_v2_getdents_t *gd = (filed_v2_getdents_t *)page;
     lpr_memset(gd, 0, sizeof(*gd));
-    gd->dir_handle = lpr_fds[fd].handle;
+    gd->dir_handle = lpr_fd_filed_payload(fd)->handle;
     gd->capacity = FILED_V2_DIRENT_CAPACITY;
     uint64_t ignored = 0;
     int64_t status = lpr_filed_call(FILED_V2_OP_VFS_GETDENTS, page_fd, 0, &ignored);

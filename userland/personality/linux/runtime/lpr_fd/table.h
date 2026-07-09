@@ -16,14 +16,66 @@ enum {
     LPR_FD_TABLE_STATUS_APPEND = 1u << 1,
 };
 
-typedef struct lpr_fd_table_slot {
+typedef struct lpr_filed_fd {
+    uint8_t active;
+    uint8_t offset_valid;
+    uint8_t pread_active;
+    uint8_t reserved1;
+    uint32_t flags;
+    uint64_t handle;
+    uint64_t offset;
+} lpr_filed_fd_t;
+
+typedef struct lpr_pipe_fd {
+    uint8_t active;
+    uint8_t pipe_id;
+    uint8_t readable;
+    uint8_t writable;
+    uint32_t flags;
+    uint64_t last_wait_events;
+    uint64_t last_wait_result;
+} lpr_pipe_fd_t;
+
+typedef struct lpr_event_fd {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t flags;
+    uint64_t counter;
+} lpr_event_fd_t;
+
+typedef struct lpr_tty_fd {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t flags;
+    uint64_t handle;
+} lpr_tty_fd_t;
+
+typedef enum lpr_fd_kind {
+    LPR_FD_NONE = LPR_FD_TABLE_KIND_EMPTY,
+    LPR_FD_FILED = LPR_FD_TABLE_KIND_FILED,
+    LPR_FD_TTY = LPR_FD_TABLE_KIND_TTY,
+    LPR_FD_PIPE = LPR_FD_TABLE_KIND_PIPE,
+    LPR_FD_EVENTFD = LPR_FD_TABLE_KIND_EVENT,
+    LPR_FD_SOCKET = LPR_FD_TABLE_KIND_SOCKET,
+} lpr_fd_kind_t;
+
+typedef union lpr_fd_payload {
+    lpr_filed_fd_t filed;
+    lpr_pipe_fd_t pipe;
+    lpr_event_fd_t eventfd;
+    lpr_tty_fd_t tty;
+} lpr_fd_payload_t;
+
+typedef struct lpr_fd_table_entry {
     uint8_t active;
     uint8_t reserved0;
     uint16_t fd_flags;
     uint32_t file_index;
-} lpr_fd_table_slot_t;
+} lpr_fd_entry_t;
 
-typedef struct lpr_fd_table_file {
+typedef struct lpr_fd_table_object {
     uint8_t active;
     uint8_t kind;
     uint16_t reserved0;
@@ -32,13 +84,19 @@ typedef struct lpr_fd_table_file {
     uint32_t rights;
     uint64_t backend_id;
     uint64_t offset;
-} lpr_fd_table_file_t;
+    uint64_t generation;
+    lpr_fd_payload_t payload;
+} lpr_fd_object_t;
+
+typedef lpr_fd_entry_t lpr_fd_table_slot_t;
+typedef lpr_fd_object_t lpr_fd_table_file_t;
 
 typedef struct lpr_fd_table {
-    lpr_fd_table_slot_t *slots;
+    lpr_fd_entry_t *slots;
     uint32_t slot_count;
-    lpr_fd_table_file_t *files;
+    lpr_fd_object_t *files;
     uint32_t file_count;
+    uint64_t generation;
 } lpr_fd_table_t;
 
 typedef struct lpr_fd_table_install {
@@ -96,6 +154,9 @@ int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t f
 int lpr_fd_table_get_offset(const lpr_fd_table_t *table, uint32_t fd, uint64_t *out_offset);
 int lpr_fd_table_set_offset(lpr_fd_table_t *table, uint32_t fd, uint64_t offset);
 
+lpr_fd_object_t *lpr_fd_table_object_for_fd(lpr_fd_table_t *table, uint32_t fd);
+const lpr_fd_object_t *lpr_fd_table_object_for_fd_const(const lpr_fd_table_t *table, uint32_t fd);
+int lpr_fd_table_get_kind(const lpr_fd_table_t *table, uint32_t fd, uint8_t *out_kind);
+int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_refcount);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_live_file_count(const lpr_fd_table_t *table);
-

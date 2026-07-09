@@ -104,7 +104,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         }
         termd_v2_io_request_t *io = (termd_v2_io_request_t *)lpr_termd_payload(page);
         lpr_memset(io, 0, sizeof(*io));
-        io->handle = lpr_tty_fds[fd].handle;
+        io->handle = lpr_fd_tty_payload(fd)->handle;
         io->length = count > TERMD_V2_IO_BYTES ? TERMD_V2_IO_BYTES : count;
         lpr_fill_termd_caller(&io->tty.session_id, &io->tty.process_id, &io->tty.pgrp_id);
         lpr_fill_termd_signal_state(&io->tty.signal_mask, &io->tty.signal_ignored);
@@ -125,7 +125,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
             return status;
         }
         if (status != -LPR_LINUX_EAGAIN ||
-            (lpr_tty_fds[fd].flags & LPR_LINUX_O_NONBLOCK) != 0)
+            (lpr_fd_tty_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
         {
             return status;
         }
@@ -148,7 +148,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     }
     termd_v2_ioctl_request_t *ioctl_req = (termd_v2_ioctl_request_t *)lpr_termd_payload(page);
     lpr_memset(ioctl_req, 0, sizeof(*ioctl_req));
-    ioctl_req->handle = lpr_tty_fds[fd].handle;
+    ioctl_req->handle = lpr_fd_tty_payload(fd)->handle;
     ioctl_req->request = request;
     lpr_fill_termd_caller(
         &ioctl_req->tty.session_id,
@@ -264,7 +264,7 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
     }
     termd_v2_poll_request_t *poll_req = (termd_v2_poll_request_t *)lpr_termd_payload(page);
     lpr_memset(poll_req, 0, sizeof(*poll_req));
-    poll_req->handle = lpr_tty_fds[fd].handle;
+    poll_req->handle = lpr_fd_tty_payload(fd)->handle;
     poll_req->events = events;
     lpr_fill_termd_caller(
         &poll_req->tty.session_id,
@@ -399,10 +399,10 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
         return 0;
     }
     uint32_t revents = 0;
-    if ((events & 0x0001u) != 0 && lpr_event_fds[fd].counter != 0) {
+    if ((events & 0x0001u) != 0 && lpr_fd_event_payload(fd)->counter != 0) {
         revents |= 0x0001u;
     }
-    if ((events & 0x0004u) != 0 && lpr_event_fds[fd].counter != UINT64_MAX) {
+    if ((events & 0x0004u) != 0 && lpr_fd_event_payload(fd)->counter != UINT64_MAX) {
         revents |= 0x0004u;
     }
     return revents;
