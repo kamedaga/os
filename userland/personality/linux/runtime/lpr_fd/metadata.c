@@ -40,7 +40,7 @@ int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, u
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
 
-    const uint64_t request_id = ++lpr_request_id;
+    const uint64_t request_id = lpr_next_request_id(&lpr_request_id);
     pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;

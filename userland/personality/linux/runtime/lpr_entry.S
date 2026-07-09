@@ -3,7 +3,8 @@
 .hidden lpr_syscall_entry
 .type lpr_syscall_entry, @function
 lpr_syscall_entry:
-    lea lpr_entry_user_frame(%rip), %r11
+    sub $296, %rsp
+    lea 24(%rsp), %r11
     mov %r15, 0(%r11)
     mov %r14, 8(%r11)
     mov %r13, 16(%r11)
@@ -20,10 +21,10 @@ lpr_syscall_entry:
     mov %rax, 112(%r11)
     mov %rcx, 104(%r11)
     mov %rcx, 120(%r11)
-    mov %rsp, 128(%r11)
+    lea 296(%rsp), %r10
+    mov %r10, 128(%r11)
     movq $0x202, 136(%r11)
 
-    sub $24, %rsp
     mov 72(%r11), %r10
     mov %r10, 0(%rsp)
     mov 64(%r11), %r10
@@ -36,8 +37,7 @@ lpr_syscall_entry:
     mov 56(%r11), %r9
     call lpr_dispatch_syscall_frame
 
-    add $24, %rsp
-    lea lpr_entry_user_frame(%rip), %r11
+    lea 24(%rsp), %r11
     mov 120(%r11), %rcx
     mov 0(%r11), %r15
     mov 8(%r11), %r14
@@ -55,6 +55,15 @@ lpr_syscall_entry:
     jmp *%rcx
 .size lpr_syscall_entry, .-lpr_syscall_entry
 
+.globl lpr_clone_thread_entry
+.hidden lpr_clone_thread_entry
+.type lpr_clone_thread_entry, @function
+lpr_clone_thread_entry:
+    mov %rsp, %rdi
+    call lpr_clone_thread_bootstrap
+    ud2
+.size lpr_clone_thread_entry, .-lpr_clone_thread_entry
+
 .globl lpr_trap_entry
 .hidden lpr_trap_entry
 .type lpr_trap_entry, @function
@@ -64,9 +73,3 @@ lpr_trap_entry:
 .size lpr_trap_entry, .-lpr_trap_entry
 
 .section .note.GNU-stack,"",@progbits
-
-.bss
-.p2align 3
-.hidden lpr_entry_user_frame
-lpr_entry_user_frame:
-    .zero 144

@@ -151,6 +151,13 @@ fn futexWake(proc: kernel.PrincipalId, user_va: u64, max_count: u64) u64 {
     return woke;
 }
 
+pub fn clearTidAndWake(h: anytype, proc: kernel.PrincipalId, user_va: u64) void {
+    if (user_va == 0 or (user_va & 0x3) != 0) return;
+    const zero = [_]u8{ 0, 0, 0, 0 };
+    if (!h.copy_bytes_to_user_va(proc, user_va, zero[0..])) return;
+    _ = futexWake(proc, user_va, 1);
+}
+
 fn getRandom(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     const out_va = frame.rdi;
     const len = frame.rsi;

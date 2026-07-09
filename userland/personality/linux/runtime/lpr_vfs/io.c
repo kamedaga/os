@@ -374,6 +374,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             int vmo_fd = -1;
             unsigned char *mapped = 0;
             uint64_t map_len = 0;
+            lpr_state_lock(&lpr_state.filed_rpc.readv_lock_word);
             if (lpr_readv_scratch_vmo(requested, &vmo_fd, &mapped, &map_len) == 0) {
                 lpr_readv_cache_to_vmo++;
                 lpr_trace_readv_size(fd, iov_count, requested, 2, lpr_filed_control_offset(fd));
@@ -392,10 +393,12 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                         lpr_filed_control_advance_offset(fd, offset, got);
                         lpr_fd_filed_payload(fd)->pread_active = 1;
                     }
+                    lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
                     return (int64_t)got;
                 }
                 lpr_trace_readv_to_vmo_status(fd, requested, n);
             }
+            lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
         }
     }
     lpr_trace_readv_size(
@@ -485,7 +488,7 @@ int64_t lpr_linux_pread_to_vmo(
 
     lpr_memmove((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, page, sizeof(*pread_vmo));
     lpr_memset(page, 0, PACHA_SERVICE_HEADER_BYTES);
-    const uint64_t request_id = ++lpr_request_id;
+    const uint64_t request_id = lpr_next_request_id(&lpr_request_id);
     pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;

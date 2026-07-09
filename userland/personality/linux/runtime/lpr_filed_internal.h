@@ -253,6 +253,25 @@ typedef struct lpr_fd_storage_state {
     uint64_t dynamic_bytes;
 } lpr_fd_storage_state_t;
 
+typedef struct lpr_thread_record {
+    struct lpr_thread_record *next;
+    uint64_t start_function;
+    uint64_t start_argument;
+    uint64_t clone_flags;
+    volatile uint32_t *parent_tid;
+    volatile uint32_t *child_tid;
+    volatile uint32_t started;
+    uint32_t tid;
+    volatile uint32_t parent_ready;
+    uint32_t reserved0;
+} lpr_thread_record_t;
+
+typedef struct lpr_thread_state {
+    volatile uint32_t lock_word;
+    lpr_thread_record_t *head;
+    lpr_thread_record_t main_thread;
+} lpr_thread_state_t;
+
 typedef struct lpr_process_state {
     int default_stdio_checked;
     int bootstrap_checked;
@@ -294,6 +313,8 @@ typedef struct lpr_rlimit_state {
 } lpr_rlimit_state_t;
 
 typedef struct lpr_filed_rpc_state {
+    volatile uint32_t lock_word;
+    volatile uint32_t readv_lock_word;
     uint64_t request_id;
     int endpoint_checked;
     int wire_page_fd;
@@ -313,6 +334,7 @@ typedef struct lpr_filed_rpc_state {
 } lpr_filed_rpc_state_t;
 
 typedef struct lpr_termd_rpc_state {
+    volatile uint32_t lock_word;
     uint64_t request_id;
     int wire_page_fd;
     void *wire_page;
@@ -320,6 +342,7 @@ typedef struct lpr_termd_rpc_state {
 } lpr_termd_rpc_state_t;
 
 typedef struct lpr_netd_rpc_state {
+    volatile uint32_t lock_word;
     uint64_t request_id;
     int page_fd;
     void *page;
@@ -368,6 +391,7 @@ typedef struct lpr_state {
     lpr_fd_table_t fd_table;
     lpr_fd_storage_state_t fd_storage;
     volatile uint32_t thread_count;
+    lpr_thread_state_t threads;
     lpr_process_state_t process;
     lpr_signal_state_t signal;
     lpr_cwd_state_t cwd;
@@ -645,6 +669,7 @@ int64_t lpr_linux_access(uint64_t path, uint64_t mode);
 int64_t lpr_linux_chdir(uint64_t path_raw);
 int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t req_raw, uint64_t rem_raw);
 int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
+int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls);
 int64_t lpr_linux_close(uint64_t fd);
 int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags);
 int64_t lpr_linux_dispatch_pending_signals(void);
@@ -669,6 +694,7 @@ int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_linux_getpgid(uint64_t pid_raw);
 int64_t lpr_linux_getpgrp(void);
 int64_t lpr_linux_getpid(void);
+int64_t lpr_linux_gettid(void);
 int64_t lpr_linux_getppid(void);
 int64_t lpr_linux_getsid(uint64_t pid_raw);
 int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
@@ -695,6 +721,7 @@ int64_t lpr_linux_resolve_utime( const lpr_linux_timespec_t *input, const lpr_li
 int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t oldact_raw, uint64_t sigsetsize);
 int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset_raw, uint64_t sigsetsize);
 int64_t lpr_linux_setpgid(uint64_t pid_raw, uint64_t pgid_raw);
+int64_t lpr_linux_set_tid_address(uint64_t tid_address);
 int64_t lpr_linux_setsid(void);
 int64_t lpr_linux_sleep_result(int64_t status);
 int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t linkpath_raw);
@@ -782,6 +809,13 @@ void lpr_destroy_tty_wire_page(int fd, void *page);
 void lpr_destroy_wire_page(int fd, void *page);
 void lpr_discard_exec_cwd(filed_v2_exec_path_t *exec);
 void lpr_fd_arrays_init(void);
+void lpr_state_lock(volatile uint32_t *word);
+void lpr_state_unlock(volatile uint32_t *word);
+uint64_t lpr_next_request_id(volatile uint64_t *counter);
+void lpr_linux_exit_thread(uint64_t code) __attribute__((noreturn));
+void lpr_linux_exit_group(uint64_t code) __attribute__((noreturn));
+void lpr_clone_thread_entry(void) __attribute__((noreturn));
+void lpr_clone_thread_bootstrap(lpr_thread_record_t *record) __attribute__((noreturn));
 void lpr_fd_table_init( lpr_fd_table_t *table, lpr_fd_table_slot_t *slots, uint32_t slot_count, lpr_fd_table_file_t *files, uint32_t file_count);
 void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t amount);
 void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset);

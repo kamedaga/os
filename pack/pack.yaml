@@ -704,6 +704,30 @@ apps:
       rebuild: ["bash", "tools/build_wsl_musl_smoke.sh"]
     out: "MUSLSMOK.ELF"
     rootfs: "/cmd/musl_smoke.elf"
+  lpr_pthread_static:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_pthread_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_pthread_smoke"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_pthread_smoke.c"
+    out: "LPRPTHST.ELF"
+    rootfs: "/cmd/lpr_pthread_static.elf"
+  lpr_pthread_dynamic:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_pthread_smoke.dynamic.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_pthread_smoke"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_pthread_smoke.c"
+    out: "LPRPTHDY.ELF"
+    rootfs: "/cmd/lpr_pthread_dynamic.elf"
+  lpr_pthread_smoke_script:
+    file: "tests/fixtures/lpr_pthread_smoke.sh"
+    out: "LPRPTHRD.SH"
+    rootfs: "/cmd/lpr_pthread_smoke.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"

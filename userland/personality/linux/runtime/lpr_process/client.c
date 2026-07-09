@@ -36,7 +36,7 @@ int64_t lpr_process_client_call(
 
     struct pacha_ipc_fd fds[2];
     uint64_t fd_count = 0;
-    const uint64_t request_id = ++*request_counter;
+    const uint64_t request_id = __atomic_add_fetch(request_counter, 1u, __ATOMIC_RELAXED);
     pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;

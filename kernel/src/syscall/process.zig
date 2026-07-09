@@ -7,6 +7,7 @@ const user_vm = @import("../memory/user_vm.zig");
 const boot_static = @import("../boot/main_static.zig");
 const kernel_log = @import("../kernel_log.zig");
 const sc = @import("numbers.zig");
+const runtime = @import("runtime.zig");
 
 const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
@@ -16,6 +17,19 @@ const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_process_map_batch_entries: usize = @intCast(process_abi.process_map_batch_max_entries);
 const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_batch_entry_size);
 const max_pipe_close_wakes = kernel.fd_table_entries;
+
+fn ThreadExitClearContext(comptime Handler: type) type {
+    return struct {
+        handler: Handler,
+        proc: kernel.PrincipalId,
+        user_va: u64,
+
+        fn run(raw_context: *anyopaque) void {
+            const context: *@This() = @ptrCast(@alignCast(raw_context));
+            runtime.clearTidAndWake(context.handler, context.proc, context.user_va);
+        }
+    };
+}
 
 const PendingPipeCloseWake = struct {
     pipe: kernel.PipeRef,
@@ -282,9 +296,13 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
     if ((frame.r10 & ~process_abi.thread_known_flags_mask) != 0) return sc.syscall_err_invalid;
     if (!isUserEntryVa(frame.rsi) or !isUserEntryVa(frame.rdx)) return sc.syscall_err_invalid;
     if (frame.r8 != 0 and !user_vm.isUserCanonicalVa(frame.r8)) return sc.syscall_err_invalid;
-    const process = state.processObjectForFd(proc, @intCast(frame.rdi), .{ .spawn = true, .set_context = true }) orelse return sc.syscall_err_invalid;
-    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
-    const owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    const owner = if (frame.rdi == process_abi.process_self_fd)
+        proc
+    else blk: {
+        const process = state.processObjectForFd(proc, @intCast(frame.rdi), .{ .spawn = true, .set_context = true }) orelse return sc.syscall_err_invalid;
+        if (!processRunnable(process.state)) return sc.syscall_err_invalid;
+        break :blk @as(kernel.PrincipalId, @enumFromInt(process.principal_raw));
+    };
     if (!state.hasActivePrincipal(owner)) return sc.syscall_err_invalid;
     const thread_index = scheduler.allocateSuspendedThread(owner, h.user_spaces, buildUserTrapFrame(frame.rsi, frame.rdx), h.free_list) orelse return sc.syscall_err_alloc;
     if (!scheduler.setFsBase(thread_index, frame.r8)) {
@@ -297,7 +315,7 @@ fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
     };
     const rights = kernel.fdRightsFromBits(frame.r9);
     return state.createThreadFd(proc, .{
-        .owner_principal_raw = process.principal_raw,
+        .owner_principal_raw = @intFromEnum(owner),
         .thread_index = @intCast(thread_index),
         .thread_generation = generation,
         .state = .active,
@@ -727,8 +745,12 @@ fn execFromStagedProcess(
 }
 
 fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, code: u32) u64 {
+    const exit_flags = frame.rdx;
+    if ((exit_flags & ~process_abi.thread_exit_known_flags_mask) != 0) return sc.syscall_err_invalid;
+    const clear_tid = (exit_flags & process_abi.thread_exit_flag_clear_tid) != 0;
     const current = scheduler.currentThread();
     const generation = scheduler.generationOfThread(current) orelse {
+        if (clear_tid) runtime.clearTidAndWake(h, proc, frame.rsi);
         state.markThreadObjectsExitedForPrincipal(proc, .exited, code);
         state.markProcessObjectsExited(proc, .exited, code);
         const handoff_target = wakeTaskFdWaiters(h, state, proc);
@@ -737,12 +759,19 @@ fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.Princi
     };
     state.markThreadObjectsExitedBySlot(current, generation, .exited, code);
     if (scheduler.liveThreadCount(proc) <= 1) {
+        if (clear_tid) runtime.clearTidAndWake(h, proc, frame.rsi);
         state.markProcessObjectsExited(proc, .exited, code);
         const handoff_target = wakeTaskFdWaiters(h, state, proc);
         h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, handoff_target);
         return frame.rax;
     }
-    if (!scheduler.exitCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave)) {
+    const ClearContext = ThreadExitClearContext(@TypeOf(h));
+    var clear_context = ClearContext{ .handler = h, .proc = proc, .user_va = frame.rsi };
+    const clear_callback: ?scheduler.BeforeCurrentThreadLeaveCallback = if (clear_tid) .{
+        .context = @ptrCast(&clear_context),
+        .run = ClearContext.run,
+    } else null;
+    if (!scheduler.exitCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave, clear_callback)) {
         h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, null);
     }
     return frame.rax;

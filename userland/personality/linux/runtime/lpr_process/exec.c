@@ -581,7 +581,7 @@ int64_t lpr_filed_exec_self(
         request_fd_count = 2;
     }
 
-    const uint64_t request_id = ++lpr_request_id;
+    const uint64_t request_id = lpr_next_request_id(&lpr_request_id);
     pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;

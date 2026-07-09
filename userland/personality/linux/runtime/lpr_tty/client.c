@@ -27,7 +27,7 @@ int64_t lpr_termd_call(
     lpr_zero_bytes(&request, sizeof(request));
     lpr_zero_bytes(&reply, sizeof(reply));
 
-    const uint64_t request_id = ++lpr_termd_request_id;
+    const uint64_t request_id = lpr_next_request_id(&lpr_termd_request_id);
     pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;

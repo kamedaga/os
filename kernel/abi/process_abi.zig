@@ -53,6 +53,9 @@ pub const process_clone_user_frame_rflags_offset: u64 = 17 * 8;
 
 pub const thread_flag_none: u64 = 0;
 pub const thread_known_flags_mask: u64 = thread_flag_none;
+pub const process_self_fd: u32 = 0xffff_ffff;
+pub const thread_exit_flag_clear_tid: u64 = 1 << 0;
+pub const thread_exit_known_flags_mask: u64 = thread_exit_flag_clear_tid;
 
 pub const status_word_state_offset: u64 = 0;
 pub const status_word_exit_code_offset: u64 = 8;

@@ -256,6 +256,7 @@ static int lpr_netd_create_page(void **out_page)
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
     }
+    lpr_state_lock(&lpr_state.netd_rpc.lock_word);
     if (lpr_netd_page_fd >= 16 && lpr_netd_page != 0 && !lpr_netd_page_busy) {
         lpr_netd_page_busy = 1;
         *out_page = lpr_netd_page;
@@ -268,7 +269,9 @@ static int lpr_netd_create_page(void **out_page)
         PACHA_FD_RIGHT_MAP_WRITE;
     const int64_t fd = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE, NETD_V2_PAGE_BYTES, rights, 0);
     if (fd < 16) {
-        return (int)lpr_negative_status(fd);
+        const int error = (int)lpr_negative_status(fd);
+        lpr_state_unlock(&lpr_state.netd_rpc.lock_word);
+        return error;
     }
     const int64_t mapped = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_MMAP,
@@ -280,7 +283,9 @@ static int lpr_netd_create_page(void **out_page)
         0);
     if (mapped < 4096) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
-        return (int)lpr_negative_status(mapped);
+        const int error = (int)lpr_negative_status(mapped);
+        lpr_state_unlock(&lpr_state.netd_rpc.lock_word);
+        return error;
     }
     *out_page = (void *)(uintptr_t)mapped;
     if (lpr_netd_page_fd < 16 && lpr_netd_page == 0) {
@@ -295,6 +300,7 @@ static void lpr_netd_destroy_page(int fd, void *page)
 {
     if (fd == lpr_netd_page_fd && page == lpr_netd_page) {
         lpr_netd_page_busy = 0;
+        lpr_state_unlock(&lpr_state.netd_rpc.lock_word);
         return;
     }
     if (page != 0) {
@@ -303,6 +309,7 @@ static void lpr_netd_destroy_page(int fd, void *page)
     if (fd >= 16) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
     }
+    lpr_state_unlock(&lpr_state.netd_rpc.lock_word);
 }
 
 static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t *out_result)
@@ -321,7 +328,7 @@ static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t 
             PACHA_FD_RIGHT_MAP_WRITE;
     }
 
-    const uint64_t request_id = ++lpr_netd_request_id;
+    const uint64_t request_id = lpr_next_request_id(&lpr_netd_request_id);
     const struct pacha_ipc_msg request = {
         .word0 = NETD_V2_REQUEST_MAGIC,
         .word1 = op,

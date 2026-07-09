@@ -1,26 +1,312 @@
 #include "../lpr_filed_internal.h"
 
-int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
+enum {
+    LPR_CLONE_VM = 0x00000100ull,
+    LPR_CLONE_FS = 0x00000200ull,
+    LPR_CLONE_FILES = 0x00000400ull,
+    LPR_CLONE_SIGHAND = 0x00000800ull,
+    LPR_CLONE_VFORK = 0x00004000ull,
+    LPR_CLONE_THREAD = 0x00010000ull,
+    LPR_CLONE_SYSVSEM = 0x00040000ull,
+    LPR_CLONE_SETTLS = 0x00080000ull,
+    LPR_CLONE_PARENT_SETTID = 0x00100000ull,
+    LPR_CLONE_CHILD_CLEARTID = 0x00200000ull,
+    LPR_CLONE_DETACHED = 0x00400000ull,
+    LPR_CLONE_CHILD_SETTID = 0x01000000ull,
+};
+
+_Static_assert(sizeof(lpr_thread_record_t) == 64u, "thread launch record size");
+
+static void lpr_thread_record_add(lpr_thread_record_t *record)
 {
-    (void)parent_tid;
-    (void)child_tid;
-    (void)tls;
-    lpr_trace_clone_args(flags, child_stack, parent_tid, child_tid);
-    const uint64_t signal = flags & 0xffu;
-    const uint64_t clone_vm = 0x100ull;
-    const uint64_t clone_vfork = 0x4000ull;
-    const uint64_t clone_thread = 0x10000ull;
-    const uint64_t known_process_flags = clone_vm | clone_vfork | 0x00100000ull | 0x01000000ull | 0x00200000ull;
-    if (signal != 0 && signal != 17u) {
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    record->next = lpr_state.threads.head;
+    lpr_state.threads.head = record;
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+}
+
+static int lpr_thread_record_remove(lpr_thread_record_t *record)
+{
+    lpr_thread_record_t **cursor = &lpr_state.threads.head;
+    while (*cursor != 0 && *cursor != record) {
+        cursor = &(*cursor)->next;
+    }
+    if (*cursor == record) {
+        *cursor = record->next;
+        record->next = 0;
+    }
+    return lpr_state.threads.head == 0;
+}
+
+static lpr_thread_record_t *lpr_thread_record_find(uint32_t tid)
+{
+    for (lpr_thread_record_t *record = lpr_state.threads.head;
+         record != 0;
+         record = record->next)
+    {
+        if (record->tid == tid) {
+            return record;
+        }
+    }
+    return 0;
+}
+
+static int lpr_thread_ensure_current_record(void)
+{
+    const int64_t raw_tid = lpr_linux_gettid();
+    if (raw_tid < 0 || raw_tid > UINT32_MAX) {
         return -LPR_LINUX_EINVAL;
     }
-    if ((flags & clone_thread) != 0) {
-        return -LPR_LINUX_ENOSYS;
+    const uint32_t tid = (uint32_t)raw_tid;
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    if (lpr_thread_record_find(tid) == 0) {
+        lpr_thread_record_t *record = &lpr_state.threads.main_thread;
+        if (record->started != 0u && record->tid != tid) {
+            lpr_state_unlock(&lpr_state.threads.lock_word);
+            return -LPR_LINUX_EINVAL;
+        }
+        lpr_memset(record, 0, sizeof(*record));
+        record->tid = tid;
+        record->started = 1;
+        record->parent_ready = 1;
+        record->next = lpr_state.threads.head;
+        lpr_state.threads.head = record;
+    }
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+    return 0;
+}
+
+static void lpr_thread_count_start(void)
+{
+    (void)__atomic_add_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
+}
+
+static void lpr_thread_count_start_failed(void)
+{
+    (void)__atomic_sub_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
+}
+
+static void lpr_thread_after_fork_child(void)
+{
+    lpr_memset(&lpr_state.threads, 0, sizeof(lpr_state.threads));
+    __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
+}
+
+int64_t lpr_linux_gettid(void)
+{
+    return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
+}
+
+int64_t lpr_linux_set_tid_address(uint64_t tid_address)
+{
+    const int64_t raw_tid = lpr_linux_gettid();
+    if (raw_tid < 0 || raw_tid > UINT32_MAX) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const uint32_t tid = (uint32_t)raw_tid;
+    const int ensure_status = lpr_thread_ensure_current_record();
+    if (ensure_status != 0) {
+        return ensure_status;
+    }
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    lpr_thread_record_t *record = lpr_thread_record_find(tid);
+    if (record == 0) {
+        lpr_state_unlock(&lpr_state.threads.lock_word);
+        return -LPR_LINUX_EINVAL;
+    }
+    record->child_tid = (volatile uint32_t *)(uintptr_t)tid_address;
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+    return raw_tid;
+}
+
+void lpr_linux_exit_thread(uint64_t code)
+{
+    const int64_t raw_tid = lpr_linux_gettid();
+    volatile uint32_t *clear_tid = 0;
+    int last_thread = 0;
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    lpr_thread_record_t *record = raw_tid >= 0 && raw_tid <= UINT32_MAX ?
+        lpr_thread_record_find((uint32_t)raw_tid) : 0;
+    if (record != 0) {
+        clear_tid = record->child_tid;
+        last_thread = lpr_thread_record_remove(record);
+    } else {
+        last_thread = lpr_state.threads.head == 0;
+    }
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+
+    if (last_thread) {
+        lpr_linux_prepare_process_exit(code);
+    }
+    (void)lpr_pacha_syscall3(
+        PACHAOS_SYSCALL_THREAD_EXIT,
+        code,
+        (uint64_t)(uintptr_t)clear_tid,
+        clear_tid != 0 ? PACHAOS_THREAD_EXIT_CLEAR_TID : 0u);
+    for (;;) {
+    }
+}
+
+void lpr_linux_exit_group(uint64_t code)
+{
+    lpr_linux_prepare_process_exit(code);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, code);
+    for (;;) {
+    }
+}
+
+void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
+{
+    const int64_t raw_tid = lpr_linux_gettid();
+    if (record == 0 || raw_tid < 0 || raw_tid > UINT32_MAX) {
+        lpr_linux_exit_thread(127u);
+    }
+    const uint32_t tid = (uint32_t)raw_tid;
+    record->tid = tid;
+    if ((record->clone_flags & LPR_CLONE_PARENT_SETTID) != 0) {
+        __atomic_store_n(record->parent_tid, tid, __ATOMIC_RELEASE);
+    }
+    if ((record->clone_flags & LPR_CLONE_CHILD_SETTID) != 0) {
+        __atomic_store_n(record->child_tid, tid, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&record->started, 1u, __ATOMIC_RELEASE);
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_FUTEX_WAKE,
+        (uint64_t)(uintptr_t)&record->started,
+        1u);
+    while (__atomic_load_n(&record->parent_ready, __ATOMIC_ACQUIRE) == 0u) {
+        (void)lpr_pacha_syscall3(
+            PACHAOS_SYSCALL_FUTEX_WAIT,
+            (uint64_t)(uintptr_t)&record->parent_ready,
+            0u,
+            0u);
+    }
+    int (*start_function)(void *) =
+        (int (*)(void *))(uintptr_t)record->start_function;
+    const int result = start_function((void *)(uintptr_t)record->start_argument);
+    lpr_linux_exit_thread((uint64_t)(uint32_t)result);
+}
+
+static int64_t lpr_linux_clone_thread(
+    const struct lpr_linux_user_frame *user_frame,
+    uint64_t flags,
+    uint64_t child_stack,
+    uint64_t parent_tid,
+    uint64_t child_tid,
+    uint64_t tls)
+{
+    const uint64_t required_flags =
+        LPR_CLONE_VM | LPR_CLONE_FS | LPR_CLONE_FILES |
+        LPR_CLONE_SIGHAND | LPR_CLONE_THREAD | LPR_CLONE_SETTLS;
+    const uint64_t allowed_flags =
+        required_flags | LPR_CLONE_SYSVSEM | LPR_CLONE_PARENT_SETTID |
+        LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID | LPR_CLONE_DETACHED;
+    if (user_frame == 0 || (flags & 0xffu) != 0 ||
+        (flags & required_flags) != required_flags ||
+        (flags & ~allowed_flags) != 0 || child_stack < sizeof(lpr_thread_record_t) ||
+        user_frame->r9 == 0 || tls == 0 ||
+        (((flags & LPR_CLONE_PARENT_SETTID) != 0) && parent_tid == 0) ||
+        (((flags & (LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID)) != 0) && child_tid == 0))
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    const int ensure_status = lpr_thread_ensure_current_record();
+    if (ensure_status != 0) {
+        return ensure_status;
+    }
+
+    const uint64_t launch_stack =
+        (child_stack - sizeof(lpr_thread_record_t)) & ~0xfull;
+    lpr_thread_record_t *record =
+        (lpr_thread_record_t *)(uintptr_t)launch_stack;
+    lpr_memset(record, 0, sizeof(*record));
+    record->start_function = user_frame->r9;
+    record->start_argument = *(const uint64_t *)(uintptr_t)child_stack;
+    record->clone_flags = flags;
+    record->parent_tid = (volatile uint32_t *)(uintptr_t)parent_tid;
+    if ((flags & (LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID)) != 0) {
+        record->child_tid = (volatile uint32_t *)(uintptr_t)child_tid;
+    }
+
+    const uint64_t thread_rights =
+        PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_KILL | PACHA_FD_RIGHT_START;
+    const int64_t thread_fd = lpr_pacha_syscall6(
+        PACHAOS_SYSCALL_THREAD_CREATE,
+        PACHAOS_PROCESS_SELF_FD,
+        (uint64_t)(uintptr_t)lpr_clone_thread_entry,
+        launch_stack,
+        0,
+        tls,
+        thread_rights);
+    if (thread_fd < 16) {
+        return lpr_pacha_status_to_errno(thread_fd);
+    }
+
+    lpr_thread_record_add(record);
+    lpr_thread_count_start();
+    const int64_t start_status = lpr_pacha_syscall1(
+        PACHAOS_SYSCALL_THREAD_START,
+        (uint64_t)(uint32_t)thread_fd);
+    if (start_status != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_THREAD_KILL,
+            (uint64_t)(uint32_t)thread_fd,
+            1u);
+        lpr_state_lock(&lpr_state.threads.lock_word);
+        (void)lpr_thread_record_remove(record);
+        lpr_state_unlock(&lpr_state.threads.lock_word);
+        lpr_thread_count_start_failed();
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)thread_fd);
+        return lpr_pacha_status_to_errno(start_status);
+    }
+    (void)lpr_pacha_syscall1(
+        PACHAOS_SYSCALL_FD_CLOSE,
+        (uint64_t)(uint32_t)thread_fd);
+
+    while (__atomic_load_n(&record->started, __ATOMIC_ACQUIRE) == 0u) {
+        (void)lpr_pacha_syscall3(
+            PACHAOS_SYSCALL_FUTEX_WAIT,
+            (uint64_t)(uintptr_t)&record->started,
+            0u,
+            0u);
+    }
+    const uint32_t tid = record->tid;
+    __atomic_store_n(&record->parent_ready, 1u, __ATOMIC_RELEASE);
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_FUTEX_WAKE,
+        (uint64_t)(uintptr_t)&record->parent_ready,
+        1u);
+    return tid;
+}
+
+int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
+{
+    return lpr_linux_clone_frame(
+        lpr_current_linux_user_frame(),
+        flags,
+        child_stack,
+        parent_tid,
+        child_tid,
+        tls);
+}
+
+int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
+{
+    lpr_trace_clone_args(flags, child_stack, parent_tid, child_tid);
+    const uint64_t signal = flags & 0xffu;
+    const uint64_t known_process_flags = LPR_CLONE_VM | LPR_CLONE_VFORK | LPR_CLONE_PARENT_SETTID | LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID;
+    if ((flags & LPR_CLONE_THREAD) != 0) {
+        return lpr_linux_clone_thread(user_frame, flags, child_stack, parent_tid, child_tid, tls);
+    }
+    if (signal != 0 && signal != 17u) {
+        return -LPR_LINUX_EINVAL;
     }
     if ((flags & ~(known_process_flags | 0xffull)) != 0) {
         return -LPR_LINUX_EINVAL;
     }
-    const struct lpr_linux_user_frame *user_frame = lpr_current_linux_user_frame();
     if (user_frame == 0) {
         return -LPR_LINUX_ENOSYS;
     }
@@ -111,6 +397,7 @@ int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_ti
         lpr_linux_pending_child_pgrp = 0;
         lpr_supervisor_pending_child_token = 0;
         lpr_linux_process_clear_children();
+        lpr_thread_after_fork_child();
         lpr_pipe_after_fork_child();
         return 0;
     }

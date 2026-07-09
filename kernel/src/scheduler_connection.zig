@@ -2144,14 +2144,24 @@ pub fn loadExitHandoffThread(frame: *TrapFrame, target_thread: usize, target_gen
     return loadContextIntoFrame(target_thread, frame);
 }
 
-pub fn exitCurrentThread(frame: *TrapFrame, saved_rax: u64, before_ap_idle: ?BeforeCurrentThreadLeaveCallback) bool {
-    if (!policyActive()) return false;
+pub fn exitCurrentThread(
+    frame: *TrapFrame,
+    saved_rax: u64,
+    before_ap_idle: ?BeforeCurrentThreadLeaveCallback,
+    after_release: ?BeforeCurrentThreadLeaveCallback,
+) bool {
     if (!isBootstrapSchedulerCpu()) {
-        exitApThreadToIdleAfter(before_ap_idle);
+        const current_thread = currentThread();
+        _ = releaseThread(current_thread);
+        if (after_release) |callback| callback.run(callback.context);
+        if (before_ap_idle) |callback| callback.run(callback.context);
+        smp.returnCurrentApToIdleFromInterrupt();
     }
     const current_thread = currentThread();
     if (externalSchedulerOwnsThread(current_thread)) return false;
     if (!releaseThread(current_thread)) return false;
+    if (after_release) |callback| callback.run(callback.context);
+    if (!policyActive()) return switchToNextReadyOnCurrentCpu(frame, null);
     return switchToExternalScheduler(frame, saved_rax);
 }
 
