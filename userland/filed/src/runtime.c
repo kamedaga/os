@@ -1,6 +1,7 @@
 #include "filed/runtime.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "filed/dispatch.h"
@@ -9,6 +10,7 @@
 #include "filed_direct_backend.h"
 #include "storage_runtime.h"
 #include "bootstrap.h"
+#include "internal/dispatch_state.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 
@@ -58,7 +60,7 @@ static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
     }
 
     runtime->syncer_ticks++;
-    const uint64_t dirty_count = filed_page_cache_dirty_count();
+    const uint64_t dirty_count = filed_page_cache_dirty_count(runtime);
     const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
     if (dirty_count == 0 && backend_dirty_hint == 0) {
         return;
@@ -193,7 +195,16 @@ static int filed_read_bootstrap_fd(int fd, filed_bootstrap_t *out_bootstrap)
     return got == (long)sizeof(*out_bootstrap) ? 0 : -2;
 }
 
-static koboxd_storage_runtime_t filed_storage_runtime;
+static koboxd_storage_runtime_t *filed_runtime_storage_runtime(filed_runtime_t *runtime)
+{
+    if (runtime == NULL) {
+        return NULL;
+    }
+    if (runtime->storage_runtime == NULL) {
+        runtime->storage_runtime = calloc(1, sizeof(koboxd_storage_runtime_t));
+    }
+    return (koboxd_storage_runtime_t *)runtime->storage_runtime;
+}
 
 static int filed_read_storage_bootstrap_fd(int fd, koboxd_bootstrap_t *out_bootstrap, long *out_got)
 {
@@ -244,6 +255,7 @@ void filed_runtime_init(filed_runtime_t *runtime)
     filed_vfs_init(&runtime->vfs);
     filed_kobox_backend_init(&runtime->backend, -1);
     filed_tmpfs_backend_init(&runtime->tmpfs);
+    (void)filed_dispatch_runtime_init(runtime);
 }
 
 int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
@@ -264,19 +276,23 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
     memset(&storage_bootstrap, 0, sizeof(storage_bootstrap));
     status = filed_read_storage_bootstrap_fd(runtime->bootstrap_fd, &storage_bootstrap, &bootstrap_bytes);
     if (status == 0 && storage_bootstrap.magic == KOBOXD_BOOTSTRAP_MAGIC) {
+        koboxd_storage_runtime_t *storage_runtime = filed_runtime_storage_runtime(runtime);
+        if (storage_runtime == NULL) {
+            return -12;
+        }
         status = koboxd_validate_bootstrap_package(&storage_bootstrap, sizeof(storage_bootstrap));
         if (status != 0) {
             return status;
         }
         status = koboxd_storage_runtime_init(
-            &filed_storage_runtime,
+            storage_runtime,
             &storage_bootstrap);
         if (status != 0) {
             return status;
         }
         filed_kobox_backend_init_direct(
             &runtime->backend,
-            koboxd_storage_runtime_fs_backend(&filed_storage_runtime),
+            koboxd_storage_runtime_fs_backend(storage_runtime),
             koboxd_filed_direct_ops());
         status = filed_pin_exec_endpoint_fd(
             (int)(uint32_t)storage_bootstrap.control_fd,

@@ -9,8 +9,9 @@
 
 enum {
     FILED_RUNTIME_MAX_SESSIONS = 32,
-    FILED_RUNTIME_FILE_VMO_CACHE_SLOTS = 16,
 };
+
+struct filed_dispatch_state;
 
 typedef struct filed_session {
     int channel_fd;
@@ -19,18 +20,6 @@ typedef struct filed_session {
     uint64_t page_size;
     uint8_t active;
 } filed_session_t;
-
-typedef struct filed_file_vmo_cache_entry {
-    uint8_t active;
-    uint8_t reserved0;
-    uint16_t reserved1;
-    int vmo_fd;
-    uint64_t backend_object;
-    uint64_t object_generation;
-    uint64_t file_offset;
-    uint64_t length;
-    uint64_t clock;
-} filed_file_vmo_cache_entry_t;
 
 typedef struct filed_runtime {
     filed_vfs_t vfs;
@@ -43,9 +32,9 @@ typedef struct filed_runtime {
     int netd_socket_endpoint_fd;
     int termd_tty_endpoint_fd;
     filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
-    filed_file_vmo_cache_entry_t file_vmo_cache[FILED_RUNTIME_FILE_VMO_CACHE_SLOTS];
+    struct filed_dispatch_state *dispatch_state;
+    void *storage_runtime;
     uint64_t request_sequence;
-    uint64_t file_vmo_cache_clock;
     uint64_t syncer_ticks;
     uint64_t syncer_flushes;
     uint64_t syncer_errors;

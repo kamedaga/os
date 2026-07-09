@@ -7,6 +7,22 @@ project(filed C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
+set(FILED_DISPATCH_SHARDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/backend.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cache/dir_cache.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cache/negative_cache.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cache/page_cache.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cache/vmo_cache.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/common.h"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/ops_common.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/ops_dir.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/ops_exec.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/ops_file.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/transport.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/transport_reply.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/internal/dispatch_state.h"
+)
 set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/backend_router.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/core.c"
@@ -127,6 +143,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/internal.h"
+    ${FILED_DISPATCH_SHARDS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/private.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/private.h"
     ${FILED_EXTRA_SOURCES}
