@@ -1,4 +1,6 @@
-static uint64_t lpr_open_rights(uint64_t flags)
+#include "../lpr_filed_internal.h"
+
+uint64_t lpr_open_rights(uint64_t flags)
 {
     uint64_t rights = FILED_V2_RIGHT_STAT;
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
@@ -22,7 +24,7 @@ static uint64_t lpr_open_rights(uint64_t flags)
     return rights;
 }
 
-static uint64_t lpr_open_flags(uint64_t flags)
+uint64_t lpr_open_flags(uint64_t flags)
 {
     uint64_t out = 0;
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
@@ -52,7 +54,7 @@ static uint64_t lpr_open_flags(uint64_t flags)
     return out;
 }
 
-static int64_t lpr_copy_path(char *out, uint64_t capacity, const char *path)
+int64_t lpr_copy_path(char *out, uint64_t capacity, const char *path)
 {
     if (out == 0 || path == 0) {
         return -LPR_LINUX_EFAULT;
@@ -69,7 +71,7 @@ static int64_t lpr_copy_path(char *out, uint64_t capacity, const char *path)
     return 0;
 }
 
-static int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
+int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
 {
     if (out == 0 || path == 0) {
         return -LPR_LINUX_EFAULT;
@@ -90,13 +92,13 @@ static int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *ou
     return 0;
 }
 
-static int64_t lpr_filed_close_handle(uint64_t handle)
+int64_t lpr_filed_close_handle(uint64_t handle)
 {
     uint64_t ignored = 0;
     return lpr_filed_call(FILED_V2_OP_VFS_CLOSE, -1, handle, &ignored);
 }
 
-static int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle)
+int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle)
 {
     if (out_handle == 0) {
         return -LPR_LINUX_EFAULT;
@@ -268,8 +270,8 @@ int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t
     return lpr_linux_faccessat(dirfd, path, 0, 0) == 0 ? -LPR_LINUX_EEXIST : 0;
 }
 
-static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
-static int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity);
+int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
+int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity);
 
 int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t linkpath_raw)
 {
@@ -371,7 +373,7 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new
     return status;
 }
 
-static int64_t lpr_filed_open_handle_at(
+int64_t lpr_filed_open_handle_at(
     uint64_t dirfd,
     const char *path,
     uint64_t flags,
@@ -420,7 +422,7 @@ static int64_t lpr_filed_open_handle_at(
     return 0;
 }
 
-static int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
+int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
 {
     const char *path = (const char *)(uintptr_t)path_raw;
     const int64_t tty_fd = lpr_tty_open_path(path, flags);
@@ -440,7 +442,7 @@ static int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t
     return fd;
 }
 
-static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity)
+int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity)
 {
     if (target == 0 || capacity == 0) {
         return -LPR_LINUX_EFAULT;
@@ -474,7 +476,7 @@ static int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw,
     return status == 0 ? (int64_t)length : status;
 }
 
-static int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity)
+int lpr_resolve_final_symlink_path(const char *path, const char *target, char *out, uint64_t capacity)
 {
     if (path == 0 || target == 0 || out == 0) {
         return 0;
@@ -538,7 +540,7 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
     return lpr_linux_openat_once(dirfd, (uint64_t)(uintptr_t)resolved, flags, mode);
 }
 
-static void lpr_cwd_pop_component(char *path, uint64_t *len)
+void lpr_cwd_pop_component(char *path, uint64_t *len)
 {
     if (path == 0 || len == 0 || *len <= 1u) {
         if (path != 0 && len != 0) {
@@ -565,7 +567,7 @@ static void lpr_cwd_pop_component(char *path, uint64_t *len)
     *len = i - 1u;
 }
 
-static int lpr_cwd_append_component(char *out, uint64_t capacity, uint64_t *len, const char *component, uint64_t component_len)
+int lpr_cwd_append_component(char *out, uint64_t capacity, uint64_t *len, const char *component, uint64_t component_len)
 {
     if (out == 0 || len == 0 || component == 0 || component_len == 0) {
         return 0;
@@ -595,7 +597,7 @@ static int lpr_cwd_append_component(char *out, uint64_t capacity, uint64_t *len,
     return 1;
 }
 
-static int64_t lpr_cwd_normalize(const char *path, char *out, uint64_t capacity)
+int64_t lpr_cwd_normalize(const char *path, char *out, uint64_t capacity)
 {
     if (path == 0 || out == 0 || capacity < 2u) {
         return -LPR_LINUX_EFAULT;
@@ -660,7 +662,7 @@ int64_t lpr_linux_getcwd(uint64_t buf, uint64_t size)
     return (int64_t)(len + 1u);
 }
 
-static int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path)
+int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path)
 {
     if (!lpr_supervisor_enabled) {
         return 0;
@@ -693,7 +695,7 @@ static int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path)
     return status;
 }
 
-static int64_t lpr_cwd_install(uint64_t handle, const char *path)
+int64_t lpr_cwd_install(uint64_t handle, const char *path)
 {
     if (path == 0 || !lpr_path_is_terminated(path, sizeof(lpr_cwd_path))) {
         if (handle != 0) {
@@ -782,7 +784,7 @@ int64_t lpr_linux_fchdir(uint64_t fd)
     return lpr_cwd_install(dup_handle, cwd_copy);
 }
 
-static int64_t lpr_linux_validate_timespec(const struct pachaos_timespec *ts)
+int64_t lpr_linux_validate_timespec(const struct pachaos_timespec *ts)
 {
     if (ts == 0) {
         return -LPR_LINUX_EFAULT;
@@ -796,7 +798,7 @@ static int64_t lpr_linux_validate_timespec(const struct pachaos_timespec *ts)
     return 0;
 }
 
-static int lpr_timespec_less_equal(
+int lpr_timespec_less_equal(
     const struct pachaos_timespec *lhs,
     const struct pachaos_timespec *rhs)
 {
@@ -806,7 +808,7 @@ static int lpr_timespec_less_equal(
     return lhs->tv_nsec <= rhs->tv_nsec;
 }
 
-static void lpr_timespec_subtract(
+void lpr_timespec_subtract(
     const struct pachaos_timespec *end,
     const struct pachaos_timespec *start,
     struct pachaos_timespec *out)
@@ -820,7 +822,7 @@ static void lpr_timespec_subtract(
     out->tv_nsec = 1000000000ull + end->tv_nsec - start->tv_nsec;
 }
 
-static int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out)
+int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out)
 {
     lpr_memset(out, 0, sizeof(*out));
     const int64_t status = lpr_pacha_syscall2(
@@ -830,7 +832,7 @@ static int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespe
     return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
 }
 
-static int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req)
+int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req)
 {
     const int64_t valid = lpr_linux_validate_timespec(req);
     if (valid != 0) {
@@ -842,7 +844,7 @@ static int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req)
     return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
 }
 
-static int64_t lpr_linux_sleep_result(int64_t status)
+int64_t lpr_linux_sleep_result(int64_t status)
 {
     if (status != -LPR_LINUX_EAGAIN) {
         return status;

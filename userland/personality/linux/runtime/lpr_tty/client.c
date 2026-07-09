@@ -1,9 +1,11 @@
-static void *lpr_termd_payload(void *page)
+#include "../lpr_filed_internal.h"
+
+void *lpr_termd_payload(void *page)
 {
     return page == 0 ? 0 : (void *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
 }
 
-static int64_t lpr_termd_call(
+int64_t lpr_termd_call(
     uint32_t op,
     int page_fd,
     void *page,
@@ -134,7 +136,7 @@ static int64_t lpr_termd_call(
     return reply_header->status;
 }
 
-static int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result)
+int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result)
 {
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
@@ -152,7 +154,7 @@ static int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out
     return status;
 }
 
-static int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags)
+int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags)
 {
     const int fd = lpr_fd_slot_alloc();
     if (fd < 0) {
@@ -174,7 +176,7 @@ static int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags)
     return fd;
 }
 
-static uint64_t lpr_parse_pts_index(const char *path)
+uint64_t lpr_parse_pts_index(const char *path)
 {
     const char prefix[] = "/dev/pts/";
     for (uint64_t i = 0; prefix[i] != 0; i++) {
@@ -197,7 +199,7 @@ static uint64_t lpr_parse_pts_index(const char *path)
     return value;
 }
 
-static uint64_t lpr_parse_hvc_index(const char *path)
+uint64_t lpr_parse_hvc_index(const char *path)
 {
     const char prefix[] = "/dev/hvc";
     for (uint64_t i = 0; prefix[i] != 0; i++) {
@@ -220,7 +222,7 @@ static uint64_t lpr_parse_hvc_index(const char *path)
     return value;
 }
 
-static void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id)
+void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id)
 {
     lpr_linux_process_state_init();
     if (session_id != 0) {
@@ -234,7 +236,7 @@ static void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, ui
     }
 }
 
-static uint64_t lpr_linux_signal_bit(uint32_t sig)
+uint64_t lpr_linux_signal_bit(uint32_t sig)
 {
     if (sig == 0 || sig > LPR_LINUX_SIGNAL_MAX) {
         return 0;
@@ -242,7 +244,7 @@ static uint64_t lpr_linux_signal_bit(uint32_t sig)
     return 1ull << (sig - 1u);
 }
 
-static void lpr_linux_queue_signal(uint32_t sig)
+void lpr_linux_queue_signal(uint32_t sig)
 {
     const uint64_t bit = lpr_linux_signal_bit(sig);
     if (bit != 0) {
@@ -250,7 +252,7 @@ static void lpr_linux_queue_signal(uint32_t sig)
     }
 }
 
-static int lpr_linux_default_signal_ignored(uint32_t sig)
+int lpr_linux_default_signal_ignored(uint32_t sig)
 {
     return sig == LPR_LINUX_SIGCHLD ||
         sig == LPR_LINUX_SIGURG ||
@@ -258,7 +260,7 @@ static int lpr_linux_default_signal_ignored(uint32_t sig)
         sig == LPR_LINUX_SIGCONT;
 }
 
-static int lpr_linux_default_signal_stops(uint32_t sig)
+int lpr_linux_default_signal_stops(uint32_t sig)
 {
     return sig == LPR_LINUX_SIGSTOP ||
         sig == LPR_LINUX_SIGTSTP ||
@@ -266,7 +268,7 @@ static int lpr_linux_default_signal_stops(uint32_t sig)
         sig == LPR_LINUX_SIGTTOU;
 }
 
-static void lpr_linux_exit_for_signal(uint32_t sig)
+void lpr_linux_exit_for_signal(uint32_t sig)
 {
     const uint64_t exit_code = 128u + (uint64_t)sig;
     lpr_linux_prepare_process_exit(exit_code);
@@ -275,7 +277,7 @@ static void lpr_linux_exit_for_signal(uint32_t sig)
     }
 }
 
-static uint32_t lpr_linux_first_pending_signal(uint64_t mask)
+uint32_t lpr_linux_first_pending_signal(uint64_t mask)
 {
     for (uint32_t sig = 1; sig <= LPR_LINUX_SIGNAL_MAX; sig += 1) {
         if ((mask & lpr_linux_signal_bit(sig)) != 0) {
@@ -331,19 +333,19 @@ int64_t lpr_linux_dispatch_pending_signals(void)
     return result;
 }
 
-static void lpr_linux_raise_sigpipe(void)
+void lpr_linux_raise_sigpipe(void)
 {
     lpr_linux_queue_signal(LPR_LINUX_SIGPIPE);
     (void)lpr_linux_dispatch_pending_signals();
 }
 
-static uint64_t lpr_linux_unblockable_signal_mask(void)
+uint64_t lpr_linux_unblockable_signal_mask(void)
 {
     return lpr_linux_signal_bit(LPR_LINUX_SIGKILL) |
         lpr_linux_signal_bit(LPR_LINUX_SIGSTOP);
 }
 
-static uint64_t lpr_linux_ignored_signal_mask(void)
+uint64_t lpr_linux_ignored_signal_mask(void)
 {
     uint64_t ignored = 0;
     for (uint32_t sig = 1; sig <= LPR_LINUX_SIGNAL_MAX; sig += 1) {
@@ -354,7 +356,7 @@ static uint64_t lpr_linux_ignored_signal_mask(void)
     return ignored;
 }
 
-static void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored)
+void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored)
 {
     if (signal_mask != 0) {
         *signal_mask = lpr_linux_signal_mask & ~lpr_linux_unblockable_signal_mask();
@@ -364,7 +366,7 @@ static void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_
     }
 }
 
-static int64_t lpr_tty_open_path(const char *path, uint64_t flags)
+int64_t lpr_tty_open_path(const char *path, uint64_t flags)
 {
     if (path == 0 || LPR_TERMD_TTY_ENDPOINT_FD < 16) {
         return -LPR_LINUX_ENOENT;

@@ -1,4 +1,6 @@
-static int lpr_pipe_fd_is_active(uint64_t fd)
+#include "../lpr_filed_internal.h"
+
+int lpr_pipe_fd_is_active(uint64_t fd)
 {
     lpr_fd_arrays_init();
     return fd < lpr_fd_table_capacity && lpr_pipe_fds[fd].active != 0;
@@ -9,7 +11,7 @@ int lpr_linux_pipe_fd_active(uint64_t fd)
     return lpr_pipe_fd_is_active(fd);
 }
 
-static uint64_t lpr_pipe_writev_wait_min(uint64_t iov_raw, uint64_t iov_count)
+uint64_t lpr_pipe_writev_wait_min(uint64_t iov_raw, uint64_t iov_count)
 {
     if (iov_raw == 0 || iov_count == 0) {
         return 1;
@@ -25,7 +27,7 @@ static uint64_t lpr_pipe_writev_wait_min(uint64_t iov_raw, uint64_t iov_count)
     return total == 0 ? 1 : total;
 }
 
-static int lpr_native_pipe_fd_info(uint64_t fd, struct pacha_fd_info *out)
+int lpr_native_pipe_fd_info(uint64_t fd, struct pacha_fd_info *out)
 {
     if (fd > LPR_LINUX_FD_MAX || out == 0) {
         return 0;
@@ -36,7 +38,7 @@ static int lpr_native_pipe_fd_info(uint64_t fd, struct pacha_fd_info *out)
     return lpr_native_fd_info(fd, out) && out->kind == PACHA_FD_KIND_PIPE;
 }
 
-static int lpr_native_pipe_slot_claimable(uint64_t fd, struct pacha_fd_info *out)
+int lpr_native_pipe_slot_claimable(uint64_t fd, struct pacha_fd_info *out)
 {
     if (fd > LPR_LINUX_FD_MAX ||
         out == 0 ||
@@ -49,7 +51,7 @@ static int lpr_native_pipe_slot_claimable(uint64_t fd, struct pacha_fd_info *out
     return lpr_native_fd_info(fd, out) && out->kind == PACHA_FD_KIND_PIPE;
 }
 
-static uint64_t lpr_pipe_flags_to_pacha(uint64_t flags)
+uint64_t lpr_pipe_flags_to_pacha(uint64_t flags)
 {
     uint64_t out = 0;
     if ((flags & LPR_LINUX_O_CLOEXEC) != 0) {
@@ -61,7 +63,7 @@ static uint64_t lpr_pipe_flags_to_pacha(uint64_t flags)
     return out;
 }
 
-static uint64_t lpr_pipe_rights(int readable)
+uint64_t lpr_pipe_rights(int readable)
 {
     return PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_DUP |
@@ -73,7 +75,7 @@ static uint64_t lpr_pipe_rights(int readable)
         (readable ? PACHA_FD_RIGHT_READ : PACHA_FD_RIGHT_WRITE);
 }
 
-static uint64_t lpr_pipe_poll_events_to_pacha(uint32_t events)
+uint64_t lpr_pipe_poll_events_to_pacha(uint32_t events)
 {
     uint64_t out = 0;
     if ((events & 0x0001u) != 0) {
@@ -88,7 +90,7 @@ static uint64_t lpr_pipe_poll_events_to_pacha(uint32_t events)
     return out;
 }
 
-static uint32_t lpr_pipe_poll_events_from_pacha(uint64_t events)
+uint32_t lpr_pipe_poll_events_from_pacha(uint64_t events)
 {
     uint32_t out = 0;
     if ((events & PACHA_FD_EVENT_READABLE) != 0) {
@@ -145,7 +147,7 @@ uint32_t lpr_linux_native_fd_poll_events(uint64_t fd, uint32_t events)
     return lpr_pipe_poll_events_from_pacha(pollfd.revents);
 }
 
-static int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes)
+int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes)
 {
     for (;;) {
         struct pacha_pollfd pollfd;
@@ -184,7 +186,7 @@ static int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_by
     }
 }
 
-static int64_t lpr_native_pipe_read(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_native_pipe_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     struct pacha_fd_info info;
     if (!lpr_native_pipe_fd_info(fd, &info)) {
@@ -217,7 +219,7 @@ static int64_t lpr_native_pipe_read(uint64_t fd, uint64_t buf, uint64_t count)
     }
 }
 
-static int64_t lpr_native_pipe_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
+int64_t lpr_native_pipe_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 {
     struct pacha_fd_info info;
     if (!lpr_native_pipe_fd_info(fd, &info)) {
@@ -244,7 +246,7 @@ static int64_t lpr_native_pipe_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov
     }
 }
 
-static int64_t lpr_native_pipe_write(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_native_pipe_write(uint64_t fd, uint64_t buf, uint64_t count)
 {
     struct pacha_fd_info info;
     if (!lpr_native_pipe_fd_info(fd, &info)) {
@@ -282,7 +284,7 @@ static int64_t lpr_native_pipe_write(uint64_t fd, uint64_t buf, uint64_t count)
     }
 }
 
-static int64_t lpr_native_pipe_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
+int64_t lpr_native_pipe_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 {
     struct pacha_fd_info info;
     if (!lpr_native_pipe_fd_info(fd, &info)) {

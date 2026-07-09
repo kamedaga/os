@@ -1,10 +1,12 @@
-static int lpr_supervisor_snapshot_count(void *ctx, uint64_t *out_count)
+#include "../lpr_filed_internal.h"
+
+int lpr_supervisor_snapshot_count(void *ctx, uint64_t *out_count)
 {
     (void)ctx;
     return lpr_count_exec_local_fds(out_count);
 }
 
-static int lpr_supervisor_snapshot_next(
+int lpr_supervisor_snapshot_next(
     void *ctx,
     uint64_t *cursor,
     lprs_v2_fd_desc_t *out,
@@ -41,7 +43,7 @@ static int lpr_supervisor_snapshot_next(
     return 0;
 }
 
-static int lpr_supervisor_snapshot_install(void *ctx, const lprs_v2_fd_desc_t *in)
+int lpr_supervisor_snapshot_install(void *ctx, const lprs_v2_fd_desc_t *in)
 {
     (void)ctx;
     if (in == 0) {
@@ -59,7 +61,7 @@ static int lpr_supervisor_snapshot_install(void *ctx, const lprs_v2_fd_desc_t *i
     return lpr_install_local_fd_descs(&desc, 1) ? 0 : -LPR_LINUX_EIO;
 }
 
-static void lpr_supervisor_snapshot_ops(lpr_supervisor_fd_snapshot_ops_t *ops)
+void lpr_supervisor_snapshot_ops(lpr_supervisor_fd_snapshot_ops_t *ops)
 {
     lpr_memset(ops, 0, sizeof(*ops));
     ops->request_counter = &lpr_request_id;

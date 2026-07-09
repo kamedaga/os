@@ -1,10 +1,12 @@
-static void lpr_readlink_cache_clear(void)
+#include "../lpr_filed_internal.h"
+
+void lpr_readlink_cache_clear(void)
 {
     lpr_memset(lpr_readlink_cache, 0, sizeof(lpr_readlink_cache));
     lpr_readlink_cache_clock = 0;
 }
 
-static int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status)
+int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status)
 {
     if (path == 0 || out_status == 0 || length == 0 || length >= FILED_V2_PATH_BYTES) {
         return 0;
@@ -22,7 +24,7 @@ static int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t 
     return 0;
 }
 
-static void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status)
+void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status)
 {
     if (path == 0 || length == 0 || length >= FILED_V2_PATH_BYTES || status >= 0) {
         return;
@@ -37,13 +39,13 @@ static void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t 
     entry->path[length] = '\0';
 }
 
-static void lpr_page_cache_clear(void)
+void lpr_page_cache_clear(void)
 {
     lpr_memset(lpr_page_cache, 0, sizeof(lpr_page_cache));
     lpr_page_cache_clock = 0;
 }
 
-static void lpr_page_cache_invalidate_handle(uint64_t handle)
+void lpr_page_cache_invalidate_handle(uint64_t handle)
 {
     if (handle == 0) {
         return;

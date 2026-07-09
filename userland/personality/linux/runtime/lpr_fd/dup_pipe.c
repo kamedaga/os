@@ -1,4 +1,6 @@
-static void lpr_pipe_close_fd(uint64_t fd)
+#include "../lpr_filed_internal.h"
+
+void lpr_pipe_close_fd(uint64_t fd)
 {
     if (lpr_pipe_fd_is_active(fd)) {
         const uint64_t mode =
@@ -12,7 +14,7 @@ static void lpr_pipe_close_fd(uint64_t fd)
     lpr_control_close_fd(fd);
 }
 
-static void lpr_pipe_after_fork_child(void)
+void lpr_pipe_after_fork_child(void)
 {
     /* Kernel fd-table clone owns native pipe endpoint refcounts. */
     lpr_cwd_init();
@@ -170,7 +172,7 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
     return fd;
 }
 
-static int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec)
+int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec)
 {
     int dup_fd = target_fd;
     lpr_trace_process_event(

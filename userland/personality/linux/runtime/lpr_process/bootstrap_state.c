@@ -1,4 +1,6 @@
-static int lpr_load_bootstrap(void)
+#include "../lpr_filed_internal.h"
+
+int lpr_load_bootstrap(void)
 {
     if (lpr_bootstrap_checked) {
         return lpr_bootstrap_valid;
@@ -91,19 +93,19 @@ invalid:
     return 0;
 }
 
-static int lpr_path_is_terminated(const char *path, uint64_t capacity)
+int lpr_path_is_terminated(const char *path, uint64_t capacity)
 {
     return path != 0 && lpr_strnlen(path, capacity) < capacity;
 }
 
-static void lpr_cwd_set_root(void)
+void lpr_cwd_set_root(void)
 {
     lpr_cwd_handle = 0;
     lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
     lpr_cwd_path[0] = '/';
 }
 
-static void lpr_cwd_init(void)
+void lpr_cwd_init(void)
 {
     if (lpr_cwd_checked) {
         return;
@@ -140,7 +142,7 @@ static void lpr_cwd_init(void)
     }
 }
 
-static void lpr_linux_process_state_init(void)
+void lpr_linux_process_state_init(void)
 {
     if (lpr_linux_process_state_checked) {
         return;
@@ -200,7 +202,7 @@ static void lpr_linux_process_state_init(void)
     }
 }
 
-static lpr_linux_process_entry_t *lpr_linux_process_find(int32_t linux_pid)
+lpr_linux_process_entry_t *lpr_linux_process_find(int32_t linux_pid)
 {
     if (linux_pid <= 0) {
         return 0;
@@ -225,7 +227,7 @@ static lpr_linux_process_entry_t *lpr_linux_process_slot(void)
     return 0;
 }
 
-static int32_t lpr_linux_alloc_child_pid(void)
+int32_t lpr_linux_alloc_child_pid(void)
 {
     lpr_linux_process_state_init();
     for (uint64_t tries = 0; tries < 32768u; tries++) {
@@ -242,7 +244,7 @@ static int32_t lpr_linux_alloc_child_pid(void)
     return -1;
 }
 
-static int lpr_linux_process_register(
+int lpr_linux_process_register(
     int32_t linux_pid,
     int32_t linux_ppid,
     int32_t linux_sid,
@@ -270,7 +272,7 @@ static int lpr_linux_process_register(
     return 0;
 }
 
-static void lpr_linux_process_clear_children(void)
+void lpr_linux_process_clear_children(void)
 {
     lpr_memset(lpr_linux_processes, 0, sizeof(lpr_linux_processes));
 }

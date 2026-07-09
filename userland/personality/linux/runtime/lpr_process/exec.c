@@ -1,11 +1,6 @@
-typedef struct lpr_pacha_process_status {
-    uint64_t state;
-    uint64_t exit_code;
-    uint64_t id;
-    uint64_t generation;
-} lpr_pacha_process_status_t;
+#include "../lpr_filed_internal.h"
 
-static int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
+int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
 {
     enum { LPR_PROCESS_WAIT_POLL_TICKS = 50 };
     if (process_fd < 16) {
@@ -50,7 +45,7 @@ static int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit
     }
 }
 
-static int64_t lpr_linux_try_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
+int64_t lpr_linux_try_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
 {
     if (process_fd < 16) {
         return -LPR_LINUX_ECHILD;
@@ -70,7 +65,7 @@ static int64_t lpr_linux_try_wait_process_fd(uint64_t process_fd, uint64_t *out_
     return lpr_pacha_status_to_errno(wait_status);
 }
 
-static int lpr_exec_add_string(filed_v2_exec_path_t *exec, filed_v2_exec_string_ref_t *ref, const char *value)
+int lpr_exec_add_string(filed_v2_exec_path_t *exec, filed_v2_exec_string_ref_t *ref, const char *value)
 {
     if (exec == 0 || ref == 0 || value == 0) {
         return -LPR_LINUX_EFAULT;
@@ -89,7 +84,7 @@ static int lpr_exec_add_string(filed_v2_exec_path_t *exec, filed_v2_exec_string_
     return 0;
 }
 
-static int64_t lpr_prepare_exec_cwd(filed_v2_exec_path_t *exec)
+int64_t lpr_prepare_exec_cwd(filed_v2_exec_path_t *exec)
 {
     if (exec == 0) {
         return -LPR_LINUX_EFAULT;
@@ -111,7 +106,7 @@ static int64_t lpr_prepare_exec_cwd(filed_v2_exec_path_t *exec)
     return lpr_filed_dup_handle(lpr_cwd_handle, 0, &exec->cwd_handle);
 }
 
-static void lpr_discard_exec_cwd(filed_v2_exec_path_t *exec)
+void lpr_discard_exec_cwd(filed_v2_exec_path_t *exec)
 {
     if (exec != 0 && exec->cwd_handle != 0) {
         (void)lpr_filed_close_handle(exec->cwd_handle);
@@ -119,7 +114,7 @@ static void lpr_discard_exec_cwd(filed_v2_exec_path_t *exec)
     }
 }
 
-static int lpr_exec_copy_string_vector(
+int lpr_exec_copy_string_vector(
     filed_v2_exec_path_t *exec,
     filed_v2_exec_string_ref_t *refs,
     uint64_t max_refs,
@@ -154,7 +149,7 @@ static int lpr_exec_copy_string_vector(
     return 0;
 }
 
-static uint64_t lpr_exec_fd_table_capacity_for_count(uint64_t count)
+uint64_t lpr_exec_fd_table_capacity_for_count(uint64_t count)
 {
     uint64_t capacity = LPR_EXEC_LOCAL_FD_TABLE_INITIAL_FDS;
     while (capacity < count) {
@@ -166,7 +161,7 @@ static uint64_t lpr_exec_fd_table_capacity_for_count(uint64_t count)
     return capacity;
 }
 
-static uint64_t lpr_align_up_4096(uint64_t value)
+uint64_t lpr_align_up_4096(uint64_t value)
 {
     const uint64_t mask = 4096ull - 1ull;
     if (value > UINT64_MAX - mask) {
@@ -175,7 +170,7 @@ static uint64_t lpr_align_up_4096(uint64_t value)
     return (value + mask) & ~mask;
 }
 
-static uint64_t lpr_exec_fd_table_bytes_for_capacity(uint64_t capacity)
+uint64_t lpr_exec_fd_table_bytes_for_capacity(uint64_t capacity)
 {
     if (capacity >
         (UINT64_MAX - sizeof(filed_v2_exec_lpr_fd_table_t)) /
@@ -188,7 +183,7 @@ static uint64_t lpr_exec_fd_table_bytes_for_capacity(uint64_t capacity)
         capacity * sizeof(filed_v2_exec_lpr_fd_t));
 }
 
-static int lpr_exec_local_fd_active(uint64_t fd)
+int lpr_exec_local_fd_active(uint64_t fd)
 {
     return lpr_fd_is_filed(fd) ||
         lpr_linux_tty_fd_active(fd) ||
@@ -196,7 +191,7 @@ static int lpr_exec_local_fd_active(uint64_t fd)
         lpr_linux_eventfd_active(fd);
 }
 
-static int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve)
+int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve)
 {
     if (out_preserve == 0) {
         return -LPR_LINUX_EFAULT;
@@ -214,7 +209,7 @@ static int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve)
     return 0;
 }
 
-static int lpr_count_exec_local_fds(uint64_t *out_count)
+int lpr_count_exec_local_fds(uint64_t *out_count)
 {
     if (out_count == 0) {
         return -LPR_LINUX_EFAULT;
@@ -241,7 +236,7 @@ static int lpr_count_exec_local_fds(uint64_t *out_count)
     return 0;
 }
 
-static void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
+void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
 {
     lpr_memset(desc, 0, sizeof(*desc));
     desc->fd = fd;
@@ -265,7 +260,7 @@ static void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t 
     }
 }
 
-static int lpr_supervisor_fd_table_replace(void)
+int lpr_supervisor_fd_table_replace(void)
 {
     if (!lpr_supervisor_enabled || lpr_supervisor_token == 0) {
         return 0;
@@ -275,7 +270,7 @@ static int lpr_supervisor_fd_table_replace(void)
     return lpr_supervisor_fd_snapshot_replace(lpr_supervisor_token, &ops, 0);
 }
 
-static int lpr_prepare_exec_local_fds(
+int lpr_prepare_exec_local_fds(
     filed_v2_exec_path_t *exec,
     lpr_exec_local_fd_table_t *local_table)
 {
@@ -382,7 +377,7 @@ static int lpr_prepare_exec_local_fds(
     return 0;
 }
 
-static void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table)
+void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table)
 {
     if (local_table == 0) {
         return;
@@ -403,7 +398,7 @@ static void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_tab
     local_table->table = 0;
 }
 
-static void lpr_close_local_state_before_self_exec(void)
+void lpr_close_local_state_before_self_exec(void)
 {
     lpr_fd_arrays_init();
     for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
@@ -447,7 +442,7 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
     lpr_trace_process_event("exit_prepare", exit_code, 0, 0);
 }
 
-static int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
+int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
 {
     if (bootstrap_fd < 16) {
         return -LPR_LINUX_EBADF;
@@ -501,7 +496,7 @@ static int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
     return flag_status == 0 ? 0 : (int)lpr_pacha_status_to_errno(flag_status);
 }
 
-static int64_t lpr_filed_exec_self(
+int64_t lpr_filed_exec_self(
     filed_v2_exec_path_t *exec,
     const lpr_exec_local_fd_table_t *local_table,
     int *out_process_fd,
@@ -610,4 +605,3 @@ static int64_t lpr_filed_exec_self(
     return 0;
 }
 
-#include "syscalls.inc"

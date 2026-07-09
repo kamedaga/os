@@ -1,4 +1,6 @@
-static int lpr_fd_is_filed(uint64_t fd)
+#include "../lpr_filed_internal.h"
+
+int lpr_fd_is_filed(uint64_t fd)
 {
     lpr_fd_arrays_init();
     return fd < lpr_fd_table_capacity && lpr_fds[fd].active != 0;
@@ -10,7 +12,7 @@ int lpr_linux_tty_fd_active(uint64_t fd)
     return fd < lpr_fd_table_capacity && lpr_tty_fds[fd].active != 0;
 }
 
-static int lpr_fd_shadow_offset_eligible(uint64_t fd)
+int lpr_fd_shadow_offset_eligible(uint64_t fd)
 {
     return lpr_fd_is_filed(fd) &&
         (lpr_fds[fd].flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY;
@@ -26,7 +28,7 @@ uint64_t lpr_linux_filed_fd_handle(uint64_t fd)
     return lpr_fd_is_filed(fd) ? lpr_fds[fd].handle : 0;
 }
 
-static int lpr_runtime_reserved_fd(uint64_t fd)
+int lpr_runtime_reserved_fd(uint64_t fd)
 {
     return fd == LPR_FILED_ENDPOINT_FD ||
         fd == LPR_NETD_ENDPOINT_FD ||
@@ -35,7 +37,7 @@ static int lpr_runtime_reserved_fd(uint64_t fd)
         fd == LPR_SUPERVISOR_ENDPOINT_FD;
 }
 
-static int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out)
+int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out)
 {
     if (fd > LPR_LINUX_FD_MAX || out == 0) {
         return 0;
@@ -47,7 +49,7 @@ static int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out)
         (uint64_t)(uintptr_t)out) == 0;
 }
 
-static int64_t lpr_close_native_fd_if_open(uint64_t fd)
+int64_t lpr_close_native_fd_if_open(uint64_t fd)
 {
     struct pacha_fd_info info;
     if (fd > LPR_LINUX_FD_MAX || lpr_runtime_reserved_fd(fd)) {
@@ -60,7 +62,7 @@ static int64_t lpr_close_native_fd_if_open(uint64_t fd)
         lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fd));
 }
 
-static int lpr_fd_local_active(uint64_t fd)
+int lpr_fd_local_active(uint64_t fd)
 {
     return lpr_fd_is_filed(fd) ||
         lpr_pipe_fd_is_active(fd) ||
@@ -68,7 +70,7 @@ static int lpr_fd_local_active(uint64_t fd)
         lpr_linux_tty_fd_active(fd);
 }
 
-static uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
+uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
 {
     uint32_t flags = 0;
     const int readable = (info->rights & PACHA_FD_RIGHT_READ) != 0;
@@ -87,17 +89,17 @@ static uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
     return flags;
 }
 
-static uint16_t lpr_control_fd_flags_from_linux(uint64_t flags)
+uint16_t lpr_control_fd_flags_from_linux(uint64_t flags)
 {
     return (flags & LPR_LINUX_O_CLOEXEC) != 0 ? LPR_FD_TABLE_FD_CLOEXEC : 0;
 }
 
-static uint16_t lpr_control_fd_flags_from_fcntl(uint64_t flags)
+uint16_t lpr_control_fd_flags_from_fcntl(uint64_t flags)
 {
     return (flags & LPR_LINUX_FD_CLOEXEC) != 0 ? LPR_FD_TABLE_FD_CLOEXEC : 0;
 }
 
-static uint32_t lpr_control_status_flags_from_linux(uint64_t flags)
+uint32_t lpr_control_status_flags_from_linux(uint64_t flags)
 {
     uint32_t status = 0;
     if ((flags & LPR_LINUX_O_NONBLOCK) != 0) {
@@ -109,7 +111,7 @@ static uint32_t lpr_control_status_flags_from_linux(uint64_t flags)
     return status;
 }
 
-static uint32_t lpr_control_status_flags_to_linux(uint32_t status)
+uint32_t lpr_control_status_flags_to_linux(uint32_t status)
 {
     uint32_t flags = 0;
     if ((status & LPR_FD_TABLE_STATUS_NONBLOCK) != 0) {
@@ -121,7 +123,7 @@ static uint32_t lpr_control_status_flags_to_linux(uint32_t status)
     return flags;
 }
 
-static uint32_t lpr_control_merge_legacy_flags(
+uint32_t lpr_control_merge_legacy_flags(
     uint32_t old_flags,
     uint16_t fd_flags,
     uint32_t status_flags)
@@ -137,7 +139,7 @@ static uint32_t lpr_control_merge_legacy_flags(
     return flags;
 }
 
-static int lpr_control_install_fd(
+int lpr_control_install_fd(
     uint64_t fd,
     uint8_t kind,
     uint64_t linux_flags,
@@ -168,14 +170,14 @@ static int lpr_control_install_fd(
         -LPR_LINUX_EMFILE;
 }
 
-static void lpr_control_close_fd(uint64_t fd)
+void lpr_control_close_fd(uint64_t fd)
 {
     if (fd < lpr_fd_table_capacity) {
         (void)lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd);
     }
 }
 
-static int lpr_control_fd_active(uint64_t fd)
+int lpr_control_fd_active(uint64_t fd)
 {
     if (fd >= lpr_fd_table_capacity) {
         return 0;
@@ -184,7 +186,7 @@ static int lpr_control_fd_active(uint64_t fd)
     return lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &fd_flags) == 0;
 }
 
-static int lpr_control_ensure_from_legacy(uint64_t fd)
+int lpr_control_ensure_from_legacy(uint64_t fd)
 {
     if (fd >= lpr_fd_table_capacity) {
         return -LPR_LINUX_EBADF;
@@ -239,7 +241,7 @@ static int lpr_control_ensure_from_legacy(uint64_t fd)
     return -LPR_LINUX_EBADF;
 }
 
-static int lpr_control_dup_fd(uint64_t old_fd, uint64_t new_fd, uint64_t cloexec)
+int lpr_control_dup_fd(uint64_t old_fd, uint64_t new_fd, uint64_t cloexec)
 {
     const int ensure_status = lpr_control_ensure_from_legacy(old_fd);
     if (ensure_status != 0) {
@@ -251,7 +253,7 @@ static int lpr_control_dup_fd(uint64_t old_fd, uint64_t new_fd, uint64_t cloexec
         -LPR_LINUX_EBADF;
 }
 
-static void lpr_control_sync_legacy_flags(uint64_t fd)
+void lpr_control_sync_legacy_flags(uint64_t fd)
 {
     if (fd >= lpr_fd_table_capacity) {
         return;
@@ -274,7 +276,7 @@ static void lpr_control_sync_legacy_flags(uint64_t fd)
     }
 }
 
-static int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags)
+int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags)
 {
     const int ensure_status = lpr_control_ensure_from_legacy(fd);
     if (ensure_status != 0) {
@@ -291,7 +293,7 @@ static int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags)
     return 0;
 }
 
-static int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
+int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
 {
     const int ensure_status = lpr_control_ensure_from_legacy(fd);
     if (ensure_status != 0) {
@@ -308,7 +310,7 @@ static int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
     return 0;
 }
 
-static int64_t lpr_control_get_fd_flags(uint64_t fd)
+int64_t lpr_control_get_fd_flags(uint64_t fd)
 {
     const int ensure_status = lpr_control_ensure_from_legacy(fd);
     if (ensure_status != 0) {
@@ -321,7 +323,7 @@ static int64_t lpr_control_get_fd_flags(uint64_t fd)
     return (fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? LPR_LINUX_FD_CLOEXEC : 0;
 }
 
-static int lpr_control_fd_cloexec(uint64_t fd, int *out_cloexec)
+int lpr_control_fd_cloexec(uint64_t fd, int *out_cloexec)
 {
     if (out_cloexec == 0) {
         return -LPR_LINUX_EFAULT;
@@ -338,7 +340,7 @@ static int lpr_control_fd_cloexec(uint64_t fd, int *out_cloexec)
     return 0;
 }
 
-static int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
+int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
 {
     const int ensure_status = lpr_control_ensure_from_legacy(fd);
     if (ensure_status != 0) {
@@ -351,7 +353,7 @@ static int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
     return (int64_t)(access_mode | lpr_control_status_flags_to_linux(status_flags));
 }
 
-static uint64_t lpr_filed_control_offset(uint64_t fd)
+uint64_t lpr_filed_control_offset(uint64_t fd)
 {
     uint64_t offset = 0;
     if (lpr_control_ensure_from_legacy(fd) == 0 &&
@@ -362,7 +364,7 @@ static uint64_t lpr_filed_control_offset(uint64_t fd)
     return lpr_fds[fd].offset;
 }
 
-static uint64_t lpr_control_fd_flags_to_lprs(uint64_t fd)
+uint64_t lpr_control_fd_flags_to_lprs(uint64_t fd)
 {
     uint16_t fd_flags = 0;
     if (fd >= lpr_fd_table_capacity ||
@@ -373,7 +375,7 @@ static uint64_t lpr_control_fd_flags_to_lprs(uint64_t fd)
     return (fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? LPRS_V2_FD_CLOEXEC : 0;
 }
 
-static uint64_t lpr_control_status_flags_to_lprs(uint64_t fd)
+uint64_t lpr_control_status_flags_to_lprs(uint64_t fd)
 {
     uint32_t status_flags = 0;
     if (fd >= lpr_fd_table_capacity ||
@@ -391,12 +393,12 @@ static uint64_t lpr_control_status_flags_to_lprs(uint64_t fd)
     return out;
 }
 
-static uint64_t lpr_lprs_fd_flags_to_linux(uint64_t fd_flags)
+uint64_t lpr_lprs_fd_flags_to_linux(uint64_t fd_flags)
 {
     return (fd_flags & LPRS_V2_FD_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0;
 }
 
-static uint64_t lpr_lprs_status_flags_to_linux(uint64_t status_flags)
+uint64_t lpr_lprs_status_flags_to_linux(uint64_t status_flags)
 {
     uint64_t out = 0;
     if ((status_flags & LPRS_V2_FILE_NONBLOCK) != 0) {
@@ -408,7 +410,7 @@ static uint64_t lpr_lprs_status_flags_to_linux(uint64_t status_flags)
     return out;
 }
 
-static void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset)
+void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset)
 {
     if (fd < lpr_fd_table_capacity) {
         lpr_fds[fd].offset = offset;
@@ -418,7 +420,7 @@ static void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset)
     }
 }
 
-static void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t amount)
+void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t amount)
 {
     const uint64_t new_offset = old_offset + amount;
     lpr_filed_control_set_offset(fd, new_offset);
@@ -427,7 +429,7 @@ static void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, u
     }
 }
 
-static int lpr_pipe_track_native_fd(uint64_t fd, const struct pacha_fd_info *info)
+int lpr_pipe_track_native_fd(uint64_t fd, const struct pacha_fd_info *info)
 {
     if (fd > LPR_LINUX_FD_MAX || info == 0) {
         return -LPR_LINUX_EMFILE;
@@ -454,7 +456,7 @@ static int lpr_pipe_track_native_fd(uint64_t fd, const struct pacha_fd_info *inf
     return 0;
 }
 
-static int lpr_fd_linux_visible_active(uint64_t fd)
+int lpr_fd_linux_visible_active(uint64_t fd)
 {
     if (lpr_fd_local_active(fd) || lpr_linux_socket_fd_active(fd)) {
         return 1;
@@ -463,7 +465,7 @@ static int lpr_fd_linux_visible_active(uint64_t fd)
     return lpr_native_fd_info(fd, &info) && info.kind == PACHA_FD_KIND_PIPE;
 }
 
-static int lpr_fd_alloc(uint64_t handle, uint64_t flags)
+int lpr_fd_alloc(uint64_t handle, uint64_t flags)
 {
     const int fd = lpr_fd_slot_alloc_from(3);
     if (fd < 0) {
@@ -489,12 +491,12 @@ static int lpr_fd_alloc(uint64_t handle, uint64_t flags)
     return fd;
 }
 
-static int lpr_fd_slot_alloc(void)
+int lpr_fd_slot_alloc(void)
 {
     return lpr_fd_slot_alloc_from(3);
 }
 
-static int lpr_fd_slot_available(uint64_t fd)
+int lpr_fd_slot_available(uint64_t fd)
 {
     lpr_fd_arrays_init();
     struct pacha_fd_info native_info;
@@ -506,7 +508,7 @@ static int lpr_fd_slot_available(uint64_t fd)
         !lpr_native_fd_info(fd, &native_info);
 }
 
-static int lpr_fd_slot_alloc_from(uint64_t min_fd)
+int lpr_fd_slot_alloc_from(uint64_t min_fd)
 {
     if (min_fd > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_EINVAL;
@@ -531,7 +533,7 @@ static int lpr_fd_slot_alloc_from(uint64_t min_fd)
     }
 }
 
-static int lpr_bootstrap_fd_desc_valid_common(const lpr_bootstrap_fd_t *desc, uint64_t *out_fd)
+int lpr_bootstrap_fd_desc_valid_common(const lpr_bootstrap_fd_t *desc, uint64_t *out_fd)
 {
     if (desc == 0 || out_fd == 0) {
         return 0;
@@ -547,7 +549,7 @@ static int lpr_bootstrap_fd_desc_valid_common(const lpr_bootstrap_fd_t *desc, ui
     return 1;
 }
 
-static int lpr_restore_bootstrap_filed_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+int lpr_restore_bootstrap_filed_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
         return 0;
@@ -567,7 +569,7 @@ static int lpr_restore_bootstrap_filed_fd(const lpr_bootstrap_fd_t *desc, uint64
         desc->offset_or_counter) == 0;
 }
 
-static int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
         return 0;
@@ -583,7 +585,7 @@ static int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t
         0) == 0;
 }
 
-static int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     struct pacha_fd_info info;
     if (!lpr_native_pipe_slot_claimable(fd, &info)) {
@@ -607,7 +609,7 @@ static int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_
     return 1;
 }
 
-static int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     if (!lpr_fd_slot_available(fd)) {
         return 0;
@@ -623,7 +625,7 @@ static int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64
         desc->offset_or_counter) == 0;
 }
 
-static int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
+int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
 {
     uint64_t fd = 0;
     if (!lpr_bootstrap_fd_desc_valid_common(desc, &fd)) {
@@ -643,7 +645,7 @@ static int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
     }
 }
 
-static int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t count)
+int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t count)
 {
     if (count != 0 && descs == 0) {
         return 0;
@@ -656,7 +658,7 @@ static int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t 
     return 1;
 }
 
-static int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count)
+int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count)
 {
     if (lpr_bootstrap_local_fds_installed) {
         return 1;

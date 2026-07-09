@@ -1,52 +1,46 @@
-static int lpr_pipe_fd_is_active(uint64_t fd);
-static int lpr_native_pipe_fd_info(uint64_t fd, struct pacha_fd_info *out);
-static int lpr_native_pipe_slot_claimable(uint64_t fd, struct pacha_fd_info *out);
-static int lpr_fd_slot_available(uint64_t fd);
-static int lpr_fd_slot_alloc_from(uint64_t min_fd);
-static int lpr_fd_table_ensure_capacity(uint64_t required_capacity);
-static int lpr_fd_table_ensure_fd(uint64_t fd);
-static int64_t lpr_pacha_status_to_errno(int64_t status);
+#include "../lpr_filed_internal.h"
 
-static int lpr_create_wire_page(void **out_page);
-static void lpr_destroy_wire_page(int page_fd, void *page);
-static int lpr_create_tty_wire_page(void **out_page);
-static void lpr_destroy_tty_wire_page(int page_fd, void *page);
-static void lpr_linux_process_state_init(void);
-static void lpr_linux_pump_tty_signals(void);
-static void lpr_linux_raise_sigpipe(void);
-static uint64_t lpr_linux_unblockable_signal_mask(void);
-static void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id);
-static void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored);
-static int64_t lpr_supervisor_call(
+
+int lpr_create_wire_page(void **out_page);
+void lpr_destroy_wire_page(int page_fd, void *page);
+int lpr_create_tty_wire_page(void **out_page);
+void lpr_destroy_tty_wire_page(int page_fd, void *page);
+void lpr_linux_process_state_init(void);
+void lpr_linux_pump_tty_signals(void);
+void lpr_linux_raise_sigpipe(void);
+uint64_t lpr_linux_unblockable_signal_mask(void);
+void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id);
+void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored);
+int64_t lpr_supervisor_call(
     uint32_t op,
     int page_fd,
     void *page,
     uint32_t payload_size,
     int transfer_fd,
     uint64_t *out_result);
-static int64_t lpr_supervisor_call_token(
+int64_t lpr_supervisor_call_token(
     uint32_t op,
     uint64_t token,
     int transfer_fd,
     uint64_t *out_result);
-static int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
-static int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state);
-static int lpr_supervisor_fd_table_replace(void);
-static int lpr_supervisor_fd_table_restore(uint64_t token);
-static int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
-static void lpr_pipe_after_fork_child(void);
-static void lpr_cwd_init(void);
-static int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
-static int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
-static int lpr_count_exec_local_fds(uint64_t *out_count);
-static void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd);
-static int lpr_prepare_exec_local_fds(
+int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
+int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state);
+int lpr_supervisor_fd_table_replace(void);
+int lpr_supervisor_fd_table_restore(uint64_t token);
+int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
+void lpr_pipe_after_fork_child(void);
+void lpr_cwd_init(void);
+int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
+int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
+int lpr_count_exec_local_fds(uint64_t *out_count);
+void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd);
+int lpr_prepare_exec_local_fds(
     filed_v2_exec_path_t *exec,
     lpr_exec_local_fd_table_t *local_table);
-static void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table);
-static int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
+void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table);
+int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
 
-static void lpr_filed_session_drop(void)
+void lpr_filed_session_drop(void)
 {
     if (lpr_session_page != 0) {
         (void)lpr_pacha_syscall2(
@@ -66,12 +60,7 @@ static void lpr_filed_session_drop(void)
     lpr_session_checked = 0;
     lpr_session_payload_busy = 0;
 }
-static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_result);
-static int64_t lpr_filed_close_handle(uint64_t handle);
-static int lpr_create_standalone_wire_page(void **out_page);
-static void lpr_destroy_standalone_wire_page(int fd, void *page);
-
-static void *lpr_session_payload_slot(uint64_t slot)
+void *lpr_session_payload_slot(uint64_t slot)
 {
     if (lpr_session_page == 0 || slot >= FILED_V2_FAST_PAYLOAD_SLOT_COUNT) {
         return 0;
@@ -81,7 +70,7 @@ static void *lpr_session_payload_slot(uint64_t slot)
         slot * FILED_V2_PAGE_BYTES);
 }
 
-static void lpr_zero_bytes(void *ptr, uint64_t len)
+void lpr_zero_bytes(void *ptr, uint64_t len)
 {
     unsigned char *p = (unsigned char *)ptr;
     while (len != 0) {
@@ -90,7 +79,7 @@ static void lpr_zero_bytes(void *ptr, uint64_t len)
     }
 }
 
-static void lpr_fd_arrays_init(void)
+void lpr_fd_arrays_init(void)
 {
     if (lpr_fd_table_capacity != 0) {
         return;
@@ -110,7 +99,7 @@ static void lpr_fd_arrays_init(void)
         LPR_FD_TABLE_INITIAL_SIZE);
 }
 
-static uint64_t lpr_align_up_pow2(uint64_t value, uint64_t align)
+uint64_t lpr_align_up_pow2(uint64_t value, uint64_t align)
 {
     const uint64_t mask = align - 1u;
     if (align == 0 || (align & mask) != 0 || value > UINT64_MAX - mask) {
@@ -119,7 +108,7 @@ static uint64_t lpr_align_up_pow2(uint64_t value, uint64_t align)
     return (value + mask) & ~mask;
 }
 
-static int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, uint64_t *out)
+int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, uint64_t *out)
 {
     if (out == 0 || capacity > UINT64_MAX / element_size) {
         return 0;
@@ -132,7 +121,7 @@ static int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, 
     return 1;
 }
 
-static int lpr_fd_table_layout(
+int lpr_fd_table_layout(
     uint64_t capacity,
     uint64_t *filed_offset,
     uint64_t *pipe_offset,
@@ -187,7 +176,7 @@ static int lpr_fd_table_layout(
     return 1;
 }
 
-static uint64_t lpr_fd_table_next_capacity(uint64_t required_capacity)
+uint64_t lpr_fd_table_next_capacity(uint64_t required_capacity)
 {
     lpr_fd_arrays_init();
     uint64_t capacity = lpr_fd_table_capacity;
@@ -207,7 +196,7 @@ static uint64_t lpr_fd_table_next_capacity(uint64_t required_capacity)
     return capacity;
 }
 
-static int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
+int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
 {
     lpr_fd_arrays_init();
     if (required_capacity <= lpr_fd_table_capacity) {
@@ -293,7 +282,7 @@ static int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
     return 0;
 }
 
-static int lpr_fd_table_ensure_fd(uint64_t fd)
+int lpr_fd_table_ensure_fd(uint64_t fd)
 {
     if (fd > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_EINVAL;
@@ -301,12 +290,12 @@ static int lpr_fd_table_ensure_fd(uint64_t fd)
     return lpr_fd_table_ensure_capacity(fd + 1u);
 }
 
-static void lpr_trace_clone_args(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid)
+void lpr_trace_clone_args(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid)
 {
     pacha_trace4(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_CLONE_ARGS, PACHA_TRACE_CLASS_STATE, flags, child_stack, parent_tid, child_tid);
 }
 
-static void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user_frame *frame, int64_t status)
+void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user_frame *frame, int64_t status)
 {
     if (frame == 0) {
         return;
@@ -324,7 +313,7 @@ static void lpr_trace_clone_frame(const char *event, const struct lpr_linux_user
     pacha_trace3(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_CLONE_FRAME, PACHA_TRACE_CLASS_STATE, frame->rax, frame->rdx, frame->rflags);
 }
 
-static void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t status)
+void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, int64_t status)
 {
     pacha_trace5(
         PACHA_TRACE_COMPONENT_LPR,
@@ -337,24 +326,24 @@ static void lpr_trace_process_event(const char *event, uint64_t a, uint64_t b, i
         (uint64_t)status);
 }
 
-static void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset)
+void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, uint64_t coalesced, uint64_t offset)
 {
     pacha_trace5(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_READV_SIZE, PACHA_TRACE_CLASS_DEBUG, fd, iov_count, requested, coalesced, offset);
 }
 
-static void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status)
+void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status)
 {
     pacha_trace3(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_READV_TO_VMO_STATUS, PACHA_TRACE_CLASS_DEBUG, fd, requested, (uint64_t)status);
 }
 
-static uint64_t lpr_readv_cache_total;
-static uint64_t lpr_readv_cache_coalesced;
-static uint64_t lpr_readv_cache_hit;
-static uint64_t lpr_readv_cache_fill;
-static uint64_t lpr_readv_cache_fallback;
-static uint64_t lpr_readv_cache_cross_page;
-static uint64_t lpr_readv_cache_to_vmo;
-static uint64_t lpr_readv_cache_bytes;
+uint64_t lpr_readv_cache_total;
+uint64_t lpr_readv_cache_coalesced;
+uint64_t lpr_readv_cache_hit;
+uint64_t lpr_readv_cache_fill;
+uint64_t lpr_readv_cache_fallback;
+uint64_t lpr_readv_cache_cross_page;
+uint64_t lpr_readv_cache_to_vmo;
+uint64_t lpr_readv_cache_bytes;
 
 void lpr_linux_readv_cache_trace_dump(void)
 {
@@ -376,10 +365,8 @@ void lpr_linux_readv_cache_trace_dump(void)
         lpr_readv_cache_to_vmo);
 }
 
-static int64_t lpr_pacha_status_to_errno(int64_t status)
+int64_t lpr_pacha_status_to_errno(int64_t status)
 {
     return pacha_kernel_status_to_errno(status);
 }
 
-#include "../lpr_fd/control.inc"
-#include "../lpr_pipe/io.inc"

@@ -1,3 +1,5 @@
+#include "../lpr_filed_internal.h"
+
 int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)
 {
     if (out_loaded != 0) {
@@ -597,7 +599,7 @@ int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     }
 }
 
-static uint8_t lpr_dtype_from_mode(uint64_t mode)
+uint8_t lpr_dtype_from_mode(uint64_t mode)
 {
     switch (mode & LPR_LINUX_S_IFMT) {
     case LPR_LINUX_S_IFIFO:
@@ -619,7 +621,7 @@ static uint8_t lpr_dtype_from_mode(uint64_t mode)
     }
 }
 
-static void lpr_write_linux_stat(void *statbuf, const filed_v2_statx_t *wire)
+void lpr_write_linux_stat(void *statbuf, const filed_v2_statx_t *wire)
 {
     lpr_linux_stat_t *st = (lpr_linux_stat_t *)statbuf;
     lpr_memset(st, 0, sizeof(*st));
@@ -747,7 +749,7 @@ int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64
     return lpr_linux_newfstatat(dirfd, path, (uint64_t)(uintptr_t)&statbuf, flags);
 }
 
-static int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw)
+int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw)
 {
     int64_t fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDWR, 0);
     if (fd == -LPR_LINUX_EISDIR) {
@@ -798,7 +800,7 @@ int64_t lpr_linux_fchmodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uin
     return status;
 }
 
-static int64_t lpr_linux_now(lpr_linux_timespec_t *out)
+int64_t lpr_linux_now(lpr_linux_timespec_t *out)
 {
     if (out == 0) {
         return -LPR_LINUX_EFAULT;
@@ -811,7 +813,7 @@ static int64_t lpr_linux_now(lpr_linux_timespec_t *out)
     return lpr_pacha_status_to_errno(status);
 }
 
-static int64_t lpr_linux_resolve_utime(
+int64_t lpr_linux_resolve_utime(
     const lpr_linux_timespec_t *input,
     const lpr_linux_timespec_t *now,
     uint64_t wire_bit,
@@ -851,7 +853,7 @@ static int64_t lpr_linux_resolve_utime(
     return 0;
 }
 
-static int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw)
+int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw)
 {
     const lpr_linux_timespec_t *times = (const lpr_linux_timespec_t *)(uintptr_t)times_raw;
     lpr_linux_timespec_t now;
@@ -963,7 +965,7 @@ int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
     return (int64_t)copy_len;
 }
 
-static uint16_t lpr_dirent_reclen(uint64_t name_len)
+uint16_t lpr_dirent_reclen(uint64_t name_len)
 {
     const uint64_t raw = 19u + name_len + 1u;
     return (uint16_t)((raw + 7u) & ~7ull);

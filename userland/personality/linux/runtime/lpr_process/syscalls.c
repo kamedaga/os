@@ -1,3 +1,5 @@
+#include "../lpr_filed_internal.h"
+
 int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
 {
     (void)parent_tid;

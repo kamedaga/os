@@ -1,4 +1,6 @@
-static int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+#include "../lpr_filed_internal.h"
+
+int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
     if (!lpr_fd_is_filed(fd)) {
         return -LPR_LINUX_EBADF;
@@ -84,7 +86,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_get(uint64_t fd, uint64_t of
     return lpr_page_cache_fill(fd, offset, requested);
 }
 
-static int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, uint64_t offset)
+int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, uint64_t offset)
 {
     if (requested == 0) {
         return 0;

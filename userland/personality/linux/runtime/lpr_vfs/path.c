@@ -1,4 +1,6 @@
-static int64_t lpr_filed_endpoint_ready(void)
+#include "../lpr_filed_internal.h"
+
+int64_t lpr_filed_endpoint_ready(void)
 {
     if (lpr_filed_endpoint_checked > 0) {
         return 0;
@@ -22,7 +24,7 @@ static int64_t lpr_filed_endpoint_ready(void)
     return 0;
 }
 
-static int64_t lpr_filed_session_connect(void)
+int64_t lpr_filed_session_connect(void)
 {
     if (lpr_session_fd >= 16 &&
         lpr_session_page_fd >= 16 &&
@@ -215,7 +217,7 @@ static int64_t lpr_filed_session_connect(void)
     return 0;
 }
 
-static int64_t lpr_filed_fast_call(uint32_t op, uint64_t word2, uint64_t *out_result)
+int64_t lpr_filed_fast_call(uint32_t op, uint64_t word2, uint64_t *out_result)
 {
     if (lpr_filed_session_connect() != 0 ||
         lpr_session_fd < 16 ||
@@ -305,7 +307,7 @@ static int64_t lpr_filed_fast_call(uint32_t op, uint64_t word2, uint64_t *out_re
     return 0;
 }
 
-static int lpr_create_wire_page(void **out_page)
+int lpr_create_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
@@ -361,7 +363,7 @@ static int lpr_create_wire_page(void **out_page)
     return (int)fd;
 }
 
-static void lpr_destroy_wire_page(int fd, void *page)
+void lpr_destroy_wire_page(int fd, void *page)
 {
     if (fd == lpr_session_page_fd && page == lpr_session_payload_slot(0)) {
         lpr_session_payload_busy = 0;
@@ -379,7 +381,7 @@ static void lpr_destroy_wire_page(int fd, void *page)
     }
 }
 
-static int lpr_create_tty_wire_page(void **out_page)
+int lpr_create_tty_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
@@ -423,7 +425,7 @@ static int lpr_create_tty_wire_page(void **out_page)
     return (int)fd;
 }
 
-static void lpr_destroy_tty_wire_page(int fd, void *page)
+void lpr_destroy_tty_wire_page(int fd, void *page)
 {
     if (fd == lpr_tty_wire_page_fd && page == lpr_tty_wire_page) {
         lpr_tty_wire_page_busy = 0;
@@ -437,7 +439,7 @@ static void lpr_destroy_tty_wire_page(int fd, void *page)
     }
 }
 
-static int lpr_create_standalone_wire_page(void **out_page)
+int lpr_create_standalone_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
@@ -472,7 +474,7 @@ static int lpr_create_standalone_wire_page(void **out_page)
     return (int)fd;
 }
 
-static void lpr_destroy_standalone_wire_page(int fd, void *page)
+void lpr_destroy_standalone_wire_page(int fd, void *page)
 {
     if (page != 0) {
         (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)page, FILED_V2_PAGE_BYTES);
@@ -482,12 +484,12 @@ static void lpr_destroy_standalone_wire_page(int fd, void *page)
     }
 }
 
-static void *lpr_supervisor_payload(void *page)
+void *lpr_supervisor_payload(void *page)
 {
     return lpr_process_client_payload(page);
 }
 
-static int64_t lpr_supervisor_call(
+int64_t lpr_supervisor_call(
     uint32_t op,
     int page_fd,
     void *page,
@@ -506,7 +508,7 @@ static int64_t lpr_supervisor_call(
         out_result);
 }
 
-static int64_t lpr_supervisor_call_token(
+int64_t lpr_supervisor_call_token(
     uint32_t op,
     uint64_t token,
     int transfer_fd,
@@ -523,7 +525,7 @@ static int64_t lpr_supervisor_call_token(
         out_result);
 }
 
-static int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered)
+int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered)
 {
     if (!lpr_supervisor_enabled || lpr_supervisor_token == 0 || sig > LPR_LINUX_SIGNAL_MAX) {
         return -LPR_LINUX_EINVAL;
@@ -552,7 +554,7 @@ static int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_
     return status;
 }
 
-static int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state)
+int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state)
 {
     if (out_state == 0 || lpr_supervisor_token == 0) {
         return -LPR_LINUX_EINVAL;
@@ -579,16 +581,15 @@ static int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state)
     return status == 0 ? 0 : (int)status;
 }
 
-#include "../lpr_process/supervisor_fd_snapshot_glue.inc"
 
-static int lpr_supervisor_fd_table_restore(uint64_t token)
+int lpr_supervisor_fd_table_restore(uint64_t token)
 {
     lpr_supervisor_fd_snapshot_ops_t ops;
     lpr_supervisor_snapshot_ops(&ops);
     return lpr_supervisor_fd_snapshot_restore(token, &ops, 0);
 }
 
-static int lpr_create_pread_vmo_wire_page(void **out_page)
+int lpr_create_pread_vmo_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
@@ -617,7 +618,7 @@ static int lpr_create_pread_vmo_wire_page(void **out_page)
     return fd;
 }
 
-static void lpr_destroy_pread_vmo_wire_page(int fd, void *page)
+void lpr_destroy_pread_vmo_wire_page(int fd, void *page)
 {
     if (fd == lpr_pread_vmo_page_fd && page == lpr_pread_vmo_page) {
         lpr_pread_vmo_page_busy = 0;
@@ -626,7 +627,7 @@ static void lpr_destroy_pread_vmo_wire_page(int fd, void *page)
     lpr_destroy_standalone_wire_page(fd, page);
 }
 
-static uint64_t lpr_page_align_up(uint64_t value)
+uint64_t lpr_page_align_up(uint64_t value)
 {
     const uint64_t mask = 4095ull;
     if (value > UINT64_MAX - mask) {
@@ -635,7 +636,7 @@ static uint64_t lpr_page_align_up(uint64_t value)
     return (value + mask) & ~mask;
 }
 
-static int64_t lpr_readv_scratch_vmo(uint64_t requested, int *out_fd, unsigned char **out_map, uint64_t *out_len)
+int64_t lpr_readv_scratch_vmo(uint64_t requested, int *out_fd, unsigned char **out_map, uint64_t *out_len)
 {
     if (out_fd == 0 || out_map == 0 || out_len == 0) {
         return -LPR_LINUX_EINVAL;
@@ -703,7 +704,7 @@ static int64_t lpr_readv_scratch_vmo(uint64_t requested, int *out_fd, unsigned c
     return 0;
 }
 
-static uint64_t lpr_scatter_iov(
+uint64_t lpr_scatter_iov(
     const lpr_linux_iovec_t *iov,
     uint64_t iov_count,
     const unsigned char *src,
@@ -724,7 +725,7 @@ static uint64_t lpr_scatter_iov(
     return copied;
 }
 
-static lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(
+lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(
     uint64_t handle,
     uint64_t offset,
     uint64_t requested)
@@ -758,7 +759,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(
     return 0;
 }
 
-static lpr_filed_page_cache_entry_t *lpr_page_cache_find_marker(uint64_t handle, uint64_t page_start)
+lpr_filed_page_cache_entry_t *lpr_page_cache_find_marker(uint64_t handle, uint64_t page_start)
 {
     if (handle == 0) {
         return 0;
@@ -777,7 +778,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_find_marker(uint64_t handle,
     return 0;
 }
 
-static lpr_filed_page_cache_entry_t *lpr_page_cache_slot(void)
+lpr_filed_page_cache_entry_t *lpr_page_cache_slot(void)
 {
     uint64_t slot = 0;
     uint64_t oldest = UINT64_MAX;
@@ -793,7 +794,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_slot(void)
     return &lpr_page_cache[slot];
 }
 
-static int64_t lpr_filed_v2_payload_size(uint32_t op, uint32_t *out_payload_size)
+int64_t lpr_filed_v2_payload_size(uint32_t op, uint32_t *out_payload_size)
 {
     if (out_payload_size == 0) {
         return -LPR_LINUX_EINVAL;
@@ -866,7 +867,7 @@ static int64_t lpr_filed_v2_payload_size(uint32_t op, uint32_t *out_payload_size
     }
 }
 
-static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_result)
+int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_result)
 {
     if (page_fd == lpr_session_page_fd && lpr_session_page != 0) {
         return lpr_filed_fast_call(op, word2, out_result);
@@ -1096,4 +1097,3 @@ static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t
     return 0;
 }
 
-#include "ops.inc"
