@@ -146,6 +146,8 @@ typedef enum koboxd_ext4_child_create_kind {
 } koboxd_ext4_child_create_kind_t;
 
 typedef struct koboxd_readdir_scan_entry {
+    uint64_t inode_number;
+    uint16_t mode;
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
 } koboxd_readdir_scan_entry_t;
 
@@ -804,7 +806,26 @@ static int fs_create_child_object(
     return 0;
 }
 
-static int fs_readdir_scan_add(koboxd_readdir_scan_t *scan, const char *name, size_t name_len)
+static uint16_t fs_mode_from_ext4_dirent_type(uint8_t file_type)
+{
+    switch (file_type) {
+    case 1: return 0100000u;
+    case 2: return 0040000u;
+    case 3: return 0020000u;
+    case 4: return 0060000u;
+    case 5: return 0010000u;
+    case 6: return 0140000u;
+    case 7: return 0120000u;
+    default: return 0;
+    }
+}
+
+static int fs_readdir_scan_add(
+    koboxd_readdir_scan_t *scan,
+    const char *name,
+    size_t name_len,
+    uint64_t inode_number,
+    uint8_t file_type)
 {
     if (scan == NULL || name == NULL || name_len == 0) {
         return 1;
@@ -824,8 +845,11 @@ static int fs_readdir_scan_add(koboxd_readdir_scan_t *scan, const char *name, si
     if (copy_len >= KOBOXD_FS_BACKEND_NAME_BYTES) {
         copy_len = KOBOXD_FS_BACKEND_NAME_BYTES - 1u;
     }
-    memcpy(scan->entries[scan->count].name, name, copy_len);
-    scan->entries[scan->count].name[copy_len] = '\0';
+    koboxd_readdir_scan_entry_t *entry = &scan->entries[scan->count];
+    entry->inode_number = inode_number;
+    entry->mode = fs_mode_from_ext4_dirent_type(file_type);
+    memcpy(entry->name, name, copy_len);
+    entry->name[copy_len] = '\0';
     scan->count++;
     return 1;
 }
@@ -840,6 +864,7 @@ static int fs_scan_ext4_dirent_block(
         const uint32_t ino = read_u32_field(block + offset, 0);
         const uint16_t rec_len = read_u16_field(block + offset, 4);
         const uint8_t name_len = block[offset + 6];
+        const uint8_t file_type = block[offset + 7];
         if (rec_len < KOBOXD_EXT4_DIRENT_HEADER_BYTES ||
             offset + rec_len > bytes)
         {
@@ -851,7 +876,9 @@ static int fs_scan_ext4_dirent_block(
             if (!fs_readdir_scan_add(
                     scan,
                     (const char *)block + offset + KOBOXD_EXT4_DIRENT_HEADER_BYTES,
-                    name_len))
+                    name_len,
+                    ino,
+                    file_type))
             {
                 return scan->overflow ? -12 : 0;
             }
@@ -911,25 +938,47 @@ static int fs_scan_ext4_dir_names(
     return scan->overflow ? -12 : 0;
 }
 
-static int fs_populate_dir_cache_from_ext4(
+static int fs_scanned_dirent_to_object(
     koboxd_fs_backend_t *backend,
     const koboxd_ext4_operations_t *ops,
-    koboxd_fs_object_t *dir)
+    koboxd_fs_object_t *dir,
+    const koboxd_readdir_scan_entry_t *entry,
+    koboxd_fs_object_t *out_object)
 {
-    if (backend == NULL || ops == NULL || dir == NULL) {
+    if (backend == NULL || ops == NULL || dir == NULL || entry == NULL || out_object == NULL) {
         return -22;
     }
-    koboxd_readdir_scan_t scan;
-    int status = fs_scan_ext4_dir_names(ops, dir, &scan);
-    if (status != 0) {
-        return status;
+
+    koboxd_fs_object_t *cached = fs_object_by_parent_name(backend, dir->object_id, entry->name);
+    if (cached != NULL) {
+        *out_object = *cached;
+        return 0;
     }
-    for (size_t i = 0; i < scan.count; i++) {
-        koboxd_fs_object_t *object = NULL;
-        status = fs_lookup_or_cache_child(backend, ops, dir, scan.entries[i].name, &object);
-        if (status != 0 && status != -2) {
+
+    /* Directory enumeration must not materialize a backend object capability. */
+    memset(out_object, 0, sizeof(*out_object));
+    out_object->parent_object_id = dir->object_id;
+    out_object->inode_number = entry->inode_number;
+    out_object->mode = entry->mode;
+    out_object->used = 1;
+    out_object->linked = 1;
+    snprintf(out_object->name, sizeof(out_object->name), "%s", entry->name);
+    if (out_object->mode == 0) {
+        void *inode = NULL;
+        void *dentry = NULL;
+        const int status = ext4_lookup_name_at(
+            ops,
+            dir->inode,
+            dir->dentry,
+            entry->name,
+            &inode,
+            &dentry);
+        if (status != 0) {
             return status;
         }
+        out_object->inode_number = read_u64_field(inode, KOBOXD_INODE_NUMBER_OFFSET);
+        out_object->mode = read_u16_field(inode, KOBOXD_INODE_MODE_OFFSET);
+        fs_discard_unregistered_lookup(inode, dentry);
     }
     return 0;
 }
@@ -1993,25 +2042,24 @@ int koboxd_fs_backend_getdents(
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    int populate_status = fs_populate_dir_cache_from_ext4(backend, &ops, dir);
-    if (populate_status != 0) {
-        return populate_status;
+    koboxd_readdir_scan_t scan;
+    int scan_status = fs_scan_ext4_dir_names(&ops, dir, &scan);
+    if (scan_status != 0) {
+        return scan_status;
     }
-
-    size_t skipped = 0;
-    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS && *out_count < capacity; i++) {
-        if (!backend->objects[i].used ||
-            !backend->objects[i].linked ||
-            backend->objects[i].object_id == dir_object_id ||
-            backend->objects[i].parent_object_id != dir_object_id)
-        {
-            continue;
+    if (offset >= scan.count) {
+        return 0;
+    }
+    for (size_t i = (size_t)offset; i < scan.count && *out_count < capacity; i++) {
+        const int status = fs_scanned_dirent_to_object(
+            backend,
+            &ops,
+            dir,
+            &scan.entries[i],
+            &out_entries[*out_count]);
+        if (status != 0) {
+            return status;
         }
-        if (skipped < offset) {
-            skipped++;
-            continue;
-        }
-        out_entries[*out_count] = backend->objects[i];
         *out_count += 1;
     }
     return 0;

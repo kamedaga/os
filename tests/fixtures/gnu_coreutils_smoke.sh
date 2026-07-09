@@ -28,6 +28,46 @@ run_case() {
   check "$name" "$want" "$got"
 }
 
+echo "GNUCU_GETDENTS_CWD=BEGIN"
+cd /
+getdents_root=FAIL
+getdents_cd=FAIL
+getdents_cwd=FAIL
+if ls >/dev/null; then
+  getdents_root=OK
+fi
+echo "GNUCU_GETDENTS_ROOT=$getdents_root"
+if cd /bin; then
+  getdents_cd=OK
+fi
+echo "GNUCU_GETDENTS_CD=$getdents_cd"
+if ls >/dev/null; then
+  getdents_cwd=OK
+fi
+echo "GNUCU_GETDENTS_DOT=$getdents_cwd"
+if [ "$getdents_root" = OK ] && [ "$getdents_cd" = OK ] && [ "$getdents_cwd" = OK ]; then
+  echo "GNUCU_GETDENTS_CWD=OK"
+else
+  echo "GNUCU_GETDENTS_CWD=FAIL"
+fi
+cd /
+
+echo "GNUCU_GETDENTS_MULTIBATCH=BEGIN"
+: >"$out"
+if /bin/ls -1 /bin >"$out" 2>/dev/null; then
+  entries=0
+  while IFS= read -r entry; do
+    entries=$((entries + 1))
+  done <"$out"
+  if [ "${entries:-0}" -gt 16 ]; then
+    echo "GNUCU_GETDENTS_MULTIBATCH=OK entries=$entries"
+  else
+    echo "GNUCU_GETDENTS_MULTIBATCH=FAIL entries=${entries:-0}"
+  fi
+else
+  echo "GNUCU_GETDENTS_MULTIBATCH=FAIL ls"
+fi
+
 run_case "GNUCU_CASE1" "1"   "/bin/coreutils --version | /usr/bin/head -n 1 | /usr/bin/wc -l"
 run_case "GNUCU_CASE2" "ok"  "/bin/ls --version | /usr/bin/head -n 1 | $bb grep -q 'GNU coreutils' && /bin/echo ok"
 run_case "GNUCU_CASE3" "gnu" "/bin/echo gnu | /bin/cat"
