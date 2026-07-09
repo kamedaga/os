@@ -116,7 +116,7 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 **T1.1 [kernel] リソースリーク耐久テスト (VMO/プロセスライフサイクルの実証)**
 - 前提修正 (2026-07-09 調査): hikitugi.md の cap-tree revoke 問題 (`revokeVmObjectCapTree`) は FD-based 再設計で既に存在しない。現行は `NativeVmoSlot` の refcount + 親チェーン解放。よって本タスクは意味論変更ではなく「現行モデルにリークがないことの実証と、見つかったリークの修正」。
 - kernel の空きページ数・使用中 VMO/fd/process スロット数を userland から読める診断手段を用意 (既存の観測経路があればそれを使い、なければ最小の診断 syscall or ログを追加)。
-- QEMU スモークとして「fork/exec を N 回 (busybox 実行 ×20 以上) 繰り返し、空きページ数が定常状態に収束する (単調減少しない)」テストを `tests/` に追加。
+- QEMU スモークとして「fork/exec を N 回 (20 回以上) 繰り返し、空きページ数が定常状態に収束する (単調減少しない)」テストを `tests/` に追加。ワークロードは rootfs 同梱の chibicc コンパイルサイクル (`/cmd/chibicc.elf` で `/cmd/chibicc_workload.c` をコンパイル → as → ld → 実行) を第一候補とし、clang 復旧 (T4.5) までの代理負荷とする。
 - 見つかったリーク (VMO, fd, IPC, process slot) は修正する。
 - 受け入れ: 新規耐久スモーク通過 + 既存スモーク 3 本通過。将来 clang が動くようになったら T4.5 で同型のテストを clang に差し替える。
 
@@ -184,9 +184,10 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - `epoll_create1/epoll_ctl/epoll_wait` を kernel `fd_wait_many` の上に LPR 内で実装 (kernel 変更なし)。
 - 受け入れ: pipe/socket/eventfd 混在の epoll 新規スモーク。
 
-**T4.5 clang 耐久テスト (T1.1 の検収)**
-- `tests/` に clang N 回連続コンパイル (chibicc でも可) + free page 監視のスモークを追加し CI 化。
-- 受け入れ: 10 回連続成功、ページリークなし。
+**T4.5 clang 復旧 + 耐久テスト (T1.1 の検収)**
+- clang は FD-based 再設計前に動いていた (hikitugi.md) が、再設計後の rootfs には未導入。まず clang を rootfs に導入し、`clang --version` → 小さな .c のコンパイル → 実行、の順で復旧させる。動かない箇所は Phase 1〜3 で整理した構造の上で修正する。
+- T1.1 の耐久スモーク (chibicc コンパイルループ) を clang 版に差し替え/併設し CI 化。
+- 受け入れ: clang でのコンパイル 10 回連続成功、ページリークなし。これが本リファクタリング全体の完了基準。
 
 ### Phase 5 — プロトコル刷新
 
