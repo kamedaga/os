@@ -788,6 +788,10 @@ apps:
     file: "musl/pachaos/smoke/chibicc_workload.c"
     out: "CHIBIWORK.C"
     rootfs: "/cmd/chibicc_workload.c"
+  pipe_stress_script:
+    file: "tests/fixtures/pipe_stress.sh"
+    out: "PIPESTRS.SH"
+    rootfs: "/cmd/pipe_stress.sh"
   chibicc_toolchain_root:
     file:
       path: ".artifacts/userland-fixtures/lpr-chibicc-toolchain-root"
