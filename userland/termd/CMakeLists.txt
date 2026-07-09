@@ -40,7 +40,7 @@ set(LINUX_TTY_SOURCES
 
 set(KOBOX_RUNTIME_SOURCES
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
-  "${REPO_ROOT}/userland/libipc/src/error_conveyor.c"
+  "${REPO_ROOT}/userland/libipc/src/status.c"
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
   "${REPO_ROOT}/userland/libpacha/src/trace.c"
@@ -123,7 +123,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol_v2.h"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol_v2.h"
-    "${REPO_ROOT}/userland/libipc/include/pacha/error_conveyor.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.h"

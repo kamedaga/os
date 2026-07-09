@@ -6,6 +6,7 @@
 #include "support/string.h"
 #include "support/syscall.h"
 #include <pacha/ipc.h>
+#include <pacha/status.h>
 #include <pacha/trace.h>
 #include <pachaos/abi.h>
 #include <personality/linux_lpr.h>
@@ -581,31 +582,7 @@ static void lpr_file_map_cache_store(uint64_t handle, int64_t vmo_fd, uint64_t l
 
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status)
 {
-    if (status == 0) {
-        return status;
-    }
-    int negative = 0;
-    if (status < 0) {
-        negative = 1;
-        status = -status;
-    }
-    if (status > PACHAOS_SYSCALL_ERR_CLOSED) {
-        return negative ? -status : status;
-    }
-    switch (status) {
-    case PACHAOS_SYSCALL_ERR_INVALID:
-        return -LPR_LINUX_EINVAL;
-    case PACHAOS_SYSCALL_ERR_ALLOC:
-    case PACHAOS_SYSCALL_ERR_MAP:
-        return -LPR_LINUX_ENOMEM;
-    case PACHAOS_SYSCALL_ERR_NOT_READY:
-    case PACHAOS_SYSCALL_ERR_EMPTY:
-        return -LPR_LINUX_EAGAIN;
-    case PACHAOS_SYSCALL_ERR_CLOSED:
-        return -LPR_LINUX_EPIPE;
-    default:
-        return -LPR_LINUX_EINVAL;
-    }
+    return pacha_kernel_status_to_errno(status);
 }
 
 static uint64_t lpr_linux_prot_to_pacha(uint64_t prot)

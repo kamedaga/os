@@ -4,16 +4,13 @@
 #include "termd/ipc_protocol_v2.h"
 
 #include <pacha/abi.h>
-#include <pacha/error_conveyor.h>
 #include <pacha/service_abi.h>
+#include <pacha/status.h>
 #include <pacha/trace.h>
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-static pacha_errconv_store_t g_error_store;
-static int g_error_store_ready;
 
 static void *termd_map_page(int page_fd)
 {
@@ -28,15 +25,6 @@ static void *termd_map_page(int page_fd)
         0);
 }
 
-static pacha_errconv_store_t *termd_errors(void)
-{
-    if (!g_error_store_ready) {
-        pacha_errconv_store_init(&g_error_store, PACHA_ERRCONV_COMPONENT_TERMD);
-        g_error_store_ready = 1;
-    }
-    return &g_error_store;
-}
-
 static uint64_t termd_error_token(
     int64_t status,
     uint64_t op,
@@ -48,18 +36,25 @@ static uint64_t termd_error_token(
     uint64_t child_token,
     const char *text)
 {
-    return pacha_errconv_error_token(
-        termd_errors(),
-        status,
-        PACHA_ERRCONV_DOMAIN_TERMD_STATUS,
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_GENERIC_ERROR,
+        PACHA_TRACE_CLASS_ERROR,
         op,
         stage,
-        raw_status,
+        (uint64_t)status,
+        (uint64_t)raw_status,
         request_id,
-        fd_count,
+        fd_count);
+    pacha_trace4(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_GENERIC_ERROR,
+        PACHA_TRACE_CLASS_ERROR,
         subject,
         child_token,
-        text);
+        text != NULL ? pacha_trace_name_id(text) : 0,
+        0);
+    return 0;
 }
 
 static int termd_send_reply_with_error(
@@ -74,12 +69,12 @@ static int termd_send_reply_with_error(
     uint64_t stage,
     const char *fallback_text)
 {
-    uint64_t token = error_token;
-    if (status < 0 && token == 0 && op != TERMD_V2_OP_DIAG_ERROR_GET) {
-        token = termd_error_token(
+    (void)error_token;
+    if (status < 0 && op != TERMD_V2_OP_DIAG_ERROR_GET) {
+        (void)termd_error_token(
             status,
             op,
-            stage != PACHA_ERRCONV_STAGE_NONE ? stage : PACHA_ERRCONV_STAGE_STATUS_MAP,
+            stage != PACHA_STATUS_STAGE_NONE ? stage : PACHA_STATUS_STAGE_STATUS_MAP,
             status,
             request_id,
             0,
@@ -93,13 +88,13 @@ static int termd_send_reply_with_error(
             request_header,
             status,
             PACHA_SERVICE_ERROR_TERMD_TTY,
-            status < 0 ? token : result,
+            status < 0 ? 0 : result,
             0);
     }
     struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
-        .word2 = status < 0 ? token : result,
+        .word2 = status < 0 ? 0 : result,
         .word3 = request_id,
     };
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
@@ -109,18 +104,18 @@ static int termd_send_reply_with_error(
 
 static int termd_send_reply(int reply_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
-    const uint64_t token = status < 0 ?
-        termd_error_token(
+    if (status < 0) {
+        (void)termd_error_token(
             status,
             0,
-            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            PACHA_STATUS_STAGE_STATUS_MAP,
             status,
             request_id,
             0,
             0,
             0,
-            "termd negative reply") :
-        0;
+            "termd negative reply");
+    }
     return termd_send_reply_with_error(
         reply_fd,
         NULL,
@@ -128,9 +123,9 @@ static int termd_send_reply(int reply_fd, uint64_t request_id, int64_t status, u
         request_id,
         status,
         result,
-        token,
         0,
-        PACHA_ERRCONV_STAGE_STATUS_MAP,
+        0,
+        PACHA_STATUS_STAGE_STATUS_MAP,
         "termd negative reply");
 }
 
@@ -262,7 +257,7 @@ static int termd_dispatch_register_signal_supervisor(
         error_token = termd_error_token(
             status,
             TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR,
-            PACHA_ERRCONV_STAGE_VALIDATION,
+            PACHA_STATUS_STAGE_VALIDATION,
             status,
             header != NULL ? header->request_id : 0,
             request != 0 ? request->fd_count : 0,
@@ -287,7 +282,7 @@ static int termd_dispatch_register_signal_supervisor(
         result,
         error_token,
         TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR,
-        status < 0 ? PACHA_ERRCONV_STAGE_VALIDATION : PACHA_ERRCONV_STAGE_NONE,
+        status < 0 ? PACHA_STATUS_STAGE_VALIDATION : PACHA_STATUS_STAGE_NONE,
         "register signal supervisor failed");
 }
 
@@ -472,7 +467,7 @@ int termd_service_dispatch_request(
         const uint64_t token = termd_error_token(
             -5,
             0,
-            PACHA_ERRCONV_STAGE_MAP_PAGE,
+            PACHA_STATUS_STAGE_MAP_PAGE,
             -5,
             request->word3,
             request->fd_count,
@@ -489,7 +484,7 @@ int termd_service_dispatch_request(
             0,
             token,
             0,
-            PACHA_ERRCONV_STAGE_MAP_PAGE,
+            PACHA_STATUS_STAGE_MAP_PAGE,
             "request page map failed");
     }
 
@@ -513,11 +508,7 @@ int termd_service_dispatch_request(
 
     void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
     if (header.op == TERMD_V2_OP_DIAG_ERROR_GET) {
-        const termd_v2_handle_request_t *diag = (const termd_v2_handle_request_t *)payload;
-        const uint64_t token = header.payload_size >= sizeof(*diag) ? diag->arg0 : 0;
-        const int status = token == 0 ?
-            TERMD_ERR_INVAL :
-            pacha_errconv_export(termd_errors(), token, payload, TERMD_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
+        const int status = PACHA_STATUS_ENOTSUP;
         termd_close_received_fds(request, fds, reply_fd, -1);
         const int reply_status = termd_send_reply_with_error(
             reply_fd,
@@ -528,7 +519,7 @@ int termd_service_dispatch_request(
             0,
             0,
             TERMD_V2_OP_DIAG_ERROR_GET,
-            status < 0 ? PACHA_ERRCONV_STAGE_ERROR_GET : PACHA_ERRCONV_STAGE_NONE,
+            PACHA_STATUS_STAGE_DIAGNOSTIC,
             "error get export failed");
         (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
         return reply_status;
@@ -561,7 +552,7 @@ int termd_service_dispatch_request(
         termd_error_token(
             status,
             header.op,
-            PACHA_ERRCONV_STAGE_DISPATCH_ENTRY,
+            PACHA_STATUS_STAGE_DISPATCH,
             status,
             header.request_id,
             request->fd_count,
@@ -578,7 +569,7 @@ int termd_service_dispatch_request(
         result,
         token,
         header.op,
-        PACHA_ERRCONV_STAGE_DISPATCH_ENTRY,
+        PACHA_STATUS_STAGE_DISPATCH,
         "termd dispatch failed");
     (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
     return reply_status;

@@ -1,4 +1,3 @@
-#include "pacha/error_conveyor.h"
 #include "pacha/ipc.h"
 #include "pacha/service_abi.h"
 #include "pacha/syscall.h"
@@ -1537,176 +1536,20 @@ static void seed0root_destroy_filed_v2_page(int fd, void *mapped)
 
 static void seed0root_dump_filed_error_token(int endpoint_fd, uint64_t token, const char *context)
 {
-    if (endpoint_fd < 16 || token == 0) {
-        return;
-    }
-    int page_fd = -1;
-    void *page = NULL;
-    if (seed0root_create_wire_page(PACHA_SERVICE_PAGE_BYTES, &page_fd, &page) != 0) {
-        return;
-    }
-
-    const uint64_t request_id = 0x45525246494c0000ull ^ token ^ FILED_V2_OP_DIAG_ERROR_GET;
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
-    memset(header, 0, sizeof(*header));
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
-    header->op = FILED_V2_OP_DIAG_ERROR_GET;
-    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD | PACHA_SERVICE_FLAG_DIAGNOSTIC;
-    header->request_id = request_id;
-    header->trace_id = request_id;
-    header->payload_size = sizeof(filed_v2_diag_request_t);
-    filed_v2_diag_request_t *payload =
-        (filed_v2_diag_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
-    payload->subject = token;
-
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)page_fd;
-    fd_item.rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word1 = 0,
-        .word2 = 0,
-        .word3 = request_id,
-        .fds = &fd_item,
-        .fd_count = 1,
-    };
-    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
-    if (reply_fd < 16) {
-        fprintf(stderr,
-            "[seed0root] filed v2 error-get call failed context=%s token=0x%llx status=%d\n",
-            context != NULL ? context : "unknown",
-            (unsigned long long)token,
-            reply_fd);
-        seed0root_destroy_wire_page(PACHA_SERVICE_PAGE_BYTES, page_fd, page);
-        return;
-    }
-
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
-    if (recv_status != 0 ||
-        reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        reply.word3 != request_id ||
-        reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
-        reply_header->op != FILED_V2_OP_DIAG_ERROR_GET ||
-        reply_header->request_id != request_id ||
-        reply_header->status != 0)
-    {
-        fprintf(stderr,
-            "[seed0root] filed v2 error-get failed context=%s token=0x%llx recv=%d magic=0x%llx status=%lld request=0x%llx\n",
-            context != NULL ? context : "unknown",
-            (unsigned long long)token,
-            recv_status,
-            (unsigned long long)reply.word0,
-            (long long)reply_header->status,
-            (unsigned long long)reply.word3);
-        seed0root_destroy_wire_page(PACHA_SERVICE_PAGE_BYTES, page_fd, page);
-        return;
-    }
-
-    (void)pacha_errconv_dump_page_to_fd(
-        2,
-        context != NULL ? context : "[seed0root:filed-error]",
-        (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
-        PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
-    seed0root_destroy_wire_page(PACHA_SERVICE_PAGE_BYTES, page_fd, page);
+    (void)endpoint_fd;
+    (void)token;
+    fprintf(stderr,
+        "[seed0root] filed negative reply context=%s; detailed error trace is emitted by service\n",
+        context != NULL ? context : "unknown");
 }
 
 static void seed0root_dump_lprs_error_token(int endpoint_fd, uint64_t token, const char *context)
 {
-    if (endpoint_fd < 16 || token == 0) {
-        return;
-    }
-    int page_fd = -1;
-    void *page = NULL;
-    if (seed0root_create_wire_page(PACHA_SERVICE_PAGE_BYTES, &page_fd, &page) != 0) {
-        return;
-    }
-
-    const uint64_t request_id = 0x4552524c50530000ull ^ token ^ LPRS_V2_OP_DIAG_ERROR_GET;
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
-    memset(header, 0, sizeof(*header));
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = LPRS_V2_SERVICE_ID;
-    header->op = LPRS_V2_OP_DIAG_ERROR_GET;
-    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD | PACHA_SERVICE_FLAG_DIAGNOSTIC;
-    header->request_id = request_id;
-    header->trace_id = request_id;
-    header->payload_size = sizeof(lprs_v2_diag_error_get_t);
-    lprs_v2_diag_error_get_t *payload =
-        (lprs_v2_diag_error_get_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
-    payload->token = token;
-
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)page_fd;
-    fd_item.rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word1 = 0,
-        .word2 = 0,
-        .word3 = request_id,
-        .fds = &fd_item,
-        .fd_count = 1,
-    };
-    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
-    if (reply_fd < 16) {
-        fprintf(stderr,
-            "[seed0root] lprs v2 error-get call failed context=%s token=0x%llx status=%d\n",
-            context != NULL ? context : "unknown",
-            (unsigned long long)token,
-            reply_fd);
-        seed0root_destroy_wire_page(PACHA_SERVICE_PAGE_BYTES, page_fd, page);
-        return;
-    }
-
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
-    if (recv_status != 0 ||
-        reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        reply.word3 != request_id ||
-        reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->request_id != request_id ||
-        (int64_t)reply.word1 != 0)
-    {
-        fprintf(stderr,
-            "[seed0root] lprs v2 error-get failed context=%s token=0x%llx recv=%d magic=0x%llx status=%lld request=0x%llx\n",
-            context != NULL ? context : "unknown",
-            (unsigned long long)token,
-            recv_status,
-            (unsigned long long)reply.word0,
-            (long long)(int64_t)reply.word1,
-            (unsigned long long)reply.word3);
-        seed0root_destroy_wire_page(PACHA_SERVICE_PAGE_BYTES, page_fd, page);
-        return;
-    }
-
-    (void)pacha_errconv_dump_page_to_fd(
-        2,
-        context != NULL ? context : "[seed0root:lprs-error]",
-        (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
-        LPRS_V2_PAYLOAD_BYTES);
-    seed0root_destroy_wire_page(PACHA_SERVICE_PAGE_BYTES, page_fd, page);
+    (void)endpoint_fd;
+    (void)token;
+    fprintf(stderr,
+        "[seed0root] lprs negative reply context=%s; detailed error trace is emitted by service\n",
+        context != NULL ? context : "unknown");
 }
 
 static int seed0root_exec_add_string(

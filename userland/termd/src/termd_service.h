@@ -4,14 +4,15 @@
 #include "termd/boot_config.h"
 
 #include <pacha/ipc.h>
+#include <pacha/status.h>
 
 #include <stdint.h>
 
 enum {
-    TERMD_ERR_INVAL = -22,
-    TERMD_ERR_NODEV = -19,
-    TERMD_ERR_NOTSUP = -95,
-    TERMD_ERR_AGAIN = -11,
+    TERMD_ERR_INVAL = PACHA_STATUS_EINVAL,
+    TERMD_ERR_NODEV = PACHA_STATUS_ENODEV,
+    TERMD_ERR_NOTSUP = PACHA_STATUS_ENOTSUP,
+    TERMD_ERR_AGAIN = PACHA_STATUS_EAGAIN,
 };
 
 typedef struct termd_service {

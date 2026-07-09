@@ -4,6 +4,8 @@
 
 #include "pacha/service_abi.h"
 
+/* Replies use pacha_service_reply_header.status: 0 or a negative Linux errno. */
+
 enum {
     LPRS_V2_SERVICE_ID = PACHA_SERVICE_ID_LPRS,
     LPRS_V2_PAGE_BYTES = PACHA_SERVICE_PAGE_BYTES,

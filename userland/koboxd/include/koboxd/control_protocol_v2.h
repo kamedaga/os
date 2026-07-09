@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+/* Reply word1 is 0 or a negative Linux errno. */
+
 enum {
     KOBOXD_V2_CONTROL_MAGIC = 0x324c52544358424bull,
     KOBOXD_V2_REPLY_MAGIC = 0x32594c504558424bull,

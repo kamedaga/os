@@ -979,10 +979,10 @@ static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t
         (uint64_t)(uintptr_t)&request);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_KERNEL_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_KERNEL,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_CALL,
+            LPR_ERROR_STAGE_CHILD_RPC_CALL,
             err,
             reply_fd,
             request_id,
@@ -1010,10 +1010,10 @@ static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = lpr_pacha_status_to_errno(recv_status);
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_KERNEL_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_KERNEL,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_RECV,
+            LPR_ERROR_STAGE_CHILD_RPC_RECV,
             err,
             recv_status,
             request_id,
@@ -1037,10 +1037,10 @@ static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_FILED_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_FILED,
             op,
-            PACHA_ERRCONV_STAGE_REPLY_MAGIC,
+            LPR_ERROR_STAGE_REPLY_MAGIC,
             -LPR_LINUX_EIO,
             (int64_t)reply.word0,
             request_id,
@@ -1057,10 +1057,10 @@ static int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t
         return -LPR_LINUX_EIO;
     }
     if (reply_header->status < 0) {
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_FILED_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_FILED,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_STATUS,
+            LPR_ERROR_STAGE_CHILD_STATUS,
             reply_header->status,
             reply_header->status,
             request_id,

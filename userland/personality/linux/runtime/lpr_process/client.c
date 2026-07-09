@@ -4,7 +4,6 @@
 #include "../support/syscall.h"
 
 #include <lpr_supervisor/ipc_protocol_v2.h>
-#include <pacha/error_conveyor.h>
 #include <pacha/ipc.h>
 #include <pacha/service_abi.h>
 #include <pachaos/abi.h>
@@ -83,10 +82,10 @@ int64_t lpr_process_client_call(
         (uint64_t)(uintptr_t)&request);
     if (reply_fd < 16) {
         const int64_t err = status_to_errno(reply_fd);
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_KERNEL_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_KERNEL,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_CALL,
+            LPR_ERROR_STAGE_CHILD_RPC_CALL,
             err,
             reply_fd,
             request_id,
@@ -108,10 +107,10 @@ int64_t lpr_process_client_call(
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = status_to_errno(recv_status);
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_KERNEL_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_KERNEL,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_RECV,
+            LPR_ERROR_STAGE_CHILD_RPC_RECV,
             err,
             recv_status,
             request_id,
@@ -128,10 +127,10 @@ int64_t lpr_process_client_call(
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
         reply_header->request_id != request_id)
     {
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_LPRS_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_LPRS,
             op,
-            PACHA_ERRCONV_STAGE_REPLY_MAGIC,
+            LPR_ERROR_STAGE_REPLY_MAGIC,
             -LPR_LINUX_EIO,
             (int64_t)reply.word0,
             request_id,
@@ -142,10 +141,10 @@ int64_t lpr_process_client_call(
         return -LPR_LINUX_EIO;
     }
     if ((int64_t)reply.word1 < 0) {
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_LPRS_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_LPRS,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_STATUS,
+            LPR_ERROR_STAGE_CHILD_STATUS,
             (int64_t)reply.word1,
             (int64_t)reply.word1,
             request_id,

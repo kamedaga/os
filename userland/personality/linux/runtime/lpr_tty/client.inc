@@ -58,10 +58,10 @@ static int64_t lpr_termd_call(
         (uint64_t)(uintptr_t)&request);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_KERNEL_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_KERNEL,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_CALL,
+            LPR_ERROR_STAGE_CHILD_RPC_CALL,
             err,
             reply_fd,
             request.word3,
@@ -80,10 +80,10 @@ static int64_t lpr_termd_call(
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = lpr_pacha_status_to_errno(recv_status);
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_KERNEL_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_KERNEL,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_RECV,
+            LPR_ERROR_STAGE_CHILD_RPC_RECV,
             err,
             recv_status,
             request.word3,
@@ -102,10 +102,10 @@ static int64_t lpr_termd_call(
         reply_header->service_id != TERMD_V2_SERVICE_ID ||
         reply_header->op != op)
     {
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_TERMD_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_TERMD,
             op,
-            PACHA_ERRCONV_STAGE_REPLY_MAGIC,
+            LPR_ERROR_STAGE_REPLY_MAGIC,
             -LPR_LINUX_EIO,
             (int64_t)reply.word0,
             request.word3,
@@ -116,10 +116,10 @@ static int64_t lpr_termd_call(
         return -LPR_LINUX_EIO;
     }
     if ((int64_t)reply.word1 < 0) {
-        lpr_errconv_record(
-            PACHA_ERRCONV_DOMAIN_TERMD_STATUS,
+        lpr_trace_error_record(
+            LPR_ERROR_DOMAIN_TERMD,
             op,
-            PACHA_ERRCONV_STAGE_CHILD_STATUS,
+            LPR_ERROR_STAGE_CHILD_STATUS,
             (int64_t)reply.word1,
             (int64_t)reply.word1,
             request.word3,

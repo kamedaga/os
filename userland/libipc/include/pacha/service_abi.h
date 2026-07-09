@@ -55,6 +55,7 @@ typedef struct pacha_service_reply_header {
     uint32_t flags;
     uint64_t request_id;
     uint64_t trace_id;
+    /* Service boundary status: 0 or a negative Linux errno from pacha/status.h. */
     int64_t status;
     uint32_t error_domain;
     uint32_t payload_size;

@@ -13,8 +13,8 @@
 #include "filed/page_cache.h"
 #include "filed/tmpfs_backend.h"
 #include "pacha/abi.h"
-#include "pacha/error_conveyor.h"
 #include "pacha/ipc.h"
+#include "pacha/status.h"
 #include "pacha/syscall.h"
 #include "pacha/trace.h"
 #include "personality/linux_lpr.h"
@@ -147,8 +147,6 @@ static uint64_t filed_file_vmo_cache_hits;
 static uint64_t filed_file_vmo_cache_misses;
 static uint64_t filed_file_vmo_cache_stores;
 static uint64_t filed_file_vmo_cache_evictions;
-static pacha_errconv_store_t filed_errconv_store;
-static int filed_errconv_store_ready;
 
 static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object);
 
@@ -1752,15 +1750,6 @@ void filed_dump_cache_metrics(const filed_runtime_t *runtime)
     pacha_trace2(PACHA_TRACE_COMPONENT_FILED, PACHA_TRACE_EVENT_FILED_METRIC_CACHE, PACHA_TRACE_CLASS_METRIC, 11, filed_dir_cache.evictions);
 }
 
-static pacha_errconv_store_t *filed_errors(void)
-{
-    if (!filed_errconv_store_ready) {
-        pacha_errconv_store_init(&filed_errconv_store, PACHA_ERRCONV_COMPONENT_FILED);
-        filed_errconv_store_ready = 1;
-    }
-    return &filed_errconv_store;
-}
-
 static uint64_t filed_error_token(
     int64_t status,
     uint64_t op,
@@ -1772,18 +1761,25 @@ static uint64_t filed_error_token(
     uint64_t child_token,
     const char *text)
 {
-    return pacha_errconv_error_token(
-        filed_errors(),
-        status,
-        PACHA_ERRCONV_DOMAIN_FILED_STATUS,
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_GENERIC_ERROR,
+        PACHA_TRACE_CLASS_ERROR,
         op,
         stage,
-        raw_status,
+        (uint64_t)status,
+        (uint64_t)raw_status,
         request_id,
-        fd_count,
+        fd_count);
+    pacha_trace4(
+        PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_GENERIC_ERROR,
+        PACHA_TRACE_CLASS_ERROR,
         subject,
         child_token,
-        text);
+        text != NULL ? pacha_trace_name_id(text) : 0,
+        0);
+    return 0;
 }
 
 static int filed_send_reply_v2_payload(
@@ -1795,7 +1791,8 @@ static int filed_send_reply_v2_payload(
     uint64_t error_token,
     uint32_t payload_size)
 {
-    const uint64_t reply_result = status < 0 ? error_token : result;
+    (void)error_token;
+    const uint64_t reply_result = status < 0 ? 0 : result;
     if (page != NULL) {
         pacha_service_reply_header_init(
             (pacha_service_reply_header_t *)page,
@@ -1829,22 +1826,22 @@ static int filed_send_reply_v2(
 
 static int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
-    const uint64_t token = status < 0 ?
-        filed_error_token(
+    if (status < 0) {
+        (void)filed_error_token(
             status,
             FILED_V2_OP_SESSION_DOORBELL,
-            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            PACHA_STATUS_STAGE_STATUS_MAP,
             status,
             request_id,
             0,
             0,
             0,
-            "filed v2 session negative reply") :
-        0;
+            "filed v2 session negative reply");
+    }
     const struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
-        .word2 = status < 0 ? token : result,
+        .word2 = status < 0 ? 0 : result,
         .word3 = request_id,
     };
     return filed_ipc_send_wait(channel_fd, &reply);
@@ -2493,36 +2490,36 @@ static int64_t filed_status_to_wire(filed_status_t status)
     case FILED_OK:
         return 0;
     case FILED_ERR_NOT_FOUND:
-        return -2;
+        return -PACHA_LINUX_ENOENT;
     case FILED_ERR_NOT_DIR:
-        return -20;
+        return -PACHA_LINUX_ENOTDIR;
     case FILED_ERR_IS_DIR:
-        return -21;
+        return -PACHA_LINUX_EISDIR;
     case FILED_ERR_EXISTS:
-        return -17;
+        return -PACHA_LINUX_EEXIST;
     case FILED_ERR_DENIED:
-        return -13;
+        return -PACHA_LINUX_EACCES;
     case FILED_ERR_INVALID:
-        return -22;
+        return -PACHA_LINUX_EINVAL;
     case FILED_ERR_CROSS_MOUNT:
-        return -18;
+        return -PACHA_LINUX_EXDEV;
     case FILED_ERR_NOT_EMPTY:
-        return -39;
+        return -PACHA_LINUX_ENOTEMPTY;
     case FILED_ERR_IO:
-        return -5;
+        return -PACHA_LINUX_EIO;
     case FILED_ERR_UNSUPPORTED:
-        return -95;
+        return -PACHA_LINUX_ENOTSUP;
     case FILED_ERR_BAD_FORMAT:
     case FILED_ERR_INVALID_IMAGE:
-        return -8;
+        return -PACHA_LINUX_ENOEXEC;
     case FILED_ERR_LOOP:
-        return -40;
+        return -PACHA_LINUX_ELOOP;
     case FILED_ERR_OVERFLOW:
-        return -75;
+        return -PACHA_LINUX_EOVERFLOW;
     case FILED_ERR_FULL:
-        return -28;
+        return -PACHA_LINUX_ENOSPC;
     }
-    return -22;
+    return -PACHA_LINUX_EINVAL;
 }
 
 static int filed_release_reclaimed_object(
@@ -4086,19 +4083,16 @@ static int filed_dispatch_file_vmo_v2(
         .fd_count = result.status == 0 && entry != NULL && entry->vmo_fd >= 16 ? 1u : 0u,
     };
     if (result.status < 0) {
-        const uint64_t token = filed_error_token(
+        (void)filed_error_token(
             result.status,
             header->op,
-            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            PACHA_STATUS_STAGE_STATUS_MAP,
             result.status,
             header->request_id,
             request->fd_count,
             file_vmo->handle,
             0,
             "filed v2 file-vmo negative reply");
-        pacha_service_reply_header_t *reply_header = (pacha_service_reply_header_t *)reply_page;
-        reply_header->result = token;
-        reply.word2 = token;
     }
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
     (void)pacha_fd_close(reply_fd);
@@ -5857,21 +5851,18 @@ out:
         (void)pacha_fd_close(lpr_bootstrap_saved.fd);
         filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     }
-    uint64_t v2_error_token = 0;
-    const uint64_t reply_result = reply_status == 0 ?
-        (uint64_t)(uint32_t)process_fd :
-        filed_error_token(
+    const uint64_t reply_result = reply_status == 0 ? (uint64_t)(uint32_t)process_fd : 0;
+    if (reply_status != 0) {
+        (void)filed_error_token(
             reply_status,
             FILED_V2_OP_EXEC_PATH,
-            PACHA_ERRCONV_STAGE_STATUS_MAP,
+            PACHA_STATUS_STAGE_STATUS_MAP,
             reply_status,
             request->word3,
             0,
             0,
             0,
             "filed exec_path negative reply");
-    if (reply_status != 0) {
-        v2_error_token = reply_result;
     }
     pacha_service_reply_header_init(
         (pacha_service_reply_header_t *)page,
@@ -5920,7 +5911,7 @@ out:
         }
         return send_status;
     }
-    return filed_send_reply_v2(reply_fd, NULL, &v2_header, reply_status, 0, v2_error_token);
+    return filed_send_reply_v2(reply_fd, NULL, &v2_header, reply_status, 0, 0);
 }
 
 static int filed_dispatch_exec_self(
@@ -6182,150 +6173,17 @@ static uint64_t filed_import_termd_error(
     uint64_t subject,
     const char *text)
 {
-    pacha_errconv_frame_t parent;
-    memset(&parent, 0, sizeof(parent));
-    parent.domain = PACHA_ERRCONV_DOMAIN_TERMD_STATUS;
-    parent.component = PACHA_ERRCONV_COMPONENT_FILED;
-    parent.op = FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR;
-    parent.stage = PACHA_ERRCONV_STAGE_CHILD_STATUS;
-    parent.status = status;
-    parent.raw_status = status;
-    parent.request_id = request_id;
-    parent.fd_count = fd_count;
-    parent.subject = subject;
-    parent.child_token = child_token;
-    pacha_errconv_frame_text(&parent, text);
-
-    if (runtime == NULL || runtime->termd_tty_endpoint_fd < 16 || child_token == 0) {
-        return pacha_errconv_begin(filed_errors(), status, &parent);
-    }
-
-    const uint64_t rights =
-        PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-    const int page_fd = pacha_vmo_create(TERMD_V2_PAGE_BYTES, rights, 0);
-    if (page_fd < 16) {
-        const uint64_t token = pacha_errconv_begin(filed_errors(), status, &parent);
-        pacha_errconv_frame_t frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.domain = PACHA_ERRCONV_DOMAIN_KERNEL_STATUS;
-        frame.component = PACHA_ERRCONV_COMPONENT_FILED;
-        frame.op = TERMD_V2_OP_DIAG_ERROR_GET;
-        frame.stage = PACHA_ERRCONV_STAGE_KERNEL_SYSCALL;
-        frame.status = page_fd;
-        frame.raw_status = page_fd;
-        frame.request_id = request_id;
-        frame.child_token = child_token;
-        pacha_errconv_frame_text(&frame, "create child error page failed");
-        (void)pacha_errconv_append(filed_errors(), token, &frame);
-        return token;
-    }
-
-    void *page = pacha_mmap(
-        page_fd,
-        TERMD_V2_PAGE_BYTES,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        PACHA_MMAP_SHARED,
-        0);
-    if (page == NULL) {
-        const uint64_t token = pacha_errconv_begin(filed_errors(), status, &parent);
-        pacha_errconv_frame_t frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.domain = PACHA_ERRCONV_DOMAIN_KERNEL_STATUS;
-        frame.component = PACHA_ERRCONV_COMPONENT_FILED;
-        frame.op = TERMD_V2_OP_DIAG_ERROR_GET;
-        frame.stage = PACHA_ERRCONV_STAGE_MAP_PAGE;
-        frame.status = -5;
-        frame.raw_status = -5;
-        frame.request_id = request_id;
-        frame.child_token = child_token;
-        pacha_errconv_frame_text(&frame, "map child error page failed");
-        (void)pacha_errconv_append(filed_errors(), token, &frame);
-        (void)pacha_fd_close(page_fd);
-        return token;
-    }
-    memset(page, 0, TERMD_V2_PAGE_BYTES);
-    const uint64_t get_request_id = request_id ^ 0x45524745545f5445ull;
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = TERMD_V2_SERVICE_ID;
-    header->op = TERMD_V2_OP_DIAG_ERROR_GET;
-    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD | PACHA_SERVICE_FLAG_DIAGNOSTIC;
-    header->request_id = get_request_id;
-    header->trace_id = request_id;
-    header->payload_size = sizeof(termd_v2_handle_request_t);
-    termd_v2_handle_request_t *payload =
-        (termd_v2_handle_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
-    payload->arg0 = child_token;
-
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)page_fd;
-    fd_item.rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-    const struct pacha_ipc_msg get_request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word1 = 0,
-        .word2 = 0,
-        .word3 = get_request_id,
-        .fds = &fd_item,
-        .fd_count = 1,
-    };
-    const int error_reply_fd = pacha_ipc_call(runtime->termd_tty_endpoint_fd, &get_request);
-    int64_t get_status = error_reply_fd;
-    if (error_reply_fd >= 16) {
-        struct pacha_ipc_msg get_reply;
-        memset(&get_reply, 0, sizeof(get_reply));
-        get_status = pacha_ipc_recv_wait(error_reply_fd, &get_reply, PACHA_FD_WAIT_FOREVER);
-        (void)pacha_fd_close(error_reply_fd);
-        const pacha_service_reply_header_t *reply_header =
-            (const pacha_service_reply_header_t *)page;
-        if (get_status == 0 &&
-            (get_reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-             get_reply.word3 != get_request.word3 ||
-             reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-             reply_header->service_id != TERMD_V2_SERVICE_ID ||
-             reply_header->op != TERMD_V2_OP_DIAG_ERROR_GET ||
-             reply_header->request_id != get_request.word3))
-        {
-            get_status = -5;
-        } else if (get_status == 0) {
-            get_status = reply_header->status;
-        }
-    }
-
-    uint64_t token = 0;
-    if (get_status == 0) {
-        token = pacha_errconv_import_page(
-            filed_errors(),
-            status,
-            &parent,
-            (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
-            TERMD_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
-    } else {
-        token = pacha_errconv_begin(filed_errors(), status, &parent);
-        pacha_errconv_frame_t frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.domain = PACHA_ERRCONV_DOMAIN_TERMD_STATUS;
-        frame.component = PACHA_ERRCONV_COMPONENT_FILED;
-        frame.op = TERMD_V2_OP_DIAG_ERROR_GET;
-        frame.stage = PACHA_ERRCONV_STAGE_ERROR_GET;
-        frame.status = get_status;
-        frame.raw_status = get_status;
-        frame.request_id = get_request.word3;
-        frame.child_token = child_token;
-        pacha_errconv_frame_text(&frame, "child error get failed");
-        (void)pacha_errconv_append(filed_errors(), token, &frame);
-    }
-
-    (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return token;
+    (void)runtime;
+    return filed_error_token(
+        status,
+        FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+        PACHA_STATUS_STAGE_CHILD_STATUS,
+        status,
+        request_id,
+        fd_count,
+        subject,
+        child_token,
+        text);
 }
 
 static int filed_dispatch_register_termd_signal_supervisor_v2(
@@ -6358,7 +6216,7 @@ static int filed_dispatch_register_termd_signal_supervisor_v2(
         const uint64_t token = filed_error_token(
             page_fd,
             header->op,
-            PACHA_ERRCONV_STAGE_KERNEL_SYSCALL,
+            PACHA_STATUS_STAGE_KERNEL_SYSCALL,
             page_fd,
             header->request_id,
             request->fd_count,
@@ -6377,7 +6235,7 @@ static int filed_dispatch_register_termd_signal_supervisor_v2(
         const uint64_t token = filed_error_token(
             -5,
             header->op,
-            PACHA_ERRCONV_STAGE_MAP_PAGE,
+            PACHA_STATUS_STAGE_MAP_PAGE,
             -5,
             header->request_id,
             request->fd_count,
@@ -6421,7 +6279,7 @@ static int filed_dispatch_register_termd_signal_supervisor_v2(
         const uint64_t token = filed_error_token(
             termd_reply_fd,
             header->op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_CALL,
+            PACHA_STATUS_STAGE_CHILD_RPC_CALL,
             termd_reply_fd,
             header->request_id,
             request->fd_count,
@@ -6456,7 +6314,7 @@ static int filed_dispatch_register_termd_signal_supervisor_v2(
             error_token = filed_error_token(
                 status,
                 header->op,
-                PACHA_ERRCONV_STAGE_REPLY_MAGIC,
+                PACHA_STATUS_STAGE_REPLY_MAGIC,
                 (int64_t)termd_reply.word0,
                 header->request_id,
                 request->fd_count,
@@ -6481,7 +6339,7 @@ static int filed_dispatch_register_termd_signal_supervisor_v2(
         error_token = filed_error_token(
             status,
             header->op,
-            PACHA_ERRCONV_STAGE_CHILD_RPC_RECV,
+            PACHA_STATUS_STAGE_CHILD_RPC_RECV,
             status,
             header->request_id,
             request->fd_count,
@@ -7222,7 +7080,7 @@ static int filed_dispatch_client_v2(
         const uint64_t token = filed_error_token(
             -5,
             0,
-            PACHA_ERRCONV_STAGE_MAP_PAGE,
+            PACHA_STATUS_STAGE_MAP_PAGE,
             -5,
             request->word3,
             request->fd_count,
@@ -7285,30 +7143,8 @@ static int filed_dispatch_client_v2(
         return reply_status;
     }
     case FILED_V2_OP_DIAG_ERROR_GET:
-        if (header.payload_size < sizeof(filed_v2_diag_request_t)) {
-            status = -22;
-        } else {
-            filed_v2_diag_request_t *diag =
-                (filed_v2_diag_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
-            status = pacha_errconv_export(
-                filed_errors(),
-                diag->subject,
-                diag,
-                PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
-            if (status == 0) {
-                const int reply_status = filed_send_reply_v2_payload(
-                    reply_fd,
-                    page,
-                    &header,
-                    status,
-                    0,
-                    0,
-                    PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES);
-                (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
-                filed_close_received_fds_except(request, reply_fd, -1);
-                return reply_status;
-            }
-        }
+        status = PACHA_STATUS_ENOTSUP;
+        break;
         break;
     case FILED_V2_OP_VFS_OPENAT:
     case FILED_V2_OP_VFS_CLOSE:
@@ -7442,7 +7278,7 @@ static int filed_dispatch_client_v2(
         error_token = filed_error_token(
             status,
             header.op,
-            PACHA_ERRCONV_STAGE_DISPATCH_ENTRY,
+            PACHA_STATUS_STAGE_DISPATCH,
             status,
             header.request_id,
             request->fd_count,

@@ -377,31 +377,7 @@ void lpr_linux_readv_cache_trace_dump(void)
 
 static int64_t lpr_pacha_status_to_errno(int64_t status)
 {
-    if (status == 0) {
-        return 0;
-    }
-    int negative = 0;
-    if (status < 0) {
-        negative = 1;
-        status = -status;
-    }
-    if (status > PACHAOS_SYSCALL_ERR_CLOSED) {
-        return negative ? -status : status;
-    }
-    switch (status) {
-    case PACHAOS_SYSCALL_ERR_INVALID:
-        return -LPR_LINUX_EINVAL;
-    case PACHAOS_SYSCALL_ERR_ALLOC:
-    case PACHAOS_SYSCALL_ERR_MAP:
-        return -LPR_LINUX_ENOMEM;
-    case PACHAOS_SYSCALL_ERR_NOT_READY:
-    case PACHAOS_SYSCALL_ERR_EMPTY:
-        return -LPR_LINUX_EAGAIN;
-    case PACHAOS_SYSCALL_ERR_CLOSED:
-        return -LPR_LINUX_EPIPE;
-    default:
-        return -LPR_LINUX_EINVAL;
-    }
+    return pacha_kernel_status_to_errno(status);
 }
 
 #include "../lpr_fd/control.inc"

@@ -92,6 +92,7 @@ def main() -> int:
         console.run("yes head wc", "/bin/yes y | /bin/head -n 3 | /bin/wc -l", [b"\r\n3\r\n"])
         console.run("redirection cat", "/bin/printf redir >/tmp/coremini-f; /bin/cat </tmp/coremini-f", [b"\r\nredir"])
         console.run("ls sees file", "/bin/ls /tmp | /bin/grep coremini-f", [b"\r\ncoremini-f\r\n"])
+        console.run("busybox ls missing path", "busybox ls /nonexistent 2>&1 || /bin/true", [b"No such file or directory"])
         console.run("test true", "/bin/test -e /tmp/coremini-f && /bin/true && /bin/echo true-ok", [b"\r\ntrue-ok\r\n"])
         console.run("false", "/bin/false || /bin/echo false-ok", [b"\r\nfalse-ok\r\n"])
         console.run("mkdir", "/bin/mkdir /tmp/coremini-d && /bin/echo mkdir-ok", [b"\r\nmkdir-ok\r\n"])

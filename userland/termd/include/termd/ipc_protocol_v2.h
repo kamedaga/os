@@ -4,6 +4,8 @@
 
 #include "pacha/service_abi.h"
 
+/* Replies use pacha_service_reply_header.status: 0 or a negative Linux errno. */
+
 enum {
     TERMD_V2_SERVICE_ID = PACHA_SERVICE_ID_TERMD,
 

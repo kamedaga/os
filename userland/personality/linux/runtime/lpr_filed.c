@@ -7,9 +7,9 @@
 #include "lpr_process/supervisor_fd_snapshot.h"
 #include "support/string.h"
 #include "support/syscall.h"
-#include <pacha/error_conveyor.h>
 #include <pacha/ipc.h>
 #include <pacha/service_abi.h>
+#include <pacha/status.h>
 #include <pacha/trace.h>
 #include <pachaos/abi.h>
 #include <personality/lpr_client_abi.h>

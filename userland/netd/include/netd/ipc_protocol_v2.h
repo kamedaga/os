@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+/* Reply word1 is 0 or a negative Linux errno. */
+
 enum {
     NETD_V2_REQUEST_MAGIC = 0x3251524454454eull,
     NETD_V2_REPLY_MAGIC = 0x3259524454454eull,

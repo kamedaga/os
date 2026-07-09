@@ -44,6 +44,7 @@ clang \
   "$repo_root/userland/personality/linux/runtime/lpr_filed.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_socket.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_dispatch.c" \
+  "$repo_root/userland/libipc/src/status.c" \
   "$repo_root/userland/libpacha/src/trace.c" \
   "$repo_root/userland/personality/linux/runtime/support/arena.c" \
   "$repo_root/userland/personality/linux/runtime/support/elf.c" \

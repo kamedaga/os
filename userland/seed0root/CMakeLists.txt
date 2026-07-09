@@ -13,7 +13,7 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/error_conveyor.c ${REPO_ROOT}/userland/libpacha/src/syscall.c"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c"
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
   DEPENDS
@@ -25,8 +25,8 @@ add_custom_command(
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol_v2.h"
     "${REPO_ROOT}/userland/personality/include/personality/linux_lpr.h"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
-    "${REPO_ROOT}/userland/libipc/src/error_conveyor.c"
-    "${REPO_ROOT}/userland/libipc/include/pacha/error_conveyor.h"
+    "${REPO_ROOT}/userland/libipc/src/status.c"
+    "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
