@@ -373,8 +373,9 @@ void fd_ipc_boot_smoke_main(void) {
     if (!expect_ok("[fd_ipc_boot_smoke] fast accept failed\n", pacha_ipc_fast_channel_accept(&server_fast, fast_pair.b, PACHA_IPC_FAST_F_PREFER_PKEY, 1))) return;
     if (!expect_u64("[fd_ipc_boot_smoke] fast client not ready\n", (u64)(unsigned)pacha_ipc_fast_channel_ready(&client_fast), 1)) return;
     if (!expect_u64("[fd_ipc_boot_smoke] fast server not ready\n", (u64)(unsigned)pacha_ipc_fast_channel_ready(&server_fast), 1)) return;
-    if (!expect_u64("[fd_ipc_boot_smoke] fast client ring backend missing\n", (u64)(unsigned)pacha_ipc_fast_channel_uses_ring(&client_fast), 1)) return;
-    if (!expect_u64("[fd_ipc_boot_smoke] fast server ring backend missing\n", (u64)(unsigned)pacha_ipc_fast_channel_uses_ring(&server_fast), 1)) return;
+    const unsigned expect_ring = (unsigned)pacha_ipc_pkey_enabled();
+    if (!expect_u64("[fd_ipc_boot_smoke] fast client backend mismatch\n", (u64)(unsigned)pacha_ipc_fast_channel_uses_ring(&client_fast), expect_ring)) return;
+    if (!expect_u64("[fd_ipc_boot_smoke] fast server backend mismatch\n", (u64)(unsigned)pacha_ipc_fast_channel_uses_ring(&server_fast), expect_ring)) return;
     log_text("[fd_ipc_boot_smoke] fast setup client=");
     log_text(pacha_ipc_fast_backend_name(client_fast.backend));
     log_text(" server=");

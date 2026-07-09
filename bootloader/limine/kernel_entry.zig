@@ -5,6 +5,7 @@ const std = @import("std");
 const kernel_api = @import("kernel_boot_api");
 const x86_platform = kernel_api.x86_platform;
 const entry = kernel_api.entry;
+const kernel_runtime = kernel_api.kernel_runtime;
 const limine = @import("protocol.zig");
 const limine_boot = @import("resources.zig");
 
@@ -120,7 +121,7 @@ fn limineKernelMain() noreturn {
     entry.prepareLimineKernelStorageOrHalt();
     const resources = entry.persistBootResourcesOrHalt(limine_boot.buildBootResourcesOrHalt(
         requests,
-        entry.global_free_list,
+        kernel_runtime.global_free_list,
         entry.currentUserSpaces(),
     ));
     serialWrite("pacha: limine resources ready\n");

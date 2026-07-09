@@ -1,8 +1,8 @@
 /// Kernel boot entry point and primary boot globals.
 /// Bootloader-specific entry code switches to the ring-0 stack before entering
 /// this module.
-const std = @import("std");
 const kernel = @import("../kernel.zig");
+const kernel_runtime = @import("../kernel_runtime.zig");
 const elf_loader = @import("../elf_loader.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const syscalls = @import("../syscalls.zig");
@@ -51,10 +51,6 @@ var limine_kernel_runtime_storage: [limine_runtime_storage_bytes]u8 align(4096) 
 var limine_user_spaces_storage: [boot_static.user_process_count]boot_static.UserAddressSpace align(4096) = undefined;
 var limine_boot_scratch_storage: [boot_scratch.default_bytes]u8 align(4096) = undefined;
 
-pub var global_free_list: *kernel.FreePageList = undefined;
-pub var kernel_state_global: *kernel.KernelState = undefined;
-pub var kernel_state_ready: bool = false;
-
 var boot_init_principal: ?kernel.PrincipalId = null;
 const spawn_parent_endpoint_id: u64 = 0x14;
 const generic_device_interrupt_vector: u8 = 0x41;
@@ -82,9 +78,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, image_range.kernelStaticStorageStartAddr());
     start = minStaticStart(start, staticStorageStart(@TypeOf(user_spaces), &user_spaces));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(global_free_list), &global_free_list));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_global), &kernel_state_global));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_state_ready), &kernel_state_ready));
+    start = minStaticStart(start, kernel_runtime.kernelStaticStorageStartAddr());
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_free_list_storage), &limine_free_list_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_kernel_state_storage), &limine_kernel_state_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_kernel_runtime_storage), &limine_kernel_runtime_storage));
@@ -100,10 +94,8 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, image_range.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces), &user_spaces));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(global_free_list), &global_free_list));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_global), &kernel_state_global));
+    end = maxStaticEnd(end, kernel_runtime.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, kernel.kernelStaticStorageEndAddr());
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_ready), &kernel_state_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_free_list_storage), &limine_free_list_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_kernel_state_storage), &limine_kernel_state_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_kernel_runtime_storage), &limine_kernel_runtime_storage));
@@ -118,39 +110,6 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
-}
-
-// ---------------------------------------------------------------------------
-// Thread label helper (used in Hooks)
-// ---------------------------------------------------------------------------
-
-fn threadLabel(thread_index: usize) []const u8 {
-    const labels = comptime blk: {
-        var items: [kernel.initial_thread_capacity][]const u8 = undefined;
-        for (0..kernel.initial_thread_capacity) |i| {
-            items[i] = std.fmt.comptimePrint("Thread{}", .{i});
-        }
-        break :blk items;
-    };
-    if (thread_index < labels.len) return labels[thread_index];
-    return "Thread?";
-}
-
-fn principalLabel(principal: kernel.PrincipalId) []const u8 {
-    if (kernel_state_ready) {
-        if (kernel_state_global.processDescriptor(principal)) |desc| {
-            return desc.label;
-        }
-    }
-    return kernel.principalLabel(principal);
-}
-
-// ---------------------------------------------------------------------------
-// CPU control register helpers (x86-specific, used only during boot)
-// ---------------------------------------------------------------------------
-
-fn readCr2() u64 {
-    return x86_platform.readCr2();
 }
 
 fn readCr3() u64 {
@@ -226,7 +185,7 @@ fn initFxStateSupport() void {
 // ---------------------------------------------------------------------------
 
 pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
-    if (!kernel_state_ready) return;
+    if (!kernel_runtime.kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
     if (!scheduler.threadReady(thread_index)) return;
@@ -238,7 +197,7 @@ pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
 }
 
 pub export fn restoreCurrentThreadFxState() callconv(.winapi) void {
-    if (!kernel_state_ready) return;
+    if (!kernel_runtime.kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
     if (!scheduler.threadReady(thread_index)) return;
@@ -299,10 +258,10 @@ fn initKernelRuntimeOrHalt() void {
         if (!traps.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
             halt.haltWithMessage("trap runtime mapping failed");
         }
-        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(kernel_state_global), @sizeOf(kernel.KernelState))) {
+        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(kernel_runtime.kernel_state_global), @sizeOf(kernel.KernelState))) {
             halt.haltWithMessage("kernel state runtime mapping failed");
         }
-        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(global_free_list), @sizeOf(kernel.FreePageList))) {
+        if (!x86_platform.mapKernelRuntimeIdentityRange(@intFromPtr(kernel_runtime.global_free_list), @sizeOf(kernel.FreePageList))) {
             halt.haltWithMessage("free list runtime mapping failed");
         }
         if (kernel_runtime_storage.len != 0 and
@@ -379,11 +338,11 @@ fn initMemoryModules() void {
 }
 
 pub fn prepareLimineKernelStorageOrHalt() void {
-    global_free_list = &limine_free_list_storage;
-    global_free_list.len = 0;
-    global_free_list.range_len = 0;
+    kernel_runtime.global_free_list = &limine_free_list_storage;
+    kernel_runtime.global_free_list.len = 0;
+    kernel_runtime.global_free_list.range_len = 0;
 
-    kernel_state_global = &limine_kernel_state_storage;
+    kernel_runtime.kernel_state_global = &limine_kernel_state_storage;
 
     kernel_runtime_storage = limine_kernel_runtime_storage[0..];
     @memset(kernel_runtime_storage, 0);
@@ -457,23 +416,23 @@ fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
 
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
-    const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
+    const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
 
     _ = scheduler.releasePrincipalThreads(principal);
 
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
-    kernel_state_global.releasePrincipalNativeMemory(principal, global_free_list);
-    kernel_state_global.resetProcessRuntimeTables(process_index);
+    kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
+    kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockAddressSpaces();
-    _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
+    _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
     var storage_index: usize = 0;
     while (storage_index < kernel.principal_count) : (storage_index += 1) {
         var wake_owner = false;
         if (storage_index < kernel.process_count) {
-            const removed = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+            const removed = scrubEndpointTargets(&kernel_runtime.kernel_state_global.endpoint_tables[storage_index], principal);
             if (removed) endpoint_targets_removed = true;
             wake_owner = removed;
         }
@@ -483,18 +442,18 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
         scheduler.wakeBlockedThread(owner);
     }
     if (endpoint_targets_removed) {
-        kernel_state_global.bumpEndpointGeneration();
+        kernel_runtime.kernel_state_global.bumpEndpointGeneration();
     }
 
-    kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .killed, fault_vector);
-    kernel_state_global.markProcessObjectsExited(principal, .killed, fault_vector);
-    _ = kernel_state_global.markProcessFaulted(principal, fault_vector);
+    kernel_runtime.kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .killed, fault_vector);
+    kernel_runtime.kernel_state_global.markProcessObjectsExited(principal, .killed, fault_vector);
+    _ = kernel_runtime.kernel_state_global.markProcessFaulted(principal, fault_vector);
     if (spawn_parent) |parent| scheduler.wakeBlockedThread(parent);
 }
 
 fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
-    const spawn_parent = kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
+    const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
     const metric_start = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
     _ = scheduler.releasePrincipalThreads(principal);
@@ -503,12 +462,12 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     user_vm.lockAddressSpaces();
     user_vm.clearUserAddressSpace(principal);
     const metric_after_clear_as = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
-    kernel_state_global.releasePrincipalNativeMemory(principal, global_free_list);
+    kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     const metric_after_release_mem = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
-    kernel_state_global.resetProcessRuntimeTables(process_index);
+    kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     user_vm.unlockAddressSpaces();
-    _ = kernel_state_global.unpublishServiceEndpointsForTarget(principal);
+    _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
     const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
     var endpoint_targets_removed = false;
@@ -516,7 +475,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     while (storage_index < kernel.principal_count) : (storage_index += 1) {
         var wake_owner = false;
         if (storage_index < kernel.process_count) {
-            const removed = scrubEndpointTargets(&kernel_state_global.endpoint_tables[storage_index], principal);
+            const removed = scrubEndpointTargets(&kernel_runtime.kernel_state_global.endpoint_tables[storage_index], principal);
             if (removed) endpoint_targets_removed = true;
             wake_owner = removed;
         }
@@ -526,11 +485,11 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
         scheduler.wakeBlockedThread(owner);
     }
     if (endpoint_targets_removed) {
-        kernel_state_global.bumpEndpointGeneration();
+        kernel_runtime.kernel_state_global.bumpEndpointGeneration();
     }
     const metric_after_scrub = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
-    _ = kernel_state_global.markProcessExited(principal);
+    _ = kernel_runtime.kernel_state_global.markProcessExited(principal);
     const metric_after_mark = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     if (enable_exit_teardown_metrics) {
         kernel_log.writeFmt(
@@ -551,9 +510,9 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     if (spawn_parent) |parent| scheduler.wakeBlockedThread(parent);
 }
 
-fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) void {
+pub export fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) callconv(.winapi) void {
     kernel_log.write("USER fault principal=");
-    kernel_log.write(principalLabel(principal));
+    kernel_log.write(kernel_runtime.principalLabel(principal));
     kernel_log.write(" thread=");
     log_util.printNumber(@as(u64, @intCast(scheduler.currentThread())));
     kernel_log.write(" cpu=");
@@ -585,8 +544,8 @@ fn exitCurrentProcess(
         scheduler.prepareExitHandoffToReadyThreadGeneration(target.thread_index, target.thread_generation)
     else
         false;
-    kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
-    kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
+    kernel_runtime.kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
+    kernel_runtime.kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
     teardownExitedProcess(principal);
     var handoff_loaded = false;
     if (handoff_prepared) {
@@ -723,8 +682,8 @@ pub fn initializeLimineRuntimeOrHalt() void {
 
 fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelState {
     user_copy.init(.{
-        .state = kernel_state_global,
-        .free_list = global_free_list,
+        .state = kernel_runtime.kernel_state_global,
+        .free_list = kernel_runtime.global_free_list,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .phys_copy_window_va = boot_static.phys_copy_window_va,
         .page_present = boot_static.page_present,
@@ -741,17 +700,17 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
         .page_addr_mask = boot_static.page_addr_mask,
         .page_present = boot_static.page_present,
         .page_ps = boot_static.page_ps,
-        .kernel_state_ready = &kernel_state_ready,
-        .state = kernel_state_global,
+        .kernel_state_ready = &kernel_runtime.kernel_state_ready,
+        .state = kernel_runtime.kernel_state_global,
         .write = kernel_log.write,
         .write_hex_raw = kernel_log.writeHexRaw,
         .write_bool01 = kernel_log.writeBool01,
     });
 
-    kernel_state_global.initFromDetectedRegionsInPlace(memory_stats.detected_regions) catch |err| {
+    kernel_runtime.kernel_state_global.initFromDetectedRegionsInPlace(memory_stats.detected_regions) catch |err| {
         halt.haltWithError("region init failed: ", err);
     };
-    const state = kernel_state_global;
+    const state = kernel_runtime.kernel_state_global;
     state.debug_process_lifecycle_hook = null;
     state.zero_physical_page_hook = user_copy.zeroPhysicalPage;
 
@@ -784,7 +743,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
     boot_init_principal = init_principal;
-    const init_process = process_factory.createUserProcess(state, init_principal, "init", global_free_list, user_spaces);
+    const init_process = process_factory.createUserProcess(state, init_principal, "init", kernel_runtime.global_free_list, user_spaces);
     state.createSerialFdAt(init_principal, 1, 1) catch |err| {
         halt.haltWithError("init stdout fd install failed: ", err);
     };
@@ -797,7 +756,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         devs.devices[0..],
         res.bootfs_image,
         res.framebuffer_info,
-        global_free_list,
+        kernel_runtime.global_free_list,
     );
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
@@ -810,7 +769,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         init_process.user_stack_page.paddr,
         res.init_elf,
         "init ELF load failed\n",
-        global_free_list,
+        kernel_runtime.global_free_list,
     );
     const init_thread = scheduler.threadForPrincipal(init_principal).?;
     const init_ctx = scheduler.threadContextMutable(init_thread).?;
@@ -827,7 +786,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         halt.haltWithMessage("kernel scheduler failed to activate init");
     }
 
-    kernel_state_ready = true;
+    kernel_runtime.kernel_state_ready = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,13 +796,13 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
 fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.MemoryStats) void {
     syscalls.init(.{
         .state = state,
-        .free_list = global_free_list,
+        .free_list = kernel_runtime.global_free_list,
         .user_spaces = user_spaces,
-        .kernel_state_ready = &kernel_state_ready,
+        .kernel_state_ready = &kernel_runtime.kernel_state_ready,
         .write = kernel_log.write,
         .print_hex = log_util.printHex,
         .print_number = log_util.printNumberU64,
-        .principal_label = principalLabel,
+        .principal_label = kernel_runtime.principalLabel,
         .read_user_u64 = user_copy.readUserU64,
         .write_user_u64 = user_copy.writeUserU64,
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
@@ -857,25 +816,6 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .block_current_thread_for_event = scheduler.blockCurrentThread,
         .exit_current_process = exitCurrentProcess,
         .total_usable_memory_bytes = memory_stats.total_usable_bytes,
-    });
-
-    traps.init(.{
-        .kernel_state_ready = &kernel_state_ready,
-        .state = state,
-        .free_list = global_free_list,
-        .scheduler_quantum_ticks = boot_static.scheduler_quantum_ticks,
-        .write = kernel_log.write,
-        .write_hex_raw = kernel_log.writeHexRaw,
-        .write_bool01 = kernel_log.writeBool01,
-        .thread_label = threadLabel,
-        .principal_label = principalLabel,
-        .read_cr2 = readCr2,
-        .read_cr3 = readCr3,
-        .dump_page_walk_for_va = page_fault_log.dumpPageWalkForVa,
-        .log_page_fault_step2 = page_fault_log.logStep2,
-        .halt_loop = halt.haltLoop,
-        .resume_after_fatal_user_exception = resumeAfterFatalUserException,
-        .switch_to_thread = scheduler.switchTo,
     });
 }
 

@@ -1,5 +1,12 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
+const boot_static = @import("boot/main_static.zig");
+const halt = @import("halt.zig");
+const kernel_log = @import("kernel_log.zig");
+const kernel_runtime = @import("kernel_runtime.zig");
+const kernel_vm = @import("memory/kernel_vm.zig");
+const page_fault_log = @import("page_fault_log.zig");
+const x86_platform = @import("arch/x86_64/platform.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
 const user_vm = @import("memory/user_vm.zig");
@@ -19,27 +26,6 @@ const user_return_iret_qword_count = 5;
 const trap_frame_iret_offset = @offsetOf(TrapFrame, "rip");
 const exception_trap_frame_iret_offset = @offsetOf(ExceptionTrapFrame, "rip");
 
-pub const Hooks = struct {
-    kernel_state_ready: *const bool,
-    state: *kernel.KernelState,
-    free_list: *kernel.FreePageList,
-    scheduler_quantum_ticks: u64,
-    write: *const fn ([]const u8) void,
-    write_hex_raw: *const fn (u64) void,
-    write_bool01: *const fn (bool) void,
-    thread_label: *const fn (usize) []const u8,
-    principal_label: *const fn (kernel.PrincipalId) []const u8,
-    read_cr2: *const fn () u64,
-    read_cr3: *const fn () u64,
-    dump_page_walk_for_va: *const fn (u64, u64) void,
-    log_page_fault_step2: *const fn (u64, *const ExceptionTrapFrame) void,
-    halt_loop: *const fn () noreturn,
-    resume_after_fatal_user_exception: *const fn (kernel.PrincipalId, u8, *TrapFrame) void,
-    switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
-};
-
-var trap_hooks_storage: Hooks = undefined;
-var trap_hooks_ready = false;
 pub export var page_fault_work_frames: [smp.max_cpus]ExceptionTrapFrame = [_]ExceptionTrapFrame{std.mem.zeroes(ExceptionTrapFrame)} ** smp.max_cpus;
 pub export var trap_fault_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
 pub export var fatal_exception_resume_work_frames: [smp.max_cpus]TrapFrame = [_]TrapFrame{std.mem.zeroes(TrapFrame)} ** smp.max_cpus;
@@ -67,8 +53,6 @@ fn mapStaticStorage(map_identity_range: *const fn (u64, usize) bool, comptime pt
 }
 
 const runtime_storage_ptrs = .{
-    &trap_hooks_storage,
-    &trap_hooks_ready,
     &page_fault_work_frames,
     &trap_fault_work_frames,
     &fatal_exception_resume_work_frames,
@@ -89,11 +73,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     return end;
 }
 
-pub fn init(new_hooks: Hooks) void {
-    trap_hooks_storage = new_hooks;
-    trap_hooks_ready = true;
-}
-
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
     inline for (runtime_storage_ptrs) |ptr| {
         if (!mapStaticStorage(map_identity_range, ptr)) return false;
@@ -101,10 +80,6 @@ pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) 
     return true;
 }
 
-fn getHooks() *const Hooks {
-    if (!trap_hooks_ready) unreachable;
-    return &trap_hooks_storage;
-}
 extern var kernel_cr3_value: u64;
 extern var kernel_syscall_stack_top: u64;
 extern var kernel_syscall_stack_tops: [smp.max_cpus]u64;
@@ -118,6 +93,7 @@ extern var user_return_iret_frame: [5]u64 align(16);
 extern fn saveCurrentThreadFxState() callconv(.winapi) void;
 extern fn restoreCurrentThreadFxState() callconv(.winapi) void;
 extern fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64;
+extern fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) callconv(.winapi) void;
 
 pub export fn timerInterruptWorkFrameForCurrentCpuFromAsm() callconv(.winapi) *TrapFrame {
     const cpu_slot = scheduler.currentCpu();
@@ -218,8 +194,7 @@ fn asmCpuSlotIntoEcx() []const u8 {
 }
 
 fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u8) []const u8 {
-    return std.fmt.comptimePrint(
-        asmCpuSlotIntoEcx() ++
+    return std.fmt.comptimePrint(asmCpuSlotIntoEcx() ++
         \\
         \\mov %ecx, %r14d
         \\mov %r14, %r13
@@ -324,91 +299,84 @@ fn exceptionName(vec: u64) []const u8 {
     };
 }
 
-fn writeReg(h: *const Hooks, label: []const u8, value: u64) void {
-    h.write("  ");
-    h.write(label);
-    h.write("=");
-    h.write_hex_raw(value);
-    h.write("\n");
+fn writeReg(label: []const u8, value: u64) void {
+    kernel_log.write("  ");
+    kernel_log.write(label);
+    kernel_log.write("=");
+    kernel_log.writeHexRaw(value);
+    kernel_log.write("\n");
 }
 
-fn writeByteHex(h: *const Hooks, byte: u8) void {
-    var buf: [2]u8 = undefined;
-    buf[0] = std.fmt.digitToChar(@intCast((byte >> 4) & 0xF), .lower);
-    buf[1] = std.fmt.digitToChar(@intCast(byte & 0xF), .lower);
-    h.write(buf[0..]);
-}
-
-fn writeCommonTrapRegs(h: *const Hooks, frame: anytype) void {
+fn writeCommonTrapRegs(frame: anytype) void {
     const cpu_slot = scheduler.currentCpu();
-    writeReg(h, "CPU", @intCast(cpu_slot));
+    writeReg("CPU", @intCast(cpu_slot));
     if (scheduler.threadContext(scheduler.currentThread())) |ctx| {
-        writeReg(h, "FS_BASE", ctx.fs_base);
+        writeReg("FS_BASE", ctx.fs_base);
     }
-    writeReg(h, "RAX", frame.rax);
-    writeReg(h, "RBX", frame.rbx);
-    writeReg(h, "RCX", frame.rcx);
-    writeReg(h, "RDX", frame.rdx);
-    writeReg(h, "RSI", frame.rsi);
-    writeReg(h, "RDI", frame.rdi);
-    writeReg(h, "R8", frame.r8);
-    writeReg(h, "R9", frame.r9);
-    writeReg(h, "R10", frame.r10);
-    writeReg(h, "R11", frame.r11);
-    writeReg(h, "R12", frame.r12);
-    writeReg(h, "R13", frame.r13);
-    writeReg(h, "R14", frame.r14);
-    writeReg(h, "R15", frame.r15);
-    writeReg(h, "RBP", frame.rbp);
-    writeReg(h, "RSP", frame.rsp);
+    writeReg("RAX", frame.rax);
+    writeReg("RBX", frame.rbx);
+    writeReg("RCX", frame.rcx);
+    writeReg("RDX", frame.rdx);
+    writeReg("RSI", frame.rsi);
+    writeReg("RDI", frame.rdi);
+    writeReg("R8", frame.r8);
+    writeReg("R9", frame.r9);
+    writeReg("R10", frame.r10);
+    writeReg("R11", frame.r11);
+    writeReg("R12", frame.r12);
+    writeReg("R13", frame.r13);
+    writeReg("R14", frame.r14);
+    writeReg("R15", frame.r15);
+    writeReg("RBP", frame.rbp);
+    writeReg("RSP", frame.rsp);
 }
 
-fn writeExceptionWithErrorSummary(h: *const Hooks, vec: u64, frame: *const ExceptionTrapFrame) void {
-    h.write(exceptionName(vec));
-    h.write("\n");
-    h.write("  THREAD=");
-    h.write(h.thread_label(scheduler.currentThread()));
-    h.write("\n");
-    h.write("  PRINCIPAL=");
-    h.write(h.principal_label(scheduler.currentPrincipal()));
-    h.write("\n");
+fn writeExceptionWithErrorSummary(vec: u64, frame: *const ExceptionTrapFrame) void {
+    kernel_log.write(exceptionName(vec));
+    kernel_log.write("\n");
+    kernel_log.write("  THREAD=");
+    kernel_log.write(kernel_runtime.threadLabel(scheduler.currentThread()));
+    kernel_log.write("\n");
+    kernel_log.write("  PRINCIPAL=");
+    kernel_log.write(kernel_runtime.principalLabel(scheduler.currentPrincipal()));
+    kernel_log.write("\n");
     if (vec == 14) {
-        const cr2 = h.read_cr2();
+        const cr2 = x86_platform.readCr2();
         const user_mode = (frame.error_code & (1 << 2)) != 0;
-        h.write("  CR2=");
-        h.write_hex_raw(cr2);
-        h.write("\n");
-        h.dump_page_walk_for_va(if (user_mode) scheduler.currentCr3() else h.read_cr3(), cr2);
-        h.log_page_fault_step2(cr2, frame);
+        kernel_log.write("  CR2=");
+        kernel_log.writeHexRaw(cr2);
+        kernel_log.write("\n");
+        page_fault_log.dumpPageWalkForVa(if (user_mode) scheduler.currentCr3() else kernel_vm.readCr3(), cr2);
+        page_fault_log.logStep2(cr2, frame);
     }
-    h.write("  EC=");
-    h.write_hex_raw(frame.error_code);
-    h.write("\n");
-    h.write("  RIP=");
-    h.write_hex_raw(frame.rip);
-    h.write("\n");
-    h.write("  CS=");
-    h.write_hex_raw(frame.cs);
-    h.write("\n");
-    h.write("  SS=");
-    h.write_hex_raw(frame.ss);
-    h.write("\n");
-    writeCommonTrapRegs(h, frame);
+    kernel_log.write("  EC=");
+    kernel_log.writeHexRaw(frame.error_code);
+    kernel_log.write("\n");
+    kernel_log.write("  RIP=");
+    kernel_log.writeHexRaw(frame.rip);
+    kernel_log.write("\n");
+    kernel_log.write("  CS=");
+    kernel_log.writeHexRaw(frame.cs);
+    kernel_log.write("\n");
+    kernel_log.write("  SS=");
+    kernel_log.writeHexRaw(frame.ss);
+    kernel_log.write("\n");
+    writeCommonTrapRegs(frame);
 }
 
-fn writeTrapSummary(h: *const Hooks, label: []const u8, frame: *const TrapFrame) void {
-    h.write(label);
-    h.write("\n");
-    h.write("  THREAD=");
-    h.write(h.thread_label(scheduler.currentThread()));
-    h.write("\n");
-    h.write("  PRINCIPAL=");
-    h.write(h.principal_label(scheduler.currentPrincipal()));
-    h.write("\n");
-    h.write("  RIP=");
-    h.write_hex_raw(frame.rip);
-    h.write("\n");
-    writeCommonTrapRegs(h, frame);
+fn writeTrapSummary(label: []const u8, frame: *const TrapFrame) void {
+    kernel_log.write(label);
+    kernel_log.write("\n");
+    kernel_log.write("  THREAD=");
+    kernel_log.write(kernel_runtime.threadLabel(scheduler.currentThread()));
+    kernel_log.write("\n");
+    kernel_log.write("  PRINCIPAL=");
+    kernel_log.write(kernel_runtime.principalLabel(scheduler.currentPrincipal()));
+    kernel_log.write("\n");
+    kernel_log.write("  RIP=");
+    kernel_log.writeHexRaw(frame.rip);
+    kernel_log.write("\n");
+    writeCommonTrapRegs(frame);
 }
 
 pub export fn userReturnToSavedFrame() callconv(.naked) noreturn {
@@ -523,12 +491,11 @@ pub export fn syscallEntryStub() callconv(.naked) noreturn {
 }
 
 pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u64 {
-    const h = getHooks();
-    const cr2 = h.read_cr2();
+    const cr2 = x86_platform.readCr2();
     const ec = frame.error_code;
     const user_mode = (ec & (1 << 2)) != 0;
     if (!user_mode or !user_vm.isUserCanonicalVa(cr2)) return 0;
-    if (!h.kernel_state_ready.*) return 0;
+    if (!kernel_runtime.kernel_state_ready) return 0;
     const principal = scheduler.currentPrincipal();
     const fault_page_va = cr2 & ~@as(u64, 4095);
     const write_access = (ec & (1 << 1)) != 0;
@@ -536,7 +503,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     user_vm.lockAddressSpaces();
     defer user_vm.unlockAddressSpaces();
     if (write_access) {
-        if (h.state.ensureNativeVmaCowMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
+        if (kernel_runtime.kernel_state_global.ensureNativeVmaCowMapping(principal, fault_page_va, write_access, instruction_fetch, kernel_runtime.global_free_list)) |mapping| {
             if (mapping.invalidate_size_bytes != 0) {
                 if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return 0;
                 if (!user_vm.invalidatePresentUserLinearRegionPtes(
@@ -566,7 +533,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
         return 0;
     }
-    if (h.state.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, h.free_list)) |mapping| {
+    if (kernel_runtime.kernel_state_global.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, kernel_runtime.global_free_list)) |mapping| {
         var paddrs = [_]u64{mapping.paddr};
         const mapped = if (fault_page_va == 0 and mapping.prot.read and !mapping.prot.write and mapping.prot.exec)
             user_vm.mapLazyLowPageZeroPaddrsWithProt(
@@ -588,18 +555,16 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
 }
 
 pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    writeExceptionWithErrorSummary(h, vec, frame);
-    h.halt_loop();
+    writeExceptionWithErrorSummary(vec, frame);
+    halt.haltLoop();
 }
 
 pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) void {
-    const h = getHooks();
     asm volatile ("cli");
-    writeExceptionWithErrorSummary(h, vec, frame);
-    h.write("  ACTION=terminate process\n");
-    h.resume_after_fatal_user_exception(
+    writeExceptionWithErrorSummary(vec, frame);
+    kernel_log.write("  ACTION=terminate process\n");
+    resumeAfterFatalUserException(
         scheduler.currentPrincipal(),
         @intCast(vec),
         fatalExceptionResumeWorkFrameForCurrentCpuFromAsm(),
@@ -607,70 +572,63 @@ pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const Except
 }
 
 pub export fn doubleFaultHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    h.write("DOUBLE FAULT\n");
-    h.write("  EC=");
-    h.write_hex_raw(error_code);
-    h.write("\n");
-    h.halt_loop();
+    kernel_log.write("DOUBLE FAULT\n");
+    kernel_log.write("  EC=");
+    kernel_log.writeHexRaw(error_code);
+    kernel_log.write("\n");
+    halt.haltLoop();
 }
 
 pub export fn invalidTssHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    h.write("INVALID TSS\n");
-    h.write("  EC=");
-    h.write_hex_raw(error_code);
-    h.write("\n");
-    h.halt_loop();
+    kernel_log.write("INVALID TSS\n");
+    kernel_log.write("  EC=");
+    kernel_log.writeHexRaw(error_code);
+    kernel_log.write("\n");
+    halt.haltLoop();
 }
 
 pub export fn segmentNotPresentHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    h.write("SEGMENT NOT PRESENT\n");
-    h.write("  EC=");
-    h.write_hex_raw(error_code);
-    h.write("\n");
-    h.halt_loop();
+    kernel_log.write("SEGMENT NOT PRESENT\n");
+    kernel_log.write("  EC=");
+    kernel_log.writeHexRaw(error_code);
+    kernel_log.write("\n");
+    halt.haltLoop();
 }
 
 pub export fn stackSegmentFaultHandlerCommon(error_code: u64) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    h.write("STACK SEGMENT FAULT\n");
-    h.write("  EC=");
-    h.write_hex_raw(error_code);
-    h.write("\n");
-    h.halt_loop();
+    kernel_log.write("STACK SEGMENT FAULT\n");
+    kernel_log.write("  EC=");
+    kernel_log.writeHexRaw(error_code);
+    kernel_log.write("\n");
+    halt.haltLoop();
 }
 
 pub export fn invalidOpcodeHandlerCommon(frame: *const TrapFrame) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    writeTrapSummary(h, "INVALID OPCODE", frame);
-    h.halt_loop();
+    writeTrapSummary("INVALID OPCODE", frame);
+    halt.haltLoop();
 }
 
 pub export fn divideErrorHandlerCommon(frame: *const TrapFrame) callconv(.winapi) noreturn {
-    const h = getHooks();
     asm volatile ("cli");
-    writeTrapSummary(h, "DIVIDE ERROR", frame);
-    h.halt_loop();
+    writeTrapSummary("DIVIDE ERROR", frame);
+    halt.haltLoop();
 }
 
 pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(.winapi) void {
-    const h = getHooks();
     asm volatile ("cli");
     const label = switch (vec) {
         0 => "DIVIDE ERROR",
         6 => "INVALID OPCODE",
         else => "TRAP",
     };
-    writeTrapSummary(h, label, frame);
-    h.write("  ACTION=terminate process\n");
-    h.resume_after_fatal_user_exception(
+    writeTrapSummary(label, frame);
+    kernel_log.write("  ACTION=terminate process\n");
+    resumeAfterFatalUserException(
         scheduler.currentPrincipal(),
         @intCast(vec),
         fatalExceptionResumeWorkFrameForCurrentCpuFromAsm(),
@@ -678,7 +636,6 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
 }
 
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
-    const h = getHooks();
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
     const user_mode = ((frame.cs & 0x3) == 0x3) and ((frame.ss & 0x3) == 0x3);
@@ -687,7 +644,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             if (!scheduler.apUserThreadCanContinue()) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
-            if (scheduler.preemptApUserThread(h.scheduler_quantum_ticks, frame)) {
+            if (scheduler.preemptApUserThread(boot_static.scheduler_quantum_ticks, frame)) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
             return;
@@ -698,24 +655,23 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
         return;
     }
     scheduler.lapic_tick_count +%= 1;
-    if (!h.kernel_state_ready.*) return;
+    if (!kernel_runtime.kernel_state_ready) return;
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
     if (!user_mode) return;
-    if (h.scheduler_quantum_ticks == 0) return;
-    _ = scheduler.preemptBootstrapThread(h.scheduler_quantum_ticks, frame);
+    if (boot_static.scheduler_quantum_ticks == 0) return;
+    _ = scheduler.preemptBootstrapThread(boot_static.scheduler_quantum_ticks, frame);
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
-    const h = getHooks();
     const active_vector = lapic.activeInterruptVectorInRange(
         generic_device_interrupt_vector,
         device_interrupt_vector_count,
     ) orelse generic_device_interrupt_vector;
     lapic.eoi();
     _ = frame;
-    if (!h.kernel_state_ready.*) return;
+    if (!kernel_runtime.kernel_state_ready) return;
     var wake_owners: [16]kernel.PrincipalId = undefined;
-    const wake_count = h.state.recordDeviceInterruptEvent(active_vector, wake_owners[0..]);
+    const wake_count = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(active_vector, wake_owners[0..]);
     var i: usize = 0;
     while (i < wake_count) : (i += 1) {
         scheduler.wakeMailboxWaiter(wake_owners[i]);
@@ -916,7 +872,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\cmp $0x3, %rax
             \\jne 9f
         ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
-        asmCallAligned("saveCurrentThreadFxState") ++
+            asmCallAligned("saveCurrentThreadFxState") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("timerInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
@@ -1043,7 +999,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\cmp $0x3, %rax
             \\jne 9f
         ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
-        asmCallAligned("saveCurrentThreadFxState") ++
+            asmCallAligned("saveCurrentThreadFxState") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
         ++ asmCallAligned("deviceInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++

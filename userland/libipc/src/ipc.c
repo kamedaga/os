@@ -409,38 +409,22 @@ static int pacha_ipc_fast_pkey_available(uint32_t flags, uint32_t pkey, struct p
     return 1;
 }
 
-static int pacha_ipc_fast_map_rings(
+static int pacha_ipc_fast_map_pkey_rings(
     struct pacha_ipc_fast_channel *fast,
     int req_fd,
     int comp_fd,
-    uint32_t flags,
     uint32_t pkey,
     int offer_side
 ) {
-    const int requires_pkey = (flags & PACHA_IPC_FAST_F_REQUIRE_PKEY) != 0;
     const uint64_t ring_size = pacha_page_align_up(sizeof(struct pacha_ipc_fast_ring));
-    int can_pkey = pacha_ipc_fast_pkey_available(flags, pkey, fast);
-    if (can_pkey < 0) return -2;
-
-    uint64_t mmap_flags = PACHA_MMAP_SHARED;
-    if (can_pkey) mmap_flags = pacha_mmap_pkey_flags(mmap_flags, pkey);
+    const uint64_t mmap_flags = pacha_mmap_pkey_flags(PACHA_MMAP_SHARED, pkey);
     long request_raw = pacha_mmap_raw(req_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
     long completion_raw = pacha_mmap_raw(comp_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
     struct pacha_ipc_fast_ring *request = request_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)request_raw : 0;
     struct pacha_ipc_fast_ring *completion = completion_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)completion_raw : 0;
-    int mapped_with_pkey = can_pkey > 0 && request && completion;
-    if ((!request || !completion) && can_pkey > 0 && !requires_pkey) {
-        fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_PKEY_MMAP_FAILED;
-        mmap_flags = PACHA_MMAP_SHARED;
-        request_raw = pacha_mmap_raw(req_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
-        completion_raw = pacha_mmap_raw(comp_fd, ring_size, PACHA_PROT_READ | PACHA_PROT_WRITE, mmap_flags, 0);
-        request = request_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)request_raw : 0;
-        completion = completion_raw >= 4096 ? (struct pacha_ipc_fast_ring *)(uintptr_t)completion_raw : 0;
-        mapped_with_pkey = 0;
-    }
     if (!request || !completion) {
         fast->last_error = !request ? (int)request_raw : (int)completion_raw;
-        fast->fallback_reason = !request ? PACHA_IPC_FAST_FALLBACK_REQUEST_MMAP_FAILED : PACHA_IPC_FAST_FALLBACK_COMPLETION_MMAP_FAILED;
+        fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_PKEY_MMAP_FAILED;
         return -4;
     }
 
@@ -450,13 +434,11 @@ static int pacha_ipc_fast_map_rings(
     fast->completion = completion;
     fast->tx = offer_side ? request : completion;
     fast->rx = offer_side ? completion : request;
-    fast->backend = mapped_with_pkey ? PACHA_IPC_BACKEND_PKEY_RING : PACHA_IPC_BACKEND_SHARED_VMO_RING;
-    if (mapped_with_pkey) fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_NONE;
-    fast->pkey = mapped_with_pkey ? pkey : 0;
-    if (fast->backend == PACHA_IPC_BACKEND_PKEY_RING) {
-        const uint32_t old_pkru = pacha_ipc_pkru_read();
-        pacha_ipc_pkru_write(old_pkru | pacha_ipc_pkey_disable_mask(pkey));
-    }
+    fast->backend = PACHA_IPC_BACKEND_PKEY_RING;
+    fast->fallback_reason = PACHA_IPC_FAST_FALLBACK_NONE;
+    fast->pkey = pkey;
+    const uint32_t old_pkru = pacha_ipc_pkru_read();
+    pacha_ipc_pkru_write(old_pkru | pacha_ipc_pkey_disable_mask(pkey));
     return 0;
 }
 
@@ -482,6 +464,13 @@ int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, int c
     };
 
     const int requires_pkey = (flags & PACHA_IPC_FAST_F_REQUIRE_PKEY) != 0;
+    const int can_pkey = pacha_ipc_fast_pkey_available(flags, pkey, fast);
+    if (can_pkey <= 0) {
+        if (can_pkey < 0) return -2;
+        if (channel_fd >= 16 && !requires_pkey) return 0;
+        return -2;
+    }
+
     const uint64_t rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     const uint64_t ring_size = pacha_page_align_up(sizeof(struct pacha_ipc_fast_ring));
     const int req_fd = pacha_vmo_create(ring_size, rights, 0);
@@ -492,7 +481,7 @@ int pacha_ipc_fast_channel_init_local(struct pacha_ipc_fast_channel *fast, int c
         return -3;
     }
 
-    if (pacha_ipc_fast_map_rings(fast, req_fd, comp_fd, flags, pkey, 1) != 0) {
+    if (pacha_ipc_fast_map_pkey_rings(fast, req_fd, comp_fd, pkey, 1) != 0) {
         if (channel_fd >= 16 && !requires_pkey) return 0;
         return -4;
     }
@@ -586,7 +575,9 @@ int pacha_ipc_fast_channel_accept(struct pacha_ipc_fast_channel *fast, int contr
     const uint32_t remote_pkey = (uint32_t)msg.word3;
     const uint32_t effective_flags = flags | (remote_flags & (PACHA_IPC_FAST_F_PREFER_PKEY | PACHA_IPC_FAST_F_REQUIRE_PKEY));
     const uint32_t effective_pkey = pkey != 0 ? pkey : remote_pkey;
-    return pacha_ipc_fast_map_rings(fast, (int)fds[0].fd, (int)fds[1].fd, effective_flags, effective_pkey, 0);
+    const int can_pkey = pacha_ipc_fast_pkey_available(effective_flags, effective_pkey, fast);
+    if (can_pkey <= 0) return can_pkey < 0 ? -2 : 0;
+    return pacha_ipc_fast_map_pkey_rings(fast, (int)fds[0].fd, (int)fds[1].fd, effective_pkey, 0);
 }
 
 int pacha_ipc_fast_channel_ready(const struct pacha_ipc_fast_channel *fast) {
@@ -597,7 +588,7 @@ int pacha_ipc_fast_channel_ready(const struct pacha_ipc_fast_channel *fast) {
 
 int pacha_ipc_fast_channel_uses_ring(const struct pacha_ipc_fast_channel *fast) {
     if (!pacha_ipc_fast_channel_ready(fast)) return 0;
-    return fast->backend == PACHA_IPC_BACKEND_SHARED_VMO_RING || fast->backend == PACHA_IPC_BACKEND_PKEY_RING;
+    return fast->backend == PACHA_IPC_BACKEND_PKEY_RING;
 }
 
 void pacha_ipc_fast_entry_init(struct pacha_ipc_fast_entry *entry, uint64_t op, uint64_t offset, uint64_t len, uint64_t flags) {
@@ -660,7 +651,6 @@ int pacha_ipc_fast_serve_once(struct pacha_ipc_fast_channel *fast, pacha_ipc_fas
 const char *pacha_ipc_fast_backend_name(enum pacha_ipc_fast_backend backend) {
     switch (backend) {
         case PACHA_IPC_BACKEND_NORMAL: return "normal";
-        case PACHA_IPC_BACKEND_SHARED_VMO_RING: return "shared_vmo_ring";
         case PACHA_IPC_BACKEND_PKEY_RING: return "pkey_ring";
         default: return "unknown";
     }
@@ -674,9 +664,6 @@ const char *pacha_ipc_fast_fallback_reason_name(enum pacha_ipc_fast_fallback_rea
         case PACHA_IPC_FAST_FALLBACK_PKEY_UNAVAILABLE: return "pkey_unavailable";
         case PACHA_IPC_FAST_FALLBACK_VMO_CREATE_FAILED: return "vmo_create_failed";
         case PACHA_IPC_FAST_FALLBACK_PKEY_MMAP_FAILED: return "pkey_mmap_failed";
-        case PACHA_IPC_FAST_FALLBACK_RING_MMAP_FAILED: return "ring_mmap_failed";
-        case PACHA_IPC_FAST_FALLBACK_REQUEST_MMAP_FAILED: return "request_mmap_failed";
-        case PACHA_IPC_FAST_FALLBACK_COMPLETION_MMAP_FAILED: return "completion_mmap_failed";
         default: return "unknown";
     }
 }
