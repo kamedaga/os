@@ -139,6 +139,7 @@ int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
             }
             const int64_t err = lpr_pacha_status_to_errno(n);
             if (err == -LPR_LINUX_EPIPE) {
+                lpr_linux_raise_sigpipe();
                 return err;
             }
             if (err != -LPR_LINUX_EAGAIN ||
@@ -146,7 +147,8 @@ int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
             {
                 return err;
             }
-            const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u);
+            const uint64_t min_write = count <= LPR_LINUX_PIPE_BUF_BYTES ? count : 1;
+            const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u, min_write);
             if (wait_status != 0) {
                 return wait_status;
             }
@@ -187,6 +189,7 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                 }
                 const int64_t err = lpr_pacha_status_to_errno(n);
                 if (err == -LPR_LINUX_EPIPE) {
+                    lpr_linux_raise_sigpipe();
                     return err;
                 }
                 if (err != -LPR_LINUX_EAGAIN ||
@@ -194,7 +197,8 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                 {
                     return err;
                 }
-                const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u);
+                const uint64_t min_write = lpr_pipe_writev_wait_min(iov_raw, iov_count);
+                const int64_t wait_status = lpr_pipe_wait(fd, 0x0004u, min_write);
                 if (wait_status != 0) {
                     return wait_status;
                 }

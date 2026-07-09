@@ -220,13 +220,22 @@ pub fn pipeFree(slot: *const PipeSlot) usize {
     return pipe_buffer_bytes - pipeUsed(slot);
 }
 
+pub fn pipeWritableReady(slot: *const PipeSlot) bool {
+    return pipeFree(slot) != 0;
+}
+
+pub fn pipeWritableReadyForBytes(slot: *const PipeSlot, min_write_bytes: u64) bool {
+    const required = if (min_write_bytes == 0) 1 else min_write_bytes;
+    return @as(u64, @intCast(pipeFree(slot))) >= required;
+}
+
 pub fn pipeReadyEventsForEndpoint(slot: *const PipeSlot, endpoint: PipeEndpointObject) u64 {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     var ready: u64 = 0;
     if (endpoint.write) {
         if (slot.read_refs == 0) {
             ready |= fd_abi.event_error | fd_abi.event_hangup;
-        } else if (pipeFree(slot) != 0) {
+        } else if (pipeWritableReady(slot)) {
             ready |= fd_abi.event_writable;
         }
     } else {
@@ -342,6 +351,7 @@ pub fn registerPipeWaiterForFd(
     fd: Fd,
     requested_events: u64,
     pollfd_va: u64,
+    min_write_bytes: u64,
     thread_index: usize,
     thread_generation: u32,
 ) KernelError!bool {
@@ -363,7 +373,7 @@ pub fn registerPipeWaiterForFd(
         .side = if (endpoint.write) 1 else 0,
     };
     const waiters = self.pipeWaitListForEndpoint(endpoint) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, thread_index, thread_generation);
+    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, min_write_bytes, thread_index, thread_generation);
     return true;
 }
 
@@ -397,5 +407,6 @@ pub fn takePipeWaiters(
     out: []ThreadWakeTarget,
 ) usize {
     const pipe = self.pipeSlot(pipe_ref) orelse return 0;
-    return pipe.waiters[if (write_side) 1 else 0].takeEvents(ready_events, out);
+    const writable_bytes: u64 = if (write_side) @intCast(@TypeOf(self.*).pipeFree(pipe)) else 0;
+    return pipe.waiters[if (write_side) 1 else 0].takeEventsWithWritableBytes(ready_events, writable_bytes, out);
 }

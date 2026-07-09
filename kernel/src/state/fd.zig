@@ -610,6 +610,10 @@ pub fn fdIpcWritable(self: anytype, payload: *const KernelObjectPayload) bool {
 }
 
 pub fn fdPollEvents(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, now_tick: u64) ?u64 {
+    return self.fdPollEventsWithWriteMin(owner, fd, requested, now_tick, 0);
+}
+
+pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, now_tick: u64, min_write_bytes: u64) ?u64 {
     const entry = self.fdEntryConst(owner, fd) orelse return null;
     if (!entry.rights.poll) return null;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
@@ -640,7 +644,7 @@ pub fn fdPollEvents(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, n
             .schedctl => entry.rights.write,
             .pipe => |endpoint| blk: {
                 const pipe = self.pipeSlotConst(endpoint.pipe) orelse break :blk false;
-                break :blk endpoint.write and pipe.read_refs != 0 and @TypeOf(self.*).pipeFree(pipe) != 0;
+                break :blk endpoint.write and pipe.read_refs != 0 and @TypeOf(self.*).pipeWritableReadyForBytes(pipe, min_write_bytes);
             },
             else => false,
         };

@@ -30,7 +30,7 @@ run_case() {
 }
 
 run_case "GNUCU_CASE1" "1"   "/bin/coreutils --version | /usr/bin/head -n 1 | /usr/bin/wc -l"
-run_case "GNUCU_CASE2" "ok"  "/bin/ls --version | /usr/bin/head -n 1 | /bin/grep -q 'GNU coreutils' && /bin/echo ok"
+run_case "GNUCU_CASE2" "ok"  "/bin/ls --version | /usr/bin/head -n 1 | $bb grep -q 'GNU coreutils' && /bin/echo ok"
 run_case "GNUCU_CASE3" "gnu" "/bin/echo gnu | /bin/cat"
 run_case "GNUCU_CASE4" "3"   "/usr/bin/printf abc | /usr/bin/wc -c"
 run_case "GNUCU_CASE5" "2"   "/usr/bin/printf 'a\nb\nc\n' | /usr/bin/head -n 2 | /usr/bin/wc -l"

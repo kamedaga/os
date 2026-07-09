@@ -331,6 +331,12 @@ int64_t lpr_linux_dispatch_pending_signals(void)
     return result;
 }
 
+static void lpr_linux_raise_sigpipe(void)
+{
+    lpr_linux_queue_signal(LPR_LINUX_SIGPIPE);
+    (void)lpr_linux_dispatch_pending_signals();
+}
+
 static uint64_t lpr_linux_unblockable_signal_mask(void)
 {
     return lpr_linux_signal_bit(LPR_LINUX_SIGKILL) |
@@ -414,4 +420,3 @@ static int64_t lpr_tty_open_path(const char *path, uint64_t flags)
     }
     return fd;
 }
-

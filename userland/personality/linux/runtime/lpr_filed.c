@@ -90,6 +90,7 @@ void *memset(void *dst, int c, size_t n)
 #define LPR_LINUX_SIG_SETMASK 2ull
 #define LPR_LINUX_SIG_DFL 0ull
 #define LPR_LINUX_SIGKILL 9u
+#define LPR_LINUX_SIGPIPE 13u
 #define LPR_LINUX_SIGCHLD 17u
 #define LPR_LINUX_SIGCONT 18u
 #define LPR_LINUX_SIGSTOP 19u

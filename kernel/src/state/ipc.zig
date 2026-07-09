@@ -601,7 +601,7 @@ pub fn registerIpcReadableWaiterForFd(
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
     const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
     const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, thread_index, thread_generation);
+    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, 0, thread_index, thread_generation);
 }
 
 pub fn registerIpcRecvCompletionWaiterForFd(
@@ -621,7 +621,7 @@ pub fn registerIpcRecvCompletionWaiterForFd(
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
     const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
     const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, 0, msg_va, fd, fd_capacity, fd_abi.event_readable, thread_index, thread_generation);
+    try waiters.register(key, owner, 0, msg_va, fd, fd_capacity, fd_abi.event_readable, 0, thread_index, thread_generation);
 }
 
 pub fn unregisterIpcReadableWaiterForFd(

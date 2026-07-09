@@ -18,6 +18,7 @@ const max_pollfds: usize = @intCast(fd_abi.max_pollfds);
 const PollItem = struct {
     fd: kernel.Fd = 0,
     events: u64 = 0,
+    min_write_bytes: u64 = 0,
     item_va: u64 = 0,
 };
 
@@ -121,13 +122,19 @@ fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.Pipe
     return wakeThreadTargets(h, wake_storage[0..wake_count]);
 }
 
+fn wakeReadyPipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool) bool {
+    const ready_events = state.pipeReadyEventsForSide(pipe_ref, write_side) orelse return false;
+    if (ready_events == 0) return true;
+    return wakePipeWaiters(h, state, pipe_ref, write_side, ready_events);
+}
+
 fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64, len: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
     if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
         if (endpoint.write) return sc.syscall_err_invalid;
         if (len == 0) return 0;
         var total: u64 = 0;
-        var buf: [256]u8 = undefined;
+        var buf: [kernel.pipe_buffer_bytes]u8 = undefined;
         while (total < len) {
             const chunk_len: usize = @intCast(@min(len - total, buf.len));
             const got = state.pipeReadBytes(proc, fd, buf[0..chunk_len]) catch |err| {
@@ -136,7 +143,7 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
             if (got == 0) return total;
             if (!h.copy_bytes_to_user_va(proc, out_va + total, buf[0..got])) return sc.syscall_err_invalid;
             total += got;
-            if (!wakePipeWaiters(h, state, endpoint.pipe, true, fd_abi.event_writable)) return sc.syscall_err_invalid;
+            if (!wakeReadyPipeWaiters(h, state, endpoint.pipe, true)) return sc.syscall_err_invalid;
             if (got < chunk_len) return total;
         }
         return total;
@@ -243,7 +250,7 @@ fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
     if (state.pipeEndpointForFd(proc, fd)) |endpoint| {
         if (endpoint.write) return sc.syscall_err_invalid;
         var total: u64 = 0;
-        var buf: [256]u8 = undefined;
+        var buf: [kernel.pipe_buffer_bytes]u8 = undefined;
         var i: u64 = 0;
         while (i < iov_count) : (i += 1) {
             const item_va = iov_va + i * fd_abi.iovec_size;
@@ -261,7 +268,7 @@ fn fdReadv(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
                 if (!h.copy_bytes_to_user_va(proc, base + offset, buf[0..got])) return sc.syscall_err_invalid;
                 offset += got;
                 total += got;
-                if (!wakePipeWaiters(h, state, endpoint.pipe, true, fd_abi.event_writable)) return sc.syscall_err_invalid;
+                if (!wakeReadyPipeWaiters(h, state, endpoint.pipe, true)) return sc.syscall_err_invalid;
                 if (got < chunk_len) return total;
             }
         }
@@ -394,10 +401,12 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
         const item_va = pollfds_va + @as(u64, @intCast(i)) * fd_abi.pollfd_size;
         const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
         const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
+        const min_write_bytes = h.read_user_u64(proc, item_va + fd_abi.pollfd_revents_offset) orelse return null;
         if ((events & ~fd_abi.event_known_mask) != 0) return null;
         out[i] = .{
             .fd = @intCast(fd_u64),
             .events = events,
+            .min_write_bytes = if ((events & fd_abi.event_writable) != 0) min_write_bytes else 0,
             .item_va = item_va,
         };
     }
@@ -407,7 +416,7 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
 fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
     var ready_count: u64 = 0;
     for (items) |item| {
-        const revents = state.fdPollEvents(proc, item.fd, item.events, now_tick) orelse return null;
+        const revents = state.fdPollEventsWithWriteMin(proc, item.fd, item.events, now_tick, item.min_write_bytes) orelse return null;
         if (!h.write_user_u64(proc, item.item_va + fd_abi.pollfd_revents_offset, revents)) return null;
         if (revents != 0) ready_count += 1;
     }
@@ -425,7 +434,7 @@ fn registerCachedWaitersForPoll(
         if (try state.registerTaskReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation)) {
             continue;
         }
-        if (try state.registerPipeWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation)) {
+        if (try state.registerPipeWaiterForFd(proc, item.fd, item.events, item.item_va, item.min_write_bytes, thread_index, thread_generation)) {
             continue;
         }
         try state.registerIpcReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation);

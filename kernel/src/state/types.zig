@@ -478,6 +478,7 @@ pub const IpcWaiter = struct {
     recv_fd: Fd = 0,
     recv_fd_capacity: u8 = 0,
     events: u64 = 0,
+    min_write_bytes: u64 = 0,
     key: IpcWaitKey = .{},
 };
 
@@ -546,6 +547,7 @@ pub const IpcWaitList = struct {
         recv_fd: Fd,
         recv_fd_capacity: u8,
         events: u64,
+        min_write_bytes: u64,
         thread_index: usize,
         thread_generation: u32,
     ) KernelError!void {
@@ -568,6 +570,7 @@ pub const IpcWaitList = struct {
                 waiter.recv_msg_va = recv_msg_va;
                 waiter.recv_fd = recv_fd;
                 waiter.recv_fd_capacity = recv_fd_capacity;
+                if (min_write_bytes > waiter.min_write_bytes) waiter.min_write_bytes = min_write_bytes;
                 return;
             }
         }
@@ -582,6 +585,7 @@ pub const IpcWaitList = struct {
             .recv_fd = recv_fd,
             .recv_fd_capacity = recv_fd_capacity,
             .events = events,
+            .min_write_bytes = min_write_bytes,
             .key = key,
         };
     }
@@ -608,11 +612,18 @@ pub const IpcWaitList = struct {
     }
 
     pub fn takeEvents(self: *IpcWaitList, ready_events: u64, out: []ThreadWakeTarget) usize {
+        return self.takeEventsWithWritableBytes(ready_events, std.math.maxInt(u64), out);
+    }
+
+    pub fn takeEventsWithWritableBytes(self: *IpcWaitList, ready_events: u64, writable_bytes: u64, out: []ThreadWakeTarget) usize {
         const fd_abi = @import("kernel_abi_root").fd_abi;
         var count: usize = 0;
         for (self.waiters[0..]) |*waiter| {
             if (!waiter.active) continue;
-            const revents = ready_events & (waiter.events | fd_abi.event_error | fd_abi.event_hangup);
+            var revents = ready_events & (waiter.events | fd_abi.event_error | fd_abi.event_hangup);
+            if ((revents & fd_abi.event_writable) != 0 and waiter.min_write_bytes != 0 and writable_bytes < waiter.min_write_bytes) {
+                revents &= ~fd_abi.event_writable;
+            }
             if (revents == 0) continue;
             const target = ThreadWakeTarget{
                 .owner = waiter.owner,

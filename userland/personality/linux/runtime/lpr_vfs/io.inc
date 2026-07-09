@@ -157,7 +157,7 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
             {
                 return err;
             }
-            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u);
+            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u, 0);
             if (wait_status != 0) {
                 return wait_status;
             }
@@ -221,7 +221,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             {
                 return err;
             }
-            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u);
+            const int64_t wait_status = lpr_pipe_wait(fd, 0x0001u, 0);
             if (wait_status != 0) {
                 return wait_status;
             }
