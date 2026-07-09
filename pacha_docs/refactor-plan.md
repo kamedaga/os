@@ -155,6 +155,13 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 
 ### Phase 3 — LPR
 
+**T3.0 pipe 安定化 (調査 → 再現スモーク → 修正)**
+- 現象 (2026-07-09 ユーザー報告): busybox でのパイプ利用が全然動かない・不安定。clang はパイプ多用のため本リファクタの目標に直結する。
+- 再現スモークを `tests/` に新設: 多段パイプライン (`ls | grep | wc`)、パイプバッファ超えの大量データ、`yes | head` (EPIPE/SIGPIPE)、writer close → reader EOF 伝播、O_NONBLOCK、dup2 での stdio 差し替え、fork 越しの pipe fd 継承、をカバーし失敗モードを分類・記録する。
+- 構造的疑い: LPR が fd 種別ごとに別シャドウテーブル (`lpr_pipe_fds` / socket / eventfd / filed fd) を持ち相互 negative check で判別している分裂構造。これが原因の失敗は、kind タグ付きの単一 fd table への統合 (T3.3 の前倒し) で直す。
+- kernel pipe (`state/pipe.zig`) 側の blocking/wakeup/EOF バグはその場で修正 (kernel 編集許可済み)。
+- 受け入れ: 新パイプスモーク全ケース通過 + 既存スモーク 3 本通過。以後このスモークを標準検証セットに加える。
+
 **T3.1 syscall dispatch の table 化 + .inc 廃止**
 - 3 つの switch を `{nr, handler}` の単一テーブルに。`lpr_vfs/*.inc` 等の textual include を通常の .c/.h に変換 (build script 更新込み)。
 - 受け入れ: 全スモーク通過。ENOSYS トレース (T0.1 経由) が syscall 名付きで出る。
@@ -207,6 +214,6 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 |---|---|---|
 | 1 | T0.1, T0.2 | — |
 | 2 | T1.1 (最優先: clang 根治), T1.2, T2.1, T3.1 | Phase 0 |
-| 3 | T1.3, T1.4, T2.2, T2.3, T3.2, T3.3 | 上記 |
+| 3 | T1.3, T1.4, T2.2, T2.3, T3.0 (pipe 安定化), T3.2, T3.3 | 上記 |
 | 4 | T3.4 → T4.1, T2.2 → T4.2, T4.3, T4.4, T4.5 | Phase 1–3 |
 | 5 | T5.1 | 全部 |
