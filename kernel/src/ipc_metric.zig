@@ -9,9 +9,6 @@ pub const Op = enum(usize) {
     wait_repoll,
     send_enqueue,
     send_wake,
-    wake_to_resume,
-    wake_to_resume_same_cpu,
-    wake_to_resume_remote_cpu,
     _count,
 };
 
@@ -83,7 +80,7 @@ fn reportLocked() void {
         },
     );
     kernel_log.writeFmt(
-        "[ipc-metric] send_enqueue count={} avg={} max={} send_wake count={} avg={} max={} wake_to_resume count={} avg={} max={}\n",
+        "[ipc-metric] send_enqueue count={} avg={} max={} send_wake count={} avg={} max={}\n",
         .{
             metrics[@intFromEnum(Op.send_enqueue)].count,
             avg(metrics[@intFromEnum(Op.send_enqueue)]),
@@ -91,20 +88,6 @@ fn reportLocked() void {
             metrics[@intFromEnum(Op.send_wake)].count,
             avg(metrics[@intFromEnum(Op.send_wake)]),
             metrics[@intFromEnum(Op.send_wake)].max_cycles,
-            metrics[@intFromEnum(Op.wake_to_resume)].count,
-            avg(metrics[@intFromEnum(Op.wake_to_resume)]),
-            metrics[@intFromEnum(Op.wake_to_resume)].max_cycles,
-        },
-    );
-    kernel_log.writeFmt(
-        "[ipc-metric] wake_resume_by_cpu same count={} avg={} max={} remote count={} avg={} max={}\n",
-        .{
-            metrics[@intFromEnum(Op.wake_to_resume_same_cpu)].count,
-            avg(metrics[@intFromEnum(Op.wake_to_resume_same_cpu)]),
-            metrics[@intFromEnum(Op.wake_to_resume_same_cpu)].max_cycles,
-            metrics[@intFromEnum(Op.wake_to_resume_remote_cpu)].count,
-            avg(metrics[@intFromEnum(Op.wake_to_resume_remote_cpu)]),
-            metrics[@intFromEnum(Op.wake_to_resume_remote_cpu)].max_cycles,
         },
     );
     while (next_report <= total) next_report += report_every;

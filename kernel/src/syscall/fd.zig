@@ -930,17 +930,17 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
             return switch (request) {
                 scheduler_abi.ioctl_query_caps => writeSchedulerCaps(h, proc, arg_va),
                 scheduler_abi.ioctl_commit => blk: {
-                    const metric_start = scheduler.externalSchedulerMetricTimestamp();
+                    const trace_start = scheduler.externalSchedulerTraceTimestamp();
                     const commit = readSchedulerCommit(h, proc, arg_va) orelse {
-                        scheduler.noteExternalSchedulerCommitIoctlCycles(metric_start);
+                        scheduler.traceExternalSchedulerCommitIoctl(trace_start);
                         break :blk sc.syscall_err_invalid;
                     };
                     const caller_thread = scheduler.currentThread();
                     if (!scheduler.commitPolicyDecision(commit.cpu_id, commit.thread_id, commit.generation, frame, sc.syscall_ok)) {
-                        scheduler.noteExternalSchedulerCommitIoctlCycles(metric_start);
+                        scheduler.traceExternalSchedulerCommitIoctl(trace_start);
                         break :blk sc.syscall_err_invalid;
                     }
-                    scheduler.noteExternalSchedulerCommitIoctlCycles(metric_start);
+                    scheduler.traceExternalSchedulerCommitIoctl(trace_start);
                     const resumed_thread = scheduler.currentThread();
                     break :blk if (resumed_thread != caller_thread) frame.rax else sc.syscall_ok;
                 },
