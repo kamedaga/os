@@ -146,9 +146,12 @@ Phase 4 の T4.1 は T3.4 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - page / dir / negative-lookup / file-VMO の 4 キャッシュを、backend_object をキーとする単一の `filed_cache` モジュールに統合。無効化 API は `filed_cache_invalidate(object)` 1 つ。dirty 管理・flush も同モジュールへ。
 - 受け入れ: ext4 永続化スモーク (`run-lpr-qemu-ext4-sync-persistence.sh`) 通過。書き込み→再起動→読み出しの一致。ベンチ非劣化。
 
-**T2.3 exec イメージ構築の所有権を personality へ**
-- `filed/src/exec/linux_lpr/{map,image,plan}.c` の zpoline / LPR レイアウト知識を `personality/` 配下の純関数ライブラリ (入力: ELF/argv/env, 出力: mapping plan) として抽出。filed は plan を実行する mapper だけを持ち、`personality/zpoline.h` への include を消す。
-- 受け入れ: execve スモーク (busybox, Python3 起動) 通過。`execve_to_child_start` ベンチ非劣化。
+**T2.3 exec 境界の契約明文化 (filed↔personality)**
+- 改訂 (2026-07-09, ユーザー指摘): ビルダーを personality へ移すと、freestanding な runtime 動的ライブラリとサーバ側ビルダーが同居して逆に複雑化する。exec ビルダーは filed に残す。zpoline/LPR の知識が `filed/src/exec/linux_lpr/` 内に収まっていること自体は問題ではない。
+- 問題は境界の契約が暗黙な点: filed が runtime 内部ヘッダ `personality/zpoline.h` を直接 include しており、レイアウト合意が「同じヘッダを見ている」ことでしか担保されない。
+- 対処: zpoline トランポリン/イメージレイアウト定数・entry/bootstrap プロトコルだけを共有 ABI ヘッダ (`personality/include/personality/lpr_image_abi.h`、定数のみ・コードなし、`lpr_client_abi.h` と同パターン) に抽出。filed と LPR runtime の両方がこれを見る。filed から `zpoline.h` include を排除。
+- 契約バージョン定数を bootstrap ページに埋め、LPR runtime 起動時に検証 (不一致は即エラー) — レイアウトドリフトを起動時に検出可能に。
+- 受け入れ: execve スモーク通過。`execve_to_child_start` ベンチ非劣化。filed から personality の runtime 内部ヘッダへの include が 0 件。
 
 ### Phase 3 — LPR
 
