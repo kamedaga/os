@@ -1,6 +1,7 @@
 /// Kernel boot entry point and primary boot globals.
 /// Bootloader-specific entry code switches to the ring-0 stack before entering
 /// this module.
+const abi_root = @import("kernel_abi_root");
 const kernel = @import("../kernel.zig");
 const kernel_runtime = @import("../kernel_runtime.zig");
 const elf_loader = @import("../elf_loader.zig");
@@ -33,7 +34,14 @@ const log_util = @import("../log_util.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
+const fd_abi = abi_root.fd_abi;
 const enable_exit_teardown_metrics = false;
+const max_pipe_close_wakes = kernel.fd_table_entries;
+
+const PendingPipeCloseWake = struct {
+    pipe: kernel.PipeRef,
+    wake_side_write: bool,
+};
 
 // ---------------------------------------------------------------------------
 // Boot globals
@@ -409,6 +417,46 @@ fn scrubEndpointTargets(table: *kernel.EndpointTable, target: kernel.PrincipalId
     return changed;
 }
 
+fn collectPipeCloseWakesForProcess(
+    principal: kernel.PrincipalId,
+    out: []PendingPipeCloseWake,
+) usize {
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
+    const table = kernel_runtime.kernel_state_global.fdTableForProcessIndexConst(process_index) orelse return 0;
+    var count: usize = 0;
+    for (table.entries[0..]) |entry| {
+        if (entry.object.isNull()) continue;
+        const slot = kernel_runtime.kernel_state_global.kernelObjectSlotConst(entry.object) orelse continue;
+        const endpoint = kernel.KernelState.pipeEndpointFromPayload(&slot.payload) orelse continue;
+        if (count >= out.len) break;
+        out[count] = .{
+            .pipe = endpoint.pipe,
+            .wake_side_write = !endpoint.write,
+        };
+        count += 1;
+    }
+    return count;
+}
+
+fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
+    for (targets) |target| {
+        if (target.pollfd_va != 0) {
+            _ = user_copy.writeUserU64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
+        }
+        _ = scheduler.wakeIfWaitingGenerationWithRax(target.thread_index, target.thread_generation, 1);
+    }
+}
+
+fn wakeReadyPipeCloseWaiters(pending_wakes: []const PendingPipeCloseWake) void {
+    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
+    for (pending_wakes) |pending| {
+        const ready_events = kernel_runtime.kernel_state_global.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
+        if (ready_events == 0) continue;
+        const wake_count = kernel_runtime.kernel_state_global.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
+        wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
+    }
+}
+
 fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
     if (scheduler.loadNextReadyThread(out_frame)) return;
     halt.haltWithMessage("kernel scheduler unavailable");
@@ -417,6 +465,8 @@ fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
+    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
+    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
 
     _ = scheduler.releasePrincipalThreads(principal);
 
@@ -425,6 +475,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockAddressSpaces();
+    wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -455,6 +506,8 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
     const metric_start = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
+    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
+    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
 
     _ = scheduler.releasePrincipalThreads(principal);
     const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
@@ -467,6 +520,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     user_vm.unlockAddressSpaces();
+    wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
     const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 

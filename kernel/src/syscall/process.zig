@@ -15,6 +15,12 @@ const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_process_map_batch_entries: usize = @intCast(process_abi.process_map_batch_max_entries);
 const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_batch_entry_size);
+const max_pipe_close_wakes = kernel.fd_table_entries;
+
+const PendingPipeCloseWake = struct {
+    pipe: kernel.PipeRef,
+    wake_side_write: bool,
+};
 
 const ProcessCloneUserFrame = extern struct {
     r15: u64,
@@ -163,6 +169,64 @@ fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.P
     return handoff_target;
 }
 
+fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) void {
+    for (targets) |target| {
+        if (target.pollfd_va != 0) {
+            _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
+        }
+        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+    }
+}
+
+fn collectPipeCloseWakesForProcess(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    cloexec_only: bool,
+    out: []PendingPipeCloseWake,
+) usize {
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
+    const table = state.fdTableForProcessIndexConst(process_index) orelse return 0;
+    var count: usize = 0;
+    for (table.entries[0..]) |entry| {
+        if (entry.object.isNull()) continue;
+        if (cloexec_only and !entry.flags.cloexec) continue;
+        const slot = state.kernelObjectSlotConst(entry.object) orelse continue;
+        const endpoint = kernel.KernelState.pipeEndpointFromPayload(&slot.payload) orelse continue;
+        if (count >= out.len) break;
+        out[count] = .{
+            .pipe = endpoint.pipe,
+            .wake_side_write = !endpoint.write,
+        };
+        count += 1;
+    }
+    return count;
+}
+
+fn wakeReadyPipeCloseWaiters(
+    h: anytype,
+    state: *kernel.KernelState,
+    pending_wakes: []const PendingPipeCloseWake,
+) void {
+    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
+    for (pending_wakes) |pending| {
+        const ready_events = state.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
+        if (ready_events == 0) continue;
+        const wake_count = state.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
+        wakeThreadTargets(h, wake_storage[0..wake_count]);
+    }
+}
+
+fn closeCloexecFdsWithPipeWakes(
+    h: anytype,
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+) kernel.KernelError!void {
+    var pending_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
+    const pending_count = collectPipeCloseWakesForProcess(state, principal, true, pending_wakes[0..]);
+    try state.closeCloexecFdsWithFreeList(principal, h.free_list);
+    wakeReadyPipeCloseWaiters(h, state, pending_wakes[0..pending_count]);
+}
+
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
     const index: usize = @intCast(thread.thread_index);
     const owner: kernel.PrincipalId = @enumFromInt(thread.owner_principal_raw);
@@ -172,6 +236,8 @@ fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
 
 fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId, exit_state: kernel.TaskObjectState, exit_code: u32) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
+    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
+    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, false, pending_pipe_wakes[0..]);
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
     state.markProcessObjectsExited(principal, exit_state, exit_code);
     _ = wakeTaskFdWaiters(h, state, principal);
@@ -181,6 +247,7 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     state.releasePrincipalNativeMemory(principal, h.free_list);
     state.resetProcessRuntimeTables(process_index);
     user_vm.unlockAddressSpaces();
+    wakeReadyPipeCloseWaiters(h, state, pending_pipe_wakes[0..pending_pipe_wake_count]);
     _ = state.unpublishServiceEndpointsForTarget(principal);
     _ = state.markProcessExited(principal);
 }
@@ -653,7 +720,7 @@ fn execFromStagedProcess(
     };
 
     cleanupProcess(h, state, staged_owner, .exited, 0);
-    state.closeCloexecFdsWithFreeList(proc, h.free_list) catch return sc.syscall_err_invalid;
+    closeCloexecFdsWithPipeWakes(h, state, proc) catch return sc.syscall_err_invalid;
     if (!scheduler.installExecContextForCurrentThread(h.user_spaces, proc, image)) return sc.syscall_err_invalid;
     frame.* = image.frame;
     return sc.syscall_ok;
