@@ -1,0 +1,201 @@
+#define _GNU_SOURCE
+#include <signal.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t handled;
+static volatile sig_atomic_t altstack_ok;
+static unsigned char alternate_stack[SIGSTKSZ * 2];
+
+static void write_marker(const char *text)
+{
+    (void)write(STDOUT_FILENO, text, strlen(text));
+}
+
+static void sigint_handler(int signo)
+{
+    if (signo == SIGINT) {
+        handled = 1;
+        write_marker("ASYNC_HANDLER_CALLED\n");
+    }
+}
+
+static void altstack_handler(int signo, siginfo_t *info, void *context)
+{
+    (void)info;
+    (void)context;
+    stack_t current;
+    unsigned char local;
+    const uintptr_t local_addr = (uintptr_t)&local;
+    const uintptr_t stack_start = (uintptr_t)alternate_stack;
+    const uintptr_t stack_end = stack_start + sizeof(alternate_stack);
+    if (signo == SIGINT &&
+        sigaltstack(0, &current) == 0 &&
+        (current.ss_flags & SS_ONSTACK) != 0 &&
+        local_addr >= stack_start && local_addr < stack_end)
+    {
+        altstack_ok = 1;
+        write_marker("ASYNC_ALTSTACK_ONSTACK=OK\n");
+    } else {
+        write_marker("ASYNC_ALTSTACK_ONSTACK=BAD\n");
+    }
+    handled = 1;
+}
+
+static int run_loop(void)
+{
+    write_marker("ASYNC_LOOP_READY\n");
+    for (;;) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+}
+
+static int run_handler(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = sigint_handler;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, 0) != 0) {
+        return 2;
+    }
+    write_marker("ASYNC_HANDLER_READY\n");
+    while (!handled) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+    write_marker("ASYNC_HANDLER_CONTINUED\n");
+    return 0;
+}
+
+static int run_altstack(void)
+{
+    stack_t stack;
+    memset(&stack, 0, sizeof(stack));
+    stack.ss_sp = alternate_stack;
+    stack.ss_size = sizeof(alternate_stack);
+    if (sigaltstack(&stack, 0) != 0) {
+        return 3;
+    }
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = altstack_handler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, 0) != 0) {
+        return 4;
+    }
+    write_marker("ASYNC_ALTSTACK_READY\n");
+    while (!handled) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+    if (!altstack_ok) {
+        return 5;
+    }
+    write_marker("ASYNC_ALTSTACK_CONTINUED\n");
+    return 0;
+}
+
+static int child_status_matches(int status, int signal)
+{
+    if (WIFSIGNALED(status) && WTERMSIG(status) == signal) {
+        return 1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 128 + signal;
+}
+
+static int run_signaled_child(const char *mode, int signal, int expect_signal)
+{
+    const pid_t pid = fork();
+    if (pid < 0) {
+        return 20;
+    }
+    if (pid == 0) {
+        if (strcmp(mode, "handler") == 0) {
+            _exit(run_handler());
+        }
+        if (strcmp(mode, "altstack") == 0) {
+            _exit(run_altstack());
+        }
+        _exit(run_loop());
+    }
+    sleep(1);
+    if (kill(pid, signal) != 0) {
+        (void)kill(pid, SIGKILL);
+        return 21;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        return 22;
+    }
+    if (expect_signal != 0) {
+        return child_status_matches(status, expect_signal) ? 0 : 23;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 24;
+}
+
+static int run_busybox_timeout(const char *self)
+{
+    const pid_t pid = fork();
+    if (pid < 0) {
+        return 30;
+    }
+    if (pid == 0) {
+        execl("/cmd/busybox", "busybox", "timeout", "1", self, "loop", (char *)0);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        return 31;
+    }
+    return WIFEXITED(status) &&
+        (WEXITSTATUS(status) == 124 || WEXITSTATUS(status) == 128 + SIGTERM) ? 0 : 32;
+}
+
+static int run_suite(const char *self)
+{
+    if (run_signaled_child("loop", SIGINT, SIGINT) != 0) {
+        return 40;
+    }
+    write_marker("ASYNC_SIGINT_DEFAULT=OK\n");
+    if (run_signaled_child("loop", SIGKILL, SIGKILL) != 0) {
+        return 41;
+    }
+    write_marker("ASYNC_SIGKILL=OK\n");
+    if (run_busybox_timeout(self) != 0) {
+        return 42;
+    }
+    write_marker("ASYNC_BUSYBOX_TIMEOUT=OK\n");
+    if (run_signaled_child("handler", SIGINT, 0) != 0) {
+        return 43;
+    }
+    write_marker("ASYNC_CUSTOM_HANDLER=OK\n");
+    if (run_signaled_child("altstack", SIGINT, 0) != 0) {
+        return 44;
+    }
+    write_marker("ASYNC_SIGALTSTACK=OK\n");
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc != 2) {
+        return 1;
+    }
+    if (strcmp(argv[1], "loop") == 0) {
+        return run_loop();
+    }
+    if (strcmp(argv[1], "handler") == 0) {
+        return run_handler();
+    }
+    if (strcmp(argv[1], "altstack") == 0) {
+        return run_altstack();
+    }
+    if (strcmp(argv[1], "suite") == 0) {
+        return run_suite(argv[0]);
+    }
+    return 1;
+}

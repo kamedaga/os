@@ -298,14 +298,6 @@ int64_t lpr_linux_dispatch_pending_signals(void)
     }
     lpr_linux_signal_dispatching = 1;
 
-    for (uint64_t i = 0; i < LPR_LINUX_SIGNAL_MAX; i += 1) {
-        const int64_t sig = lpr_pacha_syscall0(PACHAOS_SYSCALL_PROCESS_CONSUME_SIGNAL);
-        if (sig <= 0 || sig > (int64_t)LPR_LINUX_SIGNAL_MAX) {
-            break;
-        }
-        lpr_linux_queue_signal((uint32_t)sig);
-    }
-
     int64_t result = 0;
     for (;;) {
         const uint64_t deliverable = lpr_linux_pending_signal_mask & ~lpr_linux_signal_mask;

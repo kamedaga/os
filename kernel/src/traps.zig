@@ -9,6 +9,8 @@ const page_fault_log = @import("page_fault_log.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
+const process_abi = @import("kernel_abi_root").process_abi;
+const user_copy = @import("user_copy.zig");
 const user_vm = @import("memory/user_vm.zig");
 const scheduler = @import("scheduler.zig").connection;
 const smp = @import("smp.zig");
@@ -635,6 +637,56 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
     );
 }
 
+const NativeSignalFrame = extern struct {
+    magic: u64,
+    size: u64,
+    signo: u64,
+    reserved0: u64,
+    context: TrapFrame,
+    fx_state: [process_abi.signal_fx_state_size]u8,
+};
+
+comptime {
+    if (@offsetOf(NativeSignalFrame, "context") != process_abi.signal_frame_context_offset) @compileError("native signal frame context offset mismatch");
+    if (@offsetOf(NativeSignalFrame, "fx_state") != process_abi.signal_frame_fx_state_offset) @compileError("native signal frame fx state offset mismatch");
+    if (@sizeOf(NativeSignalFrame) != process_abi.signal_frame_size) @compileError("native signal frame size mismatch");
+}
+
+fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
+    const claimed = scheduler.claimCurrentSignalForUserReturn(frame.rip) orelse return;
+    const stack_cost = process_abi.signal_red_zone_size +
+        process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
+    if (frame.rsp <= stack_cost) {
+        scheduler.restoreClaimedSignal(claimed);
+        return;
+    }
+    const signal_frame_va = (frame.rsp - process_abi.signal_red_zone_size -
+        process_abi.signal_frame_size) & ~@as(u64, 15);
+    var signal_frame = NativeSignalFrame{
+        .magic = process_abi.signal_frame_magic,
+        .size = process_abi.signal_frame_size,
+        .signo = claimed.signo,
+        .reserved0 = 0,
+        .context = frame.*,
+        .fx_state = undefined,
+    };
+    if (!scheduler.copyCurrentSignalFxState(&signal_frame.fx_state)) {
+        scheduler.restoreClaimedSignal(claimed);
+        return;
+    }
+    if (!user_copy.copyBytesToUserVa(
+        scheduler.currentPrincipal(),
+        signal_frame_va,
+        std.mem.asBytes(&signal_frame),
+    )) {
+        scheduler.restoreClaimedSignal(claimed);
+        return;
+    }
+    frame.rdi = signal_frame_va;
+    frame.rip = claimed.entry;
+    frame.rsp = signal_frame_va - process_abi.signal_runtime_stack_size;
+}
+
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
@@ -647,6 +699,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             if (scheduler.preemptApUserThread(boot_static.scheduler_quantum_ticks, frame)) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
+            stagePendingSignalForUserReturn(frame);
             return;
         }
         // AP timer interrupts can arrive while a user thread is executing a
@@ -658,8 +711,10 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     if (!kernel_runtime.kernel_state_ready) return;
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
     if (!user_mode) return;
-    if (boot_static.scheduler_quantum_ticks == 0) return;
-    _ = scheduler.preemptBootstrapThread(boot_static.scheduler_quantum_ticks, frame);
+    if (boot_static.scheduler_quantum_ticks != 0) {
+        _ = scheduler.preemptBootstrapThread(boot_static.scheduler_quantum_ticks, frame);
+    }
+    stagePendingSignalForUserReturn(frame);
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {

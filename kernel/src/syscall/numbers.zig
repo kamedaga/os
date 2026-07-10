@@ -18,7 +18,7 @@ pub const syscall_thread_kill: u64 = process_abi.syscall_thread_kill;
 pub const syscall_thread_wait: u64 = process_abi.syscall_thread_wait;
 pub const syscall_thread_exit: u64 = process_abi.syscall_thread_exit;
 pub const syscall_process_signal: u64 = process_abi.syscall_process_signal;
-pub const syscall_process_consume_signal: u64 = process_abi.syscall_process_consume_signal;
+pub const syscall_process_signal_ctl: u64 = process_abi.syscall_process_signal_ctl;
 pub const syscall_process_stop: u64 = process_abi.syscall_process_stop;
 pub const syscall_process_continue: u64 = process_abi.syscall_process_continue;
 pub const syscall_thread_set_fs_base: u64 = process_abi.syscall_thread_set_fs_base;
@@ -107,7 +107,7 @@ test "native syscall numbers are contiguous" {
         syscall_thread_wait,
         syscall_thread_exit,
         syscall_process_signal,
-        syscall_process_consume_signal,
+        syscall_process_signal_ctl,
         syscall_process_stop,
         syscall_process_continue,
         syscall_thread_set_fs_base,

@@ -865,7 +865,6 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,
         .wake_waiting_thread_generation_with_rax = scheduler.wakeIfWaitingGenerationWithRax,
         .wake_blocked_thread_for_principal = scheduler.wakeBlockedThread,
-        .consume_pending_signal_for_principal = scheduler.consumeSignal,
         .switch_to_thread = scheduler.switchTo,
         .block_current_thread_for_event = scheduler.blockCurrentThread,
         .exit_current_process = exitCurrentProcess,

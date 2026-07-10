@@ -72,4 +72,34 @@ lpr_trap_entry:
     ret
 .size lpr_trap_entry, .-lpr_trap_entry
 
+.globl lpr_async_signal_entry
+.hidden lpr_async_signal_entry
+.type lpr_async_signal_entry, @function
+lpr_async_signal_entry:
+    and $-16, %rsp
+    sub $8, %rsp
+    call lpr_linux_async_signal_prepare
+    mov 16(%rax), %r11
+    mov 8(%rax), %rdi
+    lea 736(%rax), %rsi
+    lea 864(%rax), %rdx
+    lea -8(%rax), %rsp
+    jmp *%r11
+.size lpr_async_signal_entry, .-lpr_async_signal_entry
+
+.globl lpr_async_signal_restorer
+.hidden lpr_async_signal_restorer
+.type lpr_async_signal_restorer, @function
+lpr_async_signal_restorer:
+    mov %rsp, %rdi
+    and $-16, %rsp
+    sub $8, %rsp
+    call lpr_linux_rt_sigreturn_body
+    ud2
+.size lpr_async_signal_restorer, .-lpr_async_signal_restorer
+
+.globl lpr_runtime_text_end
+.hidden lpr_runtime_text_end
+lpr_runtime_text_end:
+
 .section .note.GNU-stack,"",@progbits

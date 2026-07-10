@@ -11,7 +11,7 @@ pub const syscall_thread_kill: u64 = 8;
 pub const syscall_thread_wait: u64 = 9;
 pub const syscall_thread_exit: u64 = 10;
 pub const syscall_process_signal: u64 = 11;
-pub const syscall_process_consume_signal: u64 = 12;
+pub const syscall_process_signal_ctl: u64 = 12;
 pub const syscall_process_stop: u64 = 13;
 pub const syscall_process_continue: u64 = 14;
 pub const syscall_thread_set_fs_base: u64 = 15;
@@ -70,6 +70,17 @@ pub const state_stopped: u64 = 4;
 pub const state_continued: u64 = 5;
 
 pub const signal_max: u32 = 64;
+pub const signal_kill: u32 = 9;
+pub const signal_ctl_register: u64 = 1;
+pub const signal_ctl_return: u64 = 2;
+pub const signal_frame_magic: u64 = 0x5041_4348_4153_4947;
+pub const signal_frame_header_size: u64 = 32;
+pub const signal_frame_context_offset: u64 = signal_frame_header_size;
+pub const signal_fx_state_size: u64 = 512;
+pub const signal_frame_fx_state_offset: u64 = signal_frame_context_offset + 20 * 8;
+pub const signal_frame_size: u64 = signal_frame_fx_state_offset + signal_fx_state_size;
+pub const signal_red_zone_size: u64 = 128;
+pub const signal_runtime_stack_size: u64 = 4096;
 
 pub const process_map_flag_none: u64 = 0;
 pub const process_map_flag_private: u64 = 1 << 0;

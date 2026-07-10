@@ -368,6 +368,10 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         break :blk copied;
     };
     const thread_index = scheduler.allocateReadyThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
+    if (!scheduler.copySignalDeliveryConfig(scheduler.currentThread(), thread_index)) {
+        _ = scheduler.releaseThread(thread_index);
+        return sc.syscall_err_not_ready;
+    }
     if (!scheduler.setFsBase(thread_index, scheduler.currentFsBase())) {
         _ = scheduler.releaseThread(thread_index);
         return sc.syscall_err_invalid;
@@ -404,8 +408,23 @@ fn killThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.F
     return sc.syscall_ok;
 }
 
-fn signalProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, signo: u32) u64 {
+fn killProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32, frame: *TrapFrame) u64 {
+    const process = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .killed, code) catch return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (target == proc) {
+        state.markProcessObjectsExited(proc, .killed, code);
+        state.markThreadObjectsExitedForPrincipal(proc, .killed, code);
+        const handoff_target = wakeTaskFdWaiters(h, state, proc);
+        h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, handoff_target);
+        return frame.rax;
+    }
+    cleanupProcess(h, state, target, .killed, code);
+    return sc.syscall_ok;
+}
+
+fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, signo: u32, frame: *TrapFrame) u64 {
     if (signo == 0 or signo > process_abi.signal_max) return sc.syscall_err_invalid;
+    if (signo == process_abi.signal_kill) return killProcess(h, state, proc, fd, signo, frame);
     const process = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
     if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
@@ -414,8 +433,62 @@ fn signalProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kerne
     return sc.syscall_ok;
 }
 
-fn consumeCurrentSignal() u64 {
-    return scheduler.consumeSignalNumber(scheduler.currentPrincipal());
+const NativeSignalFrame = extern struct {
+    magic: u64,
+    size: u64,
+    signo: u64,
+    reserved0: u64,
+    context: TrapFrame,
+    fx_state: [process_abi.signal_fx_state_size]u8,
+};
+
+comptime {
+    if (@offsetOf(NativeSignalFrame, "context") != process_abi.signal_frame_context_offset) @compileError("native signal frame context offset mismatch");
+    if (@offsetOf(NativeSignalFrame, "fx_state") != process_abi.signal_frame_fx_state_offset) @compileError("native signal frame fx state offset mismatch");
+    if (@sizeOf(NativeSignalFrame) != process_abi.signal_frame_size) @compileError("native signal frame size mismatch");
+}
+
+fn validReturnedSignalContext(context: *const TrapFrame) bool {
+    const user_cs = @as(u64, boot_static.gdt_user_code_selector) | 0x3;
+    const user_ss = @as(u64, boot_static.gdt_user_data_selector) | 0x3;
+    return context.cs == user_cs and context.ss == user_ss and
+        isUserEntryVa(context.rip) and isUserEntryVa(context.rsp);
+}
+
+fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    switch (frame.rdi) {
+        process_abi.signal_ctl_register => {
+            const entry = frame.rsi;
+            const inhibit_start = frame.rdx;
+            const inhibit_end = frame.r10;
+            if (!isUserEntryVa(entry) or !isUserEntryVa(inhibit_start) or
+                !isUserEntryVa(inhibit_end) or inhibit_start >= inhibit_end or
+                entry < inhibit_start or entry >= inhibit_end)
+            {
+                return sc.syscall_err_invalid;
+            }
+            return if (scheduler.configureCurrentSignalDelivery(entry, inhibit_start, inhibit_end)) sc.syscall_ok else sc.syscall_err_not_ready;
+        },
+        process_abi.signal_ctl_return => {
+            var returned: NativeSignalFrame = undefined;
+            if (!h.copy_user_bytes_from_va(proc, frame.rsi, std.mem.asBytes(&returned))) return sc.syscall_err_invalid;
+            if (returned.magic != process_abi.signal_frame_magic or
+                returned.size != process_abi.signal_frame_size or
+                returned.signo == 0 or returned.signo > process_abi.signal_max or
+                !validReturnedSignalContext(&returned.context))
+            {
+                return sc.syscall_err_invalid;
+            }
+            returned.context.rflags &= ~(@as(u64, 3) << 12);
+            returned.context.rflags &= ~(@as(u64, 1) << 14);
+            returned.context.rflags &= ~(@as(u64, 1) << 17);
+            returned.context.rflags |= (@as(u64, 1) << 1) | (@as(u64, 1) << 9);
+            if (!scheduler.restoreCurrentSignalFxState(&returned.fx_state)) return sc.syscall_err_not_ready;
+            frame.* = returned.context;
+            return returned.context.rax;
+        },
+        else => return sc.syscall_err_invalid,
+    }
 }
 
 fn stopProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
@@ -780,20 +853,7 @@ fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.Princi
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
         sc.syscall_process_create => createProcess(h, state, proc, frame),
-        sc.syscall_process_kill => blk: {
-            const process = state.setProcessObjectStateForFd(proc, @intCast(frame.rdi), .{ .kill = true }, .killed, @truncate(frame.rsi)) catch break :blk sc.syscall_err_invalid;
-            const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
-            if (target == proc) {
-                state.markProcessObjectsExited(proc, .killed, @truncate(frame.rsi));
-                state.markThreadObjectsExitedForPrincipal(proc, .killed, @truncate(frame.rsi));
-                const handoff_target = wakeTaskFdWaiters(h, state, proc);
-                h.exit_current_process(proc, @truncate(frame.rsi), frame, h.before_current_thread_leave, handoff_target);
-                break :blk frame.rax;
-            } else {
-                cleanupProcess(h, state, target, .killed, @truncate(frame.rsi));
-            }
-            break :blk sc.syscall_ok;
-        },
+        sc.syscall_process_kill => killProcess(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi), frame),
         sc.syscall_process_wait => waitProcess(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_process_exit => blk: {
             state.markProcessObjectsExited(proc, .exited, @truncate(frame.rdi));
@@ -807,8 +867,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_thread_kill => killThread(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_thread_wait => waitThread(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_thread_exit => exitCurrentThread(h, state, proc, frame, @truncate(frame.rdi)),
-        sc.syscall_process_signal => signalProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
-        sc.syscall_process_consume_signal => consumeCurrentSignal(),
+        sc.syscall_process_signal => signalProcess(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi), frame),
+        sc.syscall_process_signal_ctl => signalControl(h, proc, frame),
         sc.syscall_process_stop => stopProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_process_continue => continueProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_thread_set_fs_base => blk: {

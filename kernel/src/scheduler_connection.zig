@@ -119,6 +119,9 @@ pub const ThreadContext = struct {
     wait_mailbox: bool = false,
     stopped: bool = false,
     pending_signal: u32 = 0,
+    signal_entry: u64 = 0,
+    signal_inhibit_start: u64 = 0,
+    signal_inhibit_end: u64 = 0,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
@@ -1721,6 +1724,19 @@ fn initializeThreadContextWithReadyState(
     ctx.wait_mailbox = false;
     ctx.stopped = false;
     ctx.pending_signal = 0;
+    ctx.signal_entry = 0;
+    ctx.signal_inhibit_start = 0;
+    ctx.signal_inhibit_end = 0;
+    var inherit_index: usize = 0;
+    while (inherit_index < scheduler_state.thread_table.contexts.len) : (inherit_index += 1) {
+        if (inherit_index == thread_index) continue;
+        const source = threadContext(inherit_index) orelse continue;
+        if (!source.allocated or source.owner_process != owner_process or source.signal_entry == 0) continue;
+        ctx.signal_entry = source.signal_entry;
+        ctx.signal_inhibit_start = source.signal_inhibit_start;
+        ctx.signal_inhibit_end = source.signal_inhibit_end;
+        break;
+    }
     ctx.wake_tick = 0;
     ctx.frame = initial_frame;
     ctx.fx_state = initial_fx_state;
@@ -2268,25 +2284,81 @@ pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {
     return false;
 }
 
-pub fn consumeSignal(principal: kernel.PrincipalId) bool {
-    return consumeSignalNumber(principal) != 0;
+pub const ClaimedSignal = struct {
+    thread_index: usize,
+    signo: u32,
+    entry: u64,
+};
+
+pub fn configureCurrentSignalDelivery(entry: u64, inhibit_start: u64, inhibit_end: u64) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(currentThread()) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.signal_entry = entry;
+    ctx.signal_inhibit_start = inhibit_start;
+    ctx.signal_inhibit_end = inhibit_end;
+    return true;
 }
 
-pub fn consumeSignalNumber(principal: kernel.PrincipalId) u32 {
-    var i: usize = 0;
-    while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
-        const hot = getThreadHotStateConst(i) orelse continue;
-        if (hot.allocated == 0 or hot.owner_process != principal or hot.pending_signal == 0) continue;
-        scheduler_state.thread_table.lock();
-        defer scheduler_state.thread_table.unlock();
-        const ctx = threadContextMutable(i) orelse return 0;
-        if (!ctx.allocated or ctx.owner_process != principal or ctx.pending_signal == 0) return 0;
-        const signo = ctx.pending_signal;
-        ctx.pending_signal = 0;
-        setThreadHotPendingSignal(i, 0);
-        return signo;
+pub fn copySignalDeliveryConfig(source_thread: usize, target_thread: usize) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const source = threadContext(source_thread) orelse return false;
+    const target = threadContextMutable(target_thread) orelse return false;
+    if (!source.allocated or !target.allocated) return false;
+    target.signal_entry = source.signal_entry;
+    target.signal_inhibit_start = source.signal_inhibit_start;
+    target.signal_inhibit_end = source.signal_inhibit_end;
+    return true;
+}
+
+pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
+    const thread_index = currentThread();
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return null;
+    if (!ctx.allocated or ctx.pending_signal == 0 or ctx.signal_entry == 0) return null;
+    if (ctx.signal_inhibit_start < ctx.signal_inhibit_end and
+        rip >= ctx.signal_inhibit_start and rip < ctx.signal_inhibit_end)
+    {
+        return null;
     }
-    return 0;
+    const claimed = ClaimedSignal{
+        .thread_index = thread_index,
+        .signo = ctx.pending_signal,
+        .entry = ctx.signal_entry,
+    };
+    ctx.pending_signal = 0;
+    setThreadHotPendingSignal(thread_index, 0);
+    return claimed;
+}
+
+pub fn restoreClaimedSignal(claimed: ClaimedSignal) void {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(claimed.thread_index) orelse return;
+    if (!ctx.allocated or ctx.pending_signal != 0) return;
+    ctx.pending_signal = claimed.signo;
+    setThreadHotPendingSignal(claimed.thread_index, claimed.signo);
+}
+
+pub fn copyCurrentSignalFxState(out: *[fx_state_bytes]u8) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContext(currentThread()) orelse return false;
+    if (!ctx.allocated) return false;
+    out.* = ctx.fx_state;
+    return true;
+}
+
+pub fn restoreCurrentSignalFxState(saved: *const [fx_state_bytes]u8) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(currentThread()) orelse return false;
+    if (!ctx.allocated) return false;
+    ctx.fx_state = saved.*;
+    return true;
 }
 
 pub fn stopPrincipalThreads(principal: kernel.PrincipalId) usize {

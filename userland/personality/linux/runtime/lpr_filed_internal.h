@@ -100,7 +100,16 @@
 #define LPR_LINUX_SIGURG 23u
 #define LPR_LINUX_SIGWINCH 28u
 #define LPR_LINUX_SIG_IGN 1ull
+#define LPR_LINUX_SA_SIGINFO 0x00000004ull
+#define LPR_LINUX_SA_RESTORER 0x04000000ull
+#define LPR_LINUX_SA_ONSTACK 0x08000000ull
 #define LPR_LINUX_SA_RESTART 0x10000000ull
+#define LPR_LINUX_SA_NODEFER 0x40000000ull
+#define LPR_LINUX_SA_RESETHAND 0x80000000ull
+#define LPR_LINUX_SS_ONSTACK 1u
+#define LPR_LINUX_SS_DISABLE 2u
+#define LPR_LINUX_SS_AUTODISARM 0x80000000u
+#define LPR_LINUX_MINSIGSTKSZ 2048ull
 #define LPR_LINUX_CLOCK_REALTIME 0ull
 #define LPR_LINUX_CLOCK_MONOTONIC 1ull
 #define LPR_LINUX_TIMER_ABSTIME 1ull
@@ -301,6 +310,10 @@ typedef struct lpr_signal_state {
     lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
     uint64_t mask;
     uint64_t pending_mask;
+    uint64_t altstack_sp;
+    uint64_t altstack_size;
+    uint32_t altstack_flags;
+    uint32_t runtime_registered;
     int dispatching;
 } lpr_signal_state_t;
 
@@ -475,6 +488,10 @@ extern lpr_state_t lpr_state;
 #define lpr_linux_sigactions (lpr_state.signal.actions)
 #define lpr_linux_signal_mask (lpr_state.signal.mask)
 #define lpr_linux_pending_signal_mask (lpr_state.signal.pending_mask)
+#define lpr_linux_altstack_sp (lpr_state.signal.altstack_sp)
+#define lpr_linux_altstack_size (lpr_state.signal.altstack_size)
+#define lpr_linux_altstack_flags (lpr_state.signal.altstack_flags)
+#define lpr_linux_signal_runtime_registered (lpr_state.signal.runtime_registered)
 #define lpr_linux_signal_dispatching (lpr_state.signal.dispatching)
 #define lpr_cwd_checked (lpr_state.cwd.checked)
 #define lpr_cwd_handle (lpr_state.cwd.handle)
@@ -728,6 +745,11 @@ int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t n
 int64_t lpr_linux_resolve_utime( const lpr_linux_timespec_t *input, const lpr_linux_timespec_t *now, uint64_t wire_bit, uint64_t *mask, int64_t *out_sec, int64_t *out_nsec);
 int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t oldact_raw, uint64_t sigsetsize);
 int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset_raw, uint64_t sigsetsize);
+int64_t lpr_linux_sigaltstack(uint64_t ss_raw, uint64_t old_ss_raw);
+void lpr_linux_signal_runtime_init(void);
+void *lpr_linux_async_signal_prepare(void *native_frame);
+_Noreturn void lpr_linux_rt_sigreturn_frame(const struct lpr_linux_user_frame *frame);
+_Noreturn void lpr_linux_rt_sigreturn_body(void *body);
 int64_t lpr_linux_setpgid(uint64_t pid_raw, uint64_t pgid_raw);
 int64_t lpr_linux_set_tid_address(uint64_t tid_address);
 int64_t lpr_linux_setsid(void);

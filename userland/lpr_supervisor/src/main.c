@@ -379,6 +379,12 @@ static int lprs_signal_process_fd(int process_fd, uint64_t signal)
     if (signal == 0) {
         return 0;
     }
+    if (signal == 9u) {
+        return lprs_status_to_errno(pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_KILL,
+            (uint64_t)(uint32_t)process_fd,
+            128u + signal));
+    }
     return lprs_status_to_errno(pacha_syscall2(
         PACHA_PROCESS_SYSCALL_SIGNAL,
         (uint64_t)(uint32_t)process_fd,

@@ -63,6 +63,7 @@ int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t re
 int64_t lpr_linux_kill(uint64_t pid, uint64_t sig);
 int64_t lpr_linux_rt_sigaction(uint64_t sig, uint64_t act, uint64_t oldact, uint64_t sigsetsize);
 int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t oldset, uint64_t sigsetsize);
+int64_t lpr_linux_sigaltstack(uint64_t ss, uint64_t old_ss);
 int64_t lpr_linux_dispatch_pending_signals(void);
 int lpr_linux_filed_fd_active(uint64_t fd);
 uint64_t lpr_linux_filed_fd_handle(uint64_t fd);

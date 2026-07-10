@@ -32,6 +32,7 @@ clang \
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/personality/linux/hde" \
   -DHDE64_USE_LPR_MEMSET=1 \
+  "$repo_root/userland/personality/linux/runtime/lpr_signal.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_zpoline.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_syscall_catalog.c" \

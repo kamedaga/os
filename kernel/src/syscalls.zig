@@ -30,7 +30,6 @@ pub const Hooks = struct {
     wake_waiting_thread_generation: *const fn (usize, u32) bool,
     wake_waiting_thread_generation_with_rax: *const fn (usize, u32, u64) bool,
     wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
-    consume_pending_signal_for_principal: *const fn (kernel.PrincipalId) bool,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     before_current_thread_leave: ?scheduler.BeforeCurrentThreadLeaveCallback = null,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64, ?scheduler.BeforeCurrentThreadLeaveCallback) bool,

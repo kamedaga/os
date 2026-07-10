@@ -748,6 +748,20 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_epoll_smoke.c"
     out: "LPREPOLL.ELF"
     rootfs: "/cmd/lpr_epoll_smoke.elf"
+  lpr_async_signal_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_async_signal_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_async_signal_smoke", "userland/fixtures/src/wsl_musl/lpr_async_signal_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_async_signal_smoke.c"
+    out: "LPRASIG.ELF"
+    rootfs: "/cmd/lpr_async_signal_smoke.elf"
+  lpr_async_signal_smoke_script:
+    file: "tests/fixtures/lpr_async_signal_smoke.sh"
+    out: "LPRASIG.SH"
+    rootfs: "/cmd/lpr_async_signal_smoke.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"
