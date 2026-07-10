@@ -833,6 +833,10 @@ apps:
     file: "tests/fixtures/lpr_state_leak_smoke.sh"
     out: "LPRLEAK.SH"
     rootfs: "/cmd/lpr_state_leak.sh"
+  shell_interaction_smoke_script:
+    file: "tests/fixtures/shell_interaction_smoke.sh"
+    out: "SHINTRCT.SH"
+    rootfs: "/cmd/shell_interaction_smoke.sh"
   ext4_write_script:
     file: "tests/fixtures/ext4_persist_write.sh"
     out: "EXT4W.SH"

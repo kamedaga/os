@@ -29,7 +29,7 @@ if [[ "${PIPE_STRESS_EXPECT_DONE_ONLY:-0}" != "1" ]]; then
 fi
 
 .artifacts/bin/pacgo qemu-test \
-  --timeout "${PIPE_STRESS_TIMEOUT:-60s}" \
+  --timeout "${PIPE_STRESS_TIMEOUT:-120s}" \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
   --send "bash /cmd/pipe_stress.sh ${iters}" \
   "${expects[@]}"

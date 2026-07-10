@@ -141,6 +141,19 @@ void lpr_cwd_init(void)
     if (!lpr_load_bootstrap()) {
         return;
     }
+    /* The exec bootstrap owns the transferred cwd handle.  The supervisor's
+     * process metadata is only a fallback because its fork copy may be stale. */
+    if (lpr_bootstrap.cwd[0] == '/' &&
+        lpr_path_is_terminated(lpr_bootstrap.cwd, sizeof(lpr_bootstrap.cwd)))
+    {
+        const uint64_t len = (uint64_t)lpr_strnlen(lpr_bootstrap.cwd, sizeof(lpr_bootstrap.cwd));
+        if (len < sizeof(lpr_cwd_path)) {
+            lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
+            lpr_memcpy(lpr_cwd_path, lpr_bootstrap.cwd, (size_t)len + 1u);
+            lpr_cwd_handle = lpr_bootstrap.cwd_handle;
+        }
+        return;
+    }
     if (lpr_supervisor_enabled) {
         lprs_v2_process_state_t state;
         if (lpr_supervisor_get_state(&state) == 0 &&
@@ -153,17 +166,6 @@ void lpr_cwd_init(void)
                 lpr_memcpy(lpr_cwd_path, state.cwd, (size_t)len + 1u);
                 lpr_cwd_handle = state.cwd_handle;
             }
-        }
-        return;
-    }
-    if (lpr_bootstrap.cwd[0] == '/' &&
-        lpr_path_is_terminated(lpr_bootstrap.cwd, sizeof(lpr_bootstrap.cwd)))
-    {
-        const uint64_t len = (uint64_t)lpr_strnlen(lpr_bootstrap.cwd, sizeof(lpr_bootstrap.cwd));
-        if (len < sizeof(lpr_cwd_path)) {
-            lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
-            lpr_memcpy(lpr_cwd_path, lpr_bootstrap.cwd, (size_t)len + 1u);
-            lpr_cwd_handle = lpr_bootstrap.cwd_handle;
         }
     }
 }
