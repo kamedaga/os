@@ -1026,6 +1026,10 @@ static int64_t lpr_sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 static int64_t lpr_sys_faccessat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, 0); }
 static int64_t lpr_sys_pselect6(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_pselect6(a0, a1, a2, a3, a4, a5); }
 static int64_t lpr_sys_ppoll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_ppoll(a0, a1, a2, a3, a4); }
+static int64_t lpr_sys_epoll_wait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_epoll_wait(a0, a1, a2, a3); }
+static int64_t lpr_sys_epoll_ctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_epoll_ctl(a0, a1, a2, a3); }
+static int64_t lpr_sys_epoll_pwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_epoll_pwait(a0, a1, a2, a3, a4, a5); }
+static int64_t lpr_sys_epoll_create1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_epoll_create1(a0); }
 static int64_t lpr_sys_utimensat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_utimensat(a0, a1, a2, a3); }
 static int64_t lpr_sys_eventfd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, 0); }
 static int64_t lpr_sys_eventfd2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, a1); }
@@ -1154,10 +1158,14 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_FACCESSAT, "faccessat", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_faccessat, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_PSELECT6, "pselect6", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_pselect6, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_PPOLL, "ppoll", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_ppoll, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_WAIT, "epoll_wait", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_epoll_wait, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_CTL, "epoll_ctl", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_epoll_ctl, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_UNSHARE, "unshare", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_zero, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UTIMENSAT, "utimensat", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_utimensat, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_PWAIT, "epoll_pwait", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_epoll_pwait, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_EVENTFD, "eventfd", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_eventfd, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_EVENTFD2, "eventfd2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_eventfd2, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_epoll_create1, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_DUP3, "dup3", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_dup3, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_PIPE2, "pipe2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_pipe2, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RECVMMSG, "recvmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_recvmmsg, LPR_SYSCALL_TRACE),
@@ -1285,10 +1293,14 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_FACCESSAT].handler = lpr_sys_faccessat;
     lpr_syscall_table[LPR_LINUX_SYS_PSELECT6].handler = lpr_sys_pselect6;
     lpr_syscall_table[LPR_LINUX_SYS_PPOLL].handler = lpr_sys_ppoll;
+    lpr_syscall_table[LPR_LINUX_SYS_EPOLL_WAIT].handler = lpr_sys_epoll_wait;
+    lpr_syscall_table[LPR_LINUX_SYS_EPOLL_CTL].handler = lpr_sys_epoll_ctl;
     lpr_syscall_table[LPR_LINUX_SYS_UNSHARE].handler = lpr_sys_zero;
     lpr_syscall_table[LPR_LINUX_SYS_UTIMENSAT].handler = lpr_sys_utimensat;
+    lpr_syscall_table[LPR_LINUX_SYS_EPOLL_PWAIT].handler = lpr_sys_epoll_pwait;
     lpr_syscall_table[LPR_LINUX_SYS_EVENTFD].handler = lpr_sys_eventfd;
     lpr_syscall_table[LPR_LINUX_SYS_EVENTFD2].handler = lpr_sys_eventfd2;
+    lpr_syscall_table[LPR_LINUX_SYS_EPOLL_CREATE1].handler = lpr_sys_epoll_create1;
     lpr_syscall_table[LPR_LINUX_SYS_DUP3].handler = lpr_sys_dup3;
     lpr_syscall_table[LPR_LINUX_SYS_PIPE2].handler = lpr_sys_pipe2;
     lpr_syscall_table[LPR_LINUX_SYS_RECVMMSG].handler = lpr_sys_recvmmsg;

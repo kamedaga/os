@@ -1225,6 +1225,14 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             }
             continue;
         }
+        if (lpr_linux_filed_fd_active(fd)) {
+            fds[i].revents = (int16_t)((uint32_t)fds[i].events &
+                (LPR_LINUX_POLLIN | LPR_LINUX_POLLOUT));
+            if (fds[i].revents != 0) {
+                ready++;
+            }
+            continue;
+        }
         {
             const uint32_t native_revents = lpr_linux_native_fd_poll_events(fd, (uint32_t)fds[i].events);
             if (native_revents != LPR_LINUX_POLLNVAL) {

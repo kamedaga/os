@@ -286,6 +286,10 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 
 int64_t lpr_linux_close(uint64_t fd)
 {
+    if (lpr_linux_epoll_fd_active(fd)) {
+        lpr_control_close_fd(fd);
+        return 0;
+    }
     if (lpr_linux_socket_fd_active(fd)) {
         return lpr_linux_socket_close(fd);
     }
@@ -346,6 +350,8 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
                 if (lpr_linux_tty_fd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
                 } else if (lpr_linux_eventfd_active(fd)) {
+                    (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
+                } else if (lpr_linux_epoll_fd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
                 } else if (lpr_pipe_fd_is_active(fd)) {
                     const int64_t status = lpr_pacha_syscall3(
@@ -463,6 +469,23 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
+    if (lpr_linux_epoll_fd_active(fd)) {
+        switch (cmd) {
+        case LPR_LINUX_F_GETFD:
+            return lpr_control_get_fd_flags(fd);
+        case LPR_LINUX_F_SETFD:
+            return lpr_control_set_fd_flags(fd, arg);
+        case LPR_LINUX_F_GETFL:
+            return lpr_control_get_status_flags(fd, LPR_LINUX_O_RDWR);
+        case LPR_LINUX_F_SETFL:
+            return lpr_control_set_status_flags(fd, arg);
+        case LPR_LINUX_F_DUPFD:
+        case LPR_LINUX_F_DUPFD_CLOEXEC:
+            return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
+        default:
+            return -LPR_LINUX_EINVAL;
+        }
+    }
     if (lpr_linux_tty_fd_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:

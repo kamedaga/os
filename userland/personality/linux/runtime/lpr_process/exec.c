@@ -189,7 +189,8 @@ int lpr_exec_local_fd_active(uint64_t fd)
         lpr_linux_tty_fd_active(fd) ||
         lpr_pipe_fd_is_active(fd) ||
         lpr_linux_eventfd_active(fd) ||
-        lpr_linux_socket_fd_active(fd);
+        lpr_linux_socket_fd_active(fd) ||
+        lpr_linux_epoll_fd_active(fd);
 }
 
 static int lpr_exec_local_fd_preserve_unlocked(uint64_t fd)
@@ -202,6 +203,9 @@ static int lpr_exec_local_fd_preserve_unlocked(uint64_t fd)
         return 0;
     }
     const lpr_fd_table_file_t *file = &lpr_control_fd_table.files[slot->file_index];
+    if (file->kind == LPR_FD_TABLE_KIND_EPOLL) {
+        return 0;
+    }
     return file->active &&
         file->kind != LPR_FD_TABLE_KIND_EMPTY &&
         (slot->fd_flags & LPR_FD_TABLE_FD_CLOEXEC) == 0;
@@ -442,6 +446,10 @@ void lpr_close_local_state_before_self_exec(void)
             continue;
         }
         if (lpr_linux_eventfd_active(fd)) {
+            lpr_control_close_fd(fd);
+            continue;
+        }
+        if (lpr_linux_epoll_fd_active(fd)) {
             lpr_control_close_fd(fd);
             continue;
         }

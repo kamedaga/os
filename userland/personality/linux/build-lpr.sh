@@ -55,6 +55,7 @@ clang \
   "$repo_root/userland/personality/linux/runtime/lpr_process/exec.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/syscalls.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/metadata.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_epoll.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_socket.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_dispatch.c" \
   "$repo_root/userland/libipc/src/status.c" \

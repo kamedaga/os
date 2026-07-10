@@ -213,6 +213,13 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
         lpr_control_sync_legacy_flags((uint64_t)(uint32_t)dup_fd);
         return dup_fd;
     }
+    if (lpr_linux_epoll_fd_active(fd)) {
+        const int control_status = lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
+        if (control_status != 0) {
+            return control_status;
+        }
+        return dup_fd;
+    }
     if (lpr_pipe_fd_is_active(fd)) {
         uint64_t dup_flags = lpr_pipe_flags_to_pacha(lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_NONBLOCK);
         if (cloexec) {
@@ -346,6 +353,7 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
         !lpr_linux_tty_fd_active(old_fd) &&
         !lpr_pipe_fd_is_active(old_fd) &&
         !lpr_linux_eventfd_active(old_fd) &&
+        !lpr_linux_epoll_fd_active(old_fd) &&
         !lpr_linux_socket_fd_active(old_fd))
     {
         struct pacha_fd_info info;
@@ -364,6 +372,7 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
         lpr_linux_tty_fd_active(new_fd) ||
         lpr_pipe_fd_is_active(new_fd) ||
         lpr_linux_eventfd_active(new_fd) ||
+        lpr_linux_epoll_fd_active(new_fd) ||
         lpr_linux_socket_fd_active(new_fd))
     {
         const int64_t close_status = lpr_linux_close(new_fd);

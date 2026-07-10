@@ -2,6 +2,7 @@
 #define LPR_FILED_INTERNAL_H
 
 #include "lpr_error.h"
+#include "lpr_epoll.h"
 #include "lpr_fd/table.h"
 #include "lpr_filed.h"
 #include "lpr_linux_syscall.h"

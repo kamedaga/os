@@ -738,6 +738,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_shared_mapping_smoke.c"
     out: "LPRSHMAP.ELF"
     rootfs: "/cmd/lpr_shared_mapping.elf"
+  lpr_epoll_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_epoll_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_epoll_smoke", "userland/fixtures/src/wsl_musl/lpr_epoll_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_epoll_smoke.c"
+    out: "LPREPOLL.ELF"
+    rootfs: "/cmd/lpr_epoll_smoke.elf"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"

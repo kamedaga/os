@@ -158,6 +158,13 @@ static void lpr_fd_table_fill_payload(
         file->payload.socket.cloexec =
             (install->fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? 1u : 0u;
         break;
+    case LPR_FD_TABLE_KIND_EPOLL:
+        file->payload.epoll.active = 1;
+        file->payload.epoll.flags =
+            (install->fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? 02000000u : 0u;
+        file->payload.epoll.instance = install->backend_id;
+        file->payload.epoll.map_bytes = install->offset;
+        break;
     default:
         break;
     }

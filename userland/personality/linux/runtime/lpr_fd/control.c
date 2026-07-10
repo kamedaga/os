@@ -124,7 +124,8 @@ int lpr_fd_local_active(uint64_t fd)
             object->kind == LPR_FD_TABLE_KIND_PIPE ||
             object->kind == LPR_FD_TABLE_KIND_EVENT ||
             object->kind == LPR_FD_TABLE_KIND_TTY ||
-            object->kind == LPR_FD_TABLE_KIND_SOCKET);
+            object->kind == LPR_FD_TABLE_KIND_SOCKET ||
+            object->kind == LPR_FD_TABLE_KIND_EPOLL);
 }
 
 uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
@@ -250,6 +251,11 @@ int lpr_control_install_fd(
                 (linux_flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
             object->payload.socket.handle = backend_id;
             break;
+        case LPR_FD_TABLE_KIND_EPOLL:
+            object->payload.epoll.flags = (uint32_t)linux_flags;
+            object->payload.epoll.instance = backend_id;
+            object->payload.epoll.map_bytes = offset;
+            break;
         default:
             break;
         }
@@ -260,6 +266,7 @@ int lpr_control_install_fd(
 void lpr_control_close_fd(uint64_t fd)
 {
     if (fd < lpr_fd_table_capacity) {
+        lpr_epoll_before_close(fd);
         (void)lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd);
     }
 }
@@ -342,6 +349,10 @@ void lpr_control_sync_legacy_flags(uint64_t fd)
     case LPR_FD_TABLE_KIND_SOCKET:
         object->payload.socket.flags =
             lpr_control_merge_legacy_flags(object->payload.socket.flags, 0, status_flags);
+        break;
+    case LPR_FD_TABLE_KIND_EPOLL:
+        object->payload.epoll.flags =
+            lpr_control_merge_legacy_flags(object->payload.epoll.flags, 0, status_flags);
         break;
     default:
         break;
@@ -893,6 +904,16 @@ void lpr_state_dump(const char *reason)
                 object->payload.socket.connected,
                 object->payload.socket.connecting,
                 (uint64_t)(uint32_t)object->payload.socket.last_error);
+            break;
+        case LPR_FD_TABLE_KIND_EPOLL:
+            pacha_trace4(
+                PACHA_TRACE_COMPONENT_LPR,
+                PACHA_TRACE_EVENT_LPR_PROCESS,
+                PACHA_TRACE_CLASS_ERROR,
+                pacha_trace_name_id("lpr.fd.epoll"),
+                fd,
+                object->payload.epoll.instance,
+                object->payload.epoll.map_bytes);
             break;
         default:
             break;
