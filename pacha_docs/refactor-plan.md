@@ -217,6 +217,8 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - clang (Ctrl-C 中断)、timeout ベースのツール、mesa のウォッチドッグ系に必要。
 - 受け入れ: CPU-bound ループ (`while :; do :; done` 相当) が Ctrl-C / kill / busybox timeout で確実に止まる QEMU スモーク。
 
+**結果 (2026-07-10, 7b82bef で完了)**: 受け入れ達成。kernel は timer interrupt のユーザー復帰時に pending signal を claim し、GPR/IRET/FX state を 704B native frame へ保存して登録済み LPR entry に redirect する機構のみを持ち、policy (disposition/mask/siginfo/ucontext/sigaltstack/rt_sigreturn) は全て LPR 側 (lpr_signal.c 新設)。SIGKILL は kernel 即 teardown。syscall 12 は旧 pull 型 process_consume_signal を process_signal_ctl に非互換置換 (帯維持・シフトなし)。sigaltstack 正実装 (SS_ONSTACK 検証込み)。async-signal スモーク (5 ケース) + termd pgrp queue unit を新設し 12 本体制。全検証 green、clang cold guest 4 秒維持。既知の別件: PTY teardown 時 session_clear_tty の task->signal NULL deref (fault 0x1a0、証拠取得済み・未修正)、real-time signal queue / stop/continue 完全 semantics / SS_AUTODISARM は範囲外。pacgo qemu-test は --send 全送出後に --expect 開始のため対話的 Ctrl-C (0x03) の phase 制御は不可 → kill/timeout + termd 内部 pgrp 生成テストで代替。
+
 ### Phase 5 — プロトコル刷新
 
 **T5.1 `_v2` 廃止と envelope 統一**
