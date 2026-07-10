@@ -10,7 +10,7 @@
 enum {
     KOBOXD_FS_BACKEND_NAME_BYTES = 64,
     KOBOXD_FS_BACKEND_INLINE_DATA_BYTES = 64,
-    KOBOXD_FS_BACKEND_MAX_OBJECTS = 64,
+    KOBOXD_FS_BACKEND_MAX_OBJECTS = 256,
 };
 
 typedef struct koboxd_fs_object {
@@ -30,10 +30,20 @@ typedef struct koboxd_fs_object {
     int64_t ctime_sec;
     int64_t ctime_nsec;
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
+    uint64_t last_used;
+    uint32_t references;
     uint8_t used;
     uint8_t linked;
     uint8_t dirty;
 } koboxd_fs_object_t;
+
+typedef struct koboxd_fs_object_stats {
+    uint32_t capacity;
+    uint32_t used;
+    uint32_t referenced;
+    uint32_t cached;
+    uint64_t evictions;
+} koboxd_fs_object_stats_t;
 
 typedef struct koboxd_fs_lock {
     atomic_flag flag;
@@ -45,6 +55,8 @@ typedef struct koboxd_fs_backend {
     kb_fs_mount_result_t mount_result;
     koboxd_fs_object_t objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
     uint64_t next_object_id;
+    uint64_t object_clock;
+    uint64_t object_evictions;
     uint8_t mounted;
     uint8_t metadata_dirty;
     uint32_t deferred_unlinked_count;
@@ -89,6 +101,12 @@ int koboxd_fs_backend_pwrite(
     uint64_t offset,
     const void *buffer,
     size_t length);
+int koboxd_fs_backend_readlink(
+    koboxd_fs_backend_t *backend,
+    uint64_t object_id,
+    char *out_target,
+    size_t target_capacity,
+    size_t *out_length);
 int koboxd_fs_backend_create(
     koboxd_fs_backend_t *backend,
     uint64_t parent_object_id,
@@ -146,3 +164,6 @@ int koboxd_fs_backend_getdents(
     koboxd_fs_object_t *out_entries,
     size_t capacity,
     size_t *out_count);
+void koboxd_fs_backend_object_stats(
+    const koboxd_fs_backend_t *backend,
+    koboxd_fs_object_stats_t *out_stats);

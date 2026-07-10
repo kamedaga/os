@@ -312,6 +312,9 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     }
     struct lpr_linux_user_frame child_frame;
     lpr_memcpy(&child_frame, user_frame, sizeof(child_frame));
+    if (child_stack != 0) {
+        child_frame.rsp = child_stack;
+    }
     lpr_linux_process_state_init();
     int32_t child_pid = 0;
     uint64_t child_token = 0;

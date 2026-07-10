@@ -9,6 +9,7 @@ filed_page_dispatch_result_t filed_dispatch_unlink_page(
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
     uint64_t target_object = 0;
+    bool target_lookup_owned = false;
     if (unlink->reserved0 == 0 &&
         filed_name_is_terminated(unlink->name, sizeof(unlink->name)))
     {
@@ -38,7 +39,8 @@ filed_page_dispatch_result_t filed_dispatch_unlink_page(
                     runtime,
                     dir_handle,
                     decision.backend_object,
-                    name);
+                    name,
+                    &target_lookup_owned);
                 reply_status = filed_flush_mutated_object(runtime, target_object);
                 if (reply_status == 0) {
                     reply_status = filed_backend_unlink(
@@ -69,6 +71,9 @@ filed_page_dispatch_result_t filed_dispatch_unlink_page(
                         }
                     }
                 }
+            }
+            if (target_lookup_owned) {
+                (void)filed_backend_release_object(runtime, target_object);
             }
             filed_close_walk_handle(runtime, dir_handle, dir_owned);
         }
@@ -249,6 +254,7 @@ filed_page_dispatch_result_t filed_dispatch_readlink_page(
     storage_v2_statx_reply_t backend_stat;
     int64_t reply_status = -22;
     uint64_t target_length = 0;
+    bool lookup_owned = false;
     if (filed_name_is_terminated(readlink->name, sizeof(readlink->name))) {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
@@ -277,6 +283,7 @@ filed_page_dispatch_result_t filed_dispatch_readlink_page(
                     parent_decision.backend_object,
                     name,
                     &object_id);
+                lookup_owned = reply_status == 0;
             }
             if (reply_status == 0) {
                 memset(&backend_stat, 0, sizeof(backend_stat));
@@ -302,6 +309,9 @@ filed_page_dispatch_result_t filed_dispatch_readlink_page(
                     }
                 }
             }
+            if (lookup_owned) {
+                (void)filed_backend_release_object(runtime, object_id);
+            }
             filed_close_walk_handle(runtime, dir_handle, dir_owned);
         }
     }
@@ -320,6 +330,7 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
     uint64_t old_object_id = 0;
     uint64_t linked_object_id = 0;
     int64_t reply_status = -22;
+    bool old_lookup_owned = false;
 
     if (filed_name_is_terminated(link->old_name, sizeof(link->old_name)) &&
         filed_name_is_terminated(link->new_name, sizeof(link->new_name)))
@@ -378,6 +389,7 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
                 old_parent.backend_object,
                 old_name,
                 &old_object_id);
+            old_lookup_owned = reply_status == 0;
         }
         if (reply_status == 0) {
             memset(&backend_stat, 0, sizeof(backend_stat));
@@ -439,6 +451,9 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
         if (old_dir_handle != 0) {
             filed_close_walk_handle(runtime, old_dir_handle, old_dir_owned);
         }
+        if (old_lookup_owned) {
+            (void)filed_backend_release_object(runtime, old_object_id);
+        }
     }
 
     return filed_page_result(reply_status, linked_object_id);
@@ -453,6 +468,7 @@ filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
     uint64_t target_object = 0;
+    bool target_lookup_owned = false;
     if (rmdir->reserved0 == 0 &&
         filed_name_is_terminated(rmdir->name, sizeof(rmdir->name)))
     {
@@ -482,7 +498,8 @@ filed_page_dispatch_result_t filed_dispatch_rmdir_page(
                     runtime,
                     dir_handle,
                     decision.backend_object,
-                    name);
+                    name,
+                    &target_lookup_owned);
                 reply_status = filed_flush_mutated_object(runtime, target_object);
                 if (reply_status == 0) {
                     reply_status = filed_backend_rmdir(
@@ -514,6 +531,9 @@ filed_page_dispatch_result_t filed_dispatch_rmdir_page(
                     }
                 }
             }
+            if (target_lookup_owned) {
+                (void)filed_backend_release_object(runtime, target_object);
+            }
             filed_close_walk_handle(runtime, dir_handle, dir_owned);
         }
     }
@@ -532,6 +552,10 @@ filed_page_dispatch_result_t filed_dispatch_rename_page(
     int64_t reply_status = -22;
     uint64_t object_id = 0;
     uint64_t replaced_object_id = 0;
+    uint64_t acquired_object_id = 0;
+    uint64_t acquired_replaced_object_id = 0;
+    bool object_lookup_owned = false;
+    bool replaced_lookup_owned = false;
     if (filed_name_is_terminated(rename->old_name, sizeof(rename->old_name)) &&
         filed_name_is_terminated(rename->new_name, sizeof(rename->new_name)))
     {
@@ -587,12 +611,16 @@ filed_page_dispatch_result_t filed_dispatch_rename_page(
                     runtime,
                     new_dir_handle,
                     new_parent.backend_object,
-                    new_name);
+                    new_name,
+                    &replaced_lookup_owned);
                 object_id = filed_lookup_cache_target_object(
                     runtime,
                     old_dir_handle,
                     old_parent.backend_object,
-                    old_name);
+                    old_name,
+                    &object_lookup_owned);
+                acquired_object_id = object_id;
+                acquired_replaced_object_id = replaced_object_id;
                 if (replaced_object_id != 0 &&
                     replaced_object_id != object_id)
                 {
@@ -656,6 +684,12 @@ filed_page_dispatch_result_t filed_dispatch_rename_page(
         }
         filed_close_walk_handle(runtime, old_dir_handle, old_dir_owned);
         filed_close_walk_handle(runtime, new_dir_handle, new_dir_owned);
+        if (object_lookup_owned) {
+            (void)filed_backend_release_object(runtime, acquired_object_id);
+        }
+        if (replaced_lookup_owned) {
+            (void)filed_backend_release_object(runtime, acquired_replaced_object_id);
+        }
     }
 
     return filed_page_result(reply_status, object_id);

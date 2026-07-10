@@ -827,6 +827,7 @@ static int lookup_and_open_component(
     memset(&backend_stat, 0, sizeof(backend_stat));
     result = filed_runtime_backend_statx(runtime, object_id, &backend_stat);
     if (result != 0) {
+        (void)filed_runtime_backend_release_object(runtime, object_id);
         return result;
     }
     status = filed_vfs_open_backend_child(
@@ -838,6 +839,9 @@ static int lookup_and_open_component(
         rights,
         open_flags,
         out_open);
+    if (status != FILED_OK) {
+        (void)filed_runtime_backend_release_object(runtime, object_id);
+    }
     return lpr_exec_status_to_errno(status);
 }
 

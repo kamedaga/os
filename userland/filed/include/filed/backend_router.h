@@ -16,6 +16,10 @@ int filed_runtime_backend_statx(
     uint64_t object_id,
     storage_v2_statx_reply_t *out_stat);
 
+int filed_runtime_backend_release_object(
+    filed_runtime_t *runtime,
+    uint64_t object_id);
+
 int filed_runtime_backend_pread(
     filed_runtime_t *runtime,
     uint64_t object_id,

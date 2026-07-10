@@ -89,6 +89,7 @@ enum {
     KOBOXD_EXT4_SUPER_FREE_BLOCKS_COUNT_HI_OFFSET = 0x158,
     KOBOXD_INODE_EXT4_DISKSIZE_BACK_OFFSET = 0x30,
     KOBOXD_INODE_EXT4_DATA_SEM_BACK_OFFSET = 0x28,
+    KOBOXD_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET = 0x128,
     KOBOXD_FILE_PATH_DENTRY_OFFSET = 0x18,
     KOBOXD_FILE_MAPPING_OFFSET = 0x20,
     KOBOXD_FILE_INODE_OFFSET = 0x28,
@@ -103,6 +104,7 @@ enum {
     KOBOXD_INODE_OP_MKDIR_OFFSET = 0x48,
     KOBOXD_INODE_OP_RMDIR_OFFSET = 0x50,
     KOBOXD_INODE_OP_RENAME_OFFSET = 0x60,
+    KOBOXD_EXT4_FAST_SYMLINK_BYTES = 60,
     KOBOXD_WRITEBACK_CONTROL_SYNC_MODE_OFFSET = 0x20,
     KOBOXD_WRITEBACK_CONTROL_WB_SYNC_ALL = 1,
     KOBOXD_MODE_REGULAR_0644 = 0100000 | 0644,
@@ -270,7 +272,9 @@ static void fill_object_from_inode(
     uint64_t parent_object_id,
     void *inode,
     void *dentry,
-    const char *name)
+    const char *name,
+    uint32_t references,
+    uint64_t last_used)
 {
     if (object == NULL) {
         return;
@@ -294,8 +298,39 @@ static void fill_object_from_inode(
     if (name != NULL) {
         snprintf(object->name, sizeof(object->name), "%s", name);
     }
+    object->references = references;
+    object->last_used = last_used;
     object->used = 1;
     object->linked = 1;
+}
+
+static uint64_t fs_object_next_clock(koboxd_fs_backend_t *backend)
+{
+    if (backend->object_clock == UINT64_MAX) {
+        uint64_t next = 1;
+        for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; ++i) {
+            koboxd_fs_object_t *object = &backend->objects[i];
+            if (object->used) {
+                object->last_used = next++;
+            }
+        }
+        backend->object_clock = next;
+    }
+    ++backend->object_clock;
+    if (backend->object_clock == 0) {
+        backend->object_clock = 1;
+    }
+    return backend->object_clock;
+}
+
+static int fs_object_acquire(koboxd_fs_backend_t *backend, koboxd_fs_object_t *object)
+{
+    if (backend == NULL || object == NULL || !object->used || object->references == UINT32_MAX) {
+        return -75;
+    }
+    ++object->references;
+    object->last_used = fs_object_next_clock(backend);
+    return 0;
 }
 
 static koboxd_fs_object_t *fs_object_by_id(koboxd_fs_backend_t *backend, uint64_t object_id)
@@ -337,27 +372,57 @@ static int fs_object_register(
     void *inode,
     void *dentry,
     const char *name,
+    uint32_t references,
     uint64_t *out_object_id)
 {
     if (backend == NULL || inode == NULL || name == NULL || out_object_id == NULL) {
         return -22;
     }
-    for (unsigned int attempt = 0; attempt < 2; attempt++) {
+    for (unsigned int attempt = 0; attempt < 3; attempt++) {
         for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
             if (!backend->objects[i].used) {
                 const uint64_t object_id = backend->next_object_id++;
-                fill_object_from_inode(&backend->objects[i], object_id, parent_object_id, inode, dentry, name);
+                fill_object_from_inode(
+                    &backend->objects[i],
+                    object_id,
+                    parent_object_id,
+                    inode,
+                    dentry,
+                    name,
+                    references,
+                    fs_object_next_clock(backend));
                 *out_object_id = object_id;
                 return 0;
             }
         }
-        if (backend->deferred_unlinked_count == 0) {
+        if (attempt == 0 && backend->deferred_unlinked_count != 0) {
+            const int release_status = fs_release_deferred_unlinked_objects(backend);
+            if (release_status != 0) {
+                return release_status;
+            }
+            continue;
+        }
+        koboxd_fs_object_t *oldest = NULL;
+        for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; ++i) {
+            koboxd_fs_object_t *candidate = &backend->objects[i];
+            if (!candidate->used || !candidate->linked || candidate->dirty ||
+                candidate->references != 0 || candidate->object_id == 1)
+            {
+                continue;
+            }
+            if (oldest == NULL || candidate->last_used < oldest->last_used) {
+                oldest = candidate;
+            }
+        }
+        if (oldest == NULL) {
             break;
         }
-        const int release_status = fs_release_deferred_unlinked_objects(backend);
-        if (release_status != 0) {
-            return release_status;
+        free(oldest->dentry);
+        if (oldest->inode != NULL) {
+            kb_fs_subsystem_free_fake_inode(oldest->inode);
         }
+        memset(oldest, 0, sizeof(*oldest));
+        ++backend->object_evictions;
     }
     return -12;
 }
@@ -380,6 +445,8 @@ static void fs_object_refresh(koboxd_fs_object_t *object)
 {
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint64_t parent_object_id;
+    uint64_t last_used;
+    uint32_t references;
     uint8_t linked;
     uint8_t dirty;
     if (object == NULL || !object->used) {
@@ -387,6 +454,8 @@ static void fs_object_refresh(koboxd_fs_object_t *object)
     }
     snprintf(name, sizeof(name), "%s", object->name);
     parent_object_id = object->parent_object_id;
+    last_used = object->last_used;
+    references = object->references;
     linked = object->linked;
     dirty = object->dirty;
     fill_object_from_inode(
@@ -395,7 +464,9 @@ static void fs_object_refresh(koboxd_fs_object_t *object)
         parent_object_id,
         object->inode,
         object->dentry,
-        name);
+        name,
+        references,
+        last_used);
     object->linked = linked;
     object->dirty = dirty;
 }
@@ -704,6 +775,7 @@ static int fs_lookup_or_cache_child(
         lookup_inode,
         lookup_dentry,
         name,
+        0,
         &object_id);
     if (status != 0) {
         fs_discard_unregistered_lookup(lookup_inode, lookup_dentry);
@@ -797,7 +869,7 @@ static int fs_create_child_object(
     if (status != 0) {
         return status;
     }
-    status = fs_object_register(backend, parent->object_id, inode, dentry, name, out_object_id);
+    status = fs_object_register(backend, parent->object_id, inode, dentry, name, 1, out_object_id);
     if (status != 0) {
         fs_discard_unregistered_lookup(inode, dentry);
         return status;
@@ -1279,7 +1351,9 @@ int koboxd_fs_backend_mount_ext4(
         1,
         backend->mount_result.root_inode,
         backend->mount_result.root_dentry,
-        "/");
+        "/",
+        1,
+        fs_object_next_clock(backend));
     backend->mounted = 1;
     return 0;
 }
@@ -1296,6 +1370,10 @@ int koboxd_fs_backend_lookup(
     *out_object_id = 0;
     koboxd_fs_object_t *cached = fs_object_by_parent_name(backend, parent_object_id, name);
     if (cached != NULL) {
+        const int acquire_status = fs_object_acquire(backend, cached);
+        if (acquire_status != 0) {
+            return acquire_status;
+        }
         *out_object_id = cached->object_id;
         return 0;
     }
@@ -1315,7 +1393,59 @@ int koboxd_fs_backend_lookup(
     if (status != 0) {
         return status;
     }
-    return fs_object_register(backend, parent_object_id, inode, dentry, name, out_object_id);
+    return fs_object_register(backend, parent_object_id, inode, dentry, name, 1, out_object_id);
+}
+
+int koboxd_fs_backend_readlink(
+    koboxd_fs_backend_t *backend,
+    uint64_t object_id,
+    char *out_target,
+    size_t target_capacity,
+    size_t *out_length)
+{
+    if (backend == NULL || out_target == NULL || out_length == NULL ||
+        target_capacity == 0 || !backend->mounted)
+    {
+        return -22;
+    }
+    *out_length = 0;
+    koboxd_fs_object_t *object = fs_object_by_id(backend, object_id);
+    if (object == NULL || object->inode == NULL) {
+        return -2;
+    }
+    if ((object->mode & KOBOXD_MODE_TYPE_MASK) != 0120000) {
+        return -22;
+    }
+
+    size_t length = object->size < target_capacity ?
+        (size_t)object->size : target_capacity;
+    if (length == 0) {
+        return 0;
+    }
+    if (object->size <= KOBOXD_EXT4_FAST_SYMLINK_BYTES) {
+        const void *inline_target =
+            (const uint8_t *)object->inode - KOBOXD_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET;
+        memcpy(out_target, inline_target, length);
+        *out_length = length;
+        return 0;
+    }
+
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+        return -5;
+    }
+    const int read_result = fs_file_read(
+        &ops,
+        object->inode,
+        0,
+        out_target,
+        length,
+        target_capacity);
+    if (read_result < 0) {
+        return read_result;
+    }
+    *out_length = (size_t)read_result;
+    return 0;
 }
 
 int koboxd_fs_backend_create(
@@ -1773,7 +1903,7 @@ static int fs_release_deferred_unlinked_objects(koboxd_fs_backend_t *backend)
     size_t released_count = 0;
     for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
         koboxd_fs_object_t *object = &backend->objects[i];
-        if (!object->used || object->linked) {
+        if (!object->used || object->linked || object->references != 0) {
             continue;
         }
         uint64_t inode_number = 0;
@@ -1815,6 +1945,14 @@ int koboxd_fs_backend_release_object(koboxd_fs_backend_t *backend, uint64_t obje
         object->linked,
         object->dirty,
         object->name);
+    if (object->references == 0) {
+        return -22;
+    }
+    --object->references;
+    object->last_used = fs_object_next_clock(backend);
+    if (object->references != 0) {
+        return 0;
+    }
     if (object->linked) {
         if (object->dirty && object->inode != NULL) {
             koboxd_ext4_operations_t ops;
@@ -1832,6 +1970,33 @@ int koboxd_fs_backend_release_object(koboxd_fs_backend_t *backend, uint64_t obje
     KOBOXD_FS_TRACE("[koboxd-fs-trace] release deferred object=%llu\n",
         (unsigned long long)object_id);
     return 0;
+}
+
+void koboxd_fs_backend_object_stats(
+    const koboxd_fs_backend_t *backend,
+    koboxd_fs_object_stats_t *out_stats)
+{
+    if (out_stats == NULL) {
+        return;
+    }
+    memset(out_stats, 0, sizeof(*out_stats));
+    out_stats->capacity = KOBOXD_FS_BACKEND_MAX_OBJECTS;
+    if (backend == NULL) {
+        return;
+    }
+    out_stats->evictions = backend->object_evictions;
+    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; ++i) {
+        const koboxd_fs_object_t *object = &backend->objects[i];
+        if (!object->used) {
+            continue;
+        }
+        ++out_stats->used;
+        if (object->references != 0) {
+            ++out_stats->referenced;
+        } else if (object->linked) {
+            ++out_stats->cached;
+        }
+    }
 }
 
 int koboxd_fs_backend_pread(

@@ -256,10 +256,18 @@ static int filed_exec_lookup_and_open_component(
     uint64_t object_id = 0;
     storage_v2_statx_reply_t backend_stat;
     filed_status_t status;
+    filed_backend_object_id_t cached_object = 0;
+    bool existing_vnode_owns_object = false;
 
     if (runtime == NULL || name == NULL || out_open == NULL) {
         return -22;
     }
+    existing_vnode_owns_object =
+        filed_vfs_cached_child_backend_object(
+            &runtime->vfs,
+            parent_handle,
+            name,
+            &cached_object) == FILED_OK;
 
     status = filed_vfs_lookup_prepare(&runtime->vfs, parent_handle, &parent_decision);
     if (status != FILED_OK) {
@@ -278,6 +286,7 @@ static int filed_exec_lookup_and_open_component(
     memset(&backend_stat, 0, sizeof(backend_stat));
     result = filed_runtime_backend_statx(runtime, object_id, &backend_stat);
     if (result != 0) {
+        (void)filed_runtime_backend_release_object(runtime, object_id);
         return result;
     }
 
@@ -290,6 +299,11 @@ static int filed_exec_lookup_and_open_component(
         rights,
         open_flags,
         out_open);
+    if (status != FILED_OK ||
+        (existing_vnode_owns_object && cached_object == object_id))
+    {
+        (void)filed_runtime_backend_release_object(runtime, object_id);
+    }
     return filed_exec_status_to_errno(status);
 }
 

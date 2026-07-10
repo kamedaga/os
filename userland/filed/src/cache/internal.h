@@ -13,7 +13,8 @@ enum {
     FILED_DIR_CACHE_SLOTS = 32,
     FILED_NEGATIVE_LOOKUP_CACHE_SLOTS = 64,
     FILED_RUNTIME_FILE_VMO_CACHE_SLOTS = 128,
-    FILED_FILE_VMO_MAX_BYTES = 8u * 1024u * 1024u,
+    FILED_FILE_VMO_MAX_BYTES = 256u * 1024u * 1024u,
+    FILED_FILE_VMO_CACHE_TOTAL_BYTES = 512u * 1024u * 1024u,
     FILED_CACHE_OBJECT_SLOTS =
         FILED_PAGE_CACHE_SLOTS +
         FILED_DIR_CACHE_SLOTS +
@@ -174,6 +175,9 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
     uint64_t file_offset,
     uint64_t length);
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime);
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
+    filed_runtime_t *runtime,
+    uint64_t length);
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_shared_lookup(
     filed_runtime_t *runtime,
     uint64_t backend_object);

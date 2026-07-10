@@ -127,6 +127,32 @@ static int direct_pwrite(
     return 0;
 }
 
+static int direct_readlink(
+    void *ctx,
+    uint64_t object_id,
+    char *out_target,
+    uint64_t target_capacity,
+    uint64_t *out_length)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL || out_target == NULL || out_length == NULL) {
+        return -22;
+    }
+    size_t length = 0;
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_readlink(
+        backend,
+        object_id,
+        out_target,
+        (size_t)target_capacity,
+        &length);
+    koboxd_fs_backend_unlock(backend);
+    if (status == 0) {
+        *out_length = (uint64_t)length;
+    }
+    return status;
+}
+
 static int direct_fsync(void *ctx, uint64_t object_id)
 {
     koboxd_fs_backend_t *backend = direct_backend(ctx);
@@ -351,12 +377,32 @@ static int direct_sync_all(void *ctx)
     return status;
 }
 
+static int direct_object_stats(void *ctx, filed_kobox_object_stats_t *out_stats)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL || out_stats == NULL) {
+        return -22;
+    }
+    koboxd_fs_object_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    koboxd_fs_backend_lock(backend);
+    koboxd_fs_backend_object_stats(backend, &stats);
+    koboxd_fs_backend_unlock(backend);
+    out_stats->capacity = stats.capacity;
+    out_stats->used = stats.used;
+    out_stats->referenced = stats.referenced;
+    out_stats->cached = stats.cached;
+    out_stats->evictions = stats.evictions;
+    return 0;
+}
+
 static const filed_kobox_direct_ops_t direct_ops = {
     .mount_root = direct_mount_root,
     .lookup = direct_lookup,
     .statx = direct_statx,
     .pread = direct_pread,
     .pwrite = direct_pwrite,
+    .readlink = direct_readlink,
     .fsync = direct_fsync,
     .create = direct_create,
     .truncate = direct_truncate,
@@ -369,6 +415,7 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .release_object = direct_release_object,
     .getdents = direct_getdents,
     .sync_all = direct_sync_all,
+    .object_stats = direct_object_stats,
 };
 
 const filed_kobox_direct_ops_t *koboxd_filed_direct_ops(void)

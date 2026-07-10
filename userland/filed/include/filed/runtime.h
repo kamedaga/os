@@ -52,3 +52,6 @@ void filed_runtime_init(filed_runtime_t *runtime);
 int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv);
 int filed_runtime_mount_root(filed_runtime_t *runtime);
 int filed_runtime_serve(filed_runtime_t *runtime);
+int64_t filed_close_handle_runtime(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id);

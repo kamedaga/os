@@ -136,6 +136,7 @@ typedef struct filed_vnode {
     filed_generation_t generation;
     filed_generation_t object_generation;
     filed_generation_t dir_generation;
+    uint64_t last_used;
     uint32_t refcount;
     filed_lock_t lock;
 } filed_vnode_t;
@@ -176,6 +177,7 @@ typedef struct filed_vfs {
     filed_vnode_id_t next_vnode_id;
     filed_file_id_t next_file_id;
     filed_handle_id_t next_handle_id;
+    uint64_t vnode_clock;
 } filed_vfs_t;
 
 typedef struct filed_vfs_open_result {
@@ -224,6 +226,10 @@ typedef struct filed_vfs_reclaim_result {
     bool released;
     filed_backend_object_id_t backend_object;
 } filed_vfs_reclaim_result_t;
+
+typedef bool (*filed_vfs_backend_evictable_fn)(
+    void *context,
+    filed_backend_object_id_t backend_object);
 
 const char *filed_status_name(filed_status_t status);
 void filed_vfs_init(filed_vfs_t *vfs);
@@ -296,6 +302,12 @@ filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle
 filed_status_t filed_vfs_close_handle_ex(
     filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
+    filed_vfs_reclaim_result_t *out_reclaim);
+filed_status_t filed_vfs_evict_lru_unused_linked(
+    filed_vfs_t *vfs,
+    uint32_t max_cached,
+    filed_vfs_backend_evictable_fn evictable,
+    void *context,
     filed_vfs_reclaim_result_t *out_reclaim);
 
 filed_status_t filed_vfs_dup_handle(

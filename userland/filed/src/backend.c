@@ -223,12 +223,12 @@ int filed_backend_readlink(
             target_capacity,
             out_length);
     }
-    (void)runtime;
-    (void)object_id;
-    (void)out_target;
-    (void)target_capacity;
-    (void)out_length;
-    return -95;
+    return filed_kobox_backend_readlink(
+        &runtime->backend,
+        object_id,
+        out_target,
+        target_capacity,
+        out_length);
 }
 
 int filed_backend_rmdir(

@@ -134,6 +134,20 @@ bool filed_cache_object_dirty(filed_runtime_t *runtime, uint64_t backend_object)
     return false;
 }
 
+bool filed_cache_object_evictable(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) {
+        return false;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (entry->active && entry->backend_object == backend_object) {
+            return false;
+        }
+    }
+    return true;
+}
+
 uint64_t filed_cache_dirty_count(filed_runtime_t *runtime)
 {
     uint64_t count = 0;
@@ -1092,9 +1106,51 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
 
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime)
 {
+    return filed_file_vmo_cache_slot_for_length(runtime, 0);
+}
+
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
+    filed_runtime_t *runtime,
+    uint64_t length)
+{
     filed_file_vmo_cache_entry_t *oldest_entry = NULL;
     uint64_t oldest = UINT64_MAX;
-    (void)runtime;
+    if (runtime == NULL || length > FILED_FILE_VMO_CACHE_TOTAL_BYTES) {
+        return NULL;
+    }
+    if (length != 0) {
+        uint64_t active_bytes = 0;
+        for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+            const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+            if (entry->active) {
+                if (entry->length > FILED_FILE_VMO_CACHE_TOTAL_BYTES - active_bytes) {
+                    active_bytes = FILED_FILE_VMO_CACHE_TOTAL_BYTES;
+                    break;
+                }
+                active_bytes += entry->length;
+            }
+        }
+        while (active_bytes > FILED_FILE_VMO_CACHE_TOTAL_BYTES - length) {
+            oldest_entry = NULL;
+            oldest = UINT64_MAX;
+            for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+                filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+                if (entry->active && !entry->shared && entry->clock < oldest) {
+                    oldest = entry->clock;
+                    oldest_entry = entry;
+                }
+            }
+            if (oldest_entry == NULL) {
+                return NULL;
+            }
+            active_bytes = oldest_entry->length > active_bytes ?
+                0 : active_bytes - oldest_entry->length;
+            filed_file_vmo_cache_evictions++;
+            filed_file_vmo_cache_clear_entry(oldest_entry, false);
+        }
+    }
+    oldest_entry = NULL;
+    oldest = UINT64_MAX;
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (!entry->active) {
@@ -1220,7 +1276,8 @@ int filed_cache_create_shared_vmo(
         loaded += bytes;
     }
 
-    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(runtime);
+    filed_file_vmo_cache_entry_t *entry =
+        filed_file_vmo_cache_slot_for_length(runtime, capacity);
     if (entry == NULL) {
         (void)pacha_munmap(mapped, capacity);
         (void)pacha_fd_close(vmo_fd);
@@ -1272,6 +1329,13 @@ void filed_cache_release_object(filed_runtime_t *runtime, uint64_t backend_objec
         return;
     }
     filed_page_cache_invalidate_object(runtime, backend_object);
+    filed_dir_cache_invalidate_dir(runtime, backend_object);
+    for (size_t i = 0; i < FILED_NEGATIVE_LOOKUP_CACHE_SLOTS; ++i) {
+        filed_negative_lookup_cache_slot_t *slot = &filed_negative_lookup_cache.slots[i];
+        if (slot->valid && slot->parent_backend_object == backend_object) {
+            memset(slot, 0, sizeof(*slot));
+        }
+    }
     filed_file_vmo_cache_release_object(runtime, backend_object);
     for (size_t i = 0; i < FILED_CACHE_OBJECT_SLOTS; ++i) {
         filed_cache_object_entry_t *entry = &filed_cache.objects[i];

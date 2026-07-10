@@ -1,5 +1,24 @@
 #include "private.h"
 
+static uint64_t filed_vfs_next_vnode_clock(filed_vfs_t *vfs)
+{
+    if (vfs->vnode_clock == UINT64_MAX) {
+        uint64_t next = 1;
+        for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+            filed_vnode_t *vnode = &vfs->vnodes[i];
+            if (vnode->active) {
+                vnode->last_used = next++;
+            }
+        }
+        vfs->vnode_clock = next;
+    }
+    ++vfs->vnode_clock;
+    if (vfs->vnode_clock == 0) {
+        vfs->vnode_clock = 1;
+    }
+    return vfs->vnode_clock;
+}
+
 static void filed_reclaim_result_set(
     const filed_vfs_t *vfs,
     filed_vfs_reclaim_result_t *out_reclaim,
@@ -107,6 +126,7 @@ static filed_status_t filed_open_vnode(
     if (vfs == NULL || vnode == NULL || out_open == NULL || rights == 0) {
         return FILED_ERR_INVALID;
     }
+    vnode->last_used = filed_vfs_next_vnode_clock(vfs);
     if ((open_flags & FILED_OPEN_DIRECTORY) != 0 &&
         vnode->kind != FILED_VNODE_DIRECTORY)
     {
@@ -221,6 +241,7 @@ static filed_status_t filed_open_backend_child_at(
         child->generation = 1;
         child->object_generation = 1;
         child->dir_generation = 1;
+        child->last_used = filed_vfs_next_vnode_clock(vfs);
         child->refcount = 0;
         status = filed_copy_name(child->name, sizeof(child->name), name);
         if (status != FILED_OK) {
@@ -282,6 +303,7 @@ filed_status_t filed_vfs_mount_root(
     root->generation = 1;
     root->object_generation = 1;
     root->dir_generation = 1;
+    root->last_used = filed_vfs_next_vnode_clock(vfs);
     root->refcount = 1;
 
     status = filed_copy_name(root->name, sizeof(root->name), "/");
@@ -633,6 +655,128 @@ filed_status_t filed_vfs_close_handle_ex(
 filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle_id)
 {
     return filed_vfs_close_handle_ex(vfs, handle_id, NULL);
+}
+
+static bool filed_vfs_backend_object_is_unused_linked_leaf(
+    const filed_vfs_t *vfs,
+    filed_backend_object_id_t backend_object,
+    uint64_t *out_last_used)
+{
+    uint64_t last_used = 0;
+    bool found = false;
+    if (vfs == NULL || backend_object == 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+        const filed_vnode_t *vnode = &vfs->vnodes[i];
+        if (!vnode->active || vnode->backend_object != backend_object) {
+            continue;
+        }
+        found = true;
+        if (!vnode->linked || vnode->refcount != 0 ||
+            filed_vnode_mount_pins(vfs, vnode->id) != 0)
+        {
+            return false;
+        }
+        if (vnode->last_used > last_used) {
+            last_used = vnode->last_used;
+        }
+        for (uint32_t j = 0; j < FILED_MAX_VNODES; ++j) {
+            if (vfs->vnodes[j].active && vfs->vnodes[j].parent == vnode->id) {
+                return false;
+            }
+        }
+    }
+    if (found && out_last_used != NULL) {
+        *out_last_used = last_used;
+    }
+    return found;
+}
+
+filed_status_t filed_vfs_evict_lru_unused_linked(
+    filed_vfs_t *vfs,
+    uint32_t max_cached,
+    filed_vfs_backend_evictable_fn evictable,
+    void *context,
+    filed_vfs_reclaim_result_t *out_reclaim)
+{
+    filed_backend_object_id_t oldest_object = 0;
+    uint64_t oldest_last_used = UINT64_MAX;
+    uint32_t cached = 0;
+    if (vfs == NULL || out_reclaim == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    memset(out_reclaim, 0, sizeof(*out_reclaim));
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+        const filed_vnode_t *vnode = &vfs->vnodes[i];
+        if (!vnode->active || vnode->backend_object == 0) {
+            continue;
+        }
+        bool first_alias = true;
+        for (uint32_t j = 0; j < i; ++j) {
+            if (vfs->vnodes[j].active &&
+                vfs->vnodes[j].backend_object == vnode->backend_object)
+            {
+                first_alias = false;
+                break;
+            }
+        }
+        if (!first_alias) {
+            continue;
+        }
+        uint64_t last_used = 0;
+        if (!filed_vfs_backend_object_is_unused_linked_leaf(
+                vfs,
+                vnode->backend_object,
+                &last_used))
+        {
+            continue;
+        }
+        ++cached;
+        if ((evictable == NULL || evictable(context, vnode->backend_object)) &&
+            (oldest_object == 0 || last_used < oldest_last_used))
+        {
+            oldest_object = vnode->backend_object;
+            oldest_last_used = last_used;
+        }
+    }
+    if (cached <= max_cached || oldest_object == 0) {
+        return FILED_OK;
+    }
+    filed_vnode_t *candidate = NULL;
+    filed_vnode_t *parent = NULL;
+    uint32_t aliases = 0;
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+        filed_vnode_t *vnode = &vfs->vnodes[i];
+        if (vnode->active && vnode->backend_object == oldest_object) {
+            candidate = vnode;
+            ++aliases;
+        }
+    }
+    if (candidate == NULL || aliases != 1) {
+        return FILED_OK;
+    }
+    if (candidate->parent != 0) {
+        parent = filed_find_vnode(vfs, candidate->parent);
+    }
+    filed_vnode_write_lock(parent);
+    filed_vnode_write_lock(candidate);
+    const bool still_evictable =
+        candidate->active &&
+        candidate->backend_object == oldest_object &&
+        filed_vfs_backend_object_is_unused_linked_leaf(vfs, oldest_object, NULL) &&
+        (evictable == NULL || evictable(context, oldest_object));
+    if (!still_evictable) {
+        filed_vnode_write_unlock(candidate);
+        filed_vnode_write_unlock(parent);
+        return FILED_OK;
+    }
+    memset(candidate, 0, sizeof(*candidate));
+    filed_vnode_write_unlock(candidate);
+    filed_vnode_write_unlock(parent);
+    out_reclaim->released = true;
+    out_reclaim->backend_object = oldest_object;
+    return FILED_OK;
 }
 
 filed_status_t filed_vfs_dup_handle(

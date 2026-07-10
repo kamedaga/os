@@ -1455,6 +1455,74 @@ static void test_invalid_arguments(void)
     expect_status("check null vfs", filed_vfs_check_basic(NULL), FILED_ERR_INVALID);
 }
 
+static bool test_backend_object_evictable(void *context, filed_backend_object_id_t backend_object)
+{
+    (void)context;
+    (void)backend_object;
+    return true;
+}
+
+static void test_linked_vnode_lru_reuses_capacity(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    unsigned int evictions = 0;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for linked vnode lru",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for linked vnode lru",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_STAT,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+
+    for (unsigned int i = 0; i < 160; ++i) {
+        char name[32];
+        filed_vfs_open_result_t file;
+        filed_vfs_reclaim_result_t reclaim;
+        snprintf(name, sizeof(name), "header-%03u.h", i);
+        expect_status(
+            "open distinct linked vnode",
+            filed_vfs_open_backend_child(
+                &vfs,
+                root.handle_id,
+                1000u + i,
+                FILED_VNODE_REGULAR,
+                name,
+                FILED_RIGHT_READ | FILED_RIGHT_STAT,
+                0,
+                &file),
+            FILED_OK);
+        expect_status(
+            "close distinct linked vnode",
+            filed_vfs_close_handle(&vfs, file.handle_id),
+            FILED_OK);
+        memset(&reclaim, 0, sizeof(reclaim));
+        expect_status(
+            "evict distinct linked vnode",
+            filed_vfs_evict_lru_unused_linked(
+                &vfs,
+                32,
+                test_backend_object_evictable,
+                NULL,
+                &reclaim),
+            FILED_OK);
+        if (reclaim.released) {
+            ++evictions;
+        }
+    }
+    expect_true("linked vnode lru evicted after 100+ opens", evictions >= 128);
+    expect_status("linked vnode lru preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 int main(void)
 {
     test_init_and_root_mount();
@@ -1476,6 +1544,7 @@ int main(void)
     test_mutation_component_validation();
     test_rights_and_flags();
     test_invalid_arguments();
+    test_linked_vnode_lru_reuses_capacity();
 
     if (failures != 0) {
         printf("filed vfs tests failed: %d\n", failures);

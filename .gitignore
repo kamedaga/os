@@ -1,7 +1,8 @@
 # Build outputs
 .artifacts/
 .temp-docs/
-tools/
+tools/*
+!tools/build_wsl_alpine_clang.sh
 **/zig-out/
 kernel/.zig-cache/
 .zig-cache/

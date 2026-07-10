@@ -189,6 +189,22 @@ uint64_t filed_kobox_backend_dirty_hint(const filed_kobox_backend_t *backend)
     return backend != NULL ? backend->dirty_hint : 0;
 }
 
+int filed_kobox_backend_object_stats(
+    filed_kobox_backend_t *backend,
+    filed_kobox_object_stats_t *out_stats)
+{
+    if (backend == NULL || out_stats == NULL) {
+        return -22;
+    }
+    memset(out_stats, 0, sizeof(*out_stats));
+    if (!filed_kobox_backend_is_direct(backend) ||
+        backend->direct_ops->object_stats == NULL)
+    {
+        return -95;
+    }
+    return backend->direct_ops->object_stats(backend->direct_ctx, out_stats);
+}
+
 void filed_kobox_backend_dump_metrics(const filed_kobox_backend_t *backend)
 {
     if (backend == NULL) {
@@ -643,6 +659,32 @@ int filed_kobox_backend_pwrite(
     }
 
     return status;
+}
+
+int filed_kobox_backend_readlink(
+    filed_kobox_backend_t *backend,
+    uint64_t object_id,
+    char *out_target,
+    uint64_t target_capacity,
+    uint64_t *out_length)
+{
+    if (backend == NULL || object_id == 0 || out_target == NULL ||
+        target_capacity == 0 || out_length == NULL)
+    {
+        return -22;
+    }
+    *out_length = 0;
+    if (!filed_kobox_backend_is_direct(backend) ||
+        backend->direct_ops->readlink == NULL)
+    {
+        return -95;
+    }
+    return backend->direct_ops->readlink(
+        backend->direct_ctx,
+        object_id,
+        out_target,
+        target_capacity,
+        out_length);
 }
 
 int filed_kobox_backend_fsync(

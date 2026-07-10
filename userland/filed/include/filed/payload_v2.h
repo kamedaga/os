@@ -13,8 +13,10 @@
 #include "filed/ipc_protocol_v2.h"
 
 enum {
-    FILED_V2_SYMLINK_TARGET_BYTES = FILED_V2_IO_BYTES,
     FILED_V2_PAGE_BYTES = 8192,
+    FILED_V2_SYMLINK_TARGET_BYTES =
+        FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES -
+        FILED_V2_PATH_BYTES - 2u * sizeof(uint64_t),
     FILED_V2_SESSION_PAGE_BYTES = 40960,
     FILED_V2_FAST_MAGIC = 0x31545341464c4446ull,
     FILED_V2_FAST_VERSION = PACHA_SERVICE_ABI_VERSION,
@@ -247,6 +249,13 @@ typedef struct filed_v2_readlink {
     char target[FILED_V2_SYMLINK_TARGET_BYTES];
 } filed_v2_readlink_t;
 
+typedef char filed_v2_symlink_fits_wire_page[
+    sizeof(filed_v2_symlink_t) <=
+        FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES ? 1 : -1];
+typedef char filed_v2_readlink_fits_wire_page[
+    sizeof(filed_v2_readlink_t) <=
+        FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES ? 1 : -1];
+
 typedef struct filed_v2_link {
     uint64_t old_dir_handle;
     uint64_t new_dir_handle;
@@ -346,7 +355,8 @@ typedef struct filed_v2_exec_path {
 } filed_v2_exec_path_t;
 
 typedef char filed_v2_exec_path_fits_wire_page[
-    sizeof(filed_v2_exec_path_t) <= FILED_V2_PAGE_BYTES ? 1 : -1];
+    sizeof(filed_v2_exec_path_t) <=
+        FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES ? 1 : -1];
 
 static inline int filed_v2_exec_string_ref_empty(filed_v2_exec_string_ref_t ref)
 {

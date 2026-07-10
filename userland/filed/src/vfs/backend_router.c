@@ -32,6 +32,19 @@ int filed_runtime_backend_statx(
     return filed_kobox_backend_statx(&runtime->backend, object_id, out_stat);
 }
 
+int filed_runtime_backend_release_object(
+    filed_runtime_t *runtime,
+    uint64_t object_id)
+{
+    if (runtime == NULL) {
+        return -22;
+    }
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_release_object(&runtime->tmpfs, object_id);
+    }
+    return filed_kobox_backend_release_object(&runtime->backend, object_id);
+}
+
 int filed_runtime_backend_pread(
     filed_runtime_t *runtime,
     uint64_t object_id,

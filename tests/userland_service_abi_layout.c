@@ -38,7 +38,15 @@ int main(void)
     failures += expect(sizeof(filed_v2_file_vmo_request_t) == 48, "filed file-vmo request size");
     failures += expect(sizeof(filed_v2_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "filed io fits page");
     failures += expect(sizeof(filed_v2_openat_t) <= FILED_V2_PAGE_BYTES, "filed openat payload fits page");
-    failures += expect(sizeof(filed_v2_exec_path_t) <= FILED_V2_PAGE_BYTES, "filed exec payload fits page");
+    failures += expect(
+        sizeof(filed_v2_symlink_t) <= FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES,
+        "filed symlink payload fits after service header");
+    failures += expect(
+        sizeof(filed_v2_readlink_t) <= FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES,
+        "filed readlink payload fits after service header");
+    failures += expect(
+        sizeof(filed_v2_exec_path_t) <= FILED_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES,
+        "filed exec payload fits after service header");
     failures += expect(
         (unsigned int)FILED_V2_FAST_VERSION == (unsigned int)PACHA_SERVICE_ABI_VERSION,
         "filed fast version follows service abi");

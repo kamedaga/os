@@ -104,6 +104,16 @@ int filed_kobox_backend_pwrite(filed_kobox_backend_t *backend, uint64_t object_i
     return -95;
 }
 
+int filed_kobox_backend_readlink(filed_kobox_backend_t *backend, uint64_t object_id, char *out_target, uint64_t target_capacity, uint64_t *out_length)
+{
+    (void)backend;
+    (void)object_id;
+    (void)out_target;
+    (void)target_capacity;
+    (void)out_length;
+    return -95;
+}
+
 int filed_kobox_backend_fsync(filed_kobox_backend_t *backend, uint64_t object_id)
 {
     (void)backend;
@@ -429,12 +439,55 @@ static void test_shared_vmo_is_io_source_and_revoke_target(void)
     expect_int("shared vmo release closes owner", mock_fd_close_calls, 1);
 }
 
+static void test_file_vmo_cache_byte_budget(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    init_runtime(&runtime, &dispatch);
+
+    expect_true(
+        "vmo cache rejects over-budget entry",
+        filed_file_vmo_cache_slot_for_length(
+            &runtime,
+            FILED_FILE_VMO_CACHE_TOTAL_BYTES + 1u) == NULL);
+
+    filed_file_vmo_cache_entry_t *oldest = filed_file_vmo_cache_slot(&runtime);
+    expect_true("vmo cache budget oldest slot", oldest != NULL);
+    if (oldest == NULL) {
+        return;
+    }
+    memset(oldest, 0, sizeof(*oldest));
+    oldest->active = 1;
+    oldest->vmo_fd = -1;
+    oldest->length = 300u * 1024u * 1024u;
+    oldest->clock = 1;
+
+    filed_file_vmo_cache_entry_t *newer = filed_file_vmo_cache_slot(&runtime);
+    expect_true("vmo cache budget newer slot", newer != NULL);
+    if (newer == NULL) {
+        return;
+    }
+    memset(newer, 0, sizeof(*newer));
+    newer->active = 1;
+    newer->vmo_fd = -1;
+    newer->length = 150u * 1024u * 1024u;
+    newer->clock = 2;
+
+    filed_file_vmo_cache_entry_t *slot = filed_file_vmo_cache_slot_for_length(
+        &runtime,
+        100u * 1024u * 1024u);
+    expect_true("vmo cache budget admits after eviction", slot != NULL);
+    expect_true("vmo cache budget evicts oldest", !oldest->active);
+    expect_true("vmo cache budget preserves newer", newer->active);
+}
+
 int main(void)
 {
     test_rename_clears_negative_lookup();
     test_unlink_clears_dirent_cache();
     test_truncate_clears_page_and_vmo_cache();
     test_shared_vmo_is_io_source_and_revoke_target();
+    test_file_vmo_cache_byte_budget();
     if (failures != 0) {
         return 1;
     }

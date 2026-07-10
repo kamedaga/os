@@ -48,6 +48,43 @@ int filed_release_reclaimed_object(
     return filed_backend_release_object(runtime, reclaim->backend_object);
 }
 
+static bool filed_runtime_backend_object_evictable(
+    void *context,
+    filed_backend_object_id_t backend_object)
+{
+    return filed_cache_object_evictable((filed_runtime_t *)context, backend_object);
+}
+
+static int filed_evict_unused_linked_vnodes(filed_runtime_t *runtime)
+{
+    enum { FILED_LINKED_VNODE_CACHE_LIMIT = 48 };
+    for (;;) {
+        filed_vfs_reclaim_result_t reclaim;
+        memset(&reclaim, 0, sizeof(reclaim));
+        const filed_status_t status = filed_vfs_evict_lru_unused_linked(
+            &runtime->vfs,
+            FILED_LINKED_VNODE_CACHE_LIMIT,
+            filed_runtime_backend_object_evictable,
+            runtime,
+            &reclaim);
+        if (status != FILED_OK) {
+            return filed_status_to_wire(status);
+        }
+        if (!reclaim.released || reclaim.backend_object == 0) {
+            return 0;
+        }
+        int flush_status = filed_cache_flush_object(runtime, reclaim.backend_object);
+        if (flush_status != 0) {
+            return flush_status;
+        }
+        filed_cache_release_object(runtime, reclaim.backend_object);
+        const int release_status = filed_backend_release_object(runtime, reclaim.backend_object);
+        if (release_status != 0) {
+            return release_status;
+        }
+    }
+}
+
 int64_t filed_close_handle_runtime(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id)
@@ -69,7 +106,11 @@ int64_t filed_close_handle_runtime(
         }
         filed_cache_release_object(runtime, reclaim.backend_object);
     }
-    return filed_release_reclaimed_object(runtime, &reclaim);
+    const int release_status = filed_release_reclaimed_object(runtime, &reclaim);
+    if (release_status != 0) {
+        return release_status;
+    }
+    return filed_evict_unused_linked_vnodes(runtime);
 }
 
 void filed_write_u64_le(void *base, uint64_t offset, uint64_t value)
@@ -410,16 +451,20 @@ int64_t filed_lookup_component_stat(
     filed_handle_id_t parent_handle,
     const char *name,
     uint64_t *out_object_id,
-    storage_v2_statx_reply_t *out_stat)
+    storage_v2_statx_reply_t *out_stat,
+    bool *out_lookup_owned)
 {
     filed_vfs_io_decision_t parent_decision;
     filed_status_t status;
     int64_t reply_status;
 
-    if (runtime == NULL || name == NULL || out_object_id == NULL || out_stat == NULL) {
+    if (runtime == NULL || name == NULL || out_object_id == NULL ||
+        out_stat == NULL || out_lookup_owned == NULL)
+    {
         return filed_status_to_wire(FILED_ERR_INVALID);
     }
     *out_object_id = 0;
+    *out_lookup_owned = false;
     memset(out_stat, 0, sizeof(*out_stat));
     status = filed_vfs_lookup_prepare(&runtime->vfs, parent_handle, &parent_decision);
     reply_status = filed_status_to_wire(status);
@@ -430,7 +475,13 @@ int64_t filed_lookup_component_stat(
     if (reply_status != 0) {
         return reply_status;
     }
-    return filed_backend_statx(runtime, *out_object_id, out_stat);
+    *out_lookup_owned = true;
+    reply_status = filed_backend_statx(runtime, *out_object_id, out_stat);
+    if (reply_status != 0) {
+        (void)filed_backend_release_object(runtime, *out_object_id);
+        *out_lookup_owned = false;
+    }
+    return reply_status;
 }
 
 int64_t filed_splice_symlink_target(
@@ -622,6 +673,7 @@ int64_t filed_resolve_parent_path(
             filed_vfs_open_result_t next_open;
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
+            bool lookup_owned = false;
             storage_v2_statx_reply_t stat;
             int64_t symlink_status;
             if (filed_path_is_single_component(after_slashes)) {
@@ -632,13 +684,17 @@ int64_t filed_resolve_parent_path(
                 current_handle,
                 component,
                 &object_id,
-                &stat);
+                &stat,
+                &lookup_owned);
             if (symlink_status != 0) {
                 filed_close_walk_handle(runtime, current_handle, current_owned);
                 return symlink_status;
             }
             if (filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK) {
                 if (symlink_budget == 0) {
+                    if (lookup_owned) {
+                        (void)filed_backend_release_object(runtime, object_id);
+                    }
                     filed_close_walk_handle(runtime, current_handle, current_owned);
                     return filed_status_to_wire(FILED_ERR_LOOP);
                 }
@@ -649,6 +705,9 @@ int64_t filed_resolve_parent_path(
                     after_slashes,
                     symlink_path,
                     sizeof(symlink_path));
+                if (lookup_owned) {
+                    (void)filed_backend_release_object(runtime, object_id);
+                }
                 if (symlink_status != 0) {
                     filed_close_walk_handle(runtime, current_handle, current_owned);
                     return symlink_status;
@@ -660,6 +719,9 @@ int64_t filed_resolve_parent_path(
                 }
                 path = symlink_path;
                 continue;
+            }
+            if (lookup_owned) {
+                (void)filed_backend_release_object(runtime, object_id);
             }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,
@@ -692,6 +754,8 @@ int64_t filed_lookup_and_open_component(
     storage_v2_statx_reply_t backend_stat;
     filed_status_t status;
     int64_t reply_status;
+    bool lookup_acquired = false;
+    bool existing_vnode_owns_object = false;
     const bool can_use_negative_lookup_cache =
         (open_flags & (FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE | FILED_OPEN_TRUNCATE)) == 0;
 
@@ -744,6 +808,7 @@ int64_t filed_lookup_and_open_component(
         if (reply_status != 0) {
             return reply_status;
         }
+        lookup_acquired = true;
         filed_cache_invalidate(runtime, parent_decision.backend_object);
         memset(&backend_stat, 0, sizeof(backend_stat));
         reply_status = filed_backend_statx(
@@ -751,6 +816,7 @@ int64_t filed_lookup_and_open_component(
             object_id,
             &backend_stat);
         if (reply_status != 0) {
+            (void)filed_backend_release_object(runtime, object_id);
             return reply_status;
         }
         status = filed_vfs_create_backend_child(
@@ -774,6 +840,9 @@ int64_t filed_lookup_and_open_component(
                 object_id,
                 &snapshot);
         }
+        if (status != FILED_OK) {
+            (void)filed_backend_release_object(runtime, object_id);
+        }
         return filed_status_to_wire(status);
     }
     if (reply_status != 0) {
@@ -786,9 +855,11 @@ int64_t filed_lookup_and_open_component(
         }
         return reply_status;
     }
+    lookup_acquired = true;
     if ((open_flags & (FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE)) ==
         (FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE))
     {
+        (void)filed_backend_release_object(runtime, object_id);
         return filed_status_to_wire(FILED_ERR_EXISTS);
     }
 
@@ -798,8 +869,18 @@ int64_t filed_lookup_and_open_component(
         object_id,
         &backend_stat);
     if (reply_status != 0) {
+        (void)filed_backend_release_object(runtime, object_id);
         return reply_status;
     }
+
+    filed_backend_object_id_t cached_object = 0;
+    existing_vnode_owns_object =
+        filed_vfs_cached_child_backend_object(
+            &runtime->vfs,
+            parent_handle,
+            name,
+            &cached_object) == FILED_OK &&
+        cached_object == object_id;
 
     status = filed_vfs_open_backend_child(
         &runtime->vfs,
@@ -810,6 +891,9 @@ int64_t filed_lookup_and_open_component(
         rights,
         open_flags,
         out_open);
+    if (lookup_acquired && (status != FILED_OK || existing_vnode_owns_object)) {
+        (void)filed_backend_release_object(runtime, object_id);
+    }
     if (status == FILED_OK) {
         filed_vfs_stat_snapshot_t current_snapshot;
         memset(&current_snapshot, 0, sizeof(current_snapshot));
@@ -991,6 +1075,7 @@ int64_t filed_openat_path(
             filed_vfs_open_result_t next_open;
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
+            bool lookup_owned = false;
             storage_v2_statx_reply_t stat;
             int64_t symlink_status;
             if ((open_flags & FILED_OPEN_CREATE) != 0 &&
@@ -1003,13 +1088,17 @@ int64_t filed_openat_path(
                 current_handle,
                 component,
                 &object_id,
-                &stat);
+                &stat,
+                &lookup_owned);
             if (symlink_status != 0) {
                 filed_close_walk_handle(runtime, current_handle, current_owned);
                 return symlink_status;
             }
             if (filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK) {
                 if (symlink_budget == 0) {
+                    if (lookup_owned) {
+                        (void)filed_backend_release_object(runtime, object_id);
+                    }
                     filed_close_walk_handle(runtime, current_handle, current_owned);
                     return filed_status_to_wire(FILED_ERR_LOOP);
                 }
@@ -1020,6 +1109,9 @@ int64_t filed_openat_path(
                     after_slashes,
                     symlink_path,
                     sizeof(symlink_path));
+                if (lookup_owned) {
+                    (void)filed_backend_release_object(runtime, object_id);
+                }
                 if (symlink_status != 0) {
                     filed_close_walk_handle(runtime, current_handle, current_owned);
                     return symlink_status;
@@ -1031,6 +1123,9 @@ int64_t filed_openat_path(
                 }
                 path = symlink_path;
                 continue;
+            }
+            if (lookup_owned) {
+                (void)filed_backend_release_object(runtime, object_id);
             }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,

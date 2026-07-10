@@ -442,7 +442,8 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
         return filed_page_result(reply_status, 0);
     }
 
-    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(runtime);
+    filed_file_vmo_cache_entry_t *entry =
+        filed_file_vmo_cache_slot_for_length(runtime, length);
     if (entry == NULL) {
         (void)pacha_fd_close(vmo_fd);
         return filed_page_result(-28, 0);
@@ -1104,11 +1105,24 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
         return flush_status;
     }
     const int backend_status = filed_kobox_backend_sync_all(&runtime->backend);
+    filed_kobox_object_stats_t object_stats;
+    memset(&object_stats, 0, sizeof(object_stats));
+    const int object_stats_status =
+        filed_kobox_backend_object_stats(&runtime->backend, &object_stats);
     printf(
         "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu backend_status=%d\n",
         (unsigned long long)dirty_count,
         (unsigned long long)backend_dirty_hint,
         backend_status);
+    if (object_stats_status == 0) {
+        printf(
+            "[filed] kobox_objects used=%u referenced=%u cached=%u capacity=%u evictions=%llu\n",
+            object_stats.used,
+            object_stats.referenced,
+            object_stats.cached,
+            object_stats.capacity,
+            (unsigned long long)object_stats.evictions);
+    }
     fflush(stdout);
     return backend_status;
 }
@@ -1156,10 +1170,16 @@ uint64_t filed_lookup_cache_target_object(
     filed_runtime_t *runtime,
     filed_handle_id_t parent_handle,
     uint64_t parent_backend_object,
-    const char *name)
+    const char *name,
+    bool *out_lookup_owned)
 {
     uint64_t object_id = 0;
-    if (runtime == NULL || parent_backend_object == 0 || name == NULL) {
+    if (out_lookup_owned != NULL) {
+        *out_lookup_owned = false;
+    }
+    if (runtime == NULL || parent_backend_object == 0 || name == NULL ||
+        out_lookup_owned == NULL)
+    {
         return 0;
     }
     if (parent_handle != 0 &&
@@ -1183,6 +1203,7 @@ uint64_t filed_lookup_cache_target_object(
         return 0;
     }
     if (object_id != 0) {
+        *out_lookup_owned = true;
         filed_target_lookup_backend_hits++;
     } else {
         filed_target_lookup_misses++;

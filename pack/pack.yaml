@@ -30,7 +30,6 @@ startupManifest:
 rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
   apps:
-    - "alpine_clang"
     - "alpine_go"
     - "alpine_key_4a6a0840"
     - "alpine_key_5243ef4b"
@@ -42,6 +41,7 @@ skip:
     - "apk_repositories"
     - "apk_world"
     - "capsule_demo"
+    - "chibicc_toolchain_root"
     - "dash"
     - "dns_lookup"
     - "esp_server"
@@ -831,6 +831,18 @@ apps:
     file: "musl/pachaos/smoke/chibicc_workload.c"
     out: "CHIBIWORK.C"
     rootfs: "/cmd/chibicc_workload.c"
+  clang_hello_source:
+    file: "tests/fixtures/clang_hello.c"
+    out: "CLANGHEL.C"
+    rootfs: "/cmd/clang_hello.c"
+  clang_endurance_script:
+    file: "tests/fixtures/clang_endurance_smoke.sh"
+    out: "CLANGEND.SH"
+    rootfs: "/cmd/clang_endurance_smoke.sh"
+  clang_cold_measure_script:
+    file: "tests/fixtures/clang_cold_measure.sh"
+    out: "CLANGCLD.SH"
+    rootfs: "/cmd/clang_cold_measure.sh"
   pipe_stress_script:
     file: "tests/fixtures/pipe_stress.sh"
     out: "PIPESTRS.SH"

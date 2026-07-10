@@ -126,7 +126,7 @@ int filed_name_is_terminated(const char *name, size_t capacity);
 const char *filed_skip_slashes(const char *path);
 int filed_path_is_single_component(const char *path);
 void filed_close_walk_handle(filed_runtime_t *runtime, filed_handle_id_t handle_id, int owned);
-int64_t filed_lookup_component_stat(filed_runtime_t *runtime, filed_handle_id_t parent_handle, const char *name, uint64_t *out_object_id, storage_v2_statx_reply_t *out_stat);
+int64_t filed_lookup_component_stat(filed_runtime_t *runtime, filed_handle_id_t parent_handle, const char *name, uint64_t *out_object_id, storage_v2_statx_reply_t *out_stat, bool *out_lookup_owned);
 int64_t filed_splice_symlink_target(filed_runtime_t *runtime, uint64_t object_id, const char *rest, char *out_path, size_t out_path_size);
 int64_t filed_resolve_parent_path(filed_runtime_t *runtime, filed_handle_id_t base_dir_handle, const char *path, uint32_t parent_rights, filed_handle_id_t *out_parent_handle, int *out_parent_owned, char *out_name, size_t out_name_size);
 int64_t filed_openat_path(filed_runtime_t *runtime, const filed_v2_openat_t *openat, filed_vfs_open_result_t *out_open);
@@ -147,7 +147,7 @@ filed_page_dispatch_result_t filed_dispatch_write_page(filed_runtime_t *runtime,
 filed_page_dispatch_result_t filed_dispatch_seek_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_fsync_page(filed_runtime_t *runtime, const struct pacha_ipc_msg *request);
 filed_page_dispatch_result_t filed_dispatch_truncate_page(filed_runtime_t *runtime, void *page);
-uint64_t filed_lookup_cache_target_object(filed_runtime_t *runtime, filed_handle_id_t parent_handle, uint64_t parent_backend_object, const char *name);
+uint64_t filed_lookup_cache_target_object(filed_runtime_t *runtime, filed_handle_id_t parent_handle, uint64_t parent_backend_object, const char *name, bool *out_lookup_owned);
 void filed_invalidate_mutated_object(filed_runtime_t *runtime, uint64_t backend_object);
 int filed_flush_mutated_object(filed_runtime_t *runtime, uint64_t backend_object);
 
