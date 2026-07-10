@@ -209,6 +209,8 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - T1.1 の耐久スモーク (chibicc コンパイルループ) を clang 版に差し替え/併設し CI 化。
 - 受け入れ: clang でのコンパイル 10 回連続成功、ページリークなし。これが本リファクタリング全体の完了基準。
 
+**結果 (2026-07-10, 3a1f3c3 + _kobox 47b3181 で完了)**: 受け入れ達成 — compile→run 10/10 成功 (guest 65秒 ≈ 6.5秒/回)、LPR 状態 [open=4 live=1] 前後一致、kobox object table は [used=256 ref=67 cached=189 evictions=5] に収束し eviction の実動作を初確認。前提だった koboxd 64 枠枯渇は 256 枠 + refcount/LRU eviction で解消。cold `clang --version` は当初 219 秒 → **guest 4 秒 / host 8 秒**。真因は全て _kobox 側の 4 件: ① NVMe completion 毎の無条件 nanosleep(50µs、PachaOS 実測 6ms) — 44,223 read × 6ms = 265 秒 ② IRQ wait の内部 poll が 450 万 syscall → CQ spin pre-poll で 20.8→1.86 秒 ③ ext4 extent metadata の生 read が I/O を 44,223 回に細分化 → buffer cache 利用で約 575 回 ④ PRP list の非整列 calloc で大 read の後半がゼロのまま完了扱い (DSO ロード後 fault の真因)。泥バグ 8・9 匹目も本タスクで発見・修正: ⑧ readlink/symlink payload (8,176B) が service header 64B シフトで wire page 8,192B を 48B あふれ → LPR heap 破壊 (140 exec 後に顕在化) ⑨ clone が child_stack≠0 でも child_frame.rsp を設定せず → posix_spawn 子が親 stack から戻り先を pop して GPF (link 段 exit 13 の正体)。sigaltstack は ENOSYS のまま clang 動作に支障なし (正実装は T4.6 の signal 配送とセット)。スモークは clang cold-measure / endurance を加えた 11 本体制。
+
 **T4.6 [kernel] 非同期シグナル配送 (CPU-bound プロセスへの割込み)**
 - 現状 (2026-07-09 ユーザー情報): signal は syscall 待機中のプロセスにしか届かず、CPU-bound 実行中のプロセスには Ctrl-C も kill も効かない。バグではなく未実装。
 - timer interrupt からのユーザー復帰時に pending signal をチェックして配送する経路を kernel に追加。SIGKILL は handler なしで即終了、それ以外は LPR の signal 経路 (lpr_supervisor) へ。
