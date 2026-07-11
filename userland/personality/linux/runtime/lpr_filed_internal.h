@@ -18,6 +18,7 @@
 #include <pachaos/abi.h>
 #include <personality/lpr_client_abi.h>
 #include <personality/linux_lpr.h>
+#include <drmd/ipc_protocol.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -629,6 +630,7 @@ int lpr_fd_table_set_offset(lpr_fd_table_t *table, uint32_t fd, uint64_t offset)
 int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t flags);
 const lpr_fd_object_t *lpr_fd_object_for_fd_const(uint64_t fd);
 lpr_event_fd_t *lpr_fd_event_payload(uint64_t fd);
+lpr_drm_fd_t *lpr_fd_drm_payload(uint64_t fd);
 lpr_fd_object_t *lpr_fd_object_for_fd(uint64_t fd);
 lpr_filed_fd_t *lpr_fd_filed_payload(uint64_t fd);
 lpr_pipe_fd_t *lpr_fd_pipe_payload(uint64_t fd);
@@ -640,6 +642,7 @@ int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t count);
 int lpr_linux_default_signal_ignored(uint32_t sig);
 int lpr_linux_default_signal_stops(uint32_t sig);
 int lpr_linux_eventfd_active(uint64_t fd);
+int lpr_linux_drm_fd_active(uint64_t fd);
 int lpr_linux_filed_fd_active(uint64_t fd);
 int lpr_linux_pipe_fd_active(uint64_t fd);
 int lpr_linux_process_register( int32_t linux_pid, int32_t linux_ppid, int32_t linux_sid, int32_t linux_pgrp, int process_fd);
@@ -662,10 +665,16 @@ int lpr_restore_bootstrap_filed_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
+int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_runtime_reserved_fd(uint64_t fd);
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int lpr_timespec_less_equal( const struct pachaos_timespec *lhs, const struct pachaos_timespec *rhs);
 int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags);
+int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags);
+int64_t lpr_drm_open_path(const char *path, uint64_t flags);
+int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
+int64_t lpr_drm_close_handle(uint64_t handle);
+int64_t lpr_drm_mmap(uint64_t fd, uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset);
 int32_t lpr_linux_alloc_child_pid(void);
 int64_t lpr_close_native_fd_if_open(uint64_t fd);
 int64_t lpr_control_get_fd_flags(uint64_t fd);

@@ -5,7 +5,7 @@
 
 enum {
     LPRS_BOOT_CONFIG_MAGIC = 0x315446434c535250ull,
-    LPRS_BOOT_CONFIG_FD = 245,
+    LPRS_BOOT_CONFIG_FD = 246,
 };
 
 struct lprs_boot_config {

@@ -18,6 +18,7 @@ cc="${CC:-cc}"
   -I "$repo_root/userland/koboxd/src" \
   -I "$repo_root/userland/netd/include" \
   -I "$repo_root/userland/termd/include" \
+  -I "$repo_root/userland/drmd/include" \
   -I "$repo_root/userland/lpr_supervisor/include" \
   -I "$repo_root/userland/personality/include" \
   "$repo_root/tests/userland_service_abi_layout.c" \

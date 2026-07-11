@@ -15,6 +15,8 @@ app_out="${1:-$out_dir/hello-libc-scaffold.elf}"
 extra_sources="${PACHAOS_MUSL_EXTRA_SOURCES:-}"
 extra_include_dirs="${PACHAOS_MUSL_EXTRA_INCLUDE_DIRS:-}"
 extra_cflags="${PACHAOS_MUSL_EXTRA_CFLAGS:-}"
+libc_extra_cflags="${PACHAOS_MUSL_LIBC_EXTRA_CFLAGS:-}"
+extra_link_flags="${PACHAOS_MUSL_EXTRA_LINK_FLAGS:-}"
 extra_link_inputs="${PACHAOS_MUSL_EXTRA_LINK_INPUTS:-}"
 static_pie="${PACHAOS_MUSL_STATIC_PIE:-1}"
 
@@ -66,6 +68,9 @@ common_cflags=(
   -I "$upstream/src/internal"
   -I "$obj_dir/include"
 )
+for flag in $libc_extra_cflags; do
+  common_cflags+=("$flag")
+done
 
 libc_sources=(
   "$upstream/src/env/__libc_start_main.c"
@@ -423,6 +428,9 @@ else
   link_flags+=("-fno-pie" "-Wl,-no-pie")
   crt_start="$sysroot/usr/lib/crt1.o"
 fi
+for flag in $extra_link_flags; do
+  link_flags+=("$flag")
+done
 
 "$cc" \
   "${link_flags[@]}" \

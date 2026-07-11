@@ -138,6 +138,10 @@ static void lpr_fd_table_fill_payload(
         file->payload.tty.active = 1;
         file->payload.tty.handle = install->backend_id;
         break;
+    case LPR_FD_TABLE_KIND_DRM:
+        file->payload.drm.active = 1;
+        file->payload.drm.handle = install->backend_id;
+        break;
     case LPR_FD_TABLE_KIND_PIPE:
         file->payload.pipe.active = 1;
         file->payload.pipe.flags =

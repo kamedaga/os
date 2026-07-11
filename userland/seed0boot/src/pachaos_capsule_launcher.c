@@ -2,6 +2,7 @@
 
 #include "bootfs_reader.h"
 #include "bootstrap_abi.h"
+#include "drmd/boot_config.h"
 #include "next_stage_loader.h"
 #include "netd/boot_config.h"
 #include "pacha/ipc.h"
@@ -21,9 +22,12 @@ enum {
     SEED0_VIRTIO_NET_MODERN_DEVICE_ID = 0x1041,
     SEED0_VIRTIO_CONSOLE_LEGACY_DEVICE_ID = 0x1003,
     SEED0_VIRTIO_CONSOLE_MODERN_DEVICE_ID = 0x1043,
+    SEED0_VIRTIO_GPU_LEGACY_DEVICE_ID = 0x1010,
+    SEED0_VIRTIO_GPU_MODERN_DEVICE_ID = 0x1050,
     SEED0_FILED_ENDPOINT_FD = 240,
     SEED0_NETD_SOCKET_ENDPOINT_FD = 241,
     SEED0_TERMD_TTY_ENDPOINT_FD = 242,
+    SEED0_DRMD_DRM_ENDPOINT_FD = 243,
 };
 
 static const uint64_t seed0_netd_endpoint_rights =
@@ -115,6 +119,30 @@ static const struct seed0_device_descriptor *find_virtio_console_device(const st
         if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
             (device->device_id == SEED0_VIRTIO_CONSOLE_LEGACY_DEVICE_ID ||
              device->device_id == SEED0_VIRTIO_CONSOLE_MODERN_DEVICE_ID)) {
+            return device;
+        }
+    }
+    return 0;
+}
+
+static const struct seed0_device_descriptor *find_virtio_gpu_device(const struct seed0_init_descriptor_page *desc)
+{
+    if (desc == 0) {
+        return 0;
+    }
+    uint64_t count = desc->device_count;
+    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) {
+        count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        const struct seed0_device_descriptor *device = &desc->devices[i];
+        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
+            !seed0_fd_is_dynamic(device->init_device_fd)) {
+            continue;
+        }
+        if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
+            (device->device_id == SEED0_VIRTIO_GPU_LEGACY_DEVICE_ID ||
+             device->device_id == SEED0_VIRTIO_GPU_MODERN_DEVICE_ID)) {
             return device;
         }
     }
@@ -599,6 +627,142 @@ int seed0_launch_termd(int ready_channel_fd, int *out_tty_endpoint_fd)
         *out_tty_endpoint_fd = tty_endpoint_fd;
     } else {
         (void)pacha_fd_close(tty_endpoint_fd);
+    }
+    return 0;
+}
+
+int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
+{
+    static const struct seed0_capsule_module_spec module_specs[] = {
+        {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
+        {"/srv/kobox/linux_virtio_ring.ko", "linux_virtio_ring.ko"},
+        {"/srv/kobox/linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_modern_dev.ko"},
+        {"/srv/kobox/linux_virtio_pci_legacy_dev.ko", "linux_virtio_pci_legacy_dev.ko"},
+        {"/srv/kobox/linux_virtio_pci.ko", "linux_virtio_pci.ko"},
+        {"/srv/kobox/linux_virtio_dma_buf.ko", "linux_virtio_dma_buf.ko"},
+        {"/srv/kobox/linux_virtio_gpu.ko", "linux_virtio_gpu.ko"},
+    };
+
+    if (out_drm_endpoint_fd != 0) {
+        *out_drm_endpoint_fd = -1;
+    }
+    if (ready_channel_fd < 16) {
+        return -1;
+    }
+
+    const struct seed0_device_descriptor *device =
+        find_virtio_gpu_device(seed0_bootstrap_descriptor());
+    if (device == 0) {
+        fprintf(stderr, "[seed0boot] drmd: virtio-gpu device fd not found\n");
+        return -19;
+    }
+    const int device_fd = (int)device->init_device_fd;
+    int status = mark_device_inherit(device_fd, "drmd virtio-gpu");
+    if (status != 0) {
+        return status;
+    }
+
+    const unsigned char *daemon_image = 0;
+    uint32_t daemon_size = 0;
+    status = seed0_bootfs_open_file("/srv/drmd.elf", &daemon_image, &daemon_size);
+    if (status != 0) {
+        fprintf(stderr, "[seed0boot] drmd: open daemon from bootfs failed status=%d\n", status);
+        return -2;
+    }
+    const unsigned char *module_images[DRMD_MAX_MODULES];
+    uint32_t module_sizes[DRMD_MAX_MODULES];
+    memset(module_images, 0, sizeof(module_images));
+    memset(module_sizes, 0, sizeof(module_sizes));
+    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
+    for (uint64_t i = 0; i < module_count; i++) {
+        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
+        if (status != 0 || (uint64_t)module_sizes[i] > DRMD_MODULE_IMAGE_STRIDE) {
+            fprintf(stderr, "[seed0boot] drmd: open module failed name=%s status=%d size=%u\n",
+                module_specs[i].path,
+                status,
+                module_sizes[i]);
+            return -3;
+        }
+    }
+
+    const int drm_endpoint_fd = pacha_ipc_endpoint_create(seed0_termd_endpoint_rights, 0);
+    if (drm_endpoint_fd < 16) {
+        return drm_endpoint_fd < 0 ? drm_endpoint_fd : -2;
+    }
+    const long endpoint_dup = pacha_fd_fcntl(
+        drm_endpoint_fd,
+        PACHA_FD_FCNTL_DUP,
+        SEED0_DRMD_DRM_ENDPOINT_FD,
+        seed0_termd_endpoint_rights);
+    if (endpoint_dup != SEED0_DRMD_DRM_ENDPOINT_FD) {
+        (void)pacha_fd_close(drm_endpoint_fd);
+        return -4;
+    }
+    status = mark_device_inherit(SEED0_DRMD_DRM_ENDPOINT_FD, "drmd drm endpoint");
+    if (status == 0) {
+        status = mark_device_inherit(ready_channel_fd, "drmd ready channel");
+    }
+    if (status != 0) {
+        (void)pacha_fd_close(drm_endpoint_fd);
+        return status;
+    }
+
+    struct seed0_loaded_process loaded;
+    status = seed0_load_elf_process("/srv/drmd.elf", daemon_image, daemon_size, &loaded);
+    if (status != 0) {
+        (void)pacha_fd_close(drm_endpoint_fd);
+        return status;
+    }
+
+    struct drmd_boot_config config;
+    memset(&config, 0, sizeof(config));
+    config.magic = DRMD_BOOT_CONFIG_MAGIC;
+    config.drm_endpoint_fd = SEED0_DRMD_DRM_ENDPOINT_FD;
+    config.device_fd = (uint64_t)(uint32_t)device_fd;
+    config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
+    config.module_count = module_count;
+    for (uint64_t i = 0; i < module_count; i++) {
+        config.modules[i].image_va = DRMD_MODULE_IMAGE_VA + DRMD_MODULE_IMAGE_STRIDE * i;
+        config.modules[i].image_size = module_sizes[i];
+        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
+    }
+    status = seed0_map_bytes_into_process(
+        loaded.process_fd,
+        DRMD_BOOT_CONFIG_VA,
+        &config,
+        sizeof(config),
+        PACHA_PROT_READ);
+    if (status != 0) {
+        (void)pacha_fd_close(drm_endpoint_fd);
+        return -5;
+    }
+    for (uint64_t i = 0; i < module_count; i++) {
+        status = seed0_map_bytes_into_process(
+            loaded.process_fd,
+            config.modules[i].image_va,
+            module_images[i],
+            module_sizes[i],
+            PACHA_PROT_READ);
+        if (status != 0) {
+            fprintf(stderr, "[seed0boot] drmd: module map failed name=%s status=%d\n",
+                module_specs[i].name,
+                status);
+            (void)pacha_fd_close(drm_endpoint_fd);
+            return -6;
+        }
+    }
+
+    printf("[seed0boot] drmd modules=%llu\n", (unsigned long long)module_count);
+    status = seed0_start_process(&loaded, "/srv/drmd.elf", -1);
+    if (status != 0) {
+        (void)pacha_fd_close(drm_endpoint_fd);
+        return status;
+    }
+    (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+    if (out_drm_endpoint_fd != 0) {
+        *out_drm_endpoint_fd = drm_endpoint_fd;
+    } else {
+        (void)pacha_fd_close(drm_endpoint_fd);
     }
     return 0;
 }

@@ -248,6 +248,7 @@ void filed_runtime_init(filed_runtime_t *runtime)
     runtime->syncer_timer_fd = -1;
     runtime->netd_socket_endpoint_fd = -1;
     runtime->termd_tty_endpoint_fd = -1;
+    runtime->drmd_drm_endpoint_fd = -1;
     for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
         runtime->sessions[i].channel_fd = -1;
         runtime->sessions[i].page_fd = -1;

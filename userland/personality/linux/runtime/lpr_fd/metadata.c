@@ -300,6 +300,13 @@ int64_t lpr_linux_close(uint64_t fd)
         lpr_control_close_fd(fd);
         return refcount <= 1 ? lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0) : 0;
     }
+    if (lpr_linux_drm_fd_active(fd)) {
+        uint32_t refcount = 0;
+        (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+        const uint64_t handle = lpr_fd_drm_payload(fd)->handle;
+        lpr_control_close_fd(fd);
+        return refcount <= 1 ? lpr_drm_close_handle(handle) : 0;
+    }
     if (lpr_linux_eventfd_active(fd)) {
         lpr_control_close_fd(fd);
         return 0;
@@ -348,6 +355,8 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
             }
             if (cloexec) {
                 if (lpr_linux_tty_fd_active(fd)) {
+                    (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
+                } else if (lpr_linux_drm_fd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
                 } else if (lpr_linux_eventfd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
@@ -401,6 +410,9 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 {
     if (lpr_linux_tty_fd_active(fd)) {
+        return -LPR_LINUX_ESPIPE;
+    }
+    if (lpr_linux_drm_fd_active(fd)) {
         return -LPR_LINUX_ESPIPE;
     }
     if (lpr_pipe_fd_is_active(fd)) {
@@ -494,6 +506,23 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             return lpr_control_set_fd_flags(fd, arg);
         case LPR_LINUX_F_GETFL:
             return lpr_control_get_status_flags(fd, lpr_fd_tty_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
+        case LPR_LINUX_F_SETFL:
+            return lpr_control_set_status_flags(fd, arg);
+        case LPR_LINUX_F_DUPFD:
+        case LPR_LINUX_F_DUPFD_CLOEXEC:
+            return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
+        default:
+            return -LPR_LINUX_EINVAL;
+        }
+    }
+    if (lpr_linux_drm_fd_active(fd)) {
+        switch (cmd) {
+        case LPR_LINUX_F_GETFD:
+            return lpr_control_get_fd_flags(fd);
+        case LPR_LINUX_F_SETFD:
+            return lpr_control_set_fd_flags(fd, arg);
+        case LPR_LINUX_F_GETFL:
+            return lpr_control_get_status_flags(fd, lpr_fd_drm_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
         case LPR_LINUX_F_SETFL:
             return lpr_control_set_status_flags(fd, arg);
         case LPR_LINUX_F_DUPFD:
@@ -650,6 +679,9 @@ int64_t lpr_linux_flock(uint64_t fd, uint64_t operation)
 
 int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
+    if (lpr_linux_drm_fd_active(fd)) {
+        return lpr_drm_ioctl(fd, request, arg);
+    }
     if (lpr_linux_tty_fd_active(fd)) {
         return lpr_tty_ioctl(fd, request, arg);
     }
@@ -714,6 +746,16 @@ int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf)
         st->st_ino = fd + 1u;
         st->st_nlink = 1;
         st->st_mode = LPR_LINUX_S_IFIFO | 0600u;
+        st->st_blksize = 4096;
+        return 0;
+    }
+    if (lpr_linux_drm_fd_active(fd)) {
+        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
+        lpr_memset(st, 0, sizeof(*st));
+        st->st_ino = 0x64726900ull + fd;
+        st->st_nlink = 1;
+        st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
+        st->st_rdev = (226ull << 8);
         st->st_blksize = 4096;
         return 0;
     }

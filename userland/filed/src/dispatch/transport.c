@@ -81,6 +81,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_page_result(filed_dispatch_sync_all(runtime), 0);
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
+    case FILED_OP_SERVICE_SET_DRMD_DRM:
         return filed_page_result(-95, 0);
     default:
         return filed_page_result(-95, 0);
@@ -925,6 +926,7 @@ static int filed_dispatch_client(
     }
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
+    case FILED_OP_SERVICE_SET_DRMD_DRM:
         if (header.payload_size < sizeof(filed_service_endpoint_request_t) ||
             request->fd_count < 3 ||
             request->fds[1].fd < 16)
@@ -937,11 +939,16 @@ static int filed_dispatch_client(
                     (void)pacha_fd_close(runtime->netd_socket_endpoint_fd);
                 }
                 runtime->netd_socket_endpoint_fd = endpoint_fd;
-            } else {
+            } else if (header.op == FILED_OP_SERVICE_SET_TERMD_TTY) {
                 if (runtime->termd_tty_endpoint_fd >= 16) {
                     (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
                 }
                 runtime->termd_tty_endpoint_fd = endpoint_fd;
+            } else {
+                if (runtime->drmd_drm_endpoint_fd >= 16) {
+                    (void)pacha_fd_close(runtime->drmd_drm_endpoint_fd);
+                }
+                runtime->drmd_drm_endpoint_fd = endpoint_fd;
             }
             keep_fd = endpoint_fd;
             result = (uint64_t)(uint32_t)endpoint_fd;

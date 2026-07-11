@@ -565,6 +565,9 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
     if (flag_status != 0 || len == 0) {
         return -LPR_LINUX_EINVAL;
     }
+    if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_drm_fd_active(fd)) {
+        return lpr_drm_mmap(fd, len, prot, flags, offset);
+    }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_filed_fd_active(fd)) {
         if ((offset & 4095ull) != 0) {
             return -LPR_LINUX_EINVAL;

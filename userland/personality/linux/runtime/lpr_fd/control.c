@@ -42,6 +42,12 @@ lpr_tty_fd_t *lpr_fd_tty_payload(uint64_t fd)
     return object != 0 && object->kind == LPR_FD_TABLE_KIND_TTY ? &object->payload.tty : 0;
 }
 
+lpr_drm_fd_t *lpr_fd_drm_payload(uint64_t fd)
+{
+    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
+    return object != 0 && object->kind == LPR_FD_TABLE_KIND_DRM ? &object->payload.drm : 0;
+}
+
 lpr_socket_fd_t *lpr_fd_socket_payload(uint64_t fd)
 {
     lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
@@ -62,6 +68,11 @@ int lpr_fd_is_filed(uint64_t fd)
 int lpr_linux_tty_fd_active(uint64_t fd)
 {
     return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_TTY);
+}
+
+int lpr_linux_drm_fd_active(uint64_t fd)
+{
+    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DRM);
 }
 
 int lpr_fd_shadow_offset_eligible(uint64_t fd)
@@ -87,6 +98,7 @@ int lpr_runtime_reserved_fd(uint64_t fd)
     return fd == LPR_FILED_ENDPOINT_FD ||
         fd == LPR_NETD_ENDPOINT_FD ||
         fd == LPR_TERMD_TTY_ENDPOINT_FD ||
+        fd == LPR_DRMD_DRM_ENDPOINT_FD ||
         fd == LPR_BOOTSTRAP_FD ||
         fd == LPR_SUPERVISOR_ENDPOINT_FD;
 }
@@ -124,6 +136,7 @@ int lpr_fd_local_active(uint64_t fd)
             object->kind == LPR_FD_TABLE_KIND_PIPE ||
             object->kind == LPR_FD_TABLE_KIND_EVENT ||
             object->kind == LPR_FD_TABLE_KIND_TTY ||
+            object->kind == LPR_FD_TABLE_KIND_DRM ||
             object->kind == LPR_FD_TABLE_KIND_SOCKET ||
             object->kind == LPR_FD_TABLE_KIND_EPOLL);
 }
@@ -238,6 +251,10 @@ int lpr_control_install_fd(
             object->payload.tty.flags = (uint32_t)linux_flags;
             object->payload.tty.handle = backend_id;
             break;
+        case LPR_FD_TABLE_KIND_DRM:
+            object->payload.drm.flags = (uint32_t)linux_flags;
+            object->payload.drm.handle = backend_id;
+            break;
         case LPR_FD_TABLE_KIND_PIPE:
             object->payload.pipe.flags = (uint32_t)linux_flags;
             break;
@@ -337,6 +354,10 @@ void lpr_control_sync_legacy_flags(uint64_t fd)
     case LPR_FD_TABLE_KIND_TTY:
         object->payload.tty.flags =
             lpr_control_merge_legacy_flags(object->payload.tty.flags, 0, status_flags);
+        break;
+    case LPR_FD_TABLE_KIND_DRM:
+        object->payload.drm.flags =
+            lpr_control_merge_legacy_flags(object->payload.drm.flags, 0, status_flags);
         break;
     case LPR_FD_TABLE_KIND_EVENT:
         object->payload.eventfd.flags =
@@ -699,6 +720,25 @@ int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     return 1;
 }
 
+int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+{
+    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
+        return 0;
+    }
+    if (lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_DRM, desc->flags, desc->handle, 0) != 0) {
+        return 0;
+    }
+    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    if (drm == 0) {
+        lpr_control_close_fd(fd);
+        return 0;
+    }
+    drm->active = 1;
+    drm->flags = desc->flags;
+    drm->handle = desc->handle;
+    return 1;
+}
+
 int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     if (!lpr_fd_slot_available(fd)) {
@@ -764,6 +804,8 @@ int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
         return lpr_restore_bootstrap_filed_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_TTY:
         return lpr_restore_bootstrap_tty_fd(desc, fd);
+    case LPR_BOOTSTRAP_FD_DRM:
+        return lpr_restore_bootstrap_drm_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_PIPE:
         return lpr_restore_bootstrap_pipe_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_EVENT:
@@ -892,6 +934,16 @@ void lpr_state_dump(const char *reason)
                 fd,
                 object->payload.tty.handle,
                 (uint64_t)(uint32_t)lpr_linux_current_pgrp);
+            break;
+        case LPR_FD_TABLE_KIND_DRM:
+            pacha_trace4(
+                PACHA_TRACE_COMPONENT_LPR,
+                PACHA_TRACE_EVENT_LPR_PROCESS,
+                PACHA_TRACE_CLASS_ERROR,
+                pacha_trace_name_id("lpr.fd.drm"),
+                fd,
+                object->payload.drm.handle,
+                object->payload.drm.flags);
             break;
         case LPR_FD_TABLE_KIND_SOCKET:
             pacha_trace6(

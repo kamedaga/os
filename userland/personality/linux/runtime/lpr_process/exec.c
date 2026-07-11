@@ -187,6 +187,7 @@ int lpr_exec_local_fd_active(uint64_t fd)
 {
     return lpr_fd_is_filed(fd) ||
         lpr_linux_tty_fd_active(fd) ||
+        lpr_linux_drm_fd_active(fd) ||
         lpr_pipe_fd_is_active(fd) ||
         lpr_linux_eventfd_active(fd) ||
         lpr_linux_socket_fd_active(fd) ||
@@ -262,6 +263,10 @@ static void lpr_write_exec_local_fd_desc_unlocked(
         desc->kind = FILED_EXEC_LPR_FD_TTY;
         desc->flags = (file->payload.tty.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.tty.handle;
+    } else if (file->kind == LPR_FD_TABLE_KIND_DRM) {
+        desc->kind = FILED_EXEC_LPR_FD_DRM;
+        desc->flags = (file->payload.drm.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
+        desc->handle = file->payload.drm.handle;
     } else if (file->kind == LPR_FD_TABLE_KIND_PIPE) {
         desc->kind = FILED_EXEC_LPR_FD_PIPE;
         desc->flags = (file->payload.pipe.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;

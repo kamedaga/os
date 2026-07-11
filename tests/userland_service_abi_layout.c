@@ -3,14 +3,17 @@
 
 #include "filed/ipc_protocol.h"
 #include "filed/payload.h"
+#include "drmd/ipc_protocol.h"
 #include "koboxd/control_protocol.h"
 #include "koboxd/storage_protocol.h"
 #include "ipc_service.h"
 #include "lpr_supervisor/ipc_protocol.h"
+#include "lpr_supervisor/boot_config.h"
 #include "netd/ipc_protocol.h"
 #include "pacha/service_abi.h"
 #include "personality/coordinator_protocol.h"
 #include "personality/lpr_client_abi.h"
+#include "personality/lpr_image_abi.h"
 #include "termd/ipc_protocol.h"
 
 static int expect(int condition, const char *message)
@@ -67,7 +70,12 @@ int main(void)
     failures += expect(sizeof(netd_poll_t) == 64, "netd poll request size");
     failures += expect(sizeof(netd_io_t) <= NETD_PAGE_BYTES, "netd io fits page");
     failures += expect(sizeof(termd_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "termd io fits page");
+    failures += expect(sizeof(drmd_ioctl_request_t) <= PACHA_SERVICE_PAGE_BYTES, "drmd ioctl fits page");
     failures += expect(sizeof(lpr_client_path_request_t) == 496, "lpr client path size");
+    failures += expect(
+        LPR_DRMD_DRM_ENDPOINT_FD == 243 && LPR_BOOTSTRAP_FD == 244 &&
+        LPR_SUPERVISOR_ENDPOINT_FD == 245 && LPRS_BOOT_CONFIG_FD == 246,
+        "lpr fixed service and bootstrap fds are distinct and contiguous");
 
     pacha_service_envelope_t header;
     memset(&header, 0, sizeof(header));
@@ -86,8 +94,8 @@ int main(void)
     failures += expect(
         FILED_OP_HELLO == 0 && FILED_OP_SESSION_OPEN == 1 &&
         FILED_OP_VFS_ROOT_STAT == 4 && FILED_OP_EXEC_PATH == 37 &&
-        FILED_OP_SERVICE_SET_NETD_SOCKET == 39 && FILED_OP_DIAG_PING == 42 &&
-        FILED_OP_DIAG_SET_CACHE_SLOTS == 46,
+        FILED_OP_SERVICE_SET_NETD_SOCKET == 39 && FILED_OP_SERVICE_SET_DRMD_DRM == 41 &&
+        FILED_OP_DIAG_PING == 43 && FILED_OP_DIAG_SET_CACHE_SLOTS == 47,
         "filed ops are contiguous from zero");
     failures += expect(
         STORAGE_OP_HELLO == 0 && STORAGE_OP_MOUNT_ROOT == 1 &&
@@ -105,6 +113,10 @@ int main(void)
         TERMD_OP_SIGNAL_TAKE == 11 && TERMD_OP_DIAG_ERROR_GET == 14,
         "termd ops are contiguous from zero");
     failures += expect(
+        DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_CARD == 1 &&
+        DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5,
+        "drmd ops are contiguous from zero");
+    failures += expect(
         LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
         LPRS_OP_SIGNAL_KILL == 14 && LPRS_OP_CWD_GET == 16 &&
         LPRS_OP_DIAG_ERROR_GET == 19,
@@ -114,11 +126,13 @@ int main(void)
         "coordinator ops are contiguous from zero");
     failures += expect(sizeof(lprs_process_state_t) == 608, "lprs process state size");
     failures += expect(
-        FILED_EXEC_LPR_FD_PIPE == 3 &&
-        FILED_EXEC_LPR_FD_EVENT == 4 &&
-        LPR_CLIENT_FD_KIND_PIPE == 3 &&
-        LPR_CLIENT_FD_KIND_EVENT == 4,
-        "lpr fd kind order keeps pipe before event");
+        FILED_EXEC_LPR_FD_DRM == 3 &&
+        FILED_EXEC_LPR_FD_PIPE == 4 &&
+        FILED_EXEC_LPR_FD_EVENT == 5 &&
+        LPR_CLIENT_FD_KIND_DRMD_HANDLE == 3 &&
+        LPR_CLIENT_FD_KIND_PIPE == 4 &&
+        LPR_CLIENT_FD_KIND_EVENT == 5,
+        "lpr fd kind order keeps drm before pipe and event");
 
     return failures == 0 ? 0 : 1;
 }

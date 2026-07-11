@@ -851,6 +851,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "file="+imagePath+",format=raw,if=ide",
 		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root",
+		"-device", "virtio-gpu-pci,disable-legacy=on",
 		"-boot", "order=c",
 		"-no-reboot",
 	)
@@ -923,6 +924,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
 		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
+		"-device", "virtio-gpu-pci,disable-legacy=on",
 		"-boot", "order=c",
 		"-no-reboot",
 	}

@@ -7,6 +7,7 @@
 
 #include "filed/ipc_protocol.h"
 #include "termd/boot_config.h"
+#include "drmd/boot_config.h"
 #include "pacha/ipc.h"
 #include "pachaos_capsule_launcher.h"
 
@@ -85,7 +86,8 @@ static int seed0_filed_call(
     header->op = op;
     const int has_service_payload =
         op == FILED_OP_SERVICE_SET_NETD_SOCKET ||
-        op == FILED_OP_SERVICE_SET_TERMD_TTY;
+        op == FILED_OP_SERVICE_SET_TERMD_TTY ||
+        op == FILED_OP_SERVICE_SET_DRMD_DRM;
     header->flags = has_service_payload ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
     header->trace_id = request_id;
@@ -182,6 +184,15 @@ static int seed0_register_termd_tty_endpoint(int filed_endpoint_fd, int termd_tt
         termd_tty_endpoint_fd);
 }
 
+static int seed0_register_drmd_drm_endpoint(int filed_endpoint_fd, int drmd_drm_endpoint_fd)
+{
+    return seed0_filed_call(
+        filed_endpoint_fd,
+        FILED_OP_SERVICE_SET_DRMD_DRM,
+        0x534545443044524dull,
+        drmd_drm_endpoint_fd);
+}
+
 static int seed0_wait_filed_ready(int filed_endpoint_fd)
 {
     return seed0_filed_call(
@@ -204,6 +215,26 @@ static int seed0_wait_termd_ready(int termd_ready_channel_fd)
         return recv_status;
     }
     if (reply.word0 != TERMD_BOOT_READY_MAGIC ||
+        (int64_t)reply.word1 != 0 ||
+        reply.word2 == 0)
+    {
+        return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
+    }
+    return 0;
+}
+
+static int seed0_wait_drmd_ready(int drmd_ready_channel_fd)
+{
+    if (drmd_ready_channel_fd < 16) {
+        return -22;
+    }
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(drmd_ready_channel_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    if (recv_status != 0) {
+        return recv_status;
+    }
+    if (reply.word0 != DRMD_BOOT_READY_MAGIC ||
         (int64_t)reply.word1 != 0 ||
         reply.word2 == 0)
     {
@@ -379,19 +410,52 @@ int main(int argc, char **argv)
         (void)pacha_fd_close(termd_tty_endpoint_fd);
     }
 
+    printf("[seed0boot] drmd starting\n");
+    int drmd_drm_endpoint_fd = -1;
+    struct pacha_ipc_channel_pair drmd_ready_pair = { .a = -1, .b = -1 };
+    if (pacha_ipc_channel_create(&drmd_ready_pair, seed0_channel_rights, 0) != 0 ||
+        drmd_ready_pair.a < 16 ||
+        drmd_ready_pair.b < 16) {
+        fprintf(stderr, "[seed0boot] drmd ready channel create failed a=%d b=%d\n",
+            drmd_ready_pair.a,
+            drmd_ready_pair.b);
+        return 22;
+    }
+    capsule_status = seed0_launch_drmd(drmd_ready_pair.b, &drmd_drm_endpoint_fd);
+    (void)pacha_fd_close(drmd_ready_pair.b);
+    if (capsule_status != 0) {
+        (void)pacha_fd_close(drmd_ready_pair.a);
+        fprintf(stderr, "[seed0boot] drmd launch failed status=%d\n", capsule_status);
+        return 22;
+    }
+    const int drmd_register_status =
+        seed0_register_drmd_drm_endpoint(filed_endpoint_fd, drmd_drm_endpoint_fd);
+    if (drmd_register_status != 0) {
+        fprintf(stderr, "[seed0boot] drmd drm endpoint register failed status=%d\n", drmd_register_status);
+        return 23;
+    }
+    const int drmd_ready_status = seed0_wait_drmd_ready(drmd_ready_pair.a);
+    (void)pacha_fd_close(drmd_ready_pair.a);
+    if (drmd_ready_status != 0) {
+        fprintf(stderr, "[seed0boot] drmd ready wait failed status=%d\n", drmd_ready_status);
+        return 23;
+    }
+    printf("[seed0boot] drmd ready\n");
+    (void)pacha_fd_close(drmd_drm_endpoint_fd);
+
     printf("[seed0boot] netd starting\n");
     int netd_socket_endpoint_fd = -1;
     capsule_status = seed0_launch_netd(filed_endpoint_fd, &netd_socket_endpoint_fd);
     if (capsule_status != 0) {
         fprintf(stderr, "[seed0boot] netd launch failed status=%d\n", capsule_status);
-        return 22;
+        return 24;
     }
     printf("[seed0boot] netd started\n");
     if (netd_socket_endpoint_fd >= 16) {
         const int register_status = seed0_register_netd_socket_endpoint(filed_endpoint_fd, netd_socket_endpoint_fd);
         if (register_status != 0) {
             fprintf(stderr, "[seed0boot] netd socket endpoint register failed status=%d\n", register_status);
-            return 23;
+            return 25;
         }
         (void)pacha_fd_close(netd_socket_endpoint_fd);
     }
@@ -405,7 +469,7 @@ int main(int argc, char **argv)
     (void)pacha_fd_close(service_ready_pair.a);
     if (service_ready_status != 0) {
         fprintf(stderr, "[seed0boot] services ready send failed status=%d\n", service_ready_status);
-        return 24;
+        return 26;
     }
     printf("[seed0boot] services ready signal sent\n");
     (void)pacha_fd_close(filed_endpoint_fd);

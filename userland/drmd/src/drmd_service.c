@@ -1,0 +1,127 @@
+#include "drmd_service.h"
+
+#include <pacha/abi.h>
+#include <pacha/service_abi.h>
+
+#include <stdint.h>
+#include <string.h>
+
+static void close_received(
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds,
+    int reply_fd)
+{
+    for (uint64_t i = 0; i < request->fd_count; i++) {
+        const int fd = (int)(uint32_t)fds[i].fd;
+        if (fd >= 16 && fd != reply_fd) {
+            (void)pacha_fd_close(fd);
+        }
+    }
+}
+
+static int send_reply(
+    int reply_fd,
+    void *page,
+    const pacha_service_envelope_t *request_header,
+    int64_t status,
+    uint64_t result)
+{
+    pacha_service_reply_init(
+        (pacha_service_envelope_t *)page,
+        request_header,
+        status,
+        status < 0 ? PACHA_SERVICE_ERROR_DRMD_DRM : PACHA_SERVICE_ERROR_NONE,
+        status < 0 ? 0 : result,
+        0);
+    const struct pacha_ipc_msg reply = {
+        .word0 = PACHA_SERVICE_REPLY_MAGIC,
+        .word1 = (uint64_t)status,
+        .word2 = status < 0 ? 0 : result,
+        .word3 = request_header->request_id,
+    };
+    const int reply_status = pacha_ipc_reply(reply_fd, &reply);
+    (void)pacha_fd_close(reply_fd);
+    return reply_status;
+}
+
+int drmd_service_send_boot_ready(drmd_service_t *service, int64_t status, uint64_t result)
+{
+    if (service == NULL || service->cfg == NULL || service->cfg->ready_channel_fd < 16) {
+        return -22;
+    }
+    const struct pacha_ipc_msg ready = {
+        .word0 = DRMD_BOOT_READY_MAGIC,
+        .word1 = (uint64_t)status,
+        .word2 = status == 0 ? result : 0,
+        .word3 = 0,
+    };
+    return pacha_ipc_send((int)service->cfg->ready_channel_fd, &ready);
+}
+
+int drmd_service_dispatch(
+    drmd_service_t *service,
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds)
+{
+    if (service == NULL || request == NULL || fds == NULL || request->fd_count < 2) {
+        return -22;
+    }
+    const int reply_fd = (int)(uint32_t)fds[request->fd_count - 1u].fd;
+    const int page_fd = (int)(uint32_t)fds[0].fd;
+    if (reply_fd < 16 || page_fd < 16 || page_fd == reply_fd) {
+        close_received(request, fds, reply_fd);
+        return -22;
+    }
+    void *page = pacha_mmap(
+        page_fd,
+        DRMD_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (page == NULL) {
+        close_received(request, fds, reply_fd);
+        return -5;
+    }
+    pacha_service_envelope_t header;
+    memcpy(&header, page, sizeof(header));
+    int64_t status = -22;
+    uint64_t result = 0;
+    if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC &&
+        request->word3 == header.request_id &&
+        pacha_service_request_is_valid(&header, DRMD_SERVICE_ID)) {
+        void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
+        switch (header.op) {
+        case DRMD_OP_HELLO:
+            status = service->drm != NULL && service->drm->ready ? 0 : -19;
+            result = status == 0 ? 1 : 0;
+            break;
+        case DRMD_OP_OPEN_CARD:
+            status = header.payload_size >= sizeof(drmd_open_request_t) ?
+                drmd_drm_island_open(service->drm, payload, &result) : -22;
+            break;
+        case DRMD_OP_HANDLE_CLOSE:
+            status = header.payload_size >= sizeof(drmd_handle_request_t) ?
+                drmd_drm_island_close(service->drm, ((drmd_handle_request_t *)payload)->handle) : -22;
+            break;
+        case DRMD_OP_HANDLE_DUP:
+            status = header.payload_size >= sizeof(drmd_handle_request_t) ?
+                drmd_drm_island_dup(service->drm, ((drmd_handle_request_t *)payload)->handle, &result) : -22;
+            break;
+        case DRMD_OP_HANDLE_IOCTL:
+            status = header.payload_size >= sizeof(drmd_ioctl_request_t) ?
+                drmd_drm_island_ioctl(service->drm, payload) : -22;
+            break;
+        case DRMD_OP_HANDLE_MMAP:
+            status = header.payload_size >= sizeof(drmd_mmap_request_t) ?
+                drmd_drm_island_mmap(service->drm, payload) : -22;
+            break;
+        default:
+            status = -95;
+            break;
+        }
+    }
+    close_received(request, fds, reply_fd);
+    const int reply_status = send_reply(reply_fd, page, &header, status, result);
+    (void)pacha_munmap(page, DRMD_PAGE_BYTES);
+    return reply_status;
+}

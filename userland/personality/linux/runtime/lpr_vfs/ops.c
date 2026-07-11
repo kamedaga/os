@@ -503,6 +503,10 @@ int64_t lpr_filed_open_handle_at(
 int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
 {
     const char *path = (const char *)(uintptr_t)path_raw;
+    const int64_t drm_fd = lpr_drm_open_path(path, flags);
+    if (drm_fd != -LPR_LINUX_ENOENT) {
+        return drm_fd;
+    }
     const int64_t tty_fd = lpr_tty_open_path(path, flags);
     if (tty_fd != -LPR_LINUX_ENOENT) {
         return tty_fd;

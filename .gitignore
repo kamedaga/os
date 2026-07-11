@@ -3,6 +3,7 @@
 .temp-docs/
 tools/*
 !tools/build_wsl_alpine_clang.sh
+!tools/download_kobox_drm_modules.sh
 **/zig-out/
 kernel/.zig-cache/
 .zig-cache/

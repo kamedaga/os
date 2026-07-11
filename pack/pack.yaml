@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts"]
 skip:
   apps:
     - "alpine_go"
@@ -471,6 +471,24 @@ apps:
     out: "TTYVCON.KO"
     bootfs: "/srv/kobox/linux_virtio_console.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_console.ko"
+  kobox_linux_virtio_dma_buf:
+    file:
+      path: ".artifacts/kobox-drm/linux_virtio_dma_buf.ko"
+      rebuild: ["bash", "tools/download_kobox_drm_modules.sh"]
+      input:
+        - "tools/download_kobox_drm_modules.sh"
+    out: "LXVDBUF.KO"
+    bootfs: "/srv/kobox/linux_virtio_dma_buf.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_dma_buf.ko"
+  kobox_linux_virtio_gpu:
+    file:
+      path: ".artifacts/kobox-drm/linux_virtio_gpu.ko"
+      rebuild: ["bash", "tools/download_kobox_drm_modules.sh"]
+      input:
+        - "tools/download_kobox_drm_modules.sh"
+    out: "LXVIGPU.KO"
+    bootfs: "/srv/kobox/linux_virtio_gpu.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_gpu.ko"
   kobox_run:
     file:
       path: ".artifacts/userland-fixtures/kobox/kobox-run.elf"
@@ -762,6 +780,20 @@ apps:
     file: "tests/fixtures/lpr_async_signal_smoke.sh"
     out: "LPRASIG.SH"
     rootfs: "/cmd/lpr_async_signal_smoke.sh"
+  lpr_drm_card0_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_drm_card0_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_drm_card0_smoke", "userland/fixtures/src/wsl_musl/lpr_drm_card0_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_drm_card0_smoke.c"
+    out: "LPRDRM.ELF"
+    rootfs: "/cmd/lpr_drm_card0_smoke.elf"
+  lpr_drm_card0_smoke_script:
+    file: "tests/fixtures/drm_card0_smoke.sh"
+    out: "LPRDRM.SH"
+    rootfs: "/cmd/drm_card0_smoke.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"
@@ -968,6 +1000,28 @@ apps:
     out: "TERMD.ELF"
     bootfs: "/srv/termd.elf"
     rootfs: "/srv/termd.elf"
+  drmd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/drmd/drmd.elf"
+      rebuild: ["bash", "-lc", "cmake -S userland/drmd -B .artifacts/cmake/drmd && cmake --build .artifacts/cmake/drmd --parallel 1"]
+      input:
+        - "userland/drmd/CMakeLists.txt"
+        - "userland/drmd/src"
+        - "userland/drmd/include"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "_kobox/include"
+        - "_kobox/src"
+        - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
+    out: "DRMD.ELF"
+    bootfs: "/srv/drmd.elf"
+    rootfs: "/srv/drmd.elf"
   storage_boot:
     role: "service"
     file:
