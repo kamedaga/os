@@ -232,7 +232,6 @@ static void draw_cube(struct cube_state *state, float angle)
     glEnableVertexAttribArray(0);
     glEnableVertexAttribArray(1);
     glDrawArrays(GL_TRIANGLES, 0, 36);
-    glFinish();
 }
 
 static int framebuffer_for_bo(struct cube_state *state, struct gbm_bo *bo, uint32_t *fb_id)
@@ -393,5 +392,5 @@ int main(int argc, char **argv)
     fflush(stdout);
     sleep(1);
     close(state.fd);
-    return 0;
+    _Exit(EXIT_SUCCESS);
 }

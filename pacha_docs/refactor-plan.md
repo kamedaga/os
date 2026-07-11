@@ -367,6 +367,18 @@ ENOSYS は二つの inventory run 合計で 204=`sched_getaffinity` 0、439=`fac
 - 想定候補 (計測で確定するまで仮説扱い): DSO cold paging (clang で実績のある filed file-VMO cache の適用範囲)、llvmpipe shader JIT の初回コスト、LP_NUM_THREADS と実コア数の整合、drmd 経由の buffer 転送コピー回数、dumb buffer mmap の書き込み経路。
 - 受け入れ: 計測レポート (内訳と改善前後の数字) + warm の描画ループ (draw→swap→flip 1 フレーム) が interactive 水準に近づくこと + mesa inventory 相当スモークが常設バッテリーに入れられる実行時間 (目安: warm 全段数秒台) になること。cold も clang 同様の大幅短縮を狙う。既存回帰全 green 維持。
 
+**結果 (2026-07-12, working tree / commit なし)**: 一時計測で同一 cold/warm run を比較した。inventory e は cold 24.11→21.51秒 (-2.60秒, -10.8%)、warm 7.65→5.29秒 (-2.36秒, -30.8%) となり、warm 数秒台を達成した。LPR は各 process で file mapping 140回 / 453,419,008B、process-local cache hit 54 / miss 86。従来 hit 36回は cached VMO を shared source として map し、別の anonymous VMO へ 143,671,296B memcpy しており、cold 2.553秒 / warm 2.518秒を消費していた。cached VMO を Linux `MAP_PRIVATE` 相当の既存 COW mapping として直接 map し、実行 segment だけ既存 patch 後に最終 protection へ戻すことで、この copy を 0回 / 0B / 0秒にした。mapping 全体は cold 4.181→1.839秒、warm 3.360→0.752秒。filed の cached VMO は private writable/executable mapping に必要な native map rights を LPR へ transfer するが、cache 本体は COW で不変、Linux fd や ABI/wire layout の変更はない。kernel 変更もない。
+
+filed cold paging は Mesa/LLVM load 区間で file-VMO miss/store 59、backend pread 104回、約230.0MiB、backend read 約0.889秒で、warm は file-VMO hit のみで大 read 0。file-VMO RPC は cold 約1.56秒 / warm 約0.79秒、native mmap 176回は 12〜28ms、VMO create は0〜2ms、mprotect は1〜10msだったため、I/O や native syscall は支配項ではなかった。修正後の cold 残差は `eglCreateContext` 10.243秒、shader compile/link 2.283秒、first draw/finish 4.236秒、warm は各0.857 / 0.335 / 0.501秒であり、LLVM/llvmpipe 初回 context/JIT が支配する。cold 10秒未満には届かず21.51秒だが、残りを file cache や sleep 除去で短縮できる証拠はなく、JIT cache/precompile方式は M4/M5 で実 workload を測ってから設計する。
+
+20 frame の層別計測では、明示 `glFinish` ありは draw 32.25ms/frame (うち finish 20.90ms)、EGL swap 0、KMS submit IPC 1.70ms、event wait 22.50ms。冗長な `glFinish` を除くと draw 6.45ms、EGL swap 23.15ms、KMS submit IPC 1.35ms、event wait 22.05msとなり、draw+swap は32.25→29.60ms (-8.2%)、計測 build の fps は14.378→15.396 (+7.1%)。drmd IPC がコピーするのは ioctl/event の小さい control payload だけで、framebuffer pixels は transferred VMO/shared mapping、pixel payload copy は0回。したがって displaytarget→scanout copy は EGL swap 内の約23.15msが残る。最終 raw 1000 flip は58.948 fps、cube 8 frame は M3.3 の17.391→19.559 fps (+12.5%)、赤面→緑面 screendump と1000/1000 eventが green。cube は描画/device close後かつprocess exit前の Mesa/libc cleanup区間で停止したため、成功条件とdrmd clean closeを完了してから fixtureを `_Exit` させ、runner DONEまで成立させた。
+
+M3.2 の separate cold exec は、従来 DSO private mapping用 anonymous VMOを先に約143.7MiB実体化して物理 allocatorを断片化し、その後の3MiB DMA連続割当が9〜11回目で `PACHA_ERR_INVALID` になっていた。direct COW化後は別 process cold restart 20/20 (問題区間を含む) が成功し、INVALID 0、各回 `handles=0 fb=0 dumb=0 eventq=0 events=0 master=0` へ収束したため、kernel allocatorを変更せず解消した。
+
+clang cold は guest 2秒 / host 6秒で20秒未満。endurance は最終 affinity 有効の2 runが guest 78 / 75秒 (host 125 / 126秒) で、単発97秒は再現しなかった。過去64〜65秒との差を切り分けるため、M3.5の唯一のclang到達候補 `sched_getaffinity` だけを一時ENOSYSへ戻したA/Bも guest 78秒 / host 126秒で差なし。M3.4 PRIME/dma-buf分岐はclangのfd種別では非到達であり、M3.4/M3.5起因の回帰ではない。全3 runは各 iteration 7〜8秒、open/live `[4,1]` 前後一致、kobox used=256 / eviction=6で収束した。計時はguest wall clockにもhost vCPU schedulingを含むため残る64→75〜78秒差はホスト実行条件の残差として記録し、97秒を製品回帰とは判定しない。
+
+最終恒久実装差分は filed cached VMO map rights、LPR cached mappingのprivate COW化、cubeの重複`glFinish`除去と検証後`_Exit`だけ。一時計測、filed累積log、cold専用restart mode、affinity A/Bはすべて除去した。指定回帰は mesa-inventory、raw1000+cube8、drm-restart 20、kms-modeset、clang-cold、clang-endurance 2回が green。M4/M5へ残す性能リスクは cold llvmpipe context/JIT 約16.8秒、displaytarget→scanout copy 約23ms/frame、vblank待ち約22ms/frame、wlroots実 workloadでのmulti-surface/resize時copy増幅、4 worker時のgraceful Mesa cleanup停止である。
+
 ### Phase M4 — 入力と seat
 
 **M4.1 virtio-input / evdev → libinput**
@@ -386,4 +398,4 @@ M6.Xに向けてテスト時のinput注入方法もここで固定してほし�
 **M6.2 Swayの実用化** 動いているがまだ実用には足りない部分を調査し、修正を行う。M6.1S Swayの高速化と一緒に行うことも検討する。
 **M6.3 waylandアプリの追加** 軽量な既存Waylandアプリケーションを追加し、GUI体験を上げる gtkは少し重いかもしれないが今後を考えてgtk glibを使えるようにしたいためgtk-demoを対応行うのと、限界が気になるためfoot terminalを選びました。
 また、そちらからも理由を含め2つ軽量なGUIアプリケーションを選び、実装を行ってください
-- **選定 (2026-07-11, Claude)**: ① **bemenu** — Wayland ネイティブの dmenu 系ランチャー (C、GTK 不要、依存極小)。実用面で WM の使い勝手に直結 (foot からコマンドを打たずにアプリ起動できる) し、技術面で wlr-layer-shell プロトコル (バー/オーバーレイ用 wlroots 拡張) を通す最初のアプリになり将来のステータスバー等の土台検証を兼ねる。② **swayimg** — 画像ビューア (純 Wayland C 製、GTK 不要)。素の wayland-client + wl_shm + xdg-shell + キー/マウス入力という「普通の GUI アプリ」の基本経路を実コンテンツで検証できる (foot はターミナル特化、gtk-demo は GTK 抽象越しのため)。screendump した画像を guest 内で開けるようになり開発ループも楽になる。 
+- **選定 (2026-07-11, Claude)**: ① **bemenu** — Wayland ネイティブの dmenu 系ランチャー (C、GTK 不要、依存極小)。実用面で WM の使い勝手に直結 (foot からコマンドを打たずにアプリ起動できる) し、技術面で wlr-layer-shell プロトコル (バー/オーバーレイ用 wlroots 拡張) を通す最初のアプリになり将来のステータスバー等の土台検証を兼ねる。② **swayimg** — 画像ビューア (純 Wayland C 製、GTK 不要)。素の wayland-client + wl_shm + xdg-shell + キー/マウス入力という「普通の GUI アプリ」の基本経路を実コンテンツで検証できる (foot はターミナル特化、gtk-demo は GTK 抽象越しのため)。screendump した画像を guest 内で開けるようになり開発ループも楽になる。

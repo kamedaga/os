@@ -412,7 +412,8 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
+        PACHA_FD_RIGHT_MAP_WRITE |
+        PACHA_FD_RIGHT_MAP_EXEC;
     const int vmo_fd = pacha_vmo_create(length, rights, 0);
     if (vmo_fd < 16) {
         return filed_page_result(-12, 0);
@@ -536,7 +537,9 @@ int filed_dispatch_file_vmo(
         .fd = (uint64_t)(uint32_t)(entry != NULL ? entry->vmo_fd : -1),
         .rights =
             PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_MAP_READ,
+            PACHA_FD_RIGHT_MAP_READ |
+            PACHA_FD_RIGHT_MAP_WRITE |
+            PACHA_FD_RIGHT_MAP_EXEC,
         .flags = 0,
         .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
     };

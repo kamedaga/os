@@ -655,65 +655,33 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
         int64_t mapped = 0;
         int64_t vmo_fd = -1;
         uint64_t mapped_prot = load_prot;
-        const uint64_t readonly_shared_map_flags =
-            (pacha_flags & (PACHAOS_MMAP_FIXED | PACHAOS_MMAP_FIXED_NOREPLACE | PACHAOS_MMAP_NORESERVE)) |
-            PACHAOS_MMAP_SHARED;
         const uint64_t private_file_map_flags =
             pacha_flags & (PACHAOS_MMAP_FIXED |
                            PACHAOS_MMAP_FIXED_NOREPLACE |
                            PACHAOS_MMAP_NORESERVE |
                            PACHAOS_MMAP_PRIVATE |
                            PACHAOS_MMAP_SHARED);
-        const uint64_t direct_map_flags =
-            (prot & (LPR_LINUX_PROT_WRITE | LPR_LINUX_PROT_EXEC)) == 0
-                ? readonly_shared_map_flags
-                : private_file_map_flags;
+        const uint64_t direct_map_flags = private_file_map_flags;
         lpr_file_map_cache_entry_t *cache = lpr_file_map_cache_find(handle, offset, map_len);
         lpr_trace_file_map_cache(cache != 0 ? "hit" : "miss", handle, offset, map_len, cache != 0 ? cache->length : 0);
         if (cache != 0) {
-            if ((prot & (LPR_LINUX_PROT_WRITE | LPR_LINUX_PROT_EXEC)) == 0) {
-                mapped = lpr_pacha_syscall6(
-                    PACHAOS_SYSCALL_MMAP,
-                    cache->vmo_fd,
-                    addr,
-                    map_len,
-                    final_prot,
-                    readonly_shared_map_flags,
-                    offset);
-                if (mapped >= 4096) {
-                    done = len;
-                    mapped_prot = final_prot;
-                    goto file_mapping_ready;
-                }
-            }
-            const uint64_t target_map_flags =
-                (pacha_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED;
+            const uint64_t cached_map_prot =
+                (prot & LPR_LINUX_PROT_EXEC) != 0 ? load_prot : final_prot;
             mapped = lpr_pacha_syscall6(
                 PACHAOS_SYSCALL_MMAP,
-                0,
+                cache->vmo_fd,
                 addr,
                 map_len,
-                load_prot,
-                target_map_flags,
-                0);
-            if (mapped >= 4096) {
-                const int64_t source = lpr_pacha_syscall6(
-                    PACHAOS_SYSCALL_MMAP,
-                    cache->vmo_fd,
-                    0,
-                    map_len,
-                    PACHAOS_PROT_READ,
-                    PACHAOS_MMAP_SHARED,
-                    offset);
-                if (source >= 4096) {
-                    lpr_memcpy((void *)(uintptr_t)mapped, (const void *)(uintptr_t)source, (size_t)map_len);
-                    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)source, map_len);
-                    done = len;
-                    goto file_mapping_ready;
-                }
-                (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
-                mapped = 0;
+                cached_map_prot,
+                private_file_map_flags,
+                offset);
+            if (mapped < 4096) {
+                lpr_trace_mmap_error("cached_private_mmap", addr, len, prot, flags, fd, offset, mapped);
+                return lpr_linux_pacha_status_to_errno(mapped);
             }
+            done = len;
+            mapped_prot = cached_map_prot;
+            goto file_mapping_ready;
         }
         if (prot == LPR_LINUX_PROT_READ) {
             uint64_t loaded = 0;
