@@ -225,6 +225,8 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - 7 本の `*_v2.h` を suffix なしに改名し、request/response の共通ヘッダ (op, seq, status, payload len) を `libipc` に 1 定義。op 番号は境界ごとに 0 から振り直し (互換不要)。`pacha_docs/userland-service-abi-v2.md` を書き換え。
 - 受け入れ: 全スモーク通過。grep で `_v2` が残っていない。
 
+**結果 (2026-07-11, 435fcef で完了 — 本計画の全タスク完了)**: 受け入れ達成。共通 envelope は libipc `service_abi.h` の `pacha_service_envelope_t` (64B、request/reply を union 表現、wire layout 不変) に一本化し、各サービスの重複ヘッダ・magic・version 定数を削除。`_v2` ヘッダは実際には 8 本 (koboxd が control/storage の 2 本) で、全て suffix なしへ改名、identifier の `_v2`/`_V2` 全除去、op 番号は境界ごとに 0 から振り直し (filed 0-46 / storage 0-18 / termd 0-14 / lpr-supervisor 0-19 / netd 0-6 / coordinator 0-7 / kobox 各系統)。kobox 拡張 transport は 96/80B の別 layout のため構造維持で magic/version のみ共通化。suffix 除去で露呈した filed の flag enum 重複は flags.h に集約、seed0root の関数名衝突は page/service call に分離。仕様書は userland-service-abi.md へ改名・全面更新。`git grep '_v2\|_V2'` (userland/kernel/tests/pack/musl/pachaos) 0 件。全検証 green (QEMU 12 本 + kernel zig test + filed VFS/tmpfs/cache + termd unit + ABI layout)、clang cold guest 4 秒・endurance 10 回 guest 64 秒維持。
+
 ---
 
 ## 5. 実施順序まとめ
