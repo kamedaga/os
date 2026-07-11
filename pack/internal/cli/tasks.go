@@ -264,8 +264,9 @@ func taskStub(task string, use string) *cobra.Command {
 func qemuCommand(ctx *context) *cobra.Command {
 	var opts qemu.Options
 	cmd := &cobra.Command{
-		Use:   "qemu",
-		Short: "Boot QEMU through Limine",
+		Use:     "qemu",
+		Aliases: []string{"run"},
+		Short:   "Boot QEMU through Limine",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.Prepare {
 				if err := prepareLimineBootImage(ctx, &opts); err != nil {
@@ -527,6 +528,9 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 					[2]string{"python log", ctx.workspace.Rel(result.PythonLog)},
 				)
 			}
+			if len(result.Screendumps) != 0 {
+				rows = append(rows, [2]string{"screendumps", strings.Join(result.Screendumps, ", ")})
+			}
 			ui.KeyValues("QEMU Test", rows)
 			if err != nil {
 				return err
@@ -540,6 +544,9 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
+	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
+	cmd.Flags().StringArrayVar(&opts.ScreendumpCheck, "screendump-check", nil, "capture at MARKER and require MARKER@X,Y,W,H=#RRGGBB[:TOLERANCE]; repeatable")
+	cmd.Flags().StringVar(&opts.ScreendumpDevice, "screendump-device", "pachagpu", "QEMU display device id captured by screendump")
 	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	return cmd
 }

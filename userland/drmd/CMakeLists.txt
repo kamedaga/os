@@ -74,6 +74,7 @@ set(KOBOX_RUNTIME_SOURCES
   "${REPO_ROOT}/_kobox/src/linux_personality/linux_work.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_island.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_kms.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/drmd_service.c"
 )
 
@@ -93,9 +94,12 @@ add_custom_command(
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/drmd/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/drmd/ipc_protocol.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/drmd/kms_abi.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_island.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_island.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_kms.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_kms.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drmd_service.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drmd_service.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"

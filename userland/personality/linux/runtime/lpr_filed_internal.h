@@ -674,7 +674,7 @@ int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags);
 int64_t lpr_drm_open_path(const char *path, uint64_t flags);
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_drm_close_handle(uint64_t handle);
-int64_t lpr_drm_mmap(uint64_t fd, uint64_t length, uint64_t prot, uint64_t flags, uint64_t offset);
+int64_t lpr_drm_mmap(uint64_t fd, uint64_t address, uint64_t length, uint64_t pacha_prot, uint64_t pacha_flags, uint64_t offset);
 int32_t lpr_linux_alloc_child_pid(void);
 int64_t lpr_close_native_fd_if_open(uint64_t fd);
 int64_t lpr_control_get_fd_flags(uint64_t fd);

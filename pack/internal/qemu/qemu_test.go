@@ -145,3 +145,42 @@ func TestRunSendExpectTTY(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestParseScreendumpCheck(t *testing.T) {
+	artifacts := t.TempDir()
+	check, err := parseScreendumpCheck("FRAME_READY@8,9,10,11=#12abef:3", 1, artifacts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Marker != "FRAME_READY" || check.X != 8 || check.Y != 9 || check.Width != 10 || check.Height != 11 {
+		t.Fatalf("unexpected region: %#v", check)
+	}
+	if check.Red != 0x12 || check.Green != 0xab || check.Blue != 0xef || check.Tolerance != 3 {
+		t.Fatalf("unexpected color: %#v", check)
+	}
+	if check.Path != filepath.Join(artifacts, "screendump-02.ppm") {
+		t.Fatalf("path = %q", check.Path)
+	}
+}
+
+func TestValidatePPMRegion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "surface.ppm")
+	pixels := make([]byte, 4*3*3)
+	for i := 0; i < len(pixels); i += 3 {
+		pixels[i] = 0x20
+		pixels[i+1] = 0x40
+		pixels[i+2] = 0x60
+	}
+	data := append([]byte("P6\n4 3\n255\n"), pixels...)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	check := screendumpCheck{Marker: "FRAME", X: 1, Y: 1, Width: 2, Height: 1, Red: 0x20, Green: 0x40, Blue: 0x60, Path: path}
+	if err := validatePPMRegion(check); err != nil {
+		t.Fatal(err)
+	}
+	check.Red = 0xff
+	if err := validatePPMRegion(check); err == nil {
+		t.Fatal("wrong expected color passed")
+	}
+}

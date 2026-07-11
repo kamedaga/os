@@ -24,7 +24,8 @@ static int send_reply(
     void *page,
     const pacha_service_envelope_t *request_header,
     int64_t status,
-    uint64_t result)
+    uint64_t result,
+    int transfer_fd)
 {
     pacha_service_reply_init(
         (pacha_service_envelope_t *)page,
@@ -33,11 +34,20 @@ static int send_reply(
         status < 0 ? PACHA_SERVICE_ERROR_DRMD_DRM : PACHA_SERVICE_ERROR_NONE,
         status < 0 ? 0 : result,
         0);
+    struct pacha_ipc_fd fd;
+    memset(&fd, 0, sizeof(fd));
+    if (status == 0 && transfer_fd >= 16) {
+        fd.fd = (uint64_t)(uint32_t)transfer_fd;
+        fd.rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+    }
     const struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
         .word2 = status < 0 ? 0 : result,
         .word3 = request_header->request_id,
+        .fds = status == 0 && transfer_fd >= 16 ? &fd : NULL,
+        .fd_count = status == 0 && transfer_fd >= 16 ? 1u : 0u,
     };
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
     (void)pacha_fd_close(reply_fd);
@@ -86,6 +96,7 @@ int drmd_service_dispatch(
     memcpy(&header, page, sizeof(header));
     int64_t status = -22;
     uint64_t result = 0;
+    int transfer_fd = -1;
     if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC &&
         request->word3 == header.request_id &&
         pacha_service_request_is_valid(&header, DRMD_SERVICE_ID)) {
@@ -113,7 +124,7 @@ int drmd_service_dispatch(
             break;
         case DRMD_OP_HANDLE_MMAP:
             status = header.payload_size >= sizeof(drmd_mmap_request_t) ?
-                drmd_drm_island_mmap(service->drm, payload) : -22;
+                drmd_drm_island_mmap(service->drm, payload, &transfer_fd) : -22;
             break;
         default:
             status = -95;
@@ -121,7 +132,7 @@ int drmd_service_dispatch(
         }
     }
     close_received(request, fds, reply_fd);
-    const int reply_status = send_reply(reply_fd, page, &header, status, result);
+    const int reply_status = send_reply(reply_fd, page, &header, status, result, transfer_fd);
     (void)pacha_munmap(page, DRMD_PAGE_BYTES);
     return reply_status;
 }

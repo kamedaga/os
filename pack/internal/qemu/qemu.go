@@ -19,22 +19,24 @@ import (
 )
 
 type Options struct {
-	Memory      string
-	Display     string
-	Console     string
-	Firmware    string
-	DiskImage   string
-	DiskFormat  string
-	NoKVM       bool
-	NoNet       bool
-	Fast        bool
-	DryRun      bool
-	ExtraArgs   []string
-	NewTerminal bool
-	Prepare     bool
-	NoBuild     bool
-	LimineImage string
-	Progress    progress.Reporter
+	Memory          string
+	Display         string
+	Console         string
+	Firmware        string
+	DiskImage       string
+	DiskFormat      string
+	NoKVM           bool
+	NoNet           bool
+	Fast            bool
+	DryRun          bool
+	ExtraArgs       []string
+	NewTerminal     bool
+	Prepare         bool
+	NoBuild         bool
+	LimineImage     string
+	QMP             string
+	CaptureHeadless bool
+	Progress        progress.Reporter
 }
 
 type Result struct {
@@ -52,6 +54,7 @@ type commandPlan struct {
 	LogPath       string
 	HostTimeLog   string
 	ConsoleSocket string
+	QMPSocket     string
 }
 
 type SmokeOptions struct {
@@ -76,14 +79,17 @@ type SmokeResult struct {
 }
 
 type TTYTestOptions struct {
-	Timeout    time.Duration
-	NoKVM      bool
-	ExtraArgs  []string
-	BootMarker string
-	Send       []string
-	Expect     []string
-	Python     string
-	Progress   progress.Reporter
+	Timeout          time.Duration
+	NoKVM            bool
+	Display          string
+	ExtraArgs        []string
+	BootMarker       string
+	Send             []string
+	Expect           []string
+	ScreendumpCheck  []string
+	ScreendumpDevice string
+	Python           string
+	Progress         progress.Reporter
 }
 
 type TTYTestResult struct {
@@ -99,6 +105,7 @@ type TTYTestResult struct {
 	Expected      []string
 	Matched       []string
 	Python        string
+	Screendumps   []string
 }
 
 type hostTimeLog struct {
@@ -404,20 +411,36 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 
 	span.Set(1, "building qemu command")
+	artifacts := workspace.Path(workspace.Artifacts)
+	checks := make([]screendumpCheck, 0, len(opts.ScreendumpCheck))
+	for i, value := range opts.ScreendumpCheck {
+		check, parseErr := parseScreendumpCheck(value, i, artifacts)
+		if parseErr != nil {
+			span.Fail("invalid screendump check")
+			return TTYTestResult{}, parseErr
+		}
+		checks = append(checks, check)
+	}
+	qmpPath := ""
+	if len(checks) != 0 {
+		qmpPath = filepath.Join(artifacts, "qemu-tty-test-qmp.sock")
+		_ = os.Remove(qmpPath)
+	}
 	plan, err := commandArgs(workspace, Options{
-		Display:     "none",
-		Console:     "pty",
-		NewTerminal: true,
-		NoKVM:       opts.NoKVM,
-		Fast:        true,
-		ExtraArgs:   opts.ExtraArgs,
+		Display:         opts.Display,
+		Console:         "pty",
+		NewTerminal:     true,
+		NoKVM:           opts.NoKVM,
+		Fast:            true,
+		ExtraArgs:       opts.ExtraArgs,
+		QMP:             qmpPath,
+		CaptureHeadless: len(checks) != 0,
 	})
 	if err != nil {
 		span.Fail("qemu command failed")
 		return TTYTestResult{}, err
 	}
 
-	artifacts := workspace.Path(workspace.Artifacts)
 	serialPath := filepath.Join(artifacts, "serial-tty-test.log")
 	consolePath := filepath.Join(artifacts, "console-tty-test.log")
 	pythonLogPath := filepath.Join(artifacts, "qemu-tty-python.log")
@@ -467,6 +490,9 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		Expected:      append([]string(nil), opts.Expect...),
 		Python:        opts.Python,
 	}
+	for _, check := range checks {
+		result.Screendumps = append(result.Screendumps, check.Path)
+	}
 
 	booted := make(chan struct{})
 	var bootedOnce sync.Once
@@ -498,6 +524,9 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	defer os.Remove(plan.ConsoleSocket)
+	if plan.QMPSocket != "" {
+		defer os.Remove(plan.QMPSocket)
+	}
 
 	span.Set(3, "waiting for virtio-console socket")
 	if exited, err := waitForSocketOrExit(plan.ConsoleSocket, done, 5*time.Second); err != nil {
@@ -514,6 +543,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 
 	var ttyClient *ttyConsoleClient
+	var qmp *qmpClient
 	if opts.Python == "" {
 		ttyClient, err = startTTYConsoleClient(plan.ConsoleSocket, consoleFile)
 		if err != nil {
@@ -523,6 +553,25 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			return result, err
 		}
 		defer ttyClient.Close()
+		if len(checks) != 0 {
+			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, done, 5*time.Second); waitErr != nil || exited {
+				terminateQEMU(cmd, done)
+				scanners.Wait()
+				span.Fail("QMP socket failed")
+				if waitErr != nil {
+					return result, waitErr
+				}
+				return result, fmt.Errorf("qemu exited before QMP socket was ready")
+			}
+			qmp, err = connectQMP(plan.QMPSocket, 5*time.Second)
+			if err != nil {
+				terminateQEMU(cmd, done)
+				scanners.Wait()
+				span.Fail("QMP connect failed")
+				return result, err
+			}
+			defer qmp.Close()
+		}
 	}
 
 	span.Set(4, "waiting for boot marker")
@@ -550,7 +599,21 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		testErr = runPythonTTYTest(workspace, plan.ConsoleSocket, result, opts)
 	} else {
 		span.Set(5, "sending tty input")
+		var checkpointDone chan error
+		if len(checks) != 0 {
+			checkpointDone = make(chan error, 1)
+			device := opts.ScreendumpDevice
+			if device == "" {
+				device = "pachagpu"
+			}
+			go func() { checkpointDone <- ttyClient.RunScreendumpChecks(qmp, device, checks, opts.Timeout) }()
+		}
 		result.Sent, result.Matched, testErr = ttyClient.SendAndExpect(opts.Send, opts.Expect, opts.Timeout)
+		if checkpointDone != nil {
+			if checkpointErr := <-checkpointDone; testErr == nil {
+				testErr = checkpointErr
+			}
+		}
 	}
 
 	span.Set(6, "stopping qemu")
@@ -562,6 +625,32 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 	span.Done("qemu tty test passed")
 	return result, nil
+}
+
+func (client *ttyConsoleClient) RunScreendumpChecks(qmp *qmpClient, device string, checks []screendumpCheck, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for _, check := range checks {
+		for {
+			client.outputMu.Lock()
+			seen := strings.Contains(client.output.String(), check.Marker)
+			client.outputMu.Unlock()
+			if seen {
+				if err := qmp.screendump(device, check); err != nil {
+					return fmt.Errorf("screendump check %s failed: %w", check.Marker, err)
+				}
+				break
+			}
+			select {
+			case <-ticker.C:
+			case <-deadline.C:
+				return fmt.Errorf("screendump marker %q not found within %s", check.Marker, timeout)
+			}
+		}
+	}
+	return nil
 }
 
 type ttyConsoleClient struct {
@@ -851,12 +940,16 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "file="+imagePath+",format=raw,if=ide",
 		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root",
-		"-device", "virtio-gpu-pci,disable-legacy=on",
+		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
 		"-boot", "order=c",
 		"-no-reboot",
 	)
 	if opts.Display == "none" {
-		args = append(args, "-nographic")
+		if opts.CaptureHeadless {
+			args = append(args, "-display", "none", "-serial", "stdio")
+		} else {
+			args = append(args, "-nographic")
+		}
 	} else {
 		args = append(args, "-display", opts.Display, "-serial", "stdio")
 	}
@@ -864,6 +957,9 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		args = append(args, "-enable-kvm")
 	}
 	args = appendNetworkArgs(args, opts.NoNet)
+	if opts.QMP != "" {
+		args = append(args, "-qmp", "unix:"+opts.QMP+",server=on,wait=off")
+	}
 	var consoleSocket string
 	args, consoleSocket, err = appendConsoleArgs(workspace, args, opts)
 	if err != nil {
@@ -875,6 +971,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		LogPath:       logPath,
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
+		QMPSocket:     opts.QMP,
 	}, nil
 }
 
@@ -924,12 +1021,16 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
 		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
-		"-device", "virtio-gpu-pci,disable-legacy=on",
+		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
 		"-boot", "order=c",
 		"-no-reboot",
 	}
 	if opts.Display == "none" {
-		args = append(args, "-nographic")
+		if opts.CaptureHeadless {
+			args = append(args, "-display", "none", "-serial", "stdio")
+		} else {
+			args = append(args, "-nographic")
+		}
 	} else {
 		args = append(args, "-display", opts.Display, "-serial", "stdio")
 	}
@@ -937,6 +1038,9 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		args = append(args, "-enable-kvm")
 	}
 	args = appendNetworkArgs(args, opts.NoNet)
+	if opts.QMP != "" {
+		args = append(args, "-qmp", "unix:"+opts.QMP+",server=on,wait=off")
+	}
 	var consoleSocket string
 	args, consoleSocket, err = appendConsoleArgs(workspace, args, opts)
 	if err != nil {
@@ -948,6 +1052,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		LogPath:       logPath,
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
+		QMPSocket:     opts.QMP,
 	}, nil
 }
 

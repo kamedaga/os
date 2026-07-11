@@ -1,4 +1,5 @@
 #include "drm_island.h"
+#include "drm_kms.h"
 
 #include <kobox/device_pachaos_capsule.h>
 #include <kobox/module.h>
@@ -228,7 +229,10 @@ int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_
             break;
         }
     }
-    return island->ready ? 0 : -19;
+    if (!island->ready) {
+        return -19;
+    }
+    return drmd_kms_init(island);
 }
 
 int drmd_drm_island_open(
@@ -268,6 +272,7 @@ int drmd_drm_island_open(
         memset(handle, 0, sizeof(*handle));
         return status;
     }
+    drmd_kms_handle_open(handle->id);
     *out_handle = handle->id;
     return 0;
 }
@@ -283,6 +288,7 @@ int drmd_drm_island_close(struct drmd_drm_island *island, uint64_t id)
         handle->refs--;
         return 0;
     }
+    drmd_kms_handle_close(island, id);
     int status = 0;
     if (handle->fops_view.release != NULL) {
         drmd_owner_context_t context;
@@ -318,6 +324,12 @@ int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *
     drmd_handle_t *handle = find_handle(request->handle);
     if (handle == NULL || handle->fops_view.unlocked_ioctl == NULL) {
         return -9;
+    }
+
+    int kms_handled = 0;
+    const int kms_status = drmd_kms_ioctl(island, request, &kms_handled);
+    if (kms_handled) {
+        return kms_status;
     }
 
     void *argument = request->data;
@@ -371,11 +383,13 @@ int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *
     return 0;
 }
 
-int drmd_drm_island_mmap(struct drmd_drm_island *island, const drmd_mmap_request_t *request)
+int drmd_drm_island_mmap(
+    struct drmd_drm_island *island,
+    const drmd_mmap_request_t *request,
+    int *out_vmo_fd)
 {
-    (void)island;
     if (request == NULL || find_handle(request->handle) == NULL) {
         return -9;
     }
-    return -95;
+    return drmd_kms_mmap(island, request, out_vmo_fd);
 }

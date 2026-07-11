@@ -794,6 +794,20 @@ apps:
     file: "tests/fixtures/drm_card0_smoke.sh"
     out: "LPRDRM.SH"
     rootfs: "/cmd/drm_card0_smoke.sh"
+  lpr_kms_modeset_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_kms_modeset_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_kms_modeset_smoke", "userland/fixtures/src/wsl_musl/lpr_kms_modeset_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_kms_modeset_smoke.c"
+    out: "LPRKMSMD.ELF"
+    rootfs: "/cmd/lpr_kms_modeset_smoke.elf"
+  lpr_kms_modeset_smoke_script:
+    file: "tests/fixtures/kms_modeset_smoke.sh"
+    out: "LPRKMSMD.SH"
+    rootfs: "/cmd/kms_modeset_smoke.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"
