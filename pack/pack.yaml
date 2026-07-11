@@ -97,6 +97,14 @@ apps:
       rebuild: ["bash", "tools/build_wsl_alpine_clang.sh"]
     out: "ROOT"
     rootfs: "/"
+  alpine_mesa:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-mesa-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_mesa.sh"]
+      input:
+        - "tools/build_wsl_alpine_mesa.sh"
+    out: "MESAROOT"
+    rootfs: "/"
   alpine_go:
     file:
       path: ".artifacts/userland-fixtures/alpine-go-root"
@@ -808,6 +816,20 @@ apps:
     file: "tests/fixtures/kms_modeset_smoke.sh"
     out: "LPRKMSMD.SH"
     rootfs: "/cmd/kms_modeset_smoke.sh"
+  lpr_mesa_inventory:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_mesa_inventory.elf"
+      rebuild: ["bash", "tools/build_wsl_mesa_inventory.sh"]
+      input:
+        - "tools/build_wsl_mesa_inventory.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_mesa_inventory.c"
+    out: "LPRMESAI.ELF"
+    rootfs: "/cmd/lpr_mesa_inventory.elf"
+  lpr_mesa_inventory_script:
+    file: "tests/fixtures/mesa_inventory.sh"
+    out: "LPRMESAI.SH"
+    rootfs: "/cmd/mesa_inventory.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"

@@ -280,7 +280,68 @@ Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
 - 予想される領域: llvmpipe worker thread プール、大規模 mmap、shm/memfd、dma-buf、udev 情報の取得経路。
 - 受け入れ: 棚卸しレポート (問題・証拠・タスク分解案) → M3.2 以降として本計画へ追記。
 
-**M3.2+ ギャップ実装 → kmscube 相当が window で回る** (棚卸しから分解)
+**結果 (2026-07-11, working tree / commit なし)**: 製品機能を修正せず受け入れ達成。Alpine v3.22 の Mesa 25.1.9 (`mesa-gl`, `mesa-egl`, `mesa-gbm`, `mesa-gles`, `mesa-dri-gallium` と runtime 依存閉包) を clang と同じ LLVM 20.1.8 資産を共有する増分 root overlay として導入した。増分は runtime data (`drirc.d`, PCI IDs 等) を含む 344 files / 155,739,272 bytes (`du` 150 MiB)、guest fixture binary + script を含む rootfs publish 増分は 155,769,172 bytes、最終 rootfs は 837,685,813 bytes。BOOTFS は 15,927,512 bytes で 16 MiB 制約内 (849,704 bytes 余裕)、Mesa は rootfs のみで boot scratch を消費しない。
+
+resolver が展開した runtime package は `mesa`, `mesa-gl`, `mesa-egl`, `mesa-gbm`, `mesa-gles`, `mesa-dri-gallium`, `libdrm`, `llvm20-libs`, `spirv-tools`, `libpciaccess`, `libxau`, `libxdmcp`, `libxshmfence`, `libgcc`, `libstdc++`, `libxml2`, `libffi`, `libexpat`, `libbsd`, `libxxf86vm`, `libxext`, `libxcb`, `zlib`, `xz-libs`, `libmd`, `libx11`, `zstd-libs`, `wayland-libs-server`, `wayland-libs-client`, `libelf`, `hwdata-pci`。clang overlay と同一 byte の LLVM/libc 周辺 file は重複 publish せず共有し、`musl` package は既存 LPR runtime と衝突するため closure から除外した。build-only は `mesa-dev`, `libdrm-dev`, `linux-headers` で rootfs には publish しない。
+
+fixture `lpr_mesa_inventory` は target `a`〜`e` を持ち、最終 target `e` は一つのプロセスで全段を通る。実測は以下。
+
+| 段 | 到達点と証拠 | 判定 |
+|---|---|---|
+| a | `/dev/dri/card0`、`DRM_VERSION name=virtio_gpu 0.1.0`、`gbm_backend=drm`、status 0 | GBM device 作成成功。`MESA-LOADER: failed to retrieve device information` は毎回 5 回出るが非致命。 |
+| b | `eglGetPlatformDisplay` は非 NULL / `EGL_SUCCESS(0x3000)`、`eglInitialize=1.5`、vendor=`Mesa Project`、40 configs 中 XRGB8888 (`0x34325258`) を選択、ES2 context 作成成功 | EGL/GBM platform と context 作成まで成功。 |
+| c | 1024x768 XRGB8888、`GBM_BO_USE_SCANOUT|RENDERING` の GBM surface と EGL window surface 作成成功 | surface 宣言時点では PRIME 不要。 |
+| d | renderer=`llvmpipe (LLVM 20.1.8, 128 bits)`、OpenGL ES 3.2 Mesa 25.1.9、triangle 中央 `RGBA=128,63,64,255`、GL error 0、`eglSwapBuffers=1` | softpipe/swrast への降格なし。初回 cold paging は20秒を超えたが90秒窓で成功し、warm fresh boot は約11秒で e まで完走。 |
+| e | GBM BO handle=1/2、stride=4096、1024x768。`gbm_bo_get_fd=-1 errno=25 (ENOTTY)` のまま ADDFB2→SETCRTC→同期 PAGE_FLIP(flags=0) 成功。frame 2 marker=`#00ffff`、QMP `(8,8,8,8)` pixel check green | dumb handle 経路だけで表示可能。PRIME/dma-buf と page-flip event/vblank queue はこの最小 loop には不要。 |
+
+追加対照として `LP_NUM_THREADS=2` でも renderer=llvmpipe、triangle、swap が成功した。したがって現 LPR pthread は llvmpipe の複数 worker を実動可能。default 実行も成功しており、worker pool 起因の停止は再現しなかった。大規模な libgallium/LLVM file-backed paging/JIT を含む default 描画で fault、ENOMEM、mmap failure はなく、現時点で mmap/物理メモリ量の機能 blocker は観測されない。ただし cold 初回は20秒超のため性能課題として残す。
+
+実行中の LPR trace では x86_64 syscall 439=`faccessat2`、204=`sched_getaffinity`、99=`sysinfo`、285=`fallocate`、157=`prctl`、324=`mlock2` が ENOSYS になった。いずれも Mesa/musl の fallback 後に上記描画が成功したため M3 の機能 blocker ではない。runner の shell/tee 由来で 40=`sendfile` も ENOSYS だが Mesa 本体の壁とは分類しない。製品側の一時計測コードは追加していない。
+
+明示判定:
+
+- renderer: **llvmpipe が実選択**。`glGetString(GL_RENDERER)` の実値で確認し、softpipe/swrast 降格なし。
+- GBM/PRIME: **kmscube 相当は dumb handle だけで足りる**。PRIME export は ENOTTY でも表示成功。ただし wlroots の dmabuf/modifier path には後続実装が必要になり得る。
+- flip event/vblank: **単発・同期 loop には不要**。flags=0 の同期 PAGE_FLIP で表示成功。compositor の非同期 frame loop には未実装のまま。
+- pthread: **問題なし (今回の負荷範囲)**。default と `LP_NUM_THREADS=2` の両方で llvmpipe draw/swap 成功。
+- mmap/memory: **機能失敗なし、cold paging 遅延あり**。fault/ENOMEM/mmap error なし。初回だけ20秒 timeout では不足し、90秒で成功、cache warm 後は e まで約11秒。
+
+問題棚卸し:
+
+| 症状 | 証拠 | 推定領域 | 想定作業量 |
+|---|---|---|---|
+| Mesa loader の device information 取得失敗 | stage a〜e で同警告が各5回。ただし GBM/EGL/llvmpipe は成功 | LPR/filed の sysfs・device metadata または Mesa loader 設定 | S〜M: 要求 path/ioctl を trace し、実データ境界を決める |
+| tolerated ENOSYS 群 | 439/204/99/285/157/324 の LPR ENOSYS trace、直後も描画成功 | LPR syscall、`fallocate` は filed も関与 | M: fallback 依存を一つずつ仕様化・実装・unit 化 |
+| PRIME export 未実装 | `gbm_bo_get_fd=-1 errno=25`、一方 handle 1/2 の ADDFB2 は成功 | drmd DRM ioctl + LPR marshalling。kernel は既存 fd/VMO 転送で不足が証明されるまで対象外 | L: dma-buf lifetime/rights、PRIME handle↔fd、modifier/GBM test |
+| page-flip event/vblank 未実装 | flags=0 は成功、event queue は fixture が明示的に未使用 | drmd + LPR poll/read event queue + _kobox display IRQ | L: IRQ/vblank state、event ownership、poll/read、耐久 test |
+| rapid multi-process probe の master handoff race | a〜d を別 process で直列実行した初回だけ、次の e で `drmSetMaster=-1 errno=16`。fresh single e は status 0 | drmd handle close/master ownership と LPR process teardown ordering | M: close completionを証明し restart smoke を追加 |
+| cold Mesa paging が20秒超 | 初回 d は20秒 KILL、同一 artifact の90秒実行は成功、warm fresh e は約11秒 | filed VMO/page cache、LPR file-backed mmap、LLVM/Mesa cold footprint | M: profile-only で内訳採取。機能変更は測定後 |
+
+導入例外として行ったのは (1) fixture build-only sysroot への `linux-headers` 追加 (`drm.h` が `linux/types.h` を要求)、(2) rootfs symlink sentinel をホスト linker に渡さず実体 versioned `.so` を使う link 手順、(3) 既存 LPR musl と衝突した Mesa dependency closure 内の `musl` 除外だけ。いずれも package/fixture 導入を成立させる変更で、guest 機能不足は修正していない。
+
+最終回帰は新規 Mesa inventory+screendump、既存 QEMU 15 本 (drm-card0 / kms-modeset / pty-teardown / async-signal / fd-pipe / ext4-sync-persistence / gnu-coreutils / state-leak / pthread / shared-mapping / epoll / shell-interaction / pipe-stress `ITERS=5` / clang-cold-measure / clang-endurance) が全て green。`kernel zig build test`、filed VFS、termd pgrp signal unit、userland service ABI layout、`pack go test ./...` も全て green。clang cold は guest 5秒 / host 9秒で20秒制約を維持した。
+
+**M3.2 DRM client teardown / master handoff**
+- rapid compositor restart を模した open→GBM/EGL→close→即 reopen で master が同期的に移ることを証明する。drmd handle close と LPR process teardown の順序を修正対象とし、kernel へ移さない。
+- 受け入れ: 連続 20 restart で SET_MASTER/SETCRTC が EBUSY/EACCES にならず object leak なし。
+
+**M3.3 page-flip event / vblank / DRM event queue**
+- async PAGE_FLIP_EVENT、vblank/display IRQ、per-file event queue、poll/read を実状態で実装。同期 flip fallback は作らない。
+- 追加観測 (2026-07-11 ユーザー手動確認): 三角形 (単発フレーム) は window に表示されたが、cube 系の連続アニメーションは表示されず青い背景のみ。kmscube 相当は PAGE_FLIP_EVENT 待ちでフレームループを回すため event queue 未実装と符合するが、原因は本タスクで証拠を取って確定すること (断定しない)。
+- 受け入れ: event sequence/user_data/timestamp を検証し、1000 flip 耐久 + screendump green。**回転 cube 相当の連続アニメーションが window に実表示されること**。
+
+**M3.4 PRIME/dma-buf + GBM modifier path**
+- PRIME_HANDLE_TO_FD / FD_TO_HANDLE、dma-buf lifetime/rights、GBM modifier negotiation を実装。まず userland drmd/LPR 境界で設計し、kernel ABI 変更は既存 VMO/fd 転送で不可能と証明された場合だけ別途理由と許可を求める。
+- 受け入れ: GBM BO export/import、cross-process lifetime、ADDFB2 modifier、close/error path を実 buffer で検証。
+
+**M3.5 Mesa loader metadata + tolerated syscall / cold-path hardening**
+- loader warning の要求元を trace して sysfs/device metadata を実データ化。faccessat2/sched_getaffinity/sysinfo/fallocate/prctl は使用箇所と fallback 影響を測定して優先度順に実装し、cold 20秒以下を維持する。
+- 受け入れ: loader warning 0、fallback ENOSYS 0、llvmpipe renderer/pixel/LP_NUM_THREADS=2 green、cold e 20秒以下。
+
+**M3.6 Mesa 実行速度の調査と大幅改善 (Phase M3 の締め)**
+- 現状は棚卸し fixture の全段 (a〜e) が cold 20 秒超 / warm 約 11 秒で、常設スモークに入れるにも遅く、将来 WM (Sway) のフレームループとしては使い物にならない水準。第一章の clang 219 秒→4 秒と同じ方式で、推測せず計測から入る: cold/warm それぞれについて内訳 (Mesa/LLVM DSO の file-backed paging、llvmpipe の JIT compile、filed VMO/page cache、drmd 転送、KMS submit) を数字で確定してから、支配的要因だけを最小 diff で潰す。
+- 想定候補 (計測で確定するまで仮説扱い): DSO cold paging (clang で実績のある filed file-VMO cache の適用範囲)、llvmpipe shader JIT の初回コスト、LP_NUM_THREADS と実コア数の整合、drmd 経由の buffer 転送コピー回数、dumb buffer mmap の書き込み経路。
+- 受け入れ: 計測レポート (内訳と改善前後の数字) + warm の描画ループ (draw→swap→flip 1 フレーム) が interactive 水準に近づくこと + mesa inventory 相当スモークが常設バッテリーに入れられる実行時間 (目安: warm 全段数秒台) になること。cold も clang 同様の大幅短縮を狙う。既存回帰全 green 維持。
 
 ### Phase M4 — 入力と seat
 
