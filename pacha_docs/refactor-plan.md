@@ -259,11 +259,6 @@ Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
 
 ### Phase M1 — 前提修正と表示の第一歩
 
-**M1.0 [termd/kobox] PTY teardown fault の根治 (第一章からの持ち越し)**
-- 症状: PTY 利用プロセスの子 (grep/sleep 等) 終了時の teardown で、Linux tty core `session_clear_tty+0x38` が `task->signal == NULL` のまま offset 0x1a0 を deref して fault (RIP 0x4a00e608, CR2=0x1a0、T4.6 セッションで証拠取得済み)。
-- 注意: 「close→fops->release 前の fake task signal state 同期欠落」仮説は一度実装して同一 fault が再現し否定済み。fault は close 経路ではなく子プロセス終了時にも出る。真因は未確定なので、再現ハーネスを先に固定し、fake task (stub pid) の signal/sighand フィールドのライフサイクルを証拠で確定してから最小修正する。
-- 併せて調査: PTY job-control で foreground pgrp が shell に残り、`setsid` + controlling TTY + `tcsetpgrp` でも移らない問題 (T4.6 で観測)。対話 Ctrl-C の実用性に直結するため、原因を特定し、修正が小さければ本タスクで、大きければ証拠付きで報告のみ。
-- 受け入れ: PTY 上で子プロセスを起動・終了させても fault しない再現スモークが green。既存 12 本 + unit 群も green 維持。
 
 **M1.1 QEMU window 復活 + framebuffer テストパターン**
 - pacgo の `Display` オプションを `pacgo run` / `pacgo qemu-test` から指定可能にし、window あり起動を復活させる (既定は従来どおり headless)。

@@ -873,6 +873,20 @@ apps:
     file: "tests/fixtures/shell_interaction_smoke.sh"
     out: "SHINTRCT.SH"
     rootfs: "/cmd/shell_interaction_smoke.sh"
+  pty_teardown_smoke_script:
+    file: "tests/fixtures/pty_teardown_smoke.sh"
+    out: "PTYTDOWN.SH"
+    rootfs: "/cmd/pty_teardown_smoke.sh"
+  pty_teardown_driver:
+    file:
+      path: ".artifacts/userland-fixtures/pty_teardown_driver.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/pty_teardown_driver", "userland/fixtures/src/wsl_musl/pty_teardown_driver.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/pty_teardown_driver.c"
+    out: "PTYTDRV.ELF"
+    rootfs: "/cmd/pty_teardown_driver.elf"
   ext4_write_script:
     file: "tests/fixtures/ext4_persist_write.sh"
     out: "EXT4W.SH"

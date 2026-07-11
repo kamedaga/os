@@ -49,7 +49,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
 musl ビルドで確認済み。
 
-`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `grep` &nbsp; `Python3`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang`
 
 ### Python3 on PachaOS
 

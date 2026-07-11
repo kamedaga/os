@@ -114,6 +114,7 @@ typedef int (*termd_linux_fops_release_fn)(void *inode, void *file);
 typedef long (*termd_linux_fops_ioctl_fn)(void *file, unsigned int cmd, unsigned long arg);
 typedef uint32_t (*termd_linux_fops_poll_fn)(void *file, void *wait);
 typedef long (*termd_linux_fops_iter_fn)(void *kiocb, void *iter);
+typedef void (*termd_linux_tty_kref_put_fn)(void *tty);
 
 static void termd_write_u16(void *data, size_t offset, uint16_t value);
 
@@ -196,6 +197,26 @@ static uint16_t read_u16_field(const void *base, size_t offset)
     uint16_t value = 0;
     memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
     return value;
+}
+
+static void *termd_linux_tty_kref_get(void *tty)
+{
+    if (tty != NULL) {
+        (void)__atomic_add_fetch((uint32_t *)tty, 1u, __ATOMIC_RELAXED);
+    }
+    return tty;
+}
+
+static void termd_linux_tty_kref_put(void *tty)
+{
+    if (tty == NULL) {
+        return;
+    }
+    termd_linux_tty_kref_put_fn tty_kref_put =
+        (termd_linux_tty_kref_put_fn)kb_module_lookup_exported_symbol("tty_kref_put");
+    if (tty_kref_put != NULL) {
+        tty_kref_put(tty);
+    }
 }
 
 static void log_tty_state(const char *label, const void *tty)
@@ -452,7 +473,14 @@ static void termd_linux_tty_write_task_state(
         ids->process_id != 0 && ids->process_id == ids->session_id ? 1u : 0u);
     write_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OLD_PGRP_OFFSET, NULL);
     if (tty != NULL) {
-        write_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OFFSET, tty);
+        void *old_tty = read_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OFFSET);
+        if (old_tty != tty) {
+            write_ptr_field(
+                signal,
+                TERMD_LINUX_SIGNAL_TTY_OFFSET,
+                termd_linux_tty_kref_get(tty));
+            termd_linux_tty_kref_put(old_tty);
+        }
     }
 }
 
