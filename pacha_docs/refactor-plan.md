@@ -373,8 +373,17 @@ ENOSYS は二つの inventory run 合計で 204=`sched_getaffinity` 0、439=`fac
 - virtio-input (keyboard/mouse) モジュールを kobox に導入し /dev/input/event* を配線。libinput が列挙・イベント取得できるところまで。seat 管理 (seatd) の導入もここ。
 - 受け入れ: QEMU window へのキー/マウス入力が evdev イベントとして fixture に届く。
 
-### Phase M5 — Sway + Wayland (章の完了基準)
+### Phase M5 — Sway + Wayland 
 
 **M5.1 wlroots/Sway 導入と棚卸し** — 修正せず証拠付き棚卸し、タスク分解して追記。
 **M5.2+ ギャップ実装**
 **M5.3 完了基準**: QEMU window に Sway が起動し、Wayland ミニアプリ (まず wl_shm クライアント、次に GL クライアント) が表示され、キー入力が反映される。screendump 検証 + 起動反復のリーク耐久スモーク green。
+M6.Xに向けてテスト時のinput注入方法もここで固定してほしい
+
+### Phase M6 Sway + Waylandの実用化 (追加で)
+
+**M6.1 Swayの高速化** Swayの起動時間、平均フレームレート、マウス、キーボード遅延などを調査し分析後、修正して速度の向上を狙う
+**M6.2 Swayの実用化** 動いているがまだ実用には足りない部分を調査し、修正を行う。M6.1S Swayの高速化と一緒に行うことも検討する。
+**M6.3 waylandアプリの追加** 軽量な既存Waylandアプリケーションを追加し、GUI体験を上げる gtkは少し重いかもしれないが今後を考えてgtk glibを使えるようにしたいためgtk-demoを対応行うのと、限界が気になるためfoot terminalを選びました。
+また、そちらからも理由を含め2つ軽量なGUIアプリケーションを選び、実装を行ってください
+- **選定 (2026-07-11, Claude)**: ① **bemenu** — Wayland ネイティブの dmenu 系ランチャー (C、GTK 不要、依存極小)。実用面で WM の使い勝手に直結 (foot からコマンドを打たずにアプリ起動できる) し、技術面で wlr-layer-shell プロトコル (バー/オーバーレイ用 wlroots 拡張) を通す最初のアプリになり将来のステータスバー等の土台検証を兼ねる。② **swayimg** — 画像ビューア (純 Wayland C 製、GTK 不要)。素の wayland-client + wl_shm + xdg-shell + キー/マウス入力という「普通の GUI アプリ」の基本経路を実コンテンツで検証できる (foot はターミナル特化、gtk-demo は GTK 抽象越しのため)。screendump した画像を guest 内で開けるようになり開発ループも楽になる。 
