@@ -271,6 +271,8 @@ Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
 - KMS dumb buffer + modeset でグラデーションを表示する fixture (kmscube 以前の modeset-test 相当)。mmap した dumb buffer への書き込み → page flip まで。
 - 受け入れ: window に表示 (手動確認) + screendump ピクセル検証 green + 既存回帰 green。
 
+**結果 (2026-07-11, 55badbe + _kobox 3c8ca07 で完了)**: 受け入れ達成。pacgo に `run` alias / `--display` / `--screendump-check 'MARKER@X,Y,W,H=#RRGGBB[:TOL]'` / `--screendump-device` を追加し、QMP screendump + P6 PPM 矩形ピクセル検証を標準基盤化 (headless でも display surface を維持しキャプチャ可)。firmware VGA と virtio-gpu の併存で QMP 既定 console が VGA を掴む問題は virtio-gpu に id=pachagpu を与えて明示指定で解決 (-vga none は Limine fb 喪失のため不採用)。KMS は legacy 先行で master / 列挙 / dumb create・map・destroy / ADDFB(2)・RMFB / SETCRTC / 同期 PAGE_FLIP / VMO FD 転送 + mmap / 実 virtio-gpu resource・scanout・flush まで実装。責務: drmd = KMS/dumb/FB/scanout の実状態所有、_kobox = device 取得境界のみ、LPR = ioctl marshalling + VMO mmap、kernel 変更なし。drmd IPC payload 512→3072B。kms-modeset スモーク新設 (グラデーション 2 枚、SETCRTC→PAGE_FLIP、screendump 赤→シアン検証)。スモーク 15 本体制、全検証 green、clang cold guest 5 秒。window 手動確認: `.artifacts/bin/pacgo run --display 'gtk,show-tabs=on' --new-terminal`。M3 残: atomic property/blob・client caps・state validation / page-flip event・vblank IRQ・event queue / hotplug・EDID・動的 mode / GEM shmem helper 完全化・reservation/fence・PRIME/dma-buf/GBM。
+
 ### Phase M3 — mesa llvmpipe
 
 **M3.1 mesa 導入と実行棚卸し**
