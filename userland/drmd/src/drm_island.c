@@ -311,12 +311,14 @@ int drmd_drm_island_close(struct drmd_drm_island *island, uint64_t id)
     memset(handle, 0, sizeof(*handle));
     drmd_kms_state_counts_t counts;
     drmd_kms_get_state_counts(&counts);
-    printf("[drmd] close handle=%llu status=%d state handles=%u fb=%u dumb=%u master=%llu\n",
+    printf("[drmd] close handle=%llu status=%d state handles=%u fb=%u dumb=%u eventq=%u events=%u master=%llu\n",
         (unsigned long long)id,
         status,
         active_handle_count(),
         counts.fb,
         counts.dumb,
+        counts.event_queues,
+        counts.events,
         (unsigned long long)counts.master_handle);
     return status;
 }
@@ -410,4 +412,43 @@ int drmd_drm_island_mmap(
         return -9;
     }
     return drmd_kms_mmap(island, request, out_vmo_fd);
+}
+
+int drmd_drm_island_read(
+    struct drmd_drm_island *island,
+    drmd_read_request_t *request,
+    uint64_t *out_size)
+{
+    (void)island;
+    if (request == NULL || out_size == NULL || find_handle(request->handle) == NULL ||
+        request->capacity > sizeof(request->data)) {
+        return request != NULL && request->capacity > sizeof(request->data) ? -22 : -9;
+    }
+    request->data_size = 0;
+    const int status = drmd_kms_read(
+        request->handle, request->data, request->capacity, &request->data_size);
+    *out_size = status == 0 ? request->data_size : 0;
+    return status;
+}
+
+int drmd_drm_island_poll(
+    struct drmd_drm_island *island,
+    const drmd_handle_request_t *request,
+    uint64_t *out_events)
+{
+    (void)island;
+    if (request == NULL || out_events == NULL || find_handle(request->handle) == NULL) {
+        return -9;
+    }
+    uint32_t revents = 0;
+    const int status = drmd_kms_poll(request->handle, (uint32_t)request->arg0, &revents);
+    *out_events = revents;
+    return status;
+}
+
+void drmd_drm_island_handle_irq(struct drmd_drm_island *island)
+{
+    if (island != NULL && island->ready) {
+        drmd_kms_handle_irq();
+    }
 }

@@ -360,3 +360,60 @@ int64_t lpr_drm_mmap(
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
     return mapped < 4096 ? lpr_pacha_status_to_errno(mapped) : mapped;
 }
+
+int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events)
+{
+    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    if (drm == 0) return -LPR_LINUX_EBADF;
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_handle_request_t *poll = (drmd_handle_request_t *)lpr_drmd_payload(page);
+    lpr_memset(poll, 0, sizeof(*poll));
+    poll->handle = drm->handle;
+    poll->arg0 = events;
+    uint64_t revents = 0;
+    const int64_t status = lpr_drmd_call(
+        DRMD_OP_HANDLE_POLL, page_fd, page, sizeof(*poll), &revents, 0);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status == 0 ? (int64_t)revents : status;
+}
+
+int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
+{
+    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    if (drm == 0) return -LPR_LINUX_EBADF;
+    if (count == 0) return 0;
+    if (buf == 0) return -LPR_LINUX_EFAULT;
+    for (;;) {
+        void *page = 0;
+        const int page_fd = lpr_create_tty_wire_page(&page);
+        if (page_fd < 0) return page_fd;
+        drmd_read_request_t *read = (drmd_read_request_t *)lpr_drmd_payload(page);
+        lpr_memset(read, 0, sizeof(*read));
+        read->handle = drm->handle;
+        read->capacity = count < sizeof(read->data) ? count : sizeof(read->data);
+        uint64_t result = 0;
+        const int64_t status = lpr_drmd_call(
+            DRMD_OP_HANDLE_READ, page_fd, page, sizeof(*read), &result, 0);
+        if (status == 0) {
+            const uint64_t bytes = read->data_size < result ? read->data_size : result;
+            if (bytes > count || bytes > sizeof(read->data)) {
+                lpr_destroy_tty_wire_page(page_fd, page);
+                return -LPR_LINUX_EIO;
+            }
+            lpr_memcpy((void *)(uintptr_t)buf, read->data, bytes);
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return (int64_t)bytes;
+        }
+        lpr_destroy_tty_wire_page(page_fd, page);
+        if (status != -LPR_LINUX_EAGAIN ||
+            (drm->flags & LPR_LINUX_O_NONBLOCK) != 0) {
+            return status;
+        }
+        struct pachaos_timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
+        const int64_t sleep_status = lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_NANOSLEEP, (uint64_t)(uintptr_t)&delay);
+        if (sleep_status != 0) return lpr_pacha_status_to_errno(sleep_status);
+    }
+}

@@ -126,6 +126,14 @@ int drmd_service_dispatch(
             status = header.payload_size >= sizeof(drmd_mmap_request_t) ?
                 drmd_drm_island_mmap(service->drm, payload, &transfer_fd) : -22;
             break;
+        case DRMD_OP_HANDLE_READ:
+            status = header.payload_size >= sizeof(drmd_read_request_t) ?
+                drmd_drm_island_read(service->drm, payload, &result) : -22;
+            break;
+        case DRMD_OP_HANDLE_POLL:
+            status = header.payload_size >= sizeof(drmd_handle_request_t) ?
+                drmd_drm_island_poll(service->drm, payload, &result) : -22;
+            break;
         default:
             status = -95;
             break;

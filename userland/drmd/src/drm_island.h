@@ -22,3 +22,6 @@ int drmd_drm_island_mmap(
     struct drmd_drm_island *island,
     const drmd_mmap_request_t *request,
     int *out_vmo_fd);
+int drmd_drm_island_read(struct drmd_drm_island *island, drmd_read_request_t *request, uint64_t *out_size);
+int drmd_drm_island_poll(struct drmd_drm_island *island, const drmd_handle_request_t *request, uint64_t *out_events);
+void drmd_drm_island_handle_irq(struct drmd_drm_island *island);

@@ -14,9 +14,12 @@ enum {
     DRMD_OP_HANDLE_DUP = 3u,
     DRMD_OP_HANDLE_IOCTL = 4u,
     DRMD_OP_HANDLE_MMAP = 5u,
+    DRMD_OP_HANDLE_READ = 6u,
+    DRMD_OP_HANDLE_POLL = 7u,
 
     DRMD_PAGE_BYTES = PACHA_SERVICE_PAGE_BYTES,
     DRMD_IOCTL_DATA_BYTES = 3072u,
+    DRMD_EVENT_READ_BYTES = 512u,
     DRMD_VERSION_NAME_BYTES = 64u,
     DRMD_VERSION_DATE_BYTES = 32u,
     DRMD_VERSION_DESC_BYTES = 128u,
@@ -50,6 +53,13 @@ typedef struct drmd_mmap_request {
     uint64_t offset;
 } drmd_mmap_request_t;
 
+typedef struct drmd_read_request {
+    uint64_t handle;
+    uint64_t capacity;
+    uint64_t data_size;
+    uint8_t data[DRMD_EVENT_READ_BYTES];
+} drmd_read_request_t;
+
 typedef struct drmd_version_wire {
     int32_t major;
     int32_t minor;
@@ -70,4 +80,5 @@ _Static_assert(sizeof(drmd_open_request_t) == 16, "drmd_open_request size");
 _Static_assert(sizeof(drmd_handle_request_t) == 32, "drmd_handle_request size");
 _Static_assert(sizeof(drmd_ioctl_request_t) == 3104, "drmd_ioctl_request size");
 _Static_assert(sizeof(drmd_mmap_request_t) == 40, "drmd_mmap_request size");
+_Static_assert(sizeof(drmd_read_request_t) == 536, "drmd_read_request size");
 _Static_assert(sizeof(drmd_version_wire_t) == 288, "drmd_version_wire size");

@@ -27,6 +27,9 @@ enum {
     DRMD_MODE_CONNECTED = 1u,
     DRMD_MODE_SUBPIXEL_UNKNOWN = 1u,
     DRMD_FORMAT_XRGB8888 = 0x34325258u,
+    DRMD_MODE_PAGE_FLIP_EVENT = 1u << 0,
+
+    DRMD_EVENT_FLIP_COMPLETE = 0x02u,
 
     DRMD_KMS_FB_CAPACITY = 16u,
     DRMD_KMS_CRTC_CAPACITY = 4u,
@@ -139,6 +142,16 @@ typedef struct drmd_mode_crtc_page_flip {
     uint64_t user_data;
 } drmd_mode_crtc_page_flip_t;
 
+typedef struct drmd_event_vblank {
+    uint32_t type;
+    uint32_t length;
+    uint64_t user_data;
+    uint32_t tv_sec;
+    uint32_t tv_usec;
+    uint32_t sequence;
+    uint32_t crtc_id;
+} drmd_event_vblank_t;
+
 typedef struct drmd_mode_create_dumb {
     uint32_t height;
     uint32_t width;
@@ -207,3 +220,4 @@ _Static_assert(sizeof(drmd_mode_card_res_t) == 64, "drm resources ABI");
 _Static_assert(sizeof(drmd_mode_crtc_t) == 104, "drm crtc ABI");
 _Static_assert(sizeof(drmd_mode_get_connector_t) == 80, "drm connector ABI");
 _Static_assert(sizeof(drmd_mode_fb_cmd2_t) == 104, "drm fb2 ABI");
+_Static_assert(sizeof(drmd_event_vblank_t) == 32, "drm event vblank ABI");

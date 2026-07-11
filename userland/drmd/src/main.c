@@ -45,6 +45,8 @@ int main(void)
             return 1;
         }
         kb_run_deferred_work();
-        (void)kb_handle_any_irq(0);
+        if (kb_handle_any_irq(0) == 0) {
+            drmd_drm_island_handle_irq(&island);
+        }
     }
 }

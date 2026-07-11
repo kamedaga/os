@@ -236,7 +236,8 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         target->kind != LPR_FD_TABLE_KIND_PIPE &&
         target->kind != LPR_FD_TABLE_KIND_SOCKET &&
         target->kind != LPR_FD_TABLE_KIND_EVENT &&
-        target->kind != LPR_FD_TABLE_KIND_TTY)
+        target->kind != LPR_FD_TABLE_KIND_TTY &&
+        target->kind != LPR_FD_TABLE_KIND_DRM)
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EPERM;

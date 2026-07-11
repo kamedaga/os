@@ -71,6 +71,7 @@ int main(void)
     failures += expect(sizeof(netd_io_t) <= NETD_PAGE_BYTES, "netd io fits page");
     failures += expect(sizeof(termd_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "termd io fits page");
     failures += expect(sizeof(drmd_ioctl_request_t) <= PACHA_SERVICE_PAGE_BYTES, "drmd ioctl fits page");
+    failures += expect(sizeof(drmd_read_request_t) <= PACHA_SERVICE_PAGE_BYTES, "drmd read fits page");
     failures += expect(sizeof(lpr_client_path_request_t) == 496, "lpr client path size");
     failures += expect(
         LPR_DRMD_DRM_ENDPOINT_FD == 243 && LPR_BOOTSTRAP_FD == 244 &&
@@ -114,7 +115,8 @@ int main(void)
         "termd ops are contiguous from zero");
     failures += expect(
         DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_CARD == 1 &&
-        DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5,
+        DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5 &&
+        DRMD_OP_HANDLE_READ == 6 && DRMD_OP_HANDLE_POLL == 7,
         "drmd ops are contiguous from zero");
     failures += expect(
         LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&

@@ -156,6 +156,9 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
 
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
+    if (lpr_linux_drm_fd_active(fd)) {
+        return lpr_drm_read_events(fd, buf, count);
+    }
     if (lpr_linux_tty_fd_active(fd)) {
         return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
     }
@@ -269,6 +272,9 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         }
     }
     if (lpr_linux_tty_fd_active(fd)) {
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+    }
+    if (lpr_linux_drm_fd_active(fd)) {
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
     }
     if (lpr_linux_eventfd_active(fd)) {

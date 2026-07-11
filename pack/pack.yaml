@@ -844,6 +844,30 @@ apps:
     file: "tests/fixtures/drm_restart_smoke.sh"
     out: "LPRDRMR.SH"
     rootfs: "/cmd/drm_restart_smoke.sh"
+  lpr_mesa_cube_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_mesa_cube_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_mesa_inventory.sh", ".artifacts/userland-fixtures/lpr_mesa_cube_smoke.elf", "userland/fixtures/src/wsl_musl/lpr_mesa_cube_smoke.c"]
+      input:
+        - "tools/build_wsl_mesa_inventory.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_mesa_cube_smoke.c"
+    out: "LPRMCUBE.ELF"
+    rootfs: "/cmd/lpr_mesa_cube_smoke.elf"
+  lpr_drm_page_flip_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_drm_page_flip_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_mesa_inventory.sh", ".artifacts/userland-fixtures/lpr_drm_page_flip_smoke.elf", "userland/fixtures/src/wsl_musl/lpr_drm_page_flip_smoke.c"]
+      input:
+        - "tools/build_wsl_mesa_inventory.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_drm_page_flip_smoke.c"
+    out: "LPRDRMFL.ELF"
+    rootfs: "/cmd/lpr_drm_page_flip_smoke.elf"
+  lpr_drm_page_flip_smoke_script:
+    file: "tests/fixtures/drm_page_flip_smoke.sh"
+    out: "LPRDRMFL.SH"
+    rootfs: "/cmd/drm_page_flip_smoke.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"

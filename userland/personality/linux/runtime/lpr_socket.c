@@ -1218,6 +1218,17 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             }
             continue;
         }
+        if (lpr_linux_drm_fd_active(fd)) {
+            const int64_t drm_events = lpr_drm_poll_events(fd, (uint32_t)fds[i].events);
+            if (drm_events < 0) {
+                fds[i].revents = drm_events == -LPR_LINUX_EBADF ?
+                    LPR_LINUX_POLLNVAL : LPR_LINUX_POLLERR;
+            } else {
+                fds[i].revents = (int16_t)drm_events;
+            }
+            if (fds[i].revents != 0) ready++;
+            continue;
+        }
         if (lpr_linux_pipe_fd_active(fd)) {
             fds[i].revents = (int16_t)lpr_linux_pipe_poll_events(fd, (uint32_t)fds[i].events);
             if (fds[i].revents != 0) {
@@ -1442,6 +1453,14 @@ static int64_t lpr_linux_select_scan(
             const uint32_t revents = lpr_linux_pipe_poll_events(fd, events);
             is_read = (revents & (LPR_LINUX_POLLIN | 0x0010u)) != 0;
             is_write = (revents & LPR_LINUX_POLLOUT) != 0;
+            is_except = (revents & LPR_LINUX_POLLERR) != 0;
+        } else if (lpr_linux_drm_fd_active(fd)) {
+            uint32_t events = 0;
+            if (want_read) events |= LPR_LINUX_POLLIN;
+            if (want_except) events |= LPR_LINUX_POLLERR;
+            const int64_t revents = lpr_drm_poll_events(fd, events);
+            if (revents < 0) return revents;
+            is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_except = (revents & LPR_LINUX_POLLERR) != 0;
         } else {
             uint32_t events = 0;

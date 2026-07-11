@@ -747,6 +747,8 @@ int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags);
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_linux_pread_to_vmo( uint64_t fd, uint64_t vmo_fd, uint64_t vmo_offset, uint64_t count, uint64_t file_offset);
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count);
+int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events);
 int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz);
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
 int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count);
