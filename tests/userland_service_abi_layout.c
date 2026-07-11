@@ -116,7 +116,8 @@ int main(void)
     failures += expect(
         DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_CARD == 1 &&
         DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5 &&
-        DRMD_OP_HANDLE_READ == 6 && DRMD_OP_HANDLE_POLL == 7,
+        DRMD_OP_HANDLE_READ == 6 && DRMD_OP_HANDLE_POLL == 7 &&
+        DRMD_OP_PRIME_EXPORT == 8 && DRMD_OP_PRIME_ACQUIRE == 11,
         "drmd ops are contiguous from zero");
     failures += expect(
         LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
@@ -131,6 +132,10 @@ int main(void)
         FILED_EXEC_LPR_FD_DRM == 3 &&
         FILED_EXEC_LPR_FD_PIPE == 4 &&
         FILED_EXEC_LPR_FD_EVENT == 5 &&
+        FILED_EXEC_LPR_FD_NATIVE == 7 &&
+        FILED_EXEC_LPR_FD_DMABUF == 8 &&
+        FILED_EXEC_LPR_FD_TABLE_VERSION == 4 &&
+        LPR_IMAGE_ABI_VERSION == 7 &&
         LPR_CLIENT_FD_KIND_DRMD_HANDLE == 3 &&
         LPR_CLIENT_FD_KIND_PIPE == 4 &&
         LPR_CLIENT_FD_KIND_EVENT == 5,

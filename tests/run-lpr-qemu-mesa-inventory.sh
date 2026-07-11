@@ -12,6 +12,8 @@ fi
   --timeout 240s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
   --send 'bash /cmd/mesa_inventory.sh' \
+  --expect 'MESA_DRM_DEVICE_OK domain=0000 bus=00 dev=04 func=0 vendor=1af4 device=1050' \
+  --expect 'MESA_CPU_AFFINITY online=4 configured=4' \
   --expect 'MESA_STAGE_A_PASS' \
   --expect 'MESA_STAGE_B_PASS' \
   --expect 'MESA_STAGE_C_PASS' \

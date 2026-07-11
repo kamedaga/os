@@ -13,7 +13,8 @@
 #include <time.h>
 
 enum {
-    DRMD_KMS_DUMB_MAX = 16,
+    DRMD_KMS_BUFFER_MAX = 16,
+    DRMD_KMS_GEM_HANDLE_MAX = 32,
     DRMD_KMS_FB_MAX = 16,
     DRMD_KMS_EVENT_FILE_MAX = 32,
     DRMD_KMS_EVENT_QUEUE_MAX = 16,
@@ -74,14 +75,15 @@ typedef void (*drmd_unref_resource_fn)(void *, void *);
 typedef void *(*drmd_array_alloc_fn)(uint32_t);
 typedef void (*drmd_array_add_fn)(void *, void *);
 
-typedef struct drmd_kms_dumb {
+typedef struct drmd_kms_buffer {
     int active;
-    uint64_t owner;
-    uint32_t handle;
+    uint64_t token;
     uint32_t resource_id;
     uint32_t width;
     uint32_t height;
     uint32_t pitch;
+    uint32_t handle_refs;
+    uint32_t export_refs;
     uint32_t fb_refs;
     uint64_t size;
     uint64_t mmap_offset;
@@ -89,7 +91,14 @@ typedef struct drmd_kms_dumb {
     void *mapping;
     uint64_t dma_addr;
     void *object;
-} drmd_kms_dumb_t;
+} drmd_kms_buffer_t;
+
+typedef struct drmd_kms_gem_handle {
+    int active;
+    uint64_t owner;
+    uint32_t handle;
+    drmd_kms_buffer_t *buffer;
+} drmd_kms_gem_handle_t;
 
 typedef struct drmd_kms_fb {
     int active;
@@ -124,9 +133,11 @@ typedef struct drmd_kms_state {
     uint64_t master_handle;
     uint32_t next_handle;
     uint32_t next_fb;
+    uint64_t next_token;
     uint32_t current_fb;
     uint32_t sequence;
     drmd_modeinfo_t current_mode;
+    kb_device_backend_t *device_backend;
     void *drm_device;
     void *vgdev;
     kb_module_t *module;
@@ -141,7 +152,8 @@ typedef struct drmd_kms_state {
     drmd_unref_resource_fn unref_resource;
     drmd_array_alloc_fn array_alloc;
     drmd_array_add_fn array_add;
-    drmd_kms_dumb_t dumb[DRMD_KMS_DUMB_MAX];
+    drmd_kms_buffer_t buffers[DRMD_KMS_BUFFER_MAX];
+    drmd_kms_gem_handle_t gem_handles[DRMD_KMS_GEM_HANDLE_MAX];
     drmd_kms_fb_t fb[DRMD_KMS_FB_MAX];
     drmd_kms_event_file_t event_files[DRMD_KMS_EVENT_FILE_MAX];
     drmd_kms_pending_flip_t pending_flip;
@@ -223,6 +235,8 @@ int drmd_kms_init(struct drmd_drm_island *island)
     memset(&kms, 0, sizeof(kms));
     kms.next_handle = 1;
     kms.next_fb = 71;
+    kms.next_token = 1;
+    kms.device_backend = (kb_device_backend_t *)island->device_backend;
     kms.drm_device = kb_drm_primary_device();
     kms.vgdev = kb_drm_device_private(kms.drm_device);
     fill_mode(&kms.current_mode);
@@ -255,25 +269,92 @@ int drmd_kms_init(struct drmd_drm_island *island)
     return 0;
 }
 
-static drmd_kms_dumb_t *find_dumb(uint64_t owner, uint32_t handle)
+static drmd_kms_gem_handle_t *find_gem_handle(uint64_t owner, uint32_t handle)
 {
-    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
-        if (kms.dumb[i].active && kms.dumb[i].owner == owner && kms.dumb[i].handle == handle) {
-            return &kms.dumb[i];
+    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
+        if (kms.gem_handles[i].active && kms.gem_handles[i].owner == owner &&
+            kms.gem_handles[i].handle == handle) {
+            return &kms.gem_handles[i];
         }
     }
     return NULL;
 }
 
-static drmd_kms_dumb_t *find_dumb_offset(uint64_t owner, uint64_t offset, uint64_t length)
+static drmd_kms_buffer_t *find_buffer_token(uint64_t token)
 {
-    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
-        drmd_kms_dumb_t *dumb = &kms.dumb[i];
-        if (dumb->active && dumb->owner == owner && dumb->mmap_offset == offset && length <= dumb->size) {
-            return dumb;
+    for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+        if (kms.buffers[i].active && kms.buffers[i].token == token) {
+            return &kms.buffers[i];
         }
     }
     return NULL;
+}
+
+static drmd_kms_buffer_t *find_buffer_offset(uint64_t owner, uint64_t offset, uint64_t length)
+{
+    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
+        drmd_kms_gem_handle_t *gem = &kms.gem_handles[i];
+        if (gem->active && gem->owner == owner && gem->buffer != NULL &&
+            gem->buffer->mmap_offset == offset && length <= gem->buffer->size) {
+            return gem->buffer;
+        }
+    }
+    return NULL;
+}
+
+static drmd_kms_gem_handle_t *alloc_gem_handle(uint64_t owner, drmd_kms_buffer_t *buffer)
+{
+    if (buffer == NULL || !buffer->active) return NULL;
+    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
+        drmd_kms_gem_handle_t *gem = &kms.gem_handles[i];
+        if (!gem->active) {
+            memset(gem, 0, sizeof(*gem));
+            gem->active = 1;
+            gem->owner = owner;
+            gem->handle = kms.next_handle++;
+            if (kms.next_handle == 0) kms.next_handle = 1;
+            gem->buffer = buffer;
+            buffer->handle_refs++;
+            return gem;
+        }
+    }
+    return NULL;
+}
+
+static void destroy_buffer(drmd_kms_buffer_t *buffer)
+{
+    if (buffer == NULL || !buffer->active) return;
+    if (buffer->object != NULL) {
+        drmd_kms_owner_context_t context;
+        const int entered = enter_module(&context);
+        kms.unref_resource(kms.vgdev, buffer->object);
+        kms.notify(kms.vgdev);
+        if (entered) leave_module(&context);
+        pump_device();
+    }
+    kb_subsystem_dma_unmap(
+        kms.device_backend, NULL, buffer->dma_addr, buffer->size, KB_DMA_TO_DEVICE);
+    (void)pacha_munmap(buffer->mapping, buffer->size);
+    (void)pacha_fd_close(buffer->vmo_fd);
+    if (buffer->object != NULL) kb_kfree(buffer->object);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+static void maybe_destroy_buffer(drmd_kms_buffer_t *buffer)
+{
+    if (buffer != NULL && buffer->active && buffer->handle_refs == 0 &&
+        buffer->export_refs == 0 && buffer->fb_refs == 0) {
+        destroy_buffer(buffer);
+    }
+}
+
+static void release_gem_handle(drmd_kms_gem_handle_t *gem)
+{
+    if (gem == NULL || !gem->active) return;
+    drmd_kms_buffer_t *buffer = gem->buffer;
+    memset(gem, 0, sizeof(*gem));
+    if (buffer != NULL && buffer->handle_refs != 0) buffer->handle_refs--;
+    maybe_destroy_buffer(buffer);
 }
 
 static drmd_kms_fb_t *find_fb(uint64_t owner, uint32_t id)
@@ -284,6 +365,62 @@ static drmd_kms_fb_t *find_fb(uint64_t owner, uint32_t id)
         }
     }
     return NULL;
+}
+
+static int attach_scanout_resource(
+    drmd_kms_buffer_t *buffer,
+    uint32_t width,
+    uint32_t height,
+    uint32_t pitch)
+{
+    if (buffer == NULL || !buffer->active || width == 0 || height == 0 ||
+        width > DRMD_KMS_MAX_WIDTH || height > DRMD_KMS_MAX_HEIGHT ||
+        pitch < width * 4u || (uint64_t)pitch * height > buffer->size) {
+        return -22;
+    }
+    if (buffer->object != NULL) {
+        return buffer->width == width && buffer->height == height && buffer->pitch == pitch ? 0 : -22;
+    }
+    void *object = kb_kzalloc(DRMD_VIRTIO_GPU_OBJECT_BYTES, 0);
+    if (object == NULL) return -12;
+    *(uint32_t *)object = 1;
+    memcpy((uint8_t *)object + DRMD_GEM_DEV_OFFSET, &kms.drm_device, sizeof(kms.drm_device));
+    uint32_t resource_id = 0;
+    drmd_kms_owner_context_t context;
+    const int entered = enter_module(&context);
+    int status = kms.resource_id_get(kms.vgdev, &resource_id);
+    if (status == 0) {
+        drmd_virtio_gpu_object_params_t params;
+        memset(&params, 0, sizeof(params));
+        params.size = buffer->size;
+        params.dumb = 1;
+        params.format = 2;
+        params.width = width;
+        params.height = height;
+        memcpy((uint8_t *)object + 0x198, &resource_id, sizeof(resource_id));
+        kms.create_resource(kms.vgdev, object, &params, NULL, NULL);
+        drmd_virtio_gpu_mem_entry_t *entry = kb_kzalloc(sizeof(*entry), 0);
+        if (entry == NULL) {
+            status = -12;
+        } else {
+            entry->addr = buffer->dma_addr;
+            entry->length = (uint32_t)buffer->size;
+            kms.object_attach(kms.vgdev, object, entry, 1);
+            kms.notify(kms.vgdev);
+        }
+    }
+    if (entered) leave_module(&context);
+    pump_device();
+    if (status != 0) {
+        kb_kfree(object);
+        return status;
+    }
+    buffer->resource_id = resource_id;
+    buffer->width = width;
+    buffer->height = height;
+    buffer->pitch = pitch;
+    buffer->object = object;
+    return 0;
 }
 
 static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode_create_dumb_t *args)
@@ -298,14 +435,15 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
     if (size == 0 || size > 256u * 1024u * 1024u) {
         return -12;
     }
-    drmd_kms_dumb_t *dumb = NULL;
-    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
-        if (!kms.dumb[i].active) { dumb = &kms.dumb[i]; break; }
+    drmd_kms_buffer_t *buffer = NULL;
+    for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+        if (!kms.buffers[i].active) { buffer = &kms.buffers[i]; break; }
     }
-    if (dumb == NULL) {
+    if (buffer == NULL) {
         return -24;
     }
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     const int vmo_fd = pacha_vmo_create(size, rights, 0);
     if (vmo_fd < 16) {
@@ -366,32 +504,50 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
         (void)pacha_fd_close(vmo_fd);
         return status;
     }
-    memset(dumb, 0, sizeof(*dumb));
-    dumb->active = 1;
-    dumb->owner = owner;
-    dumb->handle = kms.next_handle++;
-    dumb->resource_id = resource_id;
-    dumb->width = args->width;
-    dumb->height = args->height;
-    dumb->pitch = (uint32_t)pitch;
-    dumb->size = size;
-    dumb->mmap_offset = (uint64_t)dumb->handle << 32u;
-    dumb->vmo_fd = vmo_fd;
-    dumb->mapping = mapping;
-    dumb->dma_addr = mapped_dma;
-    dumb->object = object;
-    args->handle = dumb->handle;
-    args->pitch = dumb->pitch;
-    args->size = dumb->size;
+    memset(buffer, 0, sizeof(*buffer));
+    buffer->active = 1;
+    buffer->resource_id = resource_id;
+    buffer->width = args->width;
+    buffer->height = args->height;
+    buffer->pitch = (uint32_t)pitch;
+    buffer->size = size;
+    buffer->vmo_fd = vmo_fd;
+    buffer->mapping = mapping;
+    buffer->dma_addr = mapped_dma;
+    buffer->object = object;
+    drmd_kms_gem_handle_t *gem = alloc_gem_handle(owner, buffer);
+    if (gem == NULL) {
+        buffer->active = 0;
+        drmd_kms_owner_context_t cleanup_context;
+        const int cleanup_entered = enter_module(&cleanup_context);
+        kms.unref_resource(kms.vgdev, object);
+        kms.notify(kms.vgdev);
+        if (cleanup_entered) leave_module(&cleanup_context);
+        pump_device();
+        kb_subsystem_dma_unmap(backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
+        (void)pacha_munmap(mapping, size);
+        (void)pacha_fd_close(vmo_fd);
+        kb_kfree(object);
+        memset(buffer, 0, sizeof(*buffer));
+        return -24;
+    }
+    buffer->mmap_offset = (uint64_t)gem->handle << 32u;
+    args->handle = gem->handle;
+    args->pitch = buffer->pitch;
+    args->size = buffer->size;
     return 0;
 }
 
 static int add_fb(uint64_t owner, uint32_t handle, uint32_t width, uint32_t height, uint32_t pitch, uint32_t format, uint32_t *out_id)
 {
-    drmd_kms_dumb_t *dumb = find_dumb(owner, handle);
-    if (dumb == NULL || width == 0 || height == 0 || width > dumb->width || height > dumb->height ||
-        pitch != dumb->pitch || format != DRMD_FORMAT_XRGB8888 || out_id == NULL) {
+    drmd_kms_gem_handle_t *gem = find_gem_handle(owner, handle);
+    drmd_kms_buffer_t *buffer = gem != NULL ? gem->buffer : NULL;
+    if (buffer == NULL || format != DRMD_FORMAT_XRGB8888 || out_id == NULL) {
         return -22;
+    }
+    const int attach_status = attach_scanout_resource(buffer, width, height, pitch);
+    if (attach_status != 0 || width > buffer->width || height > buffer->height || pitch != buffer->pitch) {
+        return attach_status != 0 ? attach_status : -22;
     }
     for (size_t i = 0; i < DRMD_KMS_FB_MAX; i++) {
         if (!kms.fb[i].active) {
@@ -405,7 +561,7 @@ static int add_fb(uint64_t owner, uint32_t handle, uint32_t width, uint32_t heig
             fb->height = height;
             fb->pitch = pitch;
             fb->format = format;
-            dumb->fb_refs++;
+            buffer->fb_refs++;
             *out_id = fb->id;
             return 0;
         }
@@ -413,10 +569,120 @@ static int add_fb(uint64_t owner, uint32_t handle, uint32_t width, uint32_t heig
     return -24;
 }
 
+int drmd_kms_prime_export(
+    uint64_t owner,
+    uint32_t gem_handle,
+    uint32_t flags,
+    uint64_t *out_token,
+    int *out_vmo_fd,
+    uint64_t *out_rights)
+{
+    if ((flags & ~(uint32_t)(DRMD_CLOEXEC | DRMD_RDWR)) != 0 ||
+        out_token == NULL || out_vmo_fd == NULL || out_rights == NULL) {
+        return -22;
+    }
+    drmd_kms_gem_handle_t *gem = find_gem_handle(owner, gem_handle);
+    drmd_kms_buffer_t *buffer = gem != NULL ? gem->buffer : NULL;
+    if (buffer == NULL || buffer->export_refs == UINT32_MAX) return -2;
+    if (buffer->token == 0) {
+        buffer->token = kms.next_token++;
+        if (kms.next_token == 0) kms.next_token = 1;
+    }
+    buffer->export_refs++;
+    *out_token = buffer->token;
+    *out_vmo_fd = buffer->vmo_fd;
+    *out_rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+    return 0;
+}
+
+int drmd_kms_prime_import(uint64_t owner, uint64_t token, uint32_t flags, uint32_t *out_gem_handle)
+{
+    if (token == 0 || flags != 0 || out_gem_handle == NULL) return -22;
+    drmd_kms_buffer_t *buffer = find_buffer_token(token);
+    if (buffer == NULL || buffer->export_refs == 0) return -9;
+    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
+        drmd_kms_gem_handle_t *gem = &kms.gem_handles[i];
+        if (gem->active && gem->owner == owner && gem->buffer == buffer) {
+            *out_gem_handle = gem->handle;
+            return 0;
+        }
+    }
+    drmd_kms_gem_handle_t *gem = alloc_gem_handle(owner, buffer);
+    if (gem == NULL) return -24;
+    *out_gem_handle = gem->handle;
+    return 0;
+}
+
+int drmd_kms_prime_import_vmo(
+    uint64_t owner,
+    int vmo_fd,
+    uint64_t size,
+    uint32_t flags,
+    uint32_t *out_gem_handle)
+{
+    if (vmo_fd < 16 || size == 0 || size > 256u * 1024u * 1024u ||
+        (size & 4095u) != 0 || flags != 0 || out_gem_handle == NULL) {
+        return -22;
+    }
+    drmd_kms_buffer_t *buffer = NULL;
+    for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+        if (!kms.buffers[i].active) { buffer = &kms.buffers[i]; break; }
+    }
+    if (buffer == NULL) return -24;
+    void *mapping = pacha_mmap(
+        vmo_fd, size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    if (mapping == NULL) return -12;
+    kb_status_t dma_status = KB_ERR_INVALID;
+    const uint64_t mapped_dma = kb_subsystem_dma_map(
+        kms.device_backend, NULL, mapping, size, KB_DMA_TO_DEVICE, &dma_status);
+    if (dma_status != KB_OK || mapped_dma == 0) {
+        (void)pacha_munmap(mapping, size);
+        return -5;
+    }
+    memset(buffer, 0, sizeof(*buffer));
+    buffer->active = 1;
+    buffer->size = size;
+    buffer->vmo_fd = vmo_fd;
+    buffer->mapping = mapping;
+    buffer->dma_addr = mapped_dma;
+    drmd_kms_gem_handle_t *gem = alloc_gem_handle(owner, buffer);
+    if (gem == NULL) {
+        kb_subsystem_dma_unmap(
+            kms.device_backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
+        (void)pacha_munmap(mapping, size);
+        memset(buffer, 0, sizeof(*buffer));
+        return -24;
+    }
+    buffer->mmap_offset = (uint64_t)gem->handle << 32u;
+    *out_gem_handle = gem->handle;
+    return 0;
+}
+
+int drmd_kms_prime_acquire(uint64_t token)
+{
+    drmd_kms_buffer_t *buffer = token != 0 ? find_buffer_token(token) : NULL;
+    if (buffer == NULL || buffer->export_refs == 0) return -9;
+    if (buffer->export_refs == UINT32_MAX) return -75;
+    buffer->export_refs++;
+    return 0;
+}
+
+int drmd_kms_prime_release(uint64_t token)
+{
+    drmd_kms_buffer_t *buffer = token != 0 ? find_buffer_token(token) : NULL;
+    if (buffer == NULL || buffer->export_refs == 0) return -9;
+    buffer->export_refs--;
+    maybe_destroy_buffer(buffer);
+    return 0;
+}
+
 static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb, void **out_fence, uint64_t *out_fence_id)
 {
-    drmd_kms_dumb_t *dumb = fb == NULL ? NULL : find_dumb(owner, fb->handle);
-    if (dumb == NULL) {
+    drmd_kms_gem_handle_t *gem = fb == NULL ? NULL : find_gem_handle(owner, fb->handle);
+    drmd_kms_buffer_t *buffer = gem != NULL ? gem->buffer : NULL;
+    if (buffer == NULL) {
         return -2;
     }
     drmd_kms_owner_context_t context;
@@ -440,10 +706,10 @@ static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb, void **out_fence
         if (entered) leave_module(&context);
         return -12;
     }
-    kms.array_add(objects, dumb->object);
+    kms.array_add(objects, buffer->object);
     kms.transfer_2d(kms.vgdev, 0, fb->width, fb->height, 0, 0, objects, NULL);
-    kms.set_scanout(kms.vgdev, 0, dumb->resource_id, fb->width, fb->height, 0, 0);
-    kms.flush(kms.vgdev, dumb->resource_id, 0, 0, fb->width, fb->height, NULL, fence);
+    kms.set_scanout(kms.vgdev, 0, buffer->resource_id, fb->width, fb->height, 0, 0);
+    kms.flush(kms.vgdev, buffer->resource_id, 0, 0, fb->width, fb->height, NULL, fence);
     kms.notify(kms.vgdev);
     if (fence != NULL) {
         memcpy(out_fence_id, (uint8_t *)fence + DRMD_VIRTIO_GPU_FENCE_ID_OFFSET, sizeof(*out_fence_id));
@@ -521,6 +787,23 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
     if (out_handled == NULL || request == NULL || !kms.ready) return -22;
     *out_handled = 1;
     switch ((uint32_t)request->request) {
+    case DRMD_IOCTL_GET_CAP: {
+        if (request->data_size < sizeof(drmd_get_cap_t)) return -22;
+        drmd_get_cap_t *cap = (void *)request->data;
+        switch (cap->capability) {
+        case DRMD_CAP_DUMB_BUFFER:
+            cap->value = 1;
+            return 0;
+        case DRMD_CAP_PRIME:
+            cap->value = DRMD_PRIME_CAP_IMPORT | DRMD_PRIME_CAP_EXPORT;
+            return 0;
+        case DRMD_CAP_ADDFB2_MODIFIERS:
+            cap->value = 1;
+            return 0;
+        default:
+            return -22;
+        }
+    }
     case DRMD_IOCTL_SET_MASTER:
         if (kms.master_handle != 0 && kms.master_handle != request->handle) return -16;
         kms.master_handle = request->handle;
@@ -529,6 +812,15 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
         if (kms.master_handle != request->handle) return -22;
         kms.master_handle = 0;
         return 0;
+    case DRMD_IOCTL_GEM_CLOSE: {
+        if (request->data_size < sizeof(drmd_gem_close_t)) return -22;
+        const drmd_gem_close_t *close = (const void *)request->data;
+        if (close->pad != 0) return -22;
+        drmd_kms_gem_handle_t *gem = find_gem_handle(request->handle, close->handle);
+        if (gem == NULL) return -2;
+        release_gem_handle(gem);
+        return 0;
+    }
     case DRMD_IOCTL_MODE_GETRESOURCES:
         return request->data_size >= sizeof(drmd_kms_resources_wire_t) ? ioctl_resources((void *)request->data) : -22;
     case DRMD_IOCTL_MODE_GETCONNECTOR:
@@ -571,9 +863,9 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
     case DRMD_IOCTL_MODE_MAP_DUMB: {
         if (request->data_size < sizeof(drmd_mode_map_dumb_t)) return -22;
         drmd_mode_map_dumb_t *map = (void *)request->data;
-        drmd_kms_dumb_t *dumb = find_dumb(request->handle, map->handle);
-        if (dumb == NULL) return -2;
-        map->offset = dumb->mmap_offset;
+        drmd_kms_gem_handle_t *gem = find_gem_handle(request->handle, map->handle);
+        if (gem == NULL || gem->buffer == NULL) return -2;
+        map->offset = gem->buffer->mmap_offset;
         return 0;
     }
     case DRMD_IOCTL_MODE_ADDFB: {
@@ -585,7 +877,9 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
     case DRMD_IOCTL_MODE_ADDFB2: {
         if (request->data_size < sizeof(drmd_mode_fb_cmd2_t)) return -22;
         drmd_mode_fb_cmd2_t *fb = (void *)request->data;
-        if (fb->flags != 0 || fb->offsets[0] != 0 || fb->handles[1] != 0) return -22;
+        if ((fb->flags != 0 && fb->flags != DRMD_MODE_FB_MODIFIERS) ||
+            fb->offsets[0] != 0 || fb->handles[1] != 0 ||
+            (fb->flags == DRMD_MODE_FB_MODIFIERS && fb->modifier[0] != DRMD_FORMAT_MOD_LINEAR)) return -22;
         return add_fb(request->handle, fb->handles[0], fb->width, fb->height, fb->pitches[0], fb->pixel_format, &fb->fb_id);
     }
     case DRMD_IOCTL_MODE_RMFB: {
@@ -594,8 +888,8 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
         drmd_kms_fb_t *fb = find_fb(request->handle, id);
         if (fb == NULL) return -2;
         if (kms.current_fb == id) return -16;
-        drmd_kms_dumb_t *dumb = find_dumb(request->handle, fb->handle);
-        if (dumb != NULL && dumb->fb_refs != 0) dumb->fb_refs--;
+        drmd_kms_gem_handle_t *gem = find_gem_handle(request->handle, fb->handle);
+        if (gem != NULL && gem->buffer != NULL && gem->buffer->fb_refs != 0) gem->buffer->fb_refs--;
         memset(fb, 0, sizeof(*fb));
         return 0;
     }
@@ -645,20 +939,10 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
     case DRMD_IOCTL_MODE_DESTROY_DUMB: {
         if (request->data_size < sizeof(drmd_mode_destroy_dumb_t)) return -22;
         drmd_mode_destroy_dumb_t *destroy = (void *)request->data;
-        drmd_kms_dumb_t *dumb = find_dumb(request->handle, destroy->handle);
-        if (dumb == NULL) return -2;
-        if (dumb->fb_refs != 0) return -16;
-        drmd_kms_owner_context_t context;
-        const int entered = enter_module(&context);
-        kms.unref_resource(kms.vgdev, dumb->object);
-        kms.notify(kms.vgdev);
-        if (entered) leave_module(&context);
-        pump_device();
-        kb_subsystem_dma_unmap((kb_device_backend_t *)island->device_backend, NULL, dumb->dma_addr, dumb->size, KB_DMA_TO_DEVICE);
-        (void)pacha_munmap(dumb->mapping, dumb->size);
-        (void)pacha_fd_close(dumb->vmo_fd);
-        kb_kfree(dumb->object);
-        memset(dumb, 0, sizeof(*dumb));
+        drmd_kms_gem_handle_t *gem = find_gem_handle(request->handle, destroy->handle);
+        if (gem == NULL || gem->buffer == NULL) return -2;
+        if (gem->buffer->fb_refs != 0) return -16;
+        release_gem_handle(gem);
         return 0;
     }
     default:
@@ -671,9 +955,9 @@ int drmd_kms_mmap(struct drmd_drm_island *island, const drmd_mmap_request_t *req
 {
     (void)island;
     if (!kms.ready || request == NULL || out_vmo_fd == NULL || request->length == 0) return -22;
-    drmd_kms_dumb_t *dumb = find_dumb_offset(request->handle, request->offset, request->length);
-    if (dumb == NULL) return -6;
-    *out_vmo_fd = dumb->vmo_fd;
+    drmd_kms_buffer_t *buffer = find_buffer_offset(request->handle, request->offset, request->length);
+    if (buffer == NULL) return -6;
+    *out_vmo_fd = buffer->vmo_fd;
     return 0;
 }
 
@@ -769,33 +1053,22 @@ void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle)
             kms.current_fb = 0;
             disable_scanout = 1;
         }
-        drmd_kms_dumb_t *dumb = find_dumb(handle, fb->handle);
-        if (dumb != NULL && dumb->fb_refs != 0) dumb->fb_refs--;
+        drmd_kms_gem_handle_t *gem = find_gem_handle(handle, fb->handle);
+        if (gem != NULL && gem->buffer != NULL && gem->buffer->fb_refs != 0) gem->buffer->fb_refs--;
         memset(fb, 0, sizeof(*fb));
     }
-    drmd_kms_owner_context_t context;
-    const int entered = enter_module(&context);
     if (disable_scanout) {
+        drmd_kms_owner_context_t context;
+        const int entered = enter_module(&context);
         kms.set_scanout(kms.vgdev, 0, 0, 0, 0, 0, 0);
+        kms.notify(kms.vgdev);
+        if (entered) leave_module(&context);
+        pump_device();
     }
-    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
-        drmd_kms_dumb_t *dumb = &kms.dumb[i];
-        if (dumb->active && dumb->owner == handle) {
-            kms.unref_resource(kms.vgdev, dumb->object);
+    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
+        if (kms.gem_handles[i].active && kms.gem_handles[i].owner == handle) {
+            release_gem_handle(&kms.gem_handles[i]);
         }
-    }
-    kms.notify(kms.vgdev);
-    if (entered) leave_module(&context);
-    pump_device();
-    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
-        drmd_kms_dumb_t *dumb = &kms.dumb[i];
-        if (!dumb->active || dumb->owner != handle) continue;
-        kb_subsystem_dma_unmap((kb_device_backend_t *)island->device_backend, NULL,
-            dumb->dma_addr, dumb->size, KB_DMA_TO_DEVICE);
-        (void)pacha_munmap(dumb->mapping, dumb->size);
-        (void)pacha_fd_close(dumb->vmo_fd);
-        kb_kfree(dumb->object);
-        memset(dumb, 0, sizeof(*dumb));
     }
 }
 
@@ -807,8 +1080,8 @@ void drmd_kms_get_state_counts(drmd_kms_state_counts_t *out_counts)
     for (size_t i = 0; i < DRMD_KMS_FB_MAX; i++) {
         out_counts->fb += kms.fb[i].active ? 1u : 0u;
     }
-    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
-        out_counts->dumb += kms.dumb[i].active ? 1u : 0u;
+    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
+        out_counts->dumb += kms.gem_handles[i].active ? 1u : 0u;
     }
     out_counts->events = kms.pending_flip.active ? 1u : 0u;
     for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; i++) {

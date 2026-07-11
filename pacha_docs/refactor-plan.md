@@ -296,7 +296,7 @@ fixture `lpr_mesa_inventory` は target `a`〜`e` を持ち、最終 target `e` 
 
 追加対照として `LP_NUM_THREADS=2` でも renderer=llvmpipe、triangle、swap が成功した。したがって現 LPR pthread は llvmpipe の複数 worker を実動可能。default 実行も成功しており、worker pool 起因の停止は再現しなかった。大規模な libgallium/LLVM file-backed paging/JIT を含む default 描画で fault、ENOMEM、mmap failure はなく、現時点で mmap/物理メモリ量の機能 blocker は観測されない。ただし cold 初回は20秒超のため性能課題として残す。
 
-実行中の LPR trace では x86_64 syscall 439=`faccessat2`、204=`sched_getaffinity`、99=`sysinfo`、285=`fallocate`、157=`prctl`、324=`mlock2` が ENOSYS になった。いずれも Mesa/musl の fallback 後に上記描画が成功したため M3 の機能 blocker ではない。runner の shell/tee 由来で 40=`sendfile` も ENOSYS だが Mesa 本体の壁とは分類しない。製品側の一時計測コードは追加していない。
+実行中の LPR trace では x86_64 syscall 439=`faccessat2`、204=`sched_getaffinity`、99=`sysinfo`、285=`fallocate`、157=`prctl`、324=`membarrier` が ENOSYS になった。当初 324 を `mlock2` と記録したのは番号の取り違えであり、実引数 command=16 も membarrier registration と一致する。いずれも Mesa/musl の fallback 後に上記描画が成功したため M3 の機能 blocker ではない。runner の shell/tee 由来で 40=`sendfile` も ENOSYS だが Mesa 本体の壁とは分類しない。製品側の一時計測コードは追加していない。
 
 明示判定:
 
@@ -344,9 +344,23 @@ restart smokeを新設し、Mesa DSOをロード済みのparentから20 childを
 - PRIME_HANDLE_TO_FD / FD_TO_HANDLE、dma-buf lifetime/rights、GBM modifier negotiation を実装。まず userland drmd/LPR 境界で設計し、kernel ABI 変更は既存 VMO/fd 転送で不可能と証明された場合だけ別途理由と許可を求める。
 - 受け入れ: GBM BO export/import、cross-process lifetime、ADDFB2 modifier、close/error path を実 buffer で検証。
 
+**結果 (2026-07-11, working tree / commit なし)**: 受け入れ達成。drmd の GEM handle を backing buffer と分離し、backing は handle ref / PRIME export ref / framebuffer ref のいずれかが残る限り生存する。PRIME export は backing ごとの token と共有 VMO FD を返し、LPR の dma-buf open-file object が token を所有する。同一 process の dup は open-file refcount を共有して最後の close だけが RELEASE、fork は child 分を ACQUIRE、exec は fd table ABI v4 / image ABI v7 の dma-buf descriptor と既存 native VMO FD を保持する。このため元 GEM handle と GBM BO を破棄した後も export FD から再importでき、M3.3 の logical-handle lifetime を file ownership へ拡張できた。VMO rights は MAP_READ/WRITE、TRANSFER、DUP、SET_FLAGS、CLOSE を生成元から転送の全段で明示的に保持する。
+
+外部 memfd は Filed の既存 shared-file VMO を LPR→drmd IPC で渡し、drmd が backing/token 化する。Mesa llvmpipe が要求する `/dev/udmabuf` は LPR pseudo device として同じ import/export を使い、F_SEAL_SHRINK の追加・縮小拒否、dma-buf mmap/dup/CLOEXEC を実装した。DRM cap は PRIME import/export と ADDFB2 modifiers を返し、modifier は現 scanout 実装で正しい LINEAR のみを受理する。Linux ABI の `DRM_CLOEXEC=O_CLOEXEC` をそのまま解釈し、kms-swrast が `DRM_CLOEXEC` だけで作る export も read/write dma-buf として扱う。
+
+新規 smoke は GBM `create_with_modifiers2(LINEAR)`→export、fork→exec した別 process の `GBM_BO_IMPORT_FD_MODIFIER`→再export→cyan 書込み、親で元 handle close後の再import、closed FD の EBADF、ADDFB2_WITH_MODIFIERS→SETCRTC、最終 pixel `#00ffff` を一つの実 1024x768 buffer で検証し host 12.1 秒で green。Mesa 25.1.9/current main の kms-swrast は FD_MODIFIER import 自体を受理する一方、displaytarget-backed llvmpipe resource の `gbm_bo_get_modifier()` を INVALID と返すため、その getter 値を OS shim で偽装していない。LINEAR 指定 import の成功、1 plane、LINEAR ADDFB2 と表示実体を oracle とした。kernel syscall/ABI/_kobox 変更はない。既存 VMO fd transfer、fork fd-table clone、shared mmap で export/import/write/display が成立したことが、kernel 追加不要の実証である。
+
 **M3.5 Mesa loader metadata + tolerated syscall / cold-path hardening**
 - loader warning の要求元を trace して sysfs/device metadata を実データ化。faccessat2/sched_getaffinity/sysinfo/fallocate/prctl は使用箇所と fallback 影響を測定して優先度順に実装し、cold 20秒以下を維持する。
 - 受け入れ: loader warning 0、fallback ENOSYS 0、llvmpipe renderer/pixel/LP_NUM_THREADS=2 green、cold e 20秒以下。
+
+**結果 (2026-07-11, working tree / commit なし)**: loader warning 0 と優先 syscall 2件を達成。libdrm 2.4.124 の要求実体は char dev 226:0 に対する `/sys/dev/char/226:0/device/drm` の存在、virtio subsystem と親 PCI subsystem の readlink、device realpath、PCI `uevent` の `PCI_SLOT_NAME`、vendor/device/subsystem/revision だった。QEMU/QMP で実測した `0000:00:04.0`, `1af4:1050`, subsystem `1af4:1100`, revision 1 を rootfs sysfs hierarchy に載せ、`drmGetDevice2(DRM_DEVICE_GET_PCI_REVISION)` が同値を返す fixture oracle を追加した。empty directory が pack manifest に入らないため実在する `drm/card0/dev=226:0` も収録した。LPR は `/dev/dri/card0` の char-device stat を返し、directory `newfstatat` は O_DIRECTORY retry、read-only directory open は過剰な READ/CREATE/REMOVE/RENAME を要求せず STAT/LOOKUP/GETDENTS に限定した。一時計測 trace は除去済み。
+
+ENOSYS は二つの inventory run 合計で 204=`sched_getaffinity` 0、439=`faccessat2` 0。sched_getaffinity は CPUID topology と PachaOS/QEMU の上限4 CPUから 8-byte mask `0x0f` を返し、tid 0/current/LPR thread table を検証する。`sysconf(_SC_NPROCESSORS_ONLN/CONF)=4/4` を oracle 化し、従来 ENOSYS 時に musl が初期 mask `{1}` のまま1 worker相当になる影響を除いた。faccessat2 は観測 flags=AT_EACCESS を、現状 real/effective ID が同一という実条件で既存 faccessat pathへ正規に接続した。
+
+非実装は 99=`sysinfo` 4 trace lines=実 call 2回、285=`fallocate` 4 lines=2回、324=`membarrier` 4 lines=registration 2回、157=`prctl` 16 lines=8回。sysinfo は musl sysconf fallback後も online/configured=4、fallocate は Mesa disk-cache preallocation fallback後も cache/draw成功、prctl は PR_SET_NAME と PR_SET_MM 系で thread naming/proc titleだけが欠け、membarrier は registration ENOSYS 後も llvmpipe draw/barrier/pixelが正しい。したがってこの4件は green の renderer=`llvmpipe (LLVM 20.1.8, 128 bits)`、triangle center `128,63,64,255`、cyan screendump、default/LP_NUM_THREADS=2 を根拠に実装価値を低いと判定した。mesa-inventory は host 15.8 秒、loader warning 0。なお 324 は mlock2 ではなく membarrier である。
+
+指定回帰は PRIME、drm-card0、drm-restart 20、drm-page-flip既定20/cube8、kms-modeset、mesa-inventory、service ABI layout が green。restart は udmabuf open により logical handle 番号が iteration ごとに2進むため、旧「末尾handle=iterations」依存を外し、clean state 20回とserial最終closeの `handles=0 fb=0 dumb=0 eventq=0 events=0 master=0` を維持した。フル回帰は新方針どおりオーケストレーター実施待ち。
 
 **M3.6 Mesa 実行速度の調査と大幅改善 (Phase M3 の締め)**
 - 現状は棚卸し fixture の全段 (a〜e) が cold 20 秒超 / warm 約 11 秒で、常設スモークに入れるにも遅く、将来 WM (Sway) のフレームループとしては使い物にならない水準。第一章の clang 219 秒→4 秒と同じ方式で、推測せず計測から入る: cold/warm それぞれについて内訳 (Mesa/LLVM DSO の file-backed paging、llvmpipe の JIT compile、filed VMO/page cache、drmd 転送、KMS submit) を数字で確定してから、支配的要因だけを最小 diff で潰す。

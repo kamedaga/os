@@ -46,6 +46,24 @@ static int stage_a(struct inventory *state)
            version->name_len, version->name, version->version_major,
            version->version_minor, version->version_patchlevel);
     drmFreeVersion(version);
+    drmDevicePtr device = NULL;
+    errno = 0;
+    const int device_status = drmGetDevice2(
+        state->fd, DRM_DEVICE_GET_PCI_REVISION, &device);
+    if (device_status != 0 || device == NULL || device->bustype != DRM_BUS_PCI ||
+        device->deviceinfo.pci == NULL) {
+        fprintf(stderr, "MESA_DRM_DEVICE_FAIL status=%d errno=%d device=%p bustype=%d\n",
+            device_status, errno, (void *)device, device != NULL ? device->bustype : -1);
+        if (device != NULL) drmFreeDevice(&device);
+        return stage_fail('A', "drmGetDevice2");
+    }
+    printf("MESA_DRM_DEVICE_OK domain=%04x bus=%02x dev=%02x func=%u vendor=%04x device=%04x\n",
+        device->businfo.pci->domain, device->businfo.pci->bus,
+        device->businfo.pci->dev, device->businfo.pci->func,
+        device->deviceinfo.pci->vendor_id, device->deviceinfo.pci->device_id);
+    drmFreeDevice(&device);
+    printf("MESA_CPU_AFFINITY online=%ld configured=%ld\n",
+        sysconf(_SC_NPROCESSORS_ONLN), sysconf(_SC_NPROCESSORS_CONF));
     errno = 0;
     state->gbm = gbm_create_device(state->fd);
     if (state->gbm == NULL) return stage_fail('A', "gbm_create_device");

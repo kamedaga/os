@@ -307,6 +307,17 @@ int64_t lpr_linux_close(uint64_t fd)
         lpr_control_close_fd(fd);
         return refcount <= 1 ? lpr_drm_close_handle(handle) : 0;
     }
+    if (lpr_linux_dmabuf_fd_active(fd)) {
+        uint32_t refcount = 0;
+        (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+        const uint64_t token = lpr_fd_dmabuf_payload(fd)->token;
+        lpr_control_close_fd(fd);
+        const int64_t close_status = lpr_pacha_status_to_errno(
+            lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fd));
+        const int64_t release_status = refcount <= 1 && token != 0 ?
+            lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token) : 0;
+        return close_status != 0 ? close_status : release_status;
+    }
     if (lpr_linux_eventfd_active(fd)) {
         lpr_control_close_fd(fd);
         return 0;
@@ -358,6 +369,15 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
                 } else if (lpr_linux_drm_fd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
+                } else if (lpr_linux_dmabuf_fd_active(fd)) {
+                    const int64_t status = lpr_pacha_syscall3(
+                        PACHAOS_SYSCALL_FD_SET_FLAGS,
+                        fd,
+                        PACHA_FD_FLAG_CLOEXEC,
+                        PACHA_FD_FLAG_CLOEXEC);
+                    if (status == 0) {
+                        (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
+                    }
                 } else if (lpr_linux_eventfd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
                 } else if (lpr_linux_epoll_fd_active(fd)) {
@@ -414,6 +434,19 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     }
     if (lpr_linux_drm_fd_active(fd)) {
         return -LPR_LINUX_ESPIPE;
+    }
+    if (lpr_linux_dmabuf_fd_active(fd)) {
+        const lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+        if ((int64_t)offset != 0 || dmabuf == 0) {
+            return -LPR_LINUX_EINVAL;
+        }
+        if (whence == 0) {
+            return 0;
+        }
+        if (whence == 2 && dmabuf->size <= INT64_MAX) {
+            return (int64_t)dmabuf->size;
+        }
+        return -LPR_LINUX_EINVAL;
     }
     if (lpr_pipe_fd_is_active(fd)) {
         return -LPR_LINUX_ESPIPE;
@@ -523,6 +556,30 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             return lpr_control_set_fd_flags(fd, arg);
         case LPR_LINUX_F_GETFL:
             return lpr_control_get_status_flags(fd, lpr_fd_drm_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
+        case LPR_LINUX_F_SETFL:
+            return lpr_control_set_status_flags(fd, arg);
+        case LPR_LINUX_F_DUPFD:
+        case LPR_LINUX_F_DUPFD_CLOEXEC:
+            return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
+        default:
+            return -LPR_LINUX_EINVAL;
+        }
+    }
+    if (lpr_linux_dmabuf_fd_active(fd)) {
+        lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+        switch (cmd) {
+        case LPR_LINUX_F_GETFD:
+            return lpr_control_get_fd_flags(fd);
+        case LPR_LINUX_F_SETFD: {
+            const uint64_t pacha_flags = (arg & LPR_LINUX_FD_CLOEXEC) != 0 ?
+                PACHA_FD_FLAG_CLOEXEC : 0;
+            const int64_t status = lpr_pacha_syscall3(
+                PACHAOS_SYSCALL_FD_SET_FLAGS, fd, pacha_flags, PACHA_FD_FLAG_CLOEXEC);
+            return status == 0 ? lpr_control_set_fd_flags(fd, arg) : lpr_pacha_status_to_errno(status);
+        }
+        case LPR_LINUX_F_GETFL:
+            return lpr_control_get_status_flags(
+                fd, dmabuf->writable ? LPR_LINUX_O_RDWR : LPR_LINUX_O_RDONLY);
         case LPR_LINUX_F_SETFL:
             return lpr_control_set_status_flags(fd, arg);
         case LPR_LINUX_F_DUPFD:
@@ -653,6 +710,25 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case LPR_LINUX_F_SETLK:
     case LPR_LINUX_F_SETLKW:
         return arg != 0 ? 0 : -LPR_LINUX_EFAULT;
+    case LPR_LINUX_F_ADD_SEALS: {
+        lpr_filed_fd_t *file = lpr_fd_filed_payload(fd);
+        if ((file->reserved1 & LPR_FILED_FD_MEMFD) == 0 ||
+            (arg & ~(uint64_t)(LPR_LINUX_F_SEAL_SEAL | LPR_LINUX_F_SEAL_SHRINK)) != 0) {
+            return -LPR_LINUX_EINVAL;
+        }
+        if ((file->reserved1 & LPR_FILED_FD_ALLOW_SEALING) == 0 ||
+            ((file->reserved1 & LPR_LINUX_F_SEAL_SEAL) != 0 &&
+                (arg & ~(uint64_t)(file->reserved1 & LPR_FILED_FD_SEALS)) != 0)) {
+            return -LPR_LINUX_EPERM;
+        }
+        file->reserved1 |= (uint8_t)arg;
+        return 0;
+    }
+    case LPR_LINUX_F_GET_SEALS: {
+        const lpr_filed_fd_t *file = lpr_fd_filed_payload(fd);
+        return (file->reserved1 & LPR_FILED_FD_MEMFD) != 0 ?
+            (int64_t)(file->reserved1 & LPR_FILED_FD_SEALS) : -LPR_LINUX_EINVAL;
+    }
     case LPR_LINUX_F_DUPFD:
     case LPR_LINUX_F_DUPFD_CLOEXEC:
         return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
@@ -749,6 +825,18 @@ int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf)
         st->st_blksize = 4096;
         return 0;
     }
+    if (lpr_linux_dmabuf_fd_active(fd)) {
+        const lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
+        lpr_memset(st, 0, sizeof(*st));
+        st->st_ino = 0x646d6100ull + dmabuf->token;
+        st->st_nlink = 1;
+        st->st_mode = LPR_LINUX_S_IFREG | 0600u;
+        st->st_size = (int64_t)dmabuf->size;
+        st->st_blksize = 4096;
+        st->st_blocks = (int64_t)((dmabuf->size + 511u) / 512u);
+        return 0;
+    }
     if (lpr_linux_drm_fd_active(fd)) {
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
         lpr_memset(st, 0, sizeof(*st));
@@ -819,6 +907,17 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     }
     lpr_trace_process_event("newfstatat_begin", dirfd, flags, 0);
     const char *path = (const char *)(uintptr_t)path_raw;
+    if ((int64_t)dirfd == LPR_LINUX_AT_FDCWD && path != 0 &&
+        lpr_strcmp(path, "/dev/dri/card0") == 0) {
+        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
+        lpr_memset(st, 0, sizeof(*st));
+        st->st_ino = 0x64726900ull;
+        st->st_nlink = 1;
+        st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
+        st->st_rdev = (226ull << 8);
+        st->st_blksize = 4096;
+        return 0;
+    }
     if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && path[0] == 0) {
         const uint64_t empty_known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW;
         if ((flags & ~empty_known_flags) != 0) {
@@ -826,7 +925,11 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
         }
         return lpr_linux_fstat(dirfd, statbuf);
     }
-    const int64_t fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDONLY, 0);
+    int64_t fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDONLY, 0);
+    if (fd == -LPR_LINUX_ENOENT || fd == -LPR_LINUX_EISDIR) {
+        fd = lpr_linux_openat(
+            dirfd, path_raw, LPR_LINUX_O_RDONLY | LPR_LINUX_O_DIRECTORY, 0);
+    }
     lpr_trace_process_event("newfstatat_open", dirfd, flags, fd);
     if (fd < 0) {
         return fd;
@@ -845,13 +948,15 @@ int64_t lpr_linux_access(uint64_t path, uint64_t mode)
 int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags)
 {
     const uint64_t known_mode = 0x7ull;
-    const uint64_t known_flags = LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH;
+    const uint64_t known_flags =
+        LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EACCESS | LPR_LINUX_AT_EMPTY_PATH;
     if ((mode & ~known_mode) != 0 || (flags & ~known_flags) != 0) {
         return -LPR_LINUX_EINVAL;
     }
     struct lpr_linux_stat statbuf;
     lpr_memset(&statbuf, 0, sizeof(statbuf));
-    return lpr_linux_newfstatat(dirfd, path, (uint64_t)(uintptr_t)&statbuf, flags);
+    return lpr_linux_newfstatat(
+        dirfd, path, (uint64_t)(uintptr_t)&statbuf, flags & ~LPR_LINUX_AT_EACCESS);
 }
 
 int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw)

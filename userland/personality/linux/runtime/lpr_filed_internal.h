@@ -28,6 +28,7 @@
 #define LPR_LINUX_AT_SYMLINK_NOFOLLOW 0x100ull
 #define LPR_LINUX_AT_SYMLINK_FOLLOW 0x400ull
 #define LPR_LINUX_AT_EMPTY_PATH 0x1000ull
+#define LPR_LINUX_AT_EACCESS 0x200ull
 #define LPR_LINUX_AT_REMOVEDIR 0x200ull
 #define LPR_LINUX_O_ACCMODE 00000003ull
 #define LPR_LINUX_O_RDONLY 00000000ull
@@ -54,6 +55,13 @@
 #define LPR_LINUX_F_SETLK 6ull
 #define LPR_LINUX_F_SETLKW 7ull
 #define LPR_LINUX_F_DUPFD_CLOEXEC 1030ull
+#define LPR_LINUX_F_ADD_SEALS 1033ull
+#define LPR_LINUX_F_GET_SEALS 1034ull
+#define LPR_LINUX_F_SEAL_SEAL 0x01u
+#define LPR_LINUX_F_SEAL_SHRINK 0x02u
+#define LPR_FILED_FD_MEMFD 0x80u
+#define LPR_FILED_FD_ALLOW_SEALING 0x40u
+#define LPR_FILED_FD_SEALS 0x0fu
 #define LPR_LINUX_FD_CLOEXEC 1ull
 #define LPR_LINUX_F_UNLCK 2
 #define LPR_LINUX_LOCK_SH 1ull
@@ -643,6 +651,8 @@ int lpr_linux_default_signal_ignored(uint32_t sig);
 int lpr_linux_default_signal_stops(uint32_t sig);
 int lpr_linux_eventfd_active(uint64_t fd);
 int lpr_linux_drm_fd_active(uint64_t fd);
+lpr_dmabuf_fd_t *lpr_fd_dmabuf_payload(uint64_t fd);
+int lpr_linux_dmabuf_fd_active(uint64_t fd);
 int lpr_linux_filed_fd_active(uint64_t fd);
 int lpr_linux_pipe_fd_active(uint64_t fd);
 int lpr_linux_process_register( int32_t linux_pid, int32_t linux_ppid, int32_t linux_sid, int32_t linux_pgrp, int process_fd);
@@ -674,6 +684,8 @@ int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags);
 int64_t lpr_drm_open_path(const char *path, uint64_t flags);
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_drm_close_handle(uint64_t handle);
+int64_t lpr_drm_dup_handle(uint64_t handle);
+int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token);
 int64_t lpr_drm_mmap(uint64_t fd, uint64_t address, uint64_t length, uint64_t pacha_prot, uint64_t pacha_flags, uint64_t offset);
 int32_t lpr_linux_alloc_child_pid(void);
 int64_t lpr_close_native_fd_if_open(uint64_t fd);
@@ -728,6 +740,7 @@ int64_t lpr_linux_getpgid(uint64_t pid_raw);
 int64_t lpr_linux_getpgrp(void);
 int64_t lpr_linux_getpid(void);
 int64_t lpr_linux_gettid(void);
+int lpr_linux_thread_exists(uint64_t tid);
 int64_t lpr_linux_getppid(void);
 int64_t lpr_linux_getsid(uint64_t pid_raw);
 int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg);

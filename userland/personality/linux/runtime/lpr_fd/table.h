@@ -11,6 +11,7 @@ enum {
     LPR_FD_TABLE_KIND_EVENT = 5u,
     LPR_FD_TABLE_KIND_SOCKET = 6u,
     LPR_FD_TABLE_KIND_EPOLL = 7u,
+    LPR_FD_TABLE_KIND_DMABUF = 8u,
 
     LPR_FD_TABLE_FD_CLOEXEC = 1u << 0,
 
@@ -62,6 +63,15 @@ typedef struct lpr_drm_fd {
     uint64_t handle;
 } lpr_drm_fd_t;
 
+typedef struct lpr_dmabuf_fd {
+    uint8_t active;
+    uint8_t writable;
+    uint16_t reserved0;
+    uint32_t flags;
+    uint64_t token;
+    uint64_t size;
+} lpr_dmabuf_fd_t;
+
 typedef struct lpr_socket_fd {
     uint8_t active;
     uint8_t type;
@@ -104,6 +114,7 @@ typedef enum lpr_fd_kind {
     LPR_FD_EVENTFD = LPR_FD_TABLE_KIND_EVENT,
     LPR_FD_SOCKET = LPR_FD_TABLE_KIND_SOCKET,
     LPR_FD_EPOLL = LPR_FD_TABLE_KIND_EPOLL,
+    LPR_FD_DMABUF = LPR_FD_TABLE_KIND_DMABUF,
 } lpr_fd_kind_t;
 
 typedef union lpr_fd_payload {
@@ -114,6 +125,7 @@ typedef union lpr_fd_payload {
     lpr_drm_fd_t drm;
     lpr_socket_fd_t socket;
     lpr_epoll_fd_t epoll;
+    lpr_dmabuf_fd_t dmabuf;
 } lpr_fd_payload_t;
 
 typedef struct lpr_fd_table_entry {

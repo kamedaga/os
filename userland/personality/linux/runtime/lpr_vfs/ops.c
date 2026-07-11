@@ -5,18 +5,19 @@ uint64_t lpr_open_rights(uint64_t flags)
     uint64_t rights = FILED_RIGHT_STAT;
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
-        rights |= FILED_RIGHT_READ | FILED_RIGHT_GETDENTS;
+        rights |= FILED_RIGHT_GETDENTS;
+        if ((flags & LPR_LINUX_O_DIRECTORY) == 0) {
+            rights |= FILED_RIGHT_READ;
+        }
     }
     if (accmode == LPR_LINUX_O_WRONLY || accmode == LPR_LINUX_O_RDWR) {
         rights |= FILED_RIGHT_WRITE;
     }
     if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
-        rights |=
-            FILED_RIGHT_LOOKUP |
-            FILED_RIGHT_GETDENTS |
-            FILED_RIGHT_CREATE |
-            FILED_RIGHT_REMOVE |
-            FILED_RIGHT_RENAME;
+        rights |= FILED_RIGHT_LOOKUP | FILED_RIGHT_GETDENTS;
+        if (accmode == LPR_LINUX_O_WRONLY || accmode == LPR_LINUX_O_RDWR) {
+            rights |= FILED_RIGHT_CREATE | FILED_RIGHT_REMOVE | FILED_RIGHT_RENAME;
+        }
     }
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
         rights |= FILED_RIGHT_CREATE | FILED_RIGHT_WRITE;
@@ -143,6 +144,15 @@ int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
     if ((int64_t)length < 0) {
         return -LPR_LINUX_EINVAL;
     }
+    const uint8_t memfd_state = lpr_fd_filed_payload(fd)->reserved1;
+    if ((memfd_state & (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_SHRINK)) ==
+        (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_SHRINK)) {
+        lpr_linux_stat_t st;
+        lpr_memset(&st, 0, sizeof(st));
+        const int64_t stat_status = lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&st);
+        if (stat_status != 0) return stat_status;
+        if (st.st_size >= 0 && length < (uint64_t)st.st_size) return -LPR_LINUX_EPERM;
+    }
     void *page = 0;
     const int page_fd = lpr_create_wire_page(&page);
     if (page_fd < 0) {
@@ -209,6 +219,12 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
     if (fd < 0) {
         (void)lpr_filed_close_handle(handle);
         return fd;
+    }
+    lpr_filed_fd_t *file = lpr_fd_filed_payload((uint64_t)(uint32_t)fd);
+    if (file != 0) {
+        file->reserved1 = LPR_FILED_FD_MEMFD |
+            ((flags & LPR_LINUX_MFD_ALLOW_SEALING) != 0 ?
+                LPR_FILED_FD_ALLOW_SEALING : LPR_LINUX_F_SEAL_SEAL);
     }
     return fd;
 }

@@ -64,6 +64,19 @@ void lpr_pipe_after_fork_child(void)
                 object->backend_id = dup_handle;
             }
         }
+        if (object->kind == LPR_FD_TABLE_KIND_DRM) {
+            const int64_t status = lpr_drm_dup_handle(object->payload.drm.handle);
+            lpr_trace_process_event("fork_dup_drm", index, object->payload.drm.handle, status);
+        }
+        if (object->kind == LPR_FD_TABLE_KIND_DMABUF) {
+            const int64_t status = lpr_drm_prime_ref(
+                DRMD_OP_PRIME_ACQUIRE, object->payload.dmabuf.token);
+            lpr_trace_process_event("fork_acquire_dmabuf", index, object->payload.dmabuf.token, status);
+            if (status != 0) {
+                object->payload.dmabuf.token = 0;
+                object->backend_id = 0;
+            }
+        }
     }
 }
 
@@ -279,6 +292,28 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
         }
         return dup_fd;
     }
+    if (lpr_linux_dmabuf_fd_active(fd)) {
+        const lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+        struct pacha_fd_info info;
+        if (dmabuf == 0 || !lpr_native_fd_info(fd, &info) || info.kind != PACHA_FD_KIND_VMO) {
+            return -LPR_LINUX_EBADF;
+        }
+        uint64_t native_flags = info.flags & PACHA_FD_FLAG_NONBLOCK;
+        if (cloexec) native_flags |= PACHA_FD_FLAG_CLOEXEC;
+        const int64_t native_dup = lpr_pacha_syscall4(
+            PACHAOS_SYSCALL_FD_DUP, fd, (uint64_t)(uint32_t)dup_fd, info.rights, native_flags);
+        if (native_dup != dup_fd) {
+            if (native_dup >= 0) (void)lpr_close_native_fd_if_open((uint64_t)native_dup);
+            return native_dup < 0 ? lpr_pacha_status_to_errno(native_dup) : -LPR_LINUX_EMFILE;
+        }
+        const int control_status = lpr_control_dup_fd(
+            fd, (uint64_t)(uint32_t)dup_fd, cloexec);
+        if (control_status != 0) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)dup_fd);
+            return control_status;
+        }
+        return dup_fd;
+    }
     if (lpr_linux_socket_fd_active(fd)) {
         const int control_status =
             lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
@@ -360,6 +395,7 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
     if (!lpr_fd_is_filed(old_fd) &&
         !lpr_linux_tty_fd_active(old_fd) &&
         !lpr_linux_drm_fd_active(old_fd) &&
+        !lpr_linux_dmabuf_fd_active(old_fd) &&
         !lpr_pipe_fd_is_active(old_fd) &&
         !lpr_linux_eventfd_active(old_fd) &&
         !lpr_linux_epoll_fd_active(old_fd) &&
@@ -380,6 +416,7 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
     if (lpr_fd_is_filed(new_fd) ||
         lpr_linux_tty_fd_active(new_fd) ||
         lpr_linux_drm_fd_active(new_fd) ||
+        lpr_linux_dmabuf_fd_active(new_fd) ||
         lpr_pipe_fd_is_active(new_fd) ||
         lpr_linux_eventfd_active(new_fd) ||
         lpr_linux_epoll_fd_active(new_fd) ||

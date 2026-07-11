@@ -91,12 +91,34 @@ skip:
   kinds: []
   includeSkippedArtifacts: false
 apps:
+  virtio_gpu_sysfs:
+    file:
+      path: ".artifacts/userland-fixtures/virtio-gpu-sysfs"
+      rebuild: ["bash", "tools/build_virtio_gpu_sysfs.sh"]
+      input:
+        - "tools/build_virtio_gpu_sysfs.sh"
+    out: "ROOT"
+    rootfs: "/"
   alpine_clang:
     file:
       path: ".artifacts/userland-fixtures/alpine-clang-root"
       rebuild: ["bash", "tools/build_wsl_alpine_clang.sh"]
     out: "ROOT"
     rootfs: "/"
+  drm_prime_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_drm_prime_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_drm_prime_smoke.sh"]
+      input:
+        - "tools/build_wsl_drm_prime_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_drm_prime_smoke.c"
+    out: "DRMPRIME.ELF"
+    rootfs: "/cmd/lpr_drm_prime_smoke.elf"
+  drm_prime_smoke_script:
+    file:
+      path: "tests/fixtures/drm_prime_smoke.sh"
+    out: "DRMPRIME.SH"
+    rootfs: "/cmd/drm_prime_smoke.sh"
   alpine_mesa:
     file:
       path: ".artifacts/userland-fixtures/alpine-mesa-root"

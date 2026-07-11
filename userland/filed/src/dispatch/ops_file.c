@@ -670,7 +670,9 @@ int filed_dispatch_shared_file_vmo(
         PACHA_SERVICE_ERROR_FILED_VFS,
         reply_status == 0 && entry != NULL ? entry->logical_size : 0,
         0);
-    uint64_t transfer_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+    uint64_t transfer_rights = PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_MAP_READ;
     if (writable) {
         transfer_rights |= PACHA_FD_RIGHT_MAP_WRITE;
     }

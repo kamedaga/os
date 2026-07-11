@@ -188,6 +188,7 @@ int lpr_exec_local_fd_active(uint64_t fd)
     return lpr_fd_is_filed(fd) ||
         lpr_linux_tty_fd_active(fd) ||
         lpr_linux_drm_fd_active(fd) ||
+        lpr_linux_dmabuf_fd_active(fd) ||
         lpr_pipe_fd_is_active(fd) ||
         lpr_linux_eventfd_active(fd) ||
         lpr_linux_socket_fd_active(fd) ||
@@ -267,6 +268,11 @@ static void lpr_write_exec_local_fd_desc_unlocked(
         desc->kind = FILED_EXEC_LPR_FD_DRM;
         desc->flags = (file->payload.drm.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.drm.handle;
+    } else if (file->kind == LPR_FD_TABLE_KIND_DMABUF) {
+        desc->kind = FILED_EXEC_LPR_FD_DMABUF;
+        desc->flags = (file->payload.dmabuf.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
+        desc->handle = file->payload.dmabuf.token;
+        desc->offset_or_counter = file->payload.dmabuf.size;
     } else if (file->kind == LPR_FD_TABLE_KIND_PIPE) {
         desc->kind = FILED_EXEC_LPR_FD_PIPE;
         desc->flags = (file->payload.pipe.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
@@ -454,6 +460,17 @@ void lpr_close_local_state_before_self_exec(void)
             lpr_control_close_fd(fd);
             continue;
         }
+        if (lpr_linux_dmabuf_fd_active(fd)) {
+            uint32_t refcount = 0;
+            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
+            const uint64_t token = lpr_fd_dmabuf_payload(fd)->token;
+            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
+            lpr_control_close_fd(fd);
+            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && token != 0) {
+                (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
+            }
+            continue;
+        }
         if (lpr_linux_epoll_fd_active(fd)) {
             lpr_control_close_fd(fd);
             continue;
@@ -494,6 +511,13 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
             object->payload.drm.handle = 0;
             object->backend_id = 0;
             (void)lpr_drm_close_handle(handle);
+        } else if (object->kind == LPR_FD_TABLE_KIND_DMABUF &&
+            object->payload.dmabuf.token != 0)
+        {
+            const uint64_t token = object->payload.dmabuf.token;
+            object->payload.dmabuf.token = 0;
+            object->backend_id = 0;
+            (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
         }
     }
     if (lpr_cwd_handle != 0) {

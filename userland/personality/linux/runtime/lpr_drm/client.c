@@ -2,7 +2,15 @@
 
 enum {
     LPR_DRM_IOCTL_VERSION = 0xc0406400u,
+    LPR_UDMABUF_CREATE = 0x40187542u,
 };
+
+typedef struct lpr_udmabuf_create {
+    uint32_t memfd;
+    uint32_t flags;
+    uint64_t offset;
+    uint64_t size;
+} lpr_udmabuf_create_t;
 
 typedef struct lpr_drm_version {
     int32_t major;
@@ -22,22 +30,23 @@ static void *lpr_drmd_payload(void *page)
     return page == 0 ? 0 : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
 }
 
-static int64_t lpr_drmd_call(
+static int64_t lpr_drmd_call_transfer(
     uint32_t op,
     int page_fd,
     void *page,
     uint32_t payload_size,
     uint64_t *out_result,
-    int *out_received_fd)
+    int *out_received_fd,
+    int transfer_fd)
 {
     if (LPR_DRMD_DRM_ENDPOINT_FD < 16 || page_fd < 16 || page == 0) {
         return -LPR_LINUX_ENODEV;
     }
-    struct pacha_ipc_fd fd;
+    struct pacha_ipc_fd fds[2];
     struct pacha_ipc_msg request;
     struct pacha_ipc_msg reply;
     struct pacha_ipc_fd reply_fd_item;
-    lpr_memset(&fd, 0, sizeof(fd));
+    lpr_memset(fds, 0, sizeof(fds));
     lpr_memset(&request, 0, sizeof(request));
     lpr_memset(&reply, 0, sizeof(reply));
     lpr_memset(&reply_fd_item, 0, sizeof(reply_fd_item));
@@ -57,13 +66,32 @@ static int64_t lpr_drmd_call(
     header->request_id = request_id;
     header->trace_id = request_id;
     header->payload_size = payload_size;
-    fd.fd = (uint64_t)(uint32_t)page_fd;
-    fd.rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+    fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    fds[0].rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+    uint64_t fd_count = 1;
+    if (transfer_fd >= 16) {
+        struct pacha_fd_info info;
+        if (!lpr_native_fd_info((uint64_t)(uint32_t)transfer_fd, &info) ||
+            info.kind != PACHA_FD_KIND_VMO ||
+            (info.rights & (PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_MAP_READ |
+                PACHA_FD_RIGHT_MAP_WRITE)) !=
+                (PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS |
+                    PACHA_FD_RIGHT_MAP_READ |
+                    PACHA_FD_RIGHT_MAP_WRITE)) {
+            return -LPR_LINUX_EBADF;
+        }
+        fds[1].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[1].rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP |
+            PACHA_FD_RIGHT_SET_FLAGS |
+            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+        fd_count = 2;
+    }
     request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
     request.word3 = request_id;
-    request.fds = &fd;
-    request.fd_count = 1;
+    request.fds = fds;
+    request.fd_count = fd_count;
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
         LPR_DRMD_DRM_ENDPOINT_FD,
@@ -101,6 +129,18 @@ static int64_t lpr_drmd_call(
     return reply_header->status;
 }
 
+static int64_t lpr_drmd_call(
+    uint32_t op,
+    int page_fd,
+    void *page,
+    uint32_t payload_size,
+    uint64_t *out_result,
+    int *out_received_fd)
+{
+    return lpr_drmd_call_transfer(
+        op, page_fd, page, payload_size, out_result, out_received_fd, -1);
+}
+
 int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags)
 {
     const int fd = lpr_fd_slot_alloc();
@@ -124,7 +164,8 @@ int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags)
 
 int64_t lpr_drm_open_path(const char *path, uint64_t flags)
 {
-    if (path == 0 || lpr_strcmp(path, "/dev/dri/card0") != 0) {
+    const int udmabuf = path != 0 && lpr_strcmp(path, "/dev/udmabuf") == 0;
+    if (path == 0 || (!udmabuf && lpr_strcmp(path, "/dev/dri/card0") != 0)) {
         return -LPR_LINUX_ENOENT;
     }
     void *page = 0;
@@ -145,6 +186,9 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
     const int fd = lpr_drm_fd_alloc(handle, flags);
     if (fd < 0) {
         (void)lpr_drm_close_handle(handle);
+    } else if (udmabuf) {
+        lpr_drm_fd_t *drm = lpr_fd_drm_payload((uint64_t)(uint32_t)fd);
+        if (drm != 0) drm->reserved0 = 1;
     }
     return fd;
 }
@@ -164,6 +208,194 @@ int64_t lpr_drm_close_handle(uint64_t handle)
     return status;
 }
 
+int64_t lpr_drm_dup_handle(uint64_t handle)
+{
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_handle_request_t *dup = (drmd_handle_request_t *)lpr_drmd_payload(page);
+    lpr_memset(dup, 0, sizeof(*dup));
+    dup->handle = handle;
+    uint64_t result = 0;
+    const int64_t status = lpr_drmd_call(DRMD_OP_HANDLE_DUP, page_fd, page, sizeof(*dup), &result, 0);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status == 0 && result == handle ? 0 : (status != 0 ? status : -LPR_LINUX_EIO);
+}
+
+int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token)
+{
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_prime_token_request_t *request = (drmd_prime_token_request_t *)lpr_drmd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->token = token;
+    const int64_t status = lpr_drmd_call(op, page_fd, page, sizeof(*request), 0, 0);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status;
+}
+
+static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, uint32_t flags)
+{
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_prime_export_request_t *request = (drmd_prime_export_request_t *)lpr_drmd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->handle = drm_handle;
+    request->gem_handle = gem_handle;
+    request->flags = flags;
+    uint64_t token = 0;
+    int native_fd = -1;
+    int64_t status = lpr_drmd_call(
+        DRMD_OP_PRIME_EXPORT, page_fd, page, sizeof(*request), &token, &native_fd);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    if (status != 0) return status;
+    struct pacha_fd_info info;
+    if (native_fd < 0 || token == 0 || !lpr_native_fd_info((uint64_t)(uint32_t)native_fd, &info) ||
+        info.kind != PACHA_FD_KIND_VMO ||
+        (info.rights & (PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE)) !=
+            (PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE)) {
+        if (native_fd >= 0) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
+        (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
+        return -LPR_LINUX_EIO;
+    }
+    uint64_t linux_fd = (uint64_t)(uint32_t)native_fd;
+    if (lpr_runtime_reserved_fd(linux_fd) || lpr_control_fd_active(linux_fd)) {
+        const int replacement = lpr_fd_slot_alloc();
+        if (replacement < 0) {
+            (void)lpr_close_native_fd_if_open(linux_fd);
+            (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
+            return replacement;
+        }
+        const int64_t dup_fd = lpr_pacha_syscall4(
+            PACHAOS_SYSCALL_FD_DUP,
+            linux_fd,
+            (uint64_t)(uint32_t)replacement,
+            info.rights,
+            info.flags);
+        (void)lpr_close_native_fd_if_open(linux_fd);
+        if (dup_fd != replacement) {
+            if (dup_fd >= 0) (void)lpr_close_native_fd_if_open((uint64_t)dup_fd);
+            (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
+            return -LPR_LINUX_EMFILE;
+        }
+        linux_fd = (uint64_t)(uint32_t)replacement;
+    }
+    const uint64_t linux_flags = LPR_LINUX_O_RDWR |
+        ((flags & DRMD_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
+    status = lpr_control_install_fd(
+        linux_fd, LPR_FD_TABLE_KIND_DMABUF, linux_flags, token, info.size);
+    lpr_dmabuf_fd_t *dmabuf = status == 0 ? lpr_fd_dmabuf_payload(linux_fd) : 0;
+    if (dmabuf == 0) {
+        (void)lpr_close_native_fd_if_open(linux_fd);
+        (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
+        return status != 0 ? status : -LPR_LINUX_EIO;
+    }
+    dmabuf->active = 1;
+    dmabuf->writable = 1;
+    dmabuf->flags = (uint32_t)linux_flags;
+    dmabuf->token = token;
+    dmabuf->size = info.size;
+    return (int64_t)linux_fd;
+}
+
+static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint32_t flags)
+{
+    lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(prime_fd);
+    if (flags != 0) return -LPR_LINUX_EINVAL;
+    int import_vmo_fd = -1;
+    uint64_t import_size = 0;
+    if (dmabuf == 0) {
+        if (!lpr_linux_filed_fd_active(prime_fd)) return -LPR_LINUX_EBADF;
+        lpr_linux_stat_t st;
+        lpr_memset(&st, 0, sizeof(st));
+        const int64_t stat_status = lpr_linux_fstat(
+            prime_fd, (uint64_t)(uintptr_t)&st);
+        if (stat_status != 0) return stat_status;
+        if (st.st_size <= 0 || (uint64_t)st.st_size > 256u * 1024u * 1024u) {
+            return -LPR_LINUX_EINVAL;
+        }
+        import_size = ((uint64_t)st.st_size + 4095u) & ~4095ull;
+        uint64_t file_size = 0;
+        const int64_t shared_vmo_fd = lpr_linux_shared_file_vmo(
+            prime_fd, 0, import_size, 1, 0, &file_size);
+        if (shared_vmo_fd < 16) return shared_vmo_fd;
+        if (file_size < (uint64_t)st.st_size) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)shared_vmo_fd);
+            return -LPR_LINUX_EIO;
+        }
+        import_vmo_fd = (int)(uint32_t)shared_vmo_fd;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) {
+        if (import_vmo_fd >= 16) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)import_vmo_fd);
+        return page_fd;
+    }
+    drmd_prime_import_request_t *request = (drmd_prime_import_request_t *)lpr_drmd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->handle = drm_handle;
+    request->token = dmabuf != 0 ? dmabuf->token : 0;
+    request->size = import_size;
+    uint64_t gem_handle = 0;
+    const int64_t status = lpr_drmd_call_transfer(
+        DRMD_OP_PRIME_IMPORT, page_fd, page, sizeof(*request), &gem_handle, 0, import_vmo_fd);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    if (import_vmo_fd >= 16) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)import_vmo_fd);
+    }
+    return status == 0 && gem_handle <= UINT32_MAX ? (int64_t)gem_handle :
+        (status != 0 ? status : -LPR_LINUX_EIO);
+}
+
+static int64_t lpr_drm_close_gem(uint64_t drm_handle, uint32_t gem_handle)
+{
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_ioctl_request_t *ioctl = (drmd_ioctl_request_t *)lpr_drmd_payload(page);
+    lpr_memset(ioctl, 0, sizeof(*ioctl));
+    ioctl->handle = drm_handle;
+    ioctl->request = DRMD_IOCTL_GEM_CLOSE;
+    ioctl->arg_size = sizeof(drmd_gem_close_t);
+    ioctl->data_size = sizeof(drmd_gem_close_t);
+    ((drmd_gem_close_t *)ioctl->data)->handle = gem_handle;
+    const int64_t status = lpr_drmd_call(
+        DRMD_OP_HANDLE_IOCTL, page_fd, page, sizeof(*ioctl), 0, 0);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status;
+}
+
+static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
+{
+    if (arg == 0) return -LPR_LINUX_EFAULT;
+    const lpr_udmabuf_create_t *create = (const void *)(uintptr_t)arg;
+    if ((create->flags & ~1u) != 0 || create->offset != 0 || create->size == 0 ||
+        (create->size & 4095u) != 0 || !lpr_linux_filed_fd_active(create->memfd)) {
+        return -LPR_LINUX_EINVAL;
+    }
+    lpr_linux_stat_t st;
+    lpr_memset(&st, 0, sizeof(st));
+    const int64_t stat_status = lpr_linux_fstat(
+        create->memfd, (uint64_t)(uintptr_t)&st);
+    if (stat_status != 0) return stat_status;
+    if (st.st_size <= 0 || create->size > (uint64_t)st.st_size) return -LPR_LINUX_EINVAL;
+    const int64_t gem_handle = lpr_drm_prime_import(drm_handle, create->memfd, 0);
+    if (gem_handle < 0) return gem_handle;
+    const int64_t dmabuf_fd = lpr_drm_prime_export(
+        drm_handle,
+        (uint32_t)gem_handle,
+        DRMD_RDWR | ((create->flags & 1u) != 0 ? DRMD_CLOEXEC : 0));
+    const int64_t close_status = lpr_drm_close_gem(drm_handle, (uint32_t)gem_handle);
+    if (dmabuf_fd < 0) return dmabuf_fd;
+    if (close_status != 0) {
+        (void)lpr_linux_close((uint64_t)dmabuf_fd);
+        return close_status;
+    }
+    return dmabuf_fd;
+}
+
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
     lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
@@ -171,6 +403,24 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     const int no_argument = command == DRMD_IOCTL_SET_MASTER || command == DRMD_IOCTL_DROP_MASTER;
     if (drm == 0 || (arg == 0 && !no_argument)) {
         return drm == 0 ? -LPR_LINUX_EBADF : -LPR_LINUX_EFAULT;
+    }
+    if (drm->reserved0 != 0) {
+        return command == LPR_UDMABUF_CREATE ?
+            lpr_udmabuf_create(drm->handle, arg) : -LPR_LINUX_ENOTTY;
+    }
+    if (command == DRMD_IOCTL_PRIME_HANDLE_TO_FD) {
+        drmd_prime_handle_t *prime = (drmd_prime_handle_t *)(uintptr_t)arg;
+        const int64_t prime_fd = lpr_drm_prime_export(drm->handle, prime->handle, prime->flags);
+        if (prime_fd >= 0) prime->fd = (int32_t)prime_fd;
+        return prime_fd >= 0 ? 0 : prime_fd;
+    }
+    if (command == DRMD_IOCTL_PRIME_FD_TO_HANDLE) {
+        drmd_prime_handle_t *prime = (drmd_prime_handle_t *)(uintptr_t)arg;
+        if (prime->fd < 0) return -LPR_LINUX_EBADF;
+        const int64_t gem_handle = lpr_drm_prime_import(
+            drm->handle, (uint64_t)(uint32_t)prime->fd, prime->flags);
+        if (gem_handle >= 0) prime->handle = (uint32_t)gem_handle;
+        return gem_handle >= 0 ? 0 : gem_handle;
     }
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);

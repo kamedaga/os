@@ -169,6 +169,11 @@ static void lpr_fd_table_fill_payload(
         file->payload.epoll.instance = install->backend_id;
         file->payload.epoll.map_bytes = install->offset;
         break;
+    case LPR_FD_TABLE_KIND_DMABUF:
+        file->payload.dmabuf.active = 1;
+        file->payload.dmabuf.token = install->backend_id;
+        file->payload.dmabuf.size = install->offset;
+        break;
     default:
         break;
     }

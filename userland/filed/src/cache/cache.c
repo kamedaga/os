@@ -1232,6 +1232,8 @@ int filed_cache_create_shared_vmo(
     const uint64_t rights =
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_SET_FLAGS |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC |

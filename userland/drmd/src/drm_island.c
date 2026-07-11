@@ -446,6 +446,50 @@ int drmd_drm_island_poll(
     return status;
 }
 
+int drmd_drm_island_prime_export(
+    struct drmd_drm_island *island,
+    const drmd_prime_export_request_t *request,
+    uint64_t *out_token,
+    int *out_vmo_fd,
+    uint64_t *out_rights)
+{
+    if (island == NULL || request == NULL || find_handle(request->handle) == NULL) return -9;
+    return drmd_kms_prime_export(
+        request->handle, request->gem_handle, request->flags,
+        out_token, out_vmo_fd, out_rights);
+}
+
+int drmd_drm_island_prime_import(
+    struct drmd_drm_island *island,
+    const drmd_prime_import_request_t *request,
+    int import_vmo_fd,
+    uint64_t *out_gem_handle)
+{
+    if (island == NULL || request == NULL || request->reserved0 != 0 ||
+        find_handle(request->handle) == NULL) return -9;
+    uint32_t gem_handle = 0;
+    const int token_import = request->token != 0 && request->size == 0 && import_vmo_fd < 16;
+    const int vmo_import = request->token == 0 && request->size != 0 && import_vmo_fd >= 16;
+    if (!token_import && !vmo_import) return -22;
+    const int status = token_import ?
+        drmd_kms_prime_import(
+            request->handle, request->token, request->flags, &gem_handle) :
+        drmd_kms_prime_import_vmo(
+            request->handle, import_vmo_fd, request->size, request->flags, &gem_handle);
+    if (status == 0 && out_gem_handle != NULL) *out_gem_handle = gem_handle;
+    return status;
+}
+
+int drmd_drm_island_prime_acquire(struct drmd_drm_island *island, uint64_t token)
+{
+    return island != NULL && island->ready ? drmd_kms_prime_acquire(token) : -19;
+}
+
+int drmd_drm_island_prime_release(struct drmd_drm_island *island, uint64_t token)
+{
+    return island != NULL && island->ready ? drmd_kms_prime_release(token) : -19;
+}
+
 void drmd_drm_island_handle_irq(struct drmd_drm_island *island)
 {
     if (island != NULL && island->ready) {

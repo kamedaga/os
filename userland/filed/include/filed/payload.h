@@ -61,10 +61,11 @@ enum {
     FILED_EXEC_LPR_FD_EVENT = 5,
     FILED_EXEC_LPR_FD_SOCKET = 6,
     FILED_EXEC_LPR_FD_NATIVE = 7,
+    FILED_EXEC_LPR_FD_DMABUF = 8,
 };
 
 #define FILED_EXEC_LPR_FD_TABLE_MAGIC 0x3144424652504c46ull
-#define FILED_EXEC_LPR_FD_TABLE_VERSION 3ull
+#define FILED_EXEC_LPR_FD_TABLE_VERSION 4ull
 
 typedef struct filed_openat {
     uint64_t dir_handle;

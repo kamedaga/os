@@ -565,6 +565,23 @@ static int64_t lpr_dispatch_mmap(uint64_t addr, uint64_t len, uint64_t prot, uin
     if (flag_status != 0 || len == 0) {
         return -LPR_LINUX_EINVAL;
     }
+    if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_dmabuf_fd_active(fd)) {
+        lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+        if (dmabuf == 0 || (offset & 4095ull) != 0 || offset > dmabuf->size ||
+            len > dmabuf->size - offset ||
+            ((prot & LPR_LINUX_PROT_WRITE) != 0 && !dmabuf->writable)) {
+            return -LPR_LINUX_EINVAL;
+        }
+        const int64_t mapped = lpr_pacha_syscall6(
+            PACHAOS_SYSCALL_MMAP,
+            fd,
+            addr,
+            len,
+            lpr_linux_prot_to_pacha(prot),
+            pacha_flags,
+            offset);
+        return mapped >= 4096 ? mapped : lpr_linux_pacha_status_to_errno(mapped);
+    }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_drm_fd_active(fd)) {
         return lpr_drm_mmap(fd, addr, len, lpr_linux_prot_to_pacha(prot), pacha_flags, offset);
     }
@@ -859,6 +876,42 @@ static int64_t lpr_dispatch_msync(uint64_t addr, uint64_t len, uint64_t flags)
     return lpr_linux_sync();
 }
 
+static uint32_t lpr_linux_online_cpu_count(void)
+{
+    uint32_t eax = 0;
+    uint32_t ebx = 0;
+    uint32_t ecx = 0;
+    uint32_t edx = 0;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0), "c"(0));
+    const uint32_t max_leaf = eax;
+    uint32_t count = 0;
+    if (max_leaf >= 0xbu) {
+        for (uint32_t level = 0; level < 8; level++) {
+            __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0xbu), "c"(level));
+            if (ebx == 0) break;
+            if (((ecx >> 8u) & 0xffu) == 2u) count = ebx & 0xffffu;
+        }
+    }
+    if (count == 0 && max_leaf >= 1u) {
+        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1), "c"(0));
+        count = (ebx >> 16u) & 0xffu;
+    }
+    if (count == 0) count = 1;
+    if (count > 4u) count = 4u;
+    return count;
+}
+
+static int64_t lpr_dispatch_sched_getaffinity(uint64_t tid, uint64_t size, uint64_t mask_raw)
+{
+    const uint64_t kernel_mask_bytes = sizeof(uint64_t);
+    if (mask_raw == 0) return -LPR_LINUX_EFAULT;
+    if (size < kernel_mask_bytes) return -LPR_LINUX_EINVAL;
+    if (!lpr_linux_thread_exists(tid)) return -LPR_LINUX_ESRCH;
+    const uint32_t cpu_count = lpr_linux_online_cpu_count();
+    *(uint64_t *)(uintptr_t)mask_raw = (1ull << cpu_count) - 1ull;
+    return (int64_t)kernel_mask_bytes;
+}
+
 typedef int64_t (*lpr_syscall_handler_t)(
     uint64_t a0,
     uint64_t a1,
@@ -869,7 +922,7 @@ typedef int64_t (*lpr_syscall_handler_t)(
 
 typedef struct lpr_syscall_entry {
     uint64_t nr;
-    char name[16];
+    char name[24];
     enum lpr_linux_syscall_class cls;
     enum lpr_linux_syscall_backend backend;
     lpr_syscall_handler_t handler;
@@ -881,6 +934,8 @@ static int64_t lpr_sys_write(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_open(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_openat(LPR_LINUX_AT_FDCWD, a0, a1, a2); }
 static int64_t lpr_sys_close(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_close(a0) : lpr_linux_close(a0); }
 static int64_t lpr_sys_close_range(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_close_range(a0, a1, a2); }
+static int64_t lpr_sys_sched_getaffinity(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_sched_getaffinity(a0, a1, a2); }
+static int64_t lpr_sys_faccessat2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, a3); }
 static int64_t lpr_sys_stat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0); }
 static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0x100); }
 static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
@@ -1053,7 +1108,7 @@ static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 #define LPR_SYSCALL(nr_value, name_value, class_value, backend_value, handler_value, trace_value) \
     [nr_value] = { nr_value, name_value, class_value, backend_value, 0, trace_value }
 
-static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE + 1u] = {
+static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_READ, "read", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_read, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_WRITE, "write", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_write, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_OPEN, "open", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_open, 0),
@@ -1181,6 +1236,8 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_GETRANDOM, "getrandom", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getrandom, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MEMFD_CREATE, "memfd_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_memfd_create, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOSE_RANGE, "close_range", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_close_range, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_GETAFFINITY, "sched_getaffinity", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_getaffinity, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FACCESSAT2, "faccessat2", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_faccessat2, 0),
 };
 
 static int lpr_syscall_table_initialized;
@@ -1318,6 +1375,8 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_GETRANDOM].handler = lpr_sys_getrandom;
     lpr_syscall_table[LPR_LINUX_SYS_MEMFD_CREATE].handler = lpr_sys_memfd_create;
     lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE].handler = lpr_sys_close_range;
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_GETAFFINITY].handler = lpr_sys_sched_getaffinity;
+    lpr_syscall_table[LPR_LINUX_SYS_FACCESSAT2].handler = lpr_sys_faccessat2;
     lpr_syscall_table_initialized = 1;
 }
 
@@ -1335,7 +1394,7 @@ static const lpr_syscall_entry_t *lpr_syscall_lookup_entry(uint64_t nr)
 const struct lpr_linux_syscall_info *lpr_linux_syscall_lookup(uint64_t nr)
 {
     const lpr_syscall_entry_t *entry = lpr_syscall_lookup_entry(nr);
-    static struct lpr_linux_syscall_info info_cache[LPR_LINUX_SYS_CLOSE_RANGE + 1u];
+    static struct lpr_linux_syscall_info info_cache[LPR_LINUX_SYS_LAST + 1u];
     if (entry == 0) {
         return 0;
     }

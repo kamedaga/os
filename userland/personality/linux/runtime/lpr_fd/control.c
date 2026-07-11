@@ -48,6 +48,12 @@ lpr_drm_fd_t *lpr_fd_drm_payload(uint64_t fd)
     return object != 0 && object->kind == LPR_FD_TABLE_KIND_DRM ? &object->payload.drm : 0;
 }
 
+lpr_dmabuf_fd_t *lpr_fd_dmabuf_payload(uint64_t fd)
+{
+    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
+    return object != 0 && object->kind == LPR_FD_TABLE_KIND_DMABUF ? &object->payload.dmabuf : 0;
+}
+
 lpr_socket_fd_t *lpr_fd_socket_payload(uint64_t fd)
 {
     lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
@@ -73,6 +79,11 @@ int lpr_linux_tty_fd_active(uint64_t fd)
 int lpr_linux_drm_fd_active(uint64_t fd)
 {
     return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DRM);
+}
+
+int lpr_linux_dmabuf_fd_active(uint64_t fd)
+{
+    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DMABUF);
 }
 
 int lpr_fd_shadow_offset_eligible(uint64_t fd)
@@ -137,6 +148,7 @@ int lpr_fd_local_active(uint64_t fd)
             object->kind == LPR_FD_TABLE_KIND_EVENT ||
             object->kind == LPR_FD_TABLE_KIND_TTY ||
             object->kind == LPR_FD_TABLE_KIND_DRM ||
+            object->kind == LPR_FD_TABLE_KIND_DMABUF ||
             object->kind == LPR_FD_TABLE_KIND_SOCKET ||
             object->kind == LPR_FD_TABLE_KIND_EPOLL);
 }
@@ -255,6 +267,13 @@ int lpr_control_install_fd(
             object->payload.drm.flags = (uint32_t)linux_flags;
             object->payload.drm.handle = backend_id;
             break;
+        case LPR_FD_TABLE_KIND_DMABUF:
+            object->payload.dmabuf.flags = (uint32_t)linux_flags;
+            object->payload.dmabuf.token = backend_id;
+            object->payload.dmabuf.size = offset;
+            object->payload.dmabuf.writable =
+                (linux_flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR ? 1u : 0u;
+            break;
         case LPR_FD_TABLE_KIND_PIPE:
             object->payload.pipe.flags = (uint32_t)linux_flags;
             break;
@@ -358,6 +377,10 @@ void lpr_control_sync_legacy_flags(uint64_t fd)
     case LPR_FD_TABLE_KIND_DRM:
         object->payload.drm.flags =
             lpr_control_merge_legacy_flags(object->payload.drm.flags, 0, status_flags);
+        break;
+    case LPR_FD_TABLE_KIND_DMABUF:
+        object->payload.dmabuf.flags =
+            lpr_control_merge_legacy_flags(object->payload.dmabuf.flags, 0, status_flags);
         break;
     case LPR_FD_TABLE_KIND_EVENT:
         object->payload.eventfd.flags =
@@ -739,6 +762,32 @@ int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     return 1;
 }
 
+int lpr_restore_bootstrap_dmabuf_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+{
+    struct pacha_fd_info info;
+    if (desc->handle == 0 || lpr_runtime_reserved_fd(fd) || lpr_control_fd_active(fd) ||
+        !lpr_native_fd_info(fd, &info) || info.kind != PACHA_FD_KIND_VMO ||
+        info.size < desc->offset_or_counter) {
+        return 0;
+    }
+    if (lpr_control_install_fd(
+        fd, LPR_FD_TABLE_KIND_DMABUF, desc->flags, desc->handle,
+        desc->offset_or_counter) != 0) {
+        return 0;
+    }
+    lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+    if (dmabuf == 0) {
+        lpr_control_close_fd(fd);
+        return 0;
+    }
+    dmabuf->active = 1;
+    dmabuf->writable = (desc->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR ? 1u : 0u;
+    dmabuf->flags = desc->flags;
+    dmabuf->token = desc->handle;
+    dmabuf->size = desc->offset_or_counter;
+    return 1;
+}
+
 int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     if (!lpr_fd_slot_available(fd)) {
@@ -806,6 +855,8 @@ int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
         return lpr_restore_bootstrap_tty_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_DRM:
         return lpr_restore_bootstrap_drm_fd(desc, fd);
+    case LPR_BOOTSTRAP_FD_DMABUF:
+        return lpr_restore_bootstrap_dmabuf_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_PIPE:
         return lpr_restore_bootstrap_pipe_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_EVENT:

@@ -97,6 +97,18 @@ int64_t lpr_linux_gettid(void)
     return lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID);
 }
 
+int lpr_linux_thread_exists(uint64_t tid)
+{
+    if (tid == 0) return 1;
+    if (tid > UINT32_MAX) return 0;
+    const int64_t current = lpr_linux_gettid();
+    if (current >= 0 && tid == (uint64_t)current) return 1;
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    const int found = lpr_thread_record_find((uint32_t)tid) != 0;
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+    return found;
+}
+
 int64_t lpr_linux_set_tid_address(uint64_t tid_address)
 {
     const int64_t raw_tid = lpr_linux_gettid();

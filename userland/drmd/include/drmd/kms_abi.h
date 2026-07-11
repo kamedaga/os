@@ -3,6 +3,10 @@
 #include <stdint.h>
 
 enum {
+    DRMD_IOCTL_GET_CAP = 0xc010640cu,
+    DRMD_IOCTL_GEM_CLOSE = 0x40086409u,
+    DRMD_IOCTL_PRIME_HANDLE_TO_FD = 0xc00c642du,
+    DRMD_IOCTL_PRIME_FD_TO_HANDLE = 0xc00c642eu,
     DRMD_IOCTL_SET_MASTER = 0x641eu,
     DRMD_IOCTL_DROP_MASTER = 0x641fu,
     DRMD_IOCTL_MODE_GETRESOURCES = 0xc04064a0u,
@@ -28,6 +32,16 @@ enum {
     DRMD_MODE_SUBPIXEL_UNKNOWN = 1u,
     DRMD_FORMAT_XRGB8888 = 0x34325258u,
     DRMD_MODE_PAGE_FLIP_EVENT = 1u << 0,
+    DRMD_MODE_FB_MODIFIERS = 1u << 1,
+    DRMD_FORMAT_MOD_LINEAR = 0u,
+
+    DRMD_CAP_DUMB_BUFFER = 0x1u,
+    DRMD_CAP_PRIME = 0x5u,
+    DRMD_CAP_ADDFB2_MODIFIERS = 0x10u,
+    DRMD_PRIME_CAP_IMPORT = 1u << 0,
+    DRMD_PRIME_CAP_EXPORT = 1u << 1,
+    DRMD_CLOEXEC = 0x80000u,
+    DRMD_RDWR = 0x2u,
 
     DRMD_EVENT_FLIP_COMPLETE = 0x02u,
 
@@ -57,6 +71,22 @@ typedef struct drmd_modeinfo {
     uint32_t type;
     char name[32];
 } drmd_modeinfo_t;
+
+typedef struct drmd_get_cap {
+    uint64_t capability;
+    uint64_t value;
+} drmd_get_cap_t;
+
+typedef struct drmd_prime_handle {
+    uint32_t handle;
+    uint32_t flags;
+    int32_t fd;
+} drmd_prime_handle_t;
+
+typedef struct drmd_gem_close {
+    uint32_t handle;
+    uint32_t pad;
+} drmd_gem_close_t;
 
 typedef struct drmd_mode_card_res {
     uint64_t fb_id_ptr;
