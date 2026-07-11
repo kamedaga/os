@@ -264,6 +264,8 @@ Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
 - kobox に DRM デバイスを立てる。候補は simpledrm (boot framebuffer 由来、依存最小) と virtio-gpu (本物の KMS/複数平面)。両者の .ko 依存関係と kobox shim の不足を調査し、根拠付きで選定 (最終的に Sway/wlroots が要求する ioctl 群を満たせる方)。/dev/dri/card0 を LPR プロセスから open できるところまで配線。
 - 受け入れ: fixture が card0 を open し DRM_IOCTL_VERSION / GET_CAP が返る。
 
+**結果 (2026-07-11, fb2445b + _kobox 0249fd3 で完了)**: 受け入れ達成 (open + VERSION=virtio_gpu 0.1.0 + GET_CAP(DUMB_BUFFER)=1)。選定は virtio-gpu — simpledrm は simple-framebuffer platform device への配線 (Limine fb の kobox 側 map) が未成立で M2.1 の境界を越える一方、virtio-gpu は既存 virtio PCI スタックに virtio_dma_buf を足すだけで kernel 変更不要、MODESET/ATOMIC/dumb/page-flip/event が wlroots 要件に直結。実装は termd の tty island と同型の**専用 drmd プロセス新設** (DRM module stack と file handle を隔離、filed は endpoint 受け渡し、LPR は FD 表現 + ioctl marshalling のみ)。Arch 6.8 実測レイアウトを根拠に DRM core shim を実装、VERSION/GET_CAP は実状態を返す (no-op 偽装なし)。固定 endpoint 挿入で LPR image ABI 更新 (互換分岐なし)。発見・修正 2 件: boot scratch 16MiB 超過 (drmd の section GC/-Oz で解消)、supervisor boot config の fd 245 衝突 (246 へシフト + ABI 一意性 assert)。スモークは drm-card0 を加えた 14 本体制。全検証 green、clang cold guest 5 秒。M2.2 残作業: MODE_* ioctl 群 / master / resource 列挙 / dumb create・map / DRM mmap の VMO 返却 / commit・scanout / event queue・vblank IRQ / GEM・fence helpers の実状態化 / window 復活との統合。
+
 **M2.2 QEMU window 復活 + dumb buffer modeset 描画**
 - pacgo の `Display` オプションを `pacgo run` / `pacgo qemu-test` から指定可能にし、window あり起動を復活させる (既定は従来どおり headless)。QMP screendump によるピクセル検証をスモーク手段として新設し、以後の Phase の標準検証にする。
 - KMS dumb buffer + modeset でグラデーションを表示する fixture (kmscube 以前の modeset-test 相当)。mmap した dumb buffer への書き込み → page flip まで。
