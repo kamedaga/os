@@ -250,21 +250,13 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 既知の資産 (2026-07-11 調査): kernel は limine framebuffer を `primary_display` (paddr/width/height/pitch, kernel/src/boot/init_setup.zig) として publish 済み。pacgo には `Display` オプションの配管が既にあり現状 "none" 固定 (pack/internal/qemu/qemu.go)。kobox の virtio モジュールは net 系のみ導入済み (tools/download_kobox_virtio_modules.sh)、GPU/input は未導入。
 
 ```
-Phase M1  前提修正 + QEMU window 復活 (framebuffer テストパターン)
-Phase M2  DRM/KMS (/dev/dri/card0、dumb buffer で modeset 描画)
+Phase M2  DRM/KMS (/dev/dri/card0、dumb buffer で modeset 描画、window 復活込み)
 Phase M3  mesa llvmpipe + GBM/EGL (kmscube 相当が window に出る)
 Phase M4  入力: virtio-input/evdev → libinput、seat 管理
 Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
 ```
 
-### Phase M1 — 前提修正と表示の第一歩
-
-
-**M1.1 QEMU window 復活 + framebuffer テストパターン**
-- pacgo の `Display` オプションを `pacgo run` / `pacgo qemu-test` から指定可能にし、window あり起動を復活させる (既定は従来どおり headless)。
-- kernel が publish 済みの `primary_display` を userland に配線し、limine framebuffer へ直接テストパターン (グラデーション + 識別マーカー) を描画する最小プログラムを rootfs に置く。どのプロセスが framebuffer を map するか (専用小デーモン or fixture 直叩き) は現構造への影響が最小の案を調査して選ぶ。
-- QMP screendump によるピクセル検証スモークを新設し、以後の Phase の標準検証手段にする。
-- 受け入れ: QEMU window にテストパターンが見える (手動) + screendump スモーク green + 既存回帰 green。
+(Phase M1 は完了済み: PTY teardown 安定化 186a71f / _kobox 658d5ac。framebuffer テストパターンは過去に実施済みのため独立タスクにせず、QEMU window 復活は M2.2 に含める — 2026-07-11 ユーザー判断)
 
 ### Phase M2 — DRM/KMS
 
@@ -272,9 +264,10 @@ Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
 - kobox に DRM デバイスを立てる。候補は simpledrm (boot framebuffer 由来、依存最小) と virtio-gpu (本物の KMS/複数平面)。両者の .ko 依存関係と kobox shim の不足を調査し、根拠付きで選定 (最終的に Sway/wlroots が要求する ioctl 群を満たせる方)。/dev/dri/card0 を LPR プロセスから open できるところまで配線。
 - 受け入れ: fixture が card0 を open し DRM_IOCTL_VERSION / GET_CAP が返る。
 
-**M2.2 dumb buffer modeset 描画**
+**M2.2 QEMU window 復活 + dumb buffer modeset 描画**
+- pacgo の `Display` オプションを `pacgo run` / `pacgo qemu-test` から指定可能にし、window あり起動を復活させる (既定は従来どおり headless)。QMP screendump によるピクセル検証をスモーク手段として新設し、以後の Phase の標準検証にする。
 - KMS dumb buffer + modeset でグラデーションを表示する fixture (kmscube 以前の modeset-test 相当)。mmap した dumb buffer への書き込み → page flip まで。
-- 受け入れ: window に表示 + screendump ピクセル検証 green。
+- 受け入れ: window に表示 (手動確認) + screendump ピクセル検証 green + 既存回帰 green。
 
 ### Phase M3 — mesa llvmpipe
 
