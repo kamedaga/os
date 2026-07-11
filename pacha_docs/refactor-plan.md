@@ -238,3 +238,25 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 | 3 | T1.3, T1.4, T2.2, T2.3, T3.0→T3.1→T3.3 (状態モデル再設計)→T3.0再開, T3.2 | 上記 |
 | 4 | T3.3 → T4.1, T2.2 → T4.2, T4.3, T4.4, T4.5 | Phase 1–3 |
 | 5 | T5.1 | 全部 |
+
+---
+
+# 第二章 — mesa3d
+
+第一章 (Phase 0〜5) で clang 耐性は達成した。第二章の目標は mesa3d のソフトウェアレンダリング (llvmpipe / softpipe 系) が PachaOS 上で動くこと。GPU パススルーは対象外。第一章と同じ方式で進める: 調査と修正を分離し、証拠なき修正はしない。実装は codex に委任し、タスクは実測の棚卸し結果から分解して追記する。
+
+### Phase M1 — 前提修正と棚卸し
+
+**M1.0 [termd/kobox] PTY teardown fault の根治 (第一章からの持ち越し)**
+- 症状: PTY 利用プロセスの子 (grep/sleep 等) 終了時の teardown で、Linux tty core `session_clear_tty+0x38` が `task->signal == NULL` のまま offset 0x1a0 を deref して fault (RIP 0x4a00e608, CR2=0x1a0、T4.6 セッションで証拠取得済み)。
+- 注意: 「close→fops->release 前の fake task signal state 同期欠落」仮説は一度実装して同一 fault が再現し否定済み。fault は close 経路ではなく子プロセス終了時にも出る。真因は未確定なので、再現ハーネスを先に固定し、fake task (stub pid) の signal/sighand フィールドのライフサイクルを証拠で確定してから最小修正する。
+- 併せて調査: PTY job-control で foreground pgrp が shell に残り、`setsid` + controlling TTY + `tcsetpgrp` でも移らない問題 (T4.6 で観測)。対話 Ctrl-C の実用性に直結するため、原因を特定し、修正が小さければ本タスクで、大きければ証拠付きで報告のみ。
+- 受け入れ: PTY 上で子プロセスを起動・終了させても fault しない再現スモークが green。既存 12 本 + unit 群も green 維持。
+
+**M1.1 mesa 導入と実行棚卸し**
+- alpine の mesa パッケージ群 (llvmpipe / osmesa / EGL surfaceless) を rootfs に導入し、最小の offscreen 描画 (osmesa render 1 枚、または surfaceless EGL + glReadPixels) を実行する。
+- 落ちる箇所・未実装 syscall・不足機能を証拠付きで棚卸しする。**このタスクでは修正しない** (T3.0 の教訓: 点修正は棚卸しを汚す)。判明した各問題を M1.2 以降のタスクに分解して本計画へ追記する。
+- 予想される領域: 大規模 mmap/スレッド (llvmpipe は worker thread プール)、shm/memfd、dma-buf 不在時の fallback、/dev/dri 不在の扱い、環境変数での driver 強制。
+- 受け入れ: 棚卸しレポート (問題・証拠・想定領域・タスク分解案) が揃うこと。
+
+**M1.2 以降** — M1.1 の棚卸し結果から分解して追記する。最終受け入れ (章の完了基準) は「offscreen 描画 1 枚のピクセル値検証スモーク + 描画反復のリーク耐久スモークが green」。
