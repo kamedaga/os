@@ -638,3 +638,16 @@ void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle)
         memset(dumb, 0, sizeof(*dumb));
     }
 }
+
+void drmd_kms_get_state_counts(drmd_kms_state_counts_t *out_counts)
+{
+    if (out_counts == NULL) return;
+    memset(out_counts, 0, sizeof(*out_counts));
+    out_counts->master_handle = kms.master_handle;
+    for (size_t i = 0; i < DRMD_KMS_FB_MAX; i++) {
+        out_counts->fb += kms.fb[i].active ? 1u : 0u;
+    }
+    for (size_t i = 0; i < DRMD_KMS_DUMB_MAX; i++) {
+        out_counts->dumb += kms.dumb[i].active ? 1u : 0u;
+    }
+}

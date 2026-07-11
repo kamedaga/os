@@ -74,6 +74,15 @@ typedef struct drmd_drm_version {
 static drmd_handle_t handles[DRMD_HANDLE_MAX];
 static uint64_t next_handle = 1;
 
+static unsigned active_handle_count(void)
+{
+    unsigned count = 0;
+    for (size_t i = 0; i < DRMD_HANDLE_MAX; i++) {
+        count += handles[i].active ? 1u : 0u;
+    }
+    return count;
+}
+
 static void write_ptr(void *base, size_t offset, const void *value)
 {
     memcpy((uint8_t *)base + offset, &value, sizeof(value));
@@ -300,6 +309,15 @@ int drmd_drm_island_close(struct drmd_drm_island *island, uint64_t id)
         }
     }
     memset(handle, 0, sizeof(*handle));
+    drmd_kms_state_counts_t counts;
+    drmd_kms_get_state_counts(&counts);
+    printf("[drmd] close handle=%llu status=%d state handles=%u fb=%u dumb=%u master=%llu\n",
+        (unsigned long long)id,
+        status,
+        active_handle_count(),
+        counts.fb,
+        counts.dumb,
+        (unsigned long long)counts.master_handle);
     return status;
 }
 

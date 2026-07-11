@@ -830,6 +830,20 @@ apps:
     file: "tests/fixtures/mesa_inventory.sh"
     out: "LPRMESAI.SH"
     rootfs: "/cmd/mesa_inventory.sh"
+  lpr_drm_restart_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_drm_restart_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_mesa_inventory.sh", ".artifacts/userland-fixtures/lpr_drm_restart_smoke.elf", "userland/fixtures/src/wsl_musl/lpr_drm_restart_smoke.c"]
+      input:
+        - "tools/build_wsl_mesa_inventory.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_drm_restart_smoke.c"
+    out: "LPRDRMR.ELF"
+    rootfs: "/cmd/lpr_drm_restart_smoke.elf"
+  lpr_drm_restart_smoke_script:
+    file: "tests/fixtures/drm_restart_smoke.sh"
+    out: "LPRDRMR.SH"
+    rootfs: "/cmd/drm_restart_smoke.sh"
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"

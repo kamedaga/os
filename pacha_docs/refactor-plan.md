@@ -325,6 +325,10 @@ fixture `lpr_mesa_inventory` は target `a`〜`e` を持ち、最終 target `e` 
 - rapid compositor restart を模した open→GBM/EGL→close→即 reopen で master が同期的に移ることを証明する。drmd handle close と LPR process teardown の順序を修正対象とし、kernel へ移さない。
 - 受け入れ: 連続 20 restart で SET_MASTER/SETCRTC が EBUSY/EACCES にならず object leak なし。
 
+**結果 (2026-07-11, working tree / commit なし)**: 受け入れ達成。最小再現条件は fresh boot で Mesa stage `a` を1 processだけ完了させ、待ち時間0 msで別 processの stage `e`を起動することだった。修正前は最初の後続 `SET_MASTER` が `EBUSY`、fresh単発 `e`は成功する。待ち時間で解消するレースではなく、LPRのprocess-exit cleanupがFILED handleだけをcloseし、DRM handleを一度もdrmdへ送らないlifetime欠落だった。原因traceは、pid=2終了直前にfd 3/4が同じDRM handle=1 (refcount=2)を保持 → drmdにclose到達なし → 次processがhandle=2をopenしてもmaster=1・active handles=2 → `SET_MASTER(handle=2)=-16`、という列を記録した。通常の`close(2)`は元から同期RPC完了後に返るため、修正は`lpr_linux_prepare_process_exit()`のobject walkへDRM backend handleの同期closeを1分岐追加しただけで、kernel/ABI/_kobox変更はない。一時計測は全除去済み。
+
+restart smokeを新設し、Mesa DSOをロード済みのparentから20 childをfork/waitで直列起動する。各childは独立processとしてopen → GBM device作成 → EGL 1.5 initialize → SET_MASTER → 1024x768 dumb/FB作成 → SETCRTC → application cleanup → card0をprocess teardownに残して終了し、child間sleepは0 ms。20/20でEBUSY/EACCESなし、drmdの各close完了後20回すべて`handles=0 fb=0 dumb=0 master=0`、先頭handle=1と末尾handle=20の前後状態一致をrunnerがserialから機械検証した (host 18.8秒)。20回を別々にcold execする予備fixtureは9〜11回目に3 MiB DMA VMOの物理連続化が`PACHA_ERR_INVALID`となる別のcold-exec断片化を露呈したため、master handoff検証からDSO pagingの交絡を除いた。これはdrmd count/IOVA回収とは別で、M3.6のcold-path計測候補とする。既存QEMU 16本、kernel test、filed VFS、termd unit、service ABI layout、pack Go testは全green。clang coldはguest 5秒 / host 9秒で20秒未満維持、mesa-inventoryはhost 25秒でgreen。
+
 **M3.3 page-flip event / vblank / DRM event queue**
 - async PAGE_FLIP_EVENT、vblank/display IRQ、per-file event queue、poll/read を実状態で実装。同期 flip fallback は作らない。
 - 追加観測 (2026-07-11 ユーザー手動確認): 三角形 (単発フレーム) は window に表示されたが、cube 系の連続アニメーションは表示されず青い背景のみ。kmscube 相当は PAGE_FLIP_EVENT 待ちでフレームループを回すため event queue 未実装と符合するが、原因は本タスクで証拠を取って確定すること (断定しない)。

@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${1:-.artifacts/userland-fixtures/lpr_mesa_inventory.elf}"
-src="${repo_root}/userland/fixtures/src/wsl_musl/lpr_mesa_inventory.c"
+src="${repo_root}/${2:-userland/fixtures/src/wsl_musl/lpr_mesa_inventory.c}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 mesa_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-root"
 mesa_dev_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-dev-root"

@@ -487,6 +487,13 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
             object->payload.filed.handle = 0;
             object->backend_id = 0;
             (void)lpr_filed_close_handle(handle);
+        } else if (object->kind == LPR_FD_TABLE_KIND_DRM &&
+            object->payload.drm.handle != 0)
+        {
+            const uint64_t handle = object->payload.drm.handle;
+            object->payload.drm.handle = 0;
+            object->backend_id = 0;
+            (void)lpr_drm_close_handle(handle);
         }
     }
     if (lpr_cwd_handle != 0) {
