@@ -17,7 +17,7 @@ static int set_inherit(int fd, int enabled)
 }
 
 int lpr_exec_prepare_inherit_fds(
-    const filed_v2_exec_path_t *request,
+    const filed_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
@@ -29,10 +29,10 @@ int lpr_exec_prepare_inherit_fds(
         return -22;
     }
     *out_prepared_count = 0;
-    if (inherit_fd_count > FILED_V2_EXEC_MAX_INHERIT_FDS) {
+    if (inherit_fd_count > FILED_EXEC_MAX_INHERIT_FDS) {
         return -22;
     }
-    if ((request->flags & FILED_V2_EXEC_INHERIT_FDS) != 0) {
+    if ((request->flags & FILED_EXEC_INHERIT_FDS) != 0) {
         if (inherit_fds == NULL && inherit_fd_count != 0) {
             return -22;
         }
@@ -44,7 +44,7 @@ int lpr_exec_prepare_inherit_fds(
             prepared[prepared_count++] = fd;
         }
     }
-    if ((request->flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0) {
+    if ((request->flags & FILED_EXEC_BOOTSTRAP_FD) != 0) {
         if (bootstrap_fd < 16 || set_inherit(bootstrap_fd, 1) != 0) {
             return -13;
         }
@@ -132,12 +132,12 @@ static int format_boot_env(char *buf, size_t size, const char *name, uint64_t va
     return 0;
 }
 
-static uint64_t linux_boot_env_count(const filed_v2_exec_path_t *request)
+static uint64_t linux_boot_env_count(const filed_exec_path_t *request)
 {
-    return request != NULL && (request->flags & FILED_V2_EXEC_LINUX_BOOTSTRAP) != 0 ? 5u : 0u;
+    return request != NULL && (request->flags & FILED_EXEC_LINUX_BOOTSTRAP) != 0 ? 5u : 0u;
 }
 
-static uint64_t request_argc(const filed_v2_exec_path_t *request)
+static uint64_t request_argc(const filed_exec_path_t *request)
 {
     if (request == NULL || request->argc == 0) {
         return 1;
@@ -145,27 +145,27 @@ static uint64_t request_argc(const filed_v2_exec_path_t *request)
     return request->argc;
 }
 
-static const char *request_arg(const filed_v2_exec_path_t *request, uint64_t index)
+static const char *request_arg(const filed_exec_path_t *request, uint64_t index)
 {
     if (request == NULL) {
         return "";
     }
     if (request->argc != 0 && index < request->argc) {
-        return filed_v2_exec_string(request, request->argv[index]);
+        return filed_exec_string(request, request->argv[index]);
     }
     return request->path;
 }
 
-int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *request, int bootstrap_fd, int start_thread)
+int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request, int bootstrap_fd, int start_thread)
 {
     if (plan == NULL || request == NULL || plan->process_fd < 16) {
         return -22;
     }
     const uint64_t boot_envc = linux_boot_env_count(request);
-    if (request->argc > FILED_V2_EXEC_MAX_ARGS ||
-        request->envc > FILED_V2_EXEC_MAX_ENVS ||
-        boot_envc > FILED_V2_EXEC_MAX_ENVS ||
-        request->envc + boot_envc > FILED_V2_EXEC_MAX_ENVS)
+    if (request->argc > FILED_EXEC_MAX_ARGS ||
+        request->envc > FILED_EXEC_MAX_ENVS ||
+        boot_envc > FILED_EXEC_MAX_ENVS ||
+        request->envc + boot_envc > FILED_EXEC_MAX_ENVS)
     {
         return -22;
     }
@@ -218,8 +218,8 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *reque
     uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
     const uint64_t argc = request_argc(request);
     const uint64_t envc = request->envc + boot_envc;
-    uint64_t argv_va[FILED_V2_EXEC_MAX_ARGS];
-    uint64_t envp_va[FILED_V2_EXEC_MAX_ENVS];
+    uint64_t argv_va[FILED_EXEC_MAX_ARGS];
+    uint64_t envp_va[FILED_EXEC_MAX_ENVS];
     char boot_env[5][64];
     memset(argv_va, 0, sizeof(argv_va));
     memset(envp_va, 0, sizeof(envp_va));
@@ -244,7 +244,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *reque
             stack,
             &sp,
             stack_base,
-            filed_v2_exec_string(request, request->envp[i - 1u]),
+            filed_exec_string(request, request->envp[i - 1u]),
             &envp_va[i - 1u]);
         if (status != 0) {
             (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
@@ -288,7 +288,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_v2_exec_path_t *reque
     sp &= ~(LPR_IMAGE_INITIAL_STACK_ALIGNMENT - 1u);
 
     const int has_bootstrap =
-        (request->flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0 && bootstrap_fd >= 16;
+        (request->flags & FILED_EXEC_BOOTSTRAP_FD) != 0 && bootstrap_fd >= 16;
     if (push_u64(stack, &sp, 0) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_NULL) != 0 ||
         (has_bootstrap &&

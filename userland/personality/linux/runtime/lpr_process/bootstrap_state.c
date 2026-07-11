@@ -155,7 +155,7 @@ void lpr_cwd_init(void)
         return;
     }
     if (lpr_supervisor_enabled) {
-        lprs_v2_process_state_t state;
+        lprs_process_state_t state;
         if (lpr_supervisor_get_state(&state) == 0 &&
             state.cwd[0] == '/' &&
             lpr_path_is_terminated(state.cwd, sizeof(state.cwd)))
@@ -183,7 +183,7 @@ void lpr_linux_process_state_init(void)
         1;
     if (lpr_load_bootstrap()) {
         if (lpr_supervisor_enabled) {
-            lprs_v2_process_state_t state;
+            lprs_process_state_t state;
             const int state_status = lpr_supervisor_get_state(&state);
             if (state_status != 0 ||
                 state.pid == 0 ||

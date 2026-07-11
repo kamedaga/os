@@ -8,14 +8,14 @@
 #include <string.h>
 
 #if defined(NETD_WITH_LIBUINET)
-#include "filed/ipc_protocol_v2.h"
+#include "filed/ipc_protocol.h"
 #include "linux_subsystem/net/net_device.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
-#include "netd/ipc_protocol_v2.h"
+#include "netd/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 #include "uinet_api.h"
@@ -1257,7 +1257,7 @@ static void *netd_filed_payload(void *page)
     return page == NULL ? NULL : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
 }
 
-static int netd_filed_call_v2(
+static int netd_filed_call(
     uint32_t op,
     int page_fd,
     void *page,
@@ -1277,10 +1277,10 @@ static int netd_filed_call_v2(
     }
 
     const uint64_t request_id = ++g_netd_filed_request_id;
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
+    header->service_id = FILED_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -1317,12 +1317,12 @@ static int netd_filed_call_v2(
     if (recv_status != 0) {
         return recv_status;
     }
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->service_id != FILED_SERVICE_ID ||
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
@@ -1347,10 +1347,10 @@ static int netd_filed_close_handle(uint64_t handle)
     if (status != 0) {
         return status;
     }
-    filed_v2_handle_request_t *request = (filed_v2_handle_request_t *)netd_filed_payload(page);
+    filed_handle_request_t *request = (filed_handle_request_t *)netd_filed_payload(page);
     request->handle = handle;
-    status = netd_filed_call_v2(
-        FILED_V2_OP_VFS_CLOSE,
+    status = netd_filed_call(
+        FILED_OP_VFS_CLOSE,
         page_fd,
         page,
         sizeof(*request),
@@ -1376,8 +1376,8 @@ static int netd_filed_file_vmo(uint64_t handle, uint64_t file_offset, uint64_t l
         return status;
     }
 
-    filed_v2_file_vmo_request_t *file_vmo =
-        (filed_v2_file_vmo_request_t *)netd_filed_payload(page);
+    filed_file_vmo_request_t *file_vmo =
+        (filed_file_vmo_request_t *)netd_filed_payload(page);
     memset(file_vmo, 0, sizeof(*file_vmo));
     file_vmo->handle = handle;
     file_vmo->file_offset = file_offset;
@@ -1387,8 +1387,8 @@ static int netd_filed_file_vmo(uint64_t handle, uint64_t file_offset, uint64_t l
     memset(&reply_fd_item, 0, sizeof(reply_fd_item));
     struct pacha_ipc_msg reply;
     memset(&reply, 0, sizeof(reply));
-    status = netd_filed_call_v2(
-        FILED_V2_OP_VFS_FILE_VMO,
+    status = netd_filed_call(
+        FILED_OP_VFS_FILE_VMO,
         page_fd,
         page,
         sizeof(*file_vmo),
@@ -1418,17 +1418,17 @@ static int netd_filed_open_readonly(const char *path, uint64_t *out_handle)
         return status;
     }
 
-    filed_v2_path_request_t *open_req = (filed_v2_path_request_t *)netd_filed_payload(page);
+    filed_path_request_t *open_req = (filed_path_request_t *)netd_filed_payload(page);
     memset(open_req, 0, sizeof(*open_req));
     open_req->dir_handle = 0;
-    open_req->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_STAT;
-    open_req->flags = FILED_V2_OPEN_CLOEXEC;
+    open_req->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
+    open_req->flags = FILED_OPEN_CLOEXEC;
     snprintf(open_req->path, sizeof(open_req->path), "%s", path);
 
     printf("[netd] filed open begin path=%s\n", path);
     uint64_t handle = 0;
-    status = netd_filed_call_v2(
-        FILED_V2_OP_VFS_OPENAT,
+    status = netd_filed_call(
+        FILED_OP_VFS_OPENAT,
         page_fd,
         page,
         sizeof(*open_req),
@@ -2511,18 +2511,18 @@ int netd_libuinet_socket_open(uint64_t domain, uint64_t type, uint64_t protocol,
     }
     *out_handle = 0;
 #if defined(NETD_WITH_LIBUINET)
-    if (g_libuinet_state != NETD_LIBUINET_READY || domain != NETD_V2_AF_INET) {
+    if (g_libuinet_state != NETD_LIBUINET_READY || domain != NETD_AF_INET) {
         return -95;
     }
     int uinet_type = 0;
     int uinet_protocol = 0;
-    if (type == NETD_V2_SOCK_DGRAM) {
+    if (type == NETD_SOCK_DGRAM) {
         uinet_type = UINET_SOCK_DGRAM;
         uinet_protocol = protocol == 0 ? UINET_IPPROTO_UDP : (int)protocol;
         if (uinet_protocol != UINET_IPPROTO_UDP) {
             return -93;
         }
-    } else if (type == NETD_V2_SOCK_STREAM) {
+    } else if (type == NETD_SOCK_STREAM) {
         uinet_type = UINET_SOCK_STREAM;
         uinet_protocol = protocol == 0 ? UINET_IPPROTO_TCP : (int)protocol;
         if (uinet_protocol != UINET_IPPROTO_TCP) {
@@ -2553,7 +2553,7 @@ int netd_libuinet_socket_open(uint64_t domain, uint64_t type, uint64_t protocol,
         return status == 0 ? -5 : -status;
     }
     uinet_sosetnonblocking(socket, 1);
-    if (type == NETD_V2_SOCK_STREAM) {
+    if (type == NETD_SOCK_STREAM) {
         int optval = 1;
         (void)uinet_sosetsockopt(socket, UINET_IPPROTO_TCP, UINET_TCP_NODELAY, &optval, sizeof(optval));
     }
@@ -2656,7 +2656,7 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
     }
     struct uinet_sockaddr_in sin;
     struct uinet_sockaddr *send_addr = NULL;
-    if (slot->type == NETD_V2_SOCK_DGRAM && (addr_be != 0 || port_be != 0)) {
+    if (slot->type == NETD_SOCK_DGRAM && (addr_be != 0 || port_be != 0)) {
         memset(&sin, 0, sizeof(sin));
         sin.sin_len = sizeof(sin);
         sin.sin_family = UINET_AF_INET;
@@ -2683,7 +2683,7 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
     *out_sent = len - (size_t)uio.uio_resid;
     slot->send_calls++;
     slot->send_bytes += (uint64_t)*out_sent;
-    if (g_libuinet_trace && slot->type == NETD_V2_SOCK_STREAM && *out_sent != 0 && slot->send_calls <= 8u) {
+    if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM && *out_sent != 0 && slot->send_calls <= 8u) {
         slot->send_preview_logged = 1;
         netd_libuinet_print_ascii_preview("[netd] socket stream send", slot->handle, data, *out_sent);
     }
@@ -2718,7 +2718,7 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint
         netd_libuinet_api_pump(1);
     }
     if (readable == 0) {
-        if (g_libuinet_trace && slot->type == NETD_V2_SOCK_STREAM && slot->recv_bytes != 0 && !slot->recv_idle_logged) {
+        if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM && slot->recv_bytes != 0 && !slot->recv_idle_logged) {
             slot->recv_idle_logged = 1;
             printf("[netd] socket recv idle handle=%llu calls=%llu bytes=%llu state=0x%x error=%d\n",
                    (unsigned long long)slot->handle,
@@ -2736,7 +2736,7 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint
             return -netd_libuinet_errno_to_linux(error);
         }
         *out_received = 0;
-        if (g_libuinet_trace && slot->type == NETD_V2_SOCK_STREAM) {
+        if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM) {
             printf("[netd] socket recv eof handle=%llu calls=%llu bytes=%llu state=0x%x error=%d\n",
                    (unsigned long long)slot->handle,
                    (unsigned long long)slot->recv_calls,
@@ -2772,7 +2772,7 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint
     slot->recv_calls++;
     slot->recv_bytes += (uint64_t)*out_received;
     slot->recv_idle_logged = 0;
-    if (g_libuinet_trace && slot->type == NETD_V2_SOCK_STREAM && *out_received != 0 && slot->recv_calls <= 2u) {
+    if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM && *out_received != 0 && slot->recv_calls <= 2u) {
         slot->recv_preview_logged = 1;
         netd_libuinet_print_ascii_preview("[netd] socket stream recv", slot->handle, data, *out_received);
     }
@@ -2803,23 +2803,23 @@ int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_re
     int writable_snapshot = -2;
     if (error != 0 && error != UINET_EINPROGRESS && error != UINET_EALREADY) {
         *out_error = netd_libuinet_errno_to_linux(error);
-        *out_revents |= NETD_V2_POLLERR;
+        *out_revents |= NETD_POLLERR;
     }
-    if ((events & NETD_V2_POLLIN) != 0) {
+    if ((events & NETD_POLLIN) != 0) {
         const int readable = uinet_soreadable(slot->socket, 0);
         readable_snapshot = readable;
         if (readable > 0) {
-            *out_revents |= NETD_V2_POLLIN;
+            *out_revents |= NETD_POLLIN;
             slot->recv_idle_logged = 0;
         } else if (readable < 0) {
             const int read_error = uinet_sogeterror(slot->socket);
             if (read_error != 0 && read_error != UINET_EINPROGRESS && read_error != UINET_EALREADY) {
                 *out_error = netd_libuinet_errno_to_linux(read_error);
-                *out_revents |= NETD_V2_POLLERR;
+                *out_revents |= NETD_POLLERR;
             } else {
-                *out_revents |= NETD_V2_POLLIN;
+                *out_revents |= NETD_POLLIN;
             }
-        } else if (g_libuinet_trace && slot->type == NETD_V2_SOCK_STREAM && slot->recv_bytes != 0 && !slot->recv_idle_logged) {
+        } else if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM && slot->recv_bytes != 0 && !slot->recv_idle_logged) {
             slot->recv_idle_logged = 1;
             printf("[netd] socket poll idle handle=%llu calls=%llu bytes=%llu state=0x%x error=%d events=0x%x\n",
                    (unsigned long long)slot->handle,
@@ -2831,19 +2831,19 @@ int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_re
             fflush(stdout);
         }
     }
-    if ((events & NETD_V2_POLLOUT) != 0) {
+    if ((events & NETD_POLLOUT) != 0) {
         const int writable = uinet_sowritable(slot->socket, 0);
         writable_snapshot = writable;
         if (writable > 0 || ((state & UINET_SS_ISCONNECTED) != 0 && error == 0)) {
-            *out_revents |= NETD_V2_POLLOUT;
+            *out_revents |= NETD_POLLOUT;
         } else if (writable < 0) {
-            *out_revents |= NETD_V2_POLLERR;
+            *out_revents |= NETD_POLLERR;
         }
     }
-    if (slot->type == NETD_V2_SOCK_STREAM) {
+    if (slot->type == NETD_SOCK_STREAM) {
         if (*out_revents != 0) {
-            if ((g_libuinet_trace || (*out_revents & NETD_V2_POLLERR) != 0) &&
-                (!slot->poll_ready_logged || (*out_revents & NETD_V2_POLLERR) != 0)) {
+            if ((g_libuinet_trace || (*out_revents & NETD_POLLERR) != 0) &&
+                (!slot->poll_ready_logged || (*out_revents & NETD_POLLERR) != 0)) {
                 slot->poll_ready_logged = 1;
                 printf("[netd] socket poll ready handle=%llu polls=%llu events=0x%x revents=0x%x state=0x%x error=%d readable=%d writable=%d bytes=%llu\n",
                        (unsigned long long)slot->handle,
@@ -2886,7 +2886,7 @@ int netd_libuinet_socket_close(uint64_t handle)
     if (slot == NULL) {
         return -9;
     }
-    if (slot->type == NETD_V2_SOCK_STREAM) {
+    if (slot->type == NETD_SOCK_STREAM) {
         const int close_error = uinet_sogeterror(slot->socket);
         if (g_libuinet_trace || close_error != 0) {
             printf("[netd] socket close handle=%llu calls=%llu bytes=%llu state=0x%x error=%d\n",

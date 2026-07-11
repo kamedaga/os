@@ -2,24 +2,24 @@
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
-    uint64_t rights = FILED_V2_RIGHT_STAT;
+    uint64_t rights = FILED_RIGHT_STAT;
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
-        rights |= FILED_V2_RIGHT_READ | FILED_V2_RIGHT_GETDENTS;
+        rights |= FILED_RIGHT_READ | FILED_RIGHT_GETDENTS;
     }
     if (accmode == LPR_LINUX_O_WRONLY || accmode == LPR_LINUX_O_RDWR) {
-        rights |= FILED_V2_RIGHT_WRITE;
+        rights |= FILED_RIGHT_WRITE;
     }
     if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
         rights |=
-            FILED_V2_RIGHT_LOOKUP |
-            FILED_V2_RIGHT_GETDENTS |
-            FILED_V2_RIGHT_CREATE |
-            FILED_V2_RIGHT_REMOVE |
-            FILED_V2_RIGHT_RENAME;
+            FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_GETDENTS |
+            FILED_RIGHT_CREATE |
+            FILED_RIGHT_REMOVE |
+            FILED_RIGHT_RENAME;
     }
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
-        rights |= FILED_V2_RIGHT_CREATE | FILED_V2_RIGHT_WRITE;
+        rights |= FILED_RIGHT_CREATE | FILED_RIGHT_WRITE;
     }
     return rights;
 }
@@ -28,28 +28,28 @@ uint64_t lpr_open_flags(uint64_t flags)
 {
     uint64_t out = 0;
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
-        out |= FILED_V2_OPEN_CREATE;
+        out |= FILED_OPEN_CREATE;
     }
     if ((flags & LPR_LINUX_O_EXCL) != 0) {
-        out |= FILED_V2_OPEN_EXCLUSIVE;
+        out |= FILED_OPEN_EXCLUSIVE;
     }
     if ((flags & LPR_LINUX_O_TRUNC) != 0) {
-        out |= FILED_V2_OPEN_TRUNCATE;
+        out |= FILED_OPEN_TRUNCATE;
     }
     if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
-        out |= FILED_V2_OPEN_DIRECTORY;
+        out |= FILED_OPEN_DIRECTORY;
     }
     if ((flags & LPR_LINUX_O_NOFOLLOW) != 0) {
-        out |= FILED_V2_OPEN_NOFOLLOW;
+        out |= FILED_OPEN_NOFOLLOW;
     }
     if ((flags & LPR_LINUX_O_CLOEXEC) != 0) {
-        out |= FILED_V2_OPEN_CLOEXEC;
+        out |= FILED_OPEN_CLOEXEC;
     }
     if ((flags & LPR_LINUX_O_APPEND) != 0) {
-        out |= FILED_V2_OPEN_APPEND;
+        out |= FILED_OPEN_APPEND;
     }
     if ((flags & LPR_LINUX_O_NONBLOCK) != 0) {
-        out |= FILED_V2_OPEN_NONBLOCK;
+        out |= FILED_OPEN_NONBLOCK;
     }
     return out;
 }
@@ -95,7 +95,7 @@ int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
 int64_t lpr_filed_close_handle(uint64_t handle)
 {
     uint64_t ignored = 0;
-    return lpr_filed_call(FILED_V2_OP_VFS_CLOSE, -1, handle, &ignored);
+    return lpr_filed_call(FILED_OP_VFS_CLOSE, -1, handle, &ignored);
 }
 
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle)
@@ -112,12 +112,12 @@ int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_h
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_handle_flags_t *flags = (filed_v2_handle_flags_t *)page;
+    filed_handle_flags_t *flags = (filed_handle_flags_t *)page;
     lpr_memset(flags, 0, sizeof(*flags));
     flags->handle = handle;
     flags->fd_flags = fd_flags;
     uint64_t dup_handle = 0;
-    const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_DUP, page_fd, 0, &dup_handle);
+    const int64_t status = lpr_filed_call(FILED_OP_VFS_DUP, page_fd, 0, &dup_handle);
     lpr_destroy_wire_page(page_fd, page);
     if (status != 0) {
         return status;
@@ -132,7 +132,7 @@ int64_t lpr_linux_fsync(uint64_t fd)
         return -LPR_LINUX_EINVAL;
     }
     uint64_t ignored = 0;
-    return lpr_filed_call(FILED_V2_OP_VFS_FSYNC, -1, lpr_fd_filed_payload(fd)->handle, &ignored);
+    return lpr_filed_call(FILED_OP_VFS_FSYNC, -1, lpr_fd_filed_payload(fd)->handle, &ignored);
 }
 
 int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
@@ -148,12 +148,12 @@ int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_truncate_t *truncate = (filed_v2_truncate_t *)page;
+    filed_truncate_t *truncate = (filed_truncate_t *)page;
     lpr_memset(truncate, 0, sizeof(*truncate));
     truncate->handle = lpr_fd_filed_payload(fd)->handle;
     truncate->size = length;
     uint64_t ignored = 0;
-    const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_TRUNCATE, page_fd, 0, &ignored);
+    const int64_t status = lpr_filed_call(FILED_OP_VFS_TRUNCATE, page_fd, 0, &ignored);
     lpr_destroy_wire_page(page_fd, page);
     if (status == 0) {
         lpr_page_cache_clear();
@@ -173,8 +173,8 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
         return -LPR_LINUX_EINVAL;
     }
     const char *name = (const char *)(uintptr_t)name_raw;
-    const size_t name_length = lpr_strnlen(name, FILED_V2_MEMFD_NAME_BYTES);
-    if (name_length >= FILED_V2_MEMFD_NAME_BYTES) {
+    const size_t name_length = lpr_strnlen(name, FILED_MEMFD_NAME_BYTES);
+    if (name_length >= FILED_MEMFD_NAME_BYTES) {
         return -LPR_LINUX_EINVAL;
     }
 
@@ -183,17 +183,17 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_memfd_create_t *memfd = (filed_v2_memfd_create_t *)page;
+    filed_memfd_create_t *memfd = (filed_memfd_create_t *)page;
     lpr_memset(memfd, 0, sizeof(*memfd));
     memfd->flags =
-        ((flags & LPR_LINUX_MFD_CLOEXEC) != 0 ? FILED_V2_MEMFD_CLOEXEC : 0) |
-        ((flags & LPR_LINUX_MFD_ALLOW_SEALING) != 0 ? FILED_V2_MEMFD_ALLOW_SEALING : 0);
+        ((flags & LPR_LINUX_MFD_CLOEXEC) != 0 ? FILED_MEMFD_CLOEXEC : 0) |
+        ((flags & LPR_LINUX_MFD_ALLOW_SEALING) != 0 ? FILED_MEMFD_ALLOW_SEALING : 0);
     lpr_memcpy(memfd->name, name, name_length);
     memfd->name[name_length] = '\0';
 
     uint64_t handle = 0;
     const int64_t status = lpr_filed_call(
-        FILED_V2_OP_VFS_MEMFD_CREATE,
+        FILED_OP_VFS_MEMFD_CREATE,
         page_fd,
         0,
         &handle);
@@ -216,7 +216,7 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
 int64_t lpr_linux_sync(void)
 {
     uint64_t ignored = 0;
-    return lpr_filed_call(FILED_V2_OP_VFS_SYNC_ALL, -1, 0, &ignored);
+    return lpr_filed_call(FILED_OP_VFS_SYNC_ALL, -1, 0, &ignored);
 }
 
 int64_t lpr_linux_mkdirat(uint64_t dirfd, uint64_t path_raw, uint64_t mode)
@@ -234,14 +234,14 @@ int64_t lpr_linux_mkdirat(uint64_t dirfd, uint64_t path_raw, uint64_t mode)
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_mkdir_t *mkdir_req = (filed_v2_mkdir_t *)page;
+    filed_mkdir_t *mkdir_req = (filed_mkdir_t *)page;
     lpr_memset(mkdir_req, 0, sizeof(*mkdir_req));
     mkdir_req->dir_handle = dir_handle;
     mkdir_req->mode = mode;
     status = lpr_copy_path(mkdir_req->name, sizeof(mkdir_req->name), path);
     uint64_t ignored = 0;
     if (status == 0) {
-        status = lpr_filed_call(FILED_V2_OP_VFS_MKDIR, page_fd, 0, &ignored);
+        status = lpr_filed_call(FILED_OP_VFS_MKDIR, page_fd, 0, &ignored);
     }
     lpr_destroy_wire_page(page_fd, page);
     return status;
@@ -266,15 +266,15 @@ int64_t lpr_linux_unlinkat(uint64_t dirfd, uint64_t path_raw, uint64_t flags)
     if (page_fd < 0) {
         return page_fd;
     }
-    uint32_t op = FILED_V2_OP_VFS_UNLINK;
+    uint32_t op = FILED_OP_VFS_UNLINK;
     if ((flags & LPR_LINUX_AT_REMOVEDIR) != 0) {
-        filed_v2_rmdir_t *rmdir_req = (filed_v2_rmdir_t *)page;
+        filed_rmdir_t *rmdir_req = (filed_rmdir_t *)page;
         lpr_memset(rmdir_req, 0, sizeof(*rmdir_req));
         rmdir_req->dir_handle = dir_handle;
         status = lpr_copy_path(rmdir_req->name, sizeof(rmdir_req->name), path);
-        op = FILED_V2_OP_VFS_RMDIR;
+        op = FILED_OP_VFS_RMDIR;
     } else {
-        filed_v2_unlink_t *unlink_req = (filed_v2_unlink_t *)page;
+        filed_unlink_t *unlink_req = (filed_unlink_t *)page;
         lpr_memset(unlink_req, 0, sizeof(*unlink_req));
         unlink_req->dir_handle = dir_handle;
         status = lpr_copy_path(unlink_req->name, sizeof(unlink_req->name), path);
@@ -308,7 +308,7 @@ int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t n
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_rename_t *rename_req = (filed_v2_rename_t *)page;
+    filed_rename_t *rename_req = (filed_rename_t *)page;
     lpr_memset(rename_req, 0, sizeof(*rename_req));
     rename_req->old_dir_handle = old_dir_handle;
     rename_req->new_dir_handle = new_dir_handle;
@@ -318,7 +318,7 @@ int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t n
     }
     uint64_t ignored = 0;
     if (status == 0) {
-        status = lpr_filed_call(FILED_V2_OP_VFS_RENAME, page_fd, 0, &ignored);
+        status = lpr_filed_call(FILED_OP_VFS_RENAME, page_fd, 0, &ignored);
     }
     lpr_destroy_wire_page(page_fd, page);
     return status;
@@ -370,19 +370,19 @@ int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t li
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_symlink_t *symlink_req = (filed_v2_symlink_t *)page;
+    filed_symlink_t *symlink_req = (filed_symlink_t *)page;
     lpr_memset(symlink_req, 0, sizeof(*symlink_req));
     symlink_req->dir_handle = dir_handle;
     status = lpr_copy_path(symlink_req->name, sizeof(symlink_req->name), linkpath);
-    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_V2_SYMLINK_TARGET_BYTES);
-    if (status == 0 && (target_len == 0 || target_len >= FILED_V2_SYMLINK_TARGET_BYTES)) {
+    const uint64_t target_len = (uint64_t)lpr_strnlen(target, FILED_SYMLINK_TARGET_BYTES);
+    if (status == 0 && (target_len == 0 || target_len >= FILED_SYMLINK_TARGET_BYTES)) {
         status = target_len == 0 ? -LPR_LINUX_EINVAL : -LPR_LINUX_ENAMETOOLONG;
     }
     if (status == 0) {
         symlink_req->target_length = target_len;
         lpr_memcpy(symlink_req->target, target, target_len + 1u);
         uint64_t ignored = 0;
-        status = lpr_filed_call(FILED_V2_OP_VFS_SYMLINK, page_fd, 0, &ignored);
+        status = lpr_filed_call(FILED_OP_VFS_SYMLINK, page_fd, 0, &ignored);
     }
     lpr_destroy_wire_page(page_fd, page);
     return status;
@@ -393,7 +393,7 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new
     const uint64_t known_flags = LPR_LINUX_AT_SYMLINK_FOLLOW;
     const char *old_path = (const char *)(uintptr_t)old_path_raw;
     const char *new_path = (const char *)(uintptr_t)new_path_raw;
-    char followed_old_path[FILED_V2_PATH_BYTES];
+    char followed_old_path[FILED_PATH_BYTES];
     if (old_path == 0 || new_path == 0) {
         return -LPR_LINUX_EFAULT;
     }
@@ -401,7 +401,7 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new
         return -LPR_LINUX_EINVAL;
     }
     if ((flags & LPR_LINUX_AT_SYMLINK_FOLLOW) != 0) {
-        char target[FILED_V2_SYMLINK_TARGET_BYTES];
+        char target[FILED_SYMLINK_TARGET_BYTES];
         lpr_memset(target, 0, sizeof(target));
         const int64_t len = lpr_linux_readlinkat_to_buffer(old_dirfd, old_path_raw, target, sizeof(target) - 1u);
         if (len > 0) {
@@ -434,7 +434,7 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_link_t *link_req = (filed_v2_link_t *)page;
+    filed_link_t *link_req = (filed_link_t *)page;
     lpr_memset(link_req, 0, sizeof(*link_req));
     link_req->old_dir_handle = old_dir_handle;
     link_req->new_dir_handle = new_dir_handle;
@@ -445,7 +445,7 @@ int64_t lpr_linux_linkat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new
     }
     if (status == 0) {
         uint64_t ignored = 0;
-        status = lpr_filed_call(FILED_V2_OP_VFS_LINK, page_fd, 0, &ignored);
+        status = lpr_filed_call(FILED_OP_VFS_LINK, page_fd, 0, &ignored);
     }
     lpr_destroy_wire_page(page_fd, page);
     return status;
@@ -482,7 +482,7 @@ int64_t lpr_filed_open_handle_at(
         return page_fd;
     }
 
-    filed_v2_openat_t *open_req = (filed_v2_openat_t *)page;
+    filed_openat_t *open_req = (filed_openat_t *)page;
     lpr_memset(open_req, 0, sizeof(*open_req));
     open_req->dir_handle = dir_handle;
     open_req->rights = lpr_open_rights(flags);
@@ -490,7 +490,7 @@ int64_t lpr_filed_open_handle_at(
     status = lpr_copy_path(open_req->name, sizeof(open_req->name), path);
     uint64_t handle = 0;
     if (status == 0) {
-        status = lpr_filed_call(FILED_V2_OP_VFS_OPENAT, page_fd, 0, &handle);
+        status = lpr_filed_call(FILED_OP_VFS_OPENAT, page_fd, 0, &handle);
     }
     lpr_destroy_wire_page(page_fd, page);
     if (status != 0) {
@@ -536,13 +536,13 @@ int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_readlink_t *readlink_req = (filed_v2_readlink_t *)page;
+    filed_readlink_t *readlink_req = (filed_readlink_t *)page;
     lpr_memset(readlink_req, 0, sizeof(*readlink_req));
     readlink_req->dir_handle = dir_handle;
     status = lpr_copy_path(readlink_req->name, sizeof(readlink_req->name), path);
     uint64_t length = 0;
     if (status == 0) {
-        status = lpr_filed_call(FILED_V2_OP_VFS_READLINK, page_fd, 0, &length);
+        status = lpr_filed_call(FILED_OP_VFS_READLINK, page_fd, 0, &length);
     }
     if (status == 0) {
         if (length > capacity) {
@@ -602,7 +602,7 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
     {
         return fd;
     }
-    char target[FILED_V2_SYMLINK_TARGET_BYTES];
+    char target[FILED_SYMLINK_TARGET_BYTES];
     lpr_memset(target, 0, sizeof(target));
     const int64_t len = lpr_linux_readlinkat_to_buffer(dirfd, path_raw, target, sizeof(target) - 1u);
     (void)lpr_linux_close((uint64_t)fd);
@@ -611,7 +611,7 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
     }
     target[len < (int64_t)(sizeof(target) - 1u) ? (uint64_t)len : sizeof(target) - 1u] = 0;
     const char *path = (const char *)(uintptr_t)path_raw;
-    char resolved[FILED_V2_PATH_BYTES];
+    char resolved[FILED_PATH_BYTES];
     if (!lpr_resolve_final_symlink_path(path, target, resolved, sizeof(resolved))) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
@@ -680,7 +680,7 @@ int64_t lpr_cwd_normalize(const char *path, char *out, uint64_t capacity)
     if (path == 0 || out == 0 || capacity < 2u) {
         return -LPR_LINUX_EFAULT;
     }
-    if (!lpr_path_is_terminated(path, FILED_V2_PATH_BYTES)) {
+    if (!lpr_path_is_terminated(path, FILED_PATH_BYTES)) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
     lpr_cwd_init();
@@ -751,19 +751,19 @@ int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path)
         return page_fd;
     }
     lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-    lprs_v2_cwd_t *cwd = (lprs_v2_cwd_t *)lpr_supervisor_payload(page);
+    lprs_cwd_t *cwd = (lprs_cwd_t *)lpr_supervisor_payload(page);
     cwd->token = lpr_supervisor_token;
     cwd->cwd_handle = handle;
     if (path != 0) {
-        const uint64_t len = (uint64_t)lpr_strnlen(path, LPRS_V2_CWD_BYTES);
-        if (len >= LPRS_V2_CWD_BYTES) {
+        const uint64_t len = (uint64_t)lpr_strnlen(path, LPRS_CWD_BYTES);
+        if (len >= LPRS_CWD_BYTES) {
             lpr_destroy_standalone_wire_page(page_fd, page);
             return -LPR_LINUX_ENAMETOOLONG;
         }
         lpr_memcpy(cwd->cwd, path, (size_t)len + 1u);
     }
     const int64_t status = lpr_supervisor_call(
-        LPRS_V2_OP_CWD_SET,
+        LPRS_OP_CWD_SET,
         page_fd,
         page,
         sizeof(*cwd),
@@ -783,7 +783,7 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     }
     lpr_cwd_init();
     const uint64_t old_handle = lpr_cwd_handle;
-    char old_path[FILED_V2_PATH_BYTES];
+    char old_path[FILED_PATH_BYTES];
     lpr_memcpy(old_path, lpr_cwd_path, sizeof(old_path));
     lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
     const uint64_t len = (uint64_t)lpr_strnlen(path, sizeof(lpr_cwd_path));
@@ -817,7 +817,7 @@ int64_t lpr_linux_chdir(uint64_t path_raw)
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    char normalized[FILED_V2_PATH_BYTES];
+    char normalized[FILED_PATH_BYTES];
     int64_t status = lpr_cwd_normalize(path, normalized, sizeof(normalized));
     if (status != 0) {
         return status;
@@ -855,7 +855,7 @@ int64_t lpr_linux_fchdir(uint64_t fd)
     if (dup_status != 0) {
         return dup_status;
     }
-    char cwd_copy[FILED_V2_PATH_BYTES];
+    char cwd_copy[FILED_PATH_BYTES];
     lpr_memset(cwd_copy, 0, sizeof(cwd_copy));
     lpr_cwd_init();
     lpr_memcpy(cwd_copy, lpr_cwd_path, sizeof(cwd_copy));

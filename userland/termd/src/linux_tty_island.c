@@ -347,7 +347,7 @@ static termd_linux_tty_owner_ids_t termd_linux_tty_merge_ids(
 
 static void termd_linux_tty_record_owner(
     termd_linux_tty_handle_t *handle,
-    const termd_v2_open_request_t *request)
+    const termd_open_request_t *request)
 {
     if (handle == NULL || request == NULL) {
         return;
@@ -807,7 +807,7 @@ int termd_linux_tty_island_open_ptmx(
 
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
-    const termd_v2_open_request_t *request,
+    const termd_open_request_t *request,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL) {
@@ -901,7 +901,7 @@ int termd_linux_tty_island_open_pts(
 
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
-    const termd_v2_open_request_t *request,
+    const termd_open_request_t *request,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL) {
@@ -978,20 +978,20 @@ int termd_linux_tty_island_open_hvc(
 
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
-    const termd_v2_open_request_t *request,
+    const termd_open_request_t *request,
     uint64_t *out_handle)
 {
     if (request == NULL) {
         return -22;
     }
-    termd_v2_open_request_t hvc_request = *request;
+    termd_open_request_t hvc_request = *request;
     hvc_request.pts_index = 0;
     return termd_linux_tty_island_open_hvc(island, &hvc_request, out_handle);
 }
 
 int termd_linux_tty_island_take_signal(
     struct termd_linux_tty_island *island,
-    termd_v2_signal_request_t *request,
+    termd_signal_request_t *request,
     uint64_t *out_result)
 {
     if (island == NULL || request == NULL || out_result == NULL) {
@@ -1095,7 +1095,7 @@ static void termd_write_u16(void *data, size_t offset, uint16_t value)
 
 int termd_linux_tty_island_ioctl(
     struct termd_linux_tty_island *island,
-    termd_v2_ioctl_request_t *request)
+    termd_ioctl_request_t *request)
 {
     if (island == NULL || request == NULL) {
         return -22;
@@ -1166,23 +1166,23 @@ static uint32_t termd_linux_poll_mask_to_wire(uint32_t mask)
 {
     uint32_t revents = 0;
     if ((mask & (TERMD_LINUX_EPOLLIN | TERMD_LINUX_EPOLLRDNORM | TERMD_LINUX_EPOLLPRI)) != 0) {
-        revents |= TERMD_V2_POLLIN;
+        revents |= TERMD_POLLIN;
     }
     if ((mask & (TERMD_LINUX_EPOLLOUT | TERMD_LINUX_EPOLLWRNORM)) != 0) {
-        revents |= TERMD_V2_POLLOUT;
+        revents |= TERMD_POLLOUT;
     }
     if ((mask & TERMD_LINUX_EPOLLERR) != 0) {
-        revents |= TERMD_V2_POLLERR;
+        revents |= TERMD_POLLERR;
     }
     if ((mask & TERMD_LINUX_EPOLLHUP) != 0) {
-        revents |= TERMD_V2_POLLHUP;
+        revents |= TERMD_POLLHUP;
     }
     return revents;
 }
 
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
-    termd_v2_poll_request_t *request)
+    termd_poll_request_t *request)
 {
     if (island == NULL || request == NULL) {
         return -22;
@@ -1206,7 +1206,7 @@ int termd_linux_tty_island_poll(
         request->tty.signal_mask,
         request->tty.signal_ignored);
     if (handle->poll == NULL) {
-        request->revents = TERMD_V2_POLLERR;
+        request->revents = TERMD_POLLERR;
         return 0;
     }
 
@@ -1219,15 +1219,15 @@ int termd_linux_tty_island_poll(
     }
     request->revents = termd_linux_poll_mask_to_wire(mask) & (
         request->events |
-        TERMD_V2_POLLERR |
-        TERMD_V2_POLLHUP);
+        TERMD_POLLERR |
+        TERMD_POLLHUP);
     return 0;
 }
 
 int termd_linux_tty_island_io(
     struct termd_linux_tty_island *island,
     int write,
-    termd_v2_io_request_t *request,
+    termd_io_request_t *request,
     uint64_t *out_result)
 {
     if (island == NULL || request == NULL || out_result == NULL) {
@@ -1256,8 +1256,8 @@ int termd_linux_tty_island_io(
         iter_fn,
         request->tty.signal_mask,
         request->tty.signal_ignored);
-    if (request->length > TERMD_V2_IO_BYTES) {
-        request->length = TERMD_V2_IO_BYTES;
+    if (request->length > TERMD_IO_BYTES) {
+        request->length = TERMD_IO_BYTES;
     }
     if (request->length == 0) {
         return 0;

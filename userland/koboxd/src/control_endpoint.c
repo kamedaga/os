@@ -1,7 +1,7 @@
 #include "control_endpoint.h"
 
 #include "ipc_wire.h"
-#include "koboxd/control_protocol_v2.h"
+#include "koboxd/control_protocol.h"
 #include "pacha/service_abi.h"
 #include "pacha/trace.h"
 
@@ -18,8 +18,8 @@ int koboxd_control_serve_get_endpoint(
         pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, 1, (uint64_t)status);
         return status;
     }
-    if (request.word0 != KOBOXD_V2_CONTROL_MAGIC ||
-        request.word1 != KOBOXD_V2_CONTROL_GET_ENDPOINT ||
+    if (request.word0 != PACHA_SERVICE_REQUEST_MAGIC ||
+        request.word1 != KOBOXD_CONTROL_GET_ENDPOINT ||
         request.word2 != expected_kind ||
         request.word3 != PACHA_SERVICE_ABI_VERSION)
     {
@@ -33,7 +33,7 @@ int koboxd_control_serve_get_endpoint(
         return -3;
     }
     int client_fd = -1;
-    if (expected_kind == KOBOXD_V2_ENDPOINT_FILED) {
+    if (expected_kind == KOBOXD_ENDPOINT_FILED) {
         const int endpoint_fd = pacha_ipc_endpoint_create(koboxd_service_channel_rights, 0);
         if (endpoint_fd < 16) {
             pacha_trace2(PACHA_TRACE_COMPONENT_KOBOXD, PACHA_TRACE_EVENT_KOBOXD_CONTROL, PACHA_TRACE_CLASS_ERROR, 2, (uint64_t)endpoint_fd);
@@ -88,7 +88,7 @@ int koboxd_block_serve_identify(
     if (status != 0) {
         return status;
     }
-    if (request.word0 != KOBOXD_V2_ENDPOINT_MAGIC || request.word1 != KOBOXD_V2_BLOCK_IDENTIFY) {
+    if (request.word0 != PACHA_SERVICE_REQUEST_MAGIC || request.word1 != KOBOXD_BLOCK_IDENTIFY) {
         return -2;
     }
     return koboxd_send_status_reply(

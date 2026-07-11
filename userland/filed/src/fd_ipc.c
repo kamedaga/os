@@ -58,7 +58,7 @@ int filed_ipc_send_wait(int fd, const struct pacha_ipc_msg *msg)
     return -2;
 }
 
-int filed_ipc_create_wire_page(uint64_t size, filed_v2_page_t *out_page)
+int filed_ipc_create_wire_page(uint64_t size, filed_page_t *out_page)
 {
     const uint64_t rights =
         PACHA_FD_RIGHT_TRANSFER |
@@ -96,7 +96,7 @@ int filed_ipc_create_wire_page(uint64_t size, filed_v2_page_t *out_page)
     return 0;
 }
 
-void filed_ipc_destroy_wire_page(filed_v2_page_t *page)
+void filed_ipc_destroy_wire_page(filed_page_t *page)
 {
     if (page == NULL) {
         return;

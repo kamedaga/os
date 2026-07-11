@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "filed/ipc_protocol_v2.h"
+#include "filed/ipc_protocol.h"
 #include "termd/boot_config.h"
 #include "pacha/ipc.h"
 #include "pachaos_capsule_launcher.h"
@@ -44,12 +44,12 @@ enum {
     SEED0_SERVICES_READY_MAGIC = 0x3159445256533053ull,
 };
 
-static void *seed0_filed_v2_payload(void *page)
+static void *seed0_filed_payload(void *page)
 {
     return page == NULL ? NULL : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
 }
 
-static int seed0_filed_v2_call(
+static int seed0_filed_call(
     int filed_endpoint_fd,
     uint32_t op,
     uint64_t request_id,
@@ -78,22 +78,22 @@ static int seed0_filed_v2_call(
         return -5;
     }
     memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
+    header->service_id = FILED_SERVICE_ID;
     header->op = op;
     const int has_service_payload =
-        op == FILED_V2_OP_SERVICE_SET_NETD_SOCKET ||
-        op == FILED_V2_OP_SERVICE_SET_TERMD_TTY;
+        op == FILED_OP_SERVICE_SET_NETD_SOCKET ||
+        op == FILED_OP_SERVICE_SET_TERMD_TTY;
     header->flags = has_service_payload ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
     header->trace_id = request_id;
-    header->payload_size = has_service_payload ? sizeof(filed_v2_service_endpoint_request_t) : 0;
+    header->payload_size = has_service_payload ? sizeof(filed_service_endpoint_request_t) : 0;
     header->fd_count = transfer_fd >= 16 ? 1u : 0u;
     if (has_service_payload) {
-        filed_v2_service_endpoint_request_t *payload =
-            (filed_v2_service_endpoint_request_t *)seed0_filed_v2_payload(page);
+        filed_service_endpoint_request_t *payload =
+            (filed_service_endpoint_request_t *)seed0_filed_payload(page);
         payload->endpoint_kind = op;
     }
 
@@ -142,12 +142,12 @@ static int seed0_filed_v2_call(
         (void)pacha_fd_close(page_fd);
         return recv_status;
     }
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->service_id != FILED_SERVICE_ID ||
         reply_header->op != op ||
         reply_header->request_id != request_id ||
         reply_header->status != 0)
@@ -166,27 +166,27 @@ static int seed0_filed_v2_call(
 
 static int seed0_register_netd_socket_endpoint(int filed_endpoint_fd, int netd_socket_endpoint_fd)
 {
-    return seed0_filed_v2_call(
+    return seed0_filed_call(
         filed_endpoint_fd,
-        FILED_V2_OP_SERVICE_SET_NETD_SOCKET,
+        FILED_OP_SERVICE_SET_NETD_SOCKET,
         0x53454544304e4554ull,
         netd_socket_endpoint_fd);
 }
 
 static int seed0_register_termd_tty_endpoint(int filed_endpoint_fd, int termd_tty_endpoint_fd)
 {
-    return seed0_filed_v2_call(
+    return seed0_filed_call(
         filed_endpoint_fd,
-        FILED_V2_OP_SERVICE_SET_TERMD_TTY,
+        FILED_OP_SERVICE_SET_TERMD_TTY,
         0x5345454430545459ull,
         termd_tty_endpoint_fd);
 }
 
 static int seed0_wait_filed_ready(int filed_endpoint_fd)
 {
-    return seed0_filed_v2_call(
+    return seed0_filed_call(
         filed_endpoint_fd,
-        FILED_V2_OP_HELLO,
+        FILED_OP_HELLO,
         0x534545443046494cull,
         -1);
 }

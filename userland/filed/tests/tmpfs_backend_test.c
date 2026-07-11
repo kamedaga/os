@@ -41,7 +41,7 @@ static void test_create_sparse_truncate_release(void)
     uint64_t bytes = 0;
     unsigned char read_buf[8];
     const unsigned char expected[6] = {0, 0, 0, 0, 'o', 'k'};
-    storage_v2_statx_reply_t stat;
+    storage_statx_reply_t stat;
 
     filed_tmpfs_backend_init(&tmpfs);
     expect_int("mount root", filed_tmpfs_backend_mount_root(&tmpfs, &root), 0);
@@ -99,7 +99,7 @@ static void test_hardlink_lifetime_and_symlink_alias(void)
     uint64_t lookup = 0;
     uint64_t bytes = 0;
     unsigned char buf[4] = {0};
-    storage_v2_statx_reply_t stat;
+    storage_statx_reply_t stat;
     uint64_t symlink = 0;
     uint64_t symlink_alias = 0;
     char target[16];
@@ -172,7 +172,7 @@ static void test_executable_sized_file(void)
     uint64_t bytes = 0;
     unsigned char page[FILED_TMPFS_PAGE_BYTES];
     unsigned char read_page[FILED_TMPFS_PAGE_BYTES];
-    storage_v2_statx_reply_t stat;
+    storage_statx_reply_t stat;
     const uint64_t file_size = FILED_TMPFS_PAGE_BYTES * 257u;
 
     filed_tmpfs_backend_init(&tmpfs);
@@ -231,7 +231,7 @@ static void test_rename_replace_and_getdents_offsets(void)
     uint64_t out = 0;
     uint64_t bytes = 0;
     unsigned char buf[2] = {0};
-    storage_v2_getdents_request_t dents;
+    storage_getdents_request_t dents;
 
     filed_tmpfs_backend_init(&tmpfs);
     expect_int("mount rename replace", filed_tmpfs_backend_mount_root(&tmpfs, &root), 0);

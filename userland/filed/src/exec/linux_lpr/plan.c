@@ -235,7 +235,7 @@ typedef struct lpr_exec_stage_metric {
 } lpr_exec_stage_metric_t;
 
 typedef struct lpr_exec_one_metric {
-    char path[FILED_V2_NAME_BYTES];
+    char path[FILED_NAME_BYTES];
     uint64_t total_before_reply_cycles;
     uint64_t prepare_inherit_cycles;
     uint64_t init_main_file_cycles;
@@ -432,7 +432,7 @@ void filed_exec_linux_lpr_dump_metrics(void)
 }
 
 static void lpr_exec_record_one_metric(
-    const filed_v2_exec_path_t *request,
+    const filed_exec_path_t *request,
     uint64_t total_before_reply_cycles,
     uint64_t prepare_inherit_cycles,
     uint64_t init_main_file_cycles,
@@ -695,7 +695,7 @@ int filed_exec_linux_lpr_prewarm(struct filed_runtime *runtime)
 static int filed_exec_linux_lpr_handle_mode(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
-    const filed_v2_exec_path_t *request,
+    const filed_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
@@ -706,7 +706,7 @@ static int filed_exec_linux_lpr_handle_mode(
     lpr_exec_file_t file;
     lpr_exec_meta_t meta;
     lpr_exec_plan_t plan;
-    int prepared[FILED_V2_EXEC_MAX_INHERIT_FDS + 1];
+    int prepared[FILED_EXEC_MAX_INHERIT_FDS + 1];
     uint64_t prepared_count = 0;
 
     if (out_process_fd != NULL) *out_process_fd = -1;
@@ -808,7 +808,7 @@ static int filed_exec_linux_lpr_handle_mode(
 int filed_exec_linux_lpr_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
-    const filed_v2_exec_path_t *request,
+    const filed_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
@@ -830,7 +830,7 @@ int filed_exec_linux_lpr_handle(
 int filed_exec_linux_lpr_prepare_self(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
-    const filed_v2_exec_path_t *request,
+    const filed_exec_path_t *request,
     int *out_process_fd,
     int *out_thread_fd)
 {

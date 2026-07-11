@@ -3,7 +3,7 @@
 #include "../support/string.h"
 #include "../support/syscall.h"
 
-#include <lpr_supervisor/ipc_protocol_v2.h>
+#include <lpr_supervisor/ipc_protocol.h>
 #include <pacha/ipc.h>
 #include <pacha/service_abi.h>
 #include <pachaos/abi.h>
@@ -29,7 +29,7 @@ int64_t lpr_process_client_call(
         status_to_errno == 0 ||
         page_fd < 16 ||
         page == 0 ||
-        payload_size > LPRS_V2_PAYLOAD_BYTES)
+        payload_size > LPRS_PAYLOAD_BYTES)
     {
         return -LPR_LINUX_EINVAL;
     }
@@ -37,11 +37,11 @@ int64_t lpr_process_client_call(
     struct pacha_ipc_fd fds[2];
     uint64_t fd_count = 0;
     const uint64_t request_id = __atomic_add_fetch(request_counter, 1u, __ATOMIC_RELAXED);
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = LPRS_V2_SERVICE_ID;
+    header->service_id = LPRS_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -121,7 +121,7 @@ int64_t lpr_process_client_call(
         return err;
     }
 
-    const pacha_service_reply_header_t *reply_header = (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
@@ -179,7 +179,7 @@ int64_t lpr_process_client_call_token(
         return page_fd;
     }
     lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-    lprs_v2_token_request_t *req = (lprs_v2_token_request_t *)lpr_process_client_payload(page);
+    lprs_token_request_t *req = (lprs_token_request_t *)lpr_process_client_payload(page);
     req->token = token;
     const int64_t status = lpr_process_client_call(
         request_counter,

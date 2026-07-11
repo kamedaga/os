@@ -13,12 +13,12 @@ int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uin
     if (page_fd < 0) {
         return page_fd;
     }
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     lpr_memset(io, 0, sizeof(*io));
     io->handle = lpr_fd_filed_payload(fd)->handle;
     io->offset = offset;
-    io->length = count > FILED_V2_IO_BYTES ? FILED_V2_IO_BYTES : count;
-    if (op == FILED_V2_OP_VFS_WRITE && io->length != 0) {
+    io->length = count > FILED_IO_BYTES ? FILED_IO_BYTES : count;
+    if (op == FILED_OP_VFS_WRITE && io->length != 0) {
         lpr_memcpy(io->data, (const void *)(uintptr_t)buf, (size_t)io->length);
     }
     uint64_t result = 0;
@@ -26,7 +26,7 @@ int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uin
     if (status == 0 && result > io->length) {
         result = io->length;
     }
-    if (status == 0 && op != FILED_V2_OP_VFS_WRITE && result != 0) {
+    if (status == 0 && op != FILED_OP_VFS_WRITE && result != 0) {
         lpr_memcpy((void *)(uintptr_t)buf, io->data, (size_t)result);
     }
     lpr_destroy_wire_page(page_fd, page);
@@ -41,14 +41,14 @@ static int64_t lpr_filed_io_chunked(uint32_t op, uint64_t fd, uint64_t buf, uint
     if (count != 0 && buf > UINT64_MAX - (count - 1u)) {
         return -LPR_LINUX_EFAULT;
     }
-    if (op == FILED_V2_OP_VFS_PREAD && count != 0 && offset > UINT64_MAX - (count - 1u)) {
+    if (op == FILED_OP_VFS_PREAD && count != 0 && offset > UINT64_MAX - (count - 1u)) {
         return -LPR_LINUX_EINVAL;
     }
     uint64_t total = 0;
     while (total < count) {
         const uint64_t remaining = count - total;
-        const uint64_t chunk = remaining > FILED_V2_IO_BYTES ? FILED_V2_IO_BYTES : remaining;
-        const uint64_t chunk_offset = op == FILED_V2_OP_VFS_PREAD ? offset + total : 0;
+        const uint64_t chunk = remaining > FILED_IO_BYTES ? FILED_IO_BYTES : remaining;
+        const uint64_t chunk_offset = op == FILED_OP_VFS_PREAD ? offset + total : 0;
         const int64_t n = lpr_filed_io(op, fd, buf + total, chunk, chunk_offset);
         if (n < 0) {
             return total != 0 ? (int64_t)total : n;
@@ -83,7 +83,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
         entry = lpr_page_cache_slot();
     }
     const int64_t n = lpr_filed_io(
-        FILED_V2_OP_VFS_PREAD,
+        FILED_OP_VFS_PREAD,
         fd,
         (uint64_t)(uintptr_t)entry->data,
         LPR_FILED_PAGE_CACHE_BYTES,
@@ -157,7 +157,7 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (lpr_linux_tty_fd_active(fd)) {
-        return lpr_tty_io(TERMD_V2_OP_HANDLE_READ, fd, buf, count);
+        return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
     }
     if (lpr_linux_eventfd_active(fd)) {
         if (count < sizeof(uint64_t)) {
@@ -221,17 +221,17 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
             lpr_fd_filed_payload(fd)->pread_active)
         {
             const uint64_t offset = lpr_filed_control_offset(fd);
-            const int64_t n = count > FILED_V2_IO_BYTES ?
-                lpr_filed_io_chunked(FILED_V2_OP_VFS_PREAD, fd, buf, count, offset) :
-                lpr_filed_io(FILED_V2_OP_VFS_PREAD, fd, buf, count, offset);
+            const int64_t n = count > FILED_IO_BYTES ?
+                lpr_filed_io_chunked(FILED_OP_VFS_PREAD, fd, buf, count, offset) :
+                lpr_filed_io(FILED_OP_VFS_PREAD, fd, buf, count, offset);
             if (n > 0) {
                 lpr_filed_control_advance_offset(fd, offset, (uint64_t)n);
             }
             return n;
         }
-        const int64_t n = count > FILED_V2_IO_BYTES ?
-            lpr_filed_io_chunked(FILED_V2_OP_VFS_READ, fd, buf, count, 0) :
-            lpr_filed_io(FILED_V2_OP_VFS_READ, fd, buf, count, 0);
+        const int64_t n = count > FILED_IO_BYTES ?
+            lpr_filed_io_chunked(FILED_OP_VFS_READ, fd, buf, count, 0) :
+            lpr_filed_io(FILED_OP_VFS_READ, fd, buf, count, 0);
         if (n >= 0 && lpr_fd_shadow_offset_eligible(fd)) {
             const uint64_t old_offset = lpr_filed_control_offset(fd);
             lpr_filed_control_advance_offset(fd, old_offset, (uint64_t)n);
@@ -310,7 +310,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             }
             requested += iov[i].len;
         }
-        if (requested != 0 && requested <= FILED_V2_IO_BYTES) {
+        if (requested != 0 && requested <= FILED_IO_BYTES) {
             const uint64_t offset = lpr_filed_control_offset(fd);
             lpr_readv_cache_coalesced++;
             lpr_readv_cache_bytes += requested;
@@ -360,8 +360,8 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                 }
             }
             lpr_readv_cache_fallback++;
-            uint8_t scratch[FILED_V2_IO_BYTES];
-            const int64_t n = lpr_filed_io(FILED_V2_OP_VFS_PREAD, fd, (uint64_t)(uintptr_t)scratch, requested, offset);
+            uint8_t scratch[FILED_IO_BYTES];
+            const int64_t n = lpr_filed_io(FILED_OP_VFS_PREAD, fd, (uint64_t)(uintptr_t)scratch, requested, offset);
             if (n < 0) {
                 return n;
             }
@@ -427,10 +427,10 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
-    if (count > FILED_V2_IO_BYTES) {
-        return lpr_filed_io_chunked(FILED_V2_OP_VFS_PREAD, fd, buf, count, offset);
+    if (count > FILED_IO_BYTES) {
+        return lpr_filed_io_chunked(FILED_OP_VFS_PREAD, fd, buf, count, offset);
     }
-    return lpr_filed_io(FILED_V2_OP_VFS_PREAD, fd, buf, count, offset);
+    return lpr_filed_io(FILED_OP_VFS_PREAD, fd, buf, count, offset);
 }
 
 int64_t lpr_linux_pread_to_vmo(
@@ -456,7 +456,7 @@ int64_t lpr_linux_pread_to_vmo(
         return page_fd;
     }
 
-    filed_v2_pread_vmo_t *pread_vmo = (filed_v2_pread_vmo_t *)page;
+    filed_pread_vmo_t *pread_vmo = (filed_pread_vmo_t *)page;
     lpr_memset(pread_vmo, 0, sizeof(*pread_vmo));
     pread_vmo->handle = lpr_fd_filed_payload(fd)->handle;
     pread_vmo->file_offset = file_offset;
@@ -490,11 +490,11 @@ int64_t lpr_linux_pread_to_vmo(
     lpr_memmove((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, page, sizeof(*pread_vmo));
     lpr_memset(page, 0, PACHA_SERVICE_HEADER_BYTES);
     const uint64_t request_id = lpr_next_request_id(&lpr_request_id);
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
-    header->op = FILED_V2_OP_VFS_PREAD_TO_VMO;
+    header->service_id = FILED_SERVICE_ID;
+    header->op = FILED_OP_VFS_PREAD_TO_VMO;
     header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
     header->request_id = request_id;
     header->trace_id = request_id;
@@ -526,12 +526,12 @@ int64_t lpr_linux_pread_to_vmo(
         lpr_destroy_pread_vmo_wire_page(page_fd, page);
         return lpr_pacha_status_to_errno(recv_status);
     }
-    const pacha_service_reply_header_t *reply_header = (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
-        reply_header->op != FILED_V2_OP_VFS_PREAD_TO_VMO ||
+        reply_header->service_id != FILED_SERVICE_ID ||
+        reply_header->op != FILED_OP_VFS_PREAD_TO_VMO ||
         reply_header->request_id != request_id)
     {
         lpr_destroy_pread_vmo_wire_page(page_fd, page);

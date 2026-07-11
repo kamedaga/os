@@ -65,16 +65,16 @@ int64_t lpr_linux_try_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_co
     return lpr_pacha_status_to_errno(wait_status);
 }
 
-int lpr_exec_add_string(filed_v2_exec_path_t *exec, filed_v2_exec_string_ref_t *ref, const char *value)
+int lpr_exec_add_string(filed_exec_path_t *exec, filed_exec_string_ref_t *ref, const char *value)
 {
     if (exec == 0 || ref == 0 || value == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const uint64_t length = (uint64_t)lpr_strnlen(value, FILED_V2_EXEC_STRING_BYTES) + 1u;
+    const uint64_t length = (uint64_t)lpr_strnlen(value, FILED_EXEC_STRING_BYTES) + 1u;
     if (length == 0 || length > UINT16_MAX) {
         return -LPR_LINUX_E2BIG;
     }
-    if (exec->string_bytes + length > FILED_V2_EXEC_STRING_BYTES) {
+    if (exec->string_bytes + length > FILED_EXEC_STRING_BYTES) {
         return -LPR_LINUX_E2BIG;
     }
     ref->offset = (uint16_t)exec->string_bytes;
@@ -84,7 +84,7 @@ int lpr_exec_add_string(filed_v2_exec_path_t *exec, filed_v2_exec_string_ref_t *
     return 0;
 }
 
-int64_t lpr_prepare_exec_cwd(filed_v2_exec_path_t *exec)
+int64_t lpr_prepare_exec_cwd(filed_exec_path_t *exec)
 {
     if (exec == 0) {
         return -LPR_LINUX_EFAULT;
@@ -106,7 +106,7 @@ int64_t lpr_prepare_exec_cwd(filed_v2_exec_path_t *exec)
     return lpr_filed_dup_handle(lpr_cwd_handle, 0, &exec->cwd_handle);
 }
 
-void lpr_discard_exec_cwd(filed_v2_exec_path_t *exec)
+void lpr_discard_exec_cwd(filed_exec_path_t *exec)
 {
     if (exec != 0 && exec->cwd_handle != 0) {
         (void)lpr_filed_close_handle(exec->cwd_handle);
@@ -115,8 +115,8 @@ void lpr_discard_exec_cwd(filed_v2_exec_path_t *exec)
 }
 
 int lpr_exec_copy_string_vector(
-    filed_v2_exec_path_t *exec,
-    filed_v2_exec_string_ref_t *refs,
+    filed_exec_path_t *exec,
+    filed_exec_string_ref_t *refs,
     uint64_t max_refs,
     uint64_t vector_raw,
     uint64_t *out_count)
@@ -173,14 +173,14 @@ uint64_t lpr_align_up_4096(uint64_t value)
 uint64_t lpr_exec_fd_table_bytes_for_capacity(uint64_t capacity)
 {
     if (capacity >
-        (UINT64_MAX - sizeof(filed_v2_exec_lpr_fd_table_t)) /
-            sizeof(filed_v2_exec_lpr_fd_t))
+        (UINT64_MAX - sizeof(filed_exec_lpr_fd_table_t)) /
+            sizeof(filed_exec_lpr_fd_t))
     {
         return 0;
     }
     return lpr_align_up_4096(
-        sizeof(filed_v2_exec_lpr_fd_table_t) +
-        capacity * sizeof(filed_v2_exec_lpr_fd_t));
+        sizeof(filed_exec_lpr_fd_table_t) +
+        capacity * sizeof(filed_exec_lpr_fd_t));
 }
 
 int lpr_exec_local_fd_active(uint64_t fd)
@@ -243,7 +243,7 @@ int lpr_count_exec_local_fds(uint64_t *out_count)
 }
 
 static void lpr_write_exec_local_fd_desc_unlocked(
-    filed_v2_exec_lpr_fd_t *desc,
+    filed_exec_lpr_fd_t *desc,
     uint64_t fd)
 {
     lpr_memset(desc, 0, sizeof(*desc));
@@ -254,31 +254,31 @@ static void lpr_write_exec_local_fd_desc_unlocked(
     const uint32_t fd_flags =
         (slot->fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0;
     if (file->kind == LPR_FD_TABLE_KIND_FILED) {
-        desc->kind = FILED_V2_EXEC_LPR_FD_FILED;
+        desc->kind = FILED_EXEC_LPR_FD_FILED;
         desc->flags = (file->payload.filed.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.filed.handle;
         desc->offset_or_counter = file->offset;
     } else if (file->kind == LPR_FD_TABLE_KIND_TTY) {
-        desc->kind = FILED_V2_EXEC_LPR_FD_TTY;
+        desc->kind = FILED_EXEC_LPR_FD_TTY;
         desc->flags = (file->payload.tty.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.tty.handle;
     } else if (file->kind == LPR_FD_TABLE_KIND_PIPE) {
-        desc->kind = FILED_V2_EXEC_LPR_FD_PIPE;
+        desc->kind = FILED_EXEC_LPR_FD_PIPE;
         desc->flags = (file->payload.pipe.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = fd;
     } else if (file->kind == LPR_FD_TABLE_KIND_EVENT) {
-        desc->kind = FILED_V2_EXEC_LPR_FD_EVENT;
+        desc->kind = FILED_EXEC_LPR_FD_EVENT;
         desc->flags = (file->payload.eventfd.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->offset_or_counter = file->payload.eventfd.counter;
     } else if (file->kind == LPR_FD_TABLE_KIND_SOCKET) {
-        desc->kind = FILED_V2_EXEC_LPR_FD_SOCKET;
+        desc->kind = FILED_EXEC_LPR_FD_SOCKET;
         desc->flags = (file->payload.socket.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.socket.handle;
         desc->offset_or_counter = file->payload.socket.type;
     }
 }
 
-void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
+void lpr_write_exec_local_fd_desc(filed_exec_lpr_fd_t *desc, uint64_t fd)
 {
     lpr_fd_arrays_init();
     lpr_fd_table_lock(&lpr_control_fd_table);
@@ -287,7 +287,7 @@ void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd)
 }
 
 int lpr_prepare_exec_local_fds(
-    filed_v2_exec_path_t *exec,
+    filed_exec_path_t *exec,
     lpr_exec_local_fd_table_t *local_table)
 {
     if (exec == 0 || local_table == 0) {
@@ -296,7 +296,7 @@ int lpr_prepare_exec_local_fds(
     local_table->fd = -1;
     local_table->map_bytes = 0;
     local_table->table = 0;
-    exec->flags &= ~((uint64_t)FILED_V2_EXEC_LPR_FD_TABLE);
+    exec->flags &= ~((uint64_t)FILED_EXEC_LPR_FD_TABLE);
     exec->lpr_fd_table_bytes = 0;
 
     lpr_fd_arrays_init();
@@ -315,8 +315,8 @@ int lpr_prepare_exec_local_fds(
 
     const uint64_t capacity = lpr_exec_fd_table_capacity_for_count(count);
     if (capacity == 0 ||
-        capacity > (UINT64_MAX - sizeof(filed_v2_exec_lpr_fd_table_t)) /
-            sizeof(filed_v2_exec_lpr_fd_t))
+        capacity > (UINT64_MAX - sizeof(filed_exec_lpr_fd_table_t)) /
+            sizeof(filed_exec_lpr_fd_t))
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_E2BIG;
@@ -327,8 +327,8 @@ int lpr_prepare_exec_local_fds(
         return -LPR_LINUX_E2BIG;
     }
     const uint64_t used_bytes =
-        sizeof(filed_v2_exec_lpr_fd_table_t) +
-        count * sizeof(filed_v2_exec_lpr_fd_t);
+        sizeof(filed_exec_lpr_fd_table_t) +
+        count * sizeof(filed_exec_lpr_fd_t);
 
     const uint64_t rights =
         PACHA_FD_RIGHT_TRANSFER |
@@ -358,16 +358,16 @@ int lpr_prepare_exec_local_fds(
         return (int)lpr_pacha_status_to_errno(mapped);
     }
 
-    filed_v2_exec_lpr_fd_table_t *table =
-        (filed_v2_exec_lpr_fd_table_t *)(uintptr_t)mapped;
+    filed_exec_lpr_fd_table_t *table =
+        (filed_exec_lpr_fd_table_t *)(uintptr_t)mapped;
     lpr_zero_bytes(table, map_bytes);
-    table->magic = FILED_V2_EXEC_LPR_FD_TABLE_MAGIC;
-    table->version = FILED_V2_EXEC_LPR_FD_TABLE_VERSION;
+    table->magic = FILED_EXEC_LPR_FD_TABLE_MAGIC;
+    table->version = FILED_EXEC_LPR_FD_TABLE_VERSION;
     table->byte_size = used_bytes;
     table->fd_count = count;
 
-    filed_v2_exec_lpr_fd_t *entries =
-        (filed_v2_exec_lpr_fd_t *)((uintptr_t)mapped + sizeof(*table));
+    filed_exec_lpr_fd_t *entries =
+        (filed_exec_lpr_fd_t *)((uintptr_t)mapped + sizeof(*table));
     uint64_t index = 0;
     for (uint64_t fd_index = 0; fd_index < lpr_fd_table_capacity; fd_index += 1) {
         if (!lpr_exec_local_fd_preserve_unlocked(fd_index)) {
@@ -392,7 +392,7 @@ int lpr_prepare_exec_local_fds(
     local_table->fd = (int)fd;
     local_table->map_bytes = map_bytes;
     local_table->table = table;
-    exec->flags |= FILED_V2_EXEC_LPR_FD_TABLE;
+    exec->flags |= FILED_EXEC_LPR_FD_TABLE;
     exec->lpr_fd_table_bytes = map_bytes;
     lpr_fd_table_unlock(&lpr_control_fd_table);
     return 0;
@@ -441,7 +441,7 @@ void lpr_close_local_state_before_self_exec(void)
             const int64_t fd_flags = lpr_control_get_fd_flags(fd);
             lpr_control_close_fd(fd);
             if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && handle != 0) {
-                (void)lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, handle, 0);
+                (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
             }
             continue;
         }
@@ -546,7 +546,7 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
 }
 
 int64_t lpr_filed_exec_self(
-    filed_v2_exec_path_t *exec,
+    filed_exec_path_t *exec,
     const lpr_exec_local_fd_table_t *local_table,
     int *out_process_fd,
     int *out_thread_fd,
@@ -555,7 +555,7 @@ int64_t lpr_filed_exec_self(
     if (exec == 0 || out_process_fd == 0 || out_thread_fd == 0 || out_bootstrap_fd == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    if (((exec->flags & FILED_V2_EXEC_LPR_FD_TABLE) != 0) &&
+    if (((exec->flags & FILED_EXEC_LPR_FD_TABLE) != 0) &&
         (local_table == 0 || local_table->fd < 16 || local_table->table == 0))
     {
         return -LPR_LINUX_EINVAL;
@@ -581,7 +581,7 @@ int64_t lpr_filed_exec_self(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
     uint64_t request_fd_count = 1;
-    if ((exec->flags & FILED_V2_EXEC_LPR_FD_TABLE) != 0) {
+    if ((exec->flags & FILED_EXEC_LPR_FD_TABLE) != 0) {
         request_fds[1].fd = (uint64_t)(uint32_t)local_table->fd;
         request_fds[1].rights =
             PACHA_FD_RIGHT_CLOSE |
@@ -590,11 +590,11 @@ int64_t lpr_filed_exec_self(
     }
 
     const uint64_t request_id = lpr_next_request_id(&lpr_request_id);
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
-    header->op = FILED_V2_OP_EXEC_SELF;
+    header->service_id = FILED_SERVICE_ID;
+    header->op = FILED_OP_EXEC_SELF;
     header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
     header->request_id = request_id;
     header->trace_id = request_id;

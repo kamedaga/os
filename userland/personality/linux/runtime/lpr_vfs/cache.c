@@ -8,7 +8,7 @@ void lpr_readlink_cache_clear(void)
 
 int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status)
 {
-    if (path == 0 || out_status == 0 || length == 0 || length >= FILED_V2_PATH_BYTES) {
+    if (path == 0 || out_status == 0 || length == 0 || length >= FILED_PATH_BYTES) {
         return 0;
     }
     for (uint64_t i = 0; i < LPR_READLINK_CACHE_ENTRIES; i += 1) {
@@ -26,7 +26,7 @@ int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_st
 
 void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status)
 {
-    if (path == 0 || length == 0 || length >= FILED_V2_PATH_BYTES || status >= 0) {
+    if (path == 0 || length == 0 || length >= FILED_PATH_BYTES || status >= 0) {
         return;
     }
     const uint64_t slot = lpr_readlink_cache_clock++ % LPR_READLINK_CACHE_ENTRIES;

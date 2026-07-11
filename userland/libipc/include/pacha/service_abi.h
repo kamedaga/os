@@ -33,7 +33,7 @@ enum {
     PACHA_SERVICE_ERROR_DYNAMIC_LOADER = 7u,
 };
 
-typedef struct pacha_service_request_header {
+typedef struct pacha_service_envelope {
     uint64_t magic;
     uint32_t abi_version;
     uint32_t service_id;
@@ -41,29 +41,29 @@ typedef struct pacha_service_request_header {
     uint32_t flags;
     uint64_t request_id;
     uint64_t trace_id;
-    uint32_t payload_size;
-    uint32_t fd_count;
-    uint64_t reserved0;
-    uint64_t reserved1;
-} pacha_service_request_header_t;
+    union {
+        struct {
+            uint32_t payload_size;
+            uint32_t fd_count;
+        };
+        /* Service boundary status: 0 or a negative Linux errno from pacha/status.h. */
+        int64_t status;
+    };
+    union {
+        struct {
+            uint64_t reserved0;
+            uint64_t reserved1;
+        };
+        struct {
+            uint32_t error_domain;
+            uint32_t reply_payload_size;
+            uint64_t result;
+        };
+    };
+} pacha_service_envelope_t;
 
-typedef struct pacha_service_reply_header {
-    uint64_t magic;
-    uint32_t abi_version;
-    uint32_t service_id;
-    uint32_t op;
-    uint32_t flags;
-    uint64_t request_id;
-    uint64_t trace_id;
-    /* Service boundary status: 0 or a negative Linux errno from pacha/status.h. */
-    int64_t status;
-    uint32_t error_domain;
-    uint32_t payload_size;
-    uint64_t result;
-} pacha_service_reply_header_t;
-
-static inline int pacha_service_request_header_is_v2(
-    const pacha_service_request_header_t *header,
+static inline int pacha_service_request_is_valid(
+    const pacha_service_envelope_t *header,
     uint32_t service_id)
 {
     return header != NULL &&
@@ -73,9 +73,9 @@ static inline int pacha_service_request_header_is_v2(
         header->payload_size <= PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES;
 }
 
-static inline void pacha_service_reply_header_init(
-    pacha_service_reply_header_t *header,
-    const pacha_service_request_header_t *request,
+static inline void pacha_service_reply_init(
+    pacha_service_envelope_t *header,
+    const pacha_service_envelope_t *request,
     int64_t status,
     uint32_t error_domain,
     uint64_t result,
@@ -93,15 +93,15 @@ static inline void pacha_service_reply_header_init(
     header->trace_id = request != NULL ? request->trace_id : 0;
     header->status = status;
     header->error_domain = status == 0 ? PACHA_SERVICE_ERROR_NONE : error_domain;
-    header->payload_size = payload_size;
+    header->reply_payload_size = payload_size;
     header->result = result;
 }
 
-_Static_assert(sizeof(pacha_service_request_header_t) == PACHA_SERVICE_HEADER_BYTES,
-    "pacha_service_request_header size");
-_Static_assert(sizeof(pacha_service_reply_header_t) == PACHA_SERVICE_HEADER_BYTES,
-    "pacha_service_reply_header size");
-_Static_assert(offsetof(pacha_service_request_header_t, payload_size) == 40,
-    "pacha_service_request_header payload_size offset");
-_Static_assert(offsetof(pacha_service_reply_header_t, status) == 40,
-    "pacha_service_reply_header status offset");
+_Static_assert(sizeof(pacha_service_envelope_t) == PACHA_SERVICE_HEADER_BYTES,
+    "pacha_service_envelope size");
+_Static_assert(offsetof(pacha_service_envelope_t, payload_size) == 40,
+    "pacha_service_envelope request payload_size offset");
+_Static_assert(offsetof(pacha_service_envelope_t, status) == 40,
+    "pacha_service_envelope reply status offset");
+_Static_assert(offsetof(pacha_service_envelope_t, reply_payload_size) == 52,
+    "pacha_service_envelope reply payload_size offset");

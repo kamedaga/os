@@ -61,7 +61,7 @@ int filed_kobox_backend_lookup(filed_kobox_backend_t *backend, uint64_t parent_o
     return -95;
 }
 
-int filed_kobox_backend_statx(filed_kobox_backend_t *backend, uint64_t object_id, storage_v2_statx_reply_t *out_stat)
+int filed_kobox_backend_statx(filed_kobox_backend_t *backend, uint64_t object_id, storage_statx_reply_t *out_stat)
 {
     (void)backend;
     (void)object_id;
@@ -203,7 +203,7 @@ int filed_kobox_backend_release_object(filed_kobox_backend_t *backend, uint64_t 
     return -95;
 }
 
-int filed_kobox_backend_getdents(filed_kobox_backend_t *backend, uint64_t dir_object_id, uint64_t offset, storage_v2_getdents_request_t *out_entries)
+int filed_kobox_backend_getdents(filed_kobox_backend_t *backend, uint64_t dir_object_id, uint64_t offset, storage_getdents_request_t *out_entries)
 {
     (void)backend;
     (void)dir_object_id;
@@ -257,7 +257,7 @@ static void init_runtime(filed_runtime_t *runtime, filed_dispatch_state_t *dispa
     filed_cache_configure(runtime, FILED_PAGE_CACHE_SLOTS);
 }
 
-static int dirents_contain(const storage_v2_getdents_request_t *entries, const char *name)
+static int dirents_contain(const storage_getdents_request_t *entries, const char *name)
 {
     if (entries == NULL || name == NULL) {
         return 0;
@@ -305,15 +305,15 @@ static void test_unlink_clears_dirent_cache(void)
     static filed_dispatch_state_t dispatch;
     uint64_t root = 0;
     uint64_t file = 0;
-    storage_v2_getdents_request_t entries;
-    storage_v2_getdents_request_t cached;
+    storage_getdents_request_t entries;
+    storage_getdents_request_t cached;
 
     init_runtime(&runtime, &dispatch);
     expect_int("mount root unlink", filed_tmpfs_backend_mount_root(&runtime.tmpfs, &root), 0);
     expect_int("create unlink target", filed_tmpfs_backend_create(&runtime.tmpfs, root, "gone", 0644, &file), 0);
 
     memset(&entries, 0, sizeof(entries));
-    entries.capacity = FILED_V2_DIRENT_CAPACITY;
+    entries.capacity = FILED_DIRENT_CAPACITY;
     expect_int("getdents before unlink", filed_tmpfs_backend_getdents(&runtime.tmpfs, root, 0, &entries), 0);
     expect_true("dirents contain before unlink", dirents_contain(&entries, "gone"));
     filed_dir_cache_store(&runtime, root, 0, &entries);
@@ -327,7 +327,7 @@ static void test_unlink_clears_dirent_cache(void)
     memset(&cached, 0, sizeof(cached));
     expect_true("dir cache invalidated after unlink", !filed_dir_cache_get(&runtime, root, 0, &cached));
     memset(&entries, 0, sizeof(entries));
-    entries.capacity = FILED_V2_DIRENT_CAPACITY;
+    entries.capacity = FILED_DIRENT_CAPACITY;
     expect_int("getdents after unlink", filed_tmpfs_backend_getdents(&runtime.tmpfs, root, 0, &entries), 0);
     expect_true("dirents omit after unlink", !dirents_contain(&entries, "gone"));
 }

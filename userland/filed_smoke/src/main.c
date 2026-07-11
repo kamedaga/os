@@ -1,5 +1,5 @@
-#include "filed/payload_v2.h"
-#include "filed/ipc_protocol_v2.h"
+#include "filed/payload.h"
+#include "filed/ipc_protocol.h"
 #include "filed_smoke/bootstrap.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
@@ -10,7 +10,7 @@
 #include <string.h>
 
 enum {
-    FILED_SMOKE_PAGE_SIZE = FILED_V2_PAGE_BYTES,
+    FILED_SMOKE_PAGE_SIZE = FILED_PAGE_BYTES,
     FILED_SMOKE_MAX_READ = 64,
 };
 
@@ -130,30 +130,30 @@ static void destroy_wire_page(int fd, void *page)
     }
 }
 
-static int filed_v2_payload_size(uint32_t op, uint32_t *out_payload_size)
+static int filed_payload_size(uint32_t op, uint32_t *out_payload_size)
 {
     if (out_payload_size == NULL) {
         return -1;
     }
 
     switch (op) {
-    case FILED_V2_OP_VFS_OPENAT: *out_payload_size = sizeof(filed_v2_path_request_t); return 0;
-    case FILED_V2_OP_VFS_STAT: *out_payload_size = sizeof(filed_v2_statx_t); return 0;
-    case FILED_V2_OP_VFS_PREAD:
-    case FILED_V2_OP_VFS_READ:
-    case FILED_V2_OP_VFS_PWRITE:
-    case FILED_V2_OP_VFS_WRITE: *out_payload_size = sizeof(filed_v2_io_t); return 0;
-    case FILED_V2_OP_VFS_GETDENTS: *out_payload_size = sizeof(filed_v2_getdents_t); return 0;
-    case FILED_V2_OP_VFS_CLOSE:
-    case FILED_V2_OP_VFS_FSYNC: *out_payload_size = sizeof(filed_v2_handle_request_t); return 0;
-    case FILED_V2_OP_VFS_DUP:
-    case FILED_V2_OP_VFS_GET_FLAGS:
-    case FILED_V2_OP_VFS_SET_FLAGS: *out_payload_size = sizeof(filed_v2_handle_flags_t); return 0;
-    case FILED_V2_OP_VFS_TRUNCATE: *out_payload_size = sizeof(filed_v2_truncate_t); return 0;
-    case FILED_V2_OP_VFS_UNLINK: *out_payload_size = sizeof(filed_v2_unlink_t); return 0;
-    case FILED_V2_OP_VFS_RENAME: *out_payload_size = sizeof(filed_v2_rename_t); return 0;
-    case FILED_V2_OP_VFS_MKDIR: *out_payload_size = sizeof(filed_v2_mkdir_t); return 0;
-    case FILED_V2_OP_VFS_RMDIR: *out_payload_size = sizeof(filed_v2_rmdir_t); return 0;
+    case FILED_OP_VFS_OPENAT: *out_payload_size = sizeof(filed_path_request_t); return 0;
+    case FILED_OP_VFS_STAT: *out_payload_size = sizeof(filed_statx_t); return 0;
+    case FILED_OP_VFS_PREAD:
+    case FILED_OP_VFS_READ:
+    case FILED_OP_VFS_PWRITE:
+    case FILED_OP_VFS_WRITE: *out_payload_size = sizeof(filed_io_t); return 0;
+    case FILED_OP_VFS_GETDENTS: *out_payload_size = sizeof(filed_getdents_t); return 0;
+    case FILED_OP_VFS_CLOSE:
+    case FILED_OP_VFS_FSYNC: *out_payload_size = sizeof(filed_handle_request_t); return 0;
+    case FILED_OP_VFS_DUP:
+    case FILED_OP_VFS_GET_FLAGS:
+    case FILED_OP_VFS_SET_FLAGS: *out_payload_size = sizeof(filed_handle_flags_t); return 0;
+    case FILED_OP_VFS_TRUNCATE: *out_payload_size = sizeof(filed_truncate_t); return 0;
+    case FILED_OP_VFS_UNLINK: *out_payload_size = sizeof(filed_unlink_t); return 0;
+    case FILED_OP_VFS_RENAME: *out_payload_size = sizeof(filed_rename_t); return 0;
+    case FILED_OP_VFS_MKDIR: *out_payload_size = sizeof(filed_mkdir_t); return 0;
+    case FILED_OP_VFS_RMDIR: *out_payload_size = sizeof(filed_rmdir_t); return 0;
     default: return -95;
     }
 }
@@ -171,7 +171,7 @@ static int filed_call(
     }
 
     uint32_t payload_size = 0;
-    const int payload_status = filed_v2_payload_size(op, &payload_size);
+    const int payload_status = filed_payload_size(op, &payload_size);
     if (payload_status != 0) {
         return payload_status;
     }
@@ -201,30 +201,30 @@ static int filed_call(
         }
     }
 
-    if (op == FILED_V2_OP_VFS_OPENAT) {
-        filed_v2_openat_t old_openat;
+    if (op == FILED_OP_VFS_OPENAT) {
+        filed_openat_t old_openat;
         memcpy(&old_openat, call_page, sizeof(old_openat));
         memset(call_page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_path_request_t *path =
-            (filed_v2_path_request_t *)((uint8_t *)call_page + PACHA_SERVICE_HEADER_BYTES);
+        filed_path_request_t *path =
+            (filed_path_request_t *)((uint8_t *)call_page + PACHA_SERVICE_HEADER_BYTES);
         path->dir_handle = old_openat.dir_handle;
         path->rights = old_openat.rights;
         path->flags = old_openat.open_flags;
         snprintf(path->path, sizeof(path->path), "%s", old_openat.name);
-    } else if (op == FILED_V2_OP_VFS_CLOSE || op == FILED_V2_OP_VFS_FSYNC) {
+    } else if (op == FILED_OP_VFS_CLOSE || op == FILED_OP_VFS_FSYNC) {
         memset(call_page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_handle_request_t *handle =
-            (filed_v2_handle_request_t *)((uint8_t *)call_page + PACHA_SERVICE_HEADER_BYTES);
+        filed_handle_request_t *handle =
+            (filed_handle_request_t *)((uint8_t *)call_page + PACHA_SERVICE_HEADER_BYTES);
         handle->handle = word2;
     } else {
         memmove((uint8_t *)call_page + PACHA_SERVICE_HEADER_BYTES, call_page, payload_size);
         memset(call_page, 0, PACHA_SERVICE_HEADER_BYTES);
     }
 
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)call_page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)call_page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
+    header->service_id = FILED_SERVICE_ID;
     header->op = op;
     header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
     header->request_id = request_id;
@@ -273,12 +273,12 @@ static int filed_call(
         }
         return recv_status;
     }
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)call_page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)call_page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->service_id != FILED_SERVICE_ID ||
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
@@ -300,9 +300,9 @@ static int filed_call(
         }
         return status;
     }
-    if (op != FILED_V2_OP_VFS_OPENAT &&
-        op != FILED_V2_OP_VFS_CLOSE &&
-        op != FILED_V2_OP_VFS_FSYNC)
+    if (op != FILED_OP_VFS_OPENAT &&
+        op != FILED_OP_VFS_CLOSE &&
+        op != FILED_OP_VFS_FSYNC)
     {
         memmove(call_page, (uint8_t *)call_page + PACHA_SERVICE_HEADER_BYTES, payload_size);
     }
@@ -329,10 +329,10 @@ static void filed_smoke_best_effort_unlink(
         return;
     }
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_unlink_t *unlink = (filed_v2_unlink_t *)page;
+    filed_unlink_t *unlink = (filed_unlink_t *)page;
     unlink->dir_handle = dir_handle;
     snprintf(unlink->name, sizeof(unlink->name), "%s", name);
-    (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, request_id, page_fd, 0, &result);
+    (void)filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, request_id, page_fd, 0, &result);
 }
 
 static void filed_smoke_best_effort_rmdir(
@@ -348,10 +348,10 @@ static void filed_smoke_best_effort_rmdir(
         return;
     }
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_rmdir_t *rmdir = (filed_v2_rmdir_t *)page;
+    filed_rmdir_t *rmdir = (filed_rmdir_t *)page;
     rmdir->dir_handle = dir_handle;
     snprintf(rmdir->name, sizeof(rmdir->name), "%s", name);
-    (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_RMDIR, request_id, page_fd, 0, &result);
+    (void)filed_call(endpoint_fd, FILED_OP_VFS_RMDIR, request_id, page_fd, 0, &result);
 }
 
 static int filed_smoke_mutation_stress(
@@ -364,9 +364,9 @@ static int filed_smoke_mutation_stress(
     uint64_t result = 0;
 
     for (unsigned int i = 0; i < 3; ++i) {
-        char tmp_name[FILED_V2_NAME_BYTES];
-        char done_name[FILED_V2_NAME_BYTES];
-        char dir_name[FILED_V2_NAME_BYTES];
+        char tmp_name[FILED_NAME_BYTES];
+        char done_name[FILED_NAME_BYTES];
+        char dir_name[FILED_NAME_BYTES];
         char payload[32];
         snprintf(tmp_name, sizeof(tmp_name), "filed-mut-%u.tmp", i);
         snprintf(done_name, sizeof(done_name), "filed-mut-%u.done", i);
@@ -390,20 +390,20 @@ static int filed_smoke_mutation_stress(
             done_name);
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_openat_t *openat = (filed_v2_openat_t *)page;
+        filed_openat_t *openat = (filed_openat_t *)page;
         openat->dir_handle = root_dir_handle;
         openat->rights =
-            FILED_V2_RIGHT_LOOKUP |
-            FILED_V2_RIGHT_STAT |
-            FILED_V2_RIGHT_CREATE |
-            FILED_V2_RIGHT_REMOVE |
-            FILED_V2_RIGHT_RENAME;
-        openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+            FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_STAT |
+            FILED_RIGHT_CREATE |
+            FILED_RIGHT_REMOVE |
+            FILED_RIGHT_RENAME;
+        openat->open_flags = FILED_OPEN_DIRECTORY;
         snprintf(openat->name, sizeof(openat->name), "%s", dir_name);
         result = 0;
         int status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_OPENAT,
+            FILED_OP_VFS_OPENAT,
             request_id++,
             page_fd,
             0,
@@ -419,7 +419,7 @@ static int filed_smoke_mutation_stress(
                 "child.tmp");
             (void)filed_call(
                 endpoint_fd,
-                FILED_V2_OP_VFS_CLOSE,
+                FILED_OP_VFS_CLOSE,
                 request_id++,
                 -1,
                 old_dir_handle,
@@ -434,18 +434,18 @@ static int filed_smoke_mutation_stress(
             dir_name);
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        openat = (filed_v2_openat_t *)page;
+        openat = (filed_openat_t *)page;
         openat->dir_handle = root_dir_handle;
         openat->rights =
-            FILED_V2_RIGHT_READ |
-            FILED_V2_RIGHT_WRITE |
-            FILED_V2_RIGHT_STAT;
-        openat->open_flags = FILED_V2_OPEN_CREATE | FILED_V2_OPEN_TRUNCATE;
+            FILED_RIGHT_READ |
+            FILED_RIGHT_WRITE |
+            FILED_RIGHT_STAT;
+        openat->open_flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE;
         snprintf(openat->name, sizeof(openat->name), "%s", tmp_name);
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_OPENAT,
+            FILED_OP_VFS_OPENAT,
             request_id++,
             page_fd,
             0,
@@ -461,14 +461,14 @@ static int filed_smoke_mutation_stress(
         const uint64_t file_handle = result;
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_io_t *io = (filed_v2_io_t *)page;
+        filed_io_t *io = (filed_io_t *)page;
         io->handle = file_handle;
         io->length = payload_len;
         memcpy(io->data, payload, (size_t)payload_len);
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_WRITE,
+            FILED_OP_VFS_WRITE,
             request_id++,
             page_fd,
             0,
@@ -481,7 +481,7 @@ static int filed_smoke_mutation_stress(
                 (unsigned long long)result);
             (void)filed_call(
                 endpoint_fd,
-                FILED_V2_OP_VFS_CLOSE,
+                FILED_OP_VFS_CLOSE,
                 request_id++,
                 -1,
                 file_handle,
@@ -491,7 +491,7 @@ static int filed_smoke_mutation_stress(
 
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_CLOSE,
+            FILED_OP_VFS_CLOSE,
             request_id++,
             -1,
             file_handle,
@@ -502,7 +502,7 @@ static int filed_smoke_mutation_stress(
         }
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_rename_t *rename = (filed_v2_rename_t *)page;
+        filed_rename_t *rename = (filed_rename_t *)page;
         rename->old_dir_handle = root_dir_handle;
         rename->new_dir_handle = root_dir_handle;
         snprintf(rename->old_name, sizeof(rename->old_name), "%s", tmp_name);
@@ -510,7 +510,7 @@ static int filed_smoke_mutation_stress(
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_RENAME,
+            FILED_OP_VFS_RENAME,
             request_id++,
             page_fd,
             0,
@@ -521,15 +521,15 @@ static int filed_smoke_mutation_stress(
         }
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        openat = (filed_v2_openat_t *)page;
+        openat = (filed_openat_t *)page;
         openat->dir_handle = root_dir_handle;
-        openat->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_STAT;
+        openat->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
         openat->open_flags = 0;
         snprintf(openat->name, sizeof(openat->name), "%s", done_name);
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_OPENAT,
+            FILED_OP_VFS_OPENAT,
             request_id++,
             page_fd,
             0,
@@ -545,14 +545,14 @@ static int filed_smoke_mutation_stress(
         const uint64_t read_handle = result;
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        io = (filed_v2_io_t *)page;
+        io = (filed_io_t *)page;
         io->handle = read_handle;
         io->offset = 0;
         io->length = payload_len;
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_PREAD,
+            FILED_OP_VFS_PREAD,
             request_id++,
             page_fd,
             0,
@@ -568,7 +568,7 @@ static int filed_smoke_mutation_stress(
                 (unsigned long long)result);
             (void)filed_call(
                 endpoint_fd,
-                FILED_V2_OP_VFS_CLOSE,
+                FILED_OP_VFS_CLOSE,
                 request_id++,
                 -1,
                 read_handle,
@@ -578,7 +578,7 @@ static int filed_smoke_mutation_stress(
 
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_CLOSE,
+            FILED_OP_VFS_CLOSE,
             request_id++,
             -1,
             read_handle,
@@ -599,14 +599,14 @@ static int filed_smoke_mutation_stress(
             done_name);
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_mkdir_t *mkdir = (filed_v2_mkdir_t *)page;
+        filed_mkdir_t *mkdir = (filed_mkdir_t *)page;
         mkdir->dir_handle = root_dir_handle;
         mkdir->mode = 0755;
         snprintf(mkdir->name, sizeof(mkdir->name), "%s", dir_name);
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_MKDIR,
+            FILED_OP_VFS_MKDIR,
             request_id++,
             page_fd,
             0,
@@ -617,19 +617,19 @@ static int filed_smoke_mutation_stress(
         }
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        openat = (filed_v2_openat_t *)page;
+        openat = (filed_openat_t *)page;
         openat->dir_handle = root_dir_handle;
         openat->rights =
-            FILED_V2_RIGHT_LOOKUP |
-            FILED_V2_RIGHT_STAT |
-            FILED_V2_RIGHT_CREATE |
-            FILED_V2_RIGHT_REMOVE;
-        openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+            FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_STAT |
+            FILED_RIGHT_CREATE |
+            FILED_RIGHT_REMOVE;
+        openat->open_flags = FILED_OPEN_DIRECTORY;
         snprintf(openat->name, sizeof(openat->name), "%s", dir_name);
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_OPENAT,
+            FILED_OP_VFS_OPENAT,
             request_id++,
             page_fd,
             0,
@@ -645,15 +645,15 @@ static int filed_smoke_mutation_stress(
         const uint64_t dir_handle = result;
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        openat = (filed_v2_openat_t *)page;
+        openat = (filed_openat_t *)page;
         openat->dir_handle = dir_handle;
-        openat->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_WRITE | FILED_V2_RIGHT_STAT;
-        openat->open_flags = FILED_V2_OPEN_CREATE | FILED_V2_OPEN_TRUNCATE;
+        openat->rights = FILED_RIGHT_READ | FILED_RIGHT_WRITE | FILED_RIGHT_STAT;
+        openat->open_flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE;
         snprintf(openat->name, sizeof(openat->name), "%s", "child.tmp");
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_OPENAT,
+            FILED_OP_VFS_OPENAT,
             request_id++,
             page_fd,
             0,
@@ -666,7 +666,7 @@ static int filed_smoke_mutation_stress(
                 (unsigned long long)result);
             (void)filed_call(
                 endpoint_fd,
-                FILED_V2_OP_VFS_CLOSE,
+                FILED_OP_VFS_CLOSE,
                 request_id++,
                 -1,
                 dir_handle,
@@ -677,7 +677,7 @@ static int filed_smoke_mutation_stress(
 
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_CLOSE,
+            FILED_OP_VFS_CLOSE,
             request_id++,
             -1,
             child_handle,
@@ -689,7 +689,7 @@ static int filed_smoke_mutation_stress(
                 status);
             (void)filed_call(
                 endpoint_fd,
-                FILED_V2_OP_VFS_CLOSE,
+                FILED_OP_VFS_CLOSE,
                 request_id++,
                 -1,
                 dir_handle,
@@ -706,7 +706,7 @@ static int filed_smoke_mutation_stress(
 
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_CLOSE,
+            FILED_OP_VFS_CLOSE,
             request_id++,
             -1,
             dir_handle,
@@ -717,13 +717,13 @@ static int filed_smoke_mutation_stress(
         }
 
         memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-        filed_v2_rmdir_t *rmdir = (filed_v2_rmdir_t *)page;
+        filed_rmdir_t *rmdir = (filed_rmdir_t *)page;
         rmdir->dir_handle = root_dir_handle;
         snprintf(rmdir->name, sizeof(rmdir->name), "%s", dir_name);
         result = 0;
         status = filed_call(
             endpoint_fd,
-            FILED_V2_OP_VFS_RMDIR,
+            FILED_OP_VFS_RMDIR,
             request_id++,
             page_fd,
             0,
@@ -747,16 +747,16 @@ static int smoke_filed_endpoint(int endpoint_fd)
         return status;
     }
 
-    filed_v2_openat_t *openat = (filed_v2_openat_t *)page;
+    filed_openat_t *openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_EXEC;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_EXEC;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "/sbin/./filed.elf");
 
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 1, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 1, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         destroy_wire_page(page_fd, page);
         fprintf(stderr, "[filed-smoke] openat failed status=%d handle=%llu\n",
@@ -767,104 +767,104 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint64_t handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_statx_t *stat = (filed_v2_statx_t *)page;
+    filed_statx_t *stat = (filed_statx_t *)page;
     stat->handle = handle;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_STAT, 2, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_STAT, 2, page_fd, 0, &result);
     if (status != 0 || stat->size == 0 || stat->kind != 0100000u) {
         fprintf(stderr,
             "[filed-smoke] stat failed status=%d size=%llu kind=0%llo\n",
             status,
             (unsigned long long)stat->size,
             (unsigned long long)stat->kind);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 4, -1, handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 4, -1, handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -4;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_handle_flags_t *flags = (filed_v2_handle_flags_t *)page;
+    filed_handle_flags_t *flags = (filed_handle_flags_t *)page;
     flags->handle = handle;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_GET_FLAGS, 3, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_GET_FLAGS, 3, page_fd, 0, &result);
     if (status != 0 || flags->fd_flags != 0 || flags->status_flags != 0) {
         fprintf(stderr,
             "[filed-smoke] get_flags failed status=%d fd=0x%llx status=0x%llx\n",
             status,
             (unsigned long long)flags->fd_flags,
             (unsigned long long)flags->status_flags);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 8, -1, handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 8, -1, handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -6;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    flags = (filed_v2_handle_flags_t *)page;
+    flags = (filed_handle_flags_t *)page;
     flags->handle = handle;
     flags->fd_flags = 0;
-    flags->status_flags = FILED_V2_FILE_NONBLOCK;
+    flags->status_flags = FILED_FILE_NONBLOCK;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_SET_FLAGS, 4, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_SET_FLAGS, 4, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] set_flags failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 8, -1, handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 8, -1, handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    flags = (filed_v2_handle_flags_t *)page;
+    flags = (filed_handle_flags_t *)page;
     flags->handle = handle;
-    flags->fd_flags = FILED_V2_FD_CLOEXEC;
+    flags->fd_flags = FILED_FD_CLOEXEC;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_DUP, 5, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_DUP, 5, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] dup failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 8, -1, handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 8, -1, handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -7;
     }
     const uint64_t dup_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    flags = (filed_v2_handle_flags_t *)page;
+    flags = (filed_handle_flags_t *)page;
     flags->handle = dup_handle;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_GET_FLAGS, 6, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_GET_FLAGS, 6, page_fd, 0, &result);
     if (status != 0 ||
-        flags->fd_flags != FILED_V2_FD_CLOEXEC ||
-        flags->status_flags != FILED_V2_FILE_NONBLOCK)
+        flags->fd_flags != FILED_FD_CLOEXEC ||
+        flags->status_flags != FILED_FILE_NONBLOCK)
     {
         fprintf(stderr,
             "[filed-smoke] dup flags failed status=%d fd=0x%llx status=0x%llx\n",
             status,
             (unsigned long long)flags->fd_flags,
             (unsigned long long)flags->status_flags);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 8, -1, dup_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 9, -1, handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 8, -1, dup_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 9, -1, handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -8;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 7, -1, handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 7, -1, handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close original failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 8, -1, dup_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 8, -1, dup_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     io->handle = dup_handle;
     io->offset = 0;
     io->length = FILED_SMOKE_MAX_READ;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_READ, 8, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_READ, 8, page_fd, 0, &result);
     if (status != 0 || result < 4 ||
         io->data[0] != 0x7f ||
         io->data[1] != 'E' ||
@@ -879,13 +879,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
             io->data[1],
             io->data[2],
             io->data[3]);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 9, -1, dup_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 9, -1, dup_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -5;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 9, -1, dup_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 9, -1, dup_handle, &result);
     const uint64_t bytes_read = io->length;
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close failed status=%d\n", status);
@@ -894,17 +894,17 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "/etc/os-release");
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 10, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 10, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] write-open failed status=%d handle=%llu\n",
@@ -916,18 +916,18 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint64_t write_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = write_handle;
     io->offset = 0;
     io->length = 16;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 11, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 11, page_fd, 0, &result);
     if (status != 0 || result < 8) {
         fprintf(stderr,
             "[filed-smoke] write pread failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 17, -1, write_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 17, -1, write_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -10;
     }
@@ -936,57 +936,57 @@ static int smoke_filed_endpoint(int endpoint_fd)
     memcpy(original, io->data, sizeof(original));
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = write_handle;
     io->offset = 0;
     io->length = original_len;
     memcpy(io->data, original, (size_t)original_len);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PWRITE, 12, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PWRITE, 12, page_fd, 0, &result);
     if (status != 0 || result != original_len) {
         fprintf(stderr,
             "[filed-smoke] pwrite failed status=%d bytes=%llu expected=%llu\n",
             status,
             (unsigned long long)result,
             (unsigned long long)original_len);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 17, -1, write_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 17, -1, write_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -11;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_FSYNC, 13, -1, write_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_FSYNC, 13, -1, write_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] fsync failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 17, -1, write_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 17, -1, write_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = write_handle;
     io->length = 4;
     memcpy(io->data, original, 4);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 14, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 14, page_fd, 0, &result);
     if (status != 0 || result != 4 || io->offset != 0) {
         fprintf(stderr,
             "[filed-smoke] write failed status=%d bytes=%llu offset=%llu\n",
             status,
             (unsigned long long)result,
             (unsigned long long)io->offset);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 17, -1, write_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 17, -1, write_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -12;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = write_handle;
     io->length = 4;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_READ, 15, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_READ, 15, page_fd, 0, &result);
     if (status != 0 ||
         result != 4 ||
         memcmp(io->data, original + 4, 4) != 0)
@@ -995,13 +995,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] write offset readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 17, -1, write_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 17, -1, write_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -13;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 16, -1, write_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 16, -1, write_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close write handle failed status=%d\n", status);
         destroy_wire_page(page_fd, page);
@@ -1009,25 +1009,25 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_unlink_t *unlink = (filed_v2_unlink_t *)page;
+    filed_unlink_t *unlink = (filed_unlink_t *)page;
     unlink->dir_handle = 0;
     snprintf(unlink->name, sizeof(unlink->name), "%s", "filed-write-smoke.tmp");
     result = 0;
-    (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, 17, page_fd, 0, &result);
+    (void)filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, 17, page_fd, 0, &result);
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
     openat->open_flags =
-        FILED_V2_OPEN_CREATE |
-        FILED_V2_OPEN_TRUNCATE;
+        FILED_OPEN_CREATE |
+        FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "/filed-write-smoke.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 18, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 18, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] create open failed status=%d handle=%llu\n",
@@ -1040,24 +1040,24 @@ static int smoke_filed_endpoint(int endpoint_fd)
 
     const char created_payload[] = "filed-create-write";
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = created_handle;
     io->length = sizeof(created_payload) - 1u;
     memcpy(io->data, created_payload, sizeof(created_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 19, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 19, page_fd, 0, &result);
     if (status != 0 || result != sizeof(created_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] create write failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -15;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 20, -1, created_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 20, -1, created_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close created failed status=%d\n", status);
         destroy_wire_page(page_fd, page);
@@ -1065,16 +1065,16 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "/filed-write-smoke.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 21, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 21, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] reopen created failed status=%d handle=%llu\n",
@@ -1086,11 +1086,11 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint64_t created_read_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = created_read_handle;
     io->length = sizeof(created_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_READ, 22, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_READ, 22, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(created_payload) - 1u ||
         memcmp(io->data, created_payload, sizeof(created_payload) - 1u) != 0)
@@ -1099,38 +1099,38 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] created read failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -17;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    flags = (filed_v2_handle_flags_t *)page;
+    flags = (filed_handle_flags_t *)page;
     flags->handle = created_read_handle;
-    flags->status_flags = FILED_V2_FILE_APPEND;
+    flags->status_flags = FILED_FILE_APPEND;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_SET_FLAGS, 23, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_SET_FLAGS, 23, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] append set_flags failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     const char append_payload[] = "+append";
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = created_read_handle;
     io->length = sizeof(append_payload) - 1u;
     memcpy(io->data, append_payload, sizeof(append_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 24, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 24, page_fd, 0, &result);
     if (status != 0 || result != sizeof(append_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] append write failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -18;
     }
@@ -1140,7 +1140,7 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint64_t append_payload_len = sizeof(append_payload) - 1u;
     const uint64_t appended_expected_len = created_payload_len + append_payload_len;
     if (appended_expected_len > sizeof(appended_expected)) {
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return -19;
     }
@@ -1151,12 +1151,12 @@ static int smoke_filed_endpoint(int endpoint_fd)
         (size_t)append_payload_len);
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = created_read_handle;
     io->offset = 0;
     io->length = appended_expected_len;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 25, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 25, page_fd, 0, &result);
     if (status != 0 ||
         result != appended_expected_len ||
         memcmp(io->data, appended_expected, (size_t)appended_expected_len) != 0)
@@ -1165,31 +1165,31 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] append readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -20;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_truncate_t *truncate = (filed_v2_truncate_t *)page;
+    filed_truncate_t *truncate = (filed_truncate_t *)page;
     truncate->handle = created_read_handle;
     truncate->size = 5;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_TRUNCATE, 26, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_TRUNCATE, 26, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] truncate failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = created_read_handle;
     io->offset = 0;
     io->length = 5;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 27, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 27, page_fd, 0, &result);
     if (status != 0 ||
         result != 5 ||
         memcmp(io->data, created_payload, 5) != 0)
@@ -1198,13 +1198,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] truncate readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 30, -1, created_read_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -21;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 28, -1, created_read_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 28, -1, created_read_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close append handle failed status=%d\n", status);
         destroy_wire_page(page_fd, page);
@@ -1212,13 +1212,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_rename_t *rename = (filed_v2_rename_t *)page;
+    filed_rename_t *rename = (filed_rename_t *)page;
     rename->old_dir_handle = 0;
     rename->new_dir_handle = 0;
     snprintf(rename->old_name, sizeof(rename->old_name), "%s", "filed-write-smoke.tmp");
     snprintf(rename->new_name, sizeof(rename->new_name), "%s", "filed-write-smoke.done");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RENAME, 29, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RENAME, 29, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] rename failed status=%d\n", status);
         destroy_wire_page(page_fd, page);
@@ -1226,15 +1226,15 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_STAT;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "/filed-write-smoke.done");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 31, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 31, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] renamed open failed status=%d handle=%llu\n",
@@ -1246,11 +1246,11 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint64_t renamed_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = renamed_handle;
     io->length = 5;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_READ, 32, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_READ, 32, page_fd, 0, &result);
     if (status != 0 ||
         result != 5 ||
         memcmp(io->data, created_payload, 5) != 0)
@@ -1259,13 +1259,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] renamed read failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 34, -1, renamed_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 34, -1, renamed_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -23;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 33, -1, renamed_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 33, -1, renamed_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close renamed failed status=%d\n", status);
         destroy_wire_page(page_fd, page);
@@ -1273,11 +1273,11 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    unlink = (filed_v2_unlink_t *)page;
+    unlink = (filed_unlink_t *)page;
     unlink->dir_handle = 0;
     snprintf(unlink->name, sizeof(unlink->name), "%s", "filed-write-smoke.done");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, 35, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, 35, page_fd, 0, &result);
     if (status != 0) {
         destroy_wire_page(page_fd, page);
         fprintf(stderr, "[filed-smoke] unlink failed status=%d\n", status);
@@ -1285,13 +1285,13 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
-    openat->rights = FILED_V2_RIGHT_READ;
+    openat->rights = FILED_RIGHT_READ;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "/filed-write-smoke.done");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 36, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 36, page_fd, 0, &result);
     if (status == 0 || result != 0) {
         fprintf(stderr,
             "[filed-smoke] unlinked open unexpectedly succeeded status=%d handle=%llu\n",
@@ -1302,19 +1302,19 @@ static int smoke_filed_endpoint(int endpoint_fd)
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_GETDENTS |
-        FILED_V2_RIGHT_CREATE |
-        FILED_V2_RIGHT_REMOVE |
-        FILED_V2_RIGHT_RENAME;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_GETDENTS |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "/");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 37, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 37, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] root dir open failed status=%d handle=%llu\n",
@@ -1326,73 +1326,73 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint64_t root_dir_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_GETDENTS;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_GETDENTS;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "etc");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 38, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 38, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] openat dirfd etc failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -26;
     }
     const uint64_t etc_dir_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = etc_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_STAT;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "os-release");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 39, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 39, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] openat nested dirfd failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -27;
     }
     const uint64_t etc_file_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = etc_file_handle;
     io->offset = 0;
     io->length = 8;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 40, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 40, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] dirfd pread failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_file_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_file_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -28;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_getdents_t *getdents = (filed_v2_getdents_t *)page;
+    filed_getdents_t *getdents = (filed_getdents_t *)page;
     getdents->dir_handle = root_dir_handle;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_GETDENTS, 41, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_GETDENTS, 41, page_fd, 0, &result);
     if (status != 0 || getdents->offset != 0 || result != getdents->count) {
         fprintf(stderr,
             "[filed-smoke] getdents first failed status=%d result=%llu offset=%llu count=%llu\n",
@@ -1400,19 +1400,19 @@ static int smoke_filed_endpoint(int endpoint_fd)
             (unsigned long long)result,
             (unsigned long long)getdents->offset,
             (unsigned long long)getdents->count);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_file_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_file_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -29;
     }
     const uint64_t first_dir_count = getdents->count;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    getdents = (filed_v2_getdents_t *)page;
+    getdents = (filed_getdents_t *)page;
     getdents->dir_handle = root_dir_handle;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_GETDENTS, 42, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_GETDENTS, 42, page_fd, 0, &result);
     if (status != 0 || getdents->offset != first_dir_count || result != getdents->count) {
         fprintf(stderr,
             "[filed-smoke] getdents second failed status=%d result=%llu offset=%llu expected=%llu count=%llu\n",
@@ -1421,57 +1421,57 @@ static int smoke_filed_endpoint(int endpoint_fd)
             (unsigned long long)getdents->offset,
             (unsigned long long)first_dir_count,
             (unsigned long long)getdents->count);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_file_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_file_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -30;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 43, -1, etc_file_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 43, -1, etc_file_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close dirfd file failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, etc_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 44, -1, etc_dir_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 44, -1, etc_dir_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close etc dir failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    unlink = (filed_v2_unlink_t *)page;
+    unlink = (filed_unlink_t *)page;
     unlink->dir_handle = root_dir_handle;
     snprintf(unlink->name, sizeof(unlink->name), "%s", "filed-open-unlink.tmp");
     result = 0;
-    (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, 45, page_fd, 0, &result);
+    (void)filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, 45, page_fd, 0, &result);
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
     openat->open_flags =
-        FILED_V2_OPEN_CREATE |
-        FILED_V2_OPEN_TRUNCATE;
+        FILED_OPEN_CREATE |
+        FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-open-unlink.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 46, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 46, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] open-unlink create failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -31;
     }
@@ -1479,44 +1479,44 @@ static int smoke_filed_endpoint(int endpoint_fd)
 
     const char unlink_payload[] = "unlink-open-alive";
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = open_unlink_handle;
     io->length = sizeof(unlink_payload) - 1u;
     memcpy(io->data, unlink_payload, sizeof(unlink_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 47, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 47, page_fd, 0, &result);
     if (status != 0 || result != sizeof(unlink_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] open-unlink write failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -32;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    unlink = (filed_v2_unlink_t *)page;
+    unlink = (filed_unlink_t *)page;
     unlink->dir_handle = root_dir_handle;
     snprintf(unlink->name, sizeof(unlink->name), "%s", "filed-open-unlink.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, 48, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, 48, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] unlink while open failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = open_unlink_handle;
     io->offset = 0;
     io->length = sizeof(unlink_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 49, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 49, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(unlink_payload) - 1u ||
         memcmp(io->data, unlink_payload, sizeof(unlink_payload) - 1u) != 0)
@@ -1525,72 +1525,72 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] unlinked open readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -33;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
-    openat->rights = FILED_V2_RIGHT_READ;
+    openat->rights = FILED_RIGHT_READ;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-open-unlink.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 50, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 50, page_fd, 0, &result);
     if (status == 0 || result != 0) {
         fprintf(stderr,
             "[filed-smoke] unlink while open path unexpectedly exists status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, open_unlink_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return -34;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 51, -1, open_unlink_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 51, -1, open_unlink_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close unlinked open failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    unlink = (filed_v2_unlink_t *)page;
+    unlink = (filed_unlink_t *)page;
     unlink->dir_handle = root_dir_handle;
     snprintf(unlink->name, sizeof(unlink->name), "%s", "filed-rename-old.tmp");
     result = 0;
-    (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, 52, page_fd, 0, &result);
+    (void)filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, 52, page_fd, 0, &result);
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    unlink = (filed_v2_unlink_t *)page;
+    unlink = (filed_unlink_t *)page;
     unlink->dir_handle = root_dir_handle;
     snprintf(unlink->name, sizeof(unlink->name), "%s", "filed-rename-new.tmp");
     result = 0;
-    (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_UNLINK, 53, page_fd, 0, &result);
+    (void)filed_call(endpoint_fd, FILED_OP_VFS_UNLINK, 53, page_fd, 0, &result);
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
     openat->open_flags =
-        FILED_V2_OPEN_CREATE |
-        FILED_V2_OPEN_TRUNCATE;
+        FILED_OPEN_CREATE |
+        FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-rename-old.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 54, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 54, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] rename old create failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -35;
     }
@@ -1598,43 +1598,43 @@ static int smoke_filed_endpoint(int endpoint_fd)
 
     const char rename_old_payload[] = "rename-old-live";
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = rename_old_handle;
     io->length = sizeof(rename_old_payload) - 1u;
     memcpy(io->data, rename_old_payload, sizeof(rename_old_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 55, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 55, page_fd, 0, &result);
     if (status != 0 || result != sizeof(rename_old_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] rename old write failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -36;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
     openat->open_flags =
-        FILED_V2_OPEN_CREATE |
-        FILED_V2_OPEN_TRUNCATE;
+        FILED_OPEN_CREATE |
+        FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-rename-new.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 56, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 56, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] rename new create failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -37;
     }
@@ -1642,48 +1642,48 @@ static int smoke_filed_endpoint(int endpoint_fd)
 
     const char rename_replaced_payload[] = "rename-replaced-live";
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = rename_replaced_handle;
     io->length = sizeof(rename_replaced_payload) - 1u;
     memcpy(io->data, rename_replaced_payload, sizeof(rename_replaced_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 57, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 57, page_fd, 0, &result);
     if (status != 0 || result != sizeof(rename_replaced_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] rename replaced write failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -38;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    rename = (filed_v2_rename_t *)page;
+    rename = (filed_rename_t *)page;
     rename->old_dir_handle = root_dir_handle;
     rename->new_dir_handle = root_dir_handle;
     snprintf(rename->old_name, sizeof(rename->old_name), "%s", "filed-rename-old.tmp");
     snprintf(rename->new_name, sizeof(rename->new_name), "%s", "filed-rename-new.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RENAME, 58, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RENAME, 58, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] rename replace while open failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = rename_replaced_handle;
     io->offset = 0;
     io->length = sizeof(rename_replaced_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 59, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 59, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(rename_replaced_payload) - 1u ||
         memcmp(io->data, rename_replaced_payload, sizeof(rename_replaced_payload) - 1u) != 0)
@@ -1692,43 +1692,43 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] replaced open readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -39;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_STAT;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-rename-new.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 60, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 60, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] renamed replacement open failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -40;
     }
     const uint64_t rename_path_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = rename_path_handle;
     io->offset = 0;
     io->length = sizeof(rename_old_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 61, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 61, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(rename_old_payload) - 1u ||
         memcmp(io->data, rename_old_payload, sizeof(rename_old_payload) - 1u) != 0)
@@ -1737,38 +1737,38 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] renamed path readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_path_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_path_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -41;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 62, -1, rename_path_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 62, -1, rename_path_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close renamed path failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_replaced_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 63, -1, rename_replaced_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 63, -1, rename_replaced_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close replaced handle failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, rename_old_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 64, -1, rename_old_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 64, -1, rename_old_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close rename old handle failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
@@ -1788,17 +1788,17 @@ static int smoke_filed_endpoint(int endpoint_fd)
         root_dir_handle,
         "filed-cross-rename.tmp");
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_REMOVE |
-        FILED_V2_RIGHT_RENAME;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-mkdir-smoke");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 67, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 67, page_fd, 0, &result);
     if (status == 0 && result != 0) {
         const uint64_t old_mkdir_dir_handle = result;
         filed_smoke_best_effort_unlink(
@@ -1809,7 +1809,7 @@ static int smoke_filed_endpoint(int endpoint_fd)
             old_mkdir_dir_handle,
             "child.tmp");
         result = 0;
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 69, -1, old_mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 69, -1, old_mkdir_dir_handle, &result);
     }
     filed_smoke_best_effort_rmdir(
         endpoint_fd,
@@ -1841,56 +1841,56 @@ static int smoke_filed_endpoint(int endpoint_fd)
         "filed-dir-rename-old");
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_mkdir_t *mkdir = (filed_v2_mkdir_t *)page;
+    filed_mkdir_t *mkdir = (filed_mkdir_t *)page;
     mkdir->dir_handle = root_dir_handle;
     mkdir->mode = 0755;
     snprintf(mkdir->name, sizeof(mkdir->name), "%s", "filed-mkdir-smoke");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_MKDIR, 74, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_MKDIR, 74, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] mkdir failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_GETDENTS |
-        FILED_V2_RIGHT_CREATE |
-        FILED_V2_RIGHT_REMOVE |
-        FILED_V2_RIGHT_RENAME;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_GETDENTS |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-mkdir-smoke");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 75, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 75, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] open mkdir dir failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -42;
     }
     const uint64_t mkdir_dir_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    stat = (filed_v2_statx_t *)page;
+    stat = (filed_statx_t *)page;
     stat->handle = mkdir_dir_handle;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_STAT, 76, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_STAT, 76, page_fd, 0, &result);
     if (status != 0 || stat->kind != 0040000u) {
         fprintf(stderr,
             "[filed-smoke] mkdir stat failed status=%d kind=0%llo\n",
             status,
             (unsigned long long)stat->kind);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -43;
     }
@@ -1899,205 +1899,205 @@ static int smoke_filed_endpoint(int endpoint_fd)
     const uint8_t cross_replace_payload[] = "cross-dir-replace-open";
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = mkdir_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_CREATE | FILED_V2_OPEN_TRUNCATE;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "child.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 77, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 77, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] open child in mkdir dir failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -45;
     }
     const uint64_t cross_child_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = cross_child_handle;
     io->length = sizeof(cross_dir_payload) - 1u;
     memcpy(io->data, cross_dir_payload, sizeof(cross_dir_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 78, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 78, page_fd, 0, &result);
     if (status != 0 || result != sizeof(cross_dir_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] write child in mkdir dir failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_child_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_child_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -46;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 79, -1, cross_child_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 79, -1, cross_child_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close child in mkdir dir failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = mkdir_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_CREATE | FILED_V2_OPEN_TRUNCATE;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "replace.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 80, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 80, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] open cross-directory replace source failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -51;
     }
     const uint64_t cross_replace_source_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = cross_replace_source_handle;
     io->length = sizeof(cross_replace_payload) - 1u;
     memcpy(io->data, cross_replace_payload, sizeof(cross_replace_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 81, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 81, page_fd, 0, &result);
     if (status != 0 || result != sizeof(cross_replace_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] write cross-directory replace source failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -52;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_CREATE | FILED_V2_OPEN_TRUNCATE;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-cross-replace.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 82, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 82, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] open cross-directory replace target failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -53;
     }
     const uint64_t cross_replace_target_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    filed_v2_rmdir_t *rmdir = (filed_v2_rmdir_t *)page;
+    filed_rmdir_t *rmdir = (filed_rmdir_t *)page;
     rmdir->dir_handle = root_dir_handle;
     snprintf(rmdir->name, sizeof(rmdir->name), "%s", "filed-mkdir-smoke");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RMDIR, 83, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RMDIR, 83, page_fd, 0, &result);
     if (status == 0) {
         fprintf(stderr, "[filed-smoke] non-empty rmdir unexpectedly succeeded\n");
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return -47;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    rename = (filed_v2_rename_t *)page;
+    rename = (filed_rename_t *)page;
     rename->old_dir_handle = mkdir_dir_handle;
     rename->new_dir_handle = root_dir_handle;
     snprintf(rename->old_name, sizeof(rename->old_name), "%s", "child.tmp");
     snprintf(rename->new_name, sizeof(rename->new_name), "%s", "filed-cross-rename.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RENAME, 84, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RENAME, 84, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] cross-directory rename failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = mkdir_dir_handle;
-    openat->rights = FILED_V2_RIGHT_STAT;
+    openat->rights = FILED_RIGHT_STAT;
     snprintf(openat->name, sizeof(openat->name), "%s", "child.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 85, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 85, page_fd, 0, &result);
     if (status == 0 || result != 0) {
         fprintf(stderr,
             "[filed-smoke] cross-directory old path unexpectedly exists status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return -48;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
-    openat->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_STAT;
+    openat->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-cross-rename.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 86, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 86, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] cross-directory new path open failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -49;
     }
     const uint64_t cross_renamed_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = cross_renamed_handle;
     io->offset = 0;
     io->length = sizeof(cross_dir_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 87, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 87, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(cross_dir_payload) - 1u ||
         memcmp(io->data, cross_dir_payload, sizeof(cross_dir_payload) - 1u) != 0)
@@ -2106,93 +2106,93 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] cross-directory readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_renamed_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_renamed_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -50;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 88, -1, cross_renamed_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 88, -1, cross_renamed_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close cross-directory file failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    rename = (filed_v2_rename_t *)page;
+    rename = (filed_rename_t *)page;
     rename->old_dir_handle = mkdir_dir_handle;
     rename->new_dir_handle = root_dir_handle;
     snprintf(rename->old_name, sizeof(rename->old_name), "%s", "replace.tmp");
     snprintf(rename->new_name, sizeof(rename->new_name), "%s", "filed-cross-replace.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RENAME, 89, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RENAME, 89, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] cross-directory replace while open failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = cross_replace_target_handle;
     io->offset = 0;
     io->length = 4;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 90, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 90, page_fd, 0, &result);
     if (status != 0 || result != 0) {
         fprintf(stderr,
             "[filed-smoke] cross-directory replaced open should read eof status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -54;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
-    openat->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_STAT;
+    openat->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-cross-replace.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 91, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 91, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] cross-directory replaced path open failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -55;
     }
     const uint64_t cross_replace_path_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = cross_replace_path_handle;
     io->offset = 0;
     io->length = sizeof(cross_replace_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 92, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 92, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(cross_replace_payload) - 1u ||
         memcmp(io->data, cross_replace_payload, sizeof(cross_replace_payload) - 1u) != 0)
@@ -2201,44 +2201,44 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] cross-directory replaced path readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_path_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_path_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -56;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 93, -1, cross_replace_path_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 93, -1, cross_replace_path_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close cross-directory replace path failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_target_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 94, -1, cross_replace_target_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 94, -1, cross_replace_target_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close cross-directory replaced target failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, cross_replace_source_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 95, -1, cross_replace_source_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 95, -1, cross_replace_source_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close cross-directory replace source failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
@@ -2259,103 +2259,103 @@ static int smoke_filed_endpoint(int endpoint_fd)
         "filed-cross-replace.tmp");
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    mkdir = (filed_v2_mkdir_t *)page;
+    mkdir = (filed_mkdir_t *)page;
     mkdir->dir_handle = root_dir_handle;
     mkdir->mode = 0755;
     snprintf(mkdir->name, sizeof(mkdir->name), "%s", "filed-dir-rename-old");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_MKDIR, 98, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_MKDIR, 98, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] mkdir directory rename source failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_CREATE |
-        FILED_V2_RIGHT_REMOVE;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-dir-rename-old");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 108, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 108, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] open directory before rename failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 109, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 110, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 109, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 110, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -59;
     }
     const uint64_t dir_rename_open_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    rename = (filed_v2_rename_t *)page;
+    rename = (filed_rename_t *)page;
     rename->old_dir_handle = root_dir_handle;
     rename->new_dir_handle = root_dir_handle;
     snprintf(rename->old_name, sizeof(rename->old_name), "%s", "filed-dir-rename-old");
     snprintf(rename->new_name, sizeof(rename->new_name), "%s", "filed-dir-rename-new");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RENAME, 99, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RENAME, 99, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] directory rename failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 110, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 100, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 101, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 110, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 100, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 101, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
-    openat->rights = FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+    openat->rights = FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-dir-rename-old");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 100, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 100, page_fd, 0, &result);
     if (status == 0 || result != 0) {
         fprintf(stderr,
             "[filed-smoke] old directory rename path unexpectedly exists status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 110, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 101, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 102, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 110, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 101, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 102, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return -57;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
     openat->rights =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_GETDENTS |
-        FILED_V2_RIGHT_CREATE |
-        FILED_V2_RIGHT_REMOVE |
-        FILED_V2_RIGHT_RENAME;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_GETDENTS |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-dir-rename-new");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 101, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 101, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] new directory rename path open failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 110, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 102, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 103, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 110, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 102, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 103, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -58;
     }
@@ -2363,92 +2363,92 @@ static int smoke_filed_endpoint(int endpoint_fd)
 
     const char dir_lifetime_payload[] = "directory-handle-live";
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = dir_rename_open_handle;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_CREATE | FILED_V2_OPEN_TRUNCATE;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE;
     snprintf(openat->name, sizeof(openat->name), "%s", "alive.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 109, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 109, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] create through renamed open directory failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 110, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 111, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 112, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 113, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 110, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 111, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 112, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 113, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -60;
     }
     const uint64_t dir_lifetime_child_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = dir_lifetime_child_handle;
     io->length = sizeof(dir_lifetime_payload) - 1u;
     memcpy(io->data, dir_lifetime_payload, sizeof(dir_lifetime_payload) - 1u);
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_WRITE, 110, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_WRITE, 110, page_fd, 0, &result);
     if (status != 0 || result != sizeof(dir_lifetime_payload) - 1u) {
         fprintf(stderr,
             "[filed-smoke] write through renamed open directory failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 111, -1, dir_lifetime_child_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 112, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 113, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 114, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 115, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 111, -1, dir_lifetime_child_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 112, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 113, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 114, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 115, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -61;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 111, -1, dir_lifetime_child_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 111, -1, dir_lifetime_child_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close renamed directory child failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 112, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 113, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 114, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 115, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 112, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 113, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 114, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 115, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = renamed_dir_handle;
-    openat->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_STAT;
+    openat->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
     openat->open_flags = 0;
     snprintf(openat->name, sizeof(openat->name), "%s", "alive.tmp");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 112, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 112, page_fd, 0, &result);
     if (status != 0 || result == 0) {
         fprintf(stderr,
             "[filed-smoke] reopen renamed directory child failed status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 113, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 114, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 115, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 116, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 113, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 114, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 115, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 116, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -62;
     }
     const uint64_t dir_lifetime_reopen_handle = result;
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    io = (filed_v2_io_t *)page;
+    io = (filed_io_t *)page;
     io->handle = dir_lifetime_reopen_handle;
     io->offset = 0;
     io->length = sizeof(dir_lifetime_payload) - 1u;
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_PREAD, 113, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_PREAD, 113, page_fd, 0, &result);
     if (status != 0 ||
         result != sizeof(dir_lifetime_payload) - 1u ||
         memcmp(io->data, dir_lifetime_payload, sizeof(dir_lifetime_payload) - 1u) != 0)
@@ -2457,23 +2457,23 @@ static int smoke_filed_endpoint(int endpoint_fd)
             "[filed-smoke] renamed directory child readback failed status=%d bytes=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 114, -1, dir_lifetime_reopen_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 115, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 116, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 117, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 118, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 114, -1, dir_lifetime_reopen_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 115, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 116, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 117, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 118, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status != 0 ? status : -63;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 114, -1, dir_lifetime_reopen_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 114, -1, dir_lifetime_reopen_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close renamed directory child reopen failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 115, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 116, -1, dir_rename_open_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 117, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 118, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 115, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 116, -1, dir_rename_open_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 117, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 118, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
@@ -2486,22 +2486,22 @@ static int smoke_filed_endpoint(int endpoint_fd)
         "alive.tmp");
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 116, -1, dir_rename_open_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 116, -1, dir_rename_open_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close old renamed directory handle failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 117, -1, renamed_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 118, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 119, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 117, -1, renamed_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 118, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 119, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 102, -1, renamed_dir_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 102, -1, renamed_dir_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close renamed directory failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 103, -1, mkdir_dir_handle, &result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 104, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 103, -1, mkdir_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 104, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
@@ -2514,54 +2514,54 @@ static int smoke_filed_endpoint(int endpoint_fd)
         "filed-dir-rename-new");
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 104, -1, mkdir_dir_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 104, -1, mkdir_dir_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close mkdir dir failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    rmdir = (filed_v2_rmdir_t *)page;
+    rmdir = (filed_rmdir_t *)page;
     rmdir->dir_handle = root_dir_handle;
     snprintf(rmdir->name, sizeof(rmdir->name), "%s", "filed-mkdir-smoke");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_RMDIR, 105, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_RMDIR, 105, page_fd, 0, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] rmdir failed status=%d\n", status);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     memset(page, 0, FILED_SMOKE_PAGE_SIZE);
-    openat = (filed_v2_openat_t *)page;
+    openat = (filed_openat_t *)page;
     openat->dir_handle = root_dir_handle;
-    openat->rights = FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_DIRECTORY;
+    openat->rights = FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_DIRECTORY;
     snprintf(openat->name, sizeof(openat->name), "%s", "filed-mkdir-smoke");
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_OPENAT, 106, page_fd, 0, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_OPENAT, 106, page_fd, 0, &result);
     if (status == 0 || result != 0) {
         fprintf(stderr,
             "[filed-smoke] rmdir path unexpectedly exists status=%d handle=%llu\n",
             status,
             (unsigned long long)result);
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return -44;
     }
 
     status = filed_smoke_mutation_stress(endpoint_fd, page_fd, page, root_dir_handle);
     if (status != 0) {
-        (void)filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
+        (void)filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 99, -1, root_dir_handle, &result);
         destroy_wire_page(page_fd, page);
         return status;
     }
 
     result = 0;
-    status = filed_call(endpoint_fd, FILED_V2_OP_VFS_CLOSE, 107, -1, root_dir_handle, &result);
+    status = filed_call(endpoint_fd, FILED_OP_VFS_CLOSE, 107, -1, root_dir_handle, &result);
     if (status != 0) {
         fprintf(stderr, "[filed-smoke] close root dir failed status=%d\n", status);
         destroy_wire_page(page_fd, page);

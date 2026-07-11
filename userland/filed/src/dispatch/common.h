@@ -9,8 +9,8 @@
 #include "filed/fd_ipc.h"
 #include "filed/exec.h"
 #include "filed/exec_linux_lpr.h"
-#include "filed/payload_v2.h"
-#include "filed/ipc_protocol_v2.h"
+#include "filed/payload.h"
+#include "filed/ipc_protocol.h"
 #include "filed/cache.h"
 #include "filed/tmpfs_backend.h"
 #include "pacha/abi.h"
@@ -20,7 +20,7 @@
 #include "pacha/trace.h"
 #include "personality/lpr_image_abi.h"
 #include "personality/linux_lpr.h"
-#include "termd/ipc_protocol_v2.h"
+#include "termd/ipc_protocol.h"
 #include "../internal/dispatch_state.h"
 
 #define filed_dispatch_metrics (runtime->dispatch_state->dispatch_metrics)
@@ -54,7 +54,7 @@ typedef struct filed_dispatch_saved_fd {
 
 bool filed_backend_object_is_tmpfs(uint64_t backend_object);
 int filed_backend_lookup(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
-int filed_backend_statx(filed_runtime_t *runtime, uint64_t object_id, storage_v2_statx_reply_t *out_stat);
+int filed_backend_statx(filed_runtime_t *runtime, uint64_t object_id, storage_statx_reply_t *out_stat);
 int filed_backend_pread(filed_runtime_t *runtime, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_backend_pwrite(filed_runtime_t *runtime, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_backend_fsync(filed_runtime_t *runtime, uint64_t object_id);
@@ -70,7 +70,7 @@ int filed_backend_readlink(filed_runtime_t *runtime, uint64_t object_id, char *o
 int filed_backend_rmdir(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name);
 int filed_backend_rename(filed_runtime_t *runtime, uint64_t old_parent_object_id, const char *old_name, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
 int filed_backend_release_object(filed_runtime_t *runtime, uint64_t object_id);
-int filed_backend_getdents(filed_runtime_t *runtime, uint64_t dir_object_id, uint64_t offset, storage_v2_getdents_request_t *out_entries);
+int filed_backend_getdents(filed_runtime_t *runtime, uint64_t dir_object_id, uint64_t offset, storage_getdents_request_t *out_entries);
 bool filed_root_getdents_splices_tmpfs(filed_runtime_t *runtime, uint64_t dir_object_id);
 uint64_t filed_root_getdents_backend_offset(filed_runtime_t *runtime, uint64_t dir_object_id, uint64_t logical_offset);
 
@@ -84,19 +84,19 @@ void filed_runtime_publish_backend_object_generation(filed_runtime_t *runtime, f
 void filed_dump_dispatch_metrics(filed_runtime_t *runtime);
 
 uint64_t filed_error_token(int64_t status, uint64_t op, uint64_t stage, int64_t detail, uint64_t request_id, uint64_t fd_count, uint64_t subject, uint64_t aux, const char *message);
-int filed_send_reply_v2(int reply_fd, void *reply_page, const pacha_service_request_header_t *header, int64_t status, uint64_t result, uint64_t error_token);
-int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t status, uint64_t result);
-int filed_send_exec_reply_v2(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int transfer_process_fd);
-int filed_send_exec_self_reply_v2(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int bootstrap_fd);
+int filed_send_reply(int reply_fd, void *reply_page, const pacha_service_envelope_t *header, int64_t status, uint64_t result, uint64_t error_token);
+int filed_send_session_reply(int channel_fd, uint64_t request_id, int64_t status, uint64_t result);
+int filed_send_exec_reply(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int transfer_process_fd);
+int filed_send_exec_self_reply(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int bootstrap_fd);
 int filed_dispatch_set_inherit(int fd, int enabled);
 void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved);
 void filed_dispatch_close_owned_fd(int *fd);
 int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved);
 void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved);
-int filed_dispatch_exec_default_stdio_valid(const filed_v2_exec_path_t *exec);
-int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd);
-int filed_dispatch_exec_lpr_fd_table_valid(const filed_v2_exec_path_t *exec, const filed_v2_exec_lpr_fd_table_t *table, int allow_table);
-int filed_dispatch_create_lpr_bootstrap_fd(const filed_v2_exec_path_t *exec, const filed_v2_exec_lpr_fd_table_t *fd_table);
+int filed_dispatch_exec_default_stdio_valid(const filed_exec_path_t *exec);
+int filed_dispatch_lpr_fd_desc_valid(const filed_exec_lpr_fd_t *fd);
+int filed_dispatch_exec_lpr_fd_table_valid(const filed_exec_path_t *exec, const filed_exec_lpr_fd_table_t *table, int allow_table);
+int filed_dispatch_create_lpr_bootstrap_fd(const filed_exec_path_t *exec, const filed_exec_lpr_fd_table_t *fd_table);
 int filed_dispatch_prepare_inherit_fd_to_target(int source_fd, uint64_t target_raw, int *out_fd, filed_dispatch_saved_fd_t *saved);
 int filed_dispatch_dup_endpoint_to_fixed(int source_fd, int target_fd, int *out_fd);
 int filed_dispatch_prepare_endpoint_to_fixed(int source_fd, int target_fd, int *out_fd, int *out_borrowed);
@@ -107,29 +107,29 @@ int filed_release_reclaimed_object(filed_runtime_t *runtime, const filed_vfs_rec
 int64_t filed_close_handle_runtime(filed_runtime_t *runtime, filed_handle_id_t handle_id);
 void filed_write_u64_le(void *base, uint64_t offset, uint64_t value);
 filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind);
-uint32_t filed_v2_rights_to_vfs(uint64_t rights);
-uint32_t filed_v2_open_flags_to_vfs(uint64_t flags);
-uint32_t filed_v2_fd_flags_to_vfs(uint64_t flags);
-uint32_t filed_v2_file_status_flags_to_vfs(uint64_t flags);
+uint32_t filed_rights_to_vfs(uint64_t rights);
+uint32_t filed_open_flags_to_vfs(uint64_t flags);
+uint32_t filed_fd_flags_to_vfs(uint64_t flags);
+uint32_t filed_file_status_flags_to_vfs(uint64_t flags);
 uint64_t filed_vfs_fd_flags_to_wire(uint32_t flags);
 uint64_t filed_vfs_file_status_flags_to_wire(uint32_t flags);
-int filed_v2_flags_are_known(uint64_t fd_flags, uint64_t status_flags);
+int filed_flags_are_known(uint64_t fd_flags, uint64_t status_flags);
 void *filed_map_request_page(const struct pacha_ipc_msg *request, uint64_t size, int *out_fd);
 filed_page_dispatch_result_t filed_page_result(int64_t status, uint64_t result);
-int filed_write_stat_from_backend(filed_v2_statx_t *out, const storage_v2_statx_reply_t *stat, uint64_t handle_id, uint64_t object_generation, uint64_t dir_generation);
-filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(const storage_v2_statx_reply_t *stat, uint64_t handle_id, uint64_t object_generation, uint64_t dir_generation);
+int filed_write_stat_from_backend(filed_statx_t *out, const storage_statx_reply_t *stat, uint64_t handle_id, uint64_t object_generation, uint64_t dir_generation);
+filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(const storage_statx_reply_t *stat, uint64_t handle_id, uint64_t object_generation, uint64_t dir_generation);
 filed_vfs_stat_snapshot_t filed_directory_snapshot_from_create(uint64_t handle_id, uint64_t mode, uint64_t object_generation, uint64_t dir_generation);
 filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(uint64_t handle_id, uint64_t target_length, uint64_t object_generation, uint64_t dir_generation);
-int filed_write_stat_from_snapshot(filed_v2_statx_t *out, const filed_vfs_stat_snapshot_t *snapshot, uint64_t handle_id);
+int filed_write_stat_from_snapshot(filed_statx_t *out, const filed_vfs_stat_snapshot_t *snapshot, uint64_t handle_id);
 int filed_backend_object_for_handle(filed_runtime_t *runtime, filed_handle_id_t handle_id, filed_vfs_io_decision_t *out_decision);
 int filed_name_is_terminated(const char *name, size_t capacity);
 const char *filed_skip_slashes(const char *path);
 int filed_path_is_single_component(const char *path);
 void filed_close_walk_handle(filed_runtime_t *runtime, filed_handle_id_t handle_id, int owned);
-int64_t filed_lookup_component_stat(filed_runtime_t *runtime, filed_handle_id_t parent_handle, const char *name, uint64_t *out_object_id, storage_v2_statx_reply_t *out_stat, bool *out_lookup_owned);
+int64_t filed_lookup_component_stat(filed_runtime_t *runtime, filed_handle_id_t parent_handle, const char *name, uint64_t *out_object_id, storage_statx_reply_t *out_stat, bool *out_lookup_owned);
 int64_t filed_splice_symlink_target(filed_runtime_t *runtime, uint64_t object_id, const char *rest, char *out_path, size_t out_path_size);
 int64_t filed_resolve_parent_path(filed_runtime_t *runtime, filed_handle_id_t base_dir_handle, const char *path, uint32_t parent_rights, filed_handle_id_t *out_parent_handle, int *out_parent_owned, char *out_name, size_t out_name_size);
-int64_t filed_openat_path(filed_runtime_t *runtime, const filed_v2_openat_t *openat, filed_vfs_open_result_t *out_open);
+int64_t filed_openat_path(filed_runtime_t *runtime, const filed_openat_t *openat, filed_vfs_open_result_t *out_open);
 
 filed_page_dispatch_result_t filed_dispatch_openat_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(filed_runtime_t *runtime, void *page);
@@ -138,8 +138,8 @@ filed_page_dispatch_result_t filed_dispatch_utimens_page(filed_runtime_t *runtim
 filed_page_dispatch_result_t filed_dispatch_chmod_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pread_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(filed_runtime_t *runtime, void *page, int vmo_fd);
-int filed_dispatch_file_vmo_v2(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_request_header_t *header);
-int filed_dispatch_shared_file_vmo_v2(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_request_header_t *header);
+int filed_dispatch_file_vmo(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_envelope_t *header);
+int filed_dispatch_shared_file_vmo(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_envelope_t *header);
 filed_page_dispatch_result_t filed_dispatch_memfd_create_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_read_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pwrite_page(filed_runtime_t *runtime, void *page);
@@ -167,6 +167,6 @@ filed_page_dispatch_result_t filed_dispatch_set_flags_page(filed_runtime_t *runt
 filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(filed_runtime_t *runtime, void *page);
 int filed_dispatch_exec_path(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request);
 int filed_dispatch_exec_self(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request);
-int filed_dispatch_session_open_v2(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *page, const pacha_service_request_header_t *header, int *out_channel_fd, int *out_page_fd);
+int filed_dispatch_session_open(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *page, const pacha_service_envelope_t *header, int *out_channel_fd, int *out_page_fd);
 uint64_t filed_import_termd_error(filed_runtime_t *runtime, uint64_t child_token, uint64_t request_id, int64_t status, uint64_t fd_count, uint64_t subject, const char *text);
-int filed_dispatch_register_termd_signal_supervisor_v2(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *page, const pacha_service_request_header_t *header);
+int filed_dispatch_register_termd_signal_supervisor(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *page, const pacha_service_envelope_t *header);

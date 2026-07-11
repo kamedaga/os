@@ -16,7 +16,7 @@ int64_t lpr_termd_call(
         return -LPR_LINUX_ENOTTY;
     }
     if (page_fd < 16 || page == 0 ||
-        payload_size > TERMD_V2_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES)
+        payload_size > TERMD_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES)
     {
         return -LPR_LINUX_EINVAL;
     }
@@ -28,11 +28,11 @@ int64_t lpr_termd_call(
     lpr_zero_bytes(&reply, sizeof(reply));
 
     const uint64_t request_id = lpr_next_request_id(&lpr_termd_request_id);
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = TERMD_V2_SERVICE_ID;
+    header->service_id = TERMD_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -95,13 +95,13 @@ int64_t lpr_termd_call(
             "termd reply recv failed");
         return err;
     }
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request.word3 ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
         reply_header->request_id != request.word3 ||
-        reply_header->service_id != TERMD_V2_SERVICE_ID ||
+        reply_header->service_id != TERMD_SERVICE_ID ||
         reply_header->op != op)
     {
         lpr_trace_error_record(
@@ -143,7 +143,7 @@ int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result
     if (page_fd < 0) {
         return page_fd;
     }
-    termd_v2_handle_request_t *req = (termd_v2_handle_request_t *)lpr_termd_payload(page);
+    termd_handle_request_t *req = (termd_handle_request_t *)lpr_termd_payload(page);
     lpr_memset(req, 0, sizeof(*req));
     req->handle = handle;
     lpr_fill_termd_caller(&req->tty.session_id, &req->tty.process_id, &req->tty.pgrp_id);
@@ -370,22 +370,22 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
     uint64_t op = 0;
     uint64_t pts_index = 0;
     if (lpr_strcmp(path, "/dev/ptmx") == 0) {
-        op = TERMD_V2_OP_OPEN_PTMX;
+        op = TERMD_OP_OPEN_PTMX;
     } else if (lpr_strcmp(path, "/dev/tty") == 0) {
-        op = TERMD_V2_OP_OPEN_CTTY;
+        op = TERMD_OP_OPEN_CTTY;
     } else if (lpr_strcmp(path, "/dev/console") == 0) {
-        op = TERMD_V2_OP_OPEN_HVC;
+        op = TERMD_OP_OPEN_HVC;
         pts_index = 0;
     } else {
         pts_index = lpr_parse_pts_index(path);
         if (pts_index != UINT64_MAX) {
-            op = TERMD_V2_OP_OPEN_PTS;
+            op = TERMD_OP_OPEN_PTS;
         } else {
             pts_index = lpr_parse_hvc_index(path);
             if (pts_index == UINT64_MAX) {
                 return -LPR_LINUX_ENOENT;
             }
-            op = TERMD_V2_OP_OPEN_HVC;
+            op = TERMD_OP_OPEN_HVC;
         }
     }
 
@@ -394,7 +394,7 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
     if (page_fd < 0) {
         return page_fd;
     }
-    termd_v2_open_request_t *open_req = (termd_v2_open_request_t *)lpr_termd_payload(page);
+    termd_open_request_t *open_req = (termd_open_request_t *)lpr_termd_payload(page);
     lpr_memset(open_req, 0, sizeof(*open_req));
     open_req->flags = flags;
     open_req->pts_index = pts_index;
@@ -413,7 +413,7 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
     }
     const int fd = lpr_tty_fd_alloc(handle, flags);
     if (fd < 0) {
-        (void)lpr_termd_call_handle(TERMD_V2_OP_HANDLE_CLOSE, handle, 0);
+        (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
         return fd;
     }
     return fd;

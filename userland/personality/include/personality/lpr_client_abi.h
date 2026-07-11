@@ -2,12 +2,12 @@
 
 #include <stdint.h>
 
-#include "filed/ipc_protocol_v2.h"
-#include "filed/payload_v2.h"
-#include "lpr_supervisor/ipc_protocol_v2.h"
-#include "netd/ipc_protocol_v2.h"
+#include "filed/ipc_protocol.h"
+#include "filed/payload.h"
+#include "lpr_supervisor/ipc_protocol.h"
+#include "netd/ipc_protocol.h"
 #include "pacha/service_abi.h"
-#include "termd/ipc_protocol_v2.h"
+#include "termd/ipc_protocol.h"
 
 enum {
     LPR_CLIENT_ABI_VERSION = PACHA_SERVICE_ABI_VERSION,

@@ -121,8 +121,8 @@ add_custom_command(
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${TERMD_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/boot_config.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol_v2.h"
-    "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol_v2.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.c"

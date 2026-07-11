@@ -2,7 +2,7 @@
 #include <personality/runtime_page.h>
 #include <personality/lpr_image_abi.h>
 #include <personality/zpoline.h>
-#include <personality/coordinator_protocol_v2.h>
+#include <personality/coordinator_protocol.h>
 #include <personality/linux_lpr.h>
 
 int main(void) {
@@ -13,7 +13,7 @@ int main(void) {
     runtime.magic = LPR_RUNTIME_MAGIC;
     trap.magic = PERSONALITY_TRAP_FRAME_MAGIC;
     patch.start_va = LPR_ZPOLINE_PAGE_VA;
-    request.magic = LPR_COORDINATOR_V2_MAGIC;
+    request.magic = PACHA_SERVICE_REQUEST_MAGIC;
     (void)LPR_LINUX_SYS_WRITE;
     return runtime.magic == 0 || trap.magic == 0 || request.magic == 0;
 }

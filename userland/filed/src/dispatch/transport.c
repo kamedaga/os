@@ -19,68 +19,68 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
     void *page)
 {
     switch (request->word1) {
-    case FILED_V2_OP_DIAG_PING:
+    case FILED_OP_DIAG_PING:
         return filed_page_result(0, request->word2);
-    case FILED_V2_OP_VFS_OPENAT:
+    case FILED_OP_VFS_OPENAT:
         return filed_dispatch_openat_page(runtime, page);
-    case FILED_V2_OP_VFS_VALIDATE_OPEN_CACHE:
+    case FILED_OP_VFS_VALIDATE_OPEN_CACHE:
         return filed_dispatch_validate_open_cache_page(runtime, page);
-    case FILED_V2_OP_VFS_STAT:
+    case FILED_OP_VFS_STAT:
         return filed_dispatch_stat_page(runtime, page);
-    case FILED_V2_OP_VFS_UTIMENS:
+    case FILED_OP_VFS_UTIMENS:
         return filed_dispatch_utimens_page(runtime, page);
-    case FILED_V2_OP_VFS_CHMOD:
+    case FILED_OP_VFS_CHMOD:
         return filed_dispatch_chmod_page(runtime, page);
-    case FILED_V2_OP_VFS_PREAD:
+    case FILED_OP_VFS_PREAD:
         return filed_dispatch_pread_page(runtime, page);
-    case FILED_V2_OP_VFS_READ:
+    case FILED_OP_VFS_READ:
         return filed_dispatch_read_page(runtime, page);
-    case FILED_V2_OP_VFS_PREAD_TO_VMO:
+    case FILED_OP_VFS_PREAD_TO_VMO:
         return filed_page_result(-95, 0);
-    case FILED_V2_OP_VFS_PWRITE:
+    case FILED_OP_VFS_PWRITE:
         return filed_dispatch_pwrite_page(runtime, page);
-    case FILED_V2_OP_VFS_WRITE:
+    case FILED_OP_VFS_WRITE:
         return filed_dispatch_write_page(runtime, page);
-    case FILED_V2_OP_VFS_TRUNCATE:
+    case FILED_OP_VFS_TRUNCATE:
         return filed_dispatch_truncate_page(runtime, page);
-    case FILED_V2_OP_VFS_MEMFD_CREATE:
+    case FILED_OP_VFS_MEMFD_CREATE:
         return filed_dispatch_memfd_create_page(runtime, page);
-    case FILED_V2_OP_VFS_UNLINK:
+    case FILED_OP_VFS_UNLINK:
         return filed_dispatch_unlink_page(runtime, page);
-    case FILED_V2_OP_VFS_RENAME:
+    case FILED_OP_VFS_RENAME:
         return filed_dispatch_rename_page(runtime, page);
-    case FILED_V2_OP_VFS_MKDIR:
+    case FILED_OP_VFS_MKDIR:
         return filed_dispatch_mkdir_page(runtime, page);
-    case FILED_V2_OP_VFS_RMDIR:
+    case FILED_OP_VFS_RMDIR:
         return filed_dispatch_rmdir_page(runtime, page);
-    case FILED_V2_OP_VFS_SYMLINK:
+    case FILED_OP_VFS_SYMLINK:
         return filed_dispatch_symlink_page(runtime, page);
-    case FILED_V2_OP_VFS_READLINK:
+    case FILED_OP_VFS_READLINK:
         return filed_dispatch_readlink_page(runtime, page);
-    case FILED_V2_OP_VFS_LINK:
+    case FILED_OP_VFS_LINK:
         return filed_dispatch_link_page(runtime, page);
-    case FILED_V2_OP_VFS_GETDENTS:
+    case FILED_OP_VFS_GETDENTS:
         return filed_dispatch_getdents_page(runtime, page);
-    case FILED_V2_OP_VFS_DUP:
+    case FILED_OP_VFS_DUP:
         return filed_dispatch_dup_page(runtime, page);
-    case FILED_V2_OP_VFS_GET_FLAGS:
+    case FILED_OP_VFS_GET_FLAGS:
         return filed_dispatch_get_flags_page(runtime, page);
-    case FILED_V2_OP_VFS_SET_FLAGS:
+    case FILED_OP_VFS_SET_FLAGS:
         return filed_dispatch_set_flags_page(runtime, page);
-    case FILED_V2_OP_VFS_FSYNC:
+    case FILED_OP_VFS_FSYNC:
         return filed_dispatch_fsync_page(runtime, request);
-    case FILED_V2_OP_VFS_SEEK:
+    case FILED_OP_VFS_SEEK:
         return filed_dispatch_seek_page(runtime, page);
-    case FILED_V2_OP_EXEC_PATH:
+    case FILED_OP_EXEC_PATH:
         return filed_dispatch_exec_path_session_page(runtime, page);
-    case FILED_V2_OP_EXEC_SELF:
+    case FILED_OP_EXEC_SELF:
         return filed_page_result(-95, 0);
-    case FILED_V2_OP_VFS_CLOSE:
+    case FILED_OP_VFS_CLOSE:
         return filed_dispatch_close_page(runtime, request);
-    case FILED_V2_OP_VFS_SYNC_ALL:
+    case FILED_OP_VFS_SYNC_ALL:
         return filed_page_result(filed_dispatch_sync_all(runtime), 0);
-    case FILED_V2_OP_SERVICE_SET_NETD_SOCKET:
-    case FILED_V2_OP_SERVICE_SET_TERMD_TTY:
+    case FILED_OP_SERVICE_SET_NETD_SOCKET:
+    case FILED_OP_SERVICE_SET_TERMD_TTY:
         return filed_page_result(-95, 0);
     default:
         return filed_page_result(-95, 0);
@@ -89,13 +89,13 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
 
 static int filed_session_fast_validate(
     const filed_session_t *session,
-    filed_v2_fast_header_t **out_header,
-    filed_v2_fast_request_t **out_requests,
-    filed_v2_fast_completion_t **out_completions)
+    filed_fast_header_t **out_header,
+    filed_fast_request_t **out_requests,
+    filed_fast_completion_t **out_completions)
 {
     if (session == NULL ||
         session->page == NULL ||
-        session->page_size < FILED_V2_SESSION_PAGE_BYTES ||
+        session->page_size < FILED_SESSION_PAGE_BYTES ||
         out_header == NULL ||
         out_requests == NULL ||
         out_completions == NULL)
@@ -103,42 +103,42 @@ static int filed_session_fast_validate(
         return -22;
     }
 
-    filed_v2_fast_header_t *header = (filed_v2_fast_header_t *)session->page;
-    if (header->magic != FILED_V2_FAST_MAGIC ||
-        header->version != FILED_V2_FAST_VERSION ||
-        header->request_capacity != FILED_V2_FAST_REQUEST_CAPACITY ||
-        header->completion_capacity != FILED_V2_FAST_COMPLETION_CAPACITY ||
-        header->payload_slot_count != FILED_V2_FAST_PAYLOAD_SLOT_COUNT ||
-        header->payload_slot_size != FILED_V2_PAGE_BYTES ||
-        header->payload_offset != FILED_V2_FAST_PAYLOAD_OFFSET ||
-        header->generation_offset != FILED_V2_FAST_GENERATION_OFFSET ||
-        header->generation_capacity != FILED_V2_FAST_GENERATION_CAPACITY ||
+    filed_fast_header_t *header = (filed_fast_header_t *)session->page;
+    if (header->magic != FILED_FAST_MAGIC ||
+        header->version != FILED_FAST_VERSION ||
+        header->request_capacity != FILED_FAST_REQUEST_CAPACITY ||
+        header->completion_capacity != FILED_FAST_COMPLETION_CAPACITY ||
+        header->payload_slot_count != FILED_FAST_PAYLOAD_SLOT_COUNT ||
+        header->payload_slot_size != FILED_PAGE_BYTES ||
+        header->payload_offset != FILED_FAST_PAYLOAD_OFFSET ||
+        header->generation_offset != FILED_FAST_GENERATION_OFFSET ||
+        header->generation_capacity != FILED_FAST_GENERATION_CAPACITY ||
         header->payload_offset + header->payload_slot_count * header->payload_slot_size > session->page_size)
     {
         return -71;
     }
 
     *out_header = header;
-    *out_requests = (filed_v2_fast_request_t *)((uint8_t *)session->page + sizeof(*header));
-    *out_completions = (filed_v2_fast_completion_t *)((uint8_t *)(*out_requests) +
+    *out_requests = (filed_fast_request_t *)((uint8_t *)session->page + sizeof(*header));
+    *out_completions = (filed_fast_completion_t *)((uint8_t *)(*out_requests) +
         sizeof(**out_requests) * header->request_capacity);
     return 0;
 }
 
 static void *filed_session_fast_payload(
     const filed_session_t *session,
-    const filed_v2_fast_header_t *header,
+    const filed_fast_header_t *header,
     uint64_t payload_slot)
 {
     if (session == NULL ||
         header == NULL ||
         payload_slot >= header->payload_slot_count ||
-        header->payload_slot_size != FILED_V2_PAGE_BYTES)
+        header->payload_slot_size != FILED_PAGE_BYTES)
     {
         return NULL;
     }
     const uint64_t offset = header->payload_offset + payload_slot * header->payload_slot_size;
-    if (offset + FILED_V2_PAGE_BYTES > session->page_size) {
+    if (offset + FILED_PAGE_BYTES > session->page_size) {
         return NULL;
     }
     return (uint8_t *)session->page + offset;
@@ -147,7 +147,7 @@ static void *filed_session_fast_payload(
 static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
     filed_runtime_t *runtime,
     filed_session_t *session,
-    filed_v2_fast_header_t *header,
+    filed_fast_header_t *header,
     uint64_t batch_count,
     bool append)
 {
@@ -157,7 +157,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
 
     uint64_t total = 0;
     int64_t status = 0;
-    const uint64_t op = append ? FILED_V2_OP_VFS_WRITE : FILED_V2_OP_VFS_PWRITE;
+    const uint64_t op = append ? FILED_OP_VFS_WRITE : FILED_OP_VFS_PWRITE;
     for (uint64_t slot = 0; slot < batch_count; slot++) {
         void *payload = filed_session_fast_payload(session, header, slot);
         if (payload == NULL) {
@@ -165,7 +165,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
             break;
         }
 
-        filed_v2_io_t *io = (filed_v2_io_t *)payload;
+        filed_io_t *io = (filed_io_t *)payload;
         const uint64_t requested = io->length;
         const uint64_t start_cycles = filed_read_tsc();
         const filed_page_dispatch_result_t result = append ?
@@ -195,9 +195,9 @@ static uint64_t filed_dispatch_session_fast_drain(
     filed_session_t *session,
     int *out_status)
 {
-    filed_v2_fast_header_t *header = NULL;
-    filed_v2_fast_request_t *requests = NULL;
-    filed_v2_fast_completion_t *completions = NULL;
+    filed_fast_header_t *header = NULL;
+    filed_fast_request_t *requests = NULL;
+    filed_fast_completion_t *completions = NULL;
     uint64_t completed = 0;
     int status = filed_session_fast_validate(session, &header, &requests, &completions);
     if (status != 0) {
@@ -213,7 +213,7 @@ static uint64_t filed_dispatch_session_fast_drain(
             break;
         }
 
-        filed_v2_fast_request_t *fast_request =
+        filed_fast_request_t *fast_request =
             &requests[header->request_head % header->request_capacity];
         const uint64_t fast_op_start_cycles = filed_read_tsc();
         void *payload = filed_session_fast_payload(session, header, fast_request->payload_slot);
@@ -227,15 +227,15 @@ static uint64_t filed_dispatch_session_fast_drain(
             pseudo_request.word3 = fast_request->request_id;
 
             const uint64_t start_cycles = filed_read_tsc();
-            if (fast_request->opcode == FILED_V2_OP_VFS_PWRITE_BATCH ||
-                fast_request->opcode == FILED_V2_OP_VFS_WRITE_BATCH)
+            if (fast_request->opcode == FILED_OP_VFS_PWRITE_BATCH ||
+                fast_request->opcode == FILED_OP_VFS_WRITE_BATCH)
             {
                 result = filed_dispatch_session_write_batch(
                     runtime,
                     session,
                     header,
                     fast_request->word2,
-                    fast_request->opcode == FILED_V2_OP_VFS_WRITE_BATCH);
+                    fast_request->opcode == FILED_OP_VFS_WRITE_BATCH);
                 filed_record_dispatch_metric_cycles(
                     runtime,
                     pseudo_request.word1,
@@ -253,7 +253,7 @@ static uint64_t filed_dispatch_session_fast_drain(
             }
         }
 
-        filed_v2_fast_completion_t *completion =
+        filed_fast_completion_t *completion =
             &completions[header->completion_tail % header->completion_capacity];
         memset(completion, 0, sizeof(*completion));
         completion->request_id = fast_request->request_id;
@@ -304,12 +304,12 @@ int filed_dispatch_session_once(filed_runtime_t *runtime, uint64_t session_index
     if (recv_status != 0) {
         return recv_status;
     }
-    const int request_is_v2 =
+    const int request_is =
         request.word0 == PACHA_SERVICE_REQUEST_MAGIC &&
-        request.word1 == FILED_V2_OP_SESSION_DOORBELL &&
+        request.word1 == FILED_OP_SESSION_DOORBELL &&
         request.word3 != 0;
-    if (!request_is_v2) {
-        return filed_send_session_reply_v2(session->channel_fd, request.word3, -22, 0);
+    if (!request_is) {
+        return filed_send_session_reply(session->channel_fd, request.word3, -22, 0);
     }
 
     int drain_status = 0;
@@ -320,7 +320,7 @@ int filed_dispatch_session_once(filed_runtime_t *runtime, uint64_t session_index
     const uint64_t drain_end_ns = filed_now_ns();
     const uint64_t reply_start_ns = filed_now_ns();
     const uint64_t reply_start_cycles = filed_read_tsc();
-    const int reply_status = filed_send_session_reply_v2(
+    const int reply_status = filed_send_session_reply(
         session->channel_fd,
         request.word3,
         drain_status,
@@ -399,47 +399,47 @@ static void filed_close_received_fds_except(
     filed_close_received_fds_except3(request, keep_fd, keep_fd2, -1);
 }
 
-typedef struct filed_v2_route_result {
+typedef struct filed_route_result {
     int replied;
     int reply_status;
     int keep_fd;
     int64_t status;
     uint64_t result;
-} filed_v2_route_result_t;
+} filed_route_result_t;
 
-static filed_v2_route_result_t filed_v2_route_pending(void)
+static filed_route_result_t filed_route_pending(void)
 {
-    filed_v2_route_result_t result;
+    filed_route_result_t result;
     memset(&result, 0, sizeof(result));
     result.keep_fd = -1;
     return result;
 }
 
-static filed_v2_route_result_t filed_v2_route_replied(int reply_status)
+static filed_route_result_t filed_route_replied(int reply_status)
 {
-    filed_v2_route_result_t result = filed_v2_route_pending();
+    filed_route_result_t result = filed_route_pending();
     result.replied = 1;
     result.reply_status = reply_status;
     return result;
 }
 
-static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
+static filed_route_result_t filed_dispatch_client_vfs(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
     void *page,
-    const pacha_service_request_header_t *header)
+    const pacha_service_envelope_t *header)
 {
-    filed_v2_route_result_t route = filed_v2_route_pending();
+    filed_route_result_t route = filed_route_pending();
     void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
 
     switch (header->op) {
-    case FILED_V2_OP_VFS_OPENAT:
-        if (header->payload_size < sizeof(filed_v2_path_request_t)) {
+    case FILED_OP_VFS_OPENAT:
+        if (header->payload_size < sizeof(filed_path_request_t)) {
             route.status = -22;
         } else {
-            filed_v2_path_request_t *path = (filed_v2_path_request_t *)payload;
-            filed_v2_openat_t openat;
+            filed_path_request_t *path = (filed_path_request_t *)payload;
+            filed_openat_t openat;
             memset(&openat, 0, sizeof(openat));
             openat.dir_handle = path->dir_handle;
             openat.rights = path->rights;
@@ -451,19 +451,19 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = open_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_CLOSE:
-        if (header->payload_size < sizeof(filed_v2_handle_request_t)) {
+    case FILED_OP_VFS_CLOSE:
+        if (header->payload_size < sizeof(filed_handle_request_t)) {
             route.status = -22;
         } else {
-            const filed_v2_handle_request_t *handle = (const filed_v2_handle_request_t *)payload;
+            const filed_handle_request_t *handle = (const filed_handle_request_t *)payload;
             const filed_handle_id_t handle_id = (filed_handle_id_t)(uint32_t)handle->handle;
             route.status = handle_id == runtime->root_handle_id ?
                 -13 :
                 filed_close_handle_runtime(runtime, handle_id);
         }
         break;
-    case FILED_V2_OP_VFS_STAT:
-        if (header->payload_size < sizeof(filed_v2_statx_t)) {
+    case FILED_OP_VFS_STAT:
+        if (header->payload_size < sizeof(filed_statx_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -472,8 +472,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_READ:
-        if (header->payload_size < sizeof(filed_v2_io_t)) {
+    case FILED_OP_VFS_READ:
+        if (header->payload_size < sizeof(filed_io_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -482,8 +482,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_PREAD:
-        if (header->payload_size < sizeof(filed_v2_io_t)) {
+    case FILED_OP_VFS_PREAD:
+        if (header->payload_size < sizeof(filed_io_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -492,8 +492,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_WRITE:
-        if (header->payload_size < sizeof(filed_v2_io_t)) {
+    case FILED_OP_VFS_WRITE:
+        if (header->payload_size < sizeof(filed_io_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -502,8 +502,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_PWRITE:
-        if (header->payload_size < sizeof(filed_v2_io_t)) {
+    case FILED_OP_VFS_PWRITE:
+        if (header->payload_size < sizeof(filed_io_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -512,8 +512,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_GETDENTS:
-        if (header->payload_size < sizeof(filed_v2_getdents_t)) {
+    case FILED_OP_VFS_GETDENTS:
+        if (header->payload_size < sizeof(filed_getdents_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -522,8 +522,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_SEEK:
-        if (header->payload_size < sizeof(filed_v2_seek_t)) {
+    case FILED_OP_VFS_SEEK:
+        if (header->payload_size < sizeof(filed_seek_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -532,8 +532,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_DUP:
-        if (header->payload_size < sizeof(filed_v2_handle_flags_t)) {
+    case FILED_OP_VFS_DUP:
+        if (header->payload_size < sizeof(filed_handle_flags_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -542,8 +542,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_GET_FLAGS:
-        if (header->payload_size < sizeof(filed_v2_handle_flags_t)) {
+    case FILED_OP_VFS_GET_FLAGS:
+        if (header->payload_size < sizeof(filed_handle_flags_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -552,8 +552,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_SET_FLAGS:
-        if (header->payload_size < sizeof(filed_v2_handle_flags_t)) {
+    case FILED_OP_VFS_SET_FLAGS:
+        if (header->payload_size < sizeof(filed_handle_flags_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -562,11 +562,11 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_FSYNC:
-        if (header->payload_size < sizeof(filed_v2_handle_request_t)) {
+    case FILED_OP_VFS_FSYNC:
+        if (header->payload_size < sizeof(filed_handle_request_t)) {
             route.status = -22;
         } else {
-            const filed_v2_handle_request_t *handle = (const filed_v2_handle_request_t *)payload;
+            const filed_handle_request_t *handle = (const filed_handle_request_t *)payload;
             struct pacha_ipc_msg pseudo_request;
             memset(&pseudo_request, 0, sizeof(pseudo_request));
             pseudo_request.word2 = handle->handle;
@@ -576,8 +576,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_TRUNCATE:
-        if (header->payload_size < sizeof(filed_v2_truncate_t)) {
+    case FILED_OP_VFS_TRUNCATE:
+        if (header->payload_size < sizeof(filed_truncate_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -586,8 +586,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_UNLINK:
-        if (header->payload_size < sizeof(filed_v2_unlink_t)) {
+    case FILED_OP_VFS_UNLINK:
+        if (header->payload_size < sizeof(filed_unlink_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -596,8 +596,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_RENAME:
-        if (header->payload_size < sizeof(filed_v2_rename_t)) {
+    case FILED_OP_VFS_RENAME:
+        if (header->payload_size < sizeof(filed_rename_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -606,8 +606,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_MKDIR:
-        if (header->payload_size < sizeof(filed_v2_mkdir_t)) {
+    case FILED_OP_VFS_MKDIR:
+        if (header->payload_size < sizeof(filed_mkdir_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -616,8 +616,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_RMDIR:
-        if (header->payload_size < sizeof(filed_v2_rmdir_t)) {
+    case FILED_OP_VFS_RMDIR:
+        if (header->payload_size < sizeof(filed_rmdir_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -626,8 +626,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_SYMLINK:
-        if (header->payload_size < sizeof(filed_v2_symlink_t)) {
+    case FILED_OP_VFS_SYMLINK:
+        if (header->payload_size < sizeof(filed_symlink_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -636,8 +636,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_READLINK:
-        if (header->payload_size < sizeof(filed_v2_readlink_t)) {
+    case FILED_OP_VFS_READLINK:
+        if (header->payload_size < sizeof(filed_readlink_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -646,8 +646,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_LINK:
-        if (header->payload_size < sizeof(filed_v2_link_t)) {
+    case FILED_OP_VFS_LINK:
+        if (header->payload_size < sizeof(filed_link_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -656,8 +656,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_UTIMENS:
-        if (header->payload_size < sizeof(filed_v2_utimens_t)) {
+    case FILED_OP_VFS_UTIMENS:
+        if (header->payload_size < sizeof(filed_utimens_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -666,8 +666,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_CHMOD:
-        if (header->payload_size < sizeof(filed_v2_chmod_t)) {
+    case FILED_OP_VFS_CHMOD:
+        if (header->payload_size < sizeof(filed_chmod_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -676,8 +676,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_MEMFD_CREATE:
-        if (header->payload_size < sizeof(filed_v2_memfd_create_t)) {
+    case FILED_OP_VFS_MEMFD_CREATE:
+        if (header->payload_size < sizeof(filed_memfd_create_t)) {
             route.status = -22;
         } else {
             const filed_page_dispatch_result_t page_result =
@@ -686,8 +686,8 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_FILE_VMO: {
-        const int reply_status = filed_dispatch_file_vmo_v2(
+    case FILED_OP_VFS_FILE_VMO: {
+        const int reply_status = filed_dispatch_file_vmo(
             runtime,
             reply_fd,
             request,
@@ -695,10 +695,10 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             header);
         (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
         filed_close_received_fds_except(request, reply_fd, -1);
-        return filed_v2_route_replied(reply_status);
+        return filed_route_replied(reply_status);
     }
-    case FILED_V2_OP_VFS_SHARED_FILE_VMO: {
-        const int reply_status = filed_dispatch_shared_file_vmo_v2(
+    case FILED_OP_VFS_SHARED_FILE_VMO: {
+        const int reply_status = filed_dispatch_shared_file_vmo(
             runtime,
             reply_fd,
             request,
@@ -706,10 +706,10 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             header);
         (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
         filed_close_received_fds_except(request, reply_fd, -1);
-        return filed_v2_route_replied(reply_status);
+        return filed_route_replied(reply_status);
     }
-    case FILED_V2_OP_VFS_PREAD_TO_VMO:
-        if (header->payload_size < sizeof(filed_v2_pread_vmo_t) ||
+    case FILED_OP_VFS_PREAD_TO_VMO:
+        if (header->payload_size < sizeof(filed_pread_vmo_t) ||
             request->fd_count < 2 ||
             request->fds == NULL ||
             request->fds[1].fd < 16)
@@ -722,7 +722,7 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
             route.result = page_result.result;
         }
         break;
-    case FILED_V2_OP_VFS_SYNC_ALL:
+    case FILED_OP_VFS_SYNC_ALL:
         route.status = filed_dispatch_sync_all(runtime);
         break;
     default:
@@ -732,7 +732,7 @@ static filed_v2_route_result_t filed_dispatch_client_vfs_v2(
     return route;
 }
 
-static int filed_dispatch_client_v2(
+static int filed_dispatch_client(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request)
@@ -744,15 +744,15 @@ static int filed_dispatch_client_v2(
         request->fds[0].fd < 16 ||
         request->fds[0].fd == (uint64_t)(uint32_t)reply_fd)
     {
-        pacha_service_request_header_t header;
+        pacha_service_envelope_t header;
         memset(&header, 0, sizeof(header));
         header.magic = PACHA_SERVICE_REQUEST_MAGIC;
         header.abi_version = PACHA_SERVICE_ABI_VERSION;
-        header.service_id = FILED_V2_SERVICE_ID;
+        header.service_id = FILED_SERVICE_ID;
         header.request_id = request != NULL ? request->word3 : 0;
         header.trace_id = request != NULL ? request->word3 : 0;
         filed_close_received_fds_except(request, reply_fd, -1);
-        return filed_send_reply_v2(reply_fd, NULL, &header, -22, 0, 0);
+        return filed_send_reply(reply_fd, NULL, &header, -22, 0, 0);
     }
 
     const int page_fd = (int)(uint32_t)request->fds[0].fd;
@@ -773,25 +773,25 @@ static int filed_dispatch_client_v2(
             request->fd_count,
             (uint64_t)(uint32_t)page_fd,
             0,
-            "filed v2 request page map failed");
-        pacha_service_request_header_t header;
+            "filed request page map failed");
+        pacha_service_envelope_t header;
         memset(&header, 0, sizeof(header));
         header.magic = PACHA_SERVICE_REQUEST_MAGIC;
         header.abi_version = PACHA_SERVICE_ABI_VERSION;
-        header.service_id = FILED_V2_SERVICE_ID;
+        header.service_id = FILED_SERVICE_ID;
         header.request_id = request->word3;
         header.trace_id = request->word3;
-        return filed_send_reply_v2(reply_fd, NULL, &header, -5, 0, token);
+        return filed_send_reply(reply_fd, NULL, &header, -5, 0, token);
     }
 
-    pacha_service_request_header_t header;
+    pacha_service_envelope_t header;
     memcpy(&header, page, sizeof(header));
-    if (!pacha_service_request_header_is_v2(&header, FILED_V2_SERVICE_ID) ||
+    if (!pacha_service_request_is_valid(&header, FILED_SERVICE_ID) ||
         header.request_id == 0 ||
         header.request_id != request->word3)
     {
-        pacha_service_reply_header_init(
-            (pacha_service_reply_header_t *)page,
+        pacha_service_reply_init(
+            (pacha_service_envelope_t *)page,
             &header,
             -22,
             PACHA_SERVICE_ERROR_ABI,
@@ -799,7 +799,7 @@ static int filed_dispatch_client_v2(
             0);
         (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
         filed_close_received_fds_except(request, reply_fd, -1);
-        return filed_send_reply_v2(reply_fd, NULL, &header, -22, 0, 0);
+        return filed_send_reply(reply_fd, NULL, &header, -22, 0, 0);
     }
 
     int keep_fd = -1;
@@ -807,13 +807,13 @@ static int filed_dispatch_client_v2(
     uint64_t result = 0;
     uint64_t error_token = 0;
     switch (header.op) {
-    case FILED_V2_OP_HELLO:
+    case FILED_OP_HELLO:
         result = PACHA_SERVICE_ABI_VERSION;
         break;
-    case FILED_V2_OP_SESSION_OPEN: {
+    case FILED_OP_SESSION_OPEN: {
         int keep_session_channel_fd = -1;
         int keep_session_page_fd = -1;
-        const int reply_status = filed_dispatch_session_open_v2(
+        const int reply_status = filed_dispatch_session_open(
             runtime,
             reply_fd,
             request,
@@ -829,39 +829,39 @@ static int filed_dispatch_client_v2(
             reply_fd);
         return reply_status;
     }
-    case FILED_V2_OP_DIAG_ERROR_GET:
+    case FILED_OP_DIAG_ERROR_GET:
         status = PACHA_STATUS_ENOTSUP;
         break;
         break;
-    case FILED_V2_OP_VFS_OPENAT:
-    case FILED_V2_OP_VFS_CLOSE:
-    case FILED_V2_OP_VFS_STAT:
-    case FILED_V2_OP_VFS_READ:
-    case FILED_V2_OP_VFS_PREAD:
-    case FILED_V2_OP_VFS_WRITE:
-    case FILED_V2_OP_VFS_PWRITE:
-    case FILED_V2_OP_VFS_GETDENTS:
-    case FILED_V2_OP_VFS_SEEK:
-    case FILED_V2_OP_VFS_DUP:
-    case FILED_V2_OP_VFS_GET_FLAGS:
-    case FILED_V2_OP_VFS_SET_FLAGS:
-    case FILED_V2_OP_VFS_FSYNC:
-    case FILED_V2_OP_VFS_TRUNCATE:
-    case FILED_V2_OP_VFS_UNLINK:
-    case FILED_V2_OP_VFS_RENAME:
-    case FILED_V2_OP_VFS_MKDIR:
-    case FILED_V2_OP_VFS_RMDIR:
-    case FILED_V2_OP_VFS_SYMLINK:
-    case FILED_V2_OP_VFS_READLINK:
-    case FILED_V2_OP_VFS_LINK:
-    case FILED_V2_OP_VFS_UTIMENS:
-    case FILED_V2_OP_VFS_CHMOD:
-    case FILED_V2_OP_VFS_FILE_VMO:
-    case FILED_V2_OP_VFS_SHARED_FILE_VMO:
-    case FILED_V2_OP_VFS_MEMFD_CREATE:
-    case FILED_V2_OP_VFS_PREAD_TO_VMO:
-    case FILED_V2_OP_VFS_SYNC_ALL: {
-        const filed_v2_route_result_t route = filed_dispatch_client_vfs_v2(
+    case FILED_OP_VFS_OPENAT:
+    case FILED_OP_VFS_CLOSE:
+    case FILED_OP_VFS_STAT:
+    case FILED_OP_VFS_READ:
+    case FILED_OP_VFS_PREAD:
+    case FILED_OP_VFS_WRITE:
+    case FILED_OP_VFS_PWRITE:
+    case FILED_OP_VFS_GETDENTS:
+    case FILED_OP_VFS_SEEK:
+    case FILED_OP_VFS_DUP:
+    case FILED_OP_VFS_GET_FLAGS:
+    case FILED_OP_VFS_SET_FLAGS:
+    case FILED_OP_VFS_FSYNC:
+    case FILED_OP_VFS_TRUNCATE:
+    case FILED_OP_VFS_UNLINK:
+    case FILED_OP_VFS_RENAME:
+    case FILED_OP_VFS_MKDIR:
+    case FILED_OP_VFS_RMDIR:
+    case FILED_OP_VFS_SYMLINK:
+    case FILED_OP_VFS_READLINK:
+    case FILED_OP_VFS_LINK:
+    case FILED_OP_VFS_UTIMENS:
+    case FILED_OP_VFS_CHMOD:
+    case FILED_OP_VFS_FILE_VMO:
+    case FILED_OP_VFS_SHARED_FILE_VMO:
+    case FILED_OP_VFS_MEMFD_CREATE:
+    case FILED_OP_VFS_PREAD_TO_VMO:
+    case FILED_OP_VFS_SYNC_ALL: {
+        const filed_route_result_t route = filed_dispatch_client_vfs(
             runtime,
             reply_fd,
             request,
@@ -875,43 +875,43 @@ static int filed_dispatch_client_v2(
         result = route.result;
         break;
     }
-    case FILED_V2_OP_EXEC_PATH:
-        if (header.payload_size < sizeof(filed_v2_exec_path_t)) {
+    case FILED_OP_EXEC_PATH:
+        if (header.payload_size < sizeof(filed_exec_path_t)) {
             status = -22;
         } else {
-            memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_v2_exec_path_t));
+            memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_exec_path_t));
             struct pacha_ipc_msg exec_request = *request;
             exec_request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
-            exec_request.word1 = FILED_V2_OP_EXEC_PATH;
+            exec_request.word1 = FILED_OP_EXEC_PATH;
             exec_request.word2 = 0;
             exec_request.word3 = header.request_id;
             (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
             return filed_dispatch_exec_path(runtime, reply_fd, &exec_request);
         }
         break;
-    case FILED_V2_OP_EXEC_SELF:
-        if (header.payload_size < sizeof(filed_v2_exec_path_t)) {
+    case FILED_OP_EXEC_SELF:
+        if (header.payload_size < sizeof(filed_exec_path_t)) {
             status = -22;
         } else {
-            memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_v2_exec_path_t));
+            memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_exec_path_t));
             struct pacha_ipc_msg exec_request = *request;
             exec_request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
-            exec_request.word1 = FILED_V2_OP_EXEC_SELF;
+            exec_request.word1 = FILED_OP_EXEC_SELF;
             exec_request.word2 = 0;
             exec_request.word3 = header.request_id;
             (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
             return filed_dispatch_exec_self(runtime, reply_fd, &exec_request);
         }
         break;
-    case FILED_V2_OP_DIAG_DUMP_METRICS:
+    case FILED_OP_DIAG_DUMP_METRICS:
         filed_dump_dispatch_metrics(runtime);
         filed_dump_cache_metrics(runtime);
         filed_exec_linux_lpr_dump_metrics();
         filed_kobox_backend_dump_metrics(&runtime->backend);
         break;
-    case FILED_V2_OP_DIAG_SET_CACHE_SLOTS: {
-        const filed_v2_diag_request_t *diag =
-            (const filed_v2_diag_request_t *)((const uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    case FILED_OP_DIAG_SET_CACHE_SLOTS: {
+        const filed_diag_request_t *diag =
+            (const filed_diag_request_t *)((const uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
         if (header.payload_size < sizeof(*diag)) {
             status = -22;
         } else {
@@ -923,16 +923,16 @@ static int filed_dispatch_client_v2(
         }
         break;
     }
-    case FILED_V2_OP_SERVICE_SET_NETD_SOCKET:
-    case FILED_V2_OP_SERVICE_SET_TERMD_TTY:
-        if (header.payload_size < sizeof(filed_v2_service_endpoint_request_t) ||
+    case FILED_OP_SERVICE_SET_NETD_SOCKET:
+    case FILED_OP_SERVICE_SET_TERMD_TTY:
+        if (header.payload_size < sizeof(filed_service_endpoint_request_t) ||
             request->fd_count < 3 ||
             request->fds[1].fd < 16)
         {
             status = -22;
         } else {
             const int endpoint_fd = (int)(uint32_t)request->fds[1].fd;
-            if (header.op == FILED_V2_OP_SERVICE_SET_NETD_SOCKET) {
+            if (header.op == FILED_OP_SERVICE_SET_NETD_SOCKET) {
                 if (runtime->netd_socket_endpoint_fd >= 16) {
                     (void)pacha_fd_close(runtime->netd_socket_endpoint_fd);
                 }
@@ -947,8 +947,8 @@ static int filed_dispatch_client_v2(
             result = (uint64_t)(uint32_t)endpoint_fd;
         }
         break;
-    case FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR: {
-        const int reply_status = filed_dispatch_register_termd_signal_supervisor_v2(
+    case FILED_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR: {
+        const int reply_status = filed_dispatch_register_termd_signal_supervisor(
             runtime,
             reply_fd,
             request,
@@ -973,11 +973,11 @@ static int filed_dispatch_client_v2(
             request->fd_count,
             0,
             0,
-            "filed v2 dispatch failed");
+            "filed dispatch failed");
     }
     filed_close_received_fds_except(request, reply_fd, keep_fd);
     const int reply_status =
-        filed_send_reply_v2(reply_fd, page, &header, status, result, error_token);
+        filed_send_reply(reply_fd, page, &header, status, result, error_token);
     (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
     return reply_status;
 }
@@ -1005,14 +1005,14 @@ int filed_dispatch_client_once(filed_runtime_t *runtime, int client_fd)
     }
     const int reply_fd = (int)fds[request.fd_count - 1].fd;
     if (request.word0 != PACHA_SERVICE_REQUEST_MAGIC) {
-        pacha_service_request_header_t header;
+        pacha_service_envelope_t header;
         memset(&header, 0, sizeof(header));
         header.magic = PACHA_SERVICE_REQUEST_MAGIC;
         header.abi_version = PACHA_SERVICE_ABI_VERSION;
-        header.service_id = FILED_V2_SERVICE_ID;
+        header.service_id = FILED_SERVICE_ID;
         header.request_id = request.word3;
         header.trace_id = request.word3;
-        return filed_send_reply_v2(reply_fd, NULL, &header, -22, 0, 0);
+        return filed_send_reply(reply_fd, NULL, &header, -22, 0, 0);
     }
-    return filed_dispatch_client_v2(runtime, reply_fd, &request);
+    return filed_dispatch_client(runtime, reply_fd, &request);
 }

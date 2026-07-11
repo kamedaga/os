@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "filed/flags.h"
+
 #define FILED_MAX_MOUNTS 16u
 #define FILED_MAX_VNODES 256u
 #define FILED_MAX_FILES 256u
@@ -56,44 +58,10 @@ typedef enum filed_vnode_kind {
     FILED_VNODE_FIFO = 5,
 } filed_vnode_kind_t;
 
-typedef enum filed_rights {
-    FILED_RIGHT_LOOKUP = 1u << 0,
-    FILED_RIGHT_READ = 1u << 1,
-    FILED_RIGHT_WRITE = 1u << 2,
-    FILED_RIGHT_EXEC = 1u << 3,
-    FILED_RIGHT_STAT = 1u << 4,
-    FILED_RIGHT_GETDENTS = 1u << 5,
-    FILED_RIGHT_CREATE = 1u << 6,
-    FILED_RIGHT_REMOVE = 1u << 7,
-    FILED_RIGHT_RENAME = 1u << 8,
-} filed_rights_t;
-
-typedef enum filed_fd_flags {
-    FILED_FD_CLOEXEC = 1u << 0,
-} filed_fd_flags_t;
-
-typedef enum filed_file_status_flags {
-    FILED_FILE_APPEND = 1u << 0,
-    FILED_FILE_NONBLOCK = 1u << 1,
-    FILED_FILE_SYNC = 1u << 2,
-} filed_file_status_flags_t;
-
 typedef enum filed_time_update_flags {
     FILED_TIME_UPDATE_ATIME = 1u << 0,
     FILED_TIME_UPDATE_MTIME = 1u << 1,
 } filed_time_update_flags_t;
-
-typedef enum filed_open_flags {
-    FILED_OPEN_CREATE = 1u << 0,
-    FILED_OPEN_EXCLUSIVE = 1u << 1,
-    FILED_OPEN_TRUNCATE = 1u << 2,
-    FILED_OPEN_DIRECTORY = 1u << 3,
-    FILED_OPEN_NOFOLLOW = 1u << 4,
-    FILED_OPEN_CLOEXEC = 1u << 5,
-    FILED_OPEN_APPEND = 1u << 6,
-    FILED_OPEN_NONBLOCK = 1u << 7,
-    FILED_OPEN_SYNC = 1u << 8,
-} filed_open_flags_t;
 
 typedef enum filed_handle_target_kind {
     FILED_HANDLE_NONE = 0,

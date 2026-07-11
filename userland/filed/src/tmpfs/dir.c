@@ -598,7 +598,7 @@ int filed_tmpfs_backend_getdents(
     filed_tmpfs_backend_t *backend,
     uint64_t dir_object_id,
     uint64_t offset,
-    storage_v2_getdents_request_t *out_entries)
+    storage_getdents_request_t *out_entries)
 {
     if (backend == NULL || out_entries == NULL) {
         return -22;
@@ -606,7 +606,7 @@ int filed_tmpfs_backend_getdents(
     memset(out_entries, 0, sizeof(*out_entries));
     out_entries->dir_object_id = dir_object_id;
     out_entries->offset = offset;
-    out_entries->capacity = STORAGE_V2_DIRENT_CAPACITY;
+    out_entries->capacity = STORAGE_DIRENT_CAPACITY;
 
     filed_tmpfs_lock_acquire(&backend->lock);
     filed_tmpfs_inode_t *dir = filed_tmpfs_find_inode(backend, dir_object_id);
@@ -620,7 +620,7 @@ int filed_tmpfs_backend_getdents(
     }
     uint64_t skipped = 0;
     uint16_t slot = dir->first_child_dentry_slot;
-    while (slot != FILED_TMPFS_NO_SLOT && out_entries->count < STORAGE_V2_DIRENT_CAPACITY) {
+    while (slot != FILED_TMPFS_NO_SLOT && out_entries->count < STORAGE_DIRENT_CAPACITY) {
         filed_tmpfs_dentry_t *dentry = filed_tmpfs_dentry_by_slot(backend, slot);
         if (dentry == NULL) {
             break;
@@ -637,7 +637,7 @@ int filed_tmpfs_backend_getdents(
             ++skipped;
             continue;
         }
-        storage_v2_dirent_t *entry = &out_entries->entries[out_entries->count++];
+        storage_dirent_t *entry = &out_entries->entries[out_entries->count++];
         entry->object_id = inode->object_id;
         entry->kind = inode->mode & FILED_TMPFS_MODE_TYPE_MASK;
         entry->name_len = strlen(dentry->name);

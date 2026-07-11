@@ -42,52 +42,52 @@ uint64_t filed_read_tsc(void)
 const char *filed_op_name(uint64_t op)
 {
     switch (op) {
-    case FILED_V2_OP_HELLO: return "hello";
-    case FILED_V2_OP_VFS_ROOT_STAT: return "root_stat";
-    case FILED_V2_OP_VFS_ROOT_GETDENTS: return "root_getdents";
-    case FILED_V2_OP_VFS_OPENAT: return "openat";
-    case FILED_V2_OP_VFS_STAT: return "stat";
-    case FILED_V2_OP_VFS_UTIMENS: return "utimens";
-    case FILED_V2_OP_VFS_CHMOD: return "chmod";
-    case FILED_V2_OP_VFS_PREAD: return "pread";
-    case FILED_V2_OP_VFS_GETDENTS: return "getdents";
-    case FILED_V2_OP_VFS_CLOSE: return "close";
-    case FILED_V2_OP_EXEC_PATH: return "exec_path";
-    case FILED_V2_OP_VFS_READ: return "read";
-    case FILED_V2_OP_VFS_DUP: return "dup";
-    case FILED_V2_OP_VFS_GET_FLAGS: return "get_flags";
-    case FILED_V2_OP_VFS_SET_FLAGS: return "set_flags";
-    case FILED_V2_OP_VFS_PWRITE: return "pwrite";
-    case FILED_V2_OP_VFS_WRITE: return "write";
-    case FILED_V2_OP_VFS_FSYNC: return "fsync";
-    case FILED_V2_OP_VFS_TRUNCATE: return "truncate";
-    case FILED_V2_OP_VFS_UNLINK: return "unlink";
-    case FILED_V2_OP_VFS_RENAME: return "rename";
-    case FILED_V2_OP_VFS_MKDIR: return "mkdir";
-    case FILED_V2_OP_VFS_RMDIR: return "rmdir";
-    case FILED_V2_OP_VFS_SYMLINK: return "symlink";
-    case FILED_V2_OP_VFS_READLINK: return "readlink";
-    case FILED_V2_OP_VFS_LINK: return "link";
-    case FILED_V2_OP_VFS_SEEK: return "seek";
-    case FILED_V2_OP_DIAG_DUMP_METRICS: return "dump_metrics";
-    case FILED_V2_OP_DIAG_SET_CACHE_SLOTS: return "set_cache_slots";
-    case FILED_V2_OP_SESSION_OPEN: return "connect";
-    case FILED_V2_OP_SERVICE_SET_NETD_SOCKET: return "set_netd_socket_endpoint";
-    case FILED_V2_OP_SERVICE_SET_TERMD_TTY: return "set_termd_tty_endpoint";
-    case FILED_V2_OP_DIAG_PING: return "ping";
-    case FILED_V2_OP_SESSION_DOORBELL: return "fast_doorbell";
-    case FILED_V2_OP_VFS_VALIDATE_OPEN_CACHE: return "validate_open_cache";
-    case FILED_V2_OP_VFS_PWRITE_BATCH: return "pwrite_batch";
-    case FILED_V2_OP_VFS_WRITE_BATCH: return "write_batch";
-    case FILED_V2_OP_VFS_PREAD_TO_VMO: return "pread_to_vmo";
-    case FILED_V2_OP_VFS_FILE_VMO: return "file_vmo";
-    case FILED_V2_OP_VFS_SHARED_FILE_VMO: return "shared_file_vmo";
-    case FILED_V2_OP_VFS_MEMFD_CREATE: return "memfd_create";
-    case FILED_V2_OP_VFS_SYNC_ALL: return "sync_all";
-    case FILED_V2_OP_EXEC_SELF: return "exec_self";
-    case FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR:
+    case FILED_OP_HELLO: return "hello";
+    case FILED_OP_VFS_ROOT_STAT: return "root_stat";
+    case FILED_OP_VFS_ROOT_GETDENTS: return "root_getdents";
+    case FILED_OP_VFS_OPENAT: return "openat";
+    case FILED_OP_VFS_STAT: return "stat";
+    case FILED_OP_VFS_UTIMENS: return "utimens";
+    case FILED_OP_VFS_CHMOD: return "chmod";
+    case FILED_OP_VFS_PREAD: return "pread";
+    case FILED_OP_VFS_GETDENTS: return "getdents";
+    case FILED_OP_VFS_CLOSE: return "close";
+    case FILED_OP_EXEC_PATH: return "exec_path";
+    case FILED_OP_VFS_READ: return "read";
+    case FILED_OP_VFS_DUP: return "dup";
+    case FILED_OP_VFS_GET_FLAGS: return "get_flags";
+    case FILED_OP_VFS_SET_FLAGS: return "set_flags";
+    case FILED_OP_VFS_PWRITE: return "pwrite";
+    case FILED_OP_VFS_WRITE: return "write";
+    case FILED_OP_VFS_FSYNC: return "fsync";
+    case FILED_OP_VFS_TRUNCATE: return "truncate";
+    case FILED_OP_VFS_UNLINK: return "unlink";
+    case FILED_OP_VFS_RENAME: return "rename";
+    case FILED_OP_VFS_MKDIR: return "mkdir";
+    case FILED_OP_VFS_RMDIR: return "rmdir";
+    case FILED_OP_VFS_SYMLINK: return "symlink";
+    case FILED_OP_VFS_READLINK: return "readlink";
+    case FILED_OP_VFS_LINK: return "link";
+    case FILED_OP_VFS_SEEK: return "seek";
+    case FILED_OP_DIAG_DUMP_METRICS: return "dump_metrics";
+    case FILED_OP_DIAG_SET_CACHE_SLOTS: return "set_cache_slots";
+    case FILED_OP_SESSION_OPEN: return "connect";
+    case FILED_OP_SERVICE_SET_NETD_SOCKET: return "set_netd_socket_endpoint";
+    case FILED_OP_SERVICE_SET_TERMD_TTY: return "set_termd_tty_endpoint";
+    case FILED_OP_DIAG_PING: return "ping";
+    case FILED_OP_SESSION_DOORBELL: return "fast_doorbell";
+    case FILED_OP_VFS_VALIDATE_OPEN_CACHE: return "validate_open_cache";
+    case FILED_OP_VFS_PWRITE_BATCH: return "pwrite_batch";
+    case FILED_OP_VFS_WRITE_BATCH: return "write_batch";
+    case FILED_OP_VFS_PREAD_TO_VMO: return "pread_to_vmo";
+    case FILED_OP_VFS_FILE_VMO: return "file_vmo";
+    case FILED_OP_VFS_SHARED_FILE_VMO: return "shared_file_vmo";
+    case FILED_OP_VFS_MEMFD_CREATE: return "memfd_create";
+    case FILED_OP_VFS_SYNC_ALL: return "sync_all";
+    case FILED_OP_EXEC_SELF: return "exec_self";
+    case FILED_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR:
         return "register_termd_signal_supervisor";
-    case FILED_V2_OP_DIAG_ERROR_GET:
+    case FILED_OP_DIAG_ERROR_GET:
         return "error_get";
     default: return "unknown";
     }
@@ -172,20 +172,20 @@ void filed_record_fast_op_metric_cycles(
     }
 }
 
-filed_v2_generation_entry_t *filed_session_generation_entries(
+filed_generation_entry_t *filed_session_generation_entries(
     const filed_session_t *session,
-    const filed_v2_fast_header_t *header)
+    const filed_fast_header_t *header)
 {
     if (session == NULL ||
         header == NULL ||
         session->page == NULL ||
-        header->generation_offset != FILED_V2_FAST_GENERATION_OFFSET ||
-        header->generation_capacity != FILED_V2_FAST_GENERATION_CAPACITY ||
-        header->generation_offset + header->generation_capacity * sizeof(filed_v2_generation_entry_t) > session->page_size)
+        header->generation_offset != FILED_FAST_GENERATION_OFFSET ||
+        header->generation_capacity != FILED_FAST_GENERATION_CAPACITY ||
+        header->generation_offset + header->generation_capacity * sizeof(filed_generation_entry_t) > session->page_size)
     {
         return NULL;
     }
-    return (filed_v2_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
+    return (filed_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
 }
 
 void filed_session_publish_generation(
@@ -202,8 +202,8 @@ void filed_session_publish_generation(
         return;
     }
 
-    filed_v2_fast_header_t *header = (filed_v2_fast_header_t *)session->page;
-    filed_v2_generation_entry_t *entries =
+    filed_fast_header_t *header = (filed_fast_header_t *)session->page;
+    filed_generation_entry_t *entries =
         filed_session_generation_entries(session, header);
     if (entries == NULL) {
         return;
@@ -223,7 +223,7 @@ void filed_session_publish_generation(
         free_slot = ((uint64_t)handle_id) % header->generation_capacity;
     }
 
-    filed_v2_generation_entry_t *entry = &entries[free_slot];
+    filed_generation_entry_t *entry = &entries[free_slot];
     ++entry->seq;
     __sync_synchronize();
     entry->handle = handle_id;

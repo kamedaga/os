@@ -3,10 +3,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "filed/payload_v2.h"
+#include "filed/payload.h"
 #include "filed/runtime.h"
 #include "../cache/internal.h"
-#include "koboxd/storage_protocol_v2.h"
+#include "koboxd/storage_protocol.h"
 #include "personality/linux_lpr.h"
 
 enum {

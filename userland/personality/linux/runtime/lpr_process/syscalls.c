@@ -325,13 +325,13 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-        lprs_v2_fork_t *fork_req = (lprs_v2_fork_t *)lpr_supervisor_payload(page);
+        lprs_fork_t *fork_req = (lprs_fork_t *)lpr_supervisor_payload(page);
         fork_req->parent_token = lpr_supervisor_token;
         const int64_t fork_status = lpr_supervisor_call(
-            LPRS_V2_OP_PROCESS_FORK_BEGIN,
+            LPRS_OP_PROCESS_FORK_BEGIN,
             page_fd,
             page,
-            sizeof(lprs_v2_token_request_t),
+            sizeof(lprs_token_request_t),
             -1,
             0);
         if (fork_status == 0 &&
@@ -389,7 +389,7 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
             lpr_supervisor_token = lpr_supervisor_pending_child_token;
             lpr_supervisor_enabled = 1;
             (void)lpr_supervisor_call_token(
-                LPRS_V2_OP_PROCESS_FORK_CHILD_READY,
+                LPRS_OP_PROCESS_FORK_CHILD_READY,
                 lpr_supervisor_token,
                 -1,
                 0);
@@ -409,7 +409,7 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         int reg_status = 0;
         if (lpr_supervisor_enabled && child_token != 0) {
             const int64_t supervisor_status = lpr_supervisor_call_token(
-                LPRS_V2_OP_PROCESS_FORK_PARENT_REGISTER,
+                LPRS_OP_PROCESS_FORK_PARENT_REGISTER,
                 child_token,
                 (int)(uint32_t)ret,
                 0);
@@ -488,11 +488,11 @@ int64_t lpr_linux_getpgid(uint64_t pid_raw)
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-        lprs_v2_pid_op_t *op = (lprs_v2_pid_op_t *)lpr_supervisor_payload(page);
+        lprs_pid_op_t *op = (lprs_pid_op_t *)lpr_supervisor_payload(page);
         op->token = lpr_supervisor_token;
         op->pid = pid;
         const int64_t status = lpr_supervisor_call(
-            LPRS_V2_OP_PROCESS_GETPGID,
+            LPRS_OP_PROCESS_GETPGID,
             page_fd,
             page,
             sizeof(*op),
@@ -524,12 +524,12 @@ int64_t lpr_linux_setpgid(uint64_t pid_raw, uint64_t pgid_raw)
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-        lprs_v2_pid_op_t *op = (lprs_v2_pid_op_t *)lpr_supervisor_payload(page);
+        lprs_pid_op_t *op = (lprs_pid_op_t *)lpr_supervisor_payload(page);
         op->token = lpr_supervisor_token;
         op->pid = pid;
         op->value = pgid;
         const int64_t status = lpr_supervisor_call(
-            LPRS_V2_OP_PROCESS_SETPGID,
+            LPRS_OP_PROCESS_SETPGID,
             page_fd,
             page,
             sizeof(*op),
@@ -567,10 +567,10 @@ int64_t lpr_linux_setsid(void)
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-        lprs_v2_pid_op_t *op = (lprs_v2_pid_op_t *)lpr_supervisor_payload(page);
+        lprs_pid_op_t *op = (lprs_pid_op_t *)lpr_supervisor_payload(page);
         op->token = lpr_supervisor_token;
         const int64_t status = lpr_supervisor_call(
-            LPRS_V2_OP_PROCESS_SETSID,
+            LPRS_OP_PROCESS_SETSID,
             page_fd,
             page,
             sizeof(*op),
@@ -605,11 +605,11 @@ int64_t lpr_linux_getsid(uint64_t pid_raw)
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-        lprs_v2_pid_op_t *op = (lprs_v2_pid_op_t *)lpr_supervisor_payload(page);
+        lprs_pid_op_t *op = (lprs_pid_op_t *)lpr_supervisor_payload(page);
         op->token = lpr_supervisor_token;
         op->pid = pid;
         const int64_t status = lpr_supervisor_call(
-            LPRS_V2_OP_PROCESS_GETSID,
+            LPRS_OP_PROCESS_GETSID,
             page_fd,
             page,
             sizeof(*op),
@@ -757,13 +757,13 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-        lprs_v2_wait4_t *wait_req = (lprs_v2_wait4_t *)lpr_supervisor_payload(page);
+        lprs_wait4_t *wait_req = (lprs_wait4_t *)lpr_supervisor_payload(page);
         wait_req->token = lpr_supervisor_token;
         wait_req->requested_pid = requested;
         wait_req->options = options & LPR_LINUX_WNOHANG;
         uint64_t packed_result = 0;
         const int64_t wait_status = lpr_supervisor_call(
-            LPRS_V2_OP_PROCESS_WAIT4,
+            LPRS_OP_PROCESS_WAIT4,
             page_fd,
             page,
             sizeof(*wait_req),
@@ -771,8 +771,8 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
             &packed_result);
         int64_t result = 0;
         if (wait_status == 0) {
-            const uint32_t result_pid = LPRS_V2_WAIT4_RESULT_PID(packed_result);
-            const uint32_t wait_result_status = LPRS_V2_WAIT4_RESULT_STATUS(packed_result);
+            const uint32_t result_pid = LPRS_WAIT4_RESULT_PID(packed_result);
+            const uint32_t wait_result_status = LPRS_WAIT4_RESULT_STATUS(packed_result);
             if (result_pid == 0) {
                 result = 0;
             } else {
@@ -846,14 +846,14 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const uint64_t path_len = (uint64_t)lpr_strnlen(path, FILED_V2_PATH_BYTES);
-    if (path_len == 0 || path_len >= FILED_V2_PATH_BYTES) {
+    const uint64_t path_len = (uint64_t)lpr_strnlen(path, FILED_PATH_BYTES);
+    if (path_len == 0 || path_len >= FILED_PATH_BYTES) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
 
-    filed_v2_exec_path_t exec;
+    filed_exec_path_t exec;
     lpr_memset(&exec, 0, sizeof(exec));
-    exec.flags = FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP | FILED_V2_EXEC_SELF;
+    exec.flags = FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP | FILED_EXEC_SELF;
     lpr_memcpy(exec.path, path, (size_t)path_len + 1u);
     int status = (int)lpr_prepare_exec_cwd(&exec);
     if (status != 0) {
@@ -873,7 +873,7 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     status = lpr_exec_copy_string_vector(
         &exec,
         exec.argv,
-        FILED_V2_EXEC_MAX_ARGS,
+        FILED_EXEC_MAX_ARGS,
         argv_raw,
         &exec.argc);
     if (status != 0) {
@@ -891,7 +891,7 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     status = lpr_exec_copy_string_vector(
         &exec,
         exec.envp,
-        FILED_V2_EXEC_MAX_ENVS,
+        FILED_EXEC_MAX_ENVS,
         envp_raw,
         &exec.envc);
     if (status != 0) {
@@ -934,7 +934,7 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     lpr_trace_process_event("execve_commit", (uint64_t)(uint32_t)process_fd, (uint64_t)(uint32_t)thread_fd, 0);
     if (lpr_supervisor_enabled) {
         (void)lpr_supervisor_call_token(
-            LPRS_V2_OP_PROCESS_EXEC_COMMIT_BEGIN,
+            LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN,
             lpr_supervisor_token,
             -1,
             0);

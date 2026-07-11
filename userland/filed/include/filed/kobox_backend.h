@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #include "filed/fd_ipc.h"
-#include "koboxd/storage_protocol_v2.h"
+#include "koboxd/storage_protocol.h"
 
 enum {
     FILED_KOBOX_BACKEND_METRIC_OP_MAX = 32,
@@ -40,14 +40,14 @@ typedef struct filed_kobox_backend {
     uint64_t bytes_written;
     uint64_t dirty_hint;
     filed_kobox_backend_metric_t metrics[FILED_KOBOX_BACKEND_METRIC_OP_MAX];
-    filed_v2_page_t wire_page;
+    filed_page_t wire_page;
     int wire_page_ready;
 } filed_kobox_backend_t;
 
 typedef struct filed_kobox_direct_ops {
     int (*mount_root)(void *ctx, uint64_t *out_magic);
     int (*lookup)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
-    int (*statx)(void *ctx, uint64_t object_id, storage_v2_statx_reply_t *out_stat);
+    int (*statx)(void *ctx, uint64_t object_id, storage_statx_reply_t *out_stat);
     int (*pread)(void *ctx, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
     int (*pwrite)(void *ctx, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
     int (*readlink)(void *ctx, uint64_t object_id, char *out_target, uint64_t target_capacity, uint64_t *out_length);
@@ -61,7 +61,7 @@ typedef struct filed_kobox_direct_ops {
     int (*rmdir)(void *ctx, uint64_t parent_object_id, const char *name);
     int (*rename)(void *ctx, uint64_t old_parent_object_id, const char *old_name, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
     int (*release_object)(void *ctx, uint64_t object_id);
-    int (*getdents)(void *ctx, uint64_t dir_object_id, uint64_t offset, storage_v2_getdents_request_t *out_entries);
+    int (*getdents)(void *ctx, uint64_t dir_object_id, uint64_t offset, storage_getdents_request_t *out_entries);
     int (*sync_all)(void *ctx);
     int (*object_stats)(void *ctx, filed_kobox_object_stats_t *out_stats);
 } filed_kobox_direct_ops_t;
@@ -82,7 +82,7 @@ int filed_kobox_backend_lookup(
 int filed_kobox_backend_statx(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
-    storage_v2_statx_reply_t *out_stat);
+    storage_statx_reply_t *out_stat);
 int filed_kobox_backend_pread(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
@@ -156,7 +156,7 @@ int filed_kobox_backend_getdents(
     filed_kobox_backend_t *backend,
     uint64_t dir_object_id,
     uint64_t offset,
-    storage_v2_getdents_request_t *out_entries);
+    storage_getdents_request_t *out_entries);
 int filed_kobox_backend_sync_all(filed_kobox_backend_t *backend);
 int filed_kobox_backend_object_stats(
     filed_kobox_backend_t *backend,

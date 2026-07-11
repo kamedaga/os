@@ -20,7 +20,7 @@ int filed_backend_lookup(
 int filed_backend_statx(
     filed_runtime_t *runtime,
     uint64_t object_id,
-    storage_v2_statx_reply_t *out_stat)
+    storage_statx_reply_t *out_stat)
 {
     if (filed_tmpfs_backend_is_object(object_id)) {
         return filed_tmpfs_backend_statx(&runtime->tmpfs, object_id, out_stat);
@@ -285,7 +285,7 @@ int filed_backend_getdents(
     filed_runtime_t *runtime,
     uint64_t dir_object_id,
     uint64_t offset,
-    storage_v2_getdents_request_t *out_entries)
+    storage_getdents_request_t *out_entries)
 {
     if (filed_tmpfs_backend_is_object(dir_object_id)) {
         return filed_tmpfs_backend_getdents(&runtime->tmpfs, dir_object_id, offset, out_entries);

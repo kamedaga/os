@@ -350,7 +350,7 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
 
 int filed_runtime_mount_root(filed_runtime_t *runtime)
 {
-    storage_v2_statx_reply_t root_stat;
+    storage_statx_reply_t root_stat;
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root_open;
     filed_status_t vfs_status;
@@ -462,7 +462,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         runtime->tmpfs_root_handle_id = tmp_open.handle_id;
         runtime->tmpfs_root_handle_valid = 1u;
         {
-            storage_v2_statx_reply_t tmp_stat;
+            storage_statx_reply_t tmp_stat;
             filed_vfs_stat_snapshot_t tmp_snapshot;
             memset(&tmp_stat, 0, sizeof(tmp_stat));
             status = filed_tmpfs_backend_statx(&runtime->tmpfs, tmpfs_root, &tmp_stat);

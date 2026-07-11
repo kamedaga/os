@@ -1,10 +1,10 @@
 #include "pacha/ipc.h"
 #include "pacha/service_abi.h"
 #include "pacha/syscall.h"
-#include "filed/payload_v2.h"
-#include "filed/ipc_protocol_v2.h"
+#include "filed/payload.h"
+#include "filed/ipc_protocol.h"
 #include "lpr_supervisor/boot_config.h"
-#include "lpr_supervisor/ipc_protocol_v2.h"
+#include "lpr_supervisor/ipc_protocol.h"
 #include "personality/linux_lpr.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
@@ -507,34 +507,34 @@ static int recv_ipc_wait(int fd, struct pacha_ipc_msg *msg)
 
 static void seed0root_dump_filed_error_token(int endpoint_fd, uint64_t token, const char *context);
 static void seed0root_dump_lprs_error_token(int endpoint_fd, uint64_t token, const char *context);
-static int seed0root_create_filed_v2_page(int *out_fd, void **out_mapped);
-static void seed0root_destroy_filed_v2_page(int fd, void *mapped);
+static int seed0root_create_filed_page(int *out_fd, void **out_mapped);
+static void seed0root_destroy_filed_page(int fd, void *mapped);
 
-static int seed0root_filed_v2_payload_size(uint32_t op, uint32_t *out_payload_size)
+static int seed0root_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
 {
     if (out_payload_size == NULL) {
         return -22;
     }
     switch (op) {
-    case FILED_V2_OP_VFS_OPENAT:
-        *out_payload_size = sizeof(filed_v2_path_request_t);
+    case FILED_OP_VFS_OPENAT:
+        *out_payload_size = sizeof(filed_path_request_t);
         return 0;
-    case FILED_V2_OP_VFS_PREAD:
-        *out_payload_size = sizeof(filed_v2_io_t);
+    case FILED_OP_VFS_PREAD:
+        *out_payload_size = sizeof(filed_io_t);
         return 0;
-    case FILED_V2_OP_VFS_CLOSE:
-        *out_payload_size = sizeof(filed_v2_handle_request_t);
+    case FILED_OP_VFS_CLOSE:
+        *out_payload_size = sizeof(filed_handle_request_t);
         return 0;
-    case FILED_V2_OP_EXEC_PATH:
-        *out_payload_size = sizeof(filed_v2_exec_path_t);
+    case FILED_OP_EXEC_PATH:
+        *out_payload_size = sizeof(filed_exec_path_t);
         return 0;
-    case FILED_V2_OP_DIAG_DUMP_METRICS:
+    case FILED_OP_DIAG_DUMP_METRICS:
         *out_payload_size = 0;
         return 0;
-    case FILED_V2_OP_DIAG_SET_CACHE_SLOTS:
-        *out_payload_size = sizeof(filed_v2_diag_request_t);
+    case FILED_OP_DIAG_SET_CACHE_SLOTS:
+        *out_payload_size = sizeof(filed_diag_request_t);
         return 0;
-    case FILED_V2_OP_VFS_SYNC_ALL:
+    case FILED_OP_VFS_SYNC_ALL:
         *out_payload_size = 0;
         return 0;
     default:
@@ -542,7 +542,7 @@ static int seed0root_filed_v2_payload_size(uint32_t op, uint32_t *out_payload_si
     }
 }
 
-static int seed0root_filed_call(
+static int seed0root_filed_page_call(
     int endpoint_fd,
     uint32_t op,
     uint64_t request_id,
@@ -557,7 +557,7 @@ static int seed0root_filed_call(
     }
 
     uint32_t payload_size = 0;
-    int status = seed0root_filed_v2_payload_size(op, &payload_size);
+    int status = seed0root_filed_payload_size(op, &payload_size);
     if (status != 0) {
         return status;
     }
@@ -565,7 +565,7 @@ static int seed0root_filed_call(
     int owned_page_fd = -1;
     void *owned_page = NULL;
     if (transfer_fd < 16) {
-        status = seed0root_create_filed_v2_page(&owned_page_fd, &owned_page);
+        status = seed0root_create_filed_page(&owned_page_fd, &owned_page);
         if (status != 0) {
             return status;
         }
@@ -575,37 +575,37 @@ static int seed0root_filed_call(
     if (page == NULL) {
         page = pacha_mmap(
             transfer_fd,
-            FILED_V2_PAGE_BYTES,
+            FILED_PAGE_BYTES,
             PACHA_PROT_READ | PACHA_PROT_WRITE,
             PACHA_MMAP_SHARED,
             0);
         if (page == NULL) {
             if (owned_page_fd >= 16) {
-                seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+                seed0root_destroy_filed_page(owned_page_fd, owned_page);
             }
             return -2;
         }
     }
 
-    if (op == FILED_V2_OP_VFS_OPENAT) {
-        filed_v2_openat_t openat_payload;
+    if (op == FILED_OP_VFS_OPENAT) {
+        filed_openat_t openat_payload;
         memcpy(&openat_payload, page, sizeof(openat_payload));
-        memset(page, 0, FILED_V2_PAGE_BYTES);
-        filed_v2_path_request_t *path =
-            (filed_v2_path_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+        memset(page, 0, FILED_PAGE_BYTES);
+        filed_path_request_t *path =
+            (filed_path_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
         path->dir_handle = openat_payload.dir_handle;
         path->rights = openat_payload.rights;
         path->flags = openat_payload.open_flags;
         snprintf(path->path, sizeof(path->path), "%s", openat_payload.name);
-    } else if (op == FILED_V2_OP_VFS_CLOSE) {
-        memset(page, 0, FILED_V2_PAGE_BYTES);
-        filed_v2_handle_request_t *handle =
-            (filed_v2_handle_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    } else if (op == FILED_OP_VFS_CLOSE) {
+        memset(page, 0, FILED_PAGE_BYTES);
+        filed_handle_request_t *handle =
+            (filed_handle_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
         handle->handle = word2;
-    } else if (op == FILED_V2_OP_DIAG_SET_CACHE_SLOTS) {
-        memset(page, 0, FILED_V2_PAGE_BYTES);
-        filed_v2_diag_request_t *diag =
-            (filed_v2_diag_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    } else if (op == FILED_OP_DIAG_SET_CACHE_SLOTS) {
+        memset(page, 0, FILED_PAGE_BYTES);
+        filed_diag_request_t *diag =
+            (filed_diag_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
         diag->subject = word2;
     } else if (payload_size != 0) {
         memmove((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, page, payload_size);
@@ -614,10 +614,10 @@ static int seed0root_filed_call(
         memset(page, 0, PACHA_SERVICE_HEADER_BYTES);
     }
 
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
+    header->service_id = FILED_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -669,10 +669,10 @@ static int seed0root_filed_call(
             (unsigned long long)transfer_info.flags,
             reply_fd);
         if (page != owned_page) {
-            (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+            (void)pacha_munmap(page, FILED_PAGE_BYTES);
         }
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return reply_fd;
     }
@@ -684,26 +684,26 @@ static int seed0root_filed_call(
     (void)pacha_fd_close(reply_fd);
     if (recv_status != 0) {
         if (page != owned_page) {
-            (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+            (void)pacha_munmap(page, FILED_PAGE_BYTES);
         }
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return recv_status;
     }
-    const pacha_service_reply_header_t *reply_header = (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (out_reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
         out_reply->word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->service_id != FILED_SERVICE_ID ||
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
         if (page != owned_page) {
-            (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+            (void)pacha_munmap(page, FILED_PAGE_BYTES);
         }
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return -2;
     }
@@ -723,31 +723,31 @@ static int seed0root_filed_call(
         fflush(stderr);
         status = (int)reply_header->status;
         if (page != owned_page) {
-            (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+            (void)pacha_munmap(page, FILED_PAGE_BYTES);
         }
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return status;
     }
-    if (op != FILED_V2_OP_VFS_OPENAT &&
-        op != FILED_V2_OP_VFS_CLOSE &&
-        op != FILED_V2_OP_DIAG_SET_CACHE_SLOTS &&
-        op != FILED_V2_OP_EXEC_PATH &&
+    if (op != FILED_OP_VFS_OPENAT &&
+        op != FILED_OP_VFS_CLOSE &&
+        op != FILED_OP_DIAG_SET_CACHE_SLOTS &&
+        op != FILED_OP_EXEC_PATH &&
         payload_size != 0)
     {
         memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, payload_size);
     }
     if (page != owned_page) {
-        (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+        (void)pacha_munmap(page, FILED_PAGE_BYTES);
     }
     if (owned_page_fd >= 16) {
-        seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+        seed0root_destroy_filed_page(owned_page_fd, owned_page);
     }
     return 0;
 }
 
-static int seed0root_filed_call_fdv(
+static int seed0root_filed_page_call_fdv(
     int endpoint_fd,
     uint32_t op,
     uint64_t request_id,
@@ -763,14 +763,14 @@ static int seed0root_filed_call_fdv(
     }
     (void)word2;
     uint32_t payload_size = 0;
-    int status = seed0root_filed_v2_payload_size(op, &payload_size);
+    int status = seed0root_filed_payload_size(op, &payload_size);
     if (status != 0 || fd_count == 0 || fds == NULL || fds[0].fd < 16) {
         return status != 0 ? status : -22;
     }
 
     void *page = pacha_mmap(
         (int)(uint32_t)fds[0].fd,
-        FILED_V2_PAGE_BYTES,
+        FILED_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -783,10 +783,10 @@ static int seed0root_filed_call_fdv(
     } else {
         memset(page, 0, PACHA_SERVICE_HEADER_BYTES);
     }
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
+    header->service_id = FILED_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -804,7 +804,7 @@ static int seed0root_filed_call_fdv(
     };
     const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
     if (reply_fd < 16) {
-        (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+        (void)pacha_munmap(page, FILED_PAGE_BYTES);
         return reply_fd;
     }
     memset(out_reply, 0, sizeof(*out_reply));
@@ -813,18 +813,18 @@ static int seed0root_filed_call_fdv(
     const int recv_status = recv_ipc_wait(reply_fd, out_reply);
     (void)pacha_fd_close(reply_fd);
     if (recv_status != 0) {
-        (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+        (void)pacha_munmap(page, FILED_PAGE_BYTES);
         return recv_status;
     }
-    const pacha_service_reply_header_t *reply_header = (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (out_reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
         out_reply->word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->service_id != FILED_SERVICE_ID ||
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
-        (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+        (void)pacha_munmap(page, FILED_PAGE_BYTES);
         return -2;
     }
     out_reply->word1 = (uint64_t)reply_header->status;
@@ -834,24 +834,24 @@ static int seed0root_filed_call_fdv(
             seed0root_dump_filed_error_token(endpoint_fd, reply_header->result, "filed fdv call");
         }
         status = (int)reply_header->status;
-        (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+        (void)pacha_munmap(page, FILED_PAGE_BYTES);
         return status;
     }
-    if (op != FILED_V2_OP_EXEC_PATH && payload_size != 0) {
+    if (op != FILED_OP_EXEC_PATH && payload_size != 0) {
         memmove(page, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, payload_size);
     }
-    (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+    (void)pacha_munmap(page, FILED_PAGE_BYTES);
     return 0;
 }
 
-static int seed0root_filed_call_v2(
+static int seed0root_filed_service_call(
     int endpoint_fd,
     uint32_t op,
     uint64_t request_id,
     uint32_t payload_size,
     int transfer_fd,
     struct pacha_ipc_msg *out_reply,
-    pacha_service_reply_header_t *out_header)
+    pacha_service_envelope_t *out_header)
 {
     if (endpoint_fd < 16 || request_id == 0 || out_reply == NULL ||
         payload_size > PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES)
@@ -861,16 +861,16 @@ static int seed0root_filed_call_v2(
 
     int page_fd = -1;
     void *page = NULL;
-    int status = seed0root_create_filed_v2_page(&page_fd, &page);
+    int status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         return status;
     }
 
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_V2_SERVICE_ID;
+    header->service_id = FILED_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -878,9 +878,9 @@ static int seed0root_filed_call_v2(
     header->payload_size = payload_size;
     header->fd_count = transfer_fd >= 16 ? 1u : 0u;
 
-    if (payload_size >= sizeof(filed_v2_service_endpoint_request_t)) {
-        filed_v2_service_endpoint_request_t *payload =
-            (filed_v2_service_endpoint_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    if (payload_size >= sizeof(filed_service_endpoint_request_t)) {
+        filed_service_endpoint_request_t *payload =
+            (filed_service_endpoint_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
         payload->endpoint_kind = op;
     }
 
@@ -909,7 +909,7 @@ static int seed0root_filed_call_v2(
     };
     const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
     if (reply_fd < 16) {
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         return reply_fd;
     }
 
@@ -917,20 +917,20 @@ static int seed0root_filed_call_v2(
     status = recv_ipc_wait(reply_fd, out_reply);
     (void)pacha_fd_close(reply_fd);
     if (status != 0) {
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         return status;
     }
 
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)page;
     if (out_reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
         out_reply->word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_V2_SERVICE_ID ||
+        reply_header->service_id != FILED_SERVICE_ID ||
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         return -2;
     }
     if (out_header != NULL) {
@@ -938,18 +938,18 @@ static int seed0root_filed_call_v2(
     }
     if (reply_header->status < 0) {
         if (reply_header->result != 0) {
-            seed0root_dump_filed_error_token(endpoint_fd, reply_header->result, "filed v2 call");
+            seed0root_dump_filed_error_token(endpoint_fd, reply_header->result, "filed call");
         }
         status = (int)reply_header->status;
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         return status;
     }
 
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     return 0;
 }
 
-static int seed0root_lprs_call_v2(
+static int seed0root_lprs_call(
     int endpoint_fd,
     uint32_t op,
     uint64_t request_id,
@@ -960,14 +960,14 @@ static int seed0root_lprs_call_v2(
     struct pacha_ipc_msg *out_reply)
 {
     if (endpoint_fd < 16 || request_id == 0 || out_reply == NULL ||
-        payload_size > LPRS_V2_PAYLOAD_BYTES)
+        payload_size > LPRS_PAYLOAD_BYTES)
     {
         return -1;
     }
     int owned_page_fd = -1;
     void *owned_page = NULL;
     if (page_fd < 16 || page == NULL) {
-        const int create_status = seed0root_create_filed_v2_page(&owned_page_fd, &owned_page);
+        const int create_status = seed0root_create_filed_page(&owned_page_fd, &owned_page);
         if (create_status != 0) {
             return create_status;
         }
@@ -975,11 +975,11 @@ static int seed0root_lprs_call_v2(
         page = owned_page;
     }
 
-    pacha_service_request_header_t *header = (pacha_service_request_header_t *)page;
+    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = LPRS_V2_SERVICE_ID;
+    header->service_id = LPRS_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
     header->request_id = request_id;
@@ -1018,7 +1018,7 @@ static int seed0root_lprs_call_v2(
     const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
     if (reply_fd < 16) {
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return reply_fd;
     }
@@ -1028,20 +1028,20 @@ static int seed0root_lprs_call_v2(
     (void)pacha_fd_close(reply_fd);
     if (recv_status != 0) {
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return recv_status;
     }
 
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)page;
     if (out_reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
         out_reply->word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
         reply_header->request_id != request_id)
     {
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return -2;
     }
@@ -1050,16 +1050,16 @@ static int seed0root_lprs_call_v2(
             seed0root_dump_lprs_error_token(
                 endpoint_fd,
                 out_reply->word2,
-                "lpr supervisor v2 call");
+                "lpr supervisor call");
         }
         const int status = (int)(int64_t)out_reply->word1;
         if (owned_page_fd >= 16) {
-            seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+            seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return status;
     }
     if (owned_page_fd >= 16) {
-        seed0root_destroy_filed_v2_page(owned_page_fd, owned_page);
+        seed0root_destroy_filed_page(owned_page_fd, owned_page);
     }
     return 0;
 }
@@ -1068,9 +1068,9 @@ static int seed0root_dump_filed_metrics(int filed_endpoint_fd)
 {
     struct pacha_ipc_msg reply;
     memset(&reply, 0, sizeof(reply));
-    return seed0root_filed_call(
+    return seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_DIAG_DUMP_METRICS,
+        FILED_OP_DIAG_DUMP_METRICS,
         0x5eed0f12u,
         -1,
         0,
@@ -1083,9 +1083,9 @@ static int seed0root_filed_sync_all(int filed_endpoint_fd)
 {
     struct pacha_ipc_msg reply;
     memset(&reply, 0, sizeof(reply));
-    return seed0root_filed_call(
+    return seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_SYNC_ALL,
+        FILED_OP_VFS_SYNC_ALL,
         0x5eed0f16u,
         -1,
         0,
@@ -1098,9 +1098,9 @@ static int seed0root_set_filed_cache_slots(int filed_endpoint_fd, uint64_t slots
 {
     struct pacha_ipc_msg reply;
     memset(&reply, 0, sizeof(reply));
-    const int status = seed0root_filed_call(
+    const int status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_DIAG_SET_CACHE_SLOTS,
+        FILED_OP_DIAG_SET_CACHE_SLOTS,
         0x5eed0f10u,
         -1,
         slots,
@@ -1127,32 +1127,32 @@ static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
         return status;
     }
 
-    status = seed0root_create_filed_v2_page(&page_fd, &page);
+    status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         return status;
     }
 
-    filed_v2_openat_t *openat = (filed_v2_openat_t *)page;
+    filed_openat_t *openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
     openat->rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_EXEC;
-    openat->open_flags = FILED_V2_OPEN_CLOEXEC;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_EXEC;
+    openat->open_flags = FILED_OPEN_CLOEXEC;
     snprintf(openat->name, sizeof(openat->name), "%s", "/cmd/libc_vfs_exec_smoke.elf");
 
     struct pacha_ipc_msg reply;
     memset(&reply, 0, sizeof(reply));
-    status = seed0root_filed_call(
+    status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_OPENAT,
+        FILED_OP_VFS_OPENAT,
         0x5eed0f13u,
         page_fd,
         0,
         &reply,
         NULL,
         0);
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     page_fd = -1;
     page = NULL;
     if (status != 0) {
@@ -1162,11 +1162,11 @@ static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
     }
 
     const uint64_t handle = reply.word2;
-    status = seed0root_create_filed_v2_page(&page_fd, &page);
+    status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
-        (void)seed0root_filed_call(
+        (void)seed0root_filed_page_call(
             filed_endpoint_fd,
-            FILED_V2_OP_VFS_CLOSE,
+            FILED_OP_VFS_CLOSE,
             0x5eed0f15u,
             -1,
             handle,
@@ -1177,14 +1177,14 @@ static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
         return status;
     }
 
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     io->handle = handle;
     io->offset = 0;
     io->length = 4;
     memset(&reply, 0, sizeof(reply));
-    status = seed0root_filed_call(
+    status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_PREAD,
+        FILED_OP_VFS_PREAD,
         0x5eed0f14u,
         page_fd,
         0,
@@ -1209,12 +1209,12 @@ static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
             io->data[3]);
         probe_status = -2;
     }
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
 
     memset(&reply, 0, sizeof(reply));
-    const int close_status = seed0root_filed_call(
+    const int close_status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_CLOSE,
+        FILED_OP_VFS_CLOSE,
         0x5eed0f15u,
         -1,
         handle,
@@ -1245,29 +1245,29 @@ static int seed0root_read_filed_text(
 
     int page_fd = -1;
     void *page = NULL;
-    int status = seed0root_create_filed_v2_page(&page_fd, &page);
+    int status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         return status;
     }
 
-    filed_v2_openat_t *openat = (filed_v2_openat_t *)page;
+    filed_openat_t *openat = (filed_openat_t *)page;
     openat->dir_handle = 0;
-    openat->rights = FILED_V2_RIGHT_READ | FILED_V2_RIGHT_STAT;
-    openat->open_flags = FILED_V2_OPEN_CLOEXEC;
+    openat->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
+    openat->open_flags = FILED_OPEN_CLOEXEC;
     snprintf(openat->name, sizeof(openat->name), "%s", path);
 
     struct pacha_ipc_msg reply;
     memset(&reply, 0, sizeof(reply));
-    status = seed0root_filed_call(
+    status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_OPENAT,
+        FILED_OP_VFS_OPENAT,
         0x5eed0f21u,
         page_fd,
         0,
         &reply,
         NULL,
         0);
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     page_fd = -1;
     page = NULL;
     if (status != 0) {
@@ -1275,11 +1275,11 @@ static int seed0root_read_filed_text(
     }
 
     const uint64_t handle = reply.word2;
-    status = seed0root_create_filed_v2_page(&page_fd, &page);
+    status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
-        (void)seed0root_filed_call(
+        (void)seed0root_filed_page_call(
             filed_endpoint_fd,
-            FILED_V2_OP_VFS_CLOSE,
+            FILED_OP_VFS_CLOSE,
             0x5eed0f23u,
             -1,
             handle,
@@ -1289,14 +1289,14 @@ static int seed0root_read_filed_text(
         return status;
     }
 
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     io->handle = handle;
     io->offset = 0;
     io->length = out_capacity - 1;
     memset(&reply, 0, sizeof(reply));
-    status = seed0root_filed_call(
+    status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_PREAD,
+        FILED_OP_VFS_PREAD,
         0x5eed0f22u,
         page_fd,
         0,
@@ -1311,12 +1311,12 @@ static int seed0root_read_filed_text(
         memcpy(out, io->data, copied);
         out[copied] = '\0';
     }
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
 
     memset(&reply, 0, sizeof(reply));
-    const int close_status = seed0root_filed_call(
+    const int close_status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_VFS_CLOSE,
+        FILED_OP_VFS_CLOSE,
         0x5eed0f23u,
         -1,
         handle,
@@ -1524,14 +1524,14 @@ static void seed0root_destroy_wire_page(uint64_t size, int fd, void *mapped)
     }
 }
 
-static int seed0root_create_filed_v2_page(int *out_fd, void **out_mapped)
+static int seed0root_create_filed_page(int *out_fd, void **out_mapped)
 {
-    return seed0root_create_wire_page(FILED_V2_PAGE_BYTES, out_fd, out_mapped);
+    return seed0root_create_wire_page(FILED_PAGE_BYTES, out_fd, out_mapped);
 }
 
-static void seed0root_destroy_filed_v2_page(int fd, void *mapped)
+static void seed0root_destroy_filed_page(int fd, void *mapped)
 {
-    seed0root_destroy_wire_page(FILED_V2_PAGE_BYTES, fd, mapped);
+    seed0root_destroy_wire_page(FILED_PAGE_BYTES, fd, mapped);
 }
 
 static void seed0root_dump_filed_error_token(int endpoint_fd, uint64_t token, const char *context)
@@ -1553,8 +1553,8 @@ static void seed0root_dump_lprs_error_token(int endpoint_fd, uint64_t token, con
 }
 
 static int seed0root_exec_add_string(
-    filed_v2_exec_path_t *exec,
-    filed_v2_exec_string_ref_t *ref,
+    filed_exec_path_t *exec,
+    filed_exec_string_ref_t *ref,
     const char *value)
 {
     if (exec == NULL || ref == NULL || value == NULL) {
@@ -1563,7 +1563,7 @@ static int seed0root_exec_add_string(
     const uint64_t length = (uint64_t)strlen(value) + 1u;
     if (length == 0 ||
         length > UINT16_MAX ||
-        exec->string_bytes + length > FILED_V2_EXEC_STRING_BYTES)
+        exec->string_bytes + length > FILED_EXEC_STRING_BYTES)
     {
         return -7;
     }
@@ -1599,19 +1599,19 @@ static int seed0root_run_exec_path_smoke_expect_any(
     uint64_t expected_count)
 {
     if (filed_endpoint_fd < 16 || path == NULL || label == NULL ||
-        argc > FILED_V2_EXEC_MAX_ARGS)
+        argc > FILED_EXEC_MAX_ARGS)
     {
         return -1;
     }
 
     int page_fd = -1;
     void *page = NULL;
-    int status = seed0root_create_filed_v2_page(&page_fd, &page);
+    int status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         return status;
     }
 
-    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
     exec->dir_handle = 0;
     exec->flags = exec_flags;
     exec->argc = argc == 0 ? 1 : argc;
@@ -1621,14 +1621,14 @@ static int seed0root_run_exec_path_smoke_expect_any(
         const char *arg = (argc > 0 && argv != NULL && argv[i] != NULL) ? argv[i] : path;
         status = seed0root_exec_add_string(exec, &exec->argv[i], arg);
         if (status != 0) {
-            seed0root_destroy_filed_v2_page(page_fd, page);
+            seed0root_destroy_filed_page(page_fd, page);
             return status;
         }
     }
     if (env != NULL) {
         status = seed0root_exec_add_string(exec, &exec->envp[0], env);
         if (status != 0) {
-            seed0root_destroy_filed_v2_page(page_fd, page);
+            seed0root_destroy_filed_page(page_fd, page);
             return status;
         }
     }
@@ -1638,9 +1638,9 @@ static int seed0root_run_exec_path_smoke_expect_any(
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
     struct pacha_ipc_msg reply;
-    status = seed0root_filed_call(
+    status = seed0root_filed_page_call(
         filed_endpoint_fd,
-        FILED_V2_OP_EXEC_PATH,
+        FILED_OP_EXEC_PATH,
         0x5eed0f11u,
         page_fd,
         0,
@@ -1649,7 +1649,7 @@ static int seed0root_run_exec_path_smoke_expect_any(
         2);
     const uint64_t exec_reply_ns = seed0root_now_ns();
     const uint64_t exec_reply_cycles = seed0root_read_tsc();
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     if (status == -2) {
         return 0;
     }
@@ -1811,7 +1811,7 @@ static int seed0root_run_lpr_minimal_smoke(int filed_endpoint_fd)
         1,
         NULL,
         "lpr minimal smoke",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_lpr_ldmusl_smoke(int filed_endpoint_fd)
@@ -1830,7 +1830,7 @@ static int seed0root_run_lpr_ldmusl_smoke(int filed_endpoint_fd)
         5,
         "LD_LIBRARY_PATH=/lib/linux",
         "lpr ld-musl smoke",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_lpr_pty_probe(int filed_endpoint_fd)
@@ -1843,7 +1843,7 @@ static int seed0root_run_lpr_pty_probe(int filed_endpoint_fd)
         1,
         "LD_LIBRARY_PATH=/lib/linux",
         "lpr pty probe",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_lpr_busybox_command(
@@ -1859,7 +1859,7 @@ static int seed0root_run_lpr_busybox_command(
         argc,
         "LD_LIBRARY_PATH=/lib:/lib/linux",
         label,
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_lpr_busybox_cold_echo_smoke(int filed_endpoint_fd)
@@ -2071,7 +2071,7 @@ static int seed0root_run_lua_cli_bench(int filed_endpoint_fd)
         2,
         "PACHA_LUA_CLI_BENCH=1",
         "lua cli bench",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_lpr_dyn_needed_smoke(int filed_endpoint_fd)
@@ -2086,7 +2086,7 @@ static int seed0root_run_lpr_dyn_needed_smoke(int filed_endpoint_fd)
         1,
         "LD_LIBRARY_PATH=/lib:/lib/linux:/usr/lib",
         "lpr dyn needed smoke",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_curl_example(int filed_endpoint_fd)
@@ -2107,7 +2107,7 @@ static int seed0root_run_curl_example(int filed_endpoint_fd)
         7,
         "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
         "curl example.com workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static void seed0root_log_curl_timing(int filed_endpoint_fd, const char *path)
@@ -2164,7 +2164,7 @@ static int seed0root_run_curl_https_expected_failure(
         14,
         "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
         label,
-        FILED_V2_EXEC_LINUX_LPR,
+        FILED_EXEC_LINUX_LPR,
         expected_exits,
         expected_count);
     seed0root_log_curl_timing(filed_endpoint_fd, timing_path);
@@ -2228,7 +2228,7 @@ static int seed0root_run_curl_https_example(int filed_endpoint_fd)
         16,
         "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
         "curl https example.com HEAD workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     seed0root_log_curl_timing(filed_endpoint_fd, "/tmp/curl-https-head.timing");
     if (status != 0) {
         return status;
@@ -2258,7 +2258,7 @@ static int seed0root_run_curl_https_example(int filed_endpoint_fd)
         15,
         "LD_LIBRARY_PATH=/opt/curl/lib:/lib:/usr/lib",
         "curl https example.com GET workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     seed0root_log_curl_timing(filed_endpoint_fd, "/tmp/curl-https-get.timing");
     if (status != 0) {
         return status;
@@ -2339,7 +2339,7 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         7,
         "PACHA_CHIBICC_CLI_BENCH=1",
         "chibicc cc1 workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2357,7 +2357,7 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         4,
         "PACHA_CHIBICC_AS_BENCH=1",
         "chibicc as workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2381,7 +2381,7 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         10,
         "PACHA_CHIBICC_LD_BENCH=1",
         "chibicc ld workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2396,7 +2396,7 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         1,
         "PACHA_CHIBICC_RUN_BENCH=1",
         "chibicc linked workload",
-        FILED_V2_EXEC_LINUX_LPR,
+        FILED_EXEC_LINUX_LPR,
         191);
 }
 
@@ -2412,7 +2412,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         3,
         "PACHA_APK_OFFLINE_PREP_ROOT=1",
         "apk offline prep mkdir root",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2426,7 +2426,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         3,
         "PACHA_APK_OFFLINE_PREP_VAR=1",
         "apk offline prep mkdir var",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2440,7 +2440,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         3,
         "PACHA_APK_OFFLINE_PREP_CACHE_PARENT=1",
         "apk offline prep mkdir cache parent",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2454,7 +2454,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         3,
         "PACHA_APK_OFFLINE_PREP_CACHE=1",
         "apk offline prep mkdir cache",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2488,7 +2488,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         17,
         apk_env,
         "apk offline add workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2503,7 +2503,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         2,
         apk_env,
         "apk installed grep version",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2517,7 +2517,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         2,
         apk_env,
         "apk installed sed version",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2531,7 +2531,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         6,
         apk_env,
         "apk installed tar create",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2545,7 +2545,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         3,
         apk_env,
         "apk installed tar list",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2559,7 +2559,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         2,
         apk_env,
         "apk installed xz version",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2573,7 +2573,7 @@ static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
         2,
         apk_env,
         "apk installed zstd version",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
@@ -2603,7 +2603,7 @@ static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
             3,
             "PACHA_APK_UPDATE_PREP=1",
             "apk update prep mkdir",
-            FILED_V2_EXEC_LINUX_LPR);
+            FILED_EXEC_LINUX_LPR);
         if (status != 0) {
             return status;
         }
@@ -2619,7 +2619,7 @@ static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
         sizeof(resolv_cp_argv) / sizeof(resolv_cp_argv[0]),
         "PACHA_APK_UPDATE_PREP=1",
         "apk update prep resolv.conf",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2642,7 +2642,7 @@ static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
         sizeof(initdb_argv) / sizeof(initdb_argv[0]),
         apk_env,
         "apk update initdb workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2668,7 +2668,7 @@ static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
         sizeof(apk_argv) / sizeof(apk_argv[0]),
         apk_env,
         "apk update workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2695,7 +2695,7 @@ static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
         sizeof(apk_add_argv) / sizeof(apk_add_argv[0]),
         apk_env,
         "apk add zlib workload",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
     if (status != 0) {
         return status;
     }
@@ -2710,7 +2710,7 @@ static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
         sizeof(zlib_stat_argv) / sizeof(zlib_stat_argv[0]),
         "PACHA_APK_ADD_VERIFY=1",
         "apk add zlib verify",
-        FILED_V2_EXEC_LINUX_LPR);
+        FILED_EXEC_LINUX_LPR);
 }
 
 static int seed0root_run_storage_services(int filed_endpoint_fd)
@@ -3103,15 +3103,15 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
 
     int page_fd = -1;
     void *page = NULL;
-    int status = seed0root_create_filed_v2_page(&page_fd, &page);
+    int status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
         (void)pacha_fd_close(endpoint_fd);
         return status;
     }
-    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
     exec->dir_handle = 0;
-    exec->flags = FILED_V2_EXEC_INHERIT_FDS;
+    exec->flags = FILED_EXEC_INHERIT_FDS;
     exec->inherit_fd_count = 2;
     exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
     exec->inherit_fd_targets[1] = LPRS_BOOT_CONFIG_FD;
@@ -3119,7 +3119,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
     snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/lpr_supervisor.elf");
     status = seed0root_exec_add_string(exec, &exec->argv[0], "/sbin/lpr_supervisor.elf");
     if (status != 0) {
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         (void)pacha_fd_close(bootstrap_fd);
         (void)pacha_fd_close(endpoint_fd);
         return status;
@@ -3128,7 +3128,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
     snprintf(boot_arg, sizeof(boot_arg), "--boot-fd=%u", (unsigned)LPRS_BOOT_CONFIG_FD);
     status = seed0root_exec_add_string(exec, &exec->argv[1], boot_arg);
     if (status != 0) {
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         (void)pacha_fd_close(bootstrap_fd);
         (void)pacha_fd_close(endpoint_fd);
         return status;
@@ -3155,9 +3155,9 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
     struct pacha_ipc_msg reply;
-    status = seed0root_filed_call_fdv(
+    status = seed0root_filed_page_call_fdv(
         filed_endpoint_fd,
-        FILED_V2_OP_EXEC_PATH,
+        FILED_OP_EXEC_PATH,
         0x5eed1001u,
         fds,
         3,
@@ -3165,7 +3165,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
         &reply,
         reply_fds,
         2);
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     (void)pacha_fd_close(bootstrap_fd);
     if (status != 0) {
         (void)pacha_fd_close(endpoint_fd);
@@ -3185,9 +3185,9 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
     (void)pacha_fd_close((int)reply_fds[0].fd);
 
     memset(&reply, 0, sizeof(reply));
-    status = seed0root_lprs_call_v2(
+    status = seed0root_lprs_call(
         endpoint_fd,
-        LPRS_V2_OP_HELLO,
+        LPRS_OP_HELLO,
         0x5eed1002u,
         -1,
         NULL,
@@ -3213,14 +3213,14 @@ static int seed0root_register_termd_signal_supervisor(
     }
 
     struct pacha_ipc_msg reply;
-    pacha_service_reply_header_t reply_header;
+    pacha_service_envelope_t reply_header;
     memset(&reply, 0, sizeof(reply));
     memset(&reply_header, 0, sizeof(reply_header));
-    const int status = seed0root_filed_call_v2(
+    const int status = seed0root_filed_service_call(
         filed_endpoint_fd,
-        FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+        FILED_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR,
         0x5eed1005u,
-        sizeof(filed_v2_service_endpoint_request_t),
+        sizeof(filed_service_endpoint_request_t),
         supervisor_endpoint_fd,
         &reply,
         &reply_header);
@@ -3233,26 +3233,26 @@ static int seed0root_register_termd_signal_supervisor(
     return 0;
 }
 
-static int seed0root_register_lpr_bash(int supervisor_endpoint_fd, lprs_v2_process_state_t *out_state)
+static int seed0root_register_lpr_bash(int supervisor_endpoint_fd, lprs_process_state_t *out_state)
 {
     if (supervisor_endpoint_fd < 16 || out_state == NULL) {
         return -22;
     }
     int page_fd = -1;
     void *page = NULL;
-    int status = seed0root_create_filed_v2_page(&page_fd, &page);
+    int status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         return status;
     }
-    lprs_v2_register_exec_t *reg =
-        (lprs_v2_register_exec_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    lprs_register_exec_t *reg =
+        (lprs_register_exec_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
     memset(reg, 0, sizeof(*reg));
     snprintf(reg->state.ctty, sizeof(reg->state.ctty), "%s", "/dev/hvc0");
     snprintf(reg->state.cwd, sizeof(reg->state.cwd), "%s", "/");
     struct pacha_ipc_msg reply;
-    status = seed0root_lprs_call_v2(
+    status = seed0root_lprs_call(
         supervisor_endpoint_fd,
-        LPRS_V2_OP_PROCESS_REGISTER_EXEC,
+        LPRS_OP_PROCESS_REGISTER_EXEC,
         0x5eed1003u,
         page_fd,
         page,
@@ -3262,7 +3262,7 @@ static int seed0root_register_lpr_bash(int supervisor_endpoint_fd, lprs_v2_proce
     if (status == 0) {
         memcpy(out_state, &reg->state, sizeof(*out_state));
     }
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     return status;
 }
 
@@ -3283,7 +3283,7 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
     if (filed_endpoint_fd < 16 || supervisor_endpoint_fd < 16) {
         return -22;
     }
-    lprs_v2_process_state_t bash_state;
+    lprs_process_state_t bash_state;
     memset(&bash_state, 0, sizeof(bash_state));
     int status = seed0root_register_lpr_bash(supervisor_endpoint_fd, &bash_state);
     if (status != 0 || bash_state.token == 0 || bash_state.pid == 0) {
@@ -3292,18 +3292,18 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
 
     int page_fd = -1;
     void *page = NULL;
-    status = seed0root_create_filed_v2_page(&page_fd, &page);
+    status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         return status;
     }
-    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
     exec->dir_handle = 0;
     exec->flags =
-        FILED_V2_EXEC_LINUX_LPR |
-        FILED_V2_EXEC_LINUX_BOOTSTRAP |
-        FILED_V2_EXEC_LINUX_DEFAULT_STDIO |
-        FILED_V2_EXEC_INHERIT_FDS |
-        FILED_V2_EXEC_TRANSFER_PROCESS_FD;
+        FILED_EXEC_LINUX_LPR |
+        FILED_EXEC_LINUX_BOOTSTRAP |
+        FILED_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_EXEC_INHERIT_FDS |
+        FILED_EXEC_TRANSFER_PROCESS_FD;
     exec->inherit_fd_count = 1;
     exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
     exec->linux_pid = bash_state.pid;
@@ -3318,20 +3318,20 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
     snprintf(exec->path, sizeof(exec->path), "%s", "/bin/bash");
     status = seed0root_exec_add_string(exec, &exec->ctty, "/dev/hvc0");
     if (status != 0) {
-        seed0root_destroy_filed_v2_page(page_fd, page);
+        seed0root_destroy_filed_page(page_fd, page);
         return status;
     }
     for (uint64_t i = 0; i < exec->argc; i++) {
         status = seed0root_exec_add_string(exec, &exec->argv[i], argv[i]);
         if (status != 0) {
-            seed0root_destroy_filed_v2_page(page_fd, page);
+            seed0root_destroy_filed_page(page_fd, page);
             return status;
         }
     }
     for (uint64_t i = 0; i < exec->envc; i++) {
         status = seed0root_exec_add_string(exec, &exec->envp[i], envp[i]);
         if (status != 0) {
-            seed0root_destroy_filed_v2_page(page_fd, page);
+            seed0root_destroy_filed_page(page_fd, page);
             return status;
         }
     }
@@ -3349,9 +3349,9 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
     struct pacha_ipc_msg reply;
-    status = seed0root_filed_call_fdv(
+    status = seed0root_filed_page_call_fdv(
         filed_endpoint_fd,
-        FILED_V2_OP_EXEC_PATH,
+        FILED_OP_EXEC_PATH,
         0x5eed0ba5u,
         fds,
         2,
@@ -3359,7 +3359,7 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
         &reply,
         reply_fds,
         2);
-    seed0root_destroy_filed_v2_page(page_fd, page);
+    seed0root_destroy_filed_page(page_fd, page);
     if (status != 0) {
         fprintf(stderr, "[seed0root] bash exec failed status=%d\n", status);
         return status;
@@ -3380,27 +3380,27 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
     memset(&reply, 0, sizeof(reply));
     int lprs_page_fd = -1;
     void *lprs_page = NULL;
-    status = seed0root_create_filed_v2_page(&lprs_page_fd, &lprs_page);
+    status = seed0root_create_filed_page(&lprs_page_fd, &lprs_page);
     if (status != 0) {
         (void)pacha_fd_close((int)reply_fds[1].fd);
         (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
         (void)pacha_fd_close((int)reply_fds[0].fd);
         return status;
     }
-    lprs_v2_token_request_t *token_req =
-        (lprs_v2_token_request_t *)((uint8_t *)lprs_page + PACHA_SERVICE_HEADER_BYTES);
+    lprs_token_request_t *token_req =
+        (lprs_token_request_t *)((uint8_t *)lprs_page + PACHA_SERVICE_HEADER_BYTES);
     memset(token_req, 0, sizeof(*token_req));
     token_req->token = bash_state.token;
-    status = seed0root_lprs_call_v2(
+    status = seed0root_lprs_call(
         supervisor_endpoint_fd,
-        LPRS_V2_OP_PROCESS_REGISTER_FD,
+        LPRS_OP_PROCESS_REGISTER_FD,
         0x5eed1004u,
         lprs_page_fd,
         lprs_page,
         sizeof(*token_req),
         (int)reply_fds[0].fd,
         &reply);
-    seed0root_destroy_filed_v2_page(lprs_page_fd, lprs_page);
+    seed0root_destroy_filed_page(lprs_page_fd, lprs_page);
     (void)pacha_fd_close((int)reply_fds[1].fd);
     if (status != 0) {
         (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);

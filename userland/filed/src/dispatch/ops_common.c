@@ -140,47 +140,47 @@ filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind)
     }
 }
 
-uint32_t filed_v2_rights_to_vfs(uint64_t rights)
+uint32_t filed_rights_to_vfs(uint64_t rights)
 {
     const uint64_t known =
-        FILED_V2_RIGHT_LOOKUP |
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_WRITE |
-        FILED_V2_RIGHT_EXEC |
-        FILED_V2_RIGHT_STAT |
-        FILED_V2_RIGHT_GETDENTS |
-        FILED_V2_RIGHT_CREATE |
-        FILED_V2_RIGHT_REMOVE |
-        FILED_V2_RIGHT_RENAME;
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_READ |
+        FILED_RIGHT_WRITE |
+        FILED_RIGHT_EXEC |
+        FILED_RIGHT_STAT |
+        FILED_RIGHT_GETDENTS |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
     return (uint32_t)(rights & known);
 }
 
-uint32_t filed_v2_open_flags_to_vfs(uint64_t flags)
+uint32_t filed_open_flags_to_vfs(uint64_t flags)
 {
     const uint64_t known =
-        FILED_V2_OPEN_CREATE |
-        FILED_V2_OPEN_EXCLUSIVE |
-        FILED_V2_OPEN_TRUNCATE |
-        FILED_V2_OPEN_DIRECTORY |
-        FILED_V2_OPEN_NOFOLLOW |
-        FILED_V2_OPEN_CLOEXEC |
-        FILED_V2_OPEN_APPEND |
-        FILED_V2_OPEN_NONBLOCK |
-        FILED_V2_OPEN_SYNC;
+        FILED_OPEN_CREATE |
+        FILED_OPEN_EXCLUSIVE |
+        FILED_OPEN_TRUNCATE |
+        FILED_OPEN_DIRECTORY |
+        FILED_OPEN_NOFOLLOW |
+        FILED_OPEN_CLOEXEC |
+        FILED_OPEN_APPEND |
+        FILED_OPEN_NONBLOCK |
+        FILED_OPEN_SYNC;
     return (uint32_t)(flags & known);
 }
 
-uint32_t filed_v2_fd_flags_to_vfs(uint64_t flags)
+uint32_t filed_fd_flags_to_vfs(uint64_t flags)
 {
-    return (uint32_t)(flags & FILED_V2_FD_CLOEXEC);
+    return (uint32_t)(flags & FILED_FD_CLOEXEC);
 }
 
-uint32_t filed_v2_file_status_flags_to_vfs(uint64_t flags)
+uint32_t filed_file_status_flags_to_vfs(uint64_t flags)
 {
     const uint64_t known =
-        FILED_V2_FILE_APPEND |
-        FILED_V2_FILE_NONBLOCK |
-        FILED_V2_FILE_SYNC;
+        FILED_FILE_APPEND |
+        FILED_FILE_NONBLOCK |
+        FILED_FILE_SYNC;
     return (uint32_t)(flags & known);
 }
 
@@ -198,13 +198,13 @@ uint64_t filed_vfs_file_status_flags_to_wire(uint32_t flags)
     return (uint64_t)(flags & known);
 }
 
-int filed_v2_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
+int filed_flags_are_known(uint64_t fd_flags, uint64_t status_flags)
 {
-    const uint64_t known_fd = FILED_V2_FD_CLOEXEC;
+    const uint64_t known_fd = FILED_FD_CLOEXEC;
     const uint64_t known_status =
-        FILED_V2_FILE_APPEND |
-        FILED_V2_FILE_NONBLOCK |
-        FILED_V2_FILE_SYNC;
+        FILED_FILE_APPEND |
+        FILED_FILE_NONBLOCK |
+        FILED_FILE_SYNC;
     return (fd_flags & ~known_fd) == 0 && (status_flags & ~known_status) == 0;
 }
 
@@ -243,8 +243,8 @@ filed_page_dispatch_result_t filed_page_result(int64_t status, uint64_t result)
 }
 
 int filed_write_stat_from_backend(
-    filed_v2_statx_t *out,
-    const storage_v2_statx_reply_t *stat,
+    filed_statx_t *out,
+    const storage_statx_reply_t *stat,
     uint64_t handle_id,
     uint64_t object_generation,
     uint64_t dir_generation)
@@ -271,7 +271,7 @@ int filed_write_stat_from_backend(
 }
 
 filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
-    const storage_v2_statx_reply_t *stat,
+    const storage_statx_reply_t *stat,
     uint64_t handle_id,
     uint64_t object_generation,
     uint64_t dir_generation)
@@ -343,7 +343,7 @@ filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(
 }
 
 int filed_write_stat_from_snapshot(
-    filed_v2_statx_t *out,
+    filed_statx_t *out,
     const filed_vfs_stat_snapshot_t *snapshot,
     uint64_t handle_id)
 {
@@ -451,7 +451,7 @@ int64_t filed_lookup_component_stat(
     filed_handle_id_t parent_handle,
     const char *name,
     uint64_t *out_object_id,
-    storage_v2_statx_reply_t *out_stat,
+    storage_statx_reply_t *out_stat,
     bool *out_lookup_owned)
 {
     filed_vfs_io_decision_t parent_decision;
@@ -491,7 +491,7 @@ int64_t filed_splice_symlink_target(
     char *out_path,
     size_t out_path_size)
 {
-    char target[FILED_V2_SYMLINK_TARGET_BYTES];
+    char target[FILED_SYMLINK_TARGET_BYTES];
     uint64_t target_length = 0;
     int64_t reply_status;
     size_t rest_length;
@@ -547,7 +547,7 @@ int64_t filed_resolve_parent_path(
     filed_handle_id_t current_handle;
     int current_owned = 0;
     unsigned int symlink_budget = 16;
-    char symlink_path[FILED_V2_PATH_BYTES];
+    char symlink_path[FILED_PATH_BYTES];
 
     if (runtime == NULL ||
         path == NULL ||
@@ -578,7 +578,7 @@ int64_t filed_resolve_parent_path(
     }
 
     for (;;) {
-        char component[FILED_V2_NAME_BYTES];
+        char component[FILED_NAME_BYTES];
         const char *component_start;
         const char *after_slashes;
         size_t component_len;
@@ -674,7 +674,7 @@ int64_t filed_resolve_parent_path(
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
             bool lookup_owned = false;
-            storage_v2_statx_reply_t stat;
+            storage_statx_reply_t stat;
             int64_t symlink_status;
             if (filed_path_is_single_component(after_slashes)) {
                 next_rights |= parent_rights;
@@ -751,7 +751,7 @@ int64_t filed_lookup_and_open_component(
 {
     filed_vfs_io_decision_t parent_decision;
     uint64_t object_id = 0;
-    storage_v2_statx_reply_t backend_stat;
+    storage_statx_reply_t backend_stat;
     filed_status_t status;
     int64_t reply_status;
     bool lookup_acquired = false;
@@ -951,11 +951,11 @@ int64_t filed_lookup_and_open_component(
 
 int64_t filed_openat_path(
     filed_runtime_t *runtime,
-    const filed_v2_openat_t *openat,
+    const filed_openat_t *openat,
     filed_vfs_open_result_t *out_open)
 {
-    const uint32_t rights = filed_v2_rights_to_vfs(openat->rights);
-    const uint32_t open_flags = filed_v2_open_flags_to_vfs(openat->open_flags);
+    const uint32_t rights = filed_rights_to_vfs(openat->rights);
+    const uint32_t open_flags = filed_open_flags_to_vfs(openat->open_flags);
     const char *path = openat->name;
     const int absolute = path[0] == '/';
     filed_handle_id_t current_handle =
@@ -964,7 +964,7 @@ int64_t filed_openat_path(
             (filed_handle_id_t)(uint32_t)openat->dir_handle;
     int current_owned = 0;
     unsigned int symlink_budget = 16;
-    char symlink_path[FILED_V2_PATH_BYTES];
+    char symlink_path[FILED_PATH_BYTES];
 
     if (path[0] == '\0') {
         return filed_status_to_wire(FILED_ERR_INVALID);
@@ -984,7 +984,7 @@ int64_t filed_openat_path(
     }
 
     for (;;) {
-        char component[FILED_V2_NAME_BYTES];
+        char component[FILED_NAME_BYTES];
         const char *component_start;
         const char *after_slashes;
         size_t component_len;
@@ -1076,7 +1076,7 @@ int64_t filed_openat_path(
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
             bool lookup_owned = false;
-            storage_v2_statx_reply_t stat;
+            storage_statx_reply_t stat;
             int64_t symlink_status;
             if ((open_flags & FILED_OPEN_CREATE) != 0 &&
                 filed_path_is_single_component(after_slashes))

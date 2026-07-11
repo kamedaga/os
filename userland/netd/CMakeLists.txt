@@ -143,8 +143,9 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/upper.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/upper.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/boot_config.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/ipc_protocol_v2.h"
-    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol_v2.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/filed/include/filed/flags.h"
+    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

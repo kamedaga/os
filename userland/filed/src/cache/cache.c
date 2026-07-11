@@ -221,8 +221,8 @@ static int filed_shared_vmo_flush_entry(
     uint64_t offset = 0;
     while (offset < entry->logical_size) {
         uint64_t chunk = entry->logical_size - offset;
-        if (chunk > STORAGE_V2_IO_BYTES) {
-            chunk = STORAGE_V2_IO_BYTES;
+        if (chunk > STORAGE_IO_BYTES) {
+            chunk = STORAGE_IO_BYTES;
         }
         uint64_t bytes = 0;
         const int status = filed_backend_pwrite(
@@ -823,7 +823,7 @@ int filed_dir_cache_get(
     filed_runtime_t *runtime,
     uint64_t backend_object,
     uint64_t offset,
-    storage_v2_getdents_request_t *out_entries)
+    storage_getdents_request_t *out_entries)
 {
     filed_dir_cache_slot_t *slot;
     if (out_entries == NULL) {
@@ -849,7 +849,7 @@ void filed_dir_cache_store(
     filed_runtime_t *runtime,
     uint64_t backend_object,
     uint64_t offset,
-    const storage_v2_getdents_request_t *entries)
+    const storage_getdents_request_t *entries)
 {
     filed_dir_cache_slot_t *slot;
     if (backend_object == 0 || entries == NULL) {
@@ -906,7 +906,7 @@ static size_t filed_lookup_name_len(const char *name)
     if (name == NULL) {
         return 0;
     }
-    while (len < FILED_V2_NAME_BYTES && name[len] != '\0') {
+    while (len < FILED_NAME_BYTES && name[len] != '\0') {
         ++len;
     }
     return len;
@@ -922,7 +922,7 @@ static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_find(
     if (parent_backend_object == 0 ||
         name == NULL ||
         name_len == 0 ||
-        name_len >= FILED_V2_NAME_BYTES)
+        name_len >= FILED_NAME_BYTES)
     {
         return NULL;
     }
@@ -931,7 +931,7 @@ static filed_negative_lookup_cache_slot_t *filed_negative_lookup_cache_find(
         if (slot->valid &&
             slot->parent_backend_object == parent_backend_object &&
             slot->parent_dir_generation == parent_dir_generation &&
-            strncmp(slot->name, name, FILED_V2_NAME_BYTES) == 0)
+            strncmp(slot->name, name, FILED_NAME_BYTES) == 0)
         {
             return slot;
         }
@@ -995,7 +995,7 @@ void filed_negative_lookup_cache_store(
     if (parent_backend_object == 0 ||
         name == NULL ||
         name_len == 0 ||
-        name_len >= FILED_V2_NAME_BYTES ||
+        name_len >= FILED_NAME_BYTES ||
         status == 0)
     {
         return;
@@ -1254,8 +1254,8 @@ int filed_cache_create_shared_vmo(
     uint64_t loaded = 0;
     while (loaded < logical_size) {
         uint64_t chunk = logical_size - loaded;
-        if (chunk > STORAGE_V2_IO_BYTES) {
-            chunk = STORAGE_V2_IO_BYTES;
+        if (chunk > STORAGE_IO_BYTES) {
+            chunk = STORAGE_IO_BYTES;
         }
         uint64_t bytes = 0;
         status = filed_backend_pread(

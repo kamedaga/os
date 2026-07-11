@@ -1,8 +1,8 @@
 #include "fs_endpoint.h"
 
 #include "ipc_wire.h"
-#include "koboxd/control_protocol_v2.h"
-#include "koboxd/storage_protocol_v2.h"
+#include "koboxd/control_protocol.h"
+#include "koboxd/storage_protocol.h"
 #include "pacha/abi.h"
 
 #include <stdio.h>
@@ -48,23 +48,23 @@ static uint64_t koboxd_read_tsc(void)
 static const char *koboxd_fs_op_name(uint64_t op)
 {
     switch (op) {
-    case STORAGE_V2_OP_MOUNT_ROOT: return "mount_root";
-    case STORAGE_V2_OP_LOOKUP: return "lookup";
-    case STORAGE_V2_OP_PREAD: return "pread";
-    case STORAGE_V2_OP_PWRITE: return "pwrite";
-    case STORAGE_V2_OP_STATX: return "statx";
-    case STORAGE_V2_OP_GETDENTS: return "getdents";
-    case STORAGE_V2_OP_FSYNC: return "fsync";
-    case STORAGE_V2_OP_UTIMENS: return "utimens";
-    case STORAGE_V2_OP_CHMOD: return "chmod";
-    case STORAGE_V2_OP_CREATE: return "create";
-    case STORAGE_V2_OP_TRUNCATE: return "truncate";
-    case STORAGE_V2_OP_UNLINK: return "unlink";
-    case STORAGE_V2_OP_RENAME: return "rename";
-    case STORAGE_V2_OP_MKDIR: return "mkdir";
-    case STORAGE_V2_OP_RMDIR: return "rmdir";
-    case STORAGE_V2_OP_RELEASE_OBJECT: return "release_object";
-    case STORAGE_V2_OP_SYNC_ALL: return "sync_all";
+    case STORAGE_OP_MOUNT_ROOT: return "mount_root";
+    case STORAGE_OP_LOOKUP: return "lookup";
+    case STORAGE_OP_PREAD: return "pread";
+    case STORAGE_OP_PWRITE: return "pwrite";
+    case STORAGE_OP_STATX: return "statx";
+    case STORAGE_OP_GETDENTS: return "getdents";
+    case STORAGE_OP_FSYNC: return "fsync";
+    case STORAGE_OP_UTIMENS: return "utimens";
+    case STORAGE_OP_CHMOD: return "chmod";
+    case STORAGE_OP_CREATE: return "create";
+    case STORAGE_OP_TRUNCATE: return "truncate";
+    case STORAGE_OP_UNLINK: return "unlink";
+    case STORAGE_OP_RENAME: return "rename";
+    case STORAGE_OP_MKDIR: return "mkdir";
+    case STORAGE_OP_RMDIR: return "rmdir";
+    case STORAGE_OP_RELEASE_OBJECT: return "release_object";
+    case STORAGE_OP_SYNC_ALL: return "sync_all";
     default: return "unknown";
     }
 }
@@ -72,23 +72,23 @@ static const char *koboxd_fs_op_name(uint64_t op)
 static uint64_t koboxd_fs_metric_slot(uint64_t op)
 {
     switch (op) {
-    case STORAGE_V2_OP_MOUNT_ROOT: return 1;
-    case STORAGE_V2_OP_LOOKUP: return 2;
-    case STORAGE_V2_OP_STATX: return 3;
-    case STORAGE_V2_OP_GETDENTS: return 4;
-    case STORAGE_V2_OP_PREAD: return 5;
-    case STORAGE_V2_OP_PWRITE: return 6;
-    case STORAGE_V2_OP_FSYNC: return 7;
-    case STORAGE_V2_OP_CREATE: return 8;
-    case STORAGE_V2_OP_TRUNCATE: return 9;
-    case STORAGE_V2_OP_UTIMENS: return 10;
-    case STORAGE_V2_OP_CHMOD: return 11;
-    case STORAGE_V2_OP_UNLINK: return 12;
-    case STORAGE_V2_OP_RENAME: return 13;
-    case STORAGE_V2_OP_MKDIR: return 14;
-    case STORAGE_V2_OP_RMDIR: return 15;
-    case STORAGE_V2_OP_RELEASE_OBJECT: return 16;
-    case STORAGE_V2_OP_SYNC_ALL: return 17;
+    case STORAGE_OP_MOUNT_ROOT: return 1;
+    case STORAGE_OP_LOOKUP: return 2;
+    case STORAGE_OP_STATX: return 3;
+    case STORAGE_OP_GETDENTS: return 4;
+    case STORAGE_OP_PREAD: return 5;
+    case STORAGE_OP_PWRITE: return 6;
+    case STORAGE_OP_FSYNC: return 7;
+    case STORAGE_OP_CREATE: return 8;
+    case STORAGE_OP_TRUNCATE: return 9;
+    case STORAGE_OP_UTIMENS: return 10;
+    case STORAGE_OP_CHMOD: return 11;
+    case STORAGE_OP_UNLINK: return 12;
+    case STORAGE_OP_RENAME: return 13;
+    case STORAGE_OP_MKDIR: return 14;
+    case STORAGE_OP_RMDIR: return 15;
+    case STORAGE_OP_RELEASE_OBJECT: return 16;
+    case STORAGE_OP_SYNC_ALL: return 17;
     default: return 0;
     }
 }
@@ -96,23 +96,23 @@ static uint64_t koboxd_fs_metric_slot(uint64_t op)
 static uint64_t koboxd_fs_metric_op(uint64_t slot)
 {
     switch (slot) {
-    case 1: return STORAGE_V2_OP_MOUNT_ROOT;
-    case 2: return STORAGE_V2_OP_LOOKUP;
-    case 3: return STORAGE_V2_OP_STATX;
-    case 4: return STORAGE_V2_OP_GETDENTS;
-    case 5: return STORAGE_V2_OP_PREAD;
-    case 6: return STORAGE_V2_OP_PWRITE;
-    case 7: return STORAGE_V2_OP_FSYNC;
-    case 8: return STORAGE_V2_OP_CREATE;
-    case 9: return STORAGE_V2_OP_TRUNCATE;
-    case 10: return STORAGE_V2_OP_UTIMENS;
-    case 11: return STORAGE_V2_OP_CHMOD;
-    case 12: return STORAGE_V2_OP_UNLINK;
-    case 13: return STORAGE_V2_OP_RENAME;
-    case 14: return STORAGE_V2_OP_MKDIR;
-    case 15: return STORAGE_V2_OP_RMDIR;
-    case 16: return STORAGE_V2_OP_RELEASE_OBJECT;
-    case 17: return STORAGE_V2_OP_SYNC_ALL;
+    case 1: return STORAGE_OP_MOUNT_ROOT;
+    case 2: return STORAGE_OP_LOOKUP;
+    case 3: return STORAGE_OP_STATX;
+    case 4: return STORAGE_OP_GETDENTS;
+    case 5: return STORAGE_OP_PREAD;
+    case 6: return STORAGE_OP_PWRITE;
+    case 7: return STORAGE_OP_FSYNC;
+    case 8: return STORAGE_OP_CREATE;
+    case 9: return STORAGE_OP_TRUNCATE;
+    case 10: return STORAGE_OP_UTIMENS;
+    case 11: return STORAGE_OP_CHMOD;
+    case 12: return STORAGE_OP_UNLINK;
+    case 13: return STORAGE_OP_RENAME;
+    case 14: return STORAGE_OP_MKDIR;
+    case 15: return STORAGE_OP_RMDIR;
+    case 16: return STORAGE_OP_RELEASE_OBJECT;
+    case 17: return STORAGE_OP_SYNC_ALL;
     default: return 0;
     }
 }
@@ -183,7 +183,7 @@ static int map_fs_wire_page(koboxd_fs_request_ctx_t *ctx)
     }
     ctx->mapped = koboxd_map_wire_vmo_from_msg(
         ctx->request,
-        STORAGE_V2_PAGE_BYTES,
+        STORAGE_PAGE_BYTES,
         &ctx->vmo_fd);
     if (ctx->mapped == NULL) {
         ctx->reply_status = -22;
@@ -202,8 +202,8 @@ static void handle_lookup(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_lookup_request_t *lookup = (storage_v2_lookup_request_t *)ctx->mapped;
-    lookup->name[STORAGE_V2_NAME_BYTES - 1] = '\0';
+    storage_lookup_request_t *lookup = (storage_lookup_request_t *)ctx->mapped;
+    lookup->name[STORAGE_NAME_BYTES - 1] = '\0';
     uint64_t object_id = 0;
     ctx->reply_status = koboxd_fs_backend_lookup(
         ctx->backend,
@@ -218,7 +218,7 @@ static void handle_statx(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_statx_reply_t *wire_stat = (storage_v2_statx_reply_t *)ctx->mapped;
+    storage_statx_reply_t *wire_stat = (storage_statx_reply_t *)ctx->mapped;
     koboxd_fs_object_t stat;
     ctx->reply_status = koboxd_fs_backend_statx(
         ctx->backend,
@@ -248,7 +248,7 @@ static void handle_pread(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_io_request_t *io = (storage_v2_io_request_t *)ctx->mapped;
+    storage_io_request_t *io = (storage_io_request_t *)ctx->mapped;
     size_t length = (size_t)io->length;
     if (length > sizeof(io->data)) {
         length = sizeof(io->data);
@@ -271,7 +271,7 @@ static void handle_pwrite(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_io_request_t *io = (storage_v2_io_request_t *)ctx->mapped;
+    storage_io_request_t *io = (storage_io_request_t *)ctx->mapped;
     size_t length = (size_t)io->length;
     if (length > sizeof(io->data)) {
         length = sizeof(io->data);
@@ -293,8 +293,8 @@ static void handle_create(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_create_request_t *create = (storage_v2_create_request_t *)ctx->mapped;
-    create->name[STORAGE_V2_NAME_BYTES - 1] = '\0';
+    storage_create_request_t *create = (storage_create_request_t *)ctx->mapped;
+    create->name[STORAGE_NAME_BYTES - 1] = '\0';
     uint64_t object_id = 0;
     ctx->reply_status = koboxd_fs_backend_create(
         ctx->backend,
@@ -310,7 +310,7 @@ static void handle_truncate(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_truncate_request_t *truncate = (storage_v2_truncate_request_t *)ctx->mapped;
+    storage_truncate_request_t *truncate = (storage_truncate_request_t *)ctx->mapped;
     ctx->reply_status = koboxd_fs_backend_truncate(
         ctx->backend,
         truncate->object_id,
@@ -322,7 +322,7 @@ static void handle_utimens(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_utimens_request_t *utimens = (storage_v2_utimens_request_t *)ctx->mapped;
+    storage_utimens_request_t *utimens = (storage_utimens_request_t *)ctx->mapped;
     ctx->reply_status = koboxd_fs_backend_utimens(
         ctx->backend,
         utimens->object_id,
@@ -338,7 +338,7 @@ static void handle_chmod(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_chmod_request_t *chmod_req = (storage_v2_chmod_request_t *)ctx->mapped;
+    storage_chmod_request_t *chmod_req = (storage_chmod_request_t *)ctx->mapped;
     ctx->reply_status = koboxd_fs_backend_chmod(
         ctx->backend,
         chmod_req->object_id,
@@ -350,8 +350,8 @@ static void handle_unlink(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_unlink_request_t *unlink = (storage_v2_unlink_request_t *)ctx->mapped;
-    unlink->name[STORAGE_V2_NAME_BYTES - 1] = '\0';
+    storage_unlink_request_t *unlink = (storage_unlink_request_t *)ctx->mapped;
+    unlink->name[STORAGE_NAME_BYTES - 1] = '\0';
     ctx->reply_status = koboxd_fs_backend_unlink(
         ctx->backend,
         unlink->parent_object_id,
@@ -363,8 +363,8 @@ static void handle_mkdir(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_mkdir_request_t *mkdir = (storage_v2_mkdir_request_t *)ctx->mapped;
-    mkdir->name[STORAGE_V2_NAME_BYTES - 1] = '\0';
+    storage_mkdir_request_t *mkdir = (storage_mkdir_request_t *)ctx->mapped;
+    mkdir->name[STORAGE_NAME_BYTES - 1] = '\0';
     uint64_t object_id = 0;
     ctx->reply_status = koboxd_fs_backend_mkdir(
         ctx->backend,
@@ -380,8 +380,8 @@ static void handle_rmdir(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_rmdir_request_t *rmdir = (storage_v2_rmdir_request_t *)ctx->mapped;
-    rmdir->name[STORAGE_V2_NAME_BYTES - 1] = '\0';
+    storage_rmdir_request_t *rmdir = (storage_rmdir_request_t *)ctx->mapped;
+    rmdir->name[STORAGE_NAME_BYTES - 1] = '\0';
     ctx->reply_status = koboxd_fs_backend_rmdir(
         ctx->backend,
         rmdir->parent_object_id,
@@ -393,9 +393,9 @@ static void handle_rename(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_rename_request_t *rename = (storage_v2_rename_request_t *)ctx->mapped;
-    rename->old_name[STORAGE_V2_NAME_BYTES - 1] = '\0';
-    rename->new_name[STORAGE_V2_NAME_BYTES - 1] = '\0';
+    storage_rename_request_t *rename = (storage_rename_request_t *)ctx->mapped;
+    rename->old_name[STORAGE_NAME_BYTES - 1] = '\0';
+    rename->new_name[STORAGE_NAME_BYTES - 1] = '\0';
     uint64_t object_id = 0;
     ctx->reply_status = koboxd_fs_backend_rename(
         ctx->backend,
@@ -412,13 +412,13 @@ static void handle_getdents(koboxd_fs_request_ctx_t *ctx)
     if (map_fs_wire_page(ctx) != 0) {
         return;
     }
-    storage_v2_getdents_request_t *wire_dir = (storage_v2_getdents_request_t *)ctx->mapped;
-    koboxd_fs_object_t entries[STORAGE_V2_DIRENT_CAPACITY];
+    storage_getdents_request_t *wire_dir = (storage_getdents_request_t *)ctx->mapped;
+    koboxd_fs_object_t entries[STORAGE_DIRENT_CAPACITY];
     memset(entries, 0, sizeof(entries));
     size_t count = 0;
     size_t capacity = (size_t)wire_dir->capacity;
-    if (capacity > STORAGE_V2_DIRENT_CAPACITY) {
-        capacity = STORAGE_V2_DIRENT_CAPACITY;
+    if (capacity > STORAGE_DIRENT_CAPACITY) {
+        capacity = STORAGE_DIRENT_CAPACITY;
     }
     ctx->reply_status = koboxd_fs_backend_getdents(
         ctx->backend,
@@ -443,55 +443,55 @@ static void handle_getdents(koboxd_fs_request_ctx_t *ctx)
 static void dispatch_fs_request(koboxd_fs_request_ctx_t *ctx)
 {
     switch (ctx->request->word1) {
-    case STORAGE_V2_OP_MOUNT_ROOT:
+    case STORAGE_OP_MOUNT_ROOT:
         handle_mount_root(ctx);
         break;
-    case STORAGE_V2_OP_LOOKUP:
+    case STORAGE_OP_LOOKUP:
         handle_lookup(ctx);
         break;
-    case STORAGE_V2_OP_STATX:
+    case STORAGE_OP_STATX:
         handle_statx(ctx);
         break;
-    case STORAGE_V2_OP_PREAD:
+    case STORAGE_OP_PREAD:
         handle_pread(ctx);
         break;
-    case STORAGE_V2_OP_PWRITE:
+    case STORAGE_OP_PWRITE:
         handle_pwrite(ctx);
         break;
-    case STORAGE_V2_OP_FSYNC:
+    case STORAGE_OP_FSYNC:
         ctx->reply_status = koboxd_fs_backend_fsync(ctx->backend, ctx->request->word2);
         break;
-    case STORAGE_V2_OP_RELEASE_OBJECT:
+    case STORAGE_OP_RELEASE_OBJECT:
         ctx->reply_status = koboxd_fs_backend_release_object(ctx->backend, ctx->request->word2);
         break;
-    case STORAGE_V2_OP_SYNC_ALL:
+    case STORAGE_OP_SYNC_ALL:
         ctx->reply_status = koboxd_fs_backend_sync_all(ctx->backend);
         break;
-    case STORAGE_V2_OP_CREATE:
+    case STORAGE_OP_CREATE:
         handle_create(ctx);
         break;
-    case STORAGE_V2_OP_TRUNCATE:
+    case STORAGE_OP_TRUNCATE:
         handle_truncate(ctx);
         break;
-    case STORAGE_V2_OP_UTIMENS:
+    case STORAGE_OP_UTIMENS:
         handle_utimens(ctx);
         break;
-    case STORAGE_V2_OP_CHMOD:
+    case STORAGE_OP_CHMOD:
         handle_chmod(ctx);
         break;
-    case STORAGE_V2_OP_UNLINK:
+    case STORAGE_OP_UNLINK:
         handle_unlink(ctx);
         break;
-    case STORAGE_V2_OP_MKDIR:
+    case STORAGE_OP_MKDIR:
         handle_mkdir(ctx);
         break;
-    case STORAGE_V2_OP_RMDIR:
+    case STORAGE_OP_RMDIR:
         handle_rmdir(ctx);
         break;
-    case STORAGE_V2_OP_RENAME:
+    case STORAGE_OP_RENAME:
         handle_rename(ctx);
         break;
-    case STORAGE_V2_OP_GETDENTS:
+    case STORAGE_OP_GETDENTS:
         handle_getdents(ctx);
         break;
     default:
@@ -506,7 +506,7 @@ static void cleanup_fs_request(koboxd_fs_request_ctx_t *ctx)
         return;
     }
     if (ctx->mapped != NULL) {
-        (void)pacha_munmap(ctx->mapped, STORAGE_V2_PAGE_BYTES);
+        (void)pacha_munmap(ctx->mapped, STORAGE_PAGE_BYTES);
     }
     if (ctx->vmo_fd >= 16) {
         (void)pacha_fd_close(ctx->vmo_fd);
@@ -532,7 +532,7 @@ int koboxd_fs_endpoint_serve_once(
     if (status != 0) {
         return status;
     }
-    if (request.word0 != KOBOXD_V2_ENDPOINT_MAGIC) {
+    if (request.word0 != PACHA_SERVICE_REQUEST_MAGIC) {
         return -2;
     }
 
@@ -559,7 +559,7 @@ int koboxd_fs_endpoint_serve_once(
         ctx.reply_status);
     cleanup_fs_request(&ctx);
 
-    if (op == STORAGE_V2_OP_SYNC_ALL) {
+    if (op == STORAGE_OP_SYNC_ALL) {
         koboxd_dump_fs_metrics();
     }
 

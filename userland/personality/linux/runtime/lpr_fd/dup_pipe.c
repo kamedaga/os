@@ -35,7 +35,7 @@ void lpr_pipe_after_fork_child(void)
         if (object->kind == LPR_FD_TABLE_KIND_TTY) {
             uint64_t dup_handle = 0;
             const int64_t status = lpr_termd_call_handle(
-                TERMD_V2_OP_HANDLE_DUP,
+                TERMD_OP_HANDLE_DUP,
                 object->payload.tty.handle,
                 &dup_handle);
             lpr_trace_process_event("fork_dup_tty", index, dup_handle, status);
@@ -51,12 +51,12 @@ void lpr_pipe_after_fork_child(void)
                 lpr_trace_process_event("fork_dup_filed_page", index, 0, page_fd);
                 continue;
             }
-            filed_v2_handle_flags_t *flags = (filed_v2_handle_flags_t *)page;
+            filed_handle_flags_t *flags = (filed_handle_flags_t *)page;
             lpr_memset(flags, 0, sizeof(*flags));
             flags->handle = object->payload.filed.handle;
             flags->fd_flags = 0;
             uint64_t dup_handle = 0;
-            const int64_t status = lpr_filed_call(FILED_V2_OP_VFS_DUP, page_fd, 0, &dup_handle);
+            const int64_t status = lpr_filed_call(FILED_OP_VFS_DUP, page_fd, 0, &dup_handle);
             lpr_destroy_wire_page(page_fd, page);
             lpr_trace_process_event("fork_dup_filed", index, dup_handle, status);
             if (status == 0 && dup_handle != 0) {
@@ -82,7 +82,7 @@ void lpr_linux_apply_pending_fork_child(void)
         lpr_supervisor_token = child_token;
         lpr_supervisor_enabled = 1;
         (void)lpr_supervisor_call_token(
-            LPRS_V2_OP_PROCESS_FORK_CHILD_READY,
+            LPRS_OP_PROCESS_FORK_CHILD_READY,
             lpr_supervisor_token,
             -1,
             0);

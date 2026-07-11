@@ -21,7 +21,7 @@ int filed_runtime_backend_lookup(
 int filed_runtime_backend_statx(
     filed_runtime_t *runtime,
     uint64_t object_id,
-    storage_v2_statx_reply_t *out_stat)
+    storage_statx_reply_t *out_stat)
 {
     if (runtime == NULL) {
         return -22;

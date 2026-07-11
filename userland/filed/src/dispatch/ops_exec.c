@@ -4,13 +4,13 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_V2_EXEC_INHERIT_HANDLES |
-        FILED_V2_EXEC_LINUX_LPR |
-        FILED_V2_EXEC_LINUX_BOOTSTRAP |
-        FILED_V2_EXEC_LINUX_DEFAULT_STDIO |
-        FILED_V2_EXEC_TRANSFER_PROCESS_FD;
+        FILED_EXEC_INHERIT_HANDLES |
+        FILED_EXEC_LINUX_LPR |
+        FILED_EXEC_LINUX_BOOTSTRAP |
+        FILED_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_EXEC_TRANSFER_PROCESS_FD;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
@@ -22,36 +22,36 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
     filed_dispatch_saved_fd_t lpr_bootstrap_saved;
-    filed_handle_id_t inherit_handles[FILED_V2_EXEC_MAX_INHERIT_HANDLES];
+    filed_handle_id_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
     filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec->flags & ~known_flags) != 0 ||
         exec->inherit_fd_count != 0 ||
         exec->fd_patch_count != 0 ||
-        exec->inherit_handle_count > FILED_V2_EXEC_MAX_INHERIT_HANDLES ||
-        exec->argc > FILED_V2_EXEC_MAX_ARGS ||
-        exec->envc > FILED_V2_EXEC_MAX_ENVS ||
-        exec->string_bytes > FILED_V2_EXEC_STRING_BYTES ||
+        exec->inherit_handle_count > FILED_EXEC_MAX_INHERIT_HANDLES ||
+        exec->argc > FILED_EXEC_MAX_ARGS ||
+        exec->envc > FILED_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_EXEC_STRING_BYTES ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_v2_exec_string_ref_empty(exec->cwd) &&
-            !filed_v2_exec_string_ref_valid(exec, exec->cwd)) ||
+        (!filed_exec_string_ref_empty(exec->cwd) &&
+            !filed_exec_string_ref_valid(exec, exec->cwd)) ||
         !filed_dispatch_exec_default_stdio_valid(exec) ||
         !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
     {
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_v2_exec_string_ref_valid(exec, exec->argv[i])) {
+        if (!filed_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_v2_exec_string_ref_valid(exec, exec->envp[i])) {
+        if (!filed_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
-    if ((exec->flags & FILED_V2_EXEC_INHERIT_HANDLES) == 0 &&
+    if ((exec->flags & FILED_EXEC_INHERIT_HANDLES) == 0 &&
         exec->inherit_handle_count != 0)
     {
         goto out;
@@ -80,7 +80,7 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
-    if ((exec->flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
+    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
         runtime->netd_socket_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -92,7 +92,7 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
-    if ((exec->flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
+    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
         runtime->termd_tty_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -104,8 +104,8 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
-    if ((exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) ==
-        (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
+    if ((exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) ==
+        (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
     {
         const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
         if (bootstrap_source_fd < 16) {
@@ -123,13 +123,13 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         }
     }
 
-    filed_v2_openat_t openat;
+    filed_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
     openat.rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_EXEC |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_EXEC |
+        FILED_RIGHT_STAT;
     snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
 
     filed_vfs_open_result_t open_result;
@@ -165,7 +165,7 @@ out:
         filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     }
     if (reply_status != 0) {
-        for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_HANDLES; ++i) {
+        for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
                 (void)filed_vfs_close_handle(&runtime->vfs, inherit_handles[i]);
             }
@@ -185,32 +185,32 @@ int filed_dispatch_exec_path(
     int reply_fd,
     const struct pacha_ipc_msg *request)
 {
-    pacha_service_request_header_t v2_header;
-    memset(&v2_header, 0, sizeof(v2_header));
-    v2_header.magic = PACHA_SERVICE_REQUEST_MAGIC;
-    v2_header.abi_version = PACHA_SERVICE_ABI_VERSION;
-    v2_header.service_id = FILED_V2_SERVICE_ID;
-    v2_header.op = FILED_V2_OP_EXEC_PATH;
-    v2_header.request_id = request->word3;
-    v2_header.trace_id = request->word3;
-    v2_header.payload_size = sizeof(filed_v2_exec_path_t);
+    pacha_service_envelope_t request_header;
+    memset(&request_header, 0, sizeof(request_header));
+    request_header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+    request_header.abi_version = PACHA_SERVICE_ABI_VERSION;
+    request_header.service_id = FILED_SERVICE_ID;
+    request_header.op = FILED_OP_EXEC_PATH;
+    request_header.request_id = request->word3;
+    request_header.trace_id = request->word3;
+    request_header.payload_size = sizeof(filed_exec_path_t);
 
     int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_V2_PAGE_BYTES, &page_fd);
+    void *page = filed_map_request_page(request, FILED_PAGE_BYTES, &page_fd);
     if (page == NULL) {
-        return filed_send_reply_v2(reply_fd, NULL, &v2_header, -22, 0, 0);
+        return filed_send_reply(reply_fd, NULL, &request_header, -22, 0, 0);
     }
 
-    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_V2_EXEC_BOOTSTRAP_FD |
-        FILED_V2_EXEC_INHERIT_FDS |
-        FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS |
-        FILED_V2_EXEC_INHERIT_HANDLES |
-        FILED_V2_EXEC_LINUX_LPR |
-        FILED_V2_EXEC_LINUX_BOOTSTRAP |
-        FILED_V2_EXEC_LINUX_DEFAULT_STDIO |
-        FILED_V2_EXEC_TRANSFER_PROCESS_FD;
+        FILED_EXEC_BOOTSTRAP_FD |
+        FILED_EXEC_INHERIT_FDS |
+        FILED_EXEC_PATCH_BOOTSTRAP_FDS |
+        FILED_EXEC_INHERIT_HANDLES |
+        FILED_EXEC_LINUX_LPR |
+        FILED_EXEC_LINUX_BOOTSTRAP |
+        FILED_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_EXEC_TRANSFER_PROCESS_FD;
     const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
     int process_fd = -1;
@@ -223,27 +223,27 @@ int filed_dispatch_exec_path(
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
-    int inherit_fds[FILED_V2_EXEC_MAX_INHERIT_FDS];
-    filed_dispatch_saved_fd_t inherit_saved[FILED_V2_EXEC_MAX_INHERIT_FDS];
+    int inherit_fds[FILED_EXEC_MAX_INHERIT_FDS];
+    filed_dispatch_saved_fd_t inherit_saved[FILED_EXEC_MAX_INHERIT_FDS];
     filed_dispatch_saved_fd_t lpr_bootstrap_saved;
-    filed_handle_id_t inherit_handles[FILED_V2_EXEC_MAX_INHERIT_HANDLES];
+    filed_handle_id_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_fds, 0xff, sizeof(inherit_fds));
-    for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_FDS; ++i) {
+    for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_FDS; ++i) {
         filed_dispatch_saved_fd_init(&inherit_saved[i]);
     }
     filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec_flags & ~known_flags) != 0 ||
-        exec->inherit_fd_count > FILED_V2_EXEC_MAX_INHERIT_FDS ||
-        exec->inherit_handle_count > FILED_V2_EXEC_MAX_INHERIT_HANDLES ||
-        exec->fd_patch_count > FILED_V2_EXEC_MAX_FD_PATCHES ||
-        exec->argc > FILED_V2_EXEC_MAX_ARGS ||
-        exec->envc > FILED_V2_EXEC_MAX_ENVS ||
-        exec->string_bytes > FILED_V2_EXEC_STRING_BYTES ||
+        exec->inherit_fd_count > FILED_EXEC_MAX_INHERIT_FDS ||
+        exec->inherit_handle_count > FILED_EXEC_MAX_INHERIT_HANDLES ||
+        exec->fd_patch_count > FILED_EXEC_MAX_FD_PATCHES ||
+        exec->argc > FILED_EXEC_MAX_ARGS ||
+        exec->envc > FILED_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_EXEC_STRING_BYTES ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_v2_exec_string_ref_empty(exec->cwd) &&
-            !filed_v2_exec_string_ref_valid(exec, exec->cwd)) ||
+        (!filed_exec_string_ref_empty(exec->cwd) &&
+            !filed_exec_string_ref_valid(exec, exec->cwd)) ||
         !filed_dispatch_exec_default_stdio_valid(exec) ||
         !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
     {
@@ -261,12 +261,12 @@ int filed_dispatch_exec_path(
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_v2_exec_string_ref_valid(exec, exec->argv[i])) {
+        if (!filed_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_v2_exec_string_ref_valid(exec, exec->envp[i])) {
+        if (!filed_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
@@ -274,17 +274,17 @@ int filed_dispatch_exec_path(
     const uint64_t inherit_handle_count = exec->inherit_handle_count;
 
     const uint64_t has_bootstrap =
-        (exec_flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0 ? 1u : 0u;
-    if ((exec_flags & FILED_V2_EXEC_INHERIT_FDS) == 0 && inherit_fd_count != 0) {
+        (exec_flags & FILED_EXEC_BOOTSTRAP_FD) != 0 ? 1u : 0u;
+    if ((exec_flags & FILED_EXEC_INHERIT_FDS) == 0 && inherit_fd_count != 0) {
         goto out;
     }
-    if ((exec_flags & FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS) == 0 && exec->fd_patch_count != 0) {
+    if ((exec_flags & FILED_EXEC_PATCH_BOOTSTRAP_FDS) == 0 && exec->fd_patch_count != 0) {
         goto out;
     }
-    if ((exec_flags & FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
+    if ((exec_flags & FILED_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
         goto out;
     }
-    if ((exec_flags & FILED_V2_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
+    if ((exec_flags & FILED_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
         goto out;
     }
 
@@ -315,7 +315,7 @@ int filed_dispatch_exec_path(
         }
     }
 
-    if ((exec_flags & FILED_V2_EXEC_BOOTSTRAP_FD) != 0) {
+    if ((exec_flags & FILED_EXEC_BOOTSTRAP_FD) != 0) {
         const uint64_t fd_index = 1u + inherit_fd_count;
         if (request->fds[fd_index].fd < 16) {
             goto out;
@@ -347,7 +347,7 @@ int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec_flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
+    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
         runtime->netd_socket_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -359,7 +359,7 @@ int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec_flags & FILED_V2_EXEC_LINUX_LPR) != 0 &&
+    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
         runtime->termd_tty_endpoint_fd >= 16)
     {
         reply_status = filed_dispatch_prepare_endpoint_to_fixed(
@@ -371,8 +371,8 @@ int filed_dispatch_exec_path(
             goto out;
         }
     }
-    if ((exec_flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) ==
-        (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
+    if ((exec_flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) ==
+        (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
     {
         const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
         if (bootstrap_source_fd < 16) {
@@ -390,7 +390,7 @@ int filed_dispatch_exec_path(
         }
     }
 
-    if ((exec_flags & FILED_V2_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
+    if ((exec_flags & FILED_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
         void *bootstrap_page = pacha_mmap(
             bootstrap_fd,
             FILED_BOOTSTRAP_PATCH_BYTES,
@@ -402,25 +402,25 @@ int filed_dispatch_exec_path(
         }
         reply_status = 0;
         for (uint64_t i = 0; i < exec->fd_patch_count; ++i) {
-            const filed_v2_exec_fd_patch_t *patch = &exec->fd_patches[i];
+            const filed_exec_fd_patch_t *patch = &exec->fd_patches[i];
             uint64_t value = 0;
             if (patch->reserved0 != 0 || patch->offset > FILED_BOOTSTRAP_PATCH_BYTES - 8u) {
                 reply_status = -22;
                 break;
             }
-            if (patch->kind == FILED_V2_EXEC_PATCH_INHERIT_FD) {
+            if (patch->kind == FILED_EXEC_PATCH_INHERIT_FD) {
                 if (patch->index >= inherit_fd_count) {
                     reply_status = -22;
                     break;
                 }
                 value = (uint64_t)(uint32_t)inherit_fds[patch->index];
-            } else if (patch->kind == FILED_V2_EXEC_PATCH_BOOTSTRAP_FD) {
+            } else if (patch->kind == FILED_EXEC_PATCH_BOOTSTRAP_FD) {
                 if (patch->index != 0) {
                     reply_status = -22;
                     break;
                 }
                 value = (uint64_t)(uint32_t)bootstrap_fd;
-            } else if (patch->kind == FILED_V2_EXEC_PATCH_INHERIT_HANDLE) {
+            } else if (patch->kind == FILED_EXEC_PATCH_INHERIT_HANDLE) {
                 if (patch->index >= inherit_handle_count) {
                     reply_status = -22;
                     break;
@@ -439,13 +439,13 @@ int filed_dispatch_exec_path(
         }
     }
 
-    filed_v2_openat_t openat;
+    filed_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
     openat.rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_EXEC |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_EXEC |
+        FILED_RIGHT_STAT;
     snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
 
     filed_vfs_open_result_t open_result;
@@ -495,7 +495,7 @@ out:
     if (reply_status != 0) {
         (void)filed_error_token(
             reply_status,
-            FILED_V2_OP_EXEC_PATH,
+            FILED_OP_EXEC_PATH,
             PACHA_STATUS_STAGE_STATUS_MAP,
             reply_status,
             request->word3,
@@ -504,19 +504,19 @@ out:
             0,
             "filed exec_path negative reply");
     }
-    pacha_service_reply_header_init(
-        (pacha_service_reply_header_t *)page,
-        &v2_header,
+    pacha_service_reply_init(
+        (pacha_service_envelope_t *)page,
+        &request_header,
         reply_status,
         PACHA_SERVICE_ERROR_FILED_EXEC,
         reply_result,
         0);
-    (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+    (void)pacha_munmap(page, FILED_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (bootstrap_fd >= 16) {
         (void)pacha_fd_close(bootstrap_fd);
     }
-    for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_FDS; ++i) {
+    for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_FDS; ++i) {
         if (inherit_fds[i] >= 0) {
             if (inherit_saved[i].fd >= 0) {
                 filed_dispatch_restore_target_fd(inherit_fds[i], &inherit_saved[i]);
@@ -529,21 +529,21 @@ out:
         }
     }
     if (reply_status != 0) {
-        for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_HANDLES; ++i) {
+        for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
                 (void)filed_vfs_close_handle(&runtime->vfs, inherit_handles[i]);
             }
         }
     }
     if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16) {
-        const int send_status = filed_send_exec_reply_v2(
+        const int send_status = filed_send_exec_reply(
             reply_fd,
             request->word3,
             process_fd,
             thread_fd,
-            (exec_flags & FILED_V2_EXEC_TRANSFER_PROCESS_FD) != 0);
+            (exec_flags & FILED_EXEC_TRANSFER_PROCESS_FD) != 0);
         if (send_status != 0) {
-            for (uint64_t i = 0; i < FILED_V2_EXEC_MAX_INHERIT_HANDLES; ++i) {
+            for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_HANDLES; ++i) {
                 if (inherit_handles[i] != 0) {
                     (void)filed_vfs_close_handle(&runtime->vfs, inherit_handles[i]);
                 }
@@ -551,7 +551,7 @@ out:
         }
         return send_status;
     }
-    return filed_send_reply_v2(reply_fd, NULL, &v2_header, reply_status, 0, 0);
+    return filed_send_reply(reply_fd, NULL, &request_header, reply_status, 0, 0);
 }
 
 int filed_dispatch_exec_self(
@@ -559,55 +559,55 @@ int filed_dispatch_exec_self(
     int reply_fd,
     const struct pacha_ipc_msg *request)
 {
-    pacha_service_request_header_t v2_header;
-    memset(&v2_header, 0, sizeof(v2_header));
-    v2_header.magic = PACHA_SERVICE_REQUEST_MAGIC;
-    v2_header.abi_version = PACHA_SERVICE_ABI_VERSION;
-    v2_header.service_id = FILED_V2_SERVICE_ID;
-    v2_header.op = FILED_V2_OP_EXEC_SELF;
-    v2_header.request_id = request->word3;
-    v2_header.trace_id = request->word3;
-    v2_header.payload_size = sizeof(filed_v2_exec_path_t);
+    pacha_service_envelope_t request_header;
+    memset(&request_header, 0, sizeof(request_header));
+    request_header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+    request_header.abi_version = PACHA_SERVICE_ABI_VERSION;
+    request_header.service_id = FILED_SERVICE_ID;
+    request_header.op = FILED_OP_EXEC_SELF;
+    request_header.request_id = request->word3;
+    request_header.trace_id = request->word3;
+    request_header.payload_size = sizeof(filed_exec_path_t);
 
     int page_fd = -1;
-    void *page = filed_map_request_page(request, FILED_V2_PAGE_BYTES, &page_fd);
+    void *page = filed_map_request_page(request, FILED_PAGE_BYTES, &page_fd);
     if (page == NULL) {
-        return filed_send_reply_v2(reply_fd, NULL, &v2_header, -22, 0, 0);
+        return filed_send_reply(reply_fd, NULL, &request_header, -22, 0, 0);
     }
 
-    filed_v2_exec_path_t *exec = (filed_v2_exec_path_t *)page;
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
     const uint64_t known_flags =
-        FILED_V2_EXEC_LINUX_LPR |
-        FILED_V2_EXEC_LINUX_BOOTSTRAP |
-        FILED_V2_EXEC_SELF |
-        FILED_V2_EXEC_LPR_FD_TABLE;
+        FILED_EXEC_LINUX_LPR |
+        FILED_EXEC_LINUX_BOOTSTRAP |
+        FILED_EXEC_SELF |
+        FILED_EXEC_LPR_FD_TABLE;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
     int lpr_fd_table_fd = -1;
     void *lpr_fd_table_page = NULL;
-    const filed_v2_exec_lpr_fd_table_t *lpr_fd_table = NULL;
-    const int wants_lpr_fd_table = (exec->flags & FILED_V2_EXEC_LPR_FD_TABLE) != 0;
+    const filed_exec_lpr_fd_table_t *lpr_fd_table = NULL;
+    const int wants_lpr_fd_table = (exec->flags & FILED_EXEC_LPR_FD_TABLE) != 0;
     const uint64_t expected_request_fd_count = wants_lpr_fd_table ? 3u : 2u;
 
     if ((exec->flags & ~known_flags) != 0 ||
-        (exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP | FILED_V2_EXEC_SELF)) !=
-            (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP | FILED_V2_EXEC_SELF) ||
+        (exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP | FILED_EXEC_SELF)) !=
+            (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP | FILED_EXEC_SELF) ||
         exec->inherit_fd_count != 0 ||
         exec->inherit_handle_count != 0 ||
         exec->fd_patch_count != 0 ||
-        exec->argc > FILED_V2_EXEC_MAX_ARGS ||
-        exec->envc > FILED_V2_EXEC_MAX_ENVS ||
-        exec->string_bytes > FILED_V2_EXEC_STRING_BYTES ||
+        exec->argc > FILED_EXEC_MAX_ARGS ||
+        exec->envc > FILED_EXEC_MAX_ENVS ||
+        exec->string_bytes > FILED_EXEC_STRING_BYTES ||
         request->fd_count != expected_request_fd_count ||
         request->fds == NULL ||
         !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_v2_exec_string_ref_empty(exec->cwd) &&
-            !filed_v2_exec_string_ref_valid(exec, exec->cwd)) ||
-        !filed_v2_exec_string_ref_empty(exec->ctty) ||
+        (!filed_exec_string_ref_empty(exec->cwd) &&
+            !filed_exec_string_ref_valid(exec, exec->cwd)) ||
+        !filed_exec_string_ref_empty(exec->ctty) ||
         (wants_lpr_fd_table &&
-            (exec->lpr_fd_table_bytes < sizeof(filed_v2_exec_lpr_fd_table_t) ||
+            (exec->lpr_fd_table_bytes < sizeof(filed_exec_lpr_fd_table_t) ||
                 request->fds[1].fd < 16)) ||
         (!wants_lpr_fd_table &&
             !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 1)))
@@ -615,12 +615,12 @@ int filed_dispatch_exec_self(
         goto out;
     }
     for (uint64_t i = 0; i < exec->argc; ++i) {
-        if (!filed_v2_exec_string_ref_valid(exec, exec->argv[i])) {
+        if (!filed_exec_string_ref_valid(exec, exec->argv[i])) {
             goto out;
         }
     }
     for (uint64_t i = 0; i < exec->envc; ++i) {
-        if (!filed_v2_exec_string_ref_valid(exec, exec->envp[i])) {
+        if (!filed_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
     }
@@ -636,7 +636,7 @@ int filed_dispatch_exec_self(
         if (lpr_fd_table_page == NULL) {
             goto out;
         }
-        lpr_fd_table = (const filed_v2_exec_lpr_fd_table_t *)lpr_fd_table_page;
+        lpr_fd_table = (const filed_exec_lpr_fd_table_t *)lpr_fd_table_page;
         if (!filed_dispatch_exec_lpr_fd_table_valid(exec, lpr_fd_table, 1)) {
             goto out;
         }
@@ -649,13 +649,13 @@ int filed_dispatch_exec_self(
         goto out;
     }
 
-    filed_v2_openat_t openat;
+    filed_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
     openat.rights =
-        FILED_V2_RIGHT_READ |
-        FILED_V2_RIGHT_EXEC |
-        FILED_V2_RIGHT_STAT;
+        FILED_RIGHT_READ |
+        FILED_RIGHT_EXEC |
+        FILED_RIGHT_STAT;
     snprintf(openat.name, sizeof(openat.name), "%s", exec->path);
 
     filed_vfs_open_result_t open_result;
@@ -691,10 +691,10 @@ out:
     if (lpr_fd_table_fd >= 16) {
         (void)pacha_fd_close(lpr_fd_table_fd);
     }
-    (void)pacha_munmap(page, FILED_V2_PAGE_BYTES);
+    (void)pacha_munmap(page, FILED_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16 && bootstrap_fd >= 16) {
-        return filed_send_exec_self_reply_v2(reply_fd, request->word3, process_fd, thread_fd, bootstrap_fd);
+        return filed_send_exec_self_reply(reply_fd, request->word3, process_fd, thread_fd, bootstrap_fd);
     }
     if (process_fd >= 16) {
         (void)pacha_syscall2(
@@ -720,12 +720,12 @@ out:
     return send_status;
 }
 
-int filed_dispatch_session_open_v2(
+int filed_dispatch_session_open(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
     void *reply_page,
-    const pacha_service_request_header_t *header,
+    const pacha_service_envelope_t *header,
     int *out_keep_fd,
     int *out_keep_fd2)
 {
@@ -744,7 +744,7 @@ int filed_dispatch_session_open_v2(
         request->fds[1].fd < 16 ||
         request->fds[2].fd < 16)
     {
-        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
+        return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
     int64_t reply_status = -24;
@@ -753,28 +753,28 @@ int filed_dispatch_session_open_v2(
     const int page_fd = (int)request->fds[2].fd;
     void *session_page = pacha_mmap(
         page_fd,
-        FILED_V2_SESSION_PAGE_BYTES,
+        FILED_SESSION_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
     if (session_page == NULL) {
-        return filed_send_reply_v2(reply_fd, reply_page, header, -14, 0, 0);
+        return filed_send_reply(reply_fd, reply_page, header, -14, 0, 0);
     }
 
-    filed_v2_fast_header_t *fast = (filed_v2_fast_header_t *)session_page;
-    if (fast->magic != FILED_V2_FAST_MAGIC ||
-        fast->version != FILED_V2_FAST_VERSION ||
-        fast->request_capacity != FILED_V2_FAST_REQUEST_CAPACITY ||
-        fast->completion_capacity != FILED_V2_FAST_COMPLETION_CAPACITY ||
-        fast->payload_slot_count != FILED_V2_FAST_PAYLOAD_SLOT_COUNT ||
-        fast->payload_slot_size != FILED_V2_PAGE_BYTES ||
-        fast->payload_offset != FILED_V2_FAST_PAYLOAD_OFFSET ||
-        fast->generation_offset != FILED_V2_FAST_GENERATION_OFFSET ||
-        fast->generation_capacity != FILED_V2_FAST_GENERATION_CAPACITY ||
-        fast->payload_offset + fast->payload_slot_count * fast->payload_slot_size > FILED_V2_SESSION_PAGE_BYTES)
+    filed_fast_header_t *fast = (filed_fast_header_t *)session_page;
+    if (fast->magic != FILED_FAST_MAGIC ||
+        fast->version != FILED_FAST_VERSION ||
+        fast->request_capacity != FILED_FAST_REQUEST_CAPACITY ||
+        fast->completion_capacity != FILED_FAST_COMPLETION_CAPACITY ||
+        fast->payload_slot_count != FILED_FAST_PAYLOAD_SLOT_COUNT ||
+        fast->payload_slot_size != FILED_PAGE_BYTES ||
+        fast->payload_offset != FILED_FAST_PAYLOAD_OFFSET ||
+        fast->generation_offset != FILED_FAST_GENERATION_OFFSET ||
+        fast->generation_capacity != FILED_FAST_GENERATION_CAPACITY ||
+        fast->payload_offset + fast->payload_slot_count * fast->payload_slot_size > FILED_SESSION_PAGE_BYTES)
     {
-        (void)pacha_munmap(session_page, FILED_V2_SESSION_PAGE_BYTES);
-        return filed_send_reply_v2(reply_fd, reply_page, header, -71, 0, 0);
+        (void)pacha_munmap(session_page, FILED_SESSION_PAGE_BYTES);
+        return filed_send_reply(reply_fd, reply_page, header, -71, 0, 0);
     }
 
     for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
@@ -785,7 +785,7 @@ int filed_dispatch_session_open_v2(
         session->channel_fd = channel_fd;
         session->page_fd = page_fd;
         session->page = session_page;
-        session->page_size = FILED_V2_SESSION_PAGE_BYTES;
+        session->page_size = FILED_SESSION_PAGE_BYTES;
         session->active = 1;
         if (out_keep_fd != NULL) {
             *out_keep_fd = channel_fd;
@@ -799,9 +799,9 @@ int filed_dispatch_session_open_v2(
     }
 
     if (reply_status != 0) {
-        (void)pacha_munmap(session_page, FILED_V2_SESSION_PAGE_BYTES);
+        (void)pacha_munmap(session_page, FILED_SESSION_PAGE_BYTES);
     }
-    return filed_send_reply_v2(reply_fd, reply_page, header, reply_status, result, 0);
+    return filed_send_reply(reply_fd, reply_page, header, reply_status, result, 0);
 }
 
 uint64_t filed_import_termd_error(
@@ -816,7 +816,7 @@ uint64_t filed_import_termd_error(
     (void)runtime;
     return filed_error_token(
         status,
-        FILED_V2_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR,
+        FILED_OP_SERVICE_REGISTER_TERMD_SIGNAL_SUPERVISOR,
         PACHA_STATUS_STAGE_CHILD_STATUS,
         status,
         request_id,
@@ -826,12 +826,12 @@ uint64_t filed_import_termd_error(
         text);
 }
 
-int filed_dispatch_register_termd_signal_supervisor_v2(
+int filed_dispatch_register_termd_signal_supervisor(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
     void *reply_page,
-    const pacha_service_request_header_t *header)
+    const pacha_service_envelope_t *header)
 {
     if (runtime == NULL ||
         request == NULL ||
@@ -840,9 +840,9 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
         request->fds[1].fd < 16 ||
         runtime->termd_tty_endpoint_fd < 16 ||
         header == NULL ||
-        header->payload_size < sizeof(filed_v2_service_endpoint_request_t))
+        header->payload_size < sizeof(filed_service_endpoint_request_t))
     {
-        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
+        return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
     const int supervisor_endpoint_fd = (int)(uint32_t)request->fds[1].fd;
@@ -851,7 +851,7 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int page_fd = pacha_vmo_create(TERMD_V2_PAGE_BYTES, page_rights, 0);
+    const int page_fd = pacha_vmo_create(TERMD_PAGE_BYTES, page_rights, 0);
     if (page_fd < 16) {
         const uint64_t token = filed_error_token(
             page_fd,
@@ -863,11 +863,11 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
             0,
             0,
             "termd signal supervisor page create failed");
-        return filed_send_reply_v2(reply_fd, reply_page, header, page_fd, 0, token);
+        return filed_send_reply(reply_fd, reply_page, header, page_fd, 0, token);
     }
     void *page = pacha_mmap(
         page_fd,
-        TERMD_V2_PAGE_BYTES,
+        TERMD_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -883,15 +883,15 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
             0,
             "termd signal supervisor page map failed");
         (void)pacha_fd_close(page_fd);
-        return filed_send_reply_v2(reply_fd, reply_page, header, -5, 0, token);
+        return filed_send_reply(reply_fd, reply_page, header, -5, 0, token);
     }
 
-    memset(page, 0, TERMD_V2_PAGE_BYTES);
-    pacha_service_request_header_t *termd_header = (pacha_service_request_header_t *)page;
+    memset(page, 0, TERMD_PAGE_BYTES);
+    pacha_service_envelope_t *termd_header = (pacha_service_envelope_t *)page;
     termd_header->magic = PACHA_SERVICE_REQUEST_MAGIC;
     termd_header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    termd_header->service_id = TERMD_V2_SERVICE_ID;
-    termd_header->op = TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR;
+    termd_header->service_id = TERMD_SERVICE_ID;
+    termd_header->op = TERMD_OP_SIGNAL_REGISTER_SUPERVISOR;
     termd_header->request_id = header->request_id;
     termd_header->trace_id = header->trace_id != 0 ? header->trace_id : header->request_id;
     termd_header->fd_count = 1;
@@ -926,9 +926,9 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
             (uint64_t)(uint32_t)runtime->termd_tty_endpoint_fd,
             0,
             "termd signal supervisor call failed");
-        (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
+        (void)pacha_munmap(page, TERMD_PAGE_BYTES);
         (void)pacha_fd_close(page_fd);
-        return filed_send_reply_v2(reply_fd, reply_page, header, termd_reply_fd, 0, token);
+        return filed_send_reply(reply_fd, reply_page, header, termd_reply_fd, 0, token);
     }
 
     struct pacha_ipc_msg termd_reply;
@@ -936,8 +936,8 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
     const int recv_status =
         pacha_ipc_recv_wait(termd_reply_fd, &termd_reply, PACHA_FD_WAIT_FOREVER);
     (void)pacha_fd_close(termd_reply_fd);
-    const pacha_service_reply_header_t *reply_header =
-        (const pacha_service_reply_header_t *)page;
+    const pacha_service_envelope_t *reply_header =
+        (const pacha_service_envelope_t *)page;
 
     int64_t status = recv_status;
     uint64_t result = 0;
@@ -946,8 +946,8 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
         if (termd_reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
             termd_reply.word3 != termd_request.word3 ||
             reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-            reply_header->service_id != TERMD_V2_SERVICE_ID ||
-            reply_header->op != TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR ||
+            reply_header->service_id != TERMD_SERVICE_ID ||
+            reply_header->op != TERMD_OP_SIGNAL_REGISTER_SUPERVISOR ||
             reply_header->request_id != termd_request.word3)
         {
             status = -5;
@@ -971,7 +971,7 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
                     header->request_id,
                     status,
                     request->fd_count,
-                    TERMD_V2_OP_SIGNAL_REGISTER_SUPERVISOR,
+                    TERMD_OP_SIGNAL_REGISTER_SUPERVISOR,
                     "termd signal supervisor returned error");
             }
         }
@@ -988,7 +988,7 @@ int filed_dispatch_register_termd_signal_supervisor_v2(
             "termd signal supervisor reply recv failed");
     }
 
-    (void)pacha_munmap(page, TERMD_V2_PAGE_BYTES);
+    (void)pacha_munmap(page, TERMD_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
-    return filed_send_reply_v2(reply_fd, reply_page, header, status, result, error_token);
+    return filed_send_reply(reply_fd, reply_page, header, status, result, error_token);
 }

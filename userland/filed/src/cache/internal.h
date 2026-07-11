@@ -3,9 +3,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "filed/payload_v2.h"
+#include "filed/payload.h"
 #include "filed/runtime.h"
-#include "koboxd/storage_protocol_v2.h"
+#include "koboxd/storage_protocol.h"
 
 enum {
     FILED_PAGE_CACHE_BYTES = 16384,
@@ -68,7 +68,7 @@ typedef struct filed_dir_cache_slot {
     uint64_t backend_object;
     uint64_t offset;
     uint64_t last_used;
-    storage_v2_getdents_request_t entries;
+    storage_getdents_request_t entries;
 } filed_dir_cache_slot_t;
 
 typedef struct filed_dir_cache {
@@ -85,7 +85,7 @@ typedef struct filed_negative_lookup_cache_slot {
     filed_generation_t parent_dir_generation;
     uint64_t last_used;
     int64_t status;
-    char name[FILED_V2_NAME_BYTES];
+    char name[FILED_NAME_BYTES];
 } filed_negative_lookup_cache_slot_t;
 
 typedef struct filed_negative_lookup_cache {
@@ -148,12 +148,12 @@ int filed_dir_cache_get(
     filed_runtime_t *runtime,
     uint64_t backend_object,
     uint64_t offset,
-    storage_v2_getdents_request_t *out_entries);
+    storage_getdents_request_t *out_entries);
 void filed_dir_cache_store(
     filed_runtime_t *runtime,
     uint64_t backend_object,
     uint64_t offset,
-    const storage_v2_getdents_request_t *entries);
+    const storage_getdents_request_t *entries);
 
 bool filed_negative_lookup_cache_get(
     filed_runtime_t *runtime,

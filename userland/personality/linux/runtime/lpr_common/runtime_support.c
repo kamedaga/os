@@ -24,16 +24,16 @@ int64_t lpr_supervisor_call_token(
     int transfer_fd,
     uint64_t *out_result);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
-int lpr_supervisor_get_state(lprs_v2_process_state_t *out_state);
+int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
 void lpr_pipe_after_fork_child(void);
 void lpr_cwd_init(void);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
 int lpr_count_exec_local_fds(uint64_t *out_count);
-void lpr_write_exec_local_fd_desc(filed_v2_exec_lpr_fd_t *desc, uint64_t fd);
+void lpr_write_exec_local_fd_desc(filed_exec_lpr_fd_t *desc, uint64_t fd);
 int lpr_prepare_exec_local_fds(
-    filed_v2_exec_path_t *exec,
+    filed_exec_path_t *exec,
     lpr_exec_local_fd_table_t *local_table);
 void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table);
 int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
@@ -44,7 +44,7 @@ void lpr_filed_session_drop(void)
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,
             (uint64_t)(uintptr_t)lpr_session_page,
-            FILED_V2_SESSION_PAGE_BYTES);
+            FILED_SESSION_PAGE_BYTES);
     }
     if (lpr_session_page_fd >= 16) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_session_page_fd);
@@ -60,12 +60,12 @@ void lpr_filed_session_drop(void)
 }
 void *lpr_session_payload_slot(uint64_t slot)
 {
-    if (lpr_session_page == 0 || slot >= FILED_V2_FAST_PAYLOAD_SLOT_COUNT) {
+    if (lpr_session_page == 0 || slot >= FILED_FAST_PAYLOAD_SLOT_COUNT) {
         return 0;
     }
     return (void *)((uintptr_t)lpr_session_page +
-        FILED_V2_FAST_PAYLOAD_OFFSET +
-        slot * FILED_V2_PAGE_BYTES);
+        FILED_FAST_PAYLOAD_OFFSET +
+        slot * FILED_PAGE_BYTES);
 }
 
 void lpr_zero_bytes(void *ptr, uint64_t len)

@@ -4,7 +4,7 @@ filed_page_dispatch_result_t filed_dispatch_unlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_unlink_t *unlink = (filed_v2_unlink_t *)page;
+    filed_unlink_t *unlink = (filed_unlink_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -15,7 +15,7 @@ filed_page_dispatch_result_t filed_dispatch_unlink_page(
     {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_V2_NAME_BYTES];
+        char name[FILED_NAME_BYTES];
         const filed_handle_id_t base_dir =
             unlink->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -86,7 +86,7 @@ filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_mkdir_t *mkdir = (filed_v2_mkdir_t *)page;
+    filed_mkdir_t *mkdir = (filed_mkdir_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -94,7 +94,7 @@ filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     if (filed_name_is_terminated(mkdir->name, sizeof(mkdir->name))) {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_V2_NAME_BYTES];
+        char name[FILED_NAME_BYTES];
         const filed_handle_id_t base_dir =
             mkdir->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -167,7 +167,7 @@ filed_page_dispatch_result_t filed_dispatch_symlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_symlink_t *symlink = (filed_v2_symlink_t *)page;
+    filed_symlink_t *symlink = (filed_symlink_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -179,7 +179,7 @@ filed_page_dispatch_result_t filed_dispatch_symlink_page(
     {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_V2_NAME_BYTES];
+        char name[FILED_NAME_BYTES];
         const filed_handle_id_t base_dir =
             symlink->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -248,17 +248,17 @@ filed_page_dispatch_result_t filed_dispatch_readlink_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_readlink_t *readlink = (filed_v2_readlink_t *)page;
+    filed_readlink_t *readlink = (filed_readlink_t *)page;
     filed_vfs_io_decision_t parent_decision;
     uint64_t object_id = 0;
-    storage_v2_statx_reply_t backend_stat;
+    storage_statx_reply_t backend_stat;
     int64_t reply_status = -22;
     uint64_t target_length = 0;
     bool lookup_owned = false;
     if (filed_name_is_terminated(readlink->name, sizeof(readlink->name))) {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_V2_NAME_BYTES];
+        char name[FILED_NAME_BYTES];
         const filed_handle_id_t base_dir =
             readlink->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -322,11 +322,11 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_link_t *link = (filed_v2_link_t *)page;
+    filed_link_t *link = (filed_link_t *)page;
     filed_vfs_io_decision_t old_parent;
     filed_vfs_io_decision_t new_parent;
     filed_vfs_open_result_t opened;
-    storage_v2_statx_reply_t backend_stat;
+    storage_statx_reply_t backend_stat;
     uint64_t old_object_id = 0;
     uint64_t linked_object_id = 0;
     int64_t reply_status = -22;
@@ -339,8 +339,8 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
         filed_handle_id_t new_dir_handle = 0;
         int old_dir_owned = 0;
         int new_dir_owned = 0;
-        char old_name[FILED_V2_NAME_BYTES];
-        char new_name[FILED_V2_NAME_BYTES];
+        char old_name[FILED_NAME_BYTES];
+        char new_name[FILED_NAME_BYTES];
         const filed_handle_id_t old_base_dir =
             link->old_dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -417,7 +417,7 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
                 &opened);
             reply_status = filed_status_to_wire(status);
             if (status == FILED_OK) {
-                storage_v2_statx_reply_t linked_stat;
+                storage_statx_reply_t linked_stat;
                 memset(&linked_stat, 0, sizeof(linked_stat));
                 if (filed_backend_statx(runtime, linked_object_id, &linked_stat) == 0) {
                     filed_vfs_stat_snapshot_t snapshot;
@@ -463,7 +463,7 @@ filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_rmdir_t *rmdir = (filed_v2_rmdir_t *)page;
+    filed_rmdir_t *rmdir = (filed_rmdir_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
@@ -474,7 +474,7 @@ filed_page_dispatch_result_t filed_dispatch_rmdir_page(
     {
         filed_handle_id_t dir_handle = 0;
         int dir_owned = 0;
-        char name[FILED_V2_NAME_BYTES];
+        char name[FILED_NAME_BYTES];
         const filed_handle_id_t base_dir =
             rmdir->dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -545,7 +545,7 @@ filed_page_dispatch_result_t filed_dispatch_rename_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_rename_t *rename = (filed_v2_rename_t *)page;
+    filed_rename_t *rename = (filed_rename_t *)page;
     filed_vfs_io_decision_t old_parent;
     filed_vfs_io_decision_t new_parent;
     filed_status_t status = FILED_ERR_INVALID;
@@ -563,8 +563,8 @@ filed_page_dispatch_result_t filed_dispatch_rename_page(
         filed_handle_id_t new_dir_handle = 0;
         int old_dir_owned = 0;
         int new_dir_owned = 0;
-        char old_name[FILED_V2_NAME_BYTES];
-        char new_name[FILED_V2_NAME_BYTES];
+        char old_name[FILED_NAME_BYTES];
+        char new_name[FILED_NAME_BYTES];
         const filed_handle_id_t old_base_dir =
             rename->old_dir_handle == 0 ?
                 runtime->root_handle_id :
@@ -699,8 +699,8 @@ filed_page_dispatch_result_t filed_dispatch_getdents_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_getdents_t *out = (filed_v2_getdents_t *)page;
-    storage_v2_getdents_request_t backend_entries;
+    filed_getdents_t *out = (filed_getdents_t *)page;
+    storage_getdents_request_t backend_entries;
     filed_vfs_io_decision_t decision;
     filed_status_t status = filed_vfs_getdents_prepare(
         &runtime->vfs,
@@ -718,7 +718,7 @@ filed_page_dispatch_result_t filed_dispatch_getdents_page(
     int64_t reply_status = filed_status_to_wire(status);
     uint64_t result = 0;
     memset(&backend_entries, 0, sizeof(backend_entries));
-    backend_entries.capacity = FILED_V2_DIRENT_CAPACITY;
+    backend_entries.capacity = FILED_DIRENT_CAPACITY;
     if (status == FILED_OK &&
         !filed_dir_cache_get(runtime, decision.backend_object, backend_offset, &backend_entries))
     {
@@ -733,7 +733,7 @@ filed_page_dispatch_result_t filed_dispatch_getdents_page(
     }
     if (reply_status == 0) {
         const uint64_t backend_start = splice_tmpfs && decision.offset == 0 ? 1u : 0u;
-        const uint64_t backend_capacity = FILED_V2_DIRENT_CAPACITY - backend_start;
+        const uint64_t backend_capacity = FILED_DIRENT_CAPACITY - backend_start;
         const uint64_t backend_count =
             backend_entries.count > backend_capacity ?
                 backend_capacity :
@@ -799,17 +799,17 @@ filed_page_dispatch_result_t filed_dispatch_dup_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_handle_flags_t *wire_flags = (filed_v2_handle_flags_t *)page;
+    filed_handle_flags_t *wire_flags = (filed_handle_flags_t *)page;
     filed_handle_id_t dup_handle = 0;
     int64_t reply_status = -22;
     uint64_t result = 0;
     if (wire_flags->reserved0 == 0 &&
-        filed_v2_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
+        filed_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
     {
         const filed_status_t status = filed_vfs_dup_handle(
             &runtime->vfs,
             (filed_handle_id_t)(uint32_t)wire_flags->handle,
-            filed_v2_fd_flags_to_vfs(wire_flags->fd_flags),
+            filed_fd_flags_to_vfs(wire_flags->fd_flags),
             &dup_handle);
         reply_status = filed_status_to_wire(status);
         if (status == FILED_OK) {
@@ -832,7 +832,7 @@ filed_page_dispatch_result_t filed_dispatch_get_flags_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_handle_flags_t *wire_flags = (filed_v2_handle_flags_t *)page;
+    filed_handle_flags_t *wire_flags = (filed_handle_flags_t *)page;
     filed_vfs_handle_flags_t flags;
     const uint64_t handle = wire_flags->handle;
     uint64_t result = 0;
@@ -857,15 +857,15 @@ filed_page_dispatch_result_t filed_dispatch_set_flags_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_handle_flags_t *wire_flags = (filed_v2_handle_flags_t *)page;
+    filed_handle_flags_t *wire_flags = (filed_handle_flags_t *)page;
     filed_vfs_handle_flags_t flags;
     filed_status_t status = FILED_ERR_INVALID;
     if (wire_flags->reserved0 == 0 &&
-        filed_v2_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
+        filed_flags_are_known(wire_flags->fd_flags, wire_flags->status_flags))
     {
-        flags.fd_flags = filed_v2_fd_flags_to_vfs(wire_flags->fd_flags);
+        flags.fd_flags = filed_fd_flags_to_vfs(wire_flags->fd_flags);
         flags.status_flags =
-            filed_v2_file_status_flags_to_vfs(wire_flags->status_flags);
+            filed_file_status_flags_to_vfs(wire_flags->status_flags);
         status = filed_vfs_set_handle_flags(
             &runtime->vfs,
             (filed_handle_id_t)(uint32_t)wire_flags->handle,

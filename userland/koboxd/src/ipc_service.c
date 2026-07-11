@@ -146,8 +146,8 @@ int koboxd_ipc_make_request(
         endpoint->next_request_id = 1;
     }
     memset(out_request, 0, sizeof(*out_request));
-    out_request->header.magic = KOBOXD_IPC_PROTOCOL_MAGIC;
-    out_request->header.version = KOBOXD_IPC_PROTOCOL_VERSION;
+    out_request->header.magic = PACHA_SERVICE_REQUEST_MAGIC;
+    out_request->header.version = PACHA_SERVICE_ABI_VERSION;
     out_request->header.header_bytes = sizeof(out_request->header);
     out_request->header.endpoint_kind = (uint16_t)endpoint->kind;
     out_request->header.op = op;
@@ -177,8 +177,8 @@ int koboxd_ipc_make_reply(
         return -2;
     }
     memset(out_reply, 0, sizeof(*out_reply));
-    out_reply->header.magic = KOBOXD_IPC_PROTOCOL_MAGIC;
-    out_reply->header.version = KOBOXD_IPC_PROTOCOL_VERSION;
+    out_reply->header.magic = PACHA_SERVICE_REPLY_MAGIC;
+    out_reply->header.version = PACHA_SERVICE_ABI_VERSION;
     out_reply->header.header_bytes = sizeof(out_reply->header);
     out_reply->header.endpoint_kind = request->header.endpoint_kind;
     out_reply->header.op = request->header.op;
@@ -201,8 +201,8 @@ int koboxd_ipc_validate_request(const koboxd_ipc_request_t *request, koboxd_ipc_
     if (request == NULL) {
         return -1;
     }
-    if (request->header.magic != KOBOXD_IPC_PROTOCOL_MAGIC ||
-        request->header.version != KOBOXD_IPC_PROTOCOL_VERSION ||
+    if (request->header.magic != PACHA_SERVICE_REQUEST_MAGIC ||
+        request->header.version != PACHA_SERVICE_ABI_VERSION ||
         request->header.header_bytes != sizeof(request->header))
     {
         return -2;
@@ -221,8 +221,8 @@ int koboxd_ipc_validate_reply(const koboxd_ipc_reply_t *reply, const koboxd_ipc_
     if (reply == NULL || request == NULL) {
         return -1;
     }
-    if (reply->header.magic != KOBOXD_IPC_PROTOCOL_MAGIC ||
-        reply->header.version != KOBOXD_IPC_PROTOCOL_VERSION ||
+    if (reply->header.magic != PACHA_SERVICE_REPLY_MAGIC ||
+        reply->header.version != PACHA_SERVICE_ABI_VERSION ||
         reply->header.header_bytes != sizeof(reply->header))
     {
         return -2;

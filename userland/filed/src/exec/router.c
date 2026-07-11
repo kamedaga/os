@@ -6,14 +6,14 @@
 int filed_exec_handle(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
-    const filed_v2_exec_path_t *request,
+    const filed_exec_path_t *request,
     const int *inherit_fds,
     uint64_t inherit_fd_count,
     int bootstrap_fd,
     int *out_process_fd,
     int *out_thread_fd)
 {
-    if (request != 0 && (request->flags & FILED_V2_EXEC_LINUX_LPR) != 0) {
+    if (request != 0 && (request->flags & FILED_EXEC_LINUX_LPR) != 0) {
         return filed_exec_linux_lpr_handle(
             runtime,
             handle_id,

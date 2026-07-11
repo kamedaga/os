@@ -48,10 +48,10 @@ uint64_t filed_error_token(
     return 0;
 }
 
-int filed_send_reply_v2_payload(
+int filed_send_reply_payload(
     int reply_fd,
     void *page,
-    const pacha_service_request_header_t *header,
+    const pacha_service_envelope_t *header,
     int64_t status,
     uint64_t result,
     uint64_t error_token,
@@ -60,8 +60,8 @@ int filed_send_reply_v2_payload(
     (void)error_token;
     const uint64_t reply_result = status < 0 ? 0 : result;
     if (page != NULL) {
-        pacha_service_reply_header_init(
-            (pacha_service_reply_header_t *)page,
+        pacha_service_reply_init(
+            (pacha_service_envelope_t *)page,
             header,
             status,
             PACHA_SERVICE_ERROR_FILED_VFS,
@@ -79,30 +79,30 @@ int filed_send_reply_v2_payload(
     return reply_status;
 }
 
-int filed_send_reply_v2(
+int filed_send_reply(
     int reply_fd,
     void *page,
-    const pacha_service_request_header_t *header,
+    const pacha_service_envelope_t *header,
     int64_t status,
     uint64_t result,
     uint64_t error_token)
 {
-    return filed_send_reply_v2_payload(reply_fd, page, header, status, result, error_token, 0);
+    return filed_send_reply_payload(reply_fd, page, header, status, result, error_token, 0);
 }
 
-int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
+int filed_send_session_reply(int channel_fd, uint64_t request_id, int64_t status, uint64_t result)
 {
     if (status < 0) {
         (void)filed_error_token(
             status,
-            FILED_V2_OP_SESSION_DOORBELL,
+            FILED_OP_SESSION_DOORBELL,
             PACHA_STATUS_STAGE_STATUS_MAP,
             status,
             request_id,
             0,
             0,
             0,
-            "filed v2 session negative reply");
+            "filed session negative reply");
     }
     const struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
@@ -113,7 +113,7 @@ int filed_send_session_reply_v2(int channel_fd, uint64_t request_id, int64_t sta
     return filed_ipc_send_wait(channel_fd, &reply);
 }
 
-int filed_send_exec_reply_v2(
+int filed_send_exec_reply(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
@@ -168,7 +168,7 @@ int filed_send_exec_reply_v2(
     return status;
 }
 
-int filed_send_exec_self_reply_v2(
+int filed_send_exec_self_reply(
     int reply_fd,
     uint64_t request_id,
     int process_fd,
@@ -325,42 +325,42 @@ void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *
     filed_dispatch_saved_fd_init(saved);
 }
 
-int filed_dispatch_exec_default_stdio_valid(const filed_v2_exec_path_t *exec)
+int filed_dispatch_exec_default_stdio_valid(const filed_exec_path_t *exec)
 {
     if (exec == NULL) {
         return 0;
     }
     const int wants_default_stdio =
-        (exec->flags & FILED_V2_EXEC_LINUX_DEFAULT_STDIO) != 0;
+        (exec->flags & FILED_EXEC_LINUX_DEFAULT_STDIO) != 0;
     if (!wants_default_stdio) {
-        return filed_v2_exec_string_ref_empty(exec->ctty);
+        return filed_exec_string_ref_empty(exec->ctty);
     }
-    if ((exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) !=
-        (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
+    if ((exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) !=
+        (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
     {
         return 0;
     }
-    return filed_v2_exec_string_ref_valid(exec, exec->ctty);
+    return filed_exec_string_ref_valid(exec, exec->ctty);
 }
 
-static const filed_v2_exec_lpr_fd_t *filed_dispatch_lpr_fd_table_entries(
-    const filed_v2_exec_lpr_fd_table_t *table)
+static const filed_exec_lpr_fd_t *filed_dispatch_lpr_fd_table_entries(
+    const filed_exec_lpr_fd_table_t *table)
 {
-    return (const filed_v2_exec_lpr_fd_t *)((const unsigned char *)table + sizeof(*table));
+    return (const filed_exec_lpr_fd_t *)((const unsigned char *)table + sizeof(*table));
 }
 
-int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
+int filed_dispatch_lpr_fd_desc_valid(const filed_exec_lpr_fd_t *fd)
 {
     if (fd == NULL || fd->fd > LPR_LINUX_FD_MAX) {
         return 0;
     }
     switch (fd->kind) {
-    case FILED_V2_EXEC_LPR_FD_FILED:
-    case FILED_V2_EXEC_LPR_FD_TTY:
-    case FILED_V2_EXEC_LPR_FD_SOCKET:
+    case FILED_EXEC_LPR_FD_FILED:
+    case FILED_EXEC_LPR_FD_TTY:
+    case FILED_EXEC_LPR_FD_SOCKET:
         return fd->handle != 0;
-    case FILED_V2_EXEC_LPR_FD_PIPE:
-    case FILED_V2_EXEC_LPR_FD_EVENT:
+    case FILED_EXEC_LPR_FD_PIPE:
+    case FILED_EXEC_LPR_FD_EVENT:
         return 1;
     default:
         return 0;
@@ -368,27 +368,27 @@ int filed_dispatch_lpr_fd_desc_valid(const filed_v2_exec_lpr_fd_t *fd)
 }
 
 int filed_dispatch_exec_lpr_fd_table_valid(
-    const filed_v2_exec_path_t *exec,
-    const filed_v2_exec_lpr_fd_table_t *table,
+    const filed_exec_path_t *exec,
+    const filed_exec_lpr_fd_table_t *table,
     int allow_table)
 {
     if (exec == NULL) {
         return 0;
     }
-    const int wants_table = (exec->flags & FILED_V2_EXEC_LPR_FD_TABLE) != 0;
+    const int wants_table = (exec->flags & FILED_EXEC_LPR_FD_TABLE) != 0;
     if (!wants_table) {
         return exec->lpr_fd_table_bytes == 0 && table == NULL;
     }
     if (!allow_table ||
         table == NULL ||
         exec->lpr_fd_table_bytes < sizeof(*table) ||
-        (exec->flags & (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP)) !=
-            (FILED_V2_EXEC_LINUX_LPR | FILED_V2_EXEC_LINUX_BOOTSTRAP))
+        (exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) !=
+            (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
     {
         return 0;
     }
-    if (table->magic != FILED_V2_EXEC_LPR_FD_TABLE_MAGIC ||
-        table->version != FILED_V2_EXEC_LPR_FD_TABLE_VERSION ||
+    if (table->magic != FILED_EXEC_LPR_FD_TABLE_MAGIC ||
+        table->version != FILED_EXEC_LPR_FD_TABLE_VERSION ||
         table->reserved0 != 0 ||
         table->reserved1 != 0 ||
         table->byte_size < sizeof(*table) ||
@@ -397,16 +397,16 @@ int filed_dispatch_exec_lpr_fd_table_valid(
         return 0;
     }
     if (table->fd_count > LPR_LINUX_FD_LIMIT ||
-        table->fd_count > (UINT64_MAX - sizeof(*table)) / sizeof(filed_v2_exec_lpr_fd_t))
+        table->fd_count > (UINT64_MAX - sizeof(*table)) / sizeof(filed_exec_lpr_fd_t))
     {
         return 0;
     }
     const uint64_t expected_size =
-        sizeof(*table) + table->fd_count * sizeof(filed_v2_exec_lpr_fd_t);
+        sizeof(*table) + table->fd_count * sizeof(filed_exec_lpr_fd_t);
     if (table->byte_size != expected_size) {
         return 0;
     }
-    const filed_v2_exec_lpr_fd_t *entries = filed_dispatch_lpr_fd_table_entries(table);
+    const filed_exec_lpr_fd_t *entries = filed_dispatch_lpr_fd_table_entries(table);
     for (uint64_t i = 0; i < table->fd_count; ++i) {
         if (!filed_dispatch_lpr_fd_desc_valid(&entries[i])) {
             return 0;
@@ -419,8 +419,8 @@ int filed_dispatch_exec_lpr_fd_table_valid(
 }
 
 int filed_dispatch_create_lpr_bootstrap_fd(
-    const filed_v2_exec_path_t *exec,
-    const filed_v2_exec_lpr_fd_table_t *fd_table)
+    const filed_exec_path_t *exec,
+    const filed_exec_lpr_fd_table_t *fd_table)
 {
     if (exec == NULL) {
         return -22;
@@ -474,7 +474,7 @@ int filed_dispatch_create_lpr_bootstrap_fd(
         bootstrap->flags |= LPR_BOOTSTRAP_FLAG_SUPERVISOR;
     }
     if (fd_table != NULL && local_fd_count != 0) {
-        const filed_v2_exec_lpr_fd_t *in = filed_dispatch_lpr_fd_table_entries(fd_table);
+        const filed_exec_lpr_fd_t *in = filed_dispatch_lpr_fd_table_entries(fd_table);
         lpr_bootstrap_fd_t *out =
             (lpr_bootstrap_fd_t *)((unsigned char *)bootstrap + bootstrap->local_fd_table_offset);
         for (uint64_t i = 0; i < local_fd_count; ++i) {
@@ -485,15 +485,15 @@ int filed_dispatch_create_lpr_bootstrap_fd(
             out[i].offset_or_counter = in[i].offset_or_counter;
         }
     }
-    if ((exec->flags & FILED_V2_EXEC_LINUX_DEFAULT_STDIO) != 0) {
+    if ((exec->flags & FILED_EXEC_LINUX_DEFAULT_STDIO) != 0) {
         bootstrap->flags |= LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO;
-        const char *ctty = filed_v2_exec_string(exec, exec->ctty);
+        const char *ctty = filed_exec_string(exec, exec->ctty);
         if (ctty != NULL) {
             snprintf(bootstrap->ctty, sizeof(bootstrap->ctty), "%s", ctty);
         }
     }
-    if (!filed_v2_exec_string_ref_empty(exec->cwd)) {
-        const char *cwd = filed_v2_exec_string(exec, exec->cwd);
+    if (!filed_exec_string_ref_empty(exec->cwd)) {
+        const char *cwd = filed_exec_string(exec, exec->cwd);
         if (cwd != NULL) {
             snprintf(bootstrap->cwd, sizeof(bootstrap->cwd), "%s", cwd);
         }

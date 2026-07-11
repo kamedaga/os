@@ -1,5 +1,5 @@
 #include "lpr_supervisor/boot_config.h"
-#include "lpr_supervisor/ipc_protocol_v2.h"
+#include "lpr_supervisor/ipc_protocol.h"
 
 #include <pacha/abi.h>
 #include <pacha/ipc.h>
@@ -29,8 +29,8 @@ typedef struct lprs_process {
     uint64_t foreground_pgrp;
     uint64_t cwd_handle;
     int process_fd;
-    char ctty[LPRS_V2_CTTY_BYTES];
-    char cwd[LPRS_V2_CWD_BYTES];
+    char ctty[LPRS_CTTY_BYTES];
+    char cwd[LPRS_CWD_BYTES];
 } lprs_process_t;
 
 typedef struct lprs_process_status {
@@ -251,7 +251,7 @@ static void lprs_copy_string(char *dst, uint64_t dst_bytes, const char *src)
     snprintf(dst, (size_t)dst_bytes, "%s", src);
 }
 
-static void lprs_write_state(const lprs_process_t *proc, lprs_v2_process_state_t *out)
+static void lprs_write_state(const lprs_process_t *proc, lprs_process_state_t *out)
 {
     memset(out, 0, sizeof(*out));
     out->token = proc->token;
@@ -270,7 +270,7 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     if (page == NULL || out_token == NULL) {
         return PACHA_STATUS_EINVAL;
     }
-    lprs_v2_register_exec_t *req = (lprs_v2_register_exec_t *)page;
+    lprs_register_exec_t *req = (lprs_register_exec_t *)page;
     lprs_process_t *proc = lprs_alloc_process();
     if (proc == NULL) {
         return PACHA_STATUS_ENOMEM;
@@ -323,7 +323,7 @@ static int lprs_get_process_state(uint64_t token, void *page)
     if (proc == NULL) {
         return PACHA_STATUS_ESRCH;
     }
-    lprs_write_state(proc, (lprs_v2_process_state_t *)page);
+    lprs_write_state(proc, (lprs_process_state_t *)page);
     return 0;
 }
 
@@ -341,8 +341,8 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     const uint64_t parent_pgrp = parent->pgrp;
     const uint64_t parent_foreground_pgrp = parent->foreground_pgrp;
     const uint64_t parent_cwd_handle = parent->cwd_handle;
-    char parent_ctty[LPRS_V2_CTTY_BYTES];
-    char parent_cwd[LPRS_V2_CWD_BYTES];
+    char parent_ctty[LPRS_CTTY_BYTES];
+    char parent_cwd[LPRS_CWD_BYTES];
     lprs_copy_string(parent_ctty, sizeof(parent_ctty), parent->ctty);
     lprs_copy_string(parent_cwd, sizeof(parent_cwd), parent->cwd);
 
@@ -360,7 +360,7 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     lprs_copy_string(child->ctty, sizeof(child->ctty), parent_ctty);
     lprs_copy_string(child->cwd, sizeof(child->cwd), parent_cwd);
 
-    lprs_v2_fork_t *fork = (lprs_v2_fork_t *)page;
+    lprs_fork_t *fork = (lprs_fork_t *)page;
     memset(fork, 0, sizeof(*fork));
     fork->parent_token = parent_token;
     fork->child_token = child->token;
@@ -457,7 +457,7 @@ static int lprs_wait4(void *page, uint64_t *out_result)
         return PACHA_STATUS_EINVAL;
     }
     *out_result = 0;
-    lprs_v2_wait4_t *req = (lprs_v2_wait4_t *)page;
+    lprs_wait4_t *req = (lprs_wait4_t *)page;
     lprs_process_t *parent = lprs_find_by_token(req->token);
     if (parent == NULL) {
         return PACHA_STATUS_ESRCH;
@@ -500,7 +500,7 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     req->result_pid = (int64_t)selected_pid;
     req->exit_code = exit_code;
     req->status = (exit_code & 0xffu) << 8;
-    *out_result = LPRS_V2_WAIT4_RESULT_PACK(selected_pid, req->status);
+    *out_result = LPRS_WAIT4_RESULT_PACK(selected_pid, req->status);
     lprs_process_reap(selected);
     return 0;
 }
@@ -510,7 +510,7 @@ static int lprs_setpgid(void *page)
     if (page == NULL) {
         return PACHA_STATUS_EINVAL;
     }
-    lprs_v2_pid_op_t *req = (lprs_v2_pid_op_t *)page;
+    lprs_pid_op_t *req = (lprs_pid_op_t *)page;
     lprs_process_t *caller = lprs_find_by_token(req->token);
     if (caller == NULL) {
         return PACHA_STATUS_ESRCH;
@@ -537,7 +537,7 @@ static int lprs_setsid(void *page)
     if (page == NULL) {
         return PACHA_STATUS_EINVAL;
     }
-    lprs_v2_pid_op_t *req = (lprs_v2_pid_op_t *)page;
+    lprs_pid_op_t *req = (lprs_pid_op_t *)page;
     lprs_process_t *caller = lprs_find_by_token(req->token);
     if (caller == NULL) {
         return PACHA_STATUS_ESRCH;
@@ -557,7 +557,7 @@ static int lprs_getpgid_or_sid(void *page, int want_sid)
     if (page == NULL) {
         return PACHA_STATUS_EINVAL;
     }
-    lprs_v2_pid_op_t *req = (lprs_v2_pid_op_t *)page;
+    lprs_pid_op_t *req = (lprs_pid_op_t *)page;
     lprs_process_t *caller = lprs_find_by_token(req->token);
     if (caller == NULL || req->pid < 0) {
         return caller == NULL ? PACHA_STATUS_ESRCH : PACHA_STATUS_EINVAL;
@@ -576,7 +576,7 @@ static int lprs_kill(void *page)
     if (page == NULL) {
         return PACHA_STATUS_EINVAL;
     }
-    lprs_v2_kill_t *req = (lprs_v2_kill_t *)page;
+    lprs_kill_t *req = (lprs_kill_t *)page;
     lprs_process_t *caller = lprs_find_by_token(req->token);
     if (caller == NULL || req->signal > 64u) {
         return caller == NULL ? PACHA_STATUS_ESRCH : PACHA_STATUS_EINVAL;
@@ -650,7 +650,7 @@ static int lprs_cwd_get(uint64_t token, void *page)
     if (proc == NULL) {
         return PACHA_STATUS_ESRCH;
     }
-    lprs_v2_cwd_t *cwd = (lprs_v2_cwd_t *)page;
+    lprs_cwd_t *cwd = (lprs_cwd_t *)page;
     memset(cwd, 0, sizeof(*cwd));
     cwd->token = proc->token;
     cwd->cwd_handle = proc->cwd_handle;
@@ -663,7 +663,7 @@ static int lprs_cwd_set(void *page)
     if (page == NULL) {
         return PACHA_STATUS_EINVAL;
     }
-    lprs_v2_cwd_t *cwd = (lprs_v2_cwd_t *)page;
+    lprs_cwd_t *cwd = (lprs_cwd_t *)page;
     lprs_process_t *proc = lprs_find_by_token(cwd->token);
     if (proc == NULL) {
         return PACHA_STATUS_ESRCH;
@@ -714,15 +714,15 @@ static void lprs_close_unowned_fds(const struct pacha_ipc_msg *request, int keep
     }
 }
 
-static uint64_t lprs_v2_token_from_payload(const void *payload, uint32_t payload_size)
+static uint64_t lprs_token_from_payload(const void *payload, uint32_t payload_size)
 {
-    if (payload == NULL || payload_size < sizeof(lprs_v2_token_request_t)) {
+    if (payload == NULL || payload_size < sizeof(lprs_token_request_t)) {
         return 0;
     }
-    return ((const lprs_v2_token_request_t *)payload)->token;
+    return ((const lprs_token_request_t *)payload)->token;
 }
 
-static int lprs_dispatch_v2(
+static int lprs_dispatch(
     struct pacha_ipc_msg *request,
     uint64_t *out_result,
     int *out_keep_fd,
@@ -754,21 +754,21 @@ static int lprs_dispatch_v2(
                 request->fd_count,
                 request->fd_count != 0 ? request->fds[0].fd : 0,
                 0,
-                "lpr supervisor v2 request page map failed");
+                "lpr supervisor request page map failed");
         }
         return PACHA_STATUS_EFAULT;
     }
 
-    pacha_service_request_header_t header;
+    pacha_service_envelope_t header;
     memcpy(&header, page, sizeof(header));
     if (out_request_id != NULL) {
         *out_request_id = header.request_id;
     }
     int status = PACHA_STATUS_EINVAL;
     uint32_t reply_payload_size = 0;
-    if (!pacha_service_request_header_is_v2(&header, LPRS_V2_SERVICE_ID)) {
-        pacha_service_reply_header_init(
-            (pacha_service_reply_header_t *)page,
+    if (!pacha_service_request_is_valid(&header, LPRS_SERVICE_ID)) {
+        pacha_service_reply_init(
+            (pacha_service_envelope_t *)page,
             &header,
             PACHA_STATUS_EINVAL,
             PACHA_SERVICE_ERROR_ABI,
@@ -779,22 +779,22 @@ static int lprs_dispatch_v2(
     }
 
     void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
-    const uint64_t token = lprs_v2_token_from_payload(payload, header.payload_size);
+    const uint64_t token = lprs_token_from_payload(payload, header.payload_size);
     switch (header.op) {
-    case LPRS_V2_OP_HELLO:
+    case LPRS_OP_HELLO:
         *out_result = PACHA_SERVICE_ABI_VERSION;
         status = 0;
         break;
-    case LPRS_V2_OP_PROCESS_REGISTER_EXEC:
-        if (header.payload_size < sizeof(lprs_v2_register_exec_t)) {
+    case LPRS_OP_PROCESS_REGISTER_EXEC:
+        if (header.payload_size < sizeof(lprs_register_exec_t)) {
             status = PACHA_STATUS_EINVAL;
         } else {
             status = lprs_register_exec(payload, out_result);
-            reply_payload_size = sizeof(lprs_v2_register_exec_t);
+            reply_payload_size = sizeof(lprs_register_exec_t);
         }
         break;
-    case LPRS_V2_OP_PROCESS_REGISTER_FD:
-    case LPRS_V2_OP_PROCESS_FORK_PARENT_REGISTER:
+    case LPRS_OP_PROCESS_REGISTER_FD:
+    case LPRS_OP_PROCESS_FORK_PARENT_REGISTER:
         if (token == 0 || request->fds == NULL || request->fd_count < 2 ||
             request->fds[1].fd < 16)
         {
@@ -807,88 +807,88 @@ static int lprs_dispatch_v2(
             }
         }
         break;
-    case LPRS_V2_OP_PROCESS_GET_STATE:
+    case LPRS_OP_PROCESS_GET_STATE:
         status = token == 0 ? PACHA_STATUS_EINVAL : lprs_get_process_state(token, payload);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_process_state_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_process_state_t) : 0;
         break;
-    case LPRS_V2_OP_PROCESS_FORK_BEGIN:
+    case LPRS_OP_PROCESS_FORK_BEGIN:
         status = token == 0 ? PACHA_STATUS_EINVAL : lprs_fork_begin(token, payload);
         if (status == 0) {
-            *out_result = ((lprs_v2_fork_t *)payload)->child_token;
-            reply_payload_size = sizeof(lprs_v2_fork_t);
+            *out_result = ((lprs_fork_t *)payload)->child_token;
+            reply_payload_size = sizeof(lprs_fork_t);
         }
         break;
-    case LPRS_V2_OP_PROCESS_FORK_CHILD_READY:
-    case LPRS_V2_OP_PROCESS_EXEC_COMMIT_BEGIN:
-    case LPRS_V2_OP_PROCESS_EXEC_COMMIT_DONE:
+    case LPRS_OP_PROCESS_FORK_CHILD_READY:
+    case LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN:
+    case LPRS_OP_PROCESS_EXEC_COMMIT_DONE:
         status = token == 0 ? PACHA_STATUS_EINVAL :
             (lprs_find_by_token(token) != NULL ? 0 : PACHA_STATUS_ESRCH);
         break;
-    case LPRS_V2_OP_PROCESS_WAIT4:
-        if (header.payload_size < sizeof(lprs_v2_wait4_t)) {
+    case LPRS_OP_PROCESS_WAIT4:
+        if (header.payload_size < sizeof(lprs_wait4_t)) {
             status = PACHA_STATUS_EINVAL;
         } else {
             status = lprs_wait4(payload, out_result);
-            reply_payload_size = sizeof(lprs_v2_wait4_t);
+            reply_payload_size = sizeof(lprs_wait4_t);
         }
         break;
-    case LPRS_V2_OP_PROCESS_SETPGID:
-        status = header.payload_size < sizeof(lprs_v2_pid_op_t) ?
+    case LPRS_OP_PROCESS_SETPGID:
+        status = header.payload_size < sizeof(lprs_pid_op_t) ?
             PACHA_STATUS_EINVAL :
             lprs_setpgid(payload);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_pid_op_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_pid_op_t) : 0;
         break;
-    case LPRS_V2_OP_PROCESS_SETSID:
-        status = header.payload_size < sizeof(lprs_v2_pid_op_t) ?
+    case LPRS_OP_PROCESS_SETSID:
+        status = header.payload_size < sizeof(lprs_pid_op_t) ?
             PACHA_STATUS_EINVAL :
             lprs_setsid(payload);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_pid_op_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_pid_op_t) : 0;
         break;
-    case LPRS_V2_OP_PROCESS_GETPGID:
-        status = header.payload_size < sizeof(lprs_v2_pid_op_t) ?
+    case LPRS_OP_PROCESS_GETPGID:
+        status = header.payload_size < sizeof(lprs_pid_op_t) ?
             PACHA_STATUS_EINVAL :
             lprs_getpgid_or_sid(payload, 0);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_pid_op_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_pid_op_t) : 0;
         break;
-    case LPRS_V2_OP_PROCESS_GETSID:
-        status = header.payload_size < sizeof(lprs_v2_pid_op_t) ?
+    case LPRS_OP_PROCESS_GETSID:
+        status = header.payload_size < sizeof(lprs_pid_op_t) ?
             PACHA_STATUS_EINVAL :
             lprs_getpgid_or_sid(payload, 1);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_pid_op_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_pid_op_t) : 0;
         break;
-    case LPRS_V2_OP_SIGNAL_KILL:
-        status = header.payload_size < sizeof(lprs_v2_kill_t) ?
+    case LPRS_OP_SIGNAL_KILL:
+        status = header.payload_size < sizeof(lprs_kill_t) ?
             PACHA_STATUS_EINVAL :
             lprs_kill(payload);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_kill_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_kill_t) : 0;
         break;
-    case LPRS_V2_OP_SIGNAL_DELIVER_TTY:
-        if (header.payload_size < sizeof(lprs_v2_tty_signal_t)) {
+    case LPRS_OP_SIGNAL_DELIVER_TTY:
+        if (header.payload_size < sizeof(lprs_tty_signal_t)) {
             status = PACHA_STATUS_EINVAL;
         } else {
-            lprs_v2_tty_signal_t *sig = (lprs_v2_tty_signal_t *)payload;
+            lprs_tty_signal_t *sig = (lprs_tty_signal_t *)payload;
             status = lprs_deliver_tty_signal_fields(sig->pgrp, sig->signal, &sig->delivered);
             reply_payload_size = sizeof(*sig);
         }
         break;
-    case LPRS_V2_OP_CWD_GET:
+    case LPRS_OP_CWD_GET:
         status = token == 0 ? PACHA_STATUS_EINVAL : lprs_cwd_get(token, payload);
-        reply_payload_size = status == 0 ? sizeof(lprs_v2_cwd_t) : 0;
+        reply_payload_size = status == 0 ? sizeof(lprs_cwd_t) : 0;
         break;
-    case LPRS_V2_OP_CWD_SET:
-        status = header.payload_size < sizeof(lprs_v2_cwd_t) ? PACHA_STATUS_EINVAL : lprs_cwd_set(payload);
+    case LPRS_OP_CWD_SET:
+        status = header.payload_size < sizeof(lprs_cwd_t) ? PACHA_STATUS_EINVAL : lprs_cwd_set(payload);
         break;
-    case LPRS_V2_OP_DIAG_ERROR_GET:
+    case LPRS_OP_DIAG_ERROR_GET:
         status = PACHA_STATUS_ENOTSUP;
         reply_payload_size = 0;
         break;
-    case LPRS_V2_OP_DIAG_DUMP:
+    case LPRS_OP_DIAG_DUMP:
     default:
         status = PACHA_STATUS_EINVAL;
         break;
     }
 
-    if (status < 0 && header.op != LPRS_V2_OP_DIAG_ERROR_GET &&
+    if (status < 0 && header.op != LPRS_OP_DIAG_ERROR_GET &&
         out_error_token != NULL && *out_error_token == 0)
     {
         *out_error_token = lprs_error_token(
@@ -900,10 +900,10 @@ static int lprs_dispatch_v2(
             request->fd_count,
             token,
             0,
-            "lpr supervisor v2 dispatch failed");
+            "lpr supervisor dispatch failed");
     }
-    pacha_service_reply_header_init(
-        (pacha_service_reply_header_t *)page,
+    pacha_service_reply_init(
+        (pacha_service_envelope_t *)page,
         &header,
         status,
         status == PACHA_STATUS_EINVAL ? PACHA_SERVICE_ERROR_ABI : PACHA_SERVICE_ERROR_LPR_TRANSLATION,
@@ -914,7 +914,7 @@ static int lprs_dispatch_v2(
     return status;
 }
 
-static int lprs_reply_v2(
+static int lprs_reply(
     int reply_fd,
     uint64_t request_id,
     int64_t status,
@@ -950,10 +950,10 @@ static int lprs_handle_received_request(struct pacha_ipc_msg *request)
     uint64_t request_id = request->word3;
     const int dispatch_status =
         request->word0 == PACHA_SERVICE_REQUEST_MAGIC ?
-            lprs_dispatch_v2(request, &result, &keep_fd, &error_token, &request_id) :
+            lprs_dispatch(request, &result, &keep_fd, &error_token, &request_id) :
             PACHA_STATUS_EINVAL;
     lprs_close_unowned_fds(request, keep_fd, reply_fd);
-    (void)lprs_reply_v2(reply_fd, request_id, dispatch_status, result, error_token);
+    (void)lprs_reply(reply_fd, request_id, dispatch_status, result, error_token);
     return 0;
 }
 

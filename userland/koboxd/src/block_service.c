@@ -28,7 +28,7 @@ int koboxd_block_service_handle_ipc(void *ctx, const koboxd_ipc_request_t *reque
     }
 
     switch (request->header.op) {
-    case KOBOXD_BLOCK_IDENTIFY:
+    case KOBOXD_IPC_BLOCK_OP_IDENTIFY:
         return koboxd_ipc_make_reply(
             request,
             0,
@@ -37,7 +37,7 @@ int koboxd_block_service_handle_ipc(void *ctx, const koboxd_ipc_request_t *reque
             NULL,
             0,
             reply);
-    case KOBOXD_BLOCK_READ: {
+    case KOBOXD_IPC_BLOCK_OP_READ: {
         uint8_t sector[512];
         memset(sector, 0, sizeof(sector));
         uint64_t length = request->header.length;

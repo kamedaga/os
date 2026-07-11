@@ -95,25 +95,25 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
     }
 
     const uint32_t wait_events =
-        op == TERMD_V2_OP_HANDLE_WRITE ? TERMD_V2_POLLOUT : TERMD_V2_POLLIN;
+        op == TERMD_OP_HANDLE_WRITE ? TERMD_POLLOUT : TERMD_POLLIN;
     for (;;) {
         void *page = 0;
         const int page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) {
             return page_fd;
         }
-        termd_v2_io_request_t *io = (termd_v2_io_request_t *)lpr_termd_payload(page);
+        termd_io_request_t *io = (termd_io_request_t *)lpr_termd_payload(page);
         lpr_memset(io, 0, sizeof(*io));
         io->handle = lpr_fd_tty_payload(fd)->handle;
-        io->length = count > TERMD_V2_IO_BYTES ? TERMD_V2_IO_BYTES : count;
+        io->length = count > TERMD_IO_BYTES ? TERMD_IO_BYTES : count;
         lpr_fill_termd_caller(&io->tty.session_id, &io->tty.process_id, &io->tty.pgrp_id);
         lpr_fill_termd_signal_state(&io->tty.signal_mask, &io->tty.signal_ignored);
-        if (op == TERMD_V2_OP_HANDLE_WRITE && io->length != 0) {
+        if (op == TERMD_OP_HANDLE_WRITE && io->length != 0) {
             lpr_memcpy(io->data, (const void *)(uintptr_t)buf, (size_t)io->length);
         }
         uint64_t result = 0;
         const int64_t status = lpr_termd_call(op, page_fd, page, sizeof(*io), &result);
-        if (status == 0 && op == TERMD_V2_OP_HANDLE_READ && result != 0) {
+        if (status == 0 && op == TERMD_OP_HANDLE_READ && result != 0) {
             lpr_memcpy((void *)(uintptr_t)buf, io->data, (size_t)result);
         }
         lpr_destroy_tty_wire_page(page_fd, page);
@@ -146,7 +146,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     if (page_fd < 0) {
         return page_fd;
     }
-    termd_v2_ioctl_request_t *ioctl_req = (termd_v2_ioctl_request_t *)lpr_termd_payload(page);
+    termd_ioctl_request_t *ioctl_req = (termd_ioctl_request_t *)lpr_termd_payload(page);
     lpr_memset(ioctl_req, 0, sizeof(*ioctl_req));
     ioctl_req->handle = lpr_fd_tty_payload(fd)->handle;
     ioctl_req->request = request;
@@ -191,7 +191,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 
     uint64_t result = 0;
     const int64_t status =
-        lpr_termd_call(TERMD_V2_OP_HANDLE_IOCTL, page_fd, page, sizeof(*ioctl_req), &result);
+        lpr_termd_call(TERMD_OP_HANDLE_IOCTL, page_fd, page, sizeof(*ioctl_req), &result);
     if (status == 0) {
         switch (request) {
         case LPR_LINUX_TCGETS:
@@ -262,7 +262,7 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
     if (page_fd < 0) {
         return 0;
     }
-    termd_v2_poll_request_t *poll_req = (termd_v2_poll_request_t *)lpr_termd_payload(page);
+    termd_poll_request_t *poll_req = (termd_poll_request_t *)lpr_termd_payload(page);
     lpr_memset(poll_req, 0, sizeof(*poll_req));
     poll_req->handle = lpr_fd_tty_payload(fd)->handle;
     poll_req->events = events;
@@ -275,8 +275,8 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
         &poll_req->tty.signal_ignored);
     uint64_t result = 0;
     const int64_t status =
-        lpr_termd_call(TERMD_V2_OP_HANDLE_POLL, page_fd, page, sizeof(*poll_req), &result);
-    uint32_t revents = status == 0 ? poll_req->revents : TERMD_V2_POLLERR;
+        lpr_termd_call(TERMD_OP_HANDLE_POLL, page_fd, page, sizeof(*poll_req), &result);
+    uint32_t revents = status == 0 ? poll_req->revents : TERMD_POLLERR;
     lpr_destroy_tty_wire_page(page_fd, page);
     return revents;
 }
@@ -301,14 +301,14 @@ int64_t lpr_tty_wait(uint64_t fd, uint32_t events)
     for (;;) {
         const uint32_t revents = lpr_linux_tty_poll_events(
             fd,
-            events | TERMD_V2_POLLERR | TERMD_V2_POLLHUP);
+            events | TERMD_POLLERR | TERMD_POLLHUP);
         if ((revents & events) != 0) {
             return 0;
         }
-        if ((revents & TERMD_V2_POLLERR) != 0) {
+        if ((revents & TERMD_POLLERR) != 0) {
             return -LPR_LINUX_EIO;
         }
-        if ((revents & TERMD_V2_POLLHUP) != 0) {
+        if ((revents & TERMD_POLLHUP) != 0) {
             return 0;
         }
         lpr_linux_pump_tty_signals();
@@ -379,11 +379,11 @@ void lpr_linux_pump_tty_signals(void)
         return;
     }
     for (uint64_t i = 0; i < 8u; i++) {
-        termd_v2_signal_request_t *signal_req = (termd_v2_signal_request_t *)lpr_termd_payload(page);
+        termd_signal_request_t *signal_req = (termd_signal_request_t *)lpr_termd_payload(page);
         lpr_memset(signal_req, 0, sizeof(*signal_req));
         uint64_t result = 0;
         const int64_t status =
-            lpr_termd_call(TERMD_V2_OP_SIGNAL_TAKE, page_fd, page, sizeof(*signal_req), &result);
+            lpr_termd_call(TERMD_OP_SIGNAL_TAKE, page_fd, page, sizeof(*signal_req), &result);
         if (status != 0 || result == 0 || signal_req->signo == 0) {
             break;
         }

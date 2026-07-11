@@ -24,8 +24,9 @@ add_custom_command(
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed_smoke/bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-    "${REPO_ROOT}/userland/filed/include/filed/payload_v2.h"
-    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol_v2.h"
+    "${REPO_ROOT}/userland/filed/include/filed/flags.h"
+    "${REPO_ROOT}/userland/filed/include/filed/payload.h"
+    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libipc/include/pacha/service_abi.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"

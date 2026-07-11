@@ -4,7 +4,7 @@ filed_page_dispatch_result_t filed_dispatch_openat_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_openat_t *openat = (filed_v2_openat_t *)page;
+    filed_openat_t *openat = (filed_openat_t *)page;
     filed_vfs_open_result_t open_result;
     int64_t reply_status = -22;
     uint64_t result = 0;
@@ -31,11 +31,11 @@ filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_validate_open_cache_t *validate =
-        (filed_v2_validate_open_cache_t *)page;
+    filed_validate_open_cache_t *validate =
+        (filed_validate_open_cache_t *)page;
     filed_vfs_io_decision_t cached_decision;
     filed_vfs_open_result_t fresh_open;
-    filed_v2_openat_t openat;
+    filed_openat_t openat;
     uint64_t valid = 0;
 
     if (runtime == NULL || validate == NULL) {
@@ -87,7 +87,7 @@ filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(
         fresh_open.object_generation == validate->object_generation &&
         cached_decision.object_generation == validate->object_generation)
     {
-        if ((validate->open_flags & FILED_V2_OPEN_DIRECTORY) == 0 ||
+        if ((validate->open_flags & FILED_OPEN_DIRECTORY) == 0 ||
             (validate->dir_generation != 0 &&
                 fresh_open.dir_generation == validate->dir_generation &&
                 cached_decision.dir_generation == validate->dir_generation))
@@ -106,10 +106,10 @@ filed_page_dispatch_result_t filed_dispatch_stat_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_statx_t *wire_stat = (filed_v2_statx_t *)page;
+    filed_statx_t *wire_stat = (filed_statx_t *)page;
     filed_vfs_io_decision_t decision;
     filed_vfs_stat_snapshot_t snapshot;
-    storage_v2_statx_reply_t backend_stat;
+    storage_statx_reply_t backend_stat;
     const uint64_t handle_id = wire_stat->handle;
     filed_status_t status = filed_vfs_stat_prepare(
         &runtime->vfs,
@@ -183,11 +183,11 @@ filed_page_dispatch_result_t filed_dispatch_utimens_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_utimens_t *utimens = (filed_v2_utimens_t *)page;
+    filed_utimens_t *utimens = (filed_utimens_t *)page;
     if (runtime == NULL || utimens == NULL) {
         return filed_page_result(-22, 0);
     }
-    if ((utimens->mask & ~((uint64_t)FILED_V2_UTIMENS_ATIME | (uint64_t)FILED_V2_UTIMENS_MTIME)) != 0) {
+    if ((utimens->mask & ~((uint64_t)FILED_UTIMENS_ATIME | (uint64_t)FILED_UTIMENS_MTIME)) != 0) {
         return filed_page_result(-22, 0);
     }
     filed_vfs_io_decision_t decision;
@@ -226,7 +226,7 @@ int filed_ensure_stat_snapshot(
 {
     filed_vfs_io_decision_t decision;
     filed_vfs_stat_snapshot_t snapshot;
-    storage_v2_statx_reply_t backend_stat;
+    storage_statx_reply_t backend_stat;
     filed_status_t status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, &decision);
     if (status != FILED_OK) {
         return filed_status_to_wire(status);
@@ -263,7 +263,7 @@ filed_page_dispatch_result_t filed_dispatch_chmod_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_chmod_t *chmod_req = (filed_v2_chmod_t *)page;
+    filed_chmod_t *chmod_req = (filed_chmod_t *)page;
     if (runtime == NULL || chmod_req == NULL || chmod_req->reserved0 != 0 || chmod_req->reserved1 != 0) {
         return filed_page_result(-22, 0);
     }
@@ -299,7 +299,7 @@ filed_page_dispatch_result_t filed_dispatch_pread_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_pread_prepare(
@@ -311,8 +311,8 @@ filed_page_dispatch_result_t filed_dispatch_pread_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_V2_IO_BYTES) {
-            length = FILED_V2_IO_BYTES;
+        if (length > FILED_IO_BYTES) {
+            length = FILED_IO_BYTES;
         }
         reply_status = filed_cached_pread(
             runtime,
@@ -338,7 +338,7 @@ filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
     void *page,
     int vmo_fd)
 {
-    filed_v2_pread_vmo_t *pread_vmo = (filed_v2_pread_vmo_t *)page;
+    filed_pread_vmo_t *pread_vmo = (filed_pread_vmo_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
 
@@ -462,24 +462,24 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
     return filed_page_result(0, bytes);
 }
 
-int filed_dispatch_file_vmo_v2(
+int filed_dispatch_file_vmo(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
     void *reply_page,
-    const pacha_service_request_header_t *header)
+    const pacha_service_envelope_t *header)
 {
     if (runtime == NULL ||
         request == NULL ||
         reply_page == NULL ||
         header == NULL ||
-        header->payload_size < sizeof(filed_v2_file_vmo_request_t))
+        header->payload_size < sizeof(filed_file_vmo_request_t))
     {
-        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
+        return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const filed_v2_file_vmo_request_t *file_vmo =
-        (const filed_v2_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    const filed_file_vmo_request_t *file_vmo =
+        (const filed_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
     filed_page_dispatch_result_t result = filed_page_result(-22, 0);
     filed_file_vmo_cache_entry_t *entry = NULL;
     if (file_vmo->length != 0 &&
@@ -525,8 +525,8 @@ int filed_dispatch_file_vmo_v2(
         }
     }
 
-    pacha_service_reply_header_init(
-        (pacha_service_reply_header_t *)reply_page,
+    pacha_service_reply_init(
+        (pacha_service_envelope_t *)reply_page,
         header,
         result.status,
         PACHA_SERVICE_ERROR_FILED_VFS,
@@ -558,28 +558,28 @@ int filed_dispatch_file_vmo_v2(
             request->fd_count,
             file_vmo->handle,
             0,
-            "filed v2 file-vmo negative reply");
+            "filed file-vmo negative reply");
     }
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
     (void)pacha_fd_close(reply_fd);
     return reply_status;
 }
 
-int filed_dispatch_shared_file_vmo_v2(
+int filed_dispatch_shared_file_vmo(
     filed_runtime_t *runtime,
     int reply_fd,
     const struct pacha_ipc_msg *request,
     void *reply_page,
-    const pacha_service_request_header_t *header)
+    const pacha_service_envelope_t *header)
 {
     if (runtime == NULL || request == NULL || reply_page == NULL || header == NULL ||
-        header->payload_size < sizeof(filed_v2_file_vmo_request_t))
+        header->payload_size < sizeof(filed_file_vmo_request_t))
     {
-        return filed_send_reply_v2(reply_fd, reply_page, header, -22, 0, 0);
+        return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const filed_v2_file_vmo_request_t *shared_vmo =
-        (const filed_v2_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    const filed_file_vmo_request_t *shared_vmo =
+        (const filed_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
     int64_t reply_status = -22;
     filed_file_vmo_cache_entry_t *entry = NULL;
     filed_vfs_io_decision_t decision;
@@ -587,9 +587,9 @@ int filed_dispatch_shared_file_vmo_v2(
     memset(&decision, 0, sizeof(decision));
     memset(&snapshot, 0, sizeof(snapshot));
 
-    const uint64_t known_flags = FILED_V2_FILE_VMO_WRITE | FILED_V2_FILE_VMO_EXEC;
-    const int writable = (shared_vmo->flags & FILED_V2_FILE_VMO_WRITE) != 0;
-    const int executable = (shared_vmo->flags & FILED_V2_FILE_VMO_EXEC) != 0;
+    const uint64_t known_flags = FILED_FILE_VMO_WRITE | FILED_FILE_VMO_EXEC;
+    const int writable = (shared_vmo->flags & FILED_FILE_VMO_WRITE) != 0;
+    const int executable = (shared_vmo->flags & FILED_FILE_VMO_EXEC) != 0;
     if (shared_vmo->length != 0 &&
         (shared_vmo->file_offset & 4095u) == 0 &&
         shared_vmo->file_offset <= UINT64_MAX - shared_vmo->length &&
@@ -627,7 +627,7 @@ int filed_dispatch_shared_file_vmo_v2(
             reply_status = filed_status_to_wire(status);
         }
         if (status == FILED_OK && !snapshot.valid) {
-            storage_v2_statx_reply_t backend_stat;
+            storage_statx_reply_t backend_stat;
             memset(&backend_stat, 0, sizeof(backend_stat));
             reply_status = filed_backend_statx(runtime, decision.backend_object, &backend_stat);
             if (reply_status == 0) {
@@ -663,8 +663,8 @@ int filed_dispatch_shared_file_vmo_v2(
         }
     }
 
-    pacha_service_reply_header_init(
-        (pacha_service_reply_header_t *)reply_page,
+    pacha_service_reply_init(
+        (pacha_service_envelope_t *)reply_page,
         header,
         reply_status,
         PACHA_SERVICE_ERROR_FILED_VFS,
@@ -700,10 +700,10 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_memfd_create_t *memfd = (filed_v2_memfd_create_t *)page;
+    filed_memfd_create_t *memfd = (filed_memfd_create_t *)page;
     const uint64_t known_flags =
-        FILED_V2_MEMFD_CLOEXEC |
-        FILED_V2_MEMFD_ALLOW_SEALING;
+        FILED_MEMFD_CLOEXEC |
+        FILED_MEMFD_ALLOW_SEALING;
     if (runtime == NULL || memfd == NULL || !runtime->tmpfs_root_handle_valid ||
         memfd->reserved0 != 0 ||
         (memfd->flags & ~known_flags) != 0 ||
@@ -716,7 +716,7 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
     if (root_object == 0) {
         return filed_page_result(-5, 0);
     }
-    char internal_name[FILED_V2_NAME_BYTES];
+    char internal_name[FILED_NAME_BYTES];
     const uint64_t sequence = ++runtime->memfd_sequence;
     const int name_length = snprintf(
         internal_name,
@@ -741,7 +741,7 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
     filed_vfs_open_result_t opened;
     memset(&opened, 0, sizeof(opened));
     const uint32_t open_flags =
-        (memfd->flags & FILED_V2_MEMFD_CLOEXEC) != 0 ? FILED_OPEN_CLOEXEC : 0;
+        (memfd->flags & FILED_MEMFD_CLOEXEC) != 0 ? FILED_OPEN_CLOEXEC : 0;
     filed_status_t status = filed_vfs_create_backend_child(
         &runtime->vfs,
         runtime->tmpfs_root_handle_id,
@@ -757,7 +757,7 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
         return filed_page_result(filed_status_to_wire(status), 0);
     }
 
-    storage_v2_statx_reply_t backend_stat;
+    storage_statx_reply_t backend_stat;
     memset(&backend_stat, 0, sizeof(backend_stat));
     reply_status = filed_tmpfs_backend_statx(&runtime->tmpfs, object_id, &backend_stat);
     if (reply_status == 0) {
@@ -788,7 +788,7 @@ filed_page_dispatch_result_t filed_dispatch_read_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_read_prepare(
@@ -799,8 +799,8 @@ filed_page_dispatch_result_t filed_dispatch_read_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_V2_IO_BYTES) {
-            length = FILED_V2_IO_BYTES;
+        if (length > FILED_IO_BYTES) {
+            length = FILED_IO_BYTES;
         }
         reply_status = filed_cached_pread(
             runtime,
@@ -833,7 +833,7 @@ filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_pwrite_prepare(
@@ -845,12 +845,12 @@ filed_page_dispatch_result_t filed_dispatch_pwrite_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_V2_IO_BYTES) {
-            length = FILED_V2_IO_BYTES;
+        if (length > FILED_IO_BYTES) {
+            length = FILED_IO_BYTES;
         }
         if (decision.offset == UINT64_MAX) {
             filed_vfs_stat_snapshot_t snapshot;
-            storage_v2_statx_reply_t backend_stat;
+            storage_statx_reply_t backend_stat;
             memset(&snapshot, 0, sizeof(snapshot));
             status = filed_vfs_get_stat_snapshot(
                 &runtime->vfs,
@@ -914,7 +914,7 @@ filed_page_dispatch_result_t filed_dispatch_write_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_io_t *io = (filed_v2_io_t *)page;
+    filed_io_t *io = (filed_io_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t bytes = 0;
     filed_status_t status = filed_vfs_write_prepare(
@@ -925,12 +925,12 @@ filed_page_dispatch_result_t filed_dispatch_write_page(
     int64_t reply_status = filed_status_to_wire(status);
     if (status == FILED_OK) {
         uint64_t length = decision.length;
-        if (length > FILED_V2_IO_BYTES) {
-            length = FILED_V2_IO_BYTES;
+        if (length > FILED_IO_BYTES) {
+            length = FILED_IO_BYTES;
         }
         if (decision.offset == UINT64_MAX) {
             filed_vfs_stat_snapshot_t snapshot;
-            storage_v2_statx_reply_t backend_stat;
+            storage_statx_reply_t backend_stat;
             memset(&snapshot, 0, sizeof(snapshot));
             status = filed_vfs_get_stat_snapshot(
                 &runtime->vfs,
@@ -1001,7 +1001,7 @@ filed_page_dispatch_result_t filed_dispatch_seek_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_seek_t *seek = (filed_v2_seek_t *)page;
+    filed_seek_t *seek = (filed_seek_t *)page;
     filed_vfs_io_decision_t decision;
     uint64_t file_size = 0;
     int64_t new_offset = 0;
@@ -1027,7 +1027,7 @@ filed_page_dispatch_result_t filed_dispatch_seek_page(
             if (status == FILED_OK && snapshot.valid) {
                 file_size = snapshot.size;
             } else if (status == FILED_OK) {
-                storage_v2_statx_reply_t backend_stat;
+                storage_statx_reply_t backend_stat;
                 memset(&backend_stat, 0, sizeof(backend_stat));
                 reply_status = filed_backend_statx(
                     runtime,
@@ -1131,7 +1131,7 @@ filed_page_dispatch_result_t filed_dispatch_truncate_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_v2_truncate_t *truncate = (filed_v2_truncate_t *)page;
+    filed_truncate_t *truncate = (filed_truncate_t *)page;
     filed_vfs_io_decision_t decision;
     filed_status_t status = FILED_ERR_INVALID;
     int64_t reply_status = -22;
