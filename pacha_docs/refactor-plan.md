@@ -241,11 +241,23 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 
 ---
 
-# 第二章 — mesa3d
+# 第二章 — グラフィクス: QEMU window 復活から Sway + Wayland まで
 
-第一章 (Phase 0〜5) で clang 耐性は達成した。第二章の目標は mesa3d のソフトウェアレンダリング (llvmpipe / softpipe 系) が PachaOS 上で動くこと。GPU パススルーは対象外。第一章と同じ方式で進める: 調査と修正を分離し、証拠なき修正はしない。実装は codex に委任し、タスクは実測の棚卸し結果から分解して追記する。
+第一章 (Phase 0〜5) で clang 耐性は達成した。第二章の最終目標は **QEMU window 上で Sway (wlroots) が起動し、Wayland ミニアプリが表示・操作できる**こと。レンダリングは mesa **llvmpipe** (ソフトウェア)。GPU パススルーは対象外。**osmesa / offscreen への矮小化はしない** — 各 Phase は必ず「window に何かが見える」形で進み、画面という実物で段階検証する。第一章と同じ方式: 調査と修正を分離、証拠なき修正はしない、実装は codex に委任、タスクは実測から分解して追記。
 
-### Phase M1 — 前提修正と棚卸し
+自動検証の方針: window は手動確認、CI/スモークは QMP screendump (または同等) で framebuffer をキャプチャしピクセル値を検証する。serial マーカー方式は従来どおり併用。
+
+既知の資産 (2026-07-11 調査): kernel は limine framebuffer を `primary_display` (paddr/width/height/pitch, kernel/src/boot/init_setup.zig) として publish 済み。pacgo には `Display` オプションの配管が既にあり現状 "none" 固定 (pack/internal/qemu/qemu.go)。kobox の virtio モジュールは net 系のみ導入済み (tools/download_kobox_virtio_modules.sh)、GPU/input は未導入。
+
+```
+Phase M1  前提修正 + QEMU window 復活 (framebuffer テストパターン)
+Phase M2  DRM/KMS (/dev/dri/card0、dumb buffer で modeset 描画)
+Phase M3  mesa llvmpipe + GBM/EGL (kmscube 相当が window に出る)
+Phase M4  入力: virtio-input/evdev → libinput、seat 管理
+Phase M5  wlroots/Sway + Wayland ミニアプリ (章の完了基準)
+```
+
+### Phase M1 — 前提修正と表示の第一歩
 
 **M1.0 [termd/kobox] PTY teardown fault の根治 (第一章からの持ち越し)**
 - 症状: PTY 利用プロセスの子 (grep/sleep 等) 終了時の teardown で、Linux tty core `session_clear_tty+0x38` が `task->signal == NULL` のまま offset 0x1a0 を deref して fault (RIP 0x4a00e608, CR2=0x1a0、T4.6 セッションで証拠取得済み)。
@@ -253,10 +265,39 @@ Phase 4 の T4.1 は T3.3 に、T4.2 は T2.2 に依存。T4.5 (clang 耐久) �
 - 併せて調査: PTY job-control で foreground pgrp が shell に残り、`setsid` + controlling TTY + `tcsetpgrp` でも移らない問題 (T4.6 で観測)。対話 Ctrl-C の実用性に直結するため、原因を特定し、修正が小さければ本タスクで、大きければ証拠付きで報告のみ。
 - 受け入れ: PTY 上で子プロセスを起動・終了させても fault しない再現スモークが green。既存 12 本 + unit 群も green 維持。
 
-**M1.1 mesa 導入と実行棚卸し**
-- alpine の mesa パッケージ群 (llvmpipe / osmesa / EGL surfaceless) を rootfs に導入し、最小の offscreen 描画 (osmesa render 1 枚、または surfaceless EGL + glReadPixels) を実行する。
-- 落ちる箇所・未実装 syscall・不足機能を証拠付きで棚卸しする。**このタスクでは修正しない** (T3.0 の教訓: 点修正は棚卸しを汚す)。判明した各問題を M1.2 以降のタスクに分解して本計画へ追記する。
-- 予想される領域: 大規模 mmap/スレッド (llvmpipe は worker thread プール)、shm/memfd、dma-buf 不在時の fallback、/dev/dri 不在の扱い、環境変数での driver 強制。
-- 受け入れ: 棚卸しレポート (問題・証拠・想定領域・タスク分解案) が揃うこと。
+**M1.1 QEMU window 復活 + framebuffer テストパターン**
+- pacgo の `Display` オプションを `pacgo run` / `pacgo qemu-test` から指定可能にし、window あり起動を復活させる (既定は従来どおり headless)。
+- kernel が publish 済みの `primary_display` を userland に配線し、limine framebuffer へ直接テストパターン (グラデーション + 識別マーカー) を描画する最小プログラムを rootfs に置く。どのプロセスが framebuffer を map するか (専用小デーモン or fixture 直叩き) は現構造への影響が最小の案を調査して選ぶ。
+- QMP screendump によるピクセル検証スモークを新設し、以後の Phase の標準検証手段にする。
+- 受け入れ: QEMU window にテストパターンが見える (手動) + screendump スモーク green + 既存回帰 green。
 
-**M1.2 以降** — M1.1 の棚卸し結果から分解して追記する。最終受け入れ (章の完了基準) は「offscreen 描画 1 枚のピクセル値検証スモーク + 描画反復のリーク耐久スモークが green」。
+### Phase M2 — DRM/KMS
+
+**M2.1 /dev/dri/card0 の成立**
+- kobox に DRM デバイスを立てる。候補は simpledrm (boot framebuffer 由来、依存最小) と virtio-gpu (本物の KMS/複数平面)。両者の .ko 依存関係と kobox shim の不足を調査し、根拠付きで選定 (最終的に Sway/wlroots が要求する ioctl 群を満たせる方)。/dev/dri/card0 を LPR プロセスから open できるところまで配線。
+- 受け入れ: fixture が card0 を open し DRM_IOCTL_VERSION / GET_CAP が返る。
+
+**M2.2 dumb buffer modeset 描画**
+- KMS dumb buffer + modeset でグラデーションを表示する fixture (kmscube 以前の modeset-test 相当)。mmap した dumb buffer への書き込み → page flip まで。
+- 受け入れ: window に表示 + screendump ピクセル検証 green。
+
+### Phase M3 — mesa llvmpipe
+
+**M3.1 mesa 導入と実行棚卸し**
+- alpine の mesa (llvmpipe / GBM / EGL) を rootfs に導入し、EGL+GBM で GL 描画 → KMS 表示する最小プログラム (kmscube 相当) を実行して、落ちる箇所・未実装 syscall・不足機能を証拠付きで棚卸しする。**このタスクでは修正しない** (T3.0 の教訓: 点修正は棚卸しを汚す)。
+- 予想される領域: llvmpipe worker thread プール、大規模 mmap、shm/memfd、dma-buf、udev 情報の取得経路。
+- 受け入れ: 棚卸しレポート (問題・証拠・タスク分解案) → M3.2 以降として本計画へ追記。
+
+**M3.2+ ギャップ実装 → kmscube 相当が window で回る** (棚卸しから分解)
+
+### Phase M4 — 入力と seat
+
+**M4.1 virtio-input / evdev → libinput**
+- virtio-input (keyboard/mouse) モジュールを kobox に導入し /dev/input/event* を配線。libinput が列挙・イベント取得できるところまで。seat 管理 (seatd) の導入もここ。
+- 受け入れ: QEMU window へのキー/マウス入力が evdev イベントとして fixture に届く。
+
+### Phase M5 — Sway + Wayland (章の完了基準)
+
+**M5.1 wlroots/Sway 導入と棚卸し** — 修正せず証拠付き棚卸し、タスク分解して追記。
+**M5.2+ ギャップ実装**
+**M5.3 完了基準**: QEMU window に Sway が起動し、Wayland ミニアプリ (まず wl_shm クライアント、次に GL クライアント) が表示され、キー入力が反映される。screendump 検証 + 起動反復のリーク耐久スモーク green。
