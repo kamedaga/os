@@ -156,6 +156,14 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
 
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
+    if (lpr_linux_device_fd_active(fd)) {
+        if ((lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
+            return -LPR_LINUX_EBADF;
+        }
+        (void)buf;
+        (void)count;
+        return 0;
+    }
     if (lpr_linux_input_fd_active(fd)) {
         return lpr_input_read_events(fd, buf, count);
     }
@@ -255,6 +263,10 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
     lpr_readv_cache_total++;
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (lpr_linux_device_fd_active(fd)) {
+        return (lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY ?
+            -LPR_LINUX_EBADF : 0;
     }
     if (lpr_pipe_fd_is_active(fd)) {
         if (!lpr_fd_pipe_payload(fd)->readable) {

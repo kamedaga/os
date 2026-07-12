@@ -131,6 +131,17 @@ int filed_kobox_backend_create(filed_kobox_backend_t *backend, uint64_t parent_o
     return -95;
 }
 
+int filed_kobox_backend_mknod(filed_kobox_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t dev, uint64_t *out_object_id)
+{
+    (void)backend;
+    (void)parent_object_id;
+    (void)name;
+    (void)mode;
+    (void)dev;
+    (void)out_object_id;
+    return -95;
+}
+
 int filed_kobox_backend_truncate(filed_kobox_backend_t *backend, uint64_t object_id, uint64_t size)
 {
     (void)backend;

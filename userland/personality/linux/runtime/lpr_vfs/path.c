@@ -945,6 +945,9 @@ int64_t lpr_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
     case FILED_OP_VFS_MKDIR:
         *out_payload_size = sizeof(filed_mkdir_t);
         return 0;
+    case FILED_OP_VFS_MKNOD:
+        *out_payload_size = sizeof(filed_mknod_t);
+        return 0;
     case FILED_OP_VFS_RMDIR:
         *out_payload_size = sizeof(filed_rmdir_t);
         return 0;

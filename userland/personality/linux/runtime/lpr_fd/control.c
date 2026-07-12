@@ -24,6 +24,13 @@ lpr_filed_fd_t *lpr_fd_filed_payload(uint64_t fd)
     return object != 0 && object->kind == LPR_FD_TABLE_KIND_FILED ? &object->payload.filed : 0;
 }
 
+lpr_device_fd_t *lpr_fd_device_payload(uint64_t fd)
+{
+    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
+    return object != 0 && object->kind == LPR_FD_TABLE_KIND_DEVICE ?
+        &object->payload.device : 0;
+}
+
 lpr_pipe_fd_t *lpr_fd_pipe_payload(uint64_t fd)
 {
     lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
@@ -75,6 +82,11 @@ static int lpr_fd_kind_active(uint64_t fd, uint8_t kind)
 int lpr_fd_is_filed(uint64_t fd)
 {
     return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_FILED);
+}
+
+int lpr_linux_device_fd_active(uint64_t fd)
+{
+    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DEVICE);
 }
 
 int lpr_linux_tty_fd_active(uint64_t fd)
@@ -156,6 +168,7 @@ int lpr_fd_local_active(uint64_t fd)
     const lpr_fd_object_t *object = lpr_fd_object_for_fd_const(fd);
     return object != 0 &&
         (object->kind == LPR_FD_TABLE_KIND_FILED ||
+            object->kind == LPR_FD_TABLE_KIND_DEVICE ||
             object->kind == LPR_FD_TABLE_KIND_PIPE ||
             object->kind == LPR_FD_TABLE_KIND_EVENT ||
             object->kind == LPR_FD_TABLE_KIND_TTY ||
@@ -386,6 +399,10 @@ void lpr_control_sync_legacy_flags(uint64_t fd)
     case LPR_FD_TABLE_KIND_FILED:
         object->payload.filed.flags =
             lpr_control_merge_legacy_flags(object->payload.filed.flags, 0, status_flags);
+        break;
+    case LPR_FD_TABLE_KIND_DEVICE:
+        object->payload.device.flags =
+            lpr_control_merge_legacy_flags(object->payload.device.flags, 0, status_flags);
         break;
     case LPR_FD_TABLE_KIND_TTY:
         object->payload.tty.flags =
@@ -783,6 +800,27 @@ int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     return 1;
 }
 
+int lpr_restore_bootstrap_device_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+{
+    const uint64_t major = desc->handle >> 32u;
+    const uint64_t minor = desc->handle & 0xffffffffull;
+    if (major == 0 || major > UINT8_MAX || minor > UINT8_MAX ||
+        !lpr_fd_slot_available(fd)) return 0;
+    if (lpr_control_install_fd(
+            fd, LPR_FD_TABLE_KIND_DEVICE, desc->flags, desc->handle, 0) != 0)
+        return 0;
+    lpr_device_fd_t *device = lpr_fd_device_payload(fd);
+    if (device == 0) {
+        lpr_control_close_fd(fd);
+        return 0;
+    }
+    device->active = 1;
+    device->major = (uint8_t)major;
+    device->minor = (uint8_t)minor;
+    device->flags = desc->flags;
+    return 1;
+}
+
 int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) return 0;
@@ -889,6 +927,8 @@ int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
     switch (desc->kind) {
     case LPR_BOOTSTRAP_FD_FILED:
         return lpr_restore_bootstrap_filed_fd(desc, fd);
+    case LPR_BOOTSTRAP_FD_DEVICE:
+        return lpr_restore_bootstrap_device_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_TTY:
         return lpr_restore_bootstrap_tty_fd(desc, fd);
     case LPR_BOOTSTRAP_FD_DRM:

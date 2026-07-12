@@ -1029,6 +1029,45 @@ int filed_kobox_backend_mkdir(
     return 0;
 }
 
+int filed_kobox_backend_mknod(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t dev,
+    uint64_t *out_object_id)
+{
+    filed_page_t *page = NULL;
+    uint64_t object_id = 0;
+    if (backend == NULL || parent_object_id == 0 || name == NULL || out_object_id == NULL) {
+        return -1;
+    }
+    *out_object_id = 0;
+    if (filed_kobox_backend_is_direct(backend)) {
+        if (backend->direct_ops->mknod == NULL) return -95;
+        uint64_t start_cycles = 0;
+        const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
+        const int status = backend->direct_ops->mknod(
+            backend->direct_ctx, parent_object_id, name, mode, dev, out_object_id);
+        if (status == 0) filed_kobox_backend_mark_dirty(backend);
+        return filed_kobox_direct_finish(
+            backend, STORAGE_OP_MKNOD, start_ns, start_cycles, status);
+    }
+    int status = filed_kobox_wire_page(backend, &page);
+    if (status != 0) return status;
+    storage_mknod_request_t *mknod = (storage_mknod_request_t *)page->addr;
+    mknod->parent_object_id = parent_object_id;
+    mknod->mode = mode;
+    mknod->dev = dev;
+    snprintf(mknod->name, sizeof(mknod->name), "%s", name);
+    status = filed_kobox_call_with_fd(
+        backend, STORAGE_OP_MKNOD, 0, filed_kobox_wire_page_fd(backend, page), &object_id);
+    if (status != 0) return status;
+    *out_object_id = object_id;
+    filed_kobox_backend_mark_dirty(backend);
+    return 0;
+}
+
 int filed_kobox_backend_rmdir(
     filed_kobox_backend_t *backend,
     uint64_t parent_object_id,

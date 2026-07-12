@@ -371,6 +371,32 @@ int filed_tmpfs_backend_mkdir(filed_tmpfs_backend_t *backend, uint64_t parent_ob
     return filed_tmpfs_create_kind(backend, parent_object_id, name, mode, FILED_VNODE_DIRECTORY, out_object_id);
 }
 
+int filed_tmpfs_backend_mknod(
+    filed_tmpfs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t dev,
+    uint64_t *out_object_id)
+{
+    filed_vnode_kind_t kind;
+    switch (mode & FILED_TMPFS_MODE_TYPE_MASK) {
+    case 0010000u: kind = FILED_VNODE_FIFO; break;
+    case 0020000u:
+    case 0060000u: kind = FILED_VNODE_DEVICE; break;
+    case 0140000u: kind = FILED_VNODE_SOCKET; break;
+    default: return -22;
+    }
+    const int status = filed_tmpfs_create_kind(
+        backend, parent_object_id, name, mode, kind, out_object_id);
+    if (status != 0) return status;
+    filed_tmpfs_lock_acquire(&backend->lock);
+    filed_tmpfs_inode_t *inode = filed_tmpfs_find_inode(backend, *out_object_id);
+    if (inode != NULL) inode->rdev = dev;
+    filed_tmpfs_lock_release(&backend->lock);
+    return inode != NULL ? 0 : -5;
+}
+
 int filed_tmpfs_backend_link(
     filed_tmpfs_backend_t *backend,
     uint64_t old_object_id,

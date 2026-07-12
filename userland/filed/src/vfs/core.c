@@ -1015,6 +1015,7 @@ filed_status_t filed_vfs_get_stat_snapshot(
         out_snapshot->blocks = vnode->stat_blocks;
         out_snapshot->nlink = vnode->stat_nlink;
         out_snapshot->kind = vnode->stat_kind;
+        out_snapshot->rdev = vnode->stat_rdev;
         out_snapshot->times_valid = vnode->stat_times_valid;
         out_snapshot->atime_sec = vnode->stat_atime_sec;
         out_snapshot->atime_nsec = vnode->stat_atime_nsec;
@@ -1144,6 +1145,7 @@ filed_status_t filed_vfs_update_stat_snapshot(
         vnode->stat_blocks = snapshot->blocks;
         vnode->stat_nlink = snapshot->nlink;
         vnode->stat_kind = snapshot->kind;
+        vnode->stat_rdev = snapshot->rdev;
         if (snapshot->times_valid) {
             vnode->stat_times_valid = true;
             vnode->stat_atime_sec = snapshot->atime_sec;

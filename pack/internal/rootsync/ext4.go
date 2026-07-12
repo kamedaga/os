@@ -118,7 +118,14 @@ func writeDebugFSCommands(path string, manifest Manifest, span progress.Span) (u
 		if span != nil && i%64 == 0 {
 			span.Set(step, spec.ImagePath)
 		}
-		if spec.IsSymlink {
+		if spec.IsDeviceNode {
+			parent, leaf := splitParent(spec.ImagePath)
+			if _, err := fmt.Fprintf(file, "cd %s\nmknod %s %c %d %d\ncd /\n",
+				debugFSQuote(parent), debugFSQuote(leaf), spec.DeviceType,
+				spec.DeviceMajor, spec.DeviceMinor); err != nil {
+				return 0, err
+			}
+		} else if spec.IsSymlink {
 			target := string(spec.SymlinkTarget)
 			if err := validateDebugFSArg(target); err != nil {
 				return 0, fmt.Errorf("%s: invalid symlink target: %w", spec.ImagePath, err)

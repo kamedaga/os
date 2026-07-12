@@ -5,14 +5,15 @@
 enum {
     LPR_FD_TABLE_KIND_EMPTY = 0u,
     LPR_FD_TABLE_KIND_FILED = 1u,
-    LPR_FD_TABLE_KIND_TTY = 2u,
-    LPR_FD_TABLE_KIND_DRM = 3u,
-    LPR_FD_TABLE_KIND_INPUT = 4u,
-    LPR_FD_TABLE_KIND_PIPE = 5u,
-    LPR_FD_TABLE_KIND_EVENT = 6u,
-    LPR_FD_TABLE_KIND_SOCKET = 7u,
-    LPR_FD_TABLE_KIND_EPOLL = 8u,
-    LPR_FD_TABLE_KIND_DMABUF = 9u,
+    LPR_FD_TABLE_KIND_DEVICE = 2u,
+    LPR_FD_TABLE_KIND_TTY = 3u,
+    LPR_FD_TABLE_KIND_DRM = 4u,
+    LPR_FD_TABLE_KIND_INPUT = 5u,
+    LPR_FD_TABLE_KIND_PIPE = 6u,
+    LPR_FD_TABLE_KIND_EVENT = 7u,
+    LPR_FD_TABLE_KIND_SOCKET = 8u,
+    LPR_FD_TABLE_KIND_EPOLL = 9u,
+    LPR_FD_TABLE_KIND_DMABUF = 10u,
 
     LPR_FD_TABLE_FD_CLOEXEC = 1u << 0,
 
@@ -65,6 +66,14 @@ typedef struct lpr_tty_fd {
     uint64_t handle;
 } lpr_tty_fd_t;
 
+typedef struct lpr_device_fd {
+    uint8_t active;
+    uint8_t major;
+    uint8_t minor;
+    uint8_t reserved0;
+    uint32_t flags;
+} lpr_device_fd_t;
+
 typedef struct lpr_drm_fd {
     uint8_t active;
     uint8_t reserved0;
@@ -97,7 +106,7 @@ typedef struct lpr_socket_fd {
     uint8_t connected;
     uint8_t connecting;
     uint8_t domain;
-    uint8_t reserved_domain[2];
+    uint16_t protocol;
     uint32_t flags;
     uint32_t sndbuf;
     uint32_t rcvbuf;
@@ -131,6 +140,7 @@ typedef struct lpr_epoll_fd {
 typedef enum lpr_fd_kind {
     LPR_FD_NONE = LPR_FD_TABLE_KIND_EMPTY,
     LPR_FD_FILED = LPR_FD_TABLE_KIND_FILED,
+    LPR_FD_DEVICE = LPR_FD_TABLE_KIND_DEVICE,
     LPR_FD_TTY = LPR_FD_TABLE_KIND_TTY,
     LPR_FD_DRM = LPR_FD_TABLE_KIND_DRM,
     LPR_FD_INPUT = LPR_FD_TABLE_KIND_INPUT,
@@ -143,6 +153,7 @@ typedef enum lpr_fd_kind {
 
 typedef union lpr_fd_payload {
     lpr_filed_fd_t filed;
+    lpr_device_fd_t device;
     lpr_pipe_fd_t pipe;
     lpr_event_fd_t eventfd;
     lpr_tty_fd_t tty;

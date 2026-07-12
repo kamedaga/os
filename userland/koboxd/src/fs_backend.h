@@ -23,6 +23,7 @@ typedef struct koboxd_fs_object {
     uint32_t nlink;
     uint64_t size;
     uint64_t blocks;
+    uint64_t rdev;
     int64_t atime_sec;
     int64_t atime_nsec;
     int64_t mtime_sec;
@@ -138,6 +139,13 @@ int koboxd_fs_backend_mkdir(
     uint64_t parent_object_id,
     const char *name,
     uint16_t mode,
+    uint64_t *out_object_id);
+int koboxd_fs_backend_mknod(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint16_t mode,
+    uint64_t dev,
     uint64_t *out_object_id);
 int koboxd_fs_backend_rmdir(
     koboxd_fs_backend_t *backend,

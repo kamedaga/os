@@ -13,6 +13,8 @@ tools/*
 !tools/build_wsl_alpine_sway.sh
 !tools/build_wsl_sway_launcher.sh
 !tools/build_wsl_wayland_shm_client.sh
+!tools/build_wsl_udev_discovery.sh
+!tools/copy_lpr_linux_musl.sh
 !tools/download_kobox_drm_modules.sh
 **/zig-out/
 kernel/.zig-cache/

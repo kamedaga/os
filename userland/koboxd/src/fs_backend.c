@@ -80,6 +80,7 @@ enum {
     KOBOXD_INODE_RWSEM_OFFSET = 0x98,
     KOBOXD_INODE_RWSEM_HELD = 1,
     KOBOXD_INODE_BLOCKS_OFFSET = 0x88,
+    KOBOXD_INODE_RDEV_OFFSET = 0x4c,
     KOBOXD_SUPER_BLOCK_FS_INFO_OFFSET = 0x380,
     KOBOXD_EXT4_SBI_CLUSTER_BITS_OFFSET = 0x54,
     KOBOXD_EXT4_SBI_SUPER_BUFFER_HEAD_OFFSET = 0x60,
@@ -103,6 +104,7 @@ enum {
     KOBOXD_INODE_OP_UNLINK_OFFSET = 0x38,
     KOBOXD_INODE_OP_MKDIR_OFFSET = 0x48,
     KOBOXD_INODE_OP_RMDIR_OFFSET = 0x50,
+    KOBOXD_INODE_OP_MKNOD_OFFSET = 0x58,
     KOBOXD_INODE_OP_RENAME_OFFSET = 0x60,
     KOBOXD_EXT4_FAST_SYMLINK_BYTES = 60,
     KOBOXD_WRITEBACK_CONTROL_SYNC_MODE_OFFSET = 0x20,
@@ -133,6 +135,7 @@ typedef struct koboxd_ext4_operations {
     void *unlink;
     void *mkdir;
     void *rmdir;
+    void *mknod;
     void *rename;
     void *dirty_inode;
     void *write_inode;
@@ -245,6 +248,20 @@ static uint32_t read_u32_field(const void *base, size_t offset)
     return value;
 }
 
+static uint32_t fs_encode_linux_dev(uint32_t kernel_dev)
+{
+    const uint32_t major = kernel_dev >> 20u;
+    const uint32_t minor = kernel_dev & ((1u << 20u) - 1u);
+    return (minor & 0xffu) | (major << 8u) | ((minor & ~0xffu) << 12u);
+}
+
+static uint32_t fs_decode_linux_dev(uint32_t encoded_dev)
+{
+    const uint32_t major = (encoded_dev & 0xfff00u) >> 8u;
+    const uint32_t minor = (encoded_dev & 0xffu) | ((encoded_dev >> 12u) & 0xfff00u);
+    return (major << 20u) | minor;
+}
+
 static uint16_t read_u16_field(const void *base, size_t offset)
 {
     uint16_t value = 0;
@@ -289,6 +306,8 @@ static void fill_object_from_inode(
     object->nlink = inode != NULL ? read_u32_field(inode, KOBOXD_INODE_NLINK_OFFSET) : 0;
     object->size = inode != NULL ? read_u64_field(inode, KOBOXD_INODE_SIZE_OFFSET) : 0;
     object->blocks = inode != NULL ? read_u64_field(inode, KOBOXD_INODE_BLOCKS_OFFSET) : 0;
+    object->rdev = inode != NULL ?
+        fs_encode_linux_dev(read_u32_field(inode, KOBOXD_INODE_RDEV_OFFSET)) : 0;
     object->atime_sec = inode != NULL ? read_i64_field(inode, KOBOXD_INODE_ATIME_SEC_OFFSET) : 0;
     object->atime_nsec = inode != NULL ? (int64_t)read_u32_field(inode, KOBOXD_INODE_ATIME_NSEC_OFFSET) : 0;
     object->mtime_sec = inode != NULL ? read_i64_field(inode, KOBOXD_INODE_MTIME_SEC_OFFSET) : 0;
@@ -557,11 +576,13 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
     out_ops->unlink = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_UNLINK_OFFSET);
     out_ops->mkdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_MKDIR_OFFSET);
     out_ops->rmdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RMDIR_OFFSET);
+    out_ops->mknod = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_MKNOD_OFFSET);
     out_ops->rename = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RENAME_OFFSET);
     const int ready = out_ops->create != NULL &&
         out_ops->unlink != NULL &&
         out_ops->mkdir != NULL &&
         out_ops->rmdir != NULL &&
+        out_ops->mknod != NULL &&
         out_ops->rename != NULL;
     if (ready) {
         cached_module = module;
@@ -1665,6 +1686,61 @@ int koboxd_fs_backend_mkdir(
         mkdir_status,
         (unsigned long long)*out_object_id);
     return mkdir_status;
+}
+
+int koboxd_fs_backend_mknod(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint16_t mode,
+    uint64_t dev,
+    uint64_t *out_object_id)
+{
+    const uint16_t type = mode & KOBOXD_MODE_TYPE_MASK;
+    if (backend == NULL || name == NULL || out_object_id == NULL ||
+        !backend->mounted ||
+        (type != 0010000u && type != 0020000u &&
+         type != 0060000u && type != 0140000u))
+    {
+        return -22;
+    }
+    *out_object_id = 0;
+    koboxd_fs_object_t *parent = NULL;
+    int status = fs_get_parent_object(backend, parent_object_id, &parent);
+    if (status != 0) return status;
+    if (fs_object_by_parent_name(backend, parent->object_id, name) != NULL) return -17;
+
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) return -5;
+    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
+    if (dentry == NULL) return -12;
+    prepare_named_dentry(dentry, parent->dentry, NULL, name);
+
+    static uint8_t mnt_idmap[136];
+    int (*mknod_fn)(void *, void *, void *, uint16_t, uint64_t) = NULL;
+    memcpy(&mknod_fn, &ops.mknod, sizeof(mknod_fn));
+    unsigned long old_gs = 0;
+    const int has_gs = enter_ext4_call(ops.mknod, &old_gs);
+    status = mknod_fn(
+        mnt_idmap,
+        parent->inode,
+        dentry,
+        mode,
+        fs_decode_linux_dev((uint32_t)dev));
+    if (has_gs) kb_shim_leave_kernel_gs(old_gs);
+    void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
+    if (status != 0 || inode == NULL) {
+        free(dentry);
+        return status != 0 ? status : -5;
+    }
+    status = fs_object_register(
+        backend, parent->object_id, inode, dentry, name, 1, out_object_id);
+    if (status != 0) {
+        fs_discard_unregistered_lookup(inode, dentry);
+        return status;
+    }
+    fs_mark_metadata_dirty(backend);
+    return 0;
 }
 
 int koboxd_fs_backend_rmdir(

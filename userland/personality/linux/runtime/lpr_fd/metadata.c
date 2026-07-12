@@ -143,6 +143,13 @@ int64_t lpr_linux_shared_file_vmo(
 
 int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count)
 {
+    if (lpr_linux_device_fd_active(fd)) {
+        if ((lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) {
+            return -LPR_LINUX_EBADF;
+        }
+        (void)buf;
+        return count <= INT64_MAX ? (int64_t)count : -LPR_LINUX_EINVAL;
+    }
     if (lpr_linux_tty_fd_active(fd)) {
         return lpr_tty_io(TERMD_OP_HANDLE_WRITE, fd, buf, count);
     }
@@ -211,6 +218,18 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 {
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (lpr_linux_device_fd_active(fd)) {
+        if ((lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) {
+            return -LPR_LINUX_EBADF;
+        }
+        const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
+        uint64_t total = 0;
+        for (uint64_t i = 0; i < iov_count; i += 1) {
+            if (iov[i].len > INT64_MAX - total) return -LPR_LINUX_EINVAL;
+            total += iov[i].len;
+        }
+        return (int64_t)total;
     }
     if (lpr_linux_tty_fd_active(fd)) {
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 1);
@@ -286,6 +305,10 @@ int64_t lpr_linux_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 
 int64_t lpr_linux_close(uint64_t fd)
 {
+    if (lpr_linux_device_fd_active(fd)) {
+        lpr_control_close_fd(fd);
+        return 0;
+    }
     if (lpr_linux_epoll_fd_active(fd)) {
         lpr_control_close_fd(fd);
         return 0;
@@ -372,7 +395,9 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
                 continue;
             }
             if (cloexec) {
-                if (lpr_linux_tty_fd_active(fd)) {
+                if (lpr_linux_device_fd_active(fd)) {
+                    (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
+                } else if (lpr_linux_tty_fd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
                 } else if (lpr_linux_drm_fd_active(fd)) {
                     (void)lpr_control_set_fd_flags(fd, LPR_LINUX_FD_CLOEXEC);
@@ -438,6 +463,10 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 {
+    if (lpr_linux_device_fd_active(fd)) {
+        (void)offset;
+        return whence <= 2 ? 0 : -LPR_LINUX_EINVAL;
+    }
     if (lpr_linux_tty_fd_active(fd)) {
         return -LPR_LINUX_ESPIPE;
     }
@@ -526,6 +555,20 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
+    if (lpr_linux_device_fd_active(fd)) {
+        switch (cmd) {
+        case LPR_LINUX_F_GETFD: return lpr_control_get_fd_flags(fd);
+        case LPR_LINUX_F_SETFD: return lpr_control_set_fd_flags(fd, arg);
+        case LPR_LINUX_F_GETFL:
+            return lpr_control_get_status_flags(
+                fd, lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE);
+        case LPR_LINUX_F_SETFL: return lpr_control_set_status_flags(fd, arg);
+        case LPR_LINUX_F_DUPFD:
+        case LPR_LINUX_F_DUPFD_CLOEXEC:
+            return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
+        default: return -LPR_LINUX_EINVAL;
+        }
+    }
     if (lpr_linux_epoll_fd_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:
@@ -836,6 +879,7 @@ void lpr_write_linux_stat(void *statbuf, const filed_statx_t *wire)
     st->st_size = (int64_t)wire->size;
     st->st_blksize = 4096;
     st->st_blocks = (int64_t)wire->blocks;
+    st->st_rdev = wire->rdev;
     st->st_atime_sec = wire->atime_sec;
     st->st_atime_nsec = wire->atime_nsec;
     st->st_mtime_sec = wire->mtime_sec;
@@ -848,6 +892,17 @@ int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf)
 {
     if (statbuf == 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    if (lpr_linux_device_fd_active(fd)) {
+        const lpr_device_fd_t *device = lpr_fd_device_payload(fd);
+        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
+        lpr_memset(st, 0, sizeof(*st));
+        st->st_ino = fd + 1u;
+        st->st_nlink = 1;
+        st->st_mode = LPR_LINUX_S_IFCHR | 0666u;
+        st->st_rdev = ((uint64_t)device->major << 8u) | device->minor;
+        st->st_blksize = 4096;
+        return 0;
     }
     if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
@@ -951,30 +1006,6 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     }
     lpr_trace_process_event("newfstatat_begin", dirfd, flags, 0);
     const char *path = (const char *)(uintptr_t)path_raw;
-    if ((int64_t)dirfd == LPR_LINUX_AT_FDCWD && path != 0 &&
-        lpr_strcmp(path, "/dev/dri/card0") == 0) {
-        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
-        lpr_memset(st, 0, sizeof(*st));
-        st->st_ino = 0x64726900ull;
-        st->st_nlink = 1;
-        st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
-        st->st_rdev = (226ull << 8);
-        st->st_blksize = 4096;
-        return 0;
-    }
-    if ((int64_t)dirfd == LPR_LINUX_AT_FDCWD && path != 0 &&
-        lpr_strncmp(path, "/dev/input/event", 16u) == 0 &&
-        path[16] >= '0' && path[16] <= '9' && path[17] == 0) {
-        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
-        const uint32_t event_index = (uint32_t)(path[16] - '0');
-        lpr_memset(st, 0, sizeof(*st));
-        st->st_ino = 0x696e7000ull + event_index;
-        st->st_nlink = 1;
-        st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
-        st->st_rdev = (13ull << 8) | (64u + event_index);
-        st->st_blksize = 4096;
-        return 0;
-    }
     if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && path[0] == 0) {
         const uint64_t empty_known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW;
         if ((flags & ~empty_known_flags) != 0) {
@@ -982,10 +1013,14 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
         }
         return lpr_linux_fstat(dirfd, statbuf);
     }
-    int64_t fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDONLY, 0);
+    uint64_t open_flags = LPR_LINUX_O_RDONLY;
+    if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
+        open_flags |= LPR_LINUX_O_NOFOLLOW;
+    }
+    int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0);
     if (fd == -LPR_LINUX_ENOENT || fd == -LPR_LINUX_EISDIR) {
         fd = lpr_linux_openat(
-            dirfd, path_raw, LPR_LINUX_O_RDONLY | LPR_LINUX_O_DIRECTORY, 0);
+            dirfd, path_raw, open_flags | LPR_LINUX_O_DIRECTORY, 0);
     }
     lpr_trace_process_event("newfstatat_open", dirfd, flags, fd);
     if (fd < 0) {
@@ -995,6 +1030,95 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     lpr_trace_process_event("newfstatat_fstat", (uint64_t)fd, flags, status);
     (void)lpr_linux_close((uint64_t)fd);
     return status;
+}
+
+static uint32_t lpr_linux_dev_major(uint64_t dev)
+{
+    return (uint32_t)(((dev >> 8u) & 0xfffull) | ((dev >> 32u) & 0xfffff000ull));
+}
+
+static uint32_t lpr_linux_dev_minor(uint64_t dev)
+{
+    return (uint32_t)((dev & 0xffull) | ((dev >> 12u) & 0xffffff00ull));
+}
+
+int64_t lpr_linux_statx(
+    uint64_t dirfd,
+    uint64_t path_raw,
+    uint64_t flags,
+    uint64_t mask,
+    uint64_t statxbuf)
+{
+    enum {
+        LPR_STATX_TYPE = 0x00000001u,
+        LPR_STATX_MODE = 0x00000002u,
+        LPR_STATX_NLINK = 0x00000004u,
+        LPR_STATX_UID = 0x00000008u,
+        LPR_STATX_GID = 0x00000010u,
+        LPR_STATX_ATIME = 0x00000020u,
+        LPR_STATX_MTIME = 0x00000040u,
+        LPR_STATX_CTIME = 0x00000080u,
+        LPR_STATX_INO = 0x00000100u,
+        LPR_STATX_SIZE = 0x00000200u,
+        LPR_STATX_BLOCKS = 0x00000400u,
+        LPR_STATX_BASIC_STATS = 0x000007ffu,
+    };
+    const uint64_t known_flags =
+        LPR_LINUX_AT_SYMLINK_NOFOLLOW |
+        LPR_LINUX_AT_EMPTY_PATH |
+        0x800ull | 0x4000ull;
+    if (statxbuf == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    if ((flags & ~known_flags) != 0 || (mask & 0x80000000ull) != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    lpr_linux_stat_t st;
+    lpr_memset(&st, 0, sizeof(st));
+    const int64_t status = lpr_linux_newfstatat(
+        dirfd,
+        path_raw,
+        (uint64_t)(uintptr_t)&st,
+        flags & (LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH));
+    if (status != 0) {
+        return status;
+    }
+
+    lpr_linux_statx_t *out = (lpr_linux_statx_t *)(uintptr_t)statxbuf;
+    lpr_memset(out, 0, sizeof(*out));
+    out->stx_mask = LPR_STATX_BASIC_STATS;
+    out->stx_blksize = st.st_blksize > 0 ? (uint32_t)st.st_blksize : 4096u;
+    out->stx_nlink = st.st_nlink > UINT32_MAX ? UINT32_MAX : (uint32_t)st.st_nlink;
+    out->stx_uid = st.st_uid;
+    out->stx_gid = st.st_gid;
+    out->stx_mode = (uint16_t)st.st_mode;
+    out->stx_ino = st.st_ino;
+    out->stx_size = st.st_size < 0 ? 0 : (uint64_t)st.st_size;
+    out->stx_blocks = st.st_blocks < 0 ? 0 : (uint64_t)st.st_blocks;
+    out->stx_atime.tv_sec = st.st_atime_sec;
+    out->stx_atime.tv_nsec = (uint32_t)st.st_atime_nsec;
+    out->stx_mtime.tv_sec = st.st_mtime_sec;
+    out->stx_mtime.tv_nsec = (uint32_t)st.st_mtime_nsec;
+    out->stx_ctime.tv_sec = st.st_ctime_sec;
+    out->stx_ctime.tv_nsec = (uint32_t)st.st_ctime_nsec;
+    out->stx_rdev_major = lpr_linux_dev_major(st.st_rdev);
+    out->stx_rdev_minor = lpr_linux_dev_minor(st.st_rdev);
+    out->stx_dev_major = lpr_linux_dev_major(st.st_dev);
+    out->stx_dev_minor = lpr_linux_dev_minor(st.st_dev);
+    (void)mask;
+    (void)LPR_STATX_TYPE;
+    (void)LPR_STATX_MODE;
+    (void)LPR_STATX_NLINK;
+    (void)LPR_STATX_UID;
+    (void)LPR_STATX_GID;
+    (void)LPR_STATX_ATIME;
+    (void)LPR_STATX_MTIME;
+    (void)LPR_STATX_CTIME;
+    (void)LPR_STATX_INO;
+    (void)LPR_STATX_SIZE;
+    (void)LPR_STATX_BLOCKS;
+    return 0;
 }
 
 int64_t lpr_linux_access(uint64_t path, uint64_t mode)

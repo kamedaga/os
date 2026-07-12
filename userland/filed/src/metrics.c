@@ -64,6 +64,7 @@ const char *filed_op_name(uint64_t op)
     case FILED_OP_VFS_UNLINK: return "unlink";
     case FILED_OP_VFS_RENAME: return "rename";
     case FILED_OP_VFS_MKDIR: return "mkdir";
+    case FILED_OP_VFS_MKNOD: return "mknod";
     case FILED_OP_VFS_RMDIR: return "rmdir";
     case FILED_OP_VFS_SYMLINK: return "symlink";
     case FILED_OP_VFS_READLINK: return "readlink";

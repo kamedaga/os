@@ -362,6 +362,8 @@ int filed_dispatch_lpr_fd_desc_valid(const filed_exec_lpr_fd_t *fd)
     case FILED_EXEC_LPR_FD_SOCKET:
     case FILED_EXEC_LPR_FD_DMABUF:
         return fd->handle != 0;
+    case FILED_EXEC_LPR_FD_DEVICE:
+        return (fd->handle >> 32u) != 0;
     case FILED_EXEC_LPR_FD_PIPE:
     case FILED_EXEC_LPR_FD_EVENT:
         return 1;

@@ -28,6 +28,7 @@ typedef struct filed_tmpfs_inode {
     uint64_t mode;
     uint64_t size;
     uint64_t generation;
+    uint64_t rdev;
     uint32_t nlink;
     filed_vnode_kind_t kind;
     uint16_t allocated_page_count;

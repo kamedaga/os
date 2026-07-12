@@ -135,6 +135,8 @@ filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind)
     case 0020000u:
     case 0060000u:
         return FILED_VNODE_DEVICE;
+    case 0140000u:
+        return FILED_VNODE_SOCKET;
     default:
         return FILED_VNODE_REGULAR;
     }
@@ -267,6 +269,7 @@ int filed_write_stat_from_backend(
     out->ctime_nsec = stat->ctime_nsec;
     out->object_generation = object_generation;
     out->dir_generation = dir_generation;
+    out->rdev = stat->rdev;
     return 0;
 }
 
@@ -288,6 +291,7 @@ filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
     snapshot.blocks = stat->blocks;
     snapshot.nlink = stat->nlink;
     snapshot.kind = stat->kind;
+    snapshot.rdev = stat->rdev;
     snapshot.times_valid = true;
     snapshot.atime_sec = stat->atime_sec;
     snapshot.atime_nsec = stat->atime_nsec;
@@ -357,6 +361,7 @@ int filed_write_stat_from_snapshot(
     out->blocks = snapshot->blocks;
     out->nlink = snapshot->nlink;
     out->kind = snapshot->kind;
+    out->rdev = snapshot->rdev;
     if (snapshot->times_valid) {
         out->atime_sec = snapshot->atime_sec;
         out->atime_nsec = snapshot->atime_nsec;
@@ -919,7 +924,10 @@ int64_t filed_lookup_and_open_component(
                 &snapshot);
         }
     }
-    if (status == FILED_OK && (open_flags & FILED_OPEN_TRUNCATE) != 0) {
+    if (status == FILED_OK &&
+        (open_flags & FILED_OPEN_TRUNCATE) != 0 &&
+        (backend_stat.kind & 0170000u) == 0100000u)
+    {
         reply_status = filed_cache_flush_object(runtime, object_id);
         if (reply_status != 0) {
             (void)filed_vfs_close_handle(&runtime->vfs, out_open->handle_id);

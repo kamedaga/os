@@ -134,6 +134,13 @@ static void lpr_fd_table_fill_payload(
         file->payload.filed.handle = install->backend_id;
         file->payload.filed.offset = install->offset;
         break;
+    case LPR_FD_TABLE_KIND_DEVICE:
+        file->payload.device.active = 1;
+        file->payload.device.major = (uint8_t)(install->backend_id >> 32u);
+        file->payload.device.minor = (uint8_t)install->backend_id;
+        file->payload.device.flags =
+            (install->status_flags & LPR_FD_TABLE_STATUS_NONBLOCK ? 00004000u : 0u);
+        break;
     case LPR_FD_TABLE_KIND_TTY:
         file->payload.tty.active = 1;
         file->payload.tty.handle = install->backend_id;

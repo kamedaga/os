@@ -163,6 +163,72 @@ filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     return filed_page_result(reply_status, 0);
 }
 
+filed_page_dispatch_result_t filed_dispatch_mknod_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
+    filed_mknod_t *mknod = (filed_mknod_t *)page;
+    filed_vfs_io_decision_t decision;
+    int64_t reply_status = -22;
+    uint64_t object_id = 0;
+    const uint64_t type = mknod != NULL ? mknod->mode & 0170000u : 0;
+    if (runtime == NULL || mknod == NULL ||
+        (type != 0010000u && type != 0020000u &&
+         type != 0060000u && type != 0140000u) ||
+        !filed_name_is_terminated(mknod->name, sizeof(mknod->name)))
+    {
+        return filed_page_result(-22, 0);
+    }
+
+    filed_handle_id_t dir_handle = 0;
+    int dir_owned = 0;
+    char name[FILED_NAME_BYTES];
+    const filed_handle_id_t base_dir = mknod->dir_handle == 0 ?
+        runtime->root_handle_id : (filed_handle_id_t)(uint32_t)mknod->dir_handle;
+    memset(name, 0, sizeof(name));
+    reply_status = filed_resolve_parent_path(
+        runtime, base_dir, mknod->name, FILED_RIGHT_CREATE,
+        &dir_handle, &dir_owned, name, sizeof(name));
+    if (reply_status == 0) {
+        filed_status_t status = filed_vfs_create_prepare(
+            &runtime->vfs, dir_handle, name, &decision);
+        reply_status = filed_status_to_wire(status);
+        if (status == FILED_OK) {
+            reply_status = filed_backend_mknod(
+                runtime, decision.backend_object, name,
+                mknod->mode, mknod->dev, &object_id);
+            if (reply_status == 0 && object_id != 0) {
+                storage_statx_reply_t backend_stat;
+                memset(&backend_stat, 0, sizeof(backend_stat));
+                reply_status = filed_backend_statx(runtime, object_id, &backend_stat);
+                if (reply_status == 0) {
+                    filed_cache_invalidate(runtime, decision.backend_object);
+                    filed_vfs_open_result_t opened;
+                    memset(&opened, 0, sizeof(opened));
+                    status = filed_vfs_create_backend_child(
+                        &runtime->vfs, dir_handle, object_id,
+                        filed_kind_from_unix_type(backend_stat.kind), name,
+                        FILED_RIGHT_STAT, 0, &opened);
+                    reply_status = filed_status_to_wire(status);
+                    if (status == FILED_OK) {
+                        const filed_vfs_stat_snapshot_t snapshot =
+                            filed_stat_snapshot_from_backend(
+                                &backend_stat, opened.handle_id,
+                                opened.object_generation, opened.dir_generation);
+                        (void)filed_vfs_update_stat_snapshot(
+                            &runtime->vfs, object_id, &snapshot);
+                        filed_runtime_publish_backend_object_generation(
+                            runtime, decision.backend_object);
+                        (void)filed_vfs_close_handle(&runtime->vfs, opened.handle_id);
+                    }
+                }
+            }
+        }
+        filed_close_walk_handle(runtime, dir_handle, dir_owned);
+    }
+    return filed_page_result(reply_status, object_id);
+}
+
 filed_page_dispatch_result_t filed_dispatch_symlink_page(
     filed_runtime_t *runtime,
     void *page)

@@ -56,6 +56,7 @@ typedef enum filed_vnode_kind {
     FILED_VNODE_SYMLINK = 3,
     FILED_VNODE_DEVICE = 4,
     FILED_VNODE_FIFO = 5,
+    FILED_VNODE_SOCKET = 6,
 } filed_vnode_kind_t;
 
 typedef enum filed_time_update_flags {
@@ -92,6 +93,7 @@ typedef struct filed_vnode {
     uint64_t stat_blocks;
     uint64_t stat_nlink;
     uint64_t stat_kind;
+    uint64_t stat_rdev;
     bool stat_times_valid;
     int64_t stat_atime_sec;
     int64_t stat_atime_nsec;
@@ -179,6 +181,7 @@ typedef struct filed_vfs_stat_snapshot {
     uint64_t blocks;
     uint64_t nlink;
     uint64_t kind;
+    uint64_t rdev;
     bool times_valid;
     int64_t atime_sec;
     int64_t atime_nsec;

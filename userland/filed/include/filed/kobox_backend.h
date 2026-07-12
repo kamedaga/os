@@ -58,6 +58,7 @@ typedef struct filed_kobox_direct_ops {
     int (*chmod)(void *ctx, uint64_t object_id, uint64_t mode);
     int (*unlink)(void *ctx, uint64_t parent_object_id, const char *name);
     int (*mkdir)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
+    int (*mknod)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t dev, uint64_t *out_object_id);
     int (*rmdir)(void *ctx, uint64_t parent_object_id, const char *name);
     int (*rename)(void *ctx, uint64_t old_parent_object_id, const char *old_name, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
     int (*release_object)(void *ctx, uint64_t object_id);
@@ -137,6 +138,13 @@ int filed_kobox_backend_mkdir(
     uint64_t parent_object_id,
     const char *name,
     uint64_t mode,
+    uint64_t *out_object_id);
+int filed_kobox_backend_mknod(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t dev,
     uint64_t *out_object_id);
 int filed_kobox_backend_rmdir(
     filed_kobox_backend_t *backend,

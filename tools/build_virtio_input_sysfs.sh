@@ -23,7 +23,8 @@ make_device() {
   mkdir -p "${event_dir}" "${out}/dev/input" \
     "${out}/sys/class/input" "${out}/sys/bus/pci" \
     "${out}/sys/bus/virtio" "${out}/sys/bus/input"
-  : >"${out}/dev/input/event${event}"
+  printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' "c 13 ${minor}" \
+    >"${out}/dev/input/event${event}"
   printf '13:%s\n' "${minor}" >"${event_dir}/dev"
   if [[ "${event}" == "0" ]]; then
     printf '%s\n' \

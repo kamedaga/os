@@ -24,10 +24,11 @@ enum {
     STORAGE_OP_UNLINK = 12u,
     STORAGE_OP_RENAME = 13u,
     STORAGE_OP_MKDIR = 14u,
-    STORAGE_OP_RMDIR = 15u,
-    STORAGE_OP_RELEASE_OBJECT = 16u,
-    STORAGE_OP_SYNC_ALL = 17u,
-    STORAGE_OP_DIAG_DUMP = 18u,
+    STORAGE_OP_MKNOD = 15u,
+    STORAGE_OP_RMDIR = 16u,
+    STORAGE_OP_RELEASE_OBJECT = 17u,
+    STORAGE_OP_SYNC_ALL = 18u,
+    STORAGE_OP_DIAG_DUMP = 19u,
 
     STORAGE_ROOT_OBJECT_ID = 1u,
     STORAGE_NAME_BYTES = 96u,
@@ -86,6 +87,13 @@ typedef struct storage_mkdir_request {
     char name[STORAGE_NAME_BYTES];
 } storage_mkdir_request_t;
 
+typedef struct storage_mknod_request {
+    uint64_t parent_object_id;
+    uint64_t mode;
+    uint64_t dev;
+    char name[STORAGE_NAME_BYTES];
+} storage_mknod_request_t;
+
 typedef struct storage_rmdir_request {
     uint64_t parent_object_id;
     char name[STORAGE_NAME_BYTES];
@@ -119,6 +127,7 @@ typedef struct storage_statx_reply {
     int64_t mtime_nsec;
     int64_t ctime_sec;
     int64_t ctime_nsec;
+    uint64_t rdev;
 } storage_statx_reply_t;
 
 typedef struct storage_dirent {
@@ -144,9 +153,10 @@ _Static_assert(sizeof(storage_utimens_request_t) == 48, "storage_utimens_request
 _Static_assert(sizeof(storage_chmod_request_t) == 16, "storage_chmod_request size");
 _Static_assert(sizeof(storage_unlink_request_t) == 104, "storage_unlink_request size");
 _Static_assert(sizeof(storage_mkdir_request_t) == 112, "storage_mkdir_request size");
+_Static_assert(sizeof(storage_mknod_request_t) == 120, "storage_mknod_request size");
 _Static_assert(sizeof(storage_rmdir_request_t) == 104, "storage_rmdir_request size");
 _Static_assert(sizeof(storage_rename_request_t) == 208, "storage_rename_request size");
 _Static_assert(sizeof(storage_io_request_t) == 7712, "storage_io_request size");
-_Static_assert(sizeof(storage_statx_reply_t) == 96, "storage_statx_reply size");
+_Static_assert(sizeof(storage_statx_reply_t) == 104, "storage_statx_reply size");
 _Static_assert(sizeof(storage_dirent_t) == 120, "storage_dirent size");
 _Static_assert(sizeof(storage_getdents_request_t) == 1952, "storage_getdents_request size");

@@ -20,6 +20,7 @@ int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id
         filed_tmpfs_dir_nlink_locked(backend, inode->object_id) :
         inode->nlink;
     out_stat->kind = inode->mode & FILED_TMPFS_MODE_TYPE_MASK;
+    out_stat->rdev = inode->rdev;
     filed_tmpfs_lock_release(&backend->lock);
     return 0;
 }

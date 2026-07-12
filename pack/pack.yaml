@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -91,6 +91,10 @@ skip:
   kinds: []
   includeSkippedArtifacts: false
 apps:
+  linux_dev_null:
+    file: "userland/fixtures/base/dev-null.node"
+    out: "DEVNULL.NODE"
+    rootfs: "/dev/null"
   virtio_input_sysfs:
     file:
       path: ".artifacts/userland-fixtures/virtio-input-sysfs"
@@ -141,6 +145,7 @@ apps:
       rebuild: ["bash", "tools/build_wsl_alpine_input.sh"]
       input:
         - "tools/build_wsl_alpine_input.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
     out: "INPUTROOT"
     rootfs: "/"
   alpine_sway:
@@ -158,6 +163,21 @@ apps:
       path: "tests/fixtures/sway_inventory.sh"
     out: "SWAYINV.SH"
     rootfs: "/cmd/sway_inventory.sh"
+  sway_socket_repeat_script:
+    file:
+      path: "tests/fixtures/sway_socket_repeat.sh"
+    out: "SWAYREP.SH"
+    rootfs: "/cmd/sway_socket_repeat.sh"
+  lpr_udev_discovery:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_udev_discovery.elf"
+      rebuild: ["bash", "tools/build_wsl_udev_discovery.sh"]
+      input:
+        - "tools/build_wsl_udev_discovery.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_udev_discovery.c"
+        - "tools/build_wsl_alpine_input.sh"
+    out: "LPRUDEV.ELF"
+    rootfs: "/cmd/lpr_udev_discovery.elf"
   lpr_sway_launcher:
     file:
       path: ".artifacts/userland-fixtures/lpr_sway_launcher.elf"

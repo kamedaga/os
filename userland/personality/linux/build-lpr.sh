@@ -5,7 +5,7 @@ out="${1:-.artifacts/lpr-linux-x86_64.so}"
 repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 mkdir -p "$(dirname "$repo_root/$out")"
 
-clang \
+/usr/bin/clang \
   -std=c11 \
   -Wall -Wextra -Werror \
   -ffreestanding \

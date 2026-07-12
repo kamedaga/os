@@ -95,16 +95,16 @@ int main(void)
 
     failures += expect(
         FILED_OP_HELLO == 0 && FILED_OP_SESSION_OPEN == 1 &&
-        FILED_OP_VFS_ROOT_STAT == 4 && FILED_OP_EXEC_PATH == 37 &&
-        FILED_OP_SERVICE_SET_NETD_SOCKET == 39 && FILED_OP_SERVICE_SET_DRMD_DRM == 41 &&
-        FILED_OP_SERVICE_SET_INPUTD_INPUT == 42 && FILED_OP_DIAG_PING == 44 &&
-        FILED_OP_DIAG_SET_CACHE_SLOTS == 48,
+        FILED_OP_VFS_ROOT_STAT == 4 && FILED_OP_VFS_MKNOD == 26 &&
+        FILED_OP_EXEC_PATH == 38 && FILED_OP_SERVICE_SET_NETD_SOCKET == 40 &&
+        FILED_OP_SERVICE_SET_DRMD_DRM == 42 && FILED_OP_SERVICE_SET_INPUTD_INPUT == 43 &&
+        FILED_OP_DIAG_PING == 45 && FILED_OP_DIAG_SET_CACHE_SLOTS == 49,
         "filed ops are contiguous from zero");
     failures += expect(
         STORAGE_OP_HELLO == 0 && STORAGE_OP_MOUNT_ROOT == 1 &&
         STORAGE_OP_LOOKUP == 2 && STORAGE_OP_PREAD == 5 &&
-        STORAGE_OP_CREATE == 8 && STORAGE_OP_RELEASE_OBJECT == 16 &&
-        STORAGE_OP_DIAG_DUMP == 18,
+        STORAGE_OP_CREATE == 8 && STORAGE_OP_MKNOD == 15 &&
+        STORAGE_OP_RELEASE_OBJECT == 17 && STORAGE_OP_DIAG_DUMP == 19,
         "storage ops are contiguous from zero");
     failures += expect(
         NETD_OP_HELLO == 0 && NETD_OP_SOCKET == 1 && NETD_OP_SEND == 4 &&
@@ -131,19 +131,20 @@ int main(void)
         "coordinator ops are contiguous from zero");
     failures += expect(sizeof(lprs_process_state_t) == 608, "lprs process state size");
     failures += expect(
-        FILED_EXEC_LPR_FD_DRM == 3 &&
-        FILED_EXEC_LPR_FD_INPUT == 4 &&
-        FILED_EXEC_LPR_FD_PIPE == 5 &&
-        FILED_EXEC_LPR_FD_EVENT == 6 &&
-        FILED_EXEC_LPR_FD_NATIVE == 8 &&
-        FILED_EXEC_LPR_FD_DMABUF == 9 &&
-        FILED_EXEC_LPR_FD_TABLE_VERSION == 5 &&
-        LPR_IMAGE_ABI_VERSION == 8 &&
+        FILED_EXEC_LPR_FD_DEVICE == 2 &&
+        FILED_EXEC_LPR_FD_DRM == 4 &&
+        FILED_EXEC_LPR_FD_INPUT == 5 &&
+        FILED_EXEC_LPR_FD_PIPE == 6 &&
+        FILED_EXEC_LPR_FD_EVENT == 7 &&
+        FILED_EXEC_LPR_FD_NATIVE == 9 &&
+        FILED_EXEC_LPR_FD_DMABUF == 10 &&
+        FILED_EXEC_LPR_FD_TABLE_VERSION == 6 &&
+        LPR_IMAGE_ABI_VERSION == 9 &&
         LPR_CLIENT_FD_KIND_DRMD_HANDLE == 3 &&
         LPR_CLIENT_FD_KIND_INPUTD_HANDLE == 4 &&
         LPR_CLIENT_FD_KIND_PIPE == 5 &&
         LPR_CLIENT_FD_KIND_EVENT == 6,
-        "lpr fd kind order keeps input before pipe and event");
+        "lpr fd kind order keeps device before service handles");
 
     return failures == 0 ? 0 : 1;
 }

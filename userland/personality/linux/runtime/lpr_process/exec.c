@@ -261,6 +261,11 @@ static void lpr_write_exec_local_fd_desc_unlocked(
         desc->flags = (file->payload.filed.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.filed.handle;
         desc->offset_or_counter = file->offset;
+    } else if (file->kind == LPR_FD_TABLE_KIND_DEVICE) {
+        desc->kind = FILED_EXEC_LPR_FD_DEVICE;
+        desc->flags = file->payload.device.flags | status_flags | fd_flags;
+        desc->handle = ((uint64_t)file->payload.device.major << 32u) |
+            file->payload.device.minor;
     } else if (file->kind == LPR_FD_TABLE_KIND_TTY) {
         desc->kind = FILED_EXEC_LPR_FD_TTY;
         desc->flags = (file->payload.tty.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;

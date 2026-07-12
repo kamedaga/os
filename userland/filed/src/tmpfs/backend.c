@@ -49,6 +49,10 @@ uint64_t filed_tmpfs_mode_for_kind(filed_vnode_kind_t kind, uint64_t mode)
     if (kind == FILED_VNODE_SYMLINK) {
         return FILED_TMPFS_MODE_SYMLINK | 0777u;
     }
+    if (kind == FILED_VNODE_DEVICE || kind == FILED_VNODE_FIFO ||
+        kind == FILED_VNODE_SOCKET) {
+        return (mode & FILED_TMPFS_MODE_TYPE_MASK) | perms;
+    }
     return FILED_TMPFS_MODE_REGULAR | (perms == 0 ? 0644u : perms);
 }
 

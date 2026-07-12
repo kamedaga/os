@@ -34,6 +34,7 @@ const (
 	fixedDate                = uint16(((2026 - 1980) << 9) | (1 << 5) | 1)
 	fixedTime                = uint16(0)
 	symlinkMarker            = "CAPABILITYOS_ROOTFS_SYMLINK\n"
+	deviceNodeMarker         = "CAPABILITYOS_ROOTFS_DEVICE\n"
 )
 
 type PartitionRegion struct {
@@ -70,6 +71,10 @@ type FileSpec struct {
 	Size           uint64
 	IsSymlink      bool
 	SymlinkTarget  []byte
+	IsDeviceNode   bool
+	DeviceType     byte
+	DeviceMajor    uint32
+	DeviceMinor    uint32
 	StartCluster   uint32
 	ClusterCount   uint32
 	DirentOffset   int64
@@ -247,6 +252,11 @@ func WriteFAT32(file *os.File, layout Layout, manifest Manifest) (WriteResult, e
 func WriteFAT32WithProgress(file *os.File, layout Layout, manifest Manifest, span progress.Span) (WriteResult, error) {
 	dirs := manifest.Dirs
 	files := manifest.Files
+	for _, spec := range files {
+		if spec.IsDeviceNode {
+			return WriteResult{}, fmt.Errorf("FAT32 does not support device node entry: %s", spec.ImagePath)
+		}
+	}
 	if span != nil {
 		span.SetTotal(int64(len(dirs) + len(files) + 5))
 		span.Set(0, "planning FAT32 layout")
@@ -346,7 +356,9 @@ func Fingerprint(manifest Manifest) ([]byte, error) {
 		writeStringHash(h, "\x00")
 		writeStringHash(h, spec.SourcePath)
 		writeStringHash(h, "\x00")
-		writeStringHash(h, fmt.Sprintf("%d:%d:%t\n", info.Size(), info.ModTime().UnixNano(), spec.IsSymlink))
+		writeStringHash(h, fmt.Sprintf("%d:%d:%t:%t:%c:%d:%d\n",
+			info.Size(), info.ModTime().UnixNano(), spec.IsSymlink, spec.IsDeviceNode,
+			spec.DeviceType, spec.DeviceMajor, spec.DeviceMinor))
 	}
 	return h.Sum(nil), nil
 }
@@ -370,21 +382,44 @@ func fileSpec(imagePath, sourcePath, leaf string, parentIndex int, serial int, o
 	if !opts.CheckSymlinks {
 		return spec, nil
 	}
-	marker := make([]byte, len(symlinkMarker))
+	const markerProbeBytes = 256
 	f, err := os.Open(sourcePath)
 	if err != nil {
 		return FileSpec{}, err
 	}
 	defer f.Close()
-	n, _ := io.ReadFull(f, marker)
-	if n == len(marker) && string(marker) == symlinkMarker {
-		target, err := io.ReadAll(f)
+	markerData := make([]byte, markerProbeBytes)
+	n, err := io.ReadFull(f, markerData)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return FileSpec{}, err
+	}
+	markerData = markerData[:n]
+	markerText := string(markerData)
+	if strings.HasPrefix(markerText, symlinkMarker) {
+		target := append([]byte(nil), markerData[len(symlinkMarker):]...)
+		remainder, err := io.ReadAll(f)
 		if err != nil {
 			return FileSpec{}, err
 		}
+		target = append(target, remainder...)
 		spec.IsSymlink = true
 		spec.SymlinkTarget = target
 		spec.Size = uint64(len(target))
+	} else if strings.HasPrefix(markerText, deviceNodeMarker) {
+		if n == markerProbeBytes {
+			return FileSpec{}, fmt.Errorf("device node marker too large: %s", sourcePath)
+		}
+		var kind byte
+		var major, minor uint32
+		if _, err := fmt.Sscanf(markerText[len(deviceNodeMarker):], "%c %d %d", &kind, &major, &minor); err != nil ||
+			(kind != 'c' && kind != 'b') {
+			return FileSpec{}, fmt.Errorf("invalid device node marker: %s", sourcePath)
+		}
+		spec.IsDeviceNode = true
+		spec.DeviceType = kind
+		spec.DeviceMajor = major
+		spec.DeviceMinor = minor
+		spec.Size = 0
 	}
 	return spec, nil
 }

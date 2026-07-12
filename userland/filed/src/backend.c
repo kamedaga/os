@@ -182,6 +182,22 @@ int filed_backend_mkdir(
     return filed_kobox_backend_mkdir(&runtime->backend, parent_object_id, name, mode, out_object_id);
 }
 
+int filed_backend_mknod(
+    filed_runtime_t *runtime,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t dev,
+    uint64_t *out_object_id)
+{
+    if (filed_tmpfs_backend_is_object(parent_object_id)) {
+        return filed_tmpfs_backend_mknod(
+            &runtime->tmpfs, parent_object_id, name, mode, dev, out_object_id);
+    }
+    return filed_kobox_backend_mknod(
+        &runtime->backend, parent_object_id, name, mode, dev, out_object_id);
+}
+
 int filed_backend_symlink(
     filed_runtime_t *runtime,
     uint64_t parent_object_id,

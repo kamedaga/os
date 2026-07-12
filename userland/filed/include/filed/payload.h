@@ -55,18 +55,19 @@ enum {
     FILED_EXEC_PATCH_INHERIT_HANDLE = 3,
 
     FILED_EXEC_LPR_FD_FILED = 1,
-    FILED_EXEC_LPR_FD_TTY = 2,
-    FILED_EXEC_LPR_FD_DRM = 3,
-    FILED_EXEC_LPR_FD_INPUT = 4,
-    FILED_EXEC_LPR_FD_PIPE = 5,
-    FILED_EXEC_LPR_FD_EVENT = 6,
-    FILED_EXEC_LPR_FD_SOCKET = 7,
-    FILED_EXEC_LPR_FD_NATIVE = 8,
-    FILED_EXEC_LPR_FD_DMABUF = 9,
+    FILED_EXEC_LPR_FD_DEVICE = 2,
+    FILED_EXEC_LPR_FD_TTY = 3,
+    FILED_EXEC_LPR_FD_DRM = 4,
+    FILED_EXEC_LPR_FD_INPUT = 5,
+    FILED_EXEC_LPR_FD_PIPE = 6,
+    FILED_EXEC_LPR_FD_EVENT = 7,
+    FILED_EXEC_LPR_FD_SOCKET = 8,
+    FILED_EXEC_LPR_FD_NATIVE = 9,
+    FILED_EXEC_LPR_FD_DMABUF = 10,
 };
 
 #define FILED_EXEC_LPR_FD_TABLE_MAGIC 0x3144424652504c46ull
-#define FILED_EXEC_LPR_FD_TABLE_VERSION 5ull
+#define FILED_EXEC_LPR_FD_TABLE_VERSION 6ull
 
 typedef struct filed_openat {
     uint64_t dir_handle;
@@ -183,6 +184,7 @@ typedef struct filed_statx {
     int64_t ctime_nsec;
     uint64_t object_generation;
     uint64_t dir_generation;
+    uint64_t rdev;
 } filed_statx_t;
 
 typedef struct filed_utimens {
@@ -226,6 +228,13 @@ typedef struct filed_mkdir {
     uint64_t mode;
     char name[FILED_PATH_BYTES];
 } filed_mkdir_t;
+
+typedef struct filed_mknod {
+    uint64_t dir_handle;
+    uint64_t mode;
+    uint64_t dev;
+    char name[FILED_PATH_BYTES];
+} filed_mknod_t;
 
 typedef struct filed_rmdir {
     uint64_t dir_handle;

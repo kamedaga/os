@@ -69,6 +69,7 @@ static int direct_statx(void *ctx, uint64_t object_id, storage_statx_reply_t *ou
     out_stat->mtime_nsec = stat.mtime_nsec;
     out_stat->ctime_sec = stat.ctime_sec;
     out_stat->ctime_nsec = stat.ctime_nsec;
+    out_stat->rdev = stat.rdev;
     return 0;
 }
 
@@ -271,6 +272,23 @@ static int direct_mkdir(
     return status;
 }
 
+static int direct_mknod(
+    void *ctx,
+    uint64_t parent_object_id,
+    const char *name,
+    uint64_t mode,
+    uint64_t dev,
+    uint64_t *out_object_id)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL) return -22;
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_mknod(
+        backend, parent_object_id, name, (uint16_t)mode, dev, out_object_id);
+    koboxd_fs_backend_unlock(backend);
+    return status;
+}
+
 static int direct_rmdir(void *ctx, uint64_t parent_object_id, const char *name)
 {
     koboxd_fs_backend_t *backend = direct_backend(ctx);
@@ -410,6 +428,7 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .chmod = direct_chmod,
     .unlink = direct_unlink,
     .mkdir = direct_mkdir,
+    .mknod = direct_mknod,
     .rmdir = direct_rmdir,
     .rename = direct_rename,
     .release_object = direct_release_object,

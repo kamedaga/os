@@ -7,21 +7,27 @@ pci="${out}/sys/devices/pci0000:00/0000:00:03.0"
 virtio="${pci}/virtio1"
 
 rm -rf "${out}"
-sysdev="${out}/sys/dev/char/226:0/device"
-mkdir -p "${out}/dev/dri" "${sysdev}/drm/card0" "${virtio}/drm/card0" \
-    "${out}/sys/bus/pci" "${out}/sys/bus/virtio"
-: >"${out}/dev/dri/card0"
-: >"${out}/dev/udmabuf"
-printf '%s\n' '226:0' >"${sysdev}/drm/card0/dev"
-printf '%s\n' '226:0' >"${virtio}/drm/card0/dev"
+card="${virtio}/drm/card0"
+mkdir -p "${out}/dev/dri" "${card}" "${out}/sys/dev/char" \
+    "${out}/sys/class/drm" "${out}/sys/bus/pci" "${out}/sys/bus/virtio" \
+    "${out}/sys/bus/drm"
+printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' 'c 226 0' >"${out}/dev/dri/card0"
+printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' 'c 10 60' >"${out}/dev/udmabuf"
+printf '%s\n' '226:0' >"${card}/dev"
+printf '%s\n' 'MAJOR=226' 'MINOR=0' 'DEVNAME=dri/card0' \
+    'DEVTYPE=drm_minor' >"${card}/uevent"
+printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '/sys/bus/drm' >"${card}/subsystem"
+printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../..' >"${card}/device"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' \
-    '../../../../bus/virtio' >"${sysdev}/subsystem"
+    '../../devices/pci0000:00/0000:00:03.0/virtio1/drm/card0' \
+    >"${out}/sys/dev/char/226:0"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' \
-    '../../../bus/pci' >"${out}/sys/dev/char/226:0/subsystem"
+    '../../devices/pci0000:00/0000:00:03.0/virtio1/drm/card0' \
+    >"${out}/sys/class/drm/card0"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../../../bus/pci' >"${pci}/subsystem"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../../../../bus/virtio' >"${virtio}/subsystem"
 
-for path in "${pci}" "${sysdev}"; do
+for path in "${pci}"; do
     printf '%s\n' '0x1af4' >"${path}/vendor"
     printf '%s\n' '0x1050' >"${path}/device"
     printf '%s\n' '0x1af4' >"${path}/subsystem_vendor"

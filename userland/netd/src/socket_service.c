@@ -1,6 +1,7 @@
 #include "socket_service.h"
 
 #include "libuinet_backend.h"
+#include "netlink_socket.h"
 #include "unix_socket.h"
 #include "netd/ipc_protocol.h"
 #include "pacha/ipc.h"
@@ -85,6 +86,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         if (req->domain == NETD_AF_UNIX) {
             return netd_unix_socket_open(req->type, req->protocol, out_result);
         }
+        if (req->domain == NETD_AF_NETLINK) {
+            return netd_netlink_socket_open(req->type, req->protocol, out_result);
+        }
         return netd_libuinet_socket_open(req->domain, req->type, req->protocol, out_result);
     }
     case NETD_OP_CONNECT: {
@@ -107,8 +111,8 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
             return -22;
         }
         size_t sent = 0;
-        int status = netd_unix_socket_is_handle(req->handle) ?
-            netd_unix_socket_send(req, &sent) : netd_libuinet_socket_send(
+        int status = netd_netlink_socket_is_handle(req->handle) ? -95 :
+            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_send(req, &sent) : netd_libuinet_socket_send(
             req->handle,
             req->data,
             (size_t)req->length,
@@ -129,8 +133,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
             capacity = NETD_IO_BYTES;
         }
         size_t received = 0;
-        int status = netd_unix_socket_is_handle(req->handle) ?
-            netd_unix_socket_recv(req, capacity, &received) :
+        int status = netd_netlink_socket_is_handle(req->handle) ?
+            netd_netlink_socket_recv(req, capacity, &received) :
+            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_recv(req, capacity, &received) :
             netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
         req->length = received;
         *out_result = received;
@@ -143,8 +148,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         netd_poll_t *req = (netd_poll_t *)page;
         uint32_t revents = 0;
         int32_t error = 0;
-        int status = netd_unix_socket_is_handle(req->handle) ?
-            netd_unix_socket_poll(req->handle, req->events, &revents, &error) :
+        int status = netd_netlink_socket_is_handle(req->handle) ?
+            netd_netlink_socket_poll(req->handle, req->events, &revents, &error) :
+            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_poll(req->handle, req->events, &revents, &error) :
             netd_libuinet_socket_poll(req->handle, req->events, &revents, &error);
         req->revents = revents;
         req->error = error;
@@ -155,11 +161,14 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         {
             uint64_t handle = *out_result;
             *out_result = 0;
-            return netd_unix_socket_is_handle(handle) ?
-                netd_unix_socket_close(handle) : netd_libuinet_socket_close(handle);
+            return netd_netlink_socket_is_handle(handle) ? netd_netlink_socket_close(handle) :
+                netd_unix_socket_is_handle(handle) ? netd_unix_socket_close(handle) : netd_libuinet_socket_close(handle);
         }
     case NETD_OP_BIND:
-        return page != NULL ? netd_unix_socket_bind((const netd_unix_path_t *)page) : -22;
+        if (page == NULL) return -22;
+        return netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle) ?
+            netd_netlink_socket_bind((const netd_netlink_bind_t *)page) :
+            netd_unix_socket_bind((const netd_unix_path_t *)page);
     case NETD_OP_LISTEN:
         return netd_unix_socket_listen(*out_result);
     case NETD_OP_ACCEPT:

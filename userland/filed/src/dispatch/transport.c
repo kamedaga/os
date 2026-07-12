@@ -51,6 +51,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_rename_page(runtime, page);
     case FILED_OP_VFS_MKDIR:
         return filed_dispatch_mkdir_page(runtime, page);
+    case FILED_OP_VFS_MKNOD:
+        return filed_dispatch_mknod_page(runtime, page);
     case FILED_OP_VFS_RMDIR:
         return filed_dispatch_rmdir_page(runtime, page);
     case FILED_OP_VFS_SYMLINK:
@@ -618,6 +620,16 @@ static filed_route_result_t filed_dispatch_client_vfs(
             route.result = page_result.result;
         }
         break;
+    case FILED_OP_VFS_MKNOD:
+        if (header->payload_size < sizeof(filed_mknod_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_mknod_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
     case FILED_OP_VFS_RMDIR:
         if (header->payload_size < sizeof(filed_rmdir_t)) {
             route.status = -22;
@@ -852,6 +864,7 @@ static int filed_dispatch_client(
     case FILED_OP_VFS_UNLINK:
     case FILED_OP_VFS_RENAME:
     case FILED_OP_VFS_MKDIR:
+    case FILED_OP_VFS_MKNOD:
     case FILED_OP_VFS_RMDIR:
     case FILED_OP_VFS_SYMLINK:
     case FILED_OP_VFS_READLINK:

@@ -63,6 +63,7 @@ int filed_backend_truncate(filed_runtime_t *runtime, uint64_t object_id, uint64_
 int filed_backend_utimens(filed_runtime_t *runtime, uint64_t object_id, uint32_t mask, int64_t atime_sec, int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec);
 int filed_backend_chmod(filed_runtime_t *runtime, uint64_t object_id, uint64_t mode);
 int filed_backend_unlink(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name);
+int filed_backend_mknod(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t dev, uint64_t *out_object_id);
 int filed_backend_link(filed_runtime_t *runtime, uint64_t old_object_id, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
 int filed_backend_mkdir(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
 int filed_backend_symlink(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name, const char *target, uint64_t target_length, uint64_t *out_object_id);
@@ -153,6 +154,7 @@ int filed_flush_mutated_object(filed_runtime_t *runtime, uint64_t backend_object
 
 filed_page_dispatch_result_t filed_dispatch_unlink_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_mkdir_page(filed_runtime_t *runtime, void *page);
+filed_page_dispatch_result_t filed_dispatch_mknod_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_symlink_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_readlink_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_link_page(filed_runtime_t *runtime, void *page);

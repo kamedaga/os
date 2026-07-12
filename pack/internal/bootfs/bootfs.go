@@ -63,6 +63,10 @@ func BuildImageWithOptions(manifestPath string, outputPath string, opts Options)
 			span.Fail("bootfs symlink unsupported")
 			return Result{}, fmt.Errorf("bootfs does not support symlink entry: %s", spec.ImagePath)
 		}
+		if spec.IsDeviceNode {
+			span.Fail("bootfs device node unsupported")
+			return Result{}, fmt.Errorf("bootfs does not support device node entry: %s", spec.ImagePath)
+		}
 		data, err := os.ReadFile(spec.SourcePath)
 		if err != nil {
 			span.Fail("bootfs file read failed")

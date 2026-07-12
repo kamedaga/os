@@ -20,10 +20,13 @@ enum {
 
     NETD_AF_UNIX = 1,
     NETD_AF_INET = 2,
+    NETD_AF_NETLINK = 16,
     NETD_SOCK_STREAM = 1,
     NETD_SOCK_DGRAM = 2,
+    NETD_SOCK_RAW = 3,
     NETD_IPPROTO_TCP = 6,
     NETD_IPPROTO_UDP = 17,
+    NETD_NETLINK_KOBJECT_UEVENT = 15,
 
     NETD_PAGE_BYTES = 65536,
     NETD_IO_BYTES = NETD_PAGE_BYTES - 256,
@@ -63,6 +66,12 @@ typedef struct netd_unix_path {
     uint32_t reserved0;
     char path[108];
 } netd_unix_path_t;
+
+typedef struct netd_netlink_bind {
+    uint64_t handle;
+    uint32_t pid;
+    uint32_t groups;
+} netd_netlink_bind_t;
 
 typedef struct netd_accept {
     uint64_t handle;

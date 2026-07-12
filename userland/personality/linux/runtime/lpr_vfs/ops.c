@@ -359,9 +359,36 @@ int64_t lpr_linux_fchownat(uint64_t dirfd, uint64_t path, uint64_t owner, uint64
 
 int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t dev)
 {
-    (void)mode;
-    (void)dev;
-    return lpr_linux_faccessat(dirfd, path, 0, 0) == 0 ? -LPR_LINUX_EEXIST : 0;
+    const uint64_t type = mode & LPR_LINUX_S_IFMT;
+    if (path == 0) return -LPR_LINUX_EFAULT;
+    if (type != LPR_LINUX_S_IFIFO && type != LPR_LINUX_S_IFCHR &&
+        type != LPR_LINUX_S_IFBLK && type != LPR_LINUX_S_IFSOCK)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    const char *path_string = (const char *)(uintptr_t)path;
+    uint64_t dir_handle = 0;
+    int64_t status = lpr_dir_handle_for(dirfd, path_string, &dir_handle);
+    if (status != 0) return status;
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    filed_mknod_t *request = (filed_mknod_t *)page;
+    lpr_memset(request, 0, sizeof(*request));
+    request->dir_handle = dir_handle;
+    request->mode = type | ((mode & 07777ull) & ~lpr_linux_umask_value);
+    request->dev = dev;
+    status = lpr_copy_path(request->name, sizeof(request->name), path_string);
+    uint64_t ignored = 0;
+    if (status == 0) {
+        status = lpr_filed_call(FILED_OP_VFS_MKNOD, page_fd, 0, &ignored);
+    }
+    lpr_destroy_wire_page(page_fd, page);
+    if (status == 0) {
+        lpr_readlink_cache_clear();
+        lpr_page_cache_clear();
+    }
+    return status;
 }
 
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
@@ -540,6 +567,28 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
     if (fd < 0) {
         (void)lpr_filed_close_handle(handle);
         return fd;
+    }
+    lpr_linux_stat_t st;
+    lpr_memset(&st, 0, sizeof(st));
+    if (lpr_linux_fstat((uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&st) == 0 &&
+        (st.st_mode & LPR_LINUX_S_IFMT) == LPR_LINUX_S_IFCHR &&
+        st.st_rdev == ((1ull << 8u) | 3ull))
+    {
+        const int64_t close_status = lpr_linux_close((uint64_t)(uint32_t)fd);
+        if (close_status != 0) return close_status;
+        const uint64_t device_id = (1ull << 32u) | 3ull;
+        const int install = lpr_control_install_fd(
+            (uint64_t)(uint32_t)fd, LPR_FD_TABLE_KIND_DEVICE, flags, device_id, 0);
+        if (install != 0) return install;
+        lpr_device_fd_t *device = lpr_fd_device_payload((uint64_t)(uint32_t)fd);
+        if (device == 0) {
+            lpr_control_close_fd((uint64_t)(uint32_t)fd);
+            return -LPR_LINUX_EIO;
+        }
+        device->active = 1;
+        device->major = 1;
+        device->minor = 3;
+        device->flags = (uint32_t)flags;
     }
     return fd;
 }

@@ -172,6 +172,41 @@ typedef struct lpr_linux_stat {
     int64_t __unused[3];
 } lpr_linux_stat_t;
 
+typedef struct lpr_linux_statx_timestamp {
+    int64_t tv_sec;
+    uint32_t tv_nsec;
+    int32_t reserved;
+} lpr_linux_statx_timestamp_t;
+
+typedef struct lpr_linux_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t reserved0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    lpr_linux_statx_timestamp_t stx_atime;
+    lpr_linux_statx_timestamp_t stx_btime;
+    lpr_linux_statx_timestamp_t stx_ctime;
+    lpr_linux_statx_timestamp_t stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t stx_mnt_id;
+    uint32_t stx_dio_mem_align;
+    uint32_t stx_dio_offset_align;
+    uint64_t reserved1[12];
+} lpr_linux_statx_t;
+
+_Static_assert(sizeof(lpr_linux_statx_t) == 256, "Linux x86_64 statx layout");
+
 typedef struct lpr_linux_iovec {
     uint64_t base;
     uint64_t len;
@@ -846,6 +881,8 @@ uint64_t lpr_exec_fd_table_capacity_for_count(uint64_t count);
 uint64_t lpr_fd_table_next_capacity(uint64_t required_capacity);
 uint64_t lpr_filed_control_offset(uint64_t fd);
 uint64_t lpr_linux_filed_fd_handle(uint64_t fd);
+lpr_device_fd_t *lpr_fd_device_payload(uint64_t fd);
+int lpr_linux_device_fd_active(uint64_t fd);
 uint64_t lpr_linux_ignored_signal_mask(void);
 uint64_t lpr_linux_signal_bit(uint32_t sig);
 uint64_t lpr_linux_unblockable_signal_mask(void);
@@ -911,6 +948,7 @@ void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, u
 void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status);
 void lpr_write_exec_local_fd_desc(filed_exec_lpr_fd_t *desc, uint64_t fd);
 void lpr_write_linux_stat(void *statbuf, const filed_statx_t *wire);
+int64_t lpr_linux_statx(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mask, uint64_t statxbuf);
 void lpr_zero_bytes(void *ptr, uint64_t len);
 
 #endif

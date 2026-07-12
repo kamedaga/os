@@ -62,6 +62,7 @@ static const char *koboxd_fs_op_name(uint64_t op)
     case STORAGE_OP_UNLINK: return "unlink";
     case STORAGE_OP_RENAME: return "rename";
     case STORAGE_OP_MKDIR: return "mkdir";
+    case STORAGE_OP_MKNOD: return "mknod";
     case STORAGE_OP_RMDIR: return "rmdir";
     case STORAGE_OP_RELEASE_OBJECT: return "release_object";
     case STORAGE_OP_SYNC_ALL: return "sync_all";
@@ -240,6 +241,7 @@ static void handle_statx(koboxd_fs_request_ctx_t *ctx)
     wire_stat->mtime_nsec = stat.mtime_nsec;
     wire_stat->ctime_sec = stat.ctime_sec;
     wire_stat->ctime_nsec = stat.ctime_nsec;
+    wire_stat->rdev = stat.rdev;
     ctx->result = stat.size;
 }
 
@@ -375,6 +377,22 @@ static void handle_mkdir(koboxd_fs_request_ctx_t *ctx)
     ctx->result = object_id;
 }
 
+static void handle_mknod(koboxd_fs_request_ctx_t *ctx)
+{
+    if (map_fs_wire_page(ctx) != 0) return;
+    storage_mknod_request_t *mknod = (storage_mknod_request_t *)ctx->mapped;
+    mknod->name[STORAGE_NAME_BYTES - 1] = '\0';
+    uint64_t object_id = 0;
+    ctx->reply_status = koboxd_fs_backend_mknod(
+        ctx->backend,
+        mknod->parent_object_id,
+        mknod->name,
+        (uint16_t)mknod->mode,
+        mknod->dev,
+        &object_id);
+    ctx->result = object_id;
+}
+
 static void handle_rmdir(koboxd_fs_request_ctx_t *ctx)
 {
     if (map_fs_wire_page(ctx) != 0) {
@@ -484,6 +502,9 @@ static void dispatch_fs_request(koboxd_fs_request_ctx_t *ctx)
         break;
     case STORAGE_OP_MKDIR:
         handle_mkdir(ctx);
+        break;
+    case STORAGE_OP_MKNOD:
+        handle_mknod(ctx);
         break;
     case STORAGE_OP_RMDIR:
         handle_rmdir(ctx);
