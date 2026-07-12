@@ -524,10 +524,10 @@ int64_t filed_splice_symlink_target(
         if (target_length + 1u + rest_length >= out_path_size) {
             return filed_status_to_wire(FILED_ERR_INVALID);
         }
-        memset(out_path, 0, out_path_size);
+        /* rest may point into out_path while resolving a second symlink. */
+        memmove(out_path + target_length + 1u, rest, rest_length + 1u);
         memcpy(out_path, target, (size_t)target_length);
         out_path[target_length] = '/';
-        memcpy(out_path + target_length + 1u, rest, rest_length + 1u);
     } else {
         if (target_length >= out_path_size) {
             return filed_status_to_wire(FILED_ERR_INVALID);

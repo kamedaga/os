@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -163,6 +163,11 @@ apps:
       path: "tests/fixtures/sway_inventory.sh"
     out: "SWAYINV.SH"
     rootfs: "/cmd/sway_inventory.sh"
+  sway_first_frame_script:
+    file:
+      path: "tests/fixtures/sway_first_frame.sh"
+    out: "SWAYM55.SH"
+    rootfs: "/cmd/sway_first_frame.sh"
   sway_socket_repeat_script:
     file:
       path: "tests/fixtures/sway_socket_repeat.sh"

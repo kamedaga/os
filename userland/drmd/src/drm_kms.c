@@ -9,6 +9,7 @@
 #include <pacha/ipc.h>
 
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 #include <time.h>
 
@@ -26,6 +27,10 @@ enum {
     DRMD_KMS_CONNECTOR_ID = 31,
     DRMD_KMS_ENCODER_ID = 41,
     DRMD_KMS_PLANE_ID = 61,
+    DRMD_KMS_DPMS_PROP_ID = 101,
+    DRMD_KMS_PLANE_TYPE_PROP_ID = 102,
+    DRMD_KMS_IN_FORMATS_PROP_ID = 103,
+    DRMD_KMS_IN_FORMATS_BLOB_ID = 201,
     DRMD_VIRTIO_GPU_OBJECT_BYTES = 0x2c0,
     DRMD_GEM_DEV_OFFSET = 0x08,
     DRMD_POLLIN = 0x0001,
@@ -105,11 +110,15 @@ typedef struct drmd_kms_fb {
     uint32_t height;
     uint32_t pitch;
     uint32_t format;
+    drmd_kms_buffer_t *buffer;
 } drmd_kms_fb_t;
 
 typedef struct drmd_kms_event_file {
     int active;
+    int universal_planes;
+    int authenticated;
     uint64_t owner;
+    uint32_t magic;
     uint32_t head;
     uint32_t count;
     drmd_event_vblank_t events[DRMD_KMS_EVENT_QUEUE_MAX];
@@ -121,8 +130,11 @@ typedef struct drmd_kms_state {
     uint32_t next_handle;
     uint32_t next_fb;
     uint64_t next_token;
+    uint32_t next_magic;
     uint32_t current_fb;
     uint32_t sequence;
+    uint32_t delivered_flip_events;
+    uint32_t dpms;
     drmd_modeinfo_t current_mode;
     kb_device_backend_t *device_backend;
     void *drm_device;
@@ -151,6 +163,25 @@ typedef struct drmd_kms_owner_context {
 } drmd_kms_owner_context_t;
 
 static drmd_kms_state_t kms;
+
+typedef struct drmd_format_modifier_blob {
+    uint32_t version;
+    uint32_t flags;
+    uint32_t count_formats;
+    uint32_t formats_offset;
+    uint32_t count_modifiers;
+    uint32_t modifiers_offset;
+    uint32_t format;
+    uint32_t pad;
+    struct {
+        uint64_t formats;
+        uint32_t offset;
+        uint32_t pad;
+        uint64_t modifier;
+    } modifier;
+} drmd_format_modifier_blob_t;
+
+_Static_assert(sizeof(drmd_format_modifier_blob_t) == 56, "format modifier blob ABI");
 
 static int enter_module(drmd_kms_owner_context_t *context)
 {
@@ -221,6 +252,8 @@ int drmd_kms_init(struct drmd_drm_island *island)
     kms.next_handle = 1;
     kms.next_fb = 71;
     kms.next_token = 1;
+    kms.next_magic = 1;
+    kms.dpms = DRMD_MODE_DPMS_ON;
     kms.device_backend = (kb_device_backend_t *)island->device_backend;
     kms.drm_device = kb_drm_primary_device();
     kms.vgdev = kb_drm_device_private(kms.drm_device);
@@ -545,8 +578,16 @@ static int add_fb(uint64_t owner, uint32_t handle, uint32_t width, uint32_t heig
             fb->height = height;
             fb->pitch = pitch;
             fb->format = format;
+            fb->buffer = buffer;
             buffer->fb_refs++;
             *out_id = fb->id;
+            size_t active_fbs = 0;
+            for (size_t j = 0; j < DRMD_KMS_FB_MAX; j++) {
+                if (kms.fb[j].active && kms.fb[j].format == DRMD_FORMAT_XRGB8888) active_fbs++;
+            }
+            if (active_fbs == 2) {
+                printf("[drmd] kms framebuffer pool format=XR24 active=2\n");
+            }
             return 0;
         }
     }
@@ -662,10 +703,9 @@ int drmd_kms_prime_release(uint64_t token)
     return 0;
 }
 
-static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
+static int submit_scanout_fb(drmd_kms_fb_t *fb)
 {
-    drmd_kms_gem_handle_t *gem = fb == NULL ? NULL : find_gem_handle(owner, fb->handle);
-    drmd_kms_buffer_t *buffer = gem != NULL ? gem->buffer : NULL;
+    drmd_kms_buffer_t *buffer = fb != NULL ? fb->buffer : NULL;
     if (buffer == NULL) {
         return -2;
     }
@@ -685,9 +725,9 @@ static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
     return 0;
 }
 
-static int scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
+static int scanout_fb(drmd_kms_fb_t *fb)
 {
-    const int status = submit_scanout_fb(owner, fb);
+    const int status = submit_scanout_fb(fb);
     if (status != 0) {
         return status;
     }
@@ -696,9 +736,31 @@ static int scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
     return 0;
 }
 
+static int disable_scanout(void)
+{
+    drmd_kms_owner_context_t context;
+    const int entered = enter_module(&context);
+    kms.set_scanout(kms.vgdev, 0, 0, 0, 0, 0, 0);
+    kms.notify(kms.vgdev);
+    if (entered) leave_module(&context);
+    pump_device();
+    kms.current_fb = 0;
+    return 0;
+}
+
 static int require_master(uint64_t handle)
 {
     return kms.master_handle == handle ? 0 : -13;
+}
+
+static drmd_kms_event_file_t *find_event_file_magic(uint32_t magic)
+{
+    for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; i++) {
+        if (kms.event_files[i].active && kms.event_files[i].magic == magic) {
+            return &kms.event_files[i];
+        }
+    }
+    return NULL;
 }
 
 static void queue_flip_event(
@@ -722,6 +784,16 @@ static void queue_flip_event(
     event->crtc_id = DRMD_KMS_CRTC_ID;
     event_file->count++;
     kms.current_fb = fb_id;
+}
+
+static void note_flip_event_delivered(const drmd_event_vblank_t *event)
+{
+    if (event == NULL || event->type != DRMD_EVENT_FLIP_COMPLETE) return;
+    kms.delivered_flip_events++;
+    if (kms.delivered_flip_events == 2) {
+        printf("[drmd] legacy page-flip events delivered count=2 crtc=%u\n",
+            event->crtc_id);
+    }
 }
 
 static int ioctl_resources(drmd_kms_resources_wire_t *wire)
@@ -756,10 +828,15 @@ static int ioctl_connector(drmd_kms_connector_wire_t *wire)
     if (wire == NULL || wire->value.connector_id != DRMD_KMS_CONNECTOR_ID) return -2;
     const uint32_t mode_capacity = wire->value.count_modes;
     const uint32_t encoder_capacity = wire->value.count_encoders;
+    const uint32_t prop_capacity = wire->value.count_props;
     if (mode_capacity != 0) wire->modes[0] = kms.current_mode;
     if (encoder_capacity != 0) wire->encoders[0] = DRMD_KMS_ENCODER_ID;
+    if (prop_capacity != 0) {
+        wire->props[0] = DRMD_KMS_DPMS_PROP_ID;
+        wire->prop_values[0] = kms.dpms;
+    }
     wire->value.count_modes = 1;
-    wire->value.count_props = 0;
+    wire->value.count_props = 1;
     wire->value.count_encoders = 1;
     wire->value.encoder_id = DRMD_KMS_ENCODER_ID;
     wire->value.connector_type = DRMD_MODE_CONNECTOR_VIRTUAL;
@@ -771,11 +848,133 @@ static int ioctl_connector(drmd_kms_connector_wire_t *wire)
     return 0;
 }
 
+static int ioctl_object_properties(drmd_kms_object_properties_wire_t *wire)
+{
+    if (wire == NULL) return -22;
+    const uint32_t capacity = wire->value.count_props;
+    uint32_t count = 0;
+    if (wire->value.obj_id == DRMD_KMS_CONNECTOR_ID &&
+        (wire->value.obj_type == DRMD_MODE_OBJECT_ANY ||
+         wire->value.obj_type == DRMD_MODE_OBJECT_CONNECTOR)) {
+        if (capacity != 0) {
+            wire->props[0] = DRMD_KMS_DPMS_PROP_ID;
+            wire->prop_values[0] = kms.dpms;
+        }
+        count = 1;
+    } else if (wire->value.obj_id == DRMD_KMS_CRTC_ID &&
+        (wire->value.obj_type == DRMD_MODE_OBJECT_ANY ||
+         wire->value.obj_type == DRMD_MODE_OBJECT_CRTC)) {
+        count = 0;
+    } else if (wire->value.obj_id == DRMD_KMS_PLANE_ID &&
+        (wire->value.obj_type == DRMD_MODE_OBJECT_ANY ||
+         wire->value.obj_type == DRMD_MODE_OBJECT_PLANE)) {
+        if (capacity != 0) {
+            wire->props[0] = DRMD_KMS_PLANE_TYPE_PROP_ID;
+            wire->prop_values[0] = DRMD_MODE_PLANE_TYPE_PRIMARY;
+        }
+        if (capacity > 1) {
+            wire->props[1] = DRMD_KMS_IN_FORMATS_PROP_ID;
+            wire->prop_values[1] = DRMD_KMS_IN_FORMATS_BLOB_ID;
+        }
+        count = 2;
+    } else {
+        return -2;
+    }
+    wire->value.count_props = count;
+    return 0;
+}
+
+static void set_property_enum(
+    drmd_mode_property_enum_t *entry,
+    uint64_t value,
+    const char *name)
+{
+    entry->value = value;
+    strncpy(entry->name, name, sizeof(entry->name) - 1);
+}
+
+static int ioctl_property(drmd_kms_property_wire_t *wire)
+{
+    if (wire == NULL) return -22;
+    const uint32_t enum_capacity = wire->value.count_enum_blobs;
+    memset(wire->value.name, 0, sizeof(wire->value.name));
+    wire->value.count_values = 0;
+    switch (wire->value.prop_id) {
+    case DRMD_KMS_DPMS_PROP_ID:
+        wire->value.flags = DRMD_MODE_PROP_ENUM;
+        memcpy(wire->value.name, "DPMS", 5);
+        if (enum_capacity > 0) set_property_enum(&wire->enums[0], DRMD_MODE_DPMS_ON, "On");
+        if (enum_capacity > 1) set_property_enum(&wire->enums[1], DRMD_MODE_DPMS_STANDBY, "Standby");
+        if (enum_capacity > 2) set_property_enum(&wire->enums[2], DRMD_MODE_DPMS_SUSPEND, "Suspend");
+        if (enum_capacity > 3) set_property_enum(&wire->enums[3], DRMD_MODE_DPMS_OFF, "Off");
+        wire->value.count_enum_blobs = 4;
+        return 0;
+    case DRMD_KMS_PLANE_TYPE_PROP_ID:
+        wire->value.flags = DRMD_MODE_PROP_ENUM | DRMD_MODE_PROP_IMMUTABLE;
+        memcpy(wire->value.name, "type", 5);
+        if (enum_capacity > 0) set_property_enum(&wire->enums[0], DRMD_MODE_PLANE_TYPE_OVERLAY, "Overlay");
+        if (enum_capacity > 1) set_property_enum(&wire->enums[1], DRMD_MODE_PLANE_TYPE_PRIMARY, "Primary");
+        if (enum_capacity > 2) set_property_enum(&wire->enums[2], DRMD_MODE_PLANE_TYPE_CURSOR, "Cursor");
+        wire->value.count_enum_blobs = 3;
+        return 0;
+    case DRMD_KMS_IN_FORMATS_PROP_ID:
+        wire->value.flags = DRMD_MODE_PROP_BLOB | DRMD_MODE_PROP_IMMUTABLE;
+        memcpy(wire->value.name, "IN_FORMATS", 11);
+        wire->value.count_enum_blobs = 0;
+        return 0;
+    default:
+        return -2;
+    }
+}
+
+static int ioctl_property_blob(drmd_kms_property_blob_wire_t *wire)
+{
+    if (wire == NULL || wire->value.blob_id != DRMD_KMS_IN_FORMATS_BLOB_ID) return -2;
+    drmd_format_modifier_blob_t blob;
+    memset(&blob, 0, sizeof(blob));
+    blob.version = 1;
+    blob.count_formats = 1;
+    blob.formats_offset = offsetof(drmd_format_modifier_blob_t, format);
+    blob.count_modifiers = 1;
+    blob.modifiers_offset = offsetof(drmd_format_modifier_blob_t, modifier);
+    blob.format = DRMD_FORMAT_XRGB8888;
+    blob.modifier.formats = 1;
+    blob.modifier.modifier = DRMD_FORMAT_MOD_LINEAR;
+    if (wire->value.length != 0) {
+        uint32_t length = wire->value.length < sizeof(blob) ? wire->value.length : sizeof(blob);
+        memcpy(wire->data, &blob, length);
+    }
+    wire->value.length = sizeof(blob);
+    return 0;
+}
+
 int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request, int *out_handled)
 {
     if (out_handled == NULL || request == NULL || !kms.ready) return -22;
     *out_handled = 1;
     switch ((uint32_t)request->request) {
+    case DRMD_IOCTL_GET_MAGIC: {
+        if (request->data_size < sizeof(uint32_t)) return -22;
+        drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+        if (event_file == NULL) return -9;
+        if (event_file->magic == 0) {
+            event_file->magic = kms.next_magic++;
+            if (kms.next_magic == 0) kms.next_magic = 1;
+        }
+        *(uint32_t *)request->data = event_file->magic;
+        return 0;
+    }
+    case DRMD_IOCTL_AUTH_MAGIC: {
+        if (require_master(request->handle) != 0) return -13;
+        if (request->data_size < sizeof(uint32_t)) return -22;
+        const uint32_t magic = *(const uint32_t *)request->data;
+        if (magic == 0) return -22;
+        drmd_kms_event_file_t *event_file = find_event_file_magic(magic);
+        if (event_file == NULL) return -22;
+        event_file->authenticated = 1;
+        event_file->magic = 0;
+        return 0;
+    }
     case DRMD_IOCTL_GET_CAP: {
         if (request->data_size < sizeof(drmd_get_cap_t)) return -22;
         drmd_get_cap_t *cap = (void *)request->data;
@@ -786,6 +985,10 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
         case DRMD_CAP_PRIME:
             cap->value = DRMD_PRIME_CAP_IMPORT | DRMD_PRIME_CAP_EXPORT;
             return 0;
+        case DRMD_CAP_TIMESTAMP_MONOTONIC:
+        case DRMD_CAP_CRTC_IN_VBLANK_EVENT:
+            cap->value = 1;
+            return 0;
         case DRMD_CAP_ADDFB2_MODIFIERS:
             cap->value = 1;
             return 0;
@@ -793,9 +996,26 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
             return -22;
         }
     }
+    case DRMD_IOCTL_SET_CLIENT_CAP: {
+        if (request->data_size < sizeof(drmd_set_client_cap_t)) return -22;
+        const drmd_set_client_cap_t *cap = (const void *)request->data;
+        if (cap->value > 1) return -22;
+        if (cap->capability == DRMD_CLIENT_CAP_ATOMIC) {
+            return cap->value == 0 ? 0 : -95;
+        }
+        if (cap->capability != DRMD_CLIENT_CAP_UNIVERSAL_PLANES) return -95;
+        drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+        if (event_file == NULL) return -9;
+        event_file->universal_planes = cap->value != 0;
+        return 0;
+    }
     case DRMD_IOCTL_SET_MASTER:
         if (kms.master_handle != 0 && kms.master_handle != request->handle) return -16;
         kms.master_handle = request->handle;
+        {
+            drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+            if (event_file != NULL) event_file->authenticated = 1;
+        }
         return 0;
     case DRMD_IOCTL_DROP_MASTER:
         if (kms.master_handle != request->handle) return -22;
@@ -814,6 +1034,27 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
         return request->data_size >= sizeof(drmd_kms_resources_wire_t) ? ioctl_resources((void *)request->data) : -22;
     case DRMD_IOCTL_MODE_GETCONNECTOR:
         return request->data_size >= sizeof(drmd_kms_connector_wire_t) ? ioctl_connector((void *)request->data) : -22;
+    case DRMD_IOCTL_MODE_GETPROPERTY:
+        return request->data_size >= sizeof(drmd_kms_property_wire_t) ?
+            ioctl_property((void *)request->data) : -22;
+    case DRMD_IOCTL_MODE_GETPROPBLOB:
+        return request->data_size >= sizeof(drmd_kms_property_blob_wire_t) ?
+            ioctl_property_blob((void *)request->data) : -22;
+    case DRMD_IOCTL_MODE_OBJ_GETPROPERTIES:
+        return request->data_size >= sizeof(drmd_kms_object_properties_wire_t) ?
+            ioctl_object_properties((void *)request->data) : -22;
+    case DRMD_IOCTL_MODE_CREATE_LEASE:
+        return -95;
+    case DRMD_IOCTL_MODE_SETPROPERTY: {
+        if (require_master(request->handle) != 0 ||
+            request->data_size < sizeof(drmd_mode_connector_set_property_t)) return -13;
+        const drmd_mode_connector_set_property_t *property = (const void *)request->data;
+        if (property->connector_id != DRMD_KMS_CONNECTOR_ID ||
+            property->prop_id != DRMD_KMS_DPMS_PROP_ID ||
+            property->value > DRMD_MODE_DPMS_OFF) return -22;
+        kms.dpms = property->value;
+        return kms.dpms == DRMD_MODE_DPMS_ON ? 0 : disable_scanout();
+    }
     case DRMD_IOCTL_MODE_GETENCODER: {
         if (request->data_size < sizeof(drmd_mode_get_encoder_t)) return -22;
         drmd_mode_get_encoder_t *encoder = (void *)request->data;
@@ -839,13 +1080,25 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
     case DRMD_IOCTL_MODE_SETCRTC: {
         if (require_master(request->handle) != 0 || request->data_size < sizeof(drmd_kms_crtc_wire_t)) return -13;
         drmd_kms_crtc_wire_t *wire = (void *)request->data;
-        if (wire->value.crtc_id != DRMD_KMS_CRTC_ID || wire->value.count_connectors != 1 ||
+        if (wire->value.crtc_id != DRMD_KMS_CRTC_ID) return -22;
+        if (wire->value.count_connectors == 0 && wire->value.fb_id == 0 &&
+            !wire->value.mode_valid) return disable_scanout();
+        if (wire->value.count_connectors != 1 ||
             wire->connectors[0] != DRMD_KMS_CONNECTOR_ID || !wire->value.mode_valid ||
             wire->value.mode.hdisplay == 0 || wire->value.mode.vdisplay == 0) return -22;
         drmd_kms_fb_t *fb = find_fb(request->handle, wire->value.fb_id);
         if (fb == NULL || fb->width != wire->value.mode.hdisplay || fb->height != wire->value.mode.vdisplay) return -22;
         kms.current_mode = wire->value.mode;
-        return scanout_fb(request->handle, fb);
+        return scanout_fb(fb);
+    }
+    case DRMD_IOCTL_MODE_CURSOR: {
+        if (require_master(request->handle) != 0 ||
+            request->data_size < sizeof(drmd_mode_cursor_t)) return -13;
+        const drmd_mode_cursor_t *cursor = (const void *)request->data;
+        if (cursor->crtc_id != DRMD_KMS_CRTC_ID) return -2;
+        if (cursor->flags == DRMD_MODE_CURSOR_BO && cursor->handle == 0 &&
+            cursor->width == 0 && cursor->height == 0) return 0;
+        return -95;
     }
     case DRMD_IOCTL_MODE_CREATE_DUMB:
         return request->data_size >= sizeof(drmd_mode_create_dumb_t) ? create_dumb(island, request->handle, (void *)request->data) : -22;
@@ -877,11 +1130,14 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
         drmd_kms_fb_t *fb = find_fb(request->handle, id);
         if (fb == NULL) return -2;
         if (kms.current_fb == id) return -16;
-        drmd_kms_gem_handle_t *gem = find_gem_handle(request->handle, fb->handle);
-        if (gem != NULL && gem->buffer != NULL && gem->buffer->fb_refs != 0) gem->buffer->fb_refs--;
+        drmd_kms_buffer_t *buffer = fb->buffer;
+        if (buffer != NULL && buffer->fb_refs != 0) buffer->fb_refs--;
         memset(fb, 0, sizeof(*fb));
+        maybe_destroy_buffer(buffer);
         return 0;
     }
+    case DRMD_IOCTL_MODE_CLOSEFB:
+        return -22;
     case DRMD_IOCTL_MODE_PAGE_FLIP: {
         if (require_master(request->handle) != 0 || request->data_size < sizeof(drmd_mode_crtc_page_flip_t)) return -13;
         drmd_mode_crtc_page_flip_t *flip = (void *)request->data;
@@ -889,11 +1145,11 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
             (flip->flags != 0 && flip->flags != DRMD_MODE_PAGE_FLIP_EVENT)) return -22;
         drmd_kms_fb_t *fb = find_fb(request->handle, flip->fb_id);
         if (fb == NULL) return -2;
-        if (flip->flags == 0) return scanout_fb(request->handle, fb);
+        if (flip->flags == 0) return scanout_fb(fb);
         drmd_kms_event_file_t *event_file = find_event_file(request->handle);
         if (event_file == NULL) return -9;
         if (event_file->count >= DRMD_KMS_EVENT_QUEUE_MAX) return -28;
-        const int status = submit_scanout_fb(request->handle, fb);
+        const int status = submit_scanout_fb(fb);
         if (status != 0) return status;
         queue_flip_event(event_file, flip->user_data, fb->id);
         return 0;
@@ -901,13 +1157,19 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
     case DRMD_IOCTL_MODE_GETPLANERESOURCES: {
         if (request->data_size < sizeof(drmd_kms_plane_res_wire_t)) return -22;
         drmd_kms_plane_res_wire_t *wire = (void *)request->data;
-        if (wire->value.count_planes != 0) wire->planes[0] = DRMD_KMS_PLANE_ID;
-        wire->value.count_planes = 1;
+        drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+        if (event_file == NULL) return -9;
+        if (event_file->universal_planes && wire->value.count_planes != 0) {
+            wire->planes[0] = DRMD_KMS_PLANE_ID;
+        }
+        wire->value.count_planes = event_file->universal_planes ? 1 : 0;
         return 0;
     }
     case DRMD_IOCTL_MODE_GETPLANE: {
         if (request->data_size < sizeof(drmd_kms_plane_wire_t)) return -22;
         drmd_kms_plane_wire_t *wire = (void *)request->data;
+        drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+        if (event_file == NULL || !event_file->universal_planes) return -2;
         if (wire->value.plane_id != DRMD_KMS_PLANE_ID) return -2;
         if (wire->value.count_format_types != 0) wire->formats[0] = DRMD_FORMAT_XRGB8888;
         wire->value.crtc_id = kms.current_fb != 0 ? DRMD_KMS_CRTC_ID : 0;
@@ -965,6 +1227,7 @@ int drmd_kms_read(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_
     if (capacity < sizeof(drmd_event_vblank_t)) return -22;
     uint8_t *output = data;
     while (event_file->count != 0 && *out_size + sizeof(drmd_event_vblank_t) <= capacity) {
+        note_flip_event_delivered(&event_file->events[event_file->head]);
         memcpy(output + *out_size, &event_file->events[event_file->head], sizeof(drmd_event_vblank_t));
         memset(&event_file->events[event_file->head], 0, sizeof(drmd_event_vblank_t));
         event_file->head = (event_file->head + 1u) % DRMD_KMS_EVENT_QUEUE_MAX;
@@ -991,6 +1254,7 @@ int drmd_kms_consume_event(uint64_t handle)
     drmd_kms_event_file_t *event_file = find_event_file(handle);
     if (event_file == NULL) return -9;
     if (event_file->count == 0) return -11;
+    note_flip_event_delivered(&event_file->events[event_file->head]);
     memset(&event_file->events[event_file->head], 0, sizeof(drmd_event_vblank_t));
     event_file->head = (event_file->head + 1u) % DRMD_KMS_EVENT_QUEUE_MAX;
     event_file->count--;
@@ -1019,9 +1283,10 @@ void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle)
             kms.current_fb = 0;
             disable_scanout = 1;
         }
-        drmd_kms_gem_handle_t *gem = find_gem_handle(handle, fb->handle);
-        if (gem != NULL && gem->buffer != NULL && gem->buffer->fb_refs != 0) gem->buffer->fb_refs--;
+        drmd_kms_buffer_t *buffer = fb->buffer;
+        if (buffer != NULL && buffer->fb_refs != 0) buffer->fb_refs--;
         memset(fb, 0, sizeof(*fb));
+        maybe_destroy_buffer(buffer);
     }
     if (disable_scanout) {
         drmd_kms_owner_context_t context;

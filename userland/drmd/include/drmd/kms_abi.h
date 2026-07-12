@@ -4,6 +4,9 @@
 
 enum {
     DRMD_IOCTL_GET_CAP = 0xc010640cu,
+    DRMD_IOCTL_GET_MAGIC = 0x80046402u,
+    DRMD_IOCTL_AUTH_MAGIC = 0x40046411u,
+    DRMD_IOCTL_SET_CLIENT_CAP = 0x4010640du,
     DRMD_IOCTL_GEM_CLOSE = 0x40086409u,
     DRMD_IOCTL_PRIME_HANDLE_TO_FD = 0xc00c642du,
     DRMD_IOCTL_PRIME_FD_TO_HANDLE = 0xc00c642eu,
@@ -12,8 +15,12 @@ enum {
     DRMD_IOCTL_MODE_GETRESOURCES = 0xc04064a0u,
     DRMD_IOCTL_MODE_GETCRTC = 0xc06864a1u,
     DRMD_IOCTL_MODE_SETCRTC = 0xc06864a2u,
+    DRMD_IOCTL_MODE_CURSOR = 0xc01c64a3u,
     DRMD_IOCTL_MODE_GETENCODER = 0xc01464a6u,
     DRMD_IOCTL_MODE_GETCONNECTOR = 0xc05064a7u,
+    DRMD_IOCTL_MODE_GETPROPERTY = 0xc04064aau,
+    DRMD_IOCTL_MODE_SETPROPERTY = 0xc01064abu,
+    DRMD_IOCTL_MODE_GETPROPBLOB = 0xc01064acu,
     DRMD_IOCTL_MODE_ADDFB = 0xc01c64aeu,
     DRMD_IOCTL_MODE_RMFB = 0xc00464afu,
     DRMD_IOCTL_MODE_PAGE_FLIP = 0xc01864b0u,
@@ -23,6 +30,9 @@ enum {
     DRMD_IOCTL_MODE_GETPLANERESOURCES = 0xc01064b5u,
     DRMD_IOCTL_MODE_GETPLANE = 0xc02064b6u,
     DRMD_IOCTL_MODE_ADDFB2 = 0xc06864b8u,
+    DRMD_IOCTL_MODE_OBJ_GETPROPERTIES = 0xc02064b9u,
+    DRMD_IOCTL_MODE_CREATE_LEASE = 0xc01864c6u,
+    DRMD_IOCTL_MODE_CLOSEFB = 0xc00864d0u,
 
     DRMD_MODE_TYPE_PREFERRED = 1u << 3,
     DRMD_MODE_TYPE_DRIVER = 1u << 6,
@@ -32,12 +42,34 @@ enum {
     DRMD_MODE_SUBPIXEL_UNKNOWN = 1u,
     DRMD_FORMAT_XRGB8888 = 0x34325258u,
     DRMD_MODE_PAGE_FLIP_EVENT = 1u << 0,
+    DRMD_MODE_CURSOR_BO = 1u << 0,
+    DRMD_MODE_CURSOR_MOVE = 1u << 1,
     DRMD_MODE_FB_MODIFIERS = 1u << 1,
     DRMD_FORMAT_MOD_LINEAR = 0u,
 
+    DRMD_MODE_OBJECT_CRTC = 0xccccccccu,
+    DRMD_MODE_OBJECT_CONNECTOR = 0xc0c0c0c0u,
+    DRMD_MODE_OBJECT_PLANE = 0xeeeeeeeeu,
+    DRMD_MODE_OBJECT_ANY = 0u,
+    DRMD_MODE_PROP_RANGE = 1u << 1,
+    DRMD_MODE_PROP_IMMUTABLE = 1u << 2,
+    DRMD_MODE_PROP_ENUM = 1u << 3,
+    DRMD_MODE_PROP_BLOB = 1u << 4,
+    DRMD_MODE_DPMS_ON = 0u,
+    DRMD_MODE_DPMS_STANDBY = 1u,
+    DRMD_MODE_DPMS_SUSPEND = 2u,
+    DRMD_MODE_DPMS_OFF = 3u,
+    DRMD_MODE_PLANE_TYPE_OVERLAY = 0u,
+    DRMD_MODE_PLANE_TYPE_PRIMARY = 1u,
+    DRMD_MODE_PLANE_TYPE_CURSOR = 2u,
+
     DRMD_CAP_DUMB_BUFFER = 0x1u,
     DRMD_CAP_PRIME = 0x5u,
+    DRMD_CAP_TIMESTAMP_MONOTONIC = 0x6u,
     DRMD_CAP_ADDFB2_MODIFIERS = 0x10u,
+    DRMD_CAP_CRTC_IN_VBLANK_EVENT = 0x12u,
+    DRMD_CLIENT_CAP_UNIVERSAL_PLANES = 2u,
+    DRMD_CLIENT_CAP_ATOMIC = 3u,
     DRMD_PRIME_CAP_IMPORT = 1u << 0,
     DRMD_PRIME_CAP_EXPORT = 1u << 1,
     DRMD_CLOEXEC = 0x80000u,
@@ -52,6 +84,11 @@ enum {
     DRMD_KMS_MODE_CAPACITY = 8u,
     DRMD_KMS_PLANE_CAPACITY = 4u,
     DRMD_KMS_FORMAT_CAPACITY = 4u,
+    DRMD_KMS_PROPERTY_CAPACITY = 8u,
+    DRMD_KMS_PROPERTY_VALUE_CAPACITY = 8u,
+    DRMD_KMS_PROPERTY_ENUM_CAPACITY = 8u,
+    DRMD_KMS_PROPERTY_BLOB_BYTES = 128u,
+    DRMD_PROP_NAME_BYTES = 32u,
 };
 
 typedef struct drmd_modeinfo {
@@ -76,6 +113,47 @@ typedef struct drmd_get_cap {
     uint64_t capability;
     uint64_t value;
 } drmd_get_cap_t;
+
+typedef struct drmd_set_client_cap {
+    uint64_t capability;
+    uint64_t value;
+} drmd_set_client_cap_t;
+
+typedef struct drmd_mode_property_enum {
+    uint64_t value;
+    char name[DRMD_PROP_NAME_BYTES];
+} drmd_mode_property_enum_t;
+
+typedef struct drmd_mode_get_property {
+    uint64_t values_ptr;
+    uint64_t enum_blob_ptr;
+    uint32_t prop_id;
+    uint32_t flags;
+    char name[DRMD_PROP_NAME_BYTES];
+    uint32_t count_values;
+    uint32_t count_enum_blobs;
+} drmd_mode_get_property_t;
+
+typedef struct drmd_mode_connector_set_property {
+    uint64_t value;
+    uint32_t prop_id;
+    uint32_t connector_id;
+} drmd_mode_connector_set_property_t;
+
+typedef struct drmd_mode_obj_get_properties {
+    uint64_t props_ptr;
+    uint64_t prop_values_ptr;
+    uint32_t count_props;
+    uint32_t obj_id;
+    uint32_t obj_type;
+    uint32_t pad;
+} drmd_mode_obj_get_properties_t;
+
+typedef struct drmd_mode_get_blob {
+    uint32_t blob_id;
+    uint32_t length;
+    uint64_t data;
+} drmd_mode_get_blob_t;
 
 typedef struct drmd_prime_handle {
     uint32_t handle;
@@ -172,6 +250,16 @@ typedef struct drmd_mode_crtc_page_flip {
     uint64_t user_data;
 } drmd_mode_crtc_page_flip_t;
 
+typedef struct drmd_mode_cursor {
+    uint32_t flags;
+    uint32_t crtc_id;
+    int32_t x;
+    int32_t y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t handle;
+} drmd_mode_cursor_t;
+
 typedef struct drmd_event_vblank {
     uint32_t type;
     uint32_t length;
@@ -228,6 +316,8 @@ typedef struct drmd_kms_connector_wire {
     drmd_mode_get_connector_t value;
     uint32_t encoders[DRMD_KMS_ENCODER_CAPACITY];
     drmd_modeinfo_t modes[DRMD_KMS_MODE_CAPACITY];
+    uint32_t props[DRMD_KMS_PROPERTY_CAPACITY];
+    uint64_t prop_values[DRMD_KMS_PROPERTY_CAPACITY];
 } drmd_kms_connector_wire_t;
 
 typedef struct drmd_kms_crtc_wire {
@@ -245,9 +335,30 @@ typedef struct drmd_kms_plane_wire {
     uint32_t formats[DRMD_KMS_FORMAT_CAPACITY];
 } drmd_kms_plane_wire_t;
 
+typedef struct drmd_kms_object_properties_wire {
+    drmd_mode_obj_get_properties_t value;
+    uint32_t props[DRMD_KMS_PROPERTY_CAPACITY];
+    uint64_t prop_values[DRMD_KMS_PROPERTY_CAPACITY];
+} drmd_kms_object_properties_wire_t;
+
+typedef struct drmd_kms_property_wire {
+    drmd_mode_get_property_t value;
+    uint64_t values[DRMD_KMS_PROPERTY_VALUE_CAPACITY];
+    drmd_mode_property_enum_t enums[DRMD_KMS_PROPERTY_ENUM_CAPACITY];
+} drmd_kms_property_wire_t;
+
+typedef struct drmd_kms_property_blob_wire {
+    drmd_mode_get_blob_t value;
+    uint8_t data[DRMD_KMS_PROPERTY_BLOB_BYTES];
+} drmd_kms_property_blob_wire_t;
+
 _Static_assert(sizeof(drmd_modeinfo_t) == 68, "drm modeinfo ABI");
 _Static_assert(sizeof(drmd_mode_card_res_t) == 64, "drm resources ABI");
 _Static_assert(sizeof(drmd_mode_crtc_t) == 104, "drm crtc ABI");
 _Static_assert(sizeof(drmd_mode_get_connector_t) == 80, "drm connector ABI");
 _Static_assert(sizeof(drmd_mode_fb_cmd2_t) == 104, "drm fb2 ABI");
 _Static_assert(sizeof(drmd_event_vblank_t) == 32, "drm event vblank ABI");
+_Static_assert(sizeof(drmd_mode_get_property_t) == 64, "drm property ABI");
+_Static_assert(sizeof(drmd_mode_obj_get_properties_t) == 32, "drm object properties ABI");
+_Static_assert(sizeof(drmd_mode_get_blob_t) == 16, "drm property blob ABI");
+_Static_assert(sizeof(drmd_mode_cursor_t) == 28, "drm cursor ABI");

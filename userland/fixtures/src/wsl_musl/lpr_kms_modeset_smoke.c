@@ -8,18 +8,30 @@
 #include <unistd.h>
 
 #define DRM_IOCTL_SET_MASTER 0x641eu
+#define DRM_IOCTL_GET_CAP 0xc010640cu
+#define DRM_IOCTL_SET_CLIENT_CAP 0x4010640du
 #define DRM_IOCTL_MODE_GETRESOURCES 0xc04064a0u
 #define DRM_IOCTL_MODE_GETCRTC 0xc06864a1u
 #define DRM_IOCTL_MODE_SETCRTC 0xc06864a2u
 #define DRM_IOCTL_MODE_GETENCODER 0xc01464a6u
 #define DRM_IOCTL_MODE_GETCONNECTOR 0xc05064a7u
+#define DRM_IOCTL_MODE_GETPROPERTY 0xc04064aau
+#define DRM_IOCTL_MODE_GETPROPBLOB 0xc01064acu
 #define DRM_IOCTL_MODE_PAGE_FLIP 0xc01864b0u
 #define DRM_IOCTL_MODE_CREATE_DUMB 0xc02064b2u
 #define DRM_IOCTL_MODE_MAP_DUMB 0xc01064b3u
 #define DRM_IOCTL_MODE_GETPLANERESOURCES 0xc01064b5u
 #define DRM_IOCTL_MODE_GETPLANE 0xc02064b6u
 #define DRM_IOCTL_MODE_ADDFB2 0xc06864b8u
+#define DRM_IOCTL_MODE_OBJ_GETPROPERTIES 0xc02064b9u
 #define DRM_FORMAT_XRGB8888 0x34325258u
+#define DRM_CAP_TIMESTAMP_MONOTONIC 0x6u
+#define DRM_CAP_CRTC_IN_VBLANK_EVENT 0x12u
+#define DRM_CLIENT_CAP_UNIVERSAL_PLANES 2u
+#define DRM_CLIENT_CAP_ATOMIC 3u
+#define DRM_MODE_OBJECT_PLANE 0xeeeeeeeeu
+#define DRM_MODE_PROP_BLOB (1u << 4)
+#define DRM_PLANE_TYPE_PRIMARY 1u
 
 struct modeinfo {
     uint32_t clock;
@@ -62,6 +74,29 @@ struct fb_cmd2 {
 struct page_flip { uint32_t crtc_id, fb_id, flags, reserved; uint64_t user_data; };
 struct plane_res { uint64_t plane_id_ptr; uint32_t count_planes, pad; };
 struct plane { uint32_t plane_id, crtc_id, fb_id, possible_crtcs, gamma_size, count_format_types; uint64_t format_type_ptr; };
+struct cap { uint64_t capability, value; };
+struct obj_properties {
+    uint64_t props_ptr, prop_values_ptr;
+    uint32_t count_props, obj_id, obj_type, pad;
+};
+struct property_enum { uint64_t value; char name[32]; };
+struct get_property {
+    uint64_t values_ptr, enum_blob_ptr;
+    uint32_t prop_id, flags;
+    char name[32];
+    uint32_t count_values, count_enum_blobs;
+};
+struct get_blob { uint32_t blob_id, length; uint64_t data; };
+struct format_modifier {
+    uint64_t formats;
+    uint32_t offset, pad;
+    uint64_t modifier;
+};
+struct format_blob {
+    uint32_t version, flags, count_formats, formats_offset;
+    uint32_t count_modifiers, modifiers_offset, format, pad;
+    struct format_modifier modifier;
+};
 
 struct buffer { struct create_dumb dumb; struct fb_cmd2 fb; uint32_t *pixels; };
 
@@ -119,6 +154,17 @@ int main(void)
     int fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     if (fd < 0) return fail("open");
     if (ioctl(fd, DRM_IOCTL_SET_MASTER, 0) != 0) return fail("SET_MASTER");
+    struct cap cap = { .capability = DRM_CAP_TIMESTAMP_MONOTONIC };
+    if (ioctl(fd, DRM_IOCTL_GET_CAP, &cap) != 0 || cap.value != 1) return fail("GET_CAP-monotonic");
+    cap.capability = DRM_CAP_CRTC_IN_VBLANK_EVENT;
+    cap.value = 0;
+    if (ioctl(fd, DRM_IOCTL_GET_CAP, &cap) != 0 || cap.value != 1) return fail("GET_CAP-crtc-event");
+    cap.capability = DRM_CLIENT_CAP_ATOMIC;
+    cap.value = 1;
+    errno = 0;
+    if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) == 0 || errno != EOPNOTSUPP) return fail("SET_CLIENT_CAP-atomic");
+    cap.capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES;
+    if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) != 0) return fail("SET_CLIENT_CAP-universal");
     struct card_res resources;
     memset(&resources, 0, sizeof(resources));
     if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &resources) != 0 || resources.count_crtcs != 1 || resources.count_connectors != 1 || resources.count_encoders != 1) return fail("GETRESOURCES-count");
@@ -153,6 +199,40 @@ int main(void)
     uint32_t plane_format = 0;
     struct plane plane = { .plane_id = plane_id, .count_format_types = 1, .format_type_ptr = (uint64_t)(uintptr_t)&plane_format };
     if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) != 0 || plane_format != DRM_FORMAT_XRGB8888) return fail("GETPLANE");
+    struct obj_properties object_props = { .obj_id = plane_id, .obj_type = DRM_MODE_OBJECT_PLANE };
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &object_props) != 0 || object_props.count_props != 2) return fail("OBJ_GETPROPERTIES-count");
+    uint32_t prop_ids[2] = {0};
+    uint64_t prop_values[2] = {0};
+    object_props.props_ptr = (uint64_t)(uintptr_t)prop_ids;
+    object_props.prop_values_ptr = (uint64_t)(uintptr_t)prop_values;
+    object_props.count_props = 2;
+    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &object_props) != 0 ||
+        prop_values[0] != DRM_PLANE_TYPE_PRIMARY || prop_values[1] == 0) return fail("OBJ_GETPROPERTIES-data");
+    struct property_enum enums[3];
+    memset(enums, 0, sizeof(enums));
+    struct get_property property = {
+        .enum_blob_ptr = (uint64_t)(uintptr_t)enums,
+        .prop_id = prop_ids[0],
+        .count_enum_blobs = 3,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) != 0 ||
+        strcmp(property.name, "type") != 0 || property.count_enum_blobs != 3) return fail("GETPROPERTY-type");
+    memset(&property, 0, sizeof(property));
+    property.prop_id = prop_ids[1];
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) != 0 ||
+        strcmp(property.name, "IN_FORMATS") != 0 || (property.flags & DRM_MODE_PROP_BLOB) == 0) return fail("GETPROPERTY-formats");
+    uint8_t blob_data[128];
+    memset(blob_data, 0, sizeof(blob_data));
+    struct get_blob blob = {
+        .blob_id = (uint32_t)prop_values[1],
+        .length = sizeof(blob_data),
+        .data = (uint64_t)(uintptr_t)blob_data,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPBLOB, &blob) != 0 || blob.length != sizeof(struct format_blob)) return fail("GETPROPBLOB");
+    const struct format_blob *formats = (const struct format_blob *)blob_data;
+    if (formats->version != 1 || formats->count_formats != 1 ||
+        formats->format != DRM_FORMAT_XRGB8888 || formats->count_modifiers != 1 ||
+        formats->modifier.formats != 1 || formats->modifier.modifier != 0) return fail("GETPROPBLOB-data");
     struct buffer first, second;
     if (create_buffer(fd, mode.hdisplay, mode.vdisplay, &first) != 0 || create_buffer(fd, mode.hdisplay, mode.vdisplay, &second) != 0) return 2;
     fill_gradient(&first, 0);

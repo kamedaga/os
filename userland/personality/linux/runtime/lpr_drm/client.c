@@ -451,6 +451,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         LPR_DRM_WIRE_CRTC,
         LPR_DRM_WIRE_PLANE_RES,
         LPR_DRM_WIRE_PLANE,
+        LPR_DRM_WIRE_OBJECT_PROPERTIES,
+        LPR_DRM_WIRE_PROPERTY,
+        LPR_DRM_WIRE_PROPERTY_BLOB,
         LPR_DRM_WIRE_NO_ARGUMENT,
     } wire_kind = LPR_DRM_WIRE_GENERIC;
     if (command == LPR_DRM_IOCTL_VERSION) {
@@ -497,6 +500,26 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         ioctl->arg_size = sizeof(wire->value);
         ioctl->data_size = sizeof(*wire);
         wire_kind = LPR_DRM_WIRE_PLANE;
+    } else if (command == DRMD_IOCTL_MODE_OBJ_GETPROPERTIES) {
+        drmd_kms_object_properties_wire_t *wire =
+            (drmd_kms_object_properties_wire_t *)ioctl->data;
+        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
+        ioctl->arg_size = sizeof(wire->value);
+        ioctl->data_size = sizeof(*wire);
+        wire_kind = LPR_DRM_WIRE_OBJECT_PROPERTIES;
+    } else if (command == DRMD_IOCTL_MODE_GETPROPERTY) {
+        drmd_kms_property_wire_t *wire = (drmd_kms_property_wire_t *)ioctl->data;
+        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
+        ioctl->arg_size = sizeof(wire->value);
+        ioctl->data_size = sizeof(*wire);
+        wire_kind = LPR_DRM_WIRE_PROPERTY;
+    } else if (command == DRMD_IOCTL_MODE_GETPROPBLOB) {
+        drmd_kms_property_blob_wire_t *wire =
+            (drmd_kms_property_blob_wire_t *)ioctl->data;
+        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
+        ioctl->arg_size = sizeof(wire->value);
+        ioctl->data_size = sizeof(*wire);
+        wire_kind = LPR_DRM_WIRE_PROPERTY_BLOB;
     } else if (no_argument) {
         ioctl->arg_size = 0;
         ioctl->data_size = 0;
@@ -553,8 +576,12 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         const drmd_mode_get_connector_t *user = (const drmd_mode_get_connector_t *)(uintptr_t)arg;
         const uint32_t mode_capacity = user->count_modes < DRMD_KMS_MODE_CAPACITY ? user->count_modes : DRMD_KMS_MODE_CAPACITY;
         const uint32_t encoder_capacity = user->count_encoders < DRMD_KMS_ENCODER_CAPACITY ? user->count_encoders : DRMD_KMS_ENCODER_CAPACITY;
+        const uint32_t prop_capacity = user->count_props < DRMD_KMS_PROPERTY_CAPACITY ?
+            user->count_props : DRMD_KMS_PROPERTY_CAPACITY;
         if (user->modes_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->modes_ptr, wire->modes, mode_capacity * sizeof(drmd_modeinfo_t));
         if (user->encoders_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->encoders_ptr, wire->encoders, encoder_capacity * sizeof(uint32_t));
+        if (user->props_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->props_ptr, wire->props, prop_capacity * sizeof(uint32_t));
+        if (user->prop_values_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->prop_values_ptr, wire->prop_values, prop_capacity * sizeof(uint64_t));
         lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_CRTC) {
         drmd_kms_crtc_wire_t *wire = (drmd_kms_crtc_wire_t *)ioctl->data;
@@ -570,6 +597,39 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         const drmd_mode_get_plane_t *user = (const drmd_mode_get_plane_t *)(uintptr_t)arg;
         const uint32_t capacity = user->count_format_types < DRMD_KMS_FORMAT_CAPACITY ? user->count_format_types : DRMD_KMS_FORMAT_CAPACITY;
         if (user->format_type_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->format_type_ptr, wire->formats, capacity * sizeof(uint32_t));
+        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_OBJECT_PROPERTIES) {
+        drmd_kms_object_properties_wire_t *wire =
+            (drmd_kms_object_properties_wire_t *)ioctl->data;
+        const drmd_mode_obj_get_properties_t *user =
+            (const drmd_mode_obj_get_properties_t *)(uintptr_t)arg;
+        const uint32_t capacity = user->count_props < DRMD_KMS_PROPERTY_CAPACITY ?
+            user->count_props : DRMD_KMS_PROPERTY_CAPACITY;
+        if (user->props_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->props_ptr,
+            wire->props, capacity * sizeof(uint32_t));
+        if (user->prop_values_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->prop_values_ptr,
+            wire->prop_values, capacity * sizeof(uint64_t));
+        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PROPERTY) {
+        drmd_kms_property_wire_t *wire = (drmd_kms_property_wire_t *)ioctl->data;
+        const drmd_mode_get_property_t *user =
+            (const drmd_mode_get_property_t *)(uintptr_t)arg;
+        const uint32_t value_capacity = user->count_values < DRMD_KMS_PROPERTY_VALUE_CAPACITY ?
+            user->count_values : DRMD_KMS_PROPERTY_VALUE_CAPACITY;
+        const uint32_t enum_capacity = user->count_enum_blobs < DRMD_KMS_PROPERTY_ENUM_CAPACITY ?
+            user->count_enum_blobs : DRMD_KMS_PROPERTY_ENUM_CAPACITY;
+        if (user->values_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->values_ptr,
+            wire->values, value_capacity * sizeof(uint64_t));
+        if (user->enum_blob_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->enum_blob_ptr,
+            wire->enums, enum_capacity * sizeof(drmd_mode_property_enum_t));
+        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PROPERTY_BLOB) {
+        drmd_kms_property_blob_wire_t *wire =
+            (drmd_kms_property_blob_wire_t *)ioctl->data;
+        const drmd_mode_get_blob_t *user = (const drmd_mode_get_blob_t *)(uintptr_t)arg;
+        uint32_t length = user->length < wire->value.length ? user->length : wire->value.length;
+        if (length > DRMD_KMS_PROPERTY_BLOB_BYTES) length = DRMD_KMS_PROPERTY_BLOB_BYTES;
+        if (user->data != 0) lpr_memcpy((void *)(uintptr_t)user->data, wire->data, length);
         lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_GENERIC) {
         lpr_memcpy((void *)(uintptr_t)arg, ioctl->data, ioctl->data_size);

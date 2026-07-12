@@ -30,6 +30,9 @@ case "${M51_VARIANT:-default}" in
         export WLR_DRM_NO_ATOMIC=1
         export WLR_RENDERER_ALLOW_SOFTWARE=1
         ;;
+    drm-only)
+        export WLR_BACKENDS=drm
+        ;;
     headless)
         export WLR_BACKENDS=headless
         export WLR_HEADLESS_OUTPUTS=1

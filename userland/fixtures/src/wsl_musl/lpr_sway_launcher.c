@@ -31,6 +31,8 @@ int main(int argc, char **argv) {
     (void)setenv("LIBSEAT_BACKEND", "seatd", 1);
     (void)setenv("SEATD_SOCK", "/run/seatd.sock", 1);
     (void)setenv("SEATD_VTBOUND", "0", 1);
+    /* card0 has no render node; wlroots must opt in before selecting llvmpipe. */
+    (void)setenv("WLR_RENDERER_ALLOW_SOFTWARE", "1", 1);
     const pid_t seatd = fork();
     if (seatd < 0) {
         perror("fork seatd");
@@ -58,6 +60,26 @@ int main(int argc, char **argv) {
     }
     printf("M51_LAUNCHER_SWAY_PID=%d\n", (int)sway);
     fflush(stdout);
+
+    if (getenv("M55_FIRST_FRAME") != NULL) {
+        int first_frame_status = 0;
+        for (int tick = 0; tick < 350; ++tick) {
+            const pid_t result = waitpid(sway, &first_frame_status, WNOHANG);
+            if (result == sway) {
+                (void)kill(seatd, SIGKILL);
+                fprintf(stderr, "M55_SWAY_EXITED_BEFORE_FRAME\n");
+                return WIFEXITED(first_frame_status) ? WEXITSTATUS(first_frame_status) : 125;
+            }
+            if (result < 0 && errno != EINTR) {
+                (void)kill(seatd, SIGKILL);
+                perror("waitpid sway first frame");
+                return 5;
+            }
+            usleep(100000);
+        }
+        printf("M55_SWAY_FIRST_FRAME_READY\n");
+        fflush(stdout);
+    }
 
     const char *client_path = getenv("M51_CLIENT");
     if (client_path != NULL && client_path[0] != '\0') {
