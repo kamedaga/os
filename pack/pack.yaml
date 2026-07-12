@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -91,6 +91,14 @@ skip:
   kinds: []
   includeSkippedArtifacts: false
 apps:
+  virtio_input_sysfs:
+    file:
+      path: ".artifacts/userland-fixtures/virtio-input-sysfs"
+      rebuild: ["bash", "tools/build_virtio_input_sysfs.sh"]
+      input:
+        - "tools/build_virtio_input_sysfs.sh"
+    out: "ROOT"
+    rootfs: "/"
   virtio_gpu_sysfs:
     file:
       path: ".artifacts/userland-fixtures/virtio-gpu-sysfs"
@@ -126,6 +134,14 @@ apps:
       input:
         - "tools/build_wsl_alpine_mesa.sh"
     out: "MESAROOT"
+    rootfs: "/"
+  alpine_input:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-input-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_input.sh"]
+      input:
+        - "tools/build_wsl_alpine_input.sh"
+    out: "INPUTROOT"
     rootfs: "/"
   alpine_go:
     file:
@@ -519,6 +535,15 @@ apps:
     out: "LXVIGPU.KO"
     bootfs: "/srv/kobox/linux_virtio_gpu.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_gpu.ko"
+  kobox_linux_virtio_input:
+    file:
+      path: ".artifacts/kobox-linux-tty/linux_virtio_input.ko"
+      rebuild: ["bash", "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh", ".artifacts/kobox-linux-tty"]
+      input:
+        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+    out: "LXVINPUT.KO"
+    bootfs: "/srv/kobox/linux_virtio_input.ko"
+    rootfs: "/usr/lib/kobox/linux_virtio_input.ko"
   kobox_run:
     file:
       path: ".artifacts/userland-fixtures/kobox/kobox-run.elf"
@@ -806,6 +831,26 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_async_signal_smoke.c"
     out: "LPRASIG.ELF"
     rootfs: "/cmd/lpr_async_signal_smoke.elf"
+  lpr_evdev_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_evdev_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_evdev_smoke", "userland/fixtures/src/wsl_musl/lpr_evdev_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_evdev_smoke.c"
+    out: "LPREVDEV.ELF"
+    rootfs: "/cmd/lpr_evdev_smoke.elf"
+  lpr_libinput_seatd_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_libinput_seatd_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_libinput_smoke.sh"]
+      input:
+        - "tools/build_wsl_libinput_smoke.sh"
+        - "tools/build_wsl_alpine_input.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_libinput_seatd_smoke.c"
+    out: "LPRLIBIN.ELF"
+    rootfs: "/cmd/lpr_libinput_seatd_smoke.elf"
   lpr_async_signal_smoke_script:
     file: "tests/fixtures/lpr_async_signal_smoke.sh"
     out: "LPRASIG.SH"
@@ -1118,6 +1163,28 @@ apps:
     out: "DRMD.ELF"
     bootfs: "/srv/drmd.elf"
     rootfs: "/srv/drmd.elf"
+  inputd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/inputd/inputd.elf"
+      rebuild: ["bash", "-lc", "cmake -S userland/inputd -B .artifacts/cmake/inputd && cmake --build .artifacts/cmake/inputd --parallel 1"]
+      input:
+        - "userland/inputd/CMakeLists.txt"
+        - "userland/inputd/src"
+        - "userland/inputd/include"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "_kobox/include"
+        - "_kobox/src"
+        - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
+    out: "INPUTD.ELF"
+    bootfs: "/srv/inputd.elf"
+    rootfs: "/srv/inputd.elf"
   storage_boot:
     role: "service"
     file:
@@ -1155,6 +1222,7 @@ apps:
         - "userland/termd/include"
         - "userland/pachaos_capsule/include"
         - "userland/storage_boot/include"
+        - "userland/inputd/include"
     out: "SEED0BT.ELF"
   seed0_next:
     role: "service"

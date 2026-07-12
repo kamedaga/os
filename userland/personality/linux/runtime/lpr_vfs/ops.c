@@ -523,6 +523,10 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
     if (drm_fd != -LPR_LINUX_ENOENT) {
         return drm_fd;
     }
+    const int64_t input_fd = lpr_input_open_path(path, flags);
+    if (input_fd != -LPR_LINUX_ENOENT) {
+        return input_fd;
+    }
     const int64_t tty_fd = lpr_tty_open_path(path, flags);
     if (tty_fd != -LPR_LINUX_ENOENT) {
         return tty_fd;

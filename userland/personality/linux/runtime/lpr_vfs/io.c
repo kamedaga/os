@@ -156,11 +156,17 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
 
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
+    if (lpr_linux_input_fd_active(fd)) {
+        return lpr_input_read_events(fd, buf, count);
+    }
     if (lpr_linux_drm_fd_active(fd)) {
         return lpr_drm_read_events(fd, buf, count);
     }
     if (lpr_linux_tty_fd_active(fd)) {
         return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
+    }
+    if (lpr_linux_timerfd_active(fd)) {
+        return lpr_linux_timerfd_read(fd, buf, count);
     }
     if (lpr_linux_eventfd_active(fd)) {
         if (count < sizeof(uint64_t)) {
@@ -277,7 +283,10 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
     if (lpr_linux_drm_fd_active(fd)) {
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
     }
-    if (lpr_linux_eventfd_active(fd)) {
+    if (lpr_linux_input_fd_active(fd)) {
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
+    }
+    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
         int64_t total = 0;
         const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
         for (uint64_t i = 0; i < iov_count; i += 1) {

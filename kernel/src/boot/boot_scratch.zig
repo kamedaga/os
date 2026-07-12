@@ -48,7 +48,7 @@ pub fn allocate(bytes: usize) ?[]align(8) u8 {
     return ptr[0..bytes];
 }
 
-pub fn free(buf: []align(8) u8) void {
+pub fn free(buf: []const u8) void {
     if (scratch.len == 0) return;
     const base = @intFromPtr(scratch.ptr);
     const limit = base + scratch.len;

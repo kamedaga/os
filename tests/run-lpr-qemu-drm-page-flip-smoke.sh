@@ -10,7 +10,7 @@ if [[ "${SKIP_SYNC:-0}" != "1" ]]; then
   .artifacts/bin/pacgo sync rootfs --force
   .artifacts/bin/pacgo sync bootfs
 fi
-pkill -9 qemu-system-x86_64 2>/dev/null || true
+pkill -9 qemu-system-x86 2>/dev/null || true
 sleep 1
 .artifacts/bin/pacgo qemu-test \
   --timeout 210s \

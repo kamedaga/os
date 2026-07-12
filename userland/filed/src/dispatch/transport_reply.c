@@ -358,6 +358,7 @@ int filed_dispatch_lpr_fd_desc_valid(const filed_exec_lpr_fd_t *fd)
     case FILED_EXEC_LPR_FD_FILED:
     case FILED_EXEC_LPR_FD_TTY:
     case FILED_EXEC_LPR_FD_DRM:
+    case FILED_EXEC_LPR_FD_INPUT:
     case FILED_EXEC_LPR_FD_SOCKET:
     case FILED_EXEC_LPR_FD_DMABUF:
         return fd->handle != 0;

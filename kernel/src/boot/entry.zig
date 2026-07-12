@@ -812,6 +812,10 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         res.framebuffer_info,
         kernel_runtime.global_free_list,
     );
+    // setupInitBootstrapResources copies every bootfs page into the init VMO.
+    // The persisted bootfs is the most recent boot-scratch allocation, so its
+    // staging storage can now be released before the init ELF load window.
+    boot_scratch.free(res.bootfs_image);
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
     init_setup.refreshInitBootLogSnapshot(state, init_principal);

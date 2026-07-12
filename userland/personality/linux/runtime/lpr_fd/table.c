@@ -142,6 +142,10 @@ static void lpr_fd_table_fill_payload(
         file->payload.drm.active = 1;
         file->payload.drm.handle = install->backend_id;
         break;
+    case LPR_FD_TABLE_KIND_INPUT:
+        file->payload.input.active = 1;
+        file->payload.input.handle = install->backend_id;
+        break;
     case LPR_FD_TABLE_KIND_PIPE:
         file->payload.pipe.active = 1;
         file->payload.pipe.flags =

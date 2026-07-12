@@ -163,6 +163,22 @@ func TestParseScreendumpCheck(t *testing.T) {
 	}
 }
 
+func TestParseInputSendCheck(t *testing.T) {
+	check, err := parseInputSendCheck("INPUT_READY@key:a=down,key:a=up,rel:x=-7,btn:left=down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Marker != "INPUT_READY" || len(check.Events) != 4 {
+		t.Fatalf("unexpected check: %#v", check)
+	}
+	if check.Events[0].Kind != "key" || !check.Events[0].Down || check.Events[1].Down {
+		t.Fatalf("unexpected key events: %#v", check.Events[:2])
+	}
+	if check.Events[2].Kind != "rel" || check.Events[2].Code != "x" || check.Events[2].Value != -7 {
+		t.Fatalf("unexpected relative event: %#v", check.Events[2])
+	}
+}
+
 func TestValidatePPMRegion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "surface.ppm")
 	pixels := make([]byte, 4*3*3)

@@ -74,6 +74,7 @@ const char *filed_op_name(uint64_t op)
     case FILED_OP_SESSION_OPEN: return "connect";
     case FILED_OP_SERVICE_SET_NETD_SOCKET: return "set_netd_socket_endpoint";
     case FILED_OP_SERVICE_SET_TERMD_TTY: return "set_termd_tty_endpoint";
+    case FILED_OP_SERVICE_SET_INPUTD_INPUT: return "set_inputd_input_endpoint";
     case FILED_OP_DIAG_PING: return "ping";
     case FILED_OP_SESSION_DOORBELL: return "fast_doorbell";
     case FILED_OP_VFS_VALIDATE_OPEN_CACHE: return "validate_open_cache";

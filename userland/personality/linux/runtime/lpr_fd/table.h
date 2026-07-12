@@ -7,11 +7,12 @@ enum {
     LPR_FD_TABLE_KIND_FILED = 1u,
     LPR_FD_TABLE_KIND_TTY = 2u,
     LPR_FD_TABLE_KIND_DRM = 3u,
-    LPR_FD_TABLE_KIND_PIPE = 4u,
-    LPR_FD_TABLE_KIND_EVENT = 5u,
-    LPR_FD_TABLE_KIND_SOCKET = 6u,
-    LPR_FD_TABLE_KIND_EPOLL = 7u,
-    LPR_FD_TABLE_KIND_DMABUF = 8u,
+    LPR_FD_TABLE_KIND_INPUT = 4u,
+    LPR_FD_TABLE_KIND_PIPE = 5u,
+    LPR_FD_TABLE_KIND_EVENT = 6u,
+    LPR_FD_TABLE_KIND_SOCKET = 7u,
+    LPR_FD_TABLE_KIND_EPOLL = 8u,
+    LPR_FD_TABLE_KIND_DMABUF = 9u,
 
     LPR_FD_TABLE_FD_CLOEXEC = 1u << 0,
 
@@ -41,11 +42,20 @@ typedef struct lpr_pipe_fd {
 
 typedef struct lpr_event_fd {
     uint8_t active;
-    uint8_t reserved0;
+    uint8_t subtype;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t counter;
+    uint64_t deadline_ns;
+    uint64_t interval_ns;
+    int32_t clock_id;
+    uint32_t reserved2;
 } lpr_event_fd_t;
+
+enum {
+    LPR_EVENT_FD_EVENTFD = 0u,
+    LPR_EVENT_FD_TIMERFD = 1u,
+};
 
 typedef struct lpr_tty_fd {
     uint8_t active;
@@ -63,6 +73,14 @@ typedef struct lpr_drm_fd {
     uint64_t handle;
 } lpr_drm_fd_t;
 
+typedef struct lpr_input_fd {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t flags;
+    uint64_t handle;
+} lpr_input_fd_t;
+
 typedef struct lpr_dmabuf_fd {
     uint8_t active;
     uint8_t writable;
@@ -78,6 +96,8 @@ typedef struct lpr_socket_fd {
     uint8_t cloexec;
     uint8_t connected;
     uint8_t connecting;
+    uint8_t domain;
+    uint8_t reserved_domain[2];
     uint32_t flags;
     uint32_t sndbuf;
     uint32_t rcvbuf;
@@ -94,6 +114,9 @@ typedef struct lpr_socket_fd {
     uint32_t peer_addr_be;
     uint16_t peer_port_be;
     uint16_t reserved1;
+    int32_t peer_pid;
+    uint32_t peer_uid;
+    uint32_t peer_gid;
 } lpr_socket_fd_t;
 
 typedef struct lpr_epoll_fd {
@@ -110,6 +133,7 @@ typedef enum lpr_fd_kind {
     LPR_FD_FILED = LPR_FD_TABLE_KIND_FILED,
     LPR_FD_TTY = LPR_FD_TABLE_KIND_TTY,
     LPR_FD_DRM = LPR_FD_TABLE_KIND_DRM,
+    LPR_FD_INPUT = LPR_FD_TABLE_KIND_INPUT,
     LPR_FD_PIPE = LPR_FD_TABLE_KIND_PIPE,
     LPR_FD_EVENTFD = LPR_FD_TABLE_KIND_EVENT,
     LPR_FD_SOCKET = LPR_FD_TABLE_KIND_SOCKET,
@@ -123,6 +147,7 @@ typedef union lpr_fd_payload {
     lpr_event_fd_t eventfd;
     lpr_tty_fd_t tty;
     lpr_drm_fd_t drm;
+    lpr_input_fd_t input;
     lpr_socket_fd_t socket;
     lpr_epoll_fd_t epoll;
     lpr_dmabuf_fd_t dmabuf;

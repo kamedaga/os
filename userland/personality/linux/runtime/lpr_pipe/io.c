@@ -317,5 +317,6 @@ int64_t lpr_native_pipe_writev(uint64_t fd, uint64_t iov_raw, uint64_t iov_count
 
 int lpr_linux_eventfd_active(uint64_t fd)
 {
-    return lpr_fd_event_payload(fd) != 0;
+    const lpr_event_fd_t *event = lpr_fd_event_payload(fd);
+    return event != 0 && event->active && event->subtype == LPR_EVENT_FD_EVENTFD;
 }

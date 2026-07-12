@@ -32,6 +32,7 @@ typedef struct filed_runtime {
     int netd_socket_endpoint_fd;
     int termd_tty_endpoint_fd;
     int drmd_drm_endpoint_fd;
+    int inputd_input_endpoint_fd;
     filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
     struct filed_dispatch_state *dispatch_state;
     void *storage_runtime;

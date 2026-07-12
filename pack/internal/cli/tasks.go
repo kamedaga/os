@@ -547,6 +547,7 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
 	cmd.Flags().StringArrayVar(&opts.ScreendumpCheck, "screendump-check", nil, "capture at MARKER and require MARKER@X,Y,W,H=#RRGGBB[:TOLERANCE]; repeatable")
 	cmd.Flags().StringVar(&opts.ScreendumpDevice, "screendump-device", "pachagpu", "QEMU display device id captured by screendump")
+	cmd.Flags().StringArrayVar(&opts.InputSendEvent, "input-send-event", nil, "inject QMP input at MARKER using MARKER@key:a=down,rel:x=4,btn:left=up; repeatable")
 	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
 	return cmd
 }

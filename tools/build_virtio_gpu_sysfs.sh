@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${repo_root}/.artifacts/userland-fixtures/virtio-gpu-sysfs"
-pci="${out}/sys/devices/pci0000:00/0000:00:04.0"
+pci="${out}/sys/devices/pci0000:00/0000:00:03.0"
 virtio="${pci}/virtio1"
 
 rm -rf "${out}"
@@ -32,7 +32,7 @@ for path in "${pci}" "${sysdev}"; do
         'PCI_CLASS=038000' \
         'PCI_ID=1AF4:1050' \
         'PCI_SUBSYS_ID=1AF4:1100' \
-        'PCI_SLOT_NAME=0000:00:04.0' \
+        'PCI_SLOT_NAME=0000:00:03.0' \
         >"${path}/uevent"
 done
 printf '%s\n' \

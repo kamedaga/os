@@ -3,6 +3,7 @@
 #include "bootfs_reader.h"
 #include "bootstrap_abi.h"
 #include "drmd/boot_config.h"
+#include "inputd/boot_config.h"
 #include "next_stage_loader.h"
 #include "netd/boot_config.h"
 #include "pacha/ipc.h"
@@ -24,10 +25,12 @@ enum {
     SEED0_VIRTIO_CONSOLE_MODERN_DEVICE_ID = 0x1043,
     SEED0_VIRTIO_GPU_LEGACY_DEVICE_ID = 0x1010,
     SEED0_VIRTIO_GPU_MODERN_DEVICE_ID = 0x1050,
+    SEED0_VIRTIO_INPUT_MODERN_DEVICE_ID = 0x1052,
     SEED0_FILED_ENDPOINT_FD = 240,
     SEED0_NETD_SOCKET_ENDPOINT_FD = 241,
     SEED0_TERMD_TTY_ENDPOINT_FD = 242,
     SEED0_DRMD_DRM_ENDPOINT_FD = 243,
+    SEED0_INPUTD_INPUT_ENDPOINT_FD = 244,
 };
 
 static const uint64_t seed0_netd_endpoint_rights =
@@ -147,6 +150,26 @@ static const struct seed0_device_descriptor *find_virtio_gpu_device(const struct
         }
     }
     return 0;
+}
+
+static int find_virtio_input_devices(
+    const struct seed0_init_descriptor_page *desc,
+    const struct seed0_device_descriptor *out_devices[INPUTD_DEVICE_COUNT])
+{
+    if (desc == NULL || out_devices == NULL) return 0;
+    uint64_t count = desc->device_count;
+    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
+    size_t found = 0;
+    for (uint64_t i = 0; i < count && found < INPUTD_DEVICE_COUNT; i++) {
+        const struct seed0_device_descriptor *device = &desc->devices[i];
+        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
+            !seed0_fd_is_dynamic(device->init_device_fd)) continue;
+        if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
+            device->device_id == SEED0_VIRTIO_INPUT_MODERN_DEVICE_ID) {
+            out_devices[found++] = device;
+        }
+    }
+    return found == INPUTD_DEVICE_COUNT;
 }
 
 struct seed0_capsule_module_spec {
@@ -764,6 +787,91 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     } else {
         (void)pacha_fd_close(drm_endpoint_fd);
     }
+    return 0;
+}
+
+int seed0_launch_inputd(int ready_channel_fd, int *out_input_endpoint_fd)
+{
+    static const struct seed0_capsule_module_spec module_specs[] = {
+        {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
+        {"/srv/kobox/linux_virtio_ring.ko", "linux_virtio_ring.ko"},
+        {"/srv/kobox/linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_modern_dev.ko"},
+        {"/srv/kobox/linux_virtio_pci_legacy_dev.ko", "linux_virtio_pci_legacy_dev.ko"},
+        {"/srv/kobox/linux_virtio_pci.ko", "linux_virtio_pci.ko"},
+        {"/srv/kobox/linux_virtio_input.ko", "linux_virtio_input.ko"},
+    };
+    if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = -1;
+    if (ready_channel_fd < 16) return -1;
+    const struct seed0_device_descriptor *devices[INPUTD_DEVICE_COUNT] = {0};
+    if (!find_virtio_input_devices(seed0_bootstrap_descriptor(), devices)) {
+        fprintf(stderr, "[seed0boot] inputd: two virtio-input device fds not found\n");
+        return -19;
+    }
+    for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++) {
+        const int status = mark_device_inherit((int)devices[i]->init_device_fd, "inputd virtio-input");
+        if (status != 0) return status;
+    }
+    const unsigned char *daemon_image = NULL;
+    uint32_t daemon_size = 0;
+    int status = seed0_bootfs_open_file("/srv/inputd.elf", &daemon_image, &daemon_size);
+    if (status != 0) return -2;
+    const unsigned char *module_images[INPUTD_MAX_MODULES] = {0};
+    uint32_t module_sizes[INPUTD_MAX_MODULES] = {0};
+    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
+    for (uint64_t i = 0; i < module_count; i++) {
+        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
+        if (status != 0 || (uint64_t)module_sizes[i] > INPUTD_MODULE_IMAGE_STRIDE) return -3;
+    }
+    const int endpoint_fd = pacha_ipc_endpoint_create(seed0_termd_endpoint_rights, 0);
+    if (endpoint_fd < 16) return endpoint_fd < 0 ? endpoint_fd : -2;
+    const long endpoint_dup = pacha_fd_fcntl(
+        endpoint_fd, PACHA_FD_FCNTL_DUP, SEED0_INPUTD_INPUT_ENDPOINT_FD,
+        seed0_termd_endpoint_rights);
+    if (endpoint_dup != SEED0_INPUTD_INPUT_ENDPOINT_FD) {
+        (void)pacha_fd_close(endpoint_fd);
+        return -4;
+    }
+    status = mark_device_inherit(SEED0_INPUTD_INPUT_ENDPOINT_FD, "inputd input endpoint");
+    if (status == 0) status = mark_device_inherit(ready_channel_fd, "inputd ready channel");
+    if (status != 0) {
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+    struct seed0_loaded_process loaded;
+    status = seed0_load_elf_process("/srv/inputd.elf", daemon_image, daemon_size, &loaded);
+    if (status != 0) {
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
+    struct inputd_boot_config config;
+    memset(&config, 0, sizeof(config));
+    config.magic = INPUTD_BOOT_CONFIG_MAGIC;
+    config.input_endpoint_fd = SEED0_INPUTD_INPUT_ENDPOINT_FD;
+    config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
+    config.device_count = INPUTD_DEVICE_COUNT;
+    for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++)
+        config.device_fds[i] = devices[i]->init_device_fd;
+    config.module_count = module_count;
+    for (uint64_t i = 0; i < module_count; i++) {
+        config.modules[i].image_va = INPUTD_MODULE_IMAGE_VA + INPUTD_MODULE_IMAGE_STRIDE * i;
+        config.modules[i].image_size = module_sizes[i];
+        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
+    }
+    status = seed0_map_bytes_into_process(
+        loaded.process_fd, INPUTD_BOOT_CONFIG_VA, &config, sizeof(config), PACHA_PROT_READ);
+    if (status != 0) return -5;
+    for (uint64_t i = 0; i < module_count; i++) {
+        status = seed0_map_bytes_into_process(loaded.process_fd, config.modules[i].image_va,
+            module_images[i], module_sizes[i], PACHA_PROT_READ);
+        if (status != 0) return -6;
+    }
+    printf("[seed0boot] inputd modules=%llu devices=%u\n",
+        (unsigned long long)module_count, INPUTD_DEVICE_COUNT);
+    status = seed0_start_process(&loaded, "/srv/inputd.elf", -1);
+    if (status != 0) return status;
+    (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+    if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = endpoint_fd;
+    else (void)pacha_fd_close(endpoint_fd);
     return 0;
 }
 

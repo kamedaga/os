@@ -68,6 +68,10 @@ void lpr_pipe_after_fork_child(void)
             const int64_t status = lpr_drm_dup_handle(object->payload.drm.handle);
             lpr_trace_process_event("fork_dup_drm", index, object->payload.drm.handle, status);
         }
+        if (object->kind == LPR_FD_TABLE_KIND_INPUT) {
+            const int64_t status = lpr_input_dup_handle(object->payload.input.handle);
+            lpr_trace_process_event("fork_dup_input", index, object->payload.input.handle, status);
+        }
         if (object->kind == LPR_FD_TABLE_KIND_DMABUF) {
             const int64_t status = lpr_drm_prime_ref(
                 DRMD_OP_PRIME_ACQUIRE, object->payload.dmabuf.token);
@@ -185,6 +189,7 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
         return -LPR_LINUX_EIO;
     }
     event->active = 1;
+    event->subtype = LPR_EVENT_FD_EVENTFD;
     event->flags = (uint32_t)flags;
     event->counter = initval;
     return fd;
@@ -218,7 +223,7 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
         }
     }
 
-    if (lpr_linux_eventfd_active(fd)) {
+    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
         const int control_status = lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
         if (control_status != 0) {
             return control_status;
@@ -285,6 +290,14 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
         return dup_fd;
     }
     if (lpr_linux_drm_fd_active(fd)) {
+        const int control_status =
+            lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
+        if (control_status != 0) {
+            return control_status;
+        }
+        return dup_fd;
+    }
+    if (lpr_linux_input_fd_active(fd)) {
         const int control_status =
             lpr_control_dup_fd(fd, (uint64_t)(uint32_t)dup_fd, cloexec);
         if (control_status != 0) {
@@ -395,9 +408,11 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
     if (!lpr_fd_is_filed(old_fd) &&
         !lpr_linux_tty_fd_active(old_fd) &&
         !lpr_linux_drm_fd_active(old_fd) &&
+        !lpr_linux_input_fd_active(old_fd) &&
         !lpr_linux_dmabuf_fd_active(old_fd) &&
         !lpr_pipe_fd_is_active(old_fd) &&
         !lpr_linux_eventfd_active(old_fd) &&
+        !lpr_linux_timerfd_active(old_fd) &&
         !lpr_linux_epoll_fd_active(old_fd) &&
         !lpr_linux_socket_fd_active(old_fd))
     {
@@ -416,9 +431,11 @@ int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags)
     if (lpr_fd_is_filed(new_fd) ||
         lpr_linux_tty_fd_active(new_fd) ||
         lpr_linux_drm_fd_active(new_fd) ||
+        lpr_linux_input_fd_active(new_fd) ||
         lpr_linux_dmabuf_fd_active(new_fd) ||
         lpr_pipe_fd_is_active(new_fd) ||
         lpr_linux_eventfd_active(new_fd) ||
+        lpr_linux_timerfd_active(new_fd) ||
         lpr_linux_epoll_fd_active(new_fd) ||
         lpr_linux_socket_fd_active(new_fd))
     {

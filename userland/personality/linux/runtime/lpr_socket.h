@@ -15,6 +15,8 @@ int64_t lpr_linux_socket_write(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_linux_socket_writev(uint64_t fd, uint64_t iov, uint64_t iov_count);
 int64_t lpr_linux_connect(uint64_t fd, uint64_t addr, uint64_t addrlen);
 int64_t lpr_linux_bind(uint64_t fd, uint64_t addr, uint64_t addrlen);
+int64_t lpr_linux_listen(uint64_t fd, uint64_t backlog);
+int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags);
 int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t dest_addr, uint64_t addrlen);
 int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t src_addr, uint64_t addrlen);
 int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg, uint64_t flags);

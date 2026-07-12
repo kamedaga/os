@@ -82,6 +82,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
     case FILED_OP_SERVICE_SET_DRMD_DRM:
+    case FILED_OP_SERVICE_SET_INPUTD_INPUT:
         return filed_page_result(-95, 0);
     default:
         return filed_page_result(-95, 0);
@@ -927,6 +928,7 @@ static int filed_dispatch_client(
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
     case FILED_OP_SERVICE_SET_DRMD_DRM:
+    case FILED_OP_SERVICE_SET_INPUTD_INPUT:
         if (header.payload_size < sizeof(filed_service_endpoint_request_t) ||
             request->fd_count < 3 ||
             request->fds[1].fd < 16)
@@ -944,6 +946,11 @@ static int filed_dispatch_client(
                     (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
                 }
                 runtime->termd_tty_endpoint_fd = endpoint_fd;
+            } else if (header.op == FILED_OP_SERVICE_SET_INPUTD_INPUT) {
+                if (runtime->inputd_input_endpoint_fd >= 16) {
+                    (void)pacha_fd_close(runtime->inputd_input_endpoint_fd);
+                }
+                runtime->inputd_input_endpoint_fd = endpoint_fd;
             } else {
                 if (runtime->drmd_drm_endpoint_fd >= 16) {
                     (void)pacha_fd_close(runtime->drmd_drm_endpoint_fd);

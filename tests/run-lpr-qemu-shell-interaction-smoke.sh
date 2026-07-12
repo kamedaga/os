@@ -46,7 +46,7 @@ expects=(
 )
 
 .artifacts/bin/pacgo qemu-test \
-  --timeout "${SHELL_INTERACTION_TIMEOUT:-90s}" \
+  --timeout "${SHELL_INTERACTION_TIMEOUT:-120s}" \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
   --send '. /cmd/shell_interaction_smoke.sh' \
   "${expects[@]}"

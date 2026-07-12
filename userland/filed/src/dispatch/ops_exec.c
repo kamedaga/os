@@ -18,11 +18,13 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     int exec_netd_socket_endpoint_fd = -1;
     int exec_termd_tty_endpoint_fd = -1;
     int exec_drmd_drm_endpoint_fd = -1;
+    int exec_inputd_input_endpoint_fd = -1;
     int exec_lpr_bootstrap_fd = -1;
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
     int exec_drmd_drm_endpoint_borrowed = 0;
+    int exec_inputd_input_endpoint_borrowed = 0;
     filed_dispatch_saved_fd_t lpr_bootstrap_saved;
     filed_handle_id_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
     filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
@@ -118,6 +120,16 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             goto out;
         }
     }
+    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
+        runtime->inputd_input_endpoint_fd >= 16)
+    {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
+            runtime->inputd_input_endpoint_fd,
+            FILED_EXEC_INPUTD_INPUT_ENDPOINT_FD,
+            &exec_inputd_input_endpoint_fd,
+            &exec_inputd_input_endpoint_borrowed);
+        if (reply_status != 0) goto out;
+    }
     if ((exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) ==
         (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
     {
@@ -169,6 +181,7 @@ out:
     filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_drmd_drm_endpoint_fd, exec_drmd_drm_endpoint_borrowed);
+    filed_dispatch_close_prepared_endpoint(&exec_inputd_input_endpoint_fd, exec_inputd_input_endpoint_borrowed);
     if (exec_lpr_bootstrap_fd >= 0) {
         if (lpr_bootstrap_saved.fd >= 0) {
             filed_dispatch_restore_target_fd(exec_lpr_bootstrap_fd, &lpr_bootstrap_saved);
@@ -235,11 +248,13 @@ int filed_dispatch_exec_path(
     int exec_netd_socket_endpoint_fd = -1;
     int exec_termd_tty_endpoint_fd = -1;
     int exec_drmd_drm_endpoint_fd = -1;
+    int exec_inputd_input_endpoint_fd = -1;
     int exec_lpr_bootstrap_fd = -1;
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
     int exec_drmd_drm_endpoint_borrowed = 0;
+    int exec_inputd_input_endpoint_borrowed = 0;
     int inherit_fds[FILED_EXEC_MAX_INHERIT_FDS];
     filed_dispatch_saved_fd_t inherit_saved[FILED_EXEC_MAX_INHERIT_FDS];
     filed_dispatch_saved_fd_t lpr_bootstrap_saved;
@@ -400,6 +415,16 @@ int filed_dispatch_exec_path(
             goto out;
         }
     }
+    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
+        runtime->inputd_input_endpoint_fd >= 16)
+    {
+        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
+            runtime->inputd_input_endpoint_fd,
+            FILED_EXEC_INPUTD_INPUT_ENDPOINT_FD,
+            &exec_inputd_input_endpoint_fd,
+            &exec_inputd_input_endpoint_borrowed);
+        if (reply_status != 0) goto out;
+    }
     if ((exec_flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) ==
         (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
     {
@@ -511,6 +536,7 @@ out:
     filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_drmd_drm_endpoint_fd, exec_drmd_drm_endpoint_borrowed);
+    filed_dispatch_close_prepared_endpoint(&exec_inputd_input_endpoint_fd, exec_inputd_input_endpoint_borrowed);
     if (exec_lpr_bootstrap_fd >= 0) {
         if (lpr_bootstrap_saved.fd >= 0) {
             filed_dispatch_restore_target_fd(exec_lpr_bootstrap_fd, &lpr_bootstrap_saved);

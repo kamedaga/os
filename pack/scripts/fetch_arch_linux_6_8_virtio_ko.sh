@@ -51,6 +51,9 @@ extract_module \
 extract_module \
     "usr/lib/modules/6.8.0-arch1-1/kernel/drivers/virtio/virtio_pci.ko.zst" \
     "linux_virtio_pci.ko"
+extract_module \
+    "usr/lib/modules/6.8.0-arch1-1/kernel/drivers/virtio/virtio_input.ko.zst" \
+    "linux_virtio_input.ko"
 if [ "${skip_console}" -eq 0 ]; then
     extract_module \
         "usr/lib/modules/6.8.0-arch1-1/kernel/drivers/char/virtio_console.ko.zst" \

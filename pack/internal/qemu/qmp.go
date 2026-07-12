@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -77,6 +78,53 @@ func parseScreendumpCheck(value string, index int, artifacts string) (screendump
 type qmpClient struct {
 	conn   net.Conn
 	reader *bufio.Reader
+	mu     sync.Mutex
+}
+
+type inputSendEvent struct {
+	Kind  string
+	Code  string
+	Value int
+	Down  bool
+}
+
+type inputSendCheck struct {
+	Marker string
+	Events []inputSendEvent
+}
+
+func parseInputSendCheck(value string) (inputSendCheck, error) {
+	var check inputSendCheck
+	markerAndEvents := strings.SplitN(value, "@", 2)
+	if len(markerAndEvents) != 2 || markerAndEvents[0] == "" || markerAndEvents[1] == "" {
+		return check, fmt.Errorf("invalid input send event %q; expected MARKER@key:a=down,rel:x=4,btn:left=up", value)
+	}
+	check.Marker = markerAndEvents[0]
+	for _, token := range strings.Split(markerAndEvents[1], ",") {
+		nameAndValue := strings.SplitN(token, "=", 2)
+		kindAndCode := strings.SplitN(nameAndValue[0], ":", 2)
+		if len(nameAndValue) != 2 || len(kindAndCode) != 2 || kindAndCode[1] == "" {
+			return inputSendCheck{}, fmt.Errorf("invalid input event %q", token)
+		}
+		event := inputSendEvent{Kind: kindAndCode[0], Code: kindAndCode[1]}
+		switch event.Kind {
+		case "key", "btn":
+			if nameAndValue[1] != "down" && nameAndValue[1] != "up" {
+				return inputSendCheck{}, fmt.Errorf("invalid %s state %q", event.Kind, nameAndValue[1])
+			}
+			event.Down = nameAndValue[1] == "down"
+		case "rel", "abs":
+			parsed, err := strconv.Atoi(nameAndValue[1])
+			if err != nil {
+				return inputSendCheck{}, fmt.Errorf("invalid %s value %q", event.Kind, nameAndValue[1])
+			}
+			event.Value = parsed
+		default:
+			return inputSendCheck{}, fmt.Errorf("unsupported input event kind %q", event.Kind)
+		}
+		check.Events = append(check.Events, event)
+	}
+	return check, nil
 }
 
 func connectQMP(socketPath string, timeout time.Duration) (*qmpClient, error) {
@@ -120,6 +168,8 @@ func (client *qmpClient) readResponse() (map[string]json.RawMessage, error) {
 }
 
 func (client *qmpClient) execute(name string, arguments map[string]any) error {
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	request := map[string]any{"execute": name}
 	if len(arguments) != 0 {
 		request["arguments"] = arguments
@@ -144,6 +194,23 @@ func (client *qmpClient) execute(name string, arguments map[string]any) error {
 		return fmt.Errorf("QMP %s returned no result", name)
 	}
 	return nil
+}
+
+func (client *qmpClient) inputSendEvent(event inputSendEvent) error {
+	data := map[string]any{}
+	switch event.Kind {
+	case "key":
+		data = map[string]any{"down": event.Down, "key": map[string]any{"type": "qcode", "data": event.Code}}
+	case "btn":
+		data = map[string]any{"down": event.Down, "button": event.Code}
+	case "rel", "abs":
+		data = map[string]any{"axis": event.Code, "value": event.Value}
+	default:
+		return fmt.Errorf("unsupported input event kind %q", event.Kind)
+	}
+	return client.execute("input-send-event", map[string]any{
+		"events": []any{map[string]any{"type": event.Kind, "data": data}},
+	})
 }
 
 func (client *qmpClient) screendump(device string, check screendumpCheck) error {

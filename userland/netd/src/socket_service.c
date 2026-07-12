@@ -1,6 +1,7 @@
 #include "socket_service.h"
 
 #include "libuinet_backend.h"
+#include "unix_socket.h"
 #include "netd/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pacha/trace.h"
@@ -81,6 +82,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
             return -22;
         }
         const netd_socket_t *req = (const netd_socket_t *)page;
+        if (req->domain == NETD_AF_UNIX) {
+            return netd_unix_socket_open(req->type, req->protocol, out_result);
+        }
         return netd_libuinet_socket_open(req->domain, req->type, req->protocol, out_result);
     }
     case NETD_OP_CONNECT: {
@@ -89,6 +93,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         }
         const netd_connect_t *req = (const netd_connect_t *)page;
         *out_result = 0;
+        if (netd_unix_socket_is_handle(req->handle)) {
+            return netd_unix_socket_connect((const netd_unix_path_t *)page);
+        }
         return netd_libuinet_socket_connect(req->handle, req->addr.addr_be, req->addr.port_be, req->flags);
     }
     case NETD_OP_SEND: {
@@ -100,7 +107,8 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
             return -22;
         }
         size_t sent = 0;
-        int status = netd_libuinet_socket_send(
+        int status = netd_unix_socket_is_handle(req->handle) ?
+            netd_unix_socket_send(req, &sent) : netd_libuinet_socket_send(
             req->handle,
             req->data,
             (size_t)req->length,
@@ -121,7 +129,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
             capacity = NETD_IO_BYTES;
         }
         size_t received = 0;
-        int status = netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
+        int status = netd_unix_socket_is_handle(req->handle) ?
+            netd_unix_socket_recv(req, capacity, &received) :
+            netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
         req->length = received;
         *out_result = received;
         return status;
@@ -133,7 +143,9 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         netd_poll_t *req = (netd_poll_t *)page;
         uint32_t revents = 0;
         int32_t error = 0;
-        int status = netd_libuinet_socket_poll(req->handle, req->events, &revents, &error);
+        int status = netd_unix_socket_is_handle(req->handle) ?
+            netd_unix_socket_poll(req->handle, req->events, &revents, &error) :
+            netd_libuinet_socket_poll(req->handle, req->events, &revents, &error);
         req->revents = revents;
         req->error = error;
         *out_result = revents;
@@ -143,7 +155,20 @@ static int netd_socket_dispatch(uint64_t op, void *page, uint64_t *out_result)
         {
             uint64_t handle = *out_result;
             *out_result = 0;
-            return netd_libuinet_socket_close(handle);
+            return netd_unix_socket_is_handle(handle) ?
+                netd_unix_socket_close(handle) : netd_libuinet_socket_close(handle);
+        }
+    case NETD_OP_BIND:
+        return page != NULL ? netd_unix_socket_bind((const netd_unix_path_t *)page) : -22;
+    case NETD_OP_LISTEN:
+        return netd_unix_socket_listen(*out_result);
+    case NETD_OP_ACCEPT:
+        if (page == NULL) return -22;
+        {
+            netd_accept_t *req = (netd_accept_t *)page;
+            const int status = netd_unix_socket_accept(req);
+            *out_result = status == 0 ? req->accepted_handle : 0;
+            return status;
         }
     default:
         return -38;

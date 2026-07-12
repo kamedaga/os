@@ -88,6 +88,7 @@ type TTYTestOptions struct {
 	Expect           []string
 	ScreendumpCheck  []string
 	ScreendumpDevice string
+	InputSendEvent   []string
 	Python           string
 	Progress         progress.Reporter
 }
@@ -421,8 +422,17 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		}
 		checks = append(checks, check)
 	}
+	inputChecks := make([]inputSendCheck, 0, len(opts.InputSendEvent))
+	for _, value := range opts.InputSendEvent {
+		check, parseErr := parseInputSendCheck(value)
+		if parseErr != nil {
+			span.Fail("invalid input send event")
+			return TTYTestResult{}, parseErr
+		}
+		inputChecks = append(inputChecks, check)
+	}
 	qmpPath := ""
-	if len(checks) != 0 {
+	if len(checks) != 0 || len(inputChecks) != 0 {
 		qmpPath = filepath.Join(artifacts, "qemu-tty-test-qmp.sock")
 		_ = os.Remove(qmpPath)
 	}
@@ -553,7 +563,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			return result, err
 		}
 		defer ttyClient.Close()
-		if len(checks) != 0 {
+		if len(checks) != 0 || len(inputChecks) != 0 {
 			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, done, 5*time.Second); waitErr != nil || exited {
 				terminateQEMU(cmd, done)
 				scanners.Wait()
@@ -608,10 +618,20 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			}
 			go func() { checkpointDone <- ttyClient.RunScreendumpChecks(qmp, device, checks, opts.Timeout) }()
 		}
+		var inputDone chan error
+		if len(inputChecks) != 0 {
+			inputDone = make(chan error, 1)
+			go func() { inputDone <- ttyClient.RunInputSendChecks(qmp, inputChecks, opts.Timeout) }()
+		}
 		result.Sent, result.Matched, testErr = ttyClient.SendAndExpect(opts.Send, opts.Expect, opts.Timeout)
 		if checkpointDone != nil {
 			if checkpointErr := <-checkpointDone; testErr == nil {
 				testErr = checkpointErr
+			}
+		}
+		if inputDone != nil {
+			if inputErr := <-inputDone; testErr == nil {
+				testErr = inputErr
 			}
 		}
 	}
@@ -625,6 +645,34 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 	span.Done("qemu tty test passed")
 	return result, nil
+}
+
+func (client *ttyConsoleClient) RunInputSendChecks(qmp *qmpClient, checks []inputSendCheck, timeout time.Duration) error {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for _, check := range checks {
+		for {
+			client.outputMu.Lock()
+			seen := strings.Contains(client.output.String(), check.Marker)
+			client.outputMu.Unlock()
+			if seen {
+				for _, event := range check.Events {
+					if err := qmp.inputSendEvent(event); err != nil {
+						return fmt.Errorf("input-send-event at %s failed: %w", check.Marker, err)
+					}
+				}
+				break
+			}
+			select {
+			case <-ticker.C:
+			case <-deadline.C:
+				return fmt.Errorf("input-send-event marker %q not found within %s", check.Marker, timeout)
+			}
+		}
+	}
+	return nil
 }
 
 func (client *ttyConsoleClient) RunScreendumpChecks(qmp *qmpClient, device string, checks []screendumpCheck, timeout time.Duration) error {
@@ -941,6 +989,8 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root",
 		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
+		"-device", "virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
+		"-device", "virtio-mouse-pci,disable-legacy=on,id=pachamouse",
 		"-boot", "order=c",
 		"-no-reboot",
 	)
@@ -1022,6 +1072,8 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
 		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
+		"-device", "virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
+		"-device", "virtio-mouse-pci,disable-legacy=on,id=pachamouse",
 		"-boot", "order=c",
 		"-no-reboot",
 	}

@@ -31,6 +31,7 @@ clang \
   -I"$repo_root/userland/netd/include" \
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/drmd/include" \
+  -I"$repo_root/userland/inputd/include" \
   -I"$repo_root/userland/personality/linux/hde" \
   -DHDE64_USE_LPR_MEMSET=1 \
   "$repo_root/userland/personality/linux/runtime/lpr_signal.c" \
@@ -46,11 +47,13 @@ clang \
   "$repo_root/userland/personality/linux/runtime/lpr_common/runtime_support.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_drm/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_input/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/bootstrap_state.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/control.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/dup_pipe.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_pipe/io.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_timerfd.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/cache.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/path.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/io.c" \

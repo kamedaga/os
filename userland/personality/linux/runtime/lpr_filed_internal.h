@@ -7,6 +7,7 @@
 #include "lpr_filed.h"
 #include "lpr_linux_syscall.h"
 #include "lpr_process/client.h"
+#include "lpr_input/client.h"
 #include "lpr_socket.h"
 #include "support/string.h"
 #include "support/syscall.h"
@@ -19,6 +20,7 @@
 #include <personality/lpr_client_abi.h>
 #include <personality/linux_lpr.h>
 #include <drmd/ipc_protocol.h>
+#include <inputd/ipc_protocol.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -639,6 +641,7 @@ int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t f
 const lpr_fd_object_t *lpr_fd_object_for_fd_const(uint64_t fd);
 lpr_event_fd_t *lpr_fd_event_payload(uint64_t fd);
 lpr_drm_fd_t *lpr_fd_drm_payload(uint64_t fd);
+lpr_input_fd_t *lpr_fd_input_payload(uint64_t fd);
 lpr_fd_object_t *lpr_fd_object_for_fd(uint64_t fd);
 lpr_filed_fd_t *lpr_fd_filed_payload(uint64_t fd);
 lpr_pipe_fd_t *lpr_fd_pipe_payload(uint64_t fd);
@@ -650,7 +653,9 @@ int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t count);
 int lpr_linux_default_signal_ignored(uint32_t sig);
 int lpr_linux_default_signal_stops(uint32_t sig);
 int lpr_linux_eventfd_active(uint64_t fd);
+int lpr_linux_timerfd_active(uint64_t fd);
 int lpr_linux_drm_fd_active(uint64_t fd);
+int lpr_linux_input_fd_active(uint64_t fd);
 lpr_dmabuf_fd_t *lpr_fd_dmabuf_payload(uint64_t fd);
 int lpr_linux_dmabuf_fd_active(uint64_t fd);
 int lpr_linux_filed_fd_active(uint64_t fd);
@@ -676,6 +681,7 @@ int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
+int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd);
 int lpr_runtime_reserved_fd(uint64_t fd);
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int lpr_timespec_less_equal( const struct pachaos_timespec *lhs, const struct pachaos_timespec *rhs);
@@ -720,6 +726,10 @@ int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec);
 int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec);
 int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags);
+int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags);
+int64_t lpr_linux_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_value, uint64_t old_value);
+int64_t lpr_linux_timerfd_gettime(uint64_t fd, uint64_t current_value);
+int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw);
 int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags);
 int64_t lpr_linux_fchdir(uint64_t fd);
@@ -822,6 +832,7 @@ uint32_t lpr_control_status_flags_to_linux(uint32_t status);
 uint32_t lpr_fd_table_live_file_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
 uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events);
+uint32_t lpr_linux_timerfd_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_first_pending_signal(uint64_t mask);
 uint32_t lpr_linux_native_fd_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events);
