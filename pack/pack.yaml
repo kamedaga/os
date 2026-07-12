@@ -143,6 +143,40 @@ apps:
         - "tools/build_wsl_alpine_input.sh"
     out: "INPUTROOT"
     rootfs: "/"
+  alpine_sway:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-sway-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_sway.sh"]
+      input:
+        - "tools/build_wsl_alpine_sway.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "tools/build_wsl_alpine_input.sh"
+    out: "SWAYROOT"
+    rootfs: "/"
+  sway_inventory_script:
+    file:
+      path: "tests/fixtures/sway_inventory.sh"
+    out: "SWAYINV.SH"
+    rootfs: "/cmd/sway_inventory.sh"
+  lpr_sway_launcher:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_sway_launcher.elf"
+      rebuild: ["bash", "tools/build_wsl_sway_launcher.sh"]
+      input:
+        - "tools/build_wsl_sway_launcher.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_sway_launcher.c"
+    out: "LPRSWAYL.ELF"
+    rootfs: "/cmd/lpr_sway_launcher.elf"
+  lpr_wayland_shm_client:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_wayland_shm_client.elf"
+      rebuild: ["bash", "tools/build_wsl_wayland_shm_client.sh"]
+      input:
+        - "tools/build_wsl_wayland_shm_client.sh"
+        - "tools/build_wsl_alpine_sway.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_wayland_shm_client.c"
+    out: "LPRWLSHM.ELF"
+    rootfs: "/cmd/lpr_wayland_shm_client.elf"
   alpine_go:
     file:
       path: ".artifacts/userland-fixtures/alpine-go-root"

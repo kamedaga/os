@@ -10,6 +10,9 @@ tools/*
 !tools/build_virtio_input_sysfs.sh
 !tools/build_wsl_alpine_input.sh
 !tools/build_wsl_libinput_smoke.sh
+!tools/build_wsl_alpine_sway.sh
+!tools/build_wsl_sway_launcher.sh
+!tools/build_wsl_wayland_shm_client.sh
 !tools/download_kobox_drm_modules.sh
 **/zig-out/
 kernel/.zig-cache/

@@ -440,8 +440,71 @@ bootfs 増大時の起動停止は serial の `loadUserElfIntoProcessPages: scra
 ### Phase M5 — Sway + Wayland 
 
 **M5.1 wlroots/Sway 導入と棚卸し** — 修正せず証拠付き棚卸し、タスク分解して追記。
-**M5.2+ ギャップ実装**
-**M5.3 完了基準**: QEMU window に Sway が起動し、Wayland ミニアプリ (まず wl_shm クライアント、次に GL クライアント) が表示され、キー入力が反映される。screendump 検証 + 起動反復のリーク耐久スモーク green。
+
+**結果 (2026-07-12, working tree / commit なし)**: 製品機能を変更せず、Alpine v3.22 の Sway 1.10.1-r1 / wlroots 0.18.2-r1 と runtime dependency closure を既存 Mesa・input・clang overlay に重ねる増分 root overlay として導入した。Alpine の通常 `libseat` は使わず、M4 で作った seatd-only `libseat.so.1` と `libudev-zero` を引き続き正とした。package binary の再ビルドや wlroots patch は行っていない。恒久追加は package resolver/publisher、seatd と Sway を fork/exec する inventory launcher、最小 wl_shm/xdg-shell client、QEMU inventory runner だけである。後段を観測するため `statx` / udev monitor / DRM metadata・cap を一項目ずつ越える一時 `LD_PRELOAD` tunnel を使ったが、最終 rootfs と source diff から全て除去した。以下で「baseline」は tunnel なし、「診断到達」は一時 tunnel 使用と明記する。
+
+導入 package と容量:
+
+- 主 version: `sway 1.10.1-r1`, `wlroots 0.18.2-r1`, `wayland 1.23.1-r3`, `wayland-protocols 1.44-r0`, `libxkbcommon 1.8.1-r2`, `pixman 0.46.4-r0`。既存資産は Mesa 25.1.9、libinput 1.28.1、seatd/libseat 0.9.1。
+- resolver の runtime closure (既存 overlay と共有するものを含む): `brotli-libs cairo fontconfig freetype fribidi glib graphite2 harfbuzz hwdata-pci json-c lcms2 libblkid libbsd libbz2 libdisplay-info libdrm libeconf libelf libexpat libffi libgcc libintl libmd libmount libpciaccess libpng libstdc++ libx11 libxau libxcb libxdmcp libxext libxft libxkbcommon libxml2 libxrender libxshmfence llvm20-libs mesa mesa-egl mesa-gbm mesa-gles pango pcre2 pixman spirv-tools sway vulkan-loader wayland wayland-libs-client wayland-libs-cursor wayland-libs-egl wayland-libs-server wayland-protocols wlroots xcb-util-renderutil xcb-util-wm xkeyboard-config xz-libs zlib zstd-libs`。M4 input overlay の `seatd`, `seatd-launch`, seatd-only `libseat`, `libinput`, `libinput-libs`, `libinput-udev`, `libevdev`, `mtdev`, `libudev-zero` は再 publish せず共有した。`musl` / busybox は既存 LPR runtime と衝突するため closure から除外した。
+- build-only sysroot は `wayland-dev` + `wayland-protocols` (scanner/header/XML)。rootfs には publish しない。
+- closure の APK metadata 上の installed size 合計は 358,855,897 bytes (build-only `wayland-dev` を含む 62 records) だが、LLVM/Mesa/input と byte 同一の file は厳密比較後に除外するため、実 Sway 増分は **594 files / 20,514,081 bytes** (`du` 22 MiB)。build-only は 134 files / 1,609,112 bytes (`du` 2.2 MiB)。launcher 18,080 bytes、wl_shm client 24,208 bytes、runner script 2,105 bytesを含む rootfs publish 増分は **20,558,474 bytes**、最終 rootfs は **859,753,633 bytes / 3,712 files**。
+- BOOTFS への追加は 0 bytes。最終 `.artifacts/BOOTFS.IMG` は **16,458,200 bytes** で、16 MiB (16,777,216) まで **319,016 bytes**。Sway/Mesa は rootfs のみ。
+
+段階別到達点:
+
+| 段 | baseline / 診断到達の証拠 | 判定 |
+|---|---|---|
+| a. version・process 初期化 | baseline `sway --version` は loader relocation で `libgio-2.0.so.0: statx: symbol not found` と `libmount.so.1: statx: symbol not found`、status 127。`statx` を ENOSYS にするだけの一時 symbol tunnel では `sway version 1.10.1`、Sway/wlroots version log、`Initializing Wayland server` まで到達。空 config を `/tmp` から読めた。 | package/DSO 閉包は揃ったが LPR libc symbol 面が baseline blocker。DBus/logind access は観測されず、seatd-only libseat closure に `libelogind`/DBus はない。 |
+| b. seat/libinput | compiled launcher で direct seatd を起動すると `Created seat seat0`、client connect、`Seat opened with backend 'seatd'`、`Enabling seat`、`Successfully loaded libseat session`。baseline の次は udev monitor 作成が `Address family not supported by protocol`。eventless monitor tunnel + `headless,libinput` 対照は session まで通るが `libinput initialization failed, no input devices`。 | M4 の seatd AF_UNIX/SCM_RIGHTS は再利用可。wlroots は M4 fixture の libinput path backendを選ばず、udev backend/monitor/enumerationが必要。XKB data は導入済みだが keyboard が列挙されず keymap compile は未到達。 |
+| c. DRM backend | udev monitor tunnel + `WLR_DRM_DEVICES=/dev/dri/card0` で seatd が card0 を開き `Found 1 GPUs`。最初は `drmGetDeviceNameFromFd2() failed: ENOENT`。fd-name tunnel 後は `Initializing DRM backend ... (virtio_gpu)`、次に `DRM universal planes unsupported`。`WLR_DRM_NO_ATOMIC=1` 対照も同じ地点。universal planes、`DRM_CAP_CRTC_IN_VBLANK_EVENT`、`DRM_CAP_TIMESTAMP_MONOTONIC` だけを順に診断 tunnel すると、実 atomic cap 応答に対して `Atomic modesetting unsupported, using legacy DRM interface`、`ADDFB2 modifiers supported`、`Found 1 DRM CRTCs` まで進み、`DRM_IOCTL_MODE_OBJ_GETPROPERTIES` 相当で `Failed to get DRM object properties: ENOTTY`。 | wlroots 0.18.2 は **atomic 非対応なら legacy へ fallback する**ことを実測。atomic 実装は最初の必須 blocker ではない。ただし universal-plane client cap、vblank/timestamp caps、object/property/plane enumeration は legacy 利用時も必須。multi-plane/modifier の実 commit は property 枚挙より後で未到達。 |
+| d. renderer | 実 DRM path は properties で止まり renderer 未到達。診断用 headless は DRM render FD がないため `Cannot create GLES2 renderer: no DRM FD`、自動で `Creating pixman renderer`。明示 pixman でも同じ。shm allocator object は作るが XR24/AR24/RG16 の explicit/implicit modifier 全試行で `Failed to allocate buffer`。 | 実 card0 上で GLES2 + llvmpipe が選ばれるかは **未検証**。headless の pixman 成功を実画面 renderer 成功とは数えない。wlroots shm allocator と現 memfd/filed 契約にも独立 gap がある。 |
+| e. Wayland socket | headless 診断では output を disable した後も `Starting backend on wayland display 'wayland-1'`、`Running compositor on wayland display 'wayland-1'`。最小 client は stale `wayland-0` の ECONNREFUSED を避け `wayland-1` に接続し、`wl_compositor=1 wl_shm=1 xdg=1` globals を取得。 | netd の AF_UNIX bind/listen/connect/accept/poll は Wayland server/clientにも届く。`accept4` syscall 288 は ENOSYS traceだが libwayland fallback後に接続成功。stale socket unlinkが `I/O error` になる別 gapあり。 |
+| f. 最初の frame | 実 DRM は c で停止。headless output は swapchain buffer allocation 全失敗で disableされ、QEMU scanoutへ一度も commitしていない。 | Sway由来 screendump marker/pixel checkは未到達。既存 boot/KMS画像を成功扱いしていない。 |
+| g. wl_shm client | client は `memfd_create` + `ftruncate` + shared mmapで 256x192 ARGB8888 (196,608 bytes) を作り、`wl_shm_pool_create_buffer` まで成功。最初の protocol flush/roundtripで `EBADF`、xdg configure 0のまま終了。LPR `sendmsg(SCM_RIGHTS)` 実装を確認すると INPUT/DRM kind以外を明示 `EBADF` にし、filed memfdを転送できない。 | connection/core globals/memfd local mapping は成功、memfd FD transferが blocker。surface configure/attach/commit/display は未到達。 |
+
+追加観測:
+
+- headless Sway は xcursor theme `default` を size 24 で読み込めた。XKB rules/data (`/usr/share/X11/xkb`) は package に存在するが、keyboard 未列挙のため runtime 完走は未検証。
+- `socketpair failed: Not supported` により `swaybg` spawn が失敗。`/usr/bin/Xwayland` 不在も log されるが、両方とも headless compositor loop開始には非致命。`swaybg`/Xwayland は今回 hard dependency として追加していない。
+- `Unable to determine kernel version`、realtime priority取得失敗、syscall 157 `prctl`、147 `sched_getscheduler`、143 `sched_getparam`、324 `membarrier` の ENOSYSを観測。今回の到達範囲では fallback/非致命だが仕様化対象。
+- fixture 設営時、`mkdir /tmp/m51-sway-runtime` は `EACCES`、shell background は `/dev/null` 不在で停止、`seatd-launch` は bind/listen後の `chown("/run/seatd.sock")` が ENOENT、stale Wayland socket `rm` は I/O error。direct seatdをcompiled launcherからforkする経路は成功した。これは product修正せず記録した。
+- first frame、client表示、input反映へ未到達なので QMP入力の恒久形は M4と同じ `--input-send-event 'SWAY_INPUT_READY@key:a=down,key:a=up,rel:x=7,rel:y=-4,btn:left=down,btn:left=up'` とする案だけ固定する。`SWAY_INPUT_READY` は compositor socket ready **かつ** client surface configured **かつ** keyboard/pointer device列挙完了後に出す。そこより前のmarkerへ注入して成功値を作らない。
+
+不足機能の分類:
+
+| 症状 | 証拠 | 推定領域 | 想定作業量 |
+|---|---|---|---|
+| Alpine DSOをloadできない | baseline `libgio`/`libmount`: `statx: symbol not found`, status 127 | LPR libc/syscall symbol surface | S: symbol + ENOSYS/fallback契約、loader smoke |
+| XDG runtime/daemon設営がLinux契約を満たさない | subdir mkdir EACCES、`/dev/null` ENOENT、stale socket unlink I/O error | filed + LPR VFS/device nodes | M: mkdir/chmod/unlink/S_IFSOCK lifetimeと `/dev/null` |
+| `seatd-launch` がtargetをexecできない | seatd ready後 `chown(/run/seatd.sock)=ENOENT`; direct launcherはseat0成功 | filed pathname metadata + netd socket node + LPR chown | M |
+| udev hotplug monitor作成不能 | session `Failed to create udev monitor: EAFNOSUPPORT` | LPR/netd (AF_NETLINK/uevent) + libudev-zero | L |
+| udev GPU/input discovery不成立 | monitor tunnel後 `udev_enumerate_scan_devices failed`; libinput backend `no input devices` | filed sysfs metadata + libudev-zero + inputd/drmd publication | M〜L |
+| DRM fdからdevice nameを復元できない | fixed card open/1 GPU後 `drmGetDeviceNameFromFd2()=ENOENT` | LPR/filed `/sys/dev/char`・fd metadata | M |
+| wlroots legacy DRM前提面が不足 | universal planes、CRTC_IN_VBLANK_EVENT、TIMESTAMP_MONOTONICがunsupported、GETPROPERTIES ENOTTY | drmd + LPR DRM marshalling。_koboxは実Linux DRM stateが必要と証明された部分のみ | L |
+| atomicはunsupported | tunnel後 `Atomic modesetting unsupported, using legacy DRM interface` | drmd | L (M5 first-frameの必須条件ではなく、legacy完走後に独立実装) |
+| 実renderer選択未到達 | DRM propertiesで停止。headlessはDRM FDなしでGLES2 skip→pixman | drmd gap解消後の Mesa/wlroots設定 | M: llvmpipe実値、format/modifier negotiationを再棚卸し |
+| wlroots shm allocatorのbuffer確保失敗 | allocator object作成後 XR24/AR24/RG16 の全試行 `Failed to allocate buffer` | LPR/filed memfd/seal/ftruncate/mmap または wlroots allocator条件 | M: syscall/errno traceから開始 |
+| WaylandでmemfdをSCM_RIGHTS転送不能 | client pool/buffer作成後 roundtrip EBADF。LPRがINPUT/DRM kindのみ許可 | LPR + netd + filed generic FD duplicate/lifetime/rights | L |
+| `socketpair(AF_UNIX)` 不足 | Sway `socketpair failed: Not supported`、swaybg spawn不可 | netd + LPR socket | M |
+| XKB runtime未検証 | data fileは存在、libinput udevがdevice 0でkeymap compile未到達 | package + inputd/filed/libudev + libxkbcommon | M (device列挙後に実測) |
+| process/realtime補助面 | kernel version不明、prctl/sched_get* ENOSYS。Sway本体はheadless loopまで継続 | LPR process/scheduler | S〜M、非致命項目はfirst-frame後に優先度判定 |
+| optional helper不足 | `/usr/bin/Xwayland` 不在、swaybg package未導入 | package + socketpair/process | S (Wayland章完了にはXwayland不要、swaybgはsolid background方針と比較) |
+
+**M5.2+ ギャップ実装案 (依存順)**
+
+1. **M5.2 Sway process/runtime baseline** — `statx` symbol/syscall fallback、`/dev/null`、mkdir/chmod/unlinkとS_IFSOCK pathname lifetimeをLPR/filed側でLinux契約化する。`seatd-launch` chown問題も同じpathname traceで直し、kernelへ移さない。受け入れ: tunnelなし `sway --version` status 0、compiled launcher/direct seatdと`seatd-launch`の双方で `Initializing Wayland server`、20回起動終了でstale socketなし。
+2. **M5.3 udev/session discovery** — AF_NETLINK uevent monitor、libudev-zero enumerate、`/sys/dev/char`/PCI/drm/input metadataを実device stateから成立させる。M4 path backendは回避策として残さず、wlroots/libinput udev backendを通す。受け入れ: `WLR_DRM_DEVICES`/monitor tunnelなしで card0 + event0/1を列挙、seat0 enable、hotplug monitor pollがidle時busy loopせず、QMP add/remove相当または再scan test。
+3. **M5.4 wlroots legacy DRM contract** — universal-plane client cap、CRTC_IN_VBLANK_EVENT/TIMESTAMP_MONOTONIC、plane/CRTC/connector/encoder、OBJ_GETPROPERTIES/property blob、format/modifierを一つの整合stateとしてdrmdへ実装する。atomicはunsupportedを正しく返しwlroots legacy fallbackを最初の経路にする。受け入れ: tunnelなしで `Atomic modesetting unsupported, using legacy DRM interface` の後、1 connector/CRTC/primary planeを列挙し renderer作成直前まで到達。偽capだけ返す実装は禁止。
+4. **M5.5 allocator/renderer/first frame** — DRM GBM allocatorとheadless shm allocator失敗をerrno付きで分離し、実 card0で GLES2 + Mesa llvmpipeを選ぶ。`WLR_RENDERER_ALLOW_SOFTWARE=1` の恒久設定場所をpackage config/launcherのどちらに置くか根拠化する。受け入れ: logに renderer=`llvmpipe` 相当の実値、XR24 swapchain 2枚、legacy page-flip event継続、solid background marker後のscreendump pixel green。pixman/headlessを実画面成功に代用しない。
+5. **M5.6 generic SCM_RIGHTS + wl_shm** — filed memfd/VMOをAF_UNIXで複製転送できるgeneric transferable FD契約をLPR/netd/filedに追加し、rights/lifetime/close/MSG_CMSG_CLOEXECをtestする。`accept4` fallbackも仕様化。受け入れ: 最小clientが connect→globals→196,608-byte memfd transfer→xdg configure→attach/commit、#336699 rectangle screendump green、sender/receiverを各20回killしてFD/VMO leakなし。
+6. **M5.7 wlroots libinput + XKB + QMP入力** — M5.3のudev列挙上でkeyboard/mouseをSway seat0へ追加し、libxkbcommonがAlpine XKB dataからkeymapをcompileする。受け入れ: `SWAY_INPUT_READY`後に固定QMP列を注入し、KEY_A press/release、REL 7/-4、BTN_LEFT press/releaseがclientへ届く。locale/XKB file open pathもtraceで記録。
+7. **M5.8 compositor helper/process面** — AF_UNIX socketpairとSway child helper lifecycleを実装し、solid backgroundをSway内描画にするか`swaybg` packageを追加するか実測で選ぶ。Xwaylandは第二章の完了条件外なので警告抑制/明示disableを先行し、package導入はM6へ分離可能。受け入れ: helper failureなし、SIGTERM/SIGKILL/normal exitでseatd/Sway/client orphan・stale socketなし。
+8. **M5.9 end-to-end/耐久** — actual DRM + llvmpipe + wl_shm client + inputを統合する。受け入れ: QEMU window手動確認、背景/client色のscreendump、固定QMP入力、Sway/client 20 restart、既存 DRM/Mesa/input/full regression green。ここを第二章 Phase M5完了判定にする。
+
+最終検証: tunnel除去・overlay再生成後の baseline inventory runner green (期待する status 127 と完了markerを回収)、既存 `libinput+seatd` smoke green (2 devices + QMP key/motion/button)、Mesa inventory green (llvmpipe + KMS cyan screendump)、`pack go test ./...`、全追加shellの `bash -n`、`git diff --check` green。kernel/ABI/_koboxの変更はない。
+
+**Phase M5 完了基準 (従来 M5.3 と記載)**: QEMU window に Sway が起動し、Wayland ミニアプリ (まず wl_shm クライアント、次に GL クライアント) が表示され、キー入力が反映される。screendump 検証 + 起動反復のリーク耐久スモーク green。
 M6.Xに向けてテスト時のinput注入方法もここで固定してほしい
 
 ### Phase M6 Sway + Waylandの実用化 (追加で)
