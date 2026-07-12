@@ -28,9 +28,6 @@ enum {
     DRMD_KMS_PLANE_ID = 61,
     DRMD_VIRTIO_GPU_OBJECT_BYTES = 0x2c0,
     DRMD_GEM_DEV_OFFSET = 0x08,
-    DRMD_VIRTIO_GPU_FENCE_DRIVER_OFFSET = 0xf278,
-    DRMD_VIRTIO_GPU_FENCE_CONTEXT_OFFSET = 0x10,
-    DRMD_VIRTIO_GPU_FENCE_ID_OFFSET = 0x48,
     DRMD_POLLIN = 0x0001,
 };
 
@@ -69,7 +66,6 @@ typedef void (*drmd_object_attach_fn)(void *, void *, void *, unsigned int);
 typedef void (*drmd_set_scanout_fn)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
 typedef void (*drmd_transfer_2d_fn)(void *, uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, void *, void *);
 typedef void (*drmd_flush_fn)(void *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void *, void *);
-typedef void *(*drmd_fence_alloc_fn)(void *, uint64_t, uint32_t);
 typedef void (*drmd_notify_fn)(void *);
 typedef void (*drmd_unref_resource_fn)(void *, void *);
 typedef void *(*drmd_array_alloc_fn)(uint32_t);
@@ -119,15 +115,6 @@ typedef struct drmd_kms_event_file {
     drmd_event_vblank_t events[DRMD_KMS_EVENT_QUEUE_MAX];
 } drmd_kms_event_file_t;
 
-typedef struct drmd_kms_pending_flip {
-    int active;
-    uint64_t owner;
-    uint64_t user_data;
-    uint32_t fb_id;
-    uint64_t fence_id;
-    void *fence;
-} drmd_kms_pending_flip_t;
-
 typedef struct drmd_kms_state {
     int ready;
     uint64_t master_handle;
@@ -147,7 +134,6 @@ typedef struct drmd_kms_state {
     drmd_set_scanout_fn set_scanout;
     drmd_transfer_2d_fn transfer_2d;
     drmd_flush_fn flush;
-    drmd_fence_alloc_fn fence_alloc;
     drmd_notify_fn notify;
     drmd_unref_resource_fn unref_resource;
     drmd_array_alloc_fn array_alloc;
@@ -156,7 +142,6 @@ typedef struct drmd_kms_state {
     drmd_kms_gem_handle_t gem_handles[DRMD_KMS_GEM_HANDLE_MAX];
     drmd_kms_fb_t fb[DRMD_KMS_FB_MAX];
     drmd_kms_event_file_t event_files[DRMD_KMS_EVENT_FILE_MAX];
-    drmd_kms_pending_flip_t pending_flip;
 } drmd_kms_state_t;
 
 typedef struct drmd_kms_owner_context {
@@ -255,7 +240,6 @@ int drmd_kms_init(struct drmd_drm_island *island)
         find_symbol("virtio_gpu_cmd_set_scanout", (void **)&kms.set_scanout) != 0 ||
         find_symbol("virtio_gpu_cmd_transfer_to_host_2d", (void **)&kms.transfer_2d) != 0 ||
         find_symbol("virtio_gpu_cmd_resource_flush", (void **)&kms.flush) != 0 ||
-        find_symbol("virtio_gpu_fence_alloc", (void **)&kms.fence_alloc) != 0 ||
         find_symbol("virtio_gpu_notify", (void **)&kms.notify) != 0 ||
         find_symbol("virtio_gpu_cmd_unref_resource", (void **)&kms.unref_resource) != 0 ||
         find_symbol("virtio_gpu_array_alloc", (void **)&kms.array_alloc) != 0 ||
@@ -678,7 +662,7 @@ int drmd_kms_prime_release(uint64_t token)
     return 0;
 }
 
-static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb, void **out_fence, uint64_t *out_fence_id)
+static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
 {
     drmd_kms_gem_handle_t *gem = fb == NULL ? NULL : find_gem_handle(owner, fb->handle);
     drmd_kms_buffer_t *buffer = gem != NULL ? gem->buffer : NULL;
@@ -687,41 +671,23 @@ static int submit_scanout_fb(uint64_t owner, drmd_kms_fb_t *fb, void **out_fence
     }
     drmd_kms_owner_context_t context;
     const int entered = enter_module(&context);
-    void *fence = NULL;
-    if (out_fence != NULL && out_fence_id != NULL) {
-        uint64_t fence_context = 0;
-        memcpy(&fence_context,
-            (uint8_t *)kms.vgdev + DRMD_VIRTIO_GPU_FENCE_DRIVER_OFFSET +
-                DRMD_VIRTIO_GPU_FENCE_CONTEXT_OFFSET,
-            sizeof(fence_context));
-        fence = kms.fence_alloc(kms.vgdev, fence_context, 0);
-        if (fence == NULL) {
-            if (entered) leave_module(&context);
-            return -12;
-        }
-    }
     void *objects = kms.array_alloc(1);
     if (objects == NULL) {
-        if (fence != NULL) kb_kfree(fence);
         if (entered) leave_module(&context);
         return -12;
     }
     kms.array_add(objects, buffer->object);
     kms.transfer_2d(kms.vgdev, 0, fb->width, fb->height, 0, 0, objects, NULL);
     kms.set_scanout(kms.vgdev, 0, buffer->resource_id, fb->width, fb->height, 0, 0);
-    kms.flush(kms.vgdev, buffer->resource_id, 0, 0, fb->width, fb->height, NULL, fence);
+    kms.flush(kms.vgdev, buffer->resource_id, 0, 0, fb->width, fb->height, NULL, NULL);
     kms.notify(kms.vgdev);
-    if (fence != NULL) {
-        memcpy(out_fence_id, (uint8_t *)fence + DRMD_VIRTIO_GPU_FENCE_ID_OFFSET, sizeof(*out_fence_id));
-        *out_fence = fence;
-    }
     if (entered) leave_module(&context);
     return 0;
 }
 
 static int scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
 {
-    const int status = submit_scanout_fb(owner, fb, NULL, NULL);
+    const int status = submit_scanout_fb(owner, fb);
     if (status != 0) {
         return status;
     }
@@ -733,6 +699,29 @@ static int scanout_fb(uint64_t owner, drmd_kms_fb_t *fb)
 static int require_master(uint64_t handle)
 {
     return kms.master_handle == handle ? 0 : -13;
+}
+
+static void queue_flip_event(
+    drmd_kms_event_file_t *event_file,
+    uint64_t user_data,
+    uint32_t fb_id)
+{
+    const uint32_t tail =
+        (event_file->head + event_file->count) % DRMD_KMS_EVENT_QUEUE_MAX;
+    drmd_event_vblank_t *event = &event_file->events[tail];
+    memset(event, 0, sizeof(*event));
+    struct timespec now;
+    memset(&now, 0, sizeof(now));
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    event->type = DRMD_EVENT_FLIP_COMPLETE;
+    event->length = sizeof(*event);
+    event->user_data = user_data;
+    event->tv_sec = now.tv_sec < 0 ? 0u : (uint32_t)now.tv_sec;
+    event->tv_usec = now.tv_nsec < 0 ? 0u : (uint32_t)(now.tv_nsec / 1000);
+    event->sequence = ++kms.sequence;
+    event->crtc_id = DRMD_KMS_CRTC_ID;
+    event_file->count++;
+    kms.current_fb = fb_id;
 }
 
 static int ioctl_resources(drmd_kms_resources_wire_t *wire)
@@ -903,18 +892,10 @@ int drmd_kms_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request
         if (flip->flags == 0) return scanout_fb(request->handle, fb);
         drmd_kms_event_file_t *event_file = find_event_file(request->handle);
         if (event_file == NULL) return -9;
-        if (kms.pending_flip.active) return -16;
         if (event_file->count >= DRMD_KMS_EVENT_QUEUE_MAX) return -28;
-        void *fence = NULL;
-        uint64_t fence_id = 0;
-        const int status = submit_scanout_fb(request->handle, fb, &fence, &fence_id);
+        const int status = submit_scanout_fb(request->handle, fb);
         if (status != 0) return status;
-        kms.pending_flip.active = 1;
-        kms.pending_flip.owner = request->handle;
-        kms.pending_flip.user_data = flip->user_data;
-        kms.pending_flip.fb_id = fb->id;
-        kms.pending_flip.fence_id = fence_id;
-        kms.pending_flip.fence = fence;
+        queue_flip_event(event_file, flip->user_data, fb->id);
         return 0;
     }
     case DRMD_IOCTL_MODE_GETPLANERESOURCES: {
@@ -974,36 +955,6 @@ void drmd_kms_handle_open(uint64_t handle)
     if (kms.master_handle == 0) kms.master_handle = handle;
 }
 
-void drmd_kms_handle_irq(void)
-{
-    if (!kms.pending_flip.active) return;
-    uint64_t completed_fence_id = 0;
-    memcpy(&completed_fence_id,
-        (uint8_t *)kms.vgdev + DRMD_VIRTIO_GPU_FENCE_DRIVER_OFFSET,
-        sizeof(completed_fence_id));
-    if (completed_fence_id < kms.pending_flip.fence_id) return;
-    drmd_kms_event_file_t *event_file = find_event_file(kms.pending_flip.owner);
-    if (event_file != NULL && event_file->count < DRMD_KMS_EVENT_QUEUE_MAX) {
-        const uint32_t tail = (event_file->head + event_file->count) % DRMD_KMS_EVENT_QUEUE_MAX;
-        drmd_event_vblank_t *event = &event_file->events[tail];
-        memset(event, 0, sizeof(*event));
-        struct timespec now;
-        memset(&now, 0, sizeof(now));
-        (void)clock_gettime(CLOCK_MONOTONIC, &now);
-        event->type = DRMD_EVENT_FLIP_COMPLETE;
-        event->length = sizeof(*event);
-        event->user_data = kms.pending_flip.user_data;
-        event->tv_sec = now.tv_sec < 0 ? 0u : (uint32_t)now.tv_sec;
-        event->tv_usec = now.tv_nsec < 0 ? 0u : (uint32_t)(now.tv_nsec / 1000);
-        event->sequence = ++kms.sequence;
-        event->crtc_id = DRMD_KMS_CRTC_ID;
-        event_file->count++;
-    }
-    kms.current_fb = kms.pending_flip.fb_id;
-    kb_kfree(kms.pending_flip.fence);
-    memset(&kms.pending_flip, 0, sizeof(kms.pending_flip));
-}
-
 int drmd_kms_read(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_size)
 {
     if (data == NULL || out_size == NULL) return -22;
@@ -1034,14 +985,6 @@ int drmd_kms_poll(uint64_t handle, uint32_t events, uint32_t *out_revents)
 
 void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle)
 {
-    if (kms.pending_flip.active && kms.pending_flip.owner == handle) {
-        while (kms.pending_flip.active) {
-            if (kb_handle_any_irq(1000000ull) == 0) {
-                drmd_kms_handle_irq();
-            }
-            kb_run_deferred_work();
-        }
-    }
     drmd_kms_event_file_t *event_file = find_event_file(handle);
     if (event_file != NULL) memset(event_file, 0, sizeof(*event_file));
     if (kms.master_handle == handle) kms.master_handle = 0;
@@ -1083,7 +1026,6 @@ void drmd_kms_get_state_counts(drmd_kms_state_counts_t *out_counts)
     for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
         out_counts->dumb += kms.gem_handles[i].active ? 1u : 0u;
     }
-    out_counts->events = kms.pending_flip.active ? 1u : 0u;
     for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; i++) {
         if (kms.event_files[i].active) {
             out_counts->event_queues++;

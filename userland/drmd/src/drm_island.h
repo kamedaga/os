@@ -37,4 +37,3 @@ int drmd_drm_island_prime_import(
     uint64_t *out_gem_handle);
 int drmd_drm_island_prime_acquire(struct drmd_drm_island *island, uint64_t token);
 int drmd_drm_island_prime_release(struct drmd_drm_island *island, uint64_t token);
-void drmd_drm_island_handle_irq(struct drmd_drm_island *island);

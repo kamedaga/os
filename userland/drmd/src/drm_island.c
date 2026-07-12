@@ -489,10 +489,3 @@ int drmd_drm_island_prime_release(struct drmd_drm_island *island, uint64_t token
 {
     return island != NULL && island->ready ? drmd_kms_prime_release(token) : -19;
 }
-
-void drmd_drm_island_handle_irq(struct drmd_drm_island *island)
-{
-    if (island != NULL && island->ready) {
-        drmd_kms_handle_irq();
-    }
-}

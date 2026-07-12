@@ -399,6 +399,18 @@ PachaOS は既存LPR syscall metricを一時有効化し、同一bootの `target
 
 最終回帰は normal fixture/runtimeへ復元したfresh diskで mesa-inventory（default e + LP_NUM_THREADS=2 d、cyan screendump）、clang-cold（guest 2秒 / host 6秒）、drm-page-flip既定20 + cube8（raw 60.975fps、cube 19.370fps、event/pixel全green）、kms-modeset（red -> cyan）と `zig build kernel` がgreen。フル回帰はオーケストレーター実施待ち。恒久diffはこの3巡目記録だけで、計測ログは `.artifacts/m36c-*`、Linux strace summaryは `.artifacts/m3.6b-linux-baseline/linux-baseline-console.log` に残した。
 
+**4巡目結果 (M3.6d, 2026-07-12, working tree / commit なし)**: フレーム側だけを再診断した。Linux baseline再実行は raw 1000回 2314.869fps、cube 100回 298.902fps、cube内訳 draw/swap/submit/wait=0.35/1.42/0.02/1.03ms/frame。Linux 6.8 sourceでは通常のprimary dumb flipは full-frame `TRANSFER_TO_HOST_2D`（fenceなし）→ framebuffer/resourceが変わる時の`SET_SCANOUT`→`RESOURCE_FLUSH`（fenceなし）をqueueし、vblank未初期化のためatomic helperがsubmit直後にfake-vblank event（sequence=0）を送る。QEMU traceでもfixtureのresource 3/4は初期modesetを含めtransfer/set-scanout/flush=501/501/501回と500/500/500回、fence event=0回で、1000 flip各1回を確認した。したがって2-buffer rawでSET_SCANOUTを省ける仮説は棄却した。
+
+PachaOS旧経路は同じ3 commandのうちflushだけにvirtio fenceを付け、controlq順序により先行transfer/set-scanoutも完了した後、`last_fence_id`到達をIRQ→deferred work→drmd event化していた。Linuxに合わせてevent flipのfence allocation/待ちとpending-fence stateを削除し、3 commandを維持したままnotify直後に既存形式のeventをqueueするよう変更した。単独変更は raw 58.858→58.837fps、cube 20.997→20.050fpsで効果がなく、原因はdrmd mainが各IPC reply後に必ずcompletionを処理し、次のPOLL/READ RPCを直列化していたためだった。device pumpを最大16 IPC dispatchごとの有界batch（endpoint idle時は即pump）にし、順序もIRQ dequeue→deferred workへ修正すると、同一timing buildでraw 70.057→212.811fps、1000回合計のfill/submit/wait/readは2405/3687/7101/1079ms→1922/1547/749/452msとなった。32 IPC batchは170.241fpsで改善せず、16へ戻した。
+
+normal fixtureの同一1000/cube8手順は旧58.962/20.100fps→最終169.491/23.952fps（raw 2.88倍、cube 1.19倍）。eventは1000/1000、user_data、sequence 1→1000、timestamp単調、magenta/red→green screendumpがgreenで、TRANSFER/SET_SCANOUT/FLUSHは削っていない。8-frame timing buildでは旧draw/swap/submit/wait=15.13/20.13/3.50/8.38ms/frameに対し11.75/29.00/3.75/<0.13ms/frameで、flip event待ちは消えたがswapのrun間変動が支配した。毎frameのserial printを計測時だけ抑えた60-frame診断はdraw/swap/submit/wait=2.30/25.78/1.85/0.23ms/frame、24.439fpsで、恒久fixture変更は0。LP_NUM_THREADS=1/2も16.891/16.497fpsで改善せずrevertした。
+
+目標判定はrawが58.8fps級から170fps級へ改善したが「最低でも数百fps」には安定到達せず、cube 60fpsも未達。残差はrawでmapped dumb fill約2.2ms、page-flip submit IPC約1.45ms、poll/read約1.05ms、その他約1.2ms（最終host変動込み約5.9ms/frame）、cubeはEGL swap約25.8msが最大で、KMS submit/event waitは約2.1ms。次設計はdrmd-LPR間のshared event ring + native wait capabilityでpoll/read RPCを除くこと、private control page/IPC allocationの再利用を測ること、llvmpipe worker完了をguest samplingまたはfutex/scheduler spanで分解してGBM dumbへのdirect present統合可否を判断すること。dumb fillのLinux差はmapping/cache属性をuserland/_koboxから先に測り、kernel仮説へ飛ばない。
+
+最終回帰はdrm-page-flip既定20/cube8（raw 176.991fps、cube 25.806fps）と1000/cube8、kms-modeset、drm-restart 20/20、mesa-inventory、clang-cold（guest 2秒 / host 6秒）、userland sync build、`zig build kernel`がgreen。fresh diskの初回1000/cube8は全frame/event/pixel成功後の既知process-exit停止だったため、timeout前にorphan runnerを除去して同一disk単体再実行しgreen。旧`efi` stepは現build graphに存在しない。kernel、公開ABI、private wire layout、_koboxの変更はない。計測ログは`.artifacts/m36d-*`、Linux QEMU traceは`.artifacts/m3.6b-linux-baseline/qemu-raw-flip.trace`に残した。
+
+**5巡目結果 (M3.6e, 2026-07-12, 中断 → M6.0 へ移管)**: 仮説を置かない内訳計測の過程で、`smp.startIdleAps()` が定義されているのに Limine boot 経路から呼ばれておらず、**PachaOS が QEMU の 4 vCPU 中 1 CPU しか起動していない**ことを発見した (commit `29ee24f` の Limine 移行で旧 UEFI 経路の SMP prepare/start/configure が失われていた)。SMP 有効化に着手し、Limine RSDP 受け渡し + MADT 解析、1MiB 未満の SIPI trampoline 確保、AP の GDT/TSS/kernel stack/CR0.WP/EFER.NXE 整備、CPUID APIC-ID による CPU slot fallback、default scheduler の AP park 経路接続などを経て、`boot: cpus ready count=4` と **AP 上での user thread 実行 (syscall/IPC/filed 処理) まで成立**した。しかし allocator 同期 (`global_free_list` が lock なしで syscall 経路と page-fault COW 経路の両方から操作される)、remote thread teardown、AP timer preemption の context 保存契約、BSP への wake IPI、TLB shootdown が未完成で、boot 後段の lpr_supervisor exec が ENOMEM になり regression-green に到達しなかった。単発タスクではなくフェーズ規模の kernel 作業と判明したため、ユーザー判断でここで中断し **M6.0 として専用フェーズ化**した。WIP は `smp-wip` branch (f9bdde6) に全て保全し、判明事実・残作業の設計・性能期待値は `pacha_docs/smp-handoff-m36e.md` に記録した。main には kernel 差分を入れず、M3.6d の drmd 差分のみ採用して Phase M3 を締める。
+
 ### Phase M4 — 入力と seat
 
 **M4.1 virtio-input / evdev → libinput**
@@ -413,6 +425,11 @@ PachaOS は既存LPR syscall metricを一時有効化し、同一bootの `target
 M6.Xに向けてテスト時のinput注入方法もここで固定してほしい
 
 ### Phase M6 Sway + Waylandの実用化 (追加で)
+
+**M6.0 SMP (マルチコア) 本格対応 — M6 の最初に実施**
+- 背景: M3.6e で PachaOS が QEMU 4 vCPU 中 1 CPU しか起動していないことが判明 (詳細は M3.6 5巡目結果)。llvmpipe worker、Sway compositor とクライアントの並行実行、clang 系ワークロードの土台として、実用化の最初にここで完成させる。
+- 再開点: `smp-wip` branch (f9bdde6) に 4 CPU boot + AP user 実行まで動く WIP がある。引き継ぎレポート `pacha_docs/smp-handoff-m36e.md` の残作業を依存順に実施する: ① 物理 page allocator 同期の一元化 (page-fault 経路との lock order に注意) ② thread 実行所有権の state machine 化と remote teardown (stop IPI + quiescence 後の slot 再利用) ③ AP timer preemption の context 保存契約の再設計 (GPR/FS/GS/FX/CR3 の所有時点を明文化) ④ BSP idle/wake の周期 timer 非依存化と kernel-mode interrupt return 契約の検証 ⑤ address space ごとの active CPU mask と TLB shootdown ⑥ kernel 全域の SMP 監査 (boot log、global tables、_kobox callback 区間) ⑦ 段階的回帰。
+- 受け入れ: 4 CPU boot 20 回連続 green、既存フルバッテリー + 耐久スモーク green、cube / raw flip / clang cold / Sway 起動の before/after 計測。性能期待値は SMP 単独で cube 60fps を保証しない (Linux の LP_NUM_THREADS 比から 40〜45fps 推定、swap 待ちが single-CPU 直列化起因なら上振れ) ため、未達分は M6.1 で継続する。
 
 **M6.1 Swayの高速化** Swayの起動時間、平均フレームレート、マウス、キーボード遅延などを調査し分析後、修正して速度の向上を狙う
 **M6.2 Swayの実用化** 動いているがまだ実用には足りない部分を調査し、修正を行う。M6.1S Swayの高速化と一緒に行うことも検討する。

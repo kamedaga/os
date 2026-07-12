@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <string.h>
 
+enum { DRMD_REQUESTS_PER_DEVICE_PUMP = 16 };
+
 int main(void)
 {
     const struct drmd_boot_config *cfg =
@@ -31,6 +33,7 @@ int main(void)
     if (ready_status != 0 || init_status != 0) {
         return 1;
     }
+    unsigned requests_since_pump = 0;
     for (;;) {
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
@@ -41,12 +44,13 @@ int main(void)
         const int status = pacha_ipc_recv((int)cfg->drm_endpoint_fd, &request);
         if (status == 0) {
             (void)drmd_service_dispatch(&service, &request, fds);
+            requests_since_pump++;
+            if (requests_since_pump < DRMD_REQUESTS_PER_DEVICE_PUMP) continue;
         } else if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY) {
             return 1;
         }
+        requests_since_pump = 0;
+        (void)kb_handle_any_irq(0);
         kb_run_deferred_work();
-        if (kb_handle_any_irq(0) == 0) {
-            drmd_drm_island_handle_irq(&island);
-        }
     }
 }
