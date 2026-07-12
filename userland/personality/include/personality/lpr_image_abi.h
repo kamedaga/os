@@ -8,7 +8,7 @@
  * belong to their respective internal headers.
  */
 
-#define LPR_IMAGE_ABI_VERSION 9ull
+#define LPR_IMAGE_ABI_VERSION 10ull
 
 /* Fixed process-image mappings. */
 #define LPR_IMAGE_PAGE_SIZE PERSONALITY_PAGE_SIZE
@@ -121,4 +121,4 @@
 #define LPR_BOOTSTRAP_CTTY_OFFSET 128u
 #define LPR_BOOTSTRAP_CWD_OFFSET 192u
 #define LPR_BOOTSTRAP_HEADER_SIZE 672u
-#define LPR_BOOTSTRAP_FD_ENTRY_SIZE 40u
+#define LPR_BOOTSTRAP_FD_ENTRY_SIZE 48u

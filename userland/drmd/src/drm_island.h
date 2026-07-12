@@ -14,7 +14,7 @@ struct drmd_drm_island {
 };
 
 int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_config *cfg);
-int drmd_drm_island_open(struct drmd_drm_island *island, const drmd_open_request_t *request, uint64_t *out_handle);
+int drmd_drm_island_open(struct drmd_drm_island *island, const drmd_open_request_t *request, int notify_fd, uint64_t *out_handle);
 int drmd_drm_island_close(struct drmd_drm_island *island, uint64_t handle);
 int drmd_drm_island_dup(struct drmd_drm_island *island, uint64_t handle, uint64_t *out_handle);
 int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request);
@@ -37,3 +37,4 @@ int drmd_drm_island_prime_import(
     uint64_t *out_gem_handle);
 int drmd_drm_island_prime_acquire(struct drmd_drm_island *island, uint64_t token);
 int drmd_drm_island_prime_release(struct drmd_drm_island *island, uint64_t token);
+void drmd_drm_island_notify_readable(struct drmd_drm_island *island);

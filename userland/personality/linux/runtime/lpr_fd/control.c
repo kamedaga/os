@@ -783,9 +783,14 @@ int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 
 int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
+    struct pacha_fd_info wait_info;
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
         return 0;
     }
+    if (desc->native_wait_fd != 0 &&
+        (desc->native_wait_fd > INT32_MAX ||
+         !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
+         wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
     if (lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_DRM, desc->flags, desc->handle, 0) != 0) {
         return 0;
     }
@@ -797,6 +802,7 @@ int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     drm->active = 1;
     drm->flags = desc->flags;
     drm->handle = desc->handle;
+    drm->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
     return 1;
 }
 
@@ -823,7 +829,12 @@ int lpr_restore_bootstrap_device_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 
 int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
+    struct pacha_fd_info wait_info;
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) return 0;
+    if (desc->native_wait_fd != 0 &&
+        (desc->native_wait_fd > INT32_MAX ||
+         !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
+         wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
     if (lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_INPUT, desc->flags, desc->handle, 0) != 0)
         return 0;
     lpr_input_fd_t *input = lpr_fd_input_payload(fd);
@@ -835,6 +846,7 @@ int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     input->reserved0 = (uint8_t)desc->offset_or_counter;
     input->flags = desc->flags;
     input->handle = desc->handle;
+    input->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
     return 1;
 }
 
@@ -891,9 +903,14 @@ int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 
 int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
+    struct pacha_fd_info wait_info;
     if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
         return 0;
     }
+    if (desc->native_wait_fd != 0 &&
+        (desc->native_wait_fd > INT32_MAX ||
+         !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
+         wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
     if (lpr_control_install_fd(
         fd,
         LPR_FD_TABLE_KIND_SOCKET,
@@ -915,6 +932,7 @@ int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     socket->type = (uint8_t)desc->offset_or_counter;
     socket->sndbuf = 256u * 1024u;
     socket->rcvbuf = 256u * 1024u;
+    socket->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
     return 1;
 }
 

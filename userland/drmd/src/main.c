@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum { DRMD_REQUESTS_PER_DEVICE_PUMP = 16 };
+enum { DRMD_ACTIVE_GRACE_TICKS = 4 };
 
 int main(void)
 {
@@ -16,7 +16,7 @@ int main(void)
         (const struct drmd_boot_config *)(uintptr_t)DRMD_BOOT_CONFIG_VA;
     if (cfg == NULL || cfg->magic != DRMD_BOOT_CONFIG_MAGIC ||
         cfg->drm_endpoint_fd < 16 || cfg->device_fd < 16 ||
-        cfg->ready_channel_fd < 16) {
+        cfg->ready_channel_fd < 16 || cfg->netd_endpoint_fd < 16) {
         return 1;
     }
     static struct drmd_drm_island island;
@@ -33,7 +33,9 @@ int main(void)
     if (ready_status != 0 || init_status != 0) {
         return 1;
     }
-    unsigned requests_since_pump = 0;
+    static struct pacha_service_wait_set wait_set;
+    if (pacha_service_wait_init(&wait_set, (int)cfg->drm_endpoint_fd) != 0) return 1;
+    unsigned active_grace_ticks = 0;
     for (;;) {
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
@@ -44,13 +46,17 @@ int main(void)
         const int status = pacha_ipc_recv((int)cfg->drm_endpoint_fd, &request);
         if (status == 0) {
             (void)drmd_service_dispatch(&service, &request, fds);
-            requests_since_pump++;
-            if (requests_since_pump < DRMD_REQUESTS_PER_DEVICE_PUMP) continue;
-        } else if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY) {
+            active_grace_ticks = DRMD_ACTIVE_GRACE_TICKS;
+        } else if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
+            (void)kb_handle_any_irq(0);
+            kb_run_deferred_work();
+            drmd_drm_island_notify_readable(&island);
+            (void)pacha_service_wait(
+                &wait_set,
+                active_grace_ticks != 0 ? 1u : PACHA_FD_WAIT_FOREVER);
+            if (active_grace_ticks != 0) active_grace_ticks--;
+        } else {
             return 1;
         }
-        requests_since_pump = 0;
-        (void)kb_handle_any_irq(0);
-        kb_run_deferred_work();
     }
 }

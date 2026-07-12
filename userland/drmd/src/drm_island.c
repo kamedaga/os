@@ -5,6 +5,7 @@
 #include <kobox/module.h>
 #include <kobox/platform.h>
 #include <kobox/shim.h>
+#include <pacha/ipc.h>
 #include "linux_subsystem/fs/kernel_object_registry.h"
 #include "linux_subsystem/kvm/kvm_symbols.h"
 #include "loader/module_context.h"
@@ -48,6 +49,7 @@ typedef struct drmd_handle {
     int active;
     uint32_t refs;
     uint64_t id;
+    int notify_fd;
     uint32_t flags;
     uint64_t dev;
     void *cdev;
@@ -247,10 +249,11 @@ int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_
 int drmd_drm_island_open(
     struct drmd_drm_island *island,
     const drmd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL ||
-        !island->ready || request->card_index != 0) {
+        !island->ready || request->card_index != 0 || notify_fd < 16) {
         return -19;
     }
     const uint64_t dev = kb_linux_kernel_encode_dev(DRMD_DRM_MAJOR, DRMD_DRM_CARD0_MINOR);
@@ -263,6 +266,7 @@ int drmd_drm_island_open(
         return -24;
     }
     handle->flags = (uint32_t)request->flags;
+    handle->notify_fd = notify_fd;
     handle->dev = dev;
     handle->cdev = record->cdev;
     handle->fops = record->fops;
@@ -297,6 +301,7 @@ int drmd_drm_island_close(struct drmd_drm_island *island, uint64_t id)
         handle->refs--;
         return 0;
     }
+    if (handle->notify_fd >= 16) (void)pacha_fd_close(handle->notify_fd);
     drmd_kms_handle_close(island, id);
     int status = 0;
     if (handle->fops_view.release != NULL) {
@@ -428,7 +433,29 @@ int drmd_drm_island_read(
     const int status = drmd_kms_read(
         request->handle, request->data, request->capacity, &request->data_size);
     *out_size = status == 0 ? request->data_size : 0;
+    if (status == 0) drmd_drm_island_notify_readable(island);
     return status;
+}
+
+void drmd_drm_island_notify_readable(struct drmd_drm_island *island)
+{
+    (void)island;
+    for (size_t i = 0; i < DRMD_HANDLE_MAX; i++) {
+        drmd_handle_t *handle = &handles[i];
+        if (!handle->active || handle->notify_fd < 16) continue;
+        for (;;) {
+            struct pacha_ipc_msg message;
+            memset(&message, 0, sizeof(message));
+            uint64_t event_size = 0;
+            const int peek_status = drmd_kms_peek_event(
+                handle->id, &message.word0, 4u * sizeof(message.word0), &event_size);
+            if (peek_status != 0) break;
+            const int send_status = event_size == 4u * sizeof(message.word0) ?
+                pacha_ipc_send(handle->notify_fd, &message) : -22;
+            if (send_status != 0) break;
+            if (drmd_kms_consume_event(handle->id) != 0) break;
+        }
+    }
 }
 
 int drmd_drm_island_poll(

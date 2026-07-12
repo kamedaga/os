@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 enum {
-    DRMD_BOOT_CONFIG_MAGIC = 0x44524d44424f4f54ull,
+    DRMD_BOOT_CONFIG_MAGIC = 0x44524d44424f4f55ull,
     DRMD_BOOT_CONFIG_VA = 0x3c190000ull,
     DRMD_MODULE_IMAGE_VA = 0x62000000ull,
     DRMD_MODULE_IMAGE_STRIDE = 0x01000000ull,
@@ -23,9 +23,10 @@ struct drmd_boot_config {
     uint64_t drm_endpoint_fd;
     uint64_t device_fd;
     uint64_t ready_channel_fd;
+    uint64_t netd_endpoint_fd;
     uint64_t module_count;
     struct drmd_module_config modules[DRMD_MAX_MODULES];
-    uint64_t reserved[6];
+    uint64_t reserved[5];
 };
 
 #endif

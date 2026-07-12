@@ -7,6 +7,7 @@
 
 int lpr_linux_socket_fd_active(uint64_t fd);
 int lpr_linux_socket_fd_cloexec(uint64_t fd);
+int lpr_linux_socket_native_wait_fd(uint64_t fd);
 int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol);
 int64_t lpr_linux_socket_close(uint64_t fd);
 int64_t lpr_linux_socket_read(uint64_t fd, uint64_t buf, uint64_t count);

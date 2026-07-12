@@ -73,19 +73,19 @@ static int64_t lpr_drmd_call_transfer(
     if (transfer_fd >= 16) {
         struct pacha_fd_info info;
         if (!lpr_native_fd_info((uint64_t)(uint32_t)transfer_fd, &info) ||
-            info.kind != PACHA_FD_KIND_VMO ||
+            (info.kind != PACHA_FD_KIND_VMO && info.kind != PACHA_FD_KIND_CHANNEL) ||
             (info.rights & (PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_DUP |
-                PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_MAP_READ |
-                PACHA_FD_RIGHT_MAP_WRITE)) !=
-                (PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS |
-                    PACHA_FD_RIGHT_MAP_READ |
-                    PACHA_FD_RIGHT_MAP_WRITE)) {
+                PACHA_FD_RIGHT_SET_FLAGS)) !=
+                (PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS)) {
             return -LPR_LINUX_EBADF;
         }
         fds[1].fd = (uint64_t)(uint32_t)transfer_fd;
-        fds[1].rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP |
-            PACHA_FD_RIGHT_SET_FLAGS |
-            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+        fds[1].rights = info.kind == PACHA_FD_KIND_VMO ?
+            PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE :
+            PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+        fds[1].transfer_flags = info.kind == PACHA_FD_KIND_CHANNEL ? PACHA_IPC_TRANSFER_MOVE : 0;
         fd_count = 2;
     }
     request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
@@ -141,7 +141,7 @@ static int64_t lpr_drmd_call(
         op, page_fd, page, payload_size, out_result, out_received_fd, -1);
 }
 
-int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags)
+int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
 {
     const int fd = lpr_fd_slot_alloc();
     if (fd < 0) {
@@ -159,6 +159,7 @@ int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags)
     drm->active = 1;
     drm->flags = (uint32_t)flags;
     drm->handle = handle;
+    drm->native_wait_fd = native_wait_fd;
     return fd;
 }
 
@@ -177,15 +178,26 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
     lpr_memset(open, 0, sizeof(*open));
     open->card_index = 0;
     open->flags = flags;
+    int native_wait_fd = -1;
+    int remote_wait_fd = -1;
+    const int pair_status = lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
+    if (pair_status != 0) {
+        lpr_destroy_tty_wire_page(page_fd, page);
+        return pair_status;
+    }
     uint64_t handle = 0;
-    const int64_t status = lpr_drmd_call(DRMD_OP_OPEN_CARD, page_fd, page, sizeof(*open), &handle, 0);
+    const int64_t status = lpr_drmd_call_transfer(
+        DRMD_OP_OPEN_CARD, page_fd, page, sizeof(*open), &handle, 0, remote_wait_fd);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)remote_wait_fd);
         return status;
     }
-    const int fd = lpr_drm_fd_alloc(handle, flags);
+    const int fd = lpr_drm_fd_alloc(handle, flags, native_wait_fd);
     if (fd < 0) {
         (void)lpr_drm_close_handle(handle);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
     } else if (udmabuf) {
         lpr_drm_fd_t *drm = lpr_fd_drm_payload((uint64_t)(uint32_t)fd);
         if (drm != 0) drm->reserved0 = 1;
@@ -615,6 +627,18 @@ int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events)
 {
     lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
     if (drm == 0) return -LPR_LINUX_EBADF;
+    if (drm->native_wait_fd >= 16) {
+        struct pacha_pollfd pollfd = {
+            .fd = drm->native_wait_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+        };
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_FD_POLL,
+            (uint64_t)(uintptr_t)&pollfd,
+            1);
+        if (status < 0) return lpr_pacha_status_to_errno(status);
+        return (pollfd.revents & PACHA_FD_EVENT_READABLE) != 0 ? events & 0x0001u : 0;
+    }
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
@@ -635,35 +659,36 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
     if (drm == 0) return -LPR_LINUX_EBADF;
     if (count == 0) return 0;
     if (buf == 0) return -LPR_LINUX_EFAULT;
+    if (drm->native_wait_fd < 16) return -LPR_LINUX_EIO;
+    if (count < 4u * sizeof(uint64_t)) return -LPR_LINUX_EINVAL;
     for (;;) {
-        void *page = 0;
-        const int page_fd = lpr_create_tty_wire_page(&page);
-        if (page_fd < 0) return page_fd;
-        drmd_read_request_t *read = (drmd_read_request_t *)lpr_drmd_payload(page);
-        lpr_memset(read, 0, sizeof(*read));
-        read->handle = drm->handle;
-        read->capacity = count < sizeof(read->data) ? count : sizeof(read->data);
-        uint64_t result = 0;
-        const int64_t status = lpr_drmd_call(
-            DRMD_OP_HANDLE_READ, page_fd, page, sizeof(*read), &result, 0);
-        if (status == 0) {
-            const uint64_t bytes = read->data_size < result ? read->data_size : result;
-            if (bytes > count || bytes > sizeof(read->data)) {
-                lpr_destroy_tty_wire_page(page_fd, page);
-                return -LPR_LINUX_EIO;
-            }
-            lpr_memcpy((void *)(uintptr_t)buf, read->data, bytes);
-            lpr_destroy_tty_wire_page(page_fd, page);
-            return (int64_t)bytes;
+        struct pacha_ipc_msg event;
+        lpr_memset(&event, 0, sizeof(event));
+        const int64_t recv_status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_RECV,
+            (uint64_t)(uint32_t)drm->native_wait_fd,
+            (uint64_t)(uintptr_t)&event);
+        if (recv_status == 0) {
+            lpr_memcpy((void *)(uintptr_t)buf, &event.word0, 4u * sizeof(uint64_t));
+            return 4u * sizeof(uint64_t);
         }
-        lpr_destroy_tty_wire_page(page_fd, page);
-        if (status != -LPR_LINUX_EAGAIN ||
-            (drm->flags & LPR_LINUX_O_NONBLOCK) != 0) {
-            return status;
+        if (recv_status != PACHA_ERR_EMPTY && recv_status != PACHA_ERR_NOT_READY) {
+            return lpr_pacha_status_to_errno(recv_status);
         }
-        struct pachaos_timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
-        const int64_t sleep_status = lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_NANOSLEEP, (uint64_t)(uintptr_t)&delay);
-        if (sleep_status != 0) return lpr_pacha_status_to_errno(sleep_status);
+        if ((drm->flags & LPR_LINUX_O_NONBLOCK) != 0) return -LPR_LINUX_EAGAIN;
+        struct pacha_pollfd waitfd = {
+            .fd = drm->native_wait_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+        };
+        const int64_t wait_status = lpr_pacha_syscall4(
+            PACHAOS_SYSCALL_FD_WAIT_MANY,
+            (uint64_t)(uintptr_t)&waitfd, 1, UINT64_MAX, 0);
+        if (wait_status < 0) return lpr_pacha_status_to_errno(wait_status);
     }
+}
+
+int lpr_drm_native_wait_fd(uint64_t fd)
+{
+    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    return drm != 0 ? drm->native_wait_fd : -1;
 }

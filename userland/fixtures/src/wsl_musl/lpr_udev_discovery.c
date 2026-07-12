@@ -33,6 +33,8 @@ extern struct udev_monitor *udev_monitor_new_from_netlink(struct udev *, const c
 extern struct udev_monitor *udev_monitor_unref(struct udev_monitor *);
 extern int udev_monitor_enable_receiving(struct udev_monitor *);
 extern int udev_monitor_get_fd(struct udev_monitor *);
+extern struct udev_device *udev_monitor_receive_device(struct udev_monitor *);
+extern const char *udev_device_get_action(struct udev_device *);
 extern char *drmGetDeviceNameFromFd2(int);
 
 static long elapsed_ms(const struct timespec *start, const struct timespec *end)
@@ -76,9 +78,22 @@ static int scan(struct udev *udev, int pass)
 
 int main(void)
 {
+    int monitor_idle_ms = 250;
+    const char *monitor_idle_env = getenv("M53_MONITOR_IDLE_MS");
+    if (monitor_idle_env != NULL) {
+        char *end = NULL;
+        const long parsed = strtol(monitor_idle_env, &end, 10);
+        if (end != monitor_idle_env && *end == '\0' && parsed > 0 && parsed <= 300000)
+            monitor_idle_ms = (int)parsed;
+    }
     struct udev *udev = udev_new();
     if (udev == NULL) return 2;
     int failed = scan(udev, 1) | scan(udev, 2);
+    struct udev_monitor *monitor = udev_monitor_new_from_netlink(udev, "udev");
+    if (monitor == NULL || udev_monitor_enable_receiving(monitor) != 0) {
+        printf("M53_MONITOR status=failed\n");
+        failed = 1;
+    }
     const int drm_fd = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     struct stat drm_stat = {0};
     char *drm_name = drm_fd >= 0 ? drmGetDeviceNameFromFd2(drm_fd) : NULL;
@@ -104,20 +119,29 @@ int main(void)
         strcmp(drm_name, "/dev/dri/card0") != 0) failed = 1;
     free(drm_name);
     if (drm_fd >= 0) close(drm_fd);
-    struct udev_monitor *monitor = udev_monitor_new_from_netlink(udev, "udev");
-    if (monitor == NULL || udev_monitor_enable_receiving(monitor) != 0) {
-        printf("M53_MONITOR status=failed\n");
-        failed = 1;
-    } else {
+    if (monitor != NULL) {
         struct pollfd pfd = { .fd = udev_monitor_get_fd(monitor), .events = POLLIN };
+        const int event_poll = poll(&pfd, 1, 2000);
+        struct udev_device *event = event_poll == 1 ? udev_monitor_receive_device(monitor) : NULL;
+        const char *action = event != NULL ? udev_device_get_action(event) : NULL;
+        const char *sysname = event != NULL ? udev_device_get_sysname(event) : NULL;
+        const char *devnode = event != NULL ? udev_device_get_devnode(event) : NULL;
+        printf("M53_UEVENT poll=%d action=%s sysname=%s devnode=%s\n",
+            event_poll, action != NULL ? action : "-", sysname != NULL ? sysname : "-",
+            devnode != NULL ? devnode : "-");
+        if (event_poll != 1 || event == NULL || action == NULL ||
+            strcmp(action, "change") != 0 || sysname == NULL || strcmp(sysname, "card0") != 0)
+            failed = 1;
+        if (event != NULL) udev_device_unref(event);
+        pfd.revents = 0;
         struct timespec start = {0}, end = {0};
         clock_gettime(CLOCK_MONOTONIC, &start);
-        const int status = poll(&pfd, 1, 250);
+        const int status = poll(&pfd, 1, monitor_idle_ms);
         clock_gettime(CLOCK_MONOTONIC, &end);
         const long milliseconds = elapsed_ms(&start, &end);
         printf("M53_MONITOR status=ready poll=%d revents=%d idle_ms=%ld\n",
             status, pfd.revents, milliseconds);
-        if (status != 0 || pfd.revents != 0 || milliseconds < 200) failed = 1;
+        if (status != 0 || pfd.revents != 0 || milliseconds < monitor_idle_ms - 50) failed = 1;
     }
     if (monitor != NULL) udev_monitor_unref(monitor);
     udev_unref(udev);

@@ -67,7 +67,7 @@ enum {
 };
 
 #define FILED_EXEC_LPR_FD_TABLE_MAGIC 0x3144424652504c46ull
-#define FILED_EXEC_LPR_FD_TABLE_VERSION 6ull
+#define FILED_EXEC_LPR_FD_TABLE_VERSION 7ull
 
 typedef struct filed_openat {
     uint64_t dir_handle;
@@ -321,6 +321,7 @@ typedef struct filed_exec_lpr_fd {
     uint64_t flags;
     uint64_t handle;
     uint64_t offset_or_counter;
+    uint64_t native_wait_fd;
 } filed_exec_lpr_fd_t;
 
 typedef struct filed_exec_lpr_fd_table {

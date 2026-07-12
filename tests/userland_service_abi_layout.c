@@ -138,8 +138,8 @@ int main(void)
         FILED_EXEC_LPR_FD_EVENT == 7 &&
         FILED_EXEC_LPR_FD_NATIVE == 9 &&
         FILED_EXEC_LPR_FD_DMABUF == 10 &&
-        FILED_EXEC_LPR_FD_TABLE_VERSION == 6 &&
-        LPR_IMAGE_ABI_VERSION == 9 &&
+        FILED_EXEC_LPR_FD_TABLE_VERSION == 7 &&
+        LPR_IMAGE_ABI_VERSION == 10 &&
         LPR_CLIENT_FD_KIND_DRMD_HANDLE == 3 &&
         LPR_CLIENT_FD_KIND_INPUTD_HANDLE == 4 &&
         LPR_CLIENT_FD_KIND_PIPE == 5 &&

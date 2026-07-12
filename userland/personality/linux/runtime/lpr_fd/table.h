@@ -80,6 +80,8 @@ typedef struct lpr_drm_fd {
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
+    int32_t native_wait_fd;
+    uint32_t reserved2;
 } lpr_drm_fd_t;
 
 typedef struct lpr_input_fd {
@@ -88,6 +90,8 @@ typedef struct lpr_input_fd {
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
+    int32_t native_wait_fd;
+    uint32_t reserved2;
 } lpr_input_fd_t;
 
 typedef struct lpr_dmabuf_fd {
@@ -126,6 +130,8 @@ typedef struct lpr_socket_fd {
     int32_t peer_pid;
     uint32_t peer_uid;
     uint32_t peer_gid;
+    int32_t native_wait_fd;
+    uint32_t reserved2;
 } lpr_socket_fd_t;
 
 typedef struct lpr_epoll_fd {

@@ -161,6 +161,7 @@ typedef struct lpr_bootstrap_fd {
     uint64_t flags;
     uint64_t handle;
     uint64_t offset_or_counter;
+    uint64_t native_wait_fd;
 } lpr_bootstrap_fd_t;
 
 struct lpr_bootstrap {

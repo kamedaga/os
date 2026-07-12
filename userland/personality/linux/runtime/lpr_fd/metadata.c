@@ -327,15 +327,21 @@ int64_t lpr_linux_close(uint64_t fd)
         uint32_t refcount = 0;
         (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
         const uint64_t handle = lpr_fd_drm_payload(fd)->handle;
+        const int native_wait_fd = lpr_fd_drm_payload(fd)->native_wait_fd;
         lpr_control_close_fd(fd);
-        return refcount <= 1 ? lpr_drm_close_handle(handle) : 0;
+        if (refcount > 1) return 0;
+        if (native_wait_fd >= 16) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        return lpr_drm_close_handle(handle);
     }
     if (lpr_linux_input_fd_active(fd)) {
         uint32_t refcount = 0;
         (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
         const uint64_t handle = lpr_fd_input_payload(fd)->handle;
+        const int native_wait_fd = lpr_fd_input_payload(fd)->native_wait_fd;
         lpr_control_close_fd(fd);
-        return refcount <= 1 ? lpr_input_close_handle(handle) : 0;
+        if (refcount > 1) return 0;
+        if (native_wait_fd >= 16) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        return lpr_input_close_handle(handle);
     }
     if (lpr_linux_dmabuf_fd_active(fd)) {
         uint32_t refcount = 0;

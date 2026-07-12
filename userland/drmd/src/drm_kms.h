@@ -17,6 +17,8 @@ int drmd_kms_mmap(
     const drmd_mmap_request_t *request,
     int *out_vmo_fd);
 int drmd_kms_read(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_size);
+int drmd_kms_peek_event(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_size);
+int drmd_kms_consume_event(uint64_t handle);
 int drmd_kms_poll(uint64_t handle, uint32_t events, uint32_t *out_revents);
 int drmd_kms_prime_export(
     uint64_t owner,

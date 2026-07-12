@@ -64,6 +64,13 @@ struct pacha_pollfd {
     uint64_t revents;
 };
 
+enum { PACHA_SERVICE_WAIT_MAX_FDS = 256 };
+
+struct pacha_service_wait_set {
+    struct pacha_pollfd fds[PACHA_SERVICE_WAIT_MAX_FDS];
+    uint64_t count;
+};
+
 enum pacha_ipc_fast_backend {
     PACHA_IPC_BACKEND_NORMAL = 0,
     PACHA_IPC_BACKEND_PKEY_RING = 2,
@@ -168,6 +175,9 @@ long pacha_fd_writev(int fd, const struct pacha_iovec *iov, uint64_t iov_count);
 long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1);
 long pacha_fd_poll(struct pacha_pollfd *fds, uint64_t count);
 long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeout_ticks);
+int pacha_service_wait_init(struct pacha_service_wait_set *set, int endpoint_fd);
+int pacha_service_wait_add(struct pacha_service_wait_set *set, int fd, uint32_t events);
+long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks);
 int pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags);
 int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rights, uint32_t fd_flags);
 int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags);

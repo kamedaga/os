@@ -488,6 +488,7 @@ int filed_dispatch_create_lpr_bootstrap_fd(
             out[i].flags = in[i].flags;
             out[i].handle = in[i].handle;
             out[i].offset_or_counter = in[i].offset_or_counter;
+            out[i].native_wait_fd = in[i].native_wait_fd;
         }
     }
     if ((exec->flags & FILED_EXEC_LINUX_DEFAULT_STDIO) != 0) {

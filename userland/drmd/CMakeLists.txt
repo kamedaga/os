@@ -86,7 +86,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${DRMD_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Oz -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       "PACHAOS_MUSL_LIBC_EXTRA_CFLAGS=-Oz -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables"
       "PACHAOS_MUSL_EXTRA_LINK_FLAGS=-Wl,--gc-sections -Wl,--strip-all"
@@ -102,6 +102,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drm_kms.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drmd_service.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/drmd_service.h"
+    "${REPO_ROOT}/userland/netd/include/netd/ipc_protocol.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

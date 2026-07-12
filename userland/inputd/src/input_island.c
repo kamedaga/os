@@ -4,6 +4,7 @@
 #include <kobox/module.h>
 #include <kobox/platform.h>
 #include <kobox/shim.h>
+#include <pacha/ipc.h>
 #include "linux_subsystem/input/input.h"
 #include "linux_subsystem/kvm/kvm_symbols.h"
 
@@ -46,6 +47,8 @@ typedef struct inputd_handle {
     int clock_id;
     uint64_t id;
     uint64_t cursor;
+    int notify_fd;
+    int notify_pending;
 } inputd_handle_t;
 
 static inputd_handle_t handles[INPUTD_HANDLE_MAX];
@@ -217,9 +220,9 @@ int inputd_input_island_init(
     return 0;
 }
 
-int inputd_input_open(uint32_t event_index, uint32_t flags, uint64_t *out_handle)
+int inputd_input_open(uint32_t event_index, uint32_t flags, int notify_fd, uint64_t *out_handle)
 {
-    if (out_handle == NULL) return -22;
+    if (out_handle == NULL || notify_fd < 16) return -22;
     kb_input_device_snapshot_t device;
     int status = lookup_device_by_index(event_index, &device);
     if (status != 0) return status;
@@ -228,6 +231,7 @@ int inputd_input_open(uint32_t event_index, uint32_t flags, uint64_t *out_handle
     handle->device_id = device.id;
     handle->flags = flags;
     handle->cursor = next_sequence;
+    handle->notify_fd = notify_fd;
     *out_handle = handle->id;
     printf("[inputd] open event%u handle=%llu device=%u name=%s\n", event_index,
         (unsigned long long)handle->id, device.id, device.name);
@@ -242,6 +246,7 @@ int inputd_input_close(uint64_t id)
         handle->refs--;
         return 0;
     }
+    if (handle->notify_fd >= 16) (void)pacha_fd_close(handle->notify_fd);
     if (handle->device_id < 64 && grabbed_handle_by_device[handle->device_id] == id)
         grabbed_handle_by_device[handle->device_id] = 0;
     memset(handle, 0, sizeof(*handle));
@@ -300,7 +305,10 @@ int inputd_input_read(inputd_read_request_t *request)
         }
     }
     handle->cursor = next_sequence;
-    return request->event_count == 0 ? -11 : 0;
+    if (request->event_count == 0) return -11;
+    handle->notify_pending = 0;
+    inputd_input_notify_readable();
+    return 0;
 }
 
 static uint32_t ioctl_size(uint64_t request) { return (uint32_t)((request >> 16) & 0x3fffu); }
@@ -422,4 +430,22 @@ int inputd_input_poll(inputd_poll_request_t *request)
         }
     }
     return 0;
+}
+
+void inputd_input_notify_readable(void)
+{
+    for (size_t i = 0; i < INPUTD_HANDLE_MAX; i++) {
+        inputd_handle_t *handle = &handles[i];
+        if (!handle->active || handle->notify_fd < 16 || handle->notify_pending) continue;
+        inputd_poll_request_t request = {
+            .handle = handle->id,
+            .events = INPUTD_POLLIN,
+        };
+        if (inputd_input_poll(&request) != 0 || request.revents == 0) continue;
+        const struct pacha_ipc_msg message = {
+            .word0 = 0x494e505554455654ull,
+            .word1 = handle->id,
+        };
+        if (pacha_ipc_send(handle->notify_fd, &message) == 0) handle->notify_pending = 1;
+    }
 }

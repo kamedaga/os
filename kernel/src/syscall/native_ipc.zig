@@ -184,6 +184,7 @@ fn recvWait(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fr
 
     const current_thread = @import("../scheduler.zig").connection.currentThread();
     const current_generation = @import("../scheduler.zig").connection.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
+    state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
     state.registerIpcRecvCompletionWaiterForFd(
         proc,
         fd,

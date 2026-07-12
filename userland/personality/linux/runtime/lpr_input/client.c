@@ -5,12 +5,13 @@ static void *lpr_inputd_payload(void *page)
     return page == 0 ? 0 : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
 }
 
-static int64_t lpr_inputd_call(
+static int64_t lpr_inputd_call_transfer(
     uint32_t op,
     int page_fd,
     void *page,
     uint32_t payload_size,
-    uint64_t *out_result)
+    uint64_t *out_result,
+    int transfer_fd)
 {
     if (page_fd < 16 || page == 0) return -LPR_LINUX_EINVAL;
     pacha_service_envelope_t *header = page;
@@ -27,15 +28,27 @@ static int64_t lpr_inputd_call(
     header->fd_count = 0;
     const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    struct pacha_ipc_fd fd = {
+    struct pacha_ipc_fd fds[2] = {{
         .fd = (uint64_t)(uint32_t)page_fd,
         .rights = rights,
-    };
+    }};
+    uint64_t fd_count = 1;
+    if (transfer_fd >= 16) {
+        struct pacha_fd_info info;
+        if (!lpr_native_fd_info((uint64_t)(uint32_t)transfer_fd, &info) ||
+            info.kind != PACHA_FD_KIND_CHANNEL) return -LPR_LINUX_EBADF;
+        fds[1].fd = (uint64_t)(uint32_t)transfer_fd;
+        fds[1].rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
+            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+        fds[1].transfer_flags = PACHA_IPC_TRANSFER_MOVE;
+        fd_count = 2;
+    }
     const struct pacha_ipc_msg request = {
         .word0 = PACHA_SERVICE_REQUEST_MAGIC,
         .word3 = request_id,
-        .fds = &fd,
-        .fd_count = 1,
+        .fds = fds,
+        .fd_count = fd_count,
     };
     const int reply_fd = (int)lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
@@ -62,7 +75,17 @@ static int64_t lpr_inputd_call(
     return status;
 }
 
-static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_index)
+static int64_t lpr_inputd_call(
+    uint32_t op,
+    int page_fd,
+    void *page,
+    uint32_t payload_size,
+    uint64_t *out_result)
+{
+    return lpr_inputd_call_transfer(op, page_fd, page, payload_size, out_result, -1);
+}
+
+static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_index, int native_wait_fd)
 {
     const int fd = lpr_fd_slot_alloc();
     if (fd < 0) return fd;
@@ -77,6 +100,7 @@ static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_in
     input->reserved0 = (uint8_t)event_index;
     input->flags = (uint32_t)flags;
     input->handle = handle;
+    input->native_wait_fd = native_wait_fd;
     return fd;
 }
 
@@ -96,13 +120,27 @@ int64_t lpr_input_open_path(const char *path, uint64_t flags)
     lpr_memset(open, 0, sizeof(*open));
     open->event_index = event_index;
     open->flags = (uint32_t)flags;
+    int native_wait_fd = -1;
+    int remote_wait_fd = -1;
+    const int pair_status = lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
+    if (pair_status != 0) {
+        lpr_destroy_tty_wire_page(page_fd, page);
+        return pair_status;
+    }
     uint64_t handle = 0;
-    const int64_t status = lpr_inputd_call(
-        INPUTD_OP_OPEN, page_fd, page, sizeof(*open), &handle);
+    const int64_t status = lpr_inputd_call_transfer(
+        INPUTD_OP_OPEN, page_fd, page, sizeof(*open), &handle, remote_wait_fd);
     lpr_destroy_tty_wire_page(page_fd, page);
-    if (status != 0) return status;
-    const int fd = lpr_input_fd_alloc(handle, flags, event_index);
-    if (fd < 0) (void)lpr_input_close_handle(handle);
+    if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)remote_wait_fd);
+        return status;
+    }
+    const int fd = lpr_input_fd_alloc(handle, flags, event_index, native_wait_fd);
+    if (fd < 0) {
+        (void)lpr_input_close_handle(handle);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+    }
     return fd;
 }
 
@@ -139,6 +177,7 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
     if (buf == 0) return -LPR_LINUX_EFAULT;
     if (count < sizeof(inputd_input_event_t)) return -LPR_LINUX_EINVAL;
     for (;;) {
+        if (input->native_wait_fd >= 16) lpr_native_wait_drain(input->native_wait_fd);
         void *page = 0;
         const int page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) return page_fd;
@@ -165,10 +204,21 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         lpr_destroy_tty_wire_page(page_fd, page);
         if (status != -LPR_LINUX_EAGAIN || (input->flags & LPR_LINUX_O_NONBLOCK) != 0)
             return status;
-        struct pachaos_timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
-        const int64_t sleep_status = lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_NANOSLEEP, (uint64_t)(uintptr_t)&delay);
-        if (sleep_status != 0) return lpr_pacha_status_to_errno(sleep_status);
+        if (input->native_wait_fd >= 16) {
+            struct pacha_pollfd waitfd = {
+                .fd = input->native_wait_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+            };
+            const int64_t wait_status = lpr_pacha_syscall4(
+                PACHAOS_SYSCALL_FD_WAIT_MANY,
+                (uint64_t)(uintptr_t)&waitfd, 1, UINT64_MAX, 0);
+            if (wait_status < 0) return lpr_pacha_status_to_errno(wait_status);
+        } else {
+            struct pachaos_timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
+            const int64_t sleep_status = lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_NANOSLEEP, (uint64_t)(uintptr_t)&delay);
+            if (sleep_status != 0) return lpr_pacha_status_to_errno(sleep_status);
+        }
     }
 }
 
@@ -206,6 +256,17 @@ int64_t lpr_input_poll_events(uint64_t fd, uint32_t events)
 {
     lpr_input_fd_t *input = lpr_fd_input_payload(fd);
     if (input == 0) return -LPR_LINUX_EBADF;
+    if (input->native_wait_fd >= 16) {
+        struct pacha_pollfd pollfd = {
+            .fd = input->native_wait_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+        };
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_FD_POLL,
+            (uint64_t)(uintptr_t)&pollfd, 1);
+        if (status < 0) return lpr_pacha_status_to_errno(status);
+        return (pollfd.revents & PACHA_FD_EVENT_READABLE) != 0 ? events & INPUTD_POLLIN : 0;
+    }
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;
@@ -218,4 +279,10 @@ int64_t lpr_input_poll_events(uint64_t fd, uint32_t events)
         INPUTD_OP_POLL, page_fd, page, sizeof(*request), &result);
     lpr_destroy_tty_wire_page(page_fd, page);
     return status == 0 ? (int64_t)result : status;
+}
+
+int lpr_input_native_wait_fd(uint64_t fd)
+{
+    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
+    return input != 0 ? input->native_wait_fd : -1;
 }

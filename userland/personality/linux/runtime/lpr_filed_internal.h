@@ -11,6 +11,7 @@
 #include "lpr_socket.h"
 #include "support/string.h"
 #include "support/syscall.h"
+#include "support/native_wait.h"
 #include <pacha/ipc.h>
 #include <pacha/abi.h>
 #include <pacha/service_abi.h>
@@ -721,7 +722,7 @@ int lpr_runtime_reserved_fd(uint64_t fd);
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int lpr_timespec_less_equal( const struct pachaos_timespec *lhs, const struct pachaos_timespec *rhs);
 int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags);
-int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags);
+int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd);
 int64_t lpr_drm_open_path(const char *path, uint64_t flags);
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_drm_close_handle(uint64_t handle);
@@ -807,6 +808,7 @@ int64_t lpr_linux_pread_to_vmo( uint64_t fd, uint64_t vmo_fd, uint64_t vmo_offse
 int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events);
+int lpr_drm_native_wait_fd(uint64_t fd);
 int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz);
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity);
 int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count);

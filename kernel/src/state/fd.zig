@@ -189,6 +189,7 @@ pub fn publishIrqObject(self: anytype, object_ref: KernelObjectRef, irq: IrqObje
     const slot = self.irqPublishSlotForRef(object_ref) orelse return;
     @atomicStore(u8, &slot.active, 0, .release);
     @atomicStore(u64, &slot.event_count, 0, .release);
+    @atomicStore(u64, &slot.observed_count, 0, .release);
     @atomicStore(u32, &slot.generation, object_ref.generation, .release);
     @atomicStore(PrincipalRaw, &slot.owner_principal_raw, irq.owner_principal_raw, .release);
     @atomicStore(u8, &slot.kind, @intFromEnum(irq.kind), .release);
@@ -208,6 +209,39 @@ pub fn irqPublishedEventCount(self: anytype, object_ref: KernelObjectRef) ?u64 {
     if (@atomicLoad(u8, &slot.active, .acquire) == 0) return 0;
     if (@atomicLoad(u32, &slot.generation, .acquire) != object_ref.generation) return 0;
     return @atomicLoad(u64, &slot.event_count, .acquire);
+}
+
+pub fn irqPublishedEventPending(self: anytype, object_ref: KernelObjectRef) ?bool {
+    const slot = self.irqPublishSlotForRefConst(object_ref) orelse return null;
+    if (@atomicLoad(u8, &slot.active, .acquire) == 0) return false;
+    if (@atomicLoad(u32, &slot.generation, .acquire) != object_ref.generation) return false;
+    return @atomicLoad(u64, &slot.event_count, .acquire) !=
+        @atomicLoad(u64, &slot.observed_count, .acquire);
+}
+
+pub fn acknowledgeIrqEventCountForFd(
+    self: anytype,
+    owner: PrincipalId,
+    fd: Fd,
+    observed_count: u64,
+) bool {
+    const entry = self.fdEntryConst(owner, fd) orelse return false;
+    if (!entry.rights.irq_wait) return false;
+    const slot = self.irqPublishSlotForRef(entry.object) orelse return false;
+    if (@atomicLoad(u8, &slot.active, .acquire) == 0) return false;
+    if (@atomicLoad(u32, &slot.generation, .acquire) != entry.object.generation) return false;
+    var previous = @atomicLoad(u64, &slot.observed_count, .acquire);
+    while (previous < observed_count) {
+        previous = @cmpxchgWeak(
+            u64,
+            &slot.observed_count,
+            previous,
+            observed_count,
+            .acq_rel,
+            .acquire,
+        ) orelse return true;
+    }
+    return true;
 }
 
 pub fn releaseMmioRegionObject(self: anytype, mmio: MmioRegionObject) void {
@@ -624,7 +658,7 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
             .process => |process| process.state != .active,
             .thread => |thread| thread.state != .active,
             .event => |counter| entry.rights.read and counter != 0,
-            .irq => (self.irqPublishedEventCount(entry.object) orelse 0) != 0,
+            .irq => self.irqPublishedEventPending(entry.object) orelse false,
             .timer => |timer| @TypeOf(self.*).timerDueCount(timer, now_tick) != 0,
             .serial => false,
             .sched_event => entry.rights.read and @import("../scheduler.zig").connection.eventQueueReadable(),
@@ -1166,10 +1200,12 @@ pub fn registerTaskReadableWaiterForFd(
             if (free_index == null) free_index = i;
             continue;
         }
-        if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
-            waiter.principal_raw = principal_raw;
-            waiter.owner = owner;
-            waiter.pollfd_va = pollfd_va;
+        if (waiter.thread_index == thread_index_u32 and
+            waiter.thread_generation == thread_generation and
+            waiter.principal_raw == principal_raw and
+            waiter.owner == owner and
+            waiter.pollfd_va == pollfd_va)
+        {
             waiter.events |= requested_events;
             return true;
         }
@@ -1199,6 +1235,34 @@ pub fn unregisterTaskReadableWaiterForThread(
         if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
             waiter.* = .{};
         }
+    }
+}
+
+pub fn unregisterFdWaitersForThread(
+    self: anytype,
+    owner: PrincipalId,
+    thread_index: usize,
+    thread_generation: u32,
+) void {
+    self.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
+    var fd_index: usize = 0;
+    while (fd_index < fd_table_entries) : (fd_index += 1) {
+        const fd: Fd = @intCast(fd_index);
+        if (self.fdEntryConst(owner, fd) == null) continue;
+        self.unregisterPipeWaiterForFd(
+            owner,
+            fd,
+            @import("kernel_abi_root").fd_abi.event_known_mask,
+            thread_index,
+            thread_generation,
+        );
+        self.unregisterIpcReadableWaiterForFd(
+            owner,
+            fd,
+            @import("kernel_abi_root").fd_abi.event_readable,
+            thread_index,
+            thread_generation,
+        );
     }
 }
 

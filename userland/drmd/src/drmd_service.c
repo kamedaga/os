@@ -2,9 +2,32 @@
 
 #include <pacha/abi.h>
 #include <pacha/service_abi.h>
+#include <netd/ipc_protocol.h>
 
 #include <stdint.h>
 #include <string.h>
+
+static int publish_device(drmd_service_t *service, uint64_t device)
+{
+    static uint64_t request_id;
+    if (service == NULL || service->cfg == NULL || service->cfg->netd_endpoint_fd < 16)
+        return -22;
+    const struct pacha_ipc_msg request = {
+        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word1 = NETD_OP_UEVENT_PUBLISH,
+        .word2 = device,
+        .word3 = ++request_id,
+    };
+    const int reply_fd = pacha_ipc_call((int)service->cfg->netd_endpoint_fd, &request);
+    if (reply_fd < 16) return reply_fd;
+    struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
+    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (recv_status != 0) return recv_status;
+    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request.word3) return -5;
+    return (int)(int64_t)reply.word1;
+}
 
 static void close_received(
     const struct pacha_ipc_msg *request,
@@ -104,7 +127,7 @@ int drmd_service_dispatch(
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     uint64_t transfer_flags = 0;
     int prime_export_ref = 0;
-    int imported_vmo_fd = -1;
+    int retained_received_fd = -1;
     if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC &&
         request->word3 == header.request_id &&
         pacha_service_request_is_valid(&header, DRMD_SERVICE_ID)) {
@@ -115,9 +138,16 @@ int drmd_service_dispatch(
             result = status == 0 ? 1 : 0;
             break;
         case DRMD_OP_OPEN_CARD:
+            {
+            const int notify_fd = request->fd_count >= 3 ? (int)(uint32_t)fds[1].fd : -1;
             status = header.payload_size >= sizeof(drmd_open_request_t) ?
-                drmd_drm_island_open(service->drm, payload, &result) : -22;
+                drmd_drm_island_open(service->drm, payload, notify_fd, &result) : -22;
+            if (status == 0) {
+                retained_received_fd = notify_fd;
+                (void)publish_device(service, NETD_UEVENT_DRM_CARD0);
+            }
             break;
+            }
         case DRMD_OP_HANDLE_CLOSE:
             status = header.payload_size >= sizeof(drmd_handle_request_t) ?
                 drmd_drm_island_close(service->drm, ((drmd_handle_request_t *)payload)->handle) : -22;
@@ -159,7 +189,7 @@ int drmd_service_dispatch(
                 const int candidate_vmo_fd = request->fd_count >= 3 ? (int)(uint32_t)fds[1].fd : -1;
                 status = drmd_drm_island_prime_import(
                     service->drm, prime, candidate_vmo_fd, &result);
-                if (status == 0 && prime->token == 0) imported_vmo_fd = candidate_vmo_fd;
+                if (status == 0 && prime->token == 0) retained_received_fd = candidate_vmo_fd;
             }
             break;
         case DRMD_OP_PRIME_RELEASE:
@@ -177,7 +207,8 @@ int drmd_service_dispatch(
             break;
         }
     }
-    close_received(request, fds, reply_fd, imported_vmo_fd);
+    if (status == 0) drmd_drm_island_notify_readable(service->drm);
+    close_received(request, fds, reply_fd, retained_received_fd);
     const int reply_status = send_reply(
         reply_fd, page, &header, status, result, transfer_fd, transfer_rights, transfer_flags);
     if (reply_status != 0 && prime_export_ref) {

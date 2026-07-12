@@ -184,6 +184,30 @@ test "process fd exposes process object kind and lifecycle state" {
     try std.testing.expectEqual(@as(u32, 7), updated.exit_code);
 }
 
+test "one thread can wait on multiple process fds" {
+    var s = try initFdState();
+    const rights = fdRights(.{ .wait = true, .poll = true, .close = true });
+    const fd1 = try s.createProcessFd(p0, .{
+        .principal_raw = @intFromEnum(p1),
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+    const fd2 = try s.createProcessFd(p0, .{
+        .principal_raw = @intFromEnum(p2),
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd1, 1, 0x1000, 7, 11));
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd2, 1, 0x1018, 7, 11));
+
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p1, targets[0..]));
+    try std.testing.expectEqual(@as(u64, 0x1000), targets[0].pollfd_va);
+    try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p2, targets[0..]));
+    try std.testing.expectEqual(@as(u64, 0x1018), targets[0].pollfd_va);
+}
+
 test "thread fd stores owner slot generation and lifecycle state" {
     var s = try initFdState();
     const rights = fdRights(.{
@@ -365,6 +389,27 @@ test "ipc channel pair sends to peer receive queue" {
     try std.testing.expectEqual(@as(u64, 8), received.words[3]);
 }
 
+test "starting a new fd wait clears stale channel waiters for the thread" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .send = true,
+        .recv = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+    });
+    const first = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const second = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    try s.registerIpcReadableWaiterForFd(p0, first.a, 1, 0x1000, 7, 11);
+    try s.registerIpcReadableWaiterForFd(p0, second.a, 1, 0x1018, 7, 11);
+
+    s.unregisterFdWaitersForThread(p0, 7, 11);
+
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try s.wakeIpcWaitersForSendFd(p0, first.b, targets[0..]));
+    try std.testing.expectEqual(@as(usize, 0), try s.wakeIpcWaitersForSendFd(p0, second.b, targets[0..]));
+}
+
 test "ipc call attaches one-shot reply fd" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -393,18 +438,24 @@ test "irq fd records interrupt events by vector" {
         .device = 0x1001,
         .kind = .msix,
         .vector = 0x41,
-    }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+    }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
 
     try std.testing.expectEqual(@as(?u64, 0), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+    try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 
     var wake_owners: [4]kernel.PrincipalId = undefined;
     const wake_count = s.recordDeviceInterruptEvent(0x41, wake_owners[0..]);
     try std.testing.expectEqual(@as(usize, 1), wake_count);
     try std.testing.expectEqual(p0, wake_owners[0]);
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+    try std.testing.expectEqual(@as(?u64, 1), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
+    try std.testing.expect(s.acknowledgeIrqEventCountForFd(p0, irq_fd, 1));
+    try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 
     try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x42, wake_owners[0..]));
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x41, wake_owners[0..]));
+    try std.testing.expectEqual(@as(?u64, 1), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 }
 
 test "physical page allocation returns a page handle" {

@@ -298,6 +298,7 @@ pub const IrqPublishSlot = struct {
     kind: u8 = 0,
     vector: u32 = 0,
     event_count: u64 = 0,
+    observed_count: u64 = 0,
 };
 
 pub const TimerObject = struct {
@@ -504,7 +505,7 @@ pub const TaskFdWaiter = struct {
     thread_generation: u32 = 0,
 };
 
-pub const max_task_fd_waiters: usize = 64;
+pub const max_task_fd_waiters: usize = fd_table_entries;
 pub const max_ipc_object_waiters: usize = 8;
 
 pub const PipeSlot = struct {
@@ -598,6 +599,13 @@ pub const IpcWaitList = struct {
     pub fn unregister(self: *IpcWaitList, thread_index: usize, thread_generation: u32) void {
         if (thread_index > std.math.maxInt(u32)) return;
         const thread_index_u32: u32 = @intCast(thread_index);
+        if (self.handoff_hint_valid and
+            self.handoff_hint.thread_index == thread_index and
+            self.handoff_hint.thread_generation == thread_generation)
+        {
+            self.handoff_hint = .{};
+            self.handoff_hint_valid = false;
+        }
         for (self.waiters[0..]) |*waiter| {
             if (!waiter.active) continue;
             if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {

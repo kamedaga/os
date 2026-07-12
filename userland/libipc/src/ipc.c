@@ -1,4 +1,6 @@
 #include "pacha/ipc.h"
+
+#include <string.h>
 #include "pacha/syscall.h"
 
 int pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags) {
@@ -176,6 +178,30 @@ long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeo
         }
         return ret;
     }
+}
+
+int pacha_service_wait_init(struct pacha_service_wait_set *set, int endpoint_fd) {
+    if (set == NULL || endpoint_fd < 16) return -1;
+    memset(set, 0, sizeof(*set));
+    set->count = 1;
+    set->fds[0].fd = endpoint_fd;
+    set->fds[0].events = PACHA_FD_EVENT_READABLE;
+    return 0;
+}
+
+int pacha_service_wait_add(struct pacha_service_wait_set *set, int fd, uint32_t events) {
+    if (set == NULL || fd < 16 || events == 0 || set->count >= PACHA_SERVICE_WAIT_MAX_FDS)
+        return -1;
+    set->fds[set->count].fd = fd;
+    set->fds[set->count].events = events;
+    set->count++;
+    return 0;
+}
+
+long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks) {
+    if (set == NULL || set->count == 0 || set->count > PACHA_SERVICE_WAIT_MAX_FDS) return -1;
+    for (uint64_t i = 0; i < set->count; i++) set->fds[i].revents = 0;
+    return pacha_fd_wait_many(set->fds, set->count, timeout_ticks);
 }
 
 int pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags) {

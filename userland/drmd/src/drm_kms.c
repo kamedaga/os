@@ -974,6 +974,29 @@ int drmd_kms_read(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_
     return 0;
 }
 
+int drmd_kms_peek_event(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_size)
+{
+    if (data == NULL || out_size == NULL || capacity < sizeof(drmd_event_vblank_t)) return -22;
+    *out_size = 0;
+    drmd_kms_event_file_t *event_file = find_event_file(handle);
+    if (event_file == NULL) return -9;
+    if (event_file->count == 0) return -11;
+    memcpy(data, &event_file->events[event_file->head], sizeof(drmd_event_vblank_t));
+    *out_size = sizeof(drmd_event_vblank_t);
+    return 0;
+}
+
+int drmd_kms_consume_event(uint64_t handle)
+{
+    drmd_kms_event_file_t *event_file = find_event_file(handle);
+    if (event_file == NULL) return -9;
+    if (event_file->count == 0) return -11;
+    memset(&event_file->events[event_file->head], 0, sizeof(drmd_event_vblank_t));
+    event_file->head = (event_file->head + 1u) % DRMD_KMS_EVENT_QUEUE_MAX;
+    event_file->count--;
+    return 0;
+}
+
 int drmd_kms_poll(uint64_t handle, uint32_t events, uint32_t *out_revents)
 {
     if (out_revents == NULL) return -22;

@@ -152,7 +152,7 @@ pub const pollfd_fd_offset: u64 = 0;
 pub const pollfd_events_offset: u64 = 8;
 pub const pollfd_revents_offset: u64 = 16;
 pub const pollfd_size: u64 = 24;
-pub const max_pollfds: u64 = 64;
+pub const max_pollfds: u64 = fd_table_entries;
 pub const wait_forever: u64 = ~@as(u64, 0);
 
 pub const iovec_base_offset: u64 = 0;

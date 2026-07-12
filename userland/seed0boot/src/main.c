@@ -435,6 +435,23 @@ int main(int argc, char **argv)
         (void)pacha_fd_close(termd_tty_endpoint_fd);
     }
 
+    printf("[seed0boot] netd starting\n");
+    int netd_socket_endpoint_fd = -1;
+    capsule_status = seed0_launch_netd(filed_endpoint_fd, &netd_socket_endpoint_fd);
+    if (capsule_status != 0 || netd_socket_endpoint_fd < 16) {
+        fprintf(stderr, "[seed0boot] netd launch failed status=%d fd=%d\n",
+            capsule_status, netd_socket_endpoint_fd);
+        return 26;
+    }
+    printf("[seed0boot] netd started\n");
+    const int netd_register_status =
+        seed0_register_netd_socket_endpoint(filed_endpoint_fd, netd_socket_endpoint_fd);
+    if (netd_register_status != 0) {
+        fprintf(stderr, "[seed0boot] netd socket endpoint register failed status=%d\n",
+            netd_register_status);
+        return 27;
+    }
+
     printf("[seed0boot] drmd starting\n");
     int drmd_drm_endpoint_fd = -1;
     struct pacha_ipc_channel_pair drmd_ready_pair = { .a = -1, .b = -1 };
@@ -446,7 +463,8 @@ int main(int argc, char **argv)
             drmd_ready_pair.b);
         return 22;
     }
-    capsule_status = seed0_launch_drmd(drmd_ready_pair.b, &drmd_drm_endpoint_fd);
+    capsule_status = seed0_launch_drmd(
+        drmd_ready_pair.b, netd_socket_endpoint_fd, &drmd_drm_endpoint_fd);
     (void)pacha_fd_close(drmd_ready_pair.b);
     if (capsule_status != 0) {
         (void)pacha_fd_close(drmd_ready_pair.a);
@@ -473,7 +491,8 @@ int main(int argc, char **argv)
     struct pacha_ipc_channel_pair inputd_ready_pair = { .a = -1, .b = -1 };
     if (pacha_ipc_channel_create(&inputd_ready_pair, seed0_channel_rights, 0) != 0 ||
         inputd_ready_pair.a < 16 || inputd_ready_pair.b < 16) return 24;
-    capsule_status = seed0_launch_inputd(inputd_ready_pair.b, &inputd_input_endpoint_fd);
+    capsule_status = seed0_launch_inputd(
+        inputd_ready_pair.b, netd_socket_endpoint_fd, &inputd_input_endpoint_fd);
     (void)pacha_fd_close(inputd_ready_pair.b);
     if (capsule_status != 0) {
         (void)pacha_fd_close(inputd_ready_pair.a);
@@ -492,22 +511,7 @@ int main(int argc, char **argv)
     printf("[seed0boot] inputd ready\n");
     (void)pacha_fd_close(inputd_input_endpoint_fd);
 
-    printf("[seed0boot] netd starting\n");
-    int netd_socket_endpoint_fd = -1;
-    capsule_status = seed0_launch_netd(filed_endpoint_fd, &netd_socket_endpoint_fd);
-    if (capsule_status != 0) {
-        fprintf(stderr, "[seed0boot] netd launch failed status=%d\n", capsule_status);
-        return 26;
-    }
-    printf("[seed0boot] netd started\n");
-    if (netd_socket_endpoint_fd >= 16) {
-        const int register_status = seed0_register_netd_socket_endpoint(filed_endpoint_fd, netd_socket_endpoint_fd);
-        if (register_status != 0) {
-            fprintf(stderr, "[seed0boot] netd socket endpoint register failed status=%d\n", register_status);
-            return 27;
-        }
-        (void)pacha_fd_close(netd_socket_endpoint_fd);
-    }
+    (void)pacha_fd_close(netd_socket_endpoint_fd);
     const struct pacha_ipc_msg service_ready_msg = {
         .word0 = SEED0_SERVICES_READY_MAGIC,
         .word1 = 0,

@@ -1100,6 +1100,10 @@ apps:
     file: "tests/fixtures/shell_interaction_smoke.sh"
     out: "SHINTRCT.SH"
     rootfs: "/cmd/shell_interaction_smoke.sh"
+  m53b_monitor_shell_script:
+    file: "tests/fixtures/m53b_monitor_shell.sh"
+    out: "M53BMON.SH"
+    rootfs: "/cmd/m53b_monitor_shell.sh"
   pty_teardown_smoke_script:
     file: "tests/fixtures/pty_teardown_smoke.sh"
     out: "PTYTDOWN.SH"

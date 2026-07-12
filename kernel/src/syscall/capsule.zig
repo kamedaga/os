@@ -417,6 +417,7 @@ pub fn dispatch(
             if (flags != 0 or max_words < 1) break :blk sc.syscall_err_invalid;
             if (count != frame.rsi) {
                 if (!h.write_user_u64(proc, frame.rdx, count)) break :blk sc.syscall_err_invalid;
+                if (!state.acknowledgeIrqEventCountForFd(proc, @intCast(frame.rdi), count)) break :blk sc.syscall_err_invalid;
                 break :blk 1;
             }
             break :blk sc.syscall_err_not_ready;

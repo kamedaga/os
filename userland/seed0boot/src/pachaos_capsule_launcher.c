@@ -654,7 +654,7 @@ int seed0_launch_termd(int ready_channel_fd, int *out_tty_endpoint_fd)
     return 0;
 }
 
-int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
+int seed0_launch_drmd(int ready_channel_fd, int netd_endpoint_fd, int *out_drm_endpoint_fd)
 {
     static const struct seed0_capsule_module_spec module_specs[] = {
         {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
@@ -669,7 +669,7 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     if (out_drm_endpoint_fd != 0) {
         *out_drm_endpoint_fd = -1;
     }
-    if (ready_channel_fd < 16) {
+    if (ready_channel_fd < 16 || netd_endpoint_fd < 16) {
         return -1;
     }
 
@@ -725,7 +725,18 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     if (status == 0) {
         status = mark_device_inherit(ready_channel_fd, "drmd ready channel");
     }
+    const long netd_dup = status == 0 ? pacha_fd_fcntl(
+        netd_endpoint_fd,
+        PACHA_FD_FCNTL_DUP,
+        SEED0_NETD_SOCKET_ENDPOINT_FD,
+        seed0_netd_endpoint_rights) : -1;
+    const int netd_dup_installed = netd_dup == SEED0_NETD_SOCKET_ENDPOINT_FD;
+    if (status == 0 && !netd_dup_installed) status = -4;
+    if (status == 0)
+        status = mark_device_inherit(SEED0_NETD_SOCKET_ENDPOINT_FD, "drmd netd endpoint");
     if (status != 0) {
+        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+        if (netd_dup_installed) (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(drm_endpoint_fd);
         return status;
     }
@@ -733,6 +744,8 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     struct seed0_loaded_process loaded;
     status = seed0_load_elf_process("/srv/drmd.elf", daemon_image, daemon_size, &loaded);
     if (status != 0) {
+        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(drm_endpoint_fd);
         return status;
     }
@@ -743,6 +756,7 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     config.drm_endpoint_fd = SEED0_DRMD_DRM_ENDPOINT_FD;
     config.device_fd = (uint64_t)(uint32_t)device_fd;
     config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
+    config.netd_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
     config.module_count = module_count;
     for (uint64_t i = 0; i < module_count; i++) {
         config.modules[i].image_va = DRMD_MODULE_IMAGE_VA + DRMD_MODULE_IMAGE_STRIDE * i;
@@ -756,6 +770,8 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
         sizeof(config),
         PACHA_PROT_READ);
     if (status != 0) {
+        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(drm_endpoint_fd);
         return -5;
     }
@@ -770,6 +786,8 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
             fprintf(stderr, "[seed0boot] drmd: module map failed name=%s status=%d\n",
                 module_specs[i].name,
                 status);
+            (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+            (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
             (void)pacha_fd_close(drm_endpoint_fd);
             return -6;
         }
@@ -778,10 +796,13 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     printf("[seed0boot] drmd modules=%llu\n", (unsigned long long)module_count);
     status = seed0_start_process(&loaded, "/srv/drmd.elf", -1);
     if (status != 0) {
+        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(drm_endpoint_fd);
         return status;
     }
     (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
+    (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
     if (out_drm_endpoint_fd != 0) {
         *out_drm_endpoint_fd = drm_endpoint_fd;
     } else {
@@ -790,7 +811,7 @@ int seed0_launch_drmd(int ready_channel_fd, int *out_drm_endpoint_fd)
     return 0;
 }
 
-int seed0_launch_inputd(int ready_channel_fd, int *out_input_endpoint_fd)
+int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_input_endpoint_fd)
 {
     static const struct seed0_capsule_module_spec module_specs[] = {
         {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
@@ -801,7 +822,7 @@ int seed0_launch_inputd(int ready_channel_fd, int *out_input_endpoint_fd)
         {"/srv/kobox/linux_virtio_input.ko", "linux_virtio_input.ko"},
     };
     if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = -1;
-    if (ready_channel_fd < 16) return -1;
+    if (ready_channel_fd < 16 || netd_endpoint_fd < 16) return -1;
     const struct seed0_device_descriptor *devices[INPUTD_DEVICE_COUNT] = {0};
     if (!find_virtio_input_devices(seed0_bootstrap_descriptor(), devices)) {
         fprintf(stderr, "[seed0boot] inputd: two virtio-input device fds not found\n");
@@ -833,13 +854,26 @@ int seed0_launch_inputd(int ready_channel_fd, int *out_input_endpoint_fd)
     }
     status = mark_device_inherit(SEED0_INPUTD_INPUT_ENDPOINT_FD, "inputd input endpoint");
     if (status == 0) status = mark_device_inherit(ready_channel_fd, "inputd ready channel");
+    const long netd_dup = status == 0 ? pacha_fd_fcntl(
+        netd_endpoint_fd,
+        PACHA_FD_FCNTL_DUP,
+        SEED0_NETD_SOCKET_ENDPOINT_FD,
+        seed0_netd_endpoint_rights) : -1;
+    const int netd_dup_installed = netd_dup == SEED0_NETD_SOCKET_ENDPOINT_FD;
+    if (status == 0 && !netd_dup_installed) status = -4;
+    if (status == 0)
+        status = mark_device_inherit(SEED0_NETD_SOCKET_ENDPOINT_FD, "inputd netd endpoint");
     if (status != 0) {
+        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+        if (netd_dup_installed) (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(endpoint_fd);
         return status;
     }
     struct seed0_loaded_process loaded;
     status = seed0_load_elf_process("/srv/inputd.elf", daemon_image, daemon_size, &loaded);
     if (status != 0) {
+        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(endpoint_fd);
         return status;
     }
@@ -848,6 +882,7 @@ int seed0_launch_inputd(int ready_channel_fd, int *out_input_endpoint_fd)
     config.magic = INPUTD_BOOT_CONFIG_MAGIC;
     config.input_endpoint_fd = SEED0_INPUTD_INPUT_ENDPOINT_FD;
     config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
+    config.netd_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
     config.device_count = INPUTD_DEVICE_COUNT;
     for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++)
         config.device_fds[i] = devices[i]->init_device_fd;
@@ -859,17 +894,33 @@ int seed0_launch_inputd(int ready_channel_fd, int *out_input_endpoint_fd)
     }
     status = seed0_map_bytes_into_process(
         loaded.process_fd, INPUTD_BOOT_CONFIG_VA, &config, sizeof(config), PACHA_PROT_READ);
-    if (status != 0) return -5;
+    if (status != 0) {
+        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
+        (void)pacha_fd_close(endpoint_fd);
+        return -5;
+    }
     for (uint64_t i = 0; i < module_count; i++) {
         status = seed0_map_bytes_into_process(loaded.process_fd, config.modules[i].image_va,
             module_images[i], module_sizes[i], PACHA_PROT_READ);
-        if (status != 0) return -6;
+        if (status != 0) {
+            (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+            (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
+            (void)pacha_fd_close(endpoint_fd);
+            return -6;
+        }
     }
     printf("[seed0boot] inputd modules=%llu devices=%u\n",
         (unsigned long long)module_count, INPUTD_DEVICE_COUNT);
     status = seed0_start_process(&loaded, "/srv/inputd.elf", -1);
-    if (status != 0) return status;
+    if (status != 0) {
+        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
+        (void)pacha_fd_close(endpoint_fd);
+        return status;
+    }
     (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
+    (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
     if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = endpoint_fd;
     else (void)pacha_fd_close(endpoint_fd);
     return 0;

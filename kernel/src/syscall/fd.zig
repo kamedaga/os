@@ -184,7 +184,11 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
     }
     if (state.irqEventCountForFd(proc, fd, .{ .read = true })) |count| {
         if (count == 0) return sc.syscall_err_not_ready;
-        return writeUserU64Bytes(h, proc, out_va, len, count);
+        const written = writeUserU64Bytes(h, proc, out_va, len, count);
+        if (written != sc.syscall_err_invalid) {
+            _ = state.acknowledgeIrqEventCountForFd(proc, fd, count);
+        }
+        return written;
     }
     return sc.syscall_err_invalid;
 }
@@ -484,6 +488,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
 
     const current_thread = scheduler.currentThread();
     const current_generation = scheduler.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
+    state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
     const register_start = ipc_metric.timestamp();
     registerCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation) catch |err| {
         unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);

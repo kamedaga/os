@@ -2489,6 +2489,21 @@ void netd_libuinet_poll(void)
 #endif
 }
 
+int netd_libuinet_needs_periodic_poll(void)
+{
+#if defined(NETD_WITH_LIBUINET)
+    if (g_libuinet_http_smoke.state != NETD_HTTP_SMOKE_IDLE &&
+        g_libuinet_http_smoke.state != NETD_HTTP_SMOKE_DONE &&
+        g_libuinet_http_smoke.state != NETD_HTTP_SMOKE_ERROR)
+        return 1;
+    for (unsigned i = 0; i < NETD_TCP_ECHO_MAX_CONNECTIONS; i++)
+        if (g_libuinet_tcp_connections[i] != NULL) return 1;
+    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; i++)
+        if (g_libuinet_api_sockets[i].handle != 0) return 1;
+#endif
+    return 0;
+}
+
 enum netd_libuinet_state netd_libuinet_state(void)
 {
     return g_libuinet_state;

@@ -274,11 +274,15 @@ static void lpr_write_exec_local_fd_desc_unlocked(
         desc->kind = FILED_EXEC_LPR_FD_DRM;
         desc->flags = (file->payload.drm.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.drm.handle;
+        desc->native_wait_fd = file->payload.drm.native_wait_fd >= 16 ?
+            (uint64_t)(uint32_t)file->payload.drm.native_wait_fd : 0;
     } else if (file->kind == LPR_FD_TABLE_KIND_INPUT) {
         desc->kind = FILED_EXEC_LPR_FD_INPUT;
         desc->flags = (file->payload.input.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.input.handle;
         desc->offset_or_counter = file->payload.input.reserved0;
+        desc->native_wait_fd = file->payload.input.native_wait_fd >= 16 ?
+            (uint64_t)(uint32_t)file->payload.input.native_wait_fd : 0;
     } else if (file->kind == LPR_FD_TABLE_KIND_DMABUF) {
         desc->kind = FILED_EXEC_LPR_FD_DMABUF;
         desc->flags = (file->payload.dmabuf.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
@@ -297,6 +301,8 @@ static void lpr_write_exec_local_fd_desc_unlocked(
         desc->flags = (file->payload.socket.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.socket.handle;
         desc->offset_or_counter = file->payload.socket.type;
+        desc->native_wait_fd = file->payload.socket.native_wait_fd >= 16 ?
+            (uint64_t)(uint32_t)file->payload.socket.native_wait_fd : 0;
     }
 }
 
@@ -530,15 +536,23 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
             object->payload.drm.handle != 0)
         {
             const uint64_t handle = object->payload.drm.handle;
+            const int native_wait_fd = object->payload.drm.native_wait_fd;
             object->payload.drm.handle = 0;
+            object->payload.drm.native_wait_fd = -1;
             object->backend_id = 0;
+            if (native_wait_fd >= 16)
+                (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
             (void)lpr_drm_close_handle(handle);
         } else if (object->kind == LPR_FD_TABLE_KIND_INPUT &&
             object->payload.input.handle != 0)
         {
             const uint64_t handle = object->payload.input.handle;
+            const int native_wait_fd = object->payload.input.native_wait_fd;
             object->payload.input.handle = 0;
+            object->payload.input.native_wait_fd = -1;
             object->backend_id = 0;
+            if (native_wait_fd >= 16)
+                (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
             (void)lpr_input_close_handle(handle);
         } else if (object->kind == LPR_FD_TABLE_KIND_DMABUF &&
             object->payload.dmabuf.token != 0)

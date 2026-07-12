@@ -410,20 +410,33 @@ static int64_t lpr_epoll_sleep_ms(uint64_t ms)
 static int64_t lpr_epoll_block(
     const lpr_epoll_snapshot_t *snapshot,
     uint32_t count,
-    uint64_t wait_ms)
+    int64_t remaining_ms,
+    uint64_t *out_waited_ms)
 {
     struct pacha_pollfd pollfds[LPR_EPOLL_NATIVE_WAIT_MAX];
     uint32_t native_count = 0;
     for (uint32_t i = 0; i < count && native_count < LPR_EPOLL_NATIVE_WAIT_MAX; i++) {
-        if (snapshot[i].kind != LPR_FD_TABLE_KIND_PIPE) {
-            continue;
-        }
+        int native_fd = -1;
+        if (snapshot[i].kind == LPR_FD_TABLE_KIND_PIPE) native_fd = snapshot[i].fd;
+        else if (snapshot[i].kind == LPR_FD_TABLE_KIND_DRM)
+            native_fd = lpr_drm_native_wait_fd((uint64_t)(uint32_t)snapshot[i].fd);
+        else if (snapshot[i].kind == LPR_FD_TABLE_KIND_INPUT)
+            native_fd = lpr_input_native_wait_fd((uint64_t)(uint32_t)snapshot[i].fd);
+        else if (snapshot[i].kind == LPR_FD_TABLE_KIND_SOCKET)
+            native_fd = lpr_linux_socket_native_wait_fd((uint64_t)(uint32_t)snapshot[i].fd);
+        if (native_fd < 16) continue;
         lpr_memset(&pollfds[native_count], 0, sizeof(pollfds[native_count]));
-        pollfds[native_count].fd = snapshot[i].fd;
-        pollfds[native_count].events = lpr_pipe_poll_events_to_pacha(
-            snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP);
+        pollfds[native_count].fd = native_fd;
+        pollfds[native_count].events = snapshot[i].kind == LPR_FD_TABLE_KIND_PIPE ?
+            lpr_pipe_poll_events_to_pacha(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) :
+            PACHA_FD_EVENT_READABLE;
         native_count++;
     }
+    uint64_t wait_ms = LPR_EPOLL_WAIT_QUANTUM_MS;
+    const int all_native = count != 0 && native_count == count;
+    if (all_native) wait_ms = remaining_ms < 0 ? UINT64_MAX : (uint64_t)remaining_ms;
+    else if (remaining_ms > 0 && remaining_ms < (int64_t)wait_ms) wait_ms = (uint64_t)remaining_ms;
+    if (out_waited_ms != 0) *out_waited_ms = wait_ms;
     if (native_count == 0) {
         return lpr_epoll_sleep_ms(wait_ms);
     }
@@ -433,8 +446,11 @@ static int64_t lpr_epoll_block(
         native_count,
         wait_ms,
         0);
-    if (status >= 0 ||
-        status == PACHA_SYSCALL_ERR_NOT_READY ||
+    if (status >= 0) {
+        if (out_waited_ms != 0) *out_waited_ms = 0;
+        return 0;
+    }
+    if (status == PACHA_SYSCALL_ERR_NOT_READY ||
         status == -PACHA_SYSCALL_ERR_NOT_READY)
     {
         return 0;
@@ -484,16 +500,13 @@ int64_t lpr_linux_epoll_wait(
             return ready;
         }
 
-        uint64_t wait_ms = LPR_EPOLL_WAIT_QUANTUM_MS;
-        if (remaining_ms > 0 && remaining_ms < (int64_t)wait_ms) {
-            wait_ms = (uint64_t)remaining_ms;
-        }
-        const int64_t wait_status = lpr_epoll_block(snapshot, count, wait_ms);
+        uint64_t waited_ms = 0;
+        const int64_t wait_status = lpr_epoll_block(snapshot, count, remaining_ms, &waited_ms);
         if (wait_status != 0 && wait_status != -LPR_LINUX_EBADF) {
             return wait_status;
         }
-        if (remaining_ms > 0) {
-            remaining_ms -= (int64_t)wait_ms;
+        if (remaining_ms > 0 && waited_ms != UINT64_MAX) {
+            remaining_ms -= (int64_t)waited_ms;
             if (remaining_ms <= 0) {
                 return 0;
             }
