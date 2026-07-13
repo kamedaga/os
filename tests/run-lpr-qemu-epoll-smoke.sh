@@ -23,6 +23,7 @@ fi
   --expect 'LPR_EPOLL_DUP=OK' \
   --expect 'LPR_EPOLL_CLOSE_AUTO=OK' \
   --expect 'LPR_EPOLL_HUP=OK' \
+  --expect 'LPR_EPOLL_NESTED=OK' \
   --expect 'LPR_EPOLL_FORK_INFINITE=OK' \
   --expect 'LPR_EPOLL_CLOEXEC_EXEC=OK' \
   --expect 'LPR_EPOLL_DONE'

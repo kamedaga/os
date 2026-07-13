@@ -172,6 +172,47 @@ static int lpr_epoll_interest_matches(
         interest->target_generation == target_generation;
 }
 
+static int lpr_epoll_reaches_unlocked(
+    uint32_t file_index,
+    uint32_t wanted_file_index,
+    uint32_t depth)
+{
+    if (file_index == wanted_file_index) {
+        return 1;
+    }
+    if (file_index >= lpr_control_fd_table.file_count ||
+        depth >= lpr_control_fd_table.file_count)
+    {
+        return 0;
+    }
+    lpr_fd_object_t *object = &lpr_control_fd_table.files[file_index];
+    lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(object);
+    if (instance == 0) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < instance->count; i++) {
+        const lpr_epoll_interest_t *interest = &instance->interests[i];
+        if (interest->target_file_index >= lpr_control_fd_table.file_count) {
+            continue;
+        }
+        const lpr_fd_object_t *target =
+            &lpr_control_fd_table.files[interest->target_file_index];
+        if (!target->active || target->generation != interest->target_generation ||
+            target->kind != LPR_FD_TABLE_KIND_EPOLL)
+        {
+            continue;
+        }
+        if (lpr_epoll_reaches_unlocked(
+                interest->target_file_index,
+                wanted_file_index,
+                depth + 1u))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uint64_t event_raw)
 {
     if (epfd_raw > LPR_LINUX_FD_MAX || fd_raw > LPR_LINUX_FD_MAX) {
@@ -238,7 +279,8 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         target->kind != LPR_FD_TABLE_KIND_EVENT &&
         target->kind != LPR_FD_TABLE_KIND_TTY &&
         target->kind != LPR_FD_TABLE_KIND_DRM &&
-        target->kind != LPR_FD_TABLE_KIND_INPUT)
+        target->kind != LPR_FD_TABLE_KIND_INPUT &&
+        target->kind != LPR_FD_TABLE_KIND_EPOLL)
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EPERM;
@@ -260,6 +302,15 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         if (found != instance->count) {
             lpr_fd_table_unlock(&lpr_control_fd_table);
             return -LPR_LINUX_EEXIST;
+        }
+        if (target->kind == LPR_FD_TABLE_KIND_EPOLL &&
+            lpr_epoll_reaches_unlocked(
+                target_slot->file_index,
+                epoll_slot->file_index,
+                0))
+        {
+            lpr_fd_table_unlock(&lpr_control_fd_table);
+            return -LPR_LINUX_ELOOP;
         }
         if (instance->count >= instance->capacity) {
             lpr_fd_table_unlock(&lpr_control_fd_table);
@@ -368,7 +419,8 @@ static int64_t lpr_epoll_scan(
 {
     lpr_linux_pollfd_t pollfds[LPR_EPOLL_MAX_INTERESTS];
     for (uint32_t i = 0; i < count; i++) {
-        pollfds[i].fd = snapshot[i].fd;
+        pollfds[i].fd = snapshot[i].kind == LPR_FD_TABLE_KIND_EPOLL ?
+            -1 : snapshot[i].fd;
         pollfds[i].events = (int16_t)(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP);
         pollfds[i].revents = 0;
     }
@@ -381,6 +433,23 @@ static int64_t lpr_epoll_scan(
     }
     uint32_t ready = 0;
     for (uint32_t i = 0; i < count && ready < maxevents; i++) {
+        if (snapshot[i].kind == LPR_FD_TABLE_KIND_EPOLL) {
+            lpr_linux_epoll_event_t nested_event;
+            const int64_t nested_ready = lpr_linux_epoll_wait(
+                (uint64_t)(uint32_t)snapshot[i].fd,
+                (uint64_t)(uintptr_t)&nested_event,
+                1,
+                0);
+            if (nested_ready < 0) {
+                return nested_ready;
+            }
+            if (nested_ready > 0 && (snapshot[i].events & LPR_EPOLLIN) != 0) {
+                events[ready].events = LPR_EPOLLIN;
+                events[ready].data = snapshot[i].data;
+                ready++;
+            }
+            continue;
+        }
         const uint32_t revents = (uint16_t)pollfds[i].revents;
         const uint32_t report = revents &
             (snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) &

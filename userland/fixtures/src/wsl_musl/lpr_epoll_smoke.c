@@ -263,6 +263,42 @@ static int hup_smoke(void)
     return 1;
 }
 
+static int nested_smoke(void)
+{
+    enum {
+        INNER_DATA = 0x91,
+        OUTER_DATA = 0x92,
+    };
+    const int inner = epoll_create1(EPOLL_CLOEXEC);
+    const int outer = epoll_create1(EPOLL_CLOEXEC);
+    const int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (inner < 0 || outer < 0 || efd < 0 ||
+        add_interest(inner, efd, EPOLLIN, INNER_DATA) != 0 ||
+        add_interest(outer, inner, EPOLLIN, OUTER_DATA) != 0)
+    {
+        return fail("LPR_EPOLL_NESTED=BAD:create\n");
+    }
+    errno = 0;
+    if (add_interest(inner, outer, EPOLLIN, 0x93) == 0 || errno != ELOOP) {
+        return fail("LPR_EPOLL_NESTED=BAD:cycle\n");
+    }
+    const uint64_t one = 1;
+    struct epoll_event event;
+    if (write(efd, &one, sizeof(one)) != (ssize_t)sizeof(one) ||
+        epoll_wait(outer, &event, 1, 200) != 1 ||
+        event.data.u64 != OUTER_DATA || (event.events & EPOLLIN) == 0 ||
+        epoll_wait(inner, &event, 1, 0) != 1 ||
+        event.data.u64 != INNER_DATA || (event.events & EPOLLIN) == 0)
+    {
+        return fail("LPR_EPOLL_NESTED=BAD:event\n");
+    }
+    close(efd);
+    close(outer);
+    close(inner);
+    emit("LPR_EPOLL_NESTED=OK\n");
+    return 1;
+}
+
 static int fork_infinite_smoke(void)
 {
     int pipefd[2] = {-1, -1};
@@ -353,6 +389,7 @@ int main(int argc, char **argv)
     if (!mixed_level_ctl_smoke() ||
         !timeout_dup_close_smoke() ||
         !hup_smoke() ||
+        !nested_smoke() ||
         !fork_infinite_smoke() ||
         !cloexec_exec_smoke(argv[0]))
     {

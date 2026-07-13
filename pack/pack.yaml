@@ -173,6 +173,11 @@ apps:
       path: "tests/fixtures/sway_shm_client.sh"
     out: "SWAYM56.SH"
     rootfs: "/cmd/sway_shm_client.sh"
+  sway_input_script:
+    file:
+      path: "tests/fixtures/sway_input.sh"
+    out: "SWAYM57.SH"
+    rootfs: "/cmd/sway_input.sh"
   sway_socket_repeat_script:
     file:
       path: "tests/fixtures/sway_socket_repeat.sh"
@@ -197,6 +202,15 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_sway_launcher.c"
     out: "LPRSWAYL.ELF"
     rootfs: "/cmd/lpr_sway_launcher.elf"
+  lpr_wlroots_keymap_compat:
+    file:
+      path: ".artifacts/userland-fixtures/libm57-wlroots-keymap-compat.so"
+      rebuild: ["bash", "pack/scripts/build_wsl_wlroots_keymap_compat.sh"]
+      input:
+        - "pack/scripts/build_wsl_wlroots_keymap_compat.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_wlroots_keymap_compat.c"
+    out: "M57KMAP.SO"
+    rootfs: "/cmd/libm57-wlroots-keymap-compat.so"
   lpr_wayland_shm_client:
     file:
       path: ".artifacts/userland-fixtures/lpr_wayland_shm_client.elf"

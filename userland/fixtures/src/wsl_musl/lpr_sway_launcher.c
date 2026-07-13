@@ -151,6 +151,9 @@ int main(int argc, char **argv) {
         /* PachaOS PRIME has no implicit fence. Zero raster threads makes
          * llvmpipe finish each scene synchronously before wlroots' glFlush. */
         (void)setenv("LP_NUM_THREADS", "0", 1);
+        const char *keymap_preload = getenv("M57_WLROOTS_KEYMAP_PRELOAD");
+        if (keymap_preload != NULL && keymap_preload[0] != '\0')
+            (void)setenv("LD_PRELOAD", keymap_preload, 1);
         execv(argv[1], &argv[1]);
         perror("exec sway");
         _exit(126);
