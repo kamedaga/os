@@ -36,6 +36,7 @@ typedef struct koboxd_fs_object {
     uint8_t used;
     uint8_t linked;
     uint8_t dirty;
+    uint8_t release_prepared;
 } koboxd_fs_object_t;
 
 typedef struct koboxd_fs_object_stats {

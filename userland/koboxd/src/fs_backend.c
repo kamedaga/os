@@ -162,6 +162,11 @@ typedef struct koboxd_readdir_scan {
     int overflow;
 } koboxd_readdir_scan_t;
 
+typedef struct koboxd_deferred_release_batch {
+    koboxd_fs_object_t *objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
+    size_t count;
+} koboxd_deferred_release_batch_t;
+
 static int fs_file_writeback_inode(const koboxd_ext4_operations_t *ops, void *inode, int commit_metadata);
 static int fs_file_fsync(const koboxd_ext4_operations_t *ops, void *inode);
 static int fs_file_read(
@@ -1892,12 +1897,8 @@ int koboxd_fs_backend_rename(
 static int fs_prepare_unlinked_object_release(
     koboxd_fs_backend_t *backend,
     const koboxd_ext4_operations_t *ops,
-    koboxd_fs_object_t *object,
-    uint64_t *out_inode_number)
+    koboxd_fs_object_t *object)
 {
-    if (out_inode_number != NULL) {
-        *out_inode_number = 0;
-    }
     if (backend == NULL || ops == NULL || object == NULL ||
         !backend->mounted || object->object_id == 0 || object->object_id == 1)
     {
@@ -1908,15 +1909,7 @@ static int fs_prepare_unlinked_object_release(
         object != NULL ? object->name : "",
         object != NULL ? (unsigned long long)object->inode_number : 0ull);
     if (object->inode == NULL) {
-        if (out_inode_number != NULL) {
-            *out_inode_number = 0;
-        }
         return 0;
-    }
-
-    uint64_t inode_number = object->inode_number;
-    if (inode_number == 0) {
-        inode_number = read_u64_field(object->inode, KOBOXD_INODE_NUMBER_OFFSET);
     }
     if ((object->mode & KOBOXD_MODE_TYPE_MASK) == 0100000) {
         int detach_status = kb_fs_subsystem_ext4_detach_inode_data_blocks_deferred(object->inode);
@@ -1936,10 +1929,6 @@ static int fs_prepare_unlinked_object_release(
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-    if (out_inode_number != NULL) {
-        *out_inode_number = inode_number;
-    }
-
     fs_mark_metadata_dirty(backend);
     return 0;
 }
@@ -1961,6 +1950,44 @@ static void fs_finalize_unlinked_object_release(koboxd_fs_backend_t *backend, ko
         (unsigned long long)object->inode_number);
 }
 
+static int fs_prepare_deferred_unlinked_objects(
+    koboxd_fs_backend_t *backend,
+    const koboxd_ext4_operations_t *ops,
+    koboxd_deferred_release_batch_t *batch)
+{
+    if (backend == NULL || ops == NULL || batch == NULL || !backend->mounted) {
+        return -22;
+    }
+    memset(batch, 0, sizeof(*batch));
+    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
+        koboxd_fs_object_t *object = &backend->objects[i];
+        if (!object->used || object->linked || object->references != 0) {
+            continue;
+        }
+        if (!object->release_prepared) {
+            const int status = fs_prepare_unlinked_object_release(backend, ops, object);
+            if (status != 0) {
+                return status;
+            }
+            object->release_prepared = 1;
+        }
+        batch->objects[batch->count++] = object;
+    }
+    return 0;
+}
+
+static void fs_finalize_deferred_release_batch(
+    koboxd_fs_backend_t *backend,
+    const koboxd_deferred_release_batch_t *batch)
+{
+    if (backend == NULL || batch == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < batch->count; i++) {
+        fs_finalize_unlinked_object_release(backend, batch->objects[i]);
+    }
+}
+
 static int fs_release_deferred_unlinked_objects(koboxd_fs_backend_t *backend)
 {
     if (backend == NULL || !backend->mounted) {
@@ -1973,37 +2000,20 @@ static int fs_release_deferred_unlinked_objects(koboxd_fs_backend_t *backend)
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    uint64_t inode_numbers[KOBOXD_FS_BACKEND_MAX_OBJECTS];
-    koboxd_fs_object_t *released_objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
-    size_t inode_count = 0;
-    size_t released_count = 0;
-    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
-        koboxd_fs_object_t *object = &backend->objects[i];
-        if (!object->used || object->linked || object->references != 0) {
-            continue;
-        }
-        uint64_t inode_number = 0;
-        const int status = fs_prepare_unlinked_object_release(backend, &ops, object, &inode_number);
-        if (status != 0) {
-            return status;
-        }
-        released_objects[released_count++] = object;
-        if (inode_number != 0) {
-            inode_numbers[inode_count++] = inode_number;
-        }
+    koboxd_deferred_release_batch_t batch;
+    kb_fs_subsystem_begin_deferred_metadata_writes();
+    int status = fs_prepare_deferred_unlinked_objects(backend, &ops, &batch);
+    if (status == 0 && backend->mount_result.super_block != NULL) {
+        status = fs_commit_superblock(&ops, backend->mount_result.super_block);
     }
-    if (inode_count != 0) {
-        int status = kb_fs_subsystem_ext4_release_inode_records(
-            backend->mount_result.super_block,
-            inode_numbers,
-            inode_count);
-        if (status != 0) {
-            return status;
-        }
+    const int finish_status = kb_fs_subsystem_end_deferred_metadata_writes();
+    if (status == 0) {
+        status = finish_status;
     }
-    for (size_t i = 0; i < released_count; i++) {
-        fs_finalize_unlinked_object_release(backend, released_objects[i]);
+    if (status != 0) {
+        return status;
     }
+    fs_finalize_deferred_release_batch(backend, &batch);
     return 0;
 }
 
@@ -2198,6 +2208,10 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
         return -5;
     }
     KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all begin metadata_dirty=%u\n", backend->metadata_dirty);
+    koboxd_deferred_release_batch_t release_batch;
+    memset(&release_batch, 0, sizeof(release_batch));
+    kb_fs_subsystem_begin_deferred_metadata_writes();
+    int transaction_status = 0;
     uint64_t flush_us = 0;
     uint64_t flush_count = 0;
     for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
@@ -2211,33 +2225,39 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
         flush_us += fs_elapsed_us(flush_start_ns, flush_end_ns);
         flush_count++;
         if (status != 0) {
-            return status;
+            transaction_status = status;
+            break;
         }
     }
     const uint64_t drain_start_ns = fs_now_ns();
-    int drain_status = fs_release_deferred_unlinked_objects(backend);
+    if (transaction_status == 0) {
+        transaction_status = fs_prepare_deferred_unlinked_objects(backend, &ops, &release_batch);
+    }
     const uint64_t drain_end_ns = fs_now_ns();
-    if (drain_status != 0) {
-        return drain_status;
+    uint64_t commit_start_ns = 0;
+    uint64_t commit_end_ns = 0;
+    if (transaction_status == 0 && backend->mount_result.super_block != NULL) {
+        commit_start_ns = fs_now_ns();
+        transaction_status = fs_commit_superblock(&ops, backend->mount_result.super_block);
+        commit_end_ns = fs_now_ns();
     }
-    if (backend->mount_result.super_block != NULL) {
-        const uint64_t commit_start_ns = fs_now_ns();
-        int status = fs_commit_superblock(&ops, backend->mount_result.super_block);
-        const uint64_t commit_end_ns = fs_now_ns();
-        if (status != 0) {
-            return status;
-        }
-        backend->metadata_dirty = 0;
-        KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done flush_count=%llu status=0\n",
-            (unsigned long long)flush_count);
-        KOBOXD_FS_STAGE("[koboxd-fs-stage] op=sync_all flush_count=%llu flush_us=%llu drain_us=%llu commit_us=%llu status=0\n",
-            (unsigned long long)flush_count,
-            (unsigned long long)flush_us,
-            (unsigned long long)fs_elapsed_us(drain_start_ns, drain_end_ns),
-            (unsigned long long)fs_elapsed_us(commit_start_ns, commit_end_ns));
-        KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done status=0\n");
-        return 0;
+    const int finish_status = kb_fs_subsystem_end_deferred_metadata_writes();
+    if (transaction_status == 0) {
+        transaction_status = finish_status;
     }
+    if (transaction_status != 0) {
+        return transaction_status;
+    }
+    fs_finalize_deferred_release_batch(backend, &release_batch);
+    backend->metadata_dirty = 0;
+    KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done flush_count=%llu status=0\n",
+        (unsigned long long)flush_count);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=sync_all flush_count=%llu flush_us=%llu drain_us=%llu commit_us=%llu status=0\n",
+        (unsigned long long)flush_count,
+        (unsigned long long)flush_us,
+        (unsigned long long)fs_elapsed_us(drain_start_ns, drain_end_ns),
+        (unsigned long long)fs_elapsed_us(commit_start_ns, commit_end_ns));
+    KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done status=0\n");
     return 0;
 }
 
