@@ -11,7 +11,7 @@ fi
 pkill -9 qemu-system-x86 2>/dev/null || true
 sleep 1
 .artifacts/bin/pacgo qemu-test \
-  --timeout 90s \
+  --timeout 240s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
   --send 'bash /cmd/sway_first_frame.sh' \
   --expect 'Atomic modesetting unsupported, using legacy DRM interface' \

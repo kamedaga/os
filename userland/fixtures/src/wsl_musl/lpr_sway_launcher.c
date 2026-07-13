@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
@@ -63,7 +65,12 @@ int main(int argc, char **argv) {
 
     if (getenv("M55_FIRST_FRAME") != NULL) {
         int first_frame_status = 0;
-        for (int tick = 0; tick < 350; ++tick) {
+        /* Cold llvmpipe (fresh shader cache) needs ~50s+ to reach the first
+         * page flips; the wait must outlast that or READY races the frame.
+         * Sway creates its IPC socket ~10s (warm) to ~12s+ (cold) before the
+         * first output commit lands, so pad generously after seeing it. */
+        int ipc_seen_tick = -1;
+        for (int tick = 0; tick < 1200; ++tick) {
             const pid_t result = waitpid(sway, &first_frame_status, WNOHANG);
             if (result == sway) {
                 (void)kill(seatd, SIGKILL);
@@ -74,6 +81,23 @@ int main(int argc, char **argv) {
                 (void)kill(seatd, SIGKILL);
                 perror("waitpid sway first frame");
                 return 5;
+            }
+            if (ipc_seen_tick < 0) {
+                DIR *dir = opendir("/tmp");
+                if (dir != NULL) {
+                    const struct dirent *entry;
+                    while ((entry = readdir(dir)) != NULL) {
+                        if (strncmp(entry->d_name, "sway-ipc", 8) == 0) {
+                            ipc_seen_tick = tick;
+                            printf("M55_SWAY_IPC_SEEN tick=%d\n", tick);
+                            fflush(stdout);
+                            break;
+                        }
+                    }
+                    closedir(dir);
+                }
+            } else if (tick - ipc_seen_tick >= 250) {
+                break;
             }
             usleep(100000);
         }

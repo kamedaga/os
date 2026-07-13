@@ -14,5 +14,7 @@ export M55_FIRST_FRAME=1
 printf 'M55_SWAY_START backend=drm card=/dev/dri/card0\n'
 /cmd/lpr_sway_launcher.elf /usr/bin/sway -d -c "$config" 2>&1
 status=$?
+# Persist the Mesa shader cache so later runs start warm.
+/bin/sync
 printf 'M55_SWAY_STATUS=%s\n' "$status"
 exit "$status"
