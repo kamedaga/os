@@ -438,7 +438,7 @@ typedef struct lpr_memory_state {
 } lpr_memory_state_t;
 
 typedef struct lpr_debug_state {
-    const struct lpr_linux_user_frame *active_user_frame;
+    struct lpr_linux_user_frame *active_user_frame;
 } lpr_debug_state_t;
 
 typedef struct lpr_bootstrap lpr_bootstrap_t;
@@ -616,6 +616,10 @@ int lpr_count_exec_local_fds(uint64_t *out_count);
 void lpr_write_exec_local_fd_desc(filed_exec_lpr_fd_t *desc, uint64_t fd);
 int lpr_prepare_exec_local_fds(filed_exec_path_t *exec, lpr_exec_local_fd_table_t *local_table);
 void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table);
+int lpr_socket_prepare_fork(void);
+void lpr_socket_cancel_fork(void);
+int lpr_socket_reserve_exec(const lpr_exec_local_fd_table_t *local_table);
+void lpr_socket_release_exec(const lpr_exec_local_fd_table_t *local_table);
 int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
 void lpr_readlink_cache_clear(void);
 int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status);
@@ -818,6 +822,7 @@ int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t olda
 int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset_raw, uint64_t sigsetsize);
 int64_t lpr_linux_sigaltstack(uint64_t ss_raw, uint64_t old_ss_raw);
 void lpr_linux_signal_runtime_init(void);
+void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result);
 void *lpr_linux_async_signal_prepare(void *native_frame);
 _Noreturn void lpr_linux_rt_sigreturn_frame(const struct lpr_linux_user_frame *frame);
 _Noreturn void lpr_linux_rt_sigreturn_body(void *body);

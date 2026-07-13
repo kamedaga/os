@@ -428,6 +428,14 @@ int filed_path_component_is_tmp(const char *component, size_t len)
         component[2] == 'p';
 }
 
+static int filed_path_component_is_run(const char *component, size_t len)
+{
+    return len == 3u &&
+        component[0] == 'r' &&
+        component[1] == 'u' &&
+        component[2] == 'n';
+}
+
 void filed_close_walk_handle(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id,
@@ -437,7 +445,8 @@ void filed_close_walk_handle(
         owned &&
         handle_id != 0 &&
         handle_id != runtime->root_handle_id &&
-        (!runtime->tmpfs_root_handle_valid || handle_id != runtime->tmpfs_root_handle_id))
+        (!runtime->tmpfs_root_handle_valid || handle_id != runtime->tmpfs_root_handle_id) &&
+        (!runtime->run_tmpfs_root_handle_valid || handle_id != runtime->run_tmpfs_root_handle_id))
     {
         (void)filed_close_handle_runtime(runtime, handle_id);
     }
@@ -613,13 +622,22 @@ int64_t filed_resolve_parent_path(
         memset(component, 0, sizeof(component));
         memcpy(component, component_start, component_len);
 
-        if (current_handle == runtime->root_handle_id &&
-            !current_owned &&
-            runtime->tmpfs_root_handle_valid &&
-            has_more &&
+        filed_handle_id_t overlay_root_handle = 0;
+        if (runtime->tmpfs_root_handle_valid &&
             filed_path_component_is_tmp(component, component_len))
         {
-            current_handle = runtime->tmpfs_root_handle_id;
+            overlay_root_handle = runtime->tmpfs_root_handle_id;
+        } else if (runtime->run_tmpfs_root_handle_valid &&
+            filed_path_component_is_run(component, component_len))
+        {
+            overlay_root_handle = runtime->run_tmpfs_root_handle_id;
+        }
+        if (current_handle == runtime->root_handle_id &&
+            !current_owned &&
+            has_more &&
+            overlay_root_handle != 0)
+        {
+            current_handle = overlay_root_handle;
             path = after_slashes;
             continue;
         }

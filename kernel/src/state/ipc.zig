@@ -664,6 +664,20 @@ pub fn wakeIpcWaitersForSendFd(
     return count;
 }
 
+pub fn takeIpcChannelPeerCloseWaiters(
+    self: anytype,
+    closed_handle: IpcChannelHandle,
+    out: []ThreadWakeTarget,
+) usize {
+    if (closed_handle.side > 1) return 0;
+    const channel = self.ipcChannelSlot(closed_handle.channel) orelse return 0;
+    if (channel.ref_count != 1) return 0;
+    return channel.waiters[1 - @as(usize, closed_handle.side)].takeEvents(
+        @import("kernel_abi_root").fd_abi.event_hangup,
+        out,
+    );
+}
+
 pub fn ipcRecvWakeOwnersForSendFd(
     self: anytype,
     owner: PrincipalId,

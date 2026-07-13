@@ -1338,7 +1338,7 @@ static int netd_filed_call(
     return 0;
 }
 
-static int netd_filed_close_handle(uint64_t handle)
+int netd_filed_close_handle(uint64_t handle)
 {
     int page_fd = -1;
     void *page = NULL;

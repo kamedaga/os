@@ -185,6 +185,13 @@ static int netd_socket_dispatch(
             return netd_netlink_socket_is_handle(handle) ? netd_netlink_socket_close(handle) :
                 netd_unix_socket_is_handle(handle) ? netd_unix_socket_close(handle) : netd_libuinet_socket_close(handle);
         }
+    case NETD_OP_DUP:
+        {
+            const uint64_t handle = *out_result;
+            *out_result = 0;
+            return netd_unix_socket_is_handle(handle) ?
+                netd_unix_socket_dup(handle) : -95;
+        }
     case NETD_OP_BIND:
         if (page == NULL) return -22;
         return netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle) ?
@@ -249,6 +256,7 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     }
 
     const int send_has_fd = request->word1 == NETD_OP_SEND && page != NULL &&
+        netd_unix_socket_is_handle(((const netd_io_t *)page)->handle) &&
         ((const netd_io_t *)page)->fd_kind != 0;
     uint64_t result = request->word2;
     int reply_transfer_fd = -1;

@@ -465,6 +465,7 @@ pub const KernelState = struct {
     pub const unregisterFdWaitersForThread = fd_state.unregisterFdWaitersForThread;
     pub const takeTaskReadableWaitersForPrincipal = fd_state.takeTaskReadableWaitersForPrincipal;
     pub const wakeIpcWaitersForSendFd = ipc_state.wakeIpcWaitersForSendFd;
+    pub const takeIpcChannelPeerCloseWaiters = ipc_state.takeIpcChannelPeerCloseWaiters;
     pub const ipcRecvWakeOwnersForSendFd = ipc_state.ipcRecvWakeOwnersForSendFd;
     pub const ipcMessageQueueForRecv = ipc_state.ipcMessageQueueForRecv;
     pub const fdFreeCountFrom = ipc_state.fdFreeCountFrom;

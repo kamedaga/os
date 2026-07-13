@@ -129,3 +129,47 @@ int filed_tmpfs_backend_mount_root(filed_tmpfs_backend_t *backend, uint64_t *out
     *out_root_object_id = backend->root_object_id;
     return 0;
 }
+
+int filed_tmpfs_backend_mount_detached_root(
+    filed_tmpfs_backend_t *backend,
+    uint64_t *out_root_object_id)
+{
+    if (backend == NULL || out_root_object_id == NULL) {
+        return -22;
+    }
+    *out_root_object_id = 0;
+
+    filed_tmpfs_lock_acquire(&backend->lock);
+    filed_tmpfs_inode_t *root = filed_tmpfs_alloc_inode(backend);
+    if (root == NULL) {
+        filed_tmpfs_lock_release(&backend->lock);
+        return -28;
+    }
+    const uint16_t slot = filed_tmpfs_inode_slot(backend, root);
+    if (slot == FILED_TMPFS_NO_SLOT) {
+        filed_tmpfs_lock_release(&backend->lock);
+        return -5;
+    }
+
+    memset(root, 0, sizeof(*root));
+    root->used = true;
+    root->slot_index = slot;
+    root->primary_dentry_slot = FILED_TMPFS_NO_SLOT;
+    root->first_child_dentry_slot = FILED_TMPFS_NO_SLOT;
+    root->object_id = filed_tmpfs_make_object_id(
+        slot,
+        backend->next_object_generation++);
+    if (root->object_id == 0) {
+        memset(root, 0, sizeof(*root));
+        backend->free_inode_stack[backend->free_inode_count++] = slot;
+        filed_tmpfs_lock_release(&backend->lock);
+        return -5;
+    }
+    root->mode = FILED_TMPFS_MODE_DIRECTORY | 0755u;
+    root->generation = 1;
+    root->nlink = 1;
+    root->kind = FILED_VNODE_DIRECTORY;
+    *out_root_object_id = root->object_id;
+    filed_tmpfs_lock_release(&backend->lock);
+    return 0;
+}

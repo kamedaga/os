@@ -168,6 +168,11 @@ apps:
       path: "tests/fixtures/sway_first_frame.sh"
     out: "SWAYM55.SH"
     rootfs: "/cmd/sway_first_frame.sh"
+  sway_shm_client_script:
+    file:
+      path: "tests/fixtures/sway_shm_client.sh"
+    out: "SWAYM56.SH"
+    rootfs: "/cmd/sway_shm_client.sh"
   sway_socket_repeat_script:
     file:
       path: "tests/fixtures/sway_socket_repeat.sh"

@@ -350,6 +350,67 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
     return 0;
 }
 
+static int filed_runtime_mount_run_tmpfs(filed_runtime_t *runtime)
+{
+    uint64_t run_root = 0;
+    filed_vfs_open_result_t run_open;
+    storage_statx_reply_t run_stat;
+    filed_vfs_stat_snapshot_t run_snapshot;
+
+    int status = filed_tmpfs_backend_mount_detached_root(
+        &runtime->tmpfs,
+        &run_root);
+    if (status != 0) {
+        return status;
+    }
+
+    memset(&run_open, 0, sizeof(run_open));
+    filed_status_t vfs_status = filed_vfs_open_backend_child(
+        &runtime->vfs,
+        runtime->root_handle_id,
+        run_root,
+        FILED_VNODE_DIRECTORY,
+        "run",
+        FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_READ |
+            FILED_RIGHT_EXEC |
+            FILED_RIGHT_STAT |
+            FILED_RIGHT_GETDENTS |
+            FILED_RIGHT_CREATE |
+            FILED_RIGHT_REMOVE |
+            FILED_RIGHT_RENAME,
+        FILED_OPEN_DIRECTORY,
+        &run_open);
+    if (vfs_status != FILED_OK) {
+        return -60 - (int)vfs_status;
+    }
+
+    memset(&run_stat, 0, sizeof(run_stat));
+    status = filed_tmpfs_backend_statx(&runtime->tmpfs, run_root, &run_stat);
+    if (status != 0) {
+        return status;
+    }
+    memset(&run_snapshot, 0, sizeof(run_snapshot));
+    run_snapshot.valid = true;
+    run_snapshot.handle_id = run_open.handle_id;
+    run_snapshot.mode = run_stat.mode;
+    run_snapshot.size = run_stat.size;
+    run_snapshot.blocks = run_stat.blocks;
+    run_snapshot.nlink = run_stat.nlink;
+    run_snapshot.kind = run_stat.kind;
+    run_snapshot.times_valid = true;
+    run_snapshot.object_generation = run_open.object_generation;
+    run_snapshot.dir_generation = run_open.dir_generation;
+    (void)filed_vfs_update_stat_snapshot(
+        &runtime->vfs,
+        run_root,
+        &run_snapshot);
+
+    runtime->run_tmpfs_root_handle_id = run_open.handle_id;
+    runtime->run_tmpfs_root_handle_valid = 1u;
+    return 0;
+}
+
 int filed_runtime_mount_root(filed_runtime_t *runtime)
 {
     storage_statx_reply_t root_stat;
@@ -489,12 +550,31 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         }
     }
 
+    status = filed_runtime_mount_run_tmpfs(runtime);
+    if (status != 0) {
+        return status;
+    }
+
     vfs_status = filed_vfs_check_basic(&runtime->vfs);
     if (vfs_status != FILED_OK) {
         return -40 - (int)vfs_status;
     }
 
     return 0;
+}
+
+static void filed_runtime_release_session(filed_session_t *session)
+{
+    if (session == NULL) return;
+    if (session->page != NULL)
+        (void)pacha_munmap(session->page, session->page_size);
+    if (session->page_fd >= 16)
+        (void)pacha_fd_close(session->page_fd);
+    if (session->channel_fd >= 16)
+        (void)pacha_fd_close(session->channel_fd);
+    memset(session, 0, sizeof(*session));
+    session->page_fd = -1;
+    session->channel_fd = -1;
 }
 
 int filed_runtime_serve(filed_runtime_t *runtime)
@@ -557,6 +637,7 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             if (status != 0 &&
                 status != PACHA_ERR_EMPTY &&
                 status != PACHA_ERR_NOT_READY &&
+                status != PACHA_ERR_CLOSED &&
                 status != -2)
             {
                 return status;
@@ -576,7 +657,16 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             if (session_index == UINT64_MAX) {
                 continue;
             }
+            filed_session_t *session = &runtime->sessions[session_index];
+            if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
+                filed_runtime_release_session(session);
+                continue;
+            }
             const int status = filed_dispatch_session_once(runtime, session_index);
+            if (status == PACHA_ERR_CLOSED) {
+                filed_runtime_release_session(session);
+                continue;
+            }
             if (status != 0 &&
                 status != PACHA_ERR_EMPTY &&
                 status != PACHA_ERR_NOT_READY &&

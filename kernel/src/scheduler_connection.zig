@@ -2261,13 +2261,19 @@ pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {
         if (hot.allocated == 0 or hot.owner_process != principal) continue;
         if (hot.stopped != 0) continue;
         if (hot.ready == 0) {
-            wakeIfWaiting(i);
             scheduler_state.thread_table.lock();
-            defer scheduler_state.thread_table.unlock();
-            const ctx = threadContextMutable(i) orelse return false;
-            if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) return false;
+            const ctx = threadContextMutable(i) orelse {
+                scheduler_state.thread_table.unlock();
+                return false;
+            };
+            if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) {
+                scheduler_state.thread_table.unlock();
+                return false;
+            }
             ctx.pending_signal = signo;
             setThreadHotPendingSignal(i, signo);
+            scheduler_state.thread_table.unlock();
+            wakeIfWaiting(i);
             return true;
         }
         if (first_ready == null) first_ready = i;

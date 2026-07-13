@@ -10,4 +10,5 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
+/bin/sync
 echo "ASYNC_SIGNAL_DONE failures=0"

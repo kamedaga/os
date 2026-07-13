@@ -19,6 +19,7 @@ enum {
     NETD_OP_ACCEPT = 9u,
     NETD_OP_ATTACH_WAIT = 10u,
     NETD_OP_UEVENT_PUBLISH = 11u,
+    NETD_OP_DUP = 12u,
 
     NETD_AF_UNIX = 1,
     NETD_AF_INET = 2,
@@ -39,6 +40,9 @@ enum {
     NETD_POLLIN = 0x0001,
     NETD_POLLOUT = 0x0004,
     NETD_POLLERR = 0x0008,
+
+    /* M5.6R one-way wl_shm transport; not a general fd-kind contract. */
+    NETD_FD_KIND_FILED_MEMFD = 0x100u,
 };
 
 typedef struct netd_socket {

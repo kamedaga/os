@@ -108,7 +108,8 @@ int main(void)
         "storage ops are contiguous from zero");
     failures += expect(
         NETD_OP_HELLO == 0 && NETD_OP_SOCKET == 1 && NETD_OP_SEND == 4 &&
-        NETD_OP_POLL == 6 && NETD_OP_BIND == 7 && NETD_OP_ACCEPT == 9,
+        NETD_OP_POLL == 6 && NETD_OP_BIND == 7 && NETD_OP_ACCEPT == 9 &&
+        NETD_OP_DUP == 12,
         "netd ops are contiguous from zero");
     failures += expect(
         TERMD_OP_HELLO == 0 && TERMD_OP_OPEN_PTMX == 1 &&

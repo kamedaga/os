@@ -502,6 +502,7 @@ int64_t lpr_linux_epoll_wait(
 
         uint64_t waited_ms = 0;
         const int64_t wait_status = lpr_epoll_block(snapshot, count, remaining_ms, &waited_ms);
+        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
         if (wait_status != 0 && wait_status != -LPR_LINUX_EBADF) {
             return wait_status;
         }

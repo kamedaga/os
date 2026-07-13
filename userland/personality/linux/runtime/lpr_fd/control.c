@@ -930,6 +930,10 @@ int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     socket->handle = desc->handle;
     socket->cloexec = (desc->flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
     socket->type = (uint8_t)desc->offset_or_counter;
+    if ((desc->handle >> 63u) != 0) {
+        socket->domain = 1u;
+        socket->connected = 1u;
+    }
     socket->sndbuf = 256u * 1024u;
     socket->rcvbuf = 256u * 1024u;
     socket->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;

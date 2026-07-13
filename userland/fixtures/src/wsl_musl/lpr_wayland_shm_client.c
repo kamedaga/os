@@ -14,6 +14,16 @@ static struct wl_compositor *compositor;
 static struct wl_shm *shm;
 static struct xdg_wm_base *wm_base;
 static int configured;
+static int frame_done;
+
+static void frame_complete(void *data, struct wl_callback *callback, uint32_t time) {
+    (void)data;
+    (void)time;
+    frame_done = 1;
+    wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener frame_listener = {.done = frame_complete};
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name,
                             const char *interface, uint32_t version) {
@@ -114,29 +124,52 @@ int main(void) {
     }
     for (size_t i = 0; i < bytes / sizeof(*pixels); ++i) pixels[i] = 0xff336699u;
     struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, (int32_t)bytes);
+    close(fd);
     struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride,
-                                                         WL_SHM_FORMAT_ARGB8888);
+                                                         WL_SHM_FORMAT_XRGB8888);
     printf("M51_WL_SHM_BUFFER_OK bytes=%zu\n", bytes);
+    printf("M56_WL_SHM_TRANSFER bytes=%zu\n", bytes);
 
     struct wl_surface *surface = wl_compositor_create_surface(compositor);
     struct xdg_surface *xdg_surface = xdg_wm_base_get_xdg_surface(wm_base, surface);
     xdg_surface_add_listener(xdg_surface, &surface_listener, NULL);
     struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(xdg_surface);
     xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
+    xdg_toplevel_set_app_id(toplevel, "m56-shm");
     xdg_toplevel_set_title(toplevel, "PachaOS M5.1 wl_shm probe");
+    xdg_toplevel_set_min_size(toplevel, width, height);
+    xdg_toplevel_set_max_size(toplevel, width, height);
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || !configured) {
         printf("M51_WL_CONFIGURE_FAIL configured=%d errno=%d\n", configured, errno);
         return 5;
     }
+    printf("M56_WL_XDG_CONFIGURE_OK\n");
     wl_surface_attach(surface, buffer, 0, 0);
     wl_surface_damage_buffer(surface, 0, 0, width, height);
+    struct wl_callback *frame = wl_surface_frame(surface);
+    wl_callback_add_listener(frame, &frame_listener, NULL);
     wl_surface_commit(surface);
-    if (wl_display_roundtrip(display) < 0) {
+    while (!frame_done && wl_display_dispatch(display) >= 0) {}
+    if (!frame_done || wl_display_roundtrip(display) < 0) {
         printf("M51_WL_COMMIT_FAIL errno=%d\n", errno);
         return 6;
     }
+    frame_done = 0;
+    wl_surface_damage_buffer(surface, 0, 0, width, height);
+    frame = wl_surface_frame(surface);
+    wl_callback_add_listener(frame, &frame_listener, NULL);
+    wl_surface_commit(surface);
+    while (!frame_done && wl_display_dispatch(display) >= 0) {}
+    if (!frame_done) {
+        printf("M51_WL_COMMIT_FAIL errno=%d\n", errno);
+        return 6;
+    }
+    usleep(500000);
     printf("M51_WL_SURFACE_COMMIT_OK color=#336699 size=%dx%d\n", width, height);
+    printf("M56_WL_SURFACE_READY color=#336699 size=%dx%d\n", width, height);
+    fflush(stdout);
+    sleep(5);
     wl_display_disconnect(display);
     return 0;
 }

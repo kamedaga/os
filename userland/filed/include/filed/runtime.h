@@ -46,8 +46,10 @@ typedef struct filed_runtime {
     filed_mount_id_t root_mount_id;
     filed_handle_id_t root_handle_id;
     filed_handle_id_t tmpfs_root_handle_id;
+    filed_handle_id_t run_tmpfs_root_handle_id;
     uint8_t root_tmpfs_synthetic_dirent;
     uint8_t tmpfs_root_handle_valid;
+    uint8_t run_tmpfs_root_handle_valid;
 } filed_runtime_t;
 
 void filed_runtime_init(filed_runtime_t *runtime);

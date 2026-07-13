@@ -328,12 +328,17 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         child_frame.rsp = child_stack;
     }
     lpr_linux_process_state_init();
+    const int socket_fork_status = lpr_socket_prepare_fork();
+    if (socket_fork_status != 0) {
+        return socket_fork_status;
+    }
     int32_t child_pid = 0;
     uint64_t child_token = 0;
     if (lpr_supervisor_enabled) {
         void *page = 0;
         const int page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
+            lpr_socket_cancel_fork();
             return page_fd;
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
@@ -356,14 +361,17 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         }
         lpr_destroy_standalone_wire_page(page_fd, page);
         if (fork_status != 0) {
+            lpr_socket_cancel_fork();
             return fork_status;
         }
         if (child_pid <= 0 || child_token == 0) {
+            lpr_socket_cancel_fork();
             return -LPR_LINUX_EIO;
         }
     } else {
         child_pid = lpr_linux_alloc_child_pid();
         if (child_pid <= 0) {
+            lpr_socket_cancel_fork();
             return -LPR_LINUX_EAGAIN;
         }
     }
@@ -442,6 +450,7 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         if (reg_status != 0) {
             (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL, (uint64_t)(uint32_t)ret, 1);
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)ret);
+            lpr_socket_cancel_fork();
             return reg_status;
         }
         if (lpr_supervisor_enabled && child_token != 0) {
@@ -450,6 +459,7 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         return (int64_t)child_pid;
     }
     lpr_trace_process_event("clone_error", flags, child_stack, ret);
+    lpr_socket_cancel_fork();
     lpr_linux_pending_child_pid = 0;
     lpr_linux_pending_child_ppid = 0;
     lpr_linux_pending_child_sid = 0;
@@ -920,20 +930,29 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         lpr_discard_exec_cwd(&exec);
         return status;
     }
+    status = lpr_socket_reserve_exec(&local_table);
+    if (status != 0) {
+        lpr_destroy_exec_local_fd_table(&local_table);
+        lpr_discard_exec_cwd(&exec);
+        return status;
+    }
 
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
     const int64_t exec_status =
         lpr_filed_exec_self(&exec, &local_table, &process_fd, &thread_fd, &bootstrap_fd);
-    lpr_destroy_exec_local_fd_table(&local_table);
     if (exec_status != 0) {
+        lpr_socket_release_exec(&local_table);
+        lpr_destroy_exec_local_fd_table(&local_table);
         lpr_discard_exec_cwd(&exec);
         lpr_trace_process_event("execve_error", path_len, 0, exec_status);
         return exec_status;
     }
     status = lpr_install_exec_bootstrap_fd(bootstrap_fd);
     if (status != 0) {
+        lpr_socket_release_exec(&local_table);
+        lpr_destroy_exec_local_fd_table(&local_table);
         lpr_discard_exec_cwd(&exec);
         if (bootstrap_fd >= 16) {
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)bootstrap_fd);
@@ -957,6 +976,8 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         (uint64_t)(uint32_t)process_fd,
         (uint64_t)(uint32_t)thread_fd,
         0);
+    lpr_socket_release_exec(&local_table);
+    lpr_destroy_exec_local_fd_table(&local_table);
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL, (uint64_t)(uint32_t)process_fd, 1);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)thread_fd);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)process_fd);

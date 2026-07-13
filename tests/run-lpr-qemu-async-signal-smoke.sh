@@ -26,4 +26,8 @@ fi
   --expect 'ASYNC_ALTSTACK_ONSTACK=OK' \
   --expect 'ASYNC_ALTSTACK_CONTINUED' \
   --expect 'ASYNC_SIGALTSTACK=OK' \
+  --expect 'ASYNC_EPOLL_HANDLER_READY' \
+  --expect 'ASYNC_EPOLL_HANDLER_CALLED' \
+  --expect 'ASYNC_EPOLL_HANDLER_CONTINUED' \
+  --expect 'ASYNC_EPOLL_HANDLER=OK' \
   --expect 'ASYNC_SIGNAL_DONE failures=0'

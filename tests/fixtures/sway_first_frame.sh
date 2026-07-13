@@ -2,7 +2,7 @@
 
 config=/tmp/m55-sway.conf
 rm -f "$config"
-printf 'xwayland disable\n' >"$config"
+printf 'swaybg_command -\nxwayland disable\n' >"$config"
 
 export XDG_RUNTIME_DIR=/tmp
 export WLR_BACKENDS=drm

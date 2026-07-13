@@ -685,6 +685,11 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
         if (writable) ready |= @import("kernel_abi_root").fd_abi.event_writable;
     }
     switch (slot.payload) {
+        .channel => |handle| {
+            if (handle.side > 1) return null;
+            const channel = self.ipcChannelSlotConst(handle.channel) orelse return null;
+            if (channel.ref_count == 1) ready |= @import("kernel_abi_root").fd_abi.event_hangup;
+        },
         .pipe => |endpoint| {
             const pipe = self.pipeSlotConst(endpoint.pipe) orelse return null;
             const pipe_ready = @TypeOf(self.*).pipeReadyEventsForEndpoint(pipe, endpoint);

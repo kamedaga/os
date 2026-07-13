@@ -36,6 +36,10 @@ const PendingPipeCloseWake = struct {
     wake_side_write: bool,
 };
 
+const PendingIpcChannelCloseWake = struct {
+    handle: kernel.IpcChannelHandle,
+};
+
 const ProcessCloneUserFrame = extern struct {
     r15: u64,
     r14: u64,
@@ -230,6 +234,40 @@ fn wakeReadyPipeCloseWaiters(
     }
 }
 
+fn collectIpcChannelCloseWakesForProcess(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    out: []PendingIpcChannelCloseWake,
+) usize {
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
+    const table = state.fdTableForProcessIndexConst(process_index) orelse return 0;
+    var count: usize = 0;
+    for (table.entries[0..]) |entry| {
+        if (entry.object.isNull()) continue;
+        const slot = state.kernelObjectSlotConst(entry.object) orelse continue;
+        const handle = switch (slot.payload) {
+            .channel => |channel_handle| channel_handle,
+            else => continue,
+        };
+        if (count >= out.len) break;
+        out[count] = .{ .handle = handle };
+        count += 1;
+    }
+    return count;
+}
+
+fn wakeIpcChannelCloseWaiters(
+    h: anytype,
+    state: *kernel.KernelState,
+    pending_wakes: []const PendingIpcChannelCloseWake,
+) void {
+    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
+    for (pending_wakes) |pending| {
+        const wake_count = state.takeIpcChannelPeerCloseWaiters(pending.handle, wake_storage[0..]);
+        wakeThreadTargets(h, wake_storage[0..wake_count]);
+    }
+}
+
 fn closeCloexecFdsWithPipeWakes(
     h: anytype,
     state: *kernel.KernelState,
@@ -252,6 +290,11 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, false, pending_pipe_wakes[0..]);
+    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
+    const pending_channel_wake_count = if (exit_state == .killed)
+        collectIpcChannelCloseWakesForProcess(state, principal, pending_channel_wakes[0..])
+    else
+        0;
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
     state.markProcessObjectsExited(principal, exit_state, exit_code);
     _ = wakeTaskFdWaiters(h, state, principal);
@@ -262,6 +305,7 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     state.resetProcessRuntimeTables(process_index);
     user_vm.unlockAddressSpaces();
     wakeReadyPipeCloseWaiters(h, state, pending_pipe_wakes[0..pending_pipe_wake_count]);
+    wakeIpcChannelCloseWaiters(h, state, pending_channel_wakes[0..pending_channel_wake_count]);
     _ = state.unpublishServiceEndpointsForTarget(principal);
     _ = state.markProcessExited(principal);
 }
@@ -455,6 +499,72 @@ fn validReturnedSignalContext(context: *const TrapFrame) bool {
         isUserEntryVa(context.rip) and isUserEntryVa(context.rsp);
 }
 
+fn trapFrameFromProcessCloneUserFrame(user_frame: *const ProcessCloneUserFrame) TrapFrame {
+    var frame = buildUserTrapFrame(user_frame.rip, user_frame.rsp);
+    frame.r15 = user_frame.r15;
+    frame.r14 = user_frame.r14;
+    frame.r13 = user_frame.r13;
+    frame.r12 = user_frame.r12;
+    frame.rbp = user_frame.rbp;
+    frame.rbx = user_frame.rbx;
+    frame.r11 = user_frame.r11;
+    frame.r10 = user_frame.r10;
+    frame.r9 = user_frame.r9;
+    frame.r8 = user_frame.r8;
+    frame.rdi = user_frame.rdi;
+    frame.rsi = user_frame.rsi;
+    frame.rdx = user_frame.rdx;
+    frame.rcx = user_frame.rcx;
+    frame.rax = user_frame.rax;
+    frame.rflags = (user_frame.rflags & 0x0000_0000_0020_0ed5) | 0x2;
+    return frame;
+}
+
+fn deliverPendingSignalToUserFrame(
+    h: anytype,
+    proc: kernel.PrincipalId,
+    frame: *TrapFrame,
+    user_frame_va: u64,
+) u64 {
+    if (user_frame_va == 0 or !user_vm.isUserCanonicalVa(user_frame_va)) {
+        return sc.syscall_err_invalid;
+    }
+    var user_frame: ProcessCloneUserFrame = undefined;
+    if (!h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame)) or
+        !isUserEntryVa(user_frame.rip) or !isUserEntryVa(user_frame.rsp))
+    {
+        return sc.syscall_err_invalid;
+    }
+    const claimed = scheduler.claimCurrentSignalForUserReturn(user_frame.rip) orelse
+        return sc.syscall_ok;
+    const stack_cost = process_abi.signal_red_zone_size +
+        process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
+    if (user_frame.rsp <= stack_cost) {
+        scheduler.restoreClaimedSignal(claimed);
+        return sc.syscall_err_invalid;
+    }
+    const signal_frame_va = (user_frame.rsp - process_abi.signal_red_zone_size -
+        process_abi.signal_frame_size) & ~@as(u64, 15);
+    var signal_frame = NativeSignalFrame{
+        .magic = process_abi.signal_frame_magic,
+        .size = process_abi.signal_frame_size,
+        .signo = claimed.signo,
+        .reserved0 = 0,
+        .context = trapFrameFromProcessCloneUserFrame(&user_frame),
+        .fx_state = undefined,
+    };
+    if (!scheduler.copyCurrentSignalFxState(&signal_frame.fx_state) or
+        !h.copy_bytes_to_user_va(proc, signal_frame_va, std.mem.asBytes(&signal_frame)))
+    {
+        scheduler.restoreClaimedSignal(claimed);
+        return sc.syscall_err_invalid;
+    }
+    frame.rdi = signal_frame_va;
+    frame.rip = claimed.entry;
+    frame.rsp = signal_frame_va - process_abi.signal_runtime_stack_size;
+    return sc.syscall_ok;
+}
+
 fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     switch (frame.rdi) {
         process_abi.signal_ctl_register => {
@@ -486,6 +596,9 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             if (!scheduler.restoreCurrentSignalFxState(&returned.fx_state)) return sc.syscall_err_not_ready;
             frame.* = returned.context;
             return returned.context.rax;
+        },
+        process_abi.signal_ctl_deliver_pending_frame => {
+            return deliverPendingSignalToUserFrame(h, proc, frame, frame.rsi);
         },
         else => return sc.syscall_err_invalid,
     }

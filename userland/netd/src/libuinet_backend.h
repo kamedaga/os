@@ -25,3 +25,4 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
 int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint64_t flags, size_t *out_received);
 int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_revents, int32_t *out_error);
 int netd_libuinet_socket_close(uint64_t handle);
+int netd_filed_close_handle(uint64_t handle);

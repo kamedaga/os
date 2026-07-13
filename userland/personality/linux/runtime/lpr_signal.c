@@ -160,6 +160,16 @@ static _Noreturn void lpr_native_signal_return(lpr_pacha_signal_frame_t *frame)
     }
 }
 
+void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result)
+{
+    if (lpr_active_user_frame == 0) return;
+    lpr_active_user_frame->rax = (uint64_t)interrupted_result;
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHAOS_PROCESS_SIGNAL_CTL_DELIVER_PENDING_FRAME,
+        (uint64_t)(uintptr_t)lpr_active_user_frame);
+}
+
 static void lpr_signal_context_to_linux(
     const lpr_pacha_signal_frame_t *native,
     lpr_linux_ucontext_t *ucontext)

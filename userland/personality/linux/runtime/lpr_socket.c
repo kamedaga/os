@@ -455,7 +455,8 @@ static void lpr_socket_discard_received_fd(uint32_t kind, uint64_t handle, int w
 {
     if (wait_fd >= 16)
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-    if (kind == LPR_FD_TABLE_KIND_INPUT) (void)lpr_input_close_handle(handle);
+    if (kind == NETD_FD_KIND_FILED_MEMFD) (void)lpr_filed_close_handle(handle);
+    else if (kind == LPR_FD_TABLE_KIND_INPUT) (void)lpr_input_close_handle(handle);
     else if (kind == LPR_FD_TABLE_KIND_DRM) (void)lpr_drm_close_handle(handle);
 }
 
@@ -634,6 +635,80 @@ int64_t lpr_linux_socket_close(uint64_t fd)
     if (native_wait_fd >= 16)
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)native_wait_fd);
     return status;
+}
+
+int lpr_socket_prepare_fork(void)
+{
+    lpr_fd_arrays_init();
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; ++index) {
+        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
+        if (!object->active || object->kind != LPR_FD_TABLE_KIND_SOCKET ||
+            object->payload.socket.domain != LPR_LINUX_AF_UNIX ||
+            object->payload.socket.handle == 0) continue;
+        const int64_t status = lpr_netd_call(
+            NETD_OP_DUP, -1, object->payload.socket.handle, 0);
+        if (status == 0) continue;
+        for (uint32_t rollback = 0; rollback < index; ++rollback) {
+            lpr_fd_object_t *prior = &lpr_control_fd_table.files[rollback];
+            if (prior->active && prior->kind == LPR_FD_TABLE_KIND_SOCKET &&
+                prior->payload.socket.domain == LPR_LINUX_AF_UNIX &&
+                prior->payload.socket.handle != 0)
+                (void)lpr_netd_call(NETD_OP_CLOSE, -1, prior->payload.socket.handle, 0);
+        }
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return (int)status;
+    }
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    return 0;
+}
+
+void lpr_socket_cancel_fork(void)
+{
+    lpr_fd_arrays_init();
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; ++index) {
+        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
+        if (object->active && object->kind == LPR_FD_TABLE_KIND_SOCKET &&
+            object->payload.socket.domain == LPR_LINUX_AF_UNIX &&
+            object->payload.socket.handle != 0)
+            (void)lpr_netd_call(NETD_OP_CLOSE, -1, object->payload.socket.handle, 0);
+    }
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+}
+
+int lpr_socket_reserve_exec(const lpr_exec_local_fd_table_t *local_table)
+{
+    if (local_table == 0 || local_table->table == 0) return 0;
+    const filed_exec_lpr_fd_table_t *table = local_table->table;
+    const filed_exec_lpr_fd_t *entries = (const filed_exec_lpr_fd_t *)(table + 1);
+    uint64_t reserved = 0;
+    for (; reserved < table->fd_count; ++reserved) {
+        if (entries[reserved].kind != FILED_EXEC_LPR_FD_SOCKET ||
+            (entries[reserved].handle >> 63u) == 0) continue;
+        const int64_t status = lpr_netd_call(
+            NETD_OP_DUP, -1, entries[reserved].handle, 0);
+        if (status == 0) continue;
+        for (uint64_t rollback = 0; rollback < reserved; ++rollback) {
+            if (entries[rollback].kind == FILED_EXEC_LPR_FD_SOCKET &&
+                (entries[rollback].handle >> 63u) != 0)
+                (void)lpr_netd_call(NETD_OP_CLOSE, -1, entries[rollback].handle, 0);
+        }
+        return (int)status;
+    }
+    return 0;
+}
+
+void lpr_socket_release_exec(const lpr_exec_local_fd_table_t *local_table)
+{
+    if (local_table == 0 || local_table->table == 0) return;
+    const filed_exec_lpr_fd_table_t *table = local_table->table;
+    const filed_exec_lpr_fd_t *entries = (const filed_exec_lpr_fd_t *)(table + 1);
+    for (uint64_t index = 0; index < table->fd_count; ++index) {
+        if (entries[index].kind == FILED_EXEC_LPR_FD_SOCKET &&
+            (entries[index].handle >> 63u) != 0)
+            (void)lpr_netd_call(NETD_OP_CLOSE, -1, entries[index].handle, 0);
+    }
 }
 
 int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
@@ -1067,11 +1142,23 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
             if (cmsg->cmsg_level == LPR_LINUX_SOL_SOCKET && cmsg->cmsg_type == LPR_LINUX_SCM_RIGHTS) {
                 const int32_t passed_fd = *(const int32_t *)((const uint8_t *)cmsg + sizeof(*cmsg));
                 lpr_fd_object_t *object = lpr_fd_object_for_fd((uint64_t)(uint32_t)passed_fd);
-                if (object == 0 || (object->kind != LPR_FD_TABLE_KIND_INPUT && object->kind != LPR_FD_TABLE_KIND_DRM)) {
+                if (object == 0 ||
+                    (object->kind != LPR_FD_TABLE_KIND_INPUT &&
+                     object->kind != LPR_FD_TABLE_KIND_DRM &&
+                     (object->kind != LPR_FD_TABLE_KIND_FILED ||
+                      (object->payload.filed.reserved1 & LPR_FILED_FD_MEMFD) == 0))) {
                     lpr_netd_destroy_page(page_fd, page); return -LPR_LINUX_EBADF;
                 }
                 int64_t dup_status;
-                if (object->kind == LPR_FD_TABLE_KIND_INPUT) {
+                if (object->kind == LPR_FD_TABLE_KIND_FILED) {
+                    uint64_t dup_handle = 0;
+                    dup_status = lpr_filed_dup_handle(
+                        object->payload.filed.handle, 0, &dup_handle);
+                    req->fd_kind = NETD_FD_KIND_FILED_MEMFD;
+                    req->fd_flags = object->payload.filed.flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+                    req->fd_handle = dup_handle;
+                    req->fd_aux = object->payload.filed.reserved1;
+                } else if (object->kind == LPR_FD_TABLE_KIND_INPUT) {
                     req->fd_handle = object->payload.input.handle;
                     req->fd_aux = object->payload.input.reserved0;
                     passed_wait_fd = object->payload.input.native_wait_fd;
@@ -1084,14 +1171,18 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
                         lpr_drm_dup_handle(object->payload.drm.handle) : -LPR_LINUX_EBADF;
                 }
                 if (dup_status != 0) { lpr_netd_destroy_page(page_fd, page); return dup_status; }
-                req->fd_kind = object->kind;
-                req->fd_flags = object->payload.input.flags;
+                if (object->kind != LPR_FD_TABLE_KIND_FILED) {
+                    req->fd_kind = object->kind;
+                    req->fd_flags = object->payload.input.flags;
+                }
             }
         }
         uint64_t sent = 0;
         const int64_t status = lpr_netd_call_with_fd(
             NETD_OP_SEND, page_fd, 0, &sent, passed_wait_fd, 0, 0);
-        if (status != 0 && req->fd_kind == LPR_FD_TABLE_KIND_INPUT)
+        if (status != 0 && req->fd_kind == NETD_FD_KIND_FILED_MEMFD)
+            (void)lpr_filed_close_handle(req->fd_handle);
+        else if (status != 0 && req->fd_kind == LPR_FD_TABLE_KIND_INPUT)
             (void)lpr_input_close_handle(req->fd_handle);
         else if (status != 0 && req->fd_kind == LPR_FD_TABLE_KIND_DRM)
             (void)lpr_drm_close_handle(req->fd_handle);
@@ -1148,7 +1239,11 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         }
         msg->msg_flags = 0;
         if (req->fd_kind != 0 && msg->msg_control != 0 && msg->msg_controllen >= 24) {
-            if (received_wait_fd < 16) {
+            const int filed_memfd = req->fd_kind == NETD_FD_KIND_FILED_MEMFD;
+            if ((filed_memfd && received_wait_fd >= 16) ||
+                (!filed_memfd && received_wait_fd < 16) ||
+                (!filed_memfd && req->fd_kind != LPR_FD_TABLE_KIND_INPUT &&
+                 req->fd_kind != LPR_FD_TABLE_KIND_DRM)) {
                 lpr_socket_discard_received_fd(req->fd_kind, req->fd_handle, received_wait_fd);
                 lpr_netd_destroy_page(page_fd, page);
                 return -LPR_LINUX_EIO;
@@ -1162,14 +1257,25 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
             uint64_t linux_flags = req->fd_flags |
                 ((flags & LPR_LINUX_MSG_CMSG_CLOEXEC) ? LPR_LINUX_O_CLOEXEC : 0);
             const int install = lpr_control_install_fd(
-                new_fd, (uint8_t)req->fd_kind, linux_flags, req->fd_handle, 0);
+                new_fd,
+                filed_memfd ? LPR_FD_TABLE_KIND_FILED : (uint8_t)req->fd_kind,
+                linux_flags,
+                req->fd_handle,
+                0);
             if (install != 0) {
                 lpr_socket_discard_received_fd(req->fd_kind, req->fd_handle, received_wait_fd);
                 lpr_netd_destroy_page(page_fd, page);
                 return install;
             }
             lpr_fd_object_t *object = lpr_fd_object_for_fd(new_fd);
-            if (req->fd_kind == LPR_FD_TABLE_KIND_INPUT) {
+            if (filed_memfd) {
+                object->payload.filed.active = 1;
+                object->payload.filed.offset_valid = 1;
+                object->payload.filed.reserved1 = (uint8_t)req->fd_aux;
+                object->payload.filed.flags = (uint32_t)linux_flags;
+                object->payload.filed.handle = req->fd_handle;
+                object->payload.filed.offset = 0;
+            } else if (req->fd_kind == LPR_FD_TABLE_KIND_INPUT) {
                 object->payload.input.active = 1; object->payload.input.handle = req->fd_handle;
                 object->payload.input.flags = (uint32_t)linux_flags; object->payload.input.reserved0 = (uint8_t)req->fd_aux;
                 object->payload.input.native_wait_fd = received_wait_fd;
@@ -1728,6 +1834,7 @@ static int64_t lpr_linux_sleep_ms(uint64_t ms)
     const int64_t status = lpr_pacha_syscall1(
         PACHAOS_SYSCALL_NANOSLEEP,
         (uint64_t)(uintptr_t)&ts);
+    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
     return status == 0 ? 0 : lpr_negative_status(status);
 }
 
@@ -1777,6 +1884,7 @@ static int64_t lpr_linux_poll_wait_native(
         count,
         timeout_ticks,
         0);
+    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
     if (status < 0 &&
         status != PACHA_SYSCALL_ERR_NOT_READY &&
         status != -PACHA_SYSCALL_ERR_NOT_READY)

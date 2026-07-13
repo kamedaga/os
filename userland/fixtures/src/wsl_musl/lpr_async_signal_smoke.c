@@ -1,14 +1,18 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handled;
 static volatile sig_atomic_t altstack_ok;
 static unsigned char alternate_stack[SIGSTKSZ * 2];
+static int terminate_event_fd = -1;
 
 static void write_marker(const char *text)
 {
@@ -43,6 +47,55 @@ static void altstack_handler(int signo, siginfo_t *info, void *context)
         write_marker("ASYNC_ALTSTACK_ONSTACK=BAD\n");
     }
     handled = 1;
+}
+
+static void terminate_event_handler(int signo)
+{
+    static const char marker[] = "ASYNC_EPOLL_HANDLER_CALLED\n";
+    const uint64_t one = 1;
+    if (signo == SIGTERM &&
+        write(terminate_event_fd, &one, sizeof(one)) == (ssize_t)sizeof(one))
+    {
+        (void)write(STDOUT_FILENO, marker, sizeof(marker) - 1);
+    }
+}
+
+static int run_epoll_handler(void)
+{
+    terminate_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    const int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (terminate_event_fd < 0 || epoll_fd < 0) return 6;
+
+    struct epoll_event interest;
+    memset(&interest, 0, sizeof(interest));
+    interest.events = EPOLLIN;
+    interest.data.fd = terminate_event_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, terminate_event_fd, &interest) != 0) return 7;
+
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = terminate_event_handler;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGTERM, &action, 0) != 0) return 8;
+
+    write_marker("ASYNC_EPOLL_HANDLER_READY\n");
+    struct epoll_event event;
+    for (;;) {
+        const int count = epoll_wait(epoll_fd, &event, 1, -1);
+        if (count == 1 && event.data.fd == terminate_event_fd &&
+            (event.events & EPOLLIN) != 0) break;
+        if (count < 0 && errno == EINTR) continue;
+        return 9;
+    }
+
+    uint64_t value = 0;
+    if (read(terminate_event_fd, &value, sizeof(value)) != (ssize_t)sizeof(value) ||
+        value != 1) return 10;
+    write_marker("ASYNC_EPOLL_HANDLER_CONTINUED\n");
+    (void)close(epoll_fd);
+    (void)close(terminate_event_fd);
+    terminate_event_fd = -1;
+    return 0;
 }
 
 static int run_loop(void)
@@ -120,6 +173,9 @@ static int run_signaled_child(const char *mode, int signal, int expect_signal)
         if (strcmp(mode, "altstack") == 0) {
             _exit(run_altstack());
         }
+        if (strcmp(mode, "epoll") == 0) {
+            _exit(run_epoll_handler());
+        }
         _exit(run_loop());
     }
     sleep(1);
@@ -177,6 +233,10 @@ static int run_suite(const char *self)
         return 44;
     }
     write_marker("ASYNC_SIGALTSTACK=OK\n");
+    if (run_signaled_child("epoll", SIGTERM, 0) != 0) {
+        return 45;
+    }
+    write_marker("ASYNC_EPOLL_HANDLER=OK\n");
     return 0;
 }
 
@@ -193,6 +253,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "altstack") == 0) {
         return run_altstack();
+    }
+    if (strcmp(argv[1], "epoll") == 0) {
+        return run_epoll_handler();
     }
     if (strcmp(argv[1], "suite") == 0) {
         return run_suite(argv[0]);

@@ -77,7 +77,6 @@ lpr_trap_entry:
 .type lpr_async_signal_entry, @function
 lpr_async_signal_entry:
     and $-16, %rsp
-    sub $8, %rsp
     call lpr_linux_async_signal_prepare
     mov 16(%rax), %r11
     mov 8(%rax), %rdi

@@ -4,6 +4,7 @@
 #include "netd/ipc_protocol.h"
 
 int netd_unix_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint64_t *out_handle);
+int netd_unix_socket_dup(uint64_t handle);
 int netd_unix_socket_attach_wait(uint64_t handle, int notify_fd);
 int netd_unix_socket_bind(const netd_unix_path_t *req);
 int netd_unix_socket_listen(uint64_t handle);

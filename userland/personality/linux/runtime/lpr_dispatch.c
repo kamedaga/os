@@ -1424,7 +1424,7 @@ int64_t lpr_dispatch_syscall(uint64_t nr,
     return lpr_dispatch_syscall_frame(0, nr, a0, a1, a2, a3, a4, a5);
 }
 
-int64_t lpr_dispatch_syscall_frame(const struct lpr_linux_user_frame *frame,
+int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
                                    uint64_t nr,
                                    uint64_t a0,
                                    uint64_t a1,
