@@ -581,6 +581,14 @@ M5.1時点の最終検証: tunnel除去・overlay再生成後の baseline invent
 **Phase M5 完了基準 (従来 M5.3 と記載)**: QEMU window に Sway が起動し、Wayland ミニアプリ (まず wl_shm クライアント、次に GL クライアント) が表示され、キー入力が反映される。screendump 検証 + 起動反復のリーク耐久スモーク green。
 M6.Xに向けてテスト時のinput注入方法もここで固定してほしい
 
+**M5 再編 (2026-07-13, ユーザー判断)**: 旧 M5.6 (generic SCM_RIGHTS) の実装が 2 回発散した (61 files / 88 files で撤退、差分は stash と scratchpad patch に保全)。原因は機能でなく fd 管理の構造負債 (kind 分岐 136 箇所、payload 二重状態、fd<16 マジック、fork/exec 契約のサービス別再実装) に汎用契約を載せようとしたスコープ膨張。方針を機能優先に確定し、残り M5 を以下に再構成する。**M5 では品質・汎用化を追わず、作業中に見つけた構造欠陥は修正せず本節末尾の Phase 6 メモに列挙する**。
+
+1. **M5.6R — wl_shm 最小経路 + 最小 lifecycle** (旧 M5.6+M5.8 の縮小統合): wl_shm client の memfd を SCM_RIGHTS で Sway へ渡す一方向のみ。opcode 再編/ABI 移行/再転送/fd<16 是正/汎用契約は禁止。検証済み signal 修正 (entry alignment、epoll/poll pending 配送) と /run tmpfs 化を含む。**最優先: SIGKILL 後の reap 未完バグの根治** (M5.6b で ext4 が治った結果、sway-socket-repeat で露出した実バグ。従来同スモークは unlink 破損による seatd/sway 即死に依存した偽 green だった)。受け入れ: #336699 screendump、normal/TERM/KILL で orphan 0・stale socket 0 (5 周)、sway-socket-repeat の green 復帰、既存回帰 green。
+2. **M5.7R — 入力** (旧 M5.7 据え置き): libinput + XKB compile + QMP 固定入力列 (KEY_A press/release、REL 7/-4、BTN_LEFT) が client に届く。
+3. **M5.8R — 統合 + 最小耐久 = Phase M5 完了判定** (旧 M5.9 減量): Sway/client 再起動 10 周、フル回帰 green、QEMU window 手動確認。
+
+**Phase 6 送りメモ (M5 中に修正しないと決めた構造課題)**: fd-ops vtable 統一 (設計ドラフト pacha_docs/fd-ops-design.md、着手時に M5 適用後のコードへ照らして見直す) / generic transferable-FD 契約・A→B→C 再転送 / native fd 窓 (fd<16) の形式化 / opcode・ABI 整理 / netd backend 参照カウント一般化。旧 Phase M6 の M6.0 SMP 以降は Phase 6 内で本整理の後段に繰り下げ。
+
 ### Phase M6 Sway + Waylandの実用化 (追加で)
 
 **M6.0 SMP (マルチコア) 本格対応 — M6 の最初に実施**
