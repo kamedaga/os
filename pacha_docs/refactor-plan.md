@@ -621,6 +621,8 @@ SIGTERM限定調査ではSway handlerへの到達と`wl_display_terminate`から
 
 filedの実測は強制終了1周で`[5 1] → [9 1]`。残る4 handleはSway固有の`.memfd-15`、`wlroots-AAAAAA`、`wayland-1.lock`と、SCM_RIGHTSでSwayへ移ったwl_shm backing `.memfd-17`である。client側のbuffer/pool destroy、NULL commit、roundtrip待ちも試したが増分は変わらず、試行差分は撤回済み。SCM_RIGHTSとfork/execでhandleがsession間を移るため、session-close一括回収はlive receiverをuse-after-closeにし得る。`pacha_docs/fd-ops-design.md`のowner lease・transfer ownershipで解決する。対してnetdはnotify peer HANGUPで毎周`[0 0]`へ回収できた。drmdはTERM/KILL各周で`handles +5 / fb +2 / dumb +4`の固定残存を実測しており、32-slot上限変更で隠さず同じowner設計へ含める。
 
+**Phase 6 付け替え (2026-07-14)**: 上の16項目のStep/独立leg対応は`pacha_docs/fd-ops-design.md` §14、旧M6.0/M7.xを廃止したPhase番号は同書§13を正とする。以下の旧M6.0 SMP見出しは履歴であり、実行順はPhase 6後半である。
+
 ### Phase M6 Sway + Waylandの実用化 (追加で)
 
 **M6.0 SMP (マルチコア) 本格対応 — M6 の最初に実施**

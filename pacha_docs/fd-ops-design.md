@@ -1,8 +1,8 @@
-# Phase 6 LPR fd 操作・ライフサイクル統一設計 (ドラフト)
+# Phase 6 LPR fd 操作・ライフサイクル統一設計
 
-日付: 2026-07-13
+日付: 2026-07-14
 
-状態: **ドラフト (執筆途中で凍結)**。ユーザー判断 (2026-07-13) により、M5 は機能優先 (wl_shm 最小 → 入力 → 統合) で先に完走し、本設計の実装は Phase 6 で行う。Phase 6 着手時に M5.6'〜M5.8' 適用後のコードへ照らして本文書を見直してから実装に入ること。文中の「旧 M5.7/M5.9 を移行後に行う」等の順序提案はこのユーザー判断で上書き済み。
+状態: **Phase 6 実装基準 (2026-07-14 改訂)**。baseline は HEAD `71d0182` (M5.8R 完了、tree clean)。本書の Step と oracle は M5.6R `818c191`、M5.7R `d104007`、M5.8R `00e8014` 適用後のコードを正とする。
 
 ## 0. 目的と範囲
 
@@ -14,13 +14,13 @@
 - `FD_CLOEXEC`、open-file-description status、backend handle、native wait capability の source of truth を一本化する。
 - fork/exec/close と SCM_RIGHTS を、backend 共通の prepare → confirm/rollback transaction にする。
 - M5.6 の filed memfd/VMO 転送を `filed` ops の `transfer` 実装として追加する。`VMO_FILE` のような横断的な特別 kind は作らない。
-- 最後に実 wl_shm client の 196,608-byte buffer と中央 `#336699` screendump、Sway/seatd/client の normal/SIGTERM/SIGKILL lifecycle を新構造上で通す。
+- 最後に実 wl_shm client の 196,608-byte buffer、中央 `#336699` screendump、KEY_A/REL `+7,-4`/BTN_LEFT 入力、Sway/seatd/client の normal/SIGTERM/SIGKILL lifecycle を新構造上で通す。
 
 非目的は次の通り。
 
 - この設計を理由に kernel に Linux fd table、LPR kind、filed/netd の path や設定知識を入れない。
-- 現在検証待ちの M5.6b ext4 journal 修正を変更しない。`koboxd`、`_kobox`、新しい unlink journal smoke は本設計の対象外である。
-- SMP、Sway 高速化、libinput/XKB 入力の完成を同時に行わない。Phase 再編は末尾で定める。
+- M5.6b の ext4 journal 修正、`koboxd`、`_kobox`、unlink journal smoke を fd-ops の都合で変更しない。ただし M5.6R 後に切り分けた Mesa shader-cache/ext4 data corruption は本設計と独立した Phase 6 序盤 leg として、fd-ops Step 1 より先に直す (§14)。
+- SMP、Sway 高速化、fake PRIME fence 等の独立課題を fd-ops の Step 列へ混ぜない。libinput/XKB 入力は M5.7R/M5.8R で旧構造上の end-to-end を達成済みであり、本書では最終 Step の新構造上 regression oracle とする。Phase 再編は §13、送りメモ全項目の位置付けは §14 で定める。
 - 旧 ABI を互換 shim で保持しない。ABI を変える Step は、理由を明示して版を上げ、同一 image の全 component を一括更新する。
 
 撤退 patch は以下を本文中で `attempt1`、`attempt2` と呼ぶ。
@@ -30,15 +30,22 @@
 
 61 files / +1862 と 88 files / +7923 は依頼時に示された機能差分の計測値として扱う。patch archive 全体には独立修正や M5.6b 差分も含まれるため、archive 全体の raw stat と混同しない。
 
+### 0.1 改訂履歴
+
+| 日付 | baseline | 内容 |
+|---|---|---|
+| 2026-07-13 | `f9a0e9f` 時点 | M5 を機能優先で完走するため執筆途中で凍結。 |
+| 2026-07-14 | `71d0182` | M5.6R〜M5.8R 後の enum/dispatch/SCM_RIGHTS/exit/signal/lock/耐久実測を再棚卸しし、Step 1、owner-lease oracle、最終入力 oracle、Phase 番号、送りメモ対応を実装基準へ更新。既決の不変条件、v2/v7 shim なし、kernel 六点許可制は維持する。 |
+
 ## 1. 現状の正確な棚卸し
 
 ### 1.1 T3.3 でできたことと、まだ残るもの
 
-T3.3 の entry/object 分離は既に入っている。entry は `active`、`fd_flags`、`file_index`、object は `kind`、`refcount`、`status_flags`、`rights`、`backend_id`、`offset`、payload を持つ (`userland/personality/linux/runtime/lpr_fd/table.h:173-191`)。`dup` は entry を増やして同じ object の refcount を上げる (`lpr_fd/table.c:342-400`)。したがって「shadow table が完全に別配列」という旧 `lpr-state-design.md` の棚卸しは現在の HEAD にはそのまま当てはまらない。
+T3.3 の entry/object 分離は既に入っている。entry は `active`、`fd_flags`、`file_index`、object は `kind`、`refcount`、`status_flags`、`rights`、`backend_id`、`offset`、payload を持つ (`userland/personality/linux/runtime/lpr_fd/table.h:173-191`)。`dup` は entry を増やして同じ object の refcount を上げる (`lpr_fd/table.c:347-405`)。したがって「shadow table が完全に別配列」という旧 `lpr-state-design.md` の棚卸しは現在の HEAD にはそのまま当てはまらない。
 
 しかし object の共通 header と kind payload が同じ意味を二重に持ち、操作側は依然として kind cascade である。T3.3 は土台を作ったが、dispatch と backend lifetime は統一されていない。
 
-さらに、object pointer を table lock 解放後にそのまま返す API がある (`lpr_fd/table.c:524-537`)。別 thread の close/reuse と競合できるため、ops 化では pointer getter を残さず、generation を検証する pinned reference に置き換える必要がある。
+さらに、object pointer を table lock 解放後にそのまま返す API がある (`lpr_fd/table.c:529-542`)。別 thread の close/reuse と競合できるため、ops 化では pointer getter を残さず、generation を検証する pinned reference に置き換える必要がある。
 
 ### 1.2 kind 数と分岐数の訂正
 
@@ -46,11 +53,11 @@ T3.3 の entry/object 分離は既に入っている。entry は `active`、`fd_
 
 再現可能な current-HEAD 計測は次の通り。
 
-- `rg -n 'LPR_FD_TABLE_KIND_' userland/personality/linux/runtime --glob '*.[ch]'` は 149 reference lines / 12 files。
-- 内訳は `control.c` 63、`table.h` 22、`epoll.c` 16、`exec.c` 15、`table.c` 11、`lpr_socket.c` 10、`dup_pipe.c` 6、残り 5 files が各 1〜2 行である。
-- `kind ==/!=`、`switch(kind)`、`case LPR_FD_TABLE_KIND_*` を拾う syntactic scan は 134 行になる。ただし、一つの分岐を複数行に書いたものと、一つの switch の case を別々に数えるため、意味上の「分岐箇所数」ではない。
+- `rg -n 'LPR_FD_TABLE_KIND_' userland/personality/linux/runtime --glob '*.[ch]'` は **165 reference lines / 12 files**。
+- 内訳は `control.c` 63、`table.h` 22、`lpr_socket.c` 21、`lpr_epoll.c` 21、`exec.c` 15、`table.c` 11、`dup_pipe.c` 6、`lpr_drm/client.c` 2、`lpr_vfs/ops.c` / `lpr_tty/client.c` / `lpr_timerfd.c` / `lpr_input/client.c` が各1行である。
+- `rg -n 'kind[[:space:]]*(==|!=)[[:space:]]*LPR_FD_TABLE_KIND_|switch \(.*kind.*\)|case LPR_FD_TABLE_KIND_' userland/personality/linux/runtime --glob '*.[ch]'` の direct syntactic scan は **120 lines**。複数行比較の enum 行を数えず、一つの switch の各 case は別々に数えるため、意味上の「分岐箇所数」ではない。
 
-従って依頼時の「136 箇所 / 12 files」「control.c 65」は、異なる scan 定義または直前差分時点の値であり、現 HEAD の厳密値としては再掲しない。また direct enum scan は accessor (`lpr_linux_*_fd_active`) を使う `io.c` や `metadata.c` の cascade を数えないので、149 を「全分岐数」と呼ぶこともしない。負債の実態は次の concrete chain で確認できる。
+凍結時の同じ direct enum scan は 149 lines / 12 files (`control.c` 63、`table.h` 22、`epoll.c` 16、`lpr_socket.c` 10) だった。M5.6R〜M5.8R で socket が 10→21、epoll が 16→21 となり、総数は16 lines増えた。これは機能優先実装が旧 chain を太らせるという旧 §13 の予測どおりである。なお accessor (`lpr_linux_*_fd_active`) を使う `io.c` や `metadata.c` の cascade は direct enum scan に入らないので、165 を「全分岐数」とは呼ばない。負債の実体は次の concrete chain で確認する。
 
 | 操作 | 現在の分岐 |
 |---|---|
@@ -59,12 +66,12 @@ T3.3 の entry/object 分離は既に入っている。entry は `active`、`fd_
 | close_range | CLOEXEC 用の kind chain と native table 用の別 loop (`lpr_fd/metadata.c:384-467`) |
 | fcntl | kind ごとに同じ `GETFD/SETFD/GETFL/SETFL/DUPFD` switch を複製 (`lpr_fd/metadata.c:562-817`) |
 | ioctl / fstat | ioctl は input/DRM/tty chain (`lpr_fd/metadata.c:835-853`)、fstat は device/event/input/dmabuf/DRM/tty/pipe/native/filed chain (`lpr_fd/metadata.c:897-1005`) |
-| syscall dispatch / mmap | socketだけをread/write/close/ioctl/readv/writev/fstat/fcntlの入口で分岐し (`lpr_dispatch.c:900-952,1077`)、mmapはdmabuf/DRM/FILEDを再列挙する (`lpr_dispatch.c:568-588`) |
-| dup/dup2 | source kind chain (`lpr_fd/dup_pipe.c:198-397`) と source/target validity chain (`lpr_fd/dup_pipe.c:404-455`) |
-| poll | event/tty/DRM/input/pipe/filed/device/native/socket chain (`lpr_socket.c:1615-1717`) |
-| epoll | 登録可能 kind の allowlist (`lpr_epoll.c:235-245`) と native wait fd 選択 chain (`lpr_epoll.c:410-458`) |
-| exec | serialize の else-if chain (`lpr_process/exec.c:248-307`)、self-exec close (`lpr_process/exec.c:450-517`)、process exit (`lpr_process/exec.c:519-565`) |
-| restore | kind 別 restore と最後の switch (`lpr_fd/control.c:683-967`) |
+| syscall dispatch / mmap | socketだけをread/write/close/ioctl/readv/writev/fstat/fcntlの入口で分岐し (`lpr_dispatch.c:900-944,974,1099`)、mmapはdmabuf/DRM/FILEDを再列挙する (`lpr_dispatch.c:568-588`) |
+| dup/dup2 | source kind chain (`lpr_fd/dup_pipe.c:198-397`) と source/target validity・close chain (`lpr_fd/dup_pipe.c:404-475`) |
+| poll | event/tty/DRM/input/pipe/filed/device/native/socket readiness chain (`lpr_socket.c:1762-1865`) と native wait source chain (`lpr_socket.c:1882-1950`) |
+| epoll | 登録可能 kind の allowlist (`lpr_epoll.c:276-283`)、nested scan (`lpr_epoll.c:414-465`)、native wait fd 選択 chain (`lpr_epoll.c:479-527`) |
+| exec | serialize の else-if chain (`lpr_process/exec.c:248-307`)、self-exec close (`lpr_process/exec.c:450-517`)、socket別 cleanup + process exit chain (`lpr_socket.c:640-655`; `lpr_process/exec.c:519-566`) |
+| restore | kind 別 restore と最後の switch (`lpr_fd/control.c:683-971`) |
 
 M5.3c の cube fd 化けは、厳密には「kind switch の更新漏れ」が根因ではなかった。drmd open 後の補助 uevent publication が `ENOENT` になり、その値を special-path の「この service の path ではない」と解釈して filed open へ fall through したものだった (`pacha_docs/refactor-plan.md:535-537`; 現在の fallback は `lpr_vfs/ops.c:546-566`)。したがってこれは kind 追加漏れの直接実績とは数えない。ただし、未知・失敗を filed/native へ暗黙 fallback すると「別 kind として成功する」という同じ failure class の実績であり、目標構造では unsupported/unknown を必ず fail closed にする。
 
@@ -72,10 +79,10 @@ M5.3c の cube fd 化けは、厳密には「kind switch の更新漏れ」が�
 
 | 概念 | 現在の重複 | 根拠 |
 |---|---|---|
-| backend handle | object `backend_id` と filed/tty/DRM/input/socket payload の `handle`、dmabuf の `token` | `lpr_fd/table.h:24-32,61-104,106-135,180-190`; install 時に両方へ書く `lpr_fd/control.c:271-322` |
+| backend handle | object `backend_id` と filed/tty/DRM/input/socket payload の `handle`、dmabuf の `token` | `lpr_fd/table.h:24-32,61-104,106-135,180-190`; install 時に両方へ書く `lpr_fd/control.c:269-323` |
 | native wait fd | DRM/input/socket payload の三複製 | `lpr_fd/table.h:77-95,106-135` |
 | Linux flags | entry `fd_flags`、object `status_flags`、各 payload の `flags` | `lpr_fd/table.h:24-144,173-190`; payload へ再同期する switch `lpr_fd/control.c:384-442` |
-| socket CLOEXEC | entry `fd_flags` のほか payload byte `cloexec` | payload 定義 `lpr_fd/table.h:106-114`; writes は `table.c:173-174`, `control.c:316-317,931`, `lpr_socket.c:595,861,1475`; read は `lpr_socket.c:437-440` |
+| socket CLOEXEC | entry `fd_flags` のほか payload byte `cloexec` | payload 定義 `lpr_fd/table.h:106-114`; writes は `lpr_fd/table.c:178-179`, `lpr_fd/control.c:316-317,931`, `lpr_socket.c:596,954,1599`; read は `lpr_socket.c:437-440` |
 | filed offset | object `offset` と filed payload `offset` | `lpr_fd/table.h:24-32,180-190`; setter が両方へ書く `lpr_fd/control.c:520-548` |
 
 `FD_CLOEXEC` と `O_NONBLOCK/O_APPEND` は同じ flags の複製ではなく、Linux 上も前者が descriptor entry、後者が open file description という別概念である。問題は、その正しい二分に加えて payload `flags` と socket `cloexec` が mirror になっている点である。目標では entry/object の意味上必要な二分は残し、mirror だけを全廃する。
@@ -86,43 +93,47 @@ M5.3c の cube fd 化けは、厳密には「kind switch の更新漏れ」が�
 
 kernel native fd table は 256 entries、dynamic allocation の開始は 16 である (`kernel/abi/fd_abi.zig:1-2`)。一方 Linux-visible table は初期 256、最大 `INT32_MAX + 1` を想定する (`lpr_filed_internal.h:28-29`)。LPR の fixed native endpoints は 240〜246 にある (`lpr_filed.h:6-7`, `lpr_socket.h:6`, `personality/lpr_image_abi.h:83-87`)。
 
-ただし 16 は default allocationとsyscall result encodingの境界であり、既知fdの型/validity境界ではない。kernel内部のindex/allocatorは0〜255の任意の`min_fd`を受け付け (`kernel/src/state/fd.zig:149-159`)、`FD_DUP`もcaller指定の低い`min_fd`へinstallできる (`kernel/src/state/fd.zig:1069-1084`)。一方 syscall statusは0〜6を使う (`kernel/src/syscall/numbers.zig:88-95`) ため、public native wrapperはallocation/dup/receiveをnamed minimum 16以上に制約し、既知fdのvalidityは`FD_GET_INFO`で判定する。`fd < 16`を任意の既知整数へ当てて「nativeではない」と判定してはならない。
+ただし 16 は default allocationとsyscall result encodingの境界であり、既知fdの型/validity境界ではない。kernel内部のindex/allocatorは0〜255の任意の`min_fd`を受け付け (`kernel/src/state/fd.zig:149-159`)、`FD_DUP`もcaller指定の低い`min_fd`へinstallできる (`kernel/src/state/fd.zig:1074-1088`)。一方 syscall statusは0〜6を使う (`kernel/src/syscall/numbers.zig:88-95`) ため、public native wrapperはallocation/dup/receiveをnamed minimum 16以上に制約し、既知fdのvalidityは`FD_GET_INFO`で判定する。`fd < 16`を任意の既知整数へ当てて「nativeではない」と判定してはならない。
 
 現在の logical allocator は、entry が空でも同じ整数に native fd が存在すれば使用不可とする (`lpr_fd/control.c:632-664`)。pipe と dmabuf は logical fd 番号をそのまま kernel syscall に渡し (`lpr_vfs/io.c:193-218`, `lpr_fd/dup_pipe.c:244-285`)、exec v7 は pipe の `handle=fd` と raw `native_wait_fd` を直列化する (`lpr_process/exec.c:277-305`)。これは「二つの表が同じ整数を偶然共有する」設計であり、一方の allocation/reuse が他方へ漏れる。
 
-`lpr_socket.c` と `lpr_process/exec.c` だけでも fd-like variable と 16 を比較する行は current scan で 42 行ある。すべてが衝突判定ではなく、native syscall result の success/error decode に使う箇所もあるが、同じ literal が result decode、validity、ownership、serialization sentinel を兼ねること自体が問題である。libpacha にも `result >= 16` を直接変換する一箇所がある (`userland/libpacha/src/syscall.c:79-85`)。
+`rg -n '(<|>=)[[:space:]]*16|16[[:space:]]*(<|<=)'` を `lpr_socket.c` と `lpr_process/exec.c` に掛けた current scan では、fd-like variable と16を比較する行が **44 lines** ある。すべてが衝突判定ではなく、native syscall result の success/error decode に使う箇所もあるが、同じ literal が result decode、validity、ownership、serialization sentinel を兼ねること自体が問題である。libpacha にも `result >= 16` を直接変換する一箇所がある (`userland/libpacha/src/syscall.c:79-85`)。
 
 attempt2 の retransfer fixture は、受信 logical fd が意図的に 3〜15 であることを要求し、その fd をさらに SCM_RIGHTS で転送する (`attempt2:7241-7302`)。これは「Linux fd が 16 未満なら native capability でない」という判定を契約に使えないことを実測で固定した。低い logical fd の再転送不能は test を弱めて回避せず、名前空間分離で消す。
 
-native syscallのreturn domainにも別の衝突がある。statusは`OK=0, error=1..6`だが (`kernel/src/syscall/numbers.zig:88-94`)、`FD_READ/WRITE/READV/WRITEV`は同じreturnに0以上のbyte countも返し、複数error pathは正のstatusを返す (`kernel/src/syscall/fd.zig:131-234,252-367`)。従って成功した1〜6 bytesとerror 1〜6をuserland decoderだけでは区別できない。`FD_POLL/FD_WAIT_MANY`もready count 1〜6とerrorが重なり (`fd.zig:472-515`)、current libipcは`revents`を再scanして一部を推測する (`userland/libipc/src/ipc.c:152-179`)。`FD_FCNTL(GET_FLAGS)`とrequestによってvalueを返す`FD_IOCTL`にも同じ問題がある (`kernel/src/syscall/fd.zig:370-382,940-979`)。pipe errorだけは既に負statusへ変換する (`kernel/src/syscall/fd.zig:100-107`) ため、ABI自身も一貫していない。typed namespace APIを成立させる前提として、Step 3でcount/value-return syscallのerrorだけを`-1..-6`へ正規化する必要がある。
+native syscallのreturn domainにも別の衝突がある。statusは`OK=0, error=1..6`だが (`kernel/src/syscall/numbers.zig:88-94`)、`FD_READ/WRITE/READV/WRITEV`は同じreturnに0以上のbyte countも返し、複数error pathは正のstatusを返す (`kernel/src/syscall/fd.zig:131-234,252-367`)。従って成功した1〜6 bytesとerror 1〜6をuserland decoderだけでは区別できない。`FD_POLL/FD_WAIT_MANY`もready count 1〜6とerrorが重なり (`kernel/src/syscall/fd.zig:472-515`)、current libipcは`revents`を再scanして一部を推測する (`userland/libipc/src/ipc.c:152-179`)。`FD_FCNTL(GET_FLAGS)`とrequestによってvalueを返す`FD_IOCTL`にも同じ問題がある (`kernel/src/syscall/fd.zig:370-382,940-979`)。pipe errorだけは既に負statusへ変換する (`kernel/src/syscall/fd.zig:100-107`) ため、ABI自身も一貫していない。typed namespace APIを成立させる前提として、Step 3でcount/value-return syscallのerrorだけを`-1..-6`へ正規化する必要がある。
 
 ### 1.5 fork / exec / close の非統一
 
-- table primitive の final close は refcount を減らして object を zero clear するだけで backend callback を持たない (`lpr_fd/table.c:314-331`)。そのため実 backend close は `metadata.c` と socket code に再実装される。
-- fork は kernel clone 後の child で filed/tty/DRM/input/dmabuf を個別に duplicate する (`lpr_fd/dup_pipe.c:17-84`; 呼出しは `lpr_process/syscalls.c:387-417`)。途中失敗は記録するだけで fork 自体を失敗にできず、rollback もなく、dmabuf は失敗時に object を破壊する。socket/event/epoll はこの後処理の対象外である。
+- table primitive の final close は refcount を減らして object を zero clear するだけで backend callback を持たない (`lpr_fd/table.c:319-332`)。そのため実 backend close は `metadata.c` と socket code に再実装される。
+- filed/tty/DRM/input/dmabuf は kernel clone 後の child で個別に duplicate する (`lpr_fd/dup_pipe.c:17-84`)。途中失敗は記録するだけで fork 自体を失敗にできず、rollback もなく、dmabuf は失敗時に object を破壊する。M5.6R は AF_UNIX socket だけ clone 前に `NETD_OP_DUP` を予約する別経路を足したが、table lock 中にRPCし、callerがcancelを手書きする (`lpr_socket.c:658-695`; 呼出し・cancelは `lpr_process/syscalls.c:382-519`)。event/epoll はいずれのbackend transactionにも載らない。
 - exec serialize は 9 kind の else-if chain で、EPOLL は CLOEXEC でなくても preserve 対象から除外される (`lpr_process/exec.c:199-215,248-307`)。
-- serialize した non-CLOEXEC socket も self-exec 前 close loop で `NETD_OP_CLOSE` される (`lpr_process/exec.c:450-517` と `lpr_socket.c:619-636`)。新 image が同じ handle を restore すると EBADF になる class を current code だけで説明できる。
-- exec commit は `PROCESS_EXEC_FROM` より先に `lpr_close_local_state_before_self_exec()` を実行し、kernel commit が失敗しても旧 table/backend ref を復元しない (`lpr_process/syscalls.c:946-965`)。新 image 側 restore も entry を先頭から逐次 publishし、途中失敗を巻き戻さないうえ、install 完了前に global installed flag を立てる (`lpr_fd/control.c:969-988`)。
+- M5.6R は non-CLOEXEC AF_UNIX socket を exec 前に `NETD_OP_DUP` 予約し、self-exec close の `NETD_OP_CLOSE` から target handleを守る ad-hoc pathを追加した (`lpr_socket.c:698-735`; `lpr_process/syscalls.c:975-1031`)。従って旧ドラフトが指摘した inherited socket 即EBADFは現経路では抑止済みだが、socketだけが独自reserve/release順序を持つためStep 19のgeneric exec transactionで削除する。
+- exec commit は `PROCESS_EXEC_FROM` より先に `lpr_close_local_state_before_self_exec()` を実行し、kernel commit が失敗しても旧 table/backend ref を復元しない (`lpr_process/syscalls.c:1024-1037`)。新 image 側 restore も entry を先頭から逐次 publishし、途中失敗を巻き戻さないうえ、install 完了前に global installed flag を立てる (`lpr_fd/control.c:973-992`)。
 - v7 は object identity を持たないため、同一 object を指す dup aliases も entry ごとに serialize される (`lpr_process/exec.c:248-307`)。restore は FILED を entry ごとに新 object へ入れ、TTY だけ raw handle 一致を heuristic に alias 化する (`lpr_fd/control.c:683-739`)。shared offset/status/refcount を全 backendで保存する契約になっていない。
-- normal process exit の backend cleanup は FILED/DRM/INPUT/DMABUF だけを列挙し、socket/tty などを含まない (`lpr_process/exec.c:519-565`)。SIGKILL ではこの userland loop 自体が走らない。
+- M5.8R は `lpr_linux_prepare_process_exit()` の先頭から socket専用loopを呼ぶようにした (`lpr_process/exec.c:519-523`; `lpr_socket.c:640-655`)。後続loopは依然 FILED/DRM/INPUT/DMABUF の列挙で (`lpr_process/exec.c:524-566`)、TTYはnormal exit cleanup対象外である。socketを含むこの手動per-kind path全体をStep 10のunique-object generic close-allが削除する。SIGKILLではuserland loop自体が走らない。
 
 attempt2 は filed owner fork と socket ref reservation を別々に追加し、caller が両方の cancel path を手書きしていた (`attempt2:11204-11346,12199-12295,12676-12732`)。clone 前予約という方向は正しいが、backend を増やすたび top-level cancel sequence が増えるため、一般化されていない。
 
 ### 1.6 poll / epoll / fd_wait_many
 
-current poll は kind ごとに readiness を scan し (`lpr_socket.c:1615-1717`)、pipe/DRM/input/socket だけを別 chain で native wait fd へ変換する (`lpr_socket.c:1734-1786`)。集合の全要素がこの native source chain に載る場合だけ `fd_wait_many` を使い、一個でも載らない fd が混じると集合全体が 10ms sleep/recheck へ落ちる (`lpr_socket.c:1743-1821`)。
+current poll は kind ごとに readiness を scan し (`lpr_socket.c:1762-1865`)、pipe/DRM/input/socket だけを別 chain で native wait fd へ変換する (`lpr_socket.c:1882-1889`)。集合の全要素がこの native source chain に載る場合だけ `fd_wait_many` を使い、一個でも載らない fd が混じると集合全体が10ms sleep/recheckへ落ちる (`lpr_socket.c:1891-1971`)。
 
-epoll も同じ kind allowlist と wait-fd chain を別実装し (`lpr_epoll.c:235-245,410-458`)、close 時には EPOLL kind だけを特別 unmap する (`lpr_epoll.c:570-604`)。新 kind が poll 実装を持っても、epoll allowlist と block path の両方を更新しなければ参加できない。
+epoll も同じ kind allowlist と wait-fd chain を別実装する (`lpr_epoll.c:276-283,479-527`)。M5.7R の nested epoll はlevel-readable再帰scanを追加したが、EPOLL object自身はnative wait sourceを持たないため、non-native targetを一つ含むと `all_native` がfalseとなり10ms quantumを使う (`lpr_epoll.c:414-465,479-510`)。close時にはEPOLL kindだけを特別unmapする (`lpr_epoll.c:623-675`)。新kindがpoll実装を持っても、epoll allowlistとblock pathの両方を更新しなければ参加できない。このnested 10ms pathはStep 11のplannerを前提に、Step 12でEPOLL object/interestを同plannerへ載せた時点で削除する。Step 11だけではまだ消えない。
 
 kernel の `fd_wait_many` 自体は既に存在する (`kernel/abi/fd_abi.zig:15`, dispatch は `kernel/src/syscall/fd.zig:1011-1014`)。不足しているのは kernel 機能ではなく、各 object が「今 ready か」「何を native wait set に arm するか」「wake 後にどう recheck するか」を共通形式で返す LPR 側の境界である。
 
 ### 1.7 現 SCM_RIGHTS の範囲と破綻点
 
-current AF_UNIX sendmsg は INPUT/DRM だけを明示許可し、handle と wait fd を直接 netd request に詰める (`lpr_socket.c:1044-1099`)。recvmsg も kind を解釈して INPUT/DRM payload を直接組み立てる (`lpr_socket.c:1115-1191`)。netd wire に `fd_kind/fd_flags/fd_handle/fd_aux` が露出する (`userland/netd/include/netd/ipc_protocol.h:91-101`)。
+M5.6R の current AF_UNIX sendmsg/recvmsg は INPUT/DRM に加えて FILED memfd を一個だけ明示許可する。LPR は FILED handleをdupして `NETD_FD_KIND_FILED_MEMFD=0x100` に変換し、receiverで FILED payloadを直接組み立てる (`lpr_socket.c:1137-1315`)。netd wireには `fd_kind/fd_flags/fd_handle/fd_aux` が露出し、header自身もこの第三kindを「M5.6R one-way」と定義する (`userland/netd/include/netd/ipc_protocol.h:44-45,95-104`)。これは本節が「採用しない構造」としたkind-aware netdを、M5機能優先の暫定経路として実装した事実であり、目標不変条件を変更する根拠ではない。Step 21でINPUT/DRMだけでなくFILED_MEMFDもopaque brokerへ移し、このwire kindを削除する。
 
-netd は ancillary を一個だけ socket state に保存し、次の recv が何 byte を読むかに関係なく即消費する (`userland/netd/src/unix_socket.c:131-166`)。したがって「通常 data の後ろに fd 付き byte を enqueue し、先行 recv は通常 data だけ読む」という stream ordering を表現できない。socket closeでnetdが解放するancillary資源はqueued native wait fdだけで (`unix_socket.c:178-185`)、INPUT/DRM service handleはrecv後のLPR discard pathがkind別にcloseする (`lpr_socket.c:454-459,1150-1188`)。queue/socket破棄時のbackend ref ownershipがnetdとLPRへ分裂し、未受信backend handleを一律回収する契約がない。
+netd は ancillary を一個だけ socket stateに保存する。M5.6Rで先頭byteの相対`fd_offset`を持ったため、anchorより前だけを読むrecvはfdを消費せずoffsetを繰り下げるが、pending ancillary中の次batchは拒否され、複数occurrence/alias/batch境界を表現できない (`userland/netd/src/unix_socket.c:168-227`)。socket破棄時にFILED_MEMFD handleとnative wait fdはnetdが回収する一方、INPUT/DRM service handleのdiscardはLPRのkind別pathに残る (`unix_socket.c:239-253`; `lpr_socket.c:454-460,1259-1312`)。queue/socket破棄時のbackend ref ownershipがnetdとLPRへ分裂し、全kindを一律回収する契約がない。
 
-一方、kernel IPC の capability transfer は既に source の `TRANSFER` right と requested-rights subset を検査し、message queue 用の object ref を retainし、enqueue 成功後だけ `MOVE` source を closeする (`kernel/src/state/ipc.zig:735-806`)。message/queue破棄も同梱 capabilityを releaseする (`kernel/src/state/ipc.zig:154-187`)。従って generic SCM_RIGHTS のための新 syscall は不要であり、LPR/service側に欠ける OFD ticket、opaque framing、stream ordering、owner leaseをこの既存 capability ownership上へ構成する。
+M5.8R の `MSG_PEEK` はnetdでdataをcopyしてcursor/ancillary原本を残すだけで、peek呼出しへ新しいfdを複製しない (`userland/netd/src/unix_socket.c:192-206`)。LPRの`FIONREAD`は `PEEK|DONTWAIT` のNETD recvをbyte-count probeに使う (`lpr_socket.c:1614-1653`)。従って §6.3 の「repeated PEEKごとに独立receiver entry/OFD ref、CLOEXEC、capacity rollback」を満たさず、現FIONREAD greenはancillary PEEK semanticsの証明ではない。この距離はStep 21のred testで閉じる。
+
+M5.8R の `reap_orphaned_sockets()` は新規socket open時、notify channelをHANGUP pollしてsocketを強制破棄する (`userland/netd/src/unix_socket.c:56-85`)。これはowner leaseのad-hocな前身であり、Step 16でside-aware lease closeへ置換する。判断根拠はnotify peerのcapability closeが作るHANGUPであってPIDや`notify_pending`ではないため、「`notify_pending`をalive oracleにしない」原則とは整合する。ただしcurrent kernel HANGUPはside別refを数えず総`ref_count==1`を見るだけで (`kernel/src/state/fd.zig:687-692`)、normal close/direct recv/execを含む完全なlease契約ではない。
+
+一方、kernel IPC の capability transfer は既に source の `TRANSFER` right と requested-rights subset を検査し、message queue 用の object ref を retainし、enqueue 成功後だけ `MOVE` source を closeする (`kernel/src/state/ipc.zig:743-820`)。message/queue破棄も同梱 capabilityを releaseする (`kernel/src/state/ipc.zig:154-187`)。従って generic SCM_RIGHTS のための新 syscall は不要であり、LPR/service側に欠ける OFD ticket、opaque framing、stream ordering、owner leaseをこの既存 capability ownership上へ構成する。
 
 filed には再利用できる土台もある。`filed_open_file` が offset/status/rights/refcount、`filed_handle` が descriptor handleを持つ (`userland/filed/include/filed/vfs.h:114-136`)。dup handle は同じ open-file targetを参照し refcountを上げる (`filed/src/vfs/core.c:782-837`)。memfd転送はこの OFD identityを export/importし、VMOだけを別物として運ばない。ただし `filed_handle.fd_flags` はLPR entryとの mirrorなので、新契約では canonical sourceにしない。
 
@@ -159,13 +170,24 @@ attempt1/attempt2 から採用する事実と、採用しない構造を分け�
 
 attempt2の`ofd_id`は「alias identityをwireに出す」着眼は採用するが、entryごとの追加fieldと過去entry scanは採用しない。v8/transfer batchはunique object recordを一回書き、entry/occurrenceがid参照するためlinearに検証できる。
 
-### 1.8 fd 構造と独立に先行できる signal 修正
+### 1.8 signal / thread-exit の M5 到達点と残るred
 
-current async signal entry は `%rsp` を 16-byte align した後にさらに 8 引いてから C 関数を call する (`lpr_entry.S:75-87`)。SysV AMD64 では call 直前が 16-byte aligned、callee entry が 8 mod 16 でなければならないため、余分な `sub $8,%rsp` を除く attempt1 の一行修正は正しい (`attempt1:2758-2767`)。同じsequenceは`lpr_async_signal_restorer`にも残る (`lpr_entry.S:90-99`) がattempt1はここを直していないため、Step 1は両call siteを同じalignment testで直す。
+M5.6R で async entry の call 直前 alignment は修正済みである (`lpr_entry.S:75-87`)。poll/epoll もnative blockingから復帰した直後にpending frameをdeliverする (`lpr_socket.c:1875-1879,1921-1935`; `lpr_epoll.c:572-575`)。kernel schedulerは`pending_signal`とhot stateをlock下でpublishした後にwaiterをwakeする (`kernel/src/scheduler_connection.zig:2260-2277`)。これらはStep 1の新規作業ではなく、維持すべきM5.6R regression baselineである。一方restorerにはcall前の余分な`sub $8,%rsp`が残る (`lpr_entry.S:89-98`)ため、同じSysV alignment testでこちらだけがredにする。
 
-また current epoll/poll は blocking `fd_wait_many` から戻った直後に pending native signal を guest frame へ反映しない (`lpr_epoll.c:503-514`, `lpr_socket.c:1773-1786`)。attempt1 の wait boundary delivery (`attempt1:2773-2788,4425-4438`) も fd ops と独立した正当な修正である。後段で wait planner を置換する前に Step 1 へ載せ、専用 regression を固定する。
+M5.8R はprocess-wide signalが「最初のblocked thread」へ配送される現契約も固定した (`kernel/src/scheduler_connection.zig:2255-2288`)。Swayではevent-loop以外のblocking threadがSIGTERMを受けるとmain-loop teardownが進まず、10秒後のSIGKILLへ必ずescalateする (`lpr_sway_launcher.c:275-311`; runner oracleは `tests/run-lpr-qemu-sway-endurance-smoke.sh:34-73`; 切り分けは `refactor-plan.md:614`)。Step 1でprocess-directed signalのowner threadを明示登録し、schedulerがそのthreadだけをwake/deliverする契約に変える。これはthread選択を行うkernelでしか完結しないため、独立redと事前許可の対象である。
 
-さらにkernel signal deliveryはblocked threadを先にwakeし、その後で`pending_signal`を書く (`kernel/src/scheduler_connection.zig:2255-2271`)。threadがその間に再sleepするとsignalを保持したまま起きないraceなので、pending/frame return値をlock下で設定してからunlock/wakeする。attempt1のscheduler差分 (`attempt1:76-171`) はこの順序を実測修正しており、Step 1のkernel permission対象に含める。
+active-stack thread exitも「再現した場合だけ」の候補ではない。M5.8Rでmusl `__unmapself`が実行中stackを先にunmapするredは再現済みである (`refactor-plan.md:612`)。currentはmusl固有の8-byte tailを照合し (`lpr_dispatch.c:919-927`)、静的4KiB stackとinline asmでmunmap→thread-exitする (`lpr_process/syscalls.c:20-26,170-210`)。musl更新で命令列が変われば壊れる暫定対処なので、Step 1でmusl byte signatureに依存しないredを固定し、許可後にkernel `thread_exit` post-switch-unmap flagへ置換する。
+
+### 1.9 M5.8R 耐久の一次red data
+
+current endurance smokeは残存leakを「解決済み」とは扱わず、強制終了回の増分を決定的に固定する。
+
+- filedは強制終了1回ごとにちょうど`+4 handles`で、シグネチャは`.memfd-15`, `.memfd-17`, `wlroots-AAAAAA`, `wayland-1.lock`である (`tests/run-lpr-qemu-sway-endurance-smoke.sh:86-108`; `refactor-plan.md:610,622`)。Step 15完了時に`+4`許容を削除し、normal/TERM/SIGKILLの各回でfiled handles/sessionがbaselineへ戻るoracleへ反転する。
+- drmdは強制終了1回ごとにownerless handles `+5`、その内訳にFB `+2`、dumb `+4`を含み、6回で`DRMD_HANDLE_MAX=32`を圧迫する (`refactor-plan.md:614,622`; max定義は `userland/drmd/src/drm_island.c:20`)。そのためcurrent fixtureはTERMを2/7、direct KILLを4/9の計4回にcapしている (`tests/fixtures/sway_endurance.sh:27-35`)。Step 16完了時にこのcapを外し、direct SIGKILL 20回連続の毎回filed/drmd/netd全handleをbaselineへ戻す。
+- SIGTERMは`kind=exit status=137 escalated=1`、direct SIGKILLは`kind=exit status=137 escalated=0`をcurrent runnerが厳密に要求する (`tests/run-lpr-qemu-sway-endurance-smoke.sh:34-50`; launcherの10秒wait/escalationは `lpr_sway_launcher.c:293-323`)。Step 1完了時にTERMを`kind=exit status=0 escalated=0`のgraceful teardownへ反転する。direct SIGKILLは`137/escalated=0`のままである。
+- M5.8Rはpeer exitがthread countを2→1にした時のstale fd-table lock wordも再現し、unlockをunconditional exchange-clearにした (`lpr_fd/table.c:53-66`; unit red/greenは `tests/lpr_fd_table_test.c:163-183`; `refactor-plan.md:612`)。これは後続のpin/lock設計のcurrent baselineであり、naked pointerやtable lock中RPCまで解決したわけではない。
+
+Step 23はこのservice-wide owner oracleにSCM queue/sender/receiverの各20回を追加し、Step 24は20回SIGKILLを含む最終Sway/input回帰として再度固定する。従って後段のStepが前段の反転を緩めることはない。
 
 ## 2. 目標不変条件
 
@@ -273,11 +295,11 @@ logical allocator は entry table だけを見る。logical 20 と hidden native
 
 pipe、dmabuf、event/timer、service notify channel など現在「logical 番号 = native 番号」を仮定する object は、object-owned hidden `lpr_native_ref_t` へ移す。stdin/stdout や bootstrap 由来の native descriptor も起動時に明示 object として wrap し、「table miss なら native syscall」という fallback は除去する。
 
-native registryはfd object外のruntime-private refsも全て所有し、上記policyとowner generationを付ける。current forkはfiled/termd wire page、filed fast session/page、readv/pread scratch VMOをservice別にunmap/closeし (`lpr_vfs/path.c:457-531`)、clone前にfiled sessionを個別dropする (`lpr_process/syscalls.c:375-376`)。これらを`RUNTIME_DROP_CHILD`または`RUNTIME_RECREATE_CHILD`へ登録し、fork coordinatorがobject snapshotと同じledgerで処理する。`OBJECT_OWNED`はobject opだけが処理して二重closeせず、fixed endpointとexec transportはnamed policyで継承/manifest化する。最終構造に`lpr_reset_fork_child_rpc_state()`型の手動service listを残さない。
+native registryはfd object外のruntime-private refsも全て所有し、上記policyとowner generationを付ける。current forkはfiled/termd wire page、filed fast session/page、readv/pread scratch VMOをservice別にunmap/closeし (`lpr_vfs/path.c:457-531`)、clone前にfiled sessionを個別dropする (`lpr_process/syscalls.c:429-436`)。これらを`RUNTIME_DROP_CHILD`または`RUNTIME_RECREATE_CHILD`へ登録し、fork coordinatorがobject snapshotと同じledgerで処理する。`OBJECT_OWNED`はobject opだけが処理して二重closeせず、fixed endpointとexec transportはnamed policyで継承/manifest化する。最終構造に`lpr_reset_fork_child_rpc_state()`型の手動service listを残さない。
 
-上記current実装について、`path.c:457-531`が明示close/resetするのはfiled/termd wire page、filed fast session/page、readv/pread scratchである。netd cached pageは`lpr_socket.c:279-337`に別管理され、fork reset列に統合されていない。従ってnetdまで既に正しくcloseしているとは数えず、registry移行時に「未登録runtime-private ref」としてstatic/fault testで検出する。
+上記current実装について、`lpr_vfs/path.c:457-531`が明示close/resetするのはfiled/termd wire page、filed fast session/page、readv/pread scratchである。netd cached pageは`lpr_socket.c:279-337`に別管理され、fork reset列に統合されていない。従ってnetdまで既に正しくcloseしているとは数えず、registry移行時に「未登録runtime-private ref」としてstatic/fault testで検出する。
 
-generic OFD-anchor endpointはM6.0後のfull Linux processに必須のbootstrap resourceとする。current supervisor tokenはflag付きoptionalである (`lpr_process/bootstrap_state.c:104-116`) が、process/job-control featureのoptional性とanchor transport availabilityを分離する。production/full imageでanchor endpoint欠落はbootstrapをfail closedにし、host unit用`LOCAL_ONLY` modeだけは起動を許す代わりにfork/exec/external shareを明示`EOPNOTSUPP`にする。正しいOFD共有をoptional token有無で黙って変えない。
+generic OFD-anchor endpointはPhase 6完了後のfull Linux processに必須のbootstrap resourceとする。current supervisor tokenはflag付きoptionalである (`lpr_process/bootstrap_state.c:104-116`) が、process/job-control featureのoptional性とanchor transport availabilityを分離する。production/full imageでanchor endpoint欠落はbootstrapをfail closedにし、host unit用`LOCAL_ONLY` modeだけは起動を許す代わりにfork/exec/external shareを明示`EOPNOTSUPP`にする。正しいOFD共有をoptional token有無で黙って変えない。
 
 hidden native ref の kernel CLOEXEC は内部 resource leak 防止 policy で常時設定してよいが、Linux entry の `FD_CLOEXEC` と同期しない。fork は clone transaction、exec は explicit capability manifest で必要 ref だけを渡す。`MSG_CMSG_CLOEXEC` は受信 entry の flag だけを決め、backend status や source entry を変えない。
 
@@ -375,6 +397,8 @@ LPR shared object の linker が start/stop symbol retention を直接提供で�
 
 fork/exec snapshot は unique object を一度だけ pin し、alias entry list を別に持つ。fd mutation は lifecycle barrier で一時停止するが、service RPC 中に fd table lock は保持しない。attempt2 のように service 別 prepare を table lock 内から呼ぶ構造、および netd queue/page lock を保持して filed RPC する構造は認めない。
 
+M5.8Rではlock取得後にpeer exitがthread countを2→1にしても必ずlock wordをexchange-clearする修正が入った (`lpr_fd/table.c:53-66`; `tests/lpr_fd_table_test.c:163-183`)。これを現lock primitiveの前提として維持するが、lock解放後のnaked pointer lifetimeとlock中RPCは未解決なので、pin/generationの必要性は変わらない。
+
 ## 5. backend 共通 lifecycle transaction
 
 ### 5.1 transaction ledger
@@ -389,6 +413,8 @@ fork/exec snapshot は unique object を一度だけ pin し、alias entry list 
 - service は PID 整数や `notify_pending` を alive oracle にしない。owner identity は native capability lease と generation で表す。
 
 service protocol は共通 lifecycle request prefix `{action, phase, txn_id, owner_generation, handle}` と opaque result ticket を用い、filed/netd/drmd/inputd/termd/LPRS が同じ state machine を実装する。これは64-byte共通service envelope自体と区別する。各 service が独自名の begin/cancel/apply API を LPR top-level へ露出しない。
+
+current netdの`reap_orphaned_sockets()`は新規open時にnotify channelのHANGUPをpollしてorphanを破棄するad-hocな前身である (`userland/netd/src/unix_socket.c:56-85`)。HANGUPはpeer capability closeの事実でありPID推測や`notify_pending`値ではないため上記原則と矛盾しないが、openの機会まで回収を遅延し、side/queue/txnを表せない。Step 16でlease close駆動の即時回収へ置換する。
 
 ### 5.2 close / dup2 / process exit
 
@@ -405,7 +431,7 @@ close は次の順で行う。valid entryを得た後の`close(PREPARE)`は、ob
 
 これは Linux close の「エラー後に fd 番号を再利用し得る」性質と、backend 2-phase cleanup を両立する。current LPRもfiled backend closeのstatusをcallerへ返す経路を持つ (`lpr_fd/metadata.c:316-376`) ため、同期confirmで観測済みのerrorまで一律に握り潰さない。`dup2/dup3` はsource pinとno-fail target close-prepareを先に済ませ、target detachとsource attachを一回のtable commitにし、その後target close-confirmを行う。target backend close errorはdup2の成功を覆さず、cleanup reaperへ渡す。source validation、`oldfd == newfd`/flags規則、table reservationだけがlogical replacement前のerrorになり得る。
 
-normal exit は table の unique object 全てに同じ close transaction を適用する。SIGKILL は userland callback を通らないため、service owner lease と native process fd-table teardown が同じ結果へ収束しなければならない。current の kind 別 exit loop (`exec.c:519-565`) は削除する。
+normal exit は table の unique object 全てに同じ close transaction を適用する。SIGKILL は userland callback を通らないため、service owner lease と native process fd-table teardown が同じ結果へ収束しなければならない。currentはM5.8Rでsocket専用cleanupを先に呼ぶようになったが、後続はFILED/DRM/INPUT/DMABUFの手動loopでTTYは対象外のままである (`lpr_process/exec.c:519-566`; `lpr_socket.c:640-655`)。このper-kind path全体を削除する。
 
 ### 5.3 fork
 
@@ -476,9 +502,11 @@ netd delivery は `RECV_PREPARE` と `RECV_COMMIT/ABORT` の二段にする。pr
 5. control bufferまたはlogical/native/backend capacity不足でもdataは受け取り`MSG_CTRUNC`をsetする。完全な`int` fdとして収まりinstallできるprefixだけを返し、CONSUME時は上記accountingでsuffix occurrence/capsuleをdiscardする。`cmsghdr`自体またはfd一個も完全に入らなければcontrolを全discardする。`EMFILE`をrecvmsg全体のerrorにしてdataを再配送せず、0個prefixでもdata成功+`MSG_CTRUNC`にする。
 6. unknown wire kind、不正rights/size/proof、backend protocol errorはentryを一個もpublishせず全prepared stateをrollbackし、capsuleをfail closedでquarantine/closeする。transient service errorはdelivery cursorを進めずretry可能なerrorにする。どちらもcapability ownerは一箇所で一回だけcloseする。
 
-plain `read/recv` またはcontrolを渡さない非PEEK `recvmsg`がanchor byteを消費した場合、dataは返すが対応capsuleをimportせずdiscardする。current codeもcontrolがない場合に受信handleをdiscardする (`lpr_socket.c:1150-1188`) が、generic queueではbyte anchor単位で同じ規則を適用する。
+plain `read/recv` またはcontrolを渡さない非PEEK `recvmsg`がanchor byteを消費した場合、dataは返すが対応capsuleをimportせずdiscardする。current codeもcontrolがない場合に受信handleをdiscardする (`lpr_socket.c:1259-1312`) が、generic queueではbyte anchor単位で同じ規則を適用する。
 
 Linux互換の`MSG_PEEK`はqueue data/cursorと元export ticketを残したまま、そのpeek呼出し用に各OFD refを複製し、新しいlogical fdを返す。従ってpeekを繰り返すたび独立receiver entries/refsが増え、その都度`FD_CLOEXEC`、control/slot truncation、rollbackを適用する。PEEK suffixのcloneだけを破棄し、queue原本は後のPEEK/CONSUME用に残す。非PEEK consumeが元queue ownershipを最後にreleaseする。peek/no-controlは原本をdiscardしない。capacity testはrepeated PEEK後の全fd closeと最終consumeでbaselineへ戻ることを要求する。
+
+current M5.8Rとの距離は明確である。netdのPEEKはdata copyだけでancillary refを呼出し側へcloneせず (`userland/netd/src/unix_socket.c:192-206`)、LPR `FIONREAD`はその`PEEK|DONTWAIT`をbyte-count probeに使うだけである (`lpr_socket.c:1614-1653`)。従って現greenはdata cursor不変だけの証明で、repeated fd clone、CLOEXEC、capacity rollback、最終consumeの証明ではない。これらをStep 21のred/acceptanceにする。
 
 streamの一回のrecv/recvmsgはordinary byte prefixを読んで最初の`delivery_anchor`へ到達できるが、そのfd-bearing send batchを処理した所で停止し、同じcallで次のsendmsg由来のfd batchへ跨がない。大bufferや`MSG_WAITALL`でも同じで、PEEKも最初のbatchをcloneした所で停止してcursorを進めない。同一sendmsg内の複数cmsghdr/occurrencesだけが一batchである。これはupstreamのnon-PEEK detach後/PEEK clone後の`if (scm.fp) break` (`net/unix/af_unix.c:3047-3073`) を基準にする ([Linux source](https://github.com/torvalds/linux/blob/master/net/unix/af_unix.c#L3047-L3073))。ordinary prefix → fd batch A → fd batch Bを一つのlarge recvへ渡し、Aまでで止まり次callがBを返すoracleを固定する。
 
@@ -499,16 +527,16 @@ socket transferだけはqueued ticketが別socketのqueueを所有し得る。so
 
 ### 6.5 backend ごとの表現
 
-| backend | M6.0 の transfer 表現と可否 |
+| backend | Phase 6 の transfer 表現と可否 |
 |---|---|
 | filed memfd | `filed` が同じ OFD と canonical shared VMO を export-reserve。receiver filed session へ同じ OFD attachment を importし、canonical VMO cap、size、access rights、seals を検証する。runtime kind は引き続き FILED ops。M5.6 の本実装。 |
-| filed regular file | contract は同じだが、M6.0 で memfd 以外まで enable するかは未決。未実装時は `EOPNOTSUPP` を明示し、memfd 判定を path や size で推測しない。 |
+| filed regular file | contract は同じだが、Phase 6 で memfd 以外まで enable するかは未決。未実装時は `EOPNOTSUPP` を明示し、memfd 判定を path や size で推測しない。 |
 | native pipe endpoint | data endpoint capability/direction/rightsと、object生成時のarena `ofd_key` + LPRS slot proofを別ownershipで運ぶ。logical fd numberは運ばず、LPRSはdata endpointをretainしない。receiverはticket/cap chainを検証してPIPE ops objectへcanonicalizeする。 |
 | socket | netd open-socket-description reservation tokenとstable OFD key。receiver用notify/wait channelを新たにattachし、senderのwait fdを公開しない。statusは同じsocket OFDを共有する。queued-only cyclesは§6.4のgraph GC対象。 |
 | INPUT / DRM | 現 M4 の転送を generic ops へ移す。service handle ref を reserve し、receiver 用 wait endpoint を attach する。netd wire から kind-specific fields を除く。 |
 | TTY | fork/exec lifecycle は実装する。SCM_RIGHTS は owner/session semantics の test ができるまで明示 `EOPNOTSUPP`。 |
 | eventfd/timerfd | current local counter/deadline は cross-process OFD を表せないため、native/shared object 化まで transfer disable。 |
-| dmabuf | native VMO と drmd PRIME token の一体 transaction が必要。M6.0 filed memfd の受け入れには含めず明示 disable。 |
+| dmabuf | native VMO と drmd PRIME token の一体 transaction が必要。Phase 6 filed memfd の受け入れには含めず明示 disable。 |
 | epoll/device | epoll interest graph、stateless device の再構築 semantics を別 test で固定するまで明示 disable。 |
 
 「generic contract」は全 kind を無条件で transfer 可にする意味ではない。各 ops が可否と表現を一箇所で明示し、不可 kind が別の fallback kind へ化けないことを意味する。
@@ -620,7 +648,7 @@ exact byte offsets、alignment、最大 blob/cap count は Step 20 開始時に 
 不要な変更:
 
 - TCP/UDP/uinet data path、routing、device model に LPR fd kind を入れない。
-- `notify_pending` を alive flag として拡張しない。current field (`netd/src/unix_socket.c:28,36-40`) は notification coalescing にだけ使う。
+- `notify_pending` を alive flag として拡張しない。current field/write-clear (`netd/src/unix_socket.c:13-46,154-165,192-225`) は notification coalescing にだけ使う。M5.8Rの`reap_orphaned_sockets()` (`unix_socket.c:56-85`) はnotify peerのHANGUPを見るのでPID/flag推測ではないが、Step 16のowner lease導入時に置換して残さない。
 
 ### 9.3 drmd / inputd / termd / LPRS と service ABI
 
@@ -635,7 +663,7 @@ current共通service ABI versionは2で、request/reply magicも`PACVREQ2`/`PACV
 
 v2 common service idsにはNETDがなく、INPUTDもprivate `0x494e5055`を使う (`service_abi.h:14-19`; `inputd/ipc_protocol.h:8-16`)。v3では`FILED, STORAGE, TERMD, DRMD, INPUTD, NETD, LPRS, LPR_CLIENT`を共通taxonomyに置き、INPUTD/NETDを意味group位置へ挿入して後続id/error-domainを全てずらす。netd/inputdも共通envelopeを使い、raw/private id compatibility pathは置かない。transfer用op/structはこの一回で定義し、後続transfer Stepで有効化することでABI bumpを繰り返さない。
 
-共通envelopeは現在64 bytesで、その後ろのpage payload offsetも64で固定される (`service_abi.h:11,39-66`)。一方netd wire pageは65,536 bytes、I/O payloadは`65,536-256`である (`netd/ipc_protocol.h:37-38,91-101`)。v3でenvelopeを拡張するか、64 bytesを維持して共通lifecycle prefixをpayload先頭へ置くかはStep 13冒頭のlayout redで一つに固定する未決事項である。common validatorはservice descriptorからpage/header capacityを受け、netd data pageを誤って8KiBへ縮小せず、他serviceを一律64KiBへ拡大もしない。request/reply magic、header bytes、payload offset/maximum、txn field offsetsを同じ数値表で検査し、serviceごとの隠れた別layoutを許さない。
+共通envelopeは現在64 bytesで、その後ろのpage payload offsetも64で固定される (`service_abi.h:11,39-66`)。一方netd wire pageは65,536 bytes、I/O payloadは`65,536-256`である (`netd/ipc_protocol.h:38-39,95-104`)。v3でenvelopeを拡張するか、64 bytesを維持して共通lifecycle prefixをpayload先頭へ置くかはStep 13冒頭のlayout redで一つに固定する未決事項である。common validatorはservice descriptorからpage/header capacityを受け、netd data pageを誤って8KiBへ縮小せず、他serviceを一律64KiBへ拡大もしない。request/reply magic、header bytes、payload offset/maximum、txn field offsetsを同じ数値表で検査し、serviceごとの隠れた別layoutを許さない。
 
 `PACHA_SERVICE_ABI_VERSION`は`PERSONALITY_ABI_VERSION`と`FILED_FAST_VERSION`にもaliasされる (`personality/personality_abi.h:6-8`; `filed/payload.h:16-24`)。従ってflag-dayではfiled/filed_smoke、koboxd control/ipc、seed0boot/seed0root、lpr_supervisor、personality/LPR client、netd、termd、drmd、inputd、personality note/trap/runtime magicのloader/kernel/runtime consumer、およびlayout testを一括rebuild/updateする。koboxd storage/ext4 data-plane op enumやfs backendはfd lifecycleの意味が変わらないため、global version/magic/headerに合わせるだけで不必要にrenumber/editしない。現在のM5.6b journal差分へ実装を重ねるのはbaseline確定後だけである。
 
@@ -645,26 +673,28 @@ fd ops、logical table、service handle transaction は userland の責務であ
 
 kernel 変更が正当化されるのは次の六点だけである。実装時は AGENTS.md に従い、各 Step の red test と理由を示して事前許可を得る。
 
-1. **signal pending-frame delivery/order**: LPR runtime 中に抑止された native signal を guest syscall return frame へ反映するのは trap frame を所有する kernel でしか完結しない。signal-control sub-op は `REGISTER=1, DELIVER_PENDING_FRAME=2, RETURN=3` と意味順に振り直し、現 `RETURN=2` (`kernel/abi/process_abi.zig:74-75`) はずらす。attempt1 のように単に op 3 を末尾追加して旧番号を温存しない。加えてblocked threadは`pending_signal`とinterrupted returnをlock下でpublishしてからwakeする (`kernel/src/scheduler_connection.zig:2255-2271`)。syscall number 12 は不変、old sub-op compatibility は持たない。
-2. **native value/count return domain**: kernelだけがsuccess value 1〜6とerror status 1〜6の発生点を区別できる。`FD_READ/WRITE/READV/WRITEV` (`kernel/src/syscall/fd.zig:131-234,252-367`)、`FD_POLL/FD_WAIT_MANY` (`fd.zig:472-515`)、`FD_FCNTL(GET_FLAGS)` (`fd.zig:370-382`) とvalue-returning `FD_IOCTL` (`fd.zig:940-979`) の全errorを`-status`へし、nonnegativeをsuccess value/count専用にする。fcntl/ioctlはcommand/request別typed decoderを使う。status-onlyは`0/+status`、new-fdは`>=16/+status`の現domainを保つ。syscall番号/argument layoutは不変だがreturn意味は非互換なので、Step 3でkernel/libipc/LPR/service全callerを一括更新しold heuristicを置かない。userlandだけでは修正不能なため事前許可対象である。
+1. **signal pending-frame delivery/order と process-directed owner**: LPR runtime 中に抑止された native signal を guest syscall return frame へ反映し、process-wide signalの配送threadを選ぶのはtrap frame/thread tableを所有するkernelでしか完結しない。current ABIはM5.6Rで`REGISTER=1, RETURN=2, DELIVER_PENDING_FRAME=3`を末尾追加している (`kernel/abi/process_abi.zig:74-76`)が、Step 1で`REGISTER=1, DELIVER_PENDING_FRAME=2, RETURN=3`へ意味順に全consumerを一括変更し、old sub-op compatibilityは持たない。`REGISTER`はfull LPRの初期/event-loop threadをprocess-directed delivery ownerとしてgeneration付きで登録し、worker cloneはhandler設定を共有してもownerを暗黙継承しない。currentの「最初のblocked thread」選択 (`kernel/src/scheduler_connection.zig:2255-2288`) をowner wake/deliveryへ変え、owner exit/re-registerはfail-closedなstate transitionとする。M5.6Rのpublish-before-wake (`scheduler_connection.zig:2260-2277`) は維持する。syscall number 12は不変とし、Sway TERMの`escalated=1`を再現するred、owner/worker双方がblockedでもownerに一回だけhandlerが届くred、ABI layout redを先に固定して許可を取る。
+2. **native value/count return domain**: kernelだけがsuccess value 1〜6とerror status 1〜6の発生点を区別できる。`FD_READ/WRITE/READV/WRITEV` (`kernel/src/syscall/fd.zig:131-234,252-367`)、`FD_POLL/FD_WAIT_MANY` (`kernel/src/syscall/fd.zig:472-515`)、`FD_FCNTL(GET_FLAGS)` (`kernel/src/syscall/fd.zig:370-382`) とvalue-returning `FD_IOCTL` (`kernel/src/syscall/fd.zig:940-979`) の全errorを`-status`へし、nonnegativeをsuccess value/count専用にする。fcntl/ioctlはcommand/request別typed decoderを使う。status-onlyは`0/+status`、new-fdは`>=16/+status`の現domainを保つ。syscall番号/argument layoutは不変だがreturn意味は非互換なので、Step 3でkernel/libipc/LPR/service全callerを一括更新しold heuristicを置かない。userlandだけでは修正不能なため事前許可対象である。
 3. **generic weak-wait subscription**: native endpointのstrong capをpersistent epoll watchが持つと、kernel objectの最後refが減らずpipe EOF/EPIPE等が壊れる (`kernel/src/state/fd.zig:277-317,1020-1038`; `kernel/src/state/pipe.zig:192-199,232-245`)。userlandはcapabilityのstrong refをweakに変換できず、ABAなしのreadiness/final-releaseもkernel object layerだけがpublishできる。Step 3で`FD_FCNTL` commandを意味順の`GET_FLAGS=1, SET_FLAGS=2, SUBSCRIBE_WAIT=3, DUP=4`へ一括renumberする。current `DUP=3` (`kernel/abi/fd_abi.zig:107-110`) のcompatibilityは持たない。`SUBSCRIBE_WAIT(source, events, min_fd)`はWAIT/POLL/CLOSEだけのruntime-private fdを返し、kernel内でsource object/generationをretainしないweak back-linkにする。source readiness changeでsignal、source final releaseでHANGUP + detach、subscription closeでback-link removalを行う。syscall番号は増やさず、fcntl argument/returnのexact layoutはStep 3のABI redで固定する。これはpipe固有知識ではなく全waitable kernel object共通の非所有monitor primitiveであり、実装前にkernel editの許可を取る。
-4. **channel peer-close semantics**: current channel は両 side 合計 `ref_count=2` だけを持ち、最後の全 ref まで queue を clear しない (`kernel/src/state/ipc.zig:257-294`)。owner leaseには side ごとの最後の ref、dead peer 宛 send=`CLOSED`、remaining side poll=`HANGUP`、dead receiver queue の transferred caps 即解放が必要である。これは任意 userland brokerが安全に capabilityを保持するための kernel object lifetime であり、netd 固有機能ではない。既存status `CLOSED=6`を使える (`kernel/src/syscall/numbers.zig:88-95`) ためsyscall番号/layoutは変えず、side lifetime semanticsだけを完成させる。共通 owner leaseを成立させる Step 14 の必須境界であり、実装前に kernel editの許可を取る。
-5. **`PROCESS_EXEC_FROM` のatomic commit**: current実装はtarget metadata clone後にVMA replaceが失敗でき、その後もstaged process cleanup、CLOEXEC close、scheduler context installの順に不可逆変更を行い、最後の二処理もerrorを返し得る (`kernel/src/syscall/process.zig:781-817`; metadata/VMA mutationは`kernel/src/memory/user_vm.zig:232-241`, `kernel/src/state/vma.zig:727-750`)。さらにcontext installはcurrent threadだけを更新する (`kernel/src/scheduler_connection.zig:1947-1990`)。Step 19ではsame-principal sibling threadsをsource stateのままquiesceし、全allocation/validation、target address-space/native-fd/context planをpreflightする。failureなら全siblingsを旧sourceでresumeし、successならprocess/scheduler lock下の一回のno-fail commitでstaged address space、VMA table、native fd table、current contextをmoveし、siblingsをterminateする。old source state/staged shell cleanupはpost-commit no-fail finalizerへ渡す。address space、fd table、trap frame、sibling scheduler stateを同時に所有するkernelだけがこのatomicityを提供できるため正当であるが、syscall番号/manifest taxonomy/LPR kind知識は追加しない。staged-state adoptionを示すnamed flagを既存flags引数に意味順で定義し、old `flags=0` compatibilityは持たない。failure injectionとtwo-thread/in-flight syscall red後にkernel edit許可を取る。
-6. **active stack thread exit**: final Sway lifecycleで、detached pthread が current stack を unmap してから同じ stack で syscall handlerを走る redが再現する場合、既存 `thread_exit` flags に post-switch unmap bit を追加する。userland は実行中 stack の解放と thread exit を atomic にできないため kernel scheduler境界が正しい。既存 `CLEAR_TID` bit 0 は不変、syscall番号追加はしない。attempt1 の実装/根因は `attempt1:476-526,565`。ただしこれは Step 24 で独立 redを再確認してからだけ採用する。
+4. **channel peer-close semantics**: current channel は両 side 合計 `ref_count=2` だけを持ち、最後の全 ref まで queue を clear しない (`kernel/src/state/ipc.zig:257-294`)。M5.6R/M5.8Rは総refが1の間のpersistent HANGUP (`kernel/src/state/fd.zig:687-692`) とSIGKILL teardown時のwaiter wake (`kernel/src/syscall/process.zig:237-269,289-308`) までは入れたが、normal close、direct receive、normal exit、exec/CLOEXECに同じwake/queue cleanup契約はない。owner leaseには side ごとの最後の ref、dead peer 宛 send=`CLOSED`、remaining side poll=`HANGUP`、sleeping waiter wake、dead receiver queue の transferred caps 即解放が必要である。これは任意 userland brokerが安全に capabilityを保持するための kernel object lifetime であり、netd 固有機能ではない。既存status `CLOSED=6`を使える (`kernel/src/syscall/numbers.zig:88-95`) ためsyscall番号/layoutは変えず、side lifetime semanticsだけを完成させる。Step 14で全exit/close/exec経路のredを出してからkernel editの許可を取る。
+5. **`PROCESS_EXEC_FROM` のatomic commit**: current実装はtarget metadata clone後にVMA replaceが失敗でき、その後もstaged process cleanup、CLOEXEC close、scheduler context installの順に不可逆変更を行い、最後の二処理もerrorを返し得る (`kernel/src/syscall/process.zig:894-930`; metadata/VMA mutationは`kernel/src/memory/user_vm.zig:232-241`, `kernel/src/state/vma.zig:727-750`)。さらにcontext installはcurrent threadだけを更新する (`kernel/src/scheduler_connection.zig:1947-1990`)。Step 19ではsame-principal sibling threadsをsource stateのままquiesceし、全allocation/validation、target address-space/native-fd/context planをpreflightする。failureなら全siblingsを旧sourceでresumeし、successならprocess/scheduler lock下の一回のno-fail commitでstaged address space、VMA table、native fd table、current contextをmoveし、siblingsをterminateする。old source state/staged shell cleanupはpost-commit no-fail finalizerへ渡す。address space、fd table、trap frame、sibling scheduler stateを同時に所有するkernelだけがこのatomicityを提供できるため正当であるが、syscall番号/manifest taxonomy/LPR kind知識は追加しない。staged-state adoptionを示すnamed flagを既存flags引数に意味順で定義し、old `flags=0` compatibilityは持たない。failure injectionとtwo-thread/in-flight syscall red後にkernel edit許可を取る。
+6. **active stack thread exit**: redはM5.8Rで再現済みで、currentのmusl tail byte照合 + 静的4KiB stack + inline asmは暫定対処である (`lpr_dispatch.c:919-927`; `lpr_process/syscalls.c:20-26,170-210`; `refactor-plan.md:612`)。Step 1で実行中stack mappingを渡す独立redをmusl固有byte列に依存せず再固定し、事前許可後に既存`thread_exit` flagsへpost-switch-unmap bitを追加する。userlandは実行中stackの解放とthread exitをatomicにできないためkernel scheduler境界が正しい。currentは`CLEAR_TID` bit 0のみで (`kernel/abi/process_abi.zig:54-58`)、exit実装は`kernel/src/syscall/process.zig:933-963`にある。bit 0とsyscall番号は不変、旧flag compatibilityを加えず、置換後にbyte照合/static stack pathを削除する。
 
 kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案は明示的に却下する。
 
 ## 10. 段階的移行計画
 
-各 Step は merge/受け入れ単位であり、途中 adapter は次 Step へ持ち越せても、Step 自体は既存 full regression green で終える。現在の M5.6b working-tree 差分が検証・基準化されるまでは Step 1 の実装を重ねない。本セッションは Step 0 文書だけであり、以下を実行しない。
+各 Step は merge/受け入れ単位であり、途中 adapter は次 Step へ持ち越せても、Step 自体は既存 full regression green で終える。baselineはM5.8R完了の`71d0182`である。ただしMesa shader-cache/ext4 corruptionはfd-opsと無関係なデータ破壊なので、本Step列に混ぜずPhase 6最初の独立legで先行修正する (§14)。本セッションは文書改訂だけであり、以下を実行しない。
 
-### Step 1 — 独立 signal boundary 修正
+### Step 1 — signal / thread-exit boundary の完了
 
-- async entryとrestorerの余分なstack adjustmentを除き、両方をSysV alignment testへ載せる。
-- kernelはpending signal/interrupted returnをpublishしてからblocked threadをwakeする。signal-control ABIを`REGISTER=1, DELIVER_PENDING_FRAME=2, RETURN=3`へ一括変更し、編集前にkernel許可を取る。
-- poll/epoll/native blocking復帰直後のpending-frame deliveryを共通helperにし、infinite waitの`EINTR`、handler一回、wake-before-pending stressを固定する。
+- M5.6Rでgreenのasync-entry alignment、poll/epoll wait-boundary delivery、publish-before-wakeをregressionとして維持し、残るrestorerの`sub $8,%rsp` (`lpr_entry.S:89-98`) をSysV call-alignment redで除く。
+- process-directed signalのowner/event-loop thread契約を先にuserland+kernel unit/QEMU redへ固定する。ownerとworkerがともにblocking中でもSIGTERM handlerがownerへ一回だけ届き、owner exit/re-registerがgeneration-safe、Sway TERMが10秒以内に終了することを要求する。そのredと§9.4 item 1の理由を示してkernel事前許可を取る。
+- 許可後、signal-control ABIを`REGISTER=1, DELIVER_PENDING_FRAME=2, RETURN=3`へ全consumer同一artifactで一括変更し、v2-style/旧sub-op shimを置かない。`REGISTER`にprocess owner generationを与え、schedulerの任意blocked-thread選択を削除する。
+- M5.8Rで再現済みのactive-stack unmapは、musl tail byteを見ない専用pthread redへ固定する。§9.4 item 6の理由で別途kernel事前許可を取り、`thread_exit` post-switch-unmap flagを入れて、tail byte照合、静的4KiB stack、inline-asm exitの暫定pathを削除する。
+- Step完了時にenduranceのTERM oracleをcurrent `kind=exit status=137 escalated=1`から`kind=exit status=0 escalated=0`へ反転し、escalation markerが0件であることを要求する。direct SIGKILLの`status=137 escalated=0`はこのStepでは変えない。
 
-消えるclass: fd wait hangとsignal delivery/alignment raceの混同。fd構造自体はまだ変えない。
+消えるclass: 任意workerへのprocess signal配送、musl固有byte列依存、active-stack unmap、restorer alignment。fd構造自体はまだ変えない。
 
 ### Step 2 — entry/OFD flags の一本化
 
@@ -739,7 +769,7 @@ kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案�
 - dup2/dup3 target replacementを一回のtable commitにし、target close errorを成功結果へ漏らさない。
 - close_rangeとnormal exitをunique object generic close-allへ移し、全kindでfinalizer一回を検査する。direct closeのdefinitive backend errorはerrnoを返しつつfdが再利用可能なこと、pin-drain/dup2/close_range/exitのdeferred errorはcaller結果を覆さずdiagnosticに一回記録されることをfault injectionする。
 
-消えるclass: final close漏れ/二重close、normal exitのsocket/tty欠落、dup2 ABA/target half-close。
+消えるclass: final close漏れ/二重close、normal exitのM5.8R socket専用pathを含む手動per-kind loopとTTY欠落、dup2 ABA/target half-close。
 
 ### Step 11 — poll/select wait planner
 
@@ -768,8 +798,8 @@ kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案�
 
 ### Step 14 — kernel peer-close と owner-lease substrate
 
-- red unit testと事前許可後、channel side-last-ref、CLOSED/HANGUP、dead-receiver queue cap cleanupを汎用kernel semanticsとして入れる。
-- dupした片側ref一個のcloseではHANGUPせず、最後のside refだけがpeer deathになることを検査する。
+- currentのpersistent HANGUP/SIGKILL wakeはregressionとし、normal close、dupした片側ref一個のclose、side-last-ref、direct receive、normal exit、exec/CLOEXEC、sleeping poll、dead-receiver queued capsを独立redにする。最後のside refだけがpeer deathになり、peer send=`CLOSED`、poll=`HANGUP`、waiter wake、queue cap baseline回復となることを要求する。
+- §9.4 item 4のredと理由を示して事前許可を取った後に、channel side-last-ref、CLOSED/HANGUP/wake、dead-receiver queue cap cleanupを汎用kernel semanticsとして入れる。
 - userland共通lease/txn tableをsynthetic backendで検査し、実serviceは次Stepから一群ずつ移す。
 
 消えるclass: PID/queued HUP/`notify_pending`をowner livenessとして推測する必要。kernelにLPR kind知識は入れない。
@@ -780,15 +810,17 @@ kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案�
 - local dupからservice DUPを除き、normal/SIGKILL、partial prepare、confirm retry、capacity回収を検査する。
 - filed OFD status/offsetとtermd session/job-control data-planeは既存の正を維持する。
 - filed/termd OFDのnon-watch strong rootとepoll weak subscriber通知をservice共通lifecycleへ載せる。
+- current FILED_MEMFD SCM adapter経由のsender/receiver handleもowner leaseで数え、Swayのnormal/TERM/direct SIGKILLの毎回にfiled active handles/sessionが開始baselineへ戻ることを検査する。このStepでrunnerの`baseline + 4 * forced-rounds`許容 (`tests/run-lpr-qemu-sway-endurance-smoke.sh:86-108`) を削除し、シグネチャ4名のいずれかが1個でも残ればfailに反転する。
 
 消えるclass: filed/tty handle close/fork用手動ref、client death時だけ残るsession/page、confirm timeout後の二重処理。
 
 ### Step 16 — netd/drmd/inputd lifecycle とwait endpoint
 
 - netd/drmd/inputdのowner attachment/notify refをv3 leaseへ移し、owner refとqueue refを別に数える。
+- netdの`reap_orphaned_sockets()` open-time scanを削除し、lease peer-closeが直接socket/notify/queueを回収することを「新規openなし」で検査する。`notify_pending`はcoalescingのみに残す。
 - 三serviceのnon-watch strong rootとepoll weak subscriber/final invalidationを共通moduleへ載せる。
 - ttyを含むblocking serviceにreceiver-specific wait endpointを揃え、10ms adapterを削除する。
-- normal/SIGKILL、32 socket endpoints、DRM/input wait attachment、notify coalescingを同一VMで回収確認する。
+- normal/SIGKILL、32 socket endpoints、DRM/input wait attachment、notify coalescingを同一VMで回収確認する。完了時にfixtureの2/4/7/9の強制終了4回capを外し、direct SIGKILLを20回連続実行する。毎回filed/drmd/netdの全handle/session/socketがbaselineへ戻り、drmdのFB/dumbもbaseline、`DRMD_HANDLE_MAX=32`の残容量が不変であることを要求する。
 
 消えるclass: `notify_pending` alive誤判定、service wait fd共有によるwake取り合い、crash時socket/notify/DRM/input handle leak。
 
@@ -828,10 +860,10 @@ kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案�
 
 消えるclass: dup alias/OFD共有消失、EPOLL強制drop、raw native slot wire、kind別restore更新漏れ。
 
-### Step 21 — generic ancillary broker と既存 INPUT/DRM 移行
+### Step 21 — generic ancillary broker と既存 INPUT/DRM/FILED_MEMFD 移行
 
 - opaque unique-object capsule + per-occurrence rights、delivery anchor、sealed bundle chain、253-fd transaction、recv consume/PEEK、全層capacity prefix/CTRUNC規則をnetd/LPRへ入れる。
-- current INPUT/DRM transferをops callbackへ移し、netd wireからkind-specific fieldsを除く。
+- current INPUT/DRM/FILED_MEMFD transferをops callbackへ移し、netd wireから`fd_kind/fd_flags/fd_handle/fd_aux`と`NETD_FD_KIND_FILED_MEMFD`を除く。FILEDの完成したmemfd semanticsはStep 23までenableしないが、M5固有wire kindはこのStepでopaque capsule adapterへ置換する。
 - zero-byte/partial stream sendでancillary 0/1回、ordinary prefix→batch A→batch BでA停止、plain read discard、repeated PEEK、`[A,A,B]` alias途中CTRUNC、異なるentry rights、19/20、253 unique/same-fd occurrences、254=`EINVAL`、cap-heavy/near-full native table、bundle chunk中death、unknown proof、lock-order faultを検査する。
 
 消えるclass: netd/LPR双方のtransfer-kind switch、stream ancillary順序ずれ、EMFILE data再配送、page/queue lock中filed RPC。attempt1のlock inversion classはここで閉じる。
@@ -847,7 +879,7 @@ kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案�
 ### Step 23 — filed memfd/VMO transfer
 
 - filed opsのmemfd export/import、canonical VMO、shared OFD offset/status/seals、rights/proof validationを実装する。`VMO_FILE` kindは作らない。
-- 196,608 bytes、first/last pixel、MAP_SHARED双方向、readonly、seals、separate/batch alias、3〜15二hop、CLOEXEC、253境界を検査する。
+- 196,608 bytes、first/last pixel、MAP_SHARED双方向、readonly、seals、separate/batch alias、3〜15二hop、CLOEXEC、253境界を検査する。加えてM5.7Rで未検証の、SCM_RIGHTS receiverでのcross-process `pread`と`MAP_PRIVATE`が`EAGAIN`になるredを固定する。`pread`はshared filed OFD owner、`MAP_PRIVATE`はStep 8のmap transaction/mapping ticketがreceiver leaseの正しいbackend refを保持することで閉じ、fd close後もprivate mappingのread/COWが継続することを要求する。Step 8単体はこのcross-process契約を完了したことにしない。
 - sender/receiver/queued SIGKILLを各20回（queuedは`imported=0`）、filed `transfer_capacity=64 map_bytes=4096`、netd endpoint capacity 32の再確保を同一VMでbaselineへ戻す。
 
 消えるclass: filed memfd横断特別kind、metadata copyだけのOFD分裂、low-fd retransfer不能、kill時VMO/ticket leak。旧M5.6機能要件はgeneric opの一実装として成立する。
@@ -856,9 +888,11 @@ kernel に pathname、Wayland、SCM kind、daemon handle table を入れる案�
 
 - 実Wayland clientでglobals、196,608-byte XRGB8888 memfd、xdg configure/ack、attach/damage/commit/frame callbackを通し、1024x768 screendump中央8x8を厳密`#336699`判定する。
 - transfer単体はpixmanを使ってよいが、real card0 + llvmpipe `sway-first-frame`も別にgreen維持する。pixmanだけでSway完了にしない。
-- `socketpair(SOCK_STREAM | SOCK_CLOEXEC)`を実経路で検査し、両entry CLOEXEC、dup/exec規則を確認する。attempt1の実測に従い`swaybg_command -`、`xwayland disable`、`MESA_SHADER_CACHE_DISABLE=true`を維持する (`attempt1:559-563`)。
-- lifecycleはnormal 2、SIGTERM 1、SIGKILL 20、最後のrecovery normal、合計23をexact statusで通す。normalは`client=exit:0, sway=exit:0, seatd=exit:0`、SIGTERMは`client=signal:15, sway=exit:0, seatd=exit:0`、SIGKILLは`client=signal:9, sway=signal:9, seatd=exit:0`とし、各回`orphan=0, stale=0, exact=1`を要求する。`M56_WL_SHM_TRANSFER bytes=196608`と`M56_WL_SURFACE_READY color=#336699 size=256x192`も各23回exact countし、iteration 23をnormal recoveryにする。124/137/143を任意successへ正規化しない (`attempt2:824-876`)。
-- active-stack exit redが再現した場合だけ許可後に§9.4のkernel flagを入れる。最後にcompat adapter、central kind branch、payload mirror、raw fd boundary、v7、service別lifecycle entrypointを0にする。
+- `socketpair(SOCK_STREAM | SOCK_CLOEXEC)`を実経路で検査し、両entry CLOEXEC、dup/exec規則を確認する。`swaybg_command -`と`xwayland disable`は維持する。Phase 6先行ext4 leg完了後は`MESA_SHADER_CACHE_DISABLE=true` (`tests/fixtures/sway_endurance.sh:23`) を外し、shader-cache有効の各23回とpost-run fsck cleanを要求する。
+- M5.7RのSway限定`shm_open` preload (`tests/fixtures/sway_endurance.sh:39-45`; launcher適用は `lpr_sway_launcher.c:178-185`) を削除し、wlroots anonymous-file生成をbuild-timeの`memfd_create`経路へ恒久化する。これはStep 23のfiled memfd transferを使い、keymapのためにregular-file transfer全体を有効化しない。
+- lifecycleはnormal 2回（最後のrecoveryを含む）、SIGTERM 1回、direct SIGKILL 20回の合計23回とする。全回clientは`status=0`、normal/TERM Swayは`kind=exit status=0 escalated=0`、direct KILLはcurrent LPR wait表現の`kind=exit status=137 escalated=0`にexact固定し、seatd正常終了、`orphan=0, stale=0, waitpid=1`を要求する。実測なしに124/143や他statusをsuccessへ正規化しない。各回filed/drmd/netd全handle/session/socketがbaselineに戻り、`+4`許容や強制終了4回capはない。iteration 23をnormal recoveryにする。
+- 全回`M56_WL_SHM_TRANSFER bytes=196608`と`M58_WL_SURFACE_READY ... color=#336699 size=256x192`及びpixelをexact countする。iteration 1とrecovery 23でQMP固定入力を送り、`KEY_A 30/1/0`、REL `+7,-4`、`BTN_LEFT 272/1/0`の`M58_INPUT_PASS`相当を要求する (`tests/run-lpr-qemu-sway-endurance-smoke.sh:29-32`)。これがM5.7R/M5.8Rで旧構造上greenだった入力の、新構造上での再達成である。
+- fake PRIME fence transportは本Step外なので`LP_NUM_THREADS=0` (`lpr_sway_launcher.c:178-181`) はここで外さない。最後にcompat adapter、central kind branch、payload mirror、raw fd boundary、v7、service別lifecycle entrypointを0にする。
 
 消えるclass: 移行専用dual path、helper orphan/stale socket、実workloadだけのqueue/exec/kill leak。旧M5.6と旧M5.8受け入れを新構造上で再達成する。
 
@@ -871,7 +905,7 @@ Host/static gate:
 - `tests/run-lpr-fd-table-tests.sh`
 - `tests/run-userland-service-abi-layout.sh`
 - filed VFS/cache tests、termd pgrp signal unit、pack `go test ./...`
-- kernel unit tests。kernel buildは repo rootで `zig build-obj` を実行せず、repo規律に従い `kernel/` workdir と sandbox外 WSL clangを使う。
+- kernel unit tests。EFI buildは`cd kernel && zig build efi`とし、repo rootで`zig build-obj`を実行しない。C compileが必要な時は`zig cc`で代用せず、repo規律どおりsandbox外のWSL clangを使う。
 - `git diff --check` と、Step固有の no-legacy static scan。
 
 QEMU/full gate:
@@ -881,6 +915,8 @@ QEMU/full gate:
 - drm card0/prime/page-flip/restart、kms modeset、Mesa inventory。
 - Sway inventory、real first-frame、socket repeat。
 - 基準化後の M5.6b ext4 sync/unlink journal smokeとpost-run fsck。
+
+M5.8R current enduranceは移行前redとして、forced exit 4回cap、filed `+4/回`、TERM `escalated=1`を一時的に厳密許容する。ただし許容は、Step 1でTERM escalation、Step 15でfiled `+4`、Step 16でforced-exit capの順に必ず反転する。Step 16以降はSIGKILL 20回連続の毎回filed/drmd/netd baseline回復を共通gateにし、Step 23はSCM sender/receiver/queue別各20回、Step 24は画面+入力+合計23回の実workloadを上乗せする。一度反転したoracleを後のStepで元の許容値へ戻さない。
 
 Step固有 testが新しい redを示す間、既存oracle、iteration数、timeout、capacityを緩めてgreen扱いしない。Step完了時は open object、native refs、service handles、transaction tickets、queue caps、mapping数が開始baselineへ戻ることも検査する。
 
@@ -899,22 +935,47 @@ Step固有 testが新しい redを示す間、既存oracle、iteration数、time
 1. ops registry の linker section start/stop symbolを現 LPR shared-object linkで使うか、macroからgenerated registryにするか。manual central listは選択肢にしない。
 2. local/native objectの cross-process OFD status storage。値とbackend stateを二重に持たないこと、fork/SCM後の `F_SETFL`共有を満たすことは決定済みで、VMO/shared service ticket等の表現だけが未決。
 3. SCM_RIGHTS 一回の最大fd数。kernel cap上限19、reply/page caps、data framingを測り、明示上限かbatchかを決める。
-4. M6.0で filed regular file、eventfd/timerfd、dmabuf、tty、epoll/deviceのtransferをどこまでenableするか。memfd、既存INPUT/DRM、pipe/socket以外はtestなしにenableしない。
+4. Phase 6で filed regular file、eventfd/timerfd、dmabuf、tty、epoll/deviceのtransferをどこまでenableするか。memfd、既存INPUT/DRM、pipe/socket以外はtestなしにenableしない。
 5. v8 header/recordのexact byte size/alignment/capacity。版数方針とentry/object分離は決定済み。
 6. service transaction ticket/owner tableのcapacity、lease timeoutの有無、GC scan cadence。正常時にwall-clock timeoutだけでownershipを破棄しない。
-7. active-stack unmap kernel flag。attempt1の実測は採用候補だが、新構造上の独立redをStep 10で再確認する。
-8. service ABI v3の各service別exact opcode/struct offset。意味group順の全renumber、version 3、一括cutは決定済みで、Step 6冒頭のlayout red testで数値表を固定してから実装する。
+7. active-stack unmap kernel flagのexact bit/argument layout。採用とStep 1での置換はM5.8R redにより決定済みだが、musl byte signatureに依存しないredと§9.4の事前許可後にexact layoutを固定する。
+8. service ABI v3の各service別exact opcode/struct offset。意味group順の全renumber、version 3、一括cutは決定済みで、Step 13冒頭のlayout red testで数値表を固定してから実装する。
 
-## 13. Phase 番号の再編案
+## 13. Phase 番号の確定
 
-M5.6b の検証後、次の番号へ再編する。
+旧呼称`M6.0 = fd-ops`と`M7.x`は廃止し、以下を正式な番号とする。
 
-| 新 Phase | 内容 | 旧位置 |
+| Phase | 内容 | 受け入れ境界 |
 |---|---|---|
-| M6.0 | 本文書の fd ops / namespace / lifecycle / exec v8 / generic transfer。最終Stepで旧 M5.6 wl_shm `#336699` と旧 M5.8 helper lifecycleを達成 | 新設専用 Phase |
-| M6.1 | wlroots libinput + XKB + fixed QMP入力を新fd構造上で完成し、actual DRM + llvmpipe + wl_shm + input、20 restart/full regressionでSway完了判定 | 旧 M5.7 + M5.9 |
-| M7.0 | SMP本格対応 | 旧 M6.0 |
-| M7.1 | Sway起動/frame/input latency高速化 | 旧 M6.1 |
-| M7.2 | Sway実用化と通常Wayland applications | 旧 M6.2以降 |
+| Phase 6 序盤 | Mesa shader-cache/ext4 corruptionの独立修正を先行し、その後に本書Step 1〜24でfd ops / namespace / lifecycle / exec v8 / generic transferを完成 | shader cache有効のpost-run fsck clean。最終Stepで画面、input、lifecycle、owner baselineを新構造上で再達成 |
+| Phase 6 後半 | §14の独立送り項目を依存順に閉じ、その後にSMP本格対応 | fd-opsで古いlifecycle/wait分岐を除去する前にSMPの並行raceを重ねない |
+| Phase M6.1 | Sway起動、frame、mouse/keyboard latencyの実測と高速化 | Phase 6/SMP後のbaseline比較、threaded llvmpipeを含む |
+| Phase M6.2 | Sway実用gapの解消、virtio-tablet絶対座標、seatd `EVIOCREVOKE`警告等 | grab不要の絶対pointerと実用workload |
+| Phase M6.3 | Waylandアプリ導入 | foot/GTK demo/選定アプリと通常利用フロー |
 
-旧 M5.7/M5.9 を fd構造移行と並走させない。入力fd、epoll、fork/exec、SCM_RIGHTSの旧chainへ追加実装すると、まさに M6.0 が除去する分岐面を増やすためである。M6.1 は新 ops/transactionだけを利用し、そこで初めて KEY_A press/release、REL 7/-4、BTN_LEFT、XKB compile、画面、20 restartを一つのSway完了oracleに統合する。
+入力配管自体はM5.7R/M5.8R (`d104007`, `00e8014`) で旧構造上のend-to-endを達成済みである。従って旧「M6.1 = 入力完成」を独立Phaseにせず、Step 24の`KEY_A 30/1/0`, REL `+7,-4`, `BTN_LEFT 272/1/0`で新構造上の再達成を証明する。Phase M6.1はそのgreen baselineの性能改善から始める。
+
+## 14. M5 「Phase 6 送りメモ」対応表
+
+`pacha_docs/refactor-plan.md:620` のslash区切り16項目を、本書のStepまたは独立legへ漏れなく対応付ける。「独立」の項目はfd-opsのStep番号を付けて混ぜない。
+
+| # | 送りメモ項目 | 位置付け | 完了条件/境界 |
+|---:|---|---|---|
+| 1 | fd-ops vtable統一 | Steps 2〜12, 17〜20, 24 | common fields→ops dispatch→lifecycle/execの順にcentral kind chainを0へする。 |
+| 2 | generic transferable-FD、A→B→C再転送 | Steps 13, 21〜23 | opaque broker、OFD canonicalization、low-fd two-hop、kill capacityを同時にgreenにする。 |
+| 3 | native fd窓 (`fd < 16`) の形式化 | Steps 3〜5 | typed result/native refとlogical namespace cut。3〜15 two-hopで完了。 |
+| 4 | opcode/ABI整理 | Step 1 signal sub-op、Step 3 native fcntl/return、Step 13 service v3、Step 20 exec v8 | 各flag-dayで意味順に全renumberし、v2/v7/旧sub-op shimを置かない。kernel対象は§9.4の事前許可が必要。 |
+| 5 | netd backend ref一般化、pathname owner lease | Steps 14, 16, 21〜22 | `reap_orphaned_sockets()`をStep 16でlease-driven cleanupへ置換し、queue/transfer cycleはStep 22で閉じる。 |
+| 6 | filed handle/session owner lease・transfer ownership | Steps 15, 21, 23 | Step 15で`+4/回`を0へ反転、Step 23でsender/receiver/queue各20 killとmappingを固定。 |
+| 7 | drmd handle/session owner lease・transfer ownership | Step 16、transfer部はSteps 21〜23の共通枠 | `+5 handles / FB +2 / dumb +4`を0へ反転し、32-slot圧迫なし。fake PRIME fenceは#13の独立leg。 |
+| 8 | process-wide signalのevent-loop thread配送 | Step 1 | current TERM `escalated=1`をowner-thread deliveryの`exit 0 / escalated=0`へ反転。§9.4 item 1のkernel事前許可対象。 |
+| 9 | SCM受信filed memfdの`pread`/`MAP_PRIVATE` `EAGAIN` | Step 8 + Step 23 | Step 8のmap transactionを前提に、Step 23のcross-process owner/mapping redで完了。Step 8単体では完了扱いしない。 |
+| 10 | wlroots keymap anonymous-file恒久化 | Steps 23〜24 | filed memfd transferを使うwlroots build-time `memfd_create`へ移し、Sway限定`shm_open` preloadを削除。regular-file transferをこのために広げない。 |
+| 11 | nested epoll native wake統合 | Step 11のplannerが前提、Step 12で削除 | M5.7Rのnon-native target 10ms quantumはStep 11だけでは残り、EPOLL object/interestをplannerへ載せるStep 12完了時に消える。 |
+| 12 | file VMO cacheのworking-set budget/DMA fragmentation | fd-ops外のPhase 6独立leg | 現256-slotを根拠なく固定せず、byte/slot/working-setを計測可能にする。fd lifecycleのcorrectness fieldにしない。 |
+| 13 | fake PRIME fence transport、`LP_NUM_THREADS=0`解除 | fd-ops外のPhase 6後半独立leg、Phase M6.1より前 | explicit/implicit fence transportをDRM/VMO transactionで固定した後だけ`LP_NUM_THREADS=0`を外し、threaded llvmpipeを回帰。 |
+| 14 | `/dev/shm` tmpfs | fd-ops外のPhase 6 userland/filed独立leg | kernelにpath知識を追加せず、filed mount/tmpfs semanticsと専用testで完了。 |
+| 15 | native channel close/wake semantics統一 | §9.4 item 4 / Step 14 | current M5のpersistent HANGUP + SIGKILL wakeだけでは未完。normal close、direct recv、normal exit、exec/CLOEXEC、dead queue capsまでside-awareに統一。kernel事前許可対象。 |
+| 16 | Mesa shader-cacheでext4 multiply-claimed block/directory corruption | **fd-ops外、Phase 6最初の独立leg** | `refactor-plan.md:600`のデータ破壊でありStep列に混ぜない。shader cache有効の再現red、修正、post-run fsck cleanを得てからStep 1へ進む。kernel修正に証拠が収束する場合は別件として事前許可を取る。 |
+
+`refactor-plan.md:618` のvirtio-tablet絶対座標とseatd `EVIOCREVOKE`警告はslash区切り16項目の外だが、行方を失わないようPhase M6.2に置く。同行末の旧`M6.0 SMP`は本書§13に従い、Phase 6のfd-ops/独立負債の後半へ付け替える。
