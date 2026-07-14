@@ -627,9 +627,10 @@ filedの実測は強制終了1周で`[5 1] → [9 1]`。残る4 handleはSway固
 
 Phase 6 は「OS の機能自体を完成させる」フェーズ。GUI 実用化 (Phase M6.1〜M6.3) の前に、fd/lifecycle/signal/SMP という土台の構造を閉じる。SMP も実用化機能ではなく OS 機能そのものなので Phase 6 に含める。Step の詳細定義・oracle・kernel 変更の六点許可制は `pacha_docs/fd-ops-design.md` (§10/§9.4/§13/§14) が正。以下は実施順の全体像。
 
-**6-A. 先行独立 leg — ext4 データ破損の根治**
+**6-A. 先行独立 leg — ext4 データ破損の根治 — 完了 (2026-07-14, _kobox `4617596` + os `86f15f1`)**
 - Mesa shader-cache 書き込みで再現する multiply-claimed block / directory corruption を修正する。データ破損は寝かせるほど被害が広がるため、fd-ops より先に単独で潰す。
 - 受け入れ: shader cache 有効での再現 red → 修正 → post-run fsck clean をゲートへ常設。kernel 原因に証拠が収束した場合のみ別途事前許可。
+- **結果**: 根因は kernel でも filed でもなく、`_kobox` の ext4 allocator/free が buffer-head・buddy 管理を迂回して bitmap / group descriptor / superblock を raw write していたこと。stale な buffer cache 像の dirty flush が割り当て bit を消去し (trace: inode 4077 の bit 23300 / block 219908 が 0x1f→0x0f で消え inode 4079 が再取得)、free 側は group free count 未更新。修正は `ext4_mb_mark_bb` / `ext4_free_blocks` への委譲 + buddy `NEED_INIT` + 事後検証。Mesa 非依存 fixture (cache DB と同型の syscall 列) と新スモーク `run-lpr-qemu-ext4-shader-cache-smoke.sh` (fresh disk + host fsck 必須) をバッテリーへ常設。修正前 red は first-frame 単独 148 inode / 最小 fixture 22 inode、修正後は新スモーク 3 連続 + 実 first-frame + ext4 回帰すべて fsck clean。ゲート: ホスト 6/6 + バッテリー v2 24/24 再試行ゼロ。
 
 **6-B. fd-ops 統一 (fd-ops-design.md Step 1〜24) — Phase 6 の本体**
 - Step 1: signal / thread-exit boundary の完了。restorer の SysV alignment、process-directed signal の owner-thread 配送契約 (Sway TERM を `escalated=1` → `exit 0` へ反転)、musl `__unmapself` バイト照合の暫定対処を kernel post-switch-unmap flag へ置換。
