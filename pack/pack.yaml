@@ -1169,6 +1169,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_ext4_unlink_journal_smoke.c"
     out: "EXT4UJNL.ELF"
     rootfs: "/cmd/lpr_ext4_unlink_journal_smoke.elf"
+  lpr_ext4_shader_cache_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_ext4_shader_cache_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_ext4_shader_cache_smoke", "userland/fixtures/src/wsl_musl/lpr_ext4_shader_cache_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_ext4_shader_cache_smoke.c"
+    out: "EXT4SHDR.ELF"
+    rootfs: "/cmd/lpr_ext4_shader_cache_smoke.elf"
   chibicc_toolchain_root:
     file:
       path: ".artifacts/userland-fixtures/lpr-chibicc-toolchain-root"
