@@ -634,6 +634,9 @@ Phase 6 は「OS の機能自体を完成させる」フェーズ。GUI 実用�
 
 **6-B. fd-ops 統一 (fd-ops-design.md Step 1〜24) — Phase 6 の本体**
 - Step 1: signal / thread-exit boundary の完了。restorer の SysV alignment、process-directed signal の owner-thread 配送契約 (Sway TERM を `escalated=1` → `exit 0` へ反転)、musl `__unmapself` バイト照合の暫定対処を kernel post-switch-unmap flag へ置換。
+  - **進捗 (2026-07-14, `ef39cbf`)**: restorer の alignment 修正は完了・green (静的検査 + handler 内 16 バイト境界退避 `ASYNC_SSE_STACK=OK` で実行時証明)。残る 2 件 (signal owner 配送 / active-stack unmap) は kernel 編集を要するが、**red 固定が新規発覚バグに阻まれている**ため申請を保留。
+  - **新規発覚バグ (Step 1 の前提条件)**: **fork した子プロセスで `pthread_create` が EAGAIN で失敗する** (`tests/run-lpr-qemu-fork-pthread-red.sh`)。親では成功し、同じ子での 128KiB `mmap` も成功するため、アドレス空間枯渇ではなく clone/THREAD_CREATE 経路の欠陥。musl が clone 失敗を一律 EAGAIN へ潰すため真の errno が guest から見えず、根因特定には LPR 側の診断出力経路が要る。疑い先は LPR `lpr_linux_clone_thread` のガード (`lpr_process/syscalls.c:253-`) か kernel `createThread` (`kernel/src/syscall/process.zig:339-`、特に `getUserSpace` が fork 子の principal を引けるか)。**fork 後にスレッドを使う Linux アプリを全滅させるため、Phase M6.3 のアプリ導入 (GTK/foot) にも直撃する。次 leg で最優先**。
+  - kernel 申請 dossier: `.temp-docs/step1-kernel-request.md` (red が揃うまで提出しない方針を明記)
 - Step 2〜5: 状態の一本化と名前空間分離。CLOEXEC/OFD flags の source of truth 一本化、typed native API と syscall return domain の正規化、backend handle/wait fd の common field 化、logical/native fd の完全分離 (fd<16 マジックの形式化、低 fd 再転送不能の根治)。
 - Step 6〜12: dispatch の vtable 統一。ops registry (kind 追加 = record 一個)、I/O・metadata・mmap・dup・close/exit・poll・epoll の kind cascade を全廃。nested epoll の 10ms quantum scan は Step 12 で消える。
 - Step 13〜18: service ABI v3 と owner lease。共通 lifecycle transaction、kernel channel peer-close semantics、filed/termd lease (強制終了 +4/周 の撤廃)、netd/drmd/inputd lease (強制終了 4 回 cap を撤廃し SIGKILL 20 連続で全 service handle baseline 復帰)、fork の prepare→confirm/rollback transaction 化。
