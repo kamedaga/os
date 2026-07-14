@@ -632,7 +632,20 @@ Phase 6 は「OS の機能自体を完成させる」フェーズ。GUI 実用�
 - 受け入れ: shader cache 有効での再現 red → 修正 → post-run fsck clean をゲートへ常設。kernel 原因に証拠が収束した場合のみ別途事前許可。
 - **結果**: 根因は kernel でも filed でもなく、`_kobox` の ext4 allocator/free が buffer-head・buddy 管理を迂回して bitmap / group descriptor / superblock を raw write していたこと。stale な buffer cache 像の dirty flush が割り当て bit を消去し (trace: inode 4077 の bit 23300 / block 219908 が 0x1f→0x0f で消え inode 4079 が再取得)、free 側は group free count 未更新。修正は `ext4_mb_mark_bb` / `ext4_free_blocks` への委譲 + buddy `NEED_INIT` + 事後検証。Mesa 非依存 fixture (cache DB と同型の syscall 列) と新スモーク `run-lpr-qemu-ext4-shader-cache-smoke.sh` (fresh disk + host fsck 必須) をバッテリーへ常設。修正前 red は first-frame 単独 148 inode / 最小 fixture 22 inode、修正後は新スモーク 3 連続 + 実 first-frame + ext4 回帰すべて fsck clean。ゲート: ホスト 6/6 + バッテリー v2 24/24 再試行ゼロ。
 
-**6-B. fd-ops 統一 (fd-ops-design.md Step 1〜24) — Phase 6 の本体**
+**スコープ方針の転換 (2026-07-14, ユーザー判断)**: `fd-ops-design.md` の 24 step グラウンドアップ書き換えは**過剰**と判断し、行進対象にしない。理由: 24 step の価値は偏っており、(a) 実証された欠陥 (red) と実測リークの修正は高価値だが、(b) Step 6〜12 の ops vtable 統一 (kind cascade → vtable) は「将来の綺麗さ」のための負債返済で、現 kind cascade は動作中 (Sway 稼働)・アプリ導入の前提ではない。exec v8 / generic capsule broker / weak-wait 等も同様に汎用性の作り込みで必須ではない。第 1 章と同じ**需要ドリブン**(症状が出た負債をその都度潰す)へ戻す。
+
+**新方針の実施内容**:
+- **実証バグは出たら直す**: red で実証された欠陥のみ。signal 配送 (`8b97a58`)・fork+pthread (`ac3943f`)・ext4 破損 (`86f15f1`) は済み。
+- **SIGKILL ハンドルリークの根治**: 耐久で実測した filed `+4/周`・drmd `+5/周` の ownerless handle を、owner lease/transfer ownership で回収する (fd-ops-design §5.1/§9 の lease 部分だけを的を絞って実装)。汎用 capsule broker や全 service v3 flag-day は伴わせない。
+- **アプリ導入 (旧 M6.3) へ早く進む**: fd の綺麗さを先に完成させず、foot/GTK 等を入れて実際にブロックされた fd 課題だけを反応的に直す。
+- **generic SCM_RIGHTS**: アプリが実際に要求したときだけ、必要な範囲で実装 (M5.6 の全面 generic 化はしない)。
+- `fd-ops-design.md` は**参照設計として温存**する (削除しない)。将来 vtable 統一が本当に必要になったとき (新 kind の頻繁追加、kind cascade 起因のバグ多発) に着手判断する。
+
+**Step 1 (signal 境界) は core 完了・commit 済み (`8b97a58`)。Step 2 (flags 一本化) は park**: codex が実装完了 (24 files、CLOEXEC/OFD status/rights/backend を common へ一本化、v7 wire 不変) したが、フル battery で **drm-prime + Sway レンダリング系 (first-frame / shm-client / input) が全滅** (dmabuf mirror = writable/token/size を common へ移した所が dmabuf/PRIME 経路を壊した)。予防的クリーンアップの dmabuf 回帰を追うより需要ドリブン優先で **park** (差分は `.temp-docs/step2-flags-unification.patch` と git stash に温存)。将来 flags 一本化を再開するなら dmabuf adapter の回帰修正込みで。**グルー削減・アプリ路線はクリーンな `8b97a58` ベースで進める**。
+
+以下の旧「6-B (Step 1〜24)」記述は参照設計への地図として残すが、実施順の拘束力は上記新方針が上書きする。
+
+**6-B. fd-ops 参照設計 (fd-ops-design.md Step 1〜24) — 北極星、行進対象ではない**
 - Step 1: signal / thread-exit boundary の完了。restorer の SysV alignment、process-directed signal の owner-thread 配送契約 (Sway TERM を `escalated=1` → `exit 0` へ反転)、musl `__unmapself` バイト照合の暫定対処を kernel post-switch-unmap flag へ置換。
   - **進捗 (2026-07-14, `ef39cbf`)**: restorer の alignment 修正は完了・green (静的検査 + handler 内 16 バイト境界退避 `ASYNC_SSE_STACK=OK` で実行時証明)。残る 2 件 (signal owner 配送 / active-stack unmap) は kernel 編集を要するが、**red 固定が下記 fork 子 pthread バグに阻まれていた**ため申請を保留していた。→ そのバグは `ac3943f` で修正済み。次 leg で退避中の 2 red (`.temp-docs/wip-step1-reds/`) を復活させて成立させる。
   - **前提バグ修正済み (2026-07-14, `ac3943f`)**: **fork した子で `pthread_create` が EAGAIN で失敗**していた欠陥を修正 (`tests/run-lpr-qemu-fork-pthread-smoke.sh`)。根因: `PACHA_PROCESS_CLONE_USER_FRAME` の子は Linux user frame へ直接復帰し `lpr_linux_clone_frame` の `ret==0` ブロックを実行せず、遅延後処理 `lpr_linux_apply_pending_fork_child` (`dup_pipe.c`) で pid/session/pipe を再設定するが、**thread state リセット (`lpr_thread_after_fork_child`) だけが `ret==0` 側にしか無く遅延経路から欠落**。子は親の `main_thread {started=1, tid=親}` を継承し `lpr_thread_ensure_current_record` が EINVAL→musl が EAGAIN にマスク (pid は再設定されるのに thread state が残る非対称が手がかりだった)。修正 = 遅延 hook に thread reset を追加 + 旧ブロックを同 hook へ集約。fork 後スレッドを使う Linux アプリ (GTK/foot、Phase M6.3) の前提。
@@ -672,3 +685,49 @@ Phase 6 は「OS の機能自体を完成させる」フェーズ。GUI 実用�
 また、そちらからも理由を含め2つ軽量なGUIアプリケーションを選び、実装を行ってください
 - **選定 (2026-07-11, Claude)**: ① **bemenu** — Wayland ネイティブの dmenu 系ランチャー (C、GTK 不要、依存極小)。実用面で WM の使い勝手に直結 (foot からコマンドを打たずにアプリ起動できる) し、技術面で wlr-layer-shell プロトコル (バー/オーバーレイ用 wlroots 拡張) を通す最初のアプリになり将来のステータスバー等の土台検証を兼ねる。② **swayimg** — 画像ビューア (純 Wayland C 製、GTK 不要)。素の wayland-client + wl_shm + xdg-shell + キー/マウス入力という「普通の GUI アプリ」の基本経路を実コンテンツで検証できる (foot はターミナル特化、gtk-demo は GTK 抽象越しのため)。screendump した画像を guest 内で開けるようになり開発ループも楽になる。
 味気なさ過ぎてwm感が全くないので、背景を変更するやつswaybg入れてもいいかも
+
+
+ここ移行は、re:refactor-plan mdを作成してここまでで分かった無理がある設計、汚い境界、fdなどをリファクタリングしていきますが、計画は固く固めすぎず、
+```
+### Phase 1 — kernel
+
+**T1.1 [kernel] VM object の参照 drop と revoke の分離 (現行 FD モデルでの完成)** ※挙動変更
+- 補足 (2026-07-09 調査): 旧 `revokeVmObjectCapTree` は FD-based 再設計で消滅し、fd 層は per-fd refcount (`closeFd` は自 entry のみ解放、transfer copy は retain) になっている。本タスクはこの分離を全経路で完成させる。ユーザーにより kernel 編集は許可済み。
+- **参照経路の監査と修正**: fd entry / VMA マッピング (mmap 中の VMO) / IPC 転送中メッセージ / fork・COW / プロセス終了 cleanup / exec による address space 置換、の各経路が「自分の retain を持ち、drop は自分の参照だけを落とす」ことを監査。drop が他保持者の backing を壊す経路、または retain 漏れ・release 漏れ (リーク) を修正する。
+- **明示 revoke の新設**: `vmo_revoke` 相当を新設。所有サービス (filed 等) が配布済み VMO を無効化できる (全 fd table / VMA から該当 object を除去し、以後の使用はエラー、backing を回収)。revoke 権限は fd rights で制御。プロセス終了時の自プロセス cleanup は従来通り。
+- **kernel unit test**: `tests/kernel_state.zig` 系に retain/release 不変条件のテストを追加 (任意順の close で他保持者が壊れない / refcount 0 で free list に全ページが戻る / 二重 close 安全 / revoke 後の全保持者無効化)。
+- 受け入れ: kernel unit test (`zig build test`) + QEMU スモーク 3 本通過。fork/exec 反復のリーク耐久スモーク (chibicc サイクル) は T4.5 で clang 版と併せて導入する。
+
+**T1.2 [kernel] kernel.zig の分割** ※挙動変更なし
+- `KernelState` のフィールドとメソッドをドメインごとに移動: `state/process.zig`, `state/fd.zig`, `state/vmo.zig`, `state/vma.zig`, `state/pipe.zig`, `state/ipc.zig`。kernel.zig は合成と初期化のみ (目安 1,000 行以下)。
+- 固定配列 + `_extra` slice の二段容量パターンを、既存 `initRuntimeStorage` 上の共通ヘルパ 1 つに統一。
+- 受け入れ: `zig build efi` 成功、`tests/kernel_state.zig` と全スモーク通過。diff は移動が主で意味変更なしをレビューで確認できる粒度に分割コミット。
+
+**T1.3 [kernel] scheduler_connection.zig の状態集約** ※挙動変更なし
+- module-level var 群を `SchedulerState` 構造体 1 つに集約し、lock との対応 (どの lock が何を守るか) をフィールドのグルーピングで表現。
+- metric / log mask 群 (`*_log_mask` 6 変数, metric slots) を削除し T0.1 のトレース基盤へ。
+- 受け入れ: SMP 起動 + 全スモーク通過。schedulerd 経路の動作確認。
+
+**T1.4 [kernel] 間接層・死に経路の削除** ※挙動変更なし
+- `traps.zig` の `Hooks` 関数ポインタを直接呼び出しに。
+- IPC fast path の 3 backend (normal / shared VMO ring / pkey ring) の実使用を計測し、使われていない backend と fallback reason 機構を削除して 1 経路 (+normal fallback) に絞る。
+- 受け入れ: 全スモーク通過 + ベンチ (`hikitugi.md` の batch 系) が悪化しない。
+
+### Phase 2 — filed
+
+**T2.1 dispatch.c の分割** ※挙動変更なし
+- `src/dispatch/transport.c` (IPC loop, session, generation publish) / `src/dispatch/ops_*.c` (op ハンドラ) / `src/cache/` / metrics(T0.1 へ) に分割。file-scope static を全部 `filed_runtime_t` へ移し、グローバル状態をゼロに。
+- 受け入れ: `filed/tests/vfs_test.c` と全スモーク通過。各 .c は 1,500 行以下。
+
+**T2.2 キャッシュ一本化** ※挙動変更あり(内部)
+- page / dir / negative-lookup / file-VMO の 4 キャッシュを、backend_object をキーとする単一の `filed_cache` モジュールに統合。無効化 API は `filed_cache_invalidate(object)` 1 つ。dirty 管理・flush も同モジュールへ。
+- 受け入れ: ext4 永続化スモーク (`run-lpr-qemu-ext4-sync-persistence.sh`) 通過。書き込み→再起動→読み出しの一致。ベンチ非劣化。
+
+**T2.3 exec 境界の契約明文化 (filed↔personality)**
+- 改訂 (2026-07-09, ユーザー指摘): ビルダーを personality へ移すと、freestanding な runtime 動的ライブラリとサーバ側ビルダーが同居して逆に複雑化する。exec ビルダーは filed に残す。zpoline/LPR の知識が `filed/src/exec/linux_lpr/` 内に収まっていること自体は問題ではない。
+- 問題は境界の契約が暗黙な点: filed が runtime 内部ヘッダ `personality/zpoline.h` を直接 include しており、レイアウト合意が「同じヘッダを見ている」ことでしか担保されない。
+- 対処: zpoline トランポリン/イメージレイアウト定数・entry/bootstrap プロトコルだけを共有 ABI ヘッダ (`personality/include/personality/lpr_image_abi.h`、定数のみ・コードなし、`lpr_client_abi.h` と同パターン) に抽出。filed と LPR runtime の両方がこれを見る。filed から `zpoline.h` include を排除。
+- 契約バージョン定数を bootstrap ページに埋め、LPR runtime 起動時に検証 (不一致は即エラー) — レイアウトドリフトを起動時に検出可能に。
+- 受け入れ: execve スモーク通過。`execve_to_child_start` ベンチ非劣化。filed から personality の runtime 内部ヘッダへの include が 0 件。
+```
+ぐらいの温度感でやります
