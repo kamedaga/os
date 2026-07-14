@@ -98,6 +98,12 @@ void lpr_thread_after_fork_child(void)
 {
     lpr_memset(&lpr_state.threads, 0, sizeof(lpr_state.threads));
     __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
+    /* The child inherits the parent's "signal runtime already registered" flag,
+     * which would otherwise skip re-registration and leave the child with no
+     * kernel signal-owner thread (process-directed signals would then fall back
+     * to whichever thread blocks first).  Clear it so the child's main thread
+     * re-registers and reclaims signal ownership on its next syscall. */
+    lpr_linux_signal_runtime_registered = 0;
 }
 
 int64_t lpr_linux_gettid(void)

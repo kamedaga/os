@@ -122,6 +122,7 @@ pub const ThreadContext = struct {
     signal_entry: u64 = 0,
     signal_inhibit_start: u64 = 0,
     signal_inhibit_end: u64 = 0,
+    signal_owner: bool = false,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
@@ -1727,6 +1728,10 @@ fn initializeThreadContextWithReadyState(
     ctx.signal_entry = 0;
     ctx.signal_inhibit_start = 0;
     ctx.signal_inhibit_end = 0;
+    // A newly created thread inherits the runtime signal trampoline from a
+    // sibling but is never the process signal owner; only an explicit REGISTER
+    // (the main/event-loop thread) claims ownership.
+    ctx.signal_owner = false;
     var inherit_index: usize = 0;
     while (inherit_index < scheduler_state.thread_table.contexts.len) : (inherit_index += 1) {
         if (inherit_index == thread_index) continue;
@@ -2254,40 +2259,44 @@ pub fn wakeBlockedThread(principal: kernel.PrincipalId) void {
 
 pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {
     if (signo == 0) return false;
+    scheduler_state.thread_table.lock();
+    // Select the delivery target under the table lock so the pending signal is
+    // published before any wake.  Prefer the registered signal owner (the
+    // process's main/event-loop thread); a process-directed signal must not be
+    // consumed by an arbitrary worker that happens to block first.  Fall back to
+    // any runnable/blocked thread only when no owner has registered.
+    var owner_index: ?usize = null;
+    var first_blocked: ?usize = null;
     var first_ready: ?usize = null;
     var i: usize = 0;
     while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
-        const hot = getThreadHotStateConst(i) orelse continue;
-        if (hot.allocated == 0 or hot.owner_process != principal) continue;
-        if (hot.stopped != 0) continue;
-        if (hot.ready == 0) {
-            scheduler_state.thread_table.lock();
-            const ctx = threadContextMutable(i) orelse {
-                scheduler_state.thread_table.unlock();
-                return false;
-            };
-            if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) {
-                scheduler_state.thread_table.unlock();
-                return false;
-            }
-            ctx.pending_signal = signo;
-            setThreadHotPendingSignal(i, signo);
-            scheduler_state.thread_table.unlock();
-            wakeIfWaiting(i);
-            return true;
+        const ctx = threadContext(i) orelse continue;
+        if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) continue;
+        if (ctx.signal_owner and owner_index == null) owner_index = i;
+        if (!ctx.ready) {
+            if (first_blocked == null) first_blocked = i;
+        } else if (first_ready == null) {
+            first_ready = i;
         }
-        if (first_ready == null) first_ready = i;
     }
-    if (first_ready) |thread_index| {
-        scheduler_state.thread_table.lock();
-        defer scheduler_state.thread_table.unlock();
-        const ctx = threadContextMutable(thread_index) orelse return false;
-        if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) return false;
-        ctx.pending_signal = signo;
-        setThreadHotPendingSignal(thread_index, signo);
-        return true;
+    const target = owner_index orelse first_blocked orelse first_ready orelse {
+        scheduler_state.thread_table.unlock();
+        return false;
+    };
+    const ctx = threadContextMutable(target) orelse {
+        scheduler_state.thread_table.unlock();
+        return false;
+    };
+    if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) {
+        scheduler_state.thread_table.unlock();
+        return false;
     }
-    return false;
+    const was_blocked = !ctx.ready;
+    ctx.pending_signal = signo;
+    setThreadHotPendingSignal(target, signo);
+    scheduler_state.thread_table.unlock();
+    if (was_blocked) wakeIfWaiting(target);
+    return true;
 }
 
 pub const ClaimedSignal = struct {
@@ -2304,6 +2313,10 @@ pub fn configureCurrentSignalDelivery(entry: u64, inhibit_start: u64, inhibit_en
     ctx.signal_entry = entry;
     ctx.signal_inhibit_start = inhibit_start;
     ctx.signal_inhibit_end = inhibit_end;
+    // The thread that registers the runtime signal trampoline is the process's
+    // signal owner (the main/event-loop thread).  Process-directed signals are
+    // delivered here so teardown runs on the loop that can service them.
+    ctx.signal_owner = true;
     return true;
 }
 
@@ -2316,6 +2329,8 @@ pub fn copySignalDeliveryConfig(source_thread: usize, target_thread: usize) bool
     target.signal_entry = source.signal_entry;
     target.signal_inhibit_start = source.signal_inhibit_start;
     target.signal_inhibit_end = source.signal_inhibit_end;
+    // Inheriting the trampoline does not transfer signal ownership.
+    target.signal_owner = false;
     return true;
 }
 
