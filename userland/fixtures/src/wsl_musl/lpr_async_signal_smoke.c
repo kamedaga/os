@@ -11,8 +11,11 @@
 
 static volatile sig_atomic_t handled;
 static volatile sig_atomic_t altstack_ok;
+static volatile sig_atomic_t sse_stack_ok;
 static unsigned char alternate_stack[SIGSTKSZ * 2];
 static int terminate_event_fd = -1;
+
+typedef float aligned_vec4_t __attribute__((vector_size(16)));
 
 static void write_marker(const char *text)
 {
@@ -22,6 +25,17 @@ static void write_marker(const char *text)
 static void sigint_handler(int signo)
 {
     if (signo == SIGINT) {
+        aligned_vec4_t spill __attribute__((aligned(16)));
+        const aligned_vec4_t value = { 1.0f, 2.0f, 4.0f, 8.0f };
+        __asm__ volatile("movaps %1, %0" : "=m"(spill) : "x"(value) : "memory");
+        if (spill[0] == 1.0f && spill[1] == 2.0f &&
+            spill[2] == 4.0f && spill[3] == 8.0f)
+        {
+            sse_stack_ok = 1;
+            write_marker("ASYNC_SSE_STACK=OK\n");
+        } else {
+            write_marker("ASYNC_SSE_STACK=BAD\n");
+        }
         handled = 1;
         write_marker("ASYNC_HANDLER_CALLED\n");
     }
@@ -118,6 +132,9 @@ static int run_handler(void)
     write_marker("ASYNC_HANDLER_READY\n");
     while (!handled) {
         __asm__ volatile("pause" ::: "memory");
+    }
+    if (!sse_stack_ok) {
+        return 11;
     }
     write_marker("ASYNC_HANDLER_CONTINUED\n");
     return 0;

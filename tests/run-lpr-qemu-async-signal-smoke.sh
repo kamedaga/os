@@ -20,6 +20,7 @@ fi
   --expect 'ASYNC_SIGINT_DEFAULT=OK' \
   --expect 'ASYNC_SIGKILL=OK' \
   --expect 'ASYNC_BUSYBOX_TIMEOUT=OK' \
+  --expect 'ASYNC_SSE_STACK=OK' \
   --expect 'ASYNC_HANDLER_CALLED' \
   --expect 'ASYNC_HANDLER_CONTINUED' \
   --expect 'ASYNC_CUSTOM_HANDLER=OK' \

@@ -92,7 +92,6 @@ lpr_async_signal_entry:
 lpr_async_signal_restorer:
     mov %rsp, %rdi
     and $-16, %rsp
-    sub $8, %rsp
     call lpr_linux_rt_sigreturn_body
     ud2
 .size lpr_async_signal_restorer, .-lpr_async_signal_restorer

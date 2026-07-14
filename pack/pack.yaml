@@ -914,6 +914,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_async_signal_smoke.c"
     out: "LPRASIG.ELF"
     rootfs: "/cmd/lpr_async_signal_smoke.elf"
+  lpr_fork_pthread_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_fork_pthread_probe.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_fork_pthread_probe", "userland/fixtures/src/wsl_musl/lpr_fork_pthread_probe.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_fork_pthread_probe.c"
+    out: "FORKPTHR.ELF"
+    rootfs: "/cmd/lpr_fork_pthread_probe.elf"
   lpr_evdev_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_evdev_smoke.static.elf"
