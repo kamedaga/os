@@ -4,6 +4,8 @@
  * Case B: a plain fork child creates a thread.
  * Case C: a fork child creates a thread after a sibling process was killed
  *         and reaped (the sequence used by the signal-owner red fixture).
+ * Case D: a fork child creates a thread while another thread remains live in
+ *         the parent; only the calling thread may exist in the child.
  */
 #define _GNU_SOURCE
 #include <pthread.h>
@@ -16,6 +18,24 @@
 static void *noop_thread(void *argument)
 {
     (void)argument;
+    return 0;
+}
+
+static pthread_mutex_t live_worker_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t live_worker_cond = PTHREAD_COND_INITIALIZER;
+static int live_worker_ready;
+static int live_worker_stop;
+
+static void *live_worker(void *argument)
+{
+    (void)argument;
+    (void)pthread_mutex_lock(&live_worker_mutex);
+    live_worker_ready = 1;
+    (void)pthread_cond_broadcast(&live_worker_cond);
+    while (!live_worker_stop) {
+        (void)pthread_cond_wait(&live_worker_cond, &live_worker_mutex);
+    }
+    (void)pthread_mutex_unlock(&live_worker_mutex);
     return 0;
 }
 
@@ -62,6 +82,31 @@ int main(void)
     (void)kill(holder, SIGKILL);
     (void)waitpid(holder, &status, 0);
     (void)waitpid(child, &status, 0);
+
+    pthread_t worker;
+    const int worker_status = pthread_create(&worker, 0, live_worker, 0);
+    if (worker_status != 0) {
+        report("CHILD_LIVE_WORKER", worker_status);
+    } else {
+        (void)pthread_mutex_lock(&live_worker_mutex);
+        while (!live_worker_ready) {
+            (void)pthread_cond_wait(&live_worker_cond, &live_worker_mutex);
+        }
+        (void)pthread_mutex_unlock(&live_worker_mutex);
+
+        const pid_t multithreaded = fork();
+        if (multithreaded == 0) {
+            report("CHILD_LIVE_WORKER", create_and_join());
+            _exit(0);
+        }
+        (void)waitpid(multithreaded, &status, 0);
+
+        (void)pthread_mutex_lock(&live_worker_mutex);
+        live_worker_stop = 1;
+        (void)pthread_cond_broadcast(&live_worker_cond);
+        (void)pthread_mutex_unlock(&live_worker_mutex);
+        (void)pthread_join(worker, 0);
+    }
 
     (void)write(STDOUT_FILENO, "FORK_PTHREAD_DONE\n", 18);
     return 0;

@@ -94,7 +94,7 @@ static void lpr_thread_count_start_failed(void)
     (void)__atomic_sub_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
 }
 
-static void lpr_thread_after_fork_child(void)
+void lpr_thread_after_fork_child(void)
 {
     lpr_memset(&lpr_state.threads, 0, sizeof(lpr_state.threads));
     __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
@@ -451,28 +451,7 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
     if (ret == 0) {
         lpr_trace_process_event("clone_child", flags, child_stack, 0);
-        lpr_linux_process_state_checked = 1;
-        lpr_linux_current_pid = lpr_linux_pending_child_pid;
-        lpr_linux_current_ppid = lpr_linux_pending_child_ppid;
-        lpr_linux_current_sid = lpr_linux_pending_child_sid;
-        lpr_linux_current_pgrp = lpr_linux_pending_child_pgrp;
-        if (lpr_supervisor_pending_child_token != 0) {
-            lpr_supervisor_token = lpr_supervisor_pending_child_token;
-            lpr_supervisor_enabled = 1;
-            (void)lpr_supervisor_call_token(
-                LPRS_OP_PROCESS_FORK_CHILD_READY,
-                lpr_supervisor_token,
-                -1,
-                0);
-        }
-        lpr_linux_pending_child_pid = 0;
-        lpr_linux_pending_child_ppid = 0;
-        lpr_linux_pending_child_sid = 0;
-        lpr_linux_pending_child_pgrp = 0;
-        lpr_supervisor_pending_child_token = 0;
-        lpr_linux_process_clear_children();
-        lpr_thread_after_fork_child();
-        lpr_pipe_after_fork_child();
+        lpr_linux_apply_pending_fork_child();
         return 0;
     }
     if (ret >= 16) {

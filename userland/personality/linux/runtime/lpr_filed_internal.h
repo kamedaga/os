@@ -933,6 +933,7 @@ void lpr_filed_session_drop(void);
 void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id);
 void lpr_fill_termd_signal_state(uint64_t *signal_mask, uint64_t *signal_ignored);
 void lpr_linux_apply_pending_fork_child(void);
+void lpr_thread_after_fork_child(void);
 void lpr_linux_ensure_default_stdio(void);
 void lpr_linux_exit_for_signal(uint32_t sig);
 void lpr_linux_prepare_process_exit(uint64_t exit_code);
