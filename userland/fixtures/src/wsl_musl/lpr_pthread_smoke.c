@@ -1,6 +1,8 @@
+#define _POSIX_C_SOURCE 200809L
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
@@ -17,6 +19,7 @@ static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 static int cond_ready;
 static int cond_go;
 static int cond_observed;
+static int detached_done;
 
 static void emit(const char *message)
 {
@@ -132,6 +135,41 @@ static int cond_smoke(void)
         result == 0 && cond_observed == 1;
 }
 
+static void *detached_worker(void *argument)
+{
+    (void)argument;
+    __atomic_store_n(&detached_done, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static int detached_exit_smoke(void)
+{
+    const struct timespec poll_delay = { .tv_nsec = 1000000 };
+    const struct timespec settle_delay = { .tv_nsec = 100000000 };
+    pthread_attr_t attr;
+    pthread_t thread;
+    detached_done = 0;
+    if (pthread_attr_init(&attr) != 0 ||
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0 ||
+        pthread_create(&thread, &attr, detached_worker, 0) != 0)
+    {
+        (void)pthread_attr_destroy(&attr);
+        return 0;
+    }
+    (void)pthread_attr_destroy(&attr);
+    for (int tick = 0; tick < 1000; ++tick) {
+        if (__atomic_load_n(&detached_done, __ATOMIC_ACQUIRE) != 0) {
+            /* The worker sets the flag immediately before musl's detached
+             * __unmapself path.  Keep this process alive long enough for that
+             * path to finish and expose a self-unmap teardown fault. */
+            (void)nanosleep(&settle_delay, 0);
+            return 1;
+        }
+        (void)nanosleep(&poll_delay, 0);
+    }
+    return 0;
+}
+
 int main(void)
 {
     emit("LPR_PTHREAD_START\n");
@@ -150,5 +188,10 @@ int main(void)
         return 3;
     }
     emit("LPR_PTHREAD_COND=OK\n");
+    if (!detached_exit_smoke()) {
+        emit("LPR_PTHREAD_DETACHED_EXIT=BAD\n");
+        return 4;
+    }
+    emit("LPR_PTHREAD_DETACHED_EXIT=OK\n");
     return 0;
 }

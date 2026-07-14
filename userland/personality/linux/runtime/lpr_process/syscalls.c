@@ -17,6 +17,14 @@ enum {
 
 _Static_assert(sizeof(lpr_thread_record_t) == 64u, "thread launch record size");
 
+/* Linux musl's x86_64 __unmapself switches directly from SYS_munmap to
+ * SYS_exit without touching its former stack.  LPR's zpoline dispatch needs
+ * an equivalent stack outside the mapping being removed.  Serializing it is
+ * sufficient because THREAD_EXIT clears and wakes the lock only after the
+ * exiting thread can no longer execute on this stack. */
+static volatile uint32_t lpr_unmapself_lock;
+static unsigned char lpr_unmapself_stack[4096] __attribute__((aligned(16)));
+
 static void lpr_thread_record_add(lpr_thread_record_t *record)
 {
     lpr_state_lock(&lpr_state.threads.lock_word);
@@ -157,6 +165,49 @@ void lpr_linux_exit_thread(uint64_t code)
         clear_tid != 0 ? PACHAOS_THREAD_EXIT_CLEAR_TID : 0u);
     for (;;) {
     }
+}
+
+void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
+{
+    lpr_state_lock(&lpr_unmapself_lock);
+
+    const int64_t raw_tid = lpr_linux_gettid();
+    int last_thread = 0;
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    lpr_thread_record_t *record = raw_tid >= 0 && raw_tid <= UINT32_MAX ?
+        lpr_thread_record_find((uint32_t)raw_tid) : 0;
+    if (record != 0) {
+        last_thread = lpr_thread_record_remove(record);
+        (void)__atomic_sub_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
+    }
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+
+    if (last_thread) {
+        lpr_linux_prepare_process_exit(0);
+    }
+
+    register uint64_t syscall_number __asm__("rax") = PACHAOS_SYSCALL_MUNMAP;
+    register uint64_t arg0 __asm__("rdi") = base;
+    register uint64_t arg1 __asm__("rsi") = size;
+    register uint64_t lock_address __asm__("r8") =
+        (uint64_t)(uintptr_t)&lpr_unmapself_lock;
+    register uint64_t stack_top __asm__("r9") =
+        (uint64_t)(uintptr_t)(lpr_unmapself_stack + sizeof(lpr_unmapself_stack));
+    __asm__ volatile(
+        "mov %%r9, %%rsp\n\t"
+        "syscall\n\t"
+        "mov %[thread_exit], %%rax\n\t"
+        "xor %%rdi, %%rdi\n\t"
+        "mov %%r8, %%rsi\n\t"
+        "mov %[clear_tid], %%rdx\n\t"
+        "syscall\n\t"
+        "ud2"
+        : "+a"(syscall_number), "+D"(arg0), "+S"(arg1),
+          "+r"(lock_address), "+r"(stack_top)
+        : [thread_exit] "i"(PACHAOS_SYSCALL_THREAD_EXIT),
+          [clear_tid] "i"(PACHAOS_THREAD_EXIT_CLEAR_TID)
+        : "rcx", "rdx", "r11", "memory");
+    __builtin_unreachable();
 }
 
 void lpr_linux_exit_group(uint64_t code)

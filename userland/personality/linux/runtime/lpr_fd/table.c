@@ -52,10 +52,15 @@ void lpr_fd_table_lock(lpr_fd_table_t *table)
 
 void lpr_fd_table_unlock(lpr_fd_table_t *table)
 {
-    if (!lpr_fd_table_lock_enabled(table)) {
+    if (table == 0) {
         return;
     }
-    __atomic_store_n(&table->lock.word, 0u, __ATOMIC_RELEASE);
+    /* A peer can exit while this lock is held, taking thread_count from two
+     * to one.  Unlock must still clear the word acquired on the multithreaded
+     * path or a later thread creation observes a permanently locked table. */
+    if (__atomic_exchange_n(&table->lock.word, 0u, __ATOMIC_RELEASE) == 0u) {
+        return;
+    }
     if (table->lock.futex_wake != 0) {
         table->lock.futex_wake(&table->lock.word, 1u);
     }

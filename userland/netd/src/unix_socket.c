@@ -1,12 +1,14 @@
 #include "unix_socket.h"
 #include "libuinet_backend.h"
 #include "pacha/ipc.h"
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
 #define NETD_UNIX_HANDLE_BIT (1ull << 63)
 #define NETD_UNIX_MAX 32u
 #define NETD_UNIX_RX 16384u
+#define NETD_MSG_PEEK 0x0002u
 
 typedef struct netd_unix_socket_state {
     uint64_t handle;
@@ -51,6 +53,23 @@ static netd_unix_socket_state_t *find_socket(uint64_t handle) {
     return NULL;
 }
 
+static void reap_orphaned_sockets(void) {
+    for (unsigned i = 0; i < NETD_UNIX_MAX; i++) {
+        netd_unix_socket_state_t *s = &sockets[i];
+        if (s->handle == 0 || s->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = s->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle = s->handle;
+        force_destroy_socket(s);
+        printf("[netd] unix_orphan_reap handle=%llu\n",
+               (unsigned long long)handle);
+    }
+}
+
 static netd_unix_socket_state_t *alloc_socket(void) {
     for (unsigned i = 0; i < NETD_UNIX_MAX; i++) if (sockets[i].handle == 0) {
         memset(&sockets[i], 0, sizeof(sockets[i]));
@@ -63,6 +82,7 @@ static netd_unix_socket_state_t *alloc_socket(void) {
 
 int netd_unix_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint64_t *out_handle) {
     if (out_handle == NULL || type != NETD_SOCK_STREAM || protocol != 0 || notify_fd < 16) return -94;
+    reap_orphaned_sockets();
     netd_unix_socket_state_t *s = alloc_socket();
     if (s == NULL) return -24;
     s->type = (uint32_t)type;
@@ -179,6 +199,11 @@ int netd_unix_socket_recv(netd_io_t *req, size_t capacity, int *out_wait_fd, siz
     if (s == NULL) return -9;
     if (s->rx_len == 0) return s->peer_closed ? 0 : -11;
     size_t n = capacity < s->rx_len ? capacity : s->rx_len;
+    if ((req->flags & NETD_MSG_PEEK) != 0) {
+        memcpy(req->data, s->rx, n);
+        *out_received = n;
+        return 0;
+    }
     const int deliver_fd = s->fd_kind != 0 && s->fd_offset < n;
     memcpy(req->data, s->rx, n);
     memmove(s->rx, s->rx + n, s->rx_len - n);
@@ -235,6 +260,19 @@ int netd_unix_socket_close(uint64_t handle) {
         s->refs--;
         return 0;
     }
+    char path[sizeof(s->path)];
+    memcpy(path, s->path, sizeof(path));
+    path[sizeof(path) - 1] = 0;
     force_destroy_socket(s);
+    unsigned active = 0;
+    unsigned refs = 0;
+    for (unsigned i = 0; i < NETD_UNIX_MAX; i++) {
+        if (sockets[i].handle == 0) continue;
+        active++;
+        refs += sockets[i].refs;
+    }
+    printf("[netd] unix_close path=%s active=%u refs=%u\n",
+           path[0] != 0 ? path : "-", active, refs);
+    fflush(stdout);
     return 0;
 }

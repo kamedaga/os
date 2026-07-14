@@ -1110,15 +1110,23 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
         return flush_status;
     }
     const int backend_status = filed_kobox_backend_sync_all(&runtime->backend);
+    uint32_t active_handles = 0;
+    uint32_t active_sessions = 0;
+    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i)
+        active_handles += runtime->vfs.handles[i].active ? 1u : 0u;
+    for (uint32_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i)
+        active_sessions += runtime->sessions[i].active ? 1u : 0u;
     filed_kobox_object_stats_t object_stats;
     memset(&object_stats, 0, sizeof(object_stats));
     const int object_stats_status =
         filed_kobox_backend_object_stats(&runtime->backend, &object_stats);
     printf(
-        "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu backend_status=%d\n",
+        "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu backend_status=%d active_handles=%u active_sessions=%u\n",
         (unsigned long long)dirty_count,
         (unsigned long long)backend_dirty_hint,
-        backend_status);
+        backend_status,
+        active_handles,
+        active_sessions);
     if (object_stats_status == 0) {
         printf(
             "[filed] kobox_objects used=%u referenced=%u cached=%u capacity=%u evictions=%llu\n",
@@ -1130,6 +1138,22 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
     }
     fflush(stdout);
     return backend_status;
+}
+
+void filed_dispatch_log_state_checkpoint(filed_runtime_t *runtime, const char *source)
+{
+    if (runtime == NULL || source == NULL) {
+        return;
+    }
+    uint32_t active_handles = 0;
+    uint32_t active_sessions = 0;
+    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i)
+        active_handles += runtime->vfs.handles[i].active ? 1u : 0u;
+    for (uint32_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i)
+        active_sessions += runtime->sessions[i].active ? 1u : 0u;
+    printf("[filed] state_checkpoint source=%s active_handles=%u active_sessions=%u\n",
+           source, active_handles, active_sessions);
+    fflush(stdout);
 }
 
 filed_page_dispatch_result_t filed_dispatch_truncate_page(

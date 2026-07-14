@@ -17,6 +17,7 @@ fi
   --expect 'LPR_PTHREAD_CREATE_JOIN=OK' \
   --expect 'LPR_PTHREAD_MUTEX=OK' \
   --expect 'LPR_PTHREAD_COND=OK' \
+  --expect 'LPR_PTHREAD_DETACHED_EXIT=OK' \
   --expect 'LPR_PTHREAD_STATIC=OK' \
   --expect 'LPR_PTHREAD_DYNAMIC=OK' \
   --expect 'LPR_PTHREAD_DONE'

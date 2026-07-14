@@ -35,6 +35,7 @@ static wl_fixed_t pointer_y;
 static wl_fixed_t pointer_dx;
 static wl_fixed_t pointer_dy;
 static char seat_name[32] = "unknown";
+static const char *m58_iteration;
 
 static void maybe_input_ready(void) {
     if (!input_mode || input_ready || !surface_ready || !keymap_ready ||
@@ -43,6 +44,9 @@ static void maybe_input_ready(void) {
     pointer_dx = 0;
     pointer_dy = 0;
     printf("M57_INPUT_READY seat=%s keyboard=1 pointer=1\n", seat_name);
+    if (m58_iteration != NULL)
+        printf("M58_INPUT_READY iteration=%s seat=%s keyboard=1 pointer=1\n",
+               m58_iteration, seat_name);
     fflush(stdout);
 }
 
@@ -53,6 +57,9 @@ static void maybe_input_finished(void) {
         dx != 7 || dy != -4 || !button_down || !button_up) return;
     input_finished = 1;
     printf("M57_INPUT_PASS key=30/1/0 motion=7,-4 button=272/1/0\n");
+    if (m58_iteration != NULL)
+        printf("M58_INPUT_PASS iteration=%s key=30/1/0 motion=7,-4 button=272/1/0\n",
+               m58_iteration);
     fflush(stdout);
 }
 
@@ -307,6 +314,8 @@ static const struct wl_seat_listener seat_listener = {
 
 int main(void) {
     input_mode = getenv("M57_INPUT") != NULL;
+    m58_iteration = getenv("M58_ITERATION");
+    if (m58_iteration != NULL && m58_iteration[0] == '\0') m58_iteration = NULL;
     struct wl_display *display = NULL;
     char display_name[32];
     for (int index = 0; index < 10 && display == NULL; ++index) {
@@ -390,6 +399,9 @@ int main(void) {
     usleep(500000);
     printf("M51_WL_SURFACE_COMMIT_OK color=#336699 size=%dx%d\n", width, height);
     printf("M56_WL_SURFACE_READY color=#336699 size=%dx%d\n", width, height);
+    if (m58_iteration != NULL)
+        printf("M58_WL_SURFACE_READY iteration=%s color=#336699 size=%dx%d\n",
+               m58_iteration, width, height);
     fflush(stdout);
     surface_ready = 1;
     maybe_input_ready();

@@ -79,8 +79,11 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_page_result(-95, 0);
     case FILED_OP_VFS_CLOSE:
         return filed_dispatch_close_page(runtime, request);
-    case FILED_OP_VFS_SYNC_ALL:
-        return filed_page_result(filed_dispatch_sync_all(runtime), 0);
+    case FILED_OP_VFS_SYNC_ALL: {
+        const int status = filed_dispatch_sync_all(runtime);
+        filed_dispatch_log_state_checkpoint(runtime, "client_sync");
+        return filed_page_result(status, 0);
+    }
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
     case FILED_OP_SERVICE_SET_DRMD_DRM:
@@ -738,6 +741,7 @@ static filed_route_result_t filed_dispatch_client_vfs(
         break;
     case FILED_OP_VFS_SYNC_ALL:
         route.status = filed_dispatch_sync_all(runtime);
+        filed_dispatch_log_state_checkpoint(runtime, "client_sync");
         break;
     default:
         route.status = -95;

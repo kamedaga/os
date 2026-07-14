@@ -637,6 +637,24 @@ int64_t lpr_linux_socket_close(uint64_t fd)
     return status;
 }
 
+void lpr_socket_prepare_process_exit(void)
+{
+    lpr_fd_arrays_init();
+    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; ++index) {
+        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
+        if (!object->active || object->kind != LPR_FD_TABLE_KIND_SOCKET ||
+            object->payload.socket.handle == 0) continue;
+        const uint64_t handle = object->payload.socket.handle;
+        const int native_wait_fd = object->payload.socket.native_wait_fd;
+        object->payload.socket.handle = 0;
+        object->payload.socket.native_wait_fd = -1;
+        object->backend_id = 0;
+        if (native_wait_fd >= 16)
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
+    }
+}
+
 int lpr_socket_prepare_fork(void)
 {
     lpr_fd_arrays_init();
@@ -1608,6 +1626,29 @@ int64_t lpr_linux_socket_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         } else {
             lpr_socket_payload(fd)->flags &= ~LPR_LINUX_O_NONBLOCK;
         }
+        return 0;
+    }
+    if (request == LPR_LINUX_FIONREAD) {
+        if (arg == 0) {
+            return -LPR_LINUX_EFAULT;
+        }
+        void *page = 0;
+        const int page_fd = lpr_netd_create_page(&page);
+        if (page_fd < 0) {
+            return page_fd;
+        }
+        lpr_memset(page, 0, NETD_PAGE_BYTES);
+        netd_io_t *req = (netd_io_t *)page;
+        req->handle = lpr_socket_payload(fd)->handle;
+        req->length = NETD_IO_BYTES;
+        req->flags = LPR_LINUX_MSG_PEEK | LPR_LINUX_MSG_DONTWAIT;
+        uint64_t received = 0;
+        const int64_t status = lpr_netd_call(NETD_OP_RECV, page_fd, 0, &received);
+        lpr_netd_destroy_page(page_fd, page);
+        if (status != 0 && status != -LPR_LINUX_EAGAIN) {
+            return status;
+        }
+        *(int *)(uintptr_t)arg = status == 0 ? (int)received : 0;
         return 0;
     }
     return -LPR_LINUX_ENOTTY;

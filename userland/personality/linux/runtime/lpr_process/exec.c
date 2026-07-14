@@ -519,6 +519,7 @@ void lpr_close_local_state_before_self_exec(void)
 void lpr_linux_prepare_process_exit(uint64_t exit_code)
 {
     lpr_trace_process_event("exit_prepare", exit_code, 0, 0);
+    lpr_socket_prepare_process_exit();
     lpr_fd_arrays_init();
     for (uint32_t index = 0; index < lpr_control_fd_table.file_count; index += 1) {
         lpr_fd_object_t *object = &lpr_control_fd_table.files[index];

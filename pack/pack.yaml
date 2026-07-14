@@ -178,6 +178,11 @@ apps:
       path: "tests/fixtures/sway_input.sh"
     out: "SWAYM57.SH"
     rootfs: "/cmd/sway_input.sh"
+  sway_endurance_script:
+    file:
+      path: "tests/fixtures/sway_endurance.sh"
+    out: "SWAYM58.SH"
+    rootfs: "/cmd/sway_endurance.sh"
   sway_socket_repeat_script:
     file:
       path: "tests/fixtures/sway_socket_repeat.sh"

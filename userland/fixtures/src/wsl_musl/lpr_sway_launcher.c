@@ -5,6 +5,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -116,6 +118,32 @@ static void terminate_and_reap(pid_t child, int signal_number, const char *name)
     }
 }
 
+static int checkpoint_netd_unix_state(const char *iteration) {
+    if (iteration == NULL || iteration[0] == '\0') return 0;
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    if (snprintf(path, sizeof(path), "/run/m58-netd-checkpoint-%s", iteration) >=
+        (int)sizeof(path)) return -1;
+    (void)unlink(path);
+    const int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, strlen(path) + 1);
+    const int bind_status = bind(fd, (const struct sockaddr *)&address, sizeof(address));
+    const int bind_errno = errno;
+    const int close_status = close(fd);
+    const int close_errno = errno;
+    (void)unlink(path);
+    if (bind_status != 0 || close_status != 0) {
+        errno = bind_status != 0 ? bind_errno : close_errno;
+        return -1;
+    }
+    printf("M58_NETD_CHECKPOINT iteration=%s\n", iteration);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: lpr_sway_launcher command [args...]\n");
@@ -162,6 +190,7 @@ int main(int argc, char **argv) {
     fflush(stdout);
     const char *lifecycle_mode = getenv("M56_LIFECYCLE_MODE");
     const int lifecycle = lifecycle_mode != NULL && lifecycle_mode[0] != '\0';
+    const char *m58_iteration = getenv("M58_ITERATION");
     if (lifecycle && wait_for_wayland_socket(300) != 0) {
         lifecycle_failed = 1;
         printf("M56_LIFECYCLE_WAYLAND_TIMEOUT\n");
@@ -223,17 +252,31 @@ int main(int argc, char **argv) {
             const int client_timeout = wait_with_timeout(client, &client_status, 100);
             if (client_timeout > 0) {
                 printf("M51_LAUNCHER_CLIENT_TIMEOUT=10\n");
+                if (lifecycle) lifecycle_failed = 1;
             } else if (client_timeout == 0 && WIFEXITED(client_status)) {
                 printf("M51_LAUNCHER_CLIENT_EXIT=%d\n", WEXITSTATUS(client_status));
+                if (m58_iteration != NULL)
+                    printf("M58_CLIENT_EXIT iteration=%s status=%d\n",
+                           m58_iteration, WEXITSTATUS(client_status));
+                if (lifecycle && WEXITSTATUS(client_status) != 0) lifecycle_failed = 1;
             } else if (client_timeout == 0 && WIFSIGNALED(client_status)) {
                 printf("M51_LAUNCHER_CLIENT_SIGNAL=%d\n", WTERMSIG(client_status));
+                if (lifecycle) lifecycle_failed = 1;
+            } else if (lifecycle) {
+                lifecycle_failed = 1;
             }
             fflush(stdout);
+        } else if (lifecycle) {
+            lifecycle_failed = 1;
         }
         if (!lifecycle) (void)kill(sway, SIGKILL);
     }
 
     if (lifecycle && !lifecycle_failed) {
+        /* waitpid(client) can win the race with Sway consuming the Wayland
+         * peer HANGUP.  Let that event retire client-owned wl_shm state before
+         * a direct SIGKILL; the termination signal itself remains abrupt. */
+        if (strcmp(lifecycle_mode, "kill") == 0) sleep(1);
         if (strcmp(lifecycle_mode, "normal") == 0) {
             if (request_sway_exit() != 0 &&
                 kill(sway, SIGINT) != 0 && errno != ESRCH)
@@ -248,18 +291,42 @@ int main(int argc, char **argv) {
     }
 
     int status = 0;
-    const int timed_out = wait_with_timeout(sway, &status, lifecycle ? 30 : 300);
+    const int timed_out = wait_with_timeout(sway, &status, lifecycle ? 100 : 300);
     terminate_and_reap(seatd, SIGTERM, "seatd");
     cleanup_runtime_sockets();
     if (lifecycle && timed_out < 0) lifecycle_failed = 1;
+    if (lifecycle && m58_iteration != NULL) {
+        const char *kind = WIFEXITED(status) ? "exit" : WIFSIGNALED(status) ? "signal" : "other";
+        const int code = WIFEXITED(status) ? WEXITSTATUS(status) :
+            WIFSIGNALED(status) ? WTERMSIG(status) : -1;
+        printf("M58_SWAY_EXIT iteration=%s mode=%s kind=%s status=%d escalated=%d\n",
+               m58_iteration, lifecycle_mode, kind, code, timed_out > 0);
+        const int exited = WIFEXITED(status);
+        const int exit_status = exited ? WEXITSTATUS(status) : -1;
+        if ((strcmp(lifecycle_mode, "normal") == 0 &&
+             (timed_out != 0 || !exited || exit_status != 0)) ||
+            (strcmp(lifecycle_mode, "term") == 0 &&
+             (timed_out != 1 || !exited || exit_status != 128 + SIGKILL)) ||
+            (strcmp(lifecycle_mode, "kill") == 0 &&
+             (timed_out != 0 || !exited || exit_status != 128 + SIGKILL)))
+            lifecycle_failed = 1;
+        if (checkpoint_netd_unix_state(m58_iteration) != 0) {
+            printf("M58_NETD_CHECKPOINT_FAIL iteration=%s errno=%d\n",
+                   m58_iteration, errno);
+            lifecycle_failed = 1;
+        }
+    }
     int extra_status = 0;
     if (lifecycle && waitpid(-1, &extra_status, WNOHANG) > 0) lifecycle_failed = 1;
     if (lifecycle) {
         if (timed_out > 0)
             printf("M56_LIFECYCLE_ESCALATED mode=%s signal=9\n", lifecycle_mode);
         if (!lifecycle_failed) {
-            printf("M56_LIFECYCLE_CLEAN mode=%s orphan=0 stale=0 waitpid=1\n",
+            printf("M56_LIFECYCLE_CLEAN mode=%s orphan=0 stale=0 waitpid=1",
                    lifecycle_mode);
+            if (m58_iteration != NULL)
+                printf(" iteration=%s", m58_iteration);
+            printf("\n");
             return 0;
         }
         printf("M56_LIFECYCLE_FAIL mode=%s timeout=%d\n", lifecycle_mode, timed_out);

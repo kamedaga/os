@@ -909,7 +909,29 @@ static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
 static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_dispatch_mmap(a0, a1, a2, a3, a4, a5); }
 static int64_t lpr_sys_mprotect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT, a0, a1, lpr_linux_prot_to_pacha(a2))); }
-static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; const int64_t result = lpr_linux_pacha_status_to_errno(lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1)); lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result); return result; }
+static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a2; (void)a3; (void)a4; (void)a5;
+    const struct lpr_linux_user_frame *frame = lpr_active_user_frame;
+    if (frame != 0 && a1 != 0 && a0 <= UINT64_MAX - a1 &&
+        frame->rsp >= a0 && frame->rsp < a0 + a1 &&
+        frame->rip < a0 && frame->rip <= UINT64_MAX - 8u)
+    {
+        /* Patched Linux musl x86_64 __unmapself sequence immediately after
+         * SYS_munmap: xor %rdi,%rdi; mov $SYS_exit,%eax. */
+        const unsigned char *next = (const unsigned char *)(uintptr_t)frame->rip;
+        static const unsigned char unmapself_tail[8] = {
+            0x48, 0x31, 0xff, 0xb8, 0x3c, 0x00, 0x00, 0x00,
+        };
+        if (lpr_memcmp(next, unmapself_tail, sizeof(unmapself_tail)) == 0) {
+            lpr_trace_mmap_call("unmapself", a0, a1, 0, 0, 0, 0, 0);
+            lpr_linux_unmapself_exit(a0, a1);
+        }
+    }
+    const int64_t result = lpr_linux_pacha_status_to_errno(
+        lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1));
+    lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);
+    return result;
+}
 static int64_t lpr_sys_msync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_msync(a0, a1, a2); }
 static int64_t lpr_sys_brk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_brk(a0); }
 static int64_t lpr_sys_rt_sigaction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigaction(a0, a1, a2, a3); }
