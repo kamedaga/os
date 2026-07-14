@@ -623,6 +623,34 @@ filedの実測は強制終了1周で`[5 1] → [9 1]`。残る4 handleはSway固
 
 **Phase 6 付け替え (2026-07-14)**: 上の16項目のStep/独立leg対応は`pacha_docs/fd-ops-design.md` §14、旧M6.0/M7.xを廃止したPhase番号は同書§13を正とする。以下の旧M6.0 SMP見出しは履歴であり、実行順はPhase 6後半である。
 
+### Phase 6 実施計画 (2026-07-14 確定)
+
+Phase 6 は「OS の機能自体を完成させる」フェーズ。GUI 実用化 (Phase M6.1〜M6.3) の前に、fd/lifecycle/signal/SMP という土台の構造を閉じる。SMP も実用化機能ではなく OS 機能そのものなので Phase 6 に含める。Step の詳細定義・oracle・kernel 変更の六点許可制は `pacha_docs/fd-ops-design.md` (§10/§9.4/§13/§14) が正。以下は実施順の全体像。
+
+**6-A. 先行独立 leg — ext4 データ破損の根治**
+- Mesa shader-cache 書き込みで再現する multiply-claimed block / directory corruption を修正する。データ破損は寝かせるほど被害が広がるため、fd-ops より先に単独で潰す。
+- 受け入れ: shader cache 有効での再現 red → 修正 → post-run fsck clean をゲートへ常設。kernel 原因に証拠が収束した場合のみ別途事前許可。
+
+**6-B. fd-ops 統一 (fd-ops-design.md Step 1〜24) — Phase 6 の本体**
+- Step 1: signal / thread-exit boundary の完了。restorer の SysV alignment、process-directed signal の owner-thread 配送契約 (Sway TERM を `escalated=1` → `exit 0` へ反転)、musl `__unmapself` バイト照合の暫定対処を kernel post-switch-unmap flag へ置換。
+- Step 2〜5: 状態の一本化と名前空間分離。CLOEXEC/OFD flags の source of truth 一本化、typed native API と syscall return domain の正規化、backend handle/wait fd の common field 化、logical/native fd の完全分離 (fd<16 マジックの形式化、低 fd 再転送不能の根治)。
+- Step 6〜12: dispatch の vtable 統一。ops registry (kind 追加 = record 一個)、I/O・metadata・mmap・dup・close/exit・poll・epoll の kind cascade を全廃。nested epoll の 10ms quantum scan は Step 12 で消える。
+- Step 13〜18: service ABI v3 と owner lease。共通 lifecycle transaction、kernel channel peer-close semantics、filed/termd lease (強制終了 +4/周 の撤廃)、netd/drmd/inputd lease (強制終了 4 回 cap を撤廃し SIGKILL 20 連続で全 service handle baseline 復帰)、fork の prepare→confirm/rollback transaction 化。
+- Step 19〜20: exec の transaction 化と v8 manifest (dup alias/OFD 共有の保存、atomic commit)。
+- Step 21〜23: generic SCM_RIGHTS。netd を opaque capsule broker 化 (現 INPUT/DRM/FILED_MEMFD の kind-aware wire を移行)、pipe/socket transfer と cycle GC、filed memfd transfer の完成 (cross-process `pread`/`MAP_PRIVATE` `EAGAIN` の根治を含む)。
+- Step 24: 新構造上での最終再達成。画面 (#336699) + 入力 (KEY_A / REL +7,-4 / BTN_LEFT) + lifecycle 23 回 (normal 2 / TERM 1 / KILL 20) を一つの oracle に統合。wlroots keymap preload の恒久置換もここ。
+
+**6-C. fd-ops 外の独立負債 (6-B と依存を見て挿入)**
+- fake PRIME の dma-buf fence transport。完成後に `LP_NUM_THREADS=0` を外して threaded llvmpipe へ復帰 (M6.1 高速化の前提)。
+- `/dev/shm` tmpfs (filed 内で完結、kernel に path 知識を入れない)。
+- file VMO cache の working-set budget 設定と DMA packing/fragmentation 対策。
+
+**6-D. SMP 本格対応 — Phase 6 の締め**
+- fd-ops が旧 lifecycle/wait 分岐を除去した後に実施し、旧 chain の上に並行 race を重ねない (順序の理由)。
+- 再開点: `smp-wip` branch (f9bdde6) + `pacha_docs/smp-handoff-m36e.md`。残作業 ①〜⑦ と受け入れ (4 CPU boot 20 連続 green ほか) は下の旧 M6.0 見出しの記載を引き継ぐ。
+
+**Phase 6 完了条件**: 6-A〜6-D すべて green — fsck clean 常設 / kind 分岐・payload mirror・fd<16 マジック 0 / SIGKILL 20 連続で baseline 復帰 / TERM graceful / 4 CPU 安定。ここから Phase M6.1 (高速化) へ進む。
+
 ### Phase M6 Sway + Waylandの実用化 (追加で)
 
 **M6.0 SMP (マルチコア) 本格対応 — M6 の最初に実施**
