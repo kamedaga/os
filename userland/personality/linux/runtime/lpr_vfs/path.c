@@ -174,12 +174,9 @@ int64_t lpr_filed_session_connect(void)
         lpr_session_checked = -1;
         return lpr_pacha_status_to_errno(reply_fd);
     }
-    status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     const pacha_service_envelope_t *service_reply =
         (const pacha_service_envelope_t *)service_page;
@@ -273,12 +270,9 @@ int64_t lpr_filed_fast_call(uint32_t op, uint64_t word2, uint64_t *out_result)
     if (status != 0) {
         return lpr_pacha_status_to_errno(status);
     }
-    status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)lpr_session_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     if (status != 0) {
         return lpr_pacha_status_to_errno(status);
     }
@@ -1100,12 +1094,9 @@ static int64_t lpr_filed_call_locked(uint32_t op, int page_fd, uint64_t word2, u
 
     struct pacha_ipc_msg reply;
     lpr_memset(&reply, 0, sizeof(reply));
-    const int64_t recv_status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = lpr_pacha_status_to_errno(recv_status);

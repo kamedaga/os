@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -177,10 +178,34 @@ static int child_status_matches(int status, int signal)
     return WIFEXITED(status) && WEXITSTATUS(status) == 128 + signal;
 }
 
+static void write_child_status_failure(
+    const char *mode,
+    pid_t pid,
+    int status,
+    int signal)
+{
+    (void)dprintf(STDOUT_FILENO,
+        "ASYNC_CHILD_FAILURE mode=%s stage=status rc=23 pid=%ld sent=%d expected=%d "
+        "raw=0x%08x exited=%d exit=%d signaled=%d signal=%d\n",
+        mode,
+        (long)pid,
+        signal,
+        signal,
+        (unsigned int)status,
+        WIFEXITED(status) ? 1 : 0,
+        WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+        WIFSIGNALED(status) ? 1 : 0,
+        WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+}
+
 static int run_signaled_child(const char *mode, int signal, int expect_signal)
 {
     const pid_t pid = fork();
     if (pid < 0) {
+        const int saved_errno = errno;
+        (void)dprintf(STDOUT_FILENO,
+            "ASYNC_CHILD_FAILURE mode=%s stage=fork rc=20 errno=%d\n",
+            mode, saved_errno);
         return 20;
     }
     if (pid == 0) {
@@ -197,15 +222,28 @@ static int run_signaled_child(const char *mode, int signal, int expect_signal)
     }
     sleep(1);
     if (kill(pid, signal) != 0) {
+        const int saved_errno = errno;
+        (void)dprintf(STDOUT_FILENO,
+            "ASYNC_CHILD_FAILURE mode=%s stage=kill rc=21 pid=%ld sent=%d errno=%d\n",
+            mode, (long)pid, signal, saved_errno);
         (void)kill(pid, SIGKILL);
         return 21;
     }
     int status = 0;
-    if (waitpid(pid, &status, 0) != pid) {
+    const pid_t waited = waitpid(pid, &status, 0);
+    if (waited != pid) {
+        const int saved_errno = errno;
+        (void)dprintf(STDOUT_FILENO,
+            "ASYNC_CHILD_FAILURE mode=%s stage=waitpid rc=22 pid=%ld got=%ld errno=%d\n",
+            mode, (long)pid, (long)waited, saved_errno);
         return 22;
     }
     if (expect_signal != 0) {
-        return child_status_matches(status, expect_signal) ? 0 : 23;
+        if (!child_status_matches(status, expect_signal)) {
+            write_child_status_failure(mode, pid, status, expect_signal);
+            return 23;
+        }
+        return 0;
     }
     return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : 24;
 }

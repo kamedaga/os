@@ -1,10 +1,17 @@
+#include <personality/lpr_signal_stack.h>
+
 .text
+
 .globl lpr_syscall_entry
 .hidden lpr_syscall_entry
 .type lpr_syscall_entry, @function
 lpr_syscall_entry:
-    sub $296, %rsp
-    lea 24(%rsp), %r11
+    # Native signal delivery addresses its frame and runtime stack relative to
+    # the interrupted Linux RSP, then its preparation code grows downward from
+    # that runtime RSP. Keep the LPR C stack below both regions; otherwise
+    # signal preparation can overwrite a live dispatch stack before returning.
+    sub $LPR_SYSCALL_ENTRY_RESERVE_BYTES, %rsp
+    lea 56(%rsp), %r11
     mov %r15, 0(%r11)
     mov %r14, 8(%r11)
     mov %r13, 16(%r11)
@@ -21,7 +28,7 @@ lpr_syscall_entry:
     mov %rax, 112(%r11)
     mov %rcx, 104(%r11)
     mov %rcx, 120(%r11)
-    lea 296(%rsp), %r10
+    lea LPR_SYSCALL_ENTRY_RESERVE_BYTES(%rsp), %r10
     mov %r10, 128(%r11)
     movq $0x202, 136(%r11)
 
@@ -35,9 +42,15 @@ lpr_syscall_entry:
     mov 88(%r11), %rcx
     mov 96(%r11), %r8
     mov 56(%r11), %r9
+    movabs $0x4c50524652414d45, %r10
+    mov %r10, 16(%rsp)
+    mov %r11, 24(%rsp)
+    movabs $0x454d41524652504c, %r10
+    mov %r10, 32(%rsp)
+    lea 16(%rsp), %rbp
     call lpr_dispatch_syscall_frame
 
-    lea 24(%rsp), %r11
+    lea 56(%rsp), %r11
     mov 120(%r11), %rcx
     mov 0(%r11), %r15
     mov 8(%r11), %r14

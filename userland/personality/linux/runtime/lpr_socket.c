@@ -399,12 +399,9 @@ static int64_t lpr_netd_call_with_fd(
         reply.fd_capacity = 1;
     }
     lpr_netd_debug_call("recv_begin", op, request_id, reply_fd, 0);
-    const int64_t recv_status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     lpr_netd_debug_call("recv_end", op, request_id, recv_status, reply.word2);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {

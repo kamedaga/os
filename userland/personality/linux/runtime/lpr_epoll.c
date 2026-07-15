@@ -600,12 +600,15 @@ int64_t lpr_linux_epoll_pwait(
             return sigsetsize != sizeof(uint64_t) ?
                 -LPR_LINUX_EINVAL : -LPR_LINUX_EFAULT;
         }
+        lpr_linux_wait_restore_mask = lpr_linux_signal_mask;
+        lpr_linux_wait_restore_mask_active = 1;
         const int64_t mask_status = lpr_linux_rt_sigprocmask(
             LPR_LINUX_SIG_SETMASK,
             sigmask,
             (uint64_t)(uintptr_t)&old_mask,
             sizeof(old_mask));
         if (mask_status != 0) {
+            lpr_linux_wait_restore_mask_active = 0;
             return mask_status;
         }
     }
@@ -616,6 +619,7 @@ int64_t lpr_linux_epoll_pwait(
             (uint64_t)(uintptr_t)&old_mask,
             0,
             sizeof(old_mask));
+        lpr_linux_wait_restore_mask_active = 0;
     }
     return result;
 }

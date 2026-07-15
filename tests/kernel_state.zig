@@ -410,6 +410,23 @@ test "starting a new fd wait clears stale channel waiters for the thread" {
     try std.testing.expectEqual(@as(usize, 0), try s.wakeIpcWaitersForSendFd(p0, second.b, targets[0..]));
 }
 
+test "signal wake cancellation clears ipc recv completion waiter" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .send = true,
+        .recv = true,
+        .wait = true,
+        .close = true,
+    });
+    const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    try s.registerIpcRecvCompletionWaiterForFd(p0, pair.a, 0x2000, 2, 7, 11);
+
+    s.unregisterFdWaitersForThread(p0, 7, 11);
+
+    var targets: [1]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try s.wakeIpcWaitersForSendFd(p0, pair.b, targets[0..]));
+}
+
 test "ipc call attaches one-shot reply fd" {
     var s = try initFdState();
     var free_list = FreePageList{};

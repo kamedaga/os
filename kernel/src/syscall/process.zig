@@ -83,6 +83,10 @@ fn isUserEntryVa(va: u64) bool {
     return va != 0 and user_vm.isUserCanonicalVa(va);
 }
 
+fn isUserSignalInhibitRange(start: u64, end: u64) bool {
+    return start < end and user_vm.isUserCanonicalVa(start) and isUserEntryVa(end);
+}
+
 fn buildUserTrapFrame(entry_rip: u64, stack_rsp: u64) TrapFrame {
     var frame = std.mem.zeroes(TrapFrame);
     frame.rip = entry_rip;
@@ -473,7 +477,16 @@ fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalI
     if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
-    if (!scheduler.deliverSignal(target, signo)) return sc.syscall_err_not_ready;
+    const delivery = scheduler.deliverSignal(target, signo) orelse return sc.syscall_err_not_ready;
+    // A prior non-signal wake can make the thread runnable while leaving its
+    // completion waiter registered.  Always remove same-generation waiters
+    // before a reply can be consumed through that stale registration.
+    if (delivery.should_interrupt) {
+        state.unregisterFdWaitersForThread(target, delivery.thread_index, delivery.thread_generation);
+    }
+    if (delivery.was_blocked) {
+        _ = scheduler.wakeBlockedGeneration(delivery.thread_index, delivery.thread_generation);
+    }
     return sc.syscall_ok;
 }
 
@@ -571,13 +584,25 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             const entry = frame.rsi;
             const inhibit_start = frame.rdx;
             const inhibit_end = frame.r10;
-            if (!isUserEntryVa(entry) or !isUserEntryVa(inhibit_start) or
-                !isUserEntryVa(inhibit_end) or inhibit_start >= inhibit_end or
+            const inhibit_secondary_start = frame.r8;
+            const inhibit_secondary_end = frame.r9;
+            if (!isUserEntryVa(entry) or
+                !isUserSignalInhibitRange(inhibit_start, inhibit_end) or
+                !isUserSignalInhibitRange(inhibit_secondary_start, inhibit_secondary_end) or
                 entry < inhibit_start or entry >= inhibit_end)
             {
                 return sc.syscall_err_invalid;
             }
-            return if (scheduler.configureCurrentSignalDelivery(entry, inhibit_start, inhibit_end)) sc.syscall_ok else sc.syscall_err_not_ready;
+            return if (scheduler.configureCurrentSignalDelivery(
+                entry,
+                inhibit_start,
+                inhibit_end,
+                inhibit_secondary_start,
+                inhibit_secondary_end,
+            )) sc.syscall_ok else sc.syscall_err_not_ready;
+        },
+        process_abi.signal_ctl_set_mask => {
+            return if (scheduler.setCurrentSignalBlockedMask(frame.rsi)) sc.syscall_ok else sc.syscall_err_not_ready;
         },
         process_abi.signal_ctl_return => {
             var returned: NativeSignalFrame = undefined;

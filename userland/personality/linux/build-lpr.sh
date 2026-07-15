@@ -11,6 +11,8 @@ mkdir -p "$(dirname "$repo_root/$out")"
   -ffreestanding \
   -fPIC \
   -fvisibility=hidden \
+  -fno-omit-frame-pointer \
+  -mno-omit-leaf-frame-pointer \
   -fno-stack-protector \
   -fno-builtin \
   -nostdlib \

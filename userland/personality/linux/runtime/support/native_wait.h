@@ -40,3 +40,23 @@ static inline void lpr_native_wait_drain(int fd)
         (uint64_t)(uint32_t)fd,
         (uint64_t)(uintptr_t)&message);
 }
+
+static inline int64_t lpr_native_ipc_recv_wait(
+    uint64_t fd,
+    struct pacha_ipc_msg *message)
+{
+    int64_t status;
+    do {
+        status = lpr_pacha_syscall4(
+            PACHAOS_SYSCALL_IPC_RECV_WAIT,
+            fd,
+            (uint64_t)(uintptr_t)message,
+            UINT64_MAX,
+            0);
+        // A native signal may cancel the kernel waiter while the Linux syscall
+        // is still inside an internal service RPC.  The reply FD remains the
+        // authoritative completion, so finish that transport wait before
+        // exposing the signal at the Linux return-frame boundary.
+    } while (status == PACHA_SYSCALL_ERR_NOT_READY);
+    return status;
+}

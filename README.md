@@ -49,7 +49,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
 musl ビルドで確認済み。
 
-`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway`
 
 ### Python3 on PachaOS
 
@@ -62,7 +62,7 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 >>>
 ```
 
-**PachaOS Capsule バックエンドで動作中**
+**Kobox**
 
 | Module | Module |
 |---|---|
@@ -70,7 +70,10 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 | USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
 | USB HID(マウスで実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
 | Ext4 | `crc16.ko` / `mbcache.ko` / `jbd2.ko` / `ext4.ko`|
-| virtio-net| `virtio.ko` / `virtio_ring` / `virtio_pci.ko` / `failover.ko` / `net_failover.ko `/ `virtio_net.ko` |
+| virtio-net | `virtio.ko` / `virtio_ring` / `virtio_pci.ko` / `failover.ko` / `net_failover.ko `/ `virtio_net.ko` |
+| linux tty | `linux_tty_core.ko` |
+| virtio-input | `linux_virtio_input.ko` ...|
+
 
 koboxはcapabilityベースからFDベースに切り替え、ネイティブABIで自然にlibcが動いたため、daemonとして動くようになりました。
 

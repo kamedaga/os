@@ -73,12 +73,9 @@ int64_t lpr_termd_call(
             "termd ipc_call failed");
         return lpr_pacha_status_to_errno(reply_fd);
     }
-    const int64_t recv_status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = lpr_pacha_status_to_errno(recv_status);
@@ -256,6 +253,26 @@ void lpr_linux_queue_signal(uint32_t sig)
     }
 }
 
+int64_t lpr_linux_rt_sigpending(uint64_t set_raw, uint64_t sigsetsize)
+{
+    if (sigsetsize != sizeof(uint64_t)) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if (set_raw == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    *(uint64_t *)(uintptr_t)set_raw = lpr_linux_pending_signal_mask;
+    return 0;
+}
+
+void lpr_linux_signal_after_fork_child(void)
+{
+    lpr_linux_pending_signal_mask = 0;
+    lpr_linux_wait_restore_mask = 0;
+    lpr_linux_wait_restore_mask_active = 0;
+    lpr_linux_signal_dispatching = 0;
+}
+
 int lpr_linux_default_signal_ignored(uint32_t sig)
 {
     return sig == LPR_LINUX_SIGCHLD ||
@@ -291,7 +308,7 @@ uint32_t lpr_linux_first_pending_signal(uint64_t mask)
     return 0;
 }
 
-int64_t lpr_linux_dispatch_pending_signals(void)
+int64_t lpr_linux_dispatch_pending_signals_with_result(int64_t interrupted_result)
 {
     if (lpr_linux_signal_dispatching) {
         return 0;
@@ -322,39 +339,37 @@ int64_t lpr_linux_dispatch_pending_signals(void)
             lpr_linux_exit_for_signal(sig);
         }
 
-        const uint64_t old_mask = lpr_linux_signal_mask;
-        lpr_linux_signal_mask |= action.mask;
-        if ((action.flags & LPR_LINUX_SA_NODEFER) == 0) {
-            lpr_linux_signal_mask |= bit;
+        // Converting a queued Linux signal back into a native signal requires
+        // a captured Linux return frame.  Without one, DELIVER_PENDING_FRAME
+        // cannot consume it and a timer would inject the handler at an
+        // arbitrary instruction instead of the next syscall boundary.
+        if (lpr_current_linux_user_frame() == 0) {
+            lpr_linux_pending_signal_mask |= bit;
+            break;
         }
-        lpr_linux_signal_mask &= ~lpr_linux_unblockable_signal_mask();
-        if ((action.flags & LPR_LINUX_SA_RESETHAND) != 0) {
-            lpr_linux_sigactions[sig].handler = LPR_LINUX_SIG_DFL;
+
+        const int64_t signal_status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_PROCESS_SIGNAL,
+            PACHA_PROCESS_SELF_FD,
+            sig);
+        if (signal_status != 0) {
+            lpr_linux_pending_signal_mask |= bit;
+            result = lpr_pacha_status_to_errno(signal_status);
+            break;
         }
-        if ((action.flags & LPR_LINUX_SA_SIGINFO) != 0) {
-            struct {
-                int32_t signo;
-                int32_t error;
-                int32_t code;
-                uint32_t reserved0;
-                uint8_t payload[112];
-            } info;
-            uint8_t context[936] __attribute__((aligned(16)));
-            lpr_memset(&info, 0, sizeof(info));
-            lpr_memset(context, 0, sizeof(context));
-            info.signo = (int32_t)sig;
-            ((void (*)(int, void *, void *))(uintptr_t)action.handler)(
-                (int)sig, &info, context);
-        } else {
-            ((void (*)(int))(uintptr_t)action.handler)((int)sig);
-        }
-        lpr_linux_signal_mask = old_mask;
-        result = -LPR_LINUX_EINTR;
-        break;
+
+        lpr_linux_signal_dispatching = 0;
+        lpr_linux_deliver_native_pending_frame(interrupted_result);
+        return interrupted_result;
     }
 
     lpr_linux_signal_dispatching = 0;
     return result;
+}
+
+int64_t lpr_linux_dispatch_pending_signals(void)
+{
+    return lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
 }
 
 void lpr_linux_raise_sigpipe(void)

@@ -361,6 +361,8 @@ typedef struct lpr_signal_state {
     lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
     uint64_t mask;
     uint64_t pending_mask;
+    uint64_t wait_restore_mask;
+    uint32_t wait_restore_mask_active;
     uint64_t altstack_sp;
     uint64_t altstack_size;
     uint32_t altstack_flags;
@@ -441,10 +443,6 @@ typedef struct lpr_memory_state {
     uint64_t brk_limit;
 } lpr_memory_state_t;
 
-typedef struct lpr_debug_state {
-    struct lpr_linux_user_frame *active_user_frame;
-} lpr_debug_state_t;
-
 typedef struct lpr_bootstrap lpr_bootstrap_t;
 
 static inline void lpr_exec_set_supervisor_tokens(
@@ -470,7 +468,6 @@ typedef struct lpr_state {
     lpr_netd_rpc_state_t netd_rpc;
     lpr_cache_state_t caches;
     lpr_memory_state_t memory;
-    lpr_debug_state_t debug;
 } lpr_state_t;
 
 extern lpr_state_t lpr_state;
@@ -541,6 +538,8 @@ extern lpr_state_t lpr_state;
 #define lpr_linux_sigactions (lpr_state.signal.actions)
 #define lpr_linux_signal_mask (lpr_state.signal.mask)
 #define lpr_linux_pending_signal_mask (lpr_state.signal.pending_mask)
+#define lpr_linux_wait_restore_mask (lpr_state.signal.wait_restore_mask)
+#define lpr_linux_wait_restore_mask_active (lpr_state.signal.wait_restore_mask_active)
 #define lpr_linux_altstack_sp (lpr_state.signal.altstack_sp)
 #define lpr_linux_altstack_size (lpr_state.signal.altstack_size)
 #define lpr_linux_altstack_flags (lpr_state.signal.altstack_flags)
@@ -555,7 +554,6 @@ extern lpr_state_t lpr_state;
 #define lpr_brk_base (lpr_state.memory.brk_base)
 #define lpr_brk_current (lpr_state.memory.brk_current)
 #define lpr_brk_limit (lpr_state.memory.brk_limit)
-#define lpr_active_user_frame (lpr_state.debug.active_user_frame)
 #define lpr_netd_request_id (lpr_state.netd_rpc.request_id)
 #define lpr_netd_page_fd (lpr_state.netd_rpc.page_fd)
 #define lpr_netd_page (lpr_state.netd_rpc.page)
@@ -791,6 +789,8 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
 int64_t lpr_linux_close(uint64_t fd);
 int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags);
 int64_t lpr_linux_dispatch_pending_signals(void);
+int64_t lpr_linux_dispatch_pending_signals_with_result(int64_t interrupted_result);
+int64_t lpr_linux_sync_native_signal_mask(void);
 int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec);
 int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec);
@@ -849,8 +849,10 @@ int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t n
 int64_t lpr_linux_resolve_utime( const lpr_linux_timespec_t *input, const lpr_linux_timespec_t *now, uint64_t wire_bit, uint64_t *mask, int64_t *out_sec, int64_t *out_nsec);
 int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t oldact_raw, uint64_t sigsetsize);
 int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset_raw, uint64_t sigsetsize);
+int64_t lpr_linux_rt_sigpending(uint64_t set_raw, uint64_t sigsetsize);
 int64_t lpr_linux_sigaltstack(uint64_t ss_raw, uint64_t old_ss_raw);
 void lpr_linux_signal_runtime_init(void);
+void lpr_linux_signal_after_fork_child(void);
 void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result);
 void *lpr_linux_async_signal_prepare(void *native_frame);
 _Noreturn void lpr_linux_rt_sigreturn_frame(const struct lpr_linux_user_frame *frame);

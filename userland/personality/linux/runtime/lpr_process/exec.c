@@ -703,12 +703,9 @@ int64_t lpr_filed_exec_self(
     lpr_memset(&reply, 0, sizeof(reply));
     reply.fds = reply_fds;
     reply.fd_capacity = 3;
-    const int64_t recv_status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     lpr_destroy_standalone_wire_page(page_fd, page);
     if (recv_status != 0) {

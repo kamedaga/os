@@ -98,6 +98,7 @@ void lpr_linux_apply_pending_fork_child(void)
     lpr_linux_pending_child_pgrp = 0;
     lpr_supervisor_pending_child_token = 0;
     lpr_linux_process_clear_children();
+    lpr_linux_signal_after_fork_child();
     lpr_thread_after_fork_child();
     lpr_pipe_after_fork_child();
     lpr_trace_process_event(

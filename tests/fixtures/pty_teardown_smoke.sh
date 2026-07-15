@@ -6,7 +6,7 @@ rm -f "$result" "$input"
 printf '%s\n' pty-teardown >"$input"
 
 failures=0
-if busybox timeout -s KILL 6 /cmd/pty_teardown_driver.elf; then
+if /cmd/busybox timeout -s KILL 6 /cmd/pty_teardown_driver.elf; then
     driver_status=0
 else
     driver_status=$?

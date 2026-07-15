@@ -14,6 +14,7 @@
 
 enum {
     LPRS_WNOHANG = 1,
+    LPRS_SIGCHLD = 17,
     LPRS_WAIT_FD_CAPACITY = 256,
 };
 
@@ -349,10 +350,6 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     lprs_copy_string(proc->cwd, sizeof(proc->cwd), req->state.cwd[0] != '\0' ? req->state.cwd : "/");
     lprs_write_state(proc, &req->state);
     *out_token = proc->token;
-    printf("P6_PAGE_DIAG register pid=%llu ppid=%llu token=%llu\n",
-        (unsigned long long)proc->pid,
-        (unsigned long long)proc->ppid,
-        (unsigned long long)proc->token);
     return 0;
 }
 
@@ -369,10 +366,6 @@ static int lprs_register_process_fd_handle(uint64_t token, int process_fd)
         (void)pacha_fd_close(proc->process_fd);
     }
     proc->process_fd = process_fd;
-    printf("P6_PAGE_DIAG register_fd pid=%llu ppid=%llu fd=%d\n",
-        (unsigned long long)proc->pid,
-        (unsigned long long)proc->ppid,
-        process_fd);
     return 0;
 }
 
@@ -572,7 +565,9 @@ static int lprs_wait_for_matching_child(
         };
         for (uint64_t i = 0; i < g_process_count; ++i) {
             lprs_process_t *child = &g_processes[i];
-            if (!lprs_child_matches(parent, child, requested) || child->process_fd < 16) {
+            if (!child->active || child->exit_ready ||
+                child->process_fd < 16 || child->ppid == 0)
+            {
                 continue;
             }
             if (count >= LPRS_WAIT_FD_CAPACITY) {
@@ -613,10 +608,6 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     if ((req->options & ~((uint64_t)LPRS_WNOHANG)) != 0) {
         return PACHA_STATUS_EINVAL;
     }
-    printf("P6_PAGE_DIAG wait4_begin parent=%llu requested=%lld options=%llu\n",
-        (unsigned long long)parent->pid,
-        (long long)req->requested_pid,
-        (unsigned long long)req->options);
     uint64_t selected_index = UINT64_MAX;
     uint64_t exit_code = 0;
     const int wait_status = lprs_wait_for_matching_child(
@@ -644,10 +635,6 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     req->exit_code = exit_code;
     req->status = (exit_code & 0xffu) << 8;
     *out_result = LPRS_WAIT4_RESULT_PACK(selected_pid, req->status);
-    printf("P6_PAGE_DIAG wait4_reap parent=%llu child=%llu status=%llu\n",
-        (unsigned long long)parent->pid,
-        (unsigned long long)selected_pid,
-        (unsigned long long)exit_code);
     lprs_process_reap(selected);
     return 0;
 }
@@ -1128,11 +1115,14 @@ static void lprs_notify_exited_child(lprs_process_t *child, uint64_t exit_code)
     }
     child->exit_status = (uint32_t)(exit_code & 0xffu);
     child->exit_ready = 1;
-    printf("P6_PAGE_DIAG exit_ready pid=%llu ppid=%llu fd=%d status=%llu\n",
-        (unsigned long long)child->pid,
-        (unsigned long long)child->ppid,
-        child->process_fd,
-        (unsigned long long)(exit_code & 0xffu));
+    lprs_process_t *parent = lprs_find_by_pid(child->ppid);
+    int notify_status = PACHA_STATUS_ESRCH;
+    if (parent != NULL && parent->process_fd >= 16) {
+        notify_status = lprs_signal_process_fd(parent->process_fd, LPRS_SIGCHLD);
+        if (notify_status == 0) {
+            child->exit_notified = 1;
+        }
+    }
 }
 
 static void lprs_refresh_exited_children(void)

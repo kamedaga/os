@@ -118,10 +118,14 @@ pub const ThreadContext = struct {
     ready: bool = false,
     wait_mailbox: bool = false,
     stopped: bool = false,
-    pending_signal: u32 = 0,
+    pending_signal_mask: u64 = 0,
+    signal_interrupt_consumed: bool = false,
     signal_entry: u64 = 0,
+    signal_blocked_mask: u64 = 0,
     signal_inhibit_start: u64 = 0,
     signal_inhibit_end: u64 = 0,
+    signal_inhibit_secondary_start: u64 = 0,
+    signal_inhibit_secondary_end: u64 = 0,
     signal_owner: bool = false,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
@@ -141,8 +145,7 @@ const ThreadHotState = extern struct {
     stopped: u8 = 0,
     wait_mailbox: u8 = 0,
     owner_process: kernel.PrincipalId = default_process_principal,
-    pending_signal: u32 = 0,
-    _pad0: [4]u8 = [_]u8{0} ** 4,
+    pending_signal_mask: u64 = 0,
     wake_tick: u64 = 0,
     cr3: u64 = 0,
 };
@@ -1246,10 +1249,21 @@ pub fn parkApThreadForBlock(
     timeout_ticks: u64,
     resume_rax: u64,
     before_block: ?BeforeCurrentThreadLeaveCallback,
-) noreturn {
+) bool {
     const current_thread = currentThread();
     scheduler_state.thread_table.lock();
     if (threadContextMutable(current_thread)) |ctx| {
+        // A signal published while this thread was runnable must interrupt the
+        // next blocking syscall.  Refuse the block while holding the same lock
+        // used by deliverSignal(), so no waiter can become stale between the
+        // pending-signal check and ready=false.
+        if (firstUnblockedPendingSignal(ctx) != 0 and ctx.signal_entry != 0 and
+            !ctx.signal_interrupt_consumed)
+        {
+            ctx.signal_interrupt_consumed = true;
+            scheduler_state.thread_table.unlock();
+            return false;
+        }
         var saved = frame.*;
         saved.rax = resume_rax;
         ctx.frame = saved;
@@ -1624,7 +1638,7 @@ fn hotStateFromContext(ctx: *const ThreadContext) ThreadHotState {
         .stopped = boolByte(ctx.stopped),
         .wait_mailbox = boolByte(ctx.wait_mailbox),
         .owner_process = ctx.owner_process,
-        .pending_signal = ctx.pending_signal,
+        .pending_signal_mask = ctx.pending_signal_mask,
         .wake_tick = ctx.wake_tick,
         .cr3 = ctx.cr3,
     };
@@ -1640,8 +1654,8 @@ fn setThreadHotReady(thread_index: usize, ready: bool) void {
     if (getThreadHotState(thread_index)) |hot| hot.ready = boolByte(ready);
 }
 
-fn setThreadHotPendingSignal(thread_index: usize, signo: u32) void {
-    if (getThreadHotState(thread_index)) |hot| hot.pending_signal = signo;
+fn setThreadHotPendingSignalMask(thread_index: usize, signal_mask: u64) void {
+    if (getThreadHotState(thread_index)) |hot| hot.pending_signal_mask = signal_mask;
 }
 
 fn setThreadHotStopped(thread_index: usize, stopped: bool) void {
@@ -1724,10 +1738,14 @@ fn initializeThreadContextWithReadyState(
     ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
     ctx.stopped = false;
-    ctx.pending_signal = 0;
+    ctx.pending_signal_mask = 0;
+    ctx.signal_interrupt_consumed = false;
     ctx.signal_entry = 0;
+    ctx.signal_blocked_mask = 0;
     ctx.signal_inhibit_start = 0;
     ctx.signal_inhibit_end = 0;
+    ctx.signal_inhibit_secondary_start = 0;
+    ctx.signal_inhibit_secondary_end = 0;
     // A newly created thread inherits the runtime signal trampoline from a
     // sibling but is never the process signal owner; only an explicit REGISTER
     // (the main/event-loop thread) claims ownership.
@@ -1738,8 +1756,11 @@ fn initializeThreadContextWithReadyState(
         const source = threadContext(inherit_index) orelse continue;
         if (!source.allocated or source.owner_process != owner_process or source.signal_entry == 0) continue;
         ctx.signal_entry = source.signal_entry;
+        ctx.signal_blocked_mask = source.signal_blocked_mask;
         ctx.signal_inhibit_start = source.signal_inhibit_start;
         ctx.signal_inhibit_end = source.signal_inhibit_end;
+        ctx.signal_inhibit_secondary_start = source.signal_inhibit_secondary_start;
+        ctx.signal_inhibit_secondary_end = source.signal_inhibit_secondary_end;
         break;
     }
     ctx.wake_tick = 0;
@@ -2209,11 +2230,21 @@ pub fn wakeIfWaiting(thread_index: usize) void {
     publishThreadReady(thread_index);
 }
 
-fn wakeIfWaitingGenerationInternal(thread_index: usize, generation: u32, resume_rax: ?u64) bool {
+fn wakeIfWaitingGenerationInternal(
+    thread_index: usize,
+    generation: u32,
+    resume_rax: ?u64,
+    mailbox_only: bool,
+) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(thread_index) orelse return false;
-    if (!ctx.allocated or ctx.generation != generation or !ctx.wait_mailbox) return false;
+    if (!ctx.allocated or ctx.generation != generation) return false;
+    if (mailbox_only) {
+        if (!ctx.wait_mailbox) return false;
+    } else if (ctx.ready) {
+        return false;
+    }
     if (resume_rax) |value| ctx.frame.rax = value;
     ctx.wait_mailbox = false;
     ctx.wake_tick = 0;
@@ -2235,11 +2266,15 @@ fn wakeIfWaitingGenerationInternal(thread_index: usize, generation: u32, resume_
 }
 
 pub fn wakeIfWaitingGeneration(thread_index: usize, generation: u32) bool {
-    return wakeIfWaitingGenerationInternal(thread_index, generation, null);
+    return wakeIfWaitingGenerationInternal(thread_index, generation, null, true);
 }
 
 pub fn wakeIfWaitingGenerationWithRax(thread_index: usize, generation: u32, resume_rax: u64) bool {
-    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax);
+    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, true);
+}
+
+pub fn wakeBlockedGeneration(thread_index: usize, generation: u32) bool {
+    return wakeIfWaitingGenerationInternal(thread_index, generation, null, false);
 }
 
 pub fn wakeMailboxWaiter(principal: kernel.PrincipalId) void {
@@ -2257,8 +2292,26 @@ pub fn wakeBlockedThread(principal: kernel.PrincipalId) void {
     wakeMailboxWaiter(principal);
 }
 
-pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {
-    if (signo == 0) return false;
+pub const SignalDelivery = struct {
+    thread_index: usize,
+    thread_generation: u32,
+    should_interrupt: bool,
+    was_blocked: bool,
+};
+
+fn signalBit(signo: u32) ?u64 {
+    if (signo == 0 or signo > 64) return null;
+    return @as(u64, 1) << @intCast(signo - 1);
+}
+
+fn firstUnblockedPendingSignal(ctx: *const ThreadContext) u32 {
+    const deliverable = ctx.pending_signal_mask & ~ctx.signal_blocked_mask;
+    if (deliverable == 0) return 0;
+    return @as(u32, @intCast(@ctz(deliverable))) + 1;
+}
+
+pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) ?SignalDelivery {
+    const signal_bit = signalBit(signo) orelse return null;
     scheduler_state.thread_table.lock();
     // Select the delivery target under the table lock so the pending signal is
     // published before any wake.  Prefer the registered signal owner (the
@@ -2281,22 +2334,38 @@ pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) bool {
     }
     const target = owner_index orelse first_blocked orelse first_ready orelse {
         scheduler_state.thread_table.unlock();
-        return false;
+        return null;
     };
     const ctx = threadContextMutable(target) orelse {
         scheduler_state.thread_table.unlock();
-        return false;
+        return null;
     };
     if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) {
         scheduler_state.thread_table.unlock();
-        return false;
+        return null;
     }
-    const was_blocked = !ctx.ready;
-    ctx.pending_signal = signo;
-    setThreadHotPendingSignal(target, signo);
+    const newly_pending = (ctx.pending_signal_mask & signal_bit) == 0;
+    const should_interrupt = newly_pending and (ctx.signal_blocked_mask & signal_bit) == 0;
+    const was_blocked = should_interrupt and !ctx.ready;
+    const generation = ctx.generation;
+    ctx.pending_signal_mask |= signal_bit;
+    // A blocked thread is interrupted immediately below by signalProcess().
+    // A runnable thread consumes the interruption when it next attempts to
+    // block. Standard signals coalesce by bit, while different blocked signals
+    // remain pending until their mask permits delivery.
+    if (should_interrupt) {
+        ctx.signal_interrupt_consumed = was_blocked;
+    } else if (firstUnblockedPendingSignal(ctx) == 0) {
+        ctx.signal_interrupt_consumed = true;
+    }
+    setThreadHotPendingSignalMask(target, ctx.pending_signal_mask);
     scheduler_state.thread_table.unlock();
-    if (was_blocked) wakeIfWaiting(target);
-    return true;
+    return .{
+        .thread_index = target,
+        .thread_generation = generation,
+        .should_interrupt = should_interrupt,
+        .was_blocked = was_blocked,
+    };
 }
 
 pub const ClaimedSignal = struct {
@@ -2305,18 +2374,37 @@ pub const ClaimedSignal = struct {
     entry: u64,
 };
 
-pub fn configureCurrentSignalDelivery(entry: u64, inhibit_start: u64, inhibit_end: u64) bool {
+pub fn configureCurrentSignalDelivery(
+    entry: u64,
+    inhibit_start: u64,
+    inhibit_end: u64,
+    inhibit_secondary_start: u64,
+    inhibit_secondary_end: u64,
+) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(currentThread()) orelse return false;
     if (!ctx.allocated) return false;
     ctx.signal_entry = entry;
+    ctx.signal_blocked_mask = 0;
     ctx.signal_inhibit_start = inhibit_start;
     ctx.signal_inhibit_end = inhibit_end;
+    ctx.signal_inhibit_secondary_start = inhibit_secondary_start;
+    ctx.signal_inhibit_secondary_end = inhibit_secondary_end;
     // The thread that registers the runtime signal trampoline is the process's
     // signal owner (the main/event-loop thread).  Process-directed signals are
     // delivered here so teardown runs on the loop that can service them.
     ctx.signal_owner = true;
+    return true;
+}
+
+pub fn setCurrentSignalBlockedMask(blocked_mask: u64) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(currentThread()) orelse return false;
+    if (!ctx.allocated or ctx.signal_entry == 0) return false;
+    ctx.signal_blocked_mask = blocked_mask;
+    ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
     return true;
 }
 
@@ -2327,8 +2415,11 @@ pub fn copySignalDeliveryConfig(source_thread: usize, target_thread: usize) bool
     const target = threadContextMutable(target_thread) orelse return false;
     if (!source.allocated or !target.allocated) return false;
     target.signal_entry = source.signal_entry;
+    target.signal_blocked_mask = source.signal_blocked_mask;
     target.signal_inhibit_start = source.signal_inhibit_start;
     target.signal_inhibit_end = source.signal_inhibit_end;
+    target.signal_inhibit_secondary_start = source.signal_inhibit_secondary_start;
+    target.signal_inhibit_secondary_end = source.signal_inhibit_secondary_end;
     // Inheriting the trampoline does not transfer signal ownership.
     target.signal_owner = false;
     return true;
@@ -2339,19 +2430,26 @@ pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(thread_index) orelse return null;
-    if (!ctx.allocated or ctx.pending_signal == 0 or ctx.signal_entry == 0) return null;
+    const signo = firstUnblockedPendingSignal(ctx);
+    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0) return null;
     if (ctx.signal_inhibit_start < ctx.signal_inhibit_end and
         rip >= ctx.signal_inhibit_start and rip < ctx.signal_inhibit_end)
     {
         return null;
     }
+    if (ctx.signal_inhibit_secondary_start < ctx.signal_inhibit_secondary_end and
+        rip >= ctx.signal_inhibit_secondary_start and rip < ctx.signal_inhibit_secondary_end)
+    {
+        return null;
+    }
     const claimed = ClaimedSignal{
         .thread_index = thread_index,
-        .signo = ctx.pending_signal,
+        .signo = signo,
         .entry = ctx.signal_entry,
     };
-    ctx.pending_signal = 0;
-    setThreadHotPendingSignal(thread_index, 0);
+    ctx.pending_signal_mask &= ~signalBit(signo).?;
+    ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
+    setThreadHotPendingSignalMask(thread_index, ctx.pending_signal_mask);
     return claimed;
 }
 
@@ -2359,9 +2457,10 @@ pub fn restoreClaimedSignal(claimed: ClaimedSignal) void {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(claimed.thread_index) orelse return;
-    if (!ctx.allocated or ctx.pending_signal != 0) return;
-    ctx.pending_signal = claimed.signo;
-    setThreadHotPendingSignal(claimed.thread_index, claimed.signo);
+    if (!ctx.allocated) return;
+    ctx.pending_signal_mask |= signalBit(claimed.signo) orelse return;
+    ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
+    setThreadHotPendingSignalMask(claimed.thread_index, ctx.pending_signal_mask);
 }
 
 pub fn copyCurrentSignalFxState(out: *[fx_state_bytes]u8) bool {
@@ -2463,7 +2562,7 @@ pub fn blockCurrentThread(
 ) bool {
     if (!isBootstrapSchedulerCpu()) {
         if (policyActive()) {
-            parkApThreadForBlock(frame, wait_mailbox, timeout_ticks, resume_rax, before_block);
+            return parkApThreadForBlock(frame, wait_mailbox, timeout_ticks, resume_rax, before_block);
         }
         return false;
     }
@@ -2473,6 +2572,17 @@ pub fn blockCurrentThread(
         scheduler_state.thread_table.unlock();
         return false;
     };
+    // Keep signal publication and the transition to blocked atomic with
+    // respect to each other.  The syscall caller will remove any waiter it
+    // registered and return NOT_READY/EAGAIN, allowing delivery at a safe
+    // user-frame boundary instead of leaving a completion waiter behind.
+    if (firstUnblockedPendingSignal(ctx) != 0 and ctx.signal_entry != 0 and
+        !ctx.signal_interrupt_consumed)
+    {
+        ctx.signal_interrupt_consumed = true;
+        scheduler_state.thread_table.unlock();
+        return false;
+    }
 
     var saved = frame.*;
     saved.rax = resume_rax;

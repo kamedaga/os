@@ -99,12 +99,9 @@ static int64_t lpr_drmd_call_transfer(
     if (reply_fd < 16) {
         return lpr_pacha_status_to_errno(reply_fd);
     }
-    const int64_t recv_status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         return lpr_pacha_status_to_errno(recv_status);

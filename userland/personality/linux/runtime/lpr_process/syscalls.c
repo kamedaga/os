@@ -781,22 +781,33 @@ int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset
     if (set_raw == 0) {
         return 0;
     }
+    const uint64_t old_mask = lpr_linux_signal_mask;
     const uint64_t set = *(const uint64_t *)(uintptr_t)set_raw;
+    int dispatch_pending = 0;
     switch (how) {
     case LPR_LINUX_SIG_BLOCK:
         lpr_linux_signal_mask |= set;
         lpr_linux_signal_mask &= ~lpr_linux_unblockable_signal_mask();
-        return 0;
+        break;
     case LPR_LINUX_SIG_UNBLOCK:
         lpr_linux_signal_mask &= ~set;
         lpr_linux_signal_mask &= ~lpr_linux_unblockable_signal_mask();
-        return lpr_linux_dispatch_pending_signals();
+        dispatch_pending = 1;
+        break;
     case LPR_LINUX_SIG_SETMASK:
         lpr_linux_signal_mask = set & ~lpr_linux_unblockable_signal_mask();
-        return lpr_linux_dispatch_pending_signals();
+        dispatch_pending = 1;
+        break;
     default:
         return -LPR_LINUX_EINVAL;
     }
+    const int64_t sync_status = lpr_linux_sync_native_signal_mask();
+    if (sync_status != 0) {
+        lpr_linux_signal_mask = old_mask;
+        (void)lpr_linux_sync_native_signal_mask();
+        return sync_status;
+    }
+    return dispatch_pending ? lpr_linux_dispatch_pending_signals_with_result(0) : 0;
 }
 
 int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uint64_t rusage)

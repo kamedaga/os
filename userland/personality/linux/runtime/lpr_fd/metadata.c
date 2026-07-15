@@ -74,12 +74,9 @@ static int64_t lpr_linux_file_vmo_call(
 
     reply.fds = reply_fd_items;
     reply.fd_capacity = 1;
-    const int64_t recv_status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_IPC_RECV_WAIT,
+    const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)call_reply_fd,
-        (uint64_t)(uintptr_t)&reply,
-        UINT64_MAX,
-        0);
+        &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)call_reply_fd);
     if (recv_status != 0) {
         lpr_destroy_pread_vmo_wire_page(page_fd, page);

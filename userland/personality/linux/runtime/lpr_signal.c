@@ -1,4 +1,5 @@
 #include "lpr_filed_internal.h"
+#include <personality/lpr_signal_stack.h>
 
 __asm__(
     ".pushsection .text\n"
@@ -104,6 +105,9 @@ typedef struct lpr_linux_signal_frame {
 
 _Static_assert(sizeof(lpr_pacha_trap_frame_t) == 160, "Pacha signal trap frame size");
 _Static_assert(sizeof(lpr_pacha_signal_frame_t) == PACHAOS_PROCESS_SIGNAL_FRAME_SIZE, "Pacha signal frame size");
+_Static_assert(LPR_NATIVE_SIGNAL_RED_ZONE_BYTES == LPR_SIGNAL_RED_ZONE, "native signal red zone size");
+_Static_assert(LPR_NATIVE_SIGNAL_FRAME_BYTES == PACHAOS_PROCESS_SIGNAL_FRAME_SIZE, "native signal frame layout size");
+_Static_assert(LPR_NATIVE_SIGNAL_RUNTIME_STACK_BYTES == PACHAOS_PROCESS_SIGNAL_RUNTIME_STACK_SIZE, "native signal runtime stack size");
 _Static_assert(sizeof(lpr_linux_siginfo_t) == 128, "Linux siginfo size");
 _Static_assert(sizeof(lpr_linux_mcontext_t) == 256, "Linux mcontext size");
 _Static_assert(sizeof(lpr_linux_ucontext_t) == 936, "Linux ucontext size");
@@ -138,19 +142,33 @@ void lpr_linux_signal_runtime_init(void)
     if (lpr_linux_signal_runtime_registered) {
         return;
     }
-    const int64_t status = lpr_pacha_syscall4(
+    const int64_t status = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_REGISTER,
         (uint64_t)(uintptr_t)lpr_async_signal_entry,
         (uint64_t)(uintptr_t)lpr_runtime_text_start,
-        (uint64_t)(uintptr_t)lpr_runtime_text_end);
+        (uint64_t)(uintptr_t)lpr_runtime_text_end,
+        LPR_ZPOLINE_PAGE_VA,
+        LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE);
     if (status == PACHAOS_SYSCALL_OK) {
         lpr_linux_signal_runtime_registered = 1;
     }
 }
 
+int64_t lpr_linux_sync_native_signal_mask(void)
+{
+    lpr_linux_signal_runtime_init();
+    const int64_t status = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHAOS_PROCESS_SIGNAL_CTL_SET_MASK,
+        lpr_linux_signal_mask);
+    return status == PACHAOS_SYSCALL_OK ? 0 : lpr_pacha_status_to_errno(status);
+}
+
 static _Noreturn void lpr_native_signal_return(lpr_pacha_signal_frame_t *frame)
 {
+    // SIGNAL_CTL_RETURN replaces the current native trap frame and therefore
+    // abandons the current LPR dispatch stack instead of returning here.
     (void)lpr_pacha_syscall2(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_RETURN,
@@ -162,12 +180,20 @@ static _Noreturn void lpr_native_signal_return(lpr_pacha_signal_frame_t *frame)
 
 void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result)
 {
-    if (lpr_active_user_frame == 0) return;
-    lpr_active_user_frame->rax = (uint64_t)interrupted_result;
+    struct lpr_linux_user_frame *interrupted_frame =
+        (struct lpr_linux_user_frame *)lpr_current_linux_user_frame();
+    if (interrupted_frame == 0) return;
+    const uint64_t saved_rax = interrupted_frame->rax;
+    interrupted_frame->rax = (uint64_t)interrupted_result;
+    // A successful DELIVER_PENDING_FRAME redirects directly to the native
+    // signal entry, so the interrupted dispatch and its stack-local frame
+    // anchor are abandoned together.
     (void)lpr_pacha_syscall2(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_DELIVER_PENDING_FRAME,
-        (uint64_t)(uintptr_t)lpr_active_user_frame);
+        (uint64_t)(uintptr_t)interrupted_frame);
+    // Reached only when no signal frame was installed.
+    interrupted_frame->rax = saved_rax;
 }
 
 static void lpr_signal_context_to_linux(
@@ -240,8 +266,20 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
 
     const uint32_t sig = (uint32_t)native->signo;
     const uint64_t bit = lpr_linux_signal_bit(sig);
+    uint64_t return_mask = lpr_linux_signal_mask;
+    const int restore_wait_mask = lpr_linux_wait_restore_mask_active != 0;
+    if (restore_wait_mask) {
+        return_mask = lpr_linux_wait_restore_mask;
+        lpr_linux_wait_restore_mask_active = 0;
+    }
     if ((lpr_linux_signal_mask & bit) != 0) {
         lpr_linux_queue_signal(sig);
+        if (restore_wait_mask) {
+            lpr_linux_signal_mask = return_mask;
+            if (lpr_linux_sync_native_signal_mask() != 0) {
+                lpr_linux_exit_for_signal(11u);
+            }
+        }
         lpr_native_signal_return(native);
     }
 
@@ -249,11 +287,23 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     if (action->handler == LPR_LINUX_SIG_IGN ||
         (action->handler == LPR_LINUX_SIG_DFL && lpr_linux_default_signal_ignored(sig)))
     {
+        if (restore_wait_mask) {
+            lpr_linux_signal_mask = return_mask;
+            if (lpr_linux_sync_native_signal_mask() != 0) {
+                lpr_linux_exit_for_signal(11u);
+            }
+        }
         lpr_native_signal_return(native);
     }
     if (action->handler == LPR_LINUX_SIG_DFL) {
         if (lpr_linux_default_signal_stops(sig)) {
             lpr_linux_queue_signal(sig);
+            if (restore_wait_mask) {
+                lpr_linux_signal_mask = return_mask;
+                if (lpr_linux_sync_native_signal_mask() != 0) {
+                    lpr_linux_exit_for_signal(11u);
+                }
+            }
             lpr_native_signal_return(native);
         }
         lpr_linux_exit_for_signal(sig);
@@ -292,7 +342,7 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     body->magic = LPR_SIGNAL_FRAME_MAGIC;
     body->signo = sig;
     body->handler = action->handler;
-    body->old_mask = lpr_linux_signal_mask;
+    body->old_mask = return_mask;
     lpr_memcpy(&body->native, native, sizeof(body->native));
     body->info.si_signo = (int32_t)sig;
     body->info.si_code = 0;
@@ -304,7 +354,7 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     } else if (!altstack_enabled) {
         body->ucontext.uc_stack.ss_flags |= LPR_LINUX_SS_DISABLE;
     }
-    body->ucontext.uc_sigmask[0] = lpr_linux_signal_mask;
+    body->ucontext.uc_sigmask[0] = return_mask;
     lpr_signal_context_to_linux(&body->native, &body->ucontext);
 
     uint64_t restorer = action->restorer;
@@ -318,6 +368,9 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
         lpr_linux_signal_mask |= bit;
     }
     lpr_linux_signal_mask &= ~lpr_linux_unblockable_signal_mask();
+    if (lpr_linux_sync_native_signal_mask() != 0) {
+        lpr_linux_exit_for_signal(11u);
+    }
     if ((action->flags & LPR_LINUX_SA_RESETHAND) != 0) {
         action->handler = LPR_LINUX_SIG_DFL;
     }
@@ -338,6 +391,9 @@ _Noreturn void lpr_linux_rt_sigreturn_body(void *body_raw)
     lpr_signal_context_from_linux(&body->native, &body->ucontext);
     lpr_linux_signal_mask =
         body->ucontext.uc_sigmask[0] & ~lpr_linux_unblockable_signal_mask();
+    if (lpr_linux_sync_native_signal_mask() != 0) {
+        lpr_linux_exit_for_signal(11u);
+    }
     lpr_native_signal_return(&body->native);
 }
 
@@ -354,8 +410,10 @@ _Noreturn void lpr_linux_rt_sigreturn_frame(const struct lpr_linux_user_frame *f
 int64_t lpr_linux_sigaltstack(uint64_t ss_raw, uint64_t old_ss_raw)
 {
     uint64_t rsp = 0;
-    if (lpr_active_user_frame != 0) {
-        rsp = lpr_active_user_frame->rsp;
+    const struct lpr_linux_user_frame *active_frame =
+        lpr_current_linux_user_frame();
+    if (active_frame != 0) {
+        rsp = active_frame->rsp;
     }
     const int on_altstack = lpr_signal_sp_on_altstack(rsp);
     if (old_ss_raw != 0) {
