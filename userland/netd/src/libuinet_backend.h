@@ -16,7 +16,8 @@ enum netd_libuinet_state {
 int netd_libuinet_start(struct netd_runtime *runtime);
 int netd_libuinet_receive_frame(const struct netd_upper_frame *frame);
 void netd_libuinet_poll(void);
-int netd_libuinet_needs_periodic_poll(void);
+int netd_libuinet_collect_runtime_wait_sources(
+    struct pacha_service_wait_set *wait_set);
 enum netd_libuinet_state netd_libuinet_state(void);
 uint64_t netd_libuinet_rx_frames(void);
 uint64_t netd_libuinet_rx_drops(void);

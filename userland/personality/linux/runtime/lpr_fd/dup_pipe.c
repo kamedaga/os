@@ -116,7 +116,8 @@ int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags)
 
 int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
 {
-    const uint64_t known_flags = LPR_LINUX_O_CLOEXEC | LPR_LINUX_O_NONBLOCK;
+    const uint64_t known_flags =
+        LPR_LINUX_O_CLOEXEC | LPR_LINUX_O_NONBLOCK | LPR_LINUX_EFD_SEMAPHORE;
     if ((flags & ~known_flags) != 0) {
         return -LPR_LINUX_EINVAL;
     }
@@ -124,22 +125,62 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
     if (fd < 0) {
         return fd;
     }
+    int wait_fd = -1;
+    int notify_fd = -1;
+    const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
+    if (pair_status != 0) return pair_status;
     const int status = lpr_control_install_fd(
         (uint64_t)(uint32_t)fd,
         LPR_FD_OPS_EVENT,
-        flags,
+        flags & ~((uint64_t)LPR_LINUX_EFD_SEMAPHORE),
         0,
         initval);
     if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
         return status;
     }
     lpr_event_backend_t *event = lpr_event_backend((uint64_t)(uint32_t)fd);
     if (event == 0) {
         lpr_control_close_fd((uint64_t)(uint32_t)fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
         return -LPR_LINUX_EIO;
     }
     event->subtype = LPR_EVENT_BACKEND_EVENTFD;
+    event->reserved1 =
+        (flags & LPR_LINUX_EFD_SEMAPHORE) != 0 ? LPR_LINUX_EFD_SEMAPHORE : 0;
+    event->wait_fd.raw = wait_fd;
+    event->notify_fd.raw = notify_fd;
     return fd;
+}
+
+void lpr_event_backend_notify(lpr_event_backend_t *event)
+{
+    if (event == 0 || event->notify_fd.raw < 16) return;
+    if (__atomic_exchange_n(&event->notify_pending, 1u, __ATOMIC_ACQ_REL) != 0)
+        return;
+    const struct pacha_ipc_msg message = {0};
+    const int64_t status = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_IPC_SEND,
+        (uint64_t)(uint32_t)event->notify_fd.raw,
+        (uint64_t)(uintptr_t)&message);
+    if (status != 0)
+        __atomic_store_n(&event->notify_pending, 0u, __ATOMIC_RELEASE);
+}
+
+int lpr_eventfd_native_wait_fd(uint64_t fd)
+{
+    lpr_event_backend_t *event = lpr_event_backend(fd);
+    return event != 0 ? event->wait_fd.raw : -1;
+}
+
+void lpr_eventfd_drain_wait(uint64_t fd)
+{
+    lpr_event_backend_t *event = lpr_event_backend(fd);
+    if (event == 0 || event->wait_fd.raw < 16) return;
+    __atomic_store_n(&event->notify_pending, 0u, __ATOMIC_RELEASE);
+    lpr_native_wait_drain(event->wait_fd.raw);
 }
 
 int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec)

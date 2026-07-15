@@ -5,6 +5,7 @@
 #include "netlink_socket.h"
 #include "socket_service.h"
 #include "unix_socket.h"
+#include "pacha/capsule.h"
 #include "pacha/ipc.h"
 
 #include <stdint.h>
@@ -77,6 +78,15 @@ int main(int argc, char **argv)
     if (status != 0) {
         return status;
     }
+    struct pacha_capsule_irq wake_irq;
+    memset(&wake_irq, 0, sizeof(wake_irq));
+    if (pacha_capsule_device_derive_irq(
+            (int)cfg->device_fd,
+            PACHA_CAPSULE_IRQ_AUTO,
+            0,
+            0,
+            &wake_irq) != 0)
+        return 8;
 
     printf("[netd] ready\n");
     netd_metrics_record("total_to_ready", total_start_cycles, netd_metrics_read_tsc());
@@ -85,18 +95,23 @@ int main(int argc, char **argv)
     fflush(stderr);
 
     for (;;) {
+        uint64_t next_irq_count = 0;
+        if (pacha_capsule_irq_poll(
+                wake_irq.fd, wake_irq.count, &next_irq_count) == 0)
+            wake_irq.count = next_irq_count;
         netd_packet_io_pump_once();
         netd_socket_service_poll();
         static struct pacha_service_wait_set wait_set;
         if (pacha_service_wait_init(&wait_set, (int)cfg->socket_endpoint_fd) != 0 ||
+            pacha_service_wait_add(
+                &wait_set, wake_irq.fd, PACHA_FD_EVENT_READABLE) != 0 ||
+            netd_libuinet_collect_runtime_wait_sources(&wait_set) != 0 ||
             netd_socket_service_collect_wait_sources(&wait_set) != 0 ||
             netd_unix_socket_collect_wait_sources(&wait_set) != 0 ||
             netd_netlink_socket_collect_wait_sources(&wait_set) != 0 ||
             netd_libuinet_socket_collect_wait_sources(&wait_set) != 0)
             return 8;
-        (void)pacha_service_wait(
-            &wait_set,
-            netd_libuinet_needs_periodic_poll() ? 1u : PACHA_FD_WAIT_FOREVER);
+        (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
         netd_socket_service_reap_hangups();
         netd_unix_socket_reap_hangups();
         netd_netlink_socket_reap_hangups();

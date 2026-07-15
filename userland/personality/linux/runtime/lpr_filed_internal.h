@@ -3,6 +3,7 @@
 
 #include "lpr_error.h"
 #include "lpr_epoll.h"
+#include "lpr_wait.h"
 #include "lpr_fd/table.h"
 #include "lpr_filed.h"
 #include "lpr_linux_syscall.h"
@@ -118,6 +119,7 @@
 #define LPR_LINUX_SA_RESTORER 0x04000000ull
 #define LPR_LINUX_SA_ONSTACK 0x08000000ull
 #define LPR_LINUX_SA_RESTART 0x10000000ull
+#define LPR_LINUX_EFD_SEMAPHORE 1u
 #define LPR_LINUX_SA_NODEFER 0x40000000ull
 #define LPR_LINUX_SA_RESETHAND 0x80000000ull
 #define LPR_LINUX_SS_ONSTACK 1u
@@ -745,6 +747,9 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd);
 int lpr_linux_default_signal_ignored(uint32_t sig);
 int lpr_linux_default_signal_stops(uint32_t sig);
 int lpr_linux_eventfd_active(uint64_t fd);
+int lpr_eventfd_native_wait_fd(uint64_t fd);
+void lpr_eventfd_drain_wait(uint64_t fd);
+void lpr_event_backend_notify(lpr_event_backend_t *event);
 int lpr_linux_timerfd_active(uint64_t fd);
 int lpr_linux_drm_fd_active(uint64_t fd);
 int lpr_linux_input_fd_active(uint64_t fd);
@@ -911,7 +916,6 @@ int64_t lpr_termd_transfer_dup_handle(uint64_t handle, int lease_fd, uint64_t *o
 int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_tty_open_path(const char *path, uint64_t flags);
-int64_t lpr_tty_sleep_ms(uint64_t ms);
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
 uint16_t lpr_control_fd_flags_from_fcntl(uint64_t flags);
 uint16_t lpr_control_fd_flags_from_linux(uint64_t flags);
@@ -923,6 +927,7 @@ uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
 uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_timerfd_poll_events(uint64_t fd, uint32_t events);
+int64_t lpr_timerfd_remaining_ns(uint64_t fd, uint64_t *out_remaining_ns);
 uint32_t lpr_linux_first_pending_signal(uint64_t mask);
 uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events);

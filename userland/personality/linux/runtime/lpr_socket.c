@@ -140,7 +140,11 @@ typedef struct lpr_linux_timeval {
     int64_t tv_usec;
 } lpr_linux_timeval_t;
 
-static int64_t lpr_linux_sleep_ms(uint64_t ms);
+typedef struct lpr_linux_pselect_sigmask {
+    uint64_t sigmask;
+    uint64_t sigsetsize;
+} lpr_linux_pselect_sigmask_t;
+
 static int64_t lpr_linux_socket_wait_events(uint64_t fd, uint32_t events, int32_t timeout_ms);
 
 int lpr_fd_slot_alloc_from(uint64_t min_fd);
@@ -1808,10 +1812,14 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
 
 static int64_t lpr_linux_socket_wait_events(uint64_t fd, uint32_t events, int32_t timeout_ms)
 {
-    int64_t remaining_ms = timeout_ms == 0 ? -1 : timeout_ms;
+    lpr_wait_deadline_t deadline;
+    int64_t status = lpr_wait_deadline_init(
+        &deadline, timeout_ms == 0 ? -1 : timeout_ms);
+    if (status != 0) return status;
     for (;;) {
         uint32_t revents = 0;
-        const int64_t status = lpr_linux_socket_poll_one(fd, events | LPR_LINUX_POLLERR, &revents);
+        status = lpr_linux_socket_poll_one(
+            fd, events | LPR_LINUX_POLLERR, &revents);
         if (status != 0) {
             return status;
         }
@@ -1821,23 +1829,16 @@ static int64_t lpr_linux_socket_wait_events(uint64_t fd, uint32_t events, int32_
         if ((revents & events) != 0) {
             return 0;
         }
-        if (remaining_ms == 0) {
-            return -LPR_LINUX_EAGAIN;
-        }
-        uint64_t sleep_ms = 10;
-        if (remaining_ms > 0 && remaining_ms < (int32_t)sleep_ms) {
-            sleep_ms = (uint64_t)remaining_ms;
-        }
-        const int64_t sleep_status = lpr_linux_sleep_ms(sleep_ms);
-        if (sleep_status != 0) {
-            return sleep_status;
-        }
-        if (remaining_ms > 0) {
-            remaining_ms -= (int32_t)sleep_ms;
-            if (remaining_ms <= 0) {
-                return -LPR_LINUX_EAGAIN;
-            }
-        }
+        int expired = 0;
+        status = lpr_wait_deadline_expired(&deadline, &expired);
+        if (status != 0) return status;
+        if (expired) return -LPR_LINUX_EAGAIN;
+        lpr_wait_graph_t graph;
+        lpr_wait_graph_init(&graph);
+        status = lpr_wait_graph_add_fd(&graph, fd, events);
+        if (status != 0) return status;
+        status = lpr_wait_graph_block(&graph, &deadline);
+        if (status != 0) return status;
     }
 }
 
@@ -1850,8 +1851,17 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             continue;
         }
         const uint64_t fd = (uint64_t)(uint32_t)fds[i].fd;
-        if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
-            fds[i].revents = (int16_t)lpr_linux_eventfd_poll_events(fd, (uint32_t)fds[i].events);
+        if (lpr_linux_timerfd_active(fd)) {
+            fds[i].revents = (int16_t)lpr_linux_timerfd_poll_events(
+                fd, (uint32_t)fds[i].events);
+            if (fds[i].revents != 0) {
+                ready++;
+            }
+            continue;
+        }
+        if (lpr_linux_eventfd_active(fd)) {
+            fds[i].revents = (int16_t)lpr_linux_eventfd_poll_events(
+                fd, (uint32_t)fds[i].events);
             if (fds[i].revents != 0) {
                 ready++;
             }
@@ -1908,6 +1918,18 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             if (fds[i].revents != 0) ready++;
             continue;
         }
+        if (lpr_linux_epoll_fd_active(fd)) {
+            const int64_t epoll_events = lpr_epoll_poll_events(
+                fd, (uint32_t)(uint16_t)fds[i].events);
+            if (epoll_events < 0) {
+                fds[i].revents = epoll_events == -LPR_LINUX_EBADF ?
+                    LPR_LINUX_POLLNVAL : LPR_LINUX_POLLERR;
+            } else {
+                fds[i].revents = (int16_t)epoll_events;
+            }
+            if (fds[i].revents != 0) ready++;
+            continue;
+        }
         if (!lpr_linux_socket_fd_active(fd)) {
             fds[i].revents = LPR_LINUX_POLLNVAL;
             ready++;
@@ -1936,109 +1958,30 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
     return ready;
 }
 
-static int64_t lpr_linux_sleep_ms(uint64_t ms)
-{
-    if (ms == 0) {
-        return 0;
-    }
-    struct pachaos_timespec ts;
-    ts.tv_sec = ms / 1000u;
-    ts.tv_nsec = (ms % 1000u) * 1000000ull;
-    const int64_t status = lpr_pacha_syscall1(
-        PACHAOS_SYSCALL_NANOSLEEP,
-        (uint64_t)(uintptr_t)&ts);
-    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
-    return status == 0 ? 0 : lpr_negative_status(status);
-}
-
-static int lpr_linux_poll_native_fd(uint64_t fd)
-{
-    if (lpr_linux_pipe_fd_active(fd)) return (int)(uint32_t)fd;
-    if (lpr_linux_drm_fd_active(fd)) return lpr_drm_native_wait_fd(fd);
-    if (lpr_linux_input_fd_active(fd)) return lpr_input_native_wait_fd(fd);
-    if (lpr_linux_socket_fd_active(fd)) return lpr_linux_socket_native_wait_fd(fd);
-    return -1;
-}
-
-static int lpr_linux_poll_is_native_only(const lpr_linux_pollfd_t *fds, uint64_t nfds)
-{
-    int found = 0;
-    for (uint64_t i = 0; i < nfds; i += 1) {
-        if (fds[i].fd < 0) continue;
-        const uint64_t fd = (uint64_t)(uint32_t)fds[i].fd;
-        if (lpr_linux_poll_native_fd(fd) < 16) return 0;
-        found = 1;
-    }
-    return found;
-}
-
-static int64_t lpr_linux_poll_wait_native(
-    lpr_linux_pollfd_t *fds,
-    uint64_t nfds,
-    int64_t timeout_ms)
-{
-    struct pacha_pollfd native[256];
-    uint64_t count = 0;
-    lpr_memset(native, 0, sizeof(native));
-    for (uint64_t i = 0; i < nfds; i++) {
-        if (fds[i].fd < 0) continue;
-        const uint64_t fd = (uint64_t)(uint32_t)fds[i].fd;
-        if (count >= sizeof(native) / sizeof(native[0])) return -LPR_LINUX_EINVAL;
-        native[count].fd = lpr_linux_poll_native_fd(fd);
-        native[count].events = lpr_linux_pipe_fd_active(fd) ?
-            lpr_pipe_poll_events_to_pacha((uint32_t)(uint16_t)fds[i].events) :
-            ((fds[i].events & LPR_LINUX_POLLIN) != 0 ? PACHA_FD_EVENT_READABLE : 0);
-        count++;
-    }
-    const uint64_t timeout_ticks = timeout_ms < 0 ? UINT64_MAX : (uint64_t)timeout_ms;
-    const int64_t status = lpr_pacha_syscall4(
-        PACHAOS_SYSCALL_FD_WAIT_MANY,
-        (uint64_t)(uintptr_t)native,
-        count,
-        timeout_ticks,
-        0);
-    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
-    if (status < 0 &&
-        status != PACHA_SYSCALL_ERR_NOT_READY &&
-        status != -PACHA_SYSCALL_ERR_NOT_READY)
-    {
-        return lpr_pacha_status_to_errno(status);
-    }
-    return lpr_linux_poll_scan(fds, nfds);
-}
-
 static int64_t lpr_linux_poll_wait(lpr_linux_pollfd_t *fds, uint64_t nfds, int64_t timeout_ms)
 {
-    enum { LPR_POLL_QUANTUM_MS = 10 };
-    int64_t ready = lpr_linux_poll_scan(fds, nfds);
-    if (ready != 0 || timeout_ms == 0) {
-        return ready;
-    }
-
-    int64_t remaining_ms = timeout_ms;
-    const int native_only = lpr_linux_poll_is_native_only(fds, nfds);
-    if (native_only) {
-        return lpr_linux_poll_wait_native(fds, nfds, timeout_ms);
-    }
+    lpr_wait_deadline_t deadline;
+    int64_t status = lpr_wait_deadline_init(&deadline, timeout_ms);
+    if (status != 0) return status;
     for (;;) {
-        uint64_t sleep_ms = LPR_POLL_QUANTUM_MS;
-        if (remaining_ms > 0 && remaining_ms < (int64_t)sleep_ms) {
-            sleep_ms = (uint64_t)remaining_ms;
+        const int64_t ready = lpr_linux_poll_scan(fds, nfds);
+        if (ready != 0 || timeout_ms == 0) return ready;
+        int expired = 0;
+        status = lpr_wait_deadline_expired(&deadline, &expired);
+        if (status != 0) return status;
+        if (expired) return 0;
+        lpr_wait_graph_t graph;
+        lpr_wait_graph_init(&graph);
+        for (uint64_t i = 0; i < nfds; ++i) {
+            if (fds[i].fd < 0) continue;
+            status = lpr_wait_graph_add_fd(
+                &graph,
+                (uint64_t)(uint32_t)fds[i].fd,
+                (uint32_t)(uint16_t)fds[i].events);
+            if (status != 0) return status;
         }
-        const int64_t sleep_status = lpr_linux_sleep_ms(sleep_ms);
-        if (sleep_status != 0) {
-            return sleep_status;
-        }
-        ready = lpr_linux_poll_scan(fds, nfds);
-        if (ready != 0) {
-            return ready;
-        }
-        if (remaining_ms > 0) {
-            remaining_ms -= (int64_t)sleep_ms;
-            if (remaining_ms <= 0) {
-                return 0;
-            }
-        }
+        status = lpr_wait_graph_block(&graph, &deadline);
+        if (status != 0) return status;
     }
 }
 
@@ -2058,10 +2001,39 @@ int64_t lpr_linux_poll(uint64_t fds_raw, uint64_t nfds, uint64_t timeout_ms)
         (int64_t)timeout_ms);
 }
 
+static int64_t lpr_linux_wait_mask_begin(
+    uint64_t sigmask,
+    uint64_t sigsetsize,
+    uint64_t *out_old_mask)
+{
+    if (sigmask == 0) return 0;
+    if (sigsetsize != sizeof(uint64_t)) return -LPR_LINUX_EINVAL;
+    if (!lpr_user_range_plausible(sigmask, sizeof(uint64_t)))
+        return -LPR_LINUX_EFAULT;
+    lpr_linux_wait_restore_mask = lpr_linux_signal_mask;
+    lpr_linux_wait_restore_mask_active = 1;
+    const int64_t status = lpr_linux_rt_sigprocmask(
+        LPR_LINUX_SIG_SETMASK,
+        sigmask,
+        (uint64_t)(uintptr_t)out_old_mask,
+        sizeof(uint64_t));
+    if (status != 0) lpr_linux_wait_restore_mask_active = 0;
+    return status;
+}
+
+static void lpr_linux_wait_mask_end(uint64_t sigmask, uint64_t old_mask)
+{
+    if (sigmask == 0) return;
+    (void)lpr_linux_rt_sigprocmask(
+        LPR_LINUX_SIG_SETMASK,
+        (uint64_t)(uintptr_t)&old_mask,
+        0,
+        sizeof(old_mask));
+    lpr_linux_wait_restore_mask_active = 0;
+}
+
 int64_t lpr_linux_ppoll(uint64_t fds, uint64_t nfds, uint64_t timeout_ts, uint64_t sigmask, uint64_t sigsetsize)
 {
-    (void)sigmask;
-    (void)sigsetsize;
     if (fds == 0 && nfds != 0) {
         return -LPR_LINUX_EFAULT;
     }
@@ -2085,7 +2057,14 @@ int64_t lpr_linux_ppoll(uint64_t fds, uint64_t nfds, uint64_t timeout_ts, uint64
             timeout_ms = ts->tv_sec * 1000ll + (ts->tv_nsec + 999999ll) / 1000000ll;
         }
     }
-    return lpr_linux_poll_wait((lpr_linux_pollfd_t *)(uintptr_t)fds, nfds, timeout_ms);
+    uint64_t old_mask = 0;
+    const int64_t mask_status = lpr_linux_wait_mask_begin(
+        sigmask, sigsetsize, &old_mask);
+    if (mask_status != 0) return mask_status;
+    const int64_t result = lpr_linux_poll_wait(
+        (lpr_linux_pollfd_t *)(uintptr_t)fds, nfds, timeout_ms);
+    lpr_linux_wait_mask_end(sigmask, old_mask);
+    return result;
 }
 
 static int64_t lpr_linux_select_scan(
@@ -2128,7 +2107,14 @@ static int64_t lpr_linux_select_scan(
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_write = (revents & LPR_LINUX_POLLOUT) != 0;
             is_except = (revents & LPR_LINUX_POLLERR) != 0 || lpr_socket_backend(fd)->last_error != 0;
-        } else if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
+        } else if (lpr_linux_timerfd_active(fd)) {
+            uint32_t events = 0;
+            if (want_read) {
+                events |= LPR_LINUX_POLLIN;
+            }
+            const uint32_t revents = lpr_linux_timerfd_poll_events(fd, events);
+            is_read = (revents & LPR_LINUX_POLLIN) != 0;
+        } else if (lpr_linux_eventfd_active(fd)) {
             uint32_t events = 0;
             if (want_read) {
                 events |= LPR_LINUX_POLLIN;
@@ -2248,7 +2234,9 @@ static int64_t lpr_linux_select_wait(
         lpr_memcpy(except_orig, (const void *)(uintptr_t)exceptfds, (size_t)(words * sizeof(uint64_t)));
     }
 
-    int64_t remaining_ms = timeout_ms;
+    lpr_wait_deadline_t deadline;
+    int64_t status = lpr_wait_deadline_init(&deadline, timeout_ms);
+    if (status != 0) return status;
     for (;;) {
         if (readfds != 0) {
             lpr_memcpy((void *)(uintptr_t)readfds, read_orig, (size_t)(words * sizeof(uint64_t)));
@@ -2272,29 +2260,27 @@ static int64_t lpr_linux_select_wait(
             return ready;
         }
 
-        uint64_t sleep_ms = 10;
-        if (remaining_ms > 0 && remaining_ms < (int64_t)sleep_ms) {
-            sleep_ms = (uint64_t)remaining_ms;
+        int expired = 0;
+        status = lpr_wait_deadline_expired(&deadline, &expired);
+        if (status != 0) return status;
+        if (expired) return 0;
+
+        lpr_wait_graph_t graph;
+        lpr_wait_graph_init(&graph);
+        for (uint64_t fd = 0; fd < nfds; ++fd) {
+            uint32_t events = 0;
+            if (readfds != 0 && lpr_fdset_test(read_orig, fd))
+                events |= LPR_LINUX_POLLIN;
+            if (writefds != 0 && lpr_fdset_test(write_orig, fd))
+                events |= LPR_LINUX_POLLOUT;
+            if (exceptfds != 0 && lpr_fdset_test(except_orig, fd))
+                events |= LPR_LINUX_POLLERR;
+            if (events == 0) continue;
+            status = lpr_wait_graph_add_fd(&graph, fd, events);
+            if (status != 0) return status;
         }
-        const int64_t sleep_status = lpr_linux_sleep_ms(sleep_ms);
-        if (sleep_status != 0) {
-            return sleep_status;
-        }
-        if (remaining_ms > 0) {
-            remaining_ms -= (int64_t)sleep_ms;
-            if (remaining_ms <= 0) {
-                if (readfds != 0) {
-                    lpr_memset((void *)(uintptr_t)readfds, 0, (size_t)(words * sizeof(uint64_t)));
-                }
-                if (writefds != 0) {
-                    lpr_memset((void *)(uintptr_t)writefds, 0, (size_t)(words * sizeof(uint64_t)));
-                }
-                if (exceptfds != 0) {
-                    lpr_memset((void *)(uintptr_t)exceptfds, 0, (size_t)(words * sizeof(uint64_t)));
-                }
-                return 0;
-            }
-        }
+        status = lpr_wait_graph_block(&graph, &deadline);
+        if (status != 0) return status;
     }
 }
 
@@ -2315,7 +2301,6 @@ int64_t lpr_linux_select(uint64_t nfds, uint64_t readfds, uint64_t writefds, uin
 
 int64_t lpr_linux_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds, uint64_t timeout, uint64_t sigmask)
 {
-    (void)sigmask;
     int64_t timeout_ms = -1;
     if (timeout != 0) {
         if (!lpr_user_range_plausible(timeout, sizeof(lpr_linux_timespec_t))) {
@@ -2326,5 +2311,22 @@ int64_t lpr_linux_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds, u
             return status;
         }
     }
-    return lpr_linux_select_wait(nfds, readfds, writefds, exceptfds, timeout_ms);
+    uint64_t sigmask_pointer = 0;
+    uint64_t sigsetsize = 0;
+    if (sigmask != 0) {
+        if (!lpr_user_range_plausible(sigmask, sizeof(lpr_linux_pselect_sigmask_t)))
+            return -LPR_LINUX_EFAULT;
+        const lpr_linux_pselect_sigmask_t *mask =
+            (const lpr_linux_pselect_sigmask_t *)(uintptr_t)sigmask;
+        sigmask_pointer = mask->sigmask;
+        sigsetsize = mask->sigsetsize;
+    }
+    uint64_t old_mask = 0;
+    const int64_t mask_status = lpr_linux_wait_mask_begin(
+        sigmask_pointer, sigsetsize, &old_mask);
+    if (mask_status != 0) return mask_status;
+    const int64_t result = lpr_linux_select_wait(
+        nfds, readfds, writefds, exceptfds, timeout_ms);
+    lpr_linux_wait_mask_end(sigmask_pointer, old_mask);
+    return result;
 }

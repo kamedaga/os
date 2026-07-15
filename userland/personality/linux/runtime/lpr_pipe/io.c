@@ -95,37 +95,27 @@ int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes)
     if (pipe == 0 || pipe->native.raw < 0) {
         return -LPR_LINUX_EBADF;
     }
-    for (;;) {
-        struct pacha_pollfd pollfd;
-        lpr_memset(&pollfd, 0, sizeof(pollfd));
-        pollfd.fd = pipe->native.raw;
-        pollfd.events = lpr_pipe_poll_events_to_pacha(events | 0x0008u);
-        pollfd.revents = (events & 0x0004u) != 0 ? min_write_bytes : 0;
-        const int64_t wait_status = lpr_pacha_syscall4(
-            PACHAOS_SYSCALL_FD_WAIT_MANY,
-            (uint64_t)(uintptr_t)&pollfd,
-            1,
-            PACHA_FD_WAIT_FOREVER,
-            0);
-        if (wait_status == PACHA_SYSCALL_ERR_NOT_READY ||
-            wait_status == -PACHA_SYSCALL_ERR_NOT_READY)
-        {
-            continue;
-        }
-        if (wait_status < 0) {
-            const int64_t status = lpr_pacha_status_to_errno(wait_status);
-            if (status == -LPR_LINUX_EAGAIN) continue;
-            return status;
-        }
-        if (wait_status > 0) {
-            const uint32_t revents = lpr_pipe_poll_events_from_pacha(pollfd.revents);
-            if ((revents & 0x0008u) != 0) {
-                lpr_linux_raise_sigpipe();
-                return -LPR_LINUX_EPIPE;
-            }
-            if ((revents & (events | 0x0010u)) != 0) return 0;
-        }
+    lpr_wait_graph_t graph;
+    lpr_wait_deadline_t deadline;
+    lpr_wait_graph_init(&graph);
+    int64_t status = lpr_wait_graph_add_native_min(
+        &graph,
+        pipe->native.raw,
+        lpr_pipe_poll_events_to_pacha(events | 0x0008u),
+        (events & 0x0004u) != 0 ? min_write_bytes : 0);
+    if (status == 0)
+        status = lpr_wait_deadline_init(&deadline, -1);
+    if (status == 0)
+        status = lpr_wait_graph_block(&graph, &deadline);
+    if (status != 0)
+        return status;
+    const uint32_t revents = lpr_pipe_poll_events_from_pacha(
+        graph.leaves[0].revents);
+    if ((revents & 0x0008u) != 0) {
+        lpr_linux_raise_sigpipe();
+        return -LPR_LINUX_EPIPE;
     }
+    return 0;
 }
 
 int lpr_linux_eventfd_active(uint64_t fd)

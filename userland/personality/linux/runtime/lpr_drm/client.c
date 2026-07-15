@@ -775,14 +775,16 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
             return lpr_pacha_status_to_errno(recv_status);
         }
         if ((drm->flags & LPR_LINUX_O_NONBLOCK) != 0) return -LPR_LINUX_EAGAIN;
-        struct pacha_pollfd waitfd = {
-            .fd = drm->wait_fd.raw,
-            .events = PACHA_FD_EVENT_READABLE,
-        };
-        const int64_t wait_status = lpr_pacha_syscall4(
-            PACHAOS_SYSCALL_FD_WAIT_MANY,
-            (uint64_t)(uintptr_t)&waitfd, 1, UINT64_MAX, 0);
-        if (wait_status < 0) return lpr_pacha_status_to_errno(wait_status);
+        lpr_wait_graph_t graph;
+        lpr_wait_deadline_t deadline;
+        lpr_wait_graph_init(&graph);
+        int64_t wait_status = lpr_wait_graph_add_fd(
+            &graph, fd, 0x0001u);
+        if (wait_status == 0)
+            wait_status = lpr_wait_deadline_init(&deadline, -1);
+        if (wait_status == 0)
+            wait_status = lpr_wait_graph_block(&graph, &deadline);
+        if (wait_status != 0) return wait_status;
     }
 }
 

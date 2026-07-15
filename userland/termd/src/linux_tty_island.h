@@ -34,6 +34,9 @@ struct termd_linux_tty_island {
     int32_t load_status;
     int32_t init_status;
     uint64_t signal_generation;
+    int wake_irq_fd;
+    uint32_t reserved1;
+    uint64_t wake_irq_count;
     const char *loader_version;
     kb_device_backend_t *backend;
     kb_platform_t *platform;

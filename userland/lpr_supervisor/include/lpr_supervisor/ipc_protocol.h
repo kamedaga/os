@@ -50,6 +50,7 @@ typedef struct lprs_token_request {
 typedef struct lprs_process_state {
     uint64_t token;
     uint64_t generation;
+    uint64_t child_sequence;
     uint64_t pid;
     uint64_t ppid;
     uint64_t sid;
@@ -118,7 +119,7 @@ typedef struct lprs_diag_error_get {
     uint64_t token;
 } lprs_diag_error_get_t;
 
-_Static_assert(sizeof(lprs_process_state_t) == 616, "lprs_process_state size");
+_Static_assert(sizeof(lprs_process_state_t) == 624, "lprs_process_state size");
 _Static_assert(sizeof(lprs_fork_t) == 48, "lprs_fork size");
 _Static_assert(sizeof(lprs_wait4_t) == 48, "lprs_wait4 size");
 _Static_assert(sizeof(lprs_pid_op_t) == 32, "lprs_pid_op size");

@@ -2,6 +2,7 @@
 #include "termd_service.h"
 
 #include <pacha/abi.h>
+#include <pacha/capsule.h>
 #include <pacha/ipc.h>
 #include <pacha/trace.h>
 
@@ -65,6 +66,15 @@ int main(void)
     }
 
     for (;;) {
+        if (tty_island.wake_irq_fd >= 16) {
+            uint64_t next_count = 0;
+            if (pacha_capsule_irq_poll(
+                    tty_island.wake_irq_fd,
+                    tty_island.wake_irq_count,
+                    &next_count) == 0)
+                tty_island.wake_irq_count = next_count;
+        }
+        termd_linux_tty_island_pump(&tty_island);
         struct pacha_ipc_msg request;
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         memset(&request, 0, sizeof(request));
@@ -87,8 +97,16 @@ int main(void)
             int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
             if (pacha_service_wait_init(&wait_set, (int)cfg->tty_endpoint_fd) != 0)
                 return 1;
+            if (tty_island.wake_irq_fd >= 16 &&
+                pacha_service_wait_add(
+                    &wait_set,
+                    tty_island.wake_irq_fd,
+                    PACHA_FD_EVENT_READABLE) != 0)
+                return 1;
             const size_t notify_count = termd_linux_tty_island_collect_wait_sources(
-                notify_fds, PACHA_SERVICE_WAIT_MAX_FDS - 1u);
+                notify_fds,
+                PACHA_SERVICE_WAIT_MAX_FDS - 1u -
+                    (tty_island.wake_irq_fd >= 16 ? 1u : 0u));
             for (size_t i = 0; i < notify_count; ++i) {
                 if (pacha_service_wait_add(
                         &wait_set, notify_fds[i], PACHA_FD_EVENT_HANGUP) != 0)

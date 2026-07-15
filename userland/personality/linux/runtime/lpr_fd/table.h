@@ -64,13 +64,16 @@ typedef struct lpr_pipe_backend {
 typedef struct lpr_event_backend {
     uint8_t active;
     uint8_t subtype;
-    uint16_t reserved1;
+    uint8_t notify_pending;
+    uint8_t reserved1;
     uint32_t flags;
     uint64_t counter;
     uint64_t deadline_ns;
     uint64_t interval_ns;
     int32_t clock_id;
     uint32_t reserved2;
+    lpr_native_fd_t wait_fd;
+    lpr_native_fd_t notify_fd;
 } lpr_event_backend_t;
 
 enum {
@@ -170,6 +173,8 @@ typedef struct lpr_epoll_backend {
     uint32_t flags;
     uint64_t instance;
     uint64_t map_bytes;
+    lpr_native_fd_t wait_fd;
+    lpr_native_fd_t notify_fd;
 } lpr_epoll_backend_t;
 
 typedef struct lpr_backend_ref {

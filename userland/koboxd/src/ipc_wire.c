@@ -20,22 +20,7 @@ int koboxd_recv_ipc_wait(int fd, struct pacha_ipc_msg *msg)
     if (fd < 16 || msg == NULL) {
         return -1;
     }
-    for (unsigned i = 0; i < 262144; i++) {
-        const int status = pacha_ipc_recv(fd, msg);
-        if (status == 0) {
-            return 0;
-        }
-        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
-            return status;
-        }
-        struct pacha_pollfd pollfd = {
-            .fd = fd,
-            .events = PACHA_FD_EVENT_READABLE,
-            .revents = 0,
-        };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
-    }
-    return -2;
+    return pacha_ipc_recv_wait(fd, msg, PACHA_FD_WAIT_FOREVER);
 }
 
 int koboxd_send_ipc_wait(int fd, const struct pacha_ipc_msg *msg)
@@ -43,12 +28,12 @@ int koboxd_send_ipc_wait(int fd, const struct pacha_ipc_msg *msg)
     if (fd < 16 || msg == NULL) {
         return -1;
     }
-    for (unsigned i = 0; i < 262144; i++) {
+    for (;;) {
         const int status = pacha_ipc_send(fd, msg);
         if (status == 0) {
             return 0;
         }
-        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
+        if (status != PACHA_ERR_NOT_READY) {
             return status;
         }
         struct pacha_pollfd pollfd = {
@@ -56,9 +41,12 @@ int koboxd_send_ipc_wait(int fd, const struct pacha_ipc_msg *msg)
             .events = PACHA_FD_EVENT_WRITABLE,
             .revents = 0,
         };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
+        const long wait_status =
+            pacha_fd_wait_many(&pollfd, 1, PACHA_FD_WAIT_FOREVER);
+        if (wait_status < 0) {
+            return (int)wait_status;
+        }
     }
-    return -2;
 }
 
 int koboxd_send_endpoint_fd(int control_fd, uint64_t request_id, uint64_t endpoint_kind, int client_fd)

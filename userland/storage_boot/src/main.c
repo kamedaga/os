@@ -7,6 +7,7 @@
 #include "linux_subsystem/fs/fs.h"
 #include "pacha/abi.h"
 #include "pacha/capsule.h"
+#include "pacha/ipc.h"
 #include "storage_boot/boot_config.h"
 
 #include <stdint.h>
@@ -1940,16 +1941,53 @@ static int load_modules(
     return 0;
 }
 
-static void *wait_for_first_disk(void)
+static void *wait_for_first_disk(int device_fd)
 {
-    for (unsigned i = 0; i < 2048; i++) {
+    struct pacha_capsule_irq wake_irq;
+    memset(&wake_irq, 0, sizeof(wake_irq));
+    if (pacha_capsule_device_derive_irq(
+            device_fd, PACHA_CAPSULE_IRQ_AUTO, 0, 0, &wake_irq) != 0)
+        return NULL;
+    const uint64_t timer_rights = PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ;
+    const int deadline_fd = pacha_timerfd_create(
+        2048000000ull, 0, timer_rights, PACHA_FD_FLAG_CLOEXEC);
+    if (deadline_fd < 16) {
+        (void)pacha_fd_close(wake_irq.fd);
+        return NULL;
+    }
+
+    for (;;) {
         kb_run_deferred_work();
-        (void)kb_handle_any_irq(1000000ull);
+        (void)kb_handle_any_irq(0);
         void *disk = kb_block_subsystem_first_registered_disk();
         if (disk != NULL) {
+            (void)pacha_fd_close(deadline_fd);
+            (void)pacha_fd_close(wake_irq.fd);
             return disk;
         }
+        struct pacha_pollfd waits[2] = {
+            {
+                .fd = wake_irq.fd,
+                .events = PACHA_FD_EVENT_READABLE,
+            },
+            {
+                .fd = deadline_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+            },
+        };
+        if (pacha_fd_wait_many(waits, 2, PACHA_FD_WAIT_FOREVER) < 0)
+            break;
+        if ((waits[1].revents & PACHA_FD_EVENT_READABLE) != 0)
+            break;
+        uint64_t next_count = 0;
+        if (pacha_capsule_irq_poll(
+                wake_irq.fd, wake_irq.count, &next_count) == 0)
+            wake_irq.count = next_count;
     }
+    (void)pacha_fd_close(deadline_fd);
+    (void)pacha_fd_close(wake_irq.fd);
     return NULL;
 }
 
@@ -2014,7 +2052,7 @@ int main(int argc, char **argv)
 
     printf("[storage_boot] modules ready\n");
     kb_shim_set_device_backend(backend);
-    void *disk = wait_for_first_disk();
+    void *disk = wait_for_first_disk((int)cfg.device_fd);
     if (disk == NULL) {
         fprintf(stderr, "[storage_boot] NVMe module stack registered no disk\n");
         return 6;

@@ -17,7 +17,6 @@
 enum {
     FILED_RUNTIME_EXEC_ENDPOINT_FD = 240,
     FILED_RUNTIME_SYNCER_INTERVAL_NS = 1000000000ull,
-    FILED_RUNTIME_SYNCER_INTERVAL_TICKS = 100,
 };
 
 static int filed_runtime_open_syncer_timer(filed_runtime_t *runtime)
@@ -595,8 +594,7 @@ int filed_runtime_serve(filed_runtime_t *runtime)
 
     int syncer_timer_status = filed_runtime_open_syncer_timer(runtime);
     if (syncer_timer_status != 0) {
-        printf("[filed] syncer timer unavailable status=%d fallback=tick-timeout\n", syncer_timer_status);
-        fflush(stdout);
+        return syncer_timer_status;
     }
 
     for (;;) {
@@ -645,15 +643,8 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             };
         }
 
-        const uint64_t wait_timeout =
-            runtime->syncer_timer_fd >= 16 ?
-                PACHA_FD_WAIT_FOREVER :
-                FILED_RUNTIME_SYNCER_INTERVAL_TICKS;
-        const long wait_status = pacha_fd_wait_many(fds, count, wait_timeout);
-        if (wait_status == PACHA_ERR_NOT_READY) {
-            filed_runtime_syncer_tick(runtime);
-            continue;
-        }
+        const long wait_status = pacha_fd_wait_many(
+            fds, count, PACHA_FD_WAIT_FOREVER);
         if (wait_status < 0) {
             return (int)wait_status;
         }

@@ -26,6 +26,7 @@ typedef struct lprs_process {
     uint32_t exit_status;
     uint64_t token;
     uint64_t generation;
+    uint64_t child_sequence;
     uint64_t pid;
     uint64_t ppid;
     uint64_t sid;
@@ -313,6 +314,7 @@ static void lprs_write_state(const lprs_process_t *proc, lprs_process_state_t *o
     memset(out, 0, sizeof(*out));
     out->token = proc->token;
     out->generation = proc->generation;
+    out->child_sequence = proc->child_sequence;
     out->pid = proc->pid;
     out->ppid = proc->ppid;
     out->sid = proc->sid;
@@ -1202,6 +1204,10 @@ static void lprs_notify_exited_child(lprs_process_t *child, uint64_t exit_code)
     child->exit_ready = 1;
     lprs_process_t *parent = lprs_find_by_pid(child->ppid);
     int notify_status = PACHA_STATUS_ESRCH;
+    if (parent != NULL) {
+        if (parent->child_sequence != UINT64_MAX)
+            parent->child_sequence++;
+    }
     if (parent != NULL && parent->process_fd >= 16) {
         notify_status = lprs_signal_process_fd(parent->process_fd, LPRS_SIGCHLD);
         if (notify_status == 0) {

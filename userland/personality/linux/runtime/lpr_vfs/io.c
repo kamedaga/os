@@ -183,11 +183,29 @@ int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
         if (buf == 0) {
             return -LPR_LINUX_EFAULT;
         }
-        if (lpr_event_backend(fd)->counter == 0) {
-            return -LPR_LINUX_EAGAIN;
+        lpr_event_backend_t *event = lpr_event_backend(fd);
+        while (event->counter == 0) {
+            if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
+                return -LPR_LINUX_EAGAIN;
+            lpr_wait_graph_t graph;
+            lpr_wait_deadline_t deadline;
+            lpr_wait_graph_init(&graph);
+            int64_t wait_status = lpr_wait_graph_add_fd(
+                &graph, fd, 0x0001u);
+            if (wait_status == 0)
+                wait_status = lpr_wait_deadline_init(&deadline, -1);
+            if (wait_status == 0)
+                wait_status = lpr_wait_graph_block(&graph, &deadline);
+            if (wait_status != 0) return wait_status;
         }
-        *(uint64_t *)(uintptr_t)buf = lpr_event_backend(fd)->counter;
-        lpr_event_backend(fd)->counter = 0;
+        if ((event->reserved1 & LPR_LINUX_EFD_SEMAPHORE) != 0) {
+            *(uint64_t *)(uintptr_t)buf = 1;
+            event->counter--;
+        } else {
+            *(uint64_t *)(uintptr_t)buf = event->counter;
+            event->counter = 0;
+        }
+        lpr_event_backend_notify(event);
         return (int64_t)sizeof(uint64_t);
     }
     if (lpr_pipe_fd_is_active(fd)) {

@@ -91,6 +91,10 @@ int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
     if (fd < 0) {
         return fd;
     }
+    int wait_fd = -1;
+    int notify_fd = -1;
+    const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
+    if (pair_status != 0) return pair_status;
     const int status = lpr_control_install_fd(
         (uint64_t)(uint32_t)fd,
         LPR_FD_OPS_EVENT,
@@ -98,17 +102,23 @@ int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
         (uint64_t)(uint32_t)fd,
         0);
     if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
         return status;
     }
     lpr_event_backend_t *timer = lpr_event_backend((uint64_t)(uint32_t)fd);
     if (timer == 0) {
         lpr_control_close_fd((uint64_t)(uint32_t)fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
         return -LPR_LINUX_EIO;
     }
     timer->active = 1;
     timer->subtype = LPR_EVENT_BACKEND_TIMERFD;
     timer->flags = (uint32_t)flags;
     timer->clock_id = (int32_t)clock_id;
+    timer->wait_fd.raw = wait_fd;
+    timer->notify_fd.raw = notify_fd;
     return fd;
 }
 
@@ -170,10 +180,12 @@ int64_t lpr_linux_timerfd_settime(
     timer->interval_ns = interval_ns;
     timer->deadline_ns = 0;
     if (value_ns == 0) {
+        lpr_event_backend_notify(timer);
         return 0;
     }
     if ((flags & LPR_LINUX_TIMER_ABSTIME) != 0) {
         timer->deadline_ns = value_ns;
+        lpr_event_backend_notify(timer);
         return 0;
     }
     uint64_t now = 0;
@@ -182,6 +194,26 @@ int64_t lpr_linux_timerfd_settime(
         return status;
     }
     timer->deadline_ns = value_ns > UINT64_MAX - now ? UINT64_MAX : now + value_ns;
+    lpr_event_backend_notify(timer);
+    return 0;
+}
+
+int64_t lpr_timerfd_remaining_ns(uint64_t fd, uint64_t *out_remaining_ns)
+{
+    if (out_remaining_ns == 0) return -LPR_LINUX_EFAULT;
+    if (!lpr_linux_timerfd_active(fd)) return -LPR_LINUX_EBADF;
+    lpr_event_backend_t *timer = lpr_event_backend(fd);
+    uint64_t now = 0;
+    const int64_t status = lpr_timerfd_update(timer, &now);
+    if (status != 0) return status;
+    if (timer->counter != 0) {
+        *out_remaining_ns = 0;
+    } else if (timer->deadline_ns == 0) {
+        *out_remaining_ns = UINT64_MAX;
+    } else {
+        *out_remaining_ns = timer->deadline_ns > now ?
+            timer->deadline_ns - now : 0;
+    }
     return 0;
 }
 
@@ -197,8 +229,11 @@ int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count)
         return -LPR_LINUX_EFAULT;
     }
     lpr_event_backend_t *timer = lpr_event_backend(fd);
+    lpr_wait_deadline_t deadline;
+    int64_t status = lpr_wait_deadline_init(&deadline, -1);
+    if (status != 0) return status;
     for (;;) {
-        const int64_t status = lpr_timerfd_update(timer, 0);
+        status = lpr_timerfd_update(timer, 0);
         if (status != 0) {
             return status;
         }
@@ -210,11 +245,12 @@ int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count)
         if ((timer->flags & LPR_TIMERFD_NONBLOCK) != 0) {
             return -LPR_LINUX_EAGAIN;
         }
-        const struct pachaos_timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
-        const int64_t sleep_status = lpr_pacha_nanosleep(&delay);
-        if (sleep_status != 0) {
-            return sleep_status;
-        }
+        lpr_wait_graph_t graph;
+        lpr_wait_graph_init(&graph);
+        status = lpr_wait_graph_add_fd(&graph, fd, 0x0001u);
+        if (status != 0) return status;
+        status = lpr_wait_graph_block(&graph, &deadline);
+        if (status != 0) return status;
     }
 }
 

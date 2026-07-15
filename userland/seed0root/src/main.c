@@ -488,22 +488,7 @@ static int recv_ipc_wait(int fd, struct pacha_ipc_msg *msg)
     if (fd < 16 || msg == NULL) {
         return -1;
     }
-    for (unsigned i = 0; i < 262144; i++) {
-        const int status = pacha_ipc_recv(fd, msg);
-        if (status == 0) {
-            return 0;
-        }
-        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
-            return status;
-        }
-        struct pacha_pollfd pollfd = {
-            .fd = fd,
-            .events = PACHA_FD_EVENT_READABLE,
-            .revents = 0,
-        };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
-    }
-    return -2;
+    return pacha_ipc_recv_wait(fd, msg, PACHA_FD_WAIT_FOREVER);
 }
 
 static void seed0root_dump_filed_error_token(int endpoint_fd, uint64_t token, const char *context);

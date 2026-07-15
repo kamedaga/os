@@ -2,13 +2,12 @@
 #include "drmd_service.h"
 
 #include <pacha/abi.h>
+#include <pacha/capsule.h>
 #include <pacha/ipc.h>
 #include <kobox/shim.h>
 
 #include <stdio.h>
 #include <string.h>
-
-enum { DRMD_ACTIVE_GRACE_TICKS = 4 };
 
 int main(void)
 {
@@ -33,10 +32,17 @@ int main(void)
     if (ready_status != 0 || init_status != 0) {
         return 1;
     }
-    unsigned active_grace_ticks = 0;
+    struct pacha_capsule_irq wake_irq;
+    memset(&wake_irq, 0, sizeof(wake_irq));
+    if (pacha_capsule_device_derive_irq(
+            (int)cfg->device_fd, PACHA_CAPSULE_IRQ_AUTO, 0, 0, &wake_irq) != 0)
+        return 1;
     for (;;) {
         static struct pacha_service_wait_set wait_set;
         if (pacha_service_wait_init(&wait_set, (int)cfg->drm_endpoint_fd) != 0)
+            return 1;
+        if (pacha_service_wait_add(
+                &wait_set, wake_irq.fd, PACHA_FD_EVENT_READABLE) != 0)
             return 1;
         int notify_fds[DRMD_DRM_WAIT_SOURCE_MAX];
         const size_t notify_count = drmd_drm_island_collect_wait_sources(
@@ -55,19 +61,19 @@ int main(void)
         const int status = pacha_ipc_recv((int)cfg->drm_endpoint_fd, &request);
         if (status == 0) {
             (void)drmd_service_dispatch(&service, &request, fds);
-            (void)drmd_drm_island_reap_hangups(&island);
-            active_grace_ticks = DRMD_ACTIVE_GRACE_TICKS;
-        } else if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
-            (void)kb_handle_any_irq(0);
-            kb_run_deferred_work();
-            drmd_drm_island_notify_readable(&island);
-            (void)pacha_service_wait(
-                &wait_set,
-                active_grace_ticks != 0 ? 1u : PACHA_FD_WAIT_FOREVER);
-            (void)drmd_drm_island_reap_hangups(&island);
-            if (active_grace_ticks != 0) active_grace_ticks--;
-        } else {
+        } else if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY) {
             return 1;
+        }
+        uint64_t next_count = 0;
+        if (pacha_capsule_irq_poll(wake_irq.fd, wake_irq.count, &next_count) == 0)
+            wake_irq.count = next_count;
+        (void)kb_handle_any_irq(0);
+        kb_run_deferred_work();
+        drmd_drm_island_notify_readable(&island);
+        (void)drmd_drm_island_reap_hangups(&island);
+        if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
+            (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+            (void)drmd_drm_island_reap_hangups(&island);
         }
     }
 }

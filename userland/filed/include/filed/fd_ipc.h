@@ -4,10 +4,6 @@
 
 #include "pacha/ipc.h"
 
-enum {
-    FILED_IPC_WAIT_SPINS = 262144u,
-};
-
 typedef struct filed_page {
     int fd;
     void *addr;

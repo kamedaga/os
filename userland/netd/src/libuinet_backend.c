@@ -3,9 +3,11 @@
 
 #include "netd_internal.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(NETD_WITH_LIBUINET)
 #include "filed/ipc_protocol.h"
@@ -94,24 +96,288 @@ struct netd_libuinet_api_socket {
     uint8_t poll_ready_logged;
     uint8_t send_preview_logged;
     uint8_t recv_preview_logged;
-    uint8_t reserved[4];
+    uint8_t notify_pending;
+    uint8_t reserved[3];
     int notify_fd;
     struct uinet_socket *socket;
 };
 static struct netd_libuinet_api_socket g_libuinet_api_sockets[NETD_SOCKET_API_MAX_SOCKETS];
 static uint64_t g_libuinet_api_next_handle;
 
-static int netd_libuinet_trace_poll_sample(uint64_t calls)
+struct netd_libuinet_sts_callout {
+    struct netd_libuinet_sts_callout *next;
+    void (*func)(void *);
+    void *arg;
+    uint64_t deadline_ns;
+    uint8_t active;
+    uint8_t pending;
+    uint8_t reserved[6];
+};
+
+_Static_assert(sizeof(struct netd_libuinet_sts_callout) <= 80,
+               "libuinet STS callout exceeds opaque storage");
+
+static struct netd_libuinet_sts_callout *g_libuinet_sts_pending;
+static int g_libuinet_sts_timer_fd = -1;
+static int g_libuinet_sts_error;
+
+static void netd_libuinet_notify_sockets(void)
 {
-    return calls == 1 || calls == 16 || calls == 64 || calls == 256 ||
-           calls == 1024 || (calls >= 4096 && (calls % 4096u) == 0);
+    struct pacha_ipc_msg notification;
+    memset(&notification, 0, sizeof(notification));
+    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; ++i) {
+        struct netd_libuinet_api_socket *slot = &g_libuinet_api_sockets[i];
+        if (slot->socket == NULL || slot->notify_fd < 16 || slot->notify_pending)
+            continue;
+        if (pacha_ipc_send(slot->notify_fd, &notification) == 0)
+            slot->notify_pending = 1;
+    }
 }
 
-static void netd_libuinet_api_pump(unsigned rounds)
+static int netd_libuinet_sts_now_ns(uint64_t *out_now)
 {
-    for (unsigned i = 0; i < rounds; i++) {
-        netd_packet_io_pump_once();
+    struct timespec now;
+    if (out_now == NULL || clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+        now.tv_sec < 0 || now.tv_nsec < 0)
+        return -1;
+    const uint64_t seconds = (uint64_t)now.tv_sec;
+    if (seconds > (UINT64_MAX - (uint64_t)now.tv_nsec) / 1000000000ull)
+        return -1;
+    *out_now = seconds * 1000000000ull + (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static void netd_libuinet_sts_remove(
+    struct netd_libuinet_sts_callout *callout)
+{
+    struct netd_libuinet_sts_callout **link = &g_libuinet_sts_pending;
+    while (*link != NULL) {
+        if (*link == callout) {
+            *link = callout->next;
+            callout->next = NULL;
+            return;
+        }
+        link = &(*link)->next;
     }
+}
+
+static void netd_libuinet_sts_rearm(void)
+{
+    if (g_libuinet_sts_timer_fd < 16) {
+        g_libuinet_sts_error = -1;
+        return;
+    }
+    uint64_t now = 0;
+    if (netd_libuinet_sts_now_ns(&now) != 0) {
+        g_libuinet_sts_error = -1;
+        return;
+    }
+    uint64_t earliest = UINT64_MAX;
+    for (const struct netd_libuinet_sts_callout *callout = g_libuinet_sts_pending;
+         callout != NULL;
+         callout = callout->next) {
+        if (callout->pending && callout->deadline_ns < earliest)
+            earliest = callout->deadline_ns;
+    }
+    uint64_t delay_ns = 0;
+    if (earliest != UINT64_MAX)
+        delay_ns = earliest > now ? earliest - now : 1;
+    if (pacha_timerfd_settime(g_libuinet_sts_timer_fd, delay_ns, 0, 0) != 0)
+        g_libuinet_sts_error = -1;
+}
+
+static void netd_libuinet_sts_callout_init(void *ctx, void *storage)
+{
+    (void)ctx;
+    struct netd_libuinet_sts_callout *callout = storage;
+    memset(callout, 0, sizeof(*callout));
+}
+
+static int netd_libuinet_sts_callout_schedule(
+    void *ctx,
+    void *storage,
+    int ticks)
+{
+    (void)ctx;
+    struct netd_libuinet_sts_callout *callout = storage;
+    const int was_pending = callout->pending != 0;
+    uint64_t now = 0;
+    if (ticks < 0 || netd_libuinet_sts_now_ns(&now) != 0 || uinet_hz == 0) {
+        g_libuinet_sts_error = -1;
+        return was_pending;
+    }
+    const uint64_t delay_ns = ((uint64_t)ticks * 1000000000ull + uinet_hz - 1u) /
+        (uint64_t)uinet_hz;
+    callout->deadline_ns = delay_ns > UINT64_MAX - now ? UINT64_MAX : now + delay_ns;
+    callout->active = 1;
+    if (!callout->pending) {
+        callout->pending = 1;
+        callout->next = g_libuinet_sts_pending;
+        g_libuinet_sts_pending = callout;
+    }
+    netd_libuinet_sts_rearm();
+    return was_pending;
+}
+
+static int netd_libuinet_sts_callout_reset(
+    void *ctx,
+    void *storage,
+    int ticks,
+    void (*func)(void *),
+    void *arg)
+{
+    struct netd_libuinet_sts_callout *callout = storage;
+    callout->func = func;
+    callout->arg = arg;
+    return netd_libuinet_sts_callout_schedule(ctx, storage, ticks);
+}
+
+static int netd_libuinet_sts_callout_pending(void *ctx, void *storage)
+{
+    (void)ctx;
+    return ((struct netd_libuinet_sts_callout *)storage)->pending != 0;
+}
+
+static int netd_libuinet_sts_callout_active(void *ctx, void *storage)
+{
+    (void)ctx;
+    return ((struct netd_libuinet_sts_callout *)storage)->active != 0;
+}
+
+static void netd_libuinet_sts_callout_deactivate(void *ctx, void *storage)
+{
+    (void)ctx;
+    ((struct netd_libuinet_sts_callout *)storage)->active = 0;
+}
+
+static int netd_libuinet_sts_callout_msecs_remaining(void *ctx, void *storage)
+{
+    (void)ctx;
+    const struct netd_libuinet_sts_callout *callout = storage;
+    uint64_t now = 0;
+    if (!callout->pending || netd_libuinet_sts_now_ns(&now) != 0 ||
+        callout->deadline_ns <= now)
+        return 0;
+    const uint64_t remaining_ms = (callout->deadline_ns - now) / 1000000ull;
+    return remaining_ms > INT_MAX ? INT_MAX : (int)remaining_ms;
+}
+
+static int netd_libuinet_sts_callout_stop(void *ctx, void *storage)
+{
+    (void)ctx;
+    struct netd_libuinet_sts_callout *callout = storage;
+    const int was_pending = callout->pending != 0;
+    callout->active = 0;
+    if (callout->pending) {
+        callout->pending = 0;
+        netd_libuinet_sts_remove(callout);
+        netd_libuinet_sts_rearm();
+    }
+    return was_pending;
+}
+
+static void *netd_libuinet_sts_instance_created(
+    void *ctx,
+    uinet_instance_t instance)
+{
+    (void)ctx;
+    return instance;
+}
+
+static void netd_libuinet_sts_instance_destroyed(void *instance)
+{
+    (void)instance;
+}
+
+static void netd_libuinet_sts_instance_notify(void *instance)
+{
+    if (instance != NULL) {
+        uinet_instance_sts_events_process((uinet_instance_t)instance);
+        netd_libuinet_notify_sockets();
+    }
+}
+
+static void *netd_libuinet_sts_if_created(void *instance, uinet_if_t interface)
+{
+    (void)instance;
+    return interface;
+}
+
+static void netd_libuinet_sts_if_destroyed(void *interface)
+{
+    (void)interface;
+}
+
+static int netd_libuinet_sts_open(struct uinet_instance_cfg *instance_cfg)
+{
+    if (instance_cfg == NULL ||
+        uinet_sts_callout_max_size() < sizeof(struct netd_libuinet_sts_callout))
+        return -1;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ;
+    g_libuinet_sts_timer_fd = pacha_timerfd_create(
+        0, 0, rights, PACHA_FD_FLAG_CLOEXEC);
+    if (g_libuinet_sts_timer_fd < 16)
+        return -1;
+    g_libuinet_sts_pending = NULL;
+    g_libuinet_sts_error = 0;
+    instance_cfg->sts.sts_enabled = 1;
+    instance_cfg->sts.sts_evctx = NULL;
+    instance_cfg->sts.sts_instance_created_cb = netd_libuinet_sts_instance_created;
+    instance_cfg->sts.sts_instance_destroyed_cb = netd_libuinet_sts_instance_destroyed;
+    instance_cfg->sts.sts_instance_event_notify_cb = netd_libuinet_sts_instance_notify;
+    instance_cfg->sts.sts_if_created_cb = netd_libuinet_sts_if_created;
+    instance_cfg->sts.sts_if_destroyed_cb = netd_libuinet_sts_if_destroyed;
+    instance_cfg->sts.sts_callout_init = netd_libuinet_sts_callout_init;
+    instance_cfg->sts.sts_callout_reset = netd_libuinet_sts_callout_reset;
+    instance_cfg->sts.sts_callout_schedule = netd_libuinet_sts_callout_schedule;
+    instance_cfg->sts.sts_callout_pending = netd_libuinet_sts_callout_pending;
+    instance_cfg->sts.sts_callout_active = netd_libuinet_sts_callout_active;
+    instance_cfg->sts.sts_callout_deactivate = netd_libuinet_sts_callout_deactivate;
+    instance_cfg->sts.sts_callout_msecs_remaining = netd_libuinet_sts_callout_msecs_remaining;
+    instance_cfg->sts.sts_callout_stop = netd_libuinet_sts_callout_stop;
+    return 0;
+}
+
+static int netd_libuinet_sts_dispatch(void)
+{
+    if (g_libuinet_sts_timer_fd < 16 || g_libuinet_sts_error != 0)
+        return g_libuinet_sts_error != 0 ? g_libuinet_sts_error : -1;
+    struct pacha_pollfd timer = {
+        .fd = g_libuinet_sts_timer_fd,
+        .events = PACHA_FD_EVENT_READABLE,
+    };
+    if (pacha_fd_poll(&timer, 1) <= 0 ||
+        (timer.revents & PACHA_FD_EVENT_READABLE) == 0)
+        return 0;
+    uint64_t expirations = 0;
+    if (pacha_fd_read(g_libuinet_sts_timer_fd, &expirations, sizeof(expirations)) < 0)
+        return -1;
+
+    int dispatched = 0;
+    for (;;) {
+        uint64_t now = 0;
+        if (netd_libuinet_sts_now_ns(&now) != 0)
+            return -1;
+        struct netd_libuinet_sts_callout **link = &g_libuinet_sts_pending;
+        while (*link != NULL && (*link)->deadline_ns > now)
+            link = &(*link)->next;
+        if (*link == NULL)
+            break;
+        struct netd_libuinet_sts_callout *callout = *link;
+        *link = callout->next;
+        callout->next = NULL;
+        callout->pending = 0;
+        void (*func)(void *) = callout->func;
+        void *arg = callout->arg;
+        dispatched = 1;
+        if (func != NULL)
+            func(arg);
+    }
+    netd_libuinet_sts_rearm();
+    if (dispatched)
+        netd_libuinet_notify_sockets();
+    return 0;
 }
 
 static void netd_libuinet_print_ascii_preview(const char *prefix, uint64_t handle, const void *data, size_t len)
@@ -2379,6 +2645,11 @@ int netd_libuinet_start(struct netd_runtime *runtime)
 
     uinet_default_cfg(&global_cfg, UINET_GLOBAL_CFG_SMALL);
     uinet_instance_default_cfg(&instance_cfg);
+    if (netd_libuinet_sts_open(&instance_cfg) != 0) {
+        fprintf(stderr, "[netd] libuinet STS timer setup failed\n");
+        g_libuinet_state = NETD_LIBUINET_ERROR;
+        return 7;
+    }
 
     uint64_t stage_start_cycles = netd_metrics_read_tsc();
     int status = uinet_init(&global_cfg, &instance_cfg);
@@ -2470,6 +2741,7 @@ int netd_libuinet_receive_frame(const struct netd_upper_frame *frame)
     int status = uinet_pachaos_if_deliver(g_libuinet_if, frame->bytes, frame->len);
     if (status == 0) {
         g_libuinet_rx_frames++;
+        netd_libuinet_notify_sockets();
     } else {
         g_libuinet_rx_drops++;
     }
@@ -2484,6 +2756,7 @@ void netd_libuinet_poll(void)
 {
 #if defined(NETD_WITH_LIBUINET)
     if (g_libuinet_state == NETD_LIBUINET_READY) {
+        (void)netd_libuinet_sts_dispatch();
         uinet_instance_sts_events_process(uinet_instance_default());
         netd_libuinet_poll_udp_echo();
         netd_libuinet_poll_tcp_echo();
@@ -2491,17 +2764,17 @@ void netd_libuinet_poll(void)
 #endif
 }
 
-int netd_libuinet_needs_periodic_poll(void)
+int netd_libuinet_collect_runtime_wait_sources(
+    struct pacha_service_wait_set *wait_set)
 {
 #if defined(NETD_WITH_LIBUINET)
-    if (g_libuinet_http_smoke.state != NETD_HTTP_SMOKE_IDLE &&
-        g_libuinet_http_smoke.state != NETD_HTTP_SMOKE_DONE &&
-        g_libuinet_http_smoke.state != NETD_HTTP_SMOKE_ERROR)
-        return 1;
-    for (unsigned i = 0; i < NETD_TCP_ECHO_MAX_CONNECTIONS; i++)
-        if (g_libuinet_tcp_connections[i] != NULL) return 1;
-    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; i++)
-        if (g_libuinet_api_sockets[i].handle != 0) return 1;
+    if (wait_set == NULL || g_libuinet_sts_timer_fd < 16 ||
+        g_libuinet_sts_error != 0)
+        return -1;
+    return pacha_service_wait_add(
+        wait_set, g_libuinet_sts_timer_fd, PACHA_FD_EVENT_READABLE);
+#else
+    (void)wait_set;
 #endif
     return 0;
 }
@@ -2739,6 +3012,7 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
     if (slot == NULL) {
         return -9;
     }
+    slot->notify_pending = 0;
     struct uinet_sockaddr_in sin;
     struct uinet_sockaddr *send_addr = NULL;
     if (slot->type == NETD_SOCK_DGRAM && (addr_be != 0 || port_be != 0)) {
@@ -2772,7 +3046,6 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
         slot->send_preview_logged = 1;
         netd_libuinet_print_ascii_preview("[netd] socket stream send", slot->handle, data, *out_sent);
     }
-    netd_libuinet_api_pump(4);
     return *out_sent == 0 ? -11 : 0;
 #else
     (void)handle;
@@ -2794,14 +3067,8 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint
     if (slot == NULL) {
         return -9;
     }
-    int readable = 0;
-    for (unsigned attempt = 0; attempt < 32; attempt++) {
-        readable = uinet_soreadable(slot->socket, 0);
-        if (readable != 0) {
-            break;
-        }
-        netd_libuinet_api_pump(1);
-    }
+    slot->notify_pending = 0;
+    const int readable = uinet_soreadable(slot->socket, 0);
     if (readable == 0) {
         if (g_libuinet_trace && slot->type == NETD_SOCK_STREAM && slot->recv_bytes != 0 && !slot->recv_idle_logged) {
             slot->recv_idle_logged = 1;
@@ -2881,7 +3148,7 @@ int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_re
         return -9;
     }
     slot->poll_calls++;
-    netd_libuinet_api_pump(4);
+    slot->notify_pending = 0;
     const int error = uinet_sogeterror(slot->socket);
     const int state = uinet_sogetstate(slot->socket);
     int readable_snapshot = -2;
@@ -2942,17 +3209,6 @@ int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_re
                        (unsigned long long)slot->recv_bytes);
                 fflush(stdout);
             }
-        } else if (g_libuinet_trace && netd_libuinet_trace_poll_sample(slot->poll_calls)) {
-            printf("[netd] socket poll wait handle=%llu polls=%llu events=0x%x state=0x%x error=%d readable=%d writable=%d bytes=%llu\n",
-                   (unsigned long long)slot->handle,
-                   (unsigned long long)slot->poll_calls,
-                   events,
-                   state,
-                   error,
-                   readable_snapshot,
-                   writable_snapshot,
-                   (unsigned long long)slot->recv_bytes);
-            fflush(stdout);
         }
     }
     return 0;

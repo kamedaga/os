@@ -2,13 +2,11 @@
 
 int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
 {
-    enum { LPR_PROCESS_WAIT_POLL_TICKS = 50 };
     if (process_fd < 16) {
         return -LPR_LINUX_ECHILD;
     }
     lpr_trace_process_event("wait_begin", process_fd, 0, 0);
     lpr_pacha_process_status_t st;
-    uint64_t waits = 0;
     for (;;) {
         lpr_memset(&st, 0, sizeof(st));
         const int64_t wait_status = lpr_pacha_syscall2(
@@ -24,24 +22,22 @@ int64_t lpr_linux_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code)
         }
         const int64_t errno_status = lpr_pacha_status_to_errno(wait_status);
         if (errno_status != -LPR_LINUX_EAGAIN) {
-            lpr_trace_process_event("wait_error", process_fd, waits, errno_status);
+            lpr_trace_process_event("wait_error", process_fd, 0, errno_status);
             return errno_status;
         }
-        waits++;
-        if (waits == 1 || waits == 16 || waits == 128) {
-            lpr_trace_process_event("wait_pending", process_fd, waits, 0);
+        lpr_wait_graph_t graph;
+        lpr_wait_deadline_t deadline;
+        lpr_wait_graph_init(&graph);
+        int64_t fd_wait_status = lpr_wait_graph_add_native(
+            &graph, (int)(uint32_t)process_fd, PACHA_FD_EVENT_READABLE);
+        if (fd_wait_status == 0)
+            fd_wait_status = lpr_wait_deadline_init(&deadline, -1);
+        if (fd_wait_status == 0)
+            fd_wait_status = lpr_wait_graph_block(&graph, &deadline);
+        if (fd_wait_status != 0) {
+            lpr_trace_process_event("wait_error", process_fd, 0, fd_wait_status);
+            return fd_wait_status;
         }
-        lpr_linux_pump_tty_signals();
-        struct pacha_pollfd pollfd;
-        lpr_memset(&pollfd, 0, sizeof(pollfd));
-        pollfd.fd = (int)(uint32_t)process_fd;
-        pollfd.events = PACHA_FD_EVENT_READABLE;
-        (void)lpr_pacha_syscall4(
-            PACHA_FD_SYSCALL_WAIT_MANY,
-            (uint64_t)(uintptr_t)&pollfd,
-            1,
-            LPR_PROCESS_WAIT_POLL_TICKS,
-            0);
     }
 }
 
@@ -254,6 +250,14 @@ static uint32_t lpr_exec_backend_native_fds(
         break;
     case LPR_FD_OPS_PIPE:
         LPR_EXEC_ADD_NATIVE(((const lpr_pipe_backend_t *)state)->native.raw);
+        break;
+    case LPR_FD_OPS_EVENT:
+        LPR_EXEC_ADD_NATIVE(((const lpr_event_backend_t *)state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_event_backend_t *)state)->notify_fd.raw);
+        break;
+    case LPR_FD_OPS_EPOLL:
+        LPR_EXEC_ADD_NATIVE(((const lpr_epoll_backend_t *)state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_epoll_backend_t *)state)->notify_fd.raw);
         break;
     case LPR_FD_OPS_SOCKET:
         LPR_EXEC_ADD_NATIVE(((const lpr_socket_backend_t *)state)->wait_fd.raw);
@@ -553,6 +557,20 @@ static int lpr_prepare_backend_record(
         const lpr_pipe_backend_t *original = original_state;
         lpr_pipe_backend_t *prepared = prepared_state;
         LPR_DUP_MANIFEST_FIELD(original->native.raw, prepared->native.raw);
+        break;
+    }
+    case LPR_FD_OPS_EVENT: {
+        const lpr_event_backend_t *original = original_state;
+        lpr_event_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
+        LPR_DUP_MANIFEST_FIELD(original->notify_fd.raw, prepared->notify_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_EPOLL: {
+        const lpr_epoll_backend_t *original = original_state;
+        lpr_epoll_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
+        LPR_DUP_MANIFEST_FIELD(original->notify_fd.raw, prepared->notify_fd.raw);
         break;
     }
     default:

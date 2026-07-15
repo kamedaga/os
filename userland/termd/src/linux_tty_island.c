@@ -11,6 +11,7 @@
 #include "linux_subsystem/kvm/kvm_symbols.h"
 #include "loader/module_context.h"
 
+#include <pacha/capsule.h>
 #include <pacha/trace.h>
 #include <pacha/ipc.h>
 
@@ -638,39 +639,52 @@ static int hvc0_cdev_ready(void)
     return record != NULL && record->has_fops_view && record->fops_view.open != NULL;
 }
 
-static int wait_hvc0_cdev_ready(void)
+static int wait_hvc0_cdev_ready(struct termd_linux_tty_island *island)
 {
-    enum {
-        HVC0_READY_POLLS = 256,
-        HVC0_READY_POLL_NS = 1000000,
-    };
+    if (island == NULL || island->wake_irq_fd < 16)
+        return -5;
+    const uint64_t timer_rights = PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ;
+    const int deadline_fd = pacha_timerfd_create(
+        256000000ull, 0, timer_rights, PACHA_FD_FLAG_CLOEXEC);
+    if (deadline_fd < 16)
+        return -5;
 
-    for (unsigned i = 0; i < HVC0_READY_POLLS; i++) {
+    for (;;) {
+        drain_linux_tty_work();
         if (hvc0_cdev_ready()) {
-            if (i != 0) {
-                printf("[termd] linux tty hvc0 cdev ready after irq/work polls=%u\n", i);
-            }
+            (void)pacha_fd_close(deadline_fd);
             return 0;
         }
-        kb_run_deferred_work();
-        const int irq_status = kb_handle_any_irq(HVC0_READY_POLL_NS);
-        if (i < 8 || irq_status == 0) {
-            printf("[termd] linux tty hvc0 wait poll=%u irq_status=%d\n", i, irq_status);
+        struct pacha_pollfd waits[2] = {
+            {
+                .fd = island->wake_irq_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+            },
+            {
+                .fd = deadline_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+            },
+        };
+        const long wait_status = pacha_fd_wait_many(
+            waits, 2, PACHA_FD_WAIT_FOREVER);
+        if (wait_status < 0) {
+            (void)pacha_fd_close(deadline_fd);
+            return (int)wait_status;
         }
-    }
-    return hvc0_cdev_ready() ? 0 : -110;
-}
-
-static void pump_hvc0_cdev_ready(void)
-{
-    enum {
-        HVC0_OPEN_POLLS = 64,
-        HVC0_OPEN_POLL_NS = 1000000,
-    };
-
-    for (unsigned i = 0; i < HVC0_OPEN_POLLS && !hvc0_cdev_ready(); i++) {
-        kb_run_deferred_work();
-        (void)kb_handle_any_irq(HVC0_OPEN_POLL_NS);
+        if ((waits[1].revents & PACHA_FD_EVENT_READABLE) != 0) {
+            uint64_t expirations = 0;
+            (void)pacha_fd_read(deadline_fd, &expirations, sizeof(expirations));
+            (void)pacha_fd_close(deadline_fd);
+            return -110;
+        }
+        uint64_t next_count = 0;
+        if (pacha_capsule_irq_poll(
+                island->wake_irq_fd,
+                island->wake_irq_count,
+                &next_count) == 0)
+            island->wake_irq_count = next_count;
     }
 }
 
@@ -1012,7 +1026,7 @@ int termd_linux_tty_island_open_hvc(
     const uint64_t dev = kb_linux_kernel_encode_dev(
         TERMD_LINUX_HVC_MAJOR,
         (unsigned)request->pts_index);
-    pump_hvc0_cdev_ready();
+    drain_linux_tty_work();
     const kb_cdev_record_t *record = kb_linux_kernel_find_active_cdev(dev);
     if (record == NULL || !record->has_fops_view || record->fops_view.open == NULL) {
         pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc_open_missing"), request->pts_index, TERMD_LINUX_HVC_MAJOR);
@@ -1576,6 +1590,7 @@ int termd_linux_tty_island_init(
         return -22;
     }
     memset(island, 0, sizeof(*island));
+    island->wake_irq_fd = -1;
     island->source_count = (uint32_t)(sizeof(linux_tty_sources) / sizeof(linux_tty_sources[0]));
     island->loader_version = kb_module_loader_version();
     island->configured_module_count = cfg->module_count > TERMD_MAX_MODULES ?
@@ -1683,7 +1698,22 @@ int termd_linux_tty_island_init(
             ptmx_status);
     }
     if (cfg->device_fd >= 16) {
-        const int hvc_status = wait_hvc0_cdev_ready();
+        struct pacha_capsule_irq wake_irq;
+        memset(&wake_irq, 0, sizeof(wake_irq));
+        const int irq_status = pacha_capsule_device_derive_irq(
+            (int)cfg->device_fd,
+            PACHA_CAPSULE_IRQ_AUTO,
+            0,
+            0,
+            &wake_irq);
+        if (irq_status != 0) {
+            island->ready = 0;
+            island->init_status = irq_status;
+            return 0;
+        }
+        island->wake_irq_fd = wake_irq.fd;
+        island->wake_irq_count = wake_irq.count;
+        const int hvc_status = wait_hvc0_cdev_ready(island);
         if (hvc_status != 0) {
             pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc0_wait"), (uint64_t)hvc_status);
         }

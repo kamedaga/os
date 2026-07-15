@@ -12,24 +12,7 @@ int filed_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg)
         return -1;
     }
 
-    for (unsigned int i = 0; i < FILED_IPC_WAIT_SPINS; ++i) {
-        const int status = pacha_ipc_recv_wait(fd, msg, UINT64_MAX);
-        if (status == 0) {
-            return 0;
-        }
-        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
-            return status;
-        }
-
-        struct pacha_pollfd pollfd = {
-            .fd = fd,
-            .events = PACHA_FD_EVENT_READABLE,
-            .revents = 0,
-        };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
-    }
-
-    return -2;
+    return pacha_ipc_recv_wait(fd, msg, PACHA_FD_WAIT_FOREVER);
 }
 
 int filed_ipc_send_wait(int fd, const struct pacha_ipc_msg *msg)
@@ -38,12 +21,12 @@ int filed_ipc_send_wait(int fd, const struct pacha_ipc_msg *msg)
         return -1;
     }
 
-    for (unsigned int i = 0; i < FILED_IPC_WAIT_SPINS; ++i) {
+    for (;;) {
         const int status = pacha_ipc_send(fd, msg);
         if (status == 0) {
             return 0;
         }
-        if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY && status != -2) {
+        if (status != PACHA_ERR_NOT_READY) {
             return status;
         }
 
@@ -52,10 +35,12 @@ int filed_ipc_send_wait(int fd, const struct pacha_ipc_msg *msg)
             .events = PACHA_FD_EVENT_WRITABLE,
             .revents = 0,
         };
-        (void)pacha_fd_wait_many(&pollfd, 1, 1);
+        const long wait_status =
+            pacha_fd_wait_many(&pollfd, 1, PACHA_FD_WAIT_FOREVER);
+        if (wait_status < 0) {
+            return (int)wait_status;
+        }
     }
-
-    return -2;
 }
 
 int filed_ipc_create_wire_page(uint64_t size, filed_page_t *out_page)

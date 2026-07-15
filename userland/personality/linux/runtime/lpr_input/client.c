@@ -226,21 +226,17 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         lpr_destroy_tty_wire_page(page_fd, page);
         if (status != -LPR_LINUX_EAGAIN || (input->flags & LPR_LINUX_O_NONBLOCK) != 0)
             return status;
-        if (input->wait_fd.raw >= 16) {
-            struct pacha_pollfd waitfd = {
-                .fd = input->wait_fd.raw,
-                .events = PACHA_FD_EVENT_READABLE,
-            };
-            const int64_t wait_status = lpr_pacha_syscall4(
-                PACHAOS_SYSCALL_FD_WAIT_MANY,
-                (uint64_t)(uintptr_t)&waitfd, 1, UINT64_MAX, 0);
-            if (wait_status < 0) return lpr_pacha_status_to_errno(wait_status);
-        } else {
-            struct pachaos_timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
-            const int64_t sleep_status = lpr_pacha_syscall1(
-                PACHAOS_SYSCALL_NANOSLEEP, (uint64_t)(uintptr_t)&delay);
-            if (sleep_status != 0) return lpr_pacha_status_to_errno(sleep_status);
-        }
+        if (input->wait_fd.raw < 16) return -LPR_LINUX_EIO;
+        lpr_wait_graph_t graph;
+        lpr_wait_deadline_t deadline;
+        lpr_wait_graph_init(&graph);
+        int64_t wait_status = lpr_wait_graph_add_fd(
+            &graph, fd, 0x0001u);
+        if (wait_status != 0) return wait_status;
+        wait_status = lpr_wait_deadline_init(&deadline, -1);
+        if (wait_status != 0) return wait_status;
+        wait_status = lpr_wait_graph_block(&graph, &deadline);
+        if (wait_status != 0) return wait_status;
     }
 }
 

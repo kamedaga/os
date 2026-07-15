@@ -210,6 +210,21 @@ static int64_t lpr_ops_pipe_close(void *state)
         (uint64_t)(uint32_t)pipe->native.raw));
 }
 
+static int64_t lpr_ops_event_close(void *state)
+{
+    const lpr_event_backend_t *event = state;
+    int64_t status = 0;
+    if (event->wait_fd.raw >= 16)
+        status = lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)event->wait_fd.raw);
+    if (event->notify_fd.raw >= 16) {
+        const int64_t notify_status = lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)event->notify_fd.raw);
+        if (status == 0) status = notify_status;
+    }
+    return status;
+}
+
 static int64_t lpr_ops_dmabuf_close(void *state)
 {
     const lpr_dmabuf_backend_t *dmabuf = state;
@@ -232,13 +247,23 @@ static int64_t lpr_ops_dmabuf_close(void *state)
 static int64_t lpr_ops_epoll_close(void *state)
 {
     const lpr_epoll_backend_t *epoll = state;
-    if (epoll->instance < 4096 || epoll->map_bytes == 0) {
-        return 0;
+    int64_t status = 0;
+    if (epoll->wait_fd.raw >= 16)
+        status = lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)epoll->wait_fd.raw);
+    if (epoll->notify_fd.raw >= 16) {
+        const int64_t notify_status = lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)epoll->notify_fd.raw);
+        if (status == 0) status = notify_status;
     }
-    return lpr_pacha_status_to_errno(lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_MUNMAP,
-        epoll->instance,
-        epoll->map_bytes));
+    if (epoll->instance >= 4096 && epoll->map_bytes != 0) {
+        const int64_t map_status = lpr_pacha_status_to_errno(lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            epoll->instance,
+            epoll->map_bytes));
+        if (status == 0) status = map_status;
+    }
+    return status;
 }
 
 static const lpr_fd_ops_t lpr_fd_ops_registry[LPR_FD_OPS_COUNT] = {
@@ -268,7 +293,7 @@ static const lpr_fd_ops_t lpr_fd_ops_registry[LPR_FD_OPS_COUNT] = {
     },
     [LPR_FD_OPS_EVENT] = {
         lpr_ops_read, lpr_ops_write, lpr_ops_readv, lpr_ops_writev,
-        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_no_close, lpr_ops_dup,
+        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_event_close, lpr_ops_dup,
     },
     [LPR_FD_OPS_SOCKET] = {
         lpr_ops_socket_read, lpr_ops_socket_write,

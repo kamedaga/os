@@ -280,23 +280,19 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
     return revents;
 }
 
-int64_t lpr_tty_sleep_ms(uint64_t ms)
-{
-    if (ms == 0) {
-        return 0;
-    }
-    struct pachaos_timespec ts;
-    ts.tv_sec = ms / 1000u;
-    ts.tv_nsec = (ms % 1000u) * 1000000ull;
-    const int64_t status = lpr_pacha_syscall1(
-        PACHAOS_SYSCALL_NANOSLEEP,
-        (uint64_t)(uintptr_t)&ts);
-    return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
-}
-
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events)
 {
-    enum { LPR_TTY_WAIT_QUANTUM_MS = 10 };
+    lpr_tty_backend_t *tty = lpr_tty_backend(fd);
+    if (tty == 0) {
+        return -LPR_LINUX_EBADF;
+    }
+    if (tty->wait_fd.raw < 16) {
+        return -LPR_LINUX_EIO;
+    }
+
+    lpr_wait_deadline_t deadline;
+    int64_t status = lpr_wait_deadline_init(&deadline, -1);
+    if (status != 0) return status;
     for (;;) {
         const uint32_t revents = lpr_linux_tty_poll_events(
             fd,
@@ -311,10 +307,12 @@ int64_t lpr_tty_wait(uint64_t fd, uint32_t events)
             return 0;
         }
         lpr_linux_pump_tty_signals();
-        const int64_t sleep_status = lpr_tty_sleep_ms(LPR_TTY_WAIT_QUANTUM_MS);
-        if (sleep_status != 0) {
-            return sleep_status;
-        }
+        lpr_wait_graph_t graph;
+        lpr_wait_graph_init(&graph);
+        status = lpr_wait_graph_add_fd(&graph, fd, events);
+        if (status != 0) return status;
+        status = lpr_wait_graph_block(&graph, &deadline);
+        if (status != 0) return status;
     }
 }
 
@@ -426,7 +424,8 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
     if ((events & 0x0001u) != 0 && lpr_event_backend(fd)->counter != 0) {
         revents |= 0x0001u;
     }
-    if ((events & 0x0004u) != 0 && lpr_event_backend(fd)->counter != UINT64_MAX) {
+    if ((events & 0x0004u) != 0 &&
+        lpr_event_backend(fd)->counter < UINT64_MAX - 1u) {
         revents |= 0x0004u;
     }
     return revents;

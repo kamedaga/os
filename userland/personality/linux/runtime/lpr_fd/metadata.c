@@ -158,10 +158,26 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
             return -LPR_LINUX_EFAULT;
         }
         const uint64_t value = *(const uint64_t *)(uintptr_t)buf;
-        if (value == UINT64_MAX || lpr_event_backend(fd)->counter > UINT64_MAX - value) {
-            return -LPR_LINUX_EAGAIN;
+        if (value == UINT64_MAX) return -LPR_LINUX_EINVAL;
+        lpr_event_backend_t *event = lpr_event_backend(fd);
+        for (;;) {
+            if (event->counter <= (UINT64_MAX - 1u) - value)
+                break;
+            if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
+                return -LPR_LINUX_EAGAIN;
+            lpr_wait_graph_t graph;
+            lpr_wait_deadline_t deadline;
+            lpr_wait_graph_init(&graph);
+            int64_t wait_status = lpr_wait_graph_add_fd(
+                &graph, fd, 0x0004u);
+            if (wait_status == 0)
+                wait_status = lpr_wait_deadline_init(&deadline, -1);
+            if (wait_status == 0)
+                wait_status = lpr_wait_graph_block(&graph, &deadline);
+            if (wait_status != 0) return wait_status;
         }
-        lpr_event_backend(fd)->counter += value;
+        event->counter += value;
+        lpr_event_backend_notify(event);
         return (int64_t)sizeof(uint64_t);
     }
     if (lpr_pipe_fd_is_active(fd)) {

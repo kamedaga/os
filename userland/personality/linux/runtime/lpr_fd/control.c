@@ -417,6 +417,8 @@ int lpr_control_install_fd(
         backend->active = 1;
         backend->flags = (uint32_t)linux_flags;
         backend->counter = offset;
+        backend->wait_fd.raw = -1;
+        backend->notify_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_SOCKET: {
@@ -434,6 +436,8 @@ int lpr_control_install_fd(
         backend->flags = (uint32_t)linux_flags;
         backend->instance = backend_id;
         backend->map_bytes = offset;
+        backend->wait_fd.raw = -1;
+        backend->notify_fd.raw = -1;
         break;
     }
     default:
