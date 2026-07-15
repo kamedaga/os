@@ -10,13 +10,20 @@ mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 cache="${repo_root}/.artifacts/third_party/alpine-sway-${branch}-${arch}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 mesa_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-root"
+mesa_dev_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-dev-root"
 input_root="${repo_root}/.artifacts/userland-fixtures/alpine-input-root"
+input_dev_root="${repo_root}/.artifacts/userland-fixtures/alpine-input-dev-root"
+linux_musl="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 out_abs="${repo_root}/${out}"
 dev_out_abs="${repo_root}/${dev_out}"
+wlroots_commit="cda69b696d65a53d5d5e75dfed059a3803e0d700"
+build_tools="${repo_root}/.artifacts/third_party/wlroots-build-tools"
 
 [[ -d "${clang_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_clang.sh"
-[[ -d "${mesa_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_mesa.sh"
-[[ -d "${input_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_input.sh"
+[[ -d "${mesa_root}" && -d "${mesa_dev_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_mesa.sh"
+[[ -d "${input_root}" && -d "${input_dev_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_input.sh"
+[[ -f "${linux_musl}" ]] ||
+  bash "${repo_root}/tools/copy_lpr_linux_musl.sh" ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 mkdir -p "${cache}"
 tmp="$(mktemp -d "${cache}/extract.XXXXXX")"
 trap 'rm -rf "${tmp}"' EXIT
@@ -125,7 +132,7 @@ enqueue() {
   fi
 }
 
-for package in sway wlroots wayland wayland-protocols wayland-utils foot font-roboto-mono libxkbcommon pixman; do
+for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot font-roboto-mono libxkbcommon pixman hwdata-pnp; do
   enqueue "${package}"
 done
 for ((i=0; i<${#queue[@]}; ++i)); do
@@ -153,7 +160,11 @@ mkdir -p "${runtime}" "${dev}"
 for package in "${!wanted[@]}"; do
   tar --warning=no-unknown-keyword -xzf "$(download "${package}")" -C "${runtime}"
 done
-for package in wayland-dev wayland-protocols; do
+for package in \
+  wayland-dev wayland-protocols libffi-dev libxkbcommon-dev pixman-dev \
+  libdisplay-info-dev hwdata-dev libxcb-dev xcb-util-wm-dev \
+  xcb-util-renderutil-dev xcb-util-dev xcb-proto xorgproto \
+  libxau-dev libxdmcp-dev; do
   tar --warning=no-unknown-keyword -xzf "$(download "${package}")" -C "${dev}"
 done
 
@@ -167,7 +178,209 @@ rm -rf \
 # running their scripts, so build the target-root cache explicitly while the
 # fontconfig symlinks still have their native representation.
 mkdir -p "${runtime}/var/cache/fontconfig"
-fc-cache --really-force --system-only --sysroot="${runtime}" >/dev/null
+host_fc_cache=/usr/bin/fc-cache
+[[ -x "${host_fc_cache}" ]] || { echo "missing host ${host_fc_cache}" >&2; exit 1; }
+# Nix's 1980 SOURCE_DATE_EPOCH makes fontconfig immediately reject its own
+# cache as older than the APK-preserved font directory mtimes.
+env -u SOURCE_DATE_EPOCH "${host_fc_cache}" \
+  --really-force --system-only --sysroot="${runtime}" \
+  /usr/share/fonts >/dev/null
+find "${runtime}/var/cache/fontconfig" -maxdepth 1 -type f -name '*cache-*' -print -quit |
+  grep -q . || { echo "host fc-cache did not populate target root" >&2; exit 1; }
+
+# This image intentionally has no Xwayland server. Keep Sway's standard
+# configuration intact while disabling the unavailable optional backend.
+mkdir -p "${runtime}/etc/sway/config.d"
+printf 'xwayland disable\n' >"${runtime}/etc/sway/config.d/pacha.conf"
+
+# Build wlroots itself so the product path contains the generic fence and
+# sealed-memfd changes. Sway remains the unmodified Alpine executable and
+# resolves this ABI-compatible shared object at runtime.
+if [[ ! -x "${build_tools}/bin/meson" || ! -x "${build_tools}/bin/ninja" ]]; then
+  rm -rf "${build_tools}"
+  python3 -m venv "${build_tools}"
+  "${build_tools}/bin/pip" install --disable-pip-version-check \
+    meson==1.8.1 ninja==1.11.1.4
+fi
+tool_path="${build_tools}/bin:${PATH}"
+
+wayland_archive="${cache}/wayland-1.23.1.tar.xz"
+wayland_source="${cache}/wayland-1.23.1"
+wayland_build="${cache}/wayland-host-build"
+[[ -f "${wayland_archive}" ]] || curl -fsSL \
+  'https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.23.1/downloads/wayland-1.23.1.tar.xz' \
+  -o "${wayland_archive}"
+if [[ ! -f "${wayland_source}/meson.build" ]]; then
+  rm -rf "${wayland_source}"
+  mkdir -p "${wayland_source}"
+  tar -xJf "${wayland_archive}" --strip-components=1 -C "${wayland_source}"
+fi
+if [[ ! -x "${wayland_build}/src/wayland-scanner" ]]; then
+  rm -rf "${wayland_build}"
+  PATH="${tool_path}" CC=/usr/bin/clang "${build_tools}/bin/meson" setup \
+    "${wayland_build}" "${wayland_source}" \
+    -Ddocumentation=false -Dtests=false -Ddtd_validation=false \
+    -Dlibraries=false -Dscanner=true
+  "${build_tools}/bin/ninja" -C "${wayland_build}"
+fi
+
+wlroots_git="${cache}/wlroots-git"
+if [[ ! -d "${wlroots_git}/.git" ]]; then
+  rm -rf "${wlroots_git}"
+  git clone --filter=blob:none --no-checkout \
+    https://gitlab.freedesktop.org/wlroots/wlroots.git "${wlroots_git}"
+fi
+if ! git -C "${wlroots_git}" cat-file -e "${wlroots_commit}^{commit}" 2>/dev/null; then
+  git -C "${wlroots_git}" fetch --depth=1 origin "${wlroots_commit}"
+fi
+wlroots_source="${tmp}/wlroots-source"
+mkdir -p "${wlroots_source}"
+git -C "${wlroots_git}" archive "${wlroots_commit}" | tar -x -C "${wlroots_source}"
+git -C "${wlroots_source}" apply "${repo_root}/pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
+git -C "${wlroots_source}" apply "${repo_root}/pack/patches/wlroots/0002-explicit-render-fences.patch"
+
+cross_root="${tmp}/cross-root"
+python3 - "${cross_root}" \
+  "${clang_root}" "${mesa_root}" "${input_root}" "${runtime}" \
+  "${mesa_dev_root}" "${input_dev_root}" "${dev}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+destination = Path(sys.argv[1]).resolve()
+roots = [Path(argument).resolve() for argument in sys.argv[2:]]
+marker = b"CAPABILITYOS_ROOTFS_SYMLINK\n"
+destination.mkdir(parents=True)
+
+for root in roots:
+    for source in sorted(root.rglob("*"), key=lambda path: (len(path.parts), str(path))):
+        relative = source.relative_to(root)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    continue
+                target.unlink()
+            target.symlink_to(os.readlink(source))
+        elif source.is_dir():
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise SystemExit(f"cross-root directory collision: {relative}")
+            target.mkdir(exist_ok=True)
+        elif source.is_file():
+            if target.exists() or target.is_symlink():
+                if target.is_dir() and not target.is_symlink():
+                    raise SystemExit(f"cross-root file collision: {relative}")
+                target.unlink()
+            payload = source.read_bytes()
+            if payload.startswith(marker):
+                target.symlink_to(payload[len(marker):].decode())
+            else:
+                target.symlink_to(source)
+PY
+install -Dm0755 "${linux_musl}" "${cross_root}/lib/ld-musl-x86_64.so.1"
+rm -f "${cross_root}/usr/lib/libudev.so"
+ln -s libudev.so.1 "${cross_root}/usr/lib/libudev.so"
+
+native_pc="${tmp}/native-pc"
+mkdir -p "${native_pc}"
+printf '%s\n' \
+  'Name: Wayland Scanner' \
+  'Description: native Wayland protocol scanner' \
+  'Version: 1.23.1' \
+  "wayland_scanner=${wayland_build}/src/wayland-scanner" \
+  >"${native_pc}/wayland-scanner.pc"
+printf '%s\n' \
+  'Name: hwdata' \
+  'Description: native hardware identification data' \
+  'Version: 0.395' \
+  "pkgdatadir=${cross_root}/usr/share/hwdata" \
+  >"${native_pc}/hwdata.pc"
+
+# Alpine's generic egl.pc lists private X11 dependencies even when consumers
+# dynamically link libEGL and the compositor's X11 backend is disabled. Keep
+# the target package version/paths while exposing only the dependency used by
+# this headless DRM build.
+cross_pc="${tmp}/cross-pc"
+mkdir -p "${cross_pc}"
+printf '%s\n' \
+  'prefix=/usr' \
+  'includedir=${prefix}/include' \
+  'libdir=${prefix}/lib' \
+  'Name: egl' \
+  'Description: Mesa EGL library for the DRM-only wlroots build' \
+  'Version: 25.1.9' \
+  'Requires.private: libdrm >= 2.4.75' \
+  'Libs: -L${libdir} -lEGL' \
+  'Libs.private: -lpthread -pthread -lm' \
+  'Cflags: -I${includedir}' \
+  >"${cross_pc}/egl.pc"
+printf '%s\n' \
+  'prefix=/usr' \
+  'includedir=${prefix}/include' \
+  'libdir=${prefix}/lib' \
+  'have_seatd=true' \
+  'have_logind=false' \
+  'have_builtin=false' \
+  'Name: libseat' \
+  'Description: seatd-only seat management library' \
+  'Version: 0.9.1' \
+  'Libs: -L${libdir} -lseat' \
+  'Libs.private: -lrt' \
+  'Cflags: -I${includedir}' \
+  >"${cross_pc}/libseat.pc"
+printf '%s\n' \
+  'Name: xwayland' \
+  'Description: Xwayland executable contract' \
+  'Version: 24.1.6' \
+  'xwayland=/usr/bin/Xwayland' \
+  'have_listenfd=true' \
+  'have_no_touch_pointer_emulation=true' \
+  'have_force_xrandr_emulation=true' \
+  'have_terminate_delay=true' \
+  >"${cross_pc}/xwayland.pc"
+
+cross_pkg_config="${tmp}/cross-pkg-config"
+printf '%s\n' \
+  '#!/bin/sh' \
+  "export PKG_CONFIG_SYSROOT_DIR='${cross_root}'" \
+  "export PKG_CONFIG_LIBDIR='${cross_pc}:${cross_root}/usr/lib/pkgconfig:${cross_root}/usr/share/pkgconfig'" \
+  'unset PKG_CONFIG_PATH' \
+  'exec /usr/bin/pkg-config "$@"' \
+  >"${cross_pkg_config}"
+chmod 0755 "${cross_pkg_config}"
+
+cross_file="${tmp}/wlroots-cross.ini"
+printf '%s\n' \
+  '[binaries]' \
+  "c = ['/usr/bin/clang', '--target=x86_64-linux-musl', '--sysroot=${cross_root}']" \
+  "ar = '/usr/bin/ar'" \
+  "strip = '/usr/bin/strip'" \
+  "pkg-config = '${cross_pkg_config}'" \
+  '[properties]' \
+  'needs_exe_wrapper = true' \
+  '[host_machine]' \
+  "system = 'linux'" \
+  "cpu_family = 'x86_64'" \
+  "cpu = 'x86_64'" \
+  "endian = 'little'" \
+  >"${cross_file}"
+
+wlroots_build="${tmp}/wlroots-build"
+PKG_CONFIG_PATH="${native_pc}" PKG_CONFIG_PATH_FOR_BUILD="${native_pc}" \
+  PATH="${tool_path}" \
+  "${build_tools}/bin/meson" setup "${wlroots_build}" "${wlroots_source}" \
+  --cross-file "${cross_file}" --prefix=/usr --buildtype=release \
+  -Dauto_features=disabled -Ddefault_library=shared \
+  -Dbackends=drm,libinput,x11 -Drenderers=gles2 -Dallocators=gbm \
+  -Dsession=enabled -Dexamples=false -Dxwayland=enabled \
+  -Dcolor-management=disabled -Dlibliftoff=disabled -Dxcb-errors=disabled
+"${build_tools}/bin/ninja" -C "${wlroots_build}"
+wlroots_install="${tmp}/wlroots-install"
+DESTDIR="${wlroots_install}" "${build_tools}/bin/ninja" -C "${wlroots_build}" install
+install -m 0755 "${wlroots_install}/usr/lib/libwlroots-0.18.so" \
+  "${runtime}/usr/lib/libwlroots-0.18.so"
+/usr/bin/strip --strip-unneeded "${runtime}/usr/lib/libwlroots-0.18.so"
 
 python3 - "${runtime}" "${clang_root}" "${mesa_root}" "${input_root}" <<'PY'
 import os

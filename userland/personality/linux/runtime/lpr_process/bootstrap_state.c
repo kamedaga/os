@@ -27,16 +27,27 @@ int lpr_load_manifest(void)
     }
     lpr_manifest_checked = 1;
     lpr_memset(&lpr_process_manifest, 0, sizeof(lpr_process_manifest));
-    const int64_t got = lpr_pacha_syscall3(
-        PACHAOS_SYSCALL_FD_READ,
+    /* The bootstrap descriptor names an immutable capability record, not a
+     * stream.  Map its header at offset zero so inherited fd cursor state can
+     * never affect process startup. */
+    const int64_t header_mapped = lpr_pacha_syscall6(
+        PACHAOS_SYSCALL_MMAP,
         LPR_BOOTSTRAP_FD,
-        (uint64_t)(uintptr_t)&lpr_process_manifest,
+        0,
+        sizeof(lpr_process_manifest),
+        PACHAOS_PROT_READ,
+        PACHAOS_MMAP_SHARED,
+        0);
+    if (header_mapped < 4096) goto invalid;
+    lpr_memcpy(
+        &lpr_process_manifest,
+        (const void *)(uintptr_t)header_mapped,
         sizeof(lpr_process_manifest));
-    if (got != (int64_t)sizeof(lpr_process_manifest) ||
-        lpr_process_manifest.magic != LPR_MANIFEST_MAGIC)
-    {
-        goto invalid;
-    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_MUNMAP,
+        (uint64_t)(uintptr_t)header_mapped,
+        sizeof(lpr_process_manifest));
+    if (lpr_process_manifest.magic != LPR_MANIFEST_MAGIC) goto invalid;
     if (lpr_process_manifest.image_abi_version != LPR_IMAGE_ABI_VERSION) {
         lpr_image_abi_mismatch_exit(lpr_process_manifest.image_abi_version);
     }
@@ -53,9 +64,7 @@ int lpr_load_manifest(void)
         PACHAOS_PROT_READ,
         PACHAOS_MMAP_SHARED,
         0);
-    if (mapped < 4096) {
-        goto invalid;
-    }
+    if (mapped < 4096) goto invalid;
     const lpr_manifest_t *mapped_manifest =
         (const lpr_manifest_t *)(uintptr_t)mapped;
     int cwd_lease_fd = -1;

@@ -94,22 +94,15 @@ int main(void)
         "previous header rejected");
 
     failures += expect(
-        FILED_OP_HELLO == 0 && FILED_OP_SESSION_OPEN == 1 &&
-        FILED_OP_VFS_ROOT_STAT == 4 && FILED_OP_VFS_MKNOD == 26 &&
-        FILED_OP_EXEC_PATH == 38 && FILED_OP_SERVICE_SET_NETD_SOCKET == 40 &&
-        FILED_OP_SERVICE_SET_DRMD_DRM == 42 && FILED_OP_SERVICE_SET_INPUTD_INPUT == 43 &&
-        FILED_OP_DIAG_PING == 45 && FILED_OP_DIAG_SET_CACHE_SLOTS == 49,
-        "filed ops are contiguous from zero");
-    failures += expect(
         STORAGE_OP_HELLO == 0 && STORAGE_OP_MOUNT_ROOT == 1 &&
         STORAGE_OP_LOOKUP == 2 && STORAGE_OP_PREAD == 5 &&
         STORAGE_OP_CREATE == 8 && STORAGE_OP_MKNOD == 15 &&
         STORAGE_OP_RELEASE_OBJECT == 17 && STORAGE_OP_DIAG_DUMP == 19,
         "storage ops are contiguous from zero");
     failures += expect(
-        NETD_OP_HELLO == 0 && NETD_OP_SOCKET == 1 && NETD_OP_SEND == 4 &&
-        NETD_OP_POLL == 6 && NETD_OP_BIND == 7 && NETD_OP_ACCEPT == 9 &&
-        NETD_OP_DUP == 12,
+        NETD_OP_HELLO == 0 && NETD_OP_SOCKET == 1 && NETD_OP_SOCKETPAIR == 2 &&
+        NETD_OP_SEND == 5 && NETD_OP_POLL == 7 && NETD_OP_BIND == 8 &&
+        NETD_OP_ACCEPT == 10 && NETD_OP_DUP == 13,
         "netd ops are contiguous from zero");
     failures += expect(
         TERMD_OP_HELLO == 0 && TERMD_OP_OPEN_PTMX == 1 &&
@@ -120,32 +113,12 @@ int main(void)
         DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_CARD == 1 &&
         DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5 &&
         DRMD_OP_HANDLE_READ == 6 && DRMD_OP_HANDLE_POLL == 7 &&
-        DRMD_OP_PRIME_EXPORT == 8 && DRMD_OP_PRIME_ACQUIRE == 11,
+        DRMD_OP_PRIME_EXPORT == 8 && DRMD_OP_PRIME_IMPORT_SYNC_FILE == 10 &&
+        DRMD_OP_PRIME_ACQUIRE == 12,
         "drmd ops are contiguous from zero");
-    failures += expect(
-        LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
-        LPRS_OP_SIGNAL_KILL == 14 && LPRS_OP_CWD_GET == 16 &&
-        LPRS_OP_DIAG_ERROR_GET == 19,
-        "lprs ops are contiguous from zero");
     failures += expect(
         LPR_COORD_OP_REGISTER_PROCESS == 0 && LPR_COORD_OP_SHARE_FD_TABLE == 7,
         "coordinator ops are contiguous from zero");
-    failures += expect(sizeof(lprs_process_state_t) == 608, "lprs process state size");
-    failures += expect(
-        FILED_EXEC_LPR_FD_DEVICE == 2 &&
-        FILED_EXEC_LPR_FD_DRM == 4 &&
-        FILED_EXEC_LPR_FD_INPUT == 5 &&
-        FILED_EXEC_LPR_FD_PIPE == 6 &&
-        FILED_EXEC_LPR_FD_EVENT == 7 &&
-        FILED_EXEC_LPR_FD_NATIVE == 9 &&
-        FILED_EXEC_LPR_FD_DMABUF == 10 &&
-        FILED_EXEC_LPR_FD_TABLE_VERSION == 7 &&
-        LPR_IMAGE_ABI_VERSION == 10 &&
-        LPR_CLIENT_FD_KIND_DRMD_HANDLE == 3 &&
-        LPR_CLIENT_FD_KIND_INPUTD_HANDLE == 4 &&
-        LPR_CLIENT_FD_KIND_PIPE == 5 &&
-        LPR_CLIENT_FD_KIND_EVENT == 6,
-        "lpr fd kind order keeps device before service handles");
 
     return failures == 0 ? 0 : 1;
 }

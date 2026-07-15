@@ -309,6 +309,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         lpr_ofd_ops_id(target) != LPR_FD_OPS_TTY &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_DRM &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_INPUT &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_SYNC_FILE &&
         lpr_ofd_ops_id(target) != LPR_FD_OPS_EPOLL)
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);

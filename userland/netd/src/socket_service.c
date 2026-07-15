@@ -191,6 +191,19 @@ static int netd_socket_dispatch(
             transferred_count == 1 ? transferred_fds[0] : -1,
             out_result);
     }
+    case NETD_OP_SOCKETPAIR: {
+        if (page == NULL || transferred_count != 2) {
+            return -22;
+        }
+        netd_socket_pair_t *req = (netd_socket_pair_t *)page;
+        if (req->domain != NETD_AF_UNIX) {
+            return -97;
+        }
+        return netd_unix_socket_pair(
+            req->type, req->protocol,
+            transferred_fds[0], transferred_fds[1],
+            req->handles);
+    }
     case NETD_OP_CONNECT: {
         if (page == NULL) {
             return -22;
@@ -321,6 +334,7 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     }
     const int op_has_page =
         request->word1 == NETD_OP_SOCKET ||
+        request->word1 == NETD_OP_SOCKETPAIR ||
         request->word1 == NETD_OP_CONNECT ||
         request->word1 == NETD_OP_SEND ||
         request->word1 == NETD_OP_RECV ||
@@ -381,6 +395,7 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     const int transfer_retained = status == 0 &&
         ((request->word1 == NETD_OP_SOCKET &&
             result != 0) ||
+         request->word1 == NETD_OP_SOCKETPAIR ||
          request->word1 == NETD_OP_ATTACH_WAIT ||
          (request->word1 == NETD_OP_DUP && transferred_count == 1) ||
          send_has_transfer);

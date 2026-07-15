@@ -1,0 +1,346 @@
+diff --git a/backend/drm/atomic.c b/backend/drm/atomic.c
+index df3a6aa..529f9bb 100644
+--- a/backend/drm/atomic.c
++++ b/backend/drm/atomic.c
+@@ -1,6 +1,7 @@
+ #include <drm_fourcc.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <unistd.h>
+ #include <wlr/util/log.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
+@@ -353,6 +354,59 @@ static void set_plane_props(struct atomic *atom, struct wlr_drm_backend *drm,
+ 	atomic_add(atom, id, props->crtc_id, crtc_id);
+ 	atomic_add(atom, id, props->crtc_x, (uint64_t)x);
+ 	atomic_add(atom, id, props->crtc_y, (uint64_t)y);
++	int fence_fd = wlr_buffer_get_acquire_fence(fb->wlr_buf);
++	if (props->in_fence_fd != 0 && fence_fd >= 0) {
++		atomic_add(atom, id, props->in_fence_fd, (uint64_t)fence_fd);
++	}
++}
++
++static bool wait_unsupported_fence(struct wlr_drm_plane *plane,
++		struct wlr_drm_fb *fb) {
++	return fb == NULL || plane->props.in_fence_fd != 0 ||
++		wlr_buffer_wait_acquire_fence(fb->wlr_buf);
++}
++
++static bool wait_unsupported_fences(const struct wlr_drm_device_state *state) {
++	for (size_t i = 0; i < state->connectors_len; i++) {
++		const struct wlr_drm_connector_state *conn_state = &state->connectors[i];
++		if (!conn_state->active) {
++			continue;
++		}
++		struct wlr_drm_crtc *crtc = conn_state->connector->crtc;
++		if (!wait_unsupported_fence(crtc->primary, conn_state->primary_fb) ||
++				(crtc->cursor != NULL &&
++				drm_connector_is_cursor_visible(conn_state->connector) &&
++				!wait_unsupported_fence(crtc->cursor, conn_state->cursor_fb))) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void consume_atomic_fence(struct wlr_drm_plane *plane,
++		struct wlr_drm_fb *fb) {
++	if (fb == NULL || plane->props.in_fence_fd == 0) {
++		return;
++	}
++	int fence_fd = wlr_buffer_take_acquire_fence(fb->wlr_buf);
++	if (fence_fd >= 0) {
++		close(fence_fd);
++	}
++}
++
++static void consume_atomic_fences(const struct wlr_drm_device_state *state) {
++	for (size_t i = 0; i < state->connectors_len; i++) {
++		const struct wlr_drm_connector_state *conn_state = &state->connectors[i];
++		if (!conn_state->active) {
++			continue;
++		}
++		struct wlr_drm_crtc *crtc = conn_state->connector->crtc;
++		consume_atomic_fence(crtc->primary, conn_state->primary_fb);
++		if (crtc->cursor != NULL &&
++				drm_connector_is_cursor_visible(conn_state->connector)) {
++			consume_atomic_fence(crtc->cursor, conn_state->cursor_fb);
++		}
++	}
+ }
+ 
+ static bool supports_cursor_hotspots(const struct wlr_drm_plane* plane) {
+@@ -419,6 +473,10 @@ static bool atomic_device_commit(struct wlr_drm_backend *drm,
+ 		const struct wlr_drm_device_state *state,
+ 		struct wlr_drm_page_flip *page_flip, uint32_t flags, bool test_only) {
+ 	bool ok = false;
++	if (!test_only && !wait_unsupported_fences(state)) {
++		wlr_log(WLR_ERROR, "Failed to wait for DRM buffer acquire fence");
++		return false;
++	}
+ 
+ 	for (size_t i = 0; i < state->connectors_len; i++) {
+ 		if (!drm_atomic_connector_prepare(&state->connectors[i], state->modeset)) {
+@@ -444,6 +502,9 @@ static bool atomic_device_commit(struct wlr_drm_backend *drm,
+ 	}
+ 
+ 	ok = atomic_commit(&atom, drm, state, page_flip, flags);
++	if (ok && !test_only) {
++		consume_atomic_fences(state);
++	}
+ 	atomic_finish(&atom);
+ 
+ out:
+diff --git a/backend/drm/legacy.c b/backend/drm/legacy.c
+index 502c092..60c3991 100644
+--- a/backend/drm/legacy.c
++++ b/backend/drm/legacy.c
+@@ -75,6 +75,11 @@ static bool legacy_crtc_commit(const struct wlr_drm_connector_state *state,
+ 			return false;
+ 		}
+ 		fb_id = state->primary_fb->id;
++		if (!wlr_buffer_wait_acquire_fence(state->primary_fb->wlr_buf)) {
++			wlr_drm_conn_log(conn, WLR_ERROR,
++				"Failed to wait for primary plane acquire fence");
++			return false;
++		}
+ 	}
+ 
+ 	if (modeset) {
+@@ -134,6 +139,11 @@ static bool legacy_crtc_commit(const struct wlr_drm_connector_state *state,
+ 			wlr_drm_conn_log(conn, WLR_DEBUG, "Failed to acquire cursor FB");
+ 			return false;
+ 		}
++		if (!wlr_buffer_wait_acquire_fence(cursor_fb->wlr_buf)) {
++			wlr_drm_conn_log(conn, WLR_ERROR,
++				"Failed to wait for cursor plane acquire fence");
++			return false;
++		}
+ 
+ 		drmModeFB *drm_fb = drmModeGetFB(drm->fd, cursor_fb->id);
+ 		if (drm_fb == NULL) {
+diff --git a/backend/drm/properties.c b/backend/drm/properties.c
+index d78bfaf..a52e2b4 100644
+--- a/backend/drm/properties.c
++++ b/backend/drm/properties.c
+@@ -55,6 +55,7 @@ static const struct prop_info plane_info[] = {
+ 	{ "FB_ID", INDEX(fb_id) },
+ 	{ "HOTSPOT_X", INDEX(hotspot_x) },
+ 	{ "HOTSPOT_Y", INDEX(hotspot_y) },
++	{ "IN_FENCE_FD", INDEX(in_fence_fd) },
+ 	{ "IN_FORMATS", INDEX(in_formats) },
+ 	{ "SIZE_HINTS", INDEX(size_hints) },
+ 	{ "SRC_H", INDEX(src_h) },
+diff --git a/include/backend/drm/properties.h b/include/backend/drm/properties.h
+index 5707370..32765db 100644
+--- a/include/backend/drm/properties.h
++++ b/include/backend/drm/properties.h
+@@ -61,6 +61,7 @@ struct wlr_drm_plane_props {
+ 	uint32_t fb_damage_clips;
+ 	uint32_t hotspot_x;
+ 	uint32_t hotspot_y;
++	uint32_t in_fence_fd;
+ };
+ 
+ bool get_drm_connector_props(int fd, uint32_t id,
+diff --git a/include/render/egl.h b/include/render/egl.h
+index 0765cce..b422745 100644
+--- a/include/render/egl.h
++++ b/include/render/egl.h
+@@ -16,6 +16,7 @@ struct wlr_egl {
+ 		bool EXT_image_dma_buf_import_modifiers;
+ 		bool IMG_context_priority;
+ 		bool EXT_create_context_robustness;
++		bool ANDROID_native_fence_sync;
+ 
+ 		// Device extensions
+ 		bool EXT_device_drm;
+@@ -38,6 +39,9 @@ struct wlr_egl {
+ 		PFNEGLQUERYDISPLAYATTRIBEXTPROC eglQueryDisplayAttribEXT;
+ 		PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceStringEXT;
+ 		PFNEGLQUERYDEVICESEXTPROC eglQueryDevicesEXT;
++		PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR;
++		PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
++		PFNEGLDUPNATIVEFENCEFDANDROIDPROC eglDupNativeFenceFDANDROID;
+ 	} procs;
+ 
+ 	bool has_modifiers;
+diff --git a/include/wlr/types/wlr_buffer.h b/include/wlr/types/wlr_buffer.h
+index 9a655dd..926a99c 100644
+--- a/include/wlr/types/wlr_buffer.h
++++ b/include/wlr/types/wlr_buffer.h
+@@ -52,6 +52,7 @@ struct wlr_buffer {
+ 	bool dropped;
+ 	size_t n_locks;
+ 	bool accessing_data_ptr;
++	int acquire_fence_fd;
+ 
+ 	struct {
+ 		struct wl_signal destroy;
+@@ -77,6 +78,17 @@ struct wlr_buffer *wlr_buffer_lock(struct wlr_buffer *buffer);
+  * done with the buffer.
+  */
+ void wlr_buffer_unlock(struct wlr_buffer *buffer);
++/**
++ * Replace the producer completion fence owned by this buffer. Ownership of
++ * fence_fd is transferred to the buffer. Pass -1 to clear the fence.
++ */
++void wlr_buffer_set_acquire_fence(struct wlr_buffer *buffer, int fence_fd);
++/** Get the buffer's producer completion fence without transferring ownership. */
++int wlr_buffer_get_acquire_fence(struct wlr_buffer *buffer);
++/** Take ownership of the buffer's producer completion fence. */
++int wlr_buffer_take_acquire_fence(struct wlr_buffer *buffer);
++/** Wait once for and consume the buffer's producer completion fence. */
++bool wlr_buffer_wait_acquire_fence(struct wlr_buffer *buffer);
+ /**
+  * Reads the DMA-BUF attributes of the buffer. If this buffer isn't a DMA-BUF,
+  * returns false.
+diff --git a/render/egl.c b/render/egl.c
+index 19868ca..339dabd 100644
+--- a/render/egl.c
++++ b/render/egl.c
+@@ -294,6 +294,14 @@ static bool egl_init_display(struct wlr_egl *egl, EGLDisplay display) {
+ 
+ 	egl->exts.EXT_create_context_robustness =
+ 		check_egl_ext(display_exts_str, "EGL_EXT_create_context_robustness");
++	if (check_egl_ext(display_exts_str,
++			"EGL_ANDROID_native_fence_sync")) {
++		egl->exts.ANDROID_native_fence_sync = true;
++		load_egl_proc(&egl->procs.eglCreateSyncKHR, "eglCreateSyncKHR");
++		load_egl_proc(&egl->procs.eglDestroySyncKHR, "eglDestroySyncKHR");
++		load_egl_proc(&egl->procs.eglDupNativeFenceFDANDROID,
++			"eglDupNativeFenceFDANDROID");
++	}
+ 
+ 	const char *device_exts_str = NULL, *driver_name = NULL;
+ 	if (egl->exts.EXT_device_query) {
+diff --git a/render/gles2/pass.c b/render/gles2/pass.c
+index 9177b0a..5cd9e4b 100644
+--- a/render/gles2/pass.c
++++ b/render/gles2/pass.c
+@@ -3,6 +3,7 @@
+ #include <pixman.h>
+ #include <time.h>
+ #include <wlr/types/wlr_matrix.h>
++#include <wlr/util/log.h>
+ #include <wlr/util/transform.h>
+ #include "render/gles2.h"
+ #include "types/wlr_matrix.h"
+@@ -36,7 +37,26 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 		clock_gettime(CLOCK_MONOTONIC, &timer->cpu_end);
+ 	}
+ 
++	int acquire_fence_fd = -1;
++	if (!renderer->egl->exts.ANDROID_native_fence_sync) {
++		wlr_log(WLR_ERROR, "EGL_ANDROID_native_fence_sync is required for GLES2 submission");
++		goto error;
++	}
++	EGLSyncKHR sync = renderer->egl->procs.eglCreateSyncKHR(
++		renderer->egl->display, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
++	if (sync == EGL_NO_SYNC_KHR) {
++		wlr_log(WLR_ERROR, "eglCreateSyncKHR(EGL_SYNC_NATIVE_FENCE_ANDROID) failed");
++		goto error;
++	}
+ 	glFlush();
++	acquire_fence_fd = renderer->egl->procs.eglDupNativeFenceFDANDROID(
++		renderer->egl->display, sync);
++	renderer->egl->procs.eglDestroySyncKHR(renderer->egl->display, sync);
++	if (acquire_fence_fd < 0) {
++		wlr_log(WLR_ERROR, "eglDupNativeFenceFDANDROID failed");
++		goto error;
++	}
++	wlr_buffer_set_acquire_fence(pass->buffer->buffer, acquire_fence_fd);
+ 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+ 
+ 	pop_gles2_debug(renderer);
+@@ -46,6 +66,14 @@ static bool render_pass_submit(struct wlr_render_pass *wlr_pass) {
+ 	free(pass);
+ 
+ 	return true;
++
++error:
++	glBindFramebuffer(GL_FRAMEBUFFER, 0);
++	pop_gles2_debug(renderer);
++	wlr_egl_restore_context(&pass->prev_ctx);
++	wlr_buffer_unlock(pass->buffer->buffer);
++	free(pass);
++	return false;
+ }
+ 
+ static void render(const struct wlr_box *box, const pixman_region32_t *clip, GLint attrib) {
+diff --git a/types/buffer/buffer.c b/types/buffer/buffer.c
+index 953207a..5265800 100644
+--- a/types/buffer/buffer.c
++++ b/types/buffer/buffer.c
+@@ -1,6 +1,9 @@
+ #include <assert.h>
+ #include <drm_fourcc.h>
++#include <errno.h>
++#include <poll.h>
+ #include <string.h>
++#include <unistd.h>
+ #include <wlr/interfaces/wlr_buffer.h>
+ #include "render/pixel_format.h"
+ #include "types/wlr_buffer.h"
+@@ -16,6 +19,7 @@ void wlr_buffer_init(struct wlr_buffer *buffer,
+ 		.impl = impl,
+ 		.width = width,
+ 		.height = height,
++		.acquire_fence_fd = -1,
+ 	};
+ 	wl_signal_init(&buffer->events.destroy);
+ 	wl_signal_init(&buffer->events.release);
+@@ -28,6 +32,10 @@ static void buffer_consider_destroy(struct wlr_buffer *buffer) {
+ 	}
+ 
+ 	assert(!buffer->accessing_data_ptr);
++	if (buffer->acquire_fence_fd >= 0) {
++		close(buffer->acquire_fence_fd);
++		buffer->acquire_fence_fd = -1;
++	}
+ 
+ 	wl_signal_emit_mutable(&buffer->events.destroy, NULL);
+ 	wlr_addon_set_finish(&buffer->addons);
+@@ -65,6 +73,41 @@ void wlr_buffer_unlock(struct wlr_buffer *buffer) {
+ 	buffer_consider_destroy(buffer);
+ }
+ 
++void wlr_buffer_set_acquire_fence(struct wlr_buffer *buffer, int fence_fd) {
++	if (buffer->acquire_fence_fd >= 0) {
++		close(buffer->acquire_fence_fd);
++	}
++	buffer->acquire_fence_fd = fence_fd;
++}
++
++int wlr_buffer_get_acquire_fence(struct wlr_buffer *buffer) {
++	return buffer->acquire_fence_fd;
++}
++
++int wlr_buffer_take_acquire_fence(struct wlr_buffer *buffer) {
++	int fence_fd = buffer->acquire_fence_fd;
++	buffer->acquire_fence_fd = -1;
++	return fence_fd;
++}
++
++bool wlr_buffer_wait_acquire_fence(struct wlr_buffer *buffer) {
++	int fence_fd = wlr_buffer_take_acquire_fence(buffer);
++	if (fence_fd < 0) {
++		return true;
++	}
++	struct pollfd pollfd = {
++		.fd = fence_fd,
++		.events = POLLIN,
++	};
++	int ret;
++	do {
++		ret = poll(&pollfd, 1, -1);
++	} while (ret < 0 && errno == EINTR);
++	bool ready = ret == 1 && (pollfd.revents & POLLIN) != 0;
++	close(fence_fd);
++	return ready;
++}
++
+ bool wlr_buffer_get_dmabuf(struct wlr_buffer *buffer,
+ 		struct wlr_dmabuf_attributes *attribs) {
+ 	if (!buffer->impl->get_dmabuf) {
+

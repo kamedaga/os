@@ -118,7 +118,8 @@ int filed_send_exec_reply(
     uint64_t request_id,
     int process_fd,
     int thread_fd,
-    int transfer_process_fd)
+    int transfer_process_fd,
+    int thread_startable)
 {
     uint64_t process_rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -129,6 +130,14 @@ int filed_send_exec_reply(
     if (transfer_process_fd) {
         process_rights |= PACHA_FD_RIGHT_TRANSFER;
     }
+    uint64_t thread_rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_KILL;
+    if (thread_startable) {
+        thread_rights |= PACHA_FD_RIGHT_START;
+    }
     struct pacha_ipc_fd fds[2] = {
         {
             .fd = (uint64_t)(uint32_t)process_fd,
@@ -138,11 +147,7 @@ int filed_send_exec_reply(
         },
         {
             .fd = (uint64_t)(uint32_t)thread_fd,
-            .rights =
-                PACHA_FD_RIGHT_INSPECT |
-                PACHA_FD_RIGHT_CLOSE |
-                PACHA_FD_RIGHT_WAIT |
-                PACHA_FD_RIGHT_KILL,
+            .rights = thread_rights,
             .flags = 0,
             .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_CLOEXEC,
         },
@@ -180,6 +185,7 @@ int filed_send_exec_self_reply(
             .fd = (uint64_t)(uint32_t)process_fd,
             .rights =
                 PACHA_FD_RIGHT_INSPECT |
+                PACHA_FD_RIGHT_TRANSFER |
                 PACHA_FD_RIGHT_CLOSE |
                 PACHA_FD_RIGHT_WAIT |
                 PACHA_FD_RIGHT_POLL |
@@ -207,7 +213,6 @@ int filed_send_exec_self_reply(
                 PACHA_FD_RIGHT_DUP |
                 PACHA_FD_RIGHT_SET_FLAGS |
                 PACHA_FD_RIGHT_CLOSE |
-                PACHA_FD_RIGHT_READ |
                 PACHA_FD_RIGHT_MAP_READ,
             .flags = 0,
             .transfer_flags = PACHA_IPC_TRANSFER_MOVE,

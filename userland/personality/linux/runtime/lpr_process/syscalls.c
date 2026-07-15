@@ -25,6 +25,51 @@ _Static_assert(sizeof(lpr_thread_record_t) == 64u, "thread launch record size");
 static volatile uint32_t lpr_unmapself_lock;
 static unsigned char lpr_unmapself_stack[4096] __attribute__((aligned(16)));
 
+enum { LPR_FORK_CHILD_STACK_BYTES = 64u * 1024u };
+
+extern void lpr_fork_child_entry(void);
+
+static volatile uint32_t lpr_process_fork_lock;
+static unsigned char lpr_fork_child_stack[LPR_FORK_CHILD_STACK_BYTES]
+    __attribute__((aligned(16)));
+static struct lpr_linux_user_frame lpr_fork_child_return_frame;
+static lpr_exec_transaction_t *lpr_fork_child_transaction;
+
+const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
+{
+    lpr_exec_transaction_t *transaction = lpr_fork_child_transaction;
+
+    /* Only the calling thread survives a process fork.  Locks owned by any
+     * vanished sibling must not reach child-side transaction cleanup. */
+    __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
+    lpr_control_fd_table.lock.word = 0;
+    lpr_state.threads.lock_word = 0;
+    lpr_state.filed_rpc.lock_word = 0;
+    lpr_state.filed_rpc.readv_lock_word = 0;
+    lpr_state.termd_rpc.lock_word = 0;
+    lpr_state.netd_rpc.lock_word = 0;
+    lpr_unmapself_lock = 0;
+
+    if (transaction == 0 ||
+        lpr_fork_transaction_commit_child(transaction) != 0)
+    {
+        if (transaction != 0) {
+            lpr_destroy_exec_transaction(transaction);
+        }
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+        for (;;) {
+        }
+    }
+    lpr_destroy_exec_transaction(transaction);
+    lpr_fork_child_transaction = 0;
+
+    /* Drop inherited RPC channels before musl atfork handlers or any child
+     * code can observe them, then publish the child process identity. */
+    lpr_linux_apply_pending_fork_child();
+    lpr_process_fork_lock = 0;
+    return &lpr_fork_child_return_frame;
+}
+
 static void lpr_thread_record_add(lpr_thread_record_t *record)
 {
     lpr_state_lock(&lpr_state.threads.lock_word);
@@ -362,7 +407,7 @@ int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_ti
         tls);
 }
 
-int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
+static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
 {
     lpr_trace_clone_args(flags, child_stack, parent_tid, child_tid);
     const uint64_t signal = flags & 0xffu;
@@ -464,26 +509,21 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     if (lpr_supervisor_enabled) {
         child_process_rights |= PACHA_FD_RIGHT_TRANSFER;
     }
+    struct lpr_linux_user_frame native_child_frame;
+    lpr_memcpy(
+        &lpr_fork_child_return_frame, &child_frame, sizeof(child_frame));
+    lpr_memcpy(&native_child_frame, &child_frame, sizeof(child_frame));
+    native_child_frame.rip = (uint64_t)(uintptr_t)lpr_fork_child_entry;
+    native_child_frame.rsp = (uint64_t)(uintptr_t)(
+        lpr_fork_child_stack + sizeof(lpr_fork_child_stack));
+    lpr_fork_child_transaction = &fork_transaction;
     const int64_t ret = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_PROCESS_CLONE,
         child_process_rights,
         PACHA_PROCESS_CLONE_CURRENT_THREAD | PACHA_PROCESS_CLONE_USER_FRAME,
-        (uint64_t)(uintptr_t)&child_frame);
+        (uint64_t)(uintptr_t)&native_child_frame);
+    lpr_fork_child_transaction = 0;
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
-    if (ret == 0) {
-        lpr_trace_process_event("clone_child", flags, child_stack, 0);
-        const int commit_status =
-            lpr_fork_transaction_commit_child(&fork_transaction);
-        if (commit_status != 0) {
-            lpr_destroy_exec_transaction(&fork_transaction);
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
-            for (;;) {
-            }
-        }
-        lpr_destroy_exec_transaction(&fork_transaction);
-        lpr_linux_apply_pending_fork_child();
-        return 0;
-    }
     if (ret >= 16) {
         lpr_trace_process_event("clone_parent", flags, child_stack, ret);
         int reg_status = 0;
@@ -546,7 +586,20 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     lpr_linux_pending_child_sid = 0;
     lpr_linux_pending_child_pgrp = 0;
     lpr_supervisor_pending_child_token = 0;
-    return lpr_pacha_status_to_errno(ret);
+    return ret == 0 ? -LPR_LINUX_EIO : lpr_pacha_status_to_errno(ret);
+}
+
+int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
+{
+    if ((flags & LPR_CLONE_THREAD) != 0) {
+        return lpr_linux_clone_frame_impl(
+            user_frame, flags, child_stack, parent_tid, child_tid, tls);
+    }
+    lpr_state_lock(&lpr_process_fork_lock);
+    const int64_t result = lpr_linux_clone_frame_impl(
+        user_frame, flags, child_stack, parent_tid, child_tid, tls);
+    lpr_state_unlock(&lpr_process_fork_lock);
+    return result;
 }
 
 int64_t lpr_linux_fork(void)

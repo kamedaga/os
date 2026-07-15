@@ -131,6 +131,7 @@ int lpr_exec_local_fd_active(uint64_t fd)
         lpr_linux_drm_fd_active(fd) ||
         lpr_linux_input_fd_active(fd) ||
         lpr_linux_dmabuf_fd_active(fd) ||
+        lpr_linux_sync_file_fd_active(fd) ||
         lpr_pipe_fd_is_active(fd) ||
         lpr_linux_eventfd_active(fd) ||
         lpr_linux_socket_fd_active(fd) ||
@@ -209,6 +210,7 @@ static uint64_t lpr_exec_backend_record_bytes(uint8_t ops_id)
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
     case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
     case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
+    case LPR_FD_OPS_SYNC_FILE: return sizeof(lpr_sync_file_backend_t);
     default: return 0;
     }
 }
@@ -266,6 +268,10 @@ static uint32_t lpr_exec_backend_native_fds(
     case LPR_FD_OPS_DMABUF:
         LPR_EXEC_ADD_NATIVE(((const lpr_dmabuf_backend_t *)state)->native.raw);
         LPR_EXEC_ADD_NATIVE(((const lpr_dmabuf_backend_t *)state)->lease_fd.raw);
+        break;
+    case LPR_FD_OPS_SYNC_FILE:
+        LPR_EXEC_ADD_NATIVE(
+            ((const lpr_sync_file_backend_t *)state)->wait_fd.raw);
         break;
     default:
         break;
@@ -508,6 +514,13 @@ static int lpr_prepare_backend_record(
                 original->lease_fd.raw, prepared->lease_fd.raw);
         break;
     }
+    case LPR_FD_OPS_SYNC_FILE: {
+        const lpr_sync_file_backend_t *original = original_state;
+        lpr_sync_file_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(
+            original->wait_fd.raw, prepared->wait_fd.raw);
+        break;
+    }
     case LPR_FD_OPS_TTY: {
         const lpr_tty_backend_t *original = original_state;
         lpr_tty_backend_t *prepared = prepared_state;
@@ -636,8 +649,10 @@ static int lpr_prepare_manifest(
             (sizeof(lpr_manifest_entry_t) + sizeof(lpr_fd_pin_t) +
                 2u * sizeof(lpr_prepared_lease_t)));
     if (map_bytes == 0) return -LPR_LINUX_E2BIG;
-    const uint64_t rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
     const int64_t manifest_fd = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_VMO_CREATE, map_bytes, rights, 0);
     if (manifest_fd < 16) return (int)lpr_pacha_status_to_errno(manifest_fd);
@@ -1168,7 +1183,15 @@ int64_t lpr_filed_exec_self(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
     request_fds[1].fd = (uint64_t)(uint32_t)transaction->manifest_fd;
-    request_fds[1].rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ;
+    /* Filed returns this immutable capability record to the caller.  Preserve
+     * only the rights needed for that one relay and for installing fd 245. */
+    request_fds[1].rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ;
     const uint64_t request_fd_count = 2;
 
     const uint64_t request_id = lpr_next_request_id(&lpr_request_id);

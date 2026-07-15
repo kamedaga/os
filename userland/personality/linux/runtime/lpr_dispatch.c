@@ -610,6 +610,20 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         if ((offset & 4095ull) != 0) {
             return -LPR_LINUX_EINVAL;
         }
+        const lpr_filed_backend_t *file = lpr_filed_backend(fd);
+        if ((flags & LPR_LINUX_MAP_SHARED) != 0 &&
+            (prot & LPR_LINUX_PROT_WRITE) != 0)
+        {
+            if ((file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) {
+                return -LPR_LINUX_EACCES;
+            }
+            if ((file->reserved1 & (LPR_FILED_FD_MEMFD |
+                    LPR_LINUX_F_SEAL_FUTURE_WRITE)) ==
+                (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_FUTURE_WRITE))
+            {
+                return -LPR_LINUX_EPERM;
+            }
+        }
         const uint64_t map_len = lpr_mmap_page_align_up(len);
         if (map_len == 0) {
             return -LPR_LINUX_ENOMEM;
@@ -986,8 +1000,8 @@ static int64_t lpr_sys_dup2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 static int64_t lpr_sys_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_nanosleep(a0, a1); }
 static int64_t lpr_sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpid(); }
 static int64_t lpr_sys_socket(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket(a0, a1, a2); }
+static int64_t lpr_sys_socketpair(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_socketpair(a0, a1, a2, a3); }
 static int64_t lpr_sys_connect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_connect(a0, a1, a2); }
-static int64_t lpr_sys_eopnotsupp(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return -LPR_LINUX_EOPNOTSUPP; }
 static int64_t lpr_sys_sendto(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_sendto(a0, a1, a2, a3, a4, a5); }
 static int64_t lpr_sys_recvfrom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_recvfrom(a0, a1, a2, a3, a4, a5); }
 static int64_t lpr_sys_sendmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_sendmsg(a0, a1, a2); }
@@ -1181,7 +1195,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_LISTEN, "listen", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_listen, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_GETSOCKNAME, "getsockname", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_getsockname, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_GETPEERNAME, "getpeername", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_getpeername, LPR_SYSCALL_TRACE),
-    LPR_SYSCALL(LPR_LINUX_SYS_SOCKETPAIR, "socketpair", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_eopnotsupp, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SOCKETPAIR, "socketpair", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_socketpair, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_SETSOCKOPT, "setsockopt", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_setsockopt, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_GETSOCKOPT, "getsockopt", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_getsockopt, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CLONE, "clone", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_clone, 0),
@@ -1326,7 +1340,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_LISTEN].handler = lpr_sys_listen;
     lpr_syscall_table[LPR_LINUX_SYS_GETSOCKNAME].handler = lpr_sys_getsockname;
     lpr_syscall_table[LPR_LINUX_SYS_GETPEERNAME].handler = lpr_sys_getpeername;
-    lpr_syscall_table[LPR_LINUX_SYS_SOCKETPAIR].handler = lpr_sys_eopnotsupp;
+    lpr_syscall_table[LPR_LINUX_SYS_SOCKETPAIR].handler = lpr_sys_socketpair;
     lpr_syscall_table[LPR_LINUX_SYS_SETSOCKOPT].handler = lpr_sys_setsockopt;
     lpr_syscall_table[LPR_LINUX_SYS_GETSOCKOPT].handler = lpr_sys_getsockopt;
     lpr_syscall_table[LPR_LINUX_SYS_CLONE].handler = lpr_sys_clone;
@@ -1501,7 +1515,6 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     if (trace_socket_syscall) {
         lpr_trace_socket_syscall_event("enter", nr, a0, a1, a2, 0);
     }
-    lpr_linux_apply_pending_fork_child();
     lpr_linux_ensure_default_stdio();
     const int64_t pre_signal_status = lpr_linux_dispatch_pending_signals();
     if (pre_signal_status != 0) {

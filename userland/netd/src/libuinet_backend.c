@@ -314,7 +314,8 @@ static int netd_libuinet_sts_open(struct uinet_instance_cfg *instance_cfg)
         uinet_sts_callout_max_size() < sizeof(struct netd_libuinet_sts_callout))
         return -1;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ;
+        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_WRITE;
     g_libuinet_sts_timer_fd = pacha_timerfd_create(
         0, 0, rights, PACHA_FD_FLAG_CLOEXEC);
     if (g_libuinet_sts_timer_fd < 16)

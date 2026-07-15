@@ -137,7 +137,10 @@ int64_t lpr_filed_transfer_dup_handle(
         return -LPR_LINUX_EINVAL;
     *out_handle = 0;
     void *page = 0;
-    const int page_fd = lpr_create_wire_page(&page);
+    /* Transfer RPC cannot use the fast-session payload slot: the receiver maps
+     * the transferred VMO at offset zero, while the slot starts after the
+     * session header.  Give it an independent page whose payload is at zero. */
+    const int page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) return page_fd;
     filed_handle_flags_t *flags = (filed_handle_flags_t *)page;
     lpr_memset(flags, 0, sizeof(*flags));
@@ -150,7 +153,7 @@ int64_t lpr_filed_transfer_dup_handle(
         0,
         &dup_handle,
         lease_fd);
-    lpr_destroy_wire_page(page_fd, page);
+    lpr_destroy_standalone_wire_page(page_fd, page);
     if (status != 0) return status;
     *out_handle = dup_handle;
     return 0;
@@ -584,9 +587,86 @@ int64_t lpr_filed_open_handle_at(
     return 0;
 }
 
+static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
+{
+    static const char prefix[] = "/proc/self/fd/";
+    const uint64_t known_flags =
+        LPR_LINUX_O_ACCMODE |
+        LPR_LINUX_O_APPEND |
+        LPR_LINUX_O_NONBLOCK |
+        LPR_LINUX_O_CLOEXEC;
+    if (path == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    for (size_t i = 0; i + 1u < sizeof(prefix); i += 1u) {
+        if (path[i] != prefix[i]) {
+            return -LPR_LINUX_ENOENT;
+        }
+    }
+    if ((flags & ~known_flags) != 0 ||
+        (flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_ACCMODE)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    const char *digits = path + sizeof(prefix) - 1u;
+    if (*digits < '0' || *digits > '9') {
+        return -LPR_LINUX_ENOENT;
+    }
+    uint64_t source_fd = 0;
+    for (const char *cursor = digits; *cursor != '\0'; cursor += 1) {
+        if (*cursor < '0' || *cursor > '9') {
+            return -LPR_LINUX_ENOENT;
+        }
+        const uint64_t digit = (uint64_t)(*cursor - '0');
+        if (source_fd > (LPR_LINUX_FD_MAX - digit) / 10u) {
+            return -LPR_LINUX_ENOENT;
+        }
+        source_fd = source_fd * 10u + digit;
+    }
+    if (!lpr_fd_is_filed(source_fd)) {
+        return -LPR_LINUX_ENOENT;
+    }
+
+    const lpr_filed_backend_t *source = lpr_filed_backend(source_fd);
+    const uint64_t access = flags & LPR_LINUX_O_ACCMODE;
+    if ((source->reserved1 & (LPR_FILED_FD_MEMFD |
+            LPR_LINUX_F_SEAL_FUTURE_WRITE)) ==
+            (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_FUTURE_WRITE) &&
+        access != LPR_LINUX_O_RDONLY)
+    {
+        return -LPR_LINUX_EPERM;
+    }
+
+    uint64_t handle = 0;
+    const uint64_t filed_flags =
+        (flags & LPR_LINUX_O_CLOEXEC) != 0 ? FILED_FD_CLOEXEC : 0;
+    const int64_t status = lpr_filed_dup_handle(
+        source->handle, filed_flags, &handle);
+    if (status != 0) {
+        return status;
+    }
+    const int fd = lpr_fd_alloc(handle, flags);
+    if (fd < 0) {
+        (void)lpr_filed_close_handle(handle);
+        return fd;
+    }
+    lpr_filed_backend_t *reopened = lpr_filed_backend((uint64_t)(uint32_t)fd);
+    if (reopened == 0) {
+        (void)lpr_linux_close((uint64_t)(uint32_t)fd);
+        return -LPR_LINUX_EIO;
+    }
+    reopened->reserved1 = source->reserved1;
+    return fd;
+}
+
 int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
 {
     const char *path = (const char *)(uintptr_t)path_raw;
+    const int64_t proc_fd = lpr_linux_proc_self_fd_open(path, flags);
+    if (proc_fd != -LPR_LINUX_ENOENT) {
+        return proc_fd;
+    }
     const int64_t drm_fd = lpr_drm_open_path(path, flags);
     if (drm_fd != -LPR_LINUX_ENOENT) {
         return drm_fd;
@@ -598,6 +678,36 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
     const int64_t tty_fd = lpr_tty_open_path(path, flags);
     if (tty_fd != -LPR_LINUX_ENOENT) {
         return tty_fd;
+    }
+    uint8_t device_minor = 0;
+    if (path != 0) {
+        if (lpr_strcmp(path, "/dev/null") == 0) {
+            device_minor = 3;
+        } else if (lpr_strcmp(path, "/dev/zero") == 0) {
+            device_minor = 5;
+        } else if (lpr_strcmp(path, "/dev/random") == 0) {
+            device_minor = 8;
+        } else if (lpr_strcmp(path, "/dev/urandom") == 0) {
+            device_minor = 9;
+        }
+    }
+    if (device_minor != 0) {
+        if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
+            return -LPR_LINUX_ENOTDIR;
+        }
+        if ((flags & (LPR_LINUX_O_CREAT | LPR_LINUX_O_EXCL)) ==
+            (LPR_LINUX_O_CREAT | LPR_LINUX_O_EXCL))
+        {
+            return -LPR_LINUX_EEXIST;
+        }
+        const int fd = lpr_fd_slot_alloc_from(3);
+        if (fd < 0) {
+            return fd;
+        }
+        const uint64_t device_id = (1ull << 32u) | device_minor;
+        const int install = lpr_control_install_fd(
+            (uint64_t)(uint32_t)fd, LPR_FD_OPS_DEVICE, flags, device_id, 0);
+        return install == 0 ? fd : install;
     }
     uint64_t handle = 0;
     const int64_t status = lpr_filed_open_handle_at(dirfd, path, flags, mode, &handle);
@@ -613,11 +723,14 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
     lpr_memset(&st, 0, sizeof(st));
     if (lpr_linux_fstat((uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&st) == 0 &&
         (st.st_mode & LPR_LINUX_S_IFMT) == LPR_LINUX_S_IFCHR &&
-        st.st_rdev == ((1ull << 8u) | 3ull))
+        (st.st_rdev == ((1ull << 8u) | 3ull) ||
+            st.st_rdev == ((1ull << 8u) | 5ull) ||
+            st.st_rdev == ((1ull << 8u) | 8ull) ||
+            st.st_rdev == ((1ull << 8u) | 9ull)))
     {
         const int64_t close_status = lpr_linux_close((uint64_t)(uint32_t)fd);
         if (close_status != 0) return close_status;
-        const uint64_t device_id = (1ull << 32u) | 3ull;
+        const uint64_t device_id = (1ull << 32u) | (st.st_rdev & 0xffu);
         const int install = lpr_control_install_fd(
             (uint64_t)(uint32_t)fd, LPR_FD_OPS_DEVICE, flags, device_id, 0);
         if (install != 0) return install;
@@ -628,7 +741,7 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
         }
         device->active = 1;
         device->major = 1;
-        device->minor = 3;
+        device->minor = (uint8_t)st.st_rdev;
         device->flags = (uint32_t)flags;
     }
     return fd;

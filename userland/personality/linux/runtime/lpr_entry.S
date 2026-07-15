@@ -68,6 +68,30 @@ lpr_syscall_entry:
     jmp *%rcx
 .size lpr_syscall_entry, .-lpr_syscall_entry
 
+.globl lpr_fork_child_entry
+.hidden lpr_fork_child_entry
+.type lpr_fork_child_entry, @function
+lpr_fork_child_entry:
+    call lpr_fork_child_bootstrap
+    mov %rax, %r11
+    mov 120(%r11), %rcx
+    mov 0(%r11), %r15
+    mov 8(%r11), %r14
+    mov 16(%r11), %r13
+    mov 24(%r11), %r12
+    mov 32(%r11), %rbp
+    mov 40(%r11), %rbx
+    mov 56(%r11), %r10
+    mov 64(%r11), %r9
+    mov 72(%r11), %r8
+    mov 80(%r11), %rdi
+    mov 88(%r11), %rsi
+    mov 96(%r11), %rdx
+    mov 128(%r11), %rsp
+    xor %eax, %eax
+    jmp *%rcx
+.size lpr_fork_child_entry, .-lpr_fork_child_entry
+
 .globl lpr_clone_thread_entry
 .hidden lpr_clone_thread_entry
 .type lpr_clone_thread_entry, @function

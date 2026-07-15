@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CapabilityOS <capabilityos@localhost>
+Date: Wed, 15 Jul 2026 00:00:00 +0900
+Subject: [PATCH] util: use sealed memfd mappings for shared files
+
+Avoid named POSIX shared-memory objects. Map the writable side before adding
+F_SEAL_FUTURE_WRITE, then reopen a read-only descriptor through procfs. This
+keeps the already-created producer mapping writable while preventing clients
+from upgrading the descriptor they receive.
+---
+ include/util/shm.h          |  2 +-
+ types/wlr_keyboard.c        | 15 +++----------
+ types/wlr_linux_dmabuf_v1.c | 17 +++------------
+ util/shm.c                  | 95 +++++++++++++++++----------------------------
+ 4 files changed, 43 insertions(+), 86 deletions(-)
+
+diff --git a/include/util/shm.h b/include/util/shm.h
+index 3beabca..e13f34a 100644
+--- a/include/util/shm.h
++++ b/include/util/shm.h
+@@ -6,6 +6,6 @@
+ 
+ int create_shm_file(void);
+ int allocate_shm_file(size_t size);
+-bool allocate_shm_file_pair(size_t size, int *rw_fd, int *ro_fd);
++bool allocate_shm_file_pair(size_t size, void **data, int *ro_fd);
+ 
+ #endif
+diff --git a/types/wlr_keyboard.c b/types/wlr_keyboard.c
+index ad15032..c7bdc96 100644
+--- a/types/wlr_keyboard.c
++++ b/types/wlr_keyboard.c
+@@ -206,20 +206,13 @@ bool wlr_keyboard_set_keymap(struct wlr_keyboard *kb, struct xkb_keymap *keymap)
+ 	}
+ 	size_t keymap_size = strlen(keymap_str) + 1;
+ 
+-	int rw_fd = -1, ro_fd = -1;
+-	if (!allocate_shm_file_pair(keymap_size, &rw_fd, &ro_fd)) {
++	void *dst = NULL;
++	int ro_fd = -1;
++	if (!allocate_shm_file_pair(keymap_size, &dst, &ro_fd)) {
+ 		wlr_log(WLR_ERROR, "Failed to allocate shm file for keymap");
+ 		goto error_keymap_str;
+ 	}
+ 
+-	void *dst = mmap(NULL, keymap_size, PROT_READ | PROT_WRITE, MAP_SHARED, rw_fd, 0);
+-	close(rw_fd);
+-	if (dst == MAP_FAILED) {
+-		wlr_log_errno(WLR_ERROR, "mmap failed");
+-		close(ro_fd);
+-		goto error_keymap_str;
+-	}
+-
+ 	memcpy(dst, keymap_str, keymap_size);
+ 	munmap(dst, keymap_size);
+ 
+diff --git a/types/wlr_linux_dmabuf_v1.c b/types/wlr_linux_dmabuf_v1.c
+index bfd9763..c0f3643 100644
+--- a/types/wlr_linux_dmabuf_v1.c
++++ b/types/wlr_linux_dmabuf_v1.c
+@@ -533,22 +533,13 @@ static struct wlr_linux_dmabuf_feedback_v1_compiled *feedback_compile(
+ 
+ 	size_t table_size =
+ 		table_len * sizeof(struct wlr_linux_dmabuf_feedback_v1_table_entry);
+-	int rw_fd, ro_fd;
+-	if (!allocate_shm_file_pair(table_size, &rw_fd, &ro_fd)) {
++	void *table_data = NULL;
++	int ro_fd;
++	if (!allocate_shm_file_pair(table_size, &table_data, &ro_fd)) {
+ 		wlr_log(WLR_ERROR, "Failed to allocate shm file for format table");
+ 		return NULL;
+ 	}
+-
+-	struct wlr_linux_dmabuf_feedback_v1_table_entry *table =
+-		mmap(NULL, table_size, PROT_READ | PROT_WRITE, MAP_SHARED, rw_fd, 0);
+-	if (table == MAP_FAILED) {
+-		wlr_log_errno(WLR_ERROR, "mmap failed");
+-		close(rw_fd);
+-		close(ro_fd);
+-		goto err_all_formats;
+-	}
+-
+-	close(rw_fd);
++	struct wlr_linux_dmabuf_feedback_v1_table_entry *table = table_data;
+ 
+ 	size_t n = 0;
+ 	for (size_t i = 0; i < all_formats.len; i++) {
+diff --git a/util/shm.c b/util/shm.c
+index 5eb87bb..8c6a2be 100644
+--- a/util/shm.c
++++ b/util/shm.c
+@@ -1,48 +1,16 @@
+ #include <errno.h>
+ #include <fcntl.h>
+-#include <string.h>
++#include <stdio.h>
+ #include <sys/mman.h>
+-#include <sys/stat.h>
+-#include <time.h>
+ #include <unistd.h>
+ #include <wlr/config.h>
+ #include "util/shm.h"
+ 
+-#define RANDNAME_PATTERN "/wlroots-XXXXXX"
+-
+-static void randname(char *buf) {
+-	struct timespec ts;
+-	clock_gettime(CLOCK_REALTIME, &ts);
+-	long r = ts.tv_nsec;
+-	for (int i = 0; i < 6; ++i) {
+-		buf[i] = 'A'+(r&15)+(r&16)*2;
+-		r >>= 5;
+-	}
+-}
+-
+-static int excl_shm_open(char *name) {
+-	int retries = 100;
+-	do {
+-		randname(name + strlen(RANDNAME_PATTERN) - 6);
+-
+-		--retries;
+-		// CLOEXEC is guaranteed to be set by shm_open
+-		int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+-		if (fd >= 0) {
+-			return fd;
+-		}
+-	} while (retries > 0 && errno == EEXIST);
+-
+-	return -1;
+-}
+-
+ int allocate_shm_file(size_t size) {
+-	char name[] = RANDNAME_PATTERN;
+-	int fd = excl_shm_open(name);
++	int fd = memfd_create("wlroots-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+ 	if (fd < 0) {
+ 		return -1;
+ 	}
+-	shm_unlink(name);
+ 
+ 	int ret;
+ 	do {
+@@ -56,42 +24,53 @@ int allocate_shm_file(size_t size) {
+ 	return fd;
+ }
+ 
+-bool allocate_shm_file_pair(size_t size, int *rw_fd_ptr, int *ro_fd_ptr) {
+-	char name[] = RANDNAME_PATTERN;
+-	int rw_fd = excl_shm_open(name);
++bool allocate_shm_file_pair(size_t size, void **data_ptr, int *ro_fd_ptr) {
++	int rw_fd = memfd_create("wlroots-shm", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+ 	if (rw_fd < 0) {
+ 		return false;
+ 	}
+ 
+-	// CLOEXEC is guaranteed to be set by shm_open
+-	int ro_fd = shm_open(name, O_RDONLY, 0);
+-	if (ro_fd < 0) {
+-		shm_unlink(name);
++	int ret;
++	do {
++		ret = ftruncate(rw_fd, size);
++	} while (ret < 0 && errno == EINTR);
++	if (ret < 0) {
+ 		close(rw_fd);
+ 		return false;
+ 	}
+ 
+-	shm_unlink(name);
++	void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, rw_fd, 0);
++	if (data == MAP_FAILED) {
++		close(rw_fd);
++		return false;
++	}
+ 
+-	// Make sure the file cannot be re-opened in read-write mode (e.g. via
+-	// "/proc/self/fd/" on Linux)
+-	if (fchmod(rw_fd, 0) != 0) {
++	if (fcntl(rw_fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE) < 0) {
++		munmap(data, size);
+ 		close(rw_fd);
+-		close(ro_fd);
+ 		return false;
+ 	}
+ 
+-	int ret;
++	char path[64];
++	int path_len = snprintf(path, sizeof(path), "/proc/self/fd/%d", rw_fd);
++	if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
++		munmap(data, size);
++		close(rw_fd);
++		return false;
++	}
++
++	int ro_fd;
+ 	do {
+-		ret = ftruncate(rw_fd, size);
+-	} while (ret < 0 && errno == EINTR);
+-	if (ret < 0) {
++		ro_fd = open(path, O_RDONLY | O_CLOEXEC);
++	} while (ro_fd < 0 && errno == EINTR);
++	if (ro_fd < 0) {
++		munmap(data, size);
+ 		close(rw_fd);
+-		close(ro_fd);
+ 		return false;
+ 	}
+ 
+-	*rw_fd_ptr = rw_fd;
++	close(rw_fd);
++	*data_ptr = data;
+ 	*ro_fd_ptr = ro_fd;
+ 	return true;
+ }
+-- 
+2.47.3

@@ -9,17 +9,18 @@
 enum {
     NETD_OP_HELLO = 0u,
     NETD_OP_SOCKET = 1u,
-    NETD_OP_CONNECT = 2u,
-    NETD_OP_CLOSE = 3u,
-    NETD_OP_SEND = 4u,
-    NETD_OP_RECV = 5u,
-    NETD_OP_POLL = 6u,
-    NETD_OP_BIND = 7u,
-    NETD_OP_LISTEN = 8u,
-    NETD_OP_ACCEPT = 9u,
-    NETD_OP_ATTACH_WAIT = 10u,
-    NETD_OP_UEVENT_PUBLISH = 11u,
-    NETD_OP_DUP = 12u,
+    NETD_OP_SOCKETPAIR = 2u,
+    NETD_OP_CONNECT = 3u,
+    NETD_OP_CLOSE = 4u,
+    NETD_OP_SEND = 5u,
+    NETD_OP_RECV = 6u,
+    NETD_OP_POLL = 7u,
+    NETD_OP_BIND = 8u,
+    NETD_OP_LISTEN = 9u,
+    NETD_OP_ACCEPT = 10u,
+    NETD_OP_ATTACH_WAIT = 11u,
+    NETD_OP_UEVENT_PUBLISH = 12u,
+    NETD_OP_DUP = 13u,
 
     NETD_AF_UNIX = 1,
     NETD_AF_INET = 2,
@@ -51,6 +52,13 @@ typedef struct netd_socket {
     uint64_t flags;
     uint64_t reserved[4];
 } netd_socket_t;
+
+typedef struct netd_socket_pair {
+    uint64_t domain;
+    uint64_t type;
+    uint64_t protocol;
+    uint64_t handles[2];
+} netd_socket_pair_t;
 
 typedef struct netd_sockaddr_in {
     uint32_t addr_be;

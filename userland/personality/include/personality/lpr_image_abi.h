@@ -8,7 +8,7 @@
  * belong to their respective internal headers.
  */
 
-#define LPR_IMAGE_ABI_VERSION 13ull
+#define LPR_IMAGE_ABI_VERSION 14ull
 
 /* Fixed process-image mappings. */
 #define LPR_IMAGE_PAGE_SIZE PERSONALITY_PAGE_SIZE

@@ -85,7 +85,13 @@ void filed_dump_dispatch_metrics(filed_runtime_t *runtime);
 uint64_t filed_error_token(int64_t status, uint64_t op, uint64_t stage, int64_t detail, uint64_t request_id, uint64_t fd_count, uint64_t subject, uint64_t aux, const char *message);
 int filed_send_reply(int reply_fd, void *reply_page, const pacha_service_envelope_t *header, int64_t status, uint64_t result, uint64_t error_token);
 int filed_send_session_reply(int channel_fd, uint64_t request_id, int64_t status, uint64_t result);
-int filed_send_exec_reply(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int transfer_process_fd);
+int filed_send_exec_reply(
+    int reply_fd,
+    uint64_t request_id,
+    int process_fd,
+    int thread_fd,
+    int transfer_process_fd,
+    int thread_startable);
 int filed_send_exec_self_reply(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int bootstrap_fd);
 int filed_dispatch_set_inherit(int fd, int enabled);
 void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved);

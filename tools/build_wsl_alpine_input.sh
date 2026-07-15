@@ -9,10 +9,15 @@ arch="${ALPINE_INPUT_ARCH:-x86_64}"
 mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 cache="${repo_root}/.artifacts/third_party/alpine-input-${branch}-${arch}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
+runtime_libc="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
+cc="/usr/bin/clang"
 out_abs="${repo_root}/${out}"
 dev_out_abs="${repo_root}/${dev_out}"
 
 [[ -d "${clang_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_clang.sh"
+[[ -x "${cc}" ]] || { echo "missing ${cc}" >&2; exit 1; }
+[[ -e "${runtime_libc}" ]] ||
+  bash "${repo_root}/tools/copy_lpr_linux_musl.sh" ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 mkdir -p "${cache}"
 tmp="$(mktemp -d "${cache}/extract.XXXXXX")"
 trap 'rm -rf "${tmp}"' EXIT
@@ -81,15 +86,36 @@ seatd_source="${cache}/seatd-0.9.1.tar.gz"
 seatd_src="${tmp}/seatd-src"
 mkdir -p "${seatd_src}"
 tar -xzf "${seatd_source}" --strip-components=1 -C "${seatd_src}"
-"${PACHAOS_HOST_CLANG:-/usr/bin/clang}" -target x86_64-linux-musl --sysroot="${clang_root}" \
+"${cc}" -target x86_64-linux-musl --sysroot="${clang_root}" \
   -std=c11 -O2 -fPIC -shared -nostdlib -D_GNU_SOURCE -DLIBSEAT=1 -DSEATD_ENABLED=1 \
-  -DSEATD_DEFAULTPATH='"/run/seatd.sock"' \
+  -DSEATD_DEFAULTPATH='"/run/user/0/seatd.sock"' \
   -I"${seatd_src}" -I"${seatd_src}/include" \
   -Wl,-soname,libseat.so.1 -Wl,--version-script,"${seatd_src}/libseat/libseat.syms" \
   "${seatd_src}/common/connection.c" "${seatd_src}/common/linked_list.c" \
   "${seatd_src}/common/log.c" "${seatd_src}/libseat/backend/seatd.c" \
   "${seatd_src}/libseat/backend/noop.c" "${seatd_src}/libseat/libseat.c" \
   -o "${runtime}/usr/lib/libseat.so.1"
+
+# The session owns one persistent seatd instance. Build the server against the
+# same LPR musl ABI as the rest of the user session and bake in its private
+# runtime socket instead of relying on launcher arguments or a global daemon.
+"${cc}" -target x86_64-linux-musl --sysroot="${clang_root}" \
+  -std=c11 -O2 -Wall -Wextra -nostdlib \
+  -D_XOPEN_SOURCE=700 -D__BSD_VISIBLE -D_NETBSD_SOURCE \
+  -DSEATD_VERSION='"0.9.1"' \
+  -DSEATD_DEFAULTPATH='"/run/user/0/seatd.sock"' \
+  -I"${dev}/usr/include" -I"${seatd_src}" -I"${seatd_src}/include" \
+  "${seatd_src}/common/log.c" "${seatd_src}/common/linked_list.c" \
+  "${seatd_src}/common/terminal.c" "${seatd_src}/common/connection.c" \
+  "${seatd_src}/common/evdev.c" "${seatd_src}/common/hidraw.c" \
+  "${seatd_src}/common/drm.c" "${seatd_src}/common/wscons.c" \
+  "${seatd_src}/seatd/poller.c" "${seatd_src}/seatd/seat.c" \
+  "${seatd_src}/seatd/client.c" "${seatd_src}/seatd/server.c" \
+  "${seatd_src}/seatd/seatd.c" \
+  "${clang_root}/usr/lib/Scrt1.o" "${clang_root}/usr/lib/crti.o" \
+  "${runtime_libc}" "${clang_root}/usr/lib/crtn.o" \
+  -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
+  -o "${runtime}/usr/bin/seatd"
 rm -rf "${runtime}"/.SIGN.* "${runtime}"/.PKGINFO "${runtime}"/.pre-* "${runtime}"/.post-* \
   "${runtime}"/etc/init.d "${runtime}"/etc/conf.d "${runtime}"/var \
   "${dev}"/.SIGN.* "${dev}"/.PKGINFO "${dev}"/.pre-* "${dev}"/.post-* "${dev}"/etc "${dev}"/var "${dev}"/usr/share

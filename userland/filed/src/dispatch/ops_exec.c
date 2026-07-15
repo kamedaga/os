@@ -198,7 +198,8 @@ int filed_dispatch_exec_path(
         FILED_EXEC_PATCH_BOOTSTRAP_FDS |
         FILED_EXEC_INHERIT_HANDLES |
         FILED_EXEC_LINUX_LPR |
-        FILED_EXEC_TRANSFER_PROCESS_FD;
+        FILED_EXEC_TRANSFER_PROCESS_FD |
+        FILED_EXEC_DEFER_START;
     const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
     int process_fd = -1;
@@ -227,6 +228,8 @@ int filed_dispatch_exec_path(
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec_flags & ~known_flags) != 0 ||
+        ((exec_flags & FILED_EXEC_DEFER_START) != 0 &&
+         (exec_flags & FILED_EXEC_LINUX_LPR) == 0) ||
         exec->inherit_fd_count > FILED_EXEC_MAX_INHERIT_FDS ||
         exec->inherit_handle_count > FILED_EXEC_MAX_INHERIT_HANDLES ||
         exec->fd_patch_count > FILED_EXEC_MAX_FD_PATCHES ||
@@ -554,7 +557,8 @@ out:
             request->word3,
             process_fd,
             thread_fd,
-            (exec_flags & FILED_EXEC_TRANSFER_PROCESS_FD) != 0);
+            (exec_flags & FILED_EXEC_TRANSFER_PROCESS_FD) != 0,
+            (exec_flags & FILED_EXEC_DEFER_START) != 0);
         if (send_status != 0) {
             for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_HANDLES; ++i) {
                 if (inherit_handles[i] != 0) {

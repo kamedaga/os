@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -156,8 +156,21 @@ apps:
         - "tools/build_wsl_alpine_sway.sh"
         - "tools/build_wsl_alpine_mesa.sh"
         - "tools/build_wsl_alpine_input.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
+        - "pack/patches/wlroots/0002-explicit-render-fences.patch"
     out: "SWAYROOT"
     rootfs: "/"
+  pacha_user_session:
+    file:
+      path: ".artifacts/userland-fixtures/pacha-user-session"
+      rebuild: ["bash", "tools/build_pacha_user_session.sh"]
+      input:
+        - "tools/build_pacha_user_session.sh"
+        - "userland/pacha_user_session/src/main.c"
+        - "tools/copy_lpr_linux_musl.sh"
+    out: "PACHASES.ELF"
+    rootfs: "/usr/libexec/pacha-user-session"
   sway_inventory_script:
     file:
       path: "tests/fixtures/sway_inventory.sh"
@@ -786,7 +799,7 @@ apps:
       input:
         - "pack/scripts/download_lpr_busybox_dynamic.sh"
     out: "BUSYBOX.ELF"
-    rootfs: "/cmd/busybox"
+    rootfs: ["/cmd/busybox", "/bin/sh", "/bin/ash"]
   lpr_bash_dynamic:
     file:
       path: ".artifacts/userland-fixtures/lpr-bash-dynamic-root/bin/bash"

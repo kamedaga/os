@@ -6,6 +6,12 @@
 struct pacha_service_wait_set;
 
 int netd_unix_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint64_t *out_handle);
+int netd_unix_socket_pair(
+    uint64_t type,
+    uint64_t protocol,
+    int first_notify_fd,
+    int second_notify_fd,
+    uint64_t out_handles[2]);
 int netd_unix_socket_dup(uint64_t handle);
 int netd_unix_socket_attach_wait(uint64_t handle, int notify_fd);
 int netd_unix_socket_bind(const netd_unix_path_t *req);

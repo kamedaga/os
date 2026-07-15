@@ -218,8 +218,15 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
         }
     }
     if (lpr_fd_is_filed(fd)) {
+        const lpr_filed_backend_t *file = lpr_filed_backend(fd);
+        if ((file->reserved1 & (LPR_FILED_FD_MEMFD |
+                LPR_LINUX_F_SEAL_FUTURE_WRITE)) ==
+            (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_FUTURE_WRITE))
+        {
+            return -LPR_LINUX_EPERM;
+        }
         if (count != 0) {
-            lpr_page_cache_invalidate_handle(lpr_filed_backend(fd)->handle);
+            lpr_page_cache_invalidate_handle(file->handle);
         }
         return lpr_filed_io(FILED_OP_VFS_WRITE, fd, buf, count, 0);
     }
@@ -448,6 +455,26 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 {
+    if (lpr_linux_sync_file_fd_active(fd)) {
+        const lpr_sync_file_backend_t *sync_file =
+            lpr_sync_file_backend(fd);
+        switch (cmd) {
+        case LPR_LINUX_F_GETFD:
+            return lpr_control_get_fd_flags(fd);
+        case LPR_LINUX_F_SETFD:
+            return lpr_control_set_fd_flags(fd, arg);
+        case LPR_LINUX_F_GETFL:
+            return lpr_control_get_status_flags(
+                fd, sync_file->flags & LPR_LINUX_O_ACCMODE);
+        case LPR_LINUX_F_SETFL:
+            return lpr_control_set_status_flags(fd, arg);
+        case LPR_LINUX_F_DUPFD:
+        case LPR_LINUX_F_DUPFD_CLOEXEC:
+            return lpr_linux_dup(fd, arg, cmd == LPR_LINUX_F_DUPFD_CLOEXEC);
+        default:
+            return -LPR_LINUX_EINVAL;
+        }
+    }
     if (lpr_linux_device_fd_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD: return lpr_control_get_fd_flags(fd);
@@ -620,7 +647,8 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         if ((file->reserved1 & LPR_FILED_FD_MEMFD) == 0 ||
             (arg & ~(uint64_t)(LPR_LINUX_F_SEAL_SEAL |
                 LPR_LINUX_F_SEAL_SHRINK |
-                LPR_LINUX_F_SEAL_GROW)) != 0) {
+                LPR_LINUX_F_SEAL_GROW |
+                LPR_LINUX_F_SEAL_FUTURE_WRITE)) != 0) {
             return -LPR_LINUX_EINVAL;
         }
         if ((file->reserved1 & LPR_FILED_FD_ALLOW_SEALING) == 0 ||
@@ -662,6 +690,9 @@ int64_t lpr_linux_flock(uint64_t fd, uint64_t operation)
 
 int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
+    if (lpr_linux_dmabuf_fd_active(fd)) {
+        return lpr_dmabuf_ioctl(fd, request, arg);
+    }
     if (lpr_linux_input_fd_active(fd)) {
         return lpr_input_ioctl(fd, request, arg);
     }
@@ -744,6 +775,15 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         st->st_ino = fd + 1u;
         st->st_nlink = 1;
         st->st_mode = LPR_LINUX_S_IFIFO | 0600u;
+        st->st_blksize = 4096;
+        return 0;
+    }
+    if (lpr_linux_sync_file_fd_active(fd)) {
+        lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
+        lpr_memset(st, 0, sizeof(*st));
+        st->st_ino = 0x73796e630000ull + fd;
+        st->st_nlink = 1;
+        st->st_mode = LPR_LINUX_S_IFREG | 0600u;
         st->st_blksize = 4096;
         return 0;
     }

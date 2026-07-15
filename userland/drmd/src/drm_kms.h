@@ -34,6 +34,7 @@ int drmd_kms_prime_import_vmo(
     uint64_t size,
     uint32_t flags,
     uint32_t *out_gem_handle);
+int drmd_kms_prime_import_sync_file(uint64_t token, int wait_fd);
 int drmd_kms_prime_acquire(uint64_t token);
 int drmd_kms_prime_release(uint64_t token);
 void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle);

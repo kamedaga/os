@@ -48,6 +48,12 @@
 #define LPR_LINUX_O_CLOEXEC 02000000ull
 #define LPR_LINUX_MFD_CLOEXEC 0x0001ull
 #define LPR_LINUX_MFD_ALLOW_SEALING 0x0002ull
+#define LPR_LINUX_DMA_BUF_SYNC_READ (1u << 0)
+#define LPR_LINUX_DMA_BUF_SYNC_WRITE (1u << 1)
+#define LPR_LINUX_DMA_BUF_SYNC_RW \
+    (LPR_LINUX_DMA_BUF_SYNC_READ | LPR_LINUX_DMA_BUF_SYNC_WRITE)
+#define LPR_LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE 0xc0086202ull
+#define LPR_LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE 0x40086203ull
 #define LPR_LINUX_CLOSE_RANGE_UNSHARE (1ull << 1u)
 #define LPR_LINUX_CLOSE_RANGE_CLOEXEC (1ull << 2u)
 #define LPR_LINUX_F_DUPFD 0ull
@@ -64,9 +70,10 @@
 #define LPR_LINUX_F_SEAL_SEAL 0x01u
 #define LPR_LINUX_F_SEAL_SHRINK 0x02u
 #define LPR_LINUX_F_SEAL_GROW 0x04u
+#define LPR_LINUX_F_SEAL_FUTURE_WRITE 0x10u
 #define LPR_FILED_FD_MEMFD 0x80u
 #define LPR_FILED_FD_ALLOW_SEALING 0x40u
-#define LPR_FILED_FD_SEALS 0x0fu
+#define LPR_FILED_FD_SEALS 0x17u
 #define LPR_LINUX_FD_CLOEXEC 1ull
 #define LPR_LINUX_F_UNLCK 2
 #define LPR_LINUX_LOCK_SH 1ull
@@ -702,6 +709,7 @@ lpr_socket_backend_t *lpr_socket_backend(uint64_t fd);
 lpr_tty_backend_t *lpr_tty_backend(uint64_t fd);
 lpr_device_backend_t *lpr_device_backend(uint64_t fd);
 lpr_dmabuf_backend_t *lpr_dmabuf_backend(uint64_t fd);
+lpr_sync_file_backend_t *lpr_sync_file_backend(uint64_t fd);
 lpr_epoll_backend_t *lpr_epoll_backend(uint64_t fd);
 void *lpr_backend_state_from_ofd(const lpr_ofd_t *ofd);
 uint8_t lpr_ofd_ops_id(const lpr_ofd_t *ofd);
@@ -755,6 +763,7 @@ int lpr_linux_drm_fd_active(uint64_t fd);
 int lpr_linux_input_fd_active(uint64_t fd);
 lpr_dmabuf_backend_t *lpr_dmabuf_backend(uint64_t fd);
 int lpr_linux_dmabuf_fd_active(uint64_t fd);
+int lpr_linux_sync_file_fd_active(uint64_t fd);
 int lpr_linux_filed_fd_active(uint64_t fd);
 int lpr_linux_pipe_fd_active(uint64_t fd);
 int lpr_linux_process_register( int32_t linux_pid, int32_t linux_ppid, int32_t linux_sid, int32_t linux_pgrp, int process_fd);
@@ -785,6 +794,11 @@ int64_t lpr_drm_transfer_dup_handle(
     uint64_t handle, int lease_fd, uint64_t *out_handle);
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token);
 int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd);
+int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
+int64_t lpr_sync_file_create_signaled(void);
+int lpr_sync_file_duplicate_wait(uint64_t fd);
+int lpr_sync_file_native_wait_fd(uint64_t fd);
+uint32_t lpr_sync_file_poll_events(uint64_t fd, uint32_t events);
 int64_t lpr_drm_mmap(uint64_t fd, uint64_t address, uint64_t length, uint64_t pacha_prot, uint64_t pacha_flags, uint64_t offset);
 int32_t lpr_linux_alloc_child_pid(void);
 int64_t lpr_close_native_fd_if_open(uint64_t fd);

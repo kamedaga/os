@@ -157,11 +157,27 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
 int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (lpr_linux_device_fd_active(fd)) {
-        if ((lpr_device_backend(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
+        const lpr_device_backend_t *device = lpr_device_backend(fd);
+        if ((device->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
             return -LPR_LINUX_EBADF;
         }
-        (void)buf;
-        (void)count;
+        if (count > INT64_MAX) {
+            return -LPR_LINUX_EINVAL;
+        }
+        if (device->major != 1 || device->minor == 3) {
+            return 0;
+        }
+        if (count != 0 && buf == 0) {
+            return -LPR_LINUX_EFAULT;
+        }
+        if (device->minor == 5) {
+            lpr_memset((void *)(uintptr_t)buf, 0, (size_t)count);
+            return (int64_t)count;
+        }
+        if (device->minor == 8 || device->minor == 9) {
+            return lpr_pacha_syscall3(
+                PACHAOS_SYSCALL_GETRANDOM, buf, count, 0);
+        }
         return 0;
     }
     if (lpr_linux_input_fd_active(fd)) {
@@ -288,8 +304,7 @@ int64_t lpr_backend_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         return -LPR_LINUX_EFAULT;
     }
     if (lpr_linux_device_fd_active(fd)) {
-        return (lpr_device_backend(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY ?
-            -LPR_LINUX_EBADF : 0;
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
     }
     if (lpr_pipe_fd_is_active(fd)) {
         lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);

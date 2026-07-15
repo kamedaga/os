@@ -12,6 +12,14 @@ typedef struct lpr_udmabuf_create {
     uint64_t size;
 } lpr_udmabuf_create_t;
 
+typedef struct lpr_dma_buf_sync_file {
+    uint32_t flags;
+    int32_t fd;
+} lpr_dma_buf_sync_file_t;
+
+_Static_assert(sizeof(lpr_dma_buf_sync_file_t) == 8,
+    "Linux dma-buf sync-file ioctl layout");
+
 typedef struct lpr_drm_version {
     int32_t major;
     int32_t minor;
@@ -289,6 +297,60 @@ int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd)
         0,
         lease_fd);
     lpr_destroy_tty_wire_page(page_fd, page);
+    return status;
+}
+
+static int lpr_dma_buf_sync_flags_valid(uint32_t flags)
+{
+    return (flags & LPR_LINUX_DMA_BUF_SYNC_RW) != 0 &&
+        (flags & ~LPR_LINUX_DMA_BUF_SYNC_RW) == 0;
+}
+
+int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
+{
+    lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(fd);
+    if (dmabuf == 0) return -LPR_LINUX_EBADF;
+    if (arg == 0) return -LPR_LINUX_EFAULT;
+    lpr_dma_buf_sync_file_t *sync =
+        (lpr_dma_buf_sync_file_t *)(uintptr_t)arg;
+    if (!lpr_dma_buf_sync_flags_valid(sync->flags))
+        return -LPR_LINUX_EINVAL;
+
+    if (request == LPR_LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE) {
+        const int64_t sync_fd = lpr_sync_file_create_signaled();
+        if (sync_fd < 0) return sync_fd;
+        sync->fd = (int32_t)sync_fd;
+        return 0;
+    }
+    if (request != LPR_LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
+        return -LPR_LINUX_ENOTTY;
+    if (sync->fd < 0 ||
+        !lpr_linux_sync_file_fd_active((uint64_t)(uint32_t)sync->fd))
+        return -LPR_LINUX_EBADF;
+
+    const int wait_fd = lpr_sync_file_duplicate_wait(
+        (uint64_t)(uint32_t)sync->fd);
+    if (wait_fd < 0) return wait_fd;
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        return page_fd;
+    }
+    drmd_prime_token_request_t *import =
+        (drmd_prime_token_request_t *)lpr_drmd_payload(page);
+    lpr_memset(import, 0, sizeof(*import));
+    import->token = dmabuf->token;
+    const int64_t status = lpr_drmd_call_transfer(
+        DRMD_OP_PRIME_IMPORT_SYNC_FILE,
+        page_fd,
+        page,
+        sizeof(*import),
+        0,
+        0,
+        wait_fd);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
     return status;
 }
 

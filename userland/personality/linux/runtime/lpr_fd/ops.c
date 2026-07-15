@@ -2,152 +2,6 @@
 
 #define LPR_LINUX_EMSGSIZE 90
 
-typedef int64_t (*lpr_fd_io_op_t)(
-    const lpr_fd_pin_t *pin,
-    uint64_t arg0,
-    uint64_t arg1);
-typedef int64_t (*lpr_fd_mmap_op_t)(
-    const lpr_fd_pin_t *pin,
-    uint64_t addr,
-    uint64_t len,
-    uint64_t prot,
-    uint64_t flags,
-    uint64_t offset);
-typedef int64_t (*lpr_fd_close_op_t)(void *state);
-typedef int64_t (*lpr_fd_dup_op_t)(const lpr_fd_pin_t *pin);
-
-typedef struct lpr_fd_ops {
-    lpr_fd_io_op_t read;
-    lpr_fd_io_op_t write;
-    lpr_fd_io_op_t readv;
-    lpr_fd_io_op_t writev;
-    lpr_fd_io_op_t ioctl;
-    lpr_fd_io_op_t stat;
-    lpr_fd_mmap_op_t mmap;
-    lpr_fd_close_op_t close;
-    lpr_fd_dup_op_t dup;
-} lpr_fd_ops_t;
-
-static int64_t lpr_ops_read(
-    const lpr_fd_pin_t *pin,
-    uint64_t buffer,
-    uint64_t count)
-{
-    return lpr_backend_read(pin->fd, buffer, count);
-}
-
-static int64_t lpr_ops_write(
-    const lpr_fd_pin_t *pin,
-    uint64_t buffer,
-    uint64_t count)
-{
-    return lpr_backend_write(pin->fd, buffer, count);
-}
-
-static int64_t lpr_ops_readv(
-    const lpr_fd_pin_t *pin,
-    uint64_t iov,
-    uint64_t count)
-{
-    return lpr_backend_readv(pin->fd, iov, count);
-}
-
-static int64_t lpr_ops_writev(
-    const lpr_fd_pin_t *pin,
-    uint64_t iov,
-    uint64_t count)
-{
-    return lpr_backend_writev(pin->fd, iov, count);
-}
-
-static int64_t lpr_ops_ioctl(
-    const lpr_fd_pin_t *pin,
-    uint64_t request,
-    uint64_t arg)
-{
-    return lpr_backend_ioctl(pin->fd, request, arg);
-}
-
-static int64_t lpr_ops_stat(
-    const lpr_fd_pin_t *pin,
-    uint64_t statbuf,
-    uint64_t unused)
-{
-    (void)unused;
-    return lpr_backend_fstat(pin->fd, statbuf);
-}
-
-static int64_t lpr_ops_mmap(
-    const lpr_fd_pin_t *pin,
-    uint64_t addr,
-    uint64_t len,
-    uint64_t prot,
-    uint64_t flags,
-    uint64_t offset)
-{
-    return lpr_backend_mmap(addr, len, prot, flags, pin->fd, offset);
-}
-
-static int64_t lpr_ops_socket_read(
-    const lpr_fd_pin_t *pin,
-    uint64_t buffer,
-    uint64_t count)
-{
-    return lpr_linux_socket_read(pin->fd, buffer, count);
-}
-
-static int64_t lpr_ops_socket_write(
-    const lpr_fd_pin_t *pin,
-    uint64_t buffer,
-    uint64_t count)
-{
-    return lpr_linux_socket_write(pin->fd, buffer, count);
-}
-
-static int64_t lpr_ops_socket_readv(
-    const lpr_fd_pin_t *pin,
-    uint64_t iov,
-    uint64_t count)
-{
-    return lpr_linux_socket_readv(pin->fd, iov, count);
-}
-
-static int64_t lpr_ops_socket_writev(
-    const lpr_fd_pin_t *pin,
-    uint64_t iov,
-    uint64_t count)
-{
-    return lpr_linux_socket_writev(pin->fd, iov, count);
-}
-
-static int64_t lpr_ops_socket_ioctl(
-    const lpr_fd_pin_t *pin,
-    uint64_t request,
-    uint64_t arg)
-{
-    return lpr_linux_socket_ioctl(pin->fd, request, arg);
-}
-
-static int64_t lpr_ops_socket_stat(
-    const lpr_fd_pin_t *pin,
-    uint64_t statbuf,
-    uint64_t unused)
-{
-    (void)unused;
-    return lpr_linux_socket_fstat(pin->fd, statbuf);
-}
-
-static int64_t lpr_ops_no_close(void *state)
-{
-    (void)state;
-    return 0;
-}
-
-static int64_t lpr_ops_dup(const lpr_fd_pin_t *pin)
-{
-    return pin != 0 && pin->state != 0 ? 0 : -LPR_LINUX_EBADF;
-}
-
 static int64_t lpr_ops_filed_close(void *state)
 {
     const lpr_filed_backend_t *filed = state;
@@ -244,6 +98,14 @@ static int64_t lpr_ops_dmabuf_close(void *state)
         (release_status != 0 ? release_status : lease_status);
 }
 
+static int64_t lpr_ops_sync_file_close(void *state)
+{
+    const lpr_sync_file_backend_t *sync_file = state;
+    return sync_file->wait_fd.raw >= 16 ?
+        lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)sync_file->wait_fd.raw) : 0;
+}
+
 static int64_t lpr_ops_epoll_close(void *state)
 {
     const lpr_epoll_backend_t *epoll = state;
@@ -266,55 +128,22 @@ static int64_t lpr_ops_epoll_close(void *state)
     return status;
 }
 
-static const lpr_fd_ops_t lpr_fd_ops_registry[LPR_FD_OPS_COUNT] = {
-    [LPR_FD_OPS_FILED] = {
-        lpr_ops_read, lpr_ops_write, lpr_ops_readv, lpr_ops_writev,
-        lpr_ops_ioctl, lpr_ops_stat, lpr_ops_mmap, lpr_ops_filed_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_DEVICE] = {
-        lpr_ops_read, lpr_ops_write, lpr_ops_readv, lpr_ops_writev,
-        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_no_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_TTY] = {
-        lpr_ops_read, lpr_ops_write, lpr_ops_readv, lpr_ops_writev,
-        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_tty_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_DRM] = {
-        lpr_ops_read, 0, lpr_ops_readv, 0,
-        lpr_ops_ioctl, lpr_ops_stat, lpr_ops_mmap, lpr_ops_drm_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_INPUT] = {
-        lpr_ops_read, 0, lpr_ops_readv, 0,
-        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_input_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_PIPE] = {
-        lpr_ops_read, lpr_ops_write, lpr_ops_readv, lpr_ops_writev,
-        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_pipe_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_EVENT] = {
-        lpr_ops_read, lpr_ops_write, lpr_ops_readv, lpr_ops_writev,
-        lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_event_close, lpr_ops_dup,
-    },
-    [LPR_FD_OPS_SOCKET] = {
-        lpr_ops_socket_read, lpr_ops_socket_write,
-        lpr_ops_socket_readv, lpr_ops_socket_writev,
-        lpr_ops_socket_ioctl, lpr_ops_socket_stat, 0, lpr_socket_close_backend,
-        lpr_ops_dup,
-    },
-    [LPR_FD_OPS_EPOLL] = {
-        0, 0, 0, 0, lpr_ops_ioctl, lpr_ops_stat, 0, lpr_ops_epoll_close,
-        lpr_ops_dup,
-    },
-    [LPR_FD_OPS_DMABUF] = {
-        0, 0, 0, 0, lpr_ops_ioctl, lpr_ops_stat, lpr_ops_mmap,
-        lpr_ops_dmabuf_close, lpr_ops_dup,
-    },
-};
-
-static const lpr_fd_ops_t *lpr_fd_ops_for(uint8_t ops_id)
+static int64_t lpr_fd_close_backend(uint8_t ops_id, void *state)
 {
-    return ops_id > LPR_FD_OPS_NONE && ops_id < LPR_FD_OPS_COUNT ?
-        &lpr_fd_ops_registry[ops_id] : 0;
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED: return lpr_ops_filed_close(state);
+    case LPR_FD_OPS_DEVICE: return 0;
+    case LPR_FD_OPS_TTY: return lpr_ops_tty_close(state);
+    case LPR_FD_OPS_DRM: return lpr_ops_drm_close(state);
+    case LPR_FD_OPS_INPUT: return lpr_ops_input_close(state);
+    case LPR_FD_OPS_PIPE: return lpr_ops_pipe_close(state);
+    case LPR_FD_OPS_EVENT: return lpr_ops_event_close(state);
+    case LPR_FD_OPS_SOCKET: return lpr_socket_close_backend(state);
+    case LPR_FD_OPS_EPOLL: return lpr_ops_epoll_close(state);
+    case LPR_FD_OPS_DMABUF: return lpr_ops_dmabuf_close(state);
+    case LPR_FD_OPS_SYNC_FILE: return lpr_ops_sync_file_close(state);
+    default: return 0;
+    }
 }
 
 static uint64_t lpr_transfer_input_handle(uint64_t token)
@@ -459,6 +288,22 @@ int lpr_fd_transfer_prepare(
         *out_capability_count = 2;
         return 0;
     }
+    if (pin->ops_id == LPR_FD_OPS_SYNC_FILE) {
+        const lpr_sync_file_backend_t *sync_file = pin->state;
+        if (sync_file->wait_fd.raw < 16 || capability_fds == 0 ||
+            capability_capacity < 1)
+            return -LPR_LINUX_EOPNOTSUPP;
+        const int wait_fd =
+            lpr_transfer_duplicate_capability(sync_file->wait_fd.raw);
+        if (wait_fd < 0) return wait_fd;
+        item->transfer_token = 1;
+        item->fd_flags =
+            sync_file->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count = 1;
+        capability_fds[0] = wait_fd;
+        *out_capability_count = 1;
+        return 0;
+    }
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
@@ -528,6 +373,13 @@ int lpr_fd_transfer_import_batch(
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
+        } else if (item->provider_id == LPR_FD_OPS_SYNC_FILE) {
+            if (item->transfer_token != 1 || item->capability_count != 1 ||
+                item_capabilities[0] < 16)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
         } else {
             status = -LPR_LINUX_EOPNOTSUPP;
             break;
@@ -565,6 +417,11 @@ int lpr_fd_transfer_import_batch(
             input->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
             input->wait_fd.raw = item_capabilities[0];
             input->lease_fd.raw = item_capabilities[1];
+        } else if (item->provider_id == LPR_FD_OPS_SYNC_FILE) {
+            lpr_sync_file_backend_t *sync_file = states[prepared_count];
+            sync_file->active = 1;
+            sync_file->flags = (uint32_t)linux_flags;
+            sync_file->wait_fd.raw = item_capabilities[0];
         } else {
             lpr_drm_backend_t *drm = states[prepared_count];
             drm->active = 1;
@@ -659,12 +516,64 @@ int64_t lpr_fd_prepare_dup(uint64_t fd)
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
         return -LPR_LINUX_EBADF;
     }
-    const lpr_fd_ops_t *ops = lpr_fd_ops_for(pin.ops_id);
-    const int64_t result = (pin.effective_rights & LPR_FD_RIGHT_DUP) == 0 ?
-        -LPR_LINUX_EBADF :
-        (ops != 0 && ops->dup != 0 ? ops->dup(&pin) : -LPR_LINUX_EOPNOTSUPP);
+    int64_t result = 0;
+    if ((pin.effective_rights & LPR_FD_RIGHT_DUP) == 0 || pin.state == 0)
+        result = -LPR_LINUX_EBADF;
+    else if (pin.ops_id <= LPR_FD_OPS_NONE || pin.ops_id >= LPR_FD_OPS_COUNT)
+        result = -LPR_LINUX_EOPNOTSUPP;
     lpr_fd_unpin(&pin);
     return result;
+}
+
+static int lpr_fd_io_supported(uint8_t ops_id, uint32_t operation)
+{
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED:
+    case LPR_FD_OPS_DEVICE:
+    case LPR_FD_OPS_TTY:
+    case LPR_FD_OPS_PIPE:
+    case LPR_FD_OPS_EVENT:
+    case LPR_FD_OPS_SOCKET:
+        return operation <= 5;
+    case LPR_FD_OPS_DRM:
+    case LPR_FD_OPS_INPUT:
+        return operation == 0 || operation == 2 || operation == 4 || operation == 5;
+    case LPR_FD_OPS_EPOLL:
+    case LPR_FD_OPS_DMABUF:
+        return operation == 4 || operation == 5;
+    case LPR_FD_OPS_SYNC_FILE:
+        return operation == 5;
+    default:
+        return 0;
+    }
+}
+
+static int64_t lpr_fd_dispatch_direct(
+    const lpr_fd_pin_t *pin,
+    uint64_t arg0,
+    uint64_t arg1,
+    uint32_t operation)
+{
+    if (pin->ops_id == LPR_FD_OPS_SOCKET) {
+        switch (operation) {
+        case 0: return lpr_linux_socket_read(pin->fd, arg0, arg1);
+        case 1: return lpr_linux_socket_write(pin->fd, arg0, arg1);
+        case 2: return lpr_linux_socket_readv(pin->fd, arg0, arg1);
+        case 3: return lpr_linux_socket_writev(pin->fd, arg0, arg1);
+        case 4: return lpr_linux_socket_ioctl(pin->fd, arg0, arg1);
+        case 5: return lpr_linux_socket_fstat(pin->fd, arg0);
+        default: return -LPR_LINUX_EOPNOTSUPP;
+        }
+    }
+    switch (operation) {
+    case 0: return lpr_backend_read(pin->fd, arg0, arg1);
+    case 1: return lpr_backend_write(pin->fd, arg0, arg1);
+    case 2: return lpr_backend_readv(pin->fd, arg0, arg1);
+    case 3: return lpr_backend_writev(pin->fd, arg0, arg1);
+    case 4: return lpr_backend_ioctl(pin->fd, arg0, arg1);
+    case 5: return lpr_backend_fstat(pin->fd, arg0);
+    default: return -LPR_LINUX_EOPNOTSUPP;
+    }
 }
 
 static int64_t lpr_fd_dispatch_io(
@@ -680,23 +589,21 @@ static int64_t lpr_fd_dispatch_io(
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
         return -LPR_LINUX_EBADF;
     }
-    const lpr_fd_ops_t *ops = lpr_fd_ops_for(pin.ops_id);
-    lpr_fd_io_op_t callback = 0;
     uint32_t required_right = 0;
-    if (ops != 0) {
-        switch (operation) {
-        case 0: callback = ops->read; required_right = LPR_FD_RIGHT_READ; break;
-        case 1: callback = ops->write; required_right = LPR_FD_RIGHT_WRITE; break;
-        case 2: callback = ops->readv; required_right = LPR_FD_RIGHT_READ; break;
-        case 3: callback = ops->writev; required_right = LPR_FD_RIGHT_WRITE; break;
-        case 4: callback = ops->ioctl; required_right = LPR_FD_RIGHT_IOCTL; break;
-        case 5: callback = ops->stat; required_right = LPR_FD_RIGHT_STAT; break;
-        default: break;
-        }
+    switch (operation) {
+    case 0: required_right = LPR_FD_RIGHT_READ; break;
+    case 1: required_right = LPR_FD_RIGHT_WRITE; break;
+    case 2: required_right = LPR_FD_RIGHT_READ; break;
+    case 3: required_right = LPR_FD_RIGHT_WRITE; break;
+    case 4: required_right = LPR_FD_RIGHT_IOCTL; break;
+    case 5: required_right = LPR_FD_RIGHT_STAT; break;
+    default: break;
     }
-    const int64_t result = (pin.effective_rights & required_right) == 0 ?
-        -LPR_LINUX_EBADF :
-        (callback != 0 ? callback(&pin, arg0, arg1) : -LPR_LINUX_EOPNOTSUPP);
+    int64_t result = -LPR_LINUX_EOPNOTSUPP;
+    if (required_right != 0 && (pin.effective_rights & required_right) == 0)
+        result = -LPR_LINUX_EBADF;
+    else if (required_right != 0 && lpr_fd_io_supported(pin.ops_id, operation))
+        result = lpr_fd_dispatch_direct(&pin, arg0, arg1, operation);
     lpr_fd_unpin(&pin);
     return result;
 }
@@ -746,11 +653,14 @@ int64_t lpr_fd_dispatch_mmap(
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
         return -LPR_LINUX_EBADF;
     }
-    const lpr_fd_ops_t *ops = lpr_fd_ops_for(pin.ops_id);
-    const int64_t result = (pin.effective_rights & LPR_FD_RIGHT_MMAP) == 0 ?
-        -LPR_LINUX_EBADF :
-        (ops != 0 && ops->mmap != 0 ?
-            ops->mmap(&pin, addr, len, prot, flags, offset) : -LPR_LINUX_EOPNOTSUPP);
+    int64_t result = -LPR_LINUX_EOPNOTSUPP;
+    if ((pin.effective_rights & LPR_FD_RIGHT_MMAP) == 0) {
+        result = -LPR_LINUX_EBADF;
+    } else if (pin.ops_id == LPR_FD_OPS_FILED ||
+        pin.ops_id == LPR_FD_OPS_DRM || pin.ops_id == LPR_FD_OPS_DMABUF)
+    {
+        result = lpr_backend_mmap(addr, len, prot, flags, pin.fd, offset);
+    }
     lpr_fd_unpin(&pin);
     return result;
 }
@@ -760,9 +670,7 @@ int64_t lpr_backend_finish_drop(const lpr_fd_drop_t *drop)
     if (drop == 0 || !drop->ready || drop->state == 0 || drop->state_bytes == 0) {
         return 0;
     }
-    const lpr_fd_ops_t *ops = lpr_fd_ops_for(drop->ops_id);
-    const int64_t close_status = ops != 0 && ops->close != 0 ?
-        ops->close(drop->state) : 0;
+    const int64_t close_status = lpr_fd_close_backend(drop->ops_id, drop->state);
     const int64_t unmap_status = lpr_pacha_status_to_errno(lpr_pacha_syscall2(
         PACHAOS_SYSCALL_MUNMAP,
         (uint64_t)(uintptr_t)drop->state,

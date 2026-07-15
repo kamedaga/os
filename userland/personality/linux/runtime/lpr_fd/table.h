@@ -14,7 +14,8 @@ enum {
     LPR_FD_OPS_SOCKET = 8u,
     LPR_FD_OPS_EPOLL = 9u,
     LPR_FD_OPS_DMABUF = 10u,
-    LPR_FD_OPS_COUNT = 11u,
+    LPR_FD_OPS_SYNC_FILE = 11u,
+    LPR_FD_OPS_COUNT = 12u,
 
     LPR_FD_ENTRY_CLOEXEC = 1u << 0,
 
@@ -134,6 +135,15 @@ typedef struct lpr_dmabuf_backend {
     lpr_native_fd_t native;
     lpr_native_fd_t lease_fd;
 } lpr_dmabuf_backend_t;
+
+typedef struct lpr_sync_file_backend {
+    uint8_t active;
+    uint8_t reserved0;
+    uint16_t reserved1;
+    uint32_t flags;
+    lpr_native_fd_t wait_fd;
+    uint32_t reserved2;
+} lpr_sync_file_backend_t;
 
 typedef struct lpr_socket_backend {
     uint8_t active;

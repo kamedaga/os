@@ -58,6 +58,7 @@ mkdir -p "$(dirname "$repo_root/$out")"
   "$repo_root/userland/personality/linux/runtime/lpr_fd/dup_pipe.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_pipe/io.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_timerfd.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_sync_file.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_wait.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/cache.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/path.c" \

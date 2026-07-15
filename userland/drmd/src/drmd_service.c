@@ -1,4 +1,5 @@
 #include "drmd_service.h"
+#include "drm_kms.h"
 
 #include <pacha/abi.h>
 #include <pacha/service_abi.h>
@@ -203,6 +204,20 @@ int drmd_service_dispatch(
                 status = drmd_drm_island_prime_import(
                     service->drm, prime, candidate_vmo_fd, &result);
                 if (status == 0 && prime->token == 0) retained_received_fd = candidate_vmo_fd;
+            }
+            break;
+        case DRMD_OP_PRIME_IMPORT_SYNC_FILE:
+            if (header.payload_size == sizeof(drmd_prime_token_request_t) &&
+                request->fd_count == 3)
+            {
+                const int wait_fd = (int)(uint32_t)fds[1].fd;
+                status = wait_fd >= 16 && wait_fd != page_fd && wait_fd != reply_fd ?
+                    drmd_kms_prime_import_sync_file(
+                        ((drmd_prime_token_request_t *)payload)->token,
+                        wait_fd) : -22;
+                if (status == 0) retained_received_fd = wait_fd;
+            } else {
+                status = -22;
             }
             break;
         case DRMD_OP_PRIME_RELEASE:

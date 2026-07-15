@@ -396,13 +396,13 @@ static int lprs_exec_commit_done(uint64_t token)
     lprs_process_t *proc = lprs_find_by_token(token);
     if (proc == NULL) return PACHA_STATUS_ESRCH;
     if (proc->pending_exec_fd < 16) return 0;
-    if (proc->process_fd >= 16) (void)pacha_fd_close(proc->process_fd);
-    proc->process_fd = proc->pending_exec_fd;
+    if (proc->process_fd < 16) {
+        proc->process_fd = proc->pending_exec_fd;
+    } else {
+        (void)pacha_fd_close(proc->pending_exec_fd);
+    }
     proc->pending_exec_fd = -1;
     proc->generation = g_next_generation++;
-    proc->exit_ready = 0;
-    proc->exit_notified = 0;
-    proc->exit_status = 0;
     return 0;
 }
 
@@ -1196,12 +1196,16 @@ static int lprs_service_one_pending_request(void)
 static void lprs_notify_exited_child(lprs_process_t *child, uint64_t exit_code)
 {
     if (child == NULL || !child->active || child->exit_ready ||
-        child->process_fd < 16 || child->ppid == 0)
+        child->process_fd < 16)
     {
         return;
     }
     child->exit_status = (uint32_t)(exit_code & 0xffu);
     child->exit_ready = 1;
+    if (child->ppid == 0) {
+        lprs_process_reap(child);
+        return;
+    }
     lprs_process_t *parent = lprs_find_by_pid(child->ppid);
     int notify_status = PACHA_STATUS_ESRCH;
     if (parent != NULL) {
@@ -1221,7 +1225,7 @@ static void lprs_refresh_exited_children(void)
     for (uint64_t i = 0; i < g_process_count; ++i) {
         lprs_process_t *child = &g_processes[i];
         if (!child->active || child->exit_ready || child->pending_exec_fd >= 16 ||
-            child->process_fd < 16 || child->ppid == 0)
+            child->process_fd < 16)
         {
             continue;
         }
@@ -1241,8 +1245,17 @@ static void lprs_refresh_failed_execs(void)
         if (!proc->active || proc->pending_exec_fd < 16) continue;
         uint64_t exit_code = 0;
         if (lprs_try_wait_process_fd(proc->pending_exec_fd, &exit_code) != 0) continue;
-        (void)pacha_fd_close(proc->pending_exec_fd);
+        if (proc->process_fd < 16) {
+            proc->process_fd = proc->pending_exec_fd;
+        } else {
+            (void)pacha_fd_close(proc->pending_exec_fd);
+        }
         proc->pending_exec_fd = -1;
+        if (proc->process_fd >= 16 && proc->exit_ready == 0 &&
+            lprs_try_wait_process_fd(proc->process_fd, &exit_code) == 0)
+        {
+            lprs_notify_exited_child(proc, exit_code);
+        }
     }
 }
 
@@ -1283,7 +1296,7 @@ int main(int argc, char **argv)
         {
             const lprs_process_t *proc = &g_processes[i];
             if (!proc->active || proc->exit_ready || proc->pending_exec_fd >= 16 ||
-                proc->process_fd < 16 || proc->ppid == 0)
+                proc->process_fd < 16)
             {
                 continue;
             }
@@ -1322,6 +1335,7 @@ int main(int argc, char **argv)
                 process_index < g_process_count)
             {
                 lprs_process_t *child = &g_processes[process_index];
+                if (!child->active || child->process_fd < 16) continue;
                 uint64_t exit_code = 0;
                 if (lprs_try_wait_process_fd(child->process_fd, &exit_code) == 0) {
                     lprs_notify_exited_child(child, exit_code);

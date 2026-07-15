@@ -517,6 +517,81 @@ static uint16_t lpr_socket_next_port_be(void)
     return lpr_socket_htons(port);
 }
 
+static int64_t lpr_socket_install_endpoint(
+    uint64_t domain,
+    uint64_t type,
+    uint64_t protocol,
+    uint64_t flags,
+    uint64_t handle,
+    int native_wait_fd,
+    int connected,
+    int32_t peer_pid,
+    uint32_t peer_uid,
+    uint32_t peer_gid)
+{
+    const int fd = lpr_socket_alloc_fd();
+    if (fd < 0) {
+        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
+        if (native_wait_fd >= 16)
+            (void)lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)native_wait_fd);
+        return fd;
+    }
+    const uint64_t linux_flags =
+        LPR_LINUX_O_RDWR |
+        ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0) |
+        ((flags & LPR_LINUX_SOCK_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
+    const int install_status = lpr_control_install_fd(
+        (uint64_t)(uint32_t)fd,
+        LPR_FD_OPS_SOCKET,
+        linux_flags,
+        handle,
+        0);
+    if (install_status != 0) {
+        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
+        if (native_wait_fd >= 16)
+            (void)lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)native_wait_fd);
+        return install_status;
+    }
+    lpr_socket_backend_t *socket = lpr_socket_backend((uint64_t)(uint32_t)fd);
+    if (socket == 0) {
+        lpr_control_close_fd((uint64_t)(uint32_t)fd);
+        if (native_wait_fd >= 16)
+            (void)lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)native_wait_fd);
+        return -LPR_LINUX_EIO;
+    }
+    socket->type = (uint8_t)type;
+    socket->connected = connected != 0;
+    socket->connecting = 0;
+    socket->domain = (uint8_t)domain;
+    socket->protocol = (uint16_t)protocol;
+    socket->flags =
+        LPR_LINUX_O_RDWR |
+        ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0);
+    socket->sndbuf = 256u * 1024u;
+    socket->rcvbuf = 256u * 1024u;
+    socket->reuseaddr = 0;
+    socket->keepalive = 0;
+    socket->tcp_nodelay = 0;
+    socket->sndtimeo_ms = 0;
+    socket->rcvtimeo_ms = 0;
+    socket->last_error = 0;
+    socket->wait_fd.raw = native_wait_fd;
+    socket->local_addr_be = 0;
+    socket->local_port_be = lpr_socket_next_port_be();
+    socket->peer_addr_be = 0;
+    socket->peer_port_be = 0;
+    socket->peer_pid = peer_pid;
+    socket->peer_uid = peer_uid;
+    socket->peer_gid = peer_gid;
+    return fd;
+}
+
 static int64_t lpr_socket_copy_sockaddr(uint64_t addr_raw, uint64_t addrlen_raw, uint32_t addr_be, uint16_t port_be)
 {
     if (addr_raw == 0 || addrlen_raw == 0) {
@@ -603,63 +678,101 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
         return status;
     }
 
-    const int fd = lpr_socket_alloc_fd();
-    if (fd < 0) {
-        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
-        if (native_wait_fd >= 16)
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)native_wait_fd);
-        lpr_socket_trace_socket(domain, type, protocol, fd);
-        return fd;
-    }
-    const uint64_t linux_flags =
-        LPR_LINUX_O_RDWR |
-        ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0) |
-        ((flags & LPR_LINUX_SOCK_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
-    const int install_status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_SOCKET,
-        linux_flags,
-        handle,
-        0);
-    if (install_status != 0) {
-        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
-        if (native_wait_fd >= 16)
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)native_wait_fd);
-        lpr_socket_trace_socket(domain, type, protocol, install_status);
-        return install_status;
-    }
-    lpr_socket_backend_t *socket = lpr_socket_backend((uint64_t)(uint32_t)fd);
-    if (socket == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)fd);
-        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
-        if (native_wait_fd >= 16)
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)native_wait_fd);
-        lpr_socket_trace_socket(domain, type, protocol, -LPR_LINUX_EIO);
-        return -LPR_LINUX_EIO;
-    }
-    socket->active = 1;
-    socket->type = (uint8_t)type;
-    socket->connected = 0;
-    socket->connecting = 0;
-    socket->domain = (uint8_t)domain;
-    socket->protocol = (uint16_t)protocol;
-    socket->flags = LPR_LINUX_O_RDWR | ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0);
-    socket->sndbuf = 256u * 1024u;
-    socket->rcvbuf = 256u * 1024u;
-    socket->reuseaddr = 0;
-    socket->keepalive = 0;
-    socket->tcp_nodelay = 0;
-    socket->sndtimeo_ms = 0;
-    socket->rcvtimeo_ms = 0;
-    socket->handle = handle;
-    socket->last_error = 0;
-    socket->wait_fd.raw = native_wait_fd;
-    socket->local_addr_be = 0;
-    socket->local_port_be = lpr_socket_next_port_be();
-    socket->peer_addr_be = 0;
-    socket->peer_port_be = 0;
+    const int64_t fd = lpr_socket_install_endpoint(
+        domain, type, protocol, flags, handle, native_wait_fd,
+        0, 0, 0, 0);
     lpr_socket_trace_socket(domain, type, protocol, fd);
     return fd;
+}
+
+int64_t lpr_linux_socketpair(
+    uint64_t domain,
+    uint64_t type,
+    uint64_t protocol,
+    uint64_t sockets_raw)
+{
+    if (domain != LPR_LINUX_AF_UNIX) return -LPR_LINUX_EAFNOSUPPORT;
+    if (!lpr_user_range_plausible(sockets_raw, sizeof(int32_t) * 2u))
+        return -LPR_LINUX_EFAULT;
+    const uint64_t flags =
+        type & (LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC);
+    type &= ~(LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC);
+    if (type != LPR_LINUX_SOCK_STREAM || protocol != 0)
+        return -LPR_LINUX_ESOCKTNOSUPPORT;
+
+    void *page = 0;
+    const int page_fd = lpr_netd_create_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, NETD_PAGE_BYTES);
+    netd_socket_pair_t *request = (netd_socket_pair_t *)page;
+    request->domain = NETD_AF_UNIX;
+    request->type = NETD_SOCK_STREAM;
+    request->protocol = protocol;
+
+    int native_wait_fds[2] = { -1, -1 };
+    int remote_wait_fds[2] = { -1, -1 };
+    for (uint32_t i = 0; i < 2; ++i) {
+        const int wait_status = lpr_native_wait_pair(
+            &native_wait_fds[i], &remote_wait_fds[i]);
+        if (wait_status != 0) {
+            for (uint32_t j = 0; j <= i; ++j) {
+                if (native_wait_fds[j] >= 16)
+                    (void)lpr_pacha_syscall1(
+                        PACHAOS_SYSCALL_FD_CLOSE,
+                        (uint64_t)(uint32_t)native_wait_fds[j]);
+                if (remote_wait_fds[j] >= 16)
+                    (void)lpr_pacha_syscall1(
+                        PACHAOS_SYSCALL_FD_CLOSE,
+                        (uint64_t)(uint32_t)remote_wait_fds[j]);
+            }
+            lpr_netd_destroy_page(page_fd, page);
+            return wait_status;
+        }
+    }
+    const lpr_netd_fd_options_t fd_options = {
+        .transfer_fds = remote_wait_fds,
+        .transfer_count = 2,
+        .move_transfer = 1,
+    };
+    const int64_t status = lpr_netd_call_with_fd(
+        NETD_OP_SOCKETPAIR, page_fd, 0, 0, &fd_options);
+    const uint64_t handles[2] = {
+        request->handles[0], request->handles[1],
+    };
+    lpr_netd_destroy_page(page_fd, page);
+    if (status != 0 || handles[0] == 0 || handles[1] == 0) {
+        if (handles[0] != 0) (void)lpr_netd_call(NETD_OP_CLOSE, -1, handles[0], 0);
+        if (handles[1] != 0) (void)lpr_netd_call(NETD_OP_CLOSE, -1, handles[1], 0);
+        for (uint32_t i = 0; i < 2; ++i)
+            if (native_wait_fds[i] >= 16)
+                (void)lpr_pacha_syscall1(
+                    PACHAOS_SYSCALL_FD_CLOSE,
+                    (uint64_t)(uint32_t)native_wait_fds[i]);
+        return status != 0 ? status : -LPR_LINUX_EIO;
+    }
+
+    const int32_t peer_pid = (int32_t)lpr_linux_getpid();
+    const int64_t first = lpr_socket_install_endpoint(
+        domain, type, protocol, flags, handles[0], native_wait_fds[0],
+        1, peer_pid, 0, 0);
+    if (first < 0) {
+        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handles[1], 0);
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)native_wait_fds[1]);
+        return first;
+    }
+    const int64_t second = lpr_socket_install_endpoint(
+        domain, type, protocol, flags, handles[1], native_wait_fds[1],
+        1, peer_pid, 0, 0);
+    if (second < 0) {
+        (void)lpr_linux_close((uint64_t)first);
+        return second;
+    }
+    int32_t *const sockets = (int32_t *)(uintptr_t)sockets_raw;
+    sockets[0] = (int32_t)first;
+    sockets[1] = (int32_t)second;
+    return 0;
 }
 
 int64_t lpr_linux_socket_close(uint64_t fd)
@@ -1867,6 +1980,12 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             }
             continue;
         }
+        if (lpr_linux_sync_file_fd_active(fd)) {
+            fds[i].revents = (int16_t)lpr_sync_file_poll_events(
+                fd, (uint32_t)(uint16_t)fds[i].events);
+            if (fds[i].revents != 0) ready++;
+            continue;
+        }
         if (lpr_linux_tty_fd_active(fd)) {
             fds[i].revents = (int16_t)lpr_linux_tty_poll_events(fd, (uint32_t)fds[i].events);
             if (fds[i].revents != 0) {
@@ -2125,6 +2244,10 @@ static int64_t lpr_linux_select_scan(
             const uint32_t revents = lpr_linux_eventfd_poll_events(fd, events);
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_write = (revents & LPR_LINUX_POLLOUT) != 0;
+        } else if (lpr_linux_sync_file_fd_active(fd)) {
+            const uint32_t revents = lpr_sync_file_poll_events(
+                fd, want_read ? LPR_LINUX_POLLIN : 0);
+            is_read = (revents & LPR_LINUX_POLLIN) != 0;
         } else if (lpr_linux_tty_fd_active(fd)) {
             uint32_t events = 0;
             if (want_read) {

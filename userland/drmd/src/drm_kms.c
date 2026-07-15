@@ -92,6 +92,7 @@ typedef struct drmd_kms_buffer {
     uint64_t size;
     uint64_t mmap_offset;
     int vmo_fd;
+    int acquire_sync_fd;
     void *mapping;
     uint64_t dma_addr;
     void *object;
@@ -166,6 +167,16 @@ typedef struct drmd_kms_owner_context {
 } drmd_kms_owner_context_t;
 
 static drmd_kms_state_t kms;
+
+static void reset_buffer(drmd_kms_buffer_t *buffer)
+{
+    if (buffer == NULL) return;
+    if (buffer->acquire_sync_fd >= 16) {
+        (void)pacha_fd_close(buffer->acquire_sync_fd);
+    }
+    memset(buffer, 0, sizeof(*buffer));
+    buffer->acquire_sync_fd = -1;
+}
 
 typedef struct drmd_format_modifier_blob {
     uint32_t version;
@@ -251,7 +262,15 @@ int drmd_kms_init(struct drmd_drm_island *island)
     if (island == NULL || island->loaded_module_count < 2) {
         return -22;
     }
+    for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+        if (kms.buffers[i].acquire_sync_fd >= 16) {
+            (void)pacha_fd_close(kms.buffers[i].acquire_sync_fd);
+        }
+    }
     memset(&kms, 0, sizeof(kms));
+    for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+        kms.buffers[i].acquire_sync_fd = -1;
+    }
     kms.next_handle = 1;
     kms.next_fb = 71;
     kms.next_token = 1;
@@ -358,7 +377,7 @@ static void destroy_buffer(drmd_kms_buffer_t *buffer)
         const uint64_t dma_addr = buffer->dma_addr;
         const uint64_t size = buffer->size;
         if (buffer->object != NULL) kb_kfree(buffer->object);
-        memset(buffer, 0, sizeof(*buffer));
+        reset_buffer(buffer);
         buffer->cached = 1;
         buffer->reusable = 1;
         buffer->vmo_fd = vmo_fd;
@@ -372,7 +391,7 @@ static void destroy_buffer(drmd_kms_buffer_t *buffer)
     (void)pacha_munmap(buffer->mapping, buffer->size);
     (void)pacha_fd_close(buffer->vmo_fd);
     if (buffer->object != NULL) kb_kfree(buffer->object);
-    memset(buffer, 0, sizeof(*buffer));
+    reset_buffer(buffer);
 }
 
 static void release_cached_storage(drmd_kms_buffer_t *buffer)
@@ -382,7 +401,7 @@ static void release_cached_storage(drmd_kms_buffer_t *buffer)
         kms.device_backend, NULL, buffer->dma_addr, buffer->size, KB_DMA_TO_DEVICE);
     (void)pacha_munmap(buffer->mapping, buffer->size);
     (void)pacha_fd_close(buffer->vmo_fd);
-    memset(buffer, 0, sizeof(*buffer));
+    reset_buffer(buffer);
 }
 
 static void maybe_destroy_buffer(drmd_kms_buffer_t *buffer)
@@ -583,7 +602,7 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
         }
         return status;
     }
-    memset(buffer, 0, sizeof(*buffer));
+    reset_buffer(buffer);
     buffer->active = 1;
     buffer->reusable = 1;
     buffer->resource_id = resource_id;
@@ -735,7 +754,7 @@ int drmd_kms_prime_import_vmo(
         (void)pacha_munmap(mapping, size);
         return -5;
     }
-    memset(buffer, 0, sizeof(*buffer));
+    reset_buffer(buffer);
     buffer->active = 1;
     buffer->size = size;
     buffer->vmo_fd = vmo_fd;
@@ -746,11 +765,23 @@ int drmd_kms_prime_import_vmo(
         kb_subsystem_dma_unmap(
             kms.device_backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
         (void)pacha_munmap(mapping, size);
-        memset(buffer, 0, sizeof(*buffer));
+        reset_buffer(buffer);
         return -24;
     }
     buffer->mmap_offset = (uint64_t)gem->handle << 32u;
     *out_gem_handle = gem->handle;
+    return 0;
+}
+
+int drmd_kms_prime_import_sync_file(uint64_t token, int wait_fd)
+{
+    drmd_kms_buffer_t *buffer = token != 0 ? find_buffer_token(token) : NULL;
+    if (buffer == NULL || buffer->export_refs == 0 || wait_fd < 16) return -9;
+    if (buffer->acquire_sync_fd >= 16) {
+        const int close_status = pacha_fd_close(buffer->acquire_sync_fd);
+        if (close_status != 0) return close_status;
+    }
+    buffer->acquire_sync_fd = wait_fd;
     return 0;
 }
 
@@ -790,12 +821,33 @@ void drmd_kms_handle_orphan(uint64_t handle)
     }
 }
 
+static int consume_acquire_sync_file(drmd_kms_buffer_t *buffer)
+{
+    if (buffer == NULL || buffer->acquire_sync_fd < 16) return 0;
+    const int wait_fd = buffer->acquire_sync_fd;
+    buffer->acquire_sync_fd = -1;
+    struct pacha_pollfd pollfd = {
+        .fd = wait_fd,
+        .events = PACHA_FD_EVENT_READABLE |
+            PACHA_FD_EVENT_ERROR |
+            PACHA_FD_EVENT_HANGUP,
+    };
+    const long wait_status =
+        pacha_fd_wait_many(&pollfd, 1, PACHA_FD_WAIT_FOREVER);
+    const int close_status = pacha_fd_close(wait_fd);
+    if (wait_status < 0) return (int)wait_status;
+    if ((pollfd.revents & PACHA_FD_EVENT_READABLE) == 0) return -5;
+    return close_status;
+}
+
 static int submit_scanout_fb(drmd_kms_fb_t *fb)
 {
     drmd_kms_buffer_t *buffer = fb != NULL ? fb->buffer : NULL;
     if (buffer == NULL) {
         return -2;
     }
+    const int acquire_status = consume_acquire_sync_file(buffer);
+    if (acquire_status != 0) return acquire_status;
     drmd_kms_owner_context_t context;
     const int entered = enter_module(&context);
     void *objects = kms.array_alloc(1);

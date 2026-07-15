@@ -13,6 +13,7 @@ static uint64_t lpr_backend_type_bytes(uint8_t ops_id)
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
     case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
     case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
+    case LPR_FD_OPS_SYNC_FILE: return sizeof(lpr_sync_file_backend_t);
     default: return 0;
     }
 }
@@ -42,6 +43,8 @@ static uint32_t lpr_backend_rights(uint8_t ops_id, uint64_t linux_flags)
         return common | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_DMABUF:
         return common | LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_MMAP;
+    case LPR_FD_OPS_SYNC_FILE:
+        return common;
     default:
         return 0;
     }
@@ -152,6 +155,12 @@ lpr_dmabuf_backend_t *lpr_dmabuf_backend(uint64_t fd)
     return (lpr_dmabuf_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_DMABUF);
 }
 
+lpr_sync_file_backend_t *lpr_sync_file_backend(uint64_t fd)
+{
+    return (lpr_sync_file_backend_t *)lpr_backend_state_for_fd(
+        fd, LPR_FD_OPS_SYNC_FILE);
+}
+
 lpr_socket_backend_t *lpr_socket_backend(uint64_t fd)
 {
     return (lpr_socket_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_SOCKET);
@@ -195,6 +204,11 @@ int lpr_linux_input_fd_active(uint64_t fd)
 int lpr_linux_dmabuf_fd_active(uint64_t fd)
 {
     return lpr_fd_ops_active(fd, LPR_FD_OPS_DMABUF);
+}
+
+int lpr_linux_sync_file_fd_active(uint64_t fd)
+{
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_SYNC_FILE);
 }
 
 int lpr_fd_shadow_offset_eligible(uint64_t fd)
@@ -405,6 +419,13 @@ int lpr_control_install_fd(
         backend->lease_fd.raw = -1;
         break;
     }
+    case LPR_FD_OPS_SYNC_FILE: {
+        lpr_sync_file_backend_t *backend = (lpr_sync_file_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->wait_fd.raw = -1;
+        break;
+    }
     case LPR_FD_OPS_PIPE: {
         lpr_pipe_backend_t *backend = (lpr_pipe_backend_t *)state;
         backend->active = 1;
@@ -533,6 +554,7 @@ void lpr_control_sync_backend_flags(uint64_t fd)
     case LPR_FD_OPS_DRM: backend_flags = &((lpr_drm_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_INPUT: backend_flags = &((lpr_input_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_DMABUF: backend_flags = &((lpr_dmabuf_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_SYNC_FILE: backend_flags = &((lpr_sync_file_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_EVENT: backend_flags = &((lpr_event_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_PIPE: backend_flags = &((lpr_pipe_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_SOCKET: backend_flags = &((lpr_socket_backend_t *)pin.state)->flags; break;

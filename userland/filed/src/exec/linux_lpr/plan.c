@@ -822,7 +822,7 @@ int filed_exec_linux_lpr_handle(
         inherit_fds,
         inherit_fd_count,
         bootstrap_fd,
-        1,
+        (request->flags & FILED_EXEC_DEFER_START) == 0,
         out_process_fd,
         out_thread_fd);
 }
@@ -834,10 +834,19 @@ int filed_exec_linux_lpr_prepare_self(
     int *out_process_fd,
     int *out_thread_fd)
 {
+    if (request == NULL) {
+        return -22;
+    }
+    /* exec_self returns the manifest capability to the current process.  It
+     * installs that capability at the fixed bootstrap descriptor immediately
+     * before PROCESS_EXEC_FROM, so the suspended image must not also inherit
+     * Filed's temporary transfer descriptor. */
+    filed_exec_path_t prepared_request = *request;
+    prepared_request.flags &= ~(uint64_t)FILED_EXEC_BOOTSTRAP_FD;
     return filed_exec_linux_lpr_handle_mode(
         runtime,
         handle_id,
-        request,
+        &prepared_request,
         NULL,
         0,
         -1,

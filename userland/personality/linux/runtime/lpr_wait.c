@@ -135,6 +135,10 @@ int64_t lpr_wait_graph_add_fd(
         return lpr_wait_graph_add_leaf(
             graph, lpr_input_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_NATIVE, (uint32_t)fd);
+    if (lpr_linux_sync_file_fd_active(fd))
+        return (events & 0x0001u) != 0 ? lpr_wait_graph_add_native(
+            graph, lpr_sync_file_native_wait_fd(fd),
+            PACHA_FD_EVENT_READABLE) : 0;
     if (lpr_linux_epoll_fd_active(fd))
         return lpr_epoll_add_wait_graph(fd, graph);
     if (lpr_linux_socket_fd_active(fd))

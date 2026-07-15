@@ -103,6 +103,35 @@ int netd_unix_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint6
     return 0;
 }
 
+int netd_unix_socket_pair(
+    uint64_t type,
+    uint64_t protocol,
+    int first_notify_fd,
+    int second_notify_fd,
+    uint64_t out_handles[2])
+{
+    if (out_handles == NULL || type != NETD_SOCK_STREAM || protocol != 0 ||
+        first_notify_fd < 16 || second_notify_fd < 16) return -94;
+    netd_unix_socket_state_t *first = alloc_socket();
+    if (first == NULL) return -24;
+    netd_unix_socket_state_t *second = alloc_socket();
+    if (second == NULL) {
+        memset(first, 0, sizeof(*first));
+        return -24;
+    }
+    first->type = (uint32_t)type;
+    first->connected = 1;
+    first->peer = second->handle;
+    first->notify_fd = first_notify_fd;
+    second->type = (uint32_t)type;
+    second->connected = 1;
+    second->peer = first->handle;
+    second->notify_fd = second_notify_fd;
+    out_handles[0] = first->handle;
+    out_handles[1] = second->handle;
+    return 0;
+}
+
 int netd_unix_socket_dup(uint64_t handle) {
     netd_unix_socket_state_t *s = find_socket(handle);
     if (s == NULL) return -9;
