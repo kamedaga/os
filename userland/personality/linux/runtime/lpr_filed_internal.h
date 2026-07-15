@@ -148,6 +148,11 @@
 #define LPR_LINUX_DT_LNK 10u
 #define LPR_LINUX_DT_SOCK 12u
 
+typedef struct lpr_prepared_lease {
+    uint32_t pin_index;
+    int32_t fd;
+} lpr_prepared_lease_t;
+
 typedef struct lpr_exec_transaction {
     int manifest_fd;
     uint64_t map_bytes;
@@ -155,6 +160,12 @@ typedef struct lpr_exec_transaction {
     lpr_fd_pin_t *pins;
     uint64_t pin_count;
     uint64_t cwd_handle;
+    int cwd_lease_fd;
+    lpr_prepared_lease_t *prepared_leases;
+    uint64_t prepared_lease_count;
+    uint64_t prepared_lease_capacity;
+    uint64_t fork_prepared_count;
+    uint8_t fork_state;
 } lpr_exec_transaction_t;
 
 typedef struct lpr_linux_stat {
@@ -376,6 +387,7 @@ typedef struct lpr_signal_state {
 typedef struct lpr_cwd_state {
     int checked;
     uint64_t handle;
+    int32_t lease_fd;
     char path[FILED_PATH_BYTES];
 } lpr_cwd_state_t;
 
@@ -540,6 +552,7 @@ extern lpr_state_t lpr_state;
 #define lpr_linux_signal_dispatching (lpr_state.signal.dispatching)
 #define lpr_cwd_checked (lpr_state.cwd.checked)
 #define lpr_cwd_handle (lpr_state.cwd.handle)
+#define lpr_cwd_lease_fd (lpr_state.cwd.lease_fd)
 #define lpr_cwd_path (lpr_state.cwd.path)
 #define lpr_linux_rlimits_initialized (lpr_state.rlimits.initialized)
 #define lpr_linux_rlimits (lpr_state.rlimits.values)
@@ -600,7 +613,7 @@ int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_deliver
 int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_fd);
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
-void lpr_pipe_after_fork_child(void);
+void lpr_fd_after_fork_child(void);
 void lpr_cwd_init(void);
 int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_result);
 int64_t lpr_filed_call_transfer(
@@ -609,14 +622,20 @@ int64_t lpr_filed_close_handle(uint64_t handle);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
 int64_t lpr_filed_transfer_dup_handle(
     uint64_t handle, uint64_t fd_flags, int lease_fd, uint64_t *out_handle);
+int64_t lpr_netd_dup_handle(uint64_t handle);
+int64_t lpr_netd_transfer_dup_handle(uint64_t handle, int lease_fd);
+int64_t lpr_netd_close_handle(uint64_t handle);
 int lpr_create_standalone_wire_page(void **out_page);
 void lpr_destroy_standalone_wire_page(int fd, void *page);
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
 int lpr_count_exec_local_fds(uint64_t *out_count);
 int lpr_prepare_exec_manifest(filed_exec_path_t *exec, lpr_exec_transaction_t *transaction);
+int lpr_prepare_fork_manifest(filed_exec_path_t *exec, lpr_exec_transaction_t *transaction);
+int lpr_fork_transaction_prepare(lpr_exec_transaction_t *transaction);
+int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction);
+int lpr_fork_transaction_commit_parent(lpr_exec_transaction_t *transaction);
+void lpr_fork_transaction_rollback(lpr_exec_transaction_t *transaction);
 void lpr_destroy_exec_transaction(lpr_exec_transaction_t *transaction);
-int lpr_socket_reserve_exec(const lpr_exec_transaction_t *transaction);
-void lpr_socket_release_exec(const lpr_exec_transaction_t *transaction);
 int lpr_install_manifest_fds(const lpr_manifest_t *manifest);
 void lpr_readlink_cache_clear(void);
 int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_status);
@@ -693,12 +712,13 @@ int lpr_fd_transfer_prepare(
     int *capability_fds,
     uint32_t capability_capacity,
     uint32_t *out_capability_count);
-int lpr_fd_transfer_import(
-    uint32_t fd,
-    const netd_transfer_occurrence_t *item,
+int lpr_fd_transfer_import_batch(
+    const netd_transfer_occurrence_t *items,
+    uint32_t item_count,
     const int *capability_fds,
     uint32_t capability_count,
-    uint32_t receive_flags);
+    uint32_t receive_flags,
+    int *out_fds);
 void lpr_fd_transfer_cancel_ticket(const netd_transfer_occurrence_t *item);
 int64_t lpr_backend_read(uint64_t fd, uint64_t buffer, uint64_t count);
 int64_t lpr_backend_write(uint64_t fd, uint64_t buffer, uint64_t count);
@@ -759,6 +779,7 @@ int64_t lpr_drm_dup_handle(uint64_t handle);
 int64_t lpr_drm_transfer_dup_handle(
     uint64_t handle, int lease_fd, uint64_t *out_handle);
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token);
+int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd);
 int64_t lpr_drm_mmap(uint64_t fd, uint64_t address, uint64_t length, uint64_t pacha_prot, uint64_t pacha_flags, uint64_t offset);
 int32_t lpr_linux_alloc_child_pid(void);
 int64_t lpr_close_native_fd_if_open(uint64_t fd);
@@ -886,6 +907,7 @@ int64_t lpr_supervisor_cwd_set(uint64_t handle, const char *path);
 int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_delivered);
 int64_t lpr_termd_call( uint32_t op, int page_fd, void *page, uint32_t payload_size, uint64_t *out_result);
 int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result);
+int64_t lpr_termd_transfer_dup_handle(uint64_t handle, int lease_fd, uint64_t *out_handle);
 int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_tty_open_path(const char *path, uint64_t flags);
@@ -956,7 +978,6 @@ void lpr_thread_after_fork_child(void);
 void lpr_linux_ensure_default_stdio(void);
 void lpr_linux_exit_for_signal(uint32_t sig);
 void lpr_linux_prepare_process_exit(uint64_t exit_code);
-void lpr_socket_prepare_process_exit(void);
 void lpr_linux_process_clear_children(void);
 void lpr_linux_process_state_init(void);
 int lpr_linux_pump_tty_signals(void);
@@ -965,7 +986,7 @@ void lpr_linux_raise_sigpipe(void);
 void lpr_linux_readv_cache_trace_dump(void);
 void lpr_page_cache_clear(void);
 void lpr_page_cache_invalidate_handle(uint64_t handle);
-void lpr_pipe_after_fork_child(void);
+void lpr_fd_after_fork_child(void);
 void lpr_readlink_cache_clear(void);
 void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status);
 void lpr_timespec_subtract( const struct pachaos_timespec *end, const struct pachaos_timespec *start, struct pachaos_timespec *out);

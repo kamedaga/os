@@ -89,6 +89,7 @@ int main(int argc, char **argv)
         netd_socket_service_poll();
         static struct pacha_service_wait_set wait_set;
         if (pacha_service_wait_init(&wait_set, (int)cfg->socket_endpoint_fd) != 0 ||
+            netd_socket_service_collect_wait_sources(&wait_set) != 0 ||
             netd_unix_socket_collect_wait_sources(&wait_set) != 0 ||
             netd_netlink_socket_collect_wait_sources(&wait_set) != 0 ||
             netd_libuinet_socket_collect_wait_sources(&wait_set) != 0)
@@ -96,6 +97,7 @@ int main(int argc, char **argv)
         (void)pacha_service_wait(
             &wait_set,
             netd_libuinet_needs_periodic_poll() ? 1u : PACHA_FD_WAIT_FOREVER);
+        netd_socket_service_reap_hangups();
         netd_unix_socket_reap_hangups();
         netd_netlink_socket_reap_hangups();
         netd_libuinet_socket_reap_hangups();

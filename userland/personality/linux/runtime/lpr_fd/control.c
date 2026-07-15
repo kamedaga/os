@@ -372,6 +372,7 @@ int lpr_control_install_fd(
         backend->flags = (uint32_t)linux_flags;
         backend->handle = backend_id;
         backend->wait_fd.raw = -1;
+        backend->lease_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_DRM: {
@@ -401,6 +402,7 @@ int lpr_control_install_fd(
         backend->token = backend_id;
         backend->size = offset;
         backend->native.raw = -1;
+        backend->lease_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_PIPE: {
@@ -421,9 +423,9 @@ int lpr_control_install_fd(
         lpr_socket_backend_t *backend = (lpr_socket_backend_t *)state;
         backend->active = 1;
         backend->flags = (uint32_t)linux_flags;
-        backend->cloexec = (linux_flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
         backend->handle = backend_id;
         backend->wait_fd.raw = -1;
+        backend->lease_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_EPOLL: {
@@ -846,7 +848,7 @@ int lpr_install_manifest_fds(const lpr_manifest_t *manifest)
             !lpr_manifest_install_first(first->fd, first, &ofds[oi],
                 records + ofds[oi].record_offset))
         {
-            return 0;
+            goto rollback;
         }
         for (uint64_t ei = 0; ei < manifest->entry_count; ++ei) {
             const lpr_manifest_entry_t *entry = &entries[ei];
@@ -858,11 +860,18 @@ int lpr_install_manifest_fds(const lpr_manifest_t *manifest)
                 lpr_control_set_effective_rights(
                     entry->fd, (uint32_t)entry->effective_rights) != 0)
             {
-                return 0;
+                goto rollback;
             }
         }
     }
     return 1;
+
+rollback:
+    for (uint64_t ei = 0; ei < manifest->entry_count; ++ei)
+        if (entries[ei].fd <= LPR_LINUX_FD_MAX &&
+            lpr_control_fd_active(entries[ei].fd))
+            lpr_control_close_fd(entries[ei].fd);
+    return 0;
 }
 
 void lpr_state_dump(const char *reason)

@@ -452,6 +452,30 @@ static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t 
     return lpr_netd_call_with_fd(op, page_fd, word2, out_result, 0);
 }
 
+int64_t lpr_netd_dup_handle(uint64_t handle)
+{
+    return handle != 0 ? lpr_netd_call(NETD_OP_DUP, -1, handle, 0) :
+        -LPR_LINUX_EBADF;
+}
+
+int64_t lpr_netd_transfer_dup_handle(uint64_t handle, int lease_fd)
+{
+    if (handle == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
+    const lpr_netd_fd_options_t fd_options = {
+        .transfer_fds = &lease_fd,
+        .transfer_count = 1,
+        .move_transfer = 1,
+    };
+    return lpr_netd_call_with_fd(
+        NETD_OP_DUP, -1, handle, 0, &fd_options);
+}
+
+int64_t lpr_netd_close_handle(uint64_t handle)
+{
+    return handle != 0 ? lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0) :
+        -LPR_LINUX_EBADF;
+}
+
 int lpr_linux_socket_fd_active(uint64_t fd)
 {
     lpr_socket_backend_t *socket = lpr_socket_backend(fd);
@@ -460,8 +484,8 @@ int lpr_linux_socket_fd_active(uint64_t fd)
 
 int lpr_linux_socket_fd_cloexec(uint64_t fd)
 {
-    lpr_socket_backend_t *socket = lpr_socket_backend(fd);
-    return socket != 0 && socket->active && socket->cloexec;
+    return lpr_linux_socket_fd_active(fd) &&
+        (lpr_control_get_fd_flags(fd) & LPR_LINUX_FD_CLOEXEC) != 0;
 }
 
 int lpr_linux_socket_native_wait_fd(uint64_t fd)
@@ -611,7 +635,6 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     }
     socket->active = 1;
     socket->type = (uint8_t)type;
-    socket->cloexec = (flags & LPR_LINUX_SOCK_CLOEXEC) != 0;
     socket->connected = 0;
     socket->connecting = 0;
     socket->domain = (uint8_t)domain;
@@ -643,70 +666,19 @@ int64_t lpr_linux_socket_close(uint64_t fd)
 int64_t lpr_socket_close_backend(void *state)
 {
     const lpr_socket_backend_t *socket = state;
-    const int64_t status = socket->handle != 0 ?
+    const int transfer_lease =
+        (socket->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0;
+    const int64_t status = !transfer_lease && socket->handle != 0 ?
         lpr_netd_call(NETD_OP_CLOSE, -1, socket->handle, 0) : 0;
     if (socket->wait_fd.raw >= 16) {
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE,
             (uint64_t)(uint32_t)socket->wait_fd.raw);
     }
-    return status;
-}
-
-void lpr_socket_prepare_process_exit(void)
-{
-    lpr_fd_arrays_init();
-    for (uint32_t index = 0; index < lpr_control_fd_table.ofd_count; ++index) {
-        lpr_ofd_t *object = &lpr_control_fd_table.ofds[index];
-        if (!object->active || lpr_ofd_ops_id(object) != LPR_FD_OPS_SOCKET ||
-            ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle == 0) continue;
-        const uint64_t handle = ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle;
-        const int native_wait_fd = ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw;
-        ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle = 0;
-        ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw = -1;
-        if (native_wait_fd >= 16)
-            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
-    }
-}
-
-int lpr_socket_reserve_exec(const lpr_exec_transaction_t *transaction)
-{
-    if (transaction == 0 || transaction->pins == 0) return 0;
-    uint64_t reserved = 0;
-    for (; reserved < transaction->pin_count; ++reserved) {
-        const lpr_fd_pin_t *pin = &transaction->pins[reserved];
-        const lpr_socket_backend_t *socket = pin->ops_id == LPR_FD_OPS_SOCKET ?
-            (const lpr_socket_backend_t *)pin->state : 0;
-        if (socket == 0 || socket->domain != LPR_LINUX_AF_UNIX ||
-            socket->handle == 0) continue;
-        const int64_t status = lpr_netd_call(
-            NETD_OP_DUP, -1, socket->handle, 0);
-        if (status == 0) continue;
-        for (uint64_t rollback = 0; rollback < reserved; ++rollback) {
-            const lpr_fd_pin_t *prior = &transaction->pins[rollback];
-            const lpr_socket_backend_t *prior_socket =
-                prior->ops_id == LPR_FD_OPS_SOCKET ?
-                    (const lpr_socket_backend_t *)prior->state : 0;
-            if (prior_socket != 0 && prior_socket->domain == LPR_LINUX_AF_UNIX &&
-                prior_socket->handle != 0)
-                (void)lpr_netd_call(NETD_OP_CLOSE, -1, prior_socket->handle, 0);
-        }
-        return (int)status;
-    }
-    return 0;
-}
-
-void lpr_socket_release_exec(const lpr_exec_transaction_t *transaction)
-{
-    if (transaction == 0 || transaction->pins == 0) return;
-    for (uint64_t index = 0; index < transaction->pin_count; ++index) {
-        const lpr_fd_pin_t *pin = &transaction->pins[index];
-        const lpr_socket_backend_t *socket = pin->ops_id == LPR_FD_OPS_SOCKET ?
-            (const lpr_socket_backend_t *)pin->state : 0;
-        if (socket != 0 && socket->domain == LPR_LINUX_AF_UNIX && socket->handle != 0)
-            (void)lpr_netd_call(NETD_OP_CLOSE, -1, socket->handle, 0);
-    }
+    const int64_t lease_status = socket->lease_fd.raw >= 16 ?
+        lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)socket->lease_fd.raw) : 0;
+    return status != 0 ? status : lease_status;
 }
 
 int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
@@ -936,7 +908,6 @@ int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t 
     s->active = 1; s->type = LPR_LINUX_SOCK_STREAM; s->domain = LPR_LINUX_AF_UNIX;
     s->connected = 1; s->flags = (uint32_t)linux_flags; s->handle = handle;
     s->wait_fd.raw = native_wait_fd;
-    s->cloexec = (flags & LPR_LINUX_SOCK_CLOEXEC) != 0;
     s->sndbuf = 256u * 1024u; s->rcvbuf = 256u * 1024u;
     s->peer_pid = req->pid; s->peer_uid = req->uid; s->peer_gid = req->gid;
     lpr_netd_destroy_page(page_fd, page);
@@ -1249,6 +1220,7 @@ static int lpr_scm_received_valid(
         const netd_transfer_occurrence_t *item = &io->transfers[i];
         if (item->provider_id == 0 || item->transfer_token == 0 ||
             item->reserved0 != 0 || item->capability_first != next_capability ||
+            item->capability_count == 0 ||
             item->capability_count > capability_count - next_capability)
             return 0;
         next_capability += item->capability_count;
@@ -1369,11 +1341,6 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         const int64_t status = lpr_netd_call_with_fd(
             NETD_OP_RECV, page_fd, 0, &received, &fd_options);
         if (status != 0) { lpr_netd_destroy_page(page_fd, page); return status; }
-        uint64_t copied = 0;
-        for (uint64_t i = 0; i < msg->msg_iovlen && copied < received; i++) {
-            uint64_t n = iov[i].len < received - copied ? iov[i].len : received - copied;
-            lpr_memcpy((void *)(uintptr_t)iov[i].base, req->data + copied, (size_t)n); copied += n;
-        }
         msg->msg_flags = 0;
         if (!lpr_scm_received_valid(req, received_capability_count)) {
             lpr_scm_cancel_received(
@@ -1395,61 +1362,22 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
             } else {
                 int installed_fds[NETD_TRANSFER_MAX_ITEMS];
                 lpr_memset(installed_fds, 0xff, sizeof(installed_fds));
-                uint64_t next_fd = 3;
-                int allocation_status = 0;
-                for (uint32_t i = 0; i < req->transfer_count; ++i) {
-                    installed_fds[i] = lpr_fd_slot_alloc_from(next_fd);
-                    if (installed_fds[i] < 0) {
-                        allocation_status = installed_fds[i];
-                        break;
-                    }
-                    next_fd = (uint64_t)(uint32_t)installed_fds[i] + 1u;
-                }
-                if (allocation_status != 0) {
+                const int import_status = lpr_fd_transfer_import_batch(
+                    req->transfers,
+                    req->transfer_count,
+                    received_capability_fds,
+                    received_capability_count,
+                    (flags & LPR_LINUX_MSG_CMSG_CLOEXEC) != 0 ?
+                        LPR_LINUX_O_CLOEXEC : 0,
+                    installed_fds);
+                if (import_status != 0) {
                     lpr_scm_cancel_received(
                         req, received_capability_fds, received_capability_count);
                     lpr_netd_destroy_page(page_fd, page);
-                    return allocation_status;
-                }
-                uint32_t imported_count = 0;
-                int import_status = 0;
-                for (; imported_count < req->transfer_count; ++imported_count) {
-                    const netd_transfer_occurrence_t *item =
-                        &req->transfers[imported_count];
-                    import_status = lpr_fd_transfer_import(
-                        (uint32_t)installed_fds[imported_count],
-                        item,
-                        received_capability_fds + item->capability_first,
-                        item->capability_count,
-                        (flags & LPR_LINUX_MSG_CMSG_CLOEXEC) != 0 ?
-                            LPR_LINUX_O_CLOEXEC : 0);
-                    if (import_status != 0) break;
-                    for (uint32_t ci = 0; ci < item->capability_count; ++ci)
-                        received_capability_fds[item->capability_first + ci] = -1;
-                }
-                if (import_status != 0) {
-                    const uint32_t failed = imported_count;
-                    int failed_installed = lpr_control_fd_active(installed_fds[failed]);
-                    if (failed_installed) {
-                        const netd_transfer_occurrence_t *item = &req->transfers[failed];
-                        lpr_control_close_fd(installed_fds[failed]);
-                        for (uint32_t ci = 0; ci < item->capability_count; ++ci)
-                            received_capability_fds[item->capability_first + ci] = -1;
-                    }
-                    while (imported_count != 0) {
-                        imported_count--;
-                        lpr_control_close_fd(installed_fds[imported_count]);
-                    }
-                    for (uint32_t i = failed + (failed_installed ? 1u : 0u);
-                         i < req->transfer_count; ++i)
-                        lpr_fd_transfer_cancel_ticket(&req->transfers[i]);
-                    for (uint32_t i = 0; i < received_capability_count; ++i)
-                        if (received_capability_fds[i] >= 16)
-                            (void)lpr_close_native_fd_if_open(
-                                (uint64_t)(uint32_t)received_capability_fds[i]);
-                    lpr_netd_destroy_page(page_fd, page);
                     return import_status;
                 }
+                for (uint32_t i = 0; i < received_capability_count; ++i)
+                    received_capability_fds[i] = -1;
                 lpr_linux_cmsghdr_t *cmsg =
                     (lpr_linux_cmsghdr_t *)(uintptr_t)msg->msg_control;
                 cmsg->cmsg_len = cmsg_length;
@@ -1460,6 +1388,11 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
                     out_fds[i] = installed_fds[i];
                 msg->msg_controllen = cmsg_space;
             }
+        }
+        uint64_t copied = 0;
+        for (uint64_t i = 0; i < msg->msg_iovlen && copied < received; i++) {
+            uint64_t n = iov[i].len < received - copied ? iov[i].len : received - copied;
+            lpr_memcpy((void *)(uintptr_t)iov[i].base, req->data + copied, (size_t)n); copied += n;
         }
         lpr_netd_destroy_page(page_fd, page);
         return (int64_t)received;
@@ -1746,7 +1679,6 @@ int64_t lpr_linux_socket_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case LPR_LINUX_F_GETFD:
         return lpr_control_get_fd_flags(fd);
     case LPR_LINUX_F_SETFD:
-        lpr_socket_backend(fd)->cloexec = (arg & LPR_LINUX_FD_CLOEXEC) != 0;
         return lpr_control_set_fd_flags(fd, arg);
     case LPR_LINUX_F_GETFL:
         return lpr_control_get_status_flags(fd, lpr_socket_backend(fd)->flags & LPR_LINUX_O_RDWR);

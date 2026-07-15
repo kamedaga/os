@@ -18,6 +18,52 @@ static uint64_t g_netd_socket_errors;
 static int g_netd_socket_trace;
 static uint64_t g_netd_socket_recv_bytes;
 
+enum { NETD_SOCKET_TRANSFER_LEASE_MAX = 64 };
+
+struct netd_socket_transfer_lease {
+    uint64_t handle;
+    int lease_fd;
+};
+
+static struct netd_socket_transfer_lease
+    g_netd_socket_transfer_leases[NETD_SOCKET_TRANSFER_LEASE_MAX];
+
+static int netd_socket_handle_dup(uint64_t handle)
+{
+    return netd_netlink_socket_is_handle(handle) ?
+        netd_netlink_socket_dup(handle) :
+        netd_unix_socket_is_handle(handle) ?
+            netd_unix_socket_dup(handle) :
+            netd_libuinet_socket_dup(handle);
+}
+
+static int netd_socket_handle_close(uint64_t handle)
+{
+    return netd_netlink_socket_is_handle(handle) ?
+        netd_netlink_socket_close(handle) :
+        netd_unix_socket_is_handle(handle) ?
+            netd_unix_socket_close(handle) :
+            netd_libuinet_socket_close(handle);
+}
+
+static int netd_socket_transfer_lease_add(uint64_t handle, int lease_fd)
+{
+    if (handle == 0 || lease_fd < 16) return -22;
+    struct netd_socket_transfer_lease *free_slot = NULL;
+    for (unsigned i = 0; i < NETD_SOCKET_TRANSFER_LEASE_MAX; ++i) {
+        if (g_netd_socket_transfer_leases[i].handle == 0) {
+            free_slot = &g_netd_socket_transfer_leases[i];
+            break;
+        }
+    }
+    if (free_slot == NULL) return -24;
+    const int status = netd_socket_handle_dup(handle);
+    if (status != 0) return status;
+    free_slot->handle = handle;
+    free_slot->lease_fd = lease_fd;
+    return 0;
+}
+
 static void netd_socket_trace_data_op(uint64_t op, int status, uint64_t result)
 {
     if (op == NETD_OP_CONNECT || op == NETD_OP_SEND ||
@@ -218,15 +264,16 @@ static int netd_socket_dispatch(
         {
             uint64_t handle = *out_result;
             *out_result = 0;
-            return netd_netlink_socket_is_handle(handle) ? netd_netlink_socket_close(handle) :
-                netd_unix_socket_is_handle(handle) ? netd_unix_socket_close(handle) : netd_libuinet_socket_close(handle);
+            return netd_socket_handle_close(handle);
         }
     case NETD_OP_DUP:
         {
             const uint64_t handle = *out_result;
             *out_result = 0;
-            return netd_unix_socket_is_handle(handle) ?
-                netd_unix_socket_dup(handle) : -95;
+            if (transferred_count > 1) return -22;
+            return transferred_count == 1 ?
+                netd_socket_transfer_lease_add(handle, transferred_fds[0]) :
+                netd_socket_handle_dup(handle);
         }
     case NETD_OP_BIND:
         if (page == NULL) return -22;
@@ -272,8 +319,17 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC || request->word3 == 0) {
         return netd_socket_send_reply(request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
     }
+    const int op_has_page =
+        request->word1 == NETD_OP_SOCKET ||
+        request->word1 == NETD_OP_CONNECT ||
+        request->word1 == NETD_OP_SEND ||
+        request->word1 == NETD_OP_RECV ||
+        request->word1 == NETD_OP_POLL ||
+        request->word1 == NETD_OP_BIND ||
+        request->word1 == NETD_OP_ACCEPT ||
+        request->word1 == NETD_OP_ATTACH_WAIT;
     int page_fd = -1;
-    if (request->fd_count >= 2 && fds[0].fd >= 16) {
+    if (op_has_page && request->fd_count >= 2 && fds[0].fd >= 16) {
         page_fd = (int)fds[0].fd;
     }
     int transferred_fds[NETD_TRANSFER_MAX_CAPABILITIES];
@@ -326,6 +382,7 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
         ((request->word1 == NETD_OP_SOCKET &&
             result != 0) ||
          request->word1 == NETD_OP_ATTACH_WAIT ||
+         (request->word1 == NETD_OP_DUP && transferred_count == 1) ||
          send_has_transfer);
     if (page != NULL) {
         (void)pacha_munmap(page, NETD_PAGE_BYTES);
@@ -353,12 +410,48 @@ int netd_socket_service_start(struct netd_runtime *runtime)
     g_netd_socket_requests = 0;
     g_netd_socket_errors = 0;
     g_netd_socket_trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;
+    memset(g_netd_socket_transfer_leases, 0,
+        sizeof(g_netd_socket_transfer_leases));
     if (g_netd_socket_endpoint_fd < 16) {
         pacha_trace1(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_ERROR, (uint64_t)(uint32_t)g_netd_socket_endpoint_fd);
         return 8;
     }
     pacha_trace1(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_STATE, (uint64_t)(uint32_t)g_netd_socket_endpoint_fd);
     return 0;
+}
+
+int netd_socket_service_collect_wait_sources(struct pacha_service_wait_set *wait_set)
+{
+    if (wait_set == NULL) return -22;
+    for (unsigned i = 0; i < NETD_SOCKET_TRANSFER_LEASE_MAX; ++i) {
+        const struct netd_socket_transfer_lease *lease =
+            &g_netd_socket_transfer_leases[i];
+        if (lease->handle == 0 || lease->lease_fd < 16) continue;
+        if (pacha_service_wait_add(
+                wait_set, lease->lease_fd, PACHA_FD_EVENT_HANGUP) != 0)
+            return -24;
+    }
+    return 0;
+}
+
+void netd_socket_service_reap_hangups(void)
+{
+    for (unsigned i = 0; i < NETD_SOCKET_TRANSFER_LEASE_MAX; ++i) {
+        struct netd_socket_transfer_lease *lease =
+            &g_netd_socket_transfer_leases[i];
+        if (lease->handle == 0 || lease->lease_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = lease->lease_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle = lease->handle;
+        const int lease_fd = lease->lease_fd;
+        memset(lease, 0, sizeof(*lease));
+        (void)pacha_fd_close(lease_fd);
+        (void)netd_socket_handle_close(handle);
+    }
 }
 
 void netd_socket_service_poll(void)

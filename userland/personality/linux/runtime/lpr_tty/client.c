@@ -177,6 +177,43 @@ int64_t lpr_termd_call_handle(uint32_t op, uint64_t handle, uint64_t *out_result
     return status;
 }
 
+int64_t lpr_termd_transfer_dup_handle(
+    uint64_t handle,
+    int lease_fd,
+    uint64_t *out_handle)
+{
+    if (out_handle == 0 || lease_fd < 16) {
+        return -LPR_LINUX_EINVAL;
+    }
+    *out_handle = 0;
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    termd_handle_request_t *request =
+        (termd_handle_request_t *)lpr_termd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->handle = handle;
+    lpr_fill_termd_caller(
+        &request->tty.session_id,
+        &request->tty.process_id,
+        &request->tty.pgrp_id);
+    lpr_fill_termd_signal_state(
+        &request->tty.signal_mask,
+        &request->tty.signal_ignored);
+    const int64_t status = lpr_termd_call_with_fd(
+        TERMD_OP_HANDLE_DUP,
+        page_fd,
+        page,
+        sizeof(*request),
+        lease_fd,
+        out_handle);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status == 0 && *out_handle == handle ? 0 :
+        (status != 0 ? status : -LPR_LINUX_EIO);
+}
+
 int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
 {
     const int fd = lpr_fd_slot_alloc();

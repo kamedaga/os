@@ -391,15 +391,16 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     lpr_memset(&fork_transaction, 0, sizeof(fork_transaction));
     fork_transaction.manifest_fd = -1;
     const int manifest_status =
-        lpr_prepare_exec_manifest(&fork_snapshot, &fork_transaction);
+        lpr_prepare_fork_manifest(&fork_snapshot, &fork_transaction);
     if (manifest_status != 0) {
         lpr_destroy_exec_transaction(&fork_transaction);
         return manifest_status;
     }
-    const int socket_fork_status = lpr_socket_reserve_exec(&fork_transaction);
-    if (socket_fork_status != 0) {
+    const int fork_prepare_status =
+        lpr_fork_transaction_prepare(&fork_transaction);
+    if (fork_prepare_status != 0) {
         lpr_destroy_exec_transaction(&fork_transaction);
-        return socket_fork_status;
+        return fork_prepare_status;
     }
     int32_t child_pid = 0;
     uint64_t child_token = 0;
@@ -407,7 +408,6 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         void *page = 0;
         const int page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
-            lpr_socket_release_exec(&fork_transaction);
             lpr_destroy_exec_transaction(&fork_transaction);
             return page_fd;
         }
@@ -431,19 +431,20 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         }
         lpr_destroy_standalone_wire_page(page_fd, page);
         if (fork_status != 0) {
-            lpr_socket_release_exec(&fork_transaction);
             lpr_destroy_exec_transaction(&fork_transaction);
             return fork_status;
         }
         if (child_pid <= 0 || child_token == 0) {
-            lpr_socket_release_exec(&fork_transaction);
+            if (child_token != 0) {
+                (void)lpr_supervisor_call_token(
+                    LPRS_OP_PROCESS_FORK_CANCEL, child_token, -1, 0);
+            }
             lpr_destroy_exec_transaction(&fork_transaction);
             return -LPR_LINUX_EIO;
         }
     } else {
         child_pid = lpr_linux_alloc_child_pid();
         if (child_pid <= 0) {
-            lpr_socket_release_exec(&fork_transaction);
             lpr_destroy_exec_transaction(&fork_transaction);
             return -LPR_LINUX_EAGAIN;
         }
@@ -453,8 +454,6 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     lpr_linux_pending_child_sid = lpr_linux_current_sid;
     lpr_linux_pending_child_pgrp = lpr_linux_current_pgrp;
     lpr_supervisor_pending_child_token = child_token;
-    lpr_trace_clone_frame("before_drop", &child_frame, 0);
-    lpr_filed_session_drop();
     lpr_trace_clone_frame("before_syscall", &child_frame, 0);
     uint64_t child_process_rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -473,6 +472,14 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
     if (ret == 0) {
         lpr_trace_process_event("clone_child", flags, child_stack, 0);
+        const int commit_status =
+            lpr_fork_transaction_commit_child(&fork_transaction);
+        if (commit_status != 0) {
+            lpr_destroy_exec_transaction(&fork_transaction);
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+            for (;;) {
+            }
+        }
         lpr_destroy_exec_transaction(&fork_transaction);
         lpr_linux_apply_pending_fork_child();
         return 0;
@@ -503,18 +510,36 @@ int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uin
         if (reg_status != 0) {
             (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL, (uint64_t)(uint32_t)ret, 1);
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)ret);
-            lpr_socket_release_exec(&fork_transaction);
+            if (lpr_supervisor_enabled && child_token != 0) {
+                (void)lpr_supervisor_call_token(
+                    LPRS_OP_PROCESS_FORK_CANCEL, child_token, -1, 0);
+            }
             lpr_destroy_exec_transaction(&fork_transaction);
             return reg_status;
         }
+        const int commit_status =
+            lpr_fork_transaction_commit_parent(&fork_transaction);
+        if (commit_status != 0) {
+            (void)lpr_pacha_syscall2(
+                PACHAOS_SYSCALL_PROCESS_KILL,
+                (uint64_t)(uint32_t)ret,
+                1);
+            lpr_destroy_exec_transaction(&fork_transaction);
+            return commit_status;
+        }
         if (lpr_supervisor_enabled && child_token != 0) {
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)ret);
+            (void)lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)ret);
         }
         lpr_destroy_exec_transaction(&fork_transaction);
         return (int64_t)child_pid;
     }
     lpr_trace_process_event("clone_error", flags, child_stack, ret);
-    lpr_socket_release_exec(&fork_transaction);
+    if (lpr_supervisor_enabled && child_token != 0) {
+        (void)lpr_supervisor_call_token(
+            LPRS_OP_PROCESS_FORK_CANCEL, child_token, -1, 0);
+    }
     lpr_destroy_exec_transaction(&fork_transaction);
     lpr_linux_pending_child_pid = 0;
     lpr_linux_pending_child_ppid = 0;
@@ -982,26 +1007,18 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         lpr_destroy_exec_transaction(&transaction);
         return status;
     }
-    status = lpr_socket_reserve_exec(&transaction);
-    if (status != 0) {
-        lpr_destroy_exec_transaction(&transaction);
-        return status;
-    }
-
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
     const int64_t exec_status =
         lpr_filed_exec_self(&exec, &transaction, &process_fd, &thread_fd, &bootstrap_fd);
     if (exec_status != 0) {
-        lpr_socket_release_exec(&transaction);
         lpr_destroy_exec_transaction(&transaction);
         lpr_trace_process_event("execve_error", path_len, 0, exec_status);
         return exec_status;
     }
     status = lpr_install_exec_bootstrap_fd(bootstrap_fd);
     if (status != 0) {
-        lpr_socket_release_exec(&transaction);
         lpr_destroy_exec_transaction(&transaction);
         if (bootstrap_fd >= 16) {
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)bootstrap_fd);
@@ -1019,7 +1036,6 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
             process_fd,
             0);
         if (supervisor_status != 0) {
-            lpr_socket_release_exec(&transaction);
             lpr_destroy_exec_transaction(&transaction);
             if (bootstrap_fd >= 16) {
                 (void)lpr_pacha_syscall1(
@@ -1045,7 +1061,6 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         (uint64_t)(uint32_t)process_fd,
         (uint64_t)(uint32_t)thread_fd,
         0);
-    lpr_socket_release_exec(&transaction);
     lpr_destroy_exec_transaction(&transaction);
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL, (uint64_t)(uint32_t)process_fd, 1);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)thread_fd);

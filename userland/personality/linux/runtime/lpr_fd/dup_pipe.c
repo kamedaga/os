@@ -1,71 +1,10 @@
 #include "../lpr_filed_internal.h"
 
-void lpr_pipe_after_fork_child(void)
+void lpr_fd_after_fork_child(void)
 {
-    /* Native endpoints are inherited by the kernel fd-table clone.  Service
-     * handles belong to the child session and must be reacquired once. */
+    /* Native endpoints and prepared service leases were committed by the
+     * fork transaction before the child becomes visible to Linux callers. */
     lpr_reset_fork_child_rpc_state();
-    lpr_cwd_init();
-    if (lpr_cwd_handle != 0) {
-        uint64_t dup_handle = 0;
-        const int64_t status = lpr_filed_dup_handle(lpr_cwd_handle, 0, &dup_handle);
-        lpr_trace_process_event("fork_dup_cwd", lpr_cwd_handle, dup_handle, status);
-        if (status == 0 && dup_handle != 0) {
-            lpr_cwd_handle = dup_handle;
-        }
-    }
-    for (uint32_t index = 0; index < lpr_control_fd_table.ofd_count; index++) {
-        lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[index];
-        if (!ofd->active) {
-            continue;
-        }
-        const uint8_t ops_id = lpr_ofd_ops_id(ofd);
-        if (ops_id == LPR_FD_OPS_TTY) {
-            lpr_tty_backend_t *tty = lpr_backend_state_from_ofd(ofd);
-            uint64_t dup_handle = 0;
-            const int64_t status = lpr_termd_call_handle(
-                TERMD_OP_HANDLE_DUP,
-                tty->handle,
-                &dup_handle);
-            lpr_trace_process_event("fork_dup_tty", index, dup_handle, status);
-            if (status == 0 && dup_handle != 0) {
-                tty->handle = dup_handle;
-            }
-        } else if (ops_id == LPR_FD_OPS_FILED) {
-            lpr_filed_backend_t *filed = lpr_backend_state_from_ofd(ofd);
-            void *page = 0;
-            const int page_fd = lpr_create_wire_page(&page);
-            if (page_fd < 0) {
-                lpr_trace_process_event("fork_dup_filed_page", index, 0, page_fd);
-                continue;
-            }
-            filed_handle_flags_t *flags = (filed_handle_flags_t *)page;
-            lpr_memset(flags, 0, sizeof(*flags));
-            flags->handle = filed->handle;
-            uint64_t dup_handle = 0;
-            const int64_t status = lpr_filed_call(FILED_OP_VFS_DUP, page_fd, 0, &dup_handle);
-            lpr_destroy_wire_page(page_fd, page);
-            lpr_trace_process_event("fork_dup_filed", index, dup_handle, status);
-            if (status == 0 && dup_handle != 0) {
-                filed->handle = dup_handle;
-            }
-        } else if (ops_id == LPR_FD_OPS_DRM) {
-            lpr_drm_backend_t *drm = lpr_backend_state_from_ofd(ofd);
-            const int64_t status = lpr_drm_dup_handle(drm->handle);
-            lpr_trace_process_event("fork_dup_drm", index, drm->handle, status);
-        } else if (ops_id == LPR_FD_OPS_INPUT) {
-            lpr_input_backend_t *input = lpr_backend_state_from_ofd(ofd);
-            const int64_t status = lpr_input_dup_handle(input->handle);
-            lpr_trace_process_event("fork_dup_input", index, input->handle, status);
-        } else if (ops_id == LPR_FD_OPS_DMABUF) {
-            lpr_dmabuf_backend_t *dmabuf = lpr_backend_state_from_ofd(ofd);
-            const int64_t status = lpr_drm_prime_ref(DRMD_OP_PRIME_ACQUIRE, dmabuf->token);
-            lpr_trace_process_event("fork_acquire_dmabuf", index, dmabuf->token, status);
-            if (status != 0) {
-                dmabuf->token = 0;
-            }
-        }
-    }
 }
 
 void lpr_linux_apply_pending_fork_child(void)
@@ -78,15 +17,21 @@ void lpr_linux_apply_pending_fork_child(void)
     const int32_t child_sid = lpr_linux_pending_child_sid;
     const int32_t child_pgrp = lpr_linux_pending_child_pgrp;
     const uint64_t child_token = lpr_supervisor_pending_child_token;
+    lpr_fd_after_fork_child();
     lpr_linux_process_state_checked = 1;
     if (child_token != 0) {
         lpr_supervisor_token = child_token;
         lpr_supervisor_enabled = 1;
-        (void)lpr_supervisor_call_token(
+        const int64_t ready_status = lpr_supervisor_call_token(
             LPRS_OP_PROCESS_FORK_CHILD_READY,
             lpr_supervisor_token,
             -1,
             0);
+        if (ready_status != 0) {
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+            for (;;) {
+            }
+        }
     }
     lpr_linux_current_pid = child_pid;
     lpr_linux_current_ppid = child_ppid;
@@ -100,7 +45,6 @@ void lpr_linux_apply_pending_fork_child(void)
     lpr_linux_process_clear_children();
     lpr_linux_signal_after_fork_child();
     lpr_thread_after_fork_child();
-    lpr_pipe_after_fork_child();
     lpr_trace_process_event(
         "fork_child_state",
         (uint64_t)(uint32_t)child_pid,

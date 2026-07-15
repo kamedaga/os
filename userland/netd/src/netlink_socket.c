@@ -18,6 +18,7 @@ typedef struct netd_netlink_message {
 
 typedef struct netd_netlink_socket_state {
     uint64_t handle;
+    uint32_t refs;
     uint32_t pid;
     uint32_t groups;
     uint8_t bound;
@@ -41,6 +42,13 @@ static netd_netlink_socket_state_t *find_socket(uint64_t handle)
     for (unsigned i = 0; i < NETD_NETLINK_MAX; i++)
         if (sockets[i].handle == handle) return &sockets[i];
     return NULL;
+}
+
+static void destroy_socket(netd_netlink_socket_state_t *socket)
+{
+    if (socket == NULL) return;
+    if (socket->notify_fd >= 16) (void)pacha_fd_close(socket->notify_fd);
+    memset(socket, 0, sizeof(*socket));
 }
 
 int netd_netlink_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set)
@@ -68,7 +76,7 @@ void netd_netlink_socket_reap_hangups(void)
         if (pacha_fd_poll(&pollfd, 1) <= 0 ||
             (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle = socket->handle;
-        (void)netd_netlink_socket_close(handle);
+        destroy_socket(socket);
         printf("[netd] netlink_orphan_reap handle=%llu\n",
             (unsigned long long)handle);
     }
@@ -96,11 +104,21 @@ int netd_netlink_socket_open(uint64_t type, uint64_t protocol, int notify_fd, ui
         if (sockets[i].handle != 0) continue;
         memset(&sockets[i], 0, sizeof(sockets[i]));
         sockets[i].handle = NETD_NETLINK_HANDLE_BIT | ++next_handle;
+        sockets[i].refs = 1;
         sockets[i].notify_fd = notify_fd;
         *out_handle = sockets[i].handle;
         return 0;
     }
     return -24;
+}
+
+int netd_netlink_socket_dup(uint64_t handle)
+{
+    netd_netlink_socket_state_t *socket = find_socket(handle);
+    if (socket == NULL) return -9;
+    if (socket->refs == UINT32_MAX) return -75;
+    socket->refs++;
+    return 0;
 }
 
 int netd_netlink_socket_bind(const netd_netlink_bind_t *request)
@@ -146,8 +164,11 @@ int netd_netlink_socket_close(uint64_t handle)
 {
     netd_netlink_socket_state_t *socket = find_socket(handle);
     if (socket == NULL) return -9;
-    if (socket->notify_fd >= 16) (void)pacha_fd_close(socket->notify_fd);
-    memset(socket, 0, sizeof(*socket));
+    if (socket->refs > 1) {
+        socket->refs--;
+        return 0;
+    }
+    destroy_socket(socket);
     return 0;
 }
 

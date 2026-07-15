@@ -76,6 +76,7 @@ int lpr_manifest_begin(
     manifest->capability_count = capability_count;
     manifest->record_offset = layout->record_offset;
     manifest->record_bytes = record_bytes;
+    manifest->cwd_capability_index = UINT64_MAX;
     return 0;
 }
 
@@ -143,6 +144,21 @@ int lpr_manifest_validate(const void *memory, uint64_t capacity)
         (const lpr_manifest_entry_t *)((const uint8_t *)manifest + manifest->entry_offset);
     const lpr_manifest_ofd_t *ofds =
         (const lpr_manifest_ofd_t *)((const uint8_t *)manifest + manifest->ofd_offset);
+    const lpr_manifest_capability_t *capabilities =
+        (const lpr_manifest_capability_t *)((const uint8_t *)manifest +
+            manifest->capability_offset);
+    if ((manifest->cwd_handle == 0 &&
+            manifest->cwd_capability_index != UINT64_MAX) ||
+        (manifest->cwd_handle != 0 &&
+            manifest->cwd_capability_index >= manifest->capability_count))
+        return 0;
+    for (uint64_t i = 0; i < manifest->capability_count; ++i) {
+        if (capabilities[i].ordinal != i ||
+            (capabilities[i].flags & ~LPR_MANIFEST_CAPABILITY_CWD_LEASE) != 0 ||
+            ((capabilities[i].flags & LPR_MANIFEST_CAPABILITY_CWD_LEASE) != 0) !=
+                (i == manifest->cwd_capability_index))
+            return 0;
+    }
     for (uint64_t i = 0; i < manifest->entry_count; ++i) {
         if (entries[i].state != LPR_MANIFEST_ENTRY_OPEN ||
             entries[i].ofd_index >= manifest->ofd_count ||

@@ -270,6 +270,28 @@ int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token)
     return status;
 }
 
+int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd)
+{
+    if (token == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_prime_token_request_t *request =
+        (drmd_prime_token_request_t *)lpr_drmd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->token = token;
+    const int64_t status = lpr_drmd_call_transfer(
+        DRMD_OP_PRIME_ACQUIRE,
+        page_fd,
+        page,
+        sizeof(*request),
+        0,
+        0,
+        lease_fd);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status;
+}
+
 static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, uint32_t flags)
 {
     void *page = 0;

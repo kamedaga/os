@@ -152,7 +152,7 @@ static int64_t lpr_ops_filed_close(void *state)
 {
     const lpr_filed_backend_t *filed = state;
     const int transfer_lease =
-        (filed->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0;
+        (filed->reserved2 & LPR_BACKEND_TRANSFER_LEASE) != 0;
     const int64_t handle_status = !transfer_lease && filed->handle != 0 ?
         lpr_filed_close_handle(filed->handle) : 0;
     const int64_t lease_status = filed->lease_fd.raw >= 16 ?
@@ -163,11 +163,16 @@ static int64_t lpr_ops_filed_close(void *state)
 static int64_t lpr_ops_tty_close(void *state)
 {
     const lpr_tty_backend_t *tty = state;
-    const int64_t handle_status = tty->handle != 0 ?
+    const int transfer_lease =
+        (tty->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0;
+    const int64_t handle_status = !transfer_lease && tty->handle != 0 ?
         lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, tty->handle, 0) : 0;
     const int64_t wait_status = tty->wait_fd.raw >= 16 ?
         lpr_close_native_fd_if_open((uint64_t)(uint32_t)tty->wait_fd.raw) : 0;
-    return handle_status != 0 ? handle_status : wait_status;
+    const int64_t lease_status = tty->lease_fd.raw >= 16 ?
+        lpr_close_native_fd_if_open((uint64_t)(uint32_t)tty->lease_fd.raw) : 0;
+    return handle_status != 0 ? handle_status :
+        (wait_status != 0 ? wait_status : lease_status);
 }
 
 static int64_t lpr_ops_drm_close(void *state)
@@ -214,9 +219,14 @@ static int64_t lpr_ops_dmabuf_close(void *state)
             PACHAOS_SYSCALL_FD_CLOSE,
             (uint64_t)(uint32_t)dmabuf->native.raw));
     }
-    const int64_t release_status = dmabuf->token != 0 ?
+    const int transfer_lease =
+        (dmabuf->reserved0 & LPR_BACKEND_TRANSFER_LEASE) != 0;
+    const int64_t release_status = !transfer_lease && dmabuf->token != 0 ?
         lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, dmabuf->token) : 0;
-    return close_status != 0 ? close_status : release_status;
+    const int64_t lease_status = dmabuf->lease_fd.raw >= 16 ?
+        lpr_close_native_fd_if_open((uint64_t)(uint32_t)dmabuf->lease_fd.raw) : 0;
+    return close_status != 0 ? close_status :
+        (release_status != 0 ? release_status : lease_status);
 }
 
 static int64_t lpr_ops_epoll_close(void *state)
@@ -342,7 +352,7 @@ int lpr_fd_transfer_prepare(
             return -LPR_LINUX_EIO;
         }
         item->transfer_token = ticket |
-            ((uint64_t)(filed->reserved1 & ~LPR_BACKEND_TRANSFER_LEASE) << 32u);
+            ((uint64_t)filed->reserved1 << 32u);
         item->fd_flags = filed->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 1;
         capability_fds[0] = lease_fd;
@@ -432,71 +442,178 @@ void lpr_fd_transfer_cancel_ticket(const netd_transfer_occurrence_t *item)
     (void)item;
 }
 
-int lpr_fd_transfer_import(
-    uint32_t fd,
-    const netd_transfer_occurrence_t *item,
+int lpr_fd_transfer_import_batch(
+    const netd_transfer_occurrence_t *items,
+    uint32_t item_count,
     const int *capability_fds,
     uint32_t capability_count,
-    uint32_t receive_flags)
+    uint32_t receive_flags,
+    int *out_fds)
 {
     const uint64_t known_rights = LPR_FD_RIGHT_READ | LPR_FD_RIGHT_WRITE |
         LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_MMAP |
         LPR_FD_RIGHT_DUP;
-    if (item == 0 || item->transfer_token == 0 || item->reserved0 != 0 ||
-        (item->rights & ~known_rights) != 0 ||
-        item->capability_count != capability_count ||
+    if (items == 0 || out_fds == 0 || item_count == 0 ||
+        item_count > NETD_TRANSFER_MAX_ITEMS ||
+        capability_count > NETD_TRANSFER_MAX_CAPABILITIES ||
+        capability_fds == 0 ||
         (receive_flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC) != 0)
         return -LPR_LINUX_EINVAL;
-    uint64_t handle = item->transfer_token;
-    if (item->provider_id == LPR_FD_OPS_FILED) {
-        if (capability_count != 1 || capability_fds == 0 || capability_fds[0] < 16 ||
-            (item->transfer_token >> 40u) != 0)
-            return -LPR_LINUX_EINVAL;
-        handle = (uint32_t)item->transfer_token;
-    } else if (item->provider_id == LPR_FD_OPS_INPUT) {
-        if (capability_count != 2 || capability_fds == 0 ||
-            capability_fds[0] < 16 || capability_fds[1] < 16)
-            return -LPR_LINUX_EINVAL;
-        handle = lpr_transfer_input_handle(item->transfer_token);
-    } else if (item->provider_id == LPR_FD_OPS_DRM) {
-        if (capability_count != 2 || capability_fds == 0 ||
-            capability_fds[0] < 16 || capability_fds[1] < 16)
-            return -LPR_LINUX_EINVAL;
-    } else {
-        return -LPR_LINUX_EOPNOTSUPP;
-    }
-    const uint64_t linux_flags = item->fd_flags | receive_flags;
-    int status = lpr_control_install_fd(
-        fd, (uint8_t)item->provider_id, linux_flags, handle, 0);
-    if (status != 0) return status;
-    if (item->provider_id == LPR_FD_OPS_FILED) {
-        lpr_filed_backend_t *filed = lpr_filed_backend(fd);
-        if (filed == 0) status = -LPR_LINUX_EIO;
-        else {
-            filed->reserved1 = (uint8_t)(item->transfer_token >> 32u) |
-                LPR_BACKEND_TRANSFER_LEASE;
-            filed->lease_fd.raw = capability_fds[0];
+    lpr_fd_install_t installs[NETD_TRANSFER_MAX_ITEMS];
+    void *states[NETD_TRANSFER_MAX_ITEMS];
+    lpr_linux_fd_t installed[NETD_TRANSFER_MAX_ITEMS];
+    lpr_memset(installs, 0, sizeof(installs));
+    lpr_memset(states, 0, sizeof(states));
+    lpr_memset(installed, 0, sizeof(installed));
+    uint32_t prepared_count = 0;
+    uint32_t next_capability = 0;
+    int status = 0;
+    for (; prepared_count < item_count; ++prepared_count) {
+        const netd_transfer_occurrence_t *item = &items[prepared_count];
+        if (item->transfer_token == 0 || item->reserved0 != 0 ||
+            (item->rights & ~known_rights) != 0 ||
+            item->capability_first != next_capability ||
+            item->capability_count > capability_count - next_capability)
+        {
+            status = -LPR_LINUX_EINVAL;
+            break;
         }
-    } else if (item->provider_id == LPR_FD_OPS_INPUT) {
-        lpr_input_backend_t *input = lpr_input_backend(fd);
-        if (input == 0) status = -LPR_LINUX_EIO;
-        else {
+        const int *item_capabilities = capability_fds + next_capability;
+        uint64_t handle = item->transfer_token;
+        if (item->provider_id == LPR_FD_OPS_FILED) {
+            if (item->capability_count != 1 || item_capabilities[0] < 16 ||
+                (item->transfer_token >> 40u) != 0)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
+            handle = (uint32_t)item->transfer_token;
+        } else if (item->provider_id == LPR_FD_OPS_INPUT) {
+            if (item->capability_count != 2 || item_capabilities[0] < 16 ||
+                item_capabilities[1] < 16)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
+            handle = lpr_transfer_input_handle(item->transfer_token);
+        } else if (item->provider_id == LPR_FD_OPS_DRM) {
+            if (item->capability_count != 2 || item_capabilities[0] < 16 ||
+                item_capabilities[1] < 16)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
+        } else {
+            status = -LPR_LINUX_EOPNOTSUPP;
+            break;
+        }
+        const int64_t mapped = lpr_pacha_syscall6(
+            PACHAOS_SYSCALL_MMAP,
+            0,
+            0,
+            4096,
+            PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+            PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS,
+            0);
+        if (mapped < 4096) {
+            status = -LPR_LINUX_ENOMEM;
+            break;
+        }
+        states[prepared_count] = (void *)(uintptr_t)mapped;
+        lpr_memset(states[prepared_count], 0, 4096);
+        const uint64_t linux_flags = item->fd_flags | receive_flags;
+        if (item->provider_id == LPR_FD_OPS_FILED) {
+            lpr_filed_backend_t *filed = states[prepared_count];
+            filed->active = 1;
+            filed->offset_valid = 1;
+            filed->flags = (uint32_t)linux_flags;
+            filed->handle = handle;
+            filed->reserved1 = (uint8_t)(item->transfer_token >> 32u);
+            filed->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
+            filed->lease_fd.raw = item_capabilities[0];
+        } else if (item->provider_id == LPR_FD_OPS_INPUT) {
+            lpr_input_backend_t *input = states[prepared_count];
+            input->active = 1;
+            input->flags = (uint32_t)linux_flags;
+            input->handle = handle;
             input->reserved0 = (uint8_t)(item->transfer_token >> 56u);
             input->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
-            input->wait_fd.raw = capability_fds[0];
-            input->lease_fd.raw = capability_fds[1];
-        }
-    } else {
-        lpr_drm_backend_t *drm = lpr_drm_backend(fd);
-        if (drm == 0) status = -LPR_LINUX_EIO;
-        else {
+            input->wait_fd.raw = item_capabilities[0];
+            input->lease_fd.raw = item_capabilities[1];
+        } else {
+            lpr_drm_backend_t *drm = states[prepared_count];
+            drm->active = 1;
+            drm->flags = (uint32_t)linux_flags;
+            drm->handle = handle;
             drm->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
-            drm->wait_fd.raw = capability_fds[0];
-            drm->lease_fd.raw = capability_fds[1];
+            drm->wait_fd.raw = item_capabilities[0];
+            drm->lease_fd.raw = item_capabilities[1];
+        }
+        lpr_fd_install_t *install = &installs[prepared_count];
+        install->ops_id = (uint8_t)item->provider_id;
+        install->fd_flags = lpr_control_fd_flags_from_linux(linux_flags);
+        install->access_mode =
+            (uint16_t)(linux_flags & LPR_LINUX_O_ACCMODE);
+        install->status_flags =
+            lpr_control_status_flags_from_linux(linux_flags);
+        install->rights = (uint32_t)item->rights;
+        install->offset = 0;
+        install->backend_state = states[prepared_count];
+        install->backend_state_bytes = 4096;
+        next_capability += item->capability_count;
+    }
+    if (status == 0 && next_capability != capability_count)
+        status = -LPR_LINUX_EINVAL;
+    if (status == 0) {
+        const lpr_linux_fd_t excluded[] = {
+            LPR_FILED_ENDPOINT_FD,
+            LPR_NETD_ENDPOINT_FD,
+            LPR_TERMD_TTY_ENDPOINT_FD,
+            LPR_DRMD_DRM_ENDPOINT_FD,
+            LPR_INPUTD_INPUT_ENDPOINT_FD,
+            LPR_BOOTSTRAP_FD,
+            LPR_SUPERVISOR_ENDPOINT_FD,
+        };
+        int batch_status = lpr_fd_table_alloc_batch(
+                &lpr_control_fd_table,
+                3,
+                installs,
+                item_count,
+                excluded,
+                (uint32_t)(sizeof(excluded) / sizeof(excluded[0])),
+                installed);
+        if (batch_status != 0) {
+            const uint64_t required_capacity =
+                lpr_fd_table_capacity + (uint64_t)item_count;
+            if (required_capacity == 0 ||
+                required_capacity > LPR_FD_TABLE_MAX_SIZE ||
+                lpr_fd_table_ensure_capacity(required_capacity) != 0)
+            {
+                status = -LPR_LINUX_EMFILE;
+            } else {
+                batch_status = lpr_fd_table_alloc_batch(
+                    &lpr_control_fd_table,
+                    3,
+                    installs,
+                    item_count,
+                    excluded,
+                    (uint32_t)(sizeof(excluded) / sizeof(excluded[0])),
+                    installed);
+                if (batch_status != 0) status = -LPR_LINUX_EMFILE;
+            }
         }
     }
-    if (status == 0 && lpr_control_set_effective_rights(fd, (uint32_t)item->rights) != 0)
-        status = -LPR_LINUX_EIO;
+    if (status != 0) {
+        for (uint32_t i = 0; i < prepared_count; ++i)
+            if (states[i] != 0)
+                (void)lpr_pacha_syscall2(
+                    PACHAOS_SYSCALL_MUNMAP,
+                    (uint64_t)(uintptr_t)states[i],
+                    4096);
+        return status;
+    }
+    for (uint32_t i = 0; i < item_count; ++i)
+        out_fds[i] = (int)installed[i];
     return status;
 }
 

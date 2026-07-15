@@ -11,6 +11,8 @@ enum {
 
     LPR_MANIFEST_ENTRY_OPEN = 1u,
 
+    LPR_MANIFEST_CAPABILITY_CWD_LEASE = 1u << 0,
+
     LPR_MANIFEST_CTTY_BYTES = 64u,
     LPR_MANIFEST_CWD_BYTES = 480u,
 };
@@ -71,6 +73,7 @@ typedef struct lpr_manifest {
     uint64_t linux_pgrp;
     uint64_t linux_next_pid;
     uint64_t cwd_handle;
+    uint64_t cwd_capability_index;
     uint64_t supervisor_token;
     uint64_t supervisor_endpoint_fd;
     uint64_t owner_generation;
@@ -122,4 +125,4 @@ static inline lpr_manifest_capability_t *lpr_manifest_capabilities(lpr_manifest_
 _Static_assert(sizeof(lpr_manifest_entry_t) == 32, "lpr manifest entry size");
 _Static_assert(sizeof(lpr_manifest_ofd_t) == 64, "lpr manifest ofd size");
 _Static_assert(sizeof(lpr_manifest_capability_t) == 24, "lpr manifest capability size");
-_Static_assert(sizeof(lpr_manifest_t) == 736, "lpr manifest header size");
+_Static_assert(sizeof(lpr_manifest_t) == 744, "lpr manifest header size");

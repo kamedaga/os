@@ -288,6 +288,71 @@ int lpr_fd_table_alloc(
     return -1;
 }
 
+int lpr_fd_table_alloc_batch(
+    lpr_fd_table_t *table,
+    lpr_linux_fd_t min_fd,
+    const lpr_fd_install_t *installs,
+    uint32_t install_count,
+    const lpr_linux_fd_t *excluded_fds,
+    uint32_t excluded_count,
+    lpr_linux_fd_t *out_fds)
+{
+    if (install_count == 0) return 0;
+    lpr_fd_table_lock(table);
+    if (!lpr_fd_table_valid(table) || installs == 0 || out_fds == 0 ||
+        min_fd >= table->entry_count || install_count > table->entry_count)
+    {
+        lpr_fd_table_unlock(table);
+        return -1;
+    }
+    uint32_t free_ofds = 0;
+    uint32_t free_backends = 0;
+    for (uint32_t i = 0; i < table->ofd_count; ++i)
+        free_ofds += table->ofds[i].active ? 0u : 1u;
+    for (uint32_t i = 0; i < table->backend_count; ++i)
+        free_backends += table->backends[i].active ? 0u : 1u;
+    if (free_ofds < install_count || free_backends < install_count) {
+        lpr_fd_table_unlock(table);
+        return -1;
+    }
+    uint32_t selected = 0;
+    for (lpr_linux_fd_t fd = min_fd;
+         fd < table->entry_count && selected < install_count;
+         ++fd)
+    {
+        if (table->entries[fd].active) continue;
+        int excluded = 0;
+        for (uint32_t i = 0; i < excluded_count; ++i)
+            if (excluded_fds != 0 && excluded_fds[i] == fd) {
+                excluded = 1;
+                break;
+            }
+        if (!excluded) out_fds[selected++] = fd;
+    }
+    if (selected != install_count) {
+        lpr_fd_table_unlock(table);
+        return -1;
+    }
+    for (uint32_t i = 0; i < install_count; ++i) {
+        const lpr_fd_install_t *install = &installs[i];
+        if (install->ops_id == LPR_FD_OPS_NONE ||
+            install->ops_id >= LPR_FD_OPS_COUNT ||
+            install->backend_state == 0 || install->backend_state_bytes == 0)
+        {
+            lpr_fd_table_unlock(table);
+            return -1;
+        }
+    }
+    for (uint32_t i = 0; i < install_count; ++i) {
+        if (lpr_fd_install_unlocked(table, out_fds[i], &installs[i]) != 0) {
+            lpr_fd_table_unlock(table);
+            return -1;
+        }
+    }
+    lpr_fd_table_unlock(table);
+    return 0;
+}
+
 static void lpr_fd_prepare_drop(
     lpr_fd_table_t *table,
     lpr_ofd_t *ofd,

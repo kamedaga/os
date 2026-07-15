@@ -70,6 +70,11 @@ int termd_linux_tty_island_dup(
     struct termd_linux_tty_island *island,
     uint64_t handle,
     uint64_t *out_handle);
+int termd_linux_tty_island_transfer_dup(
+    struct termd_linux_tty_island *island,
+    uint64_t handle,
+    int lease_fd,
+    uint64_t *out_handle);
 int termd_linux_tty_island_ioctl(
     struct termd_linux_tty_island *island,
     termd_ioctl_request_t *request);

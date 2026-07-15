@@ -82,6 +82,7 @@ static struct uinet_socket *g_libuinet_tcp_listener;
 static struct uinet_socket *g_libuinet_tcp_connections[NETD_TCP_ECHO_MAX_CONNECTIONS];
 struct netd_libuinet_api_socket {
     uint64_t handle;
+    uint64_t refcount;
     uint64_t type;
     uint64_t protocol;
     uint64_t recv_calls;
@@ -2584,6 +2585,7 @@ int netd_libuinet_socket_open(
         handle = ++g_libuinet_api_next_handle;
     }
     slot->handle = handle;
+    slot->refcount = 1;
     slot->type = type;
     slot->protocol = (uint64_t)uinet_protocol;
     slot->notify_fd = notify_fd;
@@ -2629,7 +2631,12 @@ void netd_libuinet_socket_reap_hangups(void)
         if (pacha_fd_poll(&pollfd, 1) <= 0 ||
             (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle = slot->handle;
-        (void)netd_libuinet_socket_close(handle);
+        if (slot->type == NETD_SOCK_STREAM) {
+            (void)uinet_soshutdown(slot->socket, UINET_SHUT_RDWR);
+        }
+        (void)uinet_soclose(slot->socket);
+        (void)pacha_fd_close(slot->notify_fd);
+        memset(slot, 0, sizeof(*slot));
         printf("[netd] inet_orphan_reap handle=%llu\n",
             (unsigned long long)handle);
     }
@@ -2651,6 +2658,24 @@ static struct netd_libuinet_api_socket *netd_libuinet_api_socket_find(uint64_t h
     return NULL;
 }
 #endif
+
+int netd_libuinet_socket_dup(uint64_t handle)
+{
+#if defined(NETD_WITH_LIBUINET)
+    struct netd_libuinet_api_socket *slot = netd_libuinet_api_socket_find(handle);
+    if (slot == NULL) {
+        return -9;
+    }
+    if (slot->refcount == UINT64_MAX) {
+        return -24;
+    }
+    slot->refcount++;
+    return 0;
+#else
+    (void)handle;
+    return -95;
+#endif
+}
 
 int netd_libuinet_socket_connect(uint64_t handle, uint32_t addr_be, uint16_t port_be, uint64_t flags)
 {
@@ -2945,6 +2970,10 @@ int netd_libuinet_socket_close(uint64_t handle)
     struct netd_libuinet_api_socket *slot = netd_libuinet_api_socket_find(handle);
     if (slot == NULL) {
         return -9;
+    }
+    if (slot->refcount > 1) {
+        slot->refcount--;
+        return 0;
     }
     if (slot->type == NETD_SOCK_STREAM) {
         const int close_error = uinet_sogeterror(slot->socket);

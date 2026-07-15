@@ -58,14 +58,42 @@ int lpr_load_manifest(void)
     }
     const lpr_manifest_t *mapped_manifest =
         (const lpr_manifest_t *)(uintptr_t)mapped;
-    const int install_ok =
-        lpr_manifest_validate(mapped_manifest, lpr_process_manifest.byte_size) &&
+    int cwd_lease_fd = -1;
+    const int manifest_ok =
+        lpr_manifest_validate(mapped_manifest, lpr_process_manifest.byte_size);
+    if (manifest_ok && mapped_manifest->cwd_handle != 0) {
+        const lpr_manifest_capability_t *capabilities =
+            (const lpr_manifest_capability_t *)((const uint8_t *)mapped_manifest +
+                mapped_manifest->capability_offset);
+        const lpr_manifest_capability_t *cwd_capability =
+            &capabilities[mapped_manifest->cwd_capability_index];
+        if ((cwd_capability->flags & LPR_MANIFEST_CAPABILITY_CWD_LEASE) != 0 &&
+            cwd_capability->native_fd <= INT32_MAX)
+            cwd_lease_fd = (int)(uint32_t)cwd_capability->native_fd;
+    }
+    const int install_ok = manifest_ok &&
+        (mapped_manifest->cwd_handle == 0 || cwd_lease_fd >= 16) &&
         lpr_install_manifest_fds(mapped_manifest);
+    if (!install_ok && manifest_ok) {
+        const lpr_manifest_capability_t *capabilities =
+            (const lpr_manifest_capability_t *)((const uint8_t *)mapped_manifest +
+                mapped_manifest->capability_offset);
+        for (uint64_t i = 0; i < mapped_manifest->capability_count; ++i)
+            if (capabilities[i].native_fd <= INT32_MAX)
+                (void)lpr_close_native_fd_if_open(
+                    capabilities[i].native_fd);
+    }
     (void)lpr_pacha_syscall2(
         PACHAOS_SYSCALL_MUNMAP,
         (uint64_t)(uintptr_t)mapped,
         lpr_process_manifest.byte_size);
-    if (!install_ok) goto invalid;
+    if (!install_ok) {
+        if (cwd_lease_fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)cwd_lease_fd);
+        goto invalid;
+    }
+    lpr_cwd_lease_fd = cwd_lease_fd;
     if ((lpr_process_manifest.flags & LPR_MANIFEST_FLAG_SUPERVISOR) != 0 &&
         lpr_process_manifest.supervisor_token != 0)
     {
@@ -92,8 +120,13 @@ invalid:
     lpr_memset(&lpr_process_manifest, 0, sizeof(lpr_process_manifest));
     lpr_supervisor_enabled = 0;
     lpr_supervisor_token = 0;
+    lpr_cwd_lease_fd = -1;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
-    return 0;
+    (void)lpr_pacha_syscall1(
+        PACHAOS_SYSCALL_PROCESS_EXIT,
+        LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
+    for (;;) {
+    }
 }
 
 int lpr_path_is_terminated(const char *path, uint64_t capacity)

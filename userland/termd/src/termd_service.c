@@ -355,10 +355,16 @@ static int termd_dispatch_tty(
         if (payload == 0) {
             return TERMD_ERR_INVAL;
         }
-        return termd_linux_tty_island_dup(
-            tty,
-            ((const termd_handle_request_t *)payload)->handle,
-            out_result);
+        return notify_fd >= 16 ?
+            termd_linux_tty_island_transfer_dup(
+                tty,
+                ((const termd_handle_request_t *)payload)->handle,
+                notify_fd,
+                out_result) :
+            termd_linux_tty_island_dup(
+                tty,
+                ((const termd_handle_request_t *)payload)->handle,
+                out_result);
     case TERMD_OP_SIGNAL_TAKE:
         if (payload == 0) {
             return TERMD_ERR_INVAL;
@@ -544,7 +550,8 @@ int termd_service_dispatch_request(
     const int open_op = header.op == TERMD_OP_OPEN_PTMX ||
         header.op == TERMD_OP_OPEN_PTS || header.op == TERMD_OP_OPEN_HVC ||
         header.op == TERMD_OP_OPEN_CTTY;
-    const int notify_fd = open_op && request->fd_count == 3 && fds[1].fd >= 16 ?
+    const int retains_attachment = open_op || header.op == TERMD_OP_HANDLE_DUP;
+    const int notify_fd = retains_attachment && request->fd_count == 3 && fds[1].fd >= 16 ?
         (int)(uint32_t)fds[1].fd : -1;
     uint64_t result = 0;
     const int status = termd_dispatch_tty(
@@ -564,7 +571,7 @@ int termd_service_dispatch_request(
 
     termd_close_received_fds(
         request, fds, reply_fd,
-        status == 0 && open_op ? notify_fd : -1);
+        status == 0 && retains_attachment ? notify_fd : -1);
     const uint64_t token = status < 0 ?
         termd_error_token(
             status,

@@ -85,7 +85,7 @@ typedef struct lpr_tty_backend {
     uint32_t flags;
     uint64_t handle;
     lpr_native_fd_t wait_fd;
-    uint32_t reserved2;
+    lpr_native_fd_t lease_fd;
 } lpr_tty_backend_t;
 
 enum {
@@ -129,13 +129,13 @@ typedef struct lpr_dmabuf_backend {
     uint64_t token;
     uint64_t size;
     lpr_native_fd_t native;
-    uint32_t reserved1;
+    lpr_native_fd_t lease_fd;
 } lpr_dmabuf_backend_t;
 
 typedef struct lpr_socket_backend {
     uint8_t active;
     uint8_t type;
-    uint8_t cloexec;
+    uint8_t reserved3;
     uint8_t connected;
     uint8_t connecting;
     uint8_t domain;
@@ -160,7 +160,7 @@ typedef struct lpr_socket_backend {
     uint32_t peer_uid;
     uint32_t peer_gid;
     lpr_native_fd_t wait_fd;
-    uint32_t reserved2;
+    lpr_native_fd_t lease_fd;
 } lpr_socket_backend_t;
 
 typedef struct lpr_epoll_backend {
@@ -291,6 +291,14 @@ int lpr_fd_table_alloc(
     lpr_linux_fd_t min_fd,
     const lpr_fd_install_t *install,
     lpr_linux_fd_t *out_fd);
+int lpr_fd_table_alloc_batch(
+    lpr_fd_table_t *table,
+    lpr_linux_fd_t min_fd,
+    const lpr_fd_install_t *installs,
+    uint32_t install_count,
+    const lpr_linux_fd_t *excluded_fds,
+    uint32_t excluded_count,
+    lpr_linux_fd_t *out_fds);
 int lpr_fd_table_close(
     lpr_fd_table_t *table,
     lpr_linux_fd_t fd,

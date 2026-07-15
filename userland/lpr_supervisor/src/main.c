@@ -467,6 +467,19 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     return 0;
 }
 
+static int lprs_fork_cancel(uint64_t token)
+{
+    lprs_process_t *proc = lprs_find_by_token(token);
+    if (proc == NULL) {
+        return PACHA_STATUS_ESRCH;
+    }
+    if (proc->process_fd >= 16) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_process_reap(proc);
+    return 0;
+}
+
 static int lprs_signal_process_fd(int process_fd, uint64_t signal)
 {
     if (process_fd < 16) {
@@ -995,6 +1008,9 @@ static int lprs_dispatch(
             *out_result = ((lprs_fork_t *)payload)->child_token;
             reply_payload_size = sizeof(lprs_fork_t);
         }
+        break;
+    case LPRS_OP_PROCESS_FORK_CANCEL:
+        status = token == 0 ? PACHA_STATUS_EINVAL : lprs_fork_cancel(token);
         break;
     case LPRS_OP_PROCESS_FORK_CHILD_READY:
         status = token == 0 ? PACHA_STATUS_EINVAL :

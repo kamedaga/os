@@ -14,7 +14,7 @@ struct drmd_drm_island {
     int load_status;
 };
 
-enum { DRMD_DRM_WAIT_SOURCE_MAX = 64 };
+enum { DRMD_DRM_WAIT_SOURCE_MAX = 128 };
 
 int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_config *cfg);
 int drmd_drm_island_open(struct drmd_drm_island *island, const drmd_open_request_t *request, int notify_fd, uint64_t *out_handle);
@@ -43,7 +43,10 @@ int drmd_drm_island_prime_import(
     const drmd_prime_import_request_t *request,
     int import_vmo_fd,
     uint64_t *out_gem_handle);
-int drmd_drm_island_prime_acquire(struct drmd_drm_island *island, uint64_t token);
+int drmd_drm_island_prime_acquire(
+    struct drmd_drm_island *island,
+    uint64_t token,
+    int lease_fd);
 int drmd_drm_island_prime_release(struct drmd_drm_island *island, uint64_t token);
 size_t drmd_drm_island_collect_wait_sources(int *out_fds, size_t capacity);
 size_t drmd_drm_island_reap_hangups(struct drmd_drm_island *island);

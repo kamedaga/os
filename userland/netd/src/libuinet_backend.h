@@ -27,6 +27,7 @@ int netd_libuinet_socket_open(
     uint64_t protocol,
     int notify_fd,
     uint64_t *out_handle);
+int netd_libuinet_socket_dup(uint64_t handle);
 int netd_libuinet_socket_connect(uint64_t handle, uint32_t addr_be, uint16_t port_be, uint64_t flags);
 int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uint64_t flags, uint32_t addr_be, uint16_t port_be, size_t *out_sent);
 int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint64_t flags, size_t *out_received);

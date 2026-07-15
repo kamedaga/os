@@ -159,6 +159,16 @@ static int lpr_exec_local_fd_preserve_unlocked(uint64_t fd)
         (slot->fd_flags & LPR_FD_ENTRY_CLOEXEC) == 0;
 }
 
+static int lpr_fork_local_fd_preserve_unlocked(uint64_t fd)
+{
+    if (fd >= lpr_control_fd_table.entry_count) return 0;
+    const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[fd];
+    if (!entry->active || entry->ofd_index >= lpr_control_fd_table.ofd_count)
+        return 0;
+    const lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[entry->ofd_index];
+    return ofd->active && lpr_ofd_ops_id(ofd) != LPR_FD_OPS_NONE;
+}
+
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve)
 {
     if (out_preserve == 0) {
@@ -201,47 +211,57 @@ static uint64_t lpr_exec_backend_record_bytes(uint8_t ops_id)
     case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
     case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
+    case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
     case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
     default: return 0;
     }
 }
 
+static int lpr_transaction_track_lease(
+    lpr_exec_transaction_t *transaction,
+    uint32_t pin_index,
+    int fd);
+
 static uint32_t lpr_exec_backend_native_fds(
-    const lpr_fd_pin_t *pin,
+    uint8_t ops_id,
+    const void *state,
     int32_t out_fds[2])
 {
     if (out_fds == 0) return 0;
     out_fds[0] = -1;
     out_fds[1] = -1;
-    if (pin == 0 || pin->state == 0) return 0;
+    if (state == 0) return 0;
     uint32_t count = 0;
 #define LPR_EXEC_ADD_NATIVE(value) do { \
     const int32_t native_fd__ = (value); \
     if (native_fd__ >= 16 && count < 2) out_fds[count++] = native_fd__; \
 } while (0)
-    switch (pin->ops_id) {
+    switch (ops_id) {
     case LPR_FD_OPS_FILED:
-        LPR_EXEC_ADD_NATIVE(((const lpr_filed_backend_t *)pin->state)->lease_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_filed_backend_t *)state)->lease_fd.raw);
         break;
     case LPR_FD_OPS_TTY:
-        LPR_EXEC_ADD_NATIVE(((const lpr_tty_backend_t *)pin->state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_tty_backend_t *)state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_tty_backend_t *)state)->lease_fd.raw);
         break;
     case LPR_FD_OPS_DRM:
-        LPR_EXEC_ADD_NATIVE(((const lpr_drm_backend_t *)pin->state)->wait_fd.raw);
-        LPR_EXEC_ADD_NATIVE(((const lpr_drm_backend_t *)pin->state)->lease_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_drm_backend_t *)state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_drm_backend_t *)state)->lease_fd.raw);
         break;
     case LPR_FD_OPS_INPUT:
-        LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)pin->state)->wait_fd.raw);
-        LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)pin->state)->lease_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_input_backend_t *)state)->lease_fd.raw);
         break;
     case LPR_FD_OPS_PIPE:
-        LPR_EXEC_ADD_NATIVE(((const lpr_pipe_backend_t *)pin->state)->native.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_pipe_backend_t *)state)->native.raw);
         break;
     case LPR_FD_OPS_SOCKET:
-        LPR_EXEC_ADD_NATIVE(((const lpr_socket_backend_t *)pin->state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_socket_backend_t *)state)->wait_fd.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_socket_backend_t *)state)->lease_fd.raw);
         break;
     case LPR_FD_OPS_DMABUF:
-        LPR_EXEC_ADD_NATIVE(((const lpr_dmabuf_backend_t *)pin->state)->native.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_dmabuf_backend_t *)state)->native.raw);
+        LPR_EXEC_ADD_NATIVE(((const lpr_dmabuf_backend_t *)state)->lease_fd.raw);
         break;
     default:
         break;
@@ -265,39 +285,338 @@ static void lpr_exec_unpin(lpr_exec_transaction_t *transaction)
     transaction->pin_count = 0;
 }
 
-int lpr_prepare_exec_manifest(
+static int lpr_backend_needs_transfer_lease(uint8_t ops_id, const void *state)
+{
+    if (state == 0) return 0;
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED: {
+        const lpr_filed_backend_t *backend = state;
+        return backend->handle != 0 &&
+            (backend->reserved2 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+    }
+    case LPR_FD_OPS_TTY: {
+        const lpr_tty_backend_t *backend = state;
+        return backend->handle != 0 &&
+            (backend->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+    }
+    case LPR_FD_OPS_DRM: {
+        const lpr_drm_backend_t *backend = state;
+        return backend->handle != 0 &&
+            (backend->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+    }
+    case LPR_FD_OPS_INPUT: {
+        const lpr_input_backend_t *backend = state;
+        return backend->handle != 0 &&
+            (backend->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+    }
+    case LPR_FD_OPS_SOCKET: {
+        const lpr_socket_backend_t *backend = state;
+        return backend->handle != 0 &&
+            (backend->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+    }
+    case LPR_FD_OPS_DMABUF: {
+        const lpr_dmabuf_backend_t *backend = state;
+        return backend->token != 0 &&
+            (backend->reserved0 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+static int lpr_duplicate_manifest_capability(
+    lpr_exec_transaction_t *transaction,
+    uint32_t pin_index,
+    int source_fd,
+    int32_t *out_fd)
+{
+    if (transaction == 0 || out_fd == 0 || source_fd < 16)
+        return -LPR_LINUX_EBADF;
+    struct pacha_fd_info info;
+    lpr_memset(&info, 0, sizeof(info));
+    if (!lpr_native_fd_info((uint64_t)(uint32_t)source_fd, &info) ||
+        (info.rights & PACHA_FD_RIGHT_DUP) == 0)
+        return -LPR_LINUX_EBADF;
+    const int64_t duplicate = lpr_pacha_syscall4(
+        PACHA_FD_SYSCALL_FCNTL,
+        (uint64_t)(uint32_t)source_fd,
+        PACHA_FD_FCNTL_DUP,
+        16,
+        info.rights);
+    if (duplicate < 16) return (int)lpr_pacha_status_to_errno(duplicate);
+    const int64_t flag_status = lpr_pacha_syscall4(
+        PACHA_FD_SYSCALL_FCNTL,
+        (uint64_t)(uint32_t)duplicate,
+        PACHA_FD_FCNTL_SET_FLAGS,
+        0,
+        PACHA_FD_FLAG_CLOEXEC);
+    if (flag_status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)duplicate);
+        return (int)lpr_pacha_status_to_errno(flag_status);
+    }
+    const int status = lpr_transaction_track_lease(
+        transaction, pin_index, (int)duplicate);
+    if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)duplicate);
+        return status;
+    }
+    *out_fd = (int32_t)duplicate;
+    return 0;
+}
+
+static int lpr_prepare_backend_record(
+    lpr_exec_transaction_t *transaction,
+    uint32_t pin_index,
+    int fork_snapshot,
+    uint8_t ops_id,
+    const void *original_state,
+    void *prepared_state)
+{
+    if (transaction == 0 || original_state == 0 || prepared_state == 0)
+        return -LPR_LINUX_EFAULT;
+    int status = 0;
+    if (lpr_backend_needs_transfer_lease(ops_id, original_state)) {
+        int lease_fd = -1;
+        int remote_lease_fd = -1;
+        status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        uint64_t handle = 0;
+        if (status == 0) {
+            switch (ops_id) {
+            case LPR_FD_OPS_FILED:
+                status = (int)lpr_filed_transfer_dup_handle(
+                    ((const lpr_filed_backend_t *)original_state)->handle,
+                    0,
+                    remote_lease_fd,
+                    &handle);
+                if (status == 0 && handle == 0) status = -LPR_LINUX_EIO;
+                break;
+            case LPR_FD_OPS_TTY:
+                status = (int)lpr_termd_transfer_dup_handle(
+                    ((const lpr_tty_backend_t *)original_state)->handle,
+                    remote_lease_fd,
+                    &handle);
+                if (status == 0 && handle !=
+                    ((const lpr_tty_backend_t *)original_state)->handle)
+                    status = -LPR_LINUX_EIO;
+                break;
+            case LPR_FD_OPS_DRM:
+                status = (int)lpr_drm_transfer_dup_handle(
+                    ((const lpr_drm_backend_t *)original_state)->handle,
+                    remote_lease_fd,
+                    &handle);
+                if (status == 0 && handle !=
+                    ((const lpr_drm_backend_t *)original_state)->handle)
+                    status = -LPR_LINUX_EIO;
+                break;
+            case LPR_FD_OPS_INPUT:
+                status = (int)lpr_input_transfer_dup_handle(
+                    ((const lpr_input_backend_t *)original_state)->handle,
+                    remote_lease_fd,
+                    &handle);
+                if (status == 0 && handle !=
+                    ((const lpr_input_backend_t *)original_state)->handle)
+                    status = -LPR_LINUX_EIO;
+                break;
+            case LPR_FD_OPS_SOCKET:
+                status = (int)lpr_netd_transfer_dup_handle(
+                    ((const lpr_socket_backend_t *)original_state)->handle,
+                    remote_lease_fd);
+                break;
+            case LPR_FD_OPS_DMABUF:
+                status = (int)lpr_drm_prime_transfer_acquire(
+                    ((const lpr_dmabuf_backend_t *)original_state)->token,
+                    remote_lease_fd);
+                break;
+            default:
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
+        }
+        if (status == 0)
+            status = lpr_transaction_track_lease(
+                transaction, pin_index, lease_fd);
+        if (status != 0) {
+            if (lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)lease_fd);
+            if (remote_lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)remote_lease_fd);
+            return status;
+        }
+        switch (ops_id) {
+        case LPR_FD_OPS_FILED: {
+            lpr_filed_backend_t *backend = prepared_state;
+            backend->handle = handle;
+            backend->lease_fd.raw = lease_fd;
+            backend->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
+            break;
+        }
+        case LPR_FD_OPS_TTY: {
+            lpr_tty_backend_t *backend = prepared_state;
+            backend->lease_fd.raw = lease_fd;
+            backend->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
+            break;
+        }
+        case LPR_FD_OPS_DRM: {
+            lpr_drm_backend_t *backend = prepared_state;
+            backend->lease_fd.raw = lease_fd;
+            backend->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
+            break;
+        }
+        case LPR_FD_OPS_INPUT: {
+            lpr_input_backend_t *backend = prepared_state;
+            backend->lease_fd.raw = lease_fd;
+            backend->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
+            break;
+        }
+        case LPR_FD_OPS_SOCKET: {
+            lpr_socket_backend_t *backend = prepared_state;
+            backend->lease_fd.raw = lease_fd;
+            backend->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
+            break;
+        }
+        case LPR_FD_OPS_DMABUF: {
+            lpr_dmabuf_backend_t *backend = prepared_state;
+            backend->lease_fd.raw = lease_fd;
+            backend->reserved0 |= LPR_BACKEND_TRANSFER_LEASE;
+            break;
+        }
+        default:
+            break;
+        }
+    }
+    if (fork_snapshot) return 0;
+
+#define LPR_DUP_MANIFEST_FIELD(original_fd, prepared_fd) do { \
+    if ((original_fd) >= 16) { \
+        status = lpr_duplicate_manifest_capability( \
+            transaction, pin_index, (original_fd), &(prepared_fd)); \
+        if (status != 0) return status; \
+    } \
+} while (0)
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED: {
+        const lpr_filed_backend_t *original = original_state;
+        lpr_filed_backend_t *prepared = prepared_state;
+        if ((original->reserved2 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+            LPR_DUP_MANIFEST_FIELD(
+                original->lease_fd.raw, prepared->lease_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_TTY: {
+        const lpr_tty_backend_t *original = original_state;
+        lpr_tty_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
+        if ((original->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+            LPR_DUP_MANIFEST_FIELD(
+                original->lease_fd.raw, prepared->lease_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_DRM: {
+        const lpr_drm_backend_t *original = original_state;
+        lpr_drm_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
+        if ((original->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+            LPR_DUP_MANIFEST_FIELD(
+                original->lease_fd.raw, prepared->lease_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_INPUT: {
+        const lpr_input_backend_t *original = original_state;
+        lpr_input_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
+        if ((original->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+            LPR_DUP_MANIFEST_FIELD(
+                original->lease_fd.raw, prepared->lease_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_SOCKET: {
+        const lpr_socket_backend_t *original = original_state;
+        lpr_socket_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->wait_fd.raw, prepared->wait_fd.raw);
+        if ((original->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+            LPR_DUP_MANIFEST_FIELD(
+                original->lease_fd.raw, prepared->lease_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_DMABUF: {
+        const lpr_dmabuf_backend_t *original = original_state;
+        lpr_dmabuf_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->native.raw, prepared->native.raw);
+        if ((original->reserved0 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+            LPR_DUP_MANIFEST_FIELD(
+                original->lease_fd.raw, prepared->lease_fd.raw);
+        break;
+    }
+    case LPR_FD_OPS_PIPE: {
+        const lpr_pipe_backend_t *original = original_state;
+        lpr_pipe_backend_t *prepared = prepared_state;
+        LPR_DUP_MANIFEST_FIELD(original->native.raw, prepared->native.raw);
+        break;
+    }
+    default:
+        break;
+    }
+#undef LPR_DUP_MANIFEST_FIELD
+    return 0;
+}
+
+static int lpr_prepare_manifest(
     filed_exec_path_t *exec,
-    lpr_exec_transaction_t *transaction)
+    lpr_exec_transaction_t *transaction,
+    int fork_snapshot)
 {
     if (exec == 0 || transaction == 0) return -LPR_LINUX_EFAULT;
     lpr_memset(transaction, 0, sizeof(*transaction));
     transaction->manifest_fd = -1;
+    transaction->cwd_lease_fd = -1;
     lpr_fd_arrays_init();
     lpr_cwd_init();
     exec->dir_handle = lpr_cwd_handle;
     if (lpr_cwd_handle != 0) {
-        const int64_t status = lpr_filed_dup_handle(
-            lpr_cwd_handle, 0, &transaction->cwd_handle);
-        if (status != 0) return (int)status;
+        int remote_lease_fd = -1;
+        int status = lpr_native_wait_pair(
+            &transaction->cwd_lease_fd,
+            &remote_lease_fd);
+        if (status != 0) return status;
+        const int64_t dup_status = lpr_filed_transfer_dup_handle(
+            lpr_cwd_handle,
+            0,
+            remote_lease_fd,
+            &transaction->cwd_handle);
+        if (dup_status != 0 || transaction->cwd_handle == 0) {
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)remote_lease_fd);
+            transaction->cwd_lease_fd = -1;
+            transaction->cwd_handle = 0;
+            return dup_status != 0 ? (int)dup_status : -LPR_LINUX_EIO;
+        }
     }
 
     const uint64_t capacity = lpr_fd_table_capacity;
     lpr_manifest_layout_t maximum;
-    if (capacity == 0 ||
-        lpr_manifest_layout(capacity, capacity, capacity, capacity * 256u, &maximum) != 0)
+    if (capacity == 0 || capacity > UINT64_MAX / 256u ||
+        lpr_manifest_layout(
+            capacity, capacity, capacity * 2u + 1u,
+            capacity * 256u, &maximum) != 0)
     {
         return -LPR_LINUX_E2BIG;
     }
     const uint64_t scratch_offset = lpr_align_up_4096(maximum.byte_size);
     if (scratch_offset == 0 ||
         capacity > (UINT64_MAX - scratch_offset) /
-            (sizeof(lpr_manifest_entry_t) + sizeof(lpr_fd_pin_t)))
+            (sizeof(lpr_manifest_entry_t) + sizeof(lpr_fd_pin_t) +
+                2u * sizeof(lpr_prepared_lease_t)))
     {
         return -LPR_LINUX_E2BIG;
     }
     const uint64_t map_bytes = lpr_align_up_4096(
         scratch_offset + capacity *
-            (sizeof(lpr_manifest_entry_t) + sizeof(lpr_fd_pin_t)));
+            (sizeof(lpr_manifest_entry_t) + sizeof(lpr_fd_pin_t) +
+                2u * sizeof(lpr_prepared_lease_t)));
     if (map_bytes == 0) return -LPR_LINUX_E2BIG;
     const uint64_t rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
@@ -318,12 +637,18 @@ int lpr_prepare_exec_manifest(
     lpr_manifest_entry_t *snapshot_entries =
         (lpr_manifest_entry_t *)((uintptr_t)mapped + scratch_offset);
     transaction->pins = (lpr_fd_pin_t *)(snapshot_entries + capacity);
+    transaction->prepared_leases =
+        (lpr_prepared_lease_t *)(transaction->pins + capacity);
+    transaction->prepared_lease_capacity = capacity * 2u;
 
     uint64_t entry_count = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
     const uint64_t snapshot_generation = lpr_control_fd_table.generation;
     for (uint64_t fd = 0; fd < capacity; ++fd) {
-        if (!lpr_exec_local_fd_preserve_unlocked(fd)) continue;
+        const int preserve = fork_snapshot ?
+            lpr_fork_local_fd_preserve_unlocked(fd) :
+            lpr_exec_local_fd_preserve_unlocked(fd);
+        if (!preserve) continue;
         const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[fd];
         lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[entry->ofd_index];
         lpr_backend_record_t *backend =
@@ -376,12 +701,17 @@ int lpr_prepare_exec_manifest(
     lpr_fd_table_unlock(&lpr_control_fd_table);
 
     uint64_t record_bytes = 0;
-    uint64_t capability_count = 0;
+    uint64_t capability_count = transaction->cwd_lease_fd >= 16 ? 1u : 0u;
     for (uint64_t i = 0; i < transaction->pin_count; ++i) {
         record_bytes += lpr_exec_backend_record_bytes(transaction->pins[i].ops_id);
         int32_t native_fds[2];
         capability_count += lpr_exec_backend_native_fds(
-            &transaction->pins[i], native_fds);
+            transaction->pins[i].ops_id,
+            transaction->pins[i].state,
+            native_fds);
+        capability_count += lpr_backend_needs_transfer_lease(
+            transaction->pins[i].ops_id,
+            transaction->pins[i].state) ? 1u : 0u;
     }
     lpr_manifest_layout_t layout;
     if (lpr_manifest_layout(entry_count, transaction->pin_count,
@@ -402,6 +732,7 @@ int lpr_prepare_exec_manifest(
     manifest->linux_pgrp = (uint64_t)(uint32_t)lpr_linux_current_pgrp;
     manifest->linux_next_pid = (uint64_t)(uint32_t)lpr_linux_next_pid;
     manifest->cwd_handle = transaction->cwd_handle;
+    manifest->cwd_capability_index = transaction->cwd_lease_fd >= 16 ? 0u : UINT64_MAX;
     if (lpr_supervisor_enabled) {
         lprs_process_state_t state;
         if (lpr_supervisor_get_state(&state) == 0) manifest->owner_generation = state.generation;
@@ -429,12 +760,44 @@ int lpr_prepare_exec_manifest(
     uint8_t *records = (uint8_t *)manifest + manifest->record_offset;
     uint64_t record_cursor = 0;
     uint64_t capability_cursor = 0;
+    if (transaction->cwd_lease_fd >= 16) {
+        struct pacha_fd_info info;
+        lpr_memset(&info, 0, sizeof(info));
+        if (!lpr_native_fd_info(
+                (uint64_t)(uint32_t)transaction->cwd_lease_fd, &info))
+        {
+            lpr_exec_unpin(transaction);
+            lpr_destroy_exec_transaction(transaction);
+            return -LPR_LINUX_EBADF;
+        }
+        capabilities[capability_cursor] = (lpr_manifest_capability_t){
+            .ordinal = (uint32_t)capability_cursor,
+            .flags = LPR_MANIFEST_CAPABILITY_CWD_LEASE,
+            .native_fd = (uint64_t)(uint32_t)transaction->cwd_lease_fd,
+            .rights = info.rights,
+        };
+        capability_cursor++;
+    }
     for (uint64_t i = 0; i < transaction->pin_count; ++i) {
         const lpr_fd_pin_t *pin = &transaction->pins[i];
         const uint64_t bytes = lpr_exec_backend_record_bytes(pin->ops_id);
+        void *record = records + record_cursor;
+        lpr_memcpy(record, pin->state, (size_t)bytes);
+        const int prepare_status = lpr_prepare_backend_record(
+            transaction,
+            (uint32_t)i,
+            fork_snapshot,
+            pin->ops_id,
+            pin->state,
+            record);
+        if (prepare_status != 0) {
+            lpr_exec_unpin(transaction);
+            lpr_destroy_exec_transaction(transaction);
+            return prepare_status;
+        }
         int32_t native_fds[2];
         const uint32_t native_fd_count =
-            lpr_exec_backend_native_fds(pin, native_fds);
+            lpr_exec_backend_native_fds(pin->ops_id, record, native_fds);
         ofds[i].generation = pin->ofd_generation;
         ofds[i].backend_id = pin->ops_id;
         ofds[i].access_mode = pin->access_mode;
@@ -445,7 +808,6 @@ int lpr_prepare_exec_manifest(
         ofds[i].record_bytes = (uint32_t)bytes;
         ofds[i].capability_first = (uint32_t)capability_cursor;
         ofds[i].capability_count = (uint16_t)native_fd_count;
-        lpr_memcpy(records + record_cursor, pin->state, (size_t)bytes);
         record_cursor += bytes;
         for (uint32_t ni = 0; ni < native_fd_count; ++ni) {
             const int32_t native_fd = native_fds[ni];
@@ -464,6 +826,11 @@ int lpr_prepare_exec_manifest(
             capability_cursor++;
         }
     }
+    if (record_cursor != record_bytes || capability_cursor != capability_count) {
+        lpr_exec_unpin(transaction);
+        lpr_destroy_exec_transaction(transaction);
+        return -LPR_LINUX_EIO;
+    }
     if (lpr_manifest_seal(manifest, map_bytes) != 0) {
         lpr_exec_unpin(transaction);
         lpr_destroy_exec_transaction(transaction);
@@ -473,9 +840,169 @@ int lpr_prepare_exec_manifest(
     return 0;
 }
 
+int lpr_prepare_exec_manifest(
+    filed_exec_path_t *exec,
+    lpr_exec_transaction_t *transaction)
+{
+    return lpr_prepare_manifest(exec, transaction, 0);
+}
+
+int lpr_prepare_fork_manifest(
+    filed_exec_path_t *exec,
+    lpr_exec_transaction_t *transaction)
+{
+    return lpr_prepare_manifest(exec, transaction, 1);
+}
+
+static void *lpr_fork_manifest_record(
+    const lpr_exec_transaction_t *transaction,
+    uint64_t index)
+{
+    if (transaction == 0 || transaction->manifest == 0 ||
+        index >= transaction->manifest->ofd_count)
+        return 0;
+    const lpr_manifest_ofd_t *ofds = lpr_manifest_ofds(transaction->manifest);
+    const lpr_manifest_ofd_t *ofd = &ofds[index];
+    if (ofd->record_offset > transaction->manifest->record_bytes ||
+        ofd->record_bytes > transaction->manifest->record_bytes - ofd->record_offset)
+        return 0;
+    return (uint8_t *)transaction->manifest +
+        transaction->manifest->record_offset + ofd->record_offset;
+}
+
+static int lpr_transaction_track_lease(
+    lpr_exec_transaction_t *transaction,
+    uint32_t pin_index,
+    int fd)
+{
+    if (transaction == 0 || fd < 16 || transaction->prepared_leases == 0 ||
+        transaction->prepared_lease_count >= transaction->prepared_lease_capacity)
+        return -LPR_LINUX_EMFILE;
+    transaction->prepared_leases[transaction->prepared_lease_count++] =
+        (lpr_prepared_lease_t){ .pin_index = pin_index, .fd = fd };
+    return 0;
+}
+
+void lpr_fork_transaction_rollback(lpr_exec_transaction_t *transaction)
+{
+    enum { LPR_FORK_PREPARED = 1u, LPR_FORK_COMMITTED = 2u,
+        LPR_FORK_ROLLED_BACK = 3u };
+    if (transaction == 0 || transaction->fork_state == LPR_FORK_ROLLED_BACK ||
+        transaction->fork_state == LPR_FORK_COMMITTED)
+        return;
+    for (uint64_t i = transaction->prepared_lease_count; i != 0; --i)
+        if (transaction->prepared_leases[i - 1u].fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)transaction->prepared_leases[i - 1u].fd);
+    transaction->prepared_lease_count = 0;
+    transaction->fork_prepared_count = 0;
+    transaction->fork_state = LPR_FORK_ROLLED_BACK;
+    if (transaction->cwd_lease_fd >= 16)
+        (void)lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+    transaction->cwd_lease_fd = -1;
+    transaction->cwd_handle = 0;
+}
+
+int lpr_fork_transaction_prepare(lpr_exec_transaction_t *transaction)
+{
+    enum { LPR_FORK_PREPARED = 1u };
+    if (transaction != 0 && transaction->fork_state == LPR_FORK_PREPARED &&
+        transaction->fork_prepared_count == transaction->pin_count)
+        return 0;
+    if (transaction == 0 || transaction->manifest == 0 ||
+        transaction->pins == 0 || transaction->fork_state != 0)
+        return -LPR_LINUX_EINVAL;
+    if (transaction->manifest->ofd_count != transaction->pin_count)
+        return -LPR_LINUX_EIO;
+    for (uint64_t i = 0; i < transaction->pin_count; ++i) {
+        const lpr_fd_pin_t *pin = &transaction->pins[i];
+        void *prepared_state = lpr_fork_manifest_record(transaction, i);
+        if (prepared_state == 0 || pin->state == 0 ||
+            lpr_exec_backend_record_bytes(pin->ops_id) == 0)
+            return -LPR_LINUX_EIO;
+    }
+    transaction->fork_state = LPR_FORK_PREPARED;
+    transaction->fork_prepared_count = transaction->pin_count;
+    return 0;
+}
+
+int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction)
+{
+    enum { LPR_FORK_PREPARED = 1u, LPR_FORK_COMMITTED = 2u };
+    if (transaction != 0 && transaction->fork_state == LPR_FORK_COMMITTED)
+        return 0;
+    if (transaction == 0 || transaction->fork_state != LPR_FORK_PREPARED ||
+        transaction->fork_prepared_count != transaction->pin_count)
+        return -LPR_LINUX_EINVAL;
+    for (uint64_t i = 0; i < transaction->pin_count; ++i) {
+        const lpr_fd_pin_t *pin = &transaction->pins[i];
+        if (pin->ofd_index >= lpr_control_fd_table.ofd_count) return -LPR_LINUX_EIO;
+        const lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[pin->ofd_index];
+        if (!ofd->active || ofd->generation != pin->ofd_generation ||
+            lpr_ofd_ops_id(ofd) != pin->ops_id ||
+            lpr_backend_state_from_ofd(ofd) == 0 ||
+            lpr_fork_manifest_record(transaction, i) == 0)
+            return -LPR_LINUX_EIO;
+    }
+    for (uint64_t i = 0; i < transaction->pin_count; ++i) {
+        const lpr_fd_pin_t *pin = &transaction->pins[i];
+        lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[pin->ofd_index];
+        void *state = lpr_backend_state_from_ofd(ofd);
+        const void *prepared = lpr_fork_manifest_record(transaction, i);
+        lpr_memcpy(
+            state,
+            prepared,
+            (size_t)lpr_exec_backend_record_bytes(pin->ops_id));
+    }
+    if (transaction->cwd_handle != 0) {
+        if (lpr_cwd_lease_fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+        lpr_cwd_handle = transaction->cwd_handle;
+        lpr_cwd_lease_fd = transaction->cwd_lease_fd;
+    }
+    transaction->cwd_handle = 0;
+    transaction->cwd_lease_fd = -1;
+    transaction->prepared_lease_count = 0;
+    transaction->fork_prepared_count = 0;
+    transaction->fork_state = LPR_FORK_COMMITTED;
+    return 0;
+}
+
+int lpr_fork_transaction_commit_parent(lpr_exec_transaction_t *transaction)
+{
+    enum { LPR_FORK_PREPARED = 1u, LPR_FORK_COMMITTED = 2u };
+    if (transaction != 0 && transaction->fork_state == LPR_FORK_COMMITTED)
+        return 0;
+    if (transaction == 0 || transaction->fork_state != LPR_FORK_PREPARED ||
+        transaction->fork_prepared_count != transaction->pin_count)
+        return -LPR_LINUX_EINVAL;
+    for (uint64_t i = transaction->prepared_lease_count; i != 0; --i)
+        if (transaction->prepared_leases[i - 1u].fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)transaction->prepared_leases[i - 1u].fd);
+    transaction->prepared_lease_count = 0;
+    if (transaction->cwd_lease_fd >= 16)
+        (void)lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+    transaction->cwd_handle = 0;
+    transaction->cwd_lease_fd = -1;
+    transaction->fork_prepared_count = 0;
+    transaction->fork_state = LPR_FORK_COMMITTED;
+    return 0;
+}
+
 void lpr_destroy_exec_transaction(lpr_exec_transaction_t *transaction)
 {
     if (transaction == 0) return;
+    lpr_fork_transaction_rollback(transaction);
+    for (uint64_t i = transaction->prepared_lease_count; i != 0; --i)
+        if (transaction->prepared_leases != 0 &&
+            transaction->prepared_leases[i - 1u].fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)transaction->prepared_leases[i - 1u].fd);
+    transaction->prepared_lease_count = 0;
     lpr_exec_unpin(transaction);
     if (transaction->manifest != 0 && transaction->map_bytes != 0) {
         (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
@@ -485,10 +1012,11 @@ void lpr_destroy_exec_transaction(lpr_exec_transaction_t *transaction)
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
             (uint64_t)(uint32_t)transaction->manifest_fd);
     }
-    if (transaction->cwd_handle != 0) {
-        (void)lpr_filed_close_handle(transaction->cwd_handle);
-        transaction->cwd_handle = 0;
-    }
+    if (transaction->cwd_lease_fd >= 16)
+        (void)lpr_close_native_fd_if_open(
+            (uint64_t)(uint32_t)transaction->cwd_lease_fd);
+    transaction->cwd_lease_fd = -1;
+    transaction->cwd_handle = 0;
     transaction->manifest_fd = -1;
     transaction->map_bytes = 0;
     transaction->manifest = 0;
@@ -499,120 +1027,39 @@ void lpr_close_local_state_before_self_exec(void)
 {
     lpr_fd_arrays_init();
     for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
-        if (lpr_runtime_reserved_fd(fd)) {
-            continue;
-        }
-        if (lpr_pipe_fd_is_active(fd)) {
+        if (!lpr_runtime_reserved_fd(fd) && lpr_control_fd_active(fd))
             lpr_control_close_fd(fd);
-            continue;
-        }
-        if (lpr_linux_socket_fd_active(fd)) {
-            (void)lpr_linux_socket_close(fd);
-            continue;
-        }
-        if (lpr_linux_tty_fd_active(fd)) {
-            uint32_t refcount = 0;
-            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
-            const uint64_t handle = lpr_tty_backend(fd)->handle;
-            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
-            lpr_control_close_fd(fd);
-            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && handle != 0) {
-                (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
-            }
-            continue;
-        }
-        if (lpr_linux_input_fd_active(fd)) {
-            uint32_t refcount = 0;
-            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
-            const uint64_t handle = lpr_input_backend(fd)->handle;
-            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
-            lpr_control_close_fd(fd);
-            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && handle != 0) {
-                (void)lpr_input_close_handle(handle);
-            }
-            continue;
-        }
-        if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
-            lpr_control_close_fd(fd);
-            continue;
-        }
-        if (lpr_linux_dmabuf_fd_active(fd)) {
-            uint32_t refcount = 0;
-            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
-            const uint64_t token = lpr_dmabuf_backend(fd)->token;
-            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
-            lpr_control_close_fd(fd);
-            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && token != 0) {
-                (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
-            }
-            continue;
-        }
-        if (lpr_linux_epoll_fd_active(fd)) {
-            lpr_control_close_fd(fd);
-            continue;
-        }
-        if (lpr_fd_is_filed(fd)) {
-            uint32_t refcount = 0;
-            (void)lpr_fd_table_get_refcount(&lpr_control_fd_table, (uint32_t)fd, &refcount);
-            const uint64_t handle = lpr_filed_backend(fd)->handle;
-            const int64_t fd_flags = lpr_control_get_fd_flags(fd);
-            lpr_control_close_fd(fd);
-            if (refcount <= 1 && fd_flags == LPR_LINUX_FD_CLOEXEC && handle != 0) {
-                (void)lpr_filed_close_handle(handle);
-            }
-        }
     }
+    if (lpr_cwd_handle != 0) {
+        if (lpr_cwd_lease_fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+        else
+            (void)lpr_filed_close_handle(lpr_cwd_handle);
+        lpr_cwd_handle = 0;
+        lpr_cwd_lease_fd = -1;
+    }
+    lpr_filed_session_drop();
 }
 
 void lpr_linux_prepare_process_exit(uint64_t exit_code)
 {
     lpr_trace_process_event("exit_prepare", exit_code, 0, 0);
-    lpr_socket_prepare_process_exit();
     lpr_fd_arrays_init();
-    for (uint32_t index = 0; index < lpr_control_fd_table.ofd_count; index += 1) {
-        lpr_ofd_t *object = &lpr_control_fd_table.ofds[index];
-        if (!object->active) {
-            continue;
-        }
-        if (lpr_ofd_ops_id(object) == LPR_FD_OPS_FILED &&
-            ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->handle != 0)
-        {
-            const uint64_t handle = ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->handle;
-            ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->handle = 0;
-            (void)lpr_filed_close_handle(handle);
-        } else if (lpr_ofd_ops_id(object) == LPR_FD_OPS_DRM &&
-            ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->handle != 0)
-        {
-            const uint64_t handle = ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->handle;
-            const int native_wait_fd = ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw;
-            ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->handle = 0;
-            ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw = -1;
-            if (native_wait_fd >= 16)
-                (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-            (void)lpr_drm_close_handle(handle);
-        } else if (lpr_ofd_ops_id(object) == LPR_FD_OPS_INPUT &&
-            ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->handle != 0)
-        {
-            const uint64_t handle = ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->handle;
-            const int native_wait_fd = ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw;
-            ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->handle = 0;
-            ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw = -1;
-            if (native_wait_fd >= 16)
-                (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-            (void)lpr_input_close_handle(handle);
-        } else if (lpr_ofd_ops_id(object) == LPR_FD_OPS_DMABUF &&
-            ((lpr_dmabuf_backend_t *)lpr_backend_state_from_ofd(object))->token != 0)
-        {
-            const uint64_t token = ((lpr_dmabuf_backend_t *)lpr_backend_state_from_ofd(object))->token;
-            ((lpr_dmabuf_backend_t *)lpr_backend_state_from_ofd(object))->token = 0;
-            (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
-        }
-    }
+    for (uint64_t fd = 0; fd < lpr_fd_table_capacity; ++fd)
+        if (!lpr_runtime_reserved_fd(fd) && lpr_control_fd_active(fd))
+            lpr_control_close_fd(fd);
     if (lpr_cwd_handle != 0) {
         const uint64_t handle = lpr_cwd_handle;
         lpr_cwd_handle = 0;
-        (void)lpr_filed_close_handle(handle);
+        if (lpr_cwd_lease_fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+        else
+            (void)lpr_filed_close_handle(handle);
+        lpr_cwd_lease_fd = -1;
     }
+    lpr_filed_session_drop();
 }
 
 int lpr_install_exec_bootstrap_fd(int bootstrap_fd)

@@ -43,6 +43,7 @@ enum {
     TERMD_LINUX_HVC_MAJOR = 229,
     TERMD_LINUX_UNIX98_PTY_SLAVE_MAJOR = 136,
     TERMD_LINUX_TTY_HANDLE_MAX = 32,
+    TERMD_LINUX_TRANSFER_LEASE_MAX = 64,
     TERMD_LINUX_FAKE_INODE_BYTES = 768,
     TERMD_LINUX_FAKE_MAPPING_BYTES = 256,
     TERMD_LINUX_FAKE_FILE_BYTES = 1024,
@@ -157,7 +158,15 @@ typedef struct termd_linux_tty_handle {
     uint8_t path[TERMD_LINUX_FAKE_PATH_BYTES];
 } termd_linux_tty_handle_t;
 
+typedef struct termd_linux_transfer_lease {
+    uint8_t active;
+    uint8_t reserved0[3];
+    int lease_fd;
+    uint64_t handle;
+} termd_linux_transfer_lease_t;
+
 static termd_linux_tty_handle_t tty_handles[TERMD_LINUX_TTY_HANDLE_MAX];
+static termd_linux_transfer_lease_t transfer_leases[TERMD_LINUX_TRANSFER_LEASE_MAX];
 static uint64_t next_tty_handle = 1;
 
 static void write_ptr_field(void *base, size_t offset, const void *value)
@@ -1152,6 +1161,19 @@ size_t termd_linux_tty_island_collect_wait_sources(int *out_fds, size_t capacity
         if (!tty_handles[i].active || tty_handles[i].notify_fd < 16) continue;
         out_fds[count++] = tty_handles[i].notify_fd;
     }
+    for (size_t i = 0; i < TERMD_LINUX_TRANSFER_LEASE_MAX && count < capacity; ++i) {
+        if (!transfer_leases[i].active || transfer_leases[i].lease_fd < 16) continue;
+        out_fds[count++] = transfer_leases[i].lease_fd;
+    }
+    return count;
+}
+
+static uint32_t termd_linux_transfer_lease_count(uint64_t handle)
+{
+    uint32_t count = 0;
+    for (size_t i = 0; i < TERMD_LINUX_TRANSFER_LEASE_MAX; ++i) {
+        if (transfer_leases[i].active && transfer_leases[i].handle == handle) count++;
+    }
     return count;
 }
 
@@ -1169,10 +1191,28 @@ size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island
         if (pacha_fd_poll(&pollfd, 1) <= 0 ||
             (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle_id = handle->handle;
-        handle->ref_count = 1;
+        const int notify_fd = handle->notify_fd;
+        handle->notify_fd = -1;
+        (void)pacha_fd_close(notify_fd);
+        handle->ref_count = termd_linux_transfer_lease_count(handle_id) + 1u;
         (void)termd_linux_tty_island_close(island, handle_id);
         printf("[termd] tty_orphan_reap handle=%llu\n",
             (unsigned long long)handle_id);
+        reaped++;
+    }
+    for (size_t i = 0; i < TERMD_LINUX_TRANSFER_LEASE_MAX; ++i) {
+        termd_linux_transfer_lease_t *lease = &transfer_leases[i];
+        if (!lease->active || lease->lease_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = lease->lease_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle_id = lease->handle;
+        (void)pacha_fd_close(lease->lease_fd);
+        memset(lease, 0, sizeof(*lease));
+        (void)termd_linux_tty_island_close(island, handle_id);
         reaped++;
     }
     return reaped;
@@ -1194,6 +1234,42 @@ int termd_linux_tty_island_dup(
     if (handle->ref_count == UINT32_MAX) {
         return -24;
     }
+    handle->ref_count++;
+    *out_handle = handle->handle;
+    return 0;
+}
+
+int termd_linux_tty_island_transfer_dup(
+    struct termd_linux_tty_island *island,
+    uint64_t handle_id,
+    int lease_fd,
+    uint64_t *out_handle)
+{
+    if (island == NULL || out_handle == NULL || lease_fd < 16) {
+        return -22;
+    }
+    *out_handle = 0;
+    termd_linux_tty_handle_t *handle = find_handle(handle_id);
+    if (handle == NULL) {
+        return -9;
+    }
+    if (handle->ref_count == UINT32_MAX) {
+        return -24;
+    }
+    termd_linux_transfer_lease_t *lease = NULL;
+    for (size_t i = 0; i < TERMD_LINUX_TRANSFER_LEASE_MAX; ++i) {
+        if (!transfer_leases[i].active) {
+            lease = &transfer_leases[i];
+            break;
+        }
+    }
+    if (lease == NULL) {
+        return -24;
+    }
+    memset(lease, 0, sizeof(*lease));
+    lease->active = 1;
+    lease->lease_fd = lease_fd;
+    lease->handle = handle_id;
     handle->ref_count++;
     *out_handle = handle->handle;
     return 0;

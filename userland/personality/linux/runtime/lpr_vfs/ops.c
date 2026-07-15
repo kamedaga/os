@@ -897,6 +897,7 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     }
     lpr_cwd_init();
     const uint64_t old_handle = lpr_cwd_handle;
+    const int old_lease_fd = lpr_cwd_lease_fd;
     char old_path[FILED_PATH_BYTES];
     lpr_memcpy(old_path, lpr_cwd_path, sizeof(old_path));
     lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
@@ -904,11 +905,13 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     lpr_memcpy(lpr_cwd_path, path, (size_t)len + 1u);
     if (len == 1u && path[0] == '/') {
         lpr_cwd_handle = 0;
+        lpr_cwd_lease_fd = -1;
         if (handle != 0) {
             (void)lpr_filed_close_handle(handle);
         }
     } else {
         lpr_cwd_handle = handle;
+        lpr_cwd_lease_fd = -1;
     }
     const int64_t supervisor_status = lpr_supervisor_cwd_set(lpr_cwd_handle, lpr_cwd_path);
     if (supervisor_status != 0) {
@@ -916,11 +919,16 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
             (void)lpr_filed_close_handle(lpr_cwd_handle);
         }
         lpr_cwd_handle = old_handle;
+        lpr_cwd_lease_fd = old_lease_fd;
         lpr_memcpy(lpr_cwd_path, old_path, sizeof(lpr_cwd_path));
         return supervisor_status;
     }
     if (old_handle != 0) {
-        (void)lpr_filed_close_handle(old_handle);
+        if (old_lease_fd >= 16)
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)old_lease_fd);
+        else
+            (void)lpr_filed_close_handle(old_handle);
     }
     return 0;
 }

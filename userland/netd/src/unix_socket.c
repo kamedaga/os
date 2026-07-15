@@ -185,19 +185,24 @@ static int netd_unix_transfer_valid(
         req->capability_count != capability_count)
         return 0;
     if (req->transfer_count == 0)
-        return req->transaction_id == 0 && capability_count == 0;
-    if (req->transaction_id == 0 || req->length == 0 || capability_fds == NULL)
+        return req->transaction_id == 0 && capability_count == 0 &&
+            req->reserved0 == 0;
+    if (req->transaction_id == 0 || req->length == 0 ||
+        req->reserved0 != 0 || capability_fds == NULL)
         return 0;
     for (uint32_t i = 0; i < capability_count; ++i)
         if (capability_fds[i] < 16) return 0;
+    uint32_t next_capability = 0;
     for (uint32_t i = 0; i < req->transfer_count; ++i) {
         const netd_transfer_occurrence_t *item = &req->transfers[i];
         const uint32_t end = (uint32_t)item->capability_first + item->capability_count;
         if (item->provider_id == 0 || item->transfer_token == 0 ||
-            item->reserved0 != 0 || end > capability_count)
+            item->reserved0 != 0 || item->capability_count == 0 ||
+            item->capability_first != next_capability || end > capability_count)
             return 0;
+        next_capability = end;
     }
-    return 1;
+    return next_capability == capability_count;
 }
 
 int netd_unix_socket_send(

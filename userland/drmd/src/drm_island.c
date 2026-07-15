@@ -17,7 +17,7 @@
 enum {
     DRMD_DRM_MAJOR = 226,
     DRMD_DRM_CARD0_MINOR = 0,
-    DRMD_HANDLE_MAX = DRMD_DRM_WAIT_SOURCE_MAX,
+    DRMD_HANDLE_MAX = 64,
     DRMD_FAKE_INODE_BYTES = 768,
     DRMD_FAKE_MAPPING_BYTES = 256,
     DRMD_FAKE_FILE_BYTES = 1024,
@@ -61,13 +61,22 @@ typedef struct drmd_handle {
     uint8_t file[DRMD_FAKE_FILE_BYTES];
 } drmd_handle_t;
 
-enum { DRMD_TRANSFER_LEASE_MAX = 32 };
+enum {
+    DRMD_TRANSFER_LEASE_MAX = 32,
+    DRMD_PRIME_LEASE_MAX = 32,
+};
 
 typedef struct drmd_transfer_lease {
     int active;
     int lease_fd;
     uint64_t handle;
 } drmd_transfer_lease_t;
+
+typedef struct drmd_prime_lease {
+    int active;
+    int lease_fd;
+    uint64_t token;
+} drmd_prime_lease_t;
 
 typedef struct drmd_drm_version {
     int version_major;
@@ -83,6 +92,7 @@ typedef struct drmd_drm_version {
 
 static drmd_handle_t handles[DRMD_HANDLE_MAX];
 static drmd_transfer_lease_t transfer_leases[DRMD_TRANSFER_LEASE_MAX];
+static drmd_prime_lease_t prime_leases[DRMD_PRIME_LEASE_MAX];
 static uint64_t next_handle = 1;
 
 static unsigned active_handle_count(void)
@@ -494,6 +504,10 @@ size_t drmd_drm_island_collect_wait_sources(int *out_fds, size_t capacity)
         if (!transfer_leases[i].active || transfer_leases[i].lease_fd < 16) continue;
         out_fds[count++] = transfer_leases[i].lease_fd;
     }
+    for (size_t i = 0; i < DRMD_PRIME_LEASE_MAX && count < capacity; ++i) {
+        if (!prime_leases[i].active || prime_leases[i].lease_fd < 16) continue;
+        out_fds[count++] = prime_leases[i].lease_fd;
+    }
     return count;
 }
 
@@ -540,6 +554,21 @@ size_t drmd_drm_island_reap_hangups(struct drmd_drm_island *island)
             drmd_transfer_lease_count(handle) == 0)
             drmd_kms_handle_orphan(handle);
         (void)drmd_drm_island_close(island, handle);
+        reaped++;
+    }
+    for (size_t i = 0; i < DRMD_PRIME_LEASE_MAX; ++i) {
+        drmd_prime_lease_t *lease = &prime_leases[i];
+        if (!lease->active || lease->lease_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = lease->lease_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t token = lease->token;
+        (void)pacha_fd_close(lease->lease_fd);
+        memset(lease, 0, sizeof(*lease));
+        (void)drmd_drm_island_prime_release(island, token);
         reaped++;
     }
     return reaped;
@@ -615,9 +644,31 @@ int drmd_drm_island_prime_import(
     return status;
 }
 
-int drmd_drm_island_prime_acquire(struct drmd_drm_island *island, uint64_t token)
+int drmd_drm_island_prime_acquire(
+    struct drmd_drm_island *island,
+    uint64_t token,
+    int lease_fd)
 {
-    return island != NULL && island->ready ? drmd_kms_prime_acquire(token) : -19;
+    if (island == NULL || !island->ready) return -19;
+    drmd_prime_lease_t *lease = NULL;
+    if (lease_fd >= 16) {
+        for (size_t i = 0; i < DRMD_PRIME_LEASE_MAX; ++i) {
+            if (!prime_leases[i].active) {
+                lease = &prime_leases[i];
+                break;
+            }
+        }
+        if (lease == NULL) return -24;
+    }
+    const int status = drmd_kms_prime_acquire(token);
+    if (status != 0) return status;
+    if (lease != NULL) {
+        memset(lease, 0, sizeof(*lease));
+        lease->active = 1;
+        lease->lease_fd = lease_fd;
+        lease->token = token;
+    }
+    return 0;
 }
 
 int drmd_drm_island_prime_release(struct drmd_drm_island *island, uint64_t token)
