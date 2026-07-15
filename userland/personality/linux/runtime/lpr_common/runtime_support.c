@@ -6,7 +6,7 @@ void lpr_destroy_wire_page(int page_fd, void *page);
 int lpr_create_tty_wire_page(void **out_page);
 void lpr_destroy_tty_wire_page(int page_fd, void *page);
 void lpr_linux_process_state_init(void);
-void lpr_linux_pump_tty_signals(void);
+int lpr_linux_pump_tty_signals(void);
 void lpr_linux_raise_sigpipe(void);
 uint64_t lpr_linux_unblockable_signal_mask(void);
 void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id);

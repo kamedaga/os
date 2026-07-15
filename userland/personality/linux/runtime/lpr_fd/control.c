@@ -732,6 +732,7 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
         (void)lpr_control_set_status_flags(fd, desc->flags);
         lpr_tty_fd_t *tty = lpr_fd_tty_payload(fd);
         if (tty != 0) {
+            tty->reserved0 = (uint8_t)desc->offset_or_counter;
             tty->flags = desc->flags;
             tty->handle = desc->handle;
         }
@@ -752,6 +753,7 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
         return 0;
     }
     tty->active = 1;
+    tty->reserved0 = (uint8_t)desc->offset_or_counter;
     tty->flags = desc->flags;
     tty->handle = desc->handle;
     return 1;

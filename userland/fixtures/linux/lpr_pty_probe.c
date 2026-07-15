@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,6 +10,9 @@
 
 #ifndef TIOCSPTLCK
 #define TIOCSPTLCK 0x40045431
+#endif
+#ifndef TIOCGPTN
+#define TIOCGPTN 0x80045430
 #endif
 
 static int fail_errno(const char *label)
@@ -69,14 +73,49 @@ int main(void)
         return 3;
     }
 
+    unsigned int pts_index = UINT_MAX;
+    if (ioctl(master, TIOCGPTN, &pts_index) != 0) {
+        return fail_errno("TIOCGPTN master");
+    }
+    if (pts_index != 0) {
+        fprintf(stderr, "lpr_pty_probe: unexpected pts index %u\n", pts_index);
+        return 17;
+    }
+    printf("lpr_pty_probe: TIOCGPTN index=%u\n", pts_index);
+
+    int second_master = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (second_master < 0) {
+        return fail_errno("open second /dev/ptmx");
+    }
+    unsigned int second_pts_index = UINT_MAX;
+    if (ioctl(second_master, TIOCGPTN, &second_pts_index) != 0) {
+        int saved_errno = errno;
+        close(second_master);
+        errno = saved_errno;
+        return fail_errno("TIOCGPTN second master");
+    }
+    if (second_pts_index != 1u) {
+        fprintf(stderr, "lpr_pty_probe: unexpected second pts index %u\n", second_pts_index);
+        close(second_master);
+        return 18;
+    }
+    printf("lpr_pty_probe: TIOCGPTN secondary index=%u\n", second_pts_index);
+    close(second_master);
+
     int unlock = 0;
     if (ioctl(master, TIOCSPTLCK, &unlock) != 0) {
         return fail_errno("TIOCSPTLCK master");
     }
 
-    int slave = open("/dev/pts/0", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    char slave_path[32];
+    if (snprintf(slave_path, sizeof(slave_path), "/dev/pts/%u", pts_index) >=
+        (int)sizeof(slave_path)) {
+        fprintf(stderr, "lpr_pty_probe: pts path overflow\n");
+        return 19;
+    }
+    int slave = open(slave_path, O_RDWR | O_NOCTTY | O_CLOEXEC);
     if (slave < 0) {
-        return fail_errno("open /dev/pts/0");
+        return fail_errno("open pts slave");
     }
 
     struct pollfd pfd;

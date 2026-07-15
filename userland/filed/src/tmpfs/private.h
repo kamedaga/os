@@ -28,7 +28,11 @@ int filed_tmpfs_name_valid(const char *name);
 uint16_t filed_tmpfs_alloc_page(filed_tmpfs_backend_t *backend);
 filed_tmpfs_page_t *filed_tmpfs_page_by_id(filed_tmpfs_backend_t *backend, uint16_t page_id);
 void filed_tmpfs_free_page(filed_tmpfs_backend_t *backend, uint16_t page_id);
-int filed_tmpfs_note_inode_page(filed_tmpfs_inode_t *inode, uint64_t page_index);
+uint16_t filed_tmpfs_inode_page_id(const filed_tmpfs_inode_t *inode, uint64_t page_index);
+int filed_tmpfs_note_inode_page(
+    filed_tmpfs_inode_t *inode,
+    uint64_t page_index,
+    uint16_t page_id);
 void filed_tmpfs_free_inode_pages(filed_tmpfs_backend_t *backend, filed_tmpfs_inode_t *inode, uint64_t first_page);
 
 filed_tmpfs_inode_t *filed_tmpfs_find_inode(filed_tmpfs_backend_t *backend, uint64_t object_id);

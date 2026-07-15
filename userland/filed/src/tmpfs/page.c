@@ -42,15 +42,34 @@ void filed_tmpfs_free_page(filed_tmpfs_backend_t *backend, uint16_t page_id)
     }
 }
 
-int filed_tmpfs_note_inode_page(filed_tmpfs_inode_t *inode, uint64_t page_index)
+uint16_t filed_tmpfs_inode_page_id(const filed_tmpfs_inode_t *inode, uint64_t page_index)
 {
-    if (inode == NULL || page_index >= FILED_TMPFS_NODE_MAX_PAGES) {
+    if (inode == NULL || page_index >= FILED_TMPFS_MAX_FILE_PAGES) {
         return 0;
     }
-    if (inode->allocated_page_count >= FILED_TMPFS_NODE_MAX_PAGES) {
+    for (uint16_t i = 0; i < inode->allocated_page_count; ++i) {
+        if (inode->allocated_page_indices[i] == page_index) {
+            return inode->allocated_page_ids[i];
+        }
+    }
+    return 0;
+}
+
+int filed_tmpfs_note_inode_page(
+    filed_tmpfs_inode_t *inode,
+    uint64_t page_index,
+    uint16_t page_id)
+{
+    if (inode == NULL ||
+        page_index >= FILED_TMPFS_MAX_FILE_PAGES ||
+        page_id == 0 ||
+        inode->allocated_page_count >= FILED_TMPFS_MAX_ALLOCATED_PAGES)
+    {
         return 0;
     }
-    inode->allocated_page_indices[inode->allocated_page_count++] = (uint16_t)page_index;
+    const uint16_t slot = inode->allocated_page_count++;
+    inode->allocated_page_indices[slot] = (uint32_t)page_index;
+    inode->allocated_page_ids[slot] = page_id;
     return 1;
 }
 
@@ -59,16 +78,16 @@ void filed_tmpfs_free_inode_pages(filed_tmpfs_backend_t *backend, filed_tmpfs_in
     if (inode == NULL) {
         return;
     }
-    if (first_page > FILED_TMPFS_NODE_MAX_PAGES) {
-        first_page = FILED_TMPFS_NODE_MAX_PAGES;
-    }
     uint16_t i = 0;
     while (i < inode->allocated_page_count) {
-        const uint16_t page_index = inode->allocated_page_indices[i];
-        if (page_index >= first_page && page_index < FILED_TMPFS_NODE_MAX_PAGES) {
-            filed_tmpfs_free_page(backend, inode->pages[page_index]);
-            inode->pages[page_index] = 0;
-            inode->allocated_page_indices[i] = inode->allocated_page_indices[--inode->allocated_page_count];
+        const uint32_t page_index = inode->allocated_page_indices[i];
+        if (page_index >= first_page) {
+            filed_tmpfs_free_page(backend, inode->allocated_page_ids[i]);
+            const uint16_t last = --inode->allocated_page_count;
+            inode->allocated_page_indices[i] = inode->allocated_page_indices[last];
+            inode->allocated_page_ids[i] = inode->allocated_page_ids[last];
+            inode->allocated_page_indices[last] = 0;
+            inode->allocated_page_ids[last] = 0;
         } else {
             ++i;
         }

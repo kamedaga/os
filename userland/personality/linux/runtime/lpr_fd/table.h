@@ -66,6 +66,11 @@ typedef struct lpr_tty_fd {
     uint64_t handle;
 } lpr_tty_fd_t;
 
+enum {
+    LPR_TTY_FD_PTY_MASTER = 1u,
+    LPR_TTY_FD_PTY_SLAVE = 2u,
+};
+
 typedef struct lpr_device_fd {
     uint8_t active;
     uint8_t major;

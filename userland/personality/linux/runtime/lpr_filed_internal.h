@@ -62,6 +62,7 @@
 #define LPR_LINUX_F_GET_SEALS 1034ull
 #define LPR_LINUX_F_SEAL_SEAL 0x01u
 #define LPR_LINUX_F_SEAL_SHRINK 0x02u
+#define LPR_LINUX_F_SEAL_GROW 0x04u
 #define LPR_FILED_FD_MEMFD 0x80u
 #define LPR_FILED_FD_ALLOW_SEALING 0x40u
 #define LPR_FILED_FD_SEALS 0x0fu
@@ -83,6 +84,7 @@
 #define LPR_LINUX_TIOCSWINSZ 0x5414ull
 #define LPR_LINUX_FIONREAD 0x541bull
 #define LPR_LINUX_TIOCNOTTY 0x5422ull
+#define LPR_LINUX_TIOCGPTN 0x80045430ull
 #define LPR_LINUX_TIOCSPTLCK 0x40045431ull
 #define LPR_LINUX_UTIME_NOW 1073741823ll
 #define LPR_LINUX_UTIME_OMIT 1073741822ll
@@ -581,7 +583,7 @@ int lpr_create_tty_wire_page(void **out_page);
 void lpr_destroy_tty_wire_page(int page_fd, void *page);
 void lpr_reset_fork_child_rpc_state(void);
 void lpr_linux_process_state_init(void);
-void lpr_linux_pump_tty_signals(void);
+int lpr_linux_pump_tty_signals(void);
 void lpr_linux_raise_sigpipe(void);
 uint64_t lpr_linux_unblockable_signal_mask(void);
 void lpr_fill_termd_caller(uint64_t *session_id, uint64_t *process_id, uint64_t *pgrp_id);
@@ -940,7 +942,7 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code);
 void lpr_socket_prepare_process_exit(void);
 void lpr_linux_process_clear_children(void);
 void lpr_linux_process_state_init(void);
-void lpr_linux_pump_tty_signals(void);
+int lpr_linux_pump_tty_signals(void);
 void lpr_linux_queue_signal(uint32_t sig);
 void lpr_linux_raise_sigpipe(void);
 void lpr_linux_readv_cache_trace_dump(void);

@@ -569,8 +569,32 @@ int64_t lpr_linux_epoll_wait(
             return ready;
         }
 
+        int supervisor_has_children = 0;
+        if (lpr_supervisor_enabled) {
+            lprs_process_state_t state;
+            lpr_memset(&state, 0, sizeof(state));
+            if (lpr_supervisor_get_state(&state) == 0) {
+                supervisor_has_children =
+                    (state.flags & LPRS_PROCESS_STATE_HAS_CHILDREN) != 0;
+                if ((state.flags & LPRS_PROCESS_STATE_SIGCHLD_PENDING) != 0) {
+                    lpr_linux_queue_signal(LPR_LINUX_SIGCHLD);
+                    const int64_t signal_status =
+                        lpr_linux_dispatch_pending_signals();
+                    if (signal_status != 0) {
+                        return signal_status;
+                    }
+                }
+            }
+        }
+
+        int64_t block_ms = remaining_ms;
+        if (supervisor_has_children &&
+            (block_ms < 0 || block_ms > (int64_t)LPR_EPOLL_WAIT_QUANTUM_MS))
+        {
+            block_ms = (int64_t)LPR_EPOLL_WAIT_QUANTUM_MS;
+        }
         uint64_t waited_ms = 0;
-        const int64_t wait_status = lpr_epoll_block(snapshot, count, remaining_ms, &waited_ms);
+        const int64_t wait_status = lpr_epoll_block(snapshot, count, block_ms, &waited_ms);
         lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
         if (wait_status != 0 && wait_status != -LPR_LINUX_EBADF) {
             return wait_status;

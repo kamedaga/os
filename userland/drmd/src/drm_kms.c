@@ -78,6 +78,8 @@ typedef void (*drmd_array_add_fn)(void *, void *);
 
 typedef struct drmd_kms_buffer {
     int active;
+    int cached;
+    int reusable;
     uint64_t token;
     uint32_t resource_id;
     uint32_t width;
@@ -86,6 +88,7 @@ typedef struct drmd_kms_buffer {
     uint32_t handle_refs;
     uint32_t export_refs;
     uint32_t fb_refs;
+    uint64_t export_owner;
     uint64_t size;
     uint64_t mmap_offset;
     int vmo_fd;
@@ -349,11 +352,36 @@ static void destroy_buffer(drmd_kms_buffer_t *buffer)
         if (entered) leave_module(&context);
         pump_device();
     }
+    if (buffer->reusable) {
+        const int vmo_fd = buffer->vmo_fd;
+        void *const mapping = buffer->mapping;
+        const uint64_t dma_addr = buffer->dma_addr;
+        const uint64_t size = buffer->size;
+        if (buffer->object != NULL) kb_kfree(buffer->object);
+        memset(buffer, 0, sizeof(*buffer));
+        buffer->cached = 1;
+        buffer->reusable = 1;
+        buffer->vmo_fd = vmo_fd;
+        buffer->mapping = mapping;
+        buffer->dma_addr = dma_addr;
+        buffer->size = size;
+        return;
+    }
     kb_subsystem_dma_unmap(
         kms.device_backend, NULL, buffer->dma_addr, buffer->size, KB_DMA_TO_DEVICE);
     (void)pacha_munmap(buffer->mapping, buffer->size);
     (void)pacha_fd_close(buffer->vmo_fd);
     if (buffer->object != NULL) kb_kfree(buffer->object);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+static void release_cached_storage(drmd_kms_buffer_t *buffer)
+{
+    if (buffer == NULL || buffer->active || !buffer->cached) return;
+    kb_subsystem_dma_unmap(
+        kms.device_backend, NULL, buffer->dma_addr, buffer->size, KB_DMA_TO_DEVICE);
+    (void)pacha_munmap(buffer->mapping, buffer->size);
+    (void)pacha_fd_close(buffer->vmo_fd);
     memset(buffer, 0, sizeof(*buffer));
 }
 
@@ -447,43 +475,75 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
         return -22;
     }
     const uint64_t pitch = (uint64_t)args->width * 4u;
-    uint64_t size = pitch * args->height;
-    size = (size + 4095u) & ~4095ull;
-    if (size == 0 || size > 256u * 1024u * 1024u) {
+    uint64_t requested_size = pitch * args->height;
+    requested_size = (requested_size + 4095u) & ~4095ull;
+    if (requested_size == 0 || requested_size > 256u * 1024u * 1024u) {
         return -12;
     }
     drmd_kms_buffer_t *buffer = NULL;
     for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
-        if (!kms.buffers[i].active) { buffer = &kms.buffers[i]; break; }
+        drmd_kms_buffer_t *candidate = &kms.buffers[i];
+        if (!candidate->active && candidate->cached && candidate->size >= requested_size &&
+            (buffer == NULL || candidate->size < buffer->size)) {
+            buffer = candidate;
+        }
     }
     if (buffer == NULL) {
-        return -24;
+        for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+            if (!kms.buffers[i].active && !kms.buffers[i].cached) {
+                buffer = &kms.buffers[i];
+                break;
+            }
+        }
     }
+    if (buffer == NULL) {
+        for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+            if (!kms.buffers[i].active && kms.buffers[i].cached) {
+                buffer = &kms.buffers[i];
+                release_cached_storage(buffer);
+                break;
+            }
+        }
+    }
+    if (buffer == NULL) return -24;
+    const int reused_storage = buffer->cached;
+    uint64_t size = reused_storage ? buffer->size : requested_size;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const int vmo_fd = pacha_vmo_create(size, rights, 0);
-    if (vmo_fd < 16) {
-        return -12;
-    }
-    void *mapping = pacha_mmap(vmo_fd, size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
-    if (mapping == NULL) {
-        (void)pacha_fd_close(vmo_fd);
-        return -12;
-    }
-    kb_status_t dma_status = KB_ERR_INVALID;
     kb_device_backend_t *backend = (kb_device_backend_t *)island->device_backend;
-    const uint64_t mapped_dma = kb_subsystem_dma_map(backend, NULL, mapping, size, KB_DMA_TO_DEVICE, &dma_status);
-    if (dma_status != KB_OK || mapped_dma == 0) {
-        (void)pacha_munmap(mapping, size);
-        (void)pacha_fd_close(vmo_fd);
-        return -5;
+    int vmo_fd = reused_storage ? buffer->vmo_fd : -1;
+    void *mapping = reused_storage ? buffer->mapping : NULL;
+    uint64_t mapped_dma = reused_storage ? buffer->dma_addr : 0;
+    if (reused_storage) {
+        memset(mapping, 0, size);
+    } else {
+        vmo_fd = pacha_vmo_create(size, rights, 0);
+        if (vmo_fd < 16) {
+            return -12;
+        }
+        mapping = pacha_mmap(
+            vmo_fd, size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+        if (mapping == NULL) {
+            (void)pacha_fd_close(vmo_fd);
+            return -12;
+        }
+        kb_status_t dma_status = KB_ERR_INVALID;
+        mapped_dma = kb_subsystem_dma_map(
+            backend, NULL, mapping, size, KB_DMA_TO_DEVICE, &dma_status);
+        if (dma_status != KB_OK || mapped_dma == 0) {
+            (void)pacha_munmap(mapping, size);
+            (void)pacha_fd_close(vmo_fd);
+            return -5;
+        }
     }
     void *object = kb_kzalloc(DRMD_VIRTIO_GPU_OBJECT_BYTES, 0);
     if (object == NULL) {
-        kb_subsystem_dma_unmap(backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
-        (void)pacha_munmap(mapping, size);
-        (void)pacha_fd_close(vmo_fd);
+        if (!reused_storage) {
+            kb_subsystem_dma_unmap(backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
+            (void)pacha_munmap(mapping, size);
+            (void)pacha_fd_close(vmo_fd);
+        }
         return -12;
     }
     *(uint32_t *)object = 1;
@@ -516,13 +576,16 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
     pump_device();
     if (status != 0) {
         kb_kfree(object);
-        kb_subsystem_dma_unmap(backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
-        (void)pacha_munmap(mapping, size);
-        (void)pacha_fd_close(vmo_fd);
+        if (!reused_storage) {
+            kb_subsystem_dma_unmap(backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
+            (void)pacha_munmap(mapping, size);
+            (void)pacha_fd_close(vmo_fd);
+        }
         return status;
     }
     memset(buffer, 0, sizeof(*buffer));
     buffer->active = 1;
+    buffer->reusable = 1;
     buffer->resource_id = resource_id;
     buffer->width = args->width;
     buffer->height = args->height;
@@ -534,20 +597,13 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
     buffer->object = object;
     drmd_kms_gem_handle_t *gem = alloc_gem_handle(owner, buffer);
     if (gem == NULL) {
-        buffer->active = 0;
-        drmd_kms_owner_context_t cleanup_context;
-        const int cleanup_entered = enter_module(&cleanup_context);
-        kms.unref_resource(kms.vgdev, object);
-        kms.notify(kms.vgdev);
-        if (cleanup_entered) leave_module(&cleanup_context);
-        pump_device();
-        kb_subsystem_dma_unmap(backend, NULL, mapped_dma, size, KB_DMA_TO_DEVICE);
-        (void)pacha_munmap(mapping, size);
-        (void)pacha_fd_close(vmo_fd);
-        kb_kfree(object);
-        memset(buffer, 0, sizeof(*buffer));
+        destroy_buffer(buffer);
         return -24;
     }
+    printf("[drmd] dumb storage %s bytes=%llu dma=0x%llx\n",
+        reused_storage ? "reuse" : "allocate",
+        (unsigned long long)size,
+        (unsigned long long)mapped_dma);
     buffer->mmap_offset = (uint64_t)gem->handle << 32u;
     args->handle = gem->handle;
     args->pitch = buffer->pitch;
@@ -612,6 +668,7 @@ int drmd_kms_prime_export(
     if (buffer->token == 0) {
         buffer->token = kms.next_token++;
         if (kms.next_token == 0) kms.next_token = 1;
+        buffer->export_owner = owner;
     }
     buffer->export_refs++;
     *out_token = buffer->token;
@@ -653,7 +710,19 @@ int drmd_kms_prime_import_vmo(
     }
     drmd_kms_buffer_t *buffer = NULL;
     for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
-        if (!kms.buffers[i].active) { buffer = &kms.buffers[i]; break; }
+        if (!kms.buffers[i].active && !kms.buffers[i].cached) {
+            buffer = &kms.buffers[i];
+            break;
+        }
+    }
+    if (buffer == NULL) {
+        for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+            if (!kms.buffers[i].active && kms.buffers[i].cached) {
+                buffer = &kms.buffers[i];
+                release_cached_storage(buffer);
+                break;
+            }
+        }
     }
     if (buffer == NULL) return -24;
     void *mapping = pacha_mmap(
@@ -701,6 +770,24 @@ int drmd_kms_prime_release(uint64_t token)
     buffer->export_refs--;
     maybe_destroy_buffer(buffer);
     return 0;
+}
+
+void drmd_kms_handle_orphan(uint64_t handle)
+{
+    for (size_t i = 0; i < DRMD_KMS_BUFFER_MAX; i++) {
+        drmd_kms_buffer_t *buffer = &kms.buffers[i];
+        if (!buffer->active || buffer->export_owner != handle || buffer->export_refs == 0) {
+            continue;
+        }
+        const uint64_t token = buffer->token;
+        const uint32_t refs = buffer->export_refs;
+        buffer->export_refs = 0;
+        printf("[drmd] orphan token reap owner=%llu token=%llu refs=%u\n",
+            (unsigned long long)handle,
+            (unsigned long long)token,
+            refs);
+        maybe_destroy_buffer(buffer);
+    }
 }
 
 static int submit_scanout_fb(drmd_kms_fb_t *fb)

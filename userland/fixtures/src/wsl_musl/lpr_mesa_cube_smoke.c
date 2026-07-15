@@ -392,5 +392,7 @@ int main(int argc, char **argv)
     fflush(stdout);
     sleep(1);
     close(state.fd);
+    printf("P6_PAGE_DIAG_CUBE_EXIT_CALL\n");
+    fflush(stdout);
     _Exit(EXIT_SUCCESS);
 }

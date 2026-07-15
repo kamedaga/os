@@ -20,8 +20,9 @@ enum {
 typedef struct lprs_process {
     uint8_t active;
     uint8_t waited;
-    uint16_t reserved0;
-    uint32_t reserved1;
+    uint8_t exit_notified;
+    uint8_t exit_ready;
+    uint32_t exit_status;
     uint64_t token;
     uint64_t pid;
     uint64_t ppid;
@@ -49,6 +50,7 @@ static uint64_t g_process_count;
 static uint64_t g_process_capacity;
 
 static int lprs_service_one_pending_request(void);
+static void lprs_refresh_exited_children(void);
 
 static int lprs_status_to_errno(long status)
 {
@@ -252,6 +254,51 @@ static void lprs_copy_string(char *dst, uint64_t dst_bytes, const char *src)
     snprintf(dst, (size_t)dst_bytes, "%s", src);
 }
 
+static int lprs_parent_has_unreported_exit(const lprs_process_t *parent)
+{
+    if (parent == NULL || !parent->active) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < g_process_count; ++i) {
+        const lprs_process_t *child = &g_processes[i];
+        if (child->active && child->exit_ready && !child->exit_notified &&
+            child->ppid == parent->pid)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int lprs_parent_has_children(const lprs_process_t *parent)
+{
+    if (parent == NULL || !parent->active) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < g_process_count; ++i) {
+        const lprs_process_t *child = &g_processes[i];
+        if (child->active && !child->waited && child->ppid == parent->pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void lprs_acknowledge_reported_exits(const lprs_process_t *parent)
+{
+    if (parent == NULL || !parent->active) {
+        return;
+    }
+    for (uint64_t i = 0; i < g_process_count; ++i) {
+        lprs_process_t *child = &g_processes[i];
+        if (child->active && child->exit_ready && !child->exit_notified &&
+            child->ppid == parent->pid)
+        {
+            child->exit_notified = 1;
+        }
+    }
+}
+
 static void lprs_write_state(const lprs_process_t *proc, lprs_process_state_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -262,6 +309,12 @@ static void lprs_write_state(const lprs_process_t *proc, lprs_process_state_t *o
     out->pgrp = proc->pgrp;
     out->foreground_pgrp = proc->foreground_pgrp;
     out->cwd_handle = proc->cwd_handle;
+    if (lprs_parent_has_unreported_exit(proc)) {
+        out->flags |= LPRS_PROCESS_STATE_SIGCHLD_PENDING;
+    }
+    if (lprs_parent_has_children(proc)) {
+        out->flags |= LPRS_PROCESS_STATE_HAS_CHILDREN;
+    }
     lprs_copy_string(out->ctty, sizeof(out->ctty), proc->ctty);
     lprs_copy_string(out->cwd, sizeof(out->cwd), proc->cwd);
 }
@@ -296,6 +349,10 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     lprs_copy_string(proc->cwd, sizeof(proc->cwd), req->state.cwd[0] != '\0' ? req->state.cwd : "/");
     lprs_write_state(proc, &req->state);
     *out_token = proc->token;
+    printf("P6_PAGE_DIAG register pid=%llu ppid=%llu token=%llu\n",
+        (unsigned long long)proc->pid,
+        (unsigned long long)proc->ppid,
+        (unsigned long long)proc->token);
     return 0;
 }
 
@@ -312,6 +369,10 @@ static int lprs_register_process_fd_handle(uint64_t token, int process_fd)
         (void)pacha_fd_close(proc->process_fd);
     }
     proc->process_fd = process_fd;
+    printf("P6_PAGE_DIAG register_fd pid=%llu ppid=%llu fd=%d\n",
+        (unsigned long long)proc->pid,
+        (unsigned long long)proc->ppid,
+        process_fd);
     return 0;
 }
 
@@ -325,6 +386,11 @@ static int lprs_get_process_state(uint64_t token, void *page)
         return PACHA_STATUS_ESRCH;
     }
     lprs_write_state(proc, (lprs_process_state_t *)page);
+    if ((((lprs_process_state_t *)page)->flags &
+         LPRS_PROCESS_STATE_SIGCHLD_PENDING) != 0)
+    {
+        lprs_acknowledge_reported_exits(proc);
+    }
     return 0;
 }
 
@@ -446,6 +512,11 @@ static int lprs_find_exited_child(
             continue;
         }
         *out_match_count += 1;
+        if (child->exit_ready) {
+            *out_selected_index = i;
+            *out_exit_code = child->exit_status;
+            return 0;
+        }
         if (child->process_fd < 16) {
             continue;
         }
@@ -520,6 +591,7 @@ static int lprs_wait_for_matching_child(
                 return wait_many_err;
             }
         }
+        lprs_refresh_exited_children();
         if ((pollfds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
             while (lprs_service_one_pending_request() == 0) {
             }
@@ -541,6 +613,10 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     if ((req->options & ~((uint64_t)LPRS_WNOHANG)) != 0) {
         return PACHA_STATUS_EINVAL;
     }
+    printf("P6_PAGE_DIAG wait4_begin parent=%llu requested=%lld options=%llu\n",
+        (unsigned long long)parent->pid,
+        (long long)req->requested_pid,
+        (unsigned long long)req->options);
     uint64_t selected_index = UINT64_MAX;
     uint64_t exit_code = 0;
     const int wait_status = lprs_wait_for_matching_child(
@@ -568,6 +644,10 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     req->exit_code = exit_code;
     req->status = (exit_code & 0xffu) << 8;
     *out_result = LPRS_WAIT4_RESULT_PACK(selected_pid, req->status);
+    printf("P6_PAGE_DIAG wait4_reap parent=%llu child=%llu status=%llu\n",
+        (unsigned long long)parent->pid,
+        (unsigned long long)selected_pid,
+        (unsigned long long)exit_code);
     lprs_process_reap(selected);
     return 0;
 }
@@ -1039,6 +1119,40 @@ static int lprs_service_one_pending_request(void)
     return lprs_handle_received_request(&request);
 }
 
+static void lprs_notify_exited_child(lprs_process_t *child, uint64_t exit_code)
+{
+    if (child == NULL || !child->active || child->exit_ready ||
+        child->process_fd < 16 || child->ppid == 0)
+    {
+        return;
+    }
+    child->exit_status = (uint32_t)(exit_code & 0xffu);
+    child->exit_ready = 1;
+    printf("P6_PAGE_DIAG exit_ready pid=%llu ppid=%llu fd=%d status=%llu\n",
+        (unsigned long long)child->pid,
+        (unsigned long long)child->ppid,
+        child->process_fd,
+        (unsigned long long)(exit_code & 0xffu));
+}
+
+static void lprs_refresh_exited_children(void)
+{
+    for (uint64_t i = 0; i < g_process_count; ++i) {
+        lprs_process_t *child = &g_processes[i];
+        if (!child->active || child->exit_ready ||
+            child->process_fd < 16 || child->ppid == 0)
+        {
+            continue;
+        }
+        uint64_t exit_code = 0;
+        const int status =
+            lprs_try_wait_process_fd(child->process_fd, &exit_code);
+        if (status == 0) {
+            lprs_notify_exited_child(child, exit_code);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -1057,16 +1171,55 @@ int main(int argc, char **argv)
     g_endpoint_fd = (int)(uint32_t)cfg.endpoint_fd;
 
     for (;;) {
-        struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
-        struct pacha_ipc_msg request;
-        memset(fds, 0, sizeof(fds));
-        memset(&request, 0, sizeof(request));
-        request.fds = fds;
-        request.fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS;
-        status = pacha_ipc_recv_wait(g_endpoint_fd, &request, UINT64_MAX);
-        if (status != 0) {
+        struct pacha_pollfd pollfds[LPRS_WAIT_FD_CAPACITY];
+        uint64_t process_indices[LPRS_WAIT_FD_CAPACITY];
+        memset(pollfds, 0, sizeof(pollfds));
+        for (uint64_t i = 0; i < LPRS_WAIT_FD_CAPACITY; ++i) {
+            process_indices[i] = UINT64_MAX;
+        }
+        uint64_t count = 1;
+        pollfds[0] = (struct pacha_pollfd){
+            .fd = g_endpoint_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+        };
+        for (uint64_t i = 0;
+             i < g_process_count && count < LPRS_WAIT_FD_CAPACITY;
+             ++i)
+        {
+            const lprs_process_t *proc = &g_processes[i];
+            if (!proc->active || proc->exit_ready ||
+                proc->process_fd < 16 || proc->ppid == 0)
+            {
+                continue;
+            }
+            pollfds[count] = (struct pacha_pollfd){
+                .fd = proc->process_fd,
+                .events = PACHA_FD_EVENT_READABLE,
+            };
+            process_indices[count] = i;
+            count++;
+        }
+
+        status = (int)pacha_fd_wait_many(pollfds, count, UINT64_MAX);
+        if (status < 0) {
             continue;
         }
-        (void)lprs_handle_received_request(&request);
+        lprs_refresh_exited_children();
+        for (uint64_t i = 1; i < count; ++i) {
+            const uint64_t process_index = process_indices[i];
+            if ((pollfds[i].revents & PACHA_FD_EVENT_READABLE) != 0 &&
+                process_index < g_process_count)
+            {
+                lprs_process_t *child = &g_processes[process_index];
+                uint64_t exit_code = 0;
+                if (lprs_try_wait_process_fd(child->process_fd, &exit_code) == 0) {
+                    lprs_notify_exited_child(child, exit_code);
+                }
+            }
+        }
+        if ((pollfds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
+            while (lprs_service_one_pending_request() == 0) {
+            }
+        }
     }
 }

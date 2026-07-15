@@ -308,19 +308,47 @@ int64_t lpr_linux_dispatch_pending_signals(void)
         const uint64_t bit = lpr_linux_signal_bit(sig);
         lpr_linux_pending_signal_mask &= ~bit;
 
-        const lpr_linux_sigaction_record_t *action = &lpr_linux_sigactions[sig];
-        if (action->handler == LPR_LINUX_SIG_IGN ||
-            (action->handler == LPR_LINUX_SIG_DFL && lpr_linux_default_signal_ignored(sig)))
+        const lpr_linux_sigaction_record_t action = lpr_linux_sigactions[sig];
+        if (action.handler == LPR_LINUX_SIG_IGN ||
+            (action.handler == LPR_LINUX_SIG_DFL && lpr_linux_default_signal_ignored(sig)))
         {
             continue;
         }
-        if (action->handler == LPR_LINUX_SIG_DFL) {
+        if (action.handler == LPR_LINUX_SIG_DFL) {
             if (lpr_linux_default_signal_stops(sig)) {
                 result = -LPR_LINUX_EINTR;
                 break;
             }
             lpr_linux_exit_for_signal(sig);
         }
+
+        const uint64_t old_mask = lpr_linux_signal_mask;
+        lpr_linux_signal_mask |= action.mask;
+        if ((action.flags & LPR_LINUX_SA_NODEFER) == 0) {
+            lpr_linux_signal_mask |= bit;
+        }
+        lpr_linux_signal_mask &= ~lpr_linux_unblockable_signal_mask();
+        if ((action.flags & LPR_LINUX_SA_RESETHAND) != 0) {
+            lpr_linux_sigactions[sig].handler = LPR_LINUX_SIG_DFL;
+        }
+        if ((action.flags & LPR_LINUX_SA_SIGINFO) != 0) {
+            struct {
+                int32_t signo;
+                int32_t error;
+                int32_t code;
+                uint32_t reserved0;
+                uint8_t payload[112];
+            } info;
+            uint8_t context[936] __attribute__((aligned(16)));
+            lpr_memset(&info, 0, sizeof(info));
+            lpr_memset(context, 0, sizeof(context));
+            info.signo = (int32_t)sig;
+            ((void (*)(int, void *, void *))(uintptr_t)action.handler)(
+                (int)sig, &info, context);
+        } else {
+            ((void (*)(int))(uintptr_t)action.handler)((int)sig);
+        }
+        lpr_linux_signal_mask = old_mask;
         result = -LPR_LINUX_EINTR;
         break;
     }
@@ -415,6 +443,14 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
     if (fd < 0) {
         (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
         return fd;
+    }
+    lpr_tty_fd_t *tty = lpr_fd_tty_payload((uint64_t)fd);
+    if (tty != 0) {
+        if (op == TERMD_OP_OPEN_PTMX) {
+            tty->reserved0 = LPR_TTY_FD_PTY_MASTER;
+        } else if (op == TERMD_OP_OPEN_PTS) {
+            tty->reserved0 = LPR_TTY_FD_PTY_SLAVE;
+        }
     }
     return fd;
 }

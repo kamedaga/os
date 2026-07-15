@@ -27,8 +27,8 @@ export M51_CLIENT=/cmd/lpr_wayland_shm_client.elf
 i=1
 while [ "$i" -le "$iterations" ]; do
     # Keep four deterministic forced-exit samples in the configurable run.
-    # Each one also leaves five ownerless drmd handles (Phase 6); more than
-    # five forced exits exhausts DRMD_HANDLE_MAX=32 before the next boot.
+    # The next DRM open must reap each prior client's hung-up drmd handles and
+    # exported buffer references before starting the following compositor.
     case "$i" in
         2|7) mode=term ;;
         4|9) mode=kill ;;

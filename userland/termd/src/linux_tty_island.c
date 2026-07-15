@@ -96,6 +96,7 @@ enum {
     TERMD_LINUX_TIOCGPGRP = 0x540f,
     TERMD_LINUX_TIOCSPGRP = 0x5410,
     TERMD_LINUX_FIONREAD = 0x541b,
+    TERMD_LINUX_TIOCGPTN = 0x80045430,
     TERMD_LINUX_ESRCH = 3,
     TERMD_LINUX_EPOLLIN = 0x0001,
     TERMD_LINUX_EPOLLPRI = 0x0002,
@@ -789,6 +790,36 @@ static void initialize_ptmx_winsize(struct termd_linux_tty_island *island, termd
     }
 }
 
+static int termd_linux_tty_find_pts_index(
+    const termd_linux_tty_handle_t *handle,
+    uint32_t *out_index)
+{
+    if (handle == NULL || out_index == NULL) {
+        return -22;
+    }
+    void *master_tty = handle_file_tty(handle);
+    if (master_tty == NULL) {
+        return -2;
+    }
+    for (uint32_t index = 0; index < TERMD_LINUX_TTY_HANDLE_MAX; index++) {
+        uint8_t path_probe[TERMD_LINUX_FAKE_PATH_BYTES];
+        memset(path_probe, 0, sizeof(path_probe));
+        if (kb_fs_subsystem_path_devpts_index(path_probe, index) != 0) {
+            continue;
+        }
+        void *dentry = read_ptr_field(path_probe, TERMD_LINUX_PATH_DENTRY_OFFSET);
+        void *slave_tty = dentry != NULL ?
+            read_ptr_field(dentry, TERMD_LINUX_DENTRY_FSDATA_OFFSET) : NULL;
+        void *linked_master = slave_tty != NULL ?
+            read_ptr_field(slave_tty, TERMD_LINUX_TTY_LINK_OFFSET) : NULL;
+        if (linked_master == master_tty) {
+            *out_index = index;
+            return 0;
+        }
+    }
+    return -2;
+}
+
 int termd_linux_tty_island_open_ptmx(
     struct termd_linux_tty_island *island,
     uint64_t flags,
@@ -825,11 +856,29 @@ int termd_linux_tty_island_open_ptmx(
         return result;
     }
 
+    result = termd_linux_tty_find_pts_index(handle, &handle->pts_index);
+    if (result != 0) {
+        pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("ptmx_index"), (uint64_t)result);
+        if (handle->release != NULL) {
+            termd_linux_owner_context_t context;
+            int has_context = enter_handle_function_context(handle, handle->release, &context);
+            (void)((termd_linux_fops_release_fn)handle->release)(handle->inode, handle->file);
+            if (has_context) {
+                leave_owner_context(&context);
+            }
+        }
+        memset(handle, 0, sizeof(*handle));
+        return result;
+    }
+
     handle->flags = (uint32_t)flags;
     handle->ref_count = 1;
     initialize_ptmx_winsize(island, handle);
     *out_handle = handle->handle;
-    printf("[termd] linux tty ptmx open ready handle=%llu\n", (unsigned long long)handle->handle);
+    printf(
+        "[termd] linux tty ptmx open ready index=%u handle=%llu\n",
+        (unsigned)handle->pts_index,
+        (unsigned long long)handle->handle);
     return 0;
 }
 
@@ -1182,6 +1231,8 @@ int termd_linux_tty_island_ioctl(
     if (request->request == TERMD_LINUX_TIOCGWINSZ) {
         request->result0 = termd_read_u16(request->data, 0);
         request->result1 = termd_read_u16(request->data, 2);
+    } else if (request->request == TERMD_LINUX_TIOCGPTN) {
+        request->result0 = handle->pts_index;
     } else if (request->request == TERMD_LINUX_TIOCGPGRP ||
         request->request == TERMD_LINUX_FIONREAD)
     {

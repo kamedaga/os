@@ -56,6 +56,13 @@ static void test_create_sparse_truncate_release(void)
     expect_int("stat after write", filed_tmpfs_backend_statx(&tmpfs, file, &stat), 0);
     expect_u64("size after write", stat.size, 6);
     expect_u64("blocks after sparse write", stat.blocks, FILED_TMPFS_PAGE_BYTES / 512u);
+    const uint64_t high_offset = 128u * 1024u * 1024u;
+    expect_int("high sparse write", filed_tmpfs_backend_pwrite(&tmpfs, file, high_offset, "z", 1, &bytes), 0);
+    memset(read_buf, 0xaa, sizeof(read_buf));
+    expect_int("high sparse read", filed_tmpfs_backend_pread(&tmpfs, file, high_offset - 1u, read_buf, 2, &bytes), 0);
+    expect_u64("high sparse read bytes", bytes, 2);
+    expect_bytes("high sparse read data", read_buf, (const unsigned char *)"\0z", 2);
+    expect_int("large sparse truncate", filed_tmpfs_backend_truncate(&tmpfs, file, FILED_TMPFS_MAX_FILE_BYTES), 0);
     expect_int("truncate", filed_tmpfs_backend_truncate(&tmpfs, file, 1), 0);
     memset(&stat, 0, sizeof(stat));
     expect_int("stat after truncate", filed_tmpfs_backend_statx(&tmpfs, file, &stat), 0);

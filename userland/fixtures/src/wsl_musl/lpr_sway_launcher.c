@@ -13,6 +13,15 @@
 static int lifecycle_failed;
 static int wait_with_timeout(pid_t child, int *status, int ticks);
 
+static int client_timeout_seconds(void) {
+    const char *value = getenv("M51_CLIENT_TIMEOUT_SECONDS");
+    if (value == NULL || value[0] == '\0') return 10;
+    char *end = NULL;
+    const long seconds = strtol(value, &end, 10);
+    return end != value && *end == '\0' && seconds > 0 && seconds <= 120 ?
+        (int)seconds : 10;
+}
+
 static const char *runtime_dir(void) {
     const char *runtime = getenv("XDG_RUNTIME_DIR");
     return runtime != NULL && runtime[0] != '\0' ? runtime : "/tmp";
@@ -146,8 +155,24 @@ static int checkpoint_netd_unix_state(const char *iteration) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: lpr_sway_launcher command [args...]\n");
+        fprintf(stderr,
+                "usage: lpr_sway_launcher [--client command [args...] --] "
+                "sway-command [args...]\n");
         return 2;
+    }
+    int sway_arg = 1;
+    char **client_argv = NULL;
+    if (strcmp(argv[1], "--client") == 0) {
+        int delimiter = 2;
+        while (delimiter < argc && strcmp(argv[delimiter], "--") != 0)
+            delimiter++;
+        if (delimiter <= 2 || delimiter + 1 >= argc) {
+            fprintf(stderr, "invalid --client command boundary\n");
+            return 2;
+        }
+        argv[delimiter] = NULL;
+        client_argv = &argv[2];
+        sway_arg = delimiter + 1;
     }
     (void)unlink("/run/seatd.sock");
     (void)setenv("LIBSEAT_BACKEND", "seatd", 1);
@@ -182,7 +207,7 @@ int main(int argc, char **argv) {
         const char *keymap_preload = getenv("M57_WLROOTS_KEYMAP_PRELOAD");
         if (keymap_preload != NULL && keymap_preload[0] != '\0')
             (void)setenv("LD_PRELOAD", keymap_preload, 1);
-        execv(argv[1], &argv[1]);
+        execv(argv[sway_arg], &argv[sway_arg]);
         perror("exec sway");
         _exit(126);
     }
@@ -238,20 +263,27 @@ int main(int argc, char **argv) {
         fflush(stdout);
     }
 
-    const char *client_path = getenv("M51_CLIENT");
+    const char *client_path = client_argv != NULL ? client_argv[0] : getenv("M51_CLIENT");
     if (client_path != NULL && client_path[0] != '\0') {
         sleep(3);
         const pid_t client = fork();
         if (client == 0) {
-            execl(client_path, client_path, (char *)NULL);
+            if (client_argv != NULL)
+                execv(client_path, client_argv);
+            else
+                execl(client_path, client_path, (char *)NULL);
             perror("exec Wayland client");
             _exit(126);
         }
         if (client > 0) {
+            printf("M51_LAUNCHER_CLIENT_PID=%d\n", (int)client);
+            fflush(stdout);
             int client_status = 0;
-            const int client_timeout = wait_with_timeout(client, &client_status, 100);
+            const int timeout_seconds = client_timeout_seconds();
+            const int client_timeout = wait_with_timeout(
+                client, &client_status, timeout_seconds * 10);
             if (client_timeout > 0) {
-                printf("M51_LAUNCHER_CLIENT_TIMEOUT=10\n");
+                printf("M51_LAUNCHER_CLIENT_TIMEOUT=%d\n", timeout_seconds);
                 if (lifecycle) lifecycle_failed = 1;
             } else if (client_timeout == 0 && WIFEXITED(client_status)) {
                 printf("M51_LAUNCHER_CLIENT_EXIT=%d\n", WEXITSTATUS(client_status));

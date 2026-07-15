@@ -125,7 +125,7 @@ enqueue() {
   fi
 }
 
-for package in sway wlroots wayland wayland-protocols libxkbcommon pixman; do
+for package in sway wlroots wayland wayland-protocols wayland-utils foot font-roboto-mono libxkbcommon pixman; do
   enqueue "${package}"
 done
 for ((i=0; i<${#queue[@]}; ++i)); do
@@ -162,6 +162,12 @@ rm -rf \
   "${runtime}"/etc/init.d "${runtime}"/etc/conf.d "${runtime}"/var \
   "${dev}"/.SIGN.* "${dev}"/.PKGINFO "${dev}"/.pre-* "${dev}"/.post-* \
   "${dev}"/etc "${dev}"/var
+
+# APK triggers normally create this cache.  The fixture extracts APKs without
+# running their scripts, so build the target-root cache explicitly while the
+# fontconfig symlinks still have their native representation.
+mkdir -p "${runtime}/var/cache/fontconfig"
+fc-cache --really-force --system-only --sysroot="${runtime}" >/dev/null
 
 python3 - "${runtime}" "${clang_root}" "${mesa_root}" "${input_root}" <<'PY'
 import os
@@ -201,6 +207,9 @@ PY
 for required in \
   usr/bin/sway \
   usr/bin/swaymsg \
+  usr/bin/wayland-info \
+  usr/bin/foot \
+  'usr/share/fonts/roboto-mono/RobotoMono[wght].ttf' \
   usr/lib/libwlroots-0.18.so \
   usr/lib/libwayland-client.so.0 \
   usr/lib/libwayland-server.so.0 \
@@ -212,6 +221,11 @@ for required in \
     exit 1
   fi
 done
+fontconfig_cache="$(find "${runtime}/var/cache/fontconfig" -maxdepth 1 -type f -name '*cache-*' -print -quit)"
+if [[ -z "${fontconfig_cache}" ]]; then
+  echo "missing Sway runtime fontconfig cache" >&2
+  exit 1
+fi
 for required in usr/include/wayland-client.h usr/bin/wayland-scanner usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml; do
   [[ -e "${dev}/${required}" ]] || { echo "missing Sway fixture development /${required}" >&2; exit 1; }
 done

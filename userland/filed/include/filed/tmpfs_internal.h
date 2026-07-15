@@ -32,8 +32,8 @@ typedef struct filed_tmpfs_inode {
     uint32_t nlink;
     filed_vnode_kind_t kind;
     uint16_t allocated_page_count;
-    uint16_t pages[FILED_TMPFS_NODE_MAX_PAGES];
-    uint16_t allocated_page_indices[FILED_TMPFS_NODE_MAX_PAGES];
+    uint16_t allocated_page_ids[FILED_TMPFS_MAX_ALLOCATED_PAGES];
+    uint32_t allocated_page_indices[FILED_TMPFS_MAX_ALLOCATED_PAGES];
 } filed_tmpfs_inode_t;
 
 typedef struct filed_tmpfs_dentry {

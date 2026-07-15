@@ -270,6 +270,7 @@ static void lpr_write_exec_local_fd_desc_unlocked(
         desc->kind = FILED_EXEC_LPR_FD_TTY;
         desc->flags = (file->payload.tty.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;
         desc->handle = file->payload.tty.handle;
+        desc->offset_or_counter = file->payload.tty.reserved0;
     } else if (file->kind == LPR_FD_TABLE_KIND_DRM) {
         desc->kind = FILED_EXEC_LPR_FD_DRM;
         desc->flags = (file->payload.drm.flags & LPR_LINUX_O_ACCMODE) | status_flags | fd_flags;

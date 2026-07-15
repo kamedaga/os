@@ -145,13 +145,25 @@ int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
         return -LPR_LINUX_EINVAL;
     }
     const uint8_t memfd_state = lpr_fd_filed_payload(fd)->reserved1;
-    if ((memfd_state & (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_SHRINK)) ==
-        (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_SHRINK)) {
+    if ((memfd_state & LPR_FILED_FD_MEMFD) != 0 &&
+        (memfd_state & (LPR_LINUX_F_SEAL_SHRINK | LPR_LINUX_F_SEAL_GROW)) != 0)
+    {
         lpr_linux_stat_t st;
         lpr_memset(&st, 0, sizeof(st));
         const int64_t stat_status = lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&st);
         if (stat_status != 0) return stat_status;
-        if (st.st_size >= 0 && length < (uint64_t)st.st_size) return -LPR_LINUX_EPERM;
+        if (st.st_size >= 0) {
+            if ((memfd_state & LPR_LINUX_F_SEAL_SHRINK) != 0 &&
+                length < (uint64_t)st.st_size)
+            {
+                return -LPR_LINUX_EPERM;
+            }
+            if ((memfd_state & LPR_LINUX_F_SEAL_GROW) != 0 &&
+                length > (uint64_t)st.st_size)
+            {
+                return -LPR_LINUX_EPERM;
+            }
+        }
     }
     void *page = 0;
     const int page_fd = lpr_create_wire_page(&page);

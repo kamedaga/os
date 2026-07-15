@@ -15,7 +15,7 @@ else
     exit 1
 fi
 
-(LIBGL_DEBUG=verbose EGL_LOG_LEVEL=warning busybox timeout -s KILL 90 /cmd/lpr_mesa_cube_smoke.elf "$frames" 2>&1; printf '%s\n' "$?" >"$status_file") | busybox tee "$result"
+(LIBGL_DEBUG=verbose EGL_LOG_LEVEL=warning busybox timeout -s KILL 15 /cmd/lpr_mesa_cube_smoke.elf "$frames" 2>&1; printf '%s\n' "$?" >"$status_file") | busybox tee "$result"
 status=$(busybox cat "$status_file")
 if [ "$status" -eq 0 ] && busybox grep -q '^CUBE_ANIMATION_PASS ' "$result"; then
     rm -f "$result" "$status_file"

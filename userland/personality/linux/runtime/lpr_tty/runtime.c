@@ -96,6 +96,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
 
     const uint32_t wait_events =
         op == TERMD_OP_HANDLE_WRITE ? TERMD_POLLOUT : TERMD_POLLIN;
+    const uint8_t tty_type = lpr_fd_tty_payload(fd)->reserved0;
     for (;;) {
         void *page = 0;
         const int page_fd = lpr_create_tty_wire_page(&page);
@@ -121,8 +122,19 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
             return (int64_t)result;
         }
         if (status == -LPR_LINUX_EINTR) {
-            lpr_linux_pump_tty_signals();
-            return status;
+            const int interrupted = lpr_linux_pump_tty_signals();
+            if (op == TERMD_OP_HANDLE_READ &&
+                tty_type == LPR_TTY_FD_PTY_MASTER)
+            {
+                continue;
+            }
+            if (interrupted ||
+                (op == TERMD_OP_HANDLE_READ &&
+                 tty_type == LPR_TTY_FD_PTY_SLAVE))
+            {
+                return status;
+            }
+            continue;
         }
         if (status != -LPR_LINUX_EAGAIN ||
             (lpr_fd_tty_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
@@ -141,6 +153,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     if (!lpr_linux_tty_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
+    request = (uint32_t)request;
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
@@ -212,6 +225,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             *(uint16_t *)((uintptr_t)arg + 6u) = 0;
             break;
         case LPR_LINUX_TIOCGPGRP:
+        case LPR_LINUX_TIOCGPTN:
         case LPR_LINUX_FIONREAD:
             if (arg == 0) {
                 lpr_destroy_tty_wire_page(page_fd, page);
@@ -371,13 +385,29 @@ int lpr_linux_signal_pgrp(int32_t pgrp, uint32_t signo)
     return delivered ? 0 : -LPR_LINUX_ESRCH;
 }
 
-void lpr_linux_pump_tty_signals(void)
+static int lpr_linux_tty_signal_interrupts_current(int32_t pgrp, uint32_t signo)
+{
+    if (pgrp != lpr_linux_current_pgrp) {
+        return 0;
+    }
+    const uint64_t bit = lpr_linux_signal_bit(signo);
+    if (bit == 0 || (lpr_linux_signal_mask & bit) != 0) {
+        return 0;
+    }
+    const lpr_linux_sigaction_record_t *action = &lpr_linux_sigactions[signo];
+    return action->handler != LPR_LINUX_SIG_IGN &&
+        !(action->handler == LPR_LINUX_SIG_DFL &&
+          lpr_linux_default_signal_ignored(signo));
+}
+
+int lpr_linux_pump_tty_signals(void)
 {
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
-        return;
+        return 0;
     }
+    int interrupted = 0;
     for (uint64_t i = 0; i < 8u; i++) {
         termd_signal_request_t *signal_req = (termd_signal_request_t *)lpr_termd_payload(page);
         lpr_memset(signal_req, 0, sizeof(*signal_req));
@@ -387,10 +417,16 @@ void lpr_linux_pump_tty_signals(void)
         if (status != 0 || result == 0 || signal_req->signo == 0) {
             break;
         }
+        if (lpr_linux_tty_signal_interrupts_current(
+                (int32_t)signal_req->pgrp_id, signal_req->signo))
+        {
+            interrupted = 1;
+        }
         (void)lpr_linux_signal_pgrp((int32_t)signal_req->pgrp_id, signal_req->signo);
         (void)lpr_linux_dispatch_pending_signals();
     }
     lpr_destroy_tty_wire_page(page_fd, page);
+    return interrupted;
 }
 
 uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)

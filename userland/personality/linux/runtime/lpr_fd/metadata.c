@@ -792,7 +792,9 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case LPR_LINUX_F_ADD_SEALS: {
         lpr_filed_fd_t *file = lpr_fd_filed_payload(fd);
         if ((file->reserved1 & LPR_FILED_FD_MEMFD) == 0 ||
-            (arg & ~(uint64_t)(LPR_LINUX_F_SEAL_SEAL | LPR_LINUX_F_SEAL_SHRINK)) != 0) {
+            (arg & ~(uint64_t)(LPR_LINUX_F_SEAL_SEAL |
+                LPR_LINUX_F_SEAL_SHRINK |
+                LPR_LINUX_F_SEAL_GROW)) != 0) {
             return -LPR_LINUX_EINVAL;
         }
         if ((file->reserved1 & LPR_FILED_FD_ALLOW_SEALING) == 0 ||

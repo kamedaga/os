@@ -256,6 +256,24 @@ int drmd_drm_island_open(
         !island->ready || request->card_index != 0 || notify_fd < 16) {
         return -19;
     }
+    for (size_t i = 0; i < DRMD_HANDLE_MAX; i++) {
+        drmd_handle_t *existing = &handles[i];
+        if (!existing->active || existing->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = existing->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+
+        const uint64_t orphan_id = existing->id;
+        const uint32_t orphan_refs = existing->refs;
+        drmd_kms_handle_orphan(orphan_id);
+        existing->refs = 1;
+        const int close_status = drmd_drm_island_close(island, orphan_id);
+        printf("[drmd] orphan reap handle=%llu refs=%u status=%d\n",
+            (unsigned long long)orphan_id, orphan_refs, close_status);
+    }
     const uint64_t dev = kb_linux_kernel_encode_dev(DRMD_DRM_MAJOR, DRMD_DRM_CARD0_MINOR);
     const kb_cdev_record_t *record = kb_linux_kernel_find_active_cdev(dev);
     if (record == NULL || !record->has_fops_view || record->fops_view.open == NULL) {

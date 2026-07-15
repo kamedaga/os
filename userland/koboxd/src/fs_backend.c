@@ -80,6 +80,7 @@ enum {
     KOBOXD_INODE_RWSEM_OFFSET = 0x98,
     KOBOXD_INODE_RWSEM_HELD = 1,
     KOBOXD_INODE_BLOCKS_OFFSET = 0x88,
+    KOBOXD_INODE_IO_LIST_OFFSET = 0xe0,
     KOBOXD_INODE_RDEV_OFFSET = 0x4c,
     KOBOXD_SUPER_BLOCK_FS_INFO_OFFSET = 0x380,
     KOBOXD_EXT4_SBI_CLUSTER_BITS_OFFSET = 0x54,
@@ -91,6 +92,8 @@ enum {
     KOBOXD_INODE_EXT4_DISKSIZE_BACK_OFFSET = 0x30,
     KOBOXD_INODE_EXT4_DATA_SEM_BACK_OFFSET = 0x28,
     KOBOXD_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET = 0x128,
+    KOBOXD_INODE_EXT4_FC_LIST_BACK_OFFSET = 0x88,
+    KOBOXD_INODE_EXT4_FC_DILIST_BACK_OFFSET = 0x98,
     KOBOXD_FILE_PATH_DENTRY_OFFSET = 0x18,
     KOBOXD_FILE_MAPPING_OFFSET = 0x20,
     KOBOXD_FILE_INODE_OFFSET = 0x28,
@@ -253,6 +256,30 @@ static uint32_t read_u32_field(const void *base, size_t offset)
     return value;
 }
 
+static void fs_init_list_head_if_zero(void *head)
+{
+    if (head == NULL) {
+        return;
+    }
+    if (read_pointer_field(head, 0) == NULL &&
+        read_pointer_field(head, sizeof(void *)) == NULL)
+    {
+        write_pointer_field(head, 0, head);
+        write_pointer_field(head, sizeof(void *), head);
+    }
+}
+
+static void fs_prepare_fake_inode_lists(void *inode)
+{
+    if (inode == NULL) {
+        return;
+    }
+    /* The fake inode path bypasses inode_init_once() and ext4_fc_init_inode(). */
+    fs_init_list_head_if_zero((uint8_t *)inode + KOBOXD_INODE_IO_LIST_OFFSET);
+    fs_init_list_head_if_zero((uint8_t *)inode - KOBOXD_INODE_EXT4_FC_LIST_BACK_OFFSET);
+    fs_init_list_head_if_zero((uint8_t *)inode - KOBOXD_INODE_EXT4_FC_DILIST_BACK_OFFSET);
+}
+
 static uint32_t fs_encode_linux_dev(uint32_t kernel_dev)
 {
     const uint32_t major = kernel_dev >> 20u;
@@ -301,6 +328,7 @@ static void fill_object_from_inode(
     if (object == NULL) {
         return;
     }
+    fs_prepare_fake_inode_lists(inode);
     memset(object, 0, sizeof(*object));
     object->object_id = object_id;
     object->parent_object_id = parent_object_id;

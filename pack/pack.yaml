@@ -168,6 +168,21 @@ apps:
       path: "tests/fixtures/sway_first_frame.sh"
     out: "SWAYM55.SH"
     rootfs: "/cmd/sway_first_frame.sh"
+  sway_wayland_info_probe_script:
+    file:
+      path: "tests/fixtures/sway_wayland_info_probe.sh"
+    out: "SWAYWLI.SH"
+    rootfs: "/cmd/sway_wayland_info_probe.sh"
+  sway_foot_probe_script:
+    file:
+      path: "tests/fixtures/sway_foot_probe.sh"
+    out: "SWAYFOOT.SH"
+    rootfs: "/cmd/sway_foot_probe.sh"
+  sway_foot_watch_script:
+    file:
+      path: "tests/fixtures/sway_foot_watch.sh"
+    out: "SWAYFTWA.SH"
+    rootfs: "/cmd/sway_foot_watch.sh"
   sway_shm_client_script:
     file:
       path: "tests/fixtures/sway_shm_client.sh"
