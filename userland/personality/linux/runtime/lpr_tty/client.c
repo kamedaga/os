@@ -162,14 +162,14 @@ int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags)
     }
     const int control_status = lpr_control_install_fd(
         (uint64_t)fd,
-        LPR_FD_TABLE_KIND_TTY,
+        LPR_FD_OPS_TTY,
         flags,
         handle,
         0);
     if (control_status != 0) {
         return control_status;
     }
-    lpr_tty_fd_t *tty = lpr_fd_tty_payload((uint64_t)fd);
+    lpr_tty_backend_t *tty = lpr_tty_backend((uint64_t)fd);
     if (tty == 0) {
         lpr_control_close_fd((uint64_t)fd);
         return -LPR_LINUX_EIO;
@@ -444,12 +444,12 @@ int64_t lpr_tty_open_path(const char *path, uint64_t flags)
         (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
         return fd;
     }
-    lpr_tty_fd_t *tty = lpr_fd_tty_payload((uint64_t)fd);
+    lpr_tty_backend_t *tty = lpr_tty_backend((uint64_t)fd);
     if (tty != 0) {
         if (op == TERMD_OP_OPEN_PTMX) {
-            tty->reserved0 = LPR_TTY_FD_PTY_MASTER;
+            tty->reserved0 = LPR_TTY_BACKEND_PTY_MASTER;
         } else if (op == TERMD_OP_OPEN_PTS) {
-            tty->reserved0 = LPR_TTY_FD_PTY_SLAVE;
+            tty->reserved0 = LPR_TTY_BACKEND_PTY_SLAVE;
         }
     }
     return fd;

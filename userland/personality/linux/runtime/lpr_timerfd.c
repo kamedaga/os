@@ -32,7 +32,7 @@ static void lpr_timerfd_from_ns(uint64_t ns, int64_t *sec, int64_t *nsec)
     *nsec = (int64_t)(ns % 1000000000ull);
 }
 
-static int64_t lpr_timerfd_now_ns(const lpr_event_fd_t *timer, uint64_t *out)
+static int64_t lpr_timerfd_now_ns(const lpr_event_backend_t *timer, uint64_t *out)
 {
     struct pachaos_timespec now;
     const int64_t status = lpr_pacha_clock_gettime((uint64_t)(uint32_t)timer->clock_id, &now);
@@ -46,7 +46,7 @@ static int64_t lpr_timerfd_now_ns(const lpr_event_fd_t *timer, uint64_t *out)
     return 0;
 }
 
-static int64_t lpr_timerfd_update(lpr_event_fd_t *timer, uint64_t *out_now)
+static int64_t lpr_timerfd_update(lpr_event_backend_t *timer, uint64_t *out_now)
 {
     uint64_t now = 0;
     const int64_t status = lpr_timerfd_now_ns(timer, &now);
@@ -75,8 +75,8 @@ static int64_t lpr_timerfd_update(lpr_event_fd_t *timer, uint64_t *out_now)
 
 int lpr_linux_timerfd_active(uint64_t fd)
 {
-    const lpr_event_fd_t *event = lpr_fd_event_payload(fd);
-    return event != 0 && event->active && event->subtype == LPR_EVENT_FD_TIMERFD;
+    const lpr_event_backend_t *event = lpr_event_backend(fd);
+    return event != 0 && event->active && event->subtype == LPR_EVENT_BACKEND_TIMERFD;
 }
 
 int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
@@ -93,20 +93,20 @@ int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
     }
     const int status = lpr_control_install_fd(
         (uint64_t)(uint32_t)fd,
-        LPR_FD_TABLE_KIND_EVENT,
+        LPR_FD_OPS_EVENT,
         flags,
         (uint64_t)(uint32_t)fd,
         0);
     if (status != 0) {
         return status;
     }
-    lpr_event_fd_t *timer = lpr_fd_event_payload((uint64_t)(uint32_t)fd);
+    lpr_event_backend_t *timer = lpr_event_backend((uint64_t)(uint32_t)fd);
     if (timer == 0) {
         lpr_control_close_fd((uint64_t)(uint32_t)fd);
         return -LPR_LINUX_EIO;
     }
     timer->active = 1;
-    timer->subtype = LPR_EVENT_FD_TIMERFD;
+    timer->subtype = LPR_EVENT_BACKEND_TIMERFD;
     timer->flags = (uint32_t)flags;
     timer->clock_id = (int32_t)clock_id;
     return fd;
@@ -120,7 +120,7 @@ int64_t lpr_linux_timerfd_gettime(uint64_t fd, uint64_t current_value_raw)
     if (current_value_raw == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    lpr_event_fd_t *timer = lpr_fd_event_payload(fd);
+    lpr_event_backend_t *timer = lpr_event_backend(fd);
     uint64_t now = 0;
     const int64_t status = lpr_timerfd_update(timer, &now);
     if (status != 0) {
@@ -165,7 +165,7 @@ int64_t lpr_linux_timerfd_settime(
     {
         return -LPR_LINUX_EINVAL;
     }
-    lpr_event_fd_t *timer = lpr_fd_event_payload(fd);
+    lpr_event_backend_t *timer = lpr_event_backend(fd);
     timer->counter = 0;
     timer->interval_ns = interval_ns;
     timer->deadline_ns = 0;
@@ -196,7 +196,7 @@ int64_t lpr_linux_timerfd_read(uint64_t fd, uint64_t buf, uint64_t count)
     if (buf == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    lpr_event_fd_t *timer = lpr_fd_event_payload(fd);
+    lpr_event_backend_t *timer = lpr_event_backend(fd);
     for (;;) {
         const int64_t status = lpr_timerfd_update(timer, 0);
         if (status != 0) {
@@ -223,7 +223,7 @@ uint32_t lpr_linux_timerfd_poll_events(uint64_t fd, uint32_t events)
     if (!lpr_linux_timerfd_active(fd)) {
         return 0;
     }
-    lpr_event_fd_t *timer = lpr_fd_event_payload(fd);
+    lpr_event_backend_t *timer = lpr_event_backend(fd);
     if (lpr_timerfd_update(timer, 0) != 0) {
         return 0x0008u;
     }

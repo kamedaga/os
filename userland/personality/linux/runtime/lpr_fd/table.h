@@ -3,25 +3,39 @@
 #include <stdint.h>
 
 enum {
-    LPR_FD_TABLE_KIND_EMPTY = 0u,
-    LPR_FD_TABLE_KIND_FILED = 1u,
-    LPR_FD_TABLE_KIND_DEVICE = 2u,
-    LPR_FD_TABLE_KIND_TTY = 3u,
-    LPR_FD_TABLE_KIND_DRM = 4u,
-    LPR_FD_TABLE_KIND_INPUT = 5u,
-    LPR_FD_TABLE_KIND_PIPE = 6u,
-    LPR_FD_TABLE_KIND_EVENT = 7u,
-    LPR_FD_TABLE_KIND_SOCKET = 8u,
-    LPR_FD_TABLE_KIND_EPOLL = 9u,
-    LPR_FD_TABLE_KIND_DMABUF = 10u,
+    LPR_FD_OPS_NONE = 0u,
+    LPR_FD_OPS_FILED = 1u,
+    LPR_FD_OPS_DEVICE = 2u,
+    LPR_FD_OPS_TTY = 3u,
+    LPR_FD_OPS_DRM = 4u,
+    LPR_FD_OPS_INPUT = 5u,
+    LPR_FD_OPS_PIPE = 6u,
+    LPR_FD_OPS_EVENT = 7u,
+    LPR_FD_OPS_SOCKET = 8u,
+    LPR_FD_OPS_EPOLL = 9u,
+    LPR_FD_OPS_DMABUF = 10u,
+    LPR_FD_OPS_COUNT = 11u,
 
-    LPR_FD_TABLE_FD_CLOEXEC = 1u << 0,
+    LPR_FD_ENTRY_CLOEXEC = 1u << 0,
 
-    LPR_FD_TABLE_STATUS_NONBLOCK = 1u << 0,
-    LPR_FD_TABLE_STATUS_APPEND = 1u << 1,
+    LPR_OFD_NONBLOCK = 1u << 0,
+    LPR_OFD_APPEND = 1u << 1,
+
+    LPR_FD_RIGHT_READ = 1u << 0,
+    LPR_FD_RIGHT_WRITE = 1u << 1,
+    LPR_FD_RIGHT_IOCTL = 1u << 2,
+    LPR_FD_RIGHT_STAT = 1u << 3,
+    LPR_FD_RIGHT_MMAP = 1u << 4,
+    LPR_FD_RIGHT_DUP = 1u << 5,
 };
 
-typedef struct lpr_filed_fd {
+typedef uint32_t lpr_linux_fd_t;
+
+typedef struct lpr_native_fd {
+    int32_t raw;
+} lpr_native_fd_t;
+
+typedef struct lpr_filed_backend {
     uint8_t active;
     uint8_t offset_valid;
     uint8_t pread_active;
@@ -29,9 +43,9 @@ typedef struct lpr_filed_fd {
     uint32_t flags;
     uint64_t handle;
     uint64_t offset;
-} lpr_filed_fd_t;
+} lpr_filed_backend_t;
 
-typedef struct lpr_pipe_fd {
+typedef struct lpr_pipe_backend {
     uint8_t active;
     uint8_t pipe_id;
     uint8_t readable;
@@ -39,9 +53,11 @@ typedef struct lpr_pipe_fd {
     uint32_t flags;
     uint64_t last_wait_events;
     uint64_t last_wait_result;
-} lpr_pipe_fd_t;
+    lpr_native_fd_t native;
+    uint32_t reserved0;
+} lpr_pipe_backend_t;
 
-typedef struct lpr_event_fd {
+typedef struct lpr_event_backend {
     uint8_t active;
     uint8_t subtype;
     uint16_t reserved1;
@@ -51,64 +67,66 @@ typedef struct lpr_event_fd {
     uint64_t interval_ns;
     int32_t clock_id;
     uint32_t reserved2;
-} lpr_event_fd_t;
+} lpr_event_backend_t;
 
 enum {
-    LPR_EVENT_FD_EVENTFD = 0u,
-    LPR_EVENT_FD_TIMERFD = 1u,
+    LPR_EVENT_BACKEND_EVENTFD = 0u,
+    LPR_EVENT_BACKEND_TIMERFD = 1u,
 };
 
-typedef struct lpr_tty_fd {
+typedef struct lpr_tty_backend {
     uint8_t active;
     uint8_t reserved0;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
-} lpr_tty_fd_t;
+} lpr_tty_backend_t;
 
 enum {
-    LPR_TTY_FD_PTY_MASTER = 1u,
-    LPR_TTY_FD_PTY_SLAVE = 2u,
+    LPR_TTY_BACKEND_PTY_MASTER = 1u,
+    LPR_TTY_BACKEND_PTY_SLAVE = 2u,
 };
 
-typedef struct lpr_device_fd {
+typedef struct lpr_device_backend {
     uint8_t active;
     uint8_t major;
     uint8_t minor;
     uint8_t reserved0;
     uint32_t flags;
-} lpr_device_fd_t;
+} lpr_device_backend_t;
 
-typedef struct lpr_drm_fd {
+typedef struct lpr_drm_backend {
     uint8_t active;
     uint8_t reserved0;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
-    int32_t native_wait_fd;
+    lpr_native_fd_t wait_fd;
     uint32_t reserved2;
-} lpr_drm_fd_t;
+} lpr_drm_backend_t;
 
-typedef struct lpr_input_fd {
+typedef struct lpr_input_backend {
     uint8_t active;
     uint8_t reserved0;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
-    int32_t native_wait_fd;
+    lpr_native_fd_t wait_fd;
     uint32_t reserved2;
-} lpr_input_fd_t;
+} lpr_input_backend_t;
 
-typedef struct lpr_dmabuf_fd {
+typedef struct lpr_dmabuf_backend {
     uint8_t active;
     uint8_t writable;
     uint16_t reserved0;
     uint32_t flags;
     uint64_t token;
     uint64_t size;
-} lpr_dmabuf_fd_t;
+    lpr_native_fd_t native;
+    uint32_t reserved1;
+} lpr_dmabuf_backend_t;
 
-typedef struct lpr_socket_fd {
+typedef struct lpr_socket_backend {
     uint8_t active;
     uint8_t type;
     uint8_t cloexec;
@@ -135,68 +153,55 @@ typedef struct lpr_socket_fd {
     int32_t peer_pid;
     uint32_t peer_uid;
     uint32_t peer_gid;
-    int32_t native_wait_fd;
+    lpr_native_fd_t wait_fd;
     uint32_t reserved2;
-} lpr_socket_fd_t;
+} lpr_socket_backend_t;
 
-typedef struct lpr_epoll_fd {
+typedef struct lpr_epoll_backend {
     uint8_t active;
     uint8_t reserved0;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t instance;
     uint64_t map_bytes;
-} lpr_epoll_fd_t;
+} lpr_epoll_backend_t;
 
-typedef enum lpr_fd_kind {
-    LPR_FD_NONE = LPR_FD_TABLE_KIND_EMPTY,
-    LPR_FD_FILED = LPR_FD_TABLE_KIND_FILED,
-    LPR_FD_DEVICE = LPR_FD_TABLE_KIND_DEVICE,
-    LPR_FD_TTY = LPR_FD_TABLE_KIND_TTY,
-    LPR_FD_DRM = LPR_FD_TABLE_KIND_DRM,
-    LPR_FD_INPUT = LPR_FD_TABLE_KIND_INPUT,
-    LPR_FD_PIPE = LPR_FD_TABLE_KIND_PIPE,
-    LPR_FD_EVENTFD = LPR_FD_TABLE_KIND_EVENT,
-    LPR_FD_SOCKET = LPR_FD_TABLE_KIND_SOCKET,
-    LPR_FD_EPOLL = LPR_FD_TABLE_KIND_EPOLL,
-    LPR_FD_DMABUF = LPR_FD_TABLE_KIND_DMABUF,
-} lpr_fd_kind_t;
+typedef struct lpr_backend_ref {
+    uint32_t index;
+    uint32_t generation;
+} lpr_backend_ref_t;
 
-typedef union lpr_fd_payload {
-    lpr_filed_fd_t filed;
-    lpr_device_fd_t device;
-    lpr_pipe_fd_t pipe;
-    lpr_event_fd_t eventfd;
-    lpr_tty_fd_t tty;
-    lpr_drm_fd_t drm;
-    lpr_input_fd_t input;
-    lpr_socket_fd_t socket;
-    lpr_epoll_fd_t epoll;
-    lpr_dmabuf_fd_t dmabuf;
-} lpr_fd_payload_t;
-
-typedef struct lpr_fd_table_entry {
+typedef struct lpr_linux_fd_entry {
     uint8_t active;
     uint8_t reserved0;
     uint16_t fd_flags;
-    uint32_t file_index;
+    uint32_t ofd_index;
+    uint32_t ofd_generation;
+    uint32_t effective_rights;
 } lpr_fd_entry_t;
 
-typedef struct lpr_fd_table_object {
+typedef struct lpr_ofd {
     uint8_t active;
-    uint8_t kind;
-    uint16_t reserved0;
+    uint8_t closing;
+    uint16_t access_mode;
     uint32_t refcount;
+    uint32_t pin_count;
     uint32_t status_flags;
-    uint32_t rights;
-    uint64_t backend_id;
+    uint32_t rights_ceiling;
+    uint32_t generation;
+    uint32_t reserved0;
     uint64_t offset;
-    uint64_t generation;
-    lpr_fd_payload_t payload;
-} lpr_fd_object_t;
+    lpr_backend_ref_t backend;
+} lpr_ofd_t;
 
-typedef lpr_fd_entry_t lpr_fd_table_slot_t;
-typedef lpr_fd_object_t lpr_fd_table_file_t;
+typedef struct lpr_backend_record {
+    uint8_t active;
+    uint8_t ops_id;
+    uint16_t reserved0;
+    uint32_t generation;
+    uint64_t state_bytes;
+    void *state;
+} lpr_backend_record_t;
 
 typedef void (*lpr_futex_wait_fn)(volatile uint32_t *word, uint32_t expected);
 typedef void (*lpr_futex_wake_fn)(volatile uint32_t *word, uint32_t count);
@@ -209,30 +214,60 @@ typedef struct lpr_lock {
 } lpr_lock_t;
 
 typedef struct lpr_fd_table {
-    lpr_fd_entry_t *slots;
-    uint32_t slot_count;
-    lpr_fd_object_t *files;
-    uint32_t file_count;
-    uint64_t generation;
+    lpr_fd_entry_t *entries;
+    uint32_t entry_count;
+    lpr_ofd_t *ofds;
+    uint32_t ofd_count;
+    lpr_backend_record_t *backends;
+    uint32_t backend_count;
+    uint32_t generation;
     lpr_lock_t lock;
 } lpr_fd_table_t;
 
-typedef struct lpr_fd_table_install {
-    uint8_t kind;
+typedef struct lpr_fd_install {
+    uint8_t ops_id;
     uint16_t fd_flags;
+    uint16_t access_mode;
     uint32_t status_flags;
     uint32_t rights;
-    uint64_t backend_id;
     uint64_t offset;
-} lpr_fd_table_install_t;
+    void *backend_state;
+    uint64_t backend_state_bytes;
+} lpr_fd_install_t;
+
+typedef struct lpr_fd_pin {
+    lpr_linux_fd_t fd;
+    uint16_t fd_flags;
+    uint16_t access_mode;
+    uint32_t effective_rights;
+    uint32_t status_flags;
+    uint32_t ofd_index;
+    uint32_t ofd_generation;
+    uint32_t backend_index;
+    uint32_t backend_generation;
+    uint8_t ops_id;
+    uint8_t reserved0[7];
+    uint64_t offset;
+    void *state;
+} lpr_fd_pin_t;
+
+typedef struct lpr_fd_drop {
+    uint8_t ready;
+    uint8_t ops_id;
+    uint16_t reserved0;
+    uint32_t backend_generation;
+    uint64_t state_bytes;
+    void *state;
+} lpr_fd_drop_t;
 
 void lpr_fd_table_init(
     lpr_fd_table_t *table,
-    lpr_fd_table_slot_t *slots,
-    uint32_t slot_count,
-    lpr_fd_table_file_t *files,
-    uint32_t file_count);
-
+    lpr_fd_entry_t *entries,
+    uint32_t entry_count,
+    lpr_ofd_t *ofds,
+    uint32_t ofd_count,
+    lpr_backend_record_t *backends,
+    uint32_t backend_count);
 void lpr_fd_table_configure_lock(
     lpr_fd_table_t *table,
     const volatile uint32_t *thread_count,
@@ -243,46 +278,43 @@ void lpr_fd_table_unlock(lpr_fd_table_t *table);
 
 int lpr_fd_table_install_at(
     lpr_fd_table_t *table,
-    uint32_t fd,
-    const lpr_fd_table_install_t *install);
-
+    lpr_linux_fd_t fd,
+    const lpr_fd_install_t *install);
 int lpr_fd_table_alloc(
     lpr_fd_table_t *table,
-    uint32_t min_fd,
-    const lpr_fd_table_install_t *install,
-    uint32_t *out_fd);
-
-int lpr_fd_table_close(lpr_fd_table_t *table, uint32_t fd);
-
+    lpr_linux_fd_t min_fd,
+    const lpr_fd_install_t *install,
+    lpr_linux_fd_t *out_fd);
+int lpr_fd_table_close(
+    lpr_fd_table_t *table,
+    lpr_linux_fd_t fd,
+    lpr_fd_drop_t *out_drop);
 int lpr_fd_table_dup(
     lpr_fd_table_t *table,
-    uint32_t old_fd,
-    uint32_t min_fd,
+    lpr_linux_fd_t old_fd,
+    lpr_linux_fd_t min_fd,
     uint16_t new_fd_flags,
-    uint32_t *out_fd);
-
-int lpr_fd_table_dup2(
+    lpr_linux_fd_t *out_fd);
+int lpr_fd_table_dup_at(
     lpr_fd_table_t *table,
-    uint32_t old_fd,
-    uint32_t new_fd,
+    lpr_linux_fd_t old_fd,
+    lpr_linux_fd_t new_fd,
     uint16_t new_fd_flags);
-
-int lpr_fd_table_close_range(
+int lpr_fd_table_pin(
     lpr_fd_table_t *table,
-    uint32_t first,
-    uint32_t last,
-    uint32_t cloexec_only);
+    lpr_linux_fd_t fd,
+    lpr_fd_pin_t *out_pin);
+int lpr_fd_table_unpin(
+    lpr_fd_table_t *table,
+    const lpr_fd_pin_t *pin,
+    lpr_fd_drop_t *out_drop);
 
-int lpr_fd_table_get_fd_flags(const lpr_fd_table_t *table, uint32_t fd, uint16_t *out_flags);
-int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, uint32_t fd, uint16_t flags);
-int lpr_fd_table_get_status_flags(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_flags);
-int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, uint32_t fd, uint32_t flags);
-int lpr_fd_table_get_offset(const lpr_fd_table_t *table, uint32_t fd, uint64_t *out_offset);
-int lpr_fd_table_set_offset(lpr_fd_table_t *table, uint32_t fd, uint64_t offset);
-
-lpr_fd_object_t *lpr_fd_table_object_for_fd(lpr_fd_table_t *table, uint32_t fd);
-const lpr_fd_object_t *lpr_fd_table_object_for_fd_const(const lpr_fd_table_t *table, uint32_t fd);
-int lpr_fd_table_get_kind(const lpr_fd_table_t *table, uint32_t fd, uint8_t *out_kind);
-int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, uint32_t fd, uint32_t *out_refcount);
+int lpr_fd_table_get_fd_flags(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint16_t *out_flags);
+int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint16_t flags);
+int lpr_fd_table_get_status_flags(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint32_t *out_flags);
+int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint32_t flags);
+int lpr_fd_table_get_offset(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint64_t *out_offset);
+int lpr_fd_table_set_offset(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint64_t offset);
+int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint32_t *out_refcount);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
-uint32_t lpr_fd_table_live_file_count(const lpr_fd_table_t *table);
+uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table);

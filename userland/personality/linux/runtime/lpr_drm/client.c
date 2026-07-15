@@ -147,11 +147,11 @@ int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
     if (fd < 0) {
         return fd;
     }
-    const int status = lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_DRM, flags, handle, 0);
+    const int status = lpr_control_install_fd(fd, LPR_FD_OPS_DRM, flags, handle, 0);
     if (status != 0) {
         return status;
     }
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) {
         lpr_control_close_fd(fd);
         return -LPR_LINUX_EIO;
@@ -159,7 +159,7 @@ int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
     drm->active = 1;
     drm->flags = (uint32_t)flags;
     drm->handle = handle;
-    drm->native_wait_fd = native_wait_fd;
+    drm->wait_fd.raw = native_wait_fd;
     return fd;
 }
 
@@ -199,7 +199,7 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
         (void)lpr_drm_close_handle(handle);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
     } else if (udmabuf) {
-        lpr_drm_fd_t *drm = lpr_fd_drm_payload((uint64_t)(uint32_t)fd);
+        lpr_drm_backend_t *drm = lpr_drm_backend((uint64_t)(uint32_t)fd);
         if (drm != 0) drm->reserved0 = 1;
     }
     return fd;
@@ -272,49 +272,43 @@ static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, ui
         (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
         return -LPR_LINUX_EIO;
     }
-    uint64_t linux_fd = (uint64_t)(uint32_t)native_fd;
-    if (lpr_runtime_reserved_fd(linux_fd) || lpr_control_fd_active(linux_fd)) {
-        const int replacement = lpr_fd_slot_alloc();
-        if (replacement < 0) {
-            (void)lpr_close_native_fd_if_open(linux_fd);
-            (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
-            return replacement;
-        }
-        const int64_t dup_fd = lpr_pacha_syscall4(
-            PACHAOS_SYSCALL_FD_DUP,
-            linux_fd,
-            (uint64_t)(uint32_t)replacement,
-            info.rights,
-            info.flags);
-        (void)lpr_close_native_fd_if_open(linux_fd);
-        if (dup_fd != replacement) {
-            if (dup_fd >= 0) (void)lpr_close_native_fd_if_open((uint64_t)dup_fd);
-            (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
-            return -LPR_LINUX_EMFILE;
-        }
-        linux_fd = (uint64_t)(uint32_t)replacement;
+    const int linux_fd = lpr_fd_slot_alloc();
+    if (linux_fd < 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
+        (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
+        return linux_fd;
     }
     const uint64_t linux_flags = LPR_LINUX_O_RDWR |
         ((flags & DRMD_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
     status = lpr_control_install_fd(
-        linux_fd, LPR_FD_TABLE_KIND_DMABUF, linux_flags, token, info.size);
-    lpr_dmabuf_fd_t *dmabuf = status == 0 ? lpr_fd_dmabuf_payload(linux_fd) : 0;
-    if (dmabuf == 0) {
-        (void)lpr_close_native_fd_if_open(linux_fd);
+        (uint64_t)(uint32_t)linux_fd,
+        LPR_FD_OPS_DMABUF,
+        linux_flags,
+        token,
+        info.size);
+    if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
         (void)lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, token);
-        return status != 0 ? status : -LPR_LINUX_EIO;
+        return status;
+    }
+    lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend((uint64_t)(uint32_t)linux_fd);
+    if (dmabuf == 0) {
+        lpr_control_close_fd((uint64_t)(uint32_t)linux_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
+        return -LPR_LINUX_EIO;
     }
     dmabuf->active = 1;
     dmabuf->writable = 1;
     dmabuf->flags = (uint32_t)linux_flags;
     dmabuf->token = token;
     dmabuf->size = info.size;
-    return (int64_t)linux_fd;
+    dmabuf->native.raw = native_fd;
+    return linux_fd;
 }
 
 static int64_t lpr_drm_prime_import(uint64_t drm_handle, uint64_t prime_fd, uint32_t flags)
 {
-    lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(prime_fd);
+    lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(prime_fd);
     if (flags != 0) return -LPR_LINUX_EINVAL;
     int import_vmo_fd = -1;
     uint64_t import_size = 0;
@@ -410,7 +404,7 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
 
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     const uint32_t command = (uint32_t)request;
     const int no_argument = command == DRMD_IOCTL_SET_MASTER || command == DRMD_IOCTL_DROP_MASTER;
     if (drm == 0 || (arg == 0 && !no_argument)) {
@@ -646,7 +640,7 @@ int64_t lpr_drm_mmap(
     uint64_t pacha_flags,
     uint64_t offset)
 {
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) {
         return -LPR_LINUX_EBADF;
     }
@@ -685,11 +679,11 @@ int64_t lpr_drm_mmap(
 
 int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events)
 {
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) return -LPR_LINUX_EBADF;
-    if (drm->native_wait_fd >= 16) {
+    if (drm->wait_fd.raw >= 16) {
         struct pacha_pollfd pollfd = {
-            .fd = drm->native_wait_fd,
+            .fd = drm->wait_fd.raw,
             .events = PACHA_FD_EVENT_READABLE,
         };
         const int64_t status = lpr_pacha_syscall2(
@@ -715,18 +709,18 @@ int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events)
 
 int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
 {
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) return -LPR_LINUX_EBADF;
     if (count == 0) return 0;
     if (buf == 0) return -LPR_LINUX_EFAULT;
-    if (drm->native_wait_fd < 16) return -LPR_LINUX_EIO;
+    if (drm->wait_fd.raw < 16) return -LPR_LINUX_EIO;
     if (count < 4u * sizeof(uint64_t)) return -LPR_LINUX_EINVAL;
     for (;;) {
         struct pacha_ipc_msg event;
         lpr_memset(&event, 0, sizeof(event));
         const int64_t recv_status = lpr_pacha_syscall2(
             PACHAOS_SYSCALL_IPC_RECV,
-            (uint64_t)(uint32_t)drm->native_wait_fd,
+            (uint64_t)(uint32_t)drm->wait_fd.raw,
             (uint64_t)(uintptr_t)&event);
         if (recv_status == 0) {
             lpr_memcpy((void *)(uintptr_t)buf, &event.word0, 4u * sizeof(uint64_t));
@@ -737,7 +731,7 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         }
         if ((drm->flags & LPR_LINUX_O_NONBLOCK) != 0) return -LPR_LINUX_EAGAIN;
         struct pacha_pollfd waitfd = {
-            .fd = drm->native_wait_fd,
+            .fd = drm->wait_fd.raw,
             .events = PACHA_FD_EVENT_READABLE,
         };
         const int64_t wait_status = lpr_pacha_syscall4(
@@ -749,6 +743,6 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
 
 int lpr_drm_native_wait_fd(uint64_t fd)
 {
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
-    return drm != 0 ? drm->native_wait_fd : -1;
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
+    return drm != 0 ? drm->wait_fd.raw : -1;
 }

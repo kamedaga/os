@@ -1,117 +1,205 @@
 #include "../lpr_filed_internal.h"
 
-lpr_fd_object_t *lpr_fd_object_for_fd(uint64_t fd)
+static uint64_t lpr_backend_type_bytes(uint8_t ops_id)
+{
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED: return sizeof(lpr_filed_backend_t);
+    case LPR_FD_OPS_DEVICE: return sizeof(lpr_device_backend_t);
+    case LPR_FD_OPS_TTY: return sizeof(lpr_tty_backend_t);
+    case LPR_FD_OPS_DRM: return sizeof(lpr_drm_backend_t);
+    case LPR_FD_OPS_INPUT: return sizeof(lpr_input_backend_t);
+    case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
+    case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
+    case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
+    case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
+    case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
+    default: return 0;
+    }
+}
+
+static uint32_t lpr_backend_rights(uint8_t ops_id, uint64_t linux_flags)
+{
+    const uint32_t common = LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_DUP;
+    const uint64_t access = linux_flags & LPR_LINUX_O_ACCMODE;
+    const uint32_t readable = access != LPR_LINUX_O_WRONLY ? LPR_FD_RIGHT_READ : 0;
+    const uint32_t writable = access != LPR_LINUX_O_RDONLY ? LPR_FD_RIGHT_WRITE : 0;
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED:
+        return common | readable | writable | LPR_FD_RIGHT_MMAP | LPR_FD_RIGHT_IOCTL;
+    case LPR_FD_OPS_DEVICE:
+    case LPR_FD_OPS_TTY:
+        return common | readable | writable | LPR_FD_RIGHT_IOCTL;
+    case LPR_FD_OPS_DRM:
+        return common | LPR_FD_RIGHT_READ | LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_MMAP;
+    case LPR_FD_OPS_INPUT:
+        return common | LPR_FD_RIGHT_READ | LPR_FD_RIGHT_IOCTL;
+    case LPR_FD_OPS_PIPE:
+    case LPR_FD_OPS_SOCKET:
+        return common | readable | writable | LPR_FD_RIGHT_IOCTL;
+    case LPR_FD_OPS_EVENT:
+        return common | LPR_FD_RIGHT_READ | LPR_FD_RIGHT_WRITE | LPR_FD_RIGHT_IOCTL;
+    case LPR_FD_OPS_EPOLL:
+        return common | LPR_FD_RIGHT_IOCTL;
+    case LPR_FD_OPS_DMABUF:
+        return common | LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_MMAP;
+    default:
+        return 0;
+    }
+}
+
+static void *lpr_backend_map(void)
+{
+    const int64_t mapped = lpr_pacha_syscall6(
+        PACHAOS_SYSCALL_MMAP,
+        0,
+        0,
+        4096,
+        PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+        PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS,
+        0);
+    if (mapped < 4096) {
+        return 0;
+    }
+    void *state = (void *)(uintptr_t)mapped;
+    lpr_memset(state, 0, 4096);
+    return state;
+}
+
+void *lpr_backend_state_from_ofd(const lpr_ofd_t *ofd)
+{
+    if (ofd == 0 || !ofd->active ||
+        ofd->backend.index >= lpr_control_fd_table.backend_count)
+    {
+        return 0;
+    }
+    const lpr_backend_record_t *backend =
+        &lpr_control_fd_table.backends[ofd->backend.index];
+    return backend->active && backend->generation == ofd->backend.generation ?
+        backend->state : 0;
+}
+
+uint8_t lpr_ofd_ops_id(const lpr_ofd_t *ofd)
+{
+    if (ofd == 0 || !ofd->active ||
+        ofd->backend.index >= lpr_control_fd_table.backend_count)
+    {
+        return LPR_FD_OPS_NONE;
+    }
+    const lpr_backend_record_t *backend =
+        &lpr_control_fd_table.backends[ofd->backend.index];
+    return backend->active && backend->generation == ofd->backend.generation ?
+        backend->ops_id : LPR_FD_OPS_NONE;
+}
+
+static void *lpr_backend_state_for_fd(uint64_t fd, uint8_t ops_id)
 {
     lpr_fd_arrays_init();
     if (fd >= lpr_fd_table_capacity) {
         return 0;
     }
-    return lpr_fd_table_object_for_fd(&lpr_control_fd_table, (uint32_t)fd);
-}
-
-const lpr_fd_object_t *lpr_fd_object_for_fd_const(uint64_t fd)
-{
-    lpr_fd_arrays_init();
-    if (fd >= lpr_fd_table_capacity) {
-        return 0;
+    void *state = 0;
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[fd];
+    if (entry->active && entry->ofd_index < lpr_control_fd_table.ofd_count) {
+        const lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[entry->ofd_index];
+        if (ofd->active && ofd->generation == entry->ofd_generation &&
+            lpr_ofd_ops_id(ofd) == ops_id)
+        {
+            state = lpr_backend_state_from_ofd(ofd);
+        }
     }
-    return lpr_fd_table_object_for_fd_const(&lpr_control_fd_table, (uint32_t)fd);
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    return state;
 }
 
-lpr_filed_fd_t *lpr_fd_filed_payload(uint64_t fd)
+lpr_filed_backend_t *lpr_filed_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_FILED ? &object->payload.filed : 0;
+    return (lpr_filed_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_FILED);
 }
 
-lpr_device_fd_t *lpr_fd_device_payload(uint64_t fd)
+lpr_device_backend_t *lpr_device_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_DEVICE ?
-        &object->payload.device : 0;
+    return (lpr_device_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_DEVICE);
 }
 
-lpr_pipe_fd_t *lpr_fd_pipe_payload(uint64_t fd)
+lpr_pipe_backend_t *lpr_pipe_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_PIPE ? &object->payload.pipe : 0;
+    return (lpr_pipe_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_PIPE);
 }
 
-lpr_event_fd_t *lpr_fd_event_payload(uint64_t fd)
+lpr_event_backend_t *lpr_event_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_EVENT ? &object->payload.eventfd : 0;
+    return (lpr_event_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_EVENT);
 }
 
-lpr_tty_fd_t *lpr_fd_tty_payload(uint64_t fd)
+lpr_tty_backend_t *lpr_tty_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_TTY ? &object->payload.tty : 0;
+    return (lpr_tty_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_TTY);
 }
 
-lpr_drm_fd_t *lpr_fd_drm_payload(uint64_t fd)
+lpr_drm_backend_t *lpr_drm_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_DRM ? &object->payload.drm : 0;
+    return (lpr_drm_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_DRM);
 }
 
-lpr_input_fd_t *lpr_fd_input_payload(uint64_t fd)
+lpr_input_backend_t *lpr_input_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_INPUT ? &object->payload.input : 0;
+    return (lpr_input_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_INPUT);
 }
 
-lpr_dmabuf_fd_t *lpr_fd_dmabuf_payload(uint64_t fd)
+lpr_dmabuf_backend_t *lpr_dmabuf_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_DMABUF ? &object->payload.dmabuf : 0;
+    return (lpr_dmabuf_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_DMABUF);
 }
 
-lpr_socket_fd_t *lpr_fd_socket_payload(uint64_t fd)
+lpr_socket_backend_t *lpr_socket_backend(uint64_t fd)
 {
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_SOCKET ? &object->payload.socket : 0;
+    return (lpr_socket_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_SOCKET);
 }
 
-static int lpr_fd_kind_active(uint64_t fd, uint8_t kind)
+lpr_epoll_backend_t *lpr_epoll_backend(uint64_t fd)
 {
-    const lpr_fd_object_t *object = lpr_fd_object_for_fd_const(fd);
-    return object != 0 && object->kind == kind;
+    return (lpr_epoll_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_EPOLL);
+}
+
+static int lpr_fd_ops_active(uint64_t fd, uint8_t ops_id)
+{
+    return lpr_backend_state_for_fd(fd, ops_id) != 0;
 }
 
 int lpr_fd_is_filed(uint64_t fd)
 {
-    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_FILED);
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_FILED);
 }
 
 int lpr_linux_device_fd_active(uint64_t fd)
 {
-    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DEVICE);
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_DEVICE);
 }
 
 int lpr_linux_tty_fd_active(uint64_t fd)
 {
-    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_TTY);
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_TTY);
 }
 
 int lpr_linux_drm_fd_active(uint64_t fd)
 {
-    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DRM);
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_DRM);
 }
 
 int lpr_linux_input_fd_active(uint64_t fd)
 {
-    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_INPUT);
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_INPUT);
 }
 
 int lpr_linux_dmabuf_fd_active(uint64_t fd)
 {
-    return lpr_fd_kind_active(fd, LPR_FD_TABLE_KIND_DMABUF);
+    return lpr_fd_ops_active(fd, LPR_FD_OPS_DMABUF);
 }
 
 int lpr_fd_shadow_offset_eligible(uint64_t fd)
 {
-    const lpr_filed_fd_t *filed = lpr_fd_filed_payload(fd);
+    const lpr_filed_backend_t *filed = lpr_filed_backend(fd);
     return filed != 0 &&
         (filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY;
 }
@@ -123,7 +211,7 @@ int lpr_linux_filed_fd_active(uint64_t fd)
 
 uint64_t lpr_linux_filed_fd_handle(uint64_t fd)
 {
-    const lpr_filed_fd_t *filed = lpr_fd_filed_payload(fd);
+    const lpr_filed_backend_t *filed = lpr_filed_backend(fd);
     return filed != 0 ? filed->handle : 0;
 }
 
@@ -165,18 +253,7 @@ int64_t lpr_close_native_fd_if_open(uint64_t fd)
 
 int lpr_fd_local_active(uint64_t fd)
 {
-    const lpr_fd_object_t *object = lpr_fd_object_for_fd_const(fd);
-    return object != 0 &&
-        (object->kind == LPR_FD_TABLE_KIND_FILED ||
-            object->kind == LPR_FD_TABLE_KIND_DEVICE ||
-            object->kind == LPR_FD_TABLE_KIND_PIPE ||
-            object->kind == LPR_FD_TABLE_KIND_EVENT ||
-            object->kind == LPR_FD_TABLE_KIND_TTY ||
-            object->kind == LPR_FD_TABLE_KIND_DRM ||
-            object->kind == LPR_FD_TABLE_KIND_INPUT ||
-            object->kind == LPR_FD_TABLE_KIND_DMABUF ||
-            object->kind == LPR_FD_TABLE_KIND_SOCKET ||
-            object->kind == LPR_FD_TABLE_KIND_EPOLL);
+    return lpr_control_fd_active(fd);
 }
 
 uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
@@ -200,22 +277,22 @@ uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info)
 
 uint16_t lpr_control_fd_flags_from_linux(uint64_t flags)
 {
-    return (flags & LPR_LINUX_O_CLOEXEC) != 0 ? LPR_FD_TABLE_FD_CLOEXEC : 0;
+    return (flags & LPR_LINUX_O_CLOEXEC) != 0 ? LPR_FD_ENTRY_CLOEXEC : 0;
 }
 
 uint16_t lpr_control_fd_flags_from_fcntl(uint64_t flags)
 {
-    return (flags & LPR_LINUX_FD_CLOEXEC) != 0 ? LPR_FD_TABLE_FD_CLOEXEC : 0;
+    return (flags & LPR_LINUX_FD_CLOEXEC) != 0 ? LPR_FD_ENTRY_CLOEXEC : 0;
 }
 
 uint32_t lpr_control_status_flags_from_linux(uint64_t flags)
 {
     uint32_t status = 0;
     if ((flags & LPR_LINUX_O_NONBLOCK) != 0) {
-        status |= LPR_FD_TABLE_STATUS_NONBLOCK;
+        status |= LPR_OFD_NONBLOCK;
     }
     if ((flags & LPR_LINUX_O_APPEND) != 0) {
-        status |= LPR_FD_TABLE_STATUS_APPEND;
+        status |= LPR_OFD_APPEND;
     }
     return status;
 }
@@ -223,16 +300,16 @@ uint32_t lpr_control_status_flags_from_linux(uint64_t flags)
 uint32_t lpr_control_status_flags_to_linux(uint32_t status)
 {
     uint32_t flags = 0;
-    if ((status & LPR_FD_TABLE_STATUS_NONBLOCK) != 0) {
+    if ((status & LPR_OFD_NONBLOCK) != 0) {
         flags |= LPR_LINUX_O_NONBLOCK;
     }
-    if ((status & LPR_FD_TABLE_STATUS_APPEND) != 0) {
+    if ((status & LPR_OFD_APPEND) != 0) {
         flags |= LPR_LINUX_O_APPEND;
     }
     return flags;
 }
 
-uint32_t lpr_control_merge_legacy_flags(
+uint32_t lpr_control_merge_backend_flags(
     uint32_t old_flags,
     uint16_t fd_flags,
     uint32_t status_flags)
@@ -241,7 +318,7 @@ uint32_t lpr_control_merge_legacy_flags(
         LPR_LINUX_O_CLOEXEC |
         LPR_LINUX_O_NONBLOCK |
         LPR_LINUX_O_APPEND);
-    if ((fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0) {
+    if ((fd_flags & LPR_FD_ENTRY_CLOEXEC) != 0) {
         flags |= LPR_LINUX_O_CLOEXEC;
     }
     flags |= lpr_control_status_flags_to_linux(status_flags);
@@ -250,12 +327,12 @@ uint32_t lpr_control_merge_legacy_flags(
 
 int lpr_control_install_fd(
     uint64_t fd,
-    uint8_t kind,
+    uint8_t ops_id,
     uint64_t linux_flags,
     uint64_t backend_id,
     uint64_t offset)
 {
-    if (fd > LPR_LINUX_FD_MAX) {
+    if (fd > LPR_LINUX_FD_MAX || lpr_backend_type_bytes(ops_id) == 0) {
         return -LPR_LINUX_EMFILE;
     }
     const int ensure_status = lpr_fd_table_ensure_fd(fd);
@@ -264,67 +341,118 @@ int lpr_control_install_fd(
     }
     uint16_t existing_flags = 0;
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &existing_flags) == 0) {
-        return 0;
-    }
-    const lpr_fd_table_install_t install = {
-        .kind = kind,
-        .fd_flags = lpr_control_fd_flags_from_linux(linux_flags),
-        .status_flags = lpr_control_status_flags_from_linux(linux_flags),
-        .rights = 0,
-        .backend_id = backend_id,
-        .offset = offset,
-    };
-    if (lpr_fd_table_install_at(&lpr_control_fd_table, (uint32_t)fd, &install) != 0) {
         return -LPR_LINUX_EMFILE;
     }
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    if (object != 0) {
-        switch (kind) {
-        case LPR_FD_TABLE_KIND_FILED:
-            object->payload.filed.flags = (uint32_t)linux_flags;
-            object->payload.filed.handle = backend_id;
-            object->payload.filed.offset = offset;
-            break;
-        case LPR_FD_TABLE_KIND_TTY:
-            object->payload.tty.flags = (uint32_t)linux_flags;
-            object->payload.tty.handle = backend_id;
-            break;
-        case LPR_FD_TABLE_KIND_DRM:
-            object->payload.drm.flags = (uint32_t)linux_flags;
-            object->payload.drm.handle = backend_id;
-            break;
-        case LPR_FD_TABLE_KIND_INPUT:
-            object->payload.input.flags = (uint32_t)linux_flags;
-            object->payload.input.handle = backend_id;
-            break;
-        case LPR_FD_TABLE_KIND_DMABUF:
-            object->payload.dmabuf.flags = (uint32_t)linux_flags;
-            object->payload.dmabuf.token = backend_id;
-            object->payload.dmabuf.size = offset;
-            object->payload.dmabuf.writable =
-                (linux_flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR ? 1u : 0u;
-            break;
-        case LPR_FD_TABLE_KIND_PIPE:
-            object->payload.pipe.flags = (uint32_t)linux_flags;
-            break;
-        case LPR_FD_TABLE_KIND_EVENT:
-            object->payload.eventfd.flags = (uint32_t)linux_flags;
-            object->payload.eventfd.counter = offset;
-            break;
-        case LPR_FD_TABLE_KIND_SOCKET:
-            object->payload.socket.flags = (uint32_t)linux_flags;
-            object->payload.socket.cloexec =
-                (linux_flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
-            object->payload.socket.handle = backend_id;
-            break;
-        case LPR_FD_TABLE_KIND_EPOLL:
-            object->payload.epoll.flags = (uint32_t)linux_flags;
-            object->payload.epoll.instance = backend_id;
-            object->payload.epoll.map_bytes = offset;
-            break;
-        default:
-            break;
-        }
+    void *state = lpr_backend_map();
+    if (state == 0) {
+        return -LPR_LINUX_ENOMEM;
+    }
+    switch (ops_id) {
+    case LPR_FD_OPS_FILED: {
+        lpr_filed_backend_t *backend = (lpr_filed_backend_t *)state;
+        backend->active = 1;
+        backend->offset_valid = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->handle = backend_id;
+        backend->offset = offset;
+        break;
+    }
+    case LPR_FD_OPS_DEVICE: {
+        lpr_device_backend_t *backend = (lpr_device_backend_t *)state;
+        backend->active = 1;
+        backend->major = (uint8_t)(backend_id >> 32u);
+        backend->minor = (uint8_t)backend_id;
+        backend->flags = (uint32_t)linux_flags;
+        break;
+    }
+    case LPR_FD_OPS_TTY: {
+        lpr_tty_backend_t *backend = (lpr_tty_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->handle = backend_id;
+        break;
+    }
+    case LPR_FD_OPS_DRM: {
+        lpr_drm_backend_t *backend = (lpr_drm_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->handle = backend_id;
+        backend->wait_fd.raw = -1;
+        break;
+    }
+    case LPR_FD_OPS_INPUT: {
+        lpr_input_backend_t *backend = (lpr_input_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->handle = backend_id;
+        backend->wait_fd.raw = -1;
+        break;
+    }
+    case LPR_FD_OPS_DMABUF: {
+        lpr_dmabuf_backend_t *backend = (lpr_dmabuf_backend_t *)state;
+        backend->active = 1;
+        backend->writable =
+            (linux_flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR ? 1u : 0u;
+        backend->flags = (uint32_t)linux_flags;
+        backend->token = backend_id;
+        backend->size = offset;
+        backend->native.raw = -1;
+        break;
+    }
+    case LPR_FD_OPS_PIPE: {
+        lpr_pipe_backend_t *backend = (lpr_pipe_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->native.raw = (int32_t)backend_id;
+        break;
+    }
+    case LPR_FD_OPS_EVENT: {
+        lpr_event_backend_t *backend = (lpr_event_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->counter = offset;
+        break;
+    }
+    case LPR_FD_OPS_SOCKET: {
+        lpr_socket_backend_t *backend = (lpr_socket_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->cloexec = (linux_flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
+        backend->handle = backend_id;
+        backend->wait_fd.raw = -1;
+        break;
+    }
+    case LPR_FD_OPS_EPOLL: {
+        lpr_epoll_backend_t *backend = (lpr_epoll_backend_t *)state;
+        backend->active = 1;
+        backend->flags = (uint32_t)linux_flags;
+        backend->instance = backend_id;
+        backend->map_bytes = offset;
+        break;
+    }
+    default:
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)state,
+            4096);
+        return -LPR_LINUX_EINVAL;
+    }
+    const lpr_fd_install_t install = {
+        .ops_id = ops_id,
+        .fd_flags = lpr_control_fd_flags_from_linux(linux_flags),
+        .access_mode = (uint16_t)(linux_flags & LPR_LINUX_O_ACCMODE),
+        .status_flags = lpr_control_status_flags_from_linux(linux_flags),
+        .rights = lpr_backend_rights(ops_id, linux_flags),
+        .offset = offset,
+        .backend_state = state,
+        .backend_state_bytes = 4096,
+    };
+    if (lpr_fd_table_install_at(&lpr_control_fd_table, (uint32_t)fd, &install) != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)state,
+            4096);
+        return -LPR_LINUX_EMFILE;
     }
     return 0;
 }
@@ -333,7 +461,10 @@ void lpr_control_close_fd(uint64_t fd)
 {
     if (fd < lpr_fd_table_capacity) {
         lpr_epoll_before_close(fd);
-        (void)lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd);
+        lpr_fd_drop_t drop;
+        if (lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd, &drop) == 0 && drop.ready) {
+            (void)lpr_backend_finish_drop(&drop);
+        }
     }
 }
 
@@ -346,7 +477,7 @@ int lpr_control_fd_active(uint64_t fd)
     return lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &fd_flags) == 0;
 }
 
-int lpr_control_ensure_from_legacy(uint64_t fd)
+int lpr_control_require_fd(uint64_t fd)
 {
     if (fd >= lpr_fd_table_capacity) {
         return -LPR_LINUX_EBADF;
@@ -355,33 +486,22 @@ int lpr_control_ensure_from_legacy(uint64_t fd)
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &fd_flags) == 0) {
         return 0;
     }
-    {
-        struct pacha_fd_info info;
-        if (lpr_native_pipe_fd_info(fd, &info)) {
-            return lpr_control_install_fd(
-                fd,
-                LPR_FD_TABLE_KIND_PIPE,
-                lpr_pipe_flags_from_info(&info),
-                fd,
-                0);
-        }
-    }
     return -LPR_LINUX_EBADF;
 }
 
 int lpr_control_dup_fd(uint64_t old_fd, uint64_t new_fd, uint64_t cloexec)
 {
-    const int ensure_status = lpr_control_ensure_from_legacy(old_fd);
-    if (ensure_status != 0) {
-        return ensure_status;
+    const int64_t prepare_status = lpr_fd_prepare_dup(old_fd);
+    if (prepare_status != 0) {
+        return (int)prepare_status;
     }
-    const uint16_t new_flags = cloexec ? LPR_FD_TABLE_FD_CLOEXEC : 0;
-    return lpr_fd_table_dup2(&lpr_control_fd_table, (uint32_t)old_fd, (uint32_t)new_fd, new_flags) == 0 ?
+    const uint16_t new_flags = cloexec ? LPR_FD_ENTRY_CLOEXEC : 0;
+    return lpr_fd_table_dup_at(&lpr_control_fd_table, (uint32_t)old_fd, (uint32_t)new_fd, new_flags) == 0 ?
         0 :
         -LPR_LINUX_EBADF;
 }
 
-void lpr_control_sync_legacy_flags(uint64_t fd)
+void lpr_control_sync_backend_flags(uint64_t fd)
 {
     if (fd >= lpr_fd_table_capacity) {
         return;
@@ -391,59 +511,36 @@ void lpr_control_sync_legacy_flags(uint64_t fd)
     {
         return;
     }
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    if (object == 0) {
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
         return;
     }
-    switch (object->kind) {
-    case LPR_FD_TABLE_KIND_FILED:
-        object->payload.filed.flags =
-            lpr_control_merge_legacy_flags(object->payload.filed.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_DEVICE:
-        object->payload.device.flags =
-            lpr_control_merge_legacy_flags(object->payload.device.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_TTY:
-        object->payload.tty.flags =
-            lpr_control_merge_legacy_flags(object->payload.tty.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_DRM:
-        object->payload.drm.flags =
-            lpr_control_merge_legacy_flags(object->payload.drm.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_INPUT:
-        object->payload.input.flags =
-            lpr_control_merge_legacy_flags(object->payload.input.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_DMABUF:
-        object->payload.dmabuf.flags =
-            lpr_control_merge_legacy_flags(object->payload.dmabuf.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_EVENT:
-        object->payload.eventfd.flags =
-            lpr_control_merge_legacy_flags(object->payload.eventfd.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_PIPE:
-        object->payload.pipe.flags =
-            lpr_control_merge_legacy_flags(object->payload.pipe.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_SOCKET:
-        object->payload.socket.flags =
-            lpr_control_merge_legacy_flags(object->payload.socket.flags, 0, status_flags);
-        break;
-    case LPR_FD_TABLE_KIND_EPOLL:
-        object->payload.epoll.flags =
-            lpr_control_merge_legacy_flags(object->payload.epoll.flags, 0, status_flags);
-        break;
-    default:
-        break;
+    uint32_t *backend_flags = 0;
+    switch (pin.ops_id) {
+    case LPR_FD_OPS_FILED: backend_flags = &((lpr_filed_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_DEVICE: backend_flags = &((lpr_device_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_TTY: backend_flags = &((lpr_tty_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_DRM: backend_flags = &((lpr_drm_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_INPUT: backend_flags = &((lpr_input_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_DMABUF: backend_flags = &((lpr_dmabuf_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_EVENT: backend_flags = &((lpr_event_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_PIPE: backend_flags = &((lpr_pipe_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_SOCKET: backend_flags = &((lpr_socket_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_EPOLL: backend_flags = &((lpr_epoll_backend_t *)pin.state)->flags; break;
+    default: break;
+    }
+    if (backend_flags != 0) {
+        *backend_flags = lpr_control_merge_backend_flags(*backend_flags, 0, status_flags);
+    }
+    lpr_fd_drop_t drop;
+    if (lpr_fd_table_unpin(&lpr_control_fd_table, &pin, &drop) == 0 && drop.ready) {
+        (void)lpr_backend_finish_drop(&drop);
     }
 }
 
 int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags)
 {
-    const int ensure_status = lpr_control_ensure_from_legacy(fd);
+    const int ensure_status = lpr_control_require_fd(fd);
     if (ensure_status != 0) {
         return ensure_status;
     }
@@ -459,7 +556,7 @@ int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags)
 
 int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
 {
-    const int ensure_status = lpr_control_ensure_from_legacy(fd);
+    const int ensure_status = lpr_control_require_fd(fd);
     if (ensure_status != 0) {
         return ensure_status;
     }
@@ -470,13 +567,13 @@ int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
     {
         return -LPR_LINUX_EBADF;
     }
-    lpr_control_sync_legacy_flags(fd);
+    lpr_control_sync_backend_flags(fd);
     return 0;
 }
 
 int64_t lpr_control_get_fd_flags(uint64_t fd)
 {
-    const int ensure_status = lpr_control_ensure_from_legacy(fd);
+    const int ensure_status = lpr_control_require_fd(fd);
     if (ensure_status != 0) {
         return ensure_status;
     }
@@ -484,7 +581,7 @@ int64_t lpr_control_get_fd_flags(uint64_t fd)
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &fd_flags) != 0) {
         return -LPR_LINUX_EBADF;
     }
-    return (fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0 ? LPR_LINUX_FD_CLOEXEC : 0;
+    return (fd_flags & LPR_FD_ENTRY_CLOEXEC) != 0 ? LPR_LINUX_FD_CLOEXEC : 0;
 }
 
 int lpr_control_fd_cloexec(uint64_t fd, int *out_cloexec)
@@ -492,7 +589,7 @@ int lpr_control_fd_cloexec(uint64_t fd, int *out_cloexec)
     if (out_cloexec == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const int ensure_status = lpr_control_ensure_from_legacy(fd);
+    const int ensure_status = lpr_control_require_fd(fd);
     if (ensure_status != 0) {
         return ensure_status;
     }
@@ -500,13 +597,13 @@ int lpr_control_fd_cloexec(uint64_t fd, int *out_cloexec)
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &fd_flags) != 0) {
         return -LPR_LINUX_EBADF;
     }
-    *out_cloexec = (fd_flags & LPR_FD_TABLE_FD_CLOEXEC) != 0;
+    *out_cloexec = (fd_flags & LPR_FD_ENTRY_CLOEXEC) != 0;
     return 0;
 }
 
 int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
 {
-    const int ensure_status = lpr_control_ensure_from_legacy(fd);
+    const int ensure_status = lpr_control_require_fd(fd);
     if (ensure_status != 0) {
         return ensure_status;
     }
@@ -520,23 +617,23 @@ int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
 uint64_t lpr_filed_control_offset(uint64_t fd)
 {
     uint64_t offset = 0;
-    if (lpr_control_ensure_from_legacy(fd) == 0 &&
+    if (lpr_control_require_fd(fd) == 0 &&
         lpr_fd_table_get_offset(&lpr_control_fd_table, (uint32_t)fd, &offset) == 0)
     {
         return offset;
     }
-    const lpr_filed_fd_t *filed = lpr_fd_filed_payload(fd);
+    const lpr_filed_backend_t *filed = lpr_filed_backend(fd);
     return filed != 0 ? filed->offset : 0;
 }
 
 void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset)
 {
     if (fd < lpr_fd_table_capacity) {
-        lpr_filed_fd_t *filed = lpr_fd_filed_payload(fd);
+        lpr_filed_backend_t *filed = lpr_filed_backend(fd);
         if (filed != 0) {
             filed->offset = offset;
         }
-        if (lpr_control_ensure_from_legacy(fd) == 0) {
+        if (lpr_control_require_fd(fd) == 0) {
             (void)lpr_fd_table_set_offset(&lpr_control_fd_table, (uint32_t)fd, offset);
         }
     }
@@ -547,14 +644,17 @@ void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t
     const uint64_t new_offset = old_offset + amount;
     lpr_filed_control_set_offset(fd, new_offset);
     if (new_offset < old_offset) {
-        lpr_filed_fd_t *filed = lpr_fd_filed_payload(fd);
+        lpr_filed_backend_t *filed = lpr_filed_backend(fd);
         if (filed != 0) {
             filed->offset_valid = 0;
         }
     }
 }
 
-int lpr_pipe_track_native_fd(uint64_t fd, const struct pacha_fd_info *info)
+int lpr_pipe_track_native_fd(
+    uint64_t fd,
+    uint64_t native_fd,
+    const struct pacha_fd_info *info)
 {
     if (fd > LPR_LINUX_FD_MAX || info == 0) {
         return -LPR_LINUX_EMFILE;
@@ -566,14 +666,14 @@ int lpr_pipe_track_native_fd(uint64_t fd, const struct pacha_fd_info *info)
     const uint32_t flags = lpr_pipe_flags_from_info(info);
     const int control_status = lpr_control_install_fd(
         fd,
-        LPR_FD_TABLE_KIND_PIPE,
+        LPR_FD_OPS_PIPE,
         flags,
-        fd,
+        native_fd,
         0);
     if (control_status != 0) {
         return control_status;
     }
-    lpr_pipe_fd_t *pipe = lpr_fd_pipe_payload(fd);
+    lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
     if (pipe == 0) {
         lpr_control_close_fd(fd);
         return -LPR_LINUX_EIO;
@@ -582,16 +682,13 @@ int lpr_pipe_track_native_fd(uint64_t fd, const struct pacha_fd_info *info)
     pipe->readable = (info->rights & PACHA_FD_RIGHT_READ) != 0 ? 1u : 0u;
     pipe->writable = (info->rights & PACHA_FD_RIGHT_WRITE) != 0 ? 1u : 0u;
     pipe->flags = flags;
+    pipe->native.raw = (int32_t)native_fd;
     return 0;
 }
 
 int lpr_fd_linux_visible_active(uint64_t fd)
 {
-    if (lpr_fd_local_active(fd) || lpr_linux_socket_fd_active(fd)) {
-        return 1;
-    }
-    struct pacha_fd_info info;
-    return lpr_native_fd_info(fd, &info) && info.kind == PACHA_FD_KIND_PIPE;
+    return lpr_control_fd_active(fd);
 }
 
 int lpr_fd_alloc(uint64_t handle, uint64_t flags)
@@ -602,14 +699,14 @@ int lpr_fd_alloc(uint64_t handle, uint64_t flags)
     }
     const int control_status = lpr_control_install_fd(
         (uint64_t)fd,
-        LPR_FD_TABLE_KIND_FILED,
+        LPR_FD_OPS_FILED,
         flags,
         handle,
         0);
     if (control_status != 0) {
         return control_status;
     }
-    lpr_filed_fd_t *filed = lpr_fd_filed_payload((uint64_t)fd);
+    lpr_filed_backend_t *filed = lpr_filed_backend((uint64_t)fd);
     if (filed == 0) {
         lpr_control_close_fd((uint64_t)fd);
         return -LPR_LINUX_EIO;
@@ -632,11 +729,9 @@ int lpr_fd_slot_alloc(void)
 int lpr_fd_slot_available(uint64_t fd)
 {
     lpr_fd_arrays_init();
-    struct pacha_fd_info native_info;
     return fd < lpr_fd_table_capacity &&
         !lpr_runtime_reserved_fd(fd) &&
-        !lpr_control_fd_active(fd) &&
-        !lpr_native_fd_info(fd, &native_info);
+        !lpr_control_fd_active(fd);
 }
 
 int lpr_fd_slot_alloc_from(uint64_t min_fd)
@@ -687,14 +782,14 @@ int lpr_restore_bootstrap_filed_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     }
     if (lpr_control_install_fd(
         fd,
-        LPR_FD_TABLE_KIND_FILED,
+        LPR_FD_OPS_FILED,
         desc->flags,
         desc->handle,
         desc->offset_or_counter) != 0)
     {
         return 0;
     }
-    lpr_filed_fd_t *filed = lpr_fd_filed_payload(fd);
+    lpr_filed_backend_t *filed = lpr_filed_backend(fd);
     if (filed == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -718,7 +813,7 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
         if (existing == fd || !lpr_linux_tty_fd_active(existing)) {
             continue;
         }
-        const lpr_tty_fd_t *existing_tty = lpr_fd_tty_payload(existing);
+        const lpr_tty_backend_t *existing_tty = lpr_tty_backend(existing);
         if (existing_tty == 0 || existing_tty->handle != desc->handle) {
             continue;
         }
@@ -730,7 +825,7 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
             return 0;
         }
         (void)lpr_control_set_status_flags(fd, desc->flags);
-        lpr_tty_fd_t *tty = lpr_fd_tty_payload(fd);
+        lpr_tty_backend_t *tty = lpr_tty_backend(fd);
         if (tty != 0) {
             tty->reserved0 = (uint8_t)desc->offset_or_counter;
             tty->flags = desc->flags;
@@ -740,14 +835,14 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     }
     if (lpr_control_install_fd(
         fd,
-        LPR_FD_TABLE_KIND_TTY,
+        LPR_FD_OPS_TTY,
         desc->flags,
         desc->handle,
         0) != 0)
     {
         return 0;
     }
-    lpr_tty_fd_t *tty = lpr_fd_tty_payload(fd);
+    lpr_tty_backend_t *tty = lpr_tty_backend(fd);
     if (tty == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -761,11 +856,14 @@ int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 
 int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
+    const uint64_t native_fd = desc->handle;
     struct pacha_fd_info info;
-    if (!lpr_native_pipe_slot_claimable(fd, &info)) {
+    if (native_fd > INT32_MAX ||
+        !lpr_native_fd_info(native_fd, &info) || info.kind != PACHA_FD_KIND_PIPE)
+    {
         return 0;
     }
-    if (lpr_pipe_track_native_fd(fd, &info) != 0) {
+    if (lpr_pipe_track_native_fd(fd, native_fd, &info) != 0) {
         return 0;
     }
     const uint64_t pacha_flags =
@@ -773,7 +871,7 @@ int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
         ((desc->flags & LPR_LINUX_O_NONBLOCK) != 0 ? PACHA_FD_FLAG_NONBLOCK : 0);
     (void)lpr_pacha_syscall3(
         PACHAOS_SYSCALL_FD_SET_FLAGS,
-        fd,
+        native_fd,
         pacha_flags,
         PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_NONBLOCK);
     (void)lpr_control_set_fd_flags(
@@ -793,10 +891,10 @@ int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
         (desc->native_wait_fd > INT32_MAX ||
          !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
          wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
-    if (lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_DRM, desc->flags, desc->handle, 0) != 0) {
+    if (lpr_control_install_fd(fd, LPR_FD_OPS_DRM, desc->flags, desc->handle, 0) != 0) {
         return 0;
     }
-    lpr_drm_fd_t *drm = lpr_fd_drm_payload(fd);
+    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -804,7 +902,7 @@ int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     drm->active = 1;
     drm->flags = desc->flags;
     drm->handle = desc->handle;
-    drm->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
+    drm->wait_fd.raw = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
     return 1;
 }
 
@@ -815,9 +913,9 @@ int lpr_restore_bootstrap_device_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     if (major == 0 || major > UINT8_MAX || minor > UINT8_MAX ||
         !lpr_fd_slot_available(fd)) return 0;
     if (lpr_control_install_fd(
-            fd, LPR_FD_TABLE_KIND_DEVICE, desc->flags, desc->handle, 0) != 0)
+            fd, LPR_FD_OPS_DEVICE, desc->flags, desc->handle, 0) != 0)
         return 0;
-    lpr_device_fd_t *device = lpr_fd_device_payload(fd);
+    lpr_device_backend_t *device = lpr_device_backend(fd);
     if (device == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -837,9 +935,9 @@ int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
         (desc->native_wait_fd > INT32_MAX ||
          !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
          wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
-    if (lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_INPUT, desc->flags, desc->handle, 0) != 0)
+    if (lpr_control_install_fd(fd, LPR_FD_OPS_INPUT, desc->flags, desc->handle, 0) != 0)
         return 0;
-    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
+    lpr_input_backend_t *input = lpr_input_backend(fd);
     if (input == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -848,24 +946,26 @@ int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     input->reserved0 = (uint8_t)desc->offset_or_counter;
     input->flags = desc->flags;
     input->handle = desc->handle;
-    input->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
+    input->wait_fd.raw = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
     return 1;
 }
 
 int lpr_restore_bootstrap_dmabuf_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
 {
+    const uint64_t native_fd = desc->native_wait_fd;
     struct pacha_fd_info info;
     if (desc->handle == 0 || lpr_runtime_reserved_fd(fd) || lpr_control_fd_active(fd) ||
-        !lpr_native_fd_info(fd, &info) || info.kind != PACHA_FD_KIND_VMO ||
+        native_fd > INT32_MAX || !lpr_native_fd_info(native_fd, &info) ||
+        info.kind != PACHA_FD_KIND_VMO ||
         info.size < desc->offset_or_counter) {
         return 0;
     }
     if (lpr_control_install_fd(
-        fd, LPR_FD_TABLE_KIND_DMABUF, desc->flags, desc->handle,
+        fd, LPR_FD_OPS_DMABUF, desc->flags, desc->handle,
         desc->offset_or_counter) != 0) {
         return 0;
     }
-    lpr_dmabuf_fd_t *dmabuf = lpr_fd_dmabuf_payload(fd);
+    lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(fd);
     if (dmabuf == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -875,6 +975,7 @@ int lpr_restore_bootstrap_dmabuf_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     dmabuf->flags = desc->flags;
     dmabuf->token = desc->handle;
     dmabuf->size = desc->offset_or_counter;
+    dmabuf->native.raw = (int32_t)native_fd;
     return 1;
 }
 
@@ -885,14 +986,14 @@ int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     }
     if (lpr_control_install_fd(
         fd,
-        LPR_FD_TABLE_KIND_EVENT,
+        LPR_FD_OPS_EVENT,
         desc->flags,
         fd,
         desc->offset_or_counter) != 0)
     {
         return 0;
     }
-    lpr_event_fd_t *event = lpr_fd_event_payload(fd);
+    lpr_event_backend_t *event = lpr_event_backend(fd);
     if (event == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -915,14 +1016,14 @@ int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
          wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
     if (lpr_control_install_fd(
         fd,
-        LPR_FD_TABLE_KIND_SOCKET,
+        LPR_FD_OPS_SOCKET,
         desc->flags,
         desc->handle,
         0) != 0)
     {
         return 0;
     }
-    lpr_socket_fd_t *socket = lpr_fd_socket_payload(fd);
+    lpr_socket_backend_t *socket = lpr_socket_backend(fd);
     if (socket == 0) {
         lpr_control_close_fd(fd);
         return 0;
@@ -938,7 +1039,7 @@ int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
     }
     socket->sndbuf = 256u * 1024u;
     socket->rcvbuf = 256u * 1024u;
-    socket->native_wait_fd = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
+    socket->wait_fd.raw = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
     return 1;
 }
 
@@ -1002,8 +1103,8 @@ void lpr_state_dump(const char *reason)
     uint64_t open_count = 0;
     uint64_t live_object_count = 0;
     for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
-        open_count += lpr_control_fd_table.slots[fd].active ? 1u : 0u;
-        live_object_count += lpr_control_fd_table.files[fd].active ? 1u : 0u;
+        open_count += lpr_control_fd_table.entries[fd].active ? 1u : 0u;
+        live_object_count += lpr_control_fd_table.ofds[fd].active ? 1u : 0u;
     }
     uint64_t crc = lpr_control_fd_table.generation ^ open_count;
     pacha_trace6(
@@ -1027,39 +1128,39 @@ void lpr_state_dump(const char *reason)
         live_object_count,
         reason_id);
     for (uint64_t fd = 0; fd < lpr_fd_table_capacity; fd += 1) {
-        const lpr_fd_table_slot_t *slot = &lpr_control_fd_table.slots[fd];
-        if (!slot->active || slot->file_index >= lpr_control_fd_table.file_count) {
+        const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[fd];
+        if (!slot->active || slot->ofd_index >= lpr_control_fd_table.ofd_count) {
             continue;
         }
-        const lpr_fd_object_t *object = &lpr_control_fd_table.files[slot->file_index];
+        const lpr_ofd_t *object = &lpr_control_fd_table.ofds[slot->ofd_index];
         if (!object->active) {
             continue;
         }
-        crc ^= (fd << 32u) ^ object->kind ^ object->refcount ^ object->backend_id;
+        crc ^= (fd << 32u) ^ lpr_ofd_ops_id(object) ^ object->refcount ^ object->backend.index;
         pacha_trace6(
             PACHA_TRACE_COMPONENT_LPR,
             PACHA_TRACE_EVENT_LPR_PROCESS,
             PACHA_TRACE_CLASS_ERROR,
             pacha_trace_name_id("lpr.fd.entry"),
             fd,
-            object->kind,
+            lpr_ofd_ops_id(object),
             slot->fd_flags,
             object->status_flags,
             object->refcount);
-        switch (object->kind) {
-        case LPR_FD_TABLE_KIND_FILED:
+        switch (lpr_ofd_ops_id(object)) {
+        case LPR_FD_OPS_FILED:
             pacha_trace6(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.filed"),
                 fd,
-                object->payload.filed.handle,
-                object->payload.filed.offset,
-                object->payload.filed.offset_valid,
+                ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->handle,
+                ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->offset,
+                ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->offset_valid,
                 lpr_page_cache_clock);
             break;
-        case LPR_FD_TABLE_KIND_PIPE:
+        case LPR_FD_OPS_PIPE:
             pacha_trace6(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
@@ -1067,70 +1168,70 @@ void lpr_state_dump(const char *reason)
                 pacha_trace_name_id("lpr.fd.pipe"),
                 fd,
                 fd,
-                object->payload.pipe.readable,
-                object->payload.pipe.writable,
-                object->payload.pipe.last_wait_events);
+                ((lpr_pipe_backend_t *)lpr_backend_state_from_ofd(object))->readable,
+                ((lpr_pipe_backend_t *)lpr_backend_state_from_ofd(object))->writable,
+                ((lpr_pipe_backend_t *)lpr_backend_state_from_ofd(object))->last_wait_events);
             break;
-        case LPR_FD_TABLE_KIND_EVENT:
+        case LPR_FD_OPS_EVENT:
             pacha_trace3(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.eventfd"),
                 fd,
-                object->payload.eventfd.counter);
+                ((lpr_event_backend_t *)lpr_backend_state_from_ofd(object))->counter);
             break;
-        case LPR_FD_TABLE_KIND_TTY:
+        case LPR_FD_OPS_TTY:
             pacha_trace4(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.tty"),
                 fd,
-                object->payload.tty.handle,
+                ((lpr_tty_backend_t *)lpr_backend_state_from_ofd(object))->handle,
                 (uint64_t)(uint32_t)lpr_linux_current_pgrp);
             break;
-        case LPR_FD_TABLE_KIND_DRM:
+        case LPR_FD_OPS_DRM:
             pacha_trace4(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.drm"),
                 fd,
-                object->payload.drm.handle,
-                object->payload.drm.flags);
+                ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->handle,
+                ((lpr_drm_backend_t *)lpr_backend_state_from_ofd(object))->flags);
             break;
-        case LPR_FD_TABLE_KIND_INPUT:
+        case LPR_FD_OPS_INPUT:
             pacha_trace4(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.input"),
                 fd,
-                object->payload.input.handle,
-                object->payload.input.flags);
+                ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->handle,
+                ((lpr_input_backend_t *)lpr_backend_state_from_ofd(object))->flags);
             break;
-        case LPR_FD_TABLE_KIND_SOCKET:
+        case LPR_FD_OPS_SOCKET:
             pacha_trace6(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.socket"),
                 fd,
-                object->payload.socket.handle,
-                object->payload.socket.connected,
-                object->payload.socket.connecting,
-                (uint64_t)(uint32_t)object->payload.socket.last_error);
+                ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle,
+                ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->connected,
+                ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->connecting,
+                (uint64_t)(uint32_t)((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->last_error);
             break;
-        case LPR_FD_TABLE_KIND_EPOLL:
+        case LPR_FD_OPS_EPOLL:
             pacha_trace4(
                 PACHA_TRACE_COMPONENT_LPR,
                 PACHA_TRACE_EVENT_LPR_PROCESS,
                 PACHA_TRACE_CLASS_ERROR,
                 pacha_trace_name_id("lpr.fd.epoll"),
                 fd,
-                object->payload.epoll.instance,
-                object->payload.epoll.map_bytes);
+                ((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(object))->instance,
+                ((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(object))->map_bytes);
             break;
         default:
             break;

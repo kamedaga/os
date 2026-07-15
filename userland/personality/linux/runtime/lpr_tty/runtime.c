@@ -11,26 +11,11 @@ static const char *lpr_take_boot_ctty_env(void)
     return 0;
 }
 
-void lpr_close_non_linux_native_fd(uint64_t fd)
-{
-    if (fd > LPR_LINUX_FD_MAX ||
-        lpr_runtime_reserved_fd(fd) ||
-        lpr_fd_linux_visible_active(fd))
-    {
-        return;
-    }
-    struct pacha_fd_info info;
-    if (lpr_native_fd_info(fd, &info)) {
-        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fd);
-    }
-}
-
 int64_t lpr_install_stdio_fd_from_tty(uint64_t tty_fd, uint64_t target_fd)
 {
     if (lpr_fd_linux_visible_active(target_fd)) {
         return 0;
     }
-    lpr_close_non_linux_native_fd(target_fd);
     if (tty_fd == target_fd) {
         return 0;
     }
@@ -96,7 +81,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
 
     const uint32_t wait_events =
         op == TERMD_OP_HANDLE_WRITE ? TERMD_POLLOUT : TERMD_POLLIN;
-    const uint8_t tty_type = lpr_fd_tty_payload(fd)->reserved0;
+    const uint8_t tty_type = lpr_tty_backend(fd)->reserved0;
     for (;;) {
         void *page = 0;
         const int page_fd = lpr_create_tty_wire_page(&page);
@@ -105,7 +90,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         }
         termd_io_request_t *io = (termd_io_request_t *)lpr_termd_payload(page);
         lpr_memset(io, 0, sizeof(*io));
-        io->handle = lpr_fd_tty_payload(fd)->handle;
+        io->handle = lpr_tty_backend(fd)->handle;
         io->length = count > TERMD_IO_BYTES ? TERMD_IO_BYTES : count;
         lpr_fill_termd_caller(&io->tty.session_id, &io->tty.process_id, &io->tty.pgrp_id);
         lpr_fill_termd_signal_state(&io->tty.signal_mask, &io->tty.signal_ignored);
@@ -124,20 +109,20 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         if (status == -LPR_LINUX_EINTR) {
             const int interrupted = lpr_linux_pump_tty_signals();
             if (op == TERMD_OP_HANDLE_READ &&
-                tty_type == LPR_TTY_FD_PTY_MASTER)
+                tty_type == LPR_TTY_BACKEND_PTY_MASTER)
             {
                 continue;
             }
             if (interrupted ||
                 (op == TERMD_OP_HANDLE_READ &&
-                 tty_type == LPR_TTY_FD_PTY_SLAVE))
+                 tty_type == LPR_TTY_BACKEND_PTY_SLAVE))
             {
                 return status;
             }
             continue;
         }
         if (status != -LPR_LINUX_EAGAIN ||
-            (lpr_fd_tty_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
+            (lpr_tty_backend(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
         {
             return status;
         }
@@ -161,7 +146,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     }
     termd_ioctl_request_t *ioctl_req = (termd_ioctl_request_t *)lpr_termd_payload(page);
     lpr_memset(ioctl_req, 0, sizeof(*ioctl_req));
-    ioctl_req->handle = lpr_fd_tty_payload(fd)->handle;
+    ioctl_req->handle = lpr_tty_backend(fd)->handle;
     ioctl_req->request = request;
     lpr_fill_termd_caller(
         &ioctl_req->tty.session_id,
@@ -278,7 +263,7 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
     }
     termd_poll_request_t *poll_req = (termd_poll_request_t *)lpr_termd_payload(page);
     lpr_memset(poll_req, 0, sizeof(*poll_req));
-    poll_req->handle = lpr_fd_tty_payload(fd)->handle;
+    poll_req->handle = lpr_tty_backend(fd)->handle;
     poll_req->events = events;
     lpr_fill_termd_caller(
         &poll_req->tty.session_id,
@@ -438,10 +423,10 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
         return 0;
     }
     uint32_t revents = 0;
-    if ((events & 0x0001u) != 0 && lpr_fd_event_payload(fd)->counter != 0) {
+    if ((events & 0x0001u) != 0 && lpr_event_backend(fd)->counter != 0) {
         revents |= 0x0001u;
     }
-    if ((events & 0x0004u) != 0 && lpr_fd_event_payload(fd)->counter != UINT64_MAX) {
+    if ((events & 0x0004u) != 0 && lpr_event_backend(fd)->counter != UINT64_MAX) {
         revents |= 0x0004u;
     }
     return revents;

@@ -89,9 +89,9 @@ static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_in
 {
     const int fd = lpr_fd_slot_alloc();
     if (fd < 0) return fd;
-    if (lpr_control_install_fd(fd, LPR_FD_TABLE_KIND_INPUT, flags, handle, 0) != 0)
+    if (lpr_control_install_fd(fd, LPR_FD_OPS_INPUT, flags, handle, 0) != 0)
         return -LPR_LINUX_EMFILE;
-    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
+    lpr_input_backend_t *input = lpr_input_backend(fd);
     if (input == 0) {
         lpr_control_close_fd(fd);
         return -LPR_LINUX_EIO;
@@ -100,7 +100,7 @@ static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_in
     input->reserved0 = (uint8_t)event_index;
     input->flags = (uint32_t)flags;
     input->handle = handle;
-    input->native_wait_fd = native_wait_fd;
+    input->wait_fd.raw = native_wait_fd;
     return fd;
 }
 
@@ -171,13 +171,13 @@ int64_t lpr_input_dup_handle(uint64_t handle)
 
 int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
 {
-    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
+    lpr_input_backend_t *input = lpr_input_backend(fd);
     if (input == 0) return -LPR_LINUX_EBADF;
     if (count == 0) return 0;
     if (buf == 0) return -LPR_LINUX_EFAULT;
     if (count < sizeof(inputd_input_event_t)) return -LPR_LINUX_EINVAL;
     for (;;) {
-        if (input->native_wait_fd >= 16) lpr_native_wait_drain(input->native_wait_fd);
+        if (input->wait_fd.raw >= 16) lpr_native_wait_drain(input->wait_fd.raw);
         void *page = 0;
         const int page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) return page_fd;
@@ -204,9 +204,9 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
         lpr_destroy_tty_wire_page(page_fd, page);
         if (status != -LPR_LINUX_EAGAIN || (input->flags & LPR_LINUX_O_NONBLOCK) != 0)
             return status;
-        if (input->native_wait_fd >= 16) {
+        if (input->wait_fd.raw >= 16) {
             struct pacha_pollfd waitfd = {
-                .fd = input->native_wait_fd,
+                .fd = input->wait_fd.raw,
                 .events = PACHA_FD_EVENT_READABLE,
             };
             const int64_t wait_status = lpr_pacha_syscall4(
@@ -224,7 +224,7 @@ int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
 
 int64_t lpr_input_ioctl(uint64_t fd, uint64_t command, uint64_t arg)
 {
-    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
+    lpr_input_backend_t *input = lpr_input_backend(fd);
     if (input == 0) return -LPR_LINUX_EBADF;
     const uint32_t size = (uint32_t)((command >> 16) & 0x3fffu);
     const uint32_t direction = (uint32_t)((command >> 30) & 0x3u);
@@ -254,11 +254,11 @@ int64_t lpr_input_ioctl(uint64_t fd, uint64_t command, uint64_t arg)
 
 int64_t lpr_input_poll_events(uint64_t fd, uint32_t events)
 {
-    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
+    lpr_input_backend_t *input = lpr_input_backend(fd);
     if (input == 0) return -LPR_LINUX_EBADF;
-    if (input->native_wait_fd >= 16) {
+    if (input->wait_fd.raw >= 16) {
         struct pacha_pollfd pollfd = {
-            .fd = input->native_wait_fd,
+            .fd = input->wait_fd.raw,
             .events = PACHA_FD_EVENT_READABLE,
         };
         const int64_t status = lpr_pacha_syscall2(
@@ -283,6 +283,6 @@ int64_t lpr_input_poll_events(uint64_t fd, uint32_t events)
 
 int lpr_input_native_wait_fd(uint64_t fd)
 {
-    lpr_input_fd_t *input = lpr_fd_input_payload(fd);
-    return input != 0 ? input->native_wait_fd : -1;
+    lpr_input_backend_t *input = lpr_input_backend(fd);
+    return input != 0 ? input->wait_fd.raw : -1;
 }

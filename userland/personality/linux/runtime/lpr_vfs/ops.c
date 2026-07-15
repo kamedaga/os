@@ -89,7 +89,7 @@ int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
     if (!lpr_fd_is_filed(dirfd)) {
         return -LPR_LINUX_EBADF;
     }
-    *out = lpr_fd_filed_payload(dirfd)->handle;
+    *out = lpr_filed_backend(dirfd)->handle;
     return 0;
 }
 
@@ -133,7 +133,7 @@ int64_t lpr_linux_fsync(uint64_t fd)
         return -LPR_LINUX_EINVAL;
     }
     uint64_t ignored = 0;
-    return lpr_filed_call(FILED_OP_VFS_FSYNC, -1, lpr_fd_filed_payload(fd)->handle, &ignored);
+    return lpr_filed_call(FILED_OP_VFS_FSYNC, -1, lpr_filed_backend(fd)->handle, &ignored);
 }
 
 int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
@@ -144,7 +144,7 @@ int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
     if ((int64_t)length < 0) {
         return -LPR_LINUX_EINVAL;
     }
-    const uint8_t memfd_state = lpr_fd_filed_payload(fd)->reserved1;
+    const uint8_t memfd_state = lpr_filed_backend(fd)->reserved1;
     if ((memfd_state & LPR_FILED_FD_MEMFD) != 0 &&
         (memfd_state & (LPR_LINUX_F_SEAL_SHRINK | LPR_LINUX_F_SEAL_GROW)) != 0)
     {
@@ -172,7 +172,7 @@ int64_t lpr_linux_ftruncate(uint64_t fd, uint64_t length)
     }
     filed_truncate_t *truncate = (filed_truncate_t *)page;
     lpr_memset(truncate, 0, sizeof(*truncate));
-    truncate->handle = lpr_fd_filed_payload(fd)->handle;
+    truncate->handle = lpr_filed_backend(fd)->handle;
     truncate->size = length;
     uint64_t ignored = 0;
     const int64_t status = lpr_filed_call(FILED_OP_VFS_TRUNCATE, page_fd, 0, &ignored);
@@ -232,7 +232,7 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
         (void)lpr_filed_close_handle(handle);
         return fd;
     }
-    lpr_filed_fd_t *file = lpr_fd_filed_payload((uint64_t)(uint32_t)fd);
+    lpr_filed_backend_t *file = lpr_filed_backend((uint64_t)(uint32_t)fd);
     if (file != 0) {
         file->reserved1 = LPR_FILED_FD_MEMFD |
             ((flags & LPR_LINUX_MFD_ALLOW_SEALING) != 0 ?
@@ -590,9 +590,9 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
         if (close_status != 0) return close_status;
         const uint64_t device_id = (1ull << 32u) | 3ull;
         const int install = lpr_control_install_fd(
-            (uint64_t)(uint32_t)fd, LPR_FD_TABLE_KIND_DEVICE, flags, device_id, 0);
+            (uint64_t)(uint32_t)fd, LPR_FD_OPS_DEVICE, flags, device_id, 0);
         if (install != 0) return install;
-        lpr_device_fd_t *device = lpr_fd_device_payload((uint64_t)(uint32_t)fd);
+        lpr_device_backend_t *device = lpr_device_backend((uint64_t)(uint32_t)fd);
         if (device == 0) {
             lpr_control_close_fd((uint64_t)(uint32_t)fd);
             return -LPR_LINUX_EIO;
@@ -936,7 +936,7 @@ int64_t lpr_linux_fchdir(uint64_t fd)
         return -LPR_LINUX_ENOTDIR;
     }
     uint64_t dup_handle = 0;
-    const int64_t dup_status = lpr_filed_dup_handle(lpr_fd_filed_payload(fd)->handle, 0, &dup_handle);
+    const int64_t dup_status = lpr_filed_dup_handle(lpr_filed_backend(fd)->handle, 0, &dup_handle);
     if (dup_status != 0) {
         return dup_status;
     }

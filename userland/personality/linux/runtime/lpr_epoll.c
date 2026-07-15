@@ -37,7 +37,7 @@ typedef struct lpr_linux_pollfd {
 
 typedef struct lpr_epoll_interest {
     uint32_t target_fd;
-    uint32_t target_file_index;
+    uint32_t target_ofd_index;
     uint64_t target_generation;
     uint32_t events;
     uint32_t reserved0;
@@ -80,17 +80,17 @@ static int lpr_epoll_user_range_plausible(uint64_t ptr, uint64_t bytes)
     return ptr < LPR_USER_CANONICAL_END && end < LPR_USER_CANONICAL_END;
 }
 
-static lpr_epoll_instance_t *lpr_epoll_instance_for_object(lpr_fd_object_t *object)
+static lpr_epoll_instance_t *lpr_epoll_instance_for_object(lpr_ofd_t *object)
 {
     if (object == 0 ||
-        object->kind != LPR_FD_TABLE_KIND_EPOLL ||
-        object->payload.epoll.instance < LPR_USER_LOW_GUARD_END ||
-        object->payload.epoll.map_bytes != LPR_EPOLL_INSTANCE_BYTES)
+        lpr_ofd_ops_id(object) != LPR_FD_OPS_EPOLL ||
+        ((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(object))->instance < LPR_USER_LOW_GUARD_END ||
+        ((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(object))->map_bytes != LPR_EPOLL_INSTANCE_BYTES)
     {
         return 0;
     }
     lpr_epoll_instance_t *instance =
-        (lpr_epoll_instance_t *)(uintptr_t)object->payload.epoll.instance;
+        (lpr_epoll_instance_t *)(uintptr_t)((lpr_epoll_backend_t *)lpr_backend_state_from_ofd(object))->instance;
     if (instance->magic != LPR_EPOLL_INSTANCE_MAGIC ||
         instance->capacity != LPR_EPOLL_MAX_INTERESTS ||
         instance->count > instance->capacity)
@@ -115,8 +115,7 @@ static void lpr_epoll_remove_interest(lpr_epoll_instance_t *instance, uint32_t i
 
 int lpr_linux_epoll_fd_active(uint64_t fd)
 {
-    const lpr_fd_object_t *object = lpr_fd_object_for_fd_const(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_EPOLL;
+    return lpr_epoll_backend(fd) != 0;
 }
 
 int64_t lpr_linux_epoll_create1(uint64_t flags)
@@ -147,7 +146,7 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
 
     const int status = lpr_control_install_fd(
         (uint64_t)(uint32_t)fd,
-        LPR_FD_TABLE_KIND_EPOLL,
+        LPR_FD_OPS_EPOLL,
         flags,
         (uint64_t)(uintptr_t)instance,
         LPR_EPOLL_INSTANCE_BYTES);
@@ -164,47 +163,47 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
 static int lpr_epoll_interest_matches(
     const lpr_epoll_interest_t *interest,
     uint32_t target_fd,
-    uint32_t target_file_index,
+    uint32_t target_ofd_index,
     uint64_t target_generation)
 {
     return interest->target_fd == target_fd &&
-        interest->target_file_index == target_file_index &&
+        interest->target_ofd_index == target_ofd_index &&
         interest->target_generation == target_generation;
 }
 
 static int lpr_epoll_reaches_unlocked(
-    uint32_t file_index,
-    uint32_t wanted_file_index,
+    uint32_t ofd_index,
+    uint32_t wanted_ofd_index,
     uint32_t depth)
 {
-    if (file_index == wanted_file_index) {
+    if (ofd_index == wanted_ofd_index) {
         return 1;
     }
-    if (file_index >= lpr_control_fd_table.file_count ||
-        depth >= lpr_control_fd_table.file_count)
+    if (ofd_index >= lpr_control_fd_table.ofd_count ||
+        depth >= lpr_control_fd_table.ofd_count)
     {
         return 0;
     }
-    lpr_fd_object_t *object = &lpr_control_fd_table.files[file_index];
+    lpr_ofd_t *object = &lpr_control_fd_table.ofds[ofd_index];
     lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(object);
     if (instance == 0) {
         return 0;
     }
     for (uint32_t i = 0; i < instance->count; i++) {
         const lpr_epoll_interest_t *interest = &instance->interests[i];
-        if (interest->target_file_index >= lpr_control_fd_table.file_count) {
+        if (interest->target_ofd_index >= lpr_control_fd_table.ofd_count) {
             continue;
         }
-        const lpr_fd_object_t *target =
-            &lpr_control_fd_table.files[interest->target_file_index];
+        const lpr_ofd_t *target =
+            &lpr_control_fd_table.ofds[interest->target_ofd_index];
         if (!target->active || target->generation != interest->target_generation ||
-            target->kind != LPR_FD_TABLE_KIND_EPOLL)
+            lpr_ofd_ops_id(target) != LPR_FD_OPS_EPOLL)
         {
             continue;
         }
         if (lpr_epoll_reaches_unlocked(
-                interest->target_file_index,
-                wanted_file_index,
+                interest->target_ofd_index,
+                wanted_ofd_index,
                 depth + 1u))
         {
             return 1;
@@ -242,45 +241,45 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
     const uint32_t fd = (uint32_t)fd_raw;
     lpr_fd_arrays_init();
     lpr_fd_table_lock(&lpr_control_fd_table);
-    if (epfd >= lpr_control_fd_table.slot_count ||
-        !lpr_control_fd_table.slots[epfd].active)
+    if (epfd >= lpr_control_fd_table.entry_count ||
+        !lpr_control_fd_table.entries[epfd].active)
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    lpr_fd_table_slot_t *epoll_slot = &lpr_control_fd_table.slots[epfd];
-    if (epoll_slot->file_index >= lpr_control_fd_table.file_count) {
+    lpr_fd_entry_t *epoll_slot = &lpr_control_fd_table.entries[epfd];
+    if (epoll_slot->ofd_index >= lpr_control_fd_table.ofd_count) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    lpr_fd_object_t *epoll_object = &lpr_control_fd_table.files[epoll_slot->file_index];
+    lpr_ofd_t *epoll_object = &lpr_control_fd_table.ofds[epoll_slot->ofd_index];
     lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(epoll_object);
     if (instance == 0) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return epoll_object->active ? -LPR_LINUX_EINVAL : -LPR_LINUX_EBADF;
     }
-    if (fd >= lpr_control_fd_table.slot_count || !lpr_control_fd_table.slots[fd].active) {
+    if (fd >= lpr_control_fd_table.entry_count || !lpr_control_fd_table.entries[fd].active) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    const lpr_fd_table_slot_t *target_slot = &lpr_control_fd_table.slots[fd];
-    if (target_slot->file_index >= lpr_control_fd_table.file_count) {
+    const lpr_fd_entry_t *target_slot = &lpr_control_fd_table.entries[fd];
+    if (target_slot->ofd_index >= lpr_control_fd_table.ofd_count) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    const lpr_fd_object_t *target = &lpr_control_fd_table.files[target_slot->file_index];
+    const lpr_ofd_t *target = &lpr_control_fd_table.ofds[target_slot->ofd_index];
     if (!target->active) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    if (target->kind != LPR_FD_TABLE_KIND_FILED &&
-        target->kind != LPR_FD_TABLE_KIND_PIPE &&
-        target->kind != LPR_FD_TABLE_KIND_SOCKET &&
-        target->kind != LPR_FD_TABLE_KIND_EVENT &&
-        target->kind != LPR_FD_TABLE_KIND_TTY &&
-        target->kind != LPR_FD_TABLE_KIND_DRM &&
-        target->kind != LPR_FD_TABLE_KIND_INPUT &&
-        target->kind != LPR_FD_TABLE_KIND_EPOLL)
+    if (lpr_ofd_ops_id(target) != LPR_FD_OPS_FILED &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_PIPE &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_SOCKET &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_EVENT &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_TTY &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_DRM &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_INPUT &&
+        lpr_ofd_ops_id(target) != LPR_FD_OPS_EPOLL)
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EPERM;
@@ -291,7 +290,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         if (lpr_epoll_interest_matches(
                 &instance->interests[i],
                 fd,
-                target_slot->file_index,
+                target_slot->ofd_index,
                 target->generation))
         {
             found = i;
@@ -303,10 +302,10 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
             lpr_fd_table_unlock(&lpr_control_fd_table);
             return -LPR_LINUX_EEXIST;
         }
-        if (target->kind == LPR_FD_TABLE_KIND_EPOLL &&
+        if (lpr_ofd_ops_id(target) == LPR_FD_OPS_EPOLL &&
             lpr_epoll_reaches_unlocked(
-                target_slot->file_index,
-                epoll_slot->file_index,
+                target_slot->ofd_index,
+                epoll_slot->ofd_index,
                 0))
         {
             lpr_fd_table_unlock(&lpr_control_fd_table);
@@ -319,7 +318,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         lpr_epoll_interest_t *interest = &instance->interests[instance->count++];
         lpr_memset(interest, 0, sizeof(*interest));
         interest->target_fd = fd;
-        interest->target_file_index = target_slot->file_index;
+        interest->target_ofd_index = target_slot->ofd_index;
         interest->target_generation = target->generation;
         interest->events = event.events;
         interest->data = event.data;
@@ -344,24 +343,24 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
 
 static int lpr_epoll_resolve_target_fd_unlocked(const lpr_epoll_interest_t *interest)
 {
-    if (interest->target_file_index >= lpr_control_fd_table.file_count) {
+    if (interest->target_ofd_index >= lpr_control_fd_table.ofd_count) {
         return -1;
     }
-    const lpr_fd_object_t *target =
-        &lpr_control_fd_table.files[interest->target_file_index];
+    const lpr_ofd_t *target =
+        &lpr_control_fd_table.ofds[interest->target_ofd_index];
     if (!target->active || target->generation != interest->target_generation) {
         return -1;
     }
-    if (interest->target_fd < lpr_control_fd_table.slot_count) {
-        const lpr_fd_table_slot_t *slot =
-            &lpr_control_fd_table.slots[interest->target_fd];
-        if (slot->active && slot->file_index == interest->target_file_index) {
+    if (interest->target_fd < lpr_control_fd_table.entry_count) {
+        const lpr_fd_entry_t *slot =
+            &lpr_control_fd_table.entries[interest->target_fd];
+        if (slot->active && slot->ofd_index == interest->target_ofd_index) {
             return (int)interest->target_fd;
         }
     }
-    for (uint32_t fd = 0; fd < lpr_control_fd_table.slot_count; fd++) {
-        const lpr_fd_table_slot_t *slot = &lpr_control_fd_table.slots[fd];
-        if (slot->active && slot->file_index == interest->target_file_index) {
+    for (uint32_t fd = 0; fd < lpr_control_fd_table.entry_count; fd++) {
+        const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[fd];
+        if (slot->active && slot->ofd_index == interest->target_ofd_index) {
             return (int)fd;
         }
     }
@@ -375,18 +374,18 @@ static int64_t lpr_epoll_snapshot(
 {
     *out_count = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
-    if (epfd >= lpr_control_fd_table.slot_count ||
-        !lpr_control_fd_table.slots[epfd].active)
+    if (epfd >= lpr_control_fd_table.entry_count ||
+        !lpr_control_fd_table.entries[epfd].active)
     {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    const lpr_fd_table_slot_t *slot = &lpr_control_fd_table.slots[epfd];
-    if (slot->file_index >= lpr_control_fd_table.file_count) {
+    const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[epfd];
+    if (slot->ofd_index >= lpr_control_fd_table.ofd_count) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return -LPR_LINUX_EBADF;
     }
-    lpr_fd_object_t *object = &lpr_control_fd_table.files[slot->file_index];
+    lpr_ofd_t *object = &lpr_control_fd_table.ofds[slot->ofd_index];
     lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(object);
     if (instance == 0) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
@@ -398,11 +397,11 @@ static int64_t lpr_epoll_snapshot(
         if (target_fd < 0) {
             continue;
         }
-        const lpr_fd_object_t *target =
-            &lpr_control_fd_table.files[interest->target_file_index];
+        const lpr_ofd_t *target =
+            &lpr_control_fd_table.ofds[interest->target_ofd_index];
         lpr_epoll_snapshot_t *item = &snapshot[*out_count];
         item->fd = target_fd;
-        item->kind = target->kind;
+        item->kind = lpr_ofd_ops_id(target);
         item->events = interest->events;
         item->data = interest->data;
         (*out_count)++;
@@ -419,7 +418,7 @@ static int64_t lpr_epoll_scan(
 {
     lpr_linux_pollfd_t pollfds[LPR_EPOLL_MAX_INTERESTS];
     for (uint32_t i = 0; i < count; i++) {
-        pollfds[i].fd = snapshot[i].kind == LPR_FD_TABLE_KIND_EPOLL ?
+        pollfds[i].fd = snapshot[i].kind == LPR_FD_OPS_EPOLL ?
             -1 : snapshot[i].fd;
         pollfds[i].events = (int16_t)(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP);
         pollfds[i].revents = 0;
@@ -433,7 +432,7 @@ static int64_t lpr_epoll_scan(
     }
     uint32_t ready = 0;
     for (uint32_t i = 0; i < count && ready < maxevents; i++) {
-        if (snapshot[i].kind == LPR_FD_TABLE_KIND_EPOLL) {
+        if (snapshot[i].kind == LPR_FD_OPS_EPOLL) {
             lpr_linux_epoll_event_t nested_event;
             const int64_t nested_ready = lpr_linux_epoll_wait(
                 (uint64_t)(uint32_t)snapshot[i].fd,
@@ -486,17 +485,17 @@ static int64_t lpr_epoll_block(
     uint32_t native_count = 0;
     for (uint32_t i = 0; i < count && native_count < LPR_EPOLL_NATIVE_WAIT_MAX; i++) {
         int native_fd = -1;
-        if (snapshot[i].kind == LPR_FD_TABLE_KIND_PIPE) native_fd = snapshot[i].fd;
-        else if (snapshot[i].kind == LPR_FD_TABLE_KIND_DRM)
+        if (snapshot[i].kind == LPR_FD_OPS_PIPE) native_fd = snapshot[i].fd;
+        else if (snapshot[i].kind == LPR_FD_OPS_DRM)
             native_fd = lpr_drm_native_wait_fd((uint64_t)(uint32_t)snapshot[i].fd);
-        else if (snapshot[i].kind == LPR_FD_TABLE_KIND_INPUT)
+        else if (snapshot[i].kind == LPR_FD_OPS_INPUT)
             native_fd = lpr_input_native_wait_fd((uint64_t)(uint32_t)snapshot[i].fd);
-        else if (snapshot[i].kind == LPR_FD_TABLE_KIND_SOCKET)
+        else if (snapshot[i].kind == LPR_FD_OPS_SOCKET)
             native_fd = lpr_linux_socket_native_wait_fd((uint64_t)(uint32_t)snapshot[i].fd);
         if (native_fd < 16) continue;
         lpr_memset(&pollfds[native_count], 0, sizeof(pollfds[native_count]));
         pollfds[native_count].fd = native_fd;
-        pollfds[native_count].events = snapshot[i].kind == LPR_FD_TABLE_KIND_PIPE ?
+        pollfds[native_count].events = snapshot[i].kind == LPR_FD_OPS_PIPE ?
             lpr_pipe_poll_events_to_pacha(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) :
             PACHA_FD_EVENT_READABLE;
         native_count++;
@@ -569,30 +568,7 @@ int64_t lpr_linux_epoll_wait(
             return ready;
         }
 
-        int supervisor_has_children = 0;
-        if (lpr_supervisor_enabled) {
-            lprs_process_state_t state;
-            lpr_memset(&state, 0, sizeof(state));
-            if (lpr_supervisor_get_state(&state) == 0) {
-                supervisor_has_children =
-                    (state.flags & LPRS_PROCESS_STATE_HAS_CHILDREN) != 0;
-                if ((state.flags & LPRS_PROCESS_STATE_SIGCHLD_PENDING) != 0) {
-                    lpr_linux_queue_signal(LPR_LINUX_SIGCHLD);
-                    const int64_t signal_status =
-                        lpr_linux_dispatch_pending_signals();
-                    if (signal_status != 0) {
-                        return signal_status;
-                    }
-                }
-            }
-        }
-
         int64_t block_ms = remaining_ms;
-        if (supervisor_has_children &&
-            (block_ms < 0 || block_ms > (int64_t)LPR_EPOLL_WAIT_QUANTUM_MS))
-        {
-            block_ms = (int64_t)LPR_EPOLL_WAIT_QUANTUM_MS;
-        }
         uint64_t waited_ms = 0;
         const int64_t wait_status = lpr_epoll_block(snapshot, count, block_ms, &waited_ms);
         lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
@@ -650,33 +626,31 @@ void lpr_epoll_before_close(uint64_t fd_raw)
         return;
     }
     const uint32_t fd = (uint32_t)fd_raw;
-    uint64_t unmap_address = 0;
-    uint64_t unmap_bytes = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
-    if (fd >= lpr_control_fd_table.slot_count || !lpr_control_fd_table.slots[fd].active) {
+    if (fd >= lpr_control_fd_table.entry_count || !lpr_control_fd_table.entries[fd].active) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return;
     }
-    const lpr_fd_table_slot_t *slot = &lpr_control_fd_table.slots[fd];
-    if (slot->file_index >= lpr_control_fd_table.file_count) {
+    const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[fd];
+    if (slot->ofd_index >= lpr_control_fd_table.ofd_count) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return;
     }
-    lpr_fd_object_t *closing = &lpr_control_fd_table.files[slot->file_index];
+    lpr_ofd_t *closing = &lpr_control_fd_table.ofds[slot->ofd_index];
     if (!closing->active || closing->refcount == 0) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return;
     }
     if (closing->refcount == 1) {
-        for (uint32_t i = 0; i < lpr_control_fd_table.file_count; i++) {
-            lpr_fd_object_t *object = &lpr_control_fd_table.files[i];
+        for (uint32_t i = 0; i < lpr_control_fd_table.ofd_count; i++) {
+            lpr_ofd_t *object = &lpr_control_fd_table.ofds[i];
             lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(object);
             if (instance == 0) {
                 continue;
             }
             for (uint32_t j = 0; j < instance->count;) {
                 const lpr_epoll_interest_t *interest = &instance->interests[j];
-                if (interest->target_file_index == slot->file_index &&
+                if (interest->target_ofd_index == slot->ofd_index &&
                     interest->target_generation == closing->generation)
                 {
                     lpr_epoll_remove_interest(instance, j);
@@ -685,15 +659,6 @@ void lpr_epoll_before_close(uint64_t fd_raw)
                 j++;
             }
         }
-        if (closing->kind == LPR_FD_TABLE_KIND_EPOLL) {
-            unmap_address = closing->payload.epoll.instance;
-            unmap_bytes = closing->payload.epoll.map_bytes;
-            closing->payload.epoll.instance = 0;
-            closing->payload.epoll.map_bytes = 0;
-        }
     }
     lpr_fd_table_unlock(&lpr_control_fd_table);
-    if (unmap_address >= LPR_USER_LOW_GUARD_END && unmap_bytes != 0) {
-        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, unmap_address, unmap_bytes);
-    }
 }

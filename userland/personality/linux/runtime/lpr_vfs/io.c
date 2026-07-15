@@ -15,7 +15,7 @@ int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uin
     }
     filed_io_t *io = (filed_io_t *)page;
     lpr_memset(io, 0, sizeof(*io));
-    io->handle = lpr_fd_filed_payload(fd)->handle;
+    io->handle = lpr_filed_backend(fd)->handle;
     io->offset = offset;
     io->length = count > FILED_IO_BYTES ? FILED_IO_BYTES : count;
     if (op == FILED_OP_VFS_WRITE && io->length != 0) {
@@ -78,7 +78,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
         return 0;
     }
     lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_find_marker(lpr_fd_filed_payload(fd)->handle, page_start);
+        lpr_page_cache_find_marker(lpr_filed_backend(fd)->handle, page_start);
     if (entry == 0) {
         entry = lpr_page_cache_slot();
     }
@@ -93,7 +93,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
     }
     lpr_memset(entry, 0, offsetof(lpr_filed_page_cache_entry_t, data));
     entry->active = 1;
-    entry->handle = lpr_fd_filed_payload(fd)->handle;
+    entry->handle = lpr_filed_backend(fd)->handle;
     entry->page_start = page_start;
     entry->length = (uint64_t)n;
     entry->clock = ++lpr_page_cache_clock;
@@ -108,7 +108,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
 static lpr_filed_page_cache_entry_t *lpr_page_cache_get(uint64_t fd, uint64_t offset, uint64_t requested, int *out_hit)
 {
     lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_lookup(lpr_fd_filed_payload(fd)->handle, offset, requested);
+        lpr_page_cache_lookup(lpr_filed_backend(fd)->handle, offset, requested);
     if (entry != 0) {
         if (out_hit != 0) {
             *out_hit = 1;
@@ -154,10 +154,10 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
     return (int64_t)requested;
 }
 
-int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (lpr_linux_device_fd_active(fd)) {
-        if ((lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
+        if ((lpr_device_backend(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
             return -LPR_LINUX_EBADF;
         }
         (void)buf;
@@ -183,15 +183,16 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
         if (buf == 0) {
             return -LPR_LINUX_EFAULT;
         }
-        if (lpr_fd_event_payload(fd)->counter == 0) {
+        if (lpr_event_backend(fd)->counter == 0) {
             return -LPR_LINUX_EAGAIN;
         }
-        *(uint64_t *)(uintptr_t)buf = lpr_fd_event_payload(fd)->counter;
-        lpr_fd_event_payload(fd)->counter = 0;
+        *(uint64_t *)(uintptr_t)buf = lpr_event_backend(fd)->counter;
+        lpr_event_backend(fd)->counter = 0;
         return (int64_t)sizeof(uint64_t);
     }
     if (lpr_pipe_fd_is_active(fd)) {
-        if (!lpr_fd_pipe_payload(fd)->readable) {
+        lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
+        if (pipe == 0 || !pipe->readable || pipe->native.raw < 0) {
             return -LPR_LINUX_EBADF;
         }
         if (count == 0) {
@@ -201,13 +202,17 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
             return -LPR_LINUX_EFAULT;
         }
         for (;;) {
-            const int64_t n = lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_READ, fd, buf, count);
+            const int64_t n = lpr_pacha_syscall3(
+                PACHAOS_SYSCALL_FD_READ,
+                (uint64_t)(uint32_t)pipe->native.raw,
+                buf,
+                count);
             if (n >= 0) {
                 return n;
             }
             const int64_t err = lpr_pacha_status_to_errno(n);
             if (err != -LPR_LINUX_EAGAIN ||
-                (lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
+                (pipe->flags & LPR_LINUX_O_NONBLOCK) != 0)
             {
                 return err;
             }
@@ -222,20 +227,20 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
             return 0;
         }
         if (lpr_fd_shadow_offset_eligible(fd) &&
-            lpr_fd_filed_payload(fd)->offset_valid &&
+            lpr_filed_backend(fd)->offset_valid &&
             count <= LPR_FILED_PAGE_CACHE_BYTES)
         {
             const uint64_t offset = lpr_filed_control_offset(fd);
             const int64_t cached = lpr_read_from_page_cache(fd, buf, count, offset);
             if (cached >= 0) {
                 lpr_filed_control_advance_offset(fd, offset, (uint64_t)cached);
-                lpr_fd_filed_payload(fd)->pread_active = 1;
+                lpr_filed_backend(fd)->pread_active = 1;
                 return cached;
             }
         }
         if (lpr_fd_shadow_offset_eligible(fd) &&
-            lpr_fd_filed_payload(fd)->offset_valid &&
-            lpr_fd_filed_payload(fd)->pread_active)
+            lpr_filed_backend(fd)->offset_valid &&
+            lpr_filed_backend(fd)->pread_active)
         {
             const uint64_t offset = lpr_filed_control_offset(fd);
             const int64_t n = count > FILED_IO_BYTES ?
@@ -255,31 +260,36 @@ int64_t lpr_linux_read(uint64_t fd, uint64_t buf, uint64_t count)
         }
         return n;
     }
-    return lpr_native_pipe_read(fd, buf, count);
+    return -LPR_LINUX_EBADF;
 }
 
-int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
+int64_t lpr_backend_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
 {
     lpr_readv_cache_total++;
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
     }
     if (lpr_linux_device_fd_active(fd)) {
-        return (lpr_fd_device_payload(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY ?
+        return (lpr_device_backend(fd)->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY ?
             -LPR_LINUX_EBADF : 0;
     }
     if (lpr_pipe_fd_is_active(fd)) {
-        if (!lpr_fd_pipe_payload(fd)->readable) {
+        lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
+        if (pipe == 0 || !pipe->readable || pipe->native.raw < 0) {
             return -LPR_LINUX_EBADF;
         }
         for (;;) {
-            const int64_t n = lpr_pacha_syscall3(PACHAOS_SYSCALL_FD_READV, fd, iov_raw, iov_count);
+            const int64_t n = lpr_pacha_syscall3(
+                PACHAOS_SYSCALL_FD_READV,
+                (uint64_t)(uint32_t)pipe->native.raw,
+                iov_raw,
+                iov_count);
             if (n >= 0) {
                 return n;
             }
             const int64_t err = lpr_pacha_status_to_errno(n);
             if (err != -LPR_LINUX_EAGAIN ||
-                (lpr_fd_pipe_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0)
+                (pipe->flags & LPR_LINUX_O_NONBLOCK) != 0)
             {
                 return err;
             }
@@ -314,7 +324,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         return total;
     }
     if (!lpr_fd_is_filed(fd)) {
-        return lpr_native_pipe_readv(fd, iov_raw, iov_count);
+        return -LPR_LINUX_EBADF;
     }
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
     uint64_t trace_requested = 0;
@@ -325,7 +335,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
     }
     if (iov_count > 1 &&
         lpr_fd_shadow_offset_eligible(fd) &&
-        lpr_fd_filed_payload(fd)->offset_valid)
+        lpr_filed_backend(fd)->offset_valid)
     {
         uint64_t requested = 0;
         for (uint64_t i = 0; i < iov_count; i += 1) {
@@ -357,7 +367,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                         }
                         (void)lpr_scatter_iov(iov, iov_count, entry->data + page_offset, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
-                        lpr_fd_filed_payload(fd)->pread_active = 1;
+                        lpr_filed_backend(fd)->pread_active = 1;
                         return (int64_t)requested;
                     }
                 } else {
@@ -381,7 +391,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                         }
                         (void)lpr_scatter_iov(iov, iov_count, cache_scratch, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
-                        lpr_fd_filed_payload(fd)->pread_active = 1;
+                        lpr_filed_backend(fd)->pread_active = 1;
                         return (int64_t)requested;
                     }
                 }
@@ -395,7 +405,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             const uint64_t got = (uint64_t)n;
             (void)lpr_scatter_iov(iov, iov_count, scratch, got);
             lpr_filed_control_advance_offset(fd, offset, got);
-            lpr_fd_filed_payload(fd)->pread_active = 1;
+            lpr_filed_backend(fd)->pread_active = 1;
             return (int64_t)got;
         }
         if (requested >= LPR_FILED_READV_TO_VMO_MIN && requested <= LPR_FILED_READV_TO_VMO_MAX) {
@@ -419,7 +429,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
                     (void)lpr_scatter_iov(iov, iov_count, src, got);
                     if (lpr_fd_shadow_offset_eligible(fd)) {
                         lpr_filed_control_advance_offset(fd, offset, got);
-                        lpr_fd_filed_payload(fd)->pread_active = 1;
+                        lpr_filed_backend(fd)->pread_active = 1;
                     }
                     lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
                     return (int64_t)got;
@@ -485,7 +495,7 @@ int64_t lpr_linux_pread_to_vmo(
 
     filed_pread_vmo_t *pread_vmo = (filed_pread_vmo_t *)page;
     lpr_memset(pread_vmo, 0, sizeof(*pread_vmo));
-    pread_vmo->handle = lpr_fd_filed_payload(fd)->handle;
+    pread_vmo->handle = lpr_filed_backend(fd)->handle;
     pread_vmo->file_offset = file_offset;
     pread_vmo->vmo_offset = vmo_offset;
     pread_vmo->length = count;

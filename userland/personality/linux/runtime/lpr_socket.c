@@ -142,20 +142,12 @@ static int64_t lpr_linux_sleep_ms(uint64_t ms);
 static int64_t lpr_linux_socket_wait_events(uint64_t fd, uint32_t events, int32_t timeout_ms);
 
 int lpr_fd_slot_alloc_from(uint64_t min_fd);
-int lpr_control_install_fd(uint64_t fd, uint8_t kind, uint64_t linux_flags, uint64_t backend_id, uint64_t offset);
+int lpr_control_install_fd(uint64_t fd, uint8_t ops_id, uint64_t linux_flags, uint64_t backend_id, uint64_t offset);
 void lpr_control_close_fd(uint64_t fd);
 int lpr_control_set_fd_flags(uint64_t fd, uint64_t flags);
 int lpr_control_set_status_flags(uint64_t fd, uint64_t flags);
 int64_t lpr_control_get_fd_flags(uint64_t fd);
 int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode);
-lpr_fd_object_t *lpr_fd_object_for_fd(uint64_t fd);
-
-static lpr_socket_fd_t *lpr_socket_payload(uint64_t fd)
-{
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    return object != 0 && object->kind == LPR_FD_TABLE_KIND_SOCKET ? &object->payload.socket : 0;
-}
-
 static int64_t lpr_negative_status(int64_t status)
 {
     return status < 0 ? status : -LPR_LINUX_EIO;
@@ -201,7 +193,7 @@ static int lpr_socket_connect_target_supported(uint32_t addr_be)
 static int lpr_socket_op_nonblocking(uint64_t fd, uint64_t flags)
 {
     return (flags & LPR_LINUX_MSG_DONTWAIT) != 0 ||
-           (lpr_socket_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0;
+           (lpr_socket_backend(fd)->flags & LPR_LINUX_O_NONBLOCK) != 0;
 }
 
 static int64_t lpr_socket_timeval_to_ms(const lpr_linux_timeval_t *tv, int64_t *out_ms)
@@ -338,15 +330,22 @@ static void lpr_netd_destroy_page(int fd, void *page)
     lpr_state_unlock(&lpr_state.netd_rpc.lock_word);
 }
 
+typedef struct lpr_netd_fd_options {
+    int transfer_fd;
+    int move_transfer;
+    int *out_received_fd;
+} lpr_netd_fd_options_t;
+
 static int64_t lpr_netd_call_with_fd(
     uint64_t op,
     int page_fd,
     uint64_t word2,
     uint64_t *out_result,
-    int transfer_fd,
-    int move_transfer,
-    int *out_received_fd)
+    const lpr_netd_fd_options_t *fd_options)
 {
+    const int transfer_fd = fd_options != 0 ? fd_options->transfer_fd : -1;
+    const int move_transfer = fd_options != 0 ? fd_options->move_transfer : 0;
+    int *const out_received_fd = fd_options != 0 ? fd_options->out_received_fd : 0;
     const int ready = lpr_netd_endpoint_ready();
     if (ready != 0) {
         return ready;
@@ -426,25 +425,25 @@ static int64_t lpr_netd_call_with_fd(
 
 static int64_t lpr_netd_call(uint64_t op, int page_fd, uint64_t word2, uint64_t *out_result)
 {
-    return lpr_netd_call_with_fd(op, page_fd, word2, out_result, -1, 0, 0);
+    return lpr_netd_call_with_fd(op, page_fd, word2, out_result, 0);
 }
 
 int lpr_linux_socket_fd_active(uint64_t fd)
 {
-    lpr_socket_fd_t *socket = lpr_socket_payload(fd);
+    lpr_socket_backend_t *socket = lpr_socket_backend(fd);
     return socket != 0 && socket->active;
 }
 
 int lpr_linux_socket_fd_cloexec(uint64_t fd)
 {
-    lpr_socket_fd_t *socket = lpr_socket_payload(fd);
+    lpr_socket_backend_t *socket = lpr_socket_backend(fd);
     return socket != 0 && socket->active && socket->cloexec;
 }
 
 int lpr_linux_socket_native_wait_fd(uint64_t fd)
 {
-    lpr_socket_fd_t *socket = lpr_socket_payload(fd);
-    return socket != 0 && socket->active ? socket->native_wait_fd : -1;
+    lpr_socket_backend_t *socket = lpr_socket_backend(fd);
+    return socket != 0 && socket->active ? socket->wait_fd.raw : -1;
 }
 
 static int lpr_socket_alloc_fd(void)
@@ -457,8 +456,8 @@ static void lpr_socket_discard_received_fd(uint32_t kind, uint64_t handle, int w
     if (wait_fd >= 16)
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
     if (kind == NETD_FD_KIND_FILED_MEMFD) (void)lpr_filed_close_handle(handle);
-    else if (kind == LPR_FD_TABLE_KIND_INPUT) (void)lpr_input_close_handle(handle);
-    else if (kind == LPR_FD_TABLE_KIND_DRM) (void)lpr_drm_close_handle(handle);
+    else if (kind == LPR_FD_OPS_INPUT) (void)lpr_input_close_handle(handle);
+    else if (kind == LPR_FD_OPS_DRM) (void)lpr_drm_close_handle(handle);
 }
 
 static uint16_t lpr_socket_htons(uint16_t value)
@@ -546,8 +545,13 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
         }
     }
     uint64_t handle = 0;
+    const lpr_netd_fd_options_t fd_options = {
+        .transfer_fd = remote_wait_fd,
+        .move_transfer = 1,
+        .out_received_fd = 0,
+    };
     const int64_t status = lpr_netd_call_with_fd(
-        NETD_OP_SOCKET, page_fd, 0, &handle, remote_wait_fd, 1, 0);
+        NETD_OP_SOCKET, page_fd, 0, &handle, &fd_options);
     lpr_netd_destroy_page(page_fd, page);
     if (status != 0) {
         if (native_wait_fd >= 16)
@@ -572,7 +576,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
         ((flags & LPR_LINUX_SOCK_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
     const int install_status = lpr_control_install_fd(
         (uint64_t)(uint32_t)fd,
-        LPR_FD_TABLE_KIND_SOCKET,
+        LPR_FD_OPS_SOCKET,
         linux_flags,
         handle,
         0);
@@ -583,7 +587,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
         lpr_socket_trace_socket(domain, type, protocol, install_status);
         return install_status;
     }
-    lpr_socket_fd_t *socket = lpr_socket_payload((uint64_t)(uint32_t)fd);
+    lpr_socket_backend_t *socket = lpr_socket_backend((uint64_t)(uint32_t)fd);
     if (socket == 0) {
         lpr_control_close_fd((uint64_t)(uint32_t)fd);
         (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
@@ -609,7 +613,7 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
     socket->rcvtimeo_ms = 0;
     socket->handle = handle;
     socket->last_error = 0;
-    socket->native_wait_fd = native_wait_fd;
+    socket->wait_fd.raw = native_wait_fd;
     socket->local_addr_be = 0;
     socket->local_port_be = lpr_socket_next_port_be();
     socket->peer_addr_be = 0;
@@ -620,36 +624,33 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
 
 int64_t lpr_linux_socket_close(uint64_t fd)
 {
-    if (!lpr_linux_socket_fd_active(fd)) {
-        return -LPR_LINUX_EBADF;
+    return lpr_linux_close(fd);
+}
+
+int64_t lpr_socket_close_backend(void *state)
+{
+    const lpr_socket_backend_t *socket = state;
+    const int64_t status = socket->handle != 0 ?
+        lpr_netd_call(NETD_OP_CLOSE, -1, socket->handle, 0) : 0;
+    if (socket->wait_fd.raw >= 16) {
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)socket->wait_fd.raw);
     }
-    lpr_fd_object_t *object = lpr_fd_object_for_fd(fd);
-    if (object == 0) {
-        return -LPR_LINUX_EBADF;
-    }
-    const uint32_t refcount = object->refcount;
-    const uint64_t handle = object->payload.socket.handle;
-    const int native_wait_fd = object->payload.socket.native_wait_fd;
-    lpr_control_close_fd(fd);
-    if (refcount > 1) return 0;
-    const int64_t status = lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
-    if (native_wait_fd >= 16)
-        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)native_wait_fd);
     return status;
 }
 
 void lpr_socket_prepare_process_exit(void)
 {
     lpr_fd_arrays_init();
-    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; ++index) {
-        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
-        if (!object->active || object->kind != LPR_FD_TABLE_KIND_SOCKET ||
-            object->payload.socket.handle == 0) continue;
-        const uint64_t handle = object->payload.socket.handle;
-        const int native_wait_fd = object->payload.socket.native_wait_fd;
-        object->payload.socket.handle = 0;
-        object->payload.socket.native_wait_fd = -1;
-        object->backend_id = 0;
+    for (uint32_t index = 0; index < lpr_control_fd_table.ofd_count; ++index) {
+        lpr_ofd_t *object = &lpr_control_fd_table.ofds[index];
+        if (!object->active || lpr_ofd_ops_id(object) != LPR_FD_OPS_SOCKET ||
+            ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle == 0) continue;
+        const uint64_t handle = ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle;
+        const int native_wait_fd = ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw;
+        ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle = 0;
+        ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->wait_fd.raw = -1;
         if (native_wait_fd >= 16)
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
         (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
@@ -660,20 +661,20 @@ int lpr_socket_prepare_fork(void)
 {
     lpr_fd_arrays_init();
     lpr_fd_table_lock(&lpr_control_fd_table);
-    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; ++index) {
-        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
-        if (!object->active || object->kind != LPR_FD_TABLE_KIND_SOCKET ||
-            object->payload.socket.domain != LPR_LINUX_AF_UNIX ||
-            object->payload.socket.handle == 0) continue;
+    for (uint32_t index = 0; index < lpr_control_fd_table.ofd_count; ++index) {
+        lpr_ofd_t *object = &lpr_control_fd_table.ofds[index];
+        if (!object->active || lpr_ofd_ops_id(object) != LPR_FD_OPS_SOCKET ||
+            ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->domain != LPR_LINUX_AF_UNIX ||
+            ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle == 0) continue;
         const int64_t status = lpr_netd_call(
-            NETD_OP_DUP, -1, object->payload.socket.handle, 0);
+            NETD_OP_DUP, -1, ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle, 0);
         if (status == 0) continue;
         for (uint32_t rollback = 0; rollback < index; ++rollback) {
-            lpr_fd_object_t *prior = &lpr_control_fd_table.files[rollback];
-            if (prior->active && prior->kind == LPR_FD_TABLE_KIND_SOCKET &&
-                prior->payload.socket.domain == LPR_LINUX_AF_UNIX &&
-                prior->payload.socket.handle != 0)
-                (void)lpr_netd_call(NETD_OP_CLOSE, -1, prior->payload.socket.handle, 0);
+            lpr_ofd_t *prior = &lpr_control_fd_table.ofds[rollback];
+            if (prior->active && lpr_ofd_ops_id(prior) == LPR_FD_OPS_SOCKET &&
+                ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(prior))->domain == LPR_LINUX_AF_UNIX &&
+                ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(prior))->handle != 0)
+                (void)lpr_netd_call(NETD_OP_CLOSE, -1, ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(prior))->handle, 0);
         }
         lpr_fd_table_unlock(&lpr_control_fd_table);
         return (int)status;
@@ -686,12 +687,12 @@ void lpr_socket_cancel_fork(void)
 {
     lpr_fd_arrays_init();
     lpr_fd_table_lock(&lpr_control_fd_table);
-    for (uint32_t index = 0; index < lpr_control_fd_table.file_count; ++index) {
-        lpr_fd_object_t *object = &lpr_control_fd_table.files[index];
-        if (object->active && object->kind == LPR_FD_TABLE_KIND_SOCKET &&
-            object->payload.socket.domain == LPR_LINUX_AF_UNIX &&
-            object->payload.socket.handle != 0)
-            (void)lpr_netd_call(NETD_OP_CLOSE, -1, object->payload.socket.handle, 0);
+    for (uint32_t index = 0; index < lpr_control_fd_table.ofd_count; ++index) {
+        lpr_ofd_t *object = &lpr_control_fd_table.ofds[index];
+        if (object->active && lpr_ofd_ops_id(object) == LPR_FD_OPS_SOCKET &&
+            ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->domain == LPR_LINUX_AF_UNIX &&
+            ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle != 0)
+            (void)lpr_netd_call(NETD_OP_CLOSE, -1, ((lpr_socket_backend_t *)lpr_backend_state_from_ofd(object))->handle, 0);
     }
     lpr_fd_table_unlock(&lpr_control_fd_table);
 }
@@ -738,7 +739,7 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     if (addr_raw == 0 || addrlen < sizeof(uint16_t)) {
         return -LPR_LINUX_EINVAL;
     }
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_UNIX) {
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_UNIX) {
         const lpr_linux_sockaddr_un_t *addr = (const lpr_linux_sockaddr_un_t *)(uintptr_t)addr_raw;
         if (addr->family != LPR_LINUX_AF_UNIX || addrlen > sizeof(*addr)) return -LPR_LINUX_EINVAL;
         void *page = 0;
@@ -746,15 +747,15 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
         if (page_fd < 0) return page_fd;
         lpr_memset(page, 0, NETD_PAGE_BYTES);
         netd_unix_path_t *req = page;
-        req->handle = lpr_socket_payload(fd)->handle;
+        req->handle = lpr_socket_backend(fd)->handle;
         req->pid = (int32_t)lpr_linux_getpid();
         lpr_memcpy(req->path, addr->path, sizeof(req->path));
         const int64_t status = lpr_netd_call(NETD_OP_CONNECT, page_fd, 0, 0);
         lpr_netd_destroy_page(page_fd, page);
-        if (status == 0) lpr_socket_payload(fd)->connected = 1;
+        if (status == 0) lpr_socket_backend(fd)->connected = 1;
         return status;
     }
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_NETLINK)
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK)
         return -LPR_LINUX_EOPNOTSUPP;
     if (addrlen < sizeof(lpr_linux_sockaddr_in_t)) return -LPR_LINUX_EINVAL;
     const lpr_linux_sockaddr_in_t *addr = (const lpr_linux_sockaddr_in_t *)(uintptr_t)addr_raw;
@@ -763,9 +764,9 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     }
     if (!lpr_socket_connect_target_supported(addr->addr_be)) {
         lpr_socket_debug_connect("reject", addr->addr_be, addr->port_be, -LPR_LINUX_ENETUNREACH);
-        lpr_socket_payload(fd)->connected = 0;
-        lpr_socket_payload(fd)->connecting = 0;
-        lpr_socket_payload(fd)->last_error = LPR_LINUX_ENETUNREACH;
+        lpr_socket_backend(fd)->connected = 0;
+        lpr_socket_backend(fd)->connecting = 0;
+        lpr_socket_backend(fd)->last_error = LPR_LINUX_ENETUNREACH;
         return -LPR_LINUX_ENETUNREACH;
     }
     void *page = 0;
@@ -775,7 +776,7 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     }
     lpr_memset(page, 0, NETD_PAGE_BYTES);
     netd_connect_t *req = (netd_connect_t *)page;
-    req->handle = lpr_socket_payload(fd)->handle;
+    req->handle = lpr_socket_backend(fd)->handle;
     req->addr.addr_be = addr->addr_be;
     req->addr.port_be = addr->port_be;
     lpr_socket_debug_connect("begin", addr->addr_be, addr->port_be, 0);
@@ -783,36 +784,36 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     lpr_socket_debug_connect("end", addr->addr_be, addr->port_be, status);
     lpr_netd_destroy_page(page_fd, page);
     if (status == 0) {
-        lpr_socket_payload(fd)->connected = 1;
-        lpr_socket_payload(fd)->connecting = 0;
-        lpr_socket_payload(fd)->last_error = 0;
-        lpr_socket_payload(fd)->local_addr_be = LPR_NETD_DEFAULT_ADDR_BE;
-        lpr_socket_payload(fd)->peer_addr_be = addr->addr_be;
-        lpr_socket_payload(fd)->peer_port_be = addr->port_be;
+        lpr_socket_backend(fd)->connected = 1;
+        lpr_socket_backend(fd)->connecting = 0;
+        lpr_socket_backend(fd)->last_error = 0;
+        lpr_socket_backend(fd)->local_addr_be = LPR_NETD_DEFAULT_ADDR_BE;
+        lpr_socket_backend(fd)->peer_addr_be = addr->addr_be;
+        lpr_socket_backend(fd)->peer_port_be = addr->port_be;
     } else if (status == -LPR_LINUX_EINPROGRESS || status == -LPR_LINUX_EALREADY) {
-        lpr_socket_payload(fd)->connected = 0;
-        lpr_socket_payload(fd)->connecting = 1;
-        lpr_socket_payload(fd)->last_error = 0;
-        lpr_socket_payload(fd)->local_addr_be = LPR_NETD_DEFAULT_ADDR_BE;
-        lpr_socket_payload(fd)->peer_addr_be = addr->addr_be;
-        lpr_socket_payload(fd)->peer_port_be = addr->port_be;
-        if ((lpr_socket_payload(fd)->flags & LPR_LINUX_O_NONBLOCK) == 0) {
-            const int64_t wait_status = lpr_linux_socket_wait_events(fd, LPR_LINUX_POLLOUT, lpr_socket_payload(fd)->sndtimeo_ms);
+        lpr_socket_backend(fd)->connected = 0;
+        lpr_socket_backend(fd)->connecting = 1;
+        lpr_socket_backend(fd)->last_error = 0;
+        lpr_socket_backend(fd)->local_addr_be = LPR_NETD_DEFAULT_ADDR_BE;
+        lpr_socket_backend(fd)->peer_addr_be = addr->addr_be;
+        lpr_socket_backend(fd)->peer_port_be = addr->port_be;
+        if ((lpr_socket_backend(fd)->flags & LPR_LINUX_O_NONBLOCK) == 0) {
+            const int64_t wait_status = lpr_linux_socket_wait_events(fd, LPR_LINUX_POLLOUT, lpr_socket_backend(fd)->sndtimeo_ms);
             if (wait_status != 0) {
                 return wait_status;
             }
-            if (lpr_socket_payload(fd)->last_error != 0) {
-                const int32_t error = lpr_socket_payload(fd)->last_error;
-                lpr_socket_payload(fd)->last_error = 0;
+            if (lpr_socket_backend(fd)->last_error != 0) {
+                const int32_t error = lpr_socket_backend(fd)->last_error;
+                lpr_socket_backend(fd)->last_error = 0;
                 return -error;
             }
-            lpr_socket_payload(fd)->connected = 1;
-            lpr_socket_payload(fd)->connecting = 0;
+            lpr_socket_backend(fd)->connected = 1;
+            lpr_socket_backend(fd)->connecting = 0;
             return 0;
         }
     } else {
-        lpr_socket_payload(fd)->connecting = 0;
-        lpr_socket_payload(fd)->last_error = (int32_t)-status;
+        lpr_socket_backend(fd)->connecting = 0;
+        lpr_socket_backend(fd)->last_error = (int32_t)-status;
     }
     return status;
 }
@@ -825,7 +826,7 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     if (addr_raw == 0 || addrlen < sizeof(uint16_t)) {
         return -LPR_LINUX_EINVAL;
     }
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_UNIX) {
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_UNIX) {
         const lpr_linux_sockaddr_un_t *addr = (const lpr_linux_sockaddr_un_t *)(uintptr_t)addr_raw;
         if (addr->family != LPR_LINUX_AF_UNIX || addr->path[0] == 0 || addrlen > sizeof(*addr)) return -LPR_LINUX_EINVAL;
         const int64_t node = lpr_linux_mknodat(
@@ -844,7 +845,7 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
         }
         lpr_memset(page, 0, NETD_PAGE_BYTES);
         netd_unix_path_t *req = page;
-        req->handle = lpr_socket_payload(fd)->handle;
+        req->handle = lpr_socket_backend(fd)->handle;
         req->pid = (int32_t)lpr_linux_getpid();
         lpr_memcpy(req->path, addr->path, sizeof(req->path));
         const int64_t status = lpr_netd_call(NETD_OP_BIND, page_fd, 0, 0);
@@ -856,7 +857,7 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
         }
         return status;
     }
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_NETLINK) {
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
         if (addrlen < sizeof(lpr_linux_sockaddr_nl_t)) return -LPR_LINUX_EINVAL;
         const lpr_linux_sockaddr_nl_t *addr = (const lpr_linux_sockaddr_nl_t *)(uintptr_t)addr_raw;
         if (addr->family != LPR_LINUX_AF_NETLINK) return -LPR_LINUX_EAFNOSUPPORT;
@@ -867,14 +868,14 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
         if (page_fd < 0) return page_fd;
         lpr_memset(page, 0, NETD_PAGE_BYTES);
         netd_netlink_bind_t *request = page;
-        request->handle = lpr_socket_payload(fd)->handle;
+        request->handle = lpr_socket_backend(fd)->handle;
         request->pid = pid;
         request->groups = groups;
         const int64_t status = lpr_netd_call(NETD_OP_BIND, page_fd, 0, 0);
         lpr_netd_destroy_page(page_fd, page);
         if (status == 0) {
-            lpr_socket_payload(fd)->local_addr_be = pid;
-            lpr_socket_payload(fd)->peer_addr_be = groups;
+            lpr_socket_backend(fd)->local_addr_be = pid;
+            lpr_socket_backend(fd)->peer_addr_be = groups;
         }
         return status;
     }
@@ -883,8 +884,8 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     if (addr->family != LPR_LINUX_AF_INET) {
         return -LPR_LINUX_EAFNOSUPPORT;
     }
-    lpr_socket_payload(fd)->local_addr_be = addr->addr_be;
-    lpr_socket_payload(fd)->local_port_be = addr->port_be != 0 ? addr->port_be : lpr_socket_next_port_be();
+    lpr_socket_backend(fd)->local_addr_be = addr->addr_be;
+    lpr_socket_backend(fd)->local_port_be = addr->port_be != 0 ? addr->port_be : lpr_socket_next_port_be();
     return 0;
 }
 
@@ -892,24 +893,24 @@ int64_t lpr_linux_listen(uint64_t fd, uint64_t backlog)
 {
     (void)backlog;
     if (!lpr_linux_socket_fd_active(fd)) return -LPR_LINUX_EBADF;
-    if (lpr_socket_payload(fd)->domain != LPR_LINUX_AF_UNIX) return -LPR_LINUX_EOPNOTSUPP;
-    return lpr_netd_call(NETD_OP_LISTEN, -1, lpr_socket_payload(fd)->handle, 0);
+    if (lpr_socket_backend(fd)->domain != LPR_LINUX_AF_UNIX) return -LPR_LINUX_EOPNOTSUPP;
+    return lpr_netd_call(NETD_OP_LISTEN, -1, lpr_socket_backend(fd)->handle, 0);
 }
 
 int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
 {
     (void)addr; (void)addrlen;
     if (!lpr_linux_socket_fd_active(fd)) return -LPR_LINUX_EBADF;
-    if (lpr_socket_payload(fd)->domain != LPR_LINUX_AF_UNIX) return -LPR_LINUX_EOPNOTSUPP;
+    if (lpr_socket_backend(fd)->domain != LPR_LINUX_AF_UNIX) return -LPR_LINUX_EOPNOTSUPP;
     if ((flags & ~(LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC)) != 0) return -LPR_LINUX_EINVAL;
-    if (lpr_socket_payload(fd)->native_wait_fd >= 16)
-        lpr_native_wait_drain(lpr_socket_payload(fd)->native_wait_fd);
+    if (lpr_socket_backend(fd)->wait_fd.raw >= 16)
+        lpr_native_wait_drain(lpr_socket_backend(fd)->wait_fd.raw);
     void *page = 0;
     const int page_fd = lpr_netd_create_page(&page);
     if (page_fd < 0) return page_fd;
     lpr_memset(page, 0, NETD_PAGE_BYTES);
     netd_accept_t *req = page;
-    req->handle = lpr_socket_payload(fd)->handle;
+    req->handle = lpr_socket_backend(fd)->handle;
     uint64_t handle = 0;
     const int64_t status = lpr_netd_call(NETD_OP_ACCEPT, page_fd, 0, &handle);
     if (status != 0) { lpr_netd_destroy_page(page_fd, page); return status; }
@@ -918,8 +919,13 @@ int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t 
     int attach_status = lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
     if (attach_status == 0) {
         req->handle = handle;
+        const lpr_netd_fd_options_t fd_options = {
+            .transfer_fd = remote_wait_fd,
+            .move_transfer = 1,
+            .out_received_fd = 0,
+        };
         attach_status = (int)lpr_netd_call_with_fd(
-            NETD_OP_ATTACH_WAIT, page_fd, 0, 0, remote_wait_fd, 1, 0);
+            NETD_OP_ATTACH_WAIT, page_fd, 0, 0, &fd_options);
     }
     if (attach_status != 0) {
         if (native_wait_fd >= 16)
@@ -941,17 +947,17 @@ int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t 
         ((flags & LPR_LINUX_SOCK_NONBLOCK) ? LPR_LINUX_O_NONBLOCK : 0) |
         ((flags & LPR_LINUX_SOCK_CLOEXEC) ? LPR_LINUX_O_CLOEXEC : 0);
     const int install = lpr_control_install_fd(
-        new_fd, LPR_FD_TABLE_KIND_SOCKET, linux_flags, handle, 0);
+        new_fd, LPR_FD_OPS_SOCKET, linux_flags, handle, 0);
     if (install != 0) {
         (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)native_wait_fd);
         lpr_netd_destroy_page(page_fd, page);
         return install;
     }
-    lpr_socket_fd_t *s = lpr_socket_payload(new_fd);
+    lpr_socket_backend_t *s = lpr_socket_backend(new_fd);
     s->active = 1; s->type = LPR_LINUX_SOCK_STREAM; s->domain = LPR_LINUX_AF_UNIX;
     s->connected = 1; s->flags = (uint32_t)linux_flags; s->handle = handle;
-    s->native_wait_fd = native_wait_fd;
+    s->wait_fd.raw = native_wait_fd;
     s->cloexec = (flags & LPR_LINUX_SOCK_CLOEXEC) != 0;
     s->sndbuf = 256u * 1024u; s->rcvbuf = 256u * 1024u;
     s->peer_pid = req->pid; s->peer_uid = req->uid; s->peer_gid = req->gid;
@@ -987,7 +993,7 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
         }
         lpr_memset(page, 0, NETD_PAGE_BYTES);
         netd_io_t *req = (netd_io_t *)page;
-        req->handle = lpr_socket_payload(fd)->handle;
+        req->handle = lpr_socket_backend(fd)->handle;
         req->length = chunk;
         req->flags = flags;
         if (dest_addr != 0) {
@@ -998,8 +1004,8 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
             }
             req->addr.addr_be = addr->addr_be;
             req->addr.port_be = addr->port_be;
-            lpr_socket_payload(fd)->peer_addr_be = addr->addr_be;
-            lpr_socket_payload(fd)->peer_port_be = addr->port_be;
+            lpr_socket_backend(fd)->peer_addr_be = addr->addr_be;
+            lpr_socket_backend(fd)->peer_port_be = addr->port_be;
         }
         lpr_memcpy(req->data, src + sent_total, (size_t)chunk);
         uint64_t sent = 0;
@@ -1007,7 +1013,7 @@ int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags
         lpr_netd_destroy_page(page_fd, page);
         if (status != 0) {
             if (status == -LPR_LINUX_EAGAIN && !lpr_socket_op_nonblocking(fd, flags)) {
-                const int64_t wait_status = lpr_linux_socket_wait_events(fd, LPR_LINUX_POLLOUT, lpr_socket_payload(fd)->sndtimeo_ms);
+                const int64_t wait_status = lpr_linux_socket_wait_events(fd, LPR_LINUX_POLLOUT, lpr_socket_backend(fd)->sndtimeo_ms);
                 if (wait_status == 0) {
                     continue;
                 }
@@ -1034,9 +1040,9 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
     if (len == 0) {
         return 0;
     }
-    if (lpr_socket_payload(fd)->native_wait_fd >= 16)
+    if (lpr_socket_backend(fd)->wait_fd.raw >= 16)
     {
-        lpr_native_wait_drain(lpr_socket_payload(fd)->native_wait_fd);
+        lpr_native_wait_drain(lpr_socket_backend(fd)->wait_fd.raw);
     }
     void *page = 0;
     const int page_fd = lpr_netd_create_page(&page);
@@ -1045,7 +1051,7 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
     }
     lpr_memset(page, 0, NETD_PAGE_BYTES);
     netd_io_t *req = (netd_io_t *)page;
-    req->handle = lpr_socket_payload(fd)->handle;
+    req->handle = lpr_socket_backend(fd)->handle;
     req->length = len < NETD_IO_BYTES ? len : NETD_IO_BYTES;
     req->flags = flags;
     uint64_t received = 0;
@@ -1054,7 +1060,7 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
         lpr_memcpy((void *)(uintptr_t)buf, req->data, (size_t)received);
         if (src_addr != 0 && addrlen_raw != 0) {
             uint32_t *addrlen = (uint32_t *)(uintptr_t)addrlen_raw;
-            if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_NETLINK &&
+            if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK &&
                 *addrlen >= sizeof(lpr_linux_sockaddr_nl_t))
             {
                 lpr_linux_sockaddr_nl_t *addr =
@@ -1062,21 +1068,21 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
                 lpr_memset(addr, 0, sizeof(*addr));
                 addr->family = LPR_LINUX_AF_NETLINK;
                 addr->pid = 0;
-                addr->groups = lpr_socket_payload(fd)->peer_addr_be;
+                addr->groups = lpr_socket_backend(fd)->peer_addr_be;
                 *addrlen = sizeof(*addr);
             } else if (*addrlen >= sizeof(lpr_linux_sockaddr_in_t)) {
                 lpr_linux_sockaddr_in_t *addr = (lpr_linux_sockaddr_in_t *)(uintptr_t)src_addr;
                 lpr_memset(addr, 0, sizeof(*addr));
                 addr->family = LPR_LINUX_AF_INET;
-                addr->port_be = req->addr.port_be != 0 ? req->addr.port_be : lpr_socket_payload(fd)->peer_port_be;
-                addr->addr_be = req->addr.addr_be != 0 ? req->addr.addr_be : lpr_socket_payload(fd)->peer_addr_be;
+                addr->port_be = req->addr.port_be != 0 ? req->addr.port_be : lpr_socket_backend(fd)->peer_port_be;
+                addr->addr_be = req->addr.addr_be != 0 ? req->addr.addr_be : lpr_socket_backend(fd)->peer_addr_be;
                 *addrlen = sizeof(*addr);
             }
         }
     }
     lpr_netd_destroy_page(page_fd, page);
     if (status == -LPR_LINUX_EAGAIN && !lpr_socket_op_nonblocking(fd, flags)) {
-        const int64_t wait_status = lpr_linux_socket_wait_events(fd, LPR_LINUX_POLLIN, lpr_socket_payload(fd)->rcvtimeo_ms);
+        const int64_t wait_status = lpr_linux_socket_wait_events(fd, LPR_LINUX_POLLIN, lpr_socket_backend(fd)->rcvtimeo_ms);
         if (wait_status == 0) {
             return lpr_linux_recvfrom(fd, buf, len, flags | LPR_LINUX_MSG_DONTWAIT, src_addr, addrlen_raw);
         }
@@ -1142,13 +1148,13 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
     }
     const lpr_linux_msghdr_t *msg = (const lpr_linux_msghdr_t *)(uintptr_t)msg_raw;
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)msg->msg_iov;
-    if (lpr_linux_socket_fd_active(fd) && lpr_socket_payload(fd)->domain == LPR_LINUX_AF_UNIX) {
+    if (lpr_linux_socket_fd_active(fd) && lpr_socket_backend(fd)->domain == LPR_LINUX_AF_UNIX) {
         void *page = 0;
         const int page_fd = lpr_netd_create_page(&page);
         if (page_fd < 0) return page_fd;
         lpr_memset(page, 0, NETD_PAGE_BYTES);
         netd_io_t *req = page;
-        req->handle = lpr_socket_payload(fd)->handle;
+        req->handle = lpr_socket_backend(fd)->handle;
         req->flags = flags;
         for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
             if (req->length > NETD_IO_BYTES - iov[i].len) { lpr_netd_destroy_page(page_fd, page); return -LPR_LINUX_EINVAL; }
@@ -1156,54 +1162,81 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
             req->length += iov[i].len;
         }
         int passed_wait_fd = -1;
+        lpr_fd_pin_t passed_pin;
+        int passed_pin_active = 0;
         if (msg->msg_control != 0 && msg->msg_controllen >= sizeof(lpr_linux_cmsghdr_t) + sizeof(int32_t)) {
             const lpr_linux_cmsghdr_t *cmsg = (const lpr_linux_cmsghdr_t *)(uintptr_t)msg->msg_control;
             if (cmsg->cmsg_level == LPR_LINUX_SOL_SOCKET && cmsg->cmsg_type == LPR_LINUX_SCM_RIGHTS) {
                 const int32_t passed_fd = *(const int32_t *)((const uint8_t *)cmsg + sizeof(*cmsg));
-                lpr_fd_object_t *object = lpr_fd_object_for_fd((uint64_t)(uint32_t)passed_fd);
-                if (object == 0 ||
-                    (object->kind != LPR_FD_TABLE_KIND_INPUT &&
-                     object->kind != LPR_FD_TABLE_KIND_DRM &&
-                     (object->kind != LPR_FD_TABLE_KIND_FILED ||
-                      (object->payload.filed.reserved1 & LPR_FILED_FD_MEMFD) == 0))) {
+                if (passed_fd < 0 || lpr_fd_table_pin(
+                        &lpr_control_fd_table,
+                        (uint32_t)passed_fd,
+                        &passed_pin) != 0)
+                {
                     lpr_netd_destroy_page(page_fd, page); return -LPR_LINUX_EBADF;
                 }
-                int64_t dup_status;
-                if (object->kind == LPR_FD_TABLE_KIND_FILED) {
-                    uint64_t dup_handle = 0;
-                    dup_status = lpr_filed_dup_handle(
-                        object->payload.filed.handle, 0, &dup_handle);
-                    req->fd_kind = NETD_FD_KIND_FILED_MEMFD;
-                    req->fd_flags = object->payload.filed.flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
-                    req->fd_handle = dup_handle;
-                    req->fd_aux = object->payload.filed.reserved1;
-                } else if (object->kind == LPR_FD_TABLE_KIND_INPUT) {
-                    req->fd_handle = object->payload.input.handle;
-                    req->fd_aux = object->payload.input.reserved0;
-                    passed_wait_fd = object->payload.input.native_wait_fd;
-                    dup_status = passed_wait_fd >= 16 ?
-                        lpr_input_dup_handle(object->payload.input.handle) : -LPR_LINUX_EBADF;
-                } else {
-                    req->fd_handle = object->payload.drm.handle;
-                    passed_wait_fd = object->payload.drm.native_wait_fd;
-                    dup_status = passed_wait_fd >= 16 ?
-                        lpr_drm_dup_handle(object->payload.drm.handle) : -LPR_LINUX_EBADF;
+                passed_pin_active = 1;
+                if (passed_pin.ops_id != LPR_FD_OPS_INPUT &&
+                    passed_pin.ops_id != LPR_FD_OPS_DRM &&
+                    (passed_pin.ops_id != LPR_FD_OPS_FILED ||
+                     (((lpr_filed_backend_t *)passed_pin.state)->reserved1 & LPR_FILED_FD_MEMFD) == 0))
+                {
+                    lpr_fd_unpin(&passed_pin);
+                    lpr_netd_destroy_page(page_fd, page);
+                    return -LPR_LINUX_EBADF;
                 }
-                if (dup_status != 0) { lpr_netd_destroy_page(page_fd, page); return dup_status; }
-                if (object->kind != LPR_FD_TABLE_KIND_FILED) {
-                    req->fd_kind = object->kind;
-                    req->fd_flags = object->payload.input.flags;
+                int64_t dup_status;
+                if (passed_pin.ops_id == LPR_FD_OPS_FILED) {
+                    const lpr_filed_backend_t *filed = passed_pin.state;
+                    uint64_t dup_handle = 0;
+                    dup_status = lpr_filed_dup_handle(filed->handle, 0, &dup_handle);
+                    req->fd_kind = NETD_FD_KIND_FILED_MEMFD;
+                    req->fd_flags = filed->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+                    req->fd_handle = dup_handle;
+                    req->fd_aux = filed->reserved1;
+                } else if (passed_pin.ops_id == LPR_FD_OPS_INPUT) {
+                    const lpr_input_backend_t *input = passed_pin.state;
+                    req->fd_handle = input->handle;
+                    req->fd_aux = input->reserved0;
+                    passed_wait_fd = input->wait_fd.raw;
+                    dup_status = passed_wait_fd >= 16 ?
+                        lpr_input_dup_handle(input->handle) : -LPR_LINUX_EBADF;
+                } else {
+                    const lpr_drm_backend_t *drm = passed_pin.state;
+                    req->fd_handle = drm->handle;
+                    passed_wait_fd = drm->wait_fd.raw;
+                    dup_status = passed_wait_fd >= 16 ?
+                        lpr_drm_dup_handle(drm->handle) : -LPR_LINUX_EBADF;
+                }
+                if (dup_status != 0) {
+                    lpr_fd_unpin(&passed_pin);
+                    lpr_netd_destroy_page(page_fd, page);
+                    return dup_status;
+                }
+                if (passed_pin.ops_id != LPR_FD_OPS_FILED) {
+                    req->fd_kind = passed_pin.ops_id;
+                    req->fd_flags = passed_pin.ops_id == LPR_FD_OPS_INPUT ?
+                        ((lpr_input_backend_t *)passed_pin.state)->flags :
+                        ((lpr_drm_backend_t *)passed_pin.state)->flags;
                 }
             }
         }
         uint64_t sent = 0;
+        const lpr_netd_fd_options_t fd_options = {
+            .transfer_fd = passed_wait_fd,
+            .move_transfer = 0,
+            .out_received_fd = 0,
+        };
         const int64_t status = lpr_netd_call_with_fd(
-            NETD_OP_SEND, page_fd, 0, &sent, passed_wait_fd, 0, 0);
+            NETD_OP_SEND, page_fd, 0, &sent, &fd_options);
+        if (passed_pin_active) {
+            lpr_fd_unpin(&passed_pin);
+        }
         if (status != 0 && req->fd_kind == NETD_FD_KIND_FILED_MEMFD)
             (void)lpr_filed_close_handle(req->fd_handle);
-        else if (status != 0 && req->fd_kind == LPR_FD_TABLE_KIND_INPUT)
+        else if (status != 0 && req->fd_kind == LPR_FD_OPS_INPUT)
             (void)lpr_input_close_handle(req->fd_handle);
-        else if (status != 0 && req->fd_kind == LPR_FD_TABLE_KIND_DRM)
+        else if (status != 0 && req->fd_kind == LPR_FD_OPS_DRM)
             (void)lpr_drm_close_handle(req->fd_handle);
         lpr_netd_destroy_page(page_fd, page);
         return status == 0 ? (int64_t)sent : status;
@@ -1235,7 +1268,7 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         return -LPR_LINUX_EFAULT;
     }
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)msg->msg_iov;
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_UNIX) {
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_UNIX) {
         uint64_t capacity = 0;
         for (uint64_t i = 0; i < msg->msg_iovlen; i++) capacity += iov[i].len;
         if (capacity > NETD_IO_BYTES) capacity = NETD_IO_BYTES;
@@ -1243,13 +1276,18 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         const int page_fd = lpr_netd_create_page(&page);
         if (page_fd < 0) return page_fd;
         lpr_memset(page, 0, NETD_PAGE_BYTES);
-        netd_io_t *req = page; req->handle = lpr_socket_payload(fd)->handle; req->length = capacity; req->flags = flags;
+        netd_io_t *req = page; req->handle = lpr_socket_backend(fd)->handle; req->length = capacity; req->flags = flags;
         uint64_t received = 0;
         int received_wait_fd = -1;
-        if (lpr_socket_payload(fd)->native_wait_fd >= 16)
-            lpr_native_wait_drain(lpr_socket_payload(fd)->native_wait_fd);
+        if (lpr_socket_backend(fd)->wait_fd.raw >= 16)
+            lpr_native_wait_drain(lpr_socket_backend(fd)->wait_fd.raw);
+        const lpr_netd_fd_options_t fd_options = {
+            .transfer_fd = -1,
+            .move_transfer = 0,
+            .out_received_fd = &received_wait_fd,
+        };
         const int64_t status = lpr_netd_call_with_fd(
-            NETD_OP_RECV, page_fd, 0, &received, -1, 0, &received_wait_fd);
+            NETD_OP_RECV, page_fd, 0, &received, &fd_options);
         if (status != 0) { lpr_netd_destroy_page(page_fd, page); return status; }
         uint64_t copied = 0;
         for (uint64_t i = 0; i < msg->msg_iovlen && copied < received; i++) {
@@ -1261,8 +1299,8 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
             const int filed_memfd = req->fd_kind == NETD_FD_KIND_FILED_MEMFD;
             if ((filed_memfd && received_wait_fd >= 16) ||
                 (!filed_memfd && received_wait_fd < 16) ||
-                (!filed_memfd && req->fd_kind != LPR_FD_TABLE_KIND_INPUT &&
-                 req->fd_kind != LPR_FD_TABLE_KIND_DRM)) {
+                (!filed_memfd && req->fd_kind != LPR_FD_OPS_INPUT &&
+                 req->fd_kind != LPR_FD_OPS_DRM)) {
                 lpr_socket_discard_received_fd(req->fd_kind, req->fd_handle, received_wait_fd);
                 lpr_netd_destroy_page(page_fd, page);
                 return -LPR_LINUX_EIO;
@@ -1277,7 +1315,7 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
                 ((flags & LPR_LINUX_MSG_CMSG_CLOEXEC) ? LPR_LINUX_O_CLOEXEC : 0);
             const int install = lpr_control_install_fd(
                 new_fd,
-                filed_memfd ? LPR_FD_TABLE_KIND_FILED : (uint8_t)req->fd_kind,
+                filed_memfd ? LPR_FD_OPS_FILED : (uint8_t)req->fd_kind,
                 linux_flags,
                 req->fd_handle,
                 0);
@@ -1286,22 +1324,32 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
                 lpr_netd_destroy_page(page_fd, page);
                 return install;
             }
-            lpr_fd_object_t *object = lpr_fd_object_for_fd(new_fd);
             if (filed_memfd) {
-                object->payload.filed.active = 1;
-                object->payload.filed.offset_valid = 1;
-                object->payload.filed.reserved1 = (uint8_t)req->fd_aux;
-                object->payload.filed.flags = (uint32_t)linux_flags;
-                object->payload.filed.handle = req->fd_handle;
-                object->payload.filed.offset = 0;
-            } else if (req->fd_kind == LPR_FD_TABLE_KIND_INPUT) {
-                object->payload.input.active = 1; object->payload.input.handle = req->fd_handle;
-                object->payload.input.flags = (uint32_t)linux_flags; object->payload.input.reserved0 = (uint8_t)req->fd_aux;
-                object->payload.input.native_wait_fd = received_wait_fd;
+                lpr_filed_backend_t *filed = lpr_filed_backend(new_fd);
+                if (filed == 0) {
+                    lpr_control_close_fd(new_fd);
+                    lpr_netd_destroy_page(page_fd, page);
+                    return -LPR_LINUX_EIO;
+                }
+                filed->offset_valid = 1;
+                filed->reserved1 = (uint8_t)req->fd_aux;
+            } else if (req->fd_kind == LPR_FD_OPS_INPUT) {
+                lpr_input_backend_t *input = lpr_input_backend(new_fd);
+                if (input == 0) {
+                    lpr_control_close_fd(new_fd);
+                    lpr_netd_destroy_page(page_fd, page);
+                    return -LPR_LINUX_EIO;
+                }
+                input->reserved0 = (uint8_t)req->fd_aux;
+                input->wait_fd.raw = received_wait_fd;
             } else {
-                object->payload.drm.active = 1; object->payload.drm.handle = req->fd_handle;
-                object->payload.drm.flags = (uint32_t)linux_flags;
-                object->payload.drm.native_wait_fd = received_wait_fd;
+                lpr_drm_backend_t *drm = lpr_drm_backend(new_fd);
+                if (drm == 0) {
+                    lpr_control_close_fd(new_fd);
+                    lpr_netd_destroy_page(page_fd, page);
+                    return -LPR_LINUX_EIO;
+                }
+                drm->wait_fd.raw = received_wait_fd;
             }
             lpr_linux_cmsghdr_t *cmsg = (lpr_linux_cmsghdr_t *)(uintptr_t)msg->msg_control;
             cmsg->cmsg_len = sizeof(*cmsg) + sizeof(int32_t); cmsg->cmsg_level = LPR_LINUX_SOL_SOCKET; cmsg->cmsg_type = LPR_LINUX_SCM_RIGHTS;
@@ -1332,7 +1380,7 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
             msg->msg_namelen = namelen;
         }
         total += n;
-        if (lpr_socket_payload(fd)->type == LPR_LINUX_SOCK_DGRAM) {
+        if (lpr_socket_backend(fd)->type == LPR_LINUX_SOCK_DGRAM) {
             break;
         }
         if ((uint64_t)n < iov[i].len) {
@@ -1394,7 +1442,7 @@ int64_t lpr_linux_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!lpr_linux_socket_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_NETLINK) {
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK) {
         if (addr == 0 || addrlen == 0) return -LPR_LINUX_EFAULT;
         uint32_t *length = (uint32_t *)(uintptr_t)addrlen;
         if (*length < sizeof(lpr_linux_sockaddr_nl_t)) {
@@ -1404,16 +1452,16 @@ int64_t lpr_linux_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
         lpr_linux_sockaddr_nl_t *name = (lpr_linux_sockaddr_nl_t *)(uintptr_t)addr;
         lpr_memset(name, 0, sizeof(*name));
         name->family = LPR_LINUX_AF_NETLINK;
-        name->pid = lpr_socket_payload(fd)->local_addr_be;
-        name->groups = lpr_socket_payload(fd)->peer_addr_be;
+        name->pid = lpr_socket_backend(fd)->local_addr_be;
+        name->groups = lpr_socket_backend(fd)->peer_addr_be;
         *length = sizeof(*name);
         return 0;
     }
     return lpr_socket_copy_sockaddr(
         addr,
         addrlen,
-        lpr_socket_payload(fd)->local_addr_be,
-        lpr_socket_payload(fd)->local_port_be);
+        lpr_socket_backend(fd)->local_addr_be,
+        lpr_socket_backend(fd)->local_port_be);
 }
 
 int64_t lpr_linux_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
@@ -1421,14 +1469,14 @@ int64_t lpr_linux_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
     if (!lpr_linux_socket_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
-    if (!lpr_socket_payload(fd)->connected && lpr_socket_payload(fd)->peer_addr_be == 0 && lpr_socket_payload(fd)->peer_port_be == 0) {
+    if (!lpr_socket_backend(fd)->connected && lpr_socket_backend(fd)->peer_addr_be == 0 && lpr_socket_backend(fd)->peer_port_be == 0) {
         return -LPR_LINUX_ENOTCONN;
     }
     return lpr_socket_copy_sockaddr(
         addr,
         addrlen,
-        lpr_socket_payload(fd)->peer_addr_be,
-        lpr_socket_payload(fd)->peer_port_be);
+        lpr_socket_backend(fd)->peer_addr_be,
+        lpr_socket_backend(fd)->peer_port_be);
 }
 
 int64_t lpr_linux_shutdown(uint64_t fd, uint64_t how)
@@ -1462,9 +1510,9 @@ int64_t lpr_linux_setsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
                 timeout_ms = 2147483647ll;
             }
             if (optname == LPR_LINUX_SO_SNDTIMEO) {
-                lpr_socket_payload(fd)->sndtimeo_ms = (int32_t)timeout_ms;
+                lpr_socket_backend(fd)->sndtimeo_ms = (int32_t)timeout_ms;
             } else {
-                lpr_socket_payload(fd)->rcvtimeo_ms = (int32_t)timeout_ms;
+                lpr_socket_backend(fd)->rcvtimeo_ms = (int32_t)timeout_ms;
             }
             return 0;
         }
@@ -1474,16 +1522,16 @@ int64_t lpr_linux_setsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         const int32_t value = *(const int32_t *)(uintptr_t)optval;
         switch (optname) {
         case LPR_LINUX_SO_REUSEADDR:
-            lpr_socket_payload(fd)->reuseaddr = value != 0;
+            lpr_socket_backend(fd)->reuseaddr = value != 0;
             return 0;
         case LPR_LINUX_SO_KEEPALIVE:
-            lpr_socket_payload(fd)->keepalive = value != 0;
+            lpr_socket_backend(fd)->keepalive = value != 0;
             return 0;
         case LPR_LINUX_SO_SNDBUF:
-            lpr_socket_payload(fd)->sndbuf = value > 0 ? (uint32_t)value : lpr_socket_payload(fd)->sndbuf;
+            lpr_socket_backend(fd)->sndbuf = value > 0 ? (uint32_t)value : lpr_socket_backend(fd)->sndbuf;
             return 0;
         case LPR_LINUX_SO_RCVBUF:
-            lpr_socket_payload(fd)->rcvbuf = value > 0 ? (uint32_t)value : lpr_socket_payload(fd)->rcvbuf;
+            lpr_socket_backend(fd)->rcvbuf = value > 0 ? (uint32_t)value : lpr_socket_backend(fd)->rcvbuf;
             return 0;
         default:
             return 0;
@@ -1493,7 +1541,7 @@ int64_t lpr_linux_setsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         if (optlen < sizeof(int32_t)) {
             return -LPR_LINUX_EINVAL;
         }
-        lpr_socket_payload(fd)->tcp_nodelay = *(const int32_t *)(uintptr_t)optval != 0;
+        lpr_socket_backend(fd)->tcp_nodelay = *(const int32_t *)(uintptr_t)optval != 0;
         return 0;
     }
     if ((level == LPR_LINUX_IPPROTO_IP && (optname == LPR_LINUX_IP_TOS || optname == LPR_LINUX_IP_TTL)) ||
@@ -1516,9 +1564,9 @@ int64_t lpr_linux_getsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         if (optname == LPR_LINUX_SO_PEERCRED) {
             if (*optlen < 12u) return -LPR_LINUX_EINVAL;
             int32_t *cred = (int32_t *)(uintptr_t)optval;
-            cred[0] = lpr_socket_payload(fd)->peer_pid;
-            cred[1] = (int32_t)lpr_socket_payload(fd)->peer_uid;
-            cred[2] = (int32_t)lpr_socket_payload(fd)->peer_gid;
+            cred[0] = lpr_socket_backend(fd)->peer_pid;
+            cred[1] = (int32_t)lpr_socket_backend(fd)->peer_uid;
+            cred[2] = (int32_t)lpr_socket_backend(fd)->peer_gid;
             *optlen = 12u;
             return 0;
         }
@@ -1527,7 +1575,7 @@ int64_t lpr_linux_getsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
                 return -LPR_LINUX_EINVAL;
             }
             const int32_t timeout_ms =
-                optname == LPR_LINUX_SO_SNDTIMEO ? lpr_socket_payload(fd)->sndtimeo_ms : lpr_socket_payload(fd)->rcvtimeo_ms;
+                optname == LPR_LINUX_SO_SNDTIMEO ? lpr_socket_backend(fd)->sndtimeo_ms : lpr_socket_backend(fd)->rcvtimeo_ms;
             lpr_linux_timeval_t *tv = (lpr_linux_timeval_t *)(uintptr_t)optval;
             tv->tv_sec = timeout_ms / 1000;
             tv->tv_usec = (timeout_ms % 1000) * 1000;
@@ -1540,29 +1588,29 @@ int64_t lpr_linux_getsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         int32_t value = 0;
         switch (optname) {
         case LPR_LINUX_SO_ERROR:
-            value = lpr_socket_payload(fd)->last_error;
-            lpr_socket_payload(fd)->last_error = 0;
+            value = lpr_socket_backend(fd)->last_error;
+            lpr_socket_backend(fd)->last_error = 0;
             break;
         case LPR_LINUX_SO_TYPE:
-            value = lpr_socket_payload(fd)->type;
+            value = lpr_socket_backend(fd)->type;
             break;
         case LPR_LINUX_SO_DOMAIN:
-            value = (int32_t)lpr_socket_payload(fd)->domain;
+            value = (int32_t)lpr_socket_backend(fd)->domain;
             break;
         case LPR_LINUX_SO_PROTOCOL:
-            value = lpr_socket_payload(fd)->protocol;
+            value = lpr_socket_backend(fd)->protocol;
             break;
         case LPR_LINUX_SO_REUSEADDR:
-            value = lpr_socket_payload(fd)->reuseaddr;
+            value = lpr_socket_backend(fd)->reuseaddr;
             break;
         case LPR_LINUX_SO_KEEPALIVE:
-            value = lpr_socket_payload(fd)->keepalive;
+            value = lpr_socket_backend(fd)->keepalive;
             break;
         case LPR_LINUX_SO_SNDBUF:
-            value = (int32_t)lpr_socket_payload(fd)->sndbuf;
+            value = (int32_t)lpr_socket_backend(fd)->sndbuf;
             break;
         case LPR_LINUX_SO_RCVBUF:
-            value = (int32_t)lpr_socket_payload(fd)->rcvbuf;
+            value = (int32_t)lpr_socket_backend(fd)->rcvbuf;
             break;
         default:
             value = 0;
@@ -1576,7 +1624,7 @@ int64_t lpr_linux_getsockopt(uint64_t fd, uint64_t level, uint64_t optname, uint
         if (*optlen < sizeof(int32_t)) {
             return -LPR_LINUX_EINVAL;
         }
-        *(int32_t *)(uintptr_t)optval = lpr_socket_payload(fd)->tcp_nodelay;
+        *(int32_t *)(uintptr_t)optval = lpr_socket_backend(fd)->tcp_nodelay;
         *optlen = sizeof(int32_t);
         return 0;
     }
@@ -1597,12 +1645,12 @@ int64_t lpr_linux_socket_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case LPR_LINUX_F_GETFD:
         return lpr_control_get_fd_flags(fd);
     case LPR_LINUX_F_SETFD:
-        lpr_socket_payload(fd)->cloexec = (arg & LPR_LINUX_FD_CLOEXEC) != 0;
+        lpr_socket_backend(fd)->cloexec = (arg & LPR_LINUX_FD_CLOEXEC) != 0;
         return lpr_control_set_fd_flags(fd, arg);
     case LPR_LINUX_F_GETFL:
-        return lpr_control_get_status_flags(fd, lpr_socket_payload(fd)->flags & LPR_LINUX_O_RDWR);
+        return lpr_control_get_status_flags(fd, lpr_socket_backend(fd)->flags & LPR_LINUX_O_RDWR);
     case LPR_LINUX_F_SETFL:
-        lpr_socket_payload(fd)->flags = (uint32_t)((lpr_socket_payload(fd)->flags & ~LPR_LINUX_O_NONBLOCK) | (arg & LPR_LINUX_O_NONBLOCK));
+        lpr_socket_backend(fd)->flags = (uint32_t)((lpr_socket_backend(fd)->flags & ~LPR_LINUX_O_NONBLOCK) | (arg & LPR_LINUX_O_NONBLOCK));
         return lpr_control_set_status_flags(fd, arg);
     case LPR_LINUX_F_DUPFD:
     case LPR_LINUX_F_DUPFD_CLOEXEC:
@@ -1623,9 +1671,9 @@ int64_t lpr_linux_socket_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         }
         const int enabled = *(const int *)(uintptr_t)arg != 0;
         if (enabled) {
-            lpr_socket_payload(fd)->flags |= LPR_LINUX_O_NONBLOCK;
+            lpr_socket_backend(fd)->flags |= LPR_LINUX_O_NONBLOCK;
         } else {
-            lpr_socket_payload(fd)->flags &= ~LPR_LINUX_O_NONBLOCK;
+            lpr_socket_backend(fd)->flags &= ~LPR_LINUX_O_NONBLOCK;
         }
         return 0;
     }
@@ -1640,7 +1688,7 @@ int64_t lpr_linux_socket_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         }
         lpr_memset(page, 0, NETD_PAGE_BYTES);
         netd_io_t *req = (netd_io_t *)page;
-        req->handle = lpr_socket_payload(fd)->handle;
+        req->handle = lpr_socket_backend(fd)->handle;
         req->length = NETD_IO_BYTES;
         req->flags = LPR_LINUX_MSG_PEEK | LPR_LINUX_MSG_DONTWAIT;
         uint64_t received = 0;
@@ -1681,12 +1729,12 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
     if (!lpr_linux_socket_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
-    if (lpr_socket_payload(fd)->domain == LPR_LINUX_AF_NETLINK &&
-        lpr_socket_payload(fd)->native_wait_fd >= 16)
+    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK &&
+        lpr_socket_backend(fd)->wait_fd.raw >= 16)
     {
         struct pacha_pollfd pollfd;
         lpr_memset(&pollfd, 0, sizeof(pollfd));
-        pollfd.fd = lpr_socket_payload(fd)->native_wait_fd;
+        pollfd.fd = lpr_socket_backend(fd)->wait_fd.raw;
         pollfd.events = (events & LPR_LINUX_POLLIN) != 0 ? PACHA_FD_EVENT_READABLE : 0;
         const int64_t status = lpr_pacha_syscall2(
             PACHAOS_SYSCALL_FD_POLL,
@@ -1704,7 +1752,7 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
     }
     lpr_memset(page, 0, NETD_PAGE_BYTES);
     netd_poll_t *req = (netd_poll_t *)page;
-    req->handle = lpr_socket_payload(fd)->handle;
+    req->handle = lpr_socket_backend(fd)->handle;
     req->events = events & (NETD_POLLIN | NETD_POLLOUT | NETD_POLLERR);
     uint64_t revents = 0;
     const int64_t status = lpr_netd_call(NETD_OP_POLL, page_fd, 0, &revents);
@@ -1712,13 +1760,13 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
         const int32_t socket_error = req->error;
         *out_revents = req->revents != 0 ? req->revents : (uint32_t)revents;
         if (socket_error != 0) {
-            lpr_socket_payload(fd)->last_error = socket_error;
-            lpr_socket_payload(fd)->connecting = 0;
-            lpr_socket_payload(fd)->connected = 0;
-        } else if (lpr_socket_payload(fd)->connecting && (*out_revents & NETD_POLLOUT) != 0) {
-            lpr_socket_payload(fd)->last_error = 0;
-            lpr_socket_payload(fd)->connecting = 0;
-            lpr_socket_payload(fd)->connected = 1;
+            lpr_socket_backend(fd)->last_error = socket_error;
+            lpr_socket_backend(fd)->connecting = 0;
+            lpr_socket_backend(fd)->connected = 0;
+        } else if (lpr_socket_backend(fd)->connecting && (*out_revents & NETD_POLLOUT) != 0) {
+            lpr_socket_backend(fd)->last_error = 0;
+            lpr_socket_backend(fd)->connecting = 0;
+            lpr_socket_backend(fd)->connected = 1;
         }
     }
     lpr_netd_destroy_page(page_fd, page);
@@ -1735,7 +1783,7 @@ static int64_t lpr_linux_socket_wait_events(uint64_t fd, uint32_t events, int32_
             return status;
         }
         if ((revents & LPR_LINUX_POLLERR) != 0) {
-            return lpr_socket_payload(fd)->last_error != 0 ? -lpr_socket_payload(fd)->last_error : -LPR_LINUX_EIO;
+            return lpr_socket_backend(fd)->last_error != 0 ? -lpr_socket_backend(fd)->last_error : -LPR_LINUX_EIO;
         }
         if ((revents & events) != 0) {
             return 0;
@@ -1827,16 +1875,6 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             if (fds[i].revents != 0) ready++;
             continue;
         }
-        {
-            const uint32_t native_revents = lpr_linux_native_fd_poll_events(fd, (uint32_t)fds[i].events);
-            if (native_revents != LPR_LINUX_POLLNVAL) {
-                fds[i].revents = (int16_t)native_revents;
-                if (fds[i].revents != 0) {
-                    ready++;
-                }
-                continue;
-            }
-        }
         if (!lpr_linux_socket_fd_active(fd)) {
             fds[i].revents = LPR_LINUX_POLLNVAL;
             ready++;
@@ -1855,7 +1893,7 @@ static int64_t lpr_linux_poll_scan(lpr_linux_pollfd_t *fds, uint64_t nfds)
             continue;
         }
         fds[i].revents |= (int16_t)(revents & (LPR_LINUX_POLLIN | LPR_LINUX_POLLOUT | LPR_LINUX_POLLERR));
-        if ((fds[i].events & LPR_LINUX_POLLERR) != 0 && lpr_socket_payload(fd)->last_error != 0) {
+        if ((fds[i].events & LPR_LINUX_POLLERR) != 0 && lpr_socket_backend(fd)->last_error != 0) {
             fds[i].revents |= LPR_LINUX_POLLERR;
         }
         if (fds[i].revents != 0) {
@@ -2056,7 +2094,7 @@ static int64_t lpr_linux_select_scan(
             }
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_write = (revents & LPR_LINUX_POLLOUT) != 0;
-            is_except = (revents & LPR_LINUX_POLLERR) != 0 || lpr_socket_payload(fd)->last_error != 0;
+            is_except = (revents & LPR_LINUX_POLLERR) != 0 || lpr_socket_backend(fd)->last_error != 0;
         } else if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
             uint32_t events = 0;
             if (want_read) {
@@ -2115,22 +2153,7 @@ static int64_t lpr_linux_select_scan(
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
             is_except = (revents & LPR_LINUX_POLLERR) != 0;
         } else {
-            uint32_t events = 0;
-            if (want_read) {
-                events |= LPR_LINUX_POLLIN;
-            }
-            if (want_write) {
-                events |= LPR_LINUX_POLLOUT;
-            }
-            if (want_except) {
-                events |= LPR_LINUX_POLLERR;
-            }
-            const uint32_t revents = lpr_linux_native_fd_poll_events(fd, events);
-            if (revents != LPR_LINUX_POLLNVAL) {
-                is_read = (revents & (LPR_LINUX_POLLIN | 0x0010u)) != 0;
-                is_write = (revents & LPR_LINUX_POLLOUT) != 0;
-                is_except = (revents & LPR_LINUX_POLLERR) != 0;
-            } else if (lpr_linux_filed_fd_active(fd) || lpr_linux_device_fd_active(fd)) {
+            if (lpr_linux_filed_fd_active(fd) || lpr_linux_device_fd_active(fd)) {
                 is_read = want_read;
                 is_write = want_write;
             } else {

@@ -73,7 +73,6 @@ int lpr_linux_tty_fd_active(uint64_t fd);
 uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events);
 int lpr_linux_pipe_fd_active(uint64_t fd);
 uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events);
-uint32_t lpr_linux_native_fd_poll_events(uint64_t fd, uint32_t events);
 void lpr_linux_ensure_default_stdio(void);
 void lpr_linux_readv_cache_trace_dump(void);
 

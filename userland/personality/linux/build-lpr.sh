@@ -51,6 +51,7 @@ mkdir -p "$(dirname "$repo_root/$out")"
   "$repo_root/userland/personality/linux/runtime/lpr_process/bootstrap_state.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/control.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_fd/ops.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/dup_pipe.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_pipe/io.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_timerfd.c" \

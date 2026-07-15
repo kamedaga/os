@@ -134,14 +134,17 @@ void lpr_fd_arrays_init(void)
     if (lpr_fd_table_capacity != 0) {
         return;
     }
-    lpr_control_slots = lpr_control_slots_initial;
-    lpr_control_files = lpr_control_files_initial;
+    lpr_control_entries = lpr_control_entries_initial;
+    lpr_control_ofds = lpr_control_ofds_initial;
+    lpr_control_backends = lpr_control_backends_initial;
     lpr_fd_table_capacity = LPR_FD_TABLE_INITIAL_SIZE;
     lpr_fd_table_init(
         &lpr_control_fd_table,
-        lpr_control_slots,
+        lpr_control_entries,
         LPR_FD_TABLE_INITIAL_SIZE,
-        lpr_control_files,
+        lpr_control_ofds,
+        LPR_FD_TABLE_INITIAL_SIZE,
+        lpr_control_backends,
         LPR_FD_TABLE_INITIAL_SIZE);
     lpr_fd_table_configure_lock(
         &lpr_control_fd_table,
@@ -174,31 +177,38 @@ int lpr_fd_table_segment_bytes(uint64_t capacity, uint64_t element_size, uint64_
 
 int lpr_fd_table_layout(
     uint64_t capacity,
-    uint64_t *control_slot_offset,
-    uint64_t *control_file_offset,
+    uint64_t *entry_offset,
+    uint64_t *ofd_offset,
+    uint64_t *backend_offset,
     uint64_t *total_bytes)
 {
     if (capacity < LPR_FD_TABLE_INITIAL_SIZE ||
         capacity > LPR_FD_TABLE_MAX_SIZE ||
-        control_slot_offset == 0 ||
-        control_file_offset == 0 ||
+        entry_offset == 0 ||
+        ofd_offset == 0 ||
+        backend_offset == 0 ||
         total_bytes == 0)
     {
         return 0;
     }
-    uint64_t control_slot_bytes = 0;
-    uint64_t control_file_bytes = 0;
-    if (!lpr_fd_table_segment_bytes(capacity, sizeof(lpr_fd_table_slot_t), &control_slot_bytes) ||
-        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_fd_table_file_t), &control_file_bytes))
+    uint64_t entry_bytes = 0;
+    uint64_t ofd_bytes = 0;
+    uint64_t backend_bytes = 0;
+    if (!lpr_fd_table_segment_bytes(capacity, sizeof(lpr_fd_entry_t), &entry_bytes) ||
+        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_ofd_t), &ofd_bytes) ||
+        !lpr_fd_table_segment_bytes(capacity, sizeof(lpr_backend_record_t), &backend_bytes))
     {
         return 0;
     }
-    if (control_slot_bytes > UINT64_MAX - control_file_bytes) {
+    if (entry_bytes > UINT64_MAX - ofd_bytes ||
+        entry_bytes + ofd_bytes > UINT64_MAX - backend_bytes)
+    {
         return 0;
     }
-    *control_slot_offset = 0;
-    *control_file_offset = control_slot_bytes;
-    *total_bytes = control_slot_bytes + control_file_bytes;
+    *entry_offset = 0;
+    *ofd_offset = entry_bytes;
+    *backend_offset = entry_bytes + ofd_bytes;
+    *total_bytes = entry_bytes + ofd_bytes + backend_bytes;
     return 1;
 }
 
@@ -235,13 +245,15 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
     if (new_capacity == 0) {
         return -LPR_LINUX_EMFILE;
     }
-    uint64_t control_slot_offset = 0;
-    uint64_t control_file_offset = 0;
+    uint64_t entry_offset = 0;
+    uint64_t ofd_offset = 0;
+    uint64_t backend_offset = 0;
     uint64_t total_bytes = 0;
     if (!lpr_fd_table_layout(
             new_capacity,
-            &control_slot_offset,
-            &control_file_offset,
+            &entry_offset,
+            &ofd_offset,
+            &backend_offset,
             &total_bytes))
     {
         return -LPR_LINUX_ENOMEM;
@@ -258,10 +270,12 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
         return (int)lpr_pacha_status_to_errno(mapped);
     }
     unsigned char *base = (unsigned char *)(uintptr_t)mapped;
-    lpr_fd_table_slot_t *new_control_slots =
-        (lpr_fd_table_slot_t *)(void *)(base + control_slot_offset);
-    lpr_fd_table_file_t *new_control_files =
-        (lpr_fd_table_file_t *)(void *)(base + control_file_offset);
+    lpr_fd_entry_t *new_entries =
+        (lpr_fd_entry_t *)(void *)(base + entry_offset);
+    lpr_ofd_t *new_ofds =
+        (lpr_ofd_t *)(void *)(base + ofd_offset);
+    lpr_backend_record_t *new_backends =
+        (lpr_backend_record_t *)(void *)(base + backend_offset);
     lpr_fd_table_lock(&lpr_control_fd_table);
     if (required_capacity <= lpr_fd_table_capacity) {
         lpr_fd_table_unlock(&lpr_control_fd_table);
@@ -272,25 +286,32 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
         return 0;
     }
     lpr_memcpy(
-        new_control_slots,
-        lpr_control_slots,
-        (size_t)(lpr_fd_table_capacity * sizeof(*lpr_control_slots)));
+        new_entries,
+        lpr_control_entries,
+        (size_t)(lpr_fd_table_capacity * sizeof(*lpr_control_entries)));
     lpr_memcpy(
-        new_control_files,
-        lpr_control_files,
-        (size_t)(lpr_fd_table_capacity * sizeof(*lpr_control_files)));
+        new_ofds,
+        lpr_control_ofds,
+        (size_t)(lpr_fd_table_capacity * sizeof(*lpr_control_ofds)));
+    lpr_memcpy(
+        new_backends,
+        lpr_control_backends,
+        (size_t)(lpr_fd_table_capacity * sizeof(*lpr_control_backends)));
     if (lpr_fd_table_dynamic_base != 0 && lpr_fd_table_dynamic_bytes != 0) {
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,
             (uint64_t)(uintptr_t)lpr_fd_table_dynamic_base,
             lpr_fd_table_dynamic_bytes);
     }
-    lpr_control_slots = new_control_slots;
-    lpr_control_files = new_control_files;
-    lpr_control_fd_table.slots = lpr_control_slots;
-    lpr_control_fd_table.files = lpr_control_files;
-    lpr_control_fd_table.slot_count = (uint32_t)new_capacity;
-    lpr_control_fd_table.file_count = (uint32_t)new_capacity;
+    lpr_control_entries = new_entries;
+    lpr_control_ofds = new_ofds;
+    lpr_control_backends = new_backends;
+    lpr_control_fd_table.entries = lpr_control_entries;
+    lpr_control_fd_table.ofds = lpr_control_ofds;
+    lpr_control_fd_table.backends = lpr_control_backends;
+    lpr_control_fd_table.entry_count = (uint32_t)new_capacity;
+    lpr_control_fd_table.ofd_count = (uint32_t)new_capacity;
+    lpr_control_fd_table.backend_count = (uint32_t)new_capacity;
     lpr_control_fd_table.generation++;
     lpr_fd_table_capacity = new_capacity;
     lpr_fd_table_dynamic_base = (void *)(uintptr_t)mapped;
