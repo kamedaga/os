@@ -94,11 +94,13 @@ int64_t filed_close_handle_runtime(
         return filed_status_to_wire(FILED_ERR_INVALID);
     }
 
+    const int lease_fd = filed_vfs_get_handle_lease(&runtime->vfs, handle_id);
     memset(&reclaim, 0, sizeof(reclaim));
     const filed_status_t status = filed_vfs_close_handle_ex(&runtime->vfs, handle_id, &reclaim);
     if (status != FILED_OK) {
         return filed_status_to_wire(status);
     }
+    if (lease_fd >= 16) (void)pacha_fd_close(lease_fd);
     if (reclaim.released && reclaim.backend_object != 0) {
         const int flush_status = filed_cache_flush_object(runtime, reclaim.backend_object);
         if (flush_status != 0) {

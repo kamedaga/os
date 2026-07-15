@@ -42,22 +42,43 @@ static int netd_socket_send_reply(
     uint64_t request_id,
     int64_t status,
     uint64_t result,
-    int transfer_fd)
+    const int *transfer_fds,
+    uint32_t transfer_count)
 {
-    struct pacha_ipc_fd transferred = {
-        .fd = (uint64_t)(uint32_t)transfer_fd,
-        .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
-            PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_RECV |
-            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL,
-        .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_INHERIT,
-    };
+    struct pacha_ipc_fd transferred[NETD_TRANSFER_MAX_CAPABILITIES];
+    if (transfer_count > NETD_TRANSFER_MAX_CAPABILITIES) {
+        (void)pacha_fd_close(reply_fd);
+        return -22;
+    }
+    memset(transferred, 0, sizeof(transferred));
+    for (uint32_t i = 0; i < transfer_count; ++i) {
+        if (transfer_fds == NULL || transfer_fds[i] < 16) {
+            (void)pacha_fd_close(reply_fd);
+            for (uint32_t j = 0; transfer_fds != NULL && j < transfer_count; ++j)
+                if (transfer_fds[j] >= 16) (void)pacha_fd_close(transfer_fds[j]);
+            return -22;
+        }
+        struct pacha_fd_info info;
+        memset(&info, 0, sizeof(info));
+        if (pacha_fd_get_info(transfer_fds[i], &info) != 0 ||
+            (info.rights & PACHA_FD_RIGHT_TRANSFER) == 0)
+        {
+            (void)pacha_fd_close(reply_fd);
+            for (uint32_t j = 0; j < transfer_count; ++j)
+                if (transfer_fds[j] >= 16) (void)pacha_fd_close(transfer_fds[j]);
+            return -9;
+        }
+        transferred[i].fd = (uint64_t)(uint32_t)transfer_fds[i];
+        transferred[i].rights = info.rights;
+        transferred[i].transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_INHERIT;
+    }
     const struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
         .word2 = result,
         .word3 = request_id,
-        .fds = transfer_fd >= 16 ? &transferred : NULL,
-        .fd_count = transfer_fd >= 16 ? 1u : 0u,
+        .fds = transfer_count != 0 ? transferred : NULL,
+        .fd_count = transfer_count,
     };
     if (g_netd_socket_trace && (op == NETD_OP_CONNECT || op == NETD_OP_POLL)) {
         pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)status, result, (uint64_t)(uint32_t)reply_fd);
@@ -67,7 +88,8 @@ static int netd_socket_send_reply(
         pacha_trace4(PACHA_TRACE_COMPONENT_NETD, PACHA_TRACE_EVENT_NETD_SOCKET, reply_status != 0 ? PACHA_TRACE_CLASS_ERROR : PACHA_TRACE_CLASS_DEBUG, op, (uint64_t)reply_status, result, (uint64_t)(uint32_t)reply_fd);
     }
     (void)pacha_fd_close(reply_fd);
-    if (transfer_fd >= 16) (void)pacha_fd_close(transfer_fd);
+    for (uint32_t i = 0; i < transfer_count; ++i)
+        (void)pacha_fd_close(transfer_fds[i]);
     return reply_status;
 }
 
@@ -87,9 +109,11 @@ static void *netd_socket_map_page(int page_fd)
 static int netd_socket_dispatch(
     uint64_t op,
     void *page,
-    int transferred_fd,
+    const int *transferred_fds,
+    uint32_t transferred_count,
     uint64_t *out_result,
-    int *out_reply_fd)
+    int *out_reply_fds,
+    uint32_t *out_reply_count)
 {
     if (out_result == NULL) {
         return -22;
@@ -105,12 +129,21 @@ static int netd_socket_dispatch(
         }
         const netd_socket_t *req = (const netd_socket_t *)page;
         if (req->domain == NETD_AF_UNIX) {
-            return netd_unix_socket_open(req->type, req->protocol, transferred_fd, out_result);
+            return netd_unix_socket_open(
+                req->type, req->protocol,
+                transferred_count == 1 ? transferred_fds[0] : -1,
+                out_result);
         }
         if (req->domain == NETD_AF_NETLINK) {
-            return netd_netlink_socket_open(req->type, req->protocol, transferred_fd, out_result);
+            return netd_netlink_socket_open(
+                req->type, req->protocol,
+                transferred_count == 1 ? transferred_fds[0] : -1,
+                out_result);
         }
-        return netd_libuinet_socket_open(req->domain, req->type, req->protocol, out_result);
+        return netd_libuinet_socket_open(
+            req->domain, req->type, req->protocol,
+            transferred_count == 1 ? transferred_fds[0] : -1,
+            out_result);
     }
     case NETD_OP_CONNECT: {
         if (page == NULL) {
@@ -133,7 +166,8 @@ static int netd_socket_dispatch(
         }
         size_t sent = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ? -95 :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_send(req, transferred_fd, &sent) : netd_libuinet_socket_send(
+            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_send(
+                req, transferred_fds, transferred_count, &sent) : netd_libuinet_socket_send(
             req->handle,
             req->data,
             (size_t)req->length,
@@ -156,7 +190,9 @@ static int netd_socket_dispatch(
         size_t received = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
             netd_netlink_socket_recv(req, capacity, &received) :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_recv(req, capacity, out_reply_fd, &received) :
+            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_recv(
+                req, capacity, out_reply_fds,
+                NETD_TRANSFER_MAX_CAPABILITIES, out_reply_count, &received) :
             netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
         req->length = received;
         *out_result = received;
@@ -211,7 +247,7 @@ static int netd_socket_dispatch(
         if (page == NULL) return -22;
         return netd_unix_socket_attach_wait(
             ((const netd_accept_t *)page)->handle,
-            transferred_fd);
+            transferred_count == 1 ? transferred_fds[0] : -1);
     case NETD_OP_UEVENT_PUBLISH:
         {
             const uint64_t device = *out_result;
@@ -234,34 +270,45 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
 
     const int reply_fd = (int)fds[request->fd_count - 1].fd;
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC || request->word3 == 0) {
-        return netd_socket_send_reply(request->word1, reply_fd, request->word3, -22, 0, -1);
+        return netd_socket_send_reply(request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
     }
     int page_fd = -1;
     if (request->fd_count >= 2 && fds[0].fd >= 16) {
         page_fd = (int)fds[0].fd;
     }
-    const int transferred_fd =
-        (request->word1 == NETD_OP_SOCKET || request->word1 == NETD_OP_SEND ||
-            request->word1 == NETD_OP_ATTACH_WAIT) && request->fd_count >= 3 ?
-        (int)(uint32_t)fds[1].fd : -1;
+    int transferred_fds[NETD_TRANSFER_MAX_CAPABILITIES];
+    memset(transferred_fds, 0xff, sizeof(transferred_fds));
+    const uint64_t first_transfer = page_fd >= 16 ? 1u : 0u;
+    const uint64_t transferred_count64 = request->fd_count - 1u - first_transfer;
+    if (transferred_count64 > NETD_TRANSFER_MAX_CAPABILITIES) {
+        return netd_socket_send_reply(
+            request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+    }
+    const uint32_t transferred_count = (uint32_t)transferred_count64;
+    for (uint32_t i = 0; i < transferred_count; ++i)
+        transferred_fds[i] = (int)(uint32_t)fds[first_transfer + i].fd;
 
     void *page = NULL;
     if (page_fd >= 16) {
         page = netd_socket_map_page(page_fd);
         if (page == NULL) {
             (void)pacha_fd_close(page_fd);
-            if (transferred_fd >= 16) (void)pacha_fd_close(transferred_fd);
-            return netd_socket_send_reply(request->word1, reply_fd, request->word3, -5, 0, -1);
+            for (uint32_t i = 0; i < transferred_count; ++i)
+                if (transferred_fds[i] >= 16) (void)pacha_fd_close(transferred_fds[i]);
+            return netd_socket_send_reply(request->word1, reply_fd, request->word3, -5, 0, NULL, 0);
         }
     }
 
-    const int send_has_fd = request->word1 == NETD_OP_SEND && page != NULL &&
+    const int send_has_transfer = request->word1 == NETD_OP_SEND && page != NULL &&
         netd_unix_socket_is_handle(((const netd_io_t *)page)->handle) &&
-        ((const netd_io_t *)page)->fd_kind != 0;
+        ((const netd_io_t *)page)->transfer_count != 0;
     uint64_t result = request->word2;
-    int reply_transfer_fd = -1;
+    int reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
+    uint32_t reply_transfer_count = 0;
+    memset(reply_transfer_fds, 0xff, sizeof(reply_transfer_fds));
     const int status = netd_socket_dispatch(
-        request->word1, page, transferred_fd, &result, &reply_transfer_fd);
+        request->word1, page, transferred_fds, transferred_count, &result,
+        reply_transfer_fds, &reply_transfer_count);
     if (g_netd_socket_trace) {
         netd_socket_trace_data_op(request->word1, status, result);
     }
@@ -277,24 +324,24 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     }
     const int transfer_retained = status == 0 &&
         ((request->word1 == NETD_OP_SOCKET &&
-            (netd_netlink_socket_is_handle(result) || netd_unix_socket_is_handle(result))) ||
+            result != 0) ||
          request->word1 == NETD_OP_ATTACH_WAIT ||
-         send_has_fd);
+         send_has_transfer);
     if (page != NULL) {
         (void)pacha_munmap(page, NETD_PAGE_BYTES);
     }
     if (page_fd >= 16 && page_fd != reply_fd) {
         (void)pacha_fd_close(page_fd);
     }
-    if (transferred_fd >= 16 && !transfer_retained)
-    {
-        (void)pacha_fd_close(transferred_fd);
-    }
+    if (!transfer_retained)
+        for (uint32_t i = 0; i < transferred_count; ++i)
+            if (transferred_fds[i] >= 16) (void)pacha_fd_close(transferred_fds[i]);
     if (status != 0) {
         g_netd_socket_errors++;
     }
     return netd_socket_send_reply(
-        request->word1, reply_fd, request->word3, status, result, reply_transfer_fd);
+        request->word1, reply_fd, request->word3, status, result,
+        reply_transfer_fds, reply_transfer_count);
 }
 
 int netd_socket_service_start(struct netd_runtime *runtime)

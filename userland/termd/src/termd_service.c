@@ -286,7 +286,12 @@ static int termd_dispatch_register_signal_supervisor(
         "register signal supervisor failed");
 }
 
-static int termd_dispatch_tty(termd_service_t *service, uint64_t op, void *payload, uint64_t *out_result)
+static int termd_dispatch_tty(
+    termd_service_t *service,
+    uint64_t op,
+    void *payload,
+    int notify_fd,
+    uint64_t *out_result)
 {
     if (service == NULL || service->tty == NULL || out_result == 0) {
         return TERMD_ERR_INVAL;
@@ -310,6 +315,7 @@ static int termd_dispatch_tty(termd_service_t *service, uint64_t op, void *paylo
         return termd_linux_tty_island_open_ptmx(
             tty,
             ((const termd_open_request_t *)payload)->flags,
+            notify_fd,
             out_result);
     case TERMD_OP_OPEN_PTS:
         if (payload == 0) {
@@ -318,6 +324,7 @@ static int termd_dispatch_tty(termd_service_t *service, uint64_t op, void *paylo
         return termd_linux_tty_island_open_pts(
             tty,
             (const termd_open_request_t *)payload,
+            notify_fd,
             out_result);
     case TERMD_OP_OPEN_HVC:
         if (payload == 0) {
@@ -326,6 +333,7 @@ static int termd_dispatch_tty(termd_service_t *service, uint64_t op, void *paylo
         return termd_linux_tty_island_open_hvc(
             tty,
             (const termd_open_request_t *)payload,
+            notify_fd,
             out_result);
     case TERMD_OP_OPEN_CTTY:
         if (payload == 0) {
@@ -334,6 +342,7 @@ static int termd_dispatch_tty(termd_service_t *service, uint64_t op, void *paylo
         return termd_linux_tty_island_open_ctty(
             tty,
             (const termd_open_request_t *)payload,
+            notify_fd,
             out_result);
     case TERMD_OP_HANDLE_CLOSE:
         if (payload == 0) {
@@ -532,8 +541,14 @@ int termd_service_dispatch_request(
         return reply_status;
     }
 
+    const int open_op = header.op == TERMD_OP_OPEN_PTMX ||
+        header.op == TERMD_OP_OPEN_PTS || header.op == TERMD_OP_OPEN_HVC ||
+        header.op == TERMD_OP_OPEN_CTTY;
+    const int notify_fd = open_op && request->fd_count == 3 && fds[1].fd >= 16 ?
+        (int)(uint32_t)fds[1].fd : -1;
     uint64_t result = 0;
-    const int status = termd_dispatch_tty(service, header.op, payload, &result);
+    const int status = termd_dispatch_tty(
+        service, header.op, payload, notify_fd, &result);
     if ((service->cfg->flags & TERMD_BOOT_FLAG_TRACE) != 0 ||
         (status != 0 && status != TERMD_ERR_NOTSUP && status != TERMD_ERR_AGAIN))
     {
@@ -547,7 +562,9 @@ int termd_service_dispatch_request(
         fflush(stdout);
     }
 
-    termd_close_received_fds(request, fds, reply_fd, -1);
+    termd_close_received_fds(
+        request, fds, reply_fd,
+        status == 0 && open_op ? notify_fd : -1);
     const uint64_t token = status < 0 ?
         termd_error_token(
             status,

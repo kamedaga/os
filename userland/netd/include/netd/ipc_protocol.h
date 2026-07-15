@@ -36,13 +36,12 @@ enum {
     NETD_UEVENT_INPUT_EVENT1 = 3,
 
     NETD_PAGE_BYTES = 65536,
-    NETD_IO_BYTES = NETD_PAGE_BYTES - 256,
+    NETD_IO_BYTES = NETD_PAGE_BYTES - 1024,
+    NETD_TRANSFER_MAX_ITEMS = 16,
+    NETD_TRANSFER_MAX_CAPABILITIES = 16,
     NETD_POLLIN = 0x0001,
     NETD_POLLOUT = 0x0004,
     NETD_POLLERR = 0x0008,
-
-    /* M5.6R one-way wl_shm transport; not a general fd-kind contract. */
-    NETD_FD_KIND_FILED_MEMFD = 0x100u,
 };
 
 typedef struct netd_socket {
@@ -92,15 +91,26 @@ typedef struct netd_accept {
     uint32_t reserved0;
 } netd_accept_t;
 
+typedef struct netd_transfer_occurrence {
+    uint32_t provider_id;
+    uint16_t capability_first;
+    uint16_t capability_count;
+    uint64_t transfer_token;
+    uint64_t rights;
+    uint32_t fd_flags;
+    uint32_t reserved0;
+} netd_transfer_occurrence_t;
+
 typedef struct netd_io {
     uint64_t handle;
     uint64_t length;
     uint64_t flags;
     netd_sockaddr_in_t addr;
-    uint32_t fd_kind;
-    uint32_t fd_flags;
-    uint64_t fd_handle;
-    uint64_t fd_aux;
+    uint64_t transaction_id;
+    uint32_t transfer_count;
+    uint32_t capability_count;
+    uint64_t reserved0;
+    netd_transfer_occurrence_t transfers[NETD_TRANSFER_MAX_ITEMS];
     uint8_t data[NETD_IO_BYTES];
 } netd_io_t;
 
@@ -112,3 +122,8 @@ typedef struct netd_poll {
     uint32_t reserved0;
     uint64_t reserved[5];
 } netd_poll_t;
+
+_Static_assert(sizeof(netd_transfer_occurrence_t) == 32,
+    "netd transfer occurrence size");
+_Static_assert(sizeof(netd_io_t) <= NETD_PAGE_BYTES,
+    "netd io page layout");

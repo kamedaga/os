@@ -127,6 +127,35 @@ int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_h
     return 0;
 }
 
+int64_t lpr_filed_transfer_dup_handle(
+    uint64_t handle,
+    uint64_t fd_flags,
+    int lease_fd,
+    uint64_t *out_handle)
+{
+    if (out_handle == 0 || handle == 0 || lease_fd < 16)
+        return -LPR_LINUX_EINVAL;
+    *out_handle = 0;
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    filed_handle_flags_t *flags = (filed_handle_flags_t *)page;
+    lpr_memset(flags, 0, sizeof(*flags));
+    flags->handle = handle;
+    flags->fd_flags = fd_flags;
+    uint64_t dup_handle = 0;
+    const int64_t status = lpr_filed_call_transfer(
+        FILED_OP_VFS_TRANSFER_DUP,
+        page_fd,
+        0,
+        &dup_handle,
+        lease_fd);
+    lpr_destroy_wire_page(page_fd, page);
+    if (status != 0) return status;
+    *out_handle = dup_handle;
+    return 0;
+}
+
 int64_t lpr_linux_fsync(uint64_t fd)
 {
     if (!lpr_fd_is_filed(fd)) {

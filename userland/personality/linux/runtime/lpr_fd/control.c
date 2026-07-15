@@ -355,6 +355,7 @@ int lpr_control_install_fd(
         backend->flags = (uint32_t)linux_flags;
         backend->handle = backend_id;
         backend->offset = offset;
+        backend->lease_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_DEVICE: {
@@ -370,6 +371,7 @@ int lpr_control_install_fd(
         backend->active = 1;
         backend->flags = (uint32_t)linux_flags;
         backend->handle = backend_id;
+        backend->wait_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_DRM: {
@@ -378,6 +380,7 @@ int lpr_control_install_fd(
         backend->flags = (uint32_t)linux_flags;
         backend->handle = backend_id;
         backend->wait_fd.raw = -1;
+        backend->lease_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_INPUT: {
@@ -386,6 +389,7 @@ int lpr_control_install_fd(
         backend->flags = (uint32_t)linux_flags;
         backend->handle = backend_id;
         backend->wait_fd.raw = -1;
+        backend->lease_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_DMABUF: {
@@ -759,340 +763,106 @@ int lpr_fd_slot_alloc_from(uint64_t min_fd)
     }
 }
 
-int lpr_bootstrap_fd_desc_valid_common(const lpr_bootstrap_fd_t *desc, uint64_t *out_fd)
+int lpr_control_set_effective_rights(uint32_t fd, uint32_t rights)
 {
-    if (desc == 0 || out_fd == 0) {
-        return 0;
+    int status = -1;
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    if (fd < lpr_control_fd_table.entry_count &&
+        lpr_control_fd_table.entries[fd].active)
+    {
+        lpr_control_fd_table.entries[fd].effective_rights = rights;
+        status = 0;
     }
-    const uint64_t fd = desc->fd;
-    if (fd > LPR_LINUX_FD_MAX || lpr_runtime_reserved_fd(fd)) {
-        return 0;
-    }
-    if (lpr_fd_table_ensure_fd(fd) != 0) {
-        return 0;
-    }
-    *out_fd = fd;
-    return 1;
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    return status;
 }
 
-int lpr_restore_bootstrap_filed_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+static int lpr_manifest_install_first(
+    uint32_t fd,
+    const lpr_manifest_entry_t *entry,
+    const lpr_manifest_ofd_t *ofd,
+    const void *record)
 {
-    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
-        return 0;
-    }
-    if (lpr_control_install_fd(
-        fd,
-        LPR_FD_OPS_FILED,
-        desc->flags,
-        desc->handle,
-        desc->offset_or_counter) != 0)
+    if (entry == 0 || ofd == 0 || record == 0 ||
+        ofd->backend_id == 0 || ofd->backend_id >= LPR_FD_OPS_COUNT ||
+        ofd->record_bytes != lpr_backend_type_bytes((uint8_t)ofd->backend_id) ||
+        lpr_fd_table_ensure_fd(fd) != 0 || !lpr_fd_slot_available(fd))
     {
         return 0;
     }
-    lpr_filed_backend_t *filed = lpr_filed_backend(fd);
-    if (filed == 0) {
-        lpr_control_close_fd(fd);
+    void *state = lpr_backend_map();
+    if (state == 0) return 0;
+    lpr_memcpy(state, record, ofd->record_bytes);
+    const lpr_fd_install_t install = {
+        .ops_id = (uint8_t)ofd->backend_id,
+        .fd_flags = entry->fd_flags,
+        .access_mode = ofd->access_mode,
+        .status_flags = ofd->status_flags,
+        .rights = ofd->rights_ceiling,
+        .offset = ofd->offset,
+        .backend_state = state,
+        .backend_state_bytes = 4096,
+    };
+    if (lpr_fd_table_install_at(&lpr_control_fd_table, fd, &install) != 0) {
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)state, 4096);
         return 0;
     }
-    filed->active = 1;
-    filed->offset_valid =
-        ((desc->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) ? 1u : 0u;
-    filed->pread_active = 0;
-    filed->flags = desc->flags;
-    filed->handle = desc->handle;
-    filed->offset = desc->offset_or_counter;
-    return 1;
+    return lpr_control_set_effective_rights(fd, (uint32_t)entry->effective_rights) == 0;
 }
 
-int lpr_restore_bootstrap_tty_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
+int lpr_install_manifest_fds(const lpr_manifest_t *manifest)
 {
-    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
-        return 0;
-    }
-    for (uint64_t existing = 0; existing < lpr_fd_table_capacity; existing += 1) {
-        if (existing == fd || !lpr_linux_tty_fd_active(existing)) {
-            continue;
-        }
-        const lpr_tty_backend_t *existing_tty = lpr_tty_backend(existing);
-        if (existing_tty == 0 || existing_tty->handle != desc->handle) {
-            continue;
-        }
-        if (lpr_control_dup_fd(
-                existing,
-                fd,
-                (desc->flags & LPR_LINUX_O_CLOEXEC) != 0) != 0)
+    if (lpr_manifest_fds_installed) return 1;
+    lpr_manifest_fds_installed = 1;
+    if (manifest == 0) return 0;
+    const lpr_manifest_entry_t *entries =
+        (const lpr_manifest_entry_t *)((const uint8_t *)manifest + manifest->entry_offset);
+    const lpr_manifest_ofd_t *ofds =
+        (const lpr_manifest_ofd_t *)((const uint8_t *)manifest + manifest->ofd_offset);
+    const lpr_manifest_capability_t *capabilities =
+        (const lpr_manifest_capability_t *)((const uint8_t *)manifest + manifest->capability_offset);
+    const uint8_t *records = (const uint8_t *)manifest + manifest->record_offset;
+    for (uint64_t i = 0; i < manifest->capability_count; ++i) {
+        struct pacha_fd_info info;
+        if (capabilities[i].ordinal != i ||
+            capabilities[i].native_fd > INT32_MAX ||
+            !lpr_native_fd_info(capabilities[i].native_fd, &info) ||
+            (info.rights & capabilities[i].rights) != capabilities[i].rights)
         {
             return 0;
         }
-        (void)lpr_control_set_status_flags(fd, desc->flags);
-        lpr_tty_backend_t *tty = lpr_tty_backend(fd);
-        if (tty != 0) {
-            tty->reserved0 = (uint8_t)desc->offset_or_counter;
-            tty->flags = desc->flags;
-            tty->handle = desc->handle;
+    }
+    for (uint64_t oi = 0; oi < manifest->ofd_count; ++oi) {
+        const lpr_manifest_entry_t *first = 0;
+        for (uint64_t ei = 0; ei < manifest->entry_count; ++ei) {
+            if (entries[ei].ofd_index == oi) {
+                first = &entries[ei];
+                break;
+            }
         }
-        return 1;
-    }
-    if (lpr_control_install_fd(
-        fd,
-        LPR_FD_OPS_TTY,
-        desc->flags,
-        desc->handle,
-        0) != 0)
-    {
-        return 0;
-    }
-    lpr_tty_backend_t *tty = lpr_tty_backend(fd);
-    if (tty == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    tty->active = 1;
-    tty->reserved0 = (uint8_t)desc->offset_or_counter;
-    tty->flags = desc->flags;
-    tty->handle = desc->handle;
-    return 1;
-}
-
-int lpr_restore_bootstrap_pipe_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    const uint64_t native_fd = desc->handle;
-    struct pacha_fd_info info;
-    if (native_fd > INT32_MAX ||
-        !lpr_native_fd_info(native_fd, &info) || info.kind != PACHA_FD_KIND_PIPE)
-    {
-        return 0;
-    }
-    if (lpr_pipe_track_native_fd(fd, native_fd, &info) != 0) {
-        return 0;
-    }
-    const uint64_t pacha_flags =
-        ((desc->flags & LPR_LINUX_O_CLOEXEC) != 0 ? PACHA_FD_FLAG_CLOEXEC : 0) |
-        ((desc->flags & LPR_LINUX_O_NONBLOCK) != 0 ? PACHA_FD_FLAG_NONBLOCK : 0);
-    (void)lpr_pacha_syscall3(
-        PACHAOS_SYSCALL_FD_SET_FLAGS,
-        native_fd,
-        pacha_flags,
-        PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_NONBLOCK);
-    (void)lpr_control_set_fd_flags(
-        fd,
-        (desc->flags & LPR_LINUX_O_CLOEXEC) != 0 ? LPR_LINUX_FD_CLOEXEC : 0);
-    (void)lpr_control_set_status_flags(fd, desc->flags);
-    return 1;
-}
-
-int lpr_restore_bootstrap_drm_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    struct pacha_fd_info wait_info;
-    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
-        return 0;
-    }
-    if (desc->native_wait_fd != 0 &&
-        (desc->native_wait_fd > INT32_MAX ||
-         !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
-         wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
-    if (lpr_control_install_fd(fd, LPR_FD_OPS_DRM, desc->flags, desc->handle, 0) != 0) {
-        return 0;
-    }
-    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
-    if (drm == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    drm->active = 1;
-    drm->flags = desc->flags;
-    drm->handle = desc->handle;
-    drm->wait_fd.raw = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
-    return 1;
-}
-
-int lpr_restore_bootstrap_device_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    const uint64_t major = desc->handle >> 32u;
-    const uint64_t minor = desc->handle & 0xffffffffull;
-    if (major == 0 || major > UINT8_MAX || minor > UINT8_MAX ||
-        !lpr_fd_slot_available(fd)) return 0;
-    if (lpr_control_install_fd(
-            fd, LPR_FD_OPS_DEVICE, desc->flags, desc->handle, 0) != 0)
-        return 0;
-    lpr_device_backend_t *device = lpr_device_backend(fd);
-    if (device == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    device->active = 1;
-    device->major = (uint8_t)major;
-    device->minor = (uint8_t)minor;
-    device->flags = desc->flags;
-    return 1;
-}
-
-int lpr_restore_bootstrap_input_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    struct pacha_fd_info wait_info;
-    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) return 0;
-    if (desc->native_wait_fd != 0 &&
-        (desc->native_wait_fd > INT32_MAX ||
-         !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
-         wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
-    if (lpr_control_install_fd(fd, LPR_FD_OPS_INPUT, desc->flags, desc->handle, 0) != 0)
-        return 0;
-    lpr_input_backend_t *input = lpr_input_backend(fd);
-    if (input == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    input->active = 1;
-    input->reserved0 = (uint8_t)desc->offset_or_counter;
-    input->flags = desc->flags;
-    input->handle = desc->handle;
-    input->wait_fd.raw = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
-    return 1;
-}
-
-int lpr_restore_bootstrap_dmabuf_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    const uint64_t native_fd = desc->native_wait_fd;
-    struct pacha_fd_info info;
-    if (desc->handle == 0 || lpr_runtime_reserved_fd(fd) || lpr_control_fd_active(fd) ||
-        native_fd > INT32_MAX || !lpr_native_fd_info(native_fd, &info) ||
-        info.kind != PACHA_FD_KIND_VMO ||
-        info.size < desc->offset_or_counter) {
-        return 0;
-    }
-    if (lpr_control_install_fd(
-        fd, LPR_FD_OPS_DMABUF, desc->flags, desc->handle,
-        desc->offset_or_counter) != 0) {
-        return 0;
-    }
-    lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(fd);
-    if (dmabuf == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    dmabuf->active = 1;
-    dmabuf->writable = (desc->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR ? 1u : 0u;
-    dmabuf->flags = desc->flags;
-    dmabuf->token = desc->handle;
-    dmabuf->size = desc->offset_or_counter;
-    dmabuf->native.raw = (int32_t)native_fd;
-    return 1;
-}
-
-int lpr_restore_bootstrap_event_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    if (!lpr_fd_slot_available(fd)) {
-        return 0;
-    }
-    if (lpr_control_install_fd(
-        fd,
-        LPR_FD_OPS_EVENT,
-        desc->flags,
-        fd,
-        desc->offset_or_counter) != 0)
-    {
-        return 0;
-    }
-    lpr_event_backend_t *event = lpr_event_backend(fd);
-    if (event == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    event->active = 1;
-    event->flags = desc->flags;
-    event->counter = desc->offset_or_counter;
-    return 1;
-}
-
-int lpr_restore_bootstrap_socket_fd(const lpr_bootstrap_fd_t *desc, uint64_t fd)
-{
-    struct pacha_fd_info wait_info;
-    if (desc->handle == 0 || !lpr_fd_slot_available(fd)) {
-        return 0;
-    }
-    if (desc->native_wait_fd != 0 &&
-        (desc->native_wait_fd > INT32_MAX ||
-         !lpr_native_fd_info(desc->native_wait_fd, &wait_info) ||
-         wait_info.kind != PACHA_FD_KIND_CHANNEL)) return 0;
-    if (lpr_control_install_fd(
-        fd,
-        LPR_FD_OPS_SOCKET,
-        desc->flags,
-        desc->handle,
-        0) != 0)
-    {
-        return 0;
-    }
-    lpr_socket_backend_t *socket = lpr_socket_backend(fd);
-    if (socket == 0) {
-        lpr_control_close_fd(fd);
-        return 0;
-    }
-    socket->active = 1;
-    socket->flags = desc->flags;
-    socket->handle = desc->handle;
-    socket->cloexec = (desc->flags & LPR_LINUX_O_CLOEXEC) != 0 ? 1u : 0u;
-    socket->type = (uint8_t)desc->offset_or_counter;
-    if ((desc->handle >> 63u) != 0) {
-        socket->domain = 1u;
-        socket->connected = 1u;
-    }
-    socket->sndbuf = 256u * 1024u;
-    socket->rcvbuf = 256u * 1024u;
-    socket->wait_fd.raw = desc->native_wait_fd >= 16 ? (int32_t)desc->native_wait_fd : -1;
-    return 1;
-}
-
-int lpr_restore_bootstrap_fd_desc(const lpr_bootstrap_fd_t *desc)
-{
-    uint64_t fd = 0;
-    if (!lpr_bootstrap_fd_desc_valid_common(desc, &fd)) {
-        return 0;
-    }
-    switch (desc->kind) {
-    case LPR_BOOTSTRAP_FD_FILED:
-        return lpr_restore_bootstrap_filed_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_DEVICE:
-        return lpr_restore_bootstrap_device_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_TTY:
-        return lpr_restore_bootstrap_tty_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_DRM:
-        return lpr_restore_bootstrap_drm_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_INPUT:
-        return lpr_restore_bootstrap_input_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_DMABUF:
-        return lpr_restore_bootstrap_dmabuf_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_PIPE:
-        return lpr_restore_bootstrap_pipe_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_EVENT:
-        return lpr_restore_bootstrap_event_fd(desc, fd);
-    case LPR_BOOTSTRAP_FD_SOCKET:
-        return lpr_restore_bootstrap_socket_fd(desc, fd);
-    default:
-        return 0;
-    }
-}
-
-int lpr_install_local_fd_descs(const lpr_bootstrap_fd_t *descs, uint64_t count)
-{
-    if (count != 0 && descs == 0) {
-        return 0;
-    }
-    for (uint64_t i = 0; i < count; ++i) {
-        if (!lpr_restore_bootstrap_fd_desc(&descs[i])) {
+        if (first == 0 || first->fd > LPR_LINUX_FD_MAX ||
+            lpr_runtime_reserved_fd(first->fd) ||
+            !lpr_manifest_install_first(first->fd, first, &ofds[oi],
+                records + ofds[oi].record_offset))
+        {
             return 0;
         }
+        for (uint64_t ei = 0; ei < manifest->entry_count; ++ei) {
+            const lpr_manifest_entry_t *entry = &entries[ei];
+            if (entry == first || entry->ofd_index != oi) continue;
+            if (entry->fd > LPR_LINUX_FD_MAX || lpr_runtime_reserved_fd(entry->fd) ||
+                lpr_fd_table_ensure_fd(entry->fd) != 0 ||
+                lpr_fd_table_dup_at(&lpr_control_fd_table, first->fd, entry->fd,
+                    entry->fd_flags) != 0 ||
+                lpr_control_set_effective_rights(
+                    entry->fd, (uint32_t)entry->effective_rights) != 0)
+            {
+                return 0;
+            }
+        }
     }
     return 1;
-}
-
-int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count)
-{
-    if (lpr_bootstrap_local_fds_installed) {
-        return 1;
-    }
-    lpr_bootstrap_local_fds_installed = 1;
-    return lpr_install_local_fd_descs(descs, count);
 }
 
 void lpr_state_dump(const char *reason)

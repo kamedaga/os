@@ -41,6 +41,7 @@ mkdir -p "$(dirname "$repo_root/$out")"
   "$repo_root/userland/personality/linux/runtime/lpr_zpoline.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_syscall_catalog.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_memory.c" \
+  "$repo_root/userland/personality/src/lpr_manifest.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs_local.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/table.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_error.c" \

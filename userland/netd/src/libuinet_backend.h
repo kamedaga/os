@@ -5,6 +5,8 @@
 
 #include <stdint.h>
 
+struct pacha_service_wait_set;
+
 enum netd_libuinet_state {
     NETD_LIBUINET_UNLINKED = 0,
     NETD_LIBUINET_READY = 1,
@@ -19,10 +21,17 @@ enum netd_libuinet_state netd_libuinet_state(void);
 uint64_t netd_libuinet_rx_frames(void);
 uint64_t netd_libuinet_rx_drops(void);
 
-int netd_libuinet_socket_open(uint64_t domain, uint64_t type, uint64_t protocol, uint64_t *out_handle);
+int netd_libuinet_socket_open(
+    uint64_t domain,
+    uint64_t type,
+    uint64_t protocol,
+    int notify_fd,
+    uint64_t *out_handle);
 int netd_libuinet_socket_connect(uint64_t handle, uint32_t addr_be, uint16_t port_be, uint64_t flags);
 int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uint64_t flags, uint32_t addr_be, uint16_t port_be, size_t *out_sent);
 int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint64_t flags, size_t *out_received);
 int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_revents, int32_t *out_error);
 int netd_libuinet_socket_close(uint64_t handle);
+int netd_libuinet_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set);
+void netd_libuinet_socket_reap_hangups(void);
 int netd_filed_close_handle(uint64_t handle);

@@ -5,6 +5,7 @@
 #include "termd/ipc_protocol.h"
 
 #include <stdint.h>
+#include <stddef.h>
 
 #include <kobox/device.h>
 #include <kobox/module.h>
@@ -47,18 +48,22 @@ int termd_linux_tty_island_refresh_ptmx(struct termd_linux_tty_island *island);
 int termd_linux_tty_island_open_ptmx(
     struct termd_linux_tty_island *island,
     uint64_t flags,
+    int notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle);
 int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t handle);
 int termd_linux_tty_island_dup(
@@ -81,5 +86,7 @@ int termd_linux_tty_island_take_signal(
     struct termd_linux_tty_island *island,
     termd_signal_request_t *request,
     uint64_t *out_result);
+size_t termd_linux_tty_island_collect_wait_sources(int *out_fds, size_t capacity);
+size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island);
 
 #endif

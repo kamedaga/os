@@ -2,7 +2,9 @@
 
 #include "kobox/module.h"
 #include "libuinet_backend.h"
+#include "netlink_socket.h"
 #include "socket_service.h"
+#include "unix_socket.h"
 #include "pacha/ipc.h"
 
 #include <stdint.h>
@@ -82,14 +84,20 @@ int main(int argc, char **argv)
     fflush(stdout);
     fflush(stderr);
 
-    static struct pacha_service_wait_set wait_set;
-    if (pacha_service_wait_init(&wait_set, (int)cfg->socket_endpoint_fd) != 0) return 8;
-
     for (;;) {
         netd_packet_io_pump_once();
         netd_socket_service_poll();
+        static struct pacha_service_wait_set wait_set;
+        if (pacha_service_wait_init(&wait_set, (int)cfg->socket_endpoint_fd) != 0 ||
+            netd_unix_socket_collect_wait_sources(&wait_set) != 0 ||
+            netd_netlink_socket_collect_wait_sources(&wait_set) != 0 ||
+            netd_libuinet_socket_collect_wait_sources(&wait_set) != 0)
+            return 8;
         (void)pacha_service_wait(
             &wait_set,
             netd_libuinet_needs_periodic_poll() ? 1u : PACHA_FD_WAIT_FOREVER);
+        netd_unix_socket_reap_hangups();
+        netd_netlink_socket_reap_hangups();
+        netd_libuinet_socket_reap_hangups();
     }
 }

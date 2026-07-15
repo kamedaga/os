@@ -11,6 +11,7 @@
 #define FILED_MAX_VNODES 256u
 #define FILED_MAX_FILES 256u
 #define FILED_MAX_HANDLES 256u
+#define FILED_MAX_TRANSFER_LEASES 64u
 #define FILED_ID_HINT_SLOTS 1024u
 
 typedef uint32_t filed_mount_id_t;
@@ -133,6 +134,8 @@ typedef struct filed_handle {
     uint32_t rights;
     uint32_t fd_flags;
     filed_generation_t generation;
+    uint32_t owner_session;
+    int32_t lease_fd;
 } filed_handle_t;
 
 typedef struct filed_vfs {
@@ -270,6 +273,17 @@ filed_status_t filed_vfs_open_parent(
     filed_vfs_open_result_t *out_open);
 
 filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle_id);
+filed_status_t filed_vfs_set_handle_owner(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint32_t owner_session);
+filed_status_t filed_vfs_set_handle_lease(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    int lease_fd);
+int filed_vfs_get_handle_lease(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id);
 filed_status_t filed_vfs_close_handle_ex(
     filed_vfs_t *vfs,
     filed_handle_id_t handle_id,

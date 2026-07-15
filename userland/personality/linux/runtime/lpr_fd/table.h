@@ -27,6 +27,8 @@ enum {
     LPR_FD_RIGHT_STAT = 1u << 3,
     LPR_FD_RIGHT_MMAP = 1u << 4,
     LPR_FD_RIGHT_DUP = 1u << 5,
+
+    LPR_BACKEND_TRANSFER_LEASE = 1u << 7,
 };
 
 typedef uint32_t lpr_linux_fd_t;
@@ -43,6 +45,8 @@ typedef struct lpr_filed_backend {
     uint32_t flags;
     uint64_t handle;
     uint64_t offset;
+    lpr_native_fd_t lease_fd;
+    uint32_t reserved2;
 } lpr_filed_backend_t;
 
 typedef struct lpr_pipe_backend {
@@ -80,6 +84,8 @@ typedef struct lpr_tty_backend {
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
+    lpr_native_fd_t wait_fd;
+    uint32_t reserved2;
 } lpr_tty_backend_t;
 
 enum {
@@ -102,7 +108,7 @@ typedef struct lpr_drm_backend {
     uint32_t flags;
     uint64_t handle;
     lpr_native_fd_t wait_fd;
-    uint32_t reserved2;
+    lpr_native_fd_t lease_fd;
 } lpr_drm_backend_t;
 
 typedef struct lpr_input_backend {
@@ -112,7 +118,7 @@ typedef struct lpr_input_backend {
     uint32_t flags;
     uint64_t handle;
     lpr_native_fd_t wait_fd;
-    uint32_t reserved2;
+    lpr_native_fd_t lease_fd;
 } lpr_input_backend_t;
 
 typedef struct lpr_dmabuf_backend {

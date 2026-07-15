@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <pacha/status.h>
 #include "lpr_image_abi.h"
+#include "lpr_manifest.h"
 #include "personality_abi.h"
 #include "runtime_page.h"
 
@@ -155,57 +156,6 @@
 #define LPR_LINUX_ARCH_SET_FS 0x1002ull
 #define LPR_LINUX_ARCH_GET_FS 0x1003ull
 #define LPR_LINUX_ARCH_GET_GS 0x1004ull
-
-typedef struct lpr_bootstrap_fd {
-    uint64_t fd;
-    uint64_t kind;
-    uint64_t flags;
-    uint64_t handle;
-    uint64_t offset_or_counter;
-    uint64_t native_wait_fd;
-} lpr_bootstrap_fd_t;
-
-struct lpr_bootstrap {
-    uint64_t magic;
-    uint64_t image_abi_version;
-    uint64_t byte_size;
-    uint64_t local_fd_table_offset;
-    uint64_t local_fd_table_bytes;
-    uint64_t local_fd_count;
-    uint64_t linux_pid;
-    uint64_t linux_ppid;
-    uint64_t linux_sid;
-    uint64_t linux_pgrp;
-    uint64_t linux_next_pid;
-    uint64_t cwd_handle;
-    uint64_t supervisor_token;
-    uint64_t supervisor_endpoint_fd;
-    uint64_t fd_table_token;
-    uint64_t flags;
-    char ctty[LPR_BOOTSTRAP_CTTY_BYTES];
-    char cwd[LPR_BOOTSTRAP_CWD_BYTES];
-};
-
-_Static_assert(sizeof(lpr_bootstrap_fd_t) == LPR_BOOTSTRAP_FD_ENTRY_SIZE, "lpr bootstrap fd size");
-_Static_assert(offsetof(struct lpr_bootstrap, magic) == LPR_BOOTSTRAP_MAGIC_OFFSET, "lpr bootstrap magic offset");
-_Static_assert(offsetof(struct lpr_bootstrap, image_abi_version) == LPR_BOOTSTRAP_IMAGE_ABI_VERSION_OFFSET, "lpr bootstrap image ABI version offset");
-_Static_assert(offsetof(struct lpr_bootstrap, byte_size) == LPR_BOOTSTRAP_BYTE_SIZE_OFFSET, "lpr bootstrap byte size offset");
-_Static_assert(offsetof(struct lpr_bootstrap, local_fd_table_offset) == LPR_BOOTSTRAP_LOCAL_FD_TABLE_OFFSET_OFFSET, "lpr bootstrap fd table offset field");
-_Static_assert(offsetof(struct lpr_bootstrap, local_fd_table_bytes) == LPR_BOOTSTRAP_LOCAL_FD_TABLE_BYTES_OFFSET, "lpr bootstrap fd table bytes offset");
-_Static_assert(offsetof(struct lpr_bootstrap, local_fd_count) == LPR_BOOTSTRAP_LOCAL_FD_COUNT_OFFSET, "lpr bootstrap fd count offset");
-_Static_assert(offsetof(struct lpr_bootstrap, linux_pid) == LPR_BOOTSTRAP_LINUX_PID_OFFSET, "lpr bootstrap pid offset");
-_Static_assert(offsetof(struct lpr_bootstrap, linux_ppid) == LPR_BOOTSTRAP_LINUX_PPID_OFFSET, "lpr bootstrap ppid offset");
-_Static_assert(offsetof(struct lpr_bootstrap, linux_sid) == LPR_BOOTSTRAP_LINUX_SID_OFFSET, "lpr bootstrap sid offset");
-_Static_assert(offsetof(struct lpr_bootstrap, linux_pgrp) == LPR_BOOTSTRAP_LINUX_PGRP_OFFSET, "lpr bootstrap pgrp offset");
-_Static_assert(offsetof(struct lpr_bootstrap, linux_next_pid) == LPR_BOOTSTRAP_LINUX_NEXT_PID_OFFSET, "lpr bootstrap next pid offset");
-_Static_assert(offsetof(struct lpr_bootstrap, cwd_handle) == LPR_BOOTSTRAP_CWD_HANDLE_OFFSET, "lpr bootstrap cwd handle offset");
-_Static_assert(offsetof(struct lpr_bootstrap, supervisor_token) == LPR_BOOTSTRAP_SUPERVISOR_TOKEN_OFFSET, "lpr bootstrap supervisor token offset");
-_Static_assert(offsetof(struct lpr_bootstrap, supervisor_endpoint_fd) == LPR_BOOTSTRAP_SUPERVISOR_ENDPOINT_FD_OFFSET, "lpr bootstrap supervisor fd offset");
-_Static_assert(offsetof(struct lpr_bootstrap, fd_table_token) == LPR_BOOTSTRAP_FD_TABLE_TOKEN_OFFSET, "lpr bootstrap fd table token offset");
-_Static_assert(offsetof(struct lpr_bootstrap, flags) == LPR_BOOTSTRAP_FLAGS_OFFSET, "lpr bootstrap flags offset");
-_Static_assert(offsetof(struct lpr_bootstrap, ctty) == LPR_BOOTSTRAP_CTTY_OFFSET, "lpr bootstrap ctty offset");
-_Static_assert(offsetof(struct lpr_bootstrap, cwd) == LPR_BOOTSTRAP_CWD_OFFSET, "lpr bootstrap cwd offset");
-_Static_assert(sizeof(struct lpr_bootstrap) == LPR_BOOTSTRAP_HEADER_SIZE, "lpr bootstrap header size");
 
 int64_t lpr_start(struct lpr_runtime_page *runtime);
 

@@ -231,6 +231,32 @@ int64_t lpr_drm_dup_handle(uint64_t handle)
     return status == 0 && result == handle ? 0 : (status != 0 ? status : -LPR_LINUX_EIO);
 }
 
+int64_t lpr_drm_transfer_dup_handle(
+    uint64_t handle,
+    int lease_fd,
+    uint64_t *out_handle)
+{
+    if (out_handle == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
+    *out_handle = 0;
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    drmd_handle_request_t *dup = (drmd_handle_request_t *)lpr_drmd_payload(page);
+    lpr_memset(dup, 0, sizeof(*dup));
+    dup->handle = handle;
+    const int64_t status = lpr_drmd_call_transfer(
+        DRMD_OP_HANDLE_DUP,
+        page_fd,
+        page,
+        sizeof(*dup),
+        out_handle,
+        0,
+        lease_fd);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status == 0 && *out_handle == handle ? 0 :
+        (status != 0 ? status : -LPR_LINUX_EIO);
+}
+
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token)
 {
     void *page = 0;

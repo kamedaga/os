@@ -12,6 +12,7 @@
 #include "loader/module_context.h"
 
 #include <pacha/trace.h>
+#include <pacha/ipc.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,6 +140,8 @@ typedef struct termd_linux_tty_handle {
     uint32_t process_id;
     uint32_t pgrp_id;
     uint32_t reserved_owner;
+    int notify_fd;
+    uint32_t reserved_notify;
     void *cdev;
     void *fops;
     void *open;
@@ -823,9 +826,10 @@ static int termd_linux_tty_find_pts_index(
 int termd_linux_tty_island_open_ptmx(
     struct termd_linux_tty_island *island,
     uint64_t flags,
+    int notify_fd,
     uint64_t *out_handle)
 {
-    if (island == NULL || out_handle == NULL) {
+    if (island == NULL || out_handle == NULL || notify_fd < 16) {
         return -22;
     }
     *out_handle = 0;
@@ -873,6 +877,7 @@ int termd_linux_tty_island_open_ptmx(
 
     handle->flags = (uint32_t)flags;
     handle->ref_count = 1;
+    handle->notify_fd = notify_fd;
     initialize_ptmx_winsize(island, handle);
     *out_handle = handle->handle;
     printf(
@@ -885,9 +890,10 @@ int termd_linux_tty_island_open_ptmx(
 int termd_linux_tty_island_open_pts(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle)
 {
-    if (island == NULL || request == NULL || out_handle == NULL) {
+    if (island == NULL || request == NULL || out_handle == NULL || notify_fd < 16) {
         return -22;
     }
     *out_handle = 0;
@@ -961,6 +967,7 @@ int termd_linux_tty_island_open_pts(
 
     handle->flags = (uint32_t)request->flags;
     handle->ref_count = 1;
+    handle->notify_fd = notify_fd;
     termd_linux_tty_sync_current_state(
         handle,
         termd_linux_tty_handle_ids(handle),
@@ -979,9 +986,10 @@ int termd_linux_tty_island_open_pts(
 int termd_linux_tty_island_open_hvc(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle)
 {
-    if (island == NULL || request == NULL || out_handle == NULL) {
+    if (island == NULL || request == NULL || out_handle == NULL || notify_fd < 16) {
         return -22;
     }
     *out_handle = 0;
@@ -1038,6 +1046,7 @@ int termd_linux_tty_island_open_hvc(
 
     handle->flags = (uint32_t)request->flags;
     handle->ref_count = 1;
+    handle->notify_fd = notify_fd;
     termd_linux_tty_sync_current_state(
         handle,
         termd_linux_tty_handle_ids(handle),
@@ -1056,6 +1065,7 @@ int termd_linux_tty_island_open_hvc(
 int termd_linux_tty_island_open_ctty(
     struct termd_linux_tty_island *island,
     const termd_open_request_t *request,
+    int notify_fd,
     uint64_t *out_handle)
 {
     if (request == NULL) {
@@ -1063,7 +1073,7 @@ int termd_linux_tty_island_open_ctty(
     }
     termd_open_request_t hvc_request = *request;
     hvc_request.pts_index = 0;
-    return termd_linux_tty_island_open_hvc(island, &hvc_request, out_handle);
+    return termd_linux_tty_island_open_hvc(island, &hvc_request, notify_fd, out_handle);
 }
 
 int termd_linux_tty_island_take_signal(
@@ -1126,8 +1136,46 @@ int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t
             leave_owner_context(&context);
         }
     }
+    if (handle->notify_fd >= 16) {
+        (void)pacha_fd_close(handle->notify_fd);
+        handle->notify_fd = -1;
+    }
     memset(handle, 0, sizeof(*handle));
     return result;
+}
+
+size_t termd_linux_tty_island_collect_wait_sources(int *out_fds, size_t capacity)
+{
+    size_t count = 0;
+    if (out_fds == NULL) return 0;
+    for (size_t i = 0; i < TERMD_LINUX_TTY_HANDLE_MAX && count < capacity; ++i) {
+        if (!tty_handles[i].active || tty_handles[i].notify_fd < 16) continue;
+        out_fds[count++] = tty_handles[i].notify_fd;
+    }
+    return count;
+}
+
+size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island)
+{
+    if (island == NULL) return 0;
+    size_t reaped = 0;
+    for (size_t i = 0; i < TERMD_LINUX_TTY_HANDLE_MAX; ++i) {
+        termd_linux_tty_handle_t *handle = &tty_handles[i];
+        if (!handle->active || handle->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = handle->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle_id = handle->handle;
+        handle->ref_count = 1;
+        (void)termd_linux_tty_island_close(island, handle_id);
+        printf("[termd] tty_orphan_reap handle=%llu\n",
+            (unsigned long long)handle_id);
+        reaped++;
+    }
+    return reaped;
 }
 
 int termd_linux_tty_island_dup(

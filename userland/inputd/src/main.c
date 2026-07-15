@@ -25,15 +25,11 @@ int main(void)
     const int ready_status = inputd_service_send_boot_ready(
         &service, init_status, island.ready ? island.device_count : 0);
     if (ready_status != 0 || init_status != 0) return 1;
-    static struct pacha_service_wait_set wait_set;
-    if (pacha_service_wait_init(&wait_set, (int)cfg->input_endpoint_fd) != 0) return 1;
     struct pacha_capsule_irq wake_irqs[INPUTD_DEVICE_COUNT];
     memset(wake_irqs, 0, sizeof(wake_irqs));
     for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++) {
         if (pacha_capsule_device_derive_irq(
-                (int)cfg->device_fds[i], PACHA_CAPSULE_IRQ_AUTO, 0, 0, &wake_irqs[i]) != 0 ||
-            pacha_service_wait_add(
-                &wait_set, wake_irqs[i].fd, PACHA_FD_EVENT_READABLE) != 0)
+                (int)cfg->device_fds[i], PACHA_CAPSULE_IRQ_AUTO, 0, 0, &wake_irqs[i]) != 0)
             return 1;
     }
     printf("[inputd] service loop endpoint_fd=%llu\n",
@@ -61,8 +57,27 @@ int main(void)
         }
         inputd_input_island_pump(&island);
         inputd_input_notify_readable();
+        (void)inputd_input_reap_hangups();
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
+            static struct pacha_service_wait_set wait_set;
+            int handle_wait_fds[PACHA_SERVICE_WAIT_MAX_FDS];
+            if (pacha_service_wait_init(&wait_set, (int)cfg->input_endpoint_fd) != 0)
+                return 1;
+            for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++) {
+                if (pacha_service_wait_add(
+                        &wait_set, wake_irqs[i].fd, PACHA_FD_EVENT_READABLE) != 0)
+                    return 1;
+            }
+            const size_t handle_wait_count = inputd_input_collect_wait_sources(
+                handle_wait_fds,
+                PACHA_SERVICE_WAIT_MAX_FDS - 1u - INPUTD_DEVICE_COUNT);
+            for (size_t i = 0; i < handle_wait_count; i++) {
+                if (pacha_service_wait_add(
+                        &wait_set, handle_wait_fds[i], PACHA_FD_EVENT_HANGUP) != 0)
+                    return 1;
+            }
             (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+            (void)inputd_input_reap_hangups();
         }
     }
 }

@@ -1284,7 +1284,7 @@ static void lpr_syscall_table_init(void)
     if (lpr_syscall_table_initialized) {
         return;
     }
-    (void)lpr_load_bootstrap();
+    (void)lpr_load_manifest();
     lpr_syscall_table[LPR_LINUX_SYS_READ].handler = lpr_sys_read;
     lpr_syscall_table[LPR_LINUX_SYS_WRITE].handler = lpr_sys_write;
     lpr_syscall_table[LPR_LINUX_SYS_OPEN].handler = lpr_sys_open;

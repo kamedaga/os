@@ -563,9 +563,19 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
     return 0;
 }
 
-static void filed_runtime_release_session(filed_session_t *session)
+static void filed_runtime_release_session(
+    filed_runtime_t *runtime,
+    uint64_t session_index)
 {
+    if (runtime == NULL || session_index >= FILED_RUNTIME_MAX_SESSIONS) return;
+    filed_session_t *session = &runtime->sessions[session_index];
     if (session == NULL) return;
+    const uint32_t owner_session = (uint32_t)session_index + 1u;
+    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
+        filed_handle_t *handle = &runtime->vfs.handles[i];
+        if (!handle->active || handle->owner_session != owner_session) continue;
+        (void)filed_close_handle_runtime(runtime, handle->id);
+    }
     if (session->page != NULL)
         (void)pacha_munmap(session->page, session->page_size);
     if (session->page_fd >= 16)
@@ -590,8 +600,13 @@ int filed_runtime_serve(filed_runtime_t *runtime)
     }
 
     for (;;) {
-        struct pacha_pollfd fds[2 + FILED_RUNTIME_MAX_SESSIONS];
-        uint64_t session_indices[2 + FILED_RUNTIME_MAX_SESSIONS];
+        struct pacha_pollfd fds[
+            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+        uint64_t session_indices[
+            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+        filed_handle_id_t lease_handles[
+            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+        memset(lease_handles, 0, sizeof(lease_handles));
         uint64_t count = 0;
         fds[count++] = (struct pacha_pollfd){
             .fd = runtime->client_endpoint_fd,
@@ -615,6 +630,17 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             fds[count++] = (struct pacha_pollfd){
                 .fd = runtime->sessions[i].channel_fd,
                 .events = PACHA_FD_EVENT_READABLE,
+                .revents = 0,
+            };
+        }
+        for (uint64_t i = 0; i < FILED_MAX_HANDLES; ++i) {
+            const filed_handle_t *handle = &runtime->vfs.handles[i];
+            if (!handle->active || handle->lease_fd < 16) continue;
+            session_indices[count] = UINT64_MAX;
+            lease_handles[count] = handle->id;
+            fds[count++] = (struct pacha_pollfd){
+                .fd = handle->lease_fd,
+                .events = PACHA_FD_EVENT_HANGUP,
                 .revents = 0,
             };
         }
@@ -653,18 +679,27 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 filed_runtime_syncer_tick(runtime);
                 continue;
             }
+            if (lease_handles[pos] != 0) {
+                if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
+                    const filed_handle_id_t handle_id = lease_handles[pos];
+                    (void)filed_close_handle_runtime(runtime, handle_id);
+                    printf("[filed] transfer_orphan_reap handle=%u\n",
+                        (unsigned)handle_id);
+                }
+                continue;
+            }
             const uint64_t session_index = session_indices[pos];
             if (session_index == UINT64_MAX) {
                 continue;
             }
             filed_session_t *session = &runtime->sessions[session_index];
             if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
-                filed_runtime_release_session(session);
+                filed_runtime_release_session(runtime, session_index);
                 continue;
             }
             const int status = filed_dispatch_session_once(runtime, session_index);
             if (status == PACHA_ERR_CLOSED) {
-                filed_runtime_release_session(session);
+                filed_runtime_release_session(runtime, session_index);
                 continue;
             }
             if (status != 0 &&

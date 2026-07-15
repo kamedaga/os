@@ -166,6 +166,31 @@ int64_t lpr_input_dup_handle(uint64_t handle)
     return status == 0 && result == handle ? 0 : (status != 0 ? status : -LPR_LINUX_EIO);
 }
 
+int64_t lpr_input_transfer_dup_handle(
+    uint64_t handle,
+    int lease_fd,
+    uint64_t *out_handle)
+{
+    if (out_handle == 0 || lease_fd < 16) return -LPR_LINUX_EINVAL;
+    *out_handle = 0;
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    inputd_handle_request_t *request = lpr_inputd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->handle = handle;
+    const int64_t status = lpr_inputd_call_transfer(
+        INPUTD_OP_DUP,
+        page_fd,
+        page,
+        sizeof(*request),
+        out_handle,
+        lease_fd);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    return status == 0 && *out_handle == handle ? 0 :
+        (status != 0 ? status : -LPR_LINUX_EIO);
+}
+
 int64_t lpr_input_read_events(uint64_t fd, uint64_t buf, uint64_t count)
 {
     lpr_input_backend_t *input = lpr_input_backend(fd);

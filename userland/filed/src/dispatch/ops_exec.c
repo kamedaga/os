@@ -8,8 +8,6 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     const uint64_t known_flags =
         FILED_EXEC_INHERIT_HANDLES |
         FILED_EXEC_LINUX_LPR |
-        FILED_EXEC_LINUX_BOOTSTRAP |
-        FILED_EXEC_LINUX_DEFAULT_STDIO |
         FILED_EXEC_TRANSFER_PROCESS_FD;
     int64_t reply_status = -22;
     int process_fd = -1;
@@ -19,15 +17,12 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     int exec_termd_tty_endpoint_fd = -1;
     int exec_drmd_drm_endpoint_fd = -1;
     int exec_inputd_input_endpoint_fd = -1;
-    int exec_lpr_bootstrap_fd = -1;
     int exec_filed_endpoint_borrowed = 0;
     int exec_netd_socket_endpoint_borrowed = 0;
     int exec_termd_tty_endpoint_borrowed = 0;
     int exec_drmd_drm_endpoint_borrowed = 0;
     int exec_inputd_input_endpoint_borrowed = 0;
-    filed_dispatch_saved_fd_t lpr_bootstrap_saved;
     filed_handle_id_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
-    filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
     if ((exec->flags & ~known_flags) != 0 ||
@@ -37,11 +32,7 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         exec->argc > FILED_EXEC_MAX_ARGS ||
         exec->envc > FILED_EXEC_MAX_ENVS ||
         exec->string_bytes > FILED_EXEC_STRING_BYTES ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_exec_string_ref_empty(exec->cwd) &&
-            !filed_exec_string_ref_valid(exec, exec->cwd)) ||
-        !filed_dispatch_exec_default_stdio_valid(exec) ||
-        !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
     {
         goto out;
     }
@@ -130,25 +121,6 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
             &exec_inputd_input_endpoint_borrowed);
         if (reply_status != 0) goto out;
     }
-    if ((exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) ==
-        (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
-    {
-        const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
-        if (bootstrap_source_fd < 16) {
-            reply_status = bootstrap_source_fd < 0 ? bootstrap_source_fd : -12;
-            goto out;
-        }
-        reply_status = filed_dispatch_prepare_inherit_fd_to_target(
-            bootstrap_source_fd,
-            FILED_EXEC_LPR_BOOTSTRAP_FD,
-            &exec_lpr_bootstrap_fd,
-            &lpr_bootstrap_saved);
-        if (reply_status != 0) {
-            (void)pacha_fd_close(bootstrap_source_fd);
-            goto out;
-        }
-    }
-
     filed_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
@@ -182,16 +154,6 @@ out:
     filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_drmd_drm_endpoint_fd, exec_drmd_drm_endpoint_borrowed);
     filed_dispatch_close_prepared_endpoint(&exec_inputd_input_endpoint_fd, exec_inputd_input_endpoint_borrowed);
-    if (exec_lpr_bootstrap_fd >= 0) {
-        if (lpr_bootstrap_saved.fd >= 0) {
-            filed_dispatch_restore_target_fd(exec_lpr_bootstrap_fd, &lpr_bootstrap_saved);
-        } else {
-            filed_dispatch_close_owned_fd(&exec_lpr_bootstrap_fd);
-        }
-    } else if (lpr_bootstrap_saved.fd >= 0) {
-        (void)pacha_fd_close(lpr_bootstrap_saved.fd);
-        filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
-    }
     if (reply_status != 0) {
         for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
@@ -236,8 +198,6 @@ int filed_dispatch_exec_path(
         FILED_EXEC_PATCH_BOOTSTRAP_FDS |
         FILED_EXEC_INHERIT_HANDLES |
         FILED_EXEC_LINUX_LPR |
-        FILED_EXEC_LINUX_BOOTSTRAP |
-        FILED_EXEC_LINUX_DEFAULT_STDIO |
         FILED_EXEC_TRANSFER_PROCESS_FD;
     const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
@@ -273,11 +233,7 @@ int filed_dispatch_exec_path(
         exec->argc > FILED_EXEC_MAX_ARGS ||
         exec->envc > FILED_EXEC_MAX_ENVS ||
         exec->string_bytes > FILED_EXEC_STRING_BYTES ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_exec_string_ref_empty(exec->cwd) &&
-            !filed_exec_string_ref_valid(exec, exec->cwd)) ||
-        !filed_dispatch_exec_default_stdio_valid(exec) ||
-        !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 0))
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
     {
         fprintf(stderr,
             "[filed] exec_path invalid path=%.*s flags=0x%llx inherit_fds=%llu inherit_handles=%llu fd_patches=%llu argc=%llu envc=%llu string_bytes=%llu\n",
@@ -314,6 +270,11 @@ int filed_dispatch_exec_path(
         goto out;
     }
     if ((exec_flags & FILED_EXEC_PATCH_BOOTSTRAP_FDS) != 0 && has_bootstrap == 0) {
+        goto out;
+    }
+    if ((exec_flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_PATCH_BOOTSTRAP_FDS)) ==
+        (FILED_EXEC_LINUX_LPR | FILED_EXEC_PATCH_BOOTSTRAP_FDS))
+    {
         goto out;
     }
     if ((exec_flags & FILED_EXEC_INHERIT_HANDLES) == 0 && inherit_handle_count != 0) {
@@ -425,23 +386,19 @@ int filed_dispatch_exec_path(
             &exec_inputd_input_endpoint_borrowed);
         if (reply_status != 0) goto out;
     }
-    if ((exec_flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP)) ==
-        (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP))
+    if ((exec_flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_BOOTSTRAP_FD)) ==
+        (FILED_EXEC_LINUX_LPR | FILED_EXEC_BOOTSTRAP_FD))
     {
-        const int bootstrap_source_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, NULL);
-        if (bootstrap_source_fd < 16) {
-            reply_status = bootstrap_source_fd < 0 ? bootstrap_source_fd : -12;
-            goto out;
-        }
+        const int bootstrap_source_fd = bootstrap_fd;
         reply_status = filed_dispatch_prepare_inherit_fd_to_target(
             bootstrap_source_fd,
             FILED_EXEC_LPR_BOOTSTRAP_FD,
             &exec_lpr_bootstrap_fd,
             &lpr_bootstrap_saved);
         if (reply_status != 0) {
-            (void)pacha_fd_close(bootstrap_source_fd);
             goto out;
         }
+        bootstrap_fd = -1;
     }
 
     if ((exec_flags & FILED_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
@@ -519,7 +476,7 @@ int filed_dispatch_exec_path(
         exec,
         inherit_fds,
         inherit_fd_count,
-        bootstrap_fd,
+        exec_lpr_bootstrap_fd >= 0 ? exec_lpr_bootstrap_fd : bootstrap_fd,
         &process_fd,
         &thread_fd);
     filed_close_walk_handle(runtime, open_result.handle_id, 1);
@@ -633,40 +590,33 @@ int filed_dispatch_exec_self(
 
     filed_exec_path_t *exec = (filed_exec_path_t *)page;
     const uint64_t known_flags =
+        FILED_EXEC_BOOTSTRAP_FD |
         FILED_EXEC_LINUX_LPR |
-        FILED_EXEC_LINUX_BOOTSTRAP |
-        FILED_EXEC_SELF |
-        FILED_EXEC_LPR_FD_TABLE;
+        FILED_EXEC_SELF;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
-    int lpr_fd_table_fd = -1;
-    void *lpr_fd_table_page = NULL;
-    const filed_exec_lpr_fd_table_t *lpr_fd_table = NULL;
-    const int wants_lpr_fd_table = (exec->flags & FILED_EXEC_LPR_FD_TABLE) != 0;
-    const uint64_t expected_request_fd_count = wants_lpr_fd_table ? 3u : 2u;
+    if (request->fds != NULL &&
+        request->fd_count > 1u &&
+        request->fds[1].fd >= 16)
+    {
+        bootstrap_fd = (int)request->fds[1].fd;
+    }
 
     if ((exec->flags & ~known_flags) != 0 ||
-        (exec->flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP | FILED_EXEC_SELF)) !=
-            (FILED_EXEC_LINUX_LPR | FILED_EXEC_LINUX_BOOTSTRAP | FILED_EXEC_SELF) ||
+        (exec->flags & (FILED_EXEC_BOOTSTRAP_FD | FILED_EXEC_LINUX_LPR | FILED_EXEC_SELF)) !=
+            (FILED_EXEC_BOOTSTRAP_FD | FILED_EXEC_LINUX_LPR | FILED_EXEC_SELF) ||
         exec->inherit_fd_count != 0 ||
         exec->inherit_handle_count != 0 ||
         exec->fd_patch_count != 0 ||
         exec->argc > FILED_EXEC_MAX_ARGS ||
         exec->envc > FILED_EXEC_MAX_ENVS ||
         exec->string_bytes > FILED_EXEC_STRING_BYTES ||
-        request->fd_count != expected_request_fd_count ||
+        request->fd_count != 3u ||
         request->fds == NULL ||
-        !filed_name_is_terminated(exec->path, sizeof(exec->path)) ||
-        (!filed_exec_string_ref_empty(exec->cwd) &&
-            !filed_exec_string_ref_valid(exec, exec->cwd)) ||
-        !filed_exec_string_ref_empty(exec->ctty) ||
-        (wants_lpr_fd_table &&
-            (exec->lpr_fd_table_bytes < sizeof(filed_exec_lpr_fd_table_t) ||
-                request->fds[1].fd < 16)) ||
-        (!wants_lpr_fd_table &&
-            !filed_dispatch_exec_lpr_fd_table_valid(exec, NULL, 1)))
+        bootstrap_fd < 16 ||
+        !filed_name_is_terminated(exec->path, sizeof(exec->path)))
     {
         goto out;
     }
@@ -679,30 +629,6 @@ int filed_dispatch_exec_self(
         if (!filed_exec_string_ref_valid(exec, exec->envp[i])) {
             goto out;
         }
-    }
-
-    if (wants_lpr_fd_table) {
-        lpr_fd_table_fd = (int)request->fds[1].fd;
-        lpr_fd_table_page = pacha_mmap(
-            lpr_fd_table_fd,
-            exec->lpr_fd_table_bytes,
-            PACHA_PROT_READ,
-            PACHA_MMAP_SHARED,
-            0);
-        if (lpr_fd_table_page == NULL) {
-            goto out;
-        }
-        lpr_fd_table = (const filed_exec_lpr_fd_table_t *)lpr_fd_table_page;
-        if (!filed_dispatch_exec_lpr_fd_table_valid(exec, lpr_fd_table, 1)) {
-            goto out;
-        }
-    }
-
-    bootstrap_fd = filed_dispatch_create_lpr_bootstrap_fd(exec, lpr_fd_table);
-    if (bootstrap_fd < 16) {
-        reply_status = bootstrap_fd < 0 ? bootstrap_fd : -12;
-        bootstrap_fd = -1;
-        goto out;
     }
 
     filed_openat_t openat;
@@ -741,12 +667,6 @@ int filed_dispatch_exec_self(
     }
 
 out:
-    if (lpr_fd_table_page != NULL) {
-        (void)pacha_munmap(lpr_fd_table_page, exec->lpr_fd_table_bytes);
-    }
-    if (lpr_fd_table_fd >= 16) {
-        (void)pacha_fd_close(lpr_fd_table_fd);
-    }
     (void)pacha_munmap(page, FILED_PAGE_BYTES);
     (void)pacha_fd_close(page_fd);
     if (reply_status == 0 && process_fd >= 16 && thread_fd >= 16 && bootstrap_fd >= 16) {

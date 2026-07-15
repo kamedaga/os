@@ -129,8 +129,17 @@ int inputd_service_dispatch(
                 inputd_input_close(((inputd_handle_request_t *)payload)->handle) : -22;
             break;
         case INPUTD_OP_DUP:
-            status = header.payload_size >= sizeof(inputd_handle_request_t) ?
-                inputd_input_dup(((inputd_handle_request_t *)payload)->handle, &result) : -22;
+            if (header.payload_size >= sizeof(inputd_handle_request_t)) {
+                const int notify_fd = request->fd_count >= 3 ?
+                    (int)(uint32_t)fds[1].fd : -1;
+                status = notify_fd >= 16 ? inputd_input_transfer_dup(
+                    ((inputd_handle_request_t *)payload)->handle, notify_fd, &result) :
+                    inputd_input_dup(
+                        ((inputd_handle_request_t *)payload)->handle, &result);
+                if (status == 0 && notify_fd >= 16) keep_fd = notify_fd;
+            } else {
+                status = -22;
+            }
             break;
         case INPUTD_OP_READ:
             status = header.payload_size >= sizeof(inputd_read_request_t) ?

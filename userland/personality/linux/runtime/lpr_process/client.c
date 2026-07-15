@@ -16,7 +16,7 @@ void *lpr_process_client_payload(void *page)
     return page == 0 ? 0 : (void *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
 }
 
-int64_t lpr_process_client_call(
+int64_t lpr_process_client_call_with_reply_fd(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
     uint32_t op,
@@ -24,7 +24,8 @@ int64_t lpr_process_client_call(
     void *page,
     uint32_t payload_size,
     int transfer_fd,
-    uint64_t *out_result)
+    uint64_t *out_result,
+    int *out_reply_fd)
 {
     if (request_counter == 0 ||
         status_to_errno == 0 ||
@@ -62,6 +63,7 @@ int64_t lpr_process_client_call(
         fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
         fds[fd_count].rights =
             PACHA_FD_RIGHT_INSPECT |
+            PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_WAIT |
             PACHA_FD_RIGHT_POLL |
             PACHA_FD_RIGHT_CLOSE |
@@ -98,7 +100,14 @@ int64_t lpr_process_client_call(
     }
 
     struct pacha_ipc_msg reply;
+    struct pacha_ipc_fd reply_item;
     lpr_memset(&reply, 0, sizeof(reply));
+    lpr_memset(&reply_item, 0, sizeof(reply_item));
+    if (out_reply_fd != 0) {
+        *out_reply_fd = -1;
+        reply.fds = &reply_item;
+        reply.fd_capacity = 1;
+    }
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
         &reply);
@@ -125,6 +134,8 @@ int64_t lpr_process_client_call(
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
         reply_header->request_id != request_id)
     {
+        if (reply.fd_count != 0 && reply_item.fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, reply_item.fd);
         lpr_trace_error_record(
             LPR_ERROR_DOMAIN_LPRS,
             op,
@@ -139,6 +150,8 @@ int64_t lpr_process_client_call(
         return -LPR_LINUX_EIO;
     }
     if ((int64_t)reply.word1 < 0) {
+        if (reply.fd_count != 0 && reply_item.fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, reply_item.fd);
         lpr_trace_error_record(
             LPR_ERROR_DOMAIN_LPRS,
             op,
@@ -152,10 +165,40 @@ int64_t lpr_process_client_call(
             "lpr process supervisor returned error");
         return (int64_t)reply.word1;
     }
+    if ((out_reply_fd == 0 && reply.fd_count != 0) ||
+        (out_reply_fd != 0 && (reply.fd_count != 1 || reply_item.fd < 16)))
+    {
+        if (reply.fd_count != 0 && reply_item.fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, reply_item.fd);
+        return -LPR_LINUX_EIO;
+    }
+    if (out_reply_fd != 0) *out_reply_fd = (int)(uint32_t)reply_item.fd;
     if (out_result != 0) {
         *out_result = reply.word2;
     }
     return 0;
+}
+
+int64_t lpr_process_client_call(
+    uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t status),
+    uint32_t op,
+    int page_fd,
+    void *page,
+    uint32_t payload_size,
+    int transfer_fd,
+    uint64_t *out_result)
+{
+    return lpr_process_client_call_with_reply_fd(
+        request_counter,
+        status_to_errno,
+        op,
+        page_fd,
+        page,
+        payload_size,
+        transfer_fd,
+        out_result,
+        0);
 }
 
 int64_t lpr_process_client_call_token(

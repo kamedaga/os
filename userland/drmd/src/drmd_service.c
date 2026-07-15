@@ -153,8 +153,21 @@ int drmd_service_dispatch(
                 drmd_drm_island_close(service->drm, ((drmd_handle_request_t *)payload)->handle) : -22;
             break;
         case DRMD_OP_HANDLE_DUP:
-            status = header.payload_size >= sizeof(drmd_handle_request_t) ?
-                drmd_drm_island_dup(service->drm, ((drmd_handle_request_t *)payload)->handle, &result) : -22;
+            if (header.payload_size >= sizeof(drmd_handle_request_t)) {
+                const int lease_fd = request->fd_count >= 3 ?
+                    (int)(uint32_t)fds[1].fd : -1;
+                status = lease_fd >= 16 ? drmd_drm_island_transfer_dup(
+                    service->drm,
+                    ((drmd_handle_request_t *)payload)->handle,
+                    lease_fd,
+                    &result) : drmd_drm_island_dup(
+                        service->drm,
+                        ((drmd_handle_request_t *)payload)->handle,
+                        &result);
+                if (status == 0 && lease_fd >= 16) retained_received_fd = lease_fd;
+            } else {
+                status = -22;
+            }
             break;
         case DRMD_OP_HANDLE_IOCTL:
             status = header.payload_size >= sizeof(drmd_ioctl_request_t) ?

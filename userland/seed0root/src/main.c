@@ -6,6 +6,7 @@
 #include "lpr_supervisor/boot_config.h"
 #include "lpr_supervisor/ipc_protocol.h"
 #include "personality/linux_lpr.h"
+#include "personality/lpr_manifest.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
 #define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
@@ -1000,6 +1001,7 @@ static int seed0root_lprs_call(
         fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
         fds[fd_count].rights =
             PACHA_FD_RIGHT_INSPECT |
+            PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_WAIT |
             PACHA_FD_RIGHT_POLL |
             PACHA_FD_RIGHT_CLOSE |
@@ -3286,45 +3288,96 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
     lprs_process_state_t bash_state;
     memset(&bash_state, 0, sizeof(bash_state));
     int status = seed0root_register_lpr_bash(supervisor_endpoint_fd, &bash_state);
-    if (status != 0 || bash_state.token == 0 || bash_state.pid == 0) {
+    if (status != 0 || bash_state.token == 0 || bash_state.generation == 0 || bash_state.pid == 0) {
         return status != 0 ? status : -5;
+    }
+
+    lpr_manifest_layout_t manifest_layout;
+    memset(&manifest_layout, 0, sizeof(manifest_layout));
+    status = lpr_manifest_layout(0, 0, 0, 0, &manifest_layout);
+    if (status != 0) {
+        return -22;
+    }
+    uint64_t manifest_map_bytes = 0;
+    if (align_up(manifest_layout.byte_size, &manifest_map_bytes) != 0) {
+        return -22;
+    }
+    const uint64_t manifest_rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    int manifest_fd = pacha_vmo_create(manifest_map_bytes, manifest_rights, 0);
+    if (manifest_fd < 16) {
+        return manifest_fd < 0 ? manifest_fd : -12;
+    }
+    lpr_manifest_t *manifest = pacha_mmap(
+        manifest_fd,
+        manifest_map_bytes,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    if (manifest == NULL) {
+        (void)pacha_fd_close(manifest_fd);
+        return -12;
+    }
+    status = lpr_manifest_begin(
+        manifest,
+        manifest_map_bytes,
+        &manifest_layout,
+        0,
+        0,
+        0,
+        0);
+    if (status != 0) {
+        seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
+        return -22;
+    }
+    manifest->transaction_id = bash_state.token;
+    manifest->generation = bash_state.generation;
+    manifest->flags = LPR_MANIFEST_FLAG_DEFAULT_STDIO | LPR_MANIFEST_FLAG_SUPERVISOR;
+    manifest->linux_pid = bash_state.pid;
+    manifest->linux_ppid = bash_state.ppid;
+    manifest->linux_sid = bash_state.sid;
+    manifest->linux_pgrp = bash_state.pgrp;
+    manifest->linux_next_pid = 0;
+    manifest->cwd_handle = bash_state.cwd_handle;
+    manifest->supervisor_token = bash_state.token;
+    manifest->supervisor_endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
+    manifest->owner_generation = bash_state.generation;
+    snprintf(manifest->ctty, sizeof(manifest->ctty), "%s", bash_state.ctty);
+    snprintf(manifest->cwd, sizeof(manifest->cwd), "%s", bash_state.cwd);
+    if (lpr_manifest_seal(manifest, manifest_map_bytes) != 0) {
+        seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
+        return -22;
     }
 
     int page_fd = -1;
     void *page = NULL;
     status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
+        seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
         return status;
     }
     filed_exec_path_t *exec = (filed_exec_path_t *)page;
     exec->dir_handle = 0;
     exec->flags =
         FILED_EXEC_LINUX_LPR |
-        FILED_EXEC_LINUX_BOOTSTRAP |
-        FILED_EXEC_LINUX_DEFAULT_STDIO |
+        FILED_EXEC_BOOTSTRAP_FD |
         FILED_EXEC_INHERIT_FDS |
         FILED_EXEC_TRANSFER_PROCESS_FD;
     exec->inherit_fd_count = 1;
     exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
-    exec->linux_pid = bash_state.pid;
-    exec->linux_ppid = bash_state.ppid;
-    exec->linux_sid = bash_state.sid;
-    exec->linux_pgrp = bash_state.pgrp;
-    exec->linux_next_pid = 0;
-    exec->lpr_supervisor_token = bash_state.token;
-    exec->lpr_fd_table_token = bash_state.token;
     exec->argc = sizeof(argv) / sizeof(argv[0]);
     exec->envc = sizeof(envp) / sizeof(envp[0]);
     snprintf(exec->path, sizeof(exec->path), "%s", "/bin/bash");
-    status = seed0root_exec_add_string(exec, &exec->ctty, "/dev/hvc0");
-    if (status != 0) {
-        seed0root_destroy_filed_page(page_fd, page);
-        return status;
-    }
     for (uint64_t i = 0; i < exec->argc; i++) {
         status = seed0root_exec_add_string(exec, &exec->argv[i], argv[i]);
         if (status != 0) {
             seed0root_destroy_filed_page(page_fd, page);
+            seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
             return status;
         }
     }
@@ -3332,11 +3385,12 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
         status = seed0root_exec_add_string(exec, &exec->envp[i], envp[i]);
         if (status != 0) {
             seed0root_destroy_filed_page(page_fd, page);
+            seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
             return status;
         }
     }
 
-    struct pacha_ipc_fd fds[2];
+    struct pacha_ipc_fd fds[3];
     memset(fds, 0, sizeof(fds));
     fds[0].fd = (uint64_t)(uint32_t)page_fd;
     fds[0].rights =
@@ -3345,6 +3399,13 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
         PACHA_FD_RIGHT_MAP_WRITE;
     fds[1].fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
     fds[1].rights = seed0root_channel_rights;
+    fds[2].fd = (uint64_t)(uint32_t)manifest_fd;
+    fds[2].rights =
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ;
 
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
@@ -3354,12 +3415,13 @@ static int seed0root_spawn_lpr_bash(int filed_endpoint_fd, int supervisor_endpoi
         FILED_OP_EXEC_PATH,
         0x5eed0ba5u,
         fds,
-        2,
+        3,
         0,
         &reply,
         reply_fds,
         2);
     seed0root_destroy_filed_page(page_fd, page);
+    seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
     if (status != 0) {
         fprintf(stderr, "[seed0root] bash exec failed status=%d\n", status);
         return status;

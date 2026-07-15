@@ -38,11 +38,8 @@ enum {
     FILED_EXEC_PATCH_BOOTSTRAP_FDS = 1u << 2,
     FILED_EXEC_INHERIT_HANDLES = 1u << 3,
     FILED_EXEC_LINUX_LPR = 1u << 4,
-    FILED_EXEC_LINUX_BOOTSTRAP = 1u << 5,
-    FILED_EXEC_SELF = 1u << 6,
-    FILED_EXEC_LINUX_DEFAULT_STDIO = 1u << 7,
-    FILED_EXEC_LPR_FD_TABLE = 1u << 8,
-    FILED_EXEC_TRANSFER_PROCESS_FD = 1u << 9,
+    FILED_EXEC_SELF = 1u << 5,
+    FILED_EXEC_TRANSFER_PROCESS_FD = 1u << 6,
     FILED_EXEC_MAX_INHERIT_FDS = 16,
     FILED_EXEC_MAX_INHERIT_HANDLES = 4,
     FILED_EXEC_MAX_FD_PATCHES = 4,
@@ -53,21 +50,7 @@ enum {
     FILED_EXEC_PATCH_INHERIT_FD = 1,
     FILED_EXEC_PATCH_BOOTSTRAP_FD = 2,
     FILED_EXEC_PATCH_INHERIT_HANDLE = 3,
-
-    FILED_EXEC_LPR_FD_FILED = 1,
-    FILED_EXEC_LPR_FD_DEVICE = 2,
-    FILED_EXEC_LPR_FD_TTY = 3,
-    FILED_EXEC_LPR_FD_DRM = 4,
-    FILED_EXEC_LPR_FD_INPUT = 5,
-    FILED_EXEC_LPR_FD_PIPE = 6,
-    FILED_EXEC_LPR_FD_EVENT = 7,
-    FILED_EXEC_LPR_FD_SOCKET = 8,
-    FILED_EXEC_LPR_FD_NATIVE = 9,
-    FILED_EXEC_LPR_FD_DMABUF = 10,
 };
-
-#define FILED_EXEC_LPR_FD_TABLE_MAGIC 0x3144424652504c46ull
-#define FILED_EXEC_LPR_FD_TABLE_VERSION 7ull
 
 typedef struct filed_openat {
     uint64_t dir_handle;
@@ -315,24 +298,6 @@ typedef struct filed_exec_string_ref {
     uint16_t length;
 } filed_exec_string_ref_t;
 
-typedef struct filed_exec_lpr_fd {
-    uint64_t fd;
-    uint64_t kind;
-    uint64_t flags;
-    uint64_t handle;
-    uint64_t offset_or_counter;
-    uint64_t native_wait_fd;
-} filed_exec_lpr_fd_t;
-
-typedef struct filed_exec_lpr_fd_table {
-    uint64_t magic;
-    uint64_t version;
-    uint64_t byte_size;
-    uint64_t fd_count;
-    uint64_t reserved0;
-    uint64_t reserved1;
-} filed_exec_lpr_fd_table_t;
-
 typedef struct filed_exec_path {
     uint64_t dir_handle;
     uint64_t flags;
@@ -342,21 +307,10 @@ typedef struct filed_exec_path {
     uint64_t string_bytes;
     uint64_t argc;
     uint64_t envc;
-    uint64_t linux_pid;
-    uint64_t linux_ppid;
-    uint64_t linux_sid;
-    uint64_t linux_pgrp;
-    uint64_t linux_next_pid;
-    uint64_t cwd_handle;
-    uint64_t lpr_fd_table_bytes;
-    uint64_t lpr_supervisor_token;
-    uint64_t lpr_fd_table_token;
     uint64_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
     uint64_t inherit_fd_targets[FILED_EXEC_MAX_INHERIT_FDS];
     filed_exec_fd_patch_t fd_patches[FILED_EXEC_MAX_FD_PATCHES];
     char path[FILED_PATH_BYTES];
-    filed_exec_string_ref_t cwd;
-    filed_exec_string_ref_t ctty;
     filed_exec_string_ref_t argv[FILED_EXEC_MAX_ARGS];
     filed_exec_string_ref_t envp[FILED_EXEC_MAX_ENVS];
     char strings[FILED_EXEC_STRING_BYTES];

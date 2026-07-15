@@ -2,11 +2,11 @@
 
 static const char *lpr_take_boot_ctty_env(void)
 {
-    if (lpr_load_bootstrap() &&
-        (lpr_bootstrap.flags & LPR_BOOTSTRAP_FLAG_DEFAULT_STDIO) != 0 &&
-        lpr_bootstrap.ctty[0] != 0)
+    if (lpr_load_manifest() &&
+        (lpr_process_manifest.flags & LPR_MANIFEST_FLAG_DEFAULT_STDIO) != 0 &&
+        lpr_process_manifest.ctty[0] != 0)
     {
-        return lpr_bootstrap.ctty;
+        return lpr_process_manifest.ctty;
     }
     return 0;
 }

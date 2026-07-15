@@ -94,6 +94,7 @@ struct netd_libuinet_api_socket {
     uint8_t send_preview_logged;
     uint8_t recv_preview_logged;
     uint8_t reserved[4];
+    int notify_fd;
     struct uinet_socket *socket;
 };
 static struct netd_libuinet_api_socket g_libuinet_api_sockets[NETD_SOCKET_API_MAX_SOCKETS];
@@ -2519,9 +2520,14 @@ uint64_t netd_libuinet_rx_drops(void)
     return g_libuinet_rx_drops;
 }
 
-int netd_libuinet_socket_open(uint64_t domain, uint64_t type, uint64_t protocol, uint64_t *out_handle)
+int netd_libuinet_socket_open(
+    uint64_t domain,
+    uint64_t type,
+    uint64_t protocol,
+    int notify_fd,
+    uint64_t *out_handle)
 {
-    if (out_handle == NULL) {
+    if (out_handle == NULL || notify_fd < 16) {
         return -22;
     }
     *out_handle = 0;
@@ -2580,6 +2586,7 @@ int netd_libuinet_socket_open(uint64_t domain, uint64_t type, uint64_t protocol,
     slot->handle = handle;
     slot->type = type;
     slot->protocol = (uint64_t)uinet_protocol;
+    slot->notify_fd = notify_fd;
     slot->socket = socket;
     *out_handle = handle;
     return 0;
@@ -2587,7 +2594,45 @@ int netd_libuinet_socket_open(uint64_t domain, uint64_t type, uint64_t protocol,
     (void)domain;
     (void)type;
     (void)protocol;
+    (void)notify_fd;
     return -95;
+#endif
+}
+
+int netd_libuinet_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set)
+{
+#if defined(NETD_WITH_LIBUINET)
+    if (wait_set == NULL) return -22;
+    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; ++i) {
+        const struct netd_libuinet_api_socket *slot = &g_libuinet_api_sockets[i];
+        if (slot->socket == NULL || slot->notify_fd < 16) continue;
+        if (pacha_service_wait_add(
+                wait_set, slot->notify_fd, PACHA_FD_EVENT_HANGUP) != 0)
+            return -24;
+    }
+#else
+    (void)wait_set;
+#endif
+    return 0;
+}
+
+void netd_libuinet_socket_reap_hangups(void)
+{
+#if defined(NETD_WITH_LIBUINET)
+    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; ++i) {
+        struct netd_libuinet_api_socket *slot = &g_libuinet_api_sockets[i];
+        if (slot->socket == NULL || slot->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = slot->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle = slot->handle;
+        (void)netd_libuinet_socket_close(handle);
+        printf("[netd] inet_orphan_reap handle=%llu\n",
+            (unsigned long long)handle);
+    }
 #endif
 }
 
@@ -2915,6 +2960,7 @@ int netd_libuinet_socket_close(uint64_t handle)
         (void)uinet_soshutdown(slot->socket, UINET_SHUT_RDWR);
     }
     (void)uinet_soclose(slot->socket);
+    if (slot->notify_fd >= 16) (void)pacha_fd_close(slot->notify_fd);
     memset(slot, 0, sizeof(*slot));
     return 0;
 #else

@@ -657,6 +657,45 @@ filed_status_t filed_vfs_close_handle(filed_vfs_t *vfs, filed_handle_id_t handle
     return filed_vfs_close_handle_ex(vfs, handle_id, NULL);
 }
 
+filed_status_t filed_vfs_set_handle_owner(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    uint32_t owner_session)
+{
+    if (vfs == NULL || handle_id == 0 || owner_session == 0)
+        return FILED_ERR_INVALID;
+    filed_handle_t *handle = filed_find_handle(vfs, handle_id);
+    if (handle == NULL) return FILED_ERR_INVALID;
+    handle->owner_session = owner_session;
+    return FILED_OK;
+}
+
+filed_status_t filed_vfs_set_handle_lease(
+    filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    int lease_fd)
+{
+    if (vfs == NULL || handle_id == 0 || lease_fd < 16)
+        return FILED_ERR_INVALID;
+    filed_handle_t *handle = filed_find_handle(vfs, handle_id);
+    if (handle == NULL || handle->owner_session != 0 || handle->lease_fd >= 16)
+        return FILED_ERR_INVALID;
+    uint32_t lease_count = 0;
+    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i)
+        lease_count += vfs->handles[i].active && vfs->handles[i].lease_fd >= 16;
+    if (lease_count >= FILED_MAX_TRANSFER_LEASES) return FILED_ERR_FULL;
+    handle->lease_fd = lease_fd;
+    return FILED_OK;
+}
+
+int filed_vfs_get_handle_lease(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id)
+{
+    const filed_handle_t *handle = filed_find_handle_const(vfs, handle_id);
+    return handle != NULL ? handle->lease_fd : -1;
+}
+
 static bool filed_vfs_backend_object_is_unused_linked_leaf(
     const filed_vfs_t *vfs,
     filed_backend_object_id_t backend_object,

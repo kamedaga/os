@@ -31,12 +31,6 @@ void lpr_cwd_init(void);
 int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_handle);
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
 int lpr_count_exec_local_fds(uint64_t *out_count);
-void lpr_write_exec_local_fd_desc(filed_exec_lpr_fd_t *desc, uint64_t fd);
-int lpr_prepare_exec_local_fds(
-    filed_exec_path_t *exec,
-    lpr_exec_local_fd_table_t *local_table);
-void lpr_destroy_exec_local_fd_table(lpr_exec_local_fd_table_t *local_table);
-int lpr_install_bootstrap_local_fds(const lpr_bootstrap_fd_t *descs, uint64_t count);
 
 void lpr_filed_session_drop(void)
 {

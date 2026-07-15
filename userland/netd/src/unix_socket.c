@@ -24,12 +24,13 @@ typedef struct netd_unix_socket_state {
     uint32_t gid;
     uint32_t rx_len;
     uint32_t refs;
-    uint32_t fd_offset;
-    uint32_t fd_kind;
-    uint32_t fd_flags;
-    uint64_t fd_handle;
-    uint64_t fd_aux;
-    int fd_wait_fd;
+    uint32_t transfer_offset;
+    uint32_t transfer_count;
+    uint32_t capability_count;
+    uint32_t reserved1;
+    uint64_t transaction_id;
+    netd_transfer_occurrence_t transfers[NETD_TRANSFER_MAX_ITEMS];
+    int capability_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     int notify_fd;
     uint8_t notify_pending;
     char path[108];
@@ -53,7 +54,19 @@ static netd_unix_socket_state_t *find_socket(uint64_t handle) {
     return NULL;
 }
 
-static void reap_orphaned_sockets(void) {
+int netd_unix_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set) {
+    if (wait_set == NULL) return -22;
+    for (unsigned i = 0; i < NETD_UNIX_MAX; i++) {
+        const netd_unix_socket_state_t *s = &sockets[i];
+        if (s->handle == 0 || s->notify_fd < 16) continue;
+        if (pacha_service_wait_add(
+                wait_set, s->notify_fd, PACHA_FD_EVENT_HANGUP) != 0)
+            return -24;
+    }
+    return 0;
+}
+
+void netd_unix_socket_reap_hangups(void) {
     for (unsigned i = 0; i < NETD_UNIX_MAX; i++) {
         netd_unix_socket_state_t *s = &sockets[i];
         if (s->handle == 0 || s->notify_fd < 16) continue;
@@ -82,12 +95,10 @@ static netd_unix_socket_state_t *alloc_socket(void) {
 
 int netd_unix_socket_open(uint64_t type, uint64_t protocol, int notify_fd, uint64_t *out_handle) {
     if (out_handle == NULL || type != NETD_SOCK_STREAM || protocol != 0 || notify_fd < 16) return -94;
-    reap_orphaned_sockets();
     netd_unix_socket_state_t *s = alloc_socket();
     if (s == NULL) return -24;
     s->type = (uint32_t)type;
     s->notify_fd = notify_fd;
-    s->fd_wait_fd = -1;
     *out_handle = s->handle;
     return 0;
 }
@@ -146,7 +157,6 @@ int netd_unix_socket_connect(const netd_unix_path_t *req) {
     client->pid = req->pid; client->uid = req->uid; client->gid = req->gid;
     listener->pending = server->handle;
     server->notify_fd = -1;
-    server->fd_wait_fd = -1;
     notify_readable(listener);
     return 0;
 }
@@ -165,36 +175,77 @@ int netd_unix_socket_accept(netd_accept_t *req) {
     return 0;
 }
 
-int netd_unix_socket_send(const netd_io_t *req, int passed_wait_fd, size_t *out_sent) {
+static int netd_unix_transfer_valid(
+    const netd_io_t *req,
+    const int *capability_fds,
+    uint32_t capability_count)
+{
+    if (req->transfer_count > NETD_TRANSFER_MAX_ITEMS ||
+        req->capability_count > NETD_TRANSFER_MAX_CAPABILITIES ||
+        req->capability_count != capability_count)
+        return 0;
+    if (req->transfer_count == 0)
+        return req->transaction_id == 0 && capability_count == 0;
+    if (req->transaction_id == 0 || req->length == 0 || capability_fds == NULL)
+        return 0;
+    for (uint32_t i = 0; i < capability_count; ++i)
+        if (capability_fds[i] < 16) return 0;
+    for (uint32_t i = 0; i < req->transfer_count; ++i) {
+        const netd_transfer_occurrence_t *item = &req->transfers[i];
+        const uint32_t end = (uint32_t)item->capability_first + item->capability_count;
+        if (item->provider_id == 0 || item->transfer_token == 0 ||
+            item->reserved0 != 0 || end > capability_count)
+            return 0;
+    }
+    return 1;
+}
+
+int netd_unix_socket_send(
+    const netd_io_t *req,
+    const int *capability_fds,
+    uint32_t capability_count,
+    size_t *out_sent)
+{
     netd_unix_socket_state_t *s = req ? find_socket(req->handle) : NULL;
     netd_unix_socket_state_t *peer = s ? find_socket(s->peer) : NULL;
     if (s == NULL || peer == NULL || !s->connected) return -107;
     if (req->length > NETD_UNIX_RX - peer->rx_len) return -11;
-    if (req->fd_kind != 0 && peer->fd_kind != 0) return -11;
-    if (req->fd_kind != 0 && req->length == 0) return -22;
-    if (req->fd_kind != 0 &&
-        req->fd_kind != NETD_FD_KIND_FILED_MEMFD && passed_wait_fd < 16) return -22;
-    if (req->fd_kind == NETD_FD_KIND_FILED_MEMFD && passed_wait_fd >= 16) return -22;
-    const uint32_t fd_offset = peer->rx_len;
+    if (req->transfer_count != 0 && peer->transfer_count != 0) return -11;
+    if (!netd_unix_transfer_valid(req, capability_fds, capability_count)) return -22;
+    const uint32_t transfer_offset = peer->rx_len;
     memcpy(peer->rx + peer->rx_len, req->data, (size_t)req->length);
     peer->rx_len += (uint32_t)req->length;
-    if (req->fd_kind != 0) {
-        peer->fd_offset = fd_offset;
-        peer->fd_kind = req->fd_kind; peer->fd_flags = req->fd_flags;
-        peer->fd_handle = req->fd_handle; peer->fd_aux = req->fd_aux;
-        peer->fd_wait_fd = passed_wait_fd;
+    if (req->transfer_count != 0) {
+        peer->transfer_offset = transfer_offset;
+        peer->transaction_id = req->transaction_id;
+        peer->transfer_count = req->transfer_count;
+        peer->capability_count = capability_count;
+        memcpy(peer->transfers, req->transfers,
+            sizeof(req->transfers[0]) * req->transfer_count);
+        for (uint32_t i = 0; i < capability_count; ++i)
+            peer->capability_fds[i] = capability_fds[i];
     }
     notify_readable(peer);
     *out_sent = (size_t)req->length;
     return 0;
 }
 
-int netd_unix_socket_recv(netd_io_t *req, size_t capacity, int *out_wait_fd, size_t *out_received) {
+int netd_unix_socket_recv(
+    netd_io_t *req,
+    size_t capacity,
+    int *out_capability_fds,
+    uint32_t capability_capacity,
+    uint32_t *out_capability_count,
+    size_t *out_received)
+{
     if (req != NULL) {
-        req->fd_kind = 0; req->fd_flags = 0;
-        req->fd_handle = 0; req->fd_aux = 0;
+        req->transaction_id = 0;
+        req->transfer_count = 0;
+        req->capability_count = 0;
+        req->reserved0 = 0;
+        memset(req->transfers, 0, sizeof(req->transfers));
     }
-    if (out_wait_fd != NULL) *out_wait_fd = -1;
+    if (out_capability_count != NULL) *out_capability_count = 0;
     netd_unix_socket_state_t *s = req ? find_socket(req->handle) : NULL;
     if (s == NULL) return -9;
     if (s->rx_len == 0) return s->peer_closed ? 0 : -11;
@@ -204,22 +255,31 @@ int netd_unix_socket_recv(netd_io_t *req, size_t capacity, int *out_wait_fd, siz
         *out_received = n;
         return 0;
     }
-    const int deliver_fd = s->fd_kind != 0 && s->fd_offset < n;
+    const int deliver_transfer = s->transfer_count != 0 && s->transfer_offset < n;
+    if (deliver_transfer && (out_capability_fds == NULL ||
+        out_capability_count == NULL || capability_capacity < s->capability_count))
+        return -90;
     memcpy(req->data, s->rx, n);
     memmove(s->rx, s->rx + n, s->rx_len - n);
     s->rx_len -= (uint32_t)n;
-    if (deliver_fd) {
-        req->fd_kind = s->fd_kind; req->fd_flags = s->fd_flags;
-        req->fd_handle = s->fd_handle; req->fd_aux = s->fd_aux;
-        if (out_wait_fd != NULL) {
-            *out_wait_fd = s->fd_wait_fd;
-        } else if (s->fd_wait_fd >= 16) {
-            (void)pacha_fd_close(s->fd_wait_fd);
+    if (deliver_transfer) {
+        req->transaction_id = s->transaction_id;
+        req->transfer_count = s->transfer_count;
+        req->capability_count = s->capability_count;
+        memcpy(req->transfers, s->transfers,
+            sizeof(req->transfers[0]) * s->transfer_count);
+        for (uint32_t i = 0; i < s->capability_count; ++i) {
+            out_capability_fds[i] = s->capability_fds[i];
+            s->capability_fds[i] = -1;
         }
-        s->fd_offset = 0; s->fd_kind = 0; s->fd_flags = 0;
-        s->fd_handle = 0; s->fd_aux = 0; s->fd_wait_fd = -1;
-    } else if (s->fd_kind != 0) {
-        s->fd_offset -= (uint32_t)n;
+        *out_capability_count = s->capability_count;
+        s->transfer_offset = 0;
+        s->transaction_id = 0;
+        s->transfer_count = 0;
+        s->capability_count = 0;
+        memset(s->transfers, 0, sizeof(s->transfers));
+    } else if (s->transfer_count != 0) {
+        s->transfer_offset -= (uint32_t)n;
     }
     s->notify_pending = 0;
     if (s->rx_len != 0) notify_readable(s);
@@ -246,9 +306,8 @@ static void force_destroy_socket(netd_unix_socket_state_t *s) {
     }
     netd_unix_socket_state_t *peer = find_socket(s->peer);
     if (peer) { peer->peer_closed = 1; peer->peer = 0; notify_readable(peer); }
-    if (s->fd_wait_fd >= 16) (void)pacha_fd_close(s->fd_wait_fd);
-    if (s->fd_kind == NETD_FD_KIND_FILED_MEMFD && s->fd_handle != 0)
-        (void)netd_filed_close_handle(s->fd_handle);
+    for (uint32_t i = 0; i < s->capability_count; ++i)
+        if (s->capability_fds[i] >= 16) (void)pacha_fd_close(s->capability_fds[i]);
     if (s->notify_fd >= 16) (void)pacha_fd_close(s->notify_fd);
     memset(s, 0, sizeof(*s));
 }

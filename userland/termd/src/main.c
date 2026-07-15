@@ -81,5 +81,21 @@ int main(void)
         } else {
             termd_service_forward_pending_tty_signals(&service);
         }
+        (void)termd_linux_tty_island_reap_hangups(&tty_island);
+        if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
+            static struct pacha_service_wait_set wait_set;
+            int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
+            if (pacha_service_wait_init(&wait_set, (int)cfg->tty_endpoint_fd) != 0)
+                return 1;
+            const size_t notify_count = termd_linux_tty_island_collect_wait_sources(
+                notify_fds, PACHA_SERVICE_WAIT_MAX_FDS - 1u);
+            for (size_t i = 0; i < notify_count; ++i) {
+                if (pacha_service_wait_add(
+                        &wait_set, notify_fds[i], PACHA_FD_EVENT_HANGUP) != 0)
+                    return 1;
+            }
+            (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+            (void)termd_linux_tty_island_reap_hangups(&tty_island);
+        }
     }
 }

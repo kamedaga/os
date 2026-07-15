@@ -18,8 +18,6 @@
 #include "pacha/status.h"
 #include "pacha/syscall.h"
 #include "pacha/trace.h"
-#include "personality/lpr_image_abi.h"
-#include "personality/linux_lpr.h"
 #include "termd/ipc_protocol.h"
 #include "../internal/dispatch_state.h"
 
@@ -94,10 +92,6 @@ void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved);
 void filed_dispatch_close_owned_fd(int *fd);
 int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved);
 void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved);
-int filed_dispatch_exec_default_stdio_valid(const filed_exec_path_t *exec);
-int filed_dispatch_lpr_fd_desc_valid(const filed_exec_lpr_fd_t *fd);
-int filed_dispatch_exec_lpr_fd_table_valid(const filed_exec_path_t *exec, const filed_exec_lpr_fd_table_t *table, int allow_table);
-int filed_dispatch_create_lpr_bootstrap_fd(const filed_exec_path_t *exec, const filed_exec_lpr_fd_table_t *fd_table);
 int filed_dispatch_prepare_inherit_fd_to_target(int source_fd, uint64_t target_raw, int *out_fd, filed_dispatch_saved_fd_t *saved);
 int filed_dispatch_dup_endpoint_to_fixed(int source_fd, int target_fd, int *out_fd);
 int filed_dispatch_prepare_endpoint_to_fixed(int source_fd, int target_fd, int *out_fd, int *out_borrowed);

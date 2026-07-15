@@ -251,6 +251,23 @@ static uint64_t filed_dispatch_session_fast_drain(
                     result.status);
             } else {
                 result = filed_dispatch_session_page(runtime, &pseudo_request, payload);
+                if (result.status == 0 && result.result != 0 &&
+                    (fast_request->opcode == FILED_OP_VFS_OPENAT ||
+                     fast_request->opcode == FILED_OP_VFS_DUP ||
+                     fast_request->opcode == FILED_OP_VFS_MEMFD_CREATE))
+                {
+                    const uint32_t owner_session =
+                        (uint32_t)(session - runtime->sessions) + 1u;
+                    const filed_status_t owner_status = filed_vfs_set_handle_owner(
+                        &runtime->vfs,
+                        (filed_handle_id_t)(uint32_t)result.result,
+                        owner_session);
+                    if (owner_status != FILED_OK) {
+                        (void)filed_close_handle_runtime(
+                            runtime, (filed_handle_id_t)(uint32_t)result.result);
+                        result = filed_page_result(-5, 0);
+                    }
+                }
                 filed_record_dispatch_metric_cycles(
                     runtime,
                     pseudo_request.word1,
@@ -850,7 +867,33 @@ static int filed_dispatch_client(
     case FILED_OP_DIAG_ERROR_GET:
         status = PACHA_STATUS_ENOTSUP;
         break;
+    case FILED_OP_VFS_TRANSFER_DUP: {
+        if (header.payload_size < sizeof(filed_handle_flags_t) ||
+            request->fd_count != 3 || request->fds[1].fd < 16)
+        {
+            status = -22;
+            break;
+        }
+        void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
+        const int lease_fd = (int)(uint32_t)request->fds[1].fd;
+        const filed_page_dispatch_result_t dup =
+            filed_dispatch_dup_page(runtime, payload);
+        status = dup.status;
+        result = dup.result;
+        if (status == 0) {
+            const filed_status_t lease_status = filed_vfs_set_handle_lease(
+                &runtime->vfs, (filed_handle_id_t)result, lease_fd);
+            if (lease_status == FILED_OK) {
+                keep_fd = lease_fd;
+            } else {
+                (void)filed_close_handle_runtime(
+                    runtime, (filed_handle_id_t)result);
+                status = filed_status_to_wire(lease_status);
+                result = 0;
+            }
+        }
         break;
+    }
     case FILED_OP_VFS_OPENAT:
     case FILED_OP_VFS_CLOSE:
     case FILED_OP_VFS_STAT:

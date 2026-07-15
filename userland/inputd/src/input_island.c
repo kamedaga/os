@@ -15,6 +15,7 @@
 
 enum {
     INPUTD_HANDLE_MAX = 32,
+    INPUTD_TRANSFER_LEASE_MAX = 32,
     INPUTD_RING_MAX = 4096,
     INPUTD_EV_SYN = 0,
     INPUTD_SYN_DROPPED = 3,
@@ -51,7 +52,14 @@ typedef struct inputd_handle {
     int notify_pending;
 } inputd_handle_t;
 
+typedef struct inputd_transfer_lease {
+    int active;
+    int notify_fd;
+    uint64_t handle;
+} inputd_transfer_lease_t;
+
 static inputd_handle_t handles[INPUTD_HANDLE_MAX];
+static inputd_transfer_lease_t transfer_leases[INPUTD_TRANSFER_LEASE_MAX];
 static inputd_raw_event_t event_ring[INPUTD_RING_MAX];
 static size_t event_head;
 static size_t event_count;
@@ -262,6 +270,36 @@ int inputd_input_dup(uint64_t id, uint64_t *out_handle)
     return 0;
 }
 
+int inputd_input_transfer_dup(uint64_t id, int notify_fd, uint64_t *out_handle)
+{
+    inputd_handle_t *handle = find_handle(id);
+    if (handle == NULL || out_handle == NULL || notify_fd < 16 ||
+        handle->refs == UINT32_MAX) return -9;
+    inputd_transfer_lease_t *lease = NULL;
+    for (size_t i = 0; i < INPUTD_TRANSFER_LEASE_MAX; ++i) {
+        if (!transfer_leases[i].active) {
+            lease = &transfer_leases[i];
+            break;
+        }
+    }
+    if (lease == NULL) return -24;
+    memset(lease, 0, sizeof(*lease));
+    lease->active = 1;
+    lease->notify_fd = notify_fd;
+    lease->handle = id;
+    handle->refs++;
+    *out_handle = id;
+    return 0;
+}
+
+static uint32_t inputd_transfer_lease_count(uint64_t handle)
+{
+    uint32_t count = 0;
+    for (size_t i = 0; i < INPUTD_TRANSFER_LEASE_MAX; ++i)
+        if (transfer_leases[i].active && transfer_leases[i].handle == handle) count++;
+    return count;
+}
+
 static void copy_event_time(const inputd_handle_t *handle, const inputd_raw_event_t *source,
     inputd_input_event_t *target)
 {
@@ -430,6 +468,64 @@ int inputd_input_poll(inputd_poll_request_t *request)
         }
     }
     return 0;
+}
+
+size_t inputd_input_collect_wait_sources(int *fds, size_t capacity)
+{
+    if (fds == NULL || capacity == 0) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < INPUTD_HANDLE_MAX && count < capacity; i++) {
+        const inputd_handle_t *handle = &handles[i];
+        if (!handle->active || handle->notify_fd < 16) continue;
+        fds[count++] = handle->notify_fd;
+    }
+    for (size_t i = 0; i < INPUTD_TRANSFER_LEASE_MAX && count < capacity; ++i) {
+        if (!transfer_leases[i].active || transfer_leases[i].notify_fd < 16) continue;
+        fds[count++] = transfer_leases[i].notify_fd;
+    }
+    return count;
+}
+
+size_t inputd_input_reap_hangups(void)
+{
+    size_t reaped = 0;
+    for (size_t i = 0; i < INPUTD_HANDLE_MAX; i++) {
+        inputd_handle_t *handle = &handles[i];
+        if (!handle->active || handle->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = handle->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+
+        const uint64_t orphan_id = handle->id;
+        const uint32_t orphan_refs = handle->refs;
+        const int notify_fd = handle->notify_fd;
+        handle->notify_fd = -1;
+        if (notify_fd >= 16) (void)pacha_fd_close(notify_fd);
+        handle->refs = inputd_transfer_lease_count(handle->id) + 1u;
+        const int status = inputd_input_close(orphan_id);
+        printf("[inputd] orphan reap handle=%llu refs=%u status=%d\n",
+            (unsigned long long)orphan_id, orphan_refs, status);
+        reaped++;
+    }
+    for (size_t i = 0; i < INPUTD_TRANSFER_LEASE_MAX; ++i) {
+        inputd_transfer_lease_t *lease = &transfer_leases[i];
+        if (!lease->active || lease->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = lease->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle = lease->handle;
+        (void)pacha_fd_close(lease->notify_fd);
+        memset(lease, 0, sizeof(*lease));
+        (void)inputd_input_close(handle);
+        reaped++;
+    }
+    return reaped;
 }
 
 void inputd_input_notify_readable(void)

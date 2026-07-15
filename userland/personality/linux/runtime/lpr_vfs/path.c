@@ -640,11 +640,12 @@ int64_t lpr_supervisor_kill_pid(int32_t pid, uint32_t sig, uint64_t *out_deliver
     return status;
 }
 
-int lpr_supervisor_get_state(lprs_process_state_t *out_state)
+int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_fd)
 {
-    if (out_state == 0 || lpr_supervisor_token == 0) {
+    if (out_state == 0 || out_process_fd == 0 || lpr_supervisor_token == 0) {
         return -LPR_LINUX_EINVAL;
     }
+    *out_process_fd = -1;
     void *page = 0;
     const int page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
@@ -653,18 +654,30 @@ int lpr_supervisor_get_state(lprs_process_state_t *out_state)
     lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
     lprs_token_request_t *req = (lprs_token_request_t *)lpr_supervisor_payload(page);
     req->token = lpr_supervisor_token;
-    const int64_t status = lpr_supervisor_call(
+    const int64_t status = lpr_process_client_call_with_reply_fd(
+        &lpr_request_id,
+        lpr_pacha_status_to_errno,
         LPRS_OP_PROCESS_GET_STATE,
         page_fd,
         page,
         sizeof(*req),
         -1,
-        0);
+        0,
+        out_process_fd);
     if (status == 0) {
         lpr_memcpy(out_state, lpr_supervisor_payload(page), sizeof(*out_state));
     }
     lpr_destroy_standalone_wire_page(page_fd, page);
     return status == 0 ? 0 : (int)status;
+}
+
+int lpr_supervisor_get_state(lprs_process_state_t *out_state)
+{
+    int process_fd = -1;
+    const int status = lpr_supervisor_get_owner(out_state, &process_fd);
+    if (process_fd >= 16)
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)process_fd);
+    return status;
 }
 
 int lpr_create_pread_vmo_wire_page(void **out_page)
@@ -911,6 +924,7 @@ int64_t lpr_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
         *out_payload_size = sizeof(filed_getdents_t);
         return 0;
     case FILED_OP_VFS_DUP:
+    case FILED_OP_VFS_TRANSFER_DUP:
     case FILED_OP_VFS_GET_FLAGS:
     case FILED_OP_VFS_SET_FLAGS:
         *out_payload_size = sizeof(filed_handle_flags_t);
@@ -959,11 +973,16 @@ int64_t lpr_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
     }
 }
 
-static int64_t lpr_filed_call_locked(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_result)
+static int64_t lpr_filed_call_locked(
+    uint32_t op,
+    int page_fd,
+    uint64_t word2,
+    uint64_t *out_result,
+    int transfer_fd)
 {
-    if (page_fd == lpr_session_page_fd && lpr_session_page != 0) {
+    if (transfer_fd < 16 && page_fd == lpr_session_page_fd && lpr_session_page != 0) {
         return lpr_filed_fast_call(op, word2, out_result);
-    } else if (page_fd < 16 &&
+    } else if (transfer_fd < 16 && page_fd < 16 &&
         lpr_session_page != 0 &&
         !lpr_session_payload_busy)
     {
@@ -1048,14 +1067,25 @@ static int64_t lpr_filed_call_locked(uint32_t op, int page_fd, uint64_t word2, u
     header->request_id = lpr_next_request_id(&lpr_request_id);
     header->trace_id = header->request_id;
     header->payload_size = payload_size;
+    header->fd_count = transfer_fd >= 16 ? 1u : 0u;
 
-    struct pacha_ipc_fd fd_item;
-    lpr_memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)page_fd;
-    fd_item.rights =
+    struct pacha_ipc_fd fd_items[2];
+    lpr_memset(fd_items, 0, sizeof(fd_items));
+    fd_items[0].fd = (uint64_t)(uint32_t)page_fd;
+    fd_items[0].rights =
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
+    uint64_t fd_count = 1;
+    if (transfer_fd >= 16) {
+        fd_items[1].fd = (uint64_t)(uint32_t)transfer_fd;
+        fd_items[1].rights = PACHA_FD_RIGHT_INSPECT |
+            PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
+            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+        fd_items[1].transfer_flags = PACHA_IPC_TRANSFER_MOVE;
+        fd_count++;
+    }
 
     const uint64_t request_id = header->request_id;
     const struct pacha_ipc_msg request = {
@@ -1063,8 +1093,8 @@ static int64_t lpr_filed_call_locked(uint32_t op, int page_fd, uint64_t word2, u
         .word1 = 0,
         .word2 = 0,
         .word3 = request_id,
-        .fds = &fd_item,
-        .fd_count = 1u,
+        .fds = fd_items,
+        .fd_count = fd_count,
     };
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
@@ -1190,10 +1220,21 @@ static int64_t lpr_filed_call_locked(uint32_t op, int page_fd, uint64_t word2, u
 int64_t lpr_filed_call(uint32_t op, int page_fd, uint64_t word2, uint64_t *out_result)
 {
     if (page_fd >= 16) {
-        return lpr_filed_call_locked(op, page_fd, word2, out_result);
+        return lpr_filed_call_locked(op, page_fd, word2, out_result, -1);
     }
     lpr_state_lock(&lpr_state.filed_rpc.lock_word);
-    const int64_t status = lpr_filed_call_locked(op, page_fd, word2, out_result);
+    const int64_t status = lpr_filed_call_locked(op, page_fd, word2, out_result, -1);
     lpr_state_unlock(&lpr_state.filed_rpc.lock_word);
     return status;
+}
+
+int64_t lpr_filed_call_transfer(
+    uint32_t op,
+    int page_fd,
+    uint64_t word2,
+    uint64_t *out_result,
+    int transfer_fd)
+{
+    if (page_fd < 16 || transfer_fd < 16) return -LPR_LINUX_EINVAL;
+    return lpr_filed_call_locked(op, page_fd, word2, out_result, transfer_fd);
 }

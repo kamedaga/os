@@ -10,8 +10,8 @@ static void lpr_image_abi_mismatch_exit(uint64_t actual_version)
         PACHA_TRACE_CLASS_ERROR,
         actual_version,
         LPR_IMAGE_ABI_VERSION,
-        LPR_BOOTSTRAP_IMAGE_ABI_VERSION_OFFSET,
-        LPR_BOOTSTRAP_HEADER_SIZE,
+        offsetof(lpr_manifest_t, image_abi_version),
+        sizeof(lpr_manifest_t),
         LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
     (void)lpr_pacha_syscall1(
         PACHAOS_SYSCALL_PROCESS_EXIT,
@@ -20,99 +20,76 @@ static void lpr_image_abi_mismatch_exit(uint64_t actual_version)
     }
 }
 
-int lpr_load_bootstrap(void)
+int lpr_load_manifest(void)
 {
-    if (lpr_bootstrap_checked) {
-        return lpr_bootstrap_valid;
+    if (lpr_manifest_checked) {
+        return lpr_manifest_valid;
     }
-    lpr_bootstrap_checked = 1;
-    lpr_memset(&lpr_bootstrap, 0, sizeof(lpr_bootstrap));
+    lpr_manifest_checked = 1;
+    lpr_memset(&lpr_process_manifest, 0, sizeof(lpr_process_manifest));
     const int64_t got = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_FD_READ,
         LPR_BOOTSTRAP_FD,
-        (uint64_t)(uintptr_t)&lpr_bootstrap,
-        sizeof(lpr_bootstrap));
-    if (got != (int64_t)sizeof(lpr_bootstrap) ||
-        lpr_bootstrap.magic != LPR_BOOTSTRAP_MAGIC)
+        (uint64_t)(uintptr_t)&lpr_process_manifest,
+        sizeof(lpr_process_manifest));
+    if (got != (int64_t)sizeof(lpr_process_manifest) ||
+        lpr_process_manifest.magic != LPR_MANIFEST_MAGIC)
     {
         goto invalid;
     }
-    if (lpr_bootstrap.image_abi_version != LPR_IMAGE_ABI_VERSION) {
-        lpr_image_abi_mismatch_exit(lpr_bootstrap.image_abi_version);
+    if (lpr_process_manifest.image_abi_version != LPR_IMAGE_ABI_VERSION) {
+        lpr_image_abi_mismatch_exit(lpr_process_manifest.image_abi_version);
     }
-    if (lpr_bootstrap.byte_size < sizeof(lpr_bootstrap) ||
-        lpr_bootstrap.local_fd_count > LPR_FD_TABLE_MAX_SIZE ||
-        lpr_bootstrap.local_fd_count > UINT64_MAX / sizeof(lpr_bootstrap_fd_t))
+    if (lpr_process_manifest.byte_size < sizeof(lpr_process_manifest) ||
+        lpr_process_manifest.entry_count > LPR_FD_TABLE_MAX_SIZE)
     {
         goto invalid;
     }
-
-    const uint64_t expected_table_bytes =
-        lpr_bootstrap.local_fd_count * sizeof(lpr_bootstrap_fd_t);
-    if (lpr_bootstrap.local_fd_table_bytes != expected_table_bytes ||
-        lpr_bootstrap.byte_size != sizeof(lpr_bootstrap) + expected_table_bytes)
-    {
+    const int64_t mapped = lpr_pacha_syscall6(
+        PACHAOS_SYSCALL_MMAP,
+        LPR_BOOTSTRAP_FD,
+        0,
+        lpr_process_manifest.byte_size,
+        PACHAOS_PROT_READ,
+        PACHAOS_MMAP_SHARED,
+        0);
+    if (mapped < 4096) {
         goto invalid;
     }
-    if (lpr_bootstrap.local_fd_count != 0) {
-        if (lpr_bootstrap.local_fd_table_offset != sizeof(lpr_bootstrap) ||
-            lpr_bootstrap.local_fd_table_offset > lpr_bootstrap.byte_size ||
-            lpr_bootstrap.local_fd_table_bytes >
-                lpr_bootstrap.byte_size - lpr_bootstrap.local_fd_table_offset)
-        {
-            goto invalid;
-        }
-        const int64_t mapped = lpr_pacha_syscall6(
-            PACHAOS_SYSCALL_MMAP,
-            LPR_BOOTSTRAP_FD,
-            0,
-            lpr_bootstrap.byte_size,
-            PACHAOS_PROT_READ,
-            PACHAOS_MMAP_SHARED,
-            0);
-        if (mapped < 4096) {
-            goto invalid;
-        }
-        const lpr_bootstrap_t *mapped_bootstrap =
-            (const lpr_bootstrap_t *)(uintptr_t)mapped;
-        const lpr_bootstrap_fd_t *descs =
-            (const lpr_bootstrap_fd_t *)((uintptr_t)mapped +
-                lpr_bootstrap.local_fd_table_offset);
-        if (mapped_bootstrap->image_abi_version != LPR_IMAGE_ABI_VERSION) {
-            const uint64_t actual_version = mapped_bootstrap->image_abi_version;
-            (void)lpr_pacha_syscall2(
-                PACHAOS_SYSCALL_MUNMAP,
-                (uint64_t)(uintptr_t)mapped,
-                lpr_bootstrap.byte_size);
-            lpr_image_abi_mismatch_exit(actual_version);
-        }
-        const int install_ok =
-            mapped_bootstrap->magic == LPR_BOOTSTRAP_MAGIC &&
-            mapped_bootstrap->byte_size == lpr_bootstrap.byte_size &&
-            mapped_bootstrap->local_fd_count == lpr_bootstrap.local_fd_count &&
-            lpr_install_bootstrap_local_fds(descs, lpr_bootstrap.local_fd_count);
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)mapped,
-            lpr_bootstrap.byte_size);
-        if (!install_ok) {
-            goto invalid;
-        }
-    } else if (!lpr_install_bootstrap_local_fds(0, 0)) {
-        goto invalid;
-    }
-    if ((lpr_bootstrap.flags & LPR_BOOTSTRAP_FLAG_SUPERVISOR) != 0 &&
-        lpr_bootstrap.supervisor_token != 0)
+    const lpr_manifest_t *mapped_manifest =
+        (const lpr_manifest_t *)(uintptr_t)mapped;
+    const int install_ok =
+        lpr_manifest_validate(mapped_manifest, lpr_process_manifest.byte_size) &&
+        lpr_install_manifest_fds(mapped_manifest);
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_MUNMAP,
+        (uint64_t)(uintptr_t)mapped,
+        lpr_process_manifest.byte_size);
+    if (!install_ok) goto invalid;
+    if ((lpr_process_manifest.flags & LPR_MANIFEST_FLAG_SUPERVISOR) != 0 &&
+        lpr_process_manifest.supervisor_token != 0)
     {
-        lpr_supervisor_token = lpr_bootstrap.supervisor_token;
+        lpr_supervisor_token = lpr_process_manifest.supervisor_token;
         lpr_supervisor_enabled = 1;
+        const int64_t commit_status = lpr_supervisor_call_token(
+            LPRS_OP_PROCESS_EXEC_COMMIT_DONE,
+            lpr_supervisor_token,
+            -1,
+            0);
+        if (commit_status != 0) {
+            (void)lpr_pacha_syscall1(
+                PACHAOS_SYSCALL_PROCESS_EXIT,
+                LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
+            for (;;) {
+            }
+        }
     }
-    lpr_bootstrap_valid = 1;
+    lpr_manifest_valid = 1;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
     return 1;
 
 invalid:
-    lpr_memset(&lpr_bootstrap, 0, sizeof(lpr_bootstrap));
+    lpr_memset(&lpr_process_manifest, 0, sizeof(lpr_process_manifest));
     lpr_supervisor_enabled = 0;
     lpr_supervisor_token = 0;
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
@@ -138,19 +115,20 @@ void lpr_cwd_init(void)
     }
     lpr_cwd_checked = 1;
     lpr_cwd_set_root();
-    if (!lpr_load_bootstrap()) {
+    if (!lpr_load_manifest()) {
         return;
     }
     /* The exec bootstrap owns the transferred cwd handle.  The supervisor's
      * process metadata is only a fallback because its fork copy may be stale. */
-    if (lpr_bootstrap.cwd[0] == '/' &&
-        lpr_path_is_terminated(lpr_bootstrap.cwd, sizeof(lpr_bootstrap.cwd)))
+    if (lpr_process_manifest.cwd[0] == '/' &&
+        lpr_path_is_terminated(lpr_process_manifest.cwd, sizeof(lpr_process_manifest.cwd)))
     {
-        const uint64_t len = (uint64_t)lpr_strnlen(lpr_bootstrap.cwd, sizeof(lpr_bootstrap.cwd));
+        const uint64_t len = (uint64_t)lpr_strnlen(
+            lpr_process_manifest.cwd, sizeof(lpr_process_manifest.cwd));
         if (len < sizeof(lpr_cwd_path)) {
             lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
-            lpr_memcpy(lpr_cwd_path, lpr_bootstrap.cwd, (size_t)len + 1u);
-            lpr_cwd_handle = lpr_bootstrap.cwd_handle;
+            lpr_memcpy(lpr_cwd_path, lpr_process_manifest.cwd, (size_t)len + 1u);
+            lpr_cwd_handle = lpr_process_manifest.cwd_handle;
         }
         return;
     }
@@ -181,7 +159,7 @@ void lpr_linux_process_state_init(void)
     int32_t fallback_pid = kernel_pid_raw > 0 && kernel_pid_raw <= INT32_MAX ?
         (int32_t)kernel_pid_raw :
         1;
-    if (lpr_load_bootstrap()) {
+    if (lpr_load_manifest()) {
         if (lpr_supervisor_enabled) {
             lprs_process_state_t state;
             const int state_status = lpr_supervisor_get_state(&state);
@@ -203,14 +181,14 @@ void lpr_linux_process_state_init(void)
                 lpr_linux_next_pid = lpr_linux_current_pid + 1;
             }
         } else {
-            lpr_linux_current_pid = (int32_t)lpr_bootstrap.linux_pid;
+            lpr_linux_current_pid = (int32_t)lpr_process_manifest.linux_pid;
             if (lpr_linux_current_pid <= 0) {
                 lpr_linux_current_pid = fallback_pid;
             }
-            lpr_linux_current_ppid = (int32_t)lpr_bootstrap.linux_ppid;
-            lpr_linux_current_sid = (int32_t)lpr_bootstrap.linux_sid;
-            lpr_linux_current_pgrp = (int32_t)lpr_bootstrap.linux_pgrp;
-            lpr_linux_next_pid = (int32_t)lpr_bootstrap.linux_next_pid;
+            lpr_linux_current_ppid = (int32_t)lpr_process_manifest.linux_ppid;
+            lpr_linux_current_sid = (int32_t)lpr_process_manifest.linux_sid;
+            lpr_linux_current_pgrp = (int32_t)lpr_process_manifest.linux_pgrp;
+            lpr_linux_next_pid = (int32_t)lpr_process_manifest.linux_next_pid;
         }
     } else {
         lpr_linux_current_pid = fallback_pid;

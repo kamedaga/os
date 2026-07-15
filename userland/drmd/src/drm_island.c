@@ -17,7 +17,7 @@
 enum {
     DRMD_DRM_MAJOR = 226,
     DRMD_DRM_CARD0_MINOR = 0,
-    DRMD_HANDLE_MAX = 32,
+    DRMD_HANDLE_MAX = DRMD_DRM_WAIT_SOURCE_MAX,
     DRMD_FAKE_INODE_BYTES = 768,
     DRMD_FAKE_MAPPING_BYTES = 256,
     DRMD_FAKE_FILE_BYTES = 1024,
@@ -61,6 +61,14 @@ typedef struct drmd_handle {
     uint8_t file[DRMD_FAKE_FILE_BYTES];
 } drmd_handle_t;
 
+enum { DRMD_TRANSFER_LEASE_MAX = 32 };
+
+typedef struct drmd_transfer_lease {
+    int active;
+    int lease_fd;
+    uint64_t handle;
+} drmd_transfer_lease_t;
+
 typedef struct drmd_drm_version {
     int version_major;
     int version_minor;
@@ -74,6 +82,7 @@ typedef struct drmd_drm_version {
 } drmd_drm_version_t;
 
 static drmd_handle_t handles[DRMD_HANDLE_MAX];
+static drmd_transfer_lease_t transfer_leases[DRMD_TRANSFER_LEASE_MAX];
 static uint64_t next_handle = 1;
 
 static unsigned active_handle_count(void)
@@ -256,24 +265,6 @@ int drmd_drm_island_open(
         !island->ready || request->card_index != 0 || notify_fd < 16) {
         return -19;
     }
-    for (size_t i = 0; i < DRMD_HANDLE_MAX; i++) {
-        drmd_handle_t *existing = &handles[i];
-        if (!existing->active || existing->notify_fd < 16) continue;
-        struct pacha_pollfd pollfd = {
-            .fd = existing->notify_fd,
-            .events = PACHA_FD_EVENT_HANGUP,
-        };
-        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
-            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
-
-        const uint64_t orphan_id = existing->id;
-        const uint32_t orphan_refs = existing->refs;
-        drmd_kms_handle_orphan(orphan_id);
-        existing->refs = 1;
-        const int close_status = drmd_drm_island_close(island, orphan_id);
-        printf("[drmd] orphan reap handle=%llu refs=%u status=%d\n",
-            (unsigned long long)orphan_id, orphan_refs, close_status);
-    }
     const uint64_t dev = kb_linux_kernel_encode_dev(DRMD_DRM_MAJOR, DRMD_DRM_CARD0_MINOR);
     const kb_cdev_record_t *record = kb_linux_kernel_find_active_cdev(dev);
     if (record == NULL || !record->has_fops_view || record->fops_view.open == NULL) {
@@ -356,6 +347,41 @@ int drmd_drm_island_dup(struct drmd_drm_island *island, uint64_t id, uint64_t *o
     handle->refs++;
     *out_handle = id;
     return 0;
+}
+
+int drmd_drm_island_transfer_dup(
+    struct drmd_drm_island *island,
+    uint64_t id,
+    int lease_fd,
+    uint64_t *out_handle)
+{
+    (void)island;
+    drmd_handle_t *handle = find_handle(id);
+    if (handle == NULL || out_handle == NULL || lease_fd < 16 ||
+        handle->refs == UINT32_MAX) return -9;
+    drmd_transfer_lease_t *lease = NULL;
+    for (size_t i = 0; i < DRMD_TRANSFER_LEASE_MAX; ++i) {
+        if (!transfer_leases[i].active) {
+            lease = &transfer_leases[i];
+            break;
+        }
+    }
+    if (lease == NULL) return -24;
+    memset(lease, 0, sizeof(*lease));
+    lease->active = 1;
+    lease->lease_fd = lease_fd;
+    lease->handle = id;
+    handle->refs++;
+    *out_handle = id;
+    return 0;
+}
+
+static uint32_t drmd_transfer_lease_count(uint64_t handle)
+{
+    uint32_t count = 0;
+    for (size_t i = 0; i < DRMD_TRANSFER_LEASE_MAX; ++i)
+        if (transfer_leases[i].active && transfer_leases[i].handle == handle) count++;
+    return count;
 }
 
 int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request)
@@ -453,6 +479,70 @@ int drmd_drm_island_read(
     *out_size = status == 0 ? request->data_size : 0;
     if (status == 0) drmd_drm_island_notify_readable(island);
     return status;
+}
+
+size_t drmd_drm_island_collect_wait_sources(int *out_fds, size_t capacity)
+{
+    if (out_fds == NULL || capacity == 0) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < DRMD_HANDLE_MAX && count < capacity; i++) {
+        const drmd_handle_t *handle = &handles[i];
+        if (!handle->active || handle->notify_fd < 16) continue;
+        out_fds[count++] = handle->notify_fd;
+    }
+    for (size_t i = 0; i < DRMD_TRANSFER_LEASE_MAX && count < capacity; ++i) {
+        if (!transfer_leases[i].active || transfer_leases[i].lease_fd < 16) continue;
+        out_fds[count++] = transfer_leases[i].lease_fd;
+    }
+    return count;
+}
+
+size_t drmd_drm_island_reap_hangups(struct drmd_drm_island *island)
+{
+    if (island == NULL) return 0;
+    size_t reaped = 0;
+    for (size_t i = 0; i < DRMD_HANDLE_MAX; i++) {
+        drmd_handle_t *handle = &handles[i];
+        if (!handle->active || handle->notify_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = handle->notify_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+
+        const uint64_t orphan_id = handle->id;
+        const uint32_t orphan_refs = handle->refs;
+        const int notify_fd = handle->notify_fd;
+        handle->notify_fd = -1;
+        if (notify_fd >= 16) (void)pacha_fd_close(notify_fd);
+        handle->refs = drmd_transfer_lease_count(orphan_id) + 1u;
+        if (handle->refs == 1u) drmd_kms_handle_orphan(orphan_id);
+        const int close_status = drmd_drm_island_close(island, orphan_id);
+        printf("[drmd] orphan reap handle=%llu refs=%u status=%d\n",
+            (unsigned long long)orphan_id, orphan_refs, close_status);
+        reaped++;
+    }
+    for (size_t i = 0; i < DRMD_TRANSFER_LEASE_MAX; ++i) {
+        drmd_transfer_lease_t *lease = &transfer_leases[i];
+        if (!lease->active || lease->lease_fd < 16) continue;
+        struct pacha_pollfd pollfd = {
+            .fd = lease->lease_fd,
+            .events = PACHA_FD_EVENT_HANGUP,
+        };
+        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
+            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        const uint64_t handle = lease->handle;
+        (void)pacha_fd_close(lease->lease_fd);
+        memset(lease, 0, sizeof(*lease));
+        drmd_handle_t *resource = find_handle(handle);
+        if (resource != NULL && resource->notify_fd < 16 &&
+            drmd_transfer_lease_count(handle) == 0)
+            drmd_kms_handle_orphan(handle);
+        (void)drmd_drm_island_close(island, handle);
+        reaped++;
+    }
+    return reaped;
 }
 
 void drmd_drm_island_notify_readable(struct drmd_drm_island *island)
