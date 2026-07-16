@@ -559,7 +559,14 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         }
     }
     if (user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) != null) {
-        return 0;
+        // Another thread in this address space may have won the same lazy
+        // fault while this CPU waited for the address-space lock.  The
+        // hardware error still describes the earlier non-present PTE, while
+        // the locked page-table view now contains the valid mapping.  Return
+        // through the normal user CR3 reload and retry instead of treating
+        // that resolved race as a fatal user fault.
+        const not_present_fault = (ec & 1) == 0;
+        return if (not_present_fault) 1 else 0;
     }
     if (kernel_runtime.kernel_state_global.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, kernel_runtime.global_free_list)) |mapping| {
         var paddrs = [_]u64{mapping.paddr};
