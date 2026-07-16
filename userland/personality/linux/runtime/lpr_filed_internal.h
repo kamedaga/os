@@ -351,6 +351,7 @@ typedef struct lpr_thread_record {
     uint32_t tid;
     volatile uint32_t parent_ready;
     uint32_t reserved0;
+    uint64_t signal_mask;
 } lpr_thread_record_t;
 
 typedef struct lpr_thread_state {
@@ -381,8 +382,7 @@ typedef struct lpr_process_state {
     lpr_linux_process_entry_t entries[LPR_LINUX_PROCESS_TABLE_SIZE];
 } lpr_process_state_t;
 
-typedef struct lpr_signal_state {
-    lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
+typedef struct lpr_signal_thread_state {
     uint64_t mask;
     uint64_t pending_mask;
     uint64_t wait_restore_mask;
@@ -390,8 +390,22 @@ typedef struct lpr_signal_state {
     uint64_t altstack_sp;
     uint64_t altstack_size;
     uint32_t altstack_flags;
-    uint32_t runtime_registered;
     int dispatching;
+} lpr_signal_thread_state_t;
+
+enum { LPR_SIGNAL_THREAD_SLOT_COUNT = 256 };
+
+typedef struct lpr_signal_thread_slot {
+    volatile uint32_t tid;
+    uint32_t reserved0;
+    lpr_signal_thread_state_t state;
+} lpr_signal_thread_slot_t;
+
+typedef struct lpr_signal_state {
+    lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
+    uint32_t runtime_registered;
+    uint32_t reserved0;
+    lpr_signal_thread_slot_t threads[LPR_SIGNAL_THREAD_SLOT_COUNT];
 } lpr_signal_state_t;
 
 typedef struct lpr_cwd_state {
@@ -486,6 +500,9 @@ typedef struct lpr_state {
 } lpr_state_t;
 
 extern lpr_state_t lpr_state;
+lpr_signal_thread_state_t *lpr_signal_thread_state_current(void);
+void lpr_signal_thread_state_release_current(void);
+void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_control_fd_table (lpr_state.fd_table)
 #define lpr_control_entries_initial (lpr_state.fd_storage.entries_initial)
 #define lpr_control_ofds_initial (lpr_state.fd_storage.ofds_initial)
@@ -551,15 +568,15 @@ extern lpr_state_t lpr_state;
 #define lpr_supervisor_enabled (lpr_state.process.supervisor_enabled)
 #define lpr_linux_processes (lpr_state.process.entries)
 #define lpr_linux_sigactions (lpr_state.signal.actions)
-#define lpr_linux_signal_mask (lpr_state.signal.mask)
-#define lpr_linux_pending_signal_mask (lpr_state.signal.pending_mask)
-#define lpr_linux_wait_restore_mask (lpr_state.signal.wait_restore_mask)
-#define lpr_linux_wait_restore_mask_active (lpr_state.signal.wait_restore_mask_active)
-#define lpr_linux_altstack_sp (lpr_state.signal.altstack_sp)
-#define lpr_linux_altstack_size (lpr_state.signal.altstack_size)
-#define lpr_linux_altstack_flags (lpr_state.signal.altstack_flags)
+#define lpr_linux_signal_mask (lpr_signal_thread_state_current()->mask)
+#define lpr_linux_pending_signal_mask (lpr_signal_thread_state_current()->pending_mask)
+#define lpr_linux_wait_restore_mask (lpr_signal_thread_state_current()->wait_restore_mask)
+#define lpr_linux_wait_restore_mask_active (lpr_signal_thread_state_current()->wait_restore_mask_active)
+#define lpr_linux_altstack_sp (lpr_signal_thread_state_current()->altstack_sp)
+#define lpr_linux_altstack_size (lpr_signal_thread_state_current()->altstack_size)
+#define lpr_linux_altstack_flags (lpr_signal_thread_state_current()->altstack_flags)
 #define lpr_linux_signal_runtime_registered (lpr_state.signal.runtime_registered)
-#define lpr_linux_signal_dispatching (lpr_state.signal.dispatching)
+#define lpr_linux_signal_dispatching (lpr_signal_thread_state_current()->dispatching)
 #define lpr_cwd_checked (lpr_state.cwd.checked)
 #define lpr_cwd_handle (lpr_state.cwd.handle)
 #define lpr_cwd_lease_fd (lpr_state.cwd.lease_fd)

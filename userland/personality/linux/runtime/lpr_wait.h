@@ -7,6 +7,11 @@ enum {
     LPR_WAIT_GRAPH_MAX_LEAVES = 256u,
 };
 
+// Internal-only result: unwind the active syscall before attempting native
+// signal delivery.  Linux uses this errno range for the same purpose and it
+// must never escape lpr_dispatch_syscall_frame().
+#define LPR_WAIT_RESTART_SYSCALL (-512ll)
+
 typedef struct lpr_wait_deadline {
     uint64_t expires_ns;
     uint8_t finite;

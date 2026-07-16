@@ -16,6 +16,7 @@ enum {
     LPRS_WNOHANG = 1,
     LPRS_SIGCHLD = 17,
     LPRS_WAIT_FD_CAPACITY = 256,
+    LPRS_DISPATCH_DEFERRED = 1,
 };
 
 typedef struct lprs_process {
@@ -46,6 +47,14 @@ typedef struct lprs_process_status {
     uint64_t generation;
 } lprs_process_status_t;
 
+typedef struct lprs_waiter {
+    uint8_t active;
+    int page_fd;
+    int reply_fd;
+    pacha_service_envelope_t header;
+    lprs_wait4_t request;
+} lprs_waiter_t;
+
 static int g_endpoint_fd = -1;
 static uint64_t g_next_pid = 1;
 static uint64_t g_next_token = 0x4c50525300000001ull;
@@ -53,9 +62,13 @@ static uint64_t g_next_generation = 1;
 static lprs_process_t *g_processes;
 static uint64_t g_process_count;
 static uint64_t g_process_capacity;
+static lprs_waiter_t *g_waiters;
+static uint64_t g_waiter_count;
+static uint64_t g_waiter_capacity;
 
 static int lprs_service_one_pending_request(void);
 static void lprs_refresh_exited_children(void);
+static void lprs_complete_waiters(void);
 
 static int lprs_status_to_errno(long status)
 {
@@ -179,6 +192,62 @@ static int lprs_ensure_process_capacity(uint64_t needed)
     return 0;
 }
 
+static int lprs_ensure_waiter_capacity(uint64_t needed)
+{
+    if (needed <= g_waiter_capacity) {
+        return 0;
+    }
+    uint64_t new_capacity = g_waiter_capacity == 0 ? 16 : g_waiter_capacity;
+    while (new_capacity < needed) {
+        if (new_capacity > UINT64_MAX / 2u) {
+            return PACHA_STATUS_ENOMEM;
+        }
+        new_capacity *= 2u;
+    }
+    lprs_waiter_t *new_waiters =
+        (lprs_waiter_t *)realloc(g_waiters, (size_t)(new_capacity * sizeof(*new_waiters)));
+    if (new_waiters == NULL) {
+        return PACHA_STATUS_ENOMEM;
+    }
+    memset(new_waiters + g_waiter_capacity, 0,
+        (size_t)((new_capacity - g_waiter_capacity) * sizeof(*new_waiters)));
+    g_waiters = new_waiters;
+    g_waiter_capacity = new_capacity;
+    return 0;
+}
+
+static int lprs_queue_waiter(
+    int page_fd,
+    int reply_fd,
+    const pacha_service_envelope_t *header,
+    const lprs_wait4_t *request)
+{
+    if (page_fd < 16 || reply_fd < 16 || header == NULL || request == NULL) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_waiter_t *waiter = NULL;
+    for (uint64_t i = 0; i < g_waiter_count; ++i) {
+        if (!g_waiters[i].active) {
+            waiter = &g_waiters[i];
+            break;
+        }
+    }
+    if (waiter == NULL) {
+        const int capacity_status = lprs_ensure_waiter_capacity(g_waiter_count + 1u);
+        if (capacity_status != 0) {
+            return capacity_status;
+        }
+        waiter = &g_waiters[g_waiter_count++];
+    }
+    memset(waiter, 0, sizeof(*waiter));
+    waiter->active = 1;
+    waiter->page_fd = page_fd;
+    waiter->reply_fd = reply_fd;
+    waiter->header = *header;
+    waiter->request = *request;
+    return 0;
+}
+
 static void lprs_process_release_owned(lprs_process_t *proc)
 {
     if (proc == NULL) {
@@ -207,6 +276,24 @@ static void lprs_process_reap(lprs_process_t *proc)
 {
     lprs_process_release_owned(proc);
     proc->waited = 1;
+}
+
+static void lprs_orphan_children(uint64_t parent_pid)
+{
+    if (parent_pid == 0) {
+        return;
+    }
+    for (uint64_t i = 0; i < g_process_count; ++i) {
+        lprs_process_t *child = &g_processes[i];
+        if (!child->active || child->ppid != parent_pid) {
+            continue;
+        }
+        if (child->exit_ready) {
+            lprs_process_reap(child);
+        } else {
+            child->ppid = 0;
+        }
+    }
 }
 
 static lprs_process_t *lprs_find_by_token(uint64_t token)
@@ -579,70 +666,23 @@ static int lprs_find_exited_child(
     return 0;
 }
 
-static int lprs_wait_for_matching_child(
+static int lprs_find_matching_child(
     uint64_t parent_token,
     int64_t requested,
-    uint64_t options,
     uint64_t *out_selected_index,
     uint64_t *out_exit_code)
 {
-    for (;;) {
-        const lprs_process_t *parent = lprs_find_by_token(parent_token);
-        if (parent == NULL) {
-            return PACHA_STATUS_ESRCH;
-        }
-        uint64_t match_count = 0;
-        int status = lprs_find_exited_child(
-            parent, requested, out_selected_index, out_exit_code, &match_count);
-        if (status != 0) {
-            return status;
-        }
-        if (*out_selected_index != UINT64_MAX) {
-            return 0;
-        }
-        if (match_count == 0) {
-            return PACHA_STATUS_ECHILD;
-        }
-        if ((options & LPRS_WNOHANG) != 0) {
-            return PACHA_STATUS_EAGAIN;
-        }
-
-        struct pacha_pollfd pollfds[LPRS_WAIT_FD_CAPACITY];
-        memset(pollfds, 0, sizeof(pollfds));
-        uint64_t count = 0;
-        pollfds[count++] = (struct pacha_pollfd){
-            .fd = g_endpoint_fd,
-            .events = PACHA_FD_EVENT_READABLE,
-        };
-        for (uint64_t i = 0; i < g_process_count; ++i) {
-            lprs_process_t *child = &g_processes[i];
-            if (!child->active || child->exit_ready ||
-                child->process_fd < 16 || child->ppid == 0)
-            {
-                continue;
-            }
-            if (count >= LPRS_WAIT_FD_CAPACITY) {
-                return PACHA_STATUS_ENOMEM;
-            }
-            pollfds[count++] = (struct pacha_pollfd){
-                .fd = child->process_fd,
-                .events = PACHA_FD_EVENT_READABLE,
-            };
-        }
-
-        const long wait_many = pacha_fd_wait_many(pollfds, count, UINT64_MAX);
-        if (wait_many < 0) {
-            const int wait_many_err = lprs_status_to_errno(wait_many);
-            if (wait_many_err != PACHA_STATUS_EAGAIN) {
-                return wait_many_err;
-            }
-        }
-        lprs_refresh_exited_children();
-        if ((pollfds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
-            while (lprs_service_one_pending_request() == 0) {
-            }
-        }
+    const lprs_process_t *parent = lprs_find_by_token(parent_token);
+    if (parent == NULL) {
+        return PACHA_STATUS_ESRCH;
     }
+    uint64_t match_count = 0;
+    const int status = lprs_find_exited_child(
+        parent, requested, out_selected_index, out_exit_code, &match_count);
+    if (status != 0 || *out_selected_index != UINT64_MAX) {
+        return status;
+    }
+    return match_count == 0 ? PACHA_STATUS_ECHILD : PACHA_STATUS_EAGAIN;
 }
 
 static int lprs_wait4(void *page, uint64_t *out_result)
@@ -661,8 +701,8 @@ static int lprs_wait4(void *page, uint64_t *out_result)
     }
     uint64_t selected_index = UINT64_MAX;
     uint64_t exit_code = 0;
-    const int wait_status = lprs_wait_for_matching_child(
-        parent->token, req->requested_pid, req->options, &selected_index, &exit_code);
+    const int wait_status = lprs_find_matching_child(
+        parent->token, req->requested_pid, &selected_index, &exit_code);
     if (wait_status == PACHA_STATUS_EAGAIN && (req->options & LPRS_WNOHANG) != 0) {
         req->result_pid = 0;
         req->status = 0;
@@ -1039,6 +1079,19 @@ static int lprs_dispatch(
         } else {
             status = lprs_wait4(payload, out_result);
             reply_payload_size = sizeof(lprs_wait4_t);
+            lprs_wait4_t *wait = (lprs_wait4_t *)payload;
+            if (status == PACHA_STATUS_EAGAIN &&
+                (wait->options & LPRS_WNOHANG) == 0)
+            {
+                const int reply_fd = request->fd_count != 0 ?
+                    (int)(uint32_t)request->fds[request->fd_count - 1u].fd : -1;
+                status = lprs_queue_waiter(page_fd, reply_fd, &header, wait);
+                if (status == 0) {
+                    *out_keep_fd = page_fd;
+                    (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+                    return LPRS_DISPATCH_DEFERRED;
+                }
+            }
         }
         break;
     case LPRS_OP_PROCESS_SETPGID:
@@ -1150,6 +1203,55 @@ static int lprs_reply(
     return reply_status;
 }
 
+static void lprs_complete_waiters(void)
+{
+    for (uint64_t i = 0; i < g_waiter_count; ++i) {
+        lprs_waiter_t *waiter = &g_waiters[i];
+        if (!waiter->active) {
+            continue;
+        }
+        uint64_t result = 0;
+        const int status = lprs_wait4(&waiter->request, &result);
+        if (status == PACHA_STATUS_EAGAIN) {
+            continue;
+        }
+
+        void *page = pacha_mmap(
+            waiter->page_fd,
+            PACHA_SERVICE_PAGE_BYTES,
+            PACHA_PROT_READ | PACHA_PROT_WRITE,
+            PACHA_MMAP_SHARED,
+            0);
+        int reply_status = status;
+        if (page == NULL) {
+            reply_status = PACHA_STATUS_EFAULT;
+        } else {
+            memcpy(
+                (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
+                &waiter->request,
+                sizeof(waiter->request));
+            pacha_service_reply_init(
+                (pacha_service_envelope_t *)page,
+                &waiter->header,
+                reply_status,
+                reply_status == PACHA_STATUS_EINVAL ?
+                    PACHA_SERVICE_ERROR_ABI : PACHA_SERVICE_ERROR_LPR_TRANSLATION,
+                result,
+                sizeof(waiter->request));
+            (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        }
+
+        const int page_fd = waiter->page_fd;
+        const int reply_fd = waiter->reply_fd;
+        const uint64_t request_id = waiter->header.request_id;
+        memset(waiter, 0, sizeof(*waiter));
+        waiter->page_fd = -1;
+        waiter->reply_fd = -1;
+        (void)pacha_fd_close(page_fd);
+        (void)lprs_reply(reply_fd, request_id, reply_status, result, -1, 0);
+    }
+}
+
 static int lprs_handle_received_request(struct pacha_ipc_msg *request)
 {
     if (request == NULL) {
@@ -1173,6 +1275,9 @@ static int lprs_handle_received_request(struct pacha_ipc_msg *request)
                 &error_token, &request_id) :
             PACHA_STATUS_EINVAL;
     lprs_close_unowned_fds(request, keep_fd, reply_fd);
+    if (dispatch_status == LPRS_DISPATCH_DEFERRED) {
+        return 0;
+    }
     (void)lprs_reply(
         reply_fd, request_id, dispatch_status, result, transfer_fd, error_token);
     return 0;
@@ -1202,17 +1307,20 @@ static void lprs_notify_exited_child(lprs_process_t *child, uint64_t exit_code)
     }
     child->exit_status = (uint32_t)(exit_code & 0xffu);
     child->exit_ready = 1;
+    lprs_orphan_children(child->pid);
     if (child->ppid == 0) {
         lprs_process_reap(child);
         return;
     }
     lprs_process_t *parent = lprs_find_by_pid(child->ppid);
-    int notify_status = PACHA_STATUS_ESRCH;
-    if (parent != NULL) {
-        if (parent->child_sequence != UINT64_MAX)
-            parent->child_sequence++;
+    if (parent == NULL || parent->exit_ready) {
+        lprs_process_reap(child);
+        return;
     }
-    if (parent != NULL && parent->process_fd >= 16) {
+    int notify_status = PACHA_STATUS_ESRCH;
+    if (parent->child_sequence != UINT64_MAX)
+        parent->child_sequence++;
+    if (parent->process_fd >= 16) {
         notify_status = lprs_signal_process_fd(parent->process_fd, LPRS_SIGCHLD);
         if (notify_status == 0) {
             child->exit_notified = 1;
@@ -1328,6 +1436,7 @@ int main(int argc, char **argv)
         }
         lprs_refresh_exited_children();
         lprs_refresh_failed_execs();
+        lprs_complete_waiters();
         for (uint64_t i = 1; i < count; ++i) {
             const uint64_t process_index = process_indices[i];
             if (pending_exec[i]) continue;
@@ -1345,6 +1454,7 @@ int main(int argc, char **argv)
         if ((pollfds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
             while (lprs_service_one_pending_request() == 0) {
             }
+            lprs_complete_waiters();
         }
     }
 }

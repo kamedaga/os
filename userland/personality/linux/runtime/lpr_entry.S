@@ -31,6 +31,7 @@ lpr_syscall_entry:
     lea LPR_SYSCALL_ENTRY_RESERVE_BYTES(%rsp), %r10
     mov %r10, 128(%r11)
     movq $0x202, 136(%r11)
+    movq $0, 144(%r11)
 
     mov 72(%r11), %r10
     mov %r10, 0(%rsp)

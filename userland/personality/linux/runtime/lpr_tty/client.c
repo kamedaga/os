@@ -331,10 +331,7 @@ int64_t lpr_linux_rt_sigpending(uint64_t set_raw, uint64_t sigsetsize)
 
 void lpr_linux_signal_after_fork_child(void)
 {
-    lpr_linux_pending_signal_mask = 0;
-    lpr_linux_wait_restore_mask = 0;
-    lpr_linux_wait_restore_mask_active = 0;
-    lpr_linux_signal_dispatching = 0;
+    lpr_signal_thread_state_after_fork_child();
 }
 
 int lpr_linux_default_signal_ignored(uint32_t sig)
@@ -439,7 +436,6 @@ int64_t lpr_linux_dispatch_pending_signals(void)
 void lpr_linux_raise_sigpipe(void)
 {
     lpr_linux_queue_signal(LPR_LINUX_SIGPIPE);
-    (void)lpr_linux_dispatch_pending_signals();
 }
 
 uint64_t lpr_linux_unblockable_signal_mask(void)

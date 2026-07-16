@@ -236,6 +236,12 @@ int64_t lpr_wait_graph_block(
         wait_ns = graph->relative_deadline_ns;
     if (wait_ns == 0) return 0;
 
+    uint64_t wait_started_ns = 0;
+    if (wait_ns != UINT64_MAX) {
+        const int64_t now_status = lpr_wait_now_ns(&wait_started_ns);
+        if (now_status != 0) return now_status;
+    }
+
     int64_t status = 0;
     if (graph->leaf_count == 0) {
         if (wait_ns != UINT64_MAX) {
@@ -276,8 +282,11 @@ int64_t lpr_wait_graph_block(
             0);
     }
 
+    int graph_ready = 0;
     if (status >= 0) {
         for (uint32_t i = 0; i < graph->leaf_count; ++i) {
+            if (graph->leaves[i].revents != 0)
+                graph_ready = 1;
             if ((graph->leaves[i].revents & PACHA_FD_EVENT_READABLE) == 0)
                 continue;
             if (graph->drain_modes[i] == LPR_WAIT_DRAIN_EVENT)
@@ -287,10 +296,25 @@ int64_t lpr_wait_graph_block(
         }
     }
 
-    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
-    (void)lpr_linux_pump_tty_signals();
-    if (status >= 0 || status == PACHA_SYSCALL_ERR_NOT_READY ||
-        status == -PACHA_SYSCALL_ERR_NOT_READY)
+    if (lpr_linux_pump_tty_signals())
+        return LPR_WAIT_RESTART_SYSCALL;
+
+    const int not_ready = !graph_ready &&
+        (status == PACHA_SYSCALL_ERR_NOT_READY ||
+         status == -PACHA_SYSCALL_ERR_NOT_READY ||
+         status == -LPR_LINUX_EAGAIN);
+    if (not_ready) {
+        int timed_out = 0;
+        if (wait_ns != UINT64_MAX) {
+            uint64_t now_ns = 0;
+            const int64_t now_status = lpr_wait_now_ns(&now_ns);
+            if (now_status != 0) return now_status;
+            timed_out = now_ns >= wait_started_ns &&
+                now_ns - wait_started_ns >= wait_ns;
+        }
+        return timed_out ? 0 : LPR_WAIT_RESTART_SYSCALL;
+    }
+    if (status >= 0)
         return 0;
     const int64_t linux_status = lpr_pacha_status_to_errno(status);
     return linux_status == -LPR_LINUX_EAGAIN ? 0 : linux_status;

@@ -15,7 +15,7 @@ enum {
     LPR_CLONE_CHILD_SETTID = 0x01000000ull,
 };
 
-_Static_assert(sizeof(lpr_thread_record_t) == 64u, "thread launch record size");
+_Static_assert(sizeof(lpr_thread_record_t) == 72u, "thread launch record size");
 
 /* Linux musl's x86_64 __unmapself switches directly from SYS_munmap to
  * SYS_exit without touching its former stack.  LPR's zpoline dispatch needs
@@ -209,6 +209,7 @@ void lpr_linux_exit_thread(uint64_t code)
     if (last_thread) {
         lpr_linux_prepare_process_exit(code);
     }
+    lpr_signal_thread_state_release_current();
     (void)lpr_pacha_syscall3(
         PACHAOS_SYSCALL_THREAD_EXIT,
         code,
@@ -236,6 +237,7 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
     if (last_thread) {
         lpr_linux_prepare_process_exit(0);
     }
+    lpr_signal_thread_state_release_current();
 
     register uint64_t syscall_number __asm__("rax") = PACHAOS_SYSCALL_MUNMAP;
     register uint64_t arg0 __asm__("rdi") = base;
@@ -276,6 +278,11 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
         lpr_linux_exit_thread(127u);
     }
     const uint32_t tid = (uint32_t)raw_tid;
+    lpr_signal_thread_state_t *signal_state = lpr_signal_thread_state_current();
+    signal_state->mask = record->signal_mask;
+    if (lpr_linux_sync_native_signal_mask() != 0) {
+        lpr_linux_exit_thread(127u);
+    }
     record->tid = tid;
     if ((record->clone_flags & LPR_CLONE_PARENT_SETTID) != 0) {
         __atomic_store_n(record->parent_tid, tid, __ATOMIC_RELEASE);
@@ -337,6 +344,7 @@ static int64_t lpr_linux_clone_thread(
     record->start_function = user_frame->r9;
     record->start_argument = *(const uint64_t *)(uintptr_t)child_stack;
     record->clone_flags = flags;
+    record->signal_mask = lpr_linux_signal_mask;
     record->parent_tid = (volatile uint32_t *)(uintptr_t)parent_tid;
     if ((flags & (LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID)) != 0) {
         record->child_tid = (volatile uint32_t *)(uintptr_t)child_tid;

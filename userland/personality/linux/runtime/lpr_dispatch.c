@@ -1520,6 +1520,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     if (pre_signal_status != 0) {
         return pre_signal_status;
     }
+    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
     const int trace_metrics = pacha_trace_enabled(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_CLASS_METRIC);
     if (trace_metrics && (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP)) {
         lpr_trace_syscall_record(nr, 0, 0);
@@ -1531,10 +1532,27 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
             lpr_linux_exit_thread(a0);
         }
     }
-    const uint64_t start_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
-    const int64_t result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5);
-    const uint64_t end_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
-    const uint64_t cycles = end_cycles >= start_cycles ? end_cycles - start_cycles : 0;
+    uint64_t cycles = 0;
+    int64_t result = 0;
+    for (;;) {
+        const uint64_t start_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
+        result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5);
+        const uint64_t end_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
+        if (end_cycles >= start_cycles) cycles += end_cycles - start_cycles;
+        if (result != LPR_WAIT_RESTART_SYSCALL) break;
+
+        // The blocking layer has released every stack-scoped resource.  Only
+        // now may signal delivery abandon the LPR dispatch stack.
+        const int64_t signal_status =
+            lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
+        if (signal_status != 0) {
+            result = signal_status;
+            break;
+        }
+        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        // A spurious wake or an ignored synthetic signal leaves no native
+        // frame to deliver, so restart the syscall transparently.
+    }
     if (trace_metrics) {
         lpr_trace_syscall_record(nr, cycles, result);
     }
@@ -1549,5 +1567,8 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     if (result == -LPR_LINUX_ENOSYS) {
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);
     }
-    return post_signal_status != 0 ? post_signal_status : result;
+    const int64_t final_result =
+        post_signal_status != 0 ? post_signal_status : result;
+    lpr_linux_deliver_native_pending_frame(final_result);
+    return final_result;
 }

@@ -171,6 +171,16 @@ apps:
         - "tools/copy_lpr_linux_musl.sh"
     out: "PACHASES.ELF"
     rootfs: "/usr/libexec/pacha-user-session"
+  sway_phase1_acceptance_script:
+    file:
+      path: "tests/fixtures/sway_phase1_acceptance.sh"
+    out: "SWAYP1AC.SH"
+    rootfs: "/cmd/sway_phase1_acceptance.sh"
+  sway_phase1_acceptance_config:
+    file:
+      path: "tests/fixtures/sway_phase1_acceptance.conf"
+    out: "SWAYP1AC.CFG"
+    rootfs: "/cmd/sway_phase1_acceptance.conf"
   sway_inventory_script:
     file:
       path: "tests/fixtures/sway_inventory.sh"

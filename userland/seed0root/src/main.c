@@ -3472,8 +3472,6 @@ static int seed0root_spawn_lpr_session(
         return start_status;
     }
     (void)pacha_fd_close((int)reply_fds[0].fd);
-    printf("[seed0root] user session started\n");
-    fflush(stdout);
     return 0;
 }
 

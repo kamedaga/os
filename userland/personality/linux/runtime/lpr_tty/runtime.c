@@ -310,7 +310,8 @@ int64_t lpr_tty_wait(uint64_t fd, uint32_t events)
         if ((revents & TERMD_POLLHUP) != 0) {
             return 0;
         }
-        lpr_linux_pump_tty_signals();
+        if (lpr_linux_pump_tty_signals())
+            return LPR_WAIT_RESTART_SYSCALL;
         lpr_wait_graph_t graph;
         lpr_wait_graph_init(&graph);
         status = lpr_wait_graph_add_fd(&graph, fd, events);
@@ -410,7 +411,6 @@ int lpr_linux_pump_tty_signals(void)
             interrupted = 1;
         }
         (void)lpr_linux_signal_pgrp((int32_t)signal_req->pgrp_id, signal_req->signo);
-        (void)lpr_linux_dispatch_pending_signals();
     }
     lpr_destroy_tty_wire_page(page_fd, page);
     return interrupted;
