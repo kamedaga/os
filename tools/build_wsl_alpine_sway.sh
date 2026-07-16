@@ -188,8 +188,13 @@ env -u SOURCE_DATE_EPOCH "${host_fc_cache}" \
 find "${runtime}/var/cache/fontconfig" -maxdepth 1 -type f -name '*cache-*' -print -quit |
   grep -q . || { echo "host fc-cache did not populate target root" >&2; exit 1; }
 
-# This image intentionally has no Xwayland server. Keep Sway's standard
-# configuration intact while disabling the unavailable optional backend.
+# This image intentionally has no Xwayland server. Use Alt for the guest
+# modifier and disable the unavailable optional backend.
+sed -i 's/^set \$mod Mod4$/set $mod Alt/' "${runtime}/etc/sway/config"
+grep -Fxq 'set $mod Alt' "${runtime}/etc/sway/config" || {
+  echo "failed to select Alt as the Sway modifier" >&2
+  exit 1
+}
 mkdir -p "${runtime}/etc/sway/config.d"
 printf 'xwayland disable\n' >"${runtime}/etc/sway/config.d/pacha.conf"
 
@@ -236,8 +241,12 @@ fi
 wlroots_source="${tmp}/wlroots-source"
 mkdir -p "${wlroots_source}"
 git -C "${wlroots_git}" archive "${wlroots_commit}" | tar -x -C "${wlroots_source}"
-git -C "${wlroots_source}" apply "${repo_root}/pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
-git -C "${wlroots_source}" apply "${repo_root}/pack/patches/wlroots/0002-explicit-render-fences.patch"
+GIT_CEILING_DIRECTORIES="${repo_root}/.artifacts" git -C "${wlroots_source}" apply \
+  "${repo_root}/pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
+/usr/bin/grep -Fq 'memfd_create("wlroots-shm"' "${wlroots_source}/util/shm.c" || {
+  echo "wlroots sealed-memfd patch was not applied to the extracted source" >&2
+  exit 1
+}
 
 cross_root="${tmp}/cross-root"
 python3 - "${cross_root}" \
@@ -381,6 +390,11 @@ DESTDIR="${wlroots_install}" "${build_tools}/bin/ninja" -C "${wlroots_build}" in
 install -m 0755 "${wlroots_install}/usr/lib/libwlroots-0.18.so" \
   "${runtime}/usr/lib/libwlroots-0.18.so"
 /usr/bin/strip --strip-unneeded "${runtime}/usr/lib/libwlroots-0.18.so"
+/usr/bin/readelf -Ws "${runtime}/usr/lib/libwlroots-0.18.so" |
+  /usr/bin/grep -E '[[:space:]]UND[[:space:]]+memfd_create(@|$)' >/dev/null || {
+    echo "built wlroots does not use the sealed-memfd shared-file path" >&2
+    exit 1
+  }
 
 python3 - "${runtime}" "${clang_root}" "${mesa_root}" "${input_root}" <<'PY'
 import os

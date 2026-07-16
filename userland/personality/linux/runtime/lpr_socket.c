@@ -1379,9 +1379,17 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         req->handle = lpr_socket_backend(fd)->handle;
         req->flags = flags;
         for (uint64_t i = 0; i < msg->msg_iovlen; i++) {
-            if (req->length > NETD_IO_BYTES - iov[i].len) { lpr_netd_destroy_page(page_fd, page); return -LPR_LINUX_EINVAL; }
-            lpr_memcpy(req->data + req->length, (const void *)(uintptr_t)iov[i].base, (size_t)iov[i].len);
-            req->length += iov[i].len;
+            const uint64_t available = NETD_IO_BYTES - req->length;
+            const uint64_t chunk = iov[i].len < available ?
+                iov[i].len : available;
+            if (chunk != 0) {
+                lpr_memcpy(
+                    req->data + req->length,
+                    (const void *)(uintptr_t)iov[i].base,
+                    (size_t)chunk);
+                req->length += chunk;
+            }
+            if (chunk != iov[i].len) break;
         }
         lpr_scm_send_transaction_t transaction;
         const int prepare = lpr_scm_prepare_send(msg, &transaction);

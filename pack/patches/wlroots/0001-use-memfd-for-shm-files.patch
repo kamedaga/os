@@ -11,8 +11,8 @@ from upgrading the descriptor they receive.
  include/util/shm.h          |  2 +-
  types/wlr_keyboard.c        | 15 +++----------
  types/wlr_linux_dmabuf_v1.c | 17 +++------------
- util/shm.c                  | 95 +++++++++++++++++----------------------------
- 4 files changed, 43 insertions(+), 86 deletions(-)
+ util/shm.c                  | 85 +++++++++++++++++------------------------
+ 4 files changed, 41 insertions(+), 76 deletions(-)
 
 diff --git a/include/util/shm.h b/include/util/shm.h
 index 3beabca..e13f34a 100644
@@ -89,7 +89,9 @@ diff --git a/util/shm.c b/util/shm.c
 index 5eb87bb..8c6a2be 100644
 --- a/util/shm.c
 +++ b/util/shm.c
-@@ -1,48 +1,16 @@
+@@ -1,48 +1,18 @@
++#define _GNU_SOURCE
++
  #include <errno.h>
  #include <fcntl.h>
 -#include <string.h>

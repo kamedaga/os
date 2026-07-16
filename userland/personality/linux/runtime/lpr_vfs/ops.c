@@ -594,6 +594,7 @@ static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
         LPR_LINUX_O_ACCMODE |
         LPR_LINUX_O_APPEND |
         LPR_LINUX_O_NONBLOCK |
+        LPR_LINUX_O_LARGEFILE |
         LPR_LINUX_O_CLOEXEC;
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
