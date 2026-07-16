@@ -1127,9 +1127,36 @@ pub const RegionFreeRange = struct {
 pub const FreePageList = struct {
     pub const max_ranges = 65536;
 
+    lock_word: u8 = 0,
     len: usize = 0,
     ranges: [max_ranges]RegionFreeRange = undefined,
     range_len: usize = 0,
+
+    fn lock(self: *const FreePageList) void {
+        const word = @constCast(&self.lock_word);
+        while (true) {
+            if (@cmpxchgWeak(u8, word, 0, 1, .acquire, .monotonic) == null) return;
+            while (@atomicLoad(u8, word, .monotonic) != 0) {
+                asm volatile ("pause");
+            }
+        }
+    }
+
+    fn unlock(self: *const FreePageList) void {
+        @atomicStore(u8, @constCast(&self.lock_word), 0, .release);
+    }
+
+    pub fn pageCount(self: *const FreePageList) usize {
+        self.lock();
+        defer self.unlock();
+        return self.len;
+    }
+
+    pub fn rangeCount(self: *const FreePageList) usize {
+        self.lock();
+        defer self.unlock();
+        return self.range_len;
+    }
 
     fn rangeEnd(range: *const RegionFreeRange) u64 {
         return range.physical_start + (@as(u64, @intCast(range.len)) * 4096);
@@ -1156,6 +1183,8 @@ pub const FreePageList = struct {
     }
 
     pub fn appendPage(self: *FreePageList, region_id: u64, paddr: u64) KernelError!void {
+        self.lock();
+        defer self.unlock();
         const page_end = paddr + 4096;
         var extend_before: ?usize = null;
         var extend_after: ?usize = null;
@@ -1206,6 +1235,8 @@ pub const FreePageList = struct {
         physical_start: u64,
         page_count: usize,
     ) KernelError!void {
+        self.lock();
+        defer self.unlock();
         if (page_count == 0) return;
         const byte_len = @as(u64, @intCast(page_count)) * 4096;
         const physical_end = physical_start + byte_len;
@@ -1252,6 +1283,8 @@ pub const FreePageList = struct {
     }
 
     pub fn canAppendPage(self: *const FreePageList, region_id: u64, paddr: u64) bool {
+        self.lock();
+        defer self.unlock();
         const page_end = paddr + 4096;
         var i: usize = 0;
         while (i < self.range_len) : (i += 1) {
@@ -1266,6 +1299,8 @@ pub const FreePageList = struct {
     }
 
     pub fn popFront(self: *FreePageList) KernelError!u64 {
+        self.lock();
+        defer self.unlock();
         if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
         const first = &self.ranges[0];
@@ -1286,6 +1321,8 @@ pub const FreePageList = struct {
     }
 
     pub fn popFrontBelow(self: *FreePageList, limit_exclusive: u64) KernelError!u64 {
+        self.lock();
+        defer self.unlock();
         if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
         var range_index: usize = 0;
@@ -1314,6 +1351,8 @@ pub const FreePageList = struct {
     }
 
     pub fn popFrontAtOrAbove(self: *FreePageList, min_inclusive: u64) KernelError!u64 {
+        self.lock();
+        defer self.unlock();
         if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
         var range_index: usize = 0;
@@ -1367,6 +1406,8 @@ pub const FreePageList = struct {
     }
 
     pub fn popBack(self: *FreePageList) KernelError!u64 {
+        self.lock();
+        defer self.unlock();
         if (self.len == 0 or self.range_len == 0) return KernelError.OutOfFreePages;
 
         const last = &self.ranges[self.range_len - 1];
@@ -1386,6 +1427,8 @@ pub const FreePageList = struct {
         page_count: usize,
         min_inclusive: u64,
     ) KernelError!u64 {
+        self.lock();
+        defer self.unlock();
         if (page_count == 0) return KernelError.InvalidState;
         if (self.len < page_count or self.range_len == 0) return KernelError.OutOfFreePages;
 
@@ -1436,6 +1479,8 @@ pub const FreePageList = struct {
         page_count: usize,
         limit_exclusive: u64,
     ) KernelError!u64 {
+        self.lock();
+        defer self.unlock();
         if (page_count == 0) return KernelError.InvalidState;
         if (self.len < page_count or self.range_len == 0) return KernelError.OutOfFreePages;
         const size_bytes = @as(u64, @intCast(page_count)) * 4096;

@@ -347,6 +347,7 @@ fn initMemoryModules() void {
 
 pub fn prepareLimineKernelStorageOrHalt() void {
     kernel_runtime.global_free_list = &limine_free_list_storage;
+    kernel_runtime.global_free_list.lock_word = 0;
     kernel_runtime.global_free_list.len = 0;
     kernel_runtime.global_free_list.range_len = 0;
 

@@ -66,6 +66,7 @@ pub const MemoryCollector = struct {
         user_spaces_end: u64,
     ) ?MemoryCollector {
         const h = hooks orelse return null;
+        free_list.lock_word = 0;
         free_list.len = 0;
         free_list.range_len = 0;
 

@@ -298,8 +298,8 @@ pub fn debugLogMemoryOwnership(
 
     write("Kernel.mem_diag where=");
     write(where);
-    @TypeOf(self.*).debugWriteField(write, print_number, "free_pages", @intCast(free_list.len));
-    @TypeOf(self.*).debugWriteField(write, print_number, "free_ranges", @intCast(free_list.range_len));
+    @TypeOf(self.*).debugWriteField(write, print_number, "free_pages", @intCast(free_list.pageCount()));
+    @TypeOf(self.*).debugWriteField(write, print_number, "free_ranges", @intCast(free_list.rangeCount()));
     @TypeOf(self.*).debugWriteField(write, print_number, "process_capacity", @intCast(self.process_capacity));
     @TypeOf(self.*).debugWriteField(write, print_number, "active_processes", active_total);
     @TypeOf(self.*).debugWriteField(write, print_number, "tracked_active", @intCast(self.active_process_count));
