@@ -309,6 +309,7 @@ static int lpr_dma_buf_sync_flags_valid(uint32_t flags)
 int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
     lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(fd);
+    const uint32_t command = (uint32_t)request;
     if (dmabuf == 0) return -LPR_LINUX_EBADF;
     if (arg == 0) return -LPR_LINUX_EFAULT;
     lpr_dma_buf_sync_file_t *sync =
@@ -316,13 +317,13 @@ int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     if (!lpr_dma_buf_sync_flags_valid(sync->flags))
         return -LPR_LINUX_EINVAL;
 
-    if (request == LPR_LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE) {
+    if (command == (uint32_t)LPR_LINUX_DMA_BUF_IOCTL_EXPORT_SYNC_FILE) {
         const int64_t sync_fd = lpr_sync_file_create_signaled();
         if (sync_fd < 0) return sync_fd;
         sync->fd = (int32_t)sync_fd;
         return 0;
     }
-    if (request != LPR_LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
+    if (command != (uint32_t)LPR_LINUX_DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
         return -LPR_LINUX_ENOTTY;
     if (sync->fd < 0 ||
         !lpr_linux_sync_file_fd_active((uint64_t)(uint32_t)sync->fd))

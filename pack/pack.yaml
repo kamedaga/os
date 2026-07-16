@@ -158,6 +158,7 @@ apps:
         - "tools/build_wsl_alpine_input.sh"
         - "tools/copy_lpr_linux_musl.sh"
         - "pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
+        - "pack/patches/wlroots/0002-explicit-render-fences.patch"
     out: "SWAYROOT"
     rootfs: "/"
   pacha_user_session:

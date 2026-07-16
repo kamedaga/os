@@ -242,9 +242,14 @@ wlroots_source="${tmp}/wlroots-source"
 mkdir -p "${wlroots_source}"
 git -C "${wlroots_git}" archive "${wlroots_commit}" | tar -x -C "${wlroots_source}"
 GIT_CEILING_DIRECTORIES="${repo_root}/.artifacts" git -C "${wlroots_source}" apply \
-  "${repo_root}/pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
+  "${repo_root}/pack/patches/wlroots/0001-use-memfd-for-shm-files.patch" \
+  "${repo_root}/pack/patches/wlroots/0002-explicit-render-fences.patch"
 /usr/bin/grep -Fq 'memfd_create("wlroots-shm"' "${wlroots_source}/util/shm.c" || {
   echo "wlroots sealed-memfd patch was not applied to the extracted source" >&2
+  exit 1
+}
+/usr/bin/grep -Fq 'wlr_buffer_set_acquire_fence' "${wlroots_source}/render/gles2/pass.c" || {
+  echo "wlroots render-fence patch was not applied to the extracted source" >&2
   exit 1
 }
 
