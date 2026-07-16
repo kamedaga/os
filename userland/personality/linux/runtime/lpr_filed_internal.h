@@ -394,6 +394,7 @@ typedef struct lpr_signal_thread_state {
 } lpr_signal_thread_state_t;
 
 enum { LPR_SIGNAL_THREAD_SLOT_COUNT = 256 };
+enum { LPR_SIGNAL_THREAD_CHUNK_SLOT_COUNT = 63 };
 
 typedef struct lpr_signal_thread_slot {
     volatile uint32_t tid;
@@ -401,10 +402,18 @@ typedef struct lpr_signal_thread_slot {
     lpr_signal_thread_state_t state;
 } lpr_signal_thread_slot_t;
 
+typedef struct lpr_signal_thread_chunk {
+    struct lpr_signal_thread_chunk *next;
+    lpr_signal_thread_slot_t slots[LPR_SIGNAL_THREAD_CHUNK_SLOT_COUNT];
+} lpr_signal_thread_chunk_t;
+
 typedef struct lpr_signal_state {
     lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
     uint32_t runtime_registered;
+    volatile uint32_t grow_lock_word;
+    uint32_t start_reservations;
     uint32_t reserved0;
+    lpr_signal_thread_chunk_t *overflow_head;
     lpr_signal_thread_slot_t threads[LPR_SIGNAL_THREAD_SLOT_COUNT];
 } lpr_signal_state_t;
 
@@ -501,6 +510,9 @@ typedef struct lpr_state {
 
 extern lpr_state_t lpr_state;
 lpr_signal_thread_state_t *lpr_signal_thread_state_current(void);
+int lpr_signal_thread_reserve_start(void);
+void lpr_signal_thread_release_start_reservation(void);
+void lpr_signal_thread_state_prepare_current(void);
 void lpr_signal_thread_state_release_current(void);
 void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_control_fd_table (lpr_state.fd_table)

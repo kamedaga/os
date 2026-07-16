@@ -139,6 +139,7 @@ static int lpr_signal_sp_on_altstack(uint64_t rsp)
 
 void lpr_linux_signal_runtime_init(void)
 {
+    lpr_signal_thread_state_prepare_current();
     if (lpr_linux_signal_runtime_registered) {
         return;
     }

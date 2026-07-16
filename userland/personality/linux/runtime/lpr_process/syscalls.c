@@ -335,6 +335,10 @@ static int64_t lpr_linux_clone_thread(
     if (ensure_status != 0) {
         return ensure_status;
     }
+    const int signal_reservation_status = lpr_signal_thread_reserve_start();
+    if (signal_reservation_status != 0) {
+        return signal_reservation_status;
+    }
 
     const uint64_t launch_stack =
         (child_stack - sizeof(lpr_thread_record_t)) & ~0xfull;
@@ -362,6 +366,7 @@ static int64_t lpr_linux_clone_thread(
         tls,
         thread_rights);
     if (thread_fd < 16) {
+        lpr_signal_thread_release_start_reservation();
         return lpr_pacha_status_to_errno(thread_fd);
     }
 
@@ -379,6 +384,7 @@ static int64_t lpr_linux_clone_thread(
         (void)lpr_thread_record_remove(record);
         lpr_state_unlock(&lpr_state.threads.lock_word);
         lpr_thread_count_start_failed();
+        lpr_signal_thread_release_start_reservation();
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE,
             (uint64_t)(uint32_t)thread_fd);
