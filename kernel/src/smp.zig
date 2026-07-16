@@ -35,7 +35,7 @@ pub const BootInfo = struct {
 var observed_cpu_count: u32 = 1;
 var ap_started: [max_cpus]u32 = [_]u32{0} ** max_cpus;
 var cpu_states: [max_cpus]u32 = [_]u32{cpu_state_absent} ** max_cpus;
-var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
+pub export var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
 var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
@@ -86,12 +86,12 @@ fn stateFromRaw(raw: u32) CpuState {
 }
 
 pub fn cpuCount() usize {
-    return @intCast((@as(*volatile u32, @ptrCast(&observed_cpu_count))).*);
+    return @intCast(@atomicLoad(u32, &observed_cpu_count, .acquire));
 }
 
 pub fn cpuState(cpu_slot: usize) CpuState {
     if (cpu_slot >= max_cpus) return .absent;
-    return stateFromRaw(cpuStatePtr(cpu_slot).*);
+    return stateFromRaw(@atomicLoad(u32, &cpu_states[cpu_slot], .acquire));
 }
 
 pub fn cpuInfo(cpu_slot: usize) ?CpuInfo {
@@ -127,6 +127,70 @@ pub fn isCpuIdle(cpu_slot: usize) bool {
     return cpuState(cpu_slot) == .idle;
 }
 
+fn readU32(addr: u64) u32 {
+    const p: [*]const u8 = @ptrFromInt(addr);
+    return @as(u32, p[0]) |
+        (@as(u32, p[1]) << 8) |
+        (@as(u32, p[2]) << 16) |
+        (@as(u32, p[3]) << 24);
+}
+
+fn readU64(addr: u64) u64 {
+    return @as(u64, readU32(addr)) | (@as(u64, readU32(addr + 4)) << 32);
+}
+
+fn bytesEqual(addr: u64, expected: []const u8) bool {
+    const p: [*]const u8 = @ptrFromInt(addr);
+    var i: usize = 0;
+    while (i < expected.len) : (i += 1) {
+        if (p[i] != expected[i]) return false;
+    }
+    return true;
+}
+
+fn checksumOk(addr: u64, len: usize) bool {
+    const p: [*]const u8 = @ptrFromInt(addr);
+    var sum: u8 = 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) sum +%= p[i];
+    return sum == 0;
+}
+
+fn tableLength(addr: u64) usize {
+    return @intCast(readU32(addr + 4));
+}
+
+fn findMadtFromRoot(root_addr: u64, xsdt: bool) ?u64 {
+    if (!bytesEqual(root_addr, if (xsdt) "XSDT" else "RSDT")) return null;
+    const len = tableLength(root_addr);
+    if (len < 36 or !checksumOk(root_addr, len)) return null;
+    const entry_size: usize = if (xsdt) 8 else 4;
+    var off: usize = 36;
+    while (off + entry_size <= len) : (off += entry_size) {
+        const table_addr = if (xsdt)
+            readU64(root_addr + off)
+        else
+            @as(u64, readU32(root_addr + off));
+        if (table_addr != 0 and bytesEqual(table_addr, "APIC")) return table_addr;
+    }
+    return null;
+}
+
+fn findMadt(rsdp: u64) ?u64 {
+    if (rsdp == 0 or !bytesEqual(rsdp, "RSD PTR ") or !checksumOk(rsdp, 20)) return null;
+    const revision = (@as([*]const u8, @ptrFromInt(rsdp)))[15];
+    if (revision >= 2) {
+        const len = readU32(rsdp + 20);
+        const xsdt_addr = readU64(rsdp + 24);
+        if (len >= 36 and xsdt_addr != 0 and checksumOk(rsdp, @intCast(len))) {
+            if (findMadtFromRoot(xsdt_addr, true)) |madt| return madt;
+        }
+    }
+    const rsdt_addr = readU32(rsdp + 16);
+    if (rsdt_addr == 0) return null;
+    return findMadtFromRoot(rsdt_addr, false);
+}
+
 fn appendLapicId(info: *BootInfo, id: u8) void {
     var i: usize = 0;
     while (i < info.lapic_count) : (i += 1) {
@@ -135,6 +199,43 @@ fn appendLapicId(info: *BootInfo, id: u8) void {
     if (info.lapic_count >= max_cpus) return;
     info.lapic_ids[info.lapic_count] = id;
     info.lapic_count += 1;
+}
+
+fn collectMadtLapicIds(info: *BootInfo, rsdp: u64) bool {
+    const madt = findMadt(rsdp) orelse return false;
+    const len = tableLength(madt);
+    if (len < 44 or !checksumOk(madt, len)) return false;
+    var off: usize = 44;
+    while (off + 2 <= len) {
+        const entry_addr = madt + off;
+        const entry_type = (@as([*]const u8, @ptrFromInt(entry_addr)))[0];
+        const entry_len = (@as([*]const u8, @ptrFromInt(entry_addr)))[1];
+        if (entry_len < 2 or off + entry_len > len) return false;
+        switch (entry_type) {
+            0 => if (entry_len >= 8 and (readU32(entry_addr + 4) & 0x1) != 0) {
+                appendLapicId(info, (@as([*]const u8, @ptrFromInt(entry_addr)))[3]);
+            },
+            9 => if (entry_len >= 16 and (readU32(entry_addr + 4) & 0x1) != 0) {
+                const x2apic_id = readU32(entry_addr + 8);
+                if (x2apic_id <= std.math.maxInt(u8)) appendLapicId(info, @intCast(x2apic_id));
+            },
+            else => {},
+        }
+        off += entry_len;
+    }
+    return info.lapic_count != 0;
+}
+
+pub fn prepareBootInfo(rsdp: u64, trampoline_base: u64) ?BootInfo {
+    const trampoline_bytes = @as(u64, @intCast(max_cpus * trampoline_page_bytes));
+    if (trampoline_base == 0 or (trampoline_base & 0xFFF) != 0 or
+        trampoline_base +| trampoline_bytes > 0x100000)
+    {
+        return null;
+    }
+    var info = BootInfo{ .trampoline_base = trampoline_base };
+    if (!collectMadtLapicIds(&info, rsdp)) return null;
+    return info;
 }
 
 fn emit8(page: [*]u8, off: *usize, value: u8) void {
@@ -242,7 +343,7 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     emit8(page, &off, 0x0F);
     emit8(page, &off, 0x32); // rdmsr
     emit8(page, &off, 0x0D);
-    emit32(page, &off, 0x00000100); // or eax, LME
+    emit32(page, &off, 0x00000900); // or eax, LME | NXE
     emit8(page, &off, 0x0F);
     emit8(page, &off, 0x30); // wrmsr
     emit8(page, &off, 0x0F);
@@ -275,9 +376,8 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     emit8(page, &off, 0xE0);
     emit8(page, &off, 0xFB); // and rax, ~EM
     emit8(page, &off, 0x48);
-    emit8(page, &off, 0x83);
-    emit8(page, &off, 0xC8);
-    emit8(page, &off, 0x02); // or rax, MP
+    emit8(page, &off, 0x0D);
+    emit32(page, &off, 0x00010002); // or rax, WP | MP
     emit8(page, &off, 0x0F);
     emit8(page, &off, 0x22);
     emit8(page, &off, 0xC0); // mov cr0, rax
@@ -317,62 +417,50 @@ fn buildTrampoline(base: u64, cr3: u64, stack_top: u64, cpu_slot: usize, entry: 
     return @intCast(base >> 12);
 }
 
-fn apStartedPtr(cpu_slot: usize) *volatile u32 {
-    return @ptrCast(&ap_started[cpu_slot]);
-}
-
-fn cpuStatePtr(cpu_slot: usize) *volatile u32 {
-    return @ptrCast(&cpu_states[cpu_slot]);
-}
-
 fn runtimeLapicIdPtr(cpu_slot: usize) *volatile u8 {
     return @ptrCast(&runtime_lapic_ids[cpu_slot]);
 }
 
 fn markStarted(cpu_slot: usize) void {
-    apStartedPtr(cpu_slot).* = 1;
+    @atomicStore(u32, &ap_started[cpu_slot], 1, .release);
 }
 
 fn isStarted(cpu_slot: usize) bool {
-    return apStartedPtr(cpu_slot).* != 0;
+    return @atomicLoad(u32, &ap_started[cpu_slot], .acquire) != 0;
 }
 
-pub fn markBootstrapCpuReady() void {
-    observed_cpu_count = 1;
-    runtimeLapicIdPtr(0).* = lapic.localApicId();
-    cpuStatePtr(0).* = cpu_state_idle;
-    apStartedPtr(0).* = 1;
+fn setCpuState(cpu_slot: usize, state: CpuState) void {
+    @atomicStore(u32, &cpu_states[cpu_slot], @intFromEnum(state), .release);
 }
 
-pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
+pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
     if (info.trampoline_base == 0) {
-        markBootstrapCpuReady();
-        return;
+        return false;
     }
     if (info.lapic_count == 0) {
         appendLapicId(info, lapic.localApicId());
     }
     const bsp_id = lapic.localApicId();
-    observed_cpu_count = if (info.lapic_count == 0) 1 else info.lapic_count;
+    @atomicStore(u32, &observed_cpu_count, if (info.lapic_count == 0) 1 else info.lapic_count, .release);
     runtimeLapicIdPtr(0).* = bsp_id;
-    cpuStatePtr(0).* = cpu_state_idle;
-    apStartedPtr(0).* = 1;
+    setCpuState(0, .idle);
+    markStarted(0);
 
     var cpu_slot: usize = 1;
     var i: usize = 0;
     while (i < info.lapic_count and cpu_slot < max_cpus) : (i += 1) {
         const apic_id = info.lapic_ids[i];
         if (apic_id == bsp_id) continue;
-        apStartedPtr(cpu_slot).* = 0;
+        @atomicStore(u32, &ap_started[cpu_slot], 0, .release);
         runtimeLapicIdPtr(cpu_slot).* = 0xFF;
-        cpuStatePtr(cpu_slot).* = cpu_state_booting;
+        setCpuState(cpu_slot, .booting);
         if (!x86_platform.mapCpuRuntimeStacks(cpu_slot)) {
-            cpu_slot += 1;
-            continue;
+            setCpuState(cpu_slot, .absent);
+            return false;
         }
         const stack_top = x86_platform.cpuKernelStackTop(cpu_slot) orelse {
-            cpu_slot += 1;
-            continue;
+            setCpuState(cpu_slot, .absent);
+            return false;
         };
         const trampoline_base = info.trampoline_base + (@as(u64, @intCast(cpu_slot)) * trampoline_page_bytes);
         const vector = buildTrampoline(
@@ -382,25 +470,30 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) void {
             cpu_slot,
             @intFromPtr(&apIdleEntry),
         ) orelse {
-            cpu_slot += 1;
-            continue;
+            setCpuState(cpu_slot, .absent);
+            return false;
         };
         if (!lapic.sendInitSipi(apic_id, vector)) {
-            cpu_slot += 1;
-            continue;
+            setCpuState(cpu_slot, .absent);
+            return false;
         }
         var spins: u32 = 0;
         while (!isStarted(cpu_slot) and spins < 10000000) : (spins += 1) {
             asm volatile ("pause");
         }
+        if (!isStarted(cpu_slot) or cpuState(cpu_slot) != .idle) {
+            setCpuState(cpu_slot, .absent);
+            return false;
+        }
         cpu_slot += 1;
     }
+    return cpu_slot == info.lapic_count;
 }
 
 fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     asm volatile ("cli");
     if (!x86_platform.loadGdtAndReloadSegmentsForCpu(cpu_slot)) {
-        cpuStatePtr(cpu_slot).* = cpu_state_absent;
+        setCpuState(cpu_slot, .absent);
         markStarted(cpu_slot);
         while (true) asm volatile ("hlt");
     }
@@ -412,7 +505,7 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     _ = x86_platform.enablePkuIfSupported();
     _ = lapic.enableLocalApic();
     runtimeLapicIdPtr(cpu_slot).* = lapic.localApicId();
-    cpuStatePtr(cpu_slot).* = cpu_state_idle;
+    setCpuState(cpu_slot, .idle);
     markStarted(cpu_slot);
     apIdleLoop(cpu_slot);
 }
@@ -420,16 +513,22 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {
     const cpu_slot = currentCpuSlot();
     x86_platform.writeCr3(x86_platform.kernel_cr3_value);
-    cpuStatePtr(cpu_slot).* = cpu_state_idle;
+    setCpuState(cpu_slot, .idle);
     apIdleLoop(cpu_slot);
 }
 
 pub fn wakeCpu(cpu_slot: usize) bool {
-    if (cpu_slot == 0 or cpu_slot >= runtime_lapic_ids.len) return false;
+    return interruptCpu(cpu_slot);
+}
+
+/// Deliver the scheduler/wake vector to any online CPU, including the BSP.
+/// The vector also carries kernel-internal cross-CPU maintenance requests.
+pub fn interruptCpu(cpu_slot: usize) bool {
+    if (cpu_slot >= runtime_lapic_ids.len) return false;
     const apic_id = runtime_lapic_ids[cpu_slot];
     if (apic_id == 0xFF) return false;
     if (cpuState(cpu_slot) == .absent) return false;
-    if (wake_ipi_vector == 0) return true;
+    if (wake_ipi_vector == 0) return false;
     return lapic.sendFixedIpi(apic_id, wake_ipi_vector);
 }
 
@@ -439,7 +538,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
         scheduler_observer.pollIdleScheduler(cpu_slot);
         var user_entry: scheduler_observer.UserEntry = undefined;
         if (scheduler_observer.claimIdleUserEntry(cpu_slot, &user_entry)) {
-            cpuStatePtr(cpu_slot).* = cpu_state_user;
+            setCpuState(cpu_slot, .user);
             enterUserModeFromIdle(&user_entry);
         }
         asm volatile ("sti; hlt; cli" ::: .{ .memory = true });

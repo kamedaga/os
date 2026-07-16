@@ -180,6 +180,7 @@ fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.P
     const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
     var handoff_target: ?kernel.ThreadWakeTarget = null;
     for (wake_targets[0..wake_count]) |target| {
+        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
         if (target.pollfd_va != 0) {
             _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
         }
@@ -193,6 +194,7 @@ fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.P
 
 fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) void {
     for (targets) |target| {
+        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
         if (target.pollfd_va != 0) {
             _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
         }
@@ -400,13 +402,19 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         kernel.KernelError.TableFull => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };
-    state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
-        kernel.KernelError.TableFull => sc.syscall_err_alloc,
-        else => sc.syscall_err_invalid,
-    };
-    const protect_status = writeProtectForkCowVmas(state, proc);
-    if (protect_status != sc.syscall_ok) return protect_status;
-    if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
+    // VMA metadata and the shared native-COW pool form one VM transaction.
+    // Page faults on other CPUs use the same address-space lock.
+    {
+        user_vm.lockAddressSpaces();
+        defer user_vm.unlockAddressSpaces();
+        state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
+            kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
+        const protect_status = writeProtectForkCowVmas(state, proc);
+        if (protect_status != sc.syscall_ok) return protect_status;
+        if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
+    }
 
     const child_frame = if ((frame.rsi & process_abi.process_clone_flag_user_frame) != 0)
         cloneUserFrameFromVa(h, proc, frame.rdx, frame) orelse return sc.syscall_err_invalid
@@ -942,11 +950,15 @@ fn execFromStagedProcess(
         staged_owner,
     ) orelse return sc.syscall_err_invalid;
 
-    if (!user_vm.cloneAddressSpaceMetadataForFork(staged_owner, proc)) return sc.syscall_err_map;
-    state.replaceVmaTableForExec(proc, staged_owner, h.free_list) catch |err| return switch (err) {
-        kernel.KernelError.TableFull => sc.syscall_err_alloc,
-        else => sc.syscall_err_invalid,
-    };
+    {
+        user_vm.lockAddressSpaces();
+        defer user_vm.unlockAddressSpaces();
+        if (!user_vm.cloneAddressSpaceMetadataForFork(staged_owner, proc)) return sc.syscall_err_map;
+        state.replaceVmaTableForExec(proc, staged_owner, h.free_list) catch |err| return switch (err) {
+            kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
+    }
 
     cleanupProcess(h, state, staged_owner, .exited, 0);
     closeCloexecFdsWithPipeWakes(h, state, proc) catch return sc.syscall_err_invalid;

@@ -9,14 +9,57 @@ const kernel_vm = kernel_api.kernel_vm;
 const boot_static = kernel_api.boot_static;
 const limine = @import("protocol.zig");
 const image_range = kernel_api.image_range;
+const x86_platform = kernel_api.x86_platform;
 
 pub const Requests = struct {
     hhdm: *limine.HhdmRequest,
     framebuffer: *limine.FramebufferRequest,
     memmap: *limine.MemmapRequest,
     module: *limine.ModuleRequest,
+    rsdp: *limine.RsdpRequest,
     executable_address: *limine.ExecutableAddressRequest,
 };
+
+const low_memory_limit: u64 = 0x100000;
+const page_bytes: u64 = 4096;
+const kernel_identity_limit: u64 =
+    @as(u64, @intCast(x86_platform.pd_table_count * x86_platform.page_entries)) * x86_platform.two_mib;
+
+pub fn smpBootResourcesOrHalt(requests: Requests) entry.LimineSmpResources {
+    const rsdp = requests.rsdp.response orelse {
+        halt.haltWithMessage("Limine RSDP response missing");
+    };
+    const rsdp_paddr = rsdp.address;
+    if (rsdp_paddr == 0 or rsdp_paddr >= kernel_identity_limit) {
+        halt.haltWithMessage("Limine RSDP physical address unsupported");
+    }
+    const memmap = requests.memmap.response orelse {
+        halt.haltWithMessage("Limine memory map response missing");
+    };
+    const required_bytes = @as(u64, @intCast(x86_platform.max_cpus)) * page_bytes;
+    var trampoline_base: u64 = 0;
+    var i: u64 = 0;
+    while (i < memmap.entry_count) : (i += 1) {
+        const item = memmap.entries[@intCast(i)] orelse continue;
+        if (item.kind != .usable or item.base >= low_memory_limit) continue;
+        const raw_end = item.base +| item.length;
+        const region_end = @min(raw_end, low_memory_limit) & ~(page_bytes - 1);
+        const region_start = @max(item.base, page_bytes);
+        const aligned_start = (region_start + (page_bytes - 1)) & ~(page_bytes - 1);
+        if (region_end < required_bytes) continue;
+        const candidate = region_end - required_bytes;
+        if (candidate >= aligned_start and candidate > trampoline_base) {
+            trampoline_base = candidate;
+        }
+    }
+    if (trampoline_base == 0) {
+        halt.haltWithMessage("Limine SMP trampoline memory unavailable");
+    }
+    return .{
+        .rsdp_paddr = rsdp_paddr,
+        .trampoline_base = trampoline_base,
+    };
+}
 
 fn cstrEq(value: [*:0]const u8, expected: []const u8) bool {
     return std.mem.eql(u8, std.mem.span(value), expected);

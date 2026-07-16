@@ -27,6 +27,7 @@ pub const Hooks = struct {
     copy_user_bytes_from_va: *const fn (kernel.PrincipalId, u64, []u8) bool,
     copy_bytes_to_user_va: *const fn (kernel.PrincipalId, u64, []const u8) bool,
     wake_waiting_thread_for_principal: *const fn (kernel.PrincipalId) void,
+    thread_wake_target_is_live: *const fn (usize, u32, kernel.PrincipalId) bool,
     wake_waiting_thread_generation: *const fn (usize, u32) bool,
     wake_waiting_thread_generation_with_rax: *const fn (usize, u32, u64) bool,
     wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
@@ -43,11 +44,18 @@ var syscall_hooks_ready = false;
 const KernelStateSpinLock = struct {
     value: u8 = 0,
 
+    fn waitWithInterruptWindow() void {
+        // Syscalls enter with IF clear.  A CPU waiting for the global state
+        // lock must still be able to acknowledge IPIs (notably a TLB
+        // shootdown issued by the lock owner).
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+    }
+
     fn lock(self: *KernelStateSpinLock) void {
         while (true) {
             if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
             while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
-                asm volatile ("pause");
+                waitWithInterruptWindow();
             }
         }
     }

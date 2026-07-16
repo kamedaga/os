@@ -1,5 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
+const scheduler = @import("scheduler.zig").connection;
+const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
 
 pub const Hooks = struct {
@@ -57,6 +59,39 @@ const PhysCopyWindowLock = struct {
 
 var phys_copy_window_lock: PhysCopyWindowLock = .{};
 
+const TlbShootdownLock = struct {
+    value: u8 = 0,
+
+    fn interruptsEnabled() bool {
+        var flags: u64 = 0;
+        asm volatile (
+            \\pushfq
+            \\pop %[flags]
+            : [flags] "=r" (flags),
+        );
+        return (flags & (1 << 9)) != 0;
+    }
+
+    fn lock(self: *TlbShootdownLock) void {
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
+                // A competing initiator may be waiting for this CPU's ack.
+                asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+            }
+        }
+    }
+
+    fn unlock(self: *TlbShootdownLock) void {
+        @atomicStore(u8, &self.value, 0, .release);
+    }
+};
+
+var tlb_shootdown_lock: TlbShootdownLock = .{};
+var tlb_shootdown_target_cr3: u64 = 0;
+var tlb_shootdown_generation: u64 = 0;
+var tlb_shootdown_ack: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
+
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
 }
@@ -70,6 +105,10 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_storage), &user_copy_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_ready), &user_copy_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(phys_copy_window_lock), &phys_copy_window_lock));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_lock), &tlb_shootdown_lock));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_target_cr3), &tlb_shootdown_target_cr3));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_generation), &tlb_shootdown_generation));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_ack), &tlb_shootdown_ack));
     return end;
 }
 
@@ -77,6 +116,10 @@ pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) 
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_storage), @sizeOf(@TypeOf(user_copy_hooks_storage)))) return false;
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_ready), @sizeOf(@TypeOf(user_copy_hooks_ready)))) return false;
     if (!map_identity_range(@intFromPtr(&phys_copy_window_lock), @sizeOf(@TypeOf(phys_copy_window_lock)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_lock), @sizeOf(@TypeOf(tlb_shootdown_lock)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_target_cr3), @sizeOf(@TypeOf(tlb_shootdown_target_cr3)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_generation), @sizeOf(@TypeOf(tlb_shootdown_generation)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_ack), @sizeOf(@TypeOf(tlb_shootdown_ack)))) return false;
     return true;
 }
 
@@ -324,40 +367,73 @@ pub fn readUserU64(principal: kernel.PrincipalId, src_user_va: u64) ?u64 {
     return std.mem.readInt(u64, buf[0..], .little);
 }
 
-pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
+fn flushCr3ContextOnCurrentCpu(target_cr3: u64) void {
     const h = getHooks();
-    if (target_cr3 == 0) return;
     const current_cr3 = h.read_cr3();
-    if (current_cr3 == target_cr3) {
-        h.invlpg(va);
-        return;
+    h.write_cr3(target_cr3);
+    if (current_cr3 != target_cr3) h.write_cr3(current_cr3);
+}
+
+/// Called from the scheduler IPI with the kernel page table active.
+pub fn acknowledgePendingTlbShootdown() void {
+    const cpu_slot = smp.currentCpuSlot();
+    if (cpu_slot >= tlb_shootdown_ack.len) return;
+    const generation = @atomicLoad(u64, &tlb_shootdown_generation, .acquire);
+    if (generation == 0 or @atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .monotonic) == generation) return;
+    const target_cr3 = @atomicLoad(u64, &tlb_shootdown_target_cr3, .monotonic);
+    if (target_cr3 != 0) flushCr3ContextOnCurrentCpu(target_cr3);
+    @atomicStore(u64, &tlb_shootdown_ack[cpu_slot], generation, .release);
+}
+
+fn shootdownCr3Context(target_cr3: u64) void {
+    if (target_cr3 == 0) return;
+    const restore_interrupts = TlbShootdownLock.interruptsEnabled();
+    defer if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
+    asm volatile ("cli" ::: .{ .memory = true });
+    tlb_shootdown_lock.lock();
+    defer tlb_shootdown_lock.unlock();
+
+    const target_cpu_mask = scheduler.cpuMaskRunningCr3(target_cr3);
+
+    var generation = @atomicLoad(u64, &tlb_shootdown_generation, .monotonic) +% 1;
+    if (generation == 0) generation = 1;
+    @atomicStore(u64, &tlb_shootdown_target_cr3, target_cr3, .monotonic);
+    @atomicStore(u64, &tlb_shootdown_generation, generation, .release);
+
+    const current_cpu = smp.currentCpuSlot();
+    flushCr3ContextOnCurrentCpu(target_cr3);
+    if (current_cpu < tlb_shootdown_ack.len) {
+        @atomicStore(u64, &tlb_shootdown_ack[current_cpu], generation, .release);
     }
 
-    h.write_cr3(target_cr3);
-    h.invlpg(va);
-    h.write_cr3(current_cr3);
+    var cpu_slot: usize = 0;
+    while (cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
+        const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;
+        if (!targeted or cpu_slot == current_cpu) continue;
+        while (!smp.interruptCpu(cpu_slot)) {
+            asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+        }
+    }
+
+    cpu_slot = 0;
+    while (cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
+        const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;
+        if (!targeted or cpu_slot == current_cpu) continue;
+        while (@atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .acquire) != generation) {
+            asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+        }
+    }
+}
+
+pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
+    _ = va;
+    shootdownCr3Context(target_cr3);
 }
 
 pub fn flushTlbForCr3Range(target_cr3: u64, va: u64, size_bytes: usize) void {
-    const h = getHooks();
-    if (target_cr3 == 0 or size_bytes == 0) return;
-    const page_count = (size_bytes + 4095) / 4096;
-    if (page_count <= 4) {
-        var offset: usize = 0;
-        while (offset < size_bytes) : (offset += 4096) {
-            flushTlbForCr3Va(target_cr3, va + @as(u64, @intCast(offset)));
-        }
-        return;
-    }
-
-    const current_cr3 = h.read_cr3();
-    if (current_cr3 == target_cr3) {
-        h.write_cr3(current_cr3);
-        return;
-    }
-
-    h.write_cr3(target_cr3);
-    h.write_cr3(current_cr3);
+    _ = va;
+    if (size_bytes == 0) return;
+    shootdownCr3Context(target_cr3);
 }
 
 pub fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {

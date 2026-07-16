@@ -140,6 +140,7 @@ fn wakeIpcWaitersForSendFd(
     var wake_storage: [max_ipc_wake_threads]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.wakeIpcWaitersForSendFd(proc, fd, wake_storage[0..]) catch return false;
     for (wake_storage[0..wake_count]) |target| {
+        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
         if (target.hint_only) {
             if (handoff_target) |selected| {
                 if (selected.* == null) selected.* = target;

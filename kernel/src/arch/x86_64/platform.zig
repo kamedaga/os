@@ -370,8 +370,16 @@ pub fn cr3AddressPart(value: u64) u64 {
 
 pub fn cr3WithUserPcid(raw_cr3: u64, pcid: u16) u64 {
     const raw = cr3AddressPart(raw_cr3);
+    if (raw == 0) return 0;
     if (pcid_enabled == 0 or pcid == 0) return raw;
     return raw | (@as(u64, pcid) & 0xfff);
+}
+
+pub fn userPcidForProcessIndex(process_index: usize) u16 {
+    // PCID 0 is the safe flushing fallback.  Do not alias live process slots
+    // into the 12-bit user PCID namespace.
+    if (process_index >= 0xfff) return 0;
+    return @intCast(process_index + 1);
 }
 
 fn readMsr(msr: u32) u64 {
@@ -425,26 +433,16 @@ fn writeU64LEBytes(ptr: [*]u8, offset: usize, value: u64) void {
     }
 }
 
-fn writeI32LEBytes(ptr: [*]u8, offset: usize, value: i32) void {
-    const bits: u32 = @bitCast(value);
-    var i: usize = 0;
-    while (i < 4) : (i += 1) {
-        ptr[offset + i] = @intCast((bits >> @intCast(i * 8)) & 0xFF);
-    }
-}
-
 fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
     @memset(page[0..], 0x90);
     const out: [*]u8 = @ptrCast(page);
-    const scratch_offset: usize = 0x100;
     var off: usize = 0;
 
-    const store_disp: i32 = @intCast(@as(i64, @intCast(scratch_offset)) - @as(i64, @intCast(off + 7)));
-    out[off] = 0x48;
-    out[off + 1] = 0x89;
-    out[off + 2] = 0x05;
-    writeI32LEBytes(out, off + 3, store_disp);
-    off += 7;
+    // The interrupted register state must be CPU-local.  A scratch slot in
+    // this shared trampoline page lets simultaneous interrupts overwrite one
+    // another, so preserve RAX on the current CPU's ring-0/IST stack instead.
+    out[off] = 0x50; // push %rax
+    off += 1;
     out[off] = 0x48;
     out[off + 1] = 0xB8;
     writeU64LEBytes(out, off + 2, kernel_cr3_value);
@@ -453,12 +451,8 @@ fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
     out[off + 1] = 0x22;
     out[off + 2] = 0xD8;
     off += 3;
-    const load_disp: i32 = @intCast(@as(i64, @intCast(scratch_offset)) - @as(i64, @intCast(off + 7)));
-    out[off] = 0x48;
-    out[off + 1] = 0x8B;
-    out[off + 2] = 0x05;
-    writeI32LEBytes(out, off + 3, load_disp);
-    off += 7;
+    out[off] = 0x58; // pop %rax
+    off += 1;
     out[off] = 0xFF;
     out[off + 1] = 0x25;
     out[off + 2] = 0x00;
@@ -805,6 +799,7 @@ fn mapPerCpuKernelStorage() bool {
 
 pub fn mapCpuRuntimeStacks(cpu_slot: usize) bool {
     if (cpu_slot >= max_cpus) return false;
+    if (kernelHighMappingActive()) return true;
     if (cpu_slot == 0) {
         if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes), ring0_stack_bytes)) return false;
         if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes), ist_stack_bytes)) return false;

@@ -113,10 +113,12 @@ fn limineKernelMain() noreturn {
         .framebuffer = &framebuffer_request,
         .memmap = &memmap_request,
         .module = &module_request,
+        .rsdp = &rsdp_request,
         .executable_address = &executable_address_request,
     };
     entry.prepareBootPrelude();
     limine_boot.probeBootResourcesOrHalt(requests);
+    const smp_resources = limine_boot.smpBootResourcesOrHalt(requests);
     serialWrite("pacha: limine entry\n");
     entry.prepareLimineKernelStorageOrHalt();
     const resources = entry.persistBootResourcesOrHalt(limine_boot.buildBootResourcesOrHalt(
@@ -125,7 +127,7 @@ fn limineKernelMain() noreturn {
         entry.currentUserSpaces(),
     ));
     serialWrite("pacha: limine resources ready\n");
-    entry.initializeLimineRuntimeOrHalt();
+    entry.initializeLimineRuntimeOrHalt(smp_resources);
     serialWrite("pacha: limine runtime ready\n");
     serialWrite("pacha: entering boot resources\n");
     entry.bootWithResources(resources);

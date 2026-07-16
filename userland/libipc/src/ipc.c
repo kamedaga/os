@@ -29,12 +29,18 @@ int pacha_ipc_recv(int fd, struct pacha_ipc_msg *msg) {
 
 int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg, uint64_t timeout_ticks) {
     if (!msg) return -1;
-    return pacha_status_to_int(pacha_syscall4(
-        PACHA_IPC_SYSCALL_RECV_WAIT,
-        (uint64_t)(uint32_t)fd,
-        (uint64_t)(uintptr_t)msg,
-        timeout_ticks,
-        0));
+    for (;;) {
+        const int status = pacha_status_to_int(pacha_syscall4(
+            PACHA_IPC_SYSCALL_RECV_WAIT,
+            (uint64_t)(uint32_t)fd,
+            (uint64_t)(uintptr_t)msg,
+            timeout_ticks,
+            0));
+        if (status == PACHA_ERR_NOT_READY && timeout_ticks == PACHA_FD_WAIT_FOREVER) {
+            continue;
+        }
+        return status;
+    }
 }
 
 int pacha_ipc_call(int fd, const struct pacha_ipc_msg *msg) {

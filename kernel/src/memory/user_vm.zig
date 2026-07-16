@@ -37,6 +37,20 @@ const AddressSpaceSpinLock = struct {
     owner_cpu: usize = std.math.maxInt(usize),
     depth: u32 = 0,
 
+    fn interruptsEnabled() bool {
+        var flags: u64 = 0;
+        asm volatile (
+            \\pushfq
+            \\pop %[flags]
+            : [flags] "=r" (flags),
+        );
+        return (flags & (1 << 9)) != 0;
+    }
+
+    fn waitWithInterruptWindow() void {
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+    }
+
     fn lock(self: *AddressSpaceSpinLock) void {
         const cpu = scheduler.currentCpu();
         if (@atomicLoad(u8, &self.value, .acquire) != 0 and self.owner_cpu == cpu) {
@@ -50,7 +64,9 @@ const AddressSpaceSpinLock = struct {
                 return;
             }
             while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
-                asm volatile ("pause");
+                const restore_interrupts = interruptsEnabled();
+                waitWithInterruptWindow();
+                if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
             }
         }
     }

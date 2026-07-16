@@ -1450,6 +1450,23 @@ pub fn currentCr3() u64 {
     return state.current_cr3;
 }
 
+/// Snapshot CPUs that currently own `target_cr3`.  User CR3 loads never set
+/// the no-flush bit, so a CPU that enters this address space after the
+/// snapshot will invalidate the PCID as part of that load.
+pub fn cpuMaskRunningCr3(target_cr3: u64) u64 {
+    if (target_cr3 == 0) return 0;
+    var mask: u64 = 0;
+    var cpu_slot: usize = 0;
+    while (cpu_slot < scheduler_state.cpus.len and cpu_slot < 64) : (cpu_slot += 1) {
+        const state = &scheduler_state.cpus[cpu_slot];
+        state.lock.lock();
+        const owns_cr3 = state.enabled and !state.is_idle and state.current_cr3 == target_cr3;
+        state.lock.unlock();
+        if (owns_cr3) mask |= @as(u64, 1) << @intCast(cpu_slot);
+    }
+    return mask;
+}
+
 fn buildInitialCpuSchedulerStates() [smp.max_cpus]CpuSchedulerState {
     var states: [smp.max_cpus]CpuSchedulerState = [_]CpuSchedulerState{.{}} ** smp.max_cpus;
     states[bootstrap_cpu_slot].enabled = true;
@@ -1604,7 +1621,7 @@ fn getUserSpace(user_spaces: []UserAddressSpace, principal: kernel.PrincipalId) 
 
 fn pcidForPrincipal(principal: kernel.PrincipalId) u16 {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    return @intCast(idx + 1);
+    return x86_platform.userPcidForProcessIndex(idx);
 }
 
 pub fn threadContextMutable(thread_index: usize) ?*ThreadContext {
@@ -1797,6 +1814,13 @@ pub fn generationOfThread(thread_index: usize) ?u32 {
 pub fn threadOwnedBy(thread_index: usize, principal: kernel.PrincipalId) bool {
     const ctx = threadContext(thread_index) orelse return false;
     return ctx.allocated and ctx.owner_process == principal;
+}
+
+pub fn threadWakeTargetIsLive(thread_index: usize, generation: u32, owner: kernel.PrincipalId) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContext(thread_index) orelse return false;
+    return ctx.allocated and ctx.generation == generation and ctx.owner_process == owner;
 }
 
 pub fn liveThreadCount(principal: kernel.PrincipalId) usize {
@@ -2561,10 +2585,10 @@ pub fn blockCurrentThread(
     before_block: ?BeforeCurrentThreadLeaveCallback,
 ) bool {
     if (!isBootstrapSchedulerCpu()) {
-        if (policyActive()) {
-            return parkApThreadForBlock(frame, wait_mailbox, timeout_ticks, resume_rax, before_block);
-        }
-        return false;
+        // AP user threads must leave the CPU for both the built-in and the
+        // external scheduler.  Returning false here turns a real blocking
+        // receive into NOT_READY as soon as a process is scheduled on an AP.
+        return parkApThreadForBlock(frame, wait_mailbox, timeout_ticks, resume_rax, before_block);
     }
     const current_thread = currentThread();
     scheduler_state.thread_table.lock();
@@ -2602,18 +2626,14 @@ pub fn blockCurrentThread(
         scheduler_state.thread_table.unlock();
         if (before_block) |callback| callback.run(callback.context);
         if (switchToNextReadyOnCurrentCpu(frame, resume_rax)) return true;
-        scheduler_state.thread_table.lock();
-        if (threadContextMutable(current_thread)) |restored_ctx| {
-            if (restored_ctx.allocated) {
-                restored_ctx.wait_mailbox = false;
-                restored_ctx.wake_tick = 0;
-                restored_ctx.ready = true;
-                setThreadHotWaitState(current_thread, false, 0, true);
-                verifiedWakeThread(current_thread);
-            }
+        // There is no userspace context to return to while the caller is
+        // blocked.  Keep CPU 0 interruptible until a wakeup publishes a ready
+        // thread, then load the wake-provided frame without overwriting rax
+        // with the original syscall's resume value.
+        while (!loadNextReadyThread(frame)) {
+            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
         }
-        scheduler_state.thread_table.unlock();
-        return false;
+        return true;
     }
 
     if (policyActive() and !externalSchedulerOwnsThread(current_thread)) {

@@ -165,7 +165,7 @@ fn writeCr4(value: u64) void {
 fn userCr3ForPrincipal(principal: kernel.PrincipalId) u64 {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return 0;
     if (idx >= user_spaces.len) return 0;
-    return x86_platform.cr3WithUserPcid(user_spaces[idx].cr3, @intCast(idx + 1));
+    return x86_platform.cr3WithUserPcid(user_spaces[idx].cr3, x86_platform.userPcidForProcessIndex(idx));
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +441,7 @@ fn collectPipeCloseWakesForProcess(
 
 fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
     for (targets) |target| {
+        if (!scheduler.threadWakeTargetIsLive(target.thread_index, target.thread_generation, target.owner)) continue;
         if (target.pollfd_va != 0) {
             _ = user_copy.writeUserU64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
         }
@@ -718,14 +719,30 @@ const DetectedDevices = struct {
     devices: [boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
 };
 
-pub fn initializeLimineRuntimeOrHalt() void {
+pub const LimineSmpResources = struct {
+    rsdp_paddr: u64,
+    trampoline_base: u64,
+};
+
+pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     initKernelRuntimeOrHalt();
     kernel_log.write("boot: scheduler static\n");
     scheduler.initializeStaticStorage();
     kernel_log.write("boot: idle hooks\n");
     scheduler.installIdleHooks();
-    kernel_log.write("boot: bootstrap cpu ready\n");
-    smp.markBootstrapCpuReady();
+    var smp_info = smp.prepareBootInfo(
+        smp_resources.rsdp_paddr,
+        smp_resources.trampoline_base,
+    ) orelse {
+        halt.haltWithMessage("SMP boot information invalid");
+    };
+    smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
+    smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
+    smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
+    if (!smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value)) {
+        halt.haltWithMessage("SMP application processor startup failed");
+    }
+    kernel_log.writeFmt("boot: cpus ready count={}\n", .{smp.cpuCount()});
     kernel_log.write("boot: topology\n");
     scheduler.refreshTopology();
     kernel_log.write("boot: limine runtime done\n");
@@ -867,6 +884,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .copy_user_bytes_from_va = user_copy.copyUserBytesFromVa,
         .copy_bytes_to_user_va = user_copy.copyBytesToUserVa,
         .wake_waiting_thread_for_principal = scheduler.wakeMailboxWaiter,
+        .thread_wake_target_is_live = scheduler.threadWakeTargetIsLive,
         .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,
         .wake_waiting_thread_generation_with_rax = scheduler.wakeIfWaitingGenerationWithRax,
         .wake_blocked_thread_for_principal = scheduler.wakeBlockedThread,

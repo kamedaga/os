@@ -108,6 +108,9 @@ fn statusFromPipeError(err: kernel.PipeIoError) u64 {
 
 fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) bool {
     for (targets) |target| {
+        // Shared wait lists can outlive the process which registered them.
+        // Reject the saved user VA after its thread slot has been reused.
+        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
         if (target.pollfd_va != 0) {
             if (!h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents)) return false;
         }

@@ -189,10 +189,21 @@ fn asmCpuSlotIntoEcx() []const u8 {
         \\cmp ${d}, %ecx
         \\jb 4f
         \\3:
+        \\mov $1, %eax
+        \\cpuid
+        \\shr $24, %ebx
+        \\xor %ecx, %ecx
+        \\lea runtime_lapic_ids(%rip), %rax
+        \\5:
+        \\cmpb %bl, (%rax,%rcx,1)
+        \\je 4f
+        \\inc %ecx
+        \\cmp ${d}, %ecx
+        \\jb 5b
         \\xor %ecx, %ecx
         \\4:
         \\
-    , .{smp.max_cpus});
+    , .{ smp.max_cpus, smp.max_cpus });
 }
 
 fn asmCopyUserInterruptFrameToCpuWorkFrame(comptime work_frame_symbol: []const u8) []const u8 {
@@ -242,6 +253,21 @@ fn asmCallAligned(comptime target: []const u8) []const u8 {
         \\and $-16, %rsp
         \\sub $32, %rsp
         \\call {s}
+        \\mov %r15, %rsp
+        \\
+    , .{target});
+}
+
+fn asmDispatchKernelInterruptPreservingFx(comptime target: []const u8) []const u8 {
+    return std.fmt.comptimePrint(
+        \\
+        \\mov %rsp, %r15
+        \\and $-16, %rsp
+        \\sub $544, %rsp
+        \\fxsave64 32(%rsp)
+        \\mov %r15, %rcx
+        \\call {s}
+        \\fxrstor64 32(%rsp)
         \\mov %r15, %rsp
         \\
     , .{target});
@@ -735,6 +761,7 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
     _ = frame;
+    user_copy.acknowledgePendingTlbShootdown();
     lapic.eoi();
 }
 
@@ -875,11 +902,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\9:
-            \\sub $512, %rsp
-            \\lea 512(%rsp), %rdi
-            \\mov %rdi, %rcx
-            \\call timerInterruptDispatch
-            \\add $512, %rsp
+        ++ asmDispatchKernelInterruptPreservingFx("timerInterruptDispatch") ++
             \\pop %r15
             \\pop %r14
             \\pop %r13
@@ -895,10 +918,6 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\pop %rcx
             \\pop %rbx
             \\pop %rax
-            \\mov %r10, user_return_saved_r10(%rip)
-            \\mov kernel_cr3_value(%rip), %r10
-            \\mov %r10, %cr3
-            \\mov user_return_saved_r10(%rip), %r10
             \\iretq
         );
     } else {
@@ -937,11 +956,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\9:
-            \\sub $512, %rsp
-            \\lea 512(%rsp), %rdi
-            \\mov %rdi, %rcx
-            \\call timerInterruptDispatch
-            \\add $512, %rsp
+        ++ asmDispatchKernelInterruptPreservingFx("timerInterruptDispatch") ++
             \\pop %r15
             \\pop %r14
             \\pop %r13
@@ -957,10 +972,6 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\pop %rcx
             \\pop %rbx
             \\pop %rax
-            \\mov %r10, user_return_saved_r10(%rip)
-            \\mov kernel_cr3_value(%rip), %r10
-            \\mov %r10, %cr3
-            \\mov user_return_saved_r10(%rip), %r10
             \\iretq
         );
     }
@@ -1002,11 +1013,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\9:
-            \\sub $512, %rsp
-            \\lea 512(%rsp), %rdi
-            \\mov %rdi, %rcx
-            \\call deviceInterruptDispatch
-            \\add $512, %rsp
+        ++ asmDispatchKernelInterruptPreservingFx("deviceInterruptDispatch") ++
             \\pop %r15
             \\pop %r14
             \\pop %r13
@@ -1022,10 +1029,6 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\pop %rcx
             \\pop %rbx
             \\pop %rax
-            \\mov %r10, user_return_saved_r10(%rip)
-            \\mov kernel_cr3_value(%rip), %r10
-            \\mov %r10, %cr3
-            \\mov user_return_saved_r10(%rip), %r10
             \\iretq
         );
     } else {
@@ -1064,11 +1067,7 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
         ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
             \\jmp userReturnToSavedFrame
             \\9:
-            \\sub $512, %rsp
-            \\lea 512(%rsp), %rdi
-            \\mov %rdi, %rcx
-            \\call deviceInterruptDispatch
-            \\add $512, %rsp
+        ++ asmDispatchKernelInterruptPreservingFx("deviceInterruptDispatch") ++
             \\pop %r15
             \\pop %r14
             \\pop %r13
@@ -1084,10 +1083,6 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\pop %rcx
             \\pop %rbx
             \\pop %rax
-            \\mov %r10, user_return_saved_r10(%rip)
-            \\mov kernel_cr3_value(%rip), %r10
-            \\mov %r10, %cr3
-            \\mov user_return_saved_r10(%rip), %r10
             \\iretq
         );
     }
@@ -1128,11 +1123,7 @@ pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
     ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\9:
-        \\sub $512, %rsp
-        \\lea 512(%rsp), %rdi
-        \\mov %rdi, %rcx
-        \\call schedulerWakeIpiDispatch
-        \\add $512, %rsp
+    ++ asmDispatchKernelInterruptPreservingFx("schedulerWakeIpiDispatch") ++
         \\pop %r15
         \\pop %r14
         \\pop %r13
@@ -1148,10 +1139,6 @@ pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
         \\pop %rcx
         \\pop %rbx
         \\pop %rax
-        \\mov %r10, user_return_saved_r10(%rip)
-        \\mov kernel_cr3_value(%rip), %r10
-        \\mov %r10, %cr3
-        \\mov user_return_saved_r10(%rip), %r10
         \\iretq
     );
 }
