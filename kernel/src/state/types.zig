@@ -759,7 +759,7 @@ pub const IpcRecvResult = struct {
 pub const native_page_size: u64 = 4096;
 pub const max_native_vmos: usize = 32768;
 pub const max_vmas_per_process: usize = 8192;
-pub const max_native_cow_tables: usize = max_vmas_per_process;
+pub const native_cow_table_slots_per_chunk: usize = 128;
 
 pub const NativeVmoKind = enum(u8) {
     none = 0,
@@ -803,6 +803,20 @@ pub const NativeCowTableSlot = struct {
     page_count: u32 = 0,
     page_store_start: u32 = 0,
 };
+
+// NativeCowTableRef keeps a flat index. Chunks are append-only so a fault path
+// may retain a slot pointer while another table allocation extends the pool.
+pub const NativeCowTableChunk = struct {
+    next: ?*NativeCowTableChunk = null,
+    ordinal: u32 = 0,
+    reserved0: u32 = 0,
+    slots: [native_cow_table_slots_per_chunk]NativeCowTableSlot =
+        [_]NativeCowTableSlot{.{}} ** native_cow_table_slots_per_chunk,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(NativeCowTableChunk) <= native_page_size);
+}
 
 pub const VmaProt = packed struct(u8) {
     read: bool = false,

@@ -96,7 +96,6 @@ const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
 const max_native_vmos = types.max_native_vmos;
 const max_vmas_per_process = types.max_vmas_per_process;
-const max_native_cow_tables = types.max_native_cow_tables;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;

@@ -96,7 +96,6 @@ const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
 const max_native_vmos = types.max_native_vmos;
 const max_vmas_per_process = types.max_vmas_per_process;
-const max_native_cow_tables = types.max_native_cow_tables;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;
@@ -205,7 +204,7 @@ pub fn copyForkAnonymousPresentPageToChild(
     var installed = false;
     defer if (!installed) free_list.appendPage(0, copied_paddr) catch {};
     @TypeOf(self.*).copyPhysicalPage(copied_paddr, src_paddr);
-    self.ensureEntryCowTable(dest_entry) catch return KernelError.TableFull;
+    self.ensureEntryCowTable(dest_entry, free_list) catch return KernelError.TableFull;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(dest_entry, va) orelse return KernelError.InvalidState;
     self.setNativeCowPagePaddr(dest_entry.cow_table, cow_page, copied_paddr) catch return KernelError.TableFull;
     installed = true;
@@ -483,7 +482,7 @@ pub fn ensureNativeVmaCowMapping(
         if (src_paddr != 0) {
             @TypeOf(self.*).copyPhysicalPage(new_paddr, src_paddr);
         }
-        self.ensureEntryCowTable(entry) catch return null;
+        self.ensureEntryCowTable(entry, free_list) catch return null;
         const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, fault_page_va) orelse return null;
         self.setNativeCowPagePaddr(entry.cow_table, cow_page, new_paddr) catch return null;
         installed = true;

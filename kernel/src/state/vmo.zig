@@ -97,12 +97,13 @@ const IpcRecvResult = types.IpcRecvResult;
 const native_page_size = types.native_page_size;
 const max_native_vmos = types.max_native_vmos;
 const max_vmas_per_process = types.max_vmas_per_process;
-const max_native_cow_tables = types.max_native_cow_tables;
+const native_cow_table_slots_per_chunk = types.native_cow_table_slots_per_chunk;
 const NativeVmoKind = types.NativeVmoKind;
 const NativeVmoRef = types.NativeVmoRef;
 const NativeCowTableRef = types.NativeCowTableRef;
 const NativeVmoSlot = types.NativeVmoSlot;
 const NativeCowTableSlot = types.NativeCowTableSlot;
+const NativeCowTableChunk = types.NativeCowTableChunk;
 const VmaProt = types.VmaProt;
 const MmapFlags = types.MmapFlags;
 const VmaEntry = types.VmaEntry;
@@ -324,44 +325,89 @@ pub fn nativeVmoRefsEqual(a: NativeVmoRef, b: NativeVmoRef) bool {
     return a.index == b.index and a.generation == b.generation;
 }
 
+fn nativeCowTableStorageSlot(self: anytype, index: usize) ?*NativeCowTableSlot {
+    const ordinal = index / native_cow_table_slots_per_chunk;
+    const slot_index = index % native_cow_table_slots_per_chunk;
+    if (ordinal >= self.native_cow_table_chunk_count) return null;
+    if (ordinal == 0) return &self.native_cow_table_initial.slots[slot_index];
+
+    var chunk = self.native_cow_table_overflow_head;
+    while (chunk) |current| : (chunk = current.next) {
+        if (current.ordinal == ordinal) return &current.slots[slot_index];
+    }
+    return null;
+}
+
+fn nativeCowTableStorageSlotConst(self: anytype, index: usize) ?*const NativeCowTableSlot {
+    const ordinal = index / native_cow_table_slots_per_chunk;
+    const slot_index = index % native_cow_table_slots_per_chunk;
+    if (ordinal >= self.native_cow_table_chunk_count) return null;
+    if (ordinal == 0) return &self.native_cow_table_initial.slots[slot_index];
+
+    var chunk = self.native_cow_table_overflow_head;
+    while (chunk) |current| : (chunk = current.next) {
+        if (current.ordinal == ordinal) return &current.slots[slot_index];
+    }
+    return null;
+}
+
 pub fn nativeCowTableSlot(self: anytype, table_ref: NativeCowTableRef) ?*NativeCowTableSlot {
     if (table_ref.isNull()) return null;
-    const index: usize = @intCast(table_ref.index);
-    if (index >= max_native_cow_tables) return null;
-    const slot = &self.native_cow_tables[index];
+    const slot = nativeCowTableStorageSlot(self, @intCast(table_ref.index)) orelse return null;
     if (!slot.active or slot.generation != table_ref.generation) return null;
     return slot;
 }
 
 pub fn nativeCowTableSlotConst(self: anytype, table_ref: NativeCowTableRef) ?*const NativeCowTableSlot {
     if (table_ref.isNull()) return null;
-    const index: usize = @intCast(table_ref.index);
-    if (index >= max_native_cow_tables) return null;
-    const slot = &self.native_cow_tables[index];
+    const slot = nativeCowTableStorageSlotConst(self, @intCast(table_ref.index)) orelse return null;
     if (!slot.active or slot.generation != table_ref.generation) return null;
     return slot;
 }
 
-pub fn createNativeCowTable(self: anytype, page_count: u32) KernelError!NativeCowTableRef {
+fn appendNativeCowTableChunk(self: anytype, free_list: *FreePageList) KernelError!void {
+    const max_chunk_count = (@as(usize, std.math.maxInt(u32)) + 1) /
+        native_cow_table_slots_per_chunk;
+    if (self.native_cow_table_chunk_count >= max_chunk_count) return KernelError.TableFull;
+    const storage = @TypeOf(self.*).allocKernelSlice(NativeCowTableChunk, free_list, 1) orelse
+        return KernelError.OutOfFreePages;
+    const chunk = &storage[0];
+    chunk.* = .{
+        .next = self.native_cow_table_overflow_head,
+        .ordinal = @intCast(self.native_cow_table_chunk_count),
+    };
+    self.native_cow_table_overflow_head = chunk;
+    self.native_cow_table_chunk_count += 1;
+}
+
+pub fn createNativeCowTable(
+    self: anytype,
+    page_count: u32,
+    free_list: *FreePageList,
+) KernelError!NativeCowTableRef {
     if (page_count == 0) return KernelError.InvalidState;
-    var offset: usize = 0;
-    while (offset < max_native_cow_tables) : (offset += 1) {
-        const index = (self.next_native_cow_table_scan + offset) % max_native_cow_tables;
-        const slot = &self.native_cow_tables[index];
-        if (slot.active or slot.ref_count != 0) continue;
-        const page_store_start = allocEmptyVmoBackingPageStore(page_count) orelse return KernelError.TableFull;
-        if (slot.generation == 0) slot.generation = 1;
-        slot.active = true;
-        slot.ref_count = 0;
-        slot.page_count = page_count;
-        slot.page_store_start = page_store_start;
-        self.next_native_cow_table_scan = (index + 1) % max_native_cow_tables;
-        return .{
-            .index = @intCast(index),
-            .generation = slot.generation,
-        };
+    while (true) {
+        const capacity = self.native_cow_table_chunk_count * native_cow_table_slots_per_chunk;
+        var offset: usize = 0;
+        while (offset < capacity) : (offset += 1) {
+            const index = (self.next_native_cow_table_scan + offset) % capacity;
+            const slot = nativeCowTableStorageSlot(self, index) orelse return KernelError.InvalidState;
+            if (slot.active or slot.ref_count != 0) continue;
+            const page_store_start = allocEmptyVmoBackingPageStore(page_count) orelse return KernelError.TableFull;
+            if (slot.generation == 0) slot.generation = 1;
+            slot.active = true;
+            slot.ref_count = 0;
+            slot.page_count = page_count;
+            slot.page_store_start = page_store_start;
+            self.next_native_cow_table_scan = (index + 1) % capacity;
+            return .{
+                .index = @intCast(index),
+                .generation = slot.generation,
+            };
+        }
+        try appendNativeCowTableChunk(self, free_list);
+        self.next_native_cow_table_scan = capacity;
     }
-    return KernelError.TableFull;
 }
 
 pub fn retainNativeCowTable(self: anytype, table_ref: NativeCowTableRef) KernelError!void {
@@ -461,11 +507,15 @@ pub fn entryDirtyPagePaddr(self: anytype, entry: *const VmaEntry, fault_page_va:
     return self.nativeCowPagePaddr(entry.cow_table, cow_page);
 }
 
-pub fn ensureEntryCowTable(self: anytype, entry: *VmaEntry) KernelError!void {
+pub fn ensureEntryCowTable(
+    self: anytype,
+    entry: *VmaEntry,
+    free_list: *FreePageList,
+) KernelError!void {
     if (!entry.cow_table.isNull()) return;
     const page_count_u64 = entry.size_bytes / native_page_size;
     if (page_count_u64 == 0 or page_count_u64 > std.math.maxInt(u32)) return KernelError.InvalidState;
-    const table_ref = try self.createNativeCowTable(@intCast(page_count_u64));
+    const table_ref = try self.createNativeCowTable(@intCast(page_count_u64), free_list);
     try self.retainNativeCowTable(table_ref);
     entry.cow_table = table_ref;
     entry.cow_page_offset = 0;
@@ -476,7 +526,7 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
     if (self.nativeCowTableIsUnique(entry.cow_table)) return;
     const old_ref = entry.cow_table;
     const old_table = self.nativeCowTableSlotConst(old_ref) orelse return KernelError.InvalidState;
-    const new_ref = try self.createNativeCowTable(old_table.page_count);
+    const new_ref = try self.createNativeCowTable(old_table.page_count, free_list);
     try self.retainNativeCowTable(new_ref);
     var installed = false;
     errdefer if (!installed) self.releaseNativeCowTable(new_ref, free_list);
