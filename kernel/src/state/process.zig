@@ -421,6 +421,7 @@ pub fn markProcessObjectsExited(self: anytype, principal: PrincipalId, state: Ta
         if (slot.kind != .process) continue;
         var process = @TypeOf(self.*).processFromPayload(&slot.payload) orelse continue;
         if (process.principal_raw != principal_raw) continue;
+        if (!state.isTerminal() and process.state.isTerminal()) continue;
         process.state = state;
         process.exit_code = exit_code;
         slot.payload = .{ .process = process };
@@ -435,6 +436,7 @@ pub fn markThreadObjectsExitedForPrincipal(self: anytype, principal: PrincipalId
         if (slot.kind != .thread) continue;
         var thread = @TypeOf(self.*).threadFromPayload(&slot.payload) orelse continue;
         if (thread.owner_principal_raw != principal_raw) continue;
+        if (!state.isTerminal() and thread.state.isTerminal()) continue;
         thread.state = state;
         thread.exit_code = exit_code;
         slot.payload = .{ .thread = thread };

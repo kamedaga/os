@@ -654,8 +654,8 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
     if ((requested & @import("kernel_abi_root").fd_abi.event_readable) != 0) {
         const readable = switch (slot.payload) {
             .endpoint, .channel, .reply => self.fdIpcReadable(&slot.payload),
-            .process => |process| process.state != .active,
-            .thread => |thread| thread.state != .active,
+            .process => |process| process.state.isTerminal(),
+            .thread => |thread| thread.state.isTerminal(),
             .event => |counter| entry.rights.read and counter != 0,
             .irq => self.irqPublishedEventPending(entry.object) orelse false,
             .timer => |timer| @TypeOf(self.*).timerDueCount(timer, now_tick) != 0,

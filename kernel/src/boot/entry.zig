@@ -196,7 +196,10 @@ pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
     if (!kernel_runtime.kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
-    if (!scheduler.threadReady(thread_index)) return;
+    // A remote stop clears ready before the target CPU reaches its IPI safe
+    // point.  The still-current allocated context must nevertheless retain
+    // the user FX image before scheduler ownership is severed.
+    if (!ctx.allocated) return;
     ctx.pkru = x86_platform.readPkru();
     asm volatile ("fxsave64 (%[ptr])"
         :

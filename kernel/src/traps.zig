@@ -759,10 +759,21 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
     }
 }
 
-pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
+pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
     _ = frame;
     user_copy.acknowledgePendingTlbShootdown();
     lapic.eoi();
+}
+
+pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    schedulerMaintenanceIpiDispatch(frame);
+    if (!scheduler.quiesceStoppedCurrentUserThread(frame)) return;
+    if (!scheduler.isBootstrapSchedulerCpu()) {
+        smp.returnCurrentApToIdleFromInterrupt();
+    }
+    while (!scheduler.loadNextReadyThread(frame)) {
+        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+    }
 }
 
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
@@ -1114,16 +1125,17 @@ pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
         \\cmp $0x3, %rax
         \\jne 9f
     ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
+        asmCallAligned("saveCurrentThreadFxState") ++
         \\mov (%rsp), %r12
         \\mov %r12, %rcx
-    ++ asmCallAligned("schedulerWakeIpiDispatch") ++
+    ++ asmCallAligned("schedulerWakeIpiDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
         \\mov (%rsp), %r12
         \\add $8, %rsp
         \\mov %r12, %rax
     ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\9:
-    ++ asmDispatchKernelInterruptPreservingFx("schedulerWakeIpiDispatch") ++
+    ++ asmDispatchKernelInterruptPreservingFx("schedulerMaintenanceIpiDispatch") ++
         \\pop %r15
         \\pop %r14
         \\pop %r13

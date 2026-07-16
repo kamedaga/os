@@ -63,11 +63,12 @@ fn mmioWrite(offset: u32, value: u32) void {
     reg.* = value;
 }
 
-fn waitIcrIdle() void {
+fn waitIcrIdle() bool {
     var spins: u32 = 0;
     while ((mmioRead(lapic_reg_icr_low) & icr_delivery_status) != 0 and spins < 1000000) : (spins += 1) {
         asm volatile ("pause");
     }
+    return (mmioRead(lapic_reg_icr_low) & icr_delivery_status) == 0;
 }
 
 fn delayIpi() void {
@@ -126,28 +127,26 @@ pub fn localApicId() u8 {
 
 pub fn sendInitSipi(apic_id: u8, startup_vector: u8) bool {
     if (lapic_base_pa == 0 and !enableLocalApic()) return false;
-    waitIcrIdle();
+    if (!waitIcrIdle()) return false;
     mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
     mmioWrite(lapic_reg_icr_low, icr_delivery_init | icr_level_assert | icr_trigger_level);
-    waitIcrIdle();
+    if (!waitIcrIdle()) return false;
     delayIpi();
     mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
     mmioWrite(lapic_reg_icr_low, icr_delivery_startup | @as(u32, startup_vector));
-    waitIcrIdle();
+    if (!waitIcrIdle()) return false;
     delayIpi();
     mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
     mmioWrite(lapic_reg_icr_low, icr_delivery_startup | @as(u32, startup_vector));
-    waitIcrIdle();
-    return true;
+    return waitIcrIdle();
 }
 
 pub fn sendFixedIpi(apic_id: u8, vector: u8) bool {
     if (lapic_base_pa == 0 and !enableLocalApic()) return false;
-    waitIcrIdle();
+    if (!waitIcrIdle()) return false;
     mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
     mmioWrite(lapic_reg_icr_low, @as(u32, vector));
-    waitIcrIdle();
-    return true;
+    return waitIcrIdle();
 }
 
 pub fn eoi() void {

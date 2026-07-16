@@ -33,6 +33,7 @@ pub const Hooks = struct {
     wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     before_current_thread_leave: ?scheduler.BeforeCurrentThreadLeaveCallback = null,
+    reacquire_kernel_state_lock: ?scheduler.BeforeCurrentThreadLeaveCallback = null,
     block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64, ?scheduler.BeforeCurrentThreadLeaveCallback) bool,
     exit_current_process: *const fn (kernel.PrincipalId, u8, *TrapFrame, ?scheduler.BeforeCurrentThreadLeaveCallback, ?kernel.ThreadWakeTarget) void,
     total_usable_memory_bytes: u64,
@@ -76,6 +77,13 @@ fn dropKernelStateLockBeforeCurrentThreadLeave(ctx_ptr: *anyopaque) void {
     if (!ctx.lock_held.*) return;
     kernel_state_lock.unlock();
     ctx.lock_held.* = false;
+}
+
+fn reacquireKernelStateLockAfterRemoteQuiescence(ctx_ptr: *anyopaque) void {
+    const ctx: *KernelStateLockDropContext = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.lock_held.*) return;
+    kernel_state_lock.lock();
+    ctx.lock_held.* = true;
 }
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
@@ -140,6 +148,13 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
         }
     else
         null;
+    hooks.reacquire_kernel_state_lock = if (hold_kernel_state_lock)
+        scheduler.BeforeCurrentThreadLeaveCallback{
+            .context = &lock_drop_context,
+            .run = reacquireKernelStateLockAfterRemoteQuiescence,
+        }
+    else
+        null;
     const h = &hooks;
 
     if (hold_kernel_state_lock) {
@@ -162,6 +177,14 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
         }
         base_hooks.exit_current_process(proc, 0, frame, null, null);
         return frame.rax;
+    }
+
+    // A remote lifecycle owner may temporarily drop the global state lock to
+    // drive this principal through an interrupt/syscall boundary. Do not admit
+    // another target syscall into that window; the owner will rescan contexts
+    // before teardown or publish the final stopped state.
+    if (scheduler.principalLifecycleTargets(proc)) {
+        return sc.syscall_err_not_ready;
     }
 
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {

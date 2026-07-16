@@ -94,6 +94,20 @@ pub fn cpuState(cpu_slot: usize) CpuState {
     return stateFromRaw(@atomicLoad(u32, &cpu_states[cpu_slot], .acquire));
 }
 
+pub fn onlineCpuMask() u64 {
+    var mask: u64 = 0;
+    var cpu_slot: usize = 0;
+    while (cpu_slot < max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
+        if (!isStarted(cpu_slot)) continue;
+        if (runtimeLapicIdPtr(cpu_slot).* == 0xFF) continue;
+        switch (cpuState(cpu_slot)) {
+            .idle, .user => mask |= @as(u64, 1) << @intCast(cpu_slot),
+            .absent, .booting => {},
+        }
+    }
+    return mask;
+}
+
 pub fn cpuInfo(cpu_slot: usize) ?CpuInfo {
     if (cpu_slot >= max_cpus) return null;
     const apic_id = runtimeLapicIdPtr(cpu_slot).*;

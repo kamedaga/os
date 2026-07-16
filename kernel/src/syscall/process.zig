@@ -464,16 +464,65 @@ fn killThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.F
     return sc.syscall_ok;
 }
 
+fn publishPrincipalLifecycleState(
+    state: *kernel.KernelState,
+    target: kernel.PrincipalId,
+    object_state: kernel.TaskObjectState,
+    code: u32,
+) void {
+    state.markProcessObjectsExited(target, object_state, code);
+    state.markThreadObjectsExitedForPrincipal(target, object_state, code);
+}
+
+/// Stop every context, let in-flight target syscalls reach the admission
+/// barrier, then scan once more while the kernel-state lock excludes external
+/// thread creation. The current CPU may be ignored only for self-stop.
+fn quiescePrincipalForLifecycle(h: anytype, target: kernel.PrincipalId, ignore_current_cpu: bool) bool {
+    const drop_lock = h.before_current_thread_leave orelse return false;
+    const reacquire_lock = h.reacquire_kernel_state_lock orelse return false;
+    const current_cpu = scheduler.currentCpu();
+    const ignored_mask = if (ignore_current_cpu and current_cpu < 64)
+        @as(u64, 1) << @intCast(current_cpu)
+    else
+        0;
+    while (true) {
+        _ = scheduler.stopPrincipalThreads(target);
+        drop_lock.run(drop_lock.context);
+        if (ignore_current_cpu) {
+            scheduler.waitForRemotePrincipalQuiescence(target);
+        } else {
+            scheduler.waitForPrincipalQuiescence(target);
+        }
+        reacquire_lock.run(reacquire_lock.context);
+        // An already-entered THREAD_CREATE can finish only while the lock is
+        // dropped. Catch its context before deciding teardown is safe.
+        _ = scheduler.stopPrincipalThreads(target);
+        if ((scheduler.cpuMaskRunningPrincipal(target) & ~ignored_mask) == 0) return true;
+    }
+}
+
 fn killProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32, frame: *TrapFrame) u64 {
-    const process = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .killed, code) catch return sc.syscall_err_invalid;
-    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    const existing = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(existing.principal_raw);
+    if (existing.state == .exited or existing.state == .killed) return sc.syscall_err_invalid;
     if (target == proc) {
+        _ = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .killed, code) catch return sc.syscall_err_invalid;
         state.markProcessObjectsExited(proc, .killed, code);
         state.markThreadObjectsExitedForPrincipal(proc, .killed, code);
         const handoff_target = wakeTaskFdWaiters(h, state, proc);
         h.exit_current_process(proc, @truncate(code), frame, h.before_current_thread_leave, handoff_target);
         return frame.rax;
     }
+    if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
+    if (!scheduler.tryBeginPrincipalLifecycle(target)) {
+        if (!scheduler.principalLifecycleTargets(target)) return sc.syscall_err_not_ready;
+        return if (scheduler.requestPrincipalLifecycleAction(target, .kill, code))
+            sc.syscall_ok
+        else
+            sc.syscall_err_not_ready;
+    }
+    defer scheduler.endPrincipalLifecycle();
+    if (!quiescePrincipalForLifecycle(h, target, false)) return sc.syscall_err_not_ready;
     cleanupProcess(h, state, target, .killed, code);
     return sc.syscall_ok;
 }
@@ -637,35 +686,86 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     }
 }
 
-fn stopProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
-    const process = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .stopped, code) catch return sc.syscall_err_invalid;
-    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+fn stopProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32, frame: *TrapFrame) u64 {
+    const existing = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(existing.principal_raw);
+    if (!processRunnable(existing.state) and existing.state != .stopped) return sc.syscall_err_invalid;
     if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
-    state.markProcessObjectsExited(target, .stopped, code);
-    state.markThreadObjectsExitedForPrincipal(target, .stopped, code);
-    _ = scheduler.stopPrincipalThreads(target);
+    if (h.before_current_thread_leave == null or h.reacquire_kernel_state_lock == null) {
+        return sc.syscall_err_not_ready;
+    }
+    if (!scheduler.tryBeginPrincipalLifecycle(target)) {
+        if (!scheduler.principalLifecycleTargets(target)) return sc.syscall_err_not_ready;
+        return if (scheduler.requestPrincipalLifecycleAction(target, .stop, code))
+            sc.syscall_ok
+        else
+            sc.syscall_err_not_ready;
+    }
+    if (!quiescePrincipalForLifecycle(h, target, target == proc)) {
+        scheduler.endPrincipalLifecycle();
+        return sc.syscall_err_not_ready;
+    }
+
+    const pending = scheduler.takePrincipalLifecycleAction(target);
+    switch (pending.action) {
+        .kill => {
+            scheduler.endPrincipalLifecycle();
+            if (target == proc) {
+                publishPrincipalLifecycleState(state, target, .killed, pending.code);
+                const handoff_target = wakeTaskFdWaiters(h, state, proc);
+                h.exit_current_process(proc, @truncate(pending.code), frame, h.before_current_thread_leave, handoff_target);
+                return frame.rax;
+            }
+            cleanupProcess(h, state, target, .killed, pending.code);
+            return sc.syscall_ok;
+        },
+        .continue_process => {
+            _ = scheduler.continuePrincipalThreads(target);
+            publishPrincipalLifecycleState(state, target, .continued, pending.code);
+            scheduler.endPrincipalLifecycle();
+            return sc.syscall_ok;
+        },
+        .none => publishPrincipalLifecycleState(state, target, .stopped, code),
+        .stop => publishPrincipalLifecycleState(state, target, .stopped, pending.code),
+    }
+
+    scheduler.endPrincipalLifecycle();
+    if (target != proc) return sc.syscall_ok;
+    if (scheduler.parkStoppedCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave)) {
+        return frame.rax;
+    }
     return sc.syscall_ok;
 }
 
 fn continueProcess(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
-    const process = state.setProcessObjectStateForFd(proc, fd, .{ .kill = true }, .continued, code) catch return sc.syscall_err_invalid;
-    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    const existing = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(existing.principal_raw);
     if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
-    state.markProcessObjectsExited(target, .continued, code);
-    state.markThreadObjectsExitedForPrincipal(target, .continued, code);
+    if (!scheduler.tryBeginPrincipalLifecycle(target)) {
+        if (!scheduler.principalLifecycleTargets(target)) return sc.syscall_err_not_ready;
+        return if (scheduler.requestPrincipalLifecycleAction(target, .continue_process, code))
+            sc.syscall_ok
+        else
+            sc.syscall_err_not_ready;
+    }
+    defer scheduler.endPrincipalLifecycle();
+    if (existing.state != .stopped) {
+        return if (processRunnable(existing.state)) sc.syscall_ok else sc.syscall_err_invalid;
+    }
     _ = scheduler.continuePrincipalThreads(target);
+    publishPrincipalLifecycleState(state, target, .continued, code);
     return sc.syscall_ok;
 }
 
 fn waitProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
     const process = state.processObjectForFd(proc, fd, .{ .wait = true }) orelse return sc.syscall_err_invalid;
-    if (process.state == .active) return sc.syscall_err_not_ready;
+    if (!process.state.isTerminal()) return sc.syscall_err_not_ready;
     return writeProcessStatus(h, proc, out_va, process);
 }
 
 fn waitThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
     const thread = state.threadObjectForFd(proc, fd, .{ .wait = true }) orelse return sc.syscall_err_invalid;
-    if (thread.state == .active) return sc.syscall_err_not_ready;
+    if (!thread.state.isTerminal()) return sc.syscall_err_not_ready;
     return writeThreadStatus(h, proc, out_va, thread);
 }
 
@@ -1019,7 +1119,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_thread_exit => exitCurrentThread(h, state, proc, frame, @truncate(frame.rdi)),
         sc.syscall_process_signal => signalProcess(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi), frame),
         sc.syscall_process_signal_ctl => signalControl(h, proc, frame),
-        sc.syscall_process_stop => stopProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
+        sc.syscall_process_stop => stopProcess(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi), frame),
         sc.syscall_process_continue => continueProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_thread_set_fs_base => blk: {
             const fs_base = frame.rdi;

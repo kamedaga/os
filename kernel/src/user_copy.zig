@@ -1,6 +1,5 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
-const scheduler = @import("scheduler.zig").connection;
 const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
 
@@ -393,7 +392,10 @@ fn shootdownCr3Context(target_cr3: u64) void {
     tlb_shootdown_lock.lock();
     defer tlb_shootdown_lock.unlock();
 
-    const target_cpu_mask = scheduler.cpuMaskRunningCr3(target_cr3);
+    // A CPU can enter this CR3 after a "currently running" snapshot but
+    // before the changed PTE is flushed. Broadcast to every online CPU so
+    // both current users and concurrent entrants observe the new mapping.
+    const target_cpu_mask = smp.onlineCpuMask();
 
     var generation = @atomicLoad(u64, &tlb_shootdown_generation, .monotonic) +% 1;
     if (generation == 0) generation = 1;
@@ -419,7 +421,15 @@ fn shootdownCr3Context(target_cr3: u64) void {
     while (cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
         const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;
         if (!targeted or cpu_slot == current_cpu) continue;
+        var spins: u32 = 0;
         while (@atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .acquire) != generation) {
+            spins +%= 1;
+            if ((spins & 0xFFF) == 0) {
+                // Lost or coalesced IPIs must not turn correctness into a
+                // timeout policy. Keep retransmitting until this generation
+                // is explicitly acknowledged.
+                _ = smp.interruptCpu(cpu_slot);
+            }
             asm volatile ("sti; pause; cli" ::: .{ .memory = true });
         }
     }

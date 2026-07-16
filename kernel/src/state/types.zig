@@ -232,6 +232,10 @@ pub const TaskObjectState = enum(u8) {
     killed = 3,
     stopped = 4,
     continued = 5,
+
+    pub fn isTerminal(self: TaskObjectState) bool {
+        return self == .exited or self == .killed;
+    }
 };
 
 pub const ProcessObject = struct {

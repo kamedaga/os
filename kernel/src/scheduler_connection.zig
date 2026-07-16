@@ -118,6 +118,7 @@ pub const ThreadContext = struct {
     ready: bool = false,
     wait_mailbox: bool = false,
     stopped: bool = false,
+    resume_after_stop: bool = false,
     pending_signal_mask: u64 = 0,
     signal_interrupt_consumed: bool = false,
     signal_entry: u64 = 0,
@@ -175,6 +176,22 @@ pub var scheduler_switch_count: u64 = 0;
 pub var scheduler_timer_log_once: u8 = 0;
 pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
 pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
+var principal_lifecycle_gate: u8 = 0;
+var principal_lifecycle_target_raw: usize = std.math.maxInt(usize);
+var principal_lifecycle_pending_action: u8 = 0;
+var principal_lifecycle_pending_code: u32 = 0;
+
+pub const PrincipalLifecycleAction = enum(u8) {
+    none = 0,
+    stop = 1,
+    continue_process = 2,
+    kill = 3,
+};
+
+pub const PendingPrincipalLifecycleAction = struct {
+    action: PrincipalLifecycleAction,
+    code: u32,
+};
 
 pub const ExternalSchedulerEvent = extern struct {
     size: u32 = @intCast(scheduler_abi.sched_event_size),
@@ -1424,6 +1441,10 @@ pub fn staticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_switch_count), &scheduler_switch_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_fx_state), &initial_fx_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_interrupt_fx_state), &kernel_interrupt_fx_state));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_gate), &principal_lifecycle_gate));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_target_raw), &principal_lifecycle_target_raw));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_pending_action), &principal_lifecycle_pending_action));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_pending_code), &principal_lifecycle_pending_code));
     return end;
 }
 
@@ -1450,21 +1471,110 @@ pub fn currentCr3() u64 {
     return state.current_cr3;
 }
 
-/// Snapshot CPUs that currently own `target_cr3`.  User CR3 loads never set
-/// the no-flush bit, so a CPU that enters this address space after the
-/// snapshot will invalidate the PCID as part of that load.
-pub fn cpuMaskRunningCr3(target_cr3: u64) u64 {
-    if (target_cr3 == 0) return 0;
+/// Serialize process lifecycle transitions while a remote principal is being
+/// driven to a user/kernel boundary.  Callers hold the kernel-state lock when
+/// acquiring this gate, so acquisition must never spin: a quiescing caller has
+/// deliberately dropped that lock and may be waiting for this CPU.
+pub fn tryBeginPrincipalLifecycle(target: kernel.PrincipalId) bool {
+    if (@cmpxchgStrong(u8, &principal_lifecycle_gate, 0, 1, .acquire, .monotonic) != null) {
+        return false;
+    }
+    principal_lifecycle_target_raw = @intFromEnum(target);
+    principal_lifecycle_pending_code = 0;
+    @atomicStore(u8, &principal_lifecycle_pending_action, @intFromEnum(PrincipalLifecycleAction.none), .monotonic);
+    @atomicStore(u8, &principal_lifecycle_gate, 2, .release);
+    return true;
+}
+
+pub fn endPrincipalLifecycle() void {
+    @atomicStore(u8, &principal_lifecycle_pending_action, @intFromEnum(PrincipalLifecycleAction.none), .monotonic);
+    principal_lifecycle_pending_code = 0;
+    principal_lifecycle_target_raw = std.math.maxInt(usize);
+    @atomicStore(u8, &principal_lifecycle_gate, 0, .release);
+}
+
+pub fn principalLifecycleTargets(principal: kernel.PrincipalId) bool {
+    return @atomicLoad(u8, &principal_lifecycle_gate, .acquire) == 2 and
+        principal_lifecycle_target_raw == @intFromEnum(principal);
+}
+
+/// Record the last non-terminal lifecycle request while the owner has dropped
+/// the kernel-state lock. Kill is terminal and cannot be overwritten.
+pub fn requestPrincipalLifecycleAction(
+    principal: kernel.PrincipalId,
+    action: PrincipalLifecycleAction,
+    code: u32,
+) bool {
+    if (action == .none or !principalLifecycleTargets(principal)) return false;
+    const current: PrincipalLifecycleAction = @enumFromInt(
+        @atomicLoad(u8, &principal_lifecycle_pending_action, .acquire),
+    );
+    if (current == .kill) return action == .kill;
+    principal_lifecycle_pending_code = code;
+    @atomicStore(u8, &principal_lifecycle_pending_action, @intFromEnum(action), .release);
+    return true;
+}
+
+pub fn takePrincipalLifecycleAction(principal: kernel.PrincipalId) PendingPrincipalLifecycleAction {
+    if (!principalLifecycleTargets(principal)) return .{ .action = .none, .code = 0 };
+    const raw = @atomicRmw(
+        u8,
+        &principal_lifecycle_pending_action,
+        .Xchg,
+        @intFromEnum(PrincipalLifecycleAction.none),
+        .acq_rel,
+    );
+    return .{ .action = @enumFromInt(raw), .code = principal_lifecycle_pending_code };
+}
+
+pub fn cpuMaskRunningPrincipal(principal: kernel.PrincipalId) u64 {
     var mask: u64 = 0;
     var cpu_slot: usize = 0;
     while (cpu_slot < scheduler_state.cpus.len and cpu_slot < 64) : (cpu_slot += 1) {
         const state = &scheduler_state.cpus[cpu_slot];
         state.lock.lock();
-        const owns_cr3 = state.enabled and !state.is_idle and state.current_cr3 == target_cr3;
+        const owns_principal = state.enabled and !state.is_idle and
+            state.current_principal != null and state.current_principal.? == principal;
         state.lock.unlock();
-        if (owns_cr3) mask |= @as(u64, 1) << @intCast(cpu_slot);
+        if (owns_principal) mask |= @as(u64, 1) << @intCast(cpu_slot);
     }
     return mask;
+}
+
+/// Actively drive every CPU executing `principal` through the scheduler IPI
+/// safe point.  There is intentionally no elapsed-time escape: teardown is
+/// permitted only after the ownership snapshot reaches zero.
+fn waitForPrincipalQuiescenceIgnoring(principal: kernel.PrincipalId, ignored_mask: u64) void {
+    var iterations: u64 = 0;
+    while (true) {
+        const mask = cpuMaskRunningPrincipal(principal) & ~ignored_mask;
+        if (mask == 0) return;
+        iterations +%= 1;
+        if (iterations == 100_000) {
+            kernel_log.writeFmt(
+                "[kernel] lifecycle quiescence pending principal={} mask=0x{x}\n",
+                .{ @intFromEnum(principal), mask },
+            );
+        }
+        var cpu_slot: usize = 0;
+        while (cpu_slot < scheduler_state.cpus.len and cpu_slot < 64) : (cpu_slot += 1) {
+            if ((mask & (@as(u64, 1) << @intCast(cpu_slot))) == 0) continue;
+            _ = smp.interruptCpu(cpu_slot);
+        }
+        // Syscalls enter with IF clear.  Open an interrupt window so this CPU
+        // can still acknowledge cross-CPU maintenance while it coordinates.
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+    }
+}
+
+pub fn waitForPrincipalQuiescence(principal: kernel.PrincipalId) void {
+    waitForPrincipalQuiescenceIgnoring(principal, 0);
+}
+
+pub fn waitForRemotePrincipalQuiescence(principal: kernel.PrincipalId) void {
+    const cpu_slot = currentCpu();
+    const ignored = if (cpu_slot < 64) @as(u64, 1) << @intCast(cpu_slot) else 0;
+    waitForPrincipalQuiescenceIgnoring(principal, ignored);
 }
 
 fn buildInitialCpuSchedulerStates() [smp.max_cpus]CpuSchedulerState {
@@ -1607,6 +1717,64 @@ pub fn apUserThreadCanContinue() bool {
         ctx.ready and
         hot.ready != 0 and
         ctx.cpu_slot == cpu_slot;
+}
+
+/// Save a stopped thread at an interrupt boundary and sever the scheduler's
+/// CPU ownership before its process can be torn down.  The caller has already
+/// saved the architectural FX state for the interrupted user context.
+pub fn quiesceStoppedCurrentUserThread(frame: *const TrapFrame) bool {
+    const cpu_slot = currentCpu();
+    const state = schedulerStateForSlot(cpu_slot) orelse return false;
+    state.lock.lock();
+    scheduler_state.thread_table.lock();
+    const thread_index = state.current_thread;
+    const ctx = threadContextMutable(thread_index) orelse {
+        scheduler_state.thread_table.unlock();
+        state.lock.unlock();
+        return false;
+    };
+    if (!ctx.allocated or !ctx.stopped or ctx.owner_process != state.current_principal) {
+        scheduler_state.thread_table.unlock();
+        state.lock.unlock();
+        return false;
+    }
+    ctx.frame = frame.*;
+    if (state.current_cr3 != 0) ctx.cr3 = state.current_cr3;
+    ctx.fs_base = x86_platform.readFsBase();
+    ctx.gs_base = x86_platform.readGsBase();
+    ctx.pkru = x86_platform.readPkru();
+    ctx.ready = false;
+    setThreadHotCr3(thread_index, ctx.cr3);
+    setThreadHotReady(thread_index, false);
+    state.current_thread = state.idle_thread;
+    state.current_principal = null;
+    state.current_cr3 = 0;
+    state.is_idle = true;
+    state.tick_accum = 0;
+    scheduler_state.thread_table.unlock();
+    state.lock.unlock();
+    return true;
+}
+
+/// Complete a self-stop at the syscall boundary. The stopped frame remains
+/// dormant until PROCESS_CONTINUE republishes it; this syscall never returns
+/// to the stopped user context merely because a timer tick has not arrived.
+pub fn parkStoppedCurrentThread(
+    frame: *TrapFrame,
+    resume_rax: u64,
+    before_leave: ?BeforeCurrentThreadLeaveCallback,
+) bool {
+    var stopped_frame = frame.*;
+    stopped_frame.rax = resume_rax;
+    if (!quiesceStoppedCurrentUserThread(&stopped_frame)) return false;
+    if (before_leave) |callback| callback.run(callback.context);
+    if (!isBootstrapSchedulerCpu()) {
+        smp.returnCurrentApToIdleFromInterrupt();
+    }
+    while (!loadNextReadyThread(frame)) {
+        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+    }
+    return true;
 }
 
 pub fn shouldPreemptApUserThread() bool {
@@ -1755,6 +1923,7 @@ fn initializeThreadContextWithReadyState(
     ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
     ctx.stopped = false;
+    ctx.resume_after_stop = false;
     ctx.pending_signal_mask = 0;
     ctx.signal_interrupt_consumed = false;
     ctx.signal_entry = 0;
@@ -2022,6 +2191,7 @@ pub fn installExecContextForCurrentThread(
         ctx.wait_mailbox = false;
         ctx.wake_tick = 0;
         ctx.stopped = false;
+        ctx.resume_after_stop = false;
         syncHotStateFromContext(current_thread);
     }
     scheduler_state.thread_table.unlock();
@@ -2239,6 +2409,7 @@ pub fn wakeIfWaiting(thread_index: usize) void {
     ctx.wait_mailbox = false;
     ctx.wake_tick = 0;
     if (ctx.stopped) {
+        ctx.resume_after_stop = true;
         ctx.ready = false;
         setThreadHotWaitState(thread_index, false, 0, false);
         return;
@@ -2273,6 +2444,7 @@ fn wakeIfWaitingGenerationInternal(
     ctx.wait_mailbox = false;
     ctx.wake_tick = 0;
     if (ctx.stopped) {
+        ctx.resume_after_stop = true;
         ctx.ready = false;
         setThreadHotWaitState(thread_index, false, 0, false);
         return true;
@@ -2507,13 +2679,21 @@ pub fn restoreCurrentSignalFxState(saved: *const [fx_state_bytes]u8) bool {
 
 pub fn stopPrincipalThreads(principal: kernel.PrincipalId) usize {
     var stopped_count: usize = 0;
+    // Serialize against the final state.current_principal publication in an
+    // idle-CPU claim.  After these locks are released, a stopped thread is
+    // either already visible in a CPU ownership slot or cannot be claimed.
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     var i: usize = 0;
     while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
         const ctx = threadContextMutable(i) orelse continue;
         if (!ctx.allocated or ctx.owner_process != principal) continue;
-        ctx.stopped = true;
+        if (!ctx.stopped) {
+            ctx.stopped = true;
+            ctx.resume_after_stop = ctx.ready;
+        }
         ctx.ready = false;
         setThreadHotStopped(i, true);
         setThreadHotReady(i, false);
@@ -2525,8 +2705,6 @@ pub fn stopPrincipalThreads(principal: kernel.PrincipalId) usize {
 
 pub fn continuePrincipalThreads(principal: kernel.PrincipalId) usize {
     var continued_count: usize = 0;
-    var publish_buf: [initialThreadCapacity]usize = undefined;
-    var publish_count: usize = 0;
     {
         scheduler_state.thread_table.lock();
         defer scheduler_state.thread_table.unlock();
@@ -2534,21 +2712,30 @@ pub fn continuePrincipalThreads(principal: kernel.PrincipalId) usize {
         while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
             const ctx = threadContextMutable(i) orelse continue;
             if (!ctx.allocated or ctx.owner_process != principal or !ctx.stopped) continue;
+            const ready = ctx.resume_after_stop;
             ctx.stopped = false;
-            ctx.ready = true;
+            ctx.resume_after_stop = false;
+            ctx.ready = ready;
             setThreadHotStopped(i, false);
-            setThreadHotReady(i, true);
-            if (!policyActive()) verifiedWakeThread(i);
-            if (publish_count < publish_buf.len) {
-                publish_buf[publish_count] = i;
-                publish_count += 1;
-            }
+            setThreadHotReady(i, ready);
+            if (ready and !policyActive()) verifiedWakeThread(i);
             continued_count += 1;
         }
     }
+    // The table grows dynamically, so do not cap ready publication at the
+    // bootstrap capacity. Under an external policy resumed threads cannot run
+    // before their ready event, making this unlocked second pass stable.
     var i: usize = 0;
-    while (i < publish_count) : (i += 1) {
-        publishThreadReady(publish_buf[i]);
+    while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
+        scheduler_state.thread_table.lock();
+        const ctx = threadContext(i);
+        const should_publish = if (ctx) |thread|
+            thread.allocated and thread.owner_process == principal and
+                !thread.stopped and thread.ready
+        else
+            false;
+        scheduler_state.thread_table.unlock();
+        if (should_publish) publishThreadReady(i);
     }
     return continued_count;
 }
