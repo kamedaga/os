@@ -51,8 +51,8 @@ static int prepare_environment(void)
         { "FONTCONFIG_FILE", "/etc/fonts/fonts.conf" },
         { "PATH", "/bin:/usr/bin:/cmd" },
         { "HOME", "/home" },
-        { "SHELL", "/bin/ash" },
-        { "TERM", "linux" },
+        { "SHELL", "/bin/bash" },
+        { "TERM", "xterm" },
         { "LD_LIBRARY_PATH", "/lib/linux:/usr/lib" },
     };
     if (unsetenv("LP_NUM_THREADS") != 0 || unsetenv("LD_PRELOAD") != 0) {
@@ -139,7 +139,7 @@ static int readiness_failure_code(pid_t child)
     return 125;
 }
 
-static pid_t start_sway(int *release_fd)
+static pid_t start_shell(int *release_fd)
 {
     int gate[2];
     if (release_fd == NULL || pipe(gate) != 0) {
@@ -167,15 +167,16 @@ static pid_t start_sway(int *release_fd)
     } while (received < 0 && errno == EINTR);
     (void)close(gate[0]);
     if (received != 1) {
-        perror("wait foreground sway release");
+        perror("wait foreground shell release");
         _exit(127);
     }
-    execl("/usr/bin/sway", "sway", (char *)NULL);
-    perror("exec sway");
+    execl("/bin/bash", "bash", "--noprofile", "--norc", "-i",
+        (char *)NULL);
+    perror("exec shell");
     _exit(127);
 }
 
-static int release_sway(int fd)
+static int release_child(int fd)
 {
     const unsigned char release = 1;
     ssize_t written;
@@ -230,48 +231,48 @@ int main(void)
         const int failure = readiness_failure_code(seatd);
         return failure;
     }
-    int sway_release_fd = -1;
-    const pid_t sway = start_sway(&sway_release_fd);
-    if (sway < 0) {
-        perror("fork sway");
+    int shell_release_fd = -1;
+    const pid_t shell = start_shell(&shell_release_fd);
+    if (shell < 0) {
+        perror("fork shell");
         (void)stop_seatd(seatd);
         return 41;
     }
-    if (setpgid(sway, sway) != 0 && errno != EACCES) {
-        perror("set sway process group");
-        (void)close(sway_release_fd);
-        (void)kill(sway, SIGTERM);
+    if (setpgid(shell, shell) != 0 && errno != EACCES) {
+        perror("set shell process group");
+        (void)close(shell_release_fd);
+        (void)kill(shell, SIGTERM);
         int ignored_status = 0;
-        (void)wait_for_child(sway, &ignored_status);
+        (void)wait_for_child(shell, &ignored_status);
         (void)stop_seatd(seatd);
         return 42;
     }
-    if (tcsetpgrp(STDIN_FILENO, sway) != 0) {
-        perror("set foreground sway");
-        (void)close(sway_release_fd);
-        (void)kill(sway, SIGTERM);
+    if (tcsetpgrp(STDIN_FILENO, shell) != 0) {
+        perror("set foreground shell");
+        (void)close(shell_release_fd);
+        (void)kill(shell, SIGTERM);
         int ignored_status = 0;
-        (void)wait_for_child(sway, &ignored_status);
+        (void)wait_for_child(shell, &ignored_status);
         (void)stop_seatd(seatd);
         return 43;
     }
-    if (release_sway(sway_release_fd) != 0) {
-        perror("release foreground sway");
-        (void)kill(sway, SIGTERM);
+    if (release_child(shell_release_fd) != 0) {
+        perror("release foreground shell");
+        (void)kill(shell, SIGTERM);
         int ignored_status = 0;
-        (void)wait_for_child(sway, &ignored_status);
+        (void)wait_for_child(shell, &ignored_status);
         (void)stop_seatd(seatd);
         return 44;
     }
-    int sway_status = 0;
-    if (wait_for_child(sway, &sway_status) != 0) {
-        perror("wait sway");
+    int shell_status = 0;
+    if (wait_for_child(shell, &shell_status) != 0) {
+        perror("wait shell");
         (void)stop_seatd(seatd);
         return 45;
     }
-    const int exit_code = child_exit_code(sway_status);
+    const int exit_code = child_exit_code(shell_status);
     if (exit_code != 0) {
-        fprintf(stderr, "pacha-user-session: sway exited with status %d\n",
+        fprintf(stderr, "pacha-user-session: shell exited with status %d\n",
             exit_code);
     }
     if (stop_seatd(seatd) != 0 && exit_code == 0) {

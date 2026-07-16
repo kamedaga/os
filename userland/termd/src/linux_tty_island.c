@@ -143,7 +143,9 @@ typedef struct termd_linux_tty_handle {
     uint32_t pgrp_id;
     uint32_t reserved_owner;
     int notify_fd;
-    uint32_t reserved_notify;
+    uint32_t notify_events;
+    uint8_t notify_pending;
+    uint8_t reserved_notify[3];
     void *cdev;
     void *fops;
     void *open;
@@ -272,12 +274,15 @@ static void drain_linux_tty_work(void)
     kb_run_deferred_work();
 }
 
+static void termd_linux_tty_notify_ready(void);
+
 void termd_linux_tty_island_pump(struct termd_linux_tty_island *island)
 {
     if (island == NULL || !island->ready) {
         return;
     }
     drain_linux_tty_work();
+    termd_linux_tty_notify_ready();
 }
 
 static int enter_owner_context(kb_module_t *owner, termd_linux_owner_context_t *context)
@@ -1397,6 +1402,54 @@ static uint32_t termd_linux_poll_mask_to_wire(uint32_t mask)
     return revents;
 }
 
+static uint32_t termd_linux_tty_poll_handle(
+    termd_linux_tty_handle_t *handle,
+    uint32_t events)
+{
+    if (handle == NULL || handle->poll == NULL) {
+        return TERMD_POLLERR;
+    }
+    termd_linux_owner_context_t context;
+    const int has_context =
+        enter_handle_function_context(handle, handle->poll, &context);
+    const uint32_t mask =
+        ((termd_linux_fops_poll_fn)handle->poll)(handle->file, NULL);
+    if (has_context) {
+        leave_owner_context(&context);
+    }
+    return termd_linux_poll_mask_to_wire(mask) & (
+        events |
+        TERMD_POLLERR |
+        TERMD_POLLHUP);
+}
+
+static void termd_linux_tty_notify_ready(void)
+{
+    for (size_t i = 0; i < TERMD_LINUX_TTY_HANDLE_MAX; ++i) {
+        termd_linux_tty_handle_t *handle = &tty_handles[i];
+        if (!handle->active ||
+            handle->notify_fd < 16 ||
+            handle->notify_pending ||
+            handle->notify_events == 0)
+        {
+            continue;
+        }
+        const uint32_t revents = termd_linux_tty_poll_handle(
+            handle, handle->notify_events);
+        if (revents == 0) {
+            continue;
+        }
+        const struct pacha_ipc_msg message = {
+            .word0 = 0x5454594556454e54ull,
+            .word1 = handle->handle,
+            .word2 = revents,
+        };
+        if (pacha_ipc_send(handle->notify_fd, &message) == 0) {
+            handle->notify_pending = 1;
+        }
+    }
+}
+
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
     termd_poll_request_t *request)
@@ -1427,17 +1480,13 @@ int termd_linux_tty_island_poll(
         return 0;
     }
 
-    termd_linux_owner_context_t context;
-    int has_context = enter_handle_function_context(handle, handle->poll, &context);
     drain_linux_tty_work();
-    const uint32_t mask = ((termd_linux_fops_poll_fn)handle->poll)(handle->file, NULL);
-    if (has_context) {
-        leave_owner_context(&context);
+    handle->notify_pending = 0;
+    handle->notify_events &= ~request->events;
+    request->revents = termd_linux_tty_poll_handle(handle, request->events);
+    if (request->revents == 0) {
+        handle->notify_events |= request->events;
     }
-    request->revents = termd_linux_poll_mask_to_wire(mask) & (
-        request->events |
-        TERMD_POLLERR |
-        TERMD_POLLHUP);
     return 0;
 }
 

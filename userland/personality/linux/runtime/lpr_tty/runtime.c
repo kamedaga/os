@@ -261,6 +261,10 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events)
     if (page_fd < 0) {
         return 0;
     }
+    lpr_tty_backend_t *tty = lpr_tty_backend(fd);
+    if (tty != 0 && tty->wait_fd.raw >= 16) {
+        lpr_native_wait_drain(tty->wait_fd.raw);
+    }
     termd_poll_request_t *poll_req = (termd_poll_request_t *)lpr_termd_payload(page);
     lpr_memset(poll_req, 0, sizeof(*poll_req));
     poll_req->handle = lpr_tty_backend(fd)->handle;
