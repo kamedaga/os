@@ -204,7 +204,7 @@ pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
         : .{ .memory = true });
 }
 
-pub export fn restoreCurrentThreadFxState() callconv(.winapi) void {
+pub export fn restoreCurrentThreadFxState() callconv(.c) void {
     if (!kernel_runtime.kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;

@@ -93,7 +93,7 @@ extern var user_return_saved_gprs: [15]u64 align(16);
 extern var user_return_iret_frame: [5]u64 align(16);
 
 extern fn saveCurrentThreadFxState() callconv(.winapi) void;
-extern fn restoreCurrentThreadFxState() callconv(.winapi) void;
+extern fn restoreCurrentThreadFxState() callconv(.c) void;
 extern fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64;
 extern fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) callconv(.winapi) void;
 
