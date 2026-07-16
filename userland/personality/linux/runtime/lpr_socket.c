@@ -2148,9 +2148,18 @@ static int64_t lpr_linux_wait_mask_begin(
     return status;
 }
 
-static void lpr_linux_wait_mask_end(uint64_t sigmask, uint64_t old_mask)
+static void lpr_linux_wait_mask_end(
+    uint64_t sigmask,
+    uint64_t old_mask,
+    int64_t result)
 {
     if (sigmask == 0) return;
+    /* ppoll/pselect6 must expose the temporary mask through the complete
+     * atomic wait.  A native signal can become pending at the same time as an
+     * fd becomes ready, so attempt delivery before restoring the caller mask. */
+    lpr_linux_deliver_native_pending_frame(
+        result == LPR_WAIT_RESTART_SYSCALL ?
+            -LPR_LINUX_EINTR : result);
     (void)lpr_linux_rt_sigprocmask(
         LPR_LINUX_SIG_SETMASK,
         (uint64_t)(uintptr_t)&old_mask,
@@ -2190,7 +2199,7 @@ int64_t lpr_linux_ppoll(uint64_t fds, uint64_t nfds, uint64_t timeout_ts, uint64
     if (mask_status != 0) return mask_status;
     const int64_t result = lpr_linux_poll_wait(
         (lpr_linux_pollfd_t *)(uintptr_t)fds, nfds, timeout_ms);
-    lpr_linux_wait_mask_end(sigmask, old_mask);
+    lpr_linux_wait_mask_end(sigmask, old_mask, result);
     return result;
 }
 
@@ -2458,6 +2467,6 @@ int64_t lpr_linux_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds, u
     if (mask_status != 0) return mask_status;
     const int64_t result = lpr_linux_select_wait(
         nfds, readfds, writefds, exceptfds, timeout_ms);
-    lpr_linux_wait_mask_end(sigmask_pointer, old_mask);
+    lpr_linux_wait_mask_end(sigmask_pointer, old_mask, result);
     return result;
 }

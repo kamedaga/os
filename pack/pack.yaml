@@ -181,6 +181,16 @@ apps:
       path: "tests/fixtures/sway_phase1_acceptance.conf"
     out: "SWAYP1AC.CFG"
     rootfs: "/cmd/sway_phase1_acceptance.conf"
+  sway_foot_exit_acceptance_script:
+    file:
+      path: "tests/fixtures/sway_foot_exit_acceptance.sh"
+    out: "SWAYFTEX.SH"
+    rootfs: "/cmd/sway_foot_exit_acceptance.sh"
+  sway_foot_exit_acceptance_config:
+    file:
+      path: "tests/fixtures/sway_foot_exit_acceptance.conf"
+    out: "SWAYFTEX.CFG"
+    rootfs: "/cmd/sway_foot_exit_acceptance.conf"
   sway_inventory_script:
     file:
       path: "tests/fixtures/sway_inventory.sh"

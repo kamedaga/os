@@ -661,6 +661,13 @@ int64_t lpr_linux_epoll_pwait(
     }
     const int64_t result = lpr_linux_epoll_wait(epfd, events, maxevents, timeout);
     if (sigmask != 0) {
+        /* Keep the temporary mask active until a native signal published
+         * concurrently with an fd event has had a chance to claim the Linux
+         * return frame.  Signal delivery abandons this dispatch stack; the
+         * signal frame restores old_mask on rt_sigreturn. */
+        lpr_linux_deliver_native_pending_frame(
+            result == LPR_WAIT_RESTART_SYSCALL ?
+                -LPR_LINUX_EINTR : result);
         (void)lpr_linux_rt_sigprocmask(
             LPR_LINUX_SIG_SETMASK,
             (uint64_t)(uintptr_t)&old_mask,

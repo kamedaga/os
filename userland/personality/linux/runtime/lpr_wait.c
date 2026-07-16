@@ -282,11 +282,8 @@ int64_t lpr_wait_graph_block(
             0);
     }
 
-    int graph_ready = 0;
     if (status >= 0) {
         for (uint32_t i = 0; i < graph->leaf_count; ++i) {
-            if (graph->leaves[i].revents != 0)
-                graph_ready = 1;
             if ((graph->leaves[i].revents & PACHA_FD_EVENT_READABLE) == 0)
                 continue;
             if (graph->drain_modes[i] == LPR_WAIT_DRAIN_EVENT)
@@ -299,11 +296,14 @@ int64_t lpr_wait_graph_block(
     if (lpr_linux_pump_tty_signals())
         return LPR_WAIT_RESTART_SYSCALL;
 
-    const int not_ready = !graph_ready &&
-        (status == PACHA_SYSCALL_ERR_NOT_READY ||
+    /* NOT_READY is also the signal-interrupt resume value.  Unwind even if a
+     * concurrent fd event populated revents so the dispatcher can deliver the
+     * pending native frame before the atomic wait restores its signal mask. */
+    const int retryable_wake =
+        status == PACHA_SYSCALL_ERR_NOT_READY ||
          status == -PACHA_SYSCALL_ERR_NOT_READY ||
-         status == -LPR_LINUX_EAGAIN);
-    if (not_ready) {
+         status == -LPR_LINUX_EAGAIN;
+    if (retryable_wake) {
         int timed_out = 0;
         if (wait_ns != UINT64_MAX) {
             uint64_t now_ns = 0;
