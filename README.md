@@ -17,30 +17,40 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 
 ## Features
 
-- **Pure Microkernel** — カーネルは ファイルディスクリプタ 管理・スケジューリング・trap delegation のみを担当
 - **FD-based Microkernel** — Capabilityとほぼ特性の同じ権限ベースのFD(File Descriptor)を採用していて、厳格なセキュリティとLinux ABIおよびPOSIXの相性の良さを両立しています
 - **Linux Personality Runtime** — Linux syscallをzpolineを用いてcallqに置き換えることで、動的にリンクされるshimが呼び出されprocess内で完結します。
-- **Hardware FD** — capsule を用いた、デバイスアクセスおよび特権命令の抽象化
-- **Linux ABI Compatibility** — 無改造の Linuxバイナリ を動的リンクでロードし、Linux syscall をユーザーランドで処理
-- **Userland Drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
+- **Kobox** — capsule を用いた、ユーザー空間で動くLinuxカーネルモジュールの変換レイヤー
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
 - **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます
-- **Minimal Kernel** — 20k以下を維持するマイクロカーネルです。(現在16k) 
 
 ## Update
 - Linux Personality Runtimeを実装しました
-- カーネルを再設計しFD-based Microkernelへ変更しました
+- カーネルをFD-based Microkernelへ変更しました
 - 独自ドライバからkoboxに全面移行しました。
 - Linux ABIレイヤーなしで musl libcに対応しました。
-- その影響ですべての既存のソースコードが動かなくなりました。現在修正中です。
-
 
 ## Tech Stack
 
+## Language
 | Layer | Language | Detail |
 |---|---|---|
 | Kernel | Zig / C / Rocq | Freestanding / UEFI boot / x86_64 |
 | Userland | C / CMake | musl libc / ELF loader / Linux ABI server |
+| Tools | Go / Nix / bash | Build Tools  |
+
+## Core Functions
+
+| Name | Detail |
+|---|---|
+| Filed | Ext4 / vnode / NVMe|
+| Netd | libuinet / net-driver |
+| Scheduler | EEVDF / SMP |
+| seed | Init |
+| Termd | Linux TTY |
+| Drmd | DRM / KMS |
+| LPR | Zpoline / LinuxShim ...|
+
+
 
 ---
 
@@ -49,7 +59,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
 musl ビルドで確認済み。
 
-`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway`
 
 ### Python3 on PachaOS
 
@@ -62,7 +72,7 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 >>>
 ```
 
-**PachaOS Capsule バックエンドで動作中**
+**Kobox**
 
 | Module | Module |
 |---|---|
@@ -70,7 +80,10 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 | USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
 | USB HID(マウスで実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
 | Ext4 | `crc16.ko` / `mbcache.ko` / `jbd2.ko` / `ext4.ko`|
-| virtio-net| `virtio.ko` / `virtio_ring` / `virtio_pci.ko` / `failover.ko` / `net_failover.ko `/ `virtio_net.ko` |
+| virtio-net | `virtio.ko` / `virtio_ring` / `virtio_pci.ko` / `failover.ko` / `net_failover.ko `/ `virtio_net.ko` |
+| linux tty | `linux_tty_core.ko` |
+| virtio-input | `linux_virtio_input.ko` ...|
+
 
 koboxはcapabilityベースからFDベースに切り替え、ネイティブABIで自然にlibcが動いたため、daemonとして動くようになりました。
 
@@ -94,3 +107,4 @@ nix develop
 
 PachaOS source code is licensed under the **MIT License**.  
 Third-party runtime components are documented in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
