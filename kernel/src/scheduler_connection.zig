@@ -8,7 +8,6 @@ const scheduler_observer = @import("scheduler_observer.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const kernel_log = @import("kernel_log.zig");
 const log_util = @import("log_util.zig");
-const scheduler_abi = @import("kernel_abi_root").scheduler_abi;
 pub const verified_sched = @import("verified_sched.zig");
 
 const TrapFrame = interrupts.TrapFrame;
@@ -26,17 +25,7 @@ const fx_state_bytes: usize = 512;
 pub const maxThreadSlots: usize = kernel.max_thread_slots;
 pub const initialThreadCapacity: usize = kernel.initial_thread_capacity;
 pub const idleThreadMarker: usize = maxThreadSlots;
-const max_external_scheduler_events: usize = 256;
-const external_runtime_ns_per_tick: u64 = 1_000_000;
-const ap_user_dispatch_enabled = true;
-
-const scheduler_trace_commit: u64 = 1 << 0;
-const scheduler_trace_ap_entry: u64 = 1 << 1;
-const scheduler_trace_ap_tick: u64 = 1 << 2;
-const scheduler_trace_ap_block: u64 = 1 << 3;
-const scheduler_trace_wake: u64 = 1 << 4;
-const scheduler_trace_timer_due: u64 = 1 << 5;
-const scheduler_trace_metric: u64 = 1 << 6;
+const runtime_ns_per_tick: u64 = 1_000_000;
 
 fn schedulerLocksMaskInterrupts() bool {
     return !builtin.is_test;
@@ -96,10 +85,7 @@ const CpuSchedulerState = struct {
     current_principal: ?kernel.PrincipalId = null,
     current_cr3: u64 = 0,
     idle_thread: usize = idleThreadMarker,
-    pending_commit_thread: ?usize = null,
-    pending_commit_generation: u32 = 0,
     tick_accum: u64 = 0,
-    idle_event_pending: bool = false,
     enabled: bool = false,
     is_idle: bool = true,
 };
@@ -193,27 +179,11 @@ pub const PendingPrincipalLifecycleAction = struct {
     code: u32,
 };
 
-pub const ExternalSchedulerEvent = extern struct {
-    size: u32 = @intCast(scheduler_abi.sched_event_size),
-    version: u16 = scheduler_abi.abi_version,
-    event_type: u16 = 0,
-    sequence: u64 = 0,
-    cpu_id: u32 = 0,
-    reserved0: u32 = 0,
-    thread_id: u64 = scheduler_abi.no_thread,
-    generation: u64 = 0,
-    runtime_ns: u64 = 0,
-    weight: u64 = 0,
-    slice_ns: u64 = 0,
-};
-
 const ThreadTableState = struct {
     lock_state: SchedulerSpinLock = .{},
     contexts: []ThreadContext = initial_thread_contexts[0..],
     hot_states: []ThreadHotState = initial_thread_hot_states[0..],
     next_cpu_cursor: usize = bootstrap_cpu_slot,
-    ipc_wake_resume_tsc: [initialThreadCapacity]u64 = [_]u64{0} ** initialThreadCapacity,
-    ipc_wake_resume_cpu: [initialThreadCapacity]u16 = [_]u16{0} ** initialThreadCapacity,
 
     fn lock(self: *ThreadTableState) void {
         self.lock_state.lock();
@@ -224,32 +194,9 @@ const ThreadTableState = struct {
     }
 };
 
-const ExternalSchedulerState = struct {
-    lock_state: SchedulerSpinLock = .{},
-    enabled: bool = false,
-    policy_thread: ?usize = null,
-    events: [max_external_scheduler_events]ExternalSchedulerEvent =
-        [_]ExternalSchedulerEvent{.{}} ** max_external_scheduler_events,
-    event_head: usize = 0,
-    event_len: usize = 0,
-    next_sequence: u64 = 1,
-    trace_mask: u64 = 0,
-    ap_claim_trace_count: u32 = 0,
-    ready_event_seen: u8 = 0,
-
-    fn lock(self: *ExternalSchedulerState) void {
-        self.lock_state.lock();
-    }
-
-    fn unlock(self: *ExternalSchedulerState) void {
-        self.lock_state.unlock();
-    }
-};
-
 const VerifiedCoreState = struct {
     lock_state: SchedulerSpinLock = .{},
     state: verified_sched.State = undefined,
-    probe_state: verified_sched.State = undefined,
     runqueue_scratch: verified_sched.Runqueue = undefined,
     pick_scratch: verified_sched.PickResult = undefined,
     decision: verified_sched.Decision = undefined,
@@ -268,7 +215,6 @@ const VerifiedCoreState = struct {
 
 const SchedulerState = struct {
     thread_table: ThreadTableState = .{},
-    external: ExternalSchedulerState = .{},
     verified: VerifiedCoreState = .{},
     cpus: [smp.max_cpus]CpuSchedulerState = buildInitialCpuSchedulerStates(),
 };
@@ -303,12 +249,6 @@ fn threadIndexFromVerifiedThreadId(thread_id: i64) ?usize {
     return index;
 }
 
-fn verifiedThreadIdFromExternal(thread_id: u64, generation: u64) ?i64 {
-    if (generation > std.math.maxInt(u32)) return null;
-    const thread_index = threadIndexFromExternalId(thread_id) orelse return null;
-    return verifiedThreadIdForGeneration(thread_index, @intCast(generation));
-}
-
 fn verifiedThreadCpu(thread_index: usize) usize {
     const cpu_id = threadAssignedCpuSlot(thread_index);
     return if (cpu_id < verifiedCoreCpuCount()) cpu_id else bootstrap_cpu_slot;
@@ -330,8 +270,8 @@ fn noteVerifiedCoreIssue(comptime op: []const u8, rc: verified_sched.SchedRc, th
 
 fn noteVerifiedCoreMismatch(
     cpu_id: usize,
-    expected_thread_id: u64,
-    expected_generation: u64,
+    expected_thread_id: i64,
+    expected_generation: u32,
     decision: verified_sched.Decision,
 ) void {
     const old = @atomicRmw(u32, &scheduler_state.verified.log_count, .Add, 1, .acq_rel);
@@ -344,7 +284,6 @@ fn noteVerifiedCoreMismatch(
 
 fn verifiedAddThread(thread_index: usize, generation: u32, ready: bool) void {
     if (!verifiedCoreReady()) return;
-    if (externalSchedulerOwnsThread(thread_index)) return;
     const thread_id = verifiedThreadId(thread_index) orelse return;
     const cpu_id = verifiedThreadCpu(thread_index);
     var should_wake_cpu = false;
@@ -380,7 +319,6 @@ fn verifiedAddThread(thread_index: usize, generation: u32, ready: bool) void {
 
 fn verifiedWakeThread(thread_index: usize) void {
     if (!verifiedCoreReady()) return;
-    if (externalSchedulerOwnsThread(thread_index)) return;
     const thread_id = verifiedThreadId(thread_index) orelse return;
     const cpu_id = verifiedThreadCpu(thread_index);
     scheduler_state.verified.lock();
@@ -397,7 +335,6 @@ fn verifiedWakeThread(thread_index: usize) void {
 
 fn verifiedBlockThread(thread_index: usize) void {
     if (!verifiedCoreReady()) return;
-    if (externalSchedulerOwnsThread(thread_index)) return;
     const thread_id = verifiedThreadId(thread_index) orelse return;
     const cpu_id = verifiedThreadCpu(thread_index);
     scheduler_state.verified.lock();
@@ -466,134 +403,6 @@ fn verifiedChargeAndFinish(cpu_id: usize, thread_index: usize, runtime_ns: u64) 
     if (finish_rc != .ok) noteVerifiedCoreIssue("timer-finish", finish_rc, thread_index);
 }
 
-fn verifiedApplyReadyEventLocked(event: ExternalSchedulerEvent) void {
-    if (event.thread_id == scheduler_abi.no_thread) return;
-    if (event.thread_id > @as(u64, @intCast(std.math.maxInt(i64)))) return;
-    if (event.generation > @as(u64, @intCast(std.math.maxInt(i64)))) return;
-    const internal_thread_id = verifiedThreadIdFromExternal(event.thread_id, event.generation) orelse return;
-    const weight = if (event.weight == 0) @as(u64, 1024) else event.weight;
-    const slice_ns = if (event.slice_ns == 0) @as(u64, 4_000_000) else event.slice_ns;
-    if (weight > @as(u64, @intCast(std.math.maxInt(i64))) or slice_ns > @as(u64, @intCast(std.math.maxInt(i64)))) return;
-    const add_rc = verified_sched.pacha_kernel_sched_add_thread(
-        &scheduler_state.verified.state,
-        if (event.cpu_id < verifiedCoreCpuCount()) @intCast(event.cpu_id) else bootstrap_cpu_slot,
-        internal_thread_id,
-        @intCast(event.generation),
-        @intCast(weight),
-        @intCast(slice_ns),
-        &scheduler_state.verified.decision,
-        &scheduler_state.verified.runqueue_scratch,
-    );
-    if (add_rc == .ok) return;
-    const wake_rc = verified_sched.pacha_kernel_sched_wake_thread_on_cpu(
-        &scheduler_state.verified.state,
-        if (event.cpu_id < verifiedCoreCpuCount()) @intCast(event.cpu_id) else bootstrap_cpu_slot,
-        internal_thread_id,
-        &scheduler_state.verified.decision,
-    );
-    if (wake_rc != .ok and wake_rc != .state) noteVerifiedCoreIssue("event-ready", wake_rc, threadIndexFromExternalId(event.thread_id));
-}
-
-fn verifiedApplyExternalEvent(event: ExternalSchedulerEvent) void {
-    if (!verifiedCoreReady()) return;
-    scheduler_state.verified.lock();
-    defer scheduler_state.verified.unlock();
-    switch (event.event_type) {
-        scheduler_abi.event_thread_ready => verifiedApplyReadyEventLocked(event),
-        scheduler_abi.event_thread_blocked => {
-            if (event.thread_id == scheduler_abi.no_thread or event.thread_id > @as(u64, @intCast(std.math.maxInt(i64)))) return;
-            const internal_thread_id = verifiedThreadIdFromExternal(event.thread_id, event.generation) orelse return;
-            const rc = verified_sched.pacha_kernel_sched_block_thread_on_cpu(
-                &scheduler_state.verified.state,
-                if (event.cpu_id < verifiedCoreCpuCount()) @intCast(event.cpu_id) else bootstrap_cpu_slot,
-                internal_thread_id,
-                &scheduler_state.verified.decision,
-            );
-            if (rc != .ok and rc != .invalid and rc != .state) noteVerifiedCoreIssue("event-block", rc, threadIndexFromExternalId(event.thread_id));
-        },
-        scheduler_abi.event_thread_exited => {
-            if (event.thread_id == scheduler_abi.no_thread or event.thread_id > @as(u64, @intCast(std.math.maxInt(i64)))) return;
-            const internal_thread_id = verifiedThreadIdFromExternal(event.thread_id, event.generation) orelse return;
-            const rc = verified_sched.pacha_kernel_sched_exit_thread_on_cpu(
-                &scheduler_state.verified.state,
-                if (event.cpu_id < verifiedCoreCpuCount()) @intCast(event.cpu_id) else bootstrap_cpu_slot,
-                internal_thread_id,
-                &scheduler_state.verified.decision,
-            );
-            if (rc != .ok and rc != .invalid and rc != .state) noteVerifiedCoreIssue("event-exit", rc, threadIndexFromExternalId(event.thread_id));
-        },
-        scheduler_abi.event_thread_yield, scheduler_abi.event_tick => {
-            if (event.cpu_id >= verifiedCoreCpuCount()) return;
-            if (event.thread_id != scheduler_abi.no_thread) {
-                if (event.runtime_ns > @as(u64, @intCast(std.math.maxInt(i64)))) return;
-                const timer_rc = verified_sched.pacha_kernel_sched_on_timer(
-                    &scheduler_state.verified.state,
-                    @intCast(event.cpu_id),
-                    @intCast(event.runtime_ns),
-                    &scheduler_state.verified.decision,
-                    &scheduler_state.verified.runqueue_scratch,
-                );
-                if (timer_rc != .ok) {
-                    noteVerifiedCoreIssue("event-timer", timer_rc, threadIndexFromExternalId(event.thread_id));
-                    return;
-                }
-            }
-            const finish_rc = verified_sched.pacha_kernel_sched_finish_current(
-                &scheduler_state.verified.state,
-                @intCast(event.cpu_id),
-                &scheduler_state.verified.decision,
-                &scheduler_state.verified.runqueue_scratch,
-            );
-            if (finish_rc != .ok and finish_rc != .state) noteVerifiedCoreIssue("event-finish", finish_rc, null);
-        },
-        scheduler_abi.event_cpu_idle => {},
-        else => {},
-    }
-}
-
-fn verifiedCommitMatches(
-    cpu_id: usize,
-    thread_id: u64,
-    generation: u64,
-    decision: verified_sched.Decision,
-) bool {
-    if (thread_id == scheduler_abi.no_thread) {
-        return decision.kind == .idle and decision.cpu_id == cpu_id;
-    }
-    if (thread_id > @as(u64, @intCast(std.math.maxInt(i64)))) return false;
-    if (generation > @as(u64, @intCast(std.math.maxInt(i64)))) return false;
-    const expected_thread_index = threadIndexFromExternalId(thread_id) orelse return false;
-    const decision_thread_index = threadIndexFromVerifiedThreadId(decision.thread_id) orelse return false;
-    return decision.kind == .run_thread and
-        decision.cpu_id == cpu_id and
-        decision_thread_index == expected_thread_index and
-        decision.generation == @as(i64, @intCast(generation));
-}
-
-fn verifiedProbeCommit(cpu_id: usize, thread_id: u64, generation: u64) void {
-    if (!verifiedCoreReady()) return;
-    if (cpu_id >= verifiedCoreCpuCount()) return;
-    scheduler_state.verified.lock();
-    defer scheduler_state.verified.unlock();
-    scheduler_state.verified.probe_state = scheduler_state.verified.state;
-    const rc = verified_sched.pacha_kernel_sched_pick_cpu(
-        &scheduler_state.verified.probe_state,
-        cpu_id,
-        &scheduler_state.verified.decision,
-        &scheduler_state.verified.pick_scratch,
-        &scheduler_state.verified.runqueue_scratch,
-    );
-    if (rc != .ok) {
-        noteVerifiedCoreIssue("pick", rc, null);
-        return;
-    }
-    if (!verifiedCommitMatches(cpu_id, thread_id, generation, scheduler_state.verified.decision)) {
-        noteVerifiedCoreMismatch(cpu_id, thread_id, generation, scheduler_state.verified.decision);
-        return;
-    }
-    scheduler_state.verified.state = scheduler_state.verified.probe_state;
-}
-
 fn verifiedPickThreadForCpu(cpu_id: usize) ?usize {
     if (!verifiedCoreReady()) return null;
     if (cpu_id >= verifiedCoreCpuCount()) return null;
@@ -614,7 +423,7 @@ fn verifiedPickThreadForCpu(cpu_id: usize) ?usize {
         .none, .idle => return null,
         .run_thread => {
             if (scheduler_state.verified.decision.cpu_id != cpu_id) {
-                noteVerifiedCoreMismatch(cpu_id, scheduler_abi.no_thread, 0, scheduler_state.verified.decision);
+                noteVerifiedCoreMismatch(cpu_id, 0, 0, scheduler_state.verified.decision);
                 return null;
             }
             if (scheduler_state.verified.decision.thread_id <= 0) return null;
@@ -673,7 +482,7 @@ fn verifiedHandoffToThreadOnCpu(
         return false;
     }
     const decision_thread_index = threadIndexFromVerifiedThreadId(decision.thread_id) orelse {
-        noteVerifiedCoreMismatch(cpu_id, externalThreadId(thread_index), generation, decision);
+        noteVerifiedCoreMismatch(cpu_id, verifiedThreadIdForGeneration(thread_index, generation) orelse 0, generation, decision);
         verifiedRollbackHandoff(cpu_id, rollback_thread_index, rollback_generation);
         return false;
     };
@@ -682,7 +491,7 @@ fn verifiedHandoffToThreadOnCpu(
         decision_thread_index != thread_index or
         decision.generation != @as(i64, @intCast(generation)))
     {
-        noteVerifiedCoreMismatch(cpu_id, externalThreadId(thread_index), generation, decision);
+        noteVerifiedCoreMismatch(cpu_id, verifiedThreadIdForGeneration(thread_index, generation) orelse 0, generation, decision);
         verifiedRollbackHandoff(cpu_id, rollback_thread_index, rollback_generation);
         return false;
     }
@@ -709,7 +518,6 @@ fn fillUserEntryForThread(cpu_id: usize, thread_index: usize, out_entry: *schedu
 }
 
 fn claimKernelScheduledUserEntry(cpu_id: usize, out_entry: *scheduler_observer.UserEntry) bool {
-    if (policyActive()) return false;
     if (cpu_id == bootstrap_cpu_slot) return false;
     const thread_index = verifiedPickThreadForCpu(cpu_id) orelse return false;
     const state = schedulerStateForSlot(cpu_id) orelse {
@@ -730,9 +538,6 @@ fn claimKernelScheduledUserEntry(cpu_id: usize, out_entry: *scheduler_observer.U
     state.current_thread = thread_index;
     state.current_principal = ctx.owner_process;
     state.current_cr3 = ctx.cr3;
-    state.pending_commit_thread = null;
-    state.pending_commit_generation = 0;
-    state.idle_event_pending = false;
     state.is_idle = false;
     state.lock.unlock();
     return true;
@@ -779,37 +584,11 @@ pub fn initializeStaticStorage() void {
     scheduler_state.cpus[bootstrap_cpu_slot].enabled = true;
     scheduler_state.cpus[bootstrap_cpu_slot].current_thread = 0;
     scheduler_state.cpus[bootstrap_cpu_slot].is_idle = false;
-    scheduler_state.external.enabled = false;
-    scheduler_state.external.policy_thread = null;
-    scheduler_state.external.event_head = 0;
-    scheduler_state.external.event_len = 0;
-    scheduler_state.external.next_sequence = 1;
-    scheduler_state.external.trace_mask = 0;
-    scheduler_state.external.ap_claim_trace_count = 0;
-    @atomicStore(u8, &scheduler_state.external.ready_event_seen, 0, .release);
     verified_sched.pacha_kernel_sched_empty_state(verifiedCoreCpuCount(), &scheduler_state.verified.state);
-    verified_sched.pacha_kernel_sched_empty_state(verifiedCoreCpuCount(), &scheduler_state.verified.probe_state);
     scheduler_state.verified.initialized = true;
     scheduler_state.verified.faulted = false;
     scheduler_state.verified.log_count = 0;
     scheduler_state.thread_table.next_cpu_cursor = bootstrap_cpu_slot;
-}
-
-fn externalThreadId(thread_index: usize) u64 {
-    return @as(u64, @intCast(thread_index)) + 1;
-}
-
-fn threadIndexFromExternalId(thread_id: u64) ?usize {
-    if (thread_id == scheduler_abi.no_thread) return null;
-    const index = thread_id - 1;
-    if (index > @as(u64, @intCast(std.math.maxInt(usize)))) return null;
-    const thread_index: usize = @intCast(index);
-    if (thread_index >= scheduler_state.thread_table.contexts.len) return null;
-    return thread_index;
-}
-
-fn externalSchedulerOwnsThread(thread_index: usize) bool {
-    return scheduler_state.external.policy_thread != null and scheduler_state.external.policy_thread.? == thread_index;
 }
 
 fn threadActiveOnDifferentCpu(thread_index: usize, target_cpu: usize) bool {
@@ -817,357 +596,26 @@ fn threadActiveOnDifferentCpu(thread_index: usize, target_cpu: usize) bool {
     while (cpu_slot < scheduler_state.cpus.len) : (cpu_slot += 1) {
         if (cpu_slot == target_cpu) continue;
         if (scheduler_state.cpus[cpu_slot].current_thread == thread_index) return true;
-        if (scheduler_state.cpus[cpu_slot].pending_commit_thread == thread_index) return true;
     }
     return false;
-}
-
-pub fn attachPolicyThread(thread_index: usize) bool {
-    const ctx = threadContext(thread_index) orelse return false;
-    if (!ctx.allocated) return false;
-    scheduler_state.external.policy_thread = thread_index;
-    scheduler_state.external.enabled = true;
-    verifiedExitThread(thread_index);
-    return true;
-}
-
-pub fn policyActive() bool {
-    return scheduler_state.external.enabled and scheduler_state.external.policy_thread != null;
-}
-
-pub fn eventQueueReadable() bool {
-    scheduler_state.external.lock();
-    defer scheduler_state.external.unlock();
-    return scheduler_state.external.event_len != 0;
-}
-
-pub fn pendingEventCount() u64 {
-    scheduler_state.external.lock();
-    defer scheduler_state.external.unlock();
-    return @intCast(scheduler_state.external.event_len);
-}
-
-fn schedulerTraceEnabled(mask: u64) bool {
-    return (scheduler_state.external.trace_mask & mask) != 0;
-}
-
-fn traceSchedulerEvent(comptime event: []const u8, mask: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) void {
-    if (!schedulerTraceEnabled(mask)) return;
-    kernel_log.writeFmt(
-        "[trace] c=sched e={s} tsc={} a0={} a1={} a2={} a3={} a4={} a5={}\n",
-        .{ event, x86_platform.readTimestampCounter(), a0, a1, a2, a3, a4, a5 },
-    );
-}
-
-fn noteExternalSchedulerEventEnqueued(sequence: u64, event_type: u16, queue_len_after_enqueue: usize) void {
-    traceSchedulerEvent("event.enqueue", scheduler_trace_metric, sequence, event_type, queue_len_after_enqueue, 0, 0, 0);
-}
-
-fn noteExternalSchedulerEventRead(sequence: u64) void {
-    traceSchedulerEvent("event.read", scheduler_trace_metric, sequence, 0, 0, 0, 0, 0);
-}
-
-pub fn externalSchedulerTraceTimestamp() u64 {
-    return x86_platform.readTimestampCounter();
-}
-
-pub fn traceExternalSchedulerCommitIoctl(start_tsc: u64) void {
-    const cycles = x86_platform.readTimestampCounter() -% start_tsc;
-    traceSchedulerEvent("commit.ioctl", scheduler_trace_metric, cycles, 0, 0, 0, 0, 0);
-}
-
-fn traceExternalSchedulerCommitPath(comptime path: []const u8, cpu_slot: usize, thread_index: usize) void {
-    traceSchedulerEvent("commit.path." ++ path, scheduler_trace_metric, cpu_slot, thread_index, 0, 0, 0, 0);
-}
-
-fn dropExternalSchedulerEventAtLocked(remove_offset: usize) void {
-    if (remove_offset >= scheduler_state.external.event_len) return;
-    var offset = remove_offset;
-    while (offset + 1 < scheduler_state.external.event_len) : (offset += 1) {
-        const dst = (scheduler_state.external.event_head + offset) % scheduler_state.external.events.len;
-        const src = (scheduler_state.external.event_head + offset + 1) % scheduler_state.external.events.len;
-        scheduler_state.external.events[dst] = scheduler_state.external.events[src];
-    }
-    scheduler_state.external.event_len -= 1;
-}
-
-fn dropOneExternalSchedulerIdleEventLocked() bool {
-    var offset: usize = 0;
-    while (offset < scheduler_state.external.event_len) : (offset += 1) {
-        const index = (scheduler_state.external.event_head + offset) % scheduler_state.external.events.len;
-        const event = scheduler_state.external.events[index];
-        if (event.event_type == scheduler_abi.event_cpu_idle and event.thread_id == scheduler_abi.no_thread) {
-            dropExternalSchedulerEventAtLocked(offset);
-            return true;
-        }
-    }
-    return false;
-}
-
-fn enqueueExternalSchedulerEvent(
-    event_type: u16,
-    cpu_id: usize,
-    thread_index: ?usize,
-    runtime_ns: u64,
-) bool {
-    if (!policyActive()) return false;
-    scheduler_state.external.lock();
-    defer scheduler_state.external.unlock();
-    if (scheduler_state.external.event_len >= scheduler_state.external.events.len) {
-        if (event_type == scheduler_abi.event_cpu_idle or !dropOneExternalSchedulerIdleEventLocked()) {
-            return false;
-        }
-    }
-    const tail = (scheduler_state.external.event_head + scheduler_state.external.event_len) % scheduler_state.external.events.len;
-    var event = ExternalSchedulerEvent{
-        .event_type = event_type,
-        .sequence = scheduler_state.external.next_sequence,
-        .cpu_id = @intCast(cpu_id),
-        .runtime_ns = runtime_ns,
-    };
-    scheduler_state.external.next_sequence +%= 1;
-    if (thread_index) |idx| {
-        const ctx = threadContext(idx) orelse return false;
-        event.thread_id = externalThreadId(idx);
-        event.generation = ctx.generation;
-        event.weight = 1024;
-        event.slice_ns = 4_000_000;
-    }
-    scheduler_state.external.events[tail] = event;
-    scheduler_state.external.event_len += 1;
-    noteExternalSchedulerEventEnqueued(event.sequence, event.event_type, scheduler_state.external.event_len);
-    return true;
-}
-
-pub fn publishThreadReady(thread_index: usize) void {
-    if (externalSchedulerOwnsThread(thread_index)) return;
-    const queued = enqueueExternalSchedulerEvent(
-        scheduler_abi.event_thread_ready,
-        threadAssignedCpuSlot(thread_index),
-        thread_index,
-        0,
-    );
-    if (queued) @atomicStore(u8, &scheduler_state.external.ready_event_seen, 1, .release);
-}
-
-pub fn readPolicyEventBytes(out: []u8) ?usize {
-    if (out.len < scheduler_abi.sched_event_size) return null;
-    scheduler_state.external.lock();
-    defer scheduler_state.external.unlock();
-    if (scheduler_state.external.event_len == 0) return 0;
-    const event = scheduler_state.external.events[scheduler_state.external.event_head];
-    scheduler_state.external.event_head = (scheduler_state.external.event_head + 1) % scheduler_state.external.events.len;
-    scheduler_state.external.event_len -= 1;
-    noteExternalSchedulerEventRead(event.sequence);
-    verifiedApplyExternalEvent(event);
-    const bytes = std.mem.asBytes(&event);
-    @memcpy(out[0..bytes.len], bytes);
-    return bytes.len;
-}
-
-pub fn commitPolicyDecision(
-    cpu_id: u32,
-    thread_id: u64,
-    generation: u64,
-    frame: *TrapFrame,
-    saved_rax: u64,
-) bool {
-    if (!policyActive()) return false;
-    if (cpu_id >= smp.max_cpus) return false;
-    const target_cpu: usize = @intCast(cpu_id);
-    const target_state = schedulerStateForSlot(target_cpu) orelse return false;
-    if (thread_id == scheduler_abi.no_thread) {
-        verifiedProbeCommit(target_cpu, thread_id, generation);
-        target_state.lock.lock();
-        target_state.pending_commit_thread = null;
-        target_state.pending_commit_generation = 0;
-        target_state.idle_event_pending = target_cpu != bootstrap_cpu_slot;
-        target_state.lock.unlock();
-        traceExternalSchedulerCommitPath("idle", target_cpu, 0);
-        return true;
-    }
-    if (generation > std.math.maxInt(u32)) return false;
-    const thread_index = threadIndexFromExternalId(thread_id) orelse return false;
-    const expected_generation: u32 = @intCast(generation);
-    scheduler_state.thread_table.lock();
-    const initial_ctx = threadContextMutable(thread_index) orelse {
-        scheduler_state.thread_table.unlock();
-        return false;
-    };
-    if (!initial_ctx.allocated or initial_ctx.generation != expected_generation) {
-        scheduler_state.thread_table.unlock();
-        return false;
-    }
-    scheduler_state.thread_table.unlock();
-    if (externalSchedulerOwnsThread(thread_index)) return false;
-    verifiedProbeCommit(target_cpu, thread_id, generation);
-
-    if (target_cpu == currentCpu()) {
-        if (threadActiveOnDifferentCpu(thread_index, target_cpu)) return false;
-        scheduler_state.thread_table.lock();
-        const ctx = threadContextMutable(thread_index) orelse {
-            scheduler_state.thread_table.unlock();
-            return false;
-        };
-        if (!ctx.allocated or ctx.generation != expected_generation) {
-            scheduler_state.thread_table.unlock();
-            return false;
-        }
-        ctx.cpu_slot = target_cpu;
-        if (!markThreadReadyLocked(thread_index, true, false)) {
-            scheduler_state.thread_table.unlock();
-            return false;
-        }
-        scheduler_state.thread_table.unlock();
-        const current_thread = currentThread();
-        if (thread_index == current_thread) {
-            frame.rax = saved_rax;
-            traceExternalSchedulerCommitPath("same_no_switch", target_cpu, thread_index);
-            return true;
-        }
-        const switched = switchTo(thread_index, frame, saved_rax);
-        if (switched) traceExternalSchedulerCommitPath("same_switch", target_cpu, thread_index);
-        return switched;
-    }
-
-    lockAllCpuSchedulerStates();
-    defer unlockAllCpuSchedulerStates();
-    if (!target_state.enabled) return false;
-    if (target_state.current_thread == thread_index) {
-        traceExternalSchedulerCommitPath("remote_noop", target_cpu, thread_index);
-        return true;
-    }
-    if (target_state.pending_commit_thread == thread_index) {
-        traceExternalSchedulerCommitPath("remote_noop", target_cpu, thread_index);
-        return true;
-    }
-    if (threadActiveOnDifferentCpu(thread_index, target_cpu)) return false;
-    scheduler_state.thread_table.lock();
-    const ctx = threadContextMutable(thread_index) orelse {
-        scheduler_state.thread_table.unlock();
-        return false;
-    };
-    if (!ctx.allocated or ctx.generation != expected_generation) {
-        scheduler_state.thread_table.unlock();
-        return false;
-    }
-    ctx.cpu_slot = target_cpu;
-    if (!markThreadReadyLocked(thread_index, true, false)) {
-        scheduler_state.thread_table.unlock();
-        return false;
-    }
-    target_state.pending_commit_thread = thread_index;
-    target_state.pending_commit_generation = @intCast(generation);
-    target_state.idle_event_pending = false;
-    scheduler_state.thread_table.unlock();
-    logExternalSchedulerApCommitOnce(target_cpu, thread_index);
-    _ = smp.wakeCpu(target_cpu);
-    traceExternalSchedulerCommitPath("remote_pending", target_cpu, thread_index);
-    return true;
-}
-
-fn claimExternalCommittedUserEntry(cpu_slot: usize, out_entry: *scheduler_observer.UserEntry) bool {
-    if (cpu_slot == bootstrap_cpu_slot) return false;
-    const state = schedulerStateForSlot(cpu_slot) orelse return false;
-    state.lock.lock();
-    defer state.lock.unlock();
-    const thread_index = state.pending_commit_thread orelse return false;
-    const generation = state.pending_commit_generation;
-    const ctx = threadContext(thread_index) orelse return false;
-    const hot = getThreadHotStateConst(thread_index) orelse return false;
-    logExternalSchedulerApClaimTrace(cpu_slot, thread_index, generation, ctx, hot);
-    if (!ctx.allocated or hot.allocated == 0) return false;
-    if (ctx.generation != generation) return false;
-    if (!fillUserEntryForThread(cpu_slot, thread_index, out_entry)) return false;
-    state.current_thread = thread_index;
-    state.current_principal = ctx.owner_process;
-    state.current_cr3 = ctx.cr3;
-    state.pending_commit_thread = null;
-    state.pending_commit_generation = 0;
-    state.idle_event_pending = false;
-    state.is_idle = false;
-    logExternalSchedulerApEntryOnce(cpu_slot, thread_index);
-    return true;
-}
-
-fn logExternalSchedulerApClaimTrace(cpu_slot: usize, thread_index: usize, generation: u32, ctx: *const ThreadContext, hot: *const ThreadHotState) void {
-    if (!schedulerTraceEnabled(scheduler_trace_ap_entry)) return;
-    const old = @atomicRmw(u32, &scheduler_state.external.ap_claim_trace_count, .Add, 1, .acq_rel);
-    traceSchedulerEvent(
-        "ap.claim",
-        scheduler_trace_ap_entry,
-        cpu_slot,
-        thread_index,
-        generation,
-        if (ctx.allocated) 1 else 0,
-        hot.allocated,
-        old,
-    );
-}
-
-fn logExternalSchedulerApEntryOnce(cpu_slot: usize, thread_index: usize) void {
-    traceSchedulerEvent("ap.entry", scheduler_trace_ap_entry, cpu_slot, thread_index, 0, 0, 0, 0);
-}
-
-fn logExternalSchedulerApCommitOnce(cpu_slot: usize, thread_index: usize) void {
-    traceSchedulerEvent("ap.commit", scheduler_trace_commit, cpu_slot, thread_index, 0, 0, 0, 0);
-}
-
-fn logExternalSchedulerApTickOnce(cpu_slot: usize, thread_index: usize) void {
-    traceSchedulerEvent("ap.tick", scheduler_trace_ap_tick, cpu_slot, thread_index, 0, 0, 0, 0);
-}
-
-fn logExternalSchedulerApBlockOnce(cpu_slot: usize, thread_index: usize, wait_mailbox: bool, timeout_ticks: u64, wake_tick: u64) void {
-    traceSchedulerEvent(
-        "ap.block",
-        scheduler_trace_ap_block,
-        cpu_slot,
-        thread_index,
-        if (wait_mailbox) 1 else 0,
-        timeout_ticks,
-        wake_tick,
-        0,
-    );
-}
-
-fn logExternalSchedulerWakeOnce(thread_index: usize) void {
-    traceSchedulerEvent("wake", scheduler_trace_wake, thread_index, currentCpu(), 0, 0, 0, 0);
-}
-
-fn logExternalSchedulerTimerDueOnce(thread_index: usize, now_tick: u64, wake_tick: u64) void {
-    traceSchedulerEvent("timer.due", scheduler_trace_timer_due, thread_index, now_tick, wake_tick, 0, 0, 0);
 }
 
 fn observeCpuIdleFromAp(cpu_slot: usize) callconv(.c) void {
     if (cpu_slot == bootstrap_cpu_slot) return;
     const state = schedulerStateForSlot(cpu_slot) orelse return;
-    var should_emit = false;
     state.lock.lock();
     state.current_thread = state.idle_thread;
     state.current_principal = null;
     state.current_cr3 = 0;
     state.is_idle = true;
-    const ready_seen = @atomicLoad(u8, &scheduler_state.external.ready_event_seen, .acquire) != 0;
-    if (ap_user_dispatch_enabled and ready_seen and policyActive() and state.pending_commit_thread == null and !state.idle_event_pending) {
-        state.idle_event_pending = true;
-        should_emit = true;
-    }
     state.lock.unlock();
-    if (should_emit) {
-        if (!enqueueExternalSchedulerEvent(scheduler_abi.event_cpu_idle, cpu_slot, null, 0)) {
-            state.lock.lock();
-            state.idle_event_pending = false;
-            state.lock.unlock();
-        }
-    }
 }
 
-fn claimExternalCommittedUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_observer.UserEntry) callconv(.c) bool {
-    if (policyActive()) return claimExternalCommittedUserEntry(cpu_slot, out_entry);
+fn claimKernelScheduledUserEntryFromAp(cpu_slot: usize, out_entry: *scheduler_observer.UserEntry) callconv(.c) bool {
     return claimKernelScheduledUserEntry(cpu_slot, out_entry);
 }
 
-fn markThreadReadyLocked(thread_index: usize, ready: bool, notify: bool) bool {
+fn markThreadReadyLocked(thread_index: usize, ready: bool) bool {
     const ctx = threadContextMutable(thread_index) orelse return false;
     if (!ctx.allocated) return false;
     if (ready and ctx.stopped) return false;
@@ -1176,22 +624,21 @@ fn markThreadReadyLocked(thread_index: usize, ready: bool, notify: bool) bool {
     ctx.ready = ready;
     setThreadHotReady(thread_index, ready);
     if (ready and !was_ready) {
-        if (!policyActive()) verifiedWakeThread(thread_index);
+        verifiedWakeThread(thread_index);
     } else if (!ready and was_ready) {
-        if (!policyActive()) verifiedBlockThread(thread_index);
+        verifiedBlockThread(thread_index);
     }
-    if (notify and ready and !was_ready) publishThreadReady(thread_index);
     return true;
 }
 
-fn markThreadReadyInternal(thread_index: usize, ready: bool, notify: bool) bool {
+fn markThreadReadyInternal(thread_index: usize, ready: bool) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
-    return markThreadReadyLocked(thread_index, ready, notify);
+    return markThreadReadyLocked(thread_index, ready);
 }
 
 pub fn markThreadReady(thread_index: usize, ready: bool) bool {
-    return markThreadReadyInternal(thread_index, ready, true);
+    return markThreadReadyInternal(thread_index, ready);
 }
 
 pub fn saveAndParkApUserThread(frame: *const TrapFrame, runtime_ns: u64) bool {
@@ -1200,7 +647,6 @@ pub fn saveAndParkApUserThread(frame: *const TrapFrame, runtime_ns: u64) bool {
     const state = schedulerStateForSlot(cpu_slot) orelse return false;
     const thread_index = currentThread();
     if (thread_index >= scheduler_state.thread_table.contexts.len) return false;
-    if (externalSchedulerOwnsThread(thread_index)) return false;
     state.lock.lock();
     scheduler_state.thread_table.lock();
     const ctx = threadContextMutable(thread_index) orelse {
@@ -1221,8 +667,6 @@ pub fn saveAndParkApUserThread(frame: *const TrapFrame, runtime_ns: u64) bool {
     ctx.ready = true;
     setThreadHotCr3(thread_index, ctx.cr3);
     setThreadHotReady(thread_index, true);
-    const owner_process = ctx.owner_process;
-    const cr3 = ctx.cr3;
     state.current_thread = state.idle_thread;
     state.current_principal = null;
     state.current_cr3 = 0;
@@ -1230,20 +674,7 @@ pub fn saveAndParkApUserThread(frame: *const TrapFrame, runtime_ns: u64) bool {
     state.tick_accum = 0;
     scheduler_state.thread_table.unlock();
     state.lock.unlock();
-    if (!policyActive()) {
-        verifiedChargeAndFinish(cpu_slot, thread_index, runtime_ns);
-        return true;
-    }
-    if (!enqueueExternalSchedulerEvent(scheduler_abi.event_tick, cpu_slot, thread_index, runtime_ns)) {
-        state.lock.lock();
-        state.current_thread = thread_index;
-        state.current_principal = owner_process;
-        state.current_cr3 = cr3;
-        state.is_idle = false;
-        state.lock.unlock();
-        return false;
-    }
-    logExternalSchedulerApTickOnce(cpu_slot, thread_index);
+    verifiedChargeAndFinish(cpu_slot, thread_index, runtime_ns);
     return true;
 }
 
@@ -1257,7 +688,7 @@ pub fn preemptApUserThread(quantum_ticks: u64, frame: *const TrapFrame) bool {
     const should_preempt = state.tick_accum >= quantum_ticks;
     state.lock.unlock();
     if (!should_preempt) return false;
-    return saveAndParkApUserThread(frame, quantum_ticks * external_runtime_ns_per_tick);
+    return saveAndParkApUserThread(frame, quantum_ticks * runtime_ns_per_tick);
 }
 
 pub fn parkApThreadForBlock(
@@ -1293,16 +724,7 @@ pub fn parkApThreadForBlock(
         ctx.ready = false;
         setThreadHotCr3(current_thread, ctx.cr3);
         setThreadHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
-        if (!policyActive()) verifiedBlockThread(current_thread);
-        if (policyActive()) {
-            _ = enqueueExternalSchedulerEvent(
-                scheduler_abi.event_thread_blocked,
-                currentCpu(),
-                current_thread,
-                0,
-            );
-        }
-        logExternalSchedulerApBlockOnce(currentCpu(), current_thread, wait_mailbox, timeout_ticks, ctx.wake_tick);
+        verifiedBlockThread(current_thread);
     }
     scheduler_state.thread_table.unlock();
     if (before_block) |callback| callback.run(callback.context);
@@ -1328,21 +750,9 @@ pub fn exitApThreadToIdleAfter(callback: ?BeforeCurrentThreadLeaveCallback) nore
     smp.returnCurrentApToIdleFromInterrupt();
 }
 
-fn switchToExternalScheduler(frame: *TrapFrame, saved_rax: ?u64) bool {
-    if (!policyActive()) return false;
-    const policy_thread = scheduler_state.external.policy_thread.?;
-    if (!markThreadReadyInternal(policy_thread, true, false)) return false;
-    if (policy_thread == currentThread()) {
-        if (saved_rax) |value| frame.rax = value;
-        return true;
-    }
-    return switchTo(policy_thread, frame, saved_rax);
-}
-
 pub fn preemptBootstrapThread(quantum_ticks: u64, frame: *TrapFrame) bool {
     if (quantum_ticks == 0) return false;
     const current_thread = currentThread();
-    if (policyActive() and externalSchedulerOwnsThread(current_thread)) return false;
 
     const state = schedulerStateForSlot(currentCpu()) orelse return false;
     state.lock.lock();
@@ -1352,27 +762,8 @@ pub fn preemptBootstrapThread(quantum_ticks: u64, frame: *TrapFrame) bool {
     state.lock.unlock();
     if (!should_preempt) return false;
 
-    if (!policyActive()) {
-        verifiedChargeAndFinish(currentCpu(), current_thread, quantum_ticks * external_runtime_ns_per_tick);
-        return switchToNextReadyOnCurrentCpu(frame, null);
-    }
-
-    _ = enqueueExternalSchedulerEvent(
-        scheduler_abi.event_tick,
-        currentCpu(),
-        current_thread,
-        quantum_ticks * external_runtime_ns_per_tick,
-    );
-    if (!policyActive()) verifiedChargeAndFinish(currentCpu(), current_thread, quantum_ticks * external_runtime_ns_per_tick);
-    return switchToExternalScheduler(frame, null);
-}
-
-pub fn loadPolicyThread(frame: *TrapFrame) bool {
-    if (!policyActive()) return false;
-    const policy_thread = scheduler_state.external.policy_thread.?;
-    if (!markThreadReadyInternal(policy_thread, true, false)) return false;
-    if (!activate(policy_thread)) return false;
-    return loadContextIntoFrame(policy_thread, frame);
+    verifiedChargeAndFinish(currentCpu(), current_thread, quantum_ticks * runtime_ns_per_tick);
+    return switchToNextReadyOnCurrentCpu(frame, null);
 }
 
 pub fn threadCapacity() usize {
@@ -1625,7 +1016,7 @@ fn hasAllocatedThreadLocked() bool {
 }
 
 fn selectCpuForNewThreadLocked() usize {
-    if (!verifiedCoreReady() or policyActive()) return bootstrap_cpu_slot;
+    if (!verifiedCoreReady()) return bootstrap_cpu_slot;
     if (!hasAllocatedThreadLocked()) return bootstrap_cpu_slot;
     const cpu_count = verifiedCoreCpuCount();
     if (cpu_count <= 1) return bootstrap_cpu_slot;
@@ -1655,7 +1046,7 @@ pub fn isBootstrapSchedulerCpu() bool {
 
 pub fn installIdleHooks() void {
     scheduler_observer.registerIdleObserver(observeCpuIdleFromAp);
-    scheduler_observer.registerIdleUserEntryPoll(claimExternalCommittedUserEntryFromAp);
+    scheduler_observer.registerIdleUserEntryPoll(claimKernelScheduledUserEntryFromAp);
 }
 
 pub fn refreshTopology() void {
@@ -1677,7 +1068,7 @@ pub fn refreshTopology() void {
 }
 
 pub fn apUserDispatchReady() bool {
-    return policyActive() or verifiedCoreReady();
+    return verifiedCoreReady();
 }
 
 pub fn parkApAfterThreadStopped() noreturn {
@@ -1866,11 +1257,10 @@ pub fn threadReady(thread_index: usize) bool {
 
 pub fn debugDumpRunnableState(reason: []const u8) void {
     kernel_log.writeFmt(
-        "[sched-debug] reason={s} cpu={} policy={} verified={}\n",
+        "[sched-debug] reason={s} cpu={} verified={}\n",
         .{
             reason,
             currentCpu(),
-            if (policyActive()) @as(u8, 1) else @as(u8, 0),
             if (verifiedCoreReady()) @as(u8, 1) else @as(u8, 0),
         },
     );
@@ -2017,11 +1407,7 @@ fn allocateThreadWithReadyState(owner_process: kernel.PrincipalId, user_spaces: 
             const ctx = threadContext(i) orelse continue;
             if (ctx.allocated) continue;
             if (!initializeThreadContextWithReadyState(i, owner_process, user_spaces, initial_frame, initial_ready)) return null;
-            if (!policyActive()) {
-                verifiedAddThread(i, scheduler_state.thread_table.contexts[i].generation, initial_ready);
-            } else if (initial_ready) {
-                publishThreadReady(i);
-            }
+            verifiedAddThread(i, scheduler_state.thread_table.contexts[i].generation, initial_ready);
             return i;
         }
         if (!ensureThreadCapacity(scheduler_state.thread_table.contexts.len + 1, free_list)) return null;
@@ -2036,24 +1422,10 @@ pub fn releaseThread(thread_index: usize) bool {
 
     const ctx = threadContextMutable(thread_index) orelse return false;
     if (!ctx.allocated) return false;
-    const was_external_policy = externalSchedulerOwnsThread(thread_index);
-    if (!was_external_policy and !policyActive()) verifiedExitThread(thread_index);
-    if (!was_external_policy) {
-        _ = enqueueExternalSchedulerEvent(
-            scheduler_abi.event_thread_exited,
-            threadAssignedCpuSlot(thread_index),
-            thread_index,
-            0,
-        );
-    }
+    verifiedExitThread(thread_index);
     const next_generation = nextThreadGeneration(ctx.generation);
     clearThreadFromCpuSchedulerStatesLocked(thread_index);
     ctx.* = .{ .id = @intCast(thread_index), .generation = next_generation };
-    if (was_external_policy) {
-        scheduler_state.external.enabled = false;
-        scheduler_state.external.policy_thread = null;
-    }
-    syncHotStateFromContext(thread_index);
     syncHotStateFromContext(thread_index);
     return true;
 }
@@ -2239,24 +1611,6 @@ pub fn loadContextIntoFrame(thread_index: usize, frame: *TrapFrame) bool {
     x86_platform.writeGsBase(ctx.gs_base);
     x86_platform.writePkru(ctx.pkru);
     frame.* = ctx.frame;
-    if (thread_index < scheduler_state.thread_table.ipc_wake_resume_tsc.len) {
-        const wake_tsc = @atomicRmw(u64, &scheduler_state.thread_table.ipc_wake_resume_tsc[thread_index], .Xchg, 0, .acq_rel);
-        if (wake_tsc != 0) {
-            const elapsed = x86_platform.readTimestampCounter() -% wake_tsc;
-            const wake_cpu = @atomicLoad(u16, &scheduler_state.thread_table.ipc_wake_resume_cpu[thread_index], .acquire);
-            const resume_cpu: u16 = @intCast(@min(currentCpu(), std.math.maxInt(u16)));
-            traceSchedulerEvent(
-                "wake.resume",
-                scheduler_trace_metric,
-                thread_index,
-                elapsed,
-                wake_cpu,
-                resume_cpu,
-                if (wake_cpu == resume_cpu) 1 else 0,
-                0,
-            );
-        }
-    }
     return true;
 }
 
@@ -2289,12 +1643,11 @@ pub fn handoffToReadyThreadGenerationWithRax(
     sender_rax: u64,
     before_current_thread_leave: ?BeforeCurrentThreadLeaveCallback,
 ) bool {
-    if (policyActive() or !verifiedCoreReady()) return false;
+    if (!verifiedCoreReady()) return false;
     const cpu_id = currentCpu();
     if (cpu_id >= verifiedCoreCpuCount()) return false;
     const current_thread = currentThread();
     if (target_thread == current_thread) return false;
-    if (externalSchedulerOwnsThread(current_thread) or externalSchedulerOwnsThread(target_thread)) return false;
 
     scheduler_state.thread_table.lock();
     const current_ctx = threadContext(current_thread) orelse {
@@ -2329,12 +1682,11 @@ pub fn handoffToReadyThreadGenerationWithRax(
 }
 
 pub fn prepareExitHandoffToReadyThreadGeneration(target_thread: usize, target_generation: u32) bool {
-    if (policyActive() or !verifiedCoreReady()) return false;
+    if (!verifiedCoreReady()) return false;
     const cpu_id = currentCpu();
     if (cpu_id >= verifiedCoreCpuCount()) return false;
     const current_thread = currentThread();
     if (target_thread == current_thread) return false;
-    if (externalSchedulerOwnsThread(current_thread) or externalSchedulerOwnsThread(target_thread)) return false;
 
     scheduler_state.thread_table.lock();
     const current_ctx = threadContext(current_thread) orelse {
@@ -2382,7 +1734,7 @@ pub fn loadExitHandoffThread(frame: *TrapFrame, target_thread: usize, target_gen
 
 pub fn exitCurrentThread(
     frame: *TrapFrame,
-    saved_rax: u64,
+    _: u64,
     before_ap_idle: ?BeforeCurrentThreadLeaveCallback,
     after_release: ?BeforeCurrentThreadLeaveCallback,
 ) bool {
@@ -2394,11 +1746,9 @@ pub fn exitCurrentThread(
         smp.returnCurrentApToIdleFromInterrupt();
     }
     const current_thread = currentThread();
-    if (externalSchedulerOwnsThread(current_thread)) return false;
     if (!releaseThread(current_thread)) return false;
     if (after_release) |callback| callback.run(callback.context);
-    if (!policyActive()) return switchToNextReadyOnCurrentCpu(frame, null);
-    return switchToExternalScheduler(frame, saved_rax);
+    return switchToNextReadyOnCurrentCpu(frame, null);
 }
 
 pub fn wakeIfWaiting(thread_index: usize) void {
@@ -2416,13 +1766,7 @@ pub fn wakeIfWaiting(thread_index: usize) void {
     }
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
-    if (!policyActive()) verifiedWakeThread(thread_index);
-    if (thread_index < scheduler_state.thread_table.ipc_wake_resume_tsc.len) {
-        @atomicStore(u16, &scheduler_state.thread_table.ipc_wake_resume_cpu[thread_index], @intCast(@min(currentCpu(), std.math.maxInt(u16))), .release);
-        @atomicStore(u64, &scheduler_state.thread_table.ipc_wake_resume_tsc[thread_index], x86_platform.readTimestampCounter(), .release);
-    }
-    logExternalSchedulerWakeOnce(thread_index);
-    publishThreadReady(thread_index);
+    verifiedWakeThread(thread_index);
 }
 
 fn wakeIfWaitingGenerationInternal(
@@ -2451,13 +1795,7 @@ fn wakeIfWaitingGenerationInternal(
     }
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
-    if (!policyActive()) verifiedWakeThread(thread_index);
-    if (thread_index < scheduler_state.thread_table.ipc_wake_resume_tsc.len) {
-        @atomicStore(u16, &scheduler_state.thread_table.ipc_wake_resume_cpu[thread_index], @intCast(@min(currentCpu(), std.math.maxInt(u16))), .release);
-        @atomicStore(u64, &scheduler_state.thread_table.ipc_wake_resume_tsc[thread_index], x86_platform.readTimestampCounter(), .release);
-    }
-    logExternalSchedulerWakeOnce(thread_index);
-    publishThreadReady(thread_index);
+    verifiedWakeThread(thread_index);
     return true;
 }
 
@@ -2697,7 +2035,7 @@ pub fn stopPrincipalThreads(principal: kernel.PrincipalId) usize {
         ctx.ready = false;
         setThreadHotStopped(i, true);
         setThreadHotReady(i, false);
-        if (!policyActive()) verifiedBlockThread(i);
+        verifiedBlockThread(i);
         stopped_count += 1;
     }
     return stopped_count;
@@ -2718,24 +2056,9 @@ pub fn continuePrincipalThreads(principal: kernel.PrincipalId) usize {
             ctx.ready = ready;
             setThreadHotStopped(i, false);
             setThreadHotReady(i, ready);
-            if (ready and !policyActive()) verifiedWakeThread(i);
+            if (ready) verifiedWakeThread(i);
             continued_count += 1;
         }
-    }
-    // The table grows dynamically, so do not cap ready publication at the
-    // bootstrap capacity. Under an external policy resumed threads cannot run
-    // before their ready event, making this unlocked second pass stable.
-    var i: usize = 0;
-    while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
-        scheduler_state.thread_table.lock();
-        const ctx = threadContext(i);
-        const should_publish = if (ctx) |thread|
-            thread.allocated and thread.owner_process == principal and
-                !thread.stopped and thread.ready
-        else
-            false;
-        scheduler_state.thread_table.unlock();
-        if (should_publish) publishThreadReady(i);
     }
     return continued_count;
 }
@@ -2759,7 +2082,6 @@ pub fn wakeExpiredTimers(now_tick: u64) void {
         if (hot.allocated == 0) continue;
         if (hot.ready != 0) continue;
         if (hot.wake_tick == 0 or now_tick < hot.wake_tick) continue;
-        logExternalSchedulerTimerDueOnce(i, now_tick, hot.wake_tick);
         wakeIfWaiting(i);
     }
 }
@@ -2772,9 +2094,7 @@ pub fn blockCurrentThread(
     before_block: ?BeforeCurrentThreadLeaveCallback,
 ) bool {
     if (!isBootstrapSchedulerCpu()) {
-        // AP user threads must leave the CPU for both the built-in and the
-        // external scheduler.  Returning false here turns a real blocking
-        // receive into NOT_READY as soon as a process is scheduled on an AP.
+        // AP user threads must leave the CPU for a real blocking receive.
         return parkApThreadForBlock(frame, wait_mailbox, timeout_ticks, resume_rax, before_block);
     }
     const current_thread = currentThread();
@@ -2807,49 +2127,16 @@ pub fn blockCurrentThread(
     ctx.ready = false;
     setThreadHotCr3(current_thread, ctx.cr3);
     setThreadHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
-    if (!policyActive()) verifiedBlockThread(current_thread);
-
-    if (!policyActive()) {
-        scheduler_state.thread_table.unlock();
-        if (before_block) |callback| callback.run(callback.context);
-        if (switchToNextReadyOnCurrentCpu(frame, resume_rax)) return true;
-        // There is no userspace context to return to while the caller is
-        // blocked.  Keep CPU 0 interruptible until a wakeup publishes a ready
-        // thread, then load the wake-provided frame without overwriting rax
-        // with the original syscall's resume value.
-        while (!loadNextReadyThread(frame)) {
-            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
-        }
-        return true;
-    }
-
-    if (policyActive() and !externalSchedulerOwnsThread(current_thread)) {
-        _ = enqueueExternalSchedulerEvent(
-            scheduler_abi.event_thread_blocked,
-            currentCpu(),
-            current_thread,
-            0,
-        );
-        scheduler_state.thread_table.unlock();
-        if (before_block) |callback| callback.run(callback.context);
-        if (switchToExternalScheduler(frame, resume_rax)) return true;
-        scheduler_state.thread_table.lock();
-        if (threadContextMutable(current_thread)) |restored_ctx| {
-            if (restored_ctx.allocated) {
-                restored_ctx.wait_mailbox = false;
-                restored_ctx.wake_tick = 0;
-                restored_ctx.ready = true;
-                setThreadHotWaitState(current_thread, false, 0, true);
-            }
-        }
-        scheduler_state.thread_table.unlock();
-        return false;
-    }
-
-    ctx.wait_mailbox = false;
-    ctx.wake_tick = 0;
-    ctx.ready = true;
-    setThreadHotWaitState(current_thread, false, 0, true);
+    verifiedBlockThread(current_thread);
     scheduler_state.thread_table.unlock();
-    return false;
+    if (before_block) |callback| callback.run(callback.context);
+    if (switchToNextReadyOnCurrentCpu(frame, resume_rax)) return true;
+    // There is no userspace context to return to while the caller is blocked.
+    // Keep CPU 0 interruptible until a wakeup publishes a ready thread, then
+    // load the wake-provided frame without overwriting rax with the original
+    // syscall's resume value.
+    while (!loadNextReadyThread(frame)) {
+        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+    }
+    return true;
 }

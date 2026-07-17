@@ -860,7 +860,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         loaded_init,
         "init",
     );
-    scheduler.publishThreadReady(init_thread);
     if (!scheduler.activateNextReadyOnCurrentCpu()) {
         halt.haltWithMessage("kernel scheduler failed to activate init");
     }

@@ -86,9 +86,7 @@ pub const fd_kind_dma_mapping: u64 = 11;
 pub const fd_kind_irq: u64 = 12;
 pub const fd_kind_timer: u64 = 13;
 pub const fd_kind_serial: u64 = 14;
-pub const fd_kind_schedctl: u64 = 15;
-pub const fd_kind_sched_event: u64 = 16;
-pub const fd_kind_pipe: u64 = 17;
+pub const fd_kind_pipe: u64 = 15;
 
 pub const fd_info_kind_offset: u64 = 0;
 pub const fd_info_rights_offset: u64 = 8;

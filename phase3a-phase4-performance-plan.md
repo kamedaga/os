@@ -108,6 +108,8 @@ GTK3にはMIME/pixbuf cacheと`fallocate`の`EOPNOTSUPP` fallbackが必要だっ
 
 ABI変更理由は「producerもconsumerもない旧daemon境界を消し、既に実働中のkernel schedulerを唯一の所有者にするため」とする。
 
+完了記録: 現行bootにscheduler FD生成・policy attach・daemon起動のcallerがないことを確認し、daemon、FD kind 15 / 16、event queue、commit ioctl、external-policy分岐を一括削除した。`pipe`はkernel/userlandともkind 15へ切り替えた。4 CPUの短時間bootでTTY、native pipe、外部process生成を確認した。
+
 ## 5. Step 2 — Phase 3A: 可変input registry
 
 固定`INPUTD_DEVICE_COUNT=2`とevent番号によるrole判定を廃止する。

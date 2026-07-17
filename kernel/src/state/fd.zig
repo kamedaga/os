@@ -52,8 +52,6 @@ const IrqPublishSlot = types.IrqPublishSlot;
 const TimerObject = types.TimerObject;
 const TimerFdState = types.TimerFdState;
 const SerialObject = types.SerialObject;
-const SchedulerControlObject = types.SchedulerControlObject;
-const SchedulerEventObject = types.SchedulerEventObject;
 const PipeRef = types.PipeRef;
 const PipeEndpointObject = types.PipeEndpointObject;
 const PipePair = types.PipePair;
@@ -473,9 +471,6 @@ pub fn fdInfo(self: anytype, owner: PrincipalId, fd: Fd) ?FdInfo {
         .serial => |serial| {
             info.extra = serial.stream;
         },
-        .sched_event => {
-            info.size_bytes = @import("../scheduler.zig").connection.pendingEventCount();
-        },
         .pipe => |endpoint| {
             if (self.pipeSlotConst(endpoint.pipe)) |pipe| {
                 info.size_bytes = pipe.len;
@@ -660,7 +655,6 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
             .irq => self.irqPublishedEventPending(entry.object) orelse false,
             .timer => |timer| @TypeOf(self.*).timerDueCount(timer, now_tick) != 0,
             .serial => false,
-            .sched_event => entry.rights.read and @import("../scheduler.zig").connection.eventQueueReadable(),
             .pipe => |endpoint| blk: {
                 const pipe = self.pipeSlotConst(endpoint.pipe) orelse break :blk false;
                 break :blk !endpoint.write and (pipe.len != 0 or pipe.write_refs == 0);
@@ -674,7 +668,6 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
             .endpoint, .channel, .reply => self.fdIpcWritable(&slot.payload),
             .event => entry.rights.write,
             .serial => entry.rights.write,
-            .schedctl => entry.rights.write,
             .pipe => |endpoint| blk: {
                 const pipe = self.pipeSlotConst(endpoint.pipe) orelse break :blk false;
                 break :blk endpoint.write and pipe.read_refs != 0 and @TypeOf(self.*).pipeWritableReadyForBytes(pipe, min_write_bytes);
@@ -958,58 +951,6 @@ pub fn createSerialFdAt(
             .write = true,
         },
         .flags = .{ .inherit = true },
-    };
-}
-
-pub fn createSchedulerControlFdAt(
-    self: anytype,
-    owner: PrincipalId,
-    fd: Fd,
-) KernelError!void {
-    try self.requireActiveProcess(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const table = try self.fdTableForActiveProcess(owner);
-    if (!table.entries[index].isEmpty()) return KernelError.InvalidState;
-    const object_ref = try self.createKernelObject(.schedctl, .{ .schedctl = .{
-        .owner_principal_raw = @intFromEnum(owner),
-    } });
-    errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
-    try self.retainKernelObject(object_ref);
-    table.entries[index] = .{
-        .object = object_ref,
-        .rights = .{
-            .inspect = true,
-            .close = true,
-            .read = true,
-            .write = true,
-            .poll = true,
-        },
-    };
-}
-
-pub fn createSchedulerEventFdAt(
-    self: anytype,
-    owner: PrincipalId,
-    fd: Fd,
-) KernelError!void {
-    try self.requireActiveProcess(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const table = try self.fdTableForActiveProcess(owner);
-    if (!table.entries[index].isEmpty()) return KernelError.InvalidState;
-    const object_ref = try self.createKernelObject(.sched_event, .{ .sched_event = .{
-        .owner_principal_raw = @intFromEnum(owner),
-    } });
-    errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
-    try self.retainKernelObject(object_ref);
-    table.entries[index] = .{
-        .object = object_ref,
-        .rights = .{
-            .inspect = true,
-            .close = true,
-            .read = true,
-            .wait = true,
-            .poll = true,
-        },
     };
 }
 

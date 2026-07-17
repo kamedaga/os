@@ -221,9 +221,7 @@ pub const KernelObjectKind = enum(u16) {
     irq = 12,
     timer = 13,
     serial = 14,
-    schedctl = 15,
-    sched_event = 16,
-    pipe = 17,
+    pipe = 15,
 };
 
 pub const TaskObjectState = enum(u8) {
@@ -321,14 +319,6 @@ pub const SerialObject = struct {
     stream: u8 = 0,
 };
 
-pub const SchedulerControlObject = struct {
-    owner_principal_raw: PrincipalRaw = 0,
-};
-
-pub const SchedulerEventObject = struct {
-    owner_principal_raw: PrincipalRaw = 0,
-};
-
 pub const PipeRef = struct {
     index: u32 = 0,
     generation: u32 = 0,
@@ -380,8 +370,6 @@ pub const KernelObjectPayload = union(KernelObjectKind) {
     irq: IrqObject,
     timer: TimerObject,
     serial: SerialObject,
-    schedctl: SchedulerControlObject,
-    sched_event: SchedulerEventObject,
     pipe: PipeEndpointObject,
 };
 
