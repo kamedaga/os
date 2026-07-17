@@ -462,11 +462,6 @@ fn wakeReadyPipeCloseWaiters(pending_wakes: []const PendingPipeCloseWake) void {
     }
 }
 
-fn loadRunnableThreadOrIdle(out_frame: *TrapFrame) void {
-    if (scheduler.loadNextReadyThread(out_frame)) return;
-    halt.haltWithMessage("kernel scheduler unavailable");
-}
-
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
@@ -587,7 +582,7 @@ pub export fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault
     if (!scheduler.isBootstrapSchedulerCpu()) {
         smp.returnCurrentApToIdleFromInterrupt();
     }
-    loadRunnableThreadOrIdle(out_frame);
+    scheduler.loadNextReadyThreadOrIdle(out_frame);
 }
 
 fn exitCurrentProcess(
@@ -661,7 +656,7 @@ fn exitCurrentProcess(
         );
     }
     if (before_ap_idle) |callback| callback.run(callback.context);
-    loadRunnableThreadOrIdle(out_frame);
+    scheduler.loadNextReadyThreadOrIdle(out_frame);
 }
 
 fn mmioPageWithOffset(addr: u64) init_setup.MmioPageWithOffset {

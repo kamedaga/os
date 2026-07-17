@@ -817,10 +817,10 @@ fn fillUserEntryForThread(cpu_id: usize, thread_index: usize, generation: u32, o
 }
 
 /// Pull one already-runnable entity from the busiest runqueue into an empty
-/// idle AP.  The operation is allocation-free and publishes cpu_slot only
+/// idle CPU.  The operation is allocation-free and publishes cpu_slot only
 /// while the thread table and both runqueues are locked.
 fn stealRunnableForIdleCpu(dst_cpu: usize) bool {
-    if (!verifiedCoreReady() or dst_cpu == bootstrap_cpu_slot) return false;
+    if (!verifiedCoreReady()) return false;
     const dst = schedulerStateForSlot(dst_cpu) orelse return false;
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
@@ -984,6 +984,18 @@ pub fn loadNextReadyThread(frame: *TrapFrame) bool {
     if (loadContextIntoFrameGeneration(picked.thread_index, picked.generation, frame)) return true;
     verifiedRollbackPickedCpu(cpu_id, picked);
     return false;
+}
+
+/// Complete a transition to idle without treating an empty local runqueue as
+/// a global scheduler failure.  Steal is attempted once at the transition;
+/// subsequent timer interrupts only retry the local queue, so an idle BSP does
+/// not turn its periodic timekeeping tick into a cross-CPU polling loop.
+pub fn loadNextReadyThreadOrIdle(frame: *TrapFrame) void {
+    if (loadNextReadyThread(frame)) return;
+    _ = stealRunnableForIdleCpu(currentCpu());
+    while (!loadNextReadyThread(frame)) {
+        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+    }
 }
 
 fn switchToNextReadyOnCurrentCpu(frame: *TrapFrame, saved_rax: ?u64) bool {
@@ -1596,9 +1608,7 @@ pub fn parkStoppedCurrentThread(
     if (!isBootstrapSchedulerCpu()) {
         smp.returnCurrentApToIdleFromInterrupt();
     }
-    while (!loadNextReadyThread(frame)) {
-        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
-    }
+    loadNextReadyThreadOrIdle(frame);
     return true;
 }
 
@@ -2225,13 +2235,10 @@ pub fn exitCurrentThread(
     if (!releaseThread(current_thread)) return false;
     if (after_release) |callback| callback.run(callback.context);
     if (switchToNextReadyOnCurrentCpu(frame, null)) return true;
-    // A bootstrap-CPU thread may be the last runnable entity on CPU 0 while
-    // siblings of the same process remain live on other CPUs.  That is an idle
-    // CPU, not a process-exit failure.  Stay interruptible until CPU 0 receives
-    // work instead of making the syscall layer kill the remaining siblings.
-    while (!loadNextReadyThread(frame)) {
-        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
-    }
+    // A bootstrap-CPU thread may be the last local runnable entity while work
+    // remains queued elsewhere.  Reclaim one runnable generation before
+    // waiting interruptibly for a later local wake.
+    loadNextReadyThreadOrIdle(frame);
     return true;
 }
 
@@ -2624,8 +2631,6 @@ pub fn blockCurrentThread(
     // Keep CPU 0 interruptible until a wakeup publishes a ready thread, then
     // load the wake-provided frame without overwriting rax with the original
     // syscall's resume value.
-    while (!loadNextReadyThread(frame)) {
-        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
-    }
+    loadNextReadyThreadOrIdle(frame);
     return true;
 }
