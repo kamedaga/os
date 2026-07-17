@@ -631,13 +631,14 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 .revents = 0,
             };
         }
-        for (uint64_t i = 0; i < FILED_MAX_HANDLES; ++i) {
-            const filed_handle_t *handle = &runtime->vfs.handles[i];
-            if (!handle->active || handle->lease_fd < 16) continue;
+        for (uint16_t i = 0; i < runtime->vfs.lease_handle_count; ++i) {
+            const filed_handle_id_t handle_id = runtime->vfs.lease_handle_ids[i];
+            const int lease_fd = filed_vfs_get_handle_lease(&runtime->vfs, handle_id);
+            if (lease_fd < 16) continue;
             session_indices[count] = UINT64_MAX;
-            lease_handles[count] = handle->id;
+            lease_handles[count] = handle_id;
             fds[count++] = (struct pacha_pollfd){
-                .fd = handle->lease_fd,
+                .fd = lease_fd,
                 .events = PACHA_FD_EVENT_HANGUP,
                 .revents = 0,
             };
@@ -674,8 +675,6 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
                     const filed_handle_id_t handle_id = lease_handles[pos];
                     (void)filed_close_handle_runtime(runtime, handle_id);
-                    printf("[filed] transfer_orphan_reap handle=%u\n",
-                        (unsigned)handle_id);
                 }
                 continue;
             }

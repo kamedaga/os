@@ -728,23 +728,65 @@ int64_t filed_resolve_parent_path(
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
             bool lookup_owned = false;
+            bool component_is_symlink = false;
             storage_statx_reply_t stat;
             int64_t symlink_status;
             if (filed_path_is_single_component(after_slashes)) {
                 next_rights |= parent_rights;
             }
-            symlink_status = filed_lookup_component_stat(
-                runtime,
+            memset(&next_open, 0, sizeof(next_open));
+            const filed_status_t cached_status = filed_vfs_open_cached_child(
+                &runtime->vfs,
                 current_handle,
                 component,
-                &object_id,
-                &stat,
-                &lookup_owned);
-            if (symlink_status != 0) {
+                next_rights,
+                FILED_OPEN_DIRECTORY,
+                &next_open);
+            if (cached_status == FILED_OK) {
                 filed_close_walk_handle(runtime, current_handle, current_owned);
-                return symlink_status;
+                current_handle = next_open.handle_id;
+                current_owned = 1;
+                path = after_slashes;
+                continue;
             }
-            if (filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK) {
+            if (cached_status != FILED_ERR_NOT_FOUND &&
+                cached_status != FILED_ERR_NOT_DIR)
+            {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return filed_status_to_wire(cached_status);
+            }
+            if (cached_status == FILED_ERR_NOT_DIR) {
+                filed_vnode_kind_t cached_kind = 0;
+                if (filed_vfs_cached_child_info(
+                        &runtime->vfs,
+                        current_handle,
+                        component,
+                        &object_id,
+                        &cached_kind) == FILED_OK)
+                {
+                    if (cached_kind != FILED_VNODE_SYMLINK) {
+                        filed_close_walk_handle(runtime, current_handle, current_owned);
+                        return filed_status_to_wire(FILED_ERR_NOT_DIR);
+                    }
+                    component_is_symlink = true;
+                }
+            }
+            if (!component_is_symlink) {
+                symlink_status = filed_lookup_component_stat(
+                    runtime,
+                    current_handle,
+                    component,
+                    &object_id,
+                    &stat,
+                    &lookup_owned);
+                if (symlink_status != 0) {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    return symlink_status;
+                }
+                component_is_symlink =
+                    filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK;
+            }
+            if (component_is_symlink) {
                 if (symlink_budget == 0) {
                     if (lookup_owned) {
                         (void)filed_backend_release_object(runtime, object_id);
@@ -1133,6 +1175,7 @@ int64_t filed_openat_path(
             uint32_t next_rights = FILED_WALK_RIGHTS;
             uint64_t object_id = 0;
             bool lookup_owned = false;
+            bool component_is_symlink = false;
             storage_statx_reply_t stat;
             int64_t symlink_status;
             if ((open_flags & FILED_OPEN_CREATE) != 0 &&
@@ -1140,18 +1183,59 @@ int64_t filed_openat_path(
             {
                 next_rights |= FILED_RIGHT_CREATE;
             }
-            symlink_status = filed_lookup_component_stat(
-                runtime,
+            memset(&next_open, 0, sizeof(next_open));
+            const filed_status_t cached_status = filed_vfs_open_cached_child(
+                &runtime->vfs,
                 current_handle,
                 component,
-                &object_id,
-                &stat,
-                &lookup_owned);
-            if (symlink_status != 0) {
+                next_rights,
+                FILED_OPEN_DIRECTORY,
+                &next_open);
+            if (cached_status == FILED_OK) {
                 filed_close_walk_handle(runtime, current_handle, current_owned);
-                return symlink_status;
+                current_handle = next_open.handle_id;
+                current_owned = 1;
+                path = after_slashes;
+                continue;
             }
-            if (filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK) {
+            if (cached_status != FILED_ERR_NOT_FOUND &&
+                cached_status != FILED_ERR_NOT_DIR)
+            {
+                filed_close_walk_handle(runtime, current_handle, current_owned);
+                return filed_status_to_wire(cached_status);
+            }
+            if (cached_status == FILED_ERR_NOT_DIR) {
+                filed_vnode_kind_t cached_kind = 0;
+                if (filed_vfs_cached_child_info(
+                        &runtime->vfs,
+                        current_handle,
+                        component,
+                        &object_id,
+                        &cached_kind) == FILED_OK)
+                {
+                    if (cached_kind != FILED_VNODE_SYMLINK) {
+                        filed_close_walk_handle(runtime, current_handle, current_owned);
+                        return filed_status_to_wire(FILED_ERR_NOT_DIR);
+                    }
+                    component_is_symlink = true;
+                }
+            }
+            if (!component_is_symlink) {
+                symlink_status = filed_lookup_component_stat(
+                    runtime,
+                    current_handle,
+                    component,
+                    &object_id,
+                    &stat,
+                    &lookup_owned);
+                if (symlink_status != 0) {
+                    filed_close_walk_handle(runtime, current_handle, current_owned);
+                    return symlink_status;
+                }
+                component_is_symlink =
+                    filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK;
+            }
+            if (component_is_symlink) {
                 if (symlink_budget == 0) {
                     if (lookup_owned) {
                         (void)filed_backend_release_object(runtime, object_id);

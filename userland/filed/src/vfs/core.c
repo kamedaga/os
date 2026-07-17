@@ -58,17 +58,32 @@ static filed_vnode_t *filed_find_child_vnode(
     filed_vnode_id_t parent,
     const char *name)
 {
-    size_t i;
-
     if (vfs == NULL || parent == 0 || name == NULL) {
         return NULL;
     }
-    for (i = 0; i < FILED_MAX_VNODES; ++i) {
+    uint32_t hash = parent * 2654435761u;
+    for (const unsigned char *p = (const unsigned char *)name; *p != 0; ++p) {
+        hash = (hash ^ *p) * 16777619u;
+    }
+    const uint32_t hint_index = hash & (FILED_ID_HINT_SLOTS - 1u);
+    const uint16_t hinted_slot = vfs->child_slot_hints[hint_index];
+    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_VNODES) {
+        filed_vnode_t *candidate = &vfs->vnodes[hinted_slot - 1u];
+        if (candidate->active &&
+            candidate->linked &&
+            candidate->parent == parent &&
+            strcmp(candidate->name, name) == 0)
+        {
+            return candidate;
+        }
+    }
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
         if (vfs->vnodes[i].active &&
             vfs->vnodes[i].linked &&
             vfs->vnodes[i].parent == parent &&
             strcmp(vfs->vnodes[i].name, name) == 0)
         {
+            vfs->child_slot_hints[hint_index] = (uint16_t)(i + 1u);
             return &vfs->vnodes[i];
         }
     }
@@ -464,14 +479,33 @@ filed_status_t filed_vfs_cached_child_backend_object(
     const char *name,
     filed_backend_object_id_t *out_backend_object)
 {
+    filed_vnode_kind_t ignored_kind = 0;
+    return filed_vfs_cached_child_info(
+        vfs,
+        parent_handle,
+        name,
+        out_backend_object,
+        &ignored_kind);
+}
+
+filed_status_t filed_vfs_cached_child_info(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    filed_backend_object_id_t *out_backend_object,
+    filed_vnode_kind_t *out_kind)
+{
     filed_vnode_t *parent_vnode;
     filed_vnode_t *child;
     filed_status_t status;
 
-    if (vfs == NULL || parent_handle == 0 || name == NULL || out_backend_object == NULL) {
+    if (vfs == NULL || parent_handle == 0 || name == NULL ||
+        out_backend_object == NULL || out_kind == NULL)
+    {
         return FILED_ERR_INVALID;
     }
     *out_backend_object = 0;
+    *out_kind = 0;
     if (!filed_name_is_component(name)) {
         return FILED_ERR_INVALID;
     }
@@ -493,6 +527,7 @@ filed_status_t filed_vfs_cached_child_backend_object(
     if (child != NULL) {
         filed_lock_acquire(&child->lock);
         *out_backend_object = child->backend_object;
+        *out_kind = child->kind;
         filed_lock_release(&child->lock);
     }
     filed_vnode_write_unlock(parent_vnode);
@@ -622,6 +657,7 @@ filed_status_t filed_vfs_close_handle_ex(
     filed_handle_t *handle;
     filed_file_t *file;
     filed_vnode_t *vnode;
+    uint16_t lease_index = UINT16_MAX;
 
     if (out_reclaim != NULL) {
         memset(out_reclaim, 0, sizeof(*out_reclaim));
@@ -632,6 +668,17 @@ filed_status_t filed_vfs_close_handle_ex(
     handle = filed_find_handle(vfs, handle_id);
     if (handle == NULL) {
         return FILED_ERR_INVALID;
+    }
+    if (handle->lease_fd >= 16) {
+        for (uint16_t i = 0; i < vfs->lease_handle_count; ++i) {
+            if (vfs->lease_handle_ids[i] == handle_id) {
+                lease_index = i;
+                break;
+            }
+        }
+        if (lease_index == UINT16_MAX) {
+            return FILED_ERR_INVALID;
+        }
     }
 
     if (handle->target_kind == FILED_HANDLE_FILE) {
@@ -646,6 +693,13 @@ filed_status_t filed_vfs_close_handle_ex(
                 memset(file, 0, sizeof(*file));
             }
         }
+    }
+
+    if (lease_index != UINT16_MAX) {
+        --vfs->lease_handle_count;
+        vfs->lease_handle_ids[lease_index] =
+            vfs->lease_handle_ids[vfs->lease_handle_count];
+        vfs->lease_handle_ids[vfs->lease_handle_count] = 0;
     }
 
     memset(handle, 0, sizeof(*handle));
@@ -680,11 +734,10 @@ filed_status_t filed_vfs_set_handle_lease(
     filed_handle_t *handle = filed_find_handle(vfs, handle_id);
     if (handle == NULL || handle->owner_session != 0 || handle->lease_fd >= 16)
         return FILED_ERR_INVALID;
-    uint32_t lease_count = 0;
-    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i)
-        lease_count += vfs->handles[i].active && vfs->handles[i].lease_fd >= 16;
-    if (lease_count >= FILED_MAX_TRANSFER_LEASES) return FILED_ERR_FULL;
+    if (vfs->lease_handle_count >= FILED_MAX_TRANSFER_LEASES)
+        return FILED_ERR_FULL;
     handle->lease_fd = lease_fd;
+    vfs->lease_handle_ids[vfs->lease_handle_count++] = handle_id;
     return FILED_OK;
 }
 
@@ -2185,6 +2238,29 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
             handle->target_kind != FILED_HANDLE_VNODE)
         {
             return FILED_ERR_INVALID;
+        }
+    }
+
+    if (vfs->lease_handle_count > FILED_MAX_TRANSFER_LEASES) {
+        return FILED_ERR_INVALID;
+    }
+    uint32_t active_leases = 0;
+    for (i = 0; i < FILED_MAX_HANDLES; ++i) {
+        active_leases += vfs->handles[i].active && vfs->handles[i].lease_fd >= 16;
+    }
+    if (active_leases != vfs->lease_handle_count) {
+        return FILED_ERR_INVALID;
+    }
+    for (uint16_t lease = 0; lease < vfs->lease_handle_count; ++lease) {
+        const filed_handle_id_t handle_id = vfs->lease_handle_ids[lease];
+        const filed_handle_t *handle = filed_find_handle_const(vfs, handle_id);
+        if (handle == NULL || handle->lease_fd < 16) {
+            return FILED_ERR_INVALID;
+        }
+        for (uint16_t previous = 0; previous < lease; ++previous) {
+            if (vfs->lease_handle_ids[previous] == handle_id) {
+                return FILED_ERR_INVALID;
+            }
         }
     }
 

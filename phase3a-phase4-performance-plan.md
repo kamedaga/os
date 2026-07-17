@@ -256,6 +256,10 @@ backend stateはopenごとに実型が256 bytes以下でも4 KiB anonymous mmap 
 
 WSL clang buildとFiled VFS / tmpfs / cache invariant testを通した。最初にsingle-thread elisionまで外したbuildがSwayをEGL前で停止させたため取り消し、修正版は4 CPU keyboard+tablet direct Swayをsocket 23秒、IPC 33秒で完走した。Broken pipe、scheduler unavailable、libinput lagはなくQEMUを停止した。一回値なので目標値は変えない。
 
+追加局所改善（2026-07-18、warm path / wait set）: cached intermediate directoryをbackend lookup / statxなしでopenし、cached symlink kindもvnode metadataから判定する。child lookupは検証付きhash hint、transfer leaseは64件のcompact registryへ移し、Filed waitごとの256 handle走査と正常orphan reapの同期serial出力を削除した。
+
+同buildはhost invariant testを通した。4 CPU keyboard+tablet direct Swayは再確認でsocket 18秒、IPC 28秒、分類・正常終了まで通り、対象errorはなかった。直前の一回だけbenchmark shellがIPC ready後にENOMEMとなったが、同一buildで再現せず、lease監査にもcount / lifetime破損はなかったため性能値や原因判定には使わない。QEMUは各回停止した。
+
 ## 12. Step 9 — Phase 4完了判定
 
 最終確認は長時間batteryにせず、次に限定する。

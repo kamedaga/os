@@ -146,6 +146,7 @@ typedef struct filed_vfs {
     uint16_t vnode_slot_hints[FILED_ID_HINT_SLOTS];
     uint16_t file_slot_hints[FILED_ID_HINT_SLOTS];
     uint16_t handle_slot_hints[FILED_ID_HINT_SLOTS];
+    uint16_t child_slot_hints[FILED_ID_HINT_SLOTS];
     filed_mount_id_t next_mount_id;
     filed_vnode_id_t next_vnode_id;
     filed_file_id_t next_file_id;
@@ -154,6 +155,8 @@ typedef struct filed_vfs {
     uint16_t next_vnode_slot;
     uint16_t next_file_slot;
     uint16_t next_handle_slot;
+    uint16_t lease_handle_count;
+    filed_handle_id_t lease_handle_ids[FILED_MAX_TRANSFER_LEASES];
 } filed_vfs_t;
 
 typedef struct filed_vfs_open_result {
@@ -250,6 +253,12 @@ filed_status_t filed_vfs_cached_child_backend_object(
     filed_handle_id_t parent_handle,
     const char *name,
     filed_backend_object_id_t *out_backend_object);
+filed_status_t filed_vfs_cached_child_info(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    filed_backend_object_id_t *out_backend_object,
+    filed_vnode_kind_t *out_kind);
 
 filed_status_t filed_vfs_create_backend_child(
     filed_vfs_t *vfs,
