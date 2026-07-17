@@ -17,30 +17,40 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 
 ## Features
 
-- **Pure Microkernel** — カーネルは ファイルディスクリプタ 管理・スケジューリング・trap delegation のみを担当
 - **FD-based Microkernel** — Capabilityとほぼ特性の同じ権限ベースのFD(File Descriptor)を採用していて、厳格なセキュリティとLinux ABIおよびPOSIXの相性の良さを両立しています
 - **Linux Personality Runtime** — Linux syscallをzpolineを用いてcallqに置き換えることで、動的にリンクされるshimが呼び出されprocess内で完結します。
-- **Hardware FD** — capsule を用いた、デバイスアクセスおよび特権命令の抽象化
-- **Linux ABI Compatibility** — 無改造の Linuxバイナリ を動的リンクでロードし、Linux syscall をユーザーランドで処理
-- **Userland Drivers** — virtio-blk / virtio-net などドライバはすべてユーザー空間で動作
+- **Kobox** — capsule を用いた、ユーザー空間で動くLinuxカーネルモジュールの変換レイヤー
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
 - **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます
-- **Minimal Kernel** — 20k以下を維持するマイクロカーネルです。(現在16k) 
 
 ## Update
 - Linux Personality Runtimeを実装しました
-- カーネルを再設計しFD-based Microkernelへ変更しました
+- カーネルをFD-based Microkernelへ変更しました
 - 独自ドライバからkoboxに全面移行しました。
 - Linux ABIレイヤーなしで musl libcに対応しました。
-- その影響ですべての既存のソースコードが動かなくなりました。現在修正中です。
-
 
 ## Tech Stack
 
+## Language
 | Layer | Language | Detail |
 |---|---|---|
 | Kernel | Zig / C / Rocq | Freestanding / UEFI boot / x86_64 |
 | Userland | C / CMake | musl libc / ELF loader / Linux ABI server |
+| Tools | Go / Nix / bash | Build Tools  |
+
+## Core Functions
+
+| Name | Detail |
+|---|---|
+| Filed | Ext4 / vnode / NVMe|
+| Netd | libuinet / net-driver |
+| Scheduler | EEVDF / SMP |
+| seed | Init |
+| Termd | Linux TTY |
+| Drmd | DRM / KMS |
+| LPR | Zpoline / LinuxShim ...|
+
+
 
 ---
 
