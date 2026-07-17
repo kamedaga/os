@@ -132,7 +132,7 @@ enqueue() {
   fi
 }
 
-for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot font-roboto-mono libxkbcommon pixman hwdata-pnp; do
+for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot gtk+3.0 gtk+3.0-demo font-roboto-mono libxkbcommon pixman hwdata-pnp; do
   enqueue "${package}"
 done
 for ((i=0; i<${#queue[@]}; ++i)); do
@@ -187,6 +187,28 @@ env -u SOURCE_DATE_EPOCH "${host_fc_cache}" \
   /usr/share/fonts >/dev/null
 find "${runtime}/var/cache/fontconfig" -maxdepth 1 -type f -name '*cache-*' -print -quit |
   grep -q . || { echo "host fc-cache did not populate target root" >&2; exit 1; }
+
+# APK triggers also populate the MIME database and gdk-pixbuf loader cache.
+# gtk3-demo needs both even though PNG/JPEG support is built into libgdk_pixbuf.
+host_update_mime_database=/usr/bin/update-mime-database
+[[ -x "${host_update_mime_database}" ]] || {
+  echo "missing host ${host_update_mime_database}" >&2
+  exit 1
+}
+XDG_DATA_DIRS="${runtime}/usr/share" \
+  "${host_update_mime_database}" "${runtime}/usr/share/mime" >/dev/null
+
+pixbuf_dir="${runtime}/usr/lib/gdk-pixbuf-2.0/2.10.0"
+pixbuf_cache="${pixbuf_dir}/loaders.cache"
+GDK_PIXBUF_MODULEDIR="${pixbuf_dir}/loaders" \
+  "${linux_musl}" \
+  --library-path "${runtime}/lib:${runtime}/usr/lib" \
+  "${runtime}/usr/bin/gdk-pixbuf-query-loaders" |
+  /usr/bin/sed "s#${runtime}##g" >"${pixbuf_cache}"
+[[ -s "${pixbuf_cache}" ]] || {
+  echo "target gdk-pixbuf loader cache is empty" >&2
+  exit 1
+}
 
 # This image intentionally has no Xwayland server. Use Alt for the guest
 # modifier and disable the unavailable optional backend.
@@ -441,6 +463,7 @@ for required in \
   usr/bin/swaymsg \
   usr/bin/wayland-info \
   usr/bin/foot \
+  usr/bin/gtk3-demo \
   'usr/share/fonts/roboto-mono/RobotoMono[wght].ttf' \
   usr/lib/libwlroots-0.18.so \
   usr/lib/libwayland-client.so.0 \
@@ -458,6 +481,14 @@ if [[ -z "${fontconfig_cache}" ]]; then
   echo "missing Sway runtime fontconfig cache" >&2
   exit 1
 fi
+[[ -s "${runtime}/usr/share/mime/mime.cache" ]] || {
+  echo "missing Sway runtime MIME cache" >&2
+  exit 1
+}
+[[ -s "${runtime}/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" ]] || {
+  echo "missing Sway runtime gdk-pixbuf loader cache" >&2
+  exit 1
+}
 for required in usr/include/wayland-client.h usr/bin/wayland-scanner usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml; do
   [[ -e "${dev}/${required}" ]] || { echo "missing Sway fixture development /${required}" >&2; exit 1; }
 done

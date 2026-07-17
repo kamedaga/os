@@ -20,6 +20,7 @@ import (
 
 type Options struct {
 	Memory          string
+	CPUs            int
 	Display         string
 	Console         string
 	Firmware        string
@@ -81,6 +82,7 @@ type SmokeResult struct {
 type TTYTestOptions struct {
 	Timeout          time.Duration
 	NoKVM            bool
+	CPUs             int
 	Display          string
 	ExtraArgs        []string
 	BootMarker       string
@@ -441,6 +443,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		Console:         "pty",
 		NewTerminal:     true,
 		NoKVM:           opts.NoKVM,
+		CPUs:            opts.CPUs,
 		Fast:            true,
 		ExtraArgs:       opts.ExtraArgs,
 		QMP:             qmpPath,
@@ -884,6 +887,11 @@ func terminateQEMU(cmd *exec.Cmd, done <-chan error) {
 }
 
 func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error) {
+	cpus, err := normalizeCPUCount(opts.CPUs)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	opts.CPUs = cpus
 	qemuPath := firstNonEmpty(os.Getenv("CAPOS_QEMU"), "qemu-system-x86_64")
 	if opts.LimineImage == "" {
 		opts.LimineImage = workspace.Path(workspace.Artifacts, "limine-boot.img")
@@ -896,6 +904,16 @@ func commandArgs(workspace *config.Workspace, opts Options) (commandPlan, error)
 	default:
 		return commandPlan{}, fmt.Errorf("invalid firmware %q; expected bios or uefi", opts.Firmware)
 	}
+}
+
+func normalizeCPUCount(cpus int) (int, error) {
+	if cpus == 0 {
+		return 4, nil
+	}
+	if cpus < 1 || cpus > 256 {
+		return 0, fmt.Errorf("invalid CPU count %d; expected 1..256", cpus)
+	}
+	return cpus, nil
 }
 
 func limineImagePath(workspace *config.Workspace, image string) (string, error) {
@@ -981,7 +999,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		qemuPath,
 		"-machine", "q35",
 		"-m", opts.Memory,
-		"-smp", "4",
+		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
 	}
 	args = append(args,
@@ -1063,7 +1081,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		qemuPath,
 		"-machine", "q35",
 		"-m", opts.Memory,
-		"-smp", "4",
+		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
 		"-drive", "if=pflash,format=raw,readonly=on,file=" + codePath,
 		"-drive", "if=pflash,format=raw,file=" + varsPath,

@@ -68,6 +68,33 @@ traceはringまたはhistogramへ集計し、hot pathからserialへ出力しな
 
 最初の測定で現在値、条件、初期目標を本文書へ追記する。目標の緩和・厳格化は許容するが、理由とbefore/afterを同じcommitへ残す。
 
+### Step 0 baseline — 2026-07-17
+
+条件はKVM、2 GiB、virtio-gpu、direct `/usr/bin/sway`、Xwaylandなし、5秒の640x480 animationである。Foot、GTK3、animationへQMPからkeyboard/pointerを入力した。各CPU数は独立bootを一回だけ完走させた。
+
+| metric | 4 CPU | 1 CPU診断 | 初期目標 |
+|---|---:|---:|---:|
+| cold Wayland socket | 27.0 s | 25.0 s | 観測値 |
+| cold Sway IPC | 39.0 s | 36.0 s | 観測値 |
+| Foot map | 15.0 s | 10.0 s | 観測値 |
+| GTK3 map | 17.0 s | 11.0 s | 観測値 |
+| warm Sway IPC | 35.0 s | 30.0 s | 9.9 s以下 |
+| animation throughput | 4.087 FPS | 7.695 FPS | 4 CPUが1 CPU比+20%以上 |
+| frame p99 / max | 245 / 252 ms | 133 / 133 ms | 50 / 100 ms以下 |
+| input p99 / max | 323 / 422 ms | 266 / 312 ms | 32 / 100 ms以下 |
+| libinput lag warning | あり | あり | なし |
+| Wayland Broken pipe | なし | なし | なし |
+
+1 CPU値はring-only化直前の最後の完走値であり、比較値はprovisionalとする。保存値では4 CPU throughputが1 CPUより46.9%低く、複数runでも同じ方向を再現した。1 CPUはfallbackにせず、4 CPUのscheduler、wake、locality、llvmpipe並列度をPhase 4の主redとする。
+
+手動確認ではGTK3 demo、別Run window、keyboard/pointer操作が動作し、Fishbowlは約10 FPSだった。体感は操作可能だがもっさりしていた。これは自動animationとはworkloadが違うため参考値とする。
+
+`pacha_trace_emit()`はring記録だけにし、hot pathのserial出力を廃止した。animationとinputはscenario終了時にpercentileを一度だけ出力する。permanentな性能ABIは追加していない。
+
+CPU idle、scheduler wake/migration/steal、allocator lock、fault/COW、TLB、IPC/file cache、DRM fence/page flipのcurrent値は未instrumentedをredとする。kernel変更の承認前に値を捏造せず、各owner Stepの変更前に内部ring/histogramを追加してbefore値を残す。
+
+GTK3にはMIME/pixbuf cacheと`fallocate`の`EOPNOTSUPP` fallbackが必要だった。blocking PTYの空readがEOFになるtermd shimの問題は別の短いuserland follow-upとし、標準scenarioは実際に動くinteractive Bash PTY入力を使う。目標値は変更していない。
+
 ## 4. Step 1 — schedulerdと外部policy ABIの全廃
 
 現行bootで使用されていない`schedulerd`とexternal policy経路を削除し、in-kernel verified EEVDFへ一本化する。
@@ -223,4 +250,3 @@ Phase 4完了後にinput再設計の残りを実装する。
 - disconnect / reconnect
 
 Phase 3BはPhase 4の性能目標を悪化させない。hotplug 10周、USB実機、長時間resource確認はPhase 5の統合batteryと一緒に行う。
-

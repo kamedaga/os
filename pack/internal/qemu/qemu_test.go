@@ -44,6 +44,37 @@ func TestAppendConsoleArgsOff(t *testing.T) {
 	}
 }
 
+func TestNormalizeCPUCount(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		input   int
+		want    int
+		wantErr bool
+	}{
+		{name: "default", input: 0, want: 4},
+		{name: "minimum", input: 1, want: 1},
+		{name: "maximum", input: 256, want: 256},
+		{name: "negative", input: -1, wantErr: true},
+		{name: "too large", input: 257, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := normalizeCPUCount(test.input)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeCPUCount(%d) unexpectedly succeeded with %d", test.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("normalizeCPUCount(%d) = %d, want %d", test.input, got, test.want)
+			}
+		})
+	}
+}
+
 func TestConsoleTerminalCandidatesPreferWindowsTerminalOnWSL(t *testing.T) {
 	t.Setenv("WSL_DISTRO_NAME", "Ubuntu")
 	workspace := &config.Workspace{Root: "/home/kamer/os"}

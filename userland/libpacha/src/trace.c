@@ -243,7 +243,6 @@ void pacha_trace_emit(uint32_t component,
         slot->args[i] = record.args[i];
     }
     pacha_trace_next_record++;
-    pacha_trace_write_record(&record);
 }
 
 void pacha_trace_dump_ring(void)

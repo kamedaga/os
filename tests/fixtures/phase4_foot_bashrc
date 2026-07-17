@@ -1,0 +1,7 @@
+a()
+{
+    : >"$XDG_RUNTIME_DIR/p4-foot-pty.ok"
+}
+
+trap 'exit 0' HUP INT TERM
+PS1='p4-foot$ '

@@ -181,6 +181,21 @@ apps:
       path: "tests/fixtures/sway_phase1_acceptance.conf"
     out: "SWAYP1AC.CFG"
     rootfs: "/cmd/sway_phase1_acceptance.conf"
+  phase4_gui_benchmark_script:
+    file:
+      path: "tests/fixtures/phase4_gui_benchmark.sh"
+    out: "P4GUIBEN.SH"
+    rootfs: "/cmd/phase4_gui_benchmark.sh"
+  phase4_gui_benchmark_config:
+    file:
+      path: "tests/fixtures/phase4_gui_benchmark.conf"
+    out: "P4GUIBEN.CFG"
+    rootfs: "/cmd/phase4_gui_benchmark.conf"
+  phase4_foot_bashrc:
+    file:
+      path: "tests/fixtures/phase4_foot_bashrc"
+    out: "P4FOOT.RC"
+    rootfs: "/cmd/phase4_foot_bashrc"
   sway_foot_exit_acceptance_script:
     file:
       path: "tests/fixtures/sway_foot_exit_acceptance.sh"
@@ -274,6 +289,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_wayland_shm_client.c"
     out: "LPRWLSHM.ELF"
     rootfs: "/cmd/lpr_wayland_shm_client.elf"
+  lpr_wayland_animation_bench:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_wayland_animation_bench.elf"
+      rebuild: ["bash", "tools/build_wsl_wayland_animation_bench.sh"]
+      input:
+        - "tools/build_wsl_wayland_animation_bench.sh"
+        - "tools/build_wsl_alpine_sway.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_wayland_animation_bench.c"
+    out: "P4WLBEN.ELF"
+    rootfs: "/cmd/lpr_wayland_animation_bench.elf"
   alpine_go:
     file:
       path: ".artifacts/userland-fixtures/alpine-go-root"
@@ -754,6 +779,8 @@ apps:
         - "userland/personality/include"
         - "userland/personality/linux/runtime"
         - "userland/lpr_supervisor/include"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
         - "musl/pachaos/include"
         - "userland/personality/linux/build-lpr.sh"
         - "userland/personality/linux/check-lpr-namespace.sh"
