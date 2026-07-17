@@ -62,6 +62,41 @@ void pacha_eevdf_copy_runqueue(
     const pacha_eevdf_runqueue *src,
     pacha_eevdf_runqueue *dst);
 
+pacha_eevdf_rc pacha_eevdf_entity_init(
+    int64_t thread_id,
+    int64_t generation,
+    int64_t weight,
+    int64_t slice_ns,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_wake(
+    const pacha_eevdf_entity *entity,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_block(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_exit(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_charge(
+    const pacha_eevdf_entity *entity,
+    int64_t runtime_ns,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_mark_running(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_finish(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_migrate(
+    const pacha_eevdf_entity *entity,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out);
+pacha_eevdf_rc pacha_eevdf_entity_validate(
+    const pacha_eevdf_entity *entity);
+
 pacha_eevdf_rc pacha_eevdf_reset(
     const pacha_eevdf_runqueue *rq,
     pacha_eevdf_runqueue *out);

@@ -1,8 +1,3 @@
-pub const eevdf_max_entities: usize = 256;
-pub const sched_max_cpus: usize = 256;
-pub const no_thread_id: i64 = 0;
-pub const no_cpu: usize = sched_max_cpus;
-
 pub const EevdfState = enum(c_int) {
     empty = 0,
     runnable = 1,
@@ -19,20 +14,10 @@ pub const EevdfRc = enum(c_int) {
     state = 4,
 };
 
-pub const SchedRc = enum(c_int) {
-    ok = 0,
-    invalid = 1,
-    full = 2,
-    overflow = 3,
-    state = 4,
-};
+pub const SchedRc = EevdfRc;
 
-pub const DecisionKind = enum(c_int) {
-    none = 0,
-    run_thread = 1,
-    idle = 2,
-};
-
+/// Allocation-independent state owned by the verified EEVDF core.  Container
+/// links and CPU ownership deliberately live in the kernel adapter.
 pub const Entity = extern struct {
     thread_id: i64,
     generation: i64,
@@ -45,151 +30,19 @@ pub const Entity = extern struct {
     state: EevdfState,
 };
 
-pub const Runqueue = extern struct {
-    entities: [eevdf_max_entities]Entity,
-    entity_count: usize,
-    runnable_count: usize,
-    virtual_time: i64,
-    min_vruntime: i64,
-};
-
-pub const PickResult = extern struct {
-    rq: Runqueue,
-    has_entity: c_int,
-    index: usize,
-    entity: Entity,
-};
-
-pub const Decision = extern struct {
-    kind: DecisionKind,
-    cpu_id: usize,
-    thread_id: i64,
-    generation: i64,
-};
-
-pub const Cpu = extern struct {
-    has_current: c_int,
-    current_thread_id: i64,
-    current_generation: i64,
-    activation_pending: c_int,
-};
-
-pub const State = extern struct {
-    runqueues: [sched_max_cpus]Runqueue,
-    cpus: [sched_max_cpus]Cpu,
-    cpu_count: usize,
-    balance_cursor: usize,
-};
-
-pub extern fn pacha_kernel_sched_no_decision(out: *Decision) void;
-pub extern fn pacha_kernel_sched_empty_state(cpu_count: usize, out: *State) void;
-
-pub extern fn pacha_kernel_sched_add_thread(
-    sched: *State,
-    cpu_id: usize,
+pub extern fn pacha_eevdf_entity_init(
     thread_id: i64,
     generation: i64,
     weight: i64,
     slice_ns: i64,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_wake_thread(
-    sched: *State,
-    thread_id: i64,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_wake_thread_on_cpu(
-    sched: *State,
-    cpu_id: usize,
-    thread_id: i64,
-    decision_out: *Decision,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_block_thread(
-    sched: *State,
-    thread_id: i64,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_block_thread_on_cpu(
-    sched: *State,
-    cpu_id: usize,
-    thread_id: i64,
-    decision_out: *Decision,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_exit_thread(
-    sched: *State,
-    thread_id: i64,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_exit_thread_on_cpu(
-    sched: *State,
-    cpu_id: usize,
-    thread_id: i64,
-    decision_out: *Decision,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_on_timer(
-    sched: *State,
-    cpu_id: usize,
-    runtime_ns: i64,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_pick_cpu(
-    sched: *State,
-    cpu_id: usize,
-    decision_out: *Decision,
-    pick_scratch: *PickResult,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_finish_current(
-    sched: *State,
-    cpu_id: usize,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_handoff_to_thread_on_cpu(
-    sched: *State,
-    cpu_id: usize,
-    thread_id: i64,
-    decision_out: *Decision,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_request_activation(
-    sched: *State,
-    cpu_id: usize,
-    decision_out: *Decision,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_claim_activation(
-    sched: *State,
-    cpu_id: usize,
-    decision_out: *Decision,
-    pick_scratch: *PickResult,
-    scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_migrate_runnable(
-    sched: *State,
-    src_cpu: usize,
-    dst_cpu: usize,
-    thread_id: i64,
-    decision_out: *Decision,
-    src_scratch: *Runqueue,
-    dst_scratch: *Runqueue,
-) SchedRc;
-
-pub extern fn pacha_kernel_sched_validate(sched: *const State) SchedRc;
+    floor_vruntime: i64,
+    out: *Entity,
+) EevdfRc;
+pub extern fn pacha_eevdf_entity_wake(entity: *const Entity, floor_vruntime: i64, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_block(entity: *const Entity, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_exit(entity: *const Entity, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_charge(entity: *const Entity, runtime_ns: i64, floor_vruntime: i64, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_mark_running(entity: *const Entity, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_finish(entity: *const Entity, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_migrate(entity: *const Entity, floor_vruntime: i64, out: *Entity) EevdfRc;
+pub extern fn pacha_eevdf_entity_validate(entity: *const Entity) EevdfRc;

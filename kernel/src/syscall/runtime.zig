@@ -15,6 +15,7 @@ const FutexWaiter = struct {
     active: bool = false,
     principal: kernel.PrincipalId = @enumFromInt(0),
     thread_index: usize = 0,
+    thread_generation: u32 = 0,
     user_va: u64 = 0,
 };
 
@@ -92,9 +93,13 @@ fn nanosleep(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     return sc.syscall_err_not_ready;
 }
 
-fn recordFutexWaiter(proc: kernel.PrincipalId, thread_index: usize, user_va: u64) bool {
+fn recordFutexWaiter(proc: kernel.PrincipalId, thread_index: usize, thread_generation: u32, user_va: u64) bool {
     for (futex_waiters[0..]) |*waiter| {
         if (waiter.active and waiter.principal == proc and waiter.thread_index == thread_index) {
+            if (waiter.thread_generation != thread_generation) {
+                waiter.* = .{};
+                break;
+            }
             waiter.user_va = user_va;
             return true;
         }
@@ -105,6 +110,7 @@ fn recordFutexWaiter(proc: kernel.PrincipalId, thread_index: usize, user_va: u64
             .active = true,
             .principal = proc,
             .thread_index = thread_index,
+            .thread_generation = thread_generation,
             .user_va = user_va,
         };
         return true;
@@ -112,10 +118,13 @@ fn recordFutexWaiter(proc: kernel.PrincipalId, thread_index: usize, user_va: u64
     return false;
 }
 
-fn clearFutexWaiter(proc: kernel.PrincipalId, thread_index: usize, user_va: u64) void {
+fn clearFutexWaiter(proc: kernel.PrincipalId, thread_index: usize, thread_generation: u32, user_va: u64) void {
     for (futex_waiters[0..]) |*waiter| {
         if (!waiter.active) continue;
-        if (waiter.principal != proc or waiter.thread_index != thread_index or waiter.user_va != user_va) continue;
+        if (waiter.principal != proc or
+            waiter.thread_index != thread_index or
+            waiter.thread_generation != thread_generation or
+            waiter.user_va != user_va) continue;
         waiter.* = .{};
         return;
     }
@@ -130,9 +139,10 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if (current != expected) return sc.syscall_err_not_ready;
 
     const thread_index = scheduler.currentThread();
-    if (!recordFutexWaiter(proc, thread_index, user_va)) return sc.syscall_err_alloc;
+    const thread_generation = scheduler.generationOfThread(thread_index) orelse return sc.syscall_err_invalid;
+    if (!recordFutexWaiter(proc, thread_index, thread_generation, user_va)) return sc.syscall_err_alloc;
     if (h.block_current_thread_for_event(frame, true, timeout_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
-    clearFutexWaiter(proc, thread_index, user_va);
+    clearFutexWaiter(proc, thread_index, thread_generation, user_va);
     return sc.syscall_err_not_ready;
 }
 
@@ -143,8 +153,10 @@ fn futexWake(proc: kernel.PrincipalId, user_va: u64, max_count: u64) u64 {
         if (!waiter.active) continue;
         if (waiter.principal != proc or waiter.user_va != user_va) continue;
         const thread_index = waiter.thread_index;
+        const thread_generation = waiter.thread_generation;
         waiter.* = .{};
-        scheduler.wakeIfWaiting(thread_index);
+        if (!scheduler.threadWakeTargetIsLive(thread_index, thread_generation, proc)) continue;
+        if (!scheduler.wakeIfWaitingGeneration(thread_index, thread_generation)) continue;
         woke += 1;
         if (max_count != runtime_abi.futex_wake_all and woke >= max_count) break;
     }

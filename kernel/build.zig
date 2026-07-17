@@ -24,7 +24,6 @@ fn addVerifiedSchedulerHostObject(
     });
     clang.addFileInput(b.path(source));
     clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
-    clang.addFileInput(b.path("../verified/scheduling/include/pacha_kernel_sched.h"));
     const object = clang.addOutputFileArg(basename);
     mod.addObjectFile(object);
 }
@@ -57,7 +56,6 @@ fn addVerifiedSchedulerElfObject(
     });
     clang.addFileInput(b.path(source));
     clang.addFileInput(b.path("../verified/scheduling/include/pacha_eevdf.h"));
-    clang.addFileInput(b.path("../verified/scheduling/include/pacha_kernel_sched.h"));
     const object = clang.addOutputFileArg(basename);
     mod.addObjectFile(object);
 }
@@ -85,7 +83,6 @@ pub fn build(b: *std.Build) void {
     });
     kernel_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.o");
-    addVerifiedSchedulerHostObject(b, kernel_mod, "../verified/scheduling/src/pacha_kernel_sched.c", "pacha_kernel_sched.o");
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("../tests/kernel_state.zig"),
@@ -118,6 +115,18 @@ pub fn build(b: *std.Build) void {
     const run_fd_ipc_minimal_tests = b.addRunArtifact(fd_ipc_minimal_tests);
     test_step.dependOn(&run_fd_ipc_minimal_tests.step);
 
+    const scheduler_runqueue_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/scheduler_runqueue.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    addVerifiedSchedulerHostObject(b, scheduler_runqueue_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_runqueue_test.o");
+    const scheduler_runqueue_tests = b.addTest(.{
+        .root_module = scheduler_runqueue_test_mod,
+    });
+    const run_scheduler_runqueue_tests = b.addRunArtifact(scheduler_runqueue_tests);
+    test_step.dependOn(&run_scheduler_runqueue_tests.step);
+
     const limine_mod = b.createModule(.{
         .root_source_file = b.path("../bootloader/limine/kernel_entry.zig"),
         .target = limine_target,
@@ -135,7 +144,6 @@ pub fn build(b: *std.Build) void {
     limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     limine_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
     addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_limine.o");
-    addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_kernel_sched.c", "pacha_kernel_sched_limine.o");
     const limine_kernel = b.addExecutable(.{
         .name = "pacha-kernel",
         .root_module = limine_mod,

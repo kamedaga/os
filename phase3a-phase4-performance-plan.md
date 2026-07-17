@@ -161,6 +161,8 @@ CPUごと256 entity固定配列、runqueue全copy、global scheduler lockをrunt
 - blocked / dead threadをrunqueueへ残さない。
 - generationの古いwake、stop、commitを拒否する。
 
+完了記録: kernel runtimeからCPUごとの256 entity配列、runqueue scratch copy、`pacha_kernel_sched` link、単一verified lockを除去した。thread slotは生成時に非移動scheduler nodeを持ち、thread table拡張時は追加範囲だけをstable chunkから確保する。各CPUは独立lockとintrusive augmented treapを持ち、deadline順探索をsubtree minimum eligibility / vruntimeでpruneする。wake、block、pick、charge、exit、handoffはallocationなしのscalar EEVDF transitionへ切り替え、migrationはCPU番号順の二重lockで一括更新する。generation tokenをpick、timer、handoff、futex waiterへ通し、stale transitionをcommitしない。CPU 0上のthread exitでlocal successorがない状態をprocess exitと誤認していたSMP lifecycle bugも、interruptible idle待機へ修正した。C scalar lifecycle test、300 runnable entityのtree invariant、kernel unit build、4 CPUのstatic / dynamic pthread短時間scenarioを通し、QEMU停止と`sched-core` faultなしを確認した。性能値はStep 5のone-shot timer / locality測定前なので、このStepでは更新していない。
+
 ## 8. Step 5 — scheduler fast pathとSMP locality
 
 - periodic tickごとのparkと再選択を廃止する。

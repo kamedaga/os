@@ -5,6 +5,20 @@
 #include <stdint.h>
 #include <string.h>
 
+static void assert_entity_equal(
+    const pacha_eevdf_entity *lhs,
+    const pacha_eevdf_entity *rhs) {
+  assert(lhs->thread_id == rhs->thread_id);
+  assert(lhs->generation == rhs->generation);
+  assert(lhs->weight == rhs->weight);
+  assert(lhs->slice_ns == rhs->slice_ns);
+  assert(lhs->service_ns == rhs->service_ns);
+  assert(lhs->vruntime == rhs->vruntime);
+  assert(lhs->eligible_time == rhs->eligible_time);
+  assert(lhs->deadline == rhs->deadline);
+  assert(lhs->state == rhs->state);
+}
+
 static void test_reset_and_add(void) {
   pacha_eevdf_runqueue rq;
   pacha_eevdf_runqueue next;
@@ -203,6 +217,60 @@ static void test_charge_large_runtime_large_weight(void) {
   assert(charge.entities[0].deadline == 1025);
 }
 
+static void test_scalar_entity_lifecycle(void) {
+  pacha_eevdf_entity initial;
+  pacha_eevdf_entity running;
+  pacha_eevdf_entity charged;
+  pacha_eevdf_entity finished;
+  pacha_eevdf_entity blocked;
+  pacha_eevdf_entity woken;
+  pacha_eevdf_entity migrated;
+  pacha_eevdf_entity exited;
+  pacha_eevdf_entity failed;
+
+  assert(pacha_eevdf_entity_init(
+      81, 9, 1024, 4000000, 100, &initial) == PACHA_EEVDF_OK);
+  assert(initial.state == PACHA_EEVDF_RUNNABLE);
+  assert(initial.vruntime == 100);
+  assert(initial.deadline == 4000100);
+  assert(pacha_eevdf_entity_validate(&initial) == PACHA_EEVDF_OK);
+
+  assert(pacha_eevdf_entity_mark_running(&initial, &running) ==
+      PACHA_EEVDF_OK);
+  assert(pacha_eevdf_entity_charge(&running, 500, 100, &charged) ==
+      PACHA_EEVDF_OK);
+  assert(charged.generation == 9);
+  assert(charged.service_ns == 500);
+  assert(charged.vruntime == 600);
+  assert(pacha_eevdf_entity_finish(&charged, &finished) == PACHA_EEVDF_OK);
+  assert(pacha_eevdf_entity_block(&finished, &blocked) == PACHA_EEVDF_OK);
+  assert(pacha_eevdf_entity_wake(&blocked, 1000, &woken) == PACHA_EEVDF_OK);
+  assert(woken.vruntime == 1000);
+  assert(woken.generation == 9);
+  assert(pacha_eevdf_entity_migrate(&woken, 2000, &migrated) ==
+      PACHA_EEVDF_OK);
+  assert(migrated.vruntime == 2000);
+  assert(migrated.generation == 9);
+  assert(pacha_eevdf_entity_exit(&migrated, &exited) == PACHA_EEVDF_OK);
+  assert(exited.state == PACHA_EEVDF_EXITED);
+  assert(exited.generation == 9);
+  assert(pacha_eevdf_entity_validate(&exited) == PACHA_EEVDF_OK);
+
+  assert(pacha_eevdf_entity_wake(&migrated, 2000, &failed) ==
+      PACHA_EEVDF_ERR_STATE);
+  assert_entity_equal(&failed, &migrated);
+  assert(pacha_eevdf_entity_charge(&migrated, INT64_MAX, 2000, &failed) ==
+      PACHA_EEVDF_ERR_OVERFLOW);
+  assert_entity_equal(&failed, &migrated);
+
+  memset(&failed, 0x7f, sizeof(failed));
+  assert(pacha_eevdf_entity_init(
+      0, 9, 1024, 4000000, 0, &failed) == PACHA_EEVDF_ERR_INVALID);
+  pacha_eevdf_entity empty;
+  pacha_eevdf_empty_entity(&empty);
+  assert_entity_equal(&failed, &empty);
+}
+
 int main(void) {
   test_reset_and_add();
   test_pick_tie_breaks_by_thread_id();
@@ -213,5 +281,6 @@ int main(void) {
   test_exit_compacts_active_range();
   test_charge_overflow_keeps_runqueue();
   test_charge_large_runtime_large_weight();
+  test_scalar_entity_lifecycle();
   return 0;
 }

@@ -310,6 +310,228 @@ void pacha_eevdf_empty_entity(pacha_eevdf_entity *out) {
   return;
 }
 
+static pacha_eevdf_rc fail_entity(
+    pacha_eevdf_rc rc,
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out) {
+  *out = *entity;
+  return rc;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_validate(
+    const pacha_eevdf_entity *entity) {
+  int64_t slice;
+  int64_t expected_deadline;
+  if (entity->state == PACHA_EEVDF_EMPTY) {
+    return entity->thread_id == PACHA_EEVDF_NO_THREAD_ID &&
+               entity->generation == 0 &&
+               entity->weight == 0 &&
+               entity->slice_ns == 0 &&
+               entity->service_ns == 0 &&
+               entity->vruntime == 0 &&
+               entity->eligible_time == 0 &&
+               entity->deadline == 0
+        ? PACHA_EEVDF_OK
+        : PACHA_EEVDF_ERR_STATE;
+  }
+  if (entity->state != PACHA_EEVDF_RUNNABLE &&
+      entity->state != PACHA_EEVDF_RUNNING &&
+      entity->state != PACHA_EEVDF_BLOCKED &&
+      entity->state != PACHA_EEVDF_EXITED) {
+    return PACHA_EEVDF_ERR_STATE;
+  }
+  if (entity->thread_id == PACHA_EEVDF_NO_THREAD_ID ||
+      !valid_positive(entity->generation) ||
+      !valid_positive(entity->weight) ||
+      !valid_positive(entity->slice_ns)) {
+    return PACHA_EEVDF_ERR_INVALID;
+  }
+  if (!i64_nonnegative(entity->service_ns) ||
+      !i64_nonnegative(entity->vruntime) ||
+      entity->eligible_time < entity->vruntime) {
+    return PACHA_EEVDF_ERR_STATE;
+  }
+  if (!weighted_slice(entity->slice_ns, entity->weight, &slice) ||
+      !checked_add_i64(entity->eligible_time, slice, &expected_deadline)) {
+    return PACHA_EEVDF_ERR_OVERFLOW;
+  }
+  if (entity->deadline != expected_deadline) {
+    return PACHA_EEVDF_ERR_STATE;
+  }
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_init(
+    int64_t thread_id,
+    int64_t generation,
+    int64_t weight,
+    int64_t slice_ns,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_entity entity;
+  pacha_eevdf_empty_entity(out);
+  if (thread_id == PACHA_EEVDF_NO_THREAD_ID ||
+      !valid_positive(generation) ||
+      !valid_positive(weight) ||
+      !valid_positive(slice_ns) ||
+      !i64_nonnegative(floor_vruntime)) {
+    return PACHA_EEVDF_ERR_INVALID;
+  }
+  pacha_eevdf_empty_entity(&entity);
+  entity.thread_id = thread_id;
+  entity.generation = generation;
+  entity.weight = weight;
+  entity.slice_ns = slice_ns;
+  entity.vruntime = floor_vruntime;
+  entity.state = PACHA_EEVDF_RUNNABLE;
+  if (!refresh_deadline(&entity, floor_vruntime, out)) {
+    pacha_eevdf_empty_entity(out);
+    return PACHA_EEVDF_ERR_OVERFLOW;
+  }
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_wake(
+    const pacha_eevdf_entity *entity,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_entity next;
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (entity->state != PACHA_EEVDF_BLOCKED) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  if (!i64_nonnegative(floor_vruntime)) {
+    return fail_entity(PACHA_EEVDF_ERR_INVALID, entity, out);
+  }
+  next = *entity;
+  place_entity_at_floor(&next, floor_vruntime);
+  next.state = PACHA_EEVDF_RUNNABLE;
+  if (!refresh_deadline(&next, floor_vruntime, out)) {
+    return fail_entity(PACHA_EEVDF_ERR_OVERFLOW, entity, out);
+  }
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_block(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (!runnable_or_running(entity)) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  *out = *entity;
+  out->state = PACHA_EEVDF_BLOCKED;
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_exit(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (entity->state == PACHA_EEVDF_EMPTY ||
+      entity->state == PACHA_EEVDF_EXITED) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  *out = *entity;
+  out->state = PACHA_EEVDF_EXITED;
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_charge(
+    const pacha_eevdf_entity *entity,
+    int64_t runtime_ns,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out) {
+  int64_t delta;
+  int64_t vruntime;
+  int64_t service_ns;
+  pacha_eevdf_entity next;
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (!runnable_or_running(entity)) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  if (!i64_nonnegative(runtime_ns) || !i64_nonnegative(floor_vruntime)) {
+    return fail_entity(PACHA_EEVDF_ERR_INVALID, entity, out);
+  }
+  if (!weighted_delta(runtime_ns, entity->weight, &delta) ||
+      !checked_add_i64(entity->vruntime, delta, &vruntime) ||
+      !checked_add_i64(entity->service_ns, runtime_ns, &service_ns)) {
+    return fail_entity(PACHA_EEVDF_ERR_OVERFLOW, entity, out);
+  }
+  next = *entity;
+  next.service_ns = service_ns;
+  next.vruntime = vruntime;
+  if (!refresh_deadline(&next, floor_vruntime, out)) {
+    return fail_entity(PACHA_EEVDF_ERR_OVERFLOW, entity, out);
+  }
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_mark_running(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (entity->state != PACHA_EEVDF_RUNNABLE) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  *out = *entity;
+  out->state = PACHA_EEVDF_RUNNING;
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_finish(
+    const pacha_eevdf_entity *entity,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (entity->state != PACHA_EEVDF_RUNNING) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  *out = *entity;
+  out->state = PACHA_EEVDF_RUNNABLE;
+  return PACHA_EEVDF_OK;
+}
+
+pacha_eevdf_rc pacha_eevdf_entity_migrate(
+    const pacha_eevdf_entity *entity,
+    int64_t floor_vruntime,
+    pacha_eevdf_entity *out) {
+  pacha_eevdf_entity next;
+  pacha_eevdf_rc validation = pacha_eevdf_entity_validate(entity);
+  if (validation != PACHA_EEVDF_OK) {
+    return fail_entity(validation, entity, out);
+  }
+  if (entity->state != PACHA_EEVDF_RUNNABLE) {
+    return fail_entity(PACHA_EEVDF_ERR_STATE, entity, out);
+  }
+  if (!i64_nonnegative(floor_vruntime)) {
+    return fail_entity(PACHA_EEVDF_ERR_INVALID, entity, out);
+  }
+  next = *entity;
+  place_entity_at_floor(&next, floor_vruntime);
+  if (!refresh_deadline(&next, floor_vruntime, out)) {
+    return fail_entity(PACHA_EEVDF_ERR_OVERFLOW, entity, out);
+  }
+  return PACHA_EEVDF_OK;
+}
+
 void pacha_eevdf_empty_runqueue(pacha_eevdf_runqueue *out) {
   for (size_t i = 0; i < PACHA_EEVDF_MAX_ENTITIES; ++i) {
     pacha_eevdf_empty_entity(&out->entities[i]);
