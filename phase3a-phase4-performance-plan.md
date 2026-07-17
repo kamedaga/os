@@ -234,6 +234,8 @@ graphics:
 - threaded llvmpipeのworker数、CPU分散、buffer再利用、damageを測定する。
 - live receiverが保持するbufferを再利用しない。
 
+局所改善記録（2026-07-17、input startup logging）: inputdがlibinputの各ioctlを同期serialへ出していた通常時debug logを削除した。同一4 CPU input-only scenarioのcontrolに対し、Sway内のEGL後からEDID処理までが32.925秒から26.148秒へ6.777秒（20.6%）短縮した。animationは11.071から11.104 FPSで同等、inputは6 sampleのため目標値を変更しない。C build、direct Sway、分類、入力、5秒animation、正常終了を確認し、QEMUを停止した。
+
 ## 12. Step 9 — Phase 4完了判定
 
 最終確認は長時間batteryにせず、次に限定する。

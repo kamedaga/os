@@ -5,7 +5,6 @@
 #include <netd/ipc_protocol.h>
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 _Static_assert(INPUTD_INPUT_CAP_KEYBOARD == NETD_INPUT_CAP_KEYBOARD,
@@ -181,12 +180,6 @@ int inputd_service_dispatch(
                 inputd_input_ioctl(payload) : -22;
             if (header.payload_size >= sizeof(inputd_ioctl_request_t)) {
                 const inputd_ioctl_request_t *ioctl_request = payload;
-                printf("[inputd] ioctl handle=%llu request=0x%08llx size=%u status=%lld result=%u\n",
-                    (unsigned long long)ioctl_request->handle,
-                    (unsigned long long)ioctl_request->request,
-                    ioctl_request->data_size,
-                    (long long)status,
-                    ioctl_request->result_size);
                 if (status == 0) result = ioctl_request->result_size;
             }
             break;
