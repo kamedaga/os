@@ -104,6 +104,7 @@ type TTYTestResult struct {
 	Console       string
 	Log           string
 	PythonLog     string
+	HostTimeLog   string
 	BootMarker    string
 	Timeout       time.Duration
 	Sent          int
@@ -406,7 +407,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		opts.Timeout = 30 * time.Second
 	}
 	if opts.BootMarker == "" {
-		opts.BootMarker = "[seed0boot] hvc console spawn status=0"
+		opts.BootMarker = "[termd] linux tty hvc open ready index=0 handle=2"
 	}
 	if len(opts.Send) == 0 && opts.Python == "" {
 		opts.Send = []string{"hello from pacgo"}
@@ -460,6 +461,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	serialPath := filepath.Join(artifacts, "serial-tty-test.log")
 	consolePath := filepath.Join(artifacts, "console-tty-test.log")
 	pythonLogPath := filepath.Join(artifacts, "qemu-tty-python.log")
+	hostTimeLogPath := filepath.Join(artifacts, "qemu-tty-host-time.log")
 	if err := os.MkdirAll(artifacts, 0o755); err != nil {
 		span.Fail("artifact directory failed")
 		return TTYTestResult{}, err
@@ -476,6 +478,21 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		return TTYTestResult{}, err
 	}
 	defer consoleFile.Close()
+	hostTimeLogFile, err := os.Create(hostTimeLogPath)
+	if err != nil {
+		span.Fail("host timestamp log create failed")
+		return TTYTestResult{}, err
+	}
+	defer hostTimeLogFile.Close()
+	hostLog := &hostTimeLog{file: hostTimeLogFile, started: time.Now()}
+	_, _ = fmt.Fprintf(hostTimeLogFile, "%s +0s host | qemu start\n",
+		hostLog.started.Format("2006-01-02T15:04:05.000000000-07:00"))
+	stdoutHostLog := newHostTimeLineWriter(hostLog, "serial-stdout")
+	stderrHostLog := newHostTimeLineWriter(hostLog, "serial-stderr")
+	consoleHostLog := newHostTimeLineWriter(hostLog, "console")
+	defer stdoutHostLog.Close()
+	defer stderrHostLog.Close()
+	defer consoleHostLog.Close()
 
 	cmd := exec.Command(plan.Args[0], plan.Args[1:]...)
 	cmd.Dir = workspace.Root
@@ -501,6 +518,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		Console:       consolePath,
 		Log:           plan.LogPath,
 		PythonLog:     pythonLogPath,
+		HostTimeLog:   hostTimeLogPath,
 		BootMarker:    opts.BootMarker,
 		Timeout:       opts.Timeout,
 		Expected:      append([]string(nil), opts.Expect...),
@@ -513,11 +531,12 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	booted := make(chan struct{})
 	var bootedOnce sync.Once
 	var writeMu sync.Mutex
-	scanSerial := func(reader io.Reader) {
+	scanSerial := func(reader io.Reader, hostWriter *hostTimeLineWriter) {
 		scanner := bufio.NewScanner(reader)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			hostWriter.writeLine([]byte(line))
 			writeMu.Lock()
 			_, _ = serialFile.WriteString(line + "\n")
 			writeMu.Unlock()
@@ -530,11 +549,11 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	scanners.Add(2)
 	go func() {
 		defer scanners.Done()
-		scanSerial(stdout)
+		scanSerial(stdout, stdoutHostLog)
 	}()
 	go func() {
 		defer scanners.Done()
-		scanSerial(stderr)
+		scanSerial(stderr, stderrHostLog)
 	}()
 
 	done := make(chan error, 1)
@@ -561,7 +580,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	var ttyClient *ttyConsoleClient
 	var qmp *qmpClient
 	if opts.Python == "" {
-		ttyClient, err = startTTYConsoleClient(plan.ConsoleSocket, consoleFile)
+		ttyClient, err = startTTYConsoleClient(plan.ConsoleSocket, consoleFile, consoleHostLog)
 		if err != nil {
 			terminateQEMU(cmd, done)
 			scanners.Wait()
@@ -724,10 +743,11 @@ type ttyConsoleClient struct {
 	output      strings.Builder
 	outputMu    sync.Mutex
 	readDone    chan error
+	hostWriter  io.Writer
 	closeOnce   sync.Once
 }
 
-func startTTYConsoleClient(socketPath string, consoleFile *os.File) (*ttyConsoleClient, error) {
+func startTTYConsoleClient(socketPath string, consoleFile *os.File, hostWriters ...io.Writer) (*ttyConsoleClient, error) {
 	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -738,6 +758,9 @@ func startTTYConsoleClient(socketPath string, consoleFile *os.File) (*ttyConsole
 		consoleFile: consoleFile,
 		readDone:    make(chan error, 1),
 	}
+	if len(hostWriters) != 0 {
+		client.hostWriter = hostWriters[0]
+	}
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -745,6 +768,9 @@ func startTTYConsoleClient(socketPath string, consoleFile *os.File) (*ttyConsole
 			if n > 0 {
 				chunk := buf[:n]
 				_, _ = consoleFile.Write(chunk)
+				if client.hostWriter != nil {
+					_, _ = client.hostWriter.Write(chunk)
+				}
 				client.outputMu.Lock()
 				_, _ = client.output.Write(chunk)
 				client.outputMu.Unlock()
@@ -1377,7 +1403,7 @@ func consoleTerminalScriptContent(workspace *config.Workspace, socketPath string
 		"cd " + shellQuote(workspace.Root),
 		"sock=" + shellQuote(socketPath),
 		"ready_log=" + shellQuote(readyLogPath),
-		"ready_marker='[seed0boot] hvc console spawn status=0'",
+		"ready_marker='[termd] linux tty hvc open ready index=0 handle=2'",
 		"echo 'CapabilityOS virtio-console'",
 		"echo 'waiting for '\"$sock\"",
 		"while [ ! -S \"$sock\" ]; do",

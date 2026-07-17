@@ -14,13 +14,6 @@ wait_tick()
 
 now_ns()
 {
-    local realtime=${EPOCHREALTIME:-}
-    local seconds=${realtime%%.*}
-    local fraction=${realtime#*.}
-    if [[ $seconds =~ ^[0-9]+$ && $fraction =~ ^[0-9]{6}$ ]]; then
-        printf '%s%s000\n' "$seconds" "$fraction"
-        return
-    fi
     /bin/date +%s%N
 }
 

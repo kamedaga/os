@@ -164,7 +164,7 @@ func TestConsoleTerminalScriptPathWritesArtifactScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(contentBytes)
-	for _, want := range []string{"#!/usr/bin/env bash", "sock='/tmp/virtio-console.sock'", "ready_log='/tmp/qemu-host-time.log'", "ready_marker='[seed0boot] hvc console spawn status=0'", "python3 - \"$sock\" <<'PY'", "os.open('/dev/tty', os.O_RDWR)", "reconnecting", "exec bash"} {
+	for _, want := range []string{"#!/usr/bin/env bash", "sock='/tmp/virtio-console.sock'", "ready_log='/tmp/qemu-host-time.log'", "ready_marker='[termd] linux tty hvc open ready index=0 handle=2'", "python3 - \"$sock\" <<'PY'", "os.open('/dev/tty', os.O_RDWR)", "reconnecting", "exec bash"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("script does not contain %q:\n%s", want, content)
 		}

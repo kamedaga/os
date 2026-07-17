@@ -523,6 +523,7 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 				{"matched", dash(strings.Join(result.Matched, ", "))},
 				{"serial", ctx.workspace.Rel(result.Serial)},
 				{"console", ctx.workspace.Rel(result.Console)},
+				{"host time log", ctx.workspace.Rel(result.HostTimeLog)},
 				{"qemu log", ctx.workspace.Rel(result.Log)},
 				{"socket", result.ConsoleSocket},
 			}
@@ -543,7 +544,7 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 		},
 	}
 	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 30*time.Second, "maximum time to wait for boot and console expectations")
-	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[seed0boot] hvc console spawn status=0", "serial log marker required before sending input")
+	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[termd] linux tty hvc open ready index=0 handle=2", "serial log marker required before sending input")
 	cmd.Flags().StringArrayVar(&opts.Send, "send", nil, "string to send to the TTY; repeatable")
 	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
