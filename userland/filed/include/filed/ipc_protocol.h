@@ -92,7 +92,7 @@ typedef struct filed_path_request {
     uint64_t dir_handle;
     uint64_t rights;
     uint64_t flags;
-    uint64_t mode;
+    uint64_t result_kind;
     char path[FILED_PATH_BYTES];
 } filed_path_request_t;
 

@@ -2298,8 +2298,8 @@ pub fn wakeIfWaitingGenerationWithRax(thread_index: usize, generation: u32, resu
     return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, true);
 }
 
-pub fn wakeBlockedGeneration(thread_index: usize, generation: u32) bool {
-    return wakeIfWaitingGenerationInternal(thread_index, generation, null, false);
+pub fn wakeBlockedGenerationWithRax(thread_index: usize, generation: u32, resume_rax: u64) bool {
+    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, false);
 }
 
 pub fn wakeMailboxWaiter(principal: kernel.PrincipalId) void {

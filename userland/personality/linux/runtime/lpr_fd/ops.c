@@ -32,13 +32,16 @@ static int64_t lpr_ops_tty_close(void *state)
 static int64_t lpr_ops_drm_close(void *state)
 {
     const lpr_drm_backend_t *drm = state;
-    if (drm->wait_fd.raw >= 16) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)drm->wait_fd.raw);
-    }
-    if (drm->lease_fd.raw >= 16)
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)drm->lease_fd.raw);
-    return (drm->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0 && drm->handle != 0 ?
+    const int transfer_lease =
+        (drm->reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0;
+    const int64_t handle_status = !transfer_lease && drm->handle != 0 ?
         lpr_drm_close_handle(drm->handle) : 0;
+    const int64_t wait_status = drm->wait_fd.raw >= 16 ?
+        lpr_close_native_fd_if_open((uint64_t)(uint32_t)drm->wait_fd.raw) : 0;
+    const int64_t lease_status = drm->lease_fd.raw >= 16 ?
+        lpr_close_native_fd_if_open((uint64_t)(uint32_t)drm->lease_fd.raw) : 0;
+    return handle_status != 0 ? handle_status :
+        (wait_status != 0 ? wait_status : lease_status);
 }
 
 static int64_t lpr_ops_input_close(void *state)
@@ -570,7 +573,7 @@ static int64_t lpr_fd_dispatch_direct(
     switch (operation) {
     case 0: return lpr_backend_read(pin->fd, arg0, arg1);
     case 1: return lpr_backend_write(pin->fd, arg0, arg1);
-    case 2: return lpr_backend_readv(pin->fd, arg0, arg1);
+    case 2: return lpr_backend_readv(pin, arg0, arg1);
     case 3: return lpr_backend_writev(pin->fd, arg0, arg1);
     case 4: return lpr_backend_ioctl(pin->fd, arg0, arg1);
     case 5: return lpr_backend_fstat(pin->fd, arg0);

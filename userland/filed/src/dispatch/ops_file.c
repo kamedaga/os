@@ -1,5 +1,10 @@
 #include "common.h"
 
+_Static_assert(FILED_OPENED_KIND_REGULAR == FILED_VNODE_REGULAR, "regular vnode wire kind");
+_Static_assert(FILED_OPENED_KIND_DIRECTORY == FILED_VNODE_DIRECTORY, "directory vnode wire kind");
+_Static_assert(FILED_OPENED_KIND_SYMLINK == FILED_VNODE_SYMLINK, "symlink vnode wire kind");
+_Static_assert(FILED_OPENED_KIND_DEVICE == FILED_VNODE_DEVICE, "device vnode wire kind");
+
 filed_page_dispatch_result_t filed_dispatch_openat_page(
     filed_runtime_t *runtime,
     void *page)
@@ -17,7 +22,7 @@ filed_page_dispatch_result_t filed_dispatch_openat_page(
         result = open_result.handle_id;
         openat->object_generation = open_result.object_generation;
         openat->dir_generation = open_result.dir_generation;
-        openat->reserved0 = 0;
+        openat->opened_kind = (uint64_t)open_result.kind;
         filed_runtime_publish_generation(
             runtime,
             open_result.handle_id,
@@ -1110,33 +1115,14 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
         return flush_status;
     }
     const int backend_status = filed_kobox_backend_sync_all(&runtime->backend);
-    uint32_t active_handles = 0;
-    uint32_t active_sessions = 0;
-    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i)
-        active_handles += runtime->vfs.handles[i].active ? 1u : 0u;
-    for (uint32_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i)
-        active_sessions += runtime->sessions[i].active ? 1u : 0u;
-    filed_kobox_object_stats_t object_stats;
-    memset(&object_stats, 0, sizeof(object_stats));
-    const int object_stats_status =
-        filed_kobox_backend_object_stats(&runtime->backend, &object_stats);
-    printf(
-        "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu backend_status=%d active_handles=%u active_sessions=%u\n",
-        (unsigned long long)dirty_count,
-        (unsigned long long)backend_dirty_hint,
-        backend_status,
-        active_handles,
-        active_sessions);
-    if (object_stats_status == 0) {
+    if (backend_status != 0) {
         printf(
-            "[filed] kobox_objects used=%u referenced=%u cached=%u capacity=%u evictions=%llu\n",
-            object_stats.used,
-            object_stats.referenced,
-            object_stats.cached,
-            object_stats.capacity,
-            (unsigned long long)object_stats.evictions);
+            "[filed] sync_all page_cache_dirty=%llu backend_dirty_hint=%llu backend_status=%d\n",
+            (unsigned long long)dirty_count,
+            (unsigned long long)backend_dirty_hint,
+            backend_status);
+        fflush(stdout);
     }
-    fflush(stdout);
     return backend_status;
 }
 

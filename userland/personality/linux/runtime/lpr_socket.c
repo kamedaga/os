@@ -1887,22 +1887,6 @@ static int64_t lpr_linux_socket_poll_one(uint64_t fd, uint32_t events, uint32_t 
     if (!lpr_linux_socket_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
-    if (lpr_socket_backend(fd)->domain == LPR_LINUX_AF_NETLINK &&
-        lpr_socket_backend(fd)->wait_fd.raw >= 16)
-    {
-        struct pacha_pollfd pollfd;
-        lpr_memset(&pollfd, 0, sizeof(pollfd));
-        pollfd.fd = lpr_socket_backend(fd)->wait_fd.raw;
-        pollfd.events = (events & LPR_LINUX_POLLIN) != 0 ? PACHA_FD_EVENT_READABLE : 0;
-        const int64_t status = lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_FD_POLL,
-            (uint64_t)(uintptr_t)&pollfd,
-            1);
-        if (status < 0) return lpr_pacha_status_to_errno(status);
-        if ((pollfd.revents & PACHA_FD_EVENT_READABLE) != 0)
-            *out_revents |= LPR_LINUX_POLLIN;
-        return 0;
-    }
     void *page = 0;
     const int page_fd = lpr_netd_create_page(&page);
     if (page_fd < 0) {

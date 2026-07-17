@@ -53,13 +53,21 @@ enum {
     FILED_EXEC_PATCH_INHERIT_HANDLE = 3,
 };
 
+enum {
+    FILED_OPENED_KIND_UNKNOWN = 0,
+    FILED_OPENED_KIND_REGULAR = 1,
+    FILED_OPENED_KIND_DIRECTORY = 2,
+    FILED_OPENED_KIND_SYMLINK = 3,
+    FILED_OPENED_KIND_DEVICE = 4,
+};
+
 typedef struct filed_openat {
     uint64_t dir_handle;
     uint64_t rights;
     uint64_t open_flags;
     uint64_t object_generation;
     uint64_t dir_generation;
-    uint64_t reserved0;
+    uint64_t opened_kind;
     char name[FILED_PATH_BYTES];
 } filed_openat_t;
 

@@ -297,18 +297,25 @@ int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
     return -LPR_LINUX_EBADF;
 }
 
-int64_t lpr_backend_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
+int64_t lpr_backend_readv(
+    const lpr_fd_pin_t *pin,
+    uint64_t iov_raw,
+    uint64_t iov_count)
 {
     lpr_readv_cache_total++;
+    if (pin == 0 || pin->state == 0) {
+        return -LPR_LINUX_EBADF;
+    }
     if (iov_raw == 0 && iov_count != 0) {
         return -LPR_LINUX_EFAULT;
     }
-    if (lpr_linux_device_fd_active(fd)) {
+    const uint64_t fd = pin->fd;
+    switch (pin->ops_id) {
+    case LPR_FD_OPS_DEVICE:
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
-    }
-    if (lpr_pipe_fd_is_active(fd)) {
-        lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
-        if (pipe == 0 || !pipe->readable || pipe->native.raw < 0) {
+    case LPR_FD_OPS_PIPE: {
+        lpr_pipe_backend_t *pipe = (lpr_pipe_backend_t *)pin->state;
+        if (!pipe->readable || pipe->native.raw < 0) {
             return -LPR_LINUX_EBADF;
         }
         for (;;) {
@@ -332,16 +339,20 @@ int64_t lpr_backend_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
             }
         }
     }
-    if (lpr_linux_tty_fd_active(fd)) {
+    case LPR_FD_OPS_TTY:
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
-    }
-    if (lpr_linux_drm_fd_active(fd)) {
+    case LPR_FD_OPS_DRM:
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
-    }
-    if (lpr_linux_input_fd_active(fd)) {
+    case LPR_FD_OPS_INPUT:
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
-    }
-    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
+    case LPR_FD_OPS_EVENT: {
+        const lpr_event_backend_t *event =
+            (const lpr_event_backend_t *)pin->state;
+        if (event->subtype != LPR_EVENT_BACKEND_EVENTFD &&
+            (event->subtype != LPR_EVENT_BACKEND_TIMERFD || !event->active))
+        {
+            return -LPR_LINUX_EBADF;
+        }
         int64_t total = 0;
         const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
         for (uint64_t i = 0; i < iov_count; i += 1) {
@@ -356,7 +367,9 @@ int64_t lpr_backend_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count)
         }
         return total;
     }
-    if (!lpr_fd_is_filed(fd)) {
+    case LPR_FD_OPS_FILED:
+        break;
+    default:
         return -LPR_LINUX_EBADF;
     }
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;

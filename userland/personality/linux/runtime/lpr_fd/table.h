@@ -337,6 +337,12 @@ int lpr_fd_table_unpin(
     lpr_fd_table_t *table,
     const lpr_fd_pin_t *pin,
     lpr_fd_drop_t *out_drop);
+int lpr_fd_table_seek_pinned(
+    lpr_fd_table_t *table,
+    const lpr_fd_pin_t *pin,
+    int64_t delta,
+    uint32_t whence,
+    uint64_t *out_offset);
 
 int lpr_fd_table_get_fd_flags(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint16_t *out_flags);
 int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint16_t flags);

@@ -473,6 +473,7 @@ static filed_route_result_t filed_dispatch_client_vfs(
                 filed_dispatch_openat_page(runtime, &openat);
             route.status = open_result.status;
             route.result = open_result.result;
+            path->result_kind = openat.opened_kind;
         }
         break;
     case FILED_OP_VFS_CLOSE:

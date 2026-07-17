@@ -529,6 +529,63 @@ int lpr_fd_table_unpin(
     return 0;
 }
 
+int lpr_fd_table_seek_pinned(
+    lpr_fd_table_t *table,
+    const lpr_fd_pin_t *pin,
+    int64_t delta,
+    uint32_t whence,
+    uint64_t *out_offset)
+{
+    if (pin == 0 || out_offset == 0 || whence > 1u) {
+        return -1;
+    }
+    lpr_fd_table_lock(table);
+    lpr_ofd_t *ofd = lpr_fd_ofd(table, pin->ofd_index, pin->ofd_generation);
+    lpr_backend_record_t *backend = ofd != 0 ? lpr_fd_backend(table, ofd->backend) : 0;
+    if (ofd == 0 || backend == 0 || ofd->pin_count == 0 ||
+        ofd->backend.index != pin->backend_index ||
+        ofd->backend.generation != pin->backend_generation ||
+        backend->ops_id != pin->ops_id || backend->state != pin->state)
+    {
+        lpr_fd_table_unlock(table);
+        return -1;
+    }
+
+    uint64_t next = 0;
+    if (whence == 0u) {
+        if (delta < 0) {
+            lpr_fd_table_unlock(table);
+            return -1;
+        }
+        next = (uint64_t)delta;
+    } else if (delta >= 0) {
+        const uint64_t amount = (uint64_t)delta;
+        if (ofd->offset > UINT64_MAX - amount) {
+            lpr_fd_table_unlock(table);
+            return -1;
+        }
+        next = ofd->offset + amount;
+    } else {
+        const uint64_t amount = 0u - (uint64_t)delta;
+        if (amount > ofd->offset) {
+            lpr_fd_table_unlock(table);
+            return -1;
+        }
+        next = ofd->offset - amount;
+    }
+
+    ofd->offset = next;
+    if (backend->ops_id == LPR_FD_OPS_FILED &&
+        backend->state_bytes >= sizeof(lpr_filed_backend_t))
+    {
+        ((lpr_filed_backend_t *)backend->state)->offset = next;
+    }
+    (void)lpr_fd_next_generation(table);
+    *out_offset = next;
+    lpr_fd_table_unlock(table);
+    return 0;
+}
+
 int lpr_fd_table_get_fd_flags(
     const lpr_fd_table_t *table,
     lpr_linux_fd_t fd,

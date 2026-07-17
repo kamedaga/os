@@ -543,7 +543,14 @@ fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalI
         state.unregisterFdWaitersForThread(target, delivery.thread_index, delivery.thread_generation);
     }
     if (delivery.was_blocked) {
-        _ = scheduler.wakeBlockedGeneration(delivery.thread_index, delivery.thread_generation);
+        // Timed waits keep their normal timeout result in the saved frame
+        // (nanosleep uses OK).  A signal wake must override that value so the
+        // personality can report EINTR and the remaining relative duration.
+        _ = scheduler.wakeBlockedGenerationWithRax(
+            delivery.thread_index,
+            delivery.thread_generation,
+            sc.syscall_err_not_ready,
+        );
     }
     return sc.syscall_ok;
 }

@@ -369,88 +369,84 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 {
-    if (lpr_linux_device_fd_active(fd)) {
-        (void)offset;
-        return whence <= 2 ? 0 : -LPR_LINUX_EINVAL;
-    }
-    if (lpr_linux_tty_fd_active(fd)) {
+    if (fd > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_ESPIPE;
     }
-    if (lpr_linux_drm_fd_active(fd)) {
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
         return -LPR_LINUX_ESPIPE;
     }
-    if (lpr_linux_input_fd_active(fd)) {
-        return -LPR_LINUX_ESPIPE;
+
+    int64_t result = -LPR_LINUX_ESPIPE;
+    if (pin.ops_id == LPR_FD_OPS_DEVICE) {
+        result = whence <= 2 ? 0 : -LPR_LINUX_EINVAL;
+        goto out;
     }
-    if (lpr_linux_dmabuf_fd_active(fd)) {
-        const lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(fd);
+    if (pin.ops_id == LPR_FD_OPS_DMABUF) {
+        const lpr_dmabuf_backend_t *dmabuf =
+            (const lpr_dmabuf_backend_t *)pin.state;
         if ((int64_t)offset != 0 || dmabuf == 0) {
-            return -LPR_LINUX_EINVAL;
+            result = -LPR_LINUX_EINVAL;
+        } else if (whence == 0) {
+            result = 0;
+        } else if (whence == 2 && dmabuf->size <= INT64_MAX) {
+            result = (int64_t)dmabuf->size;
+        } else {
+            result = -LPR_LINUX_EINVAL;
         }
-        if (whence == 0) {
-            return 0;
-        }
-        if (whence == 2 && dmabuf->size <= INT64_MAX) {
-            return (int64_t)dmabuf->size;
-        }
-        return -LPR_LINUX_EINVAL;
+        goto out;
     }
-    if (lpr_pipe_fd_is_active(fd)) {
-        return -LPR_LINUX_ESPIPE;
+    if (pin.ops_id != LPR_FD_OPS_FILED || pin.state == 0) {
+        goto out;
     }
-    if (!lpr_fd_is_filed(fd)) {
-        return -LPR_LINUX_ESPIPE;
-    }
-    if (lpr_fd_shadow_offset_eligible(fd) &&
-        lpr_filed_backend(fd)->offset_valid &&
-        whence <= 1)
+
+    lpr_filed_backend_t *filed = (lpr_filed_backend_t *)pin.state;
+    if ((filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY &&
+        filed->offset_valid && whence <= 1)
     {
         const int64_t signed_offset = (int64_t)offset;
-        const uint64_t current_offset = lpr_filed_control_offset(fd);
         uint64_t new_offset = 0;
-        if (whence == 0) {
-            if (signed_offset < 0) {
-                return -LPR_LINUX_EINVAL;
-            }
-            new_offset = (uint64_t)signed_offset;
-        } else {
-            if (signed_offset >= 0) {
-                const uint64_t delta = (uint64_t)signed_offset;
-                if (current_offset > UINT64_MAX - delta) {
-                    return -LPR_LINUX_EINVAL;
-                }
-                new_offset = current_offset + delta;
-            } else {
-                const uint64_t delta = (uint64_t)(-signed_offset);
-                if (delta > current_offset) {
-                    return -LPR_LINUX_EINVAL;
-                }
-                new_offset = current_offset - delta;
-            }
+        if (lpr_fd_table_seek_pinned(
+                &lpr_control_fd_table,
+                &pin,
+                signed_offset,
+                (uint32_t)whence,
+                &new_offset) != 0)
+        {
+            result = -LPR_LINUX_EINVAL;
+            goto out;
         }
-        lpr_filed_control_set_offset(fd, new_offset);
-        lpr_filed_backend(fd)->pread_active = 1;
-        return (int64_t)new_offset;
+        filed->pread_active = 1;
+        result = (int64_t)new_offset;
+        goto out;
     }
     void *page = 0;
     const int page_fd = lpr_create_wire_page(&page);
     if (page_fd < 0) {
-        return page_fd;
+        result = page_fd;
+        goto out;
     }
     filed_seek_t *seek = (filed_seek_t *)page;
     lpr_memset(seek, 0, sizeof(*seek));
-    seek->handle = lpr_filed_backend(fd)->handle;
+    seek->handle = filed->handle;
     seek->offset = (int64_t)offset;
     seek->whence = whence;
-    uint64_t result = 0;
-    const int64_t status = lpr_filed_call(FILED_OP_VFS_SEEK, page_fd, 0, &result);
+    uint64_t new_offset = 0;
+    const int64_t status =
+        lpr_filed_call(FILED_OP_VFS_SEEK, page_fd, 0, &new_offset);
     lpr_destroy_wire_page(page_fd, page);
-    if (status == 0 && lpr_fd_shadow_offset_eligible(fd)) {
-        lpr_filed_control_set_offset(fd, result);
-        lpr_filed_backend(fd)->offset_valid = 1;
-        lpr_filed_backend(fd)->pread_active = 1;
+    if (status == 0 &&
+        (filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY)
+    {
+        lpr_filed_control_set_offset(fd, new_offset);
+        filed->offset_valid = 1;
+        filed->pread_active = 1;
     }
-    return status == 0 ? (int64_t)result : status;
+    result = status == 0 ? (int64_t)new_offset : status;
+
+out:
+    lpr_fd_unpin(&pin);
+    return result;
 }
 
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)

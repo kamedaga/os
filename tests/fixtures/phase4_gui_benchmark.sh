@@ -30,14 +30,25 @@ fail()
 
 wait_for_socket()
 {
+    local sway_pid=$1
+    wait_socket=
+    wait_socket_sway_exited=0
     local ticks=0
     while [[ $ticks -lt $wait_limit ]]; do
         shopt -s nullglob
         local sockets=("$runtime"/sway-ipc.*.sock)
         shopt -u nullglob
         if [[ ${#sockets[@]} -eq 1 ]]; then
-            printf '%s\n' "${sockets[0]}"
+            wait_socket=${sockets[0]}
             return 0
+        fi
+        if ! kill -0 "$sway_pid" 2>/dev/null || pid_has_stopped "$sway_pid"; then
+            local status=0
+            wait "$sway_pid" 2>/dev/null || status=$?
+            printf 'P4_BENCH_SWAY_EXIT_BEFORE_SOCKET pid=%s status=%s\n' \
+                "$sway_pid" "$status" >&2
+            wait_socket_sway_exited=1
+            return 1
         fi
         wait_tick 0.1
         ticks=$((ticks + 1))
@@ -186,7 +197,12 @@ if [[ ${P3A_INPUT_ONLY:-0} == 1 ]]; then
     printf 'P4_BENCH_SWAY_EXEC phase=p3a guest_ns=%s path=/usr/bin/sway\n' "$p3a_start"
     /usr/bin/sway -c "$config" &
     sway_pid=$!
-    socket=$(wait_for_socket) || { fail p3a-socket; kill -KILL "$sway_pid"; exit 1; }
+    if ! wait_for_socket "$sway_pid"; then
+        fail p3a-socket
+        [[ $wait_socket_sway_exited == 1 ]] || kill -KILL "$sway_pid"
+        exit 1
+    fi
+    socket=$wait_socket
     p3a_socket=$(now_ns)
     wait_for_ipc "$socket" || { fail p3a-ipc; kill -KILL "$sway_pid"; exit 1; }
     p3a_ipc=$(now_ns)
@@ -243,7 +259,12 @@ cold_start=$(now_ns)
 printf 'P4_BENCH_SWAY_EXEC phase=cold guest_ns=%s path=/usr/bin/sway\n' "$cold_start"
 /usr/bin/sway -c "$config" &
 sway_pid=$!
-socket=$(wait_for_socket) || { fail cold-socket; kill -KILL "$sway_pid"; exit 1; }
+if ! wait_for_socket "$sway_pid"; then
+    fail cold-socket
+    [[ $wait_socket_sway_exited == 1 ]] || kill -KILL "$sway_pid"
+    exit 1
+fi
+socket=$wait_socket
 cold_socket=$(now_ns)
 wait_for_ipc "$socket" || { fail cold-ipc; kill -KILL "$sway_pid"; exit 1; }
 cold_ipc=$(now_ns)
@@ -319,7 +340,12 @@ warm_start=$(now_ns)
 printf 'P4_BENCH_SWAY_EXEC phase=warm guest_ns=%s path=/usr/bin/sway\n' "$warm_start"
 /usr/bin/sway -c "$config" &
 warm_sway_pid=$!
-warm_socket=$(wait_for_socket) || { fail warm-socket; kill -KILL "$warm_sway_pid"; exit 1; }
+if ! wait_for_socket "$warm_sway_pid"; then
+    fail warm-socket
+    [[ $wait_socket_sway_exited == 1 ]] || kill -KILL "$warm_sway_pid"
+    exit 1
+fi
+warm_socket=$wait_socket
 warm_socket_time=$(now_ns)
 wait_for_ipc "$warm_socket" || { fail warm-ipc; kill -KILL "$warm_sway_pid"; exit 1; }
 warm_ipc=$(now_ns)

@@ -1441,22 +1441,3 @@ void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle)
         }
     }
 }
-
-void drmd_kms_get_state_counts(drmd_kms_state_counts_t *out_counts)
-{
-    if (out_counts == NULL) return;
-    memset(out_counts, 0, sizeof(*out_counts));
-    out_counts->master_handle = kms.master_handle;
-    for (size_t i = 0; i < DRMD_KMS_FB_MAX; i++) {
-        out_counts->fb += kms.fb[i].active ? 1u : 0u;
-    }
-    for (size_t i = 0; i < DRMD_KMS_GEM_HANDLE_MAX; i++) {
-        out_counts->dumb += kms.gem_handles[i].active ? 1u : 0u;
-    }
-    for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; i++) {
-        if (kms.event_files[i].active) {
-            out_counts->event_queues++;
-            out_counts->events += kms.event_files[i].count;
-        }
-    }
-}

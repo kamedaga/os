@@ -1041,7 +1041,7 @@ static int64_t lpr_filed_call_locked(
         path->dir_handle = openat_payload.dir_handle;
         path->rights = openat_payload.rights;
         path->flags = openat_payload.open_flags;
-        path->mode = 0;
+        path->result_kind = 0;
         size_t path_len = lpr_strnlen(openat_payload.name, sizeof(openat_payload.name));
         if (path_len >= sizeof(path->path)) {
             path_len = sizeof(path->path) - 1u;
@@ -1198,6 +1198,13 @@ static int64_t lpr_filed_call_locked(
         return status;
     }
     const uint64_t reply_result = reply_header->result;
+    if (op == FILED_OP_VFS_OPENAT) {
+        const filed_path_request_t *path =
+            (const filed_path_request_t *)((const uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+        const uint64_t opened_kind = path->result_kind;
+        lpr_memset(page, 0, sizeof(filed_openat_t));
+        ((filed_openat_t *)page)->opened_kind = opened_kind;
+    }
     if (op != FILED_OP_VFS_OPENAT &&
         op != FILED_OP_VFS_CLOSE &&
         op != FILED_OP_VFS_FSYNC &&

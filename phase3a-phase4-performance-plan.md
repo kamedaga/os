@@ -238,6 +238,18 @@ graphics:
 
 局所改善記録（2026-07-17、input startup logging）: inputdがlibinputの各ioctlを同期serialへ出していた通常時debug logを削除した。同一4 CPU input-only scenarioのcontrolに対し、Sway内のEGL後からEDID処理までが32.925秒から26.148秒へ6.777秒（20.6%）短縮した。animationは11.071から11.104 FPSで同等、inputは6 sampleのため目標値を変更しない。C build、direct Sway、分類、入力、5秒animation、正常終了を確認し、QEMUを停止した。
 
+局所改善記録（2026-07-17、DRM open / close）: card0 openごとの同期uevent publicationを削除した。startup probeで34回あったnetd round-tripはdevice registration時の2件だけになった。normal closeはremote handleをwait / lease fdより先に閉じ、成功closeがorphan reapへ入る競合と、成功時の全handle / KMS table走査・serial出力を削除した。hotplug ABIは追加せず、registration publicationは維持した。
+
+局所改善記録（2026-07-17、file open metadata）: Sway実行後18秒の一回限りのfiled集計でopenat 307回、error 113回、最大114,894,213 cyclesを観測した。成功file openではLPRがdevice判定とsymlink判定のためfstatを最大2回行い、各fstatが4 KiB VMO create / map / IPC / unmap / closeを伴っていた。filedはopen完了時に既にvnode kindを所有するため、未使用だった同サイズのreply fieldへkindを返すようproducer / consumerを同時切替し、通常fileの追加STATを除去した。deviceだけはrdev確認を1回残し、互換分岐は置かなかった。
+
+同変更はuserland全体buildを通した。4 CPU foreground確認では`/bin/sleep 2`がhost実測1.937秒となった。kernelはsignal wakeだけ保存`rax`を`NOT_READY`へ上書きし、LPRはrelative / absolute deadline、handled / ignored signalを分離する。通常timer wakeは`OK`のまま変えない。
+
+間欠stallはnetlink queueにdataが残っていてもgeneric waitが通知tokenをdrainすると、LPRが空の通知FDだけをpollして永久waitするmissed wakeだった。AF_NETLINKもauthoritativeなnetd queue-length pollへ統一した後、EDID、event1 / event0 open、Wayland socket / IPC ready、input readyまで進んだ。
+
+AUTH_MAGIC直前の一回計測は16,176 syscall、92,414,916,332 cyclesだった。上位はclose 17.6%、open 17.3%、readv 16.6%、lseek 13.6%、ftruncate 7.1%で、pollとfutexの合計は約1.5%だった。fstatは96回まで減りopen metadata切替は機能している。次はVFSのFD再lookup、backend state allocation、file data pathを優先し、handled page fault計測は他分類でfaultが残る場合だけ承認を取る。
+
+同分類から、read-only lseekをgeneration検証付きpinned OFD transactionへ変更し、Filed readvはdispatcherの既存pinを再利用してbackend再分類8 lookupを除去した。4 CPU keyboard+tabletの一回確認はsocket 27秒、IPC 39秒で、direct Sway、両device分類、正常終了を通し、Broken pipe、scheduler unavailable、libinput lagはなかった。速度向上値には数えず、目標値は変更しない。
+
 ## 12. Step 9 — Phase 4完了判定
 
 最終確認は長時間batteryにせず、次に限定する。

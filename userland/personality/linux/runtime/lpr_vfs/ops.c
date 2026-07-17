@@ -543,13 +543,17 @@ int64_t lpr_filed_open_handle_at(
     const char *path,
     uint64_t flags,
     uint64_t mode,
-    uint64_t *out_handle)
+    uint64_t *out_handle,
+    uint64_t *out_kind)
 {
     (void)mode;
     if (out_handle == 0) {
         return -LPR_LINUX_EFAULT;
     }
     *out_handle = 0;
+    if (out_kind != 0) {
+        *out_kind = 0;
+    }
     if ((flags & (LPR_LINUX_O_CREAT | LPR_LINUX_O_TRUNC)) != 0) {
         lpr_readlink_cache_clear();
         lpr_page_cache_clear();
@@ -579,11 +583,15 @@ int64_t lpr_filed_open_handle_at(
     if (status == 0) {
         status = lpr_filed_call(FILED_OP_VFS_OPENAT, page_fd, 0, &handle);
     }
+    const uint64_t opened_kind = status == 0 ? open_req->opened_kind : 0;
     lpr_destroy_wire_page(page_fd, page);
     if (status != 0) {
         return status;
     }
     *out_handle = handle;
+    if (out_kind != 0) {
+        *out_kind = opened_kind;
+    }
     return 0;
 }
 
@@ -661,8 +669,16 @@ static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
     return fd;
 }
 
-int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
+int64_t lpr_linux_openat_once(
+    uint64_t dirfd,
+    uint64_t path_raw,
+    uint64_t flags,
+    uint64_t mode,
+    uint64_t *out_kind)
 {
+    if (out_kind != 0) {
+        *out_kind = 0;
+    }
     const char *path = (const char *)(uintptr_t)path_raw;
     const int64_t proc_fd = lpr_linux_proc_self_fd_open(path, flags);
     if (proc_fd != -LPR_LINUX_ENOENT) {
@@ -711,7 +727,9 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
         return install == 0 ? fd : install;
     }
     uint64_t handle = 0;
-    const int64_t status = lpr_filed_open_handle_at(dirfd, path, flags, mode, &handle);
+    uint64_t opened_kind = 0;
+    const int64_t status = lpr_filed_open_handle_at(
+        dirfd, path, flags, mode, &handle, &opened_kind);
     if (status != 0) {
         return status;
     }
@@ -722,7 +740,8 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
     }
     lpr_linux_stat_t st;
     lpr_memset(&st, 0, sizeof(st));
-    if (lpr_linux_fstat((uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&st) == 0 &&
+    if (opened_kind == FILED_OPENED_KIND_DEVICE &&
+        lpr_linux_fstat((uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&st) == 0 &&
         (st.st_mode & LPR_LINUX_S_IFMT) == LPR_LINUX_S_IFCHR &&
         (st.st_rdev == ((1ull << 8u) | 3ull) ||
             st.st_rdev == ((1ull << 8u) | 5ull) ||
@@ -744,6 +763,9 @@ int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags,
         device->major = 1;
         device->minor = (uint8_t)st.st_rdev;
         device->flags = (uint32_t)flags;
+    }
+    if (out_kind != 0) {
+        *out_kind = opened_kind;
     }
     return fd;
 }
@@ -817,17 +839,14 @@ int lpr_resolve_final_symlink_path(const char *path, const char *target, char *o
 
 int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode)
 {
-    int64_t fd = lpr_linux_openat_once(dirfd, path_raw, flags, mode);
+    uint64_t opened_kind = 0;
+    int64_t fd = lpr_linux_openat_once(dirfd, path_raw, flags, mode, &opened_kind);
     if (fd < 0 ||
         (flags & (LPR_LINUX_O_NOFOLLOW | LPR_LINUX_O_CREAT | LPR_LINUX_O_TRUNC)) != 0)
     {
         return fd;
     }
-    lpr_linux_stat_t st;
-    const int64_t stat_status = lpr_linux_fstat((uint64_t)fd, (uint64_t)(uintptr_t)&st);
-    if (stat_status != 0 ||
-        (((uint64_t)st.st_mode & LPR_LINUX_S_IFMT) != LPR_LINUX_S_IFLNK))
-    {
+    if (opened_kind != FILED_OPENED_KIND_SYMLINK) {
         return fd;
     }
     char target[FILED_SYMLINK_TARGET_BYTES];
@@ -843,7 +862,8 @@ int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint
     if (!lpr_resolve_final_symlink_path(path, target, resolved, sizeof(resolved))) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
-    return lpr_linux_openat_once(dirfd, (uint64_t)(uintptr_t)resolved, flags, mode);
+    return lpr_linux_openat_once(
+        dirfd, (uint64_t)(uintptr_t)resolved, flags, mode, 0);
 }
 
 void lpr_cwd_pop_component(char *path, uint64_t *len)
@@ -1064,7 +1084,8 @@ int64_t lpr_linux_chdir(uint64_t path_raw)
         path,
         LPR_LINUX_O_RDONLY | LPR_LINUX_O_DIRECTORY,
         0,
-        &handle);
+        &handle,
+        0);
     if (status != 0) {
         return status;
     }
@@ -1158,29 +1179,85 @@ int64_t lpr_pacha_nanosleep(const struct pachaos_timespec *req)
     return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
 }
 
-int64_t lpr_linux_sleep_result(int64_t status)
+static int64_t lpr_linux_relative_sleep(
+    uint64_t clock_id,
+    const struct pachaos_timespec *req,
+    uint64_t rem_raw)
 {
-    if (status != -LPR_LINUX_EAGAIN) {
-        return status;
+    struct pachaos_timespec remaining = *req;
+    for (;;) {
+        struct pachaos_timespec started;
+        int64_t status = lpr_pacha_clock_gettime(clock_id, &started);
+        if (status != 0) return status;
+
+        status = lpr_pacha_nanosleep(&remaining);
+        if (status != -LPR_LINUX_EAGAIN) return status;
+
+        struct pachaos_timespec now;
+        status = lpr_pacha_clock_gettime(clock_id, &now);
+        if (status != 0) return status;
+
+        struct pachaos_timespec interrupted_remaining = remaining;
+        if (lpr_timespec_less_equal(&started, &now)) {
+            struct pachaos_timespec elapsed;
+            lpr_memset(&elapsed, 0, sizeof(elapsed));
+            lpr_timespec_subtract(&now, &started, &elapsed);
+            if (lpr_timespec_less_equal(&remaining, &elapsed)) {
+                lpr_memset(&interrupted_remaining, 0, sizeof(interrupted_remaining));
+            } else {
+                lpr_timespec_subtract(&remaining, &elapsed, &interrupted_remaining);
+            }
+        }
+        remaining = interrupted_remaining;
+        if (rem_raw != 0) {
+            *(struct pachaos_timespec *)(uintptr_t)rem_raw = remaining;
+        }
+        if (remaining.tv_sec == 0 && remaining.tv_nsec == 0) return 0;
+
+        /* This mirrors the outer blocking-syscall contract without throwing
+         * away the elapsed interval: a handled signal abandons this dispatch
+         * with EINTR, while an ignored or spurious wake returns here and sleeps
+         * only the remaining duration. */
+        status = lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
+        if (status != 0) return status;
+        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
     }
-    const int64_t signal_status = lpr_linux_dispatch_pending_signals();
-    return signal_status != 0 ? signal_status : -LPR_LINUX_EINTR;
+}
+
+static int64_t lpr_linux_absolute_sleep(
+    uint64_t clock_id,
+    const struct pachaos_timespec *deadline)
+{
+    for (;;) {
+        struct pachaos_timespec now;
+        int64_t status = lpr_pacha_clock_gettime(clock_id, &now);
+        if (status != 0) return status;
+        if (lpr_timespec_less_equal(deadline, &now)) return 0;
+
+        struct pachaos_timespec relative;
+        lpr_memset(&relative, 0, sizeof(relative));
+        lpr_timespec_subtract(deadline, &now, &relative);
+        status = lpr_pacha_nanosleep(&relative);
+        if (status != -LPR_LINUX_EAGAIN) return status;
+
+        status = lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
+        if (status != 0) return status;
+        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+    }
 }
 
 int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw)
 {
-    (void)rem_raw;
     const struct pachaos_timespec *req = (const struct pachaos_timespec *)(uintptr_t)req_raw;
     const int64_t valid = lpr_linux_validate_timespec(req);
     if (valid != 0) {
         return valid;
     }
-    return lpr_linux_sleep_result(lpr_pacha_nanosleep(req));
+    return lpr_linux_relative_sleep(LPR_LINUX_CLOCK_MONOTONIC, req, rem_raw);
 }
 
 int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t req_raw, uint64_t rem_raw)
 {
-    (void)rem_raw;
     if (clock_id != LPR_LINUX_CLOCK_REALTIME && clock_id != LPR_LINUX_CLOCK_MONOTONIC) {
         return -LPR_LINUX_EINVAL;
     }
@@ -1193,19 +1270,8 @@ int64_t lpr_linux_clock_nanosleep(uint64_t clock_id, uint64_t flags, uint64_t re
         return valid;
     }
     if ((flags & LPR_LINUX_TIMER_ABSTIME) == 0) {
-        return lpr_linux_sleep_result(lpr_pacha_nanosleep(req));
+        return lpr_linux_relative_sleep(LPR_LINUX_CLOCK_MONOTONIC, req, rem_raw);
     }
 
-    struct pachaos_timespec now;
-    int64_t status = lpr_pacha_clock_gettime(clock_id, &now);
-    if (status != 0) {
-        return status;
-    }
-    if (lpr_timespec_less_equal(req, &now)) {
-        return 0;
-    }
-    struct pachaos_timespec relative;
-    lpr_memset(&relative, 0, sizeof(relative));
-    lpr_timespec_subtract(req, &now, &relative);
-    return lpr_linux_sleep_result(lpr_pacha_nanosleep(&relative));
+    return lpr_linux_absolute_sleep(clock_id, req);
 }
