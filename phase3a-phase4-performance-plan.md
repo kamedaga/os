@@ -91,6 +91,8 @@ traceはringまたはhistogramへ集計し、hot pathからserialへ出力しな
 
 `pacha_trace_emit()`はring記録だけにし、hot pathのserial出力を廃止した。animationとinputはscenario終了時にpercentileを一度だけ出力する。permanentな性能ABIは追加していない。
 
+局所計測の判定に使えるよう、shell側timestampは外部`date`の実質1秒値からBash builtin `EPOCHREALTIME`のµs値へ切り替え、IPC失敗後の再確認間隔を2秒から100msへ縮めた。P3A短縮scenarioもSway exec、socket、IPCを同じ時計で記録する。
+
 CPU idle、scheduler wake/migration/steal、allocator lock、fault/COW、TLB、IPC/file cache、DRM fence/page flipのcurrent値は未instrumentedをredとする。kernel変更の承認前に値を捏造せず、各owner Stepの変更前に内部ring/histogramを追加してbefore値を残す。
 
 GTK3にはMIME/pixbuf cacheと`fallocate`の`EOPNOTSUPP` fallbackが必要だった。blocking PTYの空readがEOFになるtermd shimの問題は別の短いuserland follow-upとし、標準scenarioは実際に動くinteractive Bash PTY入力を使う。目標値は変更していない。

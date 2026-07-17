@@ -14,6 +14,13 @@ wait_tick()
 
 now_ns()
 {
+    local realtime=${EPOCHREALTIME:-}
+    local seconds=${realtime%%.*}
+    local fraction=${realtime#*.}
+    if [[ $seconds =~ ^[0-9]+$ && $fraction =~ ^[0-9]{6}$ ]]; then
+        printf '%s%s000\n' "$seconds" "$fraction"
+        return
+    fi
     /bin/date +%s%N
 }
 
@@ -53,7 +60,7 @@ wait_for_ipc()
         if /usr/bin/swaymsg -s "$socket" -t get_version >/dev/null 2>&1; then
             return 0
         fi
-        wait_tick 2
+        wait_tick 0.1
         ticks=$((ticks + 1))
     done
     return 1
@@ -182,13 +189,20 @@ fi
 if [[ ${P3A_INPUT_ONLY:-0} == 1 ]]; then
     input_mode=${P3A_INPUT_MODE:-mouse}
     unset WAYLAND_DISPLAY SWAYSOCK
+    p3a_start=$(now_ns)
+    printf 'P4_BENCH_SWAY_EXEC phase=p3a guest_ns=%s path=/usr/bin/sway\n' "$p3a_start"
     /usr/bin/sway -c "$config" &
     sway_pid=$!
     socket=$(wait_for_socket) || { fail p3a-socket; kill -KILL "$sway_pid"; exit 1; }
+    p3a_socket=$(now_ns)
     wait_for_ipc "$socket" || { fail p3a-ipc; kill -KILL "$sway_pid"; exit 1; }
+    p3a_ipc=$(now_ns)
     display=$(wait_for_wayland_display) || { fail p3a-display; kill -KILL "$sway_pid"; exit 1; }
     export WAYLAND_DISPLAY=$display
     export SWAYSOCK=$socket
+    printf 'P4_BENCH_STARTUP phase=p3a socket_ms=%s ipc_ms=%s display=%s\n' \
+        "$(elapsed_ms "$p3a_start" "$p3a_socket")" \
+        "$(elapsed_ms "$p3a_start" "$p3a_ipc")" "$display"
     inputs=$(/usr/bin/swaymsg -s "$socket" -t get_inputs) || {
         fail p3a-get-inputs
         stop_sway "$socket" "$sway_pid" || true
