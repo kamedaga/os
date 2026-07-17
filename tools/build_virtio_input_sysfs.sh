@@ -5,6 +5,17 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out="${repo_root}/.artifacts/userland-fixtures/virtio-input-sysfs"
 rm -rf "${out}"
 
+raw_device_count="${CAPOS_INPUT_SYSFS_DEVICE_COUNT:-2}"
+if [[ ! "${raw_device_count}" =~ ^[0-9]+$ ]] || ((${#raw_device_count} > 3)); then
+  echo "CAPOS_INPUT_SYSFS_DEVICE_COUNT must be a decimal integer from 0 through 192" >&2
+  exit 2
+fi
+device_count="$((10#${raw_device_count}))"
+if ((device_count > 192)); then
+  echo "CAPOS_INPUT_SYSFS_DEVICE_COUNT must not exceed 192" >&2
+  exit 2
+fi
+
 write_link() {
   local path="$1" target="$2"
   mkdir -p "$(dirname "${path}")"
@@ -12,73 +23,48 @@ write_link() {
 }
 
 make_device() {
-  local event="$1" bdf="$2" virtio_index="$3" input_index="$4"
-  local name="$5" product="$6" ev="$7" key="$8" rel="$9"
-  local pci="${out}/sys/devices/pci0000:00/0000:00:${bdf}.0"
-  local virtio="${pci}/virtio${virtio_index}"
-  local input="${virtio}/input/input${input_index}"
+  local event="$1"
+  local input="${out}/sys/devices/virtual/input/input${event}"
   local event_dir="${input}/event${event}"
   local minor="$((64 + event))"
 
   mkdir -p "${event_dir}" "${out}/dev/input" \
-    "${out}/sys/class/input" "${out}/sys/bus/pci" \
-    "${out}/sys/bus/virtio" "${out}/sys/bus/input"
+    "${out}/sys/class/input" "${out}/sys/bus/input"
   printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' "c 13 ${minor}" \
     >"${out}/dev/input/event${event}"
   printf '13:%s\n' "${minor}" >"${event_dir}/dev"
-  if [[ "${event}" == "0" ]]; then
-    printf '%s\n' \
-      "MAJOR=13" "MINOR=${minor}" "DEVNAME=input/event${event}" \
-      'ID_INPUT=1' 'ID_INPUT_KEYBOARD=1' >"${event_dir}/uevent"
-  else
-    printf '%s\n' \
-      "MAJOR=13" "MINOR=${minor}" "DEVNAME=input/event${event}" \
-      'ID_INPUT=1' 'ID_INPUT_MOUSE=1' >"${event_dir}/uevent"
-  fi
-  write_link "${event_dir}/subsystem" '../../../../../../../../bus/input'
+  printf '%s\n' \
+    "MAJOR=13" "MINOR=${minor}" "DEVNAME=input/event${event}" \
+    'ID_INPUT=1' >"${event_dir}/uevent"
+  write_link "${event_dir}/subsystem" '../../../../../bus/input'
   write_link "${out}/sys/class/input/event${event}" \
-    "../../devices/pci0000:00/0000:00:${bdf}.0/virtio${virtio_index}/input/input${input_index}/event${event}"
+    "../../devices/virtual/input/input${event}/event${event}"
   write_link "${out}/sys/dev/char/13:${minor}" \
-    "../../devices/pci0000:00/0000:00:${bdf}.0/virtio${virtio_index}/input/input${input_index}/event${event}"
+    "../../devices/virtual/input/input${event}/event${event}"
 
   mkdir -p "${input}/capabilities" "${input}/id"
-  printf '%s\n' "${name}" >"${input}/name"
-  printf 'virtio%s/input0\n' "${event}" >"${input}/phys"
+  printf 'Pacha Virtual Input %s\n' "${event}" >"${input}/name"
+  printf 'pacha/input%s\n' "${event}" >"${input}/phys"
   printf '%s\n' '0' >"${input}/properties"
-  printf '%s\n' "${ev}" >"${input}/capabilities/ev"
-  printf '%s\n' "${key}" >"${input}/capabilities/key"
-  printf '%s\n' "${rel}" >"${input}/capabilities/rel"
+  printf '%s\n' '1' >"${input}/capabilities/ev"
+  printf '%s\n' '0' >"${input}/capabilities/key"
+  printf '%s\n' '0' >"${input}/capabilities/rel"
   printf '%s\n' '0' >"${input}/capabilities/abs"
   printf '%s\n' '0' >"${input}/capabilities/msc"
   printf '%s\n' '0' >"${input}/capabilities/sw"
   printf '%s\n' '0006' >"${input}/id/bustype"
-  printf '%s\n' '0627' >"${input}/id/vendor"
-  printf '%04x\n' "${product}" >"${input}/id/product"
-  printf '%04x\n' "${product}" >"${input}/id/version"
+  printf '%s\n' '0000' >"${input}/id/vendor"
+  printf '%s\n' '0000' >"${input}/id/product"
+  printf '%s\n' '0001' >"${input}/id/version"
   printf '%s\n' \
-    "PRODUCT=6/627/${product}/${product}" \
-    "NAME=\"${name}\"" \
-    "PHYS=\"virtio${event}/input0\"" \
+    'PRODUCT=6/0/0/1' \
+    "NAME=\"Pacha Virtual Input ${event}\"" \
+    "PHYS=\"pacha/input${event}\"" \
     'PROP=0' \
     >"${input}/uevent"
-  write_link "${input}/subsystem" '../../../../../../../bus/input'
-
-  printf '%s\n' '0x1af4' >"${pci}/vendor"
-  printf '%s\n' '0x1052' >"${pci}/device"
-  printf '%s\n' '0x1af4' >"${pci}/subsystem_vendor"
-  printf '%s\n' '0x1100' >"${pci}/subsystem_device"
-  printf '%s\n' '0x01' >"${pci}/revision"
-  printf '%s\n' \
-    'DRIVER=virtio-pci' 'PCI_CLASS=090200' 'PCI_ID=1AF4:1052' \
-    'PCI_SUBSYS_ID=1AF4:1100' "PCI_SLOT_NAME=0000:00:${bdf}.0" \
-    >"${pci}/uevent"
-  write_link "${pci}/subsystem" '../../../bus/pci'
-  printf '%s\n' 'DRIVER=virtio_input' 'MODALIAS=virtio:d00000012v00001AF4' >"${virtio}/uevent"
-  write_link "${virtio}/subsystem" '../../../../bus/virtio'
+  write_link "${input}/subsystem" '../../../../bus/input'
 }
 
-# pacgo's permanent Q35 order places keyboard and mouse at 00:04.0/00:05.0.
-make_device 0 04 2 0 'QEMU Virtio Keyboard' 1 '120003' \
-  '7fffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff ffffffffffffffff' '0'
-make_device 1 05 3 1 'QEMU Virtio Mouse' 2 '7' \
-  '0 0 0 0 0 10000' '3'
+for ((event = 0; event < device_count; event++)); do
+  make_device "${event}"
+done

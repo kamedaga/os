@@ -8,13 +8,33 @@
 #include <stdio.h>
 #include <string.h>
 
-static int publish_device(inputd_service_t *service, uint32_t event_index)
+_Static_assert(INPUTD_INPUT_CAP_KEYBOARD == NETD_INPUT_CAP_KEYBOARD,
+    "input keyboard capability ABI");
+_Static_assert(INPUTD_INPUT_CAP_RELATIVE == NETD_INPUT_CAP_RELATIVE,
+    "input relative capability ABI");
+_Static_assert(INPUTD_INPUT_CAP_ABSOLUTE == NETD_INPUT_CAP_ABSOLUTE,
+    "input absolute capability ABI");
+
+static int publish_device(
+    inputd_service_t *service,
+    const struct inputd_public_device *input_device)
 {
     static uint64_t request_id;
-    if (service == NULL || service->cfg == NULL || service->cfg->netd_endpoint_fd < 16)
+    if (service == NULL || service->cfg == NULL || input_device == NULL ||
+        service->cfg->netd_endpoint_fd < 16 ||
+        input_device->event_index > UINT16_MAX ||
+        input_device->capabilities > UINT8_MAX ||
+        input_device->pci_segment > UINT16_MAX || input_device->pci_bus > UINT8_MAX ||
+        input_device->pci_device > 31 || input_device->pci_function > 7)
         return -22;
-    const uint64_t device = event_index == 0 ?
-        NETD_UEVENT_INPUT_EVENT0 : NETD_UEVENT_INPUT_EVENT1;
+    const uint64_t device = netd_input_uevent_encode((netd_input_uevent_descriptor_t){
+        .segment = (uint16_t)input_device->pci_segment,
+        .bus = (uint8_t)input_device->pci_bus,
+        .device = (uint8_t)input_device->pci_device,
+        .function = (uint8_t)input_device->pci_function,
+        .capabilities = (uint8_t)input_device->capabilities,
+        .event_index = (uint16_t)input_device->event_index,
+    });
     const struct pacha_ipc_msg request = {
         .word0 = PACHA_SERVICE_REQUEST_MAGIC,
         .word1 = NETD_OP_UEVENT_PUBLISH,
@@ -30,6 +50,20 @@ static int publish_device(inputd_service_t *service, uint32_t event_index)
     if (recv_status != 0) return recv_status;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request.word3) return -5;
     return (int)(int64_t)reply.word1;
+}
+
+int inputd_service_publish_startup_devices(inputd_service_t *service)
+{
+    if (service == NULL || service->input == NULL) return -22;
+    const size_t count = inputd_input_public_device_count(service->input);
+    if (count == 0) return -19;
+    for (size_t i = 0; i < count; i++) {
+        struct inputd_public_device device;
+        int status = inputd_input_public_device(service->input, i, &device);
+        if (status == 0) status = publish_device(service, &device);
+        if (status != 0) return status;
+    }
+    return 0;
 }
 
 static void close_received(
@@ -116,10 +150,7 @@ int inputd_service_dispatch(
                 const inputd_open_request_t *open = payload;
                 const int notify_fd = request->fd_count >= 3 ? (int)(uint32_t)fds[1].fd : -1;
                 status = inputd_input_open(open->event_index, open->flags, notify_fd, &result);
-                if (status == 0) {
-                    keep_fd = notify_fd;
-                    (void)publish_device(service, open->event_index);
-                }
+                if (status == 0) keep_fd = notify_fd;
             } else {
                 status = -22;
             }

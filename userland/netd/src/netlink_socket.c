@@ -172,32 +172,55 @@ int netd_netlink_socket_close(uint64_t handle)
     return 0;
 }
 
-static int device_fields(
-    uint64_t device,
-    const char **out_path,
-    const char **out_subsystem,
-    const char **out_devname)
+typedef struct netd_device_fields {
+    char path[256];
+    char subsystem[32];
+    char devname[128];
+    char pci_slot_name[64];
+    uint8_t input_capabilities;
+    uint8_t input;
+} netd_device_fields_t;
+
+static int format_fits(int written, size_t capacity)
 {
-    if (out_path == NULL || out_subsystem == NULL || out_devname == NULL) return -22;
-    switch (device) {
-    case NETD_UEVENT_DRM_CARD0:
-        *out_path = "/devices/pci0000:00/0000:00:03.0/virtio1/drm/card0";
-        *out_subsystem = "drm";
-        *out_devname = "dri/card0";
+    return written >= 0 && (size_t)written < capacity;
+}
+
+static int device_fields(uint64_t device, netd_device_fields_t *out)
+{
+    if (out == NULL) return -22;
+    memset(out, 0, sizeof(*out));
+    if (device == NETD_UEVENT_DRM_CARD0) {
+        if (!format_fits(snprintf(out->path, sizeof(out->path),
+                "/devices/pci0000:00/0000:00:03.0/virtio1/drm/card0"),
+                sizeof(out->path)) ||
+            !format_fits(snprintf(out->subsystem, sizeof(out->subsystem), "drm"),
+                sizeof(out->subsystem)) ||
+            !format_fits(snprintf(out->devname, sizeof(out->devname), "dri/card0"),
+                sizeof(out->devname)))
+            return -22;
         return 0;
-    case NETD_UEVENT_INPUT_EVENT0:
-        *out_path = "/devices/pci0000:00/0000:00:04.0/virtio2/input/input0/event0";
-        *out_subsystem = "input";
-        *out_devname = "input/event0";
-        return 0;
-    case NETD_UEVENT_INPUT_EVENT1:
-        *out_path = "/devices/pci0000:00/0000:00:05.0/virtio3/input/input1/event1";
-        *out_subsystem = "input";
-        *out_devname = "input/event1";
-        return 0;
-    default:
-        return -22;
     }
+
+    netd_input_uevent_descriptor_t descriptor;
+    if (!netd_input_uevent_decode(device, &descriptor)) return -22;
+    if (!format_fits(snprintf(out->path, sizeof(out->path),
+            "/devices/virtual/input/input%u/event%u",
+            (unsigned)descriptor.event_index, (unsigned)descriptor.event_index),
+            sizeof(out->path)) ||
+        !format_fits(snprintf(out->subsystem, sizeof(out->subsystem), "input"),
+            sizeof(out->subsystem)) ||
+        !format_fits(snprintf(out->devname, sizeof(out->devname),
+            "input/event%u", (unsigned)descriptor.event_index),
+            sizeof(out->devname)) ||
+        !format_fits(snprintf(out->pci_slot_name, sizeof(out->pci_slot_name),
+            "PACHA_PCI_SLOT_NAME=%04x:%02x:%02x.%u",
+            descriptor.segment, descriptor.bus, descriptor.device,
+            descriptor.function), sizeof(out->pci_slot_name)))
+        return -22;
+    out->input_capabilities = descriptor.capabilities;
+    out->input = 1;
+    return 0;
 }
 
 static size_t append_field(uint8_t *dst, size_t capacity, size_t offset, const char *field)
@@ -211,15 +234,15 @@ static size_t append_field(uint8_t *dst, size_t capacity, size_t offset, const c
 int netd_netlink_publish_device(uint64_t device)
 {
     static uint64_t sequence;
-    const char *path = NULL, *subsystem = NULL, *devname = NULL;
-    int status = device_fields(device, &path, &subsystem, &devname);
+    netd_device_fields_t fields;
+    int status = device_fields(device, &fields);
     if (status != 0) return status;
     char header[256], action[32], devpath[320], subsystem_field[64], devname_field[128], seqnum[64];
-    snprintf(header, sizeof(header), "change@%s", path);
+    snprintf(header, sizeof(header), "change@%s", fields.path);
     snprintf(action, sizeof(action), "ACTION=change");
-    snprintf(devpath, sizeof(devpath), "DEVPATH=%s", path);
-    snprintf(subsystem_field, sizeof(subsystem_field), "SUBSYSTEM=%s", subsystem);
-    snprintf(devname_field, sizeof(devname_field), "DEVNAME=%s", devname);
+    snprintf(devpath, sizeof(devpath), "DEVPATH=%s", fields.path);
+    snprintf(subsystem_field, sizeof(subsystem_field), "SUBSYSTEM=%s", fields.subsystem);
+    snprintf(devname_field, sizeof(devname_field), "DEVNAME=%s", fields.devname);
     snprintf(seqnum, sizeof(seqnum), "SEQNUM=%llu", (unsigned long long)++sequence);
 
     unsigned delivered = 0;
@@ -235,6 +258,20 @@ int netd_netlink_publish_device(uint64_t device)
         length = append_field(message->data, sizeof(message->data), length, devpath);
         length = append_field(message->data, sizeof(message->data), length, subsystem_field);
         length = append_field(message->data, sizeof(message->data), length, devname_field);
+        if (fields.input) {
+            length = append_field(message->data, sizeof(message->data), length, "ID_INPUT=1");
+            if ((fields.input_capabilities & NETD_INPUT_CAP_KEYBOARD) != 0)
+                length = append_field(message->data, sizeof(message->data), length,
+                    "ID_INPUT_KEYBOARD=1");
+            if ((fields.input_capabilities & NETD_INPUT_CAP_RELATIVE) != 0)
+                length = append_field(message->data, sizeof(message->data), length,
+                    "ID_INPUT_MOUSE=1");
+            if ((fields.input_capabilities & NETD_INPUT_CAP_ABSOLUTE) != 0)
+                length = append_field(message->data, sizeof(message->data), length,
+                    "ID_INPUT_TABLET=1");
+            length = append_field(message->data, sizeof(message->data), length,
+                fields.pci_slot_name);
+        }
         length = append_field(message->data, sizeof(message->data), length, seqnum);
         if (length >= sizeof(message->data)) continue;
         message->data[length++] = '\0';

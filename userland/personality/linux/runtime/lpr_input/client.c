@@ -82,6 +82,25 @@ static int64_t lpr_inputd_call(
     return lpr_inputd_call_transfer(op, page_fd, page, payload_size, out_result, -1);
 }
 
+static int lpr_input_parse_event_index(const char *suffix, uint32_t *out_event_index)
+{
+    if (suffix == 0 || out_event_index == 0 || suffix[0] == 0)
+        return 0;
+    if (suffix[0] == '0' && suffix[1] != 0)
+        return 0;
+    uint32_t value = 0;
+    for (const char *cursor = suffix; *cursor != 0; cursor++) {
+        if (*cursor < '0' || *cursor > '9')
+            return 0;
+        const uint32_t digit = (uint32_t)(*cursor - '0');
+        if (value > (255u - digit) / 10u)
+            return 0;
+        value = value * 10u + digit;
+    }
+    *out_event_index = value;
+    return 1;
+}
+
 static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_index, int native_wait_fd)
 {
     const int fd = lpr_fd_slot_alloc();
@@ -94,7 +113,7 @@ static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_in
         return -LPR_LINUX_EIO;
     }
     input->active = 1;
-    input->reserved0 = (uint8_t)event_index;
+    input->event_index = (uint8_t)event_index;
     input->flags = (uint32_t)flags;
     input->handle = handle;
     input->wait_fd.raw = native_wait_fd;
@@ -107,9 +126,9 @@ int64_t lpr_input_open_path(const char *path, uint64_t flags)
     if (path == 0 || lpr_strncmp(path, prefix, sizeof(prefix) - 1u) != 0)
         return -LPR_LINUX_ENOENT;
     const char *suffix = path + sizeof(prefix) - 1u;
-    if (suffix[0] < '0' || suffix[0] > '9' || suffix[1] != 0)
+    uint32_t event_index = 0;
+    if (!lpr_input_parse_event_index(suffix, &event_index))
         return -LPR_LINUX_ENOENT;
-    const uint32_t event_index = (uint32_t)(suffix[0] - '0');
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) return page_fd;

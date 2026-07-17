@@ -30,6 +30,7 @@ type Options struct {
 	NoNet           bool
 	Fast            bool
 	DryRun          bool
+	InputProfile    string
 	ExtraArgs       []string
 	NewTerminal     bool
 	Prepare         bool
@@ -84,6 +85,7 @@ type TTYTestOptions struct {
 	NoKVM            bool
 	CPUs             int
 	Display          string
+	InputProfile     string
 	ExtraArgs        []string
 	BootMarker       string
 	Send             []string
@@ -445,6 +447,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		NoKVM:           opts.NoKVM,
 		CPUs:            opts.CPUs,
 		Fast:            true,
+		InputProfile:    opts.InputProfile,
 		ExtraArgs:       opts.ExtraArgs,
 		QMP:             qmpPath,
 		CaptureHeadless: len(checks) != 0,
@@ -972,6 +975,26 @@ func appendConsoleArgs(workspace *config.Workspace, args []string, opts Options)
 	}
 }
 
+func appendInputDeviceArgs(args []string, profile string) ([]string, error) {
+	keyboard := []string{"-device", "virtio-keyboard-pci,disable-legacy=on,id=pachakbd"}
+	mouse := []string{"-device", "virtio-mouse-pci,disable-legacy=on,id=pachamouse"}
+	tablet := []string{"-device", "virtio-tablet-pci,disable-legacy=on,id=pachatablet"}
+	switch profile {
+	case "", "keyboard-mouse":
+		args = append(args, keyboard...)
+		args = append(args, mouse...)
+	case "keyboard-tablet":
+		args = append(args, keyboard...)
+		args = append(args, tablet...)
+	case "mouse-keyboard":
+		args = append(args, mouse...)
+		args = append(args, keyboard...)
+	default:
+		return nil, fmt.Errorf("invalid input profile %q; expected keyboard-mouse, keyboard-tablet, or mouse-keyboard", profile)
+	}
+	return args, nil
+}
+
 func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Options) (commandPlan, error) {
 	imagePath := opts.LimineImage
 	imagePath, err := limineImagePath(workspace, imagePath)
@@ -1007,8 +1030,12 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root",
 		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
-		"-device", "virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
-		"-device", "virtio-mouse-pci,disable-legacy=on,id=pachamouse",
+	)
+	args, err = appendInputDeviceArgs(args, opts.InputProfile)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	args = append(args,
 		"-boot", "order=c",
 		"-no-reboot",
 	)
@@ -1090,11 +1117,15 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
 		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
-		"-device", "virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
-		"-device", "virtio-mouse-pci,disable-legacy=on,id=pachamouse",
+	}
+	args, err = appendInputDeviceArgs(args, opts.InputProfile)
+	if err != nil {
+		return commandPlan{}, err
+	}
+	args = append(args,
 		"-boot", "order=c",
 		"-no-reboot",
-	}
+	)
 	if opts.Display == "none" {
 		if opts.CaptureHeadless {
 			args = append(args, "-display", "none", "-serial", "stdio")

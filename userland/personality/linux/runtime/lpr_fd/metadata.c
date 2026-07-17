@@ -791,10 +791,10 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         const lpr_input_backend_t *input = lpr_input_backend(fd);
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
         lpr_memset(st, 0, sizeof(*st));
-        st->st_ino = 0x696e7000ull + input->reserved0;
+        st->st_ino = 0x696e7000ull + input->event_index;
         st->st_nlink = 1;
         st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
-        st->st_rdev = (13ull << 8) | (64u + input->reserved0);
+        st->st_rdev = (13ull << 8) | (64u + input->event_index);
         st->st_blksize = 4096;
         return 0;
     }

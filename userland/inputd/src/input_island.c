@@ -65,7 +65,15 @@ static size_t event_head;
 static size_t event_count;
 static uint64_t next_handle = 1;
 static uint64_t next_sequence = 1;
-static uint64_t grabbed_handle_by_device[64];
+
+typedef struct inputd_registry_entry {
+    struct inputd_public_device public_device;
+    uint32_t kobox_device_id;
+    uint32_t reserved0;
+    uint64_t grabbed_handle;
+} inputd_registry_entry_t;
+
+static struct inputd_input_island *active_island;
 
 static inputd_handle_t *find_handle(uint64_t id)
 {
@@ -92,41 +100,63 @@ static inputd_handle_t *alloc_handle(void)
 }
 
 typedef struct inputd_device_lookup {
-    uint32_t wanted_index;
-    uint32_t current_index;
+    int find_by_id;
     uint32_t wanted_id;
-    kb_input_device_snapshot_t snapshot;
+    kb_input_device_snapshot_t *snapshots;
+    size_t snapshot_capacity;
+    size_t snapshot_count;
     int found;
 } inputd_device_lookup_t;
+
+static int lookup_device_by_id(uint32_t id, kb_input_device_snapshot_t *out);
 
 static int lookup_device_callback(const kb_input_device_snapshot_t *device, void *opaque)
 {
     inputd_device_lookup_t *lookup = opaque;
-    if ((lookup->wanted_id != 0 && device->id == lookup->wanted_id) ||
-        (lookup->wanted_id == 0 && lookup->current_index == lookup->wanted_index)) {
-        lookup->snapshot = *device;
+    if (lookup->find_by_id && device->id == lookup->wanted_id) {
+        lookup->snapshots[0] = *device;
         lookup->found = 1;
         return 1;
     }
-    lookup->current_index++;
+    if (!lookup->find_by_id && lookup->snapshot_count < lookup->snapshot_capacity)
+        lookup->snapshots[lookup->snapshot_count++] = *device;
     return 0;
+}
+
+static inputd_registry_entry_t *lookup_registry_by_event(uint32_t event_index)
+{
+    if (active_island == NULL || active_island->registry == NULL) return NULL;
+    inputd_registry_entry_t *registry = active_island->registry;
+    for (uint32_t i = 0; i < active_island->device_count; i++)
+        if (registry[i].public_device.event_index == event_index) return &registry[i];
+    return NULL;
+}
+
+static inputd_registry_entry_t *lookup_registry_by_device_id(uint32_t device_id)
+{
+    if (active_island == NULL || active_island->registry == NULL) return NULL;
+    inputd_registry_entry_t *registry = active_island->registry;
+    for (uint32_t i = 0; i < active_island->device_count; i++)
+        if (registry[i].kobox_device_id == device_id) return &registry[i];
+    return NULL;
 }
 
 static int lookup_device_by_index(uint32_t index, kb_input_device_snapshot_t *out)
 {
-    inputd_device_lookup_t lookup = { .wanted_index = index };
-    (void)kb_input_subsystem_for_each_device(lookup_device_callback, &lookup);
-    if (!lookup.found) return -19;
-    *out = lookup.snapshot;
-    return 0;
+    inputd_registry_entry_t *entry = lookup_registry_by_event(index);
+    return entry == NULL ? -19 : lookup_device_by_id(entry->kobox_device_id, out);
 }
 
 static int lookup_device_by_id(uint32_t id, kb_input_device_snapshot_t *out)
 {
-    inputd_device_lookup_t lookup = { .wanted_id = id };
+    inputd_device_lookup_t lookup = {
+        .find_by_id = 1,
+        .wanted_id = id,
+        .snapshots = out,
+        .snapshot_capacity = 1,
+    };
     (void)kb_input_subsystem_for_each_device(lookup_device_callback, &lookup);
     if (!lookup.found) return -19;
-    *out = lookup.snapshot;
     return 0;
 }
 
@@ -165,12 +195,121 @@ void inputd_input_island_pump(struct inputd_input_island *island)
     }
 }
 
+static uint32_t input_capabilities(const kb_input_device_snapshot_t *device)
+{
+    enum {
+        ev_key = 1,
+        ev_rel = 2,
+        ev_abs = 3,
+        key_a = 30,
+        rel_x = 0,
+        rel_y = 1,
+        abs_x = 0,
+        abs_y = 1,
+    };
+    uint32_t capabilities = 0;
+    if ((device->event_bits & (UINT64_C(1) << ev_key)) != 0 &&
+        (device->key_bits[key_a / 64] & (UINT64_C(1) << (key_a % 64))) != 0)
+        capabilities |= INPUTD_INPUT_CAP_KEYBOARD;
+    if ((device->event_bits & (UINT64_C(1) << ev_rel)) != 0 &&
+        (device->rel_bits & (UINT64_C(1) << rel_x)) != 0 &&
+        (device->rel_bits & (UINT64_C(1) << rel_y)) != 0)
+        capabilities |= INPUTD_INPUT_CAP_RELATIVE;
+    if ((device->event_bits & (UINT64_C(1) << ev_abs)) != 0 &&
+        (device->abs_bits & (UINT64_C(1) << abs_x)) != 0 &&
+        (device->abs_bits & (UINT64_C(1) << abs_y)) != 0)
+        capabilities |= INPUTD_INPUT_CAP_ABSOLUTE;
+    return capabilities;
+}
+
+static int compare_registry_entry(const void *left, const void *right)
+{
+    const struct inputd_public_device *a =
+        &((const inputd_registry_entry_t *)left)->public_device;
+    const struct inputd_public_device *b =
+        &((const inputd_registry_entry_t *)right)->public_device;
+#define INPUTD_COMPARE_FIELD(field) \
+    do { if (a->field != b->field) return a->field < b->field ? -1 : 1; } while (0)
+    INPUTD_COMPARE_FIELD(pci_segment);
+    INPUTD_COMPARE_FIELD(pci_bus);
+    INPUTD_COMPARE_FIELD(pci_device);
+    INPUTD_COMPARE_FIELD(pci_function);
+    INPUTD_COMPARE_FIELD(stable_id);
+#undef INPUTD_COMPARE_FIELD
+    return 0;
+}
+
+static int build_input_registry(
+    struct inputd_input_island *island,
+    const struct inputd_boot_config *cfg)
+{
+    kb_input_device_snapshot_t *snapshots =
+        calloc(cfg->device_count, sizeof(*snapshots));
+    inputd_registry_entry_t *registry =
+        calloc(cfg->device_count, sizeof(*registry));
+    if (snapshots == NULL || registry == NULL) {
+        free(snapshots);
+        free(registry);
+        return -12;
+    }
+    inputd_device_lookup_t collect = {
+        .snapshots = snapshots,
+        .snapshot_capacity = cfg->device_count,
+    };
+    (void)kb_input_subsystem_for_each_device(lookup_device_callback, &collect);
+    if (collect.snapshot_count != cfg->device_count) {
+        free(snapshots);
+        free(registry);
+        return -19;
+    }
+
+    const struct inputd_device_config *devices = inputd_boot_devices(cfg);
+    for (uint32_t i = 0; i < cfg->device_count; i++) {
+        registry[i].public_device = (struct inputd_public_device){
+            .stable_id = devices[i].resource_id,
+            .generation = 1,
+            .capabilities = input_capabilities(&snapshots[i]),
+            .pci_segment = devices[i].pci_segment,
+            .pci_bus = devices[i].pci_bus,
+            .pci_device = devices[i].pci_device,
+            .pci_function = devices[i].pci_function,
+        };
+        registry[i].kobox_device_id = snapshots[i].id;
+    }
+    qsort(registry, cfg->device_count, sizeof(*registry), compare_registry_entry);
+    for (uint32_t i = 0; i < cfg->device_count; i++) {
+        if (i != 0 &&
+            registry[i - 1].public_device.pci_segment == registry[i].public_device.pci_segment &&
+            registry[i - 1].public_device.pci_bus == registry[i].public_device.pci_bus &&
+            registry[i - 1].public_device.pci_device == registry[i].public_device.pci_device &&
+            registry[i - 1].public_device.pci_function == registry[i].public_device.pci_function) {
+            free(snapshots);
+            free(registry);
+            return -22;
+        }
+        registry[i].public_device.event_index = i;
+        printf("[inputd] registry event%u stable=%llu generation=%u caps=0x%x pci=%04x:%02x:%02x.%u kobox=%u\n",
+            i,
+            (unsigned long long)registry[i].public_device.stable_id,
+            registry[i].public_device.generation,
+            registry[i].public_device.capabilities,
+            registry[i].public_device.pci_segment,
+            registry[i].public_device.pci_bus,
+            registry[i].public_device.pci_device,
+            registry[i].public_device.pci_function,
+            registry[i].kobox_device_id);
+    }
+    free(snapshots);
+    island->registry = registry;
+    return 0;
+}
+
 int inputd_input_island_init(
     struct inputd_input_island *island,
     const struct inputd_boot_config *cfg)
 {
-    if (island == NULL || cfg == NULL || cfg->device_count != INPUTD_DEVICE_COUNT ||
-        cfg->module_count != INPUTD_MAX_MODULES) return -22;
+    if (island == NULL || cfg == NULL || cfg->device_count == 0 ||
+        cfg->module_count == 0) return -22;
     memset(island, 0, sizeof(*island));
     (void)setenv("KOBOX_DEVICE_BACKEND", "pachaos", 1);
     (void)setenv("KOBOX_PCI_LAYOUT", "arch68", 1);
@@ -178,9 +317,14 @@ int inputd_input_island_init(
     (void)setenv("KOBOX_VIRTIO_NO_EVENT_IDX", "1", 1);
     (void)setenv("KOBOX_INPUT_TRUST_DEVICE_STRINGS", "1", 1);
 
+    const struct inputd_device_config *devices = inputd_boot_devices(cfg);
+    uint64_t *device_fds = calloc(cfg->device_count, sizeof(*device_fds));
+    if (device_fds == NULL) return -12;
+    for (uint32_t i = 0; i < cfg->device_count; i++) device_fds[i] = devices[i].device_fd;
     kb_device_backend_t *backend = NULL;
     kb_status_t status = kb_pachaos_capsule_devices_create(
-        cfg->device_fds, INPUTD_DEVICE_COUNT, &backend);
+        device_fds, cfg->device_count, &backend);
+    free(device_fds);
     if (status != KB_OK || backend == NULL) return -5;
     island->device_backend = backend;
     kb_shim_set_device_backend(backend);
@@ -194,8 +338,11 @@ int inputd_input_island_init(
     kb_platform_t *platform = NULL;
     if (kb_platform_create(&platform_desc, &platform) != KB_OK) return -5;
 
-    for (uint32_t i = 0; i < INPUTD_MAX_MODULES; i++) {
-        const struct inputd_module_config *module = &cfg->modules[i];
+    island->modules = calloc(cfg->module_count, sizeof(*island->modules));
+    if (island->modules == NULL) return -12;
+    const struct inputd_module_config *modules = inputd_boot_modules(cfg);
+    for (uint32_t i = 0; i < cfg->module_count; i++) {
+        const struct inputd_module_config *module = &modules[i];
         if (module->image_va == 0 || module->image_size == 0 || module->name[0] == '\0') return -22;
         const kb_module_image_t image = {
             .data = (const void *)(uintptr_t)module->image_va,
@@ -217,14 +364,34 @@ int inputd_input_island_init(
     for (unsigned i = 0; i < 64; i++) {
         kb_run_deferred_work();
         (void)kb_handle_any_irq(0);
-        if (kb_input_subsystem_device_count() == INPUTD_DEVICE_COUNT) break;
+        if (kb_input_subsystem_device_count() == cfg->device_count) break;
     }
     island->device_count = (uint32_t)kb_input_subsystem_device_count();
-    if (island->device_count != INPUTD_DEVICE_COUNT) return -19;
+    if (island->device_count != cfg->device_count) return -19;
     const int opened = kb_input_subsystem_open_registered_devices();
-    if (opened != INPUTD_DEVICE_COUNT) return -5;
+    if (opened < 0 || (uint32_t)opened != cfg->device_count) return -5;
+    const int registry_status = build_input_registry(island, cfg);
+    if (registry_status != 0) return registry_status;
     kb_input_subsystem_print_summary(stdout);
+    active_island = island;
     island->ready = 1;
+    return 0;
+}
+
+size_t inputd_input_public_device_count(const struct inputd_input_island *island)
+{
+    return island == NULL || island->registry == NULL ? 0 : island->device_count;
+}
+
+int inputd_input_public_device(
+    const struct inputd_input_island *island,
+    size_t ordinal,
+    struct inputd_public_device *out_device)
+{
+    if (island == NULL || island->registry == NULL || out_device == NULL ||
+        ordinal >= island->device_count) return -22;
+    const inputd_registry_entry_t *registry = island->registry;
+    *out_device = registry[ordinal].public_device;
     return 0;
 }
 
@@ -255,8 +422,8 @@ int inputd_input_close(uint64_t id)
         return 0;
     }
     if (handle->notify_fd >= 16) (void)pacha_fd_close(handle->notify_fd);
-    if (handle->device_id < 64 && grabbed_handle_by_device[handle->device_id] == id)
-        grabbed_handle_by_device[handle->device_id] = 0;
+    inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+    if (entry != NULL && entry->grabbed_handle == id) entry->grabbed_handle = 0;
     memset(handle, 0, sizeof(*handle));
     return 0;
 }
@@ -401,18 +568,21 @@ int inputd_input_ioctl(inputd_ioctl_request_t *request)
         return 0;
     }
     if (command == INPUTD_EVIOCGRAB) {
-        if (request->data_size < sizeof(int) || handle->device_id >= 64) return -22;
+        if (request->data_size < sizeof(int)) return -22;
         int grab = 0;
         memcpy(&grab, request->data, sizeof(grab));
-        uint64_t *owner = &grabbed_handle_by_device[handle->device_id];
+        inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+        if (entry == NULL) return -19;
+        uint64_t *owner = &entry->grabbed_handle;
         if (grab != 0 && *owner != 0 && *owner != handle->id) return -16;
         *owner = grab != 0 ? handle->id : 0;
         return 0;
     }
     if (command == INPUTD_EVIOCREVOKE) {
         handle->revoked = 1;
-        if (handle->device_id < 64 && grabbed_handle_by_device[handle->device_id] == handle->id)
-            grabbed_handle_by_device[handle->device_id] = 0;
+        inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+        if (entry != NULL && entry->grabbed_handle == handle->id)
+            entry->grabbed_handle = 0;
         return 0;
     }
     if (ioctl_type(request->request) != 'E') return -25;

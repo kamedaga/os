@@ -152,24 +152,26 @@ static const struct seed0_device_descriptor *find_virtio_gpu_device(const struct
     return 0;
 }
 
-static int find_virtio_input_devices(
+static size_t find_virtio_input_devices(
     const struct seed0_init_descriptor_page *desc,
-    const struct seed0_device_descriptor *out_devices[INPUTD_DEVICE_COUNT])
+    const struct seed0_device_descriptor **out_devices,
+    size_t capacity)
 {
-    if (desc == NULL || out_devices == NULL) return 0;
+    if (desc == NULL || out_devices == NULL || capacity == 0) return 0;
     uint64_t count = desc->device_count;
     if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
     size_t found = 0;
-    for (uint64_t i = 0; i < count && found < INPUTD_DEVICE_COUNT; i++) {
+    for (uint64_t i = 0; i < count; i++) {
         const struct seed0_device_descriptor *device = &desc->devices[i];
         if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
             !seed0_fd_is_dynamic(device->init_device_fd)) continue;
         if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
             device->device_id == SEED0_VIRTIO_INPUT_MODERN_DEVICE_ID) {
+            if (found == capacity) return 0;
             out_devices[found++] = device;
         }
     }
-    return found == INPUTD_DEVICE_COUNT;
+    return found;
 }
 
 struct seed0_capsule_module_spec {
@@ -811,7 +813,11 @@ int seed0_launch_drmd(int ready_channel_fd, int netd_endpoint_fd, int *out_drm_e
     return 0;
 }
 
-int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_input_endpoint_fd)
+int seed0_launch_inputd(
+    int ready_channel_fd,
+    int netd_endpoint_fd,
+    int *out_input_endpoint_fd,
+    uint32_t *out_device_count)
 {
     static const struct seed0_capsule_module_spec module_specs[] = {
         {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
@@ -822,13 +828,16 @@ int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_inp
         {"/srv/kobox/linux_virtio_input.ko", "linux_virtio_input.ko"},
     };
     if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = -1;
+    if (out_device_count != NULL) *out_device_count = 0;
     if (ready_channel_fd < 16 || netd_endpoint_fd < 16) return -1;
-    const struct seed0_device_descriptor *devices[INPUTD_DEVICE_COUNT] = {0};
-    if (!find_virtio_input_devices(seed0_bootstrap_descriptor(), devices)) {
-        fprintf(stderr, "[seed0boot] inputd: two virtio-input device fds not found\n");
+    const struct seed0_device_descriptor *devices[SEED0_INIT_MAX_DEVICE_DESCRIPTORS] = {0};
+    const size_t device_count = find_virtio_input_devices(
+        seed0_bootstrap_descriptor(), devices, SEED0_INIT_MAX_DEVICE_DESCRIPTORS);
+    if (device_count == 0) {
+        fprintf(stderr, "[seed0boot] inputd: virtio-input device fds not found\n");
         return -19;
     }
-    for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++) {
+    for (size_t i = 0; i < device_count; i++) {
         const int status = mark_device_inherit((int)devices[i]->init_device_fd, "inputd virtio-input");
         if (status != 0) return status;
     }
@@ -836,10 +845,10 @@ int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_inp
     uint32_t daemon_size = 0;
     int status = seed0_bootfs_open_file("/srv/inputd.elf", &daemon_image, &daemon_size);
     if (status != 0) return -2;
-    const unsigned char *module_images[INPUTD_MAX_MODULES] = {0};
-    uint32_t module_sizes[INPUTD_MAX_MODULES] = {0};
-    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    for (uint64_t i = 0; i < module_count; i++) {
+    const size_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
+    const unsigned char *module_images[sizeof(module_specs) / sizeof(module_specs[0])] = {0};
+    uint32_t module_sizes[sizeof(module_specs) / sizeof(module_specs[0])] = {0};
+    for (size_t i = 0; i < module_count; i++) {
         status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
         if (status != 0 || (uint64_t)module_sizes[i] > INPUTD_MODULE_IMAGE_STRIDE) return -3;
     }
@@ -877,31 +886,60 @@ int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_inp
         (void)pacha_fd_close(endpoint_fd);
         return status;
     }
-    struct inputd_boot_config config;
-    memset(&config, 0, sizeof(config));
-    config.magic = INPUTD_BOOT_CONFIG_MAGIC;
-    config.input_endpoint_fd = SEED0_INPUTD_INPUT_ENDPOINT_FD;
-    config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
-    config.netd_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
-    config.device_count = INPUTD_DEVICE_COUNT;
-    for (size_t i = 0; i < INPUTD_DEVICE_COUNT; i++)
-        config.device_fds[i] = devices[i]->init_device_fd;
-    config.module_count = module_count;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_va = INPUTD_MODULE_IMAGE_VA + INPUTD_MODULE_IMAGE_STRIDE * i;
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
+    uint8_t blob[INPUTD_BOOT_CONFIG_MAX_BYTES];
+    memset(blob, 0, sizeof(blob));
+    struct inputd_boot_config *config = (struct inputd_boot_config *)blob;
+    const uint64_t devices_bytes = device_count * sizeof(struct inputd_device_config);
+    const uint64_t modules_bytes = module_count * sizeof(struct inputd_module_config);
+    const uint64_t total_size = sizeof(*config) + devices_bytes + modules_bytes;
+    if (device_count > UINT32_MAX || module_count > UINT32_MAX ||
+        total_size > sizeof(blob)) return -7;
+    config->magic = INPUTD_BOOT_CONFIG_MAGIC;
+    config->version = INPUTD_BOOT_CONFIG_VERSION;
+    config->header_size = sizeof(*config);
+    config->total_size = total_size;
+    config->input_endpoint_fd = SEED0_INPUTD_INPUT_ENDPOINT_FD;
+    config->ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
+    config->netd_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
+    config->device_count = (uint32_t)device_count;
+    config->device_record_size = sizeof(struct inputd_device_config);
+    config->module_count = (uint32_t)module_count;
+    config->module_record_size = sizeof(struct inputd_module_config);
+    config->devices_offset = sizeof(*config);
+    config->modules_offset = sizeof(*config) + devices_bytes;
+    struct inputd_device_config *device_records =
+        (struct inputd_device_config *)(blob + config->devices_offset);
+    for (size_t i = 0; i < device_count; i++) {
+        device_records[i] = (struct inputd_device_config){
+            .device_fd = devices[i]->init_device_fd,
+            .resource_id = devices[i]->resource_id,
+            .pci_segment = 0,
+            .pci_bus = (uint32_t)devices[i]->pci_bus,
+            .pci_device = (uint32_t)devices[i]->pci_device,
+            .pci_function = (uint32_t)devices[i]->pci_function,
+            .vendor_id = (uint32_t)devices[i]->vendor_id,
+            .device_id = (uint32_t)devices[i]->device_id,
+            .subsystem_id = (uint32_t)devices[i]->subsystem_id,
+        };
+    }
+    struct inputd_module_config *module_records =
+        (struct inputd_module_config *)(blob + config->modules_offset);
+    for (size_t i = 0; i < module_count; i++) {
+        module_records[i].image_va = INPUTD_MODULE_IMAGE_VA + INPUTD_MODULE_IMAGE_STRIDE * i;
+        module_records[i].image_size = module_sizes[i];
+        strncpy(module_records[i].name, module_specs[i].name,
+            sizeof(module_records[i].name) - 1u);
     }
     status = seed0_map_bytes_into_process(
-        loaded.process_fd, INPUTD_BOOT_CONFIG_VA, &config, sizeof(config), PACHA_PROT_READ);
+        loaded.process_fd, INPUTD_BOOT_CONFIG_VA, blob, total_size, PACHA_PROT_READ);
     if (status != 0) {
         (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
         (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
         (void)pacha_fd_close(endpoint_fd);
         return -5;
     }
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(loaded.process_fd, config.modules[i].image_va,
+    for (size_t i = 0; i < module_count; i++) {
+        status = seed0_map_bytes_into_process(loaded.process_fd, module_records[i].image_va,
             module_images[i], module_sizes[i], PACHA_PROT_READ);
         if (status != 0) {
             (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
@@ -910,8 +948,8 @@ int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_inp
             return -6;
         }
     }
-    printf("[seed0boot] inputd modules=%llu devices=%u\n",
-        (unsigned long long)module_count, INPUTD_DEVICE_COUNT);
+    printf("[seed0boot] inputd modules=%zu devices=%zu blob=%llu\n",
+        module_count, device_count, (unsigned long long)total_size);
     status = seed0_start_process(&loaded, "/srv/inputd.elf", -1);
     if (status != 0) {
         (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
@@ -923,6 +961,7 @@ int seed0_launch_inputd(int ready_channel_fd, int netd_endpoint_fd, int *out_inp
     (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
     if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = endpoint_fd;
     else (void)pacha_fd_close(endpoint_fd);
+    if (out_device_count != NULL) *out_device_count = (uint32_t)device_count;
     return 0;
 }
 

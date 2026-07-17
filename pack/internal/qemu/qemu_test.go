@@ -75,6 +75,53 @@ func TestNormalizeCPUCount(t *testing.T) {
 	}
 }
 
+func TestAppendInputDeviceArgs(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "default",
+			want: "qemu -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd -device virtio-mouse-pci,disable-legacy=on,id=pachamouse",
+		},
+		{
+			name:    "keyboard mouse",
+			profile: "keyboard-mouse",
+			want:    "qemu -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd -device virtio-mouse-pci,disable-legacy=on,id=pachamouse",
+		},
+		{
+			name:    "keyboard tablet",
+			profile: "keyboard-tablet",
+			want:    "qemu -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd -device virtio-tablet-pci,disable-legacy=on,id=pachatablet",
+		},
+		{
+			name:    "mouse keyboard order",
+			profile: "mouse-keyboard",
+			want:    "qemu -device virtio-mouse-pci,disable-legacy=on,id=pachamouse -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
+		},
+		{name: "unknown", profile: "keyboard-trackball", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			args, err := appendInputDeviceArgs([]string{"qemu"}, test.profile)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("appendInputDeviceArgs(%q) unexpectedly succeeded with %q", test.profile, strings.Join(args, " "))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(args, " "); got != test.want {
+				t.Fatalf("args = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestConsoleTerminalCandidatesPreferWindowsTerminalOnWSL(t *testing.T) {
 	t.Setenv("WSL_DISTRO_NAME", "Ubuntu")
 	workspace := &config.Workspace{Root: "/home/kamer/os"}

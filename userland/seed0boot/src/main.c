@@ -254,7 +254,7 @@ static int seed0_wait_drmd_ready(int drmd_ready_channel_fd)
     return 0;
 }
 
-static int seed0_wait_inputd_ready(int ready_channel_fd)
+static int seed0_wait_inputd_ready(int ready_channel_fd, uint32_t expected_device_count)
 {
     if (ready_channel_fd < 16) return -22;
     struct pacha_ipc_msg reply;
@@ -263,7 +263,7 @@ static int seed0_wait_inputd_ready(int ready_channel_fd)
         ready_channel_fd, &reply, PACHA_FD_WAIT_FOREVER);
     if (recv_status != 0) return recv_status;
     if (reply.word0 != INPUTD_BOOT_READY_MAGIC || (int64_t)reply.word1 != 0 ||
-        reply.word2 != INPUTD_DEVICE_COUNT)
+        reply.word2 != expected_device_count)
         return reply.word1 != 0 ? (int)(int64_t)reply.word1 : -5;
     return 0;
 }
@@ -488,11 +488,13 @@ int main(int argc, char **argv)
 
     printf("[seed0boot] inputd starting\n");
     int inputd_input_endpoint_fd = -1;
+    uint32_t inputd_device_count = 0;
     struct pacha_ipc_channel_pair inputd_ready_pair = { .a = -1, .b = -1 };
     if (pacha_ipc_channel_create(&inputd_ready_pair, seed0_channel_rights, 0) != 0 ||
         inputd_ready_pair.a < 16 || inputd_ready_pair.b < 16) return 24;
     capsule_status = seed0_launch_inputd(
-        inputd_ready_pair.b, netd_socket_endpoint_fd, &inputd_input_endpoint_fd);
+        inputd_ready_pair.b, netd_socket_endpoint_fd, &inputd_input_endpoint_fd,
+        &inputd_device_count);
     (void)pacha_fd_close(inputd_ready_pair.b);
     if (capsule_status != 0) {
         (void)pacha_fd_close(inputd_ready_pair.a);
@@ -502,7 +504,8 @@ int main(int argc, char **argv)
     const int inputd_register_status = seed0_register_inputd_input_endpoint(
         filed_endpoint_fd, inputd_input_endpoint_fd);
     if (inputd_register_status != 0) return 25;
-    const int inputd_ready_status = seed0_wait_inputd_ready(inputd_ready_pair.a);
+    const int inputd_ready_status = seed0_wait_inputd_ready(
+        inputd_ready_pair.a, inputd_device_count);
     (void)pacha_fd_close(inputd_ready_pair.a);
     if (inputd_ready_status != 0) {
         fprintf(stderr, "[seed0boot] inputd ready wait failed status=%d\n", inputd_ready_status);

@@ -243,7 +243,7 @@ int lpr_fd_transfer_prepare(
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
             return -LPR_LINUX_EIO;
         }
-        item->transfer_token = ticket | ((uint64_t)input->reserved0 << 56u);
+        item->transfer_token = ticket | ((uint64_t)input->event_index << 56u);
         item->fd_flags = input->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 2;
         capability_fds[0] = wait_fd;
@@ -413,7 +413,7 @@ int lpr_fd_transfer_import_batch(
             input->active = 1;
             input->flags = (uint32_t)linux_flags;
             input->handle = handle;
-            input->reserved0 = (uint8_t)(item->transfer_token >> 56u);
+            input->event_index = (uint8_t)(item->transfer_token >> 56u);
             input->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
             input->wait_fd.raw = item_capabilities[0];
             input->lease_fd.raw = item_capabilities[1];

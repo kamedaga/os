@@ -117,7 +117,7 @@ typedef struct lpr_drm_backend {
 
 typedef struct lpr_input_backend {
     uint8_t active;
-    uint8_t reserved0;
+    uint8_t event_index;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;

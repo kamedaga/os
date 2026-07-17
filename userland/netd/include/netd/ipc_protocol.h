@@ -33,8 +33,10 @@ enum {
     NETD_NETLINK_KOBJECT_UEVENT = 15,
 
     NETD_UEVENT_DRM_CARD0 = 1,
-    NETD_UEVENT_INPUT_EVENT0 = 2,
-    NETD_UEVENT_INPUT_EVENT1 = 3,
+
+    NETD_INPUT_CAP_KEYBOARD = 1u << 0,
+    NETD_INPUT_CAP_RELATIVE = 1u << 1,
+    NETD_INPUT_CAP_ABSOLUTE = 1u << 2,
 
     NETD_PAGE_BYTES = 65536,
     NETD_IO_BYTES = NETD_PAGE_BYTES - 1024,
@@ -44,6 +46,52 @@ enum {
     NETD_POLLOUT = 0x0004,
     NETD_POLLERR = 0x0008,
 };
+
+#define NETD_UEVENT_INPUT_TAG (UINT64_C(1) << 63)
+#define NETD_UEVENT_INPUT_RESERVED_MASK UINT64_C(0x7f00000000000000)
+#define NETD_UEVENT_INPUT_CAPABILITIES_SHIFT 48u
+#define NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT 32u
+
+typedef struct netd_input_uevent_descriptor {
+    uint16_t segment;
+    uint8_t bus;
+    uint8_t device;
+    uint8_t function;
+    uint8_t capabilities;
+    uint16_t event_index;
+} netd_input_uevent_descriptor_t;
+
+static inline uint64_t netd_input_uevent_encode(netd_input_uevent_descriptor_t descriptor)
+{
+    const uint32_t bdf =
+        ((uint32_t)descriptor.segment << 16u) |
+        ((uint32_t)descriptor.bus << 8u) |
+        (((uint32_t)descriptor.device & 0x1fu) << 3u) |
+        ((uint32_t)descriptor.function & 0x07u);
+    return NETD_UEVENT_INPUT_TAG |
+        ((uint64_t)descriptor.capabilities << NETD_UEVENT_INPUT_CAPABILITIES_SHIFT) |
+        ((uint64_t)descriptor.event_index << NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT) |
+        bdf;
+}
+
+static inline int netd_input_uevent_decode(
+    uint64_t encoded,
+    netd_input_uevent_descriptor_t *out_descriptor)
+{
+    if (out_descriptor == 0 || (encoded & NETD_UEVENT_INPUT_TAG) == 0 ||
+        (encoded & NETD_UEVENT_INPUT_RESERVED_MASK) != 0)
+        return 0;
+    const uint32_t bdf = (uint32_t)encoded;
+    out_descriptor->segment = (uint16_t)(bdf >> 16u);
+    out_descriptor->bus = (uint8_t)(bdf >> 8u);
+    out_descriptor->device = (uint8_t)((bdf >> 3u) & 0x1fu);
+    out_descriptor->function = (uint8_t)(bdf & 0x07u);
+    out_descriptor->capabilities =
+        (uint8_t)(encoded >> NETD_UEVENT_INPUT_CAPABILITIES_SHIFT);
+    out_descriptor->event_index =
+        (uint16_t)(encoded >> NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT);
+    return 1;
+}
 
 typedef struct netd_socket {
     uint64_t domain;
