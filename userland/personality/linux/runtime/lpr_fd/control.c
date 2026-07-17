@@ -1,6 +1,68 @@
 #include "../lpr_filed_internal.h"
 
-static uint64_t lpr_backend_type_bytes(uint8_t ops_id)
+#define LPR_BACKEND_SLAB_PAGE_BYTES 4096u
+#define LPR_BACKEND_SLAB_SLOT_BYTES 256u
+#define LPR_BACKEND_SLAB_SLOT_OFFSET 256u
+#define LPR_BACKEND_SLAB_SLOT_COUNT \
+    ((LPR_BACKEND_SLAB_PAGE_BYTES - LPR_BACKEND_SLAB_SLOT_OFFSET) / \
+        LPR_BACKEND_SLAB_SLOT_BYTES)
+#define LPR_BACKEND_SLAB_MAGIC 0x4c505242534c4142ull
+
+typedef struct lpr_backend_slab_page {
+    uint64_t magic;
+    struct lpr_backend_slab_page *next;
+    uint64_t used_bitmap;
+    uint32_t used_count;
+    uint32_t reserved0;
+} lpr_backend_slab_page_t;
+
+_Static_assert(sizeof(lpr_filed_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "filed backend slot");
+_Static_assert(sizeof(lpr_device_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "device backend slot");
+_Static_assert(sizeof(lpr_tty_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "tty backend slot");
+_Static_assert(sizeof(lpr_drm_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "drm backend slot");
+_Static_assert(sizeof(lpr_input_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "input backend slot");
+_Static_assert(sizeof(lpr_pipe_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "pipe backend slot");
+_Static_assert(sizeof(lpr_event_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "event backend slot");
+_Static_assert(sizeof(lpr_socket_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "socket backend slot");
+_Static_assert(sizeof(lpr_epoll_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "epoll backend slot");
+_Static_assert(sizeof(lpr_dmabuf_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "dmabuf backend slot");
+_Static_assert(sizeof(lpr_sync_file_backend_t) <= LPR_BACKEND_SLAB_SLOT_BYTES, "sync backend slot");
+_Static_assert(LPR_BACKEND_SLAB_SLOT_COUNT <= 64u, "backend slab bitmap capacity");
+
+static lpr_backend_slab_page_t *lpr_backend_slab_pages;
+static volatile uint32_t lpr_backend_slab_lock;
+
+static void lpr_backend_slab_acquire(void)
+{
+    if (__atomic_exchange_n(
+            &lpr_backend_slab_lock, 1u, __ATOMIC_ACQUIRE) == 0u)
+    {
+        return;
+    }
+    while (__atomic_exchange_n(
+            &lpr_backend_slab_lock, 2u, __ATOMIC_ACQUIRE) != 0u)
+    {
+        (void)lpr_pacha_syscall3(
+            PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
+            (uint64_t)(uintptr_t)&lpr_backend_slab_lock,
+            2u,
+            0);
+    }
+}
+
+static void lpr_backend_slab_release(void)
+{
+    if (__atomic_exchange_n(
+            &lpr_backend_slab_lock, 0u, __ATOMIC_RELEASE) == 2u)
+    {
+        (void)lpr_pacha_syscall2(
+            PACHA_RUNTIME_SYSCALL_FUTEX_WAKE,
+            (uint64_t)(uintptr_t)&lpr_backend_slab_lock,
+            1u);
+    }
+}
+
+uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id)
 {
     switch (ops_id) {
     case LPR_FD_OPS_FILED: return sizeof(lpr_filed_backend_t);
@@ -50,22 +112,103 @@ static uint32_t lpr_backend_rights(uint8_t ops_id, uint64_t linux_flags)
     }
 }
 
-static void *lpr_backend_map(void)
+void *lpr_backend_state_alloc(uint64_t state_bytes)
 {
-    const int64_t mapped = lpr_pacha_syscall6(
-        PACHAOS_SYSCALL_MMAP,
-        0,
-        0,
-        4096,
-        PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
-        PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS,
-        0);
-    if (mapped < 4096) {
+    if (state_bytes == 0 || state_bytes > LPR_BACKEND_SLAB_SLOT_BYTES) {
         return 0;
     }
-    void *state = (void *)(uintptr_t)mapped;
-    lpr_memset(state, 0, 4096);
+    lpr_backend_slab_acquire();
+    lpr_backend_slab_page_t *page = lpr_backend_slab_pages;
+    const uint64_t full_bitmap =
+        (1ull << LPR_BACKEND_SLAB_SLOT_COUNT) - 1ull;
+    while (page != 0 && page->used_bitmap == full_bitmap) {
+        page = page->next;
+    }
+    if (page == 0) {
+        const int64_t mapped = lpr_pacha_syscall6(
+            PACHAOS_SYSCALL_MMAP,
+            0,
+            0,
+            LPR_BACKEND_SLAB_PAGE_BYTES,
+            PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+            PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS,
+            0);
+        if (mapped < LPR_BACKEND_SLAB_PAGE_BYTES) {
+            lpr_backend_slab_release();
+            return 0;
+        }
+        page = (lpr_backend_slab_page_t *)(uintptr_t)mapped;
+        lpr_memset(page, 0, LPR_BACKEND_SLAB_SLOT_OFFSET);
+        page->magic = LPR_BACKEND_SLAB_MAGIC;
+        page->next = lpr_backend_slab_pages;
+        lpr_backend_slab_pages = page;
+    }
+
+    uint32_t slot = 0;
+    while ((page->used_bitmap & (1ull << slot)) != 0) {
+        slot++;
+    }
+    page->used_bitmap |= 1ull << slot;
+    page->used_count++;
+    void *state = (uint8_t *)page + LPR_BACKEND_SLAB_SLOT_OFFSET +
+        (uint64_t)slot * LPR_BACKEND_SLAB_SLOT_BYTES;
+    lpr_memset(state, 0, LPR_BACKEND_SLAB_SLOT_BYTES);
+    lpr_backend_slab_release();
     return state;
+}
+
+int64_t lpr_backend_state_free(void *state, uint64_t state_bytes)
+{
+    if (state == 0 || state_bytes == 0 ||
+        state_bytes > LPR_BACKEND_SLAB_SLOT_BYTES)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    const uintptr_t address = (uintptr_t)state;
+    lpr_backend_slab_page_t *page = (lpr_backend_slab_page_t *)(
+        address & ~(uintptr_t)(LPR_BACKEND_SLAB_PAGE_BYTES - 1u));
+    const uintptr_t slot_start = (uintptr_t)page + LPR_BACKEND_SLAB_SLOT_OFFSET;
+    if (address < slot_start ||
+        (address - slot_start) % LPR_BACKEND_SLAB_SLOT_BYTES != 0)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    const uint32_t slot = (uint32_t)(
+        (address - slot_start) / LPR_BACKEND_SLAB_SLOT_BYTES);
+    if (slot >= LPR_BACKEND_SLAB_SLOT_COUNT) {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    lpr_backend_slab_acquire();
+    lpr_backend_slab_page_t **link = &lpr_backend_slab_pages;
+    while (*link != 0 && *link != page) {
+        link = &(*link)->next;
+    }
+    const uint64_t bit = 1ull << slot;
+    if (*link == 0 || page->magic != LPR_BACKEND_SLAB_MAGIC ||
+        (page->used_bitmap & bit) == 0 || page->used_count == 0)
+    {
+        lpr_backend_slab_release();
+        return -LPR_LINUX_EINVAL;
+    }
+    lpr_memset(state, 0, LPR_BACKEND_SLAB_SLOT_BYTES);
+    page->used_bitmap &= ~bit;
+    page->used_count--;
+    const int release_page = page->used_count == 0;
+    if (release_page) {
+        *link = page->next;
+        page->magic = 0;
+    }
+    lpr_backend_slab_release();
+    return release_page ? lpr_pacha_status_to_errno(lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_MUNMAP,
+        (uint64_t)(uintptr_t)page,
+        LPR_BACKEND_SLAB_PAGE_BYTES)) : 0;
+}
+
+void lpr_backend_state_after_fork_child(void)
+{
+    __atomic_store_n(&lpr_backend_slab_lock, 0u, __ATOMIC_RELEASE);
 }
 
 void *lpr_backend_state_from_ofd(const lpr_ofd_t *ofd)
@@ -346,7 +489,8 @@ int lpr_control_install_fd(
     uint64_t backend_id,
     uint64_t offset)
 {
-    if (fd > LPR_LINUX_FD_MAX || lpr_backend_type_bytes(ops_id) == 0) {
+    const uint64_t state_bytes = lpr_backend_state_bytes_for_ops(ops_id);
+    if (fd > LPR_LINUX_FD_MAX || state_bytes == 0) {
         return -LPR_LINUX_EMFILE;
     }
     const int ensure_status = lpr_fd_table_ensure_fd(fd);
@@ -357,7 +501,7 @@ int lpr_control_install_fd(
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &existing_flags) == 0) {
         return -LPR_LINUX_EMFILE;
     }
-    void *state = lpr_backend_map();
+    void *state = lpr_backend_state_alloc(state_bytes);
     if (state == 0) {
         return -LPR_LINUX_ENOMEM;
     }
@@ -462,10 +606,7 @@ int lpr_control_install_fd(
         break;
     }
     default:
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)state,
-            4096);
+        (void)lpr_backend_state_free(state, state_bytes);
         return -LPR_LINUX_EINVAL;
     }
     const lpr_fd_install_t install = {
@@ -476,13 +617,10 @@ int lpr_control_install_fd(
         .rights = lpr_backend_rights(ops_id, linux_flags),
         .offset = offset,
         .backend_state = state,
-        .backend_state_bytes = 4096,
+        .backend_state_bytes = state_bytes,
     };
     if (lpr_fd_table_install_at(&lpr_control_fd_table, (uint32_t)fd, &install) != 0) {
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)state,
-            4096);
+        (void)lpr_backend_state_free(state, state_bytes);
         return -LPR_LINUX_EMFILE;
     }
     return 0;
@@ -813,12 +951,12 @@ static int lpr_manifest_install_first(
 {
     if (entry == 0 || ofd == 0 || record == 0 ||
         ofd->backend_id == 0 || ofd->backend_id >= LPR_FD_OPS_COUNT ||
-        ofd->record_bytes != lpr_backend_type_bytes((uint8_t)ofd->backend_id) ||
+        ofd->record_bytes != lpr_backend_state_bytes_for_ops((uint8_t)ofd->backend_id) ||
         lpr_fd_table_ensure_fd(fd) != 0 || !lpr_fd_slot_available(fd))
     {
         return 0;
     }
-    void *state = lpr_backend_map();
+    void *state = lpr_backend_state_alloc(ofd->record_bytes);
     if (state == 0) return 0;
     lpr_memcpy(state, record, ofd->record_bytes);
     const lpr_fd_install_t install = {
@@ -829,11 +967,10 @@ static int lpr_manifest_install_first(
         .rights = ofd->rights_ceiling,
         .offset = ofd->offset,
         .backend_state = state,
-        .backend_state_bytes = 4096,
+        .backend_state_bytes = ofd->record_bytes,
     };
     if (lpr_fd_table_install_at(&lpr_control_fd_table, fd, &install) != 0) {
-        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)state, 4096);
+        (void)lpr_backend_state_free(state, ofd->record_bytes);
         return 0;
     }
     return lpr_control_set_effective_rights(fd, (uint32_t)entry->effective_rights) == 0;

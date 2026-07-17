@@ -744,6 +744,10 @@ lpr_epoll_backend_t *lpr_epoll_backend(uint64_t fd);
 void *lpr_backend_state_from_ofd(const lpr_ofd_t *ofd);
 uint8_t lpr_ofd_ops_id(const lpr_ofd_t *ofd);
 int64_t lpr_backend_finish_drop(const lpr_fd_drop_t *drop);
+void *lpr_backend_state_alloc(uint64_t state_bytes);
+int64_t lpr_backend_state_free(void *state, uint64_t state_bytes);
+uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id);
+void lpr_backend_state_after_fork_child(void);
 void lpr_fd_unpin(const lpr_fd_pin_t *pin);
 int64_t lpr_fd_prepare_dup(uint64_t fd);
 int lpr_fd_transfer_prepare(

@@ -250,6 +250,8 @@ AUTH_MAGIC直前の一回計測は16,176 syscall、92,414,916,332 cyclesだっ�
 
 同分類から、read-only lseekをgeneration検証付きpinned OFD transactionへ変更し、Filed readvはdispatcherの既存pinを再利用してbackend再分類8 lookupを除去した。4 CPU keyboard+tabletの一回確認はsocket 27秒、IPC 39秒で、direct Sway、両device分類、正常終了を通し、Broken pipe、scheduler unavailable、libinput lagはなかった。速度向上値には数えず、目標値は変更しない。
 
+backend stateはopenごとに実型が256 bytes以下でも4 KiB anonymous mmap / zero / munmapしていた。これを15 slotのprocess-local slabへ切り替え、通常lockはatomicだけ、競合時だけfutex wait / wakeする。fork childはtransaction cleanupより前に継承lockをresetする。open / dup / close / fork / pipeの短時間確認と4 CPU keyboard+tablet direct Swayを通し、socket 26秒、IPC 38秒だった。一回値なので速度改善とは判定せず目標値を変えない。
+
 ## 12. Step 9 — Phase 4完了判定
 
 最終確認は長時間batteryにせず、次に限定する。

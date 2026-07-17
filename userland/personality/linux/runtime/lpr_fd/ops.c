@@ -389,20 +389,13 @@ int lpr_fd_transfer_import_batch(
             status = -LPR_LINUX_EOPNOTSUPP;
             break;
         }
-        const int64_t mapped = lpr_pacha_syscall6(
-            PACHAOS_SYSCALL_MMAP,
-            0,
-            0,
-            4096,
-            PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
-            PACHAOS_MMAP_PRIVATE | PACHAOS_MMAP_ANONYMOUS,
-            0);
-        if (mapped < 4096) {
+        const uint64_t state_bytes =
+            lpr_backend_state_bytes_for_ops((uint8_t)item->provider_id);
+        states[prepared_count] = lpr_backend_state_alloc(state_bytes);
+        if (states[prepared_count] == 0) {
             status = -LPR_LINUX_ENOMEM;
             break;
         }
-        states[prepared_count] = (void *)(uintptr_t)mapped;
-        lpr_memset(states[prepared_count], 0, 4096);
         const uint64_t linux_flags = item->fd_flags | receive_flags;
         if (item->provider_id == LPR_FD_OPS_FILED) {
             lpr_filed_backend_t *filed = states[prepared_count];
@@ -446,7 +439,7 @@ int lpr_fd_transfer_import_batch(
         install->rights = (uint32_t)item->rights;
         install->offset = 0;
         install->backend_state = states[prepared_count];
-        install->backend_state_bytes = 4096;
+        install->backend_state_bytes = state_bytes;
         next_capability += item->capability_count;
     }
     if (status == 0 && next_capability != capability_count)
@@ -491,12 +484,12 @@ int lpr_fd_transfer_import_batch(
         }
     }
     if (status != 0) {
-        for (uint32_t i = 0; i < prepared_count; ++i)
-            if (states[i] != 0)
-                (void)lpr_pacha_syscall2(
-                    PACHAOS_SYSCALL_MUNMAP,
-                    (uint64_t)(uintptr_t)states[i],
-                    4096);
+        for (uint32_t i = 0; i < prepared_count; ++i) {
+            if (states[i] != 0) {
+                (void)lpr_backend_state_free(
+                    states[i], installs[i].backend_state_bytes);
+            }
+        }
         return status;
     }
     for (uint32_t i = 0; i < item_count; ++i)
@@ -676,9 +669,7 @@ int64_t lpr_backend_finish_drop(const lpr_fd_drop_t *drop)
         return 0;
     }
     const int64_t close_status = lpr_fd_close_backend(drop->ops_id, drop->state);
-    const int64_t unmap_status = lpr_pacha_status_to_errno(lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_MUNMAP,
-        (uint64_t)(uintptr_t)drop->state,
-        drop->state_bytes));
-    return close_status != 0 ? close_status : unmap_status;
+    const int64_t free_status =
+        lpr_backend_state_free(drop->state, drop->state_bytes);
+    return close_status != 0 ? close_status : free_status;
 }
