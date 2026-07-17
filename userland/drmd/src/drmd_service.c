@@ -3,32 +3,9 @@
 
 #include <pacha/abi.h>
 #include <pacha/service_abi.h>
-#include <netd/ipc_protocol.h>
 
 #include <stdint.h>
 #include <string.h>
-
-static int publish_device(drmd_service_t *service, uint64_t device)
-{
-    static uint64_t request_id;
-    if (service == NULL || service->cfg == NULL || service->cfg->netd_endpoint_fd < 16)
-        return -22;
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word1 = NETD_OP_UEVENT_PUBLISH,
-        .word2 = device,
-        .word3 = ++request_id,
-    };
-    const int reply_fd = pacha_ipc_call((int)service->cfg->netd_endpoint_fd, &request);
-    if (reply_fd < 16) return reply_fd;
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    if (recv_status != 0) return recv_status;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request.word3) return -5;
-    return (int)(int64_t)reply.word1;
-}
 
 static void close_received(
     const struct pacha_ipc_msg *request,
@@ -143,10 +120,7 @@ int drmd_service_dispatch(
             const int notify_fd = request->fd_count >= 3 ? (int)(uint32_t)fds[1].fd : -1;
             status = header.payload_size >= sizeof(drmd_open_request_t) ?
                 drmd_drm_island_open(service->drm, payload, notify_fd, &result) : -22;
-            if (status == 0) {
-                retained_received_fd = notify_fd;
-                (void)publish_device(service, NETD_UEVENT_DRM_CARD0);
-            }
+            if (status == 0) retained_received_fd = notify_fd;
             break;
             }
         case DRMD_OP_HANDLE_CLOSE:
