@@ -189,6 +189,10 @@ allocator lock waitとfault時間がredであることを確認してから変�
 
 page数保存、二重free禁止、制約範囲、contiguous alignmentをinvariant testで確認する。
 
+測定記録（2026-07-17）: 4 CPU、direct Sway、5秒animationのうちguest tick 30–40秒を、temporaryなlock/fault histogramで測定した。PMM lockは29,243 acquisition中6回だけcontended（0.021%）で、contended waitは平均2,879 cycles、最大8,473 cyclesだった。handled faultは8,294回（COW 374、lazy 7,920）、平均30,310 cycles、最大5,074,106 cyclesで、99%点は640,000 cycles未満のbucketだった。同じrunは11.119 FPS、frame p99 / max 92 / 93 msで完走した。
+
+この条件ではallocator lock waitがredではなく、fault tailとも対応しなかった。page fault、COW、teardownを先に直列化しているglobal address-space lockの分割前にmagazine / buddyへ置換しても、GUI critical path上の改善根拠がない。このためStep 6の変更gateは未成立とし、temporary metricは全削除した。固定65,536 rangeとlinear extentはcorrectness / capacity debtとして残すが、Step 7でaddress-space lockingを分割した後に同じ10秒区間を再測定し、allocator contentionがredへ変化した場合に本Stepへ戻る。性能目標は変更しない。
+
 ## 10. Step 7 — VM / TLB
 
 - address spaceごとにactive CPU maskとTLB generationを持たせる。
