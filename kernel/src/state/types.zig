@@ -861,6 +861,29 @@ pub const NativeVmaFaultMapping = struct {
     invalidate_size_bytes: u64 = 0,
 };
 
+pub const NativeVmaPrepareKind = enum(u8) {
+    denied,
+    ready,
+    allocate_zero,
+    allocate_copy,
+    locked_slow_path,
+};
+
+// A fault plan is consumed while the caller keeps the owning address-space
+// lock held.  Shared VMO/COW metadata may change between prepare and commit,
+// so commit must still revalidate every reference and backing-page identity.
+pub const NativeVmaFaultPlan = struct {
+    kind: NativeVmaPrepareKind = .denied,
+    mapping: NativeVmaFaultMapping = .{ .paddr = 0, .prot = .{} },
+    entry_index: u16 = 0,
+    fault_page_va: u64 = 0,
+    vmo: NativeVmoRef = .{},
+    vmo_page_index: u32 = 0,
+    cow_table: NativeCowTableRef = .{},
+    cow_page_index: u32 = 0,
+    source_paddr: u64 = 0,
+};
+
 pub fn vmObjectBackingFreePageCount() u64 {
     var pages: u64 = 0;
     var i: usize = 0;

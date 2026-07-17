@@ -531,11 +531,14 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     if (!user_vm.lockAddressSpace(principal)) return 0;
     defer user_vm.unlockAddressSpace(principal);
     if (write_access) {
-        const cow_mapping = blk: {
-            user_vm.lockSharedVmObjects();
-            defer user_vm.unlockSharedVmObjects();
-            break :blk kernel_runtime.kernel_state_global.ensureNativeVmaCowMapping(principal, fault_page_va, write_access, instruction_fetch, kernel_runtime.global_free_list);
-        };
+        const cow_mapping = user_copy.resolveNativeVmaCowMappingWithAddressSpaceLocked(
+            kernel_runtime.kernel_state_global,
+            kernel_runtime.global_free_list,
+            principal,
+            fault_page_va,
+            write_access,
+            instruction_fetch,
+        );
         if (cow_mapping) |mapping| {
             if (mapping.invalidate_size_bytes != 0) {
                 if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return 0;
@@ -573,11 +576,14 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         const not_present_fault = (ec & 1) == 0;
         return if (not_present_fault) 1 else 0;
     }
-    const fault_mapping = blk: {
-        user_vm.lockSharedVmObjects();
-        defer user_vm.unlockSharedVmObjects();
-        break :blk kernel_runtime.kernel_state_global.ensureNativeVmaFaultMapping(principal, fault_page_va, write_access, instruction_fetch, kernel_runtime.global_free_list);
-    };
+    const fault_mapping = user_copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(
+        kernel_runtime.kernel_state_global,
+        kernel_runtime.global_free_list,
+        principal,
+        fault_page_va,
+        write_access,
+        instruction_fetch,
+    );
     if (fault_mapping) |mapping| {
         var paddrs = [_]u64{mapping.paddr};
         const mapped = if (fault_page_va == 0 and mapping.prot.read and !mapping.prot.write and mapping.prot.exec)

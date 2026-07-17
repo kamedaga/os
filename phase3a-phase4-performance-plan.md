@@ -207,7 +207,9 @@ page数保存、二重free禁止、制約範囲、contiguous alignmentをinvaria
 
 同じ4 CPU、direct Sway、5秒animation、guest tick 30–40秒で再測定した。PMM lockは18,363 acquisition中contended 1回（0.005%）、wait 9,250 cyclesで、handled faultは2,953回、平均32,845 cycles、最大2,104,412 cyclesだった。10.858 FPS、frame p99 / max 94 / 95 msで完走し、deadlock、`kernel scheduler unavailable`、Broken pipeはなかった。PMMは分割後もredではないためStep 6のbuddy / magazine gateは未成立のままとする。temporary counterは全削除した。
 
-このsubstepでは共有object mutation中のallocation / copyとTLB ACKはまだlock内に残る。次はfaultをsnapshot/pin、lock外prepare、再検証commitへ二相化し、teardownをclosing / epoch / inflight / retireへ分けた後、active CPU maskとTLB generationへ進む。
+追加進捗（2026-07-17、effective per-AS fault）: lazy zero-fillと通常COWをprepare / commitへ二相化した。ownerのAS lockは保持してVMAとteardownを直列化する一方、PMM allocationとzero-fillをshared VM-object lock外へ移した。lazy faultはbacking identityのsnapshotと再検証commitだけを共有区間にする。COWはsource pinがまだ無いため、source pageを共有lock内で再検証し、4 KiB copyからcommitまで隙間なく行って解放済みpageを読む競合を防ぐ。commit時にVMO/COW generation、entry、VA、source pageを再検証し、競合winnerがいればcandidate pageを返却する。これにより別ASの通常faultはPMMの長い区間を並行でき、epoch / inflightはAS lock自体を外す将来段階まで追加しない。shared COW table全体のdetachだけは稀なlocked slow pathとして残す。
+
+二相化buildの4 CPU direct Sway＋5秒animationは10.962 FPS、frame p99 / max 95 / 96 ms、input p99 / max 86 / 115 msで完走した。page fault、deadlock、`kernel scheduler unavailable`、Broken pipe、libinput lag warningはなく、QEMUは停止した。その後のsource lifetime reviewでCOW copyを安全な共有区間へ戻し、最終buildを確認した。次はsource pin / object-granular locking、shared COW detachの事前copy、active CPU mask / TLB generation / retire順序へ進む。
 
 ## 11. Step 8 — IPC / storage / graphics
 

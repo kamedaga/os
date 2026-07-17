@@ -152,6 +152,106 @@ fn physWindowAddr(addr: u64, access_len: usize) ?u64 {
     return @intFromPtr(page) + offset;
 }
 
+fn allocatePreparedFaultPage(
+    state: *kernel.KernelState,
+    free_list: *kernel.FreePageList,
+    plan: kernel.NativeVmaFaultPlan,
+) ?u64 {
+    if (plan.kind != .allocate_zero and plan.kind != .allocate_copy) return null;
+    const paddr = (state.allocPhysicalPage(free_list) catch return null).paddr;
+    return paddr;
+}
+
+// The caller must hold the owner's address-space lock.  The shared-object
+// lock is used only to snapshot and commit metadata. PMM allocation and zero
+// happen between those sections. A COW source is revalidated and copied while
+// the shared lock pins its backing identity, then committed without a gap.
+pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
+    state: *kernel.KernelState,
+    free_list: *kernel.FreePageList,
+    principal: kernel.PrincipalId,
+    page_va: u64,
+    write_access: bool,
+    instruction_fetch: bool,
+) ?kernel.NativeVmaFaultMapping {
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const plan = blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            break :blk state.prepareNativeVmaCowMapping(principal, page_va, write_access, instruction_fetch);
+        };
+        switch (plan.kind) {
+            .denied => return null,
+            .ready => return plan.mapping,
+            .locked_slow_path => {
+                user_vm.lockSharedVmObjects();
+                defer user_vm.unlockSharedVmObjects();
+                return state.ensureNativeVmaCowMappingLockedSlow(
+                    principal,
+                    page_va,
+                    write_access,
+                    instruction_fetch,
+                    free_list,
+                );
+            },
+            .allocate_zero, .allocate_copy => {},
+        }
+        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse return null;
+        const mapping = blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            if (plan.kind == .allocate_copy) {
+                if (!state.nativeVmaCowPlanSourceIsCurrent(principal, plan)) break :blk null;
+                kernel.KernelState.copyPhysicalPage(candidate, plan.source_paddr);
+            }
+            break :blk state.commitNativeVmaCowMapping(principal, plan, candidate, free_list);
+        };
+        if (mapping) |resolved| {
+            if (resolved.paddr != candidate) free_list.appendPage(0, candidate) catch {};
+            return resolved;
+        }
+        free_list.appendPage(0, candidate) catch {};
+    }
+    return null;
+}
+
+pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
+    state: *kernel.KernelState,
+    free_list: *kernel.FreePageList,
+    principal: kernel.PrincipalId,
+    page_va: u64,
+    write_access: bool,
+    instruction_fetch: bool,
+) ?kernel.NativeVmaFaultMapping {
+    var attempt: usize = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const plan = blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            break :blk state.prepareNativeVmaFaultMapping(principal, page_va, write_access, instruction_fetch);
+        };
+        switch (plan.kind) {
+            .denied => return null,
+            .ready => return plan.mapping,
+            .allocate_zero => {},
+            .allocate_copy, .locked_slow_path => return null,
+        }
+        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse return null;
+        const mapping = blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            break :blk state.commitNativeVmaFaultMapping(principal, plan, candidate);
+        };
+        if (mapping) |resolved| {
+            if (resolved.paddr != candidate) free_list.appendPage(0, candidate) catch {};
+            return resolved;
+        }
+        free_list.appendPage(0, candidate) catch {};
+    }
+    return null;
+}
+
 fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, write_access: bool) ?u64 {
     if (!write_access) {
         if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
@@ -160,17 +260,14 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
     if (!user_vm.lockAddressSpace(principal)) return null;
     defer user_vm.unlockAddressSpace(principal);
     if (write_access) {
-        const cow_mapping = blk: {
-            user_vm.lockSharedVmObjects();
-            defer user_vm.unlockSharedVmObjects();
-            break :blk h.state.ensureNativeVmaCowMapping(
-                principal,
-                page_va,
-                true,
-                false,
-                h.free_list,
-            );
-        };
+        const cow_mapping = resolveNativeVmaCowMappingWithAddressSpaceLocked(
+            h.state,
+            h.free_list,
+            principal,
+            page_va,
+            true,
+            false,
+        );
         if (cow_mapping) |mapping| {
             if (mapping.invalidate_size_bytes != 0) {
                 if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return null;
@@ -198,17 +295,14 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
         }
     }
     if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
-    const mapping = blk: {
-        user_vm.lockSharedVmObjects();
-        defer user_vm.unlockSharedVmObjects();
-        break :blk h.state.ensureNativeVmaFaultMapping(
-            principal,
-            page_va,
-            write_access,
-            false,
-            h.free_list,
-        );
-    } orelse return null;
+    const mapping = resolveNativeVmaFaultMappingWithAddressSpaceLocked(
+        h.state,
+        h.free_list,
+        principal,
+        page_va,
+        write_access,
+        false,
+    ) orelse return null;
     var paddrs = [_]u64{mapping.paddr};
     if (!user_vm.mapLazyUserPaddrsWithProt(
         principal,

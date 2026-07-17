@@ -104,6 +104,7 @@ const MmapFlags = types.MmapFlags;
 const VmaEntry = types.VmaEntry;
 const VmaTable = types.VmaTable;
 const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
+const NativeVmaFaultPlan = types.NativeVmaFaultPlan;
 const EndpointTable = types.EndpointTable;
 const PublishedEndpointTable = types.PublishedEndpointTable;
 const max_vmo_backing_pages = types.max_vmo_backing_pages;
@@ -298,43 +299,78 @@ pub fn nativeVmaInitialMapping(
     };
 }
 
-pub fn ensureNativeVmaFaultMapping(
+pub fn prepareNativeVmaFaultMapping(
     self: anytype,
     owner: PrincipalId,
     fault_page_va: u64,
     write_access: bool,
     instruction_fetch: bool,
-    free_list: *FreePageList,
-) ?NativeVmaFaultMapping {
-    if (!@TypeOf(self.*).isPageAligned(fault_page_va)) return null;
-    const table = self.getVmaTable(owner) orelse return null;
+) NativeVmaFaultPlan {
+    if (!@TypeOf(self.*).isPageAligned(fault_page_va)) return .{};
+    const table = self.getVmaTable(owner) orelse return .{};
     var active_index: usize = 0;
     while (active_index < table.active_count) : (active_index += 1) {
         const entry_index: usize = @intCast(table.active_indices[active_index]);
         const entry = &table.entries[entry_index];
         if (fault_page_va < entry.start_va or fault_page_va >= entry.endVa()) continue;
-        if (!@TypeOf(self.*).vmaProtAllowsFault(entry.prot, write_access, instruction_fetch)) return null;
+        if (!@TypeOf(self.*).vmaProtAllowsFault(entry.prot, write_access, instruction_fetch)) return .{};
 
         const page_delta = (fault_page_va - entry.start_va) / native_page_size;
         const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
         const vmo_page_index: usize = @intCast(vmo_page);
-        var paddr = self.entryDirtyPagePaddr(entry, fault_page_va) orelse
+        const paddr = self.entryDirtyPagePaddr(entry, fault_page_va) orelse
             (self.nativeVmoResolvedPagePaddr(entry.vmo, vmo_page_index) orelse 0);
-        if (paddr == 0) {
-            if (!entry.flags.anonymous) return null;
-            paddr = (self.allocPhysicalPage(free_list) catch return null).paddr;
-            var page = [_]u64{paddr};
-            self.installNativeVmoPages(entry.vmo, vmo_page_index, page[0..]) catch {
-                free_list.appendPage(0, paddr) catch {};
-                return null;
+        if (paddr != 0) {
+            return .{
+                .kind = .ready,
+                .mapping = .{
+                    .paddr = paddr,
+                    .prot = @TypeOf(self.*).nativeFaultMappingProt(entry),
+                },
             };
         }
+        if (!entry.flags.anonymous or vmo_page > std.math.maxInt(u32)) return .{};
         return .{
-            .paddr = paddr,
-            .prot = @TypeOf(self.*).nativeFaultMappingProt(entry),
+            .kind = .allocate_zero,
+            .mapping = .{ .paddr = 0, .prot = @TypeOf(self.*).nativeFaultMappingProt(entry) },
+            .entry_index = @intCast(entry_index),
+            .fault_page_va = fault_page_va,
+            .vmo = entry.vmo,
+            .vmo_page_index = @intCast(vmo_page),
         };
     }
-    return null;
+    return .{};
+}
+
+pub fn commitNativeVmaFaultMapping(
+    self: anytype,
+    owner: PrincipalId,
+    plan: NativeVmaFaultPlan,
+    candidate_paddr: u64,
+) ?NativeVmaFaultMapping {
+    if (plan.kind != .allocate_zero or candidate_paddr == 0 or (candidate_paddr & 0xFFF) != 0) return null;
+    const table = self.getVmaTable(owner) orelse return null;
+    const entry_index: usize = @intCast(plan.entry_index);
+    if (entry_index >= table.entries.len) return null;
+    const entry = &table.entries[entry_index];
+    if (!entry.active or plan.fault_page_va < entry.start_va or plan.fault_page_va >= entry.endVa()) return null;
+    if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, plan.vmo)) return null;
+    const page_delta = (plan.fault_page_va - entry.start_va) / native_page_size;
+    const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+    if (vmo_page != plan.vmo_page_index) return null;
+
+    var paddr = self.entryDirtyPagePaddr(entry, plan.fault_page_va) orelse
+        (self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0);
+    if (paddr == 0) {
+        if (!entry.flags.anonymous) return null;
+        var page = [_]u64{candidate_paddr};
+        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch return null;
+        paddr = candidate_paddr;
+    }
+    return .{
+        .paddr = paddr,
+        .prot = @TypeOf(self.*).nativeFaultMappingProt(entry),
+    };
 }
 
 pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) void {
@@ -418,7 +454,129 @@ pub fn replaceVmaPageWithAnonymousPrivatePage(
     return private_vmo;
 }
 
-pub fn ensureNativeVmaCowMapping(
+fn writableCowFaultMapping(entry: *const VmaEntry, paddr: u64) NativeVmaFaultMapping {
+    return .{
+        .paddr = paddr,
+        .prot = .{
+            .read = entry.prot.read,
+            .write = entry.prot.write,
+            .exec = entry.prot.exec,
+            .pkey = entry.prot.pkey,
+        },
+    };
+}
+
+fn nativeCowRefsEqual(a: NativeCowTableRef, b: NativeCowTableRef) bool {
+    return a.index == b.index and a.generation == b.generation;
+}
+
+pub fn prepareNativeVmaCowMapping(
+    self: anytype,
+    owner: PrincipalId,
+    fault_page_va: u64,
+    write_access: bool,
+    instruction_fetch: bool,
+) NativeVmaFaultPlan {
+    if (!@TypeOf(self.*).isPageAligned(fault_page_va) or !write_access or instruction_fetch) return .{};
+    const table = self.getVmaTable(owner) orelse return .{};
+    var active_index: usize = 0;
+    while (active_index < table.active_count) : (active_index += 1) {
+        const entry_index: usize = @intCast(table.active_indices[active_index]);
+        const entry = &table.entries[entry_index];
+        if (fault_page_va < entry.start_va or fault_page_va >= entry.endVa()) continue;
+        if (!entry.flags.private or entry.flags.shared or !entry.prot.write) return .{};
+        if (entry.flags.anonymous and !entry.flags.fork_cow) return .{};
+
+        const page_delta = (fault_page_va - entry.start_va) / native_page_size;
+        const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+        if (vmo_page > std.math.maxInt(u32)) return .{};
+        const cow_page = if (entry.cow_table.isNull()) 0 else (@TypeOf(self.*).entryCowPageIndex(entry, fault_page_va) orelse return .{});
+        if (self.entryDirtyPagePaddr(entry, fault_page_va)) |owned_paddr| {
+            if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
+                return .{ .kind = .locked_slow_path };
+            }
+            return .{
+                .kind = .ready,
+                .mapping = writableCowFaultMapping(entry, owned_paddr),
+            };
+        }
+        const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
+        if (src_paddr == 0 and !entry.flags.anonymous) return .{};
+        if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
+            return .{ .kind = .locked_slow_path };
+        }
+        return .{
+            .kind = if (src_paddr == 0) .allocate_zero else .allocate_copy,
+            .mapping = writableCowFaultMapping(entry, 0),
+            .entry_index = @intCast(entry_index),
+            .fault_page_va = fault_page_va,
+            .vmo = entry.vmo,
+            .vmo_page_index = @intCast(vmo_page),
+            .cow_table = entry.cow_table,
+            .cow_page_index = cow_page,
+            .source_paddr = src_paddr,
+        };
+    }
+    return .{};
+}
+
+pub fn commitNativeVmaCowMapping(
+    self: anytype,
+    owner: PrincipalId,
+    plan: NativeVmaFaultPlan,
+    candidate_paddr: u64,
+    free_list: *FreePageList,
+) ?NativeVmaFaultMapping {
+    if ((plan.kind != .allocate_zero and plan.kind != .allocate_copy) or candidate_paddr == 0 or (candidate_paddr & 0xFFF) != 0) return null;
+    const table = self.getVmaTable(owner) orelse return null;
+    const entry_index: usize = @intCast(plan.entry_index);
+    if (entry_index >= table.entries.len) return null;
+    const entry = &table.entries[entry_index];
+    if (!entry.active or plan.fault_page_va < entry.start_va or plan.fault_page_va >= entry.endVa()) return null;
+    if (!entry.flags.private or entry.flags.shared or !entry.prot.write) return null;
+    if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, plan.vmo)) return null;
+    if (!nativeCowRefsEqual(entry.cow_table, plan.cow_table)) return null;
+
+    if (self.entryDirtyPagePaddr(entry, plan.fault_page_va)) |winner_paddr| {
+        if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) return null;
+        return writableCowFaultMapping(entry, winner_paddr);
+    }
+    const page_delta = (plan.fault_page_va - entry.start_va) / native_page_size;
+    const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+    if (vmo_page != plan.vmo_page_index) return null;
+    const current_source = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
+    if (current_source != plan.source_paddr) return null;
+
+    self.ensureEntryCowTable(entry, free_list) catch return null;
+    if (!self.nativeCowTableIsUnique(entry.cow_table)) return null;
+    const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, plan.fault_page_va) orelse return null;
+    if (cow_page != plan.cow_page_index and !plan.cow_table.isNull()) return null;
+    self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr) catch return null;
+    return writableCowFaultMapping(entry, candidate_paddr);
+}
+
+pub fn nativeVmaCowPlanSourceIsCurrent(
+    self: anytype,
+    owner: PrincipalId,
+    plan: NativeVmaFaultPlan,
+) bool {
+    if (plan.kind != .allocate_copy or plan.source_paddr == 0) return false;
+    const table = self.getVmaTable(owner) orelse return false;
+    const entry_index: usize = @intCast(plan.entry_index);
+    if (entry_index >= table.entries.len) return false;
+    const entry = &table.entries[entry_index];
+    if (!entry.active or plan.fault_page_va < entry.start_va or plan.fault_page_va >= entry.endVa()) return false;
+    if (!entry.flags.private or entry.flags.shared or !entry.prot.write) return false;
+    if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, plan.vmo)) return false;
+    if (!nativeCowRefsEqual(entry.cow_table, plan.cow_table)) return false;
+    if (self.entryDirtyPagePaddr(entry, plan.fault_page_va) != null) return false;
+    const page_delta = (plan.fault_page_va - entry.start_va) / native_page_size;
+    const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
+    if (vmo_page != plan.vmo_page_index) return false;
+    return (self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0) == plan.source_paddr;
+}
+
+pub fn ensureNativeVmaCowMappingLockedSlow(
     self: anytype,
     owner: PrincipalId,
     fault_page_va: u64,
@@ -454,15 +612,7 @@ pub fn ensureNativeVmaCowMapping(
                     .invalidate_size_bytes = entry.size_bytes,
                 };
             }
-            return .{
-                .paddr = owned_paddr,
-                .prot = .{
-                    .read = entry.prot.read,
-                    .write = entry.prot.write,
-                    .exec = entry.prot.exec,
-                    .pkey = entry.prot.pkey,
-                },
-            };
+            return writableCowFaultMapping(entry, owned_paddr);
         }
         const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
         if (src_paddr == 0 and !entry.flags.anonymous) return null;
