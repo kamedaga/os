@@ -168,6 +168,8 @@ apps:
       input:
         - "tools/build_pacha_user_session.sh"
         - "userland/pacha_user_session/src/main.c"
+        - "userland/pacha_user_session/src/input_metadata.c"
+        - "userland/pacha_user_session/src/input_metadata.h"
         - "tools/copy_lpr_linux_musl.sh"
     out: "PACHASES.ELF"
     rootfs: "/usr/libexec/pacha-user-session"

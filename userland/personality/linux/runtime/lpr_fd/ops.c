@@ -44,13 +44,15 @@ static int64_t lpr_ops_drm_close(void *state)
 static int64_t lpr_ops_input_close(void *state)
 {
     const lpr_input_backend_t *input = state;
+    const int64_t status =
+        (input->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0 && input->handle != 0 ?
+            lpr_input_close_handle(input->handle) : 0;
     if (input->wait_fd.raw >= 16) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)input->wait_fd.raw);
     }
     if (input->lease_fd.raw >= 16)
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)input->lease_fd.raw);
-    return (input->reserved1 & LPR_BACKEND_TRANSFER_LEASE) == 0 && input->handle != 0 ?
-        lpr_input_close_handle(input->handle) : 0;
+    return status;
 }
 
 static int64_t lpr_ops_pipe_close(void *state)

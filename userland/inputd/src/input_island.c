@@ -17,7 +17,10 @@ enum {
     INPUTD_HANDLE_MAX = 32,
     INPUTD_TRANSFER_LEASE_MAX = 32,
     INPUTD_RING_MAX = 4096,
+    INPUTD_FRAME_STAGE_MAX = 256,
+    INPUTD_TIMING_RING_MAX = 64,
     INPUTD_EV_SYN = 0,
+    INPUTD_SYN_REPORT = 0,
     INPUTD_SYN_DROPPED = 3,
     INPUTD_CLOCK_REALTIME = 0,
     INPUTD_CLOCK_MONOTONIC = 1,
@@ -31,6 +34,7 @@ enum {
 
 typedef struct inputd_raw_event {
     uint64_t sequence;
+    uint64_t frame_sequence;
     uint32_t device_id;
     uint16_t type;
     uint16_t code;
@@ -50,12 +54,15 @@ typedef struct inputd_handle {
     uint64_t cursor;
     int notify_fd;
     int notify_pending;
+    int readable;
+    uint32_t generation;
 } inputd_handle_t;
 
 typedef struct inputd_transfer_lease {
     int active;
     int notify_fd;
     uint64_t handle;
+    uint32_t generation;
 } inputd_transfer_lease_t;
 
 static inputd_handle_t handles[INPUTD_HANDLE_MAX];
@@ -65,15 +72,50 @@ static size_t event_head;
 static size_t event_count;
 static uint64_t next_handle = 1;
 static uint64_t next_sequence = 1;
+static uint64_t next_frame_sequence = 1;
+static uint32_t next_source_generation = 1;
+static uint64_t wait_generation = 1;
+static uint32_t notify_ready_mask;
+
+typedef struct inputd_frame_timing {
+    uint64_t frame_sequence;
+    uint64_t irq_ready_ns;
+    uint64_t publish_ns;
+} inputd_frame_timing_t;
 
 typedef struct inputd_registry_entry {
     struct inputd_public_device public_device;
     uint32_t kobox_device_id;
-    uint32_t reserved0;
     uint64_t grabbed_handle;
+    uint32_t handle_mask;
+    uint32_t stage_count;
+    int stage_dropped;
+    kb_input_event_t stage[INPUTD_FRAME_STAGE_MAX];
+    inputd_frame_timing_t timing[INPUTD_TIMING_RING_MAX];
+    uint32_t timing_head;
+    uint64_t latest_sequence;
+    uint64_t pending_irq_ready_ns;
 } inputd_registry_entry_t;
 
 static struct inputd_input_island *active_island;
+
+static void bump_wait_generation(void)
+{
+    wait_generation++;
+    if (wait_generation == 0) wait_generation = 1;
+}
+
+static uint32_t allocate_source_generation(void)
+{
+    const uint32_t generation = next_source_generation++;
+    if (next_source_generation == 0) next_source_generation = 1;
+    return generation == 0 ? allocate_source_generation() : generation;
+}
+
+static size_t handle_slot(const inputd_handle_t *handle)
+{
+    return (size_t)(handle - handles);
+}
 
 static inputd_handle_t *find_handle(uint64_t id)
 {
@@ -92,6 +134,7 @@ static inputd_handle_t *alloc_handle(void)
             handles[i].refs = 1;
             handles[i].clock_id = INPUTD_CLOCK_REALTIME;
             handles[i].id = next_handle++;
+            handles[i].generation = allocate_source_generation();
             if (next_handle == 0) next_handle = 1;
             return &handles[i];
         }
@@ -141,12 +184,6 @@ static inputd_registry_entry_t *lookup_registry_by_device_id(uint32_t device_id)
     return NULL;
 }
 
-static int lookup_device_by_index(uint32_t index, kb_input_device_snapshot_t *out)
-{
-    inputd_registry_entry_t *entry = lookup_registry_by_event(index);
-    return entry == NULL ? -19 : lookup_device_by_id(entry->kobox_device_id, out);
-}
-
 static int lookup_device_by_id(uint32_t id, kb_input_device_snapshot_t *out)
 {
     inputd_device_lookup_t lookup = {
@@ -160,7 +197,55 @@ static int lookup_device_by_id(uint32_t id, kb_input_device_snapshot_t *out)
     return 0;
 }
 
-static void append_event(const kb_input_event_t *event)
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static void flush_notify_edges(void)
+{
+    uint32_t ready = notify_ready_mask;
+    while (ready != 0) {
+        const unsigned slot = (unsigned)__builtin_ctz(ready);
+        const uint32_t bit = UINT32_C(1) << slot;
+        ready &= ~bit;
+        inputd_handle_t *handle = &handles[slot];
+        if (!handle->active || handle->notify_fd < 16 || !handle->readable) {
+            notify_ready_mask &= ~bit;
+            continue;
+        }
+        const struct pacha_ipc_msg message = {
+            .word0 = UINT64_C(0x494e505554455654),
+            .word1 = handle->id,
+        };
+        if (pacha_ipc_send(handle->notify_fd, &message) == 0) {
+            handle->notify_pending = 1;
+            notify_ready_mask &= ~bit;
+        }
+    }
+}
+
+static void mark_device_readable(inputd_registry_entry_t *entry)
+{
+    uint32_t subscribers = entry->handle_mask;
+    while (subscribers != 0) {
+        const unsigned slot = (unsigned)__builtin_ctz(subscribers);
+        const uint32_t bit = UINT32_C(1) << slot;
+        subscribers &= ~bit;
+        inputd_handle_t *handle = &handles[slot];
+        if (!handle->active || handle->readable || handle->revoked) continue;
+        handle->readable = 1;
+        notify_ready_mask |= bit;
+    }
+    flush_notify_edges();
+}
+
+static void append_event(
+    const kb_input_event_t *event,
+    uint64_t frame_sequence,
+    uint64_t irq_ready_ns)
 {
     size_t slot = (event_head + event_count) % INPUTD_RING_MAX;
     if (event_count == INPUTD_RING_MAX) {
@@ -169,30 +254,89 @@ static void append_event(const kb_input_event_t *event)
     } else {
         event_count++;
     }
-    struct timespec ts = {0};
-    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
     event_ring[slot] = (inputd_raw_event_t){
         .sequence = next_sequence++,
+        .frame_sequence = frame_sequence,
         .device_id = event->device_id,
         .type = (uint16_t)event->type,
         .code = (uint16_t)event->code,
         .value = event->value,
-        .monotonic_seconds = ts.tv_sec,
-        .monotonic_microseconds = ts.tv_nsec / 1000,
+        .monotonic_seconds = (int64_t)(irq_ready_ns / UINT64_C(1000000000)),
+        .monotonic_microseconds = (int64_t)((irq_ready_ns % UINT64_C(1000000000)) / 1000u),
     };
 }
 
-void inputd_input_island_pump(struct inputd_input_island *island)
+static void commit_staged_frame(inputd_registry_entry_t *entry)
 {
-    (void)island;
+    const uint64_t frame_sequence = next_frame_sequence++;
+    if (next_frame_sequence == 0) next_frame_sequence = 1;
+    uint64_t irq_ready_ns = entry->pending_irq_ready_ns;
+    if (irq_ready_ns == 0) irq_ready_ns = monotonic_ns();
+    const uint64_t publish_ns = monotonic_ns();
+    if (entry->stage_dropped) {
+        const kb_input_event_t dropped = {
+            .device_id = entry->kobox_device_id,
+            .type = INPUTD_EV_SYN,
+            .code = INPUTD_SYN_DROPPED,
+        };
+        const kb_input_event_t report = {
+            .device_id = entry->kobox_device_id,
+            .type = INPUTD_EV_SYN,
+            .code = INPUTD_SYN_REPORT,
+        };
+        append_event(&dropped, frame_sequence, irq_ready_ns);
+        append_event(&report, frame_sequence, irq_ready_ns);
+    } else {
+        for (uint32_t i = 0; i < entry->stage_count; i++)
+            append_event(&entry->stage[i], frame_sequence, irq_ready_ns);
+    }
+    entry->latest_sequence = next_sequence - 1u;
+    entry->timing[entry->timing_head] = (inputd_frame_timing_t){
+        .frame_sequence = frame_sequence,
+        .irq_ready_ns = irq_ready_ns,
+        .publish_ns = publish_ns,
+    };
+    entry->timing_head = (entry->timing_head + 1u) % INPUTD_TIMING_RING_MAX;
+    entry->stage_count = 0;
+    entry->stage_dropped = 0;
+    entry->pending_irq_ready_ns = 0;
+    mark_device_readable(entry);
+}
+
+static void stage_event(const kb_input_event_t *event, uint64_t irq_ready_ns)
+{
+    inputd_registry_entry_t *entry = lookup_registry_by_device_id(event->device_id);
+    if (entry == NULL) return;
+    if (entry->pending_irq_ready_ns == 0) entry->pending_irq_ready_ns = irq_ready_ns;
+    if (!entry->stage_dropped) {
+        if (entry->stage_count < INPUTD_FRAME_STAGE_MAX) {
+            entry->stage[entry->stage_count++] = *event;
+        } else {
+            entry->stage_count = 0;
+            entry->stage_dropped = 1;
+        }
+    }
+    if (event->type == INPUTD_EV_SYN && event->code == INPUTD_SYN_REPORT)
+        commit_staged_frame(entry);
+}
+
+int inputd_input_island_drain_device(
+    struct inputd_input_island *island,
+    size_t device_ordinal,
+    uint64_t irq_ready_ns)
+{
+    if (island == NULL || island->device_backend == NULL ||
+        device_ordinal >= island->device_count) return -22;
+    const int dispatch_status = kb_handle_device_irqs(
+        island->device_backend, device_ordinal, 0);
+    if (dispatch_status != 0) return dispatch_status;
     for (unsigned pass = 0; pass < 8; pass++) {
-        (void)kb_handle_any_irq(0);
-        kb_run_deferred_work();
         kb_input_event_t events[128];
         const size_t count = kb_input_subsystem_pop_events(events, 128);
-        for (size_t i = 0; i < count; i++) append_event(&events[i]);
+        for (size_t i = 0; i < count; i++) stage_event(&events[i], irq_ready_ns);
         if (count < 128) break;
     }
+    return 0;
 }
 
 static uint32_t input_capabilities(const kb_input_device_snapshot_t *device)
@@ -398,8 +542,10 @@ int inputd_input_public_device(
 int inputd_input_open(uint32_t event_index, uint32_t flags, int notify_fd, uint64_t *out_handle)
 {
     if (out_handle == NULL || notify_fd < 16) return -22;
+    inputd_registry_entry_t *entry = lookup_registry_by_event(event_index);
+    if (entry == NULL) return -19;
     kb_input_device_snapshot_t device;
-    int status = lookup_device_by_index(event_index, &device);
+    int status = lookup_device_by_id(entry->kobox_device_id, &device);
     if (status != 0) return status;
     inputd_handle_t *handle = alloc_handle();
     if (handle == NULL) return -24;
@@ -407,6 +553,8 @@ int inputd_input_open(uint32_t event_index, uint32_t flags, int notify_fd, uint6
     handle->flags = flags;
     handle->cursor = next_sequence;
     handle->notify_fd = notify_fd;
+    entry->handle_mask |= UINT32_C(1) << handle_slot(handle);
+    bump_wait_generation();
     *out_handle = handle->id;
     printf("[inputd] open event%u handle=%llu device=%u name=%s\n", event_index,
         (unsigned long long)handle->id, device.id, device.name);
@@ -423,8 +571,14 @@ int inputd_input_close(uint64_t id)
     }
     if (handle->notify_fd >= 16) (void)pacha_fd_close(handle->notify_fd);
     inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
-    if (entry != NULL && entry->grabbed_handle == id) entry->grabbed_handle = 0;
+    const uint32_t bit = UINT32_C(1) << handle_slot(handle);
+    if (entry != NULL) {
+        entry->handle_mask &= ~bit;
+        if (entry->grabbed_handle == id) entry->grabbed_handle = 0;
+    }
+    notify_ready_mask &= ~bit;
     memset(handle, 0, sizeof(*handle));
+    bump_wait_generation();
     return 0;
 }
 
@@ -454,7 +608,9 @@ int inputd_input_transfer_dup(uint64_t id, int notify_fd, uint64_t *out_handle)
     lease->active = 1;
     lease->notify_fd = notify_fd;
     lease->handle = id;
+    lease->generation = allocate_source_generation();
     handle->refs++;
+    bump_wait_generation();
     *out_handle = id;
     return 0;
 }
@@ -497,22 +653,34 @@ int inputd_input_read(inputd_read_request_t *request)
 
     const uint64_t earliest = event_count == 0 ? next_sequence : event_ring[event_head].sequence;
     if (handle->cursor < earliest && request->event_count < capacity) {
+        const inputd_raw_event_t *oldest = event_count == 0 ? NULL : &event_ring[event_head];
         request->events[request->event_count++] = (inputd_input_event_t){
-            .type = INPUTD_EV_SYN, .code = INPUTD_SYN_DROPPED, .value = 0,
+            .seconds = oldest == NULL ? 0 : oldest->monotonic_seconds,
+            .microseconds = oldest == NULL ? 0 : oldest->monotonic_microseconds,
+            .type = INPUTD_EV_SYN,
+            .code = INPUTD_SYN_DROPPED,
+            .value = 0,
         };
         handle->cursor = earliest;
     }
-    for (size_t i = 0; i < event_count && request->event_count < capacity; i++) {
+    for (size_t i = 0; i < event_count; i++) {
         const inputd_raw_event_t *event = &event_ring[(event_head + i) % INPUTD_RING_MAX];
         if (event->sequence < handle->cursor) continue;
-        if (event->device_id == handle->device_id) {
-            copy_event_time(handle, event, &request->events[request->event_count++]);
+        if (event->device_id != handle->device_id) {
+            handle->cursor = event->sequence + 1u;
+            continue;
         }
+        if (request->event_count >= capacity) break;
+        copy_event_time(handle, event, &request->events[request->event_count++]);
+        handle->cursor = event->sequence + 1u;
     }
-    handle->cursor = next_sequence;
-    if (request->event_count == 0) return -11;
+    inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+    handle->readable = entry != NULL && entry->latest_sequence >= handle->cursor;
+    if (request->event_count == 0) {
+        handle->readable = 0;
+        return -11;
+    }
     handle->notify_pending = 0;
-    inputd_input_notify_readable();
     return 0;
 }
 
@@ -629,46 +797,53 @@ int inputd_input_poll(inputd_poll_request_t *request)
     if (request == NULL) return -22;
     inputd_handle_t *handle = find_handle(request->handle);
     if (handle == NULL) return -9;
-    request->revents = 0;
-    for (size_t i = 0; i < event_count; i++) {
-        const inputd_raw_event_t *event = &event_ring[(event_head + i) % INPUTD_RING_MAX];
-        if (event->sequence >= handle->cursor && event->device_id == handle->device_id) {
-            request->revents = request->events & INPUTD_POLLIN;
-            break;
-        }
-    }
+    request->revents = handle->readable ? request->events & INPUTD_POLLIN : 0;
     return 0;
 }
 
-size_t inputd_input_collect_wait_sources(int *fds, size_t capacity)
+uint64_t inputd_input_wait_generation(void)
 {
-    if (fds == NULL || capacity == 0) return 0;
+    return wait_generation;
+}
+
+size_t inputd_input_collect_wait_sources(
+    struct inputd_wait_source *sources,
+    size_t capacity)
+{
+    if (sources == NULL || capacity == 0) return 0;
     size_t count = 0;
     for (size_t i = 0; i < INPUTD_HANDLE_MAX && count < capacity; i++) {
         const inputd_handle_t *handle = &handles[i];
         if (!handle->active || handle->notify_fd < 16) continue;
-        fds[count++] = handle->notify_fd;
+        sources[count++] = (struct inputd_wait_source){
+            .fd = handle->notify_fd,
+            .kind = INPUTD_WAIT_SOURCE_HANDLE,
+            .slot = (uint32_t)i,
+            .generation = handle->generation,
+        };
     }
     for (size_t i = 0; i < INPUTD_TRANSFER_LEASE_MAX && count < capacity; ++i) {
-        if (!transfer_leases[i].active || transfer_leases[i].notify_fd < 16) continue;
-        fds[count++] = transfer_leases[i].notify_fd;
+        const inputd_transfer_lease_t *lease = &transfer_leases[i];
+        if (!lease->active || lease->notify_fd < 16) continue;
+        sources[count++] = (struct inputd_wait_source){
+            .fd = lease->notify_fd,
+            .kind = INPUTD_WAIT_SOURCE_TRANSFER_LEASE,
+            .slot = (uint32_t)i,
+            .generation = lease->generation,
+        };
     }
     return count;
 }
 
-size_t inputd_input_reap_hangups(void)
+void inputd_input_handle_wait_event(
+    const struct inputd_wait_source *source,
+    uint64_t revents)
 {
-    size_t reaped = 0;
-    for (size_t i = 0; i < INPUTD_HANDLE_MAX; i++) {
-        inputd_handle_t *handle = &handles[i];
-        if (!handle->active || handle->notify_fd < 16) continue;
-        struct pacha_pollfd pollfd = {
-            .fd = handle->notify_fd,
-            .events = PACHA_FD_EVENT_HANGUP,
-        };
-        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
-            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
-
+    if (source == NULL || (revents & PACHA_FD_EVENT_HANGUP) == 0) return;
+    if (source->kind == INPUTD_WAIT_SOURCE_HANDLE && source->slot < INPUTD_HANDLE_MAX) {
+        inputd_handle_t *handle = &handles[source->slot];
+        if (!handle->active || handle->generation != source->generation ||
+            handle->notify_fd != source->fd) return;
         const uint64_t orphan_id = handle->id;
         const uint32_t orphan_refs = handle->refs;
         const int notify_fd = handle->notify_fd;
@@ -678,40 +853,23 @@ size_t inputd_input_reap_hangups(void)
         const int status = inputd_input_close(orphan_id);
         printf("[inputd] orphan reap handle=%llu refs=%u status=%d\n",
             (unsigned long long)orphan_id, orphan_refs, status);
-        reaped++;
+        bump_wait_generation();
+        return;
     }
-    for (size_t i = 0; i < INPUTD_TRANSFER_LEASE_MAX; ++i) {
-        inputd_transfer_lease_t *lease = &transfer_leases[i];
-        if (!lease->active || lease->notify_fd < 16) continue;
-        struct pacha_pollfd pollfd = {
-            .fd = lease->notify_fd,
-            .events = PACHA_FD_EVENT_HANGUP,
-        };
-        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
-            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+    if (source->kind == INPUTD_WAIT_SOURCE_TRANSFER_LEASE &&
+        source->slot < INPUTD_TRANSFER_LEASE_MAX) {
+        inputd_transfer_lease_t *lease = &transfer_leases[source->slot];
+        if (!lease->active || lease->generation != source->generation ||
+            lease->notify_fd != source->fd) return;
         const uint64_t handle = lease->handle;
         (void)pacha_fd_close(lease->notify_fd);
         memset(lease, 0, sizeof(*lease));
+        bump_wait_generation();
         (void)inputd_input_close(handle);
-        reaped++;
     }
-    return reaped;
 }
 
-void inputd_input_notify_readable(void)
+void inputd_input_flush_notifications(void)
 {
-    for (size_t i = 0; i < INPUTD_HANDLE_MAX; i++) {
-        inputd_handle_t *handle = &handles[i];
-        if (!handle->active || handle->notify_fd < 16 || handle->notify_pending) continue;
-        inputd_poll_request_t request = {
-            .handle = handle->id,
-            .events = INPUTD_POLLIN,
-        };
-        if (inputd_input_poll(&request) != 0 || request.revents == 0) continue;
-        const struct pacha_ipc_msg message = {
-            .word0 = 0x494e505554455654ull,
-            .word1 = handle->id,
-        };
-        if (pacha_ipc_send(handle->notify_fd, &message) == 0) handle->notify_pending = 1;
-    }
+    flush_notify_edges();
 }

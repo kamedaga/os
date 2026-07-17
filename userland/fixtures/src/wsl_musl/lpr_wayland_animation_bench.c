@@ -84,7 +84,7 @@ static void maybe_input_done(void)
         !motion_seen || !button_down || !button_up) return;
     input_done = 1;
     printf(
-        "P4_BENCH_INPUT count=%zu p50_ms=%llu p99_ms=%llu max_ms=%llu source=evdev-to-wayland-client\n",
+        "P4_BENCH_INPUT count=%zu p50_ms=%llu p99_ms=%llu max_ms=%llu source=irq-ready-to-wayland-client\n",
         input_sample_count,
         (unsigned long long)percentile(input_samples_ms, input_sample_count, 50),
         (unsigned long long)percentile(input_samples_ms, input_sample_count, 99),

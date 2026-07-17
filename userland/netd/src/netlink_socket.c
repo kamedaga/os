@@ -263,12 +263,10 @@ int netd_netlink_publish_device(uint64_t device)
             if ((fields.input_capabilities & NETD_INPUT_CAP_KEYBOARD) != 0)
                 length = append_field(message->data, sizeof(message->data), length,
                     "ID_INPUT_KEYBOARD=1");
-            if ((fields.input_capabilities & NETD_INPUT_CAP_RELATIVE) != 0)
+            if ((fields.input_capabilities &
+                    (NETD_INPUT_CAP_RELATIVE | NETD_INPUT_CAP_ABSOLUTE)) != 0)
                 length = append_field(message->data, sizeof(message->data), length,
                     "ID_INPUT_MOUSE=1");
-            if ((fields.input_capabilities & NETD_INPUT_CAP_ABSOLUTE) != 0)
-                length = append_field(message->data, sizeof(message->data), length,
-                    "ID_INPUT_TABLET=1");
             length = append_field(message->data, sizeof(message->data), length,
                 fields.pci_slot_name);
         }

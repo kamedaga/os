@@ -320,7 +320,7 @@ func qemuCommand(ctx *context) *cobra.Command {
 	cmd.Flags().StringVar(&opts.Memory, "memory", "2G", "QEMU memory size")
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
-	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
+	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-tablet", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
 	cmd.Flags().StringVar(&opts.Console, "console", "pty", "virtio console backend: pty or off")
 	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
 	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")

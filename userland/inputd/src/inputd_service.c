@@ -139,7 +139,6 @@ int inputd_service_dispatch(
     int64_t status = -22;
     uint64_t result = 0;
     int keep_fd = -1;
-    inputd_input_island_pump(service->input);
     if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC &&
         request->word3 == header.request_id &&
         pacha_service_request_is_valid(&header, INPUTD_SERVICE_ID)) {

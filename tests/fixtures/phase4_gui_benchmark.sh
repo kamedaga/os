@@ -179,6 +179,58 @@ if ! wait_for_runtime_clean; then
     exit 1
 fi
 
+if [[ ${P3A_INPUT_ONLY:-0} == 1 ]]; then
+    input_mode=${P3A_INPUT_MODE:-mouse}
+    unset WAYLAND_DISPLAY SWAYSOCK
+    /usr/bin/sway -c "$config" &
+    sway_pid=$!
+    socket=$(wait_for_socket) || { fail p3a-socket; kill -KILL "$sway_pid"; exit 1; }
+    wait_for_ipc "$socket" || { fail p3a-ipc; kill -KILL "$sway_pid"; exit 1; }
+    display=$(wait_for_wayland_display) || { fail p3a-display; kill -KILL "$sway_pid"; exit 1; }
+    export WAYLAND_DISPLAY=$display
+    export SWAYSOCK=$socket
+    inputs=$(/usr/bin/swaymsg -s "$socket" -t get_inputs) || {
+        fail p3a-get-inputs
+        stop_sway "$socket" "$sway_pid" || true
+        exit 1
+    }
+    printf '%s\n' "$inputs"
+    [[ $inputs == *'"type": "keyboard"'* ]] || {
+        fail p3a-keyboard-classification
+        stop_sway "$socket" "$sway_pid" || true
+        exit 1
+    }
+    if [[ $input_mode == tablet ]]; then
+        [[ $inputs == *'"type": "pointer"'* &&
+           $inputs == *'"name": "QEMU Virtio Tablet"'* ]] || {
+            fail p3a-tablet-classification
+            stop_sway "$socket" "$sway_pid" || true
+            exit 1
+        }
+        printf 'P3A_TABLET_INPUT_READY source=qmp-absolute\n'
+        wait_tick 2
+        kill -0 "$sway_pid" 2>/dev/null || {
+            fail p3a-tablet-sway-exit
+            exit 1
+        }
+    else
+        [[ $inputs == *'"type": "pointer"'* ]] || {
+            fail p3a-pointer-classification
+            stop_sway "$socket" "$sway_pid" || true
+            exit 1
+        }
+        /cmd/lpr_wayland_animation_bench.elf || {
+            fail p3a-wayland-input
+            stop_sway "$socket" "$sway_pid" || true
+            exit 1
+        }
+    fi
+    stop_sway "$socket" "$sway_pid" || { fail p3a-sway-exit; exit 1; }
+    wait_for_runtime_clean || { fail p3a-runtime-clean; exit 1; }
+    printf 'P3A_INPUT_PASS mode=%s direct_sway=1 classification=1\n' "$input_mode"
+    exit 0
+fi
+
 unset WAYLAND_DISPLAY SWAYSOCK
 cold_start=$(now_ns)
 printf 'P4_BENCH_SWAY_EXEC phase=cold guest_ns=%s path=/usr/bin/sway\n' "$cold_start"

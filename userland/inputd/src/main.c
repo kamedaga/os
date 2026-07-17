@@ -9,6 +9,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
 
 static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
 {
@@ -80,33 +88,13 @@ int main(void)
     if (ready_status != 0 || init_status != 0) return 1;
     printf("[inputd] service loop endpoint_fd=%llu\n",
         (unsigned long long)cfg->input_endpoint_fd);
+    static struct pacha_service_wait_set wait_set;
+    static struct inputd_wait_source wait_sources[PACHA_SERVICE_WAIT_MAX_FDS];
+    size_t wait_source_count = 0;
+    uint64_t built_wait_generation = 0;
     for (;;) {
-        struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
-        struct pacha_ipc_msg request;
-        memset(fds, 0, sizeof(fds));
-        memset(&request, 0, sizeof(request));
-        request.fds = fds;
-        request.fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS;
-        const int status = pacha_ipc_recv((int)cfg->input_endpoint_fd, &request);
-        if (status == 0) {
-            (void)inputd_service_dispatch(&service, &request, fds);
-        } else if (status != PACHA_ERR_EMPTY && status != PACHA_ERR_NOT_READY) {
-            fprintf(stderr, "[inputd] service receive failed status=%d endpoint_fd=%llu\n",
-                status, (unsigned long long)cfg->input_endpoint_fd);
-            return 1;
-        }
-        for (size_t i = 0; i < cfg->device_count; i++) {
-            uint64_t next_count = 0;
-            if (pacha_capsule_irq_poll(
-                    wake_irqs[i].fd, wake_irqs[i].count, &next_count) == 0)
-                wake_irqs[i].count = next_count;
-        }
-        inputd_input_island_pump(&island);
-        inputd_input_notify_readable();
-        (void)inputd_input_reap_hangups();
-        if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
-            static struct pacha_service_wait_set wait_set;
-            int handle_wait_fds[PACHA_SERVICE_WAIT_MAX_FDS];
+        const uint64_t current_wait_generation = inputd_input_wait_generation();
+        if (built_wait_generation != current_wait_generation) {
             if (pacha_service_wait_init(&wait_set, (int)cfg->input_endpoint_fd) != 0)
                 return 1;
             for (size_t i = 0; i < cfg->device_count; i++) {
@@ -114,16 +102,58 @@ int main(void)
                         &wait_set, wake_irqs[i].fd, PACHA_FD_EVENT_READABLE) != 0)
                     return 1;
             }
-            const size_t handle_wait_count = inputd_input_collect_wait_sources(
-                handle_wait_fds,
+            wait_source_count = inputd_input_collect_wait_sources(
+                wait_sources,
                 PACHA_SERVICE_WAIT_MAX_FDS - 1u - cfg->device_count);
-            for (size_t i = 0; i < handle_wait_count; i++) {
+            for (size_t i = 0; i < wait_source_count; i++) {
                 if (pacha_service_wait_add(
-                        &wait_set, handle_wait_fds[i], PACHA_FD_EVENT_HANGUP) != 0)
+                        &wait_set, wait_sources[i].fd, PACHA_FD_EVENT_HANGUP) != 0)
                     return 1;
             }
-            (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
-            (void)inputd_input_reap_hangups();
+            built_wait_generation = current_wait_generation;
+        }
+        if (pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER) < 0) return 1;
+
+        for (size_t i = 0; i < cfg->device_count; i++) {
+            const size_t wait_index = 1u + i;
+            if ((wait_set.fds[wait_index].revents & PACHA_FD_EVENT_READABLE) == 0)
+                continue;
+            const uint64_t irq_ready_ns = monotonic_ns();
+            uint64_t next_count = 0;
+            if (pacha_capsule_irq_poll(
+                    wake_irqs[i].fd, wake_irqs[i].count, &next_count) != 0)
+                continue;
+            wake_irqs[i].count = next_count;
+            (void)inputd_input_island_drain_device(&island, i, irq_ready_ns);
+        }
+        inputd_input_flush_notifications();
+
+        if ((wait_set.fds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
+            for (unsigned request_budget = 0; request_budget < 64; request_budget++) {
+                struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
+                struct pacha_ipc_msg request;
+                memset(fds, 0, sizeof(fds));
+                memset(&request, 0, sizeof(request));
+                request.fds = fds;
+                request.fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS;
+                const int status = pacha_ipc_recv((int)cfg->input_endpoint_fd, &request);
+                if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) break;
+                if (status != 0) {
+                    fprintf(stderr,
+                        "[inputd] service receive failed status=%d endpoint_fd=%llu\n",
+                        status, (unsigned long long)cfg->input_endpoint_fd);
+                    return 1;
+                }
+                (void)inputd_service_dispatch(&service, &request, fds);
+                inputd_input_flush_notifications();
+            }
+        }
+
+        const size_t source_base = 1u + cfg->device_count;
+        for (size_t i = 0; i < wait_source_count; i++) {
+            const uint64_t revents = wait_set.fds[source_base + i].revents;
+            if (revents != 0)
+                inputd_input_handle_wait_event(&wait_sources[i], revents);
         }
     }
 }

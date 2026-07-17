@@ -1,5 +1,7 @@
 #define _GNU_SOURCE
 
+#include "input_metadata.h"
+
 #include <errno.h>
 #include <signal.h>
 #include <stddef.h>
@@ -208,6 +210,10 @@ int main(void)
     if (prepare_environment() != 0) {
         perror("prepare environment");
         return 21;
+    }
+    if (pacha_prepare_input_metadata() != 0) {
+        perror("prepare input metadata");
+        return 22;
     }
     int ready_pipe[2];
     if (pipe(ready_pipe) != 0) {
