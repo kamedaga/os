@@ -106,6 +106,8 @@ void filed_dispatch_close_prepared_endpoint(int *fd, int borrowed);
 int64_t filed_status_to_wire(filed_status_t status);
 int filed_release_reclaimed_object(filed_runtime_t *runtime, const filed_vfs_reclaim_result_t *reclaim);
 int64_t filed_close_handle_runtime(filed_runtime_t *runtime, filed_handle_id_t handle_id);
+int64_t filed_close_handle_runtime_deferred(filed_runtime_t *runtime, filed_handle_id_t handle_id);
+int filed_maintain_vnode_cache(filed_runtime_t *runtime);
 void filed_write_u64_le(void *base, uint64_t offset, uint64_t value);
 filed_vnode_kind_t filed_kind_from_unix_type(uint64_t kind);
 uint32_t filed_rights_to_vfs(uint64_t rights);

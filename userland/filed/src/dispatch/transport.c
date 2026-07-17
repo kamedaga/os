@@ -251,6 +251,7 @@ static uint64_t filed_dispatch_session_fast_drain(
                     result.status);
             } else {
                 result = filed_dispatch_session_page(runtime, &pseudo_request, payload);
+                (void)filed_maintain_vnode_cache(runtime);
                 if (result.status == 0 && result.result != 0 &&
                     (fast_request->opcode == FILED_OP_VFS_OPENAT ||
                      fast_request->opcode == FILED_OP_VFS_DUP ||
@@ -930,6 +931,7 @@ static int filed_dispatch_client(
             request,
             page,
             &header);
+        (void)filed_maintain_vnode_cache(runtime);
         if (route.replied) {
             return route.reply_status;
         }

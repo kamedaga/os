@@ -252,6 +252,10 @@ AUTH_MAGIC直前の一回計測は16,176 syscall、92,414,916,332 cyclesだっ�
 
 backend stateはopenごとに実型が256 bytes以下でも4 KiB anonymous mmap / zero / munmapしていた。これを15 slotのprocess-local slabへ切り替え、通常lockはatomicだけ、競合時だけfutex wait / wakeする。fork childはtransaction cleanupより前に継承lockをresetする。open / dup / close / fork / pipeの短時間確認と4 CPU keyboard+tablet direct Swayを通し、socket 26秒、IPC 38秒だった。一回値なので速度改善とは判定せず目標値を変えない。
 
+局所改善記録（2026-07-18、Filed close / runtime lock）: warm closeごとに走っていたunused-linked vnodeの多重全件走査をbackend object単位の集計へ縮約し、path walk中の内部closeはrequest境界で一度だけ保守する。file / handle / vnodeの空slot探索はrotating cursor化した。LPRの共通lockとFD table lockは0 / 1 / 2状態とし、競合時だけfutexを使う。single-thread lock elisionは維持し、unlockはthread数でなく取得済みwordを基準にする。
+
+WSL clang buildとFiled VFS / tmpfs / cache invariant testを通した。最初にsingle-thread elisionまで外したbuildがSwayをEGL前で停止させたため取り消し、修正版は4 CPU keyboard+tablet direct Swayをsocket 23秒、IPC 33秒で完走した。Broken pipe、scheduler unavailable、libinput lagはなくQEMUを停止した。一回値なので目標値は変えない。
+
 ## 12. Step 9 — Phase 4完了判定
 
 最終確認は長時間batteryにせず、次に限定する。

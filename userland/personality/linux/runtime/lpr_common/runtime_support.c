@@ -90,32 +90,31 @@ static void lpr_fd_lock_futex_wake(volatile uint32_t *word, uint32_t count)
 
 void lpr_state_lock(volatile uint32_t *word)
 {
-    if (word == 0 || __atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u) {
+    if (word == 0 ||
+        __atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u)
+    {
         return;
     }
-    for (;;) {
-        uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(
-                word,
-                &expected,
-                1u,
-                0,
-                __ATOMIC_ACQUIRE,
-                __ATOMIC_RELAXED))
-        {
-            return;
-        }
-        lpr_fd_lock_futex_wait(word, 1u);
+    /* 0 is unlocked, 1 is locked without known waiters, and 2 is locked with
+     * possible waiters.  Single-thread callers retain the runtime's existing
+     * nesting semantics.  Release checks the word rather than thread_count,
+     * because another thread can start or exit while the lock is held. */
+    if (__atomic_exchange_n(word, 1u, __ATOMIC_ACQUIRE) == 0u) {
+        return;
+    }
+    while (__atomic_exchange_n(word, 2u, __ATOMIC_ACQUIRE) != 0u) {
+        lpr_fd_lock_futex_wait(word, 2u);
     }
 }
 
 void lpr_state_unlock(volatile uint32_t *word)
 {
-    if (word == 0 || __atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) <= 1u) {
+    if (word == 0) {
         return;
     }
-    __atomic_store_n(word, 0u, __ATOMIC_RELEASE);
-    lpr_fd_lock_futex_wake(word, 1u);
+    if (__atomic_exchange_n(word, 0u, __ATOMIC_RELEASE) == 2u) {
+        lpr_fd_lock_futex_wake(word, 1u);
+    }
 }
 
 uint64_t lpr_next_request_id(volatile uint64_t *counter)

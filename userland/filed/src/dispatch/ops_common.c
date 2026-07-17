@@ -85,9 +85,10 @@ static int filed_evict_unused_linked_vnodes(filed_runtime_t *runtime)
     }
 }
 
-int64_t filed_close_handle_runtime(
+static int64_t filed_close_handle_runtime_impl(
     filed_runtime_t *runtime,
-    filed_handle_id_t handle_id)
+    filed_handle_id_t handle_id,
+    bool defer_eviction)
 {
     filed_vfs_reclaim_result_t reclaim;
     if (runtime == NULL) {
@@ -112,6 +113,34 @@ int64_t filed_close_handle_runtime(
     if (release_status != 0) {
         return release_status;
     }
+    if (defer_eviction) {
+        runtime->vnode_eviction_pending = 1;
+        return 0;
+    }
+    runtime->vnode_eviction_pending = 0;
+    return filed_evict_unused_linked_vnodes(runtime);
+}
+
+int64_t filed_close_handle_runtime(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id)
+{
+    return filed_close_handle_runtime_impl(runtime, handle_id, false);
+}
+
+int64_t filed_close_handle_runtime_deferred(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id)
+{
+    return filed_close_handle_runtime_impl(runtime, handle_id, true);
+}
+
+int filed_maintain_vnode_cache(filed_runtime_t *runtime)
+{
+    if (runtime == NULL || !runtime->vnode_eviction_pending) {
+        return 0;
+    }
+    runtime->vnode_eviction_pending = 0;
     return filed_evict_unused_linked_vnodes(runtime);
 }
 
@@ -450,7 +479,7 @@ void filed_close_walk_handle(
         (!runtime->tmpfs_root_handle_valid || handle_id != runtime->tmpfs_root_handle_id) &&
         (!runtime->run_tmpfs_root_handle_valid || handle_id != runtime->run_tmpfs_root_handle_id))
     {
-        (void)filed_close_handle_runtime(runtime, handle_id);
+        (void)filed_close_handle_runtime_deferred(runtime, handle_id);
     }
 }
 

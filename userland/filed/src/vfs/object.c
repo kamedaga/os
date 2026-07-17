@@ -413,11 +413,13 @@ filed_mount_t *filed_alloc_mount(filed_vfs_t *vfs)
 
 filed_vnode_t *filed_alloc_vnode(filed_vfs_t *vfs)
 {
-    size_t i;
-
-    for (i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (!vfs->vnodes[i].active) {
-            return &vfs->vnodes[i];
+    const uint32_t start = vfs->next_vnode_slot;
+    for (uint32_t offset = 0; offset < FILED_MAX_VNODES; ++offset) {
+        const uint32_t slot = (start + offset) % FILED_MAX_VNODES;
+        if (!vfs->vnodes[slot].active) {
+            vfs->next_vnode_slot =
+                (uint16_t)((slot + 1u) % FILED_MAX_VNODES);
+            return &vfs->vnodes[slot];
         }
     }
 
@@ -426,11 +428,13 @@ filed_vnode_t *filed_alloc_vnode(filed_vfs_t *vfs)
 
 filed_file_t *filed_alloc_file(filed_vfs_t *vfs)
 {
-    size_t i;
-
-    for (i = 0; i < FILED_MAX_FILES; ++i) {
-        if (!vfs->files[i].active) {
-            return &vfs->files[i];
+    const uint32_t start = vfs->next_file_slot;
+    for (uint32_t offset = 0; offset < FILED_MAX_FILES; ++offset) {
+        const uint32_t slot = (start + offset) % FILED_MAX_FILES;
+        if (!vfs->files[slot].active) {
+            vfs->next_file_slot =
+                (uint16_t)((slot + 1u) % FILED_MAX_FILES);
+            return &vfs->files[slot];
         }
     }
 
@@ -439,11 +443,13 @@ filed_file_t *filed_alloc_file(filed_vfs_t *vfs)
 
 filed_handle_t *filed_alloc_handle(filed_vfs_t *vfs)
 {
-    size_t i;
-
-    for (i = 0; i < FILED_MAX_HANDLES; ++i) {
-        if (!vfs->handles[i].active) {
-            return &vfs->handles[i];
+    const uint32_t start = vfs->next_handle_slot;
+    for (uint32_t offset = 0; offset < FILED_MAX_HANDLES; ++offset) {
+        const uint32_t slot = (start + offset) % FILED_MAX_HANDLES;
+        if (!vfs->handles[slot].active) {
+            vfs->next_handle_slot =
+                (uint16_t)((slot + 1u) % FILED_MAX_HANDLES);
+            return &vfs->handles[slot];
         }
     }
 

@@ -739,6 +739,15 @@ filed_status_t filed_vfs_evict_lru_unused_linked(
     void *context,
     filed_vfs_reclaim_result_t *out_reclaim)
 {
+    typedef struct filed_cached_object_scan {
+        filed_backend_object_id_t backend_object;
+        uint64_t last_used;
+        uint16_t alias_count;
+        bool unused_linked_leaf;
+    } filed_cached_object_scan_t;
+    filed_cached_object_scan_t objects[FILED_MAX_VNODES];
+    uint16_t vnode_object[FILED_MAX_VNODES];
+    uint16_t object_count = 0;
     filed_backend_object_id_t oldest_object = 0;
     uint64_t oldest_last_used = UINT64_MAX;
     uint32_t cached = 0;
@@ -746,37 +755,79 @@ filed_status_t filed_vfs_evict_lru_unused_linked(
         return FILED_ERR_INVALID;
     }
     memset(out_reclaim, 0, sizeof(*out_reclaim));
+    memset(objects, 0, sizeof(objects));
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+        vnode_object[i] = UINT16_MAX;
+    }
+
+    /* Build one record per backend object first.  The old scan rediscovered
+     * aliases and children with nested full-table walks for every vnode, even
+     * when the cache was below its limit and no eviction could occur. */
     for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
         const filed_vnode_t *vnode = &vfs->vnodes[i];
         if (!vnode->active || vnode->backend_object == 0) {
             continue;
         }
-        bool first_alias = true;
-        for (uint32_t j = 0; j < i; ++j) {
-            if (vfs->vnodes[j].active &&
-                vfs->vnodes[j].backend_object == vnode->backend_object)
-            {
-                first_alias = false;
+        uint16_t object_index = 0;
+        while (object_index < object_count) {
+            if (objects[object_index].backend_object == vnode->backend_object) {
                 break;
             }
+            ++object_index;
         }
-        if (!first_alias) {
+        if (object_index == object_count) {
+            objects[object_index].backend_object = vnode->backend_object;
+            objects[object_index].unused_linked_leaf = true;
+            ++object_count;
+        }
+        filed_cached_object_scan_t *object = &objects[object_index];
+        vnode_object[i] = object_index;
+        ++object->alias_count;
+        if (!vnode->linked || vnode->refcount != 0 ||
+            filed_vnode_mount_pins(vfs, vnode->id) != 0)
+        {
+            object->unused_linked_leaf = false;
+        }
+        if (vnode->last_used > object->last_used) {
+            object->last_used = vnode->last_used;
+        }
+    }
+
+    /* A cached directory with any live child is not a leaf.  Resolve each
+     * child once instead of searching for children once per candidate. */
+    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+        const filed_vnode_t *child = &vfs->vnodes[i];
+        if (!child->active || child->parent == 0) {
             continue;
         }
-        uint64_t last_used = 0;
-        if (!filed_vfs_backend_object_is_unused_linked_leaf(
-                vfs,
-                vnode->backend_object,
-                &last_used))
-        {
+        const filed_vnode_t *parent = filed_find_vnode(vfs, child->parent);
+        if (parent == NULL) {
+            continue;
+        }
+        const ptrdiff_t parent_slot = parent - vfs->vnodes;
+        if (parent_slot >= 0 && parent_slot < (ptrdiff_t)FILED_MAX_VNODES) {
+            const uint16_t object_index = vnode_object[parent_slot];
+            if (object_index != UINT16_MAX) {
+                objects[object_index].unused_linked_leaf = false;
+            }
+        }
+    }
+
+    for (uint16_t i = 0; i < object_count; ++i) {
+        const filed_cached_object_scan_t *object = &objects[i];
+        if (!object->unused_linked_leaf) {
             continue;
         }
         ++cached;
-        if ((evictable == NULL || evictable(context, vnode->backend_object)) &&
-            (oldest_object == 0 || last_used < oldest_last_used))
+        /* Releasing a backend object with multiple linked aliases requires a
+         * separate alias-cache design.  Do not let such an object hide an
+         * older single-vnode candidate that can be reclaimed safely. */
+        if (object->alias_count == 1 &&
+            (evictable == NULL || evictable(context, object->backend_object)) &&
+            (oldest_object == 0 || object->last_used < oldest_last_used))
         {
-            oldest_object = vnode->backend_object;
-            oldest_last_used = last_used;
+            oldest_object = object->backend_object;
+            oldest_last_used = object->last_used;
         }
     }
     if (cached <= max_cached || oldest_object == 0) {

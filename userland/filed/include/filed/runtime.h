@@ -50,6 +50,7 @@ typedef struct filed_runtime {
     uint8_t root_tmpfs_synthetic_dirent;
     uint8_t tmpfs_root_handle_valid;
     uint8_t run_tmpfs_root_handle_valid;
+    uint8_t vnode_eviction_pending;
 } filed_runtime_t;
 
 void filed_runtime_init(filed_runtime_t *runtime);
@@ -59,3 +60,7 @@ int filed_runtime_serve(filed_runtime_t *runtime);
 int64_t filed_close_handle_runtime(
     filed_runtime_t *runtime,
     filed_handle_id_t handle_id);
+int64_t filed_close_handle_runtime_deferred(
+    filed_runtime_t *runtime,
+    filed_handle_id_t handle_id);
+int filed_maintain_vnode_cache(filed_runtime_t *runtime);

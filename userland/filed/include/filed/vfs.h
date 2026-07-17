@@ -151,6 +151,9 @@ typedef struct filed_vfs {
     filed_file_id_t next_file_id;
     filed_handle_id_t next_handle_id;
     uint64_t vnode_clock;
+    uint16_t next_vnode_slot;
+    uint16_t next_file_slot;
+    uint16_t next_handle_slot;
 } filed_vfs_t;
 
 typedef struct filed_vfs_open_result {

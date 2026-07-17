@@ -13,7 +13,7 @@ static int lpr_fd_table_lock_enabled(const lpr_fd_table_t *table)
 {
     return table != 0 &&
         table->lock.thread_count != 0 &&
-        __atomic_load_n(table->lock.thread_count, __ATOMIC_RELAXED) > 1u;
+        __atomic_load_n(table->lock.thread_count, __ATOMIC_ACQUIRE) > 1u;
 }
 
 void lpr_fd_table_configure_lock(
@@ -36,32 +36,24 @@ void lpr_fd_table_lock(lpr_fd_table_t *table)
     if (!lpr_fd_table_lock_enabled(table)) {
         return;
     }
-    for (;;) {
-        uint32_t expected = 0;
-        if (__atomic_compare_exchange_n(
-                &table->lock.word,
-                &expected,
-                1u,
-                0,
-                __ATOMIC_ACQUIRE,
-                __ATOMIC_RELAXED))
-        {
-            return;
-        }
+    if (__atomic_exchange_n(&table->lock.word, 1u, __ATOMIC_ACQUIRE) == 0u) {
+        return;
+    }
+    while (__atomic_exchange_n(&table->lock.word, 2u, __ATOMIC_ACQUIRE) != 0u) {
         if (table->lock.futex_wait != 0) {
-            table->lock.futex_wait(&table->lock.word, 1u);
+            table->lock.futex_wait(&table->lock.word, 2u);
         }
     }
 }
 
 void lpr_fd_table_unlock(lpr_fd_table_t *table)
 {
-    if (table == 0 ||
-        __atomic_exchange_n(&table->lock.word, 0u, __ATOMIC_RELEASE) == 0u)
-    {
+    if (table == 0) {
         return;
     }
-    if (table->lock.futex_wake != 0) {
+    if (__atomic_exchange_n(&table->lock.word, 0u, __ATOMIC_RELEASE) == 2u &&
+        table->lock.futex_wake != 0)
+    {
         table->lock.futex_wake(&table->lock.word, 1u);
     }
 }
