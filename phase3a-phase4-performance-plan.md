@@ -173,6 +173,8 @@ CPUごと256 entity固定配列、runqueue全copy、global scheduler lockをrunt
 - pending wakeがあるCPUへ重複IPIを送らない。
 - llvmpipe workerが4 CPUで同時進行していることを測定する。
 
+完了記録: LAPICをper-CPU one-shotへ切り替え、BSPの1 ms timekeepingだけをsoftware rearmし、idle APではtimerを停止した。4 ms slice満了時もeligibleな競合がなければrunning ownershipを維持し、park/reinsert/context copyを行わない。wakeはlast CPUを優先し、runqueue差が1を超えた時だけCPU番号順dual lockで移す。旧CPUがblock tailを実行中のgenerationは移動せず、同時実行を防ぐ。idle APは最大8 nodeのbounded scanで最も混雑したcompatible runqueueから一つstealし、wake IPIはpending edgeを集約する。fresh 4 CPU direct Sway＋5秒animationは正常終了し、Step 0の4.087 FPS / frame p99 245 msから11.001 FPS / 95 msへ改善、maxは100 msだった。inputはp99 85 ms / max 120 msでStep 0より改善したが目標未達のためPhase 3/4へ残す。QMPが返す4本のvCPU thread-idを50 ms窓で76 sample採取し、最大同時進行4、union 4、CPU別progress 284/389/384/419 tickを確認した。hot path traceや性能専用kernel ABIは追加せず、QEMUは停止した。
+
 ## 9. Step 6 — physical allocator
 
 allocator lock waitとfault時間がredであることを確認してから変更する。

@@ -168,6 +168,11 @@ func (client *qmpClient) readResponse() (map[string]json.RawMessage, error) {
 }
 
 func (client *qmpClient) execute(name string, arguments map[string]any) error {
+	_, err := client.executeRaw(name, arguments)
+	return err
+}
+
+func (client *qmpClient) executeRaw(name string, arguments map[string]any) (json.RawMessage, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	request := map[string]any{"execute": name}
@@ -176,24 +181,42 @@ func (client *qmpClient) execute(name string, arguments map[string]any) error {
 	}
 	encoded, err := json.Marshal(request)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	encoded = append(encoded, '\n')
 	_ = client.conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := client.conn.Write(encoded); err != nil {
-		return err
+		return nil, err
 	}
 	response, err := client.readResponse()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if raw, failed := response["error"]; failed {
-		return fmt.Errorf("QMP %s failed: %s", name, raw)
+		return nil, fmt.Errorf("QMP %s failed: %s", name, raw)
 	}
-	if _, ok := response["return"]; !ok {
-		return fmt.Errorf("QMP %s returned no result", name)
+	result, ok := response["return"]
+	if !ok {
+		return nil, fmt.Errorf("QMP %s returned no result", name)
 	}
-	return nil
+	return result, nil
+}
+
+type qmpCPUThread struct {
+	CPUIndex int `json:"cpu-index"`
+	ThreadID int `json:"thread-id"`
+}
+
+func (client *qmpClient) queryCPUThreads() ([]qmpCPUThread, error) {
+	raw, err := client.executeRaw("query-cpus-fast", nil)
+	if err != nil {
+		return nil, err
+	}
+	var threads []qmpCPUThread
+	if err := json.Unmarshal(raw, &threads); err != nil {
+		return nil, fmt.Errorf("decode QMP CPU threads: %w", err)
+	}
+	return threads, nil
 }
 
 func (client *qmpClient) inputSendEvent(event inputSendEvent) error {

@@ -146,6 +146,27 @@ pub const Tree = struct {
         return if (self.root) |root| root.subtree_min_vruntime else null;
     }
 
+    pub fn firstByDeadline(self: *const Tree) ?*Node {
+        var cursor = self.root orelse return null;
+        while (cursor.left) |left| cursor = left;
+        return cursor;
+    }
+
+    pub fn nextByDeadline(self: *const Tree, node: *const Node) ?*Node {
+        if (!self.contains(node)) return null;
+        if (node.right) |right| {
+            var cursor = right;
+            while (cursor.left) |left| cursor = left;
+            return cursor;
+        }
+        var cursor = node;
+        while (cursor.parent) |parent| {
+            if (parent.left == cursor) return parent;
+            cursor = parent;
+        }
+        return null;
+    }
+
     pub fn contains(self: *const Tree, node: *const Node) bool {
         return node.linked_tree == self;
     }
@@ -303,6 +324,8 @@ test "intrusive tree picks eligible deadline and unlinks without allocation" {
         try std.testing.expect(tree.insert(node));
     }
     try std.testing.expectEqual(@as(i64, 20), tree.bestEligible(0).?.entity.deadline);
+    try std.testing.expectEqual(@as(i64, 20), tree.firstByDeadline().?.entity.deadline);
+    try std.testing.expectEqual(@as(i64, 30), tree.nextByDeadline(&nodes[3]).?.entity.deadline);
     try std.testing.expect(tree.validate(0));
     try std.testing.expect(tree.remove(&nodes[3]));
     try std.testing.expectEqual(@as(i64, 30), tree.bestEligible(0).?.entity.deadline);

@@ -587,6 +587,17 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 				return result, err
 			}
 			defer qmp.Close()
+			if cpuThreads, queryErr := qmp.queryCPUThreads(); queryErr == nil {
+				var inventory strings.Builder
+				for _, cpu := range cpuThreads {
+					_, _ = fmt.Fprintf(&inventory, "%d\t%d\n", cpu.CPUIndex, cpu.ThreadID)
+				}
+				_ = os.WriteFile(
+					workspace.Path(workspace.Artifacts, "qemu-tty-vcpus.tsv"),
+					[]byte(inventory.String()),
+					0o644,
+				)
+			}
 		}
 	}
 

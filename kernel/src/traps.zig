@@ -729,23 +729,30 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             if (!scheduler.apUserThreadCanContinue()) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
-            if (scheduler.preemptApUserThread(boot_static.scheduler_quantum_ticks, frame)) {
-                smp.returnCurrentApToIdleFromInterrupt();
+            switch (scheduler.preemptApUserThread(boot_static.scheduler_slice_ticks, frame)) {
+                .continue_running => {},
+                .preempt, .invalid => smp.returnCurrentApToIdleFromInterrupt(),
             }
             stagePendingSignalForUserReturn(frame);
+            _ = lapic.armTimer(boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
             return;
         }
         // AP timer interrupts can arrive while a user thread is executing a
         // syscall or another kernel path. That CPU is not idle; keep its
         // current thread/cr3 intact and return to the interrupted kernel frame.
+        scheduler.deferApUserSlice(boot_static.scheduler_slice_ticks);
+        _ = lapic.armTimer(boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
         return;
     }
+    // BSP owns the 1 ms monotonic/timeouts clock.  Software rearming keeps
+    // that ABI while avoiding periodic timers on idle APs.
+    _ = lapic.armTimer(boot_static.lapic_timer_initial_count);
     scheduler.lapic_tick_count +%= 1;
     if (!kernel_runtime.kernel_state_ready) return;
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
     if (!user_mode) return;
-    if (boot_static.scheduler_quantum_ticks != 0) {
-        _ = scheduler.preemptBootstrapThread(boot_static.scheduler_quantum_ticks, frame);
+    if (boot_static.scheduler_slice_ticks != 0) {
+        _ = scheduler.preemptBootstrapThread(boot_static.scheduler_slice_ticks, frame);
     }
     stagePendingSignalForUserReturn(frame);
 }
@@ -770,6 +777,7 @@ pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winap
     _ = frame;
     user_copy.acknowledgePendingTlbShootdown();
     lapic.eoi();
+    smp.acknowledgeWakeIpi();
 }
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {

@@ -740,7 +740,10 @@ pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
         halt.haltWithMessage("SMP boot information invalid");
     };
     smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
-    smp.configureApUserTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count);
+    smp.configureApUserTimer(
+        boot_static.lapic_timer_vector,
+        boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
+    );
     smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
     if (!smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value)) {
         halt.haltWithMessage("SMP application processor startup failed");

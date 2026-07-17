@@ -100,10 +100,24 @@ pub fn initTimer(timer_vector: u8, initial_count: u32) bool {
 
     mmioWrite(lapic_reg_svr, 0x100 | 0xFF); // software enable LAPIC
     mmioWrite(lapic_reg_divide_config, 0x3); // divide by 16
-    mmioWrite(lapic_reg_lvt_timer, (@as(u32, timer_vector) & 0xFF) | (1 << 17)); // periodic mode
+    // Keep the LAPIC timer in one-shot mode.  The BSP rearms its 1 ms
+    // timekeeping deadline in the interrupt handler, while APs arm only when
+    // they actually enter a user thread.
+    mmioWrite(lapic_reg_lvt_timer, @as(u32, timer_vector) & 0xFF);
     mmioWrite(lapic_reg_initial_count, initial_count);
     mmioWrite(lapic_reg_eoi, 0);
     return true;
+}
+
+pub fn armTimer(initial_count: u32) bool {
+    if (lapic_base_pa == 0 or initial_count == 0) return false;
+    mmioWrite(lapic_reg_initial_count, initial_count);
+    return true;
+}
+
+pub fn disarmTimer() void {
+    if (lapic_base_pa == 0) return;
+    mmioWrite(lapic_reg_initial_count, 0);
 }
 
 pub fn enableLocalApic() bool {

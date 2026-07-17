@@ -40,6 +40,8 @@ var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
 var wake_ipi_vector: u8 = 0;
+var wake_ipi_pending: [max_cpus]u8 = [_]u8{0} ** max_cpus;
+var wake_ipi_sequence: [max_cpus]u64 = [_]u64{0} ** max_cpus;
 
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
 
@@ -60,6 +62,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_vector), &ap_user_timer_vector));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_vector), &wake_ipi_vector));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_pending), &wake_ipi_pending));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_sequence), &wake_ipi_sequence));
     return end;
 }
 
@@ -526,13 +530,40 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
 
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {
     const cpu_slot = currentCpuSlot();
+    lapic.disarmTimer();
     x86_platform.writeCr3(x86_platform.kernel_cr3_value);
     setCpuState(cpu_slot, .idle);
     apIdleLoop(cpu_slot);
 }
 
 pub fn wakeCpu(cpu_slot: usize) bool {
-    return interruptCpu(cpu_slot);
+    if (cpu_slot == currentCpuSlot()) return true;
+    if (cpu_slot >= wake_ipi_pending.len) return false;
+    const sequence = @atomicRmw(u64, &wake_ipi_sequence[cpu_slot], .Add, 1, .acq_rel) +% 1;
+    if (@cmpxchgStrong(u8, &wake_ipi_pending[cpu_slot], 0, 1, .acq_rel, .acquire) != null) {
+        return true;
+    }
+    var attempts: usize = 0;
+    while (attempts < 3) : (attempts += 1) {
+        if (interruptCpu(cpu_slot)) return true;
+        @atomicStore(u8, &wake_ipi_pending[cpu_slot], 0, .release);
+        // A coalesced caller observed pending=1 and relied on this sender.  If
+        // that happened, reacquire ownership and retry instead of silently
+        // dropping its edge after a transient APIC send failure.
+        if (@atomicLoad(u64, &wake_ipi_sequence[cpu_slot], .acquire) == sequence) break;
+        if (@cmpxchgStrong(u8, &wake_ipi_pending[cpu_slot], 0, 1, .acq_rel, .acquire) != null) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// A wake vector is an edge only until the target reaches this safe point.
+/// Maintenance sends remain uncoalesced through interruptCpu().
+pub fn acknowledgeWakeIpi() void {
+    const cpu_slot = currentCpuSlot();
+    if (cpu_slot >= wake_ipi_pending.len) return;
+    @atomicStore(u8, &wake_ipi_pending[cpu_slot], 0, .release);
 }
 
 /// Deliver the scheduler/wake vector to any online CPU, including the BSP.
@@ -547,6 +578,7 @@ pub fn interruptCpu(cpu_slot: usize) bool {
 }
 
 fn apIdleLoop(cpu_slot: usize) noreturn {
+    lapic.disarmTimer();
     while (true) {
         scheduler_observer.observeIdle(cpu_slot);
         scheduler_observer.pollIdleScheduler(cpu_slot);
