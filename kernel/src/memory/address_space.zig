@@ -1,3 +1,9 @@
+pub const AddressSpaceLockState = struct {
+    value: u8 = 0,
+    owner_cpu: usize = ~@as(usize, 0),
+    depth: u32 = 0,
+};
+
 pub const UserAddressSpace = struct {
     // Includes user VA mappings plus supervisor-only helper PTs for return stacks.
     pub const max_dynamic_pdp_pages: usize = 64;
@@ -40,4 +46,8 @@ pub const UserAddressSpace = struct {
     reservation_generation: u32 = 0,
     next_dynamic_map_page: u64 = 0,
     cr3: u64 = 0,
+    // This object is address-stable: its page tables contain physical
+    // pointers to the inline arrays above.  Keep the lock with that lifetime
+    // and never reset or copy it as address-space contents are recycled.
+    lock_state: AddressSpaceLockState = .{},
 };

@@ -470,11 +470,11 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 
     _ = scheduler.releasePrincipalThreads(principal);
 
-    user_vm.lockAddressSpaces();
+    if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
-    user_vm.unlockAddressSpaces();
+    user_vm.unlockVmTransaction(principal);
     wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
@@ -512,14 +512,14 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     _ = scheduler.releasePrincipalThreads(principal);
     const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
-    user_vm.lockAddressSpaces();
+    if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     const metric_after_clear_as = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     const metric_after_release_mem = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
-    user_vm.unlockAddressSpaces();
+    user_vm.unlockVmTransaction(principal);
     wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
     const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;

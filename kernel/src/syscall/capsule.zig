@@ -128,8 +128,8 @@ fn userDmaAddressForRange(
     if (page_count == 0) return null;
     if (page_span > std.math.maxInt(usize)) return null;
 
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockVmTransaction(proc)) return null;
+    defer user_vm.unlockVmTransaction(proc);
 
     const existing_first_paddr = user_vm.lookupUserMappedPaddrForVa(proc, first_page_va);
     if (existing_first_paddr) |first_paddr| {

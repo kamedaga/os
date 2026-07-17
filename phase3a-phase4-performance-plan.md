@@ -203,6 +203,12 @@ page数保存、二重free禁止、制約範囲、contiguous alignmentをinvaria
 - remote ACK待ちは残し、timeoutや全CPU broadcastでcorrectnessを代用しない。
 - address-space lock中のcopy、allocation、remote ACK待ちを可能な限りlock外へ移す。
 
+進捗記録（2026-07-17、lock topology）: 全processを止める単一lockを廃止し、address-stableな`UserAddressSpace`ごとの再帰lockへ切り替えた。単一space操作は対象lockだけ、fork / exec / process-mapはprincipal index順のpair lock、VMO revokeは全spaceを昇順に取得する。fork後に共有されるNativeVmo / NativeCowTableのslot、refcount、backing storeは別のshared VM-object lockで保護し、取得順を`kernel state → address space（昇順）→ shared VM object → PMM`へ固定した。互換APIは残していない。
+
+同じ4 CPU、direct Sway、5秒animation、guest tick 30–40秒で再測定した。PMM lockは18,363 acquisition中contended 1回（0.005%）、wait 9,250 cyclesで、handled faultは2,953回、平均32,845 cycles、最大2,104,412 cyclesだった。10.858 FPS、frame p99 / max 94 / 95 msで完走し、deadlock、`kernel scheduler unavailable`、Broken pipeはなかった。PMMは分割後もredではないためStep 6のbuddy / magazine gateは未成立のままとする。temporary counterは全削除した。
+
+このsubstepでは共有object mutation中のallocation / copyとTLB ACKはまだlock内に残る。次はfaultをsnapshot/pin、lock外prepare、再検証commitへ二相化し、teardownをclosing / epoch / inflight / retireへ分けた後、active CPU maskとTLB generationへ進む。
+
 ## 11. Step 8 — IPC / storage / graphics
 
 Step 0のtimelineで10%以上を占める経路だけを、一つの原因につき一つのcommitで変更する。

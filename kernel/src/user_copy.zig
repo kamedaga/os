@@ -157,16 +157,21 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
         if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
     }
     const h = getHooks();
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockAddressSpace(principal)) return null;
+    defer user_vm.unlockAddressSpace(principal);
     if (write_access) {
-        if (h.state.ensureNativeVmaCowMapping(
-            principal,
-            page_va,
-            true,
-            false,
-            h.free_list,
-        )) |mapping| {
+        const cow_mapping = blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            break :blk h.state.ensureNativeVmaCowMapping(
+                principal,
+                page_va,
+                true,
+                false,
+                h.free_list,
+            );
+        };
+        if (cow_mapping) |mapping| {
             if (mapping.invalidate_size_bytes != 0) {
                 if (mapping.invalidate_size_bytes > std.math.maxInt(usize)) return null;
                 if (!user_vm.invalidatePresentUserLinearRegionPtes(
@@ -193,13 +198,17 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
         }
     }
     if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
-    const mapping = h.state.ensureNativeVmaFaultMapping(
-        principal,
-        page_va,
-        write_access,
-        false,
-        h.free_list,
-    ) orelse return null;
+    const mapping = blk: {
+        user_vm.lockSharedVmObjects();
+        defer user_vm.unlockSharedVmObjects();
+        break :blk h.state.ensureNativeVmaFaultMapping(
+            principal,
+            page_va,
+            write_access,
+            false,
+            h.free_list,
+        );
+    } orelse return null;
     var paddrs = [_]u64{mapping.paddr};
     if (!user_vm.mapLazyUserPaddrsWithProt(
         principal,

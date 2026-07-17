@@ -653,8 +653,8 @@ fn revokeVmoFd(
     fd: kernel.Fd,
     free_list: *kernel.FreePageList,
 ) u64 {
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    user_vm.lockAllVmTransactions();
+    defer user_vm.unlockAllVmTransactions();
     _ = state.revokeVmoFdWithFreeList(proc, fd, free_list, VmoRevokeUnmapper{}) catch |err| switch (err) {
         kernel.KernelError.TableFull => return sc.syscall_err_alloc,
         else => return sc.syscall_err_invalid,
@@ -681,8 +681,8 @@ fn mapVmoFd(
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
     prot.pkey = flags.pkey;
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransaction(proc);
 
     const use_requested_hint =
         requested_va != 0 and
@@ -753,8 +753,8 @@ fn mprotectVmaRange(
     if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
     const prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
 
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransaction(proc);
 
     const start_vma = state.vmaEntryForVaConst(proc, base_va) orelse return sc.syscall_err_invalid;
     if (base_va + aligned_size > start_vma.endVa()) return sc.syscall_err_invalid;
@@ -804,8 +804,8 @@ fn mremapVmaRange(
     if (fixed and !may_move) return sc.syscall_err_invalid;
     if (!fixed and new_va != 0) return sc.syscall_err_invalid;
 
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransaction(proc);
 
     const result = state.mremapRangeWithFreeList(proc, old_va, old_size, new_size, new_va, may_move, fixed, free_list) catch |err| switch (err) {
         kernel.KernelError.OutOfFreePages => return sc.syscall_err_alloc,
@@ -964,8 +964,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_munmap => blk: {
             if (frame.rsi == 0 or (frame.rdi & 0xFFF) != 0) break :blk sc.syscall_err_invalid;
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
-            user_vm.lockAddressSpaces();
-            defer user_vm.unlockAddressSpaces();
+            if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_invalid;
+            defer user_vm.unlockVmTransaction(proc);
             if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) break :blk sc.syscall_err_map;
             state.munmapRangeWithFreeList(proc, frame.rdi, size, h.free_list) catch break :blk sc.syscall_err_map;
             break :blk sc.syscall_ok;

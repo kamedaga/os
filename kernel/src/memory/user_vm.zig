@@ -32,64 +32,148 @@ pub const Hooks = struct {
 
 var hooks: ?Hooks = null;
 
-const AddressSpaceSpinLock = struct {
-    value: u8 = 0,
-    owner_cpu: usize = std.math.maxInt(usize),
-    depth: u32 = 0,
+const AddressSpaceLockState = address_space.AddressSpaceLockState;
 
-    fn interruptsEnabled() bool {
-        var flags: u64 = 0;
-        asm volatile (
-            \\pushfq
-            \\pop %[flags]
-            : [flags] "=r" (flags),
-        );
-        return (flags & (1 << 9)) != 0;
-    }
-
-    fn waitWithInterruptWindow() void {
-        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
-    }
-
-    fn lock(self: *AddressSpaceSpinLock) void {
-        const cpu = scheduler.currentCpu();
-        if (@atomicLoad(u8, &self.value, .acquire) != 0 and self.owner_cpu == cpu) {
-            self.depth +%= 1;
-            return;
-        }
-        while (true) {
-            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
-                self.owner_cpu = cpu;
-                self.depth = 1;
-                return;
-            }
-            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
-                const restore_interrupts = interruptsEnabled();
-                waitWithInterruptWindow();
-                if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
-            }
-        }
-    }
-
-    fn unlock(self: *AddressSpaceSpinLock) void {
-        if (self.depth > 1) {
-            self.depth -= 1;
-            return;
-        }
-        self.owner_cpu = std.math.maxInt(usize);
-        self.depth = 0;
-        @atomicStore(u8, &self.value, 0, .release);
-    }
-};
-
-var address_space_lock: AddressSpaceSpinLock = .{};
-
-pub fn lockAddressSpaces() void {
-    address_space_lock.lock();
+fn interruptsEnabled() bool {
+    var flags: u64 = 0;
+    asm volatile (
+        \\pushfq
+        \\pop %[flags]
+        : [flags] "=r" (flags),
+    );
+    return (flags & (1 << 9)) != 0;
 }
 
-pub fn unlockAddressSpaces() void {
-    address_space_lock.unlock();
+fn waitWithInterruptWindow() void {
+    asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+}
+
+fn lockState(state: *AddressSpaceLockState) void {
+    const cpu = scheduler.currentCpu();
+    if (@atomicLoad(u8, &state.value, .acquire) != 0 and state.owner_cpu == cpu) {
+        state.depth +%= 1;
+        return;
+    }
+    while (true) {
+        if (@cmpxchgWeak(u8, &state.value, 0, 1, .acquire, .monotonic) == null) {
+            state.owner_cpu = cpu;
+            state.depth = 1;
+            return;
+        }
+        while (@atomicLoad(u8, &state.value, .monotonic) != 0) {
+            const restore_interrupts = interruptsEnabled();
+            waitWithInterruptWindow();
+            if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
+        }
+    }
+}
+
+fn unlockState(state: *AddressSpaceLockState) void {
+    if (state.depth > 1) {
+        state.depth -= 1;
+        return;
+    }
+    state.owner_cpu = std.math.maxInt(usize);
+    state.depth = 0;
+    @atomicStore(u8, &state.value, 0, .release);
+}
+
+// VMA tables are address-space local, but NativeVmo and NativeCowTable
+// objects may be shared by forked address spaces.  This lock protects only
+// that shared object metadata; page-table and reservation operations use the
+// lock embedded in the target UserAddressSpace.
+var shared_vm_object_lock: AddressSpaceLockState = .{};
+
+pub fn lockAddressSpace(principal: kernel.PrincipalId) bool {
+    const space = getUserSpace(principal) orelse return false;
+    lockState(&space.lock_state);
+    return true;
+}
+
+pub fn unlockAddressSpace(principal: kernel.PrincipalId) void {
+    const space = getUserSpace(principal) orelse return;
+    unlockState(&space.lock_state);
+}
+
+pub fn lockAddressSpacePair(first: kernel.PrincipalId, second: kernel.PrincipalId) bool {
+    const first_index = processIndex(first) orelse return false;
+    const second_index = processIndex(second) orelse return false;
+    if (first_index == second_index) return lockAddressSpace(first);
+    const low = if (first_index < second_index) first else second;
+    const high = if (first_index < second_index) second else first;
+    if (!lockAddressSpace(low)) return false;
+    if (!lockAddressSpace(high)) {
+        unlockAddressSpace(low);
+        return false;
+    }
+    return true;
+}
+
+pub fn unlockAddressSpacePair(first: kernel.PrincipalId, second: kernel.PrincipalId) void {
+    const first_index = processIndex(first) orelse return;
+    const second_index = processIndex(second) orelse return;
+    if (first_index == second_index) {
+        unlockAddressSpace(first);
+        return;
+    }
+    const low = if (first_index < second_index) first else second;
+    const high = if (first_index < second_index) second else first;
+    unlockAddressSpace(high);
+    unlockAddressSpace(low);
+}
+
+pub fn lockAllAddressSpaces() void {
+    const h = hooks orelse return;
+    for (h.user_spaces) |*space| lockState(&space.lock_state);
+}
+
+pub fn unlockAllAddressSpaces() void {
+    const h = hooks orelse return;
+    var index = h.user_spaces.len;
+    while (index != 0) {
+        index -= 1;
+        unlockState(&h.user_spaces[index].lock_state);
+    }
+}
+
+pub fn lockSharedVmObjects() void {
+    lockState(&shared_vm_object_lock);
+}
+
+pub fn unlockSharedVmObjects() void {
+    unlockState(&shared_vm_object_lock);
+}
+
+pub fn lockVmTransaction(principal: kernel.PrincipalId) bool {
+    if (!lockAddressSpace(principal)) return false;
+    lockSharedVmObjects();
+    return true;
+}
+
+pub fn unlockVmTransaction(principal: kernel.PrincipalId) void {
+    unlockSharedVmObjects();
+    unlockAddressSpace(principal);
+}
+
+pub fn lockVmTransactionPair(first: kernel.PrincipalId, second: kernel.PrincipalId) bool {
+    if (!lockAddressSpacePair(first, second)) return false;
+    lockSharedVmObjects();
+    return true;
+}
+
+pub fn unlockVmTransactionPair(first: kernel.PrincipalId, second: kernel.PrincipalId) void {
+    unlockSharedVmObjects();
+    unlockAddressSpacePair(first, second);
+}
+
+pub fn lockAllVmTransactions() void {
+    lockAllAddressSpaces();
+    lockSharedVmObjects();
+}
+
+pub fn unlockAllVmTransactions() void {
+    unlockSharedVmObjects();
+    unlockAllAddressSpaces();
 }
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
@@ -98,7 +182,7 @@ fn staticStorageEnd(comptime T: type, ptr: *T) usize {
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end = staticStorageEnd(@TypeOf(hooks), &hooks);
-    const lock_end = staticStorageEnd(@TypeOf(address_space_lock), &address_space_lock);
+    const lock_end = staticStorageEnd(@TypeOf(shared_vm_object_lock), &shared_vm_object_lock);
     if (lock_end > end) end = lock_end;
     return end;
 }
@@ -119,8 +203,8 @@ pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
 }
 
 pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return;
+    defer unlockAddressSpace(principal);
     const space = getUserSpace(principal) orelse return;
     resetUserAddressSpaceStorage(space);
 }
@@ -159,8 +243,8 @@ fn userPageIndexForVaWithLowPageZero(h: Hooks, va: u64, allow_low_page_zero: boo
 }
 
 pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return null;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return null;
     const space = getUserSpace(principal) orelse return null;
     const index = userPageIndexForVa(h, va) orelse return null;
@@ -246,8 +330,8 @@ fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
 }
 
 pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.PrincipalId) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpacePair(from, to)) return false;
+    defer unlockAddressSpacePair(from, to);
     const source = getUserSpace(from) orelse return false;
     const dest = getUserSpace(to) orelse return false;
     dest.reservations = source.reservations;
@@ -258,8 +342,8 @@ pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.Pri
 }
 
 pub fn presentUserPagePaddr(principal: kernel.PrincipalId, va: u64) ?u64 {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return null;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return null;
     const space = getUserSpace(principal) orelse return null;
     if ((va & 0xFFF) != 0) return null;
@@ -272,8 +356,8 @@ pub fn presentUserPagePaddr(principal: kernel.PrincipalId, va: u64) ?u64 {
 }
 
 pub fn writeProtectPresentUserPagesForForkCow(principal: kernel.PrincipalId, va_start: u64, size_bytes: u64) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     if ((va_start & 0xFFF) != 0 or (size_bytes & 0xFFF) != 0) return false;
@@ -845,8 +929,8 @@ fn mapUserLinearRegionWithPteFlags(
     prot: kernel.MapProt,
     uncached: bool,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = if (uncached) pteFlagsForUncachedProt(h, prot) orelse return false else pteFlagsForProt(h, prot) orelse return false;
@@ -892,8 +976,8 @@ fn mapTrustedUserPaddrsWithProtInternal(
     reserve_pages: bool,
     allow_low_page_zero: bool,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -976,8 +1060,8 @@ pub fn remapTrustedUserPaddrsWithProt(
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -1013,8 +1097,8 @@ pub fn mapOrRemapTrustedUserPaddrsWithProt(
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -1080,8 +1164,8 @@ pub fn protectUserLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -1114,8 +1198,8 @@ pub fn protectPresentUserLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     const pte_flags = pteFlagsForProt(h, prot) orelse return false;
@@ -1146,8 +1230,8 @@ pub fn unmapUserLinearRegion(
     va_start: u64,
     size_bytes: usize,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     if (size_bytes == 0) return false;
@@ -1205,8 +1289,8 @@ pub fn unmapPresentUserLinearRegion(
     va_start: u64,
     size_bytes: usize,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     if (size_bytes == 0) return false;
@@ -1258,8 +1342,8 @@ pub fn invalidatePresentUserLinearRegionPtes(
     va_start: u64,
     size_bytes: usize,
 ) bool {
-    lockAddressSpaces();
-    defer unlockAddressSpaces();
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
     if (size_bytes == 0) return false;

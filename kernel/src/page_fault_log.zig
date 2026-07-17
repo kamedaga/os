@@ -110,15 +110,19 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
         return;
     }
 
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockAddressSpace(principal)) return;
+    defer user_vm.unlockAddressSpace(principal);
 
-    const vma_mapping = h.state.nativeVmaFaultMapping(
-        principal,
-        fault_page_va,
-        write_access,
-        instruction_fetch,
-    );
+    const vma_mapping = blk: {
+        user_vm.lockSharedVmObjects();
+        defer user_vm.unlockSharedVmObjects();
+        break :blk h.state.nativeVmaFaultMapping(
+            principal,
+            fault_page_va,
+            write_access,
+            instruction_fetch,
+        );
+    };
     h.write("  VMA_LOOKUP=");
     h.write(if (vma_mapping != null) "found(native)\n" else "none(native)\n");
 

@@ -305,11 +305,11 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     state.markProcessObjectsExited(principal, exit_state, exit_code);
     _ = wakeTaskFdWaiters(h, state, principal);
     _ = scheduler.releasePrincipalThreads(principal);
-    user_vm.lockAddressSpaces();
+    if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     state.releasePrincipalNativeMemory(principal, h.free_list);
     state.resetProcessRuntimeTables(process_index);
-    user_vm.unlockAddressSpaces();
+    user_vm.unlockVmTransaction(principal);
     wakeReadyPipeCloseWaiters(h, state, pending_pipe_wakes[0..pending_pipe_wake_count]);
     wakeIpcChannelCloseWaiters(h, state, pending_channel_wakes[0..pending_channel_wake_count]);
     _ = state.unpublishServiceEndpointsForTarget(principal);
@@ -387,13 +387,13 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     const child = state.createProcessDescriptorWithCapacity("fd-process-clone", h.free_list) orelse return sc.syscall_err_alloc;
     var child_active = true;
     defer if (child_active) {
-        if (kernel.processIndexFromPrincipal(child)) |child_index| {
+        if (kernel.processIndexFromPrincipal(child)) |child_index| cleanup: {
+            if (!user_vm.lockVmTransaction(child)) break :cleanup;
+            defer user_vm.unlockVmTransaction(child);
+            user_vm.clearUserAddressSpace(child);
             state.releasePrincipalNativeMemory(child, h.free_list);
             state.resetProcessRuntimeTables(child_index);
         }
-        user_vm.lockAddressSpaces();
-        user_vm.clearUserAddressSpace(child);
-        user_vm.unlockAddressSpaces();
         _ = state.removeProcessDescriptor(child);
     };
 
@@ -403,10 +403,11 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         else => sc.syscall_err_invalid,
     };
     // VMA metadata and the shared native-COW pool form one VM transaction.
-    // Page faults on other CPUs use the same address-space lock.
+    // Pair locking keeps the parent/child page-table handoff atomic while the
+    // shared-object lock protects cross-address-space VMO/COW state.
     {
-        user_vm.lockAddressSpaces();
-        defer user_vm.unlockAddressSpaces();
+        if (!user_vm.lockVmTransactionPair(proc, child)) return sc.syscall_err_map;
+        defer user_vm.unlockVmTransactionPair(proc, child);
         state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
             kernel.KernelError.TableFull => sc.syscall_err_alloc,
             else => sc.syscall_err_invalid,
@@ -950,8 +951,8 @@ fn mapIntoProcess(
         kernel_log.write("process.map failed inactive-target\n");
         return sc.syscall_err_invalid;
     }
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockVmTransactionPair(proc, target_owner)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransactionPair(proc, target_owner);
     const installed = installProcessMapLocked(state, proc, free_list, process_fd, target_owner, prepared.request);
     return if (installed.status == sc.syscall_ok) installed.mapped_va else installed.status;
 }
@@ -1002,8 +1003,8 @@ fn mapBatchIntoProcess(
     const target_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (!state.hasActivePrincipal(target_owner)) return sc.syscall_err_invalid;
 
-    user_vm.lockAddressSpaces();
-    defer user_vm.unlockAddressSpaces();
+    if (!user_vm.lockVmTransactionPair(proc, target_owner)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransactionPair(proc, target_owner);
     var mapped_vas: [max_process_map_batch_entries]u64 = undefined;
     var mapped_sizes: [max_process_map_batch_entries]u64 = undefined;
     var mapped_count: usize = 0;
@@ -1051,8 +1052,8 @@ fn execFromStagedProcess(
     ) orelse return sc.syscall_err_invalid;
 
     {
-        user_vm.lockAddressSpaces();
-        defer user_vm.unlockAddressSpaces();
+        if (!user_vm.lockVmTransactionPair(staged_owner, proc)) return sc.syscall_err_map;
+        defer user_vm.unlockVmTransactionPair(staged_owner, proc);
         if (!user_vm.cloneAddressSpaceMetadataForFork(staged_owner, proc)) return sc.syscall_err_map;
         state.replaceVmaTableForExec(proc, staged_owner, h.free_list) catch |err| return switch (err) {
             kernel.KernelError.TableFull => sc.syscall_err_alloc,
