@@ -764,7 +764,7 @@ int lpr_fd_transfer_import_batch(
     uint32_t receive_flags,
     int *out_fds);
 void lpr_fd_transfer_cancel_ticket(const netd_transfer_occurrence_t *item);
-int64_t lpr_backend_read(uint64_t fd, uint64_t buffer, uint64_t count);
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buffer, uint64_t count);
 int64_t lpr_backend_write(uint64_t fd, uint64_t buffer, uint64_t count);
 int64_t lpr_backend_readv(const lpr_fd_pin_t *pin, uint64_t iov, uint64_t count);
 int64_t lpr_backend_writev(uint64_t fd, uint64_t iov, uint64_t count);
@@ -951,7 +951,6 @@ int64_t lpr_pacha_status_to_errno(int64_t status);
 int64_t lpr_pipe_wait(uint64_t fd, uint32_t events, uint64_t min_write_bytes);
 int64_t lpr_process_client_call( uint64_t *request_counter, int64_t (*status_to_errno)(int64_t status), uint32_t op, int page_fd, void *page, uint32_t payload_size, int transfer_fd, uint64_t *out_result);
 int64_t lpr_process_client_call_token( uint64_t *request_counter, int64_t (*status_to_errno)(int64_t status), int (*create_page)(void **out_page), void (*destroy_page)(int fd, void *page), uint32_t op, uint64_t token, int transfer_fd, uint64_t *out_result);
-int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, uint64_t offset);
 int64_t lpr_readv_scratch_vmo(uint64_t requested, int *out_fd, unsigned char **out_map, uint64_t *out_len);
 int64_t lpr_supervisor_call( uint32_t op, int page_fd, void *page, uint32_t payload_size, int transfer_fd, uint64_t *out_result);
 int64_t lpr_supervisor_call_token( uint32_t op, uint64_t token, int transfer_fd, uint64_t *out_result);

@@ -41,7 +41,12 @@ void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status)
 
 void lpr_page_cache_clear(void)
 {
-    lpr_memset(lpr_page_cache, 0, sizeof(lpr_page_cache));
+    for (uint64_t i = 0; i < LPR_FILED_PAGE_CACHE_ENTRIES; i += 1) {
+        lpr_memset(
+            &lpr_page_cache[i],
+            0,
+            offsetof(lpr_filed_page_cache_entry_t, data));
+    }
     lpr_page_cache_clock = 0;
 }
 
@@ -56,4 +61,3 @@ void lpr_page_cache_invalidate_handle(uint64_t handle)
         }
     }
 }
-

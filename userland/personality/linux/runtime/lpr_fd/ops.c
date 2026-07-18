@@ -564,7 +564,7 @@ static int64_t lpr_fd_dispatch_direct(
         }
     }
     switch (operation) {
-    case 0: return lpr_backend_read(pin->fd, arg0, arg1);
+    case 0: return lpr_backend_read(pin, arg0, arg1);
     case 1: return lpr_backend_write(pin->fd, arg0, arg1);
     case 2: return lpr_backend_readv(pin, arg0, arg1);
     case 3: return lpr_backend_writev(pin->fd, arg0, arg1);

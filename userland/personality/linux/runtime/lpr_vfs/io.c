@@ -1,10 +1,12 @@
 #include "../lpr_filed_internal.h"
 
-int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+static int64_t lpr_filed_io_handle(
+    uint32_t op,
+    uint64_t handle,
+    uint64_t buf,
+    uint64_t count,
+    uint64_t offset)
 {
-    if (!lpr_fd_is_filed(fd)) {
-        return -LPR_LINUX_EBADF;
-    }
     if (buf == 0 && count != 0) {
         return -LPR_LINUX_EFAULT;
     }
@@ -15,7 +17,7 @@ int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uin
     }
     filed_io_t *io = (filed_io_t *)page;
     lpr_memset(io, 0, sizeof(*io));
-    io->handle = lpr_filed_backend(fd)->handle;
+    io->handle = handle;
     io->offset = offset;
     io->length = count > FILED_IO_BYTES ? FILED_IO_BYTES : count;
     if (op == FILED_OP_VFS_WRITE && io->length != 0) {
@@ -33,7 +35,21 @@ int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uin
     return status == 0 ? (int64_t)result : status;
 }
 
-static int64_t lpr_filed_io_chunked(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+{
+    const lpr_filed_backend_t *file = lpr_filed_backend(fd);
+    if (file == 0) {
+        return -LPR_LINUX_EBADF;
+    }
+    return lpr_filed_io_handle(op, file->handle, buf, count, offset);
+}
+
+static int64_t lpr_filed_io_chunked(
+    uint32_t op,
+    uint64_t handle,
+    uint64_t buf,
+    uint64_t count,
+    uint64_t offset)
 {
     if (buf == 0 && count != 0) {
         return -LPR_LINUX_EFAULT;
@@ -49,7 +65,8 @@ static int64_t lpr_filed_io_chunked(uint32_t op, uint64_t fd, uint64_t buf, uint
         const uint64_t remaining = count - total;
         const uint64_t chunk = remaining > FILED_IO_BYTES ? FILED_IO_BYTES : remaining;
         const uint64_t chunk_offset = op == FILED_OP_VFS_PREAD ? offset + total : 0;
-        const int64_t n = lpr_filed_io(op, fd, buf + total, chunk, chunk_offset);
+        const int64_t n = lpr_filed_io_handle(
+            op, handle, buf + total, chunk, chunk_offset);
         if (n < 0) {
             return total != 0 ? (int64_t)total : n;
         }
@@ -64,10 +81,13 @@ static int64_t lpr_filed_io_chunked(uint32_t op, uint64_t fd, uint64_t buf, uint
     return (int64_t)total;
 }
 
-static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t offset, uint64_t requested)
+static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
+    const lpr_filed_backend_t *file,
+    uint64_t offset,
+    uint64_t requested)
 {
     if (lpr_shared_file_mapping_active ||
-        !lpr_fd_shadow_offset_eligible(fd) ||
+        (file->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDONLY ||
         requested == 0 ||
         requested > LPR_FILED_PAGE_CACHE_BYTES)
     {
@@ -78,13 +98,13 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
         return 0;
     }
     lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_find_marker(lpr_filed_backend(fd)->handle, page_start);
+        lpr_page_cache_find_marker(file->handle, page_start);
     if (entry == 0) {
         entry = lpr_page_cache_slot();
     }
-    const int64_t n = lpr_filed_io(
+    const int64_t n = lpr_filed_io_handle(
         FILED_OP_VFS_PREAD,
-        fd,
+        file->handle,
         (uint64_t)(uintptr_t)entry->data,
         LPR_FILED_PAGE_CACHE_BYTES,
         page_start);
@@ -93,7 +113,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
     }
     lpr_memset(entry, 0, offsetof(lpr_filed_page_cache_entry_t, data));
     entry->active = 1;
-    entry->handle = lpr_filed_backend(fd)->handle;
+    entry->handle = file->handle;
     entry->page_start = page_start;
     entry->length = (uint64_t)n;
     entry->clock = ++lpr_page_cache_clock;
@@ -105,10 +125,14 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(uint64_t fd, uint64_t o
     return entry;
 }
 
-static lpr_filed_page_cache_entry_t *lpr_page_cache_get(uint64_t fd, uint64_t offset, uint64_t requested, int *out_hit)
+static lpr_filed_page_cache_entry_t *lpr_page_cache_get(
+    const lpr_filed_backend_t *file,
+    uint64_t offset,
+    uint64_t requested,
+    int *out_hit)
 {
     lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_lookup(lpr_filed_backend(fd)->handle, offset, requested);
+        lpr_page_cache_lookup(file->handle, offset, requested);
     if (entry != 0) {
         if (out_hit != 0) {
             *out_hit = 1;
@@ -118,10 +142,14 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_get(uint64_t fd, uint64_t of
     if (out_hit != 0) {
         *out_hit = 0;
     }
-    return lpr_page_cache_fill(fd, offset, requested);
+    return lpr_page_cache_fill(file, offset, requested);
 }
 
-int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, uint64_t offset)
+static int64_t lpr_read_from_page_cache(
+    const lpr_filed_backend_t *file,
+    uint64_t buf,
+    uint64_t requested,
+    uint64_t offset)
 {
     if (requested == 0) {
         return 0;
@@ -132,7 +160,8 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
     const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
     const uint64_t page_offset = offset - page_start;
     if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
-        lpr_filed_page_cache_entry_t *entry = lpr_page_cache_get(fd, offset, requested, 0);
+        lpr_filed_page_cache_entry_t *entry = lpr_page_cache_get(
+            file, offset, requested, 0);
         if (entry == 0) {
             return -1;
         }
@@ -142,9 +171,10 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
 
     const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
     const uint64_t second_len = requested - first_len;
-    lpr_filed_page_cache_entry_t *first = lpr_page_cache_get(fd, offset, first_len, 0);
+    lpr_filed_page_cache_entry_t *first = lpr_page_cache_get(
+        file, offset, first_len, 0);
     lpr_filed_page_cache_entry_t *second =
-        first != 0 ? lpr_page_cache_get(fd, offset + first_len, second_len, 0) : 0;
+        first != 0 ? lpr_page_cache_get(file, offset + first_len, second_len, 0) : 0;
     if (first == 0 || second == 0) {
         return -1;
     }
@@ -154,10 +184,15 @@ int64_t lpr_read_from_page_cache(uint64_t fd, uint64_t buf, uint64_t requested, 
     return (int64_t)requested;
 }
 
-int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
 {
-    if (lpr_linux_device_fd_active(fd)) {
-        const lpr_device_backend_t *device = lpr_device_backend(fd);
+    if (pin == 0 || pin->state == 0) {
+        return -LPR_LINUX_EBADF;
+    }
+    const uint64_t fd = pin->fd;
+    switch (pin->ops_id) {
+    case LPR_FD_OPS_DEVICE: {
+        const lpr_device_backend_t *device = pin->state;
         if ((device->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
             return -LPR_LINUX_EBADF;
         }
@@ -180,26 +215,26 @@ int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
         }
         return 0;
     }
-    if (lpr_linux_input_fd_active(fd)) {
+    case LPR_FD_OPS_INPUT:
         return lpr_input_read_events(fd, buf, count);
-    }
-    if (lpr_linux_drm_fd_active(fd)) {
+    case LPR_FD_OPS_DRM:
         return lpr_drm_read_events(fd, buf, count);
-    }
-    if (lpr_linux_tty_fd_active(fd)) {
+    case LPR_FD_OPS_TTY:
         return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
-    }
-    if (lpr_linux_timerfd_active(fd)) {
-        return lpr_linux_timerfd_read(fd, buf, count);
-    }
-    if (lpr_linux_eventfd_active(fd)) {
+    case LPR_FD_OPS_EVENT: {
+        lpr_event_backend_t *event = pin->state;
+        if (event->subtype == LPR_EVENT_BACKEND_TIMERFD) {
+            return lpr_linux_timerfd_read(fd, buf, count);
+        }
+        if (event->subtype != LPR_EVENT_BACKEND_EVENTFD) {
+            return -LPR_LINUX_EBADF;
+        }
         if (count < sizeof(uint64_t)) {
             return -LPR_LINUX_EINVAL;
         }
         if (buf == 0) {
             return -LPR_LINUX_EFAULT;
         }
-        lpr_event_backend_t *event = lpr_event_backend(fd);
         while (event->counter == 0) {
             if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
                 return -LPR_LINUX_EAGAIN;
@@ -224,9 +259,9 @@ int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
         lpr_event_backend_notify(event);
         return (int64_t)sizeof(uint64_t);
     }
-    if (lpr_pipe_fd_is_active(fd)) {
-        lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
-        if (pipe == 0 || !pipe->readable || pipe->native.raw < 0) {
+    case LPR_FD_OPS_PIPE: {
+        lpr_pipe_backend_t *pipe = pin->state;
+        if (!pipe->readable || pipe->native.raw < 0) {
             return -LPR_LINUX_EBADF;
         }
         if (count == 0) {
@@ -256,45 +291,53 @@ int64_t lpr_backend_read(uint64_t fd, uint64_t buf, uint64_t count)
             }
         }
     }
-    if (lpr_fd_is_filed(fd)) {
+    case LPR_FD_OPS_FILED: {
+        lpr_filed_backend_t *file = pin->state;
+        const int shadow_offset =
+            (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY;
         if (count == 0) {
             return 0;
         }
-        if (lpr_fd_shadow_offset_eligible(fd) &&
-            lpr_filed_backend(fd)->offset_valid &&
+        if (shadow_offset &&
+            file->offset_valid &&
             count <= LPR_FILED_PAGE_CACHE_BYTES)
         {
             const uint64_t offset = lpr_filed_control_offset(fd);
-            const int64_t cached = lpr_read_from_page_cache(fd, buf, count, offset);
+            const int64_t cached = lpr_read_from_page_cache(
+                file, buf, count, offset);
             if (cached >= 0) {
                 lpr_filed_control_advance_offset(fd, offset, (uint64_t)cached);
-                lpr_filed_backend(fd)->pread_active = 1;
+                file->pread_active = 1;
                 return cached;
             }
         }
-        if (lpr_fd_shadow_offset_eligible(fd) &&
-            lpr_filed_backend(fd)->offset_valid &&
-            lpr_filed_backend(fd)->pread_active)
+        if (shadow_offset && file->offset_valid && file->pread_active)
         {
             const uint64_t offset = lpr_filed_control_offset(fd);
             const int64_t n = count > FILED_IO_BYTES ?
-                lpr_filed_io_chunked(FILED_OP_VFS_PREAD, fd, buf, count, offset) :
-                lpr_filed_io(FILED_OP_VFS_PREAD, fd, buf, count, offset);
+                lpr_filed_io_chunked(
+                    FILED_OP_VFS_PREAD, file->handle, buf, count, offset) :
+                lpr_filed_io_handle(
+                    FILED_OP_VFS_PREAD, file->handle, buf, count, offset);
             if (n > 0) {
                 lpr_filed_control_advance_offset(fd, offset, (uint64_t)n);
             }
             return n;
         }
         const int64_t n = count > FILED_IO_BYTES ?
-            lpr_filed_io_chunked(FILED_OP_VFS_READ, fd, buf, count, 0) :
-            lpr_filed_io(FILED_OP_VFS_READ, fd, buf, count, 0);
-        if (n >= 0 && lpr_fd_shadow_offset_eligible(fd)) {
+            lpr_filed_io_chunked(
+                FILED_OP_VFS_READ, file->handle, buf, count, 0) :
+            lpr_filed_io_handle(
+                FILED_OP_VFS_READ, file->handle, buf, count, 0);
+        if (n >= 0 && shadow_offset) {
             const uint64_t old_offset = lpr_filed_control_offset(fd);
             lpr_filed_control_advance_offset(fd, old_offset, (uint64_t)n);
         }
         return n;
     }
-    return -LPR_LINUX_EBADF;
+    default:
+        return -LPR_LINUX_EBADF;
+    }
 }
 
 int64_t lpr_backend_readv(
@@ -356,7 +399,7 @@ int64_t lpr_backend_readv(
         int64_t total = 0;
         const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
         for (uint64_t i = 0; i < iov_count; i += 1) {
-            const int64_t n = lpr_linux_read(fd, iov[i].base, iov[i].len);
+            const int64_t n = lpr_backend_read(pin, iov[i].base, iov[i].len);
             if (n < 0) {
                 return total != 0 ? total : n;
             }
@@ -372,6 +415,7 @@ int64_t lpr_backend_readv(
     default:
         return -LPR_LINUX_EBADF;
     }
+    lpr_filed_backend_t *file = pin->state;
     const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
     uint64_t trace_requested = 0;
     for (uint64_t i = 0; i < iov_count; i += 1) {
@@ -380,8 +424,8 @@ int64_t lpr_backend_readv(
         }
     }
     if (iov_count > 1 &&
-        lpr_fd_shadow_offset_eligible(fd) &&
-        lpr_filed_backend(fd)->offset_valid)
+        (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY &&
+        file->offset_valid)
     {
         uint64_t requested = 0;
         for (uint64_t i = 0; i < iov_count; i += 1) {
@@ -404,7 +448,7 @@ int64_t lpr_backend_readv(
                 if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
                     int cache_hit = 0;
                     lpr_filed_page_cache_entry_t *entry =
-                        lpr_page_cache_get(fd, offset, requested, &cache_hit);
+                        lpr_page_cache_get(file, offset, requested, &cache_hit);
                     if (entry != 0) {
                         if (cache_hit) {
                             lpr_readv_cache_hit++;
@@ -413,7 +457,7 @@ int64_t lpr_backend_readv(
                         }
                         (void)lpr_scatter_iov(iov, iov_count, entry->data + page_offset, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
-                        lpr_filed_backend(fd)->pread_active = 1;
+                        file->pread_active = 1;
                         return (int64_t)requested;
                     }
                 } else {
@@ -423,9 +467,10 @@ int64_t lpr_backend_readv(
                     int first_hit = 0;
                     int second_hit = 0;
                     lpr_filed_page_cache_entry_t *first =
-                        lpr_page_cache_get(fd, offset, first_len, &first_hit);
+                        lpr_page_cache_get(file, offset, first_len, &first_hit);
                     lpr_filed_page_cache_entry_t *second =
-                        first != 0 ? lpr_page_cache_get(fd, offset + first_len, second_len, &second_hit) : 0;
+                        first != 0 ? lpr_page_cache_get(
+                            file, offset + first_len, second_len, &second_hit) : 0;
                     if (first != 0 && second != 0) {
                         uint8_t cache_scratch[LPR_FILED_PAGE_CACHE_BYTES];
                         lpr_memcpy(cache_scratch, first->data + page_offset, (size_t)first_len);
@@ -437,21 +482,26 @@ int64_t lpr_backend_readv(
                         }
                         (void)lpr_scatter_iov(iov, iov_count, cache_scratch, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
-                        lpr_filed_backend(fd)->pread_active = 1;
+                        file->pread_active = 1;
                         return (int64_t)requested;
                     }
                 }
             }
             lpr_readv_cache_fallback++;
             uint8_t scratch[FILED_IO_BYTES];
-            const int64_t n = lpr_filed_io(FILED_OP_VFS_PREAD, fd, (uint64_t)(uintptr_t)scratch, requested, offset);
+            const int64_t n = lpr_filed_io_handle(
+                FILED_OP_VFS_PREAD,
+                file->handle,
+                (uint64_t)(uintptr_t)scratch,
+                requested,
+                offset);
             if (n < 0) {
                 return n;
             }
             const uint64_t got = (uint64_t)n;
             (void)lpr_scatter_iov(iov, iov_count, scratch, got);
             lpr_filed_control_advance_offset(fd, offset, got);
-            lpr_filed_backend(fd)->pread_active = 1;
+            file->pread_active = 1;
             return (int64_t)got;
         }
         if (requested >= LPR_FILED_READV_TO_VMO_MIN && requested <= LPR_FILED_READV_TO_VMO_MAX) {
@@ -473,9 +523,9 @@ int64_t lpr_backend_readv(
                     const uint64_t got = (uint64_t)n;
                     const unsigned char *src = mapped;
                     (void)lpr_scatter_iov(iov, iov_count, src, got);
-                    if (lpr_fd_shadow_offset_eligible(fd)) {
+                    if ((file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) {
                         lpr_filed_control_advance_offset(fd, offset, got);
-                        lpr_filed_backend(fd)->pread_active = 1;
+                        file->pread_active = 1;
                     }
                     lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
                     return (int64_t)got;
@@ -490,13 +540,13 @@ int64_t lpr_backend_readv(
         iov_count,
         trace_requested,
         0,
-        lpr_fd_is_filed(fd) ? lpr_filed_control_offset(fd) : 0);
+        lpr_filed_control_offset(fd));
     int64_t total = 0;
     for (uint64_t i = 0; i < iov_count; i += 1) {
         if (iov[i].len == 0) {
             continue;
         }
-        const int64_t n = lpr_linux_read(fd, iov[i].base, iov[i].len);
+        const int64_t n = lpr_backend_read(pin, iov[i].base, iov[i].len);
         if (n < 0) {
             return total != 0 ? total : n;
         }
@@ -510,10 +560,16 @@ int64_t lpr_backend_readv(
 
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
-    if (count > FILED_IO_BYTES) {
-        return lpr_filed_io_chunked(FILED_OP_VFS_PREAD, fd, buf, count, offset);
+    const lpr_filed_backend_t *file = lpr_filed_backend(fd);
+    if (file == 0) {
+        return -LPR_LINUX_EBADF;
     }
-    return lpr_filed_io(FILED_OP_VFS_PREAD, fd, buf, count, offset);
+    if (count > FILED_IO_BYTES) {
+        return lpr_filed_io_chunked(
+            FILED_OP_VFS_PREAD, file->handle, buf, count, offset);
+    }
+    return lpr_filed_io_handle(
+        FILED_OP_VFS_PREAD, file->handle, buf, count, offset);
 }
 
 int64_t lpr_linux_pread_to_vmo(

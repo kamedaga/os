@@ -328,11 +328,6 @@ filed_page_dispatch_result_t filed_dispatch_pread_page(
             &bytes);
         if (reply_status == 0) {
             io->length = bytes;
-            filed_runtime_publish_generation(
-                runtime,
-                (filed_handle_id_t)(uint32_t)io->handle,
-                decision.object_generation,
-                decision.dir_generation);
         }
     }
     return filed_page_result(reply_status, bytes);
@@ -392,13 +387,6 @@ filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
         length,
         &bytes);
     (void)pacha_munmap(mapped, pread_vmo->vmo_offset + length);
-    if (reply_status == 0) {
-        filed_runtime_publish_generation(
-            runtime,
-            (filed_handle_id_t)(uint32_t)pread_vmo->handle,
-            decision.object_generation,
-            decision.dir_generation);
-    }
     return filed_page_result(reply_status, bytes);
 }
 
@@ -822,11 +810,6 @@ filed_page_dispatch_result_t filed_dispatch_read_page(
         if (reply_status == 0) {
             io->offset = decision.offset;
             io->length = bytes;
-            filed_runtime_publish_generation(
-                runtime,
-                (filed_handle_id_t)(uint32_t)io->handle,
-                decision.object_generation,
-                decision.dir_generation);
             status = filed_vfs_read_commit(
                 &runtime->vfs,
                 (filed_handle_id_t)(uint32_t)io->handle,

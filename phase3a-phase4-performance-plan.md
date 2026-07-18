@@ -260,6 +260,10 @@ WSL clang buildとFiled VFS / tmpfs / cache invariant testを通した。最初�
 
 同buildはhost invariant testを通した。4 CPU keyboard+tablet direct Swayは再確認でsocket 18秒、IPC 28秒、分類・正常終了まで通り、対象errorはなかった。直前の一回だけbenchmark shellがIPC ready後にENOMEMとなったが、同一buildで再現せず、lease監査にもcount / lifetime破損はなかったため性能値や原因判定には使わない。QEMUは各回停止した。
 
+追加局所改善（2026-07-18、read / ftruncate）: pin済みread / readvのFD型とFiled backend再探索を除き、read成功時にgenerationを変えず最大32 session × 64 entryを再配布していた走査を削除した。ftruncate後のLPR page cache無効化は約1 MiBのdata zeroから2.5 KiBのmetadata invalidationへ縮小した。
+
+WSL clang build、Filed VFS / tmpfs / cache invariant、4 CPU keyboard+tablet direct Swayを通した。単発はsocket 23秒、IPC 33秒で、直前18 / 28秒より遅くその前23 / 33秒と同じためrun間変動とし、速度改善量・目標値は変更しない。分類・正常終了を確認してQEMUを停止した。
+
 ## 12. Step 9 — Phase 4完了判定
 
 最終確認は長時間batteryにせず、次に限定する。
