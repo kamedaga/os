@@ -193,6 +193,11 @@ apps:
       path: "tests/fixtures/phase4_gui_benchmark.conf"
     out: "P4GUIBEN.CFG"
     rootfs: "/cmd/phase4_gui_benchmark.conf"
+  phase4_gtk_fishbowl_script:
+    file:
+      path: "tests/fixtures/phase4_gtk_fishbowl.sh"
+    out: "P4GTKFSH.SH"
+    rootfs: "/cmd/phase4_gtk_fishbowl.sh"
   phase4_foot_bashrc:
     file:
       path: "tests/fixtures/phase4_foot_bashrc"

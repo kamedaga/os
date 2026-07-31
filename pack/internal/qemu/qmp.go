@@ -86,7 +86,18 @@ type inputSendEvent struct {
 	Code  string
 	Value int
 	Down  bool
+
+	// repeat and interval are parser metadata carried by the first real event.
+	// They are stripped before constructing QMP input-send-event frames.
+	repeat   int
+	interval time.Duration
 }
+
+const (
+	maxInputSendRepeat   = 100_000
+	maxInputSendInterval = 60 * time.Second
+	maxInputSendDuration = 60 * time.Second
+)
 
 type inputSendCheck struct {
 	Marker string
@@ -97,14 +108,46 @@ func parseInputSendCheck(value string) (inputSendCheck, error) {
 	var check inputSendCheck
 	markerAndEvents := strings.SplitN(value, "@", 2)
 	if len(markerAndEvents) != 2 || markerAndEvents[0] == "" || markerAndEvents[1] == "" {
-		return check, fmt.Errorf("invalid input send event %q; expected MARKER@key:a=down,rel:x=4,btn:left=up", value)
+		return check, fmt.Errorf("invalid input send event %q; expected MARKER@[meta:repeat=N,meta:interval-us=N,]key:a=down,rel:x=4,btn:left=up", value)
 	}
 	check.Marker = markerAndEvents[0]
+	repeat := 1
+	var interval time.Duration
+	var repeatSet, intervalSet bool
 	for _, token := range strings.Split(markerAndEvents[1], ",") {
 		nameAndValue := strings.SplitN(token, "=", 2)
 		kindAndCode := strings.SplitN(nameAndValue[0], ":", 2)
 		if len(nameAndValue) != 2 || len(kindAndCode) != 2 || kindAndCode[1] == "" {
 			return inputSendCheck{}, fmt.Errorf("invalid input event %q", token)
+		}
+		if kindAndCode[0] == "meta" {
+			parsed, err := strconv.ParseInt(nameAndValue[1], 10, 64)
+			if err != nil {
+				return inputSendCheck{}, fmt.Errorf("invalid input send metadata %q", token)
+			}
+			switch kindAndCode[1] {
+			case "repeat":
+				if repeatSet {
+					return inputSendCheck{}, fmt.Errorf("duplicate input send metadata %q", kindAndCode[1])
+				}
+				if parsed < 1 || parsed > maxInputSendRepeat {
+					return inputSendCheck{}, fmt.Errorf("input send repeat must be between 1 and %d", maxInputSendRepeat)
+				}
+				repeat = int(parsed)
+				repeatSet = true
+			case "interval-us":
+				if intervalSet {
+					return inputSendCheck{}, fmt.Errorf("duplicate input send metadata %q", kindAndCode[1])
+				}
+				if parsed < 0 || parsed > int64(maxInputSendInterval/time.Microsecond) {
+					return inputSendCheck{}, fmt.Errorf("input send interval-us must be between 0 and %d", maxInputSendInterval/time.Microsecond)
+				}
+				interval = time.Duration(parsed) * time.Microsecond
+				intervalSet = true
+			default:
+				return inputSendCheck{}, fmt.Errorf("unsupported input send metadata %q", kindAndCode[1])
+			}
+			continue
 		}
 		event := inputSendEvent{Kind: kindAndCode[0], Code: kindAndCode[1]}
 		switch event.Kind {
@@ -123,6 +166,19 @@ func parseInputSendCheck(value string) (inputSendCheck, error) {
 			return inputSendCheck{}, fmt.Errorf("unsupported input event kind %q", event.Kind)
 		}
 		check.Events = append(check.Events, event)
+	}
+	if len(check.Events) == 0 {
+		return inputSendCheck{}, fmt.Errorf("input send event %q contains no events", value)
+	}
+	if intervalSet && !repeatSet {
+		return inputSendCheck{}, fmt.Errorf("input send interval-us requires meta:repeat")
+	}
+	if time.Duration(repeat)*interval > maxInputSendDuration {
+		return inputSendCheck{}, fmt.Errorf("input send stream duration must not exceed %s", maxInputSendDuration)
+	}
+	if repeatSet {
+		check.Events[0].repeat = repeat
+		check.Events[0].interval = interval
 	}
 	return check, nil
 }
@@ -219,7 +275,7 @@ func (client *qmpClient) queryCPUThreads() ([]qmpCPUThread, error) {
 	return threads, nil
 }
 
-func (client *qmpClient) inputSendEvents(events []inputSendEvent) error {
+func inputSendEventArguments(events []inputSendEvent) (map[string]any, error) {
 	qmpEvents := make([]any, 0, len(events))
 	for _, event := range events {
 		data := map[string]any{}
@@ -231,11 +287,19 @@ func (client *qmpClient) inputSendEvents(events []inputSendEvent) error {
 		case "rel", "abs":
 			data = map[string]any{"axis": event.Code, "value": event.Value}
 		default:
-			return fmt.Errorf("unsupported input event kind %q", event.Kind)
+			return nil, fmt.Errorf("unsupported input event kind %q", event.Kind)
 		}
 		qmpEvents = append(qmpEvents, map[string]any{"type": event.Kind, "data": data})
 	}
-	return client.execute("input-send-event", map[string]any{"events": qmpEvents})
+	return map[string]any{"events": qmpEvents}, nil
+}
+
+func (client *qmpClient) inputSendEvents(events []inputSendEvent) error {
+	arguments, err := inputSendEventArguments(events)
+	if err != nil {
+		return err
+	}
+	return client.execute("input-send-event", arguments)
 }
 
 func inputSendEventClass(event inputSendEvent) (string, error) {
@@ -266,15 +330,227 @@ func splitInputSendEventFrames(events []inputSendEvent) ([][]inputSendEvent, err
 	return frames, nil
 }
 
-func (client *qmpClient) inputSendEventFrames(events []inputSendEvent) error {
-	frames, err := splitInputSendEventFrames(events)
+func inputSendEventSchedule(events []inputSendEvent) (int, time.Duration, []inputSendEvent, error) {
+	if len(events) == 0 {
+		return 0, 0, nil, fmt.Errorf("input event sequence is empty")
+	}
+	repeat := events[0].repeat
+	interval := events[0].interval
+	if repeat == 0 {
+		repeat = 1
+	}
+	if repeat < 1 || repeat > maxInputSendRepeat {
+		return 0, 0, nil, fmt.Errorf("input send repeat must be between 1 and %d", maxInputSendRepeat)
+	}
+	if interval < 0 || interval > maxInputSendInterval {
+		return 0, 0, nil, fmt.Errorf("input send interval must be between 0 and %s", maxInputSendInterval)
+	}
+	if time.Duration(repeat)*interval > maxInputSendDuration {
+		return 0, 0, nil, fmt.Errorf("input send stream duration must not exceed %s", maxInputSendDuration)
+	}
+	clean := append([]inputSendEvent(nil), events...)
+	for i := range clean {
+		clean[i].repeat = 0
+		clean[i].interval = 0
+	}
+	return repeat, interval, clean, nil
+}
+
+const inputSendStreamWindow = 128
+
+type inputSendStreamResponse struct {
+	message map[string]json.RawMessage
+	err     error
+}
+
+func inputSendDelay(start time.Time, iteration int, interval time.Duration, now time.Time) time.Duration {
+	delay := start.Add(time.Duration(iteration) * interval).Sub(now)
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+func validateInputSendStreamResponse(message map[string]json.RawMessage, pending map[string]struct{}) error {
+	rawID, ok := message["id"]
+	if !ok {
+		return fmt.Errorf("QMP input-send-event response has no id")
+	}
+	var id string
+	if err := json.Unmarshal(rawID, &id); err != nil {
+		return fmt.Errorf("decode QMP input-send-event response id: %w", err)
+	}
+	if _, ok := pending[id]; !ok {
+		return fmt.Errorf("unexpected QMP input-send-event response id %q", id)
+	}
+	delete(pending, id)
+	if raw, failed := message["error"]; failed {
+		return fmt.Errorf("QMP input-send-event failed: %s", raw)
+	}
+	if _, ok := message["return"]; !ok {
+		return fmt.Errorf("QMP input-send-event returned no result")
+	}
+	return nil
+}
+
+func (client *qmpClient) writeInputSendStreamRequest(id string, events []inputSendEvent) error {
+	arguments, err := inputSendEventArguments(events)
 	if err != nil {
 		return err
 	}
-	for _, frame := range frames {
-		if err := client.inputSendEvents(frame); err != nil {
-			return err
+	request := map[string]any{"execute": "input-send-event", "arguments": arguments, "id": id}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	_ = client.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	for len(encoded) != 0 {
+		written, writeErr := client.conn.Write(encoded)
+		if writeErr != nil {
+			return writeErr
 		}
+		if written == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		encoded = encoded[written:]
+	}
+	return nil
+}
+
+func (client *qmpClient) inputSendEventFrames(events []inputSendEvent) error {
+	repeat, interval, cleanEvents, err := inputSendEventSchedule(events)
+	if err != nil {
+		return err
+	}
+	frames, err := splitInputSendEventFrames(cleanEvents)
+	if err != nil {
+		return err
+	}
+	if repeat == 1 {
+		for _, frame := range frames {
+			if err := client.inputSendEvents(frame); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(frames) > int(^uint(0)>>1)/repeat {
+		return fmt.Errorf("too many input-send-event requests")
+	}
+	totalRequests := repeat * len(frames)
+
+	// Keep the normal execute path out of the stream until every response has
+	// been drained. QMP command IDs let the pipelined responses be validated.
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	_ = client.conn.SetDeadline(time.Time{})
+	defer client.conn.SetDeadline(time.Time{})
+
+	responses := make(chan inputSendStreamResponse, inputSendStreamWindow)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for index := 0; index < totalRequests; index++ {
+			_ = client.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			message, readErr := client.readResponse()
+			responses <- inputSendStreamResponse{message: message, err: readErr}
+			if readErr != nil {
+				return
+			}
+		}
+	}()
+
+	pending := make(map[string]struct{}, inputSendStreamWindow)
+	sent := 0
+	received := 0
+	var firstResponseErr error
+	handleResponse := func(response inputSendStreamResponse) error {
+		if response.err != nil {
+			return response.err
+		}
+		received++
+		if responseErr := validateInputSendStreamResponse(response.message, pending); responseErr != nil && firstResponseErr == nil {
+			firstResponseErr = responseErr
+		}
+		return nil
+	}
+	drainAvailable := func() error {
+		for {
+			select {
+			case response := <-responses:
+				if err := handleResponse(response); err != nil {
+					return err
+				}
+			default:
+				return nil
+			}
+		}
+	}
+	abortReader := func() {
+		_ = client.conn.Close()
+		for {
+			select {
+			case <-responses:
+			case <-readerDone:
+				return
+			}
+		}
+	}
+
+	start := time.Now()
+	for iteration := 0; iteration < repeat; iteration++ {
+		if iteration > 0 && interval > 0 {
+			if delay := inputSendDelay(start, iteration, interval, time.Now()); delay > 0 {
+				timer := time.NewTimer(delay)
+			waitForDeadline:
+				for {
+					select {
+					case response := <-responses:
+						if err := handleResponse(response); err != nil {
+							timer.Stop()
+							abortReader()
+							return fmt.Errorf("read QMP input-send-event response: %w", err)
+						}
+					case <-timer.C:
+						break waitForDeadline
+					}
+				}
+			}
+		}
+		if err := drainAvailable(); err != nil {
+			abortReader()
+			return fmt.Errorf("read QMP input-send-event response: %w", err)
+		}
+		for _, frame := range frames {
+			for sent-received >= inputSendStreamWindow {
+				if err := handleResponse(<-responses); err != nil {
+					abortReader()
+					return fmt.Errorf("read QMP input-send-event response: %w", err)
+				}
+			}
+			id := fmt.Sprintf("pacgo-input-stream-%d", sent)
+			pending[id] = struct{}{}
+			if err := client.writeInputSendStreamRequest(id, frame); err != nil {
+				delete(pending, id)
+				abortReader()
+				return fmt.Errorf("write QMP input-send-event request: %w", err)
+			}
+			sent++
+		}
+	}
+	for received < sent {
+		if err := handleResponse(<-responses); err != nil {
+			abortReader()
+			return fmt.Errorf("read QMP input-send-event response: %w", err)
+		}
+	}
+	<-readerDone
+	if firstResponseErr != nil {
+		return firstResponseErr
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("QMP input-send-event left %d responses pending", len(pending))
 	}
 	return nil
 }
