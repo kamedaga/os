@@ -664,9 +664,13 @@ int inputd_input_read(inputd_read_request_t *request)
         handle->cursor = earliest;
     }
     inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
-    for (size_t i = 0; i < event_count; i++) {
+    size_t start = 0;
+    if (handle->cursor > earliest) {
+        const uint64_t consumed = handle->cursor - earliest;
+        start = consumed < event_count ? (size_t)consumed : event_count;
+    }
+    for (size_t i = start; i < event_count; i++) {
         const inputd_raw_event_t *event = &event_ring[(event_head + i) % INPUTD_RING_MAX];
-        if (event->sequence < handle->cursor) continue;
         if (event->device_id != handle->device_id) {
             handle->cursor = event->sequence + 1u;
             continue;
