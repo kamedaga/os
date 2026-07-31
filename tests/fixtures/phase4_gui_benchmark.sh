@@ -6,6 +6,7 @@ runtime=/run/user/0
 config=/cmd/phase4_gui_benchmark.conf
 wait_limit=1200
 process_poll_limit=60
+process_stop_limit=400
 
 wait_tick()
 {
@@ -134,7 +135,7 @@ wait_for_pid_stopped()
 {
     local pid=$1
     local ticks=0
-    while [[ $ticks -lt 200 ]]; do
+    while [[ $ticks -lt $process_stop_limit ]]; do
         if pid_has_stopped "$pid"; then
             return 0
         fi
@@ -188,6 +189,49 @@ fi
 if ! wait_for_runtime_clean; then
     fail stale-runtime-at-baseline
     exit 1
+fi
+
+
+if [[ ${P4_SHORT_GUI_ONLY:-0} == 1 ]]; then
+    unset WAYLAND_DISPLAY SWAYSOCK
+    short_start=$(now_ns)
+    printf 'P4_BENCH_SWAY_EXEC phase=short guest_ns=%s path=/usr/bin/sway\n' \
+        "$short_start"
+    /usr/bin/sway -c "$config" &
+    sway_pid=$!
+    if ! wait_for_socket "$sway_pid"; then
+        fail short-socket
+        [[ $wait_socket_sway_exited == 1 ]] || kill -KILL "$sway_pid"
+        exit 1
+    fi
+    socket=$wait_socket
+    wait_for_ipc "$socket" || {
+        fail short-ipc
+        kill -KILL "$sway_pid"
+        exit 1
+    }
+    display=$(wait_for_wayland_display) || {
+        fail short-display
+        kill -KILL "$sway_pid"
+        exit 1
+    }
+    short_ready=$(now_ns)
+    export WAYLAND_DISPLAY=$display
+    export SWAYSOCK=$socket
+    printf 'P4_BENCH_STARTUP phase=short ipc_ms=%s display=%s\n' \
+        "$(elapsed_ms "$short_start" "$short_ready")" "$display"
+    if ! /cmd/lpr_wayland_animation_bench.elf; then
+        fail short-animation
+        stop_sway "$socket" "$sway_pid" || true
+        exit 1
+    fi
+    stop_sway "$socket" "$sway_pid" || {
+        fail short-stop
+        exit 1
+    }
+    printf 'P4_BENCH_PASS mode=short direct_sway=1 animation=1 cleanup=1 mouse_stress=%s\n' \
+        "${P4_MOUSE_STRESS:-0}"
+    exit 0
 fi
 
 if [[ ${P3A_INPUT_ONLY:-0} == 1 ]]; then
@@ -297,11 +341,35 @@ done
 [[ -e $foot_pty_ack ]] || { fail foot-pty-input; exit 1; }
 printf 'P4_BENCH_APP app=foot map_ms=%s pty_input=1 resize=1\n' \
     "$(elapsed_ms "$foot_start" "$foot_map")"
-/usr/bin/swaymsg -s "$socket" "[pid=\"$foot_pid\"] kill" >/dev/null 2>&1 || true
+foot_kill_start=$(now_ns)
+foot_kill_output=
+if ! foot_kill_output=$(
+    /usr/bin/swaymsg -s "$socket" "[pid=\"$foot_pid\"] kill" 2>&1
+); then
+    printf 'P4_BENCH_FOOT_KILL status=failed output=%q\n' "$foot_kill_output"
+    fail foot-kill-ipc
+    exit 1
+fi
+printf 'P4_BENCH_FOOT_KILL status=ok output=%q\n' "$foot_kill_output"
 wait_for_pid_stopped "$foot_pid" || { fail foot-exit; exit 1; }
 wait "$foot_pid" 2>/dev/null || true
+foot_exit=$(now_ns)
 /bin/rm -f "$foot_pty_ack"
-printf 'P4_BENCH_APP_EXIT app=foot\n'
+printf 'P4_BENCH_APP_EXIT app=foot close_ms=%s\n' \
+    "$(elapsed_ms "$foot_kill_start" "$foot_exit")"
+
+if [[ ${P4_FOOT_ONLY:-0} == 1 ]]; then
+    stop_sway "$socket" "$sway_pid" || {
+        fail foot-only-sway-exit
+        exit 1
+    }
+    wait_for_runtime_clean || {
+        fail foot-only-runtime-clean
+        exit 1
+    }
+    printf 'P4_BENCH_PASS mode=foot-only direct_sway=1 foot=1 cleanup=1\n'
+    exit 0
+fi
 
 gtk_start=$(now_ns)
 printf 'P4_BENCH_APP_EXEC app=gtk3-demo\n'

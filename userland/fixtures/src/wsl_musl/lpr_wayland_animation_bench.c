@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -13,6 +14,7 @@
 #include "xdg-shell-client-protocol.h"
 
 #define SAMPLE_CAPACITY 2048u
+#define INPUT_SAMPLE_CAPACITY 32u
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shm;
@@ -35,7 +37,13 @@ static int motion_seen;
 static int button_down;
 static int button_up;
 static uint32_t presentation_clock_id;
-static uint64_t input_samples_ms[16];
+struct input_sample {
+    uint32_t event_time_ms;
+    uint64_t receive_ns;
+};
+
+static uint64_t input_samples_ms[INPUT_SAMPLE_CAPACITY];
+static struct input_sample input_samples[INPUT_SAMPLE_CAPACITY];
 static size_t input_sample_count;
 
 static uint64_t monotonic_ns(void)
@@ -43,6 +51,31 @@ static uint64_t monotonic_ns(void)
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static pid_t start_input_stress_markers(void)
+{
+    const char *enabled = getenv("P4_MOUSE_STRESS");
+    if (enabled == NULL || strcmp(enabled, "1") != 0) return -1;
+    const pid_t pid = fork();
+    if (pid != 0) return pid;
+
+    uint64_t deadline_ns = monotonic_ns() + 50000000ull;
+    for (unsigned step = 1; step <= 60; step++, deadline_ns += 50000000ull) {
+        const struct timespec deadline = {
+            .tv_sec = (time_t)(deadline_ns / 1000000000ull),
+            .tv_nsec = (long)(deadline_ns % 1000000000ull),
+        };
+        int status;
+        do {
+            status = clock_nanosleep(
+                CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+        } while (status == EINTR);
+        if (status != 0 ||
+            dprintf(STDOUT_FILENO, "P4_MOUSE_STEP_%u\n", step) < 0)
+            _Exit(1);
+    }
+    _Exit(0);
 }
 
 static int compare_u64(const void *left, const void *right)
@@ -64,9 +97,14 @@ static uint64_t percentile(const uint64_t *samples, size_t count, unsigned perce
 
 static void record_input_latency(uint32_t event_time_ms)
 {
-    if (!input_ready || input_sample_count >= 16u) return;
-    const uint32_t now_ms = (uint32_t)(monotonic_ns() / 1000000ull);
+    if (!input_ready || input_sample_count >= INPUT_SAMPLE_CAPACITY) return;
+    const uint64_t receive_ns = monotonic_ns();
+    const uint32_t now_ms = (uint32_t)(receive_ns / 1000000ull);
     input_samples_ms[input_sample_count++] = (uint32_t)(now_ms - event_time_ms);
+    input_samples[input_sample_count - 1u] = (struct input_sample){
+        .event_time_ms = event_time_ms,
+        .receive_ns = receive_ns,
+    };
 }
 
 static void maybe_input_ready(void)
@@ -89,6 +127,18 @@ static void maybe_input_done(void)
         (unsigned long long)percentile(input_samples_ms, input_sample_count, 50),
         (unsigned long long)percentile(input_samples_ms, input_sample_count, 99),
         (unsigned long long)percentile(input_samples_ms, input_sample_count, 100));
+    fflush(stdout);
+}
+
+static void print_input_breakdown(void)
+{
+    for (size_t i = 0; i < input_sample_count; i++) {
+        printf(
+            "P4_BENCH_INPUT_EVENT time_ms=%u receive_ns=%llu\n",
+            input_samples[i].event_time_ms,
+            (unsigned long long)input_samples[i].receive_ns);
+    }
+    printf("P4_BENCH_INPUT_BOUNDARY press_to_irq=unobserved start=irq-ready-monotonic\n");
     fflush(stdout);
 }
 
@@ -296,10 +346,12 @@ static void pointer_enter(void *data, struct wl_pointer *object,
                           wl_fixed_t x, wl_fixed_t y)
 {
     (void)data;
-    (void)object;
-    (void)serial;
     (void)x;
     (void)y;
+    const char *hide_cursor = getenv("P4_HIDE_CURSOR");
+    if (hide_cursor != NULL && strcmp(hide_cursor, "1") == 0) {
+        wl_pointer_set_cursor(object, serial, NULL, 0, 0);
+    }
     pointer_focus = entered == surface;
     maybe_input_ready();
 }
@@ -419,8 +471,9 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name,
 };
 
-struct feedback_state {
-    int done;
+struct frame_sample {
+    int callback_done;
+    int feedback_done;
     int presented;
     uint64_t timestamp_ns;
 };
@@ -443,17 +496,17 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *obje
     (void)seq_hi;
     (void)seq_lo;
     (void)flags;
-    struct feedback_state *state = data;
+    struct frame_sample *state = data;
     state->timestamp_ns = (((uint64_t)tv_sec_hi << 32) | tv_sec_lo) * 1000000000ull + tv_nsec;
     state->presented = 1;
-    state->done = 1;
+    state->feedback_done = 1;
     wp_presentation_feedback_destroy(object);
 }
 
 static void feedback_discarded(void *data, struct wp_presentation_feedback *object)
 {
-    struct feedback_state *state = data;
-    state->done = 1;
+    struct frame_sample *state = data;
+    state->feedback_done = 1;
     wp_presentation_feedback_destroy(object);
 }
 
@@ -467,13 +520,26 @@ static int callback_done;
 
 static void frame_complete(void *data, struct wl_callback *callback, uint32_t time)
 {
-    (void)data;
     (void)time;
-    callback_done = 1;
+    struct frame_sample *sample = data;
+    if (sample != NULL) {
+        sample->callback_done = 1;
+    } else {
+        callback_done = 1;
+    }
     wl_callback_destroy(callback);
 }
 
 static const struct wl_callback_listener frame_listener = {.done = frame_complete};
+
+static void fill_rect(uint32_t *pixels, int stride_pixels,
+                      int x, int y, int width, int height, uint32_t color)
+{
+    for (int row = y; row < y + height; ++row) {
+        for (int column = x; column < x + width; ++column)
+            pixels[(size_t)row * (size_t)stride_pixels + (size_t)column] = color;
+    }
+}
 
 int main(void)
 {
@@ -505,6 +571,8 @@ int main(void)
     const int height = 480;
     const int stride = width * 4;
     const size_t bytes = (size_t)stride * height;
+    const char *damage_mode = getenv("P4_ANIMATION_DAMAGE");
+    const int small_damage = damage_mode != NULL && strcmp(damage_mode, "small") == 0;
     int fd = memfd_create("p4-wayland-animation", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, (off_t)(bytes * 2u)) < 0) return 3;
     uint32_t *pixels = mmap(NULL, bytes * 2u, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -532,8 +600,10 @@ int main(void)
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || !configured) return 5;
 
-    for (size_t i = 0; i < bytes / sizeof(*pixels); ++i)
-        buffers[0].pixels[i] = 0xff204060u;
+    for (size_t slot = 0; slot < 2u; ++slot) {
+        for (size_t i = 0; i < bytes / sizeof(*pixels); ++i)
+            buffers[slot].pixels[i] = 0xff204060u;
+    }
     buffers[0].released = 0;
     wl_surface_attach(surface, buffers[0].object, 0, 0);
     wl_surface_damage_buffer(surface, 0, 0, width, height);
@@ -547,54 +617,96 @@ int main(void)
     maybe_input_ready();
     while (!input_done && wl_display_dispatch(display) >= 0) {}
     if (!input_done) return 7;
+    print_input_breakdown();
 
     uint64_t frame_samples_us[SAMPLE_CAPACITY];
     uint64_t present_samples_us[SAMPLE_CAPACITY];
+    struct frame_sample frame_details[SAMPLE_CAPACITY];
+    memset(frame_details, 0, sizeof(frame_details));
     size_t frame_count = 0;
     size_t present_count = 0;
+    size_t frame_detail_count = 0;
     uint64_t previous_frame_ns = 0;
     uint64_t previous_present_ns = 0;
     unsigned discarded = 0;
     const uint64_t start_ns = monotonic_ns();
     const uint64_t deadline_ns = start_ns + 5000000000ull;
     uint64_t frame_index = 1;
+    printf("P4_BENCH_ANIMATION_MODE damage=%s\n", small_damage ? "small" : "full");
+    fflush(stdout);
+    const pid_t stress_pid = start_input_stress_markers();
+    if (stress_pid == 0) return 10;
 
-    while (monotonic_ns() < deadline_ns && frame_count < SAMPLE_CAPACITY) {
+    while (monotonic_ns() < deadline_ns && frame_detail_count < SAMPLE_CAPACITY) {
         struct buffer_slot *slot = &buffers[frame_index % 2u];
         while (!slot->released && wl_display_dispatch(display) >= 0) {}
         if (!slot->released) return 8;
+        struct frame_sample *frame = &frame_details[frame_detail_count];
+        const uint32_t background = 0xff204060u;
         const uint32_t color = (frame_index & 1u) == 0 ? 0xff285078u : 0xff704028u;
-        for (size_t i = 0; i < bytes / sizeof(*pixels); ++i) slot->pixels[i] = color;
+        if (small_damage) {
+            const int rect_size = 64;
+            const int current_x = (int)((frame_index * 37u) % (uint64_t)(width - rect_size));
+            const int current_y = (int)((frame_index * 23u) % (uint64_t)(height - rect_size));
+            if (frame_index >= 3u) {
+                const uint64_t stale_index = frame_index - 2u;
+                const int stale_x = (int)((stale_index * 37u) % (uint64_t)(width - rect_size));
+                const int stale_y = (int)((stale_index * 23u) % (uint64_t)(height - rect_size));
+                fill_rect(slot->pixels, width, stale_x, stale_y,
+                          rect_size, rect_size, background);
+            }
+            fill_rect(slot->pixels, width, current_x, current_y,
+                      rect_size, rect_size, color);
+        } else {
+            for (size_t i = 0; i < bytes / sizeof(*pixels); ++i)
+                slot->pixels[i] = color;
+        }
         slot->released = 0;
         wl_surface_attach(surface, slot->object, 0, 0);
-        wl_surface_damage_buffer(surface, 0, 0, width, height);
-
-        callback_done = 0;
+        if (small_damage) {
+            const int rect_size = 64;
+            if (frame_index >= 2u) {
+                const uint64_t previous_index = frame_index - 1u;
+                wl_surface_damage_buffer(
+                    surface,
+                    (int32_t)((previous_index * 37u) % (uint64_t)(width - rect_size)),
+                    (int32_t)((previous_index * 23u) % (uint64_t)(height - rect_size)),
+                    rect_size, rect_size);
+            }
+            wl_surface_damage_buffer(
+                surface,
+                (int32_t)((frame_index * 37u) % (uint64_t)(width - rect_size)),
+                (int32_t)((frame_index * 23u) % (uint64_t)(height - rect_size)),
+                rect_size, rect_size);
+        } else {
+            wl_surface_damage_buffer(surface, 0, 0, width, height);
+        }
         callback = wl_surface_frame(surface);
-        wl_callback_add_listener(callback, &frame_listener, NULL);
-        struct feedback_state feedback = {0};
+        wl_callback_add_listener(callback, &frame_listener, frame);
         if (presentation != NULL) {
             struct wp_presentation_feedback *object =
                 wp_presentation_feedback(presentation, surface);
-            wp_presentation_feedback_add_listener(object, &feedback_listener, &feedback);
+            wp_presentation_feedback_add_listener(object, &feedback_listener, frame);
         }
         wl_surface_commit(surface);
-        while ((!callback_done || (presentation != NULL && !feedback.done)) &&
+        while ((!frame->callback_done ||
+                (presentation != NULL && !frame->feedback_done)) &&
                wl_display_dispatch(display) >= 0) {}
-        if (!callback_done) return 8;
+        if (!frame->callback_done) return 8;
 
         const uint64_t now_ns = monotonic_ns();
         if (previous_frame_ns != 0)
             frame_samples_us[frame_count++] = (now_ns - previous_frame_ns) / 1000ull;
         previous_frame_ns = now_ns;
-        if (feedback.presented) {
+        if (frame->presented) {
             if (previous_present_ns != 0 && present_count < SAMPLE_CAPACITY)
                 present_samples_us[present_count++] =
-                    (feedback.timestamp_ns - previous_present_ns) / 1000ull;
-            previous_present_ns = feedback.timestamp_ns;
+                    (frame->timestamp_ns - previous_present_ns) / 1000ull;
+            previous_present_ns = frame->timestamp_ns;
         } else if (presentation != NULL) {
             discarded++;
         }
+        frame_detail_count++;
         frame_index++;
     }
 
@@ -616,6 +728,12 @@ int main(void)
     printf("P4_BENCH_ANIMATION_DONE elapsed_ms=%llu\n",
            (unsigned long long)(elapsed_ns / 1000000ull));
     fflush(stdout);
+    if (stress_pid > 0) {
+        int stress_status = 0;
+        if (waitpid(stress_pid, &stress_status, 0) != stress_pid ||
+            !WIFEXITED(stress_status) || WEXITSTATUS(stress_status) != 0)
+            return 10;
+    }
     wl_display_disconnect(display);
     return count == 0 ? 9 : 0;
 }

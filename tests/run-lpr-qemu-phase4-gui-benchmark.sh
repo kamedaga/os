@@ -24,7 +24,7 @@ stop_qemu
 .artifacts/bin/pacgo qemu-test \
   --cpus "$cpus" \
   --timeout "${timeout}s" \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/phase4_gui_benchmark.sh' \
   --expect 'P4_BENCH_STARTUP phase=cold' \
   --expect 'P4_BENCH_APP app=foot' \
