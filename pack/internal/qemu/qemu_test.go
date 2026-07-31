@@ -257,6 +257,28 @@ func TestParseInputSendCheck(t *testing.T) {
 	}
 }
 
+func TestSplitInputSendEventFramesPreservesDeviceFrames(t *testing.T) {
+	events := []inputSendEvent{
+		{Kind: "key", Code: "a", Down: true},
+		{Kind: "key", Code: "a", Down: false},
+		{Kind: "rel", Code: "x", Value: 7},
+		{Kind: "rel", Code: "y", Value: -4},
+		{Kind: "btn", Code: "left", Down: true},
+		{Kind: "btn", Code: "left", Down: false},
+	}
+	frames, err := splitInputSendEventFrames(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 2 || len(frames[0]) != 2 || len(frames[1]) != 4 {
+		t.Fatalf("unexpected input frames: %#v", frames)
+	}
+	if frames[0][0].Kind != "key" || frames[1][0].Kind != "rel" ||
+		frames[1][3].Kind != "btn" {
+		t.Fatalf("input frame order changed: %#v", frames)
+	}
+}
+
 func TestValidatePPMRegion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "surface.ppm")
 	pixels := make([]byte, 4*3*3)

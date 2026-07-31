@@ -219,21 +219,64 @@ func (client *qmpClient) queryCPUThreads() ([]qmpCPUThread, error) {
 	return threads, nil
 }
 
-func (client *qmpClient) inputSendEvent(event inputSendEvent) error {
-	data := map[string]any{}
+func (client *qmpClient) inputSendEvents(events []inputSendEvent) error {
+	qmpEvents := make([]any, 0, len(events))
+	for _, event := range events {
+		data := map[string]any{}
+		switch event.Kind {
+		case "key":
+			data = map[string]any{"down": event.Down, "key": map[string]any{"type": "qcode", "data": event.Code}}
+		case "btn":
+			data = map[string]any{"down": event.Down, "button": event.Code}
+		case "rel", "abs":
+			data = map[string]any{"axis": event.Code, "value": event.Value}
+		default:
+			return fmt.Errorf("unsupported input event kind %q", event.Kind)
+		}
+		qmpEvents = append(qmpEvents, map[string]any{"type": event.Kind, "data": data})
+	}
+	return client.execute("input-send-event", map[string]any{"events": qmpEvents})
+}
+
+func inputSendEventClass(event inputSendEvent) (string, error) {
 	switch event.Kind {
 	case "key":
-		data = map[string]any{"down": event.Down, "key": map[string]any{"type": "qcode", "data": event.Code}}
-	case "btn":
-		data = map[string]any{"down": event.Down, "button": event.Code}
-	case "rel", "abs":
-		data = map[string]any{"axis": event.Code, "value": event.Value}
+		return "keyboard", nil
+	case "btn", "rel", "abs":
+		return "pointer", nil
 	default:
-		return fmt.Errorf("unsupported input event kind %q", event.Kind)
+		return "", fmt.Errorf("unsupported input event kind %q", event.Kind)
 	}
-	return client.execute("input-send-event", map[string]any{
-		"events": []any{map[string]any{"type": event.Kind, "data": data}},
-	})
+}
+
+func splitInputSendEventFrames(events []inputSendEvent) ([][]inputSendEvent, error) {
+	var frames [][]inputSendEvent
+	var currentClass string
+	for _, event := range events {
+		eventClass, err := inputSendEventClass(event)
+		if err != nil {
+			return nil, err
+		}
+		if len(frames) == 0 || eventClass != currentClass {
+			frames = append(frames, nil)
+			currentClass = eventClass
+		}
+		frames[len(frames)-1] = append(frames[len(frames)-1], event)
+	}
+	return frames, nil
+}
+
+func (client *qmpClient) inputSendEventFrames(events []inputSendEvent) error {
+	frames, err := splitInputSendEventFrames(events)
+	if err != nil {
+		return err
+	}
+	for _, frame := range frames {
+		if err := client.inputSendEvents(frame); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (client *qmpClient) screendump(device string, check screendumpCheck) error {

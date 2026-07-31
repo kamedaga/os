@@ -694,10 +694,8 @@ func (client *ttyConsoleClient) RunInputSendChecks(qmp *qmpClient, checks []inpu
 			seen := strings.Contains(client.output.String(), check.Marker)
 			client.outputMu.Unlock()
 			if seen {
-				for _, event := range check.Events {
-					if err := qmp.inputSendEvent(event); err != nil {
-						return fmt.Errorf("input-send-event at %s failed: %w", check.Marker, err)
-					}
+				if err := qmp.inputSendEventFrames(check.Events); err != nil {
+					return fmt.Errorf("input-send-event at %s failed: %w", check.Marker, err)
 				}
 				break
 			}

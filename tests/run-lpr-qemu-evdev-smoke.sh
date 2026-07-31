@@ -23,5 +23,5 @@ sleep 1
   --expect 'EVDEV_EPOLL_PASS repeated_ready=1 min_events=3 drained_ready=0' \
   --input-send-event 'EVDEV_KEY_READY device=event0@key:a=down,key:a=up' \
   --input-send-event 'EVDEV_MOUSE_READY device=event1@rel:x=7,rel:y=-4,btn:left=down,btn:left=up' \
-  --input-send-event 'EVDEV_BACKLOG_READY device=event1 read_capacity=1@rel:x=1,rel:y=1' \
-  --input-send-event 'EVDEV_EPOLL_READY device=event1 read_capacity=1@rel:x=2,rel:y=2'
+  --input-send-event 'EVDEV_BACKLOG_READY device=event1 read_capacity=1@rel:x=1,rel:y=1,btn:left=down,btn:left=up' \
+  --input-send-event 'EVDEV_EPOLL_READY device=event1 read_capacity=1@rel:x=2,rel:y=2,btn:left=down,btn:left=up'

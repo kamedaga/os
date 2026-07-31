@@ -32,7 +32,13 @@ stop_qemu
 # consumed before the measured animation begins.
 input_hooks=(
   --input-send-event
-  'P4_BENCH_INPUT_READY source=wayland-event-time@key:a=down,key:a=up,rel:x=7,rel:y=-4,btn:left=down,btn:left=up'
+  'P4_BENCH_INPUT_READY source=wayland-event-time@key:a=down'
+  --input-send-event
+  'P4_BENCH_INPUT_READY source=wayland-event-time@key:a=up'
+  --input-send-event
+  'P4_BENCH_INPUT_READY source=wayland-event-time@rel:x=7,rel:y=-4,btn:left=down'
+  --input-send-event
+  'P4_BENCH_INPUT_READY source=wayland-event-time@btn:left=up'
 )
 for step in $(seq 1 60); do
   input_hooks+=(
