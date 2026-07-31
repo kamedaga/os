@@ -134,7 +134,12 @@ int64_t lpr_wait_graph_add_fd(
     if (lpr_linux_input_fd_active(fd))
         return lpr_wait_graph_add_leaf(
             graph, lpr_input_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
-            0, LPR_WAIT_DRAIN_NATIVE, (uint32_t)fd);
+            /*
+             * The channel token represents durable unread input state.
+             * Keep it readable across the post-wake poll rescan; the input
+             * read path drains it immediately before asking inputd for data.
+             */
+            0, LPR_WAIT_DRAIN_NONE, (uint32_t)fd);
     if (lpr_linux_sync_file_fd_active(fd))
         return (events & 0x0001u) != 0 ? lpr_wait_graph_add_native(
             graph, lpr_sync_file_native_wait_fd(fd),
