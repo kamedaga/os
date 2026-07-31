@@ -48,6 +48,7 @@ static int prepare_environment(void)
         { "SEATD_SOCK", "/run/user/0/seatd.sock" },
         { "SEATD_VTBOUND", "0" },
         { "WLR_BACKENDS", "drm,libinput" },
+        { "WLR_DRM_DEVICES", "/dev/dri/card0" },
         { "WLR_RENDERER", "gles2" },
         { "WLR_RENDERER_ALLOW_SOFTWARE", "1" },
         { "FONTCONFIG_FILE", "/etc/fonts/fonts.conf" },

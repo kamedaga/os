@@ -19,4 +19,9 @@ sleep 1
   --expect 'EVDEV_EVENT device=event0 type=1 code=30 value=1' \
   --expect 'EVDEV_EVENT device=event1 type=2 code=0 value=7' \
   --expect 'EVDEV_EVENT_PASS key=30:1,0 rel=0:7,1:-4 button=272:1,0' \
-  --input-send-event 'EVDEV_READY keyboard=event0 mouse=event1@key:a=down,key:a=up,rel:x=7,rel:y=-4,btn:left=down,btn:left=up'
+  --expect 'EVDEV_BACKLOG_PASS events=3 reads=3 level_rearm=1' \
+  --expect 'EVDEV_EPOLL_PASS repeated_ready=1 min_events=3 drained_ready=0' \
+  --input-send-event 'EVDEV_KEY_READY device=event0@key:a=down,key:a=up' \
+  --input-send-event 'EVDEV_MOUSE_READY device=event1@rel:x=7,rel:y=-4,btn:left=down,btn:left=up' \
+  --input-send-event 'EVDEV_BACKLOG_READY device=event1 read_capacity=1@rel:x=1,rel:y=1' \
+  --input-send-event 'EVDEV_EPOLL_READY device=event1 read_capacity=1@rel:x=2,rel:y=2'

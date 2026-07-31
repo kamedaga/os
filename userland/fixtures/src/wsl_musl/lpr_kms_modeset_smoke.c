@@ -115,7 +115,7 @@ static int create_buffer(int fd, uint32_t width, uint32_t height, struct buffer 
     if (ioctl(fd, DRM_IOCTL_MODE_CREATE_DUMB, &buffer->dumb) != 0) return fail("CREATE_DUMB");
     struct map_dumb map = { .handle = buffer->dumb.handle };
     if (ioctl(fd, DRM_IOCTL_MODE_MAP_DUMB, &map) != 0) return fail("MAP_DUMB");
-    buffer->pixels = mmap(NULL, buffer->dumb.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, map.offset);
+    buffer->pixels = mmap(NULL, buffer->dumb.size, PROT_WRITE, MAP_SHARED, fd, map.offset);
     if (buffer->pixels == MAP_FAILED) return fail("mmap");
     buffer->fb.width = width;
     buffer->fb.height = height;

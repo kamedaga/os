@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -92,7 +93,11 @@ int main(void)
     if (inspect_device(fds[0], "Keyboard", 1) != 0 ||
         inspect_device(fds[1], "Mouse", 0) != 0) return 1;
 
-    printf("EVDEV_READY keyboard=event0 mouse=event1\n");
+    (void)poll(NULL, 0, 100);
+    printf("EVDEV_KEY_READY device=event0\n");
+    fflush(stdout);
+    (void)poll(NULL, 0, 100);
+    printf("EVDEV_MOUSE_READY device=event1\n");
     fflush(stdout);
     int key_down = 0, key_up = 0, rel_x = 0, rel_y = 0, btn_down = 0, btn_up = 0;
     struct pollfd pollfds[2] = {
@@ -133,13 +138,97 @@ int main(void)
             }
         }
     }
-    close(fds[0]);
-    close(fds[1]);
     if (!(key_down && key_up && rel_x && rel_y && btn_down && btn_up)) {
         fprintf(stderr, "EVDEV_EVENT_FAIL key=%d/%d rel=%d/%d btn=%d/%d\n",
             key_down, key_up, rel_x, rel_y, btn_down, btn_up);
         return 1;
     }
     printf("EVDEV_EVENT_PASS key=30:1,0 rel=0:7,1:-4 button=272:1,0\n");
+
+    (void)poll(NULL, 0, 100);
+    printf("EVDEV_BACKLOG_READY device=event1 read_capacity=1\n");
+    fflush(stdout);
+    unsigned int backlog_events = 0;
+    unsigned int backlog_reads = 0;
+    struct pollfd mouse_poll = {.fd = fds[1], .events = POLLIN};
+    for (unsigned int iteration = 0;
+         iteration < 200 && backlog_events < 3;
+         iteration++) {
+        mouse_poll.revents = 0;
+        const int status = poll(&mouse_poll, 1, 50);
+        if (status < 0) {
+            perror("poll evdev backlog");
+            return 1;
+        }
+        if (status == 0 || (mouse_poll.revents & POLLIN) == 0) continue;
+        struct input_event events[1];
+        const ssize_t bytes = read(fds[1], events, sizeof(events));
+        if (bytes < 0 && errno == EAGAIN) continue;
+        if (bytes < 0 || bytes % (ssize_t)sizeof(events[0]) != 0) {
+            perror("read evdev backlog");
+            return 1;
+        }
+        backlog_events += (unsigned int)((size_t)bytes / sizeof(events[0]));
+        backlog_reads++;
+    }
+    if (backlog_events < 3 || backlog_reads < 3) {
+        fprintf(stderr, "EVDEV_BACKLOG_FAIL events=%u reads=%u\n",
+            backlog_events, backlog_reads);
+        return 1;
+    }
+    printf("EVDEV_BACKLOG_PASS events=%u reads=%u level_rearm=1\n",
+        backlog_events, backlog_reads);
+
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd < 0) {
+        perror("epoll_create1 evdev");
+        return 1;
+    }
+    struct epoll_event interest = {
+        .events = EPOLLIN,
+        .data.fd = fds[1],
+    };
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fds[1], &interest) != 0) {
+        perror("epoll_ctl evdev");
+        return 1;
+    }
+    printf("EVDEV_EPOLL_READY device=event1 read_capacity=1\n");
+    fflush(stdout);
+    struct epoll_event ready[2];
+    int first_ready = epoll_wait(epoll_fd, ready, 2, 10000);
+    int repeated_ready = first_ready > 0 ?
+        epoll_wait(epoll_fd, ready, 2, 0) : 0;
+    unsigned int epoll_events = 0;
+    unsigned int epoll_reads = 0;
+    while (first_ready > 0 && repeated_ready > 0 && epoll_reads < 64) {
+        struct input_event event;
+        const ssize_t bytes = read(fds[1], &event, sizeof(event));
+        if (bytes < 0 && errno == EAGAIN) break;
+        if (bytes != (ssize_t)sizeof(event)) {
+            perror("read evdev epoll");
+            return 1;
+        }
+        epoll_events++;
+        epoll_reads++;
+        const int next_ready = epoll_wait(
+            epoll_fd, ready, 2, epoll_events < 3 ? 10000 : 0);
+        if (next_ready <= 0) break;
+    }
+    const int drained_ready = epoll_wait(epoll_fd, ready, 2, 0);
+    if (first_ready <= 0 || repeated_ready <= 0 ||
+        epoll_events < 3 || epoll_reads < 3 || drained_ready != 0) {
+        fprintf(stderr,
+            "EVDEV_EPOLL_FAIL first=%d repeated=%d events=%u reads=%u drained=%d\n",
+            first_ready, repeated_ready, epoll_events, epoll_reads,
+            drained_ready);
+        return 1;
+    }
+    printf(
+        "EVDEV_EPOLL_PASS repeated_ready=1 min_events=3 drained_ready=0 "
+        "events=%u reads=%u\n",
+        epoll_events, epoll_reads);
+    close(epoll_fd);
+    close(fds[0]);
+    close(fds[1]);
     return 0;
 }

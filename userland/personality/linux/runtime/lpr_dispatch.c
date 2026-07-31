@@ -525,7 +525,7 @@ static uint64_t lpr_linux_prot_to_pacha(uint64_t prot)
         out |= PACHAOS_PROT_READ;
     }
     if ((prot & LPR_LINUX_PROT_WRITE) != 0) {
-        out |= PACHAOS_PROT_WRITE;
+        out |= PACHAOS_PROT_READ | PACHAOS_PROT_WRITE;
     }
     if ((prot & LPR_LINUX_PROT_EXEC) != 0) {
         out |= PACHAOS_PROT_EXEC;
@@ -957,7 +957,24 @@ static int64_t lpr_sys_stat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
 static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0x100); }
 static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
 static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_mmap(a0, a1, a2, a3, a4, a5); }
-static int64_t lpr_sys_mprotect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT, a0, a1, lpr_linux_prot_to_pacha(a2))); }
+static int64_t lpr_sys_mprotect(
+    uint64_t a0,
+    uint64_t a1,
+    uint64_t a2,
+    uint64_t a3,
+    uint64_t a4,
+    uint64_t a5)
+{
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    return lpr_linux_pacha_status_to_errno(
+        lpr_pacha_syscall3(
+            PACHAOS_SYSCALL_MPROTECT,
+            a0,
+            a1,
+            lpr_linux_prot_to_pacha(a2)));
+}
 static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
     const struct lpr_linux_user_frame *frame = lpr_current_linux_user_frame();

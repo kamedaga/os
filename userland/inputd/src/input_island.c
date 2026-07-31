@@ -663,6 +663,7 @@ int inputd_input_read(inputd_read_request_t *request)
         };
         handle->cursor = earliest;
     }
+    inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
     for (size_t i = 0; i < event_count; i++) {
         const inputd_raw_event_t *event = &event_ring[(event_head + i) % INPUTD_RING_MAX];
         if (event->sequence < handle->cursor) continue;
@@ -674,13 +675,14 @@ int inputd_input_read(inputd_read_request_t *request)
         copy_event_time(handle, event, &request->events[request->event_count++]);
         handle->cursor = event->sequence + 1u;
     }
-    inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
     handle->readable = entry != NULL && entry->latest_sequence >= handle->cursor;
     if (request->event_count == 0) {
         handle->readable = 0;
         return -11;
     }
     handle->notify_pending = 0;
+    if (handle->readable)
+        notify_ready_mask |= UINT32_C(1) << handle_slot(handle);
     return 0;
 }
 
