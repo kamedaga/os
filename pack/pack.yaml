@@ -829,6 +829,15 @@ apps:
         - "userland/fixtures/linux/lpr_pty_probe.c"
     out: "LPRPTY.ELF"
     rootfs: "/cmd/lpr_pty_probe.elf"
+  lpr_pty_nonblock_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_pty_nonblock_probe.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pty_nonblock_probe.sh", ".artifacts/userland-fixtures/lpr_pty_nonblock_probe.elf"]
+      input:
+        - "pack/scripts/build_lpr_pty_nonblock_probe.sh"
+        - "userland/fixtures/linux/lpr_pty_nonblock_probe.c"
+    out: "LPRPTYNB.ELF"
+    rootfs: "/cmd/lpr_pty_nonblock_probe.elf"
   lpr_hvc_console:
     file:
       path: ".artifacts/userland-fixtures/lpr_hvc_console.elf"

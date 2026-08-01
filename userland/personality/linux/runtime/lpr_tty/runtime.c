@@ -92,6 +92,7 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         lpr_memset(io, 0, sizeof(*io));
         io->handle = lpr_tty_backend(fd)->handle;
         io->length = count > TERMD_IO_BYTES ? TERMD_IO_BYTES : count;
+        io->flags = TERMD_IO_F_NOWAIT;
         lpr_fill_termd_caller(&io->tty.session_id, &io->tty.process_id, &io->tty.pgrp_id);
         lpr_fill_termd_signal_state(&io->tty.signal_mask, &io->tty.signal_ignored);
         if (op == TERMD_OP_HANDLE_WRITE && io->length != 0) {

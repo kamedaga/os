@@ -34,6 +34,10 @@ enum {
     TERMD_POLLERR = 0x0008u,
     TERMD_POLLHUP = 0x0010u,
 
+    /* The service must execute this I/O attempt without sleeping.  The LPR
+     * caller implements the guest-visible blocking/nonblocking semantics. */
+    TERMD_IO_F_NOWAIT = 1u << 0,
+
     TERMD_F_MASTER = 1u << 0,
     TERMD_F_SLAVE = 1u << 1,
 };

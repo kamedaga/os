@@ -93,6 +93,7 @@ enum {
     TERMD_LINUX_PIDTYPE_SID = 3,
     TERMD_LINUX_FMODE_READ = 0x1,
     TERMD_LINUX_FMODE_WRITE = 0x2,
+    TERMD_LINUX_O_NONBLOCK = 00004000,
     TERMD_LINUX_TCGETS = 0x5401,
     TERMD_LINUX_TIOCGWINSZ = 0x5413,
     TERMD_LINUX_TIOCSWINSZ = 0x5414,
@@ -1503,6 +1504,9 @@ int termd_linux_tty_island_io(
     if (!island->ready) {
         return -19;
     }
+    if (request->flags != TERMD_IO_F_NOWAIT) {
+        return -22;
+    }
     termd_linux_tty_handle_t *handle = find_handle(request->handle);
     if (handle == NULL) {
         return -9;
@@ -1544,7 +1548,14 @@ int termd_linux_tty_island_io(
     if (!write) {
         drain_linux_tty_work();
     }
+    const uint32_t saved_file_flags =
+        read_u32_field(handle->file, TERMD_LINUX_FILE_FLAGS_OFFSET);
+    write_u32_field(
+        handle->file,
+        TERMD_LINUX_FILE_FLAGS_OFFSET,
+        saved_file_flags | TERMD_LINUX_O_NONBLOCK);
     const long result = ((termd_linux_fops_iter_fn)iter_fn)(kiocb, iter);
+    write_u32_field(handle->file, TERMD_LINUX_FILE_FLAGS_OFFSET, saved_file_flags);
     drain_linux_tty_work();
     if (has_context) {
         leave_owner_context(&context);
