@@ -21,7 +21,6 @@ mkdir -p "$(dirname "$out")"
   -Iuserland/termd/include \
   -Iuserland/drmd/include \
   -Iuserland/inputd/include \
-  -Iuserland/personality/linux/hde \
   tests/lpr_pending_signal_frame_unit.c \
   -Wl,--gc-sections \
   -o "$out"

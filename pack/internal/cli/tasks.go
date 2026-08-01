@@ -16,6 +16,7 @@ import (
 	"capabilityos/pack/internal/buildsys"
 	"capabilityos/pack/internal/config"
 	"capabilityos/pack/internal/diskimage"
+	"capabilityos/pack/internal/imagelock"
 	"capabilityos/pack/internal/manifests"
 	"capabilityos/pack/internal/qemu"
 	"capabilityos/pack/internal/rootsync"
@@ -74,6 +75,11 @@ func fsckRootfsCommand(ctx *context) *cobra.Command {
 				return fmt.Errorf("rootfs fsck currently supports ext4, got %q", partition.Format)
 			}
 			diskPath := ctx.workspace.Path(ctx.workspace.Disk.Image)
+			locks, err := imagelock.Acquire(diskPath)
+			if err != nil {
+				return err
+			}
+			defer locks.Close()
 			disk, err := os.Open(diskPath)
 			if err != nil {
 				return err
@@ -173,10 +179,11 @@ func qemuLimineCommand(ctx *context) *cobra.Command {
 	cmd.Flags().StringVar(&opts.Memory, "memory", "2G", "QEMU memory size")
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
+	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")
 	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
 	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
 	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")
-	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw QEMU argument; extra -drive image paths are not auto-locked")
 	return cmd
 }
 
@@ -320,11 +327,12 @@ func qemuCommand(ctx *context) *cobra.Command {
 	cmd.Flags().StringVar(&opts.Memory, "memory", "2G", "QEMU memory size")
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
+	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")
 	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-tablet", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
 	cmd.Flags().StringVar(&opts.Console, "console", "pty", "virtio console backend: pty or off")
 	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
 	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")
-	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw QEMU argument; extra -drive image paths are not auto-locked")
 	return cmd
 }
 
@@ -412,14 +420,11 @@ func runSeed0rootProfile(ctx *context, profile string, marker string, timeout ti
 	if err := prepareLimineBootImage(ctx, &prepareOpts); err != nil {
 		return err
 	}
-	scratchImage, err := copySeed0rootProfileBootImage(ctx, profile, prepareOpts.LimineImage)
+	scratchDir, scratchImage, scratchDisk, err := createSeed0rootProfileScratch(ctx, prepareOpts.LimineImage)
 	if err != nil {
 		return err
 	}
-	scratchDisk, err := createSeed0rootProfileDiskScratch(ctx, profile)
-	if err != nil {
-		return err
-	}
+	defer os.RemoveAll(scratchDir)
 
 	ui.Task("smoke:" + profile)
 	result, smokeErr := qemu.Smoke(ctx.workspace, qemu.SmokeOptions{
@@ -456,33 +461,45 @@ func writeSeed0rootBootProfile(ctx *context, profile string) error {
 	return os.WriteFile(path, []byte(profile), 0o644)
 }
 
-func copySeed0rootProfileBootImage(ctx *context, profile string, source string) (string, error) {
-	if source == "" {
-		source = ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot.img")
+func createSeed0rootProfileScratch(ctx *context, bootSource string) (string, string, string, error) {
+	if bootSource == "" {
+		bootSource = ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot.img")
 	}
-	cleanProfile := strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(profile)
-	dest := ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot-profile-"+cleanProfile+".img")
-	data, err := os.ReadFile(source)
+	rootSource := ctx.workspace.Path(ctx.workspace.Disk.Image)
+	locks, err := imagelock.Acquire(bootSource, rootSource)
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
-	if err := os.WriteFile(dest, data, 0o644); err != nil {
-		return "", err
+	defer locks.Close()
+
+	scratchDir, err := os.MkdirTemp(ctx.workspace.Path(ctx.workspace.Artifacts), "seed0root-profile-")
+	if err != nil {
+		return "", "", "", err
 	}
-	return dest, nil
+	keepScratch := false
+	defer func() {
+		if !keepScratch {
+			_ = os.RemoveAll(scratchDir)
+		}
+	}()
+	bootDest := filepath.Join(scratchDir, "limine-boot.img")
+	rootDest := filepath.Join(scratchDir, "disk.img")
+	if err := copySeed0rootProfileImage(bootSource, bootDest); err != nil {
+		return "", "", "", fmt.Errorf("boot scratch copy failed: %w", err)
+	}
+	if err := copySeed0rootProfileImage(rootSource, rootDest); err != nil {
+		return "", "", "", fmt.Errorf("rootfs scratch copy failed: %w", err)
+	}
+	keepScratch = true
+	return scratchDir, bootDest, rootDest, nil
 }
 
-func createSeed0rootProfileDiskScratch(ctx *context, profile string) (string, error) {
-	cleanProfile := strings.NewReplacer("/", "_", "\\", "_", " ", "_").Replace(profile)
-	source := ctx.workspace.Path(ctx.workspace.Disk.Image)
-	dest := ctx.workspace.Path(ctx.workspace.Artifacts, "disk-profile-"+cleanProfile+".img")
-	_ = os.Remove(dest)
-	cmd := exec.Command("cp", "--reflink=auto", "--sparse=always", source, dest)
-	cmd.Dir = ctx.workspace.Root
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("disk scratch copy failed: %w: %s", err, strings.TrimSpace(string(out)))
+func copySeed0rootProfileImage(source string, dest string) error {
+	cmd := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", source, dest)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(output)))
 	}
-	return dest, nil
+	return nil
 }
 
 func restoreSeed0rootBootProfile(ctx *context) error {
@@ -544,18 +561,19 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 		},
 	}
 	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 30*time.Second, "maximum time to wait for boot and console expectations")
-	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[termd] linux tty hvc open ready index=0 handle=2", "serial log marker required before sending input")
+	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[termd] linux tty hvc open ready index=0 handle=", "serial log marker required before sending input")
 	cmd.Flags().StringArrayVar(&opts.Send, "send", nil, "string to send to the TTY; repeatable")
 	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
+	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")
 	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
 	cmd.Flags().StringArrayVar(&opts.ScreendumpCheck, "screendump-check", nil, "capture at MARKER and require MARKER@X,Y,W,H=#RRGGBB[:TOLERANCE]; repeatable")
 	cmd.Flags().StringVar(&opts.ScreendumpDevice, "screendump-device", "pachagpu", "QEMU display device id captured by screendump")
-	cmd.Flags().StringArrayVar(&opts.InputSendEvent, "input-send-event", nil, "inject QMP input at MARKER using MARKER@key:a=down,rel:x=4,btn:left=up; add meta:repeat=N,meta:interval-us=N for a timed stream; repeatable")
-	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw argument to QEMU")
+	cmd.Flags().StringArrayVar(&opts.InputSendEvent, "input-send-event", nil, "inject QMP input at MARKER using MARKER@key:a=down,rel:x=4; add repeat/interval metadata and separate patterns with ';' to alternate reports; repeatable")
+	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw QEMU argument; extra -drive image paths are not auto-locked")
 	return cmd
 }
 
@@ -900,6 +918,11 @@ func runBootfsSync(ctx *context, force bool) error {
 func syncBootfsToLimineImage(ctx *context, bootfsPath string) error {
 	const limineFatPartitionByte = int64(2 * 1024 * 1024)
 	liminePath := ctx.workspace.Path(ctx.workspace.Artifacts, "limine-boot.img")
+	locks, err := imagelock.Acquire(liminePath)
+	if err != nil {
+		return err
+	}
+	defer locks.Close()
 	if _, err := os.Stat(liminePath); err != nil {
 		if os.IsNotExist(err) {
 			ui.KeyValues("Limine ESP", [][2]string{

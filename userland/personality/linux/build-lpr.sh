@@ -4,6 +4,60 @@ set -euo pipefail
 out="${1:-.artifacts/lpr-linux-x86_64.so}"
 repo_root="$(cd "$(dirname "$0")/../../.." && pwd)"
 mkdir -p "$(dirname "$repo_root/$out")"
+zydis_source="$(bash "$repo_root/pack/scripts/download_zydis.sh")"
+
+zydis_flags=(
+  -DZYDIS_STATIC_BUILD
+  -DZYDIS_MINIMAL_MODE
+  -DZYDIS_DISABLE_ENCODER
+  -DZYDIS_DISABLE_FORMATTER
+  -DZYDIS_DISABLE_SEGMENT
+  -DZYAN_NO_LIBC
+)
+zydis_obj_dir="$repo_root/.artifacts/lpr-zydis-v4.1.1"
+mkdir -p "$zydis_obj_dir"
+zydis_objects=()
+for source in Decoder.c DecoderData.c SharedData.c; do
+  object="$zydis_obj_dir/${source%.c}.o"
+  /usr/bin/clang \
+    -std=c11 -O2 -ffreestanding -fPIC -fvisibility=hidden \
+    -fno-stack-protector -fno-builtin \
+    "${zydis_flags[@]}" \
+    -I"$zydis_source/include" \
+    -I"$zydis_source/src" \
+    -I"$zydis_source/dependencies/zycore/include" \
+    -c "$zydis_source/src/$source" \
+    -o "$object"
+  zydis_objects+=("$object")
+done
+scanner_object="$zydis_obj_dir/lpr_runtime.o"
+patch_scan_object="$zydis_obj_dir/patch_scan.o"
+/usr/bin/clang \
+  -std=c11 -O2 -Wall -Wextra -Werror \
+  -ffreestanding -fPIC -fvisibility=hidden \
+  -fno-stack-protector -fno-builtin \
+  "${zydis_flags[@]}" \
+  -I"$zydis_source/include" \
+  -I"$zydis_source/src" \
+  -I"$zydis_source/dependencies/zycore/include" \
+  -I"$repo_root/userland/personality/include" \
+  -I"$repo_root/userland/personality/linux/decoder" \
+  -I"$repo_root/userland/libipc/include" \
+  -c "$repo_root/userland/personality/linux/decoder/patch_scan.c" \
+  -o "$patch_scan_object"
+/usr/bin/clang \
+  -std=c11 -O2 -Wall -Wextra -Werror \
+  -ffreestanding -fPIC -fvisibility=hidden \
+  -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer \
+  -fno-stack-protector -fno-builtin \
+  "${zydis_flags[@]}" \
+  -I"$zydis_source/include" \
+  -I"$zydis_source/src" \
+  -I"$zydis_source/dependencies/zycore/include" \
+  -I"$repo_root/userland/personality/include" \
+  -I"$repo_root/userland/libipc/include" \
+  -c "$repo_root/userland/personality/linux/runtime/lpr_runtime.c" \
+  -o "$scanner_object"
 
 /usr/bin/clang \
   -std=c11 \
@@ -24,6 +78,10 @@ mkdir -p "$(dirname "$repo_root/$out")"
   -Wl,--version-script="$repo_root/userland/personality/linux/runtime/lpr_namespace.map" \
   -Wl,-soname,lpr-linux-x86_64.so \
   ${PACHAOS_LPR_EXTRA_CFLAGS:-} \
+  "${zydis_flags[@]}" \
+  -I"$zydis_source/include" \
+  -I"$zydis_source/src" \
+  -I"$zydis_source/dependencies/zycore/include" \
   -I"$repo_root/userland/personality/include" \
   -I"$repo_root/musl/pachaos/include" \
   -I"$repo_root/userland/libpacha/include" \
@@ -34,10 +92,9 @@ mkdir -p "$(dirname "$repo_root/$out")"
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/drmd/include" \
   -I"$repo_root/userland/inputd/include" \
-  -I"$repo_root/userland/personality/linux/hde" \
-  -DHDE64_USE_LPR_MEMSET=1 \
   "$repo_root/userland/personality/linux/runtime/lpr_signal.c" \
-  "$repo_root/userland/personality/linux/runtime/lpr_runtime.c" \
+  "$scanner_object" \
+  "$patch_scan_object" \
   "$repo_root/userland/personality/linux/runtime/lpr_zpoline.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_syscall_catalog.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_memory.c" \
@@ -76,7 +133,7 @@ mkdir -p "$(dirname "$repo_root/$out")"
   "$repo_root/userland/personality/linux/runtime/support/elf.c" \
   "$repo_root/userland/personality/linux/runtime/support/string.c" \
   "$repo_root/userland/personality/linux/runtime/support/syscall.c" \
-  "$repo_root/userland/personality/linux/hde/hde64.c" \
+  "${zydis_objects[@]}" \
   "$repo_root/userland/personality/linux/runtime/lpr_entry.S" \
   -o "$repo_root/$out"
 

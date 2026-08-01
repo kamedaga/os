@@ -449,30 +449,43 @@ test "ipc call attaches one-shot reply fd" {
     try std.testing.expectEqual(@as(u64, 1234), reply.words[0]);
 }
 
-test "irq fd records interrupt events by vector" {
+test "irq fd records only matching device and MSI-X entry" {
     var s = try initFdState();
     const irq_fd = try s.createIrqFd(p0, .{
         .device = 0x1001,
         .kind = .msix,
-        .vector = 0x41,
+        .vector = 1,
+    }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
+    const auto_fd = try s.createIrqFd(p0, .{
+        .device = 0x1001,
+        .kind = .auto,
+        .vector = 0,
+    }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
+    const other_device_fd = try s.createIrqFd(p0, .{
+        .device = 0x1002,
+        .kind = .auto,
+        .vector = 0,
     }, fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true }), .{}, 16);
 
     try std.testing.expectEqual(@as(?u64, 0), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
     try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 
     var wake_owners: [4]kernel.PrincipalId = undefined;
-    const wake_count = s.recordDeviceInterruptEvent(0x41, wake_owners[0..]);
+    const wake_count = s.recordDeviceInterruptEvent(0x1001, 1, wake_owners[0..]);
     try std.testing.expectEqual(@as(usize, 1), wake_count);
     try std.testing.expectEqual(p0, wake_owners[0]);
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
+    try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, auto_fd, fdRights(.{ .irq_wait = true })));
+    try std.testing.expectEqual(@as(?u64, 0), s.irqEventCountForFd(p0, other_device_fd, fdRights(.{ .irq_wait = true })));
     try std.testing.expectEqual(@as(?u64, 1), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
     try std.testing.expect(s.acknowledgeIrqEventCountForFd(p0, irq_fd, 1));
     try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 
-    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x42, wake_owners[0..]));
+    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1001, 2, wake_owners[0..]));
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
-    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x41, wake_owners[0..]));
-    try std.testing.expectEqual(@as(?u64, 1), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
+    try std.testing.expectEqual(@as(?u64, 2), s.irqEventCountForFd(p0, auto_fd, fdRights(.{ .irq_wait = true })));
+    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1002, 1, wake_owners[0..]));
+    try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 }
 
 test "physical page allocation returns a page handle" {
@@ -518,6 +531,30 @@ test "page-backed vmo fd uses dynamic fd range and reports fd info" {
     try s.closeFdWithFreeList(p0, fd, &free_list);
     try std.testing.expectEqual(original_free, free_list.len);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+}
+
+test "vmo backing store reclaims and coalesces its high-water tail" {
+    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
+
+    try std.testing.expectEqual(@as(?u32, 0), kernel.allocEmptyVmoBackingPageStore(2));
+    try std.testing.expectEqual(@as(?u32, 2), kernel.allocEmptyVmoBackingPageStore(3));
+    try std.testing.expectEqual(@as(?u32, 5), kernel.allocEmptyVmoBackingPageStore(4));
+    try std.testing.expect(kernel.freeVmoBackingPageStore(2, 3));
+    try std.testing.expect(kernel.freeVmoBackingPageStore(5, 4));
+    try std.testing.expectEqual(@as(?u32, 2), kernel.allocEmptyVmoBackingPageStore(8));
+
+    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
+    const range_count = kernel.max_vmo_backing_store_free_ranges;
+    const reserved_pages = range_count * 2 + 1;
+    try std.testing.expectEqual(@as(?u32, 0), kernel.allocEmptyVmoBackingPageStore(reserved_pages));
+    for (0..range_count) |i| {
+        try std.testing.expect(kernel.freeVmoBackingPageStore(@intCast(i * 2), 1));
+    }
+    try std.testing.expect(kernel.freeVmoBackingPageStore(@intCast(reserved_pages - 1), 1));
+    try std.testing.expectEqual(
+        @as(?u32, @intCast(reserved_pages - 1)),
+        kernel.allocEmptyVmoBackingPageStore(2),
+    );
 }
 
 test "anonymous vmo fd maps through vma ledger without page capability install" {

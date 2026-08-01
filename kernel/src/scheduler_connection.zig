@@ -22,7 +22,7 @@ const default_process_principal: kernel.PrincipalId = kernel.processPrincipalFro
 const bootstrap_cpu_slot: usize = 0;
 const all_cpu_affinity_mask: u64 = if (smp.max_cpus >= 64) std.math.maxInt(u64) else (@as(u64, 1) << smp.max_cpus) - 1;
 
-const fx_state_bytes: usize = 512;
+const xstate_bytes: usize = x86_platform.xstate_bytes;
 pub const maxThreadSlots: usize = kernel.max_thread_slots;
 pub const initialThreadCapacity: usize = kernel.initial_thread_capacity;
 pub const idleThreadMarker: usize = maxThreadSlots;
@@ -123,7 +123,7 @@ pub const ThreadContext = struct {
     signal_owner: bool = false,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
-    fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes,
+    x_state: [xstate_bytes]u8 align(x86_platform.xstate_alignment) = [_]u8{0} ** xstate_bytes,
 };
 
 pub const SuspendedThreadImage = struct {
@@ -168,8 +168,7 @@ pub export var lapic_tick_count: u64 = 0;
 pub var scheduler_tick_accum: u64 = 0;
 pub var scheduler_switch_count: u64 = 0;
 pub var scheduler_timer_log_once: u8 = 0;
-pub var initial_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
-pub var kernel_interrupt_fx_state: [fx_state_bytes]u8 align(16) = [_]u8{0} ** fx_state_bytes;
+pub var initial_x_state: [xstate_bytes]u8 align(x86_platform.xstate_alignment) = [_]u8{0} ** xstate_bytes;
 var principal_lifecycle_gate: u8 = 0;
 var principal_lifecycle_target_raw: usize = std.math.maxInt(usize);
 var principal_lifecycle_pending_action: u8 = 0;
@@ -343,23 +342,38 @@ fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
 
     var target_cpu = last_cpu;
     var target_count: usize = std.math.maxInt(usize);
+    var target_idle = false;
     var last_count: usize = std.math.maxInt(usize);
+    var last_idle = false;
     var cpu_id: usize = 0;
     while (cpu_id < verifiedCoreCpuCount()) : (cpu_id += 1) {
         const state = schedulerStateForSlot(cpu_id) orelse continue;
         if (!schedulerCpuEnabled(cpu_id) or !threadAllowsCpu(ctx, cpu_id)) continue;
+        state.lock.lock();
+        const is_idle = state.is_idle;
+        state.lock.unlock();
         state.runqueue_lock.lock();
         const count = state.runqueue.count;
         state.runqueue_lock.unlock();
-        if (cpu_id == last_cpu) last_count = count;
-        if (count < target_count) {
+        if (cpu_id == last_cpu) {
+            last_count = count;
+            last_idle = is_idle;
+        }
+        if ((is_idle and !target_idle) or
+            (is_idle == target_idle and count < target_count))
+        {
             target_count = count;
             target_cpu = cpu_id;
+            target_idle = is_idle;
         }
     }
     if (target_count == std.math.maxInt(usize)) return false;
     const last_allowed = schedulerCpuEnabled(last_cpu) and threadAllowsCpu(ctx, last_cpu);
-    if (last_allowed and last_count <= target_count +| 1) target_cpu = last_cpu;
+    if (last_allowed and (last_idle or !target_idle) and
+        last_count <= target_count +| 1)
+    {
+        target_cpu = last_cpu;
+    }
 
     const target_state = schedulerStateForSlot(target_cpu) orelse return false;
     const first = if (last_cpu <= target_cpu) last_state else target_state;
@@ -395,6 +409,7 @@ fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
         // Revalidate the locality threshold under the pair of runqueue locks.
         // A last CPU that is still within one queued entity always wins.
         if (target_cpu != last_cpu and last_allowed and
+            (last_state.is_idle or !target_state.is_idle) and
             last_state.runqueue.count <= target_state.runqueue.count +| 1)
         {
             target_cpu = last_cpu;
@@ -809,7 +824,7 @@ fn fillUserEntryForThread(cpu_id: usize, thread_index: usize, generation: u32, o
         .cr3 = ctx.cr3,
         .fs_base = ctx.fs_base,
         .gs_base = ctx.gs_base,
-        .fx_state_addr = @intFromPtr(&ctx.fx_state),
+        .x_state_addr = @intFromPtr(&ctx.x_state),
         .pkru = ctx.pkru,
         .frame = ctx.frame,
     };
@@ -1276,8 +1291,7 @@ pub fn staticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lapic_tick_count), &lapic_tick_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_tick_accum), &scheduler_tick_accum));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_switch_count), &scheduler_switch_count));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_fx_state), &initial_fx_state));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_interrupt_fx_state), &kernel_interrupt_fx_state));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_x_state), &initial_x_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_gate), &principal_lifecycle_gate));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_target_raw), &principal_lifecycle_target_raw));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_pending_action), &principal_lifecycle_pending_action));
@@ -1785,7 +1799,7 @@ fn initializeThreadContextWithReadyState(
     }
     ctx.wake_tick = 0;
     ctx.frame = initial_frame;
-    ctx.fx_state = initial_fx_state;
+    ctx.x_state = initial_x_state;
     syncHotStateFromContext(thread_index);
     return true;
 }
@@ -2033,6 +2047,7 @@ pub fn installExecContextForCurrentThread(
         ctx.gs_base = image.gs_base;
         ctx.pkru = image.pkru;
         ctx.frame = image.frame;
+        ctx.x_state = initial_x_state;
         ctx.ready = true;
         ctx.wait_mailbox = false;
         ctx.wake_tick = 0;
@@ -2238,6 +2253,7 @@ pub fn exitCurrentThread(
     // A bootstrap-CPU thread may be the last local runnable entity while work
     // remains queued elsewhere.  Reclaim one runnable generation before
     // waiting interruptibly for a later local wake.
+    if (before_ap_idle) |callback| callback.run(callback.context);
     loadNextReadyThreadOrIdle(frame);
     return true;
 }
@@ -2258,6 +2274,41 @@ pub fn wakeIfWaiting(thread_index: usize) void {
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
     verifiedWakeThread(thread_index);
+}
+
+fn wakeIfTimerExpired(thread_index: usize, now_tick: u64) void {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return;
+    // The lockless hot-state scan is only a candidate filter.  The thread may
+    // have completed that wait and entered a newer one before we acquire the
+    // table lock, so revalidate the current deadline before publishing ready.
+    if (!ctx.allocated or ctx.ready or
+        ctx.wake_tick == 0 or now_tick < ctx.wake_tick)
+    {
+        return;
+    }
+    const wait_mailbox = ctx.wait_mailbox;
+    const wake_tick = ctx.wake_tick;
+    ctx.wait_mailbox = false;
+    ctx.wake_tick = 0;
+    if (ctx.stopped) {
+        ctx.resume_after_stop = true;
+        ctx.ready = false;
+        setThreadHotWaitState(thread_index, false, 0, false);
+        return;
+    }
+    ctx.ready = true;
+    setThreadHotWaitState(thread_index, false, 0, true);
+    if (!verifiedWakeThreadGeneration(thread_index, ctx.generation)) {
+        // Do not strand a blocked scheduler entity behind ready=true.  The
+        // lockless timer scan treats ready as authoritative, so retain the
+        // expired deadline and retry publication on the next BSP tick.
+        ctx.wait_mailbox = wait_mailbox;
+        ctx.wake_tick = wake_tick;
+        ctx.ready = false;
+        setThreadHotWaitState(thread_index, wait_mailbox, wake_tick, false);
+    }
 }
 
 fn wakeIfWaitingGenerationInternal(
@@ -2450,6 +2501,17 @@ pub fn copySignalDeliveryConfig(source_thread: usize, target_thread: usize) bool
     return true;
 }
 
+pub fn copyThreadXState(source_thread: usize, target_thread: usize) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const source = threadContext(source_thread) orelse return false;
+    const target = threadContextMutable(target_thread) orelse return false;
+    if (!source.allocated or !target.allocated) return false;
+    target.x_state = source.x_state;
+    target.pkru = source.pkru;
+    return true;
+}
+
 pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
     const thread_index = currentThread();
     scheduler_state.thread_table.lock();
@@ -2488,21 +2550,21 @@ pub fn restoreClaimedSignal(claimed: ClaimedSignal) void {
     setThreadHotPendingSignalMask(claimed.thread_index, ctx.pending_signal_mask);
 }
 
-pub fn copyCurrentSignalFxState(out: *[fx_state_bytes]u8) bool {
+pub fn copyCurrentSignalXState(out: *[xstate_bytes]u8) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContext(currentThread()) orelse return false;
     if (!ctx.allocated) return false;
-    out.* = ctx.fx_state;
+    out.* = ctx.x_state;
     return true;
 }
 
-pub fn restoreCurrentSignalFxState(saved: *const [fx_state_bytes]u8) bool {
+pub fn restoreCurrentSignalXState(saved: *const [xstate_bytes]u8) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(currentThread()) orelse return false;
     if (!ctx.allocated) return false;
-    ctx.fx_state = saved.*;
+    ctx.x_state = saved.*;
     return true;
 }
 
@@ -2578,7 +2640,7 @@ pub fn wakeExpiredTimers(now_tick: u64) void {
         if (hot.allocated == 0) continue;
         if (hot.ready != 0) continue;
         if (hot.wake_tick == 0 or now_tick < hot.wake_tick) continue;
-        wakeIfWaiting(i);
+        wakeIfTimerExpired(i, now_tick);
     }
 }
 

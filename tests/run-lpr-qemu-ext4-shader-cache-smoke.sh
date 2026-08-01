@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+source tests/lib/pacgo_image_lock.sh
 
 parts="${EXT4_SHADER_CACHE_PARTS:-8}"
 case "$parts" in
@@ -20,8 +21,7 @@ last_part=$((parts - 1))
 log_dir="${EXT4_SHADER_CACHE_LOG_DIR:-.artifacts/test-results/ext4-shader-cache-smoke}"
 mkdir -p "$log_dir"
 
-pkill -9 qemu-system-x86 || true
-rm -f .artifacts/disk.img
+pacgo_remove_image_locked .artifacts/disk.img
 .artifacts/bin/pacgo sync rootfs --force
 .artifacts/bin/pacgo sync bootfs
 

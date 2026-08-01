@@ -10,7 +10,7 @@ process_stop_limit=400
 
 wait_tick()
 {
-    IFS= read -r -t "$1" -n 1 _ || true
+    /bin/sleep "$1"
 }
 
 now_ns()
@@ -96,7 +96,10 @@ tree_has_pid()
     local pid=$2
     local tree
     local pattern="\"pid\"[[:space:]]*:[[:space:]]*${pid}([,}])"
-    tree=$(/usr/bin/swaymsg -s "$socket" -t get_tree 2>/dev/null) || return 1
+    tree=$(
+        /usr/bin/timeout --signal=KILL 1s \
+            /usr/bin/swaymsg -s "$socket" -t get_tree 2>/dev/null
+    ) || return 1
     [[ $tree =~ $pattern ]]
 }
 
@@ -322,7 +325,7 @@ printf 'P4_BENCH_STARTUP phase=cold socket_ms=%s ipc_ms=%s display=%s\n' \
 foot_pty_ack=$runtime/p4-foot-pty.ok
 /bin/rm -f "$foot_pty_ack"
 foot_start=$(now_ns)
-printf 'P4_BENCH_APP_EXEC app=foot\n'
+printf 'P4_BENCH_APP_EXEC app=foot guest_ns=%s\n' "$foot_start"
 /usr/bin/foot /bin/bash --noprofile --rcfile /cmd/phase4_foot_bashrc -i &
 foot_pid=$!
 wait_for_tree_pid "$socket" "$foot_pid" || {

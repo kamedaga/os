@@ -189,6 +189,7 @@ pub fn publishIrqObject(self: anytype, object_ref: KernelObjectRef, irq: IrqObje
     @atomicStore(u64, &slot.observed_count, 0, .release);
     @atomicStore(u32, &slot.generation, object_ref.generation, .release);
     @atomicStore(PrincipalRaw, &slot.owner_principal_raw, irq.owner_principal_raw, .release);
+    @atomicStore(DmaDeviceId, &slot.device, irq.device, .release);
     @atomicStore(u8, &slot.kind, @intFromEnum(irq.kind), .release);
     @atomicStore(u32, &slot.vector, irq.vector, .release);
     @atomicStore(u8, &slot.active, 1, .release);
@@ -259,6 +260,11 @@ pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
     _ = self;
     if (mapping.size == 0) return;
     _ = mapping.device;
+    // Scatter mappings never install a VT-d range: their deriving syscall is
+    // rejected while VT-d is active. The FD still expresses the same caller
+    // lifetime contract as the contiguous mapping ABI, but there is no fake
+    // contiguous IOVA to unmap here.
+    if (mapping.page_count != 0) return;
     vtd.unmapRange(mapping.iova, mapping.size);
 }
 
@@ -753,9 +759,16 @@ pub fn irqObjectForFd(self: anytype, owner: PrincipalId, fd: Fd, required_rights
     };
 }
 
-pub fn irqKindMatchesInterrupt(kind: u8, irq_vector: u32, vector: u32) bool {
-    if (kind == @intFromEnum(CapsuleIrqKind.auto)) return irq_vector == 0 or irq_vector == vector;
-    return irq_vector == vector;
+pub fn irqKindMatchesInterrupt(kind: u8, irq_entry: u32, entry: u32) bool {
+    if (kind == @intFromEnum(CapsuleIrqKind.auto)) {
+        return irq_entry == 0 or irq_entry == entry;
+    }
+    if (kind == @intFromEnum(CapsuleIrqKind.msi) or
+        kind == @intFromEnum(CapsuleIrqKind.msix))
+    {
+        return irq_entry == entry;
+    }
+    return false;
 }
 
 pub fn appendUniquePrincipal(out: []PrincipalId, count: *usize, principal: PrincipalId) void {
@@ -768,14 +781,24 @@ pub fn appendUniquePrincipal(out: []PrincipalId, count: *usize, principal: Princ
     count.* += 1;
 }
 
-pub fn recordDeviceInterruptEvent(self: anytype, vector: u32, wake_owners: []PrincipalId) usize {
+pub fn recordDeviceInterruptEvent(
+    self: anytype,
+    device: DmaDeviceId,
+    entry: u32,
+    wake_owners: []PrincipalId,
+) usize {
     var wake_count: usize = 0;
     for (self.irq_publish_slots[0..]) |*slot| {
         if (@atomicLoad(u8, &slot.active, .acquire) == 0) continue;
         const generation = @atomicLoad(u32, &slot.generation, .acquire);
+        const irq_device = @atomicLoad(DmaDeviceId, &slot.device, .acquire);
         const kind = @atomicLoad(u8, &slot.kind, .acquire);
-        const irq_vector = @atomicLoad(u32, &slot.vector, .acquire);
-        if (!@TypeOf(self.*).irqKindMatchesInterrupt(kind, irq_vector, vector)) continue;
+        const irq_entry = @atomicLoad(u32, &slot.vector, .acquire);
+        if (irq_device != device or
+            !@TypeOf(self.*).irqKindMatchesInterrupt(kind, irq_entry, entry))
+        {
+            continue;
+        }
         if (@atomicLoad(u8, &slot.active, .acquire) == 0) continue;
         if (@atomicLoad(u32, &slot.generation, .acquire) != generation) continue;
         _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);

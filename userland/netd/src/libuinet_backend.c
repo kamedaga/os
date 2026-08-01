@@ -2892,18 +2892,15 @@ int netd_libuinet_socket_collect_wait_sources(struct pacha_service_wait_set *wai
     return 0;
 }
 
-void netd_libuinet_socket_reap_hangups(void)
+void netd_libuinet_socket_reap_hangups(
+    const struct pacha_service_wait_set *wait_set)
 {
 #if defined(NETD_WITH_LIBUINET)
     for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; ++i) {
         struct netd_libuinet_api_socket *slot = &g_libuinet_api_sockets[i];
         if (slot->socket == NULL || slot->notify_fd < 16) continue;
-        struct pacha_pollfd pollfd = {
-            .fd = slot->notify_fd,
-            .events = PACHA_FD_EVENT_HANGUP,
-        };
-        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
-            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        if ((pacha_service_wait_revents(wait_set, slot->notify_fd) &
+             PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle = slot->handle;
         if (slot->type == NETD_SOCK_STREAM) {
             (void)uinet_soshutdown(slot->socket, UINET_SHUT_RDWR);
@@ -2915,6 +2912,7 @@ void netd_libuinet_socket_reap_hangups(void)
             (unsigned long long)handle);
     }
 #endif
+    (void)wait_set;
 }
 
 #if defined(NETD_WITH_LIBUINET)

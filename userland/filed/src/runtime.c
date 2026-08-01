@@ -349,64 +349,143 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
     return 0;
 }
 
-static int filed_runtime_mount_run_tmpfs(filed_runtime_t *runtime)
+static int filed_runtime_mount_detached_tmpfs_child(
+    filed_runtime_t *runtime,
+    filed_handle_id_t parent_handle,
+    const char *name,
+    filed_handle_id_t *out_handle)
 {
-    uint64_t run_root = 0;
-    filed_vfs_open_result_t run_open;
-    storage_statx_reply_t run_stat;
-    filed_vfs_stat_snapshot_t run_snapshot;
+    uint64_t tmpfs_root = 0;
+    filed_vfs_open_result_t root_open;
+    storage_statx_reply_t root_stat;
+    filed_vfs_stat_snapshot_t root_snapshot;
+
+    if (runtime == NULL || parent_handle == 0 || name == NULL || out_handle == NULL) {
+        return -1;
+    }
 
     int status = filed_tmpfs_backend_mount_detached_root(
         &runtime->tmpfs,
-        &run_root);
+        &tmpfs_root);
     if (status != 0) {
         return status;
     }
 
-    memset(&run_open, 0, sizeof(run_open));
+    memset(&root_open, 0, sizeof(root_open));
     filed_status_t vfs_status = filed_vfs_open_backend_child(
         &runtime->vfs,
-        runtime->root_handle_id,
-        run_root,
+        parent_handle,
+        tmpfs_root,
         FILED_VNODE_DIRECTORY,
-        "run",
+        name,
         FILED_RIGHT_LOOKUP |
             FILED_RIGHT_READ |
             FILED_RIGHT_EXEC |
             FILED_RIGHT_STAT |
+            FILED_RIGHT_SETATTR |
             FILED_RIGHT_GETDENTS |
             FILED_RIGHT_CREATE |
             FILED_RIGHT_REMOVE |
             FILED_RIGHT_RENAME,
         FILED_OPEN_DIRECTORY,
-        &run_open);
+        &root_open);
     if (vfs_status != FILED_OK) {
         return -60 - (int)vfs_status;
     }
 
-    memset(&run_stat, 0, sizeof(run_stat));
-    status = filed_tmpfs_backend_statx(&runtime->tmpfs, run_root, &run_stat);
+    memset(&root_stat, 0, sizeof(root_stat));
+    status = filed_tmpfs_backend_statx(&runtime->tmpfs, tmpfs_root, &root_stat);
     if (status != 0) {
         return status;
     }
-    memset(&run_snapshot, 0, sizeof(run_snapshot));
-    run_snapshot.valid = true;
-    run_snapshot.handle_id = run_open.handle_id;
-    run_snapshot.mode = run_stat.mode;
-    run_snapshot.size = run_stat.size;
-    run_snapshot.blocks = run_stat.blocks;
-    run_snapshot.nlink = run_stat.nlink;
-    run_snapshot.kind = run_stat.kind;
-    run_snapshot.times_valid = true;
-    run_snapshot.object_generation = run_open.object_generation;
-    run_snapshot.dir_generation = run_open.dir_generation;
+    memset(&root_snapshot, 0, sizeof(root_snapshot));
+    root_snapshot.valid = true;
+    root_snapshot.handle_id = root_open.handle_id;
+    root_snapshot.mode = root_stat.mode;
+    root_snapshot.size = root_stat.size;
+    root_snapshot.blocks = root_stat.blocks;
+    root_snapshot.nlink = root_stat.nlink;
+    root_snapshot.kind = root_stat.kind;
+    root_snapshot.times_valid = true;
+    root_snapshot.object_generation = root_open.object_generation;
+    root_snapshot.dir_generation = root_open.dir_generation;
     (void)filed_vfs_update_stat_snapshot(
         &runtime->vfs,
-        run_root,
-        &run_snapshot);
+        tmpfs_root,
+        &root_snapshot);
 
-    runtime->run_tmpfs_root_handle_id = run_open.handle_id;
+    *out_handle = root_open.handle_id;
+    return 0;
+}
+
+static int filed_runtime_mount_run_tmpfs(filed_runtime_t *runtime)
+{
+    int status = filed_runtime_mount_detached_tmpfs_child(
+        runtime,
+        runtime->root_handle_id,
+        "run",
+        &runtime->run_tmpfs_root_handle_id);
+    if (status != 0) {
+        return status;
+    }
     runtime->run_tmpfs_root_handle_valid = 1u;
+    return 0;
+}
+
+static int filed_runtime_mount_shm_tmpfs(filed_runtime_t *runtime)
+{
+    uint64_t dev_object = 0;
+    storage_statx_reply_t dev_stat;
+    filed_vfs_open_result_t dev_open;
+
+    int status = filed_kobox_backend_lookup(
+        &runtime->backend,
+        runtime->backend.root_object_id,
+        "dev",
+        &dev_object);
+    if (status != 0) {
+        return status;
+    }
+    memset(&dev_stat, 0, sizeof(dev_stat));
+    status = filed_kobox_backend_statx(&runtime->backend, dev_object, &dev_stat);
+    if (status != 0) {
+        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        return status;
+    }
+    if ((dev_stat.kind & 0170000u) != 0040000u) {
+        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        return -20;
+    }
+
+    memset(&dev_open, 0, sizeof(dev_open));
+    filed_status_t vfs_status = filed_vfs_open_backend_child(
+        &runtime->vfs,
+        runtime->root_handle_id,
+        dev_object,
+        FILED_VNODE_DIRECTORY,
+        "dev",
+        FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_READ |
+            FILED_RIGHT_EXEC |
+            FILED_RIGHT_STAT |
+            FILED_RIGHT_GETDENTS,
+        FILED_OPEN_DIRECTORY,
+        &dev_open);
+    if (vfs_status != FILED_OK) {
+        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        return -70 - (int)vfs_status;
+    }
+
+    status = filed_runtime_mount_detached_tmpfs_child(
+        runtime,
+        dev_open.handle_id,
+        "shm",
+        &runtime->shm_tmpfs_root_handle_id);
+    (void)filed_vfs_close_handle(&runtime->vfs, dev_open.handle_id);
+    if (status != 0) {
+        return status;
+    }
+    runtime->shm_tmpfs_root_handle_valid = 1u;
     return 0;
 }
 
@@ -476,6 +555,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
             FILED_RIGHT_READ |
             FILED_RIGHT_EXEC |
             FILED_RIGHT_STAT |
+            FILED_RIGHT_SETATTR |
             FILED_RIGHT_GETDENTS |
             FILED_RIGHT_CREATE |
             FILED_RIGHT_REMOVE |
@@ -512,6 +592,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
                 FILED_RIGHT_READ |
                 FILED_RIGHT_EXEC |
                 FILED_RIGHT_STAT |
+                FILED_RIGHT_SETATTR |
                 FILED_RIGHT_GETDENTS |
                 FILED_RIGHT_CREATE |
                 FILED_RIGHT_REMOVE |
@@ -550,6 +631,10 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
     }
 
     status = filed_runtime_mount_run_tmpfs(runtime);
+    if (status != 0) {
+        return status;
+    }
+    status = filed_runtime_mount_shm_tmpfs(runtime);
     if (status != 0) {
         return status;
     }

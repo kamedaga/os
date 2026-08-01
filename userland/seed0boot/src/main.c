@@ -532,5 +532,22 @@ int main(int argc, char **argv)
     printf("[seed0boot] ready\n");
     fflush(stdout);
     fflush(stderr);
-    for (;;) __asm__ volatile("pause");
+
+    struct pacha_ipc_channel_pair idle_pair = { .a = -1, .b = -1 };
+    const int idle_create_status = pacha_ipc_channel_create(
+        &idle_pair, seed0_channel_rights, 0);
+    if (idle_create_status != 0 || idle_pair.a < 16 || idle_pair.b < 16) {
+        fprintf(stderr,
+            "[seed0boot] idle channel create failed status=%d a=%d b=%d\n",
+            idle_create_status,
+            idle_pair.a,
+            idle_pair.b);
+        return 29;
+    }
+    struct pacha_ipc_msg idle_msg;
+    memset(&idle_msg, 0, sizeof(idle_msg));
+    const int idle_status = pacha_ipc_recv_wait(
+        idle_pair.a, &idle_msg, PACHA_FD_WAIT_FOREVER);
+    fprintf(stderr, "[seed0boot] idle wait returned status=%d\n", idle_status);
+    return 29;
 }

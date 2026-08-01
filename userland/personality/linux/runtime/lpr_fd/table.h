@@ -154,10 +154,12 @@ typedef struct lpr_sync_file_backend {
 typedef struct lpr_socket_backend {
     uint8_t active;
     uint8_t type;
-    uint8_t reserved3;
+    uint8_t readable_hint;
+    uint8_t write_blocked;
     uint8_t connected;
     uint8_t connecting;
     uint8_t domain;
+    uint8_t reserved_socket0;
     uint16_t protocol;
     uint32_t flags;
     uint32_t sndbuf;

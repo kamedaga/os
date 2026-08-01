@@ -8,19 +8,22 @@
 
 enum {
     NETD_OP_HELLO = 0u,
-    NETD_OP_SOCKET = 1u,
-    NETD_OP_SOCKETPAIR = 2u,
-    NETD_OP_CONNECT = 3u,
-    NETD_OP_CLOSE = 4u,
-    NETD_OP_SEND = 5u,
-    NETD_OP_RECV = 6u,
-    NETD_OP_POLL = 7u,
-    NETD_OP_BIND = 8u,
-    NETD_OP_LISTEN = 9u,
-    NETD_OP_ACCEPT = 10u,
-    NETD_OP_ATTACH_WAIT = 11u,
-    NETD_OP_UEVENT_PUBLISH = 12u,
-    NETD_OP_DUP = 13u,
+    NETD_OP_PAGE_ATTACH = 1u,
+    NETD_OP_SOCKET = 2u,
+    NETD_OP_SOCKETPAIR = 3u,
+    NETD_OP_CONNECT = 4u,
+    NETD_OP_CLOSE = 5u,
+    NETD_OP_SEND = 6u,
+    NETD_OP_RECV = 7u,
+    NETD_OP_POLL = 8u,
+    NETD_OP_BIND = 9u,
+    NETD_OP_LISTEN = 10u,
+    NETD_OP_ACCEPT = 11u,
+    NETD_OP_ATTACH_WAIT = 12u,
+    NETD_OP_UEVENT_PUBLISH = 13u,
+    NETD_OP_DUP = 14u,
+
+    NETD_STATUS_STALE_ATTACHMENT = -116,
 
     NETD_AF_UNIX = 1,
     NETD_AF_INET = 2,
@@ -45,6 +48,7 @@ enum {
     NETD_POLLIN = 0x0001,
     NETD_POLLOUT = 0x0004,
     NETD_POLLERR = 0x0008,
+    NETD_POLLHUP = 0x0010,
 };
 
 #define NETD_UEVENT_INPUT_TAG (UINT64_C(1) << 63)
@@ -131,6 +135,12 @@ typedef struct netd_unix_path {
     uint32_t reserved0;
     char path[108];
 } netd_unix_path_t;
+
+typedef struct netd_listen {
+    uint64_t handle;
+    int32_t backlog;
+    uint32_t reserved0;
+} netd_listen_t;
 
 typedef struct netd_netlink_bind {
     uint64_t handle;

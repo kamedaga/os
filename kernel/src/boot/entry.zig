@@ -61,8 +61,9 @@ var limine_boot_scratch_storage: [boot_scratch.default_bytes]u8 align(4096) = un
 
 var boot_init_principal: ?kernel.PrincipalId = null;
 const spawn_parent_endpoint_id: u64 = 0x14;
-const generic_device_interrupt_vector: u8 = 0x41;
-const device_interrupt_vector_count: u8 = 1;
+const unrouted_device_interrupt_vector: u8 = 0x41;
+const device_interrupt_vector: u8 = pci.interrupt_vector_base;
+const device_interrupt_vector_count: u8 = pci.interrupt_vector_count;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -132,36 +133,6 @@ fn invlpg(addr: u64) void {
     kernel_vm.invlpg(addr);
 }
 
-fn readCr0() u64 {
-    var value: u64 = 0;
-    asm volatile ("mov %%cr0, %[out]"
-        : [out] "=r" (value),
-    );
-    return value;
-}
-
-fn writeCr0(value: u64) void {
-    asm volatile ("mov %[value], %%cr0"
-        :
-        : [value] "r" (value),
-        : .{ .memory = true });
-}
-
-fn readCr4() u64 {
-    var value: u64 = 0;
-    asm volatile ("mov %%cr4, %[out]"
-        : [out] "=r" (value),
-    );
-    return value;
-}
-
-fn writeCr4(value: u64) void {
-    asm volatile ("mov %[value], %%cr4"
-        :
-        : [value] "r" (value),
-        : .{ .memory = true });
-}
-
 fn userCr3ForPrincipal(principal: kernel.PrincipalId) u64 {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return 0;
     if (idx >= user_spaces.len) return 0;
@@ -169,30 +140,22 @@ fn userCr3ForPrincipal(principal: kernel.PrincipalId) u64 {
 }
 
 // ---------------------------------------------------------------------------
-// FX state support (called during initKernelRuntimeOrHalt)
+// Extended user state support (called during initKernelRuntimeOrHalt)
 // ---------------------------------------------------------------------------
 
-fn initFxStateSupport() void {
-    var cr0 = readCr0();
-    cr0 &= ~@as(u64, 1 << 2); // EM=0
-    cr0 |= @as(u64, 1 << 1); // MP=1
-    writeCr0(cr0);
-    var cr4 = readCr4();
-    cr4 |= @as(u64, (1 << 9) | (1 << 10)); // OSFXSR | OSXMMEXCPT
-    writeCr4(cr4);
-    asm volatile ("clts");
-    asm volatile ("fninit");
-    asm volatile ("fxsave64 (%[ptr])"
-        :
-        : [ptr] "r" (&scheduler.initial_fx_state),
-        : .{ .memory = true });
+fn initXStateSupport() void {
+    if (!x86_platform.enableAvxXStateForCurrentCpu()) {
+        halt.haltWithMessage("AVX xstate unavailable");
+    }
+    @memset(&scheduler.initial_x_state, 0);
+    x86_platform.saveXState(&scheduler.initial_x_state);
 }
 
 // ---------------------------------------------------------------------------
 // Exported extended user-state save/restore (called from assembly stubs in traps)
 // ---------------------------------------------------------------------------
 
-pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
+pub export fn saveCurrentThreadXState() callconv(.winapi) void {
     if (!kernel_runtime.kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
@@ -201,36 +164,16 @@ pub export fn saveCurrentThreadFxState() callconv(.winapi) void {
     // the user FX image before scheduler ownership is severed.
     if (!ctx.allocated) return;
     ctx.pkru = x86_platform.readPkru();
-    asm volatile ("fxsave64 (%[ptr])"
-        :
-        : [ptr] "r" (&ctx.fx_state),
-        : .{ .memory = true });
+    x86_platform.saveXState(&ctx.x_state);
 }
 
-pub export fn restoreCurrentThreadFxState() callconv(.c) void {
+pub export fn restoreCurrentThreadXState() callconv(.c) void {
     if (!kernel_runtime.kernel_state_ready) return;
     const thread_index = scheduler.currentThread();
     const ctx = scheduler.threadContextMutable(thread_index) orelse return;
     if (!scheduler.threadReady(thread_index)) return;
     x86_platform.writePkru(ctx.pkru);
-    asm volatile ("fxrstor64 (%[ptr])"
-        :
-        : [ptr] "r" (&ctx.fx_state),
-        : .{ .memory = true });
-}
-
-pub export fn saveKernelInterruptFxState() callconv(.winapi) void {
-    asm volatile ("fxsave64 (%[ptr])"
-        :
-        : [ptr] "r" (&scheduler.kernel_interrupt_fx_state),
-        : .{ .memory = true });
-}
-
-pub export fn restoreKernelInterruptFxState() callconv(.winapi) void {
-    asm volatile ("fxrstor64 (%[ptr])"
-        :
-        : [ptr] "r" (&scheduler.kernel_interrupt_fx_state),
-        : .{ .memory = true });
+    x86_platform.restoreXState(&ctx.x_state);
 }
 
 // ---------------------------------------------------------------------------
@@ -252,13 +195,14 @@ fn installInterruptTrampolines() void {
         .device_interrupt_stub = @intFromPtr(&traps.deviceInterruptHandlerStub),
         .lapic_timer_vector = boot_static.lapic_timer_vector,
         .scheduler_wake_ipi_vector = boot_static.scheduler_wake_ipi_vector,
-        .device_interrupt_vector = generic_device_interrupt_vector,
+        .unrouted_device_interrupt_vector = unrouted_device_interrupt_vector,
+        .device_interrupt_vector = device_interrupt_vector,
         .device_interrupt_vector_count = device_interrupt_vector_count,
     });
 }
 
 fn initKernelRuntimeOrHalt() void {
-    initFxStateSupport();
+    initXStateSupport();
     if (!boot_static.debug_skip_cr3_switch) {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
             halt.haltWithMessage("page table install failed");
@@ -677,7 +621,7 @@ fn enterUserModeIretq(user_entry_va: u64, user_rsp: u64) noreturn {
     const user_rflags: u64 = boot_static.user_entry_rflags;
     const kernel_transition_rsp = x86_platform.ring0StackTop();
 
-    restoreCurrentThreadFxState();
+    restoreCurrentThreadXState();
 
     // user_return_iret_frame lives in main.zig (exported asm symbol)
     const iret: *volatile [5]u64 = @extern(*volatile [5]u64, .{ .name = "user_return_iret_frame" });
@@ -897,10 +841,11 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
 
 pub fn prepareBootPrelude() void {
     asm volatile ("cli");
-    initFxStateSupport();
+    initXStateSupport();
     lapic.maskLegacyPic();
     kernel_log.reset();
     serial.init();
+    pci.clearInterruptRoutes();
     boot_init_principal = null;
 }
 
@@ -951,6 +896,9 @@ fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *
                 if (!shouldExposeGenericPciFunction(loc, vendor_id)) continue;
                 if (descriptor_index.* >= boot_abi.init_bootstrap_abi.max_device_descriptors) return;
                 const resource_id = pci.resourceIdFromLocation(loc);
+                if (!pci.registerInterruptRoute(resource_id, descriptor_index.*)) {
+                    halt.haltWithMessage("PCI interrupt route registration failed");
+                }
                 appendDetectedDevice(&result.devices, .{
                     .descriptor = descriptorFromPciFunction(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),
                     .dma_device = resource_id,

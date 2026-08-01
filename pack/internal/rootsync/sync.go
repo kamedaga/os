@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"capabilityos/pack/internal/config"
+	"capabilityos/pack/internal/imagelock"
 	"capabilityos/pack/internal/progress"
 )
 
@@ -83,6 +84,12 @@ func syncPartition(workspace *config.Workspace, partitionName string, manifestPa
 	filesystem := normalizeFilesystem(partition.Format)
 	cacheFilesystem := cacheFilesystemKey(filesystem)
 	diskPath := workspace.Path(workspace.Disk.Image)
+	locks, err := imagelock.Acquire(diskPath)
+	if err != nil {
+		span.Fail("disk image lock failed")
+		return Result{}, err
+	}
+	defer locks.Close()
 	span.Set(2, "fingerprinting manifest")
 	layoutFingerprint, err := ManifestContentFingerprint(manifestPath)
 	if err != nil {

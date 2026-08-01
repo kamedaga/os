@@ -181,6 +181,7 @@ uint32_t filed_rights_to_vfs(uint64_t rights)
         FILED_RIGHT_WRITE |
         FILED_RIGHT_EXEC |
         FILED_RIGHT_STAT |
+        FILED_RIGHT_SETATTR |
         FILED_RIGHT_GETDENTS |
         FILED_RIGHT_CREATE |
         FILED_RIGHT_REMOVE |
@@ -477,7 +478,8 @@ void filed_close_walk_handle(
         handle_id != 0 &&
         handle_id != runtime->root_handle_id &&
         (!runtime->tmpfs_root_handle_valid || handle_id != runtime->tmpfs_root_handle_id) &&
-        (!runtime->run_tmpfs_root_handle_valid || handle_id != runtime->run_tmpfs_root_handle_id))
+        (!runtime->run_tmpfs_root_handle_valid || handle_id != runtime->run_tmpfs_root_handle_id) &&
+        (!runtime->shm_tmpfs_root_handle_valid || handle_id != runtime->shm_tmpfs_root_handle_id))
     {
         (void)filed_close_handle_runtime_deferred(runtime, handle_id);
     }

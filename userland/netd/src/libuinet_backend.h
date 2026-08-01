@@ -35,5 +35,6 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint
 int netd_libuinet_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_revents, int32_t *out_error);
 int netd_libuinet_socket_close(uint64_t handle);
 int netd_libuinet_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set);
-void netd_libuinet_socket_reap_hangups(void);
+void netd_libuinet_socket_reap_hangups(
+    const struct pacha_service_wait_set *wait_set);
 int netd_filed_close_handle(uint64_t handle);

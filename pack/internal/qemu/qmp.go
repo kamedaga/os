@@ -86,11 +86,6 @@ type inputSendEvent struct {
 	Code  string
 	Value int
 	Down  bool
-
-	// repeat and interval are parser metadata carried by the first real event.
-	// They are stripped before constructing QMP input-send-event frames.
-	repeat   int
-	interval time.Duration
 }
 
 const (
@@ -100,86 +95,102 @@ const (
 )
 
 type inputSendCheck struct {
-	Marker string
-	Events []inputSendEvent
+	Marker   string
+	Patterns [][]inputSendEvent
+	Repeat   int
+	Interval time.Duration
 }
 
 func parseInputSendCheck(value string) (inputSendCheck, error) {
 	var check inputSendCheck
 	markerAndEvents := strings.SplitN(value, "@", 2)
 	if len(markerAndEvents) != 2 || markerAndEvents[0] == "" || markerAndEvents[1] == "" {
-		return check, fmt.Errorf("invalid input send event %q; expected MARKER@[meta:repeat=N,meta:interval-us=N,]key:a=down,rel:x=4,btn:left=up", value)
+		return check, fmt.Errorf("invalid input send event %q; expected MARKER@[meta:repeat=N,meta:interval-us=N,]key:a=down,rel:x=4,btn:left=up[;abs:x=8,abs:y=8]", value)
 	}
 	check.Marker = markerAndEvents[0]
 	repeat := 1
 	var interval time.Duration
 	var repeatSet, intervalSet bool
-	for _, token := range strings.Split(markerAndEvents[1], ",") {
-		nameAndValue := strings.SplitN(token, "=", 2)
-		kindAndCode := strings.SplitN(nameAndValue[0], ":", 2)
-		if len(nameAndValue) != 2 || len(kindAndCode) != 2 || kindAndCode[1] == "" {
-			return inputSendCheck{}, fmt.Errorf("invalid input event %q", token)
+	for patternIndex, patternText := range strings.Split(markerAndEvents[1], ";") {
+		if patternText == "" {
+			return inputSendCheck{}, fmt.Errorf("input send event %q contains an empty pattern", value)
 		}
-		if kindAndCode[0] == "meta" {
-			parsed, err := strconv.ParseInt(nameAndValue[1], 10, 64)
-			if err != nil {
-				return inputSendCheck{}, fmt.Errorf("invalid input send metadata %q", token)
+		var pattern []inputSendEvent
+		for _, token := range strings.Split(patternText, ",") {
+			nameAndValue := strings.SplitN(token, "=", 2)
+			kindAndCode := strings.SplitN(nameAndValue[0], ":", 2)
+			if len(nameAndValue) != 2 || len(kindAndCode) != 2 || kindAndCode[1] == "" {
+				return inputSendCheck{}, fmt.Errorf("invalid input event %q", token)
 			}
-			switch kindAndCode[1] {
-			case "repeat":
-				if repeatSet {
-					return inputSendCheck{}, fmt.Errorf("duplicate input send metadata %q", kindAndCode[1])
+			if kindAndCode[0] == "meta" {
+				if patternIndex != 0 {
+					return inputSendCheck{}, fmt.Errorf("input send metadata must be in the first pattern")
 				}
-				if parsed < 1 || parsed > maxInputSendRepeat {
-					return inputSendCheck{}, fmt.Errorf("input send repeat must be between 1 and %d", maxInputSendRepeat)
+				parsed, err := strconv.ParseInt(nameAndValue[1], 10, 64)
+				if err != nil {
+					return inputSendCheck{}, fmt.Errorf("invalid input send metadata %q", token)
 				}
-				repeat = int(parsed)
-				repeatSet = true
-			case "interval-us":
-				if intervalSet {
-					return inputSendCheck{}, fmt.Errorf("duplicate input send metadata %q", kindAndCode[1])
+				switch kindAndCode[1] {
+				case "repeat":
+					if repeatSet {
+						return inputSendCheck{}, fmt.Errorf("duplicate input send metadata %q", kindAndCode[1])
+					}
+					if parsed < 1 || parsed > maxInputSendRepeat {
+						return inputSendCheck{}, fmt.Errorf("input send repeat must be between 1 and %d", maxInputSendRepeat)
+					}
+					repeat = int(parsed)
+					repeatSet = true
+				case "interval-us":
+					if intervalSet {
+						return inputSendCheck{}, fmt.Errorf("duplicate input send metadata %q", kindAndCode[1])
+					}
+					if parsed < 0 || parsed > int64(maxInputSendInterval/time.Microsecond) {
+						return inputSendCheck{}, fmt.Errorf("input send interval-us must be between 0 and %d", maxInputSendInterval/time.Microsecond)
+					}
+					interval = time.Duration(parsed) * time.Microsecond
+					intervalSet = true
+				default:
+					return inputSendCheck{}, fmt.Errorf("unsupported input send metadata %q", kindAndCode[1])
 				}
-				if parsed < 0 || parsed > int64(maxInputSendInterval/time.Microsecond) {
-					return inputSendCheck{}, fmt.Errorf("input send interval-us must be between 0 and %d", maxInputSendInterval/time.Microsecond)
+				continue
+			}
+			event := inputSendEvent{Kind: kindAndCode[0], Code: kindAndCode[1]}
+			switch event.Kind {
+			case "key", "btn":
+				if nameAndValue[1] != "down" && nameAndValue[1] != "up" {
+					return inputSendCheck{}, fmt.Errorf("invalid %s state %q", event.Kind, nameAndValue[1])
 				}
-				interval = time.Duration(parsed) * time.Microsecond
-				intervalSet = true
+				event.Down = nameAndValue[1] == "down"
+			case "rel", "abs":
+				parsed, err := strconv.Atoi(nameAndValue[1])
+				if err != nil {
+					return inputSendCheck{}, fmt.Errorf("invalid %s value %q", event.Kind, nameAndValue[1])
+				}
+				event.Value = parsed
 			default:
-				return inputSendCheck{}, fmt.Errorf("unsupported input send metadata %q", kindAndCode[1])
+				return inputSendCheck{}, fmt.Errorf("unsupported input event kind %q", event.Kind)
 			}
-			continue
+			pattern = append(pattern, event)
 		}
-		event := inputSendEvent{Kind: kindAndCode[0], Code: kindAndCode[1]}
-		switch event.Kind {
-		case "key", "btn":
-			if nameAndValue[1] != "down" && nameAndValue[1] != "up" {
-				return inputSendCheck{}, fmt.Errorf("invalid %s state %q", event.Kind, nameAndValue[1])
-			}
-			event.Down = nameAndValue[1] == "down"
-		case "rel", "abs":
-			parsed, err := strconv.Atoi(nameAndValue[1])
-			if err != nil {
-				return inputSendCheck{}, fmt.Errorf("invalid %s value %q", event.Kind, nameAndValue[1])
-			}
-			event.Value = parsed
-		default:
-			return inputSendCheck{}, fmt.Errorf("unsupported input event kind %q", event.Kind)
+		if len(pattern) == 0 {
+			return inputSendCheck{}, fmt.Errorf("input send event %q contains a pattern with no events", value)
 		}
-		check.Events = append(check.Events, event)
-	}
-	if len(check.Events) == 0 {
-		return inputSendCheck{}, fmt.Errorf("input send event %q contains no events", value)
+		check.Patterns = append(check.Patterns, pattern)
 	}
 	if intervalSet && !repeatSet {
 		return inputSendCheck{}, fmt.Errorf("input send interval-us requires meta:repeat")
 	}
+	if len(check.Patterns) > 1 && !repeatSet {
+		return inputSendCheck{}, fmt.Errorf("alternating input patterns require meta:repeat")
+	}
+	if repeat < len(check.Patterns) {
+		return inputSendCheck{}, fmt.Errorf("input send repeat must cover every alternating pattern")
+	}
 	if time.Duration(repeat)*interval > maxInputSendDuration {
 		return inputSendCheck{}, fmt.Errorf("input send stream duration must not exceed %s", maxInputSendDuration)
 	}
-	if repeatSet {
-		check.Events[0].repeat = repeat
-		check.Events[0].interval = interval
-	}
+	check.Repeat = repeat
+	check.Interval = interval
 	return check, nil
 }
 
@@ -330,12 +341,10 @@ func splitInputSendEventFrames(events []inputSendEvent) ([][]inputSendEvent, err
 	return frames, nil
 }
 
-func inputSendEventSchedule(events []inputSendEvent) (int, time.Duration, []inputSendEvent, error) {
-	if len(events) == 0 {
-		return 0, 0, nil, fmt.Errorf("input event sequence is empty")
+func inputSendEventSchedule(patterns [][]inputSendEvent, repeat int, interval time.Duration) (int, time.Duration, [][][]inputSendEvent, error) {
+	if len(patterns) == 0 {
+		return 0, 0, nil, fmt.Errorf("input event pattern list is empty")
 	}
-	repeat := events[0].repeat
-	interval := events[0].interval
 	if repeat == 0 {
 		repeat = 1
 	}
@@ -348,12 +357,18 @@ func inputSendEventSchedule(events []inputSendEvent) (int, time.Duration, []inpu
 	if time.Duration(repeat)*interval > maxInputSendDuration {
 		return 0, 0, nil, fmt.Errorf("input send stream duration must not exceed %s", maxInputSendDuration)
 	}
-	clean := append([]inputSendEvent(nil), events...)
-	for i := range clean {
-		clean[i].repeat = 0
-		clean[i].interval = 0
+	patternFrames := make([][][]inputSendEvent, 0, len(patterns))
+	for _, pattern := range patterns {
+		if len(pattern) == 0 {
+			return 0, 0, nil, fmt.Errorf("input event pattern is empty")
+		}
+		frames, err := splitInputSendEventFrames(pattern)
+		if err != nil {
+			return 0, 0, nil, err
+		}
+		patternFrames = append(patternFrames, frames)
 	}
-	return repeat, interval, clean, nil
+	return repeat, interval, patternFrames, nil
 }
 
 const inputSendStreamWindow = 128
@@ -418,27 +433,27 @@ func (client *qmpClient) writeInputSendStreamRequest(id string, events []inputSe
 	return nil
 }
 
-func (client *qmpClient) inputSendEventFrames(events []inputSendEvent) error {
-	repeat, interval, cleanEvents, err := inputSendEventSchedule(events)
-	if err != nil {
-		return err
-	}
-	frames, err := splitInputSendEventFrames(cleanEvents)
+func (client *qmpClient) inputSendEventPatterns(patterns [][]inputSendEvent, repeat int, interval time.Duration) error {
+	repeat, interval, patternFrames, err := inputSendEventSchedule(patterns, repeat, interval)
 	if err != nil {
 		return err
 	}
 	if repeat == 1 {
-		for _, frame := range frames {
+		for _, frame := range patternFrames[0] {
 			if err := client.inputSendEvents(frame); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
-	if len(frames) > int(^uint(0)>>1)/repeat {
-		return fmt.Errorf("too many input-send-event requests")
+	totalRequests := 0
+	for iteration := 0; iteration < repeat; iteration++ {
+		frameCount := len(patternFrames[iteration%len(patternFrames)])
+		if totalRequests > int(^uint(0)>>1)-frameCount {
+			return fmt.Errorf("too many input-send-event requests")
+		}
+		totalRequests += frameCount
 	}
-	totalRequests := repeat * len(frames)
 
 	// Keep the normal execute path out of the stream until every response has
 	// been drained. QMP command IDs let the pipelined responses be validated.
@@ -522,7 +537,7 @@ func (client *qmpClient) inputSendEventFrames(events []inputSendEvent) error {
 			abortReader()
 			return fmt.Errorf("read QMP input-send-event response: %w", err)
 		}
-		for _, frame := range frames {
+		for _, frame := range patternFrames[iteration%len(patternFrames)] {
 			for sent-received >= inputSendStreamWindow {
 				if err := handleResponse(<-responses); err != nil {
 					abortReader()

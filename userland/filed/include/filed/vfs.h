@@ -332,6 +332,14 @@ filed_status_t filed_vfs_stat_prepare(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
     filed_vfs_io_decision_t *out_decision);
+filed_status_t filed_vfs_setattr_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision);
+filed_status_t filed_vfs_setattr_snapshot_valid(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    bool *out_valid);
 filed_status_t filed_vfs_get_stat_snapshot(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,

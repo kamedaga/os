@@ -59,9 +59,20 @@ wait_for_tree_pid()
     local socket=$1
     local pid=$2
     local ticks=0
+    local tree_error_file="$runtime/gtk-fishbowl-swaymsg.err"
     while [[ $ticks -lt 90 ]]; do
         local tree
-        tree=$(/usr/bin/swaymsg -s "$socket" -t get_tree 2>/dev/null) || true
+        local tree_error
+        local tree_status
+        tree=$(/usr/bin/timeout -s KILL 5s /usr/bin/swaymsg \
+            -s "$socket" -t get_tree 2>"$tree_error_file")
+        tree_status=$?
+        if [[ $tree_status -ne 0 ]]; then
+            tree_error=
+            IFS= read -r tree_error <"$tree_error_file" || true
+            printf 'GTK_FISHBOWL_IPC_RETRY attempt=%u status=%d error=%q\n' \
+                "$((ticks + 1))" "$tree_status" "$tree_error"
+        fi
         if [[ $tree =~ \"pid\"[[:space:]]*:[[:space:]]*$pid([,}]) ]]; then
             return 0
         fi
@@ -69,6 +80,7 @@ wait_for_tree_pid()
         wait_tick 1
         ticks=$((ticks + 1))
     done
+    rm -f "$tree_error_file"
     return 1
 }
 
@@ -143,11 +155,10 @@ printf 'GTK_FISHBOWL_BASELINE_BEGIN fullscreen=%s\n' \
 wait_tick 8
 printf 'GTK_FISHBOWL_BASELINE_END\n'
 
-printf 'GTK_FISHBOWL_MOUSE_BEGIN nominal_hz=%s delta=%s\n' \
-    "${GTK_FISHBOWL_MOUSE_HZ:-1000}" \
-    "${GTK_FISHBOWL_MOUSE_DELTA:-1}"
+printf 'GTK_FISHBOWL_TABLET_BEGIN nominal_hz=%s\n' \
+    "${GTK_FISHBOWL_TABLET_HZ:-1000}"
 wait_tick 10
-printf 'GTK_FISHBOWL_MOUSE_END\n'
+printf 'GTK_FISHBOWL_TABLET_END\n'
 wait_tick 1
 
 kill -TERM "$gtk_pid" 2>/dev/null || true
@@ -164,6 +175,5 @@ if ! pid_stopped "$gtk_pid"; then
 fi
 wait "$gtk_pid" 2>/dev/null || true
 stop_sway "$socket" "$sway_pid"
-printf 'GTK_FISHBOWL_PASS baseline_seconds=8 mouse_seconds=10 mouse_hz=%s delta=%s\n' \
-    "${GTK_FISHBOWL_MOUSE_HZ:-1000}" \
-    "${GTK_FISHBOWL_MOUSE_DELTA:-1}"
+printf 'GTK_FISHBOWL_PASS baseline_seconds=8 tablet_seconds=10 tablet_hz=%s\n' \
+    "${GTK_FISHBOWL_TABLET_HZ:-1000}"

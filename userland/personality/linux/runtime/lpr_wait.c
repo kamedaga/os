@@ -293,8 +293,13 @@ int64_t lpr_wait_graph_block(
                 continue;
             if (graph->drain_modes[i] == LPR_WAIT_DRAIN_EVENT)
                 lpr_eventfd_drain_wait(graph->logical_fds[i]);
-            else if (graph->drain_modes[i] == LPR_WAIT_DRAIN_NATIVE)
+            else if (graph->drain_modes[i] == LPR_WAIT_DRAIN_NATIVE) {
+                if (graph->logical_fds[i] != UINT32_MAX &&
+                    lpr_linux_socket_fd_active(graph->logical_fds[i])) {
+                    lpr_linux_socket_mark_readable(graph->logical_fds[i]);
+                }
                 lpr_native_wait_drain(graph->leaves[i].fd);
+            }
         }
     }
 

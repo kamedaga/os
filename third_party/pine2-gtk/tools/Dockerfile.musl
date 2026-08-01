@@ -1,0 +1,37 @@
+FROM alpine:3.21
+
+ARG CMARK_GFM_VERSION=0.29.0.gfm.13
+ARG CMARK_GFM_SHA256=5abc61798ebd9de5660bc076443c07abad2b8d15dbc11094a3a79644b8ad243a
+
+RUN apk add --no-cache \
+      build-base \
+      ca-certificates \
+      cmake \
+      curl-dev \
+      gtk+3.0-dev \
+      json-c-dev \
+      meson \
+      samurai \
+      xvfb-run
+
+# Alpine 3.21 does not package cmark-gfm. Build the pinned upstream release so
+# the native article renderer keeps its GFM tables and strikethrough support.
+RUN set -eux; \
+    archive="/tmp/cmark-gfm-${CMARK_GFM_VERSION}.tar.gz"; \
+    wget -qO "$archive" \
+      "https://github.com/github/cmark-gfm/archive/refs/tags/${CMARK_GFM_VERSION}.tar.gz"; \
+    echo "${CMARK_GFM_SHA256}  $archive" | sha256sum -c -; \
+    tar -xzf "$archive" -C /tmp; \
+    cmake \
+      -S "/tmp/cmark-gfm-${CMARK_GFM_VERSION}" \
+      -B /tmp/cmark-gfm-build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMARK_SHARED=OFF \
+      -DCMARK_STATIC=ON \
+      -DCMARK_TESTS=OFF; \
+    cmake --build /tmp/cmark-gfm-build --parallel; \
+    cmake --install /tmp/cmark-gfm-build; \
+    rm -rf "$archive" "/tmp/cmark-gfm-${CMARK_GFM_VERSION}" /tmp/cmark-gfm-build
+
+WORKDIR /src

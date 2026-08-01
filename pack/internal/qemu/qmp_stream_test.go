@@ -27,17 +27,33 @@ func TestParseInputSendCheckStreamMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if check.Marker != "MOUSE_BEGIN" || len(check.Events) != 2 {
+	if check.Marker != "MOUSE_BEGIN" || len(check.Patterns) != 1 || len(check.Patterns[0]) != 2 {
 		t.Fatalf("unexpected check: %#v", check)
 	}
-	if check.Events[0].repeat != 4 || check.Events[0].interval != 8*time.Millisecond {
-		t.Fatalf("unexpected stream schedule: %#v", check.Events[0])
+	if check.Repeat != 4 || check.Interval != 8*time.Millisecond {
+		t.Fatalf("unexpected stream schedule: %#v", check)
 	}
-	if check.Events[0].Kind != "rel" || check.Events[1].Kind != "rel" {
-		t.Fatalf("metadata leaked into QMP events: %#v", check.Events)
+	if check.Patterns[0][0].Kind != "rel" || check.Patterns[0][1].Kind != "rel" {
+		t.Fatalf("metadata leaked into QMP events: %#v", check.Patterns)
 	}
-	if check.Events[1].repeat != 0 || check.Events[1].interval != 0 {
-		t.Fatalf("schedule must only be carried by the first event: %#v", check.Events[1])
+	if len(check.Patterns[0]) != 2 {
+		t.Fatalf("metadata was parsed as an event: %#v", check.Patterns[0])
+	}
+}
+
+func TestParseInputSendCheckAlternatingPatterns(t *testing.T) {
+	check, err := parseInputSendCheck("TABLET_BEGIN@meta:repeat=4,meta:interval-us=1000,abs:x=10,abs:y=20;abs:x=30,abs:y=40")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if check.Marker != "TABLET_BEGIN" || check.Repeat != 4 || check.Interval != time.Millisecond {
+		t.Fatalf("unexpected check: %#v", check)
+	}
+	if len(check.Patterns) != 2 || len(check.Patterns[0]) != 2 || len(check.Patterns[1]) != 2 {
+		t.Fatalf("unexpected patterns: %#v", check.Patterns)
+	}
+	if check.Patterns[0][0].Value != 10 || check.Patterns[1][0].Value != 30 {
+		t.Fatalf("pattern order changed: %#v", check.Patterns)
 	}
 }
 
@@ -52,6 +68,10 @@ func TestParseInputSendCheckRejectsInvalidStreamMetadata(t *testing.T) {
 		"M@meta:repeat=2,meta:interval-us=30000001,rel:x=1",
 		"M@meta:unknown=2,rel:x=1",
 		"M@meta:repeat=2,meta:interval-us=1000",
+		"M@abs:x=1;abs:x=2",
+		"M@meta:repeat=1,abs:x=1;abs:x=2",
+		"M@meta:repeat=2,abs:x=1;",
+		"M@meta:repeat=2,abs:x=1;meta:interval-us=1000,abs:x=2",
 	}
 	for _, value := range tests {
 		t.Run(value, func(t *testing.T) {
@@ -126,7 +146,7 @@ func TestInputSendEventFramesSingleUsesLegacyRequest(t *testing.T) {
 		_, err = serverConn.Write([]byte("{\"return\":{}}\n"))
 		serverDone <- err
 	}()
-	if err := client.inputSendEventFrames([]inputSendEvent{{Kind: "rel", Code: "x", Value: 2, repeat: 1, interval: time.Millisecond}}); err != nil {
+	if err := client.inputSendEventPatterns([][]inputSendEvent{{{Kind: "rel", Code: "x", Value: 2}}}, 1, time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	if err := <-serverDone; err != nil {
@@ -185,9 +205,9 @@ func TestInputSendEventFramesPipelinesRequests(t *testing.T) {
 		serverDone <- nil
 	}()
 
-	events := []inputSendEvent{{Kind: "rel", Code: "x", Value: 1, repeat: 3}}
+	patterns := [][]inputSendEvent{{{Kind: "rel", Code: "x", Value: 1}}}
 	result := make(chan error, 1)
-	go func() { result <- client.inputSendEventFrames(events) }()
+	go func() { result <- client.inputSendEventPatterns(patterns, 3, 0) }()
 	select {
 	case err := <-result:
 		if err != nil {
@@ -196,6 +216,61 @@ func TestInputSendEventFramesPipelinesRequests(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		client.Close()
 		t.Fatal("pipelined input stream timed out")
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+}
+
+func TestInputSendEventPatternsAlternatePerReport(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	client := &qmpClient{conn: clientConn, reader: bufio.NewReader(clientConn)}
+	serverDone := make(chan error, 1)
+	go func() {
+		defer serverConn.Close()
+		reader := bufio.NewReader(serverConn)
+		want := []int{10, 30, 10, 30}
+		for index, wantValue := range want {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			var request struct {
+				ID        string `json:"id"`
+				Arguments struct {
+					Events []struct {
+						Data struct {
+							Value int `json:"value"`
+						} `json:"data"`
+					} `json:"events"`
+				} `json:"arguments"`
+			}
+			if err := json.Unmarshal(line, &request); err != nil {
+				serverDone <- err
+				return
+			}
+			if request.ID == "" || len(request.Arguments.Events) != 2 ||
+				request.Arguments.Events[0].Data.Value != wantValue {
+				serverDone <- fmt.Errorf("request %d did not use pattern value %d: %s", index, wantValue, line)
+				return
+			}
+			response, _ := json.Marshal(map[string]any{"return": map[string]any{}, "id": request.ID})
+			if _, err := serverConn.Write(append(response, '\n')); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+		serverDone <- nil
+	}()
+
+	patterns := [][]inputSendEvent{
+		{{Kind: "abs", Code: "x", Value: 10}, {Kind: "abs", Code: "y", Value: 20}},
+		{{Kind: "abs", Code: "x", Value: 30}, {Kind: "abs", Code: "y", Value: 40}},
+	}
+	if err := client.inputSendEventPatterns(patterns, 4, 0); err != nil {
+		t.Fatal(err)
 	}
 	if err := <-serverDone; err != nil {
 		t.Fatal(err)
@@ -233,8 +308,8 @@ func TestInputSendEventFramesHonorsStreamInterval(t *testing.T) {
 	}()
 
 	start := time.Now()
-	events := []inputSendEvent{{Kind: "rel", Code: "x", Value: 1, repeat: 4, interval: 15 * time.Millisecond}}
-	if err := client.inputSendEventFrames(events); err != nil {
+	patterns := [][]inputSendEvent{{{Kind: "rel", Code: "x", Value: 1}}}
+	if err := client.inputSendEventPatterns(patterns, 4, 15*time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
 	elapsed := time.Since(start)

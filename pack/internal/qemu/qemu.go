@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"capabilityos/pack/internal/config"
+	"capabilityos/pack/internal/imagelock"
 	"capabilityos/pack/internal/progress"
 )
 
@@ -22,6 +23,7 @@ type Options struct {
 	Memory          string
 	CPUs            int
 	Display         string
+	GraphicsProfile string
 	Console         string
 	Firmware        string
 	DiskImage       string
@@ -57,6 +59,50 @@ type commandPlan struct {
 	HostTimeLog   string
 	ConsoleSocket string
 	QMPSocket     string
+	ImagePaths    []string
+	Prepare       func() error
+}
+
+// processWait broadcasts one Cmd.Wait result to every observer. A channel
+// carrying an error is consumable; QMP/socket/boot-marker paths must all be
+// able to observe a QEMU exit independently.
+type processWait struct {
+	done chan struct{}
+	mu   sync.Mutex
+	err  error
+}
+
+func watchProcess(cmd *exec.Cmd) *processWait {
+	wait := &processWait{done: make(chan struct{})}
+	go func() {
+		err := cmd.Wait()
+		wait.mu.Lock()
+		wait.err = err
+		wait.mu.Unlock()
+		close(wait.done)
+	}()
+	return wait
+}
+
+func (wait *processWait) Err() error {
+	if wait == nil {
+		return nil
+	}
+	<-wait.done
+	wait.mu.Lock()
+	defer wait.mu.Unlock()
+	return wait.err
+}
+
+func lockPlanImages(plan commandPlan) (*imagelock.Set, error) {
+	return imagelock.Acquire(plan.ImagePaths...)
+}
+
+func preparePlan(plan commandPlan) error {
+	if plan.Prepare == nil {
+		return nil
+	}
+	return plan.Prepare()
 }
 
 type SmokeOptions struct {
@@ -85,6 +131,7 @@ type TTYTestOptions struct {
 	NoKVM            bool
 	CPUs             int
 	Display          string
+	GraphicsProfile  string
 	InputProfile     string
 	ExtraArgs        []string
 	BootMarker       string
@@ -214,6 +261,16 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 		span.Done("qemu dry-run ready")
 		return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog, DryRun: true}, nil
 	}
+	locks, err := lockPlanImages(plan)
+	if err != nil {
+		span.Fail("qemu image lock failed")
+		return Result{}, err
+	}
+	defer locks.Close()
+	if err := preparePlan(plan); err != nil {
+		span.Fail("qemu image preparation failed")
+		return Result{}, err
+	}
 	span.Set(3, "starting qemu")
 	hostLogFile, err := os.Create(plan.HostTimeLog)
 	if err != nil {
@@ -232,20 +289,18 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = io.MultiWriter(os.Stdout, stdoutLog)
 	cmd.Stderr = io.MultiWriter(os.Stderr, stderrLog)
+	cmd.ExtraFiles = locks.ExtraFiles()
 	if err := cmd.Start(); err != nil {
 		span.Fail("qemu start failed")
 		return Result{}, err
 	}
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
+	wait := watchProcess(cmd)
 	if plan.ConsoleSocket != "" {
 		span.Set(4, "waiting for virtio-console socket")
-		if exited, err := waitForSocketOrExit(plan.ConsoleSocket, done, 5*time.Second); err != nil {
+		if exited, err := waitForSocketOrExit(plan.ConsoleSocket, wait, 5*time.Second); err != nil {
 			if !exited && cmd.Process != nil {
 				_ = cmd.Process.Kill()
-				<-done
+				_ = wait.Err()
 			}
 			span.Fail("virtio-console socket failed")
 			return Result{}, err
@@ -259,14 +314,14 @@ func Run(workspace *config.Workspace, opts Options) (Result, error) {
 			consoleCmd.Dir = workspace.Root
 			if err := consoleCmd.Start(); err != nil {
 				_ = cmd.Process.Kill()
-				<-done
+				_ = wait.Err()
 				span.Fail("console terminal start failed")
 				return Result{}, err
 			}
 		}
 	}
 	span.Done("qemu started")
-	if err := <-done; err != nil {
+	if err := wait.Err(); err != nil {
 		return Result{}, err
 	}
 	return Result{Command: plan.Args, ConsoleCommand: consoleArgs, ConsoleSocket: plan.ConsoleSocket, Log: plan.LogPath, HostTimeLog: plan.HostTimeLog}, nil
@@ -297,6 +352,16 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 		span.Fail("qemu command failed")
 		return SmokeResult{}, err
 	}
+	locks, err := lockPlanImages(plan)
+	if err != nil {
+		span.Fail("qemu image lock failed")
+		return SmokeResult{}, err
+	}
+	defer locks.Close()
+	if err := preparePlan(plan); err != nil {
+		span.Fail("qemu image preparation failed")
+		return SmokeResult{}, err
+	}
 	serialPath := filepath.Join(workspace.Path(workspace.Artifacts), "serial-smoke.log")
 	if err := os.MkdirAll(filepath.Dir(serialPath), 0o755); err != nil {
 		span.Fail("serial log directory failed")
@@ -311,6 +376,7 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 
 	cmd := exec.Command(plan.Args[0], plan.Args[1:]...)
 	cmd.Dir = workspace.Root
+	cmd.ExtraFiles = locks.ExtraFiles()
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return SmokeResult{}, err
@@ -353,8 +419,7 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 		scan(stderr)
 	}()
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	wait := watchProcess(cmd)
 	timer := time.NewTimer(opts.Timeout)
 	defer timer.Stop()
 
@@ -374,17 +439,18 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 			_ = cmd.Process.Signal(os.Interrupt)
 		}
 		select {
-		case <-done:
+		case <-wait.done:
 		case <-time.After(2 * time.Second):
 			_ = cmd.Process.Kill()
-			<-done
+			_ = wait.Err()
 		}
 		scanners.Wait()
 		span.Done("qemu smoke passed")
 		return result, nil
-	case err := <-done:
+	case <-wait.done:
 		scanners.Wait()
 		span.Fail("qemu exited")
+		err := wait.Err()
 		if err != nil {
 			return result, fmt.Errorf("qemu exited before smoke marker: %w", err)
 		}
@@ -393,7 +459,7 @@ func Smoke(workspace *config.Workspace, opts SmokeOptions) (SmokeResult, error) 
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		<-done
+		_ = wait.Err()
 		scanners.Wait()
 		span.Fail("qemu smoke timed out")
 		return result, fmt.Errorf("smoke marker not reached within %s", opts.Timeout)
@@ -407,7 +473,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		opts.Timeout = 30 * time.Second
 	}
 	if opts.BootMarker == "" {
-		opts.BootMarker = "[termd] linux tty hvc open ready index=0 handle=2"
+		opts.BootMarker = "[termd] linux tty hvc open ready index=0 handle="
 	}
 	if len(opts.Send) == 0 && opts.Python == "" {
 		opts.Send = []string{"hello from pacgo"}
@@ -443,6 +509,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 	plan, err := commandArgs(workspace, Options{
 		Display:         opts.Display,
+		GraphicsProfile: opts.GraphicsProfile,
 		Console:         "pty",
 		NewTerminal:     true,
 		NoKVM:           opts.NoKVM,
@@ -455,6 +522,16 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	})
 	if err != nil {
 		span.Fail("qemu command failed")
+		return TTYTestResult{}, err
+	}
+	locks, err := lockPlanImages(plan)
+	if err != nil {
+		span.Fail("qemu image lock failed")
+		return TTYTestResult{}, err
+	}
+	defer locks.Close()
+	if err := preparePlan(plan); err != nil {
+		span.Fail("qemu image preparation failed")
 		return TTYTestResult{}, err
 	}
 
@@ -496,6 +573,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 
 	cmd := exec.Command(plan.Args[0], plan.Args[1:]...)
 	cmd.Dir = workspace.Root
+	cmd.ExtraFiles = locks.ExtraFiles()
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return TTYTestResult{}, err
@@ -556,17 +634,16 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		scanSerial(stderr, stderrHostLog)
 	}()
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	wait := watchProcess(cmd)
 	defer os.Remove(plan.ConsoleSocket)
 	if plan.QMPSocket != "" {
 		defer os.Remove(plan.QMPSocket)
 	}
 
 	span.Set(3, "waiting for virtio-console socket")
-	if exited, err := waitForSocketOrExit(plan.ConsoleSocket, done, 5*time.Second); err != nil {
+	if exited, err := waitForSocketOrExit(plan.ConsoleSocket, wait, 5*time.Second); err != nil {
 		if !exited {
-			terminateQEMU(cmd, done)
+			terminateQEMU(cmd, wait)
 		}
 		scanners.Wait()
 		span.Fail("virtio-console socket failed")
@@ -582,15 +659,15 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	if opts.Python == "" {
 		ttyClient, err = startTTYConsoleClient(plan.ConsoleSocket, consoleFile, consoleHostLog)
 		if err != nil {
-			terminateQEMU(cmd, done)
+			terminateQEMU(cmd, wait)
 			scanners.Wait()
 			span.Fail("virtio-console connect failed")
 			return result, err
 		}
 		defer ttyClient.Close()
 		if len(checks) != 0 || len(inputChecks) != 0 {
-			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, done, 5*time.Second); waitErr != nil || exited {
-				terminateQEMU(cmd, done)
+			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, wait, 5*time.Second); waitErr != nil || exited {
+				terminateQEMU(cmd, wait)
 				scanners.Wait()
 				span.Fail("QMP socket failed")
 				if waitErr != nil {
@@ -600,7 +677,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			}
 			qmp, err = connectQMP(plan.QMPSocket, 5*time.Second)
 			if err != nil {
-				terminateQEMU(cmd, done)
+				terminateQEMU(cmd, wait)
 				scanners.Wait()
 				span.Fail("QMP connect failed")
 				return result, err
@@ -625,15 +702,16 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	defer timer.Stop()
 	select {
 	case <-booted:
-	case err := <-done:
+	case <-wait.done:
 		scanners.Wait()
 		span.Fail("qemu exited")
+		err := wait.Err()
 		if err != nil {
 			return result, fmt.Errorf("qemu exited before boot marker: %w", err)
 		}
 		return result, fmt.Errorf("qemu exited before boot marker")
 	case <-timer.C:
-		terminateQEMU(cmd, done)
+		terminateQEMU(cmd, wait)
 		scanners.Wait()
 		span.Fail("boot marker timeout")
 		return result, fmt.Errorf("boot marker not reached within %s", opts.Timeout)
@@ -673,7 +751,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 
 	span.Set(6, "stopping qemu")
-	terminateQEMU(cmd, done)
+	terminateQEMU(cmd, wait)
 	scanners.Wait()
 	if testErr != nil {
 		span.Fail("qemu tty test failed")
@@ -694,7 +772,7 @@ func (client *ttyConsoleClient) RunInputSendChecks(qmp *qmpClient, checks []inpu
 			seen := strings.Contains(client.output.String(), check.Marker)
 			client.outputMu.Unlock()
 			if seen {
-				if err := qmp.inputSendEventFrames(check.Events); err != nil {
+				if err := qmp.inputSendEventPatterns(check.Patterns, check.Repeat, check.Interval); err != nil {
 					return fmt.Errorf("input-send-event at %s failed: %w", check.Marker, err)
 				}
 				break
@@ -911,16 +989,16 @@ func missingExpectations(expects []string, seen map[string]bool) []string {
 	return missing
 }
 
-func terminateQEMU(cmd *exec.Cmd, done <-chan error) {
+func terminateQEMU(cmd *exec.Cmd, wait *processWait) {
 	if cmd.Process == nil {
 		return
 	}
 	_ = cmd.Process.Signal(os.Interrupt)
 	select {
-	case <-done:
+	case <-wait.done:
 	case <-time.After(2 * time.Second):
 		_ = cmd.Process.Kill()
-		<-done
+		_ = wait.Err()
 	}
 }
 
@@ -953,6 +1031,8 @@ func normalizeCPUCount(cpus int) (int, error) {
 	}
 	return cpus, nil
 }
+
+const defaultCPUModel = "qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+xsave,+avx,+avx2"
 
 func limineImagePath(workspace *config.Workspace, image string) (string, error) {
 	if image == "" {
@@ -1030,6 +1110,26 @@ func appendInputDeviceArgs(args []string, profile string) ([]string, error) {
 	return args, nil
 }
 
+func appendGraphicsDeviceArgs(args []string, profile string, display string) ([]string, string, error) {
+	switch profile {
+	case "", "2d":
+		return append(args,
+			"-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,id=pachagpu"), display, nil
+	case "virgl":
+		if display == "" || display == "none" {
+			display = "egl-headless,gl=on"
+		} else if strings.Contains(display, "gl=off") {
+			return nil, "", fmt.Errorf("graphics profile virgl requires a GL-enabled QEMU display")
+		} else if !strings.Contains(display, "gl=") {
+			display += ",gl=on"
+		}
+		return append(args,
+			"-device", "virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,id=pachagpu"), display, nil
+	default:
+		return nil, "", fmt.Errorf("invalid graphics profile %q; expected 2d or virgl", profile)
+	}
+}
+
 func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Options) (commandPlan, error) {
 	imagePath := opts.LimineImage
 	imagePath, err := limineImagePath(workspace, imagePath)
@@ -1056,6 +1156,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	args := []string{
 		qemuPath,
 		"-machine", "q35",
+		"-cpu", defaultCPUModel,
 		"-m", opts.Memory,
 		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
@@ -1064,8 +1165,11 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "file="+imagePath+",format=raw,if=ide",
 		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root",
-		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
 	)
+	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
+	if err != nil {
+		return commandPlan{}, err
+	}
 	args, err = appendInputDeviceArgs(args, opts.InputProfile)
 	if err != nil {
 		return commandPlan{}, err
@@ -1102,6 +1206,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
 		QMPSocket:     opts.QMP,
+		ImagePaths:    []string{imagePath, diskPath},
 	}, nil
 }
 
@@ -1135,13 +1240,11 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	logPath := filepath.Join(artifacts, "qemu-limine-uefi.log")
 	hostTimeLogPath := filepath.Join(artifacts, "qemu-limine-uefi-host-time.log")
 	varsPath := filepath.Join(artifacts, "OVMF_LIMINE_VARS.fd")
-	if err := copyFile(varsTemplate, varsPath); err != nil {
-		return commandPlan{}, err
-	}
 	_ = os.WriteFile(logPath, nil, 0o644)
 	args := []string{
 		qemuPath,
 		"-machine", "q35",
+		"-cpu", defaultCPUModel,
 		"-m", opts.Memory,
 		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
@@ -1151,7 +1254,10 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
 		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
 		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
-		"-device", "virtio-gpu-pci,disable-legacy=on,id=pachagpu",
+	}
+	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
+	if err != nil {
+		return commandPlan{}, err
 	}
 	args, err = appendInputDeviceArgs(args, opts.InputProfile)
 	if err != nil {
@@ -1189,6 +1295,10 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
 		QMPSocket:     opts.QMP,
+		ImagePaths:    []string{imagePath, diskPath, varsPath},
+		Prepare: func() error {
+			return copyFile(varsTemplate, varsPath)
+		},
 	}, nil
 }
 
@@ -1296,18 +1406,18 @@ func consoleSocketPath(workspace *config.Workspace) (string, error) {
 	return filepath.Join(dir, name), nil
 }
 
-func waitForSocketOrExit(socketPath string, done <-chan error, timeout time.Duration) (bool, error) {
+func waitForSocketOrExit(socketPath string, wait *processWait, timeout time.Duration) (bool, error) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
-		case err := <-done:
-			if err != nil {
+		case <-wait.done:
+			if err := wait.Err(); err != nil {
 				return true, err
 			}
-			return true, nil
+			return true, fmt.Errorf("qemu exited before socket was ready: %s", socketPath)
 		case <-ticker.C:
 			info, err := os.Stat(socketPath)
 			if err == nil && info.Mode()&os.ModeSocket != 0 {
@@ -1401,7 +1511,7 @@ func consoleTerminalScriptContent(workspace *config.Workspace, socketPath string
 		"cd " + shellQuote(workspace.Root),
 		"sock=" + shellQuote(socketPath),
 		"ready_log=" + shellQuote(readyLogPath),
-		"ready_marker='[termd] linux tty hvc open ready index=0 handle=2'",
+		"ready_marker='[termd] linux tty hvc open ready index=0 handle='",
 		"echo 'CapabilityOS virtio-console'",
 		"echo 'waiting for '\"$sock\"",
 		"while [ ! -S \"$sock\" ]; do",

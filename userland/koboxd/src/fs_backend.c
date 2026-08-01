@@ -109,7 +109,6 @@ enum {
     KOBOXD_INODE_OP_RMDIR_OFFSET = 0x50,
     KOBOXD_INODE_OP_MKNOD_OFFSET = 0x58,
     KOBOXD_INODE_OP_RENAME_OFFSET = 0x60,
-    KOBOXD_EXT4_FAST_SYMLINK_BYTES = 60,
     KOBOXD_WRITEBACK_CONTROL_SYNC_MODE_OFFSET = 0x20,
     KOBOXD_WRITEBACK_CONTROL_WB_SYNC_ALL = 1,
     KOBOXD_MODE_REGULAR_0644 = 0100000 | 0644,
@@ -146,6 +145,7 @@ typedef struct koboxd_ext4_operations {
     void *truncate_inode;
     void *superblock_csum_set;
     void *evict_inode;
+    void *inode_is_fast_symlink;
 } koboxd_ext4_operations_t;
 
 typedef enum koboxd_ext4_child_create_kind {
@@ -600,7 +600,8 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
         module_symbol(module, "ext4_force_commit", &out_ops->force_commit) &&
         module_symbol(module, "ext4_truncate", &out_ops->truncate_inode) &&
         module_symbol(module, "ext4_superblock_csum_set", &out_ops->superblock_csum_set) &&
-        module_symbol(module, "ext4_evict_inode", &out_ops->evict_inode)))
+        module_symbol(module, "ext4_evict_inode", &out_ops->evict_inode) &&
+        module_symbol(module, "ext4_inode_is_fast_symlink", &out_ops->inode_is_fast_symlink)))
     {
         return 0;
     }
@@ -623,6 +624,24 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
         cached_ready = 1;
     }
     return ready;
+}
+
+static int fs_ext4_inode_is_fast_symlink(
+    const koboxd_ext4_operations_t *ops,
+    void *inode)
+{
+    if (ops == NULL || ops->inode_is_fast_symlink == NULL || inode == NULL) {
+        return 0;
+    }
+    int (*is_fast_fn)(void *) = NULL;
+    memcpy(&is_fast_fn, &ops->inode_is_fast_symlink, sizeof(is_fast_fn));
+    unsigned long old_gs = 0;
+    const int has_gs = enter_ext4_call(ops->inode_is_fast_symlink, &old_gs);
+    const int is_fast = is_fast_fn(inode);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+    return is_fast != 0;
 }
 
 static int fs_sync_super_free_blocks(const koboxd_ext4_operations_t *ops, void *super_block)
@@ -1471,12 +1490,17 @@ int koboxd_fs_backend_readlink(
         return -22;
     }
 
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+        return -5;
+    }
+
     size_t length = object->size < target_capacity ?
         (size_t)object->size : target_capacity;
     if (length == 0) {
         return 0;
     }
-    if (object->size <= KOBOXD_EXT4_FAST_SYMLINK_BYTES) {
+    if (fs_ext4_inode_is_fast_symlink(&ops, object->inode)) {
         const void *inline_target =
             (const uint8_t *)object->inode - KOBOXD_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET;
         memcpy(out_target, inline_target, length);
@@ -1484,10 +1508,6 @@ int koboxd_fs_backend_readlink(
         return 0;
     }
 
-    koboxd_ext4_operations_t ops;
-    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
-        return -5;
-    }
     const int read_result = fs_file_read(
         &ops,
         object->inode,

@@ -1,16 +1,17 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 60;
-pub const syscall_capsule_query: u64 = 60;
-pub const syscall_capsule_derive_mmio: u64 = 61;
-pub const syscall_capsule_derive_dma_buffer: u64 = 62;
-pub const syscall_capsule_derive_dma_mapping: u64 = 63;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 64;
-pub const syscall_capsule_derive_irq: u64 = 65;
-pub const syscall_capsule_pci_config_read: u64 = 66;
-pub const syscall_capsule_pci_config_write: u64 = 67;
-pub const syscall_capsule_pci_bar_info: u64 = 68;
-pub const syscall_capsule_irq_poll: u64 = 69;
+pub const syscall_capsule_first: u64 = 61;
+pub const syscall_capsule_query: u64 = 61;
+pub const syscall_capsule_derive_mmio: u64 = 62;
+pub const syscall_capsule_derive_dma_buffer: u64 = 63;
+pub const syscall_capsule_derive_dma_mapping: u64 = 64;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = 65;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 66;
+pub const syscall_capsule_derive_irq: u64 = 67;
+pub const syscall_capsule_pci_config_read: u64 = 68;
+pub const syscall_capsule_pci_config_write: u64 = 69;
+pub const syscall_capsule_pci_bar_info: u64 = 70;
+pub const syscall_capsule_irq_poll: u64 = 71;
 pub const syscall_capsule_last: u64 = syscall_capsule_irq_poll;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
@@ -101,7 +102,45 @@ pub const mmio_map_known_flags_mask: u64 = mmio_map_flag_replace_existing;
 pub const dma_iova_kernel_choose: u64 = std.math.maxInt(u64);
 pub const dma_buffer_known_flags_mask: u64 = 0;
 pub const dma_mapping_known_flags_mask: u64 = 0;
+pub const dma_mapping_pages_max_pages: usize = 512;
 pub const irq_known_flags_mask: u64 = 0;
+
+pub const DmaMappingPagesLayout = struct {
+    first_page_va: u64,
+    first_page_offset: u64,
+    end_va_exclusive: u64,
+    page_count: usize,
+    output_size_bytes: u64,
+};
+
+pub fn dmaMappingPagesLayout(user_va: u64, size: u64) ?DmaMappingPagesLayout {
+    if (user_va == 0 or size == 0) return null;
+    const end_va, const end_overflow = @addWithOverflow(user_va, size);
+    if (end_overflow != 0) return null;
+    const first_page_va = user_va & ~@as(u64, 4095);
+    const first_page_offset = user_va - first_page_va;
+    const span, const span_overflow = @addWithOverflow(first_page_offset, size);
+    if (span_overflow != 0) return null;
+    const rounded_span, const rounded_overflow = @addWithOverflow(span, 4095);
+    if (rounded_overflow != 0) return null;
+    const page_count_u64 = rounded_span / 4096;
+    if (page_count_u64 == 0 or page_count_u64 > dma_mapping_pages_max_pages) return null;
+    return .{
+        .first_page_va = first_page_va,
+        .first_page_offset = first_page_offset,
+        .end_va_exclusive = end_va,
+        .page_count = @intCast(page_count_u64),
+        .output_size_bytes = page_count_u64 * @sizeOf(u64),
+    };
+}
+
+pub fn rangesOverlap(first_start: u64, first_size: u64, second_start: u64, second_size: u64) ?bool {
+    if (first_size == 0 or second_size == 0) return null;
+    const first_end, const first_overflow = @addWithOverflow(first_start, first_size);
+    const second_end, const second_overflow = @addWithOverflow(second_start, second_size);
+    if (first_overflow != 0 or second_overflow != 0) return null;
+    return first_start < second_end and second_start < first_end;
+}
 
 pub const pci_bar_count: u32 = 6;
 pub const pci_config_space_size: u32 = 256;
@@ -114,12 +153,13 @@ comptime {
     std.debug.assert(syscall_capsule_derive_mmio == syscall_capsule_first + 1);
     std.debug.assert(syscall_capsule_derive_dma_buffer == syscall_capsule_first + 2);
     std.debug.assert(syscall_capsule_derive_dma_mapping == syscall_capsule_first + 3);
-    std.debug.assert(syscall_capsule_derive_dma_mapping_from_buffer == syscall_capsule_first + 4);
-    std.debug.assert(syscall_capsule_derive_irq == syscall_capsule_first + 5);
-    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 6);
-    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 7);
-    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 8);
-    std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 9);
+    std.debug.assert(syscall_capsule_derive_dma_mapping_pages == syscall_capsule_first + 4);
+    std.debug.assert(syscall_capsule_derive_dma_mapping_from_buffer == syscall_capsule_first + 5);
+    std.debug.assert(syscall_capsule_derive_irq == syscall_capsule_first + 6);
+    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 7);
+    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 8);
+    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 9);
+    std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 10);
 }
 
 test "capsule rights mask strips reserved bits" {
@@ -132,5 +172,32 @@ test "capsule syscall range is stable and contiguous" {
     try std.testing.expect(isCapsuleSyscall(syscall_capsule_irq_poll));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_first - 1));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_last + 1));
-    try std.testing.expectEqual(@as(usize, 10), syscall_capsule_count);
+    try std.testing.expectEqual(@as(usize, 11), syscall_capsule_count);
+}
+
+test "DMA mapping page layout checks boundaries and overflow" {
+    const aligned = dmaMappingPagesLayout(0x4000, 4096).?;
+    try std.testing.expectEqual(@as(usize, 1), aligned.page_count);
+    try std.testing.expectEqual(@as(u64, 0), aligned.first_page_offset);
+    try std.testing.expectEqual(@as(u64, 8), aligned.output_size_bytes);
+
+    const unaligned = dmaMappingPagesLayout(0x4fff, 4096).?;
+    try std.testing.expectEqual(@as(usize, 2), unaligned.page_count);
+    try std.testing.expectEqual(@as(u64, 4095), unaligned.first_page_offset);
+
+    const max_size = @as(u64, dma_mapping_pages_max_pages) * 4096 - 4095;
+    try std.testing.expectEqual(
+        dma_mapping_pages_max_pages,
+        dmaMappingPagesLayout(0x4fff, max_size).?.page_count,
+    );
+    try std.testing.expect(dmaMappingPagesLayout(0x4fff, max_size + 1) == null);
+    try std.testing.expect(dmaMappingPagesLayout(0x4000, 0) == null);
+    try std.testing.expect(dmaMappingPagesLayout(std.math.maxInt(u64) - 1, 2) == null);
+}
+
+test "DMA mapping page output must not overlap the DMA range" {
+    const layout = dmaMappingPagesLayout(0x4000, 8192).?;
+    try std.testing.expectEqual(false, rangesOverlap(0x4000, 8192, 0x8000, layout.output_size_bytes).?);
+    try std.testing.expectEqual(true, rangesOverlap(0x4000, 8192, 0x5ff8, layout.output_size_bytes).?);
+    try std.testing.expect(rangesOverlap(0x4000, 8192, std.math.maxInt(u64), layout.output_size_bytes) == null);
 }

@@ -538,6 +538,18 @@ fn shootdownCr3Context(target_cr3: u64) void {
     }
 }
 
+/// Complete a process-private memory-barrier rendezvous on every online CPU.
+///
+/// Reloading the process CR3 on each CPU is a serializing operation.  Using
+/// the same all-CPU rendezvous as a TLB shootdown also covers CPUs which enter
+/// this address space concurrently with the request.
+pub fn synchronizeUserMemoryForPrincipal(principal: kernel.PrincipalId) bool {
+    const target_cr3 = getHooks().user_space_cr3_for_principal(principal);
+    if (target_cr3 == 0) return false;
+    shootdownCr3Context(target_cr3);
+    return true;
+}
+
 pub fn flushTlbForCr3Va(target_cr3: u64, va: u64) void {
     _ = va;
     shootdownCr3Context(target_cr3);

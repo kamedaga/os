@@ -38,6 +38,13 @@ int main(void)
     failures += expect(sizeof(filed_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "filed io fits page");
     failures += expect(sizeof(filed_openat_t) <= FILED_PAGE_BYTES, "filed openat payload fits page");
     failures += expect(
+        FILED_RIGHT_LOOKUP == (1u << 0) && FILED_RIGHT_READ == (1u << 1) &&
+        FILED_RIGHT_WRITE == (1u << 2) && FILED_RIGHT_EXEC == (1u << 3) &&
+        FILED_RIGHT_STAT == (1u << 4) && FILED_RIGHT_SETATTR == (1u << 5) &&
+        FILED_RIGHT_GETDENTS == (1u << 6) && FILED_RIGHT_CREATE == (1u << 7) &&
+        FILED_RIGHT_REMOVE == (1u << 8) && FILED_RIGHT_RENAME == (1u << 9),
+        "filed rights ABI remains contiguous through rename");
+    failures += expect(
         sizeof(filed_symlink_t) <= FILED_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES,
         "filed symlink payload fits after service header");
     failures += expect(
@@ -67,6 +74,7 @@ int main(void)
     failures += expect(KOBOXD_ENDPOINT_FS_BACKEND != KOBOXD_ENDPOINT_FILED, "kobox endpoint ids distinct");
     failures += expect(sizeof(netd_socket_t) == 64, "netd socket request size");
     failures += expect(sizeof(netd_connect_t) == 64, "netd connect request size");
+    failures += expect(sizeof(netd_listen_t) == 16, "netd listen request size");
     failures += expect(sizeof(netd_poll_t) == 64, "netd poll request size");
     failures += expect(sizeof(netd_io_t) <= NETD_PAGE_BYTES, "netd io fits page");
     failures += expect(sizeof(termd_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "termd io fits page");
@@ -100,9 +108,10 @@ int main(void)
         STORAGE_OP_RELEASE_OBJECT == 17 && STORAGE_OP_DIAG_DUMP == 19,
         "storage ops are contiguous from zero");
     failures += expect(
-        NETD_OP_HELLO == 0 && NETD_OP_SOCKET == 1 && NETD_OP_SOCKETPAIR == 2 &&
-        NETD_OP_SEND == 5 && NETD_OP_POLL == 7 && NETD_OP_BIND == 8 &&
-        NETD_OP_ACCEPT == 10 && NETD_OP_DUP == 13,
+        NETD_OP_HELLO == 0 && NETD_OP_PAGE_ATTACH == 1 &&
+        NETD_OP_SOCKET == 2 && NETD_OP_SOCKETPAIR == 3 &&
+        NETD_OP_SEND == 6 && NETD_OP_POLL == 8 && NETD_OP_BIND == 9 &&
+        NETD_OP_LISTEN == 10 && NETD_OP_ACCEPT == 11 && NETD_OP_DUP == 14,
         "netd ops are contiguous from zero");
     failures += expect(
         TERMD_OP_HELLO == 0 && TERMD_OP_OPEN_PTMX == 1 &&

@@ -178,6 +178,9 @@ long pacha_fd_wait_many(struct pacha_pollfd *fds, uint64_t count, uint64_t timeo
 int pacha_service_wait_init(struct pacha_service_wait_set *set, int endpoint_fd);
 int pacha_service_wait_add(struct pacha_service_wait_set *set, int fd, uint32_t events);
 long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks);
+uint64_t pacha_service_wait_revents(
+    const struct pacha_service_wait_set *set,
+    int fd);
 int pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags);
 int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rights, uint32_t fd_flags);
 int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags);

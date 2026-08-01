@@ -244,6 +244,11 @@ typedef struct lpr_linux_timespec {
     int64_t tv_nsec;
 } lpr_linux_timespec_t;
 
+typedef struct lpr_linux_utimens_plan {
+    uint64_t mask;
+    uint8_t needs_now;
+} lpr_linux_utimens_plan_t;
+
 typedef struct lpr_readlink_cache_entry {
     uint8_t active;
     uint8_t reserved0;
@@ -461,9 +466,12 @@ typedef struct lpr_termd_rpc_state {
 typedef struct lpr_netd_rpc_state {
     volatile uint32_t lock_word;
     uint64_t request_id;
+    uint64_t page_attachment_id;
     int page_fd;
+    int page_lease_fd;
     void *page;
     int page_busy;
+    uint8_t endpoint_checked;
     uint16_t next_ephemeral_port;
 } lpr_netd_rpc_state_t;
 
@@ -600,9 +608,12 @@ void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_brk_current (lpr_state.memory.brk_current)
 #define lpr_brk_limit (lpr_state.memory.brk_limit)
 #define lpr_netd_request_id (lpr_state.netd_rpc.request_id)
+#define lpr_netd_page_attachment_id (lpr_state.netd_rpc.page_attachment_id)
 #define lpr_netd_page_fd (lpr_state.netd_rpc.page_fd)
+#define lpr_netd_page_lease_fd (lpr_state.netd_rpc.page_lease_fd)
 #define lpr_netd_page (lpr_state.netd_rpc.page)
 #define lpr_netd_page_busy (lpr_state.netd_rpc.page_busy)
+#define lpr_netd_endpoint_checked (lpr_state.netd_rpc.endpoint_checked)
 #define lpr_next_ephemeral_port (lpr_state.netd_rpc.next_ephemeral_port)
 
 void lpr_filed_session_drop(void);
@@ -908,7 +919,7 @@ int64_t lpr_linux_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t
 int64_t lpr_linux_nanosleep(uint64_t req_raw, uint64_t rem_raw);
 int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags);
 int64_t lpr_linux_now(lpr_linux_timespec_t *out);
-int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw);
+int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags);
 int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode);
 int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, uint64_t *out_kind);
 int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags);
@@ -923,6 +934,10 @@ int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *
 int64_t lpr_linux_readv(uint64_t fd, uint64_t iov_raw, uint64_t iov_count);
 int64_t lpr_linux_renameat(uint64_t old_dirfd, uint64_t old_path_raw, uint64_t new_dirfd, uint64_t new_path_raw);
 int64_t lpr_linux_resolve_utime( const lpr_linux_timespec_t *input, const lpr_linux_timespec_t *now, uint64_t wire_bit, uint64_t *mask, int64_t *out_sec, int64_t *out_nsec);
+int lpr_linux_utimens_both_omit(const lpr_linux_timespec_t *times);
+int64_t lpr_linux_utimens_plan(
+    const lpr_linux_timespec_t *times,
+    lpr_linux_utimens_plan_t *out_plan);
 int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t oldact_raw, uint64_t sigsetsize);
 int64_t lpr_linux_rt_sigprocmask(uint64_t how, uint64_t set_raw, uint64_t oldset_raw, uint64_t sigsetsize);
 int64_t lpr_linux_rt_sigpending(uint64_t set_raw, uint64_t sigsetsize);

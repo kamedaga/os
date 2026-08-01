@@ -10,7 +10,12 @@ lpr_syscall_entry:
     # the interrupted Linux RSP, then its preparation code grows downward from
     # that runtime RSP. Keep the LPR C stack below both regions; otherwise
     # signal preparation can overwrite a live dispatch stack before returning.
+    # A Linux syscall site does not promise SysV call-stack alignment. Preserve
+    # its exact RSP for return, but align the private LPR stack before entering C.
+    mov %rsp, %r11
     sub $LPR_SYSCALL_ENTRY_RESERVE_BYTES, %rsp
+    and $-16, %rsp
+    mov %r11, 40(%rsp)
     lea 56(%rsp), %r11
     mov %r15, 0(%r11)
     mov %r14, 8(%r11)
@@ -28,7 +33,7 @@ lpr_syscall_entry:
     mov %rax, 112(%r11)
     mov %rcx, 104(%r11)
     mov %rcx, 120(%r11)
-    lea LPR_SYSCALL_ENTRY_RESERVE_BYTES(%rsp), %r10
+    mov 40(%rsp), %r10
     mov %r10, 128(%r11)
     movq $0x202, 136(%r11)
     movq $0, 144(%r11)
@@ -118,8 +123,8 @@ lpr_async_signal_entry:
     call lpr_linux_async_signal_prepare
     mov 16(%rax), %r11
     mov 8(%rax), %rdi
-    lea 736(%rax), %rsi
-    lea 864(%rax), %rdx
+    lea 1056(%rax), %rsi
+    lea 1184(%rax), %rdx
     lea -8(%rax), %rsp
     jmp *%r11
 .size lpr_async_signal_entry, .-lpr_async_signal_entry

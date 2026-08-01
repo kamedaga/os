@@ -95,6 +95,10 @@ int pacha_capsule_derive_dma_mapping(int device_fd, void *addr, uint64_t iova, s
     return pacha_fd_result_to_int(pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING, (uint64_t)(uint32_t)device_fd, (uint64_t)(uintptr_t)addr, iova, len, direction, flags));
 }
 
+int pacha_capsule_derive_dma_mapping_pages(int device_fd, void *user_va, size_t size, unsigned direction, uint64_t *out_page_dma, size_t out_capacity_entries) {
+    return pacha_fd_result_to_int(pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING_PAGES, (uint64_t)(uint32_t)device_fd, (uint64_t)(uintptr_t)user_va, size, direction, (uint64_t)(uintptr_t)out_page_dma, out_capacity_entries));
+}
+
 int pacha_capsule_derive_dma_mapping_from_buffer(int dma_buffer_fd, uint64_t iova, size_t len, unsigned direction, uint64_t flags) {
     return pacha_fd_result_to_int(pacha_syscall5(PACHA_CAPSULE_SYSCALL_DERIVE_DMA_MAPPING_FROM_BUFFER, (uint64_t)(uint32_t)dma_buffer_fd, iova, len, direction, flags));
 }

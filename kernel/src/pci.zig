@@ -1,4 +1,5 @@
 const std = @import("std");
+const init_bootstrap_abi = @import("kernel_abi_root").init_bootstrap_abi;
 
 pub const Location = struct {
     bus: u8,
@@ -8,6 +9,20 @@ pub const Location = struct {
 
 pub const pci_resource_id_prefix: u64 = 0x50434900_00000000;
 pub const pci_resource_id_mask: u64 = 0xffffffff_00000000;
+
+pub const interrupt_vector_base: u8 = 0x50;
+pub const interrupt_vectors_per_device: u8 = 16;
+pub const interrupt_device_count: usize = init_bootstrap_abi.max_device_descriptors;
+pub const interrupt_vector_count: u8 =
+    @intCast(interrupt_device_count * @as(usize, interrupt_vectors_per_device));
+
+pub const InterruptRoute = struct {
+    device: u64,
+    entry: u8,
+};
+
+var interrupt_route_devices: [interrupt_device_count]u64 =
+    [_]u64{0} ** interrupt_device_count;
 
 pub const bar_flag_io: u64 = 1 << 0;
 pub const bar_flag_mem: u64 = 1 << 1;
@@ -143,6 +158,47 @@ pub fn locationFromResourceId(resource_id: u64) ?Location {
     };
 }
 
+pub fn clearInterruptRoutes() void {
+    @memset(interrupt_route_devices[0..], 0);
+}
+
+pub fn registerInterruptRoute(resource_id: u64, device_index: usize) bool {
+    if (locationFromResourceId(resource_id) == null or
+        device_index >= interrupt_route_devices.len)
+    {
+        return false;
+    }
+    for (interrupt_route_devices, 0..) |device, index| {
+        if (index != device_index and device == resource_id) return false;
+    }
+    const existing = interrupt_route_devices[device_index];
+    if (existing != 0 and existing != resource_id) return false;
+    interrupt_route_devices[device_index] = resource_id;
+    return true;
+}
+
+pub fn interruptVectorBaseForResourceId(resource_id: u64) ?u8 {
+    for (interrupt_route_devices, 0..) |device, index| {
+        if (device != resource_id) continue;
+        return interrupt_vector_base +
+            @as(u8, @intCast(index)) * interrupt_vectors_per_device;
+    }
+    return null;
+}
+
+pub fn interruptRouteForVector(vector: u8) ?InterruptRoute {
+    if (vector < interrupt_vector_base) return null;
+    const offset: u16 = @as(u16, vector) - interrupt_vector_base;
+    if (offset >= interrupt_vector_count) return null;
+    const device_index: usize = offset / interrupt_vectors_per_device;
+    const device = interrupt_route_devices[device_index];
+    if (device == 0) return null;
+    return .{
+        .device = device,
+        .entry = @intCast(offset % interrupt_vectors_per_device),
+    };
+}
+
 fn barSizeFromMask32(mask: u32) ?u64 {
     if (mask == 0) return null;
     const size = (~mask) +% 1;
@@ -236,4 +292,22 @@ test "PCI resource id encodes location" {
     try std.testing.expectEqual(loc.device, decoded.device);
     try std.testing.expectEqual(loc.function, decoded.function);
     try std.testing.expectEqual(@as(?Location, null), locationFromResourceId(0x1001));
+}
+
+test "routed interrupt vectors preserve device and MSI-X entry" {
+    clearInterruptRoutes();
+    defer clearInterruptRoutes();
+
+    const first = resourceIdFromLocation(.{ .bus = 0, .device = 3, .function = 0 });
+    const second = resourceIdFromLocation(.{ .bus = 0, .device = 4, .function = 0 });
+    try std.testing.expect(registerInterruptRoute(first, 0));
+    try std.testing.expect(registerInterruptRoute(second, 1));
+    try std.testing.expectEqual(@as(?u8, 0x50), interruptVectorBaseForResourceId(first));
+    try std.testing.expectEqual(@as(?u8, 0x60), interruptVectorBaseForResourceId(second));
+    try std.testing.expectEqual(
+        InterruptRoute{ .device = second, .entry = 7 },
+        interruptRouteForVector(0x67).?,
+    );
+    try std.testing.expectEqual(@as(?InterruptRoute, null), interruptRouteForVector(0x41));
+    try std.testing.expectEqual(@as(?InterruptRoute, null), interruptRouteForVector(0xD0));
 }

@@ -13,10 +13,18 @@
 static volatile sig_atomic_t handled;
 static volatile sig_atomic_t altstack_ok;
 static volatile sig_atomic_t sse_stack_ok;
+static volatile sig_atomic_t avx_handled;
 static unsigned char alternate_stack[SIGSTKSZ * 2];
 static int terminate_event_fd = -1;
 
 typedef float aligned_vec4_t __attribute__((vector_size(16)));
+
+static const unsigned char avx_handler_pattern[32] __attribute__((aligned(32))) = {
+    0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+    0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+};
 
 static void write_marker(const char *text)
 {
@@ -40,6 +48,122 @@ static void sigint_handler(int signo)
         handled = 1;
         write_marker("ASYNC_HANDLER_CALLED\n");
     }
+}
+
+__attribute__((target("avx2")))
+static void avx_signal_handler(int signo)
+{
+    if (signo != SIGUSR1) return;
+    write_marker("AVX_SIGNAL_HANDLER=OK\n");
+    __asm__ volatile(
+        "vmovdqu (%0), %%ymm0\n\t"
+        :
+        : "r"(avx_handler_pattern)
+        : "ymm0", "memory");
+    avx_handled = 1;
+}
+
+__attribute__((target("avx2"), noinline))
+static int run_avx_signal_roundtrip(void)
+{
+    static const unsigned char expected[32] __attribute__((aligned(32))) = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87,
+        0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
+    };
+    unsigned char observed[32] __attribute__((aligned(32)));
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = avx_signal_handler;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGUSR1, &action, 0) != 0) return 50;
+
+    write_marker("AVX_SIGNAL_READY\n");
+    const long pid = (long)getpid();
+    long rc;
+    __asm__ volatile(
+        "vmovdqu (%[expected]), %%ymm0\n\t"
+        "mov $62, %%eax\n\t"
+        "mov %[pid], %%rdi\n\t"
+        "mov $10, %%esi\n\t"
+        "syscall\n\t"
+        "vmovdqu %%ymm0, (%[observed])\n\t"
+        "vzeroupper\n\t"
+        : "=&a"(rc)
+        : [expected] "r"(expected),
+          [observed] "r"(observed),
+          [pid] "r"(pid)
+        : "rcx", "rdi", "rsi", "r11", "ymm0", "memory");
+    write_marker("AVX_SIGNAL_RETURNED\n");
+    if (rc != 0 || !avx_handled) return 51;
+    if (memcmp(expected, observed, sizeof(expected)) != 0) return 52;
+    write_marker("AVX_SIGNAL_XSTATE=OK\n");
+    return 0;
+}
+
+__attribute__((target("avx2"), noinline))
+static int run_avx_syscall_roundtrip(void)
+{
+    static const unsigned char expected[32] __attribute__((aligned(32))) = {
+        0x3c, 0x2d, 0x1e, 0x0f, 0x4b, 0x5a, 0x69, 0x78,
+        0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0,
+        0x13, 0x24, 0x35, 0x46, 0x57, 0x68, 0x79, 0x8a,
+        0x9b, 0xac, 0xbd, 0xce, 0xdf, 0xe0, 0xf1, 0x02,
+    };
+    unsigned char observed[32] __attribute__((aligned(32)));
+    long rc;
+    write_marker("AVX_SYSCALL_READY\n");
+    __asm__ volatile(
+        "vmovdqu (%[expected]), %%ymm0\n\t"
+        "mov $39, %%eax\n\t"
+        "syscall\n\t"
+        "vmovdqu %%ymm0, (%[observed])\n\t"
+        "vzeroupper\n\t"
+        : "=a"(rc)
+        : [expected] "r"(expected),
+          [observed] "r"(observed)
+        : "rcx", "r11", "ymm0", "memory");
+    write_marker("AVX_SYSCALL_RETURNED\n");
+    if (rc <= 0 || memcmp(expected, observed, sizeof(expected)) != 0) return 53;
+    write_marker("AVX_SYSCALL_XSTATE=OK\n");
+    return 0;
+}
+
+__attribute__((target("avx2"), noinline))
+static int run_avx_local(void)
+{
+    static const unsigned char expected[32] __attribute__((aligned(32))) = {
+        0x5f, 0x4e, 0x3d, 0x2c, 0x1b, 0x0a, 0x19, 0x28,
+        0x37, 0x46, 0x55, 0x64, 0x73, 0x82, 0x91, 0xa0,
+        0xaf, 0xbe, 0xcd, 0xdc, 0xeb, 0xfa, 0xe9, 0xd8,
+        0xc7, 0xb6, 0xa5, 0x94, 0x83, 0x72, 0x61, 0x50,
+    };
+    unsigned char observed[32] __attribute__((aligned(32)));
+    write_marker("AVX_LOCAL_READY\n");
+    __asm__ volatile(
+        "vmovdqu (%[expected]), %%ymm0\n\t"
+        "vmovdqu %%ymm0, (%[observed])\n\t"
+        "vzeroupper\n\t"
+        :
+        : [expected] "r"(expected),
+          [observed] "r"(observed)
+        : "ymm0", "memory");
+    if (memcmp(expected, observed, sizeof(expected)) != 0) return 54;
+    write_marker("AVX_LOCAL=OK\n");
+    return 0;
+}
+
+static int run_avx_suite(void)
+{
+    int rc = run_avx_local();
+    if (rc != 0) return rc;
+    rc = run_avx_syscall_roundtrip();
+    if (rc != 0) return rc;
+    rc = run_avx_signal_roundtrip();
+    if (rc != 0) return rc;
+    write_marker("AVX_XSTATE_SUITE=OK\n");
+    return 0;
 }
 
 static void altstack_handler(int signo, siginfo_t *info, void *context)
@@ -314,6 +438,18 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "suite") == 0) {
         return run_suite(argv[0]);
+    }
+    if (strcmp(argv[1], "avx") == 0) {
+        return run_avx_signal_roundtrip();
+    }
+    if (strcmp(argv[1], "avx-syscall") == 0) {
+        return run_avx_syscall_roundtrip();
+    }
+    if (strcmp(argv[1], "avx-local") == 0) {
+        return run_avx_local();
+    }
+    if (strcmp(argv[1], "avx-suite") == 0) {
+        return run_avx_suite();
     }
     return 1;
 }

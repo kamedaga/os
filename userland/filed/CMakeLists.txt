@@ -7,6 +7,7 @@ project(filed C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
+set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/source")
 set(FILED_DISPATCH_SHARDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.c"
@@ -55,7 +56,10 @@ set(FILED_EXTRA_SOURCES
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
   "${REPO_ROOT}/userland/libpacha/src/trace.c"
-  "${REPO_ROOT}/userland/personality/linux/hde/hde64.c"
+  "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.c"
+  "${ZYDIS_SOURCE}/src/Decoder.c"
+  "${ZYDIS_SOURCE}/src/DecoderData.c"
+  "${ZYDIS_SOURCE}/src/SharedData.c"
   "${REPO_ROOT}/_kobox/src/device/device_backend.c"
   "${REPO_ROOT}/_kobox/src/device/pachaos_capsule/device_pachaos_capsule.c"
   "${REPO_ROOT}/_kobox/src/host_interface/interface.c"
@@ -124,11 +128,13 @@ string(REPLACE ";" " " FILED_EXTRA_SOURCES_ENV "${FILED_EXTRA_SOURCES}")
 add_custom_command(
   OUTPUT "${FILED_ELF}"
   COMMAND
+    bash "${REPO_ROOT}/pack/scripts/download_zydis.sh"
+  COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/hde ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/bootstrap.h"
@@ -158,6 +164,9 @@ add_custom_command(
     "${REPO_ROOT}/userland/koboxd/include/koboxd/control_protocol.h"
     "${REPO_ROOT}/userland/koboxd/include/koboxd/storage_protocol.h"
     "${REPO_ROOT}/userland/personality/include/personality/lpr_image_abi.h"
+    "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.c"
+    "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.h"
+    "${REPO_ROOT}/pack/scripts/download_zydis.sh"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM

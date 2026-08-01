@@ -27,6 +27,7 @@ pub const syscall_process_clone: u64 = process_abi.syscall_process_clone;
 pub const syscall_process_map: u64 = process_abi.syscall_process_map;
 pub const syscall_process_map_batch: u64 = process_abi.syscall_process_map_batch;
 pub const syscall_process_exec_from: u64 = process_abi.syscall_process_exec_from;
+pub const syscall_process_memory_barrier: u64 = process_abi.syscall_process_memory_barrier;
 
 pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
 pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
@@ -74,6 +75,7 @@ pub const syscall_capsule_query: u64 = capsule_abi.syscall_capsule_query;
 pub const syscall_capsule_derive_mmio: u64 = capsule_abi.syscall_capsule_derive_mmio;
 pub const syscall_capsule_derive_dma_buffer: u64 = capsule_abi.syscall_capsule_derive_dma_buffer;
 pub const syscall_capsule_derive_dma_mapping: u64 = capsule_abi.syscall_capsule_derive_dma_mapping;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = capsule_abi.syscall_capsule_derive_dma_mapping_pages;
 pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = capsule_abi.syscall_capsule_derive_dma_mapping_from_buffer;
 pub const syscall_capsule_derive_irq: u64 = capsule_abi.syscall_capsule_derive_irq;
 pub const syscall_capsule_pci_config_read: u64 = capsule_abi.syscall_capsule_pci_config_read;
@@ -116,6 +118,7 @@ test "native syscall numbers are contiguous" {
         syscall_process_map,
         syscall_process_map_batch,
         syscall_process_exec_from,
+        syscall_process_memory_barrier,
         syscall_getpid,
         syscall_gettid,
         syscall_clock_gettime,
@@ -159,6 +162,7 @@ test "native syscall numbers are contiguous" {
         syscall_capsule_derive_mmio,
         syscall_capsule_derive_dma_buffer,
         syscall_capsule_derive_dma_mapping,
+        syscall_capsule_derive_dma_mapping_pages,
         syscall_capsule_derive_dma_mapping_from_buffer,
         syscall_capsule_derive_irq,
         syscall_capsule_pci_config_read,

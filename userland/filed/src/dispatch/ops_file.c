@@ -195,15 +195,25 @@ filed_page_dispatch_result_t filed_dispatch_utimens_page(
     if ((utimens->mask & ~((uint64_t)FILED_UTIMENS_ATIME | (uint64_t)FILED_UTIMENS_MTIME)) != 0) {
         return filed_page_result(-22, 0);
     }
+    if (utimens->mask == 0) {
+        return filed_page_result(0, 0);
+    }
+    if (((utimens->mask & FILED_UTIMENS_ATIME) != 0 &&
+            (utimens->atime_nsec < 0 || utimens->atime_nsec >= 1000000000ll)) ||
+        ((utimens->mask & FILED_UTIMENS_MTIME) != 0 &&
+            (utimens->mtime_nsec < 0 || utimens->mtime_nsec >= 1000000000ll)))
+    {
+        return filed_page_result(-22, 0);
+    }
     filed_vfs_io_decision_t decision;
-    int backend_status = filed_backend_object_for_handle(
-        runtime,
+    filed_status_t vfs_status = filed_vfs_setattr_prepare(
+        &runtime->vfs,
         (filed_handle_id_t)(uint32_t)utimens->handle,
         &decision);
-    if (backend_status != 0) {
-        return filed_page_result(backend_status, 0);
+    if (vfs_status != FILED_OK) {
+        return filed_page_result(filed_status_to_wire(vfs_status), 0);
     }
-    backend_status = filed_backend_utimens(
+    int backend_status = filed_backend_utimens(
         runtime,
         decision.backend_object,
         (uint32_t)utimens->mask,
@@ -214,7 +224,7 @@ filed_page_dispatch_result_t filed_dispatch_utimens_page(
     if (backend_status != 0) {
         return filed_page_result(backend_status, 0);
     }
-    filed_status_t status = filed_vfs_update_times(
+    vfs_status = filed_vfs_update_times(
         &runtime->vfs,
         (filed_handle_id_t)(uint32_t)utimens->handle,
         (uint32_t)utimens->mask,
@@ -222,46 +232,52 @@ filed_page_dispatch_result_t filed_dispatch_utimens_page(
         utimens->atime_nsec,
         utimens->mtime_sec,
         utimens->mtime_nsec);
-    return filed_page_result(filed_status_to_wire(status), 0);
+    return filed_page_result(filed_status_to_wire(vfs_status), 0);
 }
 
-int filed_ensure_stat_snapshot(
+static int filed_prepare_chmod_snapshot(
     filed_runtime_t *runtime,
-    filed_handle_id_t handle_id)
+    filed_handle_id_t handle_id,
+    const filed_vfs_io_decision_t *decision,
+    bool *out_snapshot_cached,
+    filed_vfs_stat_snapshot_t *out_snapshot)
 {
-    filed_vfs_io_decision_t decision;
-    filed_vfs_stat_snapshot_t snapshot;
+    bool snapshot_valid = false;
     storage_statx_reply_t backend_stat;
-    filed_status_t status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, &decision);
+    if (runtime == NULL ||
+        decision == NULL ||
+        out_snapshot_cached == NULL ||
+        out_snapshot == NULL)
+    {
+        return -22;
+    }
+    *out_snapshot_cached = false;
+    memset(out_snapshot, 0, sizeof(*out_snapshot));
+    filed_status_t status = filed_vfs_setattr_snapshot_valid(
+        &runtime->vfs,
+        handle_id,
+        &snapshot_valid);
     if (status != FILED_OK) {
         return filed_status_to_wire(status);
     }
-    memset(&snapshot, 0, sizeof(snapshot));
-    status = filed_vfs_get_stat_snapshot(&runtime->vfs, handle_id, &snapshot);
-    if (status != FILED_OK) {
-        return filed_status_to_wire(status);
-    }
-    if (snapshot.valid) {
+    if (snapshot_valid) {
+        *out_snapshot_cached = true;
         return 0;
     }
     memset(&backend_stat, 0, sizeof(backend_stat));
     int64_t reply_status = filed_backend_statx(
         runtime,
-        decision.backend_object,
+        decision->backend_object,
         &backend_stat);
     if (reply_status != 0) {
         return (int)reply_status;
     }
-    snapshot = filed_stat_snapshot_from_backend(
+    *out_snapshot = filed_stat_snapshot_from_backend(
         &backend_stat,
         handle_id,
-        decision.object_generation,
-        decision.dir_generation);
-    status = filed_vfs_update_stat_snapshot(
-        &runtime->vfs,
-        decision.backend_object,
-        &snapshot);
-    return filed_status_to_wire(status);
+        decision->object_generation,
+        decision->dir_generation);
+    return out_snapshot->valid ? 0 : -5;
 }
 
 filed_page_dispatch_result_t filed_dispatch_chmod_page(
@@ -269,20 +285,30 @@ filed_page_dispatch_result_t filed_dispatch_chmod_page(
     void *page)
 {
     filed_chmod_t *chmod_req = (filed_chmod_t *)page;
-    if (runtime == NULL || chmod_req == NULL || chmod_req->reserved0 != 0 || chmod_req->reserved1 != 0) {
+    bool snapshot_cached = false;
+    filed_vfs_stat_snapshot_t fetched_snapshot;
+    if (runtime == NULL ||
+        chmod_req == NULL ||
+        chmod_req->reserved0 != 0 ||
+        chmod_req->reserved1 != 0 ||
+        (chmod_req->mode & ~07777ull) != 0)
+    {
         return filed_page_result(-22, 0);
     }
-    int status = filed_ensure_stat_snapshot(
-        runtime,
-        (filed_handle_id_t)(uint32_t)chmod_req->handle);
-    if (status != 0) {
-        return filed_page_result(status, 0);
-    }
     filed_vfs_io_decision_t decision;
-    status = filed_backend_object_for_handle(
-        runtime,
+    filed_status_t vfs_status = filed_vfs_setattr_prepare(
+        &runtime->vfs,
         (filed_handle_id_t)(uint32_t)chmod_req->handle,
         &decision);
+    if (vfs_status != FILED_OK) {
+        return filed_page_result(filed_status_to_wire(vfs_status), 0);
+    }
+    int status = filed_prepare_chmod_snapshot(
+        runtime,
+        (filed_handle_id_t)(uint32_t)chmod_req->handle,
+        &decision,
+        &snapshot_cached,
+        &fetched_snapshot);
     if (status != 0) {
         return filed_page_result(status, 0);
     }
@@ -293,7 +319,18 @@ filed_page_dispatch_result_t filed_dispatch_chmod_page(
     if (status != 0) {
         return filed_page_result(status, 0);
     }
-    filed_status_t vfs_status = filed_vfs_update_mode(
+    if (!snapshot_cached) {
+        fetched_snapshot.mode =
+            (fetched_snapshot.mode & 0170000ull) | (chmod_req->mode & 07777ull);
+        vfs_status = filed_vfs_update_stat_snapshot(
+            &runtime->vfs,
+            decision.backend_object,
+            &fetched_snapshot);
+        if (vfs_status != FILED_OK) {
+            return filed_page_result(filed_status_to_wire(vfs_status), 0);
+        }
+    }
+    vfs_status = filed_vfs_update_mode(
         &runtime->vfs,
         (filed_handle_id_t)(uint32_t)chmod_req->handle,
         chmod_req->mode);

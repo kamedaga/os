@@ -35,11 +35,21 @@ static int64_t lpr_filed_io_handle(
     return status == 0 ? (int64_t)result : status;
 }
 
+static int64_t lpr_filed_io_chunked(
+    uint32_t op,
+    uint64_t handle,
+    uint64_t buf,
+    uint64_t count,
+    uint64_t offset);
+
 int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
     if (file == 0) {
         return -LPR_LINUX_EBADF;
+    }
+    if (count > FILED_IO_BYTES) {
+        return lpr_filed_io_chunked(op, file->handle, buf, count, offset);
     }
     return lpr_filed_io_handle(op, file->handle, buf, count, offset);
 }

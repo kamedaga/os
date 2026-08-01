@@ -99,6 +99,19 @@ int main(void) {
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETRANDOM, (uint64_t)(uintptr_t)text, 7, 0, 0, 0, 0) == 7)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETRANDOM)) return 1;
 
+    info = lpr_linux_syscall_lookup(LPR_LINUX_SYS_MEMBARRIER);
+    if (expect(info != 0)) return 1;
+    if (expect(info->cls == LPR_LINUX_SYSCALL_CLASS_MEMORY)) return 1;
+    if (expect(info->backend == LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_MEMBARRIER, 1ull << 3, 0, 0, 0, 0, 0) == -LPR_LINUX_EPERM)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_MEMBARRIER, 0, 0, 0, 0, 0, 0) == ((1ull << 3) | (1ull << 4)))) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_MEMBARRIER, 1ull << 4, 0, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_MEMBARRIER, 1ull << 3, 1, 0, 0, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_MEMBARRIER, 1ull << 3, 0, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_PROCESS_MEMORY_BARRIER &&
+               g_last.a0 == PACHAOS_PROCESS_MEMORY_BARRIER_FLAG_NONE)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_MEMBARRIER, 1ull << 7, 0, 0, 0, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
+
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_BRK, 0, 0, 0, 0, 0, 0) == 0x10000000)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_MMAP)) return 1;
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_BRK, 0x10002000, 0, 0, 0, 0, 0) == 0x10002000)) return 1;

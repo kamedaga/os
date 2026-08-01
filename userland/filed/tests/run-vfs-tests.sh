@@ -27,6 +27,33 @@ mkdir -p "${build_dir}"
   -Wextra \
   -Werror \
   -pthread \
+  -ffunction-sections \
+  -fdata-sections \
+  -Wl,--gc-sections \
+  -I"${repo_root}/userland/filed/include" \
+  -I"${repo_root}/userland/filed/src" \
+  -I"${repo_root}/userland/koboxd/include" \
+  -I"${repo_root}/userland/termd/include" \
+  -I"${repo_root}/userland/drmd/include" \
+  -I"${repo_root}/userland/inputd/include" \
+  -I"${repo_root}/userland/lpr_supervisor/include" \
+  -I"${repo_root}/userland/libipc/include" \
+  -I"${repo_root}/userland/libpacha/include" \
+  -I"${repo_root}/userland/personality/include" \
+  "${repo_root}/userland/filed/src/vfs/core.c" \
+  "${repo_root}/userland/filed/src/vfs/object.c" \
+  "${repo_root}/userland/filed/src/dispatch/ops_file.c" \
+  "${repo_root}/userland/filed/tests/setattr_dispatch_test.c" \
+  -o "${build_dir}/setattr_dispatch_test"
+
+"${build_dir}/setattr_dispatch_test"
+
+"${cc_bin}" \
+  -std=c11 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -pthread \
   -I"${repo_root}/userland/filed/include" \
   -I"${repo_root}/userland/koboxd/include" \
   -I"${repo_root}/userland/termd/include" \

@@ -26,6 +26,10 @@ stock_display_info_sha256="a8796066ec54f870927657948264b318b27cdbd0451469a7d9d46
 stock_liftoff_branch="v3.22"
 stock_liftoff_version="0.5.0-r0"
 stock_liftoff_sha256="454dba3b7e4e109ee89ba4be65a30f742059e4b578c4fb5dcae9d9ccb2252b39"
+ipaex_source_url="https://data.wolfsden.cz/mirror/IPAexfont00401.zip"
+ipaex_source_sha512="fe639ded0a25eed66df8cc1e9d5e965b501574a25fab542a749b3cb8464690448e44343ff5845aecd3224ec481c4089ee56e64880cbbc9211a260b22d4cc68cd"
+adwaita_source_url="https://download.gnome.org/sources/adwaita-icon-theme/48/adwaita-icon-theme-48.1.tar.xz"
+adwaita_source_sha512="1d116599d5397a9dbc7e580fe78ba675b2d6e055e2c6387c08b4f8a646e989a4e5b04a6ff0d8d357422ea7100aefc54c568abf37251f7927ae081ac4334742db"
 
 [[ "${branch}" == "v3.22" ]] || {
   echo "the stock Sway 1.11 overlay requires an Alpine v3.22 base, got ${branch}" >&2
@@ -149,7 +153,7 @@ enqueue() {
   fi
 }
 
-for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot gtk+3.0 gtk+3.0-demo font-roboto-mono libxkbcommon pixman hwdata-pnp; do
+for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot gtk+3.0 gtk+3.0-demo adwaita-icon-theme font-ipaex font-roboto-mono libxkbcommon pixman hwdata-pnp; do
   enqueue "${package}"
 done
 for ((i=0; i<${#queue[@]}; ++i)); do
@@ -194,6 +198,28 @@ download_pinned() {
     mv -f "${staged}" "${apk}"
   fi
   printf '%s\n' "${apk}"
+}
+
+download_source_pinned() {
+  local name="$1" url="$2" expected_sha512="$3"
+  local archive="${cache}/${name}" staged actual_sha512
+  if [[ -f "${archive}" ]]; then
+    actual_sha512="$(sha512sum "${archive}" | awk '{print $1}')"
+  else
+    actual_sha512=""
+  fi
+  if [[ "${actual_sha512}" != "${expected_sha512}" ]]; then
+    staged="${tmp}/${name}.download"
+    curl -fsSL "${url}" -o "${staged}"
+    actual_sha512="$(sha512sum "${staged}" | awk '{print $1}')"
+    if [[ "${actual_sha512}" != "${expected_sha512}" ]]; then
+      echo "pinned source checksum mismatch: ${name}" >&2
+      echo "expected ${expected_sha512}, got ${actual_sha512}" >&2
+      exit 1
+    fi
+    mv -f "${staged}" "${archive}"
+  fi
+  printf '%s\n' "${archive}"
 }
 
 verify_pinned_apk() {
@@ -266,6 +292,34 @@ rm -rf \
   "${dev}"/.SIGN.* "${dev}"/.PKGINFO "${dev}"/.pre-* "${dev}"/.post-* \
   "${dev}"/etc "${dev}"/var
 
+# Alpine's binary font/icon packages do not carry their upstream license
+# files. Keep the exact source notices next to the redistributed assets.
+ipaex_source="$(download_source_pinned \
+  IPAexfont00401.zip "${ipaex_source_url}" "${ipaex_source_sha512}")"
+adwaita_source="$(download_source_pinned \
+  adwaita-icon-theme-48.1.tar.xz \
+  "${adwaita_source_url}" "${adwaita_source_sha512}")"
+mkdir -p \
+  "${runtime}/usr/share/licenses/font-ipaex" \
+  "${runtime}/usr/share/licenses/adwaita-icon-theme"
+python3 - "${ipaex_source}" \
+  "${runtime}/usr/share/licenses/font-ipaex/IPA_Font_License_Agreement_v1.0.txt" <<'PY'
+import sys
+from pathlib import Path
+from zipfile import ZipFile
+
+archive = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+member = "IPAexfont00401/IPA_Font_License_Agreement_v1.0.txt"
+with ZipFile(archive) as source:
+    destination.write_bytes(source.read(member))
+PY
+for notice in COPYING COPYING_CCBYSA3 COPYING_LGPL; do
+  tar -xJOf "${adwaita_source}" \
+    "adwaita-icon-theme-48.1/${notice}" \
+    >"${runtime}/usr/share/licenses/adwaita-icon-theme/${notice}"
+done
+
 # APK triggers normally create this cache.  The fixture extracts APKs without
 # running their scripts, so build the target-root cache explicitly while the
 # fontconfig symlinks still have their native representation.
@@ -311,6 +365,18 @@ grep -Fxq 'set $mod Alt' "${runtime}/etc/sway/config" || {
 }
 mkdir -p "${runtime}/etc/sway/config.d"
 printf 'xwayland disable\n' >"${runtime}/etc/sway/config.d/pacha.conf"
+
+# Keep a true monospace face as Foot's primary font. IPAexGothic remains an
+# explicit Japanese fallback, but is no longer mistaken for the terminal's
+# Latin primary face and therefore does not trigger Foot's correctness warning.
+foot_ini="${runtime}/etc/xdg/foot/foot.ini"
+sed -i \
+  's/^# font=monospace:size=8$/font=Roboto Mono:size=8,IPAexGothic:size=8/' \
+  "${foot_ini}"
+grep -Fxq 'font=Roboto Mono:size=8,IPAexGothic:size=8' "${foot_ini}" || {
+  echo "failed to configure Foot's monospace primary font" >&2
+  exit 1
+}
 
 # The persisted fixture encodes symlinks as marker files, so materialize a
 # temporary flat library directory before asking the target musl loader to
@@ -440,7 +506,12 @@ for required in \
   usr/bin/wayland-info \
   usr/bin/foot \
   usr/bin/gtk3-demo \
+  etc/xdg/foot/foot.ini \
+  usr/share/fonts/ipaexfont/ipaexg.ttf \
   'usr/share/fonts/roboto-mono/RobotoMono[wght].ttf' \
+  usr/share/icons/Adwaita/index.theme \
+  usr/share/licenses/font-ipaex/IPA_Font_License_Agreement_v1.0.txt \
+  usr/share/licenses/adwaita-icon-theme/COPYING \
   usr/lib/libwlroots-0.19.so \
   usr/lib/libdisplay-info.so.3 \
   usr/lib/libliftoff.so.0 \

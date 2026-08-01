@@ -12,6 +12,7 @@ import (
 	"unicode/utf16"
 
 	"capabilityos/pack/internal/config"
+	"capabilityos/pack/internal/imagelock"
 	"capabilityos/pack/internal/progress"
 )
 
@@ -59,6 +60,12 @@ func EnsureWithOptions(workspace *config.Workspace, opts Options) (Result, error
 	defer span.Close()
 	span.Set(1, "checking disk image")
 	path := workspace.Path(workspace.Disk.Image)
+	locks, err := imagelock.Acquire(path)
+	if err != nil {
+		span.Fail("disk image lock failed")
+		return Result{}, err
+	}
+	defer locks.Close()
 	if _, err := os.Stat(path); err == nil {
 		span.Done("disk image exists")
 		return Result{Path: path, SizeMiB: workspace.Disk.SizeMiB, Partitions: len(workspace.Disk.Partitions)}, nil

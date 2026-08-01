@@ -53,7 +53,6 @@ pub const lapic_timer_initial_count: u32 = 50_000;
 pub const scheduler_slice_ticks: u64 = 4;
 pub const bootlog_auto_launch_min_visible_ticks: u64 = 1;
 pub const user_log_max_bytes: usize = 256;
-pub const fx_state_bytes: usize = 512;
 pub const boot_log_max_bytes: usize = 32 * 1024;
 pub const boot_log_page_header_bytes: usize = 8;
 pub const boot_log_page_payload_bytes: usize = 4096 - boot_log_page_header_bytes;

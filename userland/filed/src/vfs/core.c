@@ -1117,6 +1117,50 @@ filed_status_t filed_vfs_stat_prepare(
     return filed_prepare_file_handle(vfs, handle_id, FILED_RIGHT_STAT, out_decision);
 }
 
+filed_status_t filed_vfs_setattr_prepare(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    filed_vfs_io_decision_t *out_decision)
+{
+    return filed_prepare_file_handle(vfs, handle_id, FILED_RIGHT_SETATTR, out_decision);
+}
+
+filed_status_t filed_vfs_setattr_snapshot_valid(
+    const filed_vfs_t *vfs,
+    filed_handle_id_t handle_id,
+    bool *out_valid)
+{
+    const filed_handle_t *handle;
+    const filed_file_t *file;
+    const filed_vnode_t *vnode;
+
+    if (vfs == NULL || handle_id == 0 || out_valid == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    *out_valid = false;
+
+    handle = filed_find_handle_const(vfs, handle_id);
+    if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
+        return FILED_ERR_INVALID;
+    }
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_SETATTR)) {
+        return FILED_ERR_DENIED;
+    }
+    file = filed_find_file_const(vfs, (filed_file_id_t)handle->target_id);
+    if (file == NULL) {
+        return FILED_ERR_INVALID;
+    }
+    vnode = filed_find_vnode_const(vfs, file->vnode_id);
+    if (vnode == NULL) {
+        return FILED_ERR_INVALID;
+    }
+
+    filed_lock_acquire(filed_mutable_lock(&vnode->lock));
+    *out_valid = vnode->stat_valid;
+    filed_lock_release(filed_mutable_lock(&vnode->lock));
+    return FILED_OK;
+}
+
 filed_status_t filed_vfs_get_stat_snapshot(
     const filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -1412,8 +1456,10 @@ filed_status_t filed_vfs_update_times(
     if (mask == 0) {
         return FILED_OK;
     }
-    if (atime_nsec < 0 || atime_nsec >= 1000000000ll ||
-        mtime_nsec < 0 || mtime_nsec >= 1000000000ll)
+    if (((mask & (uint32_t)FILED_TIME_UPDATE_ATIME) != 0 &&
+            (atime_nsec < 0 || atime_nsec >= 1000000000ll)) ||
+        ((mask & (uint32_t)FILED_TIME_UPDATE_MTIME) != 0 &&
+            (mtime_nsec < 0 || mtime_nsec >= 1000000000ll)))
     {
         return FILED_ERR_INVALID;
     }
@@ -1421,7 +1467,7 @@ filed_status_t filed_vfs_update_times(
     if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
         return FILED_ERR_INVALID;
     }
-    if (!filed_rights_include(handle->rights, FILED_RIGHT_WRITE)) {
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_SETATTR)) {
         return FILED_ERR_DENIED;
     }
     file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
@@ -1468,7 +1514,7 @@ filed_status_t filed_vfs_update_mode(
     if (handle == NULL || handle->target_kind != FILED_HANDLE_FILE) {
         return FILED_ERR_INVALID;
     }
-    if (!filed_rights_include(handle->rights, FILED_RIGHT_WRITE)) {
+    if (!filed_rights_include(handle->rights, FILED_RIGHT_SETATTR)) {
         return FILED_ERR_DENIED;
     }
     file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);

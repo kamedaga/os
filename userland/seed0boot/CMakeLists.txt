@@ -38,8 +38,11 @@ add_custom_command(
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libcapsule/include/pacha/capsule.h"
     "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
+    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/syscall.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+    "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

@@ -25,8 +25,16 @@
 #define LPR_LINUX_MS_ASYNC 0x1ull
 #define LPR_LINUX_MS_INVALIDATE 0x2ull
 #define LPR_LINUX_MS_SYNC 0x4ull
+#define LPR_LINUX_MEMBARRIER_CMD_QUERY 0ull
+#define LPR_LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED (1ull << 3)
+#define LPR_LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED (1ull << 4)
+#define LPR_LINUX_MEMBARRIER_PRIVATE_EXPEDITED_MASK \
+    (LPR_LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED | \
+     LPR_LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status);
 static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
+
+static uint32_t lpr_linux_private_expedited_registered;
 
 const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
 {
@@ -1141,7 +1149,7 @@ static int64_t lpr_sys_unlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 static int64_t lpr_sys_renameat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_renameat(a0, a1, a2, a3); }
 static int64_t lpr_sys_linkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_linkat(a0, a1, a2, a3, a4); }
 static int64_t lpr_sys_symlinkat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_symlinkat(a0, a1, a2); }
-static int64_t lpr_sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_fchmodat(a0, a1, a2, a3); }
+static int64_t lpr_sys_fchmodat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_fchmodat(a0, a1, a2, 0); }
 static int64_t lpr_sys_faccessat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_faccessat(a0, a1, a2, 0); }
 static int64_t lpr_sys_pselect6(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_pselect6(a0, a1, a2, a3, a4, a5); }
 static int64_t lpr_sys_ppoll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_ppoll(a0, a1, a2, a3, a4); }
@@ -1164,6 +1172,32 @@ static int64_t lpr_sys_prlimit64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
 static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_sendmmsg(a0, a1, a2, a3); }
 static int64_t lpr_sys_getrandom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_pacha_syscall3(PACHAOS_SYSCALL_GETRANDOM, a0, a1, a2); }
 static int64_t lpr_sys_memfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_memfd_create(a0, a1); }
+static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a1 != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    switch (a0) {
+    case LPR_LINUX_MEMBARRIER_CMD_QUERY:
+        return LPR_LINUX_MEMBARRIER_PRIVATE_EXPEDITED_MASK;
+    case LPR_LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED:
+        __atomic_store_n(&lpr_linux_private_expedited_registered, 1u, __ATOMIC_RELEASE);
+        return 0;
+    case LPR_LINUX_MEMBARRIER_CMD_PRIVATE_EXPEDITED:
+        if (__atomic_load_n(&lpr_linux_private_expedited_registered, __ATOMIC_ACQUIRE) == 0u) {
+            return -LPR_LINUX_EPERM;
+        }
+        return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_PROCESS_MEMORY_BARRIER,
+            PACHAOS_PROCESS_MEMORY_BARRIER_FLAG_NONE));
+    default:
+        return -LPR_LINUX_EINVAL;
+    }
+}
 static int64_t lpr_sys_fcntl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket_fd_active(a0) ? lpr_linux_socket_fcntl(a0, a1, a2) : lpr_linux_fcntl(a0, a1, a2); }
 static int64_t lpr_sys_flock(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_flock(a0, a1); }
 static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_poll(a0, a1, a2); }
@@ -1304,6 +1338,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_SENDMMSG, "sendmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_sendmmsg, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRANDOM, "getrandom", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getrandom, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MEMFD_CREATE, "memfd_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_memfd_create, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_MEMBARRIER, "membarrier", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_membarrier, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_STATX, "statx", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_statx, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOSE_RANGE, "close_range", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_close_range, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_SCHED_GETAFFINITY, "sched_getaffinity", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sched_getaffinity, 0),
@@ -1449,6 +1484,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_SENDMMSG].handler = lpr_sys_sendmmsg;
     lpr_syscall_table[LPR_LINUX_SYS_GETRANDOM].handler = lpr_sys_getrandom;
     lpr_syscall_table[LPR_LINUX_SYS_MEMFD_CREATE].handler = lpr_sys_memfd_create;
+    lpr_syscall_table[LPR_LINUX_SYS_MEMBARRIER].handler = lpr_sys_membarrier;
     lpr_syscall_table[LPR_LINUX_SYS_STATX].handler = lpr_sys_statx;
     lpr_syscall_table[LPR_LINUX_SYS_CLOSE_RANGE].handler = lpr_sys_close_range;
     lpr_syscall_table[LPR_LINUX_SYS_SCHED_GETAFFINITY].handler = lpr_sys_sched_getaffinity;

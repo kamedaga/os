@@ -1000,11 +1000,19 @@ int64_t lpr_linux_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64
         dirfd, path, (uint64_t)(uintptr_t)&statbuf, flags & ~LPR_LINUX_AT_EACCESS);
 }
 
-int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw)
+int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags)
 {
-    int64_t fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDWR, 0);
+    uint64_t open_flags = LPR_LINUX_O_RDONLY;
+    if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
+        open_flags |= LPR_LINUX_O_NOFOLLOW;
+    }
+    int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0);
     if (fd == -LPR_LINUX_EISDIR) {
-        fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDWR | LPR_LINUX_O_DIRECTORY, 0);
+        fd = lpr_linux_openat(
+            dirfd,
+            path_raw,
+            open_flags | LPR_LINUX_O_DIRECTORY,
+            0);
     }
     return fd;
 }
@@ -1042,7 +1050,7 @@ int64_t lpr_linux_fchmodat(uint64_t dirfd, uint64_t path_raw, uint64_t mode, uin
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const int64_t fd = lpr_linux_open_metadata(dirfd, path_raw);
+    const int64_t fd = lpr_linux_open_metadata(dirfd, path_raw, flags);
     if (fd < 0) {
         return fd;
     }
@@ -1062,6 +1070,47 @@ int64_t lpr_linux_now(lpr_linux_timespec_t *out)
         0,
         (uint64_t)(uintptr_t)out);
     return lpr_pacha_status_to_errno(status);
+}
+
+int lpr_linux_utimens_both_omit(const lpr_linux_timespec_t *times)
+{
+    return times != 0 &&
+        times[0].tv_nsec == LPR_LINUX_UTIME_OMIT &&
+        times[1].tv_nsec == LPR_LINUX_UTIME_OMIT;
+}
+
+int64_t lpr_linux_utimens_plan(
+    const lpr_linux_timespec_t *times,
+    lpr_linux_utimens_plan_t *out_plan)
+{
+    if (out_plan == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    out_plan->mask = 0;
+    out_plan->needs_now = 0;
+    if (times == 0) {
+        out_plan->mask = FILED_UTIMENS_ATIME | FILED_UTIMENS_MTIME;
+        out_plan->needs_now = 1;
+        return 0;
+    }
+
+    const uint64_t bits[2] = { FILED_UTIMENS_ATIME, FILED_UTIMENS_MTIME };
+    for (uint32_t i = 0; i < 2; ++i) {
+        const int64_t nsec = times[i].tv_nsec;
+        if (nsec == LPR_LINUX_UTIME_OMIT) {
+            continue;
+        }
+        if (nsec == LPR_LINUX_UTIME_NOW) {
+            out_plan->mask |= bits[i];
+            out_plan->needs_now = 1;
+            continue;
+        }
+        if (nsec < 0 || nsec >= 1000000000ll) {
+            return -LPR_LINUX_EINVAL;
+        }
+        out_plan->mask |= bits[i];
+    }
+    return 0;
 }
 
 int64_t lpr_linux_resolve_utime(
@@ -1107,11 +1156,23 @@ int64_t lpr_linux_resolve_utime(
 int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw)
 {
     const lpr_linux_timespec_t *times = (const lpr_linux_timespec_t *)(uintptr_t)times_raw;
+    lpr_linux_utimens_plan_t plan;
     lpr_linux_timespec_t now;
+    const lpr_linux_timespec_t *now_ptr = 0;
     uint64_t mask = 0;
-    int64_t status = lpr_linux_now(&now);
+    int64_t status = lpr_linux_utimens_plan(times, &plan);
     if (status != 0) {
         return status;
+    }
+    if (plan.mask == 0) {
+        return 0;
+    }
+    if (plan.needs_now != 0) {
+        status = lpr_linux_now(&now);
+        if (status != 0) {
+            return status;
+        }
+        now_ptr = &now;
     }
 
     void *page = 0;
@@ -1125,7 +1186,7 @@ int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw)
 
     status = lpr_linux_resolve_utime(
         times_raw == 0 ? 0 : &times[0],
-        &now,
+        now_ptr,
         FILED_UTIMENS_ATIME,
         &mask,
         &utimens->atime_sec,
@@ -1133,7 +1194,7 @@ int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw)
     if (status == 0) {
         status = lpr_linux_resolve_utime(
             times_raw == 0 ? 0 : &times[1],
-            &now,
+            now_ptr,
             FILED_UTIMENS_MTIME,
             &mask,
             &utimens->mtime_sec,
@@ -1150,25 +1211,42 @@ int64_t lpr_filed_utimens_handle(uint64_t handle, uint64_t times_raw)
 
 int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, uint64_t flags)
 {
+    const lpr_linux_timespec_t *time_values =
+        (const lpr_linux_timespec_t *)(uintptr_t)times;
+    if (lpr_linux_utimens_both_omit(time_values)) {
+        return 0;
+    }
     const uint64_t known_flags = LPR_LINUX_AT_SYMLINK_NOFOLLOW | LPR_LINUX_AT_EMPTY_PATH;
     if ((flags & ~known_flags) != 0) {
         return -LPR_LINUX_EINVAL;
     }
     const char *path = (const char *)(uintptr_t)path_raw;
-    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && path[0] == 0) {
-        if (!lpr_fd_is_filed(dirfd)) {
-            return -LPR_LINUX_EBADF;
-        }
-        return lpr_filed_utimens_handle(lpr_filed_backend(dirfd)->handle, times);
-    }
     if (path == 0) {
-        return -LPR_LINUX_EFAULT;
+        if (flags != 0) {
+            return -LPR_LINUX_EINVAL;
+        }
+        const uint64_t handle = lpr_linux_filed_fd_handle(dirfd);
+        if (handle == 0) {
+            return lpr_fd_linux_visible_active(dirfd) ?
+                -LPR_LINUX_EOPNOTSUPP : -LPR_LINUX_EBADF;
+        }
+        return lpr_filed_utimens_handle(handle, times);
     }
-    const int64_t fd = lpr_linux_openat(dirfd, path_raw, LPR_LINUX_O_RDWR, 0);
+    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && path[0] == 0) {
+        const uint64_t handle = lpr_linux_filed_fd_handle(dirfd);
+        if (handle == 0) {
+            return lpr_fd_linux_visible_active(dirfd) ?
+                -LPR_LINUX_EOPNOTSUPP : -LPR_LINUX_EBADF;
+        }
+        return lpr_filed_utimens_handle(handle, times);
+    }
+    const int64_t fd = lpr_linux_open_metadata(dirfd, path_raw, flags);
     if (fd < 0) {
         return fd;
     }
-    const int64_t status = lpr_filed_utimens_handle(lpr_filed_backend((uint64_t)fd)->handle, times);
+    const uint64_t handle = lpr_linux_filed_fd_handle((uint64_t)fd);
+    const int64_t status = handle != 0 ?
+        lpr_filed_utimens_handle(handle, times) : -LPR_LINUX_EOPNOTSUPP;
     (void)lpr_linux_close((uint64_t)fd);
     return status;
 }

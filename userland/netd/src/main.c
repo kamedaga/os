@@ -112,9 +112,9 @@ int main(int argc, char **argv)
             netd_libuinet_socket_collect_wait_sources(&wait_set) != 0)
             return 8;
         (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
-        netd_socket_service_reap_hangups();
-        netd_unix_socket_reap_hangups();
-        netd_netlink_socket_reap_hangups();
-        netd_libuinet_socket_reap_hangups();
+        netd_socket_service_reap_hangups(&wait_set);
+        netd_unix_socket_reap_hangups(&wait_set);
+        netd_netlink_socket_reap_hangups(&wait_set);
+        netd_libuinet_socket_reap_hangups(&wait_set);
     }
 }

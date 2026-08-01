@@ -20,7 +20,8 @@ pub const syscall_process_clone: u64 = 17;
 pub const syscall_process_map: u64 = 18;
 pub const syscall_process_map_batch: u64 = 19;
 pub const syscall_process_exec_from: u64 = 20;
-pub const syscall_process_last: u64 = syscall_process_exec_from;
+pub const syscall_process_memory_barrier: u64 = 21;
+pub const syscall_process_last: u64 = syscall_process_memory_barrier;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
 pub const process_flag_none: u64 = 0;
@@ -78,9 +79,10 @@ pub const signal_ctl_deliver_pending_frame: u64 = 4;
 pub const signal_frame_magic: u64 = 0x5041_4348_4153_4947;
 pub const signal_frame_header_size: u64 = 32;
 pub const signal_frame_context_offset: u64 = signal_frame_header_size;
-pub const signal_fx_state_size: u64 = 512;
-pub const signal_frame_fx_state_offset: u64 = signal_frame_context_offset + 20 * 8;
-pub const signal_frame_size: u64 = signal_frame_fx_state_offset + signal_fx_state_size;
+pub const signal_xstate_feature_mask: u64 = 0x7;
+pub const signal_xstate_size: u64 = 832;
+pub const signal_frame_xstate_offset: u64 = signal_frame_context_offset + 20 * 8;
+pub const signal_frame_size: u64 = signal_frame_xstate_offset + signal_xstate_size;
 pub const signal_red_zone_size: u64 = 128;
 pub const signal_runtime_stack_size: u64 = 4096;
 
@@ -101,6 +103,9 @@ pub const process_map_batch_entry_size: u64 = 48;
 
 pub const process_exec_from_flag_none: u64 = 0;
 pub const process_exec_from_known_flags_mask: u64 = process_exec_from_flag_none;
+
+pub const process_memory_barrier_flag_none: u64 = 0;
+pub const process_memory_barrier_known_flags_mask: u64 = process_memory_barrier_flag_none;
 
 pub const aux_base_va: u64 = 0x0000_7000_0000_0000;
 pub const aux_page_bytes: u64 = 0x1000;

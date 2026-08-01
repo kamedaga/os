@@ -4,10 +4,12 @@ const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const user_vm = @import("../memory/user_vm.zig");
+const user_copy = @import("../user_copy.zig");
 const boot_static = @import("../boot/main_static.zig");
 const kernel_log = @import("../kernel_log.zig");
 const sc = @import("numbers.zig");
 const runtime = @import("runtime.zig");
+const x86_platform = @import("../arch/x86_64/platform.zig");
 
 const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
@@ -424,8 +426,12 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         copied.rax = 0;
         break :blk copied;
     };
-    const thread_index = scheduler.allocateReadyThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
+    const thread_index = scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
     if (!scheduler.copySignalDeliveryConfig(scheduler.currentThread(), thread_index)) {
+        _ = scheduler.releaseThread(thread_index);
+        return sc.syscall_err_not_ready;
+    }
+    if (!scheduler.copyThreadXState(scheduler.currentThread(), thread_index)) {
         _ = scheduler.releaseThread(thread_index);
         return sc.syscall_err_not_ready;
     }
@@ -436,6 +442,10 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     if (!scheduler.setThreadGsBase(thread_index, scheduler.currentGsBase())) {
         _ = scheduler.releaseThread(thread_index);
         return sc.syscall_err_invalid;
+    }
+    if (!scheduler.markThreadReady(thread_index, true)) {
+        _ = scheduler.releaseThread(thread_index);
+        return sc.syscall_err_not_ready;
     }
 
     const process_fd = state.createProcessFd(proc, .{
@@ -561,12 +571,12 @@ const NativeSignalFrame = extern struct {
     signo: u64,
     reserved0: u64,
     context: TrapFrame,
-    fx_state: [process_abi.signal_fx_state_size]u8,
+    x_state: [process_abi.signal_xstate_size]u8,
 };
 
 comptime {
     if (@offsetOf(NativeSignalFrame, "context") != process_abi.signal_frame_context_offset) @compileError("native signal frame context offset mismatch");
-    if (@offsetOf(NativeSignalFrame, "fx_state") != process_abi.signal_frame_fx_state_offset) @compileError("native signal frame fx state offset mismatch");
+    if (@offsetOf(NativeSignalFrame, "x_state") != process_abi.signal_frame_xstate_offset) @compileError("native signal frame xstate offset mismatch");
     if (@sizeOf(NativeSignalFrame) != process_abi.signal_frame_size) @compileError("native signal frame size mismatch");
 }
 
@@ -622,16 +632,16 @@ fn deliverPendingSignalToUserFrame(
         return sc.syscall_err_invalid;
     }
     const signal_frame_va = (user_frame.rsp - process_abi.signal_red_zone_size -
-        process_abi.signal_frame_size) & ~@as(u64, 15);
+        process_abi.signal_frame_size) & ~@as(u64, 63);
     var signal_frame = NativeSignalFrame{
         .magic = process_abi.signal_frame_magic,
         .size = process_abi.signal_frame_size,
         .signo = claimed.signo,
-        .reserved0 = 0,
+        .reserved0 = process_abi.signal_xstate_feature_mask,
         .context = trapFrameFromProcessCloneUserFrame(&user_frame),
-        .fx_state = undefined,
+        .x_state = undefined,
     };
-    if (!scheduler.copyCurrentSignalFxState(&signal_frame.fx_state) or
+    if (!scheduler.copyCurrentSignalXState(&signal_frame.x_state) or
         !h.copy_bytes_to_user_va(proc, signal_frame_va, std.mem.asBytes(&signal_frame)))
     {
         scheduler.restoreClaimedSignal(claimed);
@@ -674,8 +684,10 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             if (!h.copy_user_bytes_from_va(proc, frame.rsi, std.mem.asBytes(&returned))) return sc.syscall_err_invalid;
             if (returned.magic != process_abi.signal_frame_magic or
                 returned.size != process_abi.signal_frame_size or
+                returned.reserved0 != process_abi.signal_xstate_feature_mask or
                 returned.signo == 0 or returned.signo > process_abi.signal_max or
-                !validReturnedSignalContext(&returned.context))
+                !validReturnedSignalContext(&returned.context) or
+                !x86_platform.validateUserXState(&returned.x_state))
             {
                 return sc.syscall_err_invalid;
             }
@@ -683,7 +695,7 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             returned.context.rflags &= ~(@as(u64, 1) << 14);
             returned.context.rflags &= ~(@as(u64, 1) << 17);
             returned.context.rflags |= (@as(u64, 1) << 1) | (@as(u64, 1) << 9);
-            if (!scheduler.restoreCurrentSignalFxState(&returned.fx_state)) return sc.syscall_err_not_ready;
+            if (!scheduler.restoreCurrentSignalXState(&returned.x_state)) return sc.syscall_err_not_ready;
             frame.* = returned.context;
             return returned.context.rax;
         },
@@ -1075,6 +1087,16 @@ fn execFromStagedProcess(
     return sc.syscall_ok;
 }
 
+fn synchronizeProcessMemory(proc: kernel.PrincipalId, flags: u64) u64 {
+    if ((flags & ~process_abi.process_memory_barrier_known_flags_mask) != 0) {
+        return sc.syscall_err_invalid;
+    }
+    if (!user_copy.synchronizeUserMemoryForPrincipal(proc)) {
+        return sc.syscall_err_not_ready;
+    }
+    return sc.syscall_ok;
+}
+
 fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame, code: u32) u64 {
     const exit_flags = frame.rdx;
     if ((exit_flags & ~process_abi.thread_exit_known_flags_mask) != 0) return sc.syscall_err_invalid;
@@ -1145,6 +1167,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),
         sc.syscall_process_map_batch => mapBatchIntoProcess(h, state, proc, h.free_list, frame),
         sc.syscall_process_exec_from => execFromStagedProcess(h, state, proc, frame),
+        sc.syscall_process_memory_barrier => synchronizeProcessMemory(proc, frame.rdi),
         else => null,
     };
 }

@@ -1,6 +1,6 @@
 #include "internal.h"
 
-#include <hde64.h>
+#include <patch_scan.h>
 #include <string.h>
 
 int lpr_exec_validate_elf(const lpr_exec_image_t *image)
@@ -238,63 +238,21 @@ int lpr_exec_image_find_symbol(const lpr_exec_image_t *image, const char *symbol
     return -2;
 }
 
-static uint64_t lpr_exec_hde_opcode_offset(const unsigned char *bytes, uint64_t len)
+int lpr_exec_patch_syscalls(
+    unsigned char *bytes,
+    uint64_t size,
+    uint64_t *out_patched)
 {
-    uint64_t off = 0;
-    while (off < len) {
-        const unsigned char p = bytes[off];
-        if (p != 0xf0 && p != 0xf2 && p != 0xf3 && p != 0x2e && p != 0x36 &&
-            p != 0x3e && p != 0x26 && p != 0x64 && p != 0x65 && p != 0x66 && p != 0x67)
-        {
-            break;
-        }
-        off++;
+    if (bytes == NULL || out_patched == NULL) {
+        return -22;
     }
-    if (off < len && bytes[off] >= 0x40 && bytes[off] <= 0x4f) {
-        off++;
+    *out_patched = 0;
+    lpr_patch_scan_result_t result;
+    if (lpr_patch_scan_syscalls(
+            bytes, size, LPR_PATCH_SCAN_START_BOUNDARY, &result) != 0)
+    {
+        return -8;
     }
-    return off;
-}
-
-static int lpr_exec_hde_decode(const unsigned char *bytes, uint64_t size, uint64_t pos, hde64s *out)
-{
-    if (bytes == NULL || out == NULL || pos >= size) {
-        return 0;
-    }
-    const unsigned int len = hde64_disasm(bytes + pos, out);
-    if (len == 0 || (out->flags & F_ERROR) != 0 || len > size - pos) {
-        return 0;
-    }
-    return (int)len;
-}
-
-uint64_t lpr_exec_patch_syscalls(unsigned char *bytes, uint64_t size)
-{
-    if (bytes == NULL || size < 2) {
-        return 0;
-    }
-    uint64_t patched = 0;
-    for (uint64_t i = 0; i < size;) {
-        hde64s insn;
-        const int insn_len = lpr_exec_hde_decode(bytes, size, i, &insn);
-        if (insn_len <= 0) {
-            break;
-        }
-        if (insn.opcode == 0x0f && (insn.opcode2 == 0x05 || insn.opcode2 == 0x34)) {
-            hde64s next_insn;
-            const uint64_t next = i + (uint64_t)insn_len;
-            const int next_len = next < size ? lpr_exec_hde_decode(bytes, size, next, &next_insn) : 0;
-            const uint64_t opcode = i + lpr_exec_hde_opcode_offset(bytes + i, (uint64_t)insn_len);
-            if (next_len > 0 && opcode + 1u < size &&
-                bytes[opcode] == LPR_ZPOLINE_PATCH_FROM0 &&
-                bytes[opcode + 1u] == LPR_ZPOLINE_PATCH_FROM1)
-            {
-                bytes[opcode] = LPR_ZPOLINE_PATCH_TO0;
-                bytes[opcode + 1u] = LPR_ZPOLINE_PATCH_TO1;
-                patched++;
-            }
-        }
-        i += (uint64_t)insn_len;
-    }
-    return patched;
+    *out_patched = result.patched_sites;
+    return 0;
 }

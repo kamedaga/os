@@ -13,8 +13,12 @@
 typedef struct netd_unix_socket_state {
     uint64_t handle;
     uint64_t peer;
-    uint64_t pending;
+    uint64_t pending_head;
+    uint64_t pending_tail;
+    uint64_t pending_next;
     uint32_t type;
+    uint32_t backlog;
+    uint32_t pending_count;
     uint8_t listening;
     uint8_t connected;
     uint8_t peer_closed;
@@ -44,7 +48,8 @@ static void force_destroy_socket(netd_unix_socket_state_t *s);
 static void notify_readable(netd_unix_socket_state_t *s) {
     if (s == NULL || s->notify_fd < 16 || s->notify_pending) return;
     const struct pacha_ipc_msg message = { .word0 = 1 };
-    if (pacha_ipc_send(s->notify_fd, &message) == 0) s->notify_pending = 1;
+    const int status = pacha_ipc_send(s->notify_fd, &message);
+    if (status == 0) s->notify_pending = 1;
 }
 
 int netd_unix_socket_is_handle(uint64_t handle) { return (handle & NETD_UNIX_HANDLE_BIT) != 0; }
@@ -52,6 +57,24 @@ int netd_unix_socket_is_handle(uint64_t handle) { return (handle & NETD_UNIX_HAN
 static netd_unix_socket_state_t *find_socket(uint64_t handle) {
     for (unsigned i = 0; i < NETD_UNIX_MAX; i++) if (sockets[i].handle == handle) return &sockets[i];
     return NULL;
+}
+
+static netd_unix_socket_state_t *dequeue_pending(
+    netd_unix_socket_state_t *listener)
+{
+    if (listener == NULL || listener->pending_head == 0) return NULL;
+    netd_unix_socket_state_t *server = find_socket(listener->pending_head);
+    if (server == NULL) {
+        listener->pending_head = 0;
+        listener->pending_tail = 0;
+        listener->pending_count = 0;
+        return NULL;
+    }
+    listener->pending_head = server->pending_next;
+    server->pending_next = 0;
+    if (listener->pending_count != 0) listener->pending_count--;
+    if (listener->pending_head == 0) listener->pending_tail = 0;
+    return server;
 }
 
 int netd_unix_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set) {
@@ -66,16 +89,13 @@ int netd_unix_socket_collect_wait_sources(struct pacha_service_wait_set *wait_se
     return 0;
 }
 
-void netd_unix_socket_reap_hangups(void) {
+void netd_unix_socket_reap_hangups(
+    const struct pacha_service_wait_set *wait_set) {
     for (unsigned i = 0; i < NETD_UNIX_MAX; i++) {
         netd_unix_socket_state_t *s = &sockets[i];
         if (s->handle == 0 || s->notify_fd < 16) continue;
-        struct pacha_pollfd pollfd = {
-            .fd = s->notify_fd,
-            .events = PACHA_FD_EVENT_HANGUP,
-        };
-        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
-            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        if ((pacha_service_wait_revents(wait_set, s->notify_fd) &
+             PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle = s->handle;
         force_destroy_socket(s);
         printf("[netd] unix_orphan_reap handle=%llu\n",
@@ -144,7 +164,8 @@ int netd_unix_socket_attach_wait(uint64_t handle, int notify_fd) {
     netd_unix_socket_state_t *s = find_socket(handle);
     if (s == NULL || notify_fd < 16 || s->notify_fd >= 16) return -22;
     s->notify_fd = notify_fd;
-    if (s->rx_len != 0 || s->peer_closed || (s->listening && s->pending != 0))
+    if (s->rx_len != 0 || s->peer_closed ||
+        (s->listening && s->pending_head != 0))
         notify_readable(s);
     return 0;
 }
@@ -163,9 +184,14 @@ int netd_unix_socket_bind(const netd_unix_path_t *req) {
     return 0;
 }
 
-int netd_unix_socket_listen(uint64_t handle) {
-    netd_unix_socket_state_t *s = find_socket(handle);
-    if (s == NULL || s->path[0] == 0) return -22;
+int netd_unix_socket_listen(const netd_listen_t *req) {
+    netd_unix_socket_state_t *s = req ? find_socket(req->handle) : NULL;
+    if (req == NULL || s == NULL || s->path[0] == 0 || req->reserved0 != 0) {
+        return -22;
+    }
+    uint32_t backlog = req->backlog > 0 ? (uint32_t)req->backlog : 1u;
+    if (backlog >= NETD_UNIX_MAX) backlog = NETD_UNIX_MAX - 1u;
+    s->backlog = backlog;
     s->listening = 1;
     return 0;
 }
@@ -175,16 +201,30 @@ int netd_unix_socket_connect(const netd_unix_path_t *req) {
     if (client == NULL) return -9;
     netd_unix_socket_state_t *listener = NULL;
     for (unsigned i = 0; i < NETD_UNIX_MAX; i++)
-        if (sockets[i].listening && strcmp(sockets[i].path, req->path) == 0) { listener = &sockets[i]; break; }
+        if (sockets[i].listening && strcmp(sockets[i].path, req->path) == 0) {
+            listener = &sockets[i];
+            break;
+        }
     if (listener == NULL) return -111;
-    if (listener->pending != 0) return -11;
+    if (listener->pending_count >= listener->backlog) return -11;
     netd_unix_socket_state_t *server = alloc_socket();
     if (server == NULL) return -24;
     server->type = client->type; server->connected = 1; server->peer = client->handle;
-    server->pid = listener->pid; server->uid = listener->uid; server->gid = listener->gid;
+    server->pid = req->pid; server->uid = req->uid; server->gid = req->gid;
     client->connected = 1; client->peer = server->handle;
     client->pid = req->pid; client->uid = req->uid; client->gid = req->gid;
-    listener->pending = server->handle;
+    if (listener->pending_tail != 0) {
+        netd_unix_socket_state_t *tail = find_socket(listener->pending_tail);
+        if (tail == NULL) {
+            force_destroy_socket(server);
+            return -5;
+        }
+        tail->pending_next = server->handle;
+    } else {
+        listener->pending_head = server->handle;
+    }
+    listener->pending_tail = server->handle;
+    listener->pending_count++;
     server->notify_fd = -1;
     notify_readable(listener);
     return 0;
@@ -193,14 +233,15 @@ int netd_unix_socket_connect(const netd_unix_path_t *req) {
 int netd_unix_socket_accept(netd_accept_t *req) {
     netd_unix_socket_state_t *listener = req ? find_socket(req->handle) : NULL;
     if (listener == NULL || !listener->listening) return -22;
-    if (listener->pending == 0) return -11;
-    netd_unix_socket_state_t *server = find_socket(listener->pending);
-    netd_unix_socket_state_t *client = server ? find_socket(server->peer) : NULL;
-    if (server == NULL || client == NULL) return -5;
-    req->accepted_handle = server->handle;
-    req->pid = client->pid; req->uid = client->uid; req->gid = client->gid;
-    listener->pending = 0;
+    /* The caller drains the listener doorbell before ACCEPT.  A stale edge
+     * may race with another acceptor, so acknowledge it even when the FIFO is
+     * already empty and let the next empty -> pending transition notify. */
     listener->notify_pending = 0;
+    netd_unix_socket_state_t *server = dequeue_pending(listener);
+    if (server == NULL) return -11;
+    req->accepted_handle = server->handle;
+    req->pid = server->pid; req->uid = server->uid; req->gid = server->gid;
+    if (listener->pending_head != 0) notify_readable(listener);
     return 0;
 }
 
@@ -243,12 +284,19 @@ int netd_unix_socket_send(
     netd_unix_socket_state_t *s = req ? find_socket(req->handle) : NULL;
     netd_unix_socket_state_t *peer = s ? find_socket(s->peer) : NULL;
     if (s == NULL || peer == NULL || !s->connected) return -107;
-    if (req->length > NETD_UNIX_RX - peer->rx_len) return -11;
+    const size_t available = NETD_UNIX_RX - peer->rx_len;
+    if (available == 0) return -11;
     if (req->transfer_count != 0 && peer->transfer_count != 0) return -11;
     if (!netd_unix_transfer_valid(req, capability_fds, capability_count)) return -22;
+    if (req->length == 0) {
+        *out_sent = 0;
+        return 0;
+    }
+    const size_t sent = (size_t)req->length < available ?
+        (size_t)req->length : available;
     const uint32_t transfer_offset = peer->rx_len;
-    memcpy(peer->rx + peer->rx_len, req->data, (size_t)req->length);
-    peer->rx_len += (uint32_t)req->length;
+    memcpy(peer->rx + peer->rx_len, req->data, sent);
+    peer->rx_len += (uint32_t)sent;
     if (req->transfer_count != 0) {
         peer->transfer_offset = transfer_offset;
         peer->transaction_id = req->transaction_id;
@@ -260,7 +308,7 @@ int netd_unix_socket_send(
             peer->capability_fds[i] = capability_fds[i];
     }
     notify_readable(peer);
-    *out_sent = (size_t)req->length;
+    *out_sent = sent;
     return 0;
 }
 
@@ -282,10 +330,19 @@ int netd_unix_socket_recv(
     if (out_capability_count != NULL) *out_capability_count = 0;
     netd_unix_socket_state_t *s = req ? find_socket(req->handle) : NULL;
     if (s == NULL) return -9;
-    if (s->rx_len == 0) return s->peer_closed ? 0 : -11;
+    /* The caller drains the native doorbell before issuing RECV.  A stale
+     * readable observation may therefore reach us after another reader has
+     * consumed the bytes.  Acknowledge the drained doorbell even on EAGAIN so
+     * the next empty -> readable transition can notify again. */
+    s->notify_pending = 0;
+    if (s->rx_len == 0) {
+        const int status = s->peer_closed ? 0 : -11;
+        return status;
+    }
     size_t n = capacity < s->rx_len ? capacity : s->rx_len;
     if ((req->flags & NETD_MSG_PEEK) != 0) {
         memcpy(req->data, s->rx, n);
+        notify_readable(s);
         *out_received = n;
         return 0;
     }
@@ -293,6 +350,7 @@ int netd_unix_socket_recv(
     if (deliver_transfer && (out_capability_fds == NULL ||
         out_capability_count == NULL || capability_capacity < s->capability_count))
         return -90;
+    const int was_full = s->rx_len == NETD_UNIX_RX;
     memcpy(req->data, s->rx, n);
     memmove(s->rx, s->rx + n, s->rx_len - n);
     s->rx_len -= (uint32_t)n;
@@ -315,8 +373,9 @@ int netd_unix_socket_recv(
     } else if (s->transfer_count != 0) {
         s->transfer_offset -= (uint32_t)n;
     }
-    s->notify_pending = 0;
-    if (s->rx_len != 0) notify_readable(s);
+    if (s->rx_len != 0 || s->peer_closed) notify_readable(s);
+    if (was_full) notify_readable(find_socket(s->peer));
+    if (deliver_transfer) notify_readable(find_socket(s->peer));
     *out_received = n;
     return 0;
 }
@@ -324,19 +383,30 @@ int netd_unix_socket_recv(
 int netd_unix_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_revents, int32_t *out_error) {
     netd_unix_socket_state_t *s = find_socket(handle);
     if (s == NULL) return -9;
+    /* POLL is the explicit acknowledgement for the coalesced state-change
+     * doorbell.  SEND must not acknowledge it: Wayland traffic is
+     * bidirectional, and doing so can enqueue duplicate doorbells until the
+     * fixed-size IPC queue fills and a later readiness edge is lost. */
+    s->notify_pending = 0;
     *out_error = 0; *out_revents = 0;
-    if ((events & NETD_POLLIN) && ((s->listening && s->pending != 0) || s->rx_len != 0 || s->peer_closed)) *out_revents |= NETD_POLLIN;
-    if ((events & NETD_POLLOUT) && s->connected) *out_revents |= NETD_POLLOUT;
+    if ((events & NETD_POLLIN) &&
+        ((s->listening && s->pending_head != 0) ||
+         s->rx_len != 0 || s->peer_closed))
+        *out_revents |= NETD_POLLIN;
+    netd_unix_socket_state_t *peer = find_socket(s->peer);
+    if ((events & NETD_POLLOUT) && s->connected && peer != NULL &&
+        peer->rx_len < NETD_UNIX_RX && peer->transfer_count == 0)
+        *out_revents |= NETD_POLLOUT;
+    if (s->peer_closed) *out_revents |= NETD_POLLHUP;
     return 0;
 }
 
 static void force_destroy_socket(netd_unix_socket_state_t *s) {
     if (s == NULL || s->handle == 0) return;
-    const uint64_t pending_handle = s->pending;
-    s->pending = 0;
-    if (pending_handle != 0) {
-        netd_unix_socket_state_t *pending = find_socket(pending_handle);
-        if (pending != NULL && pending != s) force_destroy_socket(pending);
+    while (s->pending_head != 0) {
+        netd_unix_socket_state_t *pending = dequeue_pending(s);
+        if (pending == NULL) break;
+        if (pending != s) force_destroy_socket(pending);
     }
     netd_unix_socket_state_t *peer = find_socket(s->peer);
     if (peer) { peer->peer_closed = 1; peer->peer = 0; notify_readable(peer); }

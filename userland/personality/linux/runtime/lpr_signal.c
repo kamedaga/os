@@ -58,9 +58,9 @@ typedef struct lpr_pacha_signal_frame {
     uint64_t magic;
     uint64_t size;
     uint64_t signo;
-    uint64_t reserved0;
+    uint64_t xstate_features;
     lpr_pacha_trap_frame_t context;
-    unsigned char fx_state[512];
+    unsigned char x_state[832];
 } lpr_pacha_signal_frame_t;
 
 typedef struct lpr_linux_siginfo {
@@ -112,9 +112,9 @@ _Static_assert(sizeof(lpr_linux_siginfo_t) == 128, "Linux siginfo size");
 _Static_assert(sizeof(lpr_linux_mcontext_t) == 256, "Linux mcontext size");
 _Static_assert(sizeof(lpr_linux_ucontext_t) == 936, "Linux ucontext size");
 _Static_assert(offsetof(lpr_linux_signal_frame_t, handler) == 16, "signal handler offset");
-_Static_assert(offsetof(lpr_linux_signal_frame_t, info) == 736, "signal info offset");
-_Static_assert(offsetof(lpr_linux_signal_frame_t, ucontext) == 864, "signal ucontext offset");
-_Static_assert(sizeof(lpr_linux_signal_frame_t) == 1800, "Linux signal frame size");
+_Static_assert(offsetof(lpr_linux_signal_frame_t, info) == 1056, "signal info offset");
+_Static_assert(offsetof(lpr_linux_signal_frame_t, ucontext) == 1184, "signal ucontext offset");
+_Static_assert(sizeof(lpr_linux_signal_frame_t) == 2120, "Linux signal frame size");
 _Static_assert(
     PACHAOS_PROCESS_SIGNAL_RUNTIME_STACK_SIZE >
         sizeof(lpr_linux_signal_frame_t) + LPR_SIGNAL_RED_ZONE,
@@ -223,7 +223,7 @@ static void lpr_signal_context_to_linux(
     gregs[LPR_GREG_EFL] = context->rflags;
     gregs[LPR_GREG_CSGSFS] = context->cs;
     ucontext->uc_mcontext.fpregs = (uint64_t)(uintptr_t)ucontext->fpregs_mem;
-    lpr_memcpy(ucontext->fpregs_mem, native->fx_state, sizeof(native->fx_state));
+    lpr_memcpy(ucontext->fpregs_mem, native->x_state, sizeof(ucontext->fpregs_mem));
 }
 
 static void lpr_signal_context_from_linux(
@@ -250,7 +250,7 @@ static void lpr_signal_context_from_linux(
     context->rsp = gregs[LPR_GREG_RSP];
     context->rip = gregs[LPR_GREG_RIP];
     context->rflags = gregs[LPR_GREG_EFL];
-    lpr_memcpy(native->fx_state, ucontext->fpregs_mem, sizeof(native->fx_state));
+    lpr_memcpy(native->x_state, ucontext->fpregs_mem, sizeof(ucontext->fpregs_mem));
 }
 
 void *lpr_linux_async_signal_prepare(void *native_raw)
@@ -258,6 +258,7 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     lpr_pacha_signal_frame_t *native = (lpr_pacha_signal_frame_t *)native_raw;
     if (native == 0 || native->magic != PACHAOS_PROCESS_SIGNAL_FRAME_MAGIC ||
         native->size != PACHAOS_PROCESS_SIGNAL_FRAME_SIZE ||
+        native->xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK ||
         native->signo == 0 || native->signo > LPR_LINUX_SIGNAL_MAX)
     {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
@@ -383,7 +384,8 @@ _Noreturn void lpr_linux_rt_sigreturn_body(void *body_raw)
     lpr_linux_signal_frame_t *body = (lpr_linux_signal_frame_t *)body_raw;
     if (body == 0 || body->magic != LPR_SIGNAL_FRAME_MAGIC ||
         body->native.magic != PACHAOS_PROCESS_SIGNAL_FRAME_MAGIC ||
-        body->native.size != PACHAOS_PROCESS_SIGNAL_FRAME_SIZE)
+        body->native.size != PACHAOS_PROCESS_SIGNAL_FRAME_SIZE ||
+        body->native.xstate_features != PACHAOS_PROCESS_SIGNAL_XSTATE_FEATURE_MASK)
     {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 128u + 11u);
         for (;;) {

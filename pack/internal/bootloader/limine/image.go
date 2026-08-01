@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"capabilityos/pack/internal/config"
+	"capabilityos/pack/internal/imagelock"
 	"capabilityos/pack/internal/progress"
 )
 
@@ -56,6 +57,12 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 
 	imagePath := workspace.Path(workspace.Artifacts, imageName)
 	configPath := workspace.Path(workspace.Artifacts, "limine.conf")
+	locks, err := imagelock.Acquire(imagePath)
+	if err != nil {
+		span.Fail("limine image lock failed")
+		return Result{}, err
+	}
+	defer locks.Close()
 	span.Set(3, "creating disk image")
 	if err := os.MkdirAll(filepath.Dir(imagePath), 0o755); err != nil {
 		span.Fail("limine image directory failed")

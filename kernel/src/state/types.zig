@@ -280,6 +280,10 @@ pub const DmaMappingObject = struct {
     user_va: u64 = 0,
     iova: u64 = 0,
     size: u64 = 0,
+    /// Non-zero only for a physical-page scatter mapping. Such mappings are
+    /// admitted only while VT-d is inactive and therefore have no contiguous
+    /// IOVA range to tear down.
+    page_count: u16 = 0,
     direction: CapsuleDmaDirection = .bidirectional,
     flags: u32 = 0,
 };
@@ -297,6 +301,7 @@ pub const IrqPublishSlot = struct {
     active: u8 = 0,
     generation: u32 = 0,
     owner_principal_raw: PrincipalRaw = 0,
+    device: DmaDeviceId = 0,
     kind: u8 = 0,
     vector: u32 = 0,
     event_count: u64 = 0,
@@ -1076,6 +1081,24 @@ pub fn freeVmoBackingPageStore(start: u32, page_count: u32) bool {
     const count_usize: usize = @intCast(page_count);
     if (start_usize + count_usize > vmo_backing_page_store.len) return false;
     @memset(vmo_backing_page_store[start_usize .. start_usize + count_usize], 0);
+
+    if (start_usize + count_usize == vmo_backing_page_store_next) {
+        vmo_backing_page_store_next = start_usize;
+        while (true) {
+            var absorbed = false;
+            var i: usize = 0;
+            while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
+                const range = vmo_backing_page_store_free_ranges[i];
+                if (@as(usize, range.start) + @as(usize, range.len) != vmo_backing_page_store_next) continue;
+                vmo_backing_page_store_next = range.start;
+                removeVmoBackingFreeRange(i);
+                absorbed = true;
+                break;
+            }
+            if (!absorbed) break;
+        }
+        return true;
+    }
     return insertVmoBackingFreeRange(start, @intCast(page_count));
 }
 

@@ -1,0 +1,17 @@
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      libcurl4-openssl-dev \
+      libcmark-gfm-dev \
+      libcmark-gfm-extensions-dev \
+      libgtk-3-dev \
+      libjson-c-dev \
+      meson \
+      ninja-build \
+      xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src

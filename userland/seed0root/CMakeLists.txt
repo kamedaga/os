@@ -30,8 +30,11 @@ add_custom_command(
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libipc/src/status.c"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
+    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+    "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

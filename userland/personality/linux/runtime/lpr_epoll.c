@@ -451,7 +451,8 @@ static int64_t lpr_epoll_scan(
     const lpr_epoll_snapshot_t *snapshot,
     uint32_t count,
     lpr_linux_epoll_event_t *events,
-    uint32_t maxevents)
+    uint32_t maxevents,
+    int cached_sockets)
 {
     lpr_linux_pollfd_t pollfds[LPR_EPOLL_MAX_INTERESTS];
     for (uint32_t i = 0; i < count; i++) {
@@ -460,10 +461,9 @@ static int64_t lpr_epoll_scan(
         pollfds[i].events = (int16_t)(snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP);
         pollfds[i].revents = 0;
     }
-    const int64_t poll_status = lpr_linux_poll(
-        (uint64_t)(uintptr_t)pollfds,
-        count,
-        0);
+    const int64_t poll_status = cached_sockets ?
+        lpr_linux_poll_cached((uint64_t)(uintptr_t)pollfds, count) :
+        lpr_linux_poll((uint64_t)(uintptr_t)pollfds, count, 0);
     if (poll_status < 0) {
         return poll_status;
     }
@@ -586,6 +586,7 @@ int64_t lpr_linux_epoll_wait(
     lpr_wait_deadline_t deadline;
     int64_t status = lpr_wait_deadline_init(&deadline, timeout);
     if (status != 0) return status;
+    int cached_sockets = 1;
     for (;;) {
         lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
         uint32_t count = 0;
@@ -598,7 +599,8 @@ int64_t lpr_linux_epoll_wait(
             snapshot,
             count,
             (lpr_linux_epoll_event_t *)(uintptr_t)events_raw,
-            (uint32_t)maxevents_raw);
+            (uint32_t)maxevents_raw,
+            cached_sockets);
         if (ready != 0 || timeout == 0) {
             return ready;
         }
@@ -613,6 +615,7 @@ int64_t lpr_linux_epoll_wait(
         if (status != 0) return status;
         status = lpr_wait_graph_block(&graph, &deadline);
         if (status != 0) return status;
+        cached_sockets = 1;
     }
 }
 

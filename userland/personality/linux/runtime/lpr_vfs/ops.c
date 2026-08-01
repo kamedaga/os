@@ -2,7 +2,7 @@
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
-    uint64_t rights = FILED_RIGHT_STAT;
+    uint64_t rights = FILED_RIGHT_STAT | FILED_RIGHT_SETATTR;
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
         rights |= FILED_RIGHT_GETDENTS;

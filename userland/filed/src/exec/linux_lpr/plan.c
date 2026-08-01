@@ -509,6 +509,9 @@ static int load_plan(
     const int process_fd = pacha_process_create(process_rights, 0);
     LPR_EXEC_STAGE_RECORD("process_create", stage_start, stage_start_cycles);
     if (process_fd < 16) {
+        fprintf(stderr,
+            "[filed] linux-lpr: load plan stage=process_create result=%d\n",
+            process_fd);
         return -12;
     }
     plan->process_fd = process_fd;
@@ -523,6 +526,9 @@ static int load_plan(
         &lpr_loaded);
     LPR_EXEC_STAGE_RECORD("load_lpr_runtime", stage_start, stage_start_cycles);
     if (status != 0) {
+        fprintf(stderr,
+            "[filed] linux-lpr: load plan stage=load_lpr_runtime status=%d\n",
+            status);
         lpr_exec_discard_process_fd(process_fd);
         return status;
     }
@@ -544,6 +550,9 @@ static int load_plan(
         &main_loaded);
     LPR_EXEC_STAGE_RECORD("load_main", stage_start, stage_start_cycles);
     if (status != 0) {
+        fprintf(stderr,
+            "[filed] linux-lpr: load plan stage=load_main status=%d\n",
+            status);
         lpr_exec_pending_map_batch_discard(&file_map_batch);
         lpr_exec_discard_process_fd(process_fd);
         return status;
@@ -591,6 +600,9 @@ static int load_plan(
             &interp_loaded);
         LPR_EXEC_STAGE_RECORD("load_interpreter", stage_start, stage_start_cycles);
         if (status != 0) {
+            fprintf(stderr,
+                "[filed] linux-lpr: load plan stage=load_interpreter status=%d\n",
+                status);
             lpr_exec_pending_map_batch_discard(&file_map_batch);
             lpr_exec_discard_process_fd(process_fd);
             return status;
@@ -608,6 +620,9 @@ static int load_plan(
     status = lpr_exec_pending_map_batch_commit(process_fd, &file_map_batch);
     LPR_EXEC_STAGE_RECORD("commit_file_maps", stage_start, stage_start_cycles);
     if (status != 0) {
+        fprintf(stderr,
+            "[filed] linux-lpr: load plan stage=commit_file_maps status=%d\n",
+            status);
         lpr_exec_pending_map_batch_discard(&file_map_batch);
         lpr_exec_discard_process_fd(process_fd);
         return status;

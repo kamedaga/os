@@ -23,6 +23,7 @@ lpr_state_t lpr_state = {
     .netd_rpc = {
         .request_id = 0x4c50524e45544401ull,
         .page_fd = -1,
+        .page_lease_fd = -1,
         .next_ephemeral_port = 49152u,
     },
 };

@@ -1,6 +1,7 @@
 const std = @import("std");
 const interrupts = @import("../../interrupts.zig");
 const image_range = @import("../../boot/image_range.zig");
+const xstate_format = @import("xstate.zig");
 
 pub const max_cpus: usize = 4;
 pub const page_entries: usize = 512;
@@ -72,6 +73,7 @@ pub const TrapTargets = struct {
     device_interrupt_stub: usize,
     lapic_timer_vector: u8,
     scheduler_wake_ipi_vector: u8,
+    unrouted_device_interrupt_vector: u8,
     device_interrupt_vector: u8,
     device_interrupt_vector_count: u8,
 };
@@ -262,16 +264,28 @@ const msr_ia32_fmask: u32 = 0xC000_0084;
 const efer_sce: u64 = 1 << 0;
 const rflags_if: u64 = 1 << 9;
 const cr4_pge: u64 = 1 << 7;
+const cr4_osfxsr: u64 = 1 << 9;
+const cr4_osxmmexcpt: u64 = 1 << 10;
 const cr4_pcide: u64 = 1 << 17;
+const cr4_osxsave: u64 = 1 << 18;
 const cr4_pke: u64 = 1 << 22;
 const cpuid_leaf1_ecx_pcid: u32 = 1 << 17;
+const cpuid_leaf1_ecx_xsave: u32 = 1 << 26;
+const cpuid_leaf1_ecx_osxsave: u32 = 1 << 27;
+const cpuid_leaf1_ecx_avx: u32 = 1 << 28;
 const cpuid_leaf7_ecx_pku: u32 = 1 << 3;
 const cpuid_leaf80000001_edx_rdtscp: u32 = 1 << 27;
 const page_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_no_flush: u64 = 1 << 63;
 
-fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
+pub const xstate_bytes: usize = xstate_format.image_bytes;
+pub const xstate_alignment: usize = xstate_format.image_alignment;
+pub const xstate_feature_mask: u64 = xstate_format.feature_mask;
+
+const CpuidResult = struct { eax: u32, ebx: u32, ecx: u32, edx: u32 };
+
+fn cpuidSubleaf(leaf: u32, subleaf: u32) CpuidResult {
     var eax: u32 = 0;
     var ebx: u32 = 0;
     var ecx: u32 = 0;
@@ -282,9 +296,13 @@ fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
           [ecx] "={ecx}" (ecx),
           [edx] "={edx}" (edx),
         : [leaf] "{eax}" (leaf),
-          [subleaf] "{ecx}" (@as(u32, 0)),
+          [subleaf] "{ecx}" (subleaf),
     );
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+fn cpuid(leaf: u32) CpuidResult {
+    return cpuidSubleaf(leaf, 0);
 }
 
 fn cpuidMaxExtendedLeaf() u32 {
@@ -315,6 +333,112 @@ fn writeCr4(value: u64) void {
         :
         : [value] "r" (value),
         : .{ .memory = true });
+}
+
+fn readCr0() u64 {
+    var value: u64 = 0;
+    asm volatile ("mov %%cr0, %[out]"
+        : [out] "=r" (value),
+    );
+    return value;
+}
+
+fn writeCr0(value: u64) void {
+    asm volatile ("mov %[value], %%cr0"
+        :
+        : [value] "r" (value),
+        : .{ .memory = true });
+}
+
+fn readXcr0() u64 {
+    var eax: u32 = 0;
+    var edx: u32 = 0;
+    asm volatile ("xgetbv"
+        : [eax] "={eax}" (eax),
+          [edx] "={edx}" (edx),
+        : [ecx] "{ecx}" (@as(u32, 0)),
+    );
+    return (@as(u64, edx) << 32) | eax;
+}
+
+fn writeXcr0(value: u64) void {
+    asm volatile ("xsetbv"
+        :
+        : [eax] "{eax}" (@as(u32, @truncate(value))),
+          [edx] "{edx}" (@as(u32, @truncate(value >> 32))),
+          [ecx] "{ecx}" (@as(u32, 0)),
+        : .{ .memory = true });
+}
+
+/// Enable the one kernel-wide user xstate format on the current CPU.  XCR0 is
+/// CPU-local, so the BSP and every AP must call this before entering user mode.
+pub fn enableAvxXStateForCurrentCpu() bool {
+    if (cpuid(0).eax < 0xD) return false;
+    const base = cpuid(1);
+    if ((base.ecx & (cpuid_leaf1_ecx_xsave | cpuid_leaf1_ecx_avx)) !=
+        (cpuid_leaf1_ecx_xsave | cpuid_leaf1_ecx_avx))
+    {
+        return false;
+    }
+    const supported = cpuidSubleaf(0xD, 0);
+    if ((@as(u64, supported.edx) << 32 | supported.eax) & xstate_feature_mask != xstate_feature_mask) {
+        return false;
+    }
+
+    var cr0 = readCr0();
+    cr0 &= ~@as(u64, 1 << 2); // EM=0
+    cr0 |= @as(u64, 1 << 1); // MP=1
+    writeCr0(cr0);
+    var cr4 = readCr4();
+    cr4 |= cr4_osfxsr | cr4_osxmmexcpt | cr4_osxsave;
+    writeCr4(cr4);
+    if ((cpuid(1).ecx & cpuid_leaf1_ecx_osxsave) == 0) return false;
+    writeXcr0(xstate_feature_mask);
+    if ((readXcr0() & xstate_feature_mask) != xstate_feature_mask) return false;
+    const active = cpuidSubleaf(0xD, 0);
+    if (active.ebx != xstate_bytes) return false;
+    asm volatile ("clts");
+    asm volatile ("fninit");
+    return true;
+}
+
+pub fn saveXState(state: *align(xstate_alignment) [xstate_bytes]u8) void {
+    asm volatile ("xsave64 (%[ptr])"
+        :
+        : [ptr] "r" (state),
+          [eax] "{eax}" (@as(u32, @truncate(xstate_feature_mask))),
+          [edx] "{edx}" (@as(u32, @truncate(xstate_feature_mask >> 32))),
+        : .{ .memory = true });
+}
+
+pub fn restoreXState(state: *align(xstate_alignment) const [xstate_bytes]u8) void {
+    asm volatile ("xrstor64 (%[ptr])"
+        :
+        : [ptr] "r" (state),
+          [eax] "{eax}" (@as(u32, @truncate(xstate_feature_mask))),
+          [edx] "{edx}" (@as(u32, @truncate(xstate_feature_mask >> 32))),
+        : .{ .memory = true });
+}
+
+fn currentMxcsrValidMask() u32 {
+    var fx_state: [512]u8 align(16) = [_]u8{0} ** 512;
+    asm volatile ("fxsave64 (%[ptr])"
+        :
+        : [ptr] "r" (&fx_state),
+        : .{ .memory = true });
+    const reported = xstate_format.mxcsrMaskFromFxsave(&fx_state);
+    // Intel specifies this conservative mask for older implementations that
+    // leave MXCSR_MASK zero in an FXSAVE image.
+    return if (reported == 0) 0x0000_ffbf else reported;
+}
+
+pub fn validateUserXState(
+    state: *const [xstate_bytes]u8,
+) bool {
+    return xstate_format.validateStandardUserImage(
+        state,
+        currentMxcsrValidMask(),
+    );
 }
 
 pub fn enablePcidIfSupported() bool {
@@ -486,6 +610,13 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     interrupts.setIdtEntry(&idt, 0x20, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.lapic_timer_vector, gdt_kernel_code_selector, timer_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, targets.scheduler_wake_ipi_vector, gdt_kernel_code_selector, targets.scheduler_wake_ipi_stub, 0x8E);
+    interrupts.setIdtEntry(
+        &idt,
+        targets.unrouted_device_interrupt_vector,
+        gdt_kernel_code_selector,
+        targets.device_interrupt_stub,
+        0x8E,
+    );
     var device_vector_index: u16 = 0;
     while (device_vector_index < targets.device_interrupt_vector_count) : (device_vector_index += 1) {
         const vector: usize = @as(usize, targets.device_interrupt_vector) + @as(usize, device_vector_index);

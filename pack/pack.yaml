@@ -159,6 +159,26 @@ apps:
         - "tools/copy_lpr_linux_musl.sh"
     out: "SWAYROOT"
     rootfs: "/"
+  pine2_gtk:
+    file:
+      path: ".artifacts/userland-fixtures/pine2-gtk-root"
+      rebuild: ["bash", "tools/build_wsl_pine2_gtk.sh", ".artifacts/userland-fixtures/pine2-gtk-root"]
+      input:
+        - "tools/build_wsl_pine2_gtk.sh"
+        - "third_party/pine2-gtk/meson.build"
+        - "third_party/pine2-gtk/.dockerignore"
+        - "third_party/pine2-gtk/src"
+        - "third_party/pine2-gtk/data"
+        - "third_party/pine2-gtk/tools/build-musl.sh"
+        - "third_party/pine2-gtk/tools/Dockerfile.musl"
+        - "third_party/pine2-gtk/LICENSE"
+        - "third_party/pine2-gtk/LICENSE.md"
+        - "third_party/pine2-gtk/LICENSE.txt"
+        - "third_party/pine2-gtk/COPYING"
+        - "third_party/pine2-gtk/COPYING.md"
+        - "third_party/pine2-gtk/COPYING.txt"
+    out: "PINE2GTKROOT"
+    rootfs: "/"
   pacha_user_session:
     file:
       path: ".artifacts/userland-fixtures/pacha-user-session"
@@ -196,6 +216,11 @@ apps:
       path: "tests/fixtures/phase4_gtk_fishbowl.sh"
     out: "P4GTKFSH.SH"
     rootfs: "/cmd/phase4_gtk_fishbowl.sh"
+  pine2_gtk_smoke_script:
+    file:
+      path: "tests/fixtures/pine2_gtk_smoke.sh"
+    out: "PINE2GTKTEST.SH"
+    rootfs: "/cmd/pine2_gtk_smoke.sh"
   phase4_foot_bashrc:
     file:
       path: "tests/fixtures/phase4_foot_bashrc"
@@ -293,6 +318,8 @@ apps:
         - "tools/build_wsl_wayland_animation_bench.sh"
         - "tools/build_wsl_alpine_sway.sh"
         - "userland/fixtures/src/wsl_musl/lpr_wayland_animation_bench.c"
+        - "userland/drmd/include/drmd/kms_abi.h"
+        - "userland/inputd/include/inputd/ipc_protocol.h"
     out: "P4WLBEN.ELF"
     rootfs: "/cmd/lpr_wayland_animation_bench.elf"
   alpine_go:
@@ -773,7 +800,9 @@ apps:
       rebuild: ["bash", "userland/personality/linux/build-lpr.sh", ".artifacts/lpr-linux-x86_64.so"]
       input:
         - "userland/drmd/include"
+        - "userland/filed/include/filed/flags.h"
         - "userland/personality/include"
+        - "userland/personality/linux/decoder"
         - "userland/personality/linux/runtime"
         - "userland/lpr_supervisor/include"
         - "userland/libpacha/include"
@@ -781,9 +810,16 @@ apps:
         - "musl/pachaos/include"
         - "userland/personality/linux/build-lpr.sh"
         - "userland/personality/linux/check-lpr-namespace.sh"
+        - "userland/personality/linux/THIRD_PARTY.md"
         - "userland/personality/linux/runtime/lpr_namespace.map"
+        - "pack/scripts/download_zydis.sh"
     out: "LPRLINUX.SO"
     rootfs: "/lib/pacha/lpr-linux-x86_64.so"
+  linux_lpr_third_party_license:
+    file:
+      path: "userland/personality/linux/THIRD_PARTY.md"
+    out: "LPR3PTY.MD"
+    rootfs: "/usr/share/licenses/lpr-linux/THIRD_PARTY.md"
   lpr_minimal_linux:
     file:
       path: ".artifacts/userland-fixtures/lpr_minimal_linux.elf"
@@ -1035,6 +1071,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_evdev_smoke.c"
     out: "LPREVDEV.ELF"
     rootfs: "/cmd/lpr_evdev_smoke.elf"
+  lpr_evdev_tablet_state_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_evdev_tablet_state_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_evdev_tablet_state_smoke", "userland/fixtures/src/wsl_musl/lpr_evdev_tablet_state_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_evdev_tablet_state_smoke.c"
+    out: "LPRTABST.ELF"
+    rootfs: "/cmd/lpr_evdev_tablet_state_smoke.elf"
   lpr_libinput_seatd_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_libinput_seatd_smoke.elf"
@@ -1394,6 +1440,7 @@ apps:
         - "userland/inputd/CMakeLists.txt"
         - "userland/inputd/src"
         - "userland/inputd/include"
+        - "userland/netd/include/netd/ipc_protocol.h"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
         - "userland/libpacha/include"
@@ -1501,7 +1548,9 @@ apps:
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/personality/include"
-        - "userland/personality/linux/hde"
+        - "userland/personality/linux/decoder"
+        - "pack/scripts/download_zydis.sh"
+        - "userland/personality/linux/THIRD_PARTY.md"
     out: "FILED.ELF"
     rootfs: "/sbin/filed.elf"
   lpr_supervisor:

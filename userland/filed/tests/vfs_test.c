@@ -1425,6 +1425,211 @@ static void test_mutation_component_validation(void)
     expect_status("mutation validation preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
 }
 
+static void test_setattr_right_is_independent_of_data_write(void)
+{
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t setattr_dir;
+    filed_vfs_open_result_t stat_only_dir;
+    filed_vfs_open_result_t setattr_file;
+    filed_vfs_open_result_t write_file;
+    filed_vfs_io_decision_t decision;
+    filed_vfs_stat_snapshot_t snapshot;
+
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for setattr rights",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+
+    memset(&snapshot, 0, sizeof(snapshot));
+    snapshot.valid = true;
+    snapshot.mode = 0040755;
+    snapshot.kind = 0040000;
+    snapshot.nlink = 1;
+    expect_status(
+        "seed setattr directory stat",
+        filed_vfs_update_stat_snapshot(&vfs, 11, &snapshot),
+        FILED_OK);
+
+    memset(&setattr_dir, 0, sizeof(setattr_dir));
+    expect_status(
+        "open directory with setattr but no write",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_STAT | FILED_RIGHT_SETATTR,
+            FILED_OPEN_DIRECTORY,
+            &setattr_dir),
+        FILED_OK);
+    memset(&decision, 0, sizeof(decision));
+    expect_status(
+        "setattr prepare accepts directory setattr right",
+        filed_vfs_setattr_prepare(&vfs, setattr_dir.handle_id, &decision),
+        FILED_OK);
+    expect_true("setattr prepare directory object", decision.backend_object == 11);
+    expect_status(
+        "directory chmod cache update with setattr",
+        filed_vfs_update_mode(&vfs, setattr_dir.handle_id, 0700),
+        FILED_OK);
+    expect_status(
+        "selected atime rejects negative nsec",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_ATIME,
+            10,
+            -1,
+            0,
+            0),
+        FILED_ERR_INVALID);
+    expect_status(
+        "selected atime rejects one billion nsec",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_ATIME,
+            10,
+            1000000000ll,
+            0,
+            0),
+        FILED_ERR_INVALID);
+    expect_status(
+        "selected mtime rejects negative nsec",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_MTIME,
+            0,
+            0,
+            30,
+            -1),
+        FILED_ERR_INVALID);
+    expect_status(
+        "selected mtime rejects one billion nsec",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_MTIME,
+            0,
+            0,
+            30,
+            1000000000ll),
+        FILED_ERR_INVALID);
+    expect_status(
+        "atime lower boundary ignores unselected mtime garbage",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_ATIME,
+            10,
+            0,
+            0,
+            -1),
+        FILED_OK);
+    expect_status(
+        "mtime upper boundary ignores unselected atime garbage",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_MTIME,
+            0,
+            1000000000ll,
+            30,
+            999999999ll),
+        FILED_OK);
+    expect_status(
+        "directory time cache update with setattr",
+        filed_vfs_update_times(
+            &vfs,
+            setattr_dir.handle_id,
+            FILED_TIME_UPDATE_ATIME | FILED_TIME_UPDATE_MTIME,
+            10,
+            20,
+            30,
+            40),
+        FILED_OK);
+    memset(&snapshot, 0, sizeof(snapshot));
+    expect_status(
+        "read updated directory stat",
+        filed_vfs_get_stat_snapshot(&vfs, setattr_dir.handle_id, &snapshot),
+        FILED_OK);
+    expect_true("directory mode updated", snapshot.valid && snapshot.mode == 0040700);
+    expect_true(
+        "directory times updated",
+        snapshot.times_valid &&
+            snapshot.atime_sec == 10 && snapshot.atime_nsec == 20 &&
+            snapshot.mtime_sec == 30 && snapshot.mtime_nsec == 40);
+
+    memset(&stat_only_dir, 0, sizeof(stat_only_dir));
+    expect_status(
+        "open directory without setattr",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_STAT,
+            FILED_OPEN_DIRECTORY,
+            &stat_only_dir),
+        FILED_OK);
+    expect_status(
+        "setattr prepare denies missing right",
+        filed_vfs_setattr_prepare(&vfs, stat_only_dir.handle_id, &decision),
+        FILED_ERR_DENIED);
+    expect_status(
+        "chmod cache update denies missing setattr",
+        filed_vfs_update_mode(&vfs, stat_only_dir.handle_id, 0755),
+        FILED_ERR_DENIED);
+    expect_status(
+        "time cache update denies missing setattr",
+        filed_vfs_update_times(
+            &vfs,
+            stat_only_dir.handle_id,
+            FILED_TIME_UPDATE_MTIME,
+            0,
+            0,
+            50,
+            60),
+        FILED_ERR_DENIED);
+
+    memset(&setattr_file, 0, sizeof(setattr_file));
+    expect_status(
+        "open regular file with setattr only",
+        filed_vfs_open_backend_child(
+            &vfs,
+            setattr_dir.handle_id,
+            42,
+            FILED_VNODE_REGULAR,
+            "metadata-only",
+            FILED_RIGHT_SETATTR,
+            0,
+            &setattr_file),
+        FILED_OK);
+    expect_status(
+        "setattr does not grant data write",
+        filed_vfs_pwrite_prepare(&vfs, setattr_file.handle_id, 0, 1, &decision),
+        FILED_ERR_DENIED);
+
+    memset(&write_file, 0, sizeof(write_file));
+    expect_status(
+        "open regular file with data write only",
+        filed_vfs_open_existing(
+            &vfs,
+            setattr_file.handle_id,
+            FILED_RIGHT_WRITE,
+            0,
+            &write_file),
+        FILED_OK);
+    expect_status(
+        "data write prepare remains allowed",
+        filed_vfs_pwrite_prepare(&vfs, write_file.handle_id, 0, 1, &decision),
+        FILED_OK);
+    expect_status(
+        "data write does not grant setattr",
+        filed_vfs_setattr_prepare(&vfs, write_file.handle_id, &decision),
+        FILED_ERR_DENIED);
+    expect_status("setattr rights preserve invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 static void test_rights_and_flags(void)
 {
     uint32_t rights = FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_STAT;
@@ -1542,6 +1747,7 @@ int main(void)
     test_rename_replace_keeps_replaced_open_file_alive();
     test_rename_keeps_open_directory_handle_alive();
     test_mutation_component_validation();
+    test_setattr_right_is_independent_of_data_write();
     test_rights_and_flags();
     test_invalid_arguments();
     test_linked_vnode_lru_reuses_capacity();

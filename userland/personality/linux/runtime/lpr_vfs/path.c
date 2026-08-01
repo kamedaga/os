@@ -454,6 +454,29 @@ void lpr_reset_fork_child_rpc_state(void)
     lpr_state.filed_rpc.readv_lock_word = 0;
     lpr_state.termd_rpc.lock_word = 0;
     lpr_state.netd_rpc.lock_word = 0;
+    lpr_state.netd_rpc.endpoint_checked = 0;
+    if (lpr_netd_page_lease_fd >= 16) {
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)lpr_netd_page_lease_fd);
+    }
+    lpr_netd_page_attachment_id = 0;
+    lpr_netd_page_lease_fd = -1;
+    if (lpr_netd_page != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)lpr_netd_page,
+            NETD_PAGE_BYTES);
+    }
+    if (lpr_netd_page_fd >= 16) {
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)lpr_netd_page_fd);
+    }
+    lpr_netd_page_fd = -1;
+    lpr_netd_page = 0;
+    lpr_netd_page_busy = 0;
+
     if (lpr_wire_page != 0) {
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,

@@ -64,17 +64,14 @@ int netd_netlink_socket_collect_wait_sources(struct pacha_service_wait_set *wait
     return 0;
 }
 
-void netd_netlink_socket_reap_hangups(void)
+void netd_netlink_socket_reap_hangups(
+    const struct pacha_service_wait_set *wait_set)
 {
     for (unsigned i = 0; i < NETD_NETLINK_MAX; i++) {
         netd_netlink_socket_state_t *socket = &sockets[i];
         if (socket->handle == 0 || socket->notify_fd < 16) continue;
-        struct pacha_pollfd pollfd = {
-            .fd = socket->notify_fd,
-            .events = PACHA_FD_EVENT_HANGUP,
-        };
-        if (pacha_fd_poll(&pollfd, 1) <= 0 ||
-            (pollfd.revents & PACHA_FD_EVENT_HANGUP) == 0) continue;
+        if ((pacha_service_wait_revents(wait_set, socket->notify_fd) &
+             PACHA_FD_EVENT_HANGUP) == 0) continue;
         const uint64_t handle = socket->handle;
         destroy_socket(socket);
         printf("[netd] netlink_orphan_reap handle=%llu\n",

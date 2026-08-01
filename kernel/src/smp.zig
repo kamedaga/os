@@ -41,7 +41,6 @@ var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
 var wake_ipi_vector: u8 = 0;
 var wake_ipi_pending: [max_cpus]u8 = [_]u8{0} ** max_cpus;
-var wake_ipi_sequence: [max_cpus]u64 = [_]u64{0} ** max_cpus;
 
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
 
@@ -63,7 +62,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_vector), &wake_ipi_vector));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_pending), &wake_ipi_pending));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_sequence), &wake_ipi_sequence));
     return end;
 }
 
@@ -510,6 +508,11 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
 
 fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     asm volatile ("cli");
+    if (!x86_platform.enableAvxXStateForCurrentCpu()) {
+        setCpuState(cpu_slot, .absent);
+        markStarted(cpu_slot);
+        while (true) asm volatile ("hlt");
+    }
     if (!x86_platform.loadGdtAndReloadSegmentsForCpu(cpu_slot)) {
         setCpuState(cpu_slot, .absent);
         markStarted(cpu_slot);
@@ -539,7 +542,6 @@ pub fn returnCurrentApToIdleFromInterrupt() noreturn {
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == currentCpuSlot()) return true;
     if (cpu_slot >= wake_ipi_pending.len) return false;
-    const sequence = @atomicRmw(u64, &wake_ipi_sequence[cpu_slot], .Add, 1, .acq_rel) +% 1;
     if (@cmpxchgStrong(u8, &wake_ipi_pending[cpu_slot], 0, 1, .acq_rel, .acquire) != null) {
         return true;
     }
@@ -547,10 +549,10 @@ pub fn wakeCpu(cpu_slot: usize) bool {
     while (attempts < 3) : (attempts += 1) {
         if (interruptCpu(cpu_slot)) return true;
         @atomicStore(u8, &wake_ipi_pending[cpu_slot], 0, .release);
-        // A coalesced caller observed pending=1 and relied on this sender.  If
-        // that happened, reacquire ownership and retry instead of silently
-        // dropping its edge after a transient APIC send failure.
-        if (@atomicLoad(u64, &wake_ipi_sequence[cpu_slot], .acquire) == sequence) break;
+        if (attempts + 1 == 3) break;
+        // Every caller that observed pending=1 relies on the owner to deliver
+        // the edge.  Reacquire after a transient APIC failure; if another
+        // sender wins the slot, that sender now owns delivery.
         if (@cmpxchgStrong(u8, &wake_ipi_pending[cpu_slot], 0, 1, .acq_rel, .acquire) != null) {
             return true;
         }
@@ -671,11 +673,9 @@ fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
     if (ap_user_timer_vector != 0) {
         _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
     }
-    const fx_state: *const [512]u8 align(16) = @ptrFromInt(entry.fx_state_addr);
-    asm volatile ("fxrstor64 (%[ptr])"
-        :
-        : [ptr] "r" (fx_state),
-        : .{ .memory = true });
+    const x_state: *align(x86_platform.xstate_alignment) const [x86_platform.xstate_bytes]u8 =
+        @ptrFromInt(entry.x_state_addr);
+    x86_platform.restoreXState(x_state);
     x86_platform.writeFsBase(entry.fs_base);
     x86_platform.writeGsBase(entry.gs_base);
     x86_platform.writePkru(entry.pkru);

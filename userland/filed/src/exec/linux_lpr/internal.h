@@ -212,7 +212,10 @@ int lpr_exec_meta_get_interp_path(
     size_t out_size);
 int lpr_exec_image_find_text_section(const lpr_exec_image_t *image, uint64_t *out_offset, uint64_t *out_size);
 int lpr_exec_image_find_symbol(const lpr_exec_image_t *image, const char *symbol, uint64_t *out_value);
-uint64_t lpr_exec_patch_syscalls(unsigned char *bytes, uint64_t size);
+int lpr_exec_patch_syscalls(
+    unsigned char *bytes,
+    uint64_t size,
+    uint64_t *out_patched);
 void lpr_exec_image_dump_metrics(void);
 void lpr_exec_map_dump_metrics(void);
 

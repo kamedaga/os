@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
+source tests/lib/pacgo_image_lock.sh
 
 iterations="${EXT4_UNLINK_JOURNAL_ITERS:-40}"
 case "$iterations" in
@@ -15,8 +16,7 @@ esac
 log_dir=.artifacts/test-results/ext4-unlink-journal
 mkdir -p "$log_dir"
 
-pkill -9 qemu-system-x86 || true
-rm -f .artifacts/disk.img
+pacgo_remove_image_locked .artifacts/disk.img
 .artifacts/bin/pacgo sync rootfs --force
 .artifacts/bin/pacgo sync bootfs
 

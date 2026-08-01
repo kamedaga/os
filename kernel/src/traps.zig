@@ -6,6 +6,7 @@ const kernel_log = @import("kernel_log.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
 const kernel_vm = @import("memory/kernel_vm.zig");
 const page_fault_log = @import("page_fault_log.zig");
+const pci = @import("pci.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
@@ -18,9 +19,9 @@ const smp = @import("smp.zig");
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
-const debug_skip_timer_fx_state = false;
-const generic_device_interrupt_vector: u8 = 0x41;
-const device_interrupt_vector_count: u8 = 1;
+const debug_skip_kernel_fx_state = false;
+const device_interrupt_vector: u8 = pci.interrupt_vector_base;
+const device_interrupt_vector_count: u8 = pci.interrupt_vector_count;
 const trap_frame_qword_count = @sizeOf(TrapFrame) / @sizeOf(u64);
 const exception_trap_frame_qword_count = @sizeOf(ExceptionTrapFrame) / @sizeOf(u64);
 const user_return_gpr_qword_count = @offsetOf(TrapFrame, "rip") / @sizeOf(u64);
@@ -92,8 +93,8 @@ extern var user_return_saved_r10: u64;
 extern var user_return_saved_gprs: [15]u64 align(16);
 extern var user_return_iret_frame: [5]u64 align(16);
 
-extern fn saveCurrentThreadFxState() callconv(.winapi) void;
-extern fn restoreCurrentThreadFxState() callconv(.c) void;
+extern fn saveCurrentThreadXState() callconv(.winapi) void;
+extern fn restoreCurrentThreadXState() callconv(.c) void;
 extern fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64;
 extern fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault_vector: u8, out_frame: *TrapFrame) callconv(.winapi) void;
 
@@ -302,7 +303,7 @@ fn asmExceptionWithErrorHandlerBody(comptime vec_number: u64) []const u8 {
             \\mov %r12, %rdx
         , .{vec_number}) ++
         asmCallAligned("fatalUserExceptionWithErrorDispatch") ++
-        asmCallAligned("restoreCurrentThreadFxState") ++
+        asmCallAligned("restoreCurrentThreadXState") ++
         asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++
         asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
@@ -501,12 +502,12 @@ pub export fn syscallEntryStub() callconv(.naked) noreturn {
         \\mov (%r13,%r14,1), %rsp
         \\push %r12
         \\movq $0, syscall_entry_lock(%rip)
-    ++ asmCallAligned("saveCurrentThreadFxState") ++
+    ++ asmCallAligned("saveCurrentThreadXState") ++
         \\mov (%rsp), %r12
         \\mov %r12, %rcx
     ++ asmCallAligned("syscallDispatch") ++
         \\mov (%rsp), %r12
-    ++ asmCallAligned("restoreCurrentThreadFxState") ++
+    ++ asmCallAligned("restoreCurrentThreadXState") ++
         \\mov (%rsp), %r12
         \\add $8, %rsp
         \\mov %r12, %rax
@@ -692,12 +693,12 @@ const NativeSignalFrame = extern struct {
     signo: u64,
     reserved0: u64,
     context: TrapFrame,
-    fx_state: [process_abi.signal_fx_state_size]u8,
+    x_state: [process_abi.signal_xstate_size]u8,
 };
 
 comptime {
     if (@offsetOf(NativeSignalFrame, "context") != process_abi.signal_frame_context_offset) @compileError("native signal frame context offset mismatch");
-    if (@offsetOf(NativeSignalFrame, "fx_state") != process_abi.signal_frame_fx_state_offset) @compileError("native signal frame fx state offset mismatch");
+    if (@offsetOf(NativeSignalFrame, "x_state") != process_abi.signal_frame_xstate_offset) @compileError("native signal frame xstate offset mismatch");
     if (@sizeOf(NativeSignalFrame) != process_abi.signal_frame_size) @compileError("native signal frame size mismatch");
 }
 
@@ -710,16 +711,16 @@ fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
         return;
     }
     const signal_frame_va = (frame.rsp - process_abi.signal_red_zone_size -
-        process_abi.signal_frame_size) & ~@as(u64, 15);
+        process_abi.signal_frame_size) & ~@as(u64, 63);
     var signal_frame = NativeSignalFrame{
         .magic = process_abi.signal_frame_magic,
         .size = process_abi.signal_frame_size,
         .signo = claimed.signo,
-        .reserved0 = 0,
+        .reserved0 = process_abi.signal_xstate_feature_mask,
         .context = frame.*,
-        .fx_state = undefined,
+        .x_state = undefined,
     };
-    if (!scheduler.copyCurrentSignalFxState(&signal_frame.fx_state)) {
+    if (!scheduler.copyCurrentSignalXState(&signal_frame.x_state)) {
         scheduler.restoreClaimedSignal(claimed);
         return;
     }
@@ -775,14 +776,22 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     const active_vector = lapic.activeInterruptVectorInRange(
-        generic_device_interrupt_vector,
+        device_interrupt_vector,
         device_interrupt_vector_count,
-    ) orelse generic_device_interrupt_vector;
+    ) orelse {
+        lapic.eoi();
+        return;
+    };
     lapic.eoi();
     _ = frame;
     if (!kernel_runtime.kernel_state_ready) return;
+    const route = pci.interruptRouteForVector(active_vector) orelse return;
     var wake_owners: [16]kernel.PrincipalId = undefined;
-    const wake_count = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(active_vector, wake_owners[0..]);
+    const wake_count = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(
+        route.device,
+        route.entry,
+        wake_owners[0..],
+    );
     var i: usize = 0;
     while (i < wake_count) : (i += 1) {
         scheduler.wakeMailboxWaiter(wake_owners[i]);
@@ -832,21 +841,21 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 9f
-    ++ asmCallAligned("saveCurrentThreadFxState") ++ asmCallAligned("pageFaultWorkFrameForCurrentCpuFromAsm") ++
+    ++ asmCallAligned("saveCurrentThreadXState") ++ asmCallAligned("pageFaultWorkFrameForCurrentCpuFromAsm") ++
         \\mov %rax, %r12
     ++ asmCopyStackFrameToWorkFramePointer(exception_trap_frame_qword_count) ++
         \\mov %r12, %rcx
     ++ asmCallAligned("pageFaultDispatch") ++
         \\test %rax, %rax
         \\jz 8f
-    ++ asmCallAligned("restoreCurrentThreadFxState") ++
+    ++ asmCallAligned("restoreCurrentThreadXState") ++
         \\mov %r12, %rax
     ++ asmStageUserReturnFromWorkFramePointer(exception_trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\8:
         \\mov $14, %rcx
         \\mov %r12, %rdx
-    ++ asmCallAligned("fatalUserExceptionWithErrorDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+    ++ asmCallAligned("fatalUserExceptionWithErrorDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\9:
         \\mov %rsp, %rcx
@@ -861,7 +870,7 @@ pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 2f
-    ++ asmCallAligned("restoreCurrentThreadFxState") ++
+    ++ asmCallAligned("restoreCurrentThreadXState") ++
         \\mov %rsp, %rax
     ++ asmStageUserReturnFromWorkFramePointer(exception_trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
@@ -909,7 +918,7 @@ pub export fn doubleFaultHandlerStub() callconv(.naked) noreturn {
 }
 
 pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
-    if (debug_skip_timer_fx_state) {
+    if (debug_skip_kernel_fx_state) {
         asm volatile (
             \\push %r10
             \\mov kernel_cr3_value(%rip), %r10
@@ -988,10 +997,10 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
             \\cmp $0x3, %rax
             \\jne 9f
         ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
-            asmCallAligned("saveCurrentThreadFxState") ++
+            asmCallAligned("saveCurrentThreadXState") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
-        ++ asmCallAligned("timerInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
+        ++ asmCallAligned("timerInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++
             \\mov (%rsp), %r12
             \\add $8, %rsp
             \\mov %r12, %rax
@@ -1020,7 +1029,7 @@ pub export fn timerInterruptHandlerStub() callconv(.naked) noreturn {
 }
 
 pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
-    if (debug_skip_timer_fx_state) {
+    if (debug_skip_kernel_fx_state) {
         asm volatile (
             \\push %r10
             \\mov kernel_cr3_value(%rip), %r10
@@ -1099,10 +1108,10 @@ pub export fn deviceInterruptHandlerStub() callconv(.naked) noreturn {
             \\cmp $0x3, %rax
             \\jne 9f
         ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
-            asmCallAligned("saveCurrentThreadFxState") ++
+            asmCallAligned("saveCurrentThreadXState") ++
             \\mov (%rsp), %r12
             \\mov %r12, %rcx
-        ++ asmCallAligned("deviceInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
+        ++ asmCallAligned("deviceInterruptDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++
             \\mov (%rsp), %r12
             \\add $8, %rsp
             \\mov %r12, %rax
@@ -1156,10 +1165,10 @@ pub export fn schedulerWakeIpiHandlerStub() callconv(.naked) noreturn {
         \\cmp $0x3, %rax
         \\jne 9f
     ++ asmCopyUserInterruptFrameToCpuWorkFrame("timer_interrupt_work_frames") ++
-        asmCallAligned("saveCurrentThreadFxState") ++
+        asmCallAligned("saveCurrentThreadXState") ++
         \\mov (%rsp), %r12
         \\mov %r12, %rcx
-    ++ asmCallAligned("schedulerWakeIpiDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++
+    ++ asmCallAligned("schedulerWakeIpiDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++
         \\mov (%rsp), %r12
         \\add $8, %rsp
         \\mov %r12, %rax
@@ -1312,7 +1321,7 @@ pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
         \\jne 1f
         \\mov $0, %rcx
         \\mov %r12, %rdx
-    ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+    ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\1:
         \\mov %r12, %rcx
@@ -1351,7 +1360,7 @@ pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
         \\jne 1f
         \\mov $6, %rcx
         \\mov %r12, %rdx
-    ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadFxState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+    ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
         \\jmp userReturnToSavedFrame
         \\1:
         \\mov %r12, %rcx

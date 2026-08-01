@@ -26,7 +26,7 @@ fi
 .artifacts/bin/pacgo qemu-test \
     --cpus 4 \
     --timeout "${timeout}s" \
-    --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+    --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
     --send 'P3A_INPUT_ONLY=1 P3A_INPUT_MODE=mouse bash /cmd/phase4_gui_benchmark.sh' \
     --expect 'P4_BENCH_FRAME source=' \
     --expect 'P3A_INPUT_PASS mode=mouse direct_sway=1 classification=1' \

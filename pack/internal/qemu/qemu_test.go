@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,6 +76,19 @@ func TestNormalizeCPUCount(t *testing.T) {
 	}
 }
 
+func TestDefaultCPUModelFitsKernelXStatePolicy(t *testing.T) {
+	for _, unsupported := range []string{"avx512"} {
+		if strings.Contains(defaultCPUModel, unsupported) {
+			t.Fatalf("default CPU model %q exceeds the kernel xstate policy", defaultCPUModel)
+		}
+	}
+	for _, required := range []string{"ssse3", "sse4.1", "sse4.2", "popcnt", "xsave", "avx", "avx2"} {
+		if !strings.Contains(defaultCPUModel, required) {
+			t.Fatalf("default CPU model %q is missing %q", defaultCPUModel, required)
+		}
+	}
+}
+
 func TestAppendInputDeviceArgs(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -122,6 +136,60 @@ func TestAppendInputDeviceArgs(t *testing.T) {
 	}
 }
 
+func TestAppendGraphicsDeviceArgs(t *testing.T) {
+	tests := []struct {
+		name        string
+		profile     string
+		display     string
+		wantArgs    string
+		wantDisplay string
+		wantErr     bool
+	}{
+		{
+			name:        "default 2d",
+			wantArgs:    "qemu -device virtio-gpu-pci,disable-legacy=on,iommu_platform=on,id=pachagpu",
+			wantDisplay: "none",
+			display:     "none",
+		},
+		{
+			name:        "virgl gtk enables gl",
+			profile:     "virgl",
+			display:     "gtk,show-tabs=on",
+			wantArgs:    "qemu -device virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,id=pachagpu",
+			wantDisplay: "gtk,show-tabs=on,gl=on",
+		},
+		{
+			name:        "virgl headless",
+			profile:     "virgl",
+			display:     "none",
+			wantArgs:    "qemu -device virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,id=pachagpu",
+			wantDisplay: "egl-headless,gl=on",
+		},
+		{name: "virgl explicit gl off", profile: "virgl", display: "gtk,gl=off", wantErr: true},
+		{name: "unknown", profile: "vulkan", display: "none", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			args, display, err := appendGraphicsDeviceArgs([]string{"qemu"}, test.profile, test.display)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("appendGraphicsDeviceArgs(%q, %q) unexpectedly succeeded", test.profile, test.display)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(args, " "); got != test.wantArgs {
+				t.Fatalf("args = %q, want %q", got, test.wantArgs)
+			}
+			if display != test.wantDisplay {
+				t.Fatalf("display = %q, want %q", display, test.wantDisplay)
+			}
+		})
+	}
+}
+
 func TestConsoleTerminalCandidatesPreferWindowsTerminalOnWSL(t *testing.T) {
 	t.Setenv("WSL_DISTRO_NAME", "Ubuntu")
 	workspace := &config.Workspace{Root: "/home/kamer/os"}
@@ -164,7 +232,7 @@ func TestConsoleTerminalScriptPathWritesArtifactScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := string(contentBytes)
-	for _, want := range []string{"#!/usr/bin/env bash", "sock='/tmp/virtio-console.sock'", "ready_log='/tmp/qemu-host-time.log'", "ready_marker='[termd] linux tty hvc open ready index=0 handle=2'", "python3 - \"$sock\" <<'PY'", "os.open('/dev/tty', os.O_RDWR)", "reconnecting", "exec bash"} {
+	for _, want := range []string{"#!/usr/bin/env bash", "sock='/tmp/virtio-console.sock'", "ready_log='/tmp/qemu-host-time.log'", "ready_marker='[termd] linux tty hvc open ready index=0 handle='", "python3 - \"$sock\" <<'PY'", "os.open('/dev/tty', os.O_RDWR)", "reconnecting", "exec bash"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("script does not contain %q:\n%s", want, content)
 		}
@@ -224,6 +292,185 @@ func TestRunSendExpectTTY(t *testing.T) {
 	}
 }
 
+func TestWaitForSocketOrExitBroadcastsImmediateExit(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exit 17")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	wait := watchProcess(cmd)
+	start := time.Now()
+	for _, socket := range []string{
+		filepath.Join(t.TempDir(), "console.sock"),
+		filepath.Join(t.TempDir(), "qmp.sock"),
+	} {
+		exited, err := waitForSocketOrExit(socket, wait, 5*time.Second)
+		if !exited || err == nil {
+			t.Fatalf("waitForSocketOrExit(%q) = exited=%v err=%v, want immediate process exit", socket, exited, err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("repeated process-exit observation took %s", elapsed)
+	}
+}
+
+func TestSmokeImmediateExitDoesNotWaitForBootTimeout(t *testing.T) {
+	root := t.TempDir()
+	artifacts := filepath.Join(root, ".artifacts")
+	if err := os.MkdirAll(artifacts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"limine-boot.img", "disk.img"} {
+		if err := os.WriteFile(filepath.Join(artifacts, name), []byte("image"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeQEMU := filepath.Join(root, "fake-qemu.sh")
+	if err := os.WriteFile(fakeQEMU, []byte("#!/bin/sh\nexit 17\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAPOS_QEMU", fakeQEMU)
+	workspace := &config.Workspace{
+		Root:      root,
+		Artifacts: ".artifacts",
+		Disk: config.Disk{
+			Image: ".artifacts/disk.img",
+		},
+	}
+	start := time.Now()
+	_, err := Smoke(workspace, SmokeOptions{Timeout: 5 * time.Second, NoKVM: true, NoNet: true})
+	if err == nil || !strings.Contains(err.Error(), "qemu exited before smoke marker") {
+		t.Fatalf("Smoke immediate exit error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Smoke waited %s after immediate QEMU exit", elapsed)
+	}
+}
+
+func TestRunCleanExitBeforeConsoleSocketFailsImmediately(t *testing.T) {
+	root := t.TempDir()
+	artifacts := filepath.Join(root, ".artifacts")
+	if err := os.MkdirAll(artifacts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"limine-boot.img", "disk.img"} {
+		if err := os.WriteFile(filepath.Join(artifacts, name), []byte("image"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeQEMU := filepath.Join(root, "fake-qemu.sh")
+	if err := os.WriteFile(fakeQEMU, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAPOS_QEMU", fakeQEMU)
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	workspace := &config.Workspace{
+		Root:      root,
+		Artifacts: ".artifacts",
+		Disk:      config.Disk{Image: ".artifacts/disk.img"},
+	}
+	start := time.Now()
+	_, err := Run(workspace, Options{Console: "pty", NoKVM: true, NoNet: true})
+	if err == nil || !strings.Contains(err.Error(), "qemu exited before socket was ready") {
+		t.Fatalf("Run clean immediate exit error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("Run waited %s after clean QEMU exit", elapsed)
+	}
+}
+
+func TestUEFIDryRunDoesNotModifyVars(t *testing.T) {
+	workspace, template := testUEFIWorkspace(t)
+	varsPath := filepath.Join(workspace.Root, workspace.Artifacts, "OVMF_LIMINE_VARS.fd")
+	if err := os.WriteFile(varsPath, []byte("existing vars"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(workspace, Options{
+		Firmware: "uefi",
+		Console:  "off",
+		NoKVM:    true,
+		NoNet:    true,
+		DryRun:   true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(varsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), "existing vars"; got != want {
+		t.Fatalf("dry run modified vars = %q, want %q (template %q)", got, want, template)
+	}
+}
+
+func TestUEFIPlanPreparesVarsOnlyAfterImageLock(t *testing.T) {
+	workspace, template := testUEFIWorkspace(t)
+	varsPath := filepath.Join(workspace.Root, workspace.Artifacts, "OVMF_LIMINE_VARS.fd")
+	plan, err := commandArgs(workspace, Options{Firmware: "uefi", Console: "off", NoKVM: true, NoNet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(varsPath); !os.IsNotExist(err) {
+		t.Fatalf("command planning created vars file: %v", err)
+	}
+	if !containsPath(plan.ImagePaths, varsPath) {
+		t.Fatalf("UEFI vars path %q is not locked with image paths %#v", varsPath, plan.ImagePaths)
+	}
+	locks, err := lockPlanImages(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer locks.Close()
+	if err := preparePlan(plan); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(varsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), template; got != want {
+		t.Fatalf("prepared vars = %q, want template %q", got, want)
+	}
+}
+
+func testUEFIWorkspace(t *testing.T) (*config.Workspace, string) {
+	t.Helper()
+	root := t.TempDir()
+	artifacts := filepath.Join(root, ".artifacts")
+	if err := os.MkdirAll(artifacts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"limine-boot.img", "disk.img"} {
+		if err := os.WriteFile(filepath.Join(artifacts, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	codePath := filepath.Join(root, "OVMF_CODE.fd")
+	varsTemplate := filepath.Join(root, "OVMF_VARS.fd")
+	if err := os.WriteFile(codePath, []byte("code"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const template = "fresh vars"
+	if err := os.WriteFile(varsTemplate, []byte(template), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAPOS_OVMF_CODE", codePath)
+	t.Setenv("CAPOS_OVMF_VARS_TEMPLATE", varsTemplate)
+	return &config.Workspace{
+		Root:      root,
+		Artifacts: ".artifacts",
+		Disk:      config.Disk{Image: ".artifacts/disk.img"},
+	}, template
+}
+
+func containsPath(paths []string, wanted string) bool {
+	for _, path := range paths {
+		if path == wanted {
+			return true
+		}
+	}
+	return false
+}
+
 func TestParseScreendumpCheck(t *testing.T) {
 	artifacts := t.TempDir()
 	check, err := parseScreendumpCheck("FRAME_READY@8,9,10,11=#12abef:3", 1, artifacts)
@@ -246,14 +493,15 @@ func TestParseInputSendCheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if check.Marker != "INPUT_READY" || len(check.Events) != 4 {
+	if check.Marker != "INPUT_READY" || len(check.Patterns) != 1 || len(check.Patterns[0]) != 4 {
 		t.Fatalf("unexpected check: %#v", check)
 	}
-	if check.Events[0].Kind != "key" || !check.Events[0].Down || check.Events[1].Down {
-		t.Fatalf("unexpected key events: %#v", check.Events[:2])
+	events := check.Patterns[0]
+	if events[0].Kind != "key" || !events[0].Down || events[1].Down {
+		t.Fatalf("unexpected key events: %#v", events[:2])
 	}
-	if check.Events[2].Kind != "rel" || check.Events[2].Code != "x" || check.Events[2].Value != -7 {
-		t.Fatalf("unexpected relative event: %#v", check.Events[2])
+	if events[2].Kind != "rel" || events[2].Code != "x" || events[2].Value != -7 {
+		t.Fatalf("unexpected relative event: %#v", events[2])
 	}
 }
 

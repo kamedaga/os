@@ -91,6 +91,10 @@ int pacha_capsule_pci_bar_info(int device_fd, unsigned bar, struct pacha_capsule
 int pacha_capsule_derive_mmio(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags);
 int pacha_capsule_derive_dma_buffer(int device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags);
 int pacha_capsule_derive_dma_mapping(int device_fd, void *addr, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
+/* Returns one DMA-mapping fd. out_page_dma[0] addresses user_va exactly;
+ * later entries address the base of each following page. Keep the userspace
+ * range mapped and unchanged until the returned fd is closed. */
+int pacha_capsule_derive_dma_mapping_pages(int device_fd, void *user_va, size_t size, unsigned direction, uint64_t *out_page_dma, size_t out_capacity_entries);
 int pacha_capsule_derive_dma_mapping_from_buffer(int dma_buffer_fd, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
 int pacha_capsule_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags);
 

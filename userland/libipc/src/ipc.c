@@ -210,6 +210,16 @@ long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_tic
     return pacha_fd_wait_many(set->fds, set->count, timeout_ticks);
 }
 
+uint64_t pacha_service_wait_revents(
+    const struct pacha_service_wait_set *set,
+    int fd)
+{
+    if (set == NULL || fd < 16) return 0;
+    for (uint64_t i = 0; i < set->count; i++)
+        if (set->fds[i].fd == fd) return set->fds[i].revents;
+    return 0;
+}
+
 int pacha_eventfd_create(uint64_t initial_value, uint64_t rights, uint32_t fd_flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE, initial_value, rights, fd_flags));
 }

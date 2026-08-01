@@ -552,7 +552,7 @@ static int lpr_exec_text_file_intersection(
     return 1;
 }
 
-static void lpr_exec_patch_segment_text_range(
+static int lpr_exec_patch_segment_text_range(
     unsigned char *mapped,
     uint64_t map_size,
     uint64_t segment_file_offset,
@@ -561,18 +561,22 @@ static void lpr_exec_patch_segment_text_range(
     uint64_t patch_file_size)
 {
     if (mapped == NULL || patch_file_size == 0 || patch_file_offset < segment_file_offset) {
-        return;
+        return 0;
     }
     const uint64_t file_delta = patch_file_offset - segment_file_offset;
     if (page_offset > map_size || file_delta > map_size - page_offset) {
-        return;
+        return 0;
     }
     const uint64_t mapped_offset = page_offset + file_delta;
     if (patch_file_size > map_size - mapped_offset) {
-        return;
+        return 0;
     }
     const uint64_t patch_start_cycles = lpr_exec_map_now_cycles();
-    const uint64_t patched = lpr_exec_patch_syscalls(mapped + mapped_offset, patch_file_size);
+    uint64_t patched = 0;
+    const int status = lpr_exec_patch_syscalls(
+        mapped + mapped_offset,
+        patch_file_size,
+        &patched);
     lpr_exec_map_metric_time_cycles(
         "patch_syscalls_scan",
         patch_start_cycles,
@@ -581,6 +585,7 @@ static void lpr_exec_patch_segment_text_range(
     if (patched != 0) {
         lpr_exec_map_metric_count("patch_syscalls", patched);
     }
+    return status;
 }
 
 static void lpr_exec_memory_span_vmo_cache_clear_slot(lpr_exec_memory_span_vmo_cache_slot_t *slot);
@@ -1270,13 +1275,18 @@ static int create_segment_vmo_from_bytes(
             map_size - data_end);
     }
     if (patch_text) {
-        lpr_exec_patch_segment_text_range(
+        status = lpr_exec_patch_segment_text_range(
             mapped,
             map_size,
             file_offset,
             page_offset,
             patch_file_offset,
             patch_file_size);
+        if (status != 0) {
+            (void)pacha_munmap(mapped, map_size);
+            (void)pacha_fd_close(vmo_fd);
+            return status;
+        }
     }
     metric_start = lpr_exec_map_now_cycles();
     (void)pacha_munmap(mapped, map_size);
@@ -1551,13 +1561,16 @@ static int lpr_exec_load_memory_image_into_process(
                     &patch_file_offset,
                     &patch_file_size))
             {
-                lpr_exec_patch_segment_text_range(
+                status = lpr_exec_patch_segment_text_range(
                     mapped + (target_va - span_base),
                     map_size,
                     p_offset,
                     page_offset,
                     patch_file_offset,
                     patch_file_size);
+                if (status != 0) {
+                    break;
+                }
             }
         }
     }
@@ -1731,13 +1744,16 @@ static int lpr_exec_load_file_span_vmo_into_process(
                     &patch_file_offset,
                     &patch_file_size))
             {
-                lpr_exec_patch_segment_text_range(
+                status = lpr_exec_patch_segment_text_range(
                     mapped + (target_va - span_base),
                     map_size,
                     p_offset,
                     page_offset,
                     patch_file_offset,
                     patch_file_size);
+                if (status != 0) {
+                    break;
+                }
             }
         }
     }

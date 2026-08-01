@@ -15,7 +15,7 @@ int netd_unix_socket_pair(
 int netd_unix_socket_dup(uint64_t handle);
 int netd_unix_socket_attach_wait(uint64_t handle, int notify_fd);
 int netd_unix_socket_bind(const netd_unix_path_t *req);
-int netd_unix_socket_listen(uint64_t handle);
+int netd_unix_socket_listen(const netd_listen_t *req);
 int netd_unix_socket_connect(const netd_unix_path_t *req);
 int netd_unix_socket_accept(netd_accept_t *req);
 int netd_unix_socket_send(
@@ -34,4 +34,5 @@ int netd_unix_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_revent
 int netd_unix_socket_close(uint64_t handle);
 int netd_unix_socket_is_handle(uint64_t handle);
 int netd_unix_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set);
-void netd_unix_socket_reap_hangups(void);
+void netd_unix_socket_reap_hangups(
+    const struct pacha_service_wait_set *wait_set);

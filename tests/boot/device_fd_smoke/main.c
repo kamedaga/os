@@ -184,9 +184,15 @@ void device_fd_boot_smoke_main(void) {
         log_hex("[device_fd_boot_smoke] descriptor resource=", device->resource_id);
         return;
     }
+    if (info.index < 0x50 || info.index > 0xc0 ||
+        ((info.index - 0x50) % 16) != 0) {
+        log_hex("[device_fd_boot_smoke] irq delivery base=", info.index);
+        return;
+    }
 
     struct pacha_capsule_irq irq = {0};
-    const int irq_status = pacha_capsule_device_derive_irq(fd, PACHA_CAPSULE_IRQ_AUTO, 0x41, 0, &irq);
+    const int irq_status =
+        pacha_capsule_device_derive_irq(fd, PACHA_CAPSULE_IRQ_AUTO, 0, 0, &irq);
     if (irq_status != 0) {
         log_hex("[device_fd_boot_smoke] irq status=", (u64)(long long)irq_status);
         return;

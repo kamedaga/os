@@ -19,7 +19,12 @@ enum {
     INPUTD_RING_MAX = 4096,
     INPUTD_FRAME_STAGE_MAX = 256,
     INPUTD_TIMING_RING_MAX = 64,
+    INPUTD_STATE_FLUSH_MAX = 4,
     INPUTD_EV_SYN = 0,
+    INPUTD_EV_KEY = 1,
+    INPUTD_EV_SW = 5,
+    INPUTD_EV_LED = 0x11,
+    INPUTD_EV_SND = 0x12,
     INPUTD_SYN_REPORT = 0,
     INPUTD_SYN_DROPPED = 3,
     INPUTD_CLOCK_REALTIME = 0,
@@ -55,6 +60,14 @@ typedef struct inputd_handle {
     int notify_fd;
     int notify_pending;
     int readable;
+    int resyncing;
+    int resync_drop_pending;
+    int resync_report_pending;
+    inputd_raw_event_t resync_drop;
+    inputd_raw_event_t resync_report;
+    uint64_t state_flush_through[INPUTD_STATE_FLUSH_MAX];
+    int state_flush_active;
+    int state_flush_frame_visible;
     uint32_t generation;
 } inputd_handle_t;
 
@@ -94,6 +107,7 @@ typedef struct inputd_registry_entry {
     inputd_frame_timing_t timing[INPUTD_TIMING_RING_MAX];
     uint32_t timing_head;
     uint64_t latest_sequence;
+    uint64_t overwritten_sequence;
     uint64_t pending_irq_ready_ns;
 } inputd_registry_entry_t;
 
@@ -250,6 +264,10 @@ static void append_event(
     size_t slot = (event_head + event_count) % INPUTD_RING_MAX;
     if (event_count == INPUTD_RING_MAX) {
         slot = event_head;
+        inputd_registry_entry_t *overwritten_entry =
+            lookup_registry_by_device_id(event_ring[slot].device_id);
+        if (overwritten_entry != NULL)
+            overwritten_entry->overwritten_sequence = event_ring[slot].sequence;
         event_head = (event_head + 1u) % INPUTD_RING_MAX;
     } else {
         event_count++;
@@ -640,6 +658,71 @@ static void copy_event_time(const inputd_handle_t *handle, const inputd_raw_even
     }
 }
 
+static void copy_syn_event(const inputd_handle_t *handle,
+    const inputd_raw_event_t *source, uint16_t code, inputd_input_event_t *target)
+{
+    const inputd_raw_event_t synthetic = {
+        .type = INPUTD_EV_SYN,
+        .code = code,
+        .monotonic_seconds = source == NULL ? 0 : source->monotonic_seconds,
+        .monotonic_microseconds = source == NULL ? 0 : source->monotonic_microseconds,
+    };
+    copy_event_time(handle, &synthetic, target);
+}
+
+static int state_flush_slot(uint16_t type)
+{
+    switch (type) {
+    case INPUTD_EV_KEY: return 0;
+    case INPUTD_EV_LED: return 1;
+    case INPUTD_EV_SND: return 2;
+    case INPUTD_EV_SW: return 3;
+    default: return -1;
+    }
+}
+
+static uint64_t state_flush_last_sequence(const inputd_handle_t *handle)
+{
+    uint64_t last = 0;
+    for (size_t i = 0; i < INPUTD_STATE_FLUSH_MAX; i++)
+        if (handle->state_flush_through[i] > last)
+            last = handle->state_flush_through[i];
+    return last;
+}
+
+static void finish_state_flush_if_consumed(inputd_handle_t *handle)
+{
+    if (!handle->state_flush_active ||
+        handle->cursor <= state_flush_last_sequence(handle)) return;
+    memset(handle->state_flush_through, 0, sizeof(handle->state_flush_through));
+    handle->state_flush_active = 0;
+    handle->state_flush_frame_visible = 0;
+}
+
+static void mark_state_events_flushed(
+    inputd_handle_t *handle,
+    const inputd_registry_entry_t *entry,
+    uint16_t type)
+{
+    const int slot = state_flush_slot(type);
+    if (handle == NULL || entry == NULL || slot < 0 ||
+        entry->latest_sequence < handle->cursor) return;
+    if (entry->latest_sequence > handle->state_flush_through[slot])
+        handle->state_flush_through[slot] = entry->latest_sequence;
+    handle->state_flush_active = 1;
+    /* Linux preserves a leading report while compacting a client queue. */
+    handle->state_flush_frame_visible = 1;
+}
+
+static int event_was_state_flushed(
+    const inputd_handle_t *handle,
+    const inputd_raw_event_t *event)
+{
+    const int slot = state_flush_slot(event->type);
+    return handle->state_flush_active && slot >= 0 &&
+        event->sequence <= handle->state_flush_through[slot];
+}
+
 int inputd_input_read(inputd_read_request_t *request)
 {
     if (request == NULL) return -22;
@@ -651,35 +734,94 @@ int inputd_input_read(inputd_read_request_t *request)
     request->event_count = 0;
     if (capacity == 0) return -22;
 
-    const uint64_t earliest = event_count == 0 ? next_sequence : event_ring[event_head].sequence;
-    if (handle->cursor < earliest && request->event_count < capacity) {
-        const inputd_raw_event_t *oldest = event_count == 0 ? NULL : &event_ring[event_head];
-        request->events[request->event_count++] = (inputd_input_event_t){
-            .seconds = oldest == NULL ? 0 : oldest->monotonic_seconds,
-            .microseconds = oldest == NULL ? 0 : oldest->monotonic_microseconds,
-            .type = INPUTD_EV_SYN,
-            .code = INPUTD_SYN_DROPPED,
-            .value = 0,
-        };
-        handle->cursor = earliest;
-    }
     inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+    const uint64_t earliest = event_count == 0 ? next_sequence : event_ring[event_head].sequence;
+    if (handle->resync_report_pending && request->event_count < capacity) {
+        copy_event_time(handle, &handle->resync_report,
+            &request->events[request->event_count++]);
+        handle->resync_report_pending = 0;
+    }
+
+    if (!handle->resyncing && !handle->resync_drop_pending &&
+        !handle->resync_report_pending && entry != NULL &&
+        handle->cursor <= entry->overwritten_sequence)
+    {
+        const inputd_raw_event_t *source = event_count == 0 ? NULL : &event_ring[event_head];
+        for (size_t i = 0; i < event_count; i++) {
+            const inputd_raw_event_t *candidate =
+                &event_ring[(event_head + i) % INPUTD_RING_MAX];
+            if (candidate->device_id == handle->device_id) {
+                source = candidate;
+                break;
+            }
+        }
+        handle->resync_drop = source == NULL ? (inputd_raw_event_t){0} : *source;
+        handle->resync_drop_pending = 1;
+    }
+    if (handle->resync_drop_pending && request->event_count < capacity) {
+        copy_syn_event(handle, &handle->resync_drop, INPUTD_SYN_DROPPED,
+            &request->events[request->event_count++]);
+        handle->resync_drop_pending = 0;
+        handle->resyncing = 1;
+    }
+
     size_t start = 0;
     if (handle->cursor > earliest) {
         const uint64_t consumed = handle->cursor - earliest;
         start = consumed < event_count ? (size_t)consumed : event_count;
     }
-    for (size_t i = start; i < event_count; i++) {
+    for (size_t i = start; !handle->resync_drop_pending && i < event_count; i++) {
         const inputd_raw_event_t *event = &event_ring[(event_head + i) % INPUTD_RING_MAX];
         if (event->device_id != handle->device_id) {
             handle->cursor = event->sequence + 1u;
+            finish_state_flush_if_consumed(handle);
+            continue;
+        }
+        if (handle->resyncing) {
+            handle->cursor = event->sequence + 1u;
+            finish_state_flush_if_consumed(handle);
+            if (event->type == INPUTD_EV_SYN && event->code == INPUTD_SYN_REPORT) {
+                handle->resyncing = 0;
+                if (request->event_count < capacity) {
+                    copy_event_time(handle, event,
+                        &request->events[request->event_count++]);
+                } else {
+                    handle->resync_report = *event;
+                    handle->resync_report_pending = 1;
+                    break;
+                }
+            }
+            continue;
+        }
+        const uint64_t flush_last = state_flush_last_sequence(handle);
+        const int in_flush_window = handle->state_flush_active &&
+            event->sequence <= flush_last;
+        if (event_was_state_flushed(handle, event)) {
+            handle->cursor = event->sequence + 1u;
+            finish_state_flush_if_consumed(handle);
+            continue;
+        }
+        if (in_flush_window && event->type == INPUTD_EV_SYN &&
+            event->code == INPUTD_SYN_REPORT &&
+            !handle->state_flush_frame_visible)
+        {
+            handle->cursor = event->sequence + 1u;
+            finish_state_flush_if_consumed(handle);
             continue;
         }
         if (request->event_count >= capacity) break;
         copy_event_time(handle, event, &request->events[request->event_count++]);
         handle->cursor = event->sequence + 1u;
+        if (in_flush_window) {
+            if (event->type == INPUTD_EV_SYN && event->code == INPUTD_SYN_REPORT)
+                handle->state_flush_frame_visible = 0;
+            else
+                handle->state_flush_frame_visible = 1;
+        }
+        finish_state_flush_if_consumed(handle);
     }
-    handle->readable = entry != NULL && entry->latest_sequence >= handle->cursor;
+    handle->readable = handle->resync_drop_pending || handle->resync_report_pending ||
+        (entry != NULL && entry->latest_sequence >= handle->cursor);
     if (request->event_count == 0) {
         handle->readable = 0;
         return -11;
@@ -711,6 +853,19 @@ static int ioctl_copy_string(inputd_ioctl_request_t *request, const char *string
     size_t length = strlen(string) + 1u;
     if (length > UINT32_MAX) return -75;
     return ioctl_copy_out(request, string, (uint32_t)length);
+}
+
+static int ioctl_copy_state_and_flush(
+    inputd_ioctl_request_t *request,
+    inputd_handle_t *handle,
+    uint16_t type,
+    const void *state,
+    uint32_t size)
+{
+    inputd_registry_entry_t *entry =
+        lookup_registry_by_device_id(handle->device_id);
+    mark_state_events_flushed(handle, entry, type);
+    return ioctl_copy_out(request, state, size);
 }
 
 int inputd_input_ioctl(inputd_ioctl_request_t *request)
@@ -765,10 +920,18 @@ int inputd_input_ioctl(inputd_ioctl_request_t *request)
     if (nr == 0x07u) return ioctl_copy_string(request, device.phys);
     if (nr == 0x08u) return ioctl_copy_string(request, device.uniq);
     if (nr == 0x09u) return ioctl_copy_out(request, &device.prop_bits, sizeof(device.prop_bits));
-    if (nr == 0x18u || nr == 0x19u || nr == 0x1au || nr == 0x1bu) {
-        uint8_t zero[INPUTD_IOCTL_DATA_BYTES] = {0};
-        return ioctl_copy_out(request, zero, request->data_size);
-    }
+    if (nr == 0x18u)
+        return ioctl_copy_state_and_flush(request, handle, INPUTD_EV_KEY,
+            device.key_state, sizeof(device.key_state));
+    if (nr == 0x19u)
+        return ioctl_copy_state_and_flush(request, handle, INPUTD_EV_LED,
+            &device.led_state, sizeof(device.led_state));
+    if (nr == 0x1au)
+        return ioctl_copy_state_and_flush(request, handle, INPUTD_EV_SND,
+            &device.snd_state, sizeof(device.snd_state));
+    if (nr == 0x1bu)
+        return ioctl_copy_state_and_flush(request, handle, INPUTD_EV_SW,
+            &device.sw_state, sizeof(device.sw_state));
     if (nr >= 0x20u && nr <= 0x3fu) {
         switch (nr - 0x20u) {
         case 0: return ioctl_copy_out(request, &device.event_bits, sizeof(device.event_bits));
