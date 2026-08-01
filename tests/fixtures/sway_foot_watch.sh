@@ -19,7 +19,6 @@ export SEATD_SOCK=/run/seatd.sock
 export SEATD_VTBOUND=0
 export MESA_SHADER_CACHE_DISABLE=true
 export M55_FIRST_FRAME=1
-export M57_WLROOTS_KEYMAP_PRELOAD=/cmd/libm57-wlroots-keymap-compat.so
 export M51_CLIENT_TIMEOUT_SECONDS="$watch_seconds"
 
 printf 'P6_FOOT_WATCH_START seconds=%s\n' "$watch_seconds"

@@ -50,6 +50,7 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
     lpr_state.netd_rpc.lock_word = 0;
     lpr_unmapself_lock = 0;
     lpr_backend_state_after_fork_child();
+    lpr_drm_after_fork_child();
 
     if (transaction == 0 ||
         lpr_fork_transaction_commit_child(transaction) != 0)

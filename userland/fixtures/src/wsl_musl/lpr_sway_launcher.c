@@ -178,8 +178,10 @@ int main(int argc, char **argv) {
     (void)setenv("LIBSEAT_BACKEND", "seatd", 1);
     (void)setenv("SEATD_SOCK", "/run/seatd.sock", 1);
     (void)setenv("SEATD_VTBOUND", "0", 1);
-    /* card0 has no render node; wlroots must opt in before selecting llvmpipe. */
+    /* Keep the guest and Linux baseline on the same software renderer. */
     (void)setenv("WLR_RENDERER_ALLOW_SOFTWARE", "1", 1);
+    (void)setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+    (void)setenv("GALLIUM_DRIVER", "llvmpipe", 1);
     const pid_t seatd = fork();
     if (seatd < 0) {
         perror("fork seatd");
@@ -201,12 +203,6 @@ int main(int argc, char **argv) {
         return 4;
     }
     if (sway == 0) {
-        /* PachaOS PRIME has no implicit fence. Zero raster threads makes
-         * llvmpipe finish each scene synchronously before wlroots' glFlush. */
-        (void)setenv("LP_NUM_THREADS", "0", 1);
-        const char *keymap_preload = getenv("M57_WLROOTS_KEYMAP_PRELOAD");
-        if (keymap_preload != NULL && keymap_preload[0] != '\0')
-            (void)setenv("LD_PRELOAD", keymap_preload, 1);
         execv(argv[sway_arg], &argv[sway_arg]);
         perror("exec sway");
         _exit(126);

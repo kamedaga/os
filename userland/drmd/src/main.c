@@ -1,4 +1,5 @@
 #include "drmd/boot_config.h"
+#include "drm_kms.h"
 #include "drmd_service.h"
 
 #include <pacha/abi.h>
@@ -52,6 +53,23 @@ int main(void)
                     &wait_set, notify_fds[i], PACHA_FD_EVENT_HANGUP) != 0)
                 return 1;
         }
+        int kms_wait_fds[DRMD_DRM_WAIT_SOURCE_MAX];
+        size_t kms_wait_capacity = PACHA_SERVICE_WAIT_MAX_FDS > wait_set.count ?
+            PACHA_SERVICE_WAIT_MAX_FDS - (size_t)wait_set.count : 0;
+        if (kms_wait_capacity > DRMD_DRM_WAIT_SOURCE_MAX) {
+            kms_wait_capacity = DRMD_DRM_WAIT_SOURCE_MAX;
+        }
+        const size_t kms_wait_count = drmd_kms_collect_wait_sources(
+            kms_wait_fds, kms_wait_capacity);
+        for (size_t i = 0; i < kms_wait_count; i++) {
+            if (pacha_service_wait_add(
+                    &wait_set,
+                    kms_wait_fds[i],
+                    PACHA_FD_EVENT_READABLE |
+                        PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP) != 0) {
+                return 1;
+            }
+        }
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
         memset(fds, 0, sizeof(fds));
@@ -69,6 +87,8 @@ int main(void)
             wake_irq.count = next_count;
         (void)kb_handle_any_irq(0);
         kb_run_deferred_work();
+        drmd_kms_progress_page_flip();
+        (void)drmd_service_progress(&service);
         drmd_drm_island_notify_readable(&island);
         (void)drmd_drm_island_reap_hangups(&island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {

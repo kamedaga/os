@@ -16,7 +16,6 @@ export MESA_SHADER_CACHE_DISABLE=true
 export M55_FIRST_FRAME=1
 export M51_CLIENT=/cmd/lpr_wayland_shm_client.elf
 export M57_INPUT=1
-export M57_WLROOTS_KEYMAP_PRELOAD=/cmd/libm57-wlroots-keymap-compat.so
 
 printf 'M57_SWAY_START backend=drm,libinput client=input\n'
 /cmd/lpr_sway_launcher.elf /usr/bin/sway -d -c "$config" 2>&1

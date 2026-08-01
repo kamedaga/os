@@ -17,6 +17,7 @@
 enum {
     DRMD_DRM_MAJOR = 226,
     DRMD_DRM_CARD0_MINOR = 0,
+    DRMD_DRM_RENDERD128_MINOR = 128,
     DRMD_HANDLE_MAX = 64,
     DRMD_FAKE_INODE_BYTES = 768,
     DRMD_FAKE_MAPPING_BYTES = 256,
@@ -186,7 +187,6 @@ int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_
     (void)setenv("KOBOX_PCI_LAYOUT", "arch68", 1);
     (void)setenv("KOBOX_VIRTIO_NO_INDIRECT", "1", 1);
     (void)setenv("KOBOX_VIRTIO_NO_EVENT_IDX", "1", 1);
-
     kb_device_backend_t *backend = NULL;
     kb_status_t status = kb_pachaos_capsule_device_create(cfg->device_fd, &backend);
     if (status != KB_OK || backend == NULL) {
@@ -263,10 +263,14 @@ int drmd_drm_island_open(
     uint64_t *out_handle)
 {
     if (island == NULL || request == NULL || out_handle == NULL ||
-        !island->ready || request->card_index != 0 || notify_fd < 16) {
+        !island->ready ||
+        (request->device_minor != DRMD_DRM_CARD0_MINOR &&
+            request->device_minor != DRMD_DRM_RENDERD128_MINOR) ||
+        notify_fd < 16) {
         return -19;
     }
-    const uint64_t dev = kb_linux_kernel_encode_dev(DRMD_DRM_MAJOR, DRMD_DRM_CARD0_MINOR);
+    const uint64_t dev = kb_linux_kernel_encode_dev(
+        DRMD_DRM_MAJOR, (unsigned)request->device_minor);
     const kb_cdev_record_t *record = kb_linux_kernel_find_active_cdev(dev);
     if (record == NULL || !record->has_fops_view || record->fops_view.open == NULL) {
         return -19;
@@ -295,7 +299,7 @@ int drmd_drm_island_open(
         memset(handle, 0, sizeof(*handle));
         return status;
     }
-    drmd_kms_handle_open(handle->id);
+    drmd_kms_handle_open(handle->id, (uint32_t)request->device_minor);
     *out_handle = handle->id;
     return 0;
 }
@@ -378,10 +382,23 @@ static uint32_t drmd_transfer_lease_count(uint64_t handle)
     return count;
 }
 
-int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request)
+int drmd_drm_island_ioctl(
+    struct drmd_drm_island *island,
+    drmd_ioctl_request_t *request,
+    void *aux_data,
+    uint64_t aux_size,
+    drmd_ioctl_attachments_t *attachments)
 {
     (void)island;
-    if (request == NULL || request->data_size > DRMD_IOCTL_DATA_BYTES) {
+    if (request == NULL || request->data_size > DRMD_IOCTL_DATA_BYTES ||
+        request->aux_size != aux_size ||
+        (aux_size != 0 && aux_data == NULL) || attachments == NULL ||
+        request->reserved0 != 0 ||
+        (request->fd_flags & ~DRMD_IOCTL_FD_MASK) != 0 ||
+        (((request->fd_flags & DRMD_IOCTL_FD_INPUT_WAIT) != 0) !=
+            (attachments->input_wait_fd >= 16)) ||
+        (((request->fd_flags & DRMD_IOCTL_FD_OUTPUT_NOTIFY) != 0) !=
+            (attachments->output_notify_fd >= 16))) {
         return -22;
     }
     drmd_handle_t *handle = find_handle(request->handle);
@@ -389,11 +406,32 @@ int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *
         return -9;
     }
 
-    int kms_handled = 0;
-    const int kms_status = drmd_kms_ioctl(island, request, &kms_handled);
-    if (kms_handled) {
-        return kms_status;
+    const uint32_t minor = kb_linux_kernel_decode_minor(handle->dev);
+    if ((uint32_t)request->request == DRMD_IOCTL_GET_CAP ||
+        minor == DRMD_DRM_CARD0_MINOR) {
+        int kms_handled = 0;
+        const int kms_status = drmd_kms_ioctl(
+            island, request, attachments, &kms_handled);
+        if (kms_handled) {
+            return kms_status;
+        }
     }
+
+    if (request->fd_flags != 0) return -22;
+
+    void *drm_file = NULL;
+    memcpy(&drm_file,
+        (const uint8_t *)handle->file + DRMD_FILE_PRIVATE_DATA_OFFSET,
+        sizeof(drm_file));
+    int render_handled = 0;
+    const int render_status = drmd_kms_render_ioctl(
+        island,
+        request,
+        drm_file,
+        aux_data,
+        aux_size,
+        &render_handled);
+    if (render_handled) return render_status;
 
     void *argument = request->data;
     drmd_drm_version_t version;
@@ -417,6 +455,23 @@ int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *
         version.date = date;
         version.desc = desc;
         argument = &version;
+    } else if ((uint32_t)request->request == DRMD_IOCTL_VIRTGPU_GETPARAM) {
+        if (request->data_size < sizeof(drmd_virtgpu_getparam_t) ||
+            aux_size < sizeof(uint32_t)) {
+            return -22;
+        }
+        drmd_virtgpu_getparam_t *getparam = (void *)request->data;
+        getparam->value = (uint64_t)(uintptr_t)aux_data;
+    } else if ((uint32_t)request->request == DRMD_IOCTL_VIRTGPU_GET_CAPS) {
+        if (request->data_size < sizeof(drmd_virtgpu_get_caps_t)) {
+            return -22;
+        }
+        drmd_virtgpu_get_caps_t *caps = (void *)request->data;
+        if (caps->size == 0 || caps->size > aux_size) return -22;
+        caps->addr = (uint64_t)(uintptr_t)aux_data;
+    } else if ((uint32_t)request->request == DRMD_IOCTL_VIRTGPU_CONTEXT_INIT ||
+        (uint32_t)request->request == DRMD_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB) {
+        return -25;
     }
 
     drmd_owner_context_t context;
@@ -434,7 +489,7 @@ int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *
     }
     if (wire != NULL) {
         wire->major = version.version_major;
-        wire->minor = version.version_minor;
+        wire->minor = 0;
         wire->patchlevel = version.version_patchlevel;
         wire->name_length = version.name_len;
         wire->date_length = version.date_len;
@@ -442,6 +497,19 @@ int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *
         memcpy(wire->name, name, sizeof(wire->name));
         memcpy(wire->date, date, sizeof(wire->date));
         memcpy(wire->desc, desc, sizeof(wire->desc));
+    } else if ((uint32_t)request->request == DRMD_IOCTL_VIRTGPU_GETPARAM) {
+        drmd_virtgpu_getparam_t *getparam = (void *)request->data;
+        uint32_t *value = aux_data;
+        if (getparam->param == DRMD_VIRTGPU_PARAM_RESOURCE_BLOB ||
+            getparam->param == DRMD_VIRTGPU_PARAM_HOST_VISIBLE ||
+            getparam->param == DRMD_VIRTGPU_PARAM_CROSS_DEVICE ||
+            getparam->param == DRMD_VIRTGPU_PARAM_CONTEXT_INIT ||
+            getparam->param == DRMD_VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME) {
+            *value = 0;
+        }
+        getparam->value = 0;
+    } else if ((uint32_t)request->request == DRMD_IOCTL_VIRTGPU_GET_CAPS) {
+        ((drmd_virtgpu_get_caps_t *)request->data)->addr = 0;
     }
     return 0;
 }
@@ -619,9 +687,16 @@ int drmd_drm_island_prime_import(
     const int token_import = request->token != 0 && request->size == 0 && import_vmo_fd < 16;
     const int vmo_import = request->token == 0 && request->size != 0 && import_vmo_fd >= 16;
     if (!token_import && !vmo_import) return -22;
+    drmd_handle_t *handle = find_handle(request->handle);
+    void *drm_file = NULL;
+    if (handle != NULL) {
+        memcpy(&drm_file,
+            (const uint8_t *)handle->file + DRMD_FILE_PRIVATE_DATA_OFFSET,
+            sizeof(drm_file));
+    }
     const int status = token_import ?
         drmd_kms_prime_import(
-            request->handle, request->token, request->flags, &gem_handle) :
+            request->handle, drm_file, request->token, request->flags, &gem_handle) :
         drmd_kms_prime_import_vmo(
             request->handle, import_vmo_fd, request->size, request->flags, &gem_handle);
     if (status == 0 && out_gem_handle != NULL) *out_gem_handle = gem_handle;

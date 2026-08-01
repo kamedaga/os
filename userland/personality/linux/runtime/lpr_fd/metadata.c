@@ -807,12 +807,14 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         return 0;
     }
     if (lpr_linux_drm_fd_active(fd)) {
+        const lpr_drm_backend_t *drm = lpr_drm_backend(fd);
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
         lpr_memset(st, 0, sizeof(*st));
         st->st_ino = 0x64726900ull + fd;
         st->st_nlink = 1;
         st->st_mode = LPR_LINUX_S_IFCHR | 0660u;
-        st->st_rdev = (226ull << 8);
+        st->st_rdev = (226ull << 8) |
+            (drm != 0 && drm->node_kind == LPR_DRM_NODE_RENDER ? 128u : 0u);
         st->st_blksize = 4096;
         return 0;
     }

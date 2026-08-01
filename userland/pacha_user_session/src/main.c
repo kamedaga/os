@@ -51,6 +51,8 @@ static int prepare_environment(void)
         { "WLR_DRM_DEVICES", "/dev/dri/card0" },
         { "WLR_RENDERER", "gles2" },
         { "WLR_RENDERER_ALLOW_SOFTWARE", "1" },
+        { "LIBGL_ALWAYS_SOFTWARE", "1" },
+        { "GALLIUM_DRIVER", "llvmpipe" },
         { "FONTCONFIG_FILE", "/etc/fonts/fonts.conf" },
         { "PATH", "/bin:/usr/bin:/cmd" },
         { "HOME", "/home" },

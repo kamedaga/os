@@ -16,6 +16,12 @@ struct drmd_drm_island {
 
 enum { DRMD_DRM_WAIT_SOURCE_MAX = 128 };
 
+typedef struct drmd_ioctl_attachments {
+    int input_wait_fd;
+    int output_notify_fd;
+    uint32_t consumed_fd_flags;
+} drmd_ioctl_attachments_t;
+
 int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_config *cfg);
 int drmd_drm_island_open(struct drmd_drm_island *island, const drmd_open_request_t *request, int notify_fd, uint64_t *out_handle);
 int drmd_drm_island_close(struct drmd_drm_island *island, uint64_t handle);
@@ -25,7 +31,12 @@ int drmd_drm_island_transfer_dup(
     uint64_t handle,
     int lease_fd,
     uint64_t *out_handle);
-int drmd_drm_island_ioctl(struct drmd_drm_island *island, drmd_ioctl_request_t *request);
+int drmd_drm_island_ioctl(
+    struct drmd_drm_island *island,
+    drmd_ioctl_request_t *request,
+    void *aux_data,
+    uint64_t aux_size,
+    drmd_ioctl_attachments_t *attachments);
 int drmd_drm_island_mmap(
     struct drmd_drm_island *island,
     const drmd_mmap_request_t *request,

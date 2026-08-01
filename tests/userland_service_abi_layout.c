@@ -110,7 +110,7 @@ int main(void)
         TERMD_OP_SIGNAL_TAKE == 11 && TERMD_OP_DIAG_ERROR_GET == 14,
         "termd ops are contiguous from zero");
     failures += expect(
-        DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_CARD == 1 &&
+        DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_NODE == 1 &&
         DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5 &&
         DRMD_OP_HANDLE_READ == 6 && DRMD_OP_HANDLE_POLL == 7 &&
         DRMD_OP_PRIME_EXPORT == 8 && DRMD_OP_PRIME_IMPORT_SYNC_FILE == 10 &&

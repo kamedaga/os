@@ -39,7 +39,6 @@ while [ "$i" -le "$iterations" ]; do
     if [ "$i" -eq 1 ]; then
         export WLR_BACKENDS=drm,libinput
         export M57_INPUT=1
-        export M57_WLROOTS_KEYMAP_PRELOAD=/cmd/libm57-wlroots-keymap-compat.so
     else
         export WLR_BACKENDS=drm
         unset M57_INPUT M57_WLROOTS_KEYMAP_PRELOAD

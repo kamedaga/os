@@ -157,8 +157,6 @@ apps:
         - "tools/build_wsl_alpine_mesa.sh"
         - "tools/build_wsl_alpine_input.sh"
         - "tools/copy_lpr_linux_musl.sh"
-        - "pack/patches/wlroots/0001-use-memfd-for-shm-files.patch"
-        - "pack/patches/wlroots/0002-explicit-render-fences.patch"
     out: "SWAYROOT"
     rootfs: "/"
   pacha_user_session:
@@ -277,15 +275,6 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_sway_launcher.c"
     out: "LPRSWAYL.ELF"
     rootfs: "/cmd/lpr_sway_launcher.elf"
-  lpr_wlroots_keymap_compat:
-    file:
-      path: ".artifacts/userland-fixtures/libm57-wlroots-keymap-compat.so"
-      rebuild: ["bash", "pack/scripts/build_wsl_wlroots_keymap_compat.sh"]
-      input:
-        - "pack/scripts/build_wsl_wlroots_keymap_compat.sh"
-        - "userland/fixtures/src/wsl_musl/lpr_wlroots_keymap_compat.c"
-    out: "M57KMAP.SO"
-    rootfs: "/cmd/libm57-wlroots-keymap-compat.so"
   lpr_wayland_shm_client:
     file:
       path: ".artifacts/userland-fixtures/lpr_wayland_shm_client.elf"
@@ -783,6 +772,7 @@ apps:
       path: ".artifacts/lpr-linux-x86_64.so"
       rebuild: ["bash", "userland/personality/linux/build-lpr.sh", ".artifacts/lpr-linux-x86_64.so"]
       input:
+        - "userland/drmd/include"
         - "userland/personality/include"
         - "userland/personality/linux/runtime"
         - "userland/lpr_supervisor/include"

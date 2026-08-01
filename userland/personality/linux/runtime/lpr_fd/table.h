@@ -107,13 +107,19 @@ typedef struct lpr_device_backend {
 
 typedef struct lpr_drm_backend {
     uint8_t active;
-    uint8_t reserved0;
+    uint8_t node_kind;
     uint16_t reserved1;
     uint32_t flags;
     uint64_t handle;
     lpr_native_fd_t wait_fd;
     lpr_native_fd_t lease_fd;
 } lpr_drm_backend_t;
+
+enum {
+    LPR_DRM_NODE_PRIMARY = 0u,
+    LPR_DRM_NODE_UDMABUF = 1u,
+    LPR_DRM_NODE_RENDER = 2u,
+};
 
 typedef struct lpr_input_backend {
     uint8_t active;

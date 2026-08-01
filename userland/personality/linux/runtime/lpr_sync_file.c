@@ -1,24 +1,26 @@
 #include "lpr_filed_internal.h"
 
-int64_t lpr_sync_file_create_signaled(void)
+int64_t lpr_sync_file_install_wait(int wait_fd)
 {
+    struct pacha_fd_info info;
+    lpr_memset(&info, 0, sizeof(info));
+    if (wait_fd < 16 ||
+        !lpr_native_fd_info((uint64_t)(uint32_t)wait_fd, &info) ||
+        info.kind != PACHA_FD_KIND_CHANNEL ||
+        (info.rights & (PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+            PACHA_FD_RIGHT_CLOSE)) !=
+            (PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+                PACHA_FD_RIGHT_CLOSE)) {
+        if (wait_fd >= 16) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        }
+        return -LPR_LINUX_EBADF;
+    }
+
     const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) return fd;
-
-    int wait_fd = -1;
-    int notify_fd = -1;
-    const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
-    if (pair_status != 0) return pair_status;
-
-    const struct pacha_ipc_msg message = {0};
-    const int64_t signal_status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_SEND,
-        (uint64_t)(uint32_t)notify_fd,
-        (uint64_t)(uintptr_t)&message);
-    (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
-    if (signal_status != 0) {
+    if (fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        return lpr_pacha_status_to_errno(signal_status);
+        return fd;
     }
 
     const uint64_t flags = LPR_LINUX_O_RDONLY | LPR_LINUX_O_CLOEXEC;
@@ -40,6 +42,27 @@ int64_t lpr_sync_file_create_signaled(void)
     }
     sync_file->wait_fd.raw = wait_fd;
     return fd;
+}
+
+int64_t lpr_sync_file_create_signaled(void)
+{
+
+    int wait_fd = -1;
+    int notify_fd = -1;
+    const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
+    if (pair_status != 0) return pair_status;
+
+    const struct pacha_ipc_msg message = {0};
+    const int64_t signal_status = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_IPC_SEND,
+        (uint64_t)(uint32_t)notify_fd,
+        (uint64_t)(uintptr_t)&message);
+    (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
+    if (signal_status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+        return lpr_pacha_status_to_errno(signal_status);
+    }
+    return lpr_sync_file_install_wait(wait_fd);
 }
 
 int lpr_sync_file_native_wait_fd(uint64_t fd)

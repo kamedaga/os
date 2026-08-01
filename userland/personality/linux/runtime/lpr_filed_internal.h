@@ -828,8 +828,10 @@ int64_t lpr_drm_transfer_dup_handle(
     uint64_t handle, int lease_fd, uint64_t *out_handle);
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token);
 int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd);
+void lpr_drm_after_fork_child(void);
 int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_sync_file_create_signaled(void);
+int64_t lpr_sync_file_install_wait(int wait_fd);
 int lpr_sync_file_duplicate_wait(uint64_t fd);
 int lpr_sync_file_native_wait_fd(uint64_t fd);
 uint32_t lpr_sync_file_poll_events(uint64_t fd, uint32_t events);

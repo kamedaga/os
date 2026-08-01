@@ -10,15 +10,31 @@
 static void close_received(
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds,
-    int reply_fd,
-    int keep_fd)
+    const int *keep_fds,
+    size_t keep_count)
 {
     for (uint64_t i = 0; i < request->fd_count; i++) {
         const int fd = (int)(uint32_t)fds[i].fd;
-        if (fd >= 16 && fd != reply_fd && fd != keep_fd) {
+        int keep = 0;
+        for (size_t j = 0; j < keep_count; j++) {
+            if (fd == keep_fds[j]) {
+                keep = 1;
+                break;
+            }
+        }
+        if (fd >= 16 && !keep) {
             (void)pacha_fd_close(fd);
         }
     }
+}
+
+static int valid_channel_fd(int fd, uint64_t required_rights)
+{
+    struct pacha_fd_info info;
+    memset(&info, 0, sizeof(info));
+    return fd >= 16 && pacha_fd_get_info(fd, &info) == 0 &&
+        info.kind == PACHA_FD_KIND_CHANNEL &&
+        (info.rights & required_rights) == required_rights;
 }
 
 static int send_reply(
@@ -83,7 +99,8 @@ int drmd_service_dispatch(
     const int reply_fd = (int)(uint32_t)fds[request->fd_count - 1u].fd;
     const int page_fd = (int)(uint32_t)fds[0].fd;
     if (reply_fd < 16 || page_fd < 16 || page_fd == reply_fd) {
-        close_received(request, fds, reply_fd, -1);
+        const int keep[] = { reply_fd };
+        close_received(request, fds, keep, 1);
         return -22;
     }
     void *page = pacha_mmap(
@@ -93,7 +110,8 @@ int drmd_service_dispatch(
         PACHA_MMAP_SHARED,
         0);
     if (page == NULL) {
-        close_received(request, fds, reply_fd, -1);
+        const int keep[] = { reply_fd };
+        close_received(request, fds, keep, 1);
         return -5;
     }
     pacha_service_envelope_t header;
@@ -106,6 +124,13 @@ int drmd_service_dispatch(
     uint64_t transfer_flags = 0;
     int prime_export_ref = 0;
     int retained_received_fd = -1;
+    drmd_ioctl_attachments_t ioctl_attachments = {
+        .input_wait_fd = -1,
+        .output_notify_fd = -1,
+    };
+    void *ioctl_aux_mapping = NULL;
+    uint64_t ioctl_aux_mapping_size = 0;
+    int ioctl_aux_fd = -1;
     if (request->word0 == PACHA_SERVICE_REQUEST_MAGIC &&
         request->word3 == header.request_id &&
         pacha_service_request_is_valid(&header, DRMD_SERVICE_ID)) {
@@ -115,7 +140,7 @@ int drmd_service_dispatch(
             status = service->drm != NULL && service->drm->ready ? 0 : -19;
             result = status == 0 ? 1 : 0;
             break;
-        case DRMD_OP_OPEN_CARD:
+        case DRMD_OP_OPEN_NODE:
             {
             const int notify_fd = request->fd_count >= 3 ? (int)(uint32_t)fds[1].fd : -1;
             status = header.payload_size >= sizeof(drmd_open_request_t) ?
@@ -145,8 +170,91 @@ int drmd_service_dispatch(
             }
             break;
         case DRMD_OP_HANDLE_IOCTL:
-            status = header.payload_size >= sizeof(drmd_ioctl_request_t) ?
-                drmd_drm_island_ioctl(service->drm, payload) : -22;
+            if (header.payload_size >= sizeof(drmd_ioctl_request_t)) {
+                drmd_ioctl_request_t *ioctl = payload;
+                uint64_t fd_index = 1;
+                int descriptor_status =
+                    ioctl->reserved0 == 0 &&
+                    (ioctl->fd_flags & ~DRMD_IOCTL_FD_MASK) == 0 ? 0 : -22;
+                if (descriptor_status == 0 && ioctl->aux_size != 0) {
+                    const int aux_fd = fd_index + 1u < request->fd_count ?
+                        (int)(uint32_t)fds[fd_index].fd : -1;
+                    ioctl_aux_fd = aux_fd;
+                    fd_index++;
+                    struct pacha_fd_info info;
+                    memset(&info, 0, sizeof(info));
+                    ioctl_aux_mapping_size =
+                        (ioctl->aux_size + 4095u) & ~UINT64_C(4095);
+                    if (ioctl->aux_size <= DRMD_IOCTL_AUX_MAX_BYTES &&
+                        aux_fd >= 16 && aux_fd != page_fd && aux_fd != reply_fd &&
+                        ioctl_aux_mapping_size >= ioctl->aux_size &&
+                        pacha_fd_get_info(aux_fd, &info) == 0 &&
+                        info.kind == PACHA_FD_KIND_VMO &&
+                        info.size >= ioctl_aux_mapping_size &&
+                        (info.rights & (PACHA_FD_RIGHT_CLOSE |
+                            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE)) ==
+                            (PACHA_FD_RIGHT_CLOSE |
+                                PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE)) {
+                        ioctl_aux_mapping = pacha_mmap(
+                            aux_fd,
+                            ioctl_aux_mapping_size,
+                            PACHA_PROT_READ | PACHA_PROT_WRITE,
+                            PACHA_MMAP_SHARED,
+                            0);
+                    }
+                    if (ioctl_aux_mapping == NULL) descriptor_status = -22;
+                }
+                if (descriptor_status == 0 &&
+                    (ioctl->fd_flags & DRMD_IOCTL_FD_INPUT_WAIT) != 0) {
+                    ioctl_attachments.input_wait_fd =
+                        fd_index + 1u < request->fd_count ?
+                            (int)(uint32_t)fds[fd_index].fd : -1;
+                    fd_index++;
+                    if (!valid_channel_fd(
+                            ioctl_attachments.input_wait_fd,
+                            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+                                PACHA_FD_RIGHT_CLOSE)) {
+                        descriptor_status = -22;
+                    }
+                }
+                if (descriptor_status == 0 &&
+                    (ioctl->fd_flags & DRMD_IOCTL_FD_OUTPUT_NOTIFY) != 0) {
+                    ioctl_attachments.output_notify_fd =
+                        fd_index + 1u < request->fd_count ?
+                            (int)(uint32_t)fds[fd_index].fd : -1;
+                    fd_index++;
+                    if (!valid_channel_fd(
+                            ioctl_attachments.output_notify_fd,
+                            PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE)) {
+                        descriptor_status = -22;
+                    }
+                }
+                if (descriptor_status == 0 &&
+                    (fd_index + 1u != request->fd_count ||
+                        (int)(uint32_t)fds[fd_index].fd != reply_fd ||
+                        (((ioctl->fd_flags & DRMD_IOCTL_FD_MASK) ==
+                            DRMD_IOCTL_FD_MASK) &&
+                            ioctl_attachments.input_wait_fd ==
+                                ioctl_attachments.output_notify_fd) ||
+                        ioctl_attachments.input_wait_fd == page_fd ||
+                        ioctl_attachments.output_notify_fd == page_fd ||
+                        ioctl_attachments.input_wait_fd == reply_fd ||
+                        ioctl_attachments.output_notify_fd == reply_fd ||
+                        (ioctl_aux_fd >= 16 &&
+                            (ioctl_aux_fd == ioctl_attachments.input_wait_fd ||
+                                ioctl_aux_fd == ioctl_attachments.output_notify_fd)))) {
+                    descriptor_status = -22;
+                }
+                status = descriptor_status == 0 ?
+                    drmd_drm_island_ioctl(
+                        service->drm,
+                        ioctl,
+                        ioctl_aux_mapping,
+                        ioctl->aux_size,
+                        &ioctl_attachments) : descriptor_status;
+            } else {
+                status = -22;
+            }
             break;
         case DRMD_OP_HANDLE_MMAP:
             status = header.payload_size >= sizeof(drmd_mmap_request_t) ?
@@ -220,13 +328,63 @@ int drmd_service_dispatch(
             break;
         }
     }
+    if (ioctl_aux_mapping != NULL) {
+        (void)pacha_munmap(ioctl_aux_mapping, ioctl_aux_mapping_size);
+        ioctl_aux_mapping = NULL;
+    }
+    int keep_fds[5];
+    size_t keep_count = 0;
+    keep_fds[keep_count++] = reply_fd;
+    if (retained_received_fd >= 16) keep_fds[keep_count++] = retained_received_fd;
+    if ((ioctl_attachments.consumed_fd_flags & DRMD_IOCTL_FD_INPUT_WAIT) != 0) {
+        keep_fds[keep_count++] = ioctl_attachments.input_wait_fd;
+    }
+    if ((ioctl_attachments.consumed_fd_flags & DRMD_IOCTL_FD_OUTPUT_NOTIFY) != 0) {
+        keep_fds[keep_count++] = ioctl_attachments.output_notify_fd;
+    }
+    if (status == DRMD_IOCTL_DEFERRED) {
+        if (service->deferred.active) {
+            status = -16;
+        } else {
+            service->deferred.active = 1;
+            service->deferred.page_fd = page_fd;
+            service->deferred.reply_fd = reply_fd;
+            service->deferred.page = page;
+            service->deferred.header = header;
+            keep_fds[keep_count++] = page_fd;
+            close_received(request, fds, keep_fds, keep_count);
+            return 0;
+        }
+    }
     if (status == 0) drmd_drm_island_notify_readable(service->drm);
-    close_received(request, fds, reply_fd, retained_received_fd);
+    close_received(request, fds, keep_fds, keep_count);
     const int reply_status = send_reply(
         reply_fd, page, &header, status, result, transfer_fd, transfer_rights, transfer_flags);
     if (reply_status != 0 && prime_export_ref) {
         (void)drmd_drm_island_prime_release(service->drm, result);
     }
     (void)pacha_munmap(page, DRMD_PAGE_BYTES);
+    return reply_status;
+}
+
+int drmd_service_progress(drmd_service_t *service)
+{
+    if (service == NULL || !service->deferred.active) return 0;
+    int status = 0;
+    if (!drmd_kms_take_deferred_ioctl_result(&status)) return 0;
+    const int reply_status = send_reply(
+        service->deferred.reply_fd,
+        service->deferred.page,
+        &service->deferred.header,
+        status,
+        0,
+        0,
+        0,
+        0);
+    (void)pacha_munmap(service->deferred.page, DRMD_PAGE_BYTES);
+    (void)pacha_fd_close(service->deferred.page_fd);
+    memset(&service->deferred, 0, sizeof(service->deferred));
+    service->deferred.page_fd = -1;
+    service->deferred.reply_fd = -1;
     return reply_status;
 }

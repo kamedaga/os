@@ -189,8 +189,10 @@ int lpr_fd_transfer_prepare(
     item->rights = pin->effective_rights;
     if (pin->ops_id == LPR_FD_OPS_FILED) {
         const lpr_filed_backend_t *filed = pin->state;
-        if ((filed->reserved1 & LPR_FILED_FD_MEMFD) == 0 ||
-            filed->handle == 0 || filed->handle > UINT32_MAX)
+        /* SCM_RIGHTS transfers an open file description, not a pathname or a
+         * memfd-only object.  filed's transfer lease already preserves that
+         * description for every regular filed handle, including POSIX shm. */
+        if (filed->handle == 0 || filed->handle > UINT32_MAX)
             return -LPR_LINUX_EOPNOTSUPP;
         if (capability_fds == 0 || capability_capacity < 1)
             return -LPR_LINUX_EMSGSIZE;

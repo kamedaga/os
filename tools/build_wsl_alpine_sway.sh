@@ -16,8 +16,25 @@ input_dev_root="${repo_root}/.artifacts/userland-fixtures/alpine-input-dev-root"
 linux_musl="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 out_abs="${repo_root}/${out}"
 dev_out_abs="${repo_root}/${dev_out}"
-wlroots_commit="cda69b696d65a53d5d5e75dfed059a3803e0d700"
-build_tools="${repo_root}/.artifacts/third_party/wlroots-build-tools"
+stock_sway_branch="v3.23"
+stock_sway_version="1.11-r2"
+stock_sway_sha256="1483f7ae56a415a1baca6774c04b73d3406242d687358aad189dac2ff9822a74"
+stock_wlroots_version="0.19.2-r0"
+stock_wlroots_sha256="63449bd77d9c14fe3231004f652c4b1af0e792249f8ca516a64efa4ae9d75aed"
+stock_display_info_version="0.3.0-r0"
+stock_display_info_sha256="a8796066ec54f870927657948264b318b27cdbd0451469a7d9d46c73254d06df"
+stock_liftoff_branch="v3.22"
+stock_liftoff_version="0.5.0-r0"
+stock_liftoff_sha256="454dba3b7e4e109ee89ba4be65a30f742059e4b578c4fb5dcae9d9ccb2252b39"
+
+[[ "${branch}" == "v3.22" ]] || {
+  echo "the stock Sway 1.11 overlay requires an Alpine v3.22 base, got ${branch}" >&2
+  exit 1
+}
+[[ "${arch}" == "x86_64" ]] || {
+  echo "the pinned stock Sway overlay is only verified for x86_64, got ${arch}" >&2
+  exit 1
+}
 
 [[ -d "${clang_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_clang.sh"
 [[ -d "${mesa_root}" && -d "${mesa_dev_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_mesa.sh"
@@ -154,12 +171,87 @@ download() {
   printf '%s\n' "${apk}"
 }
 
+download_pinned() {
+  local apk_branch="$1" section="$2" package="$3" version="$4" expected_sha256="$5"
+  local apk staged actual_sha256
+  apk="${cache}/${apk_branch}-${package}-${version}.apk"
+  if [[ -f "${apk}" ]]; then
+    actual_sha256="$(sha256sum "${apk}" | awk '{print $1}')"
+  else
+    actual_sha256=""
+  fi
+  if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+    staged="${tmp}/${package}-${version}.apk.download"
+    curl -fsSL \
+      "${mirror}/${apk_branch}/${section}/${arch}/${package}-${version}.apk" \
+      -o "${staged}"
+    actual_sha256="$(sha256sum "${staged}" | awk '{print $1}')"
+    if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+      echo "pinned Alpine APK checksum mismatch: ${package}-${version}" >&2
+      echo "expected ${expected_sha256}, got ${actual_sha256}" >&2
+      exit 1
+    fi
+    mv -f "${staged}" "${apk}"
+  fi
+  printf '%s\n' "${apk}"
+}
+
+verify_pinned_apk() {
+  local apk="$1" package="$2" version="$3" pkginfo
+  pkginfo="$(tar --warning=no-unknown-keyword -xOzf "${apk}" .PKGINFO)"
+  grep -Fxq "pkgname = ${package}" <<<"${pkginfo}" || {
+    echo "pinned Alpine APK package mismatch: expected ${package}" >&2
+    exit 1
+  }
+  grep -Fxq "pkgver = ${version}" <<<"${pkginfo}" || {
+    echo "pinned Alpine APK version mismatch: expected ${package}-${version}" >&2
+    exit 1
+  }
+}
+
 runtime="${tmp}/runtime"
 dev="${tmp}/dev"
 mkdir -p "${runtime}" "${dev}"
 for package in "${!wanted[@]}"; do
+  case "${package}" in
+    sway|wlroots)
+      # Traverse their v3.22 dependency metadata, but replace both payloads
+      # below. This keeps the proven v3.22 closure without shipping both
+      # libwlroots-0.18.so and libwlroots-0.19.so.
+      continue
+      ;;
+  esac
   tar --warning=no-unknown-keyword -xzf "$(download "${package}")" -C "${runtime}"
 done
+
+stock_sway_apk="$(download_pinned \
+  "${stock_sway_branch}" community sway "${stock_sway_version}" "${stock_sway_sha256}")"
+stock_wlroots_apk="$(download_pinned \
+  "${stock_sway_branch}" community wlroots "${stock_wlroots_version}" "${stock_wlroots_sha256}")"
+stock_display_info_apk="$(download_pinned \
+  "${stock_sway_branch}" main libdisplay-info "${stock_display_info_version}" "${stock_display_info_sha256}")"
+stock_liftoff_apk="$(download_pinned \
+  "${stock_liftoff_branch}" community libliftoff "${stock_liftoff_version}" "${stock_liftoff_sha256}")"
+
+verify_pinned_apk "${stock_sway_apk}" sway "${stock_sway_version}"
+verify_pinned_apk "${stock_wlroots_apk}" wlroots "${stock_wlroots_version}"
+verify_pinned_apk "${stock_display_info_apk}" libdisplay-info "${stock_display_info_version}"
+verify_pinned_apk "${stock_liftoff_apk}" libliftoff "${stock_liftoff_version}"
+
+# These four unmodified APKs are the complete branch-crossing overlay. All
+# remaining runtime DSOs continue to come from the existing v3.22 roots.
+for apk in \
+  "${stock_display_info_apk}" \
+  "${stock_liftoff_apk}" \
+  "${stock_wlroots_apk}" \
+  "${stock_sway_apk}"; do
+  tar --warning=no-unknown-keyword -xzf "${apk}" -C "${runtime}"
+done
+
+if find "${runtime}" -name 'libwlroots-0.18.so*' -print -quit | grep -q .; then
+  echo "stock Sway overlay unexpectedly contains wlroots 0.18" >&2
+  exit 1
+fi
 for package in \
   wayland-dev wayland-protocols libffi-dev libxkbcommon-dev pixman-dev \
   libdisplay-info-dev hwdata-dev libxcb-dev xcb-util-wm-dev \
@@ -220,65 +312,12 @@ grep -Fxq 'set $mod Alt' "${runtime}/etc/sway/config" || {
 mkdir -p "${runtime}/etc/sway/config.d"
 printf 'xwayland disable\n' >"${runtime}/etc/sway/config.d/pacha.conf"
 
-# Build wlroots itself so the product path contains the generic fence and
-# sealed-memfd changes. Sway remains the unmodified Alpine executable and
-# resolves this ABI-compatible shared object at runtime.
-if [[ ! -x "${build_tools}/bin/meson" || ! -x "${build_tools}/bin/ninja" ]]; then
-  rm -rf "${build_tools}"
-  python3 -m venv "${build_tools}"
-  "${build_tools}/bin/pip" install --disable-pip-version-check \
-    meson==1.8.1 ninja==1.11.1.4
-fi
-tool_path="${build_tools}/bin:${PATH}"
-
-wayland_archive="${cache}/wayland-1.23.1.tar.xz"
-wayland_source="${cache}/wayland-1.23.1"
-wayland_build="${cache}/wayland-host-build"
-[[ -f "${wayland_archive}" ]] || curl -fsSL \
-  'https://gitlab.freedesktop.org/wayland/wayland/-/releases/1.23.1/downloads/wayland-1.23.1.tar.xz' \
-  -o "${wayland_archive}"
-if [[ ! -f "${wayland_source}/meson.build" ]]; then
-  rm -rf "${wayland_source}"
-  mkdir -p "${wayland_source}"
-  tar -xJf "${wayland_archive}" --strip-components=1 -C "${wayland_source}"
-fi
-if [[ ! -x "${wayland_build}/src/wayland-scanner" ]]; then
-  rm -rf "${wayland_build}"
-  PATH="${tool_path}" CC=/usr/bin/clang "${build_tools}/bin/meson" setup \
-    "${wayland_build}" "${wayland_source}" \
-    -Ddocumentation=false -Dtests=false -Ddtd_validation=false \
-    -Dlibraries=false -Dscanner=true
-  "${build_tools}/bin/ninja" -C "${wayland_build}"
-fi
-
-wlroots_git="${cache}/wlroots-git"
-if [[ ! -d "${wlroots_git}/.git" ]]; then
-  rm -rf "${wlroots_git}"
-  git clone --filter=blob:none --no-checkout \
-    https://gitlab.freedesktop.org/wlroots/wlroots.git "${wlroots_git}"
-fi
-if ! git -C "${wlroots_git}" cat-file -e "${wlroots_commit}^{commit}" 2>/dev/null; then
-  git -C "${wlroots_git}" fetch --depth=1 origin "${wlroots_commit}"
-fi
-wlroots_source="${tmp}/wlroots-source"
-mkdir -p "${wlroots_source}"
-git -C "${wlroots_git}" archive "${wlroots_commit}" | tar -x -C "${wlroots_source}"
-GIT_CEILING_DIRECTORIES="${repo_root}/.artifacts" git -C "${wlroots_source}" apply \
-  "${repo_root}/pack/patches/wlroots/0001-use-memfd-for-shm-files.patch" \
-  "${repo_root}/pack/patches/wlroots/0002-explicit-render-fences.patch"
-/usr/bin/grep -Fq 'memfd_create("wlroots-shm"' "${wlroots_source}/util/shm.c" || {
-  echo "wlroots sealed-memfd patch was not applied to the extracted source" >&2
-  exit 1
-}
-/usr/bin/grep -Fq 'wlr_buffer_set_acquire_fence' "${wlroots_source}/render/gles2/pass.c" || {
-  echo "wlroots render-fence patch was not applied to the extracted source" >&2
-  exit 1
-}
-
-cross_root="${tmp}/cross-root"
-python3 - "${cross_root}" \
-  "${clang_root}" "${mesa_root}" "${input_root}" "${runtime}" \
-  "${mesa_dev_root}" "${input_dev_root}" "${dev}" <<'PY'
+# The persisted fixture encodes symlinks as marker files, so materialize a
+# temporary flat library directory before asking the target musl loader to
+# resolve every DT_NEEDED entry and relocation in the stock Sway executable.
+loader_library_root="${tmp}/loader-libraries"
+python3 - "${loader_library_root}" \
+  "${runtime}" "${input_root}" "${mesa_root}" "${clang_root}" <<'PY'
 import os
 import sys
 from pathlib import Path
@@ -288,140 +327,77 @@ roots = [Path(argument).resolve() for argument in sys.argv[2:]]
 marker = b"CAPABILITYOS_ROOTFS_SYMLINK\n"
 destination.mkdir(parents=True)
 
+
+def resolve_payload(path, owner, seen):
+    key = path.absolute()
+    if key in seen:
+        raise SystemExit(f"rootfs symlink loop while resolving {path}")
+    seen.add(key)
+
+    if path.is_symlink():
+        target = os.readlink(path)
+    elif path.is_file():
+        with path.open("rb") as source:
+            payload = source.read(4096)
+        if not payload.startswith(marker):
+            return path
+        target = payload[len(marker):].decode()
+    else:
+        return None
+
+    if target.startswith("/"):
+        candidate = owner / target.lstrip("/")
+    else:
+        candidate = path.parent / target
+    candidate = Path(os.path.normpath(candidate))
+    if candidate.exists() or candidate.is_symlink():
+        return resolve_payload(candidate, owner, seen)
+
+    try:
+        relative = candidate.relative_to(owner)
+    except ValueError:
+        relative = Path(target.lstrip("/"))
+    for root in roots:
+        alternate = root / relative
+        if alternate.exists() or alternate.is_symlink():
+            return resolve_payload(alternate, root, seen)
+    return None
+
+
 for root in roots:
-    for source in sorted(root.rglob("*"), key=lambda path: (len(path.parts), str(path))):
-        relative = source.relative_to(root)
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_symlink():
+    for relative in (Path("lib"), Path("usr/lib")):
+        library_directory = root / relative
+        if not library_directory.is_dir():
+            continue
+        for source in sorted(library_directory.iterdir()):
+            target = destination / source.name
             if target.exists() or target.is_symlink():
-                if target.is_dir() and not target.is_symlink():
-                    continue
-                target.unlink()
-            target.symlink_to(os.readlink(source))
-        elif source.is_dir():
-            if target.is_symlink() or (target.exists() and not target.is_dir()):
-                raise SystemExit(f"cross-root directory collision: {relative}")
-            target.mkdir(exist_ok=True)
-        elif source.is_file():
-            if target.exists() or target.is_symlink():
-                if target.is_dir() and not target.is_symlink():
-                    raise SystemExit(f"cross-root file collision: {relative}")
-                target.unlink()
-            payload = source.read_bytes()
-            if payload.startswith(marker):
-                target.symlink_to(payload[len(marker):].decode())
-            else:
-                target.symlink_to(source)
+                continue
+            payload = resolve_payload(source, root, set())
+            if payload is not None and payload.is_file():
+                target.symlink_to(payload)
 PY
-install -Dm0755 "${linux_musl}" "${cross_root}/lib/ld-musl-x86_64.so.1"
-rm -f "${cross_root}/usr/lib/libudev.so"
-ln -s libudev.so.1 "${cross_root}/usr/lib/libudev.so"
 
-native_pc="${tmp}/native-pc"
-mkdir -p "${native_pc}"
-printf '%s\n' \
-  'Name: Wayland Scanner' \
-  'Description: native Wayland protocol scanner' \
-  'Version: 1.23.1' \
-  "wayland_scanner=${wayland_build}/src/wayland-scanner" \
-  >"${native_pc}/wayland-scanner.pc"
-printf '%s\n' \
-  'Name: hwdata' \
-  'Description: native hardware identification data' \
-  'Version: 0.395' \
-  "pkgdatadir=${cross_root}/usr/share/hwdata" \
-  >"${native_pc}/hwdata.pc"
-
-# Alpine's generic egl.pc lists private X11 dependencies even when consumers
-# dynamically link libEGL and the compositor's X11 backend is disabled. Keep
-# the target package version/paths while exposing only the dependency used by
-# this headless DRM build.
-cross_pc="${tmp}/cross-pc"
-mkdir -p "${cross_pc}"
-printf '%s\n' \
-  'prefix=/usr' \
-  'includedir=${prefix}/include' \
-  'libdir=${prefix}/lib' \
-  'Name: egl' \
-  'Description: Mesa EGL library for the DRM-only wlroots build' \
-  'Version: 25.1.9' \
-  'Requires.private: libdrm >= 2.4.75' \
-  'Libs: -L${libdir} -lEGL' \
-  'Libs.private: -lpthread -pthread -lm' \
-  'Cflags: -I${includedir}' \
-  >"${cross_pc}/egl.pc"
-printf '%s\n' \
-  'prefix=/usr' \
-  'includedir=${prefix}/include' \
-  'libdir=${prefix}/lib' \
-  'have_seatd=true' \
-  'have_logind=false' \
-  'have_builtin=false' \
-  'Name: libseat' \
-  'Description: seatd-only seat management library' \
-  'Version: 0.9.1' \
-  'Libs: -L${libdir} -lseat' \
-  'Libs.private: -lrt' \
-  'Cflags: -I${includedir}' \
-  >"${cross_pc}/libseat.pc"
-printf '%s\n' \
-  'Name: xwayland' \
-  'Description: Xwayland executable contract' \
-  'Version: 24.1.6' \
-  'xwayland=/usr/bin/Xwayland' \
-  'have_listenfd=true' \
-  'have_no_touch_pointer_emulation=true' \
-  'have_force_xrandr_emulation=true' \
-  'have_terminate_delay=true' \
-  >"${cross_pc}/xwayland.pc"
-
-cross_pkg_config="${tmp}/cross-pkg-config"
-printf '%s\n' \
-  '#!/bin/sh' \
-  "export PKG_CONFIG_SYSROOT_DIR='${cross_root}'" \
-  "export PKG_CONFIG_LIBDIR='${cross_pc}:${cross_root}/usr/lib/pkgconfig:${cross_root}/usr/share/pkgconfig'" \
-  'unset PKG_CONFIG_PATH' \
-  'exec /usr/bin/pkg-config "$@"' \
-  >"${cross_pkg_config}"
-chmod 0755 "${cross_pkg_config}"
-
-cross_file="${tmp}/wlroots-cross.ini"
-printf '%s\n' \
-  '[binaries]' \
-  "c = ['/usr/bin/clang', '--target=x86_64-linux-musl', '--sysroot=${cross_root}']" \
-  "ar = '/usr/bin/ar'" \
-  "strip = '/usr/bin/strip'" \
-  "pkg-config = '${cross_pkg_config}'" \
-  '[properties]' \
-  'needs_exe_wrapper = true' \
-  '[host_machine]' \
-  "system = 'linux'" \
-  "cpu_family = 'x86_64'" \
-  "cpu = 'x86_64'" \
-  "endian = 'little'" \
-  >"${cross_file}"
-
-wlroots_build="${tmp}/wlroots-build"
-PKG_CONFIG_PATH="${native_pc}" PKG_CONFIG_PATH_FOR_BUILD="${native_pc}" \
-  PATH="${tool_path}" \
-  "${build_tools}/bin/meson" setup "${wlroots_build}" "${wlroots_source}" \
-  --cross-file "${cross_file}" --prefix=/usr --buildtype=release \
-  -Dauto_features=disabled -Ddefault_library=shared \
-  -Dbackends=drm,libinput,x11 -Drenderers=gles2 -Dallocators=gbm \
-  -Dsession=enabled -Dexamples=false -Dxwayland=enabled \
-  -Dcolor-management=disabled -Dlibliftoff=disabled -Dxcb-errors=disabled
-"${build_tools}/bin/ninja" -C "${wlroots_build}"
-wlroots_install="${tmp}/wlroots-install"
-DESTDIR="${wlroots_install}" "${build_tools}/bin/ninja" -C "${wlroots_build}" install
-install -m 0755 "${wlroots_install}/usr/lib/libwlroots-0.18.so" \
-  "${runtime}/usr/lib/libwlroots-0.18.so"
-/usr/bin/strip --strip-unneeded "${runtime}/usr/lib/libwlroots-0.18.so"
-/usr/bin/readelf -Ws "${runtime}/usr/lib/libwlroots-0.18.so" |
-  /usr/bin/grep -E '[[:space:]]UND[[:space:]]+memfd_create(@|$)' >/dev/null || {
-    echo "built wlroots does not use the sealed-memfd shared-file path" >&2
+loader_report="${tmp}/sway-loader.list"
+if ! "${linux_musl}" \
+  --library-path "${loader_library_root}" \
+  --list "${runtime}/usr/bin/sway" >"${loader_report}" 2>&1; then
+  cat "${loader_report}" >&2
+  echo "stock Sway 1.11 does not resolve against the v3.22 fixture libraries" >&2
+  exit 1
+fi
+for dependency in libwlroots-0.19.so libdisplay-info.so.3 libliftoff.so.0; do
+  grep -Fq "${dependency} => ${loader_library_root}/${dependency}" "${loader_report}" || {
+    cat "${loader_report}" >&2
+    echo "stock Sway loader did not select pinned ${dependency}" >&2
     exit 1
   }
+done
+if grep -Fq 'libwlroots-0.18.so' "${loader_report}"; then
+  cat "${loader_report}" >&2
+  echo "stock Sway loader unexpectedly selected wlroots 0.18" >&2
+  exit 1
+fi
 
 python3 - "${runtime}" "${clang_root}" "${mesa_root}" "${input_root}" <<'PY'
 import os
@@ -465,7 +441,9 @@ for required in \
   usr/bin/foot \
   usr/bin/gtk3-demo \
   'usr/share/fonts/roboto-mono/RobotoMono[wght].ttf' \
-  usr/lib/libwlroots-0.18.so \
+  usr/lib/libwlroots-0.19.so \
+  usr/lib/libdisplay-info.so.3 \
+  usr/lib/libliftoff.so.0 \
   usr/lib/libwayland-client.so.0 \
   usr/lib/libwayland-server.so.0 \
   usr/lib/libxkbcommon.so.0 \
@@ -501,7 +479,10 @@ mv "${out_abs}.tmp" "${out_abs}"
 mv "${dev_out_abs}.tmp" "${dev_out_abs}"
 
 printf 'built Alpine Sway runtime into %s\n' "${out_abs}"
-printf 'runtime packages:'
+printf 'v3.22 base closure (sway/wlroots payloads replaced):'
 printf ' %s' "${!wanted[@]}"
-printf '\ninput-overlay packages: seatd seatd-launch libseat libinput libinput-libs libinput-udev libevdev mtdev libudev-zero\n'
+printf '\nstock overlay packages: sway-%s wlroots-%s libdisplay-info-%s libliftoff-%s\n' \
+  "${stock_sway_version}" "${stock_wlroots_version}" \
+  "${stock_display_info_version}" "${stock_liftoff_version}"
+printf 'input-overlay packages: seatd seatd-launch libseat libinput libinput-libs libinput-udev libevdev mtdev libudev-zero\n'
 du -sh "${out_abs}" "${dev_out_abs}"
