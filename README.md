@@ -107,3 +107,4 @@ nix develop
 
 PachaOS source code is licensed under the **MIT License**.  
 Third-party runtime components are documented in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
