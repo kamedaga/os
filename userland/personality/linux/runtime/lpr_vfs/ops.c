@@ -14,10 +14,17 @@ uint64_t lpr_open_rights(uint64_t flags)
         rights |= FILED_RIGHT_WRITE;
     }
     if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
-        rights |= FILED_RIGHT_LOOKUP | FILED_RIGHT_GETDENTS;
-        if (accmode == LPR_LINUX_O_WRONLY || accmode == LPR_LINUX_O_RDWR) {
-            rights |= FILED_RIGHT_CREATE | FILED_RIGHT_REMOVE | FILED_RIGHT_RENAME;
-        }
+        /*
+         * A Linux directory fd opened O_RDONLY may still be used as the
+         * dirfd for mutating *at operations.  O_ACCMODE describes access to
+         * the directory object itself; it does not make openat(O_CREAT),
+         * unlinkat(), or renameat() through that fd read-only.
+         */
+        rights |= FILED_RIGHT_LOOKUP |
+            FILED_RIGHT_GETDENTS |
+            FILED_RIGHT_CREATE |
+            FILED_RIGHT_REMOVE |
+            FILED_RIGHT_RENAME;
     }
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
         rights |= FILED_RIGHT_CREATE | FILED_RIGHT_WRITE;
@@ -546,7 +553,6 @@ int64_t lpr_filed_open_handle_at(
     uint64_t *out_handle,
     uint64_t *out_kind)
 {
-    (void)mode;
     if (out_handle == 0) {
         return -LPR_LINUX_EFAULT;
     }
@@ -578,6 +584,7 @@ int64_t lpr_filed_open_handle_at(
     open_req->dir_handle = dir_handle;
     open_req->rights = lpr_open_rights(flags);
     open_req->open_flags = lpr_open_flags(flags);
+    open_req->create_mode = FILED_CREATE_MODE_VALID | (mode & 07777ull);
     status = lpr_copy_path(open_req->name, sizeof(open_req->name), path);
     uint64_t handle = 0;
     if (status == 0) {

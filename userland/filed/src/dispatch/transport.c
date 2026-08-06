@@ -1,4 +1,205 @@
 #include "common.h"
+#include "kobox/device_pachaos_capsule.h"
+#include "linux_personality/linux_block.h"
+#include "linux_subsystem/dma/dma.h"
+#include "linux_subsystem/fs/fs.h"
+
+static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
+{
+    filed_dump_dispatch_metrics(runtime);
+    filed_dump_cache_metrics(runtime);
+    filed_exec_linux_lpr_dump_metrics();
+    filed_kobox_backend_dump_metrics(&runtime->backend);
+    filed_file_vmo_storage_profile_dump();
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    kb_fs_read_profile_t fs_profile;
+    kb_linux_block_profile_t block_profile;
+    kb_pachaos_capsule_dma_profile_t dma_profile;
+    kb_pachaos_capsule_irq_profile_t irq_profile;
+    kb_subsystem_dma_window_profile_t dma_window_profile;
+    kb_fs_read_profile_snapshot(&fs_profile);
+    kb_linux_block_profile_snapshot(&block_profile);
+    kb_pachaos_capsule_dma_profile_snapshot(&dma_profile);
+    kb_pachaos_capsule_irq_profile_snapshot(&irq_profile);
+    kb_subsystem_dma_window_profile_snapshot(&dma_window_profile);
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=fs calls=%llu bytes=%llu total_cycles=%llu "
+        "extent_calls=%llu extent_cycles=%llu device_calls=%llu device_cycles=%llu "
+        "overlay_calls=%llu overlay_cycles=%llu partial_copy_calls=%llu partial_copy_cycles=%llu\n",
+        (unsigned long long)fs_profile.calls,
+        (unsigned long long)fs_profile.bytes,
+        (unsigned long long)fs_profile.total_cycles,
+        (unsigned long long)fs_profile.extent_lookup_calls,
+        (unsigned long long)fs_profile.extent_lookup_cycles,
+        (unsigned long long)fs_profile.device_read_calls,
+        (unsigned long long)fs_profile.device_read_cycles,
+        (unsigned long long)fs_profile.overlay_calls,
+        (unsigned long long)fs_profile.overlay_cycles,
+        (unsigned long long)fs_profile.partial_copy_calls,
+        (unsigned long long)fs_profile.partial_copy_cycles);
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=block bytes=%llu "
+        "alloc_calls=%llu alloc_cycles=%llu map_calls=%llu map_cycles=%llu "
+        "before_calls=%llu before_cycles=%llu submit_calls=%llu submit_cycles=%llu "
+        "wait_calls=%llu wait_cycles=%llu unmap_calls=%llu unmap_cycles=%llu "
+        "free_calls=%llu free_cycles=%llu total_calls=%llu total_cycles=%llu "
+        "cq_poll_calls=%llu cq_poll_cycles=%llu irq_wait_calls=%llu irq_wait_cycles=%llu "
+        "poll_yield_calls=%llu poll_yield_cycles=%llu "
+        "post_irq_calls=%llu post_irq_cycles=%llu "
+        "prp_alloc_calls=%llu prp_alloc_cycles=%llu "
+        "data_map_calls=%llu data_map_cycles=%llu "
+        "prp_build_calls=%llu prp_build_cycles=%llu "
+        "prp_aux_map_calls=%llu prp_aux_map_cycles=%llu "
+        "prp_cache_hit_calls=%llu prp_cache_hit_cycles=%llu "
+        "prp_cache_miss_calls=%llu prp_cache_miss_cycles=%llu "
+        "prp_cache_fallback_calls=%llu prp_cache_fallback_cycles=%llu\n",
+        (unsigned long long)block_profile.disk_read_bytes,
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_REQUEST_ALLOC],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_REQUEST_ALLOC],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_DMA_MAP],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_DMA_MAP],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_BEFORE_EXECUTE],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_BEFORE_EXECUTE],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_QUEUE_SUBMIT],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_QUEUE_SUBMIT],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_COMPLETION_WAIT],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_COMPLETION_WAIT],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_DMA_UNMAP_COPYBACK],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_DMA_UNMAP_COPYBACK],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_REQUEST_FREE_TOTAL],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_REQUEST_FREE_TOTAL],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_DISK_IO_TOTAL],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_DISK_IO_TOTAL],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_CQ_POLL],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_CQ_POLL],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_IRQ_WAIT],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_IRQ_WAIT],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_POLL_YIELD],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_POLL_YIELD],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_POST_IRQ_DRAIN],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_POST_IRQ_DRAIN],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_ALLOC_INIT],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_ALLOC_INIT],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_DATA_MAP_PAGES],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_DATA_MAP_PAGES],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_BUILD],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_BUILD],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_AUX_MAP],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_AUX_MAP],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_HIT],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_HIT],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_MISS],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_MISS],
+        (unsigned long long)block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_FALLBACK],
+        (unsigned long long)block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_FALLBACK]);
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=dma_copy calls=%llu bytes=%llu cycles=%llu\n",
+        (unsigned long long)dma_profile.copy_back_calls,
+        (unsigned long long)dma_profile.copy_back_bytes,
+        (unsigned long long)dma_profile.copy_back_cycles);
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=irq wait_calls=%llu wait_cycles=%llu "
+        "fd_wait_calls=%llu fd_wait_cycles=%llu fd_wait_ready=%llu "
+        "poll_calls=%llu poll_cycles=%llu poll_ready=%llu "
+        "pre_poll_calls=%llu pre_poll_cycles=%llu pre_poll_ready=%llu "
+        "post_poll_calls=%llu post_poll_cycles=%llu post_poll_ready=%llu "
+        "handler_calls=%llu handler_cycles=%llu\n",
+        (unsigned long long)irq_profile.wait_calls,
+        (unsigned long long)irq_profile.wait_cycles,
+        (unsigned long long)irq_profile.fd_wait_calls,
+        (unsigned long long)irq_profile.fd_wait_cycles,
+        (unsigned long long)irq_profile.fd_wait_ready,
+        (unsigned long long)irq_profile.poll_calls,
+        (unsigned long long)irq_profile.poll_cycles,
+        (unsigned long long)irq_profile.poll_ready,
+        (unsigned long long)irq_profile.pre_poll_calls,
+        (unsigned long long)irq_profile.pre_poll_cycles,
+        (unsigned long long)irq_profile.pre_poll_ready,
+        (unsigned long long)irq_profile.post_poll_calls,
+        (unsigned long long)irq_profile.post_poll_cycles,
+        (unsigned long long)irq_profile.post_poll_ready,
+        (unsigned long long)irq_profile.handler_calls,
+        (unsigned long long)irq_profile.handler_cycles);
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=dma_window begin_calls=%llu mapping_calls=%llu "
+        "mapping_cycles=%llu reuse_calls=%llu reuse_cycles=%llu "
+        "end_calls=%llu mapped_bytes=%llu direct_mapping_calls=%llu "
+        "direct_mapping_cycles=%llu direct_mapped_bytes=%llu staged_read_calls=%llu "
+        "staged_bytes=%llu staging_copy_cycles=%llu\n",
+        (unsigned long long)dma_window_profile.begin_calls,
+        (unsigned long long)dma_window_profile.mapping_calls,
+        (unsigned long long)dma_window_profile.mapping_cycles,
+        (unsigned long long)dma_window_profile.reuse_calls,
+        (unsigned long long)dma_window_profile.reuse_cycles,
+        (unsigned long long)dma_window_profile.end_calls,
+        (unsigned long long)dma_window_profile.mapped_bytes,
+        (unsigned long long)dma_window_profile.direct_mapping_calls,
+        (unsigned long long)dma_window_profile.direct_mapping_cycles,
+        (unsigned long long)dma_window_profile.direct_mapped_bytes,
+        (unsigned long long)dma_window_profile.staged_read_calls,
+        (unsigned long long)dma_window_profile.staged_bytes,
+        (unsigned long long)dma_window_profile.staging_copy_cycles);
+#endif
+#if defined(FILED_STARTUP_PROFILE) && FILED_STARTUP_PROFILE
+    const uint64_t stage_cycles_a =
+        pacha_trace_name_id("filed.file_vmo.stage.cycles.a");
+    const uint64_t stage_cycles_b =
+        pacha_trace_name_id("filed.file_vmo.stage.cycles.b");
+    const uint64_t stage_cycles_c =
+        pacha_trace_name_id("filed.file_vmo.stage.cycles.c");
+    const uint64_t stage_counts_a =
+        pacha_trace_name_id("filed.file_vmo.stage.counts.a");
+    const uint64_t stage_counts_b =
+        pacha_trace_name_id("filed.file_vmo.stage.counts.b");
+    const uint64_t stage_counts_c =
+        pacha_trace_name_id("filed.file_vmo.stage.counts.c");
+    pacha_trace4(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA, PACHA_TRACE_CLASS_METRIC,
+        stage_cycles_a,
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_PREPARE],
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_LOOKUP],
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_CREATE_TOTAL]);
+    pacha_trace4(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA, PACHA_TRACE_CLASS_METRIC,
+        stage_cycles_b,
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_VMO_CREATE],
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP],
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_PREAD]);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA, PACHA_TRACE_CLASS_METRIC,
+        stage_cycles_c,
+        filed_file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_REPLY]);
+    pacha_trace4(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA, PACHA_TRACE_CLASS_METRIC,
+        stage_counts_a,
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_PREPARE],
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_LOOKUP],
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_CREATE_TOTAL]);
+    pacha_trace4(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA, PACHA_TRACE_CLASS_METRIC,
+        stage_counts_b,
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_VMO_CREATE],
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP],
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_PREAD]);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA, PACHA_TRACE_CLASS_METRIC,
+        stage_counts_c,
+        filed_file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_REPLY]);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO,
+        PACHA_TRACE_CLASS_METRIC, 1, filed_file_vmo_cache_hits);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO,
+        PACHA_TRACE_CLASS_METRIC, 2, filed_file_vmo_cache_misses);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO,
+        PACHA_TRACE_CLASS_METRIC, 3, filed_file_vmo_cache_stores);
+    pacha_trace2(PACHA_TRACE_COMPONENT_FILED,
+        PACHA_TRACE_EVENT_FILED_METRIC_FILE_VMO,
+        PACHA_TRACE_CLASS_METRIC, 4, filed_file_vmo_cache_evictions);
+    pacha_trace_dump_ring();
+#endif
+}
 
 int filed_dispatch_runtime_init(filed_runtime_t *runtime)
 {
@@ -7,10 +208,18 @@ int filed_dispatch_runtime_init(filed_runtime_t *runtime)
     }
     if (runtime->dispatch_state != NULL) {
         memset(runtime->dispatch_state, 0, sizeof(*runtime->dispatch_state));
-        return 0;
+    } else {
+        runtime->dispatch_state = calloc(1, sizeof(*runtime->dispatch_state));
+        if (runtime->dispatch_state == NULL) {
+            return -12;
+        }
     }
-    runtime->dispatch_state = calloc(1, sizeof(*runtime->dispatch_state));
-    return runtime->dispatch_state == NULL ? -12 : 0;
+#if defined(FILED_STARTUP_PROFILE) && FILED_STARTUP_PROFILE
+    pacha_trace_set_masks(
+        PACHA_TRACE_COMPONENT_BIT(PACHA_TRACE_COMPONENT_FILED),
+        PACHA_TRACE_CLASS_ERROR | PACHA_TRACE_CLASS_METRIC);
+#endif
+    return 0;
 }
 
 static filed_page_dispatch_result_t filed_dispatch_session_page(
@@ -21,6 +230,9 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
     switch (request->word1) {
     case FILED_OP_DIAG_PING:
         return filed_page_result(0, request->word2);
+    case FILED_OP_DIAG_DUMP_METRICS:
+        filed_dispatch_dump_metrics(runtime);
+        return filed_page_result(0, 0);
     case FILED_OP_VFS_OPENAT:
         return filed_dispatch_openat_page(runtime, page);
     case FILED_OP_VFS_VALIDATE_OPEN_CACHE:
@@ -469,12 +681,13 @@ static filed_route_result_t filed_dispatch_client_vfs(
             openat.dir_handle = path->dir_handle;
             openat.rights = path->rights;
             openat.open_flags = path->flags;
+            openat.create_mode = path->create_mode_or_result_kind;
             memcpy(openat.name, path->path, sizeof(openat.name));
             const filed_page_dispatch_result_t open_result =
                 filed_dispatch_openat_page(runtime, &openat);
             route.status = open_result.status;
             route.result = open_result.result;
-            path->result_kind = openat.opened_kind;
+            path->create_mode_or_result_kind = openat.opened_kind;
         }
         break;
     case FILED_OP_VFS_CLOSE:
@@ -969,10 +1182,7 @@ static int filed_dispatch_client(
         }
         break;
     case FILED_OP_DIAG_DUMP_METRICS:
-        filed_dump_dispatch_metrics(runtime);
-        filed_dump_cache_metrics(runtime);
-        filed_exec_linux_lpr_dump_metrics();
-        filed_kobox_backend_dump_metrics(&runtime->backend);
+        filed_dispatch_dump_metrics(runtime);
         break;
     case FILED_OP_DIAG_SET_CACHE_SLOTS: {
         const filed_diag_request_t *diag =

@@ -338,7 +338,19 @@ pub fn threadFromPayload(payload: *const KernelObjectPayload) ?ThreadObject {
 
 pub fn processObjectForFd(self: anytype, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?ProcessObject {
     const view = self.fdPayloadWithRightsConst(owner, fd, required_rights) orelse return null;
-    return @TypeOf(self.*).processFromPayload(view.payload);
+    const process = @TypeOf(self.*).processFromPayload(view.payload) orelse return null;
+    // A terminal object remains waitable after its descriptor is retired.
+    // An active object, however, must never retarget a later process that
+    // reused the same principal index.
+    if (!process.state.isTerminal() and !self.processObjectTargetsCurrentGeneration(process)) return null;
+    return process;
+}
+
+pub fn processObjectTargetsCurrentGeneration(self: anytype, process: ProcessObject) bool {
+    const principal: PrincipalId = @enumFromInt(process.principal_raw);
+    const index = processIndexFromPrincipal(principal) orelse return false;
+    const desc = self.processDescriptorSlotConst(index) orelse return false;
+    return desc.active and process.generation != 0 and process.generation == desc.generation;
 }
 
 pub fn threadObjectForFd(self: anytype, owner: PrincipalId, fd: Fd, required_rights: FdRights) ?ThreadObject {
@@ -349,12 +361,17 @@ pub fn threadObjectForFd(self: anytype, owner: PrincipalId, fd: Fd, required_rig
 pub fn createProcessFd(
     self: anytype,
     owner: PrincipalId,
-    process: ProcessObject,
+    process_input: ProcessObject,
     rights: FdRights,
     flags: FdFlags,
     min_fd: Fd,
 ) KernelError!Fd {
-    if (processIndexFromPrincipal(@enumFromInt(process.principal_raw)) == null) return KernelError.InvalidState;
+    var process = process_input;
+    const principal: PrincipalId = @enumFromInt(process.principal_raw);
+    const index = processIndexFromPrincipal(principal) orelse return KernelError.InvalidState;
+    const desc = self.processDescriptorSlotConst(index) orelse return KernelError.InvalidState;
+    if (!desc.active or desc.generation == 0) return KernelError.InvalidState;
+    process.generation = desc.generation;
     const object_ref = try self.createKernelObject(.process, .{ .process = process });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
@@ -389,6 +406,7 @@ pub fn setProcessObjectStateForFd(
 ) KernelError!ProcessObject {
     const view = self.fdPayloadWithRights(owner, fd, required_rights) orelse return KernelError.InvalidState;
     var process = @TypeOf(self.*).processFromPayload(view.payload) orelse return KernelError.InvalidState;
+    if (!self.processObjectTargetsCurrentGeneration(process)) return KernelError.InvalidState;
     process.state = state;
     process.exit_code = exit_code;
     view.payload.* = .{ .process = process };
@@ -414,11 +432,14 @@ pub fn setThreadObjectStateForFd(
 pub fn markProcessObjectsExited(self: anytype, principal: PrincipalId, state: TaskObjectState, exit_code: u32) void {
     var i: usize = 0;
     const principal_raw: PrincipalRaw = @intFromEnum(principal);
+    const index = processIndexFromPrincipal(principal) orelse return;
+    const generation = (self.processDescriptorSlotConst(index) orelse return).generation;
+    if (generation == 0) return;
     while (i < self.fd_objects.len) : (i += 1) {
         const slot = &self.fd_objects[i];
         if (slot.kind != .process) continue;
         var process = @TypeOf(self.*).processFromPayload(&slot.payload) orelse continue;
-        if (process.principal_raw != principal_raw) continue;
+        if (process.principal_raw != principal_raw or process.generation != generation) continue;
         if (!state.isTerminal() and process.state.isTerminal()) continue;
         process.state = state;
         process.exit_code = exit_code;
@@ -502,16 +523,32 @@ pub fn clearPrincipalTablesForReuse(self: anytype, index: usize) void {
     self.resetProcessRuntimeTables(index);
 }
 
-pub fn createProcessDescriptor(self: anytype, label: []const u8) ?PrincipalId {
+fn nextProcessGeneration(generation: u32) u32 {
+    const next = generation +% 1;
+    return if (next == 0) 1 else next;
+}
+
+pub fn createProcessDescriptorBelowChecked(
+    self: anytype,
+    label: []const u8,
+    limit: usize,
+    reusable: ?*const fn (PrincipalId) bool,
+) ?PrincipalId {
     var i: usize = 0;
-    while (i < self.process_capacity) : (i += 1) {
+    const capped_limit = @min(limit, self.process_capacity);
+    while (i < capped_limit) : (i += 1) {
         const desc = self.processDescriptorSlot(i) orelse continue;
         if (desc.active) continue;
         const principal = @TypeOf(self.*).processPrincipal(i);
+        if (reusable) |is_reusable| {
+            if (!is_reusable(principal)) continue;
+        }
+        const generation = nextProcessGeneration(desc.generation);
         self.clearPrincipalTablesForReuse(i);
         desc.* = .{
             .active = true,
             .principal = principal,
+            .generation = generation,
             .label = label,
         };
         self.active_process_count += 1;
@@ -521,10 +558,47 @@ pub fn createProcessDescriptor(self: anytype, label: []const u8) ?PrincipalId {
     return null;
 }
 
+pub fn createProcessDescriptorBelow(self: anytype, label: []const u8, limit: usize) ?PrincipalId {
+    return createProcessDescriptorBelowChecked(self, label, limit, null);
+}
+
+pub fn createProcessDescriptor(self: anytype, label: []const u8) ?PrincipalId {
+    return createProcessDescriptorBelow(self, label, self.process_capacity);
+}
+
 pub fn createProcessDescriptorWithCapacity(self: anytype, label: []const u8, free_list: *FreePageList) ?PrincipalId {
     if (self.createProcessDescriptor(label)) |principal| return principal;
     if (!self.ensureProcessCapacity(self.process_capacity + 1, free_list)) return null;
     return self.createProcessDescriptor(label);
+}
+
+pub fn createProcessDescriptorWithCapacityLimit(
+    self: anytype,
+    label: []const u8,
+    free_list: *FreePageList,
+    limit: usize,
+) ?PrincipalId {
+    if (limit == 0) return null;
+    if (createProcessDescriptorBelow(self, label, limit)) |principal| return principal;
+    if (self.process_capacity >= limit) return null;
+    const required = @min(self.process_capacity + 1, limit);
+    if (!self.ensureProcessCapacity(required, free_list)) return null;
+    return createProcessDescriptorBelow(self, label, limit);
+}
+
+pub fn createProcessDescriptorWithCapacityLimitChecked(
+    self: anytype,
+    label: []const u8,
+    free_list: *FreePageList,
+    limit: usize,
+    reusable: *const fn (PrincipalId) bool,
+) ?PrincipalId {
+    if (limit == 0) return null;
+    if (createProcessDescriptorBelowChecked(self, label, limit, reusable)) |principal| return principal;
+    if (self.process_capacity >= limit) return null;
+    const required = @min(self.process_capacity + 1, limit);
+    if (!self.ensureProcessCapacity(required, free_list)) return null;
+    return createProcessDescriptorBelowChecked(self, label, limit, reusable);
 }
 
 pub fn ensureProcessDescriptor(self: anytype, principal: PrincipalId, label: []const u8) bool {
@@ -534,10 +608,12 @@ pub fn ensureProcessDescriptor(self: anytype, principal: PrincipalId, label: []c
         desc.label = label;
         return true;
     }
+    const generation = nextProcessGeneration(desc.generation);
     self.clearPrincipalTablesForReuse(index);
     desc.* = .{
         .active = true,
         .principal = principal,
+        .generation = generation,
         .label = label,
     };
     self.active_process_count += 1;
@@ -585,7 +661,8 @@ pub fn removeProcessDescriptor(self: anytype, principal: PrincipalId) bool {
     const desc = self.processDescriptorSlot(index) orelse return false;
     if (!desc.active) return false;
     self.releaseFdTableForProcessIndex(index);
-    desc.* = .{};
+    const generation = desc.generation;
+    desc.* = .{ .generation = generation };
     if (self.active_process_count > 0) self.active_process_count -= 1;
     if (self.debug_process_lifecycle_hook) |hook| hook(self, principal, .remove);
     return true;
@@ -617,6 +694,7 @@ pub fn initPrincipalState(self: anytype) void {
         (self.processDescriptorSlot(i) orelse unreachable).* = .{
             .active = true,
             .principal = principal,
+            .generation = 1,
             .label = principalLabel(principal),
         };
         self.active_process_count += 1;

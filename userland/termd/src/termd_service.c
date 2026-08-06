@@ -156,6 +156,7 @@ static int termd_send_tty_signal_to_supervisor(termd_service_t *service, uint32_
         return TERMD_ERR_INVAL;
     }
     const uint64_t rights =
+        PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;

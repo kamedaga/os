@@ -359,11 +359,14 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     body->ucontext.uc_sigmask[0] = return_mask;
     lpr_signal_context_to_linux(&body->native, &body->ucontext);
 
-    uint64_t restorer = action->restorer;
-    if (restorer == 0) {
-        restorer = (uint64_t)(uintptr_t)lpr_async_signal_restorer;
-    }
-    *(uint64_t *)(uintptr_t)return_slot_va = restorer;
+    /* Linux libc restorers execute rt_sigreturn with a raw SYSCALL.  LPR
+     * cannot delegate to that instruction: executable patching is not
+     * guaranteed to discover standalone restorer stubs, and a missed stub
+     * would enter the native Pacha syscall table.  Keep the application
+     * restorer in the emulated sigaction record, but always return through
+     * the LPR restorer that translates the Linux frame to the native one. */
+    *(uint64_t *)(uintptr_t)return_slot_va =
+        (uint64_t)(uintptr_t)lpr_async_signal_restorer;
 
     lpr_linux_signal_mask |= action->mask;
     if ((action->flags & LPR_LINUX_SA_NODEFER) == 0) {

@@ -14,7 +14,7 @@ static volatile sig_atomic_t handled;
 static volatile sig_atomic_t altstack_ok;
 static volatile sig_atomic_t sse_stack_ok;
 static volatile sig_atomic_t avx_handled;
-static unsigned char alternate_stack[SIGSTKSZ * 2];
+static unsigned char alternate_stack[64 * 1024];
 static int terminate_event_fd = -1;
 
 typedef float aligned_vec4_t __attribute__((vector_size(16)));
@@ -354,7 +354,10 @@ static int run_signaled_child(const char *mode, int signal, int expect_signal)
         return 21;
     }
     int status = 0;
-    const pid_t waited = waitpid(pid, &status, 0);
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
     if (waited != pid) {
         const int saved_errno = errno;
         (void)dprintf(STDOUT_FILENO,

@@ -850,7 +850,7 @@ static int lprs_kill(void *page)
     int first_error = 0;
     for (uint64_t i = 0; i < g_process_count; ++i) {
         lprs_process_t *proc = &g_processes[i];
-        if (!proc->active || proc->process_fd < 16) {
+        if (!proc->active || proc->exit_ready || proc->process_fd < 16) {
             continue;
         }
         int match = 0;
@@ -890,7 +890,9 @@ static int lprs_deliver_tty_signal_fields(uint64_t pgrp, uint64_t signo, uint64_
     int first_error = 0;
     for (uint64_t i = 0; i < g_process_count; ++i) {
         lprs_process_t *proc = &g_processes[i];
-        if (!proc->active || proc->process_fd < 16 || proc->pgrp != (uint64_t)pgrp) {
+        if (!proc->active || proc->exit_ready || proc->process_fd < 16 ||
+            proc->pgrp != (uint64_t)pgrp)
+        {
             continue;
         }
         const int status = lprs_signal_process_fd(proc->process_fd, signo);

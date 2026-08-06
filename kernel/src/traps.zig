@@ -575,7 +575,22 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
         // through the normal user CR3 reload and retry instead of treating
         // that resolved race as a fatal user fault.
         const not_present_fault = (ec & 1) == 0;
-        return if (not_present_fault) 1 else 0;
+        // A recycled principal uses the same PCID and page-table storage.  A
+        // CPU can therefore report a protection fault from an older cached
+        // translation even though the locked current PTE permits the access.
+        // The normal return path reloads CR3 (without no-flush), so retry only
+        // when the present PTE proves that this exact access is legal.  Never
+        // retry reserved-bit, protection-key, or shadow-stack violations.
+        const exceptional_protection = (ec & ((1 << 3) | (1 << 5) | (1 << 6))) != 0;
+        const stale_permitted_translation = !not_present_fault and
+            !exceptional_protection and
+            user_vm.userMappingAllowsAccessWithAddressSpaceLocked(
+                principal,
+                fault_page_va,
+                write_access,
+                instruction_fetch,
+            );
+        return if (not_present_fault or stale_permitted_translation) 1 else 0;
     }
     const fault_mapping = user_copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         kernel_runtime.kernel_state_global,
@@ -807,6 +822,12 @@ pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winap
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
     schedulerMaintenanceIpiDispatch(frame);
+    // A lifecycle IPI can interrupt a target while it is executing a syscall
+    // and holding kernel locks.  Saving that ring-0 trap frame as a stopped
+    // user context would abandon the syscall before its deferred unlocks run.
+    // Let kernel work return normally; the lifecycle owner will send another
+    // IPI and quiesce the thread once it reaches a ring-3 boundary.
+    if ((frame.cs & 3) != 3) return;
     if (!scheduler.quiesceStoppedCurrentUserThread(frame)) return;
     if (!scheduler.isBootstrapSchedulerCpu()) {
         smp.returnCurrentApToIdleFromInterrupt();

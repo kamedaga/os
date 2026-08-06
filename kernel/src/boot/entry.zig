@@ -202,6 +202,9 @@ fn installInterruptTrampolines() void {
 }
 
 fn initKernelRuntimeOrHalt() void {
+    if (!x86_platform.enableNxForCurrentCpu()) {
+        halt.haltWithMessage("NX unavailable");
+    }
     initXStateSupport();
     if (!boot_static.debug_skip_cr3_switch) {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
@@ -273,6 +276,7 @@ fn initMemoryModules() void {
         .page_rw = boot_static.page_rw,
         .page_user = boot_static.page_user,
         .page_ps = boot_static.page_ps,
+        .page_nx = boot_static.page_nx,
         .flush_user_tlb_for_principal_va = user_copy.flushUserTlbForPrincipalVa,
         .flush_user_tlb_for_principal_range = user_copy.flushUserTlbForPrincipalRange,
         .kernel_pointer_paddr = x86_platform.kernelPointerPaddr,
@@ -412,6 +416,8 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
 
+    _ = scheduler.stopPrincipalThreads(principal);
+    scheduler.waitForRemotePrincipalQuiescence(principal);
     _ = scheduler.releasePrincipalThreads(principal);
 
     if (!user_vm.lockVmTransaction(principal)) return;
@@ -453,6 +459,8 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
 
+    _ = scheduler.stopPrincipalThreads(principal);
+    scheduler.waitForRemotePrincipalQuiescence(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
@@ -531,44 +539,14 @@ pub export fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault
 
 fn exitCurrentProcess(
     principal: kernel.PrincipalId,
-    exit_code: u8,
     out_frame: *TrapFrame,
     before_ap_idle: ?scheduler.BeforeCurrentThreadLeaveCallback,
-    exit_handoff_target: ?kernel.ThreadWakeTarget,
+    after_teardown: ?scheduler.BeforeCurrentThreadLeaveCallback,
 ) void {
     const exit_cpu = if (enable_exit_teardown_metrics) scheduler.currentCpu() else 0;
     const bootstrap_cpu = scheduler.isBootstrapSchedulerCpu();
-    const handoff_prepared = if (exit_handoff_target) |target|
-        scheduler.prepareExitHandoffToReadyThreadGeneration(target.thread_index, target.thread_generation)
-    else
-        false;
-    kernel_runtime.kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .exited, exit_code);
-    kernel_runtime.kernel_state_global.markProcessObjectsExited(principal, .exited, exit_code);
     teardownExitedProcess(principal);
-    var handoff_loaded = false;
-    if (handoff_prepared) {
-        if (exit_handoff_target) |target| {
-            if (before_ap_idle) |callback| callback.run(callback.context);
-            handoff_loaded = scheduler.loadExitHandoffThread(out_frame, target.thread_index, target.thread_generation);
-            if (handoff_loaded) {
-                if (enable_exit_teardown_metrics) {
-                    kernel_log.writeFmt(
-                        "[kernel] metric scope=process_exit_handoff principal={} cpu={} has_target={} prepared={} loaded={} bootstrap={}\n",
-                        .{
-                            @intFromEnum(principal),
-                            exit_cpu,
-                            @as(u8, 1),
-                            @as(u8, 1),
-                            @as(u8, 1),
-                            if (bootstrap_cpu) @as(u8, 1) else @as(u8, 0),
-                        },
-                    );
-                }
-                return;
-            }
-            halt.haltWithMessage("exit handoff load failed");
-        }
-    }
+    if (after_teardown) |callback| callback.run(callback.context);
     if (!bootstrap_cpu) {
         if (enable_exit_teardown_metrics) {
             kernel_log.writeFmt(
@@ -576,8 +554,8 @@ fn exitCurrentProcess(
                 .{
                     @intFromEnum(principal),
                     exit_cpu,
-                    if (exit_handoff_target == null) @as(u8, 0) else @as(u8, 1),
-                    if (handoff_prepared) @as(u8, 1) else @as(u8, 0),
+                    @as(u8, 0),
+                    @as(u8, 0),
                     @as(u8, 0),
                     @as(u8, 0),
                 },
@@ -592,9 +570,9 @@ fn exitCurrentProcess(
             .{
                 @intFromEnum(principal),
                 exit_cpu,
-                if (exit_handoff_target == null) @as(u8, 0) else @as(u8, 1),
-                if (handoff_prepared) @as(u8, 1) else @as(u8, 0),
-                if (handoff_loaded) @as(u8, 1) else @as(u8, 0),
+                @as(u8, 0),
+                @as(u8, 0),
+                @as(u8, 0),
                 @as(u8, 1),
             },
         );
@@ -807,6 +785,10 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     }
 
     kernel_runtime.kernel_state_ready = true;
+    // Boot threads are already visible to the verified runqueues at this
+    // point.  APs must not claim one until its ELF, stack, kernel state, and
+    // initial BSP activation are all complete.
+    scheduler.enableApUserDispatch();
 }
 
 // ---------------------------------------------------------------------------

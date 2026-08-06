@@ -7,11 +7,8 @@
 #define INPUTD_BOOT_READY_MAGIC UINT64_C(0x3159445254504e49)
 
 enum {
-    INPUTD_BOOT_CONFIG_VERSION = 1,
-    INPUTD_BOOT_CONFIG_VA = 0x3c1a0000ull,
+    INPUTD_BOOT_CONFIG_VERSION = 2,
     INPUTD_BOOT_CONFIG_MAX_BYTES = 4096,
-    INPUTD_MODULE_IMAGE_VA = 0x69000000ull,
-    INPUTD_MODULE_IMAGE_STRIDE = 0x01000000ull,
 };
 
 /* A boot record identifies a capsule fd without assigning it an input role. */
@@ -28,14 +25,8 @@ struct inputd_device_config {
     uint32_t reserved0;
 };
 
-struct inputd_module_config {
-    uint64_t image_va;
-    uint64_t image_size;
-    char name[64];
-};
-
 /*
- * devices and modules are dense variable-length tables at their byte offsets.
+ * devices are a dense variable-length table at devices_offset.
  * Record sizes are explicit so malformed or mismatched producers fail closed.
  */
 struct inputd_boot_config {
@@ -48,17 +39,12 @@ struct inputd_boot_config {
     uint64_t netd_endpoint_fd;
     uint32_t device_count;
     uint32_t device_record_size;
-    uint32_t module_count;
-    uint32_t module_record_size;
     uint64_t devices_offset;
-    uint64_t modules_offset;
-    uint64_t reserved[4];
+    uint64_t reserved[6];
 };
 
 _Static_assert(sizeof(struct inputd_device_config) == 48,
     "inputd boot device record ABI");
-_Static_assert(sizeof(struct inputd_module_config) == 80,
-    "inputd boot module record ABI");
 _Static_assert(sizeof(struct inputd_boot_config) == 112,
     "inputd boot header ABI");
 
@@ -67,13 +53,6 @@ static inline const struct inputd_device_config *inputd_boot_devices(
 {
     return (const struct inputd_device_config *)((const uint8_t *)config +
         config->devices_offset);
-}
-
-static inline const struct inputd_module_config *inputd_boot_modules(
-    const struct inputd_boot_config *config)
-{
-    return (const struct inputd_module_config *)((const uint8_t *)config +
-        config->modules_offset);
 }
 
 #endif

@@ -2,8 +2,8 @@
  || defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
 
 #if defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
-#define MINSIGSTKSZ 2048
-#define SIGSTKSZ 8192
+#define MINSIGSTKSZ 20480
+#define SIGSTKSZ 32768
 #endif
 
 #ifdef _GNU_SOURCE
@@ -150,4 +150,3 @@ typedef struct __ucontext {
 #define SIGUNUSED SIGSYS
 
 #define _NSIG 65
-

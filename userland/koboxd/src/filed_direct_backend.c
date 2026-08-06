@@ -154,6 +154,22 @@ static int direct_readlink(
     return status;
 }
 
+static int direct_symlink(
+    void *ctx,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t *out_object_id)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL) return -22;
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_symlink(
+        backend, parent_object_id, name, target, out_object_id);
+    koboxd_fs_backend_unlock(backend);
+    return status;
+}
+
 static int direct_fsync(void *ctx, uint64_t object_id)
 {
     koboxd_fs_backend_t *backend = direct_backend(ctx);
@@ -421,6 +437,7 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .pread = direct_pread,
     .pwrite = direct_pwrite,
     .readlink = direct_readlink,
+    .symlink = direct_symlink,
     .fsync = direct_fsync,
     .create = direct_create,
     .truncate = direct_truncate,

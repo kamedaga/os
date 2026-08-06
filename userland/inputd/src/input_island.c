@@ -1,4 +1,5 @@
 #include "input_island.h"
+#include "filed_client/module_image.h"
 
 #include <kobox/device_pachaos_capsule.h>
 #include <kobox/module.h>
@@ -470,8 +471,7 @@ int inputd_input_island_init(
     struct inputd_input_island *island,
     const struct inputd_boot_config *cfg)
 {
-    if (island == NULL || cfg == NULL || cfg->device_count == 0 ||
-        cfg->module_count == 0) return -22;
+    if (island == NULL || cfg == NULL || cfg->device_count == 0) return -22;
     memset(island, 0, sizeof(*island));
     (void)setenv("KOBOX_DEVICE_BACKEND", "pachaos", 1);
     (void)setenv("KOBOX_PCI_LAYOUT", "arch68", 1);
@@ -500,19 +500,34 @@ int inputd_input_island_init(
     kb_platform_t *platform = NULL;
     if (kb_platform_create(&platform_desc, &platform) != KB_OK) return -5;
 
-    island->modules = calloc(cfg->module_count, sizeof(*island->modules));
+    static const char *const module_names[] = {
+        "linux_virtio.ko", "linux_virtio_ring.ko",
+        "linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_legacy_dev.ko",
+        "linux_virtio_pci.ko", "linux_virtio_input.ko",
+    };
+    static const char *const module_paths[] = {
+        "/usr/lib/kobox/linux_virtio.ko",
+        "/usr/lib/kobox/linux_virtio_ring.ko",
+        "/usr/lib/kobox/linux_virtio_pci_modern_dev.ko",
+        "/usr/lib/kobox/linux_virtio_pci_legacy_dev.ko",
+        "/usr/lib/kobox/linux_virtio_pci.ko",
+        "/usr/lib/kobox/linux_virtio_input.ko",
+    };
+    const uint32_t module_count = sizeof(module_names) / sizeof(module_names[0]);
+    island->modules = calloc(module_count, sizeof(*island->modules));
     if (island->modules == NULL) return -12;
-    const struct inputd_module_config *modules = inputd_boot_modules(cfg);
-    for (uint32_t i = 0; i < cfg->module_count; i++) {
-        const struct inputd_module_config *module = &modules[i];
-        if (module->image_va == 0 || module->image_size == 0 || module->name[0] == '\0') return -22;
+    for (uint32_t i = 0; i < module_count; i++) {
+        struct filed_client_module_image loaded;
+        const int load_status = filed_client_load_module_image(
+            FILED_CLIENT_ENDPOINT_FD, module_paths[i], module_names[i], &loaded);
+        if (load_status != 0) return load_status;
         const kb_module_image_t image = {
-            .data = (const void *)(uintptr_t)module->image_va,
-            .size = (size_t)module->image_size,
-            .name = module->name,
+            .data = loaded.data,
+            .size = loaded.size,
+            .name = loaded.name,
         };
-        printf("[inputd] module open name=%s bytes=%llu\n", module->name,
-            (unsigned long long)module->image_size);
+        printf("[inputd] module open name=%s bytes=%llu\n", loaded.name,
+            (unsigned long long)loaded.size);
         status = kb_module_open_image(&image, backend, (kb_module_t **)&island->modules[i]);
         if (status != KB_OK || island->modules[i] == NULL) return -5;
         island->loaded_module_count++;
@@ -520,7 +535,7 @@ int inputd_input_island_init(
         status = kb_module_call_init((kb_module_t *)island->modules[i], &init_result);
         if (status != KB_OK && status != KB_ERR_NOT_FOUND) return -5;
         if (status == KB_OK && init_result != 0) return init_result;
-        printf("[inputd] module ready name=%s init=%d\n", module->name, init_result);
+        printf("[inputd] module ready name=%s init=%d source=rootfs\n", loaded.name, init_result);
     }
 
     for (unsigned i = 0; i < 64; i++) {

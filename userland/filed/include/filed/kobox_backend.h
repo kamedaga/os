@@ -51,6 +51,7 @@ typedef struct filed_kobox_direct_ops {
     int (*pread)(void *ctx, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
     int (*pwrite)(void *ctx, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
     int (*readlink)(void *ctx, uint64_t object_id, char *out_target, uint64_t target_capacity, uint64_t *out_length);
+    int (*symlink)(void *ctx, uint64_t parent_object_id, const char *name, const char *target, uint64_t *out_object_id);
     int (*fsync)(void *ctx, uint64_t object_id);
     int (*create)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
     int (*truncate)(void *ctx, uint64_t object_id, uint64_t size);
@@ -104,6 +105,12 @@ int filed_kobox_backend_readlink(
     char *out_target,
     uint64_t target_capacity,
     uint64_t *out_length);
+int filed_kobox_backend_symlink(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t *out_object_id);
 int filed_kobox_backend_fsync(
     filed_kobox_backend_t *backend,
     uint64_t object_id);

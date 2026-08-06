@@ -1,6 +1,25 @@
 #include "netd_internal.h"
+#include "filed_client/module_image.h"
 
 #include <stdio.h>
+
+const char *const netd_module_names[] = {
+    "virtio.ko", "virtio_ring.ko", "virtio_pci.ko",
+    "failover.ko", "net_failover.ko", "virtio_net.ko",
+};
+
+static const char *const module_paths[] = {
+    "/usr/lib/kobox/virtio.ko", "/usr/lib/kobox/virtio_ring.ko",
+    "/usr/lib/kobox/virtio_pci.ko", "/usr/lib/kobox/failover.ko",
+    "/usr/lib/kobox/net_failover.ko", "/usr/lib/kobox/virtio_net.ko",
+};
+
+const uint64_t netd_module_count = sizeof(netd_module_names) / sizeof(netd_module_names[0]);
+
+_Static_assert(sizeof(module_paths) == sizeof(netd_module_names),
+    "netd module name and path tables must stay in sync");
+_Static_assert(sizeof(netd_module_names) / sizeof(netd_module_names[0]) <= NETD_MAX_MODULES,
+    "netd module table exceeds runtime capacity");
 
 const char *netd_status_name(kb_status_t status)
 {
@@ -32,29 +51,33 @@ int netd_module_stack_load(struct netd_runtime *runtime)
         return 4;
     }
 
-    for (uint64_t i = 0; i < runtime->cfg->module_count; i++) {
-        const struct netd_module_config *module_cfg = &runtime->cfg->modules[i];
-        if (module_cfg->image_va == 0 || module_cfg->image_size == 0 || module_cfg->name[0] == '\0') {
-            fprintf(stderr, "[netd] invalid module slot=%llu\n", (unsigned long long)i);
+    runtime->module_count = netd_module_count;
+    for (uint64_t i = 0; i < runtime->module_count; i++) {
+        struct filed_client_module_image loaded;
+        const int load_status = filed_client_load_module_image(
+            FILED_CLIENT_ENDPOINT_FD, module_paths[i], netd_module_names[i], &loaded);
+        if (load_status != 0) {
+            fprintf(stderr, "[netd] module read failed path=%s status=%d\n",
+                module_paths[i], load_status);
             return 4;
         }
         const kb_module_image_t image = {
-            .data = (const void *)(uintptr_t)module_cfg->image_va,
-            .size = (size_t)module_cfg->image_size,
-            .name = module_cfg->name,
+            .data = loaded.data,
+            .size = loaded.size,
+            .name = loaded.name,
         };
         uint64_t stage_start_cycles = netd_metrics_read_tsc();
         kb_status_t status = kb_module_open_image(&image, runtime->backend, &runtime->modules[i]);
         uint64_t stage_end_cycles = netd_metrics_read_tsc();
         netd_metrics_record_ex(
             "module_open",
-            module_cfg->name,
+            loaded.name,
             stage_start_cycles,
             stage_end_cycles,
-            module_cfg->image_size);
+            loaded.size);
         if (status != KB_OK || runtime->modules[i] == NULL) {
             fprintf(stderr, "[netd] %s open failed status=%s(%d)\n",
-                module_cfg->name,
+                loaded.name,
                 netd_status_name(status),
                 status);
             return 4;

@@ -1,9 +1,238 @@
 #include "common.h"
+#include "kobox/device_pachaos_capsule.h"
+#include "linux_personality/linux_block.h"
+#include "linux_subsystem/fs/fs.h"
 
 _Static_assert(FILED_OPENED_KIND_REGULAR == FILED_VNODE_REGULAR, "regular vnode wire kind");
 _Static_assert(FILED_OPENED_KIND_DIRECTORY == FILED_VNODE_DIRECTORY, "directory vnode wire kind");
 _Static_assert(FILED_OPENED_KIND_SYMLINK == FILED_VNODE_SYMLINK, "symlink vnode wire kind");
 _Static_assert(FILED_OPENED_KIND_DEVICE == FILED_VNODE_DEVICE, "device vnode wire kind");
+
+#if defined(FILED_STARTUP_PROFILE) && FILED_STARTUP_PROFILE
+static inline uint64_t filed_profile_file_vmo_stage_begin(void)
+{
+    return filed_read_tsc();
+}
+
+static void filed_profile_file_vmo_stage_end(
+    filed_runtime_t *runtime,
+    uint32_t stage,
+    uint64_t start)
+{
+    const uint64_t end = filed_read_tsc();
+    if (runtime == NULL || runtime->dispatch_state == NULL ||
+        stage >= FILED_PROFILE_FILE_VMO_STAGE_COUNT || end < start)
+    {
+        return;
+    }
+    __atomic_fetch_add(
+        &filed_file_vmo_stage_cycles[stage], end - start, __ATOMIC_RELAXED);
+    __atomic_fetch_add(
+        &filed_file_vmo_stage_counts[stage], 1u, __ATOMIC_RELAXED);
+}
+#else
+static inline uint64_t filed_profile_file_vmo_stage_begin(void)
+{
+    return 0;
+}
+
+static inline void filed_profile_file_vmo_stage_end(
+    filed_runtime_t *runtime,
+    uint32_t stage,
+    uint64_t start)
+{
+    (void)runtime;
+    (void)stage;
+    (void)start;
+}
+#endif
+
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+static kb_fs_read_profile_t filed_file_vmo_fs_profile;
+static kb_linux_block_profile_t filed_file_vmo_block_profile;
+static kb_pachaos_capsule_dma_profile_t filed_file_vmo_dma_profile;
+static kb_pachaos_capsule_irq_profile_t filed_file_vmo_irq_profile;
+static uint64_t filed_file_vmo_profile_calls;
+static uint64_t filed_file_vmo_profile_bytes;
+
+static inline uint64_t filed_profile_delta(uint64_t before, uint64_t after)
+{
+    return after >= before ? after - before : 0;
+}
+
+static void filed_file_vmo_storage_profile_accumulate(
+    const kb_fs_read_profile_t *fs_before,
+    const kb_fs_read_profile_t *fs_after,
+    const kb_linux_block_profile_t *block_before,
+    const kb_linux_block_profile_t *block_after,
+    const kb_pachaos_capsule_dma_profile_t *dma_before,
+    const kb_pachaos_capsule_dma_profile_t *dma_after,
+    const kb_pachaos_capsule_irq_profile_t *irq_before,
+    const kb_pachaos_capsule_irq_profile_t *irq_after,
+    uint64_t bytes)
+{
+#define FILED_PROFILE_ADD(target, before, after, field) \
+    __atomic_fetch_add(&(target).field, \
+        filed_profile_delta((before)->field, (after)->field), __ATOMIC_RELAXED)
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, bytes);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, total_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, extent_lookup_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, extent_lookup_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, device_read_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, device_read_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, overlay_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, overlay_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, partial_copy_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, partial_copy_cycles);
+    for (size_t i = 0; i < KB_LINUX_BLOCK_PROFILE_STAGE_COUNT; i++) {
+        __atomic_fetch_add(
+            &filed_file_vmo_block_profile.cycles[i],
+            filed_profile_delta(block_before->cycles[i], block_after->cycles[i]),
+            __ATOMIC_RELAXED);
+        __atomic_fetch_add(
+            &filed_file_vmo_block_profile.calls[i],
+            filed_profile_delta(block_before->calls[i], block_after->calls[i]),
+            __ATOMIC_RELAXED);
+    }
+    FILED_PROFILE_ADD(
+        filed_file_vmo_block_profile, block_before, block_after, disk_read_bytes);
+    FILED_PROFILE_ADD(
+        filed_file_vmo_dma_profile, dma_before, dma_after, copy_back_calls);
+    FILED_PROFILE_ADD(
+        filed_file_vmo_dma_profile, dma_before, dma_after, copy_back_bytes);
+    FILED_PROFILE_ADD(
+        filed_file_vmo_dma_profile, dma_before, dma_after, copy_back_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, wait_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, wait_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, fd_wait_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, fd_wait_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, fd_wait_ready);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, poll_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, poll_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, poll_ready);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, pre_poll_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, pre_poll_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, pre_poll_ready);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, post_poll_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, post_poll_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, post_poll_ready);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, handler_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_irq_profile, irq_before, irq_after, handler_cycles);
+#undef FILED_PROFILE_ADD
+    __atomic_fetch_add(&filed_file_vmo_profile_calls, 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&filed_file_vmo_profile_bytes, bytes, __ATOMIC_RELAXED);
+}
+
+void filed_file_vmo_storage_profile_dump(void)
+{
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=file_vmo_fs pread_calls=%llu pread_bytes=%llu "
+        "calls=%llu bytes=%llu total_cycles=%llu extent_calls=%llu extent_cycles=%llu "
+        "device_calls=%llu device_cycles=%llu overlay_calls=%llu overlay_cycles=%llu "
+        "partial_copy_calls=%llu partial_copy_cycles=%llu\n",
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_profile_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_profile_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.total_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.extent_lookup_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.extent_lookup_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.device_read_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.device_read_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.overlay_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.overlay_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.partial_copy_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.partial_copy_cycles, __ATOMIC_RELAXED));
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=file_vmo_block bytes=%llu "
+        "alloc_calls=%llu alloc_cycles=%llu map_calls=%llu map_cycles=%llu "
+        "before_calls=%llu before_cycles=%llu submit_calls=%llu submit_cycles=%llu "
+        "wait_calls=%llu wait_cycles=%llu unmap_calls=%llu unmap_cycles=%llu "
+        "free_calls=%llu free_cycles=%llu total_calls=%llu total_cycles=%llu "
+        "cq_poll_calls=%llu cq_poll_cycles=%llu irq_wait_calls=%llu irq_wait_cycles=%llu "
+        "poll_yield_calls=%llu poll_yield_cycles=%llu "
+        "post_irq_calls=%llu post_irq_cycles=%llu "
+        "prp_alloc_calls=%llu prp_alloc_cycles=%llu "
+        "data_map_calls=%llu data_map_cycles=%llu "
+        "prp_build_calls=%llu prp_build_cycles=%llu "
+        "prp_aux_map_calls=%llu prp_aux_map_cycles=%llu "
+        "prp_cache_hit_calls=%llu prp_cache_hit_cycles=%llu "
+        "prp_cache_miss_calls=%llu prp_cache_miss_cycles=%llu "
+        "prp_cache_fallback_calls=%llu prp_cache_fallback_cycles=%llu\n",
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.disk_read_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_REQUEST_ALLOC], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_REQUEST_ALLOC], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_DMA_MAP], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_DMA_MAP], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_BEFORE_EXECUTE], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_BEFORE_EXECUTE], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_QUEUE_SUBMIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_QUEUE_SUBMIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_COMPLETION_WAIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_COMPLETION_WAIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_DMA_UNMAP_COPYBACK], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_DMA_UNMAP_COPYBACK], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_REQUEST_FREE_TOTAL], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_REQUEST_FREE_TOTAL], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_DISK_IO_TOTAL], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_DISK_IO_TOTAL], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_CQ_POLL], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_CQ_POLL], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_IRQ_WAIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_IRQ_WAIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_POLL_YIELD], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_POLL_YIELD], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_POST_IRQ_DRAIN], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_POST_IRQ_DRAIN], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_ALLOC_INIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_ALLOC_INIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_DATA_MAP_PAGES], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_DATA_MAP_PAGES], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_BUILD], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_BUILD], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_AUX_MAP], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_AUX_MAP], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_HIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_HIT], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_MISS], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_MISS], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.calls[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_FALLBACK], __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_block_profile.cycles[KB_LINUX_BLOCK_PROFILE_NVME_PRP_CACHE_FALLBACK], __ATOMIC_RELAXED));
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=file_vmo_dma_copy calls=%llu bytes=%llu cycles=%llu\n",
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_dma_profile.copy_back_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_dma_profile.copy_back_bytes, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_dma_profile.copy_back_cycles, __ATOMIC_RELAXED));
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=file_vmo_irq wait_calls=%llu wait_cycles=%llu "
+        "fd_wait_calls=%llu fd_wait_cycles=%llu fd_wait_ready=%llu "
+        "poll_calls=%llu poll_cycles=%llu poll_ready=%llu "
+        "pre_poll_calls=%llu pre_poll_cycles=%llu pre_poll_ready=%llu "
+        "post_poll_calls=%llu post_poll_cycles=%llu post_poll_ready=%llu "
+        "handler_calls=%llu handler_cycles=%llu\n",
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.wait_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.wait_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.fd_wait_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.fd_wait_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.fd_wait_ready, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.poll_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.poll_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.poll_ready, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.pre_poll_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.pre_poll_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.pre_poll_ready, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.post_poll_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.post_poll_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.post_poll_ready, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.handler_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_irq_profile.handler_cycles, __ATOMIC_RELAXED));
+}
+#else
+void filed_file_vmo_storage_profile_dump(void)
+{
+}
+#endif
 
 filed_page_dispatch_result_t filed_dispatch_openat_page(
     filed_runtime_t *runtime,
@@ -444,22 +673,45 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
+    uint64_t profile_stage = filed_profile_file_vmo_stage_begin();
     const int vmo_fd = pacha_vmo_create(length, rights, 0);
+    filed_profile_file_vmo_stage_end(
+        runtime, FILED_PROFILE_FILE_VMO_STAGE_VMO_CREATE, profile_stage);
     if (vmo_fd < 16) {
         return filed_page_result(-12, 0);
     }
+    profile_stage = filed_profile_file_vmo_stage_begin();
     unsigned char *mapped = pacha_mmap(
         vmo_fd,
         length,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
+    filed_profile_file_vmo_stage_end(
+        runtime, FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP, profile_stage);
     if (mapped == NULL) {
         (void)pacha_fd_close(vmo_fd);
         return filed_page_result(-12, 0);
     }
 
     uint64_t bytes = 0;
+    profile_stage = filed_profile_file_vmo_stage_begin();
+    const int dma_window_status =
+        kb_linux_block_dma_read_window_begin(mapped, (size_t)length);
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    kb_fs_read_profile_t fs_profile_before;
+    kb_fs_read_profile_t fs_profile_after;
+    kb_linux_block_profile_t block_profile_before;
+    kb_linux_block_profile_t block_profile_after;
+    kb_pachaos_capsule_dma_profile_t dma_profile_before;
+    kb_pachaos_capsule_dma_profile_t dma_profile_after;
+    kb_pachaos_capsule_irq_profile_t irq_profile_before;
+    kb_pachaos_capsule_irq_profile_t irq_profile_after;
+    kb_fs_read_profile_snapshot(&fs_profile_before);
+    kb_linux_block_profile_snapshot(&block_profile_before);
+    kb_pachaos_capsule_dma_profile_snapshot(&dma_profile_before);
+    kb_pachaos_capsule_irq_profile_snapshot(&irq_profile_before);
+#endif
     const int64_t reply_status = filed_cached_pread(
         runtime,
         decision->backend_object,
@@ -467,6 +719,27 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
         mapped,
         length,
         &bytes);
+    if (dma_window_status == 0) {
+        kb_linux_block_dma_read_window_end();
+    }
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+    kb_fs_read_profile_snapshot(&fs_profile_after);
+    kb_linux_block_profile_snapshot(&block_profile_after);
+    kb_pachaos_capsule_dma_profile_snapshot(&dma_profile_after);
+    kb_pachaos_capsule_irq_profile_snapshot(&irq_profile_after);
+    filed_file_vmo_storage_profile_accumulate(
+        &fs_profile_before,
+        &fs_profile_after,
+        &block_profile_before,
+        &block_profile_after,
+        &dma_profile_before,
+        &dma_profile_after,
+        &irq_profile_before,
+        &irq_profile_after,
+        bytes);
+#endif
+    filed_profile_file_vmo_stage_end(
+        runtime, FILED_PROFILE_FILE_VMO_STAGE_PREAD, profile_stage);
     (void)pacha_munmap(mapped, length);
     if (reply_status != 0) {
         (void)pacha_fd_close(vmo_fd);
@@ -520,29 +793,38 @@ int filed_dispatch_file_vmo(
         file_vmo->flags == 0)
     {
         filed_vfs_io_decision_t decision;
+        uint64_t profile_stage = filed_profile_file_vmo_stage_begin();
         filed_status_t status = filed_vfs_pread_prepare(
             &runtime->vfs,
             (filed_handle_id_t)(uint32_t)file_vmo->handle,
             file_vmo->file_offset,
             file_vmo->length,
             &decision);
+        filed_profile_file_vmo_stage_end(
+            runtime, FILED_PROFILE_FILE_VMO_STAGE_PREPARE, profile_stage);
         int64_t reply_status = filed_status_to_wire(status);
         if (status == FILED_OK && decision.length == file_vmo->length) {
+            profile_stage = filed_profile_file_vmo_stage_begin();
             entry = filed_file_vmo_cache_lookup(
                 runtime,
                 decision.backend_object,
                 decision.object_generation,
                 decision.offset,
                 decision.length);
+            filed_profile_file_vmo_stage_end(
+                runtime, FILED_PROFILE_FILE_VMO_STAGE_LOOKUP, profile_stage);
             if (entry != NULL) {
                 result = filed_page_result(0, decision.length);
             } else {
+                profile_stage = filed_profile_file_vmo_stage_begin();
                 result = filed_create_file_vmo_cache_entry(
                     runtime,
                     &decision,
                     decision.offset,
                     decision.length,
                     &entry);
+                filed_profile_file_vmo_stage_end(
+                    runtime, FILED_PROFILE_FILE_VMO_STAGE_CREATE_TOTAL, profile_stage);
             }
             if (result.status == 0) {
                 filed_runtime_publish_generation(
@@ -593,7 +875,10 @@ int filed_dispatch_file_vmo(
             0,
             "filed file-vmo negative reply");
     }
+    const uint64_t profile_stage = filed_profile_file_vmo_stage_begin();
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
+    filed_profile_file_vmo_stage_end(
+        runtime, FILED_PROFILE_FILE_VMO_STAGE_REPLY, profile_stage);
     (void)pacha_fd_close(reply_fd);
     return reply_status;
 }

@@ -508,6 +508,11 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
 
 fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     asm volatile ("cli");
+    if (!x86_platform.enableNxForCurrentCpu()) {
+        setCpuState(cpu_slot, .absent);
+        markStarted(cpu_slot);
+        while (true) asm volatile ("hlt");
+    }
     if (!x86_platform.enableAvxXStateForCurrentCpu()) {
         setCpuState(cpu_slot, .absent);
         markStarted(cpu_slot);

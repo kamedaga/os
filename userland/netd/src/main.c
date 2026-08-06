@@ -7,6 +7,7 @@
 #include "unix_socket.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
+#include "pacha/bootstrap.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -16,18 +17,17 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
 {
     if (cfg == NULL ||
         cfg->magic != NETD_BOOT_CONFIG_MAGIC ||
+        cfg->version != NETD_BOOT_CONFIG_VERSION ||
         cfg->device_fd < 16 ||
         cfg->socket_endpoint_fd < 16 ||
-        cfg->module_count == 0 ||
-        cfg->module_count > NETD_MAX_MODULES ||
         (cfg->flags & ~(NETD_BOOT_FLAG_SMOKE | NETD_BOOT_FLAG_TRACE | NETD_BOOT_FLAG_METRIC)) != 0) {
         if (cfg != NULL) {
             fprintf(stderr,
-                "[netd] invalid boot config magic=0x%llx fd=%llu socket_fd=%llu modules=%llu\n",
+                "[netd] invalid boot config magic=0x%llx version=%llu fd=%llu socket_fd=%llu\n",
                 (unsigned long long)cfg->magic,
+                (unsigned long long)cfg->version,
                 (unsigned long long)cfg->device_fd,
-                (unsigned long long)cfg->socket_endpoint_fd,
-                (unsigned long long)cfg->module_count);
+                (unsigned long long)cfg->socket_endpoint_fd);
         }
         return 0;
     }
@@ -37,13 +37,15 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
 int main(int argc, char **argv)
 {
     (void)argc;
-    (void)argv;
-
-    const struct netd_boot_config *cfg =
-        (const struct netd_boot_config *)(uintptr_t)NETD_BOOT_CONFIG_VA;
-    if (!validate_boot_config(cfg)) {
+    struct netd_boot_config config;
+    memset(&config, 0, sizeof(config));
+    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    if (bootstrap_fd < 16 ||
+        pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
+        !validate_boot_config(&config)) {
         return 2;
     }
+    const struct netd_boot_config *cfg = &config;
 
     struct netd_runtime runtime;
     memset(&runtime, 0, sizeof(runtime));
@@ -51,10 +53,9 @@ int main(int argc, char **argv)
 
     netd_metrics_set_enabled((cfg->flags & NETD_BOOT_FLAG_METRIC) != 0);
 
-    printf("[netd] start device_fd=%llu socket_fd=%llu modules=%llu loader=%s\n",
+    printf("[netd] start device_fd=%llu socket_fd=%llu module_source=rootfs loader=%s\n",
         (unsigned long long)cfg->device_fd,
         (unsigned long long)cfg->socket_endpoint_fd,
-        (unsigned long long)cfg->module_count,
         kb_module_loader_version());
     uint64_t total_start_cycles = netd_metrics_read_tsc();
 

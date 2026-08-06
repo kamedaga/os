@@ -4,6 +4,7 @@
 #include <pacha/abi.h>
 #include <pacha/capsule.h>
 #include <pacha/ipc.h>
+#include <pacha/bootstrap.h>
 #include <kobox/shim.h>
 
 #include <stdio.h>
@@ -26,22 +27,14 @@ static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
         cfg->total_size > INPUTD_BOOT_CONFIG_MAX_BYTES ||
         cfg->input_endpoint_fd < 16 || cfg->ready_channel_fd < 16 ||
         cfg->netd_endpoint_fd < 16 || cfg->device_count == 0 ||
-        cfg->module_count == 0 ||
         cfg->device_record_size != sizeof(struct inputd_device_config) ||
-        cfg->module_record_size != sizeof(struct inputd_module_config) ||
         cfg->devices_offset != sizeof(*cfg)) return -22;
     const uint64_t device_capacity =
         (INPUTD_BOOT_CONFIG_MAX_BYTES - sizeof(*cfg)) / sizeof(struct inputd_device_config);
     if (cfg->device_count > device_capacity) return -22;
-    const uint64_t modules_offset = sizeof(*cfg) +
+    const uint64_t total_size = sizeof(*cfg) +
         (uint64_t)cfg->device_count * sizeof(struct inputd_device_config);
-    if (cfg->modules_offset != modules_offset ||
-        modules_offset > INPUTD_BOOT_CONFIG_MAX_BYTES) return -22;
-    const uint64_t module_capacity =
-        (INPUTD_BOOT_CONFIG_MAX_BYTES - modules_offset) / sizeof(struct inputd_module_config);
-    if (cfg->module_count > module_capacity ||
-        cfg->total_size != modules_offset +
-            (uint64_t)cfg->module_count * sizeof(struct inputd_module_config) ||
+    if (cfg->total_size != total_size ||
         cfg->device_count >= PACHA_SERVICE_WAIT_MAX_FDS - 1u) return -22;
 
     const struct inputd_device_config *devices = inputd_boot_devices(cfg);
@@ -52,18 +45,20 @@ static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
             devices[i].vendor_id > UINT16_MAX || devices[i].device_id > UINT16_MAX ||
             devices[i].subsystem_id > UINT16_MAX) return -22;
     }
-    const struct inputd_module_config *modules = inputd_boot_modules(cfg);
-    for (uint32_t i = 0; i < cfg->module_count; i++) {
-        if (modules[i].image_va == 0 || modules[i].image_size == 0 ||
-            memchr(modules[i].name, '\0', sizeof(modules[i].name)) == NULL) return -22;
-    }
     return 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    (void)argc;
+    static unsigned char config_page[INPUTD_BOOT_CONFIG_MAX_BYTES];
+    memset(config_page, 0, sizeof(config_page));
+    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    if (bootstrap_fd < 16 ||
+        pacha_fd_read(bootstrap_fd, config_page, sizeof(config_page)) <= 0)
+        return 1;
     const struct inputd_boot_config *cfg =
-        (const struct inputd_boot_config *)(uintptr_t)INPUTD_BOOT_CONFIG_VA;
+        (const struct inputd_boot_config *)config_page;
     if (inputd_boot_config_validate(cfg) != 0) return 1;
     static struct inputd_input_island island;
     inputd_service_t service = { .cfg = cfg, .input = &island };

@@ -40,6 +40,7 @@ set(LINUX_TTY_SOURCES
 
 set(KOBOX_RUNTIME_SOURCES
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
+  "${REPO_ROOT}/userland/libfiled_client/src/module_image.c"
   "${REPO_ROOT}/userland/libipc/src/status.c"
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
@@ -116,7 +117,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${TERMD_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src ${REPO_ROOT}/third_party/linux-6.8-tty"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src ${REPO_ROOT}/third_party/linux-6.8-tty"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -DTERMD_WITH_KOBOX_TTY_ISLAND -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${TERMD_ELF}"
   DEPENDS
@@ -124,6 +125,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol.h"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
+    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.h"

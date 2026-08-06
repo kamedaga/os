@@ -543,6 +543,8 @@ static void fill_rect(uint32_t *pixels, int stride_pixels,
 
 int main(void)
 {
+    const uint64_t probe_main_started_ns = monotonic_ns();
+    const int background_probe = getenv("P4_BACKGROUND_PROBE") != NULL;
     struct wl_display *display = NULL;
     char display_name[32];
     for (int index = 0; index < 10 && display == NULL; ++index) {
@@ -554,6 +556,7 @@ int main(void)
         fprintf(stderr, "P4_BENCH_FAIL stage=connect errno=%d\n", errno);
         return 1;
     }
+    const uint64_t probe_connected_ns = monotonic_ns();
 
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
@@ -562,13 +565,14 @@ int main(void)
         fprintf(stderr, "P4_BENCH_FAIL stage=globals errno=%d\n", errno);
         return 2;
     }
+    const uint64_t probe_registry_ns = monotonic_ns();
     xdg_wm_base_add_listener(wm_base, &wm_listener, NULL);
     wl_seat_add_listener(seat, &seat_listener, NULL);
     if (presentation != NULL)
         wp_presentation_add_listener(presentation, &presentation_listener, NULL);
 
-    const int width = 640;
-    const int height = 480;
+    const int width = background_probe ? 1 : 640;
+    const int height = background_probe ? 1 : 480;
     const int stride = width * 4;
     const size_t bytes = (size_t)stride * height;
     const char *damage_mode = getenv("P4_ANIMATION_DAMAGE");
@@ -584,7 +588,12 @@ int main(void)
         buffers[i].pixels = pixels + (bytes / sizeof(*pixels)) * i;
         buffers[i].released = 1;
         buffers[i].object = wl_shm_pool_create_buffer(
-            pool, (int32_t)(bytes * i), width, height, stride, WL_SHM_FORMAT_XRGB8888);
+            pool,
+            (int32_t)(bytes * i),
+            width,
+            height,
+            stride,
+            background_probe ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888);
         wl_buffer_add_listener(buffers[i].object, &buffer_listener, &buffers[i]);
     }
 
@@ -593,16 +602,19 @@ int main(void)
     xdg_surface_add_listener(xdg_surface, &surface_listener, NULL);
     struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(xdg_surface);
     xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
-    xdg_toplevel_set_app_id(toplevel, "p4-animation");
-    xdg_toplevel_set_title(toplevel, "P4 animation benchmark");
+    xdg_toplevel_set_app_id(
+        toplevel, background_probe ? "p4-background-probe" : "p4-animation");
+    xdg_toplevel_set_title(
+        toplevel, background_probe ? "P4 background probe" : "P4 animation benchmark");
     xdg_toplevel_set_min_size(toplevel, width, height);
     xdg_toplevel_set_max_size(toplevel, width, height);
     wl_surface_commit(surface);
     if (wl_display_roundtrip(display) < 0 || !configured) return 5;
+    const uint64_t probe_configured_ns = monotonic_ns();
 
     for (size_t slot = 0; slot < 2u; ++slot) {
         for (size_t i = 0; i < bytes / sizeof(*pixels); ++i)
-            buffers[slot].pixels[i] = 0xff204060u;
+            buffers[slot].pixels[i] = background_probe ? 0x00000000u : 0xff204060u;
     }
     buffers[0].released = 0;
     wl_surface_attach(surface, buffers[0].object, 0, 0);
@@ -610,9 +622,40 @@ int main(void)
     callback_done = 0;
     struct wl_callback *callback = wl_surface_frame(surface);
     wl_callback_add_listener(callback, &frame_listener, NULL);
+    struct frame_sample first_presentation = {0};
+    if (background_probe && presentation != NULL) {
+        struct wp_presentation_feedback *feedback =
+            wp_presentation_feedback(presentation, surface);
+        wp_presentation_feedback_add_listener(
+            feedback, &feedback_listener, &first_presentation);
+    }
+    const uint64_t probe_commit_ns = monotonic_ns();
     wl_surface_commit(surface);
-    while (!callback_done && wl_display_dispatch(display) >= 0) {}
+    while ((!callback_done ||
+            (background_probe && presentation != NULL &&
+             !first_presentation.feedback_done)) &&
+           wl_display_dispatch(display) >= 0)
+    {}
     if (!callback_done) return 6;
+    if (background_probe) {
+        const uint64_t probe_received_ns = monotonic_ns();
+        if (presentation != NULL && !first_presentation.presented) return 8;
+        printf(
+            "P4_BENCH_BACKGROUND_PRESENTED source=%s presentation_ns=%llu "
+            "client_total_ms=%llu connect_ms=%llu configure_ms=%llu "
+            "registry_ms=%llu surface_configure_ms=%llu "
+            "present_wait_ms=%llu\n",
+            presentation != NULL ? "wp_presentation" : "frame_callback",
+            (unsigned long long)first_presentation.timestamp_ns,
+            (unsigned long long)((probe_received_ns - probe_main_started_ns) / 1000000ull),
+            (unsigned long long)((probe_connected_ns - probe_main_started_ns) / 1000000ull),
+            (unsigned long long)((probe_configured_ns - probe_connected_ns) / 1000000ull),
+            (unsigned long long)((probe_registry_ns - probe_connected_ns) / 1000000ull),
+            (unsigned long long)((probe_configured_ns - probe_registry_ns) / 1000000ull),
+            (unsigned long long)((probe_received_ns - probe_commit_ns) / 1000000ull));
+        fflush(stdout);
+        return 0;
+    }
     surface_ready = 1;
     maybe_input_ready();
     while (!input_done && wl_display_dispatch(display) >= 0) {}

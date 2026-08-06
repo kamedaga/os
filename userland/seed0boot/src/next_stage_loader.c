@@ -370,17 +370,20 @@ int seed0_start_process(const struct seed0_loaded_process *loaded, const char *a
     const int thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
     if (thread_fd < 16) {
         fprintf(stderr, "[seed0boot] next-stage: thread_create failed status=%d\n", thread_fd);
+        (void)pacha_fd_close(process_fd);
         return -7;
     }
     const int start_status = pacha_thread_start(thread_fd);
     if (start_status != 0) {
         fprintf(stderr, "[seed0boot] next-stage: thread_start failed thread_fd=%d status=%d\n", thread_fd, start_status);
         (void)pacha_fd_close(thread_fd);
+        (void)pacha_fd_close(process_fd);
         return -8;
     }
-    (void)thread_fd;
     printf("[seed0boot] next-stage started entry=0x%llx\n",
         (unsigned long long)loaded->runtime_entry);
+    (void)pacha_fd_close(thread_fd);
+    (void)pacha_fd_close(process_fd);
     return 0;
 }
 

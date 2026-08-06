@@ -301,6 +301,53 @@ int64_t lpr_filed_fast_call(uint32_t op, uint64_t word2, uint64_t *out_result)
     return 0;
 }
 
+int lpr_filed_live_object_generation(
+    uint64_t handle,
+    uint64_t *out_generation)
+{
+    if (handle == 0 || out_generation == 0 ||
+        lpr_filed_session_connect() != 0 || lpr_session_page == 0)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    *out_generation = 0;
+    const filed_fast_header_t *header =
+        (const filed_fast_header_t *)lpr_session_page;
+    if (header->magic != FILED_FAST_MAGIC ||
+        header->version != FILED_FAST_VERSION ||
+        header->generation_offset != FILED_FAST_GENERATION_OFFSET ||
+        header->generation_capacity != FILED_FAST_GENERATION_CAPACITY)
+    {
+        return -LPR_LINUX_EIO;
+    }
+    const filed_generation_entry_t *entries =
+        (const filed_generation_entry_t *)((const uint8_t *)lpr_session_page +
+            header->generation_offset);
+    for (uint64_t i = 0; i < header->generation_capacity; ++i) {
+        const filed_generation_entry_t *entry = &entries[i];
+        for (uint32_t retry = 0; retry < 4; ++retry) {
+            const uint64_t before =
+                __atomic_load_n(&entry->seq, __ATOMIC_ACQUIRE);
+            if ((before & 1u) != 0) {
+                continue;
+            }
+            const uint64_t entry_handle = entry->handle;
+            const uint64_t generation = entry->object_generation;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            const uint64_t after =
+                __atomic_load_n(&entry->seq, __ATOMIC_RELAXED);
+            if (before == after && (after & 1u) == 0) {
+                if (entry_handle == handle && generation != 0) {
+                    *out_generation = generation;
+                    return 0;
+                }
+                break;
+            }
+        }
+    }
+    return -LPR_LINUX_ENOENT;
+}
+
 int lpr_create_wire_page(void **out_page)
 {
     if (out_page == 0) {
@@ -450,6 +497,7 @@ void lpr_destroy_tty_wire_page(int fd, void *page)
 
 void lpr_reset_fork_child_rpc_state(void)
 {
+    lpr_file_image_cache_after_fork_child();
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
     lpr_state.termd_rpc.lock_word = 0;
@@ -845,6 +893,7 @@ uint64_t lpr_scatter_iov(
 
 lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(
     uint64_t handle,
+    uint64_t object_generation,
     uint64_t offset,
     uint64_t requested)
 {
@@ -855,22 +904,29 @@ lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(
     {
         return 0;
     }
-    const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
-    if (offset < page_start || requested > LPR_FILED_PAGE_CACHE_BYTES - (offset - page_start)) {
-        return 0;
-    }
     for (uint64_t i = 0; i < LPR_FILED_PAGE_CACHE_ENTRIES; i += 1) {
         lpr_filed_page_cache_entry_t *entry = &lpr_page_cache[i];
         if (!entry->active ||
-            entry->handle != handle ||
-            entry->page_start != page_start)
+            entry->handle != handle)
         {
             continue;
+        }
+        if (entry->object_generation != 0) {
+            uint64_t live_generation = 0;
+            if (object_generation == 0 ||
+                lpr_filed_live_object_generation(handle, &live_generation) != 0 ||
+                live_generation != object_generation ||
+                live_generation != entry->object_generation)
+            {
+                lpr_memset(entry, 0, offsetof(lpr_filed_page_cache_entry_t, data));
+                continue;
+            }
         }
         if (entry->length == 0) {
             return 0;
         }
-        if (offset + requested < offset ||
+        if (offset < entry->page_start ||
+            offset + requested < offset ||
             offset + requested > entry->page_start + entry->length)
         {
             continue;
@@ -956,6 +1012,7 @@ int64_t lpr_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
         *out_payload_size = sizeof(filed_handle_request_t);
         return 0;
     case FILED_OP_VFS_SYNC_ALL:
+    case FILED_OP_DIAG_DUMP_METRICS:
         *out_payload_size = 0;
         return 0;
     case FILED_OP_VFS_SEEK:
@@ -1064,7 +1121,7 @@ static int64_t lpr_filed_call_locked(
         path->dir_handle = openat_payload.dir_handle;
         path->rights = openat_payload.rights;
         path->flags = openat_payload.open_flags;
-        path->result_kind = 0;
+        path->create_mode_or_result_kind = openat_payload.create_mode;
         size_t path_len = lpr_strnlen(openat_payload.name, sizeof(openat_payload.name));
         if (path_len >= sizeof(path->path)) {
             path_len = sizeof(path->path) - 1u;
@@ -1224,7 +1281,7 @@ static int64_t lpr_filed_call_locked(
     if (op == FILED_OP_VFS_OPENAT) {
         const filed_path_request_t *path =
             (const filed_path_request_t *)((const uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
-        const uint64_t opened_kind = path->result_kind;
+        const uint64_t opened_kind = path->create_mode_or_result_kind;
         lpr_memset(page, 0, sizeof(filed_openat_t));
         ((filed_openat_t *)page)->opened_kind = opened_kind;
     }

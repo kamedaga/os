@@ -109,6 +109,12 @@ int koboxd_fs_backend_readlink(
     char *out_target,
     size_t target_capacity,
     size_t *out_length);
+int koboxd_fs_backend_symlink(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t *out_object_id);
 int koboxd_fs_backend_create(
     koboxd_fs_backend_t *backend,
     uint64_t parent_object_id,

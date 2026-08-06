@@ -221,6 +221,11 @@ apps:
       path: "tests/fixtures/pine2_gtk_smoke.sh"
     out: "PINE2GTKTEST.SH"
     rootfs: "/cmd/pine2_gtk_smoke.sh"
+  apk_shell_smoke_script:
+    file:
+      path: "tests/fixtures/apk_shell_smoke.sh"
+    out: "APKSHSMK.SH"
+    rootfs: "/cmd/apk_shell_smoke.sh"
   phase4_foot_bashrc:
     file:
       path: "tests/fixtures/phase4_foot_bashrc"
@@ -236,6 +241,11 @@ apps:
       path: "tests/fixtures/sway_foot_exit_acceptance.conf"
     out: "SWAYFTEX.CFG"
     rootfs: "/cmd/sway_foot_exit_acceptance.conf"
+  sway_foot_gtk_hangup_config:
+    file:
+      path: "tests/fixtures/sway_foot_gtk_hangup.conf"
+    out: "SWAYFGHK.CFG"
+    rootfs: "/cmd/sway_foot_gtk_hangup.conf"
   sway_inventory_script:
     file:
       path: "tests/fixtures/sway_inventory.sh"
@@ -300,6 +310,15 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_sway_launcher.c"
     out: "LPRSWAYL.ELF"
     rootfs: "/cmd/lpr_sway_launcher.elf"
+  lpr_sway_event_monitor:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_sway_event_monitor.elf"
+      rebuild: ["bash", "tools/build_wsl_sway_launcher.sh", ".artifacts/userland-fixtures/lpr_sway_event_monitor.elf", "userland/fixtures/src/wsl_musl/lpr_sway_event_monitor.c"]
+      input:
+        - "tools/build_wsl_sway_launcher.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_sway_event_monitor.c"
+    out: "LPRSWMON.ELF"
+    rootfs: "/cmd/lpr_sway_event_monitor.elf"
   lpr_wayland_shm_client:
     file:
       path: ".artifacts/userland-fixtures/lpr_wayland_shm_client.elf"
@@ -477,7 +496,6 @@ apps:
       path: ".artifacts/cmake/rootfs_fat_server/fat_server.elf"
       rebuild: ["bash", "tools/build_fat_server.sh"]
     out: "FATSRV.ELF"
-    bootfs: "/srv/fat_server.elf"
     rootfs: "/srv/fat_server.elf"
   gnu_grep:
     file:
@@ -556,42 +574,36 @@ apps:
       path: ".artifacts/userland-fixtures/kobox-modules/virtio.ko"
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "VIRTIO.KO"
-    bootfs: "/srv/kobox/virtio.ko"
     rootfs: "/usr/lib/kobox/virtio.ko"
   kobox_virtio_ring:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/virtio_ring.ko"
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "VIRTRING.KO"
-    bootfs: "/srv/kobox/virtio_ring.ko"
     rootfs: "/usr/lib/kobox/virtio_ring.ko"
   kobox_virtio_pci:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/virtio_pci.ko"
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "VIRTPCI.KO"
-    bootfs: "/srv/kobox/virtio_pci.ko"
     rootfs: "/usr/lib/kobox/virtio_pci.ko"
   kobox_failover:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/failover.ko"
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "FAILOVER.KO"
-    bootfs: "/srv/kobox/failover.ko"
     rootfs: "/usr/lib/kobox/failover.ko"
   kobox_net_failover:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/net_failover.ko"
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "NETFAIL.KO"
-    bootfs: "/srv/kobox/net_failover.ko"
     rootfs: "/usr/lib/kobox/net_failover.ko"
   kobox_virtio_net:
     file:
       path: ".artifacts/userland-fixtures/kobox-modules/virtio_net.ko"
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "VIRTNET.KO"
-    bootfs: "/srv/kobox/virtio_net.ko"
     rootfs: "/usr/lib/kobox/virtio_net.ko"
   kobox_linux_tty_core:
     file:
@@ -604,7 +616,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "TTYCORE.KO"
-    bootfs: "/srv/kobox/linux_tty_core.ko"
     rootfs: "/usr/lib/kobox/linux_tty_core.ko"
   kobox_linux_tty_n_null:
     file:
@@ -617,7 +628,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "TTYNULL.KO"
-    bootfs: "/srv/kobox/linux_tty_n_null.ko"
     rootfs: "/usr/lib/kobox/linux_tty_n_null.ko"
   kobox_linux_virtio:
     file:
@@ -629,7 +639,6 @@ apps:
         - "pack/scripts/build_linux_tty_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "LXVIRT.KO"
-    bootfs: "/srv/kobox/linux_virtio.ko"
     rootfs: "/usr/lib/kobox/linux_virtio.ko"
   kobox_linux_virtio_ring:
     file:
@@ -642,7 +651,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "LXVTRNG.KO"
-    bootfs: "/srv/kobox/linux_virtio_ring.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_ring.ko"
   kobox_linux_virtio_pci_modern_dev:
     file:
@@ -655,7 +663,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "LXVMODN.KO"
-    bootfs: "/srv/kobox/linux_virtio_pci_modern_dev.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_pci_modern_dev.ko"
   kobox_linux_virtio_pci_legacy_dev:
     file:
@@ -668,7 +675,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "LXVLEGD.KO"
-    bootfs: "/srv/kobox/linux_virtio_pci_legacy_dev.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_pci_legacy_dev.ko"
   kobox_linux_virtio_pci:
     file:
@@ -681,7 +687,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "LXVPCI.KO"
-    bootfs: "/srv/kobox/linux_virtio_pci.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_pci.ko"
   kobox_linux_virtio_console:
     file:
@@ -694,7 +699,6 @@ apps:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
         - "third_party/linux-6.8-tty"
     out: "TTYVCON.KO"
-    bootfs: "/srv/kobox/linux_virtio_console.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_console.ko"
   kobox_linux_virtio_dma_buf:
     file:
@@ -703,7 +707,6 @@ apps:
       input:
         - "tools/download_kobox_drm_modules.sh"
     out: "LXVDBUF.KO"
-    bootfs: "/srv/kobox/linux_virtio_dma_buf.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_dma_buf.ko"
   kobox_linux_virtio_gpu:
     file:
@@ -712,7 +715,6 @@ apps:
       input:
         - "tools/download_kobox_drm_modules.sh"
     out: "LXVIGPU.KO"
-    bootfs: "/srv/kobox/linux_virtio_gpu.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_gpu.ko"
   kobox_linux_virtio_input:
     file:
@@ -721,7 +723,6 @@ apps:
       input:
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
     out: "LXVINPUT.KO"
-    bootfs: "/srv/kobox/linux_virtio_input.ko"
     rootfs: "/usr/lib/kobox/linux_virtio_input.ko"
   kobox_run:
     file:
@@ -1366,7 +1367,6 @@ apps:
         - "userland/pachaos_capsule/src"
         - "userland/pachaos_capsule/include"
     out: "PCAPSULE.ELF"
-    bootfs: "/srv/pachaos_capsule.elf"
     rootfs: "/srv/pachaos_capsule.elf"
   netd:
     role: "service"
@@ -1383,10 +1383,10 @@ apps:
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/filed/include"
+        - "userland/libfiled_client"
         - "userland/netd/src"
         - "userland/netd/include"
     out: "NETD.ELF"
-    bootfs: "/srv/netd.elf"
     rootfs: "/srv/netd.elf"
   termd:
     role: "service"
@@ -1403,11 +1403,11 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/libfiled_client"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "TERMD.ELF"
-    bootfs: "/srv/termd.elf"
     rootfs: "/srv/termd.elf"
   drmd:
     role: "service"
@@ -1424,12 +1424,12 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/libfiled_client"
         - "_kobox/include"
         - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
     out: "DRMD.ELF"
-    bootfs: "/srv/drmd.elf"
     rootfs: "/srv/drmd.elf"
   inputd:
     role: "service"
@@ -1447,12 +1447,12 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/libfiled_client"
         - "_kobox/include"
         - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
     out: "INPUTD.ELF"
-    bootfs: "/srv/inputd.elf"
     rootfs: "/srv/inputd.elf"
   storage_boot:
     role: "service"

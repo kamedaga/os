@@ -19,6 +19,14 @@ enum {
     FILED_EXEC_INPUTD_INPUT_ENDPOINT_FD = LPR_INPUTD_INPUT_ENDPOINT_FD,
     FILED_EXEC_LPR_BOOTSTRAP_FD = LPR_BOOTSTRAP_FD,
     FILED_METRIC_OP_MAX = 0x8000u,
+    FILED_PROFILE_FILE_VMO_STAGE_PREPARE = 0,
+    FILED_PROFILE_FILE_VMO_STAGE_LOOKUP,
+    FILED_PROFILE_FILE_VMO_STAGE_CREATE_TOTAL,
+    FILED_PROFILE_FILE_VMO_STAGE_VMO_CREATE,
+    FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP,
+    FILED_PROFILE_FILE_VMO_STAGE_PREAD,
+    FILED_PROFILE_FILE_VMO_STAGE_REPLY,
+    FILED_PROFILE_FILE_VMO_STAGE_COUNT,
 };
 
 typedef struct filed_dispatch_metric {
@@ -67,6 +75,8 @@ typedef struct filed_dispatch_state {
     uint64_t target_lookup_vfs_hits;
     uint64_t target_lookup_backend_hits;
     uint64_t target_lookup_misses;
+    uint64_t file_vmo_stage_cycles[FILED_PROFILE_FILE_VMO_STAGE_COUNT];
+    uint64_t file_vmo_stage_counts[FILED_PROFILE_FILE_VMO_STAGE_COUNT];
 } filed_dispatch_state_t;
 
 int filed_dispatch_runtime_init(filed_runtime_t *runtime);

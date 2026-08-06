@@ -10,6 +10,35 @@ const kernel_vm = @import("../memory/kernel_vm.zig");
 const boot_scratch = @import("boot_scratch.zig");
 const log_util = @import("../log_util.zig");
 
+const elf_pf_x: u32 = 1 << 0;
+const elf_pf_w: u32 = 1 << 1;
+const elf_pf_r: u32 = 1 << 2;
+
+fn protForLoadPage(loaded: elf_loader.Image, page_index: usize) ?kernel.VmaProt {
+    const page_start = @as(u64, @intCast(page_index)) * kernel.native_page_size;
+    const page_end = page_start + kernel.native_page_size;
+    var flags: u32 = 0;
+    var covered = false;
+    var i: usize = 0;
+    while (i < loaded.load_segment_len) : (i += 1) {
+        const seg = loaded.load_segments[i];
+        const seg_end, const overflow = @addWithOverflow(seg.vaddr, seg.mem_size);
+        if (overflow != 0) return null;
+        if (seg.vaddr >= page_end or seg_end <= page_start) continue;
+        covered = true;
+        flags |= seg.flags;
+    }
+    // Unused holes in the load window remain readable, but never executable.
+    if (!covered) return .{ .read = true };
+    const prot: kernel.VmaProt = .{
+        .read = (flags & elf_pf_r) != 0,
+        .write = (flags & elf_pf_w) != 0,
+        .exec = (flags & elf_pf_x) != 0,
+    };
+    if (!prot.read or (prot.write and prot.exec)) return null;
+    return prot;
+}
+
 // ---------------------------------------------------------------------------
 // Single-page ELF load (for simple programs that fit in one page)
 // ---------------------------------------------------------------------------
@@ -66,8 +95,24 @@ pub fn loadUserElfIntoProcessPages(
     };
 
     const required_pages = required_bytes / 4096;
+    const page0_prot = protForLoadPage(loaded, 0) orelse {
+        log_util.logMessage("loadUserElfIntoProcessPages: invalid page 0 protections");
+        return null;
+    };
     const page0: [*]u8 = @ptrFromInt(page0_paddr);
     @memcpy(page0[0..4096], load_window[0..4096]);
+    if (!user_vm.protectPresentUserLinearRegionWithProt(principal, boot_static.user_va, 4096, .{
+        .read = page0_prot.read,
+        .write = page0_prot.write,
+        .exec = page0_prot.exec,
+    })) {
+        log_util.logMessage("loadUserElfIntoProcessPages: protect page 0 failed");
+        return null;
+    }
+    state.setVmaProtRange(principal, boot_static.user_va, 4096, page0_prot) catch |err| {
+        log_util.logError("loadUserElfIntoProcessPages: track page 0 protections failed: ", err);
+        return null;
+    };
 
     var extra_vmo_fd: ?kernel.Fd = null;
     var extra_vmo_ref: kernel.NativeVmoRef = .{};
@@ -104,7 +149,16 @@ pub fn loadUserElfIntoProcessPages(
             return null;
         };
         const map_va = boot_static.user_va + (@as(u64, @intCast(page_index)) * 4096);
-        if (!user_vm.mapUserLinearRegion(principal, map_va, extra_page.paddr, 4096, true)) {
+        const page_prot = protForLoadPage(loaded, page_index) orelse {
+            log_util.logIndexedError("loadUserElfIntoProcessPages: invalid page protections idx=", page_index, error.InvalidProtection);
+            if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+            return null;
+        };
+        if (!user_vm.mapUserLinearRegionWithProt(principal, map_va, extra_page.paddr, 4096, .{
+            .read = page_prot.read,
+            .write = page_prot.write,
+            .exec = page_prot.exec,
+        })) {
             log_util.logIndexedMapFailure("loadUserElfIntoProcessPages: map failed idx=", page_index, map_va, extra_page.paddr);
             if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;
@@ -118,23 +172,23 @@ pub fn loadUserElfIntoProcessPages(
         const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
         const off = page_index * 4096;
         @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);
-    }
-
-    if (extra_vmo_fd) |fd| {
-        const extra_size = @as(u64, @intCast(required_pages - 1)) * kernel.native_page_size;
+        const fd = extra_vmo_fd.?;
         _ = state.mmapFd(
             principal,
             fd,
-            boot_static.user_va + kernel.native_page_size,
-            extra_size,
-            .{ .read = true, .write = true, .exec = true },
+            map_va,
+            kernel.native_page_size,
+            page_prot,
             .{ .anonymous = true, .private = true, .fixed = true },
-            0,
+            @as(u64, @intCast(page_index - 1)) * kernel.native_page_size,
         ) catch |err| {
-            log_util.logError("loadUserElfIntoProcessPages: track extra native VMA failed: ", err);
+            log_util.logIndexedError("loadUserElfIntoProcessPages: track extra page failed idx=", page_index, err);
             _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;
         };
+    }
+
+    if (extra_vmo_fd) |fd| {
         state.closeFdWithFreeList(principal, fd, free_list) catch |err| {
             log_util.logError("loadUserElfIntoProcessPages: close extra native VMO fd failed: ", err);
             return null;

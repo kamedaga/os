@@ -5,17 +5,23 @@
 #include <pacha/capsule.h>
 #include <pacha/ipc.h>
 #include <pacha/trace.h>
+#include <pacha/bootstrap.h>
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
-    const struct termd_boot_config *cfg =
-        (const struct termd_boot_config *)(uintptr_t)TERMD_BOOT_CONFIG_VA;
-    if (cfg == 0 ||
+    (void)argc;
+    struct termd_boot_config config;
+    memset(&config, 0, sizeof(config));
+    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    const struct termd_boot_config *cfg = &config;
+    if (bootstrap_fd < 16 ||
+        pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         cfg->magic != TERMD_BOOT_CONFIG_MAGIC ||
+        cfg->version != TERMD_BOOT_CONFIG_VERSION ||
         cfg->tty_endpoint_fd < 16 ||
         cfg->ready_channel_fd < 16) {
         pacha_trace0(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_BOOT_CONFIG_INVALID, PACHA_TRACE_CLASS_ERROR);

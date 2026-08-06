@@ -215,7 +215,7 @@ pub fn tryCreateUserProcess(
         log_util.logLabelMessage(role_label, " process page table build failed");
         return error.CreateFailed;
     }
-    trackMappedNativePageOrHalt(state, principal, boot_static.user_va, user_page, true, true, role_label, "user map", free_list);
+    trackMappedNativePageOrHalt(state, principal, boot_static.user_va, user_page, false, true, role_label, "user map", free_list);
     trackMappedNativePageOrHalt(state, principal, boot_static.user_stack_page_va, user_stack_page, true, false, role_label, "user stack", free_list);
     mapAdditionalInitialStackPagesOrHalt(state, principal, role_label, free_list);
     const thread_slot = scheduler.allocateReadyThread(principal, user_spaces, buildInitialUserTrapFrame(), free_list) orelse {
@@ -245,7 +245,12 @@ pub fn tryCreateDynamicUserProcess(
     free_list: *kernel.FreePageList,
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!DynamicUserProcess {
-    const principal = state.createProcessDescriptorWithCapacity(role_label, free_list) orelse return error.NoFreeProcess;
+    const principal = state.createProcessDescriptorWithCapacityLimitChecked(
+        role_label,
+        free_list,
+        user_spaces.len,
+        scheduler.principalSlotReusable,
+    ) orelse return error.NoFreeProcess;
     releaseStaleThreadSlot(principal);
     const process = tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch return error.CreateFailed;
     return .{
@@ -260,7 +265,12 @@ pub fn tryCreateSuspendedUserProcess(
     free_list: *kernel.FreePageList,
     user_spaces: []boot_static.UserAddressSpace,
 ) CreateDynamicUserProcessError!SuspendedUserProcess {
-    const principal = state.createProcessDescriptorWithCapacity(role_label, free_list) orelse return error.NoFreeProcess;
+    const principal = state.createProcessDescriptorWithCapacityLimitChecked(
+        role_label,
+        free_list,
+        user_spaces.len,
+        scheduler.principalSlotReusable,
+    ) orelse return error.NoFreeProcess;
     releaseStaleThreadSlot(principal);
     if (!user_vm.buildEmptyUserAddressSpace(principal)) {
         _ = state.removeProcessDescriptor(principal);
@@ -347,7 +357,9 @@ pub fn trackMappedNativePageOrHalt(
         4096,
         .{
             .map_read = true,
-            .map_write = writable,
+            // Executable bootstrap pages are populated by the kernel before
+            // entry and may later be finalized as data by the ELF loader.
+            .map_write = writable or executable,
             .map_exec = executable,
             .close = true,
         },

@@ -192,7 +192,10 @@ fn getRandom(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, f
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
         sc.syscall_getpid => @intFromEnum(proc),
-        sc.syscall_gettid => @as(u64, @intCast(scheduler.currentThread())),
+        // Zero is reserved by libc/POSIX thread state for "no thread".  The
+        // scheduler uses a zero-based internal slot, so expose a one-based
+        // opaque TID rather than leaking slot 0 as an invalid userspace ID.
+        sc.syscall_gettid => @as(u64, @intCast(scheduler.currentThread())) + 1,
         sc.syscall_clock_gettime => clockGettime(h, proc, frame.rdi, frame.rsi),
         sc.syscall_nanosleep => nanosleep(h, proc, frame),
         sc.syscall_futex_wait => futexWait(h, proc, frame),

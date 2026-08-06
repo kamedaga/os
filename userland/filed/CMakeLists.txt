@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(filed C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(FILED_PROFILE_CFLAGS "$ENV{PACHAOS_FILED_EXTRA_CFLAGS}")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
 set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/source")
 set(FILED_DISPATCH_SHARDS
@@ -134,7 +135,7 @@ add_custom_command(
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
+      "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype ${FILED_PROFILE_CFLAGS}"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/bootstrap.h"

@@ -47,6 +47,7 @@ pub const page_present: u64 = x86_platform.page_present;
 pub const page_rw: u64 = x86_platform.page_rw;
 pub const page_user: u64 = x86_platform.page_user;
 pub const page_ps: u64 = x86_platform.page_ps;
+pub const page_nx: u64 = x86_platform.page_nx;
 pub const lapic_timer_vector: u8 = 0x40;
 pub const scheduler_wake_ipi_vector: u8 = 0x42;
 pub const lapic_timer_initial_count: u32 = 50_000;

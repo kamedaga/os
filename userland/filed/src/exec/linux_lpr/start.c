@@ -6,6 +6,11 @@
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
 
+enum {
+    LPR_EXEC_LINUX_STACK_SIZE = 8u * 1024u * 1024u,
+    LPR_EXEC_LINUX_AUXV_WORDS = 32u,
+};
+
 static int set_inherit(int fd, int enabled)
 {
     if (fd < 0) {
@@ -133,7 +138,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
         PACHA_FD_RIGHT_MAP_WRITE;
     uint64_t stage_start = lpr_exec_now_ns();
     uint64_t stage_start_cycles = lpr_exec_now_cycles();
-    const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
+    const int stack_fd = pacha_vmo_create(LPR_EXEC_LINUX_STACK_SIZE, stack_rights, 0);
     lpr_exec_metric("start_stack_vmo", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_vmo", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_fd < 16) {
@@ -143,7 +148,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
     stage_start_cycles = lpr_exec_now_cycles();
     unsigned char *stack = pacha_mmap(
         stack_fd,
-        PACHA_PROCESS_DEFAULT_STACK_SIZE,
+        LPR_EXEC_LINUX_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         PACHA_MMAP_SHARED,
         0);
@@ -159,19 +164,19 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
         plan->process_fd,
         stack_fd,
         PACHA_PROCESS_MAP_ANYWHERE,
-        PACHA_PROCESS_DEFAULT_STACK_SIZE,
+        LPR_EXEC_LINUX_STACK_SIZE,
         PACHA_PROT_READ | PACHA_PROT_WRITE,
         0,
         PACHA_PROCESS_MAP_PRIVATE);
     lpr_exec_metric("start_stack_map_child", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_map_child", stage_start_cycles, lpr_exec_now_cycles());
     if (stack_map < 4096) {
-        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
     const uint64_t stack_base = (uint64_t)stack_map;
-    uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
+    uint64_t sp = LPR_EXEC_LINUX_STACK_SIZE;
     const uint64_t argc = request_argc(request);
     const uint64_t envc = request->envc;
     uint64_t argv_va[FILED_EXEC_MAX_ARGS];
@@ -189,7 +194,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
             filed_exec_string(request, request->envp[i - 1u]),
             &envp_va[i - 1u]);
         if (status != 0) {
-            (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+            (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
             (void)pacha_fd_close(stack_fd);
             return status;
         }
@@ -197,7 +202,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
     for (uint64_t i = argc; i > 0; --i) {
         const int status = copy_stack_string(stack, &sp, stack_base, request_arg(request, i - 1u), &argv_va[i - 1u]);
         if (status != 0) {
-            (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+            (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
             (void)pacha_fd_close(stack_fd);
             return status;
         }
@@ -209,7 +214,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
     if (pacha_getrandom(stack + sp, LPR_IMAGE_INITIAL_RANDOM_BYTES, 0) !=
         (int)LPR_IMAGE_INITIAL_RANDOM_BYTES)
     {
-        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -5;
     }
@@ -217,6 +222,20 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
 
     const int has_bootstrap =
         (request->flags & FILED_EXEC_BOOTSTRAP_FD) != 0 && bootstrap_fd >= 16;
+    const uint64_t stack_table_words =
+        LPR_EXEC_LINUX_AUXV_WORDS +
+        (has_bootstrap ? 2u : 0u) +
+        1u + envc +
+        1u + argc +
+        1u;
+    if (((sp - stack_table_words * sizeof(uint64_t)) &
+            (LPR_IMAGE_INITIAL_STACK_ALIGNMENT - 1u)) != 0 &&
+        push_u64(stack, &sp, 0) != 0)
+    {
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
+        (void)pacha_fd_close(stack_fd);
+        return -12;
+    }
     if (push_u64(stack, &sp, 0) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_NULL) != 0 ||
         (has_bootstrap &&
@@ -253,36 +272,36 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
         push_u64(stack, &sp, plan->phdr_va) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_PHDR) != 0)
     {
-        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
     if (push_u64(stack, &sp, 0) != 0) {
-        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
     for (uint64_t i = envc; i > 0; --i) {
         if (push_u64(stack, &sp, envp_va[i - 1u]) != 0) {
-            (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+            (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
             (void)pacha_fd_close(stack_fd);
             return -12;
         }
     }
     if (push_u64(stack, &sp, 0) != 0) {
-        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
     for (uint64_t i = argc; i > 0; --i) {
         if (push_u64(stack, &sp, argv_va[i - 1u]) != 0) {
-            (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+            (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
             (void)pacha_fd_close(stack_fd);
             return -12;
         }
     }
     if (push_u64(stack, &sp, argc) != 0) {
-        (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+        (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
         (void)pacha_fd_close(stack_fd);
         return -12;
     }
@@ -291,7 +310,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
 
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
-    (void)pacha_munmap(stack, PACHA_PROCESS_DEFAULT_STACK_SIZE);
+    (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
     (void)pacha_fd_close(stack_fd);
     lpr_exec_metric("start_stack_unmap", stage_start, lpr_exec_now_ns());
     lpr_exec_metric_cycles("start_stack_unmap", stage_start_cycles, lpr_exec_now_cycles());

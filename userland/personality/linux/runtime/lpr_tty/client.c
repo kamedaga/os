@@ -21,12 +21,13 @@ static int64_t lpr_termd_call_with_fd(
     {
         return -LPR_LINUX_EINVAL;
     }
-    struct pacha_ipc_fd fds[3];
-    struct pacha_ipc_msg request;
-    struct pacha_ipc_msg reply;
-    lpr_zero_bytes(fds, sizeof(fds));
-    lpr_zero_bytes(&request, sizeof(request));
-    lpr_zero_bytes(&reply, sizeof(reply));
+    lpr_signal_thread_state_t *thread_state = lpr_signal_thread_state_current();
+    struct pacha_ipc_fd *fds = thread_state->termd_fds;
+    struct pacha_ipc_msg *request = &thread_state->termd_request;
+    struct pacha_ipc_msg *reply = &thread_state->termd_reply;
+    lpr_zero_bytes(fds, sizeof(thread_state->termd_fds));
+    lpr_zero_bytes(request, sizeof(*request));
+    lpr_zero_bytes(reply, sizeof(*reply));
 
     const uint64_t request_id = lpr_next_request_id(&lpr_termd_request_id);
     pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
@@ -63,16 +64,16 @@ static int64_t lpr_termd_call_with_fd(
         fd_count++;
     }
 
-    request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
-    request.word1 = 0;
-    request.word2 = 0;
-    request.word3 = request_id;
-    request.fds = fds;
-    request.fd_count = fd_count;
+    request->word0 = PACHA_SERVICE_REQUEST_MAGIC;
+    request->word1 = 0;
+    request->word2 = 0;
+    request->word3 = request_id;
+    request->fds = fds;
+    request->fd_count = fd_count;
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
         LPR_TERMD_TTY_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&request);
+        (uint64_t)(uintptr_t)request);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
         lpr_trace_error_record(
@@ -81,7 +82,7 @@ static int64_t lpr_termd_call_with_fd(
             LPR_ERROR_STAGE_CHILD_RPC_CALL,
             err,
             reply_fd,
-            request.word3,
+            request->word3,
             fd_count,
             LPR_TERMD_TTY_ENDPOINT_FD,
             0,
@@ -90,7 +91,7 @@ static int64_t lpr_termd_call_with_fd(
     }
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
-        &reply);
+        reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = lpr_pacha_status_to_errno(recv_status);
@@ -100,7 +101,7 @@ static int64_t lpr_termd_call_with_fd(
             LPR_ERROR_STAGE_CHILD_RPC_RECV,
             err,
             recv_status,
-            request.word3,
+            request->word3,
             fd_count,
             (uint64_t)(uint32_t)reply_fd,
             0,
@@ -109,10 +110,10 @@ static int64_t lpr_termd_call_with_fd(
     }
     const pacha_service_envelope_t *reply_header =
         (const pacha_service_envelope_t *)page;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        reply.word3 != request.word3 ||
+    if (reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
+        reply->word3 != request->word3 ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->request_id != request.word3 ||
+        reply_header->request_id != request->word3 ||
         reply_header->service_id != TERMD_SERVICE_ID ||
         reply_header->op != op)
     {
@@ -121,25 +122,25 @@ static int64_t lpr_termd_call_with_fd(
             op,
             LPR_ERROR_STAGE_REPLY_MAGIC,
             -LPR_LINUX_EIO,
-            (int64_t)reply.word0,
-            request.word3,
+            (int64_t)reply->word0,
+            request->word3,
             fd_count,
-            reply.word3,
-            reply.word2,
+            reply->word3,
+            reply->word2,
             "termd reply mismatch");
         return -LPR_LINUX_EIO;
     }
-    if ((int64_t)reply.word1 < 0) {
+    if ((int64_t)reply->word1 < 0) {
         lpr_trace_error_record(
             LPR_ERROR_DOMAIN_TERMD,
             op,
             LPR_ERROR_STAGE_CHILD_STATUS,
-            (int64_t)reply.word1,
-            (int64_t)reply.word1,
-            request.word3,
+            (int64_t)reply->word1,
+            (int64_t)reply->word1,
+            request->word3,
             fd_count,
             0,
-            reply.word2,
+            reply->word2,
             "termd returned error");
     }
     if (out_result != 0) {

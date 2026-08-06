@@ -23,11 +23,13 @@ const PollItem = struct {
 
 fn protFromBits(bits: u64) ?kernel.VmaProt {
     if ((bits & ~(vm_abi.prot_read | vm_abi.prot_write | vm_abi.prot_exec)) != 0) return null;
-    return .{
+    const prot: kernel.VmaProt = .{
         .read = (bits & vm_abi.prot_read) != 0,
         .write = (bits & vm_abi.prot_write) != 0,
         .exec = (bits & vm_abi.prot_exec) != 0,
     };
+    if (prot.write and prot.exec) return null;
+    return prot;
 }
 
 fn mmapFlagsFromBits(bits: u64) ?kernel.MmapFlags {
@@ -678,6 +680,7 @@ fn mapVmoFd(
     if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
+    if (flags.anonymous and prot.exec) return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
     prot.pkey = flags.pkey;

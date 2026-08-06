@@ -71,6 +71,7 @@ set(KOBOX_RUNTIME_SOURCES
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_input.c
   ${REPO_ROOT}/_kobox/src/linux_personality/linux_work.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.c
 )
 
 string(REPLACE ";" " " KOBOX_RUNTIME_SOURCES_ENV "${KOBOX_RUNTIME_SOURCES}")
@@ -87,6 +88,8 @@ add_custom_command(
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/storage_boot/boot_config.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"

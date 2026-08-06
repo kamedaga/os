@@ -5,16 +5,23 @@
 #include <pacha/abi.h>
 #include <pacha/capsule.h>
 #include <pacha/ipc.h>
+#include <pacha/bootstrap.h>
 #include <kobox/shim.h>
 
 #include <stdio.h>
 #include <string.h>
 
-int main(void)
+int main(int argc, char **argv)
 {
-    const struct drmd_boot_config *cfg =
-        (const struct drmd_boot_config *)(uintptr_t)DRMD_BOOT_CONFIG_VA;
-    if (cfg == NULL || cfg->magic != DRMD_BOOT_CONFIG_MAGIC ||
+    (void)argc;
+    struct drmd_boot_config config;
+    memset(&config, 0, sizeof(config));
+    const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
+    const struct drmd_boot_config *cfg = &config;
+    if (bootstrap_fd < 16 ||
+        pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
+        cfg->magic != DRMD_BOOT_CONFIG_MAGIC ||
+        cfg->version != DRMD_BOOT_CONFIG_VERSION ||
         cfg->drm_endpoint_fd < 16 || cfg->device_fd < 16 ||
         cfg->ready_channel_fd < 16 || cfg->netd_endpoint_fd < 16) {
         return 1;

@@ -7,6 +7,11 @@
 #include "lpr_supervisor/ipc_protocol.h"
 #include "personality/linux_lpr.h"
 #include "personality/lpr_manifest.h"
+#include "pacha/root_handoff.h"
+#include "netd/boot_config.h"
+#include "termd/boot_config.h"
+#include "drmd/boot_config.h"
+#include "inputd/boot_config.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
 #define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
@@ -21,7 +26,6 @@
 enum {
     SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
     SEED0ROOT_STORAGE_READY_MAGIC = 0x3159445252545330ull,
-    SEED0ROOT_SERVICES_READY_MAGIC = 0x3159445256533053ull,
     SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
     SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
     SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
@@ -64,6 +68,11 @@ enum {
     SEED0ROOT_BOOT_PROFILE_CURL = 1u << 8,
     SEED0ROOT_BOOT_PROFILE_HTTPS = 1u << 9,
     SEED0ROOT_BOOT_PROFILE_APK_UPDATE = 1u << 10,
+    SEED0ROOT_FD_KIND_DEVICE = 8,
+    SEED0ROOT_SERVICE_DEVICE_FD = 224,
+    SEED0ROOT_SERVICE_ENDPOINT_FD = 232,
+    SEED0ROOT_SERVICE_READY_FD = 233,
+    SEED0ROOT_SERVICE_NETD_FD = 234,
 };
 
 struct seed0root_bootstrap_module {
@@ -1625,6 +1634,7 @@ static int seed0root_run_exec_path_smoke_expect_any(
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
     struct pacha_ipc_msg reply;
+    memset(&reply, 0, sizeof(reply));
     status = seed0root_filed_page_call(
         filed_endpoint_fd,
         FILED_OP_EXEC_PATH,
@@ -2969,15 +2979,22 @@ static int start_loaded_process(
         PACHA_FD_RIGHT_START |
         PACHA_FD_RIGHT_SET_CONTEXT;
     const int thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
-    if (thread_fd < 16) return -7;
+    if (thread_fd < 16) {
+        (void)pacha_fd_close(process_fd);
+        return -7;
+    }
     const int start_status = pacha_thread_start(thread_fd);
     if (start_status != 0) {
         (void)pacha_fd_close(thread_fd);
+        (void)pacha_fd_close(process_fd);
         return -8;
     }
     if (out_started != NULL) {
         out_started->process_fd = process_fd;
         out_started->thread_fd = thread_fd;
+    } else {
+        (void)pacha_fd_close(thread_fd);
+        (void)pacha_fd_close(process_fd);
     }
     return 0;
 }
@@ -3015,52 +3032,409 @@ static int prepare_filed_storage_bootstrap(
     return 0;
 }
 
-static int seed0root_send_storage_ready(int ready_channel_fd, int filed_client_fd)
+struct seed0root_root_devices {
+    struct pacha_root_handoff metadata;
+    int fds[PACHA_ROOT_HANDOFF_MAX_DEVICES];
+};
+
+static void seed0root_close_root_devices(struct seed0root_root_devices *devices)
 {
-    if (ready_channel_fd < 16 || filed_client_fd < 16) {
-        return -1;
+    if (devices == NULL) return;
+    for (uint64_t i = 0; i < devices->metadata.device_count; i++) {
+        if (devices->fds[i] >= 16) (void)pacha_fd_close(devices->fds[i]);
+        devices->fds[i] = -1;
+    }
+}
+
+static int seed0root_receive_root_handoff(
+    int channel_fd,
+    struct seed0root_root_devices *out)
+{
+    if (channel_fd < 16 || out == NULL) return -22;
+    memset(out, 0, sizeof(*out));
+    for (uint64_t i = 0; i < PACHA_ROOT_HANDOFF_MAX_DEVICES; i++) out->fds[i] = -1;
+
+    struct pacha_ipc_fd fds[1 + PACHA_ROOT_HANDOFF_MAX_DEVICES];
+    memset(fds, 0, sizeof(fds));
+    struct pacha_ipc_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.fds = fds;
+    msg.fd_capacity = 1 + PACHA_ROOT_HANDOFF_MAX_DEVICES;
+    int status = recv_ipc_wait(channel_fd, &msg);
+    (void)pacha_fd_close(channel_fd);
+    if (status != 0 || msg.word0 != PACHA_ROOT_HANDOFF_MAGIC ||
+        msg.word1 != PACHA_ROOT_HANDOFF_VERSION ||
+        msg.word2 > PACHA_ROOT_HANDOFF_MAX_DEVICES ||
+        msg.fd_count != msg.word2 + 1 || fds[0].fd < 16)
+        goto fail;
+
+    struct pacha_fd_info info;
+    memset(&info, 0, sizeof(info));
+    if (pacha_fd_get_info((int)fds[0].fd, &info) != 0 ||
+        info.kind != PACHA_FD_KIND_VMO ||
+        (info.rights & PACHA_FD_RIGHT_MAP_READ) == 0) {
+        status = -13;
+        goto fail;
+    }
+    const void *page = pacha_mmap((int)fds[0].fd, 4096, PACHA_PROT_READ,
+        PACHA_MMAP_SHARED, 0);
+    if (page == NULL) {
+        status = -5;
+        goto fail;
+    }
+    memcpy(&out->metadata, page, sizeof(out->metadata));
+    (void)pacha_munmap((void *)page, 4096);
+    (void)pacha_fd_close((int)fds[0].fd);
+    fds[0].fd = 0;
+    if (out->metadata.magic != PACHA_ROOT_HANDOFF_MAGIC ||
+        out->metadata.version != PACHA_ROOT_HANDOFF_VERSION ||
+        out->metadata.device_count != msg.word2) {
+        status = -22;
+        goto fail;
     }
 
-    struct pacha_ipc_fd fd_item = {
-        .fd = (uint64_t)(uint32_t)filed_client_fd,
-        .rights = seed0root_channel_rights,
-        .flags = 0,
-        .transfer_flags = 0,
+    uint64_t seen = 0;
+    for (uint64_t i = 0; i < out->metadata.device_count; i++) {
+        const struct pacha_root_device_record *record = &out->metadata.devices[i];
+        if (record->transfer_index >= out->metadata.device_count ||
+            (seen & (1ull << record->transfer_index)) != 0) {
+            status = -22;
+            goto fail;
+        }
+        seen |= 1ull << record->transfer_index;
+        const int fd = (int)fds[1 + record->transfer_index].fd;
+        memset(&info, 0, sizeof(info));
+        if (fd < 16 || pacha_fd_get_info(fd, &info) != 0 ||
+            info.kind != SEED0ROOT_FD_KIND_DEVICE ||
+            (info.rights & (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) !=
+                (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) {
+            status = -13;
+            goto fail;
+        }
+        out->fds[i] = fd;
+        fds[1 + record->transfer_index].fd = 0;
+    }
+    printf("[seed0root] root capability handoff received devices=%llu\n",
+        (unsigned long long)out->metadata.device_count);
+    fflush(stdout);
+    return 0;
+
+fail:
+    for (uint64_t i = 0; i < 1 + PACHA_ROOT_HANDOFF_MAX_DEVICES; i++)
+        if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+    seed0root_close_root_devices(out);
+    fprintf(stderr, "[seed0root] invalid root capability handoff status=%d\n", status);
+    return status != 0 ? status : -5;
+}
+
+static int seed0root_find_root_device(
+    const struct seed0root_root_devices *devices,
+    uint64_t vendor_id,
+    uint64_t device_id,
+    uint64_t alternate_device_id)
+{
+    if (devices == NULL) return -1;
+    for (uint64_t i = 0; i < devices->metadata.device_count; i++) {
+        const struct pacha_root_device_record *record = &devices->metadata.devices[i];
+        if (record->vendor_id == vendor_id &&
+            (record->device_id == device_id || record->device_id == alternate_device_id))
+            return (int)i;
+    }
+    return -1;
+}
+
+static int seed0root_exec_native_service(
+    int filed_endpoint_fd,
+    const char *path,
+    const void *bootstrap,
+    uint64_t bootstrap_size,
+    const int *source_fds,
+    const uint64_t *target_fds,
+    uint64_t inherit_count,
+    uint64_t request_id)
+{
+    if (filed_endpoint_fd < 16 || path == NULL || bootstrap == NULL ||
+        bootstrap_size == 0 || inherit_count > FILED_EXEC_MAX_INHERIT_FDS)
+        return -22;
+    const int bootstrap_fd = create_inherited_vmo_from_bytes(
+        bootstrap, bootstrap_size, "service bootstrap fd");
+    if (bootstrap_fd < 16) return bootstrap_fd;
+
+    int page_fd = -1;
+    void *page = NULL;
+    int status = seed0root_create_filed_page(&page_fd, &page);
+    if (status != 0) {
+        (void)pacha_fd_close(bootstrap_fd);
+        return status;
+    }
+    filed_exec_path_t *exec = (filed_exec_path_t *)page;
+    exec->flags = FILED_EXEC_BOOTSTRAP_FD | FILED_EXEC_INHERIT_FDS;
+    exec->inherit_fd_count = inherit_count;
+    exec->argc = 1;
+    snprintf(exec->path, sizeof(exec->path), "%s", path);
+    status = seed0root_exec_add_string(exec, &exec->argv[0], path);
+    for (uint64_t i = 0; status == 0 && i < inherit_count; i++) {
+        if (source_fds[i] < 16 || target_fds[i] < 16 || target_fds[i] >= 256)
+            status = -22;
+        exec->inherit_fd_targets[i] = target_fds[i];
+    }
+    struct pacha_ipc_fd fds[2 + FILED_EXEC_MAX_INHERIT_FDS];
+    memset(fds, 0, sizeof(fds));
+    fds[0].fd = (uint64_t)(uint32_t)page_fd;
+    fds[0].rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    for (uint64_t i = 0; status == 0 && i < inherit_count; i++) {
+        struct pacha_fd_info info;
+        memset(&info, 0, sizeof(info));
+        if (pacha_fd_get_info(source_fds[i], &info) != 0) {
+            status = -13;
+            break;
+        }
+        fds[1 + i].fd = (uint64_t)(uint32_t)source_fds[i];
+        fds[1 + i].rights = info.rights;
+    }
+    struct pacha_fd_info bootstrap_info;
+    memset(&bootstrap_info, 0, sizeof(bootstrap_info));
+    if (status == 0 && pacha_fd_get_info(bootstrap_fd, &bootstrap_info) != 0)
+        status = -13;
+    fds[1 + inherit_count].fd = (uint64_t)(uint32_t)bootstrap_fd;
+    fds[1 + inherit_count].rights = bootstrap_info.rights;
+
+    struct pacha_ipc_fd reply_fds[2];
+    memset(reply_fds, 0, sizeof(reply_fds));
+    struct pacha_ipc_msg reply;
+    if (status == 0)
+        status = seed0root_filed_page_call_fdv(filed_endpoint_fd,
+            FILED_OP_EXEC_PATH, request_id, fds, inherit_count + 2, 0,
+            &reply, reply_fds, 2);
+    seed0root_destroy_filed_page(page_fd, page);
+    (void)pacha_fd_close(bootstrap_fd);
+    if (status == 0 && reply.fd_count < 2) status = -5;
+    for (uint64_t i = 0; i < 2; i++)
+        if (reply_fds[i].fd >= 16) (void)pacha_fd_close((int)reply_fds[i].fd);
+    return status;
+}
+
+static int seed0root_register_service_endpoint(
+    int filed_endpoint_fd,
+    uint32_t op,
+    int service_endpoint_fd,
+    uint64_t request_id)
+{
+    struct pacha_ipc_msg reply;
+    pacha_service_envelope_t header;
+    memset(&reply, 0, sizeof(reply));
+    memset(&header, 0, sizeof(header));
+    return seed0root_filed_service_call(filed_endpoint_fd, op, request_id,
+        sizeof(filed_service_endpoint_request_t), service_endpoint_fd,
+        &reply, &header);
+}
+
+static int seed0root_wait_service_ready(int channel_fd, uint64_t magic, const char *name)
+{
+    struct pacha_ipc_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    const int status = recv_ipc_wait(channel_fd, &msg);
+    (void)pacha_fd_close(channel_fd);
+    if (status != 0 || msg.word0 != magic || msg.word1 != 0 || msg.fd_count != 0) {
+        fprintf(stderr, "[seed0root] %s ready failed status=%d magic=0x%llx\n",
+            name, status, (unsigned long long)msg.word0);
+        return status != 0 ? status : -5;
+    }
+    return 0;
+}
+
+static int seed0root_launch_root_services(
+    int filed_endpoint_fd,
+    struct seed0root_root_devices *devices)
+{
+    enum {
+        VIRTIO_VENDOR = 0x1af4,
+        NET_LEGACY = 0x1000, NET_MODERN = 0x1041,
+        CONSOLE_LEGACY = 0x1003, CONSOLE_MODERN = 0x1043,
+        GPU_LEGACY = 0x1010, GPU_MODERN = 0x1050,
+        INPUT_MODERN = 0x1052,
     };
+    int status = 0;
+    int termd_endpoint = -1, netd_endpoint = -1, drmd_endpoint = -1;
+    int inputd_endpoint = -1;
+    struct pacha_ipc_channel_pair ready = { .a = -1, .b = -1 };
+
+    const int console = seed0root_find_root_device(devices, VIRTIO_VENDOR,
+        CONSOLE_LEGACY, CONSOLE_MODERN);
+    termd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (termd_endpoint < 16 ||
+        pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
+        status = -5;
+        goto out;
+    }
+    struct termd_boot_config termd_cfg;
+    memset(&termd_cfg, 0, sizeof(termd_cfg));
+    termd_cfg.magic = TERMD_BOOT_CONFIG_MAGIC;
+    termd_cfg.version = TERMD_BOOT_CONFIG_VERSION;
+    termd_cfg.tty_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    termd_cfg.device_fd = console >= 0 ? SEED0ROOT_SERVICE_DEVICE_FD : 0;
+    termd_cfg.ready_channel_fd = SEED0ROOT_SERVICE_READY_FD;
+    int termd_fds[3] = { termd_endpoint, ready.b, console >= 0 ? devices->fds[console] : -1 };
+    uint64_t termd_targets[3] = { SEED0ROOT_SERVICE_ENDPOINT_FD,
+        SEED0ROOT_SERVICE_READY_FD, SEED0ROOT_SERVICE_DEVICE_FD };
+    const uint64_t termd_count = console >= 0 ? 3 : 2;
+    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/termd.elf",
+        &termd_cfg, sizeof(termd_cfg), termd_fds, termd_targets, termd_count,
+        0x5eed2001u);
+    (void)pacha_fd_close(ready.b); ready.b = -1;
+    if (status != 0) goto out;
+    status = seed0root_register_service_endpoint(filed_endpoint_fd,
+        FILED_OP_SERVICE_SET_TERMD_TTY, termd_endpoint, 0x5eed2002u);
+    if (status != 0) goto out;
+    { const int ready_fd = ready.a; ready.a = -1;
+      status = seed0root_wait_service_ready(ready_fd, TERMD_BOOT_READY_MAGIC, "termd"); }
+    if (status != 0) goto out;
+
+    const int net = seed0root_find_root_device(devices, VIRTIO_VENDOR,
+        NET_LEGACY, NET_MODERN);
+    if (net < 0) { status = -19; goto out; }
+    netd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (netd_endpoint < 16) { status = -5; goto out; }
+    struct netd_boot_config netd_cfg;
+    memset(&netd_cfg, 0, sizeof(netd_cfg));
+    netd_cfg.magic = NETD_BOOT_CONFIG_MAGIC;
+    netd_cfg.version = NETD_BOOT_CONFIG_VERSION;
+    netd_cfg.device_fd = SEED0ROOT_SERVICE_DEVICE_FD;
+    netd_cfg.socket_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    int netd_fds[2] = { devices->fds[net], netd_endpoint };
+    uint64_t netd_targets[2] = { SEED0ROOT_SERVICE_DEVICE_FD,
+        SEED0ROOT_SERVICE_ENDPOINT_FD };
+    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/netd.elf",
+        &netd_cfg, sizeof(netd_cfg), netd_fds, netd_targets, 2, 0x5eed2003u);
+    if (status != 0 ||
+        (status = seed0root_register_service_endpoint(filed_endpoint_fd,
+            FILED_OP_SERVICE_SET_NETD_SOCKET, netd_endpoint, 0x5eed2004u)) != 0)
+        goto out;
+
+    const int gpu = seed0root_find_root_device(devices, VIRTIO_VENDOR,
+        GPU_LEGACY, GPU_MODERN);
+    if (gpu < 0 || pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
+        status = gpu < 0 ? -19 : -5;
+        goto out;
+    }
+    drmd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (drmd_endpoint < 16) { status = -5; goto out; }
+    struct drmd_boot_config drmd_cfg;
+    memset(&drmd_cfg, 0, sizeof(drmd_cfg));
+    drmd_cfg.magic = DRMD_BOOT_CONFIG_MAGIC;
+    drmd_cfg.version = DRMD_BOOT_CONFIG_VERSION;
+    drmd_cfg.drm_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    drmd_cfg.device_fd = SEED0ROOT_SERVICE_DEVICE_FD;
+    drmd_cfg.ready_channel_fd = SEED0ROOT_SERVICE_READY_FD;
+    drmd_cfg.netd_endpoint_fd = SEED0ROOT_SERVICE_NETD_FD;
+    int drmd_fds[4] = { devices->fds[gpu], drmd_endpoint, ready.b, netd_endpoint };
+    uint64_t drmd_targets[4] = { SEED0ROOT_SERVICE_DEVICE_FD,
+        SEED0ROOT_SERVICE_ENDPOINT_FD, SEED0ROOT_SERVICE_READY_FD,
+        SEED0ROOT_SERVICE_NETD_FD };
+    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/drmd.elf",
+        &drmd_cfg, sizeof(drmd_cfg), drmd_fds, drmd_targets, 4, 0x5eed2005u);
+    (void)pacha_fd_close(ready.b); ready.b = -1;
+    if (status != 0) goto out;
+    status = seed0root_register_service_endpoint(filed_endpoint_fd,
+        FILED_OP_SERVICE_SET_DRMD_DRM, drmd_endpoint, 0x5eed2006u);
+    if (status != 0) goto out;
+    { const int ready_fd = ready.a; ready.a = -1;
+      status = seed0root_wait_service_ready(ready_fd, DRMD_BOOT_READY_MAGIC, "drmd"); }
+    if (status != 0) goto out;
+
+    int input_slots[PACHA_ROOT_HANDOFF_MAX_DEVICES];
+    uint64_t input_count = 0;
+    for (uint64_t i = 0; i < devices->metadata.device_count; i++)
+        if (devices->metadata.devices[i].vendor_id == VIRTIO_VENDOR &&
+            devices->metadata.devices[i].device_id == INPUT_MODERN)
+            input_slots[input_count++] = (int)i;
+    if (input_count == 0 || input_count + 3 > FILED_EXEC_MAX_INHERIT_FDS ||
+        pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
+        status = input_count == 0 ? -19 : -7;
+        goto out;
+    }
+    inputd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (inputd_endpoint < 16) { status = -5; goto out; }
+    unsigned char input_blob[INPUTD_BOOT_CONFIG_MAX_BYTES];
+    memset(input_blob, 0, sizeof(input_blob));
+    struct inputd_boot_config *input_cfg = (struct inputd_boot_config *)input_blob;
+    const uint64_t input_size = sizeof(*input_cfg) +
+        input_count * sizeof(struct inputd_device_config);
+    input_cfg->magic = INPUTD_BOOT_CONFIG_MAGIC;
+    input_cfg->version = INPUTD_BOOT_CONFIG_VERSION;
+    input_cfg->header_size = sizeof(*input_cfg);
+    input_cfg->total_size = input_size;
+    input_cfg->input_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    input_cfg->ready_channel_fd = SEED0ROOT_SERVICE_READY_FD;
+    input_cfg->netd_endpoint_fd = SEED0ROOT_SERVICE_NETD_FD;
+    input_cfg->device_count = (uint32_t)input_count;
+    input_cfg->device_record_size = sizeof(struct inputd_device_config);
+    input_cfg->devices_offset = sizeof(*input_cfg);
+    struct inputd_device_config *records =
+        (struct inputd_device_config *)(input_blob + input_cfg->devices_offset);
+    int input_fds[FILED_EXEC_MAX_INHERIT_FDS];
+    uint64_t input_targets[FILED_EXEC_MAX_INHERIT_FDS];
+    for (uint64_t i = 0; i < input_count; i++) {
+        const int slot = input_slots[i];
+        const struct pacha_root_device_record *src = &devices->metadata.devices[slot];
+        records[i] = (struct inputd_device_config) {
+            .device_fd = SEED0ROOT_SERVICE_DEVICE_FD + i,
+            .resource_id = src->resource_id,
+            .pci_segment = src->pci_segment, .pci_bus = src->pci_bus,
+            .pci_device = src->pci_device, .pci_function = src->pci_function,
+            .vendor_id = (uint32_t)src->vendor_id,
+            .device_id = (uint32_t)src->device_id,
+            .subsystem_id = (uint32_t)src->subsystem_id,
+        };
+        input_fds[i] = devices->fds[slot];
+        input_targets[i] = SEED0ROOT_SERVICE_DEVICE_FD + i;
+    }
+    input_fds[input_count] = inputd_endpoint;
+    input_targets[input_count] = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    input_fds[input_count + 1] = ready.b;
+    input_targets[input_count + 1] = SEED0ROOT_SERVICE_READY_FD;
+    input_fds[input_count + 2] = netd_endpoint;
+    input_targets[input_count + 2] = SEED0ROOT_SERVICE_NETD_FD;
+    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/inputd.elf",
+        input_blob, input_size, input_fds, input_targets, input_count + 3,
+        0x5eed2007u);
+    (void)pacha_fd_close(ready.b); ready.b = -1;
+    if (status != 0) goto out;
+    status = seed0root_register_service_endpoint(filed_endpoint_fd,
+        FILED_OP_SERVICE_SET_INPUTD_INPUT, inputd_endpoint, 0x5eed2008u);
+    if (status != 0) goto out;
+    { const int ready_fd = ready.a; ready.a = -1;
+      status = seed0root_wait_service_ready(ready_fd, INPUTD_BOOT_READY_MAGIC, "inputd"); }
+    if (status != 0) goto out;
+    printf("[seed0root] rootfs services ready termd -> netd -> drmd -> inputd\n");
+    fflush(stdout);
+
+out:
+    if (ready.a >= 16) (void)pacha_fd_close(ready.a);
+    if (ready.b >= 16) (void)pacha_fd_close(ready.b);
+    if (inputd_endpoint >= 16) (void)pacha_fd_close(inputd_endpoint);
+    if (drmd_endpoint >= 16) (void)pacha_fd_close(drmd_endpoint);
+    if (netd_endpoint >= 16) (void)pacha_fd_close(netd_endpoint);
+    if (termd_endpoint >= 16) (void)pacha_fd_close(termd_endpoint);
+    seed0root_close_root_devices(devices);
+    return status;
+}
+
+static int seed0root_send_storage_ready(int ready_channel_fd)
+{
+    if (ready_channel_fd < 16) {
+        return -1;
+    }
     struct pacha_ipc_msg msg = {
-        .word0 = SEED0ROOT_STORAGE_READY_MAGIC,
+        .word0 = PACHA_ROOT_READY_MAGIC,
         .word1 = 0,
         .word2 = 0,
         .word3 = 0,
-        .fds = &fd_item,
-        .fd_count = 1,
+        .fds = NULL,
+        .fd_count = 0,
     };
     return pacha_ipc_send(ready_channel_fd, &msg);
-}
-
-static int seed0root_wait_services_ready(int service_ready_channel_fd)
-{
-    if (service_ready_channel_fd < 16) {
-        return -22;
-    }
-    struct pacha_ipc_msg msg;
-    memset(&msg, 0, sizeof(msg));
-    const int status = recv_ipc_wait(service_ready_channel_fd, &msg);
-    (void)pacha_fd_close(service_ready_channel_fd);
-    if (status != 0 ||
-        msg.word0 != SEED0ROOT_SERVICES_READY_MAGIC ||
-        msg.word1 != 0)
-    {
-        fprintf(stderr,
-            "[seed0root] services ready wait failed status=%d word0=0x%llx word1=%llu\n",
-            status,
-            (unsigned long long)msg.word0,
-            (unsigned long long)msg.word1);
-        return status != 0 ? status : -5;
-    }
-    printf("[seed0root] services ready signal received\n");
-    fflush(stdout);
-    return 0;
 }
 
 static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoint_fd)
@@ -3496,6 +3870,12 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
             (unsigned long long)bootstrap->module_count);
         return -1;
     }
+    if (pacha_fd_fcntl((int)bootstrap->ready_channel_fd,
+            PACHA_FD_FCNTL_SET_FLAGS, 0, PACHA_FD_FLAG_INHERIT) != 0 ||
+        pacha_fd_fcntl((int)bootstrap->service_ready_channel_fd,
+            PACHA_FD_FCNTL_SET_FLAGS, 0, PACHA_FD_FLAG_INHERIT) != 0) {
+        return -13;
+    }
 
     uint64_t filed_map_size = 0;
     if (align_up(bootstrap->filed_image_size, &filed_map_size) != 0) {
@@ -3580,6 +3960,9 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     struct seed0root_loaded_process loaded;
     status = load_elf_process("/sbin/filed.elf", image, bootstrap->filed_image_size, &loaded);
     (void)pacha_munmap(image, filed_map_size);
+    (void)pacha_fd_fcntl((int)bootstrap->filed_image_fd,
+        PACHA_FD_FCNTL_SET_FLAGS, 0, PACHA_FD_FLAG_INHERIT);
+    (void)pacha_fd_close((int)bootstrap->filed_image_fd);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
         (void)pacha_fd_close(filed_client_fd);
@@ -3600,19 +3983,8 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     (void)pacha_fd_close(filed_endpoint_fd);
     printf("[seed0root] filed started\n");
     fflush(stdout);
-    const long boot_client_dup =
-        pacha_fd_fcntl(filed_client_fd, PACHA_FD_FCNTL_DUP, 16, seed0root_channel_rights);
-    if (boot_client_dup < 16) {
-        (void)pacha_fd_close(filed_client_fd);
-        fprintf(stderr,
-            "[seed0root] storage ready filed endpoint dup failed status=%ld fd=%d\n",
-            boot_client_dup,
-            filed_client_fd);
-        return boot_client_dup < 0 ? (int)boot_client_dup : -2;
-    }
-    const int boot_client_fd = (int)boot_client_dup;
-    status = seed0root_send_storage_ready((int)bootstrap->ready_channel_fd, boot_client_fd);
-    (void)pacha_fd_close(boot_client_fd);
+    status = seed0root_send_storage_ready((int)bootstrap->ready_channel_fd);
+    (void)pacha_fd_close((int)bootstrap->ready_channel_fd);
     if (status != 0) {
         (void)pacha_fd_close(filed_client_fd);
         fprintf(stderr, "[seed0root] storage ready send failed status=%d fd=%llu\n",
@@ -3622,9 +3994,18 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     }
     printf("[seed0root] storage ready signal sent\n");
     fflush(stdout);
-    status = seed0root_wait_services_ready((int)bootstrap->service_ready_channel_fd);
+    struct seed0root_root_devices root_devices;
+    status = seed0root_receive_root_handoff(
+        (int)bootstrap->service_ready_channel_fd,
+        &root_devices);
     if (status != 0) {
         (void)pacha_fd_close(filed_client_fd);
+        return status;
+    }
+    status = seed0root_launch_root_services(filed_client_fd, &root_devices);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr, "[seed0root] rootfs service launch failed status=%d\n", status);
         return status;
     }
     status = seed0root_run_storage_services(filed_client_fd);
@@ -3679,6 +4060,9 @@ int main(int argc, char **argv)
     fflush(stdout);
     struct seed0root_bootstrap bootstrap;
     bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
+    (void)pacha_fd_fcntl(bootstrap_fd, PACHA_FD_FCNTL_SET_FLAGS,
+        0, PACHA_FD_FLAG_INHERIT);
+    (void)pacha_fd_close(bootstrap_fd);
     printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu ready_fd=%llu service_ready_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
         bootstrap_status,
         (unsigned long long)bootstrap.magic,

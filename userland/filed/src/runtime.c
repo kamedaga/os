@@ -305,6 +305,17 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
         if (status != 0) {
             return status;
         }
+        status = filed_clear_inherit_flag((int)(uint32_t)storage_bootstrap.device_fd);
+        if (status != 0) {
+            return status;
+        }
+        for (uint64_t i = 0; i < storage_bootstrap.module_count; i++) {
+            status = filed_clear_inherit_flag(
+                (int)(uint32_t)storage_bootstrap.modules[i].image_fd);
+            if (status != 0) {
+                return status;
+            }
+        }
         status = filed_set_inherit_flag(runtime->client_endpoint_fd);
         if (status != 0) {
             return status;

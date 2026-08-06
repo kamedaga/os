@@ -217,6 +217,26 @@ typedef struct drmd_kms_state {
     drmd_flip_completion_t pending_flip;
     drmd_syncobj_state_t syncobjs;
     drmd_virtio_gpu_unref_bridge_t unref_bridge;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    struct {
+        uint64_t first_resources_ns;
+        uint64_t first_dumb_begin_ns;
+        uint64_t first_dumb_end_ns;
+        uint64_t second_dumb_end_ns;
+        uint64_t first_addfb_ns;
+        uint64_t second_addfb_ns;
+        uint64_t first_atomic_test_ns;
+        uint64_t first_atomic_real_ns;
+        uint64_t first_atomic_submit_ns;
+        uint64_t first_atomic_complete_ns;
+        uint64_t pump_ns;
+        uint64_t render_exec_ns;
+        uint32_t dumb_count;
+        uint32_t addfb_count;
+        uint32_t pump_count;
+        uint32_t render_exec_count;
+    } startup_profile;
+#endif
 } drmd_kms_state_t;
 
 typedef struct drmd_kms_owner_context {
@@ -236,6 +256,13 @@ static uint64_t monotonic_ns(void)
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
 }
+
+#if PACHAOS_DRMD_STARTUP_PROFILE
+static uint64_t elapsed_ms(uint64_t start, uint64_t end)
+{
+    return start != 0 && end >= start ? (end - start) / UINT64_C(1000000) : 0;
+}
+#endif
 
 static int syncobj_poll_fd(void *context, int fd)
 {
@@ -335,11 +362,18 @@ static int find_symbol(const char *name, void **out)
 
 static void pump_device(void)
 {
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    const uint64_t start_ns = monotonic_ns();
+#endif
     for (unsigned i = 0; i < 32; i++) {
         (void)kb_handle_any_irq(0);
         kb_run_deferred_work();
         drmd_kms_progress_page_flip();
     }
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    kms.startup_profile.pump_ns += monotonic_ns() - start_ns;
+    kms.startup_profile.pump_count++;
+#endif
 }
 
 static uint32_t object_refcount(const drmd_kms_buffer_t *buffer)
@@ -804,6 +838,12 @@ static int attach_scanout_resource(
 
 static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode_create_dumb_t *args)
 {
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    const uint64_t profile_begin_ns = monotonic_ns();
+    if (kms.startup_profile.first_dumb_begin_ns == 0) {
+        kms.startup_profile.first_dumb_begin_ns = profile_begin_ns;
+    }
+#endif
     if (args == NULL || args->flags != 0 || args->bpp != 32 || args->width == 0 || args->height == 0 ||
         args->width > DRMD_KMS_MAX_WIDTH || args->height > DRMD_KMS_MAX_HEIGHT) {
         return -22;
@@ -937,6 +977,15 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
     args->handle = gem->handle;
     args->pitch = buffer->pitch;
     args->size = buffer->size;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    const uint64_t profile_end_ns = monotonic_ns();
+    kms.startup_profile.dumb_count++;
+    if (kms.startup_profile.dumb_count == 1) {
+        kms.startup_profile.first_dumb_end_ns = profile_end_ns;
+    } else if (kms.startup_profile.dumb_count == 2) {
+        kms.startup_profile.second_dumb_end_ns = profile_end_ns;
+    }
+#endif
     return 0;
 }
 
@@ -966,6 +1015,14 @@ static int add_fb(uint64_t owner, uint32_t handle, uint32_t width, uint32_t heig
             fb->buffer = buffer;
             buffer->fb_refs++;
             *out_id = fb->id;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+            kms.startup_profile.addfb_count++;
+            if (kms.startup_profile.addfb_count == 1) {
+                kms.startup_profile.first_addfb_ns = monotonic_ns();
+            } else if (kms.startup_profile.addfb_count == 2) {
+                kms.startup_profile.second_addfb_ns = monotonic_ns();
+            }
+#endif
             size_t active_fbs = 0;
             for (size_t j = 0; j < DRMD_KMS_FB_MAX; j++) {
                 if (kms.fb[j].active && kms.fb[j].format == DRMD_FORMAT_XRGB8888) active_fbs++;
@@ -1318,6 +1375,12 @@ static void atomic_pending_clear(void)
 static void atomic_finish(int status)
 {
     if (!kms.atomic_pending.active) return;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    if (status == 0 && kms.startup_profile.first_atomic_complete_ns == 0 &&
+        kms.startup_profile.first_atomic_real_ns != 0) {
+        kms.startup_profile.first_atomic_complete_ns = monotonic_ns();
+    }
+#endif
     const int blocking = kms.atomic_pending.blocking;
     if (status == 0) {
         const uint32_t old_mode = kms.atomic.presented.crtc_mode_id;
@@ -1384,6 +1447,11 @@ static int atomic_submit_ready(void)
         status = submit_disable_scanout(&fence);
     }
     if (status != 0) return status;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    if (kms.startup_profile.first_atomic_submit_ns == 0) {
+        kms.startup_profile.first_atomic_submit_ns = monotonic_ns();
+    }
+#endif
     kms.atomic_pending.phase = DRMD_ATOMIC_PENDING_SUBMITTED;
     if (fence == NULL) {
         atomic_finish(0);
@@ -1459,12 +1527,35 @@ static void note_flip_event_delivered(const drmd_event_vblank_t *event)
     if (kms.delivered_flip_events == 2) {
         printf("[drmd] legacy page-flip events delivered count=2 crtc=%u\n",
             event->crtc_id);
+#if PACHAOS_DRMD_STARTUP_PROFILE
+        const uint64_t origin = kms.startup_profile.first_resources_ns;
+        printf("[drmd-profile] drm-startup-ms resources=0 dumb1_begin=%llu dumb1_end=%llu dumb2_end=%llu addfb1=%llu addfb2=%llu atomic_test=%llu atomic_real=%llu atomic_submit=%llu atomic_complete=%llu event2=%llu pump_total=%llu pump_calls=%u render_exec_total=%llu render_exec_calls=%u\n",
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_dumb_begin_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_dumb_end_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.second_dumb_end_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_addfb_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.second_addfb_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_atomic_test_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_atomic_real_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_atomic_submit_ns),
+            (unsigned long long)elapsed_ms(origin, kms.startup_profile.first_atomic_complete_ns),
+            (unsigned long long)elapsed_ms(origin, monotonic_ns()),
+            (unsigned long long)(kms.startup_profile.pump_ns / UINT64_C(1000000)),
+            kms.startup_profile.pump_count,
+            (unsigned long long)(kms.startup_profile.render_exec_ns / UINT64_C(1000000)),
+            kms.startup_profile.render_exec_count);
+#endif
     }
 }
 
 static int ioctl_resources(drmd_kms_resources_wire_t *wire)
 {
     if (wire == NULL) return -22;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    if (kms.startup_profile.first_resources_ns == 0) {
+        kms.startup_profile.first_resources_ns = monotonic_ns();
+    }
+#endif
     const uint32_t fb_capacity = wire->value.count_fbs;
     const uint32_t crtc_capacity = wire->value.count_crtcs;
     const uint32_t connector_capacity = wire->value.count_connectors;
@@ -1918,6 +2009,9 @@ static int submit_render_commands(
     void *aux_data,
     uint64_t aux_size)
 {
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    const uint64_t profile_begin_ns = monotonic_ns();
+#endif
     if (args == NULL || drm_file == NULL || aux_data == NULL ||
         args->flags != 0 || args->size == 0 || args->command != 0 ||
         args->num_in_syncobjs != 0 || args->num_out_syncobjs != 0) return -22;
@@ -1965,6 +2059,10 @@ static int submit_render_commands(
     if (commands != NULL) kb_kfree(commands);
     if (entered) leave_module(&context);
     if (status == 0) pump_device();
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    kms.startup_profile.render_exec_ns += monotonic_ns() - profile_begin_ns;
+    kms.startup_profile.render_exec_count++;
+#endif
     return status;
 }
 
@@ -2089,6 +2187,15 @@ static int ioctl_atomic(
     if ((request->fd_flags & DRMD_IOCTL_FD_OUTPUT_NOTIFY) != 0) return -22;
 
     drmd_mode_atomic_wire_t *wire = (void *)request->data;
+#if PACHAOS_DRMD_STARTUP_PROFILE
+    if ((wire->flags & DRMD_MODE_ATOMIC_TEST_ONLY) != 0) {
+        if (kms.startup_profile.first_atomic_test_ns == 0) {
+            kms.startup_profile.first_atomic_test_ns = monotonic_ns();
+        }
+    } else if (kms.startup_profile.first_atomic_real_ns == 0) {
+        kms.startup_profile.first_atomic_real_ns = monotonic_ns();
+    }
+#endif
     const int has_input =
         (request->fd_flags & DRMD_IOCTL_FD_INPUT_WAIT) != 0;
     drmd_atomic_stage_result_t staged;

@@ -491,6 +491,7 @@ int64_t filed_lookup_and_open_component(
     const char *name,
     uint32_t rights,
     uint32_t open_flags,
+    uint64_t create_mode,
     filed_vfs_open_result_t *out_open);
 
 int64_t filed_lookup_component_stat(
@@ -827,6 +828,7 @@ int64_t filed_resolve_parent_path(
                 component,
                 next_rights,
                 FILED_OPEN_DIRECTORY,
+                0,
                 &next_open);
             filed_close_walk_handle(runtime, current_handle, current_owned);
             if (reply_status != 0) {
@@ -845,6 +847,7 @@ int64_t filed_lookup_and_open_component(
     const char *name,
     uint32_t rights,
     uint32_t open_flags,
+    uint64_t create_mode,
     filed_vfs_open_result_t *out_open)
 {
     filed_vfs_io_decision_t parent_decision;
@@ -897,11 +900,14 @@ int64_t filed_lookup_and_open_component(
     if (reply_status != 0 &&
         (open_flags & FILED_OPEN_CREATE) != 0)
     {
+        const uint64_t requested_mode =
+            (create_mode & FILED_CREATE_MODE_VALID) != 0 ?
+                (create_mode & 07777u) : 0644u;
         reply_status = filed_backend_create(
             runtime,
             parent_decision.backend_object,
             name,
-            0100644u,
+            0100000u | requested_mode,
             &object_id);
         if (reply_status != 0) {
             return reply_status;
@@ -1169,6 +1175,7 @@ int64_t filed_openat_path(
                 component,
                 rights,
                 open_flags | (require_directory ? FILED_OPEN_DIRECTORY : 0),
+                openat->create_mode,
                 out_open);
             filed_close_walk_handle(runtime, current_handle, current_owned);
             return reply_status;
@@ -1276,6 +1283,7 @@ int64_t filed_openat_path(
                 component,
                 next_rights,
                 FILED_OPEN_DIRECTORY,
+                0,
                 &next_open);
             filed_close_walk_handle(runtime, current_handle, current_owned);
             if (reply_status != 0) {

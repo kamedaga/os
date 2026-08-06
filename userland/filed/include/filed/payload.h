@@ -61,10 +61,13 @@ enum {
     FILED_OPENED_KIND_DEVICE = 4,
 };
 
+#define FILED_CREATE_MODE_VALID (1ull << 63)
+
 typedef struct filed_openat {
     uint64_t dir_handle;
     uint64_t rights;
     uint64_t open_flags;
+    uint64_t create_mode;
     uint64_t object_generation;
     uint64_t dir_generation;
     uint64_t opened_kind;

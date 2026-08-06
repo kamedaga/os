@@ -1,17 +1,27 @@
 #include "patch_scan.h"
 
+#include <emmintrin.h>
 #include <Zydis/Zydis.h>
 #include <personality/zpoline.h>
 
 #define LPR_RESYNC_WINDOW_BYTES 256u
 #define LPR_SITE_PLAN_BYTES 256u
 #define LPR_SITE_PLAN_BITS (LPR_SITE_PLAN_BYTES * 8u)
+#define LPR_DECODE_CACHE_SLOTS 512u
+#define LPR_DECODE_CACHE_VALID 0x80u
+#define LPR_DECODE_CACHE_SYSCALL 0x40u
+#define LPR_DECODE_CACHE_LENGTH_MASK 0x1fu
 
 typedef enum lpr_candidate_class {
     LPR_CANDIDATE_INTERIOR,
     LPR_CANDIDATE_SITE,
     LPR_CANDIDATE_AMBIGUOUS,
 } lpr_candidate_class_t;
+
+typedef struct lpr_decode_cache {
+    uint64_t positions[LPR_DECODE_CACHE_SLOTS];
+    uint8_t summaries[LPR_DECODE_CACHE_SLOTS];
+} lpr_decode_cache_t;
 
 static int lpr_decode(const ZydisDecoder *decoder, const uint8_t *bytes,
                       uint64_t size, uint64_t pos,
@@ -31,20 +41,81 @@ static int lpr_is_syscall(const ZydisDecodedInstruction *instruction)
     return instruction->mnemonic == ZYDIS_MNEMONIC_SYSCALL;
 }
 
+/* Candidate validation follows as many as sixteen overlapping instruction
+ * streams through the same 256-byte window. Cache the decode summary by byte
+ * position so converged streams and nearby candidates do not ask Zydis to
+ * decode the same instruction repeatedly. The input remains immutable while
+ * a local patch plan is built, so cached summaries cannot observe patched
+ * bytes. Direct-mapped collisions only lose a cache hit. */
+static int lpr_decode_cached(const ZydisDecoder *decoder,
+                             const uint8_t *bytes,
+                             uint64_t size,
+                             uint64_t pos,
+                             lpr_decode_cache_t *cache,
+                             int *out_syscall)
+{
+    if (out_syscall != 0) {
+        *out_syscall = 0;
+    }
+#if defined(LPR_PATCH_DISABLE_DECODE_CACHE)
+    (void)cache;
+    ZydisDecodedInstruction instruction;
+    const int uncached_length = lpr_decode(
+        decoder, bytes, size, pos, &instruction);
+    if (uncached_length > 0 && out_syscall != 0) {
+        *out_syscall = lpr_is_syscall(&instruction);
+    }
+    return uncached_length;
+#else
+    if (cache == 0 || pos >= size) {
+        ZydisDecodedInstruction instruction;
+        const int length = lpr_decode(decoder, bytes, size, pos, &instruction);
+        if (length > 0 && out_syscall != 0) {
+            *out_syscall = lpr_is_syscall(&instruction);
+        }
+        return length;
+    }
+    const uint64_t slot = pos & (LPR_DECODE_CACHE_SLOTS - 1u);
+    const uint8_t summary = cache->summaries[slot];
+    if ((summary & LPR_DECODE_CACHE_VALID) != 0 &&
+        cache->positions[slot] == pos)
+    {
+        if (out_syscall != 0) {
+            *out_syscall =
+                (summary & LPR_DECODE_CACHE_SYSCALL) != 0;
+        }
+        return (int)(summary & LPR_DECODE_CACHE_LENGTH_MASK);
+    }
+    ZydisDecodedInstruction instruction;
+    const int length = lpr_decode(decoder, bytes, size, pos, &instruction);
+    cache->positions[slot] = pos;
+    cache->summaries[slot] =
+        LPR_DECODE_CACHE_VALID |
+        (length > 0 && lpr_is_syscall(&instruction)
+            ? LPR_DECODE_CACHE_SYSCALL
+            : 0u) |
+        (uint8_t)(length > 0 ? length : 0);
+    if (length > 0 && out_syscall != 0) {
+        *out_syscall = lpr_is_syscall(&instruction);
+    }
+    return length;
+#endif
+}
+
 static int lpr_is_raw_candidate(const uint8_t *bytes, uint64_t size, uint64_t pos)
 {
     return pos + 1u < size && bytes[pos] == LPR_ZPOLINE_PATCH_FROM0 &&
            bytes[pos + 1u] == LPR_ZPOLINE_PATCH_FROM1;
 }
 
-typedef uint64_t lpr_unaligned_u64
-    __attribute__((__aligned__(1), __may_alias__));
-
 /* This is only a byte prefilter. A match is never patched until Zydis proves
  * that the bytes terminate a decoded SYSCALL instruction. */
 static uint64_t lpr_find_raw_candidate(const uint8_t *bytes, uint64_t size,
                                        uint64_t start)
 {
+#if defined(LPR_PATCH_DISABLE_SIMD_PREFILTER)
+    typedef uint64_t lpr_unaligned_u64
+        __attribute__((__aligned__(1), __may_alias__));
     const uint64_t ones = UINT64_C(0x0101010101010101);
     const uint64_t highs = UINT64_C(0x8080808080808080);
     const uint64_t needle = UINT64_C(0x0f0f0f0f0f0f0f0f);
@@ -69,11 +140,67 @@ static uint64_t lpr_find_raw_candidate(const uint8_t *bytes, uint64_t size,
         pos++;
     }
     return UINT64_MAX;
+#else
+    const __m128i needle = _mm_set1_epi8((char)LPR_ZPOLINE_PATCH_FROM0);
+    uint64_t pos = start;
+    while (pos <= size && size - pos >= 4u * sizeof(__m128i)) {
+        const __m128i block0 =
+            _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos));
+        const __m128i block1 =
+            _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos + 16u));
+        const __m128i block2 =
+            _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos + 32u));
+        const __m128i block3 =
+            _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos + 48u));
+        const uint64_t candidates =
+            (uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block0, needle)) |
+            ((uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block1, needle)) << 16) |
+            ((uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block2, needle)) << 32) |
+            ((uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block3, needle)) << 48);
+        if (candidates == 0) {
+            pos += 4u * sizeof(__m128i);
+            continue;
+        }
+        uint64_t remaining = candidates;
+        while (remaining != 0) {
+            const uint32_t lane = (uint32_t)__builtin_ctzll(remaining);
+            if (lpr_is_raw_candidate(bytes, size, pos + lane)) {
+                return pos + lane;
+            }
+            remaining &= remaining - 1u;
+        }
+        pos += 4u * sizeof(__m128i);
+    }
+    while (pos <= size && size - pos >= sizeof(__m128i)) {
+        const __m128i block =
+            _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos));
+        uint32_t candidates = (uint32_t)_mm_movemask_epi8(
+            _mm_cmpeq_epi8(block, needle));
+        while (candidates != 0) {
+            const uint32_t lane = (uint32_t)__builtin_ctz(candidates);
+            if (lpr_is_raw_candidate(bytes, size, pos + lane)) {
+                return pos + lane;
+            }
+            candidates &= candidates - 1u;
+        }
+        pos += sizeof(__m128i);
+    }
+    while (pos + 1u < size) {
+        if (lpr_is_raw_candidate(bytes, size, pos)) return pos;
+        pos++;
+    }
+    return UINT64_MAX;
+#endif
 }
 
 static lpr_candidate_class_t lpr_classify_candidate(
     const ZydisDecoder *decoder, const uint8_t *bytes, uint64_t size,
-    uint64_t candidate, uint64_t *decoded_bytes)
+    uint64_t candidate, uint64_t *decoded_bytes,
+    lpr_decode_cache_t *decode_cache)
 {
     /* The mapping might not begin at an instruction boundary. For contiguous
      * code, one of the first 16 offsets in this window is a genuine boundary
@@ -89,9 +216,9 @@ static lpr_candidate_class_t lpr_classify_candidate(
     for (uint64_t start = window; start <= last_start && start <= candidate; ++start) {
         uint64_t pos = start;
         while (pos < candidate + 2u) {
-            ZydisDecodedInstruction instruction;
-            const int instruction_length = lpr_decode(
-                decoder, bytes, size, pos, &instruction);
+            int is_syscall = 0;
+            const int instruction_length = lpr_decode_cached(
+                decoder, bytes, size, pos, decode_cache, &is_syscall);
             if (instruction_length <= 0) break;
             if (decoded_bytes != 0) {
                 const uint64_t length = (uint64_t)instruction_length;
@@ -104,7 +231,7 @@ static lpr_candidate_class_t lpr_classify_candidate(
                 pos = end;
                 continue;
             }
-            if (end == candidate + 2u && lpr_is_syscall(&instruction) &&
+            if (end == candidate + 2u && is_syscall &&
                 bytes[end - 2u] == LPR_ZPOLINE_PATCH_FROM0 &&
                 bytes[end - 1u] == LPR_ZPOLINE_PATCH_FROM1)
             {
@@ -122,11 +249,12 @@ static lpr_candidate_class_t lpr_classify_candidate(
 
 static int lpr_site_has_decodable_successor(const ZydisDecoder *decoder,
                                             const uint8_t *bytes,
-                                            uint64_t size, uint64_t opcode)
+                                            uint64_t size, uint64_t opcode,
+                                            lpr_decode_cache_t *decode_cache)
 {
-    ZydisDecodedInstruction next;
     return opcode + 2u < size &&
-        lpr_decode(decoder, bytes, size, opcode + 2u, &next) > 0;
+        lpr_decode_cached(
+            decoder, bytes, size, opcode + 2u, decode_cache, 0) > 0;
 }
 
 static void lpr_plan_set(uint8_t plan[LPR_SITE_PLAN_BYTES], uint64_t index)
@@ -159,6 +287,7 @@ static int lpr_plan_local(const ZydisDecoder *decoder, const uint8_t *bytes,
                           uint64_t size, uint8_t *plan,
                           uint64_t *out_skipped)
 {
+    lpr_decode_cache_t decode_cache = {0};
     uint64_t candidate_index = 0;
     uint64_t search = 0;
     *out_skipped = 0;
@@ -166,10 +295,12 @@ static int lpr_plan_local(const ZydisDecoder *decoder, const uint8_t *bytes,
         const uint64_t candidate = lpr_find_raw_candidate(bytes, size, search);
         if (candidate == UINT64_MAX) return 0;
         const lpr_candidate_class_t classification = lpr_classify_candidate(
-            decoder, bytes, size, candidate, 0);
+            decoder, bytes, size, candidate, 0, &decode_cache);
         if (classification == LPR_CANDIDATE_AMBIGUOUS) return -1;
         if (classification == LPR_CANDIDATE_SITE) {
-            if (lpr_site_has_decodable_successor(decoder, bytes, size, candidate)) {
+            if (lpr_site_has_decodable_successor(
+                    decoder, bytes, size, candidate, &decode_cache))
+            {
                 if (plan != 0) lpr_plan_set(plan, candidate_index);
             } else {
                 (*out_skipped)++;
@@ -240,10 +371,11 @@ static int lpr_apply_local_second_pass(const ZydisDecoder *decoder,
         const uint64_t candidate = lpr_find_raw_candidate(bytes, size, search);
         if (candidate == UINT64_MAX) return 0;
         const lpr_candidate_class_t classification = lpr_classify_candidate(
-            decoder, bytes, size, candidate, 0);
+            decoder, bytes, size, candidate, 0, 0);
         if (classification == LPR_CANDIDATE_AMBIGUOUS) return -1;
         if (classification == LPR_CANDIDATE_SITE &&
-            lpr_site_has_decodable_successor(decoder, bytes, size, candidate))
+            lpr_site_has_decodable_successor(
+                decoder, bytes, size, candidate, 0))
         {
             bytes[candidate] = LPR_ZPOLINE_PATCH_TO0;
             bytes[candidate + 1u] = LPR_ZPOLINE_PATCH_TO1;

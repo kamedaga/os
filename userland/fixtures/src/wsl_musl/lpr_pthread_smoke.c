@@ -193,5 +193,13 @@ int main(void)
         return 4;
     }
     emit("LPR_PTHREAD_DETACHED_EXIT=OK\n");
+    /* A detached musl thread exits while holding __thread_list_lock and asks
+     * the kernel to clear it after the stack is unmapped.  Verify that the
+     * next creator does not inherit a stale owner TID. */
+    if (!create_join_smoke()) {
+        emit("LPR_PTHREAD_POST_DETACHED_CREATE_JOIN=BAD\n");
+        return 5;
+    }
+    emit("LPR_PTHREAD_POST_DETACHED_CREATE_JOIN=OK\n");
     return 0;
 }

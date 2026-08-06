@@ -1,4 +1,5 @@
 #include "drm_island.h"
+#include "filed_client/module_image.h"
 #include "drm_kms.h"
 
 #include <kobox/device_pachaos_capsule.h>
@@ -178,8 +179,7 @@ static void prepare_file(drmd_handle_t *handle)
 
 int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_config *cfg)
 {
-    if (island == NULL || cfg == NULL || cfg->device_fd < 16 ||
-        cfg->module_count != DRMD_MAX_MODULES) {
+    if (island == NULL || cfg == NULL || cfg->device_fd < 16) {
         return -22;
     }
     memset(island, 0, sizeof(*island));
@@ -209,19 +209,34 @@ int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_
         return -5;
     }
 
+    static const char *const module_names[DRMD_MAX_MODULES] = {
+        "linux_virtio.ko", "linux_virtio_ring.ko",
+        "linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_legacy_dev.ko",
+        "linux_virtio_pci.ko", "linux_virtio_dma_buf.ko",
+        "linux_virtio_gpu.ko",
+    };
+    static const char *const module_paths[DRMD_MAX_MODULES] = {
+        "/usr/lib/kobox/linux_virtio.ko",
+        "/usr/lib/kobox/linux_virtio_ring.ko",
+        "/usr/lib/kobox/linux_virtio_pci_modern_dev.ko",
+        "/usr/lib/kobox/linux_virtio_pci_legacy_dev.ko",
+        "/usr/lib/kobox/linux_virtio_pci.ko",
+        "/usr/lib/kobox/linux_virtio_dma_buf.ko",
+        "/usr/lib/kobox/linux_virtio_gpu.ko",
+    };
     for (uint32_t i = 0; i < DRMD_MAX_MODULES; i++) {
-        const struct drmd_module_config *module = &cfg->modules[i];
-        if (module->image_va == 0 || module->image_size == 0 || module->name[0] == '\0') {
-            return -22;
-        }
+        struct filed_client_module_image loaded;
+        const int load_status = filed_client_load_module_image(
+            FILED_CLIENT_ENDPOINT_FD, module_paths[i], module_names[i], &loaded);
+        if (load_status != 0) return load_status;
         const kb_module_image_t image = {
-            .data = (const void *)(uintptr_t)module->image_va,
-            .size = (size_t)module->image_size,
-            .name = module->name,
+            .data = loaded.data,
+            .size = loaded.size,
+            .name = loaded.name,
         };
         printf("[drmd] module open name=%s bytes=%llu\n",
-            module->name,
-            (unsigned long long)module->image_size);
+            loaded.name,
+            (unsigned long long)loaded.size);
         status = kb_module_open_image(&image, backend, (kb_module_t **)&island->modules[i]);
         if (status != KB_OK || island->modules[i] == NULL) {
             island->load_status = status;
@@ -238,7 +253,7 @@ int drmd_drm_island_init(struct drmd_drm_island *island, const struct drmd_boot_
             island->load_status = init_result;
             return init_result;
         }
-        printf("[drmd] module ready name=%s init=%d\n", module->name, init_result);
+        printf("[drmd] module ready name=%s init=%d source=rootfs\n", loaded.name, init_result);
     }
 
     for (unsigned i = 0; i < 64; i++) {

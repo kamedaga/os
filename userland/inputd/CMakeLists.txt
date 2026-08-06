@@ -10,6 +10,7 @@ set(INPUTD_ELF "${CMAKE_BINARY_DIR}/inputd.elf")
 
 set(KOBOX_RUNTIME_SOURCES
   "${REPO_ROOT}/userland/libipc/src/ipc.c"
+  "${REPO_ROOT}/userland/libfiled_client/src/module_image.c"
   "${REPO_ROOT}/userland/libipc/src/status.c"
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
@@ -84,12 +85,13 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${INPUTD_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Oz -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       "PACHAOS_MUSL_LIBC_EXTRA_CFLAGS=-Oz -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables"
       "PACHAOS_MUSL_EXTRA_LINK_FLAGS=-Wl,--gc-sections -Wl,--strip-all"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${INPUTD_ELF}"
   DEPENDS
+    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/ipc_protocol.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"

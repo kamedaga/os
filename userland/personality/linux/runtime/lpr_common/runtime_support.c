@@ -34,6 +34,7 @@ int lpr_count_exec_local_fds(uint64_t *out_count);
 
 void lpr_filed_session_drop(void)
 {
+    lpr_file_image_cache_clear();
     if (lpr_session_page != 0) {
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,

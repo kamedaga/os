@@ -3,23 +3,34 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 out="${1:-.artifacts/userland-fixtures/lpr-apk-offline-root}"
-repo="${ALPINE_REPO:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64}"
+main_repo="${ALPINE_REPO:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64}"
+community_repo="${ALPINE_COMMUNITY_REPO:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/x86_64}"
 cache="${repo_root}/.artifacts/third_party/alpine-apk-offline"
 
 out_abs="${repo_root}/${out}"
 mkdir -p "${cache}"
 rm -rf "${out_abs}"
 mkdir -p \
+  "${out_abs}/bin" \
   "${out_abs}/cmd" \
+  "${out_abs}/usr/bin" \
+  "${out_abs}/usr/lib" \
   "${out_abs}/opt/apk-offline/bin" \
   "${out_abs}/opt/apk-offline/lib" \
-  "${out_abs}/etc/apk" \
-  "${out_abs}/var/cache/apk/offline/x86_64"
+  "${out_abs}/etc/apk/keys" \
+  "${out_abs}/var/cache/apk/offline/main/x86_64" \
+  "${out_abs}/var/cache/apk/offline/community/x86_64"
 
-index="${cache}/APKINDEX.tar.gz"
-curl -fsSL "${repo}/APKINDEX.tar.gz" -o "${index}"
-index_text="${cache}/APKINDEX"
-tar -xOzf "${index}" APKINDEX >"${index_text}"
+main_index="${cache}/APKINDEX-main.tar.gz"
+community_index="${cache}/APKINDEX-community.tar.gz"
+main_index_text="${cache}/APKINDEX-main"
+community_index_text="${cache}/APKINDEX-community"
+index_text="${cache}/APKINDEX-combined"
+curl -fsSL "${main_repo}/APKINDEX.tar.gz" -o "${main_index}"
+curl -fsSL "${community_repo}/APKINDEX.tar.gz" -o "${community_index}"
+tar -xOzf "${main_index}" APKINDEX >"${main_index_text}"
+tar -xOzf "${community_index}" APKINDEX >"${community_index_text}"
+cat "${main_index_text}" "${community_index_text}" >"${index_text}"
 
 apk_field() {
   local pkg="$1"
@@ -63,6 +74,28 @@ resolve_provider() {
   ' "${index_text}"
 }
 
+package_repo() {
+  local pkg="$1"
+  if awk -v want="${pkg}" '$0 == "P:" want { found = 1; exit } END { exit !found }' "${main_index_text}"; then
+    printf '%s\n' "${main_repo}"
+    return 0
+  fi
+  if awk -v want="${pkg}" '$0 == "P:" want { found = 1; exit } END { exit !found }' "${community_index_text}"; then
+    printf '%s\n' "${community_repo}"
+    return 0
+  fi
+  return 1
+}
+
+package_repo_name() {
+  local pkg="$1"
+  if awk -v want="${pkg}" '$0 == "P:" want { found = 1; exit } END { exit !found }' "${main_index_text}"; then
+    printf 'main\n'
+  else
+    printf 'community\n'
+  fi
+}
+
 declare -A wanted=()
 declare -A queued=()
 queue=()
@@ -84,7 +117,7 @@ enqueue() {
   fi
 }
 
-for pkg in apk-tools zstd grep sed tar xz; do
+for pkg in apk-tools alpine-keys nano zstd grep sed tar xz wget fastfetch; do
   enqueue "${pkg}"
 done
 
@@ -120,10 +153,12 @@ for pkg in "${!wanted[@]}"; do
     exit 1
   fi
   apk="${cache}/${pkg}-${version}.apk"
+  pkg_repo="$(package_repo "${pkg}")"
+  pkg_repo_name="$(package_repo_name "${pkg}")"
   if [[ ! -e "${apk}" ]]; then
-    curl -fsSL "${repo}/${pkg}-${version}.apk" -o "${apk}"
+    curl -fsSL "${pkg_repo}/${pkg}-${version}.apk" -o "${apk}"
   fi
-  cp "${apk}" "${out_abs}/var/cache/apk/offline/x86_64/"
+  cp "${apk}" "${out_abs}/var/cache/apk/offline/${pkg_repo_name}/x86_64/"
 
   rm -rf "${tmp}/root"
   mkdir -p "${tmp}/root"
@@ -142,17 +177,75 @@ for pkg in "${!wanted[@]}"; do
     mkdir -p "${out_abs}/opt/apk-offline/lib/apk"
     cp -a "${tmp}/root/lib/apk/." "${out_abs}/opt/apk-offline/lib/apk/"
   fi
+  if [[ -d "${tmp}/root/etc/apk/keys" ]]; then
+    cp -a "${tmp}/root/etc/apk/keys/." "${out_abs}/etc/apk/keys/"
+  fi
 done
 
-cp "${index}" "${out_abs}/var/cache/apk/offline/x86_64/APKINDEX.tar.gz"
+cp "${main_index}" "${out_abs}/var/cache/apk/offline/main/x86_64/APKINDEX.tar.gz"
+cp "${community_index}" "${out_abs}/var/cache/apk/offline/community/x86_64/APKINDEX.tar.gz"
 cat >"${out_abs}/etc/apk/repositories" <<'EOF'
-/var/cache/apk/offline
+/var/cache/apk/offline/main
+/var/cache/apk/offline/community
 EOF
 cat >"${out_abs}/etc/apk/world" <<'EOF'
 EOF
 cat >"${out_abs}/etc/apk/arch" <<'EOF'
 x86_64
 EOF
+cat >"${out_abs}/etc/apk/config" <<'EOF'
+sync no
+logfile no
+EOF
+
+cp "${out_abs}/opt/apk-offline/bin/apk" "${out_abs}/bin/apk"
+cp "${out_abs}/opt/apk-offline/bin/apk" "${out_abs}/usr/bin/apk"
+for library in libapk.so.3.0.0 libssl.so.3 libcrypto.so.3; do
+  cp -a "${out_abs}/opt/apk-offline/lib/${library}" "${out_abs}/usr/lib/${library}"
+done
+
+musl_version="$(apk_field musl V)"
+musl_apk="${cache}/musl-${musl_version}.apk"
+mkdir -p "${tmp}/musl-runtime"
+tar --warning=no-unknown-keyword -xzf "${musl_apk}" -C "${tmp}/musl-runtime"
+install_root="${tmp}/installed-root"
+mkdir -p \
+  "${install_root}/etc/apk/keys" \
+  "${install_root}/lib/apk/db" \
+  "${install_root}/var/lib/apk"
+cp -a "${out_abs}/etc/apk/keys/." "${install_root}/etc/apk/keys/"
+cp "${out_abs}/etc/apk/arch" "${install_root}/etc/apk/arch"
+printf '%s\n' \
+  "${out_abs}/var/cache/apk/offline/main" \
+  "${out_abs}/var/cache/apk/offline/community" \
+  >"${install_root}/etc/apk/repositories"
+LD_LIBRARY_PATH="${out_abs}/opt/apk-offline/lib" \
+  "${tmp}/musl-runtime/lib/ld-musl-x86_64.so.1" \
+  "${out_abs}/opt/apk-offline/bin/apk" \
+  --root "${install_root}" \
+  --usermode \
+  --no-network \
+  --no-cache \
+  add --initdb
+LD_LIBRARY_PATH="${out_abs}/opt/apk-offline/lib" \
+  "${tmp}/musl-runtime/lib/ld-musl-x86_64.so.1" \
+  "${out_abs}/opt/apk-offline/bin/apk" \
+  --root "${install_root}" \
+  --usermode \
+  --no-network \
+  --no-cache \
+  --sync=no \
+  --logfile=no \
+  --repository "${out_abs}/var/cache/apk/offline/main" \
+  --repository "${out_abs}/var/cache/apk/offline/community" \
+  add nano grep
+mkdir -p "${out_abs}/lib/apk/db"
+cp -a "${install_root}/lib/apk/db/." "${out_abs}/lib/apk/db/"
+cp "${install_root}/etc/apk/world" "${out_abs}/etc/apk/world"
+cp "${install_root}/usr/bin/nano" "${out_abs}/usr/bin/nano"
+cp -a "${install_root}/usr/bin/rnano" "${out_abs}/usr/bin/rnano"
+cp "${install_root}/bin/grep" "${out_abs}/bin/grep"
+cp "${install_root}/bin/grep" "${out_abs}/usr/bin/grep"
 
 find "${out_abs}" -type f -perm /111 -exec chmod 0755 {} +
 

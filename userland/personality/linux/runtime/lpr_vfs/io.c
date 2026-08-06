@@ -93,6 +93,7 @@ static int64_t lpr_filed_io_chunked(
 
 static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
     const lpr_filed_backend_t *file,
+    uint64_t fd,
     uint64_t offset,
     uint64_t requested)
 {
@@ -103,21 +104,55 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
     {
         return 0;
     }
-    const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
+    uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
     if (requested > LPR_FILED_PAGE_CACHE_BYTES - (offset - page_start)) {
         return 0;
+    }
+    uint64_t fill_length = LPR_FILED_PAGE_CACHE_BYTES;
+    uint64_t live_generation = 0;
+    const int batch_whole_file =
+        file->pread_active &&
+        file->stat_size > LPR_FILED_PAGE_CACHE_BYTES &&
+        file->stat_size <= LPR_FILED_BATCH_CACHE_BYTES &&
+        file->object_generation != 0 &&
+        lpr_filed_live_object_generation(file->handle, &live_generation) == 0 &&
+        live_generation == file->object_generation;
+    if (batch_whole_file) {
+        page_start = 0;
+        fill_length = file->stat_size;
+        lpr_page_cache_invalidate_handle(file->handle);
     }
     lpr_filed_page_cache_entry_t *entry =
         lpr_page_cache_find_marker(file->handle, page_start);
     if (entry == 0) {
         entry = lpr_page_cache_slot();
     }
-    const int64_t n = lpr_filed_io_handle(
-        FILED_OP_VFS_PREAD,
-        file->handle,
-        (uint64_t)(uintptr_t)entry->data,
-        LPR_FILED_PAGE_CACHE_BYTES,
-        page_start);
+    int64_t n = -1;
+    if (batch_whole_file) {
+        int vmo_fd = -1;
+        unsigned char *mapped = 0;
+        uint64_t map_len = 0;
+        lpr_state_lock(&lpr_state.filed_rpc.readv_lock_word);
+        if (lpr_readv_scratch_vmo(fill_length, &vmo_fd, &mapped, &map_len) == 0) {
+            n = lpr_linux_pread_to_vmo(
+                fd,
+                (uint64_t)(uint32_t)vmo_fd,
+                0,
+                fill_length,
+                0);
+            if (n > 0) {
+                lpr_memcpy(entry->data, mapped, (size_t)n);
+            }
+        }
+        lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
+    } else {
+        n = lpr_filed_io_handle(
+            FILED_OP_VFS_PREAD,
+            file->handle,
+            (uint64_t)(uintptr_t)entry->data,
+            fill_length,
+            page_start);
+    }
     if (n <= 0) {
         return 0;
     }
@@ -126,6 +161,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
     entry->handle = file->handle;
     entry->page_start = page_start;
     entry->length = (uint64_t)n;
+    entry->object_generation = batch_whole_file ? live_generation : 0;
     entry->clock = ++lpr_page_cache_clock;
     if (offset + requested < offset ||
         offset + requested > entry->page_start + entry->length)
@@ -137,12 +173,22 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
 
 static lpr_filed_page_cache_entry_t *lpr_page_cache_get(
     const lpr_filed_backend_t *file,
+    uint64_t fd,
     uint64_t offset,
     uint64_t requested,
     int *out_hit)
 {
     lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_lookup(file->handle, offset, requested);
+        lpr_page_cache_lookup(
+            file->handle, file->object_generation, offset, requested);
+    if (entry != 0 &&
+        file->pread_active &&
+        file->stat_size > LPR_FILED_PAGE_CACHE_BYTES &&
+        file->stat_size <= LPR_FILED_BATCH_CACHE_BYTES &&
+        entry->length < file->stat_size)
+    {
+        entry = 0;
+    }
     if (entry != 0) {
         if (out_hit != 0) {
             *out_hit = 1;
@@ -152,11 +198,12 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_get(
     if (out_hit != 0) {
         *out_hit = 0;
     }
-    return lpr_page_cache_fill(file, offset, requested);
+    return lpr_page_cache_fill(file, fd, offset, requested);
 }
 
 static int64_t lpr_read_from_page_cache(
     const lpr_filed_backend_t *file,
+    uint64_t fd,
     uint64_t buf,
     uint64_t requested,
     uint64_t offset)
@@ -171,26 +218,35 @@ static int64_t lpr_read_from_page_cache(
     const uint64_t page_offset = offset - page_start;
     if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
         lpr_filed_page_cache_entry_t *entry = lpr_page_cache_get(
-            file, offset, requested, 0);
+            file, fd, offset, requested, 0);
         if (entry == 0) {
             return -1;
         }
-        lpr_memcpy((void *)(uintptr_t)buf, entry->data + page_offset, (size_t)requested);
+        lpr_memcpy(
+            (void *)(uintptr_t)buf,
+            entry->data + (offset - entry->page_start),
+            (size_t)requested);
         return (int64_t)requested;
     }
 
     const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
     const uint64_t second_len = requested - first_len;
     lpr_filed_page_cache_entry_t *first = lpr_page_cache_get(
-        file, offset, first_len, 0);
+        file, fd, offset, first_len, 0);
     lpr_filed_page_cache_entry_t *second =
-        first != 0 ? lpr_page_cache_get(file, offset + first_len, second_len, 0) : 0;
+        first != 0 ? lpr_page_cache_get(file, fd, offset + first_len, second_len, 0) : 0;
     if (first == 0 || second == 0) {
         return -1;
     }
     unsigned char *dst = (unsigned char *)(uintptr_t)buf;
-    lpr_memcpy(dst, first->data + page_offset, (size_t)first_len);
-    lpr_memcpy(dst + first_len, second->data, (size_t)second_len);
+    lpr_memcpy(
+        dst,
+        first->data + (offset - first->page_start),
+        (size_t)first_len);
+    lpr_memcpy(
+        dst + first_len,
+        second->data + (offset + first_len - second->page_start),
+        (size_t)second_len);
     return (int64_t)requested;
 }
 
@@ -314,7 +370,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
         {
             const uint64_t offset = lpr_filed_control_offset(fd);
             const int64_t cached = lpr_read_from_page_cache(
-                file, buf, count, offset);
+                file, fd, buf, count, offset);
             if (cached >= 0) {
                 lpr_filed_control_advance_offset(fd, offset, (uint64_t)cached);
                 file->pread_active = 1;
@@ -458,14 +514,18 @@ int64_t lpr_backend_readv(
                 if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
                     int cache_hit = 0;
                     lpr_filed_page_cache_entry_t *entry =
-                        lpr_page_cache_get(file, offset, requested, &cache_hit);
+                        lpr_page_cache_get(file, fd, offset, requested, &cache_hit);
                     if (entry != 0) {
                         if (cache_hit) {
                             lpr_readv_cache_hit++;
                         } else {
                             lpr_readv_cache_fill++;
                         }
-                        (void)lpr_scatter_iov(iov, iov_count, entry->data + page_offset, requested);
+                        (void)lpr_scatter_iov(
+                            iov,
+                            iov_count,
+                            entry->data + (offset - entry->page_start),
+                            requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
                         file->pread_active = 1;
                         return (int64_t)requested;
@@ -477,14 +537,21 @@ int64_t lpr_backend_readv(
                     int first_hit = 0;
                     int second_hit = 0;
                     lpr_filed_page_cache_entry_t *first =
-                        lpr_page_cache_get(file, offset, first_len, &first_hit);
+                        lpr_page_cache_get(file, fd, offset, first_len, &first_hit);
                     lpr_filed_page_cache_entry_t *second =
                         first != 0 ? lpr_page_cache_get(
-                            file, offset + first_len, second_len, &second_hit) : 0;
+                            file, fd, offset + first_len, second_len, &second_hit) : 0;
                     if (first != 0 && second != 0) {
                         uint8_t cache_scratch[LPR_FILED_PAGE_CACHE_BYTES];
-                        lpr_memcpy(cache_scratch, first->data + page_offset, (size_t)first_len);
-                        lpr_memcpy(cache_scratch + first_len, second->data, (size_t)second_len);
+                        lpr_memcpy(
+                            cache_scratch,
+                            first->data + (offset - first->page_start),
+                            (size_t)first_len);
+                        lpr_memcpy(
+                            cache_scratch + first_len,
+                            second->data +
+                                (offset + first_len - second->page_start),
+                            (size_t)second_len);
                         if (first_hit && second_hit) {
                             lpr_readv_cache_hit++;
                         } else {

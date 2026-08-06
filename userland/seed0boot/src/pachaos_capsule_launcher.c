@@ -1,15 +1,12 @@
+#define _GNU_SOURCE
+
 #include "pachaos_capsule_launcher.h"
 
 #include "bootfs_reader.h"
 #include "bootstrap_abi.h"
-#include "drmd/boot_config.h"
-#include "inputd/boot_config.h"
 #include "next_stage_loader.h"
-#include "netd/boot_config.h"
 #include "pacha/ipc.h"
-#include "pachaos_capsule/boot_config.h"
 #include "storage_boot/boot_config.h"
-#include "termd/boot_config.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -18,1035 +15,130 @@
 enum {
     SEED0_QEMU_NVME_VENDOR_ID = 0x1b36,
     SEED0_QEMU_NVME_DEVICE_ID = 0x0010,
-    SEED0_VIRTIO_VENDOR_ID = 0x1af4,
-    SEED0_VIRTIO_NET_LEGACY_DEVICE_ID = 0x1000,
-    SEED0_VIRTIO_NET_MODERN_DEVICE_ID = 0x1041,
-    SEED0_VIRTIO_CONSOLE_LEGACY_DEVICE_ID = 0x1003,
-    SEED0_VIRTIO_CONSOLE_MODERN_DEVICE_ID = 0x1043,
-    SEED0_VIRTIO_GPU_LEGACY_DEVICE_ID = 0x1010,
-    SEED0_VIRTIO_GPU_MODERN_DEVICE_ID = 0x1050,
-    SEED0_VIRTIO_INPUT_MODERN_DEVICE_ID = 0x1052,
-    SEED0_FILED_ENDPOINT_FD = 240,
-    SEED0_NETD_SOCKET_ENDPOINT_FD = 241,
-    SEED0_TERMD_TTY_ENDPOINT_FD = 242,
-    SEED0_DRMD_DRM_ENDPOINT_FD = 243,
-    SEED0_INPUTD_INPUT_ENDPOINT_FD = 244,
 };
 
-static const uint64_t seed0_netd_endpoint_rights =
-    PACHA_FD_RIGHT_INSPECT |
-    PACHA_FD_RIGHT_DUP |
-    PACHA_FD_RIGHT_WAIT |
-    PACHA_FD_RIGHT_POLL |
-    PACHA_FD_RIGHT_SET_FLAGS |
-    PACHA_FD_RIGHT_CLOSE |
-    PACHA_FD_RIGHT_SEND |
-    PACHA_FD_RIGHT_RECV |
-    PACHA_FD_RIGHT_CALL |
-    PACHA_FD_RIGHT_TRANSFER;
+static int mark_inherit(int fd);
 
-static const uint64_t seed0_termd_endpoint_rights =
-    PACHA_FD_RIGHT_INSPECT |
-    PACHA_FD_RIGHT_DUP |
-    PACHA_FD_RIGHT_WAIT |
-    PACHA_FD_RIGHT_POLL |
-    PACHA_FD_RIGHT_SET_FLAGS |
-    PACHA_FD_RIGHT_CLOSE |
-    PACHA_FD_RIGHT_SEND |
-    PACHA_FD_RIGHT_RECV |
-    PACHA_FD_RIGHT_CALL |
-    PACHA_FD_RIGHT_TRANSFER;
-
-static const struct seed0_device_descriptor *find_nvme_device(const struct seed0_init_descriptor_page *desc)
+static const struct seed0_device_descriptor *find_nvme_device(
+    const struct seed0_init_descriptor_page *desc)
 {
-    if (desc == 0) {
-        return 0;
-    }
+    if (desc == NULL) return NULL;
     uint64_t count = desc->device_count;
-    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) {
+    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS)
         count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
-    }
     for (uint64_t i = 0; i < count; i++) {
         const struct seed0_device_descriptor *device = &desc->devices[i];
-        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
-            !seed0_fd_is_dynamic(device->init_device_fd)) {
-            continue;
-        }
-        if (device->vendor_id == SEED0_QEMU_NVME_VENDOR_ID &&
-            device->device_id == SEED0_QEMU_NVME_DEVICE_ID) {
+        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) != 0 &&
+            seed0_fd_is_dynamic(device->init_device_fd) &&
+            device->vendor_id == SEED0_QEMU_NVME_VENDOR_ID &&
+            device->device_id == SEED0_QEMU_NVME_DEVICE_ID)
             return device;
-        }
     }
-    return 0;
+    return NULL;
 }
 
-static const struct seed0_device_descriptor *find_virtio_net_device(const struct seed0_init_descriptor_page *desc)
+static int create_inherited_vmo(const void *data, uint64_t size, const char *label)
 {
-    if (desc == 0) {
-        return 0;
-    }
-    uint64_t count = desc->device_count;
-    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) {
-        count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
-    }
-    for (uint64_t i = 0; i < count; i++) {
-        const struct seed0_device_descriptor *device = &desc->devices[i];
-        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
-            !seed0_fd_is_dynamic(device->init_device_fd)) {
-            continue;
-        }
-        if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
-            (device->device_id == SEED0_VIRTIO_NET_LEGACY_DEVICE_ID ||
-             device->device_id == SEED0_VIRTIO_NET_MODERN_DEVICE_ID)) {
-            return device;
-        }
-    }
-    return 0;
-}
-
-static const struct seed0_device_descriptor *find_virtio_console_device(const struct seed0_init_descriptor_page *desc)
-{
-    if (desc == 0) {
-        return 0;
-    }
-    uint64_t count = desc->device_count;
-    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) {
-        count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
-    }
-    for (uint64_t i = 0; i < count; i++) {
-        const struct seed0_device_descriptor *device = &desc->devices[i];
-        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
-            !seed0_fd_is_dynamic(device->init_device_fd)) {
-            continue;
-        }
-        if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
-            (device->device_id == SEED0_VIRTIO_CONSOLE_LEGACY_DEVICE_ID ||
-             device->device_id == SEED0_VIRTIO_CONSOLE_MODERN_DEVICE_ID)) {
-            return device;
-        }
-    }
-    return 0;
-}
-
-static const struct seed0_device_descriptor *find_virtio_gpu_device(const struct seed0_init_descriptor_page *desc)
-{
-    if (desc == 0) {
-        return 0;
-    }
-    uint64_t count = desc->device_count;
-    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) {
-        count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
-    }
-    for (uint64_t i = 0; i < count; i++) {
-        const struct seed0_device_descriptor *device = &desc->devices[i];
-        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
-            !seed0_fd_is_dynamic(device->init_device_fd)) {
-            continue;
-        }
-        if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
-            (device->device_id == SEED0_VIRTIO_GPU_LEGACY_DEVICE_ID ||
-             device->device_id == SEED0_VIRTIO_GPU_MODERN_DEVICE_ID)) {
-            return device;
-        }
-    }
-    return 0;
-}
-
-static size_t find_virtio_input_devices(
-    const struct seed0_init_descriptor_page *desc,
-    const struct seed0_device_descriptor **out_devices,
-    size_t capacity)
-{
-    if (desc == NULL || out_devices == NULL || capacity == 0) return 0;
-    uint64_t count = desc->device_count;
-    if (count > SEED0_INIT_MAX_DEVICE_DESCRIPTORS) count = SEED0_INIT_MAX_DEVICE_DESCRIPTORS;
-    size_t found = 0;
-    for (uint64_t i = 0; i < count; i++) {
-        const struct seed0_device_descriptor *device = &desc->devices[i];
-        if ((device->flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
-            !seed0_fd_is_dynamic(device->init_device_fd)) continue;
-        if (device->vendor_id == SEED0_VIRTIO_VENDOR_ID &&
-            device->device_id == SEED0_VIRTIO_INPUT_MODERN_DEVICE_ID) {
-            if (found == capacity) return 0;
-            out_devices[found++] = device;
-        }
-    }
-    return found;
-}
-
-struct seed0_capsule_module_spec {
-    const char *path;
-    const char *name;
-};
-
-static int seed0_create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
-{
-    if (data == 0 || size == 0 || size > UINT64_MAX - 4095ull) {
-        return -1;
-    }
-    const uint64_t map_size = (size + 4095ull) & ~4095ull;
-    const uint64_t rights =
-        PACHA_FD_RIGHT_INSPECT |
+    if (data == NULL || size == 0 || size > UINT64_MAX - 4095u) return -22;
+    const uint64_t map_size = (size + 4095u) & ~4095ull;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_READ |
-        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
     const int fd = pacha_vmo_create(map_size, rights, PACHA_FD_FLAG_INHERIT);
-    if (fd < 16) {
-        fprintf(stderr, "[seed0boot] %s: vmo_create failed status=%d\n", label, fd);
-        return -2;
-    }
-    unsigned char *mapped = pacha_mmap(fd, map_size, PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
-    if (mapped == 0) {
+    if (fd < 16) return fd;
+    void *mapped = pacha_mmap(fd, map_size,
+        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    if (mapped == NULL) {
         (void)pacha_fd_close(fd);
-        return -3;
+        return -5;
     }
     memset(mapped, 0, (size_t)map_size);
     memcpy(mapped, data, (size_t)size);
     (void)pacha_munmap(mapped, map_size);
+    printf("[seed0boot] inherited VMO ready label=%s fd=%d size=%llu\n",
+        label, fd, (unsigned long long)size);
     return fd;
 }
 
-static int mark_device_inherit(int device_fd, const char *label)
+static int create_inherited_readonly_vmo(
+    const void *data, uint64_t size, const char *label)
 {
-    long flag_status = pacha_fd_fcntl(
-        device_fd,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        PACHA_FD_FLAG_INHERIT,
-        PACHA_FD_FLAG_INHERIT);
-    if (flag_status != 0) {
-        fprintf(stderr, "[seed0boot] %s: mark device fd inherit failed fd=%d status=%ld\n",
-            label,
-            device_fd,
-            flag_status);
-        return -4;
+    const int writable_fd = create_inherited_vmo(data, size, label);
+    if (writable_fd < 16) return writable_fd;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_MAP_READ;
+    const long readonly_fd = pacha_fd_fcntl(
+        writable_fd, PACHA_FD_FCNTL_DUP, 16, rights);
+    (void)pacha_fd_close(writable_fd);
+    if (readonly_fd < 16) return (int)readonly_fd;
+    if (mark_inherit((int)readonly_fd) != 0) {
+        (void)pacha_fd_close((int)readonly_fd);
+        return -13;
     }
-    return 0;
+    return (int)readonly_fd;
 }
 
-int seed0_launch_pachaos_capsule_nvme(void)
+static int mark_inherit(int fd)
 {
-    static const struct seed0_capsule_module_spec module_specs[] = {
-        {"/srv/kobox/nvme-auth.ko", "nvme-auth.ko"},
-        {"/srv/kobox/nvme-core.ko", "nvme-core.ko"},
-        {"/srv/kobox/nvme.ko", "nvme.ko"},
-    };
+    if (fd < 16) return -22;
+    return (int)pacha_fd_fcntl(fd, PACHA_FD_FCNTL_SET_FLAGS,
+        PACHA_FD_FLAG_INHERIT, PACHA_FD_FLAG_INHERIT);
+}
 
+int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channel_fd)
+{
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
-    const struct seed0_device_descriptor *device = find_nvme_device(desc);
-    if (device == 0) {
-        fprintf(stderr, "[seed0boot] pachaos_capsule: NVMe device fd not found\n");
-        return -1;
-    }
-    const int device_fd = (int)device->init_device_fd;
+    const struct seed0_device_descriptor *nvme = find_nvme_device(desc);
+    if (nvme == NULL || ready_channel_fd < 16 || root_handoff_channel_fd < 16)
+        return -22;
 
-    const unsigned char *daemon_image = 0;
+    const unsigned char *daemon = NULL;
     uint32_t daemon_size = 0;
-    int status = seed0_bootfs_open_file("/srv/pachaos_capsule.elf", &daemon_image, &daemon_size);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] pachaos_capsule: open daemon from bootfs failed status=%d\n", status);
-        return -2;
-    }
-    const unsigned char *module_images[PACHAOS_CAPSULE_MAX_MODULES];
-    uint32_t module_sizes[PACHAOS_CAPSULE_MAX_MODULES];
-    memset(module_images, 0, sizeof(module_images));
-    memset(module_sizes, 0, sizeof(module_sizes));
-    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] pachaos_capsule: open %s from bootfs failed status=%d\n",
-                module_specs[i].path,
-                status);
-            return -3;
-        }
-        if ((uint64_t)module_sizes[i] > PACHAOS_CAPSULE_MODULE_IMAGE_STRIDE) {
-            fprintf(stderr, "[seed0boot] pachaos_capsule: %s too large size=%u stride=%llu\n",
-                module_specs[i].path,
-                module_sizes[i],
-                (unsigned long long)PACHAOS_CAPSULE_MODULE_IMAGE_STRIDE);
-            return -3;
-        }
-    }
-
-    status = mark_device_inherit(device_fd, "pachaos_capsule");
+    int status = seed0_bootfs_open_file(
+        "/srv/storage_boot.elf", &daemon, &daemon_size);
     if (status != 0) return status;
 
-    struct seed0_loaded_process loaded;
-    status = seed0_load_elf_process("/srv/pachaos_capsule.elf", daemon_image, daemon_size, &loaded);
-    if (status != 0) {
-        return status;
-    }
-
-    struct pachaos_capsule_boot_config config;
-    memset(&config, 0, sizeof(config));
-    config.magic = PACHAOS_CAPSULE_BOOT_CONFIG_MAGIC;
-    config.version = PACHAOS_CAPSULE_BOOT_CONFIG_VERSION;
-    config.device_fd = (uint64_t)(uint32_t)device_fd;
-    config.module_count = module_count;
-    config.workload = PACHAOS_CAPSULE_WORKLOAD_NVME;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_va = PACHAOS_CAPSULE_MODULE_IMAGE_VA +
-            (PACHAOS_CAPSULE_MODULE_IMAGE_STRIDE * i);
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
-    }
-
-    status = seed0_map_bytes_into_process(
-        loaded.process_fd,
-        PACHAOS_CAPSULE_BOOT_CONFIG_VA,
-        &config,
-        sizeof(config),
-        PACHA_PROT_READ);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] pachaos_capsule: config map failed status=%d\n", status);
+    if (desc->bootfs_archive.image_va == 0 || desc->bootfs_archive.size_bytes == 0)
         return -5;
-    }
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(
-            loaded.process_fd,
-            config.modules[i].image_va,
-            module_images[i],
-            module_sizes[i],
-            PACHA_PROT_READ);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] pachaos_capsule: module map failed name=%s status=%d\n",
-                module_specs[i].name,
-                status);
-            return -6;
-        }
+    const int bootfs_fd = create_inherited_readonly_vmo(
+        (const void *)(uintptr_t)desc->bootfs_archive.image_va,
+        desc->bootfs_archive.size_bytes,
+        "bootfs archive");
+    if (bootfs_fd < 16) return bootfs_fd;
+
+    const int device_fd = (int)nvme->init_device_fd;
+    if (mark_inherit(device_fd) != 0 || mark_inherit(ready_channel_fd) != 0 ||
+        mark_inherit(root_handoff_channel_fd) != 0) {
+        (void)pacha_fd_close(bootfs_fd);
+        return -13;
     }
 
-    (void)device_fd;
-    (void)daemon_size;
-    printf("[seed0boot] pachaos_capsule modules=%llu\n",
-        (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/pachaos_capsule.elf", -1);
-    if (status != 0) {
-        return status;
-    }
-    return 0;
-}
-
-int seed0_launch_netd(int filed_endpoint_fd, int *out_socket_endpoint_fd)
-{
-    static const struct seed0_capsule_module_spec module_specs[] = {
-        {"/srv/kobox/virtio.ko", "virtio.ko"},
-        {"/srv/kobox/virtio_ring.ko", "virtio_ring.ko"},
-        {"/srv/kobox/virtio_pci.ko", "virtio_pci.ko"},
-        {"/srv/kobox/failover.ko", "failover.ko"},
-        {"/srv/kobox/net_failover.ko", "net_failover.ko"},
-        {"/srv/kobox/virtio_net.ko", "virtio_net.ko"},
-    };
-
-    if (out_socket_endpoint_fd != 0) {
-        *out_socket_endpoint_fd = -1;
-    }
-
-    const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
-    const struct seed0_device_descriptor *device = find_virtio_net_device(desc);
-    if (device == 0) {
-        printf("[seed0boot] netd: virtio-net device fd not found, skipping\n");
-        return 0;
-    }
-    const int device_fd = (int)device->init_device_fd;
-    if (filed_endpoint_fd < 16) {
-        fprintf(stderr, "[seed0boot] netd: filed endpoint fd missing\n");
-        return -1;
-    }
-
-    const unsigned char *daemon_image = 0;
-    uint32_t daemon_size = 0;
-    int status = seed0_bootfs_open_file("/srv/netd.elf", &daemon_image, &daemon_size);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] netd: open daemon from bootfs failed status=%d\n", status);
-        return -2;
-    }
-    const unsigned char *module_images[NETD_MAX_MODULES];
-    uint32_t module_sizes[NETD_MAX_MODULES];
-    memset(module_images, 0, sizeof(module_images));
-    memset(module_sizes, 0, sizeof(module_sizes));
-    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] netd: open %s from bootfs failed status=%d\n",
-                module_specs[i].path,
-                status);
-            return -3;
-        }
-        if ((uint64_t)module_sizes[i] > NETD_MODULE_IMAGE_STRIDE) {
-            fprintf(stderr, "[seed0boot] netd: %s too large size=%u stride=%llu\n",
-                module_specs[i].path,
-                module_sizes[i],
-                (unsigned long long)NETD_MODULE_IMAGE_STRIDE);
-            return -3;
-        }
-    }
-
-    status = mark_device_inherit(device_fd, "netd");
-    if (status != 0) return status;
-
-    const long endpoint_dup = pacha_fd_fcntl(
-        filed_endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        SEED0_FILED_ENDPOINT_FD,
-        PACHA_FD_RIGHT_INSPECT |
-            PACHA_FD_RIGHT_DUP |
-            PACHA_FD_RIGHT_WAIT |
-            PACHA_FD_RIGHT_POLL |
-            PACHA_FD_RIGHT_SET_FLAGS |
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_SEND |
-            PACHA_FD_RIGHT_RECV |
-            PACHA_FD_RIGHT_CALL |
-            PACHA_FD_RIGHT_TRANSFER);
-    if (endpoint_dup != SEED0_FILED_ENDPOINT_FD) {
-        fprintf(stderr,
-            "[seed0boot] netd: filed endpoint dup failed status=%ld target=%u\n",
-            endpoint_dup,
-            SEED0_FILED_ENDPOINT_FD);
-        return -4;
-    }
-    status = mark_device_inherit(SEED0_FILED_ENDPOINT_FD, "netd filed endpoint");
-    if (status != 0) return status;
-
-    const int socket_endpoint_fd = pacha_ipc_endpoint_create(seed0_netd_endpoint_rights, 0);
-    if (socket_endpoint_fd < 16) {
-        fprintf(stderr, "[seed0boot] netd: socket endpoint create failed status=%d\n", socket_endpoint_fd);
-        return socket_endpoint_fd < 0 ? socket_endpoint_fd : -2;
-    }
-    const long socket_endpoint_dup = pacha_fd_fcntl(
-        socket_endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        SEED0_NETD_SOCKET_ENDPOINT_FD,
-        seed0_netd_endpoint_rights);
-    if (socket_endpoint_dup != SEED0_NETD_SOCKET_ENDPOINT_FD) {
-        fprintf(stderr,
-            "[seed0boot] netd: socket endpoint dup failed status=%ld target=%u\n",
-            socket_endpoint_dup,
-            SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(socket_endpoint_fd);
-        return -4;
-    }
-    status = mark_device_inherit(SEED0_NETD_SOCKET_ENDPOINT_FD, "netd socket endpoint");
-    if (status != 0) {
-        (void)pacha_fd_close(socket_endpoint_fd);
-        return status;
-    }
-
-    struct seed0_loaded_process loaded;
-    status = seed0_load_elf_process("/srv/netd.elf", daemon_image, daemon_size, &loaded);
-    if (status != 0) {
-        (void)pacha_fd_close(socket_endpoint_fd);
-        return status;
-    }
-
-    struct netd_boot_config config;
-    memset(&config, 0, sizeof(config));
-    config.magic = NETD_BOOT_CONFIG_MAGIC;
-    config.device_fd = (uint64_t)(uint32_t)device_fd;
-    config.socket_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
-    config.module_count = module_count;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_va = NETD_MODULE_IMAGE_VA +
-            (NETD_MODULE_IMAGE_STRIDE * i);
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
-    }
-
-    status = seed0_map_bytes_into_process(
-        loaded.process_fd,
-        NETD_BOOT_CONFIG_VA,
-        &config,
-        sizeof(config),
-        PACHA_PROT_READ);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] netd: config map failed status=%d\n", status);
-        return -5;
-    }
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(
-            loaded.process_fd,
-            config.modules[i].image_va,
-            module_images[i],
-            module_sizes[i],
-            PACHA_PROT_READ);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] netd: module map failed name=%s status=%d\n",
-                module_specs[i].name,
-                status);
-            return -6;
-        }
-    }
-
-    printf("[seed0boot] netd modules=%llu\n",
-        (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/netd.elf", -1);
-    if (status != 0) {
-        (void)pacha_fd_close(socket_endpoint_fd);
-        return status;
-    }
-    (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-    if (out_socket_endpoint_fd != 0) {
-        *out_socket_endpoint_fd = socket_endpoint_fd;
-    } else {
-        (void)pacha_fd_close(socket_endpoint_fd);
-    }
-    return 0;
-}
-
-int seed0_launch_termd(int ready_channel_fd, int *out_tty_endpoint_fd)
-{
-    static const struct seed0_capsule_module_spec module_specs[] = {
-        {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
-        {"/srv/kobox/linux_virtio_ring.ko", "linux_virtio_ring.ko"},
-        {"/srv/kobox/linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_modern_dev.ko"},
-        {"/srv/kobox/linux_virtio_pci_legacy_dev.ko", "linux_virtio_pci_legacy_dev.ko"},
-        {"/srv/kobox/linux_virtio_pci.ko", "linux_virtio_pci.ko"},
-        {"/srv/kobox/linux_tty_core.ko", "linux_tty_core.ko"},
-        {"/srv/kobox/linux_tty_n_null.ko", "linux_tty_n_null.ko"},
-        {"/srv/kobox/linux_virtio_console.ko", "linux_virtio_console.ko"},
-    };
-
-    if (out_tty_endpoint_fd != 0) {
-        *out_tty_endpoint_fd = -1;
-    }
-    if (ready_channel_fd < 16) {
-        fprintf(stderr, "[seed0boot] termd: ready channel fd missing\n");
-        return -1;
-    }
-
-    const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
-    const struct seed0_device_descriptor *device = find_virtio_console_device(desc);
-    int device_fd = -1;
-    if (device != 0) {
-        device_fd = (int)device->init_device_fd;
-        int inherit_status = mark_device_inherit(device_fd, "termd virtio-console");
-        if (inherit_status != 0) {
-            return inherit_status;
-        }
-    } else {
-        printf("[seed0boot] termd: virtio-console device fd not found, using tty-only backend\n");
-    }
-
-    const unsigned char *daemon_image = 0;
-    uint32_t daemon_size = 0;
-    int status = seed0_bootfs_open_file("/srv/termd.elf", &daemon_image, &daemon_size);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] termd: open daemon from bootfs failed status=%d\n", status);
-        return -2;
-    }
-    const unsigned char *module_images[TERMD_MAX_MODULES];
-    uint32_t module_sizes[TERMD_MAX_MODULES];
-    memset(module_images, 0, sizeof(module_images));
-    memset(module_sizes, 0, sizeof(module_sizes));
-    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] termd: open %s from bootfs failed status=%d\n",
-                module_specs[i].path,
-                status);
-            return -3;
-        }
-        if ((uint64_t)module_sizes[i] > TERMD_MODULE_IMAGE_STRIDE) {
-            fprintf(stderr, "[seed0boot] termd: %s too large size=%u stride=%llu\n",
-                module_specs[i].path,
-                module_sizes[i],
-                (unsigned long long)TERMD_MODULE_IMAGE_STRIDE);
-            return -3;
-        }
-    }
-
-    const int tty_endpoint_fd = pacha_ipc_endpoint_create(seed0_termd_endpoint_rights, 0);
-    if (tty_endpoint_fd < 16) {
-        fprintf(stderr, "[seed0boot] termd: tty endpoint create failed status=%d\n", tty_endpoint_fd);
-        return tty_endpoint_fd < 0 ? tty_endpoint_fd : -2;
-    }
-
-    const long tty_endpoint_dup = pacha_fd_fcntl(
-        tty_endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        SEED0_TERMD_TTY_ENDPOINT_FD,
-        seed0_termd_endpoint_rights);
-    if (tty_endpoint_dup != SEED0_TERMD_TTY_ENDPOINT_FD) {
-        fprintf(stderr,
-            "[seed0boot] termd: tty endpoint dup failed status=%ld target=%u\n",
-            tty_endpoint_dup,
-            SEED0_TERMD_TTY_ENDPOINT_FD);
-        (void)pacha_fd_close(tty_endpoint_fd);
-        return -4;
-    }
-
-    status = mark_device_inherit(SEED0_TERMD_TTY_ENDPOINT_FD, "termd tty endpoint");
-    if (status != 0) {
-        (void)pacha_fd_close(tty_endpoint_fd);
-        return status;
-    }
-    status = mark_device_inherit(ready_channel_fd, "termd ready channel");
-    if (status != 0) {
-        (void)pacha_fd_close(tty_endpoint_fd);
-        return status;
-    }
-
-    struct seed0_loaded_process loaded;
-    status = seed0_load_elf_process("/srv/termd.elf", daemon_image, daemon_size, &loaded);
-    if (status != 0) {
-        (void)pacha_fd_close(tty_endpoint_fd);
-        return status;
-    }
-
-    struct termd_boot_config config;
-    memset(&config, 0, sizeof(config));
-    config.magic = TERMD_BOOT_CONFIG_MAGIC;
-    config.tty_endpoint_fd = SEED0_TERMD_TTY_ENDPOINT_FD;
-    config.device_fd = device_fd >= 16 ? (uint64_t)(uint32_t)device_fd : 0;
-    config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
-    config.module_count = module_count;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_va = TERMD_MODULE_IMAGE_VA +
-            (TERMD_MODULE_IMAGE_STRIDE * i);
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
-    }
-
-    status = seed0_map_bytes_into_process(
-        loaded.process_fd,
-        TERMD_BOOT_CONFIG_VA,
-        &config,
-        sizeof(config),
-        PACHA_PROT_READ);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] termd: config map failed status=%d\n", status);
-        (void)pacha_fd_close(tty_endpoint_fd);
-        return -5;
-    }
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(
-            loaded.process_fd,
-            config.modules[i].image_va,
-            module_images[i],
-            module_sizes[i],
-            PACHA_PROT_READ);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] termd: module map failed name=%s status=%d\n",
-                module_specs[i].name,
-                status);
-            (void)pacha_fd_close(tty_endpoint_fd);
-            return -6;
-        }
-    }
-
-    printf("[seed0boot] termd modules=%llu\n",
-        (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/termd.elf", -1);
-    if (status != 0) {
-        (void)pacha_fd_close(tty_endpoint_fd);
-        return status;
-    }
-
-    (void)pacha_fd_close(SEED0_TERMD_TTY_ENDPOINT_FD);
-    if (out_tty_endpoint_fd != 0) {
-        *out_tty_endpoint_fd = tty_endpoint_fd;
-    } else {
-        (void)pacha_fd_close(tty_endpoint_fd);
-    }
-    return 0;
-}
-
-int seed0_launch_drmd(int ready_channel_fd, int netd_endpoint_fd, int *out_drm_endpoint_fd)
-{
-    static const struct seed0_capsule_module_spec module_specs[] = {
-        {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
-        {"/srv/kobox/linux_virtio_ring.ko", "linux_virtio_ring.ko"},
-        {"/srv/kobox/linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_modern_dev.ko"},
-        {"/srv/kobox/linux_virtio_pci_legacy_dev.ko", "linux_virtio_pci_legacy_dev.ko"},
-        {"/srv/kobox/linux_virtio_pci.ko", "linux_virtio_pci.ko"},
-        {"/srv/kobox/linux_virtio_dma_buf.ko", "linux_virtio_dma_buf.ko"},
-        {"/srv/kobox/linux_virtio_gpu.ko", "linux_virtio_gpu.ko"},
-    };
-
-    if (out_drm_endpoint_fd != 0) {
-        *out_drm_endpoint_fd = -1;
-    }
-    if (ready_channel_fd < 16 || netd_endpoint_fd < 16) {
-        return -1;
-    }
-
-    const struct seed0_device_descriptor *device =
-        find_virtio_gpu_device(seed0_bootstrap_descriptor());
-    if (device == 0) {
-        fprintf(stderr, "[seed0boot] drmd: virtio-gpu device fd not found\n");
-        return -19;
-    }
-    const int device_fd = (int)device->init_device_fd;
-    int status = mark_device_inherit(device_fd, "drmd virtio-gpu");
-    if (status != 0) {
-        return status;
-    }
-
-    const unsigned char *daemon_image = 0;
-    uint32_t daemon_size = 0;
-    status = seed0_bootfs_open_file("/srv/drmd.elf", &daemon_image, &daemon_size);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] drmd: open daemon from bootfs failed status=%d\n", status);
-        return -2;
-    }
-    const unsigned char *module_images[DRMD_MAX_MODULES];
-    uint32_t module_sizes[DRMD_MAX_MODULES];
-    memset(module_images, 0, sizeof(module_images));
-    memset(module_sizes, 0, sizeof(module_sizes));
-    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
-        if (status != 0 || (uint64_t)module_sizes[i] > DRMD_MODULE_IMAGE_STRIDE) {
-            fprintf(stderr, "[seed0boot] drmd: open module failed name=%s status=%d size=%u\n",
-                module_specs[i].path,
-                status,
-                module_sizes[i]);
-            return -3;
-        }
-    }
-
-    const int drm_endpoint_fd = pacha_ipc_endpoint_create(seed0_termd_endpoint_rights, 0);
-    if (drm_endpoint_fd < 16) {
-        return drm_endpoint_fd < 0 ? drm_endpoint_fd : -2;
-    }
-    const long endpoint_dup = pacha_fd_fcntl(
-        drm_endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        SEED0_DRMD_DRM_ENDPOINT_FD,
-        seed0_termd_endpoint_rights);
-    if (endpoint_dup != SEED0_DRMD_DRM_ENDPOINT_FD) {
-        (void)pacha_fd_close(drm_endpoint_fd);
-        return -4;
-    }
-    status = mark_device_inherit(SEED0_DRMD_DRM_ENDPOINT_FD, "drmd drm endpoint");
-    if (status == 0) {
-        status = mark_device_inherit(ready_channel_fd, "drmd ready channel");
-    }
-    const long netd_dup = status == 0 ? pacha_fd_fcntl(
-        netd_endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        SEED0_NETD_SOCKET_ENDPOINT_FD,
-        seed0_netd_endpoint_rights) : -1;
-    const int netd_dup_installed = netd_dup == SEED0_NETD_SOCKET_ENDPOINT_FD;
-    if (status == 0 && !netd_dup_installed) status = -4;
-    if (status == 0)
-        status = mark_device_inherit(SEED0_NETD_SOCKET_ENDPOINT_FD, "drmd netd endpoint");
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
-        if (netd_dup_installed) (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(drm_endpoint_fd);
-        return status;
-    }
-
-    struct seed0_loaded_process loaded;
-    status = seed0_load_elf_process("/srv/drmd.elf", daemon_image, daemon_size, &loaded);
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
-        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(drm_endpoint_fd);
-        return status;
-    }
-
-    struct drmd_boot_config config;
-    memset(&config, 0, sizeof(config));
-    config.magic = DRMD_BOOT_CONFIG_MAGIC;
-    config.drm_endpoint_fd = SEED0_DRMD_DRM_ENDPOINT_FD;
-    config.device_fd = (uint64_t)(uint32_t)device_fd;
-    config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
-    config.netd_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
-    config.module_count = module_count;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_va = DRMD_MODULE_IMAGE_VA + DRMD_MODULE_IMAGE_STRIDE * i;
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
-    }
-    status = seed0_map_bytes_into_process(
-        loaded.process_fd,
-        DRMD_BOOT_CONFIG_VA,
-        &config,
-        sizeof(config),
-        PACHA_PROT_READ);
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
-        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(drm_endpoint_fd);
-        return -5;
-    }
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(
-            loaded.process_fd,
-            config.modules[i].image_va,
-            module_images[i],
-            module_sizes[i],
-            PACHA_PROT_READ);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] drmd: module map failed name=%s status=%d\n",
-                module_specs[i].name,
-                status);
-            (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
-            (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-            (void)pacha_fd_close(drm_endpoint_fd);
-            return -6;
-        }
-    }
-
-    printf("[seed0boot] drmd modules=%llu\n", (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/drmd.elf", -1);
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
-        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(drm_endpoint_fd);
-        return status;
-    }
-    (void)pacha_fd_close(SEED0_DRMD_DRM_ENDPOINT_FD);
-    (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-    if (out_drm_endpoint_fd != 0) {
-        *out_drm_endpoint_fd = drm_endpoint_fd;
-    } else {
-        (void)pacha_fd_close(drm_endpoint_fd);
-    }
-    return 0;
-}
-
-int seed0_launch_inputd(
-    int ready_channel_fd,
-    int netd_endpoint_fd,
-    int *out_input_endpoint_fd,
-    uint32_t *out_device_count)
-{
-    static const struct seed0_capsule_module_spec module_specs[] = {
-        {"/srv/kobox/linux_virtio.ko", "linux_virtio.ko"},
-        {"/srv/kobox/linux_virtio_ring.ko", "linux_virtio_ring.ko"},
-        {"/srv/kobox/linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_modern_dev.ko"},
-        {"/srv/kobox/linux_virtio_pci_legacy_dev.ko", "linux_virtio_pci_legacy_dev.ko"},
-        {"/srv/kobox/linux_virtio_pci.ko", "linux_virtio_pci.ko"},
-        {"/srv/kobox/linux_virtio_input.ko", "linux_virtio_input.ko"},
-    };
-    if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = -1;
-    if (out_device_count != NULL) *out_device_count = 0;
-    if (ready_channel_fd < 16 || netd_endpoint_fd < 16) return -1;
-    const struct seed0_device_descriptor *devices[SEED0_INIT_MAX_DEVICE_DESCRIPTORS] = {0};
-    const size_t device_count = find_virtio_input_devices(
-        seed0_bootstrap_descriptor(), devices, SEED0_INIT_MAX_DEVICE_DESCRIPTORS);
-    if (device_count == 0) {
-        fprintf(stderr, "[seed0boot] inputd: virtio-input device fds not found\n");
-        return -19;
-    }
-    for (size_t i = 0; i < device_count; i++) {
-        const int status = mark_device_inherit((int)devices[i]->init_device_fd, "inputd virtio-input");
-        if (status != 0) return status;
-    }
-    const unsigned char *daemon_image = NULL;
-    uint32_t daemon_size = 0;
-    int status = seed0_bootfs_open_file("/srv/inputd.elf", &daemon_image, &daemon_size);
-    if (status != 0) return -2;
-    const size_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    const unsigned char *module_images[sizeof(module_specs) / sizeof(module_specs[0])] = {0};
-    uint32_t module_sizes[sizeof(module_specs) / sizeof(module_specs[0])] = {0};
-    for (size_t i = 0; i < module_count; i++) {
-        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
-        if (status != 0 || (uint64_t)module_sizes[i] > INPUTD_MODULE_IMAGE_STRIDE) return -3;
-    }
-    const int endpoint_fd = pacha_ipc_endpoint_create(seed0_termd_endpoint_rights, 0);
-    if (endpoint_fd < 16) return endpoint_fd < 0 ? endpoint_fd : -2;
-    const long endpoint_dup = pacha_fd_fcntl(
-        endpoint_fd, PACHA_FD_FCNTL_DUP, SEED0_INPUTD_INPUT_ENDPOINT_FD,
-        seed0_termd_endpoint_rights);
-    if (endpoint_dup != SEED0_INPUTD_INPUT_ENDPOINT_FD) {
-        (void)pacha_fd_close(endpoint_fd);
-        return -4;
-    }
-    status = mark_device_inherit(SEED0_INPUTD_INPUT_ENDPOINT_FD, "inputd input endpoint");
-    if (status == 0) status = mark_device_inherit(ready_channel_fd, "inputd ready channel");
-    const long netd_dup = status == 0 ? pacha_fd_fcntl(
-        netd_endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        SEED0_NETD_SOCKET_ENDPOINT_FD,
-        seed0_netd_endpoint_rights) : -1;
-    const int netd_dup_installed = netd_dup == SEED0_NETD_SOCKET_ENDPOINT_FD;
-    if (status == 0 && !netd_dup_installed) status = -4;
-    if (status == 0)
-        status = mark_device_inherit(SEED0_NETD_SOCKET_ENDPOINT_FD, "inputd netd endpoint");
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
-        if (netd_dup_installed) (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(endpoint_fd);
-        return status;
-    }
-    struct seed0_loaded_process loaded;
-    status = seed0_load_elf_process("/srv/inputd.elf", daemon_image, daemon_size, &loaded);
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
-        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(endpoint_fd);
-        return status;
-    }
-    uint8_t blob[INPUTD_BOOT_CONFIG_MAX_BYTES];
-    memset(blob, 0, sizeof(blob));
-    struct inputd_boot_config *config = (struct inputd_boot_config *)blob;
-    const uint64_t devices_bytes = device_count * sizeof(struct inputd_device_config);
-    const uint64_t modules_bytes = module_count * sizeof(struct inputd_module_config);
-    const uint64_t total_size = sizeof(*config) + devices_bytes + modules_bytes;
-    if (device_count > UINT32_MAX || module_count > UINT32_MAX ||
-        total_size > sizeof(blob)) return -7;
-    config->magic = INPUTD_BOOT_CONFIG_MAGIC;
-    config->version = INPUTD_BOOT_CONFIG_VERSION;
-    config->header_size = sizeof(*config);
-    config->total_size = total_size;
-    config->input_endpoint_fd = SEED0_INPUTD_INPUT_ENDPOINT_FD;
-    config->ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
-    config->netd_endpoint_fd = SEED0_NETD_SOCKET_ENDPOINT_FD;
-    config->device_count = (uint32_t)device_count;
-    config->device_record_size = sizeof(struct inputd_device_config);
-    config->module_count = (uint32_t)module_count;
-    config->module_record_size = sizeof(struct inputd_module_config);
-    config->devices_offset = sizeof(*config);
-    config->modules_offset = sizeof(*config) + devices_bytes;
-    struct inputd_device_config *device_records =
-        (struct inputd_device_config *)(blob + config->devices_offset);
-    for (size_t i = 0; i < device_count; i++) {
-        device_records[i] = (struct inputd_device_config){
-            .device_fd = devices[i]->init_device_fd,
-            .resource_id = devices[i]->resource_id,
-            .pci_segment = 0,
-            .pci_bus = (uint32_t)devices[i]->pci_bus,
-            .pci_device = (uint32_t)devices[i]->pci_device,
-            .pci_function = (uint32_t)devices[i]->pci_function,
-            .vendor_id = (uint32_t)devices[i]->vendor_id,
-            .device_id = (uint32_t)devices[i]->device_id,
-            .subsystem_id = (uint32_t)devices[i]->subsystem_id,
-        };
-    }
-    struct inputd_module_config *module_records =
-        (struct inputd_module_config *)(blob + config->modules_offset);
-    for (size_t i = 0; i < module_count; i++) {
-        module_records[i].image_va = INPUTD_MODULE_IMAGE_VA + INPUTD_MODULE_IMAGE_STRIDE * i;
-        module_records[i].image_size = module_sizes[i];
-        strncpy(module_records[i].name, module_specs[i].name,
-            sizeof(module_records[i].name) - 1u);
-    }
-    status = seed0_map_bytes_into_process(
-        loaded.process_fd, INPUTD_BOOT_CONFIG_VA, blob, total_size, PACHA_PROT_READ);
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
-        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(endpoint_fd);
-        return -5;
-    }
-    for (size_t i = 0; i < module_count; i++) {
-        status = seed0_map_bytes_into_process(loaded.process_fd, module_records[i].image_va,
-            module_images[i], module_sizes[i], PACHA_PROT_READ);
-        if (status != 0) {
-            (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
-            (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-            (void)pacha_fd_close(endpoint_fd);
-            return -6;
-        }
-    }
-    printf("[seed0boot] inputd modules=%zu devices=%zu blob=%llu\n",
-        module_count, device_count, (unsigned long long)total_size);
-    status = seed0_start_process(&loaded, "/srv/inputd.elf", -1);
-    if (status != 0) {
-        (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
-        (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-        (void)pacha_fd_close(endpoint_fd);
-        return status;
-    }
-    (void)pacha_fd_close(SEED0_INPUTD_INPUT_ENDPOINT_FD);
-    (void)pacha_fd_close(SEED0_NETD_SOCKET_ENDPOINT_FD);
-    if (out_input_endpoint_fd != NULL) *out_input_endpoint_fd = endpoint_fd;
-    else (void)pacha_fd_close(endpoint_fd);
-    if (out_device_count != NULL) *out_device_count = (uint32_t)device_count;
-    return 0;
-}
-
-int seed0_launch_storage_boot_nvme(int ready_channel_fd, int service_ready_channel_fd)
-{
-    static const struct seed0_capsule_module_spec module_specs[] = {
-        {"/srv/kobox/nvme-auth.ko", "nvme-auth.ko"},
-        {"/srv/kobox/nvme-core.ko", "nvme-core.ko"},
-        {"/srv/kobox/nvme.ko", "nvme.ko"},
-        {"/srv/kobox/crc16.ko", "crc16.ko"},
-        {"/srv/kobox/mbcache.ko", "mbcache.ko"},
-        {"/srv/kobox/jbd2.ko", "jbd2.ko"},
-        {"/srv/kobox/ext4.ko", "ext4.ko"},
-    };
-
-    const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
-    const struct seed0_device_descriptor *device = find_nvme_device(desc);
-    if (device == 0) {
-        fprintf(stderr, "[seed0boot] storage_boot: NVMe device fd not found\n");
-        return -1;
-    }
-    const int device_fd = (int)device->init_device_fd;
-    if (ready_channel_fd < 16 || service_ready_channel_fd < 16) {
-        fprintf(stderr, "[seed0boot] storage_boot: ready channel fd missing\n");
-        return -1;
-    }
-
-    const unsigned char *daemon_image = 0;
-    uint32_t daemon_size = 0;
-    int status = seed0_bootfs_open_file("/srv/storage_boot.elf", &daemon_image, &daemon_size);
-    if (status != 0) {
-        fprintf(stderr, "[seed0boot] storage_boot: open daemon from bootfs failed status=%d\n", status);
-        return -2;
-    }
-    const unsigned char *module_images[STORAGE_BOOT_MAX_MODULES];
-    uint32_t module_sizes[STORAGE_BOOT_MAX_MODULES];
-    int module_fds[STORAGE_BOOT_MAX_MODULES];
-    memset(module_images, 0, sizeof(module_images));
-    memset(module_sizes, 0, sizeof(module_sizes));
-    memset(module_fds, 0, sizeof(module_fds));
-    const uint64_t module_count = sizeof(module_specs) / sizeof(module_specs[0]);
-    for (uint64_t i = 0; i < module_count; i++) {
-        status = seed0_bootfs_open_file(module_specs[i].path, &module_images[i], &module_sizes[i]);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] storage_boot: open %s from bootfs failed status=%d\n",
-                module_specs[i].path,
-                status);
-            return -3;
-        }
-        module_fds[i] = seed0_create_inherited_vmo_from_bytes(module_images[i], module_sizes[i], module_specs[i].name);
-        if (module_fds[i] < 16) return -3;
-    }
-
-    status = mark_device_inherit(device_fd, "storage_boot");
-    if (status != 0) return status;
     struct storage_boot_config config;
     memset(&config, 0, sizeof(config));
     config.magic = STORAGE_BOOT_CONFIG_MAGIC;
+    config.version = STORAGE_BOOT_CONFIG_VERSION;
     config.device_fd = (uint64_t)(uint32_t)device_fd;
     config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
-    config.service_ready_channel_fd = (uint64_t)(uint32_t)service_ready_channel_fd;
-    config.module_count = module_count;
-    for (uint64_t i = 0; i < module_count; i++) {
-        config.modules[i].image_fd = (uint64_t)(uint32_t)module_fds[i];
-        config.modules[i].image_size = module_sizes[i];
-        strncpy(config.modules[i].name, module_specs[i].name, sizeof(config.modules[i].name) - 1u);
-    }
-
-    const int config_fd = seed0_create_inherited_vmo_from_bytes(&config, sizeof(config), "storage_boot config");
+    config.root_handoff_channel_fd = (uint64_t)(uint32_t)root_handoff_channel_fd;
+    config.bootfs_fd = (uint64_t)(uint32_t)bootfs_fd;
+    config.bootfs_size = desc->bootfs_archive.size_bytes;
+    const int config_fd = create_inherited_vmo(&config, sizeof(config),
+        "storage_boot config");
     if (config_fd < 16) {
-        return -5;
+        (void)pacha_fd_close(bootfs_fd);
+        return config_fd;
     }
 
     struct seed0_loaded_process loaded;
-    status = seed0_load_elf_process("/srv/storage_boot.elf", daemon_image, daemon_size, &loaded);
-    if (status != 0) {
-        return status;
-    }
-
-    (void)daemon_size;
-    printf("[seed0boot] storage_boot modules=%llu\n",
-        (unsigned long long)module_count);
-    status = seed0_start_process(&loaded, "/srv/storage_boot.elf", config_fd);
-    if (status != 0) {
-        return status;
-    }
-    return 0;
+    status = seed0_load_elf_process(
+        "/srv/storage_boot.elf", daemon, daemon_size, &loaded);
+    if (status == 0)
+        status = seed0_start_process(&loaded, "/srv/storage_boot.elf", config_fd);
+    (void)pacha_fd_close(config_fd);
+    (void)pacha_fd_close(bootfs_fd);
+    (void)pacha_fd_close(device_fd);
+    return status;
 }

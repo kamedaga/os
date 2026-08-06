@@ -187,6 +187,27 @@ pub fn cloneVmaTableForFork(self: anytype, from: PrincipalId, to: PrincipalId) K
     dest_table.next_user_map_va = source_table.next_user_map_va;
 }
 
+/// Give a freshly cloned address space an independent snapshot of every
+/// already-dirty private page.  Clean VMO pages remain shared and acquire a
+/// private COW table on first write.  This keeps a child's inherited TLS and
+/// libc state independent of concurrent writes or teardown in its parent.
+/// The caller holds the VM transaction locks for both address spaces.
+pub fn detachForkChildDirtyCowTables(
+    self: anytype,
+    child: PrincipalId,
+    free_list: *FreePageList,
+) KernelError!void {
+    const table = self.getVmaTable(child) orelse return KernelError.InvalidState;
+    var active_index: usize = 0;
+    while (active_index < table.active_count) : (active_index += 1) {
+        const entry_index: usize = @intCast(table.active_indices[active_index]);
+        const entry = &table.entries[entry_index];
+        if (!entry.active or entry.cow_table.isNull()) continue;
+        if (self.nativeCowTableIsUnique(entry.cow_table)) continue;
+        try self.detachSharedEntryCowTable(entry, free_list);
+    }
+}
+
 pub fn copyForkAnonymousPresentPageToChild(
     self: anytype,
     to: PrincipalId,

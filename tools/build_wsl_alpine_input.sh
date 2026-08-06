@@ -77,6 +77,37 @@ for pkg in libinput-dev libseat-dev libevdev-dev eudev-dev linux-headers; do
   tar --warning=no-unknown-keyword -xzf "$(download "${pkg}")" -C "${dev}"
 done
 
+# libinput parses every file in this directory for each new context. FileD's
+# per-open cost makes the upstream many-file layout needlessly expensive on
+# PachaOS. Preserve the exact lexical file order and contents in one parser
+# input; /etc/libinput/local-overrides.quirks remains a separate final layer.
+python3 - "${runtime}/usr/share/libinput" <<'PY'
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+sources = sorted(directory.glob("*.quirks"), key=lambda path: path.name)
+if not sources:
+    raise SystemExit("missing libinput quirks sources")
+merged = directory / "50-pacha-merged.quirks"
+payload = bytearray()
+for source in sources:
+    payload.extend(f"# PachaOS merged source: {source.name}\n".encode())
+    contents = source.read_bytes()
+    payload.extend(contents)
+    if not contents.endswith(b"\n"):
+        payload.extend(b"\n")
+    payload.extend(b"\n")
+merged.write_bytes(payload)
+for source in sources:
+    if source != merged:
+        source.unlink()
+PY
+[[ "$(find "${runtime}/usr/share/libinput" -maxdepth 1 -type f -name '*.quirks' | wc -l)" == 1 ]] || {
+  echo "failed to consolidate libinput quirks" >&2
+  exit 1
+}
+
 # Alpine's libseat enables the logind backend and therefore carries a hard
 # libelogind dependency even when LIBSEAT_BACKEND=seatd. Build the same 0.9.1
 # source with only its seatd backend, which is the backend this rootfs supports.

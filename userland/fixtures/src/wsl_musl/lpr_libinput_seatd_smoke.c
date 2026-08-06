@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <libinput.h>
 #include <libseat.h>
+#include <libudev.h>
 #include <math.h>
 #include <poll.h>
 #include <stdint.h>
@@ -18,6 +19,13 @@ struct seat_state {
     int enabled;
     struct { int fd; int device_id; } devices[16];
 };
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
+    return (uint64_t)value.tv_sec * 1000000000ull + (uint64_t)value.tv_nsec;
+}
 
 static void seat_enable(struct libseat *seat, void *data) { (void)seat; ((struct seat_state *)data)->enabled = 1; }
 static void seat_disable(struct libseat *seat, void *data) {
@@ -106,9 +114,13 @@ static int handle_events(struct libinput *li, int *added, int *key_down, int *ke
 
 int main(int argc, char **argv)
 {
-    const int direct_path = argc == 2 && strcmp(argv[1], "--path") == 0;
+    const int direct_path = argc == 2 &&
+        (strcmp(argv[1], "--path") == 0 || strcmp(argv[1], "--path-init") == 0);
+    const int init_only = argc == 2 &&
+        (strcmp(argv[1], "--path-init") == 0 || strcmp(argv[1], "--udev-init") == 0);
+    const int udev_init = argc == 2 && strcmp(argv[1], "--udev-init") == 0;
     struct seat_state state = {0};
-    if (!direct_path) {
+    if (!direct_path && !udev_init) {
         (void)mkdir("/run", 0755);
         (void)unlink("/run/seatd.sock");
         (void)setenv("LIBSEAT_BACKEND", "seatd", 1);
@@ -129,13 +141,21 @@ int main(int argc, char **argv)
         printf("LIBSEAT_READY name=%s\n", libseat_seat_name(state.seat));
     }
 
-    struct libinput *li = libinput_path_create_context(&interface, &state);
+    const uint64_t init_start_ns = monotonic_ns();
+    struct udev *udev = udev_init ? udev_new() : NULL;
+    struct libinput *li = udev_init ?
+        libinput_udev_create_context(&interface, &state, udev) :
+        libinput_path_create_context(&interface, &state);
     if (li == NULL) { fprintf(stderr, "LIBINPUT_CONTEXT_FAIL\n"); return 1; }
+    const uint64_t context_ready_ns = monotonic_ns();
     libinput_log_set_priority(li, LIBINPUT_LOG_PRIORITY_DEBUG);
-    if (libinput_path_add_device(li, "/dev/input/event0") == NULL ||
-        libinput_path_add_device(li, "/dev/input/event1") == NULL) {
+    if ((udev_init && libinput_udev_assign_seat(li, "seat0") != 0) ||
+        (!udev_init &&
+         (libinput_path_add_device(li, "/dev/input/event0") == NULL ||
+          libinput_path_add_device(li, "/dev/input/event1") == NULL))) {
         fprintf(stderr, "LIBINPUT_PATH_ADD_FAIL\n"); return 1;
     }
+    const uint64_t devices_ready_ns = monotonic_ns();
 
     int added = 0, key_down = 0, key_up = 0, motion = 0, button_down = 0, button_up = 0;
     for (int i = 0; i < 100 && added < 2; i++) {
@@ -143,8 +163,23 @@ int main(int argc, char **argv)
         usleep(10000);
     }
     if (added < 2) { fprintf(stderr, "LIBINPUT_ENUM_FAIL added=%d\n", added); return 1; }
-    printf("LIBINPUT_READY backend=%s devices=%d\n", direct_path ? "path" : "path-seatd", added);
+    const uint64_t events_ready_ns = monotonic_ns();
+    printf(
+        "LIBINPUT_INIT_TIMING backend=%s context_ms=%llu devices_ms=%llu "
+        "events_ms=%llu total_ms=%llu\n",
+        udev_init ? "udev" : (direct_path ? "path" : "path-seatd"),
+        (unsigned long long)((context_ready_ns - init_start_ns) / 1000000ull),
+        (unsigned long long)((devices_ready_ns - context_ready_ns) / 1000000ull),
+        (unsigned long long)((events_ready_ns - devices_ready_ns) / 1000000ull),
+        (unsigned long long)((events_ready_ns - init_start_ns) / 1000000ull));
+    printf("LIBINPUT_READY backend=%s devices=%d\n",
+        udev_init ? "udev" : (direct_path ? "path" : "path-seatd"), added);
     fflush(stdout);
+    if (init_only) {
+        libinput_unref(li);
+        if (udev != NULL) udev_unref(udev);
+        return 0;
+    }
     for (int i = 0; i < 400 && !(key_down && key_up && motion && button_down && button_up); i++) {
         struct pollfd fds[2] = {{.fd = libinput_get_fd(li), .events = POLLIN}};
         nfds_t count = 1;
@@ -154,6 +189,7 @@ int main(int argc, char **argv)
         if (handle_events(li, &added, &key_down, &key_up, &motion, &button_down, &button_up) != 0) return 1;
     }
     libinput_unref(li);
+    if (udev != NULL) udev_unref(udev);
     if (state.seat != NULL) libseat_close_seat(state.seat);
     if (!(key_down && key_up && motion && button_down && button_up)) {
         fprintf(stderr, "LIBINPUT_EVENT_FAIL key=%d/%d motion=%d button=%d/%d\n",

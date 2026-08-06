@@ -210,6 +210,7 @@ const VerifiedCoreState = struct {
 const SchedulerState = struct {
     thread_table: ThreadTableState = .{},
     verified: VerifiedCoreState = .{},
+    ap_user_dispatch_enabled: u8 = 0,
     cpus: [smp.max_cpus]CpuSchedulerState = buildInitialCpuSchedulerStates(),
 };
 
@@ -952,6 +953,7 @@ fn stealRunnableForIdleCpu(dst_cpu: usize) bool {
 
 fn claimKernelScheduledUserEntry(cpu_id: usize, out_entry: *scheduler_observer.UserEntry) bool {
     if (cpu_id == bootstrap_cpu_slot) return false;
+    if (!apUserDispatchReady()) return false;
     var picked_opt = verifiedPickThreadForCpu(cpu_id);
     if (picked_opt == null and stealRunnableForIdleCpu(cpu_id)) {
         picked_opt = verifiedPickThreadForCpu(cpu_id);
@@ -1008,6 +1010,12 @@ pub fn loadNextReadyThread(frame: *TrapFrame) bool {
 pub fn loadNextReadyThreadOrIdle(frame: *TrapFrame) void {
     if (loadNextReadyThread(frame)) return;
     _ = stealRunnableForIdleCpu(currentCpu());
+    if (loadNextReadyThread(frame)) return;
+    // No saved context is referenced beyond this point.  In particular the
+    // BSP must drop ownership of an exited/blocked principal before entering
+    // its interruptible wait, otherwise remote lifecycle quiescence waits on
+    // a CPU which is already logically idle.
+    noteCpuIdleTick(currentCpu());
     while (!loadNextReadyThread(frame)) {
         asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
     }
@@ -1392,6 +1400,10 @@ pub fn cpuMaskRunningPrincipal(principal: kernel.PrincipalId) u64 {
     return mask;
 }
 
+pub fn principalSlotReusable(principal: kernel.PrincipalId) bool {
+    return cpuMaskRunningPrincipal(principal) == 0;
+}
+
 /// Actively drive every CPU executing `principal` through the scheduler IPI
 /// safe point.  There is intentionally no elapsed-time escape: teardown is
 /// permitted only after the ownership snapshot reaches zero.
@@ -1458,6 +1470,36 @@ fn unlockAllCpuSchedulerStates() void {
         remaining -= 1;
         scheduler_state.cpus[remaining].lock.unlock();
     }
+}
+
+/// An unallocated context can still be the identity of the kernel path which
+/// is retiring it.  Keep that slot unavailable until the owning CPU has
+/// actually published idle (AP) or selected its next context (BSP).
+fn threadSlotReferencedByCpu(thread_index: usize) bool {
+    var referenced = false;
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    for (&scheduler_state.cpus) |*state| {
+        if (state.enabled and !state.is_idle and state.current_thread == thread_index) {
+            referenced = true;
+            break;
+        }
+    }
+    return referenced;
+}
+
+fn threadSlotReferencedByRemoteCpu(thread_index: usize, local_cpu: usize) bool {
+    var referenced = false;
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    for (&scheduler_state.cpus, 0..) |*state, cpu_slot| {
+        if (cpu_slot == local_cpu) continue;
+        if (state.enabled and !state.is_idle and state.current_thread == thread_index) {
+            referenced = true;
+            break;
+        }
+    }
+    return referenced;
 }
 
 fn threadAssignedCpuSlot(thread_index: usize) usize {
@@ -1528,7 +1570,12 @@ pub fn refreshTopology() void {
 }
 
 pub fn apUserDispatchReady() bool {
-    return verifiedCoreReady();
+    return verifiedCoreReady() and
+        @atomicLoad(u8, &scheduler_state.ap_user_dispatch_enabled, .acquire) != 0;
+}
+
+pub fn enableApUserDispatch() void {
+    @atomicStore(u8, &scheduler_state.ap_user_dispatch_enabled, 1, .release);
 }
 
 pub fn parkApAfterThreadStopped() noreturn {
@@ -1864,6 +1911,7 @@ fn allocateThreadWithReadyState(owner_process: kernel.PrincipalId, user_spaces: 
         while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
             const ctx = threadContext(i) orelse continue;
             if (ctx.allocated) continue;
+            if (threadSlotReferencedByCpu(i)) continue;
             if (!initializeThreadContextWithReadyState(i, owner_process, user_spaces, initial_frame, initial_ready)) return null;
             const generation = scheduler_state.thread_table.contexts[i].generation;
             if (!verifiedAddThread(i, generation, initial_ready)) {
@@ -1896,21 +1944,17 @@ pub fn releaseThread(thread_index: usize) bool {
 
     const ctx = threadContextMutable(thread_index) orelse return false;
     if (!ctx.allocated) return false;
+    // Never destroy a context which another CPU can still use for interrupt,
+    // syscall-return, or user-entry state.  Lifecycle teardown first stops
+    // and quiesces remote owners; suspended rollback has no CPU reference.
+    if (threadSlotReferencedByRemoteCpu(thread_index, currentCpu())) return false;
     const generation = ctx.generation;
-    const cpu_slot = ctx.cpu_slot;
     if (!verifiedExitThreadGeneration(thread_index, generation)) return false;
     const next_generation = nextThreadGeneration(ctx.generation);
     const entity = ctx.scheduler_entity orelse return false;
-    if (schedulerStateForSlot(cpu_slot)) |state| {
-        state.lock.lock();
-        if (state.current_thread == thread_index) {
-            state.current_thread = state.idle_thread;
-            state.current_principal = null;
-            state.current_cr3 = 0;
-            state.is_idle = true;
-        }
-        state.lock.unlock();
-    }
+    // Do not publish CPU-idle here.  The caller is still executing on behalf
+    // of this generation until the AP idle path or a BSP context switch says
+    // otherwise.  Allocation checks CPU references before reusing the slot.
     entity.reset(thread_index, next_generation);
     ctx.* = .{ .id = @intCast(thread_index), .generation = next_generation, .scheduler_entity = entity };
     syncHotStateFromContext(thread_index);

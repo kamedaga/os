@@ -14,6 +14,7 @@ set(NETD_MBEDTLS_INCLUDE "${REPO_ROOT}/.artifacts/mbedtls-pachaos/include")
 
 set(KOBOX_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libipc/src/ipc.c
+  ${REPO_ROOT}/userland/libfiled_client/src/module_image.c
   ${REPO_ROOT}/userland/libcapsule/src/capsule.c
   ${REPO_ROOT}/userland/libpacha/src/syscall.c
   ${REPO_ROOT}/userland/libpacha/src/trace.c
@@ -123,7 +124,7 @@ add_custom_command(
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOX_RUNTIME_SOURCES_ENV}"
       "PACHAOS_MUSL_EXTRA_LINK_INPUTS=${NETD_LIBUINET_ARCHIVE} ${NETD_MBEDTLS_ARCHIVE}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${NETD_LIBUINET_INCLUDE} ${NETD_MBEDTLS_INCLUDE} ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${NETD_LIBUINET_INCLUDE} ${NETD_MBEDTLS_INCLUDE} ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -DNETD_WITH_LIBUINET -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${NETD_ELF}"
   DEPENDS
@@ -151,6 +152,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/ipc_protocol.h"
     "${REPO_ROOT}/userland/filed/include/filed/flags.h"
     "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
+    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"

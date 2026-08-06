@@ -145,7 +145,7 @@ if [[ ${1:-} == --foot-child ]]; then
         pty=1
     fi
     if [[ ${LD_PRELOAD+x} || ${LP_NUM_THREADS+x} ||
-          ${M57_WLROOTS_KEYMAP_PRELOAD+x} || ${MESA_SHADER_CACHE_DISABLE+x} ]]; then
+          ${M57_WLROOTS_KEYMAP_PRELOAD+x} ]]; then
         environment=dirty
     fi
     printf '\033]0;SWAY_PHASE1_FOOT_CHILD iteration=%s pty=%s environment=%s child_pid=%s foot_pid=%s\007' \
@@ -164,7 +164,7 @@ if [[ ${XDG_RUNTIME_DIR:-} != "$runtime" ||
     exit 1
 fi
 if [[ ${LD_PRELOAD+x} || ${LP_NUM_THREADS+x} ||
-      ${M57_WLROOTS_KEYMAP_PRELOAD+x} || ${MESA_SHADER_CACHE_DISABLE+x} ]]; then
+      ${M57_WLROOTS_KEYMAP_PRELOAD+x} ]]; then
     fail forbidden-environment
     exit 1
 fi

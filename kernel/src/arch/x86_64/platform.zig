@@ -35,6 +35,7 @@ pub const page_present: u64 = 1 << 0;
 pub const page_rw: u64 = 1 << 1;
 pub const page_user: u64 = 1 << 2;
 pub const page_ps: u64 = 1 << 7;
+pub const page_nx: u64 = @as(u64, 1) << 63;
 
 const GdtPtr = packed struct {
     limit: u16,
@@ -262,6 +263,7 @@ const msr_ia32_star: u32 = 0xC000_0081;
 const msr_ia32_lstar: u32 = 0xC000_0082;
 const msr_ia32_fmask: u32 = 0xC000_0084;
 const efer_sce: u64 = 1 << 0;
+const efer_nxe: u64 = 1 << 11;
 const rflags_if: u64 = 1 << 9;
 const cr4_pge: u64 = 1 << 7;
 const cr4_osfxsr: u64 = 1 << 9;
@@ -275,6 +277,7 @@ const cpuid_leaf1_ecx_osxsave: u32 = 1 << 27;
 const cpuid_leaf1_ecx_avx: u32 = 1 << 28;
 const cpuid_leaf7_ecx_pku: u32 = 1 << 3;
 const cpuid_leaf80000001_edx_rdtscp: u32 = 1 << 27;
+const cpuid_leaf80000001_edx_nx: u32 = 1 << 20;
 const page_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_addr_mask: u64 = 0x000f_ffff_ffff_f000;
 const cr3_no_flush: u64 = 1 << 63;
@@ -524,6 +527,15 @@ fn writeMsr(msr: u32, value: u64) void {
           [lo] "{eax}" (@as(u32, @truncate(value))),
           [hi] "{edx}" (@as(u32, @truncate(value >> 32))),
         : .{ .memory = true });
+}
+
+/// Enable page-table execute-disable enforcement on the current CPU.
+/// EFER is CPU-local, so this is required on the BSP and every AP.
+pub fn enableNxForCurrentCpu() bool {
+    if (cpuid(0x8000_0000).eax < 0x8000_0001) return false;
+    if ((cpuid(0x8000_0001).edx & cpuid_leaf80000001_edx_nx) == 0) return false;
+    writeMsr(msr_ia32_efer, readMsr(msr_ia32_efer) | efer_nxe);
+    return (readMsr(msr_ia32_efer) & efer_nxe) != 0;
 }
 
 pub fn readFsBase() u64 {

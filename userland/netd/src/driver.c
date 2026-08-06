@@ -20,21 +20,21 @@ int netd_driver_bind(struct netd_runtime *runtime)
         return 5;
     }
 
-    for (uint64_t i = 0; i < runtime->cfg->module_count; i++) {
-        const struct netd_module_config *module_cfg = &runtime->cfg->modules[i];
+    for (uint64_t i = 0; i < runtime->module_count; i++) {
+        const char *module_name = netd_module_names[i];
         int init_result = 0;
-        printf("[netd] %s init begin\n", module_cfg->name);
+        printf("[netd] %s init begin\n", module_name);
         fflush(stdout);
         uint64_t stage_start_cycles = netd_metrics_read_tsc();
         kb_status_t status = kb_module_call_init(runtime->modules[i], &init_result);
         uint64_t stage_end_cycles = netd_metrics_read_tsc();
-        netd_metrics_record_ex("module_init", module_cfg->name, stage_start_cycles, stage_end_cycles, 0);
-        if (status == KB_ERR_NOT_FOUND && i + 1u < runtime->cfg->module_count) {
-            printf("[netd] %s has no init_module\n", module_cfg->name);
+        netd_metrics_record_ex("module_init", module_name, stage_start_cycles, stage_end_cycles, 0);
+        if (status == KB_ERR_NOT_FOUND && i + 1u < runtime->module_count) {
+            printf("[netd] %s has no init_module\n", module_name);
             continue;
         }
         printf("[netd] %s init returned status=%s(%d) result=%d\n",
-            module_cfg->name,
+            module_name,
             netd_status_name(status),
             status,
             init_result);
@@ -42,7 +42,7 @@ int netd_driver_bind(struct netd_runtime *runtime)
         if (status != KB_OK || init_result != 0) {
             fprintf(stderr,
                 "[netd] %s init failed status=%s(%d) result=%d\n",
-                module_cfg->name,
+                module_name,
                 netd_status_name(status),
                 status,
                 init_result);

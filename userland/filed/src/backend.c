@@ -215,13 +215,13 @@ int filed_backend_symlink(
             target_length,
             out_object_id);
     }
-    (void)runtime;
-    (void)parent_object_id;
-    (void)name;
-    (void)target;
     (void)target_length;
-    (void)out_object_id;
-    return -95;
+    return filed_kobox_backend_symlink(
+        &runtime->backend,
+        parent_object_id,
+        name,
+        target,
+        out_object_id);
 }
 
 int filed_backend_readlink(

@@ -226,11 +226,13 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
     lpr_state_lock(&lpr_unmapself_lock);
 
     const int64_t raw_tid = lpr_linux_gettid();
+    volatile uint32_t *clear_tid = 0;
     int last_thread = 0;
     lpr_state_lock(&lpr_state.threads.lock_word);
     lpr_thread_record_t *record = raw_tid >= 0 && raw_tid <= UINT32_MAX ?
         lpr_thread_record_find((uint32_t)raw_tid) : 0;
     if (record != 0) {
+        clear_tid = record->child_tid;
         last_thread = lpr_thread_record_remove(record);
         (void)__atomic_sub_fetch(&lpr_state.thread_count, 1u, __ATOMIC_ACQ_REL);
     }
@@ -248,19 +250,31 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
         (uint64_t)(uintptr_t)&lpr_unmapself_lock;
     register uint64_t stack_top __asm__("r9") =
         (uint64_t)(uintptr_t)(lpr_unmapself_stack + sizeof(lpr_unmapself_stack));
+    register uint64_t clear_tid_address __asm__("r10") =
+        (uint64_t)(uintptr_t)clear_tid;
+    register uint64_t exit_flags __asm__("r12") =
+        clear_tid != 0 ? PACHAOS_THREAD_EXIT_CLEAR_TID : 0u;
     __asm__ volatile(
         "mov %%r9, %%rsp\n\t"
         "syscall\n\t"
+        /* No instruction after publishing this stack may read or write it:
+         * another detached thread can reuse it as soon as FUTEX_WAKE runs. */
+        "movl $0, (%%r8)\n\t"
+        "mov %[futex_wake], %%rax\n\t"
+        "mov %%r8, %%rdi\n\t"
+        "mov $1, %%rsi\n\t"
+        "syscall\n\t"
         "mov %[thread_exit], %%rax\n\t"
         "xor %%rdi, %%rdi\n\t"
-        "mov %%r8, %%rsi\n\t"
-        "mov %[clear_tid], %%rdx\n\t"
+        "mov %%r10, %%rsi\n\t"
+        "mov %%r12, %%rdx\n\t"
         "syscall\n\t"
         "ud2"
         : "+a"(syscall_number), "+D"(arg0), "+S"(arg1),
-          "+r"(lock_address), "+r"(stack_top)
-        : [thread_exit] "i"(PACHAOS_SYSCALL_THREAD_EXIT),
-          [clear_tid] "i"(PACHAOS_THREAD_EXIT_CLEAR_TID)
+          "+r"(lock_address), "+r"(stack_top), "+r"(clear_tid_address),
+          "+r"(exit_flags)
+        : [futex_wake] "i"(PACHAOS_SYSCALL_FUTEX_WAKE),
+          [thread_exit] "i"(PACHAOS_SYSCALL_THREAD_EXIT)
         : "rcx", "rdx", "r11", "memory");
     __builtin_unreachable();
 }
@@ -953,7 +967,17 @@ int64_t lpr_linux_wait4(uint64_t pid, uint64_t status_raw, uint64_t options, uin
             -1,
             &packed_result);
         int64_t result = 0;
-        if (wait_status == 0) {
+        if ((wait_status == -LPR_LINUX_EAGAIN ||
+             wait_status == -LPR_LINUX_EINTR) &&
+            (options & LPR_LINUX_WNOHANG) == 0)
+        {
+            // The supervisor snapshot or its IPC wait can race SIGCHLD and
+            // observe EAGAIN/EINTR before Linux signal policy has run.  Let
+            // the common restart loop consume an ignored/default SIGCHLD and
+            // issue wait4 again; a deliverable handler still turns the wait
+            // into EINTR there as Linux requires.
+            result = LPR_WAIT_RESTART_SYSCALL;
+        } else if (wait_status == 0) {
             const uint32_t result_pid = LPRS_WAIT4_RESULT_PID(packed_result);
             const uint32_t wait_result_status = LPRS_WAIT4_RESULT_STATUS(packed_result);
             if (result_pid == 0) {

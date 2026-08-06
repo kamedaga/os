@@ -105,6 +105,7 @@ enum {
     KOBOXD_IOV_ITER_BUFFER_CAPACITY_OFFSET = 0x78,
     KOBOXD_INODE_OP_CREATE_OFFSET = 0x28,
     KOBOXD_INODE_OP_UNLINK_OFFSET = 0x38,
+    KOBOXD_INODE_OP_SYMLINK_OFFSET = 0x40,
     KOBOXD_INODE_OP_MKDIR_OFFSET = 0x48,
     KOBOXD_INODE_OP_RMDIR_OFFSET = 0x50,
     KOBOXD_INODE_OP_MKNOD_OFFSET = 0x58,
@@ -135,6 +136,7 @@ typedef struct koboxd_ext4_operations {
     void *lookup;
     void *create;
     void *unlink;
+    void *symlink;
     void *mkdir;
     void *rmdir;
     void *mknod;
@@ -608,12 +610,14 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
 
     out_ops->create = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_CREATE_OFFSET);
     out_ops->unlink = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_UNLINK_OFFSET);
+    out_ops->symlink = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_SYMLINK_OFFSET);
     out_ops->mkdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_MKDIR_OFFSET);
     out_ops->rmdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RMDIR_OFFSET);
     out_ops->mknod = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_MKNOD_OFFSET);
     out_ops->rename = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RENAME_OFFSET);
     const int ready = out_ops->create != NULL &&
         out_ops->unlink != NULL &&
+        out_ops->symlink != NULL &&
         out_ops->mkdir != NULL &&
         out_ops->rmdir != NULL &&
         out_ops->mknod != NULL &&
@@ -932,8 +936,13 @@ static int fs_create_child_object(
     if (backend == NULL || ops == NULL || parent == NULL || name == NULL || out_object_id == NULL) {
         return -22;
     }
-    if (fs_object_by_parent_name(backend, parent->object_id, name) != NULL) {
+    koboxd_fs_object_t *existing = NULL;
+    int lookup_status = fs_lookup_or_cache_child(backend, ops, parent, name, &existing);
+    if (lookup_status == 0) {
         return -17;
+    }
+    if (lookup_status != -2) {
+        return lookup_status;
     }
 
     void *inode = NULL;
@@ -942,6 +951,7 @@ static int fs_create_child_object(
     if (status != 0) {
         return status;
     }
+    kb_fs_subsystem_invalidate_inode_folios(parent->inode);
     status = fs_object_register(backend, parent->object_id, inode, dentry, name, 1, out_object_id);
     if (status != 0) {
         fs_discard_unregistered_lookup(inode, dentry);
@@ -1522,6 +1532,55 @@ int koboxd_fs_backend_readlink(
     return 0;
 }
 
+int koboxd_fs_backend_symlink(
+    koboxd_fs_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t *out_object_id)
+{
+    if (backend == NULL || name == NULL || target == NULL ||
+        target[0] == '\0' || out_object_id == NULL || !backend->mounted)
+    {
+        return -22;
+    }
+    *out_object_id = 0;
+    koboxd_fs_object_t *parent = NULL;
+    int status = fs_get_parent_object(backend, parent_object_id, &parent);
+    if (status != 0) return status;
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) return -5;
+    koboxd_fs_object_t *existing = NULL;
+    status = fs_lookup_or_cache_child(backend, &ops, parent, name, &existing);
+    if (status == 0) return -17;
+    if (status != -2) return status;
+    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
+    if (dentry == NULL) return -12;
+    prepare_named_dentry(dentry, parent->dentry, NULL, name);
+
+    static uint8_t mnt_idmap[136];
+    int (*symlink_fn)(void *, void *, void *, const char *) = NULL;
+    memcpy(&symlink_fn, &ops.symlink, sizeof(symlink_fn));
+    unsigned long old_gs = 0;
+    const int has_gs = enter_ext4_call(ops.symlink, &old_gs);
+    status = symlink_fn(mnt_idmap, parent->inode, dentry, target);
+    if (has_gs) kb_shim_leave_kernel_gs(old_gs);
+    void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
+    if (status != 0 || inode == NULL) {
+        free(dentry);
+        return status != 0 ? status : -5;
+    }
+    kb_fs_subsystem_invalidate_inode_folios(parent->inode);
+    status = fs_object_register(
+        backend, parent->object_id, inode, dentry, name, 1, out_object_id);
+    if (status != 0) {
+        fs_discard_unregistered_lookup(inode, dentry);
+        return status;
+    }
+    fs_mark_metadata_dirty(backend);
+    return 0;
+}
+
 int koboxd_fs_backend_create(
     koboxd_fs_backend_t *backend,
     uint64_t parent_object_id,
@@ -1627,6 +1686,10 @@ int koboxd_fs_backend_chmod(
     if (object == NULL || object->inode == NULL) {
         return -2;
     }
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+        return -5;
+    }
     int status = fs_file_update_metadata(
         object->inode,
         0,
@@ -1637,7 +1700,9 @@ int koboxd_fs_backend_chmod(
         0,
         0);
     if (status == 0) {
-        fs_mark_object_metadata_dirty(backend, object);
+        status = fs_file_writeback_inode(&ops, object->inode, 1);
+    }
+    if (status == 0) {
         fs_object_refresh(object);
     }
     return status;
@@ -1665,6 +1730,9 @@ int koboxd_fs_backend_unlink(
     if (status != 0) {
         return status;
     }
+    if ((object->mode & KOBOXD_MODE_TYPE_MASK) == 0040000) {
+        return -21;
+    }
 
     KOBOXD_FS_TRACE("[koboxd-fs-trace] unlink parent=%llu object=%llu name=%s\n",
         (unsigned long long)parent_object_id,
@@ -1685,6 +1753,7 @@ int koboxd_fs_backend_unlink(
         result = 0;
     }
     if (result == 0) {
+        kb_fs_subsystem_invalidate_inode_folios(parent->inode);
         fs_mark_object_unlinked(backend, object);
         fs_object_refresh(object);
         fs_mark_metadata_dirty(backend);
@@ -1761,10 +1830,12 @@ int koboxd_fs_backend_mknod(
     koboxd_fs_object_t *parent = NULL;
     int status = fs_get_parent_object(backend, parent_object_id, &parent);
     if (status != 0) return status;
-    if (fs_object_by_parent_name(backend, parent->object_id, name) != NULL) return -17;
-
     koboxd_ext4_operations_t ops;
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) return -5;
+    koboxd_fs_object_t *existing = NULL;
+    status = fs_lookup_or_cache_child(backend, &ops, parent, name, &existing);
+    if (status == 0) return -17;
+    if (status != -2) return status;
     void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
     if (dentry == NULL) return -12;
     prepare_named_dentry(dentry, parent->dentry, NULL, name);
@@ -1786,6 +1857,7 @@ int koboxd_fs_backend_mknod(
         free(dentry);
         return status != 0 ? status : -5;
     }
+    kb_fs_subsystem_invalidate_inode_folios(parent->inode);
     status = fs_object_register(
         backend, parent->object_id, inode, dentry, name, 1, out_object_id);
     if (status != 0) {
@@ -1818,6 +1890,9 @@ int koboxd_fs_backend_rmdir(
     if (status != 0) {
         return status;
     }
+    if ((object->mode & KOBOXD_MODE_TYPE_MASK) != 0040000) {
+        return -20;
+    }
 
     KOBOXD_FS_TRACE("[koboxd-fs-trace] rmdir parent=%llu object=%llu name=%s\n",
         (unsigned long long)parent_object_id,
@@ -1832,6 +1907,7 @@ int koboxd_fs_backend_rmdir(
         kb_shim_leave_kernel_gs(old_gs);
     }
     if (result == 0) {
+        kb_fs_subsystem_invalidate_inode_folios(parent->inode);
         fs_mark_object_unlinked(backend, object);
         fs_object_refresh(object);
         fs_mark_metadata_dirty(backend);
@@ -1862,16 +1938,35 @@ int koboxd_fs_backend_rename(
     *out_object_id = 0;
     koboxd_fs_object_t *old_parent = fs_object_by_id(backend, old_parent_object_id);
     koboxd_fs_object_t *new_parent = fs_object_by_id(backend, new_parent_object_id);
-    koboxd_fs_object_t *object = fs_object_by_parent_name(backend, old_parent_object_id, old_name);
-    koboxd_fs_object_t *replaced = fs_object_by_parent_name(backend, new_parent_object_id, new_name);
-    if (old_parent == NULL || new_parent == NULL || object == NULL ||
-        old_parent->inode == NULL || new_parent->inode == NULL || object->dentry == NULL)
+    if (old_parent == NULL || new_parent == NULL ||
+        old_parent->inode == NULL || new_parent->inode == NULL)
     {
         return -2;
     }
     koboxd_ext4_operations_t ops;
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
+    }
+    koboxd_fs_object_t *object = NULL;
+    int lookup_status = fs_lookup_or_cache_child(
+        backend, &ops, old_parent, old_name, &object);
+    if (lookup_status != 0 || object == NULL || object->dentry == NULL) {
+        return lookup_status != 0 ? lookup_status : -2;
+    }
+    koboxd_fs_object_t *replaced = NULL;
+    if (old_parent_object_id == new_parent_object_id &&
+        strcmp(old_name, new_name) == 0)
+    {
+        replaced = object;
+    } else {
+        lookup_status = fs_lookup_or_cache_child(
+            backend, &ops, new_parent, new_name, &replaced);
+        if (lookup_status != 0 && lookup_status != -2) {
+            return lookup_status;
+        }
+        if (lookup_status == -2) {
+            replaced = NULL;
+        }
     }
     void *call_new_dentry = NULL;
     void *new_object_dentry = NULL;
@@ -1923,6 +2018,11 @@ int koboxd_fs_backend_rename(
         return result;
     }
 
+    kb_fs_subsystem_invalidate_inode_folios(old_parent->inode);
+    if (new_parent->inode != old_parent->inode) {
+        kb_fs_subsystem_invalidate_inode_folios(new_parent->inode);
+    }
+
     if (replaced != NULL && replaced != object) {
         fs_mark_object_unlinked(backend, replaced);
         fs_object_refresh(replaced);
@@ -1959,7 +2059,8 @@ static int fs_prepare_unlinked_object_release(
     if (object->inode == NULL) {
         return 0;
     }
-    if ((object->mode & KOBOXD_MODE_TYPE_MASK) == 0100000) {
+    const uint16_t object_type = object->mode & KOBOXD_MODE_TYPE_MASK;
+    if (object_type == 0100000 || object_type == 0040000 || object_type == 0120000) {
         int detach_status = kb_fs_subsystem_ext4_detach_inode_data_blocks_deferred(object->inode);
         if (detach_status != 0) {
             return detach_status;

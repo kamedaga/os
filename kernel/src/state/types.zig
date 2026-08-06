@@ -80,6 +80,7 @@ pub const Region = struct {
 pub const ProcessDescriptor = struct {
     active: bool = false,
     principal: PrincipalId = @enumFromInt(0),
+    generation: u32 = 0,
     label: []const u8 = "",
     bootstrap_owner: bool = false,
     faulted: bool = false,
@@ -238,6 +239,7 @@ pub const TaskObjectState = enum(u8) {
 
 pub const ProcessObject = struct {
     principal_raw: PrincipalRaw = 0,
+    generation: u32 = 0,
     state: TaskObjectState = .active,
     exit_code: u32 = 0,
 };

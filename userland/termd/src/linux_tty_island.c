@@ -1,4 +1,5 @@
 #include "linux_tty_island.h"
+#include "filed_client/module_image.h"
 
 #include "null_device_backend.h"
 
@@ -1563,17 +1564,17 @@ int termd_linux_tty_island_io(
     const int hvc_no_input = !write &&
         result == 0 &&
         kb_linux_kernel_decode_major(handle->dev) == TERMD_LINUX_HVC_MAJOR;
-    if (result == -TERMD_LINUX_ERESTARTSYS) {
+    if (result == -(long)TERMD_LINUX_ERESTARTSYS) {
         termd_linux_owner_context_t clear_context;
         int clear_has_context = enter_handle_function_context(handle, iter_fn, &clear_context);
         kb_clear_current_signal_pending();
         if (clear_has_context) {
             leave_owner_context(&clear_context);
         }
-        return -TERMD_LINUX_EINTR;
+        return -(int)TERMD_LINUX_EINTR;
     }
     if (hvc_no_input) {
-        return -TERMD_LINUX_EAGAIN;
+        return -(int)TERMD_LINUX_EAGAIN;
     }
     if (result < 0) {
         return (int)result;
@@ -1653,9 +1654,23 @@ int termd_linux_tty_island_init(
     island->wake_irq_fd = -1;
     island->source_count = (uint32_t)(sizeof(linux_tty_sources) / sizeof(linux_tty_sources[0]));
     island->loader_version = kb_module_loader_version();
-    island->configured_module_count = cfg->module_count > TERMD_MAX_MODULES ?
-        TERMD_MAX_MODULES :
-        (uint32_t)cfg->module_count;
+    static const char *const module_names[TERMD_MAX_MODULES] = {
+        "linux_virtio.ko", "linux_virtio_ring.ko",
+        "linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_legacy_dev.ko",
+        "linux_virtio_pci.ko", "linux_tty_core.ko",
+        "linux_tty_n_null.ko", "linux_virtio_console.ko",
+    };
+    static const char *const module_paths[TERMD_MAX_MODULES] = {
+        "/usr/lib/kobox/linux_virtio.ko",
+        "/usr/lib/kobox/linux_virtio_ring.ko",
+        "/usr/lib/kobox/linux_virtio_pci_modern_dev.ko",
+        "/usr/lib/kobox/linux_virtio_pci_legacy_dev.ko",
+        "/usr/lib/kobox/linux_virtio_pci.ko",
+        "/usr/lib/kobox/linux_tty_core.ko",
+        "/usr/lib/kobox/linux_tty_n_null.ko",
+        "/usr/lib/kobox/linux_virtio_console.ko",
+    };
+    island->configured_module_count = TERMD_MAX_MODULES;
 
     kb_device_backend_t *backend = NULL;
     kb_status_t status = termd_linux_tty_island_create_backend(cfg, &backend);
@@ -1682,50 +1697,52 @@ int termd_linux_tty_island_init(
     int tty_core_ready = 0;
     int tty_n_null_ready = 0;
     for (uint32_t i = 0; i < island->configured_module_count; i++) {
-        const struct termd_module_config *module_cfg = &cfg->modules[i];
-        if (module_cfg->image_va == 0 || module_cfg->image_size == 0 || module_cfg->name[0] == '\0') {
+        struct filed_client_module_image loaded;
+        const int load_status = filed_client_load_module_image(
+            FILED_CLIENT_ENDPOINT_FD, module_paths[i], module_names[i], &loaded);
+        if (load_status != 0) {
             island->load_status = -22;
             return 0;
         }
 
         const kb_module_image_t image = {
-            .data = (const void *)(uintptr_t)module_cfg->image_va,
-            .size = (size_t)module_cfg->image_size,
-            .name = module_cfg->name,
+            .data = loaded.data,
+            .size = loaded.size,
+            .name = loaded.name,
         };
         printf("[termd] linux tty module open begin name=%s size=%llu\n",
-            module_cfg->name,
-            (unsigned long long)module_cfg->image_size);
+            loaded.name,
+            (unsigned long long)loaded.size);
         status = kb_module_open_image(&image, backend, &island->modules[i]);
         if (status != KB_OK || island->modules[i] == NULL) {
-            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_open"), pacha_trace_name_id(module_cfg->name), (uint64_t)status);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_open"), pacha_trace_name_id(loaded.name), (uint64_t)status);
             island->load_status = (int32_t)status;
             return 0;
         }
         island->loaded_module_count++;
-        printf("[termd] linux tty module open ready name=%s\n", module_cfg->name);
+        printf("[termd] linux tty module open ready name=%s\n", loaded.name);
 
         int init_result = 0;
-        printf("[termd] linux tty module init begin name=%s\n", module_cfg->name);
+        printf("[termd] linux tty module init begin name=%s\n", loaded.name);
         status = kb_module_call_init(island->modules[i], &init_result);
         if (status == KB_ERR_NOT_FOUND) {
-            printf("[termd] linux tty module init missing name=%s\n", module_cfg->name);
+            printf("[termd] linux tty module init missing name=%s\n", loaded.name);
             continue;
         }
         if (status != KB_OK) {
-            pacha_trace4(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_init_call"), pacha_trace_name_id(module_cfg->name), (uint64_t)status, (uint64_t)init_result);
+            pacha_trace4(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_init_call"), pacha_trace_name_id(loaded.name), (uint64_t)status, (uint64_t)init_result);
             island->init_status = (int32_t)status;
             return 0;
         }
         if (init_result != 0) {
-            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_init_result"), pacha_trace_name_id(module_cfg->name), (uint64_t)init_result);
+            pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_init_result"), pacha_trace_name_id(loaded.name), (uint64_t)init_result);
             island->init_status = (int32_t)init_result;
             return 0;
         }
-        printf("[termd] linux tty module init ready name=%s\n", module_cfg->name);
-        if (strcmp(module_cfg->name, "linux_tty_core.ko") == 0) {
+        printf("[termd] linux tty module init ready name=%s\n", loaded.name);
+        if (strcmp(loaded.name, "linux_tty_core.ko") == 0) {
             tty_core_ready = 1;
-        } else if (strcmp(module_cfg->name, "linux_tty_n_null.ko") == 0) {
+        } else if (strcmp(loaded.name, "linux_tty_n_null.ko") == 0) {
             tty_n_null_ready = 1;
         }
     }

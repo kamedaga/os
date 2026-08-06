@@ -687,6 +687,36 @@ int filed_kobox_backend_readlink(
         out_length);
 }
 
+int filed_kobox_backend_symlink(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t *out_object_id)
+{
+    if (backend == NULL || parent_object_id == 0 || name == NULL ||
+        target == NULL || out_object_id == NULL)
+    {
+        return -22;
+    }
+    *out_object_id = 0;
+    if (!filed_kobox_backend_is_direct(backend) ||
+        backend->direct_ops->symlink == NULL)
+    {
+        return -95;
+    }
+    const int status = backend->direct_ops->symlink(
+        backend->direct_ctx,
+        parent_object_id,
+        name,
+        target,
+        out_object_id);
+    if (status == 0) {
+        filed_kobox_backend_mark_dirty(backend);
+    }
+    return status;
+}
+
 int filed_kobox_backend_fsync(
     filed_kobox_backend_t *backend,
     uint64_t object_id)

@@ -22,6 +22,7 @@ pub const Hooks = struct {
     page_rw: u64,
     page_user: u64,
     page_ps: u64,
+    page_nx: u64,
     flush_user_tlb_for_principal_va: *const fn (principal: kernel.PrincipalId, va: u64) void,
     flush_user_tlb_for_principal_range: *const fn (principal: kernel.PrincipalId, va: u64, size_bytes: usize) void,
     kernel_pointer_paddr: *const fn (addr: usize) ?u64,
@@ -205,7 +206,23 @@ pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
 pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
     if (!lockAddressSpace(principal)) return;
     defer unlockAddressSpace(principal);
+    const h = hooks orelse return;
     const space = getUserSpace(principal) orelse return;
+
+    // A process slot reuses both its page-table storage and its PCID.  Make
+    // the old user tree unreachable before flushing that PCID on every CPU;
+    // otherwise a later occupant can execute a cached translation after the
+    // old VMO page has already been returned to the physical free list.
+    if (space.cr3 != 0) {
+        // Keep the kernel half present: the shootdown implementation briefly
+        // loads this CR3 while handling an IPI in kernel mode.
+        @memset(space.pml4[0..256], 0);
+        h.flush_user_tlb_for_principal_range(
+            principal,
+            h.user_low_va,
+            @intCast(h.user_top_va - h.user_low_va),
+        );
+    }
     resetUserAddressSpaceStorage(space);
 }
 
@@ -256,6 +273,27 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     return paddr;
 }
 
+/// The caller must hold the principal's address-space lock.  This is used by
+/// the page-fault path to distinguish a real permission violation from a
+/// stale CPU translation after a process/PCID slot has been recycled.
+pub fn userMappingAllowsAccessWithAddressSpaceLocked(
+    principal: kernel.PrincipalId,
+    va: u64,
+    write_access: bool,
+    instruction_fetch: bool,
+) bool {
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const index = userPageIndexForVa(h, va) orelse return false;
+    const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
+    const entry = space.pt_pages[slot][index.pt];
+    if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return false;
+    if ((entry & h.page_addr_mask) == 0) return false;
+    if (write_access and (entry & h.page_rw) == 0) return false;
+    if (instruction_fetch and (entry & h.page_nx) != 0) return false;
+    return true;
+}
+
 pub fn resetUserReservations(space: *UserAddressSpace) void {
     var index: usize = 0;
     while (index < UserAddressSpace.max_reservations) : (index += 1) {
@@ -299,6 +337,14 @@ pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
 
 fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
     const h = hooks orelse return false;
+    // Validate every fallible physical-address dependency before destroying
+    // the live tables.  Exec must be able to return an error with its old
+    // address space intact.
+    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
+    if (user_pml4_pa >= h.four_gib) return false;
+    const first_pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pdp_pages[0])) orelse return false;
+    if (first_pdp_pa >= h.physical_map_limit) return false;
+
     @memset(space.pml4[0..], 0);
     h.seed_user_pml4_with_kernel(space.pml4[0..]);
     var pdp_slot_init: usize = 0;
@@ -322,8 +368,6 @@ fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
     space.pdp_page_used_len = 0;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;
-    const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
-    if (user_pml4_pa >= h.four_gib) return false;
     _ = ensureUserPdpSlotForPml4(space, 0) orelse return false;
     space.cr3 = user_pml4_pa;
     return true;
@@ -334,10 +378,10 @@ pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.Pri
     defer unlockAddressSpacePair(from, to);
     const source = getUserSpace(from) orelse return false;
     const dest = getUserSpace(to) orelse return false;
+    if (!resetUserPageTablesPreserveReservations(dest)) return false;
     dest.reservations = source.reservations;
     dest.reservation_generation = source.reservation_generation;
     dest.next_dynamic_map_page = source.next_dynamic_map_page;
-    if (!resetUserPageTablesPreserveReservations(dest)) return false;
     return true;
 }
 
@@ -860,11 +904,11 @@ fn ptePaddr(entry: u64) u64 {
 
 fn pteFlagsForProt(h: Hooks, prot: kernel.MapProt) ?u64 {
     if (!prot.read) return null;
-    // NX is not enabled yet, so exec is tracked by ABI but not enforced in PTEs.
-    _ = prot.exec;
+    if (prot.write and prot.exec) return null;
     return h.page_present |
         h.page_user |
         (if (prot.write) h.page_rw else 0) |
+        (if (!prot.exec) h.page_nx else 0) |
         (@as(u64, prot.pkey) << pte_pkey_shift);
 }
 
@@ -897,7 +941,7 @@ pub fn mapUserLinearRegion(
     return mapUserLinearRegionWithProt(principal, va_start, paddr_start, size_bytes, .{
         .read = true,
         .write = writable,
-        .exec = true,
+        .exec = false,
     });
 }
 
@@ -1616,8 +1660,8 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     const stack_pt_page: *[512]u64 = &space.pt_pages[stack_slot];
     if (!reserveUserMapping(principal, h.user_va, 1, .bootstrap, true)) return false;
     if (!reserveUserMapping(principal, h.user_stack_page_va, 1, .bootstrap, true)) return false;
-    user_pt_page[user_pt_index] = user_page_paddr | h.page_present | h.page_rw | h.page_user;
-    stack_pt_page[stack_pt_index] = user_stack_paddr | h.page_present | h.page_rw | h.page_user;
+    user_pt_page[user_pt_index] = user_page_paddr | h.page_present | h.page_user;
+    stack_pt_page[stack_pt_index] = user_stack_paddr | h.page_present | h.page_rw | h.page_user | h.page_nx;
     space.cr3 = user_pml4_pa;
     return true;
 }

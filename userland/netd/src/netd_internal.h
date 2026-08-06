@@ -11,7 +11,11 @@ struct netd_runtime {
     const struct netd_boot_config *cfg;
     kb_device_backend_t *backend;
     kb_module_t *modules[NETD_MAX_MODULES];
+    uint64_t module_count;
 };
+
+extern const char *const netd_module_names[];
+extern const uint64_t netd_module_count;
 
 uint64_t netd_metrics_read_tsc(void);
 void netd_metrics_set_enabled(int enabled);

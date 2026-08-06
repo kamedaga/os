@@ -116,6 +116,23 @@ static int write_all(int fd, const char *bytes, size_t length)
     return 0;
 }
 
+static int read_all(int fd, char *bytes, size_t capacity, size_t *out_length)
+{
+    size_t length = 0;
+    while (length < capacity) {
+        ssize_t result = read(fd, bytes + length, capacity - length);
+        if (result < 0 && errno == EINTR) continue;
+        if (result < 0) return -1;
+        if (result == 0) {
+            *out_length = length;
+            return 0;
+        }
+        length += (size_t)result;
+    }
+    errno = EOVERFLOW;
+    return -1;
+}
+
 static int publish_roles(unsigned event, const input_roles_t *roles)
 {
     char path[INPUT_PATH_BYTES];
@@ -124,23 +141,21 @@ static int publish_roles(unsigned event, const input_roles_t *roles)
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     char current[INPUT_UEVENT_BYTES];
-    ssize_t length;
-    do {
-        length = read(fd, current, sizeof(current));
-    } while (length < 0 && errno == EINTR);
+    size_t length = 0;
+    const int read_status = read_all(fd, current, sizeof(current), &length);
     const int read_errno = errno;
     (void)close(fd);
     errno = read_errno;
-    if (length < 0 || (size_t)length == sizeof(current)) return -1;
+    if (read_status != 0) return -1;
 
     char updated[INPUT_UEVENT_BYTES];
     size_t used = 0;
     size_t offset = 0;
-    while (offset < (size_t)length) {
+    while (offset < length) {
         const size_t start = offset;
-        while (offset < (size_t)length && current[offset] != '\n') offset++;
+        while (offset < length && current[offset] != '\n') offset++;
         const size_t line_length = offset - start;
-        if (offset < (size_t)length) offset++;
+        if (offset < length) offset++;
         if (line_length >= 8 && memcmp(current + start, "ID_INPUT", 8) == 0)
             continue;
         if (line_length != 0 &&

@@ -25,6 +25,8 @@ sleep 3
   --send '/cmd/lpr_shared_mapping.elf verify' \
   --expect 'SHMAP_FILE_PERSISTENCE=OK' \
   --expect 'SHMAP_MEMFD_TWO_MAP=OK' \
+  --expect 'SHMAP_PRIVATE_FILE_COW=OK' \
+  --expect 'SHMAP_PRIVATE_SPLIT_COW=OK' \
   --expect 'SHMAP_MEMFD_FORK_BIDIR=OK' \
   --expect 'SHMAP_ANON_FORK_BIDIR=OK' \
   --expect 'SHMAP_VERIFY_DONE'

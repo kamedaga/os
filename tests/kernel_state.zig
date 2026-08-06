@@ -54,6 +54,19 @@ fn mmapFlags(comptime fields: anytype) kernel.MmapFlags {
     return flags;
 }
 
+test "process descriptor capacity limit does not exceed address-space storage" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x20_0000, 16);
+    const limit = kernel.initial_process_count + 2;
+
+    const first = s.createProcessDescriptorWithCapacityLimit("limited-0", &free_list, limit) orelse unreachable;
+    const second = s.createProcessDescriptorWithCapacityLimit("limited-1", &free_list, limit) orelse unreachable;
+    try std.testing.expect(@intFromEnum(first) < limit);
+    try std.testing.expect(@intFromEnum(second) < limit);
+    try std.testing.expect(s.createProcessDescriptorWithCapacityLimit("over-limit", &free_list, limit) == null);
+}
+
 const NoopUnmapper = struct {
     pub fn unmap(_: NoopUnmapper, _: PrincipalId, _: u64, _: u64) bool {
         return true;
@@ -182,6 +195,37 @@ test "process fd exposes process object kind and lifecycle state" {
     const updated = s.processObjectForFd(p0, fd, fdRights(.{ .wait = true })) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(kernel.TaskObjectState.killed, updated.state);
     try std.testing.expectEqual(@as(u32, 7), updated.exit_code);
+}
+
+test "stale active process fd cannot retarget a reused principal generation" {
+    var s = try initFdState();
+    const rights = fdRights(.{ .kill = true, .wait = true, .close = true });
+    const stale_fd = try s.createProcessFd(p0, .{
+        .principal_raw = @intFromEnum(p1),
+        .state = .active,
+    }, rights, .{}, 16);
+    const old_generation = s.processDescriptor(p1).?.generation;
+
+    try std.testing.expect(s.markProcessExited(p1));
+    try std.testing.expect(s.ensureProcessDescriptor(p1, "reused"));
+    try std.testing.expect(s.processDescriptor(p1).?.generation != old_generation);
+    try std.testing.expect(s.processObjectForFd(p0, stale_fd, fdRights(.{ .kill = true })) == null);
+}
+
+test "terminal process fd remains waitable after principal reuse" {
+    var s = try initFdState();
+    const rights = fdRights(.{ .wait = true, .close = true });
+    const fd = try s.createProcessFd(p0, .{
+        .principal_raw = @intFromEnum(p1),
+        .state = .active,
+    }, rights, .{}, 16);
+
+    s.markProcessObjectsExited(p1, .exited, 23);
+    try std.testing.expect(s.markProcessExited(p1));
+    try std.testing.expect(s.ensureProcessDescriptor(p1, "reused"));
+    const terminal = s.processObjectForFd(p0, fd, fdRights(.{ .wait = true })) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(kernel.TaskObjectState.exited, terminal.state);
+    try std.testing.expectEqual(@as(u32, 23), terminal.exit_code);
 }
 
 test "one thread can wait on multiple process fds" {
@@ -484,7 +528,8 @@ test "irq fd records only matching device and MSI-X entry" {
     try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1001, 2, wake_owners[0..]));
     try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, irq_fd, fdRights(.{ .irq_wait = true })));
     try std.testing.expectEqual(@as(?u64, 2), s.irqEventCountForFd(p0, auto_fd, fdRights(.{ .irq_wait = true })));
-    try std.testing.expectEqual(@as(usize, 0), s.recordDeviceInterruptEvent(0x1002, 1, wake_owners[0..]));
+    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1002, 1, wake_owners[0..]));
+    try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, other_device_fd, fdRights(.{ .irq_wait = true })));
     try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 }
 
@@ -942,7 +987,7 @@ test "private file vma faults read-only then COWs on write" {
     try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(private_vma_before.vmo, 1));
     try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
 
-    const write_mapping = s.ensureNativeVmaCowMapping(
+    const write_mapping = s.ensureNativeVmaCowMappingLockedSlow(
         p0,
         0x4600_0000,
         true,

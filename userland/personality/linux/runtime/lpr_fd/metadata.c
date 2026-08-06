@@ -853,6 +853,11 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
     const int64_t status = lpr_filed_call(FILED_OP_VFS_STAT, page_fd, 0, &ignored);
     lpr_trace_process_event("fstat_filed_end", fd, (uint64_t)(uint32_t)page_fd, status);
     if (status == 0) {
+        lpr_filed_backend_t *file = lpr_filed_backend(fd);
+        if (file != 0) {
+            file->stat_size = stat->size;
+            file->object_generation = stat->object_generation;
+        }
         lpr_write_linux_stat((void *)(uintptr_t)statbuf, stat);
     }
     lpr_destroy_standalone_wire_page(page_fd, page);

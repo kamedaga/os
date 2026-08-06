@@ -48,6 +48,8 @@ typedef struct lpr_filed_backend {
     uint64_t offset;
     lpr_native_fd_t lease_fd;
     uint32_t reserved2;
+    uint64_t stat_size;
+    uint64_t object_generation;
 } lpr_filed_backend_t;
 
 typedef struct lpr_pipe_backend {

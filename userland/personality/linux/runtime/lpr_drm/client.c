@@ -74,6 +74,104 @@ static volatile uint64_t lpr_drm_event_token_counter;
 static lpr_drm_event_cookie_t
     lpr_drm_event_cookies[LPR_DRM_EVENT_COOKIE_CAPACITY];
 
+#if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
+enum { LPR_DRM_PROFILE_COMMAND_SLOTS = 32u };
+
+typedef struct lpr_drm_profile_command {
+    uint32_t command;
+    uint32_t count;
+    uint64_t total_cycles;
+    uint64_t max_cycles;
+    uint64_t errors;
+} lpr_drm_profile_command_t;
+
+static lpr_drm_profile_command_t
+    lpr_drm_profile_commands[LPR_DRM_PROFILE_COMMAND_SLOTS];
+static uint64_t lpr_drm_profile_page_cycles;
+static uint64_t lpr_drm_profile_prepare_cycles;
+static uint64_t lpr_drm_profile_ipc_cycles;
+static uint64_t lpr_drm_profile_cleanup_cycles;
+static uint64_t lpr_drm_profile_calls;
+static volatile uint32_t lpr_drm_profile_lock;
+
+static void lpr_drm_profile_record(
+    uint32_t command,
+    int64_t status,
+    uint64_t start,
+    uint64_t page_end,
+    uint64_t ipc_begin,
+    uint64_t ipc_end,
+    uint64_t end)
+{
+    while (__atomic_exchange_n(
+        &lpr_drm_profile_lock, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        __asm__ volatile("pause");
+    }
+    lpr_drm_profile_command_t *slot = 0;
+    for (uint32_t i = 0; i < LPR_DRM_PROFILE_COMMAND_SLOTS; i++) {
+        lpr_drm_profile_command_t *candidate = &lpr_drm_profile_commands[i];
+        if (candidate->count != 0 && candidate->command == command) {
+            slot = candidate;
+            break;
+        }
+        if (slot == 0 && candidate->count == 0) slot = candidate;
+    }
+    if (slot != 0) {
+        const uint64_t total = end >= start ? end - start : 0;
+        slot->command = command;
+        slot->count++;
+        slot->total_cycles += total;
+        if (total > slot->max_cycles) slot->max_cycles = total;
+        if (status < 0) slot->errors++;
+    }
+    lpr_drm_profile_calls++;
+    if (page_end >= start) lpr_drm_profile_page_cycles += page_end - start;
+    if (ipc_begin >= page_end) {
+        lpr_drm_profile_prepare_cycles += ipc_begin - page_end;
+    }
+    if (ipc_end >= ipc_begin) lpr_drm_profile_ipc_cycles += ipc_end - ipc_begin;
+    if (end >= ipc_end) lpr_drm_profile_cleanup_cycles += end - ipc_end;
+    __atomic_store_n(&lpr_drm_profile_lock, 0u, __ATOMIC_RELEASE);
+}
+
+void lpr_drm_startup_profile_dump(void)
+{
+    const uint64_t pid =
+        (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
+    const uint64_t command_marker = pacha_trace_name_id("lpr.drm.ioctl");
+    const uint64_t stage_marker = pacha_trace_name_id("lpr.drm.stages");
+    for (uint32_t i = 0; i < LPR_DRM_PROFILE_COMMAND_SLOTS; i++) {
+        const lpr_drm_profile_command_t *slot = &lpr_drm_profile_commands[i];
+        if (slot->count == 0) continue;
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_LPR,
+            PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA,
+            PACHA_TRACE_CLASS_METRIC,
+            command_marker,
+            pid,
+            slot->command,
+            slot->count,
+            slot->total_cycles,
+            slot->max_cycles);
+    }
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_LPR,
+        PACHA_TRACE_EVENT_METRIC_TIMING_EXTRA,
+        PACHA_TRACE_CLASS_METRIC,
+        stage_marker,
+        lpr_drm_profile_calls,
+        lpr_drm_profile_page_cycles,
+        lpr_drm_profile_prepare_cycles,
+        lpr_drm_profile_ipc_cycles,
+        lpr_drm_profile_cleanup_cycles);
+    pacha_trace_dump_ring();
+}
+#else
+void lpr_drm_startup_profile_dump(void)
+{
+}
+#endif
+
 static int lpr_drm_event_token_active(uint64_t token)
 {
     for (uint32_t i = 0; i < LPR_DRM_EVENT_COOKIE_CAPACITY; i++) {
@@ -836,6 +934,9 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
 
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
+#if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
+    const uint64_t profile_start = pacha_trace_read_tsc();
+#endif
     lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     const uint32_t command = (uint32_t)request;
     const int no_argument = command == DRMD_IOCTL_SET_MASTER || command == DRMD_IOCTL_DROP_MASTER;
@@ -875,6 +976,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     if (page_fd < 0) {
         return page_fd;
     }
+#if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
+    const uint64_t profile_page_end = pacha_trace_read_tsc();
+#endif
     drmd_ioctl_request_t *ioctl = (drmd_ioctl_request_t *)lpr_drmd_payload(page);
     lpr_memset(ioctl, 0, sizeof(*ioctl));
     ioctl->handle = drm->handle;
@@ -1177,6 +1281,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         transfer_fds[transfer_count] = output_notify_fd;
         temporary_vmos[transfer_count++] = 0;
     }
+#if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
+    const uint64_t profile_ipc_begin = pacha_trace_read_tsc();
+#endif
     int64_t status = lpr_drmd_call_transfers(
         DRMD_OP_HANDLE_IOCTL,
         page_fd,
@@ -1187,6 +1294,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         transfer_fds,
         temporary_vmos,
         transfer_count);
+#if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
+    const uint64_t profile_ipc_end = pacha_trace_read_tsc();
+#endif
     if (status != 0 && event_token != 0) {
         lpr_drm_event_cookie_cancel(drm->handle, event_token);
         event_token = 0;
@@ -1331,6 +1441,17 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     }
     lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
     lpr_destroy_tty_wire_page(page_fd, page);
+#if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
+    const uint64_t profile_end = pacha_trace_read_tsc();
+    lpr_drm_profile_record(
+        command,
+        status,
+        profile_start,
+        profile_page_end,
+        profile_ipc_begin,
+        profile_ipc_end,
+        profile_end);
+#endif
     return status;
 }
 

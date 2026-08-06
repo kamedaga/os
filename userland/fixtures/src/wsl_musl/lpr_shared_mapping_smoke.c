@@ -159,6 +159,97 @@ static int memfd_two_map_phase(void)
     return 1;
 }
 
+static int private_file_cow_phase(void)
+{
+    int fd = open(persist_path, O_RDWR);
+    if (fd < 0) {
+        return 0;
+    }
+    unsigned char *first = mmap(
+        0,
+        PAGE_BYTES,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE,
+        fd,
+        0);
+    unsigned char *second = mmap(
+        0,
+        PAGE_BYTES,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE,
+        fd,
+        0);
+    if (first == MAP_FAILED || second == MAP_FAILED) {
+        if (first != MAP_FAILED) munmap(first, PAGE_BYTES);
+        if (second != MAP_FAILED) munmap(second, PAGE_BYTES);
+        close(fd);
+        return 0;
+    }
+    const unsigned char original = second[0];
+    first[0] = (unsigned char)(original ^ 0xffu);
+    unsigned char file_byte = 0;
+    const int good =
+        second[0] == original &&
+        pread(fd, &file_byte, 1, 0) == 1 &&
+        file_byte == original;
+    munmap(first, PAGE_BYTES);
+    munmap(second, PAGE_BYTES);
+    close(fd);
+    if (!good) {
+        return 0;
+    }
+    emit("SHMAP_PRIVATE_FILE_COW=OK\n");
+    return 1;
+}
+
+static int private_file_split_cow_phase(void)
+{
+    int fd = open(persist_path, O_RDWR);
+    if (fd < 0) {
+        return 0;
+    }
+    const size_t split_bytes = PAGE_BYTES * 2u;
+    unsigned char *first = mmap(
+        0,
+        split_bytes,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE,
+        fd,
+        0);
+    unsigned char *second = mmap(
+        0,
+        split_bytes,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE,
+        fd,
+        0);
+    if (first == MAP_FAILED || second == MAP_FAILED) {
+        if (first != MAP_FAILED) munmap(first, split_bytes);
+        if (second != MAP_FAILED) munmap(second, split_bytes);
+        close(fd);
+        return 0;
+    }
+    const unsigned char file_original = second[0];
+    const unsigned char tail_original = second[PAGE_BYTES + 17];
+    first[0] = (unsigned char)(file_original ^ 0xffu);
+    first[PAGE_BYTES + 17] = 0x5au;
+    unsigned char file_byte = 0;
+    const int good =
+        second[0] == file_original &&
+        second[PAGE_BYTES + 17] == tail_original &&
+        tail_original == 0 &&
+        pread(fd, &file_byte, 1, 0) == 1 &&
+        file_byte == file_original;
+    munmap(first, split_bytes);
+    munmap(second, split_bytes);
+    close(fd);
+    if (!good) {
+        return 0;
+    }
+    emit("SHMAP_PRIVATE_SPLIT_COW=OK\n");
+    return 1;
+}
+
 static int fork_shared_phase(int anonymous)
 {
     int fd = -1;
@@ -211,6 +302,12 @@ static int verify_phase(void)
         return 0;
     }
     if (!memfd_two_map_phase()) {
+        return 0;
+    }
+    if (!private_file_cow_phase()) {
+        return 0;
+    }
+    if (!private_file_split_cow_phase()) {
         return 0;
     }
     if (!fork_shared_phase(0)) {

@@ -36,6 +36,8 @@
 #define filed_file_vmo_cache_misses (runtime->dispatch_state->cache.file_vmo.misses)
 #define filed_file_vmo_cache_stores (runtime->dispatch_state->cache.file_vmo.stores)
 #define filed_file_vmo_cache_evictions (runtime->dispatch_state->cache.file_vmo.evictions)
+#define filed_file_vmo_stage_cycles (runtime->dispatch_state->file_vmo_stage_cycles)
+#define filed_file_vmo_stage_counts (runtime->dispatch_state->file_vmo_stage_counts)
 
 typedef struct filed_page_dispatch_result {
     int64_t status;
@@ -143,6 +145,7 @@ filed_page_dispatch_result_t filed_dispatch_pread_page(filed_runtime_t *runtime,
 filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(filed_runtime_t *runtime, void *page, int vmo_fd);
 int filed_dispatch_file_vmo(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_envelope_t *header);
 int filed_dispatch_shared_file_vmo(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_envelope_t *header);
+void filed_file_vmo_storage_profile_dump(void);
 filed_page_dispatch_result_t filed_dispatch_memfd_create_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_read_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pwrite_page(filed_runtime_t *runtime, void *page);
