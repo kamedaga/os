@@ -124,7 +124,9 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
         "FILED_STORAGE_PROFILE scope=dma_window begin_calls=%llu mapping_calls=%llu "
         "mapping_cycles=%llu reuse_calls=%llu reuse_cycles=%llu "
         "end_calls=%llu mapped_bytes=%llu direct_mapping_calls=%llu "
-        "direct_mapping_cycles=%llu direct_mapped_bytes=%llu staged_read_calls=%llu "
+        "direct_mapping_cycles=%llu direct_mapped_bytes=%llu "
+        "direct_cache_hits=%llu direct_cache_hit_cycles=%llu "
+        "direct_cache_misses=%llu direct_cache_evictions=%llu staged_read_calls=%llu "
         "staged_bytes=%llu staging_copy_cycles=%llu\n",
         (unsigned long long)dma_window_profile.begin_calls,
         (unsigned long long)dma_window_profile.mapping_calls,
@@ -136,6 +138,10 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
         (unsigned long long)dma_window_profile.direct_mapping_calls,
         (unsigned long long)dma_window_profile.direct_mapping_cycles,
         (unsigned long long)dma_window_profile.direct_mapped_bytes,
+        (unsigned long long)dma_window_profile.direct_cache_hits,
+        (unsigned long long)dma_window_profile.direct_cache_hit_cycles,
+        (unsigned long long)dma_window_profile.direct_cache_misses,
+        (unsigned long long)dma_window_profile.direct_cache_evictions,
         (unsigned long long)dma_window_profile.staged_read_calls,
         (unsigned long long)dma_window_profile.staged_bytes,
         (unsigned long long)dma_window_profile.staging_copy_cycles);
