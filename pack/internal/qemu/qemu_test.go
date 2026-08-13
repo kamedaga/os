@@ -93,6 +93,7 @@ func TestAppendInputDeviceArgs(t *testing.T) {
 	tests := []struct {
 		name    string
 		profile string
+		iommu   bool
 		want    string
 		wantErr bool
 	}{
@@ -111,6 +112,12 @@ func TestAppendInputDeviceArgs(t *testing.T) {
 			want:    "qemu -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd -device virtio-tablet-pci,disable-legacy=on,id=pachatablet",
 		},
 		{
+			name:    "IOMMU platform",
+			profile: "keyboard-tablet",
+			iommu:   true,
+			want:    "qemu -device virtio-keyboard-pci,iommu_platform=on,disable-legacy=on,id=pachakbd -device virtio-tablet-pci,iommu_platform=on,disable-legacy=on,id=pachatablet",
+		},
+		{
 			name:    "mouse keyboard order",
 			profile: "mouse-keyboard",
 			want:    "qemu -device virtio-mouse-pci,disable-legacy=on,id=pachamouse -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
@@ -119,7 +126,7 @@ func TestAppendInputDeviceArgs(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			args, err := appendInputDeviceArgs([]string{"qemu"}, test.profile)
+			args, err := appendInputDeviceArgs([]string{"qemu"}, test.profile, test.iommu)
 			if test.wantErr {
 				if err == nil {
 					t.Fatalf("appendInputDeviceArgs(%q) unexpectedly succeeded with %q", test.profile, strings.Join(args, " "))
@@ -134,6 +141,101 @@ func TestAppendInputDeviceArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIOMMUCommandArgs(t *testing.T) {
+	root := t.TempDir()
+	artifacts := filepath.Join(root, ".artifacts")
+	if err := os.MkdirAll(artifacts, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"limine-boot.img", "disk.img"} {
+		if err := os.WriteFile(filepath.Join(artifacts, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	workspace := &config.Workspace{
+		Root:      root,
+		Artifacts: ".artifacts",
+		Disk:      config.Disk{Image: ".artifacts/disk.img"},
+	}
+
+	plan, err := commandArgs(workspace, Options{IOMMU: true, Console: "pty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices := deviceArgs(plan.Args)
+	if len(devices) == 0 || devices[0] != "intel-iommu,intremap=off,aw-bits=48" {
+		t.Fatalf("first device = %q, want intel-iommu; all devices: %#v", firstDevice(devices), devices)
+	}
+	for _, want := range []string{
+		"virtio-gpu-pci,disable-legacy=on,iommu_platform=on,id=pachagpu",
+		"virtio-keyboard-pci,iommu_platform=on,disable-legacy=on,id=pachakbd",
+		"virtio-mouse-pci,iommu_platform=on,disable-legacy=on,id=pachamouse",
+		"virtio-net-pci,iommu_platform=on,",
+		"virtio-serial-pci,iommu_platform=on,disable-legacy=on,id=virtserial0",
+	} {
+		if !deviceWithSubstring(devices, want) {
+			t.Errorf("missing device substring %q in %#v", want, devices)
+		}
+	}
+
+	defaultPlan, err := commandArgs(workspace, Options{Console: "pty"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultDevices := deviceArgs(defaultPlan.Args)
+	if deviceWithSubstring(defaultDevices, "intel-iommu") {
+		t.Fatalf("default command unexpectedly contains intel-iommu: %#v", defaultDevices)
+	}
+	for _, device := range defaultDevices {
+		if strings.HasPrefix(device, "virtio-gpu") {
+			continue
+		}
+		if strings.Contains(device, "iommu_platform=on") {
+			t.Fatalf("default command unexpectedly enables iommu_platform: %q", device)
+		}
+	}
+}
+
+func TestUEFIIOMMUIsFirstDevice(t *testing.T) {
+	workspace, _ := testUEFIWorkspace(t)
+	plan, err := commandArgs(workspace, Options{Firmware: "uefi", IOMMU: true, Console: "off", NoKVM: true, NoNet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	devices := deviceArgs(plan.Args)
+	if len(devices) == 0 || devices[0] != "intel-iommu,intremap=off,aw-bits=48" {
+		t.Fatalf("first UEFI device = %q, want intel-iommu; all devices: %#v", firstDevice(devices), devices)
+	}
+}
+
+func deviceArgs(args []string) []string {
+	devices := make([]string, 0)
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-device" {
+			devices = append(devices, args[i+1])
+			i++
+		}
+	}
+	return devices
+}
+
+func deviceWithSubstring(devices []string, want string) bool {
+	for _, device := range devices {
+		if strings.Contains(device, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstDevice(devices []string) string {
+	if len(devices) == 0 {
+		return ""
+	}
+	return devices[0]
 }
 
 func TestAppendGraphicsDeviceArgs(t *testing.T) {

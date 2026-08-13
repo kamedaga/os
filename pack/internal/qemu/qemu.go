@@ -29,6 +29,7 @@ type Options struct {
 	DiskImage       string
 	DiskFormat      string
 	NoKVM           bool
+	IOMMU           bool
 	NoNet           bool
 	Fast            bool
 	DryRun          bool
@@ -129,6 +130,7 @@ type SmokeResult struct {
 type TTYTestOptions struct {
 	Timeout          time.Duration
 	NoKVM            bool
+	IOMMU            bool
 	CPUs             int
 	Display          string
 	GraphicsProfile  string
@@ -513,6 +515,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		Console:         "pty",
 		NewTerminal:     true,
 		NoKVM:           opts.NoKVM,
+		IOMMU:           opts.IOMMU,
 		CPUs:            opts.CPUs,
 		Fast:            true,
 		InputProfile:    opts.InputProfile,
@@ -1081,7 +1084,7 @@ func appendConsoleArgs(workspace *config.Workspace, args []string, opts Options)
 		}
 		args = append(args,
 			"-chardev", "socket,id=virtcon0,path="+socketPath+",server=on,wait=off",
-			"-device", "virtio-serial-pci,disable-legacy=on,id=virtserial0",
+			"-device", "virtio-serial-pci"+virtioIOMMUPlatformArg(opts.IOMMU)+",disable-legacy=on,id=virtserial0",
 			"-device", "virtconsole,chardev=virtcon0,name=org.pachaos.console.0",
 		)
 		return args, socketPath, nil
@@ -1090,10 +1093,11 @@ func appendConsoleArgs(workspace *config.Workspace, args []string, opts Options)
 	}
 }
 
-func appendInputDeviceArgs(args []string, profile string) ([]string, error) {
-	keyboard := []string{"-device", "virtio-keyboard-pci,disable-legacy=on,id=pachakbd"}
-	mouse := []string{"-device", "virtio-mouse-pci,disable-legacy=on,id=pachamouse"}
-	tablet := []string{"-device", "virtio-tablet-pci,disable-legacy=on,id=pachatablet"}
+func appendInputDeviceArgs(args []string, profile string, iommu bool) ([]string, error) {
+	platformArg := virtioIOMMUPlatformArg(iommu)
+	keyboard := []string{"-device", "virtio-keyboard-pci" + platformArg + ",disable-legacy=on,id=pachakbd"}
+	mouse := []string{"-device", "virtio-mouse-pci" + platformArg + ",disable-legacy=on,id=pachamouse"}
+	tablet := []string{"-device", "virtio-tablet-pci" + platformArg + ",disable-legacy=on,id=pachatablet"}
 	switch profile {
 	case "", "keyboard-mouse":
 		args = append(args, keyboard...)
@@ -1108,6 +1112,13 @@ func appendInputDeviceArgs(args []string, profile string) ([]string, error) {
 		return nil, fmt.Errorf("invalid input profile %q; expected keyboard-mouse, keyboard-tablet, or mouse-keyboard", profile)
 	}
 	return args, nil
+}
+
+func virtioIOMMUPlatformArg(iommu bool) string {
+	if iommu {
+		return ",iommu_platform=on"
+	}
+	return ""
 }
 
 func appendGraphicsDeviceArgs(args []string, profile string, display string) ([]string, string, error) {
@@ -1161,6 +1172,9 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
 	}
+	if opts.IOMMU {
+		args = append(args, "-device", "intel-iommu,intremap=off,aw-bits=48")
+	}
 	args = append(args,
 		"-drive", "file="+imagePath+",format=raw,if=ide",
 		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
@@ -1170,7 +1184,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if err != nil {
 		return commandPlan{}, err
 	}
-	args, err = appendInputDeviceArgs(args, opts.InputProfile)
+	args, err = appendInputDeviceArgs(args, opts.InputProfile, opts.IOMMU)
 	if err != nil {
 		return commandPlan{}, err
 	}
@@ -1190,7 +1204,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if !opts.NoKVM {
 		args = append(args, "-enable-kvm")
 	}
-	args = appendNetworkArgs(args, opts.NoNet)
+	args = appendNetworkArgs(args, opts.NoNet, opts.IOMMU)
 	if opts.QMP != "" {
 		args = append(args, "-qmp", "unix:"+opts.QMP+",server=on,wait=off")
 	}
@@ -1248,18 +1262,23 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-m", opts.Memory,
 		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
-		"-drive", "if=pflash,format=raw,readonly=on,file=" + codePath,
-		"-drive", "if=pflash,format=raw,file=" + varsPath,
-		"-drive", "if=none,file=" + imagePath + ",format=raw,id=limineboot",
-		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
-		"-drive", "if=none,file=" + diskPath + ",format=" + diskFormat + ",id=rootdisk",
-		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
 	}
+	if opts.IOMMU {
+		args = append(args, "-device", "intel-iommu,intremap=off,aw-bits=48")
+	}
+	args = append(args,
+		"-drive", "if=pflash,format=raw,readonly=on,file="+codePath,
+		"-drive", "if=pflash,format=raw,file="+varsPath,
+		"-drive", "if=none,file="+imagePath+",format=raw,id=limineboot",
+		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
+		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
+		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
+	)
 	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
 	if err != nil {
 		return commandPlan{}, err
 	}
-	args, err = appendInputDeviceArgs(args, opts.InputProfile)
+	args, err = appendInputDeviceArgs(args, opts.InputProfile, opts.IOMMU)
 	if err != nil {
 		return commandPlan{}, err
 	}
@@ -1279,7 +1298,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if !opts.NoKVM {
 		args = append(args, "-enable-kvm")
 	}
-	args = appendNetworkArgs(args, opts.NoNet)
+	args = appendNetworkArgs(args, opts.NoNet, opts.IOMMU)
 	if opts.QMP != "" {
 		args = append(args, "-qmp", "unix:"+opts.QMP+",server=on,wait=off")
 	}
@@ -1302,14 +1321,14 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	}, nil
 }
 
-func appendNetworkArgs(args []string, noNet bool) []string {
+func appendNetworkArgs(args []string, noNet bool, iommu bool) []string {
 	if noNet {
 		return append(args, "-net", "none")
 	}
 	return append(args,
 		"-net", "none",
 		"-netdev", "user,id=net0,hostfwd=udp:127.0.0.1:10015-10.0.2.15:7777,hostfwd=tcp:127.0.0.1:10016-10.0.2.15:7778",
-		"-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
+		"-device", "virtio-net-pci"+virtioIOMMUPlatformArg(iommu)+",netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
 	)
 }
 
