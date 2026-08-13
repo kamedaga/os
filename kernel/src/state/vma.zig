@@ -1304,6 +1304,37 @@ pub fn createAnonymousVmoFdWithPages(
     return fd;
 }
 
+pub fn createContiguousVmoFdWithPages(
+    self: anytype,
+    owner: PrincipalId,
+    size_bytes: u64,
+    rights: FdRights,
+    flags: FdFlags,
+    min_fd: Fd,
+    free_list: *FreePageList,
+) KernelError!Fd {
+    const dma_pool_max_pages = @import("kernel_abi_root").capsule_abi.dma_pool_max_pages;
+    const max_size_bytes = @as(u64, @intCast(dma_pool_max_pages)) * native_page_size;
+    if (size_bytes == 0 or size_bytes > max_size_bytes) return KernelError.InvalidState;
+    const aligned_size = @TypeOf(self.*).pageAlignUp(size_bytes);
+    const page_count: usize = @intCast(aligned_size / native_page_size);
+    if (page_count == 0 or page_count > dma_pool_max_pages) return KernelError.InvalidState;
+
+    const fd = try self.createAnonymousVmoFd(owner, aligned_size, rights, flags, min_fd);
+    errdefer self.closeFdWithFreeList(owner, fd, free_list) catch {};
+    const vmo_ref = self.nativeVmoRefForFd(owner, fd) orelse return KernelError.InvalidState;
+    const base = try free_list.popContiguousBelow(page_count, @TypeOf(self.*).low_memory_limit);
+    errdefer free_list.appendContiguousRange(0, base, page_count) catch {};
+
+    var pages: [dma_pool_max_pages]u64 = undefined;
+    for (pages[0..page_count], 0..) |*paddr, page_index| {
+        paddr.* = base + (@as(u64, @intCast(page_index)) * native_page_size);
+        try self.zeroAllocatedPage(paddr.*);
+    }
+    try self.installNativeVmoPages(vmo_ref, 0, pages[0..page_count]);
+    return fd;
+}
+
 pub fn createAnonymousVmaWithPages(
     self: anytype,
     owner: PrincipalId,

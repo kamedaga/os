@@ -1324,6 +1324,93 @@ test "shared vmo fd pages survive munmap while fd remains open" {
     try std.testing.expectEqual(original_free, free_list.len);
 }
 
+test "contiguous DMA pool VMO installs consecutive low pages" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x80_0000, 8);
+
+    const fd = try s.createContiguousVmoFdWithPages(
+        p0,
+        3 * 4096 - 1,
+        fdRights(.{ .close = true, .map_read = true, .map_write = true }),
+        .{},
+        16,
+        &free_list,
+    );
+    try std.testing.expect(fd >= 16);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    const base = s.nativeVmoPagePaddr(vmo, 0) orelse unreachable;
+    var page_index: usize = 0;
+    while (page_index < 3) : (page_index += 1) {
+        const paddr = s.nativeVmoPagePaddr(vmo, page_index) orelse unreachable;
+        try std.testing.expectEqual(base + (@as(u64, @intCast(page_index)) * 4096), paddr);
+        try std.testing.expect(paddr < KernelState.low_memory_limit);
+    }
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+}
+
+test "contiguous DMA pool VMO rejects fragmented free pages without consuming them" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x90_0000, 2);
+    try free_list.appendContiguousRange(0, 0xa0_0000, 2);
+    const original_free = free_list.pageCount();
+    const original_ranges = free_list.rangeCount();
+
+    try std.testing.expectError(
+        KernelError.OutOfFreePages,
+        s.createContiguousVmoFdWithPages(
+            p0,
+            3 * 4096,
+            fdRights(.{ .close = true, .map_read = true, .map_write = true }),
+            .{},
+            16,
+            &free_list,
+        ),
+    );
+    try std.testing.expectEqual(original_free, free_list.pageCount());
+    try std.testing.expectEqual(original_ranges, free_list.rangeCount());
+}
+
+test "contiguous DMA pool VMO close restores and merges its extent" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0xb0_0000, 8);
+    const original_free = free_list.pageCount();
+
+    const fd = try s.createContiguousVmoFdWithPages(
+        p0,
+        4 * 4096,
+        fdRights(.{ .close = true }),
+        .{},
+        16,
+        &free_list,
+    );
+    try std.testing.expectEqual(original_free - 4, free_list.pageCount());
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(original_free, free_list.pageCount());
+    try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
+}
+
+test "contiguous DMA pool VMO enforces the ABI page limit" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const oversized = (@as(u64, kernel.dma_pool_max_pages) + 1) * kernel.native_page_size;
+
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.createContiguousVmoFdWithPages(
+            p0,
+            oversized,
+            fdRights(.{ .close = true }),
+            .{},
+            16,
+            &free_list,
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+}
+
 test "native vma fault mapping resolves backing page without page capability" {
     var s = try initFdState();
     var free_list = FreePageList{};

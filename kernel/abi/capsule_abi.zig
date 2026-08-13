@@ -12,7 +12,8 @@ pub const syscall_capsule_pci_config_read: u64 = 68;
 pub const syscall_capsule_pci_config_write: u64 = 69;
 pub const syscall_capsule_pci_bar_info: u64 = 70;
 pub const syscall_capsule_irq_poll: u64 = 71;
-pub const syscall_capsule_last: u64 = syscall_capsule_irq_poll;
+pub const syscall_capsule_dma_pool_create: u64 = 72;
+pub const syscall_capsule_last: u64 = syscall_capsule_dma_pool_create;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
 pub fn isCapsuleSyscall(nr: u64) bool {
@@ -103,6 +104,8 @@ pub const dma_iova_kernel_choose: u64 = std.math.maxInt(u64);
 pub const dma_buffer_known_flags_mask: u64 = 0;
 pub const dma_mapping_known_flags_mask: u64 = 0;
 pub const dma_mapping_pages_max_pages: usize = 512;
+pub const dma_pool_known_flags_mask: u64 = 0;
+pub const dma_pool_max_pages: usize = 16384;
 pub const irq_known_flags_mask: u64 = 0;
 
 pub const DmaMappingPagesLayout = struct {
@@ -177,6 +180,7 @@ comptime {
     std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 8);
     std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 9);
     std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 10);
+    std.debug.assert(syscall_capsule_dma_pool_create == syscall_capsule_first + 11);
 }
 
 test "capsule rights mask strips reserved bits" {
@@ -186,10 +190,10 @@ test "capsule rights mask strips reserved bits" {
 
 test "capsule syscall range is stable and contiguous" {
     try std.testing.expect(isCapsuleSyscall(syscall_capsule_query));
-    try std.testing.expect(isCapsuleSyscall(syscall_capsule_irq_poll));
+    try std.testing.expect(isCapsuleSyscall(syscall_capsule_dma_pool_create));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_first - 1));
     try std.testing.expect(!isCapsuleSyscall(syscall_capsule_last + 1));
-    try std.testing.expectEqual(@as(usize, 11), syscall_capsule_count);
+    try std.testing.expectEqual(@as(usize, 12), syscall_capsule_count);
 }
 
 test "DMA mapping page layout checks boundaries and overflow" {

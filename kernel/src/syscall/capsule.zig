@@ -820,6 +820,30 @@ pub fn dispatch(
             if (!writePciBarInfo(h, proc, frame.rdx, frame.r10, info)) break :blk sc.syscall_err_invalid;
             break :blk @as(u64, @intCast(capsule_abi.bar_info_word_count));
         },
+        sc.syscall_capsule_dma_pool_create => blk: {
+            if (flagsArg(frame.r10, capsule_abi.dma_pool_known_flags_mask) == null)
+                break :blk sc.syscall_err_invalid;
+            var rights = kernel.fdRightsFromBits(frame.rsi);
+            if (kernel.fdRightsToBits(rights) == 0) {
+                rights = .{
+                    .inspect = true,
+                    .dup = true,
+                    .transfer = true,
+                    .close = true,
+                    .map_read = true,
+                    .map_write = true,
+                    .revoke = true,
+                };
+            }
+            break :blk state.createContiguousVmoFdWithPages(
+                proc,
+                frame.rdi,
+                rights,
+                kernel.fdFlagsFromBits(@truncate(frame.rdx)),
+                first_dynamic_fd,
+                h.free_list,
+            ) catch |err| statusFromKernelError(err);
+        },
         else => null,
     };
 }
