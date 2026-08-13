@@ -11,6 +11,7 @@ const traps = @import("../traps.zig");
 const interrupts = @import("../interrupts.zig");
 const lapic = @import("../lapic.zig");
 const smp = @import("../smp.zig");
+const vtd = @import("../vtd.zig");
 const serial = @import("../serial.zig");
 const kernel_log = @import("../kernel_log.zig");
 const page_fault_log = @import("../page_fault_log.zig");
@@ -60,6 +61,7 @@ var limine_user_spaces_storage: [boot_static.user_process_count]boot_static.User
 var limine_boot_scratch_storage: [boot_scratch.default_bytes]u8 align(4096) = undefined;
 
 var boot_init_principal: ?kernel.PrincipalId = null;
+var boot_rsdp_paddr: u64 = 0;
 const spawn_parent_endpoint_id: u64 = 0x14;
 const unrouted_device_interrupt_vector: u8 = 0x41;
 const device_interrupt_vector: u8 = pci.interrupt_vector_base;
@@ -93,6 +95,8 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_kernel_runtime_storage), &limine_kernel_runtime_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
+    start = minStaticStart(start, vtd.kernelStaticStorageStartAddr());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -110,6 +114,8 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_kernel_runtime_storage), &limine_kernel_runtime_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
+    end = maxStaticEnd(end, vtd.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
@@ -645,6 +651,7 @@ pub const LimineSmpResources = struct {
 };
 
 pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
+    boot_rsdp_paddr = smp_resources.rsdp_paddr;
     initKernelRuntimeOrHalt();
     kernel_log.write("boot: scheduler static\n");
     scheduler.initializeStaticStorage();
@@ -835,6 +842,7 @@ pub fn bootWithResources(resources: BootResources) noreturn {
     kernel_log.writeOnly("boot: bootWithResources entry\n");
     kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
+    vtd.init(boot_rsdp_paddr);
     kernel_log.write("boot: discover devices\n");
     var devices = discoverDevices();
     kernel_log.write("boot: construct processes\n");

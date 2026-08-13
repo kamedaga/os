@@ -1,5 +1,7 @@
 const std = @import("std");
 
+pub const acpi_dmar = @import("acpi_dmar.zig");
+
 pub const types = @import("state/types.zig");
 const memory_state = @import("state/memory.zig");
 const process_state = @import("state/process.zig");

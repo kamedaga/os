@@ -54,6 +54,128 @@ fn mmapFlags(comptime fields: anytype) kernel.MmapFlags {
     return flags;
 }
 
+fn writeLe16(bytes: []u8, offset: usize, value: u16) void {
+    bytes[offset] = @truncate(value);
+    bytes[offset + 1] = @truncate(value >> 8);
+}
+
+fn writeLe32(bytes: []u8, offset: usize, value: u32) void {
+    bytes[offset] = @truncate(value);
+    bytes[offset + 1] = @truncate(value >> 8);
+    bytes[offset + 2] = @truncate(value >> 16);
+    bytes[offset + 3] = @truncate(value >> 24);
+}
+
+fn writeLe64(bytes: []u8, offset: usize, value: u64) void {
+    writeLe32(bytes, offset, @truncate(value));
+    writeLe32(bytes, offset + 4, @truncate(value >> 32));
+}
+
+fn initDmarFixture(bytes: []u8, host_address_width: u8, flags: u8) void {
+    @memset(bytes, 0);
+    @memcpy(bytes[0..4], "DMAR");
+    writeLe32(bytes, 4, @intCast(bytes.len));
+    bytes[8] = 1;
+    bytes[36] = host_address_width;
+    bytes[37] = flags;
+}
+
+fn writeDmarStructureHeader(bytes: []u8, offset: usize, structure_type: u16, length: u16) void {
+    writeLe16(bytes, offset, structure_type);
+    writeLe16(bytes, offset + 2, length);
+}
+
+fn writeDrhd(bytes: []u8, offset: usize, flags: u8, segment: u16, register_base: u64) void {
+    writeDmarStructureHeader(bytes, offset, 0, 16);
+    bytes[offset + 4] = flags;
+    writeLe16(bytes, offset + 6, segment);
+    writeLe64(bytes, offset + 8, register_base);
+}
+
+fn finishAcpiChecksum(bytes: []u8) void {
+    bytes[9] = 0;
+    var sum: u8 = 0;
+    for (bytes) |byte| sum +%= byte;
+    bytes[9] = 0 -% sum;
+}
+
+test "DMAR parser accepts one DRHD" {
+    var fixture = [_]u8{0} ** 64;
+    initDmarFixture(fixture[0..], 47, 0x1);
+    writeDrhd(fixture[0..], 48, 0x1, 3, 0xfed9_0000);
+    finishAcpiChecksum(fixture[0..]);
+
+    const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
+    try std.testing.expectEqual(@as(u8, 47), parsed.host_address_width);
+    try std.testing.expectEqual(@as(u16, 48), parsed.hostAddressWidthBits());
+    try std.testing.expectEqual(@as(u8, 0x1), parsed.flags);
+    try std.testing.expectEqual(@as(usize, 1), parsed.drhd_count);
+    try std.testing.expectEqual(@as(u64, 0xfed9_0000), parsed.drhds[0].register_base);
+    try std.testing.expectEqual(@as(u16, 3), parsed.drhds[0].segment);
+    try std.testing.expect(parsed.drhds[0].include_pci_all);
+}
+
+test "DMAR parser retains multiple DRHD structures" {
+    var fixture = [_]u8{0} ** 80;
+    initDmarFixture(fixture[0..], 38, 0);
+    writeDrhd(fixture[0..], 48, 0, 0, 0xfed9_0000);
+    writeDrhd(fixture[0..], 64, 1, 2, 0xfeda_0000);
+    finishAcpiChecksum(fixture[0..]);
+
+    const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.drhd_count);
+    try std.testing.expect(!parsed.drhds[0].include_pci_all);
+    try std.testing.expectEqual(@as(u16, 2), parsed.drhds[1].segment);
+    try std.testing.expectEqual(@as(u64, 0xfeda_0000), parsed.drhds[1].register_base);
+    try std.testing.expect(parsed.drhds[1].include_pci_all);
+}
+
+test "DMAR parser skips unknown remapping structure types" {
+    var fixture = [_]u8{0} ** 72;
+    initDmarFixture(fixture[0..], 38, 0);
+    writeDmarStructureHeader(fixture[0..], 48, 0x7fff, 8);
+    fixture[52] = 0xaa;
+    writeDrhd(fixture[0..], 56, 1, 0, 0xfed9_0000);
+    finishAcpiChecksum(fixture[0..]);
+
+    const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.drhd_count);
+    try std.testing.expectEqual(@as(u64, 0xfed9_0000), parsed.drhds[0].register_base);
+}
+
+test "DMAR parser rejects invalid and out-of-bounds structure lengths" {
+    var zero_length = [_]u8{0} ** 52;
+    initDmarFixture(zero_length[0..], 38, 0);
+    writeDmarStructureHeader(zero_length[0..], 48, 0, 0);
+    finishAcpiChecksum(zero_length[0..]);
+    try std.testing.expectError(
+        error.InvalidStructureLength,
+        kernel.acpi_dmar.parseDmar(zero_length[0..]),
+    );
+
+    var out_of_bounds = [_]u8{0} ** 56;
+    initDmarFixture(out_of_bounds[0..], 38, 0);
+    writeDmarStructureHeader(out_of_bounds[0..], 48, 0, 16);
+    finishAcpiChecksum(out_of_bounds[0..]);
+    try std.testing.expectError(
+        error.StructureOutOfBounds,
+        kernel.acpi_dmar.parseDmar(out_of_bounds[0..]),
+    );
+}
+
+test "DMAR parser rejects checksum mismatch" {
+    var fixture = [_]u8{0} ** 64;
+    initDmarFixture(fixture[0..], 38, 0);
+    writeDrhd(fixture[0..], 48, 1, 0, 0xfed9_0000);
+    finishAcpiChecksum(fixture[0..]);
+    fixture[38] +%= 1;
+
+    try std.testing.expectError(
+        error.ChecksumMismatch,
+        kernel.acpi_dmar.parseDmar(fixture[0..]),
+    );
+}
+
 test "process descriptor capacity limit does not exceed address-space storage" {
     var s = try initFdState();
     var free_list = FreePageList{};
