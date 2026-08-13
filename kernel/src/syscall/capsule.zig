@@ -192,6 +192,7 @@ fn userDmaAddressForRange(
         const result, const result_overflow = @addWithOverflow(first_paddr, offset);
         return if (result_overflow == 0) result else null;
     }
+    @import("../kernel_log.zig").writeFmt("dma derive noncontig owner={} va=0x{x} pages={}\n", .{ @intFromEnum(proc), first_page_va, page_count });
 
     // Recover the established anonymous-arena behaviour without applying
     // physical-identity replacement to COW, shared, shadow, file-backed, or

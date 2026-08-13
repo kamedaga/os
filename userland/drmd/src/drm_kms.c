@@ -887,7 +887,7 @@ static int create_dumb(struct drmd_drm_island *island, uint64_t owner, drmd_mode
     if (reused_storage) {
         memset(mapping, 0, size);
     } else {
-        vmo_fd = pacha_vmo_create(size, rights, 0);
+        vmo_fd = pacha_vmo_create_contiguous(size, rights, 0);
         if (vmo_fd < 16) {
             return -12;
         }
@@ -1886,7 +1886,7 @@ static int create_render_resource(
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_SET_FLAGS |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const int vmo_fd = pacha_vmo_create(size, rights, 0);
+    const int vmo_fd = pacha_vmo_create_contiguous(size, rights, 0);
     if (vmo_fd < 16) return -12;
     void *mapping = pacha_mmap(
         vmo_fd, size, PACHA_PROT_READ | PACHA_PROT_WRITE,
