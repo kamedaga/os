@@ -13,7 +13,7 @@ sleep 1
 .artifacts/bin/pacgo qemu-test \
   --timeout 120s \
   --input-profile keyboard-tablet \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_evdev_tablet_state_smoke.elf' \
   --expect 'TABLET_STATE_READY name=QEMU Virtio Tablet' \
   --expect 'TABLET_FIRST_PASS state=4096,8192' \

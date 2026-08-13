@@ -14,7 +14,7 @@ fi
 # before probe + 50 iterations + after probe. Keep tty input to one line.
 .artifacts/bin/pacgo qemu-test \
   --timeout 60s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/lpr_state_leak.sh' \
   --expect 'LPR_STATE_LEAK_BEFORE' \
   --expect 'LPR_STATE_LEAK_AFTER' \

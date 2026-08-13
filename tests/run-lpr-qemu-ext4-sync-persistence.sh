@@ -18,7 +18,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/ext4_w.sh' \
   --expect 'EXT4W_FILE=OK' \
   --expect 'EXT4W_DIR=OK' \
@@ -26,7 +26,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/ext4_r.sh' \
   --expect 'EXT4R_FILE=OK' \
   --expect 'EXT4R_DIR=OK' \

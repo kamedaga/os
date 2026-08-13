@@ -14,7 +14,7 @@ sleep 1
 monitor="${M53B_MONITOR:-1}"
 args=(
   --timeout "${M53B_TIMEOUT:-90s}"
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2'
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle='
   --send "M53B_MONITOR=${monitor} bash /cmd/m53b_monitor_shell.sh"
   --expect 'SHELL_INTERACTION_DONE failures=0'
   --expect 'M53B_SHELL_SECONDS='

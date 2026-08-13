@@ -15,7 +15,7 @@ pkill -9 qemu-system-x86 2>/dev/null || true
   --timeout 120s \
   --qemu-arg=-m \
   --qemu-arg=4G \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_fork_pthread_probe.elf --parallel 4 256' \
   --expect 'FORK_EXEC_TLS_PARALLEL=OK workers=4 iterations=256'
 

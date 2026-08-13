@@ -82,9 +82,11 @@ wait_for_foot_pids()
     local pattern="SWAY_PHASE1_FOOT_CHILD iteration=$iteration pty=1 environment=clean child_pid=([0-9]+) foot_pid=([0-9]+)"
     local ticks=0
     while [[ $ticks -lt 1200 ]]; do
-        local tree
-        tree=$(/usr/bin/swaymsg -s "$socket" -t get_tree 2>/dev/null || true)
-        if [[ $tree =~ $pattern ]]; then
+        local title
+        # Keep the multi-kilobyte tree out of Bash's command-substitution buffer.
+        title=$(/usr/bin/swaymsg -s "$socket" -t get_tree 2>/dev/null |
+            /bin/grep -Eom1 "$pattern" || true)
+        if [[ $title =~ $pattern ]]; then
             printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
             return 0
         fi

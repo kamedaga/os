@@ -10,7 +10,7 @@ if [[ "${SKIP_SYNC:-0}" != "1" ]]; then
 fi
 .artifacts/bin/pacgo qemu-test \
   --timeout 90s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/drm_prime_smoke.sh' \
   --expect 'PRIME_GBM_EXPORT_OK' \
   --expect 'PRIME_CHILD_IMPORT_OK' \

@@ -11,5 +11,5 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 50s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --python "$repo_root/tests/qemu_lpr_tty_signal_lifetime.py"

@@ -11,7 +11,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_shared_mapping.elf write' \
   --expect 'SHMAP_FILE_COHERENCE=OK' \
   --expect 'SHMAP_FILE_MSYNC=OK' \
@@ -21,7 +21,7 @@ sleep 3
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_shared_mapping.elf verify' \
   --expect 'SHMAP_FILE_PERSISTENCE=OK' \
   --expect 'SHMAP_MEMFD_TWO_MAP=OK' \

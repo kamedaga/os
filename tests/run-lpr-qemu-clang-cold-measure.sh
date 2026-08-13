@@ -12,7 +12,7 @@ fi
 start_seconds=$SECONDS
 .artifacts/bin/pacgo qemu-test \
   --timeout "${CLANG_COLD_TIMEOUT:-600s}" \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '. /cmd/clang_cold_measure.sh' \
   --expect 'CLANG_COLD_MEASURE_DONE'
 host_elapsed=$((SECONDS - start_seconds))

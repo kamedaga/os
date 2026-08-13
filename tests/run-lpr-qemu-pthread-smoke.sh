@@ -11,7 +11,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/lpr_pthread_smoke.sh' \
   --expect 'LPR_PTHREAD_START' \
   --expect 'LPR_PTHREAD_CREATE_JOIN=OK' \

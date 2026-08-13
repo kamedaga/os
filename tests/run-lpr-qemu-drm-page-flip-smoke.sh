@@ -14,7 +14,7 @@ pkill -9 qemu-system-x86 2>/dev/null || true
 sleep 1
 .artifacts/bin/pacgo qemu-test \
   --timeout 210s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send "bash /cmd/drm_page_flip_smoke.sh ${iters} ${frames}" \
   --expect 'FLIP_EVENT_FRAME frame=1' \
   --expect "FLIP_EVENT_FRAME frame=${iters}" \

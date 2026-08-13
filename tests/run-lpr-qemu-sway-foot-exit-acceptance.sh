@@ -10,7 +10,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 120s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/sway_foot_exit_acceptance.sh' \
   --expect 'SWAY_FOOT_EXIT_CHILD_READY' \
   --expect 'SWAY_FOOT_EXIT_RESULT'

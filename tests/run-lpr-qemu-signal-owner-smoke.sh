@@ -16,7 +16,7 @@ fi
 pkill -9 qemu-system-x86 2>/dev/null || true
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_signal_owner_red.elf' \
   --expect 'SIGNAL_OWNER_START' \
   --expect 'SIGNAL_OWNER_WORKER_BLOCKING' \

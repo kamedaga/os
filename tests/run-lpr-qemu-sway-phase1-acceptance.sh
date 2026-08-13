@@ -11,7 +11,7 @@ fi
 if [[ "${SKIP_QEMU:-0}" != 1 ]]; then
   .artifacts/bin/pacgo qemu-test \
     --timeout 900s \
-    --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+    --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
     --send 'bash /cmd/sway_phase1_acceptance.sh' \
     --expect 'SWAY_PHASE1_SESSION_OK runtime=/run/user/0 seatd=persistent environment=clean' \
     --expect 'SWAY_PHASE1_RENDERER threaded_llvmpipe=1' \

@@ -12,7 +12,7 @@ pkill -9 qemu-system-x86 2>/dev/null || true
 sleep 1
 .artifacts/bin/pacgo qemu-test \
   --timeout 120s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_libinput_seatd_smoke.elf' \
   --expect 'LIBSEAT_READY name=seat0' \
   --expect 'LIBINPUT_READY backend=path-seatd devices=2' \

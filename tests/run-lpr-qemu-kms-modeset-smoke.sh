@@ -10,7 +10,7 @@ if [[ "${SKIP_SYNC:-0}" != "1" ]]; then
 fi
 .artifacts/bin/pacgo qemu-test \
   --timeout 15s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/kms_modeset_smoke.sh' \
   --expect 'KMS_FRAME1_READY color=ff0000' \
   --expect 'KMS_FRAME2_READY color=00ffff' \

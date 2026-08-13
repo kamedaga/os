@@ -11,7 +11,7 @@ pkill -9 qemu-system-x86 2>/dev/null || true
 sleep 1
 .artifacts/bin/pacgo qemu-test \
   --timeout 240s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/sway_wayland_info_probe.sh' \
   --expect 'P6_WAYLAND_INFO_PROBE_DONE'
 

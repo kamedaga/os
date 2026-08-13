@@ -11,7 +11,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_epoll_smoke.elf' \
   --expect 'LPR_EPOLL_START' \
   --expect 'LPR_EPOLL_MIXED=OK' \

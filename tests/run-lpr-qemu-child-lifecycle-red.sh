@@ -13,7 +13,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_child_lifecycle_red.elf' \
   --expect 'LPR_CHILD_LIFECYCLE_RED_START' \
   --expect 'LPR_CHILD_LIFECYCLE_RED_ITERATION_1=OK' \

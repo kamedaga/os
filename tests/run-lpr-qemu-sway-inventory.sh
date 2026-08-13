@@ -10,7 +10,7 @@ pkill -9 qemu-system-x86 || true
 sleep 1
 .artifacts/bin/pacgo qemu-test \
   --timeout 240s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send "M51_VARIANT=${M51_VARIANT:-default} M51_LAUNCH_MODE=${M51_LAUNCH_MODE:-compiled} bash /cmd/sway_inventory.sh" \
   --expect "M51_SEAT_SETUP launcher=${M51_LAUNCH_MODE:-compiled}" \
   --expect 'M51_SWAY_VERSION_STATUS=0' \

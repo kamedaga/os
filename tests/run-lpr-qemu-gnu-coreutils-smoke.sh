@@ -14,7 +14,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/gnu_smoke.sh' \
   --expect 'GNUCU_GETDENTS_CWD=OK' \
   --expect 'GNUCU_GETDENTS_MULTIBATCH=OK' \

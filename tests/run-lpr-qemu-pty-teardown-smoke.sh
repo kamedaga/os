@@ -12,7 +12,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 15s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send 'bash /cmd/pty_teardown_smoke.sh' \
   --expect 'PTY_TEARDOWN_GREP_1=OK' \
   --expect 'PTY_TEARDOWN_SLEEP_1=OK' \

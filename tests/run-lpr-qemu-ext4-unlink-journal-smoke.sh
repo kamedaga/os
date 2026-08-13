@@ -23,7 +23,7 @@ pacgo_remove_image_locked .artifacts/disk.img
 qemu_status=0
 .artifacts/bin/pacgo qemu-test \
   --timeout 180s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send "bash /cmd/ext4_unlink_journal_smoke.sh $iterations" \
   --expect "EXT4_UNLINK_JOURNAL_START iterations=$iterations" \
   --expect "EXT4_UNLINK_JOURNAL_ITERATION=$iterations status=OK" \

@@ -14,7 +14,7 @@ iterations=5
 sample_count=$((iterations + 2))
 args=(
   --timeout 600s
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2'
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle='
   --send '. /cmd/clang_endurance_smoke.sh'
   --expect 'CLANG_VERSION_OK'
   --expect 'CLANG_OBJECT_STRESS_OK count=140'

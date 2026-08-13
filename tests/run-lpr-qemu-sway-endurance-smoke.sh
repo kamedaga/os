@@ -21,7 +21,7 @@ fi
 
 args=(
   --timeout "${M58_TIMEOUT:-900s}"
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2'
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle='
   --send "M58_ITERATIONS=$iterations bash /cmd/sway_endurance.sh"
   --expect 'Atomic modesetting unsupported, using legacy DRM interface'
   --expect 'Creating GLES2 renderer'

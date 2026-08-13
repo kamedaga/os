@@ -28,7 +28,7 @@ pacgo_remove_image_locked .artifacts/disk.img
 qemu_status=0
 .artifacts/bin/pacgo qemu-test \
   --timeout 180s \
-  --boot-marker '[termd] linux tty hvc open ready index=0 handle=2' \
+  --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send "/cmd/lpr_ext4_shader_cache_smoke.elf $parts" \
   --expect "EXT4_SHADER_CACHE_START parts=$parts header_bytes=20" \
   --expect "EXT4_SHADER_CACHE_PART=$last_part status=OK backend_pwrite_offset=0 bytes=20 files=2" \
