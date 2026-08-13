@@ -654,52 +654,6 @@ pub fn installNativeVmoPages(
     }
 }
 
-/// Atomically replace a VMO page-store range only if every current entry still
-/// matches the caller's snapshot. All validation happens before the first
-/// store, so a stale plan cannot leave a partially replaced backing range.
-pub fn replaceNativeVmoPagesIfCurrent(
-    self: anytype,
-    vmo_ref: NativeVmoRef,
-    page_offset: usize,
-    expected_paddrs: []const u64,
-    new_paddrs: []const u64,
-) KernelError!void {
-    if (expected_paddrs.len == 0 or expected_paddrs.len != new_paddrs.len) {
-        return KernelError.InvalidState;
-    }
-    const slot = self.nativeVmoSlot(vmo_ref) orelse return KernelError.InvalidState;
-    if (slot.ref_count != 1 or !slot.parent.isNull() or !slot.has_page_store or
-        page_offset > slot.page_count or
-        expected_paddrs.len > @as(usize, slot.page_count) - page_offset)
-    {
-        return KernelError.InvalidState;
-    }
-    for (expected_paddrs, new_paddrs, 0..) |expected, replacement, index| {
-        if (expected == 0 or replacement == 0 or
-            (expected & 0xFFF) != 0 or (replacement & 0xFFF) != 0)
-        {
-            return KernelError.InvalidState;
-        }
-        const current = vmoBackingPageStorePaddr(
-            slot.page_store_start,
-            slot.page_count,
-            page_offset + index,
-        ) orelse return KernelError.InvalidState;
-        if (current != expected) return KernelError.InvalidState;
-    }
-
-    for (new_paddrs, 0..) |replacement, index| {
-        // Bounds and page-store availability were validated above; this store
-        // cannot fail unless the internal backing-store invariant is broken.
-        if (!setVmoBackingPageStorePaddr(
-            slot.page_store_start,
-            slot.page_count,
-            page_offset + index,
-            replacement,
-        )) unreachable;
-    }
-}
-
 pub fn nativeVmoRefForFd(self: anytype, owner: PrincipalId, fd: Fd) ?NativeVmoRef {
     const entry = self.fdEntryConst(owner, fd) orelse return null;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return null;

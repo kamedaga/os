@@ -68,16 +68,6 @@ pub const MapProt = struct {
     pkey: u4 = 0,
 };
 
-/// Internal transaction descriptor for replacing the backing pages of a
-/// plain anonymous VMA with one physically-contiguous extent for DMA.
-/// This is kernel state, not part of the userspace ABI.
-pub const NativeVmaDmaPackPlan = struct {
-    vmo: NativeVmoRef = .{},
-    vmo_page_offset: u32 = 0,
-    page_count: u32 = 0,
-    prot: MapProt = .{},
-};
-
 pub const EndpointRoute = struct {
     endpoint_id: u64,
     target: PrincipalId,

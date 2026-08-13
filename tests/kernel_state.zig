@@ -1492,109 +1492,24 @@ test "DMA pin mode owns writable private COW pages and preserves read-only mappi
     try std.testing.expect(s.nativeVmaDmaPinMode(p0, cow_va + 1, false) == null);
 }
 
-test "DMA packing transaction only replaces an isolated plain anonymous VMA" {
-    var s = try initFdState();
-    var free_list = FreePageList{};
-    const base: u64 = 0x4540_0000;
-    const vmo = try s.createAnonymousVmaWithPages(
-        p0,
-        base,
-        3 * 4096,
-        vmaProt(.{ .read = true, .write = true }),
-        vmaProt(.{ .read = true, .write = true }),
-        mmapFlags(.{ .private = true, .anonymous = true }),
-        &free_list,
+test "DMA address derivation accepts contiguous pages and rejects fragmented pages" {
+    const single_page = [_]u64{0x1200_0000};
+    try std.testing.expectEqual(
+        @as(?u64, 0x1200_0080),
+        kernel.dmaAddressForResolvedPages(single_page[0..], 0x80),
     );
-    const old_pages = [_]u64{ 0x1200_0000, 0x1200_3000, 0x1200_7000 };
-    const new_pages = [_]u64{ 0x1300_0000, 0x1300_1000, 0x1300_2000 };
-    try s.installNativeVmoPages(vmo, 0, old_pages[0..]);
 
-    const plan = s.prepareNativeVmaDmaPack(
-        p0,
-        base,
-        3 * 4096,
-        true,
-        old_pages[0..],
-    ) orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(vmo, plan.vmo);
-    try std.testing.expectEqual(@as(u32, 0), plan.vmo_page_offset);
-    try std.testing.expectEqual(@as(u32, 3), plan.page_count);
-    try std.testing.expect(plan.prot.read and plan.prot.write and !plan.prot.exec);
-
-    const pin_fd = try s.createDmaMappingFd(p0, .{
-        .device = 1,
-        .user_va = base + 4096,
-        .iova = 0x9300_1000,
-        .size = 4096,
-        .direction = .bidirectional,
-    }, fdRights(.{ .close = true }), .{}, 16);
-    try std.testing.expect(s.prepareNativeVmaDmaPack(
-        p0,
-        base,
-        3 * 4096,
-        true,
-        old_pages[0..],
-    ) == null);
-    try s.closeFd(p0, pin_fd);
-    try std.testing.expect(s.prepareNativeVmaDmaPack(
-        p0,
-        base,
-        3 * 4096,
-        true,
-        old_pages[0..],
-    ) != null);
-
-    var stale_pages = old_pages;
-    stale_pages[1] += 4096;
-    try std.testing.expectError(
-        KernelError.InvalidState,
-        s.replaceNativeVmoPagesIfCurrent(vmo, 0, stale_pages[0..], new_pages[0..]),
+    const contiguous_pages = [_]u64{ 0x1300_0000, 0x1300_1000, 0x1300_2000 };
+    try std.testing.expectEqual(
+        @as(?u64, 0x1300_0080),
+        kernel.dmaAddressForResolvedPages(contiguous_pages[0..], 0x80),
     );
-    for (old_pages, 0..) |old_page, index| {
-        try std.testing.expectEqual(old_page, s.nativeVmoPagePaddr(vmo, index) orelse unreachable);
-    }
 
-    try s.replaceNativeVmoPagesIfCurrent(vmo, 0, old_pages[0..], new_pages[0..]);
-    for (new_pages, 0..) |new_page, index| {
-        try std.testing.expectEqual(new_page, s.nativeVmoPagePaddr(vmo, index) orelse unreachable);
-    }
-    try std.testing.expect(s.prepareNativeVmaDmaPack(
-        p0,
-        base,
-        3 * 4096,
-        true,
-        old_pages[0..],
-    ) == null);
-    try s.replaceNativeVmoPagesIfCurrent(vmo, 0, new_pages[0..], old_pages[0..]);
-
-    const table = s.getVmaTable(p0) orelse unreachable;
-    var found_vma_index: ?usize = null;
-    for (table.entries[0..], 0..) |entry, index| {
-        if (entry.active and entry.start_va == base) {
-            found_vma_index = index;
-            break;
-        }
-    }
-    const vma_index = found_vma_index orelse return error.TestExpectedEqual;
-
-    table.entries[vma_index].flags.fork_cow = true;
-    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
-    table.entries[vma_index].flags.fork_cow = false;
-    table.entries[vma_index].prot.exec = true;
-    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
-    table.entries[vma_index].prot.exec = false;
-    table.entries[vma_index].flags.shared = true;
-    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
-    table.entries[vma_index].flags.shared = false;
-
-    try s.retainNativeVmo(vmo);
-    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
-    s.releaseNativeVmo(vmo);
-    const slot = s.nativeVmoSlot(vmo) orelse unreachable;
-    slot.parent = .{ .index = 1, .generation = 1 };
-    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
-    slot.parent = .{};
-    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) != null);
+    const fragmented_pages = [_]u64{ 0x1400_0000, 0x1400_3000, 0x1400_7000 };
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        kernel.dmaAddressForResolvedPages(fragmented_pages[0..], 0x80),
+    );
 }
 
 test "private file vma faults read-only then COWs on write" {

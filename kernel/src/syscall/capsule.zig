@@ -13,10 +13,9 @@ const TrapFrame = interrupts.TrapFrame;
 const pci_config_size: usize = 256;
 const page_size: u64 = 4096;
 const first_dynamic_fd: kernel.Fd = abi_root.fd_abi.first_dynamic_fd;
-// Capsule syscalls run under the global kernel-state lock, so these bounded
-// scratch arrays cannot be used concurrently by two DMA packing transactions.
-var dma_pack_old_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
-var dma_pack_new_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
+// Capsule syscalls run under the global kernel-state lock, so this bounded
+// page-resolution scratch array cannot be used concurrently by two derives.
+var dma_resolved_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
 
 fn statusFromKernelError(err: kernel.KernelError) u64 {
     return switch (err) {
@@ -165,8 +164,6 @@ fn userDmaAddressForRange(
     }
 
     const page_count_usize: usize = @intCast(page_count);
-    var first_paddr: u64 = 0;
-    var already_contiguous = true;
     var page_index: u64 = 0;
     while (page_index < page_count) : (page_index += 1) {
         const page_delta, const delta_overflow = @mulWithOverflow(page_index, page_size);
@@ -180,120 +177,15 @@ fn userDmaAddressForRange(
             page_va,
             device_writes,
         ) orelse return null;
-        dma_pack_old_paddrs[@intCast(page_index)] = paddr;
-        if (page_index == 0) {
-            first_paddr = paddr;
-        } else {
-            const expected, const expected_overflow = @addWithOverflow(first_paddr, page_delta);
-            if (expected_overflow != 0 or paddr != expected) already_contiguous = false;
-        }
+        dma_resolved_paddrs[@intCast(page_index)] = paddr;
     }
-    if (already_contiguous) {
-        const result, const result_overflow = @addWithOverflow(first_paddr, offset);
-        return if (result_overflow == 0) result else null;
-    }
+    if (kernel.dmaAddressForResolvedPages(
+        dma_resolved_paddrs[0..page_count_usize],
+        offset,
+    )) |dma_address| return dma_address;
+
     @import("../kernel_log.zig").writeFmt("dma derive noncontig owner={} va=0x{x} pages={}\n", .{ @intFromEnum(proc), first_page_va, page_count });
-
-    // Recover the established anonymous-arena behaviour without applying
-    // physical-identity replacement to COW, shared, shadow, file-backed, or
-    // executable mappings. The state validator is run before and after the
-    // allocation so a stale plan cannot be committed.
-    const initial_plan = blk: {
-        user_vm.lockSharedVmObjects();
-        defer user_vm.unlockSharedVmObjects();
-        break :blk state.prepareNativeVmaDmaPack(
-            proc,
-            first_page_va,
-            page_span,
-            device_writes,
-            dma_pack_old_paddrs[0..page_count_usize],
-        ) orelse return null;
-    };
-    const packed_base = free_list.popContiguousBelow(
-        page_count_usize,
-        kernel.KernelState.low_memory_limit,
-    ) catch return null;
-    var packed_owned = true;
-    defer if (packed_owned) {
-        var release_index: usize = 0;
-        while (release_index < page_count_usize) : (release_index += 1) {
-            free_list.appendPage(
-                0,
-                packed_base + @as(u64, @intCast(release_index)) * page_size,
-            ) catch {};
-        }
-    };
-    for (0..page_count_usize) |index| {
-        const replacement = packed_base + @as(u64, @intCast(index)) * page_size;
-        dma_pack_new_paddrs[index] = replacement;
-    }
-
-    user_vm.lockSharedVmObjects();
-    defer user_vm.unlockSharedVmObjects();
-    const current_plan = state.prepareNativeVmaDmaPack(
-        proc,
-        first_page_va,
-        page_span,
-        device_writes,
-        dma_pack_old_paddrs[0..page_count_usize],
-    ) orelse return null;
-    if (!std.meta.eql(initial_plan, current_plan)) return null;
-
-    if (!user_vm.invalidatePresentUserPaddrsIfCurrent(
-        proc,
-        first_page_va,
-        dma_pack_old_paddrs[0..page_count_usize],
-    )) return null;
-
-    // The TLB shootdown above prevents remote user threads from modifying the
-    // old pages while their contents are copied into the new extent.
-    for (0..page_count_usize) |index| {
-        kernel.KernelState.copyPhysicalPage(
-            dma_pack_new_paddrs[index],
-            dma_pack_old_paddrs[index],
-        );
-    }
-    state.replaceNativeVmoPagesIfCurrent(
-        current_plan.vmo,
-        current_plan.vmo_page_offset,
-        dma_pack_old_paddrs[0..page_count_usize],
-        dma_pack_new_paddrs[0..page_count_usize],
-    ) catch {
-        if (!user_vm.installInvalidatedUserPaddrsWithProt(
-            proc,
-            first_page_va,
-            dma_pack_old_paddrs[0..page_count_usize],
-            current_plan.prot,
-        )) unreachable;
-        return null;
-    };
-    if (!user_vm.installInvalidatedUserPaddrsWithProt(
-        proc,
-        first_page_va,
-        dma_pack_new_paddrs[0..page_count_usize],
-        current_plan.prot,
-    )) {
-        state.replaceNativeVmoPagesIfCurrent(
-            current_plan.vmo,
-            current_plan.vmo_page_offset,
-            dma_pack_new_paddrs[0..page_count_usize],
-            dma_pack_old_paddrs[0..page_count_usize],
-        ) catch unreachable;
-        if (!user_vm.installInvalidatedUserPaddrsWithProt(
-            proc,
-            first_page_va,
-            dma_pack_old_paddrs[0..page_count_usize],
-            current_plan.prot,
-        )) unreachable;
-        return null;
-    }
-
-    for (dma_pack_old_paddrs[0..page_count_usize]) |old_paddr| {
-        free_list.appendPage(0, old_paddr) catch {};
-    }
-    packed_owned = false;
-    const packed_result, const packed_overflow = @addWithOverflow(packed_base, offset);
-    return if (packed_overflow == 0) packed_result else null;
+    return null;
 }
 
 fn installResolvedDmaPage(

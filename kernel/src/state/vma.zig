@@ -22,7 +22,6 @@ const CapsuleSnapshot = types.CapsuleSnapshot;
 const CapsuleDmaDirection = types.CapsuleDmaDirection;
 const CapsuleIrqKind = types.CapsuleIrqKind;
 const MapProt = types.MapProt;
-const NativeVmaDmaPackPlan = types.NativeVmaDmaPackPlan;
 const EndpointRoute = types.EndpointRoute;
 const Region = types.Region;
 const ProcessDescriptor = types.ProcessDescriptor;
@@ -486,70 +485,21 @@ pub fn nativeVmaDmaPinMode(
     return .direct_writable;
 }
 
-/// Validate that a resolved DMA range may have its anonymous backing replaced
-/// by a contiguous extent. Packing changes physical identity, so it is limited
-/// to a single-owner, non-COW anonymous VMO and deliberately rejects executable,
-/// shared, shadow, file-backed, and otherwise aliased mappings.
-pub fn prepareNativeVmaDmaPack(
-    self: anytype,
-    owner: PrincipalId,
-    start_va: u64,
-    size_bytes: u64,
-    device_writes: bool,
-    expected_paddrs: []const u64,
-) ?NativeVmaDmaPackPlan {
-    if (!@TypeOf(self.*).isPageAligned(start_va) or
-        !@TypeOf(self.*).isPageAligned(size_bytes) or size_bytes == 0)
-    {
-        return null;
+pub fn dmaAddressForResolvedPages(paddrs: []const u64, first_page_offset: u64) ?u64 {
+    if (paddrs.len == 0 or first_page_offset >= native_page_size) return null;
+    const first_paddr = paddrs[0];
+    if (first_paddr == 0 or (first_paddr & (native_page_size - 1)) != 0) return null;
+    for (paddrs[1..], 1..) |paddr, page_index| {
+        const page_delta, const delta_overflow = @mulWithOverflow(
+            @as(u64, @intCast(page_index)),
+            native_page_size,
+        );
+        if (delta_overflow != 0) return null;
+        const expected, const expected_overflow = @addWithOverflow(first_paddr, page_delta);
+        if (expected_overflow != 0 or paddr != expected) return null;
     }
-    const page_count_u64 = size_bytes / native_page_size;
-    if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages or
-        page_count_u64 != expected_paddrs.len)
-    {
-        return null;
-    }
-    const end_va = @TypeOf(self.*).checkedEnd(start_va, size_bytes) catch return null;
-    // Packing replaces and ultimately frees the physical backing pages.  A
-    // live MMIO/DMA object overlapping this VA range may retain either the VA
-    // identity or an IOVA that names those exact pages, so unlike ordinary
-    // streaming-DMA derivation no alias or except-object relaxation is safe.
-    if (self.rangeOverlapsPinnedUserObject(owner, start_va, size_bytes)) return null;
-    const entry = self.vmaEntryForVaConst(owner, start_va) orelse return null;
-    if (end_va > entry.endVa() or !entry.flags.anonymous or
-        !entry.flags.private or entry.flags.shared or entry.flags.fork_cow or
-        !entry.cow_table.isNull() or !entry.prot.read or !entry.prot.write or
-        entry.prot.exec or (device_writes and !entry.prot.write) or
-        self.nativeVmoIsShadow(entry.vmo) or
-        (self.nativeVmoRefCount(entry.vmo) orelse 0) != 1)
-    {
-        return null;
-    }
-    const range_delta = start_va - entry.start_va;
-    const first_vmo_byte, const vmo_offset_overflow = @addWithOverflow(entry.vmo_offset, range_delta);
-    if (vmo_offset_overflow != 0) return null;
-    const first_vmo_page_u64 = first_vmo_byte / native_page_size;
-    if (first_vmo_page_u64 > std.math.maxInt(u32)) return null;
-    const first_vmo_page: usize = @intCast(first_vmo_page_u64);
-    const page_count: usize = @intCast(page_count_u64);
-    var index: usize = 0;
-    while (index < page_count) : (index += 1) {
-        const expected = expected_paddrs[index];
-        if (expected == 0 or (expected & (native_page_size - 1)) != 0) return null;
-        const current = self.nativeVmoPagePaddrOrHole(entry.vmo, first_vmo_page + index) orelse return null;
-        if (current != expected) return null;
-    }
-    return .{
-        .vmo = entry.vmo,
-        .vmo_page_offset = @intCast(first_vmo_page),
-        .page_count = @intCast(page_count),
-        .prot = .{
-            .read = entry.prot.read,
-            .write = entry.prot.write,
-            .exec = entry.prot.exec,
-            .pkey = entry.prot.pkey,
-        },
-    };
+    const result, const result_overflow = @addWithOverflow(first_paddr, first_page_offset);
+    return if (result_overflow == 0) result else null;
 }
 
 pub fn nativeVmaInitialMapping(
