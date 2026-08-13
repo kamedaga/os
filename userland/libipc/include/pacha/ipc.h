@@ -186,6 +186,7 @@ int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rig
 int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags);
 
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
+int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags);
 int pacha_vmo_revoke(int fd);
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset);
 void *pacha_mmap_anonymous(uint64_t size, uint64_t prot, uint64_t flags);

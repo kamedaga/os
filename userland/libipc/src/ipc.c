@@ -262,6 +262,16 @@ int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
 
+int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) {
+    return pacha_fd_result_to_int(pacha_syscall4(
+        PACHA_CAPSULE_SYSCALL_DMA_POOL_CREATE,
+        size,
+        rights,
+        flags,
+        0
+    ));
+}
+
 int pacha_vmo_revoke(int fd) {
     return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_VMO_REVOKE, (uint64_t)(uint32_t)fd));
 }

@@ -14,6 +14,7 @@ set(KOBOX_RUNTIME_SOURCES
   ${REPO_ROOT}/userland/libpacha/src/syscall.c
   ${REPO_ROOT}/_kobox/src/device/device_backend.c
   ${REPO_ROOT}/_kobox/src/device/pachaos_capsule/device_pachaos_capsule.c
+  ${REPO_ROOT}/_kobox/src/device/pachaos_capsule/pachaos_dma_arena.c
   ${REPO_ROOT}/_kobox/src/host_interface/interface.c
   ${REPO_ROOT}/_kobox/src/host_interface/linux_interface_common.c
   ${REPO_ROOT}/_kobox/src/host_interface/linux_ipc/interface_linux_ipc.c
