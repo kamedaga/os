@@ -627,6 +627,13 @@ fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_
     return false;
 }
 
+pub fn userPageHasMappingOrReservation(principal: kernel.PrincipalId, va: u64) bool {
+    const space = getUserSpace(principal) orelse return true;
+    if ((va & 0xFFF) != 0) return true;
+    if (rangeOverlappingReservationEndPage(space, va, 1) != null) return true;
+    return rangeHasPresentUserMapping(principal, va, 1);
+}
+
 fn alignPageForward(page: u64, alignment: u64) u64 {
     const align_mask = alignment - 1;
     if ((alignment & align_mask) == 0) return (page + align_mask) & ~align_mask;
@@ -678,6 +685,14 @@ pub fn findFreeUserMappingRange(principal: kernel.PrincipalId, page_count: u64, 
         return findFreeUserMappingRangeInSpan(principal, space, page_count, alignment, range.start_page, cursor_page);
     }
     return null;
+}
+
+pub fn advanceFreeUserMappingSearch(principal: kernel.PrincipalId, next_va: u64) bool {
+    const space = getUserSpace(principal) orelse return false;
+    const next_page, const overflow = @addWithOverflow(next_va, @as(u64, 0xFFF));
+    if (overflow != 0) return false;
+    space.next_dynamic_map_page = next_page >> 12;
+    return true;
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pml4_index: usize, pdp_index: usize, pd_index: usize) ?usize {
@@ -1328,6 +1343,58 @@ pub fn unmapUserLinearRegion(
     return true;
 }
 
+/// Validate every fallible condition of `unmapPresentUserLinearRegion`
+/// without changing PTEs or reservations.  Callers may then prepare external
+/// backing state before crossing a no-return commit boundary.
+pub fn unmapPresentUserLinearRegionSplitSlotsRequired(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) ?usize {
+    if (!lockAddressSpace(principal)) return null;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return null;
+    const space = getUserSpace(principal) orelse return null;
+    if (size_bytes == 0 or (va_start & 0xFFF) != 0) return null;
+    const size_u64: u64 = @intCast(size_bytes);
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return null;
+
+    var offset: u64 = 0;
+    while (offset < size_u64) : (offset += 4096) {
+        const va = va_start + offset;
+        const index = userPageIndexForVa(h, va) orelse return null;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const entry = space.pt_pages[pt_slot][index.pt];
+        if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0) return null;
+    }
+
+    const release_start_page = va_start >> 12;
+    const release_end_page = release_start_page + size_u64 / 4096;
+    var needs_split_slot = false;
+    for (&space.reservations) |reservation| {
+        if (!reservation.active) continue;
+        const record_start_page = reservation.base_va >> 12;
+        const record_end_page = record_start_page + reservation.page_count;
+        if (record_start_page >= release_end_page or release_start_page >= record_end_page) continue;
+        if (release_start_page > record_start_page and release_end_page < record_end_page) {
+            needs_split_slot = true;
+            break;
+        }
+    }
+    return @intFromBool(needs_split_slot);
+}
+
+pub fn freeUserReservationSlotCount(principal: kernel.PrincipalId) usize {
+    if (!lockAddressSpace(principal)) return 0;
+    defer unlockAddressSpace(principal);
+    const space = getUserSpace(principal) orelse return 0;
+    var count: usize = 0;
+    for (&space.reservations) |reservation| {
+        if (!reservation.active) count += 1;
+    }
+    return count;
+}
+
 pub fn unmapPresentUserLinearRegion(
     principal: kernel.PrincipalId,
     va_start: u64,
@@ -1410,6 +1477,88 @@ pub fn invalidatePresentUserLinearRegionPtes(
 
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
 
+    return true;
+}
+
+/// Clear a fully-present user range only when every PTE still names the
+/// expected physical page. Validation precedes mutation, and the range TLB
+/// shootdown completes before return, so callers may then copy and retire the
+/// old pages without racing remote user-mode accesses.
+pub fn invalidatePresentUserPaddrsIfCurrent(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    expected_paddrs: []const u64,
+) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (expected_paddrs.len == 0 or (va_start & 0xFFF) != 0) return false;
+    const size_u64, const size_overflow = @mulWithOverflow(
+        @as(u64, @intCast(expected_paddrs.len)),
+        @as(u64, 4096),
+    );
+    if (size_overflow != 0 or size_u64 > std.math.maxInt(usize)) return false;
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    for (expected_paddrs, 0..) |expected, page_index| {
+        if (expected == 0 or (expected & 0xFFF) != 0) return false;
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
+        const old_entry = space.pt_pages[pt_slot][index.pt];
+        if ((old_entry & h.page_present) == 0 or (old_entry & h.page_user) == 0 or
+            (old_entry & h.page_addr_mask) != expected)
+        {
+            return false;
+        }
+    }
+    for (expected_paddrs, 0..) |_, page_index| {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse unreachable;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse unreachable;
+        space.pt_pages[pt_slot][index.pt] = 0;
+    }
+    h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
+    return true;
+}
+
+/// Install a range previously invalidated by
+/// invalidatePresentUserPaddrsIfCurrent. Every destination PTE and physical
+/// address is checked before the first store, making failure non-mutating.
+pub fn installInvalidatedUserPaddrsWithProt(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    paddrs: []const u64,
+    prot: kernel.MapProt,
+) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    const pte_flags = pteFlagsForProt(h, prot) orelse return false;
+    if (paddrs.len == 0 or (va_start & 0xFFF) != 0) return false;
+    const size_u64, const size_overflow = @mulWithOverflow(
+        @as(u64, @intCast(paddrs.len)),
+        @as(u64, 4096),
+    );
+    if (size_overflow != 0 or size_u64 > std.math.maxInt(usize)) return false;
+    _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
+
+    for (paddrs, 0..) |paddr, page_index| {
+        if (paddr == 0 or (paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
+        if ((space.pt_pages[pt_slot][index.pt] & h.page_present) != 0) return false;
+    }
+    for (paddrs, 0..) |paddr, page_index| {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse unreachable;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse unreachable;
+        space.pt_pages[pt_slot][index.pt] = paddr | pte_flags;
+    }
+    h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
     return true;
 }
 

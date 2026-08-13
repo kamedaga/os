@@ -430,6 +430,103 @@ pub fn kernelObjectRefCount(self: anytype, object_ref: KernelObjectRef) ?u32 {
     return slot.ref_count;
 }
 
+fn sameKernelObjectRef(a: KernelObjectRef, b: KernelObjectRef) bool {
+    return a.kind == b.kind and a.index == b.index and a.generation == b.generation;
+}
+
+fn objectOwnedPinnedRange(slot: *const KernelObjectSlot, owner_raw: PrincipalRaw) bool {
+    if (slot.ref_count == 0) return false;
+    return switch (slot.payload) {
+        .mmio_region => |object| object.owner_principal_raw == owner_raw,
+        .dma_buffer => |object| object.owner_principal_raw == owner_raw,
+        .dma_mapping => |object| object.owner_principal_raw == owner_raw,
+        else => false,
+    };
+}
+
+pub fn kernelObjectIsPinnedUserObject(self: anytype, object_ref: KernelObjectRef) bool {
+    const slot = self.kernelObjectSlotConst(object_ref) orelse return false;
+    return switch (slot.kind) {
+        .mmio_region, .dma_buffer, .dma_mapping => true,
+        else => false,
+    };
+}
+
+fn revokeKernelObjectFromIpcQueueWithFreeList(
+    self: anytype,
+    queue: *IpcQueue,
+    object_ref: KernelObjectRef,
+    free_list: *FreePageList,
+) void {
+    var msg_offset: usize = 0;
+    while (msg_offset < queue.len) : (msg_offset += 1) {
+        const msg = &queue.messages[queue.slotIndex(msg_offset)];
+        var fd_index: usize = 0;
+        while (fd_index < msg.fd_count and fd_index < max_ipc_message_fds) {
+            if (!sameKernelObjectRef(msg.fds[fd_index].object, object_ref)) {
+                fd_index += 1;
+                continue;
+            }
+            self.releaseKernelObjectWithFreeList(object_ref, free_list);
+            var shift_index = fd_index + 1;
+            while (shift_index < msg.fd_count and shift_index < max_ipc_message_fds) : (shift_index += 1) {
+                msg.fds[shift_index - 1] = msg.fds[shift_index];
+            }
+            if (msg.fd_count != 0) msg.fd_count -= 1;
+            msg.fds[msg.fd_count] = .{};
+        }
+    }
+}
+
+fn revokeKernelObjectEverywhereWithFreeList(
+    self: anytype,
+    object_ref: KernelObjectRef,
+    free_list: *FreePageList,
+) void {
+    var process_index: usize = 0;
+    while (process_index < self.process_capacity) : (process_index += 1) {
+        const table = self.fdTableForProcessIndex(process_index) orelse continue;
+        for (table.entries[0..]) |*entry| {
+            if (!sameKernelObjectRef(entry.object, object_ref)) continue;
+            entry.* = .{};
+            self.releaseKernelObjectWithFreeList(object_ref, free_list);
+        }
+    }
+    for (self.ipc_endpoints[0..]) |*slot| {
+        if (slot.active) revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queue, object_ref, free_list);
+    }
+    for (self.ipc_channels[0..]) |*slot| {
+        if (!slot.active) continue;
+        revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queues[0], object_ref, free_list);
+        revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queues[1], object_ref, free_list);
+    }
+    for (self.ipc_replies[0..]) |*slot| {
+        if (slot.active) revokeKernelObjectFromIpcQueueWithFreeList(self, &slot.queue, object_ref, free_list);
+    }
+}
+
+/// Address-bound objects cannot outlive the owner address space recorded in
+/// their payload.  Revoke every transferred/duplicated/queued reference while
+/// that address space and any DMA backing are still intact.
+pub fn revokeOwnedPinnedUserObjectsWithFreeList(
+    self: anytype,
+    owner: PrincipalId,
+    free_list: *FreePageList,
+) void {
+    const owner_raw: PrincipalRaw = @intFromEnum(owner);
+    var object_index: usize = 0;
+    while (object_index < self.fd_objects.len) : (object_index += 1) {
+        const slot = &self.fd_objects[object_index];
+        if (!objectOwnedPinnedRange(slot, owner_raw)) continue;
+        const object_ref = KernelObjectRef{
+            .kind = slot.kind,
+            .index = @intCast(object_index),
+            .generation = slot.generation,
+        };
+        revokeKernelObjectEverywhereWithFreeList(self, object_ref, free_list);
+    }
+}
+
 pub fn fdTableForActiveProcess(self: anytype, principal: PrincipalId) KernelError!*FdTable {
     try self.requireActiveProcess(principal);
     return self.getFdTable(principal) orelse KernelError.InvalidState;
@@ -1115,6 +1212,7 @@ pub fn transferFd(
     if (!source.rights.transfer) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
     if (self.kernelObjectSlotConst(source.object) == null) return KernelError.InvalidState;
+    if (self.kernelObjectIsPinnedUserObject(source.object)) return KernelError.InvalidState;
 
     const dest_table = try self.fdTableForActiveProcess(to);
     const dest_index = @TypeOf(self.*).findFreeFd(dest_table, min_fd) orelse return KernelError.TableFull;

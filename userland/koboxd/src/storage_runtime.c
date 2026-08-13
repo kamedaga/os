@@ -1,4 +1,5 @@
 #include "storage_runtime.h"
+#include "storage_benchmark.h"
 
 #include "kobox/device_pachaos_capsule.h"
 #include "kobox/shim.h"
@@ -109,6 +110,39 @@ static int load_one_module(
     return 0;
 }
 
+static int load_module_phase(
+    const koboxd_bootstrap_t *bootstrap,
+    kb_device_backend_t *backend,
+    storage_stack_phase_t phase,
+    kb_module_t **out_ext4_module)
+{
+    for (size_t i = 0; i < STORAGE_STACK_MODULE_COUNT; ++i) {
+        const storage_stack_module_spec_t *spec = &storage_stack_modules[i];
+        if (spec->phase != phase) {
+            continue;
+        }
+        kb_module_t **out_module = NULL;
+        if (spec->id == STORAGE_STACK_MODULE_EXT4) {
+            out_module = out_ext4_module;
+        }
+        const int status = load_one_module(
+            bootstrap,
+            backend,
+            spec->name,
+            (spec->flags & STORAGE_STACK_MODULE_FLAG_ALLOW_MISSING_INIT) != 0,
+            out_module);
+        if (status != 0) {
+            fprintf(stderr,
+                "[filed-storage] module phase failed phase=%u name=%s status=%d\n",
+                (unsigned int)phase,
+                spec->name,
+                status);
+            return status;
+        }
+    }
+    return 0;
+}
+
 static void *wait_for_first_disk(void)
 {
     for (unsigned i = 0; i < 2048; i++) {
@@ -155,15 +189,11 @@ int koboxd_storage_runtime_init(
     kb_shim_set_device_backend(runtime->device_backend);
     printf("[filed-storage] set device backend done backend=%p\n", (void *)runtime->device_backend);
     fflush(stdout);
-    int load_status = load_one_module(bootstrap, runtime->device_backend, "nvme-auth.ko", 1, NULL);
-    if (load_status != 0) {
-        return load_status;
-    }
-    load_status = load_one_module(bootstrap, runtime->device_backend, "nvme-core.ko", 1, NULL);
-    if (load_status != 0) {
-        return load_status;
-    }
-    load_status = load_one_module(bootstrap, runtime->device_backend, "nvme.ko", 0, NULL);
+    int load_status = load_module_phase(
+        bootstrap,
+        runtime->device_backend,
+        STORAGE_STACK_PHASE_NVME,
+        NULL);
     if (load_status != 0) {
         return load_status;
     }
@@ -181,19 +211,11 @@ int koboxd_storage_runtime_init(
         return -17;
     }
 
-    load_status = load_one_module(bootstrap, runtime->device_backend, "crc16.ko", 1, NULL);
-    if (load_status != 0) {
-        return -6;
-    }
-    load_status = load_one_module(bootstrap, runtime->device_backend, "mbcache.ko", 1, NULL);
-    if (load_status != 0) {
-        return -7;
-    }
-    load_status = load_one_module(bootstrap, runtime->device_backend, "jbd2.ko", 1, NULL);
-    if (load_status != 0) {
-        return -8;
-    }
-    load_status = load_one_module(bootstrap, runtime->device_backend, "ext4.ko", 0, &runtime->ext4_module);
+    load_status = load_module_phase(
+        bootstrap,
+        runtime->device_backend,
+        STORAGE_STACK_PHASE_FILESYSTEM,
+        &runtime->ext4_module);
     if (load_status != 0 || runtime->ext4_module == NULL) {
         return -9;
     }
@@ -201,9 +223,9 @@ int koboxd_storage_runtime_init(
     kb_shim_set_device_backend(runtime->device_backend);
 
     int fs_status = kb_fs_block_device_create_from_disk_gpt_partition(
-        "rootfs-nvme",
+        STORAGE_STACK_ROOT_DEVICE_NAME,
         runtime->disk,
-        KOBOXD_ROOTFS_GPT_PARTITION_INDEX,
+        STORAGE_STACK_ROOTFS_GPT_PARTITION_INDEX,
         &runtime->root_device);
     if (fs_status != 0 || runtime->root_device == NULL) {
         fprintf(stderr, "[filed-storage] rootfs block device create failed status=%d\n", fs_status);
@@ -218,6 +240,12 @@ int koboxd_storage_runtime_init(
         fprintf(stderr, "[filed-storage] fs-backend ext4 mount failed status=%d\n", fs_status);
         return -11;
     }
+#if defined(KOBOXD_STORAGE_BENCHMARK)
+    fs_status = koboxd_run_ext4_nvme_benchmark(&runtime->fs_backend);
+    if (fs_status != 0) {
+        return -18;
+    }
+#endif
     runtime->fs_ready = 1;
     return 0;
 }

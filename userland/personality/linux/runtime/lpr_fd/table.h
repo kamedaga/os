@@ -82,6 +82,7 @@ typedef struct lpr_event_backend {
 enum {
     LPR_EVENT_BACKEND_EVENTFD = 0u,
     LPR_EVENT_BACKEND_TIMERFD = 1u,
+    LPR_EVENT_BACKEND_SIGNALFD = 2u,
 };
 
 typedef struct lpr_tty_backend {

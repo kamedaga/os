@@ -114,6 +114,21 @@ int filed_kobox_backend_readlink(filed_kobox_backend_t *backend, uint64_t object
     return -95;
 }
 
+int filed_kobox_backend_symlink(
+    filed_kobox_backend_t *backend,
+    uint64_t parent_object_id,
+    const char *name,
+    const char *target,
+    uint64_t *out_object_id)
+{
+    (void)backend;
+    (void)parent_object_id;
+    (void)name;
+    (void)target;
+    (void)out_object_id;
+    return -95;
+}
+
 int filed_kobox_backend_fsync(filed_kobox_backend_t *backend, uint64_t object_id)
 {
     (void)backend;
@@ -492,6 +507,87 @@ static void test_file_vmo_cache_byte_budget(void)
     expect_true("vmo cache budget preserves newer", newer->active);
 }
 
+static void test_snapshot_vmo_does_not_pin_backend_object(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    init_runtime(&runtime, &dispatch);
+
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    expect_true("snapshot vmo cache slot", entry != NULL);
+    if (entry == NULL) {
+        return;
+    }
+    memset(entry, 0, sizeof(*entry));
+    entry->active = 1;
+    entry->vmo_fd = -1;
+    entry->backend_object = 900;
+    entry->length = 4096;
+
+    expect_true(
+        "snapshot vmo permits backend eviction",
+        filed_cache_object_evictable(&runtime, 900));
+
+    entry->shared = 1;
+    expect_true(
+        "shared vmo pins backend object",
+        !filed_cache_object_evictable(&runtime, 900));
+
+    entry->shared = 0;
+    filed_cache_release_object(&runtime, 900);
+    expect_true("snapshot vmo released with backend", !entry->active);
+}
+
+static void test_snapshot_vmo_pressure_reclaim_preserves_shared(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    init_runtime(&runtime, &dispatch);
+    mock_fd_close_calls = 0;
+
+    filed_file_vmo_cache_entry_t *first = filed_file_vmo_cache_slot(&runtime);
+    expect_true("pressure reclaim first slot", first != NULL);
+    if (first == NULL) {
+        return;
+    }
+    memset(first, 0, sizeof(*first));
+    first->active = 1;
+    first->vmo_fd = 40;
+    first->length = 4096;
+
+    filed_file_vmo_cache_entry_t *second = filed_file_vmo_cache_slot(&runtime);
+    expect_true("pressure reclaim second slot", second != NULL);
+    if (second == NULL) {
+        return;
+    }
+    memset(second, 0, sizeof(*second));
+    second->active = 1;
+    second->vmo_fd = 41;
+    second->length = 8192;
+
+    filed_file_vmo_cache_entry_t *shared = filed_file_vmo_cache_slot(&runtime);
+    expect_true("pressure reclaim shared slot", shared != NULL);
+    if (shared == NULL) {
+        return;
+    }
+    memset(shared, 0, sizeof(*shared));
+    shared->active = 1;
+    shared->shared = 1;
+    shared->vmo_fd = 42;
+    shared->length = 16384;
+
+    uint64_t reclaimed_bytes = 0;
+    expect_u64(
+        "pressure reclaim snapshot count",
+        filed_file_vmo_cache_reclaim_snapshots(&runtime, &reclaimed_bytes),
+        2);
+    expect_u64("pressure reclaim snapshot bytes", reclaimed_bytes, 12288);
+    expect_true("pressure reclaim clears first", !first->active);
+    expect_true("pressure reclaim clears second", !second->active);
+    expect_true("pressure reclaim preserves shared", shared->active);
+    expect_int("pressure reclaim closes owners", mock_fd_close_calls, 2);
+}
+
 int main(void)
 {
     test_rename_clears_negative_lookup();
@@ -499,6 +595,8 @@ int main(void)
     test_truncate_clears_page_and_vmo_cache();
     test_shared_vmo_is_io_source_and_revoke_target();
     test_file_vmo_cache_byte_budget();
+    test_snapshot_vmo_does_not_pin_backend_object();
+    test_snapshot_vmo_pressure_reclaim_preserves_shared();
     if (failures != 0) {
         return 1;
     }

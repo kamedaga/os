@@ -14,7 +14,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/personality/src/lpr_manifest.c"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/drmd/include ${REPO_ROOT}/userland/inputd/include"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/drmd/include ${REPO_ROOT}/userland/inputd/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
@@ -22,6 +22,9 @@ add_custom_command(
     "${REPO_ROOT}/userland/filed/include/filed/flags.h"
     "${REPO_ROOT}/userland/filed/include/filed/payload.h"
     "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
+    "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
+    "${REPO_ROOT}/userland/storage/include/storage/stack.h"
+    "${REPO_ROOT}/userland/storage/include/storage/stack.def"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/boot_config.h"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
     "${REPO_ROOT}/userland/personality/include/personality/linux_lpr.h"

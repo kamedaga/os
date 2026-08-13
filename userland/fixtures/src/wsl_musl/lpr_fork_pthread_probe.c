@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -218,6 +219,65 @@ static int run_parallel_stress(unsigned workers, unsigned iterations)
     return result;
 }
 
+static int wait_for_clean_exit(pid_t child)
+{
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) return 1;
+    if (!WIFEXITED(status)) return 2;
+    return WEXITSTATUS(status);
+}
+
+static int run_cow_mprotect_probe(void)
+{
+    const uint64_t child_marker = UINT64_C(0x434f575f4348494c);
+    const uint64_t initial_marker = UINT64_C(0x434f575f42415345);
+    const uint64_t parent_marker = UINT64_C(0x434f575f50415245);
+
+    volatile uint64_t *arena = mmap(0, 8192, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (arena == MAP_FAILED) return 101;
+    const pid_t none_child = fork();
+    if (none_child < 0) return 102;
+    if (none_child == 0) {
+        if (mprotect((void *)arena, 4096, PROT_READ | PROT_WRITE) != 0) _exit(103);
+        arena[0] = child_marker;
+        if (arena[0] != child_marker) _exit(104);
+        _exit(0);
+    }
+    int status = wait_for_clean_exit(none_child);
+    if (status != 0) return status;
+    if (mprotect((void *)arena, 4096, PROT_READ) != 0) return 105;
+    if (arena[0] != 0) return 106;
+    if (munmap((void *)arena, 8192) != 0) return 107;
+
+    volatile uint64_t *present = mmap(0, 4096, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (present == MAP_FAILED) return 108;
+    present[0] = initial_marker;
+    int ready_pipe[2];
+    if (pipe(ready_pipe) != 0) return 109;
+    const pid_t present_child = fork();
+    if (present_child < 0) return 110;
+    if (present_child == 0) {
+        char ready = 0;
+        (void)close(ready_pipe[1]);
+        if (read(ready_pipe[0], &ready, 1) != 1 || ready != 'R') _exit(111);
+        if (present[0] != initial_marker) _exit(112);
+        _exit(0);
+    }
+    (void)close(ready_pipe[0]);
+    if (mprotect((void *)present, 4096, PROT_READ) != 0) return 113;
+    if (mprotect((void *)present, 4096, PROT_READ | PROT_WRITE) != 0) return 114;
+    present[0] = parent_marker;
+    if (write(ready_pipe[1], "R", 1) != 1) return 115;
+    (void)close(ready_pipe[1]);
+    status = wait_for_clean_exit(present_child);
+    if (status != 0) return status;
+    if (present[0] != parent_marker) return 116;
+    if (munmap((void *)present, 4096) != 0) return 117;
+    return 0;
+}
+
 static void report(const char *label, int status)
 {
     char buffer[96];
@@ -244,6 +304,15 @@ int main(int argc, char **argv)
         if (workers == 0 || workers > 16u) workers = 8u;
         if (iterations == 0 || iterations > 4096u) iterations = 128u;
         return run_parallel_stress(workers, iterations);
+    }
+    if (argc >= 2 && strcmp(argv[1], "--cow-mprotect") == 0) {
+        const int status = run_cow_mprotect_probe();
+        char line[96];
+        const int length = snprintf(line, sizeof(line),
+            "FORK_COW_MPROTECT=%s rc=%d\n",
+            status == 0 ? "OK" : "FAIL", status);
+        if (length > 0) (void)write(STDOUT_FILENO, line, (size_t)length);
+        return status;
     }
     (void)write(STDOUT_FILENO, "FORK_PTHREAD_START\n", 19);
 

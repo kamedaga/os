@@ -8,10 +8,6 @@
 
 #include <stdint.h>
 
-enum {
-    KOBOXD_ROOTFS_GPT_PARTITION_INDEX = 2,
-};
-
 typedef struct koboxd_storage_runtime {
     kb_device_backend_t *device_backend;
     koboxd_fs_backend_t fs_backend;

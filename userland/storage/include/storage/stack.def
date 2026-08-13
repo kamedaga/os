@@ -1,0 +1,7 @@
+STORAGE_STACK_MODULE(NVME_AUTH, NVME, "nvme-auth.ko", "/srv/kobox/nvme-auth.ko", ALLOW_MISSING_INIT)
+STORAGE_STACK_MODULE(NVME_CORE, NVME, "nvme-core.ko", "/srv/kobox/nvme-core.ko", ALLOW_MISSING_INIT)
+STORAGE_STACK_MODULE(NVME, NVME, "nvme.ko", "/srv/kobox/nvme.ko", REQUIRED_INIT)
+STORAGE_STACK_MODULE(CRC16, FILESYSTEM, "crc16.ko", "/srv/kobox/crc16.ko", ALLOW_MISSING_INIT)
+STORAGE_STACK_MODULE(MBCACHE, FILESYSTEM, "mbcache.ko", "/srv/kobox/mbcache.ko", ALLOW_MISSING_INIT)
+STORAGE_STACK_MODULE(JBD2, FILESYSTEM, "jbd2.ko", "/srv/kobox/jbd2.ko", ALLOW_MISSING_INIT)
+STORAGE_STACK_MODULE(EXT4, FILESYSTEM, "ext4.ko", "/srv/kobox/ext4.ko", REQUIRED_INIT)

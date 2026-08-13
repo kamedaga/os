@@ -422,6 +422,9 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
     if (lpr_linux_timerfd_active(fd)) {
         return lpr_linux_timerfd_poll_events(fd, events);
     }
+    if (lpr_linux_signalfd_active(fd)) {
+        return lpr_linux_signalfd_poll_events(fd, events);
+    }
     if (!lpr_linux_eventfd_active(fd)) {
         return 0;
     }

@@ -8,6 +8,7 @@
 #include "personality/linux_lpr.h"
 #include "personality/lpr_manifest.h"
 #include "pacha/root_handoff.h"
+#include "storage/bootstrap.h"
 #include "netd/boot_config.h"
 #include "termd/boot_config.h"
 #include "drmd/boot_config.h"
@@ -24,11 +25,7 @@
 #include <string.h>
 
 enum {
-    SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
     SEED0ROOT_STORAGE_READY_MAGIC = 0x3159445252545330ull,
-    SEED0ROOT_BOOTSTRAP_MAX_MODULES = 8,
-    SEED0ROOT_BOOTSTRAP_NAME_BYTES = 64,
-    SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
     SEED0ROOT_PAGE_SIZE = 4096,
     SEED0ROOT_ELF64_EHDR_BYTES = 64,
     SEED0ROOT_ELF64_PHDR_BYTES = 56,
@@ -73,31 +70,6 @@ enum {
     SEED0ROOT_SERVICE_ENDPOINT_FD = 232,
     SEED0ROOT_SERVICE_READY_FD = 233,
     SEED0ROOT_SERVICE_NETD_FD = 234,
-};
-
-struct seed0root_bootstrap_module {
-    char name[SEED0ROOT_BOOTSTRAP_NAME_BYTES];
-    uint64_t image_fd;
-    uint64_t image_size;
-};
-
-struct seed0root_bootstrap {
-    uint64_t magic;
-    uint64_t device_fd;
-    uint64_t ready_channel_fd;
-    uint64_t service_ready_channel_fd;
-    uint64_t filed_image_fd;
-    uint64_t filed_image_size;
-    uint64_t module_count;
-    struct seed0root_bootstrap_module modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
-};
-
-struct seed0root_filed_storage_bootstrap {
-    uint64_t magic;
-    uint64_t device_fd;
-    uint64_t filed_endpoint_fd;
-    uint64_t module_count;
-    struct seed0root_bootstrap_module modules[SEED0ROOT_BOOTSTRAP_MAX_MODULES];
 };
 
 struct seed0root_loaded_process {
@@ -1088,144 +1060,6 @@ static int seed0root_filed_sync_all(int filed_endpoint_fd)
         &reply,
         NULL,
         0);
-}
-
-static int seed0root_set_filed_cache_slots(int filed_endpoint_fd, uint64_t slots)
-{
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    const int status = seed0root_filed_page_call(
-        filed_endpoint_fd,
-        FILED_OP_DIAG_SET_CACHE_SLOTS,
-        0x5eed0f10u,
-        -1,
-        slots,
-        &reply,
-        NULL,
-        0);
-    if (status == 0) {
-        printf("[seed0root] filed cache slots=%llu\n", (unsigned long long)reply.word2);
-    }
-    return status;
-}
-
-static int seed0root_run_filed_no_cache_probe(int filed_endpoint_fd)
-{
-    if (filed_endpoint_fd < 16) {
-        return -1;
-    }
-
-    int page_fd = -1;
-    void *page = NULL;
-    int status = seed0root_set_filed_cache_slots(filed_endpoint_fd, 0);
-    if (status != 0) {
-        fprintf(stderr, "[seed0root] filed cache disable failed status=%d\n", status);
-        return status;
-    }
-
-    status = seed0root_create_filed_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-
-    filed_openat_t *openat = (filed_openat_t *)page;
-    openat->dir_handle = 0;
-    openat->rights =
-        FILED_RIGHT_READ |
-        FILED_RIGHT_STAT |
-        FILED_RIGHT_EXEC;
-    openat->open_flags = FILED_OPEN_CLOEXEC;
-    snprintf(openat->name, sizeof(openat->name), "%s", "/cmd/libc_vfs_exec_smoke.elf");
-
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    status = seed0root_filed_page_call(
-        filed_endpoint_fd,
-        FILED_OP_VFS_OPENAT,
-        0x5eed0f13u,
-        page_fd,
-        0,
-        &reply,
-        NULL,
-        0);
-    seed0root_destroy_filed_page(page_fd, page);
-    page_fd = -1;
-    page = NULL;
-    if (status != 0) {
-        fprintf(stderr, "[seed0root] filed no-cache open failed status=%d\n", status);
-        (void)seed0root_set_filed_cache_slots(filed_endpoint_fd, 64);
-        return status;
-    }
-
-    const uint64_t handle = reply.word2;
-    status = seed0root_create_filed_page(&page_fd, &page);
-    if (status != 0) {
-        (void)seed0root_filed_page_call(
-            filed_endpoint_fd,
-            FILED_OP_VFS_CLOSE,
-            0x5eed0f15u,
-            -1,
-            handle,
-            &reply,
-            NULL,
-            0);
-        (void)seed0root_set_filed_cache_slots(filed_endpoint_fd, 64);
-        return status;
-    }
-
-    filed_io_t *io = (filed_io_t *)page;
-    io->handle = handle;
-    io->offset = 0;
-    io->length = 4;
-    memset(&reply, 0, sizeof(reply));
-    status = seed0root_filed_page_call(
-        filed_endpoint_fd,
-        FILED_OP_VFS_PREAD,
-        0x5eed0f14u,
-        page_fd,
-        0,
-        &reply,
-        NULL,
-        0);
-
-    int probe_status = status;
-    if (probe_status == 0 &&
-        (reply.word2 != 4 ||
-            io->data[0] != 0x7f ||
-            io->data[1] != 'E' ||
-            io->data[2] != 'L' ||
-            io->data[3] != 'F'))
-    {
-        fprintf(stderr,
-            "[seed0root] filed no-cache probe invalid result bytes=%llu magic=%02x %02x %02x %02x\n",
-            (unsigned long long)reply.word2,
-            io->data[0],
-            io->data[1],
-            io->data[2],
-            io->data[3]);
-        probe_status = -2;
-    }
-    seed0root_destroy_filed_page(page_fd, page);
-
-    memset(&reply, 0, sizeof(reply));
-    const int close_status = seed0root_filed_page_call(
-        filed_endpoint_fd,
-        FILED_OP_VFS_CLOSE,
-        0x5eed0f15u,
-        -1,
-        handle,
-        &reply,
-        NULL,
-        0);
-    const int restore_status = seed0root_set_filed_cache_slots(filed_endpoint_fd, 64);
-    if (probe_status == 0) {
-        probe_status = close_status;
-    }
-    if (probe_status == 0) {
-        probe_status = restore_status;
-    }
-    printf("[seed0root] filed no-cache probe status=%d\n", probe_status);
-    return probe_status;
 }
 
 static int seed0root_read_filed_text(
@@ -2720,9 +2554,6 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
     }
     const unsigned boot_profile = seed0root_boot_profile_flags(filed_endpoint_fd);
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_FS_WRITE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
-        status = seed0root_run_filed_no_cache_probe(filed_endpoint_fd);
-    }
-    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_FS_WRITE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_libc_vfs_exec_smoke(filed_endpoint_fd);
     }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_LPR) != 0 && status == 0 && filed_endpoint_fd >= 16) {
@@ -3000,27 +2831,28 @@ static int start_loaded_process(
 }
 
 static int prepare_filed_storage_bootstrap(
-    const struct seed0root_bootstrap *bootstrap,
+    const storage_seed0root_bootstrap_t *bootstrap,
     int filed_endpoint_fd,
-    struct seed0root_filed_storage_bootstrap *out_bootstrap)
+    storage_filed_bootstrap_t *out_bootstrap)
 {
     if (bootstrap == NULL ||
         out_bootstrap == NULL ||
         filed_endpoint_fd < 16 ||
         bootstrap->module_count == 0 ||
-        bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES ||
-        bootstrap->modules[0].name[0] == '\0')
+        bootstrap->module_count > STORAGE_STACK_MODULE_CAPACITY ||
+        !storage_module_table_matches_manifest(
+            bootstrap->modules, bootstrap->module_count))
     {
         return -1;
     }
 
     memset(out_bootstrap, 0, sizeof(*out_bootstrap));
-    out_bootstrap->magic = SEED0ROOT_FILED_STORAGE_BOOTSTRAP_MAGIC;
+    out_bootstrap->magic = STORAGE_FILED_BOOTSTRAP_MAGIC;
     out_bootstrap->device_fd = bootstrap->device_fd;
-    out_bootstrap->filed_endpoint_fd = (uint64_t)(uint32_t)filed_endpoint_fd;
+    out_bootstrap->control_fd = (uint64_t)(uint32_t)filed_endpoint_fd;
     out_bootstrap->module_count = bootstrap->module_count;
     for (uint64_t i = 0; i < bootstrap->module_count; i++) {
-        const struct seed0root_bootstrap_module *src = &bootstrap->modules[i];
+        const storage_module_image_desc_t *src = &bootstrap->modules[i];
         if (src->name[0] == '\0' || src->image_fd < 16 || src->image_size < 4) {
             return -2;
         }
@@ -3849,16 +3681,17 @@ static int seed0root_spawn_lpr_session(
     return 0;
 }
 
-static int launch_filed(const struct seed0root_bootstrap *bootstrap)
+static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
 {
-    if (bootstrap->magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
+    if (bootstrap->magic != STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap->filed_image_fd < 16 ||
         bootstrap->filed_image_size == 0 ||
         bootstrap->device_fd < 16 ||
         bootstrap->ready_channel_fd < 16 ||
         bootstrap->service_ready_channel_fd < 16 ||
         bootstrap->module_count == 0 ||
-        bootstrap->module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES) {
+        !storage_module_table_matches_manifest(
+            bootstrap->modules, bootstrap->module_count)) {
         fprintf(stderr,
             "[seed0root] bootstrap unavailable magic=0x%llx device_fd=%llu ready_fd=%llu service_ready_fd=%llu filed_fd=%llu size=%llu modules=%llu\n",
             (unsigned long long)bootstrap->magic,
@@ -3936,7 +3769,7 @@ static int launch_filed(const struct seed0root_bootstrap *bootstrap)
     }
     printf("[seed0root] filed device fd ready\n");
     fflush(stdout);
-    struct seed0root_filed_storage_bootstrap filed_bootstrap;
+    storage_filed_bootstrap_t filed_bootstrap;
     status = prepare_filed_storage_bootstrap(bootstrap, filed_endpoint_fd, &filed_bootstrap);
     if (status != 0) {
         (void)pacha_fd_close(filed_client_fd);
@@ -4058,7 +3891,7 @@ int main(int argc, char **argv)
     }
     printf("[seed0root] bootstrap fd=%d\n", bootstrap_fd);
     fflush(stdout);
-    struct seed0root_bootstrap bootstrap;
+    storage_seed0root_bootstrap_t bootstrap;
     bootstrap_status = read_bootstrap_fd(bootstrap_fd, &bootstrap, sizeof(bootstrap), "seed0root");
     (void)pacha_fd_fcntl(bootstrap_fd, PACHA_FD_FCNTL_SET_FLAGS,
         0, PACHA_FD_FLAG_INHERIT);
@@ -4074,14 +3907,14 @@ int main(int argc, char **argv)
         (unsigned long long)bootstrap.module_count);
     fflush(stdout);
     if (bootstrap_status != 0 ||
-        bootstrap.magic != SEED0ROOT_BOOTSTRAP_MAGIC ||
+        bootstrap.magic != STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap.device_fd < 16 ||
         bootstrap.ready_channel_fd < 16 ||
         bootstrap.service_ready_channel_fd < 16 ||
         bootstrap.filed_image_fd < 16 ||
         bootstrap.filed_image_size == 0 ||
-        bootstrap.module_count == 0 ||
-        bootstrap.module_count > SEED0ROOT_BOOTSTRAP_MAX_MODULES)
+        !storage_module_table_matches_manifest(
+            bootstrap.modules, bootstrap.module_count))
     {
         fprintf(stderr, "[seed0root] bootstrap invalid status=%d\n", bootstrap_status);
         fflush(stderr);

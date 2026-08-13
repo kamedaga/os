@@ -141,7 +141,20 @@ bool filed_cache_object_evictable(filed_runtime_t *runtime, uint64_t backend_obj
     }
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
-        if (entry->active && entry->backend_object == backend_object) {
+        /*
+         * A non-shared FILE_VMO is an immutable snapshot.  Once its contents
+         * have been copied into the VMO, the cache entry no longer needs the
+         * backend object or its vnode to remain resident.  Reclaiming that
+         * vnode closes the cache's VMO owner through
+         * filed_cache_release_object(); processes keep their transferred VMO
+         * reference.
+         *
+         * A shared VMO is different: it remains an I/O source and may still
+         * require writeback/revocation, so it must continue to pin the object.
+         */
+        if (entry->active && entry->shared &&
+            entry->backend_object == backend_object)
+        {
             return false;
         }
     }
@@ -183,6 +196,15 @@ static int filed_page_cache_flush_slot(
         slot->page_index > UINT64_MAX / FILED_PAGE_CACHE_BYTES)
     {
         filed_page_cache.flush_errors++;
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=page_cache_validate object=%llu "
+            "page=%llu bytes=%u valid_start=%u dirty_start=%u dirty_end=%u\n",
+            (unsigned long long)(slot != NULL ? slot->backend_object : 0),
+            (unsigned long long)(slot != NULL ? slot->page_index : 0),
+            slot != NULL ? slot->bytes : 0,
+            slot != NULL ? slot->valid_start : 0,
+            slot != NULL ? slot->dirty_start : 0,
+            slot != NULL ? slot->dirty_end : 0);
         return -22;
     }
 
@@ -199,6 +221,15 @@ static int filed_page_cache_flush_slot(
         &bytes);
     if (status != 0 || bytes != length) {
         filed_page_cache.flush_errors++;
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=page_cache_pwrite status=%d "
+            "object=%llu page=%llu offset=%llu length=%llu bytes=%llu\n",
+            status,
+            (unsigned long long)slot->backend_object,
+            (unsigned long long)slot->page_index,
+            (unsigned long long)offset,
+            (unsigned long long)length,
+            (unsigned long long)bytes);
         return status != 0 ? status : -5;
     }
 
@@ -1169,6 +1200,35 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
     return oldest_entry;
 }
 
+uint32_t filed_file_vmo_cache_reclaim_snapshots(
+    filed_runtime_t *runtime,
+    uint64_t *out_bytes)
+{
+    uint32_t reclaimed_entries = 0;
+    uint64_t reclaimed_bytes = 0;
+    if (out_bytes != NULL) {
+        *out_bytes = 0;
+    }
+    if (runtime == NULL) {
+        return 0;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (!entry->active || entry->shared) {
+            continue;
+        }
+        reclaimed_bytes = entry->length > UINT64_MAX - reclaimed_bytes ?
+            UINT64_MAX : reclaimed_bytes + entry->length;
+        filed_file_vmo_cache_evictions++;
+        filed_file_vmo_cache_clear_entry(entry, false);
+        reclaimed_entries++;
+    }
+    if (out_bytes != NULL) {
+        *out_bytes = reclaimed_bytes;
+    }
+    return reclaimed_entries;
+}
+
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_shared_lookup(
     filed_runtime_t *runtime,
     uint64_t backend_object)
@@ -1238,7 +1298,28 @@ int filed_cache_create_shared_vmo(
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC |
         PACHA_FD_RIGHT_REVOKE;
-    const int vmo_fd = pacha_vmo_create(capacity, rights, 0);
+    /* Enforce the cache byte budget before allocating the replacement.  This
+     * keeps resize/create from temporarily requiring old + new VMO capacity. */
+    filed_file_vmo_cache_entry_t *entry =
+        filed_file_vmo_cache_slot_for_length(runtime, capacity);
+    if (entry == NULL) {
+        return -28;
+    }
+    int vmo_fd = pacha_vmo_create(capacity, rights, 0);
+    if (vmo_fd < 16) {
+        uint64_t reclaimed_bytes = 0;
+        const uint32_t reclaimed_entries =
+            filed_file_vmo_cache_reclaim_snapshots(runtime, &reclaimed_bytes);
+        if (reclaimed_entries != 0) {
+            fprintf(stderr,
+                "[filed] file_vmo_allocation_retry kind=shared length=%llu "
+                "reclaimed_entries=%u reclaimed_bytes=%llu\n",
+                (unsigned long long)capacity,
+                reclaimed_entries,
+                (unsigned long long)reclaimed_bytes);
+            vmo_fd = pacha_vmo_create(capacity, rights, 0);
+        }
+    }
     if (vmo_fd < 16) {
         return -12;
     }
@@ -1278,13 +1359,6 @@ int filed_cache_create_shared_vmo(
         loaded += bytes;
     }
 
-    filed_file_vmo_cache_entry_t *entry =
-        filed_file_vmo_cache_slot_for_length(runtime, capacity);
-    if (entry == NULL) {
-        (void)pacha_munmap(mapped, capacity);
-        (void)pacha_fd_close(vmo_fd);
-        return -28;
-    }
     filed_page_cache_invalidate_object(runtime, backend_object);
     memset(entry, 0, sizeof(*entry));
     entry->active = 1;

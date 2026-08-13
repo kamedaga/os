@@ -289,6 +289,9 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
         return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
     case LPR_FD_OPS_EVENT: {
         lpr_event_backend_t *event = pin->state;
+        if (event->subtype == LPR_EVENT_BACKEND_SIGNALFD) {
+            return lpr_linux_signalfd_read(fd, buf, count);
+        }
         if (event->subtype == LPR_EVENT_BACKEND_TIMERFD) {
             return lpr_linux_timerfd_read(fd, buf, count);
         }
@@ -458,7 +461,8 @@ int64_t lpr_backend_readv(
         const lpr_event_backend_t *event =
             (const lpr_event_backend_t *)pin->state;
         if (event->subtype != LPR_EVENT_BACKEND_EVENTFD &&
-            (event->subtype != LPR_EVENT_BACKEND_TIMERFD || !event->active))
+            (event->subtype != LPR_EVENT_BACKEND_TIMERFD || !event->active) &&
+            (event->subtype != LPR_EVENT_BACKEND_SIGNALFD || !event->active))
         {
             return -LPR_LINUX_EBADF;
         }

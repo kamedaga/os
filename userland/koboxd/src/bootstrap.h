@@ -1,27 +1,19 @@
 #pragma once
 
+#include "storage/bootstrap.h"
+
 #include <stdint.h>
 
 enum {
-    KOBOXD_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
-    KOBOXD_BOOTSTRAP_MAX_MODULES = 8,
-    KOBOXD_BOOTSTRAP_NAME_BYTES = 64,
     KOBOXD_PAGE_SIZE = 4096,
 };
 
-typedef struct koboxd_bootstrap_module {
-    char name[KOBOXD_BOOTSTRAP_NAME_BYTES];
-    uint64_t image_fd;
-    uint64_t image_size;
-} koboxd_bootstrap_module_t;
+#define KOBOXD_BOOTSTRAP_MAGIC STORAGE_FILED_BOOTSTRAP_MAGIC
+#define KOBOXD_BOOTSTRAP_MAX_MODULES STORAGE_STACK_MODULE_CAPACITY
+#define KOBOXD_BOOTSTRAP_NAME_BYTES STORAGE_STACK_MODULE_NAME_BYTES
 
-typedef struct koboxd_bootstrap {
-    uint64_t magic;
-    uint64_t device_fd;
-    uint64_t control_fd;
-    uint64_t module_count;
-    koboxd_bootstrap_module_t modules[KOBOXD_BOOTSTRAP_MAX_MODULES];
-} koboxd_bootstrap_t;
+typedef storage_module_image_desc_t koboxd_bootstrap_module_t;
+typedef storage_filed_bootstrap_t koboxd_bootstrap_t;
 
 int koboxd_align_image_size(uint64_t size, uint64_t *out_size);
 int koboxd_find_bootstrap_fd(char **argv, int *out_bootstrap_fd);

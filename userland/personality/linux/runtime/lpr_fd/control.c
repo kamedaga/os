@@ -32,6 +32,71 @@ _Static_assert(LPR_BACKEND_SLAB_SLOT_COUNT <= 64u, "backend slab bitmap capacity
 static lpr_backend_slab_page_t *lpr_backend_slab_pages;
 static volatile uint32_t lpr_backend_slab_lock;
 
+static char *lpr_state_checkpoint_append_text(
+    char *out, const char *end, const char *text)
+{
+    while (out < end && text != 0 && *text != 0) {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_state_checkpoint_append_u64(
+    char *out, const char *end, uint64_t value)
+{
+    char digits[20];
+    uint64_t count = 0;
+    do {
+        digits[count++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && count < sizeof(digits));
+    while (out < end && count != 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static char *lpr_state_checkpoint_append_i64(
+    char *out, const char *end, int64_t value)
+{
+    uint64_t magnitude = (uint64_t)value;
+    if (value < 0) {
+        if (out < end) {
+            *out++ = '-';
+        }
+        magnitude = (~magnitude) + 1u;
+    }
+    return lpr_state_checkpoint_append_u64(out, end, magnitude);
+}
+
+void lpr_state_checkpoint_log(const char *source, int64_t status)
+{
+    lpr_fd_arrays_init();
+    const uint32_t open_count =
+        lpr_fd_table_open_count(&lpr_control_fd_table);
+    const uint32_t live_count =
+        lpr_fd_table_live_ofd_count(&lpr_control_fd_table);
+    char line[192];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_state_checkpoint_append_text(
+        out, end, "[lpr] state_checkpoint source=");
+    out = lpr_state_checkpoint_append_text(out, end, source);
+    out = lpr_state_checkpoint_append_text(out, end, " open=");
+    out = lpr_state_checkpoint_append_u64(out, end, open_count);
+    out = lpr_state_checkpoint_append_text(out, end, " live=");
+    out = lpr_state_checkpoint_append_u64(out, end, live_count);
+    out = lpr_state_checkpoint_append_text(out, end, " filed_status=");
+    out = lpr_state_checkpoint_append_i64(out, end, status);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+
 static void lpr_backend_slab_acquire(void)
 {
     if (__atomic_exchange_n(

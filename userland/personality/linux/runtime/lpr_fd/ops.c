@@ -72,6 +72,8 @@ static int64_t lpr_ops_pipe_close(void *state)
 static int64_t lpr_ops_event_close(void *state)
 {
     const lpr_event_backend_t *event = state;
+    const int was_signalfd =
+        event->subtype == LPR_EVENT_BACKEND_SIGNALFD;
     int64_t status = 0;
     if (event->wait_fd.raw >= 16)
         status = lpr_close_native_fd_if_open(
@@ -80,6 +82,11 @@ static int64_t lpr_ops_event_close(void *state)
         const int64_t notify_status = lpr_close_native_fd_if_open(
             (uint64_t)(uint32_t)event->notify_fd.raw);
         if (status == 0) status = notify_status;
+    }
+    if (was_signalfd) {
+        lpr_signalfd_refresh_mask();
+        const int64_t mask_status = lpr_linux_sync_native_signal_mask();
+        if (status == 0) status = mask_status;
     }
     return status;
 }

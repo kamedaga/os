@@ -143,6 +143,13 @@ filed_page_dispatch_result_t filed_dispatch_utimens_page(filed_runtime_t *runtim
 filed_page_dispatch_result_t filed_dispatch_chmod_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pread_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(filed_runtime_t *runtime, void *page, int vmo_fd);
+int filed_vmo_fill_window_plan(
+    uint64_t vmo_offset,
+    uint64_t remaining,
+    uint64_t *out_map_offset,
+    uint64_t *out_data_offset,
+    uint64_t *out_map_length,
+    uint64_t *out_chunk);
 int filed_dispatch_file_vmo(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_envelope_t *header);
 int filed_dispatch_shared_file_vmo(filed_runtime_t *runtime, int reply_fd, const struct pacha_ipc_msg *request, void *reply_page, const pacha_service_envelope_t *header);
 void filed_file_vmo_storage_profile_dump(void);

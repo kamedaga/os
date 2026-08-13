@@ -82,7 +82,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${KOBOX_RUNTIME_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${STORAGE_BOOT_ELF}"
   DEPENDS
@@ -91,6 +91,9 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/storage_boot/boot_config.h"
+    "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
+    "${REPO_ROOT}/userland/storage/include/storage/stack.h"
+    "${REPO_ROOT}/userland/storage/include/storage/stack.def"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
     "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"

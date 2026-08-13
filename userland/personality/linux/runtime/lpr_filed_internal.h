@@ -419,6 +419,8 @@ typedef struct lpr_signal_thread_chunk {
 
 typedef struct lpr_signal_state {
     lpr_linux_sigaction_record_t actions[LPR_LINUX_SIGNAL_MAX + 1u];
+    volatile uint64_t signalfd_pending_mask;
+    volatile uint64_t signalfd_mask_union;
     uint32_t runtime_registered;
     volatile uint32_t grow_lock_word;
     uint32_t start_reservations;
@@ -637,6 +639,7 @@ void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, u
 void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status);
 void lpr_drm_startup_profile_dump(void);
 void lpr_state_dump(const char *reason);
+void lpr_state_checkpoint_log(const char *source, int64_t status);
 
 int lpr_pipe_fd_is_active(uint64_t fd);
 int lpr_fd_slot_available(uint64_t fd);
@@ -808,6 +811,7 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd);
 int lpr_linux_default_signal_ignored(uint32_t sig);
 int lpr_linux_default_signal_stops(uint32_t sig);
 int lpr_linux_eventfd_active(uint64_t fd);
+int lpr_linux_signalfd_active(uint64_t fd);
 int lpr_eventfd_native_wait_fd(uint64_t fd);
 void lpr_eventfd_drain_wait(uint64_t fd);
 void lpr_event_backend_notify(lpr_event_backend_t *event);
@@ -890,6 +894,8 @@ int64_t lpr_linux_dup(uint64_t fd, uint64_t min_fd, uint64_t cloexec);
 int64_t lpr_linux_dup2(uint64_t old_fd, uint64_t new_fd, uint64_t flags);
 int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec);
 int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags);
+int64_t lpr_linux_signalfd4(
+    uint64_t fd, uint64_t mask, uint64_t sigsetsize, uint64_t flags);
 int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags);
 int64_t lpr_linux_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t new_value, uint64_t old_value);
 int64_t lpr_linux_timerfd_gettime(uint64_t fd, uint64_t current_value);
@@ -964,6 +970,7 @@ int64_t lpr_linux_set_tid_address(uint64_t tid_address);
 int64_t lpr_linux_setsid(void);
 int64_t lpr_linux_symlinkat(uint64_t target_raw, uint64_t new_dirfd, uint64_t linkpath_raw);
 int64_t lpr_linux_sync(void);
+int64_t lpr_linux_syncfs(uint64_t fd);
 int64_t lpr_linux_try_wait_process_fd(uint64_t process_fd, uint64_t *out_exit_code);
 int64_t lpr_linux_unlinkat(uint64_t dirfd, uint64_t path_raw, uint64_t flags);
 int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, uint64_t flags);
@@ -1000,9 +1007,14 @@ uint32_t lpr_control_status_flags_to_linux(uint32_t status);
 uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
 uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events);
+uint32_t lpr_linux_signalfd_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_timerfd_poll_events(uint64_t fd, uint32_t events);
 int64_t lpr_timerfd_remaining_ns(uint64_t fd, uint64_t *out_remaining_ns);
 uint32_t lpr_linux_first_pending_signal(uint64_t mask);
+uint64_t lpr_signalfd_union_mask(void);
+void lpr_signalfd_refresh_mask(void);
+int lpr_signalfd_enqueue(uint32_t sig);
+int64_t lpr_linux_signalfd_read(uint64_t fd, uint64_t buf, uint64_t count);
 uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events);
 uint32_t lpr_pipe_flags_from_info(const struct pacha_fd_info *info);

@@ -751,6 +751,9 @@ pub fn appendIpcSendFd(
     if (!source.rights.transfer) return KernelError.InvalidState;
     if (!isFdRightsSubset(spec.rights, source.rights)) return KernelError.InvalidState;
     if (self.kernelObjectSlotConst(source.object) == null) return KernelError.InvalidState;
+    // MMIO/DMA objects are bound to the deriving principal's VA/IOVA.  IPC
+    // transfer would outlive or retarget that address-space identity.
+    if (self.kernelObjectIsPinnedUserObject(source.object)) return KernelError.InvalidState;
     try self.retainKernelObject(source.object);
     msg.fds[msg.fd_count] = .{
         .object = source.object,

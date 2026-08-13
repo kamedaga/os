@@ -283,7 +283,18 @@ int64_t lpr_linux_memfd_create(uint64_t name_raw, uint64_t flags)
 int64_t lpr_linux_sync(void)
 {
     uint64_t ignored = 0;
-    return lpr_filed_call(FILED_OP_VFS_SYNC_ALL, -1, 0, &ignored);
+    const int64_t status =
+        lpr_filed_call(FILED_OP_VFS_SYNC_ALL, -1, 0, &ignored);
+    lpr_state_checkpoint_log("sync", status);
+    return status;
+}
+
+int64_t lpr_linux_syncfs(uint64_t fd)
+{
+    if (!lpr_fd_is_filed(fd)) {
+        return -LPR_LINUX_EINVAL;
+    }
+    return lpr_linux_sync();
 }
 
 int64_t lpr_linux_mkdirat(uint64_t dirfd, uint64_t path_raw, uint64_t mode)

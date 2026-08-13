@@ -163,6 +163,168 @@ test "capsule device authority is a native fd object" {
     try std.testing.expect(s.deviceObjectForFd(p1, child_fd, fdRights(.{ .derive_mmio = true })) == null);
 }
 
+test "pinned overlap exception is exact and other pins still reject" {
+    var s = try initFdState();
+    const base: u64 = 0x4000_0000;
+    const source_fd = try s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = base + 0x80,
+        .iova = 0x8000_0080,
+        .size = 64,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    const source_ref = (s.fdEntryConst(p0, source_fd) orelse unreachable).object;
+
+    try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, base, 4096));
+    try std.testing.expect(!s.rangeOverlapsPinnedUserObjectExcept(p0, base, 4096, source_ref));
+
+    var stale_ref = source_ref;
+    stale_ref.generation = KernelState.nextObjectGeneration(stale_ref.generation);
+    try std.testing.expect(s.rangeOverlapsPinnedUserObjectExcept(p0, base, 4096, stale_ref));
+
+    _ = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = base + 0x200,
+        .iova = 0x9000_0200,
+        .size = 64,
+        .direction = .to_device,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(s.rangeOverlapsPinnedUserObjectExcept(p0, base, 4096, source_ref));
+}
+
+test "DMA derivation aliases DMA pins only when explicitly allowed" {
+    var s = try initFdState();
+    const base: u64 = 0x4080_0000;
+    const source_fd = try s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = base + 0x80,
+        .iova = 0x8080_0080,
+        .size = 64,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    const source_ref = (s.fdEntryConst(p0, source_fd) orelse unreachable).object;
+
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, null, true));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, null, false));
+    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, base, 4096, source_ref, false));
+
+    var stale_ref = source_ref;
+    stale_ref.generation = KernelState.nextObjectGeneration(stale_ref.generation);
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, stale_ref, false));
+
+    const mapping_base: u64 = base + 0x8_0000;
+    const first_mapping_fd = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = mapping_base + 0x80,
+        .iova = 0x9088_0080,
+        .size = 64,
+        .direction = .from_device,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, true));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, false));
+
+    const scatter_base: u64 = base + 0xc_0000;
+    _ = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = scatter_base + 0x80,
+        .iova = 0x908c_0080,
+        .size = 64,
+        .page_count = 1,
+        .direction = .from_device,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, scatter_base, 4096, null, true));
+
+    const second_mapping_fd = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = mapping_base + 0x300,
+        .iova = 0x9088_0300,
+        .size = 64,
+        .direction = .to_device,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, mapping_base, 4096));
+    try s.closeFd(p0, first_mapping_fd);
+    try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, mapping_base, 4096));
+    try s.closeFd(p0, second_mapping_fd);
+    try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, mapping_base, 4096));
+
+    const mmio_base: u64 = base + 0x10_0000;
+    const mmio_fd = try s.createMmioRegionFd(p0, .{
+        .device = 1,
+        .bar_index = 0,
+        .paddr = 0xa000_0000,
+        .user_va = mmio_base,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    const mmio_ref = (s.fdEntryConst(p0, mmio_fd) orelse unreachable).object;
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mmio_base, 4096, null, true));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mmio_base, 4096, mmio_ref, true));
+
+    // The general mutation guard remains strict for the unrelated DMA buffer.
+    try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, base, 4096));
+}
+
+test "pinned fds reject transfer and skip process-create inheritance" {
+    var s = try initFdState();
+    const pin_fd = try s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = 0x4100_0000,
+        .iova = 0x8100_0000,
+        .size = 4096,
+    }, fdRights(.{ .transfer = true, .close = true }), fdFlags(.{ .inherit = true }), 16);
+    const pin_ref = (s.fdEntryConst(p0, pin_fd) orelse unreachable).object;
+    const event_ref = try createTestFdObject(&s, 0x5049_4e);
+    const event_fd = try s.installFd(
+        p0,
+        event_ref,
+        fdRights(.{ .transfer = true, .close = true }),
+        fdFlags(.{ .inherit = true }),
+        0,
+    );
+
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.transferFd(p0, p1, pin_fd, 16, fdRights(.{ .close = true }), .{}, .copy),
+    );
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(pin_ref));
+    try std.testing.expect(s.ownerHasPinnedUserObject(p0));
+
+    try s.inheritFdsForProcessCreate(p0, p1);
+    try std.testing.expect(s.fdEntryConst(p1, pin_fd) == null);
+    try std.testing.expectEqual(
+        event_ref,
+        (s.fdEntryConst(p1, event_fd) orelse unreachable).object,
+    );
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(pin_ref));
+    try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(event_ref));
+}
+
+test "owner teardown revokes exact pinned aliases only" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const owner_fd = try s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = 0x4200_0000,
+        .iova = 0x8200_0000,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    const owner_ref = (s.fdEntryConst(p0, owner_fd) orelse unreachable).object;
+    const alias_fd = try s.installFd(p1, owner_ref, fdRights(.{ .close = true }), .{}, 16);
+    const unrelated_fd = try s.createDmaMappingFd(p1, .{
+        .device = 2,
+        .user_va = 0x4300_0000,
+        .iova = 0x8300_0000,
+        .size = 4096,
+        .direction = .bidirectional,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    const unrelated_ref = (s.fdEntryConst(p1, unrelated_fd) orelse unreachable).object;
+
+    try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(owner_ref));
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    try std.testing.expect(s.fdEntryConst(p0, owner_fd) == null);
+    try std.testing.expect(s.fdEntryConst(p1, alias_fd) == null);
+    try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(owner_ref));
+    try std.testing.expectEqual(unrelated_ref, (s.fdEntryConst(p1, unrelated_fd) orelse unreachable).object);
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(unrelated_ref));
+}
+
 test "process fd exposes process object kind and lifecycle state" {
     var s = try initFdState();
     const rights = fdRights(.{
@@ -659,6 +821,123 @@ test "mmap fd rejects rights escalation and overlapping vma" {
     ));
 }
 
+test "mprotect cannot exceed the mapping authority or change its pkey" {
+    var s = try initFdState();
+    const read_fd = try s.createAnonymousVmoFd(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true }),
+        .{},
+        0,
+    );
+    _ = try s.mmapFd(
+        p0,
+        read_fd,
+        0x4110_0000,
+        4096,
+        vmaProt(.{ .read = true }),
+        mmapFlags(.{ .private = true }),
+        0,
+    );
+    const read_vma = s.vmaEntryConst(p0, 0x4110_0000) orelse unreachable;
+    try std.testing.expect(read_vma.max_prot.read);
+    try std.testing.expect(!read_vma.max_prot.write);
+    try std.testing.expect(!read_vma.max_prot.exec);
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.setVmaProtRange(
+            p0,
+            0x4110_0000,
+            4096,
+            vmaProt(.{ .read = true, .write = true }),
+        ),
+    );
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.setVmaProtRange(
+            p0,
+            0x4110_0000,
+            4096,
+            vmaProt(.{ .read = true, .exec = true }),
+        ),
+    );
+    try std.testing.expectEqual(
+        vmaProt(.{ .read = true }),
+        (s.vmaEntryConst(p0, 0x4110_0000) orelse unreachable).prot,
+    );
+
+    const keyed_fd = try s.createAnonymousVmoFd(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true, .map_write = true }),
+        .{},
+        0,
+    );
+    _ = try s.mmapFd(
+        p0,
+        keyed_fd,
+        0x4120_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true, .pkey = 7 }),
+        mmapFlags(.{ .private = true, .pkey = 7 }),
+        0,
+    );
+    try s.setVmaProtRange(
+        p0,
+        0x4120_0000,
+        4096,
+        vmaProt(.{ .read = true, .pkey = 7 }),
+    );
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.setVmaProtRange(
+            p0,
+            0x4120_0000,
+            4096,
+            vmaProt(.{ .read = true, .write = true, .pkey = 0 }),
+        ),
+    );
+    const keyed_vma = s.vmaEntryConst(p0, 0x4120_0000) orelse unreachable;
+    try std.testing.expectEqual(@as(u4, 7), keyed_vma.prot.pkey);
+    try std.testing.expect(!keyed_vma.prot.write);
+
+    const transition_fd = try s.createAnonymousVmoFd(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true, .map_write = true, .map_exec = true }),
+        .{},
+        0,
+    );
+    _ = try s.mmapFd(
+        p0,
+        transition_fd,
+        0x4130_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true }),
+        0,
+    );
+    try s.setVmaProtRange(
+        p0,
+        0x4130_0000,
+        4096,
+        vmaProt(.{ .read = true, .exec = true }),
+    );
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.setVmaProtRange(
+            p0,
+            0x4130_0000,
+            4096,
+            vmaProt(.{ .read = true, .write = true, .exec = true }),
+        ),
+    );
+    const transition_vma = s.vmaEntryConst(p0, 0x4130_0000) orelse unreachable;
+    try std.testing.expect(transition_vma.prot.read);
+    try std.testing.expect(!transition_vma.prot.write);
+    try std.testing.expect(transition_vma.prot.exec);
+}
+
 test "fd close and munmap release native vmo lifetimes independently" {
     var s = try initFdState();
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
@@ -772,6 +1051,119 @@ test "mprotect split and mremap keep vmo refs until final munmap" {
     try s.munmapRangeWithFreeList(p0, 0x4820_0000, 4096, &free_list);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo2));
     try std.testing.expectEqual(original_free, free_list.len);
+}
+
+test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x35_0000, 16);
+    const original_free = free_list.len;
+    const arena_va: u64 = 0x4830_0000;
+
+    _ = try s.createAnonymousVmaWithPages(
+        p0,
+        arena_va,
+        8192,
+        vmaProt(.{}),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    try s.cloneVmaTableForFork(p0, p1);
+
+    const parent_after_fork = s.vmaEntryConst(p0, arena_va) orelse unreachable;
+    const child_after_fork = s.vmaEntryConst(p1, arena_va) orelse unreachable;
+    try std.testing.expect(!parent_after_fork.flags.fork_cow);
+    try std.testing.expect(child_after_fork.flags.fork_cow);
+    try std.testing.expect(!parent_after_fork.prot.write);
+    try std.testing.expect(!child_after_fork.prot.write);
+
+    s.markForkCowVmasCommitted(p0);
+    try std.testing.expect((s.vmaEntryConst(p0, arena_va) orelse unreachable).flags.fork_cow);
+
+    try s.setVmaProtRange(p1, arena_va, 4096, vmaProt(.{ .read = true, .write = true }));
+    const child_enabled = s.vmaEntryConst(p1, arena_va) orelse unreachable;
+    try std.testing.expect(child_enabled.flags.fork_cow);
+    try std.testing.expect(child_enabled.prot.write);
+    try std.testing.expect(!KernelState.nativeFaultMappingProt(child_enabled).write);
+
+    const child_write = s.ensureNativeVmaCowMappingLockedSlow(
+        p1,
+        arena_va,
+        true,
+        false,
+        &free_list,
+    ) orelse unreachable;
+    try std.testing.expect(child_write.prot.write);
+    try std.testing.expectEqual(
+        @as(?u64, child_write.paddr),
+        s.entryDirtyPagePaddr(s.vmaEntryConst(p1, arena_va) orelse unreachable, arena_va),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        s.entryDirtyPagePaddr(s.vmaEntryConst(p0, arena_va) orelse unreachable, arena_va),
+    );
+
+    try s.setVmaProtRange(p0, arena_va, 4096, vmaProt(.{ .read = true, .write = true }));
+    const parent_write = s.ensureNativeVmaCowMappingLockedSlow(
+        p0,
+        arena_va,
+        true,
+        false,
+        &free_list,
+    ) orelse unreachable;
+    try std.testing.expect(parent_write.paddr != child_write.paddr);
+
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    try std.testing.expectEqual(original_free, free_list.len);
+}
+
+test "mprotect middle split fails atomically when only one VMA slot is free" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const mapping_va: u64 = 0x4840_0000;
+    const vmo = try s.createAnonymousVmaWithPages(
+        p0,
+        mapping_va,
+        12288,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    const table = s.getVmaTable(p0) orelse unreachable;
+    const source_index: usize = @intCast(table.active_indices[0]);
+    const free_index: usize = if (source_index == 0) 1 else 0;
+
+    var index: usize = 0;
+    while (index < table.entries.len) : (index += 1) {
+        if (index == source_index or index == free_index) continue;
+        table.entries[index] = .{
+            .active = true,
+            .start_va = 0x7000_0000 + @as(u64, @intCast(index)) * 0x1000,
+            .size_bytes = 4096,
+        };
+        table.active_indices[table.active_count] = @intCast(index);
+        table.active_count += 1;
+    }
+    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
+    const original = table.entries[source_index];
+    const original_refs = s.nativeVmoRefCount(vmo);
+
+    try std.testing.expectError(
+        KernelError.TableFull,
+        s.setVmaProtRange(
+            p0,
+            mapping_va + 4096,
+            4096,
+            vmaProt(.{ .read = true }),
+        ),
+    );
+    try std.testing.expectEqual(original, table.entries[source_index]);
+    try std.testing.expect(!table.entries[free_index].active);
+    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
+    try std.testing.expectEqual(original_refs, s.nativeVmoRefCount(vmo));
 }
 
 test "fork fd and vma clones release vmo pages only after child cleanup" {
@@ -953,6 +1345,171 @@ test "native vma fault mapping resolves backing page without page capability" {
     try std.testing.expect(s.nativeVmaFaultMapping(p0, 0x4500_0000, false, false) == null);
 }
 
+test "DMA pin mode owns writable private COW pages and preserves read-only mappings" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+
+    const read_only_va: u64 = 0x4510_0000;
+    _ = try s.createAnonymousVmaWithPages(
+        p0,
+        read_only_va,
+        4096,
+        vmaProt(.{ .read = true }),
+        vmaProt(.{ .read = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    try std.testing.expectEqual(
+        kernel.NativeVmaDmaPinMode.read_only,
+        s.nativeVmaDmaPinMode(p0, read_only_va, false) orelse unreachable,
+    );
+    try std.testing.expect(s.nativeVmaDmaPinMode(p0, read_only_va, true) == null);
+
+    const direct_va: u64 = 0x4520_0000;
+    _ = try s.createAnonymousVmaWithPages(
+        p0,
+        direct_va,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    try std.testing.expectEqual(
+        kernel.NativeVmaDmaPinMode.direct_writable,
+        s.nativeVmaDmaPinMode(p0, direct_va, false) orelse unreachable,
+    );
+    try std.testing.expectEqual(
+        kernel.NativeVmaDmaPinMode.direct_writable,
+        s.nativeVmaDmaPinMode(p0, direct_va, true) orelse unreachable,
+    );
+
+    const cow_va: u64 = 0x4530_0000;
+    _ = try s.createAnonymousVmaWithPages(
+        p0,
+        cow_va,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true, .fork_cow = true }),
+        &free_list,
+    );
+    try std.testing.expectEqual(
+        kernel.NativeVmaDmaPinMode.cow_writable,
+        s.nativeVmaDmaPinMode(p0, cow_va, false) orelse unreachable,
+    );
+    try std.testing.expectEqual(
+        kernel.NativeVmaDmaPinMode.cow_writable,
+        s.nativeVmaDmaPinMode(p0, cow_va, true) orelse unreachable,
+    );
+    try std.testing.expect(s.nativeVmaDmaPinMode(p0, cow_va + 1, false) == null);
+}
+
+test "DMA packing transaction only replaces an isolated plain anonymous VMA" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const base: u64 = 0x4540_0000;
+    const vmo = try s.createAnonymousVmaWithPages(
+        p0,
+        base,
+        3 * 4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    const old_pages = [_]u64{ 0x1200_0000, 0x1200_3000, 0x1200_7000 };
+    const new_pages = [_]u64{ 0x1300_0000, 0x1300_1000, 0x1300_2000 };
+    try s.installNativeVmoPages(vmo, 0, old_pages[0..]);
+
+    const plan = s.prepareNativeVmaDmaPack(
+        p0,
+        base,
+        3 * 4096,
+        true,
+        old_pages[0..],
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(vmo, plan.vmo);
+    try std.testing.expectEqual(@as(u32, 0), plan.vmo_page_offset);
+    try std.testing.expectEqual(@as(u32, 3), plan.page_count);
+    try std.testing.expect(plan.prot.read and plan.prot.write and !plan.prot.exec);
+
+    const pin_fd = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = base + 4096,
+        .iova = 0x9300_1000,
+        .size = 4096,
+        .direction = .bidirectional,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(s.prepareNativeVmaDmaPack(
+        p0,
+        base,
+        3 * 4096,
+        true,
+        old_pages[0..],
+    ) == null);
+    try s.closeFd(p0, pin_fd);
+    try std.testing.expect(s.prepareNativeVmaDmaPack(
+        p0,
+        base,
+        3 * 4096,
+        true,
+        old_pages[0..],
+    ) != null);
+
+    var stale_pages = old_pages;
+    stale_pages[1] += 4096;
+    try std.testing.expectError(
+        KernelError.InvalidState,
+        s.replaceNativeVmoPagesIfCurrent(vmo, 0, stale_pages[0..], new_pages[0..]),
+    );
+    for (old_pages, 0..) |old_page, index| {
+        try std.testing.expectEqual(old_page, s.nativeVmoPagePaddr(vmo, index) orelse unreachable);
+    }
+
+    try s.replaceNativeVmoPagesIfCurrent(vmo, 0, old_pages[0..], new_pages[0..]);
+    for (new_pages, 0..) |new_page, index| {
+        try std.testing.expectEqual(new_page, s.nativeVmoPagePaddr(vmo, index) orelse unreachable);
+    }
+    try std.testing.expect(s.prepareNativeVmaDmaPack(
+        p0,
+        base,
+        3 * 4096,
+        true,
+        old_pages[0..],
+    ) == null);
+    try s.replaceNativeVmoPagesIfCurrent(vmo, 0, new_pages[0..], old_pages[0..]);
+
+    const table = s.getVmaTable(p0) orelse unreachable;
+    var found_vma_index: ?usize = null;
+    for (table.entries[0..], 0..) |entry, index| {
+        if (entry.active and entry.start_va == base) {
+            found_vma_index = index;
+            break;
+        }
+    }
+    const vma_index = found_vma_index orelse return error.TestExpectedEqual;
+
+    table.entries[vma_index].flags.fork_cow = true;
+    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
+    table.entries[vma_index].flags.fork_cow = false;
+    table.entries[vma_index].prot.exec = true;
+    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
+    table.entries[vma_index].prot.exec = false;
+    table.entries[vma_index].flags.shared = true;
+    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
+    table.entries[vma_index].flags.shared = false;
+
+    try s.retainNativeVmo(vmo);
+    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
+    s.releaseNativeVmo(vmo);
+    const slot = s.nativeVmoSlot(vmo) orelse unreachable;
+    slot.parent = .{ .index = 1, .generation = 1 };
+    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) == null);
+    slot.parent = .{};
+    try std.testing.expect(s.prepareNativeVmaDmaPack(p0, base, 3 * 4096, true, old_pages[0..]) != null);
+}
+
 test "private file vma faults read-only then COWs on write" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -1011,4 +1568,187 @@ test "private file vma faults read-only then COWs on write" {
     try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
     try s.munmapRangeWithFreeList(p0, 0x4600_0000, 4096, &free_list);
     try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(source_vmo));
+}
+
+fn fillVmaTableExcept(table: *kernel.VmaTable, except: []const usize) void {
+    var index: usize = 0;
+    while (index < table.entries.len) : (index += 1) {
+        var skip = false;
+        for (except) |except_index| {
+            if (index == except_index) {
+                skip = true;
+                break;
+            }
+        }
+        if (skip or table.entries[index].active) continue;
+        KernelState.installVmaEntry(table, index, .{
+            .active = true,
+            .start_va = 0x7000_0000 + @as(u64, @intCast(index)) * 0x2000,
+            .size_bytes = 4096,
+        });
+    }
+}
+
+test "fixed mmap prepare reuses a fully covered slot in a full vma table" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const target_va: u64 = 0x5100_0000;
+    const source_vmo = try s.createAnonymousVmaWithPages(
+        p0,
+        target_va,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    const table = s.getVmaTable(p0) orelse unreachable;
+    const target_index: usize = @intCast(table.active_indices[0]);
+    fillVmaTableExcept(table, &.{});
+    try std.testing.expectEqual(kernel.max_vmas_per_process, table.active_count);
+
+    const dest_fd = try s.createAnonymousVmoFd(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true, .map_write = true }),
+        .{},
+        16,
+    );
+    const dest_vmo = s.nativeVmoRefForFd(p0, dest_fd) orelse unreachable;
+    var prepared = try s.prepareFixedFdMmap(
+        p0,
+        dest_fd,
+        target_va,
+        4096,
+        vmaProt(.{ .read = true }),
+        mmapFlags(.{ .fixed = true, .private = true }),
+        0,
+        &free_list,
+    );
+    try std.testing.expectEqual(target_index, prepared.destination_index);
+    s.commitFixedMmapPrepared(&prepared, &free_list);
+    try std.testing.expectEqual(kernel.max_vmas_per_process, table.active_count);
+    try std.testing.expectEqual(dest_vmo, (s.vmaEntryConst(p0, target_va) orelse unreachable).vmo);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(source_vmo));
+}
+
+test "fixed mmap middle cut fails atomically with only one spare vma slot" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const target_va: u64 = 0x5200_0000;
+    const source_vmo = try s.createAnonymousVmaWithPages(
+        p0,
+        target_va,
+        3 * 4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    const table = s.getVmaTable(p0) orelse unreachable;
+    const source_index: usize = @intCast(table.active_indices[0]);
+    const spare_index: usize = if (source_index == 0) 1 else 0;
+    fillVmaTableExcept(table, &.{ source_index, spare_index });
+    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
+    const original = table.entries[source_index];
+    const source_refs = s.nativeVmoRefCount(source_vmo);
+
+    const dest_fd = try s.createAnonymousVmoFd(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true }),
+        .{},
+        16,
+    );
+    const dest_vmo = s.nativeVmoRefForFd(p0, dest_fd) orelse unreachable;
+    const dest_refs = s.nativeVmoRefCount(dest_vmo);
+    try std.testing.expectError(KernelError.TableFull, s.prepareFixedFdMmap(
+        p0,
+        dest_fd,
+        target_va + 4096,
+        4096,
+        vmaProt(.{ .read = true }),
+        mmapFlags(.{ .fixed = true, .private = true }),
+        0,
+        &free_list,
+    ));
+    try std.testing.expectEqual(original, table.entries[source_index]);
+    try std.testing.expect(!table.entries[spare_index].active);
+    try std.testing.expectEqual(source_refs, s.nativeVmoRefCount(source_vmo));
+    try std.testing.expectEqual(dest_refs, s.nativeVmoRefCount(dest_vmo));
+}
+
+test "fixed mmap validation and discard preserve the old mapping" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const target_va: u64 = 0x5300_0000;
+    const source_vmo = try s.createAnonymousVmaWithPages(
+        p0,
+        target_va,
+        3 * 4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+        &free_list,
+    );
+    const original = (s.vmaEntryConst(p0, target_va) orelse unreachable).*;
+    const table = s.getVmaTable(p0) orelse unreachable;
+    const active_before = table.active_count;
+    const source_refs = s.nativeVmoRefCount(source_vmo);
+    const fixed_private = mmapFlags(.{ .fixed = true, .private = true });
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(
+        p0,
+        std.math.maxInt(kernel.Fd),
+        target_va + 4096,
+        4096,
+        vmaProt(.{ .read = true }),
+        fixed_private,
+        0,
+        &free_list,
+    ));
+    try std.testing.expectEqual(original, (s.vmaEntryConst(p0, target_va) orelse unreachable).*);
+    try std.testing.expectEqual(active_before, table.active_count);
+    try std.testing.expectEqual(source_refs, s.nativeVmoRefCount(source_vmo));
+
+    const dest_fd = try s.createAnonymousVmoFd(
+        p0,
+        4096,
+        fdRights(.{ .map_read = true, .map_write = true }),
+        .{},
+        16,
+    );
+    const dest_vmo = s.nativeVmoRefForFd(p0, dest_fd) orelse unreachable;
+    var prepared = try s.prepareFixedFdMmap(
+        p0,
+        dest_fd,
+        target_va + 4096,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        fixed_private,
+        0,
+        &free_list,
+    );
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(dest_vmo));
+    s.discardFixedMmapPrepared(&prepared, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(dest_vmo));
+    try std.testing.expectEqual(original, (s.vmaEntryConst(p0, target_va) orelse unreachable).*);
+
+    var anonymous = try s.prepareFixedAnonymousMmap(
+        p0,
+        target_va + 4096,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        vmaProt(.{ .read = true, .write = true, .exec = true }),
+        mmapFlags(.{ .fixed = true, .private = true, .anonymous = true }),
+        &free_list,
+    );
+    const fresh_vmo = anonymous.destination.vmo;
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(source_vmo));
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(fresh_vmo));
+    s.discardFixedMmapPrepared(&anonymous, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(source_vmo));
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(fresh_vmo));
+    try std.testing.expectEqual(original, (s.vmaEntryConst(p0, target_va) orelse unreachable).*);
 }

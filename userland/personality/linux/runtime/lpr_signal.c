@@ -159,10 +159,12 @@ void lpr_linux_signal_runtime_init(void)
 int64_t lpr_linux_sync_native_signal_mask(void)
 {
     lpr_linux_signal_runtime_init();
+    const uint64_t native_mask =
+        lpr_linux_signal_mask & ~lpr_signalfd_union_mask();
     const int64_t status = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_SET_MASK,
-        lpr_linux_signal_mask);
+        native_mask);
     return status == PACHAOS_SYSCALL_OK ? 0 : lpr_pacha_status_to_errno(status);
 }
 
@@ -275,7 +277,9 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
         lpr_linux_wait_restore_mask_active = 0;
     }
     if ((lpr_linux_signal_mask & bit) != 0) {
-        lpr_linux_queue_signal(sig);
+        if (!lpr_signalfd_enqueue(sig)) {
+            lpr_linux_queue_signal(sig);
+        }
         if (restore_wait_mask) {
             lpr_linux_signal_mask = return_mask;
             if (lpr_linux_sync_native_signal_mask() != 0) {

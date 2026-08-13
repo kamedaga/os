@@ -7,22 +7,15 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 
-EXPECTED_BOOTFS = {
-    "/srv/storage_boot.elf",
-    "/srv/kobox/nvme-auth.ko",
-    "/srv/kobox/nvme-core.ko",
-    "/srv/kobox/nvme.ko",
-    "/srv/kobox/crc16.ko",
-    "/srv/kobox/mbcache.ko",
-    "/srv/kobox/jbd2.ko",
-    "/srv/kobox/ext4.ko",
-}
+STORAGE_MANIFEST = "userland/storage/include/storage/stack.def"
+STORAGE_CONSUMERS = (
+    "userland/storage_boot/src/main.c",
+    "userland/seed0root/src/main.c",
+    "userland/koboxd/src/bootstrap.c",
+    "userland/koboxd/src/storage_runtime.c",
+)
 
 MODULE_ORDERS = {
-    "userland/storage_boot/src/main.c": [
-        "nvme-auth.ko", "nvme-core.ko", "nvme.ko", "crc16.ko",
-        "mbcache.ko", "jbd2.ko", "ext4.ko",
-    ],
     "userland/netd/src/module_stack.c": [
         "virtio.ko", "virtio_ring.ko", "virtio_pci.ko", "failover.ko",
         "net_failover.ko", "virtio_net.ko",
@@ -58,17 +51,40 @@ def assert_order(path: str, names: list[str]) -> None:
 
 
 def main() -> None:
+    manifest_text = (ROOT / STORAGE_MANIFEST).read_text()
+    manifest = re.findall(
+        r'^STORAGE_STACK_MODULE\([^,]+,\s*([^,]+),\s*"([^"]+)",\s*"([^"]+)"',
+        manifest_text,
+        re.MULTILINE,
+    )
+    assert len(manifest) == 7, f"storage manifest count changed: {len(manifest)}"
+    phases = [phase.strip() for phase, _, _ in manifest]
+    storage_names = [name for _, name, _ in manifest]
+    paths = [path for _, _, path in manifest]
+    assert len(set(storage_names)) == len(storage_names), "duplicate storage module name"
+    assert len(set(paths)) == len(paths), "duplicate storage module path"
+    assert phases == ["NVME"] * 3 + ["FILESYSTEM"] * 4, \
+        f"storage phase/order changed: {phases}"
+
+    expected_bootfs = {"/srv/storage_boot.elf", *paths}
     pack = (ROOT / "pack/pack.yaml").read_text()
     bootfs = set(re.findall(r'^\s+bootfs:\s+"(/[^"]+)"\s*$', pack, re.MULTILINE))
-    assert bootfs == EXPECTED_BOOTFS, f"bootfs mismatch: {sorted(bootfs)}"
+    assert bootfs == expected_bootfs, f"bootfs mismatch: {sorted(bootfs)}"
 
     seed0boot = ROOT / "userland/seed0boot"
     for path in seed0boot.rglob("*"):
         if path.is_file() and path.suffix in {".c", ".h"}:
             assert ".ko" not in path.read_text(), f"module name leaked into {path}"
 
-    for path, names in MODULE_ORDERS.items():
-        assert_order(path, names)
+    for path, module_names in MODULE_ORDERS.items():
+        assert_order(path, module_names)
+
+    for consumer in STORAGE_CONSUMERS:
+        text = (ROOT / consumer).read_text()
+        for name in storage_names:
+            assert name not in text, f"storage module name duplicated in {consumer}: {name}"
+        for path in paths:
+            assert path not in text, f"storage module path duplicated in {consumer}: {path}"
 
     print("boot boundary static checks: OK")
 

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/signalfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -237,6 +238,51 @@ static int run_epoll_handler(void)
     return 0;
 }
 
+static int run_signalfd_handler(void)
+{
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &mask, 0) != 0) return 11;
+
+    const int signal_fd = signalfd(
+        -1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+    const int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (signal_fd < 0 || epoll_fd < 0) return 12;
+
+    struct epoll_event interest;
+    memset(&interest, 0, sizeof(interest));
+    interest.events = EPOLLIN;
+    interest.data.fd = signal_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, signal_fd, &interest) != 0) {
+        return 13;
+    }
+
+    write_marker("ASYNC_SIGNALFD_READY\n");
+    struct epoll_event event;
+    for (;;) {
+        const int count = epoll_wait(epoll_fd, &event, 1, -1);
+        if (count == 1 && event.data.fd == signal_fd &&
+            (event.events & EPOLLIN) != 0)
+        {
+            break;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        return 14;
+    }
+
+    struct signalfd_siginfo info;
+    if (read(signal_fd, &info, sizeof(info)) != (ssize_t)sizeof(info) ||
+        info.ssi_signo != SIGTERM)
+    {
+        return 15;
+    }
+    write_marker("ASYNC_SIGNALFD_EPOLL=OK\n");
+    (void)close(epoll_fd);
+    (void)close(signal_fd);
+    return 0;
+}
+
 static int run_loop(void)
 {
     write_marker("ASYNC_LOOP_READY\n");
@@ -342,6 +388,9 @@ static int run_signaled_child(const char *mode, int signal, int expect_signal)
         if (strcmp(mode, "epoll") == 0) {
             _exit(run_epoll_handler());
         }
+        if (strcmp(mode, "signalfd") == 0) {
+            _exit(run_signalfd_handler());
+        }
         _exit(run_loop());
     }
     sleep(1);
@@ -419,6 +468,10 @@ static int run_suite(const char *self)
         return 45;
     }
     write_marker("ASYNC_EPOLL_HANDLER=OK\n");
+    if (run_signaled_child("signalfd", SIGTERM, 0) != 0) {
+        return 46;
+    }
+    write_marker("ASYNC_SIGNALFD=OK\n");
     return 0;
 }
 
@@ -438,6 +491,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "epoll") == 0) {
         return run_epoll_handler();
+    }
+    if (strcmp(argv[1], "signalfd") == 0) {
+        return run_signalfd_handler();
     }
     if (strcmp(argv[1], "suite") == 0) {
         return run_suite(argv[0]);

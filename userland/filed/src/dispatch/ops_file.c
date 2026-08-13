@@ -8,6 +8,15 @@ _Static_assert(FILED_OPENED_KIND_DIRECTORY == FILED_VNODE_DIRECTORY, "directory 
 _Static_assert(FILED_OPENED_KIND_SYMLINK == FILED_VNODE_SYMLINK, "symlink vnode wire kind");
 _Static_assert(FILED_OPENED_KIND_DEVICE == FILED_VNODE_DEVICE, "device vnode wire kind");
 
+enum {
+    FILED_VMO_FILL_PAGE_BYTES = 4096u,
+    FILED_VMO_FILL_WINDOW_BYTES = 2u * 1024u * 1024u,
+};
+
+_Static_assert(
+    (FILED_VMO_FILL_WINDOW_BYTES % FILED_VMO_FILL_PAGE_BYTES) == 0,
+    "file VMO fill window must be page aligned");
+
 #if defined(FILED_STARTUP_PROFILE) && FILED_STARTUP_PROFILE
 static inline uint64_t filed_profile_file_vmo_stage_begin(void)
 {
@@ -599,6 +608,173 @@ filed_page_dispatch_result_t filed_dispatch_pread_page(
     return filed_page_result(reply_status, bytes);
 }
 
+int filed_vmo_fill_window_plan(
+    uint64_t vmo_offset,
+    uint64_t remaining,
+    uint64_t *out_map_offset,
+    uint64_t *out_data_offset,
+    uint64_t *out_map_length,
+    uint64_t *out_chunk)
+{
+    if (remaining == 0 ||
+        out_map_offset == NULL ||
+        out_data_offset == NULL ||
+        out_map_length == NULL ||
+        out_chunk == NULL)
+    {
+        return -22;
+    }
+
+    const uint64_t map_offset =
+        vmo_offset & ~(uint64_t)(FILED_VMO_FILL_PAGE_BYTES - 1u);
+    const uint64_t data_offset = vmo_offset - map_offset;
+    uint64_t chunk = FILED_VMO_FILL_WINDOW_BYTES - data_offset;
+    if (chunk > remaining) {
+        chunk = remaining;
+    }
+
+    *out_map_offset = map_offset;
+    *out_data_offset = data_offset;
+    *out_map_length = data_offset + chunk;
+    *out_chunk = chunk;
+    return 0;
+}
+
+static int filed_pread_into_vmo_windows(
+    filed_runtime_t *runtime,
+    uint64_t backend_object,
+    uint64_t file_offset,
+    int vmo_fd,
+    uint64_t vmo_offset,
+    uint64_t length,
+    const char *kind,
+    uint64_t *out_bytes)
+{
+    if (runtime == NULL || backend_object == 0 || vmo_fd < 16 ||
+        kind == NULL || out_bytes == NULL ||
+        file_offset + length < file_offset ||
+        vmo_offset + length < vmo_offset)
+    {
+        return -22;
+    }
+    *out_bytes = 0;
+
+    uint64_t total = 0;
+    while (total < length) {
+        uint64_t map_offset = 0;
+        uint64_t data_offset = 0;
+        uint64_t map_length = 0;
+        uint64_t chunk = 0;
+        const int plan_status = filed_vmo_fill_window_plan(
+            vmo_offset + total,
+            length - total,
+            &map_offset,
+            &data_offset,
+            &map_length,
+            &chunk);
+        if (plan_status != 0) {
+            return plan_status;
+        }
+
+        uint64_t map_profile_stage = filed_profile_file_vmo_stage_begin();
+        unsigned char *mapped = pacha_mmap(
+            vmo_fd,
+            map_length,
+            PACHA_PROT_READ | PACHA_PROT_WRITE,
+            PACHA_MMAP_SHARED,
+            map_offset);
+        filed_profile_file_vmo_stage_end(
+            runtime,
+            FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP,
+            map_profile_stage);
+        if (mapped == NULL) {
+            uint64_t reclaimed_bytes = 0;
+            const uint32_t reclaimed_entries =
+                filed_file_vmo_cache_reclaim_snapshots(
+                    runtime, &reclaimed_bytes);
+            fprintf(stderr,
+                "[filed] file_vmo_window_retry kind=%s total=%llu "
+                "map_offset=%llu map_length=%llu reclaimed_entries=%u "
+                "reclaimed_bytes=%llu\n",
+                kind,
+                (unsigned long long)total,
+                (unsigned long long)map_offset,
+                (unsigned long long)map_length,
+                reclaimed_entries,
+                (unsigned long long)reclaimed_bytes);
+            map_profile_stage = filed_profile_file_vmo_stage_begin();
+            mapped = pacha_mmap(
+                vmo_fd,
+                map_length,
+                PACHA_PROT_READ | PACHA_PROT_WRITE,
+                PACHA_MMAP_SHARED,
+                map_offset);
+            filed_profile_file_vmo_stage_end(
+                runtime,
+                FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP,
+                map_profile_stage);
+        }
+        if (mapped == NULL) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=file_vmo_window_mmap "
+                "status=-12 kind=%s total=%llu map_offset=%llu "
+                "map_length=%llu requested_length=%llu\n",
+                kind,
+                (unsigned long long)total,
+                (unsigned long long)map_offset,
+                (unsigned long long)map_length,
+                (unsigned long long)length);
+            return -12;
+        }
+
+        const int dma_window_status =
+            kb_linux_block_dma_read_window_begin(mapped, (size_t)map_length);
+        uint64_t bytes = 0;
+        const int read_status = filed_cached_pread(
+            runtime,
+            backend_object,
+            file_offset + total,
+            mapped + data_offset,
+            chunk,
+            &bytes);
+        if (dma_window_status == 0) {
+            kb_linux_block_dma_read_window_end();
+        }
+        const int unmap_status = pacha_munmap(mapped, map_length);
+        if (unmap_status != 0) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=file_vmo_window_munmap "
+                "status=%d kind=%s total=%llu map_offset=%llu "
+                "map_length=%llu\n",
+                unmap_status,
+                kind,
+                (unsigned long long)total,
+                (unsigned long long)map_offset,
+                (unsigned long long)map_length);
+            return unmap_status;
+        }
+        if (read_status != 0) {
+            return read_status;
+        }
+        if (bytes > chunk) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=file_vmo_window_pread "
+                "status=-5 kind=%s total=%llu chunk=%llu bytes=%llu\n",
+                kind,
+                (unsigned long long)total,
+                (unsigned long long)chunk,
+                (unsigned long long)bytes);
+            return -5;
+        }
+        total += bytes;
+        *out_bytes = total;
+        if (bytes < chunk) {
+            break;
+        }
+    }
+    return 0;
+}
+
 filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
     filed_runtime_t *runtime,
     void *page,
@@ -635,24 +811,15 @@ filed_page_dispatch_result_t filed_dispatch_pread_to_vmo_page(
         return filed_page_result(0, 0);
     }
 
-    unsigned char *mapped = pacha_mmap(
-        vmo_fd,
-        pread_vmo->vmo_offset + length,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        PACHA_MMAP_SHARED,
-        0);
-    if (mapped == NULL) {
-        return filed_page_result(-12, 0);
-    }
-
-    reply_status = filed_cached_pread(
+    reply_status = filed_pread_into_vmo_windows(
         runtime,
         decision.backend_object,
         decision.offset,
-        mapped + pread_vmo->vmo_offset,
+        vmo_fd,
+        pread_vmo->vmo_offset,
         length,
+        "pread_to_vmo",
         &bytes);
-    (void)pacha_munmap(mapped, pread_vmo->vmo_offset + length);
     return filed_page_result(reply_status, bytes);
 }
 
@@ -673,31 +840,38 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC;
+    /* Reclaim cached owners before asking the kernel to back the next image.
+     * Large ELF dependencies (notably libLLVM) can otherwise fail even though
+     * the cache has enough evictable bytes: the old implementation allocated
+     * first and only enforced the byte budget after the read completed. */
+    filed_file_vmo_cache_entry_t *entry =
+        filed_file_vmo_cache_slot_for_length(runtime, length);
+    if (entry == NULL) {
+        return filed_page_result(-28, 0);
+    }
     uint64_t profile_stage = filed_profile_file_vmo_stage_begin();
-    const int vmo_fd = pacha_vmo_create(length, rights, 0);
+    int vmo_fd = pacha_vmo_create(length, rights, 0);
+    if (vmo_fd < 16) {
+        uint64_t reclaimed_bytes = 0;
+        const uint32_t reclaimed_entries =
+            filed_file_vmo_cache_reclaim_snapshots(runtime, &reclaimed_bytes);
+        if (reclaimed_entries != 0) {
+            fprintf(stderr,
+                "[filed] file_vmo_allocation_retry kind=snapshot length=%llu "
+                "reclaimed_entries=%u reclaimed_bytes=%llu\n",
+                (unsigned long long)length,
+                reclaimed_entries,
+                (unsigned long long)reclaimed_bytes);
+            vmo_fd = pacha_vmo_create(length, rights, 0);
+        }
+    }
     filed_profile_file_vmo_stage_end(
         runtime, FILED_PROFILE_FILE_VMO_STAGE_VMO_CREATE, profile_stage);
     if (vmo_fd < 16) {
         return filed_page_result(-12, 0);
     }
-    profile_stage = filed_profile_file_vmo_stage_begin();
-    unsigned char *mapped = pacha_mmap(
-        vmo_fd,
-        length,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        PACHA_MMAP_SHARED,
-        0);
-    filed_profile_file_vmo_stage_end(
-        runtime, FILED_PROFILE_FILE_VMO_STAGE_VMO_MMAP, profile_stage);
-    if (mapped == NULL) {
-        (void)pacha_fd_close(vmo_fd);
-        return filed_page_result(-12, 0);
-    }
-
     uint64_t bytes = 0;
     profile_stage = filed_profile_file_vmo_stage_begin();
-    const int dma_window_status =
-        kb_linux_block_dma_read_window_begin(mapped, (size_t)length);
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
     kb_fs_read_profile_t fs_profile_before;
     kb_fs_read_profile_t fs_profile_after;
@@ -712,16 +886,15 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
     kb_pachaos_capsule_dma_profile_snapshot(&dma_profile_before);
     kb_pachaos_capsule_irq_profile_snapshot(&irq_profile_before);
 #endif
-    const int64_t reply_status = filed_cached_pread(
+    const int64_t reply_status = filed_pread_into_vmo_windows(
         runtime,
         decision->backend_object,
         file_offset,
-        mapped,
+        vmo_fd,
+        0,
         length,
+        "snapshot",
         &bytes);
-    if (dma_window_status == 0) {
-        kb_linux_block_dma_read_window_end();
-    }
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
     kb_fs_read_profile_snapshot(&fs_profile_after);
     kb_linux_block_profile_snapshot(&block_profile_after);
@@ -740,18 +913,11 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
 #endif
     filed_profile_file_vmo_stage_end(
         runtime, FILED_PROFILE_FILE_VMO_STAGE_PREAD, profile_stage);
-    (void)pacha_munmap(mapped, length);
     if (reply_status != 0) {
         (void)pacha_fd_close(vmo_fd);
         return filed_page_result(reply_status, 0);
     }
 
-    filed_file_vmo_cache_entry_t *entry =
-        filed_file_vmo_cache_slot_for_length(runtime, length);
-    if (entry == NULL) {
-        (void)pacha_fd_close(vmo_fd);
-        return filed_page_result(-28, 0);
-    }
     memset(entry, 0, sizeof(*entry));
     entry->active = 1;
     entry->vmo_fd = vmo_fd;
@@ -1444,6 +1610,43 @@ void filed_dispatch_log_state_checkpoint(filed_runtime_t *runtime, const char *s
         active_sessions += runtime->sessions[i].active ? 1u : 0u;
     printf("[filed] state_checkpoint source=%s active_handles=%u active_sessions=%u\n",
            source, active_handles, active_sessions);
+    filed_kobox_object_stats_t object_stats;
+    if (filed_kobox_backend_object_stats(&runtime->backend, &object_stats) == 0) {
+        printf(
+            "[filed] kobox_objects source=%s used=%u referenced=%u cached=%u "
+            "evictions=%llu capacity=%u\n",
+            source,
+            object_stats.used,
+            object_stats.referenced,
+            object_stats.cached,
+            (unsigned long long)object_stats.evictions,
+            object_stats.capacity);
+    }
+    uint32_t file_vmo_entries = 0;
+    uint32_t file_vmo_shared = 0;
+    uint64_t file_vmo_bytes = 0;
+    for (uint32_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (!entry->active) {
+            continue;
+        }
+        file_vmo_entries++;
+        file_vmo_shared += entry->shared ? 1u : 0u;
+        file_vmo_bytes = entry->length > UINT64_MAX - file_vmo_bytes ?
+            UINT64_MAX : file_vmo_bytes + entry->length;
+    }
+    printf(
+        "[filed] file_vmo_cache source=%s entries=%u shared=%u bytes=%llu "
+        "hits=%llu misses=%llu stores=%llu evictions=%llu budget=%u\n",
+        source,
+        file_vmo_entries,
+        file_vmo_shared,
+        (unsigned long long)file_vmo_bytes,
+        (unsigned long long)filed_file_vmo_cache_hits,
+        (unsigned long long)filed_file_vmo_cache_misses,
+        (unsigned long long)filed_file_vmo_cache_stores,
+        (unsigned long long)filed_file_vmo_cache_evictions,
+        (unsigned)FILED_FILE_VMO_CACHE_TOTAL_BYTES);
     fflush(stdout);
 }
 

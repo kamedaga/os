@@ -11,10 +11,11 @@ MARKERS = (
     b"APK_SHELL_VERSION=OK",
     b"APK_SHELL_OFFLINE_INDEX=OK",
     b"APK_SHELL_UPDATE=OK",
-    b"APK_SHELL_ADD_NANO=OK",
+    b"APK_SHELL_NANO_CYCLES=OK iterations=3",
     b"APK_SHELL_ADD_GREP=OK",
     b"APK_SHELL_ADD_WGET=OK",
     b"APK_SHELL_ADD_FASTFETCH=OK",
+    b"APK_SHELL_FINAL_NANO_ABSENT=OK",
     b"APK_SHELL_SYNC=OK",
 )
 
@@ -59,6 +60,10 @@ def main() -> int:
         for marker in MARKERS:
             wait_for(sock, output, marker, deadline, fail_on_prompt=True)
         wait_for(sock, output, PROMPT, deadline)
+        if output.count(b"APK_SHELL_NANO_ADD iteration=") != 3:
+            raise AssertionError("actual apk nano add cycle count was not 3")
+        if output.count(b"APK_SHELL_NANO_DEL iteration=") != 3:
+            raise AssertionError("actual apk nano del cycle count was not 3")
         print("\nAPK_SHELL_QEMU=OK", flush=True)
         return 0
     except Exception as exc:

@@ -99,6 +99,10 @@ int main(int argc, char **argv)
         }
         (void)termd_linux_tty_island_reap_hangups(&tty_island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
+            const int diagnose = termd_linux_tty_island_diag_active();
+            if (diagnose) {
+                printf("[termd] linux tty wait prepare\n");
+            }
             static struct pacha_service_wait_set wait_set;
             int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
             if (pacha_service_wait_init(&wait_set, (int)cfg->tty_endpoint_fd) != 0)
@@ -118,7 +122,17 @@ int main(int argc, char **argv)
                         &wait_set, notify_fds[i], PACHA_FD_EVENT_HANGUP) != 0)
                     return 1;
             }
-            (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+            if (diagnose) {
+                printf(
+                    "[termd] linux tty wait begin sources=%llu\n",
+                    (unsigned long long)notify_count);
+                termd_linux_tty_island_diag_code();
+            }
+            const int wait_status =
+                pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+            if (diagnose) {
+                printf("[termd] linux tty wait done status=%d\n", wait_status);
+            }
             (void)termd_linux_tty_island_reap_hangups(&tty_island);
         }
     }

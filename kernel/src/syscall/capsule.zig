@@ -13,6 +13,8 @@ const TrapFrame = interrupts.TrapFrame;
 const pci_config_size: usize = 256;
 const page_size: u64 = 4096;
 const first_dynamic_fd: kernel.Fd = abi_root.fd_abi.first_dynamic_fd;
+// Capsule syscalls run under the global kernel-state lock, so these bounded
+// scratch arrays cannot be used concurrently by two DMA packing transactions.
 var dma_pack_old_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
 var dma_pack_new_paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
 
@@ -91,25 +93,43 @@ fn writePciBarInfo(h: anytype, proc: kernel.PrincipalId, out_va: u64, max_words:
     return true;
 }
 
-fn mapPciBarIntoUser(proc: kernel.PrincipalId, user_va: u64, map_size: u64, flags: u64, info: pci.BarInfo) bool {
+fn mapPciBarIntoUser(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    user_va: u64,
+    map_size: u64,
+    flags: u64,
+    info: pci.BarInfo,
+) bool {
     if ((user_va & (page_size - 1)) != 0 or (map_size & (page_size - 1)) != 0) return false;
     if (map_size == 0 or map_size > @as(u64, std.math.maxInt(usize))) return false;
     const paddr = pageAlignDown(info.start);
-    const required_size = pageAlignUp((info.start - paddr) + info.size) orelse return false;
-    if (map_size < required_size) return false;
+    if (paddr == 0) return false;
+    const span, const span_overflow = @addWithOverflow(info.start - paddr, info.size);
+    if (span_overflow != 0) return false;
+    const required_size = pageAlignUp(span) orelse return false;
+    // The capability names one complete BAR, not an arbitrary physical span.
+    // Accepting an oversized length would expose adjacent MMIO resources.
+    if (map_size != required_size) return false;
+    const physical_end, const physical_end_overflow = @addWithOverflow(paddr, map_size - 1);
+    if (physical_end_overflow != 0) return false;
+    _ = physical_end;
     const size_usize: usize = @intCast(map_size);
+    if (!user_vm.lockVmTransaction(proc)) return false;
+    defer user_vm.unlockVmTransaction(proc);
+    // BAR mappings are intentionally outside the VMA/VMO model and carry a
+    // close-time address identity in their FD.  Overwriting any existing VMA
+    // or address-bound object here would leave stale metadata.  Keep both the
+    // ordinary and replace-existing forms fail-closed until replacement can
+    // update those owners atomically.
+    if (!(state.userMapRangeIsFree(proc, user_va, map_size) catch false)) return false;
     if (user_vm.mapUserUncachedLinearRegionWithProt(proc, user_va, paddr, size_usize, .{
         .read = true,
         .write = true,
         .exec = false,
     })) return true;
-    if ((flags & capsule_abi.mmio_map_flag_replace_existing) == 0) return false;
-    _ = user_vm.unmapUserLinearRegion(proc, user_va, size_usize);
-    return user_vm.mapUserUncachedLinearRegionWithProt(proc, user_va, paddr, size_usize, .{
-        .read = true,
-        .write = true,
-        .exec = false,
-    });
+    _ = flags;
+    return false;
 }
 
 fn userDmaAddressForRange(
@@ -118,6 +138,9 @@ fn userDmaAddressForRange(
     proc: kernel.PrincipalId,
     user_va: u64,
     size: u64,
+    device_writes: bool,
+    except_pinned_object: ?kernel.KernelObjectRef,
+    allow_dma_mapping_aliases: bool,
 ) ?u64 {
     if (user_va == 0 or size == 0) return null;
     const first_page_va = pageAlignDown(user_va);
@@ -126,58 +149,150 @@ fn userDmaAddressForRange(
     if (span_overflow != 0) return null;
     const page_span = pageAlignUp(span) orelse return null;
     const page_count = page_span / page_size;
-    if (page_count == 0) return null;
+    if (page_count == 0 or page_count > kernel.max_vmo_backing_pages) return null;
     if (page_span > std.math.maxInt(usize)) return null;
 
-    if (!user_vm.lockVmTransaction(proc)) return null;
-    defer user_vm.unlockVmTransaction(proc);
-
-    const existing_first_paddr = user_vm.lookupUserMappedPaddrForVa(proc, first_page_va);
-    if (existing_first_paddr) |first_paddr| {
-        if ((first_paddr & (page_size - 1)) != 0) return null;
-        var existing_page_index: u64 = 1;
-        while (existing_page_index < page_count) : (existing_page_index += 1) {
-            const va = first_page_va + existing_page_index * page_size;
-            const paddr = user_vm.lookupUserMappedPaddrForVa(proc, va) orelse break;
-            if (paddr != first_paddr + existing_page_index * page_size) break;
-        } else {
-            return first_paddr + offset;
-        }
-    }
-
-    const page_count_usize: usize = @intCast(page_count);
-    const first_paddr = state.packNativeVmaContiguousMapping(
+    if (!user_vm.lockAddressSpace(proc)) return null;
+    defer user_vm.unlockAddressSpace(proc);
+    if (state.rangeConflictsWithDmaDerivation(
         proc,
         first_page_va,
         page_span,
-        true,
-        free_list,
-        dma_pack_old_paddrs[0..page_count_usize],
-        dma_pack_new_paddrs[0..page_count_usize],
-    ) orelse return null;
-    if ((first_paddr & (page_size - 1)) != 0) return null;
+        except_pinned_object,
+        allow_dma_mapping_aliases,
+    )) {
+        return null;
+    }
 
-    if (!user_vm.mapOrRemapTrustedUserPaddrsWithProt(proc, first_page_va, dma_pack_new_paddrs[0..page_count_usize], .{
-        .read = true,
-        .write = true,
-        .exec = false,
-    })) return null;
-
-    var free_index: usize = 0;
-    while (free_index < page_count_usize) : (free_index += 1) {
-        const old_paddr = dma_pack_old_paddrs[free_index];
-        if (old_paddr != 0 and old_paddr != dma_pack_new_paddrs[free_index]) {
-            free_list.appendPage(0, old_paddr) catch {};
+    const page_count_usize: usize = @intCast(page_count);
+    var first_paddr: u64 = 0;
+    var already_contiguous = true;
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const page_delta, const delta_overflow = @mulWithOverflow(page_index, page_size);
+        if (delta_overflow != 0) return null;
+        const page_va, const va_overflow = @addWithOverflow(first_page_va, page_delta);
+        if (va_overflow != 0) return null;
+        const paddr = resolveDmaPageWithAddressSpaceLocked(
+            state,
+            free_list,
+            proc,
+            page_va,
+            device_writes,
+        ) orelse return null;
+        dma_pack_old_paddrs[@intCast(page_index)] = paddr;
+        if (page_index == 0) {
+            first_paddr = paddr;
+        } else {
+            const expected, const expected_overflow = @addWithOverflow(first_paddr, page_delta);
+            if (expected_overflow != 0 or paddr != expected) already_contiguous = false;
         }
     }
-
-    var page_index: u64 = 1;
-    while (page_index < page_count) : (page_index += 1) {
-        const va = first_page_va + page_index * page_size;
-        const paddr = user_vm.lookupUserMappedPaddrForVa(proc, va) orelse return null;
-        if (paddr != first_paddr + page_index * page_size) return null;
+    if (already_contiguous) {
+        const result, const result_overflow = @addWithOverflow(first_paddr, offset);
+        return if (result_overflow == 0) result else null;
     }
-    return first_paddr + offset;
+
+    // Recover the established anonymous-arena behaviour without applying
+    // physical-identity replacement to COW, shared, shadow, file-backed, or
+    // executable mappings. The state validator is run before and after the
+    // allocation so a stale plan cannot be committed.
+    const initial_plan = blk: {
+        user_vm.lockSharedVmObjects();
+        defer user_vm.unlockSharedVmObjects();
+        break :blk state.prepareNativeVmaDmaPack(
+            proc,
+            first_page_va,
+            page_span,
+            device_writes,
+            dma_pack_old_paddrs[0..page_count_usize],
+        ) orelse return null;
+    };
+    const packed_base = free_list.popContiguousBelow(
+        page_count_usize,
+        kernel.KernelState.low_memory_limit,
+    ) catch return null;
+    var packed_owned = true;
+    defer if (packed_owned) {
+        var release_index: usize = 0;
+        while (release_index < page_count_usize) : (release_index += 1) {
+            free_list.appendPage(
+                0,
+                packed_base + @as(u64, @intCast(release_index)) * page_size,
+            ) catch {};
+        }
+    };
+    for (0..page_count_usize) |index| {
+        const replacement = packed_base + @as(u64, @intCast(index)) * page_size;
+        dma_pack_new_paddrs[index] = replacement;
+    }
+
+    user_vm.lockSharedVmObjects();
+    defer user_vm.unlockSharedVmObjects();
+    const current_plan = state.prepareNativeVmaDmaPack(
+        proc,
+        first_page_va,
+        page_span,
+        device_writes,
+        dma_pack_old_paddrs[0..page_count_usize],
+    ) orelse return null;
+    if (!std.meta.eql(initial_plan, current_plan)) return null;
+
+    if (!user_vm.invalidatePresentUserPaddrsIfCurrent(
+        proc,
+        first_page_va,
+        dma_pack_old_paddrs[0..page_count_usize],
+    )) return null;
+
+    // The TLB shootdown above prevents remote user threads from modifying the
+    // old pages while their contents are copied into the new extent.
+    for (0..page_count_usize) |index| {
+        kernel.KernelState.copyPhysicalPage(
+            dma_pack_new_paddrs[index],
+            dma_pack_old_paddrs[index],
+        );
+    }
+    state.replaceNativeVmoPagesIfCurrent(
+        current_plan.vmo,
+        current_plan.vmo_page_offset,
+        dma_pack_old_paddrs[0..page_count_usize],
+        dma_pack_new_paddrs[0..page_count_usize],
+    ) catch {
+        if (!user_vm.installInvalidatedUserPaddrsWithProt(
+            proc,
+            first_page_va,
+            dma_pack_old_paddrs[0..page_count_usize],
+            current_plan.prot,
+        )) unreachable;
+        return null;
+    };
+    if (!user_vm.installInvalidatedUserPaddrsWithProt(
+        proc,
+        first_page_va,
+        dma_pack_new_paddrs[0..page_count_usize],
+        current_plan.prot,
+    )) {
+        state.replaceNativeVmoPagesIfCurrent(
+            current_plan.vmo,
+            current_plan.vmo_page_offset,
+            dma_pack_new_paddrs[0..page_count_usize],
+            dma_pack_old_paddrs[0..page_count_usize],
+        ) catch unreachable;
+        if (!user_vm.installInvalidatedUserPaddrsWithProt(
+            proc,
+            first_page_va,
+            dma_pack_old_paddrs[0..page_count_usize],
+            current_plan.prot,
+        )) unreachable;
+        return null;
+    }
+
+    for (dma_pack_old_paddrs[0..page_count_usize]) |old_paddr| {
+        free_list.appendPage(0, old_paddr) catch {};
+    }
+    packed_owned = false;
+    const packed_result, const packed_overflow = @addWithOverflow(packed_base, offset);
+    return if (packed_overflow == 0) packed_result else null;
 }
 
 fn installResolvedDmaPage(
@@ -211,22 +326,26 @@ fn resolveDmaPageWithAddressSpaceLocked(
     free_list: *kernel.FreePageList,
     proc: kernel.PrincipalId,
     page_va: u64,
-    write_access: bool,
+    device_writes: bool,
 ) ?u64 {
-    if (write_access) {
-        if (user_copy.resolveNativeVmaCowMappingWithAddressSpaceLocked(
-            state,
-            free_list,
-            proc,
-            page_va,
-            true,
-            false,
-        )) |mapping| {
-            if (!mapping.prot.write) return null;
+    const mode = state.nativeVmaDmaPinMode(proc, page_va, device_writes) orelse return null;
+    switch (mode) {
+        .cow_writable => {
+            const mapping = user_copy.resolveNativeVmaCowMappingWithAddressSpaceLocked(
+                state,
+                free_list,
+                proc,
+                page_va,
+                true,
+                false,
+            ) orelse return null;
+            if (!mapping.prot.read or !mapping.prot.write) return null;
             return installResolvedDmaPage(proc, page_va, mapping);
-        }
+        },
+        .direct_writable, .read_only => {},
     }
 
+    const write_access = mode == .direct_writable;
     // This is required even for an already-present PTE: unlike a bare PTE
     // lookup it validates that the VMA permits the requested DMA access.
     const mapping = user_copy.resolveNativeVmaFaultMappingWithAddressSpaceLocked(
@@ -253,7 +372,8 @@ fn rightsForMmio(parent: kernel.FdRights) kernel.FdRights {
     return .{
         .inspect = parent.inspect,
         .dup = parent.dup,
-        .transfer = parent.transfer,
+        // The payload contains owner-specific virtual-address identity.
+        .transfer = false,
         .close = parent.close,
         .query = parent.query,
         .mmio_map_read = parent.mmio_map_read,
@@ -265,7 +385,8 @@ fn rightsForDma(parent: kernel.FdRights) kernel.FdRights {
     return .{
         .inspect = parent.inspect,
         .dup = parent.dup,
-        .transfer = parent.transfer,
+        // The payload contains owner-specific VA/IOVA identity.
+        .transfer = false,
         .close = parent.close,
         .query = parent.query,
         .derive_dma = parent.derive_dma,
@@ -273,6 +394,31 @@ fn rightsForDma(parent: kernel.FdRights) kernel.FdRights {
         .cpu_write = parent.cpu_write,
         .dma_read = parent.dma_read,
         .dma_write = parent.dma_write,
+    };
+}
+
+fn dmaDirectionRights(direction: kernel.CapsuleDmaDirection) kernel.FdRights {
+    return switch (direction) {
+        // dma_read means the device may read memory; dma_write means it may
+        // write memory.
+        .to_device => .{ .derive_dma = true, .dma_read = true },
+        .from_device => .{ .derive_dma = true, .dma_write = true },
+        .bidirectional => .{ .derive_dma = true, .dma_read = true, .dma_write = true },
+    };
+}
+
+fn rightsForDmaMapping(parent: kernel.FdRights, direction: kernel.CapsuleDmaDirection) kernel.FdRights {
+    return .{
+        .inspect = parent.inspect,
+        .dup = parent.dup,
+        // The payload contains owner-specific VA/IOVA identity.
+        .transfer = false,
+        .close = parent.close,
+        .query = parent.query,
+        .cpu_read = parent.cpu_read,
+        .cpu_write = parent.cpu_write,
+        .dma_read = parent.dma_read and direction != .from_device,
+        .dma_write = parent.dma_write and direction != .to_device,
     };
 }
 
@@ -375,7 +521,9 @@ pub fn dispatch(
             const loc = pci.locationFromResourceId(device.device) orelse break :blk sc.syscall_err_invalid;
             const bar = pci.probeBarInfo(loc, @intCast(bar_index)) orelse break :blk sc.syscall_err_invalid;
             if ((bar.flags & pci.bar_flag_mem) == 0) break :blk sc.syscall_err_invalid;
-            if (!mapPciBarIntoUser(proc, frame.rdx, frame.r10, flags, bar)) break :blk sc.syscall_err_map;
+            if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_map;
+            defer user_vm.unlockVmTransaction(proc);
+            if (!mapPciBarIntoUser(state, proc, frame.rdx, frame.r10, flags, bar)) break :blk sc.syscall_err_map;
             break :blk state.createMmioRegionFd(proc, .{
                 .device = device.device,
                 .bar_index = bar_index,
@@ -383,17 +531,39 @@ pub fn dispatch(
                 .user_va = frame.rdx,
                 .size = frame.r10,
                 .flags = flags,
-            }, rightsForMmio(view.rights), .{}, first_dynamic_fd) catch |err| statusFromKernelError(err);
+            }, rightsForMmio(view.rights), .{}, first_dynamic_fd) catch |err| {
+                // installFd failure already runs the MMIO destructor; object
+                // allocation/validation failure has no destructor yet.  The
+                // encompassing VM transaction makes this idempotent cleanup
+                // race-free in both cases.
+                _ = user_vm.unmapUserLinearRegion(proc, frame.rdx, @intCast(frame.r10));
+                break :blk statusFromKernelError(err);
+            };
         },
         sc.syscall_capsule_derive_dma_buffer => blk: {
             const device_fd: kernel.Fd = @intCast(frame.rdi);
-            const view = state.fdPayloadWithRightsConst(proc, device_fd, deviceRequired(.{ .derive_dma = true })) orelse break :blk sc.syscall_err_invalid;
+            // A buffer FD publishes an IOVA that callers may use in either
+            // direction without another direction-bearing syscall.
+            const view = state.fdPayloadWithRightsConst(proc, device_fd, deviceRequired(.{
+                .derive_dma = true,
+                .dma_read = true,
+                .dma_write = true,
+            })) orelse break :blk sc.syscall_err_invalid;
             const device = switch (view.payload.*) {
                 .device => |dev| dev,
                 else => break :blk sc.syscall_err_invalid,
             };
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(state, h.free_list, proc, frame.rsi, frame.r10) orelse break :blk sc.syscall_err_invalid;
+            const paddr = userDmaAddressForRange(
+                state,
+                h.free_list,
+                proc,
+                frame.rsi,
+                frame.r10,
+                true,
+                null,
+                false,
+            ) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
             break :blk state.createDmaBufferFd(proc, .{
@@ -415,8 +585,20 @@ pub fn dispatch(
                 else => break :blk sc.syscall_err_invalid,
             };
             const direction = parseDmaDirection(frame.r8) orelse break :blk sc.syscall_err_invalid;
+            if (!kernel.isFdRightsSubset(dmaDirectionRights(direction), view.rights)) {
+                break :blk sc.syscall_err_invalid;
+            }
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(state, h.free_list, proc, frame.rsi, frame.r10) orelse break :blk sc.syscall_err_invalid;
+            const paddr = userDmaAddressForRange(
+                state,
+                h.free_list,
+                proc,
+                frame.rsi,
+                frame.r10,
+                direction != .to_device,
+                null,
+                !vtd.isActive(),
+            ) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
             break :blk state.createDmaMappingFd(proc, .{
@@ -426,7 +608,7 @@ pub fn dispatch(
                 .size = frame.r10,
                 .direction = direction,
                 .flags = flags,
-            }, rightsForDma(view.rights), .{}, first_dynamic_fd) catch |err| {
+            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
                 vtd.unmapRange(iova, frame.r10);
                 break :blk statusFromKernelError(err);
             };
@@ -450,6 +632,9 @@ pub fn dispatch(
             const layout = capsule_abi.dmaMappingPagesLayout(frame.rsi, frame.rdx) orelse
                 break :blk sc.syscall_err_invalid;
             const direction = parseDmaDirection(frame.r10) orelse break :blk sc.syscall_err_invalid;
+            if (!kernel.isFdRightsSubset(dmaDirectionRights(direction), view.rights)) {
+                break :blk sc.syscall_err_invalid;
+            }
             if (frame.r8 == 0 or frame.r9 < @as(u64, @intCast(layout.page_count)))
                 break :blk sc.syscall_err_invalid;
             const output_end, const output_overflow = @addWithOverflow(frame.r8, layout.output_size_bytes);
@@ -461,12 +646,9 @@ pub fn dispatch(
             {
                 break :blk sc.syscall_err_invalid;
             }
-            const overlaps = capsule_abi.rangesOverlap(
-                frame.rsi,
-                frame.rdx,
-                frame.r8,
-                layout.output_size_bytes,
-            ) orelse break :blk sc.syscall_err_invalid;
+            const input_page_span: u64 = @as(u64, @intCast(layout.page_count)) * page_size;
+            const overlaps = capsule_abi.dmaMappingPagesOutputOverlapsInput(layout, frame.r8) orelse
+                break :blk sc.syscall_err_invalid;
             if (overlaps) break :blk sc.syscall_err_invalid;
 
             const free_fd_count = state.fdFreeCountFrom(proc, first_dynamic_fd) catch |err|
@@ -475,8 +657,13 @@ pub fn dispatch(
 
             if (!user_vm.lockAddressSpace(proc)) break :blk sc.syscall_err_invalid;
             defer user_vm.unlockAddressSpace(proc);
+            if (state.rangeOverlapsPinnedUserObject(
+                proc,
+                layout.first_page_va,
+                input_page_span,
+            )) break :blk sc.syscall_err_invalid;
 
-            const write_access = direction != .to_device;
+            const device_writes = direction != .to_device;
             var page_addresses: [capsule_abi.dma_mapping_pages_max_pages]u64 = undefined;
             var page_index: usize = 0;
             while (page_index < layout.page_count) : (page_index += 1) {
@@ -488,7 +675,7 @@ pub fn dispatch(
                     h.free_list,
                     proc,
                     page_va,
-                    write_access,
+                    device_writes,
                 ) orelse break :blk sc.syscall_err_invalid;
                 if (page_index == 0) {
                     const first_dma, const dma_overflow = @addWithOverflow(page_paddr, layout.first_page_offset);
@@ -511,7 +698,7 @@ pub fn dispatch(
                 .page_count = @intCast(layout.page_count),
                 .direction = direction,
                 .flags = 0,
-            }, rightsForDma(view.rights), .{}, first_dynamic_fd) catch |err|
+            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err|
                 break :blk statusFromKernelError(err);
 
             const output = std.mem.sliceAsBytes(page_addresses[0..layout.page_count]);
@@ -522,11 +709,25 @@ pub fn dispatch(
             break :blk mapping_fd;
         },
         sc.syscall_capsule_derive_dma_mapping_from_buffer => blk: {
-            const buffer = state.dmaBufferObjectForFd(proc, @intCast(frame.rdi), .{ .derive_dma = true }) orelse break :blk sc.syscall_err_invalid;
+            const buffer_fd: kernel.Fd = @intCast(frame.rdi);
+            const buffer_entry = state.fdEntryConst(proc, buffer_fd) orelse break :blk sc.syscall_err_invalid;
+            const buffer = state.dmaBufferObjectForFd(proc, buffer_fd, .{ .derive_dma = true }) orelse break :blk sc.syscall_err_invalid;
             const direction = parseDmaDirection(frame.r10) orelse break :blk sc.syscall_err_invalid;
+            if (!kernel.isFdRightsSubset(dmaDirectionRights(direction), buffer_entry.rights)) {
+                break :blk sc.syscall_err_invalid;
+            }
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
             if (frame.rdx == 0 or frame.rdx > buffer.size) break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(state, h.free_list, proc, buffer.user_va, frame.rdx) orelse break :blk sc.syscall_err_invalid;
+            const paddr = userDmaAddressForRange(
+                state,
+                h.free_list,
+                proc,
+                buffer.user_va,
+                frame.rdx,
+                direction != .to_device,
+                buffer_entry.object,
+                false,
+            ) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rsi, paddr, frame.rdx) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.rdx)) break :blk sc.syscall_err_map;
             break :blk state.createDmaMappingFd(proc, .{
@@ -536,14 +737,7 @@ pub fn dispatch(
                 .size = frame.rdx,
                 .direction = direction,
                 .flags = flags,
-            }, .{
-                .inspect = true,
-                .transfer = true,
-                .close = true,
-                .query = true,
-                .dma_read = true,
-                .dma_write = true,
-            }, .{}, first_dynamic_fd) catch |err| {
+            }, rightsForDmaMapping(buffer_entry.rights, direction), .{}, first_dynamic_fd) catch |err| {
                 vtd.unmapRange(iova, frame.rdx);
                 break :blk statusFromKernelError(err);
             };

@@ -28,7 +28,43 @@
 #define KOBOXD_FS_STAGE(...) do { if (0) printf(__VA_ARGS__); } while (0)
 #endif
 
+static koboxd_fs_hotpath_profile_t fs_hotpath_profile;
+
+#if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
+static uint64_t fs_profile_tsc(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+#define FS_PROFILE_BEGIN(name) const uint64_t name = fs_profile_tsc()
+#define FS_PROFILE_END(field, name) \
+    (fs_hotpath_profile.field += fs_profile_tsc() - (name))
+#else
+#define FS_PROFILE_BEGIN(name) ((void)0)
+#define FS_PROFILE_END(field, name) ((void)0)
+#endif
+
+void koboxd_fs_hotpath_profile_reset(void)
+{
+    memset(&fs_hotpath_profile, 0, sizeof(fs_hotpath_profile));
+}
+
+void koboxd_fs_hotpath_profile_snapshot(koboxd_fs_hotpath_profile_t *out_profile)
+{
+    if (out_profile != NULL) {
+        *out_profile = fs_hotpath_profile;
+    }
+}
+
 static int fs_release_deferred_unlinked_objects(koboxd_fs_backend_t *backend);
+static int fs_retire_cached_inode(
+    koboxd_fs_backend_t *backend,
+    void *inode,
+    void *dentry);
+static int fs_object_close_native_files(koboxd_fs_object_t *object);
+static int enter_ext4_call(void *function, unsigned long *old_gs);
 
 static uint64_t fs_now_ns(void)
 {
@@ -49,21 +85,9 @@ static uint64_t fs_elapsed_us(uint64_t start_ns, uint64_t end_ns)
 }
 
 enum {
-    KOBOXD_FAKE_FILE_BYTES = 512,
     KOBOXD_FAKE_KIOCB_BYTES = 128,
     KOBOXD_FAKE_IOV_ITER_BYTES = 128,
-    KOBOXD_FAKE_MAPPING_BYTES = 256,
-    KOBOXD_FAKE_DENTRY_BYTES = 512,
-    KOBOXD_FAKE_WRITEBACK_CONTROL_BYTES = 384,
-    KOBOXD_DENTRY_FLAGS_OFFSET = 0x0,
-    KOBOXD_DENTRY_PARENT_OFFSET = 0x18,
-    KOBOXD_DENTRY_NAME_HASH_OFFSET = 0x20,
-    KOBOXD_DENTRY_NAME_LEN_OFFSET = 0x24,
-    KOBOXD_DENTRY_NAME_PTR_OFFSET = 0x28,
     KOBOXD_DENTRY_INODE_OFFSET = 0x30,
-    KOBOXD_DENTRY_SB_OFFSET = 0x68,
-    KOBOXD_DENTRY_NAME_STORAGE_OFFSET = 0x100,
-    KOBOXD_DENTRY_NAME_STORAGE_BYTES = 256,
     KOBOXD_INODE_MODE_OFFSET = 0x0,
     KOBOXD_INODE_OP_OFFSET = 0x20,
     KOBOXD_INODE_SB_OFFSET = 0x28,
@@ -78,61 +102,120 @@ enum {
     KOBOXD_INODE_MTIME_NSEC_OFFSET = 0x74,
     KOBOXD_INODE_CTIME_NSEC_OFFSET = 0x78,
     KOBOXD_INODE_RWSEM_OFFSET = 0x98,
-    KOBOXD_INODE_RWSEM_HELD = 1,
     KOBOXD_INODE_BLOCKS_OFFSET = 0x88,
-    KOBOXD_INODE_IO_LIST_OFFSET = 0xe0,
     KOBOXD_INODE_RDEV_OFFSET = 0x4c,
     KOBOXD_SUPER_BLOCK_FS_INFO_OFFSET = 0x380,
-    KOBOXD_EXT4_SBI_CLUSTER_BITS_OFFSET = 0x54,
-    KOBOXD_EXT4_SBI_SUPER_BUFFER_HEAD_OFFSET = 0x60,
-    KOBOXD_EXT4_SBI_EXT4_SUPER_OFFSET = 0x68,
-    KOBOXD_EXT4_SBI_FREECLUSTERS_COUNTER_OFFSET = 0xe0,
-    KOBOXD_EXT4_SUPER_FREE_BLOCKS_COUNT_LO_OFFSET = 0xc,
-    KOBOXD_EXT4_SUPER_FREE_BLOCKS_COUNT_HI_OFFSET = 0x158,
-    KOBOXD_INODE_EXT4_DISKSIZE_BACK_OFFSET = 0x30,
-    KOBOXD_INODE_EXT4_DATA_SEM_BACK_OFFSET = 0x28,
-    KOBOXD_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET = 0x128,
-    KOBOXD_INODE_EXT4_FC_LIST_BACK_OFFSET = 0x88,
-    KOBOXD_INODE_EXT4_FC_DILIST_BACK_OFFSET = 0x98,
-    KOBOXD_FILE_PATH_DENTRY_OFFSET = 0x18,
-    KOBOXD_FILE_MAPPING_OFFSET = 0x20,
-    KOBOXD_FILE_INODE_OFFSET = 0x28,
+    /* Native Linux 6.12 struct file / file_operations layout. */
+    KOBOXD_NATIVE_FILE_PRIVATE_DATA_OFFSET = 0x20,
+    KOBOXD_NATIVE_FILE_POSITION_OFFSET = 0x70,
+    KOBOXD_FILE_OP_ITERATE_SHARED_OFFSET = 0x40,
+    KOBOXD_FILE_OP_FSYNC_OFFSET = 0x80,
     KOBOXD_KIOCB_FILE_OFFSET = 0x0,
     KOBOXD_KIOCB_POS_OFFSET = 0x8,
     KOBOXD_KIOCB_FLAGS_OFFSET = 0x20,
     KOBOXD_IOV_ITER_COUNT_OFFSET = 0x18,
     KOBOXD_IOV_ITER_BUFFER_OFFSET = 0x20,
     KOBOXD_IOV_ITER_BUFFER_CAPACITY_OFFSET = 0x78,
+    KOBOXD_IOV_ITER_DATA_SOURCE_OFFSET = 0x2,
     KOBOXD_INODE_OP_CREATE_OFFSET = 0x28,
+    KOBOXD_INODE_OP_GET_LINK_OFFSET = 0x08,
     KOBOXD_INODE_OP_UNLINK_OFFSET = 0x38,
     KOBOXD_INODE_OP_SYMLINK_OFFSET = 0x40,
     KOBOXD_INODE_OP_MKDIR_OFFSET = 0x48,
     KOBOXD_INODE_OP_RMDIR_OFFSET = 0x50,
     KOBOXD_INODE_OP_MKNOD_OFFSET = 0x58,
     KOBOXD_INODE_OP_RENAME_OFFSET = 0x60,
-    KOBOXD_WRITEBACK_CONTROL_SYNC_MODE_OFFSET = 0x20,
-    KOBOXD_WRITEBACK_CONTROL_WB_SYNC_ALL = 1,
+    KOBOXD_INODE_OP_GETATTR_OFFSET = 0x70,
+    KOBOXD_IATTR_MODE = 1u << 0,
+    KOBOXD_IATTR_SIZE = 1u << 3,
+    KOBOXD_IATTR_ATIME = 1u << 4,
+    KOBOXD_IATTR_MTIME = 1u << 5,
+    KOBOXD_IATTR_CTIME = 1u << 6,
     KOBOXD_MODE_REGULAR_0644 = 0100000 | 0644,
     KOBOXD_MODE_DIRECTORY_0755 = 0040000 | 0755,
     KOBOXD_MODE_TYPE_MASK = 0170000,
     KOBOXD_MODE_PERM_MASK = 07777,
+    KOBOXD_ERR_NOT_EMPTY = -39,
     KOBOXD_TIME_UPDATE_ATIME = 1u << 0,
     KOBOXD_TIME_UPDATE_MTIME = 1u << 1,
     KOBOXD_OBJECT_DIRTY_METADATA = 1u << 0,
     KOBOXD_OBJECT_DIRTY_DATA = 1u << 1,
-    KOBOXD_EXT4_DIRENT_HEADER_BYTES = 8,
-    KOBOXD_EXT4_DIRENT_READ_CHUNK_BYTES = 4096,
-    KOBOXD_EXT4_DIRENT_SCAN_MAX_BYTES = 4u * 1024u * 1024u,
-    KOBOXD_READDIR_SCAN_MAX_ENTRIES = 128,
+    KOBOXD_STATX_BASIC_STATS = 0x000007ffu,
+    KOBOXD_STATX_BTIME = 0x00000800u,
+    /* Internal page storage only; this is not a directory-size limit. */
+    KOBOXD_READDIR_PAGE_MAX_ENTRIES = 128,
 };
+
+static void fs_inode_write_lock(void *inode)
+{
+    if (inode != NULL) {
+        kb_down_write((uint8_t *)inode + KOBOXD_INODE_RWSEM_OFFSET);
+    }
+}
+
+static void fs_inode_write_unlock(void *inode)
+{
+    if (inode != NULL) {
+        kb_up_write((uint8_t *)inode + KOBOXD_INODE_RWSEM_OFFSET);
+    }
+}
+
+typedef struct fs_inode_lock_set {
+    void *inodes[4];
+    size_t count;
+} fs_inode_lock_set_t;
+
+static void fs_inode_lock_set_add(fs_inode_lock_set_t *set, void *inode)
+{
+    if (set == NULL || inode == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < set->count; ++i) {
+        if (set->inodes[i] == inode) {
+            return;
+        }
+    }
+    if (set->count < sizeof(set->inodes) / sizeof(set->inodes[0])) {
+        set->inodes[set->count++] = inode;
+    }
+}
+
+static void fs_inode_lock_set_acquire(fs_inode_lock_set_t *set)
+{
+    if (set == NULL) {
+        return;
+    }
+    for (size_t i = 1; i < set->count; ++i) {
+        void *inode = set->inodes[i];
+        size_t j = i;
+        while (j != 0 && (uintptr_t)set->inodes[j - 1] > (uintptr_t)inode) {
+            set->inodes[j] = set->inodes[j - 1];
+            --j;
+        }
+        set->inodes[j] = inode;
+    }
+    for (size_t i = 0; i < set->count; ++i) {
+        fs_inode_write_lock(set->inodes[i]);
+    }
+}
+
+static void fs_inode_lock_set_release(const fs_inode_lock_set_t *set)
+{
+    if (set == NULL) {
+        return;
+    }
+    for (size_t i = set->count; i != 0; --i) {
+        fs_inode_write_unlock(set->inodes[i - 1]);
+    }
+}
 
 typedef struct koboxd_ext4_operations {
     void *dir_operations;
     void *file_operations;
     void *dir_inode_operations;
+    void *dir_iterate_shared;
     void *file_read_iter;
     void *file_write_iter;
-    void *file_fsync;
     void *lookup;
     void *create;
     void *unlink;
@@ -141,14 +224,64 @@ typedef struct koboxd_ext4_operations {
     void *rmdir;
     void *mknod;
     void *rename;
-    void *dirty_inode;
-    void *write_inode;
-    void *force_commit;
-    void *truncate_inode;
-    void *superblock_csum_set;
-    void *evict_inode;
+    void *setattr;
     void *inode_is_fast_symlink;
 } koboxd_ext4_operations_t;
+
+typedef struct koboxd_linux_timespec64 {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} koboxd_linux_timespec64_t;
+
+typedef struct koboxd_linux_kstat {
+    uint32_t result_mask;
+    uint16_t mode;
+    uint16_t reserved0;
+    uint32_t nlink;
+    uint32_t blksize;
+    uint64_t attributes;
+    uint64_t attributes_mask;
+    uint64_t ino;
+    uint32_t dev;
+    uint32_t rdev;
+    uint32_t uid;
+    uint32_t gid;
+    int64_t size;
+    koboxd_linux_timespec64_t atime;
+    koboxd_linux_timespec64_t mtime;
+    koboxd_linux_timespec64_t ctime;
+    koboxd_linux_timespec64_t btime;
+    uint64_t blocks;
+    uint64_t mnt_id;
+    uint32_t dio_mem_align;
+    uint32_t dio_offset_align;
+    uint64_t change_cookie;
+} koboxd_linux_kstat_t;
+
+_Static_assert(
+    offsetof(koboxd_linux_kstat_t, btime) == 0x70,
+    "Linux 6.12 struct kstat btime layout");
+_Static_assert(
+    offsetof(koboxd_linux_kstat_t, dio_mem_align) == 0x90,
+    "Linux 6.12 struct kstat DIO layout");
+_Static_assert(
+    sizeof(koboxd_linux_kstat_t) == 0xa0,
+    "Linux 6.12 struct kstat size");
+
+typedef struct koboxd_linux_iattr {
+    uint32_t ia_valid;
+    uint16_t ia_mode;
+    uint16_t reserved0;
+    uint32_t ia_uid;
+    uint32_t ia_gid;
+    int64_t ia_size;
+    koboxd_linux_timespec64_t ia_atime;
+    koboxd_linux_timespec64_t ia_mtime;
+    koboxd_linux_timespec64_t ia_ctime;
+    void *ia_file;
+} koboxd_linux_iattr_t;
+
+_Static_assert(sizeof(koboxd_linux_iattr_t) == 80, "Linux 6.12 struct iattr layout");
 
 typedef enum koboxd_ext4_child_create_kind {
     KOBOXD_EXT4_CREATE_REGULAR,
@@ -162,21 +295,41 @@ typedef struct koboxd_readdir_scan_entry {
 } koboxd_readdir_scan_entry_t;
 
 typedef struct koboxd_readdir_scan {
-    koboxd_readdir_scan_entry_t entries[KOBOXD_READDIR_SCAN_MAX_ENTRIES];
+    koboxd_readdir_scan_entry_t entries[KOBOXD_READDIR_PAGE_MAX_ENTRIES];
+    uint64_t skip;
+    uint64_t visible;
+    size_t capacity;
     size_t count;
-    int overflow;
+    int full;
 } koboxd_readdir_scan_t;
+
+typedef int (*koboxd_dir_actor_fn)(
+    void *context,
+    const char *name,
+    int name_len,
+    int64_t position,
+    uint64_t inode_number,
+    unsigned int d_type);
+
+typedef struct koboxd_native_dir_context {
+    koboxd_dir_actor_fn actor;
+    int64_t position;
+    koboxd_readdir_scan_t *scan;
+} koboxd_native_dir_context_t;
 
 typedef struct koboxd_deferred_release_batch {
     koboxd_fs_object_t *objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
     size_t count;
 } koboxd_deferred_release_batch_t;
 
-static int fs_file_writeback_inode(const koboxd_ext4_operations_t *ops, void *inode, int commit_metadata);
-static int fs_file_fsync(const koboxd_ext4_operations_t *ops, void *inode);
+static int fs_file_fsync(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *object,
+    void *vfsmount);
 static int fs_file_read(
     const koboxd_ext4_operations_t *ops,
-    void *inode,
+    koboxd_fs_object_t *object,
+    void *vfsmount,
     uint64_t offset,
     void *buffer,
     size_t length,
@@ -258,30 +411,6 @@ static uint32_t read_u32_field(const void *base, size_t offset)
     return value;
 }
 
-static void fs_init_list_head_if_zero(void *head)
-{
-    if (head == NULL) {
-        return;
-    }
-    if (read_pointer_field(head, 0) == NULL &&
-        read_pointer_field(head, sizeof(void *)) == NULL)
-    {
-        write_pointer_field(head, 0, head);
-        write_pointer_field(head, sizeof(void *), head);
-    }
-}
-
-static void fs_prepare_fake_inode_lists(void *inode)
-{
-    if (inode == NULL) {
-        return;
-    }
-    /* The fake inode path bypasses inode_init_once() and ext4_fc_init_inode(). */
-    fs_init_list_head_if_zero((uint8_t *)inode + KOBOXD_INODE_IO_LIST_OFFSET);
-    fs_init_list_head_if_zero((uint8_t *)inode - KOBOXD_INODE_EXT4_FC_LIST_BACK_OFFSET);
-    fs_init_list_head_if_zero((uint8_t *)inode - KOBOXD_INODE_EXT4_FC_DILIST_BACK_OFFSET);
-}
-
 static uint32_t fs_encode_linux_dev(uint32_t kernel_dev)
 {
     const uint32_t major = kernel_dev >> 20u;
@@ -310,14 +439,48 @@ static uint64_t read_u64_field(const void *base, size_t offset)
     return value;
 }
 
-static int64_t read_i64_field(const void *base, size_t offset)
+static int fs_getattr_inode(
+    void *inode,
+    void *dentry,
+    koboxd_linux_kstat_t *out_stat)
 {
-    int64_t value = 0;
-    memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
-    return value;
+    if (inode == NULL || out_stat == NULL) {
+        return -22;
+    }
+    memset(out_stat, 0, sizeof(*out_stat));
+    void *inode_operations = read_pointer_field(inode, KOBOXD_INODE_OP_OFFSET);
+    void *getattr_operation = inode_operations == NULL ? NULL :
+        read_pointer_field(
+            inode_operations,
+            KOBOXD_INODE_OP_GETATTR_OFFSET);
+    if (getattr_operation == NULL || dentry == NULL) {
+        kb_fs_subsystem_generic_fillattr(
+            NULL,
+            KOBOXD_STATX_BASIC_STATS | KOBOXD_STATX_BTIME,
+            inode,
+            out_stat);
+        return 0;
+    }
+
+    static uint8_t nop_mnt_idmap[136];
+    void *path[2] = {NULL, dentry};
+    int (*getattr_fn)(void *, const void *, void *, uint32_t, unsigned int) = NULL;
+    memcpy(&getattr_fn, &getattr_operation, sizeof(getattr_fn));
+    unsigned long old_gs = 0;
+    const int has_gs = enter_ext4_call(getattr_operation, &old_gs);
+    const int status = getattr_fn(
+        nop_mnt_idmap,
+        path,
+        out_stat,
+        KOBOXD_STATX_BASIC_STATS | KOBOXD_STATX_BTIME,
+        0);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+    return status;
 }
 
-static void fill_object_from_inode(
+static int fill_object_from_inode(
     koboxd_fs_object_t *object,
     uint64_t object_id,
     uint64_t parent_object_id,
@@ -328,27 +491,30 @@ static void fill_object_from_inode(
     uint64_t last_used)
 {
     if (object == NULL) {
-        return;
+        return -22;
     }
-    fs_prepare_fake_inode_lists(inode);
+    koboxd_linux_kstat_t stat;
+    const int getattr_status = fs_getattr_inode(inode, dentry, &stat);
+    if (getattr_status != 0) {
+        return getattr_status;
+    }
     memset(object, 0, sizeof(*object));
     object->object_id = object_id;
     object->parent_object_id = parent_object_id;
-    object->inode_number = inode != NULL ? read_u64_field(inode, KOBOXD_INODE_NUMBER_OFFSET) : 0;
+    object->inode_number = stat.ino;
     object->inode = inode;
     object->dentry = dentry;
-    object->mode = inode != NULL ? read_u16_field(inode, KOBOXD_INODE_MODE_OFFSET) : 0;
-    object->nlink = inode != NULL ? read_u32_field(inode, KOBOXD_INODE_NLINK_OFFSET) : 0;
-    object->size = inode != NULL ? read_u64_field(inode, KOBOXD_INODE_SIZE_OFFSET) : 0;
-    object->blocks = inode != NULL ? read_u64_field(inode, KOBOXD_INODE_BLOCKS_OFFSET) : 0;
-    object->rdev = inode != NULL ?
-        fs_encode_linux_dev(read_u32_field(inode, KOBOXD_INODE_RDEV_OFFSET)) : 0;
-    object->atime_sec = inode != NULL ? read_i64_field(inode, KOBOXD_INODE_ATIME_SEC_OFFSET) : 0;
-    object->atime_nsec = inode != NULL ? (int64_t)read_u32_field(inode, KOBOXD_INODE_ATIME_NSEC_OFFSET) : 0;
-    object->mtime_sec = inode != NULL ? read_i64_field(inode, KOBOXD_INODE_MTIME_SEC_OFFSET) : 0;
-    object->mtime_nsec = inode != NULL ? (int64_t)read_u32_field(inode, KOBOXD_INODE_MTIME_NSEC_OFFSET) : 0;
-    object->ctime_sec = inode != NULL ? read_i64_field(inode, KOBOXD_INODE_CTIME_SEC_OFFSET) : 0;
-    object->ctime_nsec = inode != NULL ? (int64_t)read_u32_field(inode, KOBOXD_INODE_CTIME_NSEC_OFFSET) : 0;
+    object->mode = stat.mode;
+    object->nlink = stat.nlink;
+    object->size = (uint64_t)stat.size;
+    object->blocks = stat.blocks;
+    object->rdev = fs_encode_linux_dev(stat.rdev);
+    object->atime_sec = stat.atime.tv_sec;
+    object->atime_nsec = stat.atime.tv_nsec;
+    object->mtime_sec = stat.mtime.tv_sec;
+    object->mtime_nsec = stat.mtime.tv_nsec;
+    object->ctime_sec = stat.ctime.tv_sec;
+    object->ctime_nsec = stat.ctime.tv_nsec;
     if (name != NULL) {
         snprintf(object->name, sizeof(object->name), "%s", name);
     }
@@ -356,6 +522,7 @@ static void fill_object_from_inode(
     object->last_used = last_used;
     object->used = 1;
     object->linked = 1;
+    return 0;
 }
 
 static uint64_t fs_object_next_clock(koboxd_fs_backend_t *backend)
@@ -436,7 +603,7 @@ static int fs_object_register(
         for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
             if (!backend->objects[i].used) {
                 const uint64_t object_id = backend->next_object_id++;
-                fill_object_from_inode(
+                const int fill_status = fill_object_from_inode(
                     &backend->objects[i],
                     object_id,
                     parent_object_id,
@@ -445,6 +612,9 @@ static int fs_object_register(
                     name,
                     references,
                     fs_object_next_clock(backend));
+                if (fill_status != 0) {
+                    return fill_status;
+                }
                 *out_object_id = object_id;
                 return 0;
             }
@@ -459,7 +629,7 @@ static int fs_object_register(
         koboxd_fs_object_t *oldest = NULL;
         for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; ++i) {
             koboxd_fs_object_t *candidate = &backend->objects[i];
-            if (!candidate->used || !candidate->linked || candidate->dirty ||
+            if (!candidate->used || !candidate->linked ||
                 candidate->references != 0 || candidate->object_id == 1)
             {
                 continue;
@@ -471,20 +641,46 @@ static int fs_object_register(
         if (oldest == NULL) {
             break;
         }
-        free(oldest->dentry);
-        if (oldest->inode != NULL) {
-            kb_fs_subsystem_free_fake_inode(oldest->inode);
+        const int close_status = fs_object_close_native_files(oldest);
+        if (close_status != 0) {
+            return close_status;
+        }
+        const int retire_status = fs_retire_cached_inode(
+            backend,
+            oldest->inode,
+            oldest->dentry);
+        if (retire_status != 0) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=kobox_cache_evict status=%d object=%llu "
+                "inode=%llu deferred=%u\n",
+                retire_status,
+                (unsigned long long)oldest->object_id,
+                (unsigned long long)oldest->inode_number,
+                backend->deferred_unlinked_count);
+            return retire_status;
         }
         memset(oldest, 0, sizeof(*oldest));
         ++backend->object_evictions;
     }
+    koboxd_fs_object_stats_t stats;
+    koboxd_fs_backend_object_stats(backend, &stats);
+    fprintf(stderr,
+        "FILED_STORAGE_FAULT layer=kobox_object_capacity status=-12 objects=%u "
+        "referenced=%u cached=%u evictions=%llu deferred=%u\n",
+        stats.used,
+        stats.referenced,
+        stats.cached,
+        (unsigned long long)stats.evictions,
+        backend->deferred_unlinked_count);
     return -12;
 }
 
-static void fs_discard_unregistered_lookup(void *inode, void *dentry)
+static int fs_discard_unregistered_lookup(
+    koboxd_fs_backend_t *backend,
+    void *inode,
+    void *dentry)
 {
-    free(dentry);
-    kb_fs_subsystem_free_fake_inode(inode);
+    return fs_retire_cached_inode(backend, inode, dentry);
 }
 
 static void fs_object_unregister(koboxd_fs_backend_t *backend, uint64_t object_id)
@@ -495,24 +691,29 @@ static void fs_object_unregister(koboxd_fs_backend_t *backend, uint64_t object_i
     }
 }
 
-static void fs_object_refresh(koboxd_fs_object_t *object)
+static int fs_object_refresh(koboxd_fs_object_t *object)
 {
+    FS_PROFILE_BEGIN(profile_start);
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint64_t parent_object_id;
     uint64_t last_used;
     uint32_t references;
+    void *native_read_file;
+    void *native_write_file;
     uint8_t linked;
     uint8_t dirty;
     if (object == NULL || !object->used) {
-        return;
+        return -22;
     }
     snprintf(name, sizeof(name), "%s", object->name);
     parent_object_id = object->parent_object_id;
     last_used = object->last_used;
     references = object->references;
+    native_read_file = object->native_read_file;
+    native_write_file = object->native_write_file;
     linked = object->linked;
     dirty = object->dirty;
-    fill_object_from_inode(
+    const int status = fill_object_from_inode(
         object,
         object->object_id,
         parent_object_id,
@@ -521,8 +722,15 @@ static void fs_object_refresh(koboxd_fs_object_t *object)
         name,
         references,
         last_used);
+    if (status != 0) {
+        return status;
+    }
     object->linked = linked;
     object->dirty = dirty;
+    object->native_read_file = native_read_file;
+    object->native_write_file = native_write_file;
+    FS_PROFILE_END(object_refresh_cycles, profile_start);
+    return 0;
 }
 
 static int module_symbol(kb_module_t *module, const char *name, void **out_address)
@@ -547,34 +755,74 @@ static int enter_ext4_call(void *function, unsigned long *old_gs)
     return kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, old_gs) == 0;
 }
 
-static void prepare_named_dentry(
-    void *dentry,
-    void *parent,
-    void *inode,
-    const char *name)
+static int fs_object_ensure_write_file(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *object,
+    void *vfsmount)
 {
-    if (dentry == NULL || name == NULL) {
-        return;
+    if (ops == NULL || object == NULL || vfsmount == NULL) {
+        return -22;
     }
-    memset(dentry, 0, KOBOXD_FAKE_DENTRY_BYTES);
-    size_t name_len = strlen(name);
-    if (name_len >= KOBOXD_DENTRY_NAME_STORAGE_BYTES) {
-        name_len = KOBOXD_DENTRY_NAME_STORAGE_BYTES - 1u;
+    if (object->native_write_file != NULL) {
+        return 0;
     }
-    char *stable_name = (char *)dentry + KOBOXD_DENTRY_NAME_STORAGE_OFFSET;
-    memcpy(stable_name, name, name_len);
-    stable_name[name_len] = '\0';
-    write_u32_field(dentry, KOBOXD_DENTRY_FLAGS_OFFSET, 0);
-    write_pointer_field(dentry, KOBOXD_DENTRY_PARENT_OFFSET, parent == NULL ? dentry : parent);
-    write_u32_field(dentry, KOBOXD_DENTRY_NAME_HASH_OFFSET, 0);
-    write_u32_field(dentry, KOBOXD_DENTRY_NAME_LEN_OFFSET, (uint32_t)name_len);
-    write_pointer_field(dentry, KOBOXD_DENTRY_NAME_PTR_OFFSET, stable_name);
-    if (inode != NULL) {
-        write_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET, inode);
-        write_pointer_field(dentry, KOBOXD_DENTRY_SB_OFFSET, read_pointer_field(inode, KOBOXD_INODE_SB_OFFSET));
-    } else if (parent != NULL) {
-        write_pointer_field(dentry, KOBOXD_DENTRY_SB_OFFSET, read_pointer_field(parent, KOBOXD_DENTRY_SB_OFFSET));
+    void *file = NULL;
+    const int status = kb_fs_subsystem_file_open(
+        vfsmount,
+        object->dentry,
+        KB_FS_FILE_ACCESS_WRITE,
+        &file);
+    if (status != 0) {
+        return status;
     }
+    object->native_write_file = file;
+    return 0;
+}
+
+static int fs_object_ensure_read_file(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *object,
+    void *vfsmount)
+{
+    if (ops == NULL || object == NULL || vfsmount == NULL) {
+        return -22;
+    }
+    if (object->native_read_file != NULL) {
+        return 0;
+    }
+    void *file = NULL;
+    const int status = kb_fs_subsystem_file_open(
+        vfsmount,
+        object->dentry,
+        KB_FS_FILE_ACCESS_READ,
+        &file);
+    if (status != 0) {
+        return status;
+    }
+    object->native_read_file = file;
+    return 0;
+}
+
+static int fs_object_close_native_files(koboxd_fs_object_t *object)
+{
+    if (object == NULL) {
+        return -22;
+    }
+    int status = 0;
+    if (object->native_write_file != NULL) {
+        void *file = object->native_write_file;
+        object->native_write_file = NULL;
+        status = kb_fs_subsystem_file_close(file);
+    }
+    if (object->native_read_file != NULL) {
+        void *file = object->native_read_file;
+        object->native_read_file = NULL;
+        const int read_status = kb_fs_subsystem_file_close(file);
+        if (status == 0) {
+            status = read_status;
+        }
+    }
+    return status;
 }
 
 static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operations_t *out_ops)
@@ -595,14 +843,8 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
         module_symbol(module, "ext4_dir_inode_operations", &out_ops->dir_inode_operations) &&
         module_symbol(module, "ext4_file_read_iter", &out_ops->file_read_iter) &&
         module_symbol(module, "ext4_file_write_iter", &out_ops->file_write_iter) &&
-        module_symbol(module, "ext4_sync_file", &out_ops->file_fsync) &&
         module_symbol(module, "ext4_lookup", &out_ops->lookup) &&
-        module_symbol(module, "ext4_dirty_inode", &out_ops->dirty_inode) &&
-        module_symbol(module, "ext4_write_inode", &out_ops->write_inode) &&
-        module_symbol(module, "ext4_force_commit", &out_ops->force_commit) &&
-        module_symbol(module, "ext4_truncate", &out_ops->truncate_inode) &&
-        module_symbol(module, "ext4_superblock_csum_set", &out_ops->superblock_csum_set) &&
-        module_symbol(module, "ext4_evict_inode", &out_ops->evict_inode) &&
+        module_symbol(module, "ext4_setattr", &out_ops->setattr) &&
         module_symbol(module, "ext4_inode_is_fast_symlink", &out_ops->inode_is_fast_symlink)))
     {
         return 0;
@@ -615,19 +857,42 @@ static int load_ext4_operation_tables(kb_module_t *module, koboxd_ext4_operation
     out_ops->rmdir = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RMDIR_OFFSET);
     out_ops->mknod = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_MKNOD_OFFSET);
     out_ops->rename = read_pointer_field(out_ops->dir_inode_operations, KOBOXD_INODE_OP_RENAME_OFFSET);
-    const int ready = out_ops->create != NULL &&
+    out_ops->dir_iterate_shared = read_pointer_field(
+        out_ops->dir_operations,
+        KOBOXD_FILE_OP_ITERATE_SHARED_OFFSET);
+    const int ready = out_ops->dir_iterate_shared != NULL &&
+        read_pointer_field(out_ops->file_operations, KOBOXD_FILE_OP_FSYNC_OFFSET) != NULL &&
+        out_ops->create != NULL &&
         out_ops->unlink != NULL &&
         out_ops->symlink != NULL &&
         out_ops->mkdir != NULL &&
         out_ops->rmdir != NULL &&
         out_ops->mknod != NULL &&
-        out_ops->rename != NULL;
+        out_ops->rename != NULL &&
+        out_ops->setattr != NULL;
     if (ready) {
         cached_module = module;
         cached_ops = *out_ops;
         cached_ready = 1;
     }
     return ready;
+}
+
+static int fs_retire_cached_inode(
+    koboxd_fs_backend_t *backend,
+    void *inode,
+    void *dentry)
+{
+    if (backend == NULL || inode == NULL) {
+        return -22;
+    }
+    const int dentry_owns_inode = dentry != NULL &&
+        read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET) == inode;
+    kb_fs_subsystem_dput(dentry);
+    if (!dentry_owns_inode) {
+        kb_fs_subsystem_iput(inode);
+    }
+    return 0;
 }
 
 static int fs_ext4_inode_is_fast_symlink(
@@ -648,44 +913,47 @@ static int fs_ext4_inode_is_fast_symlink(
     return is_fast != 0;
 }
 
-static int fs_sync_super_free_blocks(const koboxd_ext4_operations_t *ops, void *super_block)
+static int fs_read_fast_symlink(
+    void *dentry,
+    void *inode,
+    char *out_target,
+    size_t length)
 {
-    (void)ops;
-    if (super_block == NULL) {
+    if (dentry == NULL || inode == NULL || out_target == NULL) {
         return -22;
     }
-    return kb_fs_subsystem_ext4_sync_super_free_blocks(super_block);
-}
-
-static int fs_commit_superblock(const koboxd_ext4_operations_t *ops, void *super_block)
-{
-    if (ops == NULL || ops->force_commit == NULL || super_block == NULL) {
-        return -22;
+    void *inode_ops = read_pointer_field(inode, KOBOXD_INODE_OP_OFFSET);
+    if (inode_ops == NULL) {
+        return -95;
     }
-    int (*force_commit_fn)(void *) = NULL;
-    memcpy(&force_commit_fn, &ops->force_commit, sizeof(force_commit_fn));
+    void *get_link_op = read_pointer_field(inode_ops, KOBOXD_INODE_OP_GET_LINK_OFFSET);
+    if (get_link_op == NULL) {
+        return -95;
+    }
+    const char *(*get_link_fn)(void *, void *, void *) = NULL;
+    memcpy(&get_link_fn, &get_link_op, sizeof(get_link_fn));
+    uint8_t delayed_call[32];
+    memset(delayed_call, 0, sizeof(delayed_call));
     unsigned long old_gs = 0;
-    int has_gs = enter_ext4_call(ops->force_commit, &old_gs);
-    int commit_result = force_commit_fn(super_block);
+    const int has_gs = enter_ext4_call(get_link_op, &old_gs);
+    const char *target = get_link_fn(dentry, inode, delayed_call);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-    if (commit_result != 0) {
-        return commit_result;
+    const uintptr_t value = (uintptr_t)target;
+    if (target == NULL || value >= UINTPTR_MAX - 4095u) {
+        return target == NULL ? -5 : (int)(intptr_t)target;
     }
-    int group_result = kb_fs_subsystem_ext4_sync_group_free_counts(super_block);
-    if (group_result != 0) {
-        return group_result;
-    }
-    int super_result = fs_sync_super_free_blocks(ops, super_block);
-    if (super_result != 0) {
-        return super_result;
-    }
-    int buffer_result = kb_fs_subsystem_flush_dirty_buffers();
-    if (buffer_result != 0) {
-        return buffer_result;
-    }
+    memcpy(out_target, target, length);
     return 0;
+}
+
+static int fs_sync_filesystem(void *super_block)
+{
+    if (super_block == NULL) {
+        return -22;
+    }
+    return kb_fs_subsystem_sync_filesystem(super_block);
 }
 
 static void fs_mark_metadata_dirty(koboxd_fs_backend_t *backend)
@@ -699,6 +967,13 @@ static void fs_mark_object_unlinked(koboxd_fs_backend_t *backend, koboxd_fs_obje
 {
     if (backend == NULL || object == NULL) {
         return;
+    }
+    /* ext4 has already updated i_nlink before returning from unlink/rmdir or
+     * replacement rename.  Keep filed's cached mirror coherent from that
+     * authoritative inode instead of issuing a second ->getattr call. */
+    if (object->inode != NULL) {
+        object->nlink = read_u32_field(
+            object->inode, KOBOXD_INODE_NLINK_OFFSET);
     }
     if (object->linked) {
         object->linked = 0;
@@ -724,24 +999,17 @@ static void fs_mark_object_data_dirty(koboxd_fs_object_t *object)
 static int fs_flush_dirty_object(
     const koboxd_ext4_operations_t *ops,
     koboxd_fs_object_t *object,
-    int commit_metadata)
+    void *vfsmount)
 {
     if (object == NULL || object->inode == NULL) {
         return -22;
     }
-    if ((object->dirty & KOBOXD_OBJECT_DIRTY_DATA) != 0) {
-        const int status = fs_file_fsync(ops, object->inode);
-        if (status != 0) {
-            return status;
-        }
-    }
-    const int status = fs_file_writeback_inode(ops, object->inode, commit_metadata);
+    const int status = fs_file_fsync(ops, object, vfsmount);
     if (status != 0) {
         return status;
     }
     object->dirty = 0;
-    fs_object_refresh(object);
-    return 0;
+    return fs_object_refresh(object);
 }
 
 static uint16_t regular_create_mode(uint16_t mode)
@@ -760,7 +1028,7 @@ static uint16_t directory_create_mode(uint16_t mode)
     return (uint16_t)(0040000u | (mode == 0 ? 0755u : (mode & 07777u)));
 }
 
-static int ext4_lookup_name_at(
+static int ext4_lookup_dentry_at(
     const koboxd_ext4_operations_t *ops,
     void *parent_inode,
     void *parent_dentry,
@@ -776,12 +1044,13 @@ static int ext4_lookup_name_at(
     *out_inode = NULL;
     *out_dentry = NULL;
 
-    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
+    void *dentry = kb_fs_subsystem_d_alloc_name(parent_dentry, name);
     if (dentry == NULL) {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=kobox_lookup_dentry_alloc status=-12 name=%s\n",
+            name);
         return -12;
     }
-
-    prepare_named_dentry(dentry, parent_dentry, NULL, name);
 
     unsigned long old_gs = 0;
     int has_gs = enter_ext4_call(ops->lookup, &old_gs);
@@ -792,13 +1061,42 @@ static int ext4_lookup_name_at(
         kb_shim_leave_kernel_gs(old_gs);
     }
 
-    void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
-    if (inode == NULL) {
-        free(dentry);
+    if ((intptr_t)result < 0 && (intptr_t)result >= -4095) {
+        kb_fs_subsystem_dput(dentry);
+        return (int)(intptr_t)result;
+    }
+    if (result != NULL) {
+        kb_fs_subsystem_dput(dentry);
+        dentry = result;
+    }
+    *out_inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
+    *out_dentry = dentry;
+    return 0;
+}
+
+static int ext4_lookup_name_at(
+    const koboxd_ext4_operations_t *ops,
+    void *parent_inode,
+    void *parent_dentry,
+    const char *name,
+    void **out_inode,
+    void **out_dentry)
+{
+    int status = ext4_lookup_dentry_at(
+        ops,
+        parent_inode,
+        parent_dentry,
+        name,
+        out_inode,
+        out_dentry);
+    if (status != 0) {
+        return status;
+    }
+    if (*out_inode == NULL) {
+        kb_fs_subsystem_dput(*out_dentry);
+        *out_dentry = NULL;
         return -2;
     }
-    *out_inode = inode;
-    *out_dentry = dentry;
     return 0;
 }
 
@@ -817,35 +1115,48 @@ static int fs_get_parent_object(
     return 0;
 }
 
-static int fs_lookup_or_cache_child(
+static int fs_lookup_or_prepare_child(
     koboxd_fs_backend_t *backend,
     const koboxd_ext4_operations_t *ops,
     koboxd_fs_object_t *parent,
     const char *name,
-    koboxd_fs_object_t **out_object)
+    koboxd_fs_object_t **out_object,
+    void **out_negative_dentry)
 {
-    if (backend == NULL || ops == NULL || parent == NULL || name == NULL || out_object == NULL) {
+    if (backend == NULL || ops == NULL || parent == NULL || name == NULL ||
+        out_object == NULL || out_negative_dentry == NULL)
+    {
         return -22;
     }
+    FS_PROFILE_BEGIN(cache_lookup_start);
     *out_object = fs_object_by_parent_name(backend, parent->object_id, name);
+    *out_negative_dentry = NULL;
+    FS_PROFILE_END(cache_lookup_cycles, cache_lookup_start);
     if (*out_object != NULL) {
         return 0;
     }
 
     void *lookup_inode = NULL;
     void *lookup_dentry = NULL;
-    int lookup_status = ext4_lookup_name_at(
+    FS_PROFILE_BEGIN(ext4_lookup_start);
+    int lookup_status = ext4_lookup_dentry_at(
         ops,
         parent->inode,
         parent->dentry,
         name,
         &lookup_inode,
         &lookup_dentry);
-    if (lookup_status != 0 || lookup_inode == NULL || lookup_dentry == NULL) {
-        return lookup_status != 0 ? lookup_status : -2;
+    FS_PROFILE_END(ext4_lookup_cycles, ext4_lookup_start);
+    if (lookup_status != 0 || lookup_dentry == NULL) {
+        return lookup_status != 0 ? lookup_status : -5;
+    }
+    if (lookup_inode == NULL) {
+        *out_negative_dentry = lookup_dentry;
+        return 0;
     }
 
     uint64_t object_id = 0;
+    FS_PROFILE_BEGIN(object_register_start);
     int status = fs_object_register(
         backend,
         parent->object_id,
@@ -854,12 +1165,51 @@ static int fs_lookup_or_cache_child(
         name,
         0,
         &object_id);
+    FS_PROFILE_END(object_register_cycles, object_register_start);
     if (status != 0) {
-        fs_discard_unregistered_lookup(lookup_inode, lookup_dentry);
-        return status;
+        const int discard_status = fs_discard_unregistered_lookup(
+            backend,
+            lookup_inode,
+            lookup_dentry);
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=kobox_lookup_cache status=%d discard=%d "
+            "parent=%llu name=%s\n",
+            status,
+            discard_status,
+            (unsigned long long)parent->object_id,
+            name);
+        return discard_status != 0 ? discard_status : status;
     }
     *out_object = fs_object_by_id(backend, object_id);
     return *out_object != NULL ? 0 : -2;
+}
+
+static int fs_lookup_or_cache_child(
+    koboxd_fs_backend_t *backend,
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *parent,
+    const char *name,
+    koboxd_fs_object_t **out_object)
+{
+    if (out_object == NULL) {
+        return -22;
+    }
+    void *negative_dentry = NULL;
+    int status = fs_lookup_or_prepare_child(
+        backend,
+        ops,
+        parent,
+        name,
+        out_object,
+        &negative_dentry);
+    if (status != 0) {
+        return status;
+    }
+    if (*out_object != NULL) {
+        return 0;
+    }
+    kb_fs_subsystem_dput(negative_dentry);
+    return -2;
 }
 
 static int fs_call_ext4_child_create(
@@ -868,6 +1218,7 @@ static int fs_call_ext4_child_create(
     const char *name,
     uint16_t mode,
     koboxd_ext4_child_create_kind_t kind,
+    void *negative_dentry,
     void **out_inode,
     void **out_dentry)
 {
@@ -879,20 +1230,19 @@ static int fs_call_ext4_child_create(
     *out_inode = NULL;
     *out_dentry = NULL;
 
-    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
+    void *dentry = negative_dentry;
     if (dentry == NULL) {
-        return -12;
+        dentry = kb_fs_subsystem_d_alloc_name(parent->dentry, name);
+        if (dentry == NULL) {
+            return -12;
+        }
     }
-    prepare_named_dentry(dentry, parent->dentry, NULL, name);
 
     static uint8_t mnt_idmap[136];
     unsigned long old_gs = 0;
     int has_gs = 0;
     int result = -22;
-    const int defer_metadata = kind == KOBOXD_EXT4_CREATE_DIRECTORY;
-    if (defer_metadata) {
-        kb_fs_subsystem_begin_deferred_metadata_writes();
-    }
+    fs_inode_write_lock(parent->inode);
     if (kind == KOBOXD_EXT4_CREATE_DIRECTORY) {
         int (*mkdir_fn)(void *, void *, void *, uint16_t) = NULL;
         memcpy(&mkdir_fn, &ops->mkdir, sizeof(mkdir_fn));
@@ -907,16 +1257,10 @@ static int fs_call_ext4_child_create(
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-    if (defer_metadata) {
-        const int flush_status = kb_fs_subsystem_end_deferred_metadata_writes();
-        if (result == 0 && flush_status != 0) {
-            result = flush_status;
-        }
-    }
-
+    fs_inode_write_unlock(parent->inode);
     void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
     if (result != 0 || inode == NULL) {
-        free(dentry);
+        kb_fs_subsystem_dput(dentry);
         return result != 0 ? result : -5;
     }
     *out_inode = inode;
@@ -937,40 +1281,103 @@ static int fs_create_child_object(
         return -22;
     }
     koboxd_fs_object_t *existing = NULL;
-    int lookup_status = fs_lookup_or_cache_child(backend, ops, parent, name, &existing);
-    if (lookup_status == 0) {
-        return -17;
-    }
-    if (lookup_status != -2) {
+    void *negative_dentry = NULL;
+    int lookup_status = fs_lookup_or_prepare_child(
+        backend,
+        ops,
+        parent,
+        name,
+        &existing,
+        &negative_dentry);
+    if (lookup_status != 0) {
+        koboxd_fs_object_stats_t stats;
+        koboxd_fs_backend_object_stats(backend, &stats);
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=ext4_precreate_lookup status=%d "
+            "objects=%u referenced=%u cached=%u evictions=%llu "
+            "parent=%llu name=%s\n",
+            lookup_status,
+            stats.used,
+            stats.referenced,
+            stats.cached,
+            (unsigned long long)stats.evictions,
+            (unsigned long long)parent->object_id,
+            name);
         return lookup_status;
+    }
+    if (existing != NULL) {
+        return -17;
     }
 
     void *inode = NULL;
     void *dentry = NULL;
-    int status = fs_call_ext4_child_create(ops, parent, name, mode, kind, &inode, &dentry);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=create stage=call parent=%llu name=%s\n",
+        (unsigned long long)parent->object_id,
+        name);
+    FS_PROFILE_BEGIN(ext4_create_start);
+    int status = fs_call_ext4_child_create(
+        ops,
+        parent,
+        name,
+        mode,
+        kind,
+        negative_dentry,
+        &inode,
+        &dentry);
+    FS_PROFILE_END(ext4_create_cycles, ext4_create_start);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=create stage=returned parent=%llu name=%s status=%d\n",
+        (unsigned long long)parent->object_id,
+        name,
+        status);
     if (status != 0) {
+        koboxd_fs_object_stats_t stats;
+        koboxd_fs_backend_object_stats(backend, &stats);
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=ext4_create status=%d objects=%u "
+            "referenced=%u cached=%u evictions=%llu parent=%llu name=%s\n",
+            status,
+            stats.used,
+            stats.referenced,
+            stats.cached,
+            (unsigned long long)stats.evictions,
+            (unsigned long long)parent->object_id,
+            name);
         return status;
     }
-    kb_fs_subsystem_invalidate_inode_folios(parent->inode);
+    FS_PROFILE_BEGIN(object_register_start);
     status = fs_object_register(backend, parent->object_id, inode, dentry, name, 1, out_object_id);
+    FS_PROFILE_END(object_register_cycles, object_register_start);
     if (status != 0) {
-        fs_discard_unregistered_lookup(inode, dentry);
-        return status;
+        koboxd_fs_object_stats_t stats;
+        koboxd_fs_backend_object_stats(backend, &stats);
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=kobox_object_register status=%d "
+            "objects=%u referenced=%u cached=%u evictions=%llu "
+            "parent=%llu name=%s\n",
+            status,
+            stats.used,
+            stats.referenced,
+            stats.cached,
+            (unsigned long long)stats.evictions,
+            (unsigned long long)parent->object_id,
+            name);
+        const int discard_status = fs_discard_unregistered_lookup(backend, inode, dentry);
+        return discard_status != 0 ? discard_status : status;
     }
     fs_mark_metadata_dirty(backend);
     return 0;
 }
 
-static uint16_t fs_mode_from_ext4_dirent_type(uint8_t file_type)
+static uint16_t fs_mode_from_linux_d_type(unsigned int d_type)
 {
-    switch (file_type) {
-    case 1: return 0100000u;
-    case 2: return 0040000u;
-    case 3: return 0020000u;
-    case 4: return 0060000u;
-    case 5: return 0010000u;
-    case 6: return 0140000u;
-    case 7: return 0120000u;
+    switch (d_type) {
+    case 1: return 0010000u;
+    case 2: return 0020000u;
+    case 4: return 0040000u;
+    case 6: return 0060000u;
+    case 8: return 0100000u;
+    case 10: return 0120000u;
+    case 12: return 0140000u;
     default: return 0;
     }
 }
@@ -980,7 +1387,7 @@ static int fs_readdir_scan_add(
     const char *name,
     size_t name_len,
     uint64_t inode_number,
-    uint8_t file_type)
+    unsigned int d_type)
 {
     if (scan == NULL || name == NULL || name_len == 0) {
         return 1;
@@ -991,8 +1398,12 @@ static int fs_readdir_scan_add(
         return 1;
     }
 
-    if (scan->count >= KOBOXD_READDIR_SCAN_MAX_ENTRIES) {
-        scan->overflow = 1;
+    if (scan->visible < scan->skip) {
+        scan->visible++;
+        return 1;
+    }
+    if (scan->count >= scan->capacity) {
+        scan->full = 1;
         return 0;
     }
 
@@ -1002,95 +1413,95 @@ static int fs_readdir_scan_add(
     }
     koboxd_readdir_scan_entry_t *entry = &scan->entries[scan->count];
     entry->inode_number = inode_number;
-    entry->mode = fs_mode_from_ext4_dirent_type(file_type);
+    entry->mode = fs_mode_from_linux_d_type(d_type);
     memcpy(entry->name, name, copy_len);
     entry->name[copy_len] = '\0';
     scan->count++;
+    scan->visible++;
+    if (scan->count >= scan->capacity) {
+        scan->full = 1;
+        return 0;
+    }
     return 1;
 }
 
-static int fs_scan_ext4_dirent_block(
-    koboxd_readdir_scan_t *scan,
-    const uint8_t *block,
-    size_t bytes)
+static int fs_native_readdir_actor(
+    void *context,
+    const char *name,
+    int name_len,
+    int64_t position,
+    uint64_t inode_number,
+    unsigned int d_type)
 {
-    size_t offset = 0;
-    while (offset + KOBOXD_EXT4_DIRENT_HEADER_BYTES <= bytes) {
-        const uint32_t ino = read_u32_field(block + offset, 0);
-        const uint16_t rec_len = read_u16_field(block + offset, 4);
-        const uint8_t name_len = block[offset + 6];
-        const uint8_t file_type = block[offset + 7];
-        if (rec_len < KOBOXD_EXT4_DIRENT_HEADER_BYTES ||
-            offset + rec_len > bytes)
-        {
-            return -5;
-        }
-        if (ino != 0 && name_len > 0 &&
-            (size_t)name_len <= rec_len - KOBOXD_EXT4_DIRENT_HEADER_BYTES)
-        {
-            if (!fs_readdir_scan_add(
-                    scan,
-                    (const char *)block + offset + KOBOXD_EXT4_DIRENT_HEADER_BYTES,
-                    name_len,
-                    ino,
-                    file_type))
-            {
-                return scan->overflow ? -12 : 0;
-            }
-        }
-        offset += rec_len;
+    (void)position;
+    koboxd_native_dir_context_t *dir_context =
+        (koboxd_native_dir_context_t *)context;
+    if (dir_context == NULL || dir_context->scan == NULL || name_len < 0) {
+        return 0;
     }
-    return 0;
+    return fs_readdir_scan_add(
+        dir_context->scan,
+        name,
+        (size_t)name_len,
+        inode_number,
+        d_type);
 }
 
-static int fs_scan_ext4_dir_names(
+static int fs_read_ext4_dir_native(
     const koboxd_ext4_operations_t *ops,
     koboxd_fs_object_t *dir,
+    void *vfsmount,
+    uint64_t offset,
+    size_t capacity,
     koboxd_readdir_scan_t *scan)
 {
-    if (ops == NULL || dir == NULL || dir->inode == NULL || scan == NULL) {
+    if (ops == NULL || dir == NULL || dir->inode == NULL ||
+        vfsmount == NULL || scan == NULL)
+    {
         return -22;
     }
 
     memset(scan, 0, sizeof(*scan));
-
-    /*
-     * Directory entries are ext4 state; the object table is only filed's
-     * capability/cache view.  Read the directory file through the same stable
-     * page-cache path used for normal file I/O and parse ext4_dir_entry_2
-     * records, instead of calling ext4_readdir with an incomplete fake file.
-     */
-    uint64_t size = read_u64_field(dir->inode, KOBOXD_INODE_SIZE_OFFSET);
-    if (size == 0) {
+    if (capacity > KOBOXD_READDIR_PAGE_MAX_ENTRIES) {
+        return -22;
+    }
+    scan->skip = offset;
+    scan->capacity = capacity;
+    if (capacity == 0) {
         return 0;
     }
-    if (size > KOBOXD_EXT4_DIRENT_SCAN_MAX_BYTES) {
-        return -75;
+
+    if (ops->dir_iterate_shared == NULL) {
+        return -5;
     }
 
-    uint8_t block[KOBOXD_EXT4_DIRENT_READ_CHUNK_BYTES];
-    for (uint64_t offset = 0; offset < size; offset += sizeof(block)) {
-        size_t request = sizeof(block);
-        if (request > size - offset) {
-            request = (size_t)(size - offset);
-        }
-        memset(block, 0, sizeof(block));
-        int got = fs_file_read(ops, dir->inode, offset, block, request, sizeof(block));
-        if (got < 0) {
-            return got;
-        }
-        if (got == 0) {
-            break;
-        }
-        int status = fs_scan_ext4_dirent_block(scan, block, (size_t)got);
-        if (status != 0) {
-            return status;
-        }
-        if ((size_t)got < request) {
-            break;
-        }
+    void *file = NULL;
+    int (*iterate_fn)(void *, void *) = NULL;
+    memcpy(&iterate_fn, &ops->dir_iterate_shared, sizeof(iterate_fn));
+    int result = kb_fs_subsystem_file_open(
+        vfsmount,
+        dir->dentry,
+        KB_FS_FILE_ACCESS_READ,
+        &file);
+    if (result != 0) {
+        return result;
     }
-    return scan->overflow ? -12 : 0;
+    write_u64_field(file, KOBOXD_NATIVE_FILE_POSITION_OFFSET, 0);
+
+    koboxd_native_dir_context_t context = {
+        .actor = fs_native_readdir_actor,
+        .position = 0,
+        .scan = scan,
+    };
+    unsigned long old_gs = 0;
+    int has_gs = enter_ext4_call(ops->dir_iterate_shared, &old_gs);
+    result = iterate_fn(file, &context);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+
+    const int release_result = kb_fs_subsystem_file_close(file);
+    return result != 0 ? result : release_result;
 }
 
 static int fs_scanned_dirent_to_object(
@@ -1133,274 +1544,184 @@ static int fs_scanned_dirent_to_object(
         }
         out_object->inode_number = read_u64_field(inode, KOBOXD_INODE_NUMBER_OFFSET);
         out_object->mode = read_u16_field(inode, KOBOXD_INODE_MODE_OFFSET);
-        fs_discard_unregistered_lookup(inode, dentry);
+        const int discard_status = fs_discard_unregistered_lookup(backend, inode, dentry);
+        if (discard_status != 0) {
+            return discard_status;
+        }
     }
     return 0;
 }
 
 static int fs_file_read(
     const koboxd_ext4_operations_t *ops,
-    void *inode,
+    koboxd_fs_object_t *object,
+    void *vfsmount,
     uint64_t offset,
     void *buffer,
     size_t length,
     size_t buffer_capacity)
 {
-    (void)ops;
-    if (inode == NULL || buffer == NULL) {
+    if (ops == NULL || ops->file_read_iter == NULL ||
+        object == NULL || object->inode == NULL || object->dentry == NULL ||
+        vfsmount == NULL ||
+        buffer == NULL || length > buffer_capacity)
+    {
         return -22;
     }
-    uint8_t file[KOBOXD_FAKE_FILE_BYTES];
     uint8_t kiocb[KOBOXD_FAKE_KIOCB_BYTES];
     uint8_t iter[KOBOXD_FAKE_IOV_ITER_BYTES];
-    void *mapping = read_pointer_field(inode, KOBOXD_INODE_MAPPING_OFFSET);
+    void *mapping = read_pointer_field(object->inode, KOBOXD_INODE_MAPPING_OFFSET);
     if (mapping == NULL) {
         return -12;
     }
-    memset(file, 0, sizeof(file));
     memset(kiocb, 0, sizeof(kiocb));
     memset(iter, 0, sizeof(iter));
-
-    write_pointer_field(file, KOBOXD_FILE_MAPPING_OFFSET, mapping);
-    write_pointer_field(file, KOBOXD_FILE_INODE_OFFSET, inode);
+    int status = fs_object_ensure_read_file(ops, object, vfsmount);
+    if (status != 0) {
+        return status;
+    }
+    void *file = object->native_read_file;
     write_pointer_field(kiocb, KOBOXD_KIOCB_FILE_OFFSET, file);
     write_u64_field(kiocb, KOBOXD_KIOCB_POS_OFFSET, offset);
     write_u64_field(iter, KOBOXD_IOV_ITER_COUNT_OFFSET, (uint64_t)length);
     write_pointer_field(iter, KOBOXD_IOV_ITER_BUFFER_OFFSET, buffer);
     write_u64_field(iter, KOBOXD_IOV_ITER_BUFFER_CAPACITY_OFFSET, (uint64_t)buffer_capacity);
 
-    long result = kb_fs_subsystem_generic_file_read_iter(kiocb, iter);
-    return result >= 0 ? (int)result : (int)result;
+    long (*read_iter_fn)(void *, void *) = NULL;
+    memcpy(&read_iter_fn, &ops->file_read_iter, sizeof(read_iter_fn));
+    unsigned long old_gs = 0;
+    int has_gs = enter_ext4_call(ops->file_read_iter, &old_gs);
+    long result = read_iter_fn(kiocb, iter);
+    if (has_gs) {
+        kb_shim_leave_kernel_gs(old_gs);
+    }
+    return (int)result;
 }
 
 static int fs_file_write(
     const koboxd_ext4_operations_t *ops,
-    void *inode,
+    koboxd_fs_object_t *object,
+    void *vfsmount,
     uint64_t offset,
     const void *buffer,
     size_t length)
 {
-    if (ops == NULL || ops->file_write_iter == NULL || inode == NULL || buffer == NULL) {
+    if (ops == NULL || ops->file_write_iter == NULL ||
+        object == NULL || object->inode == NULL || object->dentry == NULL ||
+        vfsmount == NULL ||
+        buffer == NULL)
+    {
         return -22;
     }
-    uint8_t file[KOBOXD_FAKE_FILE_BYTES];
     uint8_t kiocb[KOBOXD_FAKE_KIOCB_BYTES];
     uint8_t iter[KOBOXD_FAKE_IOV_ITER_BYTES];
-    uint8_t dentry[KOBOXD_FAKE_DENTRY_BYTES];
-    void *mapping = read_pointer_field(inode, KOBOXD_INODE_MAPPING_OFFSET);
+    void *mapping = read_pointer_field(object->inode, KOBOXD_INODE_MAPPING_OFFSET);
     if (mapping == NULL) {
         return -12;
     }
-    memset(file, 0, sizeof(file));
     memset(kiocb, 0, sizeof(kiocb));
     memset(iter, 0, sizeof(iter));
-    memset(dentry, 0, sizeof(dentry));
-
-    write_pointer_field(dentry, 0, inode);
-    write_pointer_field(file, KOBOXD_FILE_PATH_DENTRY_OFFSET, dentry);
-    write_pointer_field(file, KOBOXD_FILE_MAPPING_OFFSET, mapping);
-    write_pointer_field(file, KOBOXD_FILE_INODE_OFFSET, inode);
+    int status = fs_object_ensure_write_file(ops, object, vfsmount);
+    if (status != 0) {
+        return status;
+    }
+    void *file = object->native_write_file;
     write_pointer_field(kiocb, KOBOXD_KIOCB_FILE_OFFSET, file);
     write_u64_field(kiocb, KOBOXD_KIOCB_POS_OFFSET, offset);
     write_u64_field(iter, KOBOXD_IOV_ITER_COUNT_OFFSET, (uint64_t)length);
     write_pointer_field(iter, KOBOXD_IOV_ITER_BUFFER_OFFSET, (void *)(uintptr_t)buffer);
     write_u64_field(iter, KOBOXD_IOV_ITER_BUFFER_CAPACITY_OFFSET, (uint64_t)length);
+    iter[KOBOXD_IOV_ITER_DATA_SOURCE_OFFSET] = 1;
 
-    unsigned long old_gs = 0;
-    unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_write_iter);
-    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
     long (*write_iter_fn)(void *, void *) = NULL;
     memcpy(&write_iter_fn, &ops->file_write_iter, sizeof(write_iter_fn));
+    unsigned long old_gs = 0;
+    int has_gs = enter_ext4_call(ops->file_write_iter, &old_gs);
     long result = write_iter_fn(kiocb, iter);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-
-    return result >= 0 ? (int)result : (int)result;
+    return (int)result;
 }
 
-static int fs_file_writeback_inode(const koboxd_ext4_operations_t *ops, void *inode, int commit_metadata)
+static int fs_file_fsync(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *object,
+    void *vfsmount)
 {
-    if (ops == NULL || inode == NULL ||
-        ops->dirty_inode == NULL ||
-        ops->write_inode == NULL ||
-        (commit_metadata && ops->force_commit == NULL))
+    if (ops == NULL || ops->file_operations == NULL ||
+        object == NULL || object->inode == NULL || object->dentry == NULL ||
+        vfsmount == NULL)
     {
         return -22;
     }
-
-    void *super_block = read_pointer_field(inode, KOBOXD_INODE_SB_OFFSET);
-    if (commit_metadata && super_block == NULL) {
-        return -22;
-    }
-
-    uint8_t writeback_control[KOBOXD_FAKE_WRITEBACK_CONTROL_BYTES];
-    memset(writeback_control, 0, sizeof(writeback_control));
-    write_u32_field(
-        writeback_control,
-        KOBOXD_WRITEBACK_CONTROL_SYNC_MODE_OFFSET,
-        KOBOXD_WRITEBACK_CONTROL_WB_SYNC_ALL);
-
-    void (*dirty_inode_fn)(void *, int) = NULL;
-    int (*write_inode_fn)(void *, void *) = NULL;
-    int (*force_commit_fn)(void *) = NULL;
-    memcpy(&dirty_inode_fn, &ops->dirty_inode, sizeof(dirty_inode_fn));
-    memcpy(&write_inode_fn, &ops->write_inode, sizeof(write_inode_fn));
-    if (commit_metadata) {
-        memcpy(&force_commit_fn, &ops->force_commit, sizeof(force_commit_fn));
-    }
-
-    unsigned long old_gs = 0;
-    int has_gs = enter_ext4_call(ops->dirty_inode, &old_gs);
-    dirty_inode_fn(inode, 0);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
-
-    old_gs = 0;
-    has_gs = enter_ext4_call(ops->write_inode, &old_gs);
-    int write_result = write_inode_fn(inode, writeback_control);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
-    if (write_result != 0) {
-        return write_result;
-    }
-    if (!commit_metadata) {
-        return 0;
-    }
-
-    old_gs = 0;
-    has_gs = enter_ext4_call(ops->force_commit, &old_gs);
-    int commit_result = force_commit_fn(super_block);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
-    if (commit_result != 0) {
-        return commit_result;
-    }
-    int group_result = kb_fs_subsystem_ext4_sync_group_free_counts(super_block);
-    if (group_result != 0) {
-        return group_result;
-    }
-    int buffer_result = kb_fs_subsystem_flush_dirty_buffers();
-    if (buffer_result != 0) {
-        return buffer_result;
-    }
-    return fs_sync_super_free_blocks(ops, super_block);
-}
-
-static int fs_file_fsync(const koboxd_ext4_operations_t *ops, void *inode)
-{
-    if (ops == NULL || ops->file_fsync == NULL || inode == NULL) {
-        return -22;
-    }
-    void *file = calloc(1, KOBOXD_FAKE_FILE_BYTES);
-    void *mapping = read_pointer_field(inode, KOBOXD_INODE_MAPPING_OFFSET);
-    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
-    if (file == NULL || mapping == NULL || dentry == NULL) {
-        free(dentry);
-        free(file);
+    void *mapping = read_pointer_field(object->inode, KOBOXD_INODE_MAPPING_OFFSET);
+    if (mapping == NULL) {
         return -12;
     }
-
-    write_pointer_field(dentry, 0, inode);
-    write_pointer_field(file, KOBOXD_FILE_PATH_DENTRY_OFFSET, dentry);
-    write_pointer_field(file, KOBOXD_FILE_MAPPING_OFFSET, mapping);
-    write_pointer_field(file, KOBOXD_FILE_INODE_OFFSET, inode);
-
-    unsigned long old_gs = 0;
-    unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_fsync);
-    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
-    int (*fsync_fn)(void *, int64_t, int64_t, int) = NULL;
-    memcpy(&fsync_fn, &ops->file_fsync, sizeof(fsync_fn));
-    int result = fsync_fn(file, 0, INT64_MAX, 0);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
+    int status = fs_object_ensure_write_file(ops, object, vfsmount);
+    if (status != 0) {
+        return status;
     }
-
-    free(dentry);
-    free(file);
-    return result;
+    void *file = object->native_write_file;
+    status = kb_fs_subsystem_vfs_fsync_range(file, 0, INT64_MAX, 0);
+    return status;
 }
 
-static int fs_file_truncate(const koboxd_ext4_operations_t *ops, void *inode, uint64_t size)
+static int fs_file_setattr(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *object,
+    const koboxd_linux_iattr_t *iattr)
 {
-    if (ops == NULL || inode == NULL ||
-        ops->dirty_inode == NULL ||
-        ops->write_inode == NULL ||
-        ops->force_commit == NULL ||
-        ops->truncate_inode == NULL)
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=setattr stage=enter object=%llu valid=0x%x\n",
+        object != NULL ? (unsigned long long)object->object_id : 0ull,
+        iattr != NULL ? iattr->ia_valid : 0u);
+    if (ops == NULL || ops->setattr == NULL ||
+        object == NULL || object->inode == NULL || object->dentry == NULL || iattr == NULL)
     {
         return -22;
     }
-    write_u64_field(inode, KOBOXD_INODE_SIZE_OFFSET, size);
-    write_u64_field((uint8_t *)inode - KOBOXD_INODE_EXT4_DISKSIZE_BACK_OFFSET, 0, size);
-
-    uint64_t saved_rwsem = 0;
-    uint64_t saved_data_sem = 0;
-    memcpy(&saved_rwsem, (const uint8_t *)inode + KOBOXD_INODE_RWSEM_OFFSET, sizeof(saved_rwsem));
-    memcpy(&saved_data_sem, (const uint8_t *)inode - KOBOXD_INODE_EXT4_DATA_SEM_BACK_OFFSET, sizeof(saved_data_sem));
-    write_u64_field(inode, KOBOXD_INODE_RWSEM_OFFSET, KOBOXD_INODE_RWSEM_HELD);
-    write_u64_field((uint8_t *)inode - KOBOXD_INODE_EXT4_DATA_SEM_BACK_OFFSET, 0, KOBOXD_INODE_RWSEM_HELD);
-
-    int (*truncate_fn)(void *) = NULL;
-    memcpy(&truncate_fn, &ops->truncate_inode, sizeof(truncate_fn));
+    static uint8_t mnt_idmap[136];
+    int (*setattr_fn)(void *, void *, void *) = NULL;
+    memcpy(&setattr_fn, &ops->setattr, sizeof(setattr_fn));
+    fs_inode_write_lock(object->inode);
     unsigned long old_gs = 0;
-    int has_gs = enter_ext4_call(ops->truncate_inode, &old_gs);
-    int truncate_result = truncate_fn(inode);
+    int has_gs = enter_ext4_call(ops->setattr, &old_gs);
+    int status = setattr_fn(mnt_idmap, object->dentry, (void *)(uintptr_t)iattr);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=setattr stage=returned object=%llu status=%d\n",
+        (unsigned long long)object->object_id,
+        status);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
-
-    write_u64_field(inode, KOBOXD_INODE_RWSEM_OFFSET, saved_rwsem);
-    write_u64_field((uint8_t *)inode - KOBOXD_INODE_EXT4_DATA_SEM_BACK_OFFSET, 0, saved_data_sem);
-    if (truncate_result != 0) {
-        return truncate_result;
-    }
-    return fs_file_writeback_inode(ops, inode, 1);
+    fs_inode_write_unlock(object->inode);
+    return status;
 }
 
-static int fs_file_update_metadata(
-    void *inode,
-    uint32_t time_mask,
-    uint16_t mode,
-    int update_mode,
-    int64_t atime_sec,
-    int64_t atime_nsec,
-    int64_t mtime_sec,
-    int64_t mtime_nsec)
+static int fs_file_truncate(
+    const koboxd_ext4_operations_t *ops,
+    koboxd_fs_object_t *object,
+    void *vfsmount,
+    uint64_t size)
 {
-    if (inode == NULL) {
+    if (ops == NULL || object == NULL || vfsmount == NULL || size > INT64_MAX) {
         return -22;
     }
-    if ((time_mask & ~((uint32_t)KOBOXD_TIME_UPDATE_ATIME | (uint32_t)KOBOXD_TIME_UPDATE_MTIME)) != 0) {
-        return -22;
+    /* Linux ftruncate operates on an already opened writable struct file.
+     * ext4_file_open() attaches EXT4_I(inode)->jinode, which ordered-data
+     * growth and partial-page zeroing later pass to JBD2.  Calling
+     * ext4_setattr() directly after an inode-cache reload skips that required
+     * lifecycle and hands JBD2 a NULL jinode. */
+    const int open_status = fs_object_ensure_write_file(ops, object, vfsmount);
+    if (open_status != 0) {
+        return open_status;
     }
-    if (atime_nsec < 0 || atime_nsec >= 1000000000ll ||
-        mtime_nsec < 0 || mtime_nsec >= 1000000000ll)
-    {
-        return -22;
-    }
-    if (update_mode) {
-        const uint16_t old_mode = read_u16_field(inode, KOBOXD_INODE_MODE_OFFSET);
-        const uint16_t new_mode = (uint16_t)((old_mode & KOBOXD_MODE_TYPE_MASK) | (mode & KOBOXD_MODE_PERM_MASK));
-        memcpy((uint8_t *)inode + KOBOXD_INODE_MODE_OFFSET, &new_mode, sizeof(new_mode));
-    }
-    if ((time_mask & KOBOXD_TIME_UPDATE_ATIME) != 0) {
-        write_u64_field(inode, KOBOXD_INODE_ATIME_SEC_OFFSET, (uint64_t)atime_sec);
-        write_u32_field(inode, KOBOXD_INODE_ATIME_NSEC_OFFSET, (uint32_t)atime_nsec);
-    }
-    if ((time_mask & KOBOXD_TIME_UPDATE_MTIME) != 0) {
-        write_u64_field(inode, KOBOXD_INODE_MTIME_SEC_OFFSET, (uint64_t)mtime_sec);
-        write_u32_field(inode, KOBOXD_INODE_MTIME_NSEC_OFFSET, (uint32_t)mtime_nsec);
-        write_u64_field(inode, KOBOXD_INODE_CTIME_SEC_OFFSET, (uint64_t)mtime_sec);
-        write_u32_field(inode, KOBOXD_INODE_CTIME_NSEC_OFFSET, (uint32_t)mtime_nsec);
-    } else if ((time_mask & KOBOXD_TIME_UPDATE_ATIME) != 0) {
-        write_u64_field(inode, KOBOXD_INODE_CTIME_SEC_OFFSET, (uint64_t)atime_sec);
-        write_u32_field(inode, KOBOXD_INODE_CTIME_NSEC_OFFSET, (uint32_t)atime_nsec);
-    }
-    return 0;
+    koboxd_linux_iattr_t iattr;
+    memset(&iattr, 0, sizeof(iattr));
+    iattr.ia_valid = KOBOXD_IATTR_SIZE;
+    iattr.ia_size = (int64_t)size;
+    iattr.ia_file = object->native_write_file;
+    return fs_file_setattr(ops, object, &iattr);
 }
 
 int koboxd_fs_backend_mount_ext4(
@@ -1421,14 +1742,10 @@ int koboxd_fs_backend_mount_ext4(
     if (backend->mount_result.fill_super_result != 0 || backend->mount_result.observed_ext4_magic != 0xef53u) {
         return -5;
     }
-    status = kb_fs_subsystem_ext4_sync_group_free_counts(backend->mount_result.super_block);
-    if (status != 0) {
-        return status;
-    }
     printf("[filed-storage] rootfs mounted fs=ext4 reads=%u\n", backend->mount_result.block_read_count);
     backend->ext4_module = ext4_module;
     backend->next_object_id = 2;
-    fill_object_from_inode(
+    status = fill_object_from_inode(
         &backend->objects[0],
         1,
         1,
@@ -1437,6 +1754,9 @@ int koboxd_fs_backend_mount_ext4(
         "/",
         1,
         fs_object_next_clock(backend));
+    if (status != 0) {
+        return status;
+    }
     backend->mounted = 1;
     return 0;
 }
@@ -1476,7 +1796,27 @@ int koboxd_fs_backend_lookup(
     if (status != 0) {
         return status;
     }
-    return fs_object_register(backend, parent_object_id, inode, dentry, name, 1, out_object_id);
+    status = fs_object_register(backend, parent_object_id, inode, dentry, name, 1, out_object_id);
+    if (status != 0) {
+        koboxd_fs_object_stats_t stats;
+        koboxd_fs_backend_object_stats(backend, &stats);
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=kobox_lookup_register status=%d "
+            "objects=%u referenced=%u cached=%u evictions=%llu "
+            "parent=%llu name=%s\n",
+            status,
+            stats.used,
+            stats.referenced,
+            stats.cached,
+            (unsigned long long)stats.evictions,
+            (unsigned long long)parent_object_id,
+            name);
+        const int discard_status = fs_discard_unregistered_lookup(backend, inode, dentry);
+        if (discard_status != 0) {
+            return discard_status;
+        }
+    }
+    return status;
 }
 
 int koboxd_fs_backend_readlink(
@@ -1511,16 +1851,22 @@ int koboxd_fs_backend_readlink(
         return 0;
     }
     if (fs_ext4_inode_is_fast_symlink(&ops, object->inode)) {
-        const void *inline_target =
-            (const uint8_t *)object->inode - KOBOXD_INODE_EXT4_DIRECT_BLOCK0_BACK_OFFSET;
-        memcpy(out_target, inline_target, length);
+        const int status = fs_read_fast_symlink(
+            object->dentry,
+            object->inode,
+            out_target,
+            length);
+        if (status != 0) {
+            return status;
+        }
         *out_length = length;
         return 0;
     }
 
     const int read_result = fs_file_read(
         &ops,
-        object->inode,
+        object,
+        backend->mount_result.root_vfsmount,
         0,
         out_target,
         length,
@@ -1551,31 +1897,31 @@ int koboxd_fs_backend_symlink(
     koboxd_ext4_operations_t ops;
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) return -5;
     koboxd_fs_object_t *existing = NULL;
-    status = fs_lookup_or_cache_child(backend, &ops, parent, name, &existing);
-    if (status == 0) return -17;
-    if (status != -2) return status;
-    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
-    if (dentry == NULL) return -12;
-    prepare_named_dentry(dentry, parent->dentry, NULL, name);
+    void *dentry = NULL;
+    status = fs_lookup_or_prepare_child(
+        backend, &ops, parent, name, &existing, &dentry);
+    if (status != 0) return status;
+    if (existing != NULL) return -17;
 
     static uint8_t mnt_idmap[136];
     int (*symlink_fn)(void *, void *, void *, const char *) = NULL;
     memcpy(&symlink_fn, &ops.symlink, sizeof(symlink_fn));
+    fs_inode_write_lock(parent->inode);
     unsigned long old_gs = 0;
     const int has_gs = enter_ext4_call(ops.symlink, &old_gs);
     status = symlink_fn(mnt_idmap, parent->inode, dentry, target);
     if (has_gs) kb_shim_leave_kernel_gs(old_gs);
+    fs_inode_write_unlock(parent->inode);
     void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
     if (status != 0 || inode == NULL) {
-        free(dentry);
+        kb_fs_subsystem_dput(dentry);
         return status != 0 ? status : -5;
     }
-    kb_fs_subsystem_invalidate_inode_folios(parent->inode);
     status = fs_object_register(
         backend, parent->object_id, inode, dentry, name, 1, out_object_id);
     if (status != 0) {
-        fs_discard_unregistered_lookup(inode, dentry);
-        return status;
+        const int discard_status = fs_discard_unregistered_lookup(backend, inode, dentry);
+        return discard_status != 0 ? discard_status : status;
     }
     fs_mark_metadata_dirty(backend);
     return 0;
@@ -1613,6 +1959,21 @@ int koboxd_fs_backend_create(
         mode,
         KOBOXD_EXT4_CREATE_REGULAR,
         out_object_id);
+    if (create_status != 0) {
+        koboxd_fs_object_stats_t stats;
+        koboxd_fs_backend_object_stats(backend, &stats);
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=kobox_create_return status=%d "
+            "objects=%u referenced=%u cached=%u evictions=%llu "
+            "parent=%llu name=%s\n",
+            create_status,
+            stats.used,
+            stats.referenced,
+            stats.cached,
+            (unsigned long long)stats.evictions,
+            (unsigned long long)parent_object_id,
+            name);
+    }
     KOBOXD_FS_TRACE("[koboxd-fs-trace] create done status=%d object=%llu\n",
         create_status,
         (unsigned long long)*out_object_id);
@@ -1635,9 +1996,14 @@ int koboxd_fs_backend_truncate(
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    int status = fs_file_truncate(&ops, object->inode, size);
+    int status = fs_file_truncate(
+        &ops,
+        object,
+        backend->mount_result.root_vfsmount,
+        size);
     if (status == 0) {
-        fs_object_refresh(object);
+        fs_mark_object_metadata_dirty(backend, object);
+        status = fs_object_refresh(object);
     }
     return status;
 }
@@ -1658,18 +2024,30 @@ int koboxd_fs_backend_utimens(
     if (object == NULL || object->inode == NULL) {
         return -2;
     }
-    int status = fs_file_update_metadata(
-        object->inode,
-        mask,
-        0,
-        0,
-        atime_sec,
-        atime_nsec,
-        mtime_sec,
-        mtime_nsec);
+    koboxd_ext4_operations_t ops;
+    if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
+        return -5;
+    }
+    koboxd_linux_iattr_t iattr;
+    memset(&iattr, 0, sizeof(iattr));
+    if ((mask & KOBOXD_TIME_UPDATE_ATIME) != 0) {
+        iattr.ia_valid |= KOBOXD_IATTR_ATIME;
+        iattr.ia_atime.tv_sec = atime_sec;
+        iattr.ia_atime.tv_nsec = atime_nsec;
+    }
+    if ((mask & KOBOXD_TIME_UPDATE_MTIME) != 0) {
+        iattr.ia_valid |= KOBOXD_IATTR_MTIME | KOBOXD_IATTR_CTIME;
+        iattr.ia_mtime.tv_sec = mtime_sec;
+        iattr.ia_mtime.tv_nsec = mtime_nsec;
+        iattr.ia_ctime = iattr.ia_mtime;
+    } else if ((mask & KOBOXD_TIME_UPDATE_ATIME) != 0) {
+        iattr.ia_valid |= KOBOXD_IATTR_CTIME;
+        iattr.ia_ctime = iattr.ia_atime;
+    }
+    int status = fs_file_setattr(&ops, object, &iattr);
     if (status == 0) {
         fs_mark_object_metadata_dirty(backend, object);
-        fs_object_refresh(object);
+        status = fs_object_refresh(object);
     }
     return status;
 }
@@ -1690,20 +2068,15 @@ int koboxd_fs_backend_chmod(
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    int status = fs_file_update_metadata(
-        object->inode,
-        0,
-        mode,
-        1,
-        0,
-        0,
-        0,
-        0);
+    koboxd_linux_iattr_t iattr;
+    memset(&iattr, 0, sizeof(iattr));
+    iattr.ia_valid = KOBOXD_IATTR_MODE;
+    iattr.ia_mode = (uint16_t)((read_u16_field(object->inode, KOBOXD_INODE_MODE_OFFSET) &
+        KOBOXD_MODE_TYPE_MASK) | (mode & KOBOXD_MODE_PERM_MASK));
+    int status = fs_file_setattr(&ops, object, &iattr);
     if (status == 0) {
-        status = fs_file_writeback_inode(&ops, object->inode, 1);
-    }
-    if (status == 0) {
-        fs_object_refresh(object);
+        fs_mark_object_metadata_dirty(backend, object);
+        status = fs_object_refresh(object);
     }
     return status;
 }
@@ -1740,12 +2113,23 @@ int koboxd_fs_backend_unlink(
         name);
     int (*unlink_fn)(void *, void *) = NULL;
     memcpy(&unlink_fn, &ops.unlink, sizeof(unlink_fn));
+    fs_inode_write_lock(parent->inode);
+    if (object->inode != parent->inode) {
+        fs_inode_write_lock(object->inode);
+    }
     unsigned long old_gs = 0;
     int has_gs = enter_ext4_call(ops.unlink, &old_gs);
+    FS_PROFILE_BEGIN(ext4_unlink_start);
     int result = object->dentry != NULL ? unlink_fn(parent->inode, object->dentry) : -2;
+    FS_PROFILE_END(ext4_unlink_cycles, ext4_unlink_start);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
+    if (object->inode != parent->inode) {
+        fs_inode_write_unlock(object->inode);
+    }
+    fs_inode_write_unlock(parent->inode);
+    FS_PROFILE_BEGIN(unlink_post_start);
     if (result != 0 &&
         object->inode != NULL &&
         read_u32_field(object->inode, KOBOXD_INODE_NLINK_OFFSET) == 0)
@@ -1753,16 +2137,23 @@ int koboxd_fs_backend_unlink(
         result = 0;
     }
     if (result == 0) {
-        kb_fs_subsystem_invalidate_inode_folios(parent->inode);
         fs_mark_object_unlinked(backend, object);
-        fs_object_refresh(object);
         fs_mark_metadata_dirty(backend);
+    } else {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=ext4_unlink status=%d parent=%llu "
+            "object=%llu name=%s\n",
+            result,
+            (unsigned long long)parent_object_id,
+            (unsigned long long)object->object_id,
+            name);
     }
     KOBOXD_FS_TRACE("[koboxd-fs-trace] unlink done status=%d object=%llu linked=%u nlink=%u\n",
         result,
         object != NULL ? (unsigned long long)object->object_id : 0ull,
         object != NULL ? object->linked : 0u,
         object != NULL ? object->nlink : 0u);
+    FS_PROFILE_END(unlink_post_cycles, unlink_post_start);
     return result;
 }
 
@@ -1833,16 +2224,16 @@ int koboxd_fs_backend_mknod(
     koboxd_ext4_operations_t ops;
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) return -5;
     koboxd_fs_object_t *existing = NULL;
-    status = fs_lookup_or_cache_child(backend, &ops, parent, name, &existing);
-    if (status == 0) return -17;
-    if (status != -2) return status;
-    void *dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
-    if (dentry == NULL) return -12;
-    prepare_named_dentry(dentry, parent->dentry, NULL, name);
+    void *dentry = NULL;
+    status = fs_lookup_or_prepare_child(
+        backend, &ops, parent, name, &existing, &dentry);
+    if (status != 0) return status;
+    if (existing != NULL) return -17;
 
     static uint8_t mnt_idmap[136];
     int (*mknod_fn)(void *, void *, void *, uint16_t, uint64_t) = NULL;
     memcpy(&mknod_fn, &ops.mknod, sizeof(mknod_fn));
+    fs_inode_write_lock(parent->inode);
     unsigned long old_gs = 0;
     const int has_gs = enter_ext4_call(ops.mknod, &old_gs);
     status = mknod_fn(
@@ -1852,17 +2243,17 @@ int koboxd_fs_backend_mknod(
         mode,
         fs_decode_linux_dev((uint32_t)dev));
     if (has_gs) kb_shim_leave_kernel_gs(old_gs);
+    fs_inode_write_unlock(parent->inode);
     void *inode = read_pointer_field(dentry, KOBOXD_DENTRY_INODE_OFFSET);
     if (status != 0 || inode == NULL) {
-        free(dentry);
+        kb_fs_subsystem_dput(dentry);
         return status != 0 ? status : -5;
     }
-    kb_fs_subsystem_invalidate_inode_folios(parent->inode);
     status = fs_object_register(
         backend, parent->object_id, inode, dentry, name, 1, out_object_id);
     if (status != 0) {
-        fs_discard_unregistered_lookup(inode, dentry);
-        return status;
+        const int discard_status = fs_discard_unregistered_lookup(backend, inode, dentry);
+        return discard_status != 0 ? discard_status : status;
     }
     fs_mark_metadata_dirty(backend);
     return 0;
@@ -1900,17 +2291,31 @@ int koboxd_fs_backend_rmdir(
         name);
     int (*rmdir_fn)(void *, void *) = NULL;
     memcpy(&rmdir_fn, &ops.rmdir, sizeof(rmdir_fn));
+    fs_inode_write_lock(parent->inode);
+    if (object->inode != parent->inode) {
+        fs_inode_write_lock(object->inode);
+    }
     unsigned long old_gs = 0;
     int has_gs = enter_ext4_call(ops.rmdir, &old_gs);
     int result = object->dentry != NULL ? rmdir_fn(parent->inode, object->dentry) : -2;
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
+    if (object->inode != parent->inode) {
+        fs_inode_write_unlock(object->inode);
+    }
+    fs_inode_write_unlock(parent->inode);
     if (result == 0) {
-        kb_fs_subsystem_invalidate_inode_folios(parent->inode);
         fs_mark_object_unlinked(backend, object);
-        fs_object_refresh(object);
         fs_mark_metadata_dirty(backend);
+    } else if (result != KOBOXD_ERR_NOT_EMPTY) {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=ext4_rmdir status=%d parent=%llu "
+            "object=%llu name=%s\n",
+            result,
+            (unsigned long long)parent_object_id,
+            (unsigned long long)object->object_id,
+            name);
     }
     KOBOXD_FS_STAGE("[koboxd-fs-stage] op=rmdir status=%d object=%llu name=%s\n",
         result,
@@ -1932,6 +2337,9 @@ int koboxd_fs_backend_rename(
     const char *new_name,
     uint64_t *out_object_id)
 {
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=rename stage=enter old=%s new=%s\n",
+        old_name != NULL ? old_name : "(null)",
+        new_name != NULL ? new_name : "(null)");
     if (backend == NULL || old_name == NULL || new_name == NULL || out_object_id == NULL || !backend->mounted) {
         return -22;
     }
@@ -1954,36 +2362,54 @@ int koboxd_fs_backend_rename(
         return lookup_status != 0 ? lookup_status : -2;
     }
     koboxd_fs_object_t *replaced = NULL;
+    void *negative_new_dentry = NULL;
     if (old_parent_object_id == new_parent_object_id &&
         strcmp(old_name, new_name) == 0)
     {
         replaced = object;
     } else {
-        lookup_status = fs_lookup_or_cache_child(
-            backend, &ops, new_parent, new_name, &replaced);
-        if (lookup_status != 0 && lookup_status != -2) {
+        lookup_status = fs_lookup_or_prepare_child(
+            backend,
+            &ops,
+            new_parent,
+            new_name,
+            &replaced,
+            &negative_new_dentry);
+        if (lookup_status != 0) {
             return lookup_status;
-        }
-        if (lookup_status == -2) {
-            replaced = NULL;
         }
     }
     void *call_new_dentry = NULL;
     void *new_object_dentry = NULL;
     if (replaced != NULL && replaced != object) {
         call_new_dentry = replaced->dentry;
-        new_object_dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
+        new_object_dentry = kb_fs_subsystem_d_alloc_name(new_parent->dentry, new_name);
         if (new_object_dentry == NULL) {
             return -12;
         }
-        prepare_named_dentry(new_object_dentry, new_parent->dentry, object->inode, new_name);
     } else {
-        call_new_dentry = calloc(1, KOBOXD_FAKE_DENTRY_BYTES);
+        call_new_dentry = negative_new_dentry != NULL ?
+            negative_new_dentry :
+            kb_fs_subsystem_d_alloc_name(new_parent->dentry, new_name);
         if (call_new_dentry == NULL) {
             return -12;
         }
-        prepare_named_dentry(call_new_dentry, new_parent->dentry, NULL, new_name);
         new_object_dentry = call_new_dentry;
+    }
+
+    /* VFS dentry instantiation consumes the inode reference returned by
+     * lookup/new_inode.  The cached source dentry currently owns that sole
+     * reference.  Hold a transfer reference across ext4_rename(): on success
+     * dput(old) releases the old dentry's ownership and the held reference is
+     * transferred to the new dentry; on failure it is released explicitly. */
+    if (kb_fs_subsystem_igrab(object->inode) == NULL) {
+        if (new_object_dentry != NULL && new_object_dentry != call_new_dentry) {
+            kb_fs_subsystem_dput(new_object_dentry);
+        }
+        if (call_new_dentry != NULL && (replaced == NULL || replaced == object)) {
+            kb_fs_subsystem_dput(call_new_dentry);
+        }
+        return -5;
     }
 
     KOBOXD_FS_TRACE("[koboxd-fs-trace] rename old_parent=%llu old=%s new_parent=%llu new=%s object=%llu replaced=%llu\n",
@@ -1996,8 +2422,19 @@ int koboxd_fs_backend_rename(
     static uint8_t mnt_idmap[136];
     int (*rename_fn)(void *, void *, void *, void *, void *, unsigned int) = NULL;
     memcpy(&rename_fn, &ops.rename, sizeof(rename_fn));
+    fs_inode_lock_set_t rename_locks = {0};
+    fs_inode_lock_set_add(&rename_locks, old_parent->inode);
+    fs_inode_lock_set_add(&rename_locks, new_parent->inode);
+    fs_inode_lock_set_add(&rename_locks, object->inode);
+    if (replaced != NULL && replaced != object) {
+        fs_inode_lock_set_add(&rename_locks, replaced->inode);
+    }
+    fs_inode_lock_set_acquire(&rename_locks);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=rename stage=locked object=%llu\n",
+        (unsigned long long)object->object_id);
     unsigned long old_gs = 0;
     int has_gs = enter_ext4_call(ops.rename, &old_gs);
+    FS_PROFILE_BEGIN(ext4_rename_start);
     int result = rename_fn(
         mnt_idmap,
         old_parent->inode,
@@ -2005,40 +2442,42 @@ int koboxd_fs_backend_rename(
         new_parent->inode,
         call_new_dentry,
         0);
+    FS_PROFILE_END(ext4_rename_cycles, ext4_rename_start);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=rename stage=returned object=%llu status=%d\n",
+        (unsigned long long)object->object_id,
+        result);
     if (has_gs) {
         kb_shim_leave_kernel_gs(old_gs);
     }
+    fs_inode_lock_set_release(&rename_locks);
     if (result != 0) {
+        kb_fs_subsystem_iput(object->inode);
         if (call_new_dentry != NULL && (replaced == NULL || replaced == object)) {
-            free(call_new_dentry);
+            kb_fs_subsystem_dput(call_new_dentry);
         }
         if (new_object_dentry != NULL && new_object_dentry != call_new_dentry) {
-            free(new_object_dentry);
+            kb_fs_subsystem_dput(new_object_dentry);
         }
         return result;
     }
 
-    kb_fs_subsystem_invalidate_inode_folios(old_parent->inode);
-    if (new_parent->inode != old_parent->inode) {
-        kb_fs_subsystem_invalidate_inode_folios(new_parent->inode);
-    }
-
+    FS_PROFILE_BEGIN(rename_post_start);
     if (replaced != NULL && replaced != object) {
         fs_mark_object_unlinked(backend, replaced);
-        fs_object_refresh(replaced);
     }
-    free(object->dentry);
+    kb_fs_subsystem_dput(object->dentry);
     object->dentry = new_object_dentry;
     object->inode_number = read_u64_field(object->inode, KOBOXD_INODE_NUMBER_OFFSET);
-    write_pointer_field(object->dentry, KOBOXD_DENTRY_INODE_OFFSET, object->inode);
+    kb_fs_subsystem_d_instantiate(object->dentry, object->inode);
     object->parent_object_id = new_parent_object_id;
     snprintf(object->name, sizeof(object->name), "%s", new_name);
     object->linked = 1;
-    fs_object_refresh(object);
+    object->nlink = read_u32_field(object->inode, KOBOXD_INODE_NLINK_OFFSET);
     *out_object_id = object->object_id;
     fs_mark_metadata_dirty(backend);
     KOBOXD_FS_TRACE("[koboxd-fs-trace] rename done status=0 object=%llu\n",
         (unsigned long long)*out_object_id);
+    FS_PROFILE_END(rename_post_cycles, rename_post_start);
     return 0;
 }
 
@@ -2059,25 +2498,19 @@ static int fs_prepare_unlinked_object_release(
     if (object->inode == NULL) {
         return 0;
     }
-    const uint16_t object_type = object->mode & KOBOXD_MODE_TYPE_MASK;
-    if (object_type == 0100000 || object_type == 0040000 || object_type == 0120000) {
-        int detach_status = kb_fs_subsystem_ext4_detach_inode_data_blocks_deferred(object->inode);
-        if (detach_status != 0) {
-            return detach_status;
-        }
+    (void)ops;
+    const int close_status = fs_object_close_native_files(object);
+    if (close_status != 0) {
+        return close_status;
     }
-    if (ops->evict_inode == NULL) {
-        return -5;
+    const int dentry_owns_inode = object->dentry != NULL &&
+        read_pointer_field(object->dentry, KOBOXD_DENTRY_INODE_OFFSET) == object->inode;
+    kb_fs_subsystem_dput(object->dentry);
+    if (!dentry_owns_inode) {
+        kb_fs_subsystem_iput(object->inode);
     }
-    kb_fs_subsystem_mark_inode_freeing(object->inode);
-    void (*evict_inode_fn)(void *) = NULL;
-    memcpy(&evict_inode_fn, &ops->evict_inode, sizeof(evict_inode_fn));
-    unsigned long old_gs = 0;
-    int has_gs = enter_ext4_call(ops->evict_inode, &old_gs);
-    evict_inode_fn(object->inode);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
+    object->dentry = NULL;
+    object->inode = NULL;
     fs_mark_metadata_dirty(backend);
     return 0;
 }
@@ -2086,10 +2519,6 @@ static void fs_finalize_unlinked_object_release(koboxd_fs_backend_t *backend, ko
 {
     if (backend == NULL || object == NULL) {
         return;
-    }
-    free(object->dentry);
-    if (object->inode != NULL) {
-        kb_fs_subsystem_free_fake_inode(object->inode);
     }
     fs_object_unregister(backend, object->object_id);
     if (backend->deferred_unlinked_count != 0) {
@@ -2150,14 +2579,9 @@ static int fs_release_deferred_unlinked_objects(koboxd_fs_backend_t *backend)
         return -5;
     }
     koboxd_deferred_release_batch_t batch;
-    kb_fs_subsystem_begin_deferred_metadata_writes();
     int status = fs_prepare_deferred_unlinked_objects(backend, &ops, &batch);
     if (status == 0 && backend->mount_result.super_block != NULL) {
-        status = fs_commit_superblock(&ops, backend->mount_result.super_block);
-    }
-    const int finish_status = kb_fs_subsystem_end_deferred_metadata_writes();
-    if (status == 0) {
-        status = finish_status;
+        status = fs_sync_filesystem(backend->mount_result.super_block);
     }
     if (status != 0) {
         return status;
@@ -2188,17 +2612,11 @@ int koboxd_fs_backend_release_object(koboxd_fs_backend_t *backend, uint64_t obje
     if (object->references != 0) {
         return 0;
     }
+    const int close_status = fs_object_close_native_files(object);
+    if (close_status != 0) {
+        return close_status;
+    }
     if (object->linked) {
-        if (object->dirty && object->inode != NULL) {
-            koboxd_ext4_operations_t ops;
-            if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
-                return -5;
-            }
-            int flush_status = fs_flush_dirty_object(&ops, object, 1);
-            if (flush_status != 0) {
-                return flush_status;
-            }
-        }
         return 0;
     }
     fs_mark_metadata_dirty(backend);
@@ -2253,7 +2671,14 @@ int koboxd_fs_backend_pread(
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    return fs_file_read(&ops, object->inode, offset, buffer, length, buffer_capacity);
+    return fs_file_read(
+        &ops,
+        object,
+        backend->mount_result.root_vfsmount,
+        offset,
+        buffer,
+        length,
+        buffer_capacity);
 }
 
 int koboxd_fs_backend_pwrite(
@@ -2278,24 +2703,44 @@ int koboxd_fs_backend_pwrite(
         (unsigned long long)object_id,
         (unsigned long long)offset,
         length);
-    const uint64_t old_object_size = object->size;
     const uint64_t write_start_ns = fs_now_ns();
-    int status = fs_file_write(&ops, object->inode, offset, buffer, length);
+    int status = fs_file_write(
+        &ops,
+        object,
+        backend->mount_result.root_vfsmount,
+        offset,
+        buffer,
+        length);
     const uint64_t write_end_ns = fs_now_ns();
+    if (status < 0) {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=ext4_file_write status=%d "
+            "object=%llu inode=%llu offset=%llu length=%zu size=%llu dirty=%u\n",
+            status,
+            (unsigned long long)object_id,
+            (unsigned long long)object->inode_number,
+            (unsigned long long)offset,
+            length,
+            (unsigned long long)object->size,
+            object->dirty);
+    }
     if (status >= 0) {
-        uint64_t write_end = offset;
-        if (!__builtin_add_overflow(offset, (uint64_t)status, &write_end)) {
-            if (write_end > old_object_size) {
-                write_u64_field(object->inode, KOBOXD_INODE_SIZE_OFFSET, write_end);
-                write_u64_field(
-                    (uint8_t *)object->inode - KOBOXD_INODE_EXT4_DISKSIZE_BACK_OFFSET,
-                    0,
-                    write_end);
-                fs_mark_object_metadata_dirty(backend, object);
-            }
-        }
         fs_mark_object_data_dirty(object);
-        fs_object_refresh(object);
+        uint64_t write_end = 0;
+        if (__builtin_add_overflow(
+                offset,
+                (uint64_t)(unsigned int)status,
+                &write_end))
+        {
+            status = -75;
+        } else if (write_end > object->size) {
+            /* The ext4 inode remains authoritative.  Do not issue a full
+             * ->getattr after every transport-sized pwrite: Linux pwrite
+             * advances i_size in the write path and observes the remaining
+             * metadata on stat/fsync.  Keep only the size mirror needed by
+             * filed coherent here; fsync/statx performs the native refresh. */
+            object->size = write_end;
+        }
     }
     KOBOXD_FS_STAGE("[koboxd-fs-stage] op=pwrite write_us=%llu status=%d object=%llu length=%zu\n",
         (unsigned long long)fs_elapsed_us(write_start_ns, write_end_ns),
@@ -2326,7 +2771,10 @@ int koboxd_fs_backend_fsync(koboxd_fs_backend_t *backend, uint64_t object_id)
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
     }
-    return fs_flush_dirty_object(&ops, object, 1);
+    return fs_flush_dirty_object(
+        &ops,
+        object,
+        backend->mount_result.root_vfsmount);
 }
 
 int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
@@ -2334,24 +2782,16 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
     if (backend == NULL || !backend->mounted) {
         return -22;
     }
-    int has_dirty_objects = 0;
     uint64_t dirty_object_count = 0;
     for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
         const koboxd_fs_object_t *object = &backend->objects[i];
         if (object->used && object->dirty && object->inode != NULL) {
-            has_dirty_objects = 1;
             dirty_object_count++;
         }
     }
-    (void)dirty_object_count;
     KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all begin metadata_dirty=%u dirty_objects=%llu\n",
         backend->metadata_dirty,
         (unsigned long long)dirty_object_count);
-    if (!backend->metadata_dirty && !has_dirty_objects) {
-        KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all clean\n");
-        return 0;
-    }
-
     koboxd_ext4_operations_t ops;
     if (!load_ext4_operation_tables(backend->ext4_module, &ops)) {
         return -5;
@@ -2359,25 +2799,7 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
     KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all begin metadata_dirty=%u\n", backend->metadata_dirty);
     koboxd_deferred_release_batch_t release_batch;
     memset(&release_batch, 0, sizeof(release_batch));
-    kb_fs_subsystem_begin_deferred_metadata_writes();
     int transaction_status = 0;
-    uint64_t flush_us = 0;
-    uint64_t flush_count = 0;
-    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
-        koboxd_fs_object_t *object = &backend->objects[i];
-        if (!object->used || !object->dirty || object->inode == NULL) {
-            continue;
-        }
-        const uint64_t flush_start_ns = fs_now_ns();
-        int status = fs_flush_dirty_object(&ops, object, 0);
-        const uint64_t flush_end_ns = fs_now_ns();
-        flush_us += fs_elapsed_us(flush_start_ns, flush_end_ns);
-        flush_count++;
-        if (status != 0) {
-            transaction_status = status;
-            break;
-        }
-    }
     const uint64_t drain_start_ns = fs_now_ns();
     if (transaction_status == 0) {
         transaction_status = fs_prepare_deferred_unlinked_objects(backend, &ops, &release_batch);
@@ -2387,23 +2809,36 @@ int koboxd_fs_backend_sync_all(koboxd_fs_backend_t *backend)
     uint64_t commit_end_ns = 0;
     if (transaction_status == 0 && backend->mount_result.super_block != NULL) {
         commit_start_ns = fs_now_ns();
-        transaction_status = fs_commit_superblock(&ops, backend->mount_result.super_block);
+        /*
+         * Sync the mounted filesystem once through the Linux VFS path.  The
+         * old loop called ext4 fsync once per cached object, forcing the same
+         * journal transaction hundreds of times when the bounded object
+         * cache filled.  Kobox already tracks every native inode/address
+         * space, so sync_filesystem provides the normal writeback -> sync_fs
+         * -> buffer/block flush ordering without a filed-side substitute.
+         */
+        transaction_status = fs_sync_filesystem(backend->mount_result.super_block);
         commit_end_ns = fs_now_ns();
-    }
-    const int finish_status = kb_fs_subsystem_end_deferred_metadata_writes();
-    if (transaction_status == 0) {
-        transaction_status = finish_status;
     }
     if (transaction_status != 0) {
         return transaction_status;
     }
     fs_finalize_deferred_release_batch(backend, &release_batch);
+    for (size_t i = 0; i < KOBOXD_FS_BACKEND_MAX_OBJECTS; i++) {
+        koboxd_fs_object_t *object = &backend->objects[i];
+        if (object->used && object->inode != NULL) {
+            object->dirty = 0;
+            const int refresh_status = fs_object_refresh(object);
+            if (refresh_status != 0) {
+                return refresh_status;
+            }
+        }
+    }
     backend->metadata_dirty = 0;
-    KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done flush_count=%llu status=0\n",
-        (unsigned long long)flush_count);
-    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=sync_all flush_count=%llu flush_us=%llu drain_us=%llu commit_us=%llu status=0\n",
-        (unsigned long long)flush_count,
-        (unsigned long long)flush_us,
+    KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done dirty_objects=%llu status=0\n",
+        (unsigned long long)dirty_object_count);
+    KOBOXD_FS_STAGE("[koboxd-fs-stage] op=sync_all dirty_objects=%llu drain_us=%llu commit_us=%llu status=0\n",
+        (unsigned long long)dirty_object_count,
         (unsigned long long)fs_elapsed_us(drain_start_ns, drain_end_ns),
         (unsigned long long)fs_elapsed_us(commit_start_ns, commit_end_ns));
     KOBOXD_FS_TRACE("[koboxd-fs-trace] sync_all done status=0\n");
@@ -2422,7 +2857,10 @@ int koboxd_fs_backend_statx(
     if (object == NULL || object->inode == NULL) {
         return -2;
     }
-    fs_object_refresh(object);
+    const int refresh_status = fs_object_refresh(object);
+    if (refresh_status != 0) {
+        return refresh_status;
+    }
     *out_stat = *object;
     return 0;
 }
@@ -2453,14 +2891,17 @@ int koboxd_fs_backend_getdents(
         return -5;
     }
     koboxd_readdir_scan_t scan;
-    int scan_status = fs_scan_ext4_dir_names(&ops, dir, &scan);
+    int scan_status = fs_read_ext4_dir_native(
+        &ops,
+        dir,
+        backend->mount_result.root_vfsmount,
+        offset,
+        capacity,
+        &scan);
     if (scan_status != 0) {
         return scan_status;
     }
-    if (offset >= scan.count) {
-        return 0;
-    }
-    for (size_t i = (size_t)offset; i < scan.count && *out_count < capacity; i++) {
+    for (size_t i = 0; i < scan.count; i++) {
         const int status = fs_scanned_dirent_to_object(
             backend,
             &ops,

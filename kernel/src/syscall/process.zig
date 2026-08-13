@@ -156,7 +156,7 @@ fn writeProtectForkCowVmas(state: *kernel.KernelState, from: kernel.PrincipalId)
         const entry_index: usize = @intCast(source_table.active_indices[active_index]);
         const source_entry = &source_table.entries[entry_index];
         if (!source_entry.active) continue;
-        if (!source_entry.flags.fork_cow) continue;
+        if (!source_entry.flags.fork_cow and !kernel.KernelState.forkCowEligible(source_entry)) continue;
         if (!user_vm.writeProtectPresentUserPagesForForkCow(from, source_entry.start_va, source_entry.size_bytes)) {
             return sc.syscall_err_map;
         }
@@ -437,6 +437,22 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     const rights = kernel.fdRightsFromBits(frame.rdi);
     if ((frame.rsi & ~process_abi.process_clone_known_flags_mask) != 0) return sc.syscall_err_invalid;
     if ((frame.rsi & process_abi.process_clone_flag_current_thread) == 0) return sc.syscall_err_invalid;
+    // MMIO/DMA objects retain address and physical identity outside the VMA
+    // table.  Until a DONTFORK/pin-aware contract exists, inheriting their FD
+    // and reservation metadata without the device PTEs would create stale
+    // close-time unmaps or let CPU COW diverge from a live device IOVA.
+    if (state.ownerHasPinnedUserObject(proc)) return sc.syscall_err_invalid;
+
+    // Read a caller-supplied frame before allocating child state.  This is a
+    // fallible parent-memory operation and must not occur after the parent VM
+    // has committed to fork-COW.
+    const child_frame = if ((frame.rsi & process_abi.process_clone_flag_user_frame) != 0)
+        cloneUserFrameFromVa(h, proc, frame.rdx, frame) orelse return sc.syscall_err_invalid
+    else blk: {
+        var copied = frame.*;
+        copied.rax = 0;
+        break :blk copied;
+    };
 
     const child = state.createProcessDescriptorWithCapacityLimitChecked(
         "fd-process-clone",
@@ -461,6 +477,41 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         kernel.KernelError.TableFull => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };
+
+    // Allocate every remaining fallible resource before committing parent
+    // VM metadata.  The child remains suspended and its process FD cannot be
+    // observed until this syscall returns.
+    const thread_index = scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
+    var thread_active = true;
+    defer {
+        if (thread_active) {
+            _ = scheduler.releaseThread(thread_index);
+        }
+    }
+    if (!scheduler.copySignalDeliveryConfig(scheduler.currentThread(), thread_index)) {
+        return sc.syscall_err_not_ready;
+    }
+    if (!scheduler.copyThreadXState(scheduler.currentThread(), thread_index)) {
+        return sc.syscall_err_not_ready;
+    }
+    if (!scheduler.setFsBase(thread_index, scheduler.currentFsBase())) {
+        return sc.syscall_err_invalid;
+    }
+    if (!scheduler.setThreadGsBase(thread_index, scheduler.currentGsBase())) {
+        return sc.syscall_err_invalid;
+    }
+    const process_fd = state.createProcessFd(proc, .{
+        .principal_raw = @intFromEnum(child),
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, first_dynamic_fd) catch |err| return switch (err) {
+        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        else => sc.syscall_err_invalid,
+    };
+    var process_fd_active = true;
+    defer if (process_fd_active)
+        state.closeFdWithFreeList(proc, process_fd, h.free_list) catch {};
+
     // VMA metadata and the shared native-COW pool form one VM transaction.
     // Pair locking keeps the parent/child page-table handoff atomic while the
     // shared-object lock protects cross-address-space VMO/COW state.
@@ -471,59 +522,27 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
             kernel.KernelError.TableFull => sc.syscall_err_alloc,
             else => sc.syscall_err_invalid,
         };
+        // Clone all fallible child address-space metadata before committing
+        // the parent.  Marking every eligible parent VMA COW before the first
+        // write-protect makes even a partially failed PTE pass recoverable:
+        // any resulting RO page takes the normal COW write-fault path.
+        if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
+        state.markForkCowVmasCommitted(proc);
         const protect_status = writeProtectForkCowVmas(state, proc);
         if (protect_status != sc.syscall_ok) return protect_status;
         state.detachForkChildDirtyCowTables(child, h.free_list) catch |err| return switch (err) {
             kernel.KernelError.TableFull => sc.syscall_err_alloc,
             else => sc.syscall_err_map,
         };
-        if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
     }
-
-    const child_frame = if ((frame.rsi & process_abi.process_clone_flag_user_frame) != 0)
-        cloneUserFrameFromVa(h, proc, frame.rdx, frame) orelse return sc.syscall_err_invalid
-    else blk: {
-        var copied = frame.*;
-        copied.rax = 0;
-        break :blk copied;
-    };
-    const thread_index = scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
-    if (!scheduler.copySignalDeliveryConfig(scheduler.currentThread(), thread_index)) {
-        _ = scheduler.releaseThread(thread_index);
-        return sc.syscall_err_not_ready;
-    }
-    if (!scheduler.copyThreadXState(scheduler.currentThread(), thread_index)) {
-        _ = scheduler.releaseThread(thread_index);
-        return sc.syscall_err_not_ready;
-    }
-    if (!scheduler.setFsBase(thread_index, scheduler.currentFsBase())) {
-        _ = scheduler.releaseThread(thread_index);
-        return sc.syscall_err_invalid;
-    }
-    if (!scheduler.setThreadGsBase(thread_index, scheduler.currentGsBase())) {
-        _ = scheduler.releaseThread(thread_index);
-        return sc.syscall_err_invalid;
-    }
-    const process_fd = state.createProcessFd(proc, .{
-        .principal_raw = @intFromEnum(child),
-        .state = .active,
-        .exit_code = 0,
-    }, rights, .{}, first_dynamic_fd) catch |err| {
-        // The child remains suspended until its parent handle is durable.
-        _ = scheduler.releaseThread(thread_index);
-        return switch (err) {
-            kernel.KernelError.TableFull => sc.syscall_err_alloc,
-            else => sc.syscall_err_invalid,
-        };
-    };
     // Publish the child to the scheduler only after the parent has a durable
     // process handle.  Before this point every rollback can release a
     // suspended context without racing an AP that already entered the child.
     if (!scheduler.markThreadReady(thread_index, true)) {
-        state.closeFdWithFreeList(proc, process_fd, h.free_list) catch {};
-        _ = scheduler.releaseThread(thread_index);
         return sc.syscall_err_not_ready;
     }
+    process_fd_active = false;
+    thread_active = false;
     child_active = false;
 
     return process_fd;
@@ -950,6 +969,9 @@ fn installProcessMapLocked(
                 return .{ .status = sc.syscall_err_map };
             },
         };
+    } else if (!(state.userMapRangeIsFree(target_owner, target_va, req.aligned_size) catch false)) {
+        kernel_log.write("process.map failed target-occupied\n");
+        return .{ .status = sc.syscall_err_invalid };
     }
 
     _ = state.mmapFdIntoProcess(proc, req.vmo_fd, target_owner, target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset) catch |err| switch (err) {
@@ -1089,6 +1111,7 @@ fn mapBatchIntoProcess(
     defer user_vm.unlockVmTransactionPair(proc, target_owner);
     var mapped_vas: [max_process_map_batch_entries]u64 = undefined;
     var mapped_sizes: [max_process_map_batch_entries]u64 = undefined;
+    var mapped_has_user_pte: [max_process_map_batch_entries]bool = undefined;
     var mapped_count: usize = 0;
     i = 0;
     while (i < entry_count) : (i += 1) {
@@ -1096,12 +1119,21 @@ fn mapBatchIntoProcess(
         if (installed.status != sc.syscall_ok) {
             while (mapped_count > 0) {
                 mapped_count -= 1;
+                if (mapped_has_user_pte[mapped_count]) {
+                    _ = user_vm.unmapPresentUserLinearRegion(
+                        target_owner,
+                        mapped_vas[mapped_count],
+                        @intCast(mapped_sizes[mapped_count]),
+                    );
+                }
                 state.munmapRangeWithFreeList(target_owner, mapped_vas[mapped_count], mapped_sizes[mapped_count], free_list) catch {};
             }
             return installed.status;
         }
         mapped_vas[mapped_count] = installed.mapped_va;
         mapped_sizes[mapped_count] = requests[i].aligned_size;
+        mapped_has_user_pte[mapped_count] = !requests[i].flags.private and
+            (requests[i].prot.read or requests[i].prot.write or requests[i].prot.exec);
         mapped_count += 1;
     }
     return sc.syscall_ok;
@@ -1122,30 +1154,38 @@ fn execFromStagedProcess(
     if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const staged_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (staged_owner == proc or !state.hasActivePrincipal(staged_owner)) return sc.syscall_err_invalid;
+    // Exec replaces every VMA but retains non-CLOEXEC FDs.  Address-bound
+    // MMIO/DMA objects cannot survive that replacement without stale VA/IOVA
+    // identity, so reject until an explicit exec revocation contract exists.
+    if (state.ownerHasPinnedUserObject(proc) or state.ownerHasPinnedUserObject(staged_owner)) {
+        return sc.syscall_err_invalid;
+    }
 
     const thread = state.threadObjectForFd(proc, thread_fd, .{ .set_context = true }) orelse return sc.syscall_err_invalid;
     if (!processRunnable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
     if (thread.owner_principal_raw != process.principal_raw) return sc.syscall_err_invalid;
 
-    const image = scheduler.suspendedThreadImage(
+    const image = scheduler.singleThreadExecImage(
+        proc,
+        staged_owner,
         @intCast(thread.thread_index),
         thread.thread_generation,
-        staged_owner,
     ) orelse return sc.syscall_err_invalid;
 
     {
         if (!user_vm.lockVmTransactionPair(staged_owner, proc)) return sc.syscall_err_map;
         defer user_vm.unlockVmTransactionPair(staged_owner, proc);
         if (!user_vm.cloneAddressSpaceMetadataForFork(staged_owner, proc)) return sc.syscall_err_map;
-        state.replaceVmaTableForExec(proc, staged_owner, h.free_list) catch |err| return switch (err) {
-            kernel.KernelError.TableFull => sc.syscall_err_alloc,
-            else => sc.syscall_err_invalid,
-        };
+        // The destination page tables were replaced in place while retaining
+        // the process PCID.  Flush that context on every CPU before returning
+        // any old VMA backing page to the allocator.
+        if (!user_copy.synchronizeUserMemoryForPrincipal(proc)) unreachable;
+        state.replaceVmaTableForExec(proc, staged_owner, h.free_list) catch unreachable;
     }
 
     cleanupProcess(h, state, staged_owner, .exited, 0);
-    closeCloexecFdsWithPipeWakes(h, state, proc) catch return sc.syscall_err_invalid;
-    if (!scheduler.installExecContextForCurrentThread(h.user_spaces, proc, image)) return sc.syscall_err_invalid;
+    closeCloexecFdsWithPipeWakes(h, state, proc) catch unreachable;
+    if (!scheduler.installExecContextForCurrentThread(h.user_spaces, proc, image)) unreachable;
     frame.* = image.frame;
     return sc.syscall_ok;
 }

@@ -40,6 +40,84 @@ static void expect_status(const char *name, int64_t actual, int64_t expected)
     }
 }
 
+static void expect_u64(const char *name, uint64_t actual, uint64_t expected)
+{
+    if (actual != expected) {
+        fprintf(
+            stderr,
+            "FAIL %s value=%llu expected=%llu\n",
+            name,
+            (unsigned long long)actual,
+            (unsigned long long)expected);
+        ++failures;
+    }
+}
+
+static void test_vmo_fill_window_plan(void)
+{
+    enum { WINDOW_BYTES = 2u * 1024u * 1024u };
+    uint64_t map_offset = 0;
+    uint64_t data_offset = 0;
+    uint64_t map_length = 0;
+    uint64_t chunk = 0;
+
+    expect_status(
+        "aligned VMO window plan",
+        filed_vmo_fill_window_plan(
+            0,
+            3u * 1024u * 1024u,
+            &map_offset,
+            &data_offset,
+            &map_length,
+            &chunk),
+        0);
+    expect_u64("aligned map offset", map_offset, 0);
+    expect_u64("aligned data offset", data_offset, 0);
+    expect_u64("aligned map length", map_length, WINDOW_BYTES);
+    expect_u64("aligned chunk", chunk, WINDOW_BYTES);
+
+    expect_status(
+        "unaligned VMO window plan",
+        filed_vmo_fill_window_plan(
+            4096u + 17u,
+            3u * 1024u * 1024u,
+            &map_offset,
+            &data_offset,
+            &map_length,
+            &chunk),
+        0);
+    expect_u64("unaligned map offset", map_offset, 4096u);
+    expect_u64("unaligned data offset", data_offset, 17u);
+    expect_u64("unaligned map length", map_length, WINDOW_BYTES);
+    expect_u64("unaligned chunk", chunk, WINDOW_BYTES - 17u);
+
+    expect_status(
+        "short VMO window plan",
+        filed_vmo_fill_window_plan(
+            4095u,
+            4u,
+            &map_offset,
+            &data_offset,
+            &map_length,
+            &chunk),
+        0);
+    expect_u64("short map offset", map_offset, 0);
+    expect_u64("short data offset", data_offset, 4095u);
+    expect_u64("short map length", map_length, 4099u);
+    expect_u64("short chunk", chunk, 4u);
+
+    expect_status(
+        "zero remaining rejected",
+        filed_vmo_fill_window_plan(
+            0,
+            0,
+            &map_offset,
+            &data_offset,
+            &map_length,
+            &chunk),
+        -22);
+}
+
 static filed_vfs_stat_snapshot_t inspect_snapshot(const char *name)
 {
     filed_vfs_stat_snapshot_t snapshot;
@@ -224,6 +302,8 @@ int main(void)
     filed_vfs_open_result_t write_file;
     filed_page_dispatch_result_t result;
     filed_vfs_stat_snapshot_t snapshot;
+
+    test_vmo_fill_window_plan();
 
     memset(&runtime, 0, sizeof(runtime));
     filed_vfs_init(&runtime.vfs);

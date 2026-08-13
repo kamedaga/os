@@ -156,7 +156,6 @@ int main(void)
     if (holder == 0) {
         for (;;) pause();
     }
-
     const pid_t target = fork();
     if (target < 0) {
         (void)kill(holder, SIGKILL);
@@ -166,7 +165,6 @@ int main(void)
         (void)close(target_ready[0]);
         _exit(run_target(target_ready[1]));
     }
-
     (void)close(target_ready[1]);
     if (kill(holder, SIGKILL) != 0) return 4;
     int holder_status = 0;

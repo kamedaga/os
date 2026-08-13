@@ -277,6 +277,7 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_FCHMODAT },
     { .nr = LPR_LINUX_SYS_UTIMENSAT },
     { .nr = LPR_LINUX_SYS_RECVMMSG },
+    { .nr = LPR_LINUX_SYS_SYNCFS },
     { .nr = LPR_LINUX_SYS_SENDMMSG },
     { .nr = LPR_LINUX_SYS_GETRANDOM },
 };
@@ -377,6 +378,46 @@ static void lpr_trace_slow_syscall(
         cycles);
 }
 
+static char *lpr_mmap_diag_append_text(
+    char *out, const char *end, const char *text)
+{
+    if (out == 0 || end == 0 || text == 0) {
+        return out;
+    }
+    while (out < end && *text != '\0') {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_mmap_diag_append_u64(
+    char *out, const char *end, uint64_t value)
+{
+    char digits[20];
+    uint64_t count = 0;
+    do {
+        digits[count++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && count < sizeof(digits));
+    while (out < end && count != 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static char *lpr_mmap_diag_append_i64(
+    char *out, const char *end, int64_t value)
+{
+    uint64_t magnitude = (uint64_t)value;
+    if (value < 0) {
+        if (out < end) {
+            *out++ = '-';
+        }
+        magnitude = (~magnitude) + 1u;
+    }
+    return lpr_mmap_diag_append_u64(out, end, magnitude);
+}
+
 static void lpr_trace_mmap_error(
     const char *stage,
     uint64_t addr,
@@ -387,17 +428,37 @@ static void lpr_trace_mmap_error(
     uint64_t offset,
     int64_t status)
 {
+    char line[256];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_mmap_diag_append_text(out, end, "[lpr] mmap failure stage=");
+    out = lpr_mmap_diag_append_text(out, end, stage);
+    out = lpr_mmap_diag_append_text(out, end, " status=");
+    out = lpr_mmap_diag_append_i64(out, end, status);
+    out = lpr_mmap_diag_append_text(out, end, " len=");
+    out = lpr_mmap_diag_append_u64(out, end, len);
+    out = lpr_mmap_diag_append_text(out, end, " fd=");
+    out = lpr_mmap_diag_append_u64(out, end, fd);
+    out = lpr_mmap_diag_append_text(out, end, " offset=");
+    out = lpr_mmap_diag_append_u64(out, end, offset);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
     pacha_trace6(
         PACHA_TRACE_COMPONENT_LPR,
         PACHA_TRACE_EVENT_LPR_MMAP_ERROR,
-        PACHA_TRACE_CLASS_DEBUG,
+        PACHA_TRACE_CLASS_ERROR,
         pacha_trace_name_id(stage),
         len,
         prot,
         flags,
         fd,
         (uint64_t)status);
-    pacha_trace2(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_MMAP_ERROR, PACHA_TRACE_CLASS_DEBUG, addr, offset);
+    pacha_trace2(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_MMAP_ERROR, PACHA_TRACE_CLASS_ERROR, addr, offset);
 }
 
 static void lpr_trace_mmap_load(
@@ -1441,8 +1502,19 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         }
         if ((flags & LPR_LINUX_MAP_SHARED) != 0) {
             uint64_t file_size = 0;
-            const int writable = (prot & LPR_LINUX_PROT_WRITE) != 0;
-            const int executable = (prot & LPR_LINUX_PROT_EXEC) != 0;
+            /* The shared VMO's transferred rights are the lifetime ceiling
+             * for mprotect, not merely the initial PTE protection.  Derive
+             * write authority from the open file description and seals;
+             * Filed still validates it with pwrite_prepare before issuing
+             * MAP_WRITE.  Readable Filed mappings may later become RX under
+             * the existing executable-file policy. */
+            const int writable =
+                (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR &&
+                (file->reserved1 & (LPR_FILED_FD_MEMFD |
+                    LPR_LINUX_F_SEAL_FUTURE_WRITE)) !=
+                    (LPR_FILED_FD_MEMFD |
+                     LPR_LINUX_F_SEAL_FUTURE_WRITE);
+            const int executable = 1;
             const int64_t shared_vmo_fd = lpr_linux_shared_file_vmo(
                 fd,
                 offset,
@@ -1826,6 +1898,18 @@ private_file_mapping_ready:
         lpr_linux_prot_to_pacha(prot),
         pacha_flags,
         offset);
+    if (ret < 4096) {
+        lpr_trace_mmap_error(
+            (flags & LPR_LINUX_MAP_ANONYMOUS) != 0 ?
+                "anonymous_mmap" : "native_mmap",
+            addr,
+            len,
+            prot,
+            flags,
+            fd,
+            offset,
+            ret);
+    }
     const int64_t result = lpr_linux_pacha_status_to_errno(ret);
     lpr_trace_mmap_call("mmap", addr, len, prot, flags, fd, offset, result);
     return result;
@@ -1936,12 +2020,23 @@ static int64_t lpr_sys_mprotect(
     (void)a3;
     (void)a4;
     (void)a5;
-    return lpr_linux_pacha_status_to_errno(
-        lpr_pacha_syscall3(
-            PACHAOS_SYSCALL_MPROTECT,
+    const int64_t status = lpr_pacha_syscall3(
+        PACHAOS_SYSCALL_MPROTECT,
+        a0,
+        a1,
+        lpr_linux_prot_to_pacha(a2));
+    if (status != 0) {
+        lpr_trace_mmap_error(
+            "mprotect",
             a0,
             a1,
-            lpr_linux_prot_to_pacha(a2)));
+            a2,
+            0,
+            0,
+            0,
+            status);
+    }
+    return lpr_linux_pacha_status_to_errno(status);
 }
 static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a2; (void)a3; (void)a4; (void)a5;
@@ -2011,6 +2106,7 @@ static int64_t lpr_sys_fsync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_ftruncate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_ftruncate(a0, a1); }
 static int64_t lpr_sys_fallocate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return -LPR_LINUX_EOPNOTSUPP; }
 static int64_t lpr_sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sync(); }
+static int64_t lpr_sys_syncfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_syncfs(a0); }
 static int64_t lpr_sys_getcwd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getcwd(a0, a1); }
 static int64_t lpr_sys_chdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_chdir(a0); }
 static int64_t lpr_sys_fchdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_fchdir(a0); }
@@ -2123,6 +2219,7 @@ static int64_t lpr_sys_eventfd2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 static int64_t lpr_sys_timerfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_create(a0, a1); }
 static int64_t lpr_sys_timerfd_settime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_timerfd_settime(a0, a1, a2, a3); }
 static int64_t lpr_sys_timerfd_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_gettime(a0, a1); }
+static int64_t lpr_sys_signalfd4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_signalfd4(a0, a1, a2, a3); }
 static int64_t lpr_sys_accept(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_accept(a0, a1, a2, 0); }
 static int64_t lpr_sys_listen(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_listen(a0, a1); }
 static int64_t lpr_sys_dup3(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_dup2(a0, a1, a2); }
@@ -2289,12 +2386,14 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_EVENTFD, "eventfd", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_eventfd, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_TIMERFD_SETTIME, "timerfd_settime", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_timerfd_settime, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_TIMERFD_GETTIME, "timerfd_gettime", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_timerfd_gettime, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_SIGNALFD4, "signalfd4", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_signalfd4, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_EVENTFD2, "eventfd2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_eventfd2, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_epoll_create1, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_DUP3, "dup3", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_dup3, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_PIPE2, "pipe2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_pipe2, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RECVMMSG, "recvmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_recvmmsg, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_PRLIMIT64, "prlimit64", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_prlimit64, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SYNCFS, "syncfs", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_syncfs, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SENDMMSG, "sendmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_sendmmsg, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRANDOM, "getrandom", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getrandom, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MEMFD_CREATE, "memfd_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_memfd_create, 0),
@@ -2435,12 +2534,14 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_EVENTFD].handler = lpr_sys_eventfd;
     lpr_syscall_table[LPR_LINUX_SYS_TIMERFD_SETTIME].handler = lpr_sys_timerfd_settime;
     lpr_syscall_table[LPR_LINUX_SYS_TIMERFD_GETTIME].handler = lpr_sys_timerfd_gettime;
+    lpr_syscall_table[LPR_LINUX_SYS_SIGNALFD4].handler = lpr_sys_signalfd4;
     lpr_syscall_table[LPR_LINUX_SYS_EVENTFD2].handler = lpr_sys_eventfd2;
     lpr_syscall_table[LPR_LINUX_SYS_EPOLL_CREATE1].handler = lpr_sys_epoll_create1;
     lpr_syscall_table[LPR_LINUX_SYS_DUP3].handler = lpr_sys_dup3;
     lpr_syscall_table[LPR_LINUX_SYS_PIPE2].handler = lpr_sys_pipe2;
     lpr_syscall_table[LPR_LINUX_SYS_RECVMMSG].handler = lpr_sys_recvmmsg;
     lpr_syscall_table[LPR_LINUX_SYS_PRLIMIT64].handler = lpr_sys_prlimit64;
+    lpr_syscall_table[LPR_LINUX_SYS_SYNCFS].handler = lpr_sys_syncfs;
     lpr_syscall_table[LPR_LINUX_SYS_SENDMMSG].handler = lpr_sys_sendmmsg;
     lpr_syscall_table[LPR_LINUX_SYS_GETRANDOM].handler = lpr_sys_getrandom;
     lpr_syscall_table[LPR_LINUX_SYS_MEMFD_CREATE].handler = lpr_sys_memfd_create;

@@ -301,6 +301,10 @@ void lpr_signal_thread_state_after_fork_child(void)
         sizeof(inherited));
     lpr_state.signal.grow_lock_word = 0;
     __atomic_store_n(
+        &lpr_state.signal.signalfd_pending_mask,
+        0u,
+        __ATOMIC_RELEASE);
+    __atomic_store_n(
         &lpr_state.signal.start_reservations,
         0u,
         __ATOMIC_RELEASE);

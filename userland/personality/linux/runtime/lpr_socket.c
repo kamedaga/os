@@ -2203,6 +2203,14 @@ static int64_t lpr_linux_poll_scan(
             }
             continue;
         }
+        if (lpr_linux_signalfd_active(fd)) {
+            fds[i].revents = (int16_t)lpr_linux_signalfd_poll_events(
+                fd, (uint32_t)fds[i].events);
+            if (fds[i].revents != 0) {
+                ready++;
+            }
+            continue;
+        }
         if (lpr_linux_eventfd_active(fd)) {
             fds[i].revents = (int16_t)lpr_linux_eventfd_poll_events(
                 fd, (uint32_t)fds[i].events);
@@ -2490,6 +2498,13 @@ static int64_t lpr_linux_select_scan(
                 events |= LPR_LINUX_POLLIN;
             }
             const uint32_t revents = lpr_linux_timerfd_poll_events(fd, events);
+            is_read = (revents & LPR_LINUX_POLLIN) != 0;
+        } else if (lpr_linux_signalfd_active(fd)) {
+            uint32_t events = 0;
+            if (want_read) {
+                events |= LPR_LINUX_POLLIN;
+            }
+            const uint32_t revents = lpr_linux_signalfd_poll_events(fd, events);
             is_read = (revents & LPR_LINUX_POLLIN) != 0;
         } else if (lpr_linux_eventfd_active(fd)) {
             uint32_t events = 0;

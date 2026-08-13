@@ -1589,7 +1589,13 @@ EXPORT_SYMBOL(tty_kref_put);
 static void release_tty(struct tty_struct *tty, int idx)
 {
 	/* This should always be true but check for the moment */
+	if (tty->index != idx)
+		pr_err("kobox tty: release_tty index mismatch tty=%px tty_index=%d idx=%d driver=%px\n",
+		       tty, tty->index, idx, tty->driver);
 	WARN_ON(tty->index != idx);
+	if (!mutex_is_locked(&tty_mutex))
+		pr_err("kobox tty: release_tty without tty_mutex tty=%px index=%d driver=%px\n",
+		       tty, idx, tty->driver);
 	WARN_ON(!mutex_is_locked(&tty_mutex));
 	if (tty->ops->shutdown)
 		tty->ops->shutdown(tty);

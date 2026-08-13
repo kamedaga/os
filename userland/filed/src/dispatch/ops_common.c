@@ -910,6 +910,11 @@ int64_t filed_lookup_and_open_component(
             0100000u | requested_mode,
             &object_id);
         if (reply_status != 0) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=backend_create status=%lld parent=%llu name=%s\n",
+                (long long)reply_status,
+                (unsigned long long)parent_decision.backend_object,
+                name);
             return reply_status;
         }
         lookup_acquired = true;
@@ -945,6 +950,35 @@ int64_t filed_lookup_and_open_component(
                 &snapshot);
         }
         if (status != FILED_OK) {
+            uint32_t active_vnodes = 0;
+            uint32_t referenced_vnodes = 0;
+            uint32_t active_files = 0;
+            uint32_t active_handles = 0;
+            for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
+                if (runtime->vfs.vnodes[i].active) {
+                    ++active_vnodes;
+                    if (runtime->vfs.vnodes[i].refcount != 0) {
+                        ++referenced_vnodes;
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < FILED_MAX_FILES; ++i) {
+                active_files += runtime->vfs.files[i].active ? 1u : 0u;
+            }
+            for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
+                active_handles += runtime->vfs.handles[i].active ? 1u : 0u;
+            }
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=vfs_create status=%d "
+                "vnodes=%u referenced_vnodes=%u files=%u handles=%u "
+                "backend_object=%llu name=%s\n",
+                (int)status,
+                active_vnodes,
+                referenced_vnodes,
+                active_files,
+                active_handles,
+                (unsigned long long)object_id,
+                name);
             (void)filed_backend_release_object(runtime, object_id);
         }
         return filed_status_to_wire(status);

@@ -31,4 +31,7 @@ fi
   --expect 'ASYNC_EPOLL_HANDLER_CALLED' \
   --expect 'ASYNC_EPOLL_HANDLER_CONTINUED' \
   --expect 'ASYNC_EPOLL_HANDLER=OK' \
+  --expect 'ASYNC_SIGNALFD_READY' \
+  --expect 'ASYNC_SIGNALFD_EPOLL=OK' \
+  --expect 'ASYNC_SIGNALFD=OK' \
   --expect 'ASYNC_SIGNAL_DONE failures=0'

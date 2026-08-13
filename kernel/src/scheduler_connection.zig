@@ -1472,6 +1472,21 @@ fn unlockAllCpuSchedulerStates() void {
     }
 }
 
+fn lockAllCpuRunqueues() void {
+    var cpu_slot: usize = 0;
+    while (cpu_slot < scheduler_state.cpus.len) : (cpu_slot += 1) {
+        scheduler_state.cpus[cpu_slot].runqueue_lock.lock();
+    }
+}
+
+fn unlockAllCpuRunqueues() void {
+    var remaining = scheduler_state.cpus.len;
+    while (remaining != 0) {
+        remaining -= 1;
+        scheduler_state.cpus[remaining].runqueue_lock.unlock();
+    }
+}
+
 /// An unallocated context can still be the identity of the kernel path which
 /// is retiring it.  Keep that slot unavailable until the owning CPU has
 /// actually published idle (AP) or selected its next context (BSP).
@@ -2067,6 +2082,101 @@ pub fn suspendedThreadImage(
     };
 }
 
+/// Capture the sole suspended thread of a staged process only while neither
+/// address space can have another executing or schedulable thread.  Holding
+/// the thread table, every CPU ownership record, and every runqueue together
+/// closes the interval between a runqueue pick and current-principal
+/// publication that separate live-count/CPU-mask checks cannot observe.
+pub fn singleThreadExecImage(
+    current_owner: kernel.PrincipalId,
+    staged_owner: kernel.PrincipalId,
+    staged_thread_index: usize,
+    staged_generation: u32,
+) ?SuspendedThreadImage {
+    if (current_owner == staged_owner) return null;
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    lockAllCpuRunqueues();
+    defer unlockAllCpuRunqueues();
+
+    const local_cpu = currentCpu();
+    if (local_cpu >= scheduler_state.cpus.len) return null;
+    const local_state = &scheduler_state.cpus[local_cpu];
+    if (!local_state.enabled or local_state.is_idle or local_state.current_principal != current_owner) return null;
+    const current_thread_index = local_state.current_thread;
+
+    var current_count: usize = 0;
+    var staged_count: usize = 0;
+    var thread_index: usize = 0;
+    while (thread_index < scheduler_state.thread_table.contexts.len) : (thread_index += 1) {
+        const ctx = &scheduler_state.thread_table.contexts[thread_index];
+        if (!ctx.allocated) continue;
+        if (ctx.owner_process == current_owner) {
+            current_count += 1;
+            if (thread_index != current_thread_index) return null;
+        } else if (ctx.owner_process == staged_owner) {
+            staged_count += 1;
+            if (thread_index != staged_thread_index) return null;
+        }
+    }
+    if (current_count != 1 or staged_count != 1) return null;
+
+    const current_ctx = threadContext(current_thread_index) orelse return null;
+    if (!current_ctx.allocated or current_ctx.owner_process != current_owner or current_ctx.cpu_slot != local_cpu) return null;
+    const current_node = current_ctx.scheduler_entity orelse return null;
+    if (!nodeMatches(current_node, current_thread_index, current_ctx.generation, local_cpu) or
+        current_node.ownership != .running or local_state.current_entity != current_node)
+    {
+        return null;
+    }
+
+    const staged_ctx = threadContext(staged_thread_index) orelse return null;
+    if (!staged_ctx.allocated or staged_ctx.generation != staged_generation or
+        staged_ctx.owner_process != staged_owner or staged_ctx.cpu_slot >= scheduler_state.cpus.len or
+        staged_ctx.ready or staged_ctx.wait_mailbox or staged_ctx.wake_tick != 0 or
+        staged_ctx.stopped or staged_ctx.resume_after_stop)
+    {
+        return null;
+    }
+    const staged_hot = getThreadHotStateConst(staged_thread_index) orelse return null;
+    if (staged_hot.allocated == 0 or staged_hot.ready != 0 or staged_hot.wait_mailbox != 0 or
+        staged_hot.stopped != 0 or staged_hot.wake_tick != 0 or staged_hot.owner_process != staged_owner)
+    {
+        return null;
+    }
+    const staged_node = staged_ctx.scheduler_entity orelse return null;
+    if (!nodeMatches(staged_node, staged_thread_index, staged_generation, staged_ctx.cpu_slot) or
+        staged_node.ownership != .blocked or staged_node.entity.state != .blocked or
+        staged_node.linked_tree != null)
+    {
+        return null;
+    }
+
+    for (&scheduler_state.cpus, 0..) |*state, cpu_slot| {
+        if (!state.enabled) continue;
+        if (state.current_principal) |owner| {
+            if (owner == staged_owner) return null;
+            if (owner == current_owner and cpu_slot != local_cpu) return null;
+        }
+        if (state.current_entity) |entity| {
+            if (entity.thread_index == staged_thread_index) return null;
+            if (entity.thread_index == current_thread_index and cpu_slot != local_cpu) return null;
+            const entity_ctx = threadContext(entity.thread_index) orelse return null;
+            if (entity_ctx.owner_process == staged_owner) return null;
+            if (entity_ctx.owner_process == current_owner and cpu_slot != local_cpu) return null;
+        }
+    }
+
+    return .{
+        .frame = staged_ctx.frame,
+        .fs_base = staged_ctx.fs_base,
+        .gs_base = staged_ctx.gs_base,
+        .pkru = staged_ctx.pkru,
+    };
+}
+
 pub fn installExecContextForCurrentThread(
     user_spaces: []UserAddressSpace,
     owner_process: kernel.PrincipalId,
@@ -2092,6 +2202,22 @@ pub fn installExecContextForCurrentThread(
         ctx.pkru = image.pkru;
         ctx.frame = image.frame;
         ctx.x_state = initial_x_state;
+        // Signal trampoline addresses belong to the old executable image.
+        // Keep pending signals across exec, but require the new runtime to
+        // register its own address-bound delivery configuration.
+        ctx.signal_entry = 0;
+        ctx.signal_inhibit_start = 0;
+        ctx.signal_inhibit_end = 0;
+        ctx.signal_inhibit_secondary_start = 0;
+        ctx.signal_inhibit_secondary_end = 0;
+        ctx.signal_owner = false;
+        // The current private exec image contract does not carry a blocked
+        // mask.  Keep kernel and the new LPR BSS in sync instead of retaining
+        // a kernel-only value that userland would immediately overwrite.
+        // Fork registration does preserve its copied mask because this reset
+        // is confined to exec installation, not generic REGISTER.
+        ctx.signal_blocked_mask = 0;
+        ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
         ctx.ready = true;
         ctx.wait_mailbox = false;
         ctx.wake_tick = 0;
@@ -2506,7 +2632,6 @@ pub fn configureCurrentSignalDelivery(
     const ctx = threadContextMutable(currentThread()) orelse return false;
     if (!ctx.allocated) return false;
     ctx.signal_entry = entry;
-    ctx.signal_blocked_mask = 0;
     ctx.signal_inhibit_start = inhibit_start;
     ctx.signal_inhibit_end = inhibit_end;
     ctx.signal_inhibit_secondary_start = inhibit_secondary_start;
@@ -2515,6 +2640,7 @@ pub fn configureCurrentSignalDelivery(
     // signal owner (the main/event-loop thread).  Process-directed signals are
     // delivered here so teardown runs on the loop that can service them.
     ctx.signal_owner = true;
+    ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
     return true;
 }
 

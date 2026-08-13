@@ -225,7 +225,9 @@ func normalizeFilesystem(value string) string {
 
 func cacheFilesystemKey(filesystem string) string {
 	if filesystem == "ext4" {
-		return "ext4:pacha-compat-v2"
+		/* v4 adds orphan_file, metadata_csum_seed and inline_data to the host
+		 * mke2fs defaults.  Kobox now runs those paths through native ext4/JBD2. */
+		return "ext4:pacha-native-v4"
 	}
 	return filesystem
 }

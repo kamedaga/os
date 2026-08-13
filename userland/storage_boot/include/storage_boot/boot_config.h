@@ -6,7 +6,6 @@
 enum {
     STORAGE_BOOT_CONFIG_MAGIC = 0x3254424f4f544346ull,
     STORAGE_BOOT_CONFIG_VERSION = 2,
-    STORAGE_BOOT_MAX_MODULES = 8,
 };
 
 struct storage_boot_config {

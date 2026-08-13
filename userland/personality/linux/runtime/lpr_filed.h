@@ -18,6 +18,7 @@ int64_t lpr_linux_close(uint64_t fd);
 int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags);
 int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf);
 int64_t lpr_linux_fsync(uint64_t fd);
+int64_t lpr_linux_syncfs(uint64_t fd);
 int64_t lpr_linux_sync(void);
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);

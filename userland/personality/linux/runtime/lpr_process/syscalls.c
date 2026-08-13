@@ -27,6 +27,60 @@ static unsigned char lpr_unmapself_stack[4096] __attribute__((aligned(16)));
 
 enum { LPR_FORK_CHILD_STACK_BYTES = 64u * 1024u };
 
+static char *lpr_fork_diag_append_text(
+    char *out, const char *end, const char *text)
+{
+    if (out == 0 || end == 0 || text == 0) {
+        return out;
+    }
+    while (out < end && *text != '\0') {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_fork_diag_append_i64(
+    char *out, const char *end, int64_t value)
+{
+    char digits[20];
+    uint64_t count = 0;
+    uint64_t magnitude = (uint64_t)value;
+    if (value < 0) {
+        if (out < end) {
+            *out++ = '-';
+        }
+        magnitude = (~magnitude) + 1u;
+    }
+    do {
+        digits[count++] = (char)('0' + (magnitude % 10u));
+        magnitude /= 10u;
+    } while (magnitude != 0 && count < sizeof(digits));
+    while (out < end && count != 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static int64_t lpr_fork_fail(
+    const char *stage, int64_t status)
+{
+    char line[128];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_fork_diag_append_text(out, end, "[lpr] fork failure stage=");
+    out = lpr_fork_diag_append_text(out, end, stage);
+    out = lpr_fork_diag_append_text(out, end, " status=");
+    out = lpr_fork_diag_append_i64(out, end, status);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+    return status;
+}
+
 extern void lpr_fork_child_entry(void);
 
 static volatile uint32_t lpr_process_fork_lock;
@@ -469,13 +523,13 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
         lpr_prepare_fork_manifest(&fork_snapshot, &fork_transaction);
     if (manifest_status != 0) {
         lpr_destroy_exec_transaction(&fork_transaction);
-        return manifest_status;
+        return lpr_fork_fail("manifest", manifest_status);
     }
     const int fork_prepare_status =
         lpr_fork_transaction_prepare(&fork_transaction);
     if (fork_prepare_status != 0) {
         lpr_destroy_exec_transaction(&fork_transaction);
-        return fork_prepare_status;
+        return lpr_fork_fail("transaction_prepare", fork_prepare_status);
     }
     int32_t child_pid = 0;
     uint64_t child_token = 0;
@@ -484,7 +538,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
         const int page_fd = lpr_create_standalone_wire_page(&page);
         if (page_fd < 0) {
             lpr_destroy_exec_transaction(&fork_transaction);
-            return page_fd;
+            return lpr_fork_fail("wire_page", page_fd);
         }
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
         lprs_fork_t *fork_req = (lprs_fork_t *)lpr_supervisor_payload(page);
@@ -507,7 +561,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
         lpr_destroy_standalone_wire_page(page_fd, page);
         if (fork_status != 0) {
             lpr_destroy_exec_transaction(&fork_transaction);
-            return fork_status;
+            return lpr_fork_fail("supervisor_begin", fork_status);
         }
         if (child_pid <= 0 || child_token == 0) {
             if (child_token != 0) {
@@ -515,7 +569,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
                     LPRS_OP_PROCESS_FORK_CANCEL, child_token, -1, 0);
             }
             lpr_destroy_exec_transaction(&fork_transaction);
-            return -LPR_LINUX_EIO;
+            return lpr_fork_fail("supervisor_reply", -LPR_LINUX_EIO);
         }
     } else {
         child_pid = lpr_linux_alloc_child_pid();
@@ -585,7 +639,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
                     LPRS_OP_PROCESS_FORK_CANCEL, child_token, -1, 0);
             }
             lpr_destroy_exec_transaction(&fork_transaction);
-            return reg_status;
+            return lpr_fork_fail("parent_register", reg_status);
         }
         const int commit_status =
             lpr_fork_transaction_commit_parent(&fork_transaction);
@@ -595,7 +649,7 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
                 (uint64_t)(uint32_t)ret,
                 1);
             lpr_destroy_exec_transaction(&fork_transaction);
-            return commit_status;
+            return lpr_fork_fail("transaction_commit", commit_status);
         }
         if (lpr_supervisor_enabled && child_token != 0) {
             (void)lpr_pacha_syscall1(
@@ -616,7 +670,9 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     lpr_linux_pending_child_sid = 0;
     lpr_linux_pending_child_pgrp = 0;
     lpr_supervisor_pending_child_token = 0;
-    return ret == 0 ? -LPR_LINUX_EIO : lpr_pacha_status_to_errno(ret);
+    return lpr_fork_fail(
+        "native_clone",
+        ret == 0 ? -LPR_LINUX_EIO : lpr_pacha_status_to_errno(ret));
 }
 
 int64_t lpr_linux_clone_frame(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)

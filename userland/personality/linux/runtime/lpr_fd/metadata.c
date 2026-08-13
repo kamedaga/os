@@ -573,7 +573,8 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             return -LPR_LINUX_EINVAL;
         }
     }
-    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
+    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd) ||
+        lpr_linux_signalfd_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:
             return lpr_control_get_fd_flags(fd);
@@ -765,7 +766,8 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         st->st_blksize = 4096;
         return 0;
     }
-    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd)) {
+    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd) ||
+        lpr_linux_signalfd_active(fd)) {
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
         lpr_memset(st, 0, sizeof(*st));
         st->st_ino = fd + 1u;

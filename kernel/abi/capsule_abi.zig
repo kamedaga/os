@@ -142,6 +142,23 @@ pub fn rangesOverlap(first_start: u64, first_size: u64, second_start: u64, secon
     return first_start < second_end and second_start < first_end;
 }
 
+pub fn dmaMappingPagesOutputOverlapsInput(
+    layout: DmaMappingPagesLayout,
+    output_va: u64,
+) ?bool {
+    const input_page_span, const span_overflow = @mulWithOverflow(
+        @as(u64, @intCast(layout.page_count)),
+        @as(u64, 4096),
+    );
+    if (span_overflow != 0) return null;
+    return rangesOverlap(
+        layout.first_page_va,
+        input_page_span,
+        output_va,
+        layout.output_size_bytes,
+    );
+}
+
 pub const pci_bar_count: u32 = 6;
 pub const pci_config_space_size: u32 = 256;
 
@@ -197,7 +214,18 @@ test "DMA mapping page layout checks boundaries and overflow" {
 
 test "DMA mapping page output must not overlap the DMA range" {
     const layout = dmaMappingPagesLayout(0x4000, 8192).?;
-    try std.testing.expectEqual(false, rangesOverlap(0x4000, 8192, 0x8000, layout.output_size_bytes).?);
-    try std.testing.expectEqual(true, rangesOverlap(0x4000, 8192, 0x5ff8, layout.output_size_bytes).?);
-    try std.testing.expect(rangesOverlap(0x4000, 8192, std.math.maxInt(u64), layout.output_size_bytes) == null);
+    try std.testing.expectEqual(false, dmaMappingPagesOutputOverlapsInput(layout, 0x8000).?);
+    try std.testing.expectEqual(true, dmaMappingPagesOutputOverlapsInput(layout, 0x5ff8).?);
+    try std.testing.expect(dmaMappingPagesOutputOverlapsInput(layout, std.math.maxInt(u64)) == null);
+
+    const same_page = dmaMappingPagesLayout(0x4ff0, 8).?;
+    const output_va: u64 = 0x4100;
+    try std.testing.expectEqual(
+        false,
+        rangesOverlap(0x4ff0, 8, output_va, same_page.output_size_bytes).?,
+    );
+    try std.testing.expectEqual(
+        true,
+        dmaMappingPagesOutputOverlapsInput(same_page, output_va).?,
+    );
 }

@@ -295,6 +295,13 @@ static int filed_kobox_call_with_fd(
     const uint64_t start_cycles = filed_kobox_backend_read_tsc();
     int status = filed_ipc_send_wait(backend->fs_fd, &request);
     if (status != 0) {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=storage_ipc_send status=%d op=%llu "
+            "request=%llu transfer_fd=%d\n",
+            status,
+            (unsigned long long)op,
+            (unsigned long long)request_id,
+            transfer_fd);
         filed_kobox_backend_record_metric(
             backend,
             op,
@@ -312,6 +319,13 @@ static int filed_kobox_call_with_fd(
 
         status = filed_ipc_recv_wait(backend->fs_fd, &reply);
         if (status != 0) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=storage_ipc_recv status=%d op=%llu "
+                "request=%llu attempt=%u\n",
+                status,
+                (unsigned long long)op,
+                (unsigned long long)request_id,
+                attempt);
             filed_kobox_backend_record_metric(
                 backend,
                 op,
@@ -327,6 +341,13 @@ static int filed_kobox_call_with_fd(
         {
             if ((int64_t)reply.word1 < 0) {
                 status = (int)(int64_t)reply.word1;
+                fprintf(stderr,
+                    "FILED_STORAGE_FAULT layer=storage_ipc_reply status=%d "
+                    "op=%llu request=%llu result=%llu\n",
+                    status,
+                    (unsigned long long)op,
+                    (unsigned long long)request_id,
+                    (unsigned long long)reply.word2);
                 filed_kobox_backend_record_metric(
                     backend,
                     op,
@@ -770,6 +791,14 @@ int filed_kobox_backend_create(
             name,
             mode,
             out_object_id);
+        if (status != 0) {
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=storage_direct_create status=%d "
+                "parent=%llu name=%s\n",
+                status,
+                (unsigned long long)parent_object_id,
+                name);
+        }
         if (status == 0) {
             filed_kobox_backend_mark_dirty(backend);
         }
@@ -778,6 +807,14 @@ int filed_kobox_backend_create(
 
     int status = filed_kobox_wire_page(backend, &page);
     if (status != 0) {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=storage_wire_page status=%d "
+            "parent=%llu name=%s ready=%d fd=%d\n",
+            status,
+            (unsigned long long)parent_object_id,
+            name,
+            backend->wire_page_ready,
+            backend->wire_page.fd);
         return status;
     }
 
@@ -793,6 +830,13 @@ int filed_kobox_backend_create(
         filed_kobox_wire_page_fd(backend, page),
         &object_id);
     if (status != 0) {
+        fprintf(stderr,
+            "FILED_STORAGE_FAULT layer=storage_wire_create status=%d "
+            "parent=%llu name=%s wire_fd=%d\n",
+            status,
+            (unsigned long long)parent_object_id,
+            name,
+            filed_kobox_wire_page_fd(backend, page));
         return status;
     }
 

@@ -20,4 +20,6 @@ if [ ! -e /p ] && [ ! -d /kame ]; then
 else
   echo "EXT4R_CLEAN=FAIL"
 fi
+/bin/sync
+echo "EXT4R_SYNC=OK"
 echo "EXT4R_DONE"

@@ -226,6 +226,26 @@ apps:
       path: "tests/fixtures/apk_shell_smoke.sh"
     out: "APKSHSMK.SH"
     rootfs: "/cmd/apk_shell_smoke.sh"
+  ext4_apk_reproducer_script:
+    file:
+      path: "tests/fixtures/ext4_apk_reproducer.sh"
+    out: "EXT4APK.SH"
+    rootfs: "/cmd/ext4_apk_reproducer.sh"
+  lpr_bash_file_churn_probe_script:
+    file:
+      path: "tests/fixtures/lpr_bash_file_churn_probe.sh"
+    out: "LPRBASHCHURN.SH"
+    rootfs: "/cmd/lpr_bash_file_churn_probe.sh"
+  ext4_setattr_smoke_script:
+    file:
+      path: "tests/fixtures/ext4_setattr_smoke.sh"
+    out: "EXT4ATTR.SH"
+    rootfs: "/cmd/ext4_setattr_smoke.sh"
+  ext4_parallel_probe_script:
+    file:
+      path: "tests/fixtures/ext4_parallel_probe.sh"
+    out: "EXT4PAR.SH"
+    rootfs: "/cmd/ext4_parallel_probe.sh"
   phase4_foot_bashrc:
     file:
       path: "tests/fixtures/phase4_foot_bashrc"
@@ -1386,6 +1406,8 @@ apps:
         - "userland/libfiled_client"
         - "userland/netd/src"
         - "userland/netd/include"
+        - "_kobox/include"
+        - "_kobox/src"
     out: "NETD.ELF"
     rootfs: "/srv/netd.elf"
   termd:
@@ -1407,6 +1429,8 @@ apps:
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "_kobox/include"
+        - "_kobox/src"
     out: "TERMD.ELF"
     rootfs: "/srv/termd.elf"
   drmd:
@@ -1469,6 +1493,9 @@ apps:
         - "musl/upstream/arch/pachaos/syscall_arch.h"
         - "userland/storage_boot/src"
         - "userland/storage_boot/include"
+        - "userland/storage/include"
+        - "_kobox/include"
+        - "_kobox/src"
     out: "STRGBOOT.ELF"
     bootfs: "/srv/storage_boot.elf"
     rootfs: "/srv/storage_boot.elf"
@@ -1508,6 +1535,7 @@ apps:
       input:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
+        - "userland/storage/include"
         - "userland/filed/include"
         - "userland/lpr_supervisor/include"
         - "userland/personality/include"
@@ -1536,6 +1564,7 @@ apps:
         - "userland/filed/src"
         - "userland/koboxd/include"
         - "userland/koboxd/src"
+        - "userland/storage/include"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
         - "userland/libipc/include"

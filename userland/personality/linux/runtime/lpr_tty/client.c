@@ -326,7 +326,11 @@ int64_t lpr_linux_rt_sigpending(uint64_t set_raw, uint64_t sigsetsize)
     if (set_raw == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    *(uint64_t *)(uintptr_t)set_raw = lpr_linux_pending_signal_mask;
+    *(uint64_t *)(uintptr_t)set_raw =
+        lpr_linux_pending_signal_mask |
+        __atomic_load_n(
+            &lpr_state.signal.signalfd_pending_mask,
+            __ATOMIC_ACQUIRE);
     return 0;
 }
 

@@ -11,6 +11,35 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
     filed_exec_linux_lpr_dump_metrics();
     filed_kobox_backend_dump_metrics(&runtime->backend);
     filed_file_vmo_storage_profile_dump();
+    kb_fs_storage_trace_t storage_trace;
+    kb_fs_storage_trace_snapshot(&storage_trace);
+    fprintf(stderr,
+        "FILED_STORAGE_TRACE block_reads=%llu block_read_bytes=%llu "
+        "block_writes=%llu block_write_bytes=%llu "
+        "bio_read=%llu/%llu/%llu bio_write=%llu/%llu/%llu "
+        "bio_flush=%llu/%llu/%llu bio_discard=%llu/%llu/%llu "
+        "readahead=%llu/%llu/%llu/%llu "
+        "native_storage=1\n",
+        (unsigned long long)storage_trace.block_read_calls,
+        (unsigned long long)storage_trace.block_read_bytes,
+        (unsigned long long)storage_trace.block_write_calls,
+        (unsigned long long)storage_trace.block_write_bytes,
+        (unsigned long long)storage_trace.bio_submit[KB_FS_BIO_OP_READ],
+        (unsigned long long)storage_trace.bio_complete[KB_FS_BIO_OP_READ],
+        (unsigned long long)storage_trace.bio_errors[KB_FS_BIO_OP_READ],
+        (unsigned long long)storage_trace.bio_submit[KB_FS_BIO_OP_WRITE],
+        (unsigned long long)storage_trace.bio_complete[KB_FS_BIO_OP_WRITE],
+        (unsigned long long)storage_trace.bio_errors[KB_FS_BIO_OP_WRITE],
+        (unsigned long long)storage_trace.bio_submit[KB_FS_BIO_OP_FLUSH],
+        (unsigned long long)storage_trace.bio_complete[KB_FS_BIO_OP_FLUSH],
+        (unsigned long long)storage_trace.bio_errors[KB_FS_BIO_OP_FLUSH],
+        (unsigned long long)storage_trace.bio_submit[KB_FS_BIO_OP_DISCARD],
+        (unsigned long long)storage_trace.bio_complete[KB_FS_BIO_OP_DISCARD],
+        (unsigned long long)storage_trace.bio_errors[KB_FS_BIO_OP_DISCARD],
+        (unsigned long long)storage_trace.readahead_requests,
+        (unsigned long long)storage_trace.readahead_folios,
+        (unsigned long long)storage_trace.readahead_aops_calls,
+        (unsigned long long)storage_trace.readahead_fallback_calls);
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
     kb_fs_read_profile_t fs_profile;
     kb_linux_block_profile_t block_profile;
@@ -125,8 +154,7 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
         "mapping_cycles=%llu reuse_calls=%llu reuse_cycles=%llu "
         "end_calls=%llu mapped_bytes=%llu direct_mapping_calls=%llu "
         "direct_mapping_cycles=%llu direct_mapped_bytes=%llu "
-        "direct_cache_hits=%llu direct_cache_hit_cycles=%llu "
-        "direct_cache_misses=%llu direct_cache_evictions=%llu staged_read_calls=%llu "
+        "staged_read_calls=%llu "
         "staged_bytes=%llu staging_copy_cycles=%llu\n",
         (unsigned long long)dma_window_profile.begin_calls,
         (unsigned long long)dma_window_profile.mapping_calls,
@@ -138,10 +166,6 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
         (unsigned long long)dma_window_profile.direct_mapping_calls,
         (unsigned long long)dma_window_profile.direct_mapping_cycles,
         (unsigned long long)dma_window_profile.direct_mapped_bytes,
-        (unsigned long long)dma_window_profile.direct_cache_hits,
-        (unsigned long long)dma_window_profile.direct_cache_hit_cycles,
-        (unsigned long long)dma_window_profile.direct_cache_misses,
-        (unsigned long long)dma_window_profile.direct_cache_evictions,
         (unsigned long long)dma_window_profile.staged_read_calls,
         (unsigned long long)dma_window_profile.staged_bytes,
         (unsigned long long)dma_window_profile.staging_copy_cycles);

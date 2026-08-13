@@ -33,6 +33,11 @@ typedef struct koboxd_fs_object {
     char name[KOBOXD_FS_BACKEND_NAME_BYTES];
     uint64_t last_used;
     uint32_t references;
+    /* Lazily opened Linux struct files kept for the lifetime of filed object
+     * references.  Filed splits large operations into transport-sized I/O;
+     * those chunks still belong to one Linux open-file lifetime. */
+    void *native_read_file;
+    void *native_write_file;
     uint8_t used;
     uint8_t linked;
     uint8_t dirty;
@@ -46,6 +51,18 @@ typedef struct koboxd_fs_object_stats {
     uint32_t cached;
     uint64_t evictions;
 } koboxd_fs_object_stats_t;
+
+typedef struct koboxd_fs_hotpath_profile {
+    uint64_t cache_lookup_cycles;
+    uint64_t ext4_lookup_cycles;
+    uint64_t object_register_cycles;
+    uint64_t ext4_create_cycles;
+    uint64_t ext4_rename_cycles;
+    uint64_t rename_post_cycles;
+    uint64_t ext4_unlink_cycles;
+    uint64_t unlink_post_cycles;
+    uint64_t object_refresh_cycles;
+} koboxd_fs_hotpath_profile_t;
 
 typedef struct koboxd_fs_lock {
     atomic_flag flag;
@@ -182,3 +199,5 @@ int koboxd_fs_backend_getdents(
 void koboxd_fs_backend_object_stats(
     const koboxd_fs_backend_t *backend,
     koboxd_fs_object_stats_t *out_stats);
+void koboxd_fs_hotpath_profile_reset(void);
+void koboxd_fs_hotpath_profile_snapshot(koboxd_fs_hotpath_profile_t *out_profile);

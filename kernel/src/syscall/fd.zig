@@ -657,6 +657,8 @@ fn revokeVmoFd(
 ) u64 {
     user_vm.lockAllVmTransactions();
     defer user_vm.unlockAllVmTransactions();
+    const vmo_ref = state.nativeVmoRefForRevokeFd(proc, fd) catch return sc.syscall_err_invalid;
+    if (state.nativeVmoMappingsOverlapPinnedUserObjects(vmo_ref)) return sc.syscall_err_invalid;
     _ = state.revokeVmoFdWithFreeList(proc, fd, free_list, VmoRevokeUnmapper{}) catch |err| switch (err) {
         kernel.KernelError.TableFull => return sc.syscall_err_alloc,
         else => return sc.syscall_err_invalid,
@@ -681,6 +683,7 @@ fn mapVmoFd(
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
     if (flags.anonymous and prot.exec) return sc.syscall_err_invalid;
+    if (flags.anonymous and vmo_offset != 0) return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
     prot.pkey = flags.pkey;
@@ -699,15 +702,71 @@ fn mapVmoFd(
         state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch return sc.syscall_err_map;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (flags.fixed) {
-        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
-        state.munmapRangeWithFreeList(proc, base_va, aligned_size, free_list) catch return sc.syscall_err_map;
+        // File-backed shared/native-default mappings eagerly install PTEs.
+        // Until that PTE operation has its own prepare/commit token, reject
+        // it before touching the old MAP_FIXED target.  Anonymous mappings
+        // remain lazy and private file mappings fault through the VMA.
+        if (!flags.anonymous and (!flags.private or flags.shared)) {
+            return sc.syscall_err_invalid;
+        }
+        if (state.rangeOverlapsPinnedUserObject(proc, base_va, aligned_size)) {
+            return sc.syscall_err_invalid;
+        }
+        const reservation_slots = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            proc,
+            base_va,
+            @intCast(aligned_size),
+        ) orelse return sc.syscall_err_map;
+        if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) return sc.syscall_err_alloc;
+        const anonymous_max_prot = kernel.VmaProt{
+            .read = true,
+            .write = true,
+            .exec = true,
+            .pkey = flags.pkey,
+        };
+        var prepared = (if (flags.anonymous)
+            state.prepareFixedAnonymousMmap(
+                proc,
+                base_va,
+                aligned_size,
+                prot,
+                anonymous_max_prot,
+                flags,
+                free_list,
+            )
+        else
+            state.prepareFixedFdMmap(
+                proc,
+                fd,
+                base_va,
+                aligned_size,
+                prot,
+                flags,
+                vmo_offset,
+                free_list,
+            )) catch |err| return switch (err) {
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
+        defer state.discardFixedMmapPrepared(&prepared, free_list);
+        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) unreachable;
+        state.commitFixedMmapPrepared(&prepared, free_list);
+        return base_va;
     } else if (flags.fixed_noreplace) {
         if (!(state.userMapRangeIsFree(proc, base_va, aligned_size) catch false)) return sc.syscall_err_invalid;
     }
 
     if (flags.anonymous) {
-        if (vmo_offset != 0) return sc.syscall_err_invalid;
-        _ = state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, flags, free_list) catch |err| {
+        const max_prot = kernel.VmaProt{
+            .read = true,
+            .write = true,
+            // Anonymous module/JIT images are populated as RW and finalized
+            // as RX.  The syscall parser still rejects simultaneous W+X;
+            // this ceiling permits only the legitimate transition.
+            .exec = true,
+            .pkey = flags.pkey,
+        };
+        _ = state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, max_prot, flags, free_list) catch |err| {
             switch (err) {
                 kernel.KernelError.TableFull => return sc.syscall_err_alloc,
                 else => return sc.syscall_err_invalid,
@@ -754,19 +813,24 @@ fn mprotectVmaRange(
     if (size_bytes == 0 or (base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
     if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
-    const prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
+    var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
 
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
     defer user_vm.unlockVmTransaction(proc);
 
+    // DMA/MMIO objects retain the current address-to-physical identity.
+    // A protection transition could make a read-only pin writable and then
+    // move a private mapping through COW while the device still uses the old
+    // page, so keep all overlapping transitions fail-closed until close.
+    if (state.rangeOverlapsPinnedUserObject(proc, base_va, aligned_size)) {
+        return sc.syscall_err_invalid;
+    }
+
     const start_vma = state.vmaEntryForVaConst(proc, base_va) orelse return sc.syscall_err_invalid;
     if (base_va + aligned_size > start_vma.endVa()) return sc.syscall_err_invalid;
-
-    if (!prot.read and !prot.write and !prot.exec) {
-        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_map;
-        state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
-        return sc.syscall_ok;
-    }
+    // mprotect does not select a protection key.  Preserve the mapping's
+    // original key instead of silently resetting it to key zero.
+    prot.pkey = start_vma.max_prot.pkey;
 
     const page_count: usize = @intCast(aligned_size / 4096);
     var page_index: usize = 0;
@@ -776,14 +840,53 @@ fn mprotectVmaRange(
         if (va + 4096 > vma.endVa()) return sc.syscall_err_invalid;
     }
 
-    if (!user_vm.protectPresentUserLinearRegionWithProt(proc, base_va, @intCast(aligned_size), .{
-        .read = prot.read,
-        .write = prot.write,
-        .exec = prot.exec,
-        .pkey = prot.pkey,
-    })) return sc.syscall_err_map;
     state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
+    // Re-evaluate every present page from VMA/COW metadata after a protection
+    // transition.  Directly restoring a writable PTE here bypassed the write
+    // fault that separates fork-COW pages, including allocator arenas that
+    // were PROT_NONE when fork occurred.  Invalidating preserves the address
+    // reservation and lets the normal lazy-fault path install the exact new
+    // protection (or allocate a private dirty page on the first write).
+    if (!user_vm.invalidatePresentUserLinearRegionPtes(proc, base_va, @intCast(aligned_size))) {
+        return sc.syscall_err_map;
+    }
     return sc.syscall_ok;
+}
+
+fn findMremapMoveTarget(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    size_bytes: u64,
+) ?u64 {
+    const page_count = size_bytes / 4096;
+    const align_pages = @import("kernel_abi_root").process_abi.user_aslr_granule / 4096;
+    // Each retry jumps to the end of an entire colliding VMA/object.  The
+    // bounded count now reflects distinct blockers, not pages inside a large
+    // un-faulted PROT_NONE arena.
+    const max_attempts = kernel.max_vmas_per_process + kernel.max_fd_objects + 1;
+    var attempt: usize = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const candidate = user_vm.findFreeUserMappingRange(proc, page_count, align_pages) orelse return null;
+        const collision_end = state.userMapCollisionEndVa(proc, candidate, size_bytes) orelse
+            return candidate;
+        if (!user_vm.advanceFreeUserMappingSearch(proc, collision_end)) return null;
+    }
+    return null;
+}
+
+fn fixedMremapTargetIsVmaManaged(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    target_va: u64,
+    size_bytes: u64,
+) bool {
+    var offset: u64 = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const va = target_va + offset;
+        if (!user_vm.userPageHasMappingOrReservation(proc, va)) continue;
+        if (state.vmaEntryForVaConst(proc, va) == null) return false;
+    }
+    return true;
 }
 
 fn mremapVmaRange(
@@ -806,20 +909,87 @@ fn mremapVmaRange(
     const fixed = (flags_bits & vm_abi.mremap_fixed) != 0;
     if (fixed and !may_move) return sc.syscall_err_invalid;
     if (!fixed and new_va != 0) return sc.syscall_err_invalid;
+    const old_end, const old_overflow = @addWithOverflow(old_va, old_size);
+    const requested_new_end, const new_overflow = @addWithOverflow(new_va, new_size);
+    if (old_overflow != 0 or new_overflow != 0) return sc.syscall_err_invalid;
+    if (fixed) {
+        if (new_va < old_end and requested_new_end > old_va) {
+            return sc.syscall_err_invalid;
+        }
+    }
 
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
     defer user_vm.unlockVmTransaction(proc);
 
-    const result = state.mremapRangeWithFreeList(proc, old_va, old_size, new_size, new_va, may_move, fixed, free_list) catch |err| switch (err) {
+    const moves = fixed or new_size > old_size;
+    const source = state.vmaEntryForVaConst(proc, old_va) orelse return sc.syscall_err_invalid;
+    if (old_end > source.endVa() or !source.flags.anonymous) return sc.syscall_err_invalid;
+    if (state.rangeOverlapsPinnedUserObject(proc, old_va, old_size)) return sc.syscall_err_invalid;
+
+    const target_va = if (!moves)
+        old_va
+    else if (fixed)
+        new_va
+    else
+        findMremapMoveTarget(state, proc, new_size) orelse return sc.syscall_err_map;
+    if (moves and state.rangeOverlapsPinnedUserObject(proc, target_va, new_size)) {
+        return sc.syscall_err_invalid;
+    }
+    if (fixed and !fixedMremapTargetIsVmaManaged(state, proc, target_va, new_size)) {
+        return sc.syscall_err_invalid;
+    }
+
+    // Stop direct writes before the state layer retains or materializes a COW
+    // view.  Invalidation preserves the source reservation and metadata, so a
+    // later allocation failure merely causes lazy refaults in the old range.
+    const invalidate_va = if (moves) old_va else old_va + new_size;
+    const invalidate_size = if (moves) old_size else old_size - new_size;
+
+    var reservation_split_slots: usize = 0;
+    if (invalidate_size != 0) {
+        reservation_split_slots += user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            proc,
+            invalidate_va,
+            @intCast(invalidate_size),
+        ) orelse return sc.syscall_err_map;
+    }
+    if (fixed) {
+        reservation_split_slots += user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            proc,
+            target_va,
+            @intCast(new_size),
+        ) orelse return sc.syscall_err_map;
+    }
+    if (reservation_split_slots > user_vm.freeUserReservationSlotCount(proc)) {
+        return sc.syscall_err_alloc;
+    }
+
+    if (invalidate_size != 0 and
+        !user_vm.invalidatePresentUserLinearRegionPtes(proc, invalidate_va, @intCast(invalidate_size)))
+    {
+        return sc.syscall_err_map;
+    }
+
+    var prepared = state.prepareMremapWithFreeList(proc, old_va, old_size, new_size, target_va, may_move, fixed, free_list) catch |err| switch (err) {
         kernel.KernelError.OutOfFreePages => return sc.syscall_err_alloc,
         kernel.KernelError.TableFull => return sc.syscall_err_alloc,
         else => return sc.syscall_err_invalid,
     };
-    if (fixed and !user_vm.unmapPresentUserLinearRegion(proc, new_va, @intCast(new_size))) return sc.syscall_err_map;
-    if (result != old_va or new_size < old_size) {
-        const unmap_va = if (result == old_va) old_va + new_size else old_va;
-        const unmap_size = if (result == old_va) old_size - new_size else old_size;
-        if (unmap_size != 0 and !user_vm.unmapPresentUserLinearRegion(proc, unmap_va, @intCast(unmap_size))) return sc.syscall_err_map;
+    defer state.discardMremapPrepared(&prepared, free_list);
+
+    // Destination backing and every metadata split are now prepared.  The
+    // now may a fixed target cross the destructive commit boundary.
+    if (fixed and !user_vm.unmapPresentUserLinearRegion(proc, target_va, @intCast(new_size))) {
+        unreachable;
+    }
+    const result = state.commitMremapPrepared(&prepared, free_list);
+    // The source PTEs are already absent, so releasing their reservation now
+    // cannot leave a translation pointing at metadata/backing just freed by
+    // the successful state transaction.
+    if (invalidate_size != 0 and
+        !user_vm.unmapPresentUserLinearRegion(proc, invalidate_va, @intCast(invalidate_size)))
+    {
+        unreachable;
     }
     return result;
 }
@@ -969,8 +1139,25 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_invalid;
             defer user_vm.unlockVmTransaction(proc);
-            if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) break :blk sc.syscall_err_map;
-            state.munmapRangeWithFreeList(proc, frame.rdi, size, h.free_list) catch break :blk sc.syscall_err_map;
+            if (state.rangeOverlapsPinnedUserObject(proc, frame.rdi, size)) break :blk sc.syscall_err_invalid;
+            const reservation_slots = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+                proc,
+                frame.rdi,
+                @intCast(size),
+            ) orelse break :blk sc.syscall_err_map;
+            if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) break :blk sc.syscall_err_alloc;
+            var prepared = state.prepareMunmapRangeWithFreeList(
+                proc,
+                frame.rdi,
+                size,
+                h.free_list,
+            ) catch |err| break :blk switch (err) {
+                kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+                else => sc.syscall_err_map,
+            };
+            defer state.discardMunmapPrepared(&prepared, h.free_list);
+            if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) unreachable;
+            state.commitMunmapPrepared(&prepared, h.free_list);
             break :blk sc.syscall_ok;
         },
         sc.syscall_mprotect => mprotectVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),

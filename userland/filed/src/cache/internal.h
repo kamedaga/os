@@ -179,6 +179,9 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
     filed_runtime_t *runtime,
     uint64_t length);
+uint32_t filed_file_vmo_cache_reclaim_snapshots(
+    filed_runtime_t *runtime,
+    uint64_t *out_bytes);
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_shared_lookup(
     filed_runtime_t *runtime,
     uint64_t backend_object);

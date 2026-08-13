@@ -162,6 +162,13 @@ int64_t lpr_wait_graph_add_fd(
             graph, lpr_eventfd_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_EVENT, (uint32_t)fd);
     }
+    if (lpr_linux_signalfd_active(fd)) {
+        if ((events & 0x0001u) == 0)
+            return 0;
+        return lpr_wait_graph_add_leaf(
+            graph, lpr_eventfd_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
+            0, LPR_WAIT_DRAIN_EVENT, (uint32_t)fd);
+    }
     if (lpr_linux_eventfd_active(fd)) {
         const int native_fd = lpr_eventfd_native_wait_fd(fd);
         return lpr_wait_graph_add_leaf(

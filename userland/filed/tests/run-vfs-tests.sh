@@ -40,6 +40,8 @@ mkdir -p "${build_dir}"
   -I"${repo_root}/userland/libipc/include" \
   -I"${repo_root}/userland/libpacha/include" \
   -I"${repo_root}/userland/personality/include" \
+  -I"${repo_root}/_kobox/include" \
+  -I"${repo_root}/_kobox/src" \
   "${repo_root}/userland/filed/src/vfs/core.c" \
   "${repo_root}/userland/filed/src/vfs/object.c" \
   "${repo_root}/userland/filed/src/dispatch/ops_file.c" \

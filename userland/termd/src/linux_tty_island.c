@@ -68,13 +68,16 @@ enum {
     TERMD_LINUX_INODE_CDEV_OFFSET = 0x238,
     TERMD_LINUX_PATH_DENTRY_OFFSET = 0x8,
     TERMD_LINUX_DENTRY_FSDATA_OFFSET = 0x80,
+    TERMD_LINUX_TTY_INDEX_OFFSET = 0x4,
     TERMD_LINUX_TTY_DRIVER_OFFSET = 0x10,
     TERMD_LINUX_TTY_FLAGS_OFFSET = 0x1a0,
     TERMD_LINUX_TTY_COUNT_OFFSET = 0x1a8,
     TERMD_LINUX_TTY_CTRL_PGRP_OFFSET = 0x1c0,
     TERMD_LINUX_TTY_CTRL_SESSION_OFFSET = 0x1c8,
     TERMD_LINUX_TTY_LINK_OFFSET = 0x1e0,
+    TERMD_LINUX_TTY_DRIVER_NUM_OFFSET = 0x34,
     TERMD_LINUX_TTY_DRIVER_SUBTYPE_OFFSET = 0x3a,
+    TERMD_LINUX_TTY_DRIVER_TTYS_OFFSET = 0x80,
     TERMD_LINUX_TASK_SIGNAL_OFFSET = 0x848,
     TERMD_LINUX_TASK_SIGHAND_OFFSET = 0x850,
     TERMD_LINUX_TASK_BLOCKED_OFFSET = 0x858,
@@ -173,6 +176,10 @@ typedef struct termd_linux_transfer_lease {
 static termd_linux_tty_handle_t tty_handles[TERMD_LINUX_TTY_HANDLE_MAX];
 static termd_linux_transfer_lease_t transfer_leases[TERMD_LINUX_TRANSFER_LEASE_MAX];
 static uint64_t next_tty_handle = 1;
+static uint64_t next_tty_io_sequence = 1;
+static uint64_t next_tty_drain_sequence = 1;
+static uint32_t tty_drain_diag_budget;
+static const unsigned char *tty_kclose_diag_address;
 
 static void write_ptr_field(void *base, size_t offset, const void *value)
 {
@@ -246,9 +253,10 @@ static void log_tty_state(const char *label, const void *tty)
     void *driver = read_ptr_field(tty, TERMD_LINUX_TTY_DRIVER_OFFSET);
     void *link = read_ptr_field(tty, TERMD_LINUX_TTY_LINK_OFFSET);
     printf(
-        "[termd] linux tty state %s tty=%p driver=%p subtype=%u flags=0x%llx count=%u link=%p\n",
+        "[termd] linux tty state %s tty=%p index=%u driver=%p subtype=%u flags=0x%llx count=%u link=%p\n",
         label,
         tty,
+        (unsigned)read_u32_field(tty, TERMD_LINUX_TTY_INDEX_OFFSET),
         driver,
         driver != NULL ? (unsigned)read_u16_field(driver, TERMD_LINUX_TTY_DRIVER_SUBTYPE_OFFSET) : 0u,
         (unsigned long long)read_u64_field(tty, TERMD_LINUX_TTY_FLAGS_OFFSET),
@@ -267,24 +275,80 @@ static void *handle_file_tty(const termd_linux_tty_handle_t *handle)
 
 static void drain_linux_tty_work(void)
 {
+    const uint64_t sequence = next_tty_drain_sequence++;
+    const int diagnose = tty_drain_diag_budget != 0;
+    if (diagnose) {
+        tty_drain_diag_budget--;
+        printf(
+            "[termd] linux tty drain begin seq=%llu budget=%u\n",
+            (unsigned long long)sequence,
+            (unsigned)tty_drain_diag_budget);
+    }
     for (unsigned i = 0; i < 4; i++) {
         kb_run_deferred_work();
-        if (kb_handle_any_irq(0) != 0) {
+        if (diagnose) {
+            printf(
+                "[termd] linux tty drain work-done seq=%llu iteration=%u\n",
+                (unsigned long long)sequence,
+                i);
+        }
+        const int irq_status = kb_handle_any_irq(0);
+        if (diagnose) {
+            printf(
+                "[termd] linux tty drain irq-done seq=%llu iteration=%u status=%d\n",
+                (unsigned long long)sequence,
+                i,
+                irq_status);
+        }
+        if (irq_status != 0) {
             break;
         }
     }
     kb_run_deferred_work();
+    if (diagnose) {
+        printf(
+            "[termd] linux tty drain done seq=%llu\n",
+            (unsigned long long)sequence);
+    }
 }
 
 static void termd_linux_tty_notify_ready(void);
+
+int termd_linux_tty_island_diag_active(void)
+{
+    return tty_drain_diag_budget != 0;
+}
+
+void termd_linux_tty_island_diag_code(void)
+{
+    if (tty_kclose_diag_address == NULL) {
+        printf("[termd] linux tty code tty_kclose=missing\n");
+        return;
+    }
+    printf("[termd] linux tty code tty_kclose=%p bytes=", tty_kclose_diag_address);
+    for (size_t i = 0; i < 32; ++i) {
+        printf("%02x", (unsigned)tty_kclose_diag_address[i]);
+    }
+    printf(" end=%u\n", 0u);
+}
 
 void termd_linux_tty_island_pump(struct termd_linux_tty_island *island)
 {
     if (island == NULL || !island->ready) {
         return;
     }
+    const int diagnose = tty_drain_diag_budget != 0;
+    if (diagnose) {
+        printf("[termd] linux tty pump begin\n");
+    }
     drain_linux_tty_work();
+    if (diagnose) {
+        printf("[termd] linux tty pump drain-done\n");
+    }
     termd_linux_tty_notify_ready();
+    if (diagnose) {
+        printf("[termd] linux tty pump notify-done\n");
+    }
 }
 
 static int enter_owner_context(kb_module_t *owner, termd_linux_owner_context_t *context)
@@ -314,6 +378,59 @@ static kb_module_t *handle_function_owner(
         return owner;
     }
     return handle == NULL ? NULL : handle->owner;
+}
+
+static void log_tty_close_state(
+    const char *phase,
+    const char *reason,
+    const termd_linux_tty_handle_t *handle)
+{
+    if (handle == NULL) {
+        return;
+    }
+    void *tty = handle_file_tty(handle);
+    void *driver = tty != NULL ?
+        read_ptr_field(tty, TERMD_LINUX_TTY_DRIVER_OFFSET) : NULL;
+    const uint32_t tty_index = tty != NULL ?
+        read_u32_field(tty, TERMD_LINUX_TTY_INDEX_OFFSET) : UINT32_MAX;
+    const uint32_t driver_num = driver != NULL ?
+        read_u32_field(driver, TERMD_LINUX_TTY_DRIVER_NUM_OFFSET) : 0;
+    void *driver_ttys = driver != NULL ?
+        read_ptr_field(driver, TERMD_LINUX_TTY_DRIVER_TTYS_OFFSET) : NULL;
+    void *driver_slot = NULL;
+    if (driver_ttys != NULL && tty_index < driver_num) {
+        driver_slot = read_ptr_field(
+            driver_ttys,
+            (size_t)tty_index * sizeof(void *));
+    }
+    void *tty_mutex = NULL;
+    kb_module_t *tty_core = kb_module_find_owner_for_address(handle->release);
+    if (tty_core != NULL) {
+        (void)kb_module_find_symbol(tty_core, "tty_mutex", &tty_mutex);
+    }
+    printf(
+        "[termd] linux tty close %s reason=%s handle=%llu refs=%u master=%u "
+        "dev=0x%llx saved_index=%u notify_fd=%d tty=%p tty_index=%u "
+        "tty_count=%u driver=%p driver_num=%u driver_slot=%p "
+        "tty_mutex=%p mutex_locked=%d release=%p\n",
+        phase,
+        reason != NULL ? reason : "unknown",
+        (unsigned long long)handle->handle,
+        (unsigned)handle->ref_count,
+        (unsigned)handle->master,
+        (unsigned long long)handle->dev,
+        (unsigned)handle->pts_index,
+        handle->notify_fd,
+        tty,
+        (unsigned)tty_index,
+        tty != NULL ?
+            (unsigned)read_u32_field(tty, TERMD_LINUX_TTY_COUNT_OFFSET) : 0u,
+        driver,
+        (unsigned)driver_num,
+        driver_slot,
+        tty_mutex,
+        tty_mutex != NULL ? kb_mutex_is_locked(tty_mutex) : -1,
+        handle->release);
 }
 
 static int enter_handle_function_context(
@@ -1066,7 +1183,9 @@ int termd_linux_tty_island_open_hvc(
         request->tty.signal_mask,
         request->tty.signal_ignored);
 
+    log_tty_close_state("open-begin", "hvc", handle);
     int result = call_handle_open(handle);
+    log_tty_close_state("open-done", "hvc", handle);
     drain_linux_tty_work();
     if (result != 0) {
         pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc_open"), request->pts_index, (uint64_t)result);
@@ -1118,7 +1237,14 @@ int termd_linux_tty_island_take_signal(
     if (!island->ready) {
         return -19;
     }
+    const int diagnose = termd_linux_tty_island_diag_active();
+    if (diagnose) {
+        printf("[termd] linux tty signal begin\n");
+    }
     drain_linux_tty_work();
+    if (diagnose) {
+        printf("[termd] linux tty signal drain-done\n");
+    }
     int pgrp = 0;
     int sig = 0;
     uint64_t generation = island->signal_generation;
@@ -1127,6 +1253,13 @@ int termd_linux_tty_island_take_signal(
         &pgrp,
         &sig,
         &generation);
+    if (diagnose) {
+        printf(
+            "[termd] linux tty signal take-done status=%d pgrp=%d sig=%d\n",
+            status,
+            pgrp,
+            sig);
+    }
     if (status < 0) {
         return status;
     }
@@ -1144,7 +1277,10 @@ int termd_linux_tty_island_take_signal(
     return 0;
 }
 
-int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t handle_id)
+static int termd_linux_tty_island_close_reason(
+    struct termd_linux_tty_island *island,
+    uint64_t handle_id,
+    const char *reason)
 {
     if (island == NULL) {
         return -22;
@@ -1154,9 +1290,11 @@ int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t
         return -9;
     }
     if (handle->ref_count > 1) {
+        log_tty_close_state("decrement", reason, handle);
         handle->ref_count--;
         return 0;
     }
+    log_tty_close_state("release-begin", reason, handle);
     int result = 0;
     if (handle->release != NULL) {
         termd_linux_owner_context_t context;
@@ -1166,12 +1304,20 @@ int termd_linux_tty_island_close(struct termd_linux_tty_island *island, uint64_t
             leave_owner_context(&context);
         }
     }
+    log_tty_close_state("release-done", reason, handle);
     if (handle->notify_fd >= 16) {
         (void)pacha_fd_close(handle->notify_fd);
         handle->notify_fd = -1;
     }
     memset(handle, 0, sizeof(*handle));
     return result;
+}
+
+int termd_linux_tty_island_close(
+    struct termd_linux_tty_island *island,
+    uint64_t handle_id)
+{
+    return termd_linux_tty_island_close_reason(island, handle_id, "request");
 }
 
 size_t termd_linux_tty_island_collect_wait_sources(int *out_fds, size_t capacity)
@@ -1201,6 +1347,10 @@ static uint32_t termd_linux_transfer_lease_count(uint64_t handle)
 size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island)
 {
     if (island == NULL) return 0;
+    const int diagnose = termd_linux_tty_island_diag_active();
+    if (diagnose) {
+        printf("[termd] linux tty reap begin\n");
+    }
     size_t reaped = 0;
     for (size_t i = 0; i < TERMD_LINUX_TTY_HANDLE_MAX; ++i) {
         termd_linux_tty_handle_t *handle = &tty_handles[i];
@@ -1216,7 +1366,8 @@ size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island
         handle->notify_fd = -1;
         (void)pacha_fd_close(notify_fd);
         handle->ref_count = termd_linux_transfer_lease_count(handle_id) + 1u;
-        (void)termd_linux_tty_island_close(island, handle_id);
+        (void)termd_linux_tty_island_close_reason(
+            island, handle_id, "notify-hangup");
         printf("[termd] tty_orphan_reap handle=%llu\n",
             (unsigned long long)handle_id);
         reaped++;
@@ -1233,8 +1384,12 @@ size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island
         const uint64_t handle_id = lease->handle;
         (void)pacha_fd_close(lease->lease_fd);
         memset(lease, 0, sizeof(*lease));
-        (void)termd_linux_tty_island_close(island, handle_id);
+        (void)termd_linux_tty_island_close_reason(
+            island, handle_id, "transfer-hangup");
         reaped++;
+    }
+    if (diagnose) {
+        printf("[termd] linux tty reap done count=%llu\n", (unsigned long long)reaped);
     }
     return reaped;
 }
@@ -1516,6 +1671,16 @@ int termd_linux_tty_island_io(
     if (iter_fn == NULL) {
         return -95;
     }
+    const uint64_t io_sequence = next_tty_io_sequence++;
+    printf(
+        "[termd] linux tty io request seq=%llu op=%s handle=%llu length=%llu "
+        "tty=%p iter=%p\n",
+        (unsigned long long)io_sequence,
+        write ? "write" : "read",
+        (unsigned long long)handle->handle,
+        (unsigned long long)request->length,
+        handle_file_tty(handle),
+        iter_fn);
     termd_linux_tty_sync_current_state(
         handle,
         termd_linux_tty_merge_ids(
@@ -1527,6 +1692,10 @@ int termd_linux_tty_island_io(
         iter_fn,
         request->tty.signal_mask,
         request->tty.signal_ignored);
+    printf(
+        "[termd] linux tty io state-done seq=%llu op=%s\n",
+        (unsigned long long)io_sequence,
+        write ? "write" : "read");
     if (request->length > TERMD_IO_BYTES) {
         request->length = TERMD_IO_BYTES;
     }
@@ -1555,9 +1724,24 @@ int termd_linux_tty_island_io(
         handle->file,
         TERMD_LINUX_FILE_FLAGS_OFFSET,
         saved_file_flags | TERMD_LINUX_O_NONBLOCK);
+    printf(
+        "[termd] linux tty io call-begin seq=%llu op=%s length=%llu\n",
+        (unsigned long long)io_sequence,
+        write ? "write" : "read",
+        (unsigned long long)request->length);
     const long result = ((termd_linux_fops_iter_fn)iter_fn)(kiocb, iter);
+    printf(
+        "[termd] linux tty io iter-done seq=%llu op=%s result=%ld\n",
+        (unsigned long long)io_sequence,
+        write ? "write" : "read",
+        result);
     write_u32_field(handle->file, TERMD_LINUX_FILE_FLAGS_OFFSET, saved_file_flags);
     drain_linux_tty_work();
+    printf(
+        "[termd] linux tty io work-done seq=%llu op=%s\n",
+        (unsigned long long)io_sequence,
+        write ? "write" : "read");
+    tty_drain_diag_budget = 8;
     if (has_context) {
         leave_owner_context(&context);
     }
@@ -1741,6 +1925,10 @@ int termd_linux_tty_island_init(
         }
         printf("[termd] linux tty module init ready name=%s\n", loaded.name);
         if (strcmp(loaded.name, "linux_tty_core.ko") == 0) {
+            void *tty_kclose = NULL;
+            if (kb_module_find_symbol(island->modules[i], "tty_kclose", &tty_kclose) == KB_OK) {
+                tty_kclose_diag_address = tty_kclose;
+            }
             tty_core_ready = 1;
         } else if (strcmp(loaded.name, "linux_tty_n_null.ko") == 0) {
             tty_n_null_ready = 1;

@@ -283,6 +283,7 @@ pub fn inheritFdsForProcessCreate(self: anytype, from: PrincipalId, to: Principa
     while (fd_index < fd_table_entries) : (fd_index += 1) {
         const source = source_table.entries[fd_index];
         if (source.object.isNull() or !source.flags.inherit or source.flags.private) continue;
+        if (self.kernelObjectIsPinnedUserObject(source.object)) continue;
         if (!dest_table.entries[fd_index].isEmpty()) return KernelError.InvalidState;
         try self.retainKernelObject(source.object);
         dest_table.entries[fd_index] = .{

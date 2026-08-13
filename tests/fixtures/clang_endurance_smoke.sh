@@ -56,8 +56,9 @@ total_start=$("$bb" date +%s)
 echo CLANG_STATE_BEFORE
 "$bb" true
 echo CLANG_STATE_BEFORE_DONE
+iterations=${CLANG_ENDURANCE_ITERATIONS:-5}
 i=1
-while [ "$i" -le 10 ]; do
+while [ "$i" -le "$iterations" ]; do
     iter_start=$("$bb" date +%s)
     if ! "$clang" "$hello_src" -o "$hello_bin"; then
         echo "CLANG_ENDURANCE_FAIL iteration=$i stage=compile"
@@ -82,4 +83,4 @@ echo CLANG_KOBOX_AFTER_DONE
 echo CLANG_STATE_AFTER
 "$bb" true
 echo CLANG_STATE_AFTER_DONE
-echo "CLANG_ENDURANCE_DONE iterations=10 elapsed_s=$((total_end - total_start))"
+echo "CLANG_ENDURANCE_DONE iterations=$iterations elapsed_s=$((total_end - total_start))"

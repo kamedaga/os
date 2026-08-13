@@ -250,6 +250,125 @@ static int private_file_split_cow_phase(void)
     return 1;
 }
 
+static int mprotect_ceiling_phase(void)
+{
+    int fd = open(persist_path, O_RDWR);
+    if (fd < 0) {
+        return 0;
+    }
+    unsigned char *shared = mmap(
+        0,
+        PAGE_BYTES,
+        PROT_READ,
+        MAP_SHARED,
+        fd,
+        0);
+    if (shared == MAP_FAILED ||
+        mprotect(shared, PAGE_BYTES, PROT_READ | PROT_WRITE) != 0)
+    {
+        if (shared != MAP_FAILED) munmap(shared, PAGE_BYTES);
+        close(fd);
+        return 0;
+    }
+    const size_t tail = PAGE_BYTES - 1u;
+    const unsigned char original = shared[tail];
+    shared[tail] = (unsigned char)(original ^ 0xa5u);
+    const int shared_write_good = shared[tail] == (unsigned char)(original ^ 0xa5u);
+    shared[tail] = original;
+    const int shared_restore_good =
+        msync(shared, PAGE_BYTES, MS_SYNC) == 0 &&
+        mprotect(shared, PAGE_BYTES, PROT_READ) == 0;
+    munmap(shared, PAGE_BYTES);
+    close(fd);
+    if (!shared_write_good || !shared_restore_good) {
+        return 0;
+    }
+    emit("SHMAP_MPROTECT_SHARED_RDWR=OK\n");
+
+    fd = open(persist_path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    shared = mmap(0, PAGE_BYTES, PROT_READ, MAP_SHARED, fd, 0);
+    const int readonly_denied =
+        shared != MAP_FAILED &&
+        mprotect(shared, PAGE_BYTES, PROT_READ | PROT_WRITE) != 0;
+    if (shared != MAP_FAILED) munmap(shared, PAGE_BYTES);
+    close(fd);
+    if (!readonly_denied) {
+        return 0;
+    }
+    emit("SHMAP_MPROTECT_SHARED_RDONLY_DENIED=OK\n");
+
+    fd = open(persist_path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    unsigned char *private_map = mmap(
+        0,
+        PAGE_BYTES,
+        PROT_READ,
+        MAP_PRIVATE,
+        fd,
+        0);
+    if (private_map == MAP_FAILED ||
+        mprotect(private_map, PAGE_BYTES, PROT_READ | PROT_WRITE) != 0)
+    {
+        if (private_map != MAP_FAILED) munmap(private_map, PAGE_BYTES);
+        close(fd);
+        return 0;
+    }
+    const unsigned char private_original = private_map[0];
+    private_map[0] = (unsigned char)(private_original ^ 0x5au);
+    unsigned char file_byte = 0;
+    const int private_good =
+        private_map[0] == (unsigned char)(private_original ^ 0x5au) &&
+        pread(fd, &file_byte, 1, 0) == 1 &&
+        file_byte == private_original;
+    munmap(private_map, PAGE_BYTES);
+    close(fd);
+    if (!private_good) {
+        return 0;
+    }
+    emit("SHMAP_MPROTECT_PRIVATE_RDONLY_COW=OK\n");
+
+    fd = memfd_create("pacha-mprotect-seal", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0 ||
+        ftruncate(fd, PAGE_BYTES) != 0 ||
+        fcntl(fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE) != 0)
+    {
+        if (fd >= 0) close(fd);
+        return 0;
+    }
+    shared = mmap(0, PAGE_BYTES, PROT_READ, MAP_SHARED, fd, 0);
+    const int sealed_denied =
+        shared != MAP_FAILED &&
+        mprotect(shared, PAGE_BYTES, PROT_READ | PROT_WRITE) != 0;
+    if (shared != MAP_FAILED) munmap(shared, PAGE_BYTES);
+    close(fd);
+    if (!sealed_denied) {
+        return 0;
+    }
+    emit("SHMAP_MPROTECT_FUTURE_WRITE_DENIED=OK\n");
+
+    fd = open(persist_path, O_RDONLY);
+    if (fd < 0) {
+        return 0;
+    }
+    shared = mmap(0, PAGE_BYTES, PROT_READ, MAP_SHARED, fd, 0);
+    const int shared_rx_good =
+        shared != MAP_FAILED &&
+        mprotect(shared, PAGE_BYTES, PROT_READ | PROT_EXEC) == 0 &&
+        mprotect(shared, PAGE_BYTES, PROT_READ) == 0;
+    if (shared != MAP_FAILED) munmap(shared, PAGE_BYTES);
+    close(fd);
+    if (!shared_rx_good) {
+        return 0;
+    }
+    emit("SHMAP_MPROTECT_SHARED_RX=OK\n");
+    return 1;
+}
+
 static int fork_shared_phase(int anonymous)
 {
     int fd = -1;
@@ -308,6 +427,9 @@ static int verify_phase(void)
         return 0;
     }
     if (!private_file_split_cow_phase()) {
+        return 0;
+    }
+    if (!mprotect_ceiling_phase()) {
         return 0;
     }
     if (!fork_shared_phase(0)) {

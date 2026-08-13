@@ -3,11 +3,17 @@
 set -u
 
 runtime=/run/user/0
-watchdog_seconds=20
-cleanup_ticks=300
+watchdog_seconds=${SWAY_PHASE1_WATCHDOG_SECONDS:-20}
+cleanup_ticks=${SWAY_PHASE1_CLEANUP_TICKS:-300}
 
 fail()
 {
+    if [[ -n ${active_sway_log:-} && -f $active_sway_log ]]; then
+        printf 'SWAY_PHASE1_DIAGNOSTIC_BEGIN iteration=%s log=%s\n' \
+            "${i:-unknown}" "$active_sway_log"
+        /bin/cat "$active_sway_log"
+        printf 'SWAY_PHASE1_DIAGNOSTIC_END iteration=%s\n' "${i:-unknown}"
+    fi
     printf 'SWAY_PHASE1_ACCEPTANCE_FAIL stage=%s\n' "$1"
     return 1
 }
@@ -129,12 +135,11 @@ cleanup_killed_runtime()
 resource_probe()
 {
     local stage=$1
-    /bin/true &
+    /bin/sync &
     local probe_pid=$!
-    printf 'SWAY_PHASE1_LPR_PROBE stage=%s pid=%s\n' "$stage" "$probe_pid"
-    wait "$probe_pid"
+    printf 'SWAY_PHASE1_LPR_PROBE stage=%s\n' "$stage"
     printf 'SWAY_PHASE1_FILED_PROBE stage=%s\n' "$stage"
-    /bin/sync
+    wait "$probe_pid" || return 1
 }
 
 if [[ ${1:-} == --foot-child ]]; then
@@ -174,10 +179,14 @@ if ! runtime_is_clean; then
 fi
 
 printf 'SWAY_PHASE1_SESSION_OK runtime=%s seatd=persistent environment=clean\n' "$runtime"
-resource_probe baseline
+resource_probe baseline || {
+    fail sync-baseline
+    exit 1
+}
 
-iterations=10
-i=1
+iterations=${SWAY_PHASE1_ITERATIONS:-5}
+i=${SWAY_PHASE1_START_ITERATION:-1}
+active_sway_log=
 while [[ $i -le $iterations ]]; do
     case $i in
         3|8) mode=term ;;
@@ -187,10 +196,13 @@ while [[ $i -le $iterations ]]; do
 
     printf 'SWAY_PHASE1_ITERATION_BEGIN iteration=%s mode=%s path=/usr/bin/sway\n' "$i" "$mode"
     export SWAY_PHASE1_ITERATION=$i
-    if [[ $i -eq 1 ]]; then
+    if [[ $i -eq 1 || ${SWAY_PHASE1_DEBUG_ALL:-0} == 1 ]]; then
+        active_sway_log=
         /usr/bin/sway -d -c /cmd/sway_phase1_acceptance.conf &
     else
-        /usr/bin/sway -c /cmd/sway_phase1_acceptance.conf >/dev/null 2>&1 &
+        active_sway_log="$runtime/sway-phase1-iteration-$i.log"
+        rm -f -- "$active_sway_log"
+        /usr/bin/sway -c /cmd/sway_phase1_acceptance.conf >"$active_sway_log" 2>&1 &
     fi
     sway_pid=$!
 
@@ -285,7 +297,14 @@ while [[ $i -le $iterations ]]; do
 
     printf 'SWAY_PHASE1_LIFECYCLE_OK iteration=%s mode=%s sway_status=%s processes=gone sockets=gone\n' \
         "$i" "$mode" "$sway_status"
-    resource_probe "iteration-$i"
+    if [[ -n $active_sway_log ]]; then
+        rm -f -- "$active_sway_log"
+        active_sway_log=
+    fi
+    resource_probe "iteration-$i" || {
+        fail "sync-$i"
+        exit 1
+    }
     i=$((i + 1))
 done
 

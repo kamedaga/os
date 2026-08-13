@@ -122,6 +122,7 @@ set(FILED_EXTRA_SOURCES
   "${REPO_ROOT}/userland/koboxd/src/bootstrap.c"
   "${REPO_ROOT}/userland/koboxd/src/filed_direct_backend.c"
   "${REPO_ROOT}/userland/koboxd/src/fs_backend.c"
+  "${REPO_ROOT}/userland/koboxd/src/storage_benchmark.c"
   "${REPO_ROOT}/userland/koboxd/src/storage_runtime.c"
 )
 string(REPLACE ";" " " FILED_EXTRA_SOURCES_ENV "${FILED_EXTRA_SOURCES}")
@@ -134,7 +135,7 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype ${FILED_PROFILE_CFLAGS}"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
@@ -164,6 +165,11 @@ add_custom_command(
     ${FILED_EXTRA_SOURCES}
     "${REPO_ROOT}/userland/koboxd/include/koboxd/control_protocol.h"
     "${REPO_ROOT}/userland/koboxd/include/koboxd/storage_protocol.h"
+    "${REPO_ROOT}/userland/koboxd/src/storage_benchmark.h"
+    "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
+    "${REPO_ROOT}/userland/storage/include/storage/ext4_nvme_benchmark_spec.h"
+    "${REPO_ROOT}/userland/storage/include/storage/stack.h"
+    "${REPO_ROOT}/userland/storage/include/storage/stack.def"
     "${REPO_ROOT}/userland/personality/include/personality/lpr_image_abi.h"
     "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.c"
     "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.h"

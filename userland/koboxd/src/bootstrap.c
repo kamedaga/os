@@ -6,16 +6,6 @@
 #include <stdio.h>
 #include <string.h>
 
-static const char *const koboxd_expected_modules[] = {
-    "nvme-auth.ko",
-    "nvme-core.ko",
-    "nvme.ko",
-    "crc16.ko",
-    "mbcache.ko",
-    "jbd2.ko",
-    "ext4.ko",
-};
-
 int koboxd_align_image_size(uint64_t size, uint64_t *out_size)
 {
     if (out_size == NULL || size == 0 || size > UINT64_MAX - (KOBOXD_PAGE_SIZE - 1)) {
@@ -85,13 +75,11 @@ int koboxd_validate_bootstrap_package(
     if (bootstrap == NULL || bootstrap_size < sizeof(*bootstrap)) {
         return -1;
     }
-    const uint64_t expected_count =
-        sizeof(koboxd_expected_modules) / sizeof(koboxd_expected_modules[0]);
     if (bootstrap->magic != KOBOXD_BOOTSTRAP_MAGIC ||
         bootstrap->device_fd < 16 ||
         bootstrap->control_fd < 16 ||
-        bootstrap->module_count != expected_count ||
-        bootstrap->module_count > KOBOXD_BOOTSTRAP_MAX_MODULES)
+        !storage_module_table_matches_manifest(
+            bootstrap->modules, bootstrap->module_count))
     {
         fprintf(stderr,
             "[filed-storage] bootstrap invalid magic=0x%llx device_fd=%llu control_fd=%llu modules=%llu size=%llu\n",
@@ -105,8 +93,7 @@ int koboxd_validate_bootstrap_package(
 
     for (uint64_t i = 0; i < bootstrap->module_count; i++) {
         const koboxd_bootstrap_module_t *module = &bootstrap->modules[i];
-        if (strncmp(module->name, koboxd_expected_modules[i], KOBOXD_BOOTSTRAP_NAME_BYTES) != 0 ||
-            module->image_fd < 16 ||
+        if (module->image_fd < 16 ||
             module->image_size < 4)
         {
             fprintf(stderr,

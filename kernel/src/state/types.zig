@@ -68,6 +68,16 @@ pub const MapProt = struct {
     pkey: u4 = 0,
 };
 
+/// Internal transaction descriptor for replacing the backing pages of a
+/// plain anonymous VMA with one physically-contiguous extent for DMA.
+/// This is kernel state, not part of the userspace ABI.
+pub const NativeVmaDmaPackPlan = struct {
+    vmo: NativeVmoRef = .{},
+    vmo_page_offset: u32 = 0,
+    page_count: u32 = 0,
+    prot: MapProt = .{},
+};
+
 pub const EndpointRoute = struct {
     endpoint_id: u64,
     target: PrincipalId,
@@ -843,6 +853,11 @@ pub const VmaEntry = struct {
     start_va: u64 = 0,
     size_bytes: u64 = 0,
     prot: VmaProt = .{},
+    // Immutable protection ceiling captured from the mapping authority.
+    // mprotect may narrow and restore permissions within this ceiling, but
+    // cannot manufacture map_write/map_exec rights after the source FD is
+    // gone or transferred.
+    max_prot: VmaProt = .{},
     flags: MmapFlags = .{},
     vmo: NativeVmoRef = .{},
     vmo_offset: u64 = 0,
@@ -866,6 +881,16 @@ pub const NativeVmaFaultMapping = struct {
     prot: MapProt,
     invalidate_start_va: u64 = 0,
     invalidate_size_bytes: u64 = 0,
+};
+
+/// How a native VMA page must be resolved before its physical address can be
+/// pinned for DMA. Writable private mappings need an owned COW page even for
+/// device-read-only DMA: a later CPU write must not move the virtual address
+/// away from the page recorded by the DMA object.
+pub const NativeVmaDmaPinMode = enum(u8) {
+    read_only,
+    direct_writable,
+    cow_writable,
 };
 
 pub const NativeVmaPrepareKind = enum(u8) {
