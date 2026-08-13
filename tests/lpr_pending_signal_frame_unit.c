@@ -52,6 +52,22 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
     (void)exit_code;
 }
 
+/* Single-threaded harness: back the per-thread signal state with slot 0 so
+ * reset_state()'s lpr_state wipe resets it, matching the real slot storage. */
+lpr_signal_thread_state_t *lpr_signal_thread_state_current(void)
+{
+    return &lpr_state.signal.threads[0].state;
+}
+
+void lpr_signal_thread_state_after_fork_child(void)
+{
+    lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
+    state->pending_mask = 0;
+    state->wait_restore_mask = 0;
+    state->wait_restore_mask_active = 0;
+    state->dispatching = 0;
+}
+
 #include "../userland/personality/linux/runtime/lpr_tty/client.c"
 
 #define CHECK(expr) do { \

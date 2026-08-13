@@ -15,6 +15,7 @@ mkdir -p "$out_dir"
   -I"${repo_root}/userland/libipc/include" \
   -I"${repo_root}/userland/libcapsule/include" \
   -I"${repo_root}/userland/libpacha/include" \
+  -I"${repo_root}/userland/libfiled_client/include" \
   -I"${repo_root}/_kobox/include" \
   -I"${repo_root}/_kobox/src" \
   "${repo_root}/tests/inputd_ring_overflow_unit.c" \
