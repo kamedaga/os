@@ -257,14 +257,21 @@ pub fn releaseDmaBufferObject(self: anytype, dma: DmaBufferObject) void {
 }
 
 pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
-    _ = self;
     if (mapping.size == 0) return;
     _ = mapping.device;
-    // Scatter mappings never install a VT-d range: their deriving syscall is
-    // rejected while VT-d is active. The FD still expresses the same caller
-    // lifetime contract as the contiguous mapping ABI, but there is no fake
-    // contiguous IOVA to unmap here.
-    if (mapping.page_count != 0) return;
+    if (mapping.page_count != 0) {
+        if (!vtd.isActive()) return;
+        const owner = @TypeOf(self.*).objectOwner(mapping.owner_principal_raw) orelse return;
+        const first_page_va = mapping.user_va & ~@as(u64, 0xfff);
+        var page_index: u64 = 0;
+        while (page_index < mapping.page_count) : (page_index += 1) {
+            const page_va, const overflow = @addWithOverflow(first_page_va, page_index * 4096);
+            if (overflow != 0) return;
+            const paddr = @import("../memory/user_vm.zig").presentUserPagePaddr(owner, page_va) orelse return;
+            vtd.unmapRange(paddr, 4096);
+        }
+        return;
+    }
     vtd.unmapRange(mapping.iova, mapping.size);
 }
 

@@ -85,11 +85,33 @@ fn writeDmarStructureHeader(bytes: []u8, offset: usize, structure_type: u16, len
     writeLe16(bytes, offset + 2, length);
 }
 
-fn writeDrhd(bytes: []u8, offset: usize, flags: u8, segment: u16, register_base: u64) void {
-    writeDmarStructureHeader(bytes, offset, 0, 16);
+fn writeDrhdWithLength(bytes: []u8, offset: usize, length: u16, flags: u8, segment: u16, register_base: u64) void {
+    writeDmarStructureHeader(bytes, offset, 0, length);
     bytes[offset + 4] = flags;
     writeLe16(bytes, offset + 6, segment);
     writeLe64(bytes, offset + 8, register_base);
+}
+
+fn writeDrhd(bytes: []u8, offset: usize, flags: u8, segment: u16, register_base: u64) void {
+    writeDrhdWithLength(bytes, offset, 16, flags, segment, register_base);
+}
+
+fn writeDeviceScope(
+    bytes: []u8,
+    offset: usize,
+    scope_type: u8,
+    enumeration_id: u8,
+    start_bus: u8,
+    path: []const kernel.acpi_dmar.DevicePath,
+) void {
+    bytes[offset] = scope_type;
+    bytes[offset + 1] = @intCast(6 + path.len * 2);
+    bytes[offset + 4] = enumeration_id;
+    bytes[offset + 5] = start_bus;
+    for (path, 0..) |entry, index| {
+        bytes[offset + 6 + index * 2] = entry.device;
+        bytes[offset + 7 + index * 2] = entry.function;
+    }
 }
 
 fn finishAcpiChecksum(bytes: []u8) void {
@@ -128,6 +150,41 @@ test "DMAR parser retains multiple DRHD structures" {
     try std.testing.expectEqual(@as(u16, 2), parsed.drhds[1].segment);
     try std.testing.expectEqual(@as(u64, 0xfeda_0000), parsed.drhds[1].register_base);
     try std.testing.expect(parsed.drhds[1].include_pci_all);
+}
+
+test "DMAR parser retains DRHD device scopes and paths" {
+    var fixture = [_]u8{0} ** 74;
+    initDmarFixture(fixture[0..], 47, 0);
+    writeDrhdWithLength(fixture[0..], 48, 26, 0, 0, 0xfed9_0000);
+    const path = [_]kernel.acpi_dmar.DevicePath{
+        .{ .device = 2, .function = 0 },
+        .{ .device = 3, .function = 1 },
+    };
+    writeDeviceScope(fixture[0..], 64, 1, 7, 0, path[0..]);
+    finishAcpiChecksum(fixture[0..]);
+
+    const parsed = try kernel.acpi_dmar.parseDmar(fixture[0..]);
+    try std.testing.expectEqual(@as(u16, 26), parsed.drhds[0].length);
+    try std.testing.expectEqual(@as(usize, 1), parsed.drhds[0].scope_count);
+    const scope = parsed.drhds[0].scopes[0];
+    try std.testing.expectEqual(@as(u8, 1), scope.scope_type);
+    try std.testing.expectEqual(@as(u8, 7), scope.enumeration_id);
+    try std.testing.expectEqual(@as(usize, 2), scope.path_count);
+    try std.testing.expectEqual(@as(u8, 3), scope.path[1].device);
+    try std.testing.expectEqual(@as(u8, 1), scope.path[1].function);
+}
+
+test "DMAR parser rejects malformed DRHD device scope" {
+    var fixture = [_]u8{0} ** 72;
+    initDmarFixture(fixture[0..], 47, 0);
+    writeDrhdWithLength(fixture[0..], 48, 24, 0, 0, 0xfed9_0000);
+    fixture[64] = 1;
+    fixture[65] = 7;
+    finishAcpiChecksum(fixture[0..]);
+    try std.testing.expectError(
+        error.InvalidDeviceScopeLength,
+        kernel.acpi_dmar.parseDmar(fixture[0..]),
+    );
 }
 
 test "DMAR parser skips unknown remapping structure types" {
@@ -174,6 +231,34 @@ test "DMAR parser rejects checksum mismatch" {
         error.ChecksumMismatch,
         kernel.acpi_dmar.parseDmar(fixture[0..]),
     );
+}
+
+test "VT-d table builders encode legacy root context and second-level entries" {
+    var root = [_]u64{0xffff_ffff_ffff_ffff} ** 512;
+    kernel.vtd_tables.clear(&root);
+    try std.testing.expect(kernel.vtd_tables.setRootEntry(&root, 0x2a, 0x1234_5000));
+    try std.testing.expectEqual(@as(u64, 0x1234_5001), root[0x2a * 2]);
+    try std.testing.expectEqual(@as(u64, 0), root[0x2a * 2 + 1]);
+
+    var context = [_]u64{0} ** 512;
+    try std.testing.expect(kernel.vtd_tables.setContextEntry(&context, 0x9b, 0x2345_6000, 0x1357));
+    try std.testing.expectEqual(@as(u64, 0x2345_6001), context[0x9b * 2]);
+    try std.testing.expectEqual(@as(u64, 0x0013_5702), context[0x9b * 2 + 1]);
+
+    var second_level = [_]u64{0} ** 512;
+    try std.testing.expect(kernel.vtd_tables.setSecondLevelEntry(&second_level, 17, 0x3456_7000, true, true));
+    try std.testing.expectEqual(@as(u64, 0x3456_7003), second_level[17]);
+    try std.testing.expect(kernel.vtd_tables.setSecondLevelEntry(&second_level, 18, 0x4567_8000, true, false));
+    try std.testing.expectEqual(@as(u64, 0x4567_8001), second_level[18]);
+}
+
+test "VT-d table builders reject unaligned and out-of-range inputs" {
+    var page = [_]u64{0} ** 512;
+    try std.testing.expect(!kernel.vtd_tables.setRootEntry(&page, 0, 0x1234_5001));
+    try std.testing.expect(!kernel.vtd_tables.setContextEntry(&page, 0, 0x0010_0000_0000_0000, 1));
+    try std.testing.expect(kernel.vtd_tables.setContextEntry(&page, 0, 0x1000, 0));
+    try std.testing.expectEqual(@as(u64, 0x2), page[1]);
+    try std.testing.expect(!kernel.vtd_tables.setSecondLevelEntry(&page, page.len, 0x1000, true, true));
 }
 
 test "process descriptor capacity limit does not exceed address-space storage" {

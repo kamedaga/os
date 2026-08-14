@@ -842,7 +842,7 @@ pub fn bootWithResources(resources: BootResources) noreturn {
     kernel_log.writeOnly("boot: bootWithResources entry\n");
     kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
-    vtd.init(boot_rsdp_paddr);
+    vtd.init(boot_rsdp_paddr, kernel_runtime.global_free_list);
     kernel_log.write("boot: discover devices\n");
     var devices = discoverDevices();
     kernel_log.write("boot: construct processes\n");

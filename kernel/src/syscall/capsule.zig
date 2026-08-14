@@ -261,6 +261,12 @@ fn dmaIovaOrKernelChoice(iova_arg: u64, paddr: u64, size: u64) ?u64 {
     return if (vtd.isAddressableRange(paddr, size)) paddr else null;
 }
 
+fn unmapScatterPageAddresses(page_addresses: []const u64) void {
+    for (page_addresses) |address| {
+        vtd.unmapRange(address & ~(page_size - 1), page_size);
+    }
+}
+
 fn rightsForMmio(parent: kernel.FdRights) kernel.FdRights {
     return .{
         .inspect = parent.inspect,
@@ -490,7 +496,12 @@ pub fn dispatch(
                 frame.r10,
                 direction != .to_device,
                 null,
-                !vtd.isActive(),
+                // R8 uses one shared identity domain. Aliases resolve to the
+                // same SLPTE, and vtd.mapRange reference-counts that page so
+                // either mapping may close first without tearing down the
+                // survivor. In pass-through mode this preserves the previous
+                // !vtd.isActive() behavior.
+                true,
             ) orelse break :blk sc.syscall_err_invalid;
             const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
             if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
@@ -507,11 +518,6 @@ pub fn dispatch(
             };
         },
         sc.syscall_capsule_derive_dma_mapping_pages => blk: {
-            // A scatter mapping exposes physical page addresses directly. It
-            // cannot safely coexist with VT-d until the mapping object owns
-            // per-page IOVA state and teardown metadata.
-            if (vtd.isActive()) break :blk sc.syscall_err_invalid;
-
             const device_fd_u32 = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
             const view = state.fdPayloadWithRightsConst(
                 proc,
@@ -579,6 +585,15 @@ pub fn dispatch(
                 }
             }
 
+            page_index = 0;
+            while (page_index < layout.page_count) : (page_index += 1) {
+                const page_paddr = page_addresses[page_index] & ~(page_size - 1);
+                if (!vtd.mapRange(page_paddr, page_paddr, page_size)) {
+                    unmapScatterPageAddresses(page_addresses[0..page_index]);
+                    break :blk sc.syscall_err_map;
+                }
+            }
+
             // Like the existing DMA mapping ABI, the caller must keep the
             // userspace range mapped and unchanged until this FD is closed.
             // This capability deliberately records that lifetime contract;
@@ -591,11 +606,16 @@ pub fn dispatch(
                 .page_count = @intCast(layout.page_count),
                 .direction = direction,
                 .flags = 0,
-            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err|
+            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
+                unmapScatterPageAddresses(page_addresses[0..layout.page_count]);
                 break :blk statusFromKernelError(err);
+            };
 
             const output = std.mem.sliceAsBytes(page_addresses[0..layout.page_count]);
             if (!h.copy_bytes_to_user_va(proc, frame.r8, output)) {
+                // The syscall still owns the address-space lock here, so the
+                // FD destructor cannot re-resolve these PTEs for teardown.
+                unmapScatterPageAddresses(page_addresses[0..layout.page_count]);
                 state.closeFdWithFreeList(proc, mapping_fd, h.free_list) catch {};
                 break :blk sc.syscall_err_invalid;
             }
