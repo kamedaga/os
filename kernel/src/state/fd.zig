@@ -257,22 +257,29 @@ pub fn releaseDmaBufferObject(self: anytype, dma: DmaBufferObject) void {
 }
 
 pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
+    _ = self;
     if (mapping.size == 0) return;
     _ = mapping.device;
     if (mapping.page_count != 0) {
-        if (!vtd.isActive()) return;
-        const owner = @TypeOf(self.*).objectOwner(mapping.owner_principal_raw) orelse return;
-        const first_page_va = mapping.user_va & ~@as(u64, 0xfff);
-        var page_index: u64 = 0;
+        if (mapping.page_addresses_paddr == 0) return;
+        const page_addresses: [*]const u64 = @ptrFromInt(mapping.page_addresses_paddr);
+        var page_index: usize = 0;
         while (page_index < mapping.page_count) : (page_index += 1) {
-            const page_va, const overflow = @addWithOverflow(first_page_va, page_index * 4096);
-            if (overflow != 0) return;
-            const paddr = @import("../memory/user_vm.zig").presentUserPagePaddr(owner, page_va) orelse return;
-            vtd.unmapRange(paddr, 4096);
+            vtd.unmapRange(page_addresses[page_index] & ~@as(u64, 0xfff), 4096);
         }
         return;
     }
     vtd.unmapRange(mapping.iova, mapping.size);
+}
+
+fn releaseDmaMappingObjectWithFreeList(
+    self: anytype,
+    mapping: DmaMappingObject,
+    free_list: *FreePageList,
+) void {
+    self.releaseDmaMappingObject(mapping);
+    if (mapping.page_count == 0 or mapping.page_addresses_paddr == 0) return;
+    free_list.appendPage(0, mapping.page_addresses_paddr) catch {};
 }
 
 pub fn releaseIrqObject(self: anytype, irq: IrqObject) void {
@@ -311,7 +318,7 @@ pub fn releaseKernelObjectPayloadWithFreeList(
         .reply => |reply_ref| self.clearIpcReplySlotWithFreeList(reply_ref, free_list),
         .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
         .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
-        .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
+        .dma_mapping => |mapping| releaseDmaMappingObjectWithFreeList(self, mapping, free_list),
         .irq => |irq| self.releaseIrqObject(irq),
         .pipe => |pipe| self.releasePipeEndpoint(pipe),
         else => {},
@@ -532,6 +539,7 @@ pub fn revokeOwnedPinnedUserObjectsWithFreeList(
         };
         revokeKernelObjectEverywhereWithFreeList(self, object_ref, free_list);
     }
+    vtd.dumpRuntimeCheckpoint();
 }
 
 pub fn fdTableForActiveProcess(self: anytype, principal: PrincipalId) KernelError!*FdTable {
@@ -980,6 +988,8 @@ pub fn createDmaMappingFd(
     self: anytype,
     owner: PrincipalId,
     mapping: DmaMappingObject,
+    page_addresses: ?[]const u64,
+    free_list: ?*FreePageList,
     rights: FdRights,
     flags: FdFlags,
     min_fd: Fd,
@@ -987,9 +997,35 @@ pub fn createDmaMappingFd(
     if (mapping.device == 0 or mapping.user_va == 0 or mapping.size == 0) return KernelError.InvalidState;
     var payload = mapping;
     payload.owner_principal_raw = @intFromEnum(owner);
+    var side_storage_paddr: u64 = 0;
+    errdefer if (side_storage_paddr != 0) {
+        free_list.?.appendPage(0, side_storage_paddr) catch {};
+    };
+    if (mapping.page_count == 0) {
+        if (page_addresses != null or mapping.page_addresses_paddr != 0) return KernelError.InvalidState;
+    } else {
+        const addresses = page_addresses orelse return KernelError.InvalidState;
+        const pages = free_list orelse return KernelError.InvalidState;
+        if (mapping.page_addresses_paddr != 0 or
+            addresses.len != mapping.page_count or
+            addresses.len > 4096 / @sizeOf(u64)) return KernelError.InvalidState;
+        const storage_paddr = if (builtin.is_test)
+            try pages.popFront()
+        else
+            try pages.popFrontBelow(@TypeOf(self.*).low_memory_limit);
+        side_storage_paddr = storage_paddr;
+        const storage: [*]u64 = @ptrFromInt(storage_paddr);
+        @memcpy(storage[0..addresses.len], addresses);
+        payload.page_addresses_paddr = storage_paddr;
+    }
     const object_ref = try self.createKernelObject(.dma_mapping, .{ .dma_mapping = payload });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
-        if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+        if (self.kernelObjectSlot(object_ref)) |slot| {
+            slot.kind = .none;
+            slot.ref_count = 0;
+            slot.payload = .{ .none = {} };
+            slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+        }
         return err;
     };
 }

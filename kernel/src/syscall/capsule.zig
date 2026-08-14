@@ -512,7 +512,7 @@ pub fn dispatch(
                 .size = frame.r10,
                 .direction = direction,
                 .flags = flags,
-            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
+            }, null, null, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
                 vtd.unmapRange(iova, frame.r10);
                 break :blk statusFromKernelError(err);
             };
@@ -606,16 +606,13 @@ pub fn dispatch(
                 .page_count = @intCast(layout.page_count),
                 .direction = direction,
                 .flags = 0,
-            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
+            }, page_addresses[0..layout.page_count], h.free_list, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
                 unmapScatterPageAddresses(page_addresses[0..layout.page_count]);
                 break :blk statusFromKernelError(err);
             };
 
             const output = std.mem.sliceAsBytes(page_addresses[0..layout.page_count]);
             if (!h.copy_bytes_to_user_va(proc, frame.r8, output)) {
-                // The syscall still owns the address-space lock here, so the
-                // FD destructor cannot re-resolve these PTEs for teardown.
-                unmapScatterPageAddresses(page_addresses[0..layout.page_count]);
                 state.closeFdWithFreeList(proc, mapping_fd, h.free_list) catch {};
                 break :blk sc.syscall_err_invalid;
             }
@@ -650,7 +647,7 @@ pub fn dispatch(
                 .size = frame.rdx,
                 .direction = direction,
                 .flags = flags,
-            }, rightsForDmaMapping(buffer_entry.rights, direction), .{}, first_dynamic_fd) catch |err| {
+            }, null, null, rightsForDmaMapping(buffer_entry.rights, direction), .{}, first_dynamic_fd) catch |err| {
                 vtd.unmapRange(iova, frame.rdx);
                 break :blk statusFromKernelError(err);
             };

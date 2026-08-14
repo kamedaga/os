@@ -15,6 +15,7 @@ const page_size: u64 = 4096;
 const four_gib: u64 = 4 * 1024 * 1024 * 1024;
 const domain_id: u16 = 1;
 const max_leaf_tables: usize = 4096;
+const leaf_index_slots: usize = max_leaf_tables * 2;
 const poll_limit: usize = 1_000_000;
 
 const cap_reg: u64 = 0x08;
@@ -62,7 +63,11 @@ const DriverState = struct {
     second_level_root_paddr: u64 = 0,
     context_table_paddrs: [256]u64 = [_]u64{0} ** 256,
     leaf_metadata: [max_leaf_tables]LeafMetadata = [_]LeafMetadata{.{}} ** max_leaf_tables,
+    /// Open-addressed table of leaf_metadata indices plus one; zero is empty.
+    leaf_index: [leaf_index_slots]u16 = [_]u16{0} ** leaf_index_slots,
     leaf_count: usize = 0,
+    mapped_page_count: usize = 0,
+    mapping_ref_count: usize = 0,
     fault_record_count: usize = 0,
     fault_record_offset: u64 = 0,
     iotlb_offset: u64 = 0,
@@ -231,19 +236,30 @@ fn ensureChildTable(parent: *tables.TablePage, index: usize) ?u64 {
     return child;
 }
 
-fn leafMetadata(table_paddr: u64) ?*LeafMetadata {
-    for (driver_state.leaf_metadata[0..driver_state.leaf_count]) |*metadata| {
-        if (metadata.table_paddr == table_paddr) return metadata;
+fn leafMetadata(table_paddr: u64, create: bool) ?*LeafMetadata {
+    const start: usize = @intCast((table_paddr >> 12) & (leaf_index_slots - 1));
+    var probe: usize = 0;
+    while (probe < driver_state.leaf_index.len) : (probe += 1) {
+        const slot_index = (start + probe) & (leaf_index_slots - 1);
+        const encoded = driver_state.leaf_index[slot_index];
+        if (encoded != 0) {
+            const metadata = &driver_state.leaf_metadata[encoded - 1];
+            if (metadata.table_paddr == table_paddr) return metadata;
+            continue;
+        }
+        if (!create or driver_state.leaf_count >= driver_state.leaf_metadata.len) return null;
+        const refcounts = allocZeroPage() orelse return null;
+        const metadata_index = driver_state.leaf_count;
+        const result = &driver_state.leaf_metadata[metadata_index];
+        result.* = .{ .table_paddr = table_paddr, .refcounts_paddr = refcounts };
+        driver_state.leaf_count += 1;
+        driver_state.leaf_index[slot_index] = @intCast(metadata_index + 1);
+        return result;
     }
-    if (driver_state.leaf_count >= driver_state.leaf_metadata.len) return null;
-    const refcounts = allocZeroPage() orelse return null;
-    const result = &driver_state.leaf_metadata[driver_state.leaf_count];
-    result.* = .{ .table_paddr = table_paddr, .refcounts_paddr = refcounts };
-    driver_state.leaf_count += 1;
-    return result;
+    return null;
 }
 
-fn refcountsAt(paddr: u64) *[2048]u16 {
+fn refcountsAt(paddr: u64) *[512]u16 {
     return @ptrFromInt(paddr);
 }
 
@@ -271,7 +287,7 @@ fn walkToLeaf(iova: u64, create: bool) ?struct { table: *tables.TablePage, metad
     else
         pageAddress(pd[pd_index]);
     if (pt_paddr == 0) return null;
-    const metadata = leafMetadata(pt_paddr) orelse return null;
+    const metadata = leafMetadata(pt_paddr, create) orelse return null;
     return .{
         .table = tableAt(pt_paddr),
         .metadata = metadata,
@@ -286,7 +302,9 @@ fn mapIdentityPage(paddr: u64) bool {
     const existing = leaf.table[leaf.index];
     if (existing != 0 and pageAddress(existing) != paddr) return false;
     if (existing == 0 and !tables.setSecondLevelEntry(leaf.table, leaf.index, paddr, true, true)) return false;
+    if (refs[leaf.index] == 0) driver_state.mapped_page_count += 1;
     refs[leaf.index] += 1;
+    driver_state.mapping_ref_count += 1;
     return true;
 }
 
@@ -295,7 +313,11 @@ fn unmapIdentityPage(paddr: u64) void {
     const refs = refcountsAt(leaf.metadata.refcounts_paddr);
     if (refs[leaf.index] == 0) return;
     refs[leaf.index] -= 1;
-    if (refs[leaf.index] == 0) leaf.table[leaf.index] = 0;
+    driver_state.mapping_ref_count -= 1;
+    if (refs[leaf.index] == 0) {
+        leaf.table[leaf.index] = 0;
+        driver_state.mapped_page_count -= 1;
+    }
 }
 
 fn writeBufferFlush() bool {
@@ -631,5 +653,18 @@ pub fn dumpFaults() void {
     if (driver_state.register_base == 0) return;
     lock();
     defer unlock();
+    dumpFaultsLocked();
+}
+
+/// Process teardown is outside the DMA map/unmap hot path and gives smoke
+/// tests an active view of both late hardware faults and mapping lifetime.
+pub fn dumpRuntimeCheckpoint() void {
+    if (driver_state.register_base == 0) return;
+    lock();
+    defer unlock();
+    kernel_log.writeFmt(
+        "vtd: runtime checkpoint active={} mapped_pages={} refs={}\n",
+        .{ @intFromBool(driver_state.active), driver_state.mapped_page_count, driver_state.mapping_ref_count },
+    );
     dumpFaultsLocked();
 }

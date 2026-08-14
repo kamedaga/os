@@ -282,10 +282,11 @@ pub const DmaMappingObject = struct {
     user_va: u64 = 0,
     iova: u64 = 0,
     size: u64 = 0,
-    /// Non-zero only for a physical-page scatter mapping. Such mappings are
-    /// admitted only while VT-d is inactive and therefore have no contiguous
-    /// IOVA range to tear down.
+    /// Non-zero only for a physical-page scatter mapping. The corresponding
+    /// derive-time DMA addresses live in one separately allocated physical
+    /// page so teardown never has to resolve the owner's user PTEs again.
     page_count: u16 = 0,
+    page_addresses_paddr: u64 = 0,
     direction: CapsuleDmaDirection = .bidirectional,
     flags: u32 = 0,
 };
