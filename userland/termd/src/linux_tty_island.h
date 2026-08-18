@@ -85,8 +85,6 @@ int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
     termd_poll_request_t *request);
 void termd_linux_tty_island_pump(struct termd_linux_tty_island *island);
-int termd_linux_tty_island_diag_active(void);
-void termd_linux_tty_island_diag_code(void);
 int termd_linux_tty_island_io(
     struct termd_linux_tty_island *island,
     int write,

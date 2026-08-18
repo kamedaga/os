@@ -8,7 +8,6 @@
 #include <pacha/bootstrap.h>
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 int main(int argc, char **argv)
@@ -38,25 +37,28 @@ int main(int argc, char **argv)
     }
 
     if (tty_island.ready) {
-        printf(
-            "[termd] linux tty modules ready endpoint_fd=%llu loader=%s modules=%u loaded=%u sources=%u ptmx=%s\n",
-            (unsigned long long)cfg->tty_endpoint_fd,
-            tty_island.loader_version,
-            (unsigned)tty_island.configured_module_count,
-            (unsigned)tty_island.loaded_module_count,
-            (unsigned)tty_island.source_count,
-            tty_island.ptmx_registered ? "registered" : "missing");
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("modules_ready"),
+            cfg->tty_endpoint_fd,
+            pacha_trace_name_id(tty_island.loader_version),
+            tty_island.configured_module_count,
+            tty_island.loaded_module_count,
+            tty_island.source_count);
     } else {
-        printf(
-            "[termd] linux tty modules not ready endpoint_fd=%llu loader=%s modules=%u loaded=%u load_status=%d init_status=%d\n",
-            (unsigned long long)cfg->tty_endpoint_fd,
-            tty_island.loader_version,
-            (unsigned)tty_island.configured_module_count,
-            (unsigned)tty_island.loaded_module_count,
-            (int)tty_island.load_status,
-            (int)tty_island.init_status);
+        pacha_trace6(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_ERROR,
+            pacha_trace_name_id("modules_not_ready"),
+            cfg->tty_endpoint_fd,
+            tty_island.configured_module_count,
+            tty_island.loaded_module_count,
+            (uint64_t)tty_island.load_status,
+            (uint64_t)tty_island.init_status);
     }
-    fflush(stdout);
 
     const int ready_status =
         island_status != 0 ? island_status :
@@ -99,10 +101,6 @@ int main(int argc, char **argv)
         }
         (void)termd_linux_tty_island_reap_hangups(&tty_island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
-            const int diagnose = termd_linux_tty_island_diag_active();
-            if (diagnose) {
-                printf("[termd] linux tty wait prepare\n");
-            }
             static struct pacha_service_wait_set wait_set;
             int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
             if (pacha_service_wait_init(&wait_set, (int)cfg->tty_endpoint_fd) != 0)
@@ -122,17 +120,15 @@ int main(int argc, char **argv)
                         &wait_set, notify_fds[i], PACHA_FD_EVENT_HANGUP) != 0)
                     return 1;
             }
-            if (diagnose) {
-                printf(
-                    "[termd] linux tty wait begin sources=%llu\n",
-                    (unsigned long long)notify_count);
-                termd_linux_tty_island_diag_code();
-            }
             const int wait_status =
                 pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
-            if (diagnose) {
-                printf("[termd] linux tty wait done status=%d\n", wait_status);
-            }
+            pacha_trace3(
+                PACHA_TRACE_COMPONENT_TERMD,
+                PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+                PACHA_TRACE_CLASS_DEBUG,
+                pacha_trace_name_id("wait"),
+                notify_count,
+                (uint64_t)wait_status);
             (void)termd_linux_tty_island_reap_hangups(&tty_island);
         }
     }

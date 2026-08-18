@@ -68,16 +68,11 @@ enum {
     TERMD_LINUX_INODE_CDEV_OFFSET = 0x238,
     TERMD_LINUX_PATH_DENTRY_OFFSET = 0x8,
     TERMD_LINUX_DENTRY_FSDATA_OFFSET = 0x80,
-    TERMD_LINUX_TTY_INDEX_OFFSET = 0x4,
     TERMD_LINUX_TTY_DRIVER_OFFSET = 0x10,
     TERMD_LINUX_TTY_FLAGS_OFFSET = 0x1a0,
-    TERMD_LINUX_TTY_COUNT_OFFSET = 0x1a8,
     TERMD_LINUX_TTY_CTRL_PGRP_OFFSET = 0x1c0,
     TERMD_LINUX_TTY_CTRL_SESSION_OFFSET = 0x1c8,
     TERMD_LINUX_TTY_LINK_OFFSET = 0x1e0,
-    TERMD_LINUX_TTY_DRIVER_NUM_OFFSET = 0x34,
-    TERMD_LINUX_TTY_DRIVER_SUBTYPE_OFFSET = 0x3a,
-    TERMD_LINUX_TTY_DRIVER_TTYS_OFFSET = 0x80,
     TERMD_LINUX_TASK_SIGNAL_OFFSET = 0x848,
     TERMD_LINUX_TASK_SIGHAND_OFFSET = 0x850,
     TERMD_LINUX_TASK_BLOCKED_OFFSET = 0x858,
@@ -178,8 +173,6 @@ static termd_linux_transfer_lease_t transfer_leases[TERMD_LINUX_TRANSFER_LEASE_M
 static uint64_t next_tty_handle = 1;
 static uint64_t next_tty_io_sequence = 1;
 static uint64_t next_tty_drain_sequence = 1;
-static uint32_t tty_drain_diag_budget;
-static const unsigned char *tty_kclose_diag_address;
 
 static void write_ptr_field(void *base, size_t offset, const void *value)
 {
@@ -217,13 +210,6 @@ static uint32_t read_u32_field(const void *base, size_t offset)
     return value;
 }
 
-static uint16_t read_u16_field(const void *base, size_t offset)
-{
-    uint16_t value = 0;
-    memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
-    return value;
-}
-
 static void *termd_linux_tty_kref_get(void *tty)
 {
     if (tty != NULL) {
@@ -244,26 +230,6 @@ static void termd_linux_tty_kref_put(void *tty)
     }
 }
 
-static void log_tty_state(const char *label, const void *tty)
-{
-    if (tty == NULL) {
-        printf("[termd] linux tty state %s tty=null\n", label);
-        return;
-    }
-    void *driver = read_ptr_field(tty, TERMD_LINUX_TTY_DRIVER_OFFSET);
-    void *link = read_ptr_field(tty, TERMD_LINUX_TTY_LINK_OFFSET);
-    printf(
-        "[termd] linux tty state %s tty=%p index=%u driver=%p subtype=%u flags=0x%llx count=%u link=%p\n",
-        label,
-        tty,
-        (unsigned)read_u32_field(tty, TERMD_LINUX_TTY_INDEX_OFFSET),
-        driver,
-        driver != NULL ? (unsigned)read_u16_field(driver, TERMD_LINUX_TTY_DRIVER_SUBTYPE_OFFSET) : 0u,
-        (unsigned long long)read_u64_field(tty, TERMD_LINUX_TTY_FLAGS_OFFSET),
-        (unsigned)read_u32_field(tty, TERMD_LINUX_TTY_COUNT_OFFSET),
-        link);
-}
-
 static void *handle_file_tty(const termd_linux_tty_handle_t *handle)
 {
     if (handle == NULL) {
@@ -276,79 +242,36 @@ static void *handle_file_tty(const termd_linux_tty_handle_t *handle)
 static void drain_linux_tty_work(void)
 {
     const uint64_t sequence = next_tty_drain_sequence++;
-    const int diagnose = tty_drain_diag_budget != 0;
-    if (diagnose) {
-        tty_drain_diag_budget--;
-        printf(
-            "[termd] linux tty drain begin seq=%llu budget=%u\n",
-            (unsigned long long)sequence,
-            (unsigned)tty_drain_diag_budget);
-    }
+    unsigned iterations = 0;
+    int irq_status = 0;
     for (unsigned i = 0; i < 4; i++) {
         kb_run_deferred_work();
-        if (diagnose) {
-            printf(
-                "[termd] linux tty drain work-done seq=%llu iteration=%u\n",
-                (unsigned long long)sequence,
-                i);
-        }
-        const int irq_status = kb_handle_any_irq(0);
-        if (diagnose) {
-            printf(
-                "[termd] linux tty drain irq-done seq=%llu iteration=%u status=%d\n",
-                (unsigned long long)sequence,
-                i,
-                irq_status);
-        }
+        irq_status = kb_handle_any_irq(0);
+        iterations = i + 1;
         if (irq_status != 0) {
             break;
         }
     }
     kb_run_deferred_work();
-    if (diagnose) {
-        printf(
-            "[termd] linux tty drain done seq=%llu\n",
-            (unsigned long long)sequence);
-    }
+    pacha_trace4(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("drain"),
+        sequence,
+        iterations,
+        (uint64_t)irq_status);
 }
 
 static void termd_linux_tty_notify_ready(void);
-
-int termd_linux_tty_island_diag_active(void)
-{
-    return tty_drain_diag_budget != 0;
-}
-
-void termd_linux_tty_island_diag_code(void)
-{
-    if (tty_kclose_diag_address == NULL) {
-        printf("[termd] linux tty code tty_kclose=missing\n");
-        return;
-    }
-    printf("[termd] linux tty code tty_kclose=%p bytes=", tty_kclose_diag_address);
-    for (size_t i = 0; i < 32; ++i) {
-        printf("%02x", (unsigned)tty_kclose_diag_address[i]);
-    }
-    printf(" end=%u\n", 0u);
-}
 
 void termd_linux_tty_island_pump(struct termd_linux_tty_island *island)
 {
     if (island == NULL || !island->ready) {
         return;
     }
-    const int diagnose = tty_drain_diag_budget != 0;
-    if (diagnose) {
-        printf("[termd] linux tty pump begin\n");
-    }
     drain_linux_tty_work();
-    if (diagnose) {
-        printf("[termd] linux tty pump drain-done\n");
-    }
     termd_linux_tty_notify_ready();
-    if (diagnose) {
-        printf("[termd] linux tty pump notify-done\n");
-    }
 }
 
 static int enter_owner_context(kb_module_t *owner, termd_linux_owner_context_t *context)
@@ -388,49 +311,16 @@ static void log_tty_close_state(
     if (handle == NULL) {
         return;
     }
-    void *tty = handle_file_tty(handle);
-    void *driver = tty != NULL ?
-        read_ptr_field(tty, TERMD_LINUX_TTY_DRIVER_OFFSET) : NULL;
-    const uint32_t tty_index = tty != NULL ?
-        read_u32_field(tty, TERMD_LINUX_TTY_INDEX_OFFSET) : UINT32_MAX;
-    const uint32_t driver_num = driver != NULL ?
-        read_u32_field(driver, TERMD_LINUX_TTY_DRIVER_NUM_OFFSET) : 0;
-    void *driver_ttys = driver != NULL ?
-        read_ptr_field(driver, TERMD_LINUX_TTY_DRIVER_TTYS_OFFSET) : NULL;
-    void *driver_slot = NULL;
-    if (driver_ttys != NULL && tty_index < driver_num) {
-        driver_slot = read_ptr_field(
-            driver_ttys,
-            (size_t)tty_index * sizeof(void *));
-    }
-    void *tty_mutex = NULL;
-    kb_module_t *tty_core = kb_module_find_owner_for_address(handle->release);
-    if (tty_core != NULL) {
-        (void)kb_module_find_symbol(tty_core, "tty_mutex", &tty_mutex);
-    }
-    printf(
-        "[termd] linux tty close %s reason=%s handle=%llu refs=%u master=%u "
-        "dev=0x%llx saved_index=%u notify_fd=%d tty=%p tty_index=%u "
-        "tty_count=%u driver=%p driver_num=%u driver_slot=%p "
-        "tty_mutex=%p mutex_locked=%d release=%p\n",
-        phase,
-        reason != NULL ? reason : "unknown",
-        (unsigned long long)handle->handle,
-        (unsigned)handle->ref_count,
-        (unsigned)handle->master,
-        (unsigned long long)handle->dev,
-        (unsigned)handle->pts_index,
-        handle->notify_fd,
-        tty,
-        (unsigned)tty_index,
-        tty != NULL ?
-            (unsigned)read_u32_field(tty, TERMD_LINUX_TTY_COUNT_OFFSET) : 0u,
-        driver,
-        (unsigned)driver_num,
-        driver_slot,
-        tty_mutex,
-        tty_mutex != NULL ? kb_mutex_is_locked(tty_mutex) : -1,
-        handle->release);
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("close"),
+        pacha_trace_name_id(phase),
+        pacha_trace_name_id(reason),
+        handle->handle,
+        handle->ref_count,
+        handle->master);
 }
 
 static int enter_handle_function_context(
@@ -736,26 +626,6 @@ int termd_linux_tty_island_refresh_ptmx(struct termd_linux_tty_island *island)
     return 0;
 }
 
-static void log_hvc0_cdev_state(void)
-{
-    const uint64_t dev = kb_linux_kernel_encode_dev(TERMD_LINUX_HVC_MAJOR, 0);
-    const kb_cdev_record_t *record = kb_linux_kernel_find_active_cdev(dev);
-    if (record == NULL || !record->has_fops_view) {
-        printf("[termd] linux tty hvc0 cdev missing dev=%u:0\n", (unsigned)TERMD_LINUX_HVC_MAJOR);
-        return;
-    }
-    printf(
-        "[termd] linux tty hvc0 cdev ready dev=%u:0 cdev=%p fops=%p owner=%p open=%p open_gs=0x%lx read_iter=%p write_iter=%p\n",
-        (unsigned)TERMD_LINUX_HVC_MAJOR,
-        record->cdev,
-        record->fops,
-        (void *)record->owner_module,
-        record->fops_view.open,
-        kb_module_kernel_gs_for_address(record->fops_view.open),
-        record->fops_view.read_iter,
-        record->fops_view.write_iter);
-}
-
 static int hvc0_cdev_ready(void)
 {
     const uint64_t dev = kb_linux_kernel_encode_dev(TERMD_LINUX_HVC_MAJOR, 0);
@@ -890,37 +760,11 @@ static long call_handle_ioctl(
     termd_linux_owner_context_t context;
     int has_context = enter_handle_function_context(handle, handle->ioctl, &context);
     drain_linux_tty_work();
-    if (request == 0x40045431u) {
-        uint32_t value = 0;
-        if (arg != NULL) {
-            memcpy(&value, arg, sizeof(value));
-        }
-        void *tty = handle_file_tty(handle);
-        printf(
-            "[termd] linux tty ioctl call handle=%llu request=0x%x arg=%p value=%u ioctl=%p tty=%p flags_before=0x%llx\n",
-            (unsigned long long)handle->handle,
-            request,
-            arg,
-            value,
-            handle->ioctl,
-            tty,
-            tty != NULL ? (unsigned long long)read_u64_field(tty, TERMD_LINUX_TTY_FLAGS_OFFSET) : 0ull);
-    }
     const long result = ((termd_linux_fops_ioctl_fn)handle->ioctl)(
         handle->file,
         request,
         (unsigned long)(uintptr_t)arg);
     drain_linux_tty_work();
-    if (request == 0x40045431u) {
-        void *tty = handle_file_tty(handle);
-        printf(
-            "[termd] linux tty ioctl done handle=%llu request=0x%x result=%ld tty=%p flags_after=0x%llx\n",
-            (unsigned long long)handle->handle,
-            request,
-            result,
-            tty,
-            tty != NULL ? (unsigned long long)read_u64_field(tty, TERMD_LINUX_TTY_FLAGS_OFFSET) : 0ull);
-    }
     if (has_context) {
         leave_owner_context(&context);
     }
@@ -1027,10 +871,13 @@ int termd_linux_tty_island_open_ptmx(
     handle->notify_fd = notify_fd;
     initialize_ptmx_winsize(island, handle);
     *out_handle = handle->handle;
-    printf(
-        "[termd] linux tty ptmx open ready index=%u handle=%llu\n",
-        (unsigned)handle->pts_index,
-        (unsigned long long)handle->handle);
+    pacha_trace3(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("ptmx_open_ready"),
+        handle->pts_index,
+        handle->handle);
     return 0;
 }
 
@@ -1068,14 +915,15 @@ int termd_linux_tty_island_open_pts(
         read_ptr_field(probe_dentry, TERMD_LINUX_DENTRY_FSDATA_OFFSET) : NULL;
     void *probe_link = probe_tty != NULL ?
         read_ptr_field(probe_tty, TERMD_LINUX_TTY_LINK_OFFSET) : NULL;
-    printf(
-        "[termd] linux tty pts open probe index=%llu dentry=%p tty=%p link=%p\n",
-        (unsigned long long)request->pts_index,
-        probe_dentry,
-        probe_tty,
-        probe_link);
-    log_tty_state("pts-probe", probe_tty);
-    log_tty_state("pts-probe-link", probe_link);
+    pacha_trace5(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("pts_open_probe"),
+        request->pts_index,
+        (uint64_t)(uintptr_t)probe_dentry,
+        (uint64_t)(uintptr_t)probe_tty,
+        (uint64_t)(uintptr_t)probe_link);
 
     termd_linux_tty_handle_t *handle = alloc_handle();
     if (handle == NULL) {
@@ -1106,8 +954,6 @@ int termd_linux_tty_island_open_pts(
     int result = call_handle_open(handle);
     if (result != 0) {
         pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("pts_open"), request->pts_index, (uint64_t)result);
-        log_tty_state("pts-failed", probe_tty);
-        log_tty_state("pts-failed-link", probe_link);
         memset(handle, 0, sizeof(*handle));
         return result;
     }
@@ -1123,10 +969,13 @@ int termd_linux_tty_island_open_pts(
         request->tty.signal_mask,
         request->tty.signal_ignored);
     *out_handle = handle->handle;
-    printf(
-        "[termd] linux tty pts open ready index=%llu handle=%llu\n",
-        (unsigned long long)request->pts_index,
-        (unsigned long long)handle->handle);
+    pacha_trace3(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("pts_open_ready"),
+        request->pts_index,
+        handle->handle);
     return 0;
 }
 
@@ -1237,14 +1086,7 @@ int termd_linux_tty_island_take_signal(
     if (!island->ready) {
         return -19;
     }
-    const int diagnose = termd_linux_tty_island_diag_active();
-    if (diagnose) {
-        printf("[termd] linux tty signal begin\n");
-    }
     drain_linux_tty_work();
-    if (diagnose) {
-        printf("[termd] linux tty signal drain-done\n");
-    }
     int pgrp = 0;
     int sig = 0;
     uint64_t generation = island->signal_generation;
@@ -1253,13 +1095,14 @@ int termd_linux_tty_island_take_signal(
         &pgrp,
         &sig,
         &generation);
-    if (diagnose) {
-        printf(
-            "[termd] linux tty signal take-done status=%d pgrp=%d sig=%d\n",
-            status,
-            pgrp,
-            sig);
-    }
+    pacha_trace4(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("signal"),
+        (uint64_t)status,
+        (uint64_t)pgrp,
+        (uint64_t)sig);
     if (status < 0) {
         return status;
     }
@@ -1347,10 +1190,6 @@ static uint32_t termd_linux_transfer_lease_count(uint64_t handle)
 size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island)
 {
     if (island == NULL) return 0;
-    const int diagnose = termd_linux_tty_island_diag_active();
-    if (diagnose) {
-        printf("[termd] linux tty reap begin\n");
-    }
     size_t reaped = 0;
     for (size_t i = 0; i < TERMD_LINUX_TTY_HANDLE_MAX; ++i) {
         termd_linux_tty_handle_t *handle = &tty_handles[i];
@@ -1368,8 +1207,12 @@ size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island
         handle->ref_count = termd_linux_transfer_lease_count(handle_id) + 1u;
         (void)termd_linux_tty_island_close_reason(
             island, handle_id, "notify-hangup");
-        printf("[termd] tty_orphan_reap handle=%llu\n",
-            (unsigned long long)handle_id);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("orphan_reap"),
+            handle_id);
         reaped++;
     }
     for (size_t i = 0; i < TERMD_LINUX_TRANSFER_LEASE_MAX; ++i) {
@@ -1388,8 +1231,13 @@ size_t termd_linux_tty_island_reap_hangups(struct termd_linux_tty_island *island
             island, handle_id, "transfer-hangup");
         reaped++;
     }
-    if (diagnose) {
-        printf("[termd] linux tty reap done count=%llu\n", (unsigned long long)reaped);
+    if (reaped != 0) {
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("reap"),
+            reaped);
     }
     return reaped;
 }
@@ -1672,15 +1520,6 @@ int termd_linux_tty_island_io(
         return -95;
     }
     const uint64_t io_sequence = next_tty_io_sequence++;
-    printf(
-        "[termd] linux tty io request seq=%llu op=%s handle=%llu length=%llu "
-        "tty=%p iter=%p\n",
-        (unsigned long long)io_sequence,
-        write ? "write" : "read",
-        (unsigned long long)handle->handle,
-        (unsigned long long)request->length,
-        handle_file_tty(handle),
-        iter_fn);
     termd_linux_tty_sync_current_state(
         handle,
         termd_linux_tty_merge_ids(
@@ -1692,10 +1531,6 @@ int termd_linux_tty_island_io(
         iter_fn,
         request->tty.signal_mask,
         request->tty.signal_ignored);
-    printf(
-        "[termd] linux tty io state-done seq=%llu op=%s\n",
-        (unsigned long long)io_sequence,
-        write ? "write" : "read");
     if (request->length > TERMD_IO_BYTES) {
         request->length = TERMD_IO_BYTES;
     }
@@ -1724,24 +1559,19 @@ int termd_linux_tty_island_io(
         handle->file,
         TERMD_LINUX_FILE_FLAGS_OFFSET,
         saved_file_flags | TERMD_LINUX_O_NONBLOCK);
-    printf(
-        "[termd] linux tty io call-begin seq=%llu op=%s length=%llu\n",
-        (unsigned long long)io_sequence,
-        write ? "write" : "read",
-        (unsigned long long)request->length);
     const long result = ((termd_linux_fops_iter_fn)iter_fn)(kiocb, iter);
-    printf(
-        "[termd] linux tty io iter-done seq=%llu op=%s result=%ld\n",
-        (unsigned long long)io_sequence,
-        write ? "write" : "read",
-        result);
     write_u32_field(handle->file, TERMD_LINUX_FILE_FLAGS_OFFSET, saved_file_flags);
     drain_linux_tty_work();
-    printf(
-        "[termd] linux tty io work-done seq=%llu op=%s\n",
-        (unsigned long long)io_sequence,
-        write ? "write" : "read");
-    tty_drain_diag_budget = 8;
+    pacha_trace6(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("io"),
+        io_sequence,
+        (uint64_t)write,
+        handle->handle,
+        request->length,
+        (uint64_t)result);
     if (has_context) {
         leave_owner_context(&context);
     }
@@ -1788,7 +1618,12 @@ static int termd_linux_tty_island_mount_devpts(struct termd_linux_tty_island *is
         return island->devpts_status;
     }
     island->devpts_status = 0;
-    printf("[termd] linux tty devpts mounted root=%p\n", island->devpts_root);
+    pacha_trace2(
+        PACHA_TRACE_COMPONENT_TERMD,
+        PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+        PACHA_TRACE_CLASS_DEBUG,
+        pacha_trace_name_id("devpts_mounted"),
+        (uint64_t)(uintptr_t)island->devpts_root);
     return 0;
 }
 
@@ -1816,13 +1651,21 @@ static kb_status_t termd_linux_tty_island_create_backend(
             pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("virtio_dma_prepare"), cfg->device_fd, (uint64_t)dma_status);
             return KB_ERR_IO;
         }
-        printf("[termd] virtio-console backend ready fd=%llu\n",
-            (unsigned long long)cfg->device_fd);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("virtio_backend_ready"),
+            cfg->device_fd);
         return KB_OK;
     }
     kb_status_t status = termd_null_device_backend_create(out_backend);
     if (status == KB_OK && *out_backend != NULL) {
-        printf("[termd] tty-only null backend ready\n");
+        pacha_trace1(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("null_backend_ready"));
     }
     return status;
 }
@@ -1894,9 +1737,13 @@ int termd_linux_tty_island_init(
             .size = loaded.size,
             .name = loaded.name,
         };
-        printf("[termd] linux tty module open begin name=%s size=%llu\n",
-            loaded.name,
-            (unsigned long long)loaded.size);
+        pacha_trace3(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("module_open_begin"),
+            pacha_trace_name_id(loaded.name),
+            loaded.size);
         status = kb_module_open_image(&image, backend, &island->modules[i]);
         if (status != KB_OK || island->modules[i] == NULL) {
             pacha_trace3(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("module_open"), pacha_trace_name_id(loaded.name), (uint64_t)status);
@@ -1904,13 +1751,28 @@ int termd_linux_tty_island_init(
             return 0;
         }
         island->loaded_module_count++;
-        printf("[termd] linux tty module open ready name=%s\n", loaded.name);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("module_open_ready"),
+            pacha_trace_name_id(loaded.name));
 
         int init_result = 0;
-        printf("[termd] linux tty module init begin name=%s\n", loaded.name);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("module_init_begin"),
+            pacha_trace_name_id(loaded.name));
         status = kb_module_call_init(island->modules[i], &init_result);
         if (status == KB_ERR_NOT_FOUND) {
-            printf("[termd] linux tty module init missing name=%s\n", loaded.name);
+            pacha_trace2(
+                PACHA_TRACE_COMPONENT_TERMD,
+                PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+                PACHA_TRACE_CLASS_DEBUG,
+                pacha_trace_name_id("module_init_missing"),
+                pacha_trace_name_id(loaded.name));
             continue;
         }
         if (status != KB_OK) {
@@ -1923,12 +1785,13 @@ int termd_linux_tty_island_init(
             island->init_status = (int32_t)init_result;
             return 0;
         }
-        printf("[termd] linux tty module init ready name=%s\n", loaded.name);
+        pacha_trace2(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("module_init_ready"),
+            pacha_trace_name_id(loaded.name));
         if (strcmp(loaded.name, "linux_tty_core.ko") == 0) {
-            void *tty_kclose = NULL;
-            if (kb_module_find_symbol(island->modules[i], "tty_kclose", &tty_kclose) == KB_OK) {
-                tty_kclose_diag_address = tty_kclose;
-            }
             tty_core_ready = 1;
         } else if (strcmp(loaded.name, "linux_tty_n_null.ko") == 0) {
             tty_n_null_ready = 1;
@@ -1948,19 +1811,23 @@ int termd_linux_tty_island_init(
     }
     const int ptmx_status = termd_linux_tty_island_refresh_ptmx(island);
     if (ptmx_status == 0) {
-        printf(
-            "[termd] linux tty ptmx cdev ready dev=%u:%u cdev=%p fops=%p open=%p\n",
-            (unsigned)TERMD_LINUX_TTYAUX_MAJOR,
-            (unsigned)TERMD_LINUX_PTMX_MINOR,
-            island->ptmx_cdev,
-            island->ptmx_fops,
-            island->ptmx_open);
+        pacha_trace5(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_DEBUG,
+            pacha_trace_name_id("ptmx_cdev_ready"),
+            island->ptmx_dev,
+            (uint64_t)(uintptr_t)island->ptmx_cdev,
+            (uint64_t)(uintptr_t)island->ptmx_fops,
+            (uint64_t)(uintptr_t)island->ptmx_open);
     } else {
-        printf(
-            "[termd] linux tty ptmx cdev missing dev=%u:%u status=%d\n",
-            (unsigned)TERMD_LINUX_TTYAUX_MAJOR,
-            (unsigned)TERMD_LINUX_PTMX_MINOR,
-            ptmx_status);
+        pacha_trace3(
+            PACHA_TRACE_COMPONENT_TERMD,
+            PACHA_TRACE_EVENT_TERMD_TTY_STATE,
+            PACHA_TRACE_CLASS_ERROR,
+            pacha_trace_name_id("ptmx_cdev_missing"),
+            island->ptmx_dev,
+            (uint64_t)ptmx_status);
     }
     if (cfg->device_fd >= 16) {
         struct pacha_capsule_irq wake_irq;
@@ -1983,6 +1850,5 @@ int termd_linux_tty_island_init(
             pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("hvc0_wait"), (uint64_t)hvc_status);
         }
     }
-    log_hvc0_cdev_state();
     return 0;
 }
