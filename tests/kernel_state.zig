@@ -11,7 +11,6 @@ const p1: PrincipalId = kernel.processPrincipalFromIndex(1) orelse unreachable;
 const p2: PrincipalId = kernel.processPrincipalFromIndex(2) orelse unreachable;
 
 var fd_capacity_backing: [64 * 1024 * 1024]u8 align(4096) = undefined;
-var dma_mapping_side_page: [4096]u8 align(4096) = undefined;
 var runtime_storage: [kernel.runtimeStorageBytes()]u8 align(4096) = undefined;
 
 fn initFdState() !KernelState {
@@ -262,6 +261,56 @@ test "VT-d table builders reject unaligned and out-of-range inputs" {
     try std.testing.expect(!kernel.vtd_tables.setSecondLevelEntry(&page, page.len, 0x1000, true, true));
 }
 
+test "VT-d IOVA allocator allocates frees exhausts and wraps its cursor" {
+    const t = kernel.vtd_tables;
+    var bitmap: [t.iova_bitmap_bytes]u8 = undefined;
+    var allocator = t.IovaAllocator.init(&bitmap);
+
+    try std.testing.expectEqual(t.iova_window_start, allocator.alloc(2).?);
+    try std.testing.expectEqual(t.iova_window_start + 2 * t.page_size, allocator.alloc(3).?);
+    try std.testing.expect(allocator.free(t.iova_window_start, 2));
+    try std.testing.expectEqual(t.iova_window_start + 5 * t.page_size, allocator.alloc(2).?);
+
+    allocator = t.IovaAllocator.init(&bitmap);
+    try std.testing.expectEqual(t.iova_window_start, allocator.alloc(t.iova_page_count - 1).?);
+    try std.testing.expectEqual(t.iova_window_end - t.page_size, allocator.alloc(1).?);
+    try std.testing.expect(allocator.alloc(1) == null);
+    try std.testing.expect(allocator.free(t.iova_window_start, 1));
+    try std.testing.expectEqual(t.iova_window_start, allocator.alloc(1).?);
+    try std.testing.expectEqual(t.iova_page_count, allocator.peak_pages);
+
+    try std.testing.expect(allocator.free(t.iova_window_start, t.iova_page_count));
+    try std.testing.expectEqual(@as(usize, 0), allocator.used_pages);
+    try std.testing.expectEqual(t.iova_window_start, allocator.alloc(t.iova_page_count).?);
+    try std.testing.expect(allocator.alloc(1) == null);
+}
+
+test "VT-d device domains isolate mappings and reuse teardown IOVA" {
+    const t = kernel.vtd_tables;
+    var context = [_]u64{0} ** t.entries_per_page;
+    var domain_roots: [2]t.TablePage align(4096) = undefined;
+    t.clear(&domain_roots[0]);
+    t.clear(&domain_roots[1]);
+    var domain_a_leaf = [_]u64{0} ** t.entries_per_page;
+    const domain_b_leaf = [_]u64{0} ** t.entries_per_page;
+    try std.testing.expect(t.setContextEntry(&context, 0x18, @intFromPtr(&domain_roots[0]), 1));
+    try std.testing.expect(t.setContextEntry(&context, 0x20, @intFromPtr(&domain_roots[1]), 2));
+    try std.testing.expect(context[0x18 * 2] != context[0x20 * 2]);
+
+    const leaf_index: usize = @intCast((t.iova_window_start >> 12) & 0x1ff);
+    try std.testing.expect(t.setSecondLevelEntry(&domain_a_leaf, leaf_index, 0x1234_5000, true, true));
+    try std.testing.expectEqual(@as(u64, 0x1234_5003), domain_a_leaf[leaf_index]);
+    try std.testing.expectEqual(@as(u64, 0), domain_b_leaf[leaf_index]);
+
+    var bitmap: [t.iova_bitmap_bytes]u8 = undefined;
+    var allocator = t.IovaAllocator.init(&bitmap);
+    const iova = allocator.alloc(1).?;
+    domain_a_leaf[leaf_index] = 0;
+    try std.testing.expect(allocator.free(iova, 1));
+    try std.testing.expectEqual(iova + t.page_size, allocator.alloc(t.iova_page_count - 1).?);
+    try std.testing.expectEqual(iova, allocator.alloc(1).?);
+}
+
 test "process descriptor capacity limit does not exceed address-space storage" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -395,7 +444,7 @@ test "pinned overlap exception is exact and other pins still reject" {
         .iova = 0x9000_0200,
         .size = 64,
         .direction = .to_device,
-    }, null, null, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16);
     try std.testing.expect(s.rangeOverlapsPinnedUserObjectExcept(p0, base, 4096, source_ref));
 }
 
@@ -425,14 +474,12 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
         .iova = 0x9088_0080,
         .size = 64,
         .direction = .from_device,
-    }, null, null, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16);
     try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, true));
     try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, false));
 
     const scatter_base: u64 = base + 0xc_0000;
     var scatter_free_list = FreePageList{};
-    try scatter_free_list.appendPage(0, @intFromPtr(&dma_mapping_side_page));
-    const scatter_addresses = [_]u64{0x918c_0080};
     const scatter_fd = try s.createDmaMappingFd(p0, .{
         .device = 1,
         .user_va = scatter_base + 0x80,
@@ -440,7 +487,7 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
         .size = 64,
         .page_count = 1,
         .direction = .from_device,
-    }, scatter_addresses[0..], &scatter_free_list, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16);
     try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, scatter_base, 4096, null, true));
 
     const second_mapping_fd = try s.createDmaMappingFd(p0, .{
@@ -449,14 +496,14 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
         .iova = 0x9088_0300,
         .size = 64,
         .direction = .to_device,
-    }, null, null, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16);
     try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, mapping_base, 4096));
     try s.closeFd(p0, first_mapping_fd);
     try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, mapping_base, 4096));
     try s.closeFd(p0, second_mapping_fd);
     try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, mapping_base, 4096));
     try s.closeFdWithFreeList(p0, scatter_fd, &scatter_free_list);
-    try std.testing.expectEqual(@as(usize, 1), scatter_free_list.len);
+    try std.testing.expectEqual(@as(usize, 0), scatter_free_list.len);
 
     const mmio_base: u64 = base + 0x10_0000;
     const mmio_fd = try s.createMmioRegionFd(p0, .{
@@ -526,7 +573,7 @@ test "owner teardown revokes exact pinned aliases only" {
         .iova = 0x8300_0000,
         .size = 4096,
         .direction = .bidirectional,
-    }, null, null, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true }), .{}, 16);
     const unrelated_ref = (s.fdEntryConst(p1, unrelated_fd) orelse unreachable).object;
 
     try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(owner_ref));
@@ -538,22 +585,17 @@ test "owner teardown revokes exact pinned aliases only" {
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(unrelated_ref));
 }
 
-test "scatter DMA mapping owns derive-time addresses and returns side storage" {
+test "scatter DMA mapping keeps ABI page count without side storage" {
     var s = try initFdState();
-    var free_list = FreePageList{};
-    try free_list.appendPage(0, @intFromPtr(&dma_mapping_side_page));
-    const original_free = free_list.len;
-    const addresses = [_]u64{ 0x1200_0080, 0x3400_0000, 0x5600_0000 };
 
     const fd = try s.createDmaMappingFd(p0, .{
         .device = 1,
         .user_va = 0x4400_0080,
-        .iova = addresses[0],
+        .iova = 0x8200_0080,
         .size = 3 * 4096 - 0x80,
-        .page_count = addresses.len,
+        .page_count = 3,
         .direction = .bidirectional,
-    }, addresses[0..], &free_list, fdRights(.{ .close = true }), .{}, 16);
-    try std.testing.expectEqual(original_free - 1, free_list.len);
+    }, fdRights(.{ .close = true }), .{}, 16);
 
     const object_ref = (s.fdEntryConst(p0, fd) orelse unreachable).object;
     const slot = s.kernelObjectSlotConst(object_ref) orelse unreachable;
@@ -561,60 +603,40 @@ test "scatter DMA mapping owns derive-time addresses and returns side storage" {
         .dma_mapping => |value| value,
         else => return error.TestExpectedEqual,
     };
-    try std.testing.expectEqual(@intFromPtr(&dma_mapping_side_page), mapping.page_addresses_paddr);
-    const stored: [*]const u64 = @ptrFromInt(mapping.page_addresses_paddr);
-    try std.testing.expectEqualSlices(u64, addresses[0..], stored[0..addresses.len]);
+    try std.testing.expectEqual(@as(u16, 3), mapping.page_count);
+    try std.testing.expectEqual(@as(u64, 0x8200_0080), mapping.iova);
 
-    try s.closeFdWithFreeList(p0, fd, &free_list);
-    try std.testing.expectEqual(original_free, free_list.len);
+    try s.closeFd(p0, fd);
+    try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(object_ref));
 }
 
-test "scatter DMA derive failures do not leak side storage" {
+test "scatter DMA mapping validates fd capacity without allocator side storage" {
     var s = try initFdState();
-    const addresses = [_]u64{0x1200_0000};
-    var empty_free_list = FreePageList{};
-    try std.testing.expectError(KernelError.OutOfFreePages, s.createDmaMappingFd(p0, .{
-        .device = 1,
-        .user_va = 0x4500_0000,
-        .iova = addresses[0],
-        .size = 4096,
-        .page_count = 1,
-    }, addresses[0..], &empty_free_list, fdRights(.{ .close = true }), .{}, 16));
-    try std.testing.expectEqual(@as(usize, 0), empty_free_list.len);
-
-    var free_list = FreePageList{};
-    try free_list.appendPage(0, @intFromPtr(&dma_mapping_side_page));
-    const original_free = free_list.len;
     try std.testing.expectError(KernelError.TableFull, s.createDmaMappingFd(p0, .{
         .device = 1,
         .user_va = 0x4500_0000,
-        .iova = addresses[0],
+        .iova = 0x8200_0000,
         .size = 4096,
         .page_count = 1,
-    }, addresses[0..], &free_list, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries)));
-    try std.testing.expectEqual(original_free, free_list.len);
+    }, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries)));
 }
 
-test "owner revoke returns scatter DMA side storage before VMA pages" {
+test "owner revoke tears down scatter DMA without side storage" {
     var s = try initFdState();
     var free_list = FreePageList{};
-    try free_list.appendPage(0, @intFromPtr(&dma_mapping_side_page));
-    const addresses = [_]u64{ 0x2200_0080, 0x3300_0000 };
     const owner_fd = try s.createDmaMappingFd(p0, .{
         .device = 1,
         .user_va = 0x4600_0080,
-        .iova = addresses[0],
+        .iova = 0x8200_0080,
         .size = 8192 - 0x80,
-        .page_count = addresses.len,
-    }, addresses[0..], &free_list, fdRights(.{ .close = true }), .{}, 16);
+        .page_count = 2,
+    }, fdRights(.{ .close = true }), .{}, 16);
     const object_ref = (s.fdEntryConst(p0, owner_fd) orelse unreachable).object;
     const alias_fd = try s.installFd(p1, object_ref, fdRights(.{ .close = true }), .{}, 16);
-    try std.testing.expectEqual(@as(usize, 0), free_list.len);
-
     s.releasePrincipalNativeMemory(p0, &free_list);
     try std.testing.expect(s.fdEntryConst(p0, owner_fd) == null);
     try std.testing.expect(s.fdEntryConst(p1, alias_fd) == null);
-    try std.testing.expectEqual(@as(usize, 1), free_list.len);
+    try std.testing.expectEqual(@as(usize, 0), free_list.len);
 }
 
 test "process fd exposes process object kind and lifecycle state" {

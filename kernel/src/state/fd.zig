@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
@@ -252,34 +251,26 @@ pub fn releaseMmioRegionObject(self: anytype, mmio: MmioRegionObject) void {
 pub fn releaseDmaBufferObject(self: anytype, dma: DmaBufferObject) void {
     _ = self;
     if (dma.size == 0) return;
-    _ = dma.device;
-    vtd.unmapRange(dma.iova, dma.size);
+    releaseDmaIova(dma.device, dma.iova, dma.size);
 }
 
 pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
     _ = self;
     if (mapping.size == 0) return;
-    _ = mapping.device;
-    if (mapping.page_count != 0) {
-        if (mapping.page_addresses_paddr == 0) return;
-        const page_addresses: [*]const u64 = @ptrFromInt(mapping.page_addresses_paddr);
-        var page_index: usize = 0;
-        while (page_index < mapping.page_count) : (page_index += 1) {
-            vtd.unmapRange(page_addresses[page_index] & ~@as(u64, 0xfff), 4096);
-        }
-        return;
-    }
-    vtd.unmapRange(mapping.iova, mapping.size);
+    releaseDmaIova(mapping.device, mapping.iova, mapping.size);
 }
 
-fn releaseDmaMappingObjectWithFreeList(
-    self: anytype,
-    mapping: DmaMappingObject,
-    free_list: *FreePageList,
-) void {
-    self.releaseDmaMappingObject(mapping);
-    if (mapping.page_count == 0 or mapping.page_addresses_paddr == 0) return;
-    free_list.appendPage(0, mapping.page_addresses_paddr) catch {};
+fn releaseDmaIova(device: DmaDeviceId, iova: u64, size: u64) void {
+    if (!vtd.isActive() or size == 0) return;
+    const page_size: u64 = 4096;
+    const iova_base = iova & ~(page_size - 1);
+    const span, const overflow = @addWithOverflow(iova - iova_base, size);
+    if (overflow != 0) return;
+    const aligned, const align_overflow = @addWithOverflow(span, page_size - 1);
+    if (align_overflow != 0) return;
+    const page_count: usize = @intCast((aligned & ~(page_size - 1)) / page_size);
+    vtd.unmapRangeForDevice(device, iova, size);
+    vtd.freeIova(device, iova_base, page_count);
 }
 
 pub fn releaseIrqObject(self: anytype, irq: IrqObject) void {
@@ -318,7 +309,7 @@ pub fn releaseKernelObjectPayloadWithFreeList(
         .reply => |reply_ref| self.clearIpcReplySlotWithFreeList(reply_ref, free_list),
         .mmio_region => |mmio| self.releaseMmioRegionObject(mmio),
         .dma_buffer => |dma| self.releaseDmaBufferObject(dma),
-        .dma_mapping => |mapping| releaseDmaMappingObjectWithFreeList(self, mapping, free_list),
+        .dma_mapping => |mapping| self.releaseDmaMappingObject(mapping),
         .irq => |irq| self.releaseIrqObject(irq),
         .pipe => |pipe| self.releasePipeEndpoint(pipe),
         else => {},
@@ -979,7 +970,16 @@ pub fn createDmaBufferFd(
     payload.owner_principal_raw = @intFromEnum(owner);
     const object_ref = try self.createKernelObject(.dma_buffer, .{ .dma_buffer = payload });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
-        if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+        // The syscall that owns the not-yet-published IOVA performs failure
+        // cleanup. Do not run the DMA destructor here as well: freeing twice
+        // would create a window where another thread can reuse the IOVA before
+        // the caller's second unmap.
+        if (self.kernelObjectSlot(object_ref)) |slot| {
+            slot.kind = .none;
+            slot.ref_count = 0;
+            slot.payload = .{ .none = {} };
+            slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+        }
         return err;
     };
 }
@@ -988,8 +988,6 @@ pub fn createDmaMappingFd(
     self: anytype,
     owner: PrincipalId,
     mapping: DmaMappingObject,
-    page_addresses: ?[]const u64,
-    free_list: ?*FreePageList,
     rights: FdRights,
     flags: FdFlags,
     min_fd: Fd,
@@ -997,27 +995,6 @@ pub fn createDmaMappingFd(
     if (mapping.device == 0 or mapping.user_va == 0 or mapping.size == 0) return KernelError.InvalidState;
     var payload = mapping;
     payload.owner_principal_raw = @intFromEnum(owner);
-    var side_storage_paddr: u64 = 0;
-    errdefer if (side_storage_paddr != 0) {
-        free_list.?.appendPage(0, side_storage_paddr) catch {};
-    };
-    if (mapping.page_count == 0) {
-        if (page_addresses != null or mapping.page_addresses_paddr != 0) return KernelError.InvalidState;
-    } else {
-        const addresses = page_addresses orelse return KernelError.InvalidState;
-        const pages = free_list orelse return KernelError.InvalidState;
-        if (mapping.page_addresses_paddr != 0 or
-            addresses.len != mapping.page_count or
-            addresses.len > 4096 / @sizeOf(u64)) return KernelError.InvalidState;
-        const storage_paddr = if (builtin.is_test)
-            try pages.popFront()
-        else
-            try pages.popFrontBelow(@TypeOf(self.*).low_memory_limit);
-        side_storage_paddr = storage_paddr;
-        const storage: [*]u64 = @ptrFromInt(storage_paddr);
-        @memcpy(storage[0..addresses.len], addresses);
-        payload.page_addresses_paddr = storage_paddr;
-    }
     const object_ref = try self.createKernelObject(.dma_mapping, .{ .dma_mapping = payload });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         if (self.kernelObjectSlot(object_ref)) |slot| {

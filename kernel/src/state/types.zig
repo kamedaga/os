@@ -282,11 +282,9 @@ pub const DmaMappingObject = struct {
     user_va: u64 = 0,
     iova: u64 = 0,
     size: u64 = 0,
-    /// Non-zero only for a physical-page scatter mapping. The corresponding
-    /// derive-time DMA addresses live in one separately allocated physical
-    /// page so teardown never has to resolve the owner's user PTEs again.
+    /// Non-zero only for a scatter derive and exposed by the existing query
+    /// ABI. Teardown derives the owned contiguous IOVA span from iova+size.
     page_count: u16 = 0,
-    page_addresses_paddr: u64 = 0,
     direction: CapsuleDmaDirection = .bidirectional,
     flags: u32 = 0,
 };

@@ -131,7 +131,19 @@ fn mapPciBarIntoUser(
     return false;
 }
 
-fn userDmaAddressForRange(
+const ResolvedDmaRange = struct {
+    first_page_va: u64,
+    first_page_offset: u64,
+    page_count: usize,
+
+    fn paddrs(self: ResolvedDmaRange) []const u64 {
+        return dma_resolved_paddrs[0..self.page_count];
+    }
+};
+
+const DmaPolicyError = error{ Invalid, Map };
+
+fn resolveUserDmaPages(
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
     proc: kernel.PrincipalId,
@@ -140,7 +152,7 @@ fn userDmaAddressForRange(
     device_writes: bool,
     except_pinned_object: ?kernel.KernelObjectRef,
     allow_dma_mapping_aliases: bool,
-) ?u64 {
+) ?ResolvedDmaRange {
     if (user_va == 0 or size == 0) return null;
     const first_page_va = pageAlignDown(user_va);
     const offset = user_va - first_page_va;
@@ -163,7 +175,6 @@ fn userDmaAddressForRange(
         return null;
     }
 
-    const page_count_usize: usize = @intCast(page_count);
     var page_index: u64 = 0;
     while (page_index < page_count) : (page_index += 1) {
         const page_delta, const delta_overflow = @mulWithOverflow(page_index, page_size);
@@ -179,13 +190,11 @@ fn userDmaAddressForRange(
         ) orelse return null;
         dma_resolved_paddrs[@intCast(page_index)] = paddr;
     }
-    if (kernel.dmaAddressForResolvedPages(
-        dma_resolved_paddrs[0..page_count_usize],
-        offset,
-    )) |dma_address| return dma_address;
-
-    @import("../kernel_log.zig").writeFmt("dma derive noncontig owner={} va=0x{x} pages={}\n", .{ @intFromEnum(proc), first_page_va, page_count });
-    return null;
+    return .{
+        .first_page_va = first_page_va,
+        .first_page_offset = offset,
+        .page_count = @intCast(page_count),
+    };
 }
 
 fn installResolvedDmaPage(
@@ -253,18 +262,45 @@ fn resolveDmaPageWithAddressSpaceLocked(
     return installResolvedDmaPage(proc, page_va, mapping);
 }
 
-fn dmaIovaOrKernelChoice(iova_arg: u64, paddr: u64, size: u64) ?u64 {
-    if (iova_arg == capsule_abi.dma_iova_kernel_choose) {
-        return if (!vtd.isActive() or vtd.isAddressableRange(paddr, size)) paddr else null;
+fn mapResolvedDmaPages(
+    proc: kernel.PrincipalId,
+    device: kernel.DmaDeviceId,
+    iova_arg: u64,
+    resolved: ResolvedDmaRange,
+    readable: bool,
+    writable: bool,
+) DmaPolicyError!u64 {
+    if (!vtd.isActive()) {
+        const paddr = kernel.dmaAddressForResolvedPages(
+            resolved.paddrs(),
+            resolved.first_page_offset,
+        ) orelse {
+            @import("../kernel_log.zig").writeFmt(
+                "dma derive noncontig owner={} va=0x{x} pages={}\n",
+                .{ @intFromEnum(proc), resolved.first_page_va, resolved.page_count },
+            );
+            return DmaPolicyError.Invalid;
+        };
+        return if (iova_arg == capsule_abi.dma_iova_kernel_choose) paddr else iova_arg;
     }
-    if (!vtd.isActive() or vtd.isAddressableRange(iova_arg, size)) return iova_arg;
-    return if (vtd.isAddressableRange(paddr, size)) paddr else null;
+    if (iova_arg != capsule_abi.dma_iova_kernel_choose) return DmaPolicyError.Invalid;
+    const iova_base = vtd.allocIova(device, resolved.page_count) orelse return DmaPolicyError.Map;
+    if (!vtd.mapPages(device, iova_base, resolved.paddrs(), readable, writable)) {
+        vtd.freeIova(device, iova_base, resolved.page_count);
+        return DmaPolicyError.Map;
+    }
+    return iova_base + resolved.first_page_offset;
 }
 
-fn unmapScatterPageAddresses(page_addresses: []const u64) void {
-    for (page_addresses) |address| {
-        vtd.unmapRange(address & ~(page_size - 1), page_size);
-    }
+fn releaseDeviceIova(device: kernel.DmaDeviceId, iova: u64, size: u64) void {
+    if (!vtd.isActive() or size == 0) return;
+    const iova_base = pageAlignDown(iova);
+    const span, const overflow = @addWithOverflow(iova - iova_base, size);
+    if (overflow != 0) return;
+    const aligned_span = pageAlignUp(span) orelse return;
+    const page_count: usize = @intCast(aligned_span / page_size);
+    vtd.unmapRangeForDevice(device, iova, size);
+    vtd.freeIova(device, iova_base, page_count);
 }
 
 fn rightsForMmio(parent: kernel.FdRights) kernel.FdRights {
@@ -453,7 +489,9 @@ pub fn dispatch(
                 else => break :blk sc.syscall_err_invalid,
             };
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(
+            if (vtd.isActive() and frame.rdx != capsule_abi.dma_iova_kernel_choose)
+                break :blk sc.syscall_err_invalid;
+            const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
                 proc,
@@ -463,8 +501,17 @@ pub fn dispatch(
                 null,
                 false,
             ) orelse break :blk sc.syscall_err_invalid;
-            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
-            if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
+            const iova = mapResolvedDmaPages(
+                proc,
+                device.device,
+                frame.rdx,
+                resolved,
+                true,
+                true,
+            ) catch |err| break :blk switch (err) {
+                DmaPolicyError.Invalid => sc.syscall_err_invalid,
+                DmaPolicyError.Map => sc.syscall_err_map,
+            };
             break :blk state.createDmaBufferFd(proc, .{
                 .device = device.device,
                 .user_va = frame.rsi,
@@ -472,7 +519,7 @@ pub fn dispatch(
                 .size = frame.r10,
                 .flags = flags,
             }, rightsForDma(view.rights), .{}, first_dynamic_fd) catch |err| {
-                vtd.unmapRange(iova, frame.r10);
+                releaseDeviceIova(device.device, iova, frame.r10);
                 break :blk statusFromKernelError(err);
             };
         },
@@ -488,7 +535,9 @@ pub fn dispatch(
                 break :blk sc.syscall_err_invalid;
             }
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(
+            if (vtd.isActive() and frame.rdx != capsule_abi.dma_iova_kernel_choose)
+                break :blk sc.syscall_err_invalid;
+            const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
                 proc,
@@ -496,15 +545,21 @@ pub fn dispatch(
                 frame.r10,
                 direction != .to_device,
                 null,
-                // R8 uses one shared identity domain. Aliases resolve to the
-                // same SLPTE, and vtd.mapRange reference-counts that page so
-                // either mapping may close first without tearing down the
-                // survivor. In pass-through mode this preserves the previous
-                // !vtd.isActive() behavior.
+                // Each active-IOMMU derive owns a distinct IOVA allocation;
+                // pass-through mode preserves its existing alias behavior.
                 true,
             ) orelse break :blk sc.syscall_err_invalid;
-            const iova = dmaIovaOrKernelChoice(frame.rdx, paddr, frame.r10) orelse break :blk sc.syscall_err_invalid;
-            if (!vtd.mapRange(iova, paddr, frame.r10)) break :blk sc.syscall_err_map;
+            const iova = mapResolvedDmaPages(
+                proc,
+                device.device,
+                frame.rdx,
+                resolved,
+                direction != .from_device,
+                direction != .to_device,
+            ) catch |err| break :blk switch (err) {
+                DmaPolicyError.Invalid => sc.syscall_err_invalid,
+                DmaPolicyError.Map => sc.syscall_err_map,
+            };
             break :blk state.createDmaMappingFd(proc, .{
                 .device = device.device,
                 .user_va = frame.rsi,
@@ -512,8 +567,8 @@ pub fn dispatch(
                 .size = frame.r10,
                 .direction = direction,
                 .flags = flags,
-            }, null, null, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
-                vtd.unmapRange(iova, frame.r10);
+            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
+                releaseDeviceIova(device.device, iova, frame.r10);
                 break :blk statusFromKernelError(err);
             };
         },
@@ -576,22 +631,33 @@ pub fn dispatch(
                     page_va,
                     device_writes,
                 ) orelse break :blk sc.syscall_err_invalid;
-                if (page_index == 0) {
-                    const first_dma, const dma_overflow = @addWithOverflow(page_paddr, layout.first_page_offset);
-                    if (dma_overflow != 0) break :blk sc.syscall_err_invalid;
-                    page_addresses[page_index] = first_dma;
-                } else {
-                    page_addresses[page_index] = page_paddr;
-                }
+                page_addresses[page_index] = page_paddr;
             }
 
-            page_index = 0;
-            while (page_index < layout.page_count) : (page_index += 1) {
-                const page_paddr = page_addresses[page_index] & ~(page_size - 1);
-                if (!vtd.mapRange(page_paddr, page_paddr, page_size)) {
-                    unmapScatterPageAddresses(page_addresses[0..page_index]);
+            var mapping_iova: u64 = undefined;
+            if (vtd.isActive()) {
+                const iova_base = vtd.allocIova(device.device, layout.page_count) orelse break :blk sc.syscall_err_map;
+                if (!vtd.mapPages(
+                    device.device,
+                    iova_base,
+                    page_addresses[0..layout.page_count],
+                    direction != .from_device,
+                    direction != .to_device,
+                )) {
+                    vtd.freeIova(device.device, iova_base, layout.page_count);
                     break :blk sc.syscall_err_map;
                 }
+                mapping_iova = iova_base + layout.first_page_offset;
+                page_index = 0;
+                while (page_index < layout.page_count) : (page_index += 1) {
+                    page_addresses[page_index] = iova_base + @as(u64, @intCast(page_index)) * page_size;
+                }
+                page_addresses[0] += layout.first_page_offset;
+            } else {
+                const first_dma, const dma_overflow = @addWithOverflow(page_addresses[0], layout.first_page_offset);
+                if (dma_overflow != 0) break :blk sc.syscall_err_invalid;
+                mapping_iova = first_dma;
+                page_addresses[0] = first_dma;
             }
 
             // Like the existing DMA mapping ABI, the caller must keep the
@@ -601,13 +667,13 @@ pub fn dispatch(
             const mapping_fd = state.createDmaMappingFd(proc, .{
                 .device = device.device,
                 .user_va = frame.rsi,
-                .iova = page_addresses[0],
+                .iova = mapping_iova,
                 .size = frame.rdx,
                 .page_count = @intCast(layout.page_count),
                 .direction = direction,
                 .flags = 0,
-            }, page_addresses[0..layout.page_count], h.free_list, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
-                unmapScatterPageAddresses(page_addresses[0..layout.page_count]);
+            }, rightsForDmaMapping(view.rights, direction), .{}, first_dynamic_fd) catch |err| {
+                releaseDeviceIova(device.device, mapping_iova, frame.rdx);
                 break :blk statusFromKernelError(err);
             };
 
@@ -628,7 +694,9 @@ pub fn dispatch(
             }
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
             if (frame.rdx == 0 or frame.rdx > buffer.size) break :blk sc.syscall_err_invalid;
-            const paddr = userDmaAddressForRange(
+            if (vtd.isActive() and frame.rsi != capsule_abi.dma_iova_kernel_choose)
+                break :blk sc.syscall_err_invalid;
+            const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
                 proc,
@@ -638,8 +706,17 @@ pub fn dispatch(
                 buffer_entry.object,
                 false,
             ) orelse break :blk sc.syscall_err_invalid;
-            const iova = dmaIovaOrKernelChoice(frame.rsi, paddr, frame.rdx) orelse break :blk sc.syscall_err_invalid;
-            if (!vtd.mapRange(iova, paddr, frame.rdx)) break :blk sc.syscall_err_map;
+            const iova = mapResolvedDmaPages(
+                proc,
+                buffer.device,
+                frame.rsi,
+                resolved,
+                direction != .from_device,
+                direction != .to_device,
+            ) catch |err| break :blk switch (err) {
+                DmaPolicyError.Invalid => sc.syscall_err_invalid,
+                DmaPolicyError.Map => sc.syscall_err_map,
+            };
             break :blk state.createDmaMappingFd(proc, .{
                 .device = buffer.device,
                 .user_va = buffer.user_va,
@@ -647,8 +724,8 @@ pub fn dispatch(
                 .size = frame.rdx,
                 .direction = direction,
                 .flags = flags,
-            }, null, null, rightsForDmaMapping(buffer_entry.rights, direction), .{}, first_dynamic_fd) catch |err| {
-                vtd.unmapRange(iova, frame.rdx);
+            }, rightsForDmaMapping(buffer_entry.rights, direction), .{}, first_dynamic_fd) catch |err| {
+                releaseDeviceIova(buffer.device, iova, frame.rdx);
                 break :blk statusFromKernelError(err);
             };
         },

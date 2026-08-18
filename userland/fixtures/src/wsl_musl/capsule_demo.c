@@ -12,7 +12,7 @@
 #include "pacha/capsule.h"
 
 #define DEMO_PAGE_SIZE 4096ULL
-#define DEMO_DMA_IOVA 0x100000000ULL
+#define DEMO_DMA_IOVA PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE
 
 static int is_fd(int fd) {
     return fd >= 16 && fd < 256;
