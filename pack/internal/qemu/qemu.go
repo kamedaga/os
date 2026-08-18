@@ -163,6 +163,35 @@ type TTYTestResult struct {
 	Screendumps   []string
 }
 
+type serialExpectationTracker struct {
+	mu       sync.Mutex
+	expected []string
+	matched  map[string]bool
+}
+
+func newSerialExpectationTracker(expected []string) *serialExpectationTracker {
+	return &serialExpectationTracker{
+		expected: append([]string(nil), expected...),
+		matched:  make(map[string]bool, len(expected)),
+	}
+}
+
+func (tracker *serialExpectationTracker) Observe(text string) {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	for _, expected := range tracker.expected {
+		if expected != "" && !tracker.matched[expected] && strings.Contains(text, expected) {
+			tracker.matched[expected] = true
+		}
+	}
+}
+
+func (tracker *serialExpectationTracker) Matched(expected string) bool {
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	return tracker.matched[expected]
+}
+
 type hostTimeLog struct {
 	file    *os.File
 	started time.Time
@@ -610,6 +639,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 	}
 
 	booted := make(chan struct{})
+	serialExpectations := newSerialExpectationTracker(opts.Expect)
 	var bootedOnce sync.Once
 	var writeMu sync.Mutex
 	scanSerial := func(reader io.Reader, hostWriter *hostTimeLineWriter) {
@@ -617,6 +647,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
+			serialExpectations.Observe(line)
 			hostWriter.writeLine([]byte(line))
 			writeMu.Lock()
 			_, _ = serialFile.WriteString(line + "\n")
@@ -667,6 +698,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			span.Fail("virtio-console connect failed")
 			return result, err
 		}
+		ttyClient.serialExpectations = serialExpectations
 		defer ttyClient.Close()
 		if len(checks) != 0 || len(inputChecks) != 0 {
 			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, wait, 5*time.Second); waitErr != nil || exited {
@@ -817,13 +849,14 @@ func (client *ttyConsoleClient) RunScreendumpChecks(qmp *qmpClient, device strin
 }
 
 type ttyConsoleClient struct {
-	conn        net.Conn
-	consoleFile *os.File
-	output      strings.Builder
-	outputMu    sync.Mutex
-	readDone    chan error
-	hostWriter  io.Writer
-	closeOnce   sync.Once
+	conn               net.Conn
+	consoleFile        *os.File
+	output             strings.Builder
+	outputMu           sync.Mutex
+	readDone           chan error
+	hostWriter         io.Writer
+	closeOnce          sync.Once
+	serialExpectations *serialExpectationTracker
 }
 
 func startTTYConsoleClient(socketPath string, consoleFile *os.File, hostWriters ...io.Writer) (*ttyConsoleClient, error) {
@@ -908,7 +941,8 @@ func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, 
 			if expect == "" || seen[expect] {
 				continue
 			}
-			if strings.Contains(text, expect) {
+			if strings.Contains(text, expect) ||
+				(client.serialExpectations != nil && client.serialExpectations.Matched(expect)) {
 				seen[expect] = true
 				matched = append(matched, expect)
 			}
@@ -927,7 +961,8 @@ func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, 
 				if expect == "" || seen[expect] {
 					continue
 				}
-				if strings.Contains(text, expect) {
+				if strings.Contains(text, expect) ||
+					(client.serialExpectations != nil && client.serialExpectations.Matched(expect)) {
 					seen[expect] = true
 					matched = append(matched, expect)
 				}

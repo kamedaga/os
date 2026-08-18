@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +24,33 @@ import (
 	"capabilityos/pack/internal/ui"
 	"github.com/spf13/cobra"
 )
+
+type invertedBoolValue struct {
+	target *bool
+}
+
+func (value *invertedBoolValue) Set(raw string) error {
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return err
+	}
+	*value.target = !parsed
+	return nil
+}
+
+func (value *invertedBoolValue) String() string {
+	return strconv.FormatBool(!*value.target)
+}
+
+func (value *invertedBoolValue) Type() string {
+	return "bool"
+}
+
+func addIOMMUFlags(cmd *cobra.Command, enabled *bool) {
+	cmd.Flags().BoolVar(enabled, "iommu", true, "enable the QEMU Intel IOMMU and virtio IOMMU platform feature (default)")
+	cmd.Flags().Var(&invertedBoolValue{target: enabled}, "no-iommu", "disable the QEMU Intel IOMMU and virtio IOMMU platform feature")
+	cmd.Flags().Lookup("no-iommu").NoOptDefVal = "true"
+}
 
 func buildCommand(ctx *context) *cobra.Command {
 	cmd := &cobra.Command{
@@ -173,7 +201,7 @@ func qemuLimineCommand(ctx *context) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&prepare, "prepare", false, "build Limine kernel/userland/bootfs image before booting")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().BoolVar(&opts.IOMMU, "iommu", false, "enable the QEMU Intel IOMMU and virtio IOMMU platform feature")
+	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without network")
 	cmd.Flags().BoolVar(&opts.Fast, "fast", true, "reduce QEMU-side diagnostics")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
@@ -322,7 +350,7 @@ func qemuCommand(ctx *context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.NewTerminal, "new-terminal", false, "open virtio-console in a new terminal window")
 	cmd.Flags().BoolVar(&opts.NewTerminal, "terminal", false, "alias for --new-terminal")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().BoolVar(&opts.IOMMU, "iommu", false, "enable the QEMU Intel IOMMU and virtio IOMMU platform feature")
+	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without virtio-net")
 	cmd.Flags().BoolVar(&opts.Fast, "fast", true, "reduce QEMU-side diagnostics")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
@@ -565,10 +593,10 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	cmd.Flags().DurationVar(&opts.Timeout, "timeout", 30*time.Second, "maximum time to wait for boot and console expectations")
 	cmd.Flags().StringVar(&opts.BootMarker, "boot-marker", "[termd] linux tty hvc open ready index=0 handle=", "serial log marker required before sending input")
 	cmd.Flags().StringArrayVar(&opts.Send, "send", nil, "string to send to the TTY; repeatable")
-	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "console output substring required for success; repeatable")
+	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "serial or console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
-	cmd.Flags().BoolVar(&opts.IOMMU, "iommu", false, "enable the QEMU Intel IOMMU and virtio IOMMU platform feature")
+	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
 	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")

@@ -229,9 +229,10 @@ pub fn rangeOverlapsPinnedUserObjectExcept(
 ///
 /// MMIO and DMA buffers are never alias candidates. MMIO owns a close-time
 /// user-VA unmap, while a DMA buffer is a separately published bidirectional
-/// allocation. Streaming-mapping aliases are admitted only when the caller
-/// has established that the active IOMMU backend does not require independent
-/// IOVA teardown.
+/// allocation. Streaming-mapping aliases are admitted only when the syscall's
+/// lifetime policy makes closing either mapping harmless to the other. The
+/// policy is explicit at each derive operation and does not depend on VT-d
+/// state here.
 pub fn rangeConflictsWithDmaDerivation(
     self: anytype,
     owner: PrincipalId,

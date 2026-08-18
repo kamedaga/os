@@ -19,7 +19,7 @@ pub const iova_window_end = tables.iova_window_end;
 const iova_page_count = tables.iova_page_count;
 const iova_bitmap_bytes = tables.iova_bitmap_bytes;
 const iova_bitmap_pages: usize = iova_bitmap_bytes / @as(usize, @intCast(page_size));
-const max_domains: usize = 32;
+const max_domains: usize = 256;
 const max_leaf_tables: usize = 4096;
 const leaf_index_slots: usize = max_leaf_tables * 2;
 const poll_limit: usize = 1_000_000;
@@ -429,7 +429,10 @@ fn disableTranslationAfterFailure() void {
 }
 
 fn logInitFailure(reason: []const u8) void {
-    kernel_log.writeFmt("vtd: enable failed reason={s}; pass-through active=0\n", .{reason});
+    kernel_log.writeFmt(
+        "vtd: mode=pass-through reason=initialization-failed detail={s} active=0 faults=0\n",
+        .{reason},
+    );
     if (driver_state.register_base != 0 and
         ((driver_state.gcmd_shadow & gcmd_te) != 0 or (mmioRead32(gsts_reg) & gsts_tes) != 0))
     {
@@ -582,11 +585,14 @@ fn installPciContexts() bool {
 pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
     driver_state = .{};
     const table = acpi_dmar.findDmar(rsdp_paddr) orelse {
-        kernel_log.write("vtd: DMAR not found active=0 faults=0\n");
+        kernel_log.write("vtd: mode=pass-through reason=dmar-not-found active=0 faults=0\n");
         return;
     };
     const info = acpi_dmar.parseDmar(table.bytes) catch |err| {
-        kernel_log.writeFmt("vtd: DMAR invalid paddr=0x{x} error={s} active=0 faults=0\n", .{ table.paddr, @errorName(err) });
+        kernel_log.writeFmt(
+            "vtd: mode=pass-through reason=dmar-invalid paddr=0x{x} error={s} active=0 faults=0\n",
+            .{ table.paddr, @errorName(err) },
+        );
         return;
     };
     driver_state.discovery = .{ .table_paddr = table.paddr, .info = info };
@@ -674,7 +680,7 @@ pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
     }
     driver_state.active = true;
     kernel_log.writeFmt(
-        "vtd: translation enabled active=1 domains={} contexts={} root=0x{x}\n",
+        "vtd: mode=translated reason=enabled active=1 domains={} contexts={} root=0x{x}\n",
         .{ driver_state.domain_count, driver_state.context_count, driver_state.root_paddr },
     );
     dumpFaults();

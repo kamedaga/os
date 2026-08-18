@@ -499,6 +499,8 @@ pub fn dispatch(
                 frame.r10,
                 true,
                 null,
+                // A bidirectional DMA buffer is the range's published DMA
+                // allocation. It must remain exclusive of every other pin.
                 false,
             ) orelse break :blk sc.syscall_err_invalid;
             const iova = mapResolvedDmaPages(
@@ -545,8 +547,9 @@ pub fn dispatch(
                 frame.r10,
                 direction != .to_device,
                 null,
-                // Each active-IOMMU derive owns a distinct IOVA allocation;
-                // pass-through mode preserves its existing alias behavior.
+                // Streaming mappings may share resolved pages. Under VT-d,
+                // each derive owns an independent IOVA; in pass-through mode
+                // close does not tear down translation for either alias.
                 true,
             ) orelse break :blk sc.syscall_err_invalid;
             const iova = mapResolvedDmaPages(
@@ -636,6 +639,9 @@ pub fn dispatch(
 
             var mapping_iova: u64 = undefined;
             if (vtd.isActive()) {
+                // Scatter-page derivation is a first-class VT-d mapping: one
+                // contiguous IOVA allocation covers every resolved page and
+                // is owned by the returned mapping capability.
                 const iova_base = vtd.allocIova(device.device, layout.page_count) orelse break :blk sc.syscall_err_map;
                 if (!vtd.mapPages(
                     device.device,
@@ -704,6 +710,8 @@ pub fn dispatch(
                 frame.rdx,
                 direction != .to_device,
                 buffer_entry.object,
+                // Re-derivation may overlap its source buffer (excluded
+                // above), but no unrelated pinned object or mapping.
                 false,
             ) orelse break :blk sc.syscall_err_invalid;
             const iova = mapResolvedDmaPages(
