@@ -2650,11 +2650,8 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         lpr_trace_socket_syscall_event("enter", nr, a0, a1, a2, 0);
     }
     lpr_linux_ensure_default_stdio();
-    const int64_t pre_signal_status = lpr_linux_dispatch_pending_signals();
-    if (pre_signal_status != 0) {
-        return pre_signal_status;
-    }
-    lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+    /* A queued signal must not suppress the syscall. Blocking waits surface
+     * interruptions through LPR_WAIT_RESTART_SYSCALL below. */
     const int trace_metrics = pacha_trace_enabled(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_CLASS_METRIC);
     if (trace_metrics && (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP)) {
         lpr_trace_syscall_record(nr, 0, 0);

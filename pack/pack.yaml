@@ -1120,6 +1120,16 @@ apps:
     file: "tests/fixtures/lpr_wait4_signal_smoke.sh"
     out: "LPRW4SIG.SH"
     rootfs: "/cmd/lpr_wait4_signal_smoke.sh"
+  lpr_exec_pipe_race_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_exec_pipe_race_smoke.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_exec_pipe_race_smoke", "userland/fixtures/src/wsl_musl/lpr_exec_pipe_race_smoke.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_exec_pipe_race_smoke.c"
+    out: "LPRXPRAC.ELF"
+    rootfs: "/cmd/lpr_exec_pipe_race.elf"
   lpr_drm_card0_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_drm_card0_smoke.static.elf"
