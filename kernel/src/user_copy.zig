@@ -1,5 +1,6 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
+const scheduler = @import("scheduler_connection.zig");
 const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
 
@@ -21,8 +22,8 @@ pub const Hooks = struct {
 var user_copy_hooks_storage: Hooks = undefined;
 var user_copy_hooks_ready = false;
 
-const PhysCopyWindowLock = struct {
-    value: u8 = 0,
+const PhysCopyWindowGuard = struct {
+    cpu_slot: usize,
     interrupts_were_enabled: bool = false,
 
     fn interruptsEnabled() bool {
@@ -35,28 +36,24 @@ const PhysCopyWindowLock = struct {
         return (flags & (1 << 9)) != 0;
     }
 
-    fn lock(self: *PhysCopyWindowLock) void {
+    fn lock() PhysCopyWindowGuard {
         const restore_interrupts = interruptsEnabled();
         asm volatile ("cli" ::: .{ .memory = true });
-        while (true) {
-            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
-                self.interrupts_were_enabled = restore_interrupts;
-                return;
-            }
-            while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
-                asm volatile ("pause");
-            }
-        }
+        return .{
+            .cpu_slot = boundedCurrentCpuSlot(),
+            .interrupts_were_enabled = restore_interrupts,
+        };
     }
 
-    fn unlock(self: *PhysCopyWindowLock) void {
-        const restore_interrupts = self.interrupts_were_enabled;
-        @atomicStore(u8, &self.value, 0, .release);
-        if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
+    fn unlock(self: PhysCopyWindowGuard) void {
+        if (self.interrupts_were_enabled) asm volatile ("sti" ::: .{ .memory = true });
     }
 };
 
-var phys_copy_window_lock: PhysCopyWindowLock = .{};
+fn boundedCurrentCpuSlot() usize {
+    const cpu_slot = scheduler.currentCpu();
+    return if (cpu_slot < smp.max_cpus) cpu_slot else 0;
+}
 
 const TlbShootdownLock = struct {
     value: u8 = 0,
@@ -103,7 +100,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_storage), &user_copy_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_ready), &user_copy_hooks_ready));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(phys_copy_window_lock), &phys_copy_window_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_lock), &tlb_shootdown_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_target_cr3), &tlb_shootdown_target_cr3));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_generation), &tlb_shootdown_generation));
@@ -114,7 +110,6 @@ pub fn kernelStaticStorageEndAddr() usize {
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_storage), @sizeOf(@TypeOf(user_copy_hooks_storage)))) return false;
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_ready), @sizeOf(@TypeOf(user_copy_hooks_ready)))) return false;
-    if (!map_identity_range(@intFromPtr(&phys_copy_window_lock), @sizeOf(@TypeOf(phys_copy_window_lock)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_lock), @sizeOf(@TypeOf(tlb_shootdown_lock)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_target_cr3), @sizeOf(@TypeOf(tlb_shootdown_target_cr3)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_generation), @sizeOf(@TypeOf(tlb_shootdown_generation)))) return false;
@@ -132,23 +127,25 @@ fn getHooks() *const Hooks {
     return &user_copy_hooks_storage;
 }
 
-fn mapPhysPageForKernelAccess(page_paddr: u64) ?[*]u8 {
+fn mapPhysPageForKernelAccess(page_paddr: u64, cpu_slot: usize) ?[*]u8 {
     const h = getHooks();
     const page_base = page_paddr & ~@as(u64, 0xFFF);
     if (page_base >= h.physical_map_limit) return null;
-    h.phys_copy_window_pt[0] = page_base | h.page_present | h.page_rw;
-    h.invlpg(h.phys_copy_window_va);
-    return @ptrFromInt(h.phys_copy_window_va);
+    if (cpu_slot >= smp.max_cpus or cpu_slot >= h.phys_copy_window_pt.len) return null;
+    const window_va = h.phys_copy_window_va + (@as(u64, @intCast(cpu_slot)) * 4096);
+    h.phys_copy_window_pt[cpu_slot] = page_base | h.page_present | h.page_rw;
+    h.invlpg(window_va);
+    return @ptrFromInt(window_va);
 }
 
-fn physWindowAddr(addr: u64, access_len: usize) ?u64 {
+fn physWindowAddr(addr: u64, access_len: usize, cpu_slot: usize) ?u64 {
     const h = getHooks();
     if (access_len == 0 or access_len > 4096) return null;
     const offset: usize = @intCast(addr & 0xFFF);
     if (offset + access_len > 4096) return null;
     const last_addr, const overflow = @addWithOverflow(addr, @as(u64, @intCast(access_len - 1)));
     if (overflow != 0 or last_addr >= h.physical_map_limit) return null;
-    const page = mapPhysPageForKernelAccess(addr) orelse return null;
+    const page = mapPhysPageForKernelAccess(addr, cpu_slot) orelse return null;
     return @intFromPtr(page) + offset;
 }
 
@@ -260,6 +257,12 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
     if (!user_vm.lockAddressSpace(principal)) return null;
     defer user_vm.unlockAddressSpace(principal);
     if (write_access) {
+        if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
+            principal,
+            page_va,
+            true,
+            false,
+        )) |paddr| return paddr;
         const cow_mapping = resolveNativeVmaCowMappingWithAddressSpaceLocked(
             h.state,
             h.free_list,
@@ -314,33 +317,33 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
 }
 
 pub fn readPhysU8(addr: u64) ?u8 {
-    phys_copy_window_lock.lock();
-    defer phys_copy_window_lock.unlock();
-    const window_addr = physWindowAddr(addr, @sizeOf(u8)) orelse return null;
+    const window = PhysCopyWindowGuard.lock();
+    defer window.unlock();
+    const window_addr = physWindowAddr(addr, @sizeOf(u8), window.cpu_slot) orelse return null;
     const ptr: *volatile u8 = @ptrFromInt(window_addr);
     return ptr.*;
 }
 
 pub fn readPhysU32(addr: u64) ?u32 {
-    phys_copy_window_lock.lock();
-    defer phys_copy_window_lock.unlock();
-    const window_addr = physWindowAddr(addr, @sizeOf(u32)) orelse return null;
+    const window = PhysCopyWindowGuard.lock();
+    defer window.unlock();
+    const window_addr = physWindowAddr(addr, @sizeOf(u32), window.cpu_slot) orelse return null;
     const ptr: *volatile u32 = @ptrFromInt(window_addr);
     return ptr.*;
 }
 
 pub fn readPhysU64(addr: u64) ?u64 {
-    phys_copy_window_lock.lock();
-    defer phys_copy_window_lock.unlock();
-    const window_addr = physWindowAddr(addr, @sizeOf(u64)) orelse return null;
+    const window = PhysCopyWindowGuard.lock();
+    defer window.unlock();
+    const window_addr = physWindowAddr(addr, @sizeOf(u64), window.cpu_slot) orelse return null;
     const ptr: *volatile u64 = @ptrFromInt(window_addr);
     return ptr.*;
 }
 
 pub fn writePhysU8(addr: u64, value: u8) bool {
-    phys_copy_window_lock.lock();
-    defer phys_copy_window_lock.unlock();
-    const window_addr = physWindowAddr(addr, @sizeOf(u8)) orelse return false;
+    const window = PhysCopyWindowGuard.lock();
+    defer window.unlock();
+    const window_addr = physWindowAddr(addr, @sizeOf(u8), window.cpu_slot) orelse return false;
     const ptr: *volatile u8 = @ptrFromInt(window_addr);
     ptr.* = value;
     return true;
@@ -348,9 +351,9 @@ pub fn writePhysU8(addr: u64, value: u8) bool {
 
 pub fn zeroPhysicalPage(page_paddr: u64) bool {
     if ((page_paddr & 0xFFF) != 0) return false;
-    phys_copy_window_lock.lock();
-    defer phys_copy_window_lock.unlock();
-    const page = mapPhysPageForKernelAccess(page_paddr) orelse return false;
+    const window = PhysCopyWindowGuard.lock();
+    defer window.unlock();
+    const page = mapPhysPageForKernelAccess(page_paddr, window.cpu_slot) orelse return false;
     @memset(page[0..4096], 0);
     return true;
 }
@@ -392,14 +395,11 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
         if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
 
         {
-            phys_copy_window_lock.lock();
-            defer phys_copy_window_lock.unlock();
-            const src_page = mapPhysPageForKernelAccess(src_paddr) orelse return false;
+            const window = PhysCopyWindowGuard.lock();
+            defer window.unlock();
+            const src_page = mapPhysPageForKernelAccess(src_paddr, window.cpu_slot) orelse return false;
             const src: [*]const u8 = @ptrCast(src_page + page_off);
-            var i: usize = 0;
-            while (i < chunk_len) : (i += 1) {
-                dest[copied + i] = src[i];
-            }
+            @memcpy(dest[copied .. copied + chunk_len], src[0..chunk_len]);
         }
         copied += chunk_len;
     }
@@ -443,14 +443,11 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
         if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
 
         {
-            phys_copy_window_lock.lock();
-            defer phys_copy_window_lock.unlock();
-            const dst_page = mapPhysPageForKernelAccess(dst_paddr) orelse return false;
+            const window = PhysCopyWindowGuard.lock();
+            defer window.unlock();
+            const dst_page = mapPhysPageForKernelAccess(dst_paddr, window.cpu_slot) orelse return false;
             const dst: [*]u8 = @ptrCast(dst_page + page_off);
-            var i: usize = 0;
-            while (i < chunk_len) : (i += 1) {
-                dst[i] = src[copied + i];
-            }
+            @memcpy(dst[0..chunk_len], src[copied .. copied + chunk_len]);
         }
         copied += chunk_len;
     }

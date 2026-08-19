@@ -282,16 +282,31 @@ pub fn userMappingAllowsAccessWithAddressSpaceLocked(
     write_access: bool,
     instruction_fetch: bool,
 ) bool {
-    const h = hooks orelse return false;
-    const space = getUserSpace(principal) orelse return false;
-    const index = userPageIndexForVa(h, va) orelse return false;
-    const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
+    return lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
+        principal,
+        va,
+        write_access,
+        instruction_fetch,
+    ) != null;
+}
+
+pub fn lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
+    principal: kernel.PrincipalId,
+    va: u64,
+    write_access: bool,
+    instruction_fetch: bool,
+) ?u64 {
+    const h = hooks orelse return null;
+    const space = getUserSpace(principal) orelse return null;
+    const index = userPageIndexForVa(h, va) orelse return null;
+    const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
     const entry = space.pt_pages[slot][index.pt];
-    if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return false;
-    if ((entry & h.page_addr_mask) == 0) return false;
-    if (write_access and (entry & h.page_rw) == 0) return false;
-    if (instruction_fetch and (entry & h.page_nx) != 0) return false;
-    return true;
+    if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return null;
+    const paddr = entry & h.page_addr_mask;
+    if (paddr == 0) return null;
+    if (write_access and (entry & h.page_rw) == 0) return null;
+    if (instruction_fetch and (entry & h.page_nx) != 0) return null;
+    return paddr;
 }
 
 pub fn resetUserReservations(space: *UserAddressSpace) void {
