@@ -1116,6 +1116,10 @@ apps:
     file: "tests/fixtures/lpr_async_signal_smoke.sh"
     out: "LPRASIG.SH"
     rootfs: "/cmd/lpr_async_signal_smoke.sh"
+  lpr_wait4_signal_smoke_script:
+    file: "tests/fixtures/lpr_wait4_signal_smoke.sh"
+    out: "LPRW4SIG.SH"
+    rootfs: "/cmd/lpr_wait4_signal_smoke.sh"
   lpr_drm_card0_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_drm_card0_smoke.static.elf"

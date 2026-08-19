@@ -74,6 +74,7 @@ static uint64_t g_waiter_capacity;
 static int lprs_service_one_pending_request(void);
 static void lprs_refresh_exited_children(void);
 static void lprs_complete_waiters(void);
+static void lprs_interrupt_waiters(uint64_t token);
 
 static int lprs_status_to_errno(long status)
 {
@@ -606,6 +607,11 @@ static int lprs_signal_process_fd(int process_fd, uint64_t signal)
         signal));
 }
 
+static int lprs_signal_interrupts_wait(uint64_t signal)
+{
+    return signal != 0 && signal != 9u && signal != LPRS_SIGSTOP;
+}
+
 static int lprs_try_wait_process_fd(
     int process_fd,
     uint64_t *out_state,
@@ -868,6 +874,9 @@ static int lprs_kill(void *page)
         }
         const int status = lprs_signal_process_fd(proc->process_fd, req->signal);
         if (status == 0) {
+            if (lprs_signal_interrupts_wait(req->signal)) {
+                lprs_interrupt_waiters(proc->token);
+            }
             delivered++;
         } else if (first_error == 0) {
             first_error = status;
@@ -897,6 +906,9 @@ static int lprs_deliver_tty_signal_fields(uint64_t pgrp, uint64_t signo, uint64_
         }
         const int status = lprs_signal_process_fd(proc->process_fd, signo);
         if (status == 0) {
+            if (lprs_signal_interrupts_wait(signo)) {
+                lprs_interrupt_waiters(proc->token);
+            }
             delivered++;
         } else if (first_error == 0) {
             first_error = status;
@@ -1245,6 +1257,56 @@ static int lprs_reply(
     return reply_status;
 }
 
+static void lprs_finish_waiter(lprs_waiter_t *waiter, int status, uint64_t result)
+{
+    if (waiter == NULL || !waiter->active) {
+        return;
+    }
+    void *page = pacha_mmap(
+        waiter->page_fd,
+        PACHA_SERVICE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE,
+        PACHA_MMAP_SHARED,
+        0);
+    int reply_status = status;
+    if (page == NULL) {
+        reply_status = PACHA_STATUS_EFAULT;
+    } else {
+        memcpy(
+            (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
+            &waiter->request,
+            sizeof(waiter->request));
+        pacha_service_reply_init(
+            (pacha_service_envelope_t *)page,
+            &waiter->header,
+            reply_status,
+            reply_status == PACHA_STATUS_EINVAL ?
+                PACHA_SERVICE_ERROR_ABI : PACHA_SERVICE_ERROR_LPR_TRANSLATION,
+            result,
+            sizeof(waiter->request));
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+    }
+
+    const int page_fd = waiter->page_fd;
+    const int reply_fd = waiter->reply_fd;
+    const uint64_t request_id = waiter->header.request_id;
+    memset(waiter, 0, sizeof(*waiter));
+    waiter->page_fd = -1;
+    waiter->reply_fd = -1;
+    (void)pacha_fd_close(page_fd);
+    (void)lprs_reply(reply_fd, request_id, reply_status, result, -1, 0);
+}
+
+static void lprs_interrupt_waiters(uint64_t token)
+{
+    for (uint64_t i = 0; i < g_waiter_count; ++i) {
+        lprs_waiter_t *waiter = &g_waiters[i];
+        if (waiter->active && waiter->request.token == token) {
+            lprs_finish_waiter(waiter, -PACHA_LINUX_EINTR, 0);
+        }
+    }
+}
+
 static void lprs_complete_waiters(void)
 {
     for (uint64_t i = 0; i < g_waiter_count; ++i) {
@@ -1257,40 +1319,7 @@ static void lprs_complete_waiters(void)
         if (status == PACHA_STATUS_EAGAIN) {
             continue;
         }
-
-        void *page = pacha_mmap(
-            waiter->page_fd,
-            PACHA_SERVICE_PAGE_BYTES,
-            PACHA_PROT_READ | PACHA_PROT_WRITE,
-            PACHA_MMAP_SHARED,
-            0);
-        int reply_status = status;
-        if (page == NULL) {
-            reply_status = PACHA_STATUS_EFAULT;
-        } else {
-            memcpy(
-                (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES,
-                &waiter->request,
-                sizeof(waiter->request));
-            pacha_service_reply_init(
-                (pacha_service_envelope_t *)page,
-                &waiter->header,
-                reply_status,
-                reply_status == PACHA_STATUS_EINVAL ?
-                    PACHA_SERVICE_ERROR_ABI : PACHA_SERVICE_ERROR_LPR_TRANSLATION,
-                result,
-                sizeof(waiter->request));
-            (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
-        }
-
-        const int page_fd = waiter->page_fd;
-        const int reply_fd = waiter->reply_fd;
-        const uint64_t request_id = waiter->header.request_id;
-        memset(waiter, 0, sizeof(*waiter));
-        waiter->page_fd = -1;
-        waiter->reply_fd = -1;
-        (void)pacha_fd_close(page_fd);
-        (void)lprs_reply(reply_fd, request_id, reply_status, result, -1, 0);
+        lprs_finish_waiter(waiter, status, result);
     }
 }
 
