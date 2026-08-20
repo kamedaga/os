@@ -255,6 +255,26 @@ fn initKernelRuntimeOrHalt() void {
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
     }
+    const timer_calibration = lapic.calibrateTimer(
+        boot_static.lapic_timer_initial_count,
+        boot_static.lapic_timer_rearm_overhead_ns,
+    );
+    if (timer_calibration.calibrated) {
+        kernel_log.writeFmt(
+            "lapic-timer: calibration=pit frequency_hz={} initial_count={} rearm_overhead_ns={} pit_ticks={}\n",
+            .{
+                timer_calibration.frequency_hz,
+                timer_calibration.initial_count,
+                timer_calibration.rearm_overhead_ns,
+                timer_calibration.pit_ticks,
+            },
+        );
+    } else {
+        kernel_log.writeFmt(
+            "lapic-timer: calibration=fallback frequency_hz=unknown initial_count={} rearm_overhead_ns={}\n",
+            .{ timer_calibration.initial_count, timer_calibration.rearm_overhead_ns },
+        );
+    }
     if (!elf_loader.probe()) {
         halt.haltWithMessage("ELF loader probe failed");
     }
@@ -666,7 +686,7 @@ pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     smp.configureApUserTimer(
         boot_static.lapic_timer_vector,
-        boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
+        lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
     );
     smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
     if (!smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value)) {

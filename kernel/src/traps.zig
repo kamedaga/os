@@ -766,19 +766,19 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
                 .preempt, .invalid => smp.returnCurrentApToIdleFromInterrupt(),
             }
             stagePendingSignalForUserReturn(frame);
-            _ = lapic.armTimer(boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
+            _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
             return;
         }
         // AP timer interrupts can arrive while a user thread is executing a
         // syscall or another kernel path. That CPU is not idle; keep its
         // current thread/cr3 intact and return to the interrupted kernel frame.
         scheduler.deferApUserSlice(boot_static.scheduler_slice_ticks);
-        _ = lapic.armTimer(boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
+        _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
         return;
     }
     // BSP owns the 1 ms monotonic/timeouts clock.  Software rearming keeps
     // that ABI while avoiding periodic timers on idle APs.
-    _ = lapic.armTimer(boot_static.lapic_timer_initial_count);
+    _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count));
     scheduler.lapic_tick_count +%= 1;
     if (!kernel_runtime.kernel_state_ready) return;
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
