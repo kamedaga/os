@@ -171,6 +171,7 @@ fn resolveUserDmaPages(
         page_span,
         except_pinned_object,
         allow_dma_mapping_aliases,
+        vtd.isActive(),
     )) {
         return null;
     }

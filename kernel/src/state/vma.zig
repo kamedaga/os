@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const vtd = @import("../vtd.zig");
+const kernel_log = @import("../kernel_log.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
 const capsule = types.capsule;
@@ -230,9 +230,9 @@ pub fn rangeOverlapsPinnedUserObjectExcept(
 /// MMIO and DMA buffers are never alias candidates. MMIO owns a close-time
 /// user-VA unmap, while a DMA buffer is a separately published bidirectional
 /// allocation. Streaming-mapping aliases are admitted only when the syscall's
-/// lifetime policy makes closing either mapping harmless to the other. The
-/// policy is explicit at each derive operation and does not depend on VT-d
-/// state here.
+/// lifetime policy makes closing either mapping harmless to the other. Scatter
+/// mappings additionally require active VT-d so every alias owns an independent
+/// IOVA allocation; pass-through retains only its existing linear-mapping alias.
 pub fn rangeConflictsWithDmaDerivation(
     self: anytype,
     owner: PrincipalId,
@@ -240,6 +240,7 @@ pub fn rangeConflictsWithDmaDerivation(
     size_bytes: u64,
     except_object: ?KernelObjectRef,
     allow_dma_mapping_aliases: bool,
+    vtd_active: bool,
 ) bool {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
     for (self.fd_objects[0..], 0..) |*slot, object_index| {
@@ -253,14 +254,75 @@ pub fn rangeConflictsWithDmaDerivation(
         else
             false;
         switch (slot.payload) {
-            .mmio_region => return true,
-            .dma_buffer => if (!is_except) return true,
+            .mmio_region => {
+                pachaTraceDmaDerivationConflict(
+                    "mmio_region",
+                    null,
+                    start_va,
+                    size_bytes,
+                    allow_dma_mapping_aliases,
+                    vtd_active,
+                );
+                return true;
+            },
+            .dma_buffer => if (!is_except) {
+                pachaTraceDmaDerivationConflict(
+                    "dma_buffer",
+                    null,
+                    start_va,
+                    size_bytes,
+                    allow_dma_mapping_aliases,
+                    vtd_active,
+                );
+                return true;
+            },
             .dma_mapping => |mapping| if (!is_except and
-                (mapping.page_count != 0 or !allow_dma_mapping_aliases)) return true,
+                (!allow_dma_mapping_aliases or (mapping.page_count != 0 and !vtd_active)))
+            {
+                pachaTraceDmaDerivationConflict(
+                    "dma_mapping",
+                    mapping.page_count,
+                    start_va,
+                    size_bytes,
+                    allow_dma_mapping_aliases,
+                    vtd_active,
+                );
+                return true;
+            },
             else => unreachable,
         }
     }
     return false;
+}
+
+fn pachaTraceDmaDerivationConflict(
+    object_kind: []const u8,
+    page_count: ?u16,
+    requested_start: u64,
+    requested_size: u64,
+    allow_dma_mapping_aliases: bool,
+    vtd_active: bool,
+) void {
+    const requested_end, const overflow = @addWithOverflow(requested_start, requested_size);
+    const range_end = if (overflow == 0) requested_end else std.math.maxInt(u64);
+    var buf: [256]u8 = undefined;
+    const line = if (page_count) |pages|
+        std.fmt.bufPrint(
+            &buf,
+            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} page_count={} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} vtd_active={}\n",
+            .{ object_kind, pages, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(vtd_active) },
+        ) catch return
+    else
+        std.fmt.bufPrint(
+            &buf,
+            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} vtd_active={}\n",
+            .{ object_kind, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(vtd_active) },
+        ) catch return;
+    if (builtin.is_test) {
+        kernel_log.appendText(line);
+    } else {
+        kernel_log.write(line);
+    }
 }
 
 pub fn ownerHasPinnedUserObject(self: anytype, owner: PrincipalId) bool {

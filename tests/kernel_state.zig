@@ -459,13 +459,13 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
     }, fdRights(.{ .close = true }), .{}, 16);
     const source_ref = (s.fdEntryConst(p0, source_fd) orelse unreachable).object;
 
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, null, true));
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, null, false));
-    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, base, 4096, source_ref, false));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, null, true, false));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, null, false, false));
+    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, base, 4096, source_ref, false, false));
 
     var stale_ref = source_ref;
     stale_ref.generation = KernelState.nextObjectGeneration(stale_ref.generation);
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, stale_ref, false));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, base, 4096, stale_ref, false, false));
 
     const mapping_base: u64 = base + 0x8_0000;
     const first_mapping_fd = try s.createDmaMappingFd(p0, .{
@@ -475,8 +475,8 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
         .size = 64,
         .direction = .from_device,
     }, fdRights(.{ .close = true }), .{}, 16);
-    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, true));
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, false));
+    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, true, false));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mapping_base, 4096, null, false, false));
 
     const scatter_base: u64 = base + 0xc_0000;
     var scatter_free_list = FreePageList{};
@@ -488,7 +488,7 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
         .page_count = 1,
         .direction = .from_device,
     }, fdRights(.{ .close = true }), .{}, 16);
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, scatter_base, 4096, null, true));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, scatter_base, 4096, null, true, false));
 
     const second_mapping_fd = try s.createDmaMappingFd(p0, .{
         .device = 1,
@@ -514,11 +514,74 @@ test "DMA derivation aliases DMA pins only when explicitly allowed" {
         .size = 4096,
     }, fdRights(.{ .close = true }), .{}, 16);
     const mmio_ref = (s.fdEntryConst(p0, mmio_fd) orelse unreachable).object;
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mmio_base, 4096, null, true));
-    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mmio_base, 4096, mmio_ref, true));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mmio_base, 4096, null, true, false));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(p0, mmio_base, 4096, mmio_ref, true, false));
 
     // The general mutation guard remains strict for the unrelated DMA buffer.
     try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, base, 4096));
+}
+
+test "VT-d scatter DMA aliases do not relax other pinned objects or pass-through" {
+    var s = try initFdState();
+    const scatter_base: u64 = 0x4098_0000;
+    _ = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = scatter_base + 0x180,
+        .iova = 0x9098_0180,
+        .size = 64,
+        .page_count = 1,
+        .direction = .from_device,
+    }, fdRights(.{ .close = true }), .{}, 16);
+
+    try std.testing.expect(!s.rangeConflictsWithDmaDerivation(
+        p0,
+        scatter_base,
+        4096,
+        null,
+        true,
+        true,
+    ));
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(
+        p0,
+        scatter_base,
+        4096,
+        null,
+        true,
+        false,
+    ));
+
+    const dma_buffer_base: u64 = scatter_base + 0x4_0000;
+    _ = try s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = dma_buffer_base,
+        .iova = 0x909c_0000,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(
+        p0,
+        dma_buffer_base,
+        4096,
+        null,
+        true,
+        true,
+    ));
+
+    const mmio_base: u64 = scatter_base + 0x8_0000;
+    _ = try s.createMmioRegionFd(p0, .{
+        .device = 1,
+        .bar_index = 0,
+        .paddr = 0xa100_0000,
+        .user_va = mmio_base,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    try std.testing.expect(s.rangeConflictsWithDmaDerivation(
+        p0,
+        mmio_base,
+        4096,
+        null,
+        true,
+        true,
+    ));
 }
 
 test "pinned fds reject transfer and skip process-create inheritance" {
