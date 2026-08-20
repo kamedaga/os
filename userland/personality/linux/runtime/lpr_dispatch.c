@@ -441,6 +441,14 @@ static void lpr_trace_mmap_error(
     out = lpr_mmap_diag_append_u64(out, end, fd);
     out = lpr_mmap_diag_append_text(out, end, " offset=");
     out = lpr_mmap_diag_append_u64(out, end, offset);
+    /* A rejection is only actionable with the request that was rejected:
+     * the kernel refuses some prot/flags combinations outright. */
+    out = lpr_mmap_diag_append_text(out, end, " addr=");
+    out = lpr_mmap_diag_append_u64(out, end, addr);
+    out = lpr_mmap_diag_append_text(out, end, " prot=");
+    out = lpr_mmap_diag_append_u64(out, end, prot);
+    out = lpr_mmap_diag_append_text(out, end, " flags=");
+    out = lpr_mmap_diag_append_u64(out, end, flags);
     if (out < end) {
         *out++ = '\n';
     }
