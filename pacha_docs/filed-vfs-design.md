@@ -1,27 +1,39 @@
 # filed VFS Design
 
+> **現行配置について:** この文書には、filed と koboxd を別 daemon として
+> 立ち上げていた開発段階の記述が残っている。現在、storage 用 Kobox runtime
+> は `filed.elf` にリンクされている。ただし filed の VFS/exec と Kobox の
+> filesystem/block/driver backend の責務境界は維持されている。process 分離を
+> 恒久的な設計条件とはしない。全体の判断基準は
+> [PachaOS の設計思想](./architecture.md) を参照すること。
+
 ## 目的
 
 `koboxd` まで NVMe と Linux `.ko` loader/backend が到達したので、次の主対象は rootfs の顔になる VFS である。
 
-ただし VFS を `koboxd` に入れない。`koboxd` は Linux `.ko` runtime / device backend / block provider / filesystem backend provider に集中させる。VFS は独立 daemon の `filed` が担当する。
+VFS を Kobox backend に入れない。Kobox storage runtime は Linux `.ko`
+runtime / device backend / block provider / filesystem backend provider に
+集中させ、VFS は `filed` component が担当する。現在は両 component を同じ
+`filed.elf` に配置するが、backend interface と状態所有の境界は混ぜない。
 
 VFS は単なる `open/read` smoke ではなく、PachaOS の userland が日常的に触るファイル API の基盤になる。そのため、既存 Unix / BSD の堅牢なファイル意味論と、Linux ext4 / 将来の btrfs backend が要求する引数・状態・呼び出し順の両方を満たす必要がある。
 
-この文書では、`filed` VFS、PachaOS native `libvfs`、musl/POSIX layer、trusted pkey IPC backend、`koboxd` block/filesystem backend provider との境界を固定する。
+この文書では、`filed` VFS、PachaOS native `libvfs`、musl/POSIX layer、
+backend transport、Kobox block/filesystem backend provider との境界を固定する。
 
-## Daemon 分離
+## Component 境界と現行配置
 
-恒久構造は次のようにする。
+現行の実行配置は次のとおり。
 
 ```text
 storage_boot
   -> seed0root
-    -> koboxd  : .ko loader / capsule backend / NVMe block + ext4/btrfs backend daemon
-    -> filed   : VFS / vnode / mount / file handle server
+    -> filed.elf
+         ├─ filed: VFS / vnode / mount / file handle / exec
+         └─ Kobox storage runtime: .ko loader / capsule / block / filesystem backend
 ```
 
-`koboxd` の責務。
+Kobox storage component の責務。
 
 - capsule device fd を受け取る
 - PCI config / BAR / DMA / IRQ を `libcapsule` 経由で扱う
@@ -29,13 +41,13 @@ storage_boot
 - `nvme-auth.ko`, `nvme-core.ko`, `nvme.ko` を load/init する
 - `crc16.ko`, `mbcache.ko`, `jbd2.ko`, `ext4.ko` を load/init する
 - 将来 `btrfs.ko` と依存 `.ko` を load/init する
-- block device service endpoint を公開する
-- filesystem backend endpoint を公開する
+- block device backend を提供する
+- filesystem backend interface を提供する
 - Linux driver / filesystem `.ko` runtime に集中する
 
 `filed` の責務。
 
-- rootfs filesystem backend endpoint を `koboxd` から受け取る
+- rootfs filesystem backend を Kobox storage component から受け取る
 - ext4 / btrfs backend endpoint を mount する
 - vnode / mount / open file description / handle table / path walk を持つ
 - `libvfs` / musl から呼ばれる file service endpoint を公開する
@@ -43,7 +55,16 @@ storage_boot
 - executable file read, ELF validation, process image construction, initial stack / auxv construction を行う
 - VFS cache と namespace policy を所有する
 
-この分離により、`koboxd` が VFS server まで兼任して肥大化することと、Linux `.ko` runtime が複数 daemon に散らばることの両方を避ける。将来 `netd`, `inputd`, `displayd` などを増やす場合も、`koboxd` は Linux `.ko` backend runtime、`filed` は file namespace server という役割が保たれる。
+この component 分離により、Linux `.ko` runtime が VFS namespace や exec
+policy を所有することを避ける。同時に、不可分な rootfs dependency chain を
+同じ process に置き、意味のない IPC と同期を増やさない。
+
+別 process にするだけでは、filesystem/block/driver 障害時に filed が rootfs
+service を継続できるようにはならない。独立再起動、handle 復元、cache 再検証、
+transaction recovery を実装して初めて process 分離が障害耐性になる。
+
+一方、TTY、network、display、input は独立した状態・capability・回復単位を
+持つため、`termd`、`netd`、`drmd`、`inputd` として分離する。
 
 ### bootstrap exec exception
 
@@ -55,22 +76,22 @@ storage_boot
 seed0boot
   -> storage_boot
     -> seed0root
-      -> koboxd
       -> filed
 ```
 
-`filed` が起動する前に、`seed0root` は少なくとも `koboxd` と `filed` 自身を起動しなければならない。そのため、`seed0root` の ELF load / process start は完全には消せない。
+`filed` が起動する前に、`seed0root` は `filed` 自身を起動しなければならない。
+そのため、`seed0root` の ELF load / process start は完全には消せない。
 
 ただしこれは通常の process exec authority ではない。`seed0root` の exec は bootstrap executor としての例外であり、通常の `/sbin/...`、service spawn、user process exec は `filed` に集約する。
 
-恒久的な責務分離。
+恒久的な責務分離。これは process 数ではなく、状態所有と interface の境界を
+指す。
 
 ```text
 seed0root:
   - bootstrap fd を読む
-  - koboxd を起動する
   - filed を起動する
-  - filed に fs backend endpoint / control endpoint を渡す
+  - filed に storage bootstrap capability を渡す
 
 filed:
   - namespace / VFS handle / vnode / mount を管理する
@@ -83,10 +104,10 @@ filed:
 ## 基本方針
 
 - kernel に VFS / FS / block file semantics を入れない
-- `koboxd` は block provider と filesystem backend provider とする
+- Kobox storage component は block provider と filesystem backend provider とする
 - `filed` を VFS server とし、namespace と file handle lifetime を所有させる
 - VFS core は PachaOS の vnode model として設計する
-- ext4 / btrfs は `koboxd` の filesystem backend endpoint として扱い、Linux の `inode` / `dentry` / `file` 構造体を `filed` core に漏らさない
+- ext4 / btrfs は Kobox の filesystem backend として扱い、Linux の `inode` / `dentry` / `file` 構造体を `filed` core に漏らさない
 - PachaOS native daemon 向けに `libvfs` を提供する
 - POSIX 互換 API は musl layer で提供し、`libvfs` を POSIX API そのものにしない
 - `filed` との高速 IPC は trusted 専用の pkey shared-memory backend を使えるようにする
@@ -280,7 +301,9 @@ rmdir
 
 `path_walk_context` は root start / cwd start を明示する。相対 path は cwd から、絶対相当の path は root から開始する。symlink 展開は budget を消費し、loop / excessive expansion は `FiledErrLoop` に落とす。
 
-`*_prepare` は backend I/O を直接行わない。VFS model は「この backend request を出してよい」という decision を返す。実際の `koboxd` request は C adapter が実行する。
+`*_prepare` は backend I/O を直接行わない。VFS model は「この backend
+request を出してよい」という decision を返す。実際の Kobox backend
+operation は C adapter が実行する。
 
 `read_prepare` は Unix `read` 相当として `Vfile.offset` を使い、成功時に共有 open file description の offset を進める。`pread_prepare` は caller supplied offset を使い、`Vfile.offset` を更新しない。
 
@@ -296,7 +319,7 @@ rmdir
 
 `DUP` は `filed_vfs_dup_handle` で同じ `filed_open_file_t` を指す新しい `filed_handle_t` を作る。新 handle の `CLOEXEC` は caller が明示する。`GET_FLAGS` / `SET_FLAGS` は `CLOEXEC` を handle-local に、`APPEND` / `NONBLOCK` / `SYNC` を共有 open file description に反映する。これにより、`dup` 後に offset と file status flags は共有され、exec inheritance policy は fd ごとに独立する。
 
-`PWRITE` / `WRITE` / `FSYNC` は `koboxd` の ext4 backend write path に接続する。`PWRITE` は caller supplied offset を使い、`filed_open_file_t.offset` を更新しない。`WRITE` は current offset を使い、backend が実際に書けた byte 数だけ offset を進める。`FSYNC` は write 権限のある regular file handle に対して backend `fsync` を発行する。
+`PWRITE` / `WRITE` / `FSYNC` は Kobox の ext4 backend write path に接続する。`PWRITE` は caller supplied offset を使い、`filed_open_file_t.offset` を更新しない。`WRITE` は current offset を使い、backend が実際に書けた byte 数だけ offset を進める。`FSYNC` は write 権限のある regular file handle に対して backend `fsync` を発行する。
 
 初期実装では `APPEND` 付き `WRITE` は未対応として明示的に拒否する。append write は EOF 決定と write ordering policy が必要なので、`statx` / backend size refresh / write lock policy を固めてから入れる。
 
@@ -577,7 +600,7 @@ client に vnode pointer や backend pointer は見せない。
 
 ext4 / btrfs backend は Linux `.ko` を使う。
 
-ただし PachaOS VFS core は Linux VFS の clone にはしない。Linux `.ko` が要求する `struct inode`, `struct dentry`, `struct file`, `address_space`, `kiocb`, `iov_iter` などは `koboxd` の backend adapter が作る。
+ただし PachaOS VFS core は Linux VFS の clone にはしない。Linux `.ko` が要求する `struct inode`, `struct dentry`, `struct file`, `address_space`, `kiocb`, `iov_iter` などは Kobox backend adapter が作る。
 
 `filed` は Linux object を直接管理しない。`filed` は `FsBackendOps` endpoint を mount し、そこから返される opaque backend object id を `Vnode` identity に使う。
 
@@ -586,12 +609,12 @@ ext4 / btrfs backend は Linux `.ko` を使う。
 | layer | 責務 |
 | --- | --- |
 | VFS core | vnode, mount, path walk, handle lifetime, rights, common semantics |
-| filed FS backend client | VnodeOps を `koboxd` FS backend endpoint に変換 |
-| koboxd FS backend adapter | FS backend request を Linux `.ko` 呼び出しに変換 |
-| ext4/btrfs `.ko` | filesystem implementation inside `koboxd` |
-| koboxd block provider | NVMe block service |
+| filed FS backend client | VnodeOps を Kobox FS backend operation に変換 |
+| Kobox FS backend adapter | FS backend operation を Linux `.ko` 呼び出しに変換 |
+| ext4/btrfs `.ko` | filesystem implementation inside Kobox runtime |
+| Kobox block provider | NVMe block service |
 
-`koboxd` Linux adapter に閉じ込めるもの。
+Kobox Linux adapter に閉じ込めるもの。
 
 - fake / shim Linux object layout
 - `inode` / `dentry` / `file` allocation
@@ -608,7 +631,8 @@ VFS core に入れてはいけないもの。
 - Linux `dentry` cache semantics
 - Linux page cache assumptions
 
-`filed` と `koboxd` の FS backend endpoint は、初期実装から request id / timeout / cancellation / data plane slot を持つ final-shape operation とする。
+filed と Kobox の FS backend interface は、transport が direct call でも IPC
+でも同じ object/operation contract を保つ。
 
 - `fs_mount_root(block_device, fs_type) -> fs_backend`
 - `fs_lookup(parent_backend_id, name) -> child_backend_id, metadata`
@@ -715,7 +739,7 @@ fd-local な `CLOEXEC` は `VfsHandle` が持つ。`APPEND`, `NONBLOCK`, `SYNC` 
 初期方針。
 
 - cache は `filed` が所有する
-- filesystem I/O は `koboxd` FS backend endpoint に出す
+- filesystem I/O は Kobox FS backend interface に出す
 - dirty file data writeback は backend/fsync policy に従う
 - file data cache は `pread/pwrite` の上に後から乗せる
 - mmap/pager-backed file mapping は初期 VFS では対象外
@@ -793,7 +817,8 @@ cursor offset/state は `Vfile` または dedicated directory cursor object の 
 - metadata I/O を伴う `statx`
 - `fsync`
 
-`filed <-> koboxd` の FS backend I/O は async request として扱う。初期実装で synchronous call に見えても、内部 API は worker が待てる形にする。
+filed と Kobox の FS backend I/O は、VFS core から adapter effect として扱う。
+direct call か IPC かは pure VFS state transition の外側で選べる。
 
 ### pkey ring と thread
 
@@ -1054,6 +1079,11 @@ koboxd NVMe block provider
 ```
 
 ## IPC
+
+> この節に残る独立 `koboxd` daemon と pkey transport の記述は、初期配置の
+> 設計記録である。現在の storage path は同じ backend contract を
+> `filed_direct_backend` で呼ぶ。transport の変更は VFS/exec と Linux
+> filesystem/block implementation の責務境界を変更しない。
 
 VFS 関連 IPC は初期実装から final-shape protocol とする。
 
@@ -1341,7 +1371,11 @@ rights attenuation は `libvfs` / `filed` control plane で行う。kernel fd ri
 | `VFS_IO` | `EIO` |
 | `VFS_UNSUPPORTED` | `ENOTSUP` |
 
-## 実装順
+## 当初の実装順（履歴）
+
+以下は filed と koboxd が別 process だった段階の導入計画であり、現在の
+process 配置を定義するものではない。現在も有効なのは VFS/exec と storage
+backend の責務・interface 境界である。
 
 ### Step 1: koboxd IPC substrate
 
@@ -1510,7 +1544,10 @@ exec service の最初の成功条件。
 [seed0root] filed exec /sbin/seed0_next.elf started
 ```
 
-ここで `seed0root` の bootstrap exec と `filed` の normal exec は分けて見る。`seed0root` は `koboxd` と `filed` を起動するための最小 loader を持つ。`filed` exec は rootfs path, rights, fd inheritance, argv/env/auxv を含む通常の process exec とする。
+ここで `seed0root` の bootstrap exec と `filed` の normal exec は分けて見る。
+現在の `seed0root` は integrated `filed.elf` を起動するための最小 loader を
+持つ。`filed` exec は rootfs path, rights, fd inheritance, argv/env/auxv を
+含む通常の process exec とする。
 
 ## 非目標
 
@@ -1518,7 +1555,7 @@ exec service の最初の成功条件。
 
 - kernel VFS
 - kernel file object
-- `koboxd` に VFS を詰め込むこと
+- Kobox storage backend に VFS policy を持たせること
 - POSIX API を `libvfs` に直実装すること
 - untrusted process 向け pkey security boundary
 - network filesystem
@@ -1529,23 +1566,21 @@ exec service の最初の成功条件。
 - 初期段階での VST proof
 - `seed0root` bootstrap exec の完全削除
 
-## 決定事項
+## 現行の決定事項
 
-- VFS は独立 daemon `filed` に置く
-- `koboxd` は Linux `.ko` runtime / NVMe block provider / ext4-btrfs FS backend provider に集中する
+- VFS/exec component は `filed` とし、namespace と policy を所有させる
+- Kobox storage component は Linux `.ko` runtime / NVMe block provider / ext4-btrfs FS backend provider に集中する
+- 両 component は現在 `filed.elf` に同居させるが、型・状態所有・backend interface の境界は維持する
+- process 分離は機能分類だけでは行わず、独立した所有・回復単位になる場合に行う
 - core abstraction は vnode model とする
 - ext4 を first backend、btrfs を future backend とする
-- Linux FS `.ko` adapter は `filed` VFS core から分離し、`koboxd` に集約する
+- Linux FS `.ko` adapter は `filed` VFS core から分離し、Kobox storage component に集約する
 - PachaOS native API は `libvfs`
 - POSIX API は musl layer
-- `koboxd` IPC は初期実装から final-shape protocol とする
-- `koboxd` IPC は request id / timeout / cancellation / metrics を必須にする
-- `koboxd` は control / block / fs-backend / event endpoint を分ける
-- `koboxd` は endpoint ごとの worker queue を持つ
 - `client <-> filed` IPC は normal IPC control plane と pkey shared-memory data plane に分ける
-- `filed <-> koboxd` は FS backend service IPC とし、初期実装から pkey data plane を標準経路にする
+- `filed VFS <-> Kobox storage` は backend interface とし、同居時は direct adapter を利用できる
 - pkey backend は trusted 専用であり、untrusted isolation として扱わない
 - `filed` は通常の pathname based process exec を提供する
-- `seed0root` の exec は `koboxd` と `filed` を起動する bootstrap exception として残す
+- `seed0root` の exec は integrated `filed.elf` を起動する bootstrap exception として残す
 - VFS と exec は Coq 抽象モデルを先に作り、C 実装をその分解に合わせる
 - 初期検証は VST ではなく、Coq executable model / invariant preservation / C differential test で行う

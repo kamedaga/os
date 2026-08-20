@@ -10,15 +10,20 @@
 ![Status](https://img.shields.io/badge/status-experimental-orange?style=flat-square)
 ![Linux ABI](https://img.shields.io/badge/Linux%20ABI-compatible-brightgreen?style=flat-square&logo=linux)
 
-既存の Linux エコシステムとの互換を目指すマイクロカーネル。  
-musl libc をネイティブでサポートし、カーネルのコード量は 20,000 行未満（現在約 16,000 行）に抑えています。
+既存の Linux エコシステムとの互換を目指す FD capability ベースのマイクロカーネルです。
+
+Linux application も特別な仮想マシンや Linux process ではなく、必要最小限の
+FD capability を持つ普通の PachaOS process として動きます。Linux syscall は
+kernel や特権 server ではなく、process に動的リンクされた非特権の LPR が
+userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/architecture.md)
+を参照してください。
 
 ---
 
 ## Features
 
-- **FD-based Microkernel** — Capabilityとほぼ特性の同じ権限ベースのFD(File Descriptor)を採用していて、厳格なセキュリティとLinux ABIおよびPOSIXの相性の良さを両立しています
-- **Linux Personality Runtime** — Linux syscallをzpolineを用いてcallqに置き換えることで、動的にリンクされるshimが呼び出されprocess内で完結します。
+- **FD-based Microkernel** — 全ての process が、rights を縮小して受け渡せる FD capability で authority を持ちます
+- **Linux Personality Runtime** — zpoline で Linux syscall を process 内の関数呼び出しへ変換する、非特権の動的リンク runtime です
 - **Kobox** — capsule を用いた、ユーザー空間で動くLinuxカーネルモジュールの変換レイヤー
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
 - **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます
@@ -35,7 +40,7 @@ musl libc をネイティブでサポートし、カーネルのコード量は 
 | Layer | Language | Detail |
 |---|---|---|
 | Kernel | Zig / C / Rocq | Freestanding / UEFI boot / x86_64 |
-| Userland | C / CMake | musl libc / ELF loader / Linux ABI server |
+| Userland | C / CMake | musl libc / ELF loader / per-process Linux Personality Runtime |
 | Tools | Go / Nix / bash | Build Tools  |
 
 ## Core Functions
@@ -85,7 +90,10 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 | virtio-input | `linux_virtio_input.ko` ...|
 
 
-koboxはcapabilityベースからFDベースに切り替え、ネイティブABIで自然にlibcが動いたため、daemonとして動くようになりました。
+Kobox は FD capability を使う userland component です。storage 用 runtime は
+VFS/execとの責務境界を保ったまま、現在は `filed.elf` にリンクされています。
+TTY、network、display、input など、独立した状態と回復単位を持つ subsystem は
+それぞれ別の service process に配置されます。
 
 ※koboxはApache 2.0でライセンスされてます。
 
@@ -107,4 +115,3 @@ nix develop
 
 PachaOS source code is licensed under the **MIT License**.  
 Third-party runtime components are documented in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
-

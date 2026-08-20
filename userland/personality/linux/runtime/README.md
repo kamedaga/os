@@ -1,6 +1,16 @@
 # Linux Personality Runtime
 
-This directory will contain the per-process Linux Personality Runtime.
+This directory contains the per-process Linux Personality Runtime.
+
+An application using LPR is still an ordinary PachaOS process. PachaOS does not
+give it a Linux-specific process type or place LPR in a privileged relationship
+with the kernel. LPR is a dynamically linked user-space syscall abstraction: it
+translates Linux ABI operations into native syscalls and userland service calls.
+
+The application's authority is exactly the set of native FD capabilities
+installed in that process. Bypassing or modifying LPR cannot create authority;
+the kernel enforces the rights on every native FD operation. LPR provides Linux
+semantics, not the OS security boundary.
 
 The runtime is loaded into each Linux process address space and owns:
 
