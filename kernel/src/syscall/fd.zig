@@ -60,7 +60,7 @@ fn pageAlignUp(value: u64) ?u64 {
 
 fn statusFromKernelError(err: kernel.KernelError) u64 {
     return switch (err) {
-        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };
 }
@@ -744,10 +744,7 @@ fn mapVmoFd(
                 flags,
                 vmo_offset,
                 free_list,
-            )) catch |err| return switch (err) {
-            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
-            else => sc.syscall_err_invalid,
-        };
+            )) catch |err| return statusFromKernelError(err);
         defer state.discardFixedMmapPrepared(&prepared, free_list);
         if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) unreachable;
         state.commitFixedMmapPrepared(&prepared, free_list);
@@ -1131,7 +1128,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             kernel.fdFlagsFromBits(@truncate(frame.rdx)),
             first_dynamic_fd,
             h.free_list,
-        ) catch sc.syscall_err_alloc,
+        ) catch |err| statusFromKernelError(err),
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {

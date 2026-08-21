@@ -1120,25 +1120,94 @@ test "page-backed vmo fd uses dynamic fd range and reports fd info" {
 test "vmo backing store reclaims and coalesces its high-water tail" {
     try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
 
-    try std.testing.expectEqual(@as(?u32, 0), kernel.allocEmptyVmoBackingPageStore(2));
-    try std.testing.expectEqual(@as(?u32, 2), kernel.allocEmptyVmoBackingPageStore(3));
-    try std.testing.expectEqual(@as(?u32, 5), kernel.allocEmptyVmoBackingPageStore(4));
-    try std.testing.expect(kernel.freeVmoBackingPageStore(2, 3));
-    try std.testing.expect(kernel.freeVmoBackingPageStore(5, 4));
-    try std.testing.expectEqual(@as(?u32, 2), kernel.allocEmptyVmoBackingPageStore(8));
+    // The store now records an owner per entry.  This test exercises the range
+    // allocator rather than ownership, so one synthetic owner keeps every
+    // allocate/free pair matched.
+    const store_owner = kernel.vmoBackingStoreOwner(.native_vmo, 1, 1);
+
+    try std.testing.expectEqual(@as(?u32, 0), kernel.allocEmptyVmoBackingPageStore(2, store_owner));
+    try std.testing.expectEqual(@as(?u32, 2), kernel.allocEmptyVmoBackingPageStore(3, store_owner));
+    try std.testing.expectEqual(@as(?u32, 5), kernel.allocEmptyVmoBackingPageStore(4, store_owner));
+    try std.testing.expect(kernel.freeVmoBackingPageStore(2, 3, store_owner));
+    try std.testing.expect(kernel.freeVmoBackingPageStore(5, 4, store_owner));
+    try std.testing.expectEqual(@as(?u32, 2), kernel.allocEmptyVmoBackingPageStore(8, store_owner));
 
     try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
     const range_count = kernel.max_vmo_backing_store_free_ranges;
     const reserved_pages = range_count * 2 + 1;
-    try std.testing.expectEqual(@as(?u32, 0), kernel.allocEmptyVmoBackingPageStore(reserved_pages));
+    try std.testing.expectEqual(@as(?u32, 0), kernel.allocEmptyVmoBackingPageStore(reserved_pages, store_owner));
     for (0..range_count) |i| {
-        try std.testing.expect(kernel.freeVmoBackingPageStore(@intCast(i * 2), 1));
+        try std.testing.expect(kernel.freeVmoBackingPageStore(@intCast(i * 2), 1, store_owner));
     }
-    try std.testing.expect(kernel.freeVmoBackingPageStore(@intCast(reserved_pages - 1), 1));
+    try std.testing.expect(kernel.freeVmoBackingPageStore(@intCast(reserved_pages - 1), 1, store_owner));
     try std.testing.expectEqual(
         @as(?u32, @intCast(reserved_pages - 1)),
-        kernel.allocEmptyVmoBackingPageStore(2),
+        kernel.allocEmptyVmoBackingPageStore(2, store_owner),
     );
+}
+
+test "vmo backing store operations wait for the dedicated inner lock" {
+    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
+
+    const Context = struct {
+        started: *u8,
+        finished: *u8,
+        result: *?u32,
+        owner: u64,
+    };
+    const Worker = struct {
+        fn run(context: *Context) void {
+            @atomicStore(u8, context.started, 1, .release);
+            context.result.* = kernel.allocEmptyVmoBackingPageStore(1, context.owner);
+            @atomicStore(u8, context.finished, 1, .release);
+        }
+    };
+
+    var started: u8 = 0;
+    var finished: u8 = 0;
+    var result: ?u32 = null;
+    var lock_held = kernel.lockVmoBackingPageStoreForTest();
+    try std.testing.expect(lock_held);
+    defer if (lock_held) kernel.unlockVmoBackingPageStoreForTest();
+
+    var context = Context{
+        .started = &started,
+        .finished = &finished,
+        .result = &result,
+        .owner = kernel.vmoBackingStoreOwner(.native_vmo, 2, 1),
+    };
+    const worker = try std.Thread.spawn(.{}, Worker.run, .{&context});
+    while (@atomicLoad(u8, &started, .acquire) == 0) std.Thread.yield() catch {};
+    for (0..1024) |_| std.Thread.yield() catch {};
+    const finished_while_locked = @atomicLoad(u8, &finished, .acquire) != 0;
+
+    kernel.unlockVmoBackingPageStoreForTest();
+    lock_held = false;
+    worker.join();
+
+    try std.testing.expect(!finished_while_locked);
+    try std.testing.expectEqual(@as(?u32, 0), result);
+    try std.testing.expectEqual(@as(u8, 1), @atomicLoad(u8, &finished, .acquire));
+}
+
+test "vmo backing store owner ledger rejects cross-object writes and frees" {
+    try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
+    const owner = kernel.vmoBackingStoreOwner(.native_vmo, 3, 1);
+    const intruder = kernel.vmoBackingStoreOwner(.native_cow, 4, 1);
+    const start = kernel.allocEmptyVmoBackingPageStore(1, owner) orelse unreachable;
+
+    try std.testing.expect(!kernel.setVmoBackingPageStorePaddr(start, 1, 0, intruder, 0x1000));
+    try std.testing.expectEqual(@as(?u64, 0), kernel.vmoBackingPageStorePaddr(start, 1, 0));
+    try std.testing.expect(kernel.setVmoBackingPageStorePaddr(start, 1, 0, owner, 0x1000));
+    try std.testing.expect(!kernel.freeVmoBackingPageStore(start, 1, intruder));
+    try std.testing.expectEqual(@as(?u64, 0x1000), kernel.vmoBackingPageStorePaddr(start, 1, 0));
+    try std.testing.expect(kernel.freeVmoBackingPageStore(start, 1, owner));
+
+    const fault = kernel.vmoBackingStoreOwnershipFault();
+    try std.testing.expectEqual(@as(u64, 2), fault.count);
+    try std.testing.expectEqual(@as(u8, 3), fault.operation);
+    try std.testing.expectEqual(intruder, fault.expected);
+    try std.testing.expectEqual(owner, fault.actual);
 }
 
 test "anonymous vmo fd maps through vma ledger without page capability install" {

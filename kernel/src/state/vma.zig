@@ -1298,7 +1298,9 @@ pub fn createAnonymousVmoFdWithPages(
 ) KernelError!Fd {
     const aligned_size = @TypeOf(self.*).pageAlignUp(size_bytes);
     const page_count_u64 = aligned_size / native_page_size;
-    if (size_bytes == 0 or page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
+    if (size_bytes == 0 or page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) {
+        return KernelError.InvalidState;
+    }
     const fd = try self.createAnonymousVmoFd(owner, aligned_size, rights, flags, min_fd);
     errdefer self.closeFdWithFreeList(owner, fd, free_list) catch {};
     const vmo_ref = self.nativeVmoRefForFd(owner, fd) orelse return KernelError.InvalidState;

@@ -132,6 +132,7 @@ const fdRightsFromBits = types.fdRightsFromBits;
 const fdRightsToBits = types.fdRightsToBits;
 const isFdRightsSubset = types.isFdRightsSubset;
 const vmObjectBackingFreePageCount = types.vmObjectBackingFreePageCount;
+const vmObjectBackingStoreStats = types.vmObjectBackingStoreStats;
 const removeVmoBackingFreeRange = types.removeVmoBackingFreeRange;
 const insertVmoBackingFreeRange = types.insertVmoBackingFreeRange;
 const allocEmptyVmoBackingPageStore = types.allocEmptyVmoBackingPageStore;
@@ -296,14 +297,15 @@ pub fn debugLogMemoryOwnership(
 
     write("Kernel.mem_diag where=");
     write(where);
+    const vm_store = vmObjectBackingStoreStats();
     @TypeOf(self.*).debugWriteField(write, print_number, "free_pages", @intCast(free_list.pageCount()));
     @TypeOf(self.*).debugWriteField(write, print_number, "free_ranges", @intCast(free_list.rangeCount()));
     @TypeOf(self.*).debugWriteField(write, print_number, "process_capacity", @intCast(self.process_capacity));
     @TypeOf(self.*).debugWriteField(write, print_number, "active_processes", active_total);
     @TypeOf(self.*).debugWriteField(write, print_number, "tracked_active", @intCast(self.active_process_count));
-    @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_next", @intCast(vmo_backing_page_store_next));
-    @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_free_pages", vmObjectBackingFreePageCount());
-    @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_free_ranges", @intCast(vmo_backing_page_store_free_range_len));
+    @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_next", vm_store.bump_next);
+    @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_free_pages", vm_store.free_total);
+    @TypeOf(self.*).debugWriteField(write, print_number, "vm_store_free_ranges", vm_store.free_ranges);
     write("\n");
 
     pidx = 0;
