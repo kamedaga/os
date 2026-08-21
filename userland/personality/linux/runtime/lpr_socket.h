@@ -36,6 +36,7 @@ int64_t lpr_linux_socket_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_linux_socket_fstat(uint64_t fd, uint64_t statbuf);
 int64_t lpr_linux_poll(uint64_t fds, uint64_t nfds, uint64_t timeout_ms);
 int64_t lpr_linux_poll_cached(uint64_t fds, uint64_t nfds);
+int64_t lpr_linux_poll_current(uint64_t fds, uint64_t nfds);
 int64_t lpr_linux_ppoll(uint64_t fds, uint64_t nfds, uint64_t timeout_ts, uint64_t sigmask, uint64_t sigsetsize);
 int64_t lpr_linux_select(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds, uint64_t timeout);
 int64_t lpr_linux_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds, uint64_t exceptfds, uint64_t timeout, uint64_t sigmask);

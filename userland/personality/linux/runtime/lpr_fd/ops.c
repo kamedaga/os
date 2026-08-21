@@ -612,6 +612,7 @@ static int64_t lpr_fd_dispatch_io(
     else if (required_right != 0 && lpr_fd_io_supported(pin.ops_id, operation))
         result = lpr_fd_dispatch_direct(&pin, arg0, arg1, operation);
     lpr_fd_unpin(&pin);
+    if (operation <= 3) lpr_epoll_note_fd_state(fd);
     return result;
 }
 

@@ -162,17 +162,6 @@ static int mixed_level_ctl_smoke(void)
         return fail("LPR_EPOLL_DEL=BAD\n");
     }
 
-    int edge_pipe[2] = {-1, -1};
-    if (pipe(edge_pipe) != 0) {
-        return fail("LPR_EPOLL_ET_REJECT=BAD:create\n");
-    }
-    errno = 0;
-    if (add_interest(epfd, edge_pipe[0], EPOLLIN | EPOLLET, 0x55) == 0 || errno != EINVAL) {
-        return fail("LPR_EPOLL_ET_REJECT=BAD\n");
-    }
-
-    close(edge_pipe[0]);
-    close(edge_pipe[1]);
     close(pipefd[0]);
     close(pipefd[1]);
     close(efd);
@@ -183,7 +172,101 @@ static int mixed_level_ctl_smoke(void)
     emit("LPR_EPOLL_LT=OK\n");
     emit("LPR_EPOLL_DEL=OK\n");
     emit("LPR_EPOLL_CLOEXEC=OK\n");
-    emit("LPR_EPOLL_ET_REJECT=OK\n");
+    return 1;
+}
+
+static int edge_triggered_smoke(void)
+{
+    enum {
+        EDGE_DATA = 0x55,
+        ONESHOT_DATA = 0x56,
+    };
+    int edge_pipe[2] = {-1, -1};
+    int oneshot_pipe[2] = {-1, -1};
+    const int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0 || pipe(edge_pipe) != 0 || pipe(oneshot_pipe) != 0) {
+        return fail("LPR_EPOLL_ET=BAD:create\n");
+    }
+
+    /* D-Bus installs disabled watches as EPOLLET-only registrations. */
+    if (add_interest(epfd, edge_pipe[0], EPOLLET, EDGE_DATA) != 0) {
+        return fail("LPR_EPOLL_ET_DISABLED=BAD:add\n");
+    }
+    const char bytes[2] = {'e', 't'};
+    struct epoll_event event;
+    if (write(edge_pipe[1], bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes) ||
+        epoll_wait(epfd, &event, 1, 0) != 0)
+    {
+        return fail("LPR_EPOLL_ET_DISABLED=BAD:ready\n");
+    }
+    if (mod_interest(epfd, edge_pipe[0], EPOLLIN | EPOLLET, EDGE_DATA) != 0 ||
+        epoll_wait(epfd, &event, 1, 100) != 1 ||
+        event.data.u64 != EDGE_DATA || (event.events & EPOLLIN) == 0)
+    {
+        return fail("LPR_EPOLL_ET=BAD:first-edge\n");
+    }
+    if (epoll_wait(epfd, &event, 1, 0) != 0) {
+        return fail("LPR_EPOLL_ET=BAD:repeat\n");
+    }
+
+    char byte = 0;
+    if (read(edge_pipe[0], &byte, 1) != 1 || byte != bytes[0] ||
+        epoll_wait(epfd, &event, 1, 0) != 0)
+    {
+        return fail("LPR_EPOLL_ET_PARTIAL=BAD\n");
+    }
+    if (read(edge_pipe[0], &byte, 1) != 1 || byte != bytes[1] ||
+        write(edge_pipe[1], bytes, 1) != 1 ||
+        epoll_wait(epfd, &event, 1, 100) != 1 ||
+        event.data.u64 != EDGE_DATA || (event.events & EPOLLIN) == 0)
+    {
+        return fail("LPR_EPOLL_ET=BAD:refill-before-wait\n");
+    }
+
+    /* MOD must re-arm an ET registration even while its target stays ready. */
+    if (mod_interest(epfd, edge_pipe[0], EPOLLIN | EPOLLET, EDGE_DATA) != 0 ||
+        epoll_wait(epfd, &event, 1, 0) != 1 ||
+        event.data.u64 != EDGE_DATA || (event.events & EPOLLIN) == 0 ||
+        read(edge_pipe[0], &byte, 1) != 1)
+    {
+        return fail("LPR_EPOLL_ET_MOD_REARM=BAD\n");
+    }
+
+    if (add_interest(
+            epfd,
+            oneshot_pipe[0],
+            EPOLLIN | EPOLLET | EPOLLONESHOT,
+            ONESHOT_DATA) != 0 ||
+        write(oneshot_pipe[1], bytes, 1) != 1 ||
+        epoll_wait(epfd, &event, 1, 100) != 1 ||
+        event.data.u64 != ONESHOT_DATA || (event.events & EPOLLIN) == 0 ||
+        read(oneshot_pipe[0], &byte, 1) != 1 ||
+        write(oneshot_pipe[1], bytes + 1, 1) != 1 ||
+        epoll_wait(epfd, &event, 1, 0) != 0)
+    {
+        return fail("LPR_EPOLL_ONESHOT=BAD:disable\n");
+    }
+    if (mod_interest(
+            epfd,
+            oneshot_pipe[0],
+            EPOLLIN | EPOLLET | EPOLLONESHOT,
+            ONESHOT_DATA) != 0 ||
+        epoll_wait(epfd, &event, 1, 100) != 1 ||
+        event.data.u64 != ONESHOT_DATA || (event.events & EPOLLIN) == 0)
+    {
+        return fail("LPR_EPOLL_ONESHOT=BAD:rearm\n");
+    }
+
+    close(oneshot_pipe[0]);
+    close(oneshot_pipe[1]);
+    close(edge_pipe[0]);
+    close(edge_pipe[1]);
+    close(epfd);
+    emit("LPR_EPOLL_ET_DISABLED=OK\n");
+    emit("LPR_EPOLL_ET=OK\n");
+    emit("LPR_EPOLL_ET_PARTIAL=OK\n");
+    emit("LPR_EPOLL_ET_MOD_REARM=OK\n");
+    emit("LPR_EPOLL_ONESHOT=OK\n");
     return 1;
 }
 
@@ -387,6 +470,7 @@ int main(int argc, char **argv)
     }
     emit("LPR_EPOLL_START\n");
     if (!mixed_level_ctl_smoke() ||
+        !edge_triggered_smoke() ||
         !timeout_dup_close_smoke() ||
         !hup_smoke() ||
         !nested_smoke() ||

@@ -19,6 +19,13 @@
 #define LPR_EPOLL_CTL_DEL 2u
 #define LPR_EPOLL_CTL_MOD 3u
 
+#define LPR_EPOLL_READY_BITS \
+    (LPR_EPOLLIN | LPR_EPOLLOUT | LPR_EPOLLERR | LPR_EPOLLHUP)
+#define LPR_EPOLL_STATE_READY_MASK 0x0000ffffu
+#define LPR_EPOLL_STATE_PENDING_SHIFT 16u
+#define LPR_EPOLL_STATE_PENDING_MASK 0x7fff0000u
+#define LPR_EPOLL_STATE_ONESHOT_DISABLED 0x80000000u
+
 #define LPR_USER_LOW_GUARD_END 4096ull
 #define LPR_USER_CANONICAL_END 0x0000800000000000ull
 
@@ -38,7 +45,7 @@ typedef struct lpr_epoll_interest {
     uint32_t target_ofd_index;
     uint64_t target_generation;
     uint32_t events;
-    uint32_t reserved0;
+    uint32_t state;
     uint64_t data;
 } lpr_epoll_interest_t;
 
@@ -62,7 +69,11 @@ typedef struct lpr_epoll_snapshot {
     uint8_t kind;
     uint8_t reserved0;
     uint16_t reserved1;
+    uint32_t target_ofd_index;
+    uint32_t registered_fd;
+    uint64_t target_generation;
     uint32_t events;
+    uint32_t reserved3;
     uint64_t data;
 } lpr_epoll_snapshot_t;
 
@@ -261,7 +272,7 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
             return -LPR_LINUX_EFAULT;
         }
         lpr_memcpy(&event, (const void *)(uintptr_t)event_raw, sizeof(event));
-        if ((event.events & (LPR_EPOLLET | LPR_EPOLLONESHOT | LPR_EPOLLEXCLUSIVE)) != 0) {
+        if ((event.events & LPR_EPOLLEXCLUSIVE) != 0) {
             return -LPR_LINUX_EINVAL;
         }
         event.events &= ~LPR_EPOLLWAKEUP;
@@ -368,6 +379,10 @@ int64_t lpr_linux_epoll_ctl(uint64_t epfd_raw, uint64_t op, uint64_t fd_raw, uin
         lpr_epoll_remove_interest(instance, found);
     } else {
         instance->interests[found].events = event.events;
+        /* MOD is the Linux re-arm operation for both ET and ONESHOT.  Forget
+         * the previously observed level so an already-ready target produces
+         * a fresh event under the new registration. */
+        instance->interests[found].state = 0;
         instance->interests[found].data = event.data;
         instance->generation++;
     }
@@ -430,6 +445,9 @@ static int64_t lpr_epoll_snapshot(
     }
     for (uint32_t i = 0; i < instance->count; i++) {
         const lpr_epoll_interest_t *interest = &instance->interests[i];
+        if ((interest->state & LPR_EPOLL_STATE_ONESHOT_DISABLED) != 0) {
+            continue;
+        }
         const int target_fd = lpr_epoll_resolve_target_fd_unlocked(interest);
         if (target_fd < 0) {
             continue;
@@ -439,6 +457,9 @@ static int64_t lpr_epoll_snapshot(
         lpr_epoll_snapshot_t *item = &snapshot[*out_count];
         item->fd = target_fd;
         item->kind = lpr_ofd_ops_id(target);
+        item->target_ofd_index = interest->target_ofd_index;
+        item->registered_fd = interest->target_fd;
+        item->target_generation = interest->target_generation;
         item->events = interest->events;
         item->data = interest->data;
         (*out_count)++;
@@ -447,12 +468,103 @@ static int64_t lpr_epoll_snapshot(
     return 0;
 }
 
+static uint32_t lpr_epoll_interest_observe(
+    lpr_epoll_interest_t *interest,
+    uint32_t current,
+    int consume)
+{
+    if (interest == 0 ||
+        (interest->state & LPR_EPOLL_STATE_ONESHOT_DISABLED) != 0)
+    {
+        return 0;
+    }
+    current &= (interest->events | LPR_EPOLLERR | LPR_EPOLLHUP) &
+        LPR_EPOLL_READY_BITS;
+    uint32_t report = current;
+    if ((interest->events & LPR_EPOLLET) != 0) {
+        const uint32_t previous =
+            interest->state & LPR_EPOLL_STATE_READY_MASK;
+        uint32_t pending =
+            (interest->state & LPR_EPOLL_STATE_PENDING_MASK) >>
+            LPR_EPOLL_STATE_PENDING_SHIFT;
+        pending |= current & ~previous;
+        interest->state =
+            (interest->state & LPR_EPOLL_STATE_ONESHOT_DISABLED) |
+            current |
+            (pending << LPR_EPOLL_STATE_PENDING_SHIFT);
+        report = pending;
+        if (consume && report != 0) {
+            interest->state &= ~LPR_EPOLL_STATE_PENDING_MASK;
+        }
+    }
+    if (consume && report != 0 &&
+        (interest->events & LPR_EPOLLONESHOT) != 0)
+    {
+        interest->state |= LPR_EPOLL_STATE_ONESHOT_DISABLED;
+    }
+    return report;
+}
+
+static int64_t lpr_epoll_apply_observation(
+    uint32_t epfd,
+    const lpr_epoll_snapshot_t *item,
+    uint32_t current,
+    int consume,
+    uint32_t *out_report)
+{
+    *out_report = 0;
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    if (epfd >= lpr_control_fd_table.entry_count ||
+        !lpr_control_fd_table.entries[epfd].active)
+    {
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return -LPR_LINUX_EBADF;
+    }
+    const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[epfd];
+    if (slot->ofd_index >= lpr_control_fd_table.ofd_count) {
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return -LPR_LINUX_EBADF;
+    }
+    lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(
+        &lpr_control_fd_table.ofds[slot->ofd_index]);
+    if (instance == 0) {
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return -LPR_LINUX_EINVAL;
+    }
+    for (uint32_t i = 0; i < instance->count; ++i) {
+        lpr_epoll_interest_t *interest = &instance->interests[i];
+        if (!lpr_epoll_interest_matches(
+                interest,
+                item->registered_fd,
+                item->target_ofd_index,
+                item->target_generation))
+        {
+            continue;
+        }
+        *out_report = lpr_epoll_interest_observe(
+            interest, current, consume);
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return 0;
+    }
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    return 0;
+}
+
+static int64_t lpr_epoll_scan_fd(
+    uint32_t epfd,
+    lpr_linux_epoll_event_t *events,
+    uint32_t maxevents,
+    int cached_sockets,
+    int consume);
+
 static int64_t lpr_epoll_scan(
+    uint32_t epfd,
     const lpr_epoll_snapshot_t *snapshot,
     uint32_t count,
     lpr_linux_epoll_event_t *events,
     uint32_t maxevents,
-    int cached_sockets)
+    int cached_sockets,
+    int consume)
 {
     lpr_linux_pollfd_t pollfds[LPR_EPOLL_MAX_INTERESTS];
     for (uint32_t i = 0; i < count; i++) {
@@ -463,34 +575,43 @@ static int64_t lpr_epoll_scan(
     }
     const int64_t poll_status = cached_sockets ?
         lpr_linux_poll_cached((uint64_t)(uintptr_t)pollfds, count) :
-        lpr_linux_poll((uint64_t)(uintptr_t)pollfds, count, 0);
+        lpr_linux_poll_current((uint64_t)(uintptr_t)pollfds, count);
     if (poll_status < 0) {
         return poll_status;
     }
     uint32_t ready = 0;
-    for (uint32_t i = 0; i < count && ready < maxevents; i++) {
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t current = 0;
         if (snapshot[i].kind == LPR_FD_OPS_EPOLL) {
             lpr_linux_epoll_event_t nested_event;
-            const int64_t nested_ready = lpr_linux_epoll_wait(
-                (uint64_t)(uint32_t)snapshot[i].fd,
-                (uint64_t)(uintptr_t)&nested_event,
+            const int64_t nested_ready = lpr_epoll_scan_fd(
+                (uint32_t)snapshot[i].fd,
+                &nested_event,
                 1,
+                cached_sockets,
                 0);
             if (nested_ready < 0) {
                 return nested_ready;
             }
             if (nested_ready > 0 && (snapshot[i].events & LPR_EPOLLIN) != 0) {
-                events[ready].events = LPR_EPOLLIN;
-                events[ready].data = snapshot[i].data;
-                ready++;
+                current = LPR_EPOLLIN;
             }
+        } else {
+            current = (uint16_t)pollfds[i].revents &
+                (snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) &
+                LPR_EPOLL_READY_BITS;
+        }
+        uint32_t report = 0;
+        const int can_consume = consume && ready < maxevents;
+        const int64_t observation = lpr_epoll_apply_observation(
+            epfd, &snapshot[i], current, can_consume, &report);
+        if (observation != 0) {
+            return observation;
+        }
+        if (report == 0) {
             continue;
         }
-        const uint32_t revents = (uint16_t)pollfds[i].revents;
-        const uint32_t report = revents &
-            (snapshot[i].events | LPR_EPOLLERR | LPR_EPOLLHUP) &
-            (LPR_EPOLLIN | LPR_EPOLLOUT | LPR_EPOLLERR | LPR_EPOLLHUP);
-        if (report == 0) {
+        if (ready >= maxevents) {
             continue;
         }
         events[ready].events = report;
@@ -498,6 +619,21 @@ static int64_t lpr_epoll_scan(
         ready++;
     }
     return ready;
+}
+
+static int64_t lpr_epoll_scan_fd(
+    uint32_t epfd,
+    lpr_linux_epoll_event_t *events,
+    uint32_t maxevents,
+    int cached_sockets,
+    int consume)
+{
+    lpr_epoll_snapshot_t snapshot[LPR_EPOLL_MAX_INTERESTS];
+    uint32_t count = 0;
+    const int64_t status = lpr_epoll_snapshot(epfd, snapshot, &count);
+    if (status != 0) return status;
+    return lpr_epoll_scan(
+        epfd, snapshot, count, events, maxevents, cached_sockets, consume);
 }
 
 int64_t lpr_epoll_add_wait_graph(
@@ -596,11 +732,13 @@ int64_t lpr_linux_epoll_wait(
             return snapshot_status;
         }
         const int64_t ready = lpr_epoll_scan(
+            (uint32_t)epfd_raw,
             snapshot,
             count,
             (lpr_linux_epoll_event_t *)(uintptr_t)events_raw,
             (uint32_t)maxevents_raw,
-            cached_sockets);
+            cached_sockets,
+            1);
         if (ready != 0 || timeout == 0) {
             return ready;
         }
@@ -624,14 +762,120 @@ int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events)
     if (!lpr_linux_epoll_fd_active(fd))
         return -LPR_LINUX_EBADF;
     lpr_linux_epoll_event_t event;
-    const int64_t ready = lpr_linux_epoll_wait(
-        fd,
-        (uint64_t)(uintptr_t)&event,
+    const int64_t ready = lpr_epoll_scan_fd(
+        (uint32_t)fd,
+        &event,
+        1,
         1,
         0);
     if (ready < 0)
         return ready;
     return ready != 0 && (events & LPR_EPOLLIN) != 0 ? LPR_EPOLLIN : 0;
+}
+
+void lpr_epoll_note_fd_state(uint64_t fd_raw)
+{
+    if (fd_raw > LPR_LINUX_FD_MAX) return;
+    const uint32_t fd = (uint32_t)fd_raw;
+    uint32_t target_ofd_index = UINT32_MAX;
+    uint64_t target_generation = 0;
+    uint32_t observed_events = 0;
+
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    if (fd < lpr_control_fd_table.entry_count &&
+        lpr_control_fd_table.entries[fd].active)
+    {
+        target_ofd_index = lpr_control_fd_table.entries[fd].ofd_index;
+        if (target_ofd_index < lpr_control_fd_table.ofd_count) {
+            lpr_ofd_t *target = &lpr_control_fd_table.ofds[target_ofd_index];
+            target_generation = target->generation;
+            for (uint32_t i = 0; i < lpr_control_fd_table.ofd_count; ++i) {
+                lpr_epoll_instance_t *instance = lpr_epoll_instance_for_object(
+                    &lpr_control_fd_table.ofds[i]);
+                if (instance == 0) continue;
+                for (uint32_t j = 0; j < instance->count; ++j) {
+                    const lpr_epoll_interest_t *interest =
+                        &instance->interests[j];
+                    if (interest->target_ofd_index == target_ofd_index &&
+                        interest->target_generation == target_generation &&
+                        (interest->events & LPR_EPOLLET) != 0 &&
+                        (interest->state &
+                         LPR_EPOLL_STATE_ONESHOT_DISABLED) == 0)
+                    {
+                        observed_events |= interest->events |
+                            LPR_EPOLLERR | LPR_EPOLLHUP;
+                    }
+                }
+            }
+        }
+    }
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    if (target_ofd_index == UINT32_MAX || observed_events == 0) return;
+
+    lpr_linux_pollfd_t pollfd = {
+        .fd = (int32_t)fd,
+        .events = (int16_t)(observed_events & LPR_EPOLL_READY_BITS),
+        .revents = 0,
+    };
+    if (lpr_linux_poll_current(
+            (uint64_t)(uintptr_t)&pollfd, 1) < 0)
+    {
+        return;
+    }
+    const uint32_t current =
+        (uint16_t)pollfd.revents & LPR_EPOLL_READY_BITS;
+    int notify_fds[LPR_WAIT_GRAPH_MAX_LEAVES];
+    uint32_t notify_count = 0;
+
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    if (fd >= lpr_control_fd_table.entry_count ||
+        !lpr_control_fd_table.entries[fd].active ||
+        lpr_control_fd_table.entries[fd].ofd_index != target_ofd_index ||
+        target_ofd_index >= lpr_control_fd_table.ofd_count ||
+        lpr_control_fd_table.ofds[target_ofd_index].generation !=
+            target_generation)
+    {
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        return;
+    }
+    for (uint32_t i = 0; i < lpr_control_fd_table.ofd_count; ++i) {
+        lpr_ofd_t *object = &lpr_control_fd_table.ofds[i];
+        lpr_epoll_instance_t *instance =
+            lpr_epoll_instance_for_object(object);
+        if (instance == 0) continue;
+        int became_pending = 0;
+        for (uint32_t j = 0; j < instance->count; ++j) {
+            lpr_epoll_interest_t *interest = &instance->interests[j];
+            if (interest->target_ofd_index != target_ofd_index ||
+                interest->target_generation != target_generation ||
+                (interest->events & LPR_EPOLLET) == 0)
+            {
+                continue;
+            }
+            const uint32_t old_pending = interest->state &
+                LPR_EPOLL_STATE_PENDING_MASK;
+            (void)lpr_epoll_interest_observe(interest, current, 0);
+            if (old_pending == 0 &&
+                (interest->state & LPR_EPOLL_STATE_PENDING_MASK) != 0)
+            {
+                became_pending = 1;
+            }
+        }
+        if (!became_pending || notify_count >= LPR_WAIT_GRAPH_MAX_LEAVES)
+            continue;
+        lpr_epoll_backend_t *backend =
+            (lpr_epoll_backend_t *)lpr_backend_state_from_ofd(object);
+        if (backend == 0 || backend->notify_fd.raw < 16) continue;
+        int known = 0;
+        for (uint32_t j = 0; j < notify_count; ++j) {
+            if (notify_fds[j] == backend->notify_fd.raw) known = 1;
+        }
+        if (!known) notify_fds[notify_count++] = backend->notify_fd.raw;
+    }
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    for (uint32_t i = 0; i < notify_count; ++i) {
+        lpr_epoll_notify_native(notify_fds[i]);
+    }
 }
 
 int64_t lpr_linux_epoll_pwait(

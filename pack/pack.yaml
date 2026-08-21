@@ -221,6 +221,11 @@ apps:
       path: "tests/fixtures/pine2_gtk_smoke.sh"
     out: "PINE2GTKTEST.SH"
     rootfs: "/cmd/pine2_gtk_smoke.sh"
+  thunar_bringup_script:
+    file:
+      path: "tests/fixtures/thunar_bringup.sh"
+    out: "THUNARTEST.SH"
+    rootfs: "/cmd/thunar_bringup.sh"
   apk_shell_smoke_script:
     file:
       path: "tests/fixtures/apk_shell_smoke.sh"
@@ -1631,6 +1636,10 @@ apps:
     file: "userland/fixtures/base/os-release"
     out: "OS-RELEASE"
     rootfs: "/etc/os-release"
+  passwd:
+    file: "userland/fixtures/base/passwd"
+    out: "PASSWD"
+    rootfs: "/etc/passwd"
   pipe_probe:
     file:
       path: ".artifacts/userland-fixtures/pipe_probe.elf"
@@ -1647,6 +1656,10 @@ apps:
     file: "userland/fixtures/base/resolv.conf"
     out: "RESOLV.CONF"
     rootfs: "/etc/resolv.conf"
+  group:
+    file: "userland/fixtures/base/group"
+    out: "GROUP"
+    rootfs: "/etc/group"
   rootfs_vfs:
     role: "service"
     file:

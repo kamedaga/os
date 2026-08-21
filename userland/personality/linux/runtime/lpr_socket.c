@@ -2376,6 +2376,17 @@ int64_t lpr_linux_poll_cached(uint64_t fds_raw, uint64_t nfds)
         (lpr_linux_pollfd_t *)(uintptr_t)fds_raw, nfds, 1);
 }
 
+int64_t lpr_linux_poll_current(uint64_t fds_raw, uint64_t nfds)
+{
+    if (fds_raw == 0 && nfds != 0) return -LPR_LINUX_EFAULT;
+    if (nfds > UINT64_MAX / sizeof(lpr_linux_pollfd_t) ||
+        !lpr_user_range_plausible(
+            fds_raw, nfds * sizeof(lpr_linux_pollfd_t)))
+        return -LPR_LINUX_EFAULT;
+    return lpr_linux_poll_scan(
+        (lpr_linux_pollfd_t *)(uintptr_t)fds_raw, nfds, 0);
+}
+
 static int64_t lpr_linux_wait_mask_begin(
     uint64_t sigmask,
     uint64_t sigsetsize,
