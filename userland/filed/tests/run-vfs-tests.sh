@@ -96,3 +96,34 @@ mkdir -p "${build_dir}"
   -o "${build_dir}/cache_consistency_test"
 
 "${build_dir}/cache_consistency_test"
+
+"${cc_bin}" \
+  -std=c11 \
+  -D_POSIX_C_SOURCE=200809L \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -I"${repo_root}/userland/filed/include" \
+  -I"${repo_root}/userland/koboxd/include" \
+  -I"${repo_root}/userland/libipc/include" \
+  -I"${repo_root}/userland/libpacha/include" \
+  "${repo_root}/userland/filed/src/kobox_backend.c" \
+  "${repo_root}/userland/filed/tests/kobox_backend_link_test.c" \
+  -o "${build_dir}/kobox_backend_link_test"
+
+"${build_dir}/kobox_backend_link_test"
+
+"${cc_bin}" \
+  -std=c11 \
+  -D_POSIX_C_SOURCE=200809L \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -I"${repo_root}/userland/filed/include" \
+  -I"${repo_root}/userland/filed/src" \
+  -I"${repo_root}/userland/libipc/include" \
+  "${repo_root}/userland/filed/src/exec/linux_lpr/script.c" \
+  "${repo_root}/userland/filed/tests/shebang_test.c" \
+  -o "${build_dir}/shebang_test"
+
+"${build_dir}/shebang_test"

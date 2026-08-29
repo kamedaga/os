@@ -1,7 +1,14 @@
-NAME="PachaOS"
-PRETTY_NAME="PachaOS"
-ID=pachaos
-VERSION_ID="0.1"
-VERSION="0.1"
-HOME_URL="https://example.invalid/pachaos"
-ANSI_COLOR="1;36"
+NAME="Alpine Linux"
+PRETTY_NAME="Alpine Linux v3.22 (PachaOS / Pacha microkernel)"
+ID=alpine
+VERSION_ID="3.22"
+VERSION="3.22 userland on PachaOS 0.1"
+
+VARIANT="PachaOS on Pacha microkernel"
+VARIANT_ID=pachaos
+IMAGE_ID=pachaos-alpine
+IMAGE_VERSION="0.1"
+
+PACHAOS_VERSION_ID="0.1"
+PACHAOS_KERNEL="pacha-microkernel"
+ALPINE_VERSION_ID="3.22"

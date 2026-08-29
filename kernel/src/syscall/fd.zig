@@ -28,7 +28,6 @@ fn protFromBits(bits: u64) ?kernel.VmaProt {
         .write = (bits & vm_abi.prot_write) != 0,
         .exec = (bits & vm_abi.prot_exec) != 0,
     };
-    if (prot.write and prot.exec) return null;
     return prot;
 }
 
@@ -58,11 +57,26 @@ fn pageAlignUp(value: u64) ?u64 {
     return (value + 4095) & ~@as(u64, 4095);
 }
 
+/// TEMPORARY (apk network-install fault): a refused allocation that says
+/// nothing turns every downstream failure into guesswork.  Rate-limited.
+var refusal_count: u64 = 0;
+
+fn reportRefusal(site: []const u8, err: kernel.KernelError) void {
+    refusal_count += 1;
+    if (refusal_count > 24 and refusal_count % 256 != 0) return;
+    kernel_log.writeFmt(
+        "mem: refused site={s} err={s} n={}\n",
+        .{ site, @errorName(err), refusal_count },
+    );
+}
+
 fn statusFromKernelError(err: kernel.KernelError) u64 {
-    return switch (err) {
+    const status: u64 = switch (err) {
         kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };
+    reportRefusal("kernel_error", err);
+    return status;
 }
 
 fn writeUserU64Bytes(h: anytype, proc: kernel.PrincipalId, out_va: u64, len: u64, value: u64) u64 {
@@ -123,6 +137,20 @@ fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) bool 
 fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool, ready_events: u64) bool {
     var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takePipeWaiters(pipe_ref, write_side, ready_events, wake_storage[0..]);
+    return wakeThreadTargets(h, wake_storage[0..wake_count]);
+}
+
+fn ipcChannelHandleForFd(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) ?kernel.IpcChannelHandle {
+    const view = state.fdPayloadWithRightsConst(proc, fd, .{}) orelse return null;
+    return switch (view.payload.*) {
+        .channel => |handle| handle,
+        else => null,
+    };
+}
+
+fn wakeIpcChannelCloseWaiters(h: anytype, state: *kernel.KernelState, handle: kernel.IpcChannelHandle) bool {
+    var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
+    const wake_count = state.takeIpcChannelPeerCloseWaiters(handle, wake_storage[0..]);
     return wakeThreadTargets(h, wake_storage[0..wake_count]);
 }
 
@@ -501,7 +529,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     if (nextCachedPollWakeDelta(state, proc, poll_items, now)) |delta| {
         if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
     }
-    if (h.block_current_thread_for_event(frame, true, block_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
+    if (h.block_current_thread_for_event(frame, true, 0, block_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
     unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
     return sc.syscall_err_not_ready;
 }
@@ -682,7 +710,6 @@ fn mapVmoFd(
     if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
-    if (flags.anonymous and prot.exec) return sc.syscall_err_invalid;
     if (flags.anonymous and vmo_offset != 0) return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
@@ -757,15 +784,45 @@ fn mapVmoFd(
         const max_prot = kernel.VmaProt{
             .read = true,
             .write = true,
-            // Anonymous module/JIT images are populated as RW and finalized
-            // as RX.  The syscall parser still rejects simultaneous W+X;
-            // this ceiling permits only the legitimate transition.
+            // The VM ABI represents read, write, and execute independently.
+            // Preserve that full ceiling so mmap/mprotect can implement the
+            // caller's requested permissions exactly.
             .exec = true,
             .pkey = flags.pkey,
         };
         _ = state.createAnonymousVmaWithPages(proc, base_va, aligned_size, prot, max_prot, flags, free_list) catch |err| {
             switch (err) {
-                kernel.KernelError.TableFull => return sc.syscall_err_alloc,
+                kernel.KernelError.TableFull => {
+                    // Reported to userspace as ENOMEM, so say which table ran
+                    // out rather than leaving the reader hunting for memory.
+                    reportRefusal("anonymous_vma", err);
+                    const capacity = state.anonymousMapCapacity(proc);
+                    const store = kernel.vmObjectBackingStoreStats();
+                    kernel_log.writeFmt(
+                        "  anon_full vmas={}/{} vmos={}/{} store_used={} store_capacity={} store_free={} reservations_free={}\n",
+                        .{
+                            capacity.vmas_active,
+                            capacity.vmas_capacity,
+                            capacity.vmos_active,
+                            capacity.vmos_capacity,
+                            store.used_entries,
+                            store.capacity,
+                            store.free_entries,
+                            user_vm.freeUserReservationSlotCount(proc),
+                        },
+                    );
+                    kernel_log.writeFmt(
+                        "  anon_full.shape anonymous={} single_page={} mapped_bytes={} span_lo={x} span_hi={x}\n",
+                        .{
+                            capacity.vmas_anonymous,
+                            capacity.vmas_single_page,
+                            capacity.vmas_bytes,
+                            capacity.vmas_lowest_va,
+                            capacity.vmas_highest_end_va,
+                        },
+                    );
+                    return sc.syscall_err_alloc;
+                },
                 else => return sc.syscall_err_invalid,
             }
         };
@@ -1085,13 +1142,18 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
         sc.syscall_fd_close => blk: {
-            const pipe_endpoint = state.pipeEndpointForFd(proc, @intCast(frame.rdi));
-            state.closeFdWithFreeList(proc, @intCast(frame.rdi), h.free_list) catch break :blk sc.syscall_err_invalid;
+            const fd: kernel.Fd = @intCast(frame.rdi);
+            const pipe_endpoint = state.pipeEndpointForFd(proc, fd);
+            const channel_handle = ipcChannelHandleForFd(state, proc, fd);
+            state.closeFdWithFreeList(proc, fd, h.free_list) catch break :blk sc.syscall_err_invalid;
             if (pipe_endpoint) |endpoint| {
                 const wake_side_write = !endpoint.write;
                 if (state.pipeReadyEventsForSide(endpoint.pipe, wake_side_write)) |ready_events| {
                     if (ready_events != 0 and !wakePipeWaiters(h, state, endpoint.pipe, wake_side_write, ready_events)) break :blk sc.syscall_err_invalid;
                 }
+            }
+            if (channel_handle) |handle| {
+                if (!wakeIpcChannelCloseWaiters(h, state, handle)) break :blk sc.syscall_err_invalid;
             }
             break :blk sc.syscall_ok;
         },
@@ -1121,14 +1183,18 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_timerfd_create => timerfdCreate(state, proc, frame),
         sc.syscall_timerfd_settime => timerfdSettime(h, state, proc, frame),
         sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),
-        sc.syscall_vmo_create => state.createAnonymousVmoFdWithPages(
-            proc,
-            frame.rdi,
-            defaultVmoRights(kernel.fdRightsFromBits(frame.rsi)),
-            kernel.fdFlagsFromBits(@truncate(frame.rdx)),
-            first_dynamic_fd,
-            h.free_list,
-        ) catch |err| statusFromKernelError(err),
+        sc.syscall_vmo_create => blk: {
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            break :blk state.createAnonymousVmoFdWithPages(
+                proc,
+                frame.rdi,
+                defaultVmoRights(kernel.fdRightsFromBits(frame.rsi)),
+                kernel.fdFlagsFromBits(@truncate(frame.rdx)),
+                first_dynamic_fd,
+                h.free_list,
+            ) catch |err| statusFromKernelError(err);
+        },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {

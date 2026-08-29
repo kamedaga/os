@@ -760,11 +760,19 @@ static long call_handle_ioctl(
     termd_linux_owner_context_t context;
     int has_context = enter_handle_function_context(handle, handle->ioctl, &context);
     drain_linux_tty_work();
-    const long result = ((termd_linux_fops_ioctl_fn)handle->ioctl)(
+    long result = ((termd_linux_fops_ioctl_fn)handle->ioctl)(
         handle->file,
         request,
         (unsigned long)(uintptr_t)arg);
     drain_linux_tty_work();
+    /* ERESTARTSYS is private to the embedded Linux syscall boundary.  Letting
+     * -512 escape termd collides with LPR's own restart sentinel and makes a
+     * foreground PTY ioctl spin forever.  Match the read/write path: consume
+     * the embedded task's pending bit and expose an ordinary EINTR. */
+    if (result == -(long)TERMD_LINUX_ERESTARTSYS) {
+        kb_clear_current_signal_pending();
+        result = -(long)TERMD_LINUX_EINTR;
+    }
     if (has_context) {
         leave_owner_context(&context);
     }

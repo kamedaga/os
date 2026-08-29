@@ -425,16 +425,25 @@ pub fn writeProtectPresentUserPagesForForkCow(principal: kernel.PrincipalId, va_
 
     var changed = false;
     var offset: u64 = 0;
-    while (offset < size_bytes) : (offset += 4096) {
+    while (offset < size_bytes) {
         const va = va_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
-        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
-        const old_entry = pt_page[index.pt];
-        if ((old_entry & h.page_present) == 0 or (old_entry & h.page_user) == 0) continue;
-        if ((old_entry & h.page_rw) == 0) continue;
-        pt_page[index.pt] = old_entry & ~h.page_rw;
-        changed = true;
+        // All entries until the next 2-MiB boundary share one PT slot.  The
+        // former per-page lookup rescanned as many as 512 PT descriptors for
+        // every page of large brk arenas during fork.
+        const remaining_pages: usize = @intCast((size_bytes - offset) / 4096);
+        const segment_pages = @min(remaining_pages, h.page_entries - index.pt);
+        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
+            const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+            for (pt_page[index.pt .. index.pt + segment_pages]) |*entry| {
+                const old_entry = entry.*;
+                if ((old_entry & h.page_present) == 0 or (old_entry & h.page_user) == 0) continue;
+                if ((old_entry & h.page_rw) == 0) continue;
+                entry.* = old_entry & ~h.page_rw;
+                changed = true;
+            }
+        }
+        offset += @as(u64, @intCast(segment_pages)) * 4096;
     }
     if (changed) {
         h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_bytes));
@@ -934,7 +943,6 @@ fn ptePaddr(entry: u64) u64 {
 
 fn pteFlagsForProt(h: Hooks, prot: kernel.MapProt) ?u64 {
     if (!prot.read) return null;
-    if (prot.write and prot.exec) return null;
     return h.page_present |
         h.page_user |
         (if (prot.write) h.page_rw else 0) |

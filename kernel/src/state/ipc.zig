@@ -108,17 +108,11 @@ const EndpointTable = types.EndpointTable;
 const PublishedEndpointTable = types.PublishedEndpointTable;
 const max_vmo_backing_pages = types.max_vmo_backing_pages;
 const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
-const max_vmo_backing_store_free_ranges = types.max_vmo_backing_store_free_ranges;
-const VmoBackingStoreFreeRange = types.VmoBackingStoreFreeRange;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
 const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
 const vmo_backing_page_store = types.vmo_backing_page_store;
-const vmo_backing_page_store_next = types.vmo_backing_page_store_next;
-const empty_vmo_backing_page_store_free_ranges = types.empty_vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_ranges = types.vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_range_len = types.vmo_backing_page_store_free_range_len;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
 const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
 const empty_fd_tables_extra = types.empty_fd_tables_extra;
@@ -131,9 +125,6 @@ const fdFlagsToBits = types.fdFlagsToBits;
 const fdRightsFromBits = types.fdRightsFromBits;
 const fdRightsToBits = types.fdRightsToBits;
 const isFdRightsSubset = types.isFdRightsSubset;
-const vmObjectBackingFreePageCount = types.vmObjectBackingFreePageCount;
-const removeVmoBackingFreeRange = types.removeVmoBackingFreeRange;
-const insertVmoBackingFreeRange = types.insertVmoBackingFreeRange;
 const allocEmptyVmoBackingPageStore = types.allocEmptyVmoBackingPageStore;
 const vmoBackingPageStorePaddr = types.vmoBackingPageStorePaddr;
 const setVmoBackingPageStorePaddr = types.setVmoBackingPageStorePaddr;
@@ -591,14 +582,20 @@ pub fn registerIpcReadableWaiterForFd(
     thread_generation: u32,
 ) KernelError!void {
     const fd_abi = @import("kernel_abi_root").fd_abi;
-    if ((requested_events & fd_abi.event_readable) == 0) return;
     if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
     const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
-    if (!entry.rights.recv or (!entry.rights.wait and !entry.rights.poll)) return;
+    if (!entry.rights.wait and !entry.rights.poll) return;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+    var wait_events = requested_events & switch (slot.payload) {
+        .channel => fd_abi.event_readable | fd_abi.event_hangup,
+        .endpoint, .reply => fd_abi.event_readable,
+        else => return,
+    };
+    if (!entry.rights.recv) wait_events &= ~fd_abi.event_readable;
+    if (wait_events == 0) return;
     const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
     const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, 0, thread_index, thread_generation);
+    try waiters.register(key, owner, pollfd_va, 0, 0, 0, wait_events, 0, thread_index, thread_generation);
 }
 
 pub fn registerIpcRecvCompletionWaiterForFd(
@@ -630,10 +627,16 @@ pub fn unregisterIpcReadableWaiterForFd(
     thread_generation: u32,
 ) void {
     const fd_abi = @import("kernel_abi_root").fd_abi;
-    if ((requested_events & fd_abi.event_readable) == 0) return;
     const entry = self.fdEntryConst(owner, fd) orelse return;
-    if (!entry.rights.recv or (!entry.rights.wait and !entry.rights.poll)) return;
+    if (!entry.rights.wait and !entry.rights.poll) return;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return;
+    var wait_events = requested_events & switch (slot.payload) {
+        .channel => fd_abi.event_readable | fd_abi.event_hangup,
+        .endpoint, .reply => fd_abi.event_readable,
+        else => return,
+    };
+    if (!entry.rights.recv) wait_events &= ~fd_abi.event_readable;
+    if (wait_events == 0) return;
     const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
     waiters.unregister(thread_index, thread_generation);
 }

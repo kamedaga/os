@@ -2,6 +2,11 @@
 
 #define LPR_LINUX_EMSGSIZE 90
 
+enum {
+    LPR_TRANSFER_AF_UNIX = 1u,
+    LPR_TRANSFER_SOCK_STREAM = 1u,
+};
+
 static int64_t lpr_ops_filed_close(void *state)
 {
     const lpr_filed_backend_t *filed = state;
@@ -318,6 +323,50 @@ int lpr_fd_transfer_prepare(
         *out_capability_count = 1;
         return 0;
     }
+    if (pin->ops_id == LPR_FD_OPS_SOCKET) {
+        const lpr_socket_backend_t *socket = pin->state;
+        /* Glycin passes its image input as one end of an AF_UNIX stream
+         * socket.  Keep this support deliberately narrower than arbitrary
+         * socket migration: the receiver can reconstruct every relevant
+         * property of a connected Unix stream without inventing an ABI for
+         * TCP, netlink, or sequenced-packet state. */
+        if (!socket->active || socket->handle == 0 ||
+            socket->domain != LPR_TRANSFER_AF_UNIX ||
+            socket->type != LPR_TRANSFER_SOCK_STREAM ||
+            !socket->connected || socket->protocol != 0 ||
+            socket->wait_fd.raw < 16)
+            return -LPR_LINUX_EOPNOTSUPP;
+        if (capability_fds == 0 || capability_capacity < 2)
+            return -LPR_LINUX_EMSGSIZE;
+
+        const int wait_fd =
+            lpr_transfer_duplicate_capability(socket->wait_fd.raw);
+        if (wait_fd < 0) return wait_fd;
+        int lease_fd = -1;
+        int remote_lease_fd = -1;
+        const int pair_status =
+            lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        if (pair_status != 0) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+            return pair_status;
+        }
+        const int64_t status = lpr_netd_transfer_dup_handle(
+            socket->handle, remote_lease_fd);
+        if (status != 0) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)remote_lease_fd);
+            return (int)status;
+        }
+        item->transfer_token = socket->handle;
+        item->fd_flags = socket->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count = 2;
+        capability_fds[0] = wait_fd;
+        capability_fds[1] = lease_fd;
+        *out_capability_count = 2;
+        return 0;
+    }
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
@@ -394,6 +443,14 @@ int lpr_fd_transfer_import_batch(
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
+        } else if (item->provider_id == LPR_FD_OPS_SOCKET) {
+            if (item->capability_count != 2 ||
+                item_capabilities[0] < 16 || item_capabilities[1] < 16 ||
+                item->transfer_token == 0)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
         } else {
             status = -LPR_LINUX_EOPNOTSUPP;
             break;
@@ -429,6 +486,20 @@ int lpr_fd_transfer_import_batch(
             sync_file->active = 1;
             sync_file->flags = (uint32_t)linux_flags;
             sync_file->wait_fd.raw = item_capabilities[0];
+        } else if (item->provider_id == LPR_FD_OPS_SOCKET) {
+            lpr_socket_backend_t *socket = states[prepared_count];
+            socket->active = 1;
+            socket->type = LPR_TRANSFER_SOCK_STREAM;
+            socket->connected = 1;
+            socket->domain = LPR_TRANSFER_AF_UNIX;
+            socket->protocol = 0;
+            socket->flags = (uint32_t)linux_flags;
+            socket->sndbuf = 256u * 1024u;
+            socket->rcvbuf = 256u * 1024u;
+            socket->handle = handle;
+            socket->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
+            socket->wait_fd.raw = item_capabilities[0];
+            socket->lease_fd.raw = item_capabilities[1];
         } else {
             lpr_drm_backend_t *drm = states[prepared_count];
             drm->active = 1;
@@ -644,6 +715,58 @@ int64_t lpr_linux_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf)
 {
     return lpr_fd_dispatch_io(fd, statbuf, 0, 5);
+}
+
+static int64_t lpr_filed_statfs_handle(uint64_t handle, uint64_t statfsbuf)
+{
+    if (statfsbuf == 0) return -LPR_LINUX_EFAULT;
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+
+    filed_statfs_t *request = (filed_statfs_t *)page;
+    lpr_memset(request, 0, sizeof(*request));
+    request->handle = handle;
+    uint64_t ignored = 0;
+    const int64_t status = lpr_filed_call(
+        FILED_OP_VFS_STATFS,
+        page_fd,
+        0,
+        &ignored);
+    if (status == 0) {
+        lpr_linux_statfs_t *result =
+            (lpr_linux_statfs_t *)(uintptr_t)statfsbuf;
+        lpr_memcpy(result, &request->type, sizeof(*result));
+    }
+    lpr_destroy_wire_page(page_fd, page);
+    return status;
+}
+
+int64_t lpr_linux_fstatfs(uint64_t fd, uint64_t statfsbuf)
+{
+    if (statfsbuf == 0) return -LPR_LINUX_EFAULT;
+    if (!lpr_fd_is_filed(fd)) return -LPR_LINUX_EBADF;
+    const lpr_filed_backend_t *file = lpr_filed_backend(fd);
+    if (file == 0 || file->handle == 0) return -LPR_LINUX_EBADF;
+    return lpr_filed_statfs_handle(file->handle, statfsbuf);
+}
+
+int64_t lpr_linux_statfs(uint64_t path_raw, uint64_t statfsbuf)
+{
+    const char *path = (const char *)(uintptr_t)path_raw;
+    if (path == 0 || statfsbuf == 0) return -LPR_LINUX_EFAULT;
+    uint64_t handle = 0;
+    int64_t status = lpr_filed_open_handle_at(
+        (uint64_t)(int64_t)LPR_LINUX_AT_FDCWD,
+        path,
+        LPR_LINUX_O_RDONLY | LPR_LINUX_O_CLOEXEC,
+        0,
+        &handle,
+        0);
+    if (status != 0) return status;
+    status = lpr_filed_statfs_handle(handle, statfsbuf);
+    const int64_t close_status = lpr_filed_close_handle(handle);
+    return status != 0 ? status : close_status;
 }
 
 int64_t lpr_fd_dispatch_mmap(

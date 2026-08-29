@@ -6,6 +6,7 @@
 
 static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
 {
+    filed_dispatch_log_state_checkpoint(runtime, "metrics_dump");
     filed_dump_dispatch_metrics(runtime);
     filed_dump_cache_metrics(runtime);
     filed_exec_linux_lpr_dump_metrics();
@@ -42,11 +43,13 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
         (unsigned long long)storage_trace.readahead_fallback_calls);
 #if defined(KOBOX_STORAGE_PROFILE) && KOBOX_STORAGE_PROFILE
     kb_fs_read_profile_t fs_profile;
+    kb_fs_hotpath_profile_t fs_hotpath_profile;
     kb_linux_block_profile_t block_profile;
     kb_pachaos_capsule_dma_profile_t dma_profile;
     kb_pachaos_capsule_irq_profile_t irq_profile;
     kb_subsystem_dma_window_profile_t dma_window_profile;
     kb_fs_read_profile_snapshot(&fs_profile);
+    kb_fs_hotpath_profile_snapshot(&fs_hotpath_profile);
     kb_linux_block_profile_snapshot(&block_profile);
     kb_pachaos_capsule_dma_profile_snapshot(&dma_profile);
     kb_pachaos_capsule_irq_profile_snapshot(&irq_profile);
@@ -54,7 +57,11 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
     fprintf(stderr,
         "FILED_STORAGE_PROFILE scope=fs calls=%llu bytes=%llu total_cycles=%llu "
         "extent_calls=%llu extent_cycles=%llu device_calls=%llu device_cycles=%llu "
-        "overlay_calls=%llu overlay_cycles=%llu partial_copy_calls=%llu partial_copy_cycles=%llu\n",
+        "overlay_calls=%llu overlay_cycles=%llu partial_copy_calls=%llu partial_copy_cycles=%llu "
+        "cache_folio_calls=%llu cache_folio_cycles=%llu "
+        "copy_to_iter_calls=%llu copy_to_iter_cycles=%llu "
+        "folio_put_calls=%llu folio_put_cycles=%llu "
+        "atime_calls=%llu atime_cycles=%llu\n",
         (unsigned long long)fs_profile.calls,
         (unsigned long long)fs_profile.bytes,
         (unsigned long long)fs_profile.total_cycles,
@@ -65,7 +72,41 @@ static void filed_dispatch_dump_metrics(filed_runtime_t *runtime)
         (unsigned long long)fs_profile.overlay_calls,
         (unsigned long long)fs_profile.overlay_cycles,
         (unsigned long long)fs_profile.partial_copy_calls,
-        (unsigned long long)fs_profile.partial_copy_cycles);
+        (unsigned long long)fs_profile.partial_copy_cycles,
+        (unsigned long long)fs_profile.cache_folio_calls,
+        (unsigned long long)fs_profile.cache_folio_cycles,
+        (unsigned long long)fs_profile.copy_to_iter_calls,
+        (unsigned long long)fs_profile.copy_to_iter_cycles,
+        (unsigned long long)fs_profile.folio_put_calls,
+        (unsigned long long)fs_profile.folio_put_cycles,
+        (unsigned long long)fs_profile.atime_calls,
+        (unsigned long long)fs_profile.atime_cycles);
+    fprintf(stderr,
+        "FILED_STORAGE_PROFILE scope=fs_hotpath "
+        "xrefresh_calls=%llu xrefresh_cycles=%llu "
+        "xload_calls=%llu xload_cycles=%llu "
+        "folio_calls=%llu folio_cycles=%llu "
+        "buffer_calls=%llu buffer_cycles=%llu "
+        "inode_find_calls=%llu inode_find_cycles=%llu "
+        "inode_claim_calls=%llu inode_claim_cycles=%llu "
+        "dentry_find_calls=%llu dentry_find_cycles=%llu "
+        "dentry_claim_calls=%llu dentry_claim_cycles=%llu\n",
+        (unsigned long long)fs_hotpath_profile.xarray_refresh_calls,
+        (unsigned long long)fs_hotpath_profile.xarray_refresh_cycles,
+        (unsigned long long)fs_hotpath_profile.xarray_load_calls,
+        (unsigned long long)fs_hotpath_profile.xarray_load_cycles,
+        (unsigned long long)fs_hotpath_profile.folio_lookup_calls,
+        (unsigned long long)fs_hotpath_profile.folio_lookup_cycles,
+        (unsigned long long)fs_hotpath_profile.buffer_lookup_calls,
+        (unsigned long long)fs_hotpath_profile.buffer_lookup_cycles,
+        (unsigned long long)fs_hotpath_profile.inode_find_calls,
+        (unsigned long long)fs_hotpath_profile.inode_find_cycles,
+        (unsigned long long)fs_hotpath_profile.inode_claim_calls,
+        (unsigned long long)fs_hotpath_profile.inode_claim_cycles,
+        (unsigned long long)fs_hotpath_profile.dentry_find_calls,
+        (unsigned long long)fs_hotpath_profile.dentry_find_cycles,
+        (unsigned long long)fs_hotpath_profile.dentry_claim_calls,
+        (unsigned long long)fs_hotpath_profile.dentry_claim_cycles);
     fprintf(stderr,
         "FILED_STORAGE_PROFILE scope=block bytes=%llu "
         "alloc_calls=%llu alloc_cycles=%llu map_calls=%llu map_cycles=%llu "
@@ -269,6 +310,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_validate_open_cache_page(runtime, page);
     case FILED_OP_VFS_STAT:
         return filed_dispatch_stat_page(runtime, page);
+    case FILED_OP_VFS_STATFS:
+        return filed_dispatch_statfs_page(runtime, page);
     case FILED_OP_VFS_UTIMENS:
         return filed_dispatch_utimens_page(runtime, page);
     case FILED_OP_VFS_CHMOD:
@@ -741,6 +784,16 @@ static filed_route_result_t filed_dispatch_client_vfs(
             route.result = page_result.result;
         }
         break;
+    case FILED_OP_VFS_STATFS:
+        if (header->payload_size < sizeof(filed_statfs_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result =
+                filed_dispatch_statfs_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
     case FILED_OP_VFS_READ:
         if (header->payload_size < sizeof(filed_io_t)) {
             route.status = -22;
@@ -1142,6 +1195,7 @@ static int filed_dispatch_client(
     case FILED_OP_VFS_OPENAT:
     case FILED_OP_VFS_CLOSE:
     case FILED_OP_VFS_STAT:
+    case FILED_OP_VFS_STATFS:
     case FILED_OP_VFS_READ:
     case FILED_OP_VFS_PREAD:
     case FILED_OP_VFS_WRITE:

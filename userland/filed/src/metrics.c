@@ -47,6 +47,7 @@ const char *filed_op_name(uint64_t op)
     case FILED_OP_VFS_ROOT_GETDENTS: return "root_getdents";
     case FILED_OP_VFS_OPENAT: return "openat";
     case FILED_OP_VFS_STAT: return "stat";
+    case FILED_OP_VFS_STATFS: return "statfs";
     case FILED_OP_VFS_UTIMENS: return "utimens";
     case FILED_OP_VFS_CHMOD: return "chmod";
     case FILED_OP_VFS_PREAD: return "pread";

@@ -146,10 +146,22 @@ int64_t lpr_wait_graph_add_fd(
             PACHA_FD_EVENT_READABLE) : 0;
     if (lpr_linux_epoll_fd_active(fd))
         return lpr_epoll_add_wait_graph(fd, graph);
-    if (lpr_linux_socket_fd_active(fd))
+    if (lpr_linux_socket_fd_active(fd)) {
+        const int native_fd = lpr_linux_socket_native_wait_fd(fd);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (0 && __atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
+            __atomic_load_n(
+                &lpr_glycin_diag_socket_fd, __ATOMIC_ACQUIRE) == (uint32_t)fd)
+        {
+            lpr_glycin_diag_event(
+                "wait.add.socket", fd, (uint64_t)(uint32_t)native_fd,
+                events, graph->leaf_count);
+        }
+#endif
         return lpr_wait_graph_add_leaf(
-            graph, lpr_linux_socket_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
+            graph, native_fd, PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_NATIVE, (uint32_t)fd);
+    }
     if (lpr_linux_timerfd_active(fd)) {
         if ((events & 0x0001u) == 0)
             return 0;
@@ -171,6 +183,16 @@ int64_t lpr_wait_graph_add_fd(
     }
     if (lpr_linux_eventfd_active(fd)) {
         const int native_fd = lpr_eventfd_native_wait_fd(fd);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+            const lpr_event_backend_t *event = lpr_event_backend(fd);
+            lpr_glycin_diag_event(
+                "event.wait.add", fd,
+                event != 0 ? event->counter : 0,
+                event != 0 ? event->notify_pending : 0,
+                native_fd);
+        }
+#endif
         return lpr_wait_graph_add_leaf(
             graph, native_fd, PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_EVENT, (uint32_t)fd);
@@ -240,6 +262,21 @@ int64_t lpr_wait_graph_block(
     const lpr_wait_deadline_t *deadline)
 {
     if (graph == 0) return -LPR_LINUX_EFAULT;
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    uint32_t diag_watch_index = UINT32_MAX;
+    const uint32_t diag_watch_fd = __atomic_load_n(
+        &lpr_glycin_diag_socket_fd, __ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
+        diag_watch_fd != 0u)
+    {
+        for (uint32_t i = 0; i < graph->leaf_count; ++i) {
+            if (graph->logical_fds[i] == diag_watch_fd) {
+                diag_watch_index = i;
+                break;
+            }
+        }
+    }
+#endif
     uint64_t wait_ns = UINT64_MAX;
     const int64_t deadline_status =
         lpr_wait_deadline_remaining(deadline, &wait_ns);
@@ -253,6 +290,17 @@ int64_t lpr_wait_graph_block(
         const int64_t now_status = lpr_wait_now_ns(&wait_started_ns);
         if (now_status != 0) return now_status;
     }
+
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (0 && diag_watch_index != UINT32_MAX) {
+        lpr_glycin_diag_event(
+            "wait.block.enter",
+            diag_watch_fd,
+            (uint64_t)(uint32_t)graph->leaves[diag_watch_index].fd,
+            graph->leaf_count,
+            wait_ns == UINT64_MAX ? -1 : (int64_t)wait_ns);
+    }
+#endif
 
     int64_t status = 0;
     if (graph->leaf_count == 0) {
@@ -294,21 +342,51 @@ int64_t lpr_wait_graph_block(
             0);
     }
 
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (0 && diag_watch_index != UINT32_MAX) {
+        lpr_glycin_diag_event(
+            "wait.block.exit",
+            diag_watch_fd,
+            graph->leaves[diag_watch_index].events,
+            graph->leaves[diag_watch_index].revents,
+            status);
+    }
+#endif
+
     if (status >= 0) {
         for (uint32_t i = 0; i < graph->leaf_count; ++i) {
-            if ((graph->leaves[i].revents & PACHA_FD_EVENT_READABLE) == 0)
+            if ((graph->leaves[i].revents &
+                 (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP)) == 0)
                 continue;
             if (graph->drain_modes[i] == LPR_WAIT_DRAIN_EVENT)
                 lpr_eventfd_drain_wait(graph->logical_fds[i]);
             else if (graph->drain_modes[i] == LPR_WAIT_DRAIN_NATIVE) {
                 if (graph->logical_fds[i] != UINT32_MAX &&
                     lpr_linux_socket_fd_active(graph->logical_fds[i])) {
-                    lpr_linux_socket_mark_readable(graph->logical_fds[i]);
+                    const uint64_t events =
+                        lpr_native_wait_drain_events(graph->leaves[i].fd);
+                    if (events != 0)
+                        lpr_linux_socket_mark_events(
+                            graph->logical_fds[i], events);
+                    else
+                        lpr_linux_socket_mark_readable(graph->logical_fds[i]);
+                } else {
+                    lpr_native_wait_drain(graph->leaves[i].fd);
                 }
-                lpr_native_wait_drain(graph->leaves[i].fd);
             }
         }
     }
+
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (0 && diag_watch_index != UINT32_MAX) {
+        lpr_glycin_diag_event(
+            "wait.block.drained",
+            diag_watch_fd,
+            graph->leaves[diag_watch_index].events,
+            graph->leaves[diag_watch_index].revents,
+            status);
+    }
+#endif
 
     if (lpr_linux_pump_tty_signals())
         return LPR_WAIT_RESTART_SYSCALL;

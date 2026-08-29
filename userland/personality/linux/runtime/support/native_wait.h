@@ -31,14 +31,28 @@ static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
     return 0;
 }
 
+static inline uint64_t lpr_native_wait_drain_events(int fd)
+{
+    if (fd < 16) return 0;
+    uint64_t events = 0;
+    /* NetD emits at most one queued message per readiness bit.  Drain all
+     * currently coalesced bits so the Linux-side cache and acknowledgement
+     * describe the same observation. */
+    for (unsigned i = 0; i < 8; ++i) {
+        struct pacha_ipc_msg message = {0};
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_RECV,
+            (uint64_t)(uint32_t)fd,
+            (uint64_t)(uintptr_t)&message);
+        if (status != 0) break;
+        events |= message.word0;
+    }
+    return events;
+}
+
 static inline void lpr_native_wait_drain(int fd)
 {
-    if (fd < 16) return;
-    struct pacha_ipc_msg message = {0};
-    (void)lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_RECV,
-        (uint64_t)(uint32_t)fd,
-        (uint64_t)(uintptr_t)&message);
+    (void)lpr_native_wait_drain_events(fd);
 }
 
 static inline int64_t lpr_native_ipc_recv_wait(

@@ -30,6 +30,16 @@ enum {
     LPR_FD_RIGHT_DUP = 1u << 5,
 
     LPR_BACKEND_TRANSFER_LEASE = 1u << 7,
+
+    /*
+     * Keep the name used to open a filed-backed OFD.  Linux exposes this
+     * through /proc/self/fd/N; gdk-pixbuf 2.44 uses that link to turn the
+     * FILE * passed to an image loader back into a GFile.
+     *
+     * Backend objects already occupy fixed 256-byte slab slots, so using the
+     * otherwise empty tail does not increase the slab footprint.
+     */
+    LPR_FILED_OPEN_PATH_BYTES = 192u,
 };
 
 typedef uint32_t lpr_linux_fd_t;
@@ -50,6 +60,7 @@ typedef struct lpr_filed_backend {
     uint32_t reserved2;
     uint64_t stat_size;
     uint64_t object_generation;
+    char open_path[LPR_FILED_OPEN_PATH_BYTES];
 } lpr_filed_backend_t;
 
 typedef struct lpr_pipe_backend {
@@ -162,7 +173,7 @@ typedef struct lpr_socket_backend {
     uint8_t connected;
     uint8_t connecting;
     uint8_t domain;
-    uint8_t reserved_socket0;
+    uint8_t notify_ack;
     uint16_t protocol;
     uint32_t flags;
     uint32_t sndbuf;

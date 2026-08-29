@@ -126,6 +126,54 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     h.write("  VMA_LOOKUP=");
     h.write(if (vma_mapping != null) "found(native)\n" else "none(native)\n");
 
+    if (h.state.vmaEntryForVaConst(principal, fault_page_va)) |fault_entry| {
+        h.write("  FAULT_VMA_START=");
+        h.write_hex_raw(fault_entry.start_va);
+        h.write("\n  FAULT_VMA_SIZE=");
+        h.write_hex_raw(fault_entry.size_bytes);
+        h.write("\n  FAULT_VMA_PRIVATE=");
+        h.write_bool01(fault_entry.flags.private);
+        h.write("\n  FAULT_VMA_ANONYMOUS=");
+        h.write_bool01(fault_entry.flags.anonymous);
+        h.write("\n  FAULT_VMA_FORK_COW=");
+        h.write_bool01(fault_entry.flags.fork_cow);
+        h.write("\n  FAULT_VMA_COW_TABLE=");
+        h.write(if (fault_entry.cow_table.isNull()) "none\n" else "present\n");
+    }
+
+    // The faulting address says what was touched; the mapping that holds the
+    // instruction says which image was running.  Without it a report gives an
+    // instruction pointer nobody can resolve to a file.
+    if (h.state.vmaEntryForVaConst(principal, frame.rip)) |rip_entry| {
+        h.write("  RIP_VMA_START=");
+        h.write_hex_raw(rip_entry.start_va);
+        h.write("\n  RIP_VMA_SIZE=");
+        h.write_hex_raw(rip_entry.size_bytes);
+        h.write("\n");
+    } else {
+        h.write("  RIP_VMA=none\n");
+    }
+
+    // TEMPORARY (apk network-install fault): the instruction itself, so the
+    // faulting store can be decoded without first guessing which file the
+    // address belongs to.
+    {
+        const rip_page = frame.rip & ~@as(u64, 4095);
+        const rip_offset = frame.rip & 4095;
+        if (rip_offset + 16 <= 4096) {
+            if (user_vm.lookupUserMappedPaddrForVa(principal, rip_page)) |rip_paddr| {
+                const words: *const [2]u64 = @ptrFromInt(rip_paddr + rip_offset);
+                h.write("  RIP_BYTES0=");
+                h.write_hex_raw(words[0]);
+                h.write("\n  RIP_BYTES1=");
+                h.write_hex_raw(words[1]);
+                h.write("\n");
+            } else {
+                h.write("  RIP_BYTES=unmapped\n");
+            }
+        }
+    }
+
     const mapped_paddr = user_vm.lookupUserMappedPaddrForVa(principal, fault_page_va) orelse {
         h.write("  MAPPED_PADDR=none\n");
         return;

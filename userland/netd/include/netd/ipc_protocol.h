@@ -31,6 +31,7 @@ enum {
     NETD_SOCK_STREAM = 1,
     NETD_SOCK_DGRAM = 2,
     NETD_SOCK_RAW = 3,
+    NETD_SOCK_SEQPACKET = 5,
     NETD_IPPROTO_TCP = 6,
     NETD_IPPROTO_UDP = 17,
     NETD_NETLINK_KOBJECT_UEVENT = 15,
@@ -154,7 +155,7 @@ typedef struct netd_accept {
     int32_t pid;
     uint32_t uid;
     uint32_t gid;
-    uint32_t reserved0;
+    uint32_t notify_ack;
 } netd_accept_t;
 
 typedef struct netd_transfer_occurrence {
@@ -175,7 +176,10 @@ typedef struct netd_io {
     uint64_t transaction_id;
     uint32_t transfer_count;
     uint32_t capability_count;
-    uint64_t reserved0;
+    /* Readiness bits obtained from this socket's native notification
+     * channel.  This acknowledges exactly the coalesced edges consumed by
+     * the caller without requiring a separate NETD_OP_POLL round trip. */
+    uint64_t notify_ack;
     netd_transfer_occurrence_t transfers[NETD_TRANSFER_MAX_ITEMS];
     uint8_t data[NETD_IO_BYTES];
 } netd_io_t;

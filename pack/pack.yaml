@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -95,6 +95,14 @@ apps:
     file: "userland/fixtures/base/dev-null.node"
     out: "DEVNULL.NODE"
     rootfs: "/dev/null"
+  linux_proc_overflowuid:
+    file: "userland/fixtures/base/proc-overflowuid"
+    out: "PROCOVUID"
+    rootfs: "/proc/sys/kernel/overflowuid"
+  linux_proc_overflowgid:
+    file: "userland/fixtures/base/proc-overflowgid"
+    out: "PROCOVGID"
+    rootfs: "/proc/sys/kernel/overflowgid"
   virtio_input_sysfs:
     file:
       path: ".artifacts/userland-fixtures/virtio-input-sysfs"
@@ -206,6 +214,57 @@ apps:
       path: "tests/fixtures/phase4_gui_benchmark.sh"
     out: "P4GUIBEN.SH"
     rootfs: "/cmd/phase4_gui_benchmark.sh"
+  gui_startup_benchmark_script:
+    file:
+      path: "tests/fixtures/gui_startup_benchmark.sh"
+    out: "GUISTART.SH"
+    rootfs: "/cmd/gui_startup_benchmark.sh"
+  key_launch_phase_benchmark_script:
+    file:
+      path: "tests/fixtures/key_launch_phase_benchmark.sh"
+    out: "KEYPHASE.SH"
+    rootfs: "/cmd/key_launch_phase_benchmark.sh"
+  key_launch_probe_script:
+    file:
+      path: "tests/fixtures/key_launch_probe.sh"
+    out: "KEYPROBE.SH"
+    rootfs: "/cmd/key_launch_probe.sh"
+  lpr_tsc_calibrate:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_tsc_calibrate.elf"
+      rebuild: ["bash", "tools/build_wsl_sway_launcher.sh", ".artifacts/userland-fixtures/lpr_tsc_calibrate.elf", "userland/fixtures/src/wsl_musl/lpr_tsc_calibrate.c"]
+      input:
+        - "tools/build_wsl_sway_launcher.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_tsc_calibrate.c"
+    out: "LPRTSC.ELF"
+    rootfs: "/cmd/lpr_tsc_calibrate.elf"
+  lpr_key_launch_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_key_launch_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_sway_launcher.sh", ".artifacts/userland-fixtures/lpr_key_launch_probe.elf", "userland/fixtures/src/wsl_musl/lpr_key_launch_probe.c"]
+      input:
+        - "tools/build_wsl_sway_launcher.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_key_launch_probe.c"
+    out: "LPRKEYPR.ELF"
+    rootfs: "/cmd/lpr_key_launch_probe.elf"
+  lpr_glycin_app_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_glycin_app_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_glycin_app_probe.sh"]
+      input:
+        - "tools/build_wsl_glycin_app_probe.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_glycin_app_probe.c"
+    out: "LPRGLYAP.ELF"
+    rootfs: "/cmd/lpr_glycin_app_probe.elf"
+  lpr_glycin_timing_trace:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_glycin_timing_trace.so"
+      rebuild: ["bash", "tools/build_wsl_glycin_timing_trace.sh"]
+      input:
+        - "tools/build_wsl_glycin_timing_trace.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_glycin_timing_trace.c"
+    out: "LPRGLYTM.SO"
+    rootfs: "/cmd/lpr_glycin_timing_trace.so"
   phase4_gui_benchmark_config:
     file:
       path: "tests/fixtures/phase4_gui_benchmark.conf"
@@ -236,6 +295,11 @@ apps:
       path: "tests/fixtures/ext4_apk_reproducer.sh"
     out: "EXT4APK.SH"
     rootfs: "/cmd/ext4_apk_reproducer.sh"
+  ext4_hardlink_smoke_script:
+    file:
+      path: "tests/fixtures/ext4_hardlink_smoke.sh"
+    out: "EXT4LNK.SH"
+    rootfs: "/cmd/ext4_hardlink_smoke.sh"
   lpr_bash_file_churn_probe_script:
     file:
       path: "tests/fixtures/lpr_bash_file_churn_probe.sh"
@@ -1027,6 +1091,20 @@ apps:
     file: "tests/fixtures/lpr_pthread_smoke.sh"
     out: "LPRPTHRD.SH"
     rootfs: "/cmd/lpr_pthread_smoke.sh"
+  lpr_futex_pingpong_bench:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_futex_pingpong_bench.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_futex_pingpong_bench", "userland/fixtures/src/wsl_musl/lpr_futex_pingpong_bench.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_futex_pingpong_bench.c"
+    out: "LPRFTXBN.ELF"
+    rootfs: "/cmd/lpr_futex_pingpong_bench.elf"
+  lpr_futex_pingpong_bench_script:
+    file: "tests/fixtures/lpr_futex_pingpong_bench.sh"
+    out: "LPRFTXBN.SH"
+    rootfs: "/cmd/lpr_futex_pingpong_bench.sh"
   lpr_shared_mapping_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_shared_mapping_smoke.static.elf"
@@ -1444,6 +1522,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/filed/include"
         - "userland/libfiled_client"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
@@ -1467,6 +1546,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/filed/include"
         - "userland/libfiled_client"
         - "_kobox/include"
         - "_kobox/src"
@@ -1490,6 +1570,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/filed/include"
         - "userland/libfiled_client"
         - "_kobox/include"
         - "_kobox/src"

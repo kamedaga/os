@@ -55,6 +55,7 @@ typedef struct filed_dispatch_saved_fd {
 bool filed_backend_object_is_tmpfs(uint64_t backend_object);
 int filed_backend_lookup(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
 int filed_backend_statx(filed_runtime_t *runtime, uint64_t object_id, storage_statx_reply_t *out_stat);
+int filed_backend_statfs(filed_runtime_t *runtime, uint64_t object_id, storage_statfs_reply_t *out_statfs);
 int filed_backend_pread(filed_runtime_t *runtime, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_backend_pwrite(filed_runtime_t *runtime, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_backend_fsync(filed_runtime_t *runtime, uint64_t object_id);
@@ -139,6 +140,7 @@ int64_t filed_openat_path(filed_runtime_t *runtime, const filed_openat_t *openat
 filed_page_dispatch_result_t filed_dispatch_openat_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_stat_page(filed_runtime_t *runtime, void *page);
+filed_page_dispatch_result_t filed_dispatch_statfs_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_utimens_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_chmod_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_pread_page(filed_runtime_t *runtime, void *page);

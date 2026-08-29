@@ -30,11 +30,12 @@ pub const Hooks = struct {
     thread_wake_target_is_live: *const fn (usize, u32, kernel.PrincipalId) bool,
     wake_waiting_thread_generation: *const fn (usize, u32) bool,
     wake_waiting_thread_generation_with_rax: *const fn (usize, u32, u64) bool,
+    wake_waiting_thread_generation_with_rax_prefer_current: *const fn (usize, u32, u64) bool,
     wake_blocked_thread_for_principal: *const fn (kernel.PrincipalId) void,
     switch_to_thread: *const fn (usize, *TrapFrame, ?u64) bool,
     before_current_thread_leave: ?scheduler.BeforeCurrentThreadLeaveCallback = null,
     reacquire_kernel_state_lock: ?scheduler.BeforeCurrentThreadLeaveCallback = null,
-    block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64, ?scheduler.BeforeCurrentThreadLeaveCallback) bool,
+    block_current_thread_for_event: *const fn (*TrapFrame, bool, u64, u64, u64, ?scheduler.BeforeCurrentThreadLeaveCallback) bool,
     exit_current_process: *const fn (kernel.PrincipalId, *TrapFrame, ?scheduler.BeforeCurrentThreadLeaveCallback, ?scheduler.BeforeCurrentThreadLeaveCallback) void,
     total_usable_memory_bytes: u64,
 };
@@ -183,7 +184,7 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     // drive this principal through an interrupt/syscall boundary. Do not admit
     // another target syscall into that window; the owner will rescan contexts
     // before teardown or publish the final stopped state.
-    if (scheduler.principalLifecycleTargets(proc)) {
+    if (scheduler.principalLifecycleBlocksAdmission(proc)) {
         return sc.syscall_err_not_ready;
     }
 

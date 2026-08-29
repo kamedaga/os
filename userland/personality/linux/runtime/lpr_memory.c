@@ -5,7 +5,42 @@
 
 enum {
     LPR_BRK_RESERVE_SIZE = 64ull * 1024ull * 1024ull,
+    LPR_LINUX_MREMAP_MAYMOVE = 1ull << 0,
+    LPR_LINUX_MREMAP_FIXED = 1ull << 1,
+    LPR_LINUX_MREMAP_DONTUNMAP = 1ull << 2,
 };
+
+int64_t lpr_linux_mremap(
+    uint64_t old_address,
+    uint64_t old_size,
+    uint64_t new_size,
+    uint64_t flags,
+    uint64_t new_address)
+{
+    const uint64_t supported_flags =
+        LPR_LINUX_MREMAP_MAYMOVE | LPR_LINUX_MREMAP_FIXED;
+    if ((flags & ~supported_flags) != 0 ||
+        (flags & LPR_LINUX_MREMAP_DONTUNMAP) != 0 ||
+        ((flags & LPR_LINUX_MREMAP_FIXED) != 0 &&
+         (flags & LPR_LINUX_MREMAP_MAYMOVE) == 0))
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    /* The existing CapabilityOS VM ABI intentionally uses the Linux bit
+     * values for MAYMOVE and FIXED.  Linux ignores the fifth syscall argument
+     * unless FIXED is set; do not forward an unspecified register value. */
+    const uint64_t target =
+        (flags & LPR_LINUX_MREMAP_FIXED) != 0 ? new_address : 0;
+    const int64_t result = lpr_pacha_syscall5(
+        PACHA_VM_SYSCALL_MREMAP,
+        old_address,
+        old_size,
+        new_size,
+        flags,
+        target);
+    return result >= 4096 ? result : pacha_kernel_status_to_errno(result);
+}
 
 static uint64_t align_up_page(uint64_t value)
 {

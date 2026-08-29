@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "netd_internal.h"
 
 #include "kobox/module.h"
@@ -11,6 +13,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int validate_boot_config(const struct netd_boot_config *cfg)
@@ -37,6 +40,7 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
 int main(int argc, char **argv)
 {
     (void)argc;
+    (void)setenv("KOBOX_DAEMON_NAME", "netd", 1);
     struct netd_boot_config config;
     memset(&config, 0, sizeof(config));
     const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);

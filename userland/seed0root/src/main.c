@@ -61,7 +61,6 @@ enum {
     SEED0ROOT_BOOT_PROFILE_LUA = 1u << 4,
     SEED0ROOT_BOOT_PROFILE_DYN_NEEDED = 1u << 5,
     SEED0ROOT_BOOT_PROFILE_CHIBICC = 1u << 6,
-    SEED0ROOT_BOOT_PROFILE_APK = 1u << 7,
     SEED0ROOT_BOOT_PROFILE_CURL = 1u << 8,
     SEED0ROOT_BOOT_PROFILE_HTTPS = 1u << 9,
     SEED0ROOT_BOOT_PROFILE_APK_UPDATE = 1u << 10,
@@ -1218,9 +1217,6 @@ static unsigned seed0root_boot_profile_flags(int filed_endpoint_fd)
     if (seed0root_profile_has_token(profile, "chibicc")) {
         flags |= SEED0ROOT_BOOT_PROFILE_CHIBICC;
     }
-    if (seed0root_profile_has_token(profile, "apk")) {
-        flags |= SEED0ROOT_BOOT_PROFILE_APK;
-    }
     if (seed0root_profile_has_token(profile, "apk-update")) {
         flags |= SEED0ROOT_BOOT_PROFILE_APK_UPDATE;
     }
@@ -2231,182 +2227,6 @@ static int seed0root_run_chibicc_cli_bench(int filed_endpoint_fd)
         191);
 }
 
-static int seed0root_run_apk_offline_bench(int filed_endpoint_fd)
-{
-    const char *mkdir_root_argv[] = {
-        "busybox", "mkdir", "/tmp/apk-root",
-    };
-    int status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/cmd/alpine-busybox.elf",
-        mkdir_root_argv,
-        3,
-        "PACHA_APK_OFFLINE_PREP_ROOT=1",
-        "apk offline prep mkdir root",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *mkdir_var_argv[] = {
-        "busybox", "mkdir", "/tmp/apk-root/var",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/cmd/alpine-busybox.elf",
-        mkdir_var_argv,
-        3,
-        "PACHA_APK_OFFLINE_PREP_VAR=1",
-        "apk offline prep mkdir var",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *mkdir_cache_parent_argv[] = {
-        "busybox", "mkdir", "/tmp/apk-root/var/cache",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/cmd/alpine-busybox.elf",
-        mkdir_cache_parent_argv,
-        3,
-        "PACHA_APK_OFFLINE_PREP_CACHE_PARENT=1",
-        "apk offline prep mkdir cache parent",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *mkdir_cache_argv[] = {
-        "busybox", "mkdir", "/tmp/apk-root/var/cache/apk",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/cmd/alpine-busybox.elf",
-        mkdir_cache_argv,
-        3,
-        "PACHA_APK_OFFLINE_PREP_CACHE=1",
-        "apk offline prep mkdir cache",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-
-    const char *apk_env = "LD_LIBRARY_PATH=/tmp/apk-root/lib:/tmp/apk-root/usr/lib:/opt/apk-offline/lib:/lib:/lib/linux:/usr/lib";
-    const char *apk_argv[] = {
-        "/cmd/apk-offline.elf",
-        "--root",
-        "/tmp/apk-root",
-        "--initdb",
-        "--no-network",
-        "--no-scripts",
-        "--allow-untrusted",
-        "--timeout",
-        "10",
-        "--repository",
-        "/var/cache/apk/offline",
-        "--cache-dir",
-        "/tmp/apk-root/var/cache/apk",
-        "add",
-        "zstd",
-        "grep",
-        "sed",
-        "tar",
-        "xz",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/cmd/apk-offline.elf",
-        apk_argv,
-        17,
-        apk_env,
-        "apk offline add workload",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-
-    const char *grep_argv[] = {
-        "grep", "--version",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/tmp/apk-root/bin/grep",
-        grep_argv,
-        2,
-        apk_env,
-        "apk installed grep version",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *sed_argv[] = {
-        "sed", "--version",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/tmp/apk-root/bin/sed",
-        sed_argv,
-        2,
-        apk_env,
-        "apk installed sed version",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *tar_create_argv[] = {
-        "tar", "-cf", "/tmp/apk-root/apk-world.tar", "-C", "/tmp/apk-root", "etc/apk/world",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/tmp/apk-root/bin/tar",
-        tar_create_argv,
-        6,
-        apk_env,
-        "apk installed tar create",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *tar_list_argv[] = {
-        "tar", "-tf", "/tmp/apk-root/apk-world.tar",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/tmp/apk-root/bin/tar",
-        tar_list_argv,
-        3,
-        apk_env,
-        "apk installed tar list",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *xz_argv[] = {
-        "xz", "--version",
-    };
-    status = seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/tmp/apk-root/usr/bin/xz",
-        xz_argv,
-        2,
-        apk_env,
-        "apk installed xz version",
-        FILED_EXEC_LINUX_LPR);
-    if (status != 0) {
-        return status;
-    }
-    const char *zstd_argv[] = {
-        "zstd", "--version",
-    };
-    return seed0root_run_exec_path_smoke(
-        filed_endpoint_fd,
-        "/tmp/apk-root/usr/bin/zstd",
-        zstd_argv,
-        2,
-        apk_env,
-        "apk installed zstd version",
-        FILED_EXEC_LINUX_LPR);
-}
-
 static int seed0root_run_apk_update_smoke(int filed_endpoint_fd)
 {
     const char *dirs[] = {
@@ -2596,9 +2416,6 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
         filed_endpoint_fd >= 16) {
         status = seed0root_run_chibicc_cli_bench(filed_endpoint_fd);
     }
-    if ((boot_profile & SEED0ROOT_BOOT_PROFILE_APK) != 0 && status == 0 && filed_endpoint_fd >= 16) {
-        status = seed0root_run_apk_offline_bench(filed_endpoint_fd);
-    }
     if ((boot_profile & SEED0ROOT_BOOT_PROFILE_APK_UPDATE) != 0 && status == 0 && filed_endpoint_fd >= 16) {
         status = seed0root_run_apk_update_smoke(filed_endpoint_fd);
     }
@@ -2610,7 +2427,6 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
                         SEED0ROOT_BOOT_PROFILE_LUA |
                         SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
                         SEED0ROOT_BOOT_PROFILE_CHIBICC |
-                        SEED0ROOT_BOOT_PROFILE_APK |
                         SEED0ROOT_BOOT_PROFILE_APK_UPDATE |
                         SEED0ROOT_BOOT_PROFILE_CURL |
                         SEED0ROOT_BOOT_PROFILE_HTTPS);
@@ -2622,7 +2438,6 @@ static int seed0root_run_storage_services(int filed_endpoint_fd)
                         SEED0ROOT_BOOT_PROFILE_LUA |
                         SEED0ROOT_BOOT_PROFILE_DYN_NEEDED |
                         SEED0ROOT_BOOT_PROFILE_CHIBICC |
-                        SEED0ROOT_BOOT_PROFILE_APK |
                         SEED0ROOT_BOOT_PROFILE_APK_UPDATE |
                         SEED0ROOT_BOOT_PROFILE_CURL |
                         SEED0ROOT_BOOT_PROFILE_HTTPS);

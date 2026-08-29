@@ -840,6 +840,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .thread_wake_target_is_live = scheduler.threadWakeTargetIsLive,
         .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,
         .wake_waiting_thread_generation_with_rax = scheduler.wakeIfWaitingGenerationWithRax,
+        .wake_waiting_thread_generation_with_rax_prefer_current = scheduler.wakeIfWaitingGenerationWithRaxPreferCurrent,
         .wake_blocked_thread_for_principal = scheduler.wakeBlockedThread,
         .switch_to_thread = scheduler.switchTo,
         .block_current_thread_for_event = scheduler.blockCurrentThread,

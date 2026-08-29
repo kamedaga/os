@@ -158,7 +158,19 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
 void lpr_event_backend_notify(lpr_event_backend_t *event)
 {
     if (event == 0 || event->notify_fd.raw < 16) return;
-    if (__atomic_exchange_n(&event->notify_pending, 1u, __ATOMIC_ACQ_REL) != 0)
+    const uint8_t pending = __atomic_exchange_n(
+        &event->notify_pending, 1u, __ATOMIC_ACQ_REL);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+        lpr_glycin_diag_event(
+            "event.notify.enter",
+            (uint64_t)(uintptr_t)event,
+            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            pending,
+            event->notify_fd.raw);
+    }
+#endif
+    if (pending != 0)
         return;
     const struct pacha_ipc_msg message = {0};
     const int64_t status = lpr_pacha_syscall2(
@@ -167,6 +179,16 @@ void lpr_event_backend_notify(lpr_event_backend_t *event)
         (uint64_t)(uintptr_t)&message);
     if (status != 0)
         __atomic_store_n(&event->notify_pending, 0u, __ATOMIC_RELEASE);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+        lpr_glycin_diag_event(
+            "event.notify.exit",
+            (uint64_t)(uintptr_t)event,
+            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
+            status);
+    }
+#endif
 }
 
 int lpr_eventfd_native_wait_fd(uint64_t fd)
@@ -179,8 +201,28 @@ void lpr_eventfd_drain_wait(uint64_t fd)
 {
     lpr_event_backend_t *event = lpr_event_backend(fd);
     if (event == 0 || event->wait_fd.raw < 16) return;
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+        lpr_glycin_diag_event(
+            "event.drain.enter",
+            fd,
+            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
+            event->wait_fd.raw);
+    }
+#endif
     __atomic_store_n(&event->notify_pending, 0u, __ATOMIC_RELEASE);
     lpr_native_wait_drain(event->wait_fd.raw);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+        lpr_glycin_diag_event(
+            "event.drain.exit",
+            fd,
+            __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
+            event->wait_fd.raw);
+    }
+#endif
 }
 
 int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t cloexec)

@@ -1096,12 +1096,21 @@ static void test_hardlink_alias_lifetime_and_stat(void)
 
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.valid = true;
+    snapshot.inode_number = 900;
     snapshot.mode = 0100644;
     snapshot.size = 7;
     snapshot.blocks = 1;
     snapshot.nlink = 2;
     snapshot.kind = 0100000;
     expect_status("update alias stat", filed_vfs_update_stat_snapshot(&vfs, 90, &snapshot), FILED_OK);
+    memset(&snapshot, 0, sizeof(snapshot));
+    expect_status(
+        "read hardlink inode identity",
+        filed_vfs_get_stat_snapshot(&vfs, alias.handle_id, &snapshot),
+        FILED_OK);
+    expect_true(
+        "hardlink inode identity cached",
+        snapshot.valid && snapshot.inode_number == 900);
     expect_status("stat source alias", filed_vfs_stat_prepare(&vfs, file.handle_id, &decision), FILED_OK);
     expect_true("stat source nlink", decision.backend_object == 90);
     expect_status("stat hardlink alias", filed_vfs_stat_prepare(&vfs, alias.handle_id, &decision), FILED_OK);
@@ -1660,6 +1669,58 @@ static void test_invalid_arguments(void)
     expect_status("check null vfs", filed_vfs_check_basic(NULL), FILED_ERR_INVALID);
 }
 
+static void test_service_width_component_name(void)
+{
+    static const char name[] =
+        "vnd.openxmlformats-officedocument.wordprocessingml.document.xml.new";
+    filed_vfs_t vfs;
+    filed_mount_id_t root_mount = 0;
+    filed_vfs_open_result_t root;
+    filed_vfs_open_result_t file;
+    filed_vfs_open_result_t cached;
+
+    expect_true("service-width component exceeds legacy vnode name", strlen(name) > 63u);
+    expect_true("service-width component fits filed ABI", strlen(name) < FILED_NAME_BYTES);
+    filed_vfs_init(&vfs);
+    expect_status(
+        "mount for service-width component",
+        filed_vfs_mount_root(&vfs, FILED_FS_SYNTHETIC, 7, 11, &root_mount),
+        FILED_OK);
+    expect_status(
+        "open root for service-width component",
+        filed_vfs_open_root(
+            &vfs,
+            root_mount,
+            FILED_RIGHT_LOOKUP | FILED_RIGHT_CREATE,
+            FILED_OPEN_DIRECTORY,
+            &root),
+        FILED_OK);
+    expect_status(
+        "create service-width component",
+        filed_vfs_create_backend_child(
+            &vfs,
+            root.handle_id,
+            700,
+            FILED_VNODE_REGULAR,
+            name,
+            FILED_RIGHT_READ | FILED_RIGHT_STAT,
+            0,
+            &file),
+        FILED_OK);
+    expect_status(
+        "lookup service-width component",
+        filed_vfs_open_cached_child(
+            &vfs,
+            root.handle_id,
+            name,
+            FILED_RIGHT_READ | FILED_RIGHT_STAT,
+            0,
+            &cached),
+        FILED_OK);
+    expect_true("service-width component backend preserved", cached.backend_object == 700);
+    expect_status("service-width component invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 static bool test_backend_object_evictable(void *context, filed_backend_object_id_t backend_object)
 {
     (void)context;
@@ -1750,6 +1811,7 @@ int main(void)
     test_setattr_right_is_independent_of_data_write();
     test_rights_and_flags();
     test_invalid_arguments();
+    test_service_width_component_name();
     test_linked_vnode_lru_reuses_capacity();
 
     if (failures != 0) {

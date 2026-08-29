@@ -160,6 +160,13 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
         const uint64_t value = *(const uint64_t *)(uintptr_t)buf;
         if (value == UINT64_MAX) return -LPR_LINUX_EINVAL;
         lpr_event_backend_t *event = lpr_event_backend(fd);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+            lpr_glycin_diag_event(
+                "event.write.enter", fd, event->counter,
+                event->notify_pending, (int64_t)value);
+        }
+#endif
         for (;;) {
             if (event->counter <= (UINT64_MAX - 1u) - value)
                 break;
@@ -178,6 +185,13 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
         }
         event->counter += value;
         lpr_event_backend_notify(event);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+            lpr_glycin_diag_event(
+                "event.write.exit", fd, event->counter,
+                event->notify_pending, (int64_t)value);
+        }
+#endif
         return (int64_t)sizeof(uint64_t);
     }
     if (lpr_pipe_fd_is_active(fd)) {
@@ -219,10 +233,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
     }
     if (lpr_fd_is_filed(fd)) {
         const lpr_filed_backend_t *file = lpr_filed_backend(fd);
-        if ((file->reserved1 & (LPR_FILED_FD_MEMFD |
-                LPR_LINUX_F_SEAL_FUTURE_WRITE)) ==
-            (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_FUTURE_WRITE))
-        {
+        if (lpr_memfd_write_is_sealed(file->reserved1)) {
             return -LPR_LINUX_EPERM;
         }
         if (count != 0) {
@@ -641,20 +652,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         return arg != 0 ? 0 : -LPR_LINUX_EFAULT;
     case LPR_LINUX_F_ADD_SEALS: {
         lpr_filed_backend_t *file = lpr_filed_backend(fd);
-        if ((file->reserved1 & LPR_FILED_FD_MEMFD) == 0 ||
-            (arg & ~(uint64_t)(LPR_LINUX_F_SEAL_SEAL |
-                LPR_LINUX_F_SEAL_SHRINK |
-                LPR_LINUX_F_SEAL_GROW |
-                LPR_LINUX_F_SEAL_FUTURE_WRITE)) != 0) {
-            return -LPR_LINUX_EINVAL;
-        }
-        if ((file->reserved1 & LPR_FILED_FD_ALLOW_SEALING) == 0 ||
-            ((file->reserved1 & LPR_LINUX_F_SEAL_SEAL) != 0 &&
-                (arg & ~(uint64_t)(file->reserved1 & LPR_FILED_FD_SEALS)) != 0)) {
-            return -LPR_LINUX_EPERM;
-        }
-        file->reserved1 |= (uint8_t)arg;
-        return 0;
+        return lpr_memfd_add_seals(&file->reserved1, arg);
     }
     case LPR_LINUX_F_GET_SEALS: {
         const lpr_filed_backend_t *file = lpr_filed_backend(fd);
@@ -687,6 +685,20 @@ int64_t lpr_linux_flock(uint64_t fd, uint64_t operation)
 
 int64_t lpr_backend_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
+    if (request == LPR_LINUX_FIONBIO) {
+        if (arg == 0) {
+            return -LPR_LINUX_EFAULT;
+        }
+        const int64_t current = lpr_linux_fcntl(fd, LPR_LINUX_F_GETFL, 0);
+        if (current < 0) {
+            return current;
+        }
+        const int enabled = *(const int *)(uintptr_t)arg != 0;
+        const uint64_t flags = enabled
+            ? (uint64_t)current | LPR_LINUX_O_NONBLOCK
+            : (uint64_t)current & ~LPR_LINUX_O_NONBLOCK;
+        return lpr_linux_fcntl(fd, LPR_LINUX_F_SETFL, flags);
+    }
     if (lpr_linux_dmabuf_fd_active(fd)) {
         return lpr_dmabuf_ioctl(fd, request, arg);
     }
@@ -735,7 +747,9 @@ void lpr_write_linux_stat(void *statbuf, const filed_statx_t *wire)
     lpr_linux_stat_t *st = (lpr_linux_stat_t *)statbuf;
     lpr_memset(st, 0, sizeof(*st));
     st->st_dev = 1;
-    st->st_ino = wire->handle != 0 ? wire->handle : 1;
+    st->st_ino = wire->inode_number != 0 ?
+        wire->inode_number :
+        (wire->handle != 0 ? wire->handle : 1);
     st->st_nlink = wire->nlink != 0 ? wire->nlink : 1;
     st->st_mode = (uint32_t)wire->mode;
     st->st_size = (int64_t)wire->size;
@@ -843,7 +857,7 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         return -LPR_LINUX_EBADF;
     }
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const int page_fd = lpr_create_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -862,8 +876,64 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         }
         lpr_write_linux_stat((void *)(uintptr_t)statbuf, stat);
     }
-    lpr_destroy_standalone_wire_page(page_fd, page);
+    lpr_destroy_wire_page(page_fd, page);
     return status;
+}
+
+static int64_t lpr_filed_fstat_close_metadata(uint64_t fd, uint64_t statbuf)
+{
+    lpr_filed_backend_t *file = lpr_filed_backend(fd);
+    if (file == 0 || file->handle == 0) {
+        const int64_t status = lpr_linux_fstat(fd, statbuf);
+        (void)lpr_linux_close(fd);
+        return status;
+    }
+
+    void *page = 0;
+    const int page_fd = lpr_create_wire_page(&page);
+    if (page_fd < 0) {
+        const int64_t status = lpr_linux_fstat(fd, statbuf);
+        (void)lpr_linux_close(fd);
+        return status;
+    }
+    filed_statx_t *stat = (filed_statx_t *)page;
+    lpr_memset(stat, 0, sizeof(*stat));
+    stat->handle = file->handle;
+    int64_t stat_status = -LPR_LINUX_EIO;
+    int64_t close_status = -LPR_LINUX_EIO;
+    const int64_t batch_status = lpr_filed_fast_stat_close(
+        file->handle, page_fd, &stat_status, &close_status);
+    if (batch_status == 0 && stat_status == 0) {
+        file->stat_size = stat->size;
+        file->object_generation = stat->object_generation;
+        lpr_write_linux_stat((void *)(uintptr_t)statbuf, stat);
+    }
+    lpr_destroy_wire_page(page_fd, page);
+
+    if (batch_status == -LPR_LINUX_ENOSYS ||
+        batch_status == -LPR_LINUX_EAGAIN)
+    {
+        const int64_t status = lpr_linux_fstat(fd, statbuf);
+        (void)lpr_linux_close(fd);
+        return status;
+    }
+    if (batch_status != 0) {
+        /* Once the doorbell was accepted, a malformed/lost reply cannot tell
+         * us whether Filed consumed CLOSE.  This fd is private to statat;
+         * detach it locally and let session teardown reclaim any remote
+         * handle instead of issuing an unsafe duplicate request. */
+        lpr_filed_session_abandon();
+        file->handle = 0;
+        (void)lpr_linux_close(fd);
+        return batch_status;
+    }
+    if (close_status == 0) {
+        file->handle = 0;
+    }
+    (void)lpr_linux_close(fd);
+    /* Match newfstatat's existing semantics: its internal close result does
+     * not replace the metadata result. */
+    return stat_status;
 }
 
 int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf, uint64_t flags)
@@ -885,13 +955,19 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
         open_flags |= LPR_LINUX_O_NOFOLLOW;
     }
     int64_t fd = lpr_linux_openat(dirfd, path_raw, open_flags, 0);
-    if (fd == -LPR_LINUX_ENOENT || fd == -LPR_LINUX_EISDIR) {
+    /* ENOENT is definitive: adding O_DIRECTORY cannot make a missing path
+     * appear, and toolkit startup probes many optional paths.  Only EISDIR
+     * means the first open found an object that needs a directory handle. */
+    if (fd == -LPR_LINUX_EISDIR) {
         fd = lpr_linux_openat(
             dirfd, path_raw, open_flags | LPR_LINUX_O_DIRECTORY, 0);
     }
     lpr_trace_process_event("newfstatat_open", dirfd, flags, fd);
     if (fd < 0) {
         return fd;
+    }
+    if (lpr_fd_is_filed((uint64_t)fd)) {
+        return lpr_filed_fstat_close_metadata((uint64_t)fd, statbuf);
     }
     const int64_t status = lpr_linux_fstat((uint64_t)fd, statbuf);
     lpr_trace_process_event("newfstatat_fstat", (uint64_t)fd, flags, status);
@@ -1314,6 +1390,10 @@ int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     }
     if (buf == 0 && count != 0) {
         return -LPR_LINUX_EFAULT;
+    }
+    const int64_t proc_status = lpr_linux_proc_getdents64(fd, buf, count);
+    if (proc_status != -LPR_LINUX_ENOENT) {
+        return proc_status;
     }
     void *page = 0;
     const int page_fd = lpr_create_standalone_wire_page(&page);

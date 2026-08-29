@@ -13,6 +13,8 @@ enum {
     LPR_CLONE_CHILD_CLEARTID = 0x00200000ull,
     LPR_CLONE_DETACHED = 0x00400000ull,
     LPR_CLONE_CHILD_SETTID = 0x01000000ull,
+    LPR_PR_SET_PDEATHSIG = 1u,
+    LPR_PR_GET_PDEATHSIG = 2u,
 };
 
 _Static_assert(sizeof(lpr_thread_record_t) == 72u, "thread launch record size");
@@ -494,6 +496,10 @@ int64_t lpr_linux_clone(uint64_t flags, uint64_t child_stack, uint64_t parent_ti
 static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *user_frame, uint64_t flags, uint64_t child_stack, uint64_t parent_tid, uint64_t child_tid, uint64_t tls)
 {
     lpr_trace_clone_args(flags, child_stack, parent_tid, child_tid);
+    const int64_t namespace_status = lpr_linux_clone_namespace_guard(flags);
+    if (namespace_status != 0) {
+        return namespace_status;
+    }
     const uint64_t signal = flags & 0xffu;
     const uint64_t known_process_flags = LPR_CLONE_VM | LPR_CLONE_VFORK | LPR_CLONE_PARENT_SETTID | LPR_CLONE_CHILD_SETTID | LPR_CLONE_CHILD_CLEARTID;
     if ((flags & LPR_CLONE_THREAD) != 0) {
@@ -868,6 +874,60 @@ int64_t lpr_linux_getsid(uint64_t pid_raw)
     return entry != 0 ? entry->linux_sid : -LPR_LINUX_ESRCH;
 }
 
+int64_t lpr_linux_prctl(uint64_t option,
+                        uint64_t arg2,
+                        uint64_t arg3,
+                        uint64_t arg4,
+                        uint64_t arg5)
+{
+    if (option != LPR_PR_SET_PDEATHSIG && option != LPR_PR_GET_PDEATHSIG) {
+        return lpr_linux_prctl_compat(option, arg2, arg3, arg4, arg5);
+    }
+    if (arg3 != 0 || arg4 != 0 || arg5 != 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if (option == LPR_PR_SET_PDEATHSIG && arg2 > LPR_LINUX_SIGNAL_MAX) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if (option == LPR_PR_GET_PDEATHSIG && arg2 == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+
+    lpr_linux_process_state_init();
+    if (!lpr_supervisor_enabled) {
+        /* Parent-death notification needs the process-lifecycle owner.  Do not
+         * claim success when the supervisor is unavailable. */
+        return -LPR_LINUX_ENOSYS;
+    }
+
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_pdeathsig_t *request =
+        (lprs_pdeathsig_t *)lpr_supervisor_payload(page);
+    request->token = lpr_supervisor_token;
+    if (option == LPR_PR_SET_PDEATHSIG) {
+        request->signal = arg2;
+    }
+    const int64_t status = lpr_supervisor_call(
+        option == LPR_PR_SET_PDEATHSIG ?
+            LPRS_OP_PROCESS_SET_PDEATHSIG :
+            LPRS_OP_PROCESS_GET_PDEATHSIG,
+        page_fd,
+        page,
+        sizeof(*request),
+        -1,
+        0);
+    if (status == 0 && option == LPR_PR_GET_PDEATHSIG) {
+        *(int *)(uintptr_t)arg2 = (int)request->result;
+    }
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    return status;
+}
+
 int64_t lpr_linux_kill(uint64_t pid_raw, uint64_t sig_raw)
 {
     lpr_linux_process_state_init();
@@ -936,6 +996,48 @@ int64_t lpr_linux_kill(uint64_t pid_raw, uint64_t sig_raw)
         return -LPR_LINUX_ESRCH;
     }
     return sig == 0 ? 0 : lpr_linux_signal_process_fd(entry->process_fd, sig);
+}
+
+int64_t lpr_linux_tkill(uint64_t tid_raw, uint64_t sig_raw)
+{
+    const int64_t tid = (int64_t)tid_raw;
+    const uint32_t sig = (uint32_t)sig_raw;
+    if (tid <= 0 || tid > UINT32_MAX || sig_raw > LPR_LINUX_SIGNAL_MAX) {
+        return -LPR_LINUX_EINVAL;
+    }
+
+    const int64_t current_tid = lpr_linux_gettid();
+    if (current_tid < 0) {
+        return current_tid;
+    }
+    if (tid != current_tid) {
+        /* Native process signals select an eligible thread; using that path
+         * here would silently violate tkill's thread-directed contract. */
+        return lpr_linux_thread_exists((uint64_t)tid) ?
+            -LPR_LINUX_ENOSYS : -LPR_LINUX_ESRCH;
+    }
+    if (sig == 0) {
+        return 0;
+    }
+    lpr_linux_queue_signal(sig);
+    return lpr_linux_dispatch_pending_signals();
+}
+
+int64_t lpr_linux_tgkill(uint64_t tgid_raw, uint64_t tid_raw, uint64_t sig_raw)
+{
+    const int64_t tgid = (int64_t)tgid_raw;
+    const int64_t tid = (int64_t)tid_raw;
+    if (tgid <= 0 || tgid > INT32_MAX || tid <= 0 || tid > UINT32_MAX) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const int64_t current_pid = lpr_linux_getpid();
+    if (current_pid < 0) {
+        return current_pid;
+    }
+    if (tgid != current_pid) {
+        return -LPR_LINUX_ESRCH;
+    }
+    return lpr_linux_tkill(tid_raw, sig_raw);
 }
 
 int64_t lpr_linux_rt_sigaction(uint64_t sig_raw, uint64_t act_raw, uint64_t oldact_raw, uint64_t sigsetsize)

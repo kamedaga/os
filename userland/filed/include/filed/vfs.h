@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 
 #include "filed/flags.h"
+#include "filed/limits.h"
 
 #define FILED_MAX_MOUNTS 16u
 #define FILED_MAX_VNODES 256u
@@ -89,6 +90,7 @@ typedef struct filed_vnode {
     filed_mount_id_t mount_id;
     filed_backend_object_id_t backend_object;
     filed_vnode_kind_t kind;
+    uint64_t stat_inode_number;
     uint64_t stat_mode;
     uint64_t stat_size;
     uint64_t stat_blocks;
@@ -103,7 +105,7 @@ typedef struct filed_vnode {
     int64_t stat_ctime_sec;
     int64_t stat_ctime_nsec;
     filed_vnode_id_t parent;
-    char name[64];
+    char name[FILED_NAME_BYTES];
     filed_generation_t generation;
     filed_generation_t object_generation;
     filed_generation_t dir_generation;
@@ -185,6 +187,7 @@ typedef struct filed_vfs_handle_flags {
 typedef struct filed_vfs_stat_snapshot {
     bool valid;
     uint64_t handle_id;
+    uint64_t inode_number;
     uint64_t mode;
     uint64_t size;
     uint64_t blocks;

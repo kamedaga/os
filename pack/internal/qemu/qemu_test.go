@@ -89,6 +89,15 @@ func TestDefaultCPUModelFitsKernelXStatePolicy(t *testing.T) {
 	}
 }
 
+func TestCPUModelUsesHostWithKVM(t *testing.T) {
+	if got, want := cpuModel(false), "host"; got != want {
+		t.Fatalf("cpuModel(false) = %q, want %q", got, want)
+	}
+	if got, want := cpuModel(true), defaultCPUModel; got != want {
+		t.Fatalf("cpuModel(true) = %q, want %q", got, want)
+	}
+}
+
 func TestAppendInputDeviceArgs(t *testing.T) {
 	tests := []struct {
 		name    string

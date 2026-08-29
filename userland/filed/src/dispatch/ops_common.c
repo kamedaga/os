@@ -288,6 +288,7 @@ int filed_write_stat_from_backend(
     }
     memset(out, 0, sizeof(*out));
     out->handle = handle_id;
+    out->inode_number = stat->inode_number;
     out->mode = stat->mode;
     out->size = stat->size;
     out->blocks = stat->blocks;
@@ -318,6 +319,7 @@ filed_vfs_stat_snapshot_t filed_stat_snapshot_from_backend(
     }
     snapshot.valid = true;
     snapshot.handle_id = handle_id;
+    snapshot.inode_number = stat->inode_number;
     snapshot.mode = stat->mode;
     snapshot.size = stat->size;
     snapshot.blocks = stat->blocks;
@@ -346,6 +348,7 @@ filed_vfs_stat_snapshot_t filed_directory_snapshot_from_create(
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.valid = true;
     snapshot.handle_id = handle_id;
+    snapshot.inode_number = handle_id;
     snapshot.mode = 0040000u | (mode & 07777u);
     snapshot.size = 0;
     snapshot.blocks = 0;
@@ -367,6 +370,7 @@ filed_vfs_stat_snapshot_t filed_symlink_snapshot_from_create(
     memset(&snapshot, 0, sizeof(snapshot));
     snapshot.valid = true;
     snapshot.handle_id = handle_id;
+    snapshot.inode_number = handle_id;
     snapshot.mode = 0120000u | 0777u;
     snapshot.size = target_length;
     snapshot.blocks = 0;
@@ -388,6 +392,7 @@ int filed_write_stat_from_snapshot(
     }
     memset(out, 0, sizeof(*out));
     out->handle = handle_id;
+    out->inode_number = snapshot->inode_number;
     out->mode = snapshot->mode;
     out->size = snapshot->size;
     out->blocks = snapshot->blocks;
@@ -1203,6 +1208,77 @@ int64_t filed_openat_path(
         }
 
         if (final_component) {
+            if ((open_flags & FILED_OPEN_NOFOLLOW) == 0) {
+                uint64_t object_id = 0;
+                filed_vnode_kind_t cached_kind = 0;
+                bool lookup_owned = false;
+                bool component_is_symlink = false;
+                storage_statx_reply_t stat;
+                const filed_status_t cached_status = filed_vfs_cached_child_info(
+                    &runtime->vfs,
+                    current_handle,
+                    component,
+                    &object_id,
+                    &cached_kind);
+                if (cached_status == FILED_OK) {
+                    component_is_symlink = cached_kind == FILED_VNODE_SYMLINK;
+                } else {
+                    memset(&stat, 0, sizeof(stat));
+                    const int64_t symlink_status = filed_lookup_component_stat(
+                        runtime,
+                        current_handle,
+                        component,
+                        &object_id,
+                        &stat,
+                        &lookup_owned);
+                    if (symlink_status != 0) {
+                        if (symlink_status == filed_status_to_wire(FILED_ERR_NOT_FOUND) &&
+                            (open_flags & FILED_OPEN_CREATE) != 0)
+                        {
+                            component_is_symlink = false;
+                        } else {
+                            filed_close_walk_handle(runtime, current_handle, current_owned);
+                            return symlink_status;
+                        }
+                    } else {
+                        component_is_symlink =
+                            filed_kind_from_unix_type(stat.kind) == FILED_VNODE_SYMLINK;
+                    }
+                }
+                if (component_is_symlink) {
+                    if (symlink_budget == 0) {
+                        if (lookup_owned) {
+                            (void)filed_backend_release_object(runtime, object_id);
+                        }
+                        filed_close_walk_handle(runtime, current_handle, current_owned);
+                        return filed_status_to_wire(FILED_ERR_LOOP);
+                    }
+                    --symlink_budget;
+                    const int64_t symlink_status = filed_splice_symlink_target(
+                        runtime,
+                        object_id,
+                        "",
+                        symlink_path,
+                        sizeof(symlink_path));
+                    if (lookup_owned) {
+                        (void)filed_backend_release_object(runtime, object_id);
+                    }
+                    if (symlink_status != 0) {
+                        filed_close_walk_handle(runtime, current_handle, current_owned);
+                        return symlink_status;
+                    }
+                    if (symlink_path[0] == '/') {
+                        filed_close_walk_handle(runtime, current_handle, current_owned);
+                        current_handle = runtime->root_handle_id;
+                        current_owned = 0;
+                    }
+                    path = symlink_path;
+                    continue;
+                }
+                if (lookup_owned) {
+                    (void)filed_backend_release_object(runtime, object_id);
+                }
+            }
             const int64_t reply_status = filed_lookup_and_open_component(
                 runtime,
                 current_handle,

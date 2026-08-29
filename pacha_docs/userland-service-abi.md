@@ -89,10 +89,18 @@ per-service magic/version definitions.
 | `STORAGE_OP_PWRITE` | 6 | `STORAGE_OP_FSYNC` | 7 |
 | `STORAGE_OP_CREATE` | 8 | `STORAGE_OP_TRUNCATE` | 9 |
 | `STORAGE_OP_UTIMENS` | 10 | `STORAGE_OP_CHMOD` | 11 |
-| `STORAGE_OP_UNLINK` | 12 | `STORAGE_OP_RENAME` | 13 |
-| `STORAGE_OP_MKDIR` | 14 | `STORAGE_OP_RMDIR` | 15 |
-| `STORAGE_OP_RELEASE_OBJECT` | 16 | `STORAGE_OP_SYNC_ALL` | 17 |
-| `STORAGE_OP_DIAG_DUMP` | 18 | | |
+| `STORAGE_OP_LINK` | 12 | `STORAGE_OP_UNLINK` | 13 |
+| `STORAGE_OP_RENAME` | 14 | `STORAGE_OP_MKDIR` | 15 |
+| `STORAGE_OP_MKNOD` | 16 | `STORAGE_OP_RMDIR` | 17 |
+| `STORAGE_OP_RELEASE_OBJECT` | 18 | `STORAGE_OP_SYNC_ALL` | 19 |
+| `STORAGE_OP_DIAG_DUMP` | 20 | | |
+
+`storage_statx_reply_t` is 112 bytes and carries `inode_number` immediately
+after the path-scoped `object_id`. `filed_statx_t` is 128 bytes and carries the
+same identity immediately after its path-scoped `handle`. This is an in-tree
+flag-day layout update: all userland producers and consumers are rebuilt
+together. A hard-linked path may have a distinct object or handle while
+retaining the same inode number.
 
 ### termd
 
@@ -113,14 +121,29 @@ per-service magic/version definitions.
 |---|---:|---|---:|
 | `LPRS_OP_HELLO` | 0 | `LPRS_OP_PROCESS_REGISTER_EXEC` | 1 |
 | `LPRS_OP_PROCESS_REGISTER_FD` | 2 | `LPRS_OP_PROCESS_GET_STATE` | 3 |
-| `LPRS_OP_PROCESS_FORK_BEGIN` | 4 | `LPRS_OP_PROCESS_FORK_PARENT_REGISTER` | 5 |
-| `LPRS_OP_PROCESS_FORK_CHILD_READY` | 6 | `LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN` | 7 |
-| `LPRS_OP_PROCESS_EXEC_COMMIT_DONE` | 8 | `LPRS_OP_PROCESS_WAIT4` | 9 |
-| `LPRS_OP_PROCESS_SETPGID` | 10 | `LPRS_OP_PROCESS_SETSID` | 11 |
-| `LPRS_OP_PROCESS_GETPGID` | 12 | `LPRS_OP_PROCESS_GETSID` | 13 |
-| `LPRS_OP_SIGNAL_KILL` | 14 | `LPRS_OP_SIGNAL_DELIVER_TTY` | 15 |
-| `LPRS_OP_CWD_GET` | 16 | `LPRS_OP_CWD_SET` | 17 |
-| `LPRS_OP_DIAG_DUMP` | 18 | `LPRS_OP_DIAG_ERROR_GET` | 19 |
+| `LPRS_OP_PROCESS_LIST` | 4 | `LPRS_OP_PROCESS_FORK_BEGIN` | 5 |
+| `LPRS_OP_PROCESS_FORK_CANCEL` | 6 | `LPRS_OP_PROCESS_FORK_PARENT_REGISTER` | 7 |
+| `LPRS_OP_PROCESS_FORK_CHILD_READY` | 8 | `LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN` | 9 |
+| `LPRS_OP_PROCESS_EXEC_COMMIT_DONE` | 10 | `LPRS_OP_PROCESS_WAIT4` | 11 |
+| `LPRS_OP_PROCESS_SETPGID` | 12 | `LPRS_OP_PROCESS_SETSID` | 13 |
+| `LPRS_OP_PROCESS_GETPGID` | 14 | `LPRS_OP_PROCESS_GETSID` | 15 |
+| `LPRS_OP_PROCESS_SET_PDEATHSIG` | 16 | `LPRS_OP_PROCESS_GET_PDEATHSIG` | 17 |
+| `LPRS_OP_SIGNAL_KILL` | 18 | `LPRS_OP_SIGNAL_DELIVER_TTY` | 19 |
+| `LPRS_OP_CWD_GET` | 20 | `LPRS_OP_CWD_SET` | 21 |
+| `LPRS_OP_DIAG_DUMP` | 22 | `LPRS_OP_DIAG_ERROR_GET` | 23 |
+
+The supervisor stores the Linux parent-death signal because it is the userland
+owner of process parent/child relationships and exit notification. When a
+parent exits, the supervisor delivers the configured signal through the
+child's native process handle before orphaning it. The two operations were
+inserted next to the other process-state operations, so later signal, cwd, and
+diagnostic operation numbers move together in this in-tree flag-day ABI.
+
+`PROCESS_LIST` is next to the other process-state operations because the
+supervisor is the authoritative owner of Linux PID lifetime.  The paginated
+reply is used to synthesize numeric `/proc/<pid>` directory entries; inserting
+it at 4 shifts every later operation together rather than appending an
+unrelated process query after the diagnostic range.
 
 ### netd
 

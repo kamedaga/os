@@ -48,6 +48,7 @@ typedef struct filed_kobox_direct_ops {
     int (*mount_root)(void *ctx, uint64_t *out_magic);
     int (*lookup)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
     int (*statx)(void *ctx, uint64_t object_id, storage_statx_reply_t *out_stat);
+    int (*statfs)(void *ctx, storage_statfs_reply_t *out_statfs);
     int (*pread)(void *ctx, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
     int (*pwrite)(void *ctx, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
     int (*readlink)(void *ctx, uint64_t object_id, char *out_target, uint64_t target_capacity, uint64_t *out_length);
@@ -57,6 +58,7 @@ typedef struct filed_kobox_direct_ops {
     int (*truncate)(void *ctx, uint64_t object_id, uint64_t size);
     int (*utimens)(void *ctx, uint64_t object_id, uint32_t mask, int64_t atime_sec, int64_t atime_nsec, int64_t mtime_sec, int64_t mtime_nsec);
     int (*chmod)(void *ctx, uint64_t object_id, uint64_t mode);
+    int (*link)(void *ctx, uint64_t old_object_id, uint64_t new_parent_object_id, const char *new_name, uint64_t *out_object_id);
     int (*unlink)(void *ctx, uint64_t parent_object_id, const char *name);
     int (*mkdir)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);
     int (*mknod)(void *ctx, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t dev, uint64_t *out_object_id);
@@ -85,6 +87,9 @@ int filed_kobox_backend_statx(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
     storage_statx_reply_t *out_stat);
+int filed_kobox_backend_statfs(
+    filed_kobox_backend_t *backend,
+    storage_statfs_reply_t *out_statfs);
 int filed_kobox_backend_pread(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
@@ -136,6 +141,12 @@ int filed_kobox_backend_chmod(
     filed_kobox_backend_t *backend,
     uint64_t object_id,
     uint64_t mode);
+int filed_kobox_backend_link(
+    filed_kobox_backend_t *backend,
+    uint64_t old_object_id,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id);
 int filed_kobox_backend_unlink(
     filed_kobox_backend_t *backend,
     uint64_t parent_object_id,

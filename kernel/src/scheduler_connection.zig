@@ -110,6 +110,12 @@ pub const ThreadContext = struct {
     pkru: u32 = 0,
     ready: bool = false,
     wait_mailbox: bool = false,
+    // Opaque identity for a keyed blocking operation.  Zero is reserved for
+    // the existing unkeyed FD/IPC waits.  The scheduler never interprets the
+    // token; it only prevents a completion left over from an older wait from
+    // waking the thread in a newer, unrelated wait.
+    active_wait_token: u64 = 0,
+    next_wait_token: u64 = 1,
     stopped: bool = false,
     resume_after_stop: bool = false,
     pending_signal_mask: u64 = 0,
@@ -173,6 +179,9 @@ var principal_lifecycle_gate: u8 = 0;
 var principal_lifecycle_target_raw: usize = std.math.maxInt(usize);
 var principal_lifecycle_pending_action: u8 = 0;
 var principal_lifecycle_pending_code: u32 = 0;
+const principal_self_exit_reservation_word_count = (kernel.max_process_slots + 63) / 64;
+var principal_self_exit_reservations: [principal_self_exit_reservation_word_count]u64 =
+    [_]u64{0} ** principal_self_exit_reservation_word_count;
 
 pub const PrincipalLifecycleAction = enum(u8) {
     none = 0,
@@ -334,7 +343,11 @@ fn verifiedAddThread(thread_index: usize, generation: u32, ready: bool) bool {
     return true;
 }
 
-fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
+fn verifiedWakeThreadGenerationPreferred(
+    thread_index: usize,
+    generation: u32,
+    preferred_cpu: ?usize,
+) bool {
     if (!verifiedCoreReady()) return false;
     const ctx = threadContextMutable(thread_index) orelse return false;
     const node = ctx.scheduler_entity orelse return false;
@@ -370,7 +383,14 @@ fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
     }
     if (target_count == std.math.maxInt(usize)) return false;
     const last_allowed = schedulerCpuEnabled(last_cpu) and threadAllowsCpu(ctx, last_cpu);
-    if (last_allowed and (last_idle or !target_idle) and
+    var preferred_selected = false;
+    if (preferred_cpu) |cpu| {
+        if (cpu < verifiedCoreCpuCount() and schedulerCpuEnabled(cpu) and threadAllowsCpu(ctx, cpu)) {
+            target_cpu = cpu;
+            preferred_selected = true;
+        }
+    }
+    if (!preferred_selected and last_allowed and (last_idle or !target_idle) and
         last_count <= target_count +| 1)
     {
         target_cpu = last_cpu;
@@ -400,16 +420,18 @@ fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
         if (!target_state.enabled) {
             if (!last_state.enabled or !threadAllowsCpu(ctx, last_cpu)) break :wake_locked false;
             target_cpu = last_cpu;
+            preferred_selected = false;
         }
         // Scalar ownership becomes blocked before the old CPU completes its
         // kernel-to-idle transition.  Do not publish this generation on a
         // second CPU while the old CPU still executes its block tail.
         if (!last_state.is_idle and last_state.current_thread == thread_index) {
             target_cpu = last_cpu;
+            preferred_selected = false;
         }
         // Revalidate the locality threshold under the pair of runqueue locks.
         // A last CPU that is still within one queued entity always wins.
-        if (target_cpu != last_cpu and last_allowed and
+        if (!preferred_selected and target_cpu != last_cpu and last_allowed and
             (last_state.is_idle or !target_state.is_idle) and
             last_state.runqueue.count <= target_state.runqueue.count +| 1)
         {
@@ -435,6 +457,10 @@ fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
     };
     if (woke and target_cpu != currentCpu()) _ = smp.wakeCpu(target_cpu);
     return woke;
+}
+
+fn verifiedWakeThreadGeneration(thread_index: usize, generation: u32) bool {
+    return verifiedWakeThreadGenerationPreferred(thread_index, generation, null);
 }
 
 fn verifiedWakeThread(thread_index: usize) void {
@@ -1035,6 +1061,7 @@ fn nextThreadGeneration(current: u32) u32 {
 }
 
 pub fn initializeStaticStorage() void {
+    @memset(principal_self_exit_reservations[0..], 0);
     var cpu_slot: usize = 0;
     while (cpu_slot < scheduler_state.cpus.len) : (cpu_slot += 1) {
         scheduler_state.cpus[cpu_slot] = .{};
@@ -1152,6 +1179,7 @@ pub fn deferApUserSlice(slice_ticks: u64) void {
 pub fn parkApThreadForBlock(
     frame: *TrapFrame,
     wait_mailbox: bool,
+    wait_token: u64,
     timeout_ticks: u64,
     resume_rax: u64,
     before_block: ?BeforeCurrentThreadLeaveCallback,
@@ -1159,6 +1187,25 @@ pub fn parkApThreadForBlock(
     const current_thread = currentThread();
     scheduler_state.thread_table.lock();
     if (threadContextMutable(current_thread)) |ctx| {
+        if (wait_token != 0) {
+            if (!wait_mailbox or ctx.active_wait_token != wait_token) {
+                scheduler_state.thread_table.unlock();
+                return false;
+            }
+            if (!ctx.wait_mailbox) {
+                // The keyed wake raced with the transition into the blocked
+                // state.  It stored the completion in the reserved token;
+                // consume it without ever publishing this thread as blocked.
+                frame.rax = ctx.frame.rax;
+                ctx.active_wait_token = 0;
+                ctx.wake_tick = 0;
+                scheduler_state.thread_table.unlock();
+                return true;
+            }
+        } else if (ctx.active_wait_token != 0) {
+            scheduler_state.thread_table.unlock();
+            return false;
+        }
         // A signal published while this thread was runnable must interrupt the
         // next blocking syscall.  Refuse the block while holding the same lock
         // used by deliverSignal(), so no waiter can become stale between the
@@ -1167,6 +1214,10 @@ pub fn parkApThreadForBlock(
             !ctx.signal_interrupt_consumed)
         {
             ctx.signal_interrupt_consumed = true;
+            if (wait_token != 0) {
+                ctx.wait_mailbox = false;
+                ctx.active_wait_token = 0;
+            }
             scheduler_state.thread_table.unlock();
             return false;
         }
@@ -1178,6 +1229,7 @@ pub fn parkApThreadForBlock(
         ctx.gs_base = x86_platform.readGsBase();
         ctx.pkru = x86_platform.readPkru();
         ctx.wait_mailbox = wait_mailbox;
+        ctx.active_wait_token = wait_token;
         ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
         ctx.ready = false;
         setThreadHotCr3(current_thread, ctx.cr3);
@@ -1304,6 +1356,7 @@ pub fn staticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_target_raw), &principal_lifecycle_target_raw));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_pending_action), &principal_lifecycle_pending_action));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_lifecycle_pending_code), &principal_lifecycle_pending_code));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(principal_self_exit_reservations), &principal_self_exit_reservations));
     return end;
 }
 
@@ -1334,7 +1387,37 @@ pub fn currentCr3() u64 {
 /// driven to a user/kernel boundary.  Callers hold the kernel-state lock when
 /// acquiring this gate, so acquisition must never spin: a quiescing caller has
 /// deliberately dropped that lock and may be waiting for this CPU.
-pub fn tryBeginPrincipalLifecycle(target: kernel.PrincipalId) bool {
+fn principalSelfExitReservation(target: kernel.PrincipalId) ?struct { word: *u64, mask: u64 } {
+    const process_index = kernel.processIndexFromPrincipal(target) orelse return null;
+    const bit: u6 = @intCast(process_index & 63);
+    return .{
+        .word = &principal_self_exit_reservations[process_index / 64],
+        .mask = @as(u64, 1) << bit,
+    };
+}
+
+fn principalSelfExitIsReserved(target: kernel.PrincipalId) bool {
+    const reservation = principalSelfExitReservation(target) orelse return false;
+    return (@atomicLoad(u64, reservation.word, .acquire) & reservation.mask) != 0;
+}
+
+/// Reserve this target for its own PROCESS_EXIT before the caller temporarily
+/// drops the kernel-state lock.  This prevents a remote stop/kill from owning
+/// the lifecycle gate for the exiting target and waiting on that same ring-0
+/// caller.  The reservation is internal scheduler state, not an ABI surface.
+pub fn reservePrincipalSelfExit(target: kernel.PrincipalId) bool {
+    const reservation = principalSelfExitReservation(target) orelse return false;
+    const previous = @atomicRmw(u64, reservation.word, .Or, reservation.mask, .acq_rel);
+    return (previous & reservation.mask) == 0;
+}
+
+fn clearPrincipalSelfExitReservation(target_raw: usize) void {
+    if (target_raw >= kernel.max_process_slots) return;
+    const reservation = principalSelfExitReservation(@enumFromInt(@as(kernel.PrincipalRaw, @intCast(target_raw)))) orelse return;
+    _ = @atomicRmw(u64, reservation.word, .And, ~reservation.mask, .acq_rel);
+}
+
+fn tryBeginPrincipalLifecycleGate(target: kernel.PrincipalId) bool {
     if (@cmpxchgStrong(u8, &principal_lifecycle_gate, 0, 1, .acquire, .monotonic) != null) {
         return false;
     }
@@ -1345,9 +1428,20 @@ pub fn tryBeginPrincipalLifecycle(target: kernel.PrincipalId) bool {
     return true;
 }
 
+pub fn tryBeginPrincipalLifecycle(target: kernel.PrincipalId) bool {
+    if (principalSelfExitIsReserved(target)) return false;
+    return tryBeginPrincipalLifecycleGate(target);
+}
+
+pub fn tryBeginReservedPrincipalLifecycle(target: kernel.PrincipalId) bool {
+    if (!principalSelfExitIsReserved(target)) return false;
+    return tryBeginPrincipalLifecycleGate(target);
+}
+
 pub fn endPrincipalLifecycle() void {
     @atomicStore(u8, &principal_lifecycle_pending_action, @intFromEnum(PrincipalLifecycleAction.none), .monotonic);
     principal_lifecycle_pending_code = 0;
+    clearPrincipalSelfExitReservation(principal_lifecycle_target_raw);
     principal_lifecycle_target_raw = std.math.maxInt(usize);
     @atomicStore(u8, &principal_lifecycle_gate, 0, .release);
 }
@@ -1355,6 +1449,10 @@ pub fn endPrincipalLifecycle() void {
 pub fn principalLifecycleTargets(principal: kernel.PrincipalId) bool {
     return @atomicLoad(u8, &principal_lifecycle_gate, .acquire) == 2 and
         principal_lifecycle_target_raw == @intFromEnum(principal);
+}
+
+pub fn principalLifecycleBlocksAdmission(principal: kernel.PrincipalId) bool {
+    return principalLifecycleTargets(principal) or principalSelfExitIsReserved(principal);
 }
 
 /// Record the last non-terminal lifecycle request while the owner has dropped
@@ -1832,6 +1930,8 @@ fn initializeThreadContextWithReadyState(
     ctx.pkru = 0;
     ctx.ready = initial_ready;
     ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
+    ctx.next_wait_token = 1;
     ctx.stopped = false;
     ctx.resume_after_stop = false;
     ctx.pending_signal_mask = 0;
@@ -1900,6 +2000,58 @@ pub fn threadWakeTargetIsLive(thread_index: usize, generation: u32, owner: kerne
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContext(thread_index) orelse return false;
     return ctx.allocated and ctx.generation == generation and ctx.owner_process == owner;
+}
+
+pub fn reserveCurrentWaitToken(expected_generation: u32) ?u64 {
+    const thread_index = currentThread();
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return null;
+    if (!ctx.allocated or ctx.generation != expected_generation or
+        !ctx.ready or ctx.active_wait_token != 0)
+    {
+        return null;
+    }
+    var token = ctx.next_wait_token;
+    if (token == 0) token = 1;
+    ctx.next_wait_token = token +% 1;
+    if (ctx.next_wait_token == 0) ctx.next_wait_token = 1;
+    // Publish the reservation while holding the same lock used by keyed
+    // wake.  A wake arriving before blockCurrentThread() can then complete
+    // this token instead of being lost in the record-to-park window.
+    ctx.wait_mailbox = true;
+    ctx.active_wait_token = token;
+    return token;
+}
+
+pub fn cancelCurrentWaitToken(expected_generation: u32, token: u64) void {
+    if (token == 0) return;
+    const thread_index = currentThread();
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return;
+    if (!ctx.allocated or ctx.generation != expected_generation or
+        !ctx.ready or ctx.active_wait_token != token)
+    {
+        return;
+    }
+    ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
+    ctx.wake_tick = 0;
+}
+
+pub fn waitTokenIsCurrent(
+    owner: kernel.PrincipalId,
+    thread_index: usize,
+    generation: u32,
+    token: u64,
+) bool {
+    if (token == 0) return false;
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContext(thread_index) orelse return false;
+    return ctx.allocated and ctx.owner_process == owner and
+        ctx.generation == generation and ctx.active_wait_token == token;
 }
 
 pub fn liveThreadCount(principal: kernel.PrincipalId) usize {
@@ -2070,6 +2222,7 @@ pub fn suspendedThreadImage(
         ctx.owner_process != owner_process or
         ctx.ready or
         ctx.wait_mailbox or
+        ctx.active_wait_token != 0 or
         ctx.wake_tick != 0)
     {
         return null;
@@ -2135,7 +2288,8 @@ pub fn singleThreadExecImage(
     const staged_ctx = threadContext(staged_thread_index) orelse return null;
     if (!staged_ctx.allocated or staged_ctx.generation != staged_generation or
         staged_ctx.owner_process != staged_owner or staged_ctx.cpu_slot >= scheduler_state.cpus.len or
-        staged_ctx.ready or staged_ctx.wait_mailbox or staged_ctx.wake_tick != 0 or
+        staged_ctx.ready or staged_ctx.wait_mailbox or staged_ctx.active_wait_token != 0 or
+        staged_ctx.wake_tick != 0 or
         staged_ctx.stopped or staged_ctx.resume_after_stop)
     {
         return null;
@@ -2220,6 +2374,7 @@ pub fn installExecContextForCurrentThread(
         ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
         ctx.ready = true;
         ctx.wait_mailbox = false;
+        ctx.active_wait_token = 0;
         ctx.wake_tick = 0;
         ctx.stopped = false;
         ctx.resume_after_stop = false;
@@ -2428,22 +2583,25 @@ pub fn exitCurrentThread(
     return true;
 }
 
-pub fn wakeIfWaiting(thread_index: usize) void {
+pub fn wakeIfWaiting(thread_index: usize) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
-    const ctx = threadContextMutable(thread_index) orelse return;
-    if (!ctx.allocated) return;
+    const ctx = threadContextMutable(thread_index) orelse return false;
+    if (!ctx.allocated or !ctx.wait_mailbox or
+        ctx.active_wait_token != 0) return false;
     ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
     ctx.wake_tick = 0;
     if (ctx.stopped) {
         ctx.resume_after_stop = true;
         ctx.ready = false;
         setThreadHotWaitState(thread_index, false, 0, false);
-        return;
+        return true;
     }
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
     verifiedWakeThread(thread_index);
+    return true;
 }
 
 fn wakeIfTimerExpired(thread_index: usize, now_tick: u64) void {
@@ -2459,8 +2617,10 @@ fn wakeIfTimerExpired(thread_index: usize, now_tick: u64) void {
         return;
     }
     const wait_mailbox = ctx.wait_mailbox;
+    const wait_token = ctx.active_wait_token;
     const wake_tick = ctx.wake_tick;
     ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
     ctx.wake_tick = 0;
     if (ctx.stopped) {
         ctx.resume_after_stop = true;
@@ -2475,6 +2635,7 @@ fn wakeIfTimerExpired(thread_index: usize, now_tick: u64) void {
         // lockless timer scan treats ready as authoritative, so retain the
         // expired deadline and retry publication on the next BSP tick.
         ctx.wait_mailbox = wait_mailbox;
+        ctx.active_wait_token = wait_token;
         ctx.wake_tick = wake_tick;
         ctx.ready = false;
         setThreadHotWaitState(thread_index, wait_mailbox, wake_tick, false);
@@ -2486,18 +2647,20 @@ fn wakeIfWaitingGenerationInternal(
     generation: u32,
     resume_rax: ?u64,
     mailbox_only: bool,
+    preferred_cpu: ?usize,
 ) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(thread_index) orelse return false;
     if (!ctx.allocated or ctx.generation != generation) return false;
     if (mailbox_only) {
-        if (!ctx.wait_mailbox) return false;
+        if (!ctx.wait_mailbox or ctx.active_wait_token != 0) return false;
     } else if (ctx.ready) {
         return false;
     }
     if (resume_rax) |value| ctx.frame.rax = value;
     ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
     ctx.wake_tick = 0;
     if (ctx.stopped) {
         ctx.resume_after_stop = true;
@@ -2507,20 +2670,84 @@ fn wakeIfWaitingGenerationInternal(
     }
     ctx.ready = true;
     setThreadHotWaitState(thread_index, false, 0, true);
-    verifiedWakeThread(thread_index);
+    _ = verifiedWakeThreadGenerationPreferred(thread_index, generation, preferred_cpu);
     return true;
 }
 
+pub const KeyedWakeResult = enum {
+    woke,
+    stale,
+    publish_failed,
+};
+
+pub fn wakeIfWaitingTokenGenerationWithRax(
+    thread_index: usize,
+    generation: u32,
+    owner: kernel.PrincipalId,
+    wait_token: u64,
+    resume_rax: u64,
+) KeyedWakeResult {
+    if (wait_token == 0) return .stale;
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return .stale;
+    if (!ctx.allocated or ctx.owner_process != owner or
+        ctx.generation != generation or ctx.active_wait_token != wait_token)
+    {
+        return .stale;
+    }
+
+    if (ctx.ready) {
+        if (!ctx.wait_mailbox) return .stale;
+        // The waiter has reserved its token but has not parked yet.  Preserve
+        // the token until blockCurrentThread() consumes this completion.
+        ctx.frame.rax = resume_rax;
+        ctx.wait_mailbox = false;
+        ctx.wake_tick = 0;
+        return .woke;
+    }
+    if (!ctx.wait_mailbox) return .stale;
+
+    const previous_rax = ctx.frame.rax;
+    const wake_tick = ctx.wake_tick;
+    ctx.frame.rax = resume_rax;
+    ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
+    ctx.wake_tick = 0;
+    if (ctx.stopped) {
+        ctx.resume_after_stop = true;
+        ctx.ready = false;
+        setThreadHotWaitState(thread_index, false, 0, false);
+        return .woke;
+    }
+    ctx.ready = true;
+    setThreadHotWaitState(thread_index, false, 0, true);
+    if (!verifiedWakeThreadGeneration(thread_index, generation)) {
+        ctx.frame.rax = previous_rax;
+        ctx.wait_mailbox = true;
+        ctx.active_wait_token = wait_token;
+        ctx.wake_tick = wake_tick;
+        ctx.ready = false;
+        setThreadHotWaitState(thread_index, true, wake_tick, false);
+        return .publish_failed;
+    }
+    return .woke;
+}
+
 pub fn wakeIfWaitingGeneration(thread_index: usize, generation: u32) bool {
-    return wakeIfWaitingGenerationInternal(thread_index, generation, null, true);
+    return wakeIfWaitingGenerationInternal(thread_index, generation, null, true, null);
 }
 
 pub fn wakeIfWaitingGenerationWithRax(thread_index: usize, generation: u32, resume_rax: u64) bool {
-    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, true);
+    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, true, null);
+}
+
+pub fn wakeIfWaitingGenerationWithRaxPreferCurrent(thread_index: usize, generation: u32, resume_rax: u64) bool {
+    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, true, currentCpu());
 }
 
 pub fn wakeBlockedGenerationWithRax(thread_index: usize, generation: u32, resume_rax: u64) bool {
-    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, false);
+    return wakeIfWaitingGenerationInternal(thread_index, generation, resume_rax, false, null);
 }
 
 pub fn wakeMailboxWaiter(principal: kernel.PrincipalId) void {
@@ -2529,8 +2756,7 @@ pub fn wakeMailboxWaiter(principal: kernel.PrincipalId) void {
         const hot = getThreadHotStateConst(i) orelse continue;
         if (hot.allocated == 0 or hot.owner_process != principal) continue;
         if (hot.wait_mailbox == 0) continue;
-        wakeIfWaiting(i);
-        return;
+        if (wakeIfWaiting(i)) return;
     }
 }
 
@@ -2817,13 +3043,14 @@ pub fn wakeExpiredTimers(now_tick: u64) void {
 pub fn blockCurrentThread(
     frame: *TrapFrame,
     wait_mailbox: bool,
+    wait_token: u64,
     timeout_ticks: u64,
     resume_rax: u64,
     before_block: ?BeforeCurrentThreadLeaveCallback,
 ) bool {
     if (!isBootstrapSchedulerCpu()) {
         // AP user threads must leave the CPU for a real blocking receive.
-        return parkApThreadForBlock(frame, wait_mailbox, timeout_ticks, resume_rax, before_block);
+        return parkApThreadForBlock(frame, wait_mailbox, wait_token, timeout_ticks, resume_rax, before_block);
     }
     const current_thread = currentThread();
     scheduler_state.thread_table.lock();
@@ -2831,6 +3058,22 @@ pub fn blockCurrentThread(
         scheduler_state.thread_table.unlock();
         return false;
     };
+    if (wait_token != 0) {
+        if (!wait_mailbox or ctx.active_wait_token != wait_token) {
+            scheduler_state.thread_table.unlock();
+            return false;
+        }
+        if (!ctx.wait_mailbox) {
+            frame.rax = ctx.frame.rax;
+            ctx.active_wait_token = 0;
+            ctx.wake_tick = 0;
+            scheduler_state.thread_table.unlock();
+            return true;
+        }
+    } else if (ctx.active_wait_token != 0) {
+        scheduler_state.thread_table.unlock();
+        return false;
+    }
     // Keep signal publication and the transition to blocked atomic with
     // respect to each other.  The syscall caller will remove any waiter it
     // registered and return NOT_READY/EAGAIN, allowing delivery at a safe
@@ -2839,6 +3082,10 @@ pub fn blockCurrentThread(
         !ctx.signal_interrupt_consumed)
     {
         ctx.signal_interrupt_consumed = true;
+        if (wait_token != 0) {
+            ctx.wait_mailbox = false;
+            ctx.active_wait_token = 0;
+        }
         scheduler_state.thread_table.unlock();
         return false;
     }
@@ -2851,6 +3098,7 @@ pub fn blockCurrentThread(
     ctx.gs_base = x86_platform.readGsBase();
     ctx.pkru = x86_platform.readPkru();
     ctx.wait_mailbox = wait_mailbox;
+    ctx.active_wait_token = wait_token;
     ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
     ctx.ready = false;
     setThreadHotCr3(current_thread, ctx.cr3);

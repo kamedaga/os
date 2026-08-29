@@ -605,6 +605,26 @@ static int64_t lpr_epoll_scan(
         const int can_consume = consume && ready < maxevents;
         const int64_t observation = lpr_epoll_apply_observation(
             epfd, &snapshot[i], current, can_consume, &report);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
+            __atomic_load_n(
+                &lpr_glycin_diag_socket_fd, __ATOMIC_ACQUIRE) ==
+                (uint32_t)snapshot[i].fd)
+        {
+            lpr_glycin_diag_event(
+                "epoll.observe",
+                epfd,
+                current,
+                report,
+                observation);
+            lpr_glycin_diag_event(
+                "epoll.interest",
+                snapshot[i].events,
+                snapshot[i].data,
+                consume,
+                ready);
+        }
+#endif
         if (observation != 0) {
             return observation;
         }
@@ -739,6 +759,25 @@ int64_t lpr_linux_epoll_wait(
             (uint32_t)maxevents_raw,
             cached_sockets,
             1);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
+            __atomic_load_n(
+                &lpr_glycin_diag_socket_fd, __ATOMIC_ACQUIRE) != 0u &&
+            ready != 0)
+        {
+            const lpr_linux_epoll_event_t *diag_events =
+                (const lpr_linux_epoll_event_t *)(uintptr_t)events_raw;
+            lpr_glycin_diag_event(
+                "epoll.return",
+                epfd_raw,
+                ready > 0 ? diag_events[0].events : 0,
+                ready > 0 ? diag_events[0].data : 0,
+                ready);
+            __atomic_store_n(
+                &lpr_glycin_diag_follow_budget, 96u, __ATOMIC_RELEASE);
+            lpr_glycin_diag_event("follow.arm", epfd_raw, ready, 96u, 0);
+        }
+#endif
         if (ready != 0 || timeout == 0) {
             return ready;
         }

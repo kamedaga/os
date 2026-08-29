@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kobox/module.h"
+#include "koboxd/storage_protocol.h"
 #include "linux_subsystem/fs/fs.h"
 
 #include <stddef.h>
@@ -8,7 +9,7 @@
 #include <stdatomic.h>
 
 enum {
-    KOBOXD_FS_BACKEND_NAME_BYTES = 64,
+    KOBOXD_FS_BACKEND_NAME_BYTES = STORAGE_NAME_BYTES,
     KOBOXD_FS_BACKEND_INLINE_DATA_BYTES = 64,
     KOBOXD_FS_BACKEND_MAX_OBJECTS = 256,
 };
@@ -100,6 +101,9 @@ int koboxd_fs_backend_mount_ext4(
     koboxd_fs_backend_t *backend,
     kb_module_t *ext4_module,
     kb_fs_block_device_t *root_device);
+int koboxd_fs_backend_statfs(
+    koboxd_fs_backend_t *backend,
+    storage_statfs_reply_t *out_statfs);
 void koboxd_fs_backend_lock(koboxd_fs_backend_t *backend);
 void koboxd_fs_backend_unlock(koboxd_fs_backend_t *backend);
 int koboxd_fs_backend_lookup(
@@ -131,6 +135,12 @@ int koboxd_fs_backend_symlink(
     uint64_t parent_object_id,
     const char *name,
     const char *target,
+    uint64_t *out_object_id);
+int koboxd_fs_backend_link(
+    koboxd_fs_backend_t *backend,
+    uint64_t old_object_id,
+    uint64_t new_parent_object_id,
+    const char *new_name,
     uint64_t *out_object_id);
 int koboxd_fs_backend_create(
     koboxd_fs_backend_t *backend,

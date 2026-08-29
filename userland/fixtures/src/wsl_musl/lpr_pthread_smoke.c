@@ -1,9 +1,17 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
+#include <errno.h>
 #include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
+
+#define LPR_FUTEX_WAKE_PRIVATE (1 | 128)
+#define LPR_FUTEX_WAIT_BITSET_PRIVATE (9 | 128)
+#define LPR_FUTEX_BITSET_MATCH_ANY 0xffffffffu
 
 enum {
     THREAD_COUNT = 4,
@@ -20,6 +28,17 @@ static int cond_ready;
 static int cond_go;
 static int cond_observed;
 static int detached_done;
+static _Atomic int futex_bitset_word;
+static _Atomic int futex_bitset_waiter_started;
+static long futex_bitset_wait_result;
+static int futex_bitset_wait_errno;
+static struct timespec futex_bitset_deadline;
+static _Atomic int stale_futex_word;
+static _Atomic int stale_wait_phase;
+static int stale_wait_pipe[2];
+static long stale_timeout_result;
+static int stale_timeout_errno;
+static ssize_t stale_pipe_read_result;
 
 static void emit(const char *message)
 {
@@ -170,6 +189,125 @@ static int detached_exit_smoke(void)
     return 0;
 }
 
+static void *futex_bitset_waiter(void *argument)
+{
+    (void)argument;
+    atomic_store_explicit(
+        &futex_bitset_waiter_started, 1, memory_order_release);
+    errno = 0;
+    futex_bitset_wait_result = syscall(
+        SYS_futex,
+        &futex_bitset_word,
+        LPR_FUTEX_WAIT_BITSET_PRIVATE,
+        0,
+        &futex_bitset_deadline,
+        0,
+        LPR_FUTEX_BITSET_MATCH_ANY);
+    futex_bitset_wait_errno = errno;
+    return 0;
+}
+
+static int futex_bitset_smoke(void)
+{
+    const struct timespec settle_delay = { .tv_nsec = 100000000 };
+    pthread_t waiter;
+    atomic_store_explicit(&futex_bitset_word, 0, memory_order_relaxed);
+    atomic_store_explicit(
+        &futex_bitset_waiter_started, 0, memory_order_relaxed);
+    futex_bitset_wait_result = -1;
+    futex_bitset_wait_errno = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &futex_bitset_deadline) != 0) return 0;
+    futex_bitset_deadline.tv_sec += 5;
+    if (pthread_create(&waiter, 0, futex_bitset_waiter, 0) != 0) return 0;
+    while (atomic_load_explicit(
+        &futex_bitset_waiter_started, memory_order_acquire) == 0)
+    {
+        sched_yield();
+    }
+    (void)nanosleep(&settle_delay, 0);
+    errno = 0;
+    const long wake_result = syscall(
+        SYS_futex,
+        &futex_bitset_word,
+        LPR_FUTEX_WAKE_PRIVATE,
+        1,
+        0,
+        0,
+        0);
+    const int wake_errno = errno;
+    if (pthread_join(waiter, 0) != 0) return 0;
+    return wake_result == 1 && wake_errno == 0 &&
+        futex_bitset_wait_result == 0 && futex_bitset_wait_errno == 0;
+}
+
+static void *futex_timeout_then_pipe_waiter(void *argument)
+{
+    (void)argument;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) return 0;
+    deadline.tv_sec += 1;
+    errno = 0;
+    stale_timeout_result = syscall(
+        SYS_futex,
+        &stale_futex_word,
+        LPR_FUTEX_WAIT_BITSET_PRIVATE,
+        0,
+        &deadline,
+        0,
+        LPR_FUTEX_BITSET_MATCH_ANY);
+    stale_timeout_errno = errno;
+    atomic_store_explicit(&stale_wait_phase, 1, memory_order_release);
+    char byte = 0;
+    stale_pipe_read_result = read(stale_wait_pipe[0], &byte, 1);
+    if (stale_pipe_read_result == 1 && byte == 'x') {
+        atomic_store_explicit(&stale_wait_phase, 2, memory_order_release);
+    }
+    return 0;
+}
+
+static int futex_timeout_stale_smoke(void)
+{
+    const struct timespec settle_delay = { .tv_nsec = 250000000 };
+    pthread_t waiter;
+    if (pipe(stale_wait_pipe) != 0) return 0;
+    atomic_store_explicit(&stale_futex_word, 0, memory_order_relaxed);
+    atomic_store_explicit(&stale_wait_phase, 0, memory_order_relaxed);
+    stale_timeout_result = 0;
+    stale_timeout_errno = 0;
+    stale_pipe_read_result = -1;
+    if (pthread_create(&waiter, 0, futex_timeout_then_pipe_waiter, 0) != 0) {
+        (void)close(stale_wait_pipe[0]);
+        (void)close(stale_wait_pipe[1]);
+        return 0;
+    }
+    while (atomic_load_explicit(&stale_wait_phase, memory_order_acquire) == 0) {
+        sched_yield();
+    }
+    (void)nanosleep(&settle_delay, 0);
+    errno = 0;
+    const long stale_wake_result = syscall(
+        SYS_futex,
+        &stale_futex_word,
+        LPR_FUTEX_WAKE_PRIVATE,
+        1,
+        0,
+        0,
+        0);
+    const int stale_wake_errno = errno;
+    const int pipe_was_still_blocked =
+        atomic_load_explicit(&stale_wait_phase, memory_order_acquire) == 1;
+    const ssize_t write_result = write(stale_wait_pipe[1], "x", 1);
+    const int joined = pthread_join(waiter, 0) == 0;
+    (void)close(stale_wait_pipe[0]);
+    (void)close(stale_wait_pipe[1]);
+    return stale_timeout_result == -1 &&
+        stale_timeout_errno == ETIMEDOUT &&
+        stale_wake_result == 0 && stale_wake_errno == 0 &&
+        pipe_was_still_blocked && write_result == 1 && joined &&
+        stale_pipe_read_result == 1 &&
+        atomic_load_explicit(&stale_wait_phase, memory_order_acquire) == 2;
+}
+
 int main(void)
 {
     emit("LPR_PTHREAD_START\n");
@@ -193,12 +331,22 @@ int main(void)
         return 4;
     }
     emit("LPR_PTHREAD_DETACHED_EXIT=OK\n");
+    if (!futex_bitset_smoke()) {
+        emit("LPR_PTHREAD_FUTEX_WAIT_BITSET=BAD\n");
+        return 5;
+    }
+    emit("LPR_PTHREAD_FUTEX_WAIT_BITSET=OK\n");
+    if (!futex_timeout_stale_smoke()) {
+        emit("LPR_PTHREAD_FUTEX_TIMEOUT_STALE=BAD\n");
+        return 6;
+    }
+    emit("LPR_PTHREAD_FUTEX_TIMEOUT_STALE=OK\n");
     /* A detached musl thread exits while holding __thread_list_lock and asks
      * the kernel to clear it after the stack is unmapped.  Verify that the
      * next creator does not inherit a stale owner TID. */
     if (!create_join_smoke()) {
         emit("LPR_PTHREAD_POST_DETACHED_CREATE_JOIN=BAD\n");
-        return 5;
+        return 7;
     }
     emit("LPR_PTHREAD_POST_DETACHED_CREATE_JOIN=OK\n");
     return 0;

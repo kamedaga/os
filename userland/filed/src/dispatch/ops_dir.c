@@ -82,6 +82,34 @@ filed_page_dispatch_result_t filed_dispatch_unlink_page(
     return filed_page_result(reply_status, 0);
 }
 
+/* Trailing separators name the same directory as the path without them, so
+ * `mkdir("/usr/")` asks to create a directory that already exists.  The parent
+ * walk cannot express an empty final component and answers EINVAL, which makes
+ * `mkdir -p` report a failure for a directory that is already there. */
+static void filed_path_trim_trailing_separators(char *path)
+{
+    if (path == NULL) {
+        return;
+    }
+    size_t length = strlen(path);
+    while (length > 1u && path[length - 1u] == '/') {
+        path[--length] = '\0';
+    }
+}
+
+static int filed_path_is_only_separators(const char *path)
+{
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    for (const char *cursor = path; *cursor != '\0'; cursor++) {
+        if (*cursor != '/') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 filed_page_dispatch_result_t filed_dispatch_mkdir_page(
     filed_runtime_t *runtime,
     void *page)
@@ -99,6 +127,13 @@ filed_page_dispatch_result_t filed_dispatch_mkdir_page(
             mkdir->dir_handle == 0 ?
                 runtime->root_handle_id :
                 (filed_handle_id_t)(uint32_t)mkdir->dir_handle;
+
+        filed_path_trim_trailing_separators(mkdir->name);
+        /* A path made only of separators names the base directory itself,
+         * which already exists.  Linux answers EEXIST. */
+        if (filed_path_is_only_separators(mkdir->name)) {
+            return filed_page_result(filed_status_to_wire(FILED_ERR_EXISTS), 0);
+        }
 
         memset(name, 0, sizeof(name));
         reply_status = filed_resolve_parent_path(
@@ -462,6 +497,9 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
             reply_status = filed_backend_statx(runtime, old_object_id, &backend_stat);
         }
         if (reply_status == 0) {
+            reply_status = filed_flush_mutated_object(runtime, old_object_id);
+        }
+        if (reply_status == 0) {
             reply_status = filed_backend_link(
                 runtime,
                 old_object_id,
@@ -486,24 +524,12 @@ filed_page_dispatch_result_t filed_dispatch_link_page(
                 storage_statx_reply_t linked_stat;
                 memset(&linked_stat, 0, sizeof(linked_stat));
                 if (filed_backend_statx(runtime, linked_object_id, &linked_stat) == 0) {
-                    filed_vfs_stat_snapshot_t snapshot;
-                    memset(&snapshot, 0, sizeof(snapshot));
-                    snapshot.valid = true;
-                    snapshot.handle_id = opened.handle_id;
-                    snapshot.mode = linked_stat.mode;
-                    snapshot.size = linked_stat.size;
-                    snapshot.blocks = linked_stat.blocks;
-                    snapshot.nlink = linked_stat.nlink;
-                    snapshot.kind = linked_stat.kind;
-                    snapshot.times_valid = true;
-                    snapshot.atime_sec = linked_stat.atime_sec;
-                    snapshot.atime_nsec = linked_stat.atime_nsec;
-                    snapshot.mtime_sec = linked_stat.mtime_sec;
-                    snapshot.mtime_nsec = linked_stat.mtime_nsec;
-                    snapshot.ctime_sec = linked_stat.ctime_sec;
-                    snapshot.ctime_nsec = linked_stat.ctime_nsec;
-                    snapshot.object_generation = opened.object_generation;
-                    snapshot.dir_generation = opened.dir_generation;
+                    const filed_vfs_stat_snapshot_t snapshot =
+                        filed_stat_snapshot_from_backend(
+                            &linked_stat,
+                            opened.handle_id,
+                            opened.object_generation,
+                            opened.dir_generation);
                     (void)filed_vfs_update_stat_snapshot(&runtime->vfs, linked_object_id, &snapshot);
                 }
                 filed_runtime_publish_backend_object_generation(runtime, linked_object_id);

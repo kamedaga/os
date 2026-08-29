@@ -39,6 +39,7 @@ typedef struct lprs_process {
     uint64_t pgrp;
     uint64_t foreground_pgrp;
     uint64_t cwd_handle;
+    uint32_t pdeath_signal;
     int process_fd;
     int pending_exec_fd;
     char ctty[LPRS_CTTY_BYTES];
@@ -75,6 +76,7 @@ static int lprs_service_one_pending_request(void);
 static void lprs_refresh_exited_children(void);
 static void lprs_complete_waiters(void);
 static void lprs_interrupt_waiters(uint64_t token);
+static int lprs_signal_process_fd(int process_fd, uint64_t signal);
 
 static int lprs_status_to_errno(long status)
 {
@@ -297,6 +299,11 @@ static void lprs_orphan_children(uint64_t parent_pid)
         if (child->exit_ready) {
             lprs_process_reap(child);
         } else {
+            if (child->pdeath_signal != 0 && child->process_fd >= 16) {
+                (void)lprs_signal_process_fd(
+                    child->process_fd, child->pdeath_signal);
+                child->pdeath_signal = 0;
+            }
             child->ppid = 0;
         }
     }
@@ -514,6 +521,36 @@ static int lprs_get_process_state(uint64_t token, void *page)
     {
         lprs_acknowledge_reported_exits(proc);
     }
+    return 0;
+}
+
+static int lprs_list_processes(lprs_process_list_t *list)
+{
+    if (list == NULL || list->token == 0) {
+        return PACHA_STATUS_EINVAL;
+    }
+    if (lprs_find_by_token(list->token) == NULL) {
+        return PACHA_STATUS_ESRCH;
+    }
+
+    uint64_t capacity = list->capacity;
+    if (capacity > LPRS_PROCESS_LIST_CAPACITY) {
+        capacity = LPRS_PROCESS_LIST_CAPACITY;
+    }
+    uint64_t skipped = 0;
+    uint64_t count = 0;
+    for (uint64_t i = 0; i < g_process_count; ++i) {
+        const lprs_process_t *proc = &g_processes[i];
+        if (!proc->active) continue;
+        if (skipped < list->offset) {
+            skipped += 1u;
+            continue;
+        }
+        if (count >= capacity) break;
+        list->pids[count++] = proc->pid;
+    }
+    list->capacity = capacity;
+    list->count = count;
     return 0;
 }
 
@@ -842,6 +879,35 @@ static int lprs_getpgid_or_sid(void *page, int want_sid)
     return 0;
 }
 
+static int lprs_set_pdeathsig(void *page)
+{
+    if (page == NULL) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_pdeathsig_t *req = (lprs_pdeathsig_t *)page;
+    lprs_process_t *caller = lprs_find_by_token(req->token);
+    if (caller == NULL || req->signal > 64u) {
+        return caller == NULL ? PACHA_STATUS_ESRCH : PACHA_STATUS_EINVAL;
+    }
+    caller->pdeath_signal = (uint32_t)req->signal;
+    req->result = caller->pdeath_signal;
+    return 0;
+}
+
+static int lprs_get_pdeathsig(void *page)
+{
+    if (page == NULL) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_pdeathsig_t *req = (lprs_pdeathsig_t *)page;
+    lprs_process_t *caller = lprs_find_by_token(req->token);
+    if (caller == NULL) {
+        return PACHA_STATUS_ESRCH;
+    }
+    req->result = caller->pdeath_signal;
+    return 0;
+}
+
 static int lprs_kill(void *page)
 {
     if (page == NULL) {
@@ -1098,6 +1164,11 @@ static int lprs_dispatch(
             else *out_reply_fd = proc->process_fd;
         }
         break;
+    case LPRS_OP_PROCESS_LIST:
+        status = header.payload_size < sizeof(lprs_process_list_t) ?
+            PACHA_STATUS_EINVAL : lprs_list_processes(payload);
+        reply_payload_size = status == 0 ? sizeof(lprs_process_list_t) : 0;
+        break;
     case LPRS_OP_PROCESS_FORK_BEGIN:
         status = token == 0 ? PACHA_STATUS_EINVAL : lprs_fork_begin(token, payload);
         if (status == 0) {
@@ -1171,6 +1242,18 @@ static int lprs_dispatch(
             PACHA_STATUS_EINVAL :
             lprs_getpgid_or_sid(payload, 1);
         reply_payload_size = status == 0 ? sizeof(lprs_pid_op_t) : 0;
+        break;
+    case LPRS_OP_PROCESS_SET_PDEATHSIG:
+        status = header.payload_size < sizeof(lprs_pdeathsig_t) ?
+            PACHA_STATUS_EINVAL :
+            lprs_set_pdeathsig(payload);
+        reply_payload_size = status == 0 ? sizeof(lprs_pdeathsig_t) : 0;
+        break;
+    case LPRS_OP_PROCESS_GET_PDEATHSIG:
+        status = header.payload_size < sizeof(lprs_pdeathsig_t) ?
+            PACHA_STATUS_EINVAL :
+            lprs_get_pdeathsig(payload);
+        reply_payload_size = status == 0 ? sizeof(lprs_pdeathsig_t) : 0;
         break;
     case LPRS_OP_SIGNAL_KILL:
         status = header.payload_size < sizeof(lprs_kill_t) ?

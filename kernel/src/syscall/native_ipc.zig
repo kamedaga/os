@@ -147,7 +147,7 @@ fn wakeIpcWaitersForSendFd(
             }
         } else if (target.recv_msg_va != 0) {
             const status = completeRecvWaiter(h, state, target);
-            const woke = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, status);
+            const woke = h.wake_waiting_thread_generation_with_rax_prefer_current(target.thread_index, target.thread_generation, status);
             if (woke and status == sc.syscall_ok) {
                 if (handoff_target) |selected| {
                     if (selected.* == null) selected.* = target;
@@ -155,7 +155,7 @@ fn wakeIpcWaitersForSendFd(
             }
         } else if (target.pollfd_va != 0) {
             if (!h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents)) return false;
-            const woke = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+            const woke = h.wake_waiting_thread_generation_with_rax_prefer_current(target.thread_index, target.thread_generation, 1);
             if (woke) {
                 if (handoff_target) |selected| {
                     if (selected.* == null) selected.* = target;
@@ -197,7 +197,7 @@ fn recvWait(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fr
         return mapError(err);
     };
 
-    if (h.block_current_thread_for_event(frame, true, 0, sc.syscall_err_not_ready, h.before_current_thread_leave)) {
+    if (h.block_current_thread_for_event(frame, true, 0, 0, sc.syscall_err_not_ready, h.before_current_thread_leave)) {
         return frame.rax;
     }
     state.unregisterIpcReadableWaiterForFd(proc, fd, fd_abi.event_readable, current_thread, current_generation);

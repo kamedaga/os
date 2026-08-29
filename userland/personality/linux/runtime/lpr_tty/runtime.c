@@ -428,13 +428,22 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
     if (!lpr_linux_eventfd_active(fd)) {
         return 0;
     }
+    const lpr_event_backend_t *event = lpr_event_backend(fd);
     uint32_t revents = 0;
-    if ((events & 0x0001u) != 0 && lpr_event_backend(fd)->counter != 0) {
+    if ((events & 0x0001u) != 0 && event->counter != 0) {
         revents |= 0x0001u;
     }
     if ((events & 0x0004u) != 0 &&
-        lpr_event_backend(fd)->counter < UINT64_MAX - 1u) {
+        event->counter < UINT64_MAX - 1u) {
         revents |= 0x0004u;
     }
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+        lpr_glycin_diag_event(
+            "event.poll", fd, event->counter,
+            ((uint64_t)events << 32u) | event->notify_pending,
+            revents);
+    }
+#endif
     return revents;
 }

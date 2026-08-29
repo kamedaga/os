@@ -45,15 +45,18 @@ static const char *filed_kobox_backend_op_name(uint64_t op)
     case STORAGE_OP_PREAD: return "pread";
     case STORAGE_OP_PWRITE: return "pwrite";
     case STORAGE_OP_STATX: return "statx";
+    case STORAGE_OP_STATFS: return "statfs";
     case STORAGE_OP_GETDENTS: return "getdents";
     case STORAGE_OP_FSYNC: return "fsync";
     case STORAGE_OP_UTIMENS: return "utimens";
     case STORAGE_OP_CHMOD: return "chmod";
     case STORAGE_OP_CREATE: return "create";
     case STORAGE_OP_TRUNCATE: return "truncate";
+    case STORAGE_OP_LINK: return "link";
     case STORAGE_OP_UNLINK: return "unlink";
     case STORAGE_OP_RENAME: return "rename";
     case STORAGE_OP_MKDIR: return "mkdir";
+    case STORAGE_OP_MKNOD: return "mknod";
     case STORAGE_OP_RMDIR: return "rmdir";
     case STORAGE_OP_RELEASE_OBJECT: return "release_object";
     case STORAGE_OP_SYNC_ALL: return "sync_all";
@@ -67,20 +70,23 @@ static uint64_t filed_kobox_backend_metric_slot(uint64_t op)
     case STORAGE_OP_MOUNT_ROOT: return 1;
     case STORAGE_OP_LOOKUP: return 2;
     case STORAGE_OP_STATX: return 3;
-    case STORAGE_OP_GETDENTS: return 4;
-    case STORAGE_OP_PREAD: return 5;
-    case STORAGE_OP_PWRITE: return 6;
-    case STORAGE_OP_FSYNC: return 7;
-    case STORAGE_OP_CREATE: return 8;
-    case STORAGE_OP_TRUNCATE: return 9;
-    case STORAGE_OP_UTIMENS: return 10;
-    case STORAGE_OP_CHMOD: return 11;
-    case STORAGE_OP_UNLINK: return 12;
-    case STORAGE_OP_RENAME: return 13;
-    case STORAGE_OP_MKDIR: return 14;
-    case STORAGE_OP_RMDIR: return 15;
-    case STORAGE_OP_RELEASE_OBJECT: return 16;
-    case STORAGE_OP_SYNC_ALL: return 17;
+    case STORAGE_OP_STATFS: return 4;
+    case STORAGE_OP_GETDENTS: return 5;
+    case STORAGE_OP_PREAD: return 6;
+    case STORAGE_OP_PWRITE: return 7;
+    case STORAGE_OP_FSYNC: return 8;
+    case STORAGE_OP_CREATE: return 9;
+    case STORAGE_OP_TRUNCATE: return 10;
+    case STORAGE_OP_UTIMENS: return 11;
+    case STORAGE_OP_CHMOD: return 12;
+    case STORAGE_OP_LINK: return 13;
+    case STORAGE_OP_UNLINK: return 14;
+    case STORAGE_OP_RENAME: return 15;
+    case STORAGE_OP_MKDIR: return 16;
+    case STORAGE_OP_MKNOD: return 17;
+    case STORAGE_OP_RMDIR: return 18;
+    case STORAGE_OP_RELEASE_OBJECT: return 19;
+    case STORAGE_OP_SYNC_ALL: return 20;
     default: return 0;
     }
 }
@@ -91,20 +97,23 @@ static uint64_t filed_kobox_backend_metric_op(uint64_t slot)
     case 1: return STORAGE_OP_MOUNT_ROOT;
     case 2: return STORAGE_OP_LOOKUP;
     case 3: return STORAGE_OP_STATX;
-    case 4: return STORAGE_OP_GETDENTS;
-    case 5: return STORAGE_OP_PREAD;
-    case 6: return STORAGE_OP_PWRITE;
-    case 7: return STORAGE_OP_FSYNC;
-    case 8: return STORAGE_OP_CREATE;
-    case 9: return STORAGE_OP_TRUNCATE;
-    case 10: return STORAGE_OP_UTIMENS;
-    case 11: return STORAGE_OP_CHMOD;
-    case 12: return STORAGE_OP_UNLINK;
-    case 13: return STORAGE_OP_RENAME;
-    case 14: return STORAGE_OP_MKDIR;
-    case 15: return STORAGE_OP_RMDIR;
-    case 16: return STORAGE_OP_RELEASE_OBJECT;
-    case 17: return STORAGE_OP_SYNC_ALL;
+    case 4: return STORAGE_OP_STATFS;
+    case 5: return STORAGE_OP_GETDENTS;
+    case 6: return STORAGE_OP_PREAD;
+    case 7: return STORAGE_OP_PWRITE;
+    case 8: return STORAGE_OP_FSYNC;
+    case 9: return STORAGE_OP_CREATE;
+    case 10: return STORAGE_OP_TRUNCATE;
+    case 11: return STORAGE_OP_UTIMENS;
+    case 12: return STORAGE_OP_CHMOD;
+    case 13: return STORAGE_OP_LINK;
+    case 14: return STORAGE_OP_UNLINK;
+    case 15: return STORAGE_OP_RENAME;
+    case 16: return STORAGE_OP_MKDIR;
+    case 17: return STORAGE_OP_MKNOD;
+    case 18: return STORAGE_OP_RMDIR;
+    case 19: return STORAGE_OP_RELEASE_OBJECT;
+    case 20: return STORAGE_OP_SYNC_ALL;
     default: return 0;
     }
 }
@@ -532,6 +541,42 @@ int filed_kobox_backend_statx(
         &ignored);
     if (status == 0) {
         *out_stat = *(storage_statx_reply_t *)page->addr;
+    }
+    return status;
+}
+
+int filed_kobox_backend_statfs(
+    filed_kobox_backend_t *backend,
+    storage_statfs_reply_t *out_statfs)
+{
+    filed_page_t *page = NULL;
+    uint64_t ignored = 0;
+    if (backend == NULL || out_statfs == NULL) return -1;
+    if (filed_kobox_backend_is_direct(backend)) {
+        if (backend->direct_ops->statfs == NULL) return -95;
+        uint64_t start_cycles = 0;
+        const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
+        const int status = backend->direct_ops->statfs(
+            backend->direct_ctx,
+            out_statfs);
+        return filed_kobox_direct_finish(
+            backend,
+            STORAGE_OP_STATFS,
+            start_ns,
+            start_cycles,
+            status);
+    }
+    int status = filed_kobox_wire_page(backend, &page);
+    if (status != 0) return status;
+    memset(page->addr, 0, sizeof(*out_statfs));
+    status = filed_kobox_call_with_fd(
+        backend,
+        STORAGE_OP_STATFS,
+        0,
+        filed_kobox_wire_page_fd(backend, page),
+        &ignored);
+    if (status == 0) {
+        *out_statfs = *(const storage_statfs_reply_t *)page->addr;
     }
     return status;
 }
@@ -1044,6 +1089,68 @@ int filed_kobox_backend_unlink(
         filed_kobox_backend_mark_dirty(backend);
     }
     return status;
+}
+
+int filed_kobox_backend_link(
+    filed_kobox_backend_t *backend,
+    uint64_t old_object_id,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id)
+{
+    filed_page_t *page = NULL;
+    uint64_t object_id = 0;
+
+    if (backend == NULL || old_object_id == 0 || new_parent_object_id == 0 ||
+        new_name == NULL || out_object_id == NULL)
+    {
+        return -1;
+    }
+    *out_object_id = 0;
+    if (filed_kobox_backend_is_direct(backend)) {
+        if (backend->direct_ops->link == NULL) {
+            return -95;
+        }
+        uint64_t start_cycles = 0;
+        const uint64_t start_ns = filed_kobox_direct_begin(&start_cycles);
+        const int status = backend->direct_ops->link(
+            backend->direct_ctx,
+            old_object_id,
+            new_parent_object_id,
+            new_name,
+            out_object_id);
+        if (status == 0) {
+            filed_kobox_backend_mark_dirty(backend);
+        }
+        return filed_kobox_direct_finish(
+            backend,
+            STORAGE_OP_LINK,
+            start_ns,
+            start_cycles,
+            status);
+    }
+
+    int status = filed_kobox_wire_page(backend, &page);
+    if (status != 0) {
+        return status;
+    }
+    storage_link_request_t *link = (storage_link_request_t *)page->addr;
+    link->old_object_id = old_object_id;
+    link->new_parent_object_id = new_parent_object_id;
+    snprintf(link->new_name, sizeof(link->new_name), "%s", new_name);
+
+    status = filed_kobox_call_with_fd(
+        backend,
+        STORAGE_OP_LINK,
+        0,
+        filed_kobox_wire_page_fd(backend, page),
+        &object_id);
+    if (status != 0) {
+        return status;
+    }
+    *out_object_id = object_id;
+    filed_kobox_backend_mark_dirty(backend);
+    return 0;
 }
 
 int filed_kobox_backend_mkdir(

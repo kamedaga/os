@@ -14,6 +14,11 @@ enum {
     FILED_NEGATIVE_LOOKUP_CACHE_SLOTS = 64,
     /* Leave room in the 256-entry native fd table for IPC and exec fds. */
     FILED_RUNTIME_FILE_VMO_CACHE_SLOTS = 128,
+    /* Immutable snapshots are optional cache owners.  Keep their pins below
+     * half of the 48-entry linked-vnode LRU so concurrent path walks and exec
+     * can still retain working vnodes.  Shared VMOs are required I/O state and
+     * are deliberately not charged to this limit. */
+    FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT = 24,
     FILED_FILE_VMO_MAX_BYTES = 256u * 1024u * 1024u,
     FILED_FILE_VMO_CACHE_TOTAL_BYTES = 512u * 1024u * 1024u,
     FILED_CACHE_OBJECT_SLOTS =
@@ -177,6 +182,9 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
     uint64_t length);
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime);
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
+    filed_runtime_t *runtime,
+    uint64_t length);
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
     filed_runtime_t *runtime,
     uint64_t length);
 uint32_t filed_file_vmo_cache_reclaim_snapshots(

@@ -1,4 +1,7 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "filed/runtime.h"
 
@@ -8,6 +11,7 @@ int main(int argc, char **argv)
     int status;
 
     (void)argc;
+    (void)setenv("KOBOX_DAEMON_NAME", "filed", 1);
     filed_runtime_init(&runtime);
 
     status = filed_runtime_bootstrap(&runtime, argv);

@@ -31,6 +31,7 @@ pub const syscall_process_memory_barrier: u64 = process_abi.syscall_process_memo
 
 pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
 pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
+pub const syscall_system_info: u64 = runtime_abi.syscall_system_info;
 pub const syscall_clock_gettime: u64 = runtime_abi.syscall_clock_gettime;
 pub const syscall_nanosleep: u64 = runtime_abi.syscall_nanosleep;
 pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
@@ -122,6 +123,7 @@ test "native syscall numbers are contiguous" {
         syscall_process_memory_barrier,
         syscall_getpid,
         syscall_gettid,
+        syscall_system_info,
         syscall_clock_gettime,
         syscall_nanosleep,
         syscall_futex_wait,

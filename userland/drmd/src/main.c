@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "drmd/boot_config.h"
 #include "drm_kms.h"
 #include "drmd_service.h"
@@ -9,11 +11,13 @@
 #include <kobox/shim.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(int argc, char **argv)
 {
     (void)argc;
+    (void)setenv("KOBOX_DAEMON_NAME", "drmd", 1);
     struct drmd_boot_config config;
     memset(&config, 0, sizeof(config));
     const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);

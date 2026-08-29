@@ -1,9 +1,9 @@
-pub const syscall_vm_first: u64 = 49;
-pub const syscall_mmap: u64 = 49;
-pub const syscall_munmap: u64 = 50;
-pub const syscall_mprotect: u64 = 51;
-pub const syscall_mremap: u64 = 52;
-pub const syscall_madvise: u64 = 53;
+pub const syscall_vm_first: u64 = 50;
+pub const syscall_mmap: u64 = 50;
+pub const syscall_munmap: u64 = 51;
+pub const syscall_mprotect: u64 = 52;
+pub const syscall_mremap: u64 = 53;
+pub const syscall_madvise: u64 = 54;
 pub const syscall_vm_last: u64 = syscall_madvise;
 pub const syscall_vm_count: u64 = syscall_vm_last - syscall_vm_first + 1;
 

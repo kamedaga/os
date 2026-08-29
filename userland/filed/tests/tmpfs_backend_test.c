@@ -123,6 +123,7 @@ static void test_hardlink_lifetime_and_symlink_alias(void)
     expect_u64("hardlink same object", alias, file);
     memset(&stat, 0, sizeof(stat));
     expect_int("stat hardlink nlink", filed_tmpfs_backend_statx(&tmpfs, file, &stat), 0);
+    expect_u64("hardlink inode identity", stat.inode_number, file);
     expect_u64("hardlink nlink 2", stat.nlink, 2);
     expect_int("lookup alias", filed_tmpfs_backend_lookup(&tmpfs, root, "alias", &lookup), 0);
     expect_u64("lookup alias object", lookup, file);

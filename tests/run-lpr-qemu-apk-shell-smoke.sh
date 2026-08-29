@@ -8,13 +8,14 @@ log_dir=.artifacts/test-results/apk-shell-smoke
 mkdir -p "$log_dir" .artifacts/tmp
 
 if [[ ${SKIP_SYNC:-0} != 1 ]]; then
+  rm -f "$repo_root/.artifacts/disk.img"
   .artifacts/bin/pacgo sync rootfs --force
-  .artifacts/bin/pacgo sync bootfs
+  .artifacts/bin/pacgo sync bootfs --force
 fi
 
 .artifacts/bin/pacgo qemu-test \
   --cpus 4 \
-  --timeout 240s \
+  --timeout 120s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --python tests/qemu_lpr_apk_shell_smoke.py
 

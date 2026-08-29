@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -35,6 +36,10 @@ int main(void)
         "filed service endpoint size");
     failures += expect(sizeof(filed_path_request_t) == 512, "filed path request size");
     failures += expect(sizeof(filed_file_vmo_request_t) == 48, "filed file-vmo request size");
+    failures += expect(sizeof(filed_statx_t) == 128, "filed statx reply size");
+    failures += expect(
+        offsetof(filed_statx_t, inode_number) == 8,
+        "filed statx inode identity offset");
     failures += expect(sizeof(filed_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "filed io fits page");
     failures += expect(sizeof(filed_openat_t) <= FILED_PAGE_BYTES, "filed openat payload fits page");
     failures += expect(
@@ -86,6 +91,21 @@ int main(void)
         LPR_BOOTSTRAP_FD == 245 &&
         LPR_SUPERVISOR_ENDPOINT_FD == 246 && LPRS_BOOT_CONFIG_FD == 247,
         "lpr fixed service and bootstrap fds are distinct and contiguous");
+    failures += expect(
+        LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
+        LPRS_OP_PROCESS_GET_STATE == 3 && LPRS_OP_PROCESS_LIST == 4 &&
+        LPRS_OP_PROCESS_GETSID == 15 &&
+        LPRS_OP_PROCESS_SET_PDEATHSIG == 16 &&
+        LPRS_OP_PROCESS_GET_PDEATHSIG == 17 &&
+        LPRS_OP_SIGNAL_KILL == 18 && LPRS_OP_CWD_GET == 20 &&
+        LPRS_OP_DIAG_ERROR_GET == 23,
+        "lpr supervisor process, signal, cwd, and diagnostic ops are contiguous");
+    failures += expect(
+        sizeof(lprs_process_list_t) == LPRS_PAYLOAD_BYTES,
+        "lpr supervisor process list fills payload");
+    failures += expect(
+        sizeof(lprs_pdeathsig_t) == 24,
+        "lpr supervisor parent-death signal payload size");
 
     pacha_service_envelope_t header;
     memset(&header, 0, sizeof(header));
@@ -103,10 +123,17 @@ int main(void)
 
     failures += expect(
         STORAGE_OP_HELLO == 0 && STORAGE_OP_MOUNT_ROOT == 1 &&
-        STORAGE_OP_LOOKUP == 2 && STORAGE_OP_PREAD == 5 &&
-        STORAGE_OP_CREATE == 8 && STORAGE_OP_MKNOD == 15 &&
-        STORAGE_OP_RELEASE_OBJECT == 17 && STORAGE_OP_DIAG_DUMP == 19,
+        STORAGE_OP_LOOKUP == 2 && STORAGE_OP_STATFS == 4 &&
+        STORAGE_OP_PREAD == 6 && STORAGE_OP_CREATE == 9 &&
+        STORAGE_OP_LINK == 13 && STORAGE_OP_MKNOD == 17 &&
+        STORAGE_OP_RELEASE_OBJECT == 19 && STORAGE_OP_DIAG_DUMP == 21,
         "storage ops are contiguous from zero");
+    failures += expect(sizeof(storage_link_request_t) == 112, "storage link request size");
+    failures += expect(sizeof(storage_statx_reply_t) == 112, "storage statx reply size");
+    failures += expect(sizeof(storage_statfs_reply_t) == 120, "storage statfs reply size");
+    failures += expect(
+        offsetof(storage_statx_reply_t, inode_number) == 8,
+        "storage statx inode identity offset");
     failures += expect(
         NETD_OP_HELLO == 0 && NETD_OP_PAGE_ATTACH == 1 &&
         NETD_OP_SOCKET == 2 && NETD_OP_SOCKETPAIR == 3 &&

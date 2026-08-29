@@ -1072,6 +1072,13 @@ func normalizeCPUCount(cpus int) (int, error) {
 
 const defaultCPUModel = "qemu64,+ssse3,+sse4.1,+sse4.2,+popcnt,+xsave,+avx,+avx2"
 
+func cpuModel(noKVM bool) string {
+	if noKVM {
+		return defaultCPUModel
+	}
+	return "host"
+}
+
 func limineImagePath(workspace *config.Workspace, image string) (string, error) {
 	if image == "" {
 		image = workspace.Path(workspace.Artifacts, "limine-boot.img")
@@ -1202,7 +1209,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	args := []string{
 		qemuPath,
 		"-machine", "q35",
-		"-cpu", defaultCPUModel,
+		"-cpu", cpuModel(opts.NoKVM),
 		"-m", opts.Memory,
 		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",
@@ -1293,7 +1300,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	args := []string{
 		qemuPath,
 		"-machine", "q35",
-		"-cpu", defaultCPUModel,
+		"-cpu", cpuModel(opts.NoKVM),
 		"-m", opts.Memory,
 		"-smp", fmt.Sprint(opts.CPUs),
 		"-monitor", "none",

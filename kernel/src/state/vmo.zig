@@ -111,17 +111,11 @@ const EndpointTable = types.EndpointTable;
 const PublishedEndpointTable = types.PublishedEndpointTable;
 const max_vmo_backing_pages = types.max_vmo_backing_pages;
 const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
-const max_vmo_backing_store_free_ranges = types.max_vmo_backing_store_free_ranges;
-const VmoBackingStoreFreeRange = types.VmoBackingStoreFreeRange;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
 const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
 const vmo_backing_page_store = types.vmo_backing_page_store;
-const vmo_backing_page_store_next = types.vmo_backing_page_store_next;
-const empty_vmo_backing_page_store_free_ranges = types.empty_vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_ranges = types.vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_range_len = types.vmo_backing_page_store_free_range_len;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
 const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
 const empty_fd_tables_extra = types.empty_fd_tables_extra;
@@ -134,13 +128,12 @@ const fdFlagsToBits = types.fdFlagsToBits;
 const fdRightsFromBits = types.fdRightsFromBits;
 const fdRightsToBits = types.fdRightsToBits;
 const isFdRightsSubset = types.isFdRightsSubset;
-const vmObjectBackingFreePageCount = types.vmObjectBackingFreePageCount;
-const removeVmoBackingFreeRange = types.removeVmoBackingFreeRange;
-const insertVmoBackingFreeRange = types.insertVmoBackingFreeRange;
 const allocEmptyVmoBackingPageStore = types.allocEmptyVmoBackingPageStore;
+const growVmoBackingPageStore = types.growVmoBackingPageStore;
 const vmoBackingStoreOwner = types.vmoBackingStoreOwner;
 const vmoBackingPageStorePaddr = types.vmoBackingPageStorePaddr;
 const setVmoBackingPageStorePaddr = types.setVmoBackingPageStorePaddr;
+const setVmoBackingPageStorePaddrs = types.setVmoBackingPageStorePaddrs;
 const freeVmoBackingPageStore = types.freeVmoBackingPageStore;
 const resetVmoBackingPageStore = types.resetVmoBackingPageStore;
 const kernelStaticStorageEndAddr = types.kernelStaticStorageEndAddr;
@@ -181,7 +174,7 @@ pub fn releaseNativeVmoOwnedPages(slot: *NativeVmoSlot, free_list: *FreePageList
             if (paddr == 0) continue;
             if (free_list.canAppendPage(0, paddr)) {
                 free_list.appendPage(0, paddr) catch {};
-                _ = setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, slot.page_store_owner, 0);
+                setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, slot.page_store_owner, 0) catch {};
             }
         }
     }
@@ -273,6 +266,51 @@ pub fn nativeVmoRefCount(self: anytype, vmo_ref: NativeVmoRef) ?u32 {
 pub fn nativeVmoSize(self: anytype, vmo_ref: NativeVmoRef) ?u64 {
     const slot = self.nativeVmoSlotConst(vmo_ref) orelse return null;
     return slot.size_bytes;
+}
+
+/// Extend an unaliased anonymous VMO so an adjacent mapping can share its VMA
+/// entry.  A false result is a no-op; the caller must then install a separate
+/// VMO/VMA as before.
+pub fn growUniqueAnonymousVmo(
+    self: anytype,
+    vmo_ref: NativeVmoRef,
+    additional_size_bytes: u64,
+) bool {
+    if (additional_size_bytes == 0 or
+        additional_size_bytes % native_page_size != 0)
+    {
+        return false;
+    }
+    const slot = self.nativeVmoSlot(vmo_ref) orelse return false;
+    if (slot.kind != .anonymous or slot.ref_count != 1 or
+        !slot.parent.isNull() or !slot.has_page_store or
+        slot.size_bytes % native_page_size != 0)
+    {
+        return false;
+    }
+    if (slot.size_bytes > std.math.maxInt(u64) - additional_size_bytes) {
+        return false;
+    }
+    const new_size = slot.size_bytes + additional_size_bytes;
+    const new_page_count_u64 = new_size / native_page_size;
+    if (new_page_count_u64 == 0 or
+        new_page_count_u64 > max_vmo_backing_pages or
+        new_page_count_u64 > std.math.maxInt(u32))
+    {
+        return false;
+    }
+    const new_page_count: u32 = @intCast(new_page_count_u64);
+    const new_store_start = growVmoBackingPageStore(
+        slot.page_store_start,
+        slot.page_count,
+        new_page_count,
+        slot.page_store_owner,
+    );
+    const committed_store_start = new_store_start orelse return false;
+    slot.page_store_start = committed_store_start;
+    slot.page_count = new_page_count;
+    slot.size_bytes = new_size;
+    return true;
 }
 
 pub fn nativeVmoHasPageStore(self: anytype, vmo_ref: NativeVmoRef) bool {
@@ -367,7 +405,9 @@ pub fn nativeCowTableSlotConst(self: anytype, table_ref: NativeCowTableRef) ?*co
 }
 
 fn appendNativeCowTableChunk(self: anytype, free_list: *FreePageList) KernelError!void {
-    const max_chunk_count = (@as(usize, std.math.maxInt(u32)) + 1) /
+    // Backing-store owner tokens reserve bit 63 for the object kind, leaving
+    // a full u32 generation and a u31 flat COW-table index.
+    const max_chunk_count = (@as(usize, std.math.maxInt(u31)) + 1) /
         native_cow_table_slots_per_chunk;
     if (self.native_cow_table_chunk_count >= max_chunk_count) return KernelError.TableFull;
     const storage = @TypeOf(self.*).allocKernelSlice(NativeCowTableChunk, free_list, 1) orelse
@@ -392,10 +432,14 @@ pub fn createNativeCowTable(
         var offset: usize = 0;
         while (offset < capacity) : (offset += 1) {
             const index = (self.next_native_cow_table_scan + offset) % capacity;
+            if (index > std.math.maxInt(u31)) return KernelError.TableFull;
             const slot = nativeCowTableStorageSlot(self, index) orelse return KernelError.InvalidState;
             if (slot.active or slot.ref_count != 0) continue;
             if (slot.generation == 0) slot.generation = 1;
             const page_store_owner = vmoBackingStoreOwner(.native_cow, @intCast(index), slot.generation);
+            // COW tables may be created directly from a page-fault path. The
+            // sparse backing index has its own innermost lock, so reserving a
+            // logical table does not require the global syscall-state lock.
             const page_store_start = allocEmptyVmoBackingPageStore(page_count, page_store_owner) orelse return KernelError.TableFull;
             slot.active = true;
             slot.ref_count = 0;
@@ -436,7 +480,7 @@ pub fn clearNativeCowPageSlots(
         const paddr = vmoBackingPageStorePaddr(table.page_store_start, table.page_count, page_index) orelse continue;
         if (paddr == 0) continue;
         if (free_list) |fl| fl.appendPage(0, paddr) catch {};
-        _ = setVmoBackingPageStorePaddr(table.page_store_start, table.page_count, page_index, page_store_owner, 0);
+        setVmoBackingPageStorePaddr(table.page_store_start, table.page_count, page_index, page_store_owner, 0) catch {};
     }
 }
 
@@ -496,9 +540,13 @@ pub fn setNativeCowPagePaddr(
     } else {
         return KernelError.InvalidState;
     }
-    if (!setVmoBackingPageStorePaddr(table.page_store_start, table.page_count, page_index, page_store_owner, paddr)) {
-        return KernelError.InvalidState;
-    }
+    try setVmoBackingPageStorePaddr(
+        table.page_store_start,
+        table.page_count,
+        page_index,
+        page_store_owner,
+        paddr,
+    );
 }
 
 pub fn entryCowPageIndex(entry: *const VmaEntry, fault_page_va: u64) ?u32 {
@@ -603,7 +651,7 @@ pub fn releaseUnmappedAnonymousVmoPageRange(
         if (paddr == 0) continue;
         if (free_list.canAppendPage(0, paddr)) {
             free_list.appendPage(0, paddr) catch {};
-            _ = setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page, slot.page_store_owner, 0);
+            setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page, slot.page_store_owner, 0) catch {};
         }
     }
 }
@@ -654,19 +702,15 @@ pub fn installNativeVmoPages(
     if (page_offset > slot.page_count or paddrs.len > @as(usize, slot.page_count) - page_offset) {
         return KernelError.InvalidState;
     }
-    for (paddrs, 0..) |paddr, i| {
-        if ((paddr & 0xFFF) != 0) return KernelError.InvalidState;
-        if (slot.has_page_store) {
-            const existing = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i) orelse 0;
-            if (existing != 0) return KernelError.InvalidState;
-        }
-    }
+    for (paddrs) |paddr| if ((paddr & 0xFFF) != 0) return KernelError.InvalidState;
     try @TypeOf(self.*).ensureNativeVmoPageStore(slot);
-    for (paddrs, 0..) |paddr, i| {
-        if (!setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_offset + i, slot.page_store_owner, paddr)) {
-            return KernelError.InvalidState;
-        }
-    }
+    try setVmoBackingPageStorePaddrs(
+        slot.page_store_start,
+        slot.page_count,
+        page_offset,
+        slot.page_store_owner,
+        paddrs,
+    );
 }
 
 pub fn nativeVmoRefForFd(self: anytype, owner: PrincipalId, fd: Fd) ?NativeVmoRef {

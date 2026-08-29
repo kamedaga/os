@@ -413,7 +413,6 @@ func profileBenchCommand(ctx *context) *cobra.Command {
 		Short: "Run focused boot benchmark profiles",
 	}
 	cmd.AddCommand(profileRunCommand(ctx, "runtime", "chibicc", "[seed0root] storage clean checkpoint status=0", 30*time.Second))
-	cmd.AddCommand(profileRunCommand(ctx, "apk", "apk", "[seed0root] storage clean checkpoint status=0", 60*time.Second))
 	return cmd
 }
 

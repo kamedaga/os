@@ -86,6 +86,24 @@ int main(void)
     processes[1].ppid = 41;
     processes[1].process_fd = 84;
 
+    lprs_process_list_t process_list = {
+        .token = 123,
+        .offset = 0,
+        .capacity = 3,
+    };
+    CHECK(lprs_list_processes(&process_list) == 0);
+    CHECK(process_list.count == 2);
+    CHECK(process_list.pids[0] == 41);
+    CHECK(process_list.pids[1] == 42);
+    process_list.offset = 1;
+    process_list.capacity = 1;
+    process_list.count = 0;
+    CHECK(lprs_list_processes(&process_list) == 0);
+    CHECK(process_list.count == 1);
+    CHECK(process_list.pids[0] == 42);
+    process_list.token = 999;
+    CHECK(lprs_list_processes(&process_list) == PACHA_STATUS_ESRCH);
+
     lprs_notify_exited_child(&processes[1], LPRS_NATIVE_PROCESS_EXITED, 37);
     CHECK(processes[1].exit_ready == 1);
     CHECK(processes[1].exit_status == 37);
@@ -181,6 +199,58 @@ int main(void)
     CHECK(lprs_kill(&kill_request) == 0);
     CHECK(kill_request.delivered == 1);
     CHECK(waiters[0].active == 1);
+
+    lprs_process_t pdeath_processes[3] = {0};
+    g_processes = pdeath_processes;
+    g_process_count = 3;
+    g_process_capacity = 3;
+    pdeath_processes[0].active = 1;
+    pdeath_processes[0].pid = 100;
+    pdeath_processes[0].token = 200;
+    pdeath_processes[0].process_fd = 120;
+    pdeath_processes[1].active = 1;
+    pdeath_processes[1].pid = 101;
+    pdeath_processes[1].ppid = 100;
+    pdeath_processes[1].token = 201;
+    pdeath_processes[1].process_fd = 121;
+    pdeath_processes[2].active = 1;
+    pdeath_processes[2].pid = 102;
+    pdeath_processes[2].ppid = 100;
+    pdeath_processes[2].token = 202;
+    pdeath_processes[2].process_fd = 122;
+
+    lprs_pdeathsig_t pdeath_request = {
+        .token = 201,
+        .signal = 9,
+    };
+    CHECK(lprs_set_pdeathsig(&pdeath_request) == 0);
+    CHECK(pdeath_processes[1].pdeath_signal == 9);
+    pdeath_request.signal = 0;
+    pdeath_request.result = 0;
+    CHECK(lprs_get_pdeathsig(&pdeath_request) == 0);
+    CHECK(pdeath_request.result == 9);
+
+    /* CapabilityOS exec replaces the current process image in place.  The
+     * staged process handle is temporary, while Linux prctl state belongs to
+     * the surviving logical process. */
+    g_closed_fd_count = 0;
+    CHECK(lprs_exec_commit_begin(201, 130) == 0);
+    CHECK(lprs_exec_commit_done(201) == 0);
+    CHECK(pdeath_processes[1].process_fd == 121);
+    CHECK(pdeath_processes[1].pending_exec_fd == -1);
+    CHECK(pdeath_processes[1].pdeath_signal == 9);
+    CHECK(g_closed_fd_count == 1 && g_closed_fds[0] == 130);
+
+    g_syscall_count = 0;
+    g_syscall_result = 0;
+    lprs_orphan_children(100);
+    CHECK(g_syscall_count == 1);
+    CHECK(g_syscall_nr == PACHA_PROCESS_SYSCALL_KILL);
+    CHECK(g_syscall_a0 == 121);
+    CHECK(g_syscall_a1 == 137);
+    CHECK(pdeath_processes[1].pdeath_signal == 0);
+    CHECK(pdeath_processes[1].ppid == 0);
+    CHECK(pdeath_processes[2].ppid == 0);
 
     puts("LPRS_CHILD_NOTIFICATION_UNIT=OK");
     return 0;

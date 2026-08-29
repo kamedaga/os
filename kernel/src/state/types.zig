@@ -788,7 +788,8 @@ pub const NativeVmoSlot = struct {
     generation: u32 = 1,
     size_bytes: u64 = 0,
     page_count: u32 = 0,
-    page_store_start: u32 = 0,
+    // Opaque kernel-internal owner token for sparse backing-page lookup.
+    page_store_start: u64 = 0,
     page_store_owner: u64 = 0,
     has_page_store: bool = false,
     ref_count: u32 = 0,
@@ -801,7 +802,8 @@ pub const NativeCowTableSlot = struct {
     generation: u32 = 1,
     ref_count: u32 = 0,
     page_count: u32 = 0,
-    page_store_start: u32 = 0,
+    // Opaque kernel-internal owner token for sparse backing-page lookup.
+    page_store_start: u64 = 0,
 };
 
 // NativeCowTableRef keeps a flat index. Chunks are append-only so a fault path
@@ -907,52 +909,29 @@ pub const NativeVmaFaultPlan = struct {
     source_paddr: u64 = 0,
 };
 
-pub fn vmObjectBackingFreePageCount() u64 {
-    vmo_backing_page_store_lock.lock();
-    defer vmo_backing_page_store_lock.unlock();
-    var pages: u64 = 0;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        pages += vmo_backing_page_store_free_ranges[i].len;
-    }
-    return pages;
-}
-
 /// Post-mortem view of the VM-object backing store.
 ///
-/// The store is a fixed array with a first-fit free list and a bump tail, so a
-/// large total of free entries says nothing about whether one request fits.
-/// Reporting the largest run and the tail separately is what distinguishes
-/// exhaustion from fragmentation.
+/// Only instantiated physical pages consume entries. One physical slot stays
+/// empty so deletion can rebuild an open-addressing cluster without a
+/// tombstone or an ambiguous full-table state.
 pub const VmObjectBackingStoreStats = struct {
     capacity: u64,
-    bump_next: u64,
-    free_total: u64,
-    free_ranges: u64,
-    largest_free_run: u64,
-    tail_free: u64,
+    used_entries: u64,
+    free_entries: u64,
 };
 
 pub fn vmObjectBackingStoreStats() VmObjectBackingStoreStats {
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
-    var total: u64 = 0;
-    var largest: u64 = 0;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        const len: u64 = vmo_backing_page_store_free_ranges[i].len;
-        total += len;
-        if (len > largest) largest = len;
-    }
-    const capacity: u64 = @intCast(vmo_backing_page_store.len);
-    const next: u64 = @intCast(vmo_backing_page_store_next);
+    const capacity: u64 = if (vmo_backing_page_store.len > 0)
+        @intCast(vmo_backing_page_store.len - 1)
+    else
+        0;
+    const used: u64 = @intCast(vmo_backing_page_store_used);
     return .{
         .capacity = capacity,
-        .bump_next = next,
-        .free_total = total,
-        .free_ranges = @intCast(vmo_backing_page_store_free_range_len),
-        .largest_free_run = largest,
-        .tail_free = if (capacity > next) capacity - next else 0,
+        .used_entries = used,
+        .free_entries = if (capacity > used) capacity - used else 0,
     };
 }
 
@@ -1041,22 +1020,14 @@ pub const PublishedEndpointTable = struct {
 
 pub const max_vmo_backing_pages: usize = 131072;
 pub const max_vmo_backing_store_pages: usize = 1048576;
-pub const max_vmo_backing_store_free_ranges: usize = 1024;
 
 pub var empty_vmo_backing_page_store: [0]u64 = .{};
 pub var vmo_backing_page_store: []u64 = empty_vmo_backing_page_store[0..];
 pub var empty_vmo_backing_page_store_owners: [0]u64 = .{};
 pub var vmo_backing_page_store_owners: []u64 = empty_vmo_backing_page_store_owners[0..];
-pub var vmo_backing_page_store_next: usize = 0;
-
-pub const VmoBackingStoreFreeRange = struct {
-    start: u32 = 0,
-    len: u32 = 0,
-};
-
-pub var empty_vmo_backing_page_store_free_ranges: [0]VmoBackingStoreFreeRange = .{};
-pub var vmo_backing_page_store_free_ranges: []VmoBackingStoreFreeRange = empty_vmo_backing_page_store_free_ranges[0..];
-pub var vmo_backing_page_store_free_range_len: usize = 0;
+pub var empty_vmo_backing_page_store_page_indices: [0]u32 = .{};
+pub var vmo_backing_page_store_page_indices: []u32 = empty_vmo_backing_page_store_page_indices[0..];
+pub var vmo_backing_page_store_used: usize = 0;
 
 /// The VM-object backing arrays are reached from both syscall and fault paths,
 /// whose outer locks are intentionally unrelated. This lock is therefore the
@@ -1099,13 +1070,12 @@ const VmoBackingPageStoreLock = struct {
 
 var vmo_backing_page_store_lock: VmoBackingPageStoreLock = .{};
 
-/// Compact, permanent evidence that the owner ledger rejected an operation.
-/// The per-page owner array costs 8 MiB at maximum capacity; unlike the former
-/// writer/provenance ledgers, it directly prevents silent cross-object reuse.
+/// Compact, permanent evidence that the sparse owner ledger rejected an
+/// operation. This records the first mismatch while retaining a total count.
 pub const VmoBackingStoreOwnershipFault = struct {
     count: u64 = 0,
-    operation: u8 = 0, // 1 allocate, 2 free, 3 write, 4 free-list insertion
-    start: u32 = 0,
+    operation: u8 = 0, // 1 allocate, 2 free, 3 write
+    start: u64 = 0,
     len: u32 = 0,
     index: u32 = 0,
     expected: u64 = 0,
@@ -1120,14 +1090,15 @@ pub const VmoBackingStoreOwnerKind = enum(u1) {
 };
 
 pub fn vmoBackingStoreOwner(kind: VmoBackingStoreOwnerKind, index: u32, generation: u32) u64 {
+    if (index > std.math.maxInt(u31) or generation == 0) return 0;
     const kind_bit = @as(u64, @intFromEnum(kind)) << 63;
-    const generation_bits = (@as(u64, generation) & 0x7fff_ffff) << 32;
+    const generation_bits = @as(u64, generation) << 31;
     return kind_bit | generation_bits | index;
 }
 
 fn recordVmoBackingStoreOwnershipFaultLocked(
     operation: u8,
-    start: u32,
+    start: u64,
     len: u32,
     index: u32,
     expected: u64,
@@ -1149,180 +1120,231 @@ pub fn vmoBackingStoreOwnershipFault() VmoBackingStoreOwnershipFault {
     return vmo_backing_store_ownership_fault;
 }
 
-fn removeVmoBackingFreeRangeLocked(index: usize) void {
-    if (index >= vmo_backing_page_store_free_range_len) return;
-    var i = index + 1;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        vmo_backing_page_store_free_ranges[i - 1] = vmo_backing_page_store_free_ranges[i];
-    }
-    vmo_backing_page_store_free_range_len -= 1;
+fn vmoBackingPageStoreReadyLocked() bool {
+    return vmo_backing_page_store.len >= 2 and
+        vmo_backing_page_store_owners.len == vmo_backing_page_store.len and
+        vmo_backing_page_store_page_indices.len == vmo_backing_page_store.len and
+        vmo_backing_page_store_used < vmo_backing_page_store.len;
 }
 
-pub fn removeVmoBackingFreeRange(index: usize) void {
-    vmo_backing_page_store_lock.lock();
-    defer vmo_backing_page_store_lock.unlock();
-    removeVmoBackingFreeRangeLocked(index);
+fn mixVmoBackingPageStoreKey(owner: u64, page_index: u32) u64 {
+    var value = owner ^ (@as(u64, page_index) *% 0x9e37_79b9_7f4a_7c15);
+    value ^= value >> 30;
+    value *%= 0xbf58_476d_1ce4_e5b9;
+    value ^= value >> 27;
+    value *%= 0x94d0_49bb_1331_11eb;
+    value ^= value >> 31;
+    return value;
 }
 
-fn insertVmoBackingFreeRangeLocked(start: u32, len: u32) bool {
-    if (len == 0) return true;
-    var merged_start = start;
-    var merged_len = len;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) {
-        const range = vmo_backing_page_store_free_ranges[i];
-        const range_end = range.start + range.len;
-        const merged_end = merged_start + merged_len;
-        if (range_end < merged_start or merged_end < range.start) {
-            i += 1;
-            continue;
+fn vmoBackingPageStoreBucketLocked(owner: u64, page_index: u32) usize {
+    return @intCast(mixVmoBackingPageStoreKey(owner, page_index) % vmo_backing_page_store.len);
+}
+
+fn findVmoBackingPageStoreSlotLocked(owner: u64, page_index: u32) ?usize {
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0) return null;
+    var slot_index = vmoBackingPageStoreBucketLocked(owner, page_index);
+    var probes: usize = 0;
+    while (probes < vmo_backing_page_store.len) : (probes += 1) {
+        const actual_owner = vmo_backing_page_store_owners[slot_index];
+        if (actual_owner == 0) return null;
+        if (actual_owner == owner and
+            vmo_backing_page_store_page_indices[slot_index] == page_index)
+        {
+            return slot_index;
         }
-        if (range.start < merged_start) merged_start = range.start;
-        const new_end = if (range_end > merged_end) range_end else merged_end;
-        merged_len = new_end - merged_start;
-        removeVmoBackingFreeRangeLocked(i);
+        slot_index = if (slot_index + 1 == vmo_backing_page_store.len) 0 else slot_index + 1;
     }
-    if (vmo_backing_page_store_free_range_len >= vmo_backing_page_store_free_ranges.len) return false;
-    vmo_backing_page_store_free_ranges[vmo_backing_page_store_free_range_len] = .{
-        .start = merged_start,
-        .len = merged_len,
-    };
-    vmo_backing_page_store_free_range_len += 1;
-    return true;
+    return null;
 }
 
-fn unusedVmoBackingRangeLocked(start: u32, len: u32, operation: u8) bool {
-    const start_usize: usize = @intCast(start);
-    const len_usize: usize = @intCast(len);
-    if (start_usize + len_usize > vmo_backing_page_store.len or
-        start_usize + len_usize > vmo_backing_page_store_owners.len)
+fn insertVmoBackingPageStoreSlotLocked(owner: u64, page_index: u32, paddr: u64) KernelError!usize {
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or paddr == 0 or
+        (paddr & 0xFFF) != 0)
     {
-        return false;
+        return KernelError.InvalidState;
     }
-    var index: usize = 0;
-    while (index < len_usize) : (index += 1) {
-        const owner = vmo_backing_page_store_owners[start_usize + index];
-        if (owner != 0) {
-            recordVmoBackingStoreOwnershipFaultLocked(operation, start, len, @intCast(index), 0, owner);
-            return false;
+    var slot_index = vmoBackingPageStoreBucketLocked(owner, page_index);
+    var probes: usize = 0;
+    while (probes < vmo_backing_page_store.len) : (probes += 1) {
+        const actual_owner = vmo_backing_page_store_owners[slot_index];
+        if (actual_owner == 0) {
+            // Keep one physical slot empty so delete/reinsert cannot turn the
+            // table into a probe cycle with no terminating empty bucket.
+            if (vmo_backing_page_store_used >= vmo_backing_page_store.len - 1) {
+                return KernelError.TableFull;
+            }
+            vmo_backing_page_store[slot_index] = paddr;
+            vmo_backing_page_store_page_indices[slot_index] = page_index;
+            vmo_backing_page_store_owners[slot_index] = owner;
+            vmo_backing_page_store_used += 1;
+            return slot_index;
         }
-        const paddr = vmo_backing_page_store[start_usize + index];
-        if (paddr != 0) {
-            recordVmoBackingStoreOwnershipFaultLocked(operation, start, len, @intCast(index), 0, paddr);
-            return false;
+        if (actual_owner == owner and
+            vmo_backing_page_store_page_indices[slot_index] == page_index)
+        {
+            vmo_backing_page_store[slot_index] = paddr;
+            return slot_index;
         }
+        slot_index = if (slot_index + 1 == vmo_backing_page_store.len) 0 else slot_index + 1;
     }
-    return true;
+    return KernelError.TableFull;
 }
 
-pub fn insertVmoBackingFreeRange(start: u32, len: u32, owner: u64) bool {
-    _ = owner;
-    vmo_backing_page_store_lock.lock();
-    defer vmo_backing_page_store_lock.unlock();
-    if (!unusedVmoBackingRangeLocked(start, len, 4)) return false;
-    return insertVmoBackingFreeRangeLocked(start, len);
+fn removeVmoBackingPageStoreSlotLocked(slot_index: usize) void {
+    if (slot_index >= vmo_backing_page_store.len or
+        vmo_backing_page_store_owners[slot_index] == 0)
+    {
+        return;
+    }
+    vmo_backing_page_store[slot_index] = 0;
+    vmo_backing_page_store_page_indices[slot_index] = 0;
+    vmo_backing_page_store_owners[slot_index] = 0;
+    vmo_backing_page_store_used -= 1;
+
+    var scan = if (slot_index + 1 == vmo_backing_page_store.len) 0 else slot_index + 1;
+    var probes: usize = 0;
+    while (probes < vmo_backing_page_store.len) : (probes += 1) {
+        const owner = vmo_backing_page_store_owners[scan];
+        if (owner == 0) return;
+        const page_index = vmo_backing_page_store_page_indices[scan];
+        const paddr = vmo_backing_page_store[scan];
+        vmo_backing_page_store[scan] = 0;
+        vmo_backing_page_store_page_indices[scan] = 0;
+        vmo_backing_page_store_owners[scan] = 0;
+        vmo_backing_page_store_used -= 1;
+        _ = insertVmoBackingPageStoreSlotLocked(owner, page_index, paddr) catch unreachable;
+        scan = if (scan + 1 == vmo_backing_page_store.len) 0 else scan + 1;
+    }
+    unreachable;
 }
 
-pub fn allocEmptyVmoBackingPageStore(page_count: usize, owner: u64) ?u32 {
-    if (page_count == 0 or page_count > max_vmo_backing_pages or owner == 0) return null;
+pub fn allocEmptyVmoBackingPageStore(page_count: usize, owner: u64) ?u64 {
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
-    var start: usize = 0;
-    var free_index: ?usize = null;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        if (vmo_backing_page_store_free_ranges[i].len < page_count) continue;
-        start = vmo_backing_page_store_free_ranges[i].start;
-        free_index = i;
-        break;
+    if (!vmoBackingPageStoreReadyLocked() or page_count == 0 or
+        page_count > max_vmo_backing_pages or owner == 0)
+    {
+        return null;
     }
-    if (free_index) |index| {
-        if (!unusedVmoBackingRangeLocked(@intCast(start), @intCast(page_count), 1)) return null;
-        const consumed: u32 = @intCast(page_count);
-        vmo_backing_page_store_free_ranges[index].start += consumed;
-        vmo_backing_page_store_free_ranges[index].len -= consumed;
-        if (vmo_backing_page_store_free_ranges[index].len == 0) removeVmoBackingFreeRangeLocked(index);
-    } else {
-        if (vmo_backing_page_store_next + page_count > vmo_backing_page_store.len) return null;
-        start = vmo_backing_page_store_next;
-        if (!unusedVmoBackingRangeLocked(@intCast(start), @intCast(page_count), 1)) return null;
-        vmo_backing_page_store_next += page_count;
-    }
-    @memset(vmo_backing_page_store_owners[start .. start + page_count], owner);
-    return @intCast(start);
+    return owner;
 }
 
-pub fn vmoBackingPageStorePaddr(start: u32, page_count: u32, page_index: usize) ?u64 {
+/// Logical VMO growth needs no sparse metadata until a physical page appears.
+pub fn growVmoBackingPageStore(
+    start: u64,
+    old_page_count: u32,
+    new_page_count: u32,
+    owner: u64,
+) ?u64 {
+    if (owner == 0 or start != owner or old_page_count == 0 or
+        new_page_count <= old_page_count or
+        new_page_count > max_vmo_backing_pages)
+    {
+        return null;
+    }
+
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
-    if (page_index >= page_count) return null;
-    const store_index = @as(usize, start) + page_index;
-    if (store_index >= vmo_backing_page_store.len) return null;
-    const paddr = vmo_backing_page_store[store_index];
+    if (!vmoBackingPageStoreReadyLocked()) return null;
+    return start;
+}
+
+pub fn vmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize) ?u64 {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or start == 0 or page_index >= page_count or
+        page_index > std.math.maxInt(u32))
+    {
+        return null;
+    }
+    const slot_index = findVmoBackingPageStoreSlotLocked(start, @intCast(page_index)) orelse
+        return 0;
+    const paddr = vmo_backing_page_store[slot_index];
     if ((paddr & 0xFFF) != 0) return null;
     return paddr;
 }
 
-pub fn setVmoBackingPageStorePaddr(start: u32, page_count: u32, page_index: usize, owner: u64, paddr: u64) bool {
+pub fn setVmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize, owner: u64, paddr: u64) KernelError!void {
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
-    if ((paddr & 0xFFF) != 0) return false;
-    if (page_index >= page_count) return false;
-    const store_index = @as(usize, start) + page_index;
-    if (store_index >= vmo_backing_page_store.len) return false;
-    if (store_index >= vmo_backing_page_store_owners.len) return false;
-    const actual_owner = vmo_backing_page_store_owners[store_index];
-    if (actual_owner != owner) {
-        recordVmoBackingStoreOwnershipFaultLocked(3, start, page_count, @intCast(page_index), owner, actual_owner);
-        return false;
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner or
+        (paddr & 0xFFF) != 0 or page_index >= page_count or
+        page_index > std.math.maxInt(u32))
+    {
+        recordVmoBackingStoreOwnershipFaultLocked(
+            3,
+            start,
+            page_count,
+            if (page_index <= std.math.maxInt(u32)) @intCast(page_index) else std.math.maxInt(u32),
+            owner,
+            start,
+        );
+        return KernelError.InvalidState;
     }
-    vmo_backing_page_store[store_index] = paddr;
-    return true;
+    const key_index: u32 = @intCast(page_index);
+    if (paddr == 0) {
+        const slot_index = findVmoBackingPageStoreSlotLocked(owner, key_index) orelse return;
+        removeVmoBackingPageStoreSlotLocked(slot_index);
+        return;
+    }
+    _ = try insertVmoBackingPageStoreSlotLocked(owner, key_index, paddr);
 }
 
-pub fn freeVmoBackingPageStore(start: u32, page_count: u32, owner: u64) bool {
+pub fn setVmoBackingPageStorePaddrs(
+    start: u64,
+    page_count: u32,
+    page_offset: usize,
+    owner: u64,
+    paddrs: []const u64,
+) KernelError!void {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner or
+        paddrs.len == 0 or page_offset > page_count or
+        paddrs.len > @as(usize, page_count) - page_offset)
+    {
+        return KernelError.InvalidState;
+    }
+
+    var required: usize = 0;
+    for (paddrs, 0..) |paddr, offset| {
+        if ((paddr & 0xFFF) != 0 or page_offset + offset > std.math.maxInt(u32)) {
+            return KernelError.InvalidState;
+        }
+        const page_index: u32 = @intCast(page_offset + offset);
+        if (findVmoBackingPageStoreSlotLocked(owner, page_index)) |slot_index| {
+            if (vmo_backing_page_store[slot_index] != 0) return KernelError.InvalidState;
+        } else if (paddr != 0) {
+            required += 1;
+        }
+    }
+    const usable_capacity = vmo_backing_page_store.len - 1;
+    if (required > usable_capacity - vmo_backing_page_store_used) return KernelError.TableFull;
+
+    for (paddrs, 0..) |paddr, offset| {
+        if (paddr == 0) continue;
+        _ = insertVmoBackingPageStoreSlotLocked(
+            owner,
+            @intCast(page_offset + offset),
+            paddr,
+        ) catch unreachable;
+    }
+}
+
+pub fn freeVmoBackingPageStore(start: u64, page_count: u32, owner: u64) bool {
     if (page_count == 0) return true;
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
-    const start_usize: usize = @intCast(start);
-    const count_usize: usize = @intCast(page_count);
-    if (start_usize + count_usize > vmo_backing_page_store.len or
-        start_usize + count_usize > vmo_backing_page_store_owners.len)
-    {
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner) {
+        recordVmoBackingStoreOwnershipFaultLocked(2, start, page_count, 0, owner, start);
         return false;
     }
-    var owner_index: usize = 0;
-    while (owner_index < count_usize) : (owner_index += 1) {
-        const store_index = start_usize + owner_index;
-        const actual_owner = vmo_backing_page_store_owners[store_index];
-        if (actual_owner != owner) {
-            recordVmoBackingStoreOwnershipFaultLocked(2, start, page_count, @intCast(owner_index), owner, actual_owner);
-            return false;
-        }
+    var page_index: u32 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const slot_index = findVmoBackingPageStoreSlotLocked(owner, page_index) orelse continue;
+        removeVmoBackingPageStoreSlotLocked(slot_index);
     }
-
-    if (start_usize + count_usize == vmo_backing_page_store_next) {
-        @memset(vmo_backing_page_store[start_usize .. start_usize + count_usize], 0);
-        @memset(vmo_backing_page_store_owners[start_usize .. start_usize + count_usize], 0);
-        vmo_backing_page_store_next = start_usize;
-        while (true) {
-            var absorbed = false;
-            var i: usize = 0;
-            while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-                const range = vmo_backing_page_store_free_ranges[i];
-                if (@as(usize, range.start) + @as(usize, range.len) != vmo_backing_page_store_next) continue;
-                vmo_backing_page_store_next = range.start;
-                removeVmoBackingFreeRangeLocked(i);
-                absorbed = true;
-                break;
-            }
-            if (!absorbed) break;
-        }
-        return true;
-    }
-    if (!insertVmoBackingFreeRangeLocked(start, @intCast(page_count))) return false;
-    @memset(vmo_backing_page_store[start_usize .. start_usize + count_usize], 0);
-    @memset(vmo_backing_page_store_owners[start_usize .. start_usize + count_usize], 0);
     return true;
 }
 
@@ -1331,10 +1353,40 @@ pub fn resetVmoBackingPageStore() void {
     defer vmo_backing_page_store_lock.unlock();
     @memset(vmo_backing_page_store[0..], 0);
     @memset(vmo_backing_page_store_owners[0..], 0);
-    @memset(vmo_backing_page_store_free_ranges[0..], .{});
-    vmo_backing_page_store_next = 0;
-    vmo_backing_page_store_free_range_len = 0;
+    @memset(vmo_backing_page_store_page_indices[0..], 0);
+    vmo_backing_page_store_used = 0;
     vmo_backing_store_ownership_fault = .{};
+}
+
+pub fn vmoBackingPageStoreBucketForTest(owner: u64, page_index: u32) ?usize {
+    if (!builtin.is_test) return null;
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0) return null;
+    return vmoBackingPageStoreBucketLocked(owner, page_index);
+}
+
+pub fn initVmoBackingPageStoreForTest(
+    paddrs: []u64,
+    owners: []u64,
+    page_indices: []u32,
+) bool {
+    if (!builtin.is_test or paddrs.len < 2 or owners.len != paddrs.len or
+        page_indices.len != paddrs.len)
+    {
+        return false;
+    }
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    vmo_backing_page_store = paddrs;
+    vmo_backing_page_store_owners = owners;
+    vmo_backing_page_store_page_indices = page_indices;
+    @memset(vmo_backing_page_store, 0);
+    @memset(vmo_backing_page_store_owners, 0);
+    @memset(vmo_backing_page_store_page_indices, 0);
+    vmo_backing_page_store_used = 0;
+    vmo_backing_store_ownership_fault = .{};
+    return true;
 }
 
 pub fn lockVmoBackingPageStoreForTest() bool {
@@ -1360,9 +1412,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store), &vmo_backing_page_store));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_owners), &vmo_backing_page_store_owners));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_next), &vmo_backing_page_store_next));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_ranges), &vmo_backing_page_store_free_ranges));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_range_len), &vmo_backing_page_store_free_range_len));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_page_indices), &vmo_backing_page_store_page_indices));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_used), &vmo_backing_page_store_used));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_lock), &vmo_backing_page_store_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_store_ownership_fault), &vmo_backing_store_ownership_fault));
     return end;
@@ -1383,8 +1434,8 @@ pub fn runtimeStorageBytes() usize {
     cursor += @sizeOf(u64) * max_vmo_backing_store_pages;
     cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
     cursor += @sizeOf(u64) * max_vmo_backing_store_pages;
-    cursor = std.mem.alignForward(usize, cursor, @alignOf(VmoBackingStoreFreeRange));
-    cursor += @sizeOf(VmoBackingStoreFreeRange) * max_vmo_backing_store_free_ranges;
+    cursor = std.mem.alignForward(usize, cursor, @alignOf(u32));
+    cursor += @sizeOf(u32) * max_vmo_backing_store_pages;
     return std.mem.alignForward(usize, cursor, 4096);
 }
 
@@ -1394,13 +1445,12 @@ pub fn initRuntimeStorage(storage: []align(4096) u8) bool {
     var cursor: usize = 0;
     vmo_backing_page_store = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
     vmo_backing_page_store_owners = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
-    vmo_backing_page_store_free_ranges = runtimeStorageSlice(VmoBackingStoreFreeRange, storage, &cursor, max_vmo_backing_store_free_ranges) orelse return false;
+    vmo_backing_page_store_page_indices = runtimeStorageSlice(u32, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
 
     @memset(vmo_backing_page_store, 0);
     @memset(vmo_backing_page_store_owners, 0);
-    @memset(vmo_backing_page_store_free_ranges, .{});
-    vmo_backing_page_store_next = 0;
-    vmo_backing_page_store_free_range_len = 0;
+    @memset(vmo_backing_page_store_page_indices, 0);
+    vmo_backing_page_store_used = 0;
     vmo_backing_store_ownership_fault = .{};
     return true;
 }

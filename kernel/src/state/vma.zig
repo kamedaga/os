@@ -110,17 +110,11 @@ const EndpointTable = types.EndpointTable;
 const PublishedEndpointTable = types.PublishedEndpointTable;
 const max_vmo_backing_pages = types.max_vmo_backing_pages;
 const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
-const max_vmo_backing_store_free_ranges = types.max_vmo_backing_store_free_ranges;
-const VmoBackingStoreFreeRange = types.VmoBackingStoreFreeRange;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
 const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
 const vmo_backing_page_store = types.vmo_backing_page_store;
-const vmo_backing_page_store_next = types.vmo_backing_page_store_next;
-const empty_vmo_backing_page_store_free_ranges = types.empty_vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_ranges = types.vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_range_len = types.vmo_backing_page_store_free_range_len;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
 const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
 const empty_fd_tables_extra = types.empty_fd_tables_extra;
@@ -133,9 +127,6 @@ const fdFlagsToBits = types.fdFlagsToBits;
 const fdRightsFromBits = types.fdRightsFromBits;
 const fdRightsToBits = types.fdRightsToBits;
 const isFdRightsSubset = types.isFdRightsSubset;
-const vmObjectBackingFreePageCount = types.vmObjectBackingFreePageCount;
-const removeVmoBackingFreeRange = types.removeVmoBackingFreeRange;
-const insertVmoBackingFreeRange = types.insertVmoBackingFreeRange;
 const allocEmptyVmoBackingPageStore = types.allocEmptyVmoBackingPageStore;
 const vmoBackingPageStorePaddr = types.vmoBackingPageStorePaddr;
 const setVmoBackingPageStorePaddr = types.setVmoBackingPageStorePaddr;
@@ -832,11 +823,32 @@ pub fn commitNativeVmaCowMapping(
     const current_source = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
     if (current_source != plan.source_paddr) return null;
 
-    self.ensureEntryCowTable(entry, free_list) catch return null;
+    self.ensureEntryCowTable(entry, free_list) catch |err| {
+        const store = types.vmObjectBackingStoreStats();
+        kernel_log.writeFmt(
+            "cow: commit failure stage=ensure_table err={s} vma_start=0x{x} " ++
+                "vma_pages={} store_used={} store_capacity={} store_free={}\n",
+            .{
+                @errorName(err),
+                entry.start_va,
+                entry.size_bytes / native_page_size,
+                store.used_entries,
+                store.capacity,
+                store.free_entries,
+            },
+        );
+        return null;
+    };
     if (!self.nativeCowTableIsUnique(entry.cow_table)) return null;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, plan.fault_page_va) orelse return null;
     if (cow_page != plan.cow_page_index and !plan.cow_table.isNull()) return null;
-    self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr) catch return null;
+    self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr) catch |err| {
+        kernel_log.writeFmt(
+            "cow: commit failure stage=install_page err={s} vma_start=0x{x} cow_page={}\n",
+            .{ @errorName(err), entry.start_va, cow_page },
+        );
+        return null;
+    };
     return writableCowFaultMapping(entry, candidate_paddr);
 }
 
@@ -1255,10 +1267,9 @@ pub fn vmaMaxProtForRights(rights: FdRights, pkey: u4) VmaProt {
 }
 
 pub fn vmaProtAllowedByMax(prot: VmaProt, max_prot: VmaProt) bool {
-    // W^X is a VMA invariant, not merely a syscall-parser convention.  The
-    // ceiling may contain both bits so an RW image can transition to RX, but
-    // no installed current protection may enable both simultaneously.
-    if (prot.write and prot.exec) return false;
+    // Read, write, and execute are independent VM ABI permissions.  Policy
+    // must not silently narrow a requested combination once the mapping
+    // authority represented by max_prot grants all of its bits.
     if (prot.pkey != max_prot.pkey) return false;
     if (prot.read and !max_prot.read) return false;
     if (prot.write and !max_prot.write) return false;
@@ -1350,6 +1361,105 @@ pub fn createContiguousVmoFdWithPages(
     return fd;
 }
 
+/// How full the two per-process/global tables behind an anonymous mapping are.
+///
+/// `TableFull` on a four-kilobyte mapping is reported to userspace as ENOMEM,
+/// which sends the reader looking for exhausted memory instead of an exhausted
+/// table.  Naming the table costs one error-path scan.
+pub const AnonymousMapCapacity = struct {
+    vmas_active: u64,
+    vmas_capacity: u64,
+    vmos_active: u64,
+    vmos_capacity: u64,
+    /// Composition of the exhausted table: many single-page anonymous entries
+    /// mean an allocator whose separate mappings never rejoin, while a spread
+    /// of larger file-backed entries means something else entirely.
+    vmas_anonymous: u64,
+    vmas_single_page: u64,
+    vmas_bytes: u64,
+    vmas_lowest_va: u64,
+    vmas_highest_end_va: u64,
+};
+
+pub fn anonymousMapCapacity(self: anytype, owner: PrincipalId) AnonymousMapCapacity {
+    var vmas_active: u64 = 0;
+    var vmas_anonymous: u64 = 0;
+    var vmas_single_page: u64 = 0;
+    var vmas_bytes: u64 = 0;
+    var vmas_lowest_va: u64 = std.math.maxInt(u64);
+    var vmas_highest_end_va: u64 = 0;
+    if (self.getVmaTableConst(owner)) |table| {
+        vmas_active = @intCast(table.active_count);
+        var index: usize = 0;
+        while (index < table.entries.len) : (index += 1) {
+            const entry = &table.entries[index];
+            if (!entry.active) continue;
+            if (entry.flags.anonymous) vmas_anonymous += 1;
+            if (entry.size_bytes == native_page_size) vmas_single_page += 1;
+            vmas_bytes += entry.size_bytes;
+            if (entry.start_va < vmas_lowest_va) vmas_lowest_va = entry.start_va;
+            if (entry.endVa() > vmas_highest_end_va) vmas_highest_end_va = entry.endVa();
+        }
+    }
+    if (vmas_lowest_va == std.math.maxInt(u64)) vmas_lowest_va = 0;
+    var vmos_active: u64 = 0;
+    var index: usize = 0;
+    while (index < max_native_vmos) : (index += 1) {
+        const slot = &self.native_vmos[index];
+        if (slot.kind != .none or slot.ref_count != 0) vmos_active += 1;
+    }
+    return .{
+        .vmas_active = vmas_active,
+        .vmas_capacity = @intCast(max_vmas_per_process),
+        .vmos_active = vmos_active,
+        .vmos_capacity = @intCast(max_native_vmos),
+        .vmas_anonymous = vmas_anonymous,
+        .vmas_single_page = vmas_single_page,
+        .vmas_bytes = vmas_bytes,
+        .vmas_lowest_va = vmas_lowest_va,
+        .vmas_highest_end_va = vmas_highest_end_va,
+    };
+}
+
+fn anonymousVmaCanGrow(
+    self: anytype,
+    owner: PrincipalId,
+    entry: *const VmaEntry,
+    start_va: u64,
+    prot: VmaProt,
+    max_prot: VmaProt,
+    flags: MmapFlags,
+) bool {
+    if (!entry.active or entry.endVa() != start_va or
+        !flags.anonymous or !flags.private or flags.shared or
+        flags.fixed or flags.fixed_noreplace or flags.fork_cow or
+        !entry.flags.anonymous or !entry.flags.private or
+        entry.flags.shared or entry.flags.fork_cow or
+        !entry.cow_table.isNull() or entry.cow_page_offset != 0 or
+        entry.vmo_offset != 0)
+    {
+        return false;
+    }
+    if (@as(u8, @bitCast(entry.prot)) != @as(u8, @bitCast(prot)) or
+        @as(u8, @bitCast(entry.max_prot)) != @as(u8, @bitCast(max_prot)) or
+        @as(u32, @bitCast(entry.flags)) != @as(u32, @bitCast(flags)))
+    {
+        return false;
+    }
+    const vmo_size = self.nativeVmoSize(entry.vmo) orelse return false;
+    if (entry.size_bytes != vmo_size or self.nativeVmoHasParent(entry.vmo)) {
+        return false;
+    }
+    // A DMA/MMIO pin retains the old VA-to-paddr identity independently of
+    // the VMO refcount, so do not resize even a uniquely referenced VMO while
+    // such an external object exists.
+    return !self.rangeOverlapsPinnedUserObject(
+        owner,
+        entry.start_va,
+        entry.size_bytes,
+    );
+}
+
 pub fn createAnonymousVmaWithPages(
     self: anytype,
     owner: PrincipalId,
@@ -1368,6 +1478,29 @@ pub fn createAnonymousVmaWithPages(
 
     const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
     if (try @TypeOf(self.*).vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
+
+    // Linux workloads routinely issue thousands of adjacent one-page
+    // MAP_PRIVATE|MAP_ANONYMOUS requests.  Preserve their syscall boundaries
+    // while using one native VMA when the preceding VMO is provably unaliased.
+    // Every rejected optimization falls through without mutation.
+    var active_index: usize = 0;
+    while (active_index < vma_table.active_count) : (active_index += 1) {
+        const candidate_index: usize = @intCast(vma_table.active_indices[active_index]);
+        const candidate = &vma_table.entries[candidate_index];
+        if (!anonymousVmaCanGrow(
+            self,
+            owner,
+            candidate,
+            start_va,
+            prot,
+            max_prot,
+            flags,
+        )) continue;
+        if (!self.growUniqueAnonymousVmo(candidate.vmo, size_bytes)) continue;
+        candidate.size_bytes += size_bytes;
+        return candidate.vmo;
+    }
+
     const vma_index = @TypeOf(self.*).findFreeVma(vma_table) orelse return KernelError.TableFull;
 
     const vmo_ref = try self.createNativeVmo(.anonymous, size_bytes);

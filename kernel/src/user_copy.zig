@@ -1,5 +1,6 @@
 const std = @import("std");
 const kernel = @import("kernel.zig");
+const kernel_log = @import("kernel_log.zig");
 const scheduler = @import("scheduler_connection.zig");
 const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
@@ -159,6 +160,86 @@ fn allocatePreparedFaultPage(
     return paddr;
 }
 
+fn logCowResolutionFailure(
+    state: *kernel.KernelState,
+    free_list: *kernel.FreePageList,
+    principal: kernel.PrincipalId,
+    page_va: u64,
+    stage: []const u8,
+    plan: kernel.NativeVmaFaultPlan,
+) void {
+    user_vm.lockSharedVmObjects();
+    defer user_vm.unlockSharedVmObjects();
+    const store = kernel.vmObjectBackingStoreStats();
+    if (state.vmaEntryForVaConst(principal, page_va)) |entry| {
+        const cow_refs: u32 = if (entry.cow_table.isNull())
+            0
+        else if (state.nativeCowTableSlotConst(entry.cow_table)) |table|
+            table.ref_count
+        else
+            0;
+        kernel_log.writeFmt(
+            "cow: failure stage={s} principal={} va=0x{x} plan={s} free_pages={}\n",
+            .{
+                stage,
+                @intFromEnum(principal),
+                page_va,
+                @tagName(plan.kind),
+                free_list.pageCount(),
+            },
+        );
+        kernel_log.writeFmt(
+            "cow: vma start=0x{x} pages={} private={} anonymous={} fork_cow={} cow_null={} cow_refs={}\n",
+            .{
+                entry.start_va,
+                entry.size_bytes / 4096,
+                @intFromBool(entry.flags.private),
+                @intFromBool(entry.flags.anonymous),
+                @intFromBool(entry.flags.fork_cow),
+                @intFromBool(entry.cow_table.isNull()),
+                cow_refs,
+            },
+        );
+        kernel_log.writeFmt(
+            "cow: store used={} capacity={} free={}\n",
+            .{
+                store.used_entries,
+                store.capacity,
+                store.free_entries,
+            },
+        );
+        return;
+    }
+    kernel_log.writeFmt(
+        "cow: failure stage={s} principal={} va=0x{x} plan={s} free_pages={} vma=none\n",
+        .{
+            stage,
+            @intFromEnum(principal),
+            page_va,
+            @tagName(plan.kind),
+            free_list.pageCount(),
+        },
+    );
+    kernel_log.writeFmt(
+        "cow: store used={} capacity={} free={}\n",
+        .{
+            store.used_entries,
+            store.capacity,
+            store.free_entries,
+        },
+    );
+}
+
+fn isCowFaultCandidate(
+    state: *kernel.KernelState,
+    principal: kernel.PrincipalId,
+    page_va: u64,
+) bool {
+    const entry = state.vmaEntryForVaConst(principal, page_va) orelse return false;
+    return entry.flags.private and !entry.flags.shared and entry.prot.write and
+        (entry.flags.fork_cow or !entry.flags.anonymous);
+}
+
 // The caller must hold the owner's address-space lock.  The shared-object
 // lock is used only to snapshot and commit metadata. PMM allocation and zero
 // happen between those sections. A COW source is revalidated and copied while
@@ -172,29 +253,43 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
     instruction_fetch: bool,
 ) ?kernel.NativeVmaFaultMapping {
     var attempt: usize = 0;
+    var last_plan: kernel.NativeVmaFaultPlan = .{};
     while (attempt < 2) : (attempt += 1) {
         const plan = blk: {
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
             break :blk state.prepareNativeVmaCowMapping(principal, page_va, write_access, instruction_fetch);
         };
+        last_plan = plan;
         switch (plan.kind) {
-            .denied => return null,
+            .denied => {
+                if (isCowFaultCandidate(state, principal, page_va)) {
+                    logCowResolutionFailure(state, free_list, principal, page_va, "prepare", plan);
+                }
+                return null;
+            },
             .ready => return plan.mapping,
             .locked_slow_path => {
                 user_vm.lockSharedVmObjects();
                 defer user_vm.unlockSharedVmObjects();
-                return state.ensureNativeVmaCowMappingLockedSlow(
+                const mapping = state.ensureNativeVmaCowMappingLockedSlow(
                     principal,
                     page_va,
                     write_access,
                     instruction_fetch,
                     free_list,
                 );
+                if (mapping == null) {
+                    logCowResolutionFailure(state, free_list, principal, page_va, "locked_slow", plan);
+                }
+                return mapping;
             },
             .allocate_zero, .allocate_copy => {},
         }
-        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse return null;
+        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse {
+            logCowResolutionFailure(state, free_list, principal, page_va, "page_alloc", plan);
+            return null;
+        };
         const mapping = blk: {
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
@@ -210,6 +305,7 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
         }
         free_list.appendPage(0, candidate) catch {};
     }
+    logCowResolutionFailure(state, free_list, principal, page_va, "commit_retry", last_plan);
     return null;
 }
 

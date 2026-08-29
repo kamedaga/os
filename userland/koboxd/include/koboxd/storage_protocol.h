@@ -13,22 +13,24 @@ enum {
     STORAGE_OP_MOUNT_ROOT = 1u,
     STORAGE_OP_LOOKUP = 2u,
     STORAGE_OP_STATX = 3u,
-    STORAGE_OP_GETDENTS = 4u,
-    STORAGE_OP_PREAD = 5u,
-    STORAGE_OP_PWRITE = 6u,
-    STORAGE_OP_FSYNC = 7u,
-    STORAGE_OP_CREATE = 8u,
-    STORAGE_OP_TRUNCATE = 9u,
-    STORAGE_OP_UTIMENS = 10u,
-    STORAGE_OP_CHMOD = 11u,
-    STORAGE_OP_UNLINK = 12u,
-    STORAGE_OP_RENAME = 13u,
-    STORAGE_OP_MKDIR = 14u,
-    STORAGE_OP_MKNOD = 15u,
-    STORAGE_OP_RMDIR = 16u,
-    STORAGE_OP_RELEASE_OBJECT = 17u,
-    STORAGE_OP_SYNC_ALL = 18u,
-    STORAGE_OP_DIAG_DUMP = 19u,
+    STORAGE_OP_STATFS = 4u,
+    STORAGE_OP_GETDENTS = 5u,
+    STORAGE_OP_PREAD = 6u,
+    STORAGE_OP_PWRITE = 7u,
+    STORAGE_OP_FSYNC = 8u,
+    STORAGE_OP_CREATE = 9u,
+    STORAGE_OP_TRUNCATE = 10u,
+    STORAGE_OP_UTIMENS = 11u,
+    STORAGE_OP_CHMOD = 12u,
+    STORAGE_OP_LINK = 13u,
+    STORAGE_OP_UNLINK = 14u,
+    STORAGE_OP_RENAME = 15u,
+    STORAGE_OP_MKDIR = 16u,
+    STORAGE_OP_MKNOD = 17u,
+    STORAGE_OP_RMDIR = 18u,
+    STORAGE_OP_RELEASE_OBJECT = 19u,
+    STORAGE_OP_SYNC_ALL = 20u,
+    STORAGE_OP_DIAG_DUMP = 21u,
 
     STORAGE_ROOT_OBJECT_ID = 1u,
     STORAGE_NAME_BYTES = 96u,
@@ -76,6 +78,12 @@ typedef struct storage_chmod_request {
     uint64_t mode;
 } storage_chmod_request_t;
 
+typedef struct storage_link_request {
+    uint64_t old_object_id;
+    uint64_t new_parent_object_id;
+    char new_name[STORAGE_NAME_BYTES];
+} storage_link_request_t;
+
 typedef struct storage_unlink_request {
     uint64_t parent_object_id;
     char name[STORAGE_NAME_BYTES];
@@ -116,6 +124,7 @@ typedef struct storage_io_request {
 
 typedef struct storage_statx_reply {
     uint64_t object_id;
+    uint64_t inode_number;
     uint64_t mode;
     uint64_t size;
     uint64_t blocks;
@@ -129,6 +138,21 @@ typedef struct storage_statx_reply {
     int64_t ctime_nsec;
     uint64_t rdev;
 } storage_statx_reply_t;
+
+typedef struct storage_statfs_reply {
+    uint64_t type;
+    uint64_t block_size;
+    uint64_t blocks;
+    uint64_t blocks_free;
+    uint64_t blocks_available;
+    uint64_t files;
+    uint64_t files_free;
+    uint32_t fsid[2];
+    uint64_t name_length;
+    uint64_t fragment_size;
+    uint64_t flags;
+    uint64_t spare[4];
+} storage_statfs_reply_t;
 
 typedef struct storage_dirent {
     uint64_t object_id;
@@ -151,12 +175,14 @@ _Static_assert(sizeof(storage_create_request_t) == 112, "storage_create_request 
 _Static_assert(sizeof(storage_truncate_request_t) == 16, "storage_truncate_request size");
 _Static_assert(sizeof(storage_utimens_request_t) == 48, "storage_utimens_request size");
 _Static_assert(sizeof(storage_chmod_request_t) == 16, "storage_chmod_request size");
+_Static_assert(sizeof(storage_link_request_t) == 112, "storage_link_request size");
 _Static_assert(sizeof(storage_unlink_request_t) == 104, "storage_unlink_request size");
 _Static_assert(sizeof(storage_mkdir_request_t) == 112, "storage_mkdir_request size");
 _Static_assert(sizeof(storage_mknod_request_t) == 120, "storage_mknod_request size");
 _Static_assert(sizeof(storage_rmdir_request_t) == 104, "storage_rmdir_request size");
 _Static_assert(sizeof(storage_rename_request_t) == 208, "storage_rename_request size");
 _Static_assert(sizeof(storage_io_request_t) == 7712, "storage_io_request size");
-_Static_assert(sizeof(storage_statx_reply_t) == 104, "storage_statx_reply size");
+_Static_assert(sizeof(storage_statx_reply_t) == 112, "storage_statx_reply size");
+_Static_assert(sizeof(storage_statfs_reply_t) == 120, "storage_statfs_reply size");
 _Static_assert(sizeof(storage_dirent_t) == 120, "storage_dirent size");
 _Static_assert(sizeof(storage_getdents_request_t) == 1952, "storage_getdents_request size");

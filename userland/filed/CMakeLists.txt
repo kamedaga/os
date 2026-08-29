@@ -41,6 +41,7 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/image.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/map.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/plan.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/script.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/start.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/native/native.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fd_ipc.c"
@@ -160,6 +161,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/internal.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/script.h"
     ${FILED_DISPATCH_SHARDS}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/private.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/private.h"

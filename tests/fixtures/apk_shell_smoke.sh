@@ -11,13 +11,6 @@ printf 'APK_SHELL_PATH=%s\n' "$apk_path"
 apk --version
 printf 'APK_SHELL_VERSION=OK\n'
 
-apk --repositories-file /dev/null \
-    --no-network \
-    --repository /var/cache/apk/offline/main \
-    --repository /var/cache/apk/offline/community \
-    --progress=no update
-printf 'APK_SHELL_OFFLINE_INDEX=OK\n'
-
 apk --progress=no update
 printf 'APK_SHELL_UPDATE=OK\n'
 
@@ -50,11 +43,13 @@ done
 printf 'APK_SHELL_NANO_CYCLES=OK iterations=%s\n' "$apk_iterations"
 
 apk --progress=no add grep
-grep --version | head -n 1
+grep_version=$(grep --version)
+printf '%s\n' "${grep_version%%$'\n'*}"
 printf 'APK_SHELL_ADD_GREP=OK\n'
 
 apk --progress=no add wget
-wget --version | head -n 1
+wget_version=$(wget --version)
+printf '%s\n' "${wget_version%%$'\n'*}"
 test "$(stat -c '%a' /usr/bin/wget)" = 755
 printf 'APK_SHELL_ADD_WGET=OK\n'
 

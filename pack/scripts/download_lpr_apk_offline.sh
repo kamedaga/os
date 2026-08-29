@@ -7,9 +7,17 @@ main_repo="${ALPINE_REPO:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/ma
 community_repo="${ALPINE_COMMUNITY_REPO:-https://dl-cdn.alpinelinux.org/alpine/latest-stable/community/x86_64}"
 cache="${repo_root}/.artifacts/third_party/alpine-apk-offline"
 
+# The seed packages are staged in a host-side repository used only to build the
+# pre-populated package database below.  Nothing under it ships: the guest
+# resolves every package from the network.  Shipping a mirror of the upstream
+# index while carrying only a handful of the packages it names made apk pick
+# the local repository and then fail with "package mentioned in index not
+# found" for everything else.
+localrepo="${cache}/localrepo"
+
 out_abs="${repo_root}/${out}"
 mkdir -p "${cache}"
-rm -rf "${out_abs}"
+rm -rf "${out_abs}" "${localrepo}"
 mkdir -p \
   "${out_abs}/bin" \
   "${out_abs}/cmd" \
@@ -18,8 +26,8 @@ mkdir -p \
   "${out_abs}/opt/apk-offline/bin" \
   "${out_abs}/opt/apk-offline/lib" \
   "${out_abs}/etc/apk/keys" \
-  "${out_abs}/var/cache/apk/offline/main/x86_64" \
-  "${out_abs}/var/cache/apk/offline/community/x86_64"
+  "${localrepo}/main/x86_64" \
+  "${localrepo}/community/x86_64"
 
 main_index="${cache}/APKINDEX-main.tar.gz"
 community_index="${cache}/APKINDEX-community.tar.gz"
@@ -158,7 +166,7 @@ for pkg in "${!wanted[@]}"; do
   if [[ ! -e "${apk}" ]]; then
     curl -fsSL "${pkg_repo}/${pkg}-${version}.apk" -o "${apk}"
   fi
-  cp "${apk}" "${out_abs}/var/cache/apk/offline/${pkg_repo_name}/x86_64/"
+  cp "${apk}" "${localrepo}/${pkg_repo_name}/x86_64/"
 
   rm -rf "${tmp}/root"
   mkdir -p "${tmp}/root"
@@ -182,12 +190,10 @@ for pkg in "${!wanted[@]}"; do
   fi
 done
 
-cp "${main_index}" "${out_abs}/var/cache/apk/offline/main/x86_64/APKINDEX.tar.gz"
-cp "${community_index}" "${out_abs}/var/cache/apk/offline/community/x86_64/APKINDEX.tar.gz"
-cat >"${out_abs}/etc/apk/repositories" <<'EOF'
-/var/cache/apk/offline/main
-/var/cache/apk/offline/community
-EOF
+cp "${main_index}" "${localrepo}/main/x86_64/APKINDEX.tar.gz"
+cp "${community_index}" "${localrepo}/community/x86_64/APKINDEX.tar.gz"
+printf '%s\n' "${main_repo%/x86_64}" "${community_repo%/x86_64}" \
+  >"${out_abs}/etc/apk/repositories"
 cat >"${out_abs}/etc/apk/world" <<'EOF'
 EOF
 cat >"${out_abs}/etc/apk/arch" <<'EOF'
@@ -216,8 +222,8 @@ mkdir -p \
 cp -a "${out_abs}/etc/apk/keys/." "${install_root}/etc/apk/keys/"
 cp "${out_abs}/etc/apk/arch" "${install_root}/etc/apk/arch"
 printf '%s\n' \
-  "${out_abs}/var/cache/apk/offline/main" \
-  "${out_abs}/var/cache/apk/offline/community" \
+  "${localrepo}/main" \
+  "${localrepo}/community" \
   >"${install_root}/etc/apk/repositories"
 LD_LIBRARY_PATH="${out_abs}/opt/apk-offline/lib" \
   "${tmp}/musl-runtime/lib/ld-musl-x86_64.so.1" \
@@ -236,8 +242,8 @@ LD_LIBRARY_PATH="${out_abs}/opt/apk-offline/lib" \
   --no-cache \
   --sync=no \
   --logfile=no \
-  --repository "${out_abs}/var/cache/apk/offline/main" \
-  --repository "${out_abs}/var/cache/apk/offline/community" \
+  --repository "${localrepo}/main" \
+  --repository "${localrepo}/community" \
   add nano grep
 mkdir -p "${out_abs}/lib/apk/db"
 cp -a "${install_root}/lib/apk/db/." "${out_abs}/lib/apk/db/"

@@ -166,6 +166,8 @@ typedef struct filed_generation_entry {
 
 typedef struct filed_statx {
     uint64_t handle;
+    /* Filesystem identity; unlike the path handle, equal across hard links. */
+    uint64_t inode_number;
     uint64_t mode;
     uint64_t size;
     uint64_t blocks;
@@ -181,6 +183,24 @@ typedef struct filed_statx {
     uint64_t dir_generation;
     uint64_t rdev;
 } filed_statx_t;
+
+typedef struct filed_statfs {
+    uint64_t handle;
+    uint64_t type;
+    uint64_t block_size;
+    uint64_t blocks;
+    uint64_t blocks_free;
+    uint64_t blocks_available;
+    uint64_t files;
+    uint64_t files_free;
+    uint32_t fsid[2];
+    uint64_t name_length;
+    uint64_t fragment_size;
+    uint64_t flags;
+    uint64_t spare[4];
+} filed_statfs_t;
+
+_Static_assert(sizeof(filed_statfs_t) == 128, "filed_statfs size");
 
 typedef struct filed_utimens {
     uint64_t handle;
