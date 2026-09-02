@@ -12,10 +12,7 @@
 
 既存の Linux エコシステムとの互換を目指す FD capability ベースのマイクロカーネルです。
 
-Linux application も特別な仮想マシンや Linux process ではなく、必要最小限の
-FD capability を持つ普通の PachaOS process として動きます。Linux syscall は
-kernel や特権 server ではなく、process に動的リンクされた非特権の LPR が
-userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/architecture.md)
+詳しくは [設計思想](pacha_docs/architecture.md)
 を参照してください。
 
 ---
@@ -35,7 +32,7 @@ userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/
 - Linux Personality Runtimeを実装しました
 - カーネルをFD-based Microkernelへ変更しました
 - 独自ドライバからkoboxに全面移行しました。
-- Linux ABIレイヤーなしで musl libcに対応しました。
+- Native ABIで musl libcに対応しました。
 
 ## Tech Stack
 
@@ -67,18 +64,9 @@ userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/
 Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
 musl ビルドで確認済み。
 
-`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway` nbsp; `Sway`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway` &nbsp; `Xfce`
 
-### Python3 on PachaOS
 
-```pycon
-Python 3.12.13 (main, Apr 10 2026, 14:16:05) [GCC 14.2.0] on linux
-Type "help", "copyright", "credits" or "license" for more information.
->>> import os
->>> print("os.uname():", os.uname())
-os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release='6.0.0-capabilityos', version='CapabilityOS Linux ABI', machine='x86_64')
->>>
-```
 
 **Kobox**
 
@@ -86,19 +74,15 @@ os.uname(): posix.uname_result(sysname='Linux', nodename='capabilityos', release
 |---|---|
 | NVMe | `nvme.ko` / `nvme-core.ko` |
 | USB Storage | `usbcore.ko` / `usb-storage.ko` / `xhci-hcd.ko` |
-| USB HID(マウスで実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
+| USB HID(実験中) | `usbcore.ko` / `hid.ko` / `hid-generic.ko` / `usbhid.ko` / `xhci-hcd.ko`|
 | Ext4 | `crc16.ko` / `mbcache.ko` / `jbd2.ko` / `ext4.ko`|
 | virtio-net | `virtio.ko` / `virtio_ring` / `virtio_pci.ko` / `failover.ko` / `net_failover.ko `/ `virtio_net.ko` |
 | linux tty | `linux_tty_core.ko` |
 | virtio-input | `linux_virtio_input.ko` ...|
 
 
-Kobox は FD capability を使う userland component です。storage 用 runtime は
-VFS/execとの責務境界を保ったまま、現在は `filed.elf` にリンクされています。
-TTY、network、display、input など、独立した状態と回復単位を持つ subsystem は
-それぞれ別の service process に配置されます。
+Kobox は capsule を使う Linux互換レイヤー です。
 
-※koboxはApache 2.0でライセンスされてます。
 
 ---
 
@@ -107,7 +91,6 @@ TTY、network、display、input など、独立した状態と回復単位を持
 ```powershell
 nix develop
 ./pacgo sync rootfs
-./pacgo qemu --new-terminal
 ```
 
 詳細は [ビルドガイド](pacha_docs/build.md) を参照してください（動作確認済みバージョン・依存関係など）。
