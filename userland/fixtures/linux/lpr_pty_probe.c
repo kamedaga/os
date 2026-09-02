@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -13,6 +14,15 @@
 #endif
 #ifndef TIOCGPTN
 #define TIOCGPTN 0x80045430
+#endif
+#ifndef TIOCGPTPEER
+#define TIOCGPTPEER 0x5441
+#endif
+#ifndef TIOCPKT
+#define TIOCPKT 0x5420
+#endif
+#ifndef TIOCPKT_DATA
+#define TIOCPKT_DATA 0
 #endif
 
 static int fail_errno(const char *label)
@@ -77,10 +87,6 @@ int main(void)
     if (ioctl(master, TIOCGPTN, &pts_index) != 0) {
         return fail_errno("TIOCGPTN master");
     }
-    if (pts_index != 0) {
-        fprintf(stderr, "lpr_pty_probe: unexpected pts index %u\n", pts_index);
-        return 17;
-    }
     printf("lpr_pty_probe: TIOCGPTN index=%u\n", pts_index);
 
     int second_master = open("/dev/ptmx", O_RDWR | O_NOCTTY | O_CLOEXEC);
@@ -94,8 +100,11 @@ int main(void)
         errno = saved_errno;
         return fail_errno("TIOCGPTN second master");
     }
-    if (second_pts_index != 1u) {
-        fprintf(stderr, "lpr_pty_probe: unexpected second pts index %u\n", second_pts_index);
+    if (pts_index == UINT_MAX || second_pts_index != pts_index + 1u) {
+        fprintf(stderr,
+            "lpr_pty_probe: non-consecutive pts indexes %u then %u\n",
+            pts_index,
+            second_pts_index);
         close(second_master);
         return 18;
     }
@@ -105,6 +114,63 @@ int main(void)
     int unlock = 0;
     if (ioctl(master, TIOCSPTLCK, &unlock) != 0) {
         return fail_errno("TIOCSPTLCK master");
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        return fail_errno("fork controlling tty probe");
+    }
+    if (child == 0) {
+        if (setsid() < 0) {
+            fprintf(stderr, "lpr_pty_probe: child setsid failed errno=%d\n", errno);
+            _exit(21);
+        }
+        int child_peer = ioctl(
+            master,
+            TIOCGPTPEER,
+            O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (child_peer < 0) {
+            fprintf(stderr, "lpr_pty_probe: child TIOCGPTPEER failed errno=%d\n", errno);
+            _exit(22);
+        }
+        if (ioctl(child_peer, TIOCSCTTY, 0) != 0) {
+            fprintf(stderr, "lpr_pty_probe: child TIOCSCTTY failed errno=%d\n", errno);
+            _exit(23);
+        }
+        pid_t foreground = tcgetpgrp(child_peer);
+        if (foreground != getpgrp()) {
+            fprintf(stderr,
+                "lpr_pty_probe: child foreground pgrp=%d expected=%d errno=%d\n",
+                (int)foreground,
+                (int)getpgrp(),
+                errno);
+            _exit(24);
+        }
+        close(child_peer);
+        _exit(0);
+    }
+    int child_status = 0;
+    if (waitpid(child, &child_status, 0) != child) {
+        return fail_errno("waitpid controlling tty probe");
+    }
+    if (!WIFEXITED(child_status) || WEXITSTATUS(child_status) != 0) {
+        fprintf(stderr,
+            "lpr_pty_probe: controlling tty child status=0x%x\n",
+            child_status);
+        return 21;
+    }
+
+    int peer = ioctl(master, TIOCGPTPEER, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (peer < 0) {
+        return fail_errno("TIOCGPTPEER master");
+    }
+    if ((fcntl(peer, F_GETFD) & FD_CLOEXEC) == 0) {
+        fprintf(stderr, "lpr_pty_probe: TIOCGPTPEER missing FD_CLOEXEC\n");
+        close(peer);
+        return 20;
+    }
+    if (close(peer) != 0) {
+        return fail_errno("close TIOCGPTPEER slave");
     }
 
     char slave_path[32];
@@ -207,6 +273,35 @@ int main(void)
     if (status != 0) {
         return status;
     }
+
+    int packet_mode = 1;
+    if (ioctl(master, TIOCPKT, &packet_mode) != 0) {
+        return fail_errno("TIOCPKT enable master");
+    }
+    const char packet_payload[] = "packet-mode";
+    if (write(slave, packet_payload, sizeof(packet_payload) - 1) !=
+        (ssize_t)(sizeof(packet_payload) - 1))
+    {
+        return fail_errno("write slave packet mode");
+    }
+    char packet_buf[sizeof(packet_payload)];
+    memset(packet_buf, 0xff, sizeof(packet_buf));
+    const ssize_t packet_read = read(master, packet_buf, sizeof(packet_buf));
+    if (packet_read != (ssize_t)sizeof(packet_buf) ||
+        (unsigned char)packet_buf[0] != TIOCPKT_DATA ||
+        memcmp(packet_buf + 1, packet_payload, sizeof(packet_payload) - 1) != 0)
+    {
+        fprintf(stderr,
+            "lpr_pty_probe: TIOCPKT data read=%zd header=%u\n",
+            packet_read,
+            (unsigned)(unsigned char)packet_buf[0]);
+        return 25;
+    }
+    packet_mode = 0;
+    if (ioctl(master, TIOCPKT, &packet_mode) != 0) {
+        return fail_errno("TIOCPKT disable master");
+    }
+    printf("lpr_pty_probe: TIOCPKT data ok\n");
 
     if (close(slave) != 0) {
         return fail_errno("close slave");

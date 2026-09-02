@@ -58,6 +58,7 @@ static int direct_statx(void *ctx, uint64_t object_id, storage_statx_reply_t *ou
     }
     memset(out_stat, 0, sizeof(*out_stat));
     out_stat->object_id = stat.object_id;
+    out_stat->inode_number = stat.inode_number;
     out_stat->mode = stat.mode;
     out_stat->size = stat.size;
     out_stat->blocks = stat.blocks;
@@ -71,6 +72,16 @@ static int direct_statx(void *ctx, uint64_t object_id, storage_statx_reply_t *ou
     out_stat->ctime_nsec = stat.ctime_nsec;
     out_stat->rdev = stat.rdev;
     return 0;
+}
+
+static int direct_statfs(void *ctx, storage_statfs_reply_t *out_statfs)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL || out_statfs == NULL) return -22;
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_statfs(backend, out_statfs);
+    koboxd_fs_backend_unlock(backend);
+    return status;
 }
 
 static int direct_pread(
@@ -266,6 +277,28 @@ static int direct_unlink(void *ctx, uint64_t parent_object_id, const char *name)
     return status;
 }
 
+static int direct_link(
+    void *ctx,
+    uint64_t old_object_id,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id)
+{
+    koboxd_fs_backend_t *backend = direct_backend(ctx);
+    if (backend == NULL) {
+        return -22;
+    }
+    koboxd_fs_backend_lock(backend);
+    const int status = koboxd_fs_backend_link(
+        backend,
+        old_object_id,
+        new_parent_object_id,
+        new_name,
+        out_object_id);
+    koboxd_fs_backend_unlock(backend);
+    return status;
+}
+
 static int direct_mkdir(
     void *ctx,
     uint64_t parent_object_id,
@@ -434,6 +467,7 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .mount_root = direct_mount_root,
     .lookup = direct_lookup,
     .statx = direct_statx,
+    .statfs = direct_statfs,
     .pread = direct_pread,
     .pwrite = direct_pwrite,
     .readlink = direct_readlink,
@@ -443,6 +477,7 @@ static const filed_kobox_direct_ops_t direct_ops = {
     .truncate = direct_truncate,
     .utimens = direct_utimens,
     .chmod = direct_chmod,
+    .link = direct_link,
     .unlink = direct_unlink,
     .mkdir = direct_mkdir,
     .mknod = direct_mknod,

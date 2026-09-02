@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 pub const capsule = @import("../capsule.zig");
 const table = @import("table.zig");
 pub const initial_process_count: usize = 8;
@@ -85,6 +86,7 @@ pub const ProcessDescriptor = struct {
     bootstrap_owner: bool = false,
     faulted: bool = false,
     fault_vector: u8 = 0,
+    signal_pending_hint_va: u64 = 0,
 };
 
 pub const ProcessStatus = struct {
@@ -467,6 +469,88 @@ pub const IpcWaitKey = struct {
     }
 };
 
+pub const FdWaitRegistrationKind = enum(u8) {
+    none = 0,
+    task = 1,
+    pipe = 2,
+    endpoint = 3,
+    channel = 4,
+    reply = 5,
+};
+
+pub const FdWaitRegistrationRef = struct {
+    kind: FdWaitRegistrationKind = .none,
+    side: u8 = 0,
+    slot: u8 = 0,
+    reserved0: u8 = 0,
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: FdWaitRegistrationRef) bool {
+        return self.kind == .none;
+    }
+
+    pub fn matches(self: FdWaitRegistrationRef, other: FdWaitRegistrationRef) bool {
+        return self.kind == other.kind and
+            self.side == other.side and
+            self.slot == other.slot and
+            self.index == other.index and
+            self.generation == other.generation;
+    }
+};
+
+pub const FdWaitGroupRef = struct {
+    index: u16 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: FdWaitGroupRef) bool {
+        return self.generation == 0;
+    }
+
+    pub fn matches(self: FdWaitGroupRef, other: FdWaitGroupRef) bool {
+        return self.index == other.index and self.generation == other.generation;
+    }
+};
+
+pub const FdWaitGroupState = enum(u8) {
+    free = 0,
+    building = 1,
+    armed = 2,
+};
+
+pub const FdWaitGroupSlot = struct {
+    state: FdWaitGroupState = .free,
+    generation: u32 = 1,
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+    wait_token: u64 = 0,
+    link_count: u16 = 0,
+    links: [max_fd_wait_group_links]FdWaitRegistrationRef =
+        [_]FdWaitRegistrationRef{.{}} ** max_fd_wait_group_links,
+};
+
+pub const FdWaitGroupSnapshot = struct {
+    group: FdWaitGroupRef = .{},
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+    wait_token: u64 = 0,
+};
+
+pub const max_fd_wait_groups: usize = fd_table_entries;
+// A bidirectional IPC channel poll item can require one registration for its
+// receive queue and one for its send queue.  This is the exact worst case for
+// max_pollfds entries; the user ABI itself is unchanged.
+pub const max_fd_wait_group_links: usize = fd_table_entries * 2;
+
+pub const FdWaitBinding = struct {
+    group: FdWaitGroupRef = .{},
+    link_index: u16 = 0,
+    wait_token: u64 = 0,
+    completion_pending: bool = false,
+};
+
 pub const IpcWaiter = struct {
     active: bool = false,
     owner: PrincipalId = default_process_principal,
@@ -479,28 +563,46 @@ pub const IpcWaiter = struct {
     events: u64 = 0,
     min_write_bytes: u64 = 0,
     key: IpcWaitKey = .{},
+    registration: FdWaitRegistrationRef = .{},
+    binding: FdWaitBinding = .{},
 };
 
 pub const ThreadWakeTarget = struct {
     owner: PrincipalId = default_process_principal,
     thread_index: usize = 0,
     thread_generation: u32 = 0,
-    hint_only: bool = false,
+    wait_token: u64 = 0,
     pollfd_va: u64 = 0,
     recv_msg_va: u64 = 0,
     recv_fd: Fd = 0,
     recv_fd_capacity: u8 = 0,
     revents: u64 = 0,
+    registration: FdWaitRegistrationRef = .{},
+    group: FdWaitGroupRef = .{},
+    group_link_index: u16 = 0,
+};
+
+/// Scheduling hint for an IPC object whose consumer is runnable rather than
+/// currently registered in the object's wait list.  The generation prevents a
+/// recycled thread-table slot from inheriting the hint.
+pub const IpcReceiverHint = struct {
+    active: bool = false,
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
 };
 
 pub const TaskFdWaiter = struct {
     active: bool = false,
     principal_raw: PrincipalRaw = 0,
+    object: KernelObjectRef = .{},
     owner: PrincipalId = default_process_principal,
     pollfd_va: u64 = 0,
     events: u64 = 0,
     thread_index: u32 = 0,
     thread_generation: u32 = 0,
+    registration: FdWaitRegistrationRef = .{},
+    binding: FdWaitBinding = .{},
 };
 
 pub const max_task_fd_waiters: usize = fd_table_entries;
@@ -519,23 +621,6 @@ pub const PipeSlot = struct {
 
 pub const IpcWaitList = struct {
     waiters: [max_ipc_object_waiters]IpcWaiter = [_]IpcWaiter{.{}} ** max_ipc_object_waiters,
-    handoff_hint_valid: bool = false,
-    handoff_hint: ThreadWakeTarget = .{},
-
-    pub fn rememberHandoffHint(
-        self: *IpcWaitList,
-        owner: PrincipalId,
-        thread_index: usize,
-        thread_generation: u32,
-    ) void {
-        self.handoff_hint = .{
-            .owner = owner,
-            .thread_index = thread_index,
-            .thread_generation = thread_generation,
-            .hint_only = true,
-        };
-        self.handoff_hint_valid = true;
-    }
 
     pub fn register(
         self: *IpcWaitList,
@@ -549,10 +634,12 @@ pub const IpcWaitList = struct {
         min_write_bytes: u64,
         thread_index: usize,
         thread_generation: u32,
-    ) KernelError!void {
+        wait_token: u64,
+        group: FdWaitGroupRef,
+    ) KernelError!FdWaitRegistrationRef {
         if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        if (wait_token == 0 or group.isNull()) return KernelError.InvalidState;
         const thread_index_u32: u32 = @intCast(thread_index);
-        self.rememberHandoffHint(owner, thread_index, thread_generation);
         var free_index: ?usize = null;
         var i: usize = 0;
         while (i < self.waiters.len) : (i += 1) {
@@ -561,7 +648,13 @@ pub const IpcWaitList = struct {
                 if (free_index == null) free_index = i;
                 continue;
             }
-            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+            if (waiter.thread_index == thread_index_u32 and
+                waiter.thread_generation == thread_generation and
+                waiter.binding.wait_token == wait_token and
+                waiter.binding.group.matches(group) and
+                waiter.pollfd_va == pollfd_va and
+                waiter.recv_msg_va == recv_msg_va)
+            {
                 waiter.events |= events;
                 waiter.key = key;
                 waiter.owner = owner;
@@ -570,10 +663,23 @@ pub const IpcWaitList = struct {
                 waiter.recv_fd = recv_fd;
                 waiter.recv_fd_capacity = recv_fd_capacity;
                 if (min_write_bytes > waiter.min_write_bytes) waiter.min_write_bytes = min_write_bytes;
-                return;
+                return waiter.registration;
             }
         }
         const target = free_index orelse return KernelError.TableFull;
+        const registration = FdWaitRegistrationRef{
+            .kind = switch (key.kind) {
+                .pipe => .pipe,
+                .endpoint => .endpoint,
+                .channel => .channel,
+                .reply => .reply,
+                else => return KernelError.InvalidState,
+            },
+            .side = key.side,
+            .slot = @intCast(target),
+            .index = key.index,
+            .generation = key.generation,
+        };
         self.waiters[target] = .{
             .active = true,
             .owner = owner,
@@ -586,24 +692,18 @@ pub const IpcWaitList = struct {
             .events = events,
             .min_write_bytes = min_write_bytes,
             .key = key,
+            .registration = registration,
+            .binding = .{
+                .wait_token = wait_token,
+                .group = group,
+            },
         };
-    }
-
-    pub fn handoffHint(self: *const IpcWaitList) ?ThreadWakeTarget {
-        if (!self.handoff_hint_valid) return null;
-        return self.handoff_hint;
+        return registration;
     }
 
     pub fn unregister(self: *IpcWaitList, thread_index: usize, thread_generation: u32) void {
         if (thread_index > std.math.maxInt(u32)) return;
         const thread_index_u32: u32 = @intCast(thread_index);
-        if (self.handoff_hint_valid and
-            self.handoff_hint.thread_index == thread_index and
-            self.handoff_hint.thread_generation == thread_generation)
-        {
-            self.handoff_hint = .{};
-            self.handoff_hint_valid = false;
-        }
         for (self.waiters[0..]) |*waiter| {
             if (!waiter.active) continue;
             if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
@@ -625,7 +725,7 @@ pub const IpcWaitList = struct {
         const fd_abi = @import("kernel_abi_root").fd_abi;
         var count: usize = 0;
         for (self.waiters[0..]) |*waiter| {
-            if (!waiter.active) continue;
+            if (!waiter.active or waiter.binding.completion_pending) continue;
             var revents = ready_events & (waiter.events | fd_abi.event_error | fd_abi.event_hangup);
             if ((revents & fd_abi.event_writable) != 0 and waiter.min_write_bytes != 0 and writable_bytes < waiter.min_write_bytes) {
                 revents &= ~fd_abi.event_writable;
@@ -635,13 +735,17 @@ pub const IpcWaitList = struct {
                 .owner = waiter.owner,
                 .thread_index = waiter.thread_index,
                 .thread_generation = waiter.thread_generation,
+                .wait_token = waiter.binding.wait_token,
                 .pollfd_va = waiter.pollfd_va,
                 .recv_msg_va = waiter.recv_msg_va,
                 .recv_fd = waiter.recv_fd,
                 .recv_fd_capacity = waiter.recv_fd_capacity,
                 .revents = revents,
+                .registration = waiter.registration,
+                .group = waiter.binding.group,
+                .group_link_index = waiter.binding.link_index,
             };
-            waiter.* = .{};
+            waiter.binding.completion_pending = true;
             if (count < out.len) {
                 out[count] = target;
                 count += 1;
@@ -712,6 +816,7 @@ pub const IpcEndpointSlot = struct {
     generation: u32 = 1,
     queue: IpcQueue = .{},
     waiters: IpcWaitList = .{},
+    receiver_hint: IpcReceiverHint = .{},
 };
 
 pub const IpcChannelSlot = struct {
@@ -728,6 +833,7 @@ pub const IpcReplySlot = struct {
     sent: bool = false,
     queue: IpcQueue = .{},
     waiters: IpcWaitList = .{},
+    receiver_hint: IpcReceiverHint = .{},
 };
 
 pub const IpcSendFd = struct {
@@ -752,6 +858,11 @@ pub const IpcRecvResult = struct {
     words: [4]u64 = .{ 0, 0, 0, 0 },
     fd_count: usize = 0,
     fds: [max_ipc_message_fds]IpcRecvFd = [_]IpcRecvFd{.{}} ** max_ipc_message_fds,
+};
+
+pub const IpcRecvOutcome = struct {
+    message: IpcRecvResult = .{},
+    writable_wake_count: usize = 0,
 };
 
 pub const native_page_size: u64 = 4096;
@@ -787,7 +898,9 @@ pub const NativeVmoSlot = struct {
     generation: u32 = 1,
     size_bytes: u64 = 0,
     page_count: u32 = 0,
-    page_store_start: u32 = 0,
+    // Opaque kernel-internal owner token for sparse backing-page lookup.
+    page_store_start: u64 = 0,
+    page_store_owner: u64 = 0,
     has_page_store: bool = false,
     ref_count: u32 = 0,
     parent: NativeVmoRef = .{},
@@ -799,7 +912,8 @@ pub const NativeCowTableSlot = struct {
     generation: u32 = 1,
     ref_count: u32 = 0,
     page_count: u32 = 0,
-    page_store_start: u32 = 0,
+    // Opaque kernel-internal owner token for sparse backing-page lookup.
+    page_store_start: u64 = 0,
 };
 
 // NativeCowTableRef keeps a flat index. Chunks are append-only so a fault path
@@ -905,13 +1019,30 @@ pub const NativeVmaFaultPlan = struct {
     source_paddr: u64 = 0,
 };
 
-pub fn vmObjectBackingFreePageCount() u64 {
-    var pages: u64 = 0;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        pages += vmo_backing_page_store_free_ranges[i].len;
-    }
-    return pages;
+/// Post-mortem view of the VM-object backing store.
+///
+/// Only instantiated physical pages consume entries. One physical slot stays
+/// empty so deletion can rebuild an open-addressing cluster without a
+/// tombstone or an ambiguous full-table state.
+pub const VmObjectBackingStoreStats = struct {
+    capacity: u64,
+    used_entries: u64,
+    free_entries: u64,
+};
+
+pub fn vmObjectBackingStoreStats() VmObjectBackingStoreStats {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    const capacity: u64 = if (vmo_backing_page_store.len > 0)
+        @intCast(vmo_backing_page_store.len - 1)
+    else
+        0;
+    const used: u64 = @intCast(vmo_backing_page_store_used);
+    return .{
+        .capacity = capacity,
+        .used_entries = used,
+        .free_entries = if (capacity > used) capacity - used else 0,
+    };
 }
 
 pub const EndpointTable = struct {
@@ -999,130 +1130,384 @@ pub const PublishedEndpointTable = struct {
 
 pub const max_vmo_backing_pages: usize = 131072;
 pub const max_vmo_backing_store_pages: usize = 1048576;
-pub const max_vmo_backing_store_free_ranges: usize = 1024;
 
 pub var empty_vmo_backing_page_store: [0]u64 = .{};
 pub var vmo_backing_page_store: []u64 = empty_vmo_backing_page_store[0..];
-pub var vmo_backing_page_store_next: usize = 0;
+pub var empty_vmo_backing_page_store_owners: [0]u64 = .{};
+pub var vmo_backing_page_store_owners: []u64 = empty_vmo_backing_page_store_owners[0..];
+pub var empty_vmo_backing_page_store_page_indices: [0]u32 = .{};
+pub var vmo_backing_page_store_page_indices: []u32 = empty_vmo_backing_page_store_page_indices[0..];
+pub var vmo_backing_page_store_used: usize = 0;
 
-pub const VmoBackingStoreFreeRange = struct {
-    start: u32 = 0,
-    len: u32 = 0,
+/// The VM-object backing arrays are reached from both syscall and fault paths,
+/// whose outer locks are intentionally unrelated. This lock is therefore the
+/// innermost lock for every backing-store read and mutation.
+const VmoBackingPageStoreLock = struct {
+    value: u8 = 0,
+
+    fn interruptsEnabled() bool {
+        if (builtin.is_test) return false;
+        var flags: u64 = 0;
+        asm volatile (
+            \\pushfq
+            \\pop %[flags]
+            : [flags] "=r" (flags),
+        );
+        return (flags & (1 << 9)) != 0;
+    }
+
+    fn waitWithInterruptWindow() void {
+        if (builtin.is_test) {
+            asm volatile ("pause");
+            return;
+        }
+        const restore_interrupts = interruptsEnabled();
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+        if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
+    }
+
+    fn lock(self: *VmoBackingPageStoreLock) void {
+        while (true) {
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
+            while (@atomicLoad(u8, &self.value, .monotonic) != 0) waitWithInterruptWindow();
+        }
+    }
+
+    fn unlock(self: *VmoBackingPageStoreLock) void {
+        @atomicStore(u8, &self.value, 0, .release);
+    }
 };
 
-pub var empty_vmo_backing_page_store_free_ranges: [0]VmoBackingStoreFreeRange = .{};
-pub var vmo_backing_page_store_free_ranges: []VmoBackingStoreFreeRange = empty_vmo_backing_page_store_free_ranges[0..];
-pub var vmo_backing_page_store_free_range_len: usize = 0;
+var vmo_backing_page_store_lock: VmoBackingPageStoreLock = .{};
 
-pub fn removeVmoBackingFreeRange(index: usize) void {
-    var i = index + 1;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        vmo_backing_page_store_free_ranges[i - 1] = vmo_backing_page_store_free_ranges[i];
-    }
-    vmo_backing_page_store_free_range_len -= 1;
+/// Compact, permanent evidence that the sparse owner ledger rejected an
+/// operation. This records the first mismatch while retaining a total count.
+pub const VmoBackingStoreOwnershipFault = struct {
+    count: u64 = 0,
+    operation: u8 = 0, // 1 allocate, 2 free, 3 write
+    start: u64 = 0,
+    len: u32 = 0,
+    index: u32 = 0,
+    expected: u64 = 0,
+    actual: u64 = 0,
+};
+
+var vmo_backing_store_ownership_fault: VmoBackingStoreOwnershipFault = .{};
+
+pub const VmoBackingStoreOwnerKind = enum(u1) {
+    native_vmo = 0,
+    native_cow = 1,
+};
+
+pub fn vmoBackingStoreOwner(kind: VmoBackingStoreOwnerKind, index: u32, generation: u32) u64 {
+    if (index > std.math.maxInt(u31) or generation == 0) return 0;
+    const kind_bit = @as(u64, @intFromEnum(kind)) << 63;
+    const generation_bits = @as(u64, generation) << 31;
+    return kind_bit | generation_bits | index;
 }
 
-pub fn insertVmoBackingFreeRange(start: u32, len: u32) bool {
-    if (len == 0) return true;
-    var merged_start = start;
-    var merged_len = len;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) {
-        const range = vmo_backing_page_store_free_ranges[i];
-        const range_end = range.start + range.len;
-        const merged_end = merged_start + merged_len;
-        if (range_end < merged_start or merged_end < range.start) {
-            i += 1;
-            continue;
+fn recordVmoBackingStoreOwnershipFaultLocked(
+    operation: u8,
+    start: u64,
+    len: u32,
+    index: u32,
+    expected: u64,
+    actual: u64,
+) void {
+    vmo_backing_store_ownership_fault.count +%= 1;
+    if (vmo_backing_store_ownership_fault.count != 1) return;
+    vmo_backing_store_ownership_fault.operation = operation;
+    vmo_backing_store_ownership_fault.start = start;
+    vmo_backing_store_ownership_fault.len = len;
+    vmo_backing_store_ownership_fault.index = index;
+    vmo_backing_store_ownership_fault.expected = expected;
+    vmo_backing_store_ownership_fault.actual = actual;
+}
+
+pub fn vmoBackingStoreOwnershipFault() VmoBackingStoreOwnershipFault {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    return vmo_backing_store_ownership_fault;
+}
+
+fn vmoBackingPageStoreReadyLocked() bool {
+    return vmo_backing_page_store.len >= 2 and
+        vmo_backing_page_store_owners.len == vmo_backing_page_store.len and
+        vmo_backing_page_store_page_indices.len == vmo_backing_page_store.len and
+        vmo_backing_page_store_used < vmo_backing_page_store.len;
+}
+
+fn mixVmoBackingPageStoreKey(owner: u64, page_index: u32) u64 {
+    var value = owner ^ (@as(u64, page_index) *% 0x9e37_79b9_7f4a_7c15);
+    value ^= value >> 30;
+    value *%= 0xbf58_476d_1ce4_e5b9;
+    value ^= value >> 27;
+    value *%= 0x94d0_49bb_1331_11eb;
+    value ^= value >> 31;
+    return value;
+}
+
+fn vmoBackingPageStoreBucketLocked(owner: u64, page_index: u32) usize {
+    return @intCast(mixVmoBackingPageStoreKey(owner, page_index) % vmo_backing_page_store.len);
+}
+
+fn findVmoBackingPageStoreSlotLocked(owner: u64, page_index: u32) ?usize {
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0) return null;
+    var slot_index = vmoBackingPageStoreBucketLocked(owner, page_index);
+    var probes: usize = 0;
+    while (probes < vmo_backing_page_store.len) : (probes += 1) {
+        const actual_owner = vmo_backing_page_store_owners[slot_index];
+        if (actual_owner == 0) return null;
+        if (actual_owner == owner and
+            vmo_backing_page_store_page_indices[slot_index] == page_index)
+        {
+            return slot_index;
         }
-        if (range.start < merged_start) merged_start = range.start;
-        const new_end = if (range_end > merged_end) range_end else merged_end;
-        merged_len = new_end - merged_start;
-        removeVmoBackingFreeRange(i);
+        slot_index = if (slot_index + 1 == vmo_backing_page_store.len) 0 else slot_index + 1;
     }
-    if (vmo_backing_page_store_free_range_len >= vmo_backing_page_store_free_ranges.len) return false;
-    vmo_backing_page_store_free_ranges[vmo_backing_page_store_free_range_len] = .{
-        .start = merged_start,
-        .len = merged_len,
-    };
-    vmo_backing_page_store_free_range_len += 1;
-    return true;
+    return null;
 }
 
-pub fn allocEmptyVmoBackingPageStore(page_count: usize) ?u32 {
-    if (page_count == 0 or page_count > max_vmo_backing_pages) return null;
-    var start: usize = 0;
-    var free_index: ?usize = null;
-    var i: usize = 0;
-    while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-        if (vmo_backing_page_store_free_ranges[i].len < page_count) continue;
-        start = vmo_backing_page_store_free_ranges[i].start;
-        free_index = i;
-        break;
+fn insertVmoBackingPageStoreSlotLocked(owner: u64, page_index: u32, paddr: u64) KernelError!usize {
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or paddr == 0 or
+        (paddr & 0xFFF) != 0)
+    {
+        return KernelError.InvalidState;
     }
-    if (free_index) |index| {
-        const consumed: u32 = @intCast(page_count);
-        vmo_backing_page_store_free_ranges[index].start += consumed;
-        vmo_backing_page_store_free_ranges[index].len -= consumed;
-        if (vmo_backing_page_store_free_ranges[index].len == 0) removeVmoBackingFreeRange(index);
-    } else {
-        if (vmo_backing_page_store_next + page_count > vmo_backing_page_store.len) return null;
-        start = vmo_backing_page_store_next;
-        vmo_backing_page_store_next += page_count;
+    var slot_index = vmoBackingPageStoreBucketLocked(owner, page_index);
+    var probes: usize = 0;
+    while (probes < vmo_backing_page_store.len) : (probes += 1) {
+        const actual_owner = vmo_backing_page_store_owners[slot_index];
+        if (actual_owner == 0) {
+            // Keep one physical slot empty so delete/reinsert cannot turn the
+            // table into a probe cycle with no terminating empty bucket.
+            if (vmo_backing_page_store_used >= vmo_backing_page_store.len - 1) {
+                return KernelError.TableFull;
+            }
+            vmo_backing_page_store[slot_index] = paddr;
+            vmo_backing_page_store_page_indices[slot_index] = page_index;
+            vmo_backing_page_store_owners[slot_index] = owner;
+            vmo_backing_page_store_used += 1;
+            return slot_index;
+        }
+        if (actual_owner == owner and
+            vmo_backing_page_store_page_indices[slot_index] == page_index)
+        {
+            vmo_backing_page_store[slot_index] = paddr;
+            return slot_index;
+        }
+        slot_index = if (slot_index + 1 == vmo_backing_page_store.len) 0 else slot_index + 1;
     }
-    return @intCast(start);
+    return KernelError.TableFull;
 }
 
-pub fn vmoBackingPageStorePaddr(start: u32, page_count: u32, page_index: usize) ?u64 {
-    if (page_index >= page_count) return null;
-    const store_index = @as(usize, start) + page_index;
-    if (store_index >= vmo_backing_page_store.len) return null;
-    const paddr = vmo_backing_page_store[store_index];
+fn removeVmoBackingPageStoreSlotLocked(slot_index: usize) void {
+    if (slot_index >= vmo_backing_page_store.len or
+        vmo_backing_page_store_owners[slot_index] == 0)
+    {
+        return;
+    }
+    vmo_backing_page_store[slot_index] = 0;
+    vmo_backing_page_store_page_indices[slot_index] = 0;
+    vmo_backing_page_store_owners[slot_index] = 0;
+    vmo_backing_page_store_used -= 1;
+
+    var scan = if (slot_index + 1 == vmo_backing_page_store.len) 0 else slot_index + 1;
+    var probes: usize = 0;
+    while (probes < vmo_backing_page_store.len) : (probes += 1) {
+        const owner = vmo_backing_page_store_owners[scan];
+        if (owner == 0) return;
+        const page_index = vmo_backing_page_store_page_indices[scan];
+        const paddr = vmo_backing_page_store[scan];
+        vmo_backing_page_store[scan] = 0;
+        vmo_backing_page_store_page_indices[scan] = 0;
+        vmo_backing_page_store_owners[scan] = 0;
+        vmo_backing_page_store_used -= 1;
+        _ = insertVmoBackingPageStoreSlotLocked(owner, page_index, paddr) catch unreachable;
+        scan = if (scan + 1 == vmo_backing_page_store.len) 0 else scan + 1;
+    }
+    unreachable;
+}
+
+pub fn allocEmptyVmoBackingPageStore(page_count: usize, owner: u64) ?u64 {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or page_count == 0 or
+        page_count > max_vmo_backing_pages or owner == 0)
+    {
+        return null;
+    }
+    return owner;
+}
+
+/// Logical VMO growth needs no sparse metadata until a physical page appears.
+pub fn growVmoBackingPageStore(
+    start: u64,
+    old_page_count: u32,
+    new_page_count: u32,
+    owner: u64,
+) ?u64 {
+    if (owner == 0 or start != owner or old_page_count == 0 or
+        new_page_count <= old_page_count or
+        new_page_count > max_vmo_backing_pages)
+    {
+        return null;
+    }
+
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked()) return null;
+    return start;
+}
+
+pub fn vmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize) ?u64 {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or start == 0 or page_index >= page_count or
+        page_index > std.math.maxInt(u32))
+    {
+        return null;
+    }
+    const slot_index = findVmoBackingPageStoreSlotLocked(start, @intCast(page_index)) orelse
+        return 0;
+    const paddr = vmo_backing_page_store[slot_index];
     if ((paddr & 0xFFF) != 0) return null;
     return paddr;
 }
 
-pub fn setVmoBackingPageStorePaddr(start: u32, page_count: u32, page_index: usize, paddr: u64) bool {
-    if ((paddr & 0xFFF) != 0) return false;
-    if (page_index >= page_count) return false;
-    const store_index = @as(usize, start) + page_index;
-    if (store_index >= vmo_backing_page_store.len) return false;
-    vmo_backing_page_store[store_index] = paddr;
+pub fn setVmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize, owner: u64, paddr: u64) KernelError!void {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner or
+        (paddr & 0xFFF) != 0 or page_index >= page_count or
+        page_index > std.math.maxInt(u32))
+    {
+        recordVmoBackingStoreOwnershipFaultLocked(
+            3,
+            start,
+            page_count,
+            if (page_index <= std.math.maxInt(u32)) @intCast(page_index) else std.math.maxInt(u32),
+            owner,
+            start,
+        );
+        return KernelError.InvalidState;
+    }
+    const key_index: u32 = @intCast(page_index);
+    if (paddr == 0) {
+        const slot_index = findVmoBackingPageStoreSlotLocked(owner, key_index) orelse return;
+        removeVmoBackingPageStoreSlotLocked(slot_index);
+        return;
+    }
+    _ = try insertVmoBackingPageStoreSlotLocked(owner, key_index, paddr);
+}
+
+pub fn setVmoBackingPageStorePaddrs(
+    start: u64,
+    page_count: u32,
+    page_offset: usize,
+    owner: u64,
+    paddrs: []const u64,
+) KernelError!void {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner or
+        paddrs.len == 0 or page_offset > page_count or
+        paddrs.len > @as(usize, page_count) - page_offset)
+    {
+        return KernelError.InvalidState;
+    }
+
+    var required: usize = 0;
+    for (paddrs, 0..) |paddr, offset| {
+        if ((paddr & 0xFFF) != 0 or page_offset + offset > std.math.maxInt(u32)) {
+            return KernelError.InvalidState;
+        }
+        const page_index: u32 = @intCast(page_offset + offset);
+        if (findVmoBackingPageStoreSlotLocked(owner, page_index)) |slot_index| {
+            if (vmo_backing_page_store[slot_index] != 0) return KernelError.InvalidState;
+        } else if (paddr != 0) {
+            required += 1;
+        }
+    }
+    const usable_capacity = vmo_backing_page_store.len - 1;
+    if (required > usable_capacity - vmo_backing_page_store_used) return KernelError.TableFull;
+
+    for (paddrs, 0..) |paddr, offset| {
+        if (paddr == 0) continue;
+        _ = insertVmoBackingPageStoreSlotLocked(
+            owner,
+            @intCast(page_offset + offset),
+            paddr,
+        ) catch unreachable;
+    }
+}
+
+pub fn freeVmoBackingPageStore(start: u64, page_count: u32, owner: u64) bool {
+    if (page_count == 0) return true;
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner) {
+        recordVmoBackingStoreOwnershipFaultLocked(2, start, page_count, 0, owner, start);
+        return false;
+    }
+    var page_index: u32 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const slot_index = findVmoBackingPageStoreSlotLocked(owner, page_index) orelse continue;
+        removeVmoBackingPageStoreSlotLocked(slot_index);
+    }
     return true;
 }
 
-pub fn freeVmoBackingPageStore(start: u32, page_count: u32) bool {
-    if (page_count == 0) return true;
-    const start_usize: usize = @intCast(start);
-    const count_usize: usize = @intCast(page_count);
-    if (start_usize + count_usize > vmo_backing_page_store.len) return false;
-    @memset(vmo_backing_page_store[start_usize .. start_usize + count_usize], 0);
-
-    if (start_usize + count_usize == vmo_backing_page_store_next) {
-        vmo_backing_page_store_next = start_usize;
-        while (true) {
-            var absorbed = false;
-            var i: usize = 0;
-            while (i < vmo_backing_page_store_free_range_len) : (i += 1) {
-                const range = vmo_backing_page_store_free_ranges[i];
-                if (@as(usize, range.start) + @as(usize, range.len) != vmo_backing_page_store_next) continue;
-                vmo_backing_page_store_next = range.start;
-                removeVmoBackingFreeRange(i);
-                absorbed = true;
-                break;
-            }
-            if (!absorbed) break;
-        }
-        return true;
-    }
-    return insertVmoBackingFreeRange(start, @intCast(page_count));
+pub fn resetVmoBackingPageStore() void {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    @memset(vmo_backing_page_store[0..], 0);
+    @memset(vmo_backing_page_store_owners[0..], 0);
+    @memset(vmo_backing_page_store_page_indices[0..], 0);
+    vmo_backing_page_store_used = 0;
+    vmo_backing_store_ownership_fault = .{};
 }
 
-pub fn resetVmoBackingPageStore() void {
-    @memset(vmo_backing_page_store[0..], 0);
-    @memset(vmo_backing_page_store_free_ranges[0..], .{});
-    vmo_backing_page_store_next = 0;
-    vmo_backing_page_store_free_range_len = 0;
+pub fn vmoBackingPageStoreBucketForTest(owner: u64, page_index: u32) ?usize {
+    if (!builtin.is_test) return null;
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0) return null;
+    return vmoBackingPageStoreBucketLocked(owner, page_index);
+}
+
+pub fn initVmoBackingPageStoreForTest(
+    paddrs: []u64,
+    owners: []u64,
+    page_indices: []u32,
+) bool {
+    if (!builtin.is_test or paddrs.len < 2 or owners.len != paddrs.len or
+        page_indices.len != paddrs.len)
+    {
+        return false;
+    }
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    vmo_backing_page_store = paddrs;
+    vmo_backing_page_store_owners = owners;
+    vmo_backing_page_store_page_indices = page_indices;
+    @memset(vmo_backing_page_store, 0);
+    @memset(vmo_backing_page_store_owners, 0);
+    @memset(vmo_backing_page_store_page_indices, 0);
+    vmo_backing_page_store_used = 0;
+    vmo_backing_store_ownership_fault = .{};
+    return true;
+}
+
+pub fn lockVmoBackingPageStoreForTest() bool {
+    if (!builtin.is_test) return false;
+    vmo_backing_page_store_lock.lock();
+    return true;
+}
+
+pub fn unlockVmoBackingPageStoreForTest() void {
+    if (!builtin.is_test) return;
+    vmo_backing_page_store_lock.unlock();
 }
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
@@ -1136,9 +1521,11 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store), &vmo_backing_page_store));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_next), &vmo_backing_page_store_next));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_ranges), &vmo_backing_page_store_free_ranges));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_free_range_len), &vmo_backing_page_store_free_range_len));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_owners), &vmo_backing_page_store_owners));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_page_indices), &vmo_backing_page_store_page_indices));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_used), &vmo_backing_page_store_used));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_lock), &vmo_backing_page_store_lock));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_store_ownership_fault), &vmo_backing_store_ownership_fault));
     return end;
 }
 
@@ -1155,20 +1542,26 @@ pub fn runtimeStorageBytes() usize {
     var cursor: usize = 0;
     cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
     cursor += @sizeOf(u64) * max_vmo_backing_store_pages;
-    cursor = std.mem.alignForward(usize, cursor, @alignOf(VmoBackingStoreFreeRange));
-    cursor += @sizeOf(VmoBackingStoreFreeRange) * max_vmo_backing_store_free_ranges;
+    cursor = std.mem.alignForward(usize, cursor, @alignOf(u64));
+    cursor += @sizeOf(u64) * max_vmo_backing_store_pages;
+    cursor = std.mem.alignForward(usize, cursor, @alignOf(u32));
+    cursor += @sizeOf(u32) * max_vmo_backing_store_pages;
     return std.mem.alignForward(usize, cursor, 4096);
 }
 
 pub fn initRuntimeStorage(storage: []align(4096) u8) bool {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
     var cursor: usize = 0;
     vmo_backing_page_store = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
-    vmo_backing_page_store_free_ranges = runtimeStorageSlice(VmoBackingStoreFreeRange, storage, &cursor, max_vmo_backing_store_free_ranges) orelse return false;
+    vmo_backing_page_store_owners = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
+    vmo_backing_page_store_page_indices = runtimeStorageSlice(u32, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
 
     @memset(vmo_backing_page_store, 0);
-    @memset(vmo_backing_page_store_free_ranges, .{});
-    vmo_backing_page_store_next = 0;
-    vmo_backing_page_store_free_range_len = 0;
+    @memset(vmo_backing_page_store_owners, 0);
+    @memset(vmo_backing_page_store_page_indices, 0);
+    vmo_backing_page_store_used = 0;
+    vmo_backing_store_ownership_fault = .{};
     return true;
 }
 

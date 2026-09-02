@@ -77,6 +77,8 @@ const IpcReplyRef = types.IpcReplyRef;
 const IpcWaitKey = types.IpcWaitKey;
 const IpcWaiter = types.IpcWaiter;
 const ThreadWakeTarget = types.ThreadWakeTarget;
+const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
+const FdWaitGroupRef = types.FdWaitGroupRef;
 const TaskFdWaiter = types.TaskFdWaiter;
 const max_task_fd_waiters = types.max_task_fd_waiters;
 const max_ipc_object_waiters = types.max_ipc_object_waiters;
@@ -109,17 +111,11 @@ const EndpointTable = types.EndpointTable;
 const PublishedEndpointTable = types.PublishedEndpointTable;
 const max_vmo_backing_pages = types.max_vmo_backing_pages;
 const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
-const max_vmo_backing_store_free_ranges = types.max_vmo_backing_store_free_ranges;
-const VmoBackingStoreFreeRange = types.VmoBackingStoreFreeRange;
 const RegionFreeRange = types.RegionFreeRange;
 const FreePageList = types.FreePageList;
 const PageCapability = types.PageCapability;
 const empty_vmo_backing_page_store = types.empty_vmo_backing_page_store;
 const vmo_backing_page_store = types.vmo_backing_page_store;
-const vmo_backing_page_store_next = types.vmo_backing_page_store_next;
-const empty_vmo_backing_page_store_free_ranges = types.empty_vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_ranges = types.vmo_backing_page_store_free_ranges;
-const vmo_backing_page_store_free_range_len = types.vmo_backing_page_store_free_range_len;
 const empty_process_descriptors_extra = types.empty_process_descriptors_extra;
 const empty_endpoint_tables_extra = types.empty_endpoint_tables_extra;
 const empty_fd_tables_extra = types.empty_fd_tables_extra;
@@ -132,9 +128,6 @@ const fdFlagsToBits = types.fdFlagsToBits;
 const fdRightsFromBits = types.fdRightsFromBits;
 const fdRightsToBits = types.fdRightsToBits;
 const isFdRightsSubset = types.isFdRightsSubset;
-const vmObjectBackingFreePageCount = types.vmObjectBackingFreePageCount;
-const removeVmoBackingFreeRange = types.removeVmoBackingFreeRange;
-const insertVmoBackingFreeRange = types.insertVmoBackingFreeRange;
 const allocEmptyVmoBackingPageStore = types.allocEmptyVmoBackingPageStore;
 const vmoBackingPageStorePaddr = types.vmoBackingPageStorePaddr;
 const setVmoBackingPageStorePaddr = types.setVmoBackingPageStorePaddr;
@@ -351,6 +344,8 @@ pub fn registerPipeWaiterForFd(
     min_write_bytes: u64,
     thread_index: usize,
     thread_generation: u32,
+    wait_token: u64,
+    group: FdWaitGroupRef,
 ) KernelError!bool {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
@@ -362,7 +357,7 @@ pub fn registerPipeWaiterForFd(
         requested_events & (fd_abi.event_writable | fd_abi.event_error | fd_abi.event_hangup)
     else
         requested_events & (fd_abi.event_readable | fd_abi.event_error | fd_abi.event_hangup);
-    if (matched_events == 0) return true;
+    if (matched_events == 0) return false;
     const key = IpcWaitKey{
         .kind = .pipe,
         .index = endpoint.pipe.index,
@@ -370,7 +365,28 @@ pub fn registerPipeWaiterForFd(
         .side = if (endpoint.write) 1 else 0,
     };
     const waiters = self.pipeWaitListForEndpoint(endpoint) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, min_write_bytes, thread_index, thread_generation);
+    const registration = try waiters.register(
+        key,
+        owner,
+        pollfd_va,
+        0,
+        0,
+        0,
+        requested_events,
+        min_write_bytes,
+        thread_index,
+        thread_generation,
+        wait_token,
+        group,
+    );
+    self.linkFdWaitRegistration(group, registration) catch |err| {
+        if (registration.slot < waiters.waiters.len) {
+            const waiter = &waiters.waiters[registration.slot];
+            if (waiter.active and waiter.registration.matches(registration) and
+                waiter.binding.group.matches(group)) waiter.* = .{};
+        }
+        return err;
+    };
     return true;
 }
 

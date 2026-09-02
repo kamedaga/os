@@ -40,7 +40,6 @@ var ap_user_timer_vector: u8 = 0;
 var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
 var wake_ipi_vector: u8 = 0;
-var wake_ipi_pending: [max_cpus]u8 = [_]u8{0} ** max_cpus;
 
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
 
@@ -61,7 +60,6 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_vector), &ap_user_timer_vector));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_vector), &wake_ipi_vector));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_pending), &wake_ipi_pending));
     return end;
 }
 
@@ -546,31 +544,15 @@ pub fn returnCurrentApToIdleFromInterrupt() noreturn {
 
 pub fn wakeCpu(cpu_slot: usize) bool {
     if (cpu_slot == currentCpuSlot()) return true;
-    if (cpu_slot >= wake_ipi_pending.len) return false;
-    if (@cmpxchgStrong(u8, &wake_ipi_pending[cpu_slot], 0, 1, .acq_rel, .acquire) != null) {
-        return true;
-    }
+    if (cpu_slot >= max_cpus) return false;
+    // A runnable publication needs its own APIC edge. Coalescing against an
+    // earlier vector loses the later publication when the target consumes the
+    // first vector immediately before returning to HLT.
     var attempts: usize = 0;
     while (attempts < 3) : (attempts += 1) {
         if (interruptCpu(cpu_slot)) return true;
-        @atomicStore(u8, &wake_ipi_pending[cpu_slot], 0, .release);
-        if (attempts + 1 == 3) break;
-        // Every caller that observed pending=1 relies on the owner to deliver
-        // the edge.  Reacquire after a transient APIC failure; if another
-        // sender wins the slot, that sender now owns delivery.
-        if (@cmpxchgStrong(u8, &wake_ipi_pending[cpu_slot], 0, 1, .acq_rel, .acquire) != null) {
-            return true;
-        }
     }
     return false;
-}
-
-/// A wake vector is an edge only until the target reaches this safe point.
-/// Maintenance sends remain uncoalesced through interruptCpu().
-pub fn acknowledgeWakeIpi() void {
-    const cpu_slot = currentCpuSlot();
-    if (cpu_slot >= wake_ipi_pending.len) return;
-    @atomicStore(u8, &wake_ipi_pending[cpu_slot], 0, .release);
 }
 
 /// Deliver the scheduler/wake vector to any online CPU, including the BSP.

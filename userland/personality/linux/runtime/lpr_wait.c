@@ -146,10 +146,30 @@ int64_t lpr_wait_graph_add_fd(
             PACHA_FD_EVENT_READABLE) : 0;
     if (lpr_linux_epoll_fd_active(fd))
         return lpr_epoll_add_wait_graph(fd, graph);
-    if (lpr_linux_socket_fd_active(fd))
+    if (lpr_linux_socket_fd_active(fd)) {
+        const int native_fd = lpr_linux_socket_native_wait_fd(fd);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        const lpr_socket_backend_t *socket = lpr_socket_backend(fd);
+        if (socket != 0 &&
+            (socket->reserved0 & LPR_SOCKET_DIAG_DBUS) != 0u)
+        {
+            lpr_glycin_diag_event(
+                "wait.add.socket", fd, (uint64_t)(uint32_t)native_fd,
+                events, graph->leaf_count);
+        }
+#endif
         return lpr_wait_graph_add_leaf(
-            graph, lpr_linux_socket_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
+            graph, native_fd, PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_NATIVE, (uint32_t)fd);
+    }
+    if (lpr_linux_inotify_active(fd)) {
+        if ((events & 0x0001u) == 0)
+            return 0;
+        return lpr_wait_graph_add_leaf(
+            graph, lpr_eventfd_native_wait_fd(fd), PACHA_FD_EVENT_READABLE,
+            /* The timer is consumed by the inotify scan after wakeup. */
+            0, LPR_WAIT_DRAIN_NONE, (uint32_t)fd);
+    }
     if (lpr_linux_timerfd_active(fd)) {
         if ((events & 0x0001u) == 0)
             return 0;
@@ -171,6 +191,16 @@ int64_t lpr_wait_graph_add_fd(
     }
     if (lpr_linux_eventfd_active(fd)) {
         const int native_fd = lpr_eventfd_native_wait_fd(fd);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
+            const lpr_event_backend_t *event = lpr_event_backend(fd);
+            lpr_glycin_diag_event(
+                "event.wait.add", fd,
+                event != 0 ? event->counter : 0,
+                event != 0 ? event->notify_pending : 0,
+                native_fd);
+        }
+#endif
         return lpr_wait_graph_add_leaf(
             graph, native_fd, PACHA_FD_EVENT_READABLE,
             0, LPR_WAIT_DRAIN_EVENT, (uint32_t)fd);
@@ -187,11 +217,21 @@ int64_t lpr_wait_deadline_init(
     if (deadline == 0) return -LPR_LINUX_EFAULT;
     lpr_memset(deadline, 0, sizeof(*deadline));
     if (timeout_ms < 0) return 0;
+    const uint64_t timeout_ns =
+        (uint64_t)timeout_ms > UINT64_MAX / LPR_WAIT_NS_PER_MS ?
+        UINT64_MAX : (uint64_t)timeout_ms * LPR_WAIT_NS_PER_MS;
+    return lpr_wait_deadline_init_ns(deadline, timeout_ns);
+}
+
+int64_t lpr_wait_deadline_init_ns(
+    lpr_wait_deadline_t *deadline,
+    uint64_t timeout_ns)
+{
+    if (deadline == 0) return -LPR_LINUX_EFAULT;
+    lpr_memset(deadline, 0, sizeof(*deadline));
     uint64_t now = 0;
     const int64_t status = lpr_wait_now_ns(&now);
     if (status != 0) return status;
-    const uint64_t timeout_ns = (uint64_t)timeout_ms > UINT64_MAX / LPR_WAIT_NS_PER_MS ?
-        UINT64_MAX : (uint64_t)timeout_ms * LPR_WAIT_NS_PER_MS;
     deadline->finite = 1;
     deadline->expires_ns = timeout_ns > UINT64_MAX - now ?
         UINT64_MAX : now + timeout_ns;
@@ -240,6 +280,24 @@ int64_t lpr_wait_graph_block(
     const lpr_wait_deadline_t *deadline)
 {
     if (graph == 0) return -LPR_LINUX_EFAULT;
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    uint32_t diag_watch_index = UINT32_MAX;
+    uint32_t diag_watch_fd = 0;
+    for (uint32_t i = 0; i < graph->leaf_count; ++i) {
+        const uint32_t logical_fd = graph->logical_fds[i];
+        if (logical_fd == UINT32_MAX ||
+            !lpr_linux_socket_fd_active(logical_fd))
+            continue;
+        const lpr_socket_backend_t *socket = lpr_socket_backend(logical_fd);
+        if (socket != 0 &&
+            (socket->reserved0 & LPR_SOCKET_DIAG_DBUS) != 0u)
+        {
+            diag_watch_fd = logical_fd;
+            diag_watch_index = i;
+            break;
+        }
+    }
+#endif
     uint64_t wait_ns = UINT64_MAX;
     const int64_t deadline_status =
         lpr_wait_deadline_remaining(deadline, &wait_ns);
@@ -253,6 +311,17 @@ int64_t lpr_wait_graph_block(
         const int64_t now_status = lpr_wait_now_ns(&wait_started_ns);
         if (now_status != 0) return now_status;
     }
+
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (diag_watch_index != UINT32_MAX) {
+        lpr_glycin_diag_event(
+            "wait.block.enter",
+            diag_watch_fd,
+            (uint64_t)(uint32_t)graph->leaves[diag_watch_index].fd,
+            graph->leaf_count,
+            wait_ns == UINT64_MAX ? -1 : (int64_t)wait_ns);
+    }
+#endif
 
     int64_t status = 0;
     if (graph->leaf_count == 0) {
@@ -286,32 +355,105 @@ int64_t lpr_wait_graph_block(
             if (wait_ns % LPR_WAIT_NS_PER_MS != 0) timeout_ticks++;
             if (timeout_ticks == PACHA_FD_WAIT_FOREVER) timeout_ticks--;
         }
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG && \
+    defined(LPR_WAIT_ENTRY_DIAG) && LPR_WAIT_ENTRY_DIAG
+        lpr_wait_native_diag_event(
+            "native.enter",
+            (uint64_t)(uint32_t)graph->leaves[0].fd,
+            graph->leaves[0].events,
+            graph->leaf_count,
+            timeout_ticks,
+            0);
+#endif
         status = lpr_pacha_syscall4(
             PACHA_FD_SYSCALL_WAIT_MANY,
             (uint64_t)(uintptr_t)graph->leaves,
             graph->leaf_count,
             timeout_ticks,
             0);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG && \
+    defined(LPR_WAIT_ENTRY_DIAG) && LPR_WAIT_ENTRY_DIAG
+        lpr_wait_native_diag_event(
+            "native.exit",
+            (uint64_t)(uint32_t)graph->leaves[0].fd,
+            graph->leaves[0].events,
+            graph->leaf_count,
+            timeout_ticks,
+            status);
+        if (status >= 0) {
+            for (uint32_t i = 0; i < graph->leaf_count; ++i) {
+                if (graph->leaves[i].revents == 0) continue;
+                lpr_wait_native_diag_event(
+                    "native.ready",
+                    (uint64_t)(uint32_t)graph->leaves[i].fd,
+                    graph->leaves[i].revents,
+                    graph->logical_fds[i],
+                    i,
+                    0);
+            }
+        }
+#endif
     }
+
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (diag_watch_index != UINT32_MAX) {
+        const uint64_t diag_revents =
+            graph->leaves[diag_watch_index].revents;
+        if (diag_revents != 0 || status < 0) {
+            lpr_glycin_diag_event(
+                "wait.block.exit",
+                diag_watch_fd,
+                graph->leaves[diag_watch_index].events,
+                diag_revents,
+                status);
+        }
+    }
+#endif
 
     if (status >= 0) {
         for (uint32_t i = 0; i < graph->leaf_count; ++i) {
-            if ((graph->leaves[i].revents & PACHA_FD_EVENT_READABLE) == 0)
+            if ((graph->leaves[i].revents &
+                 (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP)) == 0)
                 continue;
             if (graph->drain_modes[i] == LPR_WAIT_DRAIN_EVENT)
                 lpr_eventfd_drain_wait(graph->logical_fds[i]);
             else if (graph->drain_modes[i] == LPR_WAIT_DRAIN_NATIVE) {
                 if (graph->logical_fds[i] != UINT32_MAX &&
                     lpr_linux_socket_fd_active(graph->logical_fds[i])) {
-                    lpr_linux_socket_mark_readable(graph->logical_fds[i]);
+                    const uint64_t events =
+                        lpr_native_wait_drain_events(graph->leaves[i].fd);
+                    if (events != 0)
+                        lpr_linux_socket_mark_events(
+                            graph->logical_fds[i], events);
+                    else
+                        lpr_linux_socket_mark_readable(graph->logical_fds[i]);
+                } else {
+                    lpr_native_wait_drain(graph->leaves[i].fd);
                 }
-                lpr_native_wait_drain(graph->leaves[i].fd);
             }
         }
     }
 
-    if (lpr_linux_pump_tty_signals())
-        return LPR_WAIT_RESTART_SYSCALL;
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (diag_watch_index != UINT32_MAX) {
+        const uint64_t diag_revents =
+            graph->leaves[diag_watch_index].revents;
+        if (diag_revents != 0 || status < 0) {
+            lpr_glycin_diag_event(
+                "wait.block.drained",
+                diag_watch_fd,
+                graph->leaves[diag_watch_index].events,
+                diag_revents,
+                status);
+        }
+    }
+#endif
+
+    /* termd forwards queued TTY signals through lpr_supervisor, whose native
+     * process signal interrupts this wait.  Polling TERMD_OP_SIGNAL_TAKE here
+     * would serialize every unrelated fd wake behind a second service RPC.
+     * TTY operations still pump explicitly when their own reply reports
+     * EINTR, closing the reply-versus-forwarding race at that boundary. */
 
     /* NOT_READY is also the signal-interrupt resume value.  Unwind even if a
      * concurrent fd event populated revents so the dispatcher can deliver the

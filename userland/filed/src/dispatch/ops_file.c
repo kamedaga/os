@@ -94,6 +94,14 @@ static void filed_file_vmo_storage_profile_accumulate(
     FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, overlay_cycles);
     FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, partial_copy_calls);
     FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, partial_copy_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, cache_folio_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, cache_folio_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, copy_to_iter_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, copy_to_iter_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, folio_put_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, folio_put_cycles);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, atime_calls);
+    FILED_PROFILE_ADD(filed_file_vmo_fs_profile, fs_before, fs_after, atime_cycles);
     for (size_t i = 0; i < KB_LINUX_BLOCK_PROFILE_STAGE_COUNT; i++) {
         __atomic_fetch_add(
             &filed_file_vmo_block_profile.cycles[i],
@@ -139,7 +147,11 @@ void filed_file_vmo_storage_profile_dump(void)
         "FILED_STORAGE_PROFILE scope=file_vmo_fs pread_calls=%llu pread_bytes=%llu "
         "calls=%llu bytes=%llu total_cycles=%llu extent_calls=%llu extent_cycles=%llu "
         "device_calls=%llu device_cycles=%llu overlay_calls=%llu overlay_cycles=%llu "
-        "partial_copy_calls=%llu partial_copy_cycles=%llu\n",
+        "partial_copy_calls=%llu partial_copy_cycles=%llu "
+        "cache_folio_calls=%llu cache_folio_cycles=%llu "
+        "copy_to_iter_calls=%llu copy_to_iter_cycles=%llu "
+        "folio_put_calls=%llu folio_put_cycles=%llu "
+        "atime_calls=%llu atime_cycles=%llu\n",
         (unsigned long long)__atomic_load_n(&filed_file_vmo_profile_calls, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&filed_file_vmo_profile_bytes, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.calls, __ATOMIC_RELAXED),
@@ -152,7 +164,15 @@ void filed_file_vmo_storage_profile_dump(void)
         (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.overlay_calls, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.overlay_cycles, __ATOMIC_RELAXED),
         (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.partial_copy_calls, __ATOMIC_RELAXED),
-        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.partial_copy_cycles, __ATOMIC_RELAXED));
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.partial_copy_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.cache_folio_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.cache_folio_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.copy_to_iter_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.copy_to_iter_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.folio_put_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.folio_put_cycles, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.atime_calls, __ATOMIC_RELAXED),
+        (unsigned long long)__atomic_load_n(&filed_file_vmo_fs_profile.atime_cycles, __ATOMIC_RELAXED));
     fprintf(stderr,
         "FILED_STORAGE_PROFILE scope=file_vmo_block bytes=%llu "
         "alloc_calls=%llu alloc_cycles=%llu map_calls=%llu map_cycles=%llu "
@@ -420,6 +440,36 @@ filed_page_dispatch_result_t filed_dispatch_stat_page(
         }
     }
     return filed_page_result(reply_status, result);
+}
+
+filed_page_dispatch_result_t filed_dispatch_statfs_page(
+    filed_runtime_t *runtime,
+    void *page)
+{
+    filed_statfs_t *wire_statfs = (filed_statfs_t *)page;
+    const uint64_t handle = wire_statfs->handle;
+    filed_vfs_io_decision_t decision;
+    const filed_status_t vfs_status = filed_vfs_stat_prepare(
+        &runtime->vfs,
+        (filed_handle_id_t)(uint32_t)handle,
+        &decision);
+    if (vfs_status != FILED_OK) {
+        return filed_page_result(filed_status_to_wire(vfs_status), 0);
+    }
+    storage_statfs_reply_t backend_statfs;
+    memset(&backend_statfs, 0, sizeof(backend_statfs));
+    const int64_t status = filed_backend_statfs(
+        runtime,
+        decision.backend_object,
+        &backend_statfs);
+    if (status != 0) return filed_page_result(status, 0);
+    memset(wire_statfs, 0, sizeof(*wire_statfs));
+    wire_statfs->handle = handle;
+    memcpy(
+        &wire_statfs->type,
+        &backend_statfs,
+        sizeof(backend_statfs));
+    return filed_page_result(0, 0);
 }
 
 filed_page_dispatch_result_t filed_dispatch_utimens_page(
@@ -845,7 +895,7 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
      * the cache has enough evictable bytes: the old implementation allocated
      * first and only enforced the byte budget after the read completed. */
     filed_file_vmo_cache_entry_t *entry =
-        filed_file_vmo_cache_slot_for_length(runtime, length);
+        filed_file_vmo_cache_pinned_slot_for_length(runtime, length);
     if (entry == NULL) {
         return filed_page_result(-28, 0);
     }

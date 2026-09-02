@@ -11,6 +11,7 @@
 #include "filed/vfs.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
+#include "script.h"
 
 enum {
     LPR_EXEC_EHDR_BYTES = 64,
@@ -185,6 +186,11 @@ void lpr_exec_metric_cycles(const char *label, uint64_t start_cycles, uint64_t e
 int lpr_exec_read_absolute_image(filed_runtime_t *runtime, const char *path, lpr_exec_image_t *out_image);
 int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t handle_id, lpr_exec_file_t *out_file);
 int lpr_exec_open_absolute_file(filed_runtime_t *runtime, const char *path, lpr_exec_file_t *out_file);
+int lpr_exec_open_file_at(
+    filed_runtime_t *runtime,
+    uint64_t dir_handle,
+    const char *path,
+    lpr_exec_file_t *out_file);
 void lpr_exec_close_file(filed_runtime_t *runtime, lpr_exec_file_t *file);
 int lpr_exec_read_file_range(
     filed_runtime_t *runtime,

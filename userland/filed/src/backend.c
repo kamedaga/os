@@ -28,6 +28,18 @@ int filed_backend_statx(
     return filed_kobox_backend_statx(&runtime->backend, object_id, out_stat);
 }
 
+int filed_backend_statfs(
+    filed_runtime_t *runtime,
+    uint64_t object_id,
+    storage_statfs_reply_t *out_statfs)
+{
+    if (runtime == NULL || out_statfs == NULL) return -22;
+    if (filed_tmpfs_backend_is_object(object_id)) {
+        return filed_tmpfs_backend_statfs(&runtime->tmpfs, out_statfs);
+    }
+    return filed_kobox_backend_statfs(&runtime->backend, out_statfs);
+}
+
 int filed_backend_pread(
     filed_runtime_t *runtime,
     uint64_t object_id,
@@ -161,12 +173,12 @@ int filed_backend_link(
     {
         return -18;
     }
-    (void)runtime;
-    (void)old_object_id;
-    (void)new_parent_object_id;
-    (void)new_name;
-    (void)out_object_id;
-    return -95;
+    return filed_kobox_backend_link(
+        &runtime->backend,
+        old_object_id,
+        new_parent_object_id,
+        new_name,
+        out_object_id);
 }
 
 int filed_backend_mkdir(

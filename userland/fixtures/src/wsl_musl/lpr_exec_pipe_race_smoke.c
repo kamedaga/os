@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -46,8 +47,84 @@ static int wait_child(pid_t child, int *status)
     }
 }
 
-int main(void)
+static int exec_pipe_writer_mode(const char *fd_text)
 {
+    char *end = NULL;
+    errno = 0;
+    const long parsed = strtol(fd_text, &end, 10);
+    if (errno != 0 || end == fd_text || *end != '\0' || parsed < 0 ||
+        parsed > 0x7fffffffL)
+    {
+        return 30;
+    }
+    const int fd = (int)parsed;
+    static const char payload[] = "exec-pipe-eof";
+    if (write(fd, payload, sizeof(payload) - 1u) !=
+        (ssize_t)(sizeof(payload) - 1u))
+    {
+        return 31;
+    }
+    return close(fd) == 0 ? 0 : 32;
+}
+
+static int check_exec_pipe_eof(void)
+{
+    int pipe_fds[2];
+    if (pipe2(pipe_fds, 0) != 0) return 33;
+
+    const pid_t writer = fork();
+    if (writer < 0) return 34;
+    if (writer == 0) {
+        (void)close(pipe_fds[0]);
+        char fd_text[32];
+        if (snprintf(fd_text, sizeof(fd_text), "%d", pipe_fds[1]) <= 0)
+            _exit(125);
+        execl(
+            "/cmd/lpr_exec_pipe_race.elf",
+            "lpr_exec_pipe_race.elf",
+            "--pipe-writer",
+            fd_text,
+            (char *)0);
+        _exit(126);
+    }
+
+    if (close(pipe_fds[1]) != 0) return 35;
+    static const char expected[] = "exec-pipe-eof";
+    char got[sizeof(expected)];
+    size_t used = 0;
+    while (used < sizeof(expected) - 1u) {
+        const ssize_t n = read(
+            pipe_fds[0], got + used, sizeof(expected) - 1u - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return 36;
+        used += (size_t)n;
+    }
+    if (memcmp(got, expected, sizeof(expected) - 1u) != 0) return 37;
+
+    char byte = 0;
+    ssize_t eof;
+    do {
+        eof = read(pipe_fds[0], &byte, 1);
+    } while (eof < 0 && errno == EINTR);
+    if (eof != 0) return 38;
+    if (close(pipe_fds[0]) != 0) return 39;
+
+    int status = 0;
+    if (wait_child(writer, &status) != 0 || !WIFEXITED(status) ||
+        WEXITSTATUS(status) != 0)
+    {
+        return 40;
+    }
+    puts("LPR_EXEC_PIPE_EOF_DONE");
+    fflush(stdout);
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 3 && strcmp(argv[1], "--pipe-writer") == 0)
+        return exec_pipe_writer_mode(argv[2]);
+
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = signal_handler;
@@ -56,6 +133,9 @@ int main(void)
 
     puts("LPR_EXEC_PIPE_RACE_START");
     fflush(stdout);
+
+    const int exec_pipe_status = check_exec_pipe_eof();
+    if (exec_pipe_status != 0) return exec_pipe_status;
 
     const pid_t signaler = fork();
     if (signaler < 0) return 11;

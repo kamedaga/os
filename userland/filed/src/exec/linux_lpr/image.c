@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include "filed/backend_router.h"
+#include "filed/dispatch.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -1193,6 +1194,7 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
     }
     memset(&stat, 0, sizeof(stat));
     if (snapshot.valid) {
+        stat.inode_number = snapshot.inode_number;
         stat.mode = snapshot.mode;
         stat.size = snapshot.size;
         stat.blocks = snapshot.blocks;
@@ -1200,8 +1202,7 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
         stat.kind = snapshot.kind;
     }
     if (!snapshot.valid ||
-        (stat.kind & 0170000u) == 0 ||
-        stat.size < LPR_EXEC_EHDR_BYTES)
+        (stat.kind & 0170000u) == 0)
     {
         stage_start = lpr_exec_image_now_ns();
         const int status = filed_runtime_backend_statx(runtime, stat_decision.backend_object, &stat);
@@ -1210,6 +1211,7 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
             return status;
         }
         snapshot.valid = true;
+        snapshot.inode_number = stat.inode_number;
         snapshot.mode = stat.mode;
         snapshot.size = stat.size;
         snapshot.blocks = stat.blocks;
@@ -1218,7 +1220,6 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
         (void)filed_vfs_update_stat_snapshot(&runtime->vfs, stat_decision.backend_object, &snapshot);
     }
     if ((stat.kind & 0170000u) != 0100000u ||
-        stat.size < LPR_EXEC_EHDR_BYTES ||
         stat.size > LPR_EXEC_MAX_IMAGE_BYTES)
     {
         fprintf(stderr,
@@ -1230,6 +1231,9 @@ int lpr_exec_init_file_from_handle(filed_runtime_t *runtime, filed_handle_id_t h
             (unsigned long long)stat.size,
             snapshot.valid ? 1u : 0u);
         return -8;
+    }
+    if ((stat.mode & 0111u) == 0) {
+        return -13;
     }
     out_file->handle_id = handle_id;
     out_file->backend_object = stat_decision.backend_object;
@@ -1453,6 +1457,38 @@ int lpr_exec_open_absolute_file(filed_runtime_t *runtime, const char *path, lpr_
         FILED_RIGHT_READ | FILED_RIGHT_EXEC | FILED_RIGHT_STAT,
         0,
         &open_result);
+    if (status != 0) {
+        return status;
+    }
+    status = lpr_exec_init_file_from_handle(runtime, open_result.handle_id, out_file);
+    if (status != 0) {
+        (void)filed_vfs_close_handle(&runtime->vfs, open_result.handle_id);
+        memset(out_file, 0, sizeof(*out_file));
+    }
+    return status;
+}
+
+int lpr_exec_open_file_at(
+    filed_runtime_t *runtime,
+    uint64_t dir_handle,
+    const char *path,
+    lpr_exec_file_t *out_file)
+{
+    filed_openat_t openat;
+    filed_vfs_open_result_t open_result;
+    if (runtime == NULL || path == NULL || path[0] == '\0' || out_file == NULL) {
+        return -22;
+    }
+    memset(out_file, 0, sizeof(*out_file));
+    memset(&openat, 0, sizeof(openat));
+    memset(&open_result, 0, sizeof(open_result));
+    openat.dir_handle = dir_handle;
+    openat.rights = FILED_RIGHT_READ | FILED_RIGHT_EXEC | FILED_RIGHT_STAT;
+    const int path_bytes = snprintf(openat.name, sizeof(openat.name), "%s", path);
+    if (path_bytes < 0 || (size_t)path_bytes >= sizeof(openat.name)) {
+        return -36;
+    }
+    int status = (int)filed_openat_path(runtime, &openat, &open_result);
     if (status != 0) {
         return status;
     }

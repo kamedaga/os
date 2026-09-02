@@ -13,7 +13,9 @@ if [[ "${SKIP_SYNC:-0}" != "1" ]]; then
 fi
 
 .artifacts/bin/pacgo qemu-test \
+  --cpus 4 \
   --timeout 30s \
+  --console-shell \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '. /cmd/lpr_async_signal_smoke.sh' \
   --expect 'ASYNC_SIGNAL_START' \
@@ -34,4 +36,14 @@ fi
   --expect 'ASYNC_SIGNALFD_READY' \
   --expect 'ASYNC_SIGNALFD_EPOLL=OK' \
   --expect 'ASYNC_SIGNALFD=OK' \
+  --expect 'ASYNC_EXEC_SIGIGN=OK' \
+  --expect 'ASYNC_EXEC_CAUGHT_RESET=OK' \
+  --expect 'ASYNC_EXEC_SIGMASK=OK' \
+  --expect 'ASYNC_EXEC_SIGNAL_STATE=OK' \
+  --expect 'ASYNC_SIGTIMEDWAIT_PENDING=OK' \
+  --expect 'ASYNC_SIGTIMEDWAIT_ZERO_TIMEOUT=OK' \
+  --expect 'ASYNC_SIGTIMEDWAIT_FINITE_TIMEOUT=OK' \
+  --expect 'ASYNC_SIGTIMEDWAIT_SIGCHLD=OK' \
+  --expect 'ASYNC_SIGTIMEDWAIT_EINTR=OK' \
+  --expect 'ASYNC_SIGTIMEDWAIT_IGNORED_RESTART=OK' \
   --expect 'ASYNC_SIGNAL_DONE failures=0'

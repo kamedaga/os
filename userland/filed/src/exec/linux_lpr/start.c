@@ -181,6 +181,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
     const uint64_t envc = request->envc;
     uint64_t argv_va[FILED_EXEC_MAX_ARGS];
     uint64_t envp_va[FILED_EXEC_MAX_ENVS];
+    uint64_t execfn_va = 0;
     memset(argv_va, 0, sizeof(argv_va));
     memset(envp_va, 0, sizeof(envp_va));
 
@@ -207,7 +208,19 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
             return status;
         }
     }
-    const uint64_t argv0_va = argv_va[0];
+    {
+        const int status = copy_stack_string(
+            stack,
+            &sp,
+            stack_base,
+            request->path,
+            &execfn_va);
+        if (status != 0) {
+            (void)pacha_munmap(stack, LPR_EXEC_LINUX_STACK_SIZE);
+            (void)pacha_fd_close(stack_fd);
+            return status;
+        }
+    }
     sp &= ~(LPR_IMAGE_INITIAL_STACK_ALIGNMENT - 1u);
     sp -= LPR_IMAGE_INITIAL_RANDOM_BYTES;
     const uint64_t random_va = stack_base + sp;
@@ -241,7 +254,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
         (has_bootstrap &&
             (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 ||
              push_u64(stack, &sp, LPR_IMAGE_AT_BOOTSTRAP_FD) != 0)) ||
-        push_u64(stack, &sp, argv0_va) != 0 ||
+        push_u64(stack, &sp, execfn_va) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_EXECFN) != 0 ||
         push_u64(stack, &sp, random_va) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_RANDOM) != 0 ||

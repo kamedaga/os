@@ -141,19 +141,10 @@ bool filed_cache_object_evictable(filed_runtime_t *runtime, uint64_t backend_obj
     }
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
-        /*
-         * A non-shared FILE_VMO is an immutable snapshot.  Once its contents
-         * have been copied into the VMO, the cache entry no longer needs the
-         * backend object or its vnode to remain resident.  Reclaiming that
-         * vnode closes the cache's VMO owner through
-         * filed_cache_release_object(); processes keep their transferred VMO
-         * reference.
-         *
-         * A shared VMO is different: it remains an I/O source and may still
-         * require writeback/revocation, so it must continue to pin the object.
-         */
-        if (entry->active && entry->shared &&
-            entry->backend_object == backend_object)
+        /* All active entries keep their cache key valid.  Creation uses the
+         * bounded pinned-slot allocator below, so immutable snapshots cannot
+         * consume the entire vnode/backend-object table. */
+        if (entry->active && entry->backend_object == backend_object)
         {
             return false;
         }
@@ -1090,6 +1081,7 @@ static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uin
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (entry->active && entry->backend_object == backend_object) {
+            filed_file_vmo_cache_evictions++;
             filed_file_vmo_cache_clear_entry(entry, entry->shared != 0);
         }
     }
@@ -1103,6 +1095,7 @@ static void filed_file_vmo_cache_release_object(filed_runtime_t *runtime, uint64
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (entry->active && entry->backend_object == backend_object) {
+            filed_file_vmo_cache_evictions++;
             filed_file_vmo_cache_clear_entry(entry, false);
         }
     }
@@ -1140,12 +1133,37 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime
     return filed_file_vmo_cache_slot_for_length(runtime, 0);
 }
 
+static filed_file_vmo_cache_entry_t *filed_file_vmo_cache_snapshot_victim(
+    filed_runtime_t *runtime)
+{
+    filed_file_vmo_cache_entry_t *victim = NULL;
+    if (runtime == NULL) {
+        return NULL;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (!entry->active || entry->shared) {
+            continue;
+        }
+        /* A snapshot pins one backend object regardless of its byte size.
+         * Prefer retaining the snapshots that are most expensive to rebuild;
+         * use LRU only between equal-sized images.  This keeps a large shared
+         * library image reusable while small loader mappings pass through the
+         * bounded pinned-vnode set. */
+        if (victim == NULL ||
+            entry->length < victim->length ||
+            (entry->length == victim->length && entry->clock < victim->clock))
+        {
+            victim = entry;
+        }
+    }
+    return victim;
+}
+
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
     filed_runtime_t *runtime,
     uint64_t length)
 {
-    filed_file_vmo_cache_entry_t *oldest_entry = NULL;
-    uint64_t oldest = UINT64_MAX;
     if (runtime == NULL || length > FILED_FILE_VMO_CACHE_TOTAL_BYTES) {
         return NULL;
     }
@@ -1162,42 +1180,60 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
             }
         }
         while (active_bytes > FILED_FILE_VMO_CACHE_TOTAL_BYTES - length) {
-            oldest_entry = NULL;
-            oldest = UINT64_MAX;
-            for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-                filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
-                if (entry->active && !entry->shared && entry->clock < oldest) {
-                    oldest = entry->clock;
-                    oldest_entry = entry;
-                }
-            }
-            if (oldest_entry == NULL) {
+            filed_file_vmo_cache_entry_t *victim =
+                filed_file_vmo_cache_snapshot_victim(runtime);
+            if (victim == NULL) {
                 return NULL;
             }
-            active_bytes = oldest_entry->length > active_bytes ?
-                0 : active_bytes - oldest_entry->length;
+            active_bytes = victim->length > active_bytes ?
+                0 : active_bytes - victim->length;
             filed_file_vmo_cache_evictions++;
-            filed_file_vmo_cache_clear_entry(oldest_entry, false);
+            filed_file_vmo_cache_clear_entry(victim, false);
         }
     }
-    oldest_entry = NULL;
-    oldest = UINT64_MAX;
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (!entry->active) {
             return entry;
         }
-        if (!entry->shared && entry->clock < oldest) {
-            oldest = entry->clock;
-            oldest_entry = entry;
-        }
     }
-    if (oldest_entry == NULL) {
+    filed_file_vmo_cache_entry_t *victim =
+        filed_file_vmo_cache_snapshot_victim(runtime);
+    if (victim == NULL) {
         return NULL;
     }
     filed_file_vmo_cache_evictions++;
-    filed_file_vmo_cache_clear_entry(oldest_entry, false);
-    return oldest_entry;
+    filed_file_vmo_cache_clear_entry(victim, false);
+    return victim;
+}
+
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
+    filed_runtime_t *runtime,
+    uint64_t length)
+{
+    uint32_t snapshot_entries = 0;
+    if (runtime == NULL) {
+        return NULL;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (!entry->active) {
+            continue;
+        }
+        if (!entry->shared) {
+            ++snapshot_entries;
+        }
+    }
+    if (snapshot_entries >= FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT) {
+        filed_file_vmo_cache_entry_t *victim =
+            filed_file_vmo_cache_snapshot_victim(runtime);
+        if (victim == NULL) {
+            return NULL;
+        }
+        filed_file_vmo_cache_evictions++;
+        filed_file_vmo_cache_clear_entry(victim, false);
+    }
+    return filed_file_vmo_cache_slot_for_length(runtime, length);
 }
 
 uint32_t filed_file_vmo_cache_reclaim_snapshots(
@@ -1301,7 +1337,7 @@ int filed_cache_create_shared_vmo(
     /* Enforce the cache byte budget before allocating the replacement.  This
      * keeps resize/create from temporarily requiring old + new VMO capacity. */
     filed_file_vmo_cache_entry_t *entry =
-        filed_file_vmo_cache_slot_for_length(runtime, capacity);
+        filed_file_vmo_cache_pinned_slot_for_length(runtime, capacity);
     if (entry == NULL) {
         return -28;
     }

@@ -112,6 +112,119 @@ int main(void) {
                far_code[381] == LPR_ZPOLINE_PATCH_TO0 &&
                far_code[382] == LPR_ZPOLINE_PATCH_TO1)) return 1;
 
+    /* Rustix's packed epoll_event occupies the top twelve bytes of the red
+     * zone. zpoline must move the input below its CALL return slot while
+     * leaving the generated wrapper otherwise byte-for-byte intact. */
+    uint8_t rustix_epoll_code[] = {
+        0x4c, 0x8d, 0x54, 0x24, 0xf4,
+        0x41, 0x89, 0x0a,
+        0x49, 0x89, 0x42, 0x04,
+        0x89, 0xf2,
+        0xb8, 0xe9, 0x00, 0x00, 0x00,
+        0xbe, 0x03, 0x00, 0x00, 0x00,
+        0x0f, 0x05,
+        0xc3,
+    };
+    uint8_t rustix_epoll_expected[sizeof(rustix_epoll_code)];
+    memcpy(rustix_epoll_expected, rustix_epoll_code,
+           sizeof(rustix_epoll_expected));
+    rustix_epoll_expected[4] = 0xec;
+    rustix_epoll_expected[24] = LPR_ZPOLINE_PATCH_TO0;
+    rustix_epoll_expected[25] = LPR_ZPOLINE_PATCH_TO1;
+    const struct lpr_patch_mapping_request rustix_epoll_request = {
+        .start_va = (uint64_t)(uintptr_t)rustix_epoll_code,
+        .size_bytes = sizeof(rustix_epoll_code),
+        .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE,
+    };
+    if (expect(lpr_patch_mapping(&rustix_epoll_request, &result) == 0)) return 1;
+    if (expect(result.patched_sites == 1)) return 1;
+    if (expect(memcmp(rustix_epoll_code, rustix_epoll_expected,
+                      sizeof(rustix_epoll_code)) == 0)) return 1;
+
+    /* The same Rust support code has an eight-byte write buffer at rsp-8.
+     * Its RIP-relative fd displacement is intentionally arbitrary here. */
+    uint8_t rust_write_code[] = {
+        0x48, 0x8d, 0x74, 0x24, 0xf8,
+        0x48, 0xc7, 0x06, 0x01, 0x00, 0x00, 0x00,
+        0x8b, 0x3d, 0x12, 0x34, 0x56, 0x78,
+        0xb8, 0x01, 0x00, 0x00, 0x00,
+        0xba, 0x08, 0x00, 0x00, 0x00,
+        0x0f, 0x05,
+        0xc3,
+    };
+    uint8_t rust_write_expected[sizeof(rust_write_code)];
+    memcpy(rust_write_expected, rust_write_code, sizeof(rust_write_expected));
+    rust_write_expected[4] = 0xf0;
+    rust_write_expected[28] = LPR_ZPOLINE_PATCH_TO0;
+    rust_write_expected[29] = LPR_ZPOLINE_PATCH_TO1;
+    const struct lpr_patch_mapping_request rust_write_request = {
+        .start_va = (uint64_t)(uintptr_t)rust_write_code,
+        .size_bytes = sizeof(rust_write_code),
+        .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE |
+                 LPR_PATCH_FLAG_VALIDATED_INSN,
+    };
+    if (expect(lpr_patch_mapping(&rust_write_request, &result) == 0)) return 1;
+    if (expect(result.patched_sites == 1)) return 1;
+    if (expect(memcmp(rust_write_code, rust_write_expected,
+                      sizeof(rust_write_code)) == 0)) return 1;
+
+    /* Close byte sequences still get their SYSCALL patched, but must not be
+     * rewritten as one of the known red-zone inputs. */
+    uint8_t epoll_near_miss[sizeof(rustix_epoll_expected)];
+    memcpy(epoll_near_miss, rustix_epoll_expected, sizeof(epoll_near_miss));
+    epoll_near_miss[4] = 0xf4;
+    epoll_near_miss[15] = 0xe8; /* syscall number 232, not epoll_ctl */
+    epoll_near_miss[24] = LPR_ZPOLINE_PATCH_FROM0;
+    epoll_near_miss[25] = LPR_ZPOLINE_PATCH_FROM1;
+    const struct lpr_patch_mapping_request epoll_near_miss_request = {
+        .start_va = (uint64_t)(uintptr_t)epoll_near_miss,
+        .size_bytes = sizeof(epoll_near_miss),
+        .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE |
+                 LPR_PATCH_FLAG_VALIDATED_INSN,
+    };
+    if (expect(lpr_patch_mapping(&epoll_near_miss_request, &result) == 0)) return 1;
+    if (expect(epoll_near_miss[4] == 0xf4)) return 1;
+    if (expect(epoll_near_miss[24] == LPR_ZPOLINE_PATCH_TO0 &&
+               epoll_near_miss[25] == LPR_ZPOLINE_PATCH_TO1)) return 1;
+
+    uint8_t write_near_miss[sizeof(rust_write_expected)];
+    memcpy(write_near_miss, rust_write_expected, sizeof(write_near_miss));
+    write_near_miss[4] = 0xf8;
+    write_near_miss[8] = 0x02; /* writes a different value */
+    write_near_miss[28] = LPR_ZPOLINE_PATCH_FROM0;
+    write_near_miss[29] = LPR_ZPOLINE_PATCH_FROM1;
+    const struct lpr_patch_mapping_request write_near_miss_request = {
+        .start_va = (uint64_t)(uintptr_t)write_near_miss,
+        .size_bytes = sizeof(write_near_miss),
+        .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE |
+                 LPR_PATCH_FLAG_VALIDATED_INSN,
+    };
+    if (expect(lpr_patch_mapping(&write_near_miss_request, &result) == 0)) return 1;
+    if (expect(write_near_miss[4] == 0xf8)) return 1;
+    if (expect(write_near_miss[28] == LPR_ZPOLINE_PATCH_TO0 &&
+               write_near_miss[29] == LPR_ZPOLINE_PATCH_TO1)) return 1;
+
+    /* Red-zone relocation is part of the transactional patch: a later decode
+     * failure leaves both the displacement and SYSCALL unchanged. */
+    uint8_t red_zone_transaction[sizeof(rustix_epoll_code) + 2u];
+    memcpy(red_zone_transaction, rustix_epoll_expected,
+           sizeof(rustix_epoll_expected));
+    red_zone_transaction[4] = 0xf4;
+    red_zone_transaction[24] = LPR_ZPOLINE_PATCH_FROM0;
+    red_zone_transaction[25] = LPR_ZPOLINE_PATCH_FROM1;
+    red_zone_transaction[26] = 0x0f;
+    red_zone_transaction[27] = 0x04;
+    const struct lpr_patch_mapping_request red_zone_transaction_request = {
+        .start_va = (uint64_t)(uintptr_t)red_zone_transaction,
+        .size_bytes = sizeof(red_zone_transaction),
+        .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE |
+                 LPR_PATCH_FLAG_VALIDATED_INSN,
+    };
+    if (expect(lpr_patch_mapping(&red_zone_transaction_request, &result) < 0)) return 1;
+    if (expect(red_zone_transaction[4] == 0xf4)) return 1;
+    if (expect(red_zone_transaction[24] == LPR_ZPOLINE_PATCH_FROM0 &&
+               red_zone_transaction[25] == LPR_ZPOLINE_PATCH_FROM1)) return 1;
+
     uint8_t page[LPR_ZPOLINE_PAGE_SIZE];
     memset(page, 0, sizeof(page));
     if (expect(lpr_build_zpoline_page(page, 0x1122334455667788ull) == 0)) return 1;

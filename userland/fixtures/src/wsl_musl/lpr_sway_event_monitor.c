@@ -76,7 +76,7 @@ static int connect_when_ready(const char *path)
 
 int main(int argc, char **argv)
 {
-    static const char subscription[] = "[\"window\",\"tick\"]";
+    static const char subscription[] = "[\"window\",\"binding\",\"tick\"]";
     if (argc != 2) return 2;
     const int fd = connect_when_ready(argv[1]);
     if (fd < 0) return 1;

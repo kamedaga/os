@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "netd_internal.h"
 
 #include "kobox/module.h"
@@ -11,6 +13,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int validate_boot_config(const struct netd_boot_config *cfg)
@@ -34,9 +37,25 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
     return 1;
 }
 
+static int netd_wait_set_failure(
+    const char *collector,
+    int status,
+    const struct pacha_service_wait_set *wait_set)
+{
+    fprintf(stderr,
+        "[netd] wait_set_collect_failed collector=%s status=%d count=%llu capacity=%u\n",
+        collector,
+        status,
+        (unsigned long long)(wait_set != NULL ? wait_set->count : 0),
+        (unsigned)PACHA_SERVICE_WAIT_MAX_FDS);
+    fflush(stderr);
+    return 8;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
+    (void)setenv("KOBOX_DAEMON_NAME", "netd", 1);
     struct netd_boot_config config;
     memset(&config, 0, sizeof(config));
     const int bootstrap_fd = pacha_bootstrap_fd_from_argv(argv);
@@ -103,15 +122,34 @@ int main(int argc, char **argv)
         netd_packet_io_pump_once();
         netd_socket_service_poll();
         static struct pacha_service_wait_set wait_set;
-        if (pacha_service_wait_init(&wait_set, (int)cfg->socket_endpoint_fd) != 0 ||
-            pacha_service_wait_add(
-                &wait_set, wake_irq.fd, PACHA_FD_EVENT_READABLE) != 0 ||
-            netd_libuinet_collect_runtime_wait_sources(&wait_set) != 0 ||
-            netd_socket_service_collect_wait_sources(&wait_set) != 0 ||
-            netd_unix_socket_collect_wait_sources(&wait_set) != 0 ||
-            netd_netlink_socket_collect_wait_sources(&wait_set) != 0 ||
-            netd_libuinet_socket_collect_wait_sources(&wait_set) != 0)
-            return 8;
+        status = pacha_service_wait_init(
+            &wait_set, (int)cfg->socket_endpoint_fd);
+        if (status != 0)
+            return netd_wait_set_failure(
+                "service_wait_init", status, &wait_set);
+        status = pacha_service_wait_add(
+            &wait_set, wake_irq.fd, PACHA_FD_EVENT_READABLE);
+        if (status != 0)
+            return netd_wait_set_failure("wake_irq", status, &wait_set);
+        status = netd_libuinet_collect_runtime_wait_sources(&wait_set);
+        if (status != 0)
+            return netd_wait_set_failure(
+                "libuinet_runtime", status, &wait_set);
+        status = netd_socket_service_collect_wait_sources(&wait_set);
+        if (status != 0)
+            return netd_wait_set_failure(
+                "socket_service", status, &wait_set);
+        status = netd_unix_socket_collect_wait_sources(&wait_set);
+        if (status != 0)
+            return netd_wait_set_failure("unix_socket", status, &wait_set);
+        status = netd_netlink_socket_collect_wait_sources(&wait_set);
+        if (status != 0)
+            return netd_wait_set_failure(
+                "netlink_socket", status, &wait_set);
+        status = netd_libuinet_socket_collect_wait_sources(&wait_set);
+        if (status != 0)
+            return netd_wait_set_failure(
+                "libuinet_socket", status, &wait_set);
         (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
         netd_socket_service_reap_hangups(&wait_set);
         netd_unix_socket_reap_hangups(&wait_set);

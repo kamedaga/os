@@ -707,6 +707,74 @@ int filed_exec_linux_lpr_prewarm(struct filed_runtime *runtime)
     return 0;
 }
 
+typedef struct lpr_exec_script_file_context {
+    filed_runtime_t *runtime;
+    uint64_t dir_handle;
+    lpr_exec_file_t *file;
+    int owns_file;
+} lpr_exec_script_file_context_t;
+
+static int lpr_exec_read_script_prefix(
+    filed_runtime_t *runtime,
+    const lpr_exec_file_t *file,
+    unsigned char *out_prefix,
+    size_t prefix_capacity,
+    size_t *out_prefix_length)
+{
+    if (runtime == NULL || file == NULL || out_prefix == NULL ||
+        prefix_capacity < LPR_EXEC_SCRIPT_PREFIX_BYTES || out_prefix_length == NULL)
+    {
+        return -22;
+    }
+    const uint64_t length = file->size < LPR_EXEC_SCRIPT_PREFIX_BYTES ?
+        file->size : LPR_EXEC_SCRIPT_PREFIX_BYTES;
+    memset(out_prefix, 0, prefix_capacity);
+    *out_prefix_length = (size_t)length;
+    if (length == 0) {
+        return 0;
+    }
+    return lpr_exec_read_file_range(runtime, file, 0, out_prefix, length);
+}
+
+static int lpr_exec_open_script_prefix(
+    void *context_raw,
+    const char *path,
+    unsigned char *out_prefix,
+    size_t prefix_capacity,
+    size_t *out_prefix_length)
+{
+    lpr_exec_script_file_context_t *context = context_raw;
+    if (context == NULL || context->runtime == NULL || context->file == NULL) {
+        return -22;
+    }
+    lpr_exec_file_t next_file;
+    memset(&next_file, 0, sizeof(next_file));
+    int status = lpr_exec_open_file_at(
+        context->runtime,
+        context->dir_handle,
+        path,
+        &next_file);
+    if (status != 0) {
+        return status;
+    }
+    status = lpr_exec_read_script_prefix(
+        context->runtime,
+        &next_file,
+        out_prefix,
+        prefix_capacity,
+        out_prefix_length);
+    if (status != 0) {
+        lpr_exec_close_file(context->runtime, &next_file);
+        return status;
+    }
+    if (context->owns_file) {
+        lpr_exec_close_file(context->runtime, context->file);
+    }
+    *context->file = next_file;
+    context->owns_file = 1;
+    return 0;
+}
+
 static int filed_exec_linux_lpr_handle_mode(
     struct filed_runtime *runtime,
     filed_handle_id_t handle_id,
@@ -721,8 +789,13 @@ static int filed_exec_linux_lpr_handle_mode(
     lpr_exec_file_t file;
     lpr_exec_meta_t meta;
     lpr_exec_plan_t plan;
+    filed_exec_path_t resolved_request;
+    lpr_exec_script_file_context_t script_context;
+    unsigned char script_prefix[LPR_EXEC_SCRIPT_PREFIX_BYTES];
+    char executable_path[FILED_PATH_BYTES];
     int prepared[FILED_EXEC_MAX_INHERIT_FDS + 1];
     uint64_t prepared_count = 0;
+    size_t script_prefix_length = 0;
 
     if (out_process_fd != NULL) *out_process_fd = -1;
     if (out_thread_fd != NULL) *out_thread_fd = -1;
@@ -732,6 +805,10 @@ static int filed_exec_linux_lpr_handle_mode(
     memset(&file, 0, sizeof(file));
     memset(&meta, 0, sizeof(meta));
     memset(&plan, 0, sizeof(plan));
+    resolved_request = *request;
+    memset(&script_context, 0, sizeof(script_context));
+    memset(script_prefix, 0, sizeof(script_prefix));
+    memset(executable_path, 0, sizeof(executable_path));
     memset(prepared, 0, sizeof(prepared));
     plan.process_fd = -1;
     plan.thread_fd = -1;
@@ -763,7 +840,28 @@ static int filed_exec_linux_lpr_handle_mode(
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    status = lpr_exec_read_meta(runtime, &file, &meta);
+    script_context.runtime = runtime;
+    script_context.dir_handle = request->dir_handle;
+    script_context.file = &file;
+    status = lpr_exec_read_script_prefix(
+        runtime,
+        &file,
+        script_prefix,
+        sizeof(script_prefix),
+        &script_prefix_length);
+    if (status == 0) {
+        status = lpr_exec_resolve_script_chain(
+            &resolved_request,
+            script_prefix,
+            script_prefix_length,
+            lpr_exec_open_script_prefix,
+            &script_context,
+            executable_path,
+            sizeof(executable_path));
+    }
+    if (status == 0) {
+        status = lpr_exec_read_meta(runtime, &file, &meta);
+    }
     LPR_EXEC_STAGE_RECORD_TO("read_main_meta", stage_start, stage_start_cycles, read_main_meta_cycles);
     if (status != 0) {
         fprintf(stderr,
@@ -772,6 +870,9 @@ static int filed_exec_linux_lpr_handle_mode(
             (unsigned long long)file.size,
             (unsigned long long)file.backend_object,
             (unsigned long long)file.object_generation);
+        if (script_context.owns_file) {
+            lpr_exec_close_file(runtime, &file);
+        }
         lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
@@ -779,6 +880,9 @@ static int filed_exec_linux_lpr_handle_mode(
     status = load_plan(runtime, &file, &meta, &plan);
     LPR_EXEC_STAGE_RECORD_TO("load_plan", stage_start, stage_start_cycles, load_plan_cycles);
     lpr_exec_free_meta(&meta);
+    if (script_context.owns_file) {
+        lpr_exec_close_file(runtime, &file);
+    }
     if (status != 0) {
         fprintf(stderr,
             "[filed] linux-lpr: load plan failed status=%d size=%llu backend=0x%llx generation=%llu\n",
@@ -790,7 +894,7 @@ static int filed_exec_linux_lpr_handle_mode(
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    status = lpr_exec_start_plan(&plan, request, bootstrap_fd, start_thread);
+    status = lpr_exec_start_plan(&plan, &resolved_request, bootstrap_fd, start_thread);
     LPR_EXEC_STAGE_RECORD_TO("start_plan", stage_start, stage_start_cycles, start_plan_cycles);
     lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {

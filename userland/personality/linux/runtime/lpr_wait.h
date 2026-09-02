@@ -47,6 +47,9 @@ int64_t lpr_wait_graph_add_fd(
 int64_t lpr_wait_deadline_init(
     lpr_wait_deadline_t *deadline,
     int64_t timeout_ms);
+int64_t lpr_wait_deadline_init_ns(
+    lpr_wait_deadline_t *deadline,
+    uint64_t timeout_ns);
 int64_t lpr_wait_deadline_expired(
     const lpr_wait_deadline_t *deadline,
     int *out_expired);

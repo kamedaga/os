@@ -126,6 +126,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol.h"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
+    "${REPO_ROOT}/userland/filed/include/filed/payload.h"
     "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_tty_island.c"

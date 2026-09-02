@@ -9,6 +9,7 @@ const boot_static = @import("../boot/main_static.zig");
 const kernel_log = @import("../kernel_log.zig");
 const sc = @import("numbers.zig");
 const runtime = @import("runtime.zig");
+const fd_syscall = @import("fd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 
 const fd_abi = abi_root.fd_abi;
@@ -19,6 +20,20 @@ const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_process_map_batch_entries: usize = @intCast(process_abi.process_map_batch_max_entries);
 const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_batch_entry_size);
 const max_pipe_close_wakes = kernel.fd_table_entries;
+
+var fork_failure_count: u64 = 0;
+
+fn reportForkFailure(stage: []const u8, status: u64) u64 {
+    const count = @atomicRmw(u64, &fork_failure_count, .Add, 1, .monotonic) +% 1;
+    if (count <= 8 or (count & 63) == 0) {
+        const store = kernel.vmObjectBackingStoreStats();
+        kernel_log.writeFmt(
+            "fork: failure stage={s} status={} count={} store_used={} store_capacity={} store_free={}\n",
+            .{ stage, status, count, store.used_entries, store.capacity, store.free_entries },
+        );
+    }
+    return status;
+}
 
 fn ThreadExitClearContext(comptime Handler: type) type {
     return struct {
@@ -40,12 +55,17 @@ fn ProcessExitPublishContext(comptime Handler: type) type {
         principal: kernel.PrincipalId,
         exit_state: kernel.TaskObjectState,
         exit_code: u32,
+        release_lifecycle: bool,
 
         fn run(raw_context: *anyopaque) void {
             const context: *@This() = @ptrCast(@alignCast(raw_context));
             context.state.markThreadObjectsExitedForPrincipal(context.principal, context.exit_state, context.exit_code);
             context.state.markProcessObjectsExited(context.principal, context.exit_state, context.exit_code);
             _ = wakeTaskFdWaiters(context.handler, context.state, context.principal);
+            if (context.release_lifecycle) {
+                scheduler.endPrincipalLifecycle();
+                context.release_lifecycle = false;
+            }
         }
     };
 }
@@ -91,7 +111,6 @@ fn protFromBits(bits: u64) ?kernel.VmaProt {
         .write = (bits & vm_abi.prot_write) != 0,
         .exec = (bits & vm_abi.prot_exec) != 0,
     };
-    if (prot.write and prot.exec) return null;
     return prot;
 }
 
@@ -199,28 +218,12 @@ fn writeThreadStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, thread: 
 fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId) ?kernel.ThreadWakeTarget {
     var wake_targets: [kernel.max_task_fd_waiters]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
-    var handoff_target: ?kernel.ThreadWakeTarget = null;
-    for (wake_targets[0..wake_count]) |target| {
-        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.pollfd_va != 0) {
-            _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
-        }
-        const woke = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
-        if (woke and handoff_target == null) {
-            handoff_target = target;
-        }
-    }
-    return handoff_target;
+    _ = fd_syscall.wakeThreadTargets(h, state, wake_targets[0..wake_count]);
+    return null;
 }
 
-fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) void {
-    for (targets) |target| {
-        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.pollfd_va != 0) {
-            _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
-        }
-        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
-    }
+fn wakeThreadTargets(h: anytype, state: *kernel.KernelState, targets: []const kernel.ThreadWakeTarget) void {
+    _ = fd_syscall.wakeThreadTargets(h, state, targets);
 }
 
 fn collectPipeCloseWakesForProcess(
@@ -257,13 +260,14 @@ fn wakeReadyPipeCloseWaiters(
         const ready_events = state.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
         if (ready_events == 0) continue;
         const wake_count = state.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
-        wakeThreadTargets(h, wake_storage[0..wake_count]);
+        wakeThreadTargets(h, state, wake_storage[0..wake_count]);
     }
 }
 
 fn collectIpcChannelCloseWakesForProcess(
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
+    cloexec_only: bool,
     out: []PendingIpcChannelCloseWake,
 ) usize {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
@@ -271,6 +275,7 @@ fn collectIpcChannelCloseWakesForProcess(
     var count: usize = 0;
     for (table.entries[0..]) |entry| {
         if (entry.object.isNull()) continue;
+        if (cloexec_only and !entry.flags.cloexec) continue;
         const slot = state.kernelObjectSlotConst(entry.object) orelse continue;
         const handle = switch (slot.payload) {
             .channel => |channel_handle| channel_handle,
@@ -291,19 +296,22 @@ fn wakeIpcChannelCloseWaiters(
     var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
     for (pending_wakes) |pending| {
         const wake_count = state.takeIpcChannelPeerCloseWaiters(pending.handle, wake_storage[0..]);
-        wakeThreadTargets(h, wake_storage[0..wake_count]);
+        wakeThreadTargets(h, state, wake_storage[0..wake_count]);
     }
 }
 
-fn closeCloexecFdsWithPipeWakes(
+fn closeCloexecFdsWithWakes(
     h: anytype,
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
 ) kernel.KernelError!void {
-    var pending_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_count = collectPipeCloseWakesForProcess(state, principal, true, pending_wakes[0..]);
+    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
+    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, true, pending_pipe_wakes[0..]);
+    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
+    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(state, principal, true, pending_channel_wakes[0..]);
     try state.closeCloexecFdsWithFreeList(principal, h.free_list);
-    wakeReadyPipeCloseWaiters(h, state, pending_wakes[0..pending_count]);
+    wakeReadyPipeCloseWaiters(h, state, pending_pipe_wakes[0..pending_pipe_wake_count]);
+    wakeIpcChannelCloseWaiters(h, state, pending_channel_wakes[0..pending_channel_wake_count]);
 }
 
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
@@ -318,10 +326,8 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, false, pending_pipe_wakes[0..]);
     var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = if (exit_state == .killed)
-        collectIpcChannelCloseWakesForProcess(state, principal, pending_channel_wakes[0..])
-    else
-        0;
+    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(state, principal, false, pending_channel_wakes[0..]);
+    state.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
@@ -345,6 +351,9 @@ fn exitProcessAfterTeardown(
     exit_code: u32,
     frame: *TrapFrame,
 ) void {
+    beginPrincipalLifecycleForSelfExit(h, principal);
+    if (!quiescePrincipalForLifecycle(h, principal, true)) unreachable;
+
     const PublishContext = ProcessExitPublishContext(@TypeOf(h));
     var publish_context = PublishContext{
         .handler = h,
@@ -352,7 +361,9 @@ fn exitProcessAfterTeardown(
         .principal = principal,
         .exit_state = exit_state,
         .exit_code = exit_code,
+        .release_lifecycle = true,
     };
+    defer if (publish_context.release_lifecycle) scheduler.endPrincipalLifecycle();
     const publish_callback = scheduler.BeforeCurrentThreadLeaveCallback{
         .context = @ptrCast(&publish_context),
         .run = PublishContext.run,
@@ -367,10 +378,10 @@ fn exitProcessAfterTeardown(
 
 fn createProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if ((frame.rdi & ~process_abi.process_known_flags_mask) != 0) return sc.syscall_err_invalid;
-    const principal = state.createProcessDescriptorWithCapacityLimitChecked(
+    const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
         "fd-process",
         h.free_list,
-        h.user_spaces.len,
+        h.user_spaces,
         scheduler.principalSlotReusable,
     ) orelse return sc.syscall_err_alloc;
     if (!user_vm.buildEmptyUserAddressSpace(principal)) {
@@ -454,12 +465,12 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         break :blk copied;
     };
 
-    const child = state.createProcessDescriptorWithCapacityLimitChecked(
+    const child = state.createProcessDescriptorWithUserAddressSpaceChecked(
         "fd-process-clone",
         h.free_list,
-        h.user_spaces.len,
+        h.user_spaces,
         scheduler.principalSlotReusable,
-    ) orelse return sc.syscall_err_alloc;
+    ) orelse return reportForkFailure("process_descriptor", sc.syscall_err_alloc);
     var child_active = true;
     defer if (child_active) {
         if (kernel.processIndexFromPrincipal(child)) |child_index| cleanup: {
@@ -472,16 +483,19 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         _ = state.removeProcessDescriptor(child);
     };
 
-    if (!user_vm.buildEmptyUserAddressSpace(child)) return sc.syscall_err_map;
+    if (!user_vm.buildEmptyUserAddressSpace(child)) {
+        return reportForkFailure("address_space", sc.syscall_err_map);
+    }
     state.cloneFdTableForFork(proc, child) catch |err| return switch (err) {
-        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        kernel.KernelError.TableFull => reportForkFailure("fd_table", sc.syscall_err_alloc),
         else => sc.syscall_err_invalid,
     };
 
     // Allocate every remaining fallible resource before committing parent
     // VM metadata.  The child remains suspended and its process FD cannot be
     // observed until this syscall returns.
-    const thread_index = scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse return sc.syscall_err_alloc;
+    const thread_index = scheduler.allocateSuspendedThread(child, h.user_spaces, child_frame, h.free_list) orelse
+        return reportForkFailure("thread", sc.syscall_err_alloc);
     var thread_active = true;
     defer {
         if (thread_active) {
@@ -505,7 +519,7 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         .state = .active,
         .exit_code = 0,
     }, rights, .{}, first_dynamic_fd) catch |err| return switch (err) {
-        kernel.KernelError.TableFull => sc.syscall_err_alloc,
+        kernel.KernelError.TableFull => reportForkFailure("process_fd", sc.syscall_err_alloc),
         else => sc.syscall_err_invalid,
     };
     var process_fd_active = true;
@@ -516,23 +530,29 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     // Pair locking keeps the parent/child page-table handoff atomic while the
     // shared-object lock protects cross-address-space VMO/COW state.
     {
-        if (!user_vm.lockVmTransactionPair(proc, child)) return sc.syscall_err_map;
+        if (!user_vm.lockVmTransactionPair(proc, child)) {
+            return reportForkFailure("vm_lock", sc.syscall_err_map);
+        }
         defer user_vm.unlockVmTransactionPair(proc, child);
         state.cloneVmaTableForFork(proc, child) catch |err| return switch (err) {
-            kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            kernel.KernelError.TableFull => reportForkFailure("vma_table", sc.syscall_err_alloc),
             else => sc.syscall_err_invalid,
         };
         // Clone all fallible child address-space metadata before committing
         // the parent.  Marking every eligible parent VMA COW before the first
         // write-protect makes even a partially failed PTE pass recoverable:
         // any resulting RO page takes the normal COW write-fault path.
-        if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) return sc.syscall_err_map;
+        if (!user_vm.cloneAddressSpaceMetadataForFork(proc, child)) {
+            return reportForkFailure("page_table_clone", sc.syscall_err_map);
+        }
         state.markForkCowVmasCommitted(proc);
         const protect_status = writeProtectForkCowVmas(state, proc);
-        if (protect_status != sc.syscall_ok) return protect_status;
+        if (protect_status != sc.syscall_ok) {
+            return reportForkFailure("parent_write_protect", protect_status);
+        }
         state.detachForkChildDirtyCowTables(child, h.free_list) catch |err| return switch (err) {
-            kernel.KernelError.TableFull => sc.syscall_err_alloc,
-            else => sc.syscall_err_map,
+            kernel.KernelError.TableFull => reportForkFailure("dirty_cow_detach", sc.syscall_err_alloc),
+            else => reportForkFailure("dirty_cow_detach", sc.syscall_err_map),
         };
     }
     // Publish the child to the scheduler only after the parent has a durable
@@ -571,6 +591,30 @@ fn publishPrincipalLifecycleState(
 ) void {
     state.markProcessObjectsExited(target, object_state, code);
     state.markThreadObjectsExitedForPrincipal(target, object_state, code);
+}
+
+/// Self-exit participates in the same admission barrier as remote stop/kill.
+/// PROCESS_EXIT enters with the global kernel-state lock held.  If another
+/// thread of this process is already waiting for that lock, retaining it while
+/// waiting for remote CPU quiescence creates a cycle: the waiter is in ring 0
+/// and therefore cannot be stopped by the lifecycle IPI.  Publish the target
+/// before dropping the lock so such an admitted waiter returns NOT_READY at
+/// dispatch's existing lifecycle check instead of starting more state work.
+fn beginPrincipalLifecycleForSelfExit(h: anytype, target: kernel.PrincipalId) void {
+    const drop_lock = h.before_current_thread_leave orelse unreachable;
+    const reacquire_lock = h.reacquire_kernel_state_lock orelse unreachable;
+    // Reserve this target before releasing the state lock.  A remote stop or
+    // kill can then use the global lifecycle gate for another target, but it
+    // cannot acquire that gate for this self-exit and wait on this ring-0 CPU.
+    if (!scheduler.reservePrincipalSelfExit(target)) unreachable;
+    while (!scheduler.tryBeginReservedPrincipalLifecycle(target)) {
+        // Another principal may be quiescing with the global lifecycle gate.
+        // Yield the state lock so that owner can reacquire it, publish its
+        // terminal state, and release the gate before this exit retries.
+        drop_lock.run(drop_lock.context);
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+        reacquire_lock.run(reacquire_lock.context);
+    }
 }
 
 /// Stop every context, let in-flight target syscalls reach the admission
@@ -624,28 +668,26 @@ fn killProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
 
 fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, signo: u32, frame: *TrapFrame) u64 {
     if (signo == 0 or signo > process_abi.signal_max) return sc.syscall_err_invalid;
-    if (signo == process_abi.signal_kill) return killProcess(h, state, proc, fd, signo, frame);
-    const process = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
-    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
-    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (signo == process_abi.signal_kill) {
+        if (fd == process_abi.process_self_fd) {
+            exitProcessAfterTeardown(h, state, proc, .killed, signo, frame);
+            return frame.rax;
+        }
+        return killProcess(h, state, proc, fd, signo, frame);
+    }
+    const target = if (fd == process_abi.process_self_fd)
+        proc
+    else blk: {
+        const process = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+        if (!processRunnable(process.state)) return sc.syscall_err_invalid;
+        break :blk @as(kernel.PrincipalId, @enumFromInt(process.principal_raw));
+    };
     if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
-    const delivery = scheduler.deliverSignal(target, signo) orelse return sc.syscall_err_not_ready;
-    // A prior non-signal wake can make the thread runnable while leaving its
-    // completion waiter registered.  Always remove same-generation waiters
-    // before a reply can be consumed through that stale registration.
-    if (delivery.should_interrupt) {
-        state.unregisterFdWaitersForThread(target, delivery.thread_index, delivery.thread_generation);
-    }
-    if (delivery.was_blocked) {
-        // Timed waits keep their normal timeout result in the saved frame
-        // (nanosleep uses OK).  A signal wake must override that value so the
-        // personality can report EINTR and the remaining relative duration.
-        _ = scheduler.wakeBlockedGenerationWithRax(
-            delivery.thread_index,
-            delivery.thread_generation,
-            sc.syscall_err_not_ready,
-        );
-    }
+    _ = scheduler.deliverSignal(
+        target,
+        signo,
+        sc.syscall_err_not_ready,
+    ) orelse return sc.syscall_err_not_ready;
     return sc.syscall_ok;
 }
 
@@ -737,6 +779,31 @@ fn deliverPendingSignalToUserFrame(
     return sc.syscall_ok;
 }
 
+fn writeSignalTimerState(
+    h: anytype,
+    proc: kernel.PrincipalId,
+    out_va: u64,
+    state: scheduler.ProcessSignalTimerState,
+) u64 {
+    if (out_va == 0) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(
+        proc,
+        out_va + process_abi.signal_timer_state_signo_offset,
+        state.signo,
+    )) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(
+        proc,
+        out_va + process_abi.signal_timer_state_remaining_ticks_offset,
+        state.remaining_ticks,
+    )) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(
+        proc,
+        out_va + process_abi.signal_timer_state_interval_ticks_offset,
+        state.interval_ticks,
+    )) return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
 fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     switch (frame.rdi) {
         process_abi.signal_ctl_register => {
@@ -785,6 +852,37 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
         },
         process_abi.signal_ctl_deliver_pending_frame => {
             return deliverPendingSignalToUserFrame(h, proc, frame, frame.rsi);
+        },
+        process_abi.signal_ctl_get_timer => {
+            return writeSignalTimerState(
+                h,
+                proc,
+                frame.rsi,
+                scheduler.getProcessSignalTimer(proc, scheduler.lapic_tick_count),
+            );
+        },
+        process_abi.signal_ctl_set_timer => {
+            const signo: u32 = @truncate(frame.rsi);
+            if (signo == 0 or signo > process_abi.signal_max)
+                return sc.syscall_err_invalid;
+            const old = scheduler.setProcessSignalTimer(
+                proc,
+                signo,
+                frame.rdx,
+                frame.r10,
+                scheduler.lapic_tick_count,
+            ) catch return sc.syscall_err_alloc;
+            return if (frame.r8 == 0)
+                sc.syscall_ok
+            else
+                writeSignalTimerState(h, proc, frame.r8, old);
+        },
+        process_abi.signal_ctl_set_pending_hint => {
+            if (frame.rsi != 0 and !isUserEntryVa(frame.rsi)) return sc.syscall_err_invalid;
+            return if (scheduler.setCurrentSignalPendingHint(frame.rsi))
+                sc.syscall_ok
+            else
+                sc.syscall_err_not_ready;
         },
         else => return sc.syscall_err_invalid,
     }
@@ -1149,7 +1247,6 @@ fn execFromStagedProcess(
     const thread_fd: kernel.Fd = @intCast(frame.rsi);
     const flags = frame.rdx;
     if ((flags & ~process_abi.process_exec_from_known_flags_mask) != 0) return sc.syscall_err_invalid;
-
     const process = state.processObjectForFd(proc, process_fd, .{ .kill = true, .set_context = true }) orelse return sc.syscall_err_invalid;
     if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const staged_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
@@ -1172,6 +1269,8 @@ fn execFromStagedProcess(
         thread.thread_generation,
     ) orelse return sc.syscall_err_invalid;
 
+    state.cancelFdWaitGroupsForOwner(proc);
+
     {
         if (!user_vm.lockVmTransactionPair(staged_owner, proc)) return sc.syscall_err_map;
         defer user_vm.unlockVmTransactionPair(staged_owner, proc);
@@ -1184,7 +1283,7 @@ fn execFromStagedProcess(
     }
 
     cleanupProcess(h, state, staged_owner, .exited, 0);
-    closeCloexecFdsWithPipeWakes(h, state, proc) catch unreachable;
+    closeCloexecFdsWithWakes(h, state, proc) catch unreachable;
     if (!scheduler.installExecContextForCurrentThread(h.user_spaces, proc, image)) unreachable;
     frame.* = image.frame;
     return sc.syscall_ok;

@@ -5,6 +5,7 @@
 #include "filed/cache.h"
 #include "filed/tmpfs_internal.h"
 #include "../src/cache/internal.h"
+#include "../src/dispatch/common.h"
 #include "../src/internal/dispatch_state.h"
 
 static int failures;
@@ -12,6 +13,10 @@ static unsigned char mock_backend_data[64];
 static uint64_t mock_backend_size;
 static int mock_vmo_revoke_calls;
 static int mock_fd_close_calls;
+static int mock_link_calls;
+static uint64_t mock_link_old_object_id;
+static uint64_t mock_link_new_parent_object_id;
+static char mock_link_new_name[STORAGE_NAME_BYTES];
 
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
 {
@@ -66,6 +71,15 @@ int filed_kobox_backend_statx(filed_kobox_backend_t *backend, uint64_t object_id
     (void)backend;
     (void)object_id;
     (void)out_stat;
+    return -95;
+}
+
+int filed_kobox_backend_statfs(
+    filed_kobox_backend_t *backend,
+    storage_statfs_reply_t *out_statfs)
+{
+    (void)backend;
+    (void)out_statfs;
     return -95;
 }
 
@@ -191,6 +205,22 @@ int filed_kobox_backend_unlink(filed_kobox_backend_t *backend, uint64_t parent_o
     (void)parent_object_id;
     (void)name;
     return -95;
+}
+
+int filed_kobox_backend_link(
+    filed_kobox_backend_t *backend,
+    uint64_t old_object_id,
+    uint64_t new_parent_object_id,
+    const char *new_name,
+    uint64_t *out_object_id)
+{
+    (void)backend;
+    ++mock_link_calls;
+    mock_link_old_object_id = old_object_id;
+    mock_link_new_parent_object_id = new_parent_object_id;
+    snprintf(mock_link_new_name, sizeof(mock_link_new_name), "%s", new_name);
+    *out_object_id = 909;
+    return 0;
 }
 
 int filed_kobox_backend_mkdir(filed_kobox_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id)
@@ -358,6 +388,40 @@ static void test_unlink_clears_dirent_cache(void)
     expect_true("dirents omit after unlink", !dirents_contain(&entries, "gone"));
 }
 
+static void test_link_routes_to_matching_backend(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    uint64_t linked = 0;
+    uint64_t tmpfs_root = 0;
+
+    init_runtime(&runtime, &dispatch);
+    mock_link_calls = 0;
+    mock_link_old_object_id = 0;
+    mock_link_new_parent_object_id = 0;
+    memset(mock_link_new_name, 0, sizeof(mock_link_new_name));
+
+    expect_int(
+        "ext4 link route",
+        filed_backend_link(&runtime, 42, 7, "alias", &linked),
+        0);
+    expect_int("ext4 link call count", mock_link_calls, 1);
+    expect_u64("ext4 link old object", mock_link_old_object_id, 42);
+    expect_u64("ext4 link new parent", mock_link_new_parent_object_id, 7);
+    expect_true("ext4 link new name", strcmp(mock_link_new_name, "alias") == 0);
+    expect_u64("ext4 link object", linked, 909);
+
+    expect_int(
+        "mount tmpfs root for cross-backend link",
+        filed_tmpfs_backend_mount_root(&runtime.tmpfs, &tmpfs_root),
+        0);
+    expect_int(
+        "cross-backend link rejected",
+        filed_backend_link(&runtime, 42, tmpfs_root, "cross", &linked),
+        -18);
+    expect_int("cross-backend link bypasses kobox", mock_link_calls, 1);
+}
+
 static void test_truncate_clears_page_and_vmo_cache(void)
 {
     static filed_runtime_t runtime;
@@ -503,11 +567,12 @@ static void test_file_vmo_cache_byte_budget(void)
         &runtime,
         100u * 1024u * 1024u);
     expect_true("vmo cache budget admits after eviction", slot != NULL);
-    expect_true("vmo cache budget evicts oldest", !oldest->active);
-    expect_true("vmo cache budget preserves newer", newer->active);
+    expect_true("vmo cache budget preserves costly snapshot", oldest->active);
+    expect_true("vmo cache budget evicts cheaper snapshot", !newer->active);
+    expect_true("vmo cache budget reuses cheaper slot", slot == newer);
 }
 
-static void test_snapshot_vmo_does_not_pin_backend_object(void)
+static void test_snapshot_vmo_pins_backend_object(void)
 {
     static filed_runtime_t runtime;
     static filed_dispatch_state_t dispatch;
@@ -525,8 +590,8 @@ static void test_snapshot_vmo_does_not_pin_backend_object(void)
     entry->length = 4096;
 
     expect_true(
-        "snapshot vmo permits backend eviction",
-        filed_cache_object_evictable(&runtime, 900));
+        "snapshot vmo pins backend object",
+        !filed_cache_object_evictable(&runtime, 900));
 
     entry->shared = 1;
     expect_true(
@@ -536,6 +601,59 @@ static void test_snapshot_vmo_does_not_pin_backend_object(void)
     entry->shared = 0;
     filed_cache_release_object(&runtime, 900);
     expect_true("snapshot vmo released with backend", !entry->active);
+}
+
+static void test_pinned_file_vmo_limit_preserves_costly_snapshot(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    init_runtime(&runtime, &dispatch);
+
+    filed_file_vmo_cache_entry_t *shared = filed_file_vmo_cache_slot(&runtime);
+    expect_true("pinned limit shared slot", shared != NULL);
+    if (shared == NULL) {
+        return;
+    }
+    memset(shared, 0, sizeof(*shared));
+    shared->active = 1;
+    shared->shared = 1;
+    shared->vmo_fd = -1;
+    shared->backend_object = 1;
+    shared->clock = 1;
+
+    filed_file_vmo_cache_entry_t *costly_oldest = NULL;
+    filed_file_vmo_cache_entry_t *cheapest = NULL;
+    for (uint32_t i = 0; i < FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT; ++i) {
+        filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+        expect_true("pinned limit fill slot", entry != NULL);
+        if (entry == NULL) {
+            return;
+        }
+        memset(entry, 0, sizeof(*entry));
+        entry->active = 1;
+        entry->vmo_fd = -1;
+        entry->backend_object = 100 + i;
+        entry->clock = i + 2;
+        entry->length = i == 0 ? 178u * 1024u * 1024u : (uint64_t)(i + 1u) * 4096u;
+        if (costly_oldest == NULL) {
+            costly_oldest = entry;
+        }
+        if (i == 1) {
+            cheapest = entry;
+        }
+    }
+
+    filed_file_vmo_cache_entry_t *replacement =
+        filed_file_vmo_cache_pinned_slot_for_length(&runtime, 4096);
+    expect_true("pinned limit replacement slot", replacement != NULL);
+    expect_true("pinned limit preserves shared", shared->active);
+    expect_true(
+        "pinned limit preserves costly oldest snapshot",
+        costly_oldest != NULL && costly_oldest->active);
+    expect_true(
+        "pinned limit evicts cheapest snapshot",
+        cheapest != NULL && !cheapest->active);
+    expect_true("pinned limit reuses cheapest slot", replacement == cheapest);
 }
 
 static void test_snapshot_vmo_pressure_reclaim_preserves_shared(void)
@@ -592,10 +710,12 @@ int main(void)
 {
     test_rename_clears_negative_lookup();
     test_unlink_clears_dirent_cache();
+    test_link_routes_to_matching_backend();
     test_truncate_clears_page_and_vmo_cache();
     test_shared_vmo_is_io_source_and_revoke_target();
     test_file_vmo_cache_byte_budget();
-    test_snapshot_vmo_does_not_pin_backend_object();
+    test_snapshot_vmo_pins_backend_object();
+    test_pinned_file_vmo_limit_preserves_costly_snapshot();
     test_snapshot_vmo_pressure_reclaim_preserves_shared();
     if (failures != 0) {
         return 1;

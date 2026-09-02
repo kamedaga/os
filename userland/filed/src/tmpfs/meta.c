@@ -13,6 +13,7 @@ int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id
         return -2;
     }
     out_stat->object_id = inode->object_id;
+    out_stat->inode_number = inode->object_id;
     out_stat->mode = inode->mode;
     out_stat->size = inode->size;
     out_stat->blocks = (uint64_t)inode->allocated_page_count * (FILED_TMPFS_PAGE_BYTES / 512u);
@@ -21,6 +22,26 @@ int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id
         inode->nlink;
     out_stat->kind = inode->mode & FILED_TMPFS_MODE_TYPE_MASK;
     out_stat->rdev = inode->rdev;
+    filed_tmpfs_lock_release(&backend->lock);
+    return 0;
+}
+
+int filed_tmpfs_backend_statfs(
+    filed_tmpfs_backend_t *backend,
+    storage_statfs_reply_t *out_statfs)
+{
+    if (backend == NULL || out_statfs == NULL) return -22;
+    memset(out_statfs, 0, sizeof(*out_statfs));
+    filed_tmpfs_lock_acquire(&backend->lock);
+    out_statfs->type = 0x01021994u;
+    out_statfs->block_size = FILED_TMPFS_PAGE_BYTES;
+    out_statfs->blocks = FILED_TMPFS_PAGE_POOL_PAGES;
+    out_statfs->blocks_free = backend->free_page_count;
+    out_statfs->blocks_available = backend->free_page_count;
+    out_statfs->files = FILED_TMPFS_MAX_INODES;
+    out_statfs->files_free = backend->free_inode_count;
+    out_statfs->name_length = FILED_TMPFS_NAME_BYTES - 1u;
+    out_statfs->fragment_size = FILED_TMPFS_PAGE_BYTES;
     filed_tmpfs_lock_release(&backend->lock);
     return 0;
 }

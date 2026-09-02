@@ -123,6 +123,10 @@ def process_labels(console: Path | None) -> dict[int, str]:
         labels[int(pid)] = f"sway:{phase}"
     for app, pid in re.findall(r"P4_BENCH_APP_PID app=(\S+) pid=(\d+)", text):
         labels[int(pid)] = app
+    for app, pid in re.findall(
+        r"KEY_PHASE_PROBE app=(\S+) stage=process_created .*?pid=(\d+)", text
+    ):
+        labels[int(pid)] = app
     return labels
 
 
@@ -299,6 +303,11 @@ def main() -> int:
             labels[pid] = "sway(native-pid)"
         elif name_id("/etc/xdg/foot/foot.ini") in hashes:
             labels[pid] = "foot(native-pid)"
+        elif (
+            name_id("/usr/lib/gio/modules/libxfconfgsettingsbackend.so") in hashes
+            and name_id("/usr/lib/libgtk-3.so.0") in hashes
+        ):
+            labels[pid] = "thunar(GTK/Xfce signature)"
 
     for pid in sorted({key[0] for key in metrics}):
         rows = [(path_hash, metric) for (row_pid, path_hash), metric in metrics.items() if row_pid == pid]
@@ -359,14 +368,31 @@ def main() -> int:
         if lookups:
             print(f"\nVMO cache hit rate: {100.0 * file_vmo.get(1, 0) / lookups:.1f}%")
     if any(filed_stages["counts"]):
-        total = sum(filed_stages["cycles"])
+        cycles_by_stage = filed_stages["cycles"]
+        outer_total = (
+            cycles_by_stage[0]
+            + cycles_by_stage[1]
+            + cycles_by_stage[2]
+            + cycles_by_stage[6]
+        )
         print("\n## FileD file_vmo stages")
-        print("| stage | cycles | measured share | calls |")
-        print("|---|---:|---:|---:|")
+        print("| stage | cycles | scope share | calls | scope |")
+        print("|---|---:|---:|---:|---|")
         for index, name in enumerate(filed_stage_names):
-            cycles = filed_stages["cycles"][index]
-            share = 100.0 * cycles / total if total else 0.0
-            print(f"| {name} | {cycles:,} | {share:.1f}% | {filed_stages['counts'][index]} |")
+            cycles = cycles_by_stage[index]
+            denominator = outer_total
+            scope = "outer request"
+            if index in (3, 5):
+                denominator = cycles_by_stage[2]
+                scope = "inside cache miss create"
+            elif index == 4:
+                denominator = cycles_by_stage[5]
+                scope = "inside cached pread"
+            share = 100.0 * cycles / denominator if denominator else 0.0
+            print(
+                f"| {name} | {cycles:,} | {share:.1f}% | "
+                f"{filed_stages['counts'][index]} | {scope} |"
+            )
 
     fs_storage = storage.get("file_vmo_fs") or storage.get("fs")
     if fs_storage:

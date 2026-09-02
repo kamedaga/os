@@ -102,7 +102,7 @@ int main(int argc, char **argv)
         (void)termd_linux_tty_island_reap_hangups(&tty_island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
             static struct pacha_service_wait_set wait_set;
-            int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
+            static int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
             if (pacha_service_wait_init(&wait_set, (int)cfg->tty_endpoint_fd) != 0)
                 return 1;
             if (tty_island.wake_irq_fd >= 16 &&

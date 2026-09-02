@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -36,6 +36,7 @@ skip:
     - "alpine_key_5261cecb"
     - "alpine_key_6165ee59"
     - "alpine_key_61666e3f"
+    - "alpine_sway"
     - "apk"
     - "apk_arch"
     - "apk_repositories"
@@ -65,6 +66,10 @@ skip:
     - "libc_musl"
     - "linux_abi_probe"
     - "linux_abi_server"
+    - "lpr_apk_offline"
+    - "lua_cli"
+    - "lua_cli_workload"
+    - "lua_runtime"
     - "mbedcrypto"
     - "mbedtls"
     - "mbedx509"
@@ -95,12 +100,21 @@ apps:
     file: "userland/fixtures/base/dev-null.node"
     out: "DEVNULL.NODE"
     rootfs: "/dev/null"
+  linux_proc_overflowuid:
+    file: "userland/fixtures/base/proc-overflowuid"
+    out: "PROCOVUID"
+    rootfs: "/proc/sys/kernel/overflowuid"
+  linux_proc_overflowgid:
+    file: "userland/fixtures/base/proc-overflowgid"
+    out: "PROCOVGID"
+    rootfs: "/proc/sys/kernel/overflowgid"
   virtio_input_sysfs:
     file:
       path: ".artifacts/userland-fixtures/virtio-input-sysfs"
       rebuild: ["bash", "tools/build_virtio_input_sysfs.sh"]
       input:
         - "tools/build_virtio_input_sysfs.sh"
+        - "tools/derive_input_id.py"
     out: "ROOT"
     rootfs: "/"
   virtio_gpu_sysfs:
@@ -159,6 +173,19 @@ apps:
         - "tools/copy_lpr_linux_musl.sh"
     out: "SWAYROOT"
     rootfs: "/"
+  alpine_xfce:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-xfce-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_xfce.sh"]
+      input:
+        - "tools/build_wsl_alpine_xfce.sh"
+        - "tools/rootfs_overlay.py"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "tools/build_wsl_alpine_input.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+    out: "XFCEROOT"
+    rootfs: "/"
   pine2_gtk:
     file:
       path: ".artifacts/userland-fixtures/pine2-gtk-root"
@@ -179,18 +206,11 @@ apps:
         - "third_party/pine2-gtk/COPYING.txt"
     out: "PINE2GTKROOT"
     rootfs: "/"
-  pacha_user_session:
+  xfce_app_acceptance:
     file:
-      path: ".artifacts/userland-fixtures/pacha-user-session"
-      rebuild: ["bash", "tools/build_pacha_user_session.sh"]
-      input:
-        - "tools/build_pacha_user_session.sh"
-        - "userland/pacha_user_session/src/main.c"
-        - "userland/pacha_user_session/src/input_metadata.c"
-        - "userland/pacha_user_session/src/input_metadata.h"
-        - "tools/copy_lpr_linux_musl.sh"
-    out: "PACHASES.ELF"
-    rootfs: "/usr/libexec/pacha-user-session"
+      path: "tests/run-lpr-qemu-xfce-app-acceptance.sh"
+    out: "XFCEAPAC.SH"
+    rootfs: "/cmd/xfce_app_acceptance.sh"
   sway_phase1_acceptance_script:
     file:
       path: "tests/fixtures/sway_phase1_acceptance.sh"
@@ -206,6 +226,57 @@ apps:
       path: "tests/fixtures/phase4_gui_benchmark.sh"
     out: "P4GUIBEN.SH"
     rootfs: "/cmd/phase4_gui_benchmark.sh"
+  gui_startup_benchmark_script:
+    file:
+      path: "tests/fixtures/gui_startup_benchmark.sh"
+    out: "GUISTART.SH"
+    rootfs: "/cmd/gui_startup_benchmark.sh"
+  key_launch_phase_benchmark_script:
+    file:
+      path: "tests/fixtures/key_launch_phase_benchmark.sh"
+    out: "KEYPHASE.SH"
+    rootfs: "/cmd/key_launch_phase_benchmark.sh"
+  key_launch_probe_script:
+    file:
+      path: "tests/fixtures/key_launch_probe.sh"
+    out: "KEYPROBE.SH"
+    rootfs: "/cmd/key_launch_probe.sh"
+  lpr_tsc_calibrate:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_tsc_calibrate.elf"
+      rebuild: ["bash", "tools/build_wsl_sway_launcher.sh", ".artifacts/userland-fixtures/lpr_tsc_calibrate.elf", "userland/fixtures/src/wsl_musl/lpr_tsc_calibrate.c"]
+      input:
+        - "tools/build_wsl_sway_launcher.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_tsc_calibrate.c"
+    out: "LPRTSC.ELF"
+    rootfs: "/cmd/lpr_tsc_calibrate.elf"
+  lpr_key_launch_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_key_launch_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_sway_launcher.sh", ".artifacts/userland-fixtures/lpr_key_launch_probe.elf", "userland/fixtures/src/wsl_musl/lpr_key_launch_probe.c"]
+      input:
+        - "tools/build_wsl_sway_launcher.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_key_launch_probe.c"
+    out: "LPRKEYPR.ELF"
+    rootfs: "/cmd/lpr_key_launch_probe.elf"
+  lpr_glycin_app_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_glycin_app_probe.elf"
+      rebuild: ["bash", "tools/build_wsl_glycin_app_probe.sh"]
+      input:
+        - "tools/build_wsl_glycin_app_probe.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_glycin_app_probe.c"
+    out: "LPRGLYAP.ELF"
+    rootfs: "/cmd/lpr_glycin_app_probe.elf"
+  lpr_glycin_timing_trace:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_glycin_timing_trace.so"
+      rebuild: ["bash", "tools/build_wsl_glycin_timing_trace.sh"]
+      input:
+        - "tools/build_wsl_glycin_timing_trace.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_glycin_timing_trace.c"
+    out: "LPRGLYTM.SO"
+    rootfs: "/cmd/lpr_glycin_timing_trace.so"
   phase4_gui_benchmark_config:
     file:
       path: "tests/fixtures/phase4_gui_benchmark.conf"
@@ -221,6 +292,11 @@ apps:
       path: "tests/fixtures/pine2_gtk_smoke.sh"
     out: "PINE2GTKTEST.SH"
     rootfs: "/cmd/pine2_gtk_smoke.sh"
+  thunar_bringup_script:
+    file:
+      path: "tests/fixtures/thunar_bringup.sh"
+    out: "THUNARTEST.SH"
+    rootfs: "/cmd/thunar_bringup.sh"
   apk_shell_smoke_script:
     file:
       path: "tests/fixtures/apk_shell_smoke.sh"
@@ -231,6 +307,11 @@ apps:
       path: "tests/fixtures/ext4_apk_reproducer.sh"
     out: "EXT4APK.SH"
     rootfs: "/cmd/ext4_apk_reproducer.sh"
+  ext4_hardlink_smoke_script:
+    file:
+      path: "tests/fixtures/ext4_hardlink_smoke.sh"
+    out: "EXT4LNK.SH"
+    rootfs: "/cmd/ext4_hardlink_smoke.sh"
   lpr_bash_file_churn_probe_script:
     file:
       path: "tests/fixtures/lpr_bash_file_churn_probe.sh"
@@ -853,9 +934,11 @@ apps:
   lpr_linux_musl_libc:
     file:
       path: ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
-      rebuild: ["bash", "tools/copy_lpr_linux_musl.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
+      rebuild: ["bash", "userland/personality/linux/build-musl-runtime.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
       input:
-        - "tools/copy_lpr_linux_musl.sh"
+        - "musl/upstream"
+        - "userland/personality/linux/build-musl-runtime.sh"
+        - "userland/personality/linux/musl/synccall.c"
     out: "LPRMUSL.SO"
     rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1", "/lib/libc.musl-x86_64.so.1"]
   lpr_ldmusl_smoke:
@@ -917,7 +1000,6 @@ apps:
       input:
         - "pack/scripts/download_lpr_bash_dynamic.sh"
     out: "BASH.ELF"
-    rootfs: "/bin/bash"
   lpr_apk_offline:
     file:
       path: ".artifacts/userland-fixtures/lpr-apk-offline-root"
@@ -1022,6 +1104,20 @@ apps:
     file: "tests/fixtures/lpr_pthread_smoke.sh"
     out: "LPRPTHRD.SH"
     rootfs: "/cmd/lpr_pthread_smoke.sh"
+  lpr_futex_pingpong_bench:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_futex_pingpong_bench.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_futex_pingpong_bench", "userland/fixtures/src/wsl_musl/lpr_futex_pingpong_bench.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_futex_pingpong_bench.c"
+    out: "LPRFTXBN.ELF"
+    rootfs: "/cmd/lpr_futex_pingpong_bench.elf"
+  lpr_futex_pingpong_bench_script:
+    file: "tests/fixtures/lpr_futex_pingpong_bench.sh"
+    out: "LPRFTXBN.SH"
+    rootfs: "/cmd/lpr_futex_pingpong_bench.sh"
   lpr_shared_mapping_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_shared_mapping_smoke.static.elf"
@@ -1439,6 +1535,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/filed/include"
         - "userland/libfiled_client"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
@@ -1462,6 +1559,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/filed/include"
         - "userland/libfiled_client"
         - "_kobox/include"
         - "_kobox/src"
@@ -1485,6 +1583,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/libipc/include"
         - "userland/libipc/src"
+        - "userland/filed/include"
         - "userland/libfiled_client"
         - "_kobox/include"
         - "_kobox/src"
@@ -1631,6 +1730,10 @@ apps:
     file: "userland/fixtures/base/os-release"
     out: "OS-RELEASE"
     rootfs: "/etc/os-release"
+  passwd:
+    file: "userland/fixtures/base/passwd"
+    out: "PASSWD"
+    rootfs: "/etc/passwd"
   pipe_probe:
     file:
       path: ".artifacts/userland-fixtures/pipe_probe.elf"
@@ -1647,6 +1750,10 @@ apps:
     file: "userland/fixtures/base/resolv.conf"
     out: "RESOLV.CONF"
     rootfs: "/etc/resolv.conf"
+  group:
+    file: "userland/fixtures/base/group"
+    out: "GROUP"
+    rootfs: "/etc/group"
   rootfs_vfs:
     role: "service"
     file:

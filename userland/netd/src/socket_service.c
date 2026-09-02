@@ -13,24 +13,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef NETD_DBUS_DIAG
+#define NETD_DBUS_DIAG 0
+#endif
+
 static int g_netd_socket_endpoint_fd = -1;
 static uint64_t g_netd_socket_requests;
 static uint64_t g_netd_socket_errors;
 static int g_netd_socket_trace;
 static uint64_t g_netd_socket_recv_bytes;
 
-enum { NETD_SOCKET_TRANSFER_LEASE_MAX = 64 };
-
 struct netd_socket_transfer_lease {
+    struct netd_socket_transfer_lease *next;
     uint64_t handle;
     int lease_fd;
 };
 
-static struct netd_socket_transfer_lease
-    g_netd_socket_transfer_leases[NETD_SOCKET_TRANSFER_LEASE_MAX];
+static struct netd_socket_transfer_lease *g_netd_socket_transfer_leases;
 
 enum {
-    NETD_PAGE_ATTACHMENT_MAX = PACHA_SERVICE_WAIT_MAX_FDS / 4,
+    NETD_PAGE_ATTACHMENT_MAX = 64,
 };
 
 #define NETD_PAGE_ATTACHMENT_TAG UINT64_C(0x4e50000000000000)
@@ -67,21 +69,32 @@ static int netd_socket_handle_close(uint64_t handle)
             netd_libuinet_socket_close(handle);
 }
 
+static void netd_socket_transfer_lease_destroy(
+    struct netd_socket_transfer_lease *lease)
+{
+    if (lease == NULL) return;
+    if (lease->lease_fd >= 16)
+        (void)pacha_fd_close(lease->lease_fd);
+    if (lease->handle != 0)
+        (void)netd_socket_handle_close(lease->handle);
+    free(lease);
+}
+
 static int netd_socket_transfer_lease_add(uint64_t handle, int lease_fd)
 {
     if (handle == 0 || lease_fd < 16) return -22;
-    struct netd_socket_transfer_lease *free_slot = NULL;
-    for (unsigned i = 0; i < NETD_SOCKET_TRANSFER_LEASE_MAX; ++i) {
-        if (g_netd_socket_transfer_leases[i].handle == 0) {
-            free_slot = &g_netd_socket_transfer_leases[i];
-            break;
-        }
-    }
-    if (free_slot == NULL) return -24;
+    struct netd_socket_transfer_lease *lease =
+        calloc(1, sizeof(*lease));
+    if (lease == NULL) return -12;
     const int status = netd_socket_handle_dup(handle);
-    if (status != 0) return status;
-    free_slot->handle = handle;
-    free_slot->lease_fd = lease_fd;
+    if (status != 0) {
+        free(lease);
+        return status;
+    }
+    lease->handle = handle;
+    lease->lease_fd = lease_fd;
+    lease->next = g_netd_socket_transfer_leases;
+    g_netd_socket_transfer_leases = lease;
     return 0;
 }
 
@@ -410,6 +423,9 @@ static int netd_socket_dispatch(
         return netd_unix_socket_attach_wait(
             ((const netd_accept_t *)page)->handle,
             transferred_count == 1 ? transferred_fds[0] : -1);
+    case NETD_OP_UNIX_NAME:
+        if (page == NULL) return -22;
+        return netd_unix_socket_name((netd_unix_name_t *)page);
     case NETD_OP_UEVENT_PUBLISH:
         {
             const uint64_t device = *out_result;
@@ -421,7 +437,9 @@ static int netd_socket_dispatch(
     }
 }
 
-static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, const struct pacha_ipc_fd *fds)
+static int netd_socket_dispatch_request(
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds)
 {
     if (request == NULL) {
         return -22;
@@ -472,7 +490,8 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
         request->word1 == NETD_OP_BIND ||
         request->word1 == NETD_OP_LISTEN ||
         request->word1 == NETD_OP_ACCEPT ||
-        request->word1 == NETD_OP_ATTACH_WAIT;
+        request->word1 == NETD_OP_ATTACH_WAIT ||
+        request->word1 == NETD_OP_UNIX_NAME;
     struct netd_page_attachment *attachment = op_uses_page ?
         netd_page_attachment_find(request->word2) : NULL;
     if (op_uses_page && attachment == NULL) {
@@ -503,6 +522,23 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     void *const page = attachment != NULL ? attachment->page : NULL;
     if (page != NULL) __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
+#if NETD_DBUS_DIAG
+    const uint64_t diag_handle = page != NULL &&
+        (request->word1 == NETD_OP_SEND ||
+         request->word1 == NETD_OP_RECV ||
+         request->word1 == NETD_OP_POLL) ?
+        ((const netd_io_t *)page)->handle : 0;
+    const int diag_dbus = netd_unix_socket_is_handle(diag_handle) &&
+        netd_unix_socket_diag_dbus(diag_handle);
+    if (diag_dbus) {
+        printf("[netd-dbus-rpc] phase=dispatch-enter id=%llu op=%llu handle=%llu reply_fd=%d\n",
+            (unsigned long long)request->word3,
+            (unsigned long long)request->word1,
+            (unsigned long long)diag_handle,
+            reply_fd);
+    }
+#endif
+
     const int send_has_transfer = request->word1 == NETD_OP_SEND && page != NULL &&
         netd_unix_socket_is_handle(((const netd_io_t *)page)->handle) &&
         ((const netd_io_t *)page)->transfer_count != 0;
@@ -510,9 +546,20 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     int reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     uint32_t reply_transfer_count = 0;
     memset(reply_transfer_fds, 0xff, sizeof(reply_transfer_fds));
+    netd_unix_socket_set_notifications_deferred(1);
     const int status = netd_socket_dispatch(
         request->word1, page, transferred_fds, transferred_count, &result,
         reply_transfer_fds, &reply_transfer_count);
+#if NETD_DBUS_DIAG
+    if (diag_dbus) {
+        printf("[netd-dbus-rpc] phase=dispatch-exit id=%llu op=%llu handle=%llu status=%d result=%llu\n",
+            (unsigned long long)request->word3,
+            (unsigned long long)request->word1,
+            (unsigned long long)diag_handle,
+            status,
+            (unsigned long long)result);
+    }
+#endif
     if (page != NULL) __atomic_thread_fence(__ATOMIC_RELEASE);
     if (g_netd_socket_trace) {
         netd_socket_trace_data_op(request->word1, status, result);
@@ -540,9 +587,20 @@ static int netd_socket_dispatch_request(const struct pacha_ipc_msg *request, con
     if (status != 0) {
         g_netd_socket_errors++;
     }
-    return netd_socket_send_reply(
+    const int reply_status = netd_socket_send_reply(
         request->word1, reply_fd, request->word3, status, result,
         reply_transfer_fds, reply_transfer_count);
+    netd_unix_socket_set_notifications_deferred(0);
+#if NETD_DBUS_DIAG
+    if (diag_dbus) {
+        printf("[netd-dbus-rpc] phase=reply-exit id=%llu op=%llu handle=%llu status=%d\n",
+            (unsigned long long)request->word3,
+            (unsigned long long)request->word1,
+            (unsigned long long)diag_handle,
+            reply_status);
+    }
+#endif
+    return reply_status;
 }
 
 int netd_socket_service_start(struct netd_runtime *runtime)
@@ -554,8 +612,12 @@ int netd_socket_service_start(struct netd_runtime *runtime)
     g_netd_socket_requests = 0;
     g_netd_socket_errors = 0;
     g_netd_socket_trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;
-    memset(g_netd_socket_transfer_leases, 0,
-        sizeof(g_netd_socket_transfer_leases));
+    while (g_netd_socket_transfer_leases != NULL) {
+        struct netd_socket_transfer_lease *lease =
+            g_netd_socket_transfer_leases;
+        g_netd_socket_transfer_leases = lease->next;
+        netd_socket_transfer_lease_destroy(lease);
+    }
     while (g_netd_page_attachments != NULL) {
         struct netd_page_attachment *attachment =
             g_netd_page_attachments;
@@ -575,10 +637,11 @@ int netd_socket_service_start(struct netd_runtime *runtime)
 int netd_socket_service_collect_wait_sources(struct pacha_service_wait_set *wait_set)
 {
     if (wait_set == NULL) return -22;
-    for (unsigned i = 0; i < NETD_SOCKET_TRANSFER_LEASE_MAX; ++i) {
-        const struct netd_socket_transfer_lease *lease =
-            &g_netd_socket_transfer_leases[i];
-        if (lease->handle == 0 || lease->lease_fd < 16) continue;
+    for (const struct netd_socket_transfer_lease *lease =
+             g_netd_socket_transfer_leases;
+         lease != NULL;
+         lease = lease->next)
+    {
         if (pacha_service_wait_add(
                 wait_set, lease->lease_fd, PACHA_FD_EVENT_HANGUP) != 0)
             return -24;
@@ -601,17 +664,18 @@ int netd_socket_service_collect_wait_sources(struct pacha_service_wait_set *wait
 void netd_socket_service_reap_hangups(
     const struct pacha_service_wait_set *wait_set)
 {
-    for (unsigned i = 0; i < NETD_SOCKET_TRANSFER_LEASE_MAX; ++i) {
-        struct netd_socket_transfer_lease *lease =
-            &g_netd_socket_transfer_leases[i];
-        if (lease->handle == 0 || lease->lease_fd < 16) continue;
+    struct netd_socket_transfer_lease **lease_cursor =
+        &g_netd_socket_transfer_leases;
+    while (*lease_cursor != NULL) {
+        struct netd_socket_transfer_lease *lease = *lease_cursor;
         if ((pacha_service_wait_revents(wait_set, lease->lease_fd) &
-             PACHA_FD_EVENT_HANGUP) == 0) continue;
-        const uint64_t handle = lease->handle;
-        const int lease_fd = lease->lease_fd;
-        memset(lease, 0, sizeof(*lease));
-        (void)pacha_fd_close(lease_fd);
-        (void)netd_socket_handle_close(handle);
+             PACHA_FD_EVENT_HANGUP) == 0)
+        {
+            lease_cursor = &lease->next;
+            continue;
+        }
+        *lease_cursor = lease->next;
+        netd_socket_transfer_lease_destroy(lease);
     }
 
     struct netd_page_attachment **cursor = &g_netd_page_attachments;
@@ -639,6 +703,7 @@ void netd_socket_service_poll(void)
     }
 
     for (unsigned i = 0; i < 32; i++) {
+        (void)netd_unix_socket_flush_notification();
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
         memset(fds, 0, sizeof(fds));
@@ -653,4 +718,5 @@ void netd_socket_service_poll(void)
         g_netd_socket_requests++;
         (void)netd_socket_dispatch_request(&request, fds);
     }
+
 }

@@ -54,6 +54,24 @@ static int prepare_environment(void)
         { "LIBGL_ALWAYS_SOFTWARE", "1" },
         { "GALLIUM_DRIVER", "llvmpipe" },
         { "FONTCONFIG_FILE", "/etc/fonts/fonts.conf" },
+        /* at-spi-bus-launcher cannot currently establish the accessibility
+         * bus on CapabilityOS.  Leaving GTK's bridge enabled turns every
+         * first GTK launch into a D-Bus NoReply timeout without providing
+         * accessibility.  Remove this once the AT-SPI bus is supported. */
+        { "NO_AT_BRIDGE", "1" },
+        /* Glycin creates a fresh Rayon pool for each decoded frame.  On the
+         * current LPR thread path, several workers cost more to create and
+         * join than they save for both icon-sized SVGs and the Sway wallpaper.
+         * Keep the value in the session environment so applications can
+         * override it before launching a workload that benefits from wider
+         * image parallelism. */
+        { "RAYON_NUM_THREADS", "1" },
+        /* Glycin uses the blocking crate on both sides of its private D-Bus
+         * connection.  Its unbounded default grows extra workers while GTK
+         * is loading icon batches; on LPR the thread hand-offs cost more than
+         * the additional parallelism saves.  One worker can deadlock nested
+         * blocking work, while two keeps that progress dependency intact. */
+        { "BLOCKING_MAX_THREADS", "2" },
         { "PATH", "/bin:/usr/bin:/cmd" },
         { "HOME", "/home" },
         { "SHELL", "/bin/bash" },
@@ -214,7 +232,7 @@ int main(void)
         perror("prepare environment");
         return 21;
     }
-    if (pacha_prepare_input_metadata() != 0) {
+    if (pacha_prepare_input_metadata("pacha-user-session") != 0) {
         perror("prepare input metadata");
         return 22;
     }

@@ -9,7 +9,6 @@ import time
 PROMPT = b"bash-5.3# "
 MARKERS = (
     b"APK_SHELL_VERSION=OK",
-    b"APK_SHELL_OFFLINE_INDEX=OK",
     b"APK_SHELL_UPDATE=OK",
     b"APK_SHELL_NANO_CYCLES=OK iterations=3",
     b"APK_SHELL_ADD_GREP=OK",

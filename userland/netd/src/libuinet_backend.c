@@ -2644,7 +2644,13 @@ int netd_libuinet_start(struct netd_runtime *runtime)
     memset(&global_cfg, 0, sizeof(global_cfg));
     memset(&instance_cfg, 0, sizeof(instance_cfg));
 
+    /* The SMALL profile caps cluster mbufs at 4096, which a package download
+     * exhausts; the allocator then faults instead of failing the allocation.
+     * MEDIUM's 128K clusters reserve far more than this guest has to spare, so
+     * raise only the two limits the workload actually needs. */
     uinet_default_cfg(&global_cfg, UINET_GLOBAL_CFG_SMALL);
+    global_cfg.kern.ipc.nmbclusters = 32 * 1024;
+    global_cfg.kern.ipc.maxsockets = 4 * 1024;
     uinet_instance_default_cfg(&instance_cfg);
     if (netd_libuinet_sts_open(&instance_cfg) != 0) {
         fprintf(stderr, "[netd] libuinet STS timer setup failed\n");

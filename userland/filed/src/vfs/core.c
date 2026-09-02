@@ -1197,6 +1197,7 @@ filed_status_t filed_vfs_get_stat_snapshot(
     if (vnode->stat_valid) {
         out_snapshot->valid = true;
         out_snapshot->handle_id = handle_id;
+        out_snapshot->inode_number = vnode->stat_inode_number;
         out_snapshot->mode = vnode->stat_mode;
         out_snapshot->size = vnode->stat_size;
         out_snapshot->blocks = vnode->stat_blocks;
@@ -1327,6 +1328,7 @@ filed_status_t filed_vfs_update_stat_snapshot(
         }
         filed_lock_acquire(&vnode->lock);
         vnode->stat_valid = true;
+        vnode->stat_inode_number = snapshot->inode_number;
         vnode->stat_mode = snapshot->mode;
         vnode->stat_size = snapshot->size;
         vnode->stat_blocks = snapshot->blocks;

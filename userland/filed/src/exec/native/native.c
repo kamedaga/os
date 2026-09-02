@@ -617,6 +617,7 @@ static int filed_exec_read_image(
     }
     memset(&stat, 0, sizeof(stat));
     if (snapshot.valid) {
+        stat.inode_number = snapshot.inode_number;
         stat.mode = snapshot.mode;
         stat.size = snapshot.size;
         stat.blocks = snapshot.blocks;
@@ -628,6 +629,7 @@ static int filed_exec_read_image(
             return status;
         }
         snapshot.valid = true;
+        snapshot.inode_number = stat.inode_number;
         snapshot.mode = stat.mode;
         snapshot.size = stat.size;
         snapshot.blocks = stat.blocks;

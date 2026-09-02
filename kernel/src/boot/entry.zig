@@ -44,12 +44,17 @@ const PendingPipeCloseWake = struct {
     wake_side_write: bool,
 };
 
+const PendingIpcChannelCloseWake = struct {
+    handle: kernel.IpcChannelHandle,
+};
+
 // ---------------------------------------------------------------------------
 // Boot globals
 // ---------------------------------------------------------------------------
 
 var empty_user_spaces_storage: [0]boot_static.UserAddressSpace align(4096) = .{};
 var user_spaces: []boot_static.UserAddressSpace = empty_user_spaces_storage[0..];
+var user_space_table: boot_static.UserAddressSpaceTable = .{};
 var empty_kernel_runtime_storage: [0]u8 align(4096) = .{};
 var kernel_runtime_storage: []align(4096) u8 = empty_kernel_runtime_storage[0..];
 
@@ -88,6 +93,7 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, boot_scratch.kernelStaticStorageStartAddr());
     start = minStaticStart(start, image_range.kernelStaticStorageStartAddr());
     start = minStaticStart(start, staticStorageStart(@TypeOf(user_spaces), &user_spaces));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(user_space_table), &user_space_table));
     start = minStaticStart(start, staticStorageStart(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
     start = minStaticStart(start, kernel_runtime.kernelStaticStorageStartAddr());
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_free_list_storage), &limine_free_list_storage));
@@ -106,6 +112,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, boot_scratch.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, image_range.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_spaces), &user_spaces));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_space_table), &user_space_table));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_runtime_storage), &kernel_runtime_storage));
     end = maxStaticEnd(end, kernel_runtime.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, kernel.kernelStaticStorageEndAddr());
@@ -141,8 +148,8 @@ fn invlpg(addr: u64) void {
 
 fn userCr3ForPrincipal(principal: kernel.PrincipalId) u64 {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    if (idx >= user_spaces.len) return 0;
-    return x86_platform.cr3WithUserPcid(user_spaces[idx].cr3, x86_platform.userPcidForProcessIndex(idx));
+    const space = user_space_table.get(idx) orelse return 0;
+    return x86_platform.cr3WithUserPcid(space.cr3, x86_platform.userPcidForProcessIndex(idx));
 }
 
 // ---------------------------------------------------------------------------
@@ -255,18 +262,39 @@ fn initKernelRuntimeOrHalt() void {
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
     }
+    const timer_calibration = lapic.calibrateTimer(
+        boot_static.lapic_timer_initial_count,
+        boot_static.lapic_timer_rearm_overhead_ns,
+    );
+    if (timer_calibration.calibrated) {
+        kernel_log.writeFmt(
+            "lapic-timer: calibration=pit frequency_hz={} initial_count={} rearm_overhead_ns={} pit_ticks={}\n",
+            .{
+                timer_calibration.frequency_hz,
+                timer_calibration.initial_count,
+                timer_calibration.rearm_overhead_ns,
+                timer_calibration.pit_ticks,
+            },
+        );
+    } else {
+        kernel_log.writeFmt(
+            "lapic-timer: calibration=fallback frequency_hz=unknown initial_count={} rearm_overhead_ns={}\n",
+            .{ timer_calibration.initial_count, timer_calibration.rearm_overhead_ns },
+        );
+    }
     if (!elf_loader.probe()) {
         halt.haltWithMessage("ELF loader probe failed");
     }
 }
 
 fn initMemoryModules() void {
+    user_space_table.init(user_spaces);
     for (user_spaces) |*space| {
         user_vm.resetUserAddressSpaceStorage(space);
     }
 
     user_vm.init(.{
-        .user_spaces = user_spaces,
+        .user_spaces = &user_space_table,
         .four_gib = boot_static.four_gib,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
         .user_low_va = boot_static.user_low_va,
@@ -397,12 +425,51 @@ fn collectPipeCloseWakesForProcess(
 }
 
 fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
-    for (targets) |target| {
-        if (!scheduler.threadWakeTargetIsLive(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.pollfd_va != 0) {
-            _ = user_copy.writeUserU64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
+    for (targets, 0..) |target, target_index| {
+        if (target.wait_token == 0 or target.group.isNull()) continue;
+        var already_handled = false;
+        for (targets[0..target_index]) |earlier| {
+            if (earlier.wait_token == target.wait_token and earlier.group.matches(target.group)) {
+                already_handled = true;
+                break;
+            }
         }
-        _ = scheduler.wakeIfWaitingGenerationWithRax(target.thread_index, target.thread_generation, 1);
+        if (already_handled) continue;
+        switch (scheduler.claimWaitTokenCompletion(
+            target.thread_index,
+            target.thread_generation,
+            target.owner,
+            target.wait_token,
+        )) {
+            .stale => {
+                kernel_runtime.kernel_state_global.cancelFdWaitGroup(target.group, target.wait_token);
+                continue;
+            },
+            .claimed => {},
+        }
+        kernel_runtime.kernel_state_global.cancelFdWaitGroup(target.group, target.wait_token);
+        var ready_count: u64 = 0;
+        var copy_ok = true;
+        for (targets) |member| {
+            if (member.wait_token != target.wait_token or
+                !member.group.matches(target.group) or member.pollfd_va == 0)
+            {
+                continue;
+            }
+            if (!user_copy.writeUserU64(
+                member.owner,
+                member.pollfd_va + fd_abi.pollfd_revents_offset,
+                member.revents,
+            )) copy_ok = false;
+            if (member.revents != 0) ready_count += 1;
+        }
+        _ = scheduler.publishClaimedWaitCompletion(
+            target.thread_index,
+            target.thread_generation,
+            target.owner,
+            target.wait_token,
+            if (copy_ok) ready_count else @import("../syscall/numbers.zig").syscall_err_invalid,
+        );
     }
 }
 
@@ -416,14 +483,56 @@ fn wakeReadyPipeCloseWaiters(pending_wakes: []const PendingPipeCloseWake) void {
     }
 }
 
+fn collectIpcChannelCloseWakesForProcess(
+    principal: kernel.PrincipalId,
+    out: []PendingIpcChannelCloseWake,
+) usize {
+    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
+    const table = kernel_runtime.kernel_state_global.fdTableForProcessIndexConst(process_index) orelse return 0;
+    var count: usize = 0;
+    for (table.entries[0..]) |entry| {
+        if (entry.object.isNull()) continue;
+        const slot = kernel_runtime.kernel_state_global.kernelObjectSlotConst(entry.object) orelse continue;
+        const handle = switch (slot.payload) {
+            .channel => |channel_handle| channel_handle,
+            else => continue,
+        };
+        if (count >= out.len) break;
+        out[count] = .{ .handle = handle };
+        count += 1;
+    }
+    return count;
+}
+
+fn wakeIpcChannelCloseWaiters(pending_wakes: []const PendingIpcChannelCloseWake) void {
+    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
+    for (pending_wakes) |pending| {
+        const wake_count = kernel_runtime.kernel_state_global.takeIpcChannelPeerCloseWaiters(
+            pending.handle,
+            wake_storage[0..],
+        );
+        wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
+    }
+}
+
+fn wakeTaskFdWaiters(principal: kernel.PrincipalId) void {
+    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
+    const wake_count = kernel_runtime.kernel_state_global.takeTaskReadableWaitersForPrincipal(
+        principal,
+        wake_storage[0..],
+    );
+    wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
+}
+
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
     var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
+    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
+    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(principal, pending_channel_wakes[0..]);
 
-    _ = scheduler.stopPrincipalThreads(principal);
-    scheduler.waitForRemotePrincipalQuiescence(principal);
+    kernel_runtime.kernel_state_global.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
 
     if (!user_vm.lockVmTransaction(principal)) return;
@@ -432,6 +541,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockVmTransaction(principal);
     wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
+    wakeIpcChannelCloseWaiters(pending_channel_wakes[0..pending_channel_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -454,6 +564,7 @@ fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void 
 
     kernel_runtime.kernel_state_global.markThreadObjectsExitedForPrincipal(principal, .killed, fault_vector);
     kernel_runtime.kernel_state_global.markProcessObjectsExited(principal, .killed, fault_vector);
+    wakeTaskFdWaiters(principal);
     _ = kernel_runtime.kernel_state_global.markProcessFaulted(principal, fault_vector);
     if (spawn_parent) |parent| scheduler.wakeBlockedThread(parent);
 }
@@ -464,9 +575,10 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const metric_start = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
+    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
+    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(principal, pending_channel_wakes[0..]);
 
-    _ = scheduler.stopPrincipalThreads(principal);
-    scheduler.waitForRemotePrincipalQuiescence(principal);
+    kernel_runtime.kernel_state_global.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
@@ -479,6 +591,7 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     user_vm.unlockVmTransaction(principal);
     wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
+    wakeIpcChannelCloseWaiters(pending_channel_wakes[0..pending_channel_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
     const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
@@ -536,7 +649,13 @@ pub export fn resumeAfterFatalUserException(principal: kernel.PrincipalId, fault
     kernel_log.write(" rsp=");
     kernel_log.writeHexRaw(out_frame.rsp);
     kernel_log.write("\n");
-    teardownFaultedProcess(principal, fault_vector);
+    switch (syscalls.beginExternalPrincipalTeardown(principal)) {
+        .acquired => {
+            teardownFaultedProcess(principal, fault_vector);
+            syscalls.endExternalPrincipalTeardown();
+        },
+        .handled_by_existing_lifecycle => {},
+    }
     if (!scheduler.isBootstrapSchedulerCpu()) {
         smp.returnCurrentApToIdleFromInterrupt();
     }
@@ -551,8 +670,25 @@ fn exitCurrentProcess(
 ) void {
     const exit_cpu = if (enable_exit_teardown_metrics) scheduler.currentCpu() else 0;
     const bootstrap_cpu = scheduler.isBootstrapSchedulerCpu();
-    teardownExitedProcess(principal);
-    if (after_teardown) |callback| callback.run(callback.context);
+    // PROCESS_EXIT arrives with both the lifecycle gate and state lock held.
+    // The inactive-principal fallback enters that same exclusion here.
+    var external_teardown_acquired = false;
+    var teardown_owned_elsewhere = false;
+    if (before_ap_idle == null) {
+        switch (syscalls.beginExternalPrincipalTeardown(principal)) {
+            .acquired => external_teardown_acquired = true,
+            .handled_by_existing_lifecycle => teardown_owned_elsewhere = true,
+        }
+    }
+
+    if (!teardown_owned_elsewhere) {
+        teardownExitedProcess(principal);
+        if (after_teardown) |callback| callback.run(callback.context);
+    }
+    if (external_teardown_acquired) {
+        syscalls.endExternalPrincipalTeardown();
+        external_teardown_acquired = false;
+    }
     if (!bootstrap_cpu) {
         if (enable_exit_teardown_metrics) {
             kernel_log.writeFmt(
@@ -666,7 +802,7 @@ pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     smp.configureApUserTimer(
         boot_static.lapic_timer_vector,
-        boot_static.lapic_timer_initial_count * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
+        lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)),
     );
     smp.configureWakeIpiVector(boot_static.scheduler_wake_ipi_vector);
     if (!smp.startIdleAps(&smp_info, x86_platform.kernel_cr3_value)) {
@@ -745,7 +881,7 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         halt.haltWithError("init bootstrap owner mark failed: ", err);
     };
     boot_init_principal = init_principal;
-    const init_process = process_factory.createUserProcess(state, init_principal, "init", kernel_runtime.global_free_list, user_spaces);
+    const init_process = process_factory.createUserProcess(state, init_principal, "init", kernel_runtime.global_free_list, &user_space_table);
     state.createSerialFdAt(init_principal, 1, 1) catch |err| {
         halt.haltWithError("init stdout fd install failed: ", err);
     };
@@ -806,7 +942,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
     syscalls.init(.{
         .state = state,
         .free_list = kernel_runtime.global_free_list,
-        .user_spaces = user_spaces,
+        .user_spaces = &user_space_table,
         .kernel_state_ready = &kernel_runtime.kernel_state_ready,
         .write = kernel_log.write,
         .print_hex = log_util.printHex,
@@ -820,6 +956,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .thread_wake_target_is_live = scheduler.threadWakeTargetIsLive,
         .wake_waiting_thread_generation = scheduler.wakeIfWaitingGeneration,
         .wake_waiting_thread_generation_with_rax = scheduler.wakeIfWaitingGenerationWithRax,
+        .wake_waiting_thread_generation_with_rax_prefer_current = scheduler.wakeIfWaitingGenerationWithRaxPreferCurrent,
         .wake_blocked_thread_for_principal = scheduler.wakeBlockedThread,
         .switch_to_thread = scheduler.switchTo,
         .block_current_thread_for_event = scheduler.blockCurrentThread,

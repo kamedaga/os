@@ -22,8 +22,6 @@ lpr_state_t lpr_state = {
     },
     .netd_rpc = {
         .request_id = 0x4c50524e45544401ull,
-        .page_fd = -1,
-        .page_lease_fd = -1,
         .next_ephemeral_port = 49152u,
     },
 };
@@ -322,6 +320,11 @@ void lpr_signal_thread_state_after_fork_child(void)
     current->pending_mask = 0;
     current->wait_restore_mask = 0;
     current->wait_restore_mask_active = 0;
+    current->sigwait_active = 0;
+    current->sigwait_set = 0;
+    current->sigwait_info = 0;
+    current->sigwait_deadline_ns = 0;
+    current->sigwait_deadline_finite = 0;
     current->dispatching = 0;
     const struct lpr_linux_user_frame *frame = lpr_current_linux_user_frame();
     if (frame != 0) {

@@ -23,6 +23,7 @@ int filed_tmpfs_backend_mount_root(filed_tmpfs_backend_t *backend, uint64_t *out
 int filed_tmpfs_backend_mount_detached_root(filed_tmpfs_backend_t *backend, uint64_t *out_root_object_id);
 int filed_tmpfs_backend_lookup(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
 int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id, storage_statx_reply_t *out_stat);
+int filed_tmpfs_backend_statfs(filed_tmpfs_backend_t *backend, storage_statfs_reply_t *out_statfs);
 int filed_tmpfs_backend_pread(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_tmpfs_backend_pwrite(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_tmpfs_backend_fsync(filed_tmpfs_backend_t *backend, uint64_t object_id);

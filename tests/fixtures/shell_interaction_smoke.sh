@@ -85,7 +85,7 @@ exit_status_case() {
 }
 
 shebang_case() {
-  "$bb" printf '#!/bin/bash\necho SHELL_SHEBANG_PAYLOAD\n' > /tmp/shell_shebang.sh || return 1
+  "$bb" printf '#!/bin/sh\necho SHELL_SHEBANG_PAYLOAD\n' > /tmp/shell_shebang.sh || return 1
   "$bb" chmod +x /tmp/shell_shebang.sh || return 1
   /tmp/shell_shebang.sh >"$out" 2>/dev/null || return 1
   "$bb" grep -q '^SHELL_SHEBANG_PAYLOAD$' "$out"

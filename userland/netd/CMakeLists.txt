@@ -153,6 +153,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/netd/ipc_protocol.h"
     "${REPO_ROOT}/userland/filed/include/filed/flags.h"
     "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
+    "${REPO_ROOT}/userland/filed/include/filed/payload.h"
     "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     ${KOBOX_RUNTIME_SOURCES}

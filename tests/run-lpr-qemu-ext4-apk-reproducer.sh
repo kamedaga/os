@@ -8,13 +8,14 @@ log_dir=.artifacts/test-results/ext4-apk-reproducer
 mkdir -p "$log_dir"
 
 if [[ ${SKIP_SYNC:-0} != 1 ]]; then
+  rm -f "$repo_root/.artifacts/disk.img"
   .artifacts/bin/pacgo sync rootfs --force
-  .artifacts/bin/pacgo sync bootfs
+  .artifacts/bin/pacgo sync bootfs --force
 fi
 
 .artifacts/bin/pacgo qemu-test \
   --cpus 4 \
-  --timeout 420s \
+  --timeout 120s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '. /cmd/ext4_apk_reproducer.sh' \
   --expect 'EXT4_APK_REPRO_CREATE=OK files=512' \

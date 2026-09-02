@@ -8,9 +8,14 @@ tools/*
 !tools/build_wsl_drm_prime_smoke.sh
 !tools/build_virtio_gpu_sysfs.sh
 !tools/build_virtio_input_sysfs.sh
+!tools/derive_input_id.py
 !tools/build_wsl_alpine_input.sh
 !tools/build_wsl_libinput_smoke.sh
 !tools/build_wsl_alpine_sway.sh
+!tools/build_wsl_alpine_xfce.sh
+!tools/rootfs_overlay.py
+!tools/manifests/
+tools/manifests/*
 !tools/build_wsl_pine2_gtk.sh
 !tools/build_wsl_sway_launcher.sh
 !tools/build_wsl_wayland_shm_client.sh
@@ -46,6 +51,7 @@ target/
 *.dmp
 *.lock
 !flake.lock
+!tools/manifests/alpine-xfce-v3.22-x86_64.lock
 _disk_bootx64.efi
 
 # Temporary files

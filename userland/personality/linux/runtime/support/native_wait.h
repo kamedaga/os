@@ -31,14 +31,28 @@ static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
     return 0;
 }
 
+static inline uint64_t lpr_native_wait_drain_events(int fd)
+{
+    if (fd < 16) return 0;
+    uint64_t events = 0;
+    /* NetD emits at most one queued message per readiness bit.  Drain all
+     * currently coalesced bits so the Linux-side cache and acknowledgement
+     * describe the same observation. */
+    for (unsigned i = 0; i < 8; ++i) {
+        struct pacha_ipc_msg message = {0};
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_RECV,
+            (uint64_t)(uint32_t)fd,
+            (uint64_t)(uintptr_t)&message);
+        if (status != 0) break;
+        events |= message.word0;
+    }
+    return events;
+}
+
 static inline void lpr_native_wait_drain(int fd)
 {
-    if (fd < 16) return;
-    struct pacha_ipc_msg message = {0};
-    (void)lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_RECV,
-        (uint64_t)(uint32_t)fd,
-        (uint64_t)(uintptr_t)&message);
+    (void)lpr_native_wait_drain_events(fd);
 }
 
 static inline int64_t lpr_native_ipc_recv_wait(
@@ -59,4 +73,74 @@ static inline int64_t lpr_native_ipc_recv_wait(
         // exposing the signal at the Linux return-frame boundary.
     } while (status == PACHA_SYSCALL_ERR_NOT_READY);
     return status;
+}
+
+static inline int64_t lpr_native_fd_wait_writable(uint64_t fd)
+{
+    for (;;) {
+        struct pacha_pollfd pollfd = {
+            .fd = (int)(uint32_t)fd,
+            .events = PACHA_FD_EVENT_WRITABLE,
+            .revents = 0,
+        };
+        const int64_t status = lpr_pacha_syscall4(
+            PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)&pollfd,
+            1,
+            PACHA_FD_WAIT_FOREVER,
+            0);
+        if (status > 0 && pollfd.revents != 0) {
+            return 0;
+        }
+        if (status != PACHA_SYSCALL_ERR_NOT_READY &&
+            status != -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            return status != 0 ? status : PACHA_SYSCALL_ERR_NOT_READY;
+        }
+    }
+}
+
+static inline int64_t lpr_native_ipc_send_wait(
+    uint64_t fd,
+    const struct pacha_ipc_msg *message)
+{
+    for (;;) {
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_SEND,
+            fd,
+            (uint64_t)(uintptr_t)message);
+        if (status == 0) {
+            return 0;
+        }
+        if (status != PACHA_SYSCALL_ERR_NOT_READY &&
+            status != -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            return status;
+        }
+        const int64_t wait_status = lpr_native_fd_wait_writable(fd);
+        if (wait_status != 0) {
+            return wait_status;
+        }
+    }
+}
+
+static inline int64_t lpr_native_ipc_call_wait(
+    uint64_t fd,
+    const struct pacha_ipc_msg *message)
+{
+    for (;;) {
+        const int64_t reply_fd = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_CALL,
+            fd,
+            (uint64_t)(uintptr_t)message);
+        if (reply_fd != PACHA_SYSCALL_ERR_NOT_READY &&
+            reply_fd != -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            return reply_fd;
+        }
+        const int64_t wait_status = lpr_native_fd_wait_writable(fd);
+        if (wait_status != 0) {
+            return wait_status;
+        }
+    }
 }

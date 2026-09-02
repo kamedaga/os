@@ -153,7 +153,7 @@ enqueue() {
   fi
 }
 
-for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot gtk+3.0 gtk+3.0-demo adwaita-icon-theme font-ipaex font-roboto-mono libxkbcommon pixman hwdata-pnp; do
+for package in sway swaybar swaybg swaynag sway-wallpapers wlroots wayland wayland-protocols wayland-utils foot gtk+3.0 gtk+3.0-demo adwaita-icon-theme font-ipaex font-roboto-mono libxkbcommon pixman hwdata-pnp thunar dbus; do
   enqueue "${package}"
 done
 for ((i=0; i<${#queue[@]}; ++i)); do
@@ -506,6 +506,10 @@ for required in \
   usr/bin/wayland-info \
   usr/bin/foot \
   usr/bin/gtk3-demo \
+  usr/bin/thunar \
+  usr/bin/dbus-daemon \
+  usr/bin/dbus-send \
+  usr/bin/dbus-uuidgen \
   etc/xdg/foot/foot.ini \
   usr/share/fonts/ipaexfont/ipaexg.ttf \
   'usr/share/fonts/roboto-mono/RobotoMono[wght].ttf' \

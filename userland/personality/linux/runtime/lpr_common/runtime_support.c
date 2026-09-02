@@ -35,23 +35,38 @@ int lpr_count_exec_local_fds(uint64_t *out_count);
 void lpr_filed_session_drop(void)
 {
     lpr_file_image_cache_clear();
-    if (lpr_session_page != 0) {
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)lpr_session_page,
-            FILED_SESSION_PAGE_BYTES);
-    }
-    if (lpr_session_page_fd >= 16) {
-        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_session_page_fd);
-    }
-    if (lpr_session_fd >= 16) {
-        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)lpr_session_fd);
-    }
+
+    /* The filed RPC lock is also the fast-session lifetime lock.  Every
+     * request that can retain a session-page pointer holds it until the
+     * request and any payload access have finished, so acquiring it here
+     * drains existing users before the mapping is detached. */
+    lpr_state_lock(&lpr_state.filed_rpc.lock_word);
+    void *const page = lpr_session_page;
+    const int page_fd = lpr_session_page_fd;
+    const int session_fd = lpr_session_fd;
     lpr_session_fd = -1;
     lpr_session_page_fd = -1;
     lpr_session_page = 0;
     lpr_session_checked = 0;
     lpr_session_payload_busy = 0;
+
+    if (page != 0) {
+        (void)lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_MUNMAP,
+            (uint64_t)(uintptr_t)page,
+            FILED_SESSION_PAGE_BYTES);
+    }
+    if (page_fd >= 16) {
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)page_fd);
+    }
+    if (session_fd >= 16) {
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)session_fd);
+    }
+    lpr_state_unlock(&lpr_state.filed_rpc.lock_word);
 }
 void *lpr_session_payload_slot(uint64_t slot)
 {

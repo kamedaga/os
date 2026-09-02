@@ -2,7 +2,19 @@
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
-    uint64_t rights = FILED_RIGHT_STAT | FILED_RIGHT_SETATTR;
+    /*
+     * Linux does not require O_DIRECTORY when opening a directory that will
+     * later be used as an *at() dirfd.  The object kind is not known until
+     * filed completes this open, so request the directory-only capabilities
+     * up front.  Filed still rejects lookup/create/remove/rename when the
+     * resulting vnode is not a directory.
+     */
+    uint64_t rights = FILED_RIGHT_STAT |
+        FILED_RIGHT_SETATTR |
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
         rights |= FILED_RIGHT_GETDENTS;
@@ -13,19 +25,8 @@ uint64_t lpr_open_rights(uint64_t flags)
     if (accmode == LPR_LINUX_O_WRONLY || accmode == LPR_LINUX_O_RDWR) {
         rights |= FILED_RIGHT_WRITE;
     }
-    if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
-        /*
-         * A Linux directory fd opened O_RDONLY may still be used as the
-         * dirfd for mutating *at operations.  O_ACCMODE describes access to
-         * the directory object itself; it does not make openat(O_CREAT),
-         * unlinkat(), or renameat() through that fd read-only.
-         */
-        rights |= FILED_RIGHT_LOOKUP |
-            FILED_RIGHT_GETDENTS |
-            FILED_RIGHT_CREATE |
-            FILED_RIGHT_REMOVE |
-            FILED_RIGHT_RENAME;
-    }
+    if ((flags & LPR_LINUX_O_DIRECTORY) != 0)
+        rights |= FILED_RIGHT_GETDENTS;
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
         rights |= FILED_RIGHT_CREATE | FILED_RIGHT_WRITE;
     }
@@ -613,9 +614,36 @@ int64_t lpr_filed_open_handle_at(
     return 0;
 }
 
-static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
+static int lpr_linux_proc_self_fd_number(const char *path, uint64_t *out_fd)
 {
     static const char prefix[] = "/proc/self/fd/";
+    if (path == 0 || out_fd == 0) return 0;
+    for (size_t i = 0; i + 1u < sizeof(prefix); i += 1u) {
+        if (path[i] != prefix[i]) {
+            return 0;
+        }
+    }
+    const char *digits = path + sizeof(prefix) - 1u;
+    if (*digits < '0' || *digits > '9') {
+        return 0;
+    }
+    uint64_t source_fd = 0;
+    for (const char *cursor = digits; *cursor != '\0'; cursor += 1) {
+        if (*cursor < '0' || *cursor > '9') {
+            return 0;
+        }
+        const uint64_t digit = (uint64_t)(*cursor - '0');
+        if (source_fd > (LPR_LINUX_FD_MAX - digit) / 10u) {
+            return 0;
+        }
+        source_fd = source_fd * 10u + digit;
+    }
+    *out_fd = source_fd;
+    return 1;
+}
+
+static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
+{
     const uint64_t known_flags =
         LPR_LINUX_O_ACCMODE |
         LPR_LINUX_O_APPEND |
@@ -625,31 +653,14 @@ static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    for (size_t i = 0; i + 1u < sizeof(prefix); i += 1u) {
-        if (path[i] != prefix[i]) {
-            return -LPR_LINUX_ENOENT;
-        }
+    uint64_t source_fd = 0;
+    if (!lpr_linux_proc_self_fd_number(path, &source_fd)) {
+        return -LPR_LINUX_ENOENT;
     }
     if ((flags & ~known_flags) != 0 ||
         (flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_ACCMODE)
     {
         return -LPR_LINUX_EINVAL;
-    }
-
-    const char *digits = path + sizeof(prefix) - 1u;
-    if (*digits < '0' || *digits > '9') {
-        return -LPR_LINUX_ENOENT;
-    }
-    uint64_t source_fd = 0;
-    for (const char *cursor = digits; *cursor != '\0'; cursor += 1) {
-        if (*cursor < '0' || *cursor > '9') {
-            return -LPR_LINUX_ENOENT;
-        }
-        const uint64_t digit = (uint64_t)(*cursor - '0');
-        if (source_fd > (LPR_LINUX_FD_MAX - digit) / 10u) {
-            return -LPR_LINUX_ENOENT;
-        }
-        source_fd = source_fd * 10u + digit;
     }
     if (!lpr_fd_is_filed(source_fd)) {
         return -LPR_LINUX_ENOENT;
@@ -657,9 +668,7 @@ static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
 
     const lpr_filed_backend_t *source = lpr_filed_backend(source_fd);
     const uint64_t access = flags & LPR_LINUX_O_ACCMODE;
-    if ((source->reserved1 & (LPR_FILED_FD_MEMFD |
-            LPR_LINUX_F_SEAL_FUTURE_WRITE)) ==
-            (LPR_FILED_FD_MEMFD | LPR_LINUX_F_SEAL_FUTURE_WRITE) &&
+    if (lpr_memfd_write_is_sealed(source->reserved1) &&
         access != LPR_LINUX_O_RDONLY)
     {
         return -LPR_LINUX_EPERM;
@@ -684,6 +693,9 @@ static int64_t lpr_linux_proc_self_fd_open(const char *path, uint64_t flags)
         return -LPR_LINUX_EIO;
     }
     reopened->reserved1 = source->reserved1;
+    lpr_memcpy(reopened->open_path,
+               source->open_path,
+               sizeof(reopened->open_path));
     return fd;
 }
 
@@ -698,6 +710,10 @@ int64_t lpr_linux_openat_once(
         *out_kind = 0;
     }
     const char *path = (const char *)(uintptr_t)path_raw;
+    const int64_t proc_snapshot_fd = lpr_linux_proc_snapshot_open(path, flags);
+    if (proc_snapshot_fd != -LPR_LINUX_ENOENT) {
+        return proc_snapshot_fd;
+    }
     const int64_t proc_fd = lpr_linux_proc_self_fd_open(path, flags);
     if (proc_fd != -LPR_LINUX_ENOENT) {
         return proc_fd;
@@ -756,6 +772,15 @@ int64_t lpr_linux_openat_once(
         (void)lpr_filed_close_handle(handle);
         return fd;
     }
+    lpr_filed_backend_t *opened =
+        lpr_filed_backend((uint64_t)(uint32_t)fd);
+    if (opened != 0 && path != 0) {
+        const uint64_t path_length =
+            (uint64_t)lpr_strnlen(path, sizeof(opened->open_path));
+        if (path_length < sizeof(opened->open_path)) {
+            lpr_memcpy(opened->open_path, path, path_length + 1u);
+        }
+    }
     lpr_linux_stat_t st;
     lpr_memset(&st, 0, sizeof(st));
     if (opened_kind == FILED_OPENED_KIND_DEVICE &&
@@ -794,6 +819,20 @@ int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *
         return -LPR_LINUX_EFAULT;
     }
     const char *path = (const char *)(uintptr_t)path_raw;
+    uint64_t source_fd = 0;
+    if (lpr_linux_proc_self_fd_number(path, &source_fd)) {
+        const lpr_filed_backend_t *source = lpr_filed_backend(source_fd);
+        if (source == 0) {
+            return -LPR_LINUX_ENOENT;
+        }
+        const char *link_target = source->open_path[0] != '\0' ?
+            source->open_path : path;
+        uint64_t length =
+            (uint64_t)lpr_strnlen(link_target, FILED_PATH_BYTES);
+        if (length > capacity) length = capacity;
+        lpr_memcpy(target, link_target, length);
+        return (int64_t)length;
+    }
     uint64_t dir_handle = 0;
     int64_t status = lpr_dir_handle_for(dirfd, path, &dir_handle);
     if (status != 0) {
@@ -1052,23 +1091,55 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     const int old_lease_fd = lpr_cwd_lease_fd;
     char old_path[FILED_PATH_BYTES];
     lpr_memcpy(old_path, lpr_cwd_path, sizeof(old_path));
-    lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
     const uint64_t len = (uint64_t)lpr_strnlen(path, sizeof(lpr_cwd_path));
+    const int root = len == 1u && path[0] == '/';
+    uint64_t installed_handle = 0;
+    int installed_lease_fd = -1;
+    if (!root) {
+        int remote_lease_fd = -1;
+        int status = lpr_native_wait_pair(
+            &installed_lease_fd,
+            &remote_lease_fd);
+        if (status == 0) {
+            status = (int)lpr_filed_transfer_dup_handle(
+                handle,
+                0,
+                remote_lease_fd,
+                &installed_handle);
+        }
+        if (status != 0 || installed_handle == 0) {
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)installed_lease_fd);
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)remote_lease_fd);
+            (void)lpr_filed_close_handle(handle);
+            return status != 0 ? status : -LPR_LINUX_EIO;
+        }
+        /* The process-wide cwd must outlive a reconnect of the filed RPC
+         * session.  Keep the duplicate alive through its explicit lease and
+         * retire the short-lived session-owned handle returned by open/dup. */
+        (void)lpr_filed_close_handle(handle);
+    }
+    lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
     lpr_memcpy(lpr_cwd_path, path, (size_t)len + 1u);
-    if (len == 1u && path[0] == '/') {
+    if (root) {
         lpr_cwd_handle = 0;
         lpr_cwd_lease_fd = -1;
         if (handle != 0) {
             (void)lpr_filed_close_handle(handle);
         }
     } else {
-        lpr_cwd_handle = handle;
-        lpr_cwd_lease_fd = -1;
+        lpr_cwd_handle = installed_handle;
+        lpr_cwd_lease_fd = installed_lease_fd;
     }
     const int64_t supervisor_status = lpr_supervisor_cwd_set(lpr_cwd_handle, lpr_cwd_path);
     if (supervisor_status != 0) {
         if (lpr_cwd_handle != 0 && lpr_cwd_handle != old_handle) {
-            (void)lpr_filed_close_handle(lpr_cwd_handle);
+            if (lpr_cwd_lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+            else
+                (void)lpr_filed_close_handle(lpr_cwd_handle);
         }
         lpr_cwd_handle = old_handle;
         lpr_cwd_lease_fd = old_lease_fd;
@@ -1178,10 +1249,19 @@ void lpr_timespec_subtract(
 int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out)
 {
     lpr_memset(out, 0, sizeof(*out));
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_CLOCK_GETTIME,
-        clock_id,
-        (uint64_t)(uintptr_t)out);
+    int64_t status;
+    do {
+        status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_CLOCK_GETTIME,
+            clock_id,
+            (uint64_t)(uintptr_t)out);
+        if (status == PACHA_SYSCALL_ERR_NOT_READY ||
+            status == -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            __asm__ volatile("pause");
+        }
+    } while (status == PACHA_SYSCALL_ERR_NOT_READY ||
+             status == -PACHA_SYSCALL_ERR_NOT_READY);
     return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
 }
 

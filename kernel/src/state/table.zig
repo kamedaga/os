@@ -1,5 +1,30 @@
 const std = @import("std");
 
+pub fn nextGeometricCapacity(
+    current_capacity: usize,
+    initial_capacity: usize,
+    max_capacity: usize,
+    required: usize,
+) ?usize {
+    if (required > max_capacity or initial_capacity == 0 or initial_capacity > max_capacity) return null;
+    var capacity = current_capacity;
+    if (capacity == 0) capacity = initial_capacity;
+    while (capacity < required) {
+        const doubled, const overflow = @mulWithOverflow(capacity, @as(usize, 2));
+        capacity = if (overflow != 0 or doubled > max_capacity) max_capacity else doubled;
+        if (capacity < required and capacity == max_capacity) return null;
+    }
+    return capacity;
+}
+
+test "geometric capacity doubles and clamps at the shared maximum" {
+    try std.testing.expectEqual(@as(?usize, 32), nextGeometricCapacity(32, 32, 65536, 32));
+    try std.testing.expectEqual(@as(?usize, 64), nextGeometricCapacity(32, 32, 65536, 33));
+    try std.testing.expectEqual(@as(?usize, 128), nextGeometricCapacity(64, 32, 65536, 65));
+    try std.testing.expectEqual(@as(?usize, 65536), nextGeometricCapacity(32768, 32, 65536, 65536));
+    try std.testing.expectEqual(@as(?usize, null), nextGeometricCapacity(65536, 32, 65536, 65537));
+}
+
 pub fn StaticPlusExtra(comptime T: type, comptime inline_capacity: usize) type {
     return struct {
         pub const Item = T;

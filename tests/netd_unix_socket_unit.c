@@ -5,12 +5,14 @@
 #include "pacha/ipc.h"
 
 static unsigned notifications[512];
+static uint32_t notification_events[512];
 
 int pacha_ipc_send(int fd, const struct pacha_ipc_msg *msg)
 {
-    (void)msg;
-    if (fd >= 0 && (unsigned)fd < sizeof(notifications) / sizeof(notifications[0]))
+    if (fd >= 0 && (unsigned)fd < sizeof(notifications) / sizeof(notifications[0])) {
         notifications[fd]++;
+        notification_events[fd] |= (uint32_t)msg->word0;
+    }
     return 0;
 }
 
@@ -60,6 +62,17 @@ static uint64_t open_socket(int notify_fd)
     return handle;
 }
 
+static uint32_t take_notification_events(int notify_fd)
+{
+    if (notify_fd < 0 ||
+        (unsigned)notify_fd >=
+            sizeof(notification_events) / sizeof(notification_events[0]))
+        return 0;
+    const uint32_t events = notification_events[notify_fd];
+    notification_events[notify_fd] = 0;
+    return events;
+}
+
 static int connect_socket(uint64_t handle, const char *path, int32_t pid)
 {
     netd_unix_path_t req;
@@ -72,21 +85,74 @@ static int connect_socket(uint64_t handle, const char *path, int32_t pid)
     return netd_unix_socket_connect(&req);
 }
 
+static int connect_abstract_socket(
+    uint64_t handle,
+    const void *name,
+    uint32_t name_length,
+    int32_t pid)
+{
+    netd_unix_path_t req;
+    memset(&req, 0, sizeof(req));
+    req.handle = handle;
+    req.flags = NETD_UNIX_PATH_ABSTRACT;
+    req.pid = pid;
+    req.reserved0 = name_length;
+    memcpy(req.path, name, name_length);
+    return netd_unix_socket_connect(&req);
+}
+
 static uint64_t accept_socket(uint64_t listener, int32_t expected_pid)
 {
     netd_accept_t req;
     memset(&req, 0, sizeof(req));
     req.handle = listener;
+    netd_unix_socket_state_t *listener_state = find_socket(listener);
+    if (listener_state != NULL)
+        req.notify_ack = take_notification_events(listener_state->notify_fd);
     expect(netd_unix_socket_accept(&req) == 0, "accept socket");
     expect(req.pid == expected_pid, "accept preserves FIFO credentials");
     return req.accepted_handle;
 }
 
+static netd_unix_name_t socket_name(uint64_t handle, uint32_t peer)
+{
+    netd_unix_name_t name;
+    memset(&name, 0, sizeof(name));
+    name.handle = handle;
+    name.peer = peer;
+    expect(netd_unix_socket_name(&name) == 0, "query Unix socket name");
+    return name;
+}
+
 int main(void)
 {
-    memset(sockets, 0, sizeof(sockets));
+    sockets = NULL;
+    socket_count = 0;
+    notification_head = NULL;
+    notification_tail = NULL;
+    notifications_deferred = 0;
     memset(notifications, 0, sizeof(notifications));
+    memset(notification_events, 0, sizeof(notification_events));
     next_handle = 0;
+
+    enum { BURST_SOCKET_COUNT = 384 };
+    uint64_t burst_sockets[BURST_SOCKET_COUNT];
+    size_t burst_opened = 0;
+    memset(burst_sockets, 0, sizeof(burst_sockets));
+    for (; burst_opened < BURST_SOCKET_COUNT; ++burst_opened) {
+        const int status = netd_unix_socket_open(
+            NETD_SOCK_STREAM, 0, 40, &burst_sockets[burst_opened]);
+        expect(status == 0,
+            "open substantially more than 128 Unix sockets");
+        if (status != 0) break;
+    }
+    expect(burst_opened == BURST_SOCKET_COUNT,
+        "Unix socket allocation has no 128-entry EMFILE ceiling");
+    for (size_t i = 0; i < burst_opened; ++i)
+        expect(netd_unix_socket_close(burst_sockets[i]) == 0,
+            "close burst Unix socket");
+    expect(socket_count == 0 && sockets == NULL,
+        "burst Unix sockets release dynamic state and receive buffers");
 
     const uint64_t listener = open_socket(20);
     netd_unix_path_t bind_req;
@@ -100,6 +166,48 @@ int main(void)
     };
     expect(netd_unix_socket_listen(&listen_req) == 0, "listen backlog two");
 
+    static const uint8_t abstract_name[] = {
+        '/', 't', 'm', 'p', '/', '.', 'I', 'C', 'E', '-', 'u', 'n', 'i', 'x',
+        '/', '6', '\0', 'x',
+    };
+    const uint64_t abstract_listener = open_socket(27);
+    netd_unix_path_t abstract_bind;
+    memset(&abstract_bind, 0, sizeof(abstract_bind));
+    abstract_bind.handle = abstract_listener;
+    abstract_bind.flags = NETD_UNIX_PATH_ABSTRACT;
+    abstract_bind.reserved0 = sizeof(abstract_name);
+    memcpy(abstract_bind.path, abstract_name, sizeof(abstract_name));
+    expect(netd_unix_socket_bind(&abstract_bind) == 0,
+        "bind length-delimited abstract listener");
+    const netd_listen_t abstract_listen = {
+        .handle = abstract_listener,
+        .backlog = 1,
+    };
+    expect(netd_unix_socket_listen(&abstract_listen) == 0,
+        "listen on abstract namespace");
+    const uint64_t abstract_duplicate = open_socket(28);
+    abstract_bind.handle = abstract_duplicate;
+    expect(netd_unix_socket_bind(&abstract_bind) == -98,
+        "duplicate abstract name reports EADDRINUSE");
+    const uint64_t abstract_client = open_socket(29);
+    expect(connect_abstract_socket(
+        abstract_client,
+        abstract_name,
+        sizeof(abstract_name),
+        109) == 0,
+        "connect to abstract name with embedded nul");
+    const uint64_t abstract_server = accept_socket(abstract_listener, 109);
+    expect(abstract_server != 0,
+        "accept abstract namespace client");
+    netd_unix_name_t name = socket_name(abstract_client, 1);
+    expect(name.abstract == 1 && name.length == sizeof(abstract_name) &&
+               memcmp(name.path, abstract_name, sizeof(abstract_name)) == 0,
+           "abstract client reports its peer's length-delimited name");
+    name = socket_name(abstract_server, 0);
+    expect(name.abstract == 1 && name.length == sizeof(abstract_name) &&
+               memcmp(name.path, abstract_name, sizeof(abstract_name)) == 0,
+           "accepted abstract socket inherits listener local name");
+
     const uint64_t client1 = open_socket(21);
     const uint64_t client2 = open_socket(22);
     const uint64_t client3 = open_socket(23);
@@ -110,6 +218,8 @@ int main(void)
     expect(connect_socket(client3, "/sway-ipc.sock", 103) == -11,
         "backlog full reports EAGAIN");
     expect(notifications[20] == 1, "listener notification is coalesced");
+    expect(notification_events[20] == NETD_POLLIN,
+        "listener notification identifies readable state");
 
     const uint64_t server1 = accept_socket(listener, 101);
     expect(notifications[20] == 2,
@@ -120,6 +230,20 @@ int main(void)
     const uint64_t server3 = accept_socket(listener, 103);
     expect(server1 != 0 && server2 != 0 && server3 != 0,
         "FIFO accepts all queued peers");
+    name = socket_name(client1, 0);
+    expect(name.abstract == 0 && name.length == 0,
+        "unbound client has unnamed local address");
+    name = socket_name(client1, 1);
+    expect(name.abstract == 0 && name.length == strlen("/sway-ipc.sock") &&
+               memcmp(name.path, "/sway-ipc.sock", name.length) == 0,
+        "client peer name is the listener pathname");
+    name = socket_name(server1, 0);
+    expect(name.abstract == 0 && name.length == strlen("/sway-ipc.sock") &&
+               memcmp(name.path, "/sway-ipc.sock", name.length) == 0,
+        "accepted socket inherits listener local pathname");
+    name = socket_name(server1, 1);
+    expect(name.abstract == 0 && name.length == 0,
+        "accepted socket reports unnamed client peer");
 
     netd_unix_socket_state_t *listener_state = find_socket(listener);
     expect(listener_state != NULL, "find listener state");
@@ -127,6 +251,7 @@ int main(void)
     netd_accept_t stale_accept;
     memset(&stale_accept, 0, sizeof(stale_accept));
     stale_accept.handle = listener;
+    stale_accept.notify_ack = NETD_POLLIN;
     expect(netd_unix_socket_accept(&stale_accept) == -11,
         "stale listener edge reports EAGAIN");
     const unsigned listener_notifications = notifications[20];
@@ -141,13 +266,13 @@ int main(void)
     netd_io_t send_req;
     memset(&send_req, 0, sizeof(send_req));
     send_req.handle = client1;
-    send_req.length = NETD_UNIX_RX + 257u;
+    send_req.length = NETD_UNIX_RX;
     for (uint32_t i = 0; i < send_req.length; ++i)
         send_req.data[i] = (uint8_t)(i & 0xffu);
     size_t sent = 0;
     expect(netd_unix_socket_send(&send_req, NULL, 0, &sent) == 0,
-        "oversized stream write succeeds partially");
-    expect(sent == NETD_UNIX_RX, "partial write fills available receive space");
+        "maximum stream write succeeds");
+    expect(sent == NETD_UNIX_RX, "maximum write fills receive space");
 
     uint32_t revents = 0;
     int32_t error = 0;
@@ -172,6 +297,8 @@ int main(void)
             "partial stream byte ordering");
     expect(notifications[21] == writer_notifications + 1,
         "drain notifies blocked writer");
+    expect((notification_events[21] & NETD_POLLOUT) != 0,
+        "drain notification identifies writable state");
     revents = 0;
     expect(netd_unix_socket_poll(
         client1, NETD_POLLOUT, &revents, &error) == 0,
@@ -182,14 +309,24 @@ int main(void)
     memset(&send_req, 0, sizeof(send_req));
     send_req.handle = client1;
     send_req.length = 100;
+    for (uint32_t i = 0; i < send_req.length; ++i)
+        send_req.data[i] = (uint8_t)(0xa5u ^ i);
     expect(netd_unix_socket_send(&send_req, NULL, 0, &sent) == 0 &&
         sent == 100,
         "writer refills receive buffer after readiness acknowledgement");
     memset(&recv_req, 0, sizeof(recv_req));
     recv_req.handle = server1;
     expect(netd_unix_socket_recv(
-        &recv_req, 100, NULL, 0, &received_caps, &received) == 0,
-        "drain refilled receive buffer");
+        &recv_req, NETD_UNIX_RX, NULL, 0, &received_caps, &received) == 0 &&
+        received == NETD_UNIX_RX,
+        "drain wrapped receive buffer");
+    for (uint32_t i = 0; i < NETD_UNIX_RX - 100u; ++i)
+        expect(recv_req.data[i] == (uint8_t)((i + 100u) & 0xffu),
+            "wrapped stream preserves original tail");
+    for (uint32_t i = 0; i < 100u; ++i)
+        expect(recv_req.data[NETD_UNIX_RX - 100u + i] ==
+            (uint8_t)(0xa5u ^ i),
+            "wrapped stream preserves appended bytes");
     expect(notifications[21] == writer_notifications + 2,
         "successive full-to-writable edges each notify writer");
 
@@ -208,6 +345,8 @@ int main(void)
         "peer sends readable byte");
     expect(notifications[21] == client_notifications + 1,
         "readable transition notifies client");
+    expect((notification_events[21] & NETD_POLLIN) != 0,
+        "readable notification identifies input state");
     memset(&send_req, 0, sizeof(send_req));
     send_req.handle = client1;
     send_req.length = 1;
@@ -230,10 +369,18 @@ int main(void)
 
     expect(netd_unix_socket_close(client2) == 0, "close empty peer");
     revents = 0;
-    expect(netd_unix_socket_poll(server2, 0, &revents, &error) == 0,
+    expect(netd_unix_socket_poll(
+        server2, NETD_POLLOUT, &revents, &error) == 0,
         "poll closed peer");
     expect((revents & NETD_POLLHUP) != 0,
         "peer close reports HUP without requested event mask");
+    expect((revents & NETD_POLLOUT) == 0,
+        "detached peer is not resolved through a free socket slot");
+    memset(&send_req, 0, sizeof(send_req));
+    send_req.handle = server2;
+    send_req.length = 189;
+    expect(netd_unix_socket_send(&send_req, NULL, 0, &sent) == -107,
+        "send after peer close reports ENOTCONN without touching a free slot");
 
     const uint64_t client4 = open_socket(24);
     expect(connect_socket(client4, "/sway-ipc.sock", 104) == 0,
@@ -265,15 +412,18 @@ int main(void)
     const unsigned hup_notifications = notifications[29];
     expect(netd_unix_socket_close(hup_pair[0]) == 0,
         "close peer while data remains unread");
-    expect(notifications[29] == hup_notifications,
-        "close coalesces with existing data notification");
+    expect(notifications[29] == hup_notifications + 1,
+        "close adds HUP to an existing data notification");
+    expect(notification_events[29] == (NETD_POLLIN | NETD_POLLHUP),
+        "data and HUP notifications retain both event kinds");
     memset(&recv_req, 0, sizeof(recv_req));
     recv_req.handle = hup_pair[1];
+    recv_req.notify_ack = take_notification_events(29);
     expect(netd_unix_socket_recv(
         &recv_req, 4, NULL, 0, &received_caps, &received) == 0 &&
         received == 4,
         "receive final bytes before HUP");
-    expect(notifications[29] == hup_notifications + 1,
+    expect(notifications[29] == hup_notifications + 2,
         "final data receive rearms persistent HUP notification");
     revents = 0;
     expect(netd_unix_socket_poll(
@@ -333,6 +483,7 @@ int main(void)
     if (stale_reader != NULL) stale_reader->notify_pending = 1;
     memset(&recv_req, 0, sizeof(recv_req));
     recv_req.handle = stale_pair[1];
+    recv_req.notify_ack = NETD_POLLIN;
     expect(netd_unix_socket_recv(
         &recv_req, 1, NULL, 0, &received_caps, &received) == -11,
         "stale empty receive reports EAGAIN");
@@ -345,6 +496,153 @@ int main(void)
         "send after stale empty receive");
     expect(notifications[33] == stale_notifications + 1,
         "empty receive acknowledges stale doorbell");
+
+    uint64_t stress_pair[2] = {0, 0};
+    expect(netd_unix_socket_pair(
+        NETD_SOCK_STREAM, 0, 36, 37, stress_pair) == 0,
+        "open wrapped stream stress pair");
+    enum { STRESS_BYTES = NETD_UNIX_RX * 3u + 257u };
+    static uint8_t stress_source[STRESS_BYTES];
+    static uint8_t stress_received[STRESS_BYTES];
+    for (uint32_t i = 0; i < STRESS_BYTES; ++i)
+        stress_source[i] = (uint8_t)((i * 131u + i / 251u) & 0xffu);
+    static const uint32_t receive_sizes[] = {
+        32u, 32u, 64u, 128u, 256u, 512u, 1024u, 2048u,
+        4096u, 8192u, 16384u, 32768u, NETD_UNIX_RX,
+    };
+    size_t source_offset = 0;
+    size_t received_offset = 0;
+    size_t receive_step = 0;
+    while (received_offset < STRESS_BYTES) {
+        const size_t previous_source = source_offset;
+        const size_t previous_received = received_offset;
+        if (source_offset < STRESS_BYTES) {
+            memset(&send_req, 0, sizeof(send_req));
+            send_req.handle = stress_pair[0];
+            size_t request = STRESS_BYTES - source_offset;
+            if (request > NETD_UNIX_RX) request = NETD_UNIX_RX;
+            send_req.length = request;
+            memcpy(send_req.data, stress_source + source_offset, request);
+            const int send_status = netd_unix_socket_send(
+                &send_req, NULL, 0, &sent);
+            expect(send_status == 0 || send_status == -11,
+                "wrapped stream stress send status");
+            if (send_status == 0) source_offset += sent;
+        }
+
+        memset(&recv_req, 0, sizeof(recv_req));
+        recv_req.handle = stress_pair[1];
+        size_t capacity = receive_sizes[
+            receive_step % (sizeof(receive_sizes) / sizeof(receive_sizes[0]))];
+        if (capacity > STRESS_BYTES - received_offset)
+            capacity = STRESS_BYTES - received_offset;
+        const int recv_status = netd_unix_socket_recv(
+            &recv_req, capacity, NULL, 0, &received_caps, &received);
+        expect(recv_status == 0 || recv_status == -11,
+            "wrapped stream stress receive status");
+        if (recv_status == 0) {
+            memcpy(stress_received + received_offset, recv_req.data, received);
+            received_offset += received;
+            receive_step++;
+        }
+        expect(source_offset != previous_source ||
+            received_offset != previous_received,
+            "wrapped stream stress makes progress");
+    }
+    expect(source_offset == STRESS_BYTES,
+        "wrapped stream stress sends all bytes");
+    expect(memcmp(stress_received, stress_source, STRESS_BYTES) == 0,
+        "wrapped stream stress preserves every byte");
+
+    uint64_t seq_pair[2] = {0, 0};
+    expect(netd_unix_socket_pair(
+        NETD_SOCK_SEQPACKET, 0, 34, 35, seq_pair) == 0,
+        "open SOCK_SEQPACKET pair");
+    memset(&send_req, 0, sizeof(send_req));
+    send_req.handle = seq_pair[0];
+    send_req.length = 3;
+    memcpy(send_req.data, "one", 3);
+    expect(netd_unix_socket_send(
+        &send_req, NULL, 0, &sent) == 0 && sent == 3,
+        "send first atomic seqpacket");
+    send_req.length = 5;
+    memcpy(send_req.data, "three", 5);
+    expect(netd_unix_socket_send(
+        &send_req, NULL, 0, &sent) == 0 && sent == 5,
+        "send second atomic seqpacket");
+    memset(&recv_req, 0, sizeof(recv_req));
+    recv_req.handle = seq_pair[1];
+    expect(netd_unix_socket_recv(
+        &recv_req, 2, NULL, 0, &received_caps, &received) == 0 &&
+        received == 2 && memcmp(recv_req.data, "on", 2) == 0,
+        "short seqpacket receive returns packet prefix");
+    expect((recv_req.flags & NETD_MSG_TRUNC) != 0,
+        "short seqpacket receive reports truncation");
+    memset(&recv_req, 0, sizeof(recv_req));
+    recv_req.handle = seq_pair[1];
+    expect(netd_unix_socket_recv(
+        &recv_req, 8, NULL, 0, &received_caps, &received) == 0 &&
+        received == 5 && memcmp(recv_req.data, "three", 5) == 0,
+        "truncated packet remainder is discarded without crossing boundary");
+    memset(&send_req, 0, sizeof(send_req));
+    send_req.handle = seq_pair[0];
+    send_req.length = NETD_UNIX_RX + 1u;
+    expect(netd_unix_socket_send(
+        &send_req, NULL, 0, &sent) == -90,
+        "oversized seqpacket is rejected atomically");
+
+    memset(&send_req, 0, sizeof(send_req));
+    send_req.handle = seq_pair[0];
+    expect(netd_unix_socket_send(
+        &send_req, NULL, 0, &sent) == 0 && sent == 0,
+        "zero-length seqpacket is queued");
+    send_req.length = 1;
+    send_req.data[0] = 0x7b;
+    expect(netd_unix_socket_send(
+        &send_req, NULL, 0, &sent) == 0 && sent == 1,
+        "packet after zero-length seqpacket is queued separately");
+    memset(&recv_req, 0, sizeof(recv_req));
+    recv_req.handle = seq_pair[1];
+    expect(netd_unix_socket_recv(
+        &recv_req, 1, NULL, 0, &received_caps, &received) == 0 &&
+        received == 0,
+        "zero-length seqpacket is consumed as a record");
+    memset(&recv_req, 0, sizeof(recv_req));
+    recv_req.handle = seq_pair[1];
+    expect(netd_unix_socket_recv(
+        &recv_req, 1, NULL, 0, &received_caps, &received) == 0 &&
+        received == 1 && recv_req.data[0] == 0x7b,
+        "record after zero-length seqpacket remains intact");
+
+    memset(&send_req, 0, sizeof(send_req));
+    send_req.handle = seq_pair[0];
+    expect(netd_unix_socket_send(
+        &send_req, NULL, 0, &sent) == 0 && sent == 0,
+        "queue zero-length packet before SCM packet");
+    send_req.transaction_id = 17;
+    send_req.transfer_count = 1;
+    send_req.capability_count = 1;
+    send_req.transfers[0].provider_id = 1;
+    send_req.transfers[0].capability_count = 1;
+    send_req.transfers[0].transfer_token = 19;
+    const int seq_capability = 81;
+    expect(netd_unix_socket_send(
+        &send_req, &seq_capability, 1, &sent) == 0 && sent == 0,
+        "zero-length seqpacket carries SCM rights");
+    memset(&recv_req, 0, sizeof(recv_req));
+    recv_req.handle = seq_pair[1];
+    received_fds[0] = -1;
+    expect(netd_unix_socket_recv(
+        &recv_req, 0, received_fds, 1,
+        &received_caps, &received) == 0 && received_caps == 0,
+        "preceding zero packet does not steal later SCM rights");
+    memset(&recv_req, 0, sizeof(recv_req));
+    recv_req.handle = seq_pair[1];
+    expect(netd_unix_socket_recv(
+        &recv_req, 0, received_fds, 1,
+        &received_caps, &received) == 0 &&
+        received_caps == 1 && received_fds[0] == seq_capability,
+        "SCM rights are anchored to their zero-length seqpacket");
 
     if (failures != 0) return 1;
     puts("netd unix socket unit: PASS");

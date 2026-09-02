@@ -37,6 +37,29 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1) {
     g_last.a0 = a0;
     g_last.a1 = a1;
     g_last.a2 = 0;
+    if (nr == PACHAOS_SYSCALL_CLOCK_GETRES) {
+        struct pachaos_timespec *out = (struct pachaos_timespec *)(uintptr_t)a1;
+        if (a0 == PACHAOS_CLOCK_REALTIME) {
+            out->tv_sec = 1;
+            out->tv_nsec = 0;
+            return 0;
+        }
+        if (a0 == PACHAOS_CLOCK_MONOTONIC) {
+            out->tv_sec = 0;
+            out->tv_nsec = 1000000;
+            return 0;
+        }
+        return PACHAOS_SYSCALL_ERR_INVALID;
+    }
+    if (nr == PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL &&
+        a0 == PACHAOS_PROCESS_SIGNAL_CTL_GET_TIMER)
+    {
+        uint64_t *state = (uint64_t *)(uintptr_t)a1;
+        state[0] = 14;
+        state[1] = 1234;
+        state[2] = 2000;
+        return 0;
+    }
     if (nr == PACHAOS_SYSCALL_FD_GET_INFO) return PACHAOS_SYSCALL_ERR_INVALID;
     return 0;
 }
@@ -56,6 +79,24 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, u
     g_last.a1 = a1;
     g_last.a2 = a2;
     g_last.a3 = a3;
+    return 0;
+}
+
+int64_t lpr_pacha_syscall5(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {
+    g_last.nr = nr;
+    g_last.a0 = a0;
+    g_last.a1 = a1;
+    g_last.a2 = a2;
+    g_last.a3 = a3;
+    g_last.a4 = a4;
+    if (nr == PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL &&
+        a0 == PACHAOS_PROCESS_SIGNAL_CTL_SET_TIMER && a4 != 0)
+    {
+        uint64_t *old = (uint64_t *)(uintptr_t)a4;
+        old[0] = 14;
+        old[1] = 7;
+        old[2] = 3;
+    }
     return 0;
 }
 
@@ -87,6 +128,86 @@ int main(void) {
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETTID)) return 1;
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_SET_TID_ADDRESS, 0x1000, 0, 0, 0, 0, 0) == 5678)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETTID)) return 1;
+
+    uint64_t clock_result[2] = {0, 0};
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETTIME, 5,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_CLOCK_GETTIME && g_last.a0 == 0)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETTIME, 4,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_CLOCK_GETTIME && g_last.a0 == 1)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETTIME, 6,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_CLOCK_GETTIME && g_last.a0 == 1)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETTIME, 7,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_CLOCK_GETTIME && g_last.a0 == 1)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETTIME, 2,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) ==
+            -LPR_LINUX_EINVAL)) return 1;
+
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETRES, 0,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_CLOCK_GETRES &&
+            g_last.a0 == PACHAOS_CLOCK_REALTIME && clock_result[0] == 1 &&
+            clock_result[1] == 0)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETRES, 1,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.a0 == PACHAOS_CLOCK_MONOTONIC &&
+            clock_result[0] == 0 && clock_result[1] == 1000000)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETRES, 4,
+            0, 0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.a0 == PACHAOS_CLOCK_MONOTONIC)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_CLOCK_GETRES, 2,
+            (uint64_t)(uintptr_t)clock_result, 0, 0, 0, 0) ==
+            -LPR_LINUX_EINVAL)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_FADVISE64, 0, 0, 0,
+            6, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
+
+    struct {
+        int64_t interval_sec;
+        int64_t interval_usec;
+        int64_t value_sec;
+        int64_t value_usec;
+    } new_itimer = {0, 250000, 1, 500000}, old_itimer = {0};
+    if (expect(lpr_dispatch_syscall(
+            LPR_LINUX_SYS_SETITIMER,
+            0,
+            (uint64_t)(uintptr_t)&new_itimer,
+            (uint64_t)(uintptr_t)&old_itimer,
+            0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL &&
+            g_last.a0 == PACHAOS_PROCESS_SIGNAL_CTL_SET_TIMER &&
+            g_last.a1 == 14 && g_last.a2 == 1500 && g_last.a3 == 250)) return 1;
+    if (expect(old_itimer.interval_sec == 0 &&
+            old_itimer.interval_usec == 3000 &&
+            old_itimer.value_sec == 0 &&
+            old_itimer.value_usec == 7000)) return 1;
+    if (expect(lpr_dispatch_syscall(
+            LPR_LINUX_SYS_SETITIMER,
+            1,
+            (uint64_t)(uintptr_t)&new_itimer,
+            0, 0, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
+    old_itimer.interval_sec = 0;
+    old_itimer.interval_usec = 0;
+    old_itimer.value_sec = 0;
+    old_itimer.value_usec = 0;
+    if (expect(lpr_dispatch_syscall(
+            LPR_LINUX_SYS_GETITIMER,
+            0,
+            (uint64_t)(uintptr_t)&old_itimer,
+            0, 0, 0, 0) == 0)) return 1;
+    if (expect(g_last.nr == PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL &&
+            g_last.a0 == PACHAOS_PROCESS_SIGNAL_CTL_GET_TIMER)) return 1;
+    if (expect(old_itimer.interval_sec == 2 &&
+            old_itimer.interval_usec == 0 &&
+            old_itimer.value_sec == 1 &&
+            old_itimer.value_usec == 234000)) return 1;
+    uint64_t suspend_mask = 0;
+    if (expect(lpr_dispatch_syscall(
+            LPR_LINUX_SYS_RT_SIGSUSPEND,
+            (uint64_t)(uintptr_t)&suspend_mask,
+            16, 0, 0, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
 
     const char text[] = "hello";
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_WRITE, 1, (uint64_t)(uintptr_t)text, 5, 0, 0, 0) == 5)) return 1;

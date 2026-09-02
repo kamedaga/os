@@ -412,6 +412,7 @@ static int filed_runtime_mount_detached_tmpfs_child(
     memset(&root_snapshot, 0, sizeof(root_snapshot));
     root_snapshot.valid = true;
     root_snapshot.handle_id = root_open.handle_id;
+    root_snapshot.inode_number = root_stat.inode_number;
     root_snapshot.mode = root_stat.mode;
     root_snapshot.size = root_stat.size;
     root_snapshot.blocks = root_stat.blocks;
@@ -539,6 +540,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         filed_vfs_stat_snapshot_t root_snapshot;
         memset(&root_snapshot, 0, sizeof(root_snapshot));
         root_snapshot.valid = true;
+        root_snapshot.inode_number = root_stat.inode_number;
         root_snapshot.mode = root_stat.mode;
         root_snapshot.size = root_stat.size;
         root_snapshot.blocks = root_stat.blocks;
@@ -626,6 +628,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
             memset(&tmp_snapshot, 0, sizeof(tmp_snapshot));
             tmp_snapshot.valid = true;
             tmp_snapshot.handle_id = tmp_open.handle_id;
+            tmp_snapshot.inode_number = tmp_stat.inode_number;
             tmp_snapshot.mode = tmp_stat.mode;
             tmp_snapshot.size = tmp_stat.size;
             tmp_snapshot.blocks = tmp_stat.blocks;

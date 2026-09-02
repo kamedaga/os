@@ -109,18 +109,23 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_drm/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_input/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/bootstrap_state.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_process/capability.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_process/compat.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/control.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_fd/memfd.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/ops.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/dup_pipe.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_pipe/io.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_timerfd.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_inotify.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_signalfd.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_sync_file.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_wait.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/cache.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/path.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/io.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_vfs/proc.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/ops.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/exec.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/syscalls.c" \

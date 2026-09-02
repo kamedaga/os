@@ -51,6 +51,8 @@ pub const page_nx: u64 = x86_platform.page_nx;
 pub const lapic_timer_vector: u8 = 0x40;
 pub const scheduler_wake_ipi_vector: u8 = 0x42;
 pub const lapic_timer_initial_count: u32 = 50_000;
+// Midpoint of the measured 25.959-48.361 us one-shot interrupt/rearm cost.
+pub const lapic_timer_rearm_overhead_ns: u64 = 37_160;
 pub const scheduler_slice_ticks: u64 = 4;
 pub const bootlog_auto_launch_min_visible_ticks: u64 = 1;
 pub const user_log_max_bytes: usize = 256;
@@ -65,6 +67,7 @@ pub const debug_trigger_page_fault_test = false;
 pub const user_process_count: usize = kernel.process_count;
 pub const user_thread_count: usize = scheduler.maxThreadSlots;
 pub const UserAddressSpace = address_space.UserAddressSpace;
+pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 
 pub const syscall_ok: u64 = syscall_numbers.syscall_ok;
 pub const syscall_err_invalid = syscall_numbers.syscall_err_invalid;

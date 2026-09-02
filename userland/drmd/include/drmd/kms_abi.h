@@ -24,6 +24,7 @@ enum {
     DRMD_IOCTL_MODE_ADDFB = 0xc01c64aeu,
     DRMD_IOCTL_MODE_RMFB = 0xc00464afu,
     DRMD_IOCTL_MODE_PAGE_FLIP = 0xc01864b0u,
+    DRMD_IOCTL_MODE_DIRTYFB = 0xc01864b1u,
     DRMD_IOCTL_MODE_CREATE_DUMB = 0xc02064b2u,
     DRMD_IOCTL_MODE_MAP_DUMB = 0xc01064b3u,
     DRMD_IOCTL_MODE_DESTROY_DUMB = 0xc00464b4u,
@@ -42,6 +43,9 @@ enum {
     DRMD_IOCTL_SYNCOBJ_TRANSFER = 0xc02064ccu,
     DRMD_IOCTL_MODE_CLOSEFB = 0xc00864d0u,
     DRMD_IOCTL_SYNCOBJ_EVENTFD = 0xc01864cfu,
+    DRMD_IOCTL_WAIT_VBLANK = 0xc018643au,
+    DRMD_IOCTL_CRTC_GET_SEQUENCE = 0xc018643bu,
+    DRMD_IOCTL_CRTC_QUEUE_SEQUENCE = 0xc018643cu,
 
     DRMD_MODE_TYPE_PREFERRED = 1u << 3,
     DRMD_MODE_TYPE_DRIVER = 1u << 6,
@@ -98,6 +102,16 @@ enum {
     DRMD_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE = 1u << 0,
 
     DRMD_EVENT_FLIP_COMPLETE = 0x02u,
+    DRMD_EVENT_VBLANK = 0x01u,
+    DRMD_EVENT_CRTC_SEQUENCE = 0x03u,
+    DRMD_VBLANK_RELATIVE = 0x00000001u,
+    DRMD_VBLANK_HIGH_CRTC_MASK = 0x0000003eu,
+    DRMD_VBLANK_EVENT = 0x04000000u,
+    DRMD_VBLANK_NEXT_ON_MISS = 0x10000000u,
+    DRMD_VBLANK_SECONDARY = 0x20000000u,
+    DRMD_VBLANK_SIGNAL = 0x40000000u,
+    DRMD_CRTC_SEQUENCE_RELATIVE = 0x00000001u,
+    DRMD_CRTC_SEQUENCE_NEXT_ON_MISS = 0x00000002u,
 
     DRMD_KMS_FB_CAPACITY = 16u,
     DRMD_KMS_CRTC_CAPACITY = 4u,
@@ -344,6 +358,14 @@ typedef struct drmd_mode_crtc_page_flip {
     uint64_t user_data;
 } drmd_mode_crtc_page_flip_t;
 
+typedef struct drmd_mode_fb_dirty {
+    uint32_t fb_id;
+    uint32_t flags;
+    uint32_t color;
+    uint32_t num_clips;
+    uint64_t clips_ptr;
+} drmd_mode_fb_dirty_t;
+
 typedef struct drmd_mode_cursor {
     uint32_t flags;
     uint32_t crtc_id;
@@ -363,6 +385,42 @@ typedef struct drmd_event_vblank {
     uint32_t sequence;
     uint32_t crtc_id;
 } drmd_event_vblank_t;
+
+typedef union drmd_wait_vblank {
+    struct {
+        uint32_t type;
+        uint32_t sequence;
+        uint64_t signal;
+    } request;
+    struct {
+        uint32_t type;
+        uint32_t sequence;
+        int64_t tv_sec;
+        int64_t tv_usec;
+    } reply;
+} drmd_wait_vblank_t;
+
+typedef struct drmd_crtc_get_sequence {
+    uint32_t crtc_id;
+    uint32_t active;
+    uint64_t sequence;
+    int64_t sequence_ns;
+} drmd_crtc_get_sequence_t;
+
+typedef struct drmd_crtc_queue_sequence {
+    uint32_t crtc_id;
+    uint32_t flags;
+    uint64_t sequence;
+    uint64_t user_data;
+} drmd_crtc_queue_sequence_t;
+
+typedef struct drmd_event_crtc_sequence {
+    uint32_t type;
+    uint32_t length;
+    uint64_t user_data;
+    int64_t time_ns;
+    uint64_t sequence;
+} drmd_event_crtc_sequence_t;
 
 typedef struct drmd_mode_create_dumb {
     uint32_t height;
@@ -451,7 +509,12 @@ _Static_assert(sizeof(drmd_mode_card_res_t) == 64, "drm resources ABI");
 _Static_assert(sizeof(drmd_mode_crtc_t) == 104, "drm crtc ABI");
 _Static_assert(sizeof(drmd_mode_get_connector_t) == 80, "drm connector ABI");
 _Static_assert(sizeof(drmd_mode_fb_cmd2_t) == 104, "drm fb2 ABI");
+_Static_assert(sizeof(drmd_mode_fb_dirty_t) == 24, "drm dirtyfb ABI");
 _Static_assert(sizeof(drmd_event_vblank_t) == 32, "drm event vblank ABI");
+_Static_assert(sizeof(drmd_wait_vblank_t) == 24, "drm wait vblank ABI");
+_Static_assert(sizeof(drmd_crtc_get_sequence_t) == 24, "drm get sequence ABI");
+_Static_assert(sizeof(drmd_crtc_queue_sequence_t) == 24, "drm queue sequence ABI");
+_Static_assert(sizeof(drmd_event_crtc_sequence_t) == 32, "drm crtc sequence event ABI");
 _Static_assert(sizeof(drmd_mode_get_property_t) == 64, "drm property ABI");
 _Static_assert(sizeof(drmd_mode_obj_get_properties_t) == 32, "drm object properties ABI");
 _Static_assert(sizeof(drmd_mode_get_blob_t) == 16, "drm property blob ABI");

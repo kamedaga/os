@@ -53,12 +53,14 @@ static const char *koboxd_fs_op_name(uint64_t op)
     case STORAGE_OP_PREAD: return "pread";
     case STORAGE_OP_PWRITE: return "pwrite";
     case STORAGE_OP_STATX: return "statx";
+    case STORAGE_OP_STATFS: return "statfs";
     case STORAGE_OP_GETDENTS: return "getdents";
     case STORAGE_OP_FSYNC: return "fsync";
     case STORAGE_OP_UTIMENS: return "utimens";
     case STORAGE_OP_CHMOD: return "chmod";
     case STORAGE_OP_CREATE: return "create";
     case STORAGE_OP_TRUNCATE: return "truncate";
+    case STORAGE_OP_LINK: return "link";
     case STORAGE_OP_UNLINK: return "unlink";
     case STORAGE_OP_RENAME: return "rename";
     case STORAGE_OP_MKDIR: return "mkdir";
@@ -76,20 +78,23 @@ static uint64_t koboxd_fs_metric_slot(uint64_t op)
     case STORAGE_OP_MOUNT_ROOT: return 1;
     case STORAGE_OP_LOOKUP: return 2;
     case STORAGE_OP_STATX: return 3;
-    case STORAGE_OP_GETDENTS: return 4;
-    case STORAGE_OP_PREAD: return 5;
-    case STORAGE_OP_PWRITE: return 6;
-    case STORAGE_OP_FSYNC: return 7;
-    case STORAGE_OP_CREATE: return 8;
-    case STORAGE_OP_TRUNCATE: return 9;
-    case STORAGE_OP_UTIMENS: return 10;
-    case STORAGE_OP_CHMOD: return 11;
-    case STORAGE_OP_UNLINK: return 12;
-    case STORAGE_OP_RENAME: return 13;
-    case STORAGE_OP_MKDIR: return 14;
-    case STORAGE_OP_RMDIR: return 15;
-    case STORAGE_OP_RELEASE_OBJECT: return 16;
-    case STORAGE_OP_SYNC_ALL: return 17;
+    case STORAGE_OP_STATFS: return 4;
+    case STORAGE_OP_GETDENTS: return 5;
+    case STORAGE_OP_PREAD: return 6;
+    case STORAGE_OP_PWRITE: return 7;
+    case STORAGE_OP_FSYNC: return 8;
+    case STORAGE_OP_CREATE: return 9;
+    case STORAGE_OP_TRUNCATE: return 10;
+    case STORAGE_OP_UTIMENS: return 11;
+    case STORAGE_OP_CHMOD: return 12;
+    case STORAGE_OP_LINK: return 13;
+    case STORAGE_OP_UNLINK: return 14;
+    case STORAGE_OP_RENAME: return 15;
+    case STORAGE_OP_MKDIR: return 16;
+    case STORAGE_OP_MKNOD: return 17;
+    case STORAGE_OP_RMDIR: return 18;
+    case STORAGE_OP_RELEASE_OBJECT: return 19;
+    case STORAGE_OP_SYNC_ALL: return 20;
     default: return 0;
     }
 }
@@ -100,20 +105,23 @@ static uint64_t koboxd_fs_metric_op(uint64_t slot)
     case 1: return STORAGE_OP_MOUNT_ROOT;
     case 2: return STORAGE_OP_LOOKUP;
     case 3: return STORAGE_OP_STATX;
-    case 4: return STORAGE_OP_GETDENTS;
-    case 5: return STORAGE_OP_PREAD;
-    case 6: return STORAGE_OP_PWRITE;
-    case 7: return STORAGE_OP_FSYNC;
-    case 8: return STORAGE_OP_CREATE;
-    case 9: return STORAGE_OP_TRUNCATE;
-    case 10: return STORAGE_OP_UTIMENS;
-    case 11: return STORAGE_OP_CHMOD;
-    case 12: return STORAGE_OP_UNLINK;
-    case 13: return STORAGE_OP_RENAME;
-    case 14: return STORAGE_OP_MKDIR;
-    case 15: return STORAGE_OP_RMDIR;
-    case 16: return STORAGE_OP_RELEASE_OBJECT;
-    case 17: return STORAGE_OP_SYNC_ALL;
+    case 4: return STORAGE_OP_STATFS;
+    case 5: return STORAGE_OP_GETDENTS;
+    case 6: return STORAGE_OP_PREAD;
+    case 7: return STORAGE_OP_PWRITE;
+    case 8: return STORAGE_OP_FSYNC;
+    case 9: return STORAGE_OP_CREATE;
+    case 10: return STORAGE_OP_TRUNCATE;
+    case 11: return STORAGE_OP_UTIMENS;
+    case 12: return STORAGE_OP_CHMOD;
+    case 13: return STORAGE_OP_LINK;
+    case 14: return STORAGE_OP_UNLINK;
+    case 15: return STORAGE_OP_RENAME;
+    case 16: return STORAGE_OP_MKDIR;
+    case 17: return STORAGE_OP_MKNOD;
+    case 18: return STORAGE_OP_RMDIR;
+    case 19: return STORAGE_OP_RELEASE_OBJECT;
+    case 20: return STORAGE_OP_SYNC_ALL;
     default: return 0;
     }
 }
@@ -230,6 +238,7 @@ static void handle_statx(koboxd_fs_request_ctx_t *ctx)
     }
     memset(wire_stat, 0, sizeof(*wire_stat));
     wire_stat->object_id = stat.object_id;
+    wire_stat->inode_number = stat.inode_number;
     wire_stat->mode = stat.mode;
     wire_stat->size = stat.size;
     wire_stat->blocks = stat.blocks;
@@ -243,6 +252,16 @@ static void handle_statx(koboxd_fs_request_ctx_t *ctx)
     wire_stat->ctime_nsec = stat.ctime_nsec;
     wire_stat->rdev = stat.rdev;
     ctx->result = stat.size;
+}
+
+static void handle_statfs(koboxd_fs_request_ctx_t *ctx)
+{
+    if (map_fs_wire_page(ctx) != 0) return;
+    storage_statfs_reply_t *wire_statfs =
+        (storage_statfs_reply_t *)ctx->mapped;
+    ctx->reply_status = koboxd_fs_backend_statfs(
+        ctx->backend,
+        wire_statfs);
 }
 
 static void handle_pread(koboxd_fs_request_ctx_t *ctx)
@@ -360,6 +379,23 @@ static void handle_unlink(koboxd_fs_request_ctx_t *ctx)
         unlink->name);
 }
 
+static void handle_link(koboxd_fs_request_ctx_t *ctx)
+{
+    if (map_fs_wire_page(ctx) != 0) {
+        return;
+    }
+    storage_link_request_t *link = (storage_link_request_t *)ctx->mapped;
+    link->new_name[STORAGE_NAME_BYTES - 1] = '\0';
+    uint64_t object_id = 0;
+    ctx->reply_status = koboxd_fs_backend_link(
+        ctx->backend,
+        link->old_object_id,
+        link->new_parent_object_id,
+        link->new_name,
+        &object_id);
+    ctx->result = object_id;
+}
+
 static void handle_mkdir(koboxd_fs_request_ctx_t *ctx)
 {
     if (map_fs_wire_page(ctx) != 0) {
@@ -470,6 +506,9 @@ static void dispatch_fs_request(koboxd_fs_request_ctx_t *ctx)
     case STORAGE_OP_STATX:
         handle_statx(ctx);
         break;
+    case STORAGE_OP_STATFS:
+        handle_statfs(ctx);
+        break;
     case STORAGE_OP_PREAD:
         handle_pread(ctx);
         break;
@@ -496,6 +535,9 @@ static void dispatch_fs_request(koboxd_fs_request_ctx_t *ctx)
         break;
     case STORAGE_OP_CHMOD:
         handle_chmod(ctx);
+        break;
+    case STORAGE_OP_LINK:
+        handle_link(ctx);
         break;
     case STORAGE_OP_UNLINK:
         handle_unlink(ctx);

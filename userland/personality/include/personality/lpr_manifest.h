@@ -53,7 +53,6 @@ typedef struct lpr_manifest_capability {
 
 typedef struct lpr_manifest {
     uint64_t magic;
-    uint64_t image_abi_version;
     uint64_t byte_size;
     uint64_t transaction_id;
     uint64_t generation;
@@ -72,6 +71,8 @@ typedef struct lpr_manifest {
     uint64_t linux_sid;
     uint64_t linux_pgrp;
     uint64_t linux_next_pid;
+    uint64_t signal_mask;
+    uint64_t signal_ignored_mask;
     uint64_t cwd_handle;
     uint64_t cwd_capability_index;
     uint64_t supervisor_token;
@@ -125,4 +126,4 @@ static inline lpr_manifest_capability_t *lpr_manifest_capabilities(lpr_manifest_
 _Static_assert(sizeof(lpr_manifest_entry_t) == 32, "lpr manifest entry size");
 _Static_assert(sizeof(lpr_manifest_ofd_t) == 64, "lpr manifest ofd size");
 _Static_assert(sizeof(lpr_manifest_capability_t) == 24, "lpr manifest capability size");
-_Static_assert(sizeof(lpr_manifest_t) == 744, "lpr manifest header size");
+_Static_assert(sizeof(lpr_manifest_t) == 752, "lpr manifest header size");

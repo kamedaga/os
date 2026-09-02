@@ -106,6 +106,7 @@ add_custom_command(
       "PACHAOS_MUSL_EXTRA_LINK_FLAGS=-Wl,--gc-sections -Wl,--strip-all"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${DRMD_ELF}"
   DEPENDS
+    "${REPO_ROOT}/userland/filed/include/filed/payload.h"
     "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/drmd/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/drmd/ipc_protocol.h"

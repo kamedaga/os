@@ -413,7 +413,6 @@ func profileBenchCommand(ctx *context) *cobra.Command {
 		Short: "Run focused boot benchmark profiles",
 	}
 	cmd.AddCommand(profileRunCommand(ctx, "runtime", "chibicc", "[seed0root] storage clean checkpoint status=0", 30*time.Second))
-	cmd.AddCommand(profileRunCommand(ctx, "apk", "apk", "[seed0root] storage clean checkpoint status=0", 60*time.Second))
 	return cmd
 }
 
@@ -550,10 +549,45 @@ func restoreSeed0rootBootProfile(ctx *context) error {
 
 func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	var opts qemu.TTYTestOptions
+	var consoleShell bool
 	cmd := &cobra.Command{
 		Use:   use,
 		Short: "Run QEMU TTY interaction test",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			if consoleShell {
+				if err := writeSeed0rootBootProfile(ctx, "console-shell"); err != nil {
+					return err
+				}
+				defer func() {
+					restoreErr := restoreSeed0rootBootProfile(ctx)
+					if restoreErr == nil {
+						return
+					}
+					if runErr == nil {
+						runErr = restoreErr
+					} else {
+						runErr = fmt.Errorf(
+							"%v; console shell profile restore failed: %w",
+							runErr, restoreErr)
+					}
+				}()
+
+				ui.Task("activate:console-shell")
+				userland, err := buildsys.BuildUserland(
+					ctx.workspace,
+					buildsys.UserlandOptions{
+						AppID:    "seed0root_boot_profile",
+						Progress: ui.NewProgressReporter(),
+					})
+				if err != nil {
+					return err
+				}
+				printUserland(userland)
+				if err := runRootfsSync(ctx, userland, false); err != nil {
+					return err
+				}
+			}
+
 			ui.Task("test:qemu")
 			opts.Progress = ui.NewProgressReporter()
 			result, err := qemu.TTYTest(ctx.workspace, opts)
@@ -595,6 +629,7 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	cmd.Flags().StringArrayVar(&opts.Send, "send", nil, "string to send to the TTY; repeatable")
 	cmd.Flags().StringArrayVar(&opts.Expect, "expect", nil, "serial or console output substring required for success; repeatable")
 	cmd.Flags().StringVar(&opts.Python, "python", "", "python3 script for detailed TTY testing")
+	cmd.Flags().BoolVar(&consoleShell, "console-shell", false, "select the rootfs console shell boot profile for this test and restore startx afterward")
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")

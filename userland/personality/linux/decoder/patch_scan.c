@@ -279,6 +279,77 @@ static uint64_t lpr_count_raw_candidates(const uint8_t *bytes, uint64_t size)
     }
 }
 
+static int lpr_bytes_equal(const uint8_t *left, const uint8_t *right,
+                           uint64_t size)
+{
+    for (uint64_t i = 0; i < size; ++i) {
+        if (left[i] != right[i]) return 0;
+    }
+    return 1;
+}
+
+/* zpoline's two-byte CALL replacement writes its return address to
+ * [rsp-8, rsp). Rustix has two leaf wrappers which deliberately place a
+ * syscall input in that part of the SysV red zone. Keep the zpoline entry
+ * mechanism intact and move only those fully matched inputs down by one
+ * qword before replacing SYSCALL. The LPR entry immediately switches to its
+ * reserved stack, so [rsp-128, rsp-8) remains untouched until dispatch has
+ * consumed the syscall arguments. */
+static void lpr_relocate_known_call_red_zone_input(uint8_t *bytes,
+                                                   uint64_t size,
+                                                   uint64_t candidate)
+{
+    static const uint8_t rustix_epoll_ctl_prefix[] = {
+        0x4c, 0x8d, 0x54, 0x24, 0xf4, /* lea -12(%rsp), %r10 */
+        0x41, 0x89, 0x0a,             /* mov %ecx, (%r10) */
+        0x49, 0x89, 0x42, 0x04,       /* mov %rax, 4(%r10) */
+        0x89, 0xf2,                   /* mov %esi, %edx */
+        0xb8, 0xe9, 0x00, 0x00, 0x00, /* mov $233, %eax */
+        0xbe, 0x03, 0x00, 0x00, 0x00, /* mov $3, %esi */
+    };
+    const uint64_t epoll_size = sizeof(rustix_epoll_ctl_prefix);
+    if (candidate >= epoll_size && candidate + 2u <= size &&
+        lpr_bytes_equal(bytes + candidate - epoll_size,
+                        rustix_epoll_ctl_prefix, epoll_size))
+    {
+        /* packed epoll_event: [rsp-12, rsp) -> [rsp-20, rsp-8) */
+        bytes[candidate - epoll_size + 4u] = 0xec;
+        return;
+    }
+
+    static const uint8_t rust_write_prefix[] = {
+        0x48, 0x8d, 0x74, 0x24, 0xf8, /* lea -8(%rsp), %rsi */
+        0x48, 0xc7, 0x06, 0x01, 0x00, 0x00, 0x00,
+        0x8b, 0x3d, /* mov disp32(%rip), %edi; displacement follows */
+    };
+    static const uint8_t rust_write_suffix[] = {
+        0xb8, 0x01, 0x00, 0x00, 0x00, /* mov $1, %eax */
+        0xba, 0x08, 0x00, 0x00, 0x00, /* mov $8, %edx */
+    };
+    const uint64_t write_size = 28u;
+    const uint64_t write_start = candidate >= write_size
+        ? candidate - write_size
+        : UINT64_MAX;
+    if (write_start != UINT64_MAX && candidate + 2u <= size &&
+        lpr_bytes_equal(bytes + write_start, rust_write_prefix,
+                        sizeof(rust_write_prefix)) &&
+        lpr_bytes_equal(bytes + write_start + 18u, rust_write_suffix,
+                        sizeof(rust_write_suffix)))
+    {
+        /* eight-byte write input: [rsp-8, rsp) -> [rsp-16, rsp-8) */
+        bytes[write_start + 4u] = 0xf0;
+    }
+}
+
+static void lpr_apply_site(uint8_t *bytes, uint64_t size, uint64_t candidate,
+                           lpr_patch_scan_result_t *result)
+{
+    lpr_relocate_known_call_red_zone_input(bytes, size, candidate);
+    bytes[candidate] = LPR_ZPOLINE_PATCH_TO0;
+    bytes[candidate + 1u] = LPR_ZPOLINE_PATCH_TO1;
+    result->patched_sites++;
+}
+
 /* Build a complete plan before changing bytes. This keeps a decode failure or
  * ambiguous candidate transactional even though LPR has no allocator. The
  * small plan covers normal Linux images; larger inputs use a verified second
@@ -353,9 +424,7 @@ static void lpr_apply_plan(uint8_t *bytes, uint64_t size,
         const uint64_t candidate = lpr_find_raw_candidate(bytes, size, search);
         if (candidate == UINT64_MAX) return;
         if (lpr_plan_get(plan, candidate_index)) {
-            bytes[candidate] = LPR_ZPOLINE_PATCH_TO0;
-            bytes[candidate + 1u] = LPR_ZPOLINE_PATCH_TO1;
-            result->patched_sites++;
+            lpr_apply_site(bytes, size, candidate, result);
         }
         candidate_index++;
         search = candidate + 2u;
@@ -377,9 +446,7 @@ static int lpr_apply_local_second_pass(const ZydisDecoder *decoder,
             lpr_site_has_decodable_successor(
                 decoder, bytes, size, candidate, 0))
         {
-            bytes[candidate] = LPR_ZPOLINE_PATCH_TO0;
-            bytes[candidate + 1u] = LPR_ZPOLINE_PATCH_TO1;
-            result->patched_sites++;
+            lpr_apply_site(bytes, size, candidate, result);
         }
         search = candidate + 2u;
     }
@@ -395,9 +462,7 @@ static int lpr_apply_full_second_pass(const ZydisDecoder *decoder,
         const int decoded = lpr_decode(decoder, bytes, size, pos, &instruction);
         if (decoded <= 0) return -1;
         if (pending_opcode != UINT64_MAX) {
-            bytes[pending_opcode] = LPR_ZPOLINE_PATCH_TO0;
-            bytes[pending_opcode + 1u] = LPR_ZPOLINE_PATCH_TO1;
-            result->patched_sites++;
+            lpr_apply_site(bytes, size, pending_opcode, result);
             pending_opcode = UINT64_MAX;
         }
         const uint64_t end = pos + (uint64_t)decoded;
