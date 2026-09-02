@@ -265,8 +265,9 @@ device adapter             -> MMIO / DMA / IRQ / reset / revoke
 - PachaOS の syscall number / FD / VMO を書けるのは PachaOS リポジトリ内の
   kobox2 port / role 実装だけ
 - `test` host port でも同じ loader と core / subsystem `.so` 群を build / test する
-- protocol と host contract は別に version を持ち、PachaOS ABI version と
-  同一視しない
+- controller API、host contract、transport、protocol は一つの番号なし `dev` interface
+  とし、明示的な freeze まで ABI 番号を割り当てない
+- 全 component は一致する source revision と schema digest を使う
 
 PachaOS port はまず既存の process / thread / VMO / IPC / capsule capability で
 実装します。既存 mechanism で満たせないことが実測で確定するまでは kernel を
@@ -389,8 +390,9 @@ kobox2 リポジトリの `docs/ring-transport-jp.md` が所有します。
 
 shared-memory capability には generation 内で一意な 64-bit transport-address 区間を
 割り当て、descriptor の `addr` / `len` は登録区間と access right で検証します。
-message envelope は protocol ID / version、opcode、flags、generation、correlation ID、
-payload length を持ちます。
+message envelope は protocol ID、`dev` ABI identity、opcode、flags、generation、
+correlation ID、payload length を持ちます。channel descriptor の schema digest が
+一致しない peer とは channel を確立しません。
 
 control、GPU、block、filesystem、network は同じ transport を使い、別 protocol ID と
 schema を持ちます。各 subsystem は queue 構成、resource 所有、ordering、completion、
@@ -669,7 +671,7 @@ wraparound、fault、generation rollover の test が通ること。
 - PachaOS `gpud` service bridge、sandbox DRM boundary、Mesa / libdrm boundary を決める
 
 **gate:** GPU の全 message、所有権、ordering、failure、generation transition が仕様で
-閉じ、VirGL と AMDGPU profile を同じ protocol major で表現できること。
+閉じ、VirGL と AMDGPU profile を同じ `dev` GPU schema で表現できること。
 
 ### Phase 4 — `gpud` で virtio-gpu / VirGL を動かす
 
@@ -690,7 +692,7 @@ restart 後の旧 fence / completion が新 generation から分離されるこ�
 - BAR、doorbell、DMA mapping、IRQ、reset capability を GPU generation に束縛する
 
 **gate:** RX 9060 XT で render、display、IRQ、GPU reset、sandbox restart が反復し、
-Phase 3 の GPU protocol major と resource ownership を維持すること。
+Phase 3 の `dev` GPU schema と resource ownership を維持すること。
 
 ### Phase 6 — storage protocol と subsystem 単位を固定する
 
