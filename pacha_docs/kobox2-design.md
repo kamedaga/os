@@ -1,6 +1,6 @@
 # kobox2 の設計思想
 
-> **状態:** 設計検討中。実装は未着手。仮称 `kobox2`。
+> **状態:** repository bootstrap と基本設計が完了。実装は未着手。
 > 全体の判断基準は [PachaOS の設計思想](./architecture.md) を参照すること。
 > 本文書は既存の [filed VFS design](./filed-vfs-design.md) の記述と一部衝突する。
 > §14 に整理した。
@@ -16,9 +16,9 @@ kobox2 は、**Linux の binary `.ko` を sandbox userland で動かすための
 
 kobox2 の**非 GPL controller 側**は Linux のことを知りません。Linux の
 構造体も、意味論も、バージョンも持ちません。それらと `.ko` の loader は、
-別リポジトリ・GPLv2 で管理される **Linux sandbox 側**にあります。
-controller が持つのは、sandbox process の生成と監督、起動 manifest の検証、
-そして意図的に狭められた channel の確立だけです。
+別リポジトリ・GPL-2.0-only で管理される **Linux sandbox 側**にあります。
+controller が持つのは起動 manifest の検証、lifecycle / generation の状態管理、
+channel 構成、host port が実行する action の生成だけです。
 
 ### 何でないか
 
@@ -66,12 +66,15 @@ kobox2 が正当化されるのは、次の三点です。
 
 ### 3.1 非 GPL 側は小さい controller である
 
-kobox2 の非 GPL controller の責務は次に限定します。
+kobox2 controller は、PachaOS の `gpud` など host service が利用する
+host 非依存の C11 library です。内部 thread と I/O を持たない決定論的な
+state machine とし、host port が実行する action を返します。責務は次に限定します。
 
 - module image の hash / size、opaque profile、capability set の検証と起動指示
-- sandbox process の生成・監督・再起動
-- ring buffer channel の確立と権限付与
-- resource admission policy (どの capability と上限を渡すか) の保持
+- sandbox lifecycle、generation、fault、停止、再起動の状態管理
+- Virtio split-ring channel の構成と権限付与
+- process 生成、resource transfer、停止を表す host action の生成
+- host が承認した capability set と上限の照合
 
 subsystem `.so` の ELF load / dynamic symbol 解決と、`.ko` の ELF parse、再配置、
 依存解決、Linux symbol 解決、`init_module` / `cleanup_module` 呼び出しは
@@ -84,6 +87,9 @@ controller が**持たないもの**: Linux の構造体定義、Linux の意味
 filesystem/block/net の知識、カーネルバージョン依存の値、再配置処理。
 Linux feature の `refused` / `unimplemented` manifest は GPL sandbox 側が所有し、
 controller はその profile ID と hash を opaque な値として扱います。
+
+再起動回数、backoff、fallback は host service が policy として決定し、controller は
+指定された遷移と generation 更新を実行します。
 
 これは方針ではなく機構で保証します。非 GPL controller は Linux header を
 include できません (§3.3)。
@@ -146,14 +152,15 @@ Linux sandbox リポジトリを GPLv2 にする決定は、ライセンス衛�
 | 論理は上流のまま、土台呼び出しのみ差し替え | **移植** | `fs/buffer.c`, `mm/filemap.c`, `fs/libfs.c` |
 | 土台そのもの | **書く** | thread, lock, allocator, time, RCU, per-CPU |
 
-さらに、Linux sandbox リポジトリは pin した upstream Linux の point release
-を基点にした fork とし、**上流のディレクトリ構成をそのまま使います**。
+`linux-sandbox` リポジトリは pin した upstream Linux point release の完全な
+source snapshot とし、**上流のディレクトリ構成をそのまま使います**。基準 tag、
+peeled commit、config、toolchain を manifest に固定します。
 `mm/filemap.c` を使うなら配置先も `mm/filemap.c`、`lib/xarray.c` なら
 `lib/xarray.c` です。選んだファイルを `src/linux_compat/` のような独自分類へ
 コピーし直しません。
 
 ```text
-kobox-linux/                 # GPLv2、pin した Linux source tree が基準
+linux-sandbox/               # GPL-2.0-only、pin した Linux source tree が基準
   COPYING
   Kconfig / Makefile
   block/ crypto/ drivers/ fs/ include/ kernel/ lib/ mm/ ...
@@ -169,7 +176,7 @@ kobox-linux/                 # GPLv2、pin した Linux source tree が基準
 patch として管理します。`kobox/` は OS 境界や loader のように上流 Linux に
 対応する置き場所がないコードだけに使います。これで 4 つ得られます。
 
-- 何をそのまま流用し、何を変更したかが upstream tag との差分で機械的に出る
+- 何をそのまま流用し、何を変更したかが基準 snapshot との差分で機械的に出る
 - source / config / header / `.ko` の組を一つの tree で固定できる
 - ファイルが肥大しない (上流の当該ファイルが事実上の行数上限になる)
 - 派生物を派生物として、GPL リポジトリに、同じ構造で置くという正直な姿勢
@@ -197,12 +204,13 @@ subsystem 境界に沿って `.so` 化します。そのため netd-kobox が使
 保つことを優先します。
 
 target profile は必要な `.so` と `.ko` だけを manifest に列挙し、sandbox はそれだけを
-ロードします。filed-kobox の NVMe 段階なら core/primitive / device-pci / blk 系 `.so` と
+ロードします。`gpud` の VirGL 段階なら core/primitive / device-pci / virtio / drm 系
+`.so` と `virtio-gpu.ko` の dependency closure、AMDGPU 段階なら core/primitive / device-pci /
+drm 系 `.so` と AMDGPU の dependency closure を使います。filed-kobox の NVMe 段階なら
+core/primitive / device-pci / blk 系 `.so` と
 `nvme-core.ko` / `nvme.ko`、ext4 まで載せる段階で初めて fs `.so` と `jbd2.ko` /
 `mbcache.ko` / `crc16.ko` / `ext4.ko` を追加します。netd-kobox なら
 core/primitive / device-pci / net 系 `.so` と対象 NIC driver `.ko` だけです。
-gpud-kobox なら core/primitive / device-pci / drm 系 `.so` と AMDGPU の dependency
-closure だけをロードします。
 
 Linux core `.so` は全 Linux kernel ではありません。選択した module 群が要求する
 core symbol の実装だけを含み、syscall ABI、全 driver、未選択 subsystem は載せません。
@@ -243,7 +251,7 @@ device adapter             -> MMIO / DMA / IRQ / reset / revoke
 
 1. **host contract** — sandbox process 内の C ABI。native thread、memory、time、
    wait/wake、log と、必要な場合だけ device capability を facet ごとに渡す。
-2. **wire protocol** — controller、filed2、sandbox 間の process 境界。固定幅整数と
+2. **wire protocol** — controller、host service、sandbox 間の process 境界。固定幅整数と
    opaque ID だけを使い、pointer、PachaOS FD 番号、kernel object layout を
    wire に載せない。capability の実転送方法は port が持つ。
 
@@ -253,9 +261,9 @@ device adapter             -> MMIO / DMA / IRQ / reset / revoke
 
 依存規則は CI で固定します。
 
-- `kobox` と `kobox-linux` に PachaOS header / syscall wrapper を置かない
+- `kobox2` と `linux-sandbox` に PachaOS header / syscall wrapper を置かない
 - PachaOS の syscall number / FD / VMO を書けるのは PachaOS リポジトリ内の
-  kobox port / role 実装だけ
+  kobox2 port / role 実装だけ
 - `test` host port でも同じ loader と core / subsystem `.so` 群を build / test する
 - protocol と host contract は別に version を持ち、PachaOS ABI version と
   同一視しない
@@ -266,13 +274,15 @@ PachaOS port はまず既存の process / thread / VMO / IPC / capsule capabilit
 所有します。将来のマイクロカーネルも自身のリポジトリに port を実装し、Linux
 source と controller state machine を変更せず通ることを移植完了条件にします。
 
-### 3.7 role ごとに kobox instance を作る
+### 3.7 role ごとに kobox2 instance を作る
 
-`kobox` と `kobox-linux` は mechanism、protocol、再利用可能な `.so` / loader を
+`kobox2` と `linux-sandbox` は mechanism、protocol、再利用可能な `.so` / loader を
 提供します。`filed` や `netd` という PachaOS service の知識は持ちません。
 
 PachaOS リポジトリが role ごとの構成を所有します。
 
+- **gpud** — GPU capability、GPU protocol、core / virtio / device-pci / drm `.so`、
+  virtio-gpu または AMDGPU stack の `.ko`
 - **filed-kobox** — storage device capability、filed protocol、core / device-pci /
   blk / fs `.so`、NVMe / ext4 stack の `.ko`
 - **netd-kobox** — network device capability、netd protocol、core / device-pci /
@@ -325,142 +335,87 @@ architecture.md への追記を要するため、**本文書の一存では確�
 
 ### 4.3 配置
 
-以下は **PachaOS の filed-kobox 配置**です。service、role controller、sandbox
-という関係は共通ですが、process 作成や capability 移送の方法は host port が
-持ちます。
+最初の実装は PachaOS の `gpud` と GPU sandbox です。kobox2 controller は
+`gpud` が link する library であり、service data plane と controller state は
+同じ process 内で別 component として存在します。
 
 ```text
-filed2 プロセス
-  namespace / vnode / OFD / path policy / exec policy
+Mesa / Xorg / Xfce
         │
-        │  ring buffer  (データパス。kobox2 は介在しない)
-        │
-        ├──────────────────────────┐
-        │                          │
-   filed-kobox controller プロセス  │
-     監督 / role manifest 検証 / resource policy
-     (control plane のみ)          │
-        │  ring buffer             │
-        │  (control)               │
-        ↓                          ↓
-   filed-kobox sandbox プロセス  (専用 IOMMU domain)
+        v
+gpud process
+  GPU service bridge ───── role data virtqueue ─────┐
+  kobox2 controller ─── management virtqueue ───────┤
+                                                    v
+GPU sandbox process  (専用 restart / IOMMU domain)
      - .so / .ko self-loader
      - Linux core/primitive .so (kernel/mm/lib の共通機構)
-     - device-pci subsystem .so (device model, PCI, DMA API, IRQ glue, ...)
-     - blk subsystem .so       → nvme-core.ko / nvme.ko
-     - fs subsystem .so        → jbd2.ko / mbcache.ko / crc16.ko / ext4.ko
+     - device-pci / virtio / drm subsystem .so → virtio-gpu.ko
+     - device-pci / drm subsystem .so → amdgpu.ko (長期 profile)
 ```
 
-これは最終的な storage profile の図です。Phase 4 の NVMe profile は fs subsystem
-`.so` と ext4 stack をロードせず、Phase 5 で初めて下段を追加します。
-
-netd-kobox も同じ型ですが、別 instance です。
-
-```text
-netd ───────────────→ netd-kobox sandbox
-  └─ control ──────→ netd-kobox controller
-
-netd-kobox sandbox:
-  Linux core/primitive .so + device-pci .so + net .so + NIC driver .ko
-```
-
-**controller はデータパスに入りません。** `filed2 → controller → sandbox` の
-直列構成では、I/O 1 往復あたり ring を 4 回横断します。controller は channel を
-確立したら退き、filed2 と sandbox が直接 ring を共有します。
-
-これは性能のためだけではありません。controller を control plane に限定する
-ことが、§3.1 の境界を最も強く担保します。データを見ない
-component は、データの意味を知る必要がないからです。
+storage と network も同じ配置を独立 instance として使います。各 instance は
+controller state、sandbox process、channel、generation、capability、DMA domain、
+restart domain を個別に持ちます。
 
 ### 4.4 所有と authority を分ける
 
-§4.3 の「controller はデータパスに入らない」は、このままでは **規約** です。
-守るのは実装者であり、一度でも「ここだけ kobox2 が中継すれば早い」を通せば
-崩れます。規約は性能圧の下で必ず破れます。
+所有を次の三者へ分けます。
 
-別 OS (形式検証マイクロカーネル) の DMA モデルが、これを不変条件へ変える形
-を示しています。
+- sandbox は device / MMIO / IRQ / DMA mapping と Linux runtime state を所有する
+- host service は client-facing object と role data channel endpoint を所有する
+- kobox2 controller state は management channel、opaque ID、generation、host action を
+  所有する
 
-> Device / MMIO / IRQ / DMA mapping の実所有者は worker sandbox。
-> controller は生成・停止・再割当てを要求する管理 authority だけを持つ。
-
-kobox2 controller に写すと、**sandbox の生死を制御する権限は持つが、sandbox が触る
-メモリやデバイスへの参照は保持できない**。データパスに入らないのではなく、
-**入れない**。capability の型がそれを禁じます。
-
-PachaOS 上での形:
-
-- device FD / DMA mapping FD / ring VMO の所有者は sandbox。controller は
-  それらを自分の FD 表に持たない
-- controller が持つのは「sandbox を作る / 止める / 再生成する」権限のみ
-- filed2 ↔ sandbox の ring は両者が直接共有する。controller は確立を仲介した
-  のち、自分側の参照を落とす
-
-**確立時に一時的に参照を持つのは避けられません。** 条件は「確立完了時点で
-controller 側から到達不能になっていること」であり、これは FD 表を見れば検証
-できます。§3.1 の「小さい controller」を、意図ではなく構造で担保する形です。
+host adapter は channel 確立時の capability transfer を実行し、controller API へは
+opaque resource ID だけを渡します。restart は capability revoke、device reset、
+旧 process 終了、新しい queue memory と generation の割り当て、handshake の順で
+進めます。
 
 ## 5. ring buffer
 
-### 5.1 lock を避ける形
+### 5.1 Virtio split-ring transport
 
-単一の lock-free MPMC ring は、正しく書くのが難しく、書けてもキャッシュ
-ラインで競合します。kobox2 は **スレッド / キューごとの SPSC ペア**
-(submission + completion) を採ります。
+kobox2 transport は **Virtio 1.0 little-endian split virtqueue** を使います。各 channel は
+一つの event virtqueue と一つ以上の request virtqueue を持ち、各 available / used ring
+の producer は一つです。
 
-これは NVMe の SQ/CQ そのものであり、`nvme.ko` と blk-mq が前提とする
-per-CPU hardware queue の形とも一致します。lock-free が自明になり、SMP で
-そのままスケールし、抽象化の継ぎ目が自然になります。
+profile は `VIRTIO_RING_F_INDIRECT_DESC` と `VIRTIO_RING_F_EVENT_IDX`、direct / indirect
+scatter-gather、任意順 completion を最初から含みます。queue size、最大 chain 長、
+最大 outstanding request 数は channel descriptor で固定します。正確な wire 仕様は
+kobox2 リポジトリの `docs/ring-transport-jp.md` が所有します。
 
-### 5.2 意図的に狭める
+### 5.2 address と subsystem protocol
 
-二つの interface を混同しません。
+shared-memory capability には generation 内で一意な 64-bit transport-address 区間を
+割り当て、descriptor の `addr` / `len` は登録区間と access right で検証します。
+message envelope は protocol ID / version、opcode、flags、generation、correlation ID、
+payload length を持ちます。
 
-- sandbox **内**の host contract は、facet ごとの関数ポインタ構造体に
-  閉じ込め、それを超える OS 依存がコンパイルエラーになる形にする
-- process **間**の ring は pointer や関数ポインタを一切含まない wire format
-  とし、operation、request ID、generation、offset、length、flags だけを持つ
+control、GPU、block、filesystem、network は同じ transport を使い、別 protocol ID と
+schema を持ちます。各 subsystem は queue 構成、resource 所有、ordering、completion、
+timeout、reset、error、上限を仕様として確定してから実装します。
 
-LKL の `lkl_host_operations` (~30 コールバック) は前者の形が成立することの
-実証ですが、後者を同じ vtable に押し込む根拠にはしません。wire operation は
-filed / block / control の意味ごとに分け、万能な `request(void *)` を作りません。
+### 5.3 generation lifecycle
 
-### 5.3 共有メモリ基盤は既にある
+各 sandbox generation へ新しい virtqueue memory、channel ID、transport-address
+registration、notification endpoint を割り当てます。`EVENT_IDX` が notification
+suppression を制御し、ring index を進捗状態の正本とします。descriptor 違反は channel を
+`FAULTED` へ移し、control fault として報告します。
 
-「ring buffer 文化が PachaOS にない」は、見かけより安く済むはずです。
-
-- 先行実装: `userland/drmd/src/virtio_gpu_unref_bridge.c` と kvm 層の vring
-  処理。**virtqueue は lock-free ring そのもの**です。
-- 基盤: DMA 修理 Phase 1 で導入した「作成時から連続な VMO + `mmap(SHARED)`
-  の eager PTE install」が、プロセス間 ring が必要とするものの正体です。
-
-virtio の descriptor / avail / used 分割は、仕様が公開され意味論が枯れて
-います。**独自 ring を設計する前に、これを土台にできないか検討すること。**
-
-### 5.4 ring と device queue を混同しない
-
-「ring は DMA 対象にしない」という規則は、**sandbox 間 IPC の ring にしか
-適用できません**。
-
-blk subsystem に `nvme.ko` を載せた時点で、NVMe の SQ/CQ は本質的に DMA
-対象になります (コントローラが SQ を読み、CQ を書く)。実 virtio デバイスの
-descriptor / avail / used ring も同じです。
+### 5.4 IPC virtqueue と device queue
 
 | | 用途 | DMA | 保護 |
 |---|---|---|---|
-| **IPC ring** | filed2 ↔ sandbox、kobox2 ↔ sandbox | させない | 共有 VMO のみ。device から到達不能 |
-| **device queue** | sandbox ↔ NVMe / virtio HW | 必須 | IOMMU domain + device 世代検査 (§11-4) |
-
-同じ「ring」という語で両方を指すと、規則が静かに破れます。**本文書および
-実装では、device queue を ring と呼ばないこと。**
+| **IPC virtqueue** | host service / kobox2 ↔ sandbox | なし | shared VMO + generation |
+| **device queue** | sandbox ↔ NVMe / virtio HW | 必須 | IOMMU domain + device 世代検査 (§11) |
 
 ## 6. 境界の実測
 
-この節の既存値は ext4 profile の測定であり、実装順を意味しません。Phase 0 では
-先に同じ source / config から `nvme-core.ko` / `nvme.ko` の undefined symbol closure
-を再生成し、core/primitive / device-pci / blk subsystem `.so` へ割り当てます。その
-profile が fs subsystem `.so` を要求しないことを最初の境界検査にします。
-ext4 の以下の測定は Phase 5 で使用します。
+この節の既存値は ext4 profile の測定であり、実装順を意味しません。最初の境界検査は
+fixture `.so` / `.ko`、実 device target は virtio-gpu / VirGL、AMDGPU、ext4 の順です。
+ext4 に着手する段階で、同じ source / config から土台となる NVMe と ext4 の dependency
+closure を再生成します。
 
 `ext4.ko` の未定義シンボルが、境界の定義そのものです。**615 個**。
 
@@ -543,16 +498,16 @@ writeback 状態、`folio->private` の buffer_head。ここが本物なら、�
 
 | リポジトリ | ライセンス | 中身 |
 |---|---|---|
-| kobox | 現行のまま | controller、OS 非依存 protocol、startup manifest schema、controller port interface |
-| kobox-linux (新規・完全分離) | **GPLv2** | pin した Linux source fork、Linux core `.so`、device-pci / blk / fs / net 等の非 driver subsystem `.so`、Linux feature manifest、`.so` / `.ko` self-loader、OS 非依存 sandbox host contract |
-| PachaOS (本リポジトリ) | 現行のまま | PachaOS controller/sandbox ports、filed-kobox、netd-kobox 等の role manifest / service bridge / packaging |
+| kobox2 | **Apache-2.0** (`protocol/` は **MIT**) | controller、transport / subsystem protocol、startup schema、controller port interface |
+| linux-sandbox (kobox2 submodule) | **GPL-2.0-only** | Linux v6.18.48 source snapshot、core / subsystem `.so`、feature manifest、`.so` / `.ko` self-loader、sandbox host contract |
+| PachaOS (本リポジトリ) | **MIT** | `gpud`、PachaOS port、role manifest、service bridge、packaging |
 
 - **commit #1 から** GPLv2 + SPDX ヘッダを入れること。後から遡って付けるのは、
   他者のコミットが入った瞬間に困難になります。
 - **ワイヤプロトコル仕様は非 GPL 側**に置き、両者がそれを実装する形にします。
 - Linux source の license / copyright / `COPYING` は upstream のまま保持し、
-  基準 tag と kobox patch の対応を機械的に出せるようにします。
-- `filed-kobox` / `netd-kobox` の source と設定を `kobox` / `kobox-linux` へ
+  基準 snapshot と独自 patch の対応を機械的に出せるようにします。
+- `gpud` / `filed-kobox` / `netd-kobox` の source と設定を `kobox2` / `linux-sandbox` へ
   逆流させない。これらは PachaOS の service / capability 構成だからです。
 - プロセス分離と、文書化された IPC プロトコルという構造が、分離を主張する
   上で最も強い形です。
@@ -640,18 +595,13 @@ profile の制限性) が kobox2 固有の領域です。
 
 ### 最初のターゲット
 
-最終 target は `filed2 + nvme + ext4` ですが、実装順は **NVMe → ext4** です。
-Linux ext4 が使う block device は Linux の NVMe driver / block layer の上にあるため、
-先に `nvme-core.ko` / `nvme.ko` と blk subsystem `.so` を成立させます。NVMe の
-ほうが page cache、buffer_head、writeback、jbd2 を要求しないため、最初の実 module
-target としても小さい。そこで得た block device の上に、fs subsystem `.so` と
-ext4 stack を追加します。
+最初の conformance target は `fixture_core.so`、`fixture_provider.ko`、
+`fixture_consumer.ko` です。controller、Virtio split-ring、self-loader、`.ko` 間依存、
+native-thread SMP、crash / restart を一つの恒久 fixture で固定します。
 
-ext4 は source があり、native Linux を正しさの oracle にできるため、kobox2 の
-`.so` / `.ko` 分割、SMP、隔離を検証する最初の filesystem 題材に向いています。
-その先の具体的な driver target の一つを AMDGPU とし、手元の RX 9060 XT を
-実機 oracle にします。ただし filed-kobox の完了条件へ GPU を混ぜず、別 role
-profile として依存 closure、firmware、DMA/IRQ/reset 境界を測定します。
+実 device target は **virtio-gpu + VirGL → RX 9060 XT の AMDGPU → ext4** の順です。
+VirGL と AMDGPU は、PachaOS の `gpud`、Mesa、Xorg、Xfce から同じ GPU protocol を
+通して利用します。ext4 の block device は先行する NVMe phase で成立させます。
 
 ## 11. 未決事項
 
@@ -661,169 +611,133 @@ module と `.artifacts/ext4-u.names` は移行前の調査資料に留め、kobo
 
 | # | 項目 | なぜ先に決めるべきか |
 |---|---|---|
-| 2 | **ring の wire format** | §5.3。virtio の queue layout を流用するか、用途別の小さい SPSC format を定義するか。pointer-free、generation 付き、IPC ring と device queue を別型にする条件は確定済み |
-| 3 | **host contract の最小 operation 集合** | thread / VM / wait / time / log と device facet の正確な切り方。v1 の巨大 backend API を名前だけ変えて持ち込まないため、最初の module と PachaOS 既存 capability の両方から operation を導く必要がある |
-| 4 | **sandbox 再起動時の handle 復元 (と device 世代)** | §4.1。filed2 が vnode/OFD を inode 番号から再解決する設計が必要。加えて再起動前の DMA・completion・IRQ を新世代が受理してはならない。まず PachaOS の reset / revoke / IOMMU teardown を userland から実測し、既存 mechanism で保証できないと証明された場合だけ kernel ABI 案を作る。kernel 編集は別途許可を得るまで行わない |
-| 5 | **ベンダ binary `.ko` の現実的射程** | §9.1 の config 制約。長期目標が実際にどこまで届くかの見積もり |
+| 1 | **host contract の operation 集合** | thread / VM / wait / time / log と device facet を fixture と PachaOS capability の両方から確定する |
+| 2 | **GPU subsystem protocol** | resource、context、submission、fence、event、reset、error、上限を VirGL 実装前に確定する |
+| 3 | **filed handle 復元** | sandbox restart 後に vnode/OFD を inode 番号から再解決する規則を storage 実装前に確定する |
+| 4 | **ベンダ binary `.ko` の射程** | source / config / firmware の組と RX 9060 XT で実測する |
 
 core / subsystem `.so` と `.ko` をロードする主体は未決事項ではありません。§3.1 の
 とおり、GPL sandbox 側の self-loader に確定します。
+ring transport も §5 の Virtio 1.0 split virtqueue に確定しています。
 
 ## 12. 実装計画
 
 phase は機能数ではなく、**境界を一つずつ実証する順序**で進めます。後続 phase
 の都合で前段の境界を崩した場合は、機能が動いていても完了とはしません。
 
-### Phase 0 — 基準 tree と測定値を固定する
+### Phase 0 — repository と基準 tree を固定する
 
-- upstream stable の v6.18.48
-  (`5bbb9c9f8f808710e2123f2b30f0d61d7d698f52`) と kobox2 最小 config を
-  build manifest に固定する
-- その tag を基点に `kobox-linux` GPLv2 repository を作り、Linux tree の
-  directory 構成と履歴を保持する
-- 同じ source + config から `nvme-core.ko` / `nvme.ko` と、ext4 / jbd2 / mbcache /
-  crc16 を build する
-- Linux core `.so` と device-pci / blk / fs subsystem `.so` ごとに source manifest を
-  `kobox-linux` 側で作る
-- PachaOS 側に filed-kobox の `nvme` profile と `nvme+ext4` profile を置き、それぞれの
-  undefined symbol / dependency closure を再生成する
-- v1 の probe image、symbol scanner、`e2fsck` oracle を変更せず再実行できる
-  test data として取り込む
+- Apache-2.0 の `kobox2` と GPL-2.0-only の `linux-sandbox` を作り、後者を
+  submodule にする
+- Linux v6.18.48 (`5bbb9c9f8f808710e2123f2b30f0d61d7d698f52`) の完全な source
+  snapshot、config、toolchain を build manifest に固定する
+- controller / protocol と Linux runtime の license 境界、coding style、build artifact
+  の配置を CI rule にする
 
-**gate:** source commit、config hash、toolchain、module hash、symbol manifest が
-一つの build manifest から再現でき、各 source file と出力 core / subsystem `.so`
-の対応が追跡できること。全 subsystem を結合した runtime artifact は作らない。
-ここでは PachaOS/kernel を編集しない。
+**gate:** fresh checkout から基準 tree と manifest hash を再現でき、両 repository の
+license と provenance が機械的に検査できること。
 
-### Phase 1 — OS 境界を先に作る
+### Phase 1 — controller と transport を実装する
 
-- controller state machine、wire schema、sandbox host contract を header と文書で
+- controller state machine、launch spec、generation、host action、control protocol を
+  C11 API と schema に固定する
+- §5 の Virtio split-ring、transport address、validation、notification を実装する
+- sandbox host contract と `test` / PachaOS port interface を同時に定義する
+- PachaOS dependency、wire pointer / FD、license 越境を CI で検査する
+
+**gate:** Clang / GCC と sanitizer で全 state transition、malformed descriptor、queue
+wraparound、fault、generation rollover の test が通ること。
+
+### Phase 2 — 恒久 conformance fixture を通す
+
+- `fixture_core.so`、`fixture_provider.ko`、`fixture_consumer.ko` を同じ Linux source /
+  config から build する
+- x86_64 Linux v6.18.48 module ABI の relocation、symbol、dependency、init / cleanup を
+  sandbox self-loader で処理する
+- consumer module が provider symbol、allocation、lock、wait/wake、二本以上の native
+  thread を使い、決定的な結果を control virtqueue へ返す
+- crash / restart ごとに queue memory と generation を更新する
+
+**gate:** load、並行実行、逆順 unload、fault、反復 restart、stale completion 拒否が
+一つの fixture で再現され、manifest の symbol closure が実 export と一致すること。
+
+### Phase 3 — GPU subsystem 仕様を固定する
+
+- GPU protocol の resource、context、submission、fence、event、reset、error、limit と
+  queue topology を schema と test vector にする
+- virtio-gpu / VirGL と AMDGPU を同じ device 非依存 protocol へ対応付ける
+- PachaOS `gpud` service bridge、sandbox DRM boundary、Mesa / libdrm boundary を決める
+
+**gate:** GPU の全 message、所有権、ordering、failure、generation transition が仕様で
+閉じ、VirGL と AMDGPU profile を同じ protocol major で表現できること。
+
+### Phase 4 — `gpud` で virtio-gpu / VirGL を動かす
+
+- `gpud` を PachaOS の新規 service として作り、既存 `drmd` は開発対象から外す
+- Linux core / device-pci / virtio / drm `.so` と `virtio-gpu.ko` の dependency closure を
+  profile に固定し、GPU protocol へ接続する
+- Mesa、Xorg、Xfce の render path と sandbox crash / restart を検証する
+
+**gate:** `SUBMIT_3D > 0`、`TRANSFER_TO_HOST_2D == 0`、renderer が VirGL であり、
+restart 後の旧 fence / completion が新 generation から分離されること。
+
+### Phase 5 — 同じ GPU protocol で AMDGPU を動かす
+
+- device-pci / drm `.so`、AMDGPU dependency closure、linux-firmware、Mesa、libdrm の
+  revision と hash を profile に固定する
+- PCI probe、firmware、VRAM / GTT、ring / fence、IRQ、reset、KMS、render を GPU
+  protocol へ接続する
+- BAR、doorbell、DMA mapping、IRQ、reset capability を GPU generation に束縛する
+
+**gate:** RX 9060 XT で render、display、IRQ、GPU reset、sandbox restart が反復し、
+Phase 3 の GPU protocol major と resource ownership を維持すること。
+
+### Phase 6 — storage protocol と subsystem 単位を固定する
+
+- block / filesystem protocol の request、completion、buffer ownership、flush、cancel、
+  timeout、restart、handle recovery を schema と test vector にする
+- core/primitive、device-pci、blk、fs `.so` の source manifest と dependency boundary を
   固定する
-- `kobox-linux` の `test` host port と、PachaOS リポジトリの controller / sandbox
-  port skeleton を同時に build する
-- PachaOS include が `kobox` / `kobox-linux` へ逆流しない fence、wire の pointer/FD
-  混入検査、upstream tag との差分 report を CI に入れる
-- role manifest と service bridge は PachaOS 側だけに置き、filed/netd 名を generic
-  repository に入れない
-- startup resource は path で探さず、manifest に列挙した opaque resource slot と
-  capability transfer だけで受け取る
+- xarray / page cache / writeback は core、VFS / buffer_head は fs に配置し、SMP と
+  generated feature manifest を全 profile に適用する
 
-**gate:** controller、loader、core/subsystem `.so` の generic source に PachaOS header
-がなく、同じ protocol test vector が `test` port と PachaOS port の両方を通ること。
+**gate:** NVMe profile と NVMe + ext4 profile の `.so` / `.ko` closure が独立して再現し、
+silent stub がゼロであること。
 
-### Phase 2 — filed-kobox bootstrap と self-loader
+### Phase 7 — filed-kobox で NVMe を動かす
 
-- PachaOS の既存 process / thread / VMO / IPC を使い、PachaOS リポジトリの
-  filed-kobox controller から filed-kobox sandbox を起動する
-- core / subsystem `.so`、module image、resource capability を渡し、sandbox 内
-  loader が `.so` と `.ko` の relocation / symbol closure / init order を解決する
-- 最小 Linux core `.so` + fixture `.ko` で load / init / unload / crash / restart を
-  固定する
-- 最初から 2 本以上の native execution thread で起動し、host contract の
-  lock、wait/wake、timer、thread-local CPU ID の concurrency test を通す
+- core / device-pci / blk `.so` と `nvme-core.ko` / `nvme.ko` を profile に固定する
+- MMIO、DMA、IRQ、reset、revoke を device host facet へ接続する
+- scratch namespace で identify、read、write、flush、timeout、reset、reload を検証する
 
-**gate:** cross-process memory write、固定 FD 番号、controller 内 Linux symbol table
-なしで、manifest に列挙した `.so` と fixture `.ko` だけが反復起動できること。
-この phase では raw device / DMA を渡さない。
+**gate:** 実 NVMe I/O、IOMMU isolation、device reset、sandbox restart が通り、旧
+generation の IRQ / DMA completion / block handle が新 generation から分離されること。
 
-### Phase 3 — subsystem `.so` の単位を成立させる
+### Phase 8 — NVMe 上に ext4 を載せる
 
-- `kernel/` / `mm/` / `lib/` から選んだ core 実装を、一つの Linux core/primitive
-  `.so` として build する。mm / scheduler / RCU 等を別 `.so` へ分けない
-- device model / PCI core / DMA API / IRQ glue を device-pci subsystem `.so` として
-  別 build する
-- bio / request / blk-mq / block device core を blk subsystem `.so` として別 build
-  し、Linux core `.so` への依存を manifest に明記する
-- VFS / buffer_head / filesystem core は fs subsystem `.so` に置く。xarray / page
-  cache / writeback 等の `mm/` / `lib/` core 実装は Linux core `.so` に置く
-- host 接続は `kobox/host/` に置き、各 subsystem `.so` が OS API を直接呼ばない
-- Linux の spinlock、workqueue、kthread、RCU を 2 CPU 以上で最初から有効にする
-- `implemented` / `refused` / `unimplemented` manifest と生成 stub を symbol 単位で
-  CI 検査する
+- fs `.so` と `jbd2.ko` / `mbcache.ko` / `crc16.ko` / `ext4.ko` を NVMe profile へ加える
+- mount、read、write、fsync、unmount、journal replay、handle recovery を検証する
+- native Linux と operation result、metadata、block、`dumpe2fs`、`e2fsck` を比較する
 
-**gate:** core `.so` だけ、NVMe 用の core + device-pci + blk `.so`、ext4 用の core +
-device-pci + blk + fs `.so` を別々に link/load 検査でき、NVMe profile が fs
-subsystem `.so` をロードしないこと。上流無変更 file、patch file、kobox 固有 file を
-区別でき、silent stub が 0、SMP stress が安定して通ること。
+**gate:** crash checkpoint ごとに image と journal が整合し、restart 後の inode /
+block handle が generation 規則に従って復元されること。
 
-### Phase 4 — filed-kobox で NVMe driver を先に動かす
+### Phase 9 — role 分離を実証する
 
-- Linux core / device-pci / blk subsystem `.so` と `nvme-core.ko` / `nvme.ko` だけを
-  target profile に入れる。fs subsystem `.so` と ext4 stack は載せない
-- MMIO / DMA / IRQ / reset / revoke を device host facet として追加し、device と DMA
-  mapping は sandbox に直接所有させる
-- Linux NVMe driver が登録した block device に対して、scratch namespace の identify、
-  read、write、flush、timeout、reset、unload / reload を検証する
-- sandbox generation を DMA mapping、IRQ、completion、block device handle に伝播し、
-  restart 前の event を拒否する
+- GPU、storage、network を別 controller instance、sandbox、capability、DMA domain、
+  generation、restart domain として構成する
+- net profile は core / device-pci / net `.so` と対象 NIC `.ko` の closure を使う
 
-**gate:** blk profile が fs subsystem をロードせずに実 NVMe I/O を完了し、IOMMU
-domain の外へ DMA できず、controller が device / mapping を保持せず、reset 中の
-delayed completion を新世代が受理しないこと。既存の PachaOS mechanism で満たせない
-場合は、再現結果と最小 ABI 案を提示して許可を得るまで kernel へ進まない。
+**gate:** 各 role の loaded artifact と authority が manifest に一致し、一つの role の
+crash / reset が他 role の state と data path から分離されること。
 
-### Phase 5 — filed-kobox の NVMe 上に ext4 を載せる
+### Phase 10 — 第二のマイクロカーネル port
 
-- Phase 4 の profile に fs subsystem `.so` と `jbd2.ko` / `mbcache.ko` / `crc16.ko` /
-  `ext4.ko` を追加し、Linux NVMe driver が登録した block device へ接続する
-- PachaOS block service で NVMe を迂回する経路は integration の成功条件にしない。
-  image-backed provider は fs subsystem 単体 test にだけ使う
-- read-only mount、read、write、fsync、unmount、journal replay の順に通す
-- filed2 の vnode/OFD と sandbox inode handle の対応、sandbox restart 後の再解決を
-  設計・検証する
-- 同一操作列を native Linux と kobox2 に与え、operation result、正規化した
-  metadata / block 差分、`dumpe2fs`、`e2fsck`、crash point ごとの replay 結果を
-  比較する。決定的な fixture では image hash も比較する
+- controller port と sandbox host port を新しい OS の repository に実装する
+- Phase 2 の loader、SMP、`.so` / `.ko`、transport test vector を同じ構成で実行する
 
-**gate:** Linux core `.so` の page cache / writeback と、fs subsystem `.so` の
-buffer_head / VFS、`jbd2.ko` を省略せず、電源断相当の全 checkpoint で NVMe 上の
-image が整合し、sandbox 再起動後に stale filed / inode / block handle を受理しない
-こと。
-
-### Phase 6 — PachaOS 内で role 分離を実証する
-
-- filed-kobox の構成から PachaOS 固有の role template を抽出する。ただし generic
-  kobox repository へ filed/netd の知識を移さない
-- netd-kobox を PachaOS リポジトリに追加し、Linux core `.so`、device-pci / net
-  subsystem `.so`、一つの NIC driver `.ko` だけをロードする
-- filed-kobox と netd-kobox が別 controller / sandbox / capability / DMA domain /
-  generation / restart domain を持つことを検査する
-
-**gate:** netd-kobox が blk / fs `.so` や storage `.ko` をロードせず、filed-kobox が
-net `.so` や NIC `.ko` をロードしないこと。一方の crash / restart / device reset が
-他方の state と data path に影響しないこと。
-
-### Phase 7 — gpud-kobox で RX 9060 XT の AMDGPU driver を動かす
-
-- PachaOS リポジトリに gpud-kobox の controller / sandbox port / role manifest を
-  追加し、Linux core `.so`、device-pci / drm subsystem `.so` と AMDGPU の `.ko`
-  dependency closure だけをロードする
-- v6.18.48 と組にする `linux-firmware` commit、必要 firmware file の hash、license を
-  manifest に固定し、path lookup ではなく起動 resource として sandbox へ渡す
-- 最初に PCI probe、IP discovery、firmware load、VRAM/GTT allocation、ring/fence、
-  interrupt、GPU reset を通し、その後に KMS と render client 境界を追加する
-- BAR / doorbell / VRAM / GTT / DMA mapping / IRQ / reset capability と generation を
-  gpud-kobox 専用にし、filed-kobox / netd-kobox と共有しない
-- 描画を始める段階で Mesa / libdrm も個別の source revision と build manifest に固定し、
-  kernel tag や firmware revision への暗黙依存を禁止する
-
-**gate:** 手元の RX 9060 XT で probe から GPU ring test、IRQ、reset、sandbox
-restart まで反復でき、stale fence / IRQ / DMA completion を新世代が受理しないこと。
-gpud-kobox が blk / fs / net subsystem `.so` をロードせず、他 role の crash / reset が
-GPU state に影響せず、GPU reset が他 role の device domain に影響しないこと。
-
-### Phase 8 — 第二のマイクロカーネル port
-
-- 将来のマイクロカーネルが必要な process / thread / VM / channel / device capability
-  を提供できる段階で、controller port と sandbox host port を追加する
-- Linux source、self-loader、Linux feature manifest、host contract は変更しない。
-  新しい OS の role protocol / packaging は、その OS のリポジトリが所有する。移植で
-  不足が出た場合は、まず port の問題か host contract の漏れかを分類する
-
-**gate:** OS 固有変更が新しい OS 側 repository の port と role packaging に閉じ、
-Phase 2〜5 で使った loader / SMP / `.so` / `.ko` の共通 test vector が通ること。
-共通 loader / subsystem source の変更を要した場合は、PachaOS 固有概念が漏れていた
-設計不具合として記録する。
+**gate:** OS 固有実装が port と role packaging に閉じ、共通 controller、protocol、
+self-loader、subsystem source が同一であること。
 
 ## 13. v1 から継ぐもの・捨てるもの
 
@@ -858,7 +772,7 @@ kobox2 はこれを**反転させます** — process 分離を恒久的な設�
 > 将来、独立再起動や状態復元に意味を持たせられるなら、同じ interface を
 > process 境界として使うこともできます。
 
-§4.1 がこの条件への回答です。ただし未決事項 4 (handle 復元) が閉じるまで、
+§4.1 がこの条件への回答です。ただし未決事項 3 (handle 復元) が閉じるまで、
 条件は完全には満たされていません。
 
 **この二文書の更新は、kobox2 の設計確定後に行うこと。** 本文書が先行して
