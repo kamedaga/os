@@ -79,6 +79,10 @@ static int64_t lpr_ops_event_close(void *state)
     const lpr_event_backend_t *event = state;
     const int was_signalfd =
         event->subtype == LPR_EVENT_BACKEND_SIGNALFD;
+    const int was_inotify =
+        event->subtype == LPR_EVENT_BACKEND_INOTIFY;
+    const uint64_t inotify_mapping = event->counter;
+    const uint64_t inotify_mapping_bytes = event->deadline_ns;
     int64_t status = 0;
     if (event->wait_fd.raw >= 16)
         status = lpr_close_native_fd_if_open(
@@ -92,6 +96,16 @@ static int64_t lpr_ops_event_close(void *state)
         lpr_signalfd_refresh_mask();
         const int64_t mask_status = lpr_linux_sync_native_signal_mask();
         if (status == 0) status = mask_status;
+    }
+    if (was_inotify && inotify_mapping >= 4096u &&
+        inotify_mapping_bytes != 0)
+    {
+        const int64_t map_status = lpr_pacha_status_to_errno(
+            lpr_pacha_syscall2(
+                PACHAOS_SYSCALL_MUNMAP,
+                inotify_mapping,
+                inotify_mapping_bytes));
+        if (status == 0) status = map_status;
     }
     return status;
 }
@@ -230,6 +244,46 @@ int lpr_fd_transfer_prepare(
         item->capability_count = 1;
         capability_fds[0] = lease_fd;
         *out_capability_count = 1;
+        return 0;
+    }
+    if (pin->ops_id == LPR_FD_OPS_TTY) {
+        const lpr_tty_backend_t *tty = pin->state;
+        /* GApplication forwards the invoking process' stdin over
+         * SCM_RIGHTS.  The Xfce session stdin is the console TTY.  PTY
+         * master/slave roles need additional metadata, so keep this transfer
+         * deliberately limited to the role-less console handle. */
+        if (!tty->active || tty->handle == 0 || tty->wait_fd.raw < 16 ||
+            tty->reserved0 != 0)
+            return -LPR_LINUX_EOPNOTSUPP;
+        if (capability_fds == 0 || capability_capacity < 2)
+            return -LPR_LINUX_EMSGSIZE;
+        const int wait_fd =
+            lpr_transfer_duplicate_capability(tty->wait_fd.raw);
+        if (wait_fd < 0) return wait_fd;
+        int lease_fd = -1;
+        int remote_lease_fd = -1;
+        const int pair_status =
+            lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        if (pair_status != 0) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+            return pair_status;
+        }
+        uint64_t handle = 0;
+        const int64_t status = lpr_termd_transfer_dup_handle(
+            tty->handle, remote_lease_fd, &handle);
+        if (status != 0 || handle != tty->handle) {
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)remote_lease_fd);
+            return status != 0 ? (int)status : -LPR_LINUX_EIO;
+        }
+        item->transfer_token = handle;
+        item->fd_flags = tty->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count = 2;
+        capability_fds[0] = wait_fd;
+        capability_fds[1] = lease_fd;
+        *out_capability_count = 2;
         return 0;
     }
     if (pin->ops_id == LPR_FD_OPS_INPUT) {
@@ -421,6 +475,13 @@ int lpr_fd_transfer_import_batch(
                 break;
             }
             handle = (uint32_t)item->transfer_token;
+        } else if (item->provider_id == LPR_FD_OPS_TTY) {
+            if (item->capability_count != 2 ||
+                item_capabilities[0] < 16 || item_capabilities[1] < 16)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
         } else if (item->provider_id == LPR_FD_OPS_INPUT) {
             if (item->capability_count != 2 || item_capabilities[0] < 16 ||
                 item_capabilities[1] < 16)
@@ -472,6 +533,14 @@ int lpr_fd_transfer_import_batch(
             filed->reserved1 = (uint8_t)(item->transfer_token >> 32u);
             filed->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
             filed->lease_fd.raw = item_capabilities[0];
+        } else if (item->provider_id == LPR_FD_OPS_TTY) {
+            lpr_tty_backend_t *tty = states[prepared_count];
+            tty->active = 1;
+            tty->flags = (uint32_t)linux_flags;
+            tty->handle = handle;
+            tty->wait_fd.raw = item_capabilities[0];
+            tty->lease_fd.raw = item_capabilities[1];
+            tty->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
         } else if (item->provider_id == LPR_FD_OPS_INPUT) {
             lpr_input_backend_t *input = states[prepared_count];
             input->active = 1;

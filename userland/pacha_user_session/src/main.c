@@ -232,7 +232,7 @@ int main(void)
         perror("prepare environment");
         return 21;
     }
-    if (pacha_prepare_input_metadata() != 0) {
+    if (pacha_prepare_input_metadata("pacha-user-session") != 0) {
         perror("prepare input metadata");
         return 22;
     }

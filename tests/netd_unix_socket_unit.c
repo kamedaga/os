@@ -85,6 +85,22 @@ static int connect_socket(uint64_t handle, const char *path, int32_t pid)
     return netd_unix_socket_connect(&req);
 }
 
+static int connect_abstract_socket(
+    uint64_t handle,
+    const void *name,
+    uint32_t name_length,
+    int32_t pid)
+{
+    netd_unix_path_t req;
+    memset(&req, 0, sizeof(req));
+    req.handle = handle;
+    req.flags = NETD_UNIX_PATH_ABSTRACT;
+    req.pid = pid;
+    req.reserved0 = name_length;
+    memcpy(req.path, name, name_length);
+    return netd_unix_socket_connect(&req);
+}
+
 static uint64_t accept_socket(uint64_t listener, int32_t expected_pid)
 {
     netd_accept_t req;
@@ -98,12 +114,45 @@ static uint64_t accept_socket(uint64_t listener, int32_t expected_pid)
     return req.accepted_handle;
 }
 
+static netd_unix_name_t socket_name(uint64_t handle, uint32_t peer)
+{
+    netd_unix_name_t name;
+    memset(&name, 0, sizeof(name));
+    name.handle = handle;
+    name.peer = peer;
+    expect(netd_unix_socket_name(&name) == 0, "query Unix socket name");
+    return name;
+}
+
 int main(void)
 {
-    memset(sockets, 0, sizeof(sockets));
+    sockets = NULL;
+    socket_count = 0;
+    notification_head = NULL;
+    notification_tail = NULL;
+    notifications_deferred = 0;
     memset(notifications, 0, sizeof(notifications));
     memset(notification_events, 0, sizeof(notification_events));
     next_handle = 0;
+
+    enum { BURST_SOCKET_COUNT = 384 };
+    uint64_t burst_sockets[BURST_SOCKET_COUNT];
+    size_t burst_opened = 0;
+    memset(burst_sockets, 0, sizeof(burst_sockets));
+    for (; burst_opened < BURST_SOCKET_COUNT; ++burst_opened) {
+        const int status = netd_unix_socket_open(
+            NETD_SOCK_STREAM, 0, 40, &burst_sockets[burst_opened]);
+        expect(status == 0,
+            "open substantially more than 128 Unix sockets");
+        if (status != 0) break;
+    }
+    expect(burst_opened == BURST_SOCKET_COUNT,
+        "Unix socket allocation has no 128-entry EMFILE ceiling");
+    for (size_t i = 0; i < burst_opened; ++i)
+        expect(netd_unix_socket_close(burst_sockets[i]) == 0,
+            "close burst Unix socket");
+    expect(socket_count == 0 && sockets == NULL,
+        "burst Unix sockets release dynamic state and receive buffers");
 
     const uint64_t listener = open_socket(20);
     netd_unix_path_t bind_req;
@@ -116,6 +165,48 @@ int main(void)
         .backlog = 2,
     };
     expect(netd_unix_socket_listen(&listen_req) == 0, "listen backlog two");
+
+    static const uint8_t abstract_name[] = {
+        '/', 't', 'm', 'p', '/', '.', 'I', 'C', 'E', '-', 'u', 'n', 'i', 'x',
+        '/', '6', '\0', 'x',
+    };
+    const uint64_t abstract_listener = open_socket(27);
+    netd_unix_path_t abstract_bind;
+    memset(&abstract_bind, 0, sizeof(abstract_bind));
+    abstract_bind.handle = abstract_listener;
+    abstract_bind.flags = NETD_UNIX_PATH_ABSTRACT;
+    abstract_bind.reserved0 = sizeof(abstract_name);
+    memcpy(abstract_bind.path, abstract_name, sizeof(abstract_name));
+    expect(netd_unix_socket_bind(&abstract_bind) == 0,
+        "bind length-delimited abstract listener");
+    const netd_listen_t abstract_listen = {
+        .handle = abstract_listener,
+        .backlog = 1,
+    };
+    expect(netd_unix_socket_listen(&abstract_listen) == 0,
+        "listen on abstract namespace");
+    const uint64_t abstract_duplicate = open_socket(28);
+    abstract_bind.handle = abstract_duplicate;
+    expect(netd_unix_socket_bind(&abstract_bind) == -98,
+        "duplicate abstract name reports EADDRINUSE");
+    const uint64_t abstract_client = open_socket(29);
+    expect(connect_abstract_socket(
+        abstract_client,
+        abstract_name,
+        sizeof(abstract_name),
+        109) == 0,
+        "connect to abstract name with embedded nul");
+    const uint64_t abstract_server = accept_socket(abstract_listener, 109);
+    expect(abstract_server != 0,
+        "accept abstract namespace client");
+    netd_unix_name_t name = socket_name(abstract_client, 1);
+    expect(name.abstract == 1 && name.length == sizeof(abstract_name) &&
+               memcmp(name.path, abstract_name, sizeof(abstract_name)) == 0,
+           "abstract client reports its peer's length-delimited name");
+    name = socket_name(abstract_server, 0);
+    expect(name.abstract == 1 && name.length == sizeof(abstract_name) &&
+               memcmp(name.path, abstract_name, sizeof(abstract_name)) == 0,
+           "accepted abstract socket inherits listener local name");
 
     const uint64_t client1 = open_socket(21);
     const uint64_t client2 = open_socket(22);
@@ -139,6 +230,20 @@ int main(void)
     const uint64_t server3 = accept_socket(listener, 103);
     expect(server1 != 0 && server2 != 0 && server3 != 0,
         "FIFO accepts all queued peers");
+    name = socket_name(client1, 0);
+    expect(name.abstract == 0 && name.length == 0,
+        "unbound client has unnamed local address");
+    name = socket_name(client1, 1);
+    expect(name.abstract == 0 && name.length == strlen("/sway-ipc.sock") &&
+               memcmp(name.path, "/sway-ipc.sock", name.length) == 0,
+        "client peer name is the listener pathname");
+    name = socket_name(server1, 0);
+    expect(name.abstract == 0 && name.length == strlen("/sway-ipc.sock") &&
+               memcmp(name.path, "/sway-ipc.sock", name.length) == 0,
+        "accepted socket inherits listener local pathname");
+    name = socket_name(server1, 1);
+    expect(name.abstract == 0 && name.length == 0,
+        "accepted socket reports unnamed client peer");
 
     netd_unix_socket_state_t *listener_state = find_socket(listener);
     expect(listener_state != NULL, "find listener state");
@@ -264,10 +369,18 @@ int main(void)
 
     expect(netd_unix_socket_close(client2) == 0, "close empty peer");
     revents = 0;
-    expect(netd_unix_socket_poll(server2, 0, &revents, &error) == 0,
+    expect(netd_unix_socket_poll(
+        server2, NETD_POLLOUT, &revents, &error) == 0,
         "poll closed peer");
     expect((revents & NETD_POLLHUP) != 0,
         "peer close reports HUP without requested event mask");
+    expect((revents & NETD_POLLOUT) == 0,
+        "detached peer is not resolved through a free socket slot");
+    memset(&send_req, 0, sizeof(send_req));
+    send_req.handle = server2;
+    send_req.length = 189;
+    expect(netd_unix_socket_send(&send_req, NULL, 0, &sent) == -107,
+        "send after peer close reports ENOTCONN without touching a free slot");
 
     const uint64_t client4 = open_socket(24);
     expect(connect_socket(client4, "/sway-ipc.sock", 104) == 0,

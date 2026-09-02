@@ -76,6 +76,9 @@ const IpcReplyRef = types.IpcReplyRef;
 const IpcWaitKey = types.IpcWaitKey;
 const IpcWaiter = types.IpcWaiter;
 const ThreadWakeTarget = types.ThreadWakeTarget;
+const IpcReceiverHint = types.IpcReceiverHint;
+const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
+const FdWaitGroupRef = types.FdWaitGroupRef;
 const TaskFdWaiter = types.TaskFdWaiter;
 const max_task_fd_waiters = types.max_task_fd_waiters;
 const max_ipc_object_waiters = types.max_ipc_object_waiters;
@@ -91,6 +94,7 @@ const IpcSendFd = types.IpcSendFd;
 const IpcSendMessage = types.IpcSendMessage;
 const IpcRecvFd = types.IpcRecvFd;
 const IpcRecvResult = types.IpcRecvResult;
+const IpcRecvOutcome = types.IpcRecvOutcome;
 const native_page_size = types.native_page_size;
 const max_native_vmos = types.max_native_vmos;
 const max_vmas_per_process = types.max_vmas_per_process;
@@ -218,6 +222,7 @@ pub fn createIpcEndpoint(self: anytype) KernelError!IpcEndpointRef {
         if (slot.generation == 0) slot.generation = 1;
         slot.active = true;
         slot.queue = .{};
+        slot.receiver_hint = .{};
         self.next_ipc_endpoint_scan = (index + 1) % max_ipc_endpoints;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
@@ -326,6 +331,7 @@ pub fn createIpcReply(self: anytype) KernelError!IpcReplyRef {
         slot.active = true;
         slot.sent = false;
         slot.queue = .{};
+        slot.receiver_hint = .{};
         self.next_ipc_reply_scan = (index + 1) % max_ipc_replies;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
@@ -572,7 +578,43 @@ pub fn ipcWaitListForSendPayload(self: anytype, payload: *const KernelObjectPayl
     };
 }
 
-pub fn registerIpcReadableWaiterForFd(
+fn registerIpcPollWaiterInList(
+    self: anytype,
+    waiters: *IpcWaitList,
+    key: IpcWaitKey,
+    owner: PrincipalId,
+    pollfd_va: u64,
+    events: u64,
+    thread_index: usize,
+    thread_generation: u32,
+    wait_token: u64,
+    group: FdWaitGroupRef,
+) KernelError!void {
+    const registration = try waiters.register(
+        key,
+        owner,
+        pollfd_va,
+        0,
+        0,
+        0,
+        events,
+        0,
+        thread_index,
+        thread_generation,
+        wait_token,
+        group,
+    );
+    self.linkFdWaitRegistration(group, registration) catch |err| {
+        if (registration.slot < waiters.waiters.len) {
+            const waiter = &waiters.waiters[registration.slot];
+            if (waiter.active and waiter.registration.matches(registration) and
+                waiter.binding.group.matches(group)) waiter.* = .{};
+        }
+        return err;
+    };
+}
+
+pub fn registerIpcPollWaitersForFd(
     self: anytype,
     owner: PrincipalId,
     fd: Fd,
@@ -580,22 +622,85 @@ pub fn registerIpcReadableWaiterForFd(
     pollfd_va: u64,
     thread_index: usize,
     thread_generation: u32,
-) KernelError!void {
+    wait_token: u64,
+    group: FdWaitGroupRef,
+) KernelError!bool {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
     const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
-    if (!entry.rights.wait and !entry.rights.poll) return;
+    if (!entry.rights.wait and !entry.rights.poll) return false;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
-    var wait_events = requested_events & switch (slot.payload) {
-        .channel => fd_abi.event_readable | fd_abi.event_hangup,
-        .endpoint, .reply => fd_abi.event_readable,
-        else => return,
-    };
-    if (!entry.rights.recv) wait_events &= ~fd_abi.event_readable;
-    if (wait_events == 0) return;
-    const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
-    const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, pollfd_va, 0, 0, 0, wait_events, 0, thread_index, thread_generation);
+    switch (slot.payload) {
+        .endpoint, .reply => {
+            var wait_events = requested_events & (fd_abi.event_readable | fd_abi.event_writable);
+            if (!entry.rights.recv) wait_events &= ~fd_abi.event_readable;
+            if (!entry.rights.send and !entry.rights.call) wait_events &= ~fd_abi.event_writable;
+            if (wait_events == 0) return false;
+            const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return false;
+            const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse
+                return KernelError.InvalidState;
+            try registerIpcPollWaiterInList(
+                self,
+                waiters,
+                key,
+                owner,
+                pollfd_va,
+                wait_events,
+                thread_index,
+                thread_generation,
+                wait_token,
+                group,
+            );
+            return true;
+        },
+        .channel => {
+            // Channel receive and send readiness refer to opposite queues.
+            // Keep a receive-side registration even with events=0 because
+            // POLLHUP is implicit and must wake a poll that requested only
+            // writable (or no ordinary events) when the peer closes.
+            var recv_events = requested_events & fd_abi.event_readable;
+            if (!entry.rights.recv) recv_events = 0;
+            const recv_key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse
+                return KernelError.InvalidState;
+            const recv_waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse
+                return KernelError.InvalidState;
+            try registerIpcPollWaiterInList(
+                self,
+                recv_waiters,
+                recv_key,
+                owner,
+                pollfd_va,
+                recv_events,
+                thread_index,
+                thread_generation,
+                wait_token,
+                group,
+            );
+
+            var send_events = requested_events & fd_abi.event_writable;
+            if (!entry.rights.send and !entry.rights.call) send_events = 0;
+            if (send_events != 0) {
+                const send_key = @TypeOf(self.*).ipcRecvWaitKeyFromSendPayload(&slot.payload) orelse
+                    return KernelError.InvalidState;
+                const send_waiters = self.ipcWaitListForSendPayload(&slot.payload) orelse
+                    return KernelError.InvalidState;
+                try registerIpcPollWaiterInList(
+                    self,
+                    send_waiters,
+                    send_key,
+                    owner,
+                    pollfd_va,
+                    send_events,
+                    thread_index,
+                    thread_generation,
+                    wait_token,
+                    group,
+                );
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 pub fn registerIpcRecvCompletionWaiterForFd(
@@ -606,39 +711,87 @@ pub fn registerIpcRecvCompletionWaiterForFd(
     fd_capacity: u8,
     thread_index: usize,
     thread_generation: u32,
-) KernelError!void {
+    wait_token: u64,
+    group: FdWaitGroupRef,
+) KernelError!FdWaitRegistrationRef {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     if (msg_va == 0) return KernelError.InvalidState;
     if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
     const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
     if (!entry.rights.recv or !entry.rights.wait) return KernelError.InvalidState;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
-    const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return;
+    const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse
+        return KernelError.InvalidState;
     const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, 0, msg_va, fd, fd_capacity, fd_abi.event_readable, 0, thread_index, thread_generation);
+    const registration = try waiters.register(
+        key,
+        owner,
+        0,
+        msg_va,
+        fd,
+        fd_capacity,
+        fd_abi.event_readable,
+        0,
+        thread_index,
+        thread_generation,
+        wait_token,
+        group,
+    );
+    self.linkFdWaitRegistration(group, registration) catch |err| {
+        if (registration.slot < waiters.waiters.len) {
+            const waiter = &waiters.waiters[registration.slot];
+            if (waiter.active and waiter.registration.matches(registration) and
+                waiter.binding.group.matches(group)) waiter.* = .{};
+        }
+        return err;
+    };
+    return registration;
 }
 
-pub fn unregisterIpcReadableWaiterForFd(
+pub fn unregisterIpcPollWaitersForFd(
     self: anytype,
     owner: PrincipalId,
     fd: Fd,
-    requested_events: u64,
     thread_index: usize,
     thread_generation: u32,
 ) void {
-    const fd_abi = @import("kernel_abi_root").fd_abi;
     const entry = self.fdEntryConst(owner, fd) orelse return;
     if (!entry.rights.wait and !entry.rights.poll) return;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return;
-    var wait_events = requested_events & switch (slot.payload) {
-        .channel => fd_abi.event_readable | fd_abi.event_hangup,
-        .endpoint, .reply => fd_abi.event_readable,
-        else => return,
+    switch (slot.payload) {
+        .endpoint, .reply => {
+            const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
+            waiters.unregister(thread_index, thread_generation);
+        },
+        .channel => {
+            const recv_waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
+            const send_waiters = self.ipcWaitListForSendPayload(&slot.payload) orelse return;
+            recv_waiters.unregister(thread_index, thread_generation);
+            send_waiters.unregister(thread_index, thread_generation);
+        },
+        else => {},
+    }
+}
+
+pub fn ipcRecvFdMatchesRegistration(
+    self: anytype,
+    owner: PrincipalId,
+    fd: Fd,
+    registration: FdWaitRegistrationRef,
+) bool {
+    const entry = self.fdEntryConst(owner, fd) orelse return false;
+    const slot = self.kernelObjectSlotConst(entry.object) orelse return false;
+    const key = @TypeOf(self.*).ipcRecvWaitKeyFromPayload(&slot.payload) orelse return false;
+    const kind: types.FdWaitRegistrationKind = switch (key.kind) {
+        .endpoint => .endpoint,
+        .channel => .channel,
+        .reply => .reply,
+        else => return false,
     };
-    if (!entry.rights.recv) wait_events &= ~fd_abi.event_readable;
-    if (wait_events == 0) return;
-    const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse return;
-    waiters.unregister(thread_index, thread_generation);
+    return registration.kind == kind and
+        registration.index == key.index and
+        registration.generation == key.generation and
+        registration.side == key.side;
 }
 
 pub fn wakeIpcWaitersForSendFd(
@@ -647,21 +800,93 @@ pub fn wakeIpcWaitersForSendFd(
     fd: Fd,
     out: []ThreadWakeTarget,
 ) KernelError!usize {
-    const fd_abi = @import("kernel_abi_root").fd_abi;
     const source = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
     const send_slot = self.kernelObjectSlotConst(source.object) orelse return KernelError.InvalidState;
-    const key = @TypeOf(self.*).ipcRecvWaitKeyFromSendPayload(&send_slot.payload) orelse return KernelError.InvalidState;
-    _ = fd_abi;
+    _ = @TypeOf(self.*).ipcRecvWaitKeyFromSendPayload(&send_slot.payload) orelse
+        return KernelError.InvalidState;
     const waiters = self.ipcWaitListForSendPayload(&send_slot.payload) orelse return KernelError.InvalidState;
-    _ = key;
-    const count = waiters.takeReadable(out);
-    if (count == 0 and out.len != 0) {
-        if (waiters.handoffHint()) |hint| {
-            out[0] = hint;
-            return 1;
-        }
+    return waiters.takeReadable(out);
+}
+
+/// Remember a thread that has demonstrably consumed from an endpoint, or the
+/// creator that owns the receive side of a one-shot reply.  This is only a
+/// scheduling hint: it never registers a wait or changes thread readiness.
+pub fn noteIpcReceiverForFd(
+    self: anytype,
+    owner: PrincipalId,
+    fd: Fd,
+    thread_index: usize,
+    thread_generation: u32,
+) bool {
+    if (thread_index > std.math.maxInt(u32) or thread_generation == 0) return false;
+    const entry = self.fdEntryConst(owner, fd) orelse return false;
+    if (!entry.rights.recv) return false;
+    const object_slot = self.kernelObjectSlotConst(entry.object) orelse return false;
+    const hint = IpcReceiverHint{
+        .active = true,
+        .owner = owner,
+        .thread_index = @intCast(thread_index),
+        .thread_generation = thread_generation,
+    };
+    switch (object_slot.payload) {
+        .endpoint => |endpoint_ref| {
+            const endpoint = self.ipcEndpointSlot(endpoint_ref) orelse return false;
+            endpoint.receiver_hint = hint;
+        },
+        .reply => |reply_ref| {
+            const reply = self.ipcReplySlot(reply_ref) orelse return false;
+            reply.receiver_hint = hint;
+        },
+        else => return false,
     }
-    return count;
+    return true;
+}
+
+/// Return the last confirmed receiver for the object targeted by a send.  The
+/// scheduler still validates allocation, generation, readiness, and CPU
+/// ownership before it can consume this hint for a directed handoff.
+pub fn ipcReceiverHandoffHintForSendFd(
+    self: anytype,
+    owner: PrincipalId,
+    fd: Fd,
+) ?ThreadWakeTarget {
+    const entry = self.fdEntryConst(owner, fd) orelse return null;
+    const object_slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+    const hint = switch (object_slot.payload) {
+        .endpoint => |endpoint_ref| (self.ipcEndpointSlotConst(endpoint_ref) orelse return null).receiver_hint,
+        .reply => |reply_ref| (self.ipcReplySlotConst(reply_ref) orelse return null).receiver_hint,
+        else => return null,
+    };
+    if (!hint.active) return null;
+    return .{
+        .owner = hint.owner,
+        .thread_index = hint.thread_index,
+        .thread_generation = hint.thread_generation,
+    };
+}
+
+pub fn takeIpcWritableWaitersForRecvFd(
+    self: anytype,
+    owner: PrincipalId,
+    fd: Fd,
+    out: []ThreadWakeTarget,
+) KernelError!usize {
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
+    if (!entry.rights.recv) return KernelError.InvalidState;
+    const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+    // A successful receive creates send capacity for endpoints and for the
+    // channel peer that targets this receive queue.  Reply handles are
+    // single-shot: reply.sent remains true after dequeue, so they do not
+    // become writable again.
+    switch (slot.payload) {
+        .endpoint, .channel => {},
+        .reply => return 0,
+        else => return KernelError.InvalidState,
+    }
+    const waiters = self.ipcWaitListForRecvPayload(&slot.payload) orelse
+        return KernelError.InvalidState;
+    return waiters.takeEvents(fd_abi.event_writable, out);
 }
 
 pub fn takeIpcChannelPeerCloseWaiters(
@@ -672,10 +897,16 @@ pub fn takeIpcChannelPeerCloseWaiters(
     if (closed_handle.side > 1) return 0;
     const channel = self.ipcChannelSlot(closed_handle.channel) orelse return 0;
     if (channel.ref_count != 1) return 0;
-    return channel.waiters[1 - @as(usize, closed_handle.side)].takeEvents(
-        @import("kernel_abi_root").fd_abi.event_hangup,
-        out,
-    );
+    const hangup = @import("kernel_abi_root").fd_abi.event_hangup;
+    const remaining_side = 1 - @as(usize, closed_handle.side);
+    var count = channel.waiters[remaining_side].takeEvents(hangup, out);
+    if (count < out.len) {
+        count += channel.waiters[@as(usize, closed_handle.side)].takeEvents(
+            hangup,
+            out[count..],
+        );
+    }
+    return count;
 }
 
 pub fn ipcRecvWakeOwnersForSendFd(
@@ -933,4 +1164,29 @@ pub fn ipcRecv(
     var msg = queue.pop() orelse return KernelError.MailboxEmpty;
     self.releaseIpcMessageWithFreeList(&msg, free_list);
     return result;
+}
+
+pub fn ipcRecvWithWritableWake(
+    self: anytype,
+    owner: PrincipalId,
+    fd: Fd,
+    fd_capacity: usize,
+    min_fd: Fd,
+    free_list: *FreePageList,
+    writable_wake_out: []ThreadWakeTarget,
+) KernelError!IpcRecvOutcome {
+    const message = try self.ipcRecv(owner, fd, fd_capacity, min_fd, free_list);
+    // Syscall dispatch holds the global KernelState lock across dequeue and
+    // waiter extraction, so no sender can refill the queue between these two
+    // operations.  A successful pop therefore publishes the exact writable
+    // edge created by this receive.
+    const writable_wake_count = try self.takeIpcWritableWaitersForRecvFd(
+        owner,
+        fd,
+        writable_wake_out,
+    );
+    return .{
+        .message = message,
+        .writable_wake_count = writable_wake_count,
+    };
 }

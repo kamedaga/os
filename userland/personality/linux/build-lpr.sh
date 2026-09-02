@@ -118,6 +118,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_fd/dup_pipe.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_pipe/io.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_timerfd.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_inotify.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_signalfd.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_sync_file.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_wait.c" \

@@ -31,6 +31,9 @@ enum {
 
     LPR_BACKEND_TRANSFER_LEASE = 1u << 7,
 
+    /* Temporary D-Bus wait-path diagnostic marker. */
+    LPR_SOCKET_DIAG_DBUS = 1u << 0,
+
     /*
      * Keep the name used to open a filed-backed OFD.  Linux exposes this
      * through /proc/self/fd/N; gdk-pixbuf 2.44 uses that link to turn the
@@ -94,6 +97,7 @@ enum {
     LPR_EVENT_BACKEND_EVENTFD = 0u,
     LPR_EVENT_BACKEND_TIMERFD = 1u,
     LPR_EVENT_BACKEND_SIGNALFD = 2u,
+    LPR_EVENT_BACKEND_INOTIFY = 3u,
 };
 
 typedef struct lpr_tty_backend {

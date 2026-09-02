@@ -63,6 +63,32 @@ static char *lpr_fork_diag_append_i64(
     return out;
 }
 
+#if defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG
+static void lpr_exec_diag(const char *path)
+{
+    char line[384];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_fork_diag_append_text(out, end, "[lpr-exec] native_pid=");
+    out = lpr_fork_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_fork_diag_append_text(out, end, " native_tid=");
+    out = lpr_fork_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID));
+    out = lpr_fork_diag_append_text(out, end, " linux_pid=");
+    out = lpr_fork_diag_append_i64(out, end, lpr_linux_current_pid);
+    out = lpr_fork_diag_append_text(out, end, " path=");
+    out = lpr_fork_diag_append_text(out, end, path);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+#endif
+
 static int64_t lpr_fork_fail(
     const char *stage, int64_t status)
 {
@@ -207,6 +233,7 @@ void lpr_thread_after_fork_child(void)
      * to whichever thread blocks first).  Clear it so the child's main thread
      * re-registers and reclaims signal ownership on its next syscall. */
     lpr_linux_signal_runtime_registered = 0;
+    lpr_linux_signal_hint_reset_for_fork_child();
 }
 
 int64_t lpr_linux_gettid(void)
@@ -343,17 +370,56 @@ void lpr_linux_exit_group(uint64_t code)
     }
 }
 
+static void lpr_thread_bootstrap_log(
+    const char *outcome, const char *stage, int64_t status)
+{
+    char line[128];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_fork_diag_append_text(out, end, "[lpr] thread bootstrap ");
+    out = lpr_fork_diag_append_text(out, end, outcome);
+    out = lpr_fork_diag_append_text(out, end, " stage=");
+    out = lpr_fork_diag_append_text(out, end, stage);
+    out = lpr_fork_diag_append_text(out, end, " status=");
+    out = lpr_fork_diag_append_i64(out, end, status);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+
+/* Exiting only this thread is not an option here: the creator is parked on
+ * `record->started` with no timeout, so it would wait for the life of the
+ * process.  Publishing a failure to it is not available either, because
+ * `record` and this thread's stack are one mapping and a clone() that returns
+ * an error makes musl unmap it while this thread is still running there.
+ * Taking the process down is the only outcome that cannot wedge the creator. */
+static _Noreturn void lpr_clone_thread_bootstrap_abort(
+    const char *stage, int64_t status)
+{
+    lpr_thread_bootstrap_log("abort", stage, status);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+    for (;;) {
+    }
+}
+
 void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
 {
     const int64_t raw_tid = lpr_linux_gettid();
     if (record == 0 || raw_tid < 0 || raw_tid > UINT32_MAX) {
-        lpr_linux_exit_thread(127u);
+        lpr_clone_thread_bootstrap_abort("gettid", raw_tid);
     }
     const uint32_t tid = (uint32_t)raw_tid;
     lpr_signal_thread_state_t *signal_state = lpr_signal_thread_state_current();
     signal_state->mask = record->signal_mask;
-    if (lpr_linux_sync_native_signal_mask() != 0) {
-        lpr_linux_exit_thread(127u);
+    const int64_t mask_status = lpr_linux_sync_native_signal_mask();
+    if (mask_status != 0) {
+        /* Best effort: a thread carrying a stale native mask is a far smaller
+         * fault than never letting its creator return from clone(). */
+        lpr_thread_bootstrap_log("degraded", "signal-mask", mask_status);
     }
     record->tid = tid;
     if ((record->clone_flags & LPR_CLONE_PARENT_SETTID) != 0) {
@@ -880,6 +946,9 @@ int64_t lpr_linux_prctl(uint64_t option,
                         uint64_t arg4,
                         uint64_t arg5)
 {
+    if (option == LPR_PR_SET_PDEATHSIG) {
+        lpr_signal_source_diag("prctl-pdeathsig", (uint32_t)arg2, 0, 0);
+    }
     if (option != LPR_PR_SET_PDEATHSIG && option != LPR_PR_GET_PDEATHSIG) {
         return lpr_linux_prctl_compat(option, arg2, arg3, arg4, arg5);
     }
@@ -933,6 +1002,7 @@ int64_t lpr_linux_kill(uint64_t pid_raw, uint64_t sig_raw)
     lpr_linux_process_state_init();
     const int32_t pid = (int32_t)(int64_t)pid_raw;
     const uint32_t sig = (uint32_t)sig_raw;
+    lpr_signal_source_diag("kill", sig, (uint64_t)(int64_t)pid, 0);
     if (sig > LPR_LINUX_SIGNAL_MAX) {
         return -LPR_LINUX_EINVAL;
     }
@@ -1002,6 +1072,9 @@ int64_t lpr_linux_tkill(uint64_t tid_raw, uint64_t sig_raw)
 {
     const int64_t tid = (int64_t)tid_raw;
     const uint32_t sig = (uint32_t)sig_raw;
+    const struct lpr_linux_user_frame *frame = lpr_current_linux_user_frame();
+    lpr_signal_source_diag(
+        "tkill", sig, tid_raw, frame != 0 ? frame->rip : 0);
     if (tid <= 0 || tid > UINT32_MAX || sig_raw > LPR_LINUX_SIGNAL_MAX) {
         return -LPR_LINUX_EINVAL;
     }
@@ -1027,6 +1100,7 @@ int64_t lpr_linux_tgkill(uint64_t tgid_raw, uint64_t tid_raw, uint64_t sig_raw)
 {
     const int64_t tgid = (int64_t)tgid_raw;
     const int64_t tid = (int64_t)tid_raw;
+    lpr_signal_source_diag("tgkill", (uint32_t)sig_raw, tgid_raw, tid_raw);
     if (tgid <= 0 || tgid > INT32_MAX || tid <= 0 || tid > UINT32_MAX) {
         return -LPR_LINUX_EINVAL;
     }
@@ -1222,6 +1296,9 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     lpr_memcpy(exec.path, path, (size_t)path_len + 1u);
     int status = 0;
     lpr_linux_process_state_init();
+#if defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG
+    lpr_exec_diag(exec.path);
+#endif
     lpr_trace_process_event("execve_begin", path_len, 0, 0);
 
     status = lpr_exec_copy_string_vector(
@@ -1307,11 +1384,19 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         }
     }
     lpr_close_local_state_before_self_exec();
+    lpr_exec_transaction_commit_self(&transaction);
     const int64_t commit_status = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_PROCESS_EXEC_FROM,
         (uint64_t)(uint32_t)process_fd,
         (uint64_t)(uint32_t)thread_fd,
         0);
+    if (commit_status != 0 && lpr_supervisor_enabled) {
+        (void)lpr_supervisor_call_token(
+            LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL,
+            lpr_supervisor_token,
+            -1,
+            0);
+    }
     lpr_destroy_exec_transaction(&transaction);
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL, (uint64_t)(uint32_t)process_fd, 1);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)thread_fd);

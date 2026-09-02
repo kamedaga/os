@@ -9,6 +9,7 @@ const boot_static = @import("../boot/main_static.zig");
 const kernel_log = @import("../kernel_log.zig");
 const sc = @import("numbers.zig");
 const runtime = @import("runtime.zig");
+const fd_syscall = @import("fd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 
 const fd_abi = abi_root.fd_abi;
@@ -217,28 +218,12 @@ fn writeThreadStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, thread: 
 fn wakeTaskFdWaiters(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId) ?kernel.ThreadWakeTarget {
     var wake_targets: [kernel.max_task_fd_waiters]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takeTaskReadableWaitersForPrincipal(principal, wake_targets[0..]);
-    var handoff_target: ?kernel.ThreadWakeTarget = null;
-    for (wake_targets[0..wake_count]) |target| {
-        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.pollfd_va != 0) {
-            _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
-        }
-        const woke = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
-        if (woke and handoff_target == null) {
-            handoff_target = target;
-        }
-    }
-    return handoff_target;
+    _ = fd_syscall.wakeThreadTargets(h, state, wake_targets[0..wake_count]);
+    return null;
 }
 
-fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) void {
-    for (targets) |target| {
-        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.pollfd_va != 0) {
-            _ = h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents);
-        }
-        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
-    }
+fn wakeThreadTargets(h: anytype, state: *kernel.KernelState, targets: []const kernel.ThreadWakeTarget) void {
+    _ = fd_syscall.wakeThreadTargets(h, state, targets);
 }
 
 fn collectPipeCloseWakesForProcess(
@@ -275,7 +260,7 @@ fn wakeReadyPipeCloseWaiters(
         const ready_events = state.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
         if (ready_events == 0) continue;
         const wake_count = state.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
-        wakeThreadTargets(h, wake_storage[0..wake_count]);
+        wakeThreadTargets(h, state, wake_storage[0..wake_count]);
     }
 }
 
@@ -311,7 +296,7 @@ fn wakeIpcChannelCloseWaiters(
     var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
     for (pending_wakes) |pending| {
         const wake_count = state.takeIpcChannelPeerCloseWaiters(pending.handle, wake_storage[0..]);
-        wakeThreadTargets(h, wake_storage[0..wake_count]);
+        wakeThreadTargets(h, state, wake_storage[0..wake_count]);
     }
 }
 
@@ -342,6 +327,7 @@ fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.Prin
     const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, false, pending_pipe_wakes[0..]);
     var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
     const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(state, principal, false, pending_channel_wakes[0..]);
+    state.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
@@ -392,10 +378,10 @@ fn exitProcessAfterTeardown(
 
 fn createProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if ((frame.rdi & ~process_abi.process_known_flags_mask) != 0) return sc.syscall_err_invalid;
-    const principal = state.createProcessDescriptorWithCapacityLimitChecked(
+    const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
         "fd-process",
         h.free_list,
-        h.user_spaces.len,
+        h.user_spaces,
         scheduler.principalSlotReusable,
     ) orelse return sc.syscall_err_alloc;
     if (!user_vm.buildEmptyUserAddressSpace(principal)) {
@@ -479,10 +465,10 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         break :blk copied;
     };
 
-    const child = state.createProcessDescriptorWithCapacityLimitChecked(
+    const child = state.createProcessDescriptorWithUserAddressSpaceChecked(
         "fd-process-clone",
         h.free_list,
-        h.user_spaces.len,
+        h.user_spaces,
         scheduler.principalSlotReusable,
     ) orelse return reportForkFailure("process_descriptor", sc.syscall_err_alloc);
     var child_active = true;
@@ -682,28 +668,26 @@ fn killProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId,
 
 fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, signo: u32, frame: *TrapFrame) u64 {
     if (signo == 0 or signo > process_abi.signal_max) return sc.syscall_err_invalid;
-    if (signo == process_abi.signal_kill) return killProcess(h, state, proc, fd, signo, frame);
-    const process = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
-    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
-    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (signo == process_abi.signal_kill) {
+        if (fd == process_abi.process_self_fd) {
+            exitProcessAfterTeardown(h, state, proc, .killed, signo, frame);
+            return frame.rax;
+        }
+        return killProcess(h, state, proc, fd, signo, frame);
+    }
+    const target = if (fd == process_abi.process_self_fd)
+        proc
+    else blk: {
+        const process = state.processObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+        if (!processRunnable(process.state)) return sc.syscall_err_invalid;
+        break :blk @as(kernel.PrincipalId, @enumFromInt(process.principal_raw));
+    };
     if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
-    const delivery = scheduler.deliverSignal(target, signo) orelse return sc.syscall_err_not_ready;
-    // A prior non-signal wake can make the thread runnable while leaving its
-    // completion waiter registered.  Always remove same-generation waiters
-    // before a reply can be consumed through that stale registration.
-    if (delivery.should_interrupt) {
-        state.unregisterFdWaitersForThread(target, delivery.thread_index, delivery.thread_generation);
-    }
-    if (delivery.was_blocked) {
-        // Timed waits keep their normal timeout result in the saved frame
-        // (nanosleep uses OK).  A signal wake must override that value so the
-        // personality can report EINTR and the remaining relative duration.
-        _ = scheduler.wakeBlockedGenerationWithRax(
-            delivery.thread_index,
-            delivery.thread_generation,
-            sc.syscall_err_not_ready,
-        );
-    }
+    _ = scheduler.deliverSignal(
+        target,
+        signo,
+        sc.syscall_err_not_ready,
+    ) orelse return sc.syscall_err_not_ready;
     return sc.syscall_ok;
 }
 
@@ -795,6 +779,31 @@ fn deliverPendingSignalToUserFrame(
     return sc.syscall_ok;
 }
 
+fn writeSignalTimerState(
+    h: anytype,
+    proc: kernel.PrincipalId,
+    out_va: u64,
+    state: scheduler.ProcessSignalTimerState,
+) u64 {
+    if (out_va == 0) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(
+        proc,
+        out_va + process_abi.signal_timer_state_signo_offset,
+        state.signo,
+    )) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(
+        proc,
+        out_va + process_abi.signal_timer_state_remaining_ticks_offset,
+        state.remaining_ticks,
+    )) return sc.syscall_err_invalid;
+    if (!h.write_user_u64(
+        proc,
+        out_va + process_abi.signal_timer_state_interval_ticks_offset,
+        state.interval_ticks,
+    )) return sc.syscall_err_invalid;
+    return sc.syscall_ok;
+}
+
 fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     switch (frame.rdi) {
         process_abi.signal_ctl_register => {
@@ -843,6 +852,37 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
         },
         process_abi.signal_ctl_deliver_pending_frame => {
             return deliverPendingSignalToUserFrame(h, proc, frame, frame.rsi);
+        },
+        process_abi.signal_ctl_get_timer => {
+            return writeSignalTimerState(
+                h,
+                proc,
+                frame.rsi,
+                scheduler.getProcessSignalTimer(proc, scheduler.lapic_tick_count),
+            );
+        },
+        process_abi.signal_ctl_set_timer => {
+            const signo: u32 = @truncate(frame.rsi);
+            if (signo == 0 or signo > process_abi.signal_max)
+                return sc.syscall_err_invalid;
+            const old = scheduler.setProcessSignalTimer(
+                proc,
+                signo,
+                frame.rdx,
+                frame.r10,
+                scheduler.lapic_tick_count,
+            ) catch return sc.syscall_err_alloc;
+            return if (frame.r8 == 0)
+                sc.syscall_ok
+            else
+                writeSignalTimerState(h, proc, frame.r8, old);
+        },
+        process_abi.signal_ctl_set_pending_hint => {
+            if (frame.rsi != 0 and !isUserEntryVa(frame.rsi)) return sc.syscall_err_invalid;
+            return if (scheduler.setCurrentSignalPendingHint(frame.rsi))
+                sc.syscall_ok
+            else
+                sc.syscall_err_not_ready;
         },
         else => return sc.syscall_err_invalid,
     }
@@ -1207,7 +1247,6 @@ fn execFromStagedProcess(
     const thread_fd: kernel.Fd = @intCast(frame.rsi);
     const flags = frame.rdx;
     if ((flags & ~process_abi.process_exec_from_known_flags_mask) != 0) return sc.syscall_err_invalid;
-
     const process = state.processObjectForFd(proc, process_fd, .{ .kill = true, .set_context = true }) orelse return sc.syscall_err_invalid;
     if (!processRunnable(process.state)) return sc.syscall_err_invalid;
     const staged_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
@@ -1229,6 +1268,8 @@ fn execFromStagedProcess(
         @intCast(thread.thread_index),
         thread.thread_generation,
     ) orelse return sc.syscall_err_invalid;
+
+    state.cancelFdWaitGroupsForOwner(proc);
 
     {
         if (!user_vm.lockVmTransactionPair(staged_owner, proc)) return sc.syscall_err_map;

@@ -567,8 +567,9 @@ static void test_file_vmo_cache_byte_budget(void)
         &runtime,
         100u * 1024u * 1024u);
     expect_true("vmo cache budget admits after eviction", slot != NULL);
-    expect_true("vmo cache budget evicts oldest", !oldest->active);
-    expect_true("vmo cache budget preserves newer", newer->active);
+    expect_true("vmo cache budget preserves costly snapshot", oldest->active);
+    expect_true("vmo cache budget evicts cheaper snapshot", !newer->active);
+    expect_true("vmo cache budget reuses cheaper slot", slot == newer);
 }
 
 static void test_snapshot_vmo_pins_backend_object(void)
@@ -602,7 +603,7 @@ static void test_snapshot_vmo_pins_backend_object(void)
     expect_true("snapshot vmo released with backend", !entry->active);
 }
 
-static void test_pinned_file_vmo_limit_evicts_oldest_snapshot(void)
+static void test_pinned_file_vmo_limit_preserves_costly_snapshot(void)
 {
     static filed_runtime_t runtime;
     static filed_dispatch_state_t dispatch;
@@ -620,7 +621,8 @@ static void test_pinned_file_vmo_limit_evicts_oldest_snapshot(void)
     shared->backend_object = 1;
     shared->clock = 1;
 
-    filed_file_vmo_cache_entry_t *oldest = NULL;
+    filed_file_vmo_cache_entry_t *costly_oldest = NULL;
+    filed_file_vmo_cache_entry_t *cheapest = NULL;
     for (uint32_t i = 0; i < FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT; ++i) {
         filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
         expect_true("pinned limit fill slot", entry != NULL);
@@ -632,8 +634,12 @@ static void test_pinned_file_vmo_limit_evicts_oldest_snapshot(void)
         entry->vmo_fd = -1;
         entry->backend_object = 100 + i;
         entry->clock = i + 2;
-        if (oldest == NULL) {
-            oldest = entry;
+        entry->length = i == 0 ? 178u * 1024u * 1024u : (uint64_t)(i + 1u) * 4096u;
+        if (costly_oldest == NULL) {
+            costly_oldest = entry;
+        }
+        if (i == 1) {
+            cheapest = entry;
         }
     }
 
@@ -641,8 +647,13 @@ static void test_pinned_file_vmo_limit_evicts_oldest_snapshot(void)
         filed_file_vmo_cache_pinned_slot_for_length(&runtime, 4096);
     expect_true("pinned limit replacement slot", replacement != NULL);
     expect_true("pinned limit preserves shared", shared->active);
-    expect_true("pinned limit evicts oldest snapshot", oldest != NULL && !oldest->active);
-    expect_true("pinned limit reuses oldest slot", replacement == oldest);
+    expect_true(
+        "pinned limit preserves costly oldest snapshot",
+        costly_oldest != NULL && costly_oldest->active);
+    expect_true(
+        "pinned limit evicts cheapest snapshot",
+        cheapest != NULL && !cheapest->active);
+    expect_true("pinned limit reuses cheapest slot", replacement == cheapest);
 }
 
 static void test_snapshot_vmo_pressure_reclaim_preserves_shared(void)
@@ -704,7 +715,7 @@ int main(void)
     test_shared_vmo_is_io_source_and_revoke_target();
     test_file_vmo_cache_byte_budget();
     test_snapshot_vmo_pins_backend_object();
-    test_pinned_file_vmo_limit_evicts_oldest_snapshot();
+    test_pinned_file_vmo_limit_preserves_costly_snapshot();
     test_snapshot_vmo_pressure_reclaim_preserves_shared();
     if (failures != 0) {
         return 1;

@@ -14,6 +14,7 @@ fi
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_exec_pipe_race.elf' \
   --expect 'LPR_EXEC_PIPE_RACE_START' \
+  --expect 'LPR_EXEC_PIPE_EOF_DONE' \
   --expect 'LPR_EXEC_PIPE_RACE_WINDOW iterations=' \
   --expect 'LPR_EXEC_PIPE_RACE_DONE'
 

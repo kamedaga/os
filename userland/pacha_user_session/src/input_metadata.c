@@ -195,8 +195,12 @@ static int parse_event_name(const char *name, unsigned *event)
     return 1;
 }
 
-int pacha_prepare_input_metadata(void)
+int pacha_prepare_input_metadata(const char *session_name)
 {
+    if (session_name == NULL || session_name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
     DIR *directory = opendir("/dev/input");
     if (directory == NULL) return -1;
     unsigned devices = 0, keyboards = 0, relative = 0, absolute = 0;
@@ -240,8 +244,8 @@ int pacha_prepare_input_metadata(void)
     if (status == 0 && devices == 0) status = -1;
     if (status == 0) {
         fprintf(stderr,
-            "pacha-user-session: input metadata devices=%u keyboard=%u relative=%u absolute=%u\n",
-            devices, keyboards, relative, absolute);
+            "%s: input metadata devices=%u keyboard=%u relative=%u absolute=%u\n",
+            session_name, devices, keyboards, relative, absolute);
     }
     return status;
 }

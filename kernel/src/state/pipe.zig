@@ -77,6 +77,8 @@ const IpcReplyRef = types.IpcReplyRef;
 const IpcWaitKey = types.IpcWaitKey;
 const IpcWaiter = types.IpcWaiter;
 const ThreadWakeTarget = types.ThreadWakeTarget;
+const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
+const FdWaitGroupRef = types.FdWaitGroupRef;
 const TaskFdWaiter = types.TaskFdWaiter;
 const max_task_fd_waiters = types.max_task_fd_waiters;
 const max_ipc_object_waiters = types.max_ipc_object_waiters;
@@ -342,6 +344,8 @@ pub fn registerPipeWaiterForFd(
     min_write_bytes: u64,
     thread_index: usize,
     thread_generation: u32,
+    wait_token: u64,
+    group: FdWaitGroupRef,
 ) KernelError!bool {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
@@ -353,7 +357,7 @@ pub fn registerPipeWaiterForFd(
         requested_events & (fd_abi.event_writable | fd_abi.event_error | fd_abi.event_hangup)
     else
         requested_events & (fd_abi.event_readable | fd_abi.event_error | fd_abi.event_hangup);
-    if (matched_events == 0) return true;
+    if (matched_events == 0) return false;
     const key = IpcWaitKey{
         .kind = .pipe,
         .index = endpoint.pipe.index,
@@ -361,7 +365,28 @@ pub fn registerPipeWaiterForFd(
         .side = if (endpoint.write) 1 else 0,
     };
     const waiters = self.pipeWaitListForEndpoint(endpoint) orelse return KernelError.InvalidState;
-    try waiters.register(key, owner, pollfd_va, 0, 0, 0, requested_events, min_write_bytes, thread_index, thread_generation);
+    const registration = try waiters.register(
+        key,
+        owner,
+        pollfd_va,
+        0,
+        0,
+        0,
+        requested_events,
+        min_write_bytes,
+        thread_index,
+        thread_generation,
+        wait_token,
+        group,
+    );
+    self.linkFdWaitRegistration(group, registration) catch |err| {
+        if (registration.slot < waiters.waiters.len) {
+            const waiter = &waiters.waiters[registration.slot];
+            if (waiter.active and waiter.registration.matches(registration) and
+                waiter.binding.group.matches(group)) waiter.* = .{};
+        }
+        return err;
+    };
     return true;
 }
 

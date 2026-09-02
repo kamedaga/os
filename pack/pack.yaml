@@ -27,7 +27,7 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -36,6 +36,7 @@ skip:
     - "alpine_key_5261cecb"
     - "alpine_key_6165ee59"
     - "alpine_key_61666e3f"
+    - "alpine_sway"
     - "apk"
     - "apk_arch"
     - "apk_repositories"
@@ -65,6 +66,10 @@ skip:
     - "libc_musl"
     - "linux_abi_probe"
     - "linux_abi_server"
+    - "lpr_apk_offline"
+    - "lua_cli"
+    - "lua_cli_workload"
+    - "lua_runtime"
     - "mbedcrypto"
     - "mbedtls"
     - "mbedx509"
@@ -109,6 +114,7 @@ apps:
       rebuild: ["bash", "tools/build_virtio_input_sysfs.sh"]
       input:
         - "tools/build_virtio_input_sysfs.sh"
+        - "tools/derive_input_id.py"
     out: "ROOT"
     rootfs: "/"
   virtio_gpu_sysfs:
@@ -167,6 +173,19 @@ apps:
         - "tools/copy_lpr_linux_musl.sh"
     out: "SWAYROOT"
     rootfs: "/"
+  alpine_xfce:
+    file:
+      path: ".artifacts/userland-fixtures/alpine-xfce-root"
+      rebuild: ["bash", "tools/build_wsl_alpine_xfce.sh"]
+      input:
+        - "tools/build_wsl_alpine_xfce.sh"
+        - "tools/rootfs_overlay.py"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "tools/build_wsl_alpine_input.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+    out: "XFCEROOT"
+    rootfs: "/"
   pine2_gtk:
     file:
       path: ".artifacts/userland-fixtures/pine2-gtk-root"
@@ -187,18 +206,11 @@ apps:
         - "third_party/pine2-gtk/COPYING.txt"
     out: "PINE2GTKROOT"
     rootfs: "/"
-  pacha_user_session:
+  xfce_app_acceptance:
     file:
-      path: ".artifacts/userland-fixtures/pacha-user-session"
-      rebuild: ["bash", "tools/build_pacha_user_session.sh"]
-      input:
-        - "tools/build_pacha_user_session.sh"
-        - "userland/pacha_user_session/src/main.c"
-        - "userland/pacha_user_session/src/input_metadata.c"
-        - "userland/pacha_user_session/src/input_metadata.h"
-        - "tools/copy_lpr_linux_musl.sh"
-    out: "PACHASES.ELF"
-    rootfs: "/usr/libexec/pacha-user-session"
+      path: "tests/run-lpr-qemu-xfce-app-acceptance.sh"
+    out: "XFCEAPAC.SH"
+    rootfs: "/cmd/xfce_app_acceptance.sh"
   sway_phase1_acceptance_script:
     file:
       path: "tests/fixtures/sway_phase1_acceptance.sh"
@@ -922,9 +934,11 @@ apps:
   lpr_linux_musl_libc:
     file:
       path: ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
-      rebuild: ["bash", "tools/copy_lpr_linux_musl.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
+      rebuild: ["bash", "userland/personality/linux/build-musl-runtime.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
       input:
-        - "tools/copy_lpr_linux_musl.sh"
+        - "musl/upstream"
+        - "userland/personality/linux/build-musl-runtime.sh"
+        - "userland/personality/linux/musl/synccall.c"
     out: "LPRMUSL.SO"
     rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1", "/lib/libc.musl-x86_64.so.1"]
   lpr_ldmusl_smoke:
@@ -986,7 +1000,6 @@ apps:
       input:
         - "pack/scripts/download_lpr_bash_dynamic.sh"
     out: "BASH.ELF"
-    rootfs: "/bin/bash"
   lpr_apk_offline:
     file:
       path: ".artifacts/userland-fixtures/lpr-apk-offline-root"

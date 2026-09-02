@@ -1133,12 +1133,37 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot(filed_runtime_t *runtime
     return filed_file_vmo_cache_slot_for_length(runtime, 0);
 }
 
+static filed_file_vmo_cache_entry_t *filed_file_vmo_cache_snapshot_victim(
+    filed_runtime_t *runtime)
+{
+    filed_file_vmo_cache_entry_t *victim = NULL;
+    if (runtime == NULL) {
+        return NULL;
+    }
+    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
+        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        if (!entry->active || entry->shared) {
+            continue;
+        }
+        /* A snapshot pins one backend object regardless of its byte size.
+         * Prefer retaining the snapshots that are most expensive to rebuild;
+         * use LRU only between equal-sized images.  This keeps a large shared
+         * library image reusable while small loader mappings pass through the
+         * bounded pinned-vnode set. */
+        if (victim == NULL ||
+            entry->length < victim->length ||
+            (entry->length == victim->length && entry->clock < victim->clock))
+        {
+            victim = entry;
+        }
+    }
+    return victim;
+}
+
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
     filed_runtime_t *runtime,
     uint64_t length)
 {
-    filed_file_vmo_cache_entry_t *oldest_entry = NULL;
-    uint64_t oldest = UINT64_MAX;
     if (runtime == NULL || length > FILED_FILE_VMO_CACHE_TOTAL_BYTES) {
         return NULL;
     }
@@ -1155,42 +1180,31 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
             }
         }
         while (active_bytes > FILED_FILE_VMO_CACHE_TOTAL_BYTES - length) {
-            oldest_entry = NULL;
-            oldest = UINT64_MAX;
-            for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-                filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
-                if (entry->active && !entry->shared && entry->clock < oldest) {
-                    oldest = entry->clock;
-                    oldest_entry = entry;
-                }
-            }
-            if (oldest_entry == NULL) {
+            filed_file_vmo_cache_entry_t *victim =
+                filed_file_vmo_cache_snapshot_victim(runtime);
+            if (victim == NULL) {
                 return NULL;
             }
-            active_bytes = oldest_entry->length > active_bytes ?
-                0 : active_bytes - oldest_entry->length;
+            active_bytes = victim->length > active_bytes ?
+                0 : active_bytes - victim->length;
             filed_file_vmo_cache_evictions++;
-            filed_file_vmo_cache_clear_entry(oldest_entry, false);
+            filed_file_vmo_cache_clear_entry(victim, false);
         }
     }
-    oldest_entry = NULL;
-    oldest = UINT64_MAX;
     for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
         filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
         if (!entry->active) {
             return entry;
         }
-        if (!entry->shared && entry->clock < oldest) {
-            oldest = entry->clock;
-            oldest_entry = entry;
-        }
     }
-    if (oldest_entry == NULL) {
+    filed_file_vmo_cache_entry_t *victim =
+        filed_file_vmo_cache_snapshot_victim(runtime);
+    if (victim == NULL) {
         return NULL;
     }
     filed_file_vmo_cache_evictions++;
-    filed_file_vmo_cache_clear_entry(oldest_entry, false);
-    return oldest_entry;
+    filed_file_vmo_cache_clear_entry(victim, false);
+    return victim;
 }
 
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
@@ -1198,7 +1212,6 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
     uint64_t length)
 {
     uint32_t snapshot_entries = 0;
-    filed_file_vmo_cache_entry_t *oldest_snapshot = NULL;
     if (runtime == NULL) {
         return NULL;
     }
@@ -1209,16 +1222,16 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
         }
         if (!entry->shared) {
             ++snapshot_entries;
-            if (oldest_snapshot == NULL || entry->clock < oldest_snapshot->clock) {
-                oldest_snapshot = entry;
-            }
         }
     }
-    if (snapshot_entries >= FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT &&
-        oldest_snapshot != NULL)
-    {
+    if (snapshot_entries >= FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT) {
+        filed_file_vmo_cache_entry_t *victim =
+            filed_file_vmo_cache_snapshot_victim(runtime);
+        if (victim == NULL) {
+            return NULL;
+        }
         filed_file_vmo_cache_evictions++;
-        filed_file_vmo_cache_clear_entry(oldest_snapshot, false);
+        filed_file_vmo_cache_clear_entry(victim, false);
     }
     return filed_file_vmo_cache_slot_for_length(runtime, length);
 }

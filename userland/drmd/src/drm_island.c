@@ -34,7 +34,20 @@ enum {
     DRMD_FMODE_READ = 0x1,
     DRMD_FMODE_WRITE = 0x2,
     DRMD_IOCTL_VERSION = 0xc0406400u,
+    DRMD_IOCTL_WAIT_VBLANK_DIAG = 0xc018643au,
+    DRMD_IOCTL_CRTC_GET_SEQUENCE_DIAG = 0xc018643bu,
+    DRMD_IOCTL_CRTC_QUEUE_SEQUENCE_DIAG = 0xc018643cu,
 };
+
+static int drmd_is_present_timing_ioctl(uint32_t command)
+{
+    return command == DRMD_IOCTL_WAIT_VBLANK_DIAG ||
+        command == DRMD_IOCTL_CRTC_GET_SEQUENCE_DIAG ||
+        command == DRMD_IOCTL_CRTC_QUEUE_SEQUENCE_DIAG;
+}
+
+enum { DRMD_NOTIFY_DIAG_LIMIT = 32 };
+static uint32_t drmd_notify_diag_count;
 
 typedef int (*drmd_fops_open_fn)(void *, void *);
 typedef int (*drmd_fops_release_fn)(void *, void *);
@@ -492,12 +505,21 @@ int drmd_drm_island_ioctl(
     drmd_owner_context_t context;
     kb_module_t *owner = kb_module_find_owner_for_address(handle->fops_view.unlocked_ioctl);
     const int entered = enter_owner(owner != NULL ? owner : handle->owner, &context);
+    const uint32_t command = (uint32_t)request->request;
+    if (drmd_is_present_timing_ioctl(command)) {
+        printf("[drmd-present-diag] command=0x%08x stage=underlying.begin handle=%llu\n",
+            command, (unsigned long long)request->handle);
+    }
     const long status = ((drmd_fops_ioctl_fn)handle->fops_view.unlocked_ioctl)(
         handle->file,
         (unsigned int)request->request,
         (unsigned long)(uintptr_t)argument);
     if (entered) {
         leave_owner(&context);
+    }
+    if (drmd_is_present_timing_ioctl(command)) {
+        printf("[drmd-present-diag] command=0x%08x stage=underlying.end status=%ld\n",
+            command, status);
     }
     if (status != 0) {
         return (int)status;
@@ -656,6 +678,15 @@ void drmd_drm_island_notify_readable(struct drmd_drm_island *island)
             if (peek_status != 0) break;
             const int send_status = event_size == 4u * sizeof(message.word0) ?
                 pacha_ipc_send(handle->notify_fd, &message) : -22;
+            if (drmd_notify_diag_count < DRMD_NOTIFY_DIAG_LIMIT) {
+                drmd_notify_diag_count++;
+                printf(
+                    "[drmd-vblank-diag] notify owner=%llu fd=%d type=%u length=%u size=%llu status=%d\n",
+                    (unsigned long long)handle->id, handle->notify_fd,
+                    (unsigned)(uint32_t)message.word0,
+                    (unsigned)(uint32_t)(message.word0 >> 32u),
+                    (unsigned long long)event_size, send_status);
+            }
             if (send_status != 0) break;
             if (drmd_kms_consume_event(handle->id) != 0) break;
         }

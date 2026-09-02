@@ -11,6 +11,73 @@
 #include <personality/linux_lpr.h>
 #include <stdint.h>
 
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+static char *lpr_process_rpc_diag_text(
+    char *out, const char *end, const char *text)
+{
+    while (out < end && text != 0 && *text != '\0') {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_process_rpc_diag_u64(
+    char *out, const char *end, uint64_t value)
+{
+    char digits[20];
+    uint32_t count = 0;
+    do {
+        digits[count++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && count < sizeof(digits));
+    while (out < end && count != 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static char *lpr_process_rpc_diag_i64(
+    char *out, const char *end, int64_t value)
+{
+    uint64_t magnitude = (uint64_t)value;
+    if (value < 0) {
+        if (out < end) *out++ = '-';
+        magnitude = (~magnitude) + 1u;
+    }
+    return lpr_process_rpc_diag_u64(out, end, magnitude);
+}
+
+static void lpr_process_rpc_diag(
+    const char *stage,
+    uint64_t request_id,
+    int64_t reply_fd,
+    int64_t status,
+    uint64_t word0,
+    uint64_t word3)
+{
+    char line[256];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_process_rpc_diag_text(out, end, "[lpr-process-rpc] stage=");
+    out = lpr_process_rpc_diag_text(out, end, stage);
+    out = lpr_process_rpc_diag_text(out, end, " request=");
+    out = lpr_process_rpc_diag_u64(out, end, request_id);
+    out = lpr_process_rpc_diag_text(out, end, " reply_fd=");
+    out = lpr_process_rpc_diag_i64(out, end, reply_fd);
+    out = lpr_process_rpc_diag_text(out, end, " status=");
+    out = lpr_process_rpc_diag_i64(out, end, status);
+    out = lpr_process_rpc_diag_text(out, end, " word0=");
+    out = lpr_process_rpc_diag_u64(out, end, word0);
+    out = lpr_process_rpc_diag_text(out, end, " word3=");
+    out = lpr_process_rpc_diag_u64(out, end, word3);
+    if (out < end) *out++ = '\n';
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+#endif
+
 void *lpr_process_client_payload(void *page)
 {
     return page == 0 ? 0 : (void *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
@@ -83,6 +150,11 @@ int64_t lpr_process_client_call_with_reply_fd(
         PACHAOS_SYSCALL_IPC_CALL,
         LPR_SUPERVISOR_ENDPOINT_FD,
         (uint64_t)(uintptr_t)&request);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (op == LPRS_OP_PROCESS_WAIT4) {
+        lpr_process_rpc_diag("call-return", request_id, reply_fd, 0, 0, 0);
+    }
+#endif
     if (reply_fd < 16) {
         const int64_t err = status_to_errno(reply_fd);
         lpr_trace_error_record(
@@ -108,9 +180,25 @@ int64_t lpr_process_client_call_with_reply_fd(
         reply.fds = &reply_item;
         reply.fd_capacity = 1;
     }
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (op == LPRS_OP_PROCESS_WAIT4) {
+        lpr_process_rpc_diag("recv-enter", request_id, reply_fd, 0, 0, 0);
+    }
+#endif
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
         &reply);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    if (op == LPRS_OP_PROCESS_WAIT4) {
+        lpr_process_rpc_diag(
+            "recv-return",
+            request_id,
+            reply_fd,
+            recv_status,
+            reply.word0,
+            reply.word3);
+    }
+#endif
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = status_to_errno(recv_status);

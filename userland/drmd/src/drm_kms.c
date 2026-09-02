@@ -130,6 +130,20 @@ typedef struct drmd_kms_fb {
     drmd_kms_buffer_t *buffer;
 } drmd_kms_fb_t;
 
+typedef union drmd_kms_event {
+    drmd_event_vblank_t vblank;
+    drmd_event_crtc_sequence_t crtc_sequence;
+} drmd_kms_event_t;
+
+_Static_assert(sizeof(drmd_kms_event_t) == 32, "DRM event queue ABI");
+
+typedef struct drmd_kms_pending_vblank {
+    int active;
+    int crtc_sequence;
+    uint64_t target_sequence;
+    uint64_t user_data;
+} drmd_kms_pending_vblank_t;
+
 typedef struct drmd_kms_event_file {
     int active;
     int universal_planes;
@@ -139,7 +153,9 @@ typedef struct drmd_kms_event_file {
     uint32_t magic;
     uint32_t head;
     uint32_t count;
-    drmd_event_vblank_t events[DRMD_KMS_EVENT_QUEUE_MAX];
+    uint32_t pending_vblank_count;
+    drmd_kms_event_t events[DRMD_KMS_EVENT_QUEUE_MAX];
+    drmd_kms_pending_vblank_t pending_vblanks[DRMD_KMS_EVENT_QUEUE_MAX];
 } drmd_kms_event_file_t;
 
 typedef struct drmd_kms_mode_blob {
@@ -179,9 +195,12 @@ typedef struct drmd_kms_state {
     uint32_t next_magic;
     uint32_t next_blob;
     uint32_t current_fb;
-    uint32_t sequence;
     uint32_t delivered_flip_events;
     uint32_t dpms;
+    int vblank_timer_fd;
+    uint64_t vblank_epoch_ns;
+    uint64_t vblank_base_sequence;
+    uint64_t vblank_period_ns;
     drmd_modeinfo_t current_mode;
     kb_device_backend_t *device_backend;
     void *drm_device;
@@ -247,6 +266,16 @@ typedef struct drmd_kms_owner_context {
 
 static drmd_kms_state_t kms;
 
+enum { DRMD_VBLANK_DIAG_LIMIT = 64 };
+static uint32_t drmd_vblank_diag_count;
+
+#define DRMD_VBLANK_DIAG(...) do { \
+    if (drmd_vblank_diag_count < DRMD_VBLANK_DIAG_LIMIT) { \
+        drmd_vblank_diag_count++; \
+        printf(__VA_ARGS__); \
+    } \
+} while (0)
+
 static int attach_gem_context(void *drm_file, drmd_kms_gem_handle_t *gem);
 static int detach_gem_context(drmd_kms_gem_handle_t *gem);
 
@@ -255,6 +284,102 @@ static uint64_t monotonic_ns(void)
     struct timespec now = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t mode_vblank_period_ns(const drmd_modeinfo_t *mode)
+{
+    if (mode != NULL && mode->clock != 0 && mode->htotal != 0 &&
+        mode->vtotal != 0) {
+        const uint64_t pixels = (uint64_t)mode->htotal * mode->vtotal;
+        const uint64_t pixel_hz = (uint64_t)mode->clock * 1000u;
+        if (pixels <= UINT64_MAX / UINT64_C(1000000000)) {
+            const uint64_t numerator = pixels * UINT64_C(1000000000);
+            const uint64_t period = (numerator + pixel_hz - 1u) / pixel_hz;
+            if (period != 0) return period;
+        }
+    }
+    return UINT64_C(1000000000) / 60u;
+}
+
+static void sample_vblank(
+    uint64_t now_ns,
+    uint64_t *out_sequence,
+    uint64_t *out_sequence_ns)
+{
+    const uint64_t period = kms.vblank_period_ns != 0 ?
+        kms.vblank_period_ns : UINT64_C(1000000000) / 60u;
+    const uint64_t elapsed = now_ns >= kms.vblank_epoch_ns ?
+        now_ns - kms.vblank_epoch_ns : 0;
+    uint64_t frames = elapsed / period;
+    if (frames > UINT64_MAX - kms.vblank_base_sequence) {
+        frames = UINT64_MAX - kms.vblank_base_sequence;
+    }
+    if (out_sequence != NULL) *out_sequence = kms.vblank_base_sequence + frames;
+    if (out_sequence_ns != NULL) {
+        *out_sequence_ns = kms.vblank_epoch_ns + frames * period;
+    }
+}
+
+static uint64_t vblank_target_ns(uint64_t sequence)
+{
+    if (sequence <= kms.vblank_base_sequence) return kms.vblank_epoch_ns;
+    const uint64_t frames = sequence - kms.vblank_base_sequence;
+    const uint64_t period = kms.vblank_period_ns != 0 ?
+        kms.vblank_period_ns : UINT64_C(1000000000) / 60u;
+    if (frames > (UINT64_MAX - kms.vblank_epoch_ns) / period) {
+        return UINT64_MAX;
+    }
+    return kms.vblank_epoch_ns + frames * period;
+}
+
+static int any_pending_vblank(void)
+{
+    for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; ++i) {
+        if (kms.event_files[i].active &&
+            kms.event_files[i].pending_vblank_count != 0) return 1;
+    }
+    return 0;
+}
+
+static void arm_vblank_timer(void)
+{
+    if (kms.vblank_timer_fd < 16) return;
+    uint64_t earliest_ns = UINT64_MAX;
+    for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; ++i) {
+        const drmd_kms_event_file_t *event_file = &kms.event_files[i];
+        if (!event_file->active) continue;
+        for (size_t j = 0; j < DRMD_KMS_EVENT_QUEUE_MAX; ++j) {
+            const drmd_kms_pending_vblank_t *pending =
+                &event_file->pending_vblanks[j];
+            if (!pending->active) continue;
+            const uint64_t deadline = vblank_target_ns(pending->target_sequence);
+            if (deadline < earliest_ns) earliest_ns = deadline;
+        }
+    }
+    if (earliest_ns == UINT64_MAX) {
+        (void)pacha_timerfd_settime(kms.vblank_timer_fd, 0, 0, 0);
+        return;
+    }
+    const uint64_t now_ns = monotonic_ns();
+    const uint64_t relative_ns = earliest_ns > now_ns ? earliest_ns - now_ns : 1u;
+    const int status = pacha_timerfd_settime(
+        kms.vblank_timer_fd, relative_ns, 0, 0);
+    DRMD_VBLANK_DIAG(
+        "[drmd-vblank-diag] timer-arm fd=%d relative_ns=%llu status=%d\n",
+        kms.vblank_timer_fd, (unsigned long long)relative_ns, status);
+}
+
+static void set_current_mode(const drmd_modeinfo_t *mode)
+{
+    if (mode == NULL) return;
+    const uint64_t now_ns = monotonic_ns();
+    uint64_t sequence = 0;
+    sample_vblank(now_ns, &sequence, NULL);
+    kms.current_mode = *mode;
+    kms.vblank_base_sequence = sequence;
+    kms.vblank_epoch_ns = now_ns;
+    kms.vblank_period_ns = mode_vblank_period_ns(mode);
+    arm_vblank_timer();
 }
 
 #if PACHAOS_DRMD_STARTUP_PROFILE
@@ -530,10 +655,20 @@ int drmd_kms_init(struct drmd_drm_island *island)
     kms.next_magic = 1;
     kms.next_blob = DRMD_KMS_IN_FORMATS_BLOB_ID + 1u;
     kms.dpms = DRMD_MODE_DPMS_ON;
+    kms.vblank_timer_fd = -1;
     kms.device_backend = (kb_device_backend_t *)island->device_backend;
     kms.drm_device = kb_drm_primary_device();
     kms.vgdev = kb_drm_device_private(kms.drm_device);
     fill_mode(&kms.current_mode);
+    kms.vblank_epoch_ns = monotonic_ns();
+    kms.vblank_period_ns = mode_vblank_period_ns(&kms.current_mode);
+    const uint64_t timer_rights = PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_WRITE;
+    kms.vblank_timer_fd = pacha_timerfd_create(
+        0, 0, timer_rights, PACHA_FD_FLAG_CLOEXEC);
+    if (kms.vblank_timer_fd < 16) return kms.vblank_timer_fd;
     drmd_atomic_lifecycle_init(&kms.atomic);
     kms.atomic_pending.input_wait_fd = -1;
     const drmd_syncobj_fd_ops_t syncobj_ops = {
@@ -571,6 +706,8 @@ int drmd_kms_init(struct drmd_drm_island *island)
         find_symbol("virtio_gpu_cmd_transfer_to_host_3d", (void **)&kms.transfer_to_host_3d) != 0 ||
         drmd_virtio_gpu_unref_bridge_init(
             &kms.unref_bridge, kms.module, kms.vgdev) != 0) {
+        (void)pacha_fd_close(kms.vblank_timer_fd);
+        kms.vblank_timer_fd = -1;
         return -19;
     }
     kms.ready = 1;
@@ -1211,9 +1348,10 @@ static int consume_acquire_sync_file(drmd_kms_buffer_t *buffer)
     return close_status;
 }
 
-static int submit_scanout_fb(
+static int submit_fb_flush(
     drmd_kms_fb_t *fb,
     int consume_buffer_acquire,
+    int select_scanout,
     void **out_fence)
 {
     drmd_kms_buffer_t *buffer = fb != NULL ? fb->buffer : NULL;
@@ -1240,7 +1378,11 @@ static int submit_scanout_fb(
         kms.array_add(objects, buffer->object);
         kms.transfer_2d(kms.vgdev, 0, fb->width, fb->height, 0, 0, objects, NULL);
     }
-    kms.set_scanout(kms.vgdev, 0, buffer->resource_id, fb->width, fb->height, 0, 0);
+    if (select_scanout) {
+        kms.set_scanout(
+            kms.vgdev, 0, buffer->resource_id,
+            fb->width, fb->height, 0, 0);
+    }
     kms.flush(kms.vgdev, buffer->resource_id, 0, 0, fb->width, fb->height, NULL, fence);
     const uint32_t submitted_refs = drmd_dma_fence_refcount(fence);
     kms.notify(kms.vgdev);
@@ -1253,6 +1395,14 @@ static int submit_scanout_fb(
     return 0;
 }
 
+static int submit_scanout_fb(
+    drmd_kms_fb_t *fb,
+    int consume_buffer_acquire,
+    void **out_fence)
+{
+    return submit_fb_flush(fb, consume_buffer_acquire, 1, out_fence);
+}
+
 static int wait_scanout_fence(void *fence)
 {
     if (fence == NULL || drmd_dma_fence_refcount(fence) != 2) return -5;
@@ -1262,6 +1412,42 @@ static int wait_scanout_fence(void *fence)
         drmd_kms_progress_page_flip();
     }
     return drmd_dma_fence_refcount(fence) == 1 ? 0 : -5;
+}
+
+static int dirty_fb(uint64_t handle, const drmd_mode_fb_dirty_t *dirty)
+{
+    static uint32_t dirty_count;
+    dirty_count++;
+    if (dirty == NULL || dirty->flags != 0) {
+        printf("[drmd-dirty-diag] count=%u fb=%u flags=%u clips=%u status=-22\n",
+            dirty_count,
+            dirty != NULL ? dirty->fb_id : 0,
+            dirty != NULL ? dirty->flags : 0,
+            dirty != NULL ? dirty->num_clips : 0);
+        return -22;
+    }
+    drmd_kms_fb_t *fb = find_fb(handle, dirty->fb_id);
+    if (fb == NULL) {
+        printf("[drmd-dirty-diag] count=%u fb=%u flags=%u clips=%u status=-2\n",
+            dirty_count, dirty->fb_id, dirty->flags, dirty->num_clips);
+        return -2;
+    }
+    if (kms.pending_flip.active || kms.atomic_pending.active) {
+        printf("[drmd-dirty-diag] count=%u fb=%u flags=%u clips=%u status=-16\n",
+            dirty_count, dirty->fb_id, dirty->flags, dirty->num_clips);
+        return -16;
+    }
+    void *fence = NULL;
+    int status = submit_fb_flush(fb, 0, 0, &fence);
+    if (status == 0) {
+        status = wait_scanout_fence(fence);
+        if (status == 0) kb_kfree(fence);
+    }
+    if (dirty_count <= 8 || (dirty_count & (dirty_count - 1u)) == 0) {
+        printf("[drmd-dirty-diag] count=%u fb=%u flags=%u clips=%u status=%d\n",
+            dirty_count, dirty->fb_id, dirty->flags, dirty->num_clips, status);
+    }
+    return status;
 }
 
 static int scanout_fb(drmd_kms_fb_t *fb)
@@ -1344,13 +1530,119 @@ static drmd_kms_event_file_t *find_event_file_magic(uint32_t magic)
     return NULL;
 }
 
+static int queue_pending_vblank(
+    drmd_kms_event_file_t *event_file,
+    uint64_t target_sequence,
+    uint64_t user_data,
+    int crtc_sequence)
+{
+    if (event_file == NULL) return -9;
+    if (event_file->pending_vblank_count >= DRMD_KMS_EVENT_QUEUE_MAX) return -28;
+    for (size_t i = 0; i < DRMD_KMS_EVENT_QUEUE_MAX; ++i) {
+        drmd_kms_pending_vblank_t *pending = &event_file->pending_vblanks[i];
+        if (pending->active) continue;
+        *pending = (drmd_kms_pending_vblank_t){
+            .active = 1,
+            .crtc_sequence = crtc_sequence,
+            .target_sequence = target_sequence,
+            .user_data = user_data,
+        };
+        event_file->pending_vblank_count++;
+        DRMD_VBLANK_DIAG(
+            "[drmd-vblank-diag] queue owner=%llu kind=%s target=%llu user=%llu pending=%u\n",
+            (unsigned long long)event_file->owner,
+            crtc_sequence ? "crtc" : "vblank",
+            (unsigned long long)target_sequence,
+            (unsigned long long)user_data,
+            event_file->pending_vblank_count);
+        arm_vblank_timer();
+        return 0;
+    }
+    return -28;
+}
+
+static void emit_pending_vblank(
+    drmd_kms_event_file_t *event_file,
+    const drmd_kms_pending_vblank_t *pending,
+    uint64_t sequence,
+    uint64_t sequence_ns)
+{
+    const uint32_t tail =
+        (event_file->head + event_file->count) % DRMD_KMS_EVENT_QUEUE_MAX;
+    drmd_kms_event_t *event = &event_file->events[tail];
+    memset(event, 0, sizeof(*event));
+    if (pending->crtc_sequence) {
+        event->crtc_sequence.type = DRMD_EVENT_CRTC_SEQUENCE;
+        event->crtc_sequence.length = sizeof(event->crtc_sequence);
+        event->crtc_sequence.user_data = pending->user_data;
+        event->crtc_sequence.time_ns = (int64_t)sequence_ns;
+        event->crtc_sequence.sequence = sequence;
+    } else {
+        event->vblank.type = DRMD_EVENT_VBLANK;
+        event->vblank.length = sizeof(event->vblank);
+        event->vblank.user_data = pending->user_data;
+        event->vblank.tv_sec = (uint32_t)(sequence_ns / UINT64_C(1000000000));
+        event->vblank.tv_usec =
+            (uint32_t)((sequence_ns % UINT64_C(1000000000)) / 1000u);
+        event->vblank.sequence = (uint32_t)sequence;
+        event->vblank.crtc_id = DRMD_KMS_CRTC_ID;
+    }
+    event_file->count++;
+    DRMD_VBLANK_DIAG(
+        "[drmd-vblank-diag] emit owner=%llu kind=%s sequence=%llu user=%llu queued=%u\n",
+        (unsigned long long)event_file->owner,
+        pending->crtc_sequence ? "crtc" : "vblank",
+        (unsigned long long)sequence,
+        (unsigned long long)pending->user_data,
+        event_file->count);
+}
+
+static void progress_vblank_events(void)
+{
+    if (!any_pending_vblank()) return;
+    if (kms.vblank_timer_fd >= 16) {
+        struct pacha_pollfd pollfd = {
+            .fd = kms.vblank_timer_fd,
+            .events = PACHA_FD_EVENT_READABLE,
+        };
+        if (pacha_fd_poll(&pollfd, 1) > 0 &&
+            (pollfd.revents & PACHA_FD_EVENT_READABLE) != 0) {
+            uint64_t expirations = 0;
+            const long read_status = pacha_fd_read(
+                kms.vblank_timer_fd, &expirations, sizeof(expirations));
+            DRMD_VBLANK_DIAG(
+                "[drmd-vblank-diag] timer-wake fd=%d read=%ld expirations=%llu\n",
+                kms.vblank_timer_fd, read_status,
+                (unsigned long long)expirations);
+        }
+    }
+    const uint64_t now_ns = monotonic_ns();
+    uint64_t sequence = 0;
+    uint64_t sequence_ns = 0;
+    sample_vblank(now_ns, &sequence, &sequence_ns);
+    for (size_t i = 0; i < DRMD_KMS_EVENT_FILE_MAX; ++i) {
+        drmd_kms_event_file_t *event_file = &kms.event_files[i];
+        if (!event_file->active) continue;
+        for (size_t j = 0; j < DRMD_KMS_EVENT_QUEUE_MAX; ++j) {
+            drmd_kms_pending_vblank_t *pending = &event_file->pending_vblanks[j];
+            if (!pending->active || pending->target_sequence > sequence ||
+                event_file->count >= DRMD_KMS_EVENT_QUEUE_MAX) continue;
+            emit_pending_vblank(
+                event_file, pending, sequence, sequence_ns);
+            memset(pending, 0, sizeof(*pending));
+            event_file->pending_vblank_count--;
+        }
+    }
+    arm_vblank_timer();
+}
+
 static void queue_flip_event(
     drmd_kms_event_file_t *event_file,
     uint64_t user_data)
 {
     const uint32_t tail =
         (event_file->head + event_file->count) % DRMD_KMS_EVENT_QUEUE_MAX;
-    drmd_event_vblank_t *event = &event_file->events[tail];
+    drmd_event_vblank_t *event = &event_file->events[tail].vblank;
     memset(event, 0, sizeof(*event));
     const uint64_t queued_ns = monotonic_ns();
     event->type = DRMD_EVENT_FLIP_COMPLETE;
@@ -1358,7 +1650,9 @@ static void queue_flip_event(
     event->user_data = user_data;
     event->tv_sec = (uint32_t)(queued_ns / UINT64_C(1000000000));
     event->tv_usec = (uint32_t)((queued_ns % UINT64_C(1000000000)) / 1000u);
-    event->sequence = ++kms.sequence;
+    uint64_t sequence = 0;
+    sample_vblank(queued_ns, &sequence, NULL);
+    event->sequence = (uint32_t)sequence;
     event->crtc_id = DRMD_KMS_CRTC_ID;
     event_file->count++;
 }
@@ -1394,7 +1688,7 @@ static void atomic_finish(int status)
                 drmd_modeinfo_t mode;
                 if (mode_blob_mode(
                         kms.atomic_pending.owner, new_mode, 0, &mode) == 0) {
-                    kms.current_mode = mode;
+                    set_current_mode(&mode);
                 }
             }
             if ((kms.atomic_pending.flags & DRMD_MODE_PAGE_FLIP_EVENT) != 0) {
@@ -1480,6 +1774,7 @@ static void atomic_progress(void)
 
 void drmd_kms_progress_page_flip(void)
 {
+    progress_vblank_events();
     progress_buffer_destructions();
     atomic_progress();
     drmd_flip_completion_t completed;
@@ -1507,6 +1802,10 @@ size_t drmd_kms_collect_wait_sources(int *out_fds, size_t capacity)
         kms.atomic_pending.phase == DRMD_ATOMIC_PENDING_WAIT_ACQUIRE &&
         kms.atomic_pending.input_wait_fd >= 16) {
         out_fds[count++] = kms.atomic_pending.input_wait_fd;
+    }
+    if (count < capacity && kms.vblank_timer_fd >= 16 &&
+        any_pending_vblank()) {
+        out_fds[count++] = kms.vblank_timer_fd;
     }
     return count;
 }
@@ -2283,6 +2582,106 @@ int drmd_kms_ioctl(
     if (request->aux_size != 0 ||
         (request->fd_flags != 0 && !accepts_descriptors)) return -22;
     switch (command) {
+    case DRMD_IOCTL_CRTC_GET_SEQUENCE: {
+        if (request->data_size < sizeof(drmd_crtc_get_sequence_t)) return -22;
+        drmd_crtc_get_sequence_t *sequence = (void *)request->data;
+        if (sequence->crtc_id != DRMD_KMS_CRTC_ID) return -2;
+        uint64_t sequence_ns = 0;
+        sample_vblank(
+            monotonic_ns(), &sequence->sequence, &sequence_ns);
+        sequence->active = kms.current_fb != 0 && kms.dpms == DRMD_MODE_DPMS_ON;
+        sequence->sequence_ns = (int64_t)sequence_ns;
+        DRMD_VBLANK_DIAG(
+            "[drmd-vblank-diag] get owner=%llu active=%u fb=%u dpms=%u sequence=%llu\n",
+            (unsigned long long)request->handle, sequence->active,
+            kms.current_fb, kms.dpms,
+            (unsigned long long)sequence->sequence);
+        return 0;
+    }
+    case DRMD_IOCTL_CRTC_QUEUE_SEQUENCE: {
+        if (request->data_size < sizeof(drmd_crtc_queue_sequence_t)) return -22;
+        drmd_crtc_queue_sequence_t *queued = (void *)request->data;
+        if (queued->crtc_id != DRMD_KMS_CRTC_ID ||
+            (queued->flags & ~(uint32_t)(DRMD_CRTC_SEQUENCE_RELATIVE |
+                DRMD_CRTC_SEQUENCE_NEXT_ON_MISS)) != 0) return -22;
+        drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+        if (event_file == NULL) return -9;
+        uint64_t current = 0;
+        sample_vblank(monotonic_ns(), &current, NULL);
+        uint64_t target = queued->sequence;
+        if ((queued->flags & DRMD_CRTC_SEQUENCE_RELATIVE) != 0) {
+            if (target > UINT64_MAX - current) return -22;
+            target += current;
+        }
+        if (target <= current) {
+            if ((queued->flags & DRMD_CRTC_SEQUENCE_NEXT_ON_MISS) != 0) {
+                if (current == UINT64_MAX) return -22;
+                target = current + 1u;
+            } else {
+                target = current;
+            }
+        }
+        const int status = queue_pending_vblank(
+            event_file, target, queued->user_data, 1);
+        if (status == 0) queued->sequence = target;
+        DRMD_VBLANK_DIAG(
+            "[drmd-vblank-diag] queue-ioctl owner=%llu flags=0x%x current=%llu target=%llu status=%d\n",
+            (unsigned long long)request->handle, queued->flags,
+            (unsigned long long)current, (unsigned long long)target, status);
+        return status;
+    }
+    case DRMD_IOCTL_WAIT_VBLANK: {
+        if (request->data_size < sizeof(drmd_wait_vblank_t)) return -22;
+        drmd_wait_vblank_t *vblank = (void *)request->data;
+        const uint32_t type = vblank->request.type;
+        const uint32_t supported = DRMD_VBLANK_RELATIVE |
+            DRMD_VBLANK_EVENT | DRMD_VBLANK_NEXT_ON_MISS;
+        if ((type & ~supported) != 0 ||
+            (type & (DRMD_VBLANK_HIGH_CRTC_MASK |
+                DRMD_VBLANK_SECONDARY | DRMD_VBLANK_SIGNAL)) != 0) return -22;
+        uint64_t current = 0;
+        uint64_t current_ns = 0;
+        sample_vblank(monotonic_ns(), &current, &current_ns);
+        uint64_t target = vblank->request.sequence;
+        if ((type & DRMD_VBLANK_RELATIVE) != 0) {
+            if (target > UINT64_MAX - current) return -22;
+            target += current;
+        }
+        if (target <= current) {
+            if ((type & DRMD_VBLANK_NEXT_ON_MISS) != 0) {
+                if (current == UINT64_MAX) return -22;
+                target = current + 1u;
+            } else {
+                target = current;
+            }
+        }
+        if ((type & DRMD_VBLANK_EVENT) != 0) {
+            drmd_kms_event_file_t *event_file = find_event_file(request->handle);
+            if (event_file == NULL) return -9;
+            const uint64_t user_data = vblank->request.signal;
+            const int status = queue_pending_vblank(
+                event_file, target, user_data, 0);
+            if (status != 0) return status;
+            const uint64_t target_ns = vblank_target_ns(target);
+            vblank->reply.type = type;
+            vblank->reply.sequence = (uint32_t)target;
+            vblank->reply.tv_sec = (int64_t)(target_ns / UINT64_C(1000000000));
+            vblank->reply.tv_usec =
+                (int64_t)((target_ns % UINT64_C(1000000000)) / 1000u);
+            return 0;
+        }
+        /* The non-event query used by KMS clients is synchronous only when
+         * the requested sequence is already observable.  A future blocking
+         * wait requires a per-request deferred reply slot; do not block the
+         * single drmd service thread in the meantime. */
+        if (target > current) return -95;
+        vblank->reply.type = type;
+        vblank->reply.sequence = (uint32_t)current;
+        vblank->reply.tv_sec = (int64_t)(current_ns / UINT64_C(1000000000));
+        vblank->reply.tv_usec =
+            (int64_t)((current_ns % UINT64_C(1000000000)) / 1000u);
+        return 0;
+    }
     case DRMD_IOCTL_GET_MAGIC: {
         if (request->data_size < sizeof(uint32_t)) return -22;
         drmd_kms_event_file_t *event_file = find_event_file(request->handle);
@@ -2505,7 +2904,7 @@ int drmd_kms_ioctl(
         drmd_kms_fb_t *fb = find_fb(request->handle, wire->value.fb_id);
         if (fb == NULL || fb->width != wire->value.mode.hdisplay || fb->height != wire->value.mode.vdisplay) return -22;
         const int status = scanout_fb(fb);
-        if (status == 0) kms.current_mode = wire->value.mode;
+        if (status == 0) set_current_mode(&wire->value.mode);
         return status;
     }
     case DRMD_IOCTL_MODE_CURSOR: {
@@ -2558,6 +2957,11 @@ int drmd_kms_ioctl(
     }
     case DRMD_IOCTL_MODE_CLOSEFB:
         return -22;
+    case DRMD_IOCTL_MODE_DIRTYFB:
+        return request->data_size >= sizeof(drmd_mode_fb_dirty_t) ?
+            dirty_fb(
+                request->handle,
+                (const drmd_mode_fb_dirty_t *)request->data) : -22;
     case DRMD_IOCTL_MODE_PAGE_FLIP: {
         if (require_master(request->handle) != 0 || request->data_size < sizeof(drmd_mode_crtc_page_flip_t)) return -13;
         drmd_mode_crtc_page_flip_t *flip = (void *)request->data;
@@ -2659,9 +3063,9 @@ int drmd_kms_read(uint64_t handle, void *data, uint64_t capacity, uint64_t *out_
     if (capacity < sizeof(drmd_event_vblank_t)) return -22;
     uint8_t *output = data;
     while (event_file->count != 0 && *out_size + sizeof(drmd_event_vblank_t) <= capacity) {
-        note_flip_event_delivered(&event_file->events[event_file->head]);
-        memcpy(output + *out_size, &event_file->events[event_file->head], sizeof(drmd_event_vblank_t));
-        memset(&event_file->events[event_file->head], 0, sizeof(drmd_event_vblank_t));
+        note_flip_event_delivered(&event_file->events[event_file->head].vblank);
+        memcpy(output + *out_size, &event_file->events[event_file->head], sizeof(drmd_kms_event_t));
+        memset(&event_file->events[event_file->head], 0, sizeof(drmd_kms_event_t));
         event_file->head = (event_file->head + 1u) % DRMD_KMS_EVENT_QUEUE_MAX;
         event_file->count--;
         *out_size += sizeof(drmd_event_vblank_t);
@@ -2676,7 +3080,7 @@ int drmd_kms_peek_event(uint64_t handle, void *data, uint64_t capacity, uint64_t
     drmd_kms_event_file_t *event_file = find_event_file(handle);
     if (event_file == NULL) return -9;
     if (event_file->count == 0) return -11;
-    memcpy(data, &event_file->events[event_file->head], sizeof(drmd_event_vblank_t));
+    memcpy(data, &event_file->events[event_file->head], sizeof(drmd_kms_event_t));
     *out_size = sizeof(drmd_event_vblank_t);
     return 0;
 }
@@ -2686,8 +3090,8 @@ int drmd_kms_consume_event(uint64_t handle)
     drmd_kms_event_file_t *event_file = find_event_file(handle);
     if (event_file == NULL) return -9;
     if (event_file->count == 0) return -11;
-    note_flip_event_delivered(&event_file->events[event_file->head]);
-    memset(&event_file->events[event_file->head], 0, sizeof(drmd_event_vblank_t));
+    note_flip_event_delivered(&event_file->events[event_file->head].vblank);
+    memset(&event_file->events[event_file->head], 0, sizeof(drmd_kms_event_t));
     event_file->head = (event_file->head + 1u) % DRMD_KMS_EVENT_QUEUE_MAX;
     event_file->count--;
     return 0;
@@ -2736,7 +3140,10 @@ void drmd_kms_handle_close(struct drmd_drm_island *island, uint64_t handle)
     }
 
     drmd_kms_event_file_t *event_file = find_event_file(handle);
-    if (event_file != NULL) memset(event_file, 0, sizeof(*event_file));
+    if (event_file != NULL) {
+        memset(event_file, 0, sizeof(*event_file));
+        arm_vblank_timer();
+    }
     if (kms.master_handle == handle) kms.master_handle = 0;
     for (size_t i = 0; i < DRMD_KMS_FB_MAX; i++) {
         drmd_kms_fb_t *fb = &kms.fb[i];

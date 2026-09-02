@@ -161,10 +161,9 @@ int64_t lpr_filed_session_connect(void)
     request.word3 = request_id;
     request.fds = fds;
     request.fd_count = 3;
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
+    const int64_t reply_fd = lpr_native_ipc_call_wait(
         LPR_FILED_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&request);
+        &request);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
     if (reply_fd < 16) {
         lpr_destroy_standalone_wire_page(service_page_fd, service_page);
@@ -263,10 +262,9 @@ int64_t lpr_filed_fast_call(uint32_t op, uint64_t word2, uint64_t *out_result)
     request.word1 = FILED_OP_SESSION_DOORBELL;
     request.word2 = ++header->doorbell_seq;
     request.word3 = request_id;
-    int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_SEND,
+    int64_t status = lpr_native_ipc_send_wait(
         (uint64_t)(uint32_t)lpr_session_fd,
-        (uint64_t)(uintptr_t)&request);
+        &request);
     if (status != 0) {
         return lpr_pacha_status_to_errno(status);
     }
@@ -366,10 +364,9 @@ int64_t lpr_filed_fast_stat_close(
     request.word1 = FILED_OP_SESSION_DOORBELL;
     request.word2 = ++header->doorbell_seq;
     request.word3 = stat_request_id;
-    int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_SEND,
+    int64_t status = lpr_native_ipc_send_wait(
         (uint64_t)(uint32_t)lpr_session_fd,
-        (uint64_t)(uintptr_t)&request);
+        &request);
     if (status != 0) {
         /* A failed send did not publish the new tail to Filed.  Roll the two
          * reservations back so the ordinary one-at-a-time path can retry. */
@@ -436,12 +433,17 @@ int lpr_filed_live_object_generation(
     uint64_t handle,
     uint64_t *out_generation)
 {
-    if (handle == 0 || out_generation == 0 ||
-        lpr_filed_session_connect() != 0 || lpr_session_page == 0)
-    {
+    if (handle == 0 || out_generation == 0) {
         return -LPR_LINUX_EINVAL;
     }
+
+    int status = -LPR_LINUX_EINVAL;
     *out_generation = 0;
+    lpr_state_lock(&lpr_state.filed_rpc.lock_word);
+    if (lpr_filed_session_connect() != 0 || lpr_session_page == 0) {
+        goto out;
+    }
+
     const filed_fast_header_t *header =
         (const filed_fast_header_t *)lpr_session_page;
     if (header->magic != FILED_FAST_MAGIC ||
@@ -449,11 +451,13 @@ int lpr_filed_live_object_generation(
         header->generation_offset != FILED_FAST_GENERATION_OFFSET ||
         header->generation_capacity != FILED_FAST_GENERATION_CAPACITY)
     {
-        return -LPR_LINUX_EIO;
+        status = -LPR_LINUX_EIO;
+        goto out;
     }
     const filed_generation_entry_t *entries =
         (const filed_generation_entry_t *)((const uint8_t *)lpr_session_page +
             header->generation_offset);
+    status = -LPR_LINUX_ENOENT;
     for (uint64_t i = 0; i < header->generation_capacity; ++i) {
         const filed_generation_entry_t *entry = &entries[i];
         for (uint32_t retry = 0; retry < 4; ++retry) {
@@ -470,13 +474,17 @@ int lpr_filed_live_object_generation(
             if (before == after && (after & 1u) == 0) {
                 if (entry_handle == handle && generation != 0) {
                     *out_generation = generation;
-                    return 0;
+                    status = 0;
+                    goto out;
                 }
                 break;
             }
         }
     }
-    return -LPR_LINUX_ENOENT;
+
+out:
+    lpr_state_unlock(&lpr_state.filed_rpc.lock_word);
+    return status;
 }
 
 int lpr_create_wire_page(void **out_page)
@@ -634,27 +642,7 @@ void lpr_reset_fork_child_rpc_state(void)
     lpr_state.termd_rpc.lock_word = 0;
     lpr_state.netd_rpc.lock_word = 0;
     lpr_state.netd_rpc.endpoint_checked = 0;
-    if (lpr_netd_page_lease_fd >= 16) {
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE,
-            (uint64_t)(uint32_t)lpr_netd_page_lease_fd);
-    }
-    lpr_netd_page_attachment_id = 0;
-    lpr_netd_page_lease_fd = -1;
-    if (lpr_netd_page != 0) {
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)lpr_netd_page,
-            NETD_PAGE_BYTES);
-    }
-    if (lpr_netd_page_fd >= 16) {
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE,
-            (uint64_t)(uint32_t)lpr_netd_page_fd);
-    }
-    lpr_netd_page_fd = -1;
-    lpr_netd_page = 0;
-    lpr_netd_page_busy = 0;
+    lpr_netd_page_pool_after_fork_child();
 
     if (lpr_wire_page != 0) {
         (void)lpr_pacha_syscall2(
@@ -1354,10 +1342,9 @@ static int64_t lpr_filed_call_locked(
         .fds = fd_items,
         .fd_count = fd_count,
     };
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
+    const int64_t reply_fd = lpr_native_ipc_call_wait(
         LPR_FILED_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&request);
+        &request);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
         lpr_trace_error_record(

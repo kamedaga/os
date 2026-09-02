@@ -86,6 +86,7 @@ pub const ProcessDescriptor = struct {
     bootstrap_owner: bool = false,
     faulted: bool = false,
     fault_vector: u8 = 0,
+    signal_pending_hint_va: u64 = 0,
 };
 
 pub const ProcessStatus = struct {
@@ -468,6 +469,88 @@ pub const IpcWaitKey = struct {
     }
 };
 
+pub const FdWaitRegistrationKind = enum(u8) {
+    none = 0,
+    task = 1,
+    pipe = 2,
+    endpoint = 3,
+    channel = 4,
+    reply = 5,
+};
+
+pub const FdWaitRegistrationRef = struct {
+    kind: FdWaitRegistrationKind = .none,
+    side: u8 = 0,
+    slot: u8 = 0,
+    reserved0: u8 = 0,
+    index: u32 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: FdWaitRegistrationRef) bool {
+        return self.kind == .none;
+    }
+
+    pub fn matches(self: FdWaitRegistrationRef, other: FdWaitRegistrationRef) bool {
+        return self.kind == other.kind and
+            self.side == other.side and
+            self.slot == other.slot and
+            self.index == other.index and
+            self.generation == other.generation;
+    }
+};
+
+pub const FdWaitGroupRef = struct {
+    index: u16 = 0,
+    generation: u32 = 0,
+
+    pub fn isNull(self: FdWaitGroupRef) bool {
+        return self.generation == 0;
+    }
+
+    pub fn matches(self: FdWaitGroupRef, other: FdWaitGroupRef) bool {
+        return self.index == other.index and self.generation == other.generation;
+    }
+};
+
+pub const FdWaitGroupState = enum(u8) {
+    free = 0,
+    building = 1,
+    armed = 2,
+};
+
+pub const FdWaitGroupSlot = struct {
+    state: FdWaitGroupState = .free,
+    generation: u32 = 1,
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+    wait_token: u64 = 0,
+    link_count: u16 = 0,
+    links: [max_fd_wait_group_links]FdWaitRegistrationRef =
+        [_]FdWaitRegistrationRef{.{}} ** max_fd_wait_group_links,
+};
+
+pub const FdWaitGroupSnapshot = struct {
+    group: FdWaitGroupRef = .{},
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
+    wait_token: u64 = 0,
+};
+
+pub const max_fd_wait_groups: usize = fd_table_entries;
+// A bidirectional IPC channel poll item can require one registration for its
+// receive queue and one for its send queue.  This is the exact worst case for
+// max_pollfds entries; the user ABI itself is unchanged.
+pub const max_fd_wait_group_links: usize = fd_table_entries * 2;
+
+pub const FdWaitBinding = struct {
+    group: FdWaitGroupRef = .{},
+    link_index: u16 = 0,
+    wait_token: u64 = 0,
+    completion_pending: bool = false,
+};
+
 pub const IpcWaiter = struct {
     active: bool = false,
     owner: PrincipalId = default_process_principal,
@@ -480,28 +563,46 @@ pub const IpcWaiter = struct {
     events: u64 = 0,
     min_write_bytes: u64 = 0,
     key: IpcWaitKey = .{},
+    registration: FdWaitRegistrationRef = .{},
+    binding: FdWaitBinding = .{},
 };
 
 pub const ThreadWakeTarget = struct {
     owner: PrincipalId = default_process_principal,
     thread_index: usize = 0,
     thread_generation: u32 = 0,
-    hint_only: bool = false,
+    wait_token: u64 = 0,
     pollfd_va: u64 = 0,
     recv_msg_va: u64 = 0,
     recv_fd: Fd = 0,
     recv_fd_capacity: u8 = 0,
     revents: u64 = 0,
+    registration: FdWaitRegistrationRef = .{},
+    group: FdWaitGroupRef = .{},
+    group_link_index: u16 = 0,
+};
+
+/// Scheduling hint for an IPC object whose consumer is runnable rather than
+/// currently registered in the object's wait list.  The generation prevents a
+/// recycled thread-table slot from inheriting the hint.
+pub const IpcReceiverHint = struct {
+    active: bool = false,
+    owner: PrincipalId = default_process_principal,
+    thread_index: u32 = 0,
+    thread_generation: u32 = 0,
 };
 
 pub const TaskFdWaiter = struct {
     active: bool = false,
     principal_raw: PrincipalRaw = 0,
+    object: KernelObjectRef = .{},
     owner: PrincipalId = default_process_principal,
     pollfd_va: u64 = 0,
     events: u64 = 0,
     thread_index: u32 = 0,
     thread_generation: u32 = 0,
+    registration: FdWaitRegistrationRef = .{},
+    binding: FdWaitBinding = .{},
 };
 
 pub const max_task_fd_waiters: usize = fd_table_entries;
@@ -520,23 +621,6 @@ pub const PipeSlot = struct {
 
 pub const IpcWaitList = struct {
     waiters: [max_ipc_object_waiters]IpcWaiter = [_]IpcWaiter{.{}} ** max_ipc_object_waiters,
-    handoff_hint_valid: bool = false,
-    handoff_hint: ThreadWakeTarget = .{},
-
-    pub fn rememberHandoffHint(
-        self: *IpcWaitList,
-        owner: PrincipalId,
-        thread_index: usize,
-        thread_generation: u32,
-    ) void {
-        self.handoff_hint = .{
-            .owner = owner,
-            .thread_index = thread_index,
-            .thread_generation = thread_generation,
-            .hint_only = true,
-        };
-        self.handoff_hint_valid = true;
-    }
 
     pub fn register(
         self: *IpcWaitList,
@@ -550,10 +634,12 @@ pub const IpcWaitList = struct {
         min_write_bytes: u64,
         thread_index: usize,
         thread_generation: u32,
-    ) KernelError!void {
+        wait_token: u64,
+        group: FdWaitGroupRef,
+    ) KernelError!FdWaitRegistrationRef {
         if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+        if (wait_token == 0 or group.isNull()) return KernelError.InvalidState;
         const thread_index_u32: u32 = @intCast(thread_index);
-        self.rememberHandoffHint(owner, thread_index, thread_generation);
         var free_index: ?usize = null;
         var i: usize = 0;
         while (i < self.waiters.len) : (i += 1) {
@@ -562,7 +648,13 @@ pub const IpcWaitList = struct {
                 if (free_index == null) free_index = i;
                 continue;
             }
-            if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
+            if (waiter.thread_index == thread_index_u32 and
+                waiter.thread_generation == thread_generation and
+                waiter.binding.wait_token == wait_token and
+                waiter.binding.group.matches(group) and
+                waiter.pollfd_va == pollfd_va and
+                waiter.recv_msg_va == recv_msg_va)
+            {
                 waiter.events |= events;
                 waiter.key = key;
                 waiter.owner = owner;
@@ -571,10 +663,23 @@ pub const IpcWaitList = struct {
                 waiter.recv_fd = recv_fd;
                 waiter.recv_fd_capacity = recv_fd_capacity;
                 if (min_write_bytes > waiter.min_write_bytes) waiter.min_write_bytes = min_write_bytes;
-                return;
+                return waiter.registration;
             }
         }
         const target = free_index orelse return KernelError.TableFull;
+        const registration = FdWaitRegistrationRef{
+            .kind = switch (key.kind) {
+                .pipe => .pipe,
+                .endpoint => .endpoint,
+                .channel => .channel,
+                .reply => .reply,
+                else => return KernelError.InvalidState,
+            },
+            .side = key.side,
+            .slot = @intCast(target),
+            .index = key.index,
+            .generation = key.generation,
+        };
         self.waiters[target] = .{
             .active = true,
             .owner = owner,
@@ -587,24 +692,18 @@ pub const IpcWaitList = struct {
             .events = events,
             .min_write_bytes = min_write_bytes,
             .key = key,
+            .registration = registration,
+            .binding = .{
+                .wait_token = wait_token,
+                .group = group,
+            },
         };
-    }
-
-    pub fn handoffHint(self: *const IpcWaitList) ?ThreadWakeTarget {
-        if (!self.handoff_hint_valid) return null;
-        return self.handoff_hint;
+        return registration;
     }
 
     pub fn unregister(self: *IpcWaitList, thread_index: usize, thread_generation: u32) void {
         if (thread_index > std.math.maxInt(u32)) return;
         const thread_index_u32: u32 = @intCast(thread_index);
-        if (self.handoff_hint_valid and
-            self.handoff_hint.thread_index == thread_index and
-            self.handoff_hint.thread_generation == thread_generation)
-        {
-            self.handoff_hint = .{};
-            self.handoff_hint_valid = false;
-        }
         for (self.waiters[0..]) |*waiter| {
             if (!waiter.active) continue;
             if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
@@ -626,7 +725,7 @@ pub const IpcWaitList = struct {
         const fd_abi = @import("kernel_abi_root").fd_abi;
         var count: usize = 0;
         for (self.waiters[0..]) |*waiter| {
-            if (!waiter.active) continue;
+            if (!waiter.active or waiter.binding.completion_pending) continue;
             var revents = ready_events & (waiter.events | fd_abi.event_error | fd_abi.event_hangup);
             if ((revents & fd_abi.event_writable) != 0 and waiter.min_write_bytes != 0 and writable_bytes < waiter.min_write_bytes) {
                 revents &= ~fd_abi.event_writable;
@@ -636,13 +735,17 @@ pub const IpcWaitList = struct {
                 .owner = waiter.owner,
                 .thread_index = waiter.thread_index,
                 .thread_generation = waiter.thread_generation,
+                .wait_token = waiter.binding.wait_token,
                 .pollfd_va = waiter.pollfd_va,
                 .recv_msg_va = waiter.recv_msg_va,
                 .recv_fd = waiter.recv_fd,
                 .recv_fd_capacity = waiter.recv_fd_capacity,
                 .revents = revents,
+                .registration = waiter.registration,
+                .group = waiter.binding.group,
+                .group_link_index = waiter.binding.link_index,
             };
-            waiter.* = .{};
+            waiter.binding.completion_pending = true;
             if (count < out.len) {
                 out[count] = target;
                 count += 1;
@@ -713,6 +816,7 @@ pub const IpcEndpointSlot = struct {
     generation: u32 = 1,
     queue: IpcQueue = .{},
     waiters: IpcWaitList = .{},
+    receiver_hint: IpcReceiverHint = .{},
 };
 
 pub const IpcChannelSlot = struct {
@@ -729,6 +833,7 @@ pub const IpcReplySlot = struct {
     sent: bool = false,
     queue: IpcQueue = .{},
     waiters: IpcWaitList = .{},
+    receiver_hint: IpcReceiverHint = .{},
 };
 
 pub const IpcSendFd = struct {
@@ -753,6 +858,11 @@ pub const IpcRecvResult = struct {
     words: [4]u64 = .{ 0, 0, 0, 0 },
     fd_count: usize = 0,
     fds: [max_ipc_message_fds]IpcRecvFd = [_]IpcRecvFd{.{}} ** max_ipc_message_fds,
+};
+
+pub const IpcRecvOutcome = struct {
+    message: IpcRecvResult = .{},
+    writable_wake_count: usize = 0,
 };
 
 pub const native_page_size: u64 = 4096;

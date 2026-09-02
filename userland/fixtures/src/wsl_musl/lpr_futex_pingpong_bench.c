@@ -11,6 +11,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,6 +28,7 @@ static _Atomic uint32_t turn;
 static _Atomic uint32_t worker_ready;
 static unsigned iterations;
 static int socket_pair[2];
+static char named_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
 typedef struct socket_profile {
     _Atomic uint64_t send_ns;
@@ -293,6 +296,112 @@ static int run_socket_trial(unsigned trial)
     return 0;
 }
 
+static int named_socket_child_main(int listener)
+{
+    unsigned char request[64];
+    unsigned char response[64];
+    struct sockaddr_un address;
+    (void)close(listener);
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, named_socket_path, strlen(named_socket_path) + 1);
+
+    const int socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (socket_fd < 0) return 1;
+    if (connect(socket_fd, (const struct sockaddr *)&address,
+                sizeof(address)) != 0) {
+        return 2;
+    }
+
+    memset(response, 0x5a, sizeof(response));
+    for (unsigned i = 0; i < iterations; ++i) {
+        if (message_recv(socket_fd, request, sizeof(request)) != 0) return 3;
+        if (message_send(socket_fd, response, sizeof(response)) != 0) return 4;
+    }
+    (void)close(socket_fd);
+    return 0;
+}
+
+static int run_named_socket_trial(unsigned trial)
+{
+    unsigned char request[64];
+    unsigned char response[64];
+    struct sockaddr_un address;
+    memset(request, 0xa5, sizeof(request));
+
+    const int path_length = snprintf(named_socket_path, sizeof(named_socket_path),
+                                     "/tmp/lpr-futex-pingpong-%ld.sock",
+                                     (long)getpid());
+    if (path_length < 0 || (size_t)path_length >= sizeof(named_socket_path)) {
+        return 30;
+    }
+    (void)unlink(named_socket_path);
+
+    const int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (listener < 0) return 31;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, named_socket_path, strlen(named_socket_path) + 1);
+    if (bind(listener, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+        (void)close(listener);
+        return 32;
+    }
+    if (listen(listener, 1) != 0) {
+        (void)close(listener);
+        (void)unlink(named_socket_path);
+        return 33;
+    }
+
+    const pid_t child = fork();
+    if (child < 0) {
+        (void)close(listener);
+        (void)unlink(named_socket_path);
+        return 34;
+    }
+    if (child == 0) _exit(named_socket_child_main(listener));
+
+    for (;;) {
+        socket_pair[0] = accept(listener, 0, 0);
+        if (socket_pair[0] >= 0) break;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            struct pollfd wait = { .fd = listener, .events = POLLIN };
+            if (poll(&wait, 1, -1) > 0) continue;
+        }
+        return 35;
+    }
+    (void)close(listener);
+
+    const uint64_t begin = monotonic_ns();
+    for (unsigned i = 0; i < iterations; ++i) {
+        if (message_send(socket_pair[0], request, sizeof(request)) != 0) return 36;
+        if (message_recv(socket_pair[0], response, sizeof(response)) != 0) return 37;
+    }
+    const uint64_t end = monotonic_ns();
+
+    (void)close(socket_pair[0]);
+    (void)unlink(named_socket_path);
+    int child_status = 0;
+    pid_t wait_result;
+    do {
+        wait_result = waitpid(child, &child_status, 0);
+    } while (wait_result < 0 && errno == EINTR);
+    if (wait_result != child || !WIFEXITED(child_status) ||
+        WEXITSTATUS(child_status) != 0) {
+        return 38;
+    }
+
+    const uint64_t elapsed_ns = end - begin;
+    printf(
+        "LPR_NAMED_SOCKET_PINGPONG trial=%u iterations=%u elapsed_ns=%llu "
+        "ns_roundtrip=%llu\n",
+        trial,
+        iterations,
+        (unsigned long long)elapsed_ns,
+        (unsigned long long)(elapsed_ns / iterations));
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     unsigned trials = DEFAULT_TRIALS;
@@ -315,6 +424,15 @@ int main(int argc, char **argv)
         const int status = run_socket_trial(trial);
         if (status != 0) {
             fprintf(stderr, "LPR_SOCKET_PINGPONG_FAILED trial=%u status=%d errno=%d\n",
+                    trial, status, errno);
+            return status;
+        }
+    }
+    for (unsigned trial = 1; trial <= trials; ++trial) {
+        const int status = run_named_socket_trial(trial);
+        if (status != 0) {
+            fprintf(stderr,
+                    "LPR_NAMED_SOCKET_PINGPONG_FAILED trial=%u status=%d errno=%d\n",
                     trial, status, errno);
             return status;
         }

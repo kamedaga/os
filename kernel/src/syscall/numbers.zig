@@ -33,9 +33,11 @@ pub const syscall_getpid: u64 = runtime_abi.syscall_getpid;
 pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
 pub const syscall_system_info: u64 = runtime_abi.syscall_system_info;
 pub const syscall_clock_gettime: u64 = runtime_abi.syscall_clock_gettime;
+pub const syscall_clock_getres: u64 = runtime_abi.syscall_clock_getres;
 pub const syscall_nanosleep: u64 = runtime_abi.syscall_nanosleep;
 pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
 pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
+pub const syscall_futex_requeue: u64 = runtime_abi.syscall_futex_requeue;
 pub const syscall_getrandom: u64 = runtime_abi.syscall_getrandom;
 
 pub const syscall_fd_close: u64 = fd_abi.syscall_fd_close;
@@ -125,9 +127,11 @@ test "native syscall numbers are contiguous" {
         syscall_gettid,
         syscall_system_info,
         syscall_clock_gettime,
+        syscall_clock_getres,
         syscall_nanosleep,
         syscall_futex_wait,
         syscall_futex_wake,
+        syscall_futex_requeue,
         syscall_getrandom,
         syscall_fd_close,
         syscall_fd_dup,

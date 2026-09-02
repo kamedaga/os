@@ -67,6 +67,7 @@ pub const debug_trigger_page_fault_test = false;
 pub const user_process_count: usize = kernel.process_count;
 pub const user_thread_count: usize = scheduler.maxThreadSlots;
 pub const UserAddressSpace = address_space.UserAddressSpace;
+pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 
 pub const syscall_ok: u64 = syscall_numbers.syscall_ok;
 pub const syscall_err_invalid = syscall_numbers.syscall_err_invalid;

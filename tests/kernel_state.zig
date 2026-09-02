@@ -737,6 +737,31 @@ test "process fd exposes process object kind and lifecycle state" {
     try std.testing.expectEqual(@as(u32, 7), updated.exit_code);
 }
 
+test "process signal pending hint is process-scoped and cleared by lifecycle" {
+    var s = try initFdState();
+    try std.testing.expectEqual(@as(u64, 0), s.processSignalPendingHintVa(p1));
+    try std.testing.expect(s.setProcessSignalPendingHintVa(p1, 0x1234));
+    try std.testing.expectEqual(@as(u64, 0x1234), s.processSignalPendingHintVa(p1));
+
+    const child = s.createProcessDescriptor("fork-child") orelse unreachable;
+    try std.testing.expectEqual(@as(u64, 0), s.processSignalPendingHintVa(child));
+
+    const p1_index = kernel.processIndexFromPrincipal(p1) orelse unreachable;
+    try std.testing.expect(s.markProcessExited(p1));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        s.processDescriptorSlotConst(p1_index).?.signal_pending_hint_va,
+    );
+
+    try std.testing.expect(s.ensureProcessDescriptor(p1, "reused"));
+    try std.testing.expect(s.setProcessSignalPendingHintVa(p1, 0x5678));
+    try std.testing.expect(s.markProcessFaulted(p1, 13));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        s.processDescriptorSlotConst(p1_index).?.signal_pending_hint_va,
+    );
+}
+
 test "stale active process fd cannot retarget a reused principal generation" {
     var s = try initFdState();
     const rights = fdRights(.{ .kill = true, .wait = true, .close = true });
@@ -782,8 +807,10 @@ test "one thread can wait on multiple process fds" {
         .exit_code = 0,
     }, rights, .{}, 16);
 
-    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd1, 1, 0x1000, 7, 11));
-    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd2, 1, 0x1018, 7, 11));
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd1, 1, 0x1000, 7, 11, 1, group));
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd2, 1, 0x1018, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
 
     var targets: [2]kernel.ThreadWakeTarget = undefined;
     try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p1, targets[0..]));
@@ -973,6 +1000,69 @@ test "ipc channel pair sends to peer receive queue" {
     try std.testing.expectEqual(@as(u64, 8), received.words[3]);
 }
 
+test "ipc writable waiter wakes when receive frees a full channel queue" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const rights = fdRights(.{
+        .send = true,
+        .recv = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+    });
+    const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+
+    for (0..kernel.max_ipc_queue_messages) |sequence| {
+        try s.ipcSend(
+            p0,
+            pair.a,
+            .{ .words = .{ @intCast(sequence), 0, 0, 0 } },
+            &free_list,
+        );
+    }
+    try std.testing.expectEqual(
+        @as(?u64, 0),
+        s.fdPollEvents(p0, pair.a, fd_abi.event_writable, 0),
+    );
+    try std.testing.expectError(
+        KernelError.TableFull,
+        s.ipcSend(p0, pair.a, .{}, &free_list),
+    );
+
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 71);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        pair.a,
+        fd_abi.event_writable,
+        0x1000,
+        7,
+        11,
+        71,
+        group,
+    ));
+    try s.armFdWaitGroup(group);
+
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    const outcome = try s.ipcRecvWithWritableWake(
+        p0,
+        pair.b,
+        0,
+        16,
+        &free_list,
+        targets[0..],
+    );
+    try std.testing.expectEqual(@as(u64, 0), outcome.message.words[0]);
+    try std.testing.expectEqual(@as(usize, 1), outcome.writable_wake_count);
+    try std.testing.expectEqual(fd_abi.event_writable, targets[0].revents);
+    try std.testing.expectEqual(@as(u64, 0x1000), targets[0].pollfd_va);
+    try std.testing.expect(targets[0].group.matches(group));
+    try std.testing.expectEqual(
+        @as(?u64, fd_abi.event_writable),
+        s.fdPollEvents(p0, pair.a, fd_abi.event_writable, 0),
+    );
+    s.cancelFdWaitGroup(group, 71);
+}
+
 test "starting a new fd wait clears stale channel waiters for the thread" {
     var s = try initFdState();
     const rights = fdRights(.{
@@ -984,8 +1074,10 @@ test "starting a new fd wait clears stale channel waiters for the thread" {
     });
     const first = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
     const second = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
-    try s.registerIpcReadableWaiterForFd(p0, first.a, 1, 0x1000, 7, 11);
-    try s.registerIpcReadableWaiterForFd(p0, second.a, 1, 0x1018, 7, 11);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, first.a, 1, 0x1000, 7, 11, 1, group));
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, second.a, 1, 0x1018, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
 
     s.unregisterFdWaitersForThread(p0, 7, 11);
 
@@ -1013,7 +1105,9 @@ test "ipc channel hangup waiter wakes only after the peer's final fd closes" {
         else => unreachable,
     };
 
-    try s.registerIpcReadableWaiterForFd(p0, pair.a, fd_abi.event_hangup, 0x1000, 7, 11);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_hangup, 0x1000, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
 
     var targets: [2]kernel.ThreadWakeTarget = undefined;
     try s.closeFdWithFreeList(p0, pair.b, &free_list);
@@ -1042,7 +1136,9 @@ test "fd waiter cleanup removes a channel hangup-only waiter" {
         .channel => |handle| handle,
         else => unreachable,
     };
-    try s.registerIpcReadableWaiterForFd(p0, pair.a, fd_abi.event_hangup, 0x1000, 7, 11);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(p0, pair.a, fd_abi.event_hangup, 0x1000, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
 
     s.unregisterFdWaitersForThread(p0, 7, 11);
     try s.closeFdWithFreeList(p0, pair.b, &free_list);
@@ -1060,12 +1156,163 @@ test "signal wake cancellation clears ipc recv completion waiter" {
         .close = true,
     });
     const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
-    try s.registerIpcRecvCompletionWaiterForFd(p0, pair.a, 0x2000, 2, 7, 11);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    _ = try s.registerIpcRecvCompletionWaiterForFd(p0, pair.a, 0x2000, 2, 7, 11, 1, group);
+    try s.armFdWaitGroup(group);
 
     s.unregisterFdWaitersForThread(p0, 7, 11);
 
     var targets: [1]kernel.ThreadWakeTarget = undefined;
     try std.testing.expectEqual(@as(usize, 0), try s.wakeIpcWaitersForSendFd(p0, pair.b, targets[0..]));
+}
+
+test "fd wait group cancellation survives a destroyed object in the registration map" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const rights = fdRights(.{
+        .send = true,
+        .recv = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+    });
+    const destroyed = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const survivor = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 41);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        destroyed.a,
+        fd_abi.event_readable,
+        0x1000,
+        7,
+        11,
+        41,
+        group,
+    ));
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        survivor.a,
+        fd_abi.event_readable,
+        0x1018,
+        7,
+        11,
+        41,
+        group,
+    ));
+    try s.armFdWaitGroup(group);
+
+    try s.closeFdWithFreeList(p0, destroyed.a, &free_list);
+    try s.closeFdWithFreeList(p0, destroyed.b, &free_list);
+    s.cancelFdWaitGroup(group, 41);
+
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try s.wakeIpcWaitersForSendFd(p0, survivor.b, targets[0..]),
+    );
+}
+
+test "delayed target cannot cancel a reused fd wait group slot" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .send = true,
+        .recv = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+    });
+    const old_pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const new_pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const old_group = try s.beginFdWaitGroup(p0, 7, 11, 51);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        old_pair.a,
+        fd_abi.event_readable,
+        0x1000,
+        7,
+        11,
+        51,
+        old_group,
+    ));
+    try s.armFdWaitGroup(old_group);
+    var delayed: [1]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try s.wakeIpcWaitersForSendFd(p0, old_pair.b, delayed[0..]),
+    );
+    s.cancelFdWaitGroup(old_group, 51);
+
+    var i: usize = 0;
+    while (i < kernel.max_fd_wait_groups - 1) : (i += 1) {
+        const transient = try s.beginFdWaitGroup(p0, 8, @intCast(100 + i), @intCast(1000 + i));
+        s.cancelFdWaitGroup(transient, @intCast(1000 + i));
+    }
+    const new_group = try s.beginFdWaitGroup(p0, 7, 11, 52);
+    try std.testing.expectEqual(old_group.index, new_group.index);
+    try std.testing.expect(old_group.generation != new_group.generation);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        new_pair.a,
+        fd_abi.event_readable,
+        0x2000,
+        7,
+        11,
+        52,
+        new_group,
+    ));
+    try s.armFdWaitGroup(new_group);
+
+    s.cancelFdWaitGroup(delayed[0].group, delayed[0].wait_token);
+    var current: [1]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try s.wakeIpcWaitersForSendFd(p0, new_pair.b, current[0..]),
+    );
+    try std.testing.expect(current[0].group.matches(new_group));
+}
+
+test "duplicate poll entries stay grouped until completion" {
+    var s = try initFdState();
+    const rights = fdRights(.{
+        .send = true,
+        .recv = true,
+        .wait = true,
+        .poll = true,
+        .close = true,
+    });
+    const pair = try s.createIpcChannelPairFds(p0, rights, .{}, 16);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 61);
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        pair.a,
+        fd_abi.event_readable,
+        0x1000,
+        7,
+        11,
+        61,
+        group,
+    ));
+    try std.testing.expect(try s.registerIpcPollWaitersForFd(
+        p0,
+        pair.a,
+        fd_abi.event_readable,
+        0x1018,
+        7,
+        11,
+        61,
+        group,
+    ));
+    try s.armFdWaitGroup(group);
+
+    var targets: [2]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        try s.wakeIpcWaitersForSendFd(p0, pair.b, targets[0..]),
+    );
+    try std.testing.expect(targets[0].group.matches(group));
+    try std.testing.expect(targets[1].group.matches(group));
+    try std.testing.expectEqual(@as(u64, 0x1000), targets[0].pollfd_va);
+    try std.testing.expectEqual(@as(u64, 0x1018), targets[1].pollfd_va);
 }
 
 test "ipc call attaches one-shot reply fd" {
@@ -1088,6 +1335,48 @@ test "ipc call attaches one-shot reply fd" {
 
     const reply = try s.ipcRecv(p1, client_reply, 0, 16, &free_list);
     try std.testing.expectEqual(@as(u64, 1234), reply.words[0]);
+}
+
+test "ipc receiver handoff hints follow endpoint receiver and reply creator" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const endpoint = try s.createIpcEndpointFd(
+        p0,
+        fdRights(.{ .recv = true, .call = true, .transfer = true, .close = true }),
+        .{},
+        16,
+    );
+    const client_endpoint = try s.transferFd(
+        p0,
+        p1,
+        endpoint,
+        16,
+        fdRights(.{ .call = true, .close = true }),
+        .{},
+        .copy,
+    );
+
+    try std.testing.expect(s.ipcReceiverHandoffHintForSendFd(p1, client_endpoint) == null);
+    try std.testing.expect(s.noteIpcReceiverForFd(p0, endpoint, 7, 11));
+    const endpoint_hint = s.ipcReceiverHandoffHintForSendFd(p1, client_endpoint) orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 7), endpoint_hint.thread_index);
+    try std.testing.expectEqual(@as(u32, 11), endpoint_hint.thread_generation);
+    try std.testing.expectEqual(p0, endpoint_hint.owner);
+
+    const client_reply = try s.ipcCall(
+        p1,
+        client_endpoint,
+        .{ .words = .{ 99, 0, 0, 0 } },
+        16,
+        &free_list,
+    );
+    try std.testing.expect(s.noteIpcReceiverForFd(p1, client_reply, 9, 13));
+    const request = try s.ipcRecv(p0, endpoint, 1, 16, &free_list);
+    const server_reply = request.fds[0].fd;
+    const reply_hint = s.ipcReceiverHandoffHintForSendFd(p0, server_reply) orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 9), reply_hint.thread_index);
+    try std.testing.expectEqual(@as(u32, 13), reply_hint.thread_generation);
+    try std.testing.expectEqual(p1, reply_hint.owner);
 }
 
 test "irq fd records only matching device and MSI-X entry" {

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 
-PROMPT = b"bash-5.3# "
+PROMPTS = (b"bash-5.2# ", b"bash-5.3# ")
 DONE = b"LPR_FUTEX_PINGPONG_DONE"
 FAULT_MARKERS = (
     b"GENERAL PROTECTION",
@@ -43,7 +43,7 @@ def main() -> int:
             console_log.write(chunk)
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
-            if not sent and PROMPT in output:
+            if not sent and any(prompt in output for prompt in PROMPTS):
                 console.sendall(b"bash /cmd/lpr_futex_pingpong_bench.sh 64 3\n")
                 sent = True
                 output.clear()

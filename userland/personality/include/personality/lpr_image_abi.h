@@ -8,8 +8,6 @@
  * belong to their respective internal headers.
  */
 
-#define LPR_IMAGE_ABI_VERSION 14ull
-
 /* Fixed process-image mappings. */
 #define LPR_IMAGE_PAGE_SIZE PERSONALITY_PAGE_SIZE
 #define LPR_IMAGE_RUNTIME_PATH "/lib/pacha/lpr-linux-x86_64.so"

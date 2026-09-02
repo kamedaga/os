@@ -74,3 +74,73 @@ static inline int64_t lpr_native_ipc_recv_wait(
     } while (status == PACHA_SYSCALL_ERR_NOT_READY);
     return status;
 }
+
+static inline int64_t lpr_native_fd_wait_writable(uint64_t fd)
+{
+    for (;;) {
+        struct pacha_pollfd pollfd = {
+            .fd = (int)(uint32_t)fd,
+            .events = PACHA_FD_EVENT_WRITABLE,
+            .revents = 0,
+        };
+        const int64_t status = lpr_pacha_syscall4(
+            PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)&pollfd,
+            1,
+            PACHA_FD_WAIT_FOREVER,
+            0);
+        if (status > 0 && pollfd.revents != 0) {
+            return 0;
+        }
+        if (status != PACHA_SYSCALL_ERR_NOT_READY &&
+            status != -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            return status != 0 ? status : PACHA_SYSCALL_ERR_NOT_READY;
+        }
+    }
+}
+
+static inline int64_t lpr_native_ipc_send_wait(
+    uint64_t fd,
+    const struct pacha_ipc_msg *message)
+{
+    for (;;) {
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_SEND,
+            fd,
+            (uint64_t)(uintptr_t)message);
+        if (status == 0) {
+            return 0;
+        }
+        if (status != PACHA_SYSCALL_ERR_NOT_READY &&
+            status != -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            return status;
+        }
+        const int64_t wait_status = lpr_native_fd_wait_writable(fd);
+        if (wait_status != 0) {
+            return wait_status;
+        }
+    }
+}
+
+static inline int64_t lpr_native_ipc_call_wait(
+    uint64_t fd,
+    const struct pacha_ipc_msg *message)
+{
+    for (;;) {
+        const int64_t reply_fd = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_IPC_CALL,
+            fd,
+            (uint64_t)(uintptr_t)message);
+        if (reply_fd != PACHA_SYSCALL_ERR_NOT_READY &&
+            reply_fd != -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            return reply_fd;
+        }
+        const int64_t wait_status = lpr_native_fd_wait_writable(fd);
+        if (wait_status != 0) {
+            return wait_status;
+        }
+    }
+}

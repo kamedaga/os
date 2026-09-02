@@ -1,10 +1,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const kernel = @import("kernel.zig");
+const kernel_runtime = @import("kernel_runtime.zig");
 const address_space = @import("memory/address_space.zig");
 const interrupts = @import("interrupts.zig");
 const smp = @import("smp.zig");
 const scheduler_observer = @import("scheduler_observer.zig");
+const user_copy = @import("user_copy.zig");
 const x86_platform = @import("arch/x86_64/platform.zig");
 const kernel_log = @import("kernel_log.zig");
 const log_util = @import("log_util.zig");
@@ -17,7 +19,9 @@ pub const BeforeCurrentThreadLeaveCallback = struct {
     context: *anyopaque,
     run: *const fn (*anyopaque) void,
 };
+
 const UserAddressSpace = address_space.UserAddressSpace;
+const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 const default_process_principal: kernel.PrincipalId = kernel.processPrincipalFromIndex(0) orelse unreachable;
 const bootstrap_cpu_slot: usize = 0;
 const all_cpu_affinity_mask: u64 = if (smp.max_cpus >= 64) std.math.maxInt(u64) else (@as(u64, 1) << smp.max_cpus) - 1;
@@ -116,6 +120,9 @@ pub const ThreadContext = struct {
     // waking the thread in a newer, unrelated wait.
     active_wait_token: u64 = 0,
     next_wait_token: u64 = 1,
+    wait_completion_claimed: bool = false,
+    wait_completion_publish_pending: bool = false,
+    wait_completion_rax: u64 = 0,
     stopped: bool = false,
     resume_after_stop: bool = false,
     pending_signal_mask: u64 = 0,
@@ -144,10 +151,30 @@ const ThreadHotState = extern struct {
     ready: u8 = 0,
     stopped: u8 = 0,
     wait_mailbox: u8 = 0,
+    wait_completion_claimed: u8 = 0,
     owner_process: kernel.PrincipalId = default_process_principal,
     pending_signal_mask: u64 = 0,
     wake_tick: u64 = 0,
     cr3: u64 = 0,
+};
+
+const ProcessSignalTimer = struct {
+    active: bool = false,
+    principal: kernel.PrincipalId = default_process_principal,
+    signo: u32 = 0,
+    deadline_tick: u64 = 0,
+    interval_ticks: u64 = 0,
+};
+
+pub const ProcessSignalTimerState = struct {
+    signo: u32 = 0,
+    remaining_ticks: u64 = 0,
+    interval_ticks: u64 = 0,
+};
+
+pub const ExpiredProcessSignalTimer = struct {
+    principal: kernel.PrincipalId,
+    signo: u32,
 };
 
 fn buildInitialThreadContexts() [initialThreadCapacity]ThreadContext {
@@ -170,6 +197,8 @@ var initial_thread_contexts: [initialThreadCapacity]ThreadContext = buildInitial
 var initial_scheduler_entities: [initialThreadCapacity]scheduler_runqueue.Node = undefined;
 pub export var thread_contexts_ptr: *anyopaque = @ptrCast(initial_thread_contexts[0..].ptr);
 var initial_thread_hot_states: [initialThreadCapacity]ThreadHotState = buildInitialThreadHotStates();
+var process_signal_timers: [initialThreadCapacity]ProcessSignalTimer =
+    [_]ProcessSignalTimer{.{}} ** initialThreadCapacity;
 pub export var lapic_tick_count: u64 = 0;
 pub var scheduler_tick_accum: u64 = 0;
 pub var scheduler_switch_count: u64 = 0;
@@ -199,6 +228,7 @@ const ThreadTableState = struct {
     lock_state: SchedulerSpinLock = .{},
     contexts: []ThreadContext = initial_thread_contexts[0..],
     hot_states: []ThreadHotState = initial_thread_hot_states[0..],
+    signal_timers: []ProcessSignalTimer = process_signal_timers[0..],
     next_cpu_cursor: usize = bootstrap_cpu_slot,
 
     fn lock(self: *ThreadTableState) void {
@@ -1012,7 +1042,9 @@ fn claimKernelScheduledUserEntry(cpu_id: usize, out_entry: *scheduler_observer.U
 pub fn activateNextReadyOnCurrentCpu() bool {
     const cpu_id = currentCpu();
     const picked = verifiedPickThreadForCpu(cpu_id) orelse return false;
-    if (activateGeneration(picked.thread_index, picked.generation)) return true;
+    if (activateGeneration(picked.thread_index, picked.generation)) {
+        return true;
+    }
     verifiedRollbackPickedCpu(cpu_id, picked);
     return false;
 }
@@ -1024,7 +1056,9 @@ pub fn loadNextReadyThread(frame: *TrapFrame) bool {
         verifiedRollbackPickedCpu(cpu_id, picked);
         return false;
     }
-    if (loadContextIntoFrameGeneration(picked.thread_index, picked.generation, frame)) return true;
+    if (loadContextIntoFrameGeneration(picked.thread_index, picked.generation, frame)) {
+        return true;
+    }
     verifiedRollbackPickedCpu(cpu_id, picked);
     return false;
 }
@@ -1050,7 +1084,9 @@ pub fn loadNextReadyThreadOrIdle(frame: *TrapFrame) void {
 fn switchToNextReadyOnCurrentCpu(frame: *TrapFrame, saved_rax: ?u64) bool {
     const cpu_id = currentCpu();
     const picked = verifiedPickThreadForCpu(cpu_id) orelse return false;
-    if (switchToGeneration(picked.thread_index, picked.generation, frame, saved_rax)) return true;
+    if (switchToGeneration(picked.thread_index, picked.generation, frame, saved_rax)) {
+        return true;
+    }
     verifiedRollbackPickedCpu(cpu_id, picked);
     return false;
 }
@@ -1199,6 +1235,8 @@ pub fn parkApThreadForBlock(
                 frame.rax = ctx.frame.rax;
                 ctx.active_wait_token = 0;
                 ctx.wake_tick = 0;
+                ctx.wait_completion_publish_pending = false;
+                ctx.wait_completion_rax = 0;
                 scheduler_state.thread_table.unlock();
                 return true;
             }
@@ -1230,22 +1268,38 @@ pub fn parkApThreadForBlock(
         ctx.pkru = x86_platform.readPkru();
         ctx.wait_mailbox = wait_mailbox;
         ctx.active_wait_token = wait_token;
+        ctx.wait_completion_claimed = false;
+        ctx.wait_completion_publish_pending = false;
+        ctx.wait_completion_rax = 0;
         ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
         ctx.ready = false;
         setThreadHotCr3(current_thread, ctx.cr3);
         setThreadHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
+        setThreadHotCompletionClaimed(current_thread, false);
         verifiedBlockThread(current_thread);
+        // Publish the local CPU as idle before releasing the thread table.
+        // A remote completion takes that same table lock before it selects a
+        // wake CPU.  Publishing it afterwards leaves a window where the
+        // completion sees this thread as still executing on its old CPU,
+        // rejects its preferred handoff CPU, and sends an IPI here.  That IPI
+        // may interrupt the remaining ring-0 block tail; the wake handler
+        // deliberately returns from ring-0 work, after which this path would
+        // enter HLT with the only edge already consumed.
+        //
+        // Once this state is visible, either a preferred IPC handoff consumes
+        // the runnable receiver on the sender CPU, or an ordinary wake leaves
+        // a runnable entity visible to apIdleLoop before it executes HLT.
+        if (schedulerStateForSlot(currentCpu())) |state| {
+            state.lock.lock();
+            state.current_thread = state.idle_thread;
+            state.current_principal = null;
+            state.current_cr3 = 0;
+            state.is_idle = true;
+            state.lock.unlock();
+        }
     }
     scheduler_state.thread_table.unlock();
     if (before_block) |callback| callback.run(callback.context);
-    if (schedulerStateForSlot(currentCpu())) |state| {
-        state.lock.lock();
-        state.current_thread = state.idle_thread;
-        state.current_principal = null;
-        state.current_cr3 = 0;
-        state.is_idle = true;
-        state.lock.unlock();
-    }
     smp.returnCurrentApToIdleFromInterrupt();
 }
 
@@ -1310,6 +1364,7 @@ fn ensureThreadCapacity(required: usize, free_list: *kernel.FreePageList) bool {
     const capacity = nextThreadCapacity(required) orelse return false;
     const new_contexts = allocKernelSlice(ThreadContext, free_list, capacity) orelse return false;
     const new_hot_threads = allocKernelSlice(ThreadHotState, free_list, capacity) orelse return false;
+    const new_signal_timers = allocKernelSlice(ProcessSignalTimer, free_list, capacity) orelse return false;
     const new_entities = allocKernelSlice(scheduler_runqueue.Node, free_list, capacity - old_capacity) orelse return false;
 
     scheduler_state.thread_table.lock();
@@ -1319,16 +1374,19 @@ fn ensureThreadCapacity(required: usize, free_list: *kernel.FreePageList) bool {
     }
     @memcpy(new_contexts[0..old_capacity], scheduler_state.thread_table.contexts);
     @memcpy(new_hot_threads[0..old_capacity], scheduler_state.thread_table.hot_states);
+    @memcpy(new_signal_timers[0..old_capacity], scheduler_state.thread_table.signal_timers);
     var i = old_capacity;
     while (i < capacity) : (i += 1) {
         const entity = &new_entities[i - old_capacity];
         entity.reset(i, 1);
         new_contexts[i] = .{ .id = @intCast(i), .scheduler_entity = entity };
         new_hot_threads[i] = .{};
+        new_signal_timers[i] = .{};
     }
 
     scheduler_state.thread_table.contexts = new_contexts;
     scheduler_state.thread_table.hot_states = new_hot_threads;
+    scheduler_state.thread_table.signal_timers = new_signal_timers;
     thread_contexts_ptr = @ptrCast(scheduler_state.thread_table.contexts.ptr);
     return true;
 }
@@ -1346,6 +1404,7 @@ pub fn staticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_thread_contexts), &initial_thread_contexts));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(thread_contexts_ptr), &thread_contexts_ptr));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_thread_hot_states), &initial_thread_hot_states));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(process_signal_timers), &process_signal_timers));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(initial_scheduler_entities), &initial_scheduler_entities));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(scheduler_state), &scheduler_state));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(lapic_tick_count), &lapic_tick_count));
@@ -1790,10 +1849,9 @@ pub fn shouldPreemptApUserThread() bool {
     return false;
 }
 
-fn getUserSpace(user_spaces: []UserAddressSpace, principal: kernel.PrincipalId) ?*UserAddressSpace {
+fn getUserSpace(user_spaces: *UserAddressSpaceTable, principal: kernel.PrincipalId) ?*UserAddressSpace {
     const idx = kernel.processIndexFromPrincipal(principal) orelse return null;
-    if (idx >= user_spaces.len) return null;
-    return &user_spaces[idx];
+    return user_spaces.get(idx);
 }
 
 fn pcidForPrincipal(principal: kernel.PrincipalId) u16 {
@@ -1831,6 +1889,7 @@ fn hotStateFromContext(ctx: *const ThreadContext) ThreadHotState {
         .ready = boolByte(ctx.ready),
         .stopped = boolByte(ctx.stopped),
         .wait_mailbox = boolByte(ctx.wait_mailbox),
+        .wait_completion_claimed = boolByte(ctx.wait_completion_publish_pending),
         .owner_process = ctx.owner_process,
         .pending_signal_mask = ctx.pending_signal_mask,
         .wake_tick = ctx.wake_tick,
@@ -1862,6 +1921,11 @@ fn setThreadHotWaitState(thread_index: usize, wait_mailbox: bool, wake_tick: u64
         hot.wake_tick = wake_tick;
         hot.ready = boolByte(ready);
     }
+}
+
+fn setThreadHotCompletionClaimed(thread_index: usize, claimed: bool) void {
+    if (getThreadHotState(thread_index)) |hot|
+        hot.wait_completion_claimed = boolByte(claimed);
 }
 
 fn setThreadHotCr3(thread_index: usize, cr3: u64) void {
@@ -1910,7 +1974,7 @@ pub fn debugDumpRunnableState(reason: []const u8) void {
 fn initializeThreadContextWithReadyState(
     thread_index: usize,
     owner_process: kernel.PrincipalId,
-    user_spaces: []UserAddressSpace,
+    user_spaces: *UserAddressSpaceTable,
     initial_frame: TrapFrame,
     initial_ready: bool,
 ) bool {
@@ -1932,6 +1996,9 @@ fn initializeThreadContextWithReadyState(
     ctx.wait_mailbox = false;
     ctx.active_wait_token = 0;
     ctx.next_wait_token = 1;
+    ctx.wait_completion_claimed = false;
+    ctx.wait_completion_publish_pending = false;
+    ctx.wait_completion_rax = 0;
     ctx.stopped = false;
     ctx.resume_after_stop = false;
     ctx.pending_signal_mask = 0;
@@ -1969,7 +2036,7 @@ fn initializeThreadContextWithReadyState(
 pub fn initializeThreadContext(
     thread_index: usize,
     owner_process: kernel.PrincipalId,
-    user_spaces: []UserAddressSpace,
+    user_spaces: *UserAddressSpaceTable,
     initial_frame: TrapFrame,
 ) bool {
     return initializeThreadContextWithReadyState(thread_index, owner_process, user_spaces, initial_frame, true);
@@ -2008,7 +2075,7 @@ pub fn reserveCurrentWaitToken(expected_generation: u32) ?u64 {
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(thread_index) orelse return null;
     if (!ctx.allocated or ctx.generation != expected_generation or
-        !ctx.ready or ctx.active_wait_token != 0)
+        !ctx.ready or ctx.active_wait_token != 0 or ctx.wait_completion_claimed)
     {
         return null;
     }
@@ -2021,6 +2088,9 @@ pub fn reserveCurrentWaitToken(expected_generation: u32) ?u64 {
     // this token instead of being lost in the record-to-park window.
     ctx.wait_mailbox = true;
     ctx.active_wait_token = token;
+    ctx.wait_completion_publish_pending = false;
+    ctx.wait_completion_rax = 0;
+    setThreadHotCompletionClaimed(thread_index, false);
     return token;
 }
 
@@ -2038,6 +2108,10 @@ pub fn cancelCurrentWaitToken(expected_generation: u32, token: u64) void {
     ctx.wait_mailbox = false;
     ctx.active_wait_token = 0;
     ctx.wake_tick = 0;
+    ctx.wait_completion_claimed = false;
+    ctx.wait_completion_publish_pending = false;
+    ctx.wait_completion_rax = 0;
+    setThreadHotCompletionClaimed(thread_index, false);
 }
 
 pub fn waitTokenIsCurrent(
@@ -2064,15 +2138,15 @@ pub fn liveThreadCount(principal: kernel.PrincipalId) usize {
     return count;
 }
 
-pub fn allocateReadyThread(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame, free_list: *kernel.FreePageList) ?usize {
+pub fn allocateReadyThread(owner_process: kernel.PrincipalId, user_spaces: *UserAddressSpaceTable, initial_frame: TrapFrame, free_list: *kernel.FreePageList) ?usize {
     return allocateThreadWithReadyState(owner_process, user_spaces, initial_frame, true, free_list);
 }
 
-pub fn allocateSuspendedThread(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame, free_list: *kernel.FreePageList) ?usize {
+pub fn allocateSuspendedThread(owner_process: kernel.PrincipalId, user_spaces: *UserAddressSpaceTable, initial_frame: TrapFrame, free_list: *kernel.FreePageList) ?usize {
     return allocateThreadWithReadyState(owner_process, user_spaces, initial_frame, false, free_list);
 }
 
-fn allocateThreadWithReadyState(owner_process: kernel.PrincipalId, user_spaces: []UserAddressSpace, initial_frame: TrapFrame, initial_ready: bool, free_list: *kernel.FreePageList) ?usize {
+fn allocateThreadWithReadyState(owner_process: kernel.PrincipalId, user_spaces: *UserAddressSpaceTable, initial_frame: TrapFrame, initial_ready: bool, free_list: *kernel.FreePageList) ?usize {
     while (true) {
         var i: usize = 0;
         while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
@@ -2223,6 +2297,7 @@ pub fn suspendedThreadImage(
         ctx.ready or
         ctx.wait_mailbox or
         ctx.active_wait_token != 0 or
+        ctx.wait_completion_claimed or
         ctx.wake_tick != 0)
     {
         return null;
@@ -2289,6 +2364,7 @@ pub fn singleThreadExecImage(
     if (!staged_ctx.allocated or staged_ctx.generation != staged_generation or
         staged_ctx.owner_process != staged_owner or staged_ctx.cpu_slot >= scheduler_state.cpus.len or
         staged_ctx.ready or staged_ctx.wait_mailbox or staged_ctx.active_wait_token != 0 or
+        staged_ctx.wait_completion_claimed or
         staged_ctx.wake_tick != 0 or
         staged_ctx.stopped or staged_ctx.resume_after_stop)
     {
@@ -2332,7 +2408,7 @@ pub fn singleThreadExecImage(
 }
 
 pub fn installExecContextForCurrentThread(
-    user_spaces: []UserAddressSpace,
+    user_spaces: *UserAddressSpaceTable,
     owner_process: kernel.PrincipalId,
     image: SuspendedThreadImage,
 ) bool {
@@ -2360,6 +2436,7 @@ pub fn installExecContextForCurrentThread(
         // Keep pending signals across exec, but require the new runtime to
         // register its own address-bound delivery configuration.
         ctx.signal_entry = 0;
+        _ = kernel_runtime.kernel_state_global.clearProcessSignalPendingHintVa(owner_process);
         ctx.signal_inhibit_start = 0;
         ctx.signal_inhibit_end = 0;
         ctx.signal_inhibit_secondary_start = 0;
@@ -2375,6 +2452,9 @@ pub fn installExecContextForCurrentThread(
         ctx.ready = true;
         ctx.wait_mailbox = false;
         ctx.active_wait_token = 0;
+        ctx.wait_completion_claimed = false;
+        ctx.wait_completion_publish_pending = false;
+        ctx.wait_completion_rax = 0;
         ctx.wake_tick = 0;
         ctx.stopped = false;
         ctx.resume_after_stop = false;
@@ -2494,21 +2574,73 @@ pub fn handoffToReadyThreadGenerationWithRax(
         return false;
     };
     const current_generation = current_ctx.generation;
+    const target_cpu = target_ctx.cpu_slot;
     const can_handoff =
         current_ctx.allocated and
         target_ctx.allocated and
         target_ctx.generation == target_generation and
         target_ctx.ready and
-        current_ctx.cpu_slot == cpu_id and
-        target_ctx.cpu_slot == cpu_id;
+        current_ctx.cpu_slot == cpu_id;
     scheduler_state.thread_table.unlock();
     if (!can_handoff) return false;
+    // IPC completion may have made the receiver runnable on another CPU.
+    // Move only that runnable generation into the sender's runqueue before
+    // consuming it there: migrateRunnableThreadGeneration serializes both
+    // runqueues and republishes cpu_slot, so the target never has two owners.
+    // If its old CPU has already selected it, migration fails and the normal
+    // remote wake remains the safe fallback.
+    if (target_cpu != cpu_id and
+        !migrateRunnableThreadGeneration(target_thread, target_generation, cpu_id))
+    {
+        return false;
+    }
     if (!verifiedHandoffToThreadOnCpu(cpu_id, target_thread, target_generation, current_thread, current_generation)) return false;
-    if (before_current_thread_leave) |callback| callback.run(callback.context);
-    if (switchTo(target_thread, frame, sender_rax)) return true;
+    // Keep the caller's global state lock through the scheduler transition.
+    // Once the verified core has made the target the running entity, dropping
+    // that lock before installing its saved context lets a remote lifecycle
+    // operation invalidate either side of the handoff.  A failed switch would
+    // then return to the syscall with both a rolled-back scheduler transition
+    // and an already-released lock.  The callback is still before the actual
+    // user return when it runs after the in-kernel context installation.
+    if (switchTo(target_thread, frame, sender_rax)) {
+        if (before_current_thread_leave) |callback| callback.run(callback.context);
+        return true;
+    }
 
     verifiedRollbackHandoff(cpu_id, current_thread, current_generation);
     return false;
+}
+
+/// Consume one local runnable entity at a user-mode wake-IPI boundary.  The
+/// normal remote-wake path has no sender trap frame to name a particular
+/// receiver, but it must still not leave a newly runnable entity behind an
+/// unrelated userspace timeslice.  `handoffToReadyThreadGenerationWithRax`
+/// keeps the runqueue ownership transition atomic and preserves the
+/// interrupted thread as runnable on this CPU.
+pub fn handoffToBestReadyThreadForWakeIpi(frame: *TrapFrame) bool {
+    if (!verifiedCoreReady()) return false;
+    const cpu_id = currentCpu();
+    if (cpu_id >= verifiedCoreCpuCount()) return false;
+    const current_thread = currentThread();
+    const state = schedulerStateForSlot(cpu_id) orelse return false;
+
+    state.runqueue_lock.lock();
+    const target = state.runqueue.bestEligible(state.virtual_time) orelse {
+        state.runqueue_lock.unlock();
+        return false;
+    };
+    const target_thread = target.thread_index;
+    const target_generation = target.generation;
+    state.runqueue_lock.unlock();
+    if (target_thread == current_thread) return false;
+
+    return handoffToReadyThreadGenerationWithRax(
+        frame,
+        target_thread,
+        target_generation,
+        frame.rax,
+        null,
+    );
 }
 
 pub fn prepareExitHandoffToReadyThreadGeneration(target_thread: usize, target_generation: u32) bool {
@@ -2653,6 +2785,7 @@ fn wakeIfWaitingGenerationInternal(
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(thread_index) orelse return false;
     if (!ctx.allocated or ctx.generation != generation) return false;
+    if (ctx.wait_completion_claimed) return false;
     if (mailbox_only) {
         if (!ctx.wait_mailbox or ctx.active_wait_token != 0) return false;
     } else if (ctx.ready) {
@@ -2692,15 +2825,14 @@ pub fn wakeIfWaitingTokenGenerationWithRax(
     defer scheduler_state.thread_table.unlock();
     const ctx = threadContextMutable(thread_index) orelse return .stale;
     if (!ctx.allocated or ctx.owner_process != owner or
-        ctx.generation != generation or ctx.active_wait_token != wait_token)
+        ctx.generation != generation or ctx.active_wait_token != wait_token or
+        ctx.wait_completion_claimed)
     {
         return .stale;
     }
 
     if (ctx.ready) {
         if (!ctx.wait_mailbox) return .stale;
-        // The waiter has reserved its token but has not parked yet.  Preserve
-        // the token until blockCurrentThread() consumes this completion.
         ctx.frame.rax = resume_rax;
         ctx.wait_mailbox = false;
         ctx.wake_tick = 0;
@@ -2732,6 +2864,144 @@ pub fn wakeIfWaitingTokenGenerationWithRax(
         return .publish_failed;
     }
     return .woke;
+}
+
+pub const WaitTokenClaimResult = enum {
+    claimed,
+    stale,
+};
+
+pub const ClaimedWaitPublishResult = enum {
+    published,
+    pending,
+    stale,
+};
+
+pub fn claimWaitTokenCompletion(
+    thread_index: usize,
+    generation: u32,
+    owner: kernel.PrincipalId,
+    wait_token: u64,
+) WaitTokenClaimResult {
+    if (wait_token == 0) return .stale;
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return .stale;
+    if (!ctx.allocated or ctx.owner_process != owner or
+        ctx.generation != generation or ctx.active_wait_token != wait_token or
+        !ctx.wait_mailbox or ctx.wait_completion_claimed)
+    {
+        return .stale;
+    }
+    ctx.wait_completion_claimed = true;
+    ctx.wait_completion_publish_pending = false;
+    // Claim is the completion linearization point.  Timeout and signal paths
+    // must no longer be able to win while KernelState cleanup/copyout runs.
+    ctx.wake_tick = 0;
+    setThreadHotWaitState(thread_index, true, 0, ctx.ready);
+    setThreadHotCompletionClaimed(thread_index, false);
+    return .claimed;
+}
+
+fn publishClaimedWaitLocked(
+    thread_index: usize,
+    generation: u32,
+    owner: kernel.PrincipalId,
+    wait_token: u64,
+    resume_rax: u64,
+    preferred_cpu: ?usize,
+) ClaimedWaitPublishResult {
+    const ctx = threadContextMutable(thread_index) orelse return .stale;
+    if (!ctx.allocated or ctx.owner_process != owner or
+        ctx.generation != generation or ctx.active_wait_token != wait_token or
+        !ctx.wait_completion_claimed)
+    {
+        return .stale;
+    }
+    ctx.wait_completion_rax = resume_rax;
+    if (ctx.ready) {
+        ctx.frame.rax = resume_rax;
+        ctx.wait_mailbox = false;
+        ctx.wake_tick = 0;
+        ctx.wait_completion_claimed = false;
+        ctx.wait_completion_publish_pending = false;
+        setThreadHotWaitState(thread_index, false, 0, true);
+        setThreadHotCompletionClaimed(thread_index, false);
+        return .published;
+    }
+
+    ctx.frame.rax = resume_rax;
+    ctx.wait_mailbox = false;
+    ctx.active_wait_token = 0;
+    ctx.wake_tick = 0;
+    if (ctx.stopped) {
+        ctx.resume_after_stop = true;
+        ctx.wait_completion_claimed = false;
+        ctx.wait_completion_publish_pending = false;
+        setThreadHotWaitState(thread_index, false, 0, false);
+        setThreadHotCompletionClaimed(thread_index, false);
+        return .published;
+    }
+    ctx.ready = true;
+    setThreadHotWaitState(thread_index, false, 0, true);
+    if (!verifiedWakeThreadGenerationPreferred(thread_index, generation, preferred_cpu)) {
+        // Registrations and user copyout have already completed.  Keep this
+        // scheduler-owned completion non-runnable and retry publication from
+        // the maintenance tick; it must never revert to an ordinary wait.
+        ctx.active_wait_token = wait_token;
+        ctx.ready = false;
+        ctx.wait_completion_claimed = true;
+        ctx.wait_completion_publish_pending = true;
+        setThreadHotWaitState(thread_index, false, 0, false);
+        setThreadHotCompletionClaimed(thread_index, true);
+        return .pending;
+    }
+    ctx.wait_completion_claimed = false;
+    ctx.wait_completion_publish_pending = false;
+    setThreadHotCompletionClaimed(thread_index, false);
+    return .published;
+}
+
+pub fn publishClaimedWaitCompletion(
+    thread_index: usize,
+    generation: u32,
+    owner: kernel.PrincipalId,
+    wait_token: u64,
+    resume_rax: u64,
+) ClaimedWaitPublishResult {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    return publishClaimedWaitLocked(
+        thread_index,
+        generation,
+        owner,
+        wait_token,
+        resume_rax,
+        null,
+    );
+}
+
+/// Publish an IPC completion directly on the sender's CPU.  The caller can
+/// then hand off to that same runnable generation without first waking its old
+/// CPU and racing it into the running state.
+pub fn publishClaimedWaitCompletionPreferred(
+    thread_index: usize,
+    generation: u32,
+    owner: kernel.PrincipalId,
+    wait_token: u64,
+    resume_rax: u64,
+    preferred_cpu: usize,
+) ClaimedWaitPublishResult {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    return publishClaimedWaitLocked(
+        thread_index,
+        generation,
+        owner,
+        wait_token,
+        resume_rax,
+        preferred_cpu,
+    );
 }
 
 pub fn wakeIfWaitingGeneration(thread_index: usize, generation: u32) bool {
@@ -2782,7 +3052,127 @@ fn firstUnblockedPendingSignal(ctx: *const ThreadContext) u32 {
     return @as(u32, @intCast(@ctz(deliverable))) + 1;
 }
 
-pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) ?SignalDelivery {
+fn publishPendingSignalHint(principal: kernel.PrincipalId) void {
+    const hint_va = kernel_runtime.kernel_state_global.processSignalPendingHintVa(principal);
+    if (hint_va == 0) return;
+    var pending: u32 = 1;
+    _ = user_copy.copyBytesToUserVa(principal, hint_va, std.mem.asBytes(&pending));
+}
+
+fn processSignalTimerState(
+    timer: *const ProcessSignalTimer,
+    now_tick: u64,
+) ProcessSignalTimerState {
+    if (!timer.active) return .{};
+    return .{
+        .signo = timer.signo,
+        .remaining_ticks = if (timer.deadline_tick > now_tick)
+            timer.deadline_tick - now_tick
+        else
+            0,
+        .interval_ticks = timer.interval_ticks,
+    };
+}
+
+pub fn getProcessSignalTimer(
+    principal: kernel.PrincipalId,
+    now_tick: u64,
+) ProcessSignalTimerState {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    for (scheduler_state.thread_table.signal_timers) |*timer| {
+        if (timer.active and timer.principal == principal)
+            return processSignalTimerState(timer, now_tick);
+    }
+    return .{};
+}
+
+pub fn setProcessSignalTimer(
+    principal: kernel.PrincipalId,
+    signo: u32,
+    initial_ticks: u64,
+    interval_ticks: u64,
+    now_tick: u64,
+) error{Full}!ProcessSignalTimerState {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+
+    var free_slot: ?*ProcessSignalTimer = null;
+    for (scheduler_state.thread_table.signal_timers) |*timer| {
+        if (timer.active and timer.principal == principal) {
+            const old = processSignalTimerState(timer, now_tick);
+            if (initial_ticks == 0) {
+                timer.* = .{};
+                return old;
+            }
+            const deadline, const overflow = @addWithOverflow(now_tick, initial_ticks);
+            timer.* = .{
+                .active = true,
+                .principal = principal,
+                .signo = signo,
+                .deadline_tick = if (overflow == 0) deadline else std.math.maxInt(u64),
+                .interval_ticks = interval_ticks,
+            };
+            return old;
+        }
+        if (!timer.active and free_slot == null) free_slot = timer;
+    }
+
+    if (initial_ticks == 0) return .{};
+    const timer = free_slot orelse return error.Full;
+    const deadline, const overflow = @addWithOverflow(now_tick, initial_ticks);
+    timer.* = .{
+        .active = true,
+        .principal = principal,
+        .signo = signo,
+        .deadline_tick = if (overflow == 0) deadline else std.math.maxInt(u64),
+        .interval_ticks = interval_ticks,
+    };
+    return .{};
+}
+
+pub fn clearProcessSignalTimer(principal: kernel.PrincipalId) void {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    for (scheduler_state.thread_table.signal_timers) |*timer| {
+        if (timer.active and timer.principal == principal) timer.* = .{};
+    }
+}
+
+pub fn takeExpiredProcessSignalTimer(now_tick: u64) ?ExpiredProcessSignalTimer {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    for (scheduler_state.thread_table.signal_timers) |*timer| {
+        if (!timer.active or timer.deadline_tick == 0 or now_tick < timer.deadline_tick)
+            continue;
+        const expired = ExpiredProcessSignalTimer{
+            .principal = timer.principal,
+            .signo = timer.signo,
+        };
+        if (timer.interval_ticks == 0) {
+            timer.* = .{};
+        } else {
+            const elapsed = now_tick - timer.deadline_tick;
+            const periods = elapsed / timer.interval_ticks + 1;
+            const advance, const mul_overflow =
+                @mulWithOverflow(periods, timer.interval_ticks);
+            const next, const add_overflow =
+                @addWithOverflow(timer.deadline_tick, advance);
+            timer.deadline_tick = if (mul_overflow == 0 and add_overflow == 0)
+                next
+            else
+                std.math.maxInt(u64);
+        }
+        return expired;
+    }
+    return null;
+}
+
+pub fn deliverSignal(
+    principal: kernel.PrincipalId,
+    signo: u32,
+    blocked_resume_rax: u64,
+) ?SignalDelivery {
     const signal_bit = signalBit(signo) orelse return null;
     scheduler_state.thread_table.lock();
     // Select the delivery target under the table lock so the pending signal is
@@ -2818,9 +3208,11 @@ pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) ?SignalDelivery 
     }
     const newly_pending = (ctx.pending_signal_mask & signal_bit) == 0;
     const should_interrupt = newly_pending and (ctx.signal_blocked_mask & signal_bit) == 0;
-    const was_blocked = should_interrupt and !ctx.ready;
+    const was_blocked = should_interrupt and !ctx.ready and
+        !ctx.wait_completion_claimed;
     const generation = ctx.generation;
     ctx.pending_signal_mask |= signal_bit;
+    publishPendingSignalHint(principal);
     // A blocked thread is interrupted immediately below by signalProcess().
     // A runnable thread consumes the interruption when it next attempts to
     // block. Standard signals coalesce by bit, while different blocked signals
@@ -2831,6 +3223,22 @@ pub fn deliverSignal(principal: kernel.PrincipalId, signo: u32) ?SignalDelivery 
         ctx.signal_interrupt_consumed = true;
     }
     setThreadHotPendingSignalMask(target, ctx.pending_signal_mask);
+    if (was_blocked) {
+        // Token invalidation and the blocked/runnable transition share this
+        // lock with event completion claim.  Exactly one of signal, timeout,
+        // or FD completion can own the wait.
+        ctx.frame.rax = blocked_resume_rax;
+        ctx.wait_mailbox = false;
+        ctx.active_wait_token = 0;
+        ctx.wake_tick = 0;
+        ctx.wait_completion_claimed = false;
+        ctx.wait_completion_publish_pending = false;
+        ctx.wait_completion_rax = 0;
+        ctx.ready = true;
+        setThreadHotWaitState(target, false, 0, true);
+        setThreadHotCompletionClaimed(target, false);
+        _ = verifiedWakeThreadGeneration(target, generation);
+    }
     scheduler_state.thread_table.unlock();
     return .{
         .thread_index = target,
@@ -2872,11 +3280,41 @@ pub fn configureCurrentSignalDelivery(
 
 pub fn setCurrentSignalBlockedMask(blocked_mask: u64) bool {
     scheduler_state.thread_table.lock();
-    defer scheduler_state.thread_table.unlock();
-    const ctx = threadContextMutable(currentThread()) orelse return false;
-    if (!ctx.allocated or ctx.signal_entry == 0) return false;
+    const ctx = threadContextMutable(currentThread()) orelse {
+        scheduler_state.thread_table.unlock();
+        return false;
+    };
+    if (!ctx.allocated or ctx.signal_entry == 0) {
+        scheduler_state.thread_table.unlock();
+        return false;
+    }
     ctx.signal_blocked_mask = blocked_mask;
     ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
+    const should_publish = !ctx.signal_interrupt_consumed;
+    const principal = ctx.owner_process;
+    scheduler_state.thread_table.unlock();
+    if (should_publish) publishPendingSignalHint(principal);
+    return true;
+}
+
+pub fn setCurrentSignalPendingHint(hint_va: u64) bool {
+    scheduler_state.thread_table.lock();
+    const ctx = threadContextMutable(currentThread()) orelse {
+        scheduler_state.thread_table.unlock();
+        return false;
+    };
+    if (!ctx.allocated or ctx.signal_entry == 0 or !ctx.signal_owner) {
+        scheduler_state.thread_table.unlock();
+        return false;
+    }
+    const should_publish = firstUnblockedPendingSignal(ctx) != 0;
+    const principal = ctx.owner_process;
+    if (!kernel_runtime.kernel_state_global.setProcessSignalPendingHintVa(principal, hint_va)) {
+        scheduler_state.thread_table.unlock();
+        return false;
+    }
+    scheduler_state.thread_table.unlock();
+    if (should_publish) publishPendingSignalHint(principal);
     return true;
 }
 
@@ -2911,18 +3349,25 @@ pub fn copyThreadXState(source_thread: usize, target_thread: usize) bool {
 pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
     const thread_index = currentThread();
     scheduler_state.thread_table.lock();
-    defer scheduler_state.thread_table.unlock();
-    const ctx = threadContextMutable(thread_index) orelse return null;
+    const ctx = threadContextMutable(thread_index) orelse {
+        scheduler_state.thread_table.unlock();
+        return null;
+    };
     const signo = firstUnblockedPendingSignal(ctx);
-    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0) return null;
+    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0) {
+        scheduler_state.thread_table.unlock();
+        return null;
+    }
     if (ctx.signal_inhibit_start < ctx.signal_inhibit_end and
         rip >= ctx.signal_inhibit_start and rip < ctx.signal_inhibit_end)
     {
+        scheduler_state.thread_table.unlock();
         return null;
     }
     if (ctx.signal_inhibit_secondary_start < ctx.signal_inhibit_secondary_end and
         rip >= ctx.signal_inhibit_secondary_start and rip < ctx.signal_inhibit_secondary_end)
     {
+        scheduler_state.thread_table.unlock();
         return null;
     }
     const claimed = ClaimedSignal{
@@ -2933,17 +3378,33 @@ pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
     ctx.pending_signal_mask &= ~signalBit(signo).?;
     ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
     setThreadHotPendingSignalMask(thread_index, ctx.pending_signal_mask);
+    const should_publish = !ctx.signal_interrupt_consumed;
+    const principal = ctx.owner_process;
+    scheduler_state.thread_table.unlock();
+    if (should_publish) publishPendingSignalHint(principal);
     return claimed;
 }
 
 pub fn restoreClaimedSignal(claimed: ClaimedSignal) void {
     scheduler_state.thread_table.lock();
-    defer scheduler_state.thread_table.unlock();
-    const ctx = threadContextMutable(claimed.thread_index) orelse return;
-    if (!ctx.allocated) return;
-    ctx.pending_signal_mask |= signalBit(claimed.signo) orelse return;
+    const ctx = threadContextMutable(claimed.thread_index) orelse {
+        scheduler_state.thread_table.unlock();
+        return;
+    };
+    if (!ctx.allocated) {
+        scheduler_state.thread_table.unlock();
+        return;
+    }
+    const signal_bit = signalBit(claimed.signo) orelse {
+        scheduler_state.thread_table.unlock();
+        return;
+    };
+    ctx.pending_signal_mask |= signal_bit;
     ctx.signal_interrupt_consumed = firstUnblockedPendingSignal(ctx) == 0;
     setThreadHotPendingSignalMask(claimed.thread_index, ctx.pending_signal_mask);
+    const principal = ctx.owner_process;
+    scheduler_state.thread_table.unlock();
+    publishPendingSignalHint(principal);
 }
 
 pub fn copyCurrentSignalXState(out: *[xstate_bytes]u8) bool {
@@ -3018,6 +3479,7 @@ pub fn continuePrincipalThreads(principal: kernel.PrincipalId) usize {
 }
 
 pub fn releasePrincipalThreads(principal: kernel.PrincipalId) usize {
+    clearProcessSignalTimer(principal);
     var released: usize = 0;
     var i: usize = 0;
     while (i < scheduler_state.thread_table.contexts.len) : (i += 1) {
@@ -3028,6 +3490,26 @@ pub fn releasePrincipalThreads(principal: kernel.PrincipalId) usize {
     return released;
 }
 
+fn retryClaimedWaitCompletion(thread_index: usize) void {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(thread_index) orelse return;
+    if (!ctx.allocated or ctx.ready or !ctx.wait_completion_claimed or
+        !ctx.wait_completion_publish_pending or
+        ctx.active_wait_token == 0)
+    {
+        return;
+    }
+    _ = publishClaimedWaitLocked(
+        thread_index,
+        ctx.generation,
+        ctx.owner_process,
+        ctx.active_wait_token,
+        ctx.wait_completion_rax,
+        null,
+    );
+}
+
 pub fn wakeExpiredTimers(now_tick: u64) void {
     if (!isBootstrapSchedulerCpu()) return;
     var i: usize = 0;
@@ -3035,6 +3517,10 @@ pub fn wakeExpiredTimers(now_tick: u64) void {
         const hot = getThreadHotStateConst(i) orelse continue;
         if (hot.allocated == 0) continue;
         if (hot.ready != 0) continue;
+        if (hot.wait_completion_claimed != 0) {
+            retryClaimedWaitCompletion(i);
+            continue;
+        }
         if (hot.wake_tick == 0 or now_tick < hot.wake_tick) continue;
         wakeIfTimerExpired(i, now_tick);
     }
@@ -3067,6 +3553,8 @@ pub fn blockCurrentThread(
             frame.rax = ctx.frame.rax;
             ctx.active_wait_token = 0;
             ctx.wake_tick = 0;
+            ctx.wait_completion_publish_pending = false;
+            ctx.wait_completion_rax = 0;
             scheduler_state.thread_table.unlock();
             return true;
         }
@@ -3099,14 +3587,29 @@ pub fn blockCurrentThread(
     ctx.pkru = x86_platform.readPkru();
     ctx.wait_mailbox = wait_mailbox;
     ctx.active_wait_token = wait_token;
+    ctx.wait_completion_claimed = false;
+    ctx.wait_completion_publish_pending = false;
+    ctx.wait_completion_rax = 0;
     ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
     ctx.ready = false;
     setThreadHotCr3(current_thread, ctx.cr3);
     setThreadHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
+    setThreadHotCompletionClaimed(current_thread, false);
     verifiedBlockThread(current_thread);
+    // Match the AP block ordering: a keyed remote completion selects its
+    // destination while holding this table lock.  It must observe either the
+    // current runnable thread or a CPU that is already logically idle, never
+    // a blocked thread still advertised as the CPU's current owner.
+    noteCpuIdleTick(currentCpu());
     scheduler_state.thread_table.unlock();
     if (before_block) |callback| callback.run(callback.context);
-    if (switchToNextReadyOnCurrentCpu(frame, resume_rax)) return true;
+    // The blocked context was saved before its scheduler entity left the
+    // running state.  A remote CPU may complete this wait after the table lock
+    // is dropped and publish a different rax into ctx.frame.  Do not use the
+    // ordinary switch path here: it saves the live syscall frame again and can
+    // overwrite that completion (including when the just-woken current thread
+    // is picked).  Only activate and load the selected saved context.
+    if (loadNextReadyThread(frame)) return true;
     // There is no userspace context to return to while the caller is blocked.
     // Keep CPU 0 interruptible until a wakeup publishes a ready thread, then
     // load the wake-provided frame without overwriting rax with the original

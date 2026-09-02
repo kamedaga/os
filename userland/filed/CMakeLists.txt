@@ -168,6 +168,7 @@ add_custom_command(
     ${FILED_EXTRA_SOURCES}
     "${REPO_ROOT}/userland/koboxd/include/koboxd/control_protocol.h"
     "${REPO_ROOT}/userland/koboxd/include/koboxd/storage_protocol.h"
+    "${REPO_ROOT}/userland/koboxd/src/fs_backend.h"
     "${REPO_ROOT}/userland/koboxd/src/storage_benchmark.h"
     "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
     "${REPO_ROOT}/userland/storage/include/storage/ext4_nvme_benchmark_spec.h"

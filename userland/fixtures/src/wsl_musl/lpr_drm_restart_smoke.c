@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <GLES2/gl2.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
@@ -62,6 +63,26 @@ static int run_iteration(unsigned iteration)
     EGLint egl_major = 0;
     EGLint egl_minor = 0;
     if (!eglInitialize(display, &egl_major, &egl_minor)) return fail(iteration, "eglInitialize");
+    static const EGLint context_attributes[] = {
+        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR,
+        EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
+        EGL_CONTEXT_MAJOR_VERSION_KHR,
+        3,
+        EGL_CONTEXT_MINOR_VERSION_KHR,
+        1,
+        EGL_NONE,
+    };
+    if (!eglBindAPI(EGL_OPENGL_API)) return fail(iteration, "eglBindAPI");
+    EGLContext context = eglCreateContext(
+        display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, context_attributes);
+    if (context == EGL_NO_CONTEXT) return fail(iteration, "eglCreateContext");
+    if (!eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, context)) {
+        return fail(iteration, "eglMakeCurrent-context");
+    }
+    const GLubyte *renderer = glGetString(GL_RENDERER);
+    if (renderer == NULL) return fail(iteration, "glGetString-renderer");
+    printf("DRM_RESTART_EGL_CONTEXT iter=%u renderer=%s\n", iteration, renderer);
+    fflush(stdout);
 
     errno = 0;
     if (drmSetMaster(fd) != 0) return fail(iteration, "drmSetMaster");
@@ -114,8 +135,21 @@ static int run_iteration(unsigned iteration)
     drmModeFreeConnector(connector);
     drmModeFreeResources(resources);
     if (munmap(pixels, create.size) != 0) return fail(iteration, "munmap");
-    (void)eglTerminate(display);
+    printf("DRM_RESTART_EGL_CLEANUP_BEGIN iter=%u stage=make-current-null\n", iteration);
+    fflush(stdout);
+    if (!eglMakeCurrent(
+            display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
+        return fail(iteration, "eglMakeCurrent-null");
+    }
+    printf("DRM_RESTART_EGL_CLEANUP_DONE iter=%u stage=make-current-null\n", iteration);
+    printf("DRM_RESTART_EGL_CLEANUP_BEGIN iter=%u stage=terminate\n", iteration);
+    fflush(stdout);
+    if (!eglTerminate(display)) return fail(iteration, "eglTerminate");
+    printf("DRM_RESTART_EGL_CLEANUP_DONE iter=%u stage=terminate\n", iteration);
+    printf("DRM_RESTART_EGL_CLEANUP_BEGIN iter=%u stage=gbm-destroy\n", iteration);
+    fflush(stdout);
     gbm_device_destroy(gbm);
+    printf("DRM_RESTART_EGL_CLEANUP_DONE iter=%u stage=gbm-destroy\n", iteration);
     printf("DRM_RESTART_ITER pass=%u egl=%d.%d fb=%u color=%06x\n",
         iteration, egl_major, egl_minor, fb_id, color & 0xffffffu);
     fflush(stdout);

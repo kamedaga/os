@@ -121,23 +121,91 @@ fn statusFromPipeError(err: kernel.PipeIoError) u64 {
     return 0 -% status;
 }
 
-fn wakeThreadTargets(h: anytype, targets: []const kernel.ThreadWakeTarget) bool {
-    for (targets) |target| {
-        // Shared wait lists can outlive the process which registered them.
-        // Reject the saved user VA after its thread slot has been reused.
-        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.pollfd_va != 0) {
-            if (!h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents)) return false;
+fn sameFdWaitGroup(a: kernel.ThreadWakeTarget, b: kernel.ThreadWakeTarget) bool {
+    return a.wait_token == b.wait_token and a.group.matches(b.group);
+}
+
+pub fn wakeThreadTargets(
+    h: anytype,
+    state: *kernel.KernelState,
+    targets: []const kernel.ThreadWakeTarget,
+) bool {
+    var all_copies_ok = true;
+    for (targets, 0..) |target, target_index| {
+        if (target.wait_token == 0 or target.group.isNull()) continue;
+        var already_handled = false;
+        for (targets[0..target_index]) |earlier| {
+            if (sameFdWaitGroup(earlier, target)) {
+                already_handled = true;
+                break;
+            }
         }
-        _ = h.wake_waiting_thread_generation_with_rax(target.thread_index, target.thread_generation, 1);
+        if (already_handled) continue;
+
+        const claim = scheduler.claimWaitTokenCompletion(
+            target.thread_index,
+            target.thread_generation,
+            target.owner,
+            target.wait_token,
+        );
+        switch (claim) {
+            .stale => {
+                state.cancelFdWaitGroup(target.group, target.wait_token);
+                continue;
+            },
+            .claimed => {},
+        }
+
+        // Targets are snapshots.  Remove every registration in the group
+        // before touching userspace, while the scheduler claim keeps the
+        // target non-runnable and excludes timeout/signal completion.
+        state.cancelFdWaitGroup(target.group, target.wait_token);
+        var ready_count: u64 = 0;
+        var copy_ok = true;
+        for (targets, 0..) |member, member_index| {
+            if (!sameFdWaitGroup(member, target) or member.pollfd_va == 0) continue;
+            var duplicate_poll_item = false;
+            for (targets[0..member_index]) |earlier| {
+                if (sameFdWaitGroup(earlier, target) and
+                    earlier.pollfd_va == member.pollfd_va)
+                {
+                    duplicate_poll_item = true;
+                    break;
+                }
+            }
+            if (duplicate_poll_item) continue;
+            var combined_revents: u64 = 0;
+            for (targets[member_index..]) |candidate| {
+                if (sameFdWaitGroup(candidate, target) and
+                    candidate.pollfd_va == member.pollfd_va)
+                {
+                    combined_revents |= candidate.revents;
+                }
+            }
+            if (!h.write_user_u64(
+                member.owner,
+                member.pollfd_va + fd_abi.pollfd_revents_offset,
+                combined_revents,
+            )) copy_ok = false;
+            if (combined_revents != 0) ready_count += 1;
+        }
+        const resume_rax = if (copy_ok) ready_count else sc.syscall_err_invalid;
+        _ = scheduler.publishClaimedWaitCompletion(
+            target.thread_index,
+            target.thread_generation,
+            target.owner,
+            target.wait_token,
+            resume_rax,
+        );
+        if (!copy_ok) all_copies_ok = false;
     }
-    return true;
+    return all_copies_ok;
 }
 
 fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool, ready_events: u64) bool {
     var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takePipeWaiters(pipe_ref, write_side, ready_events, wake_storage[0..]);
-    return wakeThreadTargets(h, wake_storage[0..wake_count]);
+    return wakeThreadTargets(h, state, wake_storage[0..wake_count]);
 }
 
 fn ipcChannelHandleForFd(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) ?kernel.IpcChannelHandle {
@@ -151,7 +219,7 @@ fn ipcChannelHandleForFd(state: *kernel.KernelState, proc: kernel.PrincipalId, f
 fn wakeIpcChannelCloseWaiters(h: anytype, state: *kernel.KernelState, handle: kernel.IpcChannelHandle) bool {
     var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takeIpcChannelPeerCloseWaiters(handle, wake_storage[0..]);
-    return wakeThreadTargets(h, wake_storage[0..wake_count]);
+    return wakeThreadTargets(h, state, wake_storage[0..wake_count]);
 }
 
 fn wakeReadyPipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.PipeRef, write_side: bool) bool {
@@ -246,9 +314,14 @@ fn fdWrite(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
         }
     }
     const value = readUserU64Bytes(h, proc, in_va, len) orelse return sc.syscall_err_invalid;
+    const event_object = (state.fdEntryConst(proc, fd) orelse return sc.syscall_err_invalid).object;
     var wake_storage: [max_fd_wake_owners]kernel.PrincipalId = undefined;
     const wake_count = state.eventWakeOwnersForFd(proc, fd, wake_storage[0..]) catch return sc.syscall_err_invalid;
     state.eventWriteCounter(proc, fd, value) catch return sc.syscall_err_invalid;
+    var target_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
+    const target_count = state.takeObjectReadableWaiters(event_object, target_storage[0..]);
+    if (!wakeThreadTargets(h, state, target_storage[0..target_count]))
+        return sc.syscall_err_invalid;
     wakeOwners(h, wake_storage[0..wake_count]);
     return 8;
 }
@@ -452,16 +525,86 @@ fn registerCachedWaitersForPoll(
     items: []const PollItem,
     thread_index: usize,
     thread_generation: u32,
+    wait_token: u64,
+    group: kernel.FdWaitGroupRef,
 ) kernel.KernelError!void {
     for (items) |item| {
-        if (try state.registerTaskReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation)) {
+        if (try state.registerTaskReadableWaiterForFd(
+            proc,
+            item.fd,
+            item.events,
+            item.item_va,
+            thread_index,
+            thread_generation,
+            wait_token,
+            group,
+        )) {
             continue;
         }
-        if (try state.registerPipeWaiterForFd(proc, item.fd, item.events, item.item_va, item.min_write_bytes, thread_index, thread_generation)) {
+        if (try state.registerPipeWaiterForFd(
+            proc,
+            item.fd,
+            item.events,
+            item.item_va,
+            item.min_write_bytes,
+            thread_index,
+            thread_generation,
+            wait_token,
+            group,
+        )) {
             continue;
         }
-        try state.registerIpcReadableWaiterForFd(proc, item.fd, item.events, item.item_va, thread_index, thread_generation);
+        _ = try state.registerIpcPollWaitersForFd(
+            proc,
+            item.fd,
+            item.events,
+            item.item_va,
+            thread_index,
+            thread_generation,
+            wait_token,
+            group,
+        );
     }
+}
+
+pub fn reclaimStaleFdWaitGroups(state: *kernel.KernelState) void {
+    var snapshots: [kernel.max_fd_wait_groups]kernel.FdWaitGroupSnapshot = undefined;
+    const count = state.snapshotFdWaitGroups(snapshots[0..]);
+    for (snapshots[0..count]) |snapshot| {
+        if (scheduler.waitTokenIsCurrent(
+            snapshot.owner,
+            snapshot.thread_index,
+            snapshot.thread_generation,
+            snapshot.wait_token,
+        )) continue;
+        state.cancelFdWaitGroup(snapshot.group, snapshot.wait_token);
+    }
+}
+
+pub fn beginFdWaitGroupWithReclaim(
+    state: *kernel.KernelState,
+    owner: kernel.PrincipalId,
+    thread_index: usize,
+    thread_generation: u32,
+    wait_token: u64,
+) kernel.KernelError!kernel.FdWaitGroupRef {
+    return state.beginFdWaitGroup(
+        owner,
+        thread_index,
+        thread_generation,
+        wait_token,
+    ) catch |err| switch (err) {
+        kernel.KernelError.TableFull => {
+            reclaimStaleFdWaitGroups(state);
+            return state.beginFdWaitGroup(
+                owner,
+                thread_index,
+                thread_generation,
+                wait_token,
+            );
+        },
+        else => return err,
+    };
 }
 
 fn unregisterCachedWaitersForPoll(
@@ -473,7 +616,7 @@ fn unregisterCachedWaitersForPoll(
 ) void {
     for (items) |item| {
         state.unregisterPipeWaiterForFd(proc, item.fd, item.events, thread_index, thread_generation);
-        state.unregisterIpcReadableWaiterForFd(proc, item.fd, item.events, thread_index, thread_generation);
+        state.unregisterIpcPollWaitersForFd(proc, item.fd, thread_index, thread_generation);
     }
     state.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
 }
@@ -508,20 +651,48 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const current_thread = scheduler.currentThread();
     const current_generation = scheduler.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
     state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
+    const wait_token = scheduler.reserveCurrentWaitToken(current_generation) orelse
+        return sc.syscall_err_invalid;
+    const group = beginFdWaitGroupWithReclaim(
+        state,
+        proc,
+        current_thread,
+        current_generation,
+        wait_token,
+    ) catch |err| {
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        return statusFromKernelError(err);
+    };
     const register_start = ipc_metric.timestamp();
-    registerCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation) catch |err| {
-        unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
+    registerCachedWaitersForPoll(
+        state,
+        proc,
+        poll_items,
+        current_thread,
+        current_generation,
+        wait_token,
+        group,
+    ) catch |err| {
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        state.cancelFdWaitGroup(group, wait_token);
+        return statusFromKernelError(err);
+    };
+    state.armFdWaitGroup(group) catch |err| {
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        state.cancelFdWaitGroup(group, wait_token);
         return statusFromKernelError(err);
     };
     ipc_metric.record(.wait_register, register_start);
     const repoll_start = ipc_metric.timestamp();
     const ready_after_register = pollCached(h, state, proc, poll_items, scheduler.lapic_tick_count) orelse {
-        unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        state.cancelFdWaitGroup(group, wait_token);
         return sc.syscall_err_invalid;
     };
     ipc_metric.record(.wait_repoll, repoll_start);
     if (ready_after_register != 0) {
-        unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        state.cancelFdWaitGroup(group, wait_token);
         return ready_after_register;
     }
 
@@ -529,8 +700,16 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     if (nextCachedPollWakeDelta(state, proc, poll_items, now)) |delta| {
         if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
     }
-    if (h.block_current_thread_for_event(frame, true, 0, block_ticks, sc.syscall_err_not_ready, h.before_current_thread_leave)) return frame.rax;
-    unregisterCachedWaitersForPoll(state, proc, poll_items, current_thread, current_generation);
+    if (h.block_current_thread_for_event(
+        frame,
+        true,
+        wait_token,
+        block_ticks,
+        sc.syscall_err_not_ready,
+        h.before_current_thread_leave,
+    )) return frame.rax;
+    scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+    state.cancelFdWaitGroup(group, wait_token);
     return sc.syscall_err_not_ready;
 }
 

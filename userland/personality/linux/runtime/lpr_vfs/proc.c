@@ -424,6 +424,65 @@ static int64_t lpr_proc_write_meminfo(uint64_t fd)
     return status;
 }
 
+static int64_t lpr_proc_write_stat_cpu(
+    uint64_t fd,
+    const char *name,
+    uint64_t idle_ticks)
+{
+    int64_t status = lpr_proc_write_string(fd, name);
+    if (status == 0) status = lpr_proc_write_string(fd, " 0 0 0 ");
+    if (status == 0) status = lpr_proc_write_u64(fd, idle_ticks);
+    if (status == 0) {
+        status = lpr_proc_write_string(fd, " 0 0 0 0 0 0\n");
+    }
+    return status;
+}
+
+static int64_t lpr_proc_write_stat(uint64_t fd)
+{
+    pachaos_system_info_t system_info;
+    lpr_memset(&system_info, 0, sizeof(system_info));
+    int64_t status = lpr_pacha_syscall1(
+        PACHAOS_SYSCALL_SYSTEM_INFO,
+        (uint64_t)(uintptr_t)&system_info);
+    if (status != 0) return lpr_pacha_status_to_errno(status);
+
+    struct pachaos_timespec monotonic;
+    status = lpr_pacha_clock_gettime(PACHAOS_CLOCK_MONOTONIC, &monotonic);
+    if (status != 0) return status;
+
+    uint64_t cpu_count = system_info.online_cpu_count;
+    if (cpu_count == 0) cpu_count = 1;
+    const uint64_t idle_ticks =
+        monotonic.tv_sec * 100u + monotonic.tv_nsec / 10000000u;
+
+    /* Linux /proc/stat starts with one aggregate line followed immediately by
+     * contiguous cpuN lines.  libgtop's Linux backend uses exactly that shape
+     * to enumerate CPUs during glibtop_init(), before callers request any CPU
+     * accounting.  PachaOS does not expose per-CPU accounting to userland, so
+     * report elapsed boot time as idle time instead of inventing busy time. */
+    status = lpr_proc_write_stat_cpu(fd, "cpu", idle_ticks * cpu_count);
+    for (uint64_t cpu = 0; status == 0 && cpu < cpu_count; ++cpu) {
+        lpr_proc_buffer_t name;
+        lpr_memset(&name, 0, sizeof(name));
+        status = lpr_proc_buffer_append_string(&name, "cpu");
+        if (status == 0) status = lpr_proc_buffer_append_u64(&name, cpu);
+        if (status != 0) break;
+        name.bytes[name.length] = '\0';
+        status = lpr_proc_write_stat_cpu(fd, name.bytes, idle_ticks);
+    }
+    if (status == 0) {
+        status = lpr_proc_write_string(
+            fd,
+            "intr 0\n"
+            "ctxt 0\n"
+            "processes 0\n"
+            "procs_running 1\n"
+            "procs_blocked 0\n");
+    }
+    return status;
+}
+
 static int64_t lpr_proc_write_mounts(uint64_t fd)
 {
     return lpr_proc_write_string(
@@ -473,6 +532,7 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
         { "self", LPR_LINUX_S_IFLNK },
         { "cpuinfo", LPR_LINUX_S_IFREG },
         { "meminfo", LPR_LINUX_S_IFREG },
+        { "stat", LPR_LINUX_S_IFREG },
         { "mounts", LPR_LINUX_S_IFREG },
         { "sys", LPR_LINUX_S_IFDIR },
         { "overflowuid", LPR_LINUX_S_IFREG },
@@ -554,6 +614,7 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         LPR_PROC_NONE = 0,
         LPR_PROC_CPUINFO,
         LPR_PROC_MEMINFO,
+        LPR_PROC_STAT,
         LPR_PROC_MOUNTS,
     } kind = LPR_PROC_NONE;
     const char *name = 0;
@@ -564,6 +625,9 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
     } else if (lpr_strcmp(path, "/proc/meminfo") == 0) {
         kind = LPR_PROC_MEMINFO;
         name = "proc-meminfo";
+    } else if (lpr_strcmp(path, "/proc/stat") == 0) {
+        kind = LPR_PROC_STAT;
+        name = "proc-stat";
     } else if (lpr_strcmp(path, "/proc/mounts") == 0) {
         kind = LPR_PROC_MOUNTS;
         name = "proc-mounts";
@@ -580,6 +644,9 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         break;
     case LPR_PROC_MEMINFO:
         status = lpr_proc_write_meminfo((uint64_t)staging_fd);
+        break;
+    case LPR_PROC_STAT:
+        status = lpr_proc_write_stat((uint64_t)staging_fd);
         break;
     case LPR_PROC_MOUNTS:
         status = lpr_proc_write_mounts((uint64_t)staging_fd);

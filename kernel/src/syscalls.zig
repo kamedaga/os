@@ -16,7 +16,7 @@ const TrapFrame = interrupts.TrapFrame;
 pub const Hooks = struct {
     state: *kernel.KernelState,
     free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
+    user_spaces: *boot_static.UserAddressSpaceTable,
     kernel_state_ready: *const bool,
     write: *const fn ([]const u8) void,
     print_hex: *const fn (u64) void,
@@ -62,12 +62,61 @@ const KernelStateSpinLock = struct {
         }
     }
 
+    fn tryLock(self: *KernelStateSpinLock) bool {
+        return @cmpxchgStrong(u8, &self.value, 0, 1, .acquire, .monotonic) == null;
+    }
+
     fn unlock(self: *KernelStateSpinLock) void {
         @atomicStore(u8, &self.value, 0, .release);
     }
 };
 
 var kernel_state_lock: KernelStateSpinLock = .{};
+
+pub const ExternalPrincipalTeardownAcquire = enum {
+    acquired,
+    handled_by_existing_lifecycle,
+};
+
+/// Enter the same lifecycle/state-lock exclusion used by PROCESS_EXIT when a
+/// fatal user exception or inactive-principal fallback starts outside syscall
+/// dispatch. On success the lifecycle gate and KernelState lock remain held.
+pub fn beginExternalPrincipalTeardown(
+    principal: kernel.PrincipalId,
+) ExternalPrincipalTeardownAcquire {
+    while (!scheduler.tryBeginPrincipalLifecycle(principal)) {
+        if (scheduler.principalLifecycleTargets(principal)) {
+            return .handled_by_existing_lifecycle;
+        }
+        KernelStateSpinLock.waitWithInterruptWindow();
+    }
+
+    kernel_state_lock.lock();
+    while (true) {
+        _ = scheduler.stopPrincipalThreads(principal);
+        kernel_state_lock.unlock();
+        scheduler.waitForRemotePrincipalQuiescence(principal);
+        kernel_state_lock.lock();
+
+        // A syscall or THREAD_CREATE admitted before the lifecycle gate may
+        // have finished while the lock was dropped. Stop its result and scan
+        // CPU ownership again before permitting teardown.
+        _ = scheduler.stopPrincipalThreads(principal);
+        const current_cpu = scheduler.currentCpu();
+        const ignored_mask = if (current_cpu < 64)
+            @as(u64, 1) << @intCast(current_cpu)
+        else
+            0;
+        if ((scheduler.cpuMaskRunningPrincipal(principal) & ~ignored_mask) == 0) {
+            return .acquired;
+        }
+    }
+}
+
+pub fn endExternalPrincipalTeardown() void {
+    scheduler.endPrincipalLifecycle();
+    kernel_state_lock.unlock();
+}
 
 const KernelStateLockDropContext = struct {
     lock_held: *bool,
@@ -109,7 +158,7 @@ pub fn init(new_hooks: Hooks) void {
     syscall_hooks_ready = true;
 }
 
-pub fn updateUserSpaces(user_spaces: []boot_static.UserAddressSpace) void {
+pub fn updateUserSpaces(user_spaces: *boot_static.UserAddressSpaceTable) void {
     if (!syscall_hooks_ready) return;
     syscall_hooks_storage.user_spaces = user_spaces;
 }
@@ -117,6 +166,22 @@ pub fn updateUserSpaces(user_spaces: []boot_static.UserAddressSpace) void {
 fn getHooks() *const Hooks {
     if (!syscall_hooks_ready) unreachable;
     return &syscall_hooks_storage;
+}
+
+/// IRQ publication itself is lock-free, but completing an FD wait mutates its
+/// generational wait group and must use the same KernelState lock as syscalls.
+/// Interrupt context must never spin on a lock held by the interrupted CPU;
+/// the BSP timer retries any publication that loses this try-lock race.
+pub fn completePendingIrqFdWaitersFromInterrupt() void {
+    if (!syscall_hooks_ready) return;
+    const h = getHooks();
+    if (!h.kernel_state_ready.*) return;
+    if (!kernel_state_lock.tryLock()) return;
+    defer kernel_state_lock.unlock();
+
+    var targets: [kernel.fd_table_entries]kernel.ThreadWakeTarget = undefined;
+    const count = h.state.takeReadyIrqWaiters(targets[0..]);
+    _ = fd_syscalls.wakeThreadTargets(h, h.state, targets[0..count]);
 }
 
 fn hasExplicitUserLogLabel(message: []const u8) bool {
@@ -138,6 +203,10 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
 
     const state = base_hooks.state;
     const proc = scheduler.currentPrincipal();
+    // Recorded on entry, not at deschedule: the trap frame's rax carries the
+    // syscall number in and the result out, so by the time a thread is placed
+    // again the number is gone.  rdi is kept alongside because it is the fd or
+    // futex address the spin is going around.
     const hold_kernel_state_lock = syscall_lock_policy.needsKernelStateLock(frame.rax);
     var lock_held = false;
     var lock_drop_context = KernelStateLockDropContext{ .lock_held = &lock_held };
@@ -186,6 +255,17 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     // before teardown or publish the final stopped state.
     if (scheduler.principalLifecycleBlocksAdmission(proc)) {
         return sc.syscall_err_not_ready;
+    }
+
+    // Timeout/signal completion invalidates the scheduler token without
+    // traversing KernelState.  Reclaim that thread's exact generational wait
+    // group at its next stateful syscall before any user poll array can be
+    // reused for an unrelated FD.
+    if (hold_kernel_state_lock) {
+        const thread_index = scheduler.currentThread();
+        if (scheduler.generationOfThread(thread_index)) |thread_generation| {
+            state.cancelFdWaitGroupsForThread(proc, thread_index, thread_generation);
+        }
     }
 
     if (process_syscalls.dispatch(h, state, proc, frame)) |result| {

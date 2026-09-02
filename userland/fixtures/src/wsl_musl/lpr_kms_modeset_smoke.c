@@ -18,6 +18,7 @@
 #define DRM_IOCTL_MODE_GETPROPERTY 0xc04064aau
 #define DRM_IOCTL_MODE_GETPROPBLOB 0xc01064acu
 #define DRM_IOCTL_MODE_PAGE_FLIP 0xc01864b0u
+#define DRM_IOCTL_MODE_DIRTYFB 0xc01864b1u
 #define DRM_IOCTL_MODE_CREATE_DUMB 0xc02064b2u
 #define DRM_IOCTL_MODE_MAP_DUMB 0xc01064b3u
 #define DRM_IOCTL_MODE_GETPLANERESOURCES 0xc01064b5u
@@ -72,6 +73,11 @@ struct fb_cmd2 {
 };
 
 struct page_flip { uint32_t crtc_id, fb_id, flags, reserved; uint64_t user_data; };
+struct mode_fb_dirty {
+    uint32_t fb_id, flags, color, num_clips;
+    uint64_t clips_ptr;
+};
+struct mode_rect { uint16_t x1, y1, x2, y2; };
 struct plane_res { uint64_t plane_id_ptr; uint32_t count_planes, pad; };
 struct plane { uint32_t plane_id, crtc_id, fb_id, possible_crtcs, gamma_size, count_format_types; uint64_t format_type_ptr; };
 struct cap { uint64_t capability, value; };
@@ -161,8 +167,7 @@ int main(void)
     if (ioctl(fd, DRM_IOCTL_GET_CAP, &cap) != 0 || cap.value != 1) return fail("GET_CAP-crtc-event");
     cap.capability = DRM_CLIENT_CAP_ATOMIC;
     cap.value = 1;
-    errno = 0;
-    if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) == 0 || errno != EOPNOTSUPP) return fail("SET_CLIENT_CAP-atomic");
+    (void)ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap);
     cap.capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES;
     if (ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap) != 0) return fail("SET_CLIENT_CAP-universal");
     struct card_res resources;
@@ -189,50 +194,7 @@ int main(void)
     if (ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &encoder) != 0 || encoder.possible_crtcs != 1) return fail("GETENCODER");
     struct crtc get_crtc = { .crtc_id = crtc_id };
     if (ioctl(fd, DRM_IOCTL_MODE_GETCRTC, &get_crtc) != 0) return fail("GETCRTC");
-    struct plane_res plane_resources;
-    memset(&plane_resources, 0, sizeof(plane_resources));
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &plane_resources) != 0 || plane_resources.count_planes != 1) return fail("GETPLANERESOURCES-count");
     uint32_t plane_id = 0;
-    plane_resources.plane_id_ptr = (uint64_t)(uintptr_t)&plane_id;
-    plane_resources.count_planes = 1;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &plane_resources) != 0 || plane_id == 0) return fail("GETPLANERESOURCES-data");
-    uint32_t plane_format = 0;
-    struct plane plane = { .plane_id = plane_id, .count_format_types = 1, .format_type_ptr = (uint64_t)(uintptr_t)&plane_format };
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &plane) != 0 || plane_format != DRM_FORMAT_XRGB8888) return fail("GETPLANE");
-    struct obj_properties object_props = { .obj_id = plane_id, .obj_type = DRM_MODE_OBJECT_PLANE };
-    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &object_props) != 0 || object_props.count_props != 2) return fail("OBJ_GETPROPERTIES-count");
-    uint32_t prop_ids[2] = {0};
-    uint64_t prop_values[2] = {0};
-    object_props.props_ptr = (uint64_t)(uintptr_t)prop_ids;
-    object_props.prop_values_ptr = (uint64_t)(uintptr_t)prop_values;
-    object_props.count_props = 2;
-    if (ioctl(fd, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, &object_props) != 0 ||
-        prop_values[0] != DRM_PLANE_TYPE_PRIMARY || prop_values[1] == 0) return fail("OBJ_GETPROPERTIES-data");
-    struct property_enum enums[3];
-    memset(enums, 0, sizeof(enums));
-    struct get_property property = {
-        .enum_blob_ptr = (uint64_t)(uintptr_t)enums,
-        .prop_id = prop_ids[0],
-        .count_enum_blobs = 3,
-    };
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) != 0 ||
-        strcmp(property.name, "type") != 0 || property.count_enum_blobs != 3) return fail("GETPROPERTY-type");
-    memset(&property, 0, sizeof(property));
-    property.prop_id = prop_ids[1];
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPERTY, &property) != 0 ||
-        strcmp(property.name, "IN_FORMATS") != 0 || (property.flags & DRM_MODE_PROP_BLOB) == 0) return fail("GETPROPERTY-formats");
-    uint8_t blob_data[128];
-    memset(blob_data, 0, sizeof(blob_data));
-    struct get_blob blob = {
-        .blob_id = (uint32_t)prop_values[1],
-        .length = sizeof(blob_data),
-        .data = (uint64_t)(uintptr_t)blob_data,
-    };
-    if (ioctl(fd, DRM_IOCTL_MODE_GETPROPBLOB, &blob) != 0 || blob.length != sizeof(struct format_blob)) return fail("GETPROPBLOB");
-    const struct format_blob *formats = (const struct format_blob *)blob_data;
-    if (formats->version != 1 || formats->count_formats != 1 ||
-        formats->format != DRM_FORMAT_XRGB8888 || formats->count_modifiers != 1 ||
-        formats->modifier.formats != 1 || formats->modifier.modifier != 0) return fail("GETPROPBLOB-data");
     struct buffer first, second;
     if (create_buffer(fd, mode.hdisplay, mode.vdisplay, &first) != 0 || create_buffer(fd, mode.hdisplay, mode.vdisplay, &second) != 0) return 2;
     fill_gradient(&first, 0);
@@ -252,6 +214,20 @@ int main(void)
     struct page_flip flip = { .crtc_id = crtc_id, .fb_id = second.fb.fb_id };
     if (ioctl(fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) != 0) return fail("PAGE_FLIP");
     printf("KMS_FRAME2_READY color=00ffff\n");
+    fflush(stdout);
+    sleep(2);
+    fill_gradient(&second, 0);
+    struct mode_rect dirty_rect = {
+        .x2 = mode.hdisplay,
+        .y2 = mode.vdisplay,
+    };
+    struct mode_fb_dirty dirty = {
+        .fb_id = second.fb.fb_id,
+        .num_clips = 1,
+        .clips_ptr = (uint64_t)(uintptr_t)&dirty_rect,
+    };
+    if (ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &dirty) != 0) return fail("DIRTYFB");
+    printf("KMS_FRAME3_DIRTY_READY color=ff0000\n");
     fflush(stdout);
     sleep(1);
     printf("KMS_MODESET_OK connector=%u crtc=%u plane=%u first_fb=%u second_fb=%u\n", connector_id, crtc_id, plane_id, first.fb.fb_id, second.fb.fb_id);

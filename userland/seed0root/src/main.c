@@ -1495,6 +1495,8 @@ static int seed0root_run_exec_path_smoke_expect_any(
             (void)pacha_fd_close((int)reply_fds[1].fd);
         }
         if (reply_fds[0].fd >= 16) {
+            (void)pacha_syscall2(
+                PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
             (void)pacha_fd_close((int)reply_fds[0].fd);
         }
         return -2;
@@ -3241,7 +3243,7 @@ static int seed0root_register_termd_signal_supervisor(
     return 0;
 }
 
-static int seed0root_register_lpr_session(
+static int seed0root_register_lpr_init(
     int supervisor_endpoint_fd,
     lprs_process_state_t *out_state)
 {
@@ -3276,29 +3278,51 @@ static int seed0root_register_lpr_session(
     return status;
 }
 
-static int seed0root_spawn_lpr_session(
+static void seed0root_cancel_lpr_exec(
+    int supervisor_endpoint_fd,
+    uint64_t token)
+{
+    int page_fd = -1;
+    void *page = NULL;
+    if (supervisor_endpoint_fd < 16 || token == 0 ||
+        seed0root_create_filed_page(&page_fd, &page) != 0)
+    {
+        return;
+    }
+    lprs_token_request_t *request =
+        (lprs_token_request_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
+    memset(request, 0, sizeof(*request));
+    request->token = token;
+    struct pacha_ipc_msg reply;
+    (void)seed0root_lprs_call(
+        supervisor_endpoint_fd,
+        LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL,
+        0x5eed1006u,
+        page_fd,
+        page,
+        sizeof(*request),
+        -1,
+        &reply);
+    seed0root_destroy_filed_page(page_fd, page);
+}
+
+static int seed0root_spawn_lpr_init(
     int filed_endpoint_fd,
     int supervisor_endpoint_fd)
 {
     static const char *const argv[] = {
-        "/usr/libexec/pacha-user-session",
-    };
-    static const char *const envp[] = {
-        "PATH=/bin:/usr/bin:/cmd",
-        "TERM=linux",
-        "HOME=/home",
-        "LD_LIBRARY_PATH=/lib/linux:/usr/lib",
+        "/sbin/init",
     };
     if (filed_endpoint_fd < 16 || supervisor_endpoint_fd < 16) {
         return -22;
     }
-    lprs_process_state_t session_state;
-    memset(&session_state, 0, sizeof(session_state));
-    int status = seed0root_register_lpr_session(
+    lprs_process_state_t init_state;
+    memset(&init_state, 0, sizeof(init_state));
+    int status = seed0root_register_lpr_init(
         supervisor_endpoint_fd,
-        &session_state);
-    if (status != 0 || session_state.token == 0 ||
-        session_state.generation == 0 || session_state.pid == 0)
+        &init_state);
+    if (status != 0 || init_state.token == 0 ||
+        init_state.generation == 0 || init_state.pid == 0)
     {
         return status != 0 ? status : -5;
     }
@@ -3307,10 +3331,14 @@ static int seed0root_spawn_lpr_session(
     memset(&manifest_layout, 0, sizeof(manifest_layout));
     status = lpr_manifest_layout(0, 0, 0, 0, &manifest_layout);
     if (status != 0) {
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return -22;
     }
     uint64_t manifest_map_bytes = 0;
     if (align_up(manifest_layout.byte_size, &manifest_map_bytes) != 0) {
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return -22;
     }
     const uint64_t manifest_rights =
@@ -3323,6 +3351,8 @@ static int seed0root_spawn_lpr_session(
         PACHA_FD_RIGHT_MAP_WRITE;
     int manifest_fd = pacha_vmo_create(manifest_map_bytes, manifest_rights, 0);
     if (manifest_fd < 16) {
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return manifest_fd < 0 ? manifest_fd : -12;
     }
     lpr_manifest_t *manifest = pacha_mmap(
@@ -3333,6 +3363,8 @@ static int seed0root_spawn_lpr_session(
         0);
     if (manifest == NULL) {
         (void)pacha_fd_close(manifest_fd);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return -12;
     }
     status = lpr_manifest_begin(
@@ -3345,24 +3377,28 @@ static int seed0root_spawn_lpr_session(
         0);
     if (status != 0) {
         seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return -22;
     }
-    manifest->transaction_id = session_state.token;
-    manifest->generation = session_state.generation;
+    manifest->transaction_id = init_state.token;
+    manifest->generation = init_state.generation;
     manifest->flags = LPR_MANIFEST_FLAG_DEFAULT_STDIO | LPR_MANIFEST_FLAG_SUPERVISOR;
-    manifest->linux_pid = session_state.pid;
-    manifest->linux_ppid = session_state.ppid;
-    manifest->linux_sid = session_state.sid;
-    manifest->linux_pgrp = session_state.pgrp;
+    manifest->linux_pid = init_state.pid;
+    manifest->linux_ppid = init_state.ppid;
+    manifest->linux_sid = init_state.sid;
+    manifest->linux_pgrp = init_state.pgrp;
     manifest->linux_next_pid = 0;
-    manifest->cwd_handle = session_state.cwd_handle;
-    manifest->supervisor_token = session_state.token;
+    manifest->cwd_handle = init_state.cwd_handle;
+    manifest->supervisor_token = init_state.token;
     manifest->supervisor_endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
-    manifest->owner_generation = session_state.generation;
-    snprintf(manifest->ctty, sizeof(manifest->ctty), "%s", session_state.ctty);
-    snprintf(manifest->cwd, sizeof(manifest->cwd), "%s", session_state.cwd);
+    manifest->owner_generation = init_state.generation;
+    snprintf(manifest->ctty, sizeof(manifest->ctty), "%s", init_state.ctty);
+    snprintf(manifest->cwd, sizeof(manifest->cwd), "%s", init_state.cwd);
     if (lpr_manifest_seal(manifest, manifest_map_bytes) != 0) {
         seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return -22;
     }
 
@@ -3371,6 +3407,8 @@ static int seed0root_spawn_lpr_session(
     status = seed0root_create_filed_page(&page_fd, &page);
     if (status != 0) {
         seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return status;
     }
     filed_exec_path_t *exec = (filed_exec_path_t *)page;
@@ -3384,25 +3422,18 @@ static int seed0root_spawn_lpr_session(
     exec->inherit_fd_count = 1;
     exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
     exec->argc = sizeof(argv) / sizeof(argv[0]);
-    exec->envc = sizeof(envp) / sizeof(envp[0]);
-    snprintf(exec->path, sizeof(exec->path), "%s", "/usr/libexec/pacha-user-session");
+    exec->envc = 0;
+    snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/init");
     for (uint64_t i = 0; i < exec->argc; i++) {
         status = seed0root_exec_add_string(exec, &exec->argv[i], argv[i]);
         if (status != 0) {
             seed0root_destroy_filed_page(page_fd, page);
             seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
+            seed0root_cancel_lpr_exec(
+                supervisor_endpoint_fd, init_state.token);
             return status;
         }
     }
-    for (uint64_t i = 0; i < exec->envc; i++) {
-        status = seed0root_exec_add_string(exec, &exec->envp[i], envp[i]);
-        if (status != 0) {
-            seed0root_destroy_filed_page(page_fd, page);
-            seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
-            return status;
-        }
-    }
-
     struct pacha_ipc_fd fds[3];
     memset(fds, 0, sizeof(fds));
     fds[0].fd = (uint64_t)(uint32_t)page_fd;
@@ -3437,7 +3468,9 @@ static int seed0root_spawn_lpr_session(
     seed0root_destroy_filed_page(page_fd, page);
     seed0root_destroy_wire_page(manifest_map_bytes, manifest_fd, manifest);
     if (status != 0) {
-        fprintf(stderr, "[seed0root] user session exec failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] Linux init exec failed status=%d\n", status);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return status;
     }
     if (reply.fd_count < 2 || reply_fds[0].fd < 16 || reply_fds[1].fd < 16) {
@@ -3445,8 +3478,12 @@ static int seed0root_spawn_lpr_session(
             (void)pacha_fd_close((int)reply_fds[1].fd);
         }
         if (reply_fds[0].fd >= 16) {
+            (void)pacha_syscall2(
+                PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
             (void)pacha_fd_close((int)reply_fds[0].fd);
         }
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return -5;
     }
     memset(&reply, 0, sizeof(reply));
@@ -3457,12 +3494,14 @@ static int seed0root_spawn_lpr_session(
         (void)pacha_fd_close((int)reply_fds[1].fd);
         (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
         (void)pacha_fd_close((int)reply_fds[0].fd);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return status;
     }
     lprs_token_request_t *token_req =
         (lprs_token_request_t *)((uint8_t *)lprs_page + PACHA_SERVICE_HEADER_BYTES);
     memset(token_req, 0, sizeof(*token_req));
-    token_req->token = session_state.token;
+    token_req->token = init_state.token;
     status = seed0root_lprs_call(
         supervisor_endpoint_fd,
         LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN,
@@ -3478,17 +3517,21 @@ static int seed0root_spawn_lpr_session(
         (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
         (void)pacha_fd_close((int)reply_fds[0].fd);
         fprintf(stderr,
-            "[seed0root] user session transaction begin failed status=%d\n",
+            "[seed0root] Linux init transaction begin failed status=%d\n",
             status);
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         return status;
     }
     const int start_status = pacha_thread_start((int)reply_fds[1].fd);
     (void)pacha_fd_close((int)reply_fds[1].fd);
     if (start_status != 0) {
+        seed0root_cancel_lpr_exec(
+            supervisor_endpoint_fd, init_state.token);
         (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, reply_fds[0].fd, 1);
         (void)pacha_fd_close((int)reply_fds[0].fd);
         fprintf(stderr,
-            "[seed0root] user session thread start failed status=%d\n",
+            "[seed0root] Linux init thread start failed status=%d\n",
             start_status);
         return start_status;
     }
@@ -3680,13 +3723,13 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
             status);
         return status;
     }
-    status = seed0root_spawn_lpr_session(
+    status = seed0root_spawn_lpr_init(
         filed_client_fd,
         lpr_supervisor_endpoint_fd);
     (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
     (void)pacha_fd_close(filed_client_fd);
     if (status != 0) {
-        fprintf(stderr, "[seed0root] user session launch failed status=%d\n", status);
+        fprintf(stderr, "[seed0root] Linux init launch failed status=%d\n", status);
         return status;
     }
     printf("[seed0root] storage ready\n");

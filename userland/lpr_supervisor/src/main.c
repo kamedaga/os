@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef LPRS_SIGNAL_DIAG
+#define LPRS_SIGNAL_DIAG 0
+#endif
+
 enum {
     LPRS_WNOHANG = 1,
     LPRS_SIGCHLD = 17,
@@ -253,7 +257,24 @@ static int lprs_queue_waiter(
     waiter->reply_fd = reply_fd;
     waiter->header = *header;
     waiter->request = *request;
+    fprintf(stderr,
+        "[lprs-wait4] queued token=%llu requested=%lld page_fd=%d reply_fd=%d\n",
+        (unsigned long long)request->token,
+        (long long)request->requested_pid,
+        page_fd,
+        reply_fd);
     return 0;
+}
+
+static void lprs_discard_pending_exec(lprs_process_t *proc)
+{
+    if (proc == NULL || proc->pending_exec_fd < 16) return;
+    (void)pacha_syscall2(
+        PACHA_PROCESS_SYSCALL_KILL,
+        (uint64_t)(uint32_t)proc->pending_exec_fd,
+        1);
+    (void)pacha_fd_close(proc->pending_exec_fd);
+    proc->pending_exec_fd = -1;
 }
 
 static void lprs_process_release_owned(lprs_process_t *proc)
@@ -264,9 +285,7 @@ static void lprs_process_release_owned(lprs_process_t *proc)
     if (proc->process_fd >= 16) {
         (void)pacha_fd_close(proc->process_fd);
     }
-    if (proc->pending_exec_fd >= 16) {
-        (void)pacha_fd_close(proc->pending_exec_fd);
-    }
+    lprs_discard_pending_exec(proc);
     memset(proc, 0, sizeof(*proc));
     proc->process_fd = -1;
     proc->pending_exec_fd = -1;
@@ -486,8 +505,19 @@ static int lprs_exec_commit_begin(uint64_t token, int process_fd)
     if (process_fd < 16) return PACHA_STATUS_EINVAL;
     lprs_process_t *proc = lprs_find_by_token(token);
     if (proc == NULL) return PACHA_STATUS_ESRCH;
-    if (proc->pending_exec_fd >= 16) (void)pacha_fd_close(proc->pending_exec_fd);
+    if (proc->exit_ready) return PACHA_STATUS_ESRCH;
+    if (proc->pending_exec_fd >= 16) return PACHA_STATUS_EAGAIN;
     proc->pending_exec_fd = process_fd;
+    return 0;
+}
+
+static int lprs_exec_commit_cancel(uint64_t token)
+{
+    lprs_process_t *proc = lprs_find_by_token(token);
+    if (proc == NULL) return PACHA_STATUS_ESRCH;
+    const int initial_exec = proc->process_fd < 16;
+    lprs_discard_pending_exec(proc);
+    if (initial_exec) lprs_process_reap(proc);
     return 0;
 }
 
@@ -495,7 +525,7 @@ static int lprs_exec_commit_done(uint64_t token)
 {
     lprs_process_t *proc = lprs_find_by_token(token);
     if (proc == NULL) return PACHA_STATUS_ESRCH;
-    if (proc->pending_exec_fd < 16) return 0;
+    if (proc->pending_exec_fd < 16) return PACHA_STATUS_EINVAL;
     if (proc->process_fd < 16) {
         proc->process_fd = proc->pending_exec_fd;
     } else {
@@ -918,6 +948,13 @@ static int lprs_kill(void *page)
     if (caller == NULL || req->signal > 64u) {
         return caller == NULL ? PACHA_STATUS_ESRCH : PACHA_STATUS_EINVAL;
     }
+#if LPRS_SIGNAL_DIAG
+    printf("[lprs-signal-diag] op=kill caller=%llu caller_pgrp=%llu pid=%lld signal=%llu\n",
+        (unsigned long long)caller->pid,
+        (unsigned long long)caller->pgrp,
+        (long long)req->pid,
+        (unsigned long long)req->signal);
+#endif
     uint64_t delivered = 0;
     int first_error = 0;
     for (uint64_t i = 0; i < g_process_count; ++i) {
@@ -938,6 +975,13 @@ static int lprs_kill(void *page)
         if (!match) {
             continue;
         }
+#if LPRS_SIGNAL_DIAG
+        printf("[lprs-signal-diag] op=deliver caller=%llu target=%llu target_pgrp=%llu signal=%llu\n",
+            (unsigned long long)caller->pid,
+            (unsigned long long)proc->pid,
+            (unsigned long long)proc->pgrp,
+            (unsigned long long)req->signal);
+#endif
         const int status = lprs_signal_process_fd(proc->process_fd, req->signal);
         if (status == 0) {
             if (lprs_signal_interrupts_wait(req->signal)) {
@@ -1194,6 +1238,10 @@ static int lprs_dispatch(
             if (status == 0) *out_keep_fd = (int)(uint32_t)request->fds[1].fd;
         }
         break;
+    case LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL:
+        status = token == 0 ? PACHA_STATUS_EINVAL :
+            lprs_exec_commit_cancel(token);
+        break;
     case LPRS_OP_PROCESS_EXEC_COMMIT_DONE:
         status = token == 0 ? PACHA_STATUS_EINVAL :
             lprs_exec_commit_done(token);
@@ -1372,12 +1420,28 @@ static void lprs_finish_waiter(lprs_waiter_t *waiter, int status, uint64_t resul
 
     const int page_fd = waiter->page_fd;
     const int reply_fd = waiter->reply_fd;
+    const uint64_t token = waiter->request.token;
     const uint64_t request_id = waiter->header.request_id;
+    fprintf(stderr,
+        "[lprs-wait4] finish token=%llu requested=%lld status=%d result=%llu\n",
+        (unsigned long long)token,
+        (long long)waiter->request.requested_pid,
+        status,
+        (unsigned long long)result);
     memset(waiter, 0, sizeof(*waiter));
     waiter->page_fd = -1;
     waiter->reply_fd = -1;
     (void)pacha_fd_close(page_fd);
-    (void)lprs_reply(reply_fd, request_id, reply_status, result, -1, 0);
+    const int send_status =
+        lprs_reply(reply_fd, request_id, reply_status, result, -1, 0);
+    fprintf(stderr,
+        "[lprs-wait4] replied token=%llu request=%llu reply_fd=%d "
+        "status=%d send_status=%d\n",
+        (unsigned long long)token,
+        (unsigned long long)request_id,
+        reply_fd,
+        reply_status,
+        send_status);
 }
 
 static void lprs_interrupt_waiters(uint64_t token)
@@ -1462,6 +1526,7 @@ static void lprs_notify_exited_child(
     {
         return;
     }
+    lprs_discard_pending_exec(child);
     child->exit_status = (uint32_t)(exit_code & 0xffu);
     child->exit_state = (uint32_t)exit_state;
     child->exit_ready = 1;
@@ -1484,14 +1549,21 @@ static void lprs_notify_exited_child(
             child->exit_notified = 1;
         }
     }
+    fprintf(stderr,
+        "[lprs-wait4] exited child=%llu parent=%llu state=%llu code=%llu "
+        "notify=%d\n",
+        (unsigned long long)child->pid,
+        (unsigned long long)child->ppid,
+        (unsigned long long)exit_state,
+        (unsigned long long)exit_code,
+        notify_status);
 }
 
 static void lprs_refresh_exited_children(void)
 {
     for (uint64_t i = 0; i < g_process_count; ++i) {
         lprs_process_t *child = &g_processes[i];
-        if (!child->active || child->exit_ready || child->pending_exec_fd >= 16 ||
-            child->process_fd < 16)
+        if (!child->active || child->exit_ready || child->process_fd < 16)
         {
             continue;
         }
@@ -1505,11 +1577,12 @@ static void lprs_refresh_exited_children(void)
     }
 }
 
-static void lprs_refresh_failed_execs(void)
+static void lprs_refresh_initial_execs(void)
 {
     for (uint64_t i = 0; i < g_process_count; ++i) {
         lprs_process_t *proc = &g_processes[i];
-        if (!proc->active || proc->pending_exec_fd < 16) continue;
+        if (!proc->active || proc->process_fd >= 16 ||
+            proc->pending_exec_fd < 16) continue;
         uint64_t exit_state = 0;
         uint64_t exit_code = 0;
         if (lprs_try_wait_process_fd(
@@ -1517,11 +1590,7 @@ static void lprs_refresh_failed_execs(void)
         {
             continue;
         }
-        if (proc->process_fd < 16) {
-            proc->process_fd = proc->pending_exec_fd;
-        } else {
-            (void)pacha_fd_close(proc->pending_exec_fd);
-        }
+        proc->process_fd = proc->pending_exec_fd;
         proc->pending_exec_fd = -1;
         if (proc->process_fd >= 16 && proc->exit_ready == 0 &&
             lprs_try_wait_process_fd(
@@ -1559,18 +1628,19 @@ int main(int argc, char **argv)
             process_indices[i] = UINT64_MAX;
         }
         uint64_t count = 1;
+        uint8_t wait_set_overflow = 0;
         pollfds[0] = (struct pacha_pollfd){
             .fd = g_endpoint_fd,
             .events = PACHA_FD_EVENT_READABLE,
         };
-        for (uint64_t i = 0;
-             i < g_process_count && count < LPRS_WAIT_FD_CAPACITY;
-             ++i)
-        {
+        for (uint64_t i = 0; i < g_process_count; ++i) {
             const lprs_process_t *proc = &g_processes[i];
-            if (!proc->active || proc->exit_ready || proc->pending_exec_fd >= 16 ||
-                proc->process_fd < 16)
+            if (!proc->active || proc->exit_ready || proc->process_fd < 16)
             {
+                continue;
+            }
+            if (count == LPRS_WAIT_FD_CAPACITY) {
+                wait_set_overflow = 1;
                 continue;
             }
             pollfds[count] = (struct pacha_pollfd){
@@ -1580,12 +1650,14 @@ int main(int argc, char **argv)
             process_indices[count] = i;
             count++;
         }
-        for (uint64_t i = 0;
-             i < g_process_count && count < LPRS_WAIT_FD_CAPACITY;
-             ++i)
-        {
+        for (uint64_t i = 0; i < g_process_count; ++i) {
             const lprs_process_t *proc = &g_processes[i];
-            if (!proc->active || proc->pending_exec_fd < 16) continue;
+            if (!proc->active || proc->process_fd >= 16 ||
+                proc->pending_exec_fd < 16) continue;
+            if (count == LPRS_WAIT_FD_CAPACITY) {
+                wait_set_overflow = 1;
+                continue;
+            }
             pollfds[count] = (struct pacha_pollfd){
                 .fd = proc->pending_exec_fd,
                 .events = PACHA_FD_EVENT_READABLE,
@@ -1599,26 +1671,55 @@ int main(int argc, char **argv)
         if (status < 0) {
             continue;
         }
-        lprs_refresh_exited_children();
-        lprs_refresh_failed_execs();
-        lprs_complete_waiters();
+        if (wait_set_overflow) {
+            lprs_refresh_exited_children();
+            lprs_refresh_initial_execs();
+        }
         for (uint64_t i = 1; i < count; ++i) {
             const uint64_t process_index = process_indices[i];
-            if (pending_exec[i]) continue;
-            if ((pollfds[i].revents & PACHA_FD_EVENT_READABLE) != 0 &&
-                process_index < g_process_count)
+            if ((pollfds[i].revents & PACHA_FD_EVENT_READABLE) == 0 ||
+                process_index >= g_process_count)
             {
-                lprs_process_t *child = &g_processes[process_index];
-                if (!child->active || child->process_fd < 16) continue;
+                continue;
+            }
+            lprs_process_t *proc = &g_processes[process_index];
+            if (pending_exec[i]) {
+                if (!proc->active || proc->process_fd >= 16 ||
+                    proc->pending_exec_fd != pollfds[i].fd)
+                {
+                    continue;
+                }
                 uint64_t exit_state = 0;
                 uint64_t exit_code = 0;
                 if (lprs_try_wait_process_fd(
-                        child->process_fd, &exit_state, &exit_code) == 0)
+                        proc->pending_exec_fd, &exit_state, &exit_code) != 0)
                 {
-                    lprs_notify_exited_child(child, exit_state, exit_code);
+                    continue;
                 }
+                proc->process_fd = proc->pending_exec_fd;
+                proc->pending_exec_fd = -1;
+                if (proc->exit_ready == 0 &&
+                    lprs_try_wait_process_fd(
+                        proc->process_fd, &exit_state, &exit_code) == 0)
+                {
+                    lprs_notify_exited_child(proc, exit_state, exit_code);
+                }
+                continue;
+            }
+            if (!proc->active || proc->exit_ready ||
+                proc->process_fd != pollfds[i].fd)
+            {
+                continue;
+            }
+            uint64_t exit_state = 0;
+            uint64_t exit_code = 0;
+            if (lprs_try_wait_process_fd(
+                    proc->process_fd, &exit_state, &exit_code) == 0)
+            {
+                lprs_notify_exited_child(proc, exit_state, exit_code);
             }
         }
+        lprs_complete_waiters();
         if ((pollfds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
             while (lprs_service_one_pending_request() == 0) {
             }

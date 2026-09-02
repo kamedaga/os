@@ -19,39 +19,41 @@
 #define PACHAOS_SYSCALL_GETTID 23
 #define PACHAOS_SYSCALL_SYSTEM_INFO 24
 #define PACHAOS_SYSCALL_CLOCK_GETTIME 25
-#define PACHAOS_SYSCALL_NANOSLEEP 26
-#define PACHAOS_SYSCALL_FUTEX_WAIT 27
-#define PACHAOS_SYSCALL_FUTEX_WAKE 28
-#define PACHAOS_SYSCALL_GETRANDOM 29
-#define PACHAOS_SYSCALL_FD_CLOSE 30
-#define PACHAOS_SYSCALL_FD_READ 34
-#define PACHAOS_SYSCALL_FD_WRITE 35
-#define PACHAOS_SYSCALL_FD_READV 36
-#define PACHAOS_SYSCALL_FD_WRITEV 37
-#define PACHAOS_SYSCALL_FD_FCNTL 38
-#define PACHAOS_SYSCALL_FD_POLL 39
-#define PACHAOS_SYSCALL_FD_WAIT_MANY 40
-#define PACHAOS_SYSCALL_FD_IOCTL 41
-#define PACHAOS_SYSCALL_FD_STAT 42
-#define PACHAOS_SYSCALL_EVENTFD_CREATE 43
-#define PACHAOS_SYSCALL_PIPE_CREATE 44
-#define PACHAOS_SYSCALL_TIMERFD_CREATE 45
-#define PACHAOS_SYSCALL_TIMERFD_SETTIME 46
-#define PACHAOS_SYSCALL_TIMERFD_GETTIME 47
-#define PACHAOS_SYSCALL_VMO_CREATE 48
-#define PACHAOS_SYSCALL_VMO_REVOKE 49
-#define PACHAOS_SYSCALL_MMAP 50
-#define PACHAOS_SYSCALL_MUNMAP 51
-#define PACHAOS_SYSCALL_MPROTECT 52
-#define PACHAOS_SYSCALL_MREMAP 53
-#define PACHAOS_SYSCALL_MADVISE 54
-#define PACHAOS_SYSCALL_IPC_ENDPOINT_CREATE 55
-#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 56
-#define PACHAOS_SYSCALL_IPC_SEND 57
-#define PACHAOS_SYSCALL_IPC_RECV 58
-#define PACHAOS_SYSCALL_IPC_CALL 59
-#define PACHAOS_SYSCALL_IPC_REPLY 60
-#define PACHAOS_SYSCALL_IPC_RECV_WAIT 61
+#define PACHAOS_SYSCALL_CLOCK_GETRES 26
+#define PACHAOS_SYSCALL_NANOSLEEP 27
+#define PACHAOS_SYSCALL_FUTEX_WAIT 28
+#define PACHAOS_SYSCALL_FUTEX_WAKE 29
+#define PACHAOS_SYSCALL_FUTEX_REQUEUE 30
+#define PACHAOS_SYSCALL_GETRANDOM 31
+#define PACHAOS_SYSCALL_FD_CLOSE 32
+#define PACHAOS_SYSCALL_FD_READ 36
+#define PACHAOS_SYSCALL_FD_WRITE 37
+#define PACHAOS_SYSCALL_FD_READV 38
+#define PACHAOS_SYSCALL_FD_WRITEV 39
+#define PACHAOS_SYSCALL_FD_FCNTL 40
+#define PACHAOS_SYSCALL_FD_POLL 41
+#define PACHAOS_SYSCALL_FD_WAIT_MANY 42
+#define PACHAOS_SYSCALL_FD_IOCTL 43
+#define PACHAOS_SYSCALL_FD_STAT 44
+#define PACHAOS_SYSCALL_EVENTFD_CREATE 45
+#define PACHAOS_SYSCALL_PIPE_CREATE 46
+#define PACHAOS_SYSCALL_TIMERFD_CREATE 47
+#define PACHAOS_SYSCALL_TIMERFD_SETTIME 48
+#define PACHAOS_SYSCALL_TIMERFD_GETTIME 49
+#define PACHAOS_SYSCALL_VMO_CREATE 50
+#define PACHAOS_SYSCALL_VMO_REVOKE 51
+#define PACHAOS_SYSCALL_MMAP 52
+#define PACHAOS_SYSCALL_MUNMAP 53
+#define PACHAOS_SYSCALL_MPROTECT 54
+#define PACHAOS_SYSCALL_MREMAP 55
+#define PACHAOS_SYSCALL_MADVISE 56
+#define PACHAOS_SYSCALL_IPC_ENDPOINT_CREATE 57
+#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 58
+#define PACHAOS_SYSCALL_IPC_SEND 59
+#define PACHAOS_SYSCALL_IPC_RECV 60
+#define PACHAOS_SYSCALL_IPC_CALL 61
+#define PACHAOS_SYSCALL_IPC_REPLY 62
+#define PACHAOS_SYSCALL_IPC_RECV_WAIT 63
 
 #define PACHAOS_FD_FLAG_CLOEXEC 1
 #define PACHAOS_FD_FLAG_NONBLOCK 2
@@ -94,6 +96,7 @@
 #define LINUX_MREMAP_DONTUNMAP 4
 #define LINUX_FUTEX_WAIT 0
 #define LINUX_FUTEX_WAKE 1
+#define LINUX_FUTEX_REQUEUE 3
 #define LINUX_AT_SYMLINK_NOFOLLOW 0x100
 #define LINUX_AT_REMOVEDIR 0x200
 #define LINUX_AT_EMPTY_PATH 0x1000
@@ -3549,6 +3552,7 @@ static __inline long __syscall2(long n, long a1, long a2)
 	case __NR_munmap: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, a1, a2));
 	case __NR_madvise: return __pachaos_madvise(a1, a2, 0);
 	case __NR_clock_gettime: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_CLOCK_GETTIME, a1, a2));
+	case __NR_clock_getres: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_CLOCK_GETRES, a1, a2));
 	case __NR_nanosleep: return __pachaos_status(__pachaos_raw2(PACHAOS_SYSCALL_NANOSLEEP, a1, a2));
 	case __NR_fstat: return __pachaos_filed_fstat(a1, (void *)a2);
 	case __NR_ftruncate: return __pachaos_filed_ftruncate(a1, a2);
@@ -3639,6 +3643,14 @@ static __inline long __syscall4(long n, long a1, long a2, long a3, long a4)
 static __inline long __syscall5(long n, long a1, long a2, long a3, long a4, long a5)
 {
 	switch (n) {
+	case __NR_futex:
+		if ((a2 & 127) == LINUX_FUTEX_REQUEUE) {
+			if (!a1 || !a5 || (a1 & 3) || (a5 & 3) || a1 == a5)
+				return -22;
+			return __pachaos_raw4(
+				PACHAOS_SYSCALL_FUTEX_REQUEUE, a1, a3, a4, a5);
+		}
+		return -38;
 	case __NR_mremap:
 		return __pachaos_mremap(a1, a2, a3, a4, a5);
 	case __NR_renameat2:
@@ -3662,6 +3674,7 @@ static __inline long __syscall6(long n, long a1, long a2, long a3, long a4, long
 		return __syscall1(n, a1);
 	case __NR_munmap:
 	case __NR_clock_gettime:
+	case __NR_clock_getres:
 	case __NR_nanosleep:
 	case __NR_fstat:
 	case __NR_ftruncate:

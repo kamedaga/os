@@ -197,7 +197,7 @@ pub fn tryCreateUserProcess(
     principal: kernel.PrincipalId,
     role_label: []const u8,
     free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
+    user_spaces: *boot_static.UserAddressSpaceTable,
 ) CreateUserProcessError!CreatedUserProcess {
     if (!state.ensureProcessDescriptor(principal, role_label)) {
         log_util.logPrefixedLabelMessage("ensureProcessDescriptor failed for ", role_label, "");
@@ -234,7 +234,7 @@ pub fn createUserProcess(
     principal: kernel.PrincipalId,
     role_label: []const u8,
     free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
+    user_spaces: *boot_static.UserAddressSpaceTable,
 ) CreatedUserProcess {
     return tryCreateUserProcess(state, principal, role_label, free_list, user_spaces) catch halt.haltLoop();
 }
@@ -243,12 +243,12 @@ pub fn tryCreateDynamicUserProcess(
     state: *kernel.KernelState,
     role_label: []const u8,
     free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
+    user_spaces: *boot_static.UserAddressSpaceTable,
 ) CreateDynamicUserProcessError!DynamicUserProcess {
-    const principal = state.createProcessDescriptorWithCapacityLimitChecked(
+    const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
         role_label,
         free_list,
-        user_spaces.len,
+        user_spaces,
         scheduler.principalSlotReusable,
     ) orelse return error.NoFreeProcess;
     releaseStaleThreadSlot(principal);
@@ -263,12 +263,12 @@ pub fn tryCreateSuspendedUserProcess(
     state: *kernel.KernelState,
     role_label: []const u8,
     free_list: *kernel.FreePageList,
-    user_spaces: []boot_static.UserAddressSpace,
+    user_spaces: *boot_static.UserAddressSpaceTable,
 ) CreateDynamicUserProcessError!SuspendedUserProcess {
-    const principal = state.createProcessDescriptorWithCapacityLimitChecked(
+    const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
         role_label,
         free_list,
-        user_spaces.len,
+        user_spaces,
         scheduler.principalSlotReusable,
     ) orelse return error.NoFreeProcess;
     releaseStaleThreadSlot(principal);

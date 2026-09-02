@@ -7,6 +7,20 @@ __asm__(
     "lpr_runtime_text_start:\n"
     ".popsection\n");
 
+/* Starts set and is only trusted once the kernel has accepted the address:
+ * the safe direction is to ask when we do not know.  A stale 1 costs one
+ * syscall; a stale 0 drops a signal and hangs the process. */
+static volatile uint32_t lpr_native_pending_hint = 1;
+static int lpr_native_pending_hint_active;
+
+void lpr_linux_signal_hint_reset_for_fork_child(void)
+{
+    /* The child's principal has no hint address registered yet, and the
+     * inherited word may read 0. */
+    lpr_native_pending_hint = 1;
+    lpr_native_pending_hint_active = 0;
+}
+
 enum {
     LPR_SIGNAL_FRAME_MAGIC = 0x5349474652414d45ull,
     LPR_SIGNAL_RED_ZONE = 128,
@@ -122,8 +136,75 @@ _Static_assert(
 
 extern void lpr_async_signal_entry(void);
 extern void lpr_async_signal_restorer(void);
+extern void lpr_syscall_entry(void);
 extern char lpr_runtime_text_start[];
 extern char lpr_runtime_text_end[];
+
+#if defined(LPR_SIGNAL_SOURCE_DIAG) && LPR_SIGNAL_SOURCE_DIAG
+static char *lpr_signal_diag_append_text(
+    char *out, const char *end, const char *text)
+{
+    while (out < end && text != 0 && *text != '\0') {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_signal_diag_append_u64(
+    char *out, const char *end, uint64_t value)
+{
+    char digits[20];
+    uint64_t count = 0;
+    do {
+        digits[count++] = (char)('0' + (value % 10u));
+        value /= 10u;
+    } while (value != 0 && count < sizeof(digits));
+    while (out < end && count != 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+void lpr_signal_source_diag(
+    const char *source, uint32_t sig, uint64_t arg0, uint64_t arg1)
+{
+    char line[320];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_signal_diag_append_text(out, end, "[lpr-signal-source] source=");
+    out = lpr_signal_diag_append_text(out, end, source);
+    out = lpr_signal_diag_append_text(out, end, " native_pid=");
+    out = lpr_signal_diag_append_u64(
+        out, end, (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_signal_diag_append_text(out, end, " native_tid=");
+    out = lpr_signal_diag_append_u64(
+        out, end, (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID));
+    out = lpr_signal_diag_append_text(out, end, " linux_pid=");
+    out = lpr_signal_diag_append_u64(out, end, (uint64_t)lpr_linux_current_pid);
+    out = lpr_signal_diag_append_text(out, end, " signal=");
+    out = lpr_signal_diag_append_u64(out, end, sig);
+    out = lpr_signal_diag_append_text(out, end, " arg0=");
+    out = lpr_signal_diag_append_u64(out, end, arg0);
+    out = lpr_signal_diag_append_text(out, end, " arg1=");
+    out = lpr_signal_diag_append_u64(out, end, arg1);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+#else
+void lpr_signal_source_diag(
+    const char *source, uint32_t sig, uint64_t arg0, uint64_t arg1)
+{
+    (void)source;
+    (void)sig;
+    (void)arg0;
+    (void)arg1;
+}
+#endif
 
 static int lpr_signal_sp_on_altstack(uint64_t rsp)
 {
@@ -139,10 +220,16 @@ static int lpr_signal_sp_on_altstack(uint64_t rsp)
 
 void lpr_linux_signal_runtime_init(void)
 {
-    lpr_signal_thread_state_prepare_current();
+    /* Runs on the way in from every intercepted Linux syscall, so the early
+     * exit has to come first: claiming the slot needs the tid, and asking the
+     * kernel for it is a real syscall on a value that cannot change while the
+     * thread lives.  Threads that appear after registration already claim
+     * their slot in lpr_clone_thread_bootstrap(), and a fork child clears
+     * runtime_registered, so its first syscall still comes through here. */
     if (lpr_linux_signal_runtime_registered) {
         return;
     }
+    lpr_signal_thread_state_prepare_current();
     const int64_t status = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
         PACHAOS_PROCESS_SIGNAL_CTL_REGISTER,
@@ -152,7 +239,20 @@ void lpr_linux_signal_runtime_init(void)
         LPR_ZPOLINE_PAGE_VA,
         LPR_ZPOLINE_PAGE_VA + LPR_ZPOLINE_PAGE_SIZE);
     if (status == PACHAOS_SYSCALL_OK) {
-        lpr_linux_signal_runtime_registered = 1;
+        /* Best effort: the hint only removes a syscall.  Letting it gate
+         * registration would turn an optimisation failure into a runtime that
+         * re-registers on every syscall. */
+        /* Left inert: the hint is a separate line of work and would confound
+         * the netd notification-drain measurement. */
+        const uint64_t native_mask =
+            lpr_linux_signal_mask & ~lpr_signalfd_union_mask();
+        if (lpr_pacha_syscall2(
+                PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+                PACHAOS_PROCESS_SIGNAL_CTL_SET_MASK,
+                native_mask) == PACHAOS_SYSCALL_OK)
+        {
+            lpr_linux_signal_runtime_registered = 1;
+        }
     }
 }
 
@@ -168,6 +268,17 @@ int64_t lpr_linux_sync_native_signal_mask(void)
     return status == PACHAOS_SYSCALL_OK ? 0 : lpr_pacha_status_to_errno(status);
 }
 
+static int64_t lpr_linux_set_native_signal_mask(uint64_t native_mask)
+{
+    lpr_linux_signal_runtime_init();
+    const int64_t status = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHAOS_PROCESS_SIGNAL_CTL_SET_MASK,
+        native_mask);
+    return status == PACHAOS_SYSCALL_OK ?
+        0 : lpr_pacha_status_to_errno(status);
+}
+
 static _Noreturn void lpr_native_signal_return(lpr_pacha_signal_frame_t *frame)
 {
     // SIGNAL_CTL_RETURN replaces the current native trap frame and therefore
@@ -181,11 +292,179 @@ static _Noreturn void lpr_native_signal_return(lpr_pacha_signal_frame_t *frame)
     }
 }
 
+static void lpr_linux_sigwait_info_fill(uint64_t info_raw, uint32_t sig)
+{
+    if (info_raw == 0) return;
+    lpr_linux_siginfo_t *info =
+        (lpr_linux_siginfo_t *)(uintptr_t)info_raw;
+    lpr_memset(info, 0, sizeof(*info));
+    info->si_signo = (int32_t)sig;
+}
+
+static void lpr_linux_sigwait_clear(lpr_signal_thread_state_t *state)
+{
+    state->sigwait_set = 0;
+    state->sigwait_info = 0;
+    state->sigwait_deadline_ns = 0;
+    state->sigwait_deadline_finite = 0;
+    __atomic_store_n(&state->sigwait_active, 0u, __ATOMIC_RELEASE);
+}
+
+static int64_t lpr_linux_sigwait_finish(int64_t result, uint32_t sig)
+{
+    lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
+    const uint64_t info_raw = state->sigwait_info;
+    lpr_linux_sigwait_clear(state);
+    const int64_t restore_status = lpr_linux_sync_native_signal_mask();
+    if (restore_status != 0) return restore_status;
+    if (sig != 0) lpr_linux_sigwait_info_fill(info_raw, sig);
+    return result;
+}
+
+static uint32_t lpr_linux_sigwait_take_pending(uint64_t wait_set)
+{
+    for (;;) {
+        const uint64_t local_ready =
+            lpr_linux_pending_signal_mask & wait_set;
+        const uint64_t shared_pending = __atomic_load_n(
+            &lpr_state.signal.signalfd_pending_mask,
+            __ATOMIC_ACQUIRE);
+        const uint64_t ready = local_ready | (shared_pending & wait_set);
+        if (ready == 0) return 0;
+        const uint32_t sig = (uint32_t)__builtin_ctzll(ready) + 1u;
+        const uint64_t bit = lpr_linux_signal_bit(sig);
+        if ((local_ready & bit) != 0) {
+            lpr_linux_pending_signal_mask &= ~bit;
+            return sig;
+        }
+        uint64_t expected = shared_pending;
+        if (__atomic_compare_exchange_n(
+                &lpr_state.signal.signalfd_pending_mask,
+                &expected,
+                shared_pending & ~bit,
+                0,
+                __ATOMIC_ACQ_REL,
+                __ATOMIC_ACQUIRE))
+        {
+            return sig;
+        }
+    }
+}
+
+int64_t lpr_linux_rt_sigtimedwait(
+    uint64_t set_raw,
+    uint64_t info_raw,
+    uint64_t timeout_raw,
+    uint64_t sigsetsize)
+{
+    lpr_signal_thread_state_t *state = lpr_signal_thread_state_current();
+    lpr_wait_deadline_t deadline;
+
+    if (__atomic_load_n(&state->sigwait_active, __ATOMIC_ACQUIRE) == 0u) {
+        if (set_raw == 0) return -LPR_LINUX_EFAULT;
+        if (sigsetsize != sizeof(uint64_t)) return -LPR_LINUX_EINVAL;
+
+        const uint64_t wait_set =
+            *(const uint64_t *)(uintptr_t)set_raw &
+            ~lpr_linux_unblockable_signal_mask();
+        const uint32_t pending = lpr_linux_sigwait_take_pending(wait_set);
+        if (pending != 0) {
+            lpr_linux_sigwait_info_fill(info_raw, pending);
+            return pending;
+        }
+
+        if (timeout_raw == 0) {
+            lpr_memset(&deadline, 0, sizeof(deadline));
+        } else {
+            const lpr_linux_timespec_t *timeout =
+                (const lpr_linux_timespec_t *)(uintptr_t)timeout_raw;
+            if (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+                timeout->tv_nsec >= 1000000000ll)
+            {
+                return -LPR_LINUX_EINVAL;
+            }
+            uint64_t timeout_ns = UINT64_MAX;
+            if ((uint64_t)timeout->tv_sec <=
+                (UINT64_MAX - (uint64_t)timeout->tv_nsec) / 1000000000ull)
+            {
+                timeout_ns =
+                    (uint64_t)timeout->tv_sec * 1000000000ull +
+                    (uint64_t)timeout->tv_nsec;
+            }
+            const int64_t deadline_status =
+                lpr_wait_deadline_init_ns(&deadline, timeout_ns);
+            if (deadline_status != 0) return deadline_status;
+        }
+
+        state->sigwait_set = wait_set;
+        state->sigwait_info = info_raw;
+        state->sigwait_deadline_ns = deadline.expires_ns;
+        state->sigwait_deadline_finite = deadline.finite;
+        __atomic_store_n(&state->sigwait_active, 1u, __ATOMIC_RELEASE);
+
+        const uint64_t native_mask =
+            (lpr_linux_signal_mask & ~lpr_signalfd_union_mask()) &
+            ~wait_set;
+        const int64_t mask_status =
+            lpr_linux_set_native_signal_mask(native_mask);
+        if (mask_status != 0) {
+            lpr_linux_sigwait_clear(state);
+            return mask_status;
+        }
+
+        const uint32_t rescanned =
+            lpr_linux_sigwait_take_pending(wait_set);
+        if (rescanned != 0)
+            return lpr_linux_sigwait_finish(rescanned, rescanned);
+
+        /* SET_MASK can expose a signal that was already pending in the native
+         * scheduler.  Ask the existing return-frame bridge to claim it before
+         * deciding that a zero timeout has expired.  A matching signal is
+         * completed in lpr_linux_async_signal_prepare(). */
+        lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+    } else {
+        deadline.expires_ns = state->sigwait_deadline_ns;
+        deadline.finite = (uint8_t)state->sigwait_deadline_finite;
+        lpr_memset(deadline.reserved, 0, sizeof(deadline.reserved));
+    }
+
+    for (;;) {
+        const uint32_t pending =
+            lpr_linux_sigwait_take_pending(state->sigwait_set);
+        if (pending != 0)
+            return lpr_linux_sigwait_finish(pending, pending);
+
+        int expired = 0;
+        int64_t status = lpr_wait_deadline_expired(&deadline, &expired);
+        if (status != 0)
+            return lpr_linux_sigwait_finish(status, 0);
+        if (expired)
+            return lpr_linux_sigwait_finish(-LPR_LINUX_EAGAIN, 0);
+
+        lpr_wait_graph_t graph;
+        lpr_wait_graph_init(&graph);
+        status = lpr_wait_graph_block(&graph, &deadline);
+        if (status == LPR_WAIT_RESTART_SYSCALL) {
+            const uint32_t rescanned =
+                lpr_linux_sigwait_take_pending(state->sigwait_set);
+            if (rescanned != 0)
+                return lpr_linux_sigwait_finish(rescanned, rescanned);
+            return LPR_WAIT_RESTART_SYSCALL;
+        }
+        if (status != 0)
+            return lpr_linux_sigwait_finish(status, 0);
+    }
+}
+
 void lpr_linux_deliver_native_pending_frame(int64_t interrupted_result)
 {
+    if (lpr_native_pending_hint_active && lpr_native_pending_hint == 0) return;
     struct lpr_linux_user_frame *interrupted_frame =
         (struct lpr_linux_user_frame *)lpr_current_linux_user_frame();
     if (interrupted_frame == 0) return;
+    /* Cleared before the ask: a signal queued while the syscall runs makes the
+     * kernel set it again, so nothing is lost. */
+    if (lpr_native_pending_hint_active) lpr_native_pending_hint = 0;
     const uint64_t saved_rax = interrupted_frame->rax;
     interrupted_frame->rax = (uint64_t)interrupted_result;
     // A successful DELIVER_PENDING_FRAME redirects directly to the native
@@ -269,7 +548,46 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
     }
 
     const uint32_t sig = (uint32_t)native->signo;
+    if (sig != LPR_LINUX_SIGALRM) {
+        lpr_signal_source_diag(
+            "native-frame",
+            sig,
+            native->context.rip,
+            lpr_linux_sigactions[sig].handler);
+    }
     const uint64_t bit = lpr_linux_signal_bit(sig);
+    lpr_linux_sigaction_record_t *action = &lpr_linux_sigactions[sig];
+    lpr_signal_thread_state_t *thread_state =
+        lpr_signal_thread_state_current();
+    if (__atomic_load_n(
+            &thread_state->sigwait_active,
+            __ATOMIC_ACQUIRE) != 0u)
+    {
+        if ((thread_state->sigwait_set & bit) != 0) {
+            const uint64_t info_raw = thread_state->sigwait_info;
+            lpr_linux_sigwait_info_fill(info_raw, sig);
+            lpr_linux_sigwait_clear(thread_state);
+            if (lpr_linux_sync_native_signal_mask() != 0)
+                lpr_linux_exit_for_signal(11u);
+            native->context.rax = sig;
+            lpr_native_signal_return(native);
+        }
+        if (action->handler == LPR_LINUX_SIG_IGN ||
+            (action->handler == LPR_LINUX_SIG_DFL &&
+             lpr_linux_default_signal_ignored(sig)))
+        {
+            /* The native scheduler had to interrupt the current Linux frame
+             * before LPR could apply its ignored disposition.  Re-enter the
+             * same syscall with its original argument registers and the
+             * absolute deadline retained in thread state. */
+            native->context.rax = LPR_LINUX_SYS_RT_SIGTIMEDWAIT;
+            native->context.rip = (uint64_t)(uintptr_t)lpr_syscall_entry;
+            lpr_native_signal_return(native);
+        }
+        lpr_linux_sigwait_clear(thread_state);
+        if (lpr_linux_sync_native_signal_mask() != 0)
+            lpr_linux_exit_for_signal(11u);
+    }
     uint64_t return_mask = lpr_linux_signal_mask;
     const int restore_wait_mask = lpr_linux_wait_restore_mask_active != 0;
     if (restore_wait_mask) {
@@ -289,7 +607,6 @@ void *lpr_linux_async_signal_prepare(void *native_raw)
         lpr_native_signal_return(native);
     }
 
-    lpr_linux_sigaction_record_t *action = &lpr_linux_sigactions[sig];
     if (action->handler == LPR_LINUX_SIG_IGN ||
         (action->handler == LPR_LINUX_SIG_DFL && lpr_linux_default_signal_ignored(sig)))
     {

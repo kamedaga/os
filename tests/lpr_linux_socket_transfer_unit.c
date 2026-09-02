@@ -14,6 +14,7 @@ enum {
     TEST_LEASE_FD = 70,
     TEST_REMOTE_LEASE_FD = 71,
     TEST_IMPORTED_FD = 23,
+    TEST_TTY_HANDLE = 0x3344,
 };
 
 lpr_state_t lpr_state;
@@ -23,6 +24,7 @@ static uint64_t duplicated_handle;
 static int duplicated_lease_fd;
 static unsigned duplicate_handle_calls;
 static lpr_socket_backend_t imported_socket;
+static lpr_tty_backend_t imported_tty;
 static lpr_fd_install_t imported_install;
 static unsigned notifications[128];
 
@@ -155,16 +157,34 @@ int64_t lpr_drm_transfer_dup_handle(
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
+int64_t lpr_termd_transfer_dup_handle(
+    uint64_t handle, int lease_fd, uint64_t *out_handle)
+{
+    if (handle != TEST_TTY_HANDLE || lease_fd != TEST_REMOTE_LEASE_FD ||
+        out_handle == NULL)
+        return -LPR_LINUX_EINVAL;
+    *out_handle = handle;
+    return 0;
+}
+
 uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id)
 {
-    return ops_id == LPR_FD_OPS_SOCKET ? sizeof(imported_socket) : 0;
+    if (ops_id == LPR_FD_OPS_SOCKET) return sizeof(imported_socket);
+    if (ops_id == LPR_FD_OPS_TTY) return sizeof(imported_tty);
+    return 0;
 }
 
 void *lpr_backend_state_alloc(uint64_t state_bytes)
 {
-    if (state_bytes != sizeof(imported_socket)) return NULL;
-    memset(&imported_socket, 0, sizeof(imported_socket));
-    return &imported_socket;
+    if (state_bytes == sizeof(imported_socket)) {
+        memset(&imported_socket, 0, sizeof(imported_socket));
+        return &imported_socket;
+    }
+    if (state_bytes == sizeof(imported_tty)) {
+        memset(&imported_tty, 0, sizeof(imported_tty));
+        return &imported_tty;
+    }
+    return NULL;
 }
 
 int64_t lpr_backend_state_free(void *state, uint64_t state_bytes)
@@ -211,6 +231,53 @@ int lpr_fd_table_ensure_capacity(uint64_t required_capacity)
 
 int main(void)
 {
+    lpr_tty_backend_t console_tty;
+    memset(&console_tty, 0, sizeof(console_tty));
+    console_tty.active = 1;
+    console_tty.flags = LPR_LINUX_O_RDWR | LPR_LINUX_O_CLOEXEC;
+    console_tty.handle = TEST_TTY_HANDLE;
+    console_tty.wait_fd.raw = TEST_WAIT_SOURCE_FD;
+    const lpr_fd_pin_t tty_pin = {
+        .effective_rights = LPR_FD_RIGHT_READ | LPR_FD_RIGHT_WRITE |
+            LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_DUP,
+        .ops_id = LPR_FD_OPS_TTY,
+        .state = &console_tty,
+    };
+    netd_transfer_occurrence_t tty_item;
+    int tty_capabilities[2] = {-1, -1};
+    uint32_t tty_capability_count = 0;
+    expect(lpr_fd_transfer_prepare(
+               &tty_pin, &tty_item, tty_capabilities, 2,
+               &tty_capability_count) == 0,
+           "console TTY is transferable for GApplication stdin");
+    expect(tty_item.provider_id == LPR_FD_OPS_TTY &&
+               tty_item.transfer_token == TEST_TTY_HANDLE &&
+               tty_item.capability_count == 2,
+           "TTY transfer preserves provider and termd handle");
+    expect(tty_capability_count == 2 &&
+               tty_capabilities[0] == TEST_WAIT_DUP_FD &&
+               tty_capabilities[1] == TEST_LEASE_FD,
+           "TTY transfer carries wait and lifetime capabilities");
+    int imported_tty_fd = -1;
+    expect(lpr_fd_transfer_import_batch(
+               &tty_item, 1, tty_capabilities, tty_capability_count,
+               LPR_LINUX_O_CLOEXEC, &imported_tty_fd) == 0,
+           "received console TTY transfer imports atomically");
+    expect(imported_tty_fd == TEST_IMPORTED_FD &&
+               imported_install.ops_id == LPR_FD_OPS_TTY &&
+               imported_tty.active &&
+               imported_tty.handle == TEST_TTY_HANDLE,
+           "TTY import installs the original termd handle");
+    expect(imported_tty.wait_fd.raw == TEST_WAIT_DUP_FD &&
+               imported_tty.lease_fd.raw == TEST_LEASE_FD &&
+               (imported_tty.reserved1 & LPR_BACKEND_TRANSFER_LEASE) != 0,
+           "TTY import owns readiness and termd lifetime leases");
+    console_tty.reserved0 = LPR_TTY_BACKEND_PTY_MASTER;
+    expect(lpr_fd_transfer_prepare(
+               &tty_pin, &tty_item, tty_capabilities, 2,
+               &tty_capability_count) == -LPR_LINUX_EOPNOTSUPP,
+           "PTY roles are rejected until their role metadata is transferable");
+
     uint64_t data_pair[2] = {0, 0};
     expect(netd_unix_socket_pair(
                NETD_SOCK_STREAM, 0, 80, 81, data_pair) == 0,

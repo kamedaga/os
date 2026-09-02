@@ -81,6 +81,11 @@ int termd_linux_tty_island_transfer_dup(
 int termd_linux_tty_island_ioctl(
     struct termd_linux_tty_island *island,
     termd_ioctl_request_t *request);
+int termd_linux_tty_island_open_peer(
+    struct termd_linux_tty_island *island,
+    const termd_ioctl_request_t *request,
+    int notify_fd,
+    uint64_t *out_handle);
 int termd_linux_tty_island_poll(
     struct termd_linux_tty_island *island,
     termd_poll_request_t *request);

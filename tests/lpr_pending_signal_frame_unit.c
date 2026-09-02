@@ -52,6 +52,18 @@ void lpr_linux_prepare_process_exit(uint64_t exit_code)
     (void)exit_code;
 }
 
+void lpr_signal_source_diag(
+    const char *source,
+    uint32_t sig,
+    uint64_t arg0,
+    uint64_t arg1)
+{
+    (void)source;
+    (void)sig;
+    (void)arg0;
+    (void)arg1;
+}
+
 /* Single-threaded harness: back the per-thread signal state with slot 0 so
  * reset_state()'s lpr_state wipe resets it, matching the real slot storage. */
 lpr_signal_thread_state_t *lpr_signal_thread_state_current(void)

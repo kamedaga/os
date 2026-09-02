@@ -11,6 +11,7 @@ fi
 
 .artifacts/bin/pacgo qemu-test \
   --timeout 30s \
+  --console-shell \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
   --send '/cmd/lpr_epoll_smoke.elf' \
   --expect 'LPR_EPOLL_START' \
@@ -28,6 +29,7 @@ fi
   --expect 'LPR_EPOLL_CLOSE_AUTO=OK' \
   --expect 'LPR_EPOLL_HUP=OK' \
   --expect 'LPR_EPOLL_NESTED=OK' \
+  --expect 'LPR_EPOLL_EVENTFD_CONTENTION=OK' \
   --expect 'LPR_EPOLL_FORK_INFINITE=OK' \
   --expect 'LPR_EPOLL_CLOEXEC_EXEC=OK' \
   --expect 'LPR_EPOLL_DONE'

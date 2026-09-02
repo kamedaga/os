@@ -4,9 +4,10 @@ const kernel = @import("../kernel.zig");
 const scheduler = @import("../scheduler.zig").connection;
 
 pub const UserAddressSpace = address_space.UserAddressSpace;
+pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 
 pub const Hooks = struct {
-    user_spaces: []UserAddressSpace,
+    user_spaces: *UserAddressSpaceTable,
     four_gib: u64,
     physical_map_limit: u64,
     user_low_va: u64,
@@ -125,15 +126,21 @@ pub fn unlockAddressSpacePair(first: kernel.PrincipalId, second: kernel.Principa
 
 pub fn lockAllAddressSpaces() void {
     const h = hooks orelse return;
-    for (h.user_spaces) |*space| lockState(&space.lock_state);
+    const capacity = h.user_spaces.capacity();
+    var index: usize = 0;
+    while (index < capacity) : (index += 1) {
+        const space = h.user_spaces.get(index) orelse continue;
+        lockState(&space.lock_state);
+    }
 }
 
 pub fn unlockAllAddressSpaces() void {
     const h = hooks orelse return;
-    var index = h.user_spaces.len;
+    var index = h.user_spaces.capacity();
     while (index != 0) {
         index -= 1;
-        unlockState(&h.user_spaces[index].lock_state);
+        const space = h.user_spaces.get(index) orelse continue;
+        unlockState(&space.lock_state);
     }
 }
 
@@ -192,15 +199,14 @@ pub fn init(new_hooks: Hooks) void {
     hooks = new_hooks;
 }
 
-pub fn updateUserSpaces(user_spaces: []UserAddressSpace) void {
+pub fn updateUserSpaces(user_spaces: *UserAddressSpaceTable) void {
     if (hooks) |*h| h.user_spaces = user_spaces;
 }
 
 pub fn getUserSpace(principal: kernel.PrincipalId) ?*UserAddressSpace {
     const h = hooks orelse return null;
     const idx = processIndex(principal) orelse return null;
-    if (idx >= h.user_spaces.len) return null;
-    return &h.user_spaces[idx];
+    return h.user_spaces.get(idx);
 }
 
 pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
@@ -324,30 +330,7 @@ pub fn resetUserReservations(space: *UserAddressSpace) void {
 }
 
 pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
-    @memset(space.pml4[0..], 0);
-    var pdp_slot_init: usize = 0;
-    while (pdp_slot_init < UserAddressSpace.max_dynamic_pdp_pages) : (pdp_slot_init += 1) {
-        space.pdp_page_pml4_index[pdp_slot_init] = UserAddressSpace.no_pd_index;
-        @memset(space.pdp_pages[pdp_slot_init][0..], 0);
-    }
-    var pd_slot_init: usize = 0;
-    while (pd_slot_init < UserAddressSpace.max_dynamic_pd_pages) : (pd_slot_init += 1) {
-        space.pd_page_pml4_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
-        @memset(space.pd_pages[pd_slot_init][0..], 0);
-    }
-    var pt_slot_init: usize = 0;
-    while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
-        space.pt_page_pml4_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pdp_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        @memset(space.pt_pages[pt_slot_init][0..], 0);
-    }
-    space.pdp_page_used_len = 0;
-    space.pd_page_used_len = 0;
-    space.pt_page_used_len = 0;
-    space.cr3 = 0;
-    resetUserReservations(space);
+    address_space.resetUserAddressSpaceStorage(space);
 }
 
 fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {

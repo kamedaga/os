@@ -176,6 +176,23 @@ pub fn processStatus(self: anytype, principal: PrincipalId) ProcessStatus {
     };
 }
 
+pub fn processSignalPendingHintVa(self: anytype, principal: PrincipalId) u64 {
+    const desc = self.processDescriptor(principal) orelse return 0;
+    return desc.signal_pending_hint_va;
+}
+
+pub fn setProcessSignalPendingHintVa(self: anytype, principal: PrincipalId, hint_va: u64) bool {
+    const index = processIndexFromPrincipal(principal) orelse return false;
+    const desc = self.processDescriptorSlot(index) orelse return false;
+    if (!desc.active) return false;
+    desc.signal_pending_hint_va = hint_va;
+    return true;
+}
+
+pub fn clearProcessSignalPendingHintVa(self: anytype, principal: PrincipalId) bool {
+    return self.setProcessSignalPendingHintVa(principal, 0);
+}
+
 pub fn isBootstrapOwner(self: anytype, principal: PrincipalId) bool {
     const desc = self.processDescriptor(principal) orelse return false;
     return desc.bootstrap_owner;
@@ -468,15 +485,12 @@ pub fn markThreadObjectsExitedBySlot(self: anytype, thread_index: usize, thread_
 }
 
 pub fn nextProcessCapacity(self: anytype, required: usize) ?usize {
-    if (required > max_process_slots) return null;
-    var capacity = self.process_capacity;
-    if (capacity == 0) capacity = process_count;
-    while (capacity < required) {
-        const doubled = capacity * 2;
-        capacity = if (doubled > max_process_slots) max_process_slots else doubled;
-        if (capacity < required and capacity == max_process_slots) return null;
-    }
-    return capacity;
+    return table.nextGeometricCapacity(
+        self.process_capacity,
+        process_count,
+        max_process_slots,
+        required,
+    );
 }
 
 pub fn ensureProcessCapacity(self: anytype, required: usize, free_list: *FreePageList) bool {
@@ -593,6 +607,42 @@ pub fn createProcessDescriptorWithCapacityLimitChecked(
     return createProcessDescriptorBelowChecked(self, label, limit, reusable);
 }
 
+pub fn createProcessDescriptorWithUserAddressSpaceChecked(
+    self: anytype,
+    label: []const u8,
+    free_list: *FreePageList,
+    user_spaces: anytype,
+    reusable: *const fn (PrincipalId) bool,
+) ?PrincipalId {
+    var principal = createProcessDescriptorBelowChecked(
+        self,
+        label,
+        self.process_capacity,
+        reusable,
+    );
+    if (principal == null) {
+        const capacity = self.nextProcessCapacity(self.process_capacity + 1) orelse return null;
+        // Grow the address-space directory first. If process-table growth then
+        // fails, the extra empty directory entries are harmless and reusable.
+        if (!user_spaces.ensureCapacity(capacity, free_list)) return null;
+        if (!self.ensureProcessCapacity(capacity, free_list)) return null;
+        principal = createProcessDescriptorBelowChecked(
+            self,
+            label,
+            capacity,
+            reusable,
+        );
+    }
+
+    const created = principal orelse return null;
+    const index = processIndexFromPrincipal(created) orelse unreachable;
+    if (user_spaces.ensureSlot(index, free_list) == null) {
+        _ = self.removeProcessDescriptor(created);
+        return null;
+    }
+    return created;
+}
+
 pub fn ensureProcessDescriptor(self: anytype, principal: PrincipalId, label: []const u8) bool {
     const index = processIndexFromPrincipal(principal) orelse return false;
     const desc = self.processDescriptorSlot(index) orelse return false;
@@ -627,6 +677,7 @@ pub fn markProcessFaulted(self: anytype, principal: PrincipalId, fault_vector: u
     self.releaseFdTableForProcessIndex(index);
     desc.active = false;
     desc.bootstrap_owner = false;
+    desc.signal_pending_hint_va = 0;
     desc.faulted = true;
     desc.fault_vector = fault_vector;
     if (self.active_process_count > 0) self.active_process_count -= 1;
@@ -641,6 +692,7 @@ pub fn markProcessExited(self: anytype, principal: PrincipalId) bool {
     self.releaseFdTableForProcessIndex(index);
     desc.active = false;
     desc.bootstrap_owner = false;
+    desc.signal_pending_hint_va = 0;
     desc.faulted = false;
     desc.fault_vector = 0;
     if (self.active_process_count > 0) self.active_process_count -= 1;

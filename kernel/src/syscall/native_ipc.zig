@@ -4,6 +4,7 @@ const ipc_metric = @import("../ipc_metric.zig");
 const kernel = @import("../kernel.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const sc = @import("numbers.zig");
+const fd_syscall = @import("fd.zig");
 
 const fd_abi = abi_root.fd_abi;
 const ipc_abi = abi_root.ipc_abi;
@@ -105,14 +106,37 @@ fn recvMessageToUser(
     fd: kernel.Fd,
     msg_va: u64,
     fd_capacity: usize,
+    receiver_thread: usize,
+    receiver_generation: u32,
 ) u64 {
-    const result = state.ipcRecv(proc, fd, fd_capacity, first_dynamic_fd, h.free_list) catch |err| return mapError(err);
+    var wake_storage: [max_ipc_wake_threads]kernel.ThreadWakeTarget = undefined;
+    const outcome = state.ipcRecvWithWritableWake(
+        proc,
+        fd,
+        fd_capacity,
+        first_dynamic_fd,
+        h.free_list,
+        wake_storage[0..],
+    ) catch |err| return mapError(err);
+    _ = fd_syscall.wakeThreadTargets(
+        h,
+        state,
+        wake_storage[0..outcome.writable_wake_count],
+    );
+    const result = outcome.message;
     const status = writeRecvMessage(h, proc, msg_va, result);
     if (status != sc.syscall_ok) {
         var i: usize = 0;
         while (i < result.fd_count) : (i += 1) {
             state.closeFdWithFreeList(proc, result.fds[i].fd, h.free_list) catch {};
         }
+    } else {
+        _ = state.noteIpcReceiverForFd(
+            proc,
+            fd,
+            receiver_thread,
+            receiver_generation,
+        );
     }
     return status;
 }
@@ -126,6 +150,8 @@ fn completeRecvWaiter(h: anytype, state: *kernel.KernelState, target: kernel.Thr
         target.recv_fd,
         target.recv_msg_va,
         target.recv_fd_capacity,
+        target.thread_index,
+        target.thread_generation,
     );
 }
 
@@ -139,30 +165,86 @@ fn wakeIpcWaitersForSendFd(
     if (handoff_target) |target| target.* = null;
     var wake_storage: [max_ipc_wake_threads]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.wakeIpcWaitersForSendFd(proc, fd, wake_storage[0..]) catch return false;
-    for (wake_storage[0..wake_count]) |target| {
-        if (!h.thread_wake_target_is_live(target.thread_index, target.thread_generation, target.owner)) continue;
-        if (target.hint_only) {
-            if (handoff_target) |selected| {
-                if (selected.* == null) selected.* = target;
+    for (wake_storage[0..wake_count], 0..) |target, target_index| {
+        if (target.wait_token == 0 or target.group.isNull()) continue;
+        var already_handled = false;
+        for (wake_storage[0..target_index]) |earlier| {
+            if (earlier.wait_token == target.wait_token and
+                earlier.group.matches(target.group))
+            {
+                already_handled = true;
+                break;
             }
-        } else if (target.recv_msg_va != 0) {
-            const status = completeRecvWaiter(h, state, target);
-            const woke = h.wake_waiting_thread_generation_with_rax_prefer_current(target.thread_index, target.thread_generation, status);
-            if (woke and status == sc.syscall_ok) {
-                if (handoff_target) |selected| {
-                    if (selected.* == null) selected.* = target;
-                }
-            }
-        } else if (target.pollfd_va != 0) {
-            if (!h.write_user_u64(target.owner, target.pollfd_va + fd_abi.pollfd_revents_offset, target.revents)) return false;
-            const woke = h.wake_waiting_thread_generation_with_rax_prefer_current(target.thread_index, target.thread_generation, 1);
-            if (woke) {
+        }
+        if (already_handled) continue;
+        const claim = scheduler.claimWaitTokenCompletion(
+            target.thread_index,
+            target.thread_generation,
+            target.owner,
+            target.wait_token,
+        );
+        switch (claim) {
+            .stale => {
+                state.cancelFdWaitGroup(target.group, target.wait_token);
+                continue;
+            },
+            .claimed => {},
+        }
+        state.cancelFdWaitGroup(target.group, target.wait_token);
+        if (target.recv_msg_va != 0) {
+            // The token claim precedes dequeue.  A timeout/signal winner can
+            // therefore never consume a message through a stale waiter.
+            const status = if (state.ipcRecvFdMatchesRegistration(
+                target.owner,
+                target.recv_fd,
+                target.registration,
+            ))
+                completeRecvWaiter(h, state, target)
+            else
+                sc.syscall_err_closed;
+            const published = scheduler.publishClaimedWaitCompletionPreferred(
+                target.thread_index,
+                target.thread_generation,
+                target.owner,
+                target.wait_token,
+                status,
+                scheduler.currentCpu(),
+            );
+            if (published == .published and status == sc.syscall_ok) {
                 if (handoff_target) |selected| {
                     if (selected.* == null) selected.* = target;
                 }
             }
         } else {
-            _ = h.wake_waiting_thread_generation(target.thread_index, target.thread_generation);
+            var ready_count: u64 = 0;
+            var copy_ok = true;
+            for (wake_storage[0..wake_count]) |member| {
+                if (member.wait_token != target.wait_token or
+                    !member.group.matches(target.group) or member.pollfd_va == 0)
+                {
+                    continue;
+                }
+                if (!h.write_user_u64(
+                    member.owner,
+                    member.pollfd_va + fd_abi.pollfd_revents_offset,
+                    member.revents,
+                )) copy_ok = false;
+                if (member.revents != 0) ready_count += 1;
+            }
+            const published = scheduler.publishClaimedWaitCompletionPreferred(
+                target.thread_index,
+                target.thread_generation,
+                target.owner,
+                target.wait_token,
+                if (copy_ok) ready_count else sc.syscall_err_invalid,
+                scheduler.currentCpu(),
+            );
+            if (published == .published and copy_ok) {
+                if (handoff_target) |selected| {
+                    if (selected.* == null) selected.* = target;
+                }
+            }
+            if (!copy_ok) return false;
         }
     }
     return true;
@@ -178,29 +260,59 @@ fn recvWait(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fr
     if (fd_capacity_u64 > kernel.max_ipc_message_fds) return sc.syscall_err_invalid;
     const fd_capacity_u8: u8 = @intCast(fd_capacity_u64);
 
-    const immediate = recvMessageToUser(h, state, proc, fd, msg_va, fd_capacity_u8);
-    if (immediate != sc.syscall_err_empty) return immediate;
-    if (timeout_ticks == 0) return sc.syscall_err_empty;
-    if (timeout_ticks != fd_abi.wait_forever) return sc.syscall_err_not_ready;
-
-    const current_thread = @import("../scheduler.zig").connection.currentThread();
-    const current_generation = @import("../scheduler.zig").connection.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
-    state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
-    state.registerIpcRecvCompletionWaiterForFd(
+    const current_thread = scheduler.currentThread();
+    const current_generation = scheduler.generationOfThread(current_thread) orelse return sc.syscall_err_invalid;
+    const immediate = recvMessageToUser(
+        h,
+        state,
         proc,
         fd,
         msg_va,
         fd_capacity_u8,
         current_thread,
         current_generation,
+    );
+    if (immediate != sc.syscall_err_empty) return immediate;
+    if (timeout_ticks == 0) return sc.syscall_err_empty;
+    if (timeout_ticks != fd_abi.wait_forever) return sc.syscall_err_not_ready;
+
+    state.unregisterFdWaitersForThread(proc, current_thread, current_generation);
+    const wait_token = scheduler.reserveCurrentWaitToken(current_generation) orelse
+        return sc.syscall_err_invalid;
+    const group = fd_syscall.beginFdWaitGroupWithReclaim(
+        state,
+        proc,
+        current_thread,
+        current_generation,
+        wait_token,
     ) catch |err| {
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         return mapError(err);
     };
-
-    if (h.block_current_thread_for_event(frame, true, 0, 0, sc.syscall_err_not_ready, h.before_current_thread_leave)) {
+    _ = state.registerIpcRecvCompletionWaiterForFd(
+        proc,
+        fd,
+        msg_va,
+        fd_capacity_u8,
+        current_thread,
+        current_generation,
+        wait_token,
+        group,
+    ) catch |err| {
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        state.cancelFdWaitGroup(group, wait_token);
+        return mapError(err);
+    };
+    state.armFdWaitGroup(group) catch |err| {
+        scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+        state.cancelFdWaitGroup(group, wait_token);
+        return mapError(err);
+    };
+    if (h.block_current_thread_for_event(frame, true, wait_token, 0, sc.syscall_err_not_ready, h.before_current_thread_leave)) {
         return frame.rax;
     }
-    state.unregisterIpcReadableWaiterForFd(proc, fd, fd_abi.event_readable, current_thread, current_generation);
+    scheduler.cancelCurrentWaitToken(current_generation, wait_token);
+    state.cancelFdWaitGroup(group, wait_token);
     return sc.syscall_err_not_ready;
 }
 
@@ -210,7 +322,9 @@ fn maybeHandoffToRecvWaiter(
     handoff_target: ?kernel.ThreadWakeTarget,
     sender_rax: u64,
 ) ?u64 {
-    const target = handoff_target orelse return null;
+    const target = handoff_target orelse {
+        return null;
+    };
     if (!scheduler.handoffToReadyThreadGenerationWithRax(
         frame,
         target.thread_index,
@@ -261,19 +375,43 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             if (frame.rsi == 0) break :blk sc.syscall_err_invalid;
             const fd_capacity = h.read_user_u64(proc, frame.rsi + ipc_abi.msg_fd_capacity_offset) orelse break :blk sc.syscall_err_invalid;
             if (fd_capacity > kernel.max_ipc_message_fds) break :blk sc.syscall_err_invalid;
-            break :blk recvMessageToUser(h, state, proc, @intCast(frame.rdi), frame.rsi, @intCast(fd_capacity));
+            const current_thread = scheduler.currentThread();
+            const current_generation = scheduler.generationOfThread(current_thread) orelse
+                break :blk sc.syscall_err_invalid;
+            break :blk recvMessageToUser(
+                h,
+                state,
+                proc,
+                @intCast(frame.rdi),
+                frame.rsi,
+                @intCast(fd_capacity),
+                current_thread,
+                current_generation,
+            );
         },
         sc.syscall_ipc_recv_wait => recvWait(h, state, proc, frame),
         sc.syscall_ipc_call => blk: {
             var fd_storage: [kernel.max_ipc_message_fds]kernel.IpcSendFd = undefined;
             const msg = readIpcMessage(h, proc, frame.rsi, &fd_storage) orelse break :blk sc.syscall_err_invalid;
             const send_fd: kernel.Fd = @intCast(frame.rdi);
+            const current_thread = scheduler.currentThread();
+            const current_generation = scheduler.generationOfThread(current_thread) orelse
+                break :blk sc.syscall_err_invalid;
             const enqueue_start = ipc_metric.timestamp();
             const reply_fd = state.ipcCall(proc, send_fd, msg, first_dynamic_fd, h.free_list) catch |err| break :blk mapError(err);
+            _ = state.noteIpcReceiverForFd(
+                proc,
+                reply_fd,
+                current_thread,
+                current_generation,
+            );
             ipc_metric.record(.send_enqueue, enqueue_start);
             const wake_start = ipc_metric.timestamp();
             var handoff_target: ?kernel.ThreadWakeTarget = null;
             if (!wakeIpcWaitersForSendFd(h, state, proc, send_fd, &handoff_target)) break :blk sc.syscall_err_invalid;
+            if (handoff_target == null) {
+                handoff_target = state.ipcReceiverHandoffHintForSendFd(proc, send_fd);
+            }
             ipc_metric.record(.send_wake, wake_start);
             if (maybeHandoffToRecvWaiter(h, frame, handoff_target, reply_fd)) |handoff_rax| {
                 break :blk handoff_rax;
@@ -290,6 +428,9 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             const wake_start = ipc_metric.timestamp();
             var handoff_target: ?kernel.ThreadWakeTarget = null;
             if (!wakeIpcWaitersForSendFd(h, state, proc, send_fd, &handoff_target)) break :blk sc.syscall_err_invalid;
+            if (handoff_target == null) {
+                handoff_target = state.ipcReceiverHandoffHintForSendFd(proc, send_fd);
+            }
             ipc_metric.record(.send_wake, wake_start);
             if (maybeHandoffToRecvWaiter(h, frame, handoff_target, sc.syscall_ok)) |handoff_rax| {
                 break :blk handoff_rax;

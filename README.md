@@ -19,6 +19,7 @@ userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/
 を参照してください。
 
 ---
+![xfce4 fastfetch](/assets/xfce-screenshot.png)
 
 ## Features
 
@@ -27,6 +28,8 @@ userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/
 - **Kobox** — capsule を用いた、ユーザー空間で動くLinuxカーネルモジュールの変換レイヤー
 - **x86_64** — x86_64 対応。AArch64 は今後対応予定
 - **Native Libc** — musl libcを互換レイヤーを用いず、ネイティブで動かせます
+
+
 
 ## Update
 - Linux Personality Runtimeを実装しました
@@ -64,7 +67,7 @@ userland で実装します。詳しくは [PachaOS の設計思想](pacha_docs/
 Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
 musl ビルドで確認済み。
 
-`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway` nbsp; `Sway`
 
 ### Python3 on PachaOS
 

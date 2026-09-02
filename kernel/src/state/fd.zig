@@ -75,6 +75,8 @@ const IpcReplyRef = types.IpcReplyRef;
 const IpcWaitKey = types.IpcWaitKey;
 const IpcWaiter = types.IpcWaiter;
 const ThreadWakeTarget = types.ThreadWakeTarget;
+const FdWaitRegistrationRef = types.FdWaitRegistrationRef;
+const FdWaitGroupRef = types.FdWaitGroupRef;
 const TaskFdWaiter = types.TaskFdWaiter;
 const max_task_fd_waiters = types.max_task_fd_waiters;
 const max_ipc_object_waiters = types.max_ipc_object_waiters;
@@ -748,7 +750,7 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
     var ready: u64 = 0;
     if ((requested & @import("kernel_abi_root").fd_abi.event_readable) != 0) {
         const readable = switch (slot.payload) {
-            .endpoint, .channel, .reply => self.fdIpcReadable(&slot.payload),
+            .endpoint, .channel, .reply => entry.rights.recv and self.fdIpcReadable(&slot.payload),
             .process => |process| process.state.isTerminal(),
             .thread => |thread| thread.state.isTerminal(),
             .event => |counter| entry.rights.read and counter != 0,
@@ -765,7 +767,8 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
     }
     if ((requested & @import("kernel_abi_root").fd_abi.event_writable) != 0) {
         const writable = switch (slot.payload) {
-            .endpoint, .channel, .reply => self.fdIpcWritable(&slot.payload),
+            .endpoint, .channel, .reply => (entry.rights.send or entry.rights.call) and
+                self.fdIpcWritable(&slot.payload),
             .event => entry.rights.write,
             .serial => entry.rights.write,
             .pipe => |endpoint| blk: {
@@ -1258,16 +1261,20 @@ pub fn registerTaskReadableWaiterForFd(
     pollfd_va: u64,
     thread_index: usize,
     thread_generation: u32,
+    wait_token: u64,
+    group: FdWaitGroupRef,
 ) KernelError!bool {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     if ((requested_events & fd_abi.event_readable) == 0) return false;
-    if (thread_index > std.math.maxInt(u32)) return KernelError.InvalidState;
+    if (thread_index > std.math.maxInt(u32) or wait_token == 0 or group.isNull())
+        return KernelError.InvalidState;
     const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
     if (!entry.rights.poll and !entry.rights.wait) return KernelError.InvalidState;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
     const principal_raw: PrincipalRaw = switch (slot.payload) {
         .process => |process| process.principal_raw,
         .thread => |thread| thread.owner_principal_raw,
+        .event, .irq => 0,
         else => return false,
     };
     const thread_index_u32: u32 = @intCast(thread_index);
@@ -1279,7 +1286,11 @@ pub fn registerTaskReadableWaiterForFd(
         }
         if (waiter.thread_index == thread_index_u32 and
             waiter.thread_generation == thread_generation and
-            waiter.principal_raw == principal_raw and
+            waiter.binding.wait_token == wait_token and
+            waiter.binding.group.matches(group) and
+            waiter.object.kind == entry.object.kind and
+            waiter.object.index == entry.object.index and
+            waiter.object.generation == entry.object.generation and
             waiter.owner == owner and
             waiter.pollfd_va == pollfd_va)
         {
@@ -1288,14 +1299,28 @@ pub fn registerTaskReadableWaiterForFd(
         }
     }
     const target = free_index orelse return KernelError.TableFull;
+    const registration = FdWaitRegistrationRef{
+        .kind = .task,
+        .slot = @intCast(target),
+    };
     self.task_fd_waiters[target] = .{
         .active = true,
         .principal_raw = principal_raw,
+        .object = entry.object,
         .owner = owner,
         .pollfd_va = pollfd_va,
         .events = requested_events,
         .thread_index = thread_index_u32,
         .thread_generation = thread_generation,
+        .registration = registration,
+        .binding = .{
+            .wait_token = wait_token,
+            .group = group,
+        },
+    };
+    self.linkFdWaitRegistration(group, registration) catch |err| {
+        self.task_fd_waiters[target] = .{};
+        return err;
     };
     return true;
 }
@@ -1308,7 +1333,7 @@ pub fn unregisterTaskReadableWaiterForThread(
     if (thread_index > std.math.maxInt(u32)) return;
     const thread_index_u32: u32 = @intCast(thread_index);
     for (&self.task_fd_waiters) |*waiter| {
-        if (!waiter.active) continue;
+        if (!waiter.active or waiter.binding.completion_pending) continue;
         if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
             waiter.* = .{};
         }
@@ -1321,26 +1346,7 @@ pub fn unregisterFdWaitersForThread(
     thread_index: usize,
     thread_generation: u32,
 ) void {
-    self.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
-    var fd_index: usize = 0;
-    while (fd_index < fd_table_entries) : (fd_index += 1) {
-        const fd: Fd = @intCast(fd_index);
-        if (self.fdEntryConst(owner, fd) == null) continue;
-        self.unregisterPipeWaiterForFd(
-            owner,
-            fd,
-            @import("kernel_abi_root").fd_abi.event_known_mask,
-            thread_index,
-            thread_generation,
-        );
-        self.unregisterIpcReadableWaiterForFd(
-            owner,
-            fd,
-            @import("kernel_abi_root").fd_abi.event_known_mask,
-            thread_index,
-            thread_generation,
-        );
-    }
+    self.cancelFdWaitGroupsForThread(owner, thread_index, thread_generation);
 }
 
 pub fn takeTaskReadableWaitersForPrincipal(
@@ -1352,21 +1358,311 @@ pub fn takeTaskReadableWaitersForPrincipal(
     const principal_raw: PrincipalRaw = @intFromEnum(principal);
     var count: usize = 0;
     for (&self.task_fd_waiters) |*waiter| {
-        if (!waiter.active) continue;
+        if (!waiter.active or waiter.binding.completion_pending) continue;
+        if (waiter.object.kind != .process and waiter.object.kind != .thread) continue;
         if (waiter.principal_raw != principal_raw) continue;
         if ((waiter.events & fd_abi.event_readable) == 0) continue;
         const target = ThreadWakeTarget{
             .owner = waiter.owner,
             .thread_index = @intCast(waiter.thread_index),
             .thread_generation = waiter.thread_generation,
+            .wait_token = waiter.binding.wait_token,
             .pollfd_va = waiter.pollfd_va,
             .revents = fd_abi.event_readable,
+            .registration = waiter.registration,
+            .group = waiter.binding.group,
+            .group_link_index = waiter.binding.link_index,
         };
-        waiter.* = .{};
+        waiter.binding.completion_pending = true;
         if (count < out.len) {
             out[count] = target;
             count += 1;
         }
+    }
+    return count;
+}
+
+pub fn takeObjectReadableWaiters(
+    self: anytype,
+    object: KernelObjectRef,
+    out: []ThreadWakeTarget,
+) usize {
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    var count: usize = 0;
+    for (&self.task_fd_waiters) |*waiter| {
+        if (!waiter.active or waiter.binding.completion_pending) continue;
+        if (waiter.object.kind != object.kind or waiter.object.index != object.index or
+            waiter.object.generation != object.generation or
+            (waiter.events & fd_abi.event_readable) == 0)
+        {
+            continue;
+        }
+        if (count >= out.len) break;
+        out[count] = .{
+            .owner = waiter.owner,
+            .thread_index = waiter.thread_index,
+            .thread_generation = waiter.thread_generation,
+            .wait_token = waiter.binding.wait_token,
+            .pollfd_va = waiter.pollfd_va,
+            .revents = fd_abi.event_readable,
+            .registration = waiter.registration,
+            .group = waiter.binding.group,
+            .group_link_index = waiter.binding.link_index,
+        };
+        waiter.binding.completion_pending = true;
+        count += 1;
+    }
+    return count;
+}
+
+pub fn takeReadyIrqWaiters(
+    self: anytype,
+    out: []ThreadWakeTarget,
+) usize {
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    var count: usize = 0;
+    for (&self.task_fd_waiters) |*waiter| {
+        if (!waiter.active or waiter.binding.completion_pending) continue;
+        if (waiter.object.kind != .irq or
+            (waiter.events & fd_abi.event_readable) == 0 or
+            !(self.irqPublishedEventPending(waiter.object) orelse false))
+        {
+            continue;
+        }
+        if (count >= out.len) break;
+        out[count] = .{
+            .owner = waiter.owner,
+            .thread_index = waiter.thread_index,
+            .thread_generation = waiter.thread_generation,
+            .wait_token = waiter.binding.wait_token,
+            .pollfd_va = waiter.pollfd_va,
+            .revents = fd_abi.event_readable,
+            .registration = waiter.registration,
+            .group = waiter.binding.group,
+            .group_link_index = waiter.binding.link_index,
+        };
+        waiter.binding.completion_pending = true;
+        count += 1;
+    }
+    return count;
+}
+
+fn fdWaitListForRegistration(
+    self: anytype,
+    registration: FdWaitRegistrationRef,
+) ?*IpcWaitList {
+    return switch (registration.kind) {
+        .pipe => blk: {
+            const pipe = self.pipeSlot(.{
+                .index = registration.index,
+                .generation = registration.generation,
+            }) orelse break :blk null;
+            if (registration.side > 1) break :blk null;
+            break :blk &pipe.waiters[registration.side];
+        },
+        .endpoint => &(self.ipcEndpointSlot(.{
+            .index = registration.index,
+            .generation = registration.generation,
+        }) orelse return null).waiters,
+        .channel => blk: {
+            const channel = self.ipcChannelSlot(.{
+                .index = registration.index,
+                .generation = registration.generation,
+            }) orelse break :blk null;
+            if (registration.side > 1) break :blk null;
+            break :blk &channel.waiters[registration.side];
+        },
+        .reply => &(self.ipcReplySlot(.{
+            .index = registration.index,
+            .generation = registration.generation,
+        }) orelse return null).waiters,
+        else => null,
+    };
+}
+
+fn fdWaitIpcWaiterForRegistration(
+    self: anytype,
+    registration: FdWaitRegistrationRef,
+) ?*IpcWaiter {
+    const list = fdWaitListForRegistration(self, registration) orelse return null;
+    if (registration.slot >= list.waiters.len) return null;
+    const waiter = &list.waiters[registration.slot];
+    if (!waiter.active or !waiter.registration.matches(registration)) return null;
+    return waiter;
+}
+
+fn fdWaitTaskWaiterForRegistration(
+    self: anytype,
+    registration: FdWaitRegistrationRef,
+) ?*TaskFdWaiter {
+    if (registration.kind != .task or
+        registration.slot >= self.task_fd_waiters.len)
+        return null;
+    const waiter = &self.task_fd_waiters[registration.slot];
+    if (!waiter.active or !waiter.registration.matches(registration)) return null;
+    return waiter;
+}
+
+fn nextFdWaitGroupGeneration(current: u32) u32 {
+    const next = current +% 1;
+    return if (next == 0) 1 else next;
+}
+
+fn fdWaitGroupSlot(self: anytype, group: FdWaitGroupRef) ?*types.FdWaitGroupSlot {
+    if (group.isNull() or group.index >= self.fd_wait_groups.len) return null;
+    const slot = &self.fd_wait_groups[group.index];
+    if (slot.state == .free or slot.generation != group.generation) return null;
+    return slot;
+}
+
+pub fn beginFdWaitGroup(
+    self: anytype,
+    owner: PrincipalId,
+    thread_index: usize,
+    thread_generation: u32,
+    wait_token: u64,
+) KernelError!FdWaitGroupRef {
+    if (thread_index > std.math.maxInt(u32) or wait_token == 0)
+        return KernelError.InvalidState;
+    var offset: usize = 0;
+    while (offset < self.fd_wait_groups.len) : (offset += 1) {
+        const index = (self.next_fd_wait_group_scan + offset) % self.fd_wait_groups.len;
+        const slot = &self.fd_wait_groups[index];
+        if (slot.state != .free) continue;
+        const generation = if (slot.generation == 0) 1 else slot.generation;
+        slot.* = .{
+            .state = .building,
+            .generation = generation,
+            .owner = owner,
+            .thread_index = @intCast(thread_index),
+            .thread_generation = thread_generation,
+            .wait_token = wait_token,
+        };
+        self.next_fd_wait_group_scan = (index + 1) % self.fd_wait_groups.len;
+        return .{ .index = @intCast(index), .generation = generation };
+    }
+    return KernelError.TableFull;
+}
+
+pub fn linkFdWaitRegistration(
+    self: anytype,
+    group: FdWaitGroupRef,
+    registration: FdWaitRegistrationRef,
+) KernelError!void {
+    if (registration.isNull()) return KernelError.InvalidState;
+    const slot = fdWaitGroupSlot(self, group) orelse return KernelError.InvalidState;
+    if (slot.state != .building or slot.link_count >= slot.links.len)
+        return KernelError.TableFull;
+    const link_index = slot.link_count;
+    slot.links[link_index] = registration;
+    slot.link_count += 1;
+
+    if (registration.kind == .task) {
+        const waiter = fdWaitTaskWaiterForRegistration(self, registration) orelse
+            return KernelError.InvalidState;
+        if (!waiter.binding.group.matches(group)) return KernelError.InvalidState;
+        waiter.binding.link_index = link_index;
+        return;
+    }
+    const waiter = fdWaitIpcWaiterForRegistration(self, registration) orelse
+        return KernelError.InvalidState;
+    if (!waiter.binding.group.matches(group)) return KernelError.InvalidState;
+    waiter.binding.link_index = link_index;
+}
+
+pub fn armFdWaitGroup(self: anytype, group: FdWaitGroupRef) KernelError!void {
+    const slot = fdWaitGroupSlot(self, group) orelse return KernelError.InvalidState;
+    if (slot.state != .building) return KernelError.InvalidState;
+    slot.state = .armed;
+}
+
+pub fn cancelFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) void {
+    const slot = fdWaitGroupSlot(self, group) orelse return;
+    if (wait_token == 0 or slot.wait_token != wait_token) return;
+    const link_count: usize = slot.link_count;
+    var link_index: usize = 0;
+    while (link_index < link_count) : (link_index += 1) {
+        const registration = slot.links[link_index];
+        if (registration.kind == .task) {
+            if (fdWaitTaskWaiterForRegistration(self, registration)) |waiter| {
+                if (waiter.binding.wait_token == wait_token and
+                    waiter.binding.group.matches(group) and
+                    waiter.binding.link_index == link_index)
+                {
+                    waiter.* = .{};
+                }
+            }
+            continue;
+        }
+        if (fdWaitIpcWaiterForRegistration(self, registration)) |waiter| {
+            if (waiter.binding.wait_token == wait_token and
+                waiter.binding.group.matches(group) and
+                waiter.binding.link_index == link_index)
+            {
+                waiter.* = .{};
+            }
+        }
+    }
+    const next_generation = nextFdWaitGroupGeneration(slot.generation);
+    slot.* = .{ .generation = next_generation };
+}
+
+pub fn cancelFdWaitGroupsForThread(
+    self: anytype,
+    owner: PrincipalId,
+    thread_index: usize,
+    thread_generation: u32,
+) void {
+    if (thread_index > std.math.maxInt(u32)) return;
+    const thread_index_u32: u32 = @intCast(thread_index);
+    var index: usize = 0;
+    while (index < self.fd_wait_groups.len) : (index += 1) {
+        const slot = &self.fd_wait_groups[index];
+        if (slot.state == .free or slot.owner != owner or
+            slot.thread_index != thread_index_u32 or
+            slot.thread_generation != thread_generation)
+        {
+            continue;
+        }
+        const group = FdWaitGroupRef{
+            .index = @intCast(index),
+            .generation = slot.generation,
+        };
+        const wait_token = slot.wait_token;
+        self.cancelFdWaitGroup(group, wait_token);
+    }
+}
+
+pub fn cancelFdWaitGroupsForOwner(self: anytype, owner: PrincipalId) void {
+    var index: usize = 0;
+    while (index < self.fd_wait_groups.len) : (index += 1) {
+        const slot = &self.fd_wait_groups[index];
+        if (slot.state == .free or slot.owner != owner) continue;
+        const group = FdWaitGroupRef{
+            .index = @intCast(index),
+            .generation = slot.generation,
+        };
+        const wait_token = slot.wait_token;
+        self.cancelFdWaitGroup(group, wait_token);
+    }
+}
+
+pub fn snapshotFdWaitGroups(
+    self: anytype,
+    out: []types.FdWaitGroupSnapshot,
+) usize {
+    var count: usize = 0;
+    for (&self.fd_wait_groups, 0..) |*slot, index| {
+        if (slot.state == .free) continue;
+        if (count >= out.len) break;
+        out[count] = .{
+            .group = .{ .index = @intCast(index), .generation = slot.generation },
+            .owner = slot.owner,
+            .thread_index = slot.thread_index,
+            .thread_generation = slot.thread_generation,
+            .wait_token = slot.wait_token,
+        };
+        count += 1;
     }
     return count;
 }

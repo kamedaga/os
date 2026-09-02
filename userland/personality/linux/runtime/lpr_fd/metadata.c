@@ -168,8 +168,35 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
         }
 #endif
         for (;;) {
-            if (event->counter <= (UINT64_MAX - 1u) - value)
-                break;
+            uint64_t counter = __atomic_load_n(
+                &event->counter, __ATOMIC_ACQUIRE);
+            while (counter <= (UINT64_MAX - 1u) - value) {
+                if (__atomic_compare_exchange_n(
+                        &event->counter,
+                        &counter,
+                        counter + value,
+                        0,
+                        __ATOMIC_ACQ_REL,
+                        __ATOMIC_ACQUIRE))
+                {
+                    if (value != 0) lpr_event_backend_notify(event);
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+                    if (__atomic_load_n(
+                            &lpr_glycin_diag_armed,
+                            __ATOMIC_ACQUIRE) != 0u)
+                    {
+                        lpr_glycin_diag_event(
+                            "event.write.exit", fd,
+                            __atomic_load_n(
+                                &event->counter, __ATOMIC_ACQUIRE),
+                            __atomic_load_n(
+                                &event->notify_pending, __ATOMIC_ACQUIRE),
+                            (int64_t)value);
+                    }
+#endif
+                    return (int64_t)sizeof(uint64_t);
+                }
+            }
             if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
                 return -LPR_LINUX_EAGAIN;
             lpr_wait_graph_t graph;
@@ -183,16 +210,6 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
                 wait_status = lpr_wait_graph_block(&graph, &deadline);
             if (wait_status != 0) return wait_status;
         }
-        event->counter += value;
-        lpr_event_backend_notify(event);
-#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
-        if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
-            lpr_glycin_diag_event(
-                "event.write.exit", fd, event->counter,
-                event->notify_pending, (int64_t)value);
-        }
-#endif
-        return (int64_t)sizeof(uint64_t);
     }
     if (lpr_pipe_fd_is_active(fd)) {
         lpr_pipe_backend_t *pipe = lpr_pipe_backend(fd);
@@ -211,9 +228,7 @@ int64_t lpr_backend_write(uint64_t fd, uint64_t buf, uint64_t count)
                 (uint64_t)(uint32_t)pipe->native.raw,
                 buf,
                 count);
-            if (n >= 0) {
-                return n;
-            }
+            if (n >= 0) return n;
             const int64_t err = lpr_pacha_status_to_errno(n);
             if (err == -LPR_LINUX_EPIPE) {
                 lpr_linux_raise_sigpipe();
@@ -584,7 +599,8 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
             return -LPR_LINUX_EINVAL;
         }
     }
-    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd) ||
+    if (lpr_linux_eventfd_active(fd) || lpr_linux_inotify_active(fd) ||
+        lpr_linux_timerfd_active(fd) ||
         lpr_linux_signalfd_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:
@@ -780,7 +796,8 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         st->st_blksize = 4096;
         return 0;
     }
-    if (lpr_linux_eventfd_active(fd) || lpr_linux_timerfd_active(fd) ||
+    if (lpr_linux_eventfd_active(fd) || lpr_linux_inotify_active(fd) ||
+        lpr_linux_timerfd_active(fd) ||
         lpr_linux_signalfd_active(fd)) {
         lpr_linux_stat_t *st = (lpr_linux_stat_t *)(uintptr_t)statbuf;
         lpr_memset(st, 0, sizeof(*st));
@@ -882,57 +899,16 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
 
 static int64_t lpr_filed_fstat_close_metadata(uint64_t fd, uint64_t statbuf)
 {
-    lpr_filed_backend_t *file = lpr_filed_backend(fd);
-    if (file == 0 || file->handle == 0) {
-        const int64_t status = lpr_linux_fstat(fd, statbuf);
-        (void)lpr_linux_close(fd);
-        return status;
-    }
-
-    void *page = 0;
-    const int page_fd = lpr_create_wire_page(&page);
-    if (page_fd < 0) {
-        const int64_t status = lpr_linux_fstat(fd, statbuf);
-        (void)lpr_linux_close(fd);
-        return status;
-    }
-    filed_statx_t *stat = (filed_statx_t *)page;
-    lpr_memset(stat, 0, sizeof(*stat));
-    stat->handle = file->handle;
-    int64_t stat_status = -LPR_LINUX_EIO;
-    int64_t close_status = -LPR_LINUX_EIO;
-    const int64_t batch_status = lpr_filed_fast_stat_close(
-        file->handle, page_fd, &stat_status, &close_status);
-    if (batch_status == 0 && stat_status == 0) {
-        file->stat_size = stat->size;
-        file->object_generation = stat->object_generation;
-        lpr_write_linux_stat((void *)(uintptr_t)statbuf, stat);
-    }
-    lpr_destroy_wire_page(page_fd, page);
-
-    if (batch_status == -LPR_LINUX_ENOSYS ||
-        batch_status == -LPR_LINUX_EAGAIN)
-    {
-        const int64_t status = lpr_linux_fstat(fd, statbuf);
-        (void)lpr_linux_close(fd);
-        return status;
-    }
-    if (batch_status != 0) {
-        /* Once the doorbell was accepted, a malformed/lost reply cannot tell
-         * us whether Filed consumed CLOSE.  This fd is private to statat;
-         * detach it locally and let session teardown reclaim any remote
-         * handle instead of issuing an unsafe duplicate request. */
-        lpr_filed_session_abandon();
-        file->handle = 0;
-        (void)lpr_linux_close(fd);
-        return batch_status;
-    }
-    if (close_status == 0) {
-        file->handle = 0;
-    }
+    /* Keep metadata and close as individually acknowledged operations.  The
+     * former two-entry fast-session batch had an unrecoverable ambiguity: if
+     * its combined reply was malformed or lost after Filed consumed CLOSE,
+     * the client abandoned the whole session.  That teardown also destroyed
+     * unrelated live handles owned by the session while their Linux FD-table
+     * entries remained active, so a later fork observed a valid local FD with
+     * a stale Filed handle.  A private newfstatat staging FD does not justify
+     * weakening every other open file description in the process. */
+    const int64_t stat_status = lpr_linux_fstat(fd, statbuf);
     (void)lpr_linux_close(fd);
-    /* Match newfstatat's existing semantics: its internal close result does
-     * not replace the metadata result. */
     return stat_status;
 }
 
@@ -1396,7 +1372,7 @@ int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
         return proc_status;
     }
     void *page = 0;
-    const int page_fd = lpr_create_standalone_wire_page(&page);
+    const int page_fd = lpr_create_wire_page(&page);
     if (page_fd < 0) {
         return page_fd;
     }
@@ -1407,7 +1383,7 @@ int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     uint64_t ignored = 0;
     int64_t status = lpr_filed_call(FILED_OP_VFS_GETDENTS, page_fd, 0, &ignored);
     if (status != 0) {
-        lpr_destroy_standalone_wire_page(page_fd, page);
+        lpr_destroy_wire_page(page_fd, page);
         return status;
     }
 
@@ -1436,6 +1412,6 @@ int64_t lpr_linux_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
         out[written + 19u + name_len] = 0;
         written += reclen;
     }
-    lpr_destroy_standalone_wire_page(page_fd, page);
+    lpr_destroy_wire_page(page_fd, page);
     return (int64_t)written;
 }

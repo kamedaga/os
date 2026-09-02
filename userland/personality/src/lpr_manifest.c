@@ -66,7 +66,6 @@ int lpr_manifest_begin(
     }
     lpr_manifest_t *manifest = memory;
     manifest->magic = LPR_MANIFEST_MAGIC;
-    manifest->image_abi_version = LPR_IMAGE_ABI_VERSION;
     manifest->byte_size = layout->byte_size;
     manifest->entry_offset = layout->entry_offset;
     manifest->entry_count = entry_count;
@@ -123,7 +122,6 @@ int lpr_manifest_validate(const void *memory, uint64_t capacity)
     const lpr_manifest_t *manifest = memory;
     if (manifest == NULL || capacity < sizeof(*manifest) ||
         manifest->magic != LPR_MANIFEST_MAGIC ||
-        manifest->image_abi_version != LPR_IMAGE_ABI_VERSION ||
         manifest->byte_size < sizeof(*manifest) || manifest->byte_size > capacity ||
         !lpr_manifest_range(manifest->entry_offset, manifest->entry_count,
             sizeof(lpr_manifest_entry_t), manifest->byte_size) ||

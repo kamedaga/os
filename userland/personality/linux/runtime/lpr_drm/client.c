@@ -74,6 +74,98 @@ static volatile uint64_t lpr_drm_event_token_counter;
 static lpr_drm_event_cookie_t
     lpr_drm_event_cookies[LPR_DRM_EVENT_COOKIE_CAPACITY];
 
+#if defined(LPR_DRM_IOCTL_DIAG) && LPR_DRM_IOCTL_DIAG
+enum { LPR_DRM_IOCTL_DIAG_SLOTS = 64u };
+
+typedef struct lpr_drm_ioctl_diag_slot {
+    uint32_t command;
+    uint32_t count;
+} lpr_drm_ioctl_diag_slot_t;
+
+static lpr_drm_ioctl_diag_slot_t
+    lpr_drm_ioctl_diag_slots[LPR_DRM_IOCTL_DIAG_SLOTS];
+static volatile uint32_t lpr_drm_ioctl_diag_lock;
+
+static char *lpr_drm_ioctl_diag_append_text(
+    char *out, const char *end, const char *text)
+{
+    while (out < end && text != 0 && *text != '\0') {
+        *out++ = *text++;
+    }
+    return out;
+}
+
+static char *lpr_drm_ioctl_diag_append_u64(
+    char *out, const char *end, uint64_t value)
+{
+    char digits[20];
+    uint32_t count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10u);
+        value /= 10u;
+    } while (value != 0 && count < sizeof(digits));
+    while (out < end && count != 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static void lpr_drm_ioctl_diag(
+    uint64_t fd,
+    uint32_t command,
+    uint64_t handle,
+    uint32_t node_kind)
+{
+    while (__atomic_exchange_n(
+        &lpr_drm_ioctl_diag_lock, 1u, __ATOMIC_ACQUIRE) != 0u) {
+        __asm__ volatile("pause");
+    }
+
+    lpr_drm_ioctl_diag_slot_t *slot = 0;
+    for (uint32_t i = 0; i < LPR_DRM_IOCTL_DIAG_SLOTS; i++) {
+        lpr_drm_ioctl_diag_slot_t *candidate =
+            &lpr_drm_ioctl_diag_slots[i];
+        if (candidate->count != 0 && candidate->command == command) {
+            slot = candidate;
+            break;
+        }
+        if (slot == 0 && candidate->count == 0) slot = candidate;
+    }
+    uint32_t count = 0;
+    if (slot != 0) {
+        slot->command = command;
+        count = ++slot->count;
+    }
+    __atomic_store_n(&lpr_drm_ioctl_diag_lock, 0u, __ATOMIC_RELEASE);
+
+    if (count == 0 ||
+        (count > 8u && (count & (count - 1u)) != 0u)) return;
+
+    char line[256];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_drm_ioctl_diag_append_text(
+        out, end, "[lpr-drm-ioctl] pid=");
+    out = lpr_drm_ioctl_diag_append_u64(
+        out, end, (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_drm_ioctl_diag_append_text(out, end, " fd=");
+    out = lpr_drm_ioctl_diag_append_u64(out, end, fd);
+    out = lpr_drm_ioctl_diag_append_text(out, end, " node=");
+    out = lpr_drm_ioctl_diag_append_u64(out, end, node_kind);
+    out = lpr_drm_ioctl_diag_append_text(out, end, " handle=");
+    out = lpr_drm_ioctl_diag_append_u64(out, end, handle);
+    out = lpr_drm_ioctl_diag_append_text(out, end, " command=");
+    out = lpr_drm_ioctl_diag_append_u64(out, end, command);
+    out = lpr_drm_ioctl_diag_append_text(out, end, " count=");
+    out = lpr_drm_ioctl_diag_append_u64(out, end, count);
+    if (out < end) *out++ = '\n';
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+#endif
+
 #if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
 enum { LPR_DRM_PROFILE_COMMAND_SLOTS = 32u };
 
@@ -939,6 +1031,13 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 #endif
     lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     const uint32_t command = (uint32_t)request;
+#if defined(LPR_DRM_IOCTL_DIAG) && LPR_DRM_IOCTL_DIAG
+    lpr_drm_ioctl_diag(
+        fd,
+        command,
+        drm != 0 ? drm->handle : 0,
+        drm != 0 ? (uint32_t)drm->node_kind : 0);
+#endif
     const int no_argument = command == DRMD_IOCTL_SET_MASTER || command == DRMD_IOCTL_DROP_MASTER;
     if (drm == 0 || (arg == 0 && !no_argument)) {
         return drm == 0 ? -LPR_LINUX_EBADF : -LPR_LINUX_EFAULT;

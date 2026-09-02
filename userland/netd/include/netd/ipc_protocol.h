@@ -22,6 +22,7 @@ enum {
     NETD_OP_ATTACH_WAIT = 12u,
     NETD_OP_UEVENT_PUBLISH = 13u,
     NETD_OP_DUP = 14u,
+    NETD_OP_UNIX_NAME = 15u,
 
     NETD_STATUS_STALE_ATTACHMENT = -116,
 
@@ -50,6 +51,10 @@ enum {
     NETD_POLLOUT = 0x0004,
     NETD_POLLERR = 0x0008,
     NETD_POLLHUP = 0x0010,
+
+    /* netd_unix_path.flags.  Abstract names contain no filesystem node;
+     * reserved0 carries the number of significant bytes in path. */
+    NETD_UNIX_PATH_ABSTRACT = 1u << 0,
 };
 
 #define NETD_UEVENT_INPUT_TAG (UINT64_C(1) << 63)
@@ -136,6 +141,15 @@ typedef struct netd_unix_path {
     uint32_t reserved0;
     char path[108];
 } netd_unix_path_t;
+
+typedef struct netd_unix_name {
+    uint64_t handle;
+    uint32_t peer;
+    uint32_t abstract;
+    uint32_t length;
+    uint32_t reserved0;
+    char path[108];
+} netd_unix_name_t;
 
 typedef struct netd_listen {
     uint64_t handle;

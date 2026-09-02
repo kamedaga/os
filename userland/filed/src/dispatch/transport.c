@@ -1178,12 +1178,26 @@ static int filed_dispatch_client(
             filed_dispatch_dup_page(runtime, payload);
         status = dup.status;
         result = dup.result;
+        if (status != 0) {
+            const filed_handle_flags_t *flags = payload;
+            fprintf(stderr,
+                "[filed-transfer-diag] stage=dup source=%llu status=%lld leases=%u\n",
+                (unsigned long long)flags->handle,
+                (long long)status,
+                (unsigned)runtime->vfs.lease_handle_count);
+        }
         if (status == 0) {
             const filed_status_t lease_status = filed_vfs_set_handle_lease(
                 &runtime->vfs, (filed_handle_id_t)result, lease_fd);
             if (lease_status == FILED_OK) {
                 keep_fd = lease_fd;
             } else {
+                fprintf(stderr,
+                    "[filed-transfer-diag] stage=lease source=%llu duplicate=%llu status=%d leases=%u\n",
+                    (unsigned long long)((const filed_handle_flags_t *)payload)->handle,
+                    (unsigned long long)result,
+                    (int)lease_status,
+                    (unsigned)runtime->vfs.lease_handle_count);
                 (void)filed_close_handle_runtime(
                     runtime, (filed_handle_id_t)result);
                 status = filed_status_to_wire(lease_status);

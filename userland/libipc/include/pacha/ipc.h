@@ -64,7 +64,7 @@ struct pacha_pollfd {
     uint64_t revents;
 };
 
-enum { PACHA_SERVICE_WAIT_MAX_FDS = 256 };
+enum { PACHA_SERVICE_WAIT_MAX_FDS = 1024 };
 
 struct pacha_service_wait_set {
     struct pacha_pollfd fds[PACHA_SERVICE_WAIT_MAX_FDS];

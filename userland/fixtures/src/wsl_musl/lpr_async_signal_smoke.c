@@ -8,7 +8,9 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t handled;
@@ -17,6 +19,7 @@ static volatile sig_atomic_t sse_stack_ok;
 static volatile sig_atomic_t avx_handled;
 static unsigned char alternate_stack[64 * 1024];
 static int terminate_event_fd = -1;
+static volatile sig_atomic_t sigwait_interrupted;
 
 typedef float aligned_vec4_t __attribute__((vector_size(16)));
 
@@ -442,6 +445,218 @@ static int run_busybox_timeout(const char *self)
         (WEXITSTATUS(status) == 124 || WEXITSTATUS(status) == 128 + SIGTERM) ? 0 : 32;
 }
 
+static int run_exec_signal_state_child(void)
+{
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    if (sigaction(SIGUSR1, 0, &action) != 0 ||
+        action.sa_handler != SIG_IGN)
+    {
+        return 60;
+    }
+    write_marker("ASYNC_EXEC_SIGIGN=OK\n");
+
+    memset(&action, 0, sizeof(action));
+    if (sigaction(SIGUSR2, 0, &action) != 0 ||
+        action.sa_handler != SIG_DFL)
+    {
+        return 61;
+    }
+    write_marker("ASYNC_EXEC_CAUGHT_RESET=OK\n");
+
+    sigset_t mask;
+    if (sigprocmask(SIG_SETMASK, 0, &mask) != 0 ||
+        sigismember(&mask, SIGTERM) != 1)
+    {
+        return 62;
+    }
+    write_marker("ASYNC_EXEC_SIGMASK=OK\n");
+    return 0;
+}
+
+static int run_exec_signal_state(const char *self)
+{
+    struct sigaction ignored;
+    struct sigaction caught;
+    struct sigaction old_usr1;
+    struct sigaction old_usr2;
+    memset(&ignored, 0, sizeof(ignored));
+    memset(&caught, 0, sizeof(caught));
+    ignored.sa_handler = SIG_IGN;
+    caught.sa_handler = sigint_handler;
+    sigemptyset(&ignored.sa_mask);
+    sigemptyset(&caught.sa_mask);
+    if (sigaction(SIGUSR1, &ignored, &old_usr1) != 0 ||
+        sigaction(SIGUSR2, &caught, &old_usr2) != 0)
+    {
+        return 63;
+    }
+
+    sigset_t blocked;
+    sigset_t old_mask;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &blocked, &old_mask) != 0) return 64;
+
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execl(self, self, "exec-signal-state", (char *)0);
+        _exit(127);
+    }
+    int result = 0;
+    if (pid < 0) {
+        result = 65;
+    } else {
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid ||
+            !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        {
+            result = 66;
+        }
+    }
+    (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+    (void)sigaction(SIGUSR2, &old_usr2, 0);
+    (void)sigaction(SIGUSR1, &old_usr1, 0);
+    if (result == 0) write_marker("ASYNC_EXEC_SIGNAL_STATE=OK\n");
+    return result;
+}
+
+static void sigwait_interrupt_handler(int signo)
+{
+    if (signo == SIGUSR2) sigwait_interrupted = 1;
+}
+
+static void child_signal_after(pid_t parent, int signal, long delay_ns)
+{
+    const struct timespec delay = {
+        .tv_sec = delay_ns / 1000000000l,
+        .tv_nsec = delay_ns % 1000000000l,
+    };
+    (void)nanosleep(&delay, 0);
+    (void)kill(parent, signal);
+}
+
+static int wait_child_ok(pid_t child)
+{
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int run_sigtimedwait_suite(void)
+{
+    sigset_t wait_set;
+    sigset_t blocked;
+    sigset_t old_mask;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGUSR1);
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR1);
+    sigaddset(&blocked, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &blocked, &old_mask) != 0) return 70;
+
+    const struct timespec zero = {0, 0};
+    const struct timespec finite = {0, 30000000l};
+    const struct timespec one_second = {1, 0};
+    siginfo_t info;
+    memset(&info, 0xa5, sizeof(info));
+    if (kill(getpid(), SIGUSR1) != 0 ||
+        sigtimedwait(&wait_set, &info, &zero) != SIGUSR1 ||
+        info.si_signo != SIGUSR1)
+    {
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 71;
+    }
+    write_marker("ASYNC_SIGTIMEDWAIT_PENDING=OK\n");
+
+    errno = 0;
+    if (sigtimedwait(&wait_set, 0, &zero) != -1 || errno != EAGAIN) {
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 72;
+    }
+    write_marker("ASYNC_SIGTIMEDWAIT_ZERO_TIMEOUT=OK\n");
+
+    errno = 0;
+    if (sigtimedwait(&wait_set, 0, &finite) != -1 || errno != EAGAIN) {
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 73;
+    }
+    write_marker("ASYNC_SIGTIMEDWAIT_FINITE_TIMEOUT=OK\n");
+
+    sigset_t child_set;
+    sigemptyset(&child_set);
+    sigaddset(&child_set, SIGCHLD);
+    pid_t child = fork();
+    if (child == 0) _exit(0);
+    if (child < 0 || sigtimedwait(&child_set, 0, &one_second) != SIGCHLD ||
+        !wait_child_ok(child))
+    {
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 74;
+    }
+    write_marker("ASYNC_SIGTIMEDWAIT_SIGCHLD=OK\n");
+
+    struct sigaction caught;
+    struct sigaction ignored;
+    struct sigaction old_usr2;
+    memset(&caught, 0, sizeof(caught));
+    memset(&ignored, 0, sizeof(ignored));
+    caught.sa_handler = sigwait_interrupt_handler;
+    ignored.sa_handler = SIG_IGN;
+    sigemptyset(&caught.sa_mask);
+    sigemptyset(&ignored.sa_mask);
+    if (sigaction(SIGUSR2, &caught, &old_usr2) != 0) {
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 75;
+    }
+    sigwait_interrupted = 0;
+    child = fork();
+    if (child == 0) {
+        child_signal_after(getppid(), SIGUSR2, 20000000l);
+        _exit(0);
+    }
+    errno = 0;
+    const int interrupted_result = (int)syscall(
+        SYS_rt_sigtimedwait,
+        &wait_set,
+        0,
+        &one_second,
+        sizeof(uint64_t));
+    if (child < 0 || interrupted_result != -1 || errno != EINTR ||
+        !sigwait_interrupted || !wait_child_ok(child))
+    {
+        (void)sigaction(SIGUSR2, &old_usr2, 0);
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 76;
+    }
+    write_marker("ASYNC_SIGTIMEDWAIT_EINTR=OK\n");
+
+    if (sigaction(SIGUSR2, &ignored, 0) != 0) {
+        (void)sigaction(SIGUSR2, &old_usr2, 0);
+        (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+        return 77;
+    }
+    child = fork();
+    if (child == 0) {
+        const pid_t parent = getppid();
+        child_signal_after(parent, SIGUSR2, 10000000l);
+        child_signal_after(parent, SIGUSR1, 10000000l);
+        _exit(0);
+    }
+    const int ignored_result =
+        sigtimedwait(&wait_set, 0, &one_second);
+    const int ignored_ok = child >= 0 && ignored_result == SIGUSR1 &&
+        wait_child_ok(child);
+    (void)sigaction(SIGUSR2, &old_usr2, 0);
+    (void)sigprocmask(SIG_SETMASK, &old_mask, 0);
+    if (!ignored_ok) return 78;
+    write_marker("ASYNC_SIGTIMEDWAIT_IGNORED_RESTART=OK\n");
+    return 0;
+}
+
 static int run_suite(const char *self)
 {
     if (run_signaled_child("loop", SIGINT, SIGINT) != 0) {
@@ -472,6 +687,12 @@ static int run_suite(const char *self)
         return 46;
     }
     write_marker("ASYNC_SIGNALFD=OK\n");
+    if (run_exec_signal_state(self) != 0) {
+        return 47;
+    }
+    if (run_sigtimedwait_suite() != 0) {
+        return 48;
+    }
     return 0;
 }
 
@@ -494,6 +715,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "signalfd") == 0) {
         return run_signalfd_handler();
+    }
+    if (strcmp(argv[1], "exec-signal-state") == 0) {
+        return run_exec_signal_state_child();
     }
     if (strcmp(argv[1], "suite") == 0) {
         return run_suite(argv[0]);

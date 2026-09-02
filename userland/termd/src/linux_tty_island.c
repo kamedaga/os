@@ -500,15 +500,13 @@ static void termd_linux_tty_write_task_state(
         TERMD_LINUX_SIGNAL_LEADER_OFFSET,
         ids->process_id != 0 && ids->process_id == ids->session_id ? 1u : 0u);
     write_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OLD_PGRP_OFFSET, NULL);
-    if (tty != NULL) {
-        void *old_tty = read_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OFFSET);
-        if (old_tty != tty) {
-            write_ptr_field(
-                signal,
-                TERMD_LINUX_SIGNAL_TTY_OFFSET,
-                termd_linux_tty_kref_get(tty));
-            termd_linux_tty_kref_put(old_tty);
-        }
+    void *old_tty = read_ptr_field(signal, TERMD_LINUX_SIGNAL_TTY_OFFSET);
+    if (old_tty != tty) {
+        write_ptr_field(
+            signal,
+            TERMD_LINUX_SIGNAL_TTY_OFFSET,
+            termd_linux_tty_kref_get(tty));
+        termd_linux_tty_kref_put(old_tty);
     }
 }
 
@@ -524,6 +522,10 @@ static void termd_linux_tty_sync_current_state(
         return;
     }
     void *real_tty = termd_linux_tty_real_tty(handle);
+    /* Linux never installs a PTY master as the caller's controlling tty.
+     * tty_ioctl() may operate on the linked slave for termios requests, but
+     * the terminal emulator that owns /dev/ptmx must still have no ctty. */
+    void *controlling_tty = handle->master ? NULL : real_tty;
     termd_linux_owner_context_t context;
     const void *owner_function = function != NULL ?
         function :
@@ -545,7 +547,7 @@ static void termd_linux_tty_sync_current_state(
         process,
         pgrp,
         session,
-        real_tty,
+        controlling_tty,
         signal_mask,
         signal_ignored);
     termd_linux_tty_write_task_state(
@@ -554,7 +556,7 @@ static void termd_linux_tty_sync_current_state(
         process,
         pgrp,
         session,
-        real_tty,
+        controlling_tty,
         signal_mask,
         signal_ignored);
     termd_linux_tty_write_task_state(
@@ -563,7 +565,7 @@ static void termd_linux_tty_sync_current_state(
         process,
         pgrp,
         session,
-        real_tty,
+        controlling_tty,
         signal_mask,
         signal_ignored);
     termd_linux_tty_write_task_state(
@@ -572,14 +574,21 @@ static void termd_linux_tty_sync_current_state(
         process,
         pgrp,
         session,
-        real_tty,
+        controlling_tty,
         signal_mask,
         signal_ignored);
-    if (real_tty != NULL && session != NULL) {
+    /* Opening or using the master side must not claim the linked slave for
+     * the terminal emulator's desktop session.  The slave side establishes
+     * its own session/foreground group when it is opened and controlled. */
+    if (!handle->master && real_tty != NULL && session != NULL) {
+        const int hvc_foreground_open =
+            install_initial_foreground &&
+            kb_linux_kernel_decode_major(handle->dev) == TERMD_LINUX_HVC_MAJOR;
         write_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_SESSION_OFFSET, session);
         if (install_initial_foreground &&
             pgrp != NULL &&
-            read_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET) == NULL)
+            (hvc_foreground_open ||
+             read_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET) == NULL))
         {
             write_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_PGRP_OFFSET, pgrp);
         }
@@ -1395,6 +1404,35 @@ int termd_linux_tty_island_ioctl(
         request->result0 = termd_read_u32(request->data, 0);
     }
     return 0;
+}
+
+int termd_linux_tty_island_open_peer(
+    struct termd_linux_tty_island *island,
+    const termd_ioctl_request_t *request,
+    int notify_fd,
+    uint64_t *out_handle)
+{
+    if (island == NULL || request == NULL || out_handle == NULL || notify_fd < 16) {
+        return -22;
+    }
+    termd_linux_tty_handle_t *master = find_handle(request->handle);
+    if (master == NULL) {
+        return -9;
+    }
+    if (!master->master) {
+        return -5;
+    }
+
+    const termd_open_request_t open_request = {
+        .tty = request->tty,
+        .flags = request->arg0,
+        .pts_index = master->pts_index,
+    };
+    return termd_linux_tty_island_open_pts(
+        island,
+        &open_request,
+        notify_fd,
+        out_handle);
 }
 
 static uint32_t termd_linux_poll_mask_to_wire(uint32_t mask)

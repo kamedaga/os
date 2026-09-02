@@ -1,25 +1,5 @@
 #include "../lpr_filed_internal.h"
 
-#define LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS 127ull
-
-static void lpr_image_abi_mismatch_exit(uint64_t actual_version)
-{
-    pacha_trace5(
-        PACHA_TRACE_COMPONENT_LPR,
-        PACHA_TRACE_EVENT_LPR_IMAGE_ABI_MISMATCH,
-        PACHA_TRACE_CLASS_ERROR,
-        actual_version,
-        LPR_IMAGE_ABI_VERSION,
-        offsetof(lpr_manifest_t, image_abi_version),
-        sizeof(lpr_manifest_t),
-        LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
-    (void)lpr_pacha_syscall1(
-        PACHAOS_SYSCALL_PROCESS_EXIT,
-        LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
-    for (;;) {
-    }
-}
-
 int lpr_load_manifest(void)
 {
     if (lpr_manifest_checked) {
@@ -48,9 +28,6 @@ int lpr_load_manifest(void)
         (uint64_t)(uintptr_t)header_mapped,
         sizeof(lpr_process_manifest));
     if (lpr_process_manifest.magic != LPR_MANIFEST_MAGIC) goto invalid;
-    if (lpr_process_manifest.image_abi_version != LPR_IMAGE_ABI_VERSION) {
-        lpr_image_abi_mismatch_exit(lpr_process_manifest.image_abi_version);
-    }
     if (lpr_process_manifest.byte_size < sizeof(lpr_process_manifest) ||
         lpr_process_manifest.entry_count > LPR_FD_TABLE_MAX_SIZE)
     {
@@ -102,6 +79,21 @@ int lpr_load_manifest(void)
                 (uint64_t)(uint32_t)cwd_lease_fd);
         goto invalid;
     }
+    if (lpr_install_exec_bootstrap_fd(LPR_BOOTSTRAP_FD) != 0) goto invalid;
+    lpr_linux_signal_mask =
+        lpr_process_manifest.signal_mask &
+        ~lpr_linux_unblockable_signal_mask();
+    lpr_memset(
+        lpr_linux_sigactions,
+        0,
+        sizeof(lpr_state.signal.actions));
+    const uint64_t ignored_mask =
+        lpr_process_manifest.signal_ignored_mask &
+        ~lpr_linux_unblockable_signal_mask();
+    for (uint32_t sig = 1; sig <= LPR_LINUX_SIGNAL_MAX; ++sig) {
+        if ((ignored_mask & lpr_linux_signal_bit(sig)) != 0)
+            lpr_linux_sigactions[sig].handler = LPR_LINUX_SIG_IGN;
+    }
     lpr_cwd_lease_fd = cwd_lease_fd;
     if ((lpr_process_manifest.flags & LPR_MANIFEST_FLAG_SUPERVISOR) != 0 &&
         lpr_process_manifest.supervisor_token != 0)
@@ -116,13 +108,16 @@ int lpr_load_manifest(void)
         if (commit_status != 0) {
             (void)lpr_pacha_syscall1(
                 PACHAOS_SYSCALL_PROCESS_EXIT,
-                LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
+                127u);
             for (;;) {
             }
         }
     }
     lpr_manifest_valid = 1;
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
+    /* Keep the consumed manifest capability as the reservation for the fixed
+     * bootstrap slot.  A later self-exec replaces it only after filed has
+     * returned all donor capabilities, so native allocation cannot hand fd
+     * 245 to the process, thread, or manifest reply in the meantime. */
     return 1;
 
 invalid:
@@ -133,7 +128,7 @@ invalid:
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, LPR_BOOTSTRAP_FD);
     (void)lpr_pacha_syscall1(
         PACHAOS_SYSCALL_PROCESS_EXIT,
-        LPR_IMAGE_ABI_MISMATCH_EXIT_STATUS);
+        127u);
     for (;;) {
     }
 }

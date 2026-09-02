@@ -242,6 +242,71 @@ int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
     return fd;
 }
 
+int64_t lpr_tty_open_peer(uint64_t master_fd, uint64_t flags)
+{
+    if (!lpr_linux_tty_fd_active(master_fd)) {
+        return -LPR_LINUX_EBADF;
+    }
+    lpr_tty_backend_t *master = lpr_tty_backend(master_fd);
+    if (master == NULL || master->reserved0 != LPR_TTY_BACKEND_PTY_MASTER) {
+        return -LPR_LINUX_EIO;
+    }
+
+    void *page = 0;
+    const int page_fd = lpr_create_tty_wire_page(&page);
+    if (page_fd < 0) {
+        return page_fd;
+    }
+    termd_ioctl_request_t *request =
+        (termd_ioctl_request_t *)lpr_termd_payload(page);
+    lpr_memset(request, 0, sizeof(*request));
+    request->handle = master->handle;
+    request->request = TERMD_IOCTL_TIOCGPTPEER;
+    request->arg0 = (uint32_t)flags;
+    lpr_fill_termd_caller(
+        &request->tty.session_id,
+        &request->tty.process_id,
+        &request->tty.pgrp_id);
+    lpr_fill_termd_signal_state(
+        &request->tty.signal_mask,
+        &request->tty.signal_ignored);
+
+    uint64_t handle = 0;
+    int native_wait_fd = -1;
+    int remote_wait_fd = -1;
+    const int wait_status =
+        lpr_native_wait_pair(&native_wait_fd, &remote_wait_fd);
+    if (wait_status != 0) {
+        lpr_destroy_tty_wire_page(page_fd, page);
+        return wait_status;
+    }
+    const int64_t status = lpr_termd_call_with_fd(
+        TERMD_OP_HANDLE_IOCTL,
+        page_fd,
+        page,
+        sizeof(*request),
+        remote_wait_fd,
+        &handle);
+    lpr_destroy_tty_wire_page(page_fd, page);
+    if (status != 0) {
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)remote_wait_fd);
+        return status;
+    }
+
+    const int peer_fd = lpr_tty_fd_alloc(handle, flags, native_wait_fd);
+    if (peer_fd < 0) {
+        (void)lpr_termd_call_handle(TERMD_OP_HANDLE_CLOSE, handle, 0);
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
+        return peer_fd;
+    }
+    lpr_tty_backend_t *peer = lpr_tty_backend((uint64_t)(uint32_t)peer_fd);
+    if (peer != NULL) {
+        peer->reserved0 = LPR_TTY_BACKEND_PTY_SLAVE;
+    }
+    return peer_fd;
+}
+
 uint64_t lpr_parse_pts_index(const char *path)
 {
     const char prefix[] = "/dev/pts/";
@@ -357,6 +422,11 @@ int lpr_linux_default_signal_stops(uint32_t sig)
 
 void lpr_linux_exit_for_signal(uint32_t sig)
 {
+    lpr_signal_source_diag(
+        "default-exit",
+        sig,
+        lpr_linux_pending_signal_mask,
+        sig <= LPR_LINUX_SIGNAL_MAX ? lpr_linux_sigactions[sig].handler : 0);
     const uint64_t exit_code = 128u + (uint64_t)sig;
     lpr_linux_prepare_process_exit(exit_code);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, exit_code);

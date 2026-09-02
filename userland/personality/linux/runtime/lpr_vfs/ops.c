@@ -2,7 +2,19 @@
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
-    uint64_t rights = FILED_RIGHT_STAT | FILED_RIGHT_SETATTR;
+    /*
+     * Linux does not require O_DIRECTORY when opening a directory that will
+     * later be used as an *at() dirfd.  The object kind is not known until
+     * filed completes this open, so request the directory-only capabilities
+     * up front.  Filed still rejects lookup/create/remove/rename when the
+     * resulting vnode is not a directory.
+     */
+    uint64_t rights = FILED_RIGHT_STAT |
+        FILED_RIGHT_SETATTR |
+        FILED_RIGHT_LOOKUP |
+        FILED_RIGHT_CREATE |
+        FILED_RIGHT_REMOVE |
+        FILED_RIGHT_RENAME;
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
         rights |= FILED_RIGHT_GETDENTS;
@@ -13,19 +25,8 @@ uint64_t lpr_open_rights(uint64_t flags)
     if (accmode == LPR_LINUX_O_WRONLY || accmode == LPR_LINUX_O_RDWR) {
         rights |= FILED_RIGHT_WRITE;
     }
-    if ((flags & LPR_LINUX_O_DIRECTORY) != 0) {
-        /*
-         * A Linux directory fd opened O_RDONLY may still be used as the
-         * dirfd for mutating *at operations.  O_ACCMODE describes access to
-         * the directory object itself; it does not make openat(O_CREAT),
-         * unlinkat(), or renameat() through that fd read-only.
-         */
-        rights |= FILED_RIGHT_LOOKUP |
-            FILED_RIGHT_GETDENTS |
-            FILED_RIGHT_CREATE |
-            FILED_RIGHT_REMOVE |
-            FILED_RIGHT_RENAME;
-    }
+    if ((flags & LPR_LINUX_O_DIRECTORY) != 0)
+        rights |= FILED_RIGHT_GETDENTS;
     if ((flags & LPR_LINUX_O_CREAT) != 0) {
         rights |= FILED_RIGHT_CREATE | FILED_RIGHT_WRITE;
     }
@@ -1090,23 +1091,55 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     const int old_lease_fd = lpr_cwd_lease_fd;
     char old_path[FILED_PATH_BYTES];
     lpr_memcpy(old_path, lpr_cwd_path, sizeof(old_path));
-    lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
     const uint64_t len = (uint64_t)lpr_strnlen(path, sizeof(lpr_cwd_path));
+    const int root = len == 1u && path[0] == '/';
+    uint64_t installed_handle = 0;
+    int installed_lease_fd = -1;
+    if (!root) {
+        int remote_lease_fd = -1;
+        int status = lpr_native_wait_pair(
+            &installed_lease_fd,
+            &remote_lease_fd);
+        if (status == 0) {
+            status = (int)lpr_filed_transfer_dup_handle(
+                handle,
+                0,
+                remote_lease_fd,
+                &installed_handle);
+        }
+        if (status != 0 || installed_handle == 0) {
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)installed_lease_fd);
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)remote_lease_fd);
+            (void)lpr_filed_close_handle(handle);
+            return status != 0 ? status : -LPR_LINUX_EIO;
+        }
+        /* The process-wide cwd must outlive a reconnect of the filed RPC
+         * session.  Keep the duplicate alive through its explicit lease and
+         * retire the short-lived session-owned handle returned by open/dup. */
+        (void)lpr_filed_close_handle(handle);
+    }
+    lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
     lpr_memcpy(lpr_cwd_path, path, (size_t)len + 1u);
-    if (len == 1u && path[0] == '/') {
+    if (root) {
         lpr_cwd_handle = 0;
         lpr_cwd_lease_fd = -1;
         if (handle != 0) {
             (void)lpr_filed_close_handle(handle);
         }
     } else {
-        lpr_cwd_handle = handle;
-        lpr_cwd_lease_fd = -1;
+        lpr_cwd_handle = installed_handle;
+        lpr_cwd_lease_fd = installed_lease_fd;
     }
     const int64_t supervisor_status = lpr_supervisor_cwd_set(lpr_cwd_handle, lpr_cwd_path);
     if (supervisor_status != 0) {
         if (lpr_cwd_handle != 0 && lpr_cwd_handle != old_handle) {
-            (void)lpr_filed_close_handle(lpr_cwd_handle);
+            if (lpr_cwd_lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)lpr_cwd_lease_fd);
+            else
+                (void)lpr_filed_close_handle(lpr_cwd_handle);
         }
         lpr_cwd_handle = old_handle;
         lpr_cwd_lease_fd = old_lease_fd;
@@ -1216,10 +1249,19 @@ void lpr_timespec_subtract(
 int64_t lpr_pacha_clock_gettime(uint64_t clock_id, struct pachaos_timespec *out)
 {
     lpr_memset(out, 0, sizeof(*out));
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_CLOCK_GETTIME,
-        clock_id,
-        (uint64_t)(uintptr_t)out);
+    int64_t status;
+    do {
+        status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_CLOCK_GETTIME,
+            clock_id,
+            (uint64_t)(uintptr_t)out);
+        if (status == PACHA_SYSCALL_ERR_NOT_READY ||
+            status == -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            __asm__ volatile("pause");
+        }
+    } while (status == PACHA_SYSCALL_ERR_NOT_READY ||
+             status == -PACHA_SYSCALL_ERR_NOT_READY);
     return status == 0 ? 0 : lpr_pacha_status_to_errno(status);
 }
 

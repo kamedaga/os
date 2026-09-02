@@ -33,6 +33,7 @@
      LPR_LINUX_MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
 #define LPR_LINUX_FUTEX_WAIT 0ull
 #define LPR_LINUX_FUTEX_WAKE 1ull
+#define LPR_LINUX_FUTEX_REQUEUE 3ull
 #define LPR_LINUX_FUTEX_WAIT_BITSET 9ull
 #define LPR_LINUX_FUTEX_PRIVATE_FLAG 128ull
 #define LPR_LINUX_FUTEX_CLOCK_REALTIME 256ull
@@ -277,6 +278,8 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_EXECVE },
     { .nr = LPR_LINUX_SYS_WAIT4 },
     { .nr = LPR_LINUX_SYS_NANOSLEEP },
+    { .nr = LPR_LINUX_SYS_GETITIMER },
+    { .nr = LPR_LINUX_SYS_SETITIMER },
     { .nr = LPR_LINUX_SYS_GETPID },
     { .nr = LPR_LINUX_SYS_EXIT },
     { .nr = LPR_LINUX_SYS_FCNTL },
@@ -303,7 +306,11 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_GETTID },
     { .nr = LPR_LINUX_SYS_GETDENTS64 },
     { .nr = LPR_LINUX_SYS_SET_TID_ADDRESS },
+    { .nr = LPR_LINUX_SYS_RT_SIGTIMEDWAIT },
+    { .nr = LPR_LINUX_SYS_RT_SIGSUSPEND },
+    { .nr = LPR_LINUX_SYS_FADVISE64 },
     { .nr = LPR_LINUX_SYS_CLOCK_GETTIME },
+    { .nr = LPR_LINUX_SYS_CLOCK_GETRES },
     { .nr = LPR_LINUX_SYS_CLOCK_NANOSLEEP },
     { .nr = LPR_LINUX_SYS_FUTEX },
     { .nr = LPR_LINUX_SYS_EPOLL_WAIT },
@@ -315,6 +322,10 @@ static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
     { .nr = LPR_LINUX_SYS_TIMERFD_GETTIME },
     { .nr = LPR_LINUX_SYS_EVENTFD },
     { .nr = LPR_LINUX_SYS_EVENTFD2 },
+    { .nr = LPR_LINUX_SYS_INOTIFY_INIT },
+    { .nr = LPR_LINUX_SYS_INOTIFY_ADD_WATCH },
+    { .nr = LPR_LINUX_SYS_INOTIFY_RM_WATCH },
+    { .nr = LPR_LINUX_SYS_INOTIFY_INIT1 },
     { .nr = LPR_LINUX_SYS_EPOLL_CREATE1 },
     { .nr = LPR_LINUX_SYS_DUP3 },
     { .nr = LPR_LINUX_SYS_PIPE2 },
@@ -538,6 +549,124 @@ static char *lpr_mmap_diag_append_i64(
     return lpr_mmap_diag_append_u64(out, end, magnitude);
 }
 
+#if defined(LPR_MMAP_IMAGE_DIAG) && LPR_MMAP_IMAGE_DIAG
+static void lpr_mmap_image_diag(
+    const lpr_filed_backend_t *file,
+    uint64_t len,
+    uint64_t map_len,
+    uint64_t prot,
+    uint64_t offset,
+    int64_t mapped)
+{
+    if (file == 0 || mapped < 4096 ||
+        (prot & LPR_LINUX_PROT_EXEC) == 0 ||
+        map_len < 512u * 1024u)
+    {
+        return;
+    }
+    char line[512];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_mmap_diag_append_text(
+        out, end, "[lpr-mmap-image] native_pid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_mmap_diag_append_text(out, end, " native_tid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID));
+    out = lpr_mmap_diag_append_text(out, end, " linux_pid=");
+    out = lpr_mmap_diag_append_i64(out, end, lpr_linux_current_pid);
+    out = lpr_mmap_diag_append_text(out, end, " mapped=");
+    out = lpr_mmap_diag_append_i64(out, end, mapped);
+    out = lpr_mmap_diag_append_text(out, end, " len=");
+    out = lpr_mmap_diag_append_u64(out, end, len);
+    out = lpr_mmap_diag_append_text(out, end, " map_len=");
+    out = lpr_mmap_diag_append_u64(out, end, map_len);
+    out = lpr_mmap_diag_append_text(out, end, " offset=");
+    out = lpr_mmap_diag_append_u64(out, end, offset);
+    out = lpr_mmap_diag_append_text(out, end, " file_size=");
+    out = lpr_mmap_diag_append_u64(out, end, file->stat_size);
+    out = lpr_mmap_diag_append_text(out, end, " path=");
+    out = lpr_mmap_diag_append_text(out, end, file->open_path);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+
+static void lpr_mmap_exec_diag(
+    const char *operation,
+    uint64_t address,
+    uint64_t length,
+    uint64_t prot)
+{
+    if (operation == 0 || address < 4096 ||
+        (prot & LPR_LINUX_PROT_EXEC) == 0 ||
+        length < 4096u)
+    {
+        return;
+    }
+    char line[256];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_mmap_diag_append_text(
+        out, end, "[lpr-mmap-exec] native_pid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_mmap_diag_append_text(out, end, " native_tid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID));
+    out = lpr_mmap_diag_append_text(out, end, " linux_pid=");
+    out = lpr_mmap_diag_append_i64(out, end, lpr_linux_current_pid);
+    out = lpr_mmap_diag_append_text(out, end, " op=");
+    out = lpr_mmap_diag_append_text(out, end, operation);
+    out = lpr_mmap_diag_append_text(out, end, " address=");
+    out = lpr_mmap_diag_append_u64(out, end, address);
+    out = lpr_mmap_diag_append_text(out, end, " length=");
+    out = lpr_mmap_diag_append_u64(out, end, length);
+    out = lpr_mmap_diag_append_text(out, end, " prot=");
+    out = lpr_mmap_diag_append_u64(out, end, prot);
+    if (out < end) {
+        *out++ = '\n';
+    }
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+}
+#else
+static inline void lpr_mmap_image_diag(
+    const lpr_filed_backend_t *file,
+    uint64_t len,
+    uint64_t map_len,
+    uint64_t prot,
+    uint64_t offset,
+    int64_t mapped)
+{
+    (void)file;
+    (void)len;
+    (void)map_len;
+    (void)prot;
+    (void)offset;
+    (void)mapped;
+}
+
+static inline void lpr_mmap_exec_diag(
+    const char *operation,
+    uint64_t address,
+    uint64_t length,
+    uint64_t prot)
+{
+    (void)operation;
+    (void)address;
+    (void)length;
+    (void)prot;
+}
+#endif
+
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
 uint32_t lpr_glycin_diag_armed;
 uint32_t lpr_glycin_diag_socket_fd;
@@ -548,6 +677,19 @@ static uint64_t lpr_glycin_diag_owner_tid;
 static uint64_t lpr_glycin_diag_lines;
 static uint32_t lpr_glycin_diag_log_lock;
 
+static int lpr_glycin_diag_event_selected(const char *event)
+{
+    if (event == 0) return 0;
+    return lpr_memcmp(event, "wait.block.exit", 15u) == 0 ||
+        lpr_memcmp(event, "wait.block.drained", 18u) == 0 ||
+        lpr_memcmp(event, "dbus.", 5u) == 0 ||
+        lpr_memcmp(event, "socket.watch", 12u) == 0 ||
+        lpr_memcmp(event, "recvmsg.", 8u) == 0 ||
+        lpr_memcmp(event, "sendmsg.", 8u) == 0 ||
+        lpr_memcmp(event, "poll.native", 11u) == 0 ||
+        lpr_memcmp(event, "poll.netd", 9u) == 0;
+}
+
 void lpr_glycin_diag_event(
     const char *event,
     uint64_t a,
@@ -555,6 +697,7 @@ void lpr_glycin_diag_event(
     uint64_t c,
     int64_t result)
 {
+    if (!lpr_glycin_diag_event_selected(event)) return;
     const uint64_t pid = (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
     const uint64_t owner_pid = __atomic_load_n(
         &lpr_glycin_diag_owner_pid, __ATOMIC_ACQUIRE);
@@ -657,6 +800,283 @@ static int lpr_glycin_diag_syscall_selected(
     default:
         return 0;
     }
+}
+
+static int lpr_dbus_wait_diag_syscall(uint64_t nr)
+{
+    switch (nr) {
+    case LPR_LINUX_SYS_POLL:
+    case LPR_LINUX_SYS_NANOSLEEP:
+    case LPR_LINUX_SYS_FUTEX:
+    case LPR_LINUX_SYS_CLOCK_NANOSLEEP:
+    case LPR_LINUX_SYS_EPOLL_WAIT:
+    case LPR_LINUX_SYS_PSELECT6:
+    case LPR_LINUX_SYS_PPOLL:
+    case LPR_LINUX_SYS_EPOLL_PWAIT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+#if defined(LPR_WAIT_ENTRY_DIAG) && LPR_WAIT_ENTRY_DIAG
+static int lpr_wait_entry_diag_syscall(uint64_t nr, uint64_t operation)
+{
+    if (nr != LPR_LINUX_SYS_FUTEX)
+        return lpr_dbus_wait_diag_syscall(nr);
+
+    const uint64_t command = operation &
+        ~(LPR_LINUX_FUTEX_PRIVATE_FLAG | LPR_LINUX_FUTEX_CLOCK_REALTIME);
+    return command == LPR_LINUX_FUTEX_WAIT ||
+        command == LPR_LINUX_FUTEX_WAIT_BITSET;
+}
+#endif
+
+static uint32_t lpr_dbus_wait_diag_lock;
+static uint32_t lpr_dbus_wait_diag_lines;
+
+#if defined(LPR_WAIT_ENTRY_DIAG) && LPR_WAIT_ENTRY_DIAG
+static uint32_t lpr_wait_entry_diag_lock;
+static uint32_t lpr_wait_entry_diag_lines;
+
+static void lpr_wait_entry_diag_log(
+    const char *stage,
+    uint64_t nr,
+    uint64_t a0,
+    uint64_t a1,
+    uint64_t a2,
+    uint64_t a3,
+    uint64_t a4,
+    int64_t result)
+{
+#if defined(LPR_WAIT_ENTRY_DIAG_LINUX_PID)
+    if (lpr_linux_current_pid != LPR_WAIT_ENTRY_DIAG_LINUX_PID) return;
+#endif
+    while (__atomic_exchange_n(
+               &lpr_wait_entry_diag_lock, 1u, __ATOMIC_ACQUIRE) != 0u)
+    {
+        __asm__ volatile("pause");
+    }
+    if (__atomic_fetch_add(
+            &lpr_wait_entry_diag_lines, 1u, __ATOMIC_RELAXED) >= 4096u)
+    {
+        __atomic_store_n(
+            &lpr_wait_entry_diag_lock, 0u, __ATOMIC_RELEASE);
+        return;
+    }
+    char line[384];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_mmap_diag_append_text(out, end, "[lpr-wait-call] stage=");
+    out = lpr_mmap_diag_append_text(out, end, stage);
+    out = lpr_mmap_diag_append_text(out, end, " native_pid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_mmap_diag_append_text(out, end, " native_tid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID));
+    out = lpr_mmap_diag_append_text(out, end, " linux_pid=");
+    out = lpr_mmap_diag_append_i64(out, end, lpr_linux_current_pid);
+    out = lpr_mmap_diag_append_text(out, end, " nr=");
+    out = lpr_mmap_diag_append_u64(out, end, nr);
+    out = lpr_mmap_diag_append_text(out, end, " a0=");
+    out = lpr_mmap_diag_append_u64(out, end, a0);
+    out = lpr_mmap_diag_append_text(out, end, " a1=");
+    out = lpr_mmap_diag_append_u64(out, end, a1);
+    out = lpr_mmap_diag_append_text(out, end, " a2=");
+    out = lpr_mmap_diag_append_u64(out, end, a2);
+    out = lpr_mmap_diag_append_text(out, end, " a3=");
+    out = lpr_mmap_diag_append_u64(out, end, a3);
+    out = lpr_mmap_diag_append_text(out, end, " a4=");
+    out = lpr_mmap_diag_append_u64(out, end, a4);
+    const uint64_t timeout_raw = nr == LPR_LINUX_SYS_PPOLL ? a2 :
+        (nr == LPR_LINUX_SYS_PSELECT6 ? a4 : 0);
+    if (timeout_raw >= 4096u &&
+        timeout_raw <= 0x0000800000000000ull - 2u * sizeof(int64_t))
+    {
+        const int64_t *timeout = (const int64_t *)(uintptr_t)timeout_raw;
+        out = lpr_mmap_diag_append_text(out, end, " timeout_sec=");
+        out = lpr_mmap_diag_append_i64(out, end, timeout[0]);
+        out = lpr_mmap_diag_append_text(out, end, " timeout_nsec=");
+        out = lpr_mmap_diag_append_i64(out, end, timeout[1]);
+    }
+    out = lpr_mmap_diag_append_text(out, end, " result=");
+    out = lpr_mmap_diag_append_i64(out, end, result);
+    if (out < end) *out++ = '\n';
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+    __atomic_store_n(
+        &lpr_wait_entry_diag_lock, 0u, __ATOMIC_RELEASE);
+}
+
+void lpr_wait_native_diag_event(
+    const char *stage,
+    uint64_t fd,
+    uint64_t events,
+    uint64_t leaf_count,
+    uint64_t timeout_ticks,
+    int64_t status)
+{
+    lpr_wait_entry_diag_log(
+        stage,
+        PACHA_FD_SYSCALL_WAIT_MANY,
+        fd,
+        events,
+        leaf_count,
+        timeout_ticks,
+        0,
+        status);
+}
+#endif
+
+typedef struct lpr_dbus_wait_diag_pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+} lpr_dbus_wait_diag_pollfd_t;
+
+static void lpr_dbus_wait_diag_log(
+    uint64_t nr,
+    uint64_t a0,
+    uint64_t a1,
+    uint64_t a2,
+    uint64_t a3,
+    int64_t result,
+    uint64_t elapsed_ns)
+{
+    if (elapsed_ns < 100000000u) return;
+    while (__atomic_exchange_n(
+               &lpr_dbus_wait_diag_lock, 1u, __ATOMIC_ACQUIRE) != 0u)
+    {
+        __asm__ volatile("pause");
+    }
+    if (__atomic_fetch_add(
+            &lpr_dbus_wait_diag_lines, 1u, __ATOMIC_RELAXED) >= 512u)
+    {
+        __atomic_store_n(
+            &lpr_dbus_wait_diag_lock, 0u, __ATOMIC_RELEASE);
+        return;
+    }
+    char line[640];
+    char *out = line;
+    const char *end = line + sizeof(line);
+    out = lpr_mmap_diag_append_text(out, end, "[lpr-dbus-wait] pid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID));
+    out = lpr_mmap_diag_append_text(out, end, " tid=");
+    out = lpr_mmap_diag_append_i64(
+        out, end, lpr_pacha_syscall0(PACHAOS_SYSCALL_GETTID));
+    out = lpr_mmap_diag_append_text(out, end, " nr=");
+    out = lpr_mmap_diag_append_u64(out, end, nr);
+    out = lpr_mmap_diag_append_text(out, end, " elapsed_ns=");
+    out = lpr_mmap_diag_append_u64(out, end, elapsed_ns);
+    out = lpr_mmap_diag_append_text(out, end, " result=");
+    out = lpr_mmap_diag_append_i64(out, end, result);
+    out = lpr_mmap_diag_append_text(out, end, " a0=");
+    out = lpr_mmap_diag_append_u64(out, end, a0);
+    out = lpr_mmap_diag_append_text(out, end, " a1=");
+    out = lpr_mmap_diag_append_u64(out, end, a1);
+    out = lpr_mmap_diag_append_text(out, end, " a2=");
+    out = lpr_mmap_diag_append_u64(out, end, a2);
+    out = lpr_mmap_diag_append_text(out, end, " a3=");
+    out = lpr_mmap_diag_append_u64(out, end, a3);
+    if ((nr == LPR_LINUX_SYS_POLL || nr == LPR_LINUX_SYS_PPOLL) &&
+        a1 != 0 &&
+        a0 >= 4096u &&
+        a0 <= 0x0000800000000000ull -
+            sizeof(lpr_dbus_wait_diag_pollfd_t))
+    {
+        const lpr_dbus_wait_diag_pollfd_t *pollfd =
+            (const lpr_dbus_wait_diag_pollfd_t *)(uintptr_t)a0;
+        const int64_t logical_fd = pollfd->fd;
+        uint64_t backend_kind = 0;
+        uint64_t event_state = 0;
+        int64_t native_wait_fd = -1;
+        if (logical_fd >= 0) {
+            const uint64_t fd = (uint64_t)(uint32_t)logical_fd;
+            if (lpr_linux_eventfd_active(fd)) {
+                backend_kind |= 1u;
+                const lpr_event_backend_t *event = lpr_event_backend(fd);
+                if (event != 0) {
+                    event_state =
+                        (__atomic_load_n(
+                             &event->counter, __ATOMIC_ACQUIRE) << 1u) |
+                        __atomic_load_n(
+                            &event->notify_pending, __ATOMIC_ACQUIRE);
+                    native_wait_fd = event->wait_fd.raw;
+                }
+            }
+            if (lpr_linux_pipe_fd_active(fd)) backend_kind |= 2u;
+            if (lpr_linux_socket_fd_active(fd)) backend_kind |= 4u;
+            if (lpr_linux_timerfd_active(fd)) backend_kind |= 8u;
+            if (lpr_linux_epoll_fd_active(fd)) backend_kind |= 16u;
+        }
+        out = lpr_mmap_diag_append_text(out, end, " fd0=");
+        out = lpr_mmap_diag_append_i64(out, end, logical_fd);
+        out = lpr_mmap_diag_append_text(out, end, " events0=");
+        out = lpr_mmap_diag_append_i64(out, end, pollfd->events);
+        out = lpr_mmap_diag_append_text(out, end, " revents0=");
+        out = lpr_mmap_diag_append_i64(out, end, pollfd->revents);
+        out = lpr_mmap_diag_append_text(out, end, " kind0=");
+        out = lpr_mmap_diag_append_u64(out, end, backend_kind);
+        out = lpr_mmap_diag_append_text(out, end, " estate0=");
+        out = lpr_mmap_diag_append_u64(out, end, event_state);
+        out = lpr_mmap_diag_append_text(out, end, " native0=");
+        out = lpr_mmap_diag_append_i64(out, end, native_wait_fd);
+        if (a1 > 1u &&
+            a0 <= 0x0000800000000000ull -
+                2u * sizeof(lpr_dbus_wait_diag_pollfd_t))
+        {
+            pollfd++;
+            const int64_t second_fd = pollfd->fd;
+            backend_kind = 0;
+            event_state = 0;
+            native_wait_fd = -1;
+            if (second_fd >= 0) {
+                const uint64_t fd = (uint64_t)(uint32_t)second_fd;
+                if (lpr_linux_eventfd_active(fd)) {
+                    backend_kind |= 1u;
+                    const lpr_event_backend_t *event =
+                        lpr_event_backend(fd);
+                    if (event != 0) {
+                        event_state =
+                            (__atomic_load_n(
+                                 &event->counter,
+                                 __ATOMIC_ACQUIRE) << 1u) |
+                            __atomic_load_n(
+                                &event->notify_pending,
+                                __ATOMIC_ACQUIRE);
+                        native_wait_fd = event->wait_fd.raw;
+                    }
+                }
+                if (lpr_linux_pipe_fd_active(fd)) backend_kind |= 2u;
+                if (lpr_linux_socket_fd_active(fd)) backend_kind |= 4u;
+                if (lpr_linux_timerfd_active(fd)) backend_kind |= 8u;
+                if (lpr_linux_epoll_fd_active(fd)) backend_kind |= 16u;
+            }
+            out = lpr_mmap_diag_append_text(out, end, " fd1=");
+            out = lpr_mmap_diag_append_i64(out, end, second_fd);
+            out = lpr_mmap_diag_append_text(out, end, " events1=");
+            out = lpr_mmap_diag_append_i64(out, end, pollfd->events);
+            out = lpr_mmap_diag_append_text(out, end, " revents1=");
+            out = lpr_mmap_diag_append_i64(out, end, pollfd->revents);
+            out = lpr_mmap_diag_append_text(out, end, " kind1=");
+            out = lpr_mmap_diag_append_u64(out, end, backend_kind);
+            out = lpr_mmap_diag_append_text(out, end, " estate1=");
+            out = lpr_mmap_diag_append_u64(out, end, event_state);
+            out = lpr_mmap_diag_append_text(out, end, " native1=");
+            out = lpr_mmap_diag_append_i64(out, end, native_wait_fd);
+        }
+    }
+    if (out < end) *out++ = '\n';
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_LOG,
+        (uint64_t)(uintptr_t)line,
+        (uint64_t)(out - line));
+    __atomic_store_n(
+        &lpr_dbus_wait_diag_lock, 0u, __ATOMIC_RELEASE);
 }
 
 static int lpr_glycin_diag_take_follow_slot(void)
@@ -1504,9 +1924,8 @@ static int64_t lpr_linux_uname(uint64_t uts_raw)
     return 0;
 }
 
-void lpr_file_image_cache_clear(void)
+static void lpr_file_image_cache_clear_locked(void)
 {
-    lpr_state_lock(&lpr_file_image_cache_lock);
     for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
         lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
         if (entry->active) {
@@ -1518,12 +1937,41 @@ void lpr_file_image_cache_clear(void)
         }
     }
     lpr_file_image_cache_clock = 0;
+}
+
+void lpr_file_image_cache_clear(void)
+{
+    lpr_state_lock(&lpr_file_image_cache_lock);
+    lpr_file_image_cache_clear_locked();
+    lpr_state_unlock(&lpr_file_image_cache_lock);
+}
+
+void lpr_file_image_cache_pause(void)
+{
+    lpr_state_lock(&lpr_file_image_cache_lock);
+    if (lpr_file_image_cache_pause_count == 0) {
+        /* A mapped VMA retains its VMO independently of this descriptor-only
+         * lookup cache.  Drop the cache before a manifest reserves transient
+         * transfer leases so cached ELF images cannot exhaust native FDs. */
+        lpr_file_image_cache_clear_locked();
+    }
+    lpr_file_image_cache_pause_count++;
+    lpr_state_unlock(&lpr_file_image_cache_lock);
+}
+
+void lpr_file_image_cache_resume(void)
+{
+    lpr_state_lock(&lpr_file_image_cache_lock);
+    if (lpr_file_image_cache_pause_count != 0) {
+        lpr_file_image_cache_pause_count--;
+    }
     lpr_state_unlock(&lpr_file_image_cache_lock);
 }
 
 void lpr_file_image_cache_after_fork_child(void)
 {
     __atomic_store_n(&lpr_file_image_cache_lock, 0u, __ATOMIC_RELEASE);
+    lpr_file_image_cache_pause_count = 0;
     lpr_file_image_cache_clear();
 }
 
@@ -1539,6 +1987,10 @@ static lpr_file_image_cache_entry_t *lpr_file_image_cache_acquire(
     const int generation_status =
         lpr_filed_live_object_generation(handle, &generation);
     lpr_state_lock(&lpr_file_image_cache_lock);
+    if (lpr_file_image_cache_pause_count != 0) {
+        lpr_state_unlock(&lpr_file_image_cache_lock);
+        return 0;
+    }
     lpr_file_image_cache_entry_t *hit = 0;
     for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
         lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
@@ -1583,6 +2035,12 @@ static void lpr_file_image_cache_store(
         return;
     }
     lpr_state_lock(&lpr_file_image_cache_lock);
+    if (lpr_file_image_cache_pause_count != 0) {
+        (void)lpr_pacha_syscall1(
+            PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+        lpr_state_unlock(&lpr_file_image_cache_lock);
+        return;
+    }
     lpr_file_image_cache_entry_t *slot = 0;
     lpr_file_image_cache_entry_t *oldest = 0;
     for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
@@ -2197,6 +2655,13 @@ private_file_mapping_ready:
             }
         }
         const int64_t mmap_result = mapped;
+        lpr_mmap_image_diag(
+            private_file,
+            len,
+            map_len,
+            prot,
+            offset,
+            mmap_result);
         lpr_trace_mmap_call("mmap", addr, len, prot, flags, fd, offset, mmap_result);
         return mmap_result;
     }
@@ -2209,6 +2674,9 @@ private_file_mapping_ready:
         lpr_linux_prot_to_pacha(prot),
         pacha_flags,
         offset);
+    if (ret >= 4096 && (flags & LPR_LINUX_MAP_ANONYMOUS) != 0) {
+        lpr_mmap_exec_diag("mmap-anonymous", (uint64_t)ret, len, prot);
+    }
     if (ret < 4096) {
         lpr_trace_mmap_error(
             (flags & LPR_LINUX_MAP_ANONYMOUS) != 0 ?
@@ -2359,6 +2827,8 @@ static int64_t lpr_sys_mprotect(
             0,
             0,
             status);
+    } else {
+        lpr_mmap_exec_diag("mprotect", a0, a1, a2);
     }
     return lpr_linux_pacha_status_to_errno(status);
 }
@@ -2390,6 +2860,7 @@ static int64_t lpr_sys_brk(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, u
 static int64_t lpr_sys_rt_sigaction(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigaction(a0, a1, a2, a3); }
 static int64_t lpr_sys_rt_sigprocmask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigprocmask(a0, a1, a2, a3); }
 static int64_t lpr_sys_rt_sigpending(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_rt_sigpending(a0, a1); }
+static int64_t lpr_sys_rt_sigtimedwait(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_rt_sigtimedwait(a0, a1, a2, a3); }
 static int64_t lpr_sys_rt_sigreturn(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; lpr_linux_rt_sigreturn_frame(lpr_current_linux_user_frame()); }
 static int64_t lpr_sys_sigaltstack(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sigaltstack(a0, a1); }
 static int64_t lpr_sys_ioctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_ioctl(a0, a1, a2); }
@@ -2474,6 +2945,15 @@ static int64_t lpr_sys_umask(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_getrlimit(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_copy_out_rlimit(a0, a1); }
 static int64_t lpr_sys_zero(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return 0; }
 static int64_t lpr_sys_setid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return a0 == 0 ? 0 : -LPR_LINUX_EPERM; }
+static int64_t lpr_sys_setresid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a3; (void)a4; (void)a5;
+    const uint32_t id0 = (uint32_t)a0;
+    const uint32_t id1 = (uint32_t)a1;
+    const uint32_t id2 = (uint32_t)a2;
+    return (id0 == 0 || id0 == UINT32_MAX) &&
+        (id1 == 0 || id1 == UINT32_MAX) &&
+        (id2 == 0 || id2 == UINT32_MAX) ? 0 : -LPR_LINUX_EPERM;
+}
 static int64_t lpr_sys_getresid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getresid(a0, a1, a2); }
 static int64_t lpr_sys_capget(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capget(a0, a1, lpr_linux_getpid()); }
 static int64_t lpr_sys_capset(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_capset(a0, a1, lpr_linux_getpid()); }
@@ -2536,7 +3016,6 @@ static int64_t lpr_futex_timeout_ticks(
 
 static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
-    (void)a4;
     const uint64_t command = a1 & 0x7full;
     const uint64_t flags = a1 & ~0x7full;
     const int wait_bitset = command == LPR_LINUX_FUTEX_WAIT_BITSET;
@@ -2544,7 +3023,8 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
         (wait_bitset ? LPR_LINUX_FUTEX_CLOCK_REALTIME : 0ull);
     if ((flags & ~allowed_flags) != 0 ||
         (command != LPR_LINUX_FUTEX_WAIT &&
-         command != LPR_LINUX_FUTEX_WAKE && !wait_bitset)) {
+         command != LPR_LINUX_FUTEX_WAKE &&
+         command != LPR_LINUX_FUTEX_REQUEUE && !wait_bitset)) {
         return -LPR_LINUX_ENOSYS;
     }
     if (a0 == 0 || (a0 & 3u) != 0) {
@@ -2560,6 +3040,20 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
             PACHAOS_SYSCALL_FUTEX_WAKE,
             a0,
             a2);
+    }
+    if (command == LPR_LINUX_FUTEX_REQUEUE) {
+        if (a4 == 0 || (a4 & 3u) != 0 || a4 == a0) {
+            return -LPR_LINUX_EINVAL;
+        }
+        /* The native result is the number of waiters woken plus requeued.
+         * As with FUTEX_WAKE, return it directly because small successful
+         * counts overlap native status values. */
+        return lpr_pacha_syscall4(
+            PACHAOS_SYSCALL_FUTEX_REQUEUE,
+            a0,
+            a2,
+            a3,
+            a4);
     }
     if (wait_bitset && (uint32_t)a5 == 0u) return -LPR_LINUX_EINVAL;
 
@@ -2591,7 +3085,224 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     return error;
 }
 static int64_t lpr_sys_getdents64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getdents64(a0, a1, a2); }
-static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; const uint64_t native_clock = a0 == LPR_LINUX_CLOCK_BOOTTIME ? LPR_LINUX_CLOCK_MONOTONIC : a0; return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall2(PACHAOS_SYSCALL_CLOCK_GETTIME, native_clock, a1)); }
+
+typedef struct lpr_linux_timeval {
+    int64_t tv_sec;
+    int64_t tv_usec;
+} lpr_linux_timeval_t;
+
+typedef struct lpr_linux_itimerval {
+    lpr_linux_timeval_t interval;
+    lpr_linux_timeval_t value;
+} lpr_linux_itimerval_t;
+
+typedef struct lpr_native_signal_timer_state {
+    uint64_t signo;
+    uint64_t remaining_ticks;
+    uint64_t interval_ticks;
+} lpr_native_signal_timer_state_t;
+
+_Static_assert(
+    offsetof(lpr_native_signal_timer_state_t, signo) ==
+        PACHA_PROCESS_SIGNAL_TIMER_STATE_SIGNO_OFFSET,
+    "native signal timer signo offset");
+_Static_assert(
+    offsetof(lpr_native_signal_timer_state_t, remaining_ticks) ==
+        PACHA_PROCESS_SIGNAL_TIMER_STATE_REMAINING_TICKS_OFFSET,
+    "native signal timer remaining offset");
+_Static_assert(
+    offsetof(lpr_native_signal_timer_state_t, interval_ticks) ==
+        PACHA_PROCESS_SIGNAL_TIMER_STATE_INTERVAL_TICKS_OFFSET,
+    "native signal timer interval offset");
+_Static_assert(
+    sizeof(lpr_native_signal_timer_state_t) ==
+        PACHA_PROCESS_SIGNAL_TIMER_STATE_SIZE,
+    "native signal timer state size");
+
+static int64_t lpr_itimer_timeval_to_ticks(
+    const lpr_linux_timeval_t *value,
+    uint64_t *out_ticks)
+{
+    if (value == 0 || out_ticks == 0) return -LPR_LINUX_EFAULT;
+    if (value->tv_sec < 0 || value->tv_usec < 0 ||
+        value->tv_usec >= 1000000)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    const uint64_t seconds = (uint64_t)value->tv_sec;
+    const uint64_t fractional_ticks =
+        ((uint64_t)value->tv_usec + 999u) / 1000u;
+    if (seconds > (UINT64_MAX - fractional_ticks) / 1000u)
+        return -LPR_LINUX_EINVAL;
+    *out_ticks = seconds * 1000u + fractional_ticks;
+    return 0;
+}
+
+static void lpr_itimer_ticks_to_timeval(
+    uint64_t ticks,
+    lpr_linux_timeval_t *out)
+{
+    out->tv_sec = (int64_t)(ticks / 1000u);
+    out->tv_usec = (int64_t)((ticks % 1000u) * 1000u);
+}
+
+static void lpr_itimer_native_to_linux(
+    const lpr_native_signal_timer_state_t *native,
+    lpr_linux_itimerval_t *out)
+{
+    lpr_memset(out, 0, sizeof(*out));
+    lpr_itimer_ticks_to_timeval(native->remaining_ticks, &out->value);
+    lpr_itimer_ticks_to_timeval(native->interval_ticks, &out->interval);
+}
+
+static int64_t lpr_sys_getitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a0 != 0) return -LPR_LINUX_EINVAL;
+    if (a1 == 0) return -LPR_LINUX_EFAULT;
+    lpr_native_signal_timer_state_t native = {0};
+    const int64_t status = lpr_linux_pacha_status_to_errno(
+        lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+            PACHA_PROCESS_SIGNAL_CTL_GET_TIMER,
+            (uint64_t)(uintptr_t)&native));
+    if (status != 0) return status;
+    lpr_itimer_native_to_linux(
+        &native,
+        (lpr_linux_itimerval_t *)(uintptr_t)a1);
+    return 0;
+}
+
+static int64_t lpr_sys_setitimer(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a0 != 0) return -LPR_LINUX_EINVAL;
+
+    const lpr_linux_itimerval_t zero = {0};
+    const lpr_linux_itimerval_t *value = a1 != 0 ?
+        (const lpr_linux_itimerval_t *)(uintptr_t)a1 : &zero;
+    uint64_t initial_ticks = 0;
+    uint64_t interval_ticks = 0;
+    int64_t status = lpr_itimer_timeval_to_ticks(
+        &value->value, &initial_ticks);
+    if (status != 0) return status;
+    status = lpr_itimer_timeval_to_ticks(
+        &value->interval, &interval_ticks);
+    if (status != 0) return status;
+
+    lpr_native_signal_timer_state_t old = {0};
+    status = lpr_linux_pacha_status_to_errno(lpr_pacha_syscall5(
+        PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL,
+        PACHA_PROCESS_SIGNAL_CTL_SET_TIMER,
+        LPR_LINUX_SIGALRM,
+        initial_ticks,
+        interval_ticks,
+        (uint64_t)(uintptr_t)&old));
+    if (status != 0) return status;
+    if (a2 != 0) {
+        lpr_itimer_native_to_linux(
+            &old,
+            (lpr_linux_itimerval_t *)(uintptr_t)a2);
+    }
+    return 0;
+}
+
+static int64_t lpr_sys_rt_sigsuspend(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a0 == 0) return -LPR_LINUX_EFAULT;
+    return lpr_linux_ppoll(0, 0, 0, a0, a1);
+}
+
+static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    uint64_t native_clock = 0;
+    switch (a0) {
+    case LPR_LINUX_CLOCK_REALTIME:
+    case LPR_LINUX_CLOCK_REALTIME_COARSE:
+        native_clock = LPR_LINUX_CLOCK_REALTIME;
+        break;
+    case LPR_LINUX_CLOCK_MONOTONIC:
+    case LPR_LINUX_CLOCK_MONOTONIC_RAW:
+    case LPR_LINUX_CLOCK_MONOTONIC_COARSE:
+    case LPR_LINUX_CLOCK_BOOTTIME:
+        native_clock = LPR_LINUX_CLOCK_MONOTONIC;
+        break;
+    default:
+        return -LPR_LINUX_EINVAL;
+    }
+    int64_t native_status;
+    do {
+        native_status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_CLOCK_GETTIME, native_clock, a1);
+        if (native_status == PACHA_SYSCALL_ERR_NOT_READY ||
+            native_status == -PACHA_SYSCALL_ERR_NOT_READY)
+        {
+            __asm__ volatile("pause");
+        }
+    } while (native_status == PACHA_SYSCALL_ERR_NOT_READY ||
+             native_status == -PACHA_SYSCALL_ERR_NOT_READY);
+    return lpr_linux_pacha_status_to_errno(native_status);
+}
+static int64_t lpr_sys_clock_getres(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    uint64_t native_clock = 0;
+    switch (a0) {
+    case LPR_LINUX_CLOCK_REALTIME:
+    case LPR_LINUX_CLOCK_REALTIME_COARSE:
+        native_clock = LPR_LINUX_CLOCK_REALTIME;
+        break;
+    case LPR_LINUX_CLOCK_MONOTONIC:
+    case LPR_LINUX_CLOCK_MONOTONIC_RAW:
+    case LPR_LINUX_CLOCK_MONOTONIC_COARSE:
+    case LPR_LINUX_CLOCK_BOOTTIME:
+        native_clock = LPR_LINUX_CLOCK_MONOTONIC;
+        break;
+    default:
+        return -LPR_LINUX_EINVAL;
+    }
+    struct pachaos_timespec ignored;
+    const uint64_t out = a1 != 0 ? a1 : (uint64_t)(uintptr_t)&ignored;
+    return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_CLOCK_GETRES,
+        native_clock,
+        out));
+}
+static int64_t lpr_sys_fadvise64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a4;
+    (void)a5;
+    if (a3 > 5u || (int64_t)a1 < 0 || (int64_t)a2 < 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if (a0 > LPR_LINUX_FD_MAX || !lpr_fd_linux_visible_active(a0)) {
+        return -LPR_LINUX_EBADF;
+    }
+    if (!lpr_linux_filed_fd_active(a0)) {
+        return -LPR_LINUX_ESPIPE;
+    }
+    /* POSIX_FADV_* is advisory.  filed has already populated the shared file
+     * image/cache for regular files, so accepting the hint is the complete
+     * observable Linux behavior; it must not fail merely because no extra
+     * readahead action is necessary. */
+    return 0;
+}
 static int64_t lpr_sys_clock_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_clock_nanosleep(a0, a1, a2, a3); }
 static int64_t lpr_sys_openat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_openat(a0, a1, a2, a3); }
 static int64_t lpr_sys_mkdirat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_mkdirat(a0, a1, a2); }
@@ -2614,6 +3325,10 @@ static int64_t lpr_sys_epoll_create1(uint64_t a0, uint64_t a1, uint64_t a2, uint
 static int64_t lpr_sys_utimensat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_utimensat(a0, a1, a2, a3); }
 static int64_t lpr_sys_eventfd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, 0); }
 static int64_t lpr_sys_eventfd2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_eventfd2(a0, a1); }
+static int64_t lpr_sys_inotify_init(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_init1(0); }
+static int64_t lpr_sys_inotify_init1(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_init1(a0); }
+static int64_t lpr_sys_inotify_add_watch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_add_watch(a0, a1, a2); }
+static int64_t lpr_sys_inotify_rm_watch(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_inotify_rm_watch(a0, a1); }
 static int64_t lpr_sys_timerfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_create(a0, a1); }
 static int64_t lpr_sys_timerfd_settime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_timerfd_settime(a0, a1, a2, a3); }
 static int64_t lpr_sys_timerfd_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_gettime(a0, a1); }
@@ -2690,6 +3405,8 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_DUP, "dup", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_dup, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_DUP2, "dup2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_dup2, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_NANOSLEEP, "nanosleep", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_nanosleep, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_GETITIMER, "getitimer", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getitimer, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SETITIMER, "setitimer", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_setitimer, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETPID, "getpid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getpid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SOCKET, "socket", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_socket, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CONNECT, "connect", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_connect, LPR_SYSCALL_TRACE),
@@ -2749,13 +3466,17 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_GETPPID, "getppid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getppid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETPGRP, "getpgrp", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getpgrp, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SETSID, "setsid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_setsid, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SETRESUID, "setresuid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_setresid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRESUID, "getresuid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getresid, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SETRESGID, "setresgid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_setresid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRESGID, "getresgid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getresid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETPGID, "getpgid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getpgid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETSID, "getsid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_getsid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CAPGET, "capget", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_capget, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CAPSET, "capset", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_capset, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RT_SIGPENDING, "rt_sigpending", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_rt_sigpending, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_RT_SIGTIMEDWAIT, "rt_sigtimedwait", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_rt_sigtimedwait, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_RT_SIGSUSPEND, "rt_sigsuspend", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_rt_sigsuspend, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SIGALTSTACK, "sigaltstack", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_sigaltstack, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_STATFS, "statfs", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_statfs, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FSTATFS, "fstatfs", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fstatfs, 0),
@@ -2768,7 +3489,9 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_FUTEX, "futex", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_futex, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETDENTS64, "getdents64", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_getdents64, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_SET_TID_ADDRESS, "set_tid_address", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_set_tid_address, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FADVISE64, "fadvise64", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_fadvise64, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOCK_GETTIME, "clock_gettime", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_clock_gettime, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_CLOCK_GETRES, "clock_getres", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_clock_getres, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOCK_NANOSLEEP, "clock_nanosleep", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_clock_nanosleep, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_EXIT_GROUP, "exit_group", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_exit_group, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_OPENAT, "openat", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_openat, 0),
@@ -2789,6 +3512,9 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_UNSHARE, "unshare", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_unshare, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UTIMENSAT, "utimensat", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_utimensat, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_PWAIT, "epoll_pwait", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_epoll_pwait, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_INOTIFY_INIT, "inotify_init", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_inotify_init, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_INOTIFY_ADD_WATCH, "inotify_add_watch", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_inotify_add_watch, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_INOTIFY_RM_WATCH, "inotify_rm_watch", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_inotify_rm_watch, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_TIMERFD_CREATE, "timerfd_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_timerfd_create, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_EVENTFD, "eventfd", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_eventfd, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_TIMERFD_SETTIME, "timerfd_settime", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_timerfd_settime, LPR_SYSCALL_TRACE),
@@ -2798,6 +3524,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_EPOLL_CREATE1, "epoll_create1", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_epoll_create1, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_DUP3, "dup3", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_dup3, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_PIPE2, "pipe2", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_pipe2, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_INOTIFY_INIT1, "inotify_init1", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_inotify_init1, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RECVMMSG, "recvmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_recvmmsg, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_PRLIMIT64, "prlimit64", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_prlimit64, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SYNCFS, "syncfs", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_syncfs, 0),
@@ -2837,6 +3564,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGACTION].handler = lpr_sys_rt_sigaction;
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGPROCMASK].handler = lpr_sys_rt_sigprocmask;
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGPENDING].handler = lpr_sys_rt_sigpending;
+    lpr_syscall_table[LPR_LINUX_SYS_RT_SIGTIMEDWAIT].handler = lpr_sys_rt_sigtimedwait;
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGRETURN].handler = lpr_sys_rt_sigreturn;
     lpr_syscall_table[LPR_LINUX_SYS_IOCTL].handler = lpr_sys_ioctl;
     lpr_syscall_table[LPR_LINUX_SYS_PREAD64].handler = lpr_sys_pread64;
@@ -2848,6 +3576,8 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_DUP].handler = lpr_sys_dup;
     lpr_syscall_table[LPR_LINUX_SYS_DUP2].handler = lpr_sys_dup2;
     lpr_syscall_table[LPR_LINUX_SYS_NANOSLEEP].handler = lpr_sys_nanosleep;
+    lpr_syscall_table[LPR_LINUX_SYS_GETITIMER].handler = lpr_sys_getitimer;
+    lpr_syscall_table[LPR_LINUX_SYS_SETITIMER].handler = lpr_sys_setitimer;
     lpr_syscall_table[LPR_LINUX_SYS_GETPID].handler = lpr_sys_getpid;
     lpr_syscall_table[LPR_LINUX_SYS_SOCKET].handler = lpr_sys_socket;
     lpr_syscall_table[LPR_LINUX_SYS_CONNECT].handler = lpr_sys_connect;
@@ -2907,12 +3637,15 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_GETPPID].handler = lpr_sys_getppid;
     lpr_syscall_table[LPR_LINUX_SYS_GETPGRP].handler = lpr_sys_getpgrp;
     lpr_syscall_table[LPR_LINUX_SYS_SETSID].handler = lpr_sys_setsid;
+    lpr_syscall_table[LPR_LINUX_SYS_SETRESUID].handler = lpr_sys_setresid;
     lpr_syscall_table[LPR_LINUX_SYS_GETRESUID].handler = lpr_sys_getresid;
+    lpr_syscall_table[LPR_LINUX_SYS_SETRESGID].handler = lpr_sys_setresid;
     lpr_syscall_table[LPR_LINUX_SYS_GETRESGID].handler = lpr_sys_getresid;
     lpr_syscall_table[LPR_LINUX_SYS_GETPGID].handler = lpr_sys_getpgid;
     lpr_syscall_table[LPR_LINUX_SYS_GETSID].handler = lpr_sys_getsid;
     lpr_syscall_table[LPR_LINUX_SYS_CAPGET].handler = lpr_sys_capget;
     lpr_syscall_table[LPR_LINUX_SYS_CAPSET].handler = lpr_sys_capset;
+    lpr_syscall_table[LPR_LINUX_SYS_RT_SIGSUSPEND].handler = lpr_sys_rt_sigsuspend;
     lpr_syscall_table[LPR_LINUX_SYS_SIGALTSTACK].handler = lpr_sys_sigaltstack;
     lpr_syscall_table[LPR_LINUX_SYS_STATFS].handler = lpr_sys_statfs;
     lpr_syscall_table[LPR_LINUX_SYS_FSTATFS].handler = lpr_sys_fstatfs;
@@ -2925,7 +3658,9 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_FUTEX].handler = lpr_sys_futex;
     lpr_syscall_table[LPR_LINUX_SYS_GETDENTS64].handler = lpr_sys_getdents64;
     lpr_syscall_table[LPR_LINUX_SYS_SET_TID_ADDRESS].handler = lpr_sys_set_tid_address;
+    lpr_syscall_table[LPR_LINUX_SYS_FADVISE64].handler = lpr_sys_fadvise64;
     lpr_syscall_table[LPR_LINUX_SYS_CLOCK_GETTIME].handler = lpr_sys_clock_gettime;
+    lpr_syscall_table[LPR_LINUX_SYS_CLOCK_GETRES].handler = lpr_sys_clock_getres;
     lpr_syscall_table[LPR_LINUX_SYS_CLOCK_NANOSLEEP].handler = lpr_sys_clock_nanosleep;
     lpr_syscall_table[LPR_LINUX_SYS_EXIT_GROUP].handler = lpr_sys_exit_group;
     lpr_syscall_table[LPR_LINUX_SYS_OPENAT].handler = lpr_sys_openat;
@@ -2946,6 +3681,9 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_UNSHARE].handler = lpr_sys_unshare;
     lpr_syscall_table[LPR_LINUX_SYS_UTIMENSAT].handler = lpr_sys_utimensat;
     lpr_syscall_table[LPR_LINUX_SYS_EPOLL_PWAIT].handler = lpr_sys_epoll_pwait;
+    lpr_syscall_table[LPR_LINUX_SYS_INOTIFY_INIT].handler = lpr_sys_inotify_init;
+    lpr_syscall_table[LPR_LINUX_SYS_INOTIFY_ADD_WATCH].handler = lpr_sys_inotify_add_watch;
+    lpr_syscall_table[LPR_LINUX_SYS_INOTIFY_RM_WATCH].handler = lpr_sys_inotify_rm_watch;
     lpr_syscall_table[LPR_LINUX_SYS_TIMERFD_CREATE].handler = lpr_sys_timerfd_create;
     lpr_syscall_table[LPR_LINUX_SYS_EVENTFD].handler = lpr_sys_eventfd;
     lpr_syscall_table[LPR_LINUX_SYS_TIMERFD_SETTIME].handler = lpr_sys_timerfd_settime;
@@ -2955,6 +3693,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_EPOLL_CREATE1].handler = lpr_sys_epoll_create1;
     lpr_syscall_table[LPR_LINUX_SYS_DUP3].handler = lpr_sys_dup3;
     lpr_syscall_table[LPR_LINUX_SYS_PIPE2].handler = lpr_sys_pipe2;
+    lpr_syscall_table[LPR_LINUX_SYS_INOTIFY_INIT1].handler = lpr_sys_inotify_init1;
     lpr_syscall_table[LPR_LINUX_SYS_RECVMMSG].handler = lpr_sys_recvmmsg;
     lpr_syscall_table[LPR_LINUX_SYS_PRLIMIT64].handler = lpr_sys_prlimit64;
     lpr_syscall_table[LPR_LINUX_SYS_SYNCFS].handler = lpr_sys_syncfs;
@@ -3114,6 +3853,21 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     }
     uint64_t cycles = 0;
     int64_t result = 0;
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+    const int dbus_wait_diag =
+        __atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&
+        lpr_dbus_wait_diag_syscall(nr);
+    struct pachaos_timespec dbus_wait_started;
+    lpr_memset(&dbus_wait_started, 0, sizeof(dbus_wait_started));
+    if (dbus_wait_diag)
+        (void)lpr_pacha_clock_gettime(
+            LPR_LINUX_CLOCK_MONOTONIC, &dbus_wait_started);
+#if defined(LPR_WAIT_ENTRY_DIAG) && LPR_WAIT_ENTRY_DIAG
+    const int wait_entry_diag = lpr_wait_entry_diag_syscall(nr, a1);
+    if (wait_entry_diag)
+        lpr_wait_entry_diag_log("enter", nr, a0, a1, a2, a3, a4, 0);
+#endif
+#endif
     for (;;) {
         const uint64_t start_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
         result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5);
@@ -3133,6 +3887,31 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         // A spurious wake or an ignored synthetic signal leaves no native
         // frame to deliver, so restart the syscall transparently.
     }
+#if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
+#if defined(LPR_WAIT_ENTRY_DIAG) && LPR_WAIT_ENTRY_DIAG
+    if (wait_entry_diag)
+        lpr_wait_entry_diag_log("exit", nr, a0, a1, a2, a3, a4, result);
+#endif
+    if (dbus_wait_diag) {
+        struct pachaos_timespec dbus_wait_finished;
+        lpr_memset(&dbus_wait_finished, 0, sizeof(dbus_wait_finished));
+        if (lpr_pacha_clock_gettime(
+                LPR_LINUX_CLOCK_MONOTONIC, &dbus_wait_finished) == 0 &&
+            lpr_timespec_less_equal(
+                &dbus_wait_started, &dbus_wait_finished))
+        {
+            struct pachaos_timespec elapsed;
+            lpr_timespec_subtract(
+                &dbus_wait_finished, &dbus_wait_started, &elapsed);
+            const uint64_t elapsed_ns =
+                elapsed.tv_sec <= UINT64_MAX / 1000000000u ?
+                elapsed.tv_sec * 1000000000u + elapsed.tv_nsec :
+                UINT64_MAX;
+            lpr_dbus_wait_diag_log(
+                nr, a0, a1, a2, a3, result, elapsed_ns);
+        }
+    }
+#endif
     if (trace_metrics) {
         lpr_trace_syscall_record(nr, cycles, result);
     }
@@ -3157,13 +3936,13 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
             nr, a0, a1, result);
     }
 #endif
-    const int64_t post_signal_status =
-        lpr_linux_dispatch_pending_signals_with_result(result);
+    /* The syscall has completed.  A failure while translating a subsequently
+     * pending Linux signal into a native signal must leave that signal queued;
+     * it is not the result of the completed Linux syscall. */
+    (void)lpr_linux_dispatch_pending_signals_with_result(result);
     if (result == -LPR_LINUX_ENOSYS) {
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);
     }
-    const int64_t final_result =
-        post_signal_status != 0 ? post_signal_status : result;
-    lpr_linux_deliver_native_pending_frame(final_result);
-    return final_result;
+    lpr_linux_deliver_native_pending_frame(result);
+    return result;
 }

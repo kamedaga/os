@@ -40,6 +40,11 @@ enum {
 
     TERMD_F_MASTER = 1u << 0,
     TERMD_F_SLAVE = 1u << 1,
+
+    /* Linux TIOCGPTPEER returns a process-local fd.  Across the termd
+     * boundary its successful result is instead a termd handle which LPR
+     * materializes as a Linux-visible fd. */
+    TERMD_IOCTL_TIOCGPTPEER = 0x5441u,
 };
 
 typedef struct termd_tty_context {

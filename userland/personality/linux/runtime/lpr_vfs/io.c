@@ -289,6 +289,9 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
         return lpr_tty_io(TERMD_OP_HANDLE_READ, fd, buf, count);
     case LPR_FD_OPS_EVENT: {
         lpr_event_backend_t *event = pin->state;
+        if (event->subtype == LPR_EVENT_BACKEND_INOTIFY) {
+            return lpr_linux_inotify_read(fd, buf, count);
+        }
         if (event->subtype == LPR_EVENT_BACKEND_SIGNALFD) {
             return lpr_linux_signalfd_read(fd, buf, count);
         }
@@ -311,34 +314,51 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
                 event->notify_pending, count);
         }
 #endif
-        while (event->counter == 0) {
-            if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
-                return -LPR_LINUX_EAGAIN;
-            lpr_wait_graph_t graph;
-            lpr_wait_deadline_t deadline;
-            lpr_wait_graph_init(&graph);
-            int64_t wait_status = lpr_wait_graph_add_fd(
-                &graph, fd, 0x0001u);
-            if (wait_status == 0)
-                wait_status = lpr_wait_deadline_init(&deadline, -1);
-            if (wait_status == 0)
-                wait_status = lpr_wait_graph_block(&graph, &deadline);
-            if (wait_status != 0) return wait_status;
+        uint64_t consumed = 0;
+        for (;;) {
+            uint64_t counter = __atomic_load_n(
+                &event->counter, __ATOMIC_ACQUIRE);
+            while (counter == 0) {
+                if ((event->flags & LPR_LINUX_O_NONBLOCK) != 0)
+                    return -LPR_LINUX_EAGAIN;
+                lpr_wait_graph_t graph;
+                lpr_wait_deadline_t deadline;
+                lpr_wait_graph_init(&graph);
+                int64_t wait_status = lpr_wait_graph_add_fd(
+                    &graph, fd, 0x0001u);
+                if (wait_status == 0)
+                    wait_status = lpr_wait_deadline_init(&deadline, -1);
+                if (wait_status == 0)
+                    wait_status = lpr_wait_graph_block(&graph, &deadline);
+                if (wait_status != 0) return wait_status;
+                counter = __atomic_load_n(
+                    &event->counter, __ATOMIC_ACQUIRE);
+            }
+            const uint64_t next =
+                (event->reserved1 & LPR_LINUX_EFD_SEMAPHORE) != 0 ?
+                    counter - 1u : 0u;
+            if (__atomic_compare_exchange_n(
+                    &event->counter,
+                    &counter,
+                    next,
+                    0,
+                    __ATOMIC_ACQ_REL,
+                    __ATOMIC_ACQUIRE))
+            {
+                consumed =
+                    (event->reserved1 & LPR_LINUX_EFD_SEMAPHORE) != 0 ?
+                        1u : counter;
+                break;
+            }
         }
-        if ((event->reserved1 & LPR_LINUX_EFD_SEMAPHORE) != 0) {
-            *(uint64_t *)(uintptr_t)buf = 1;
-            event->counter--;
-        } else {
-            *(uint64_t *)(uintptr_t)buf = event->counter;
-            event->counter = 0;
-        }
+        *(uint64_t *)(uintptr_t)buf = consumed;
         lpr_event_backend_notify(event);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
         if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
             lpr_glycin_diag_event(
                 "event.read.exit", fd, event->counter,
                 event->notify_pending,
-                (int64_t)*(uint64_t *)(uintptr_t)buf);
+                (int64_t)consumed);
         }
 #endif
         return (int64_t)sizeof(uint64_t);
@@ -360,9 +380,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
                 (uint64_t)(uint32_t)pipe->native.raw,
                 buf,
                 count);
-            if (n >= 0) {
-                return n;
-            }
+            if (n >= 0) return n;
             const int64_t err = lpr_pacha_status_to_errno(n);
             if (err != -LPR_LINUX_EAGAIN ||
                 (pipe->flags & LPR_LINUX_O_NONBLOCK) != 0)
@@ -477,7 +495,8 @@ int64_t lpr_backend_readv(
             (const lpr_event_backend_t *)pin->state;
         if (event->subtype != LPR_EVENT_BACKEND_EVENTFD &&
             (event->subtype != LPR_EVENT_BACKEND_TIMERFD || !event->active) &&
-            (event->subtype != LPR_EVENT_BACKEND_SIGNALFD || !event->active))
+            (event->subtype != LPR_EVENT_BACKEND_SIGNALFD || !event->active) &&
+            (event->subtype != LPR_EVENT_BACKEND_INOTIFY || !event->active))
         {
             return -LPR_LINUX_EBADF;
         }

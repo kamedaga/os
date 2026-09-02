@@ -15,6 +15,8 @@ const user_copy = @import("user_copy.zig");
 const user_vm = @import("memory/user_vm.zig");
 const scheduler = @import("scheduler.zig").connection;
 const smp = @import("smp.zig");
+const syscall_numbers = @import("syscall/numbers.zig");
+const syscalls = @import("syscalls.zig");
 
 const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
@@ -752,6 +754,20 @@ fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
     frame.rsp = signal_frame_va - process_abi.signal_runtime_stack_size;
 }
 
+fn deliverExpiredProcessSignalTimers(now_tick: u64) void {
+    while (scheduler.takeExpiredProcessSignalTimer(now_tick)) |expired| {
+        const delivery = scheduler.deliverSignal(
+            expired.principal,
+            expired.signo,
+            syscall_numbers.syscall_err_not_ready,
+        ) orelse {
+            scheduler.clearProcessSignalTimer(expired.principal);
+            continue;
+        };
+        _ = delivery;
+    }
+}
+
 pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     lapic.eoiLegacyPicMaster();
     lapic.eoi();
@@ -781,6 +797,8 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count));
     scheduler.lapic_tick_count +%= 1;
     if (!kernel_runtime.kernel_state_ready) return;
+    deliverExpiredProcessSignalTimers(scheduler.lapic_tick_count);
+    syscalls.completePendingIrqFdWaitersFromInterrupt();
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
     if (!user_mode) return;
     if (boot_static.scheduler_slice_ticks != 0) {
@@ -801,23 +819,19 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
     _ = frame;
     if (!kernel_runtime.kernel_state_ready) return;
     const route = pci.interruptRouteForVector(active_vector) orelse return;
-    var wake_owners: [16]kernel.PrincipalId = undefined;
-    const wake_count = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(
+    var ignored_wake_owners: [16]kernel.PrincipalId = undefined;
+    _ = kernel_runtime.kernel_state_global.recordDeviceInterruptEvent(
         route.device,
         route.entry,
-        wake_owners[0..],
+        ignored_wake_owners[0..],
     );
-    var i: usize = 0;
-    while (i < wake_count) : (i += 1) {
-        scheduler.wakeMailboxWaiter(wake_owners[i]);
-    }
+    syscalls.completePendingIrqFdWaitersFromInterrupt();
 }
 
 pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
     _ = frame;
     user_copy.acknowledgePendingTlbShootdown();
     lapic.eoi();
-    smp.acknowledgeWakeIpi();
 }
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
@@ -828,13 +842,19 @@ pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void
     // Let kernel work return normally; the lifecycle owner will send another
     // IPI and quiesce the thread once it reaches a ring-3 boundary.
     if ((frame.cs & 3) != 3) return;
-    if (!scheduler.quiesceStoppedCurrentUserThread(frame)) return;
-    if (!scheduler.isBootstrapSchedulerCpu()) {
-        smp.returnCurrentApToIdleFromInterrupt();
+    if (scheduler.quiesceStoppedCurrentUserThread(frame)) {
+        if (!scheduler.isBootstrapSchedulerCpu()) {
+            smp.returnCurrentApToIdleFromInterrupt();
+        }
+        while (!scheduler.loadNextReadyThread(frame)) {
+            asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
+        }
+        return;
     }
-    while (!scheduler.loadNextReadyThread(frame)) {
-        asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
-    }
+    // A normal remote wake reaches this vector with a runnable entity already
+    // queued on this CPU.  Switch at the interrupt boundary instead of merely
+    // returning to an unrelated user thread and waiting for its timeslice.
+    _ = scheduler.handoffToBestReadyThreadForWakeIpi(frame);
 }
 
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {

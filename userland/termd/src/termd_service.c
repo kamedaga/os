@@ -393,6 +393,15 @@ static int termd_dispatch_tty(
         if (payload == 0) {
             return TERMD_ERR_INVAL;
         }
+        if (((const termd_ioctl_request_t *)payload)->request ==
+            TERMD_IOCTL_TIOCGPTPEER)
+        {
+            return termd_linux_tty_island_open_peer(
+                tty,
+                (const termd_ioctl_request_t *)payload,
+                notify_fd,
+                out_result);
+        }
         return termd_linux_tty_island_ioctl(tty, (termd_ioctl_request_t *)payload);
     default:
         return TERMD_ERR_INVAL;
@@ -551,7 +560,12 @@ int termd_service_dispatch_request(
     const int open_op = header.op == TERMD_OP_OPEN_PTMX ||
         header.op == TERMD_OP_OPEN_PTS || header.op == TERMD_OP_OPEN_HVC ||
         header.op == TERMD_OP_OPEN_CTTY;
-    const int retains_attachment = open_op || header.op == TERMD_OP_HANDLE_DUP;
+    const int peer_open_op = header.op == TERMD_OP_HANDLE_IOCTL &&
+        payload != NULL &&
+        ((const termd_ioctl_request_t *)payload)->request ==
+            TERMD_IOCTL_TIOCGPTPEER;
+    const int retains_attachment =
+        open_op || peer_open_op || header.op == TERMD_OP_HANDLE_DUP;
     const int notify_fd = retains_attachment && request->fd_count == 3 && fds[1].fd >= 16 ?
         (int)(uint32_t)fds[1].fd : -1;
     uint64_t result = 0;

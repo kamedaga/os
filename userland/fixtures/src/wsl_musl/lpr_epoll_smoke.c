@@ -1,6 +1,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -382,6 +385,96 @@ static int nested_smoke(void)
     return 1;
 }
 
+enum {
+    EVENTFD_CONTENTION_WRITERS = 2,
+    EVENTFD_CONTENTION_WRITES = 20000,
+};
+
+struct eventfd_contention_writer {
+    int fd;
+    int failed;
+};
+
+static void *eventfd_contention_write(void *opaque)
+{
+    struct eventfd_contention_writer *writer = opaque;
+    const uint64_t one = 1;
+    for (unsigned i = 0; i < EVENTFD_CONTENTION_WRITES; ++i) {
+        if (write(writer->fd, &one, sizeof(one)) != (ssize_t)sizeof(one)) {
+            writer->failed = 1;
+            return NULL;
+        }
+        if ((i & 31u) == 0u) sched_yield();
+    }
+    return NULL;
+}
+
+static int eventfd_contention_smoke(void)
+{
+    const int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (efd < 0) return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:create\n");
+
+    pthread_t threads[EVENTFD_CONTENTION_WRITERS];
+    struct eventfd_contention_writer writers[EVENTFD_CONTENTION_WRITERS];
+    memset(threads, 0, sizeof(threads));
+    memset(writers, 0, sizeof(writers));
+    for (unsigned i = 0; i < EVENTFD_CONTENTION_WRITERS; ++i) {
+        writers[i].fd = efd;
+        if (pthread_create(
+                &threads[i], NULL, eventfd_contention_write, &writers[i]) != 0)
+        {
+            close(efd);
+            return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:pthread-create\n");
+        }
+    }
+
+    const uint64_t expected =
+        EVENTFD_CONTENTION_WRITERS * (uint64_t)EVENTFD_CONTENTION_WRITES;
+    uint64_t observed = 0;
+    unsigned idle_timeouts = 0;
+    while (observed < expected) {
+        struct pollfd pollfd = {
+            .fd = efd,
+            .events = POLLIN,
+        };
+        const int ready = poll(&pollfd, 1, 100);
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready < 0) {
+            close(efd);
+            return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:poll\n");
+        }
+        if (ready == 0) {
+            if (++idle_timeouts >= 50u) {
+                close(efd);
+                return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:lost-wake\n");
+            }
+            continue;
+        }
+        idle_timeouts = 0;
+        uint64_t value = 0;
+        if (read(efd, &value, sizeof(value)) != (ssize_t)sizeof(value)) {
+            if (errno == EAGAIN) continue;
+            close(efd);
+            return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:read\n");
+        }
+        if (value == 0 || observed > expected - value) {
+            close(efd);
+            return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:counter\n");
+        }
+        observed += value;
+    }
+
+    for (unsigned i = 0; i < EVENTFD_CONTENTION_WRITERS; ++i) {
+        if (pthread_join(threads[i], NULL) != 0 || writers[i].failed) {
+            close(efd);
+            return fail("LPR_EPOLL_EVENTFD_CONTENTION=BAD:writer\n");
+        }
+    }
+    close(efd);
+    emit("LPR_EPOLL_EVENTFD_CONTENTION=OK\n");
+    return 1;
+}
+
 static int fork_infinite_smoke(void)
 {
     int pipefd[2] = {-1, -1};
@@ -469,7 +562,8 @@ int main(int argc, char **argv)
         return 1;
     }
     emit("LPR_EPOLL_START\n");
-    if (!mixed_level_ctl_smoke() ||
+    if (!eventfd_contention_smoke() ||
+        !mixed_level_ctl_smoke() ||
         !edge_triggered_smoke() ||
         !timeout_dup_close_smoke() ||
         !hup_smoke() ||

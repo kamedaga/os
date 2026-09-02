@@ -158,31 +158,26 @@ int64_t lpr_linux_eventfd2(uint64_t initval, uint64_t flags)
 void lpr_event_backend_notify(lpr_event_backend_t *event)
 {
     if (event == 0 || event->notify_fd.raw < 16) return;
-    const uint8_t pending = __atomic_exchange_n(
-        &event->notify_pending, 1u, __ATOMIC_ACQ_REL);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
         lpr_glycin_diag_event(
-            "event.notify.enter",
+            "event.notify.send.enter",
             (uint64_t)(uintptr_t)event,
             __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
-            pending,
+            __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
             event->notify_fd.raw);
     }
 #endif
-    if (pending != 0)
-        return;
     const struct pacha_ipc_msg message = {0};
     const int64_t status = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_SEND,
         (uint64_t)(uint32_t)event->notify_fd.raw,
         (uint64_t)(uintptr_t)&message);
-    if (status != 0)
-        __atomic_store_n(&event->notify_pending, 0u, __ATOMIC_RELEASE);
+    (void)status;
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
         lpr_glycin_diag_event(
-            "event.notify.exit",
+            "event.notify.send.exit",
             (uint64_t)(uintptr_t)event,
             __atomic_load_n(&event->counter, __ATOMIC_ACQUIRE),
             __atomic_load_n(&event->notify_pending, __ATOMIC_ACQUIRE),
@@ -211,8 +206,18 @@ void lpr_eventfd_drain_wait(uint64_t fd)
             event->wait_fd.raw);
     }
 #endif
-    __atomic_store_n(&event->notify_pending, 0u, __ATOMIC_RELEASE);
-    lpr_native_wait_drain(event->wait_fd.raw);
+    /* Readability is owned by the native channel queue, while the Linux
+     * counter/deadline is the durable logical state.  Do not gate receives on
+     * a second userspace state machine: several waiters can be released by one
+     * channel message, and a stale waiter may otherwise consume a producer's
+     * pre-send state transition without consuming the message itself.
+     * Consume at most one token so a continuously active producer cannot keep
+     * this thread here instead of returning it to the logical-state scan. */
+    struct pacha_ipc_msg message = {0};
+    (void)lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_IPC_RECV,
+        (uint64_t)(uint32_t)event->wait_fd.raw,
+        (uint64_t)(uintptr_t)&message);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
         lpr_glycin_diag_event(

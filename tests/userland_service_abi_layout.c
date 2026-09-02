@@ -94,11 +94,14 @@ int main(void)
     failures += expect(
         LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
         LPRS_OP_PROCESS_GET_STATE == 3 && LPRS_OP_PROCESS_LIST == 4 &&
-        LPRS_OP_PROCESS_GETSID == 15 &&
-        LPRS_OP_PROCESS_SET_PDEATHSIG == 16 &&
-        LPRS_OP_PROCESS_GET_PDEATHSIG == 17 &&
-        LPRS_OP_SIGNAL_KILL == 18 && LPRS_OP_CWD_GET == 20 &&
-        LPRS_OP_DIAG_ERROR_GET == 23,
+        LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN == 9 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL == 10 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_DONE == 11 &&
+        LPRS_OP_PROCESS_GETSID == 16 &&
+        LPRS_OP_PROCESS_SET_PDEATHSIG == 17 &&
+        LPRS_OP_PROCESS_GET_PDEATHSIG == 18 &&
+        LPRS_OP_SIGNAL_KILL == 19 && LPRS_OP_CWD_GET == 21 &&
+        LPRS_OP_DIAG_ERROR_GET == 24,
         "lpr supervisor process, signal, cwd, and diagnostic ops are contiguous");
     failures += expect(
         sizeof(lprs_process_list_t) == LPRS_PAYLOAD_BYTES,
@@ -138,7 +141,8 @@ int main(void)
         NETD_OP_HELLO == 0 && NETD_OP_PAGE_ATTACH == 1 &&
         NETD_OP_SOCKET == 2 && NETD_OP_SOCKETPAIR == 3 &&
         NETD_OP_SEND == 6 && NETD_OP_POLL == 8 && NETD_OP_BIND == 9 &&
-        NETD_OP_LISTEN == 10 && NETD_OP_ACCEPT == 11 && NETD_OP_DUP == 14,
+        NETD_OP_LISTEN == 10 && NETD_OP_ACCEPT == 11 &&
+        NETD_OP_DUP == 14 && NETD_OP_UNIX_NAME == 15,
         "netd ops are contiguous from zero");
     failures += expect(
         TERMD_OP_HELLO == 0 && TERMD_OP_OPEN_PTMX == 1 &&

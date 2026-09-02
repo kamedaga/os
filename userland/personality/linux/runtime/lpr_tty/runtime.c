@@ -1,5 +1,6 @@
 #include "../lpr_filed_internal.h"
 
+
 static const char *lpr_take_boot_ctty_env(void)
 {
     if (lpr_load_manifest() &&
@@ -140,6 +141,9 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         return -LPR_LINUX_EBADF;
     }
     request = (uint32_t)request;
+    if (request == LPR_LINUX_TIOCGPTPEER) {
+        return lpr_tty_open_peer(fd, arg);
+    }
     void *page = 0;
     const int page_fd = lpr_create_tty_wire_page(&page);
     if (page_fd < 0) {
@@ -177,6 +181,7 @@ int64_t lpr_tty_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         break;
     case LPR_LINUX_TIOCSPGRP:
     case LPR_LINUX_TIOCSPTLCK:
+    case LPR_LINUX_TIOCPKT:
         if (arg == 0) {
             lpr_destroy_tty_wire_page(page_fd, page);
             return -LPR_LINUX_EFAULT;
@@ -419,6 +424,9 @@ int lpr_linux_pump_tty_signals(void)
 
 uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
 {
+    if (lpr_linux_inotify_active(fd)) {
+        return lpr_linux_inotify_poll_events(fd, events);
+    }
     if (lpr_linux_timerfd_active(fd)) {
         return lpr_linux_timerfd_poll_events(fd, events);
     }
@@ -429,18 +437,20 @@ uint32_t lpr_linux_eventfd_poll_events(uint64_t fd, uint32_t events)
         return 0;
     }
     const lpr_event_backend_t *event = lpr_event_backend(fd);
+    const uint64_t counter = __atomic_load_n(
+        &event->counter, __ATOMIC_ACQUIRE);
     uint32_t revents = 0;
-    if ((events & 0x0001u) != 0 && event->counter != 0) {
+    if ((events & 0x0001u) != 0 && counter != 0) {
         revents |= 0x0001u;
     }
     if ((events & 0x0004u) != 0 &&
-        event->counter < UINT64_MAX - 1u) {
+        counter < UINT64_MAX - 1u) {
         revents |= 0x0004u;
     }
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (__atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u) {
         lpr_glycin_diag_event(
-            "event.poll", fd, event->counter,
+            "event.poll", fd, counter,
             ((uint64_t)events << 32u) | event->notify_pending,
             revents);
     }
