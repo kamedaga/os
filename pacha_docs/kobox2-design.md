@@ -1,6 +1,6 @@
 # kobox2 の設計思想
 
-> **状態:** repository bootstrap と基本設計が完了。実装は未着手。
+> **状態:** Phase 3 のGPU base、DRM core 26、DRM mode 44、virtgpu 11、AMDGPU 20 command契約を`dev` schemaへ固定済み。
 > 全体の判断基準は [PachaOS の設計思想](./architecture.md) を参照すること。
 > 本文書は既存の [filed VFS design](./filed-vfs-design.md) の記述と一部衝突する。
 > §14 に整理した。
@@ -786,6 +786,7 @@ kobox2 はこれを**反転させます** — process 分離を恒久的な設�
 
 - [PachaOS の設計思想](./architecture.md)
 - [filed VFS design](./filed-vfs-design.md)
+- [kobox2 GPU protocol](../kobox2/docs/gpu-protocol-jp.md)
 - [Userland service ABI](./userland-service-abi.md)
 
 by Claude Opus 5
