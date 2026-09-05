@@ -44,7 +44,7 @@ def main() -> int:
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
             if not sent and any(prompt in output for prompt in PROMPTS):
-                console.sendall(b"bash /cmd/lpr_futex_pingpong_bench.sh 64 3\n")
+                console.sendall(b"bash /cmd/lpr_futex_pingpong_bench.sh 8192 5\n")
                 sent = True
                 output.clear()
             if sent and DONE in output:
