@@ -14,6 +14,7 @@ if [[ ${SKIP_SYNC:-0} != 1 ]]; then
 fi
 
 .artifacts/bin/pacgo qemu-test \
+  --console-shell \
   --cpus 4 \
   --timeout 120s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \

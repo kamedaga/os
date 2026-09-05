@@ -37,13 +37,43 @@ wait_for_xfce() {
   return 1
 }
 
+# One dump after the wait gives a single frame of a moving picture, and three
+# such frames disagreed about which process was stuck.  Sample the interesting
+# ones while the wait is still running so the sequence is visible.
+sample_watched_processes() {
+  local tag=$1 pid comm
+  for pid in /proc/[0-9]*; do
+    pid=${pid#/proc/}
+    comm=$(/bin/busybox cat "/proc/${pid}/comm" 2>/dev/null) || continue
+    case "${comm}" in
+      Xorg|geany|gtk3-demo|xfce4-terminal|xfce4-about|pine2-gtk|thunar|Thunar|dbus-daemon|at-spi-bus-launcher|at-spi2-registryd) ;;
+      *) continue ;;
+    esac
+    printf 'XFCE_APP_SAMPLE at=%s pid=%s comm=%s syscall=%s\n' \
+      "${tag}" "${pid}" "${comm}" \
+      "$(/bin/busybox cat "/proc/${pid}/syscall" 2>/dev/null | /bin/busybox tr -d '\n')"
+  done
+}
+
+request_message_bus_snapshot() {
+  # This peer intentionally does not exist.  unix_socket.c recognizes the
+  # connect path and snapshots without depending on the possibly stalled
+  # session bus to finish a D-Bus handshake.
+  /bin/busybox timeout -k 1 3 /usr/bin/dbus-send \
+    --peer=unix:path=/tmp/.pacha-atspi-snapshot \
+    /org/pacha/Atspi org.pacha.Atspi.Snapshot \
+    >/dev/null 2>&1 || true
+}
+
 find_new_mapped_window() {
   local baseline=$1 class_regex=$2 title_regex=$3 work_prefix=$4
   local attempt line line_lower window window_info properties
+  local attempts=${XFCE_APP_WINDOW_ATTEMPTS:-20}
   mapped_window=
   mapped_pid=
+  mapped_attempt=
 
-  for ((attempt = 0; attempt < 20; ++attempt)); do
+  for ((attempt = 0; attempt < attempts; ++attempt)); do
     window_tree >"${work_prefix}.tree"
     while IFS= read -r line; do
       line_lower=${line,,}
@@ -64,12 +94,19 @@ find_new_mapped_window() {
       )"
 
       mapped_window=${window}
+      mapped_attempt=${attempt}
       if [[ "${properties}" =~ _NET_WM_PID[^=]*=[[:space:]]*([0-9]+) ]]; then
         mapped_pid=${BASH_REMATCH[1]}
       fi
       printf '%s\n' "${properties}" >"${work_prefix}.properties"
       return 0
     done <"${work_prefix}.tree"
+    if (( attempt % 5 == 0 )); then
+      sample_watched_processes "wait-${attempt}"
+    fi
+    if (( attempt == 8 )); then
+      request_message_bus_snapshot
+    fi
     /bin/busybox sleep 1
   done
   return 1
@@ -139,6 +176,35 @@ run_app() {
       title_regex='About the Xfce Desktop Environment'
       /usr/bin/xfce4-about >"${log}" 2>&1 &
       ;;
+    geany)
+      # Not part of the default set: geany ships in no image, so this case
+      # installs it the way a user does and then runs that same binary.  It
+      # covers the report that an apk-installed GUI app hangs while the ones
+      # already in the image do not.
+      command_name=/usr/bin/geany
+      class_regex='geany'
+      title_regex='Geany|untitled'
+      if [[ ! -x /usr/bin/geany ]]; then
+        printf 'XFCE_APP_INSTRUMENT apk-add app=%s iteration=%s\n' \
+          "${app}" "${iteration}"
+        if ! /sbin/apk --no-progress add geany >"${work_prefix}.apk" 2>&1; then
+          printf 'XFCE_APP_RESULT app=%s iteration=%s status=FAIL reason=apk-add\n' \
+            "${app}" "${iteration}"
+          /bin/busybox tail -n 40 "${work_prefix}.apk" 2>/dev/null || true
+          return 1
+        fi
+        printf 'XFCE_APP_INSTRUMENT apk-add-done app=%s iteration=%s\n' \
+          "${app}" "${iteration}"
+      fi
+      # XFCE_APP_GEANY_ENV exists to bisect, not to configure: setting
+      # NO_AT_BRIDGE=1 here answers whether the hang lives in the
+      # accessibility path without pretending that disabling it is a fix.
+      if [[ -n "${XFCE_APP_GEANY_ENV:-}" ]]; then
+        env ${XFCE_APP_GEANY_ENV} /usr/bin/geany >"${log}" 2>&1 &
+      else
+        env -u NO_AT_BRIDGE /usr/bin/geany >"${log}" 2>&1 &
+      fi
+      ;;
     gtk3-demo)
       command_name=/usr/bin/gtk3-demo
       class_regex='gtk3-demo'
@@ -180,9 +246,9 @@ run_app() {
 
   if find_new_mapped_window \
       "${baseline}" "${class_regex}" "${title_regex}" "${work_prefix}"; then
-    printf 'XFCE_APP_RESULT app=%s iteration=%s status=PASS window=%s pid=%s command=%s\n' \
+    printf 'XFCE_APP_RESULT app=%s iteration=%s status=PASS window=%s pid=%s attempt=%s command=%s\n' \
       "${app}" "${iteration}" "${mapped_window}" "${mapped_pid:-unknown}" \
-      "${command_name}"
+      "${mapped_attempt:-unknown}" "${command_name}"
     stop_test_window "${launch_pid}" "${app}" "${close_file}"
     return 0
   fi
@@ -191,6 +257,10 @@ run_app() {
     "${app}" "${iteration}" "${command_name}"
   window_tree | /bin/busybox tail -n 80 || true
   /bin/busybox tail -n 80 "${log}" 2>/dev/null || true
+  # The app is still alive at this point, so record where it is sleeping
+  # before stop_test_window kills it.  Without this the only evidence left is
+  # that no window appeared, which does not say what the app was waiting on.
+  dump_startup_process_tree "app-${app}-no-window"
   stop_test_window "${launch_pid}" "${app}" "${close_file}"
   return 1
 }
@@ -216,7 +286,7 @@ run_x_session() {
   local -a apps=(Thunar pine2-gtk about gtk3-demo terminal)
   if [[ -n "${XFCE_APP_ONLY:-}" ]]; then
     case "${XFCE_APP_ONLY}" in
-      Thunar|pine2-gtk|about|gtk3-demo|terminal)
+      Thunar|pine2-gtk|about|gtk3-demo|terminal|geany)
         apps=("${XFCE_APP_ONLY}")
         ;;
       *)
@@ -278,6 +348,8 @@ launch_xfce() {
 
 run_guest_controller() {
   export XFCE_APP_REPEAT=${XFCE_APP_REPEAT:-1}
+  export XFCE_APP_WINDOW_ATTEMPTS=${XFCE_APP_WINDOW_ATTEMPTS:-20}
+  export XFCE_APP_GEANY_ENV=${XFCE_APP_GEANY_ENV:-}
   export HOME=/root
   export USER=root
   export LOGNAME=root
@@ -301,9 +373,23 @@ run_guest_controller() {
 }
 
 dump_startup_process_tree() {
-  local reason=${1:-unknown}
+  local reason=${1:-unknown} pid state
   printf 'XFCE_STARTUP_PROCESS_TREE_BEGIN reason=%s\n' "${reason}"
-  /bin/busybox ps -o pid,ppid,stat,wchan,etime,args 2>&1 || true
+  # busybox ps rejects the whole -o list if one field is unsupported, and it
+  # has no wchan, so asking for one printed nothing at all.  Read the blocking
+  # state straight out of procfs instead, which is what the tree is for.
+  /bin/busybox ps -o pid,ppid,stat,etime,args 2>&1 || true
+  for pid in /proc/[0-9]*; do
+    pid=${pid#/proc/}
+    state=$(/bin/busybox sed -n 's/^State:[[:space:]]*//p' "/proc/${pid}/status" 2>/dev/null)
+    [[ -n "${state}" ]] || continue
+    printf 'XFCE_STARTUP_PROC pid=%s state=%s wchan=%s syscall=%s comm=%s\n' \
+      "${pid}" \
+      "${state}" \
+      "$(/bin/busybox cat "/proc/${pid}/wchan" 2>/dev/null || printf '?')" \
+      "$(/bin/busybox cat "/proc/${pid}/syscall" 2>/dev/null || printf '?')" \
+      "$(/bin/busybox cat "/proc/${pid}/comm" 2>/dev/null || printf '?')"
+  done
   printf 'XFCE_STARTUP_PROCESS_TREE_END reason=%s\n' "${reason}"
 }
 
@@ -369,7 +455,7 @@ run_host() {
     '')
       expected_apps=(Thunar pine2-gtk about gtk3-demo terminal)
       ;;
-    Thunar|pine2-gtk|about|gtk3-demo|terminal)
+    Thunar|pine2-gtk|about|gtk3-demo|terminal|geany)
       expected_apps=("${selected_app}")
       ;;
     *)
@@ -396,7 +482,7 @@ run_host() {
     --timeout "${timeout_seconds}s" \
     --graphics 2d \
     --input-profile keyboard-tablet \
-    --send "XFCE_APP_REPEAT=${repeat} XFCE_APP_ONLY=${selected_app} /bin/bash ${script_guest} --guest-controller" \
+    --send "XFCE_APP_REPEAT=${repeat} XFCE_APP_ONLY=${selected_app} XFCE_APP_WINDOW_ATTEMPTS=${XFCE_APP_WINDOW_ATTEMPTS:-20} XFCE_APP_GEANY_ENV=${XFCE_APP_GEANY_ENV:-} /bin/bash ${script_guest} --guest-controller" \
     "${expect_args[@]}" \
     --expect 'XFCE_APP_ACCEPTANCE_DONE status='
 

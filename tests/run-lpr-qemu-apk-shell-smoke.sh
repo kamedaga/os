@@ -7,10 +7,34 @@ cd "$repo_root"
 log_dir=.artifacts/test-results/apk-shell-smoke
 mkdir -p "$log_dir" .artifacts/tmp
 
+# --console-shell syncs the entire ext4 image on entry AND exit.  Select
+# the profile once for both boots; no host sync may intervene before fsck.
+profile=.artifacts/seed0root_boot_profile.txt
+profile_backup=$(mktemp .artifacts/tmp/apk-shell-profile.XXXXXX)
+if [[ -f $profile ]]; then
+  cp "$profile" "$profile_backup"
+fi
+recovery_image=
+restore_profile() {
+  local status=$?
+  cp "$profile_backup" "$profile"
+  rm -f "$profile_backup"
+  [[ -z $recovery_image ]] || rm -f "$recovery_image"
+  # Restore host artifacts only.  Preserve the tested disk (also on failure);
+  # the next explicit rootfs sync restores its normal boot profile.
+  .artifacts/bin/pacgo build userland seed0root_boot_profile --no-rootfs || status=1
+  exit "$status"
+}
+trap restore_profile EXIT
+printf 'console-shell\n' > "$profile"
+
 if [[ ${SKIP_SYNC:-0} != 1 ]]; then
   rm -f "$repo_root/.artifacts/disk.img"
   .artifacts/bin/pacgo sync rootfs --force
   .artifacts/bin/pacgo sync bootfs --force
+else
+  # As with --console-shell, even SKIP_SYNC must activate the shell profile.
+  .artifacts/bin/pacgo build userland seed0root_boot_profile
 fi
 
 .artifacts/bin/pacgo qemu-test \
@@ -36,11 +60,14 @@ cp "$python_log" "$log_dir/mutation-console.log"
 # The mutation phase ends with wget/fastfetch installed and nano removed.
 # Start a new VM against the same ext4 rootfs to prove that both package DB
 # state and the installed files survived sync plus cold boot.
+# The console echoes what is sent, so a marker written literally in --send
+# matches its own echo and passes before the command has run.  Splitting the
+# string keeps the echo from matching while the printed result still does.
 .artifacts/bin/pacgo qemu-test \
   --cpus 4 \
   --timeout 60s \
   --boot-marker '[termd] linux tty hvc open ready index=0 handle=' \
-  --send 'if apk info -e wget >/dev/null 2>&1 && apk info -e fastfetch >/dev/null 2>&1 && ! apk info -e nano >/dev/null 2>&1 && test -x /usr/bin/wget && test -x /usr/bin/fastfetch; then sync && echo APK_SHELL_PERSISTENCE=OK; else echo APK_SHELL_PERSISTENCE=FAIL; fi' \
+  --send 'if apk info -e wget >/dev/null 2>&1 && apk info -e fastfetch >/dev/null 2>&1 && ! apk info -e nano >/dev/null 2>&1 && test -x /usr/bin/wget && test -x /usr/bin/fastfetch; then sync && echo APK_SHELL"_PERSISTENCE=OK"; else echo APK_SHELL"_PERSISTENCE=FAIL"; fi' \
   --expect 'APK_SHELL_PERSISTENCE=OK'
 
 if rg -q "$fault_pattern" "$serial"; then
@@ -62,7 +89,6 @@ if [[ -z $rootfs_start || -z $rootfs_size ]]; then
   exit 1
 fi
 recovery_image=$(mktemp .artifacts/tmp/apk-shell-recovery.XXXXXX.ext4)
-trap 'rm -f "$recovery_image"' EXIT
 dd if=.artifacts/disk.img of="$recovery_image" bs=512 \
   skip="$rootfs_start" count="$rootfs_size" conv=sparse status=none
 
