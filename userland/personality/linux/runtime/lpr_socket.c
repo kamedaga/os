@@ -766,7 +766,11 @@ static int64_t lpr_netd_page_attach(int page_fd)
         PACHA_FD_RIGHT_MAP_WRITE;
     attach_fds[1].fd = pair[1];
     attach_fds[1].rights = channel_rights;
-    attach_fds[1].transfer_flags = PACHA_IPC_TRANSFER_MOVE;
+    /* Retain this sender FD until the close below. MOVE would release its
+     * number during IPC_CALL, allowing another thread to reuse it for a
+     * reply or socket before attachment setup closes it again.
+     */
+    attach_fds[1].transfer_flags = 0;
 
     uint64_t attachment_id = 0;
     const int64_t status = lpr_netd_exchange(

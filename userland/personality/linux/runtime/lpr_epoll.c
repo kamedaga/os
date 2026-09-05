@@ -812,7 +812,8 @@ int64_t lpr_epoll_poll_events(uint64_t fd, uint32_t events)
     return ready != 0 && (events & LPR_EPOLLIN) != 0 ? LPR_EPOLLIN : 0;
 }
 
-void lpr_epoll_note_fd_state(uint64_t fd_raw)
+void lpr_epoll_note_fd_state(
+    uint64_t fd_raw, uint32_t io_events, int64_t result)
 {
     if (fd_raw > LPR_LINUX_FD_MAX) return;
     const uint32_t fd = (uint32_t)fd_raw;
@@ -833,7 +834,7 @@ void lpr_epoll_note_fd_state(uint64_t fd_raw)
                     &lpr_control_fd_table.ofds[i]);
                 if (instance == 0) continue;
                 for (uint32_t j = 0; j < instance->count; ++j) {
-                    const lpr_epoll_interest_t *interest =
+                    lpr_epoll_interest_t *interest =
                         &instance->interests[j];
                     if (interest->target_ofd_index == target_ofd_index &&
                         interest->target_generation == target_generation &&
@@ -841,6 +842,14 @@ void lpr_epoll_note_fd_state(uint64_t fd_raw)
                         (interest->state &
                          LPR_EPOLL_STATE_ONESHOT_DISABLED) == 0)
                     {
+                        /* EAGAIN observed this direction empty before the
+                         * following poll. A peer can refill it in between;
+                         * retain that falling edge so the refill is reported.
+                         * Already pending events and other directions survive.
+                         */
+                        if (result == -LPR_LINUX_EAGAIN)
+                            interest->state &= ~(io_events &
+                                (LPR_EPOLLIN | LPR_EPOLLOUT));
                         observed_events |= interest->events |
                             LPR_EPOLLERR | LPR_EPOLLHUP;
                     }
