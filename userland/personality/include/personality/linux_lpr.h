@@ -111,6 +111,23 @@
 #define LPR_LINUX_SYS_STATFS 137ull
 #define LPR_LINUX_SYS_FSTATFS 138ull
 #define LPR_LINUX_SYS_SETPRIORITY 141ull
+
+/* Extended attributes.  The rootfs image carries no xattr store, so these
+ * report the same "filesystem does not support it" answer Linux gives for a
+ * mount without xattr support.  Leaving them unimplemented instead returns
+ * ENOSYS, which apk reports as a hard error while extracting packages. */
+#define LPR_LINUX_SYS_SETXATTR 188ull
+#define LPR_LINUX_SYS_LSETXATTR 189ull
+#define LPR_LINUX_SYS_FSETXATTR 190ull
+#define LPR_LINUX_SYS_GETXATTR 191ull
+#define LPR_LINUX_SYS_LGETXATTR 192ull
+#define LPR_LINUX_SYS_FGETXATTR 193ull
+#define LPR_LINUX_SYS_LISTXATTR 194ull
+#define LPR_LINUX_SYS_LLISTXATTR 195ull
+#define LPR_LINUX_SYS_FLISTXATTR 196ull
+#define LPR_LINUX_SYS_REMOVEXATTR 197ull
+#define LPR_LINUX_SYS_LREMOVEXATTR 198ull
+#define LPR_LINUX_SYS_FREMOVEXATTR 199ull
 #define LPR_LINUX_SYS_SETRLIMIT 160ull
 #define LPR_LINUX_SYS_SYNC 162ull
 #define LPR_LINUX_SYS_ARCH_PRCTL 158ull

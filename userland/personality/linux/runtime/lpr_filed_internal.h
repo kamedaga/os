@@ -408,6 +408,13 @@ typedef struct lpr_process_state {
     uint64_t supervisor_token;
     uint64_t supervisor_pending_child_token;
     int supervisor_enabled;
+    /* This process's slot in the supervisor's shared diagnostic page, or null
+     * when it never attached.  Written by the syscall hooks with plain stores;
+     * nothing else in the runtime may write it.  A forked child inherits both
+     * fields by copy and must clear them, or it would write into its parent's
+     * slot and corrupt the parent's reported state. */
+    struct lprs_diag_slot *diag_slot;
+    int diag_attach_attempted;
     lpr_linux_process_entry_t entries[LPR_LINUX_PROCESS_TABLE_SIZE];
 } lpr_process_state_t;
 
@@ -634,6 +641,8 @@ void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_supervisor_token (lpr_state.process.supervisor_token)
 #define lpr_supervisor_pending_child_token (lpr_state.process.supervisor_pending_child_token)
 #define lpr_supervisor_enabled (lpr_state.process.supervisor_enabled)
+#define lpr_diag_slot (lpr_state.process.diag_slot)
+#define lpr_diag_attach_attempted (lpr_state.process.diag_attach_attempted)
 #define lpr_linux_processes (lpr_state.process.entries)
 #define lpr_linux_sigactions (lpr_state.signal.actions)
 #define lpr_linux_signal_mask (lpr_signal_thread_state_current()->mask)
@@ -713,6 +722,9 @@ int lpr_supervisor_list_processes(
     uint64_t *pids,
     uint64_t capacity,
     uint64_t *out_count);
+int lpr_supervisor_set_comm(const char *path);
+int lpr_supervisor_query_process(uint64_t pid, lprs_process_query_t *out);
+int lpr_supervisor_diag_attach(void);
 int64_t lpr_tty_wait(uint64_t fd, uint32_t events);
 void lpr_fd_after_fork_child(void);
 void lpr_cwd_init(void);

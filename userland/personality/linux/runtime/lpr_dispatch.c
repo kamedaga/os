@@ -2895,12 +2895,16 @@ static int64_t lpr_sys_nanosleep(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t
 static int64_t lpr_sys_getpid(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getpid(); }
 static int64_t lpr_sys_socket(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_socket(a0, a1, a2); }
 static int64_t lpr_sys_socketpair(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_socketpair(a0, a1, a2, a3); }
-static int64_t lpr_epoll_note_result(uint64_t fd, int64_t result) { lpr_epoll_note_fd_state(fd); return result; }
-static int64_t lpr_sys_connect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, lpr_linux_connect(a0, a1, a2)); }
-static int64_t lpr_sys_sendto(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_epoll_note_result(a0, lpr_linux_sendto(a0, a1, a2, a3, a4, a5)); }
-static int64_t lpr_sys_recvfrom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_epoll_note_result(a0, lpr_linux_recvfrom(a0, a1, a2, a3, a4, a5)); }
-static int64_t lpr_sys_sendmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, lpr_linux_sendmsg(a0, a1, a2)); }
-static int64_t lpr_sys_recvmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, lpr_linux_recvmsg(a0, a1, a2)); }
+static int64_t lpr_epoll_note_result(uint64_t fd, uint32_t events, int64_t result)
+{
+    lpr_epoll_note_fd_state(fd, events, result);
+    return result;
+}
+static int64_t lpr_sys_connect(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_connect(a0, a1, a2)); }
+static int64_t lpr_sys_sendto(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendto(a0, a1, a2, a3, a4, a5)); }
+static int64_t lpr_sys_recvfrom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvfrom(a0, a1, a2, a3, a4, a5)); }
+static int64_t lpr_sys_sendmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmsg(a0, a1, a2)); }
+static int64_t lpr_sys_recvmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmsg(a0, a1, a2)); }
 static int64_t lpr_sys_shutdown(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_shutdown(a0, a1); }
 static int64_t lpr_sys_bind(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_bind(a0, a1, a2); }
 static int64_t lpr_sys_getsockname(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getsockname(a0, a1, a2); }
@@ -3284,6 +3288,70 @@ static int64_t lpr_sys_clock_getres(uint64_t a0, uint64_t a1, uint64_t a2, uint6
         native_clock,
         out));
 }
+/* Extended attributes.
+ *
+ * The rootfs carries no xattr store.  Linux answers EOPNOTSUPP for a mount
+ * without xattr support and callers are written for that: apk treats it as
+ * "nothing to restore" and continues.  Leaving the handlers absent produces
+ * ENOSYS instead, which apk reports as a hard error for every archive member
+ * that carries an attribute.
+ *
+ * The argument checks keep the kernel's ordering, so a bad pointer or a
+ * closed descriptor is still EFAULT/EBADF rather than a blanket refusal. */
+static int64_t lpr_sys_xattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a0 == 0 || a1 == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    return -LPR_LINUX_EOPNOTSUPP;
+}
+
+static int64_t lpr_sys_xattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a1 == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    if (a0 > LPR_LINUX_FD_MAX || !lpr_fd_linux_visible_active(a0)) {
+        return -LPR_LINUX_EBADF;
+    }
+    return -LPR_LINUX_EOPNOTSUPP;
+}
+
+/* listxattr takes no name argument, so only the path/fd is checked. */
+static int64_t lpr_sys_listxattr_path(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a0 == 0) {
+        return -LPR_LINUX_EFAULT;
+    }
+    return -LPR_LINUX_EOPNOTSUPP;
+}
+
+static int64_t lpr_sys_listxattr_fd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    if (a0 > LPR_LINUX_FD_MAX || !lpr_fd_linux_visible_active(a0)) {
+        return -LPR_LINUX_EBADF;
+    }
+    return -LPR_LINUX_EOPNOTSUPP;
+}
+
 static int64_t lpr_sys_fadvise64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
     (void)a4;
@@ -3333,13 +3401,13 @@ static int64_t lpr_sys_timerfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uin
 static int64_t lpr_sys_timerfd_settime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_timerfd_settime(a0, a1, a2, a3); }
 static int64_t lpr_sys_timerfd_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_timerfd_gettime(a0, a1); }
 static int64_t lpr_sys_signalfd4(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_signalfd4(a0, a1, a2, a3); }
-static int64_t lpr_sys_accept(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, lpr_linux_accept(a0, a1, a2, 0)); }
+static int64_t lpr_sys_accept(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_accept(a0, a1, a2, 0)); }
 static int64_t lpr_sys_listen(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_listen(a0, a1); }
 static int64_t lpr_sys_dup3(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_dup2(a0, a1, a2); }
 static int64_t lpr_sys_pipe2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_pipe2(a0, a1); }
-static int64_t lpr_sys_recvmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_epoll_note_result(a0, lpr_linux_recvmmsg(a0, a1, a2, a3, a4)); }
+static int64_t lpr_sys_recvmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmmsg(a0, a1, a2, a3, a4)); }
 static int64_t lpr_sys_prlimit64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_prlimit64(a0, a1, a2, a3); }
-static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_epoll_note_result(a0, lpr_linux_sendmmsg(a0, a1, a2, a3)); }
+static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmmsg(a0, a1, a2, a3)); }
 static int64_t lpr_sys_getrandom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_pacha_syscall3(PACHAOS_SYSCALL_GETRANDOM, a0, a1, a2); }
 static int64_t lpr_sys_memfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_memfd_create(a0, a1); }
 static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
@@ -3490,6 +3558,18 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_GETDENTS64, "getdents64", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_getdents64, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_SET_TID_ADDRESS, "set_tid_address", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_set_tid_address, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FADVISE64, "fadvise64", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_fadvise64, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_SETXATTR, "setxattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_LSETXATTR, "lsetxattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FSETXATTR, "fsetxattr", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_fd, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_GETXATTR, "getxattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_LGETXATTR, "lgetxattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FGETXATTR, "fgetxattr", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_fd, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_LISTXATTR, "listxattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_listxattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_LLISTXATTR, "llistxattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_listxattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FLISTXATTR, "flistxattr", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_listxattr_fd, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_REMOVEXATTR, "removexattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_LREMOVEXATTR, "lremovexattr", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_path, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_FREMOVEXATTR, "fremovexattr", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_xattr_fd, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOCK_GETTIME, "clock_gettime", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_clock_gettime, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOCK_GETRES, "clock_getres", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_clock_getres, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_CLOCK_NANOSLEEP, "clock_nanosleep", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_clock_nanosleep, 0),
@@ -3659,6 +3739,18 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_GETDENTS64].handler = lpr_sys_getdents64;
     lpr_syscall_table[LPR_LINUX_SYS_SET_TID_ADDRESS].handler = lpr_sys_set_tid_address;
     lpr_syscall_table[LPR_LINUX_SYS_FADVISE64].handler = lpr_sys_fadvise64;
+    lpr_syscall_table[LPR_LINUX_SYS_SETXATTR].handler = lpr_sys_xattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_LSETXATTR].handler = lpr_sys_xattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_FSETXATTR].handler = lpr_sys_xattr_fd;
+    lpr_syscall_table[LPR_LINUX_SYS_GETXATTR].handler = lpr_sys_xattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_LGETXATTR].handler = lpr_sys_xattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_FGETXATTR].handler = lpr_sys_xattr_fd;
+    lpr_syscall_table[LPR_LINUX_SYS_LISTXATTR].handler = lpr_sys_listxattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_LLISTXATTR].handler = lpr_sys_listxattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_FLISTXATTR].handler = lpr_sys_listxattr_fd;
+    lpr_syscall_table[LPR_LINUX_SYS_REMOVEXATTR].handler = lpr_sys_xattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_LREMOVEXATTR].handler = lpr_sys_xattr_path;
+    lpr_syscall_table[LPR_LINUX_SYS_FREMOVEXATTR].handler = lpr_sys_xattr_fd;
     lpr_syscall_table[LPR_LINUX_SYS_CLOCK_GETTIME].handler = lpr_sys_clock_gettime;
     lpr_syscall_table[LPR_LINUX_SYS_CLOCK_GETRES].handler = lpr_sys_clock_getres;
     lpr_syscall_table[LPR_LINUX_SYS_CLOCK_NANOSLEEP].handler = lpr_sys_clock_nanosleep;
@@ -3736,6 +3828,60 @@ const struct lpr_linux_syscall_info *lpr_linux_syscall_lookup(uint64_t nr)
     return info;
 }
 
+/* Publishes the call this process is inside, so another process reading
+ * /proc/<pid> can see where a stuck one is waiting.  Plain stores into a
+ * shared page: no lock, no system call, and nothing to do when the process
+ * never attached.  seq is left odd only between the two writes below, which is
+ * how the reader detects a torn sample. */
+/* Unserialised on purpose: the timestamp only has to say roughly how long a
+ * call has been outstanding, and an lfence on every syscall would cost far
+ * more than the answer is worth. */
+static inline uint64_t lpr_diag_timestamp(void)
+{
+    uint32_t lo = 0;
+    uint32_t hi = 0;
+    __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+static inline void lpr_diag_enter(uint64_t nr, uint64_t a0, uint64_t a1)
+{
+    lprs_diag_slot_t *slot = lpr_diag_slot;
+    if (slot == 0) return;
+    __atomic_store_n(&slot->seq, slot->seq + 1u, __ATOMIC_RELAXED);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    slot->syscall_nr = nr;
+    slot->arg0 = a0;
+    slot->arg1 = a1;
+    slot->enter_tick = lpr_diag_timestamp();
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&slot->seq, slot->seq + 1u, __ATOMIC_RELEASE);
+}
+
+static inline void lpr_diag_leave(void)
+{
+    lprs_diag_slot_t *slot = lpr_diag_slot;
+    if (slot == 0) return;
+    __atomic_store_n(&slot->seq, slot->seq + 1u, __ATOMIC_RELAXED);
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    slot->syscall_nr = LPRS_DIAG_SYSCALL_NONE;
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&slot->seq, slot->seq + 1u, __ATOMIC_RELEASE);
+}
+
+/* Claimed on the first dispatched call rather than during bootstrap: the
+ * attach itself needs a wire page and a reply descriptor, which are not usable
+ * as early as the exec commit.  The attempt flag is set before the call, so
+ * the system calls the attach makes do not recurse into it. */
+static void lpr_diag_attach_once(void)
+{
+    if (lpr_diag_slot != 0 || lpr_diag_attach_attempted != 0) return;
+    if (!lpr_supervisor_enabled || lpr_supervisor_token == 0) return;
+    lpr_diag_attach_attempted = 1;
+    const int attach_status = lpr_supervisor_diag_attach();
+    if (attach_status != 0) lpr_diag_attach_attempted = attach_status;
+}
+
 static int64_t lpr_dispatch_syscall_inner(const lpr_syscall_entry_t *entry,
                                           const struct lpr_linux_user_frame *frame,
                                           uint64_t a0,
@@ -3748,16 +3894,21 @@ static int64_t lpr_dispatch_syscall_inner(const lpr_syscall_entry_t *entry,
     if (entry == 0) {
         return -LPR_LINUX_ENOSYS;
     }
+    lpr_diag_attach_once();
+    lpr_diag_enter(entry->nr, a0, a1);
+    int64_t result;
     if (entry->nr == LPR_LINUX_SYS_CLONE) {
-        return lpr_linux_clone_frame(frame, a0, a1, a2, a3, a4);
+        result = lpr_linux_clone_frame(frame, a0, a1, a2, a3, a4);
+    } else if (entry->nr == LPR_LINUX_SYS_FORK) {
+        result = lpr_linux_clone_frame(frame, 17u, 0, 0, 0, 0);
+    } else if (entry->nr == LPR_LINUX_SYS_VFORK) {
+        result = lpr_linux_clone_frame(
+            frame, 0x4000ull | 0x100ull | 17u, 0, 0, 0, 0);
+    } else {
+        result = entry->handler(a0, a1, a2, a3, a4, a5);
     }
-    if (entry->nr == LPR_LINUX_SYS_FORK) {
-        return lpr_linux_clone_frame(frame, 17u, 0, 0, 0, 0);
-    }
-    if (entry->nr == LPR_LINUX_SYS_VFORK) {
-        return lpr_linux_clone_frame(frame, 0x4000ull | 0x100ull | 17u, 0, 0, 0, 0);
-    }
-    return entry->handler(a0, a1, a2, a3, a4, a5);
+    lpr_diag_leave();
+    return result;
 }
 
 int64_t lpr_dispatch_syscall(uint64_t nr,

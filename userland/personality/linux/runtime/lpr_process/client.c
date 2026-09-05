@@ -83,7 +83,11 @@ void *lpr_process_client_payload(void *page)
     return page == 0 ? 0 : (void *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
 }
 
-int64_t lpr_process_client_call_with_reply_fd(
+/* The rights a transferred descriptor carries are the receiver's whole
+ * authority over it, so the caller names them.  Handing every transfer the
+ * union of what any receiver might need would give a process capability the
+ * right to be mapped, which no receiver has a use for. */
+int64_t lpr_process_client_call_with_transfer_rights(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
     uint32_t op,
@@ -91,6 +95,7 @@ int64_t lpr_process_client_call_with_reply_fd(
     void *page,
     uint32_t payload_size,
     int transfer_fd,
+    uint64_t transfer_rights,
     uint64_t *out_result,
     int *out_reply_fd)
 {
@@ -128,13 +133,7 @@ int64_t lpr_process_client_call_with_reply_fd(
     fd_count++;
     if (transfer_fd >= 16) {
         fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
-        fds[fd_count].rights =
-            PACHA_FD_RIGHT_INSPECT |
-            PACHA_FD_RIGHT_TRANSFER |
-            PACHA_FD_RIGHT_WAIT |
-            PACHA_FD_RIGHT_POLL |
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_KILL;
+        fds[fd_count].rights = transfer_rights;
         fd_count++;
     }
 
@@ -265,6 +264,40 @@ int64_t lpr_process_client_call_with_reply_fd(
         *out_result = reply.word2;
     }
     return 0;
+}
+
+/* What a service needs to own and watch a descriptor handed to it: the rights
+ * every existing transfer already relied on. */
+#define LPR_TRANSFER_RIGHTS_DEFAULT ( \
+    PACHA_FD_RIGHT_INSPECT | \
+    PACHA_FD_RIGHT_TRANSFER | \
+    PACHA_FD_RIGHT_WAIT | \
+    PACHA_FD_RIGHT_POLL | \
+    PACHA_FD_RIGHT_CLOSE | \
+    PACHA_FD_RIGHT_KILL)
+
+int64_t lpr_process_client_call_with_reply_fd(
+    uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t status),
+    uint32_t op,
+    int page_fd,
+    void *page,
+    uint32_t payload_size,
+    int transfer_fd,
+    uint64_t *out_result,
+    int *out_reply_fd)
+{
+    return lpr_process_client_call_with_transfer_rights(
+        request_counter,
+        status_to_errno,
+        op,
+        page_fd,
+        page,
+        payload_size,
+        transfer_fd,
+        LPR_TRANSFER_RIGHTS_DEFAULT,
+        out_result,
+        out_reply_fd);
 }
 
 int64_t lpr_process_client_call(

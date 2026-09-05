@@ -5,6 +5,15 @@ void lpr_fd_after_fork_child(void)
     /* Native endpoints and prepared service leases were committed by the
      * fork transaction before the child becomes visible to Linux callers. */
     lpr_reset_fork_child_rpc_state();
+    /* The diagnostic slot pointer was copied from the parent and belongs to
+     * the parent's process record, so it must not be written through here.
+     * The child is left marked as already attempted rather than attaching on
+     * its next call: the fork is not complete until the child reports ready,
+     * and issuing a supervisor request before that point stalls the parent
+     * inside fork.  A child that goes on to exec attaches from the new image
+     * instead, which covers everything /proc is read for. */
+    lpr_diag_slot = 0;
+    lpr_diag_attach_attempted = 1;
 }
 
 void lpr_linux_apply_pending_fork_child(void)

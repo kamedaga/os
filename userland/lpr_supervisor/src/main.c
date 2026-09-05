@@ -48,6 +48,10 @@ typedef struct lprs_process {
     int pending_exec_fd;
     char ctty[LPRS_CTTY_BYTES];
     char cwd[LPRS_CWD_BYTES];
+    char comm[LPRS_PROCESS_COMM_BYTES];
+    char cmdline[LPRS_PROCESS_CMDLINE_BYTES];
+    const lprs_diag_slot_t *diag_page;
+    int diag_fd;
 } lprs_process_t;
 
 typedef struct lprs_process_status {
@@ -66,6 +70,12 @@ typedef struct lprs_waiter {
 } lprs_waiter_t;
 
 static int g_endpoint_fd = -1;
+/* Shared diagnostic page.  Processes write their own slot without a system
+ * call; the supervisor only ever reads, and maps it once for its own lifetime
+ * so answering a query costs no extra round trip to the target. */
+
+
+
 static uint64_t g_next_pid = 1;
 static uint64_t g_next_token = 0x4c50525300000001ull;
 static uint64_t g_next_generation = 1;
@@ -277,6 +287,21 @@ static void lprs_discard_pending_exec(lprs_process_t *proc)
     proc->pending_exec_fd = -1;
 }
 
+/* Both halves of an attached page: the mapping and the descriptor the
+ * supervisor kept.  Dropping only the mapping leaked one descriptor per exec,
+ * which a package install exhausted quickly enough to break unrelated work. */
+static void lprs_diag_release(lprs_process_t *proc)
+{
+    if (proc->diag_page != NULL) {
+        (void)pacha_munmap((void *)proc->diag_page, PACHA_SERVICE_PAGE_BYTES);
+        proc->diag_page = NULL;
+    }
+    if (proc->diag_fd >= 16) {
+        (void)pacha_fd_close(proc->diag_fd);
+    }
+    proc->diag_fd = -1;
+}
+
 static void lprs_process_release_owned(lprs_process_t *proc)
 {
     if (proc == NULL) {
@@ -285,6 +310,7 @@ static void lprs_process_release_owned(lprs_process_t *proc)
     if (proc->process_fd >= 16) {
         (void)pacha_fd_close(proc->process_fd);
     }
+    lprs_diag_release(proc);
     lprs_discard_pending_exec(proc);
     memset(proc, 0, sizeof(*proc));
     proc->process_fd = -1;
@@ -481,6 +507,114 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     lprs_copy_string(proc->cwd, sizeof(proc->cwd), req->state.cwd[0] != '\0' ? req->state.cwd : "/");
     lprs_write_state(proc, &req->state);
     *out_token = proc->token;
+    return 0;
+}
+
+/* The page belongs to the process being described; this only maps it read
+ * only, so a supervisor bug can never corrupt what a process reports. */
+static int lprs_diag_attach(uint64_t token, int diag_fd, int *out_keep_fd)
+{
+    if (diag_fd < 16 || out_keep_fd == NULL) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_process_t *proc = lprs_find_by_token(token);
+    if (proc == NULL) {
+        return PACHA_STATUS_ESRCH;
+    }
+    /* exec keeps the token but replaces the address space, so the new image
+     * attaches again.  Replacing the mapping is the point: refusing the second
+     * attach would leave this reporting the page the old image stopped
+     * writing, frozen on the execve it never returned from. */
+    lprs_diag_release(proc);
+    void *addr = pacha_mmap(
+        diag_fd,
+        PACHA_SERVICE_PAGE_BYTES,
+        PACHA_PROT_READ,
+        PACHA_MMAP_SHARED,
+        0);
+    if (addr == NULL) {
+        return PACHA_STATUS_ENOMEM;
+    }
+    proc->diag_page = (const lprs_diag_slot_t *)addr;
+    proc->diag_fd = diag_fd;
+    *out_keep_fd = diag_fd;
+    return 0;
+}
+
+/* Reads one slot without locking.  seq is odd while the owner is writing, so
+ * an odd value or a change across the body means the sample was torn and is
+ * reported as unavailable rather than as a wrong answer. */
+static void lprs_diag_sample(
+    const lprs_process_t *proc,
+    lprs_process_query_t *out)
+{
+    out->diag_valid = 0;
+    out->syscall_nr = LPRS_DIAG_SYSCALL_NONE;
+    if (proc->diag_page == NULL) {
+        return;
+    }
+    const volatile lprs_diag_slot_t *slot = proc->diag_page;
+    for (unsigned attempt = 0; attempt < 4u; ++attempt) {
+        const uint64_t before = slot->seq;
+        if ((before & 1u) != 0) continue;
+        const uint64_t syscall_nr = slot->syscall_nr;
+        const uint64_t arg0 = slot->arg0;
+        const uint64_t arg1 = slot->arg1;
+        const uint64_t enter_tick = slot->enter_tick;
+        if (slot->seq != before) continue;
+        out->syscall_nr = syscall_nr;
+        out->syscall_arg0 = arg0;
+        out->syscall_arg1 = arg1;
+        out->syscall_enter_tick = enter_tick;
+        out->diag_valid = 1;
+        return;
+    }
+}
+
+/* The program name follows the token across exec, so the personality reports
+ * it just before committing and the record survives into the new image. */
+static int lprs_set_comm(uint64_t token, void *page, uint64_t payload_size)
+{
+    if (page == NULL || payload_size < sizeof(lprs_process_set_comm_t)) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_process_t *proc = lprs_find_by_token(token);
+    if (proc == NULL) {
+        return PACHA_STATUS_ESRCH;
+    }
+    const lprs_process_set_comm_t *req = (const lprs_process_set_comm_t *)page;
+    char comm[LPRS_PROCESS_COMM_BYTES];
+    char cmdline[LPRS_PROCESS_CMDLINE_BYTES];
+    snprintf(comm, sizeof(comm), "%.*s",
+        (int)(sizeof(req->comm) - 1u), req->comm);
+    snprintf(cmdline, sizeof(cmdline), "%.*s",
+        (int)(sizeof(req->cmdline) - 1u), req->cmdline);
+    lprs_copy_string(proc->comm, sizeof(proc->comm), comm);
+    lprs_copy_string(proc->cmdline, sizeof(proc->cmdline), cmdline);
+    return 0;
+}
+
+static int lprs_query_process(void *page, uint64_t payload_size)
+{
+    if (page == NULL || payload_size < sizeof(lprs_process_query_t)) {
+        return PACHA_STATUS_EINVAL;
+    }
+    lprs_process_query_t *req = (lprs_process_query_t *)page;
+    const lprs_process_t *proc = lprs_find_by_pid(req->pid);
+    if (proc == NULL) {
+        return PACHA_STATUS_ESRCH;
+    }
+    req->ppid = proc->ppid;
+    req->sid = proc->sid;
+    req->pgrp = proc->pgrp;
+    req->run_state = proc->exit_ready != 0 ?
+        LPRS_PROCESS_RUN_STATE_ZOMBIE : LPRS_PROCESS_RUN_STATE_RUNNING;
+    req->exit_status = proc->exit_status;
+    req->flags = 0;
+    lprs_copy_string(req->comm, sizeof(req->comm), proc->comm);
+    lprs_copy_string(req->cmdline, sizeof(req->cmdline), proc->cmdline);
+    lprs_copy_string(req->cwd, sizeof(req->cwd), proc->cwd);
+    lprs_diag_sample(proc, req);
     return 0;
 }
 
@@ -1246,6 +1380,24 @@ static int lprs_dispatch(
         status = token == 0 ? PACHA_STATUS_EINVAL :
             lprs_exec_commit_done(token);
         break;
+    case LPRS_OP_PROCESS_SET_COMM:
+        status = token == 0 ? PACHA_STATUS_EINVAL :
+            lprs_set_comm(token, payload, header.payload_size);
+        break;
+    case LPRS_OP_PROCESS_QUERY:
+        status = lprs_query_process(payload, header.payload_size);
+        reply_payload_size = status == 0 ? sizeof(lprs_process_query_t) : 0;
+        break;
+    case LPRS_OP_PROCESS_DIAG_ATTACH:
+        if (token == 0 || request->fds == NULL || request->fd_count < 2 ||
+            request->fds[1].fd < 16)
+        {
+            status = PACHA_STATUS_EINVAL;
+        } else {
+            status = lprs_diag_attach(
+                token, (int)(uint32_t)request->fds[1].fd, out_keep_fd);
+        }
+        break;
     case LPRS_OP_PROCESS_WAIT4:
         if (header.payload_size < sizeof(lprs_wait4_t)) {
             status = PACHA_STATUS_EINVAL;
@@ -1511,6 +1663,18 @@ static int lprs_service_one_pending_request(void)
     request.fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS;
     const int status = pacha_ipc_recv(g_endpoint_fd, &request);
     if (status != 0) {
+        /* A request the descriptor table cannot hold is left at the head of
+         * the queue, so the endpoint stays readable and nothing behind it is
+         * ever received.  The service then spins and merely looks idle. */
+        if (status == PACHA_ERR_ALLOC) {
+            static int reported;
+            if (!reported) {
+                reported = 1;
+                fprintf(stderr,
+                    "[lpr-supervisor] recv blocked: descriptor table full, endpoint stalled\n");
+                fflush(stderr);
+            }
+        }
         return status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY ? PACHA_STATUS_EAGAIN : status;
     }
     return lprs_handle_received_request(&request);

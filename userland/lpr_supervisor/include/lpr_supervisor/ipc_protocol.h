@@ -46,7 +46,79 @@ enum {
     LPRS_OP_DIAG_DUMP = 23u,
     LPRS_OP_DIAG_ERROR_GET = 24u,
 
+    /* Process introspection behind /proc/<pid>.  Appended rather than grouped
+     * with the process operations above so every existing operation keeps the
+     * number already compiled into the personality images. */
+    LPRS_OP_PROCESS_SET_COMM = 25u,
+    LPRS_OP_PROCESS_QUERY = 26u,
+    LPRS_OP_PROCESS_DIAG_ATTACH = 27u,
 };
+
+enum {
+    LPRS_PROCESS_COMM_BYTES = 32u,
+    LPRS_PROCESS_CMDLINE_BYTES = 256u,
+
+    /* What the supervisor alone can tell about a process.  It records
+     * lifetime, not scheduling, so a live process is reported as running and
+     * only an exited-but-unreaped one is distinguishable. */
+    LPRS_PROCESS_RUN_STATE_RUNNING = 0u,
+    LPRS_PROCESS_RUN_STATE_ZOMBIE = 1u,
+
+    LPRS_DIAG_SLOT_COUNT = 256u,
+    LPRS_DIAG_SLOT_BYTES = 64u,
+    LPRS_DIAG_PAGE_BYTES = LPRS_DIAG_SLOT_COUNT * LPRS_DIAG_SLOT_BYTES,
+};
+
+/* Not a Linux call number: marks a process that is running its own code
+ * rather than sitting inside the personality. */
+#define LPRS_DIAG_SYSCALL_NONE 0xffffffffffffffffull
+
+typedef struct lprs_process_set_comm {
+    uint64_t token;
+    char comm[LPRS_PROCESS_COMM_BYTES];
+    char cmdline[LPRS_PROCESS_CMDLINE_BYTES];
+} lprs_process_set_comm_t;
+
+/* One cache line per process in the shared diagnostic page.  Only that process
+ * writes it, with plain stores and no system call, and only the supervisor
+ * reads it.  seq is odd while a write is in flight, so a reader that sees the
+ * same even value before and after the body has a consistent sample without
+ * either side taking a lock. */
+typedef struct lprs_diag_slot {
+    uint64_t seq;
+    uint64_t syscall_nr;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint64_t enter_tick;
+    uint64_t reserved[3];
+} lprs_diag_slot_t;
+
+typedef struct lprs_diag_attach {
+    uint64_t token;
+    uint64_t slot_index;  /* filled by the supervisor */
+    uint64_t slot_count;  /* filled by the supervisor */
+} lprs_diag_attach_t;
+
+typedef struct lprs_process_query {
+    uint64_t token;      /* caller */
+    uint64_t pid;        /* target, supplied by the caller */
+    uint64_t ppid;
+    uint64_t sid;
+    uint64_t pgrp;
+    uint64_t run_state;
+    uint64_t exit_status;
+    uint64_t flags;
+    /* Sampled from the target's diagnostic slot.  diag_valid is zero when the
+     * process never attached or the sample was torn. */
+    uint64_t diag_valid;
+    uint64_t syscall_nr;
+    uint64_t syscall_arg0;
+    uint64_t syscall_arg1;
+    uint64_t syscall_enter_tick;
+    char comm[LPRS_PROCESS_COMM_BYTES];
+    char cmdline[LPRS_PROCESS_CMDLINE_BYTES];
+    char cwd[LPRS_CWD_BYTES];
+} lprs_process_query_t;
 
 typedef struct lprs_token_request {
     uint64_t token;
@@ -150,3 +222,10 @@ _Static_assert(sizeof(lprs_tty_signal_t) == 24, "lprs_tty_signal size");
 _Static_assert(sizeof(lprs_cwd_t) == 496, "lprs_cwd size");
 _Static_assert(sizeof(lprs_process_state_t) <= LPRS_PAYLOAD_BYTES,
     "lprs_process_state fits payload");
+_Static_assert(sizeof(lprs_process_set_comm_t) == 296, "lprs_process_set_comm size");
+_Static_assert(sizeof(lprs_process_query_t) == 872, "lprs_process_query size");
+_Static_assert(sizeof(lprs_process_query_t) <= LPRS_PAYLOAD_BYTES,
+    "lprs_process_query fits payload");
+_Static_assert(sizeof(lprs_diag_slot_t) == LPRS_DIAG_SLOT_BYTES,
+    "lprs_diag_slot is one cache line");
+_Static_assert(sizeof(lprs_diag_attach_t) == 24, "lprs_diag_attach size");

@@ -1358,6 +1358,13 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     }
     lpr_trace_process_event("execve_commit", (uint64_t)(uint32_t)process_fd, (uint64_t)(uint32_t)thread_fd, 0);
     if (lpr_supervisor_enabled) {
+        /* Publish the program name while this image can still read it.  The
+         * token carries across the commit, so /proc/<pid> reports the process
+         * that is about to run rather than the one being replaced.  A failure
+         * here only costs a name, so it must not abort the exec. */
+        (void)lpr_supervisor_set_comm(exec.path);
+    }
+    if (lpr_supervisor_enabled) {
         const int64_t supervisor_status = lpr_supervisor_call_token(
             LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN,
             lpr_supervisor_token,

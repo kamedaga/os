@@ -914,6 +914,135 @@ int lpr_supervisor_list_processes(
     return raw_status == 0 ? 0 : (int)raw_status;
 }
 
+int lpr_supervisor_set_comm(const char *path)
+{
+    if (path == 0 || !lpr_supervisor_enabled || lpr_supervisor_token == 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const uint64_t length = (uint64_t)lpr_strnlen(path, FILED_PATH_BYTES);
+    if (length == 0) return -LPR_LINUX_EINVAL;
+
+    /* comm is the last path component, the way Linux derives it. */
+    uint64_t base = length;
+    while (base > 0 && path[base - 1u] != '/') base -= 1u;
+
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_process_set_comm_t *req =
+        (lprs_process_set_comm_t *)lpr_supervisor_payload(page);
+    req->token = lpr_supervisor_token;
+
+    uint64_t comm_length = length - base;
+    if (comm_length > sizeof(req->comm) - 1u) comm_length = sizeof(req->comm) - 1u;
+    lpr_memcpy(req->comm, path + base, (size_t)comm_length);
+    req->comm[comm_length] = '\0';
+
+    uint64_t cmdline_length = length;
+    if (cmdline_length > sizeof(req->cmdline) - 1u)
+        cmdline_length = sizeof(req->cmdline) - 1u;
+    lpr_memcpy(req->cmdline, path, (size_t)cmdline_length);
+    req->cmdline[cmdline_length] = '\0';
+
+    const int64_t raw_status = lpr_supervisor_call(
+        LPRS_OP_PROCESS_SET_COMM,
+        page_fd,
+        page,
+        sizeof(*req),
+        -1,
+        0);
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    return raw_status == 0 ? 0 : (int)raw_status;
+}
+
+/* Hands the supervisor a page this process already owns and keeps writing to.
+ * The page travels as a transfer descriptor, which is the same path every
+ * other supervisor call uses, so nothing new has to work for the attach to
+ * succeed.  The reverse arrangement, mapping a page the supervisor owns, was
+ * tried first and left the system unable to reach a shell. */
+int lpr_supervisor_diag_attach(void)
+{
+    if (!lpr_supervisor_enabled || lpr_supervisor_token == 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if (lpr_diag_slot != 0) return 0;
+
+    void *diag_page = 0;
+    const int diag_fd = lpr_create_standalone_wire_page(&diag_page);
+    if (diag_fd < 0) return diag_fd;
+    lpr_memset(diag_page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_diag_slot_t *slot = (lprs_diag_slot_t *)diag_page;
+    slot->syscall_nr = LPRS_DIAG_SYSCALL_NONE;
+
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) {
+        lpr_destroy_standalone_wire_page(diag_fd, diag_page);
+        return page_fd;
+    }
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_diag_attach_t *req =
+        (lprs_diag_attach_t *)lpr_supervisor_payload(page);
+    req->token = lpr_supervisor_token;
+    /* The supervisor has to map this page to read it, and read is all it ever
+     * needs: the process itself is the only writer. */
+    const int64_t status = lpr_process_client_call_with_transfer_rights(
+        &lpr_request_id,
+        lpr_pacha_status_to_errno,
+        LPRS_OP_PROCESS_DIAG_ATTACH,
+        page_fd,
+        page,
+        sizeof(*req),
+        diag_fd,
+        /* A subset of what the wire page itself holds: a transfer cannot grant
+         * a right the sender does not have, and asking for one it lacks fails
+         * the whole call.  Write access is deliberately not passed on. */
+        PACHA_FD_RIGHT_TRANSFER |
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ,
+        0,
+        0);
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    if (status != 0) {
+        lpr_destroy_standalone_wire_page(diag_fd, diag_page);
+        return (int)status;
+    }
+    /* The supervisor holds the descriptor now.  This mapping stays for the
+     * life of the process and is what the syscall hooks write into. */
+    lpr_diag_slot = slot;
+    return 0;
+}
+
+int lpr_supervisor_query_process(uint64_t pid, lprs_process_query_t *out)
+{
+    if (out == 0 || pid == 0 || !lpr_supervisor_enabled ||
+        lpr_supervisor_token == 0)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_process_query_t *req =
+        (lprs_process_query_t *)lpr_supervisor_payload(page);
+    req->token = lpr_supervisor_token;
+    req->pid = pid;
+    const int64_t raw_status = lpr_supervisor_call(
+        LPRS_OP_PROCESS_QUERY,
+        page_fd,
+        page,
+        sizeof(*req),
+        -1,
+        0);
+    if (raw_status == 0) {
+        lpr_memcpy(out, req, sizeof(*out));
+    }
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    return raw_status == 0 ? 0 : (int)raw_status;
+}
+
 int lpr_create_pread_vmo_wire_page(void **out_page)
 {
     if (out_page == 0) {
