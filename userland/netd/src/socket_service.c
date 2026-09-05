@@ -42,7 +42,6 @@ struct netd_page_attachment {
     struct netd_page_attachment *next;
     uint64_t id;
     uint64_t wait_index;
-    int page_fd;
     int lease_fd;
     void *page;
 };
@@ -205,8 +204,6 @@ static void netd_page_attachment_destroy(
     if (attachment == NULL) return;
     if (attachment->page != NULL)
         (void)pacha_munmap(attachment->page, NETD_PAGE_BYTES);
-    if (attachment->page_fd >= 16)
-        (void)pacha_fd_close(attachment->page_fd);
     if (attachment->lease_fd >= 16)
         (void)pacha_fd_close(attachment->lease_fd);
     free(attachment);
@@ -256,7 +253,9 @@ static int netd_page_attachment_add(
     }
 
     attachment->id = id;
-    attachment->page_fd = page_fd;
+    /* The shared mapping retains the VMO. Keeping its descriptor as well
+     * consumes the slots needed to receive new IPC requests during a fork. */
+    (void)pacha_fd_close(page_fd);
     attachment->lease_fd = lease_fd;
     attachment->page = page;
     attachment->next = g_netd_page_attachments;
@@ -696,10 +695,31 @@ void netd_socket_service_reap_hangups(
     }
 }
 
-void netd_socket_service_poll(void)
+/* A request that cannot be received is not popped from the queue, so the
+ * endpoint stays readable and every later request is blocked behind it too.
+ * The service then spins without progress and looks merely idle, which is how
+ * a full descriptor table cost hours of diagnosis once already.  Say it once:
+ * the condition is permanent, so one line is enough and cannot flood. */
+static void netd_report_recv_table_full(void)
+{
+    static int reported;
+    if (reported) return;
+    reported = 1;
+    fprintf(stderr,
+        "[netd] recv blocked: descriptor table full, endpoint stalled after %llu requests\n",
+        (unsigned long long)g_netd_socket_requests);
+    fflush(stderr);
+}
+
+/* Returns non-zero when the drain budget ran out with the endpoint still
+ * readable, so the caller must pump again instead of waiting.  A burst larger
+ * than the budget otherwise left requests queued while netd slept until some
+ * unrelated event woke it: a D-Bus service activation issues far more than 32
+ * AF_UNIX operations at once, which stalled every client of that socket. */
+int netd_socket_service_poll(void)
 {
     if (g_netd_socket_endpoint_fd < 16) {
-        return;
+        return 0;
     }
 
     for (unsigned i = 0; i < 32; i++) {
@@ -713,10 +733,16 @@ void netd_socket_service_poll(void)
 
         int status = pacha_ipc_recv(g_netd_socket_endpoint_fd, &request);
         if (status != 0) {
-            break;
+            if (status == PACHA_ERR_ALLOC)
+                netd_report_recv_table_full();
+            /* No request is waiting, but one flush only advances the
+             * notification queue by a single socket.  Report the remainder so
+             * the caller pumps again rather than sleeping on it. */
+            return netd_unix_socket_notifications_pending();
         }
         g_netd_socket_requests++;
         (void)netd_socket_dispatch_request(&request, fds);
     }
 
+    return 1;
 }

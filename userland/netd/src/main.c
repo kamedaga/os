@@ -120,7 +120,8 @@ int main(int argc, char **argv)
                 wake_irq.fd, wake_irq.count, &next_irq_count) == 0)
             wake_irq.count = next_irq_count;
         netd_packet_io_pump_once();
-        netd_socket_service_poll();
+        if (netd_socket_service_poll() != 0)
+            continue;
         static struct pacha_service_wait_set wait_set;
         status = pacha_service_wait_init(
             &wait_set, (int)cfg->socket_endpoint_fd);

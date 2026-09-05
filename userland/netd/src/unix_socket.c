@@ -28,6 +28,10 @@
 #define NETD_X11_DIAG 0
 #endif
 
+#ifndef NETD_DBUS_SNAPSHOT_DIAG
+#define NETD_DBUS_SNAPSHOT_DIAG 0
+#endif
+
 typedef struct netd_unix_socket_state {
     struct netd_unix_socket_state *next;
     struct netd_unix_socket_state *notification_next;
@@ -45,6 +49,9 @@ typedef struct netd_unix_socket_state {
     uint8_t reserved0;
     uint8_t diag_dbus_send_count;
     uint8_t diag_dbus_notify_count;
+    uint8_t diag_dbus_queue_count;
+    uint8_t diag_dbus_ack_count;
+    uint8_t diag_session_activation;
 #if NETD_UNIX_DIAG
     uint8_t diag_send_count;
     uint8_t diag_recv_count;
@@ -144,7 +151,7 @@ static void dbus_diag_message(
     size_t length)
 {
     if (source == NULL || peer == NULL || data == NULL || length < 16u ||
-        (source->reserved0 == 0 && peer->reserved0 == 0) ||
+        (source->reserved0 != 2u && peer->reserved0 != 2u) ||
         (data[0] != 'l' && data[0] != 'B') || data[3] != 1u ||
         dbus_wire_diag_count >= 2048u)
     {
@@ -210,20 +217,143 @@ static void dbus_diag_message(
     dbus_wire_diag_count++;
     printf(
         "[netd-dbus-wire] count=%u from=%llu to=%llu type=%u "
-        "serial=%u reply=%u member=%s bytes=%llu body=%u peer_rx=%u "
-        "peer_pending=%u\n",
+        "from_pid=%d to_pid=%d serial=%u reply=%u member=%s "
+        "bytes=%llu body=%u peer_rx=%u peer_pending=%u peer_deferred=%u\n",
         dbus_wire_diag_count,
         (unsigned long long)source->handle,
         (unsigned long long)peer->handle,
         data[1],
+        source->pid,
+        peer->pid,
         serial,
         reply_serial,
         member[0] != 0 ? member : "-",
         (unsigned long long)length,
         body_length,
         peer->rx_len,
-        peer->notify_pending);
+        peer->notify_pending,
+        peer->notify_deferred);
 }
+#endif
+
+/* Classifies sockets for focused message-bus diagnostics.  The session bus
+ * lives under /tmp/dbus-, while the accessibility bus lives at
+ * /run/user/<uid>/at-spi/.  Keep the values distinct so a geany run can trace
+ * only accessibility traffic without exhausting the diagnostic budget on the
+ * desktop session bus. */
+static int netd_unix_path_is_message_bus(const char *path, uint16_t length)
+{
+    if (path == NULL) return 0;
+    if (length >= 10u && memcmp(path, "/tmp/dbus-", 10u) == 0) return 1;
+    for (uint16_t i = 0; i + 7u <= length; ++i)
+        if (memcmp(path + i, "at-spi/", 7u) == 0) return 2;
+    return 0;
+}
+
+#if NETD_DBUS_SNAPSHOT_DIAG
+typedef struct netd_dbus_activation_event {
+    const char *stage;
+    uint64_t handle;
+    uint64_t peer;
+    int32_t pid;
+    uint32_t value0;
+    uint32_t value1;
+    uint32_t value2;
+} netd_dbus_activation_event_t;
+
+enum { NETD_DBUS_ACTIVATION_EVENT_MAX = 256 };
+
+static netd_dbus_activation_event_t
+    netd_dbus_activation_events[NETD_DBUS_ACTIVATION_EVENT_MAX];
+static uint32_t netd_dbus_activation_event_count;
+static uint8_t netd_dbus_activation_armed;
+static uint8_t netd_dbus_activation_dumped;
+
+static int netd_bytes_contains(
+    const uint8_t *data,
+    size_t length,
+    const char *needle)
+{
+    const size_t needle_length = strlen(needle);
+    if (data == NULL || needle_length == 0 || needle_length > length)
+        return 0;
+    for (size_t i = 0; i + needle_length <= length; ++i)
+        if (memcmp(data + i, needle, needle_length) == 0) return 1;
+    return 0;
+}
+
+static void netd_dbus_activation_reset(void)
+{
+    netd_dbus_activation_event_count = 0;
+    netd_dbus_activation_armed = 1;
+    netd_dbus_activation_dumped = 0;
+    for (netd_unix_socket_state_t *s = sockets; s != NULL; s = s->next)
+        s->diag_session_activation = 0;
+}
+
+static void netd_dbus_activation_record(
+    const char *stage,
+    const netd_unix_socket_state_t *s,
+    uint32_t value0,
+    uint32_t value1,
+    uint32_t value2)
+{
+    if (!netd_dbus_activation_armed || s == NULL ||
+        !s->diag_session_activation ||
+        netd_dbus_activation_event_count >= NETD_DBUS_ACTIVATION_EVENT_MAX)
+        return;
+    netd_dbus_activation_event_t *event =
+        &netd_dbus_activation_events[netd_dbus_activation_event_count++];
+    event->stage = stage;
+    event->handle = s->handle;
+    event->peer = s->peer;
+    event->pid = s->pid;
+    event->value0 = value0;
+    event->value1 = value1;
+    event->value2 = value2;
+}
+
+static void netd_dbus_snapshot(void)
+{
+    if (netd_dbus_activation_dumped) return;
+    netd_dbus_activation_dumped = 1;
+    printf("[netd-dbus-snapshot] begin\n");
+    for (uint32_t i = 0; i < netd_dbus_activation_event_count; ++i) {
+        const netd_dbus_activation_event_t *event =
+            &netd_dbus_activation_events[i];
+        printf("[netd-dbus-activation] index=%u stage=%s handle=%llu peer=%llu pid=%d value0=%u value1=%u value2=%u\n",
+            i,
+            event->stage,
+            (unsigned long long)event->handle,
+            (unsigned long long)event->peer,
+            event->pid,
+            event->value0,
+            event->value1,
+            event->value2);
+    }
+    for (const netd_unix_socket_state_t *s = sockets;
+         s != NULL;
+         s = s->next)
+    {
+        if (s->reserved0 == 0u) continue;
+        printf("[netd-dbus-snapshot] handle=%llu class=%u pid=%d peer=%llu refs=%u rx=%u pending=%u deferred=%u queued=%u notify_fd=%d connected=%u closed=%u\n",
+            (unsigned long long)s->handle,
+            (unsigned)s->reserved0,
+            s->pid,
+            (unsigned long long)s->peer,
+            s->refs,
+            s->rx_len,
+            s->notify_pending,
+            s->notify_deferred,
+            s->notify_queued,
+            s->notify_fd,
+            s->connected,
+            s->peer_closed);
+    }
+    printf("[netd-dbus-snapshot] end\n");
+    fflush(stdout);
+}
+
 #endif
 
 static uint32_t readable_events(const netd_unix_socket_state_t *s)
@@ -277,6 +407,24 @@ static void notify_events(netd_unix_socket_state_t *s, uint32_t events) {
     events &= NETD_POLLIN | NETD_POLLOUT | NETD_POLLHUP;
     s->notify_deferred |= events;
     notification_enqueue(s);
+#if NETD_DBUS_SNAPSHOT_DIAG
+    netd_dbus_activation_record(
+        "notify-queue", s, events, s->notify_pending, s->rx_len);
+#endif
+#if NETD_DBUS_DIAG
+    if (s->reserved0 == 2u && s->diag_dbus_queue_count < 96u) {
+        s->diag_dbus_queue_count++;
+        printf("[netd-atspi-notify] phase=queue count=%u handle=%llu pid=%d events=%u pending=%u deferred=%u rx=%u queued=%u\n",
+            (unsigned)s->diag_dbus_queue_count,
+            (unsigned long long)s->handle,
+            s->pid,
+            events,
+            s->notify_pending,
+            s->notify_deferred,
+            s->rx_len,
+            s->notify_queued);
+    }
+#endif
     if (notifications_deferred) return;
     (void)netd_unix_socket_flush_notification();
 }
@@ -301,9 +449,27 @@ unsigned netd_unix_socket_flush_notification(void)
     }
     const uint32_t fresh = s->notify_deferred & ~s->notify_pending;
     s->notify_deferred = fresh;
+#if NETD_DBUS_DIAG
+    if (fresh == 0 && s->reserved0 == 2u &&
+        s->diag_dbus_notify_count < 96u)
+    {
+        s->diag_dbus_notify_count++;
+        printf("[netd-atspi-notify] phase=suppress count=%u handle=%llu pid=%d pending=%u deferred=%u rx=%u\n",
+            (unsigned)s->diag_dbus_notify_count,
+            (unsigned long long)s->handle,
+            s->pid,
+            s->notify_pending,
+            s->notify_deferred,
+            s->rx_len);
+    }
+#endif
     if (fresh == 0) return 0;
     const struct pacha_ipc_msg message = { .word0 = fresh };
     const int status = pacha_ipc_send(s->notify_fd, &message);
+#if NETD_DBUS_SNAPSHOT_DIAG
+    netd_dbus_activation_record(
+        "notify-send", s, fresh, s->notify_pending, (uint32_t)status);
+#endif
     if (status == 0) {
         s->notify_pending |= fresh;
         s->notify_deferred &= ~fresh;
@@ -325,18 +491,15 @@ unsigned netd_unix_socket_flush_notification(void)
     }
 #endif
 #if NETD_DBUS_DIAG
-    if (s->reserved0 != 0 &&
-        (status != 0 || s->rx_len >= 512u) &&
-        s->diag_dbus_notify_count < 64)
-    {
+    if (s->reserved0 == 2u && s->diag_dbus_notify_count < 96u) {
         s->diag_dbus_notify_count++;
-        printf("[netd-dbus-wait] op=notify count=%u handle=%llu pid=%d events=%u fresh=%u pending=%u rx=%u status=%d\n",
+        printf("[netd-atspi-notify] phase=send count=%u handle=%llu pid=%d fresh=%u pending=%u deferred=%u rx=%u status=%d\n",
             (unsigned)s->diag_dbus_notify_count,
             (unsigned long long)s->handle,
             s->pid,
             fresh,
-            fresh,
             s->notify_pending,
+            s->notify_deferred,
             s->rx_len,
             status);
     }
@@ -344,12 +507,23 @@ unsigned netd_unix_socket_flush_notification(void)
     return status == 0 ? 1u : 0u;
 }
 
+/* Whether any socket is still queued for notification.  The flush result
+ * cannot answer this: it reports whether one notification was sent, and
+ * returns zero for a dropped or already-pending entry while the queue behind
+ * it is untouched.  Callers need the queue state to decide whether it is safe
+ * to sleep, because every client blocked on one of these notifications is a
+ * client that will not send the request that would wake netd again. */
+int netd_unix_socket_notifications_pending(void)
+{
+    return notification_head != NULL;
+}
+
 int netd_unix_socket_is_handle(uint64_t handle) { return (handle & NETD_UNIX_HANDLE_BIT) != 0; }
 
 int netd_unix_socket_diag_dbus(uint64_t handle)
 {
     const netd_unix_socket_state_t *socket = find_socket(handle);
-    return socket != NULL && socket->reserved0 != 0;
+    return socket != NULL && socket->reserved0 == 2u;
 }
 
 static netd_unix_socket_state_t *find_socket(uint64_t handle) {
@@ -683,6 +857,17 @@ int netd_unix_socket_connect(const netd_unix_path_t *req) {
 #endif
         return -9;
     }
+#if NETD_DBUS_SNAPSHOT_DIAG
+    if ((req->flags & NETD_UNIX_PATH_ABSTRACT) == 0 &&
+        unix_request_path_length(req) ==
+            sizeof("/tmp/.pacha-atspi-snapshot") - 1u &&
+        memcmp(req->path, "/tmp/.pacha-atspi-snapshot",
+            sizeof("/tmp/.pacha-atspi-snapshot") - 1u) == 0)
+    {
+        netd_dbus_snapshot();
+        return -111;
+    }
+#endif
     netd_unix_socket_state_t *listener = NULL;
     for (netd_unix_socket_state_t *candidate = sockets;
          candidate != NULL;
@@ -726,10 +911,23 @@ int netd_unix_socket_connect(const netd_unix_path_t *req) {
     server->pid = req->pid; server->uid = req->uid; server->gid = req->gid;
     client->connected = 1; client->peer = server->handle;
     client->pid = req->pid; client->uid = req->uid; client->gid = req->gid;
-    if (!listener->path_abstract && listener->path_length >= 10 &&
-        memcmp(listener->path, "/tmp/dbus-", 10) == 0) {
-        client->reserved0 = 1;
-        server->reserved0 = 1;
+    const int message_bus = !listener->path_abstract ?
+        netd_unix_path_is_message_bus(listener->path, listener->path_length) : 0;
+    if (message_bus != 0) {
+        client->reserved0 = (uint8_t)message_bus;
+        server->reserved0 = (uint8_t)message_bus;
+#if NETD_DBUS_SNAPSHOT_DIAG
+        if (message_bus == 1 && netd_dbus_activation_armed) {
+            client->diag_session_activation = 1;
+            server->diag_session_activation = 1;
+            netd_dbus_activation_record(
+                "connect-client", client, client->notify_pending,
+                client->rx_len, client->refs);
+            netd_dbus_activation_record(
+                "connect-server", server, server->notify_pending,
+                server->rx_len, server->refs);
+        }
+#endif
     }
     if (listener->pending_tail != 0) {
         netd_unix_socket_state_t *tail = find_socket(listener->pending_tail);
@@ -924,6 +1122,23 @@ int netd_unix_socket_send(
         for (uint32_t i = 0; i < capability_count; ++i)
             peer->capability_fds[i] = capability_fds[i];
     }
+    #if NETD_DBUS_SNAPSHOT_DIAG
+    if (sent >= 2u && req->data[1] == 1u &&
+        (s->reserved0 == 1u || peer->reserved0 == 1u) &&
+        netd_bytes_contains(req->data, sent, "org.a11y.Bus"))
+    {
+        netd_dbus_activation_reset();
+        s->diag_session_activation = 1;
+        peer->diag_session_activation = 1;
+        netd_dbus_activation_record(
+            "activation", s, (uint32_t)sent, peer->rx_len,
+            peer->notify_pending);
+    }
+    netd_dbus_activation_record(
+        netd_bytes_contains(req->data, sent, "Hello") ?
+            "send-hello" : "send",
+        s, (uint32_t)sent, peer->rx_len, peer->notify_pending);
+    #endif
     notify_events(peer, NETD_POLLIN);
 #if NETD_DBUS_DIAG
     dbus_diag_message(s, peer, req->data, sent);
@@ -988,9 +1203,38 @@ int netd_unix_socket_recv(
     if ((notify_ack &
          ~(uint64_t)(NETD_POLLIN | NETD_POLLOUT | NETD_POLLHUP)) != 0)
         return -22;
+#if NETD_DBUS_DIAG
+    const uint32_t notify_pending_before = s->notify_pending;
+#endif
     s->notify_pending &= ~(uint32_t)notify_ack;
+#if NETD_DBUS_SNAPSHOT_DIAG
+    netd_dbus_activation_record(
+        "recv-enter", s, (uint32_t)notify_ack, s->rx_len,
+        s->notify_pending);
+#endif
+#if NETD_DBUS_DIAG
+    if (s->reserved0 == 2u &&
+        (notify_ack != 0 || notify_pending_before != s->notify_pending) &&
+        s->diag_dbus_ack_count < 96u)
+    {
+        s->diag_dbus_ack_count++;
+        printf("[netd-atspi-ack] op=recv count=%u handle=%llu pid=%d ack=%llu pending_before=%u pending_after=%u rx=%u\n",
+            (unsigned)s->diag_dbus_ack_count,
+            (unsigned long long)s->handle,
+            s->pid,
+            (unsigned long long)notify_ack,
+            notify_pending_before,
+            s->notify_pending,
+            s->rx_len);
+    }
+#endif
     if (!socket_has_data(s)) {
         const int status = s->peer_closed ? 0 : -11;
+#if NETD_DBUS_SNAPSHOT_DIAG
+        netd_dbus_activation_record(
+            "recv-empty", s, (uint32_t)notify_ack, s->notify_pending,
+            (uint32_t)status);
+#endif
         return status;
     }
     const uint32_t queued = s->type == NETD_SOCK_SEQPACKET ?
@@ -1053,6 +1297,10 @@ int netd_unix_socket_recv(
     if (deliver_transfer)
         notify_events(find_socket(s->peer), NETD_POLLOUT);
     *out_received = n;
+#if NETD_DBUS_SNAPSHOT_DIAG
+    netd_dbus_activation_record(
+        "recv", s, (uint32_t)n, s->rx_len, s->notify_pending);
+#endif
     return 0;
 }
 
@@ -1075,7 +1323,25 @@ int netd_unix_socket_poll(uint64_t handle, uint32_t events, uint32_t *out_revent
      * doorbell.  SEND must not acknowledge it: Wayland traffic is
      * bidirectional, and doing so can enqueue duplicate doorbells until the
      * fixed-size IPC queue fills and a later readiness edge is lost. */
+#if NETD_DBUS_DIAG
+    if (s->reserved0 == 2u && s->notify_pending != 0 &&
+        s->diag_dbus_ack_count < 96u)
+    {
+        s->diag_dbus_ack_count++;
+        printf("[netd-atspi-ack] op=poll count=%u handle=%llu pid=%d ack=%u pending_before=%u pending_after=0 rx=%u\n",
+            (unsigned)s->diag_dbus_ack_count,
+            (unsigned long long)s->handle,
+            s->pid,
+            s->notify_pending,
+            s->notify_pending,
+            s->rx_len);
+    }
+#endif
     s->notify_pending = 0;
+#if NETD_DBUS_SNAPSHOT_DIAG
+    netd_dbus_activation_record(
+        "poll", s, events, s->rx_len, s->notify_pending);
+#endif
     *out_error = 0; *out_revents = 0;
     if ((events & NETD_POLLIN) &&
         ((s->listening && s->pending_head != 0) ||

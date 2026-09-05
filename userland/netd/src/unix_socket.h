@@ -36,6 +36,7 @@ int netd_unix_socket_close(uint64_t handle);
 int netd_unix_socket_is_handle(uint64_t handle);
 int netd_unix_socket_diag_dbus(uint64_t handle);
 unsigned netd_unix_socket_flush_notification(void);
+int netd_unix_socket_notifications_pending(void);
 void netd_unix_socket_set_notifications_deferred(int deferred);
 int netd_unix_socket_collect_wait_sources(struct pacha_service_wait_set *wait_set);
 void netd_unix_socket_reap_hangups(
