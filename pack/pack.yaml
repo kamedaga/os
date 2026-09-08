@@ -181,6 +181,8 @@ apps:
         - "tools/build_wsl_alpine_xfce.sh"
         - "tools/rootfs_overlay.py"
         - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+        - "tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
+        - "userland/fixtures/linux/libreoffice-launcher.sh"
         - "tools/build_wsl_alpine_mesa.sh"
         - "tools/build_wsl_alpine_input.sh"
         - "tools/copy_lpr_linux_musl.sh"

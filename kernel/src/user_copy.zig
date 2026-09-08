@@ -1,4 +1,5 @@
 const std = @import("std");
+const perf = @import("smp_perf.zig");
 const kernel = @import("kernel.zig");
 const kernel_log = @import("kernel_log.zig");
 const scheduler = @import("scheduler_connection.zig");
@@ -330,7 +331,14 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
             .allocate_zero => {},
             .allocate_copy, .locked_slow_path => return null,
         }
-        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse return null;
+        const candidate = allocatePreparedFaultPage(state, free_list, plan) orelse {
+            const store = kernel.vmObjectBackingStoreStats();
+            kernel_log.writeFmt(
+                "vm: fault allocation failed principal={} va=0x{x} free_pages={} store_used={} store_free={}\n",
+                .{ @intFromEnum(principal), page_va, free_list.pageCount(), store.used_entries, store.free_entries },
+            );
+            return null;
+        };
         const mapping = blk: {
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
@@ -575,6 +583,7 @@ pub fn acknowledgePendingTlbShootdown() void {
     if (cpu_slot >= tlb_shootdown_ack.len) return;
     const generation = @atomicLoad(u64, &tlb_shootdown_generation, .acquire);
     if (generation == 0 or @atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .monotonic) == generation) return;
+    perf.add(.tlb_received, 1);
     const target_cr3 = @atomicLoad(u64, &tlb_shootdown_target_cr3, .monotonic);
     if (target_cr3 != 0) flushCr3ContextOnCurrentCpu(target_cr3);
     @atomicStore(u64, &tlb_shootdown_ack[cpu_slot], generation, .release);
@@ -585,7 +594,10 @@ fn shootdownCr3Context(target_cr3: u64) void {
     const restore_interrupts = TlbShootdownLock.interruptsEnabled();
     defer if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
     asm volatile ("cli" ::: .{ .memory = true });
+    const lock_start = perf.timestamp();
     tlb_shootdown_lock.lock();
+    perf.elapsed(.tlb_lock_wait_cycles, lock_start);
+    perf.add(.tlb_requests, 1);
     defer tlb_shootdown_lock.unlock();
 
     // A CPU can enter this CR3 after a "currently running" snapshot but
@@ -604,8 +616,11 @@ fn shootdownCr3Context(target_cr3: u64) void {
         @atomicStore(u64, &tlb_shootdown_ack[current_cpu], generation, .release);
     }
 
+    const send_start = perf.timestamp();
+    perf.add(.tlb_targets, @popCount(target_cpu_mask) -| 1);
     var cpu_slot: usize = 0;
-    while (cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
+    const broadcast_sent = smp.interruptAllOtherOnlineCpus(target_cpu_mask);
+    while (!broadcast_sent and cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
         const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;
         if (!targeted or cpu_slot == current_cpu) continue;
         while (!smp.interruptCpu(cpu_slot)) {
@@ -613,6 +628,9 @@ fn shootdownCr3Context(target_cr3: u64) void {
         }
     }
 
+    perf.elapsed(.tlb_send_cycles, send_start);
+    const ack_start = perf.timestamp();
+    defer perf.elapsed(.tlb_ack_wait_cycles, ack_start);
     cpu_slot = 0;
     while (cpu_slot < smp.max_cpus and cpu_slot < 64) : (cpu_slot += 1) {
         const targeted = (target_cpu_mask & (@as(u64, 1) << @intCast(cpu_slot))) != 0;

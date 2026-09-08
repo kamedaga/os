@@ -2,6 +2,7 @@
 /// The full OS handoff is wired in stages: this file owns the Limine protocol
 /// requests and converts them into boot/entry.zig resources.
 const std = @import("std");
+pub const smp_profile_enabled = @import("smp_profile_options").enabled;
 const kernel_api = @import("kernel_boot_api");
 const x86_platform = kernel_api.x86_platform;
 const entry = kernel_api.entry;

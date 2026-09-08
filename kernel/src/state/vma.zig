@@ -1,4 +1,5 @@
 const std = @import("std");
+const smp_perf = @import("../smp_perf.zig");
 const builtin = @import("builtin");
 const kernel_log = @import("../kernel_log.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
@@ -1067,6 +1068,9 @@ pub fn releaseVmaCowPageRange(self: anytype, entry: *const VmaEntry, first_page_
 
 pub fn releaseVmaCowResources(self: anytype, entry: *const VmaEntry, free_list: ?*FreePageList) void {
     if (entry.cow_table.isNull()) return;
+    const profile_start = smp_perf.timestamp();
+    smp_perf.vmoAdd(.cow_calls, 1);
+    defer smp_perf.vmoElapsed(.cow_cycles, profile_start);
     const page_count: usize = @intCast(entry.size_bytes / native_page_size);
     self.releaseVmaCowPageRange(entry, 0, page_count, free_list);
     self.releaseNativeCowTable(entry.cow_table, free_list);
@@ -1981,8 +1985,14 @@ fn munmapRangeWithFreeListInternal(
     const end_va = try @TypeOf(self.*).checkedEnd(start_va, size_bytes);
     const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
 
-    var index: usize = 0;
-    while (index < table.entries.len) : (index += 1) {
+    // Snapshot active slots in the original slot-index order. Clearing an
+    // entry swaps active_indices, and splitting can insert an earlier slot;
+    // neither must perturb this traversal. A newly created suffix starts at
+    // cut_end and is outside the removed range, so it needs no second visit.
+    var active_slots = std.StaticBitSet(max_vmas_per_process).initEmpty();
+    for (table.active_indices[0..table.active_count]) |index| active_slots.set(index);
+    var active_iterator = active_slots.iterator(.{ .direction = .forward });
+    while (active_iterator.next()) |index| {
         var entry = &table.entries[index];
         if (!entry.active) continue;
         const entry_start = entry.start_va;

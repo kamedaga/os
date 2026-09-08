@@ -50,6 +50,7 @@ for required in \
   usr/bin/xfsettingsd \
   usr/bin/xfce4-about \
   usr/bin/gtk3-demo \
+  usr/bin/gtk4-demo \
   usr/bin/thunar \
   usr/bin/xfce4-terminal \
   usr/lib/xfce4/notifyd/xfce4-notifyd \
@@ -85,6 +86,7 @@ grep -Fxq 'https://dl-cdn.alpinelinux.org/alpine/v3.22/community' \
   "${xfce_root}/etc/apk/repositories"
 grep -Fxq 'apk-tools=2.14.10-r0' "${xfce_root}/etc/apk/world"
 grep -Fxq 'xfce4=4.20-r0' "${xfce_root}/etc/apk/world"
+grep -Fxq 'gtk4.0-demo=4.18.6-r0' "${xfce_root}/etc/apk/world"
 grep -Fxq '127.0.0.1 localhost localhost.localdomain pachaos' \
   "${xfce_root}/etc/hosts"
 grep -Fxq '::1 localhost localhost.localdomain pachaos' \
@@ -105,7 +107,7 @@ python3 tools/rootfs_overlay.py library-view \
   "${xfce_root}" "${mesa_root}" "${input_root}" "${clang_root}" "${pine2_root}"
 "${linux_musl}" --library-path "${apk_library_view}" \
   "${xfce_root}/sbin/apk" --version | grep -Fq 'apk-tools 2.14.10'
-for installed_package in apk-tools alpine-keys xfce4 xfwm4; do
+for installed_package in apk-tools alpine-keys xfce4 xfwm4 gtk4.0-demo; do
   "${linux_musl}" --library-path "${apk_library_view}" \
     "${xfce_root}/sbin/apk" --root "${xfce_root}" \
     info --installed "${installed_package}" >/dev/null
@@ -149,6 +151,7 @@ grep -Fq '/usr/bin/xfce4-panel=' "${manifest}"
 grep -Fq '/usr/bin/xfdesktop=' "${manifest}"
 grep -Fq '/usr/bin/xfce4-about=' "${manifest}"
 grep -Fq '/usr/bin/gtk3-demo=' "${manifest}"
+grep -Fq '/usr/bin/gtk4-demo=' "${manifest}"
 grep -Fq '/usr/bin/pine2-gtk=' "${manifest}"
 grep -Fq '/sbin/apk=' "${manifest}"
 grep -Fq '/etc/apk/repositories=' "${manifest}"

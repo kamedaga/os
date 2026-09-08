@@ -620,9 +620,24 @@ int filed_cached_pread(
         filed_page_cache_slot_t *slot =
             filed_page_cache_find(runtime, backend_object, page_index);
 
-        if (slot != NULL && page_offset < slot->valid_start) {
+        uint64_t page_wanted = length - total;
+        if (page_wanted > FILED_PAGE_CACHE_BYTES - page_offset) {
+            page_wanted = FILED_PAGE_CACHE_BYTES - page_offset;
+        }
+        /* A write-created slot contains only its written interval.  Its end
+         * is not the file's EOF: bytes following it may still be in storage.
+         * Preserve dirty data before refilling any uncovered read interval. */
+        if (slot != NULL &&
+            (page_offset < slot->valid_start ||
+             page_offset + page_wanted > slot->bytes))
+        {
             const int flush_status = filed_page_cache_flush_slot(runtime, slot);
             if (flush_status != 0) {
+                /* Preserve a prefix already copied by this read. The next
+                 * read at the failing page can report the pending error;
+                 * returning an error now would discard transferred bytes
+                 * and leave the caller's shared stream cursor unchanged. */
+                if (total != 0) break;
                 return flush_status;
             }
             memset(slot, 0, sizeof(*slot));
@@ -637,14 +652,28 @@ int filed_cached_pread(
             const uint64_t page_start = absolute_offset - page_offset;
             filed_page_cache.misses++;
             memset(page_buffer, 0, sizeof(page_buffer));
-            const int status = filed_backend_pread(
+            int status = filed_backend_pread(
                 runtime,
                 backend_object,
                 page_start,
                 page_buffer,
                 FILED_PAGE_CACHE_BYTES,
                 &read_bytes);
+            /* A sparse write can extend the file in dirty cache slots while
+             * the backend still reports the old EOF. Only a short fill needs
+             * this check; ordinary full-page read misses remain read-only. */
+            if (status == 0 && read_bytes < FILED_PAGE_CACHE_BYTES &&
+                filed_cache_object_dirty(runtime, backend_object))
+            {
+                status = filed_cache_flush_object(runtime, backend_object);
+                if (status == 0) {
+                    status = filed_backend_pread(
+                        runtime, backend_object, page_start, page_buffer,
+                        FILED_PAGE_CACHE_BYTES, &read_bytes);
+                }
+            }
             if (status != 0) {
+                if (total != 0) break;
                 return status;
             }
             if (read_bytes == 0) {

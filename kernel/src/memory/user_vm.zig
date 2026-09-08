@@ -339,7 +339,7 @@ fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
     // the live tables.  Exec must be able to return an error with its old
     // address space intact.
     const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
-    if (user_pml4_pa >= h.four_gib) return false;
+    if (user_pml4_pa >= h.physical_map_limit) return false;
     const first_pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pdp_pages[0])) orelse return false;
     if (first_pdp_pa >= h.physical_map_limit) return false;
 
@@ -1797,7 +1797,7 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     resetUserReservations(space);
 
     const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
-    if (user_pml4_pa >= h.four_gib) return false;
+    if (user_pml4_pa >= h.physical_map_limit) return false;
     if (user_page_paddr >= h.four_gib or user_stack_paddr >= h.four_gib) return false;
 
     const pml4_index: usize = @intCast((h.user_va >> 39) & 0x1FF);
@@ -1853,7 +1853,7 @@ pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
     resetUserReservations(space);
 
     const user_pml4_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pml4)) orelse return false;
-    if (user_pml4_pa >= h.four_gib) return false;
+    if (user_pml4_pa >= h.physical_map_limit) return false;
 
     _ = ensureUserPdpSlotForPml4(space, 0) orelse return false;
     space.cr3 = user_pml4_pa;

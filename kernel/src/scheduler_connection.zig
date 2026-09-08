@@ -1,4 +1,5 @@
 const std = @import("std");
+const perf = @import("smp_perf.zig");
 const builtin = @import("builtin");
 const kernel = @import("kernel.zig");
 const kernel_runtime = @import("kernel_runtime.zig");
@@ -64,11 +65,14 @@ const SchedulerSpinLock = struct {
     interrupts_were_enabled: bool = false,
 
     fn lock(self: *SchedulerSpinLock) void {
+        const start = perf.timestamp();
         const restore_interrupts = interruptsEnabled();
         disableInterruptsForSchedulerLock();
         while (true) {
             if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
                 self.interrupts_were_enabled = restore_interrupts;
+                perf.elapsed(.scheduler_lock_wait_cycles, start);
+                perf.add(.scheduler_lock_acquires, 1);
                 return;
             }
             while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
@@ -247,6 +251,7 @@ const VerifiedCoreState = struct {
 };
 
 const SchedulerState = struct {
+    cpu_count: usize = 1,
     thread_table: ThreadTableState = .{},
     verified: VerifiedCoreState = .{},
     ap_user_dispatch_enabled: u8 = 0,
@@ -256,7 +261,7 @@ const SchedulerState = struct {
 var scheduler_state: SchedulerState = .{};
 
 fn verifiedCoreCpuCount() usize {
-    return smp.max_cpus;
+    return @atomicLoad(usize, &scheduler_state.cpu_count, .acquire);
 }
 
 fn verifiedThreadIdForGeneration(thread_index: usize, generation: u32) ?i64 {
@@ -378,6 +383,9 @@ fn verifiedWakeThreadGenerationPreferred(
     generation: u32,
     preferred_cpu: ?usize,
 ) bool {
+    const start = perf.timestamp();
+    perf.add(.wake_scan_calls, 1);
+    defer perf.elapsed(.wake_scan_cycles, start);
     if (!verifiedCoreReady()) return false;
     const ctx = threadContextMutable(thread_index) orelse return false;
     const node = ctx.scheduler_entity orelse return false;
@@ -385,12 +393,21 @@ fn verifiedWakeThreadGenerationPreferred(
     const last_state = schedulerStateForSlot(last_cpu) orelse return false;
 
     var target_cpu = last_cpu;
+    var preferred_selected = false;
+    if (preferred_cpu) |cpu| {
+        if (cpu < verifiedCoreCpuCount() and schedulerCpuEnabled(cpu) and threadAllowsCpu(ctx, cpu)) {
+            target_cpu = cpu;
+            preferred_selected = true;
+        }
+    }
+    // A valid synchronous IPC handoff selects this CPU regardless of load.
+    // Do not inspect every runqueue only to discard that choice afterward.
     var target_count: usize = std.math.maxInt(usize);
     var target_idle = false;
     var last_count: usize = std.math.maxInt(usize);
     var last_idle = false;
     var cpu_id: usize = 0;
-    while (cpu_id < verifiedCoreCpuCount()) : (cpu_id += 1) {
+    while (!preferred_selected and cpu_id < verifiedCoreCpuCount()) : (cpu_id += 1) {
         const state = schedulerStateForSlot(cpu_id) orelse continue;
         if (!schedulerCpuEnabled(cpu_id) or !threadAllowsCpu(ctx, cpu_id)) continue;
         state.lock.lock();
@@ -411,15 +428,8 @@ fn verifiedWakeThreadGenerationPreferred(
             target_idle = is_idle;
         }
     }
-    if (target_count == std.math.maxInt(usize)) return false;
+    if (!preferred_selected and target_count == std.math.maxInt(usize)) return false;
     const last_allowed = schedulerCpuEnabled(last_cpu) and threadAllowsCpu(ctx, last_cpu);
-    var preferred_selected = false;
-    if (preferred_cpu) |cpu| {
-        if (cpu < verifiedCoreCpuCount() and schedulerCpuEnabled(cpu) and threadAllowsCpu(ctx, cpu)) {
-            target_cpu = cpu;
-            preferred_selected = true;
-        }
-    }
     if (!preferred_selected and last_allowed and (last_idle or !target_idle) and
         last_count <= target_count +| 1)
     {
@@ -835,6 +845,21 @@ pub fn migrateRunnableThreadGeneration(thread_index: usize, generation: u32, dst
     if (!ctx.allocated or ctx.generation != generation or ctx.cpu_slot != src_cpu or src_cpu == dst_cpu) return false;
     const src = schedulerStateForSlot(src_cpu) orelse return false;
     const dst = schedulerStateForSlot(dst_cpu) orelse return false;
+
+    // Preemption/handoff publishes a runnable entity before switchToGeneration
+    // saves the outgoing frame and installs the next CPU identity. A remote
+    // IPC handoff must not consume that entity's previous saved frame in this
+    // interval. Stealing already checks the executing identity; explicit
+    // migration needs the same exclusion, held through the queue transfer.
+    const first_state = if (src_cpu < dst_cpu) src else dst;
+    const second_state = if (src_cpu < dst_cpu) dst else src;
+    first_state.lock.lock();
+    second_state.lock.lock();
+    defer {
+        second_state.lock.unlock();
+        first_state.lock.unlock();
+    }
+    if (!src.is_idle and src.current_thread == thread_index) return false;
     if (!dst.enabled) return false;
 
     const first = if (src_cpu < dst_cpu) src else dst;
@@ -888,10 +913,119 @@ fn fillUserEntryForThread(cpu_id: usize, thread_index: usize, generation: u32, o
     return true;
 }
 
+test "preferred wake preserves fallback affinity and outgoing block tail" {
+    const cases = [_]struct { preferred: ?usize, enabled: bool = true, affinity: u64 = 3, tail: bool = false, expected: usize }{
+        .{ .preferred = 1, .expected = 1 },
+        .{ .preferred = null, .expected = 0 },
+        .{ .preferred = 64, .expected = 0 },
+        .{ .preferred = 1, .enabled = false, .expected = 0 },
+        .{ .preferred = 1, .affinity = 1, .expected = 0 },
+        .{ .preferred = 1, .tail = true, .expected = 0 },
+    };
+    for (cases) |case| {
+        initializeStaticStorage();
+        defer initializeStaticStorage();
+        const tid = 4;
+        const node = &initial_scheduler_entities[tid];
+        const ctx = &initial_thread_contexts[tid];
+        ctx.* = .{ .id = tid, .allocated = true, .scheduler_entity = node, .cpu_affinity_mask = case.affinity };
+        defer ctx.* = .{ .id = tid, .scheduler_entity = node };
+        scheduler_state.cpu_count = 2;
+        scheduler_state.cpus[0].is_idle = true;
+        scheduler_state.cpus[0].current_thread = idleThreadMarker;
+        scheduler_state.cpus[1].enabled = case.enabled;
+        try std.testing.expect(verifiedAddThread(tid, 1, false));
+        if (case.tail) {
+            scheduler_state.cpus[0].is_idle = false;
+            scheduler_state.cpus[0].current_thread = tid;
+        }
+        try std.testing.expect(verifiedWakeThreadGenerationPreferred(tid, 1, case.preferred));
+        try std.testing.expectEqual(case.expected, ctx.cpu_slot);
+        try std.testing.expectEqual(.runnable, node.ownership);
+        try std.testing.expectEqual(@as(usize, 1), scheduler_state.cpus[case.expected].runqueue.count);
+        try std.testing.expect(!verifiedWakeThreadGenerationPreferred(tid, 1, case.preferred));
+    }
+}
+
+test "migration waits for the outgoing CPU context to be saved and released" {
+    // Exercise both producers of the runnable-before-context-save interval.
+    for (0..8) |scenario| {
+        const handoff = scenario % 2 != 0;
+        const destination = ([_]usize{ 1, 5, 7, 63 })[scenario / 2];
+        initializeStaticStorage();
+        defer initializeStaticStorage();
+        const tid = 4;
+        const generation = 1;
+        const node = &initial_scheduler_entities[tid];
+        const ctx = &initial_thread_contexts[tid];
+        ctx.* = .{ .id = tid, .allocated = true, .ready = true, .scheduler_entity = node };
+        defer ctx.* = .{ .id = tid, .scheduler_entity = node };
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(
+            5,
+            generation,
+            1024,
+            4_000_000,
+            0,
+            &node.entity,
+        ));
+        node.ownership = .runnable;
+        try std.testing.expect(scheduler_state.cpus[0].runqueue.insert(node));
+        const picked = verifiedPickThreadForCpu(0) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, tid), picked.thread_index);
+        scheduler_state.cpus[0].current_thread = tid;
+        scheduler_state.cpus[0].is_idle = false;
+        scheduler_state.cpus[destination].enabled = true;
+        scheduler_state.cpu_count = destination + 1;
+
+        const target = &initial_scheduler_entities[tid + 1];
+        try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(
+            6,
+            generation,
+            1024,
+            4_000_000,
+            0,
+            &target.entity,
+        ));
+        target.ownership = .runnable;
+        try std.testing.expect(scheduler_state.cpus[0].runqueue.insert(target));
+        if (handoff) {
+            try std.testing.expect(verifiedHandoffToThreadOnCpu(0, tid + 1, generation, tid, generation));
+        } else {
+            try std.testing.expectEqual(.preempt, verifiedExpireSlice(0, tid, generation, 4_000_000));
+        }
+
+        // Handoff/preemption has enqueued the outgoing entity, but its CPU
+        // has not saved the live frame yet. The old frame must not be runnable
+        // on a second CPU during this interval.
+        ctx.frame.rip = 0x1111;
+        try std.testing.expect(!migrateRunnableThreadGeneration(tid, generation, destination));
+        try std.testing.expectEqual(@as(usize, 0), ctx.cpu_slot);
+        try std.testing.expectEqual(@as(usize, if (handoff) 1 else 2), scheduler_state.cpus[0].runqueue.count);
+        try std.testing.expectEqual(@as(usize, 0), scheduler_state.cpus[destination].runqueue.count);
+
+        ctx.frame.rip = 0x2222;
+        scheduler_state.cpus[0].current_thread = idleThreadMarker;
+        scheduler_state.cpus[0].is_idle = true;
+        try std.testing.expect(migrateRunnableThreadGeneration(tid, generation, destination));
+        try std.testing.expectEqual(destination, ctx.cpu_slot);
+        try std.testing.expectEqual(@as(u64, 0x2222), ctx.frame.rip);
+
+        // A handoff to another live thread also releases the outgoing identity;
+        // migration must not require the entire source CPU to become idle.
+        scheduler_state.cpus[destination].current_thread = tid + 1;
+        scheduler_state.cpus[destination].is_idle = false;
+        try std.testing.expect(migrateRunnableThreadGeneration(tid, generation, 0));
+        try std.testing.expectEqual(@as(usize, 0), ctx.cpu_slot);
+    }
+}
+
 /// Pull one already-runnable entity from the busiest runqueue into an empty
 /// idle CPU.  The operation is allocation-free and publishes cpu_slot only
 /// while the thread table and both runqueues are locked.
 fn stealRunnableForIdleCpu(dst_cpu: usize) bool {
+    const start = perf.timestamp();
+    perf.add(.steal_attempts, 1);
+    defer perf.elapsed(.steal_cycles, start);
     if (!verifiedCoreReady()) return false;
     const dst = schedulerStateForSlot(dst_cpu) orelse return false;
     scheduler_state.thread_table.lock();
@@ -1097,6 +1231,7 @@ fn nextThreadGeneration(current: u32) u32 {
 }
 
 pub fn initializeStaticStorage() void {
+    @atomicStore(usize, &scheduler_state.cpu_count, 1, .release);
     @memset(principal_self_exit_reservations[0..], 0);
     var cpu_slot: usize = 0;
     while (cpu_slot < scheduler_state.cpus.len) : (cpu_slot += 1) {
@@ -1339,7 +1474,7 @@ fn allocKernelSlice(comptime T: type, free_list: *kernel.FreePageList, count: us
     if (count == 0) return null;
     const bytes = @sizeOf(T) * count;
     const page_count = (bytes + 4095) / 4096;
-    const paddr = free_list.popContiguousAtOrAbove(page_count, 0) catch return null;
+    const paddr = free_list.popContiguousBelow(page_count, @import("arch/x86_64/physical_layout.zig").identity_limit) catch return null;
     const raw: [*]u8 = @ptrFromInt(paddr);
     @memset(raw[0 .. page_count * 4096], 0);
     const ptr: [*]T = @ptrCast(@alignCast(raw));
@@ -1727,6 +1862,7 @@ pub fn refreshTopology() void {
     lockAllCpuSchedulerStates();
     defer unlockAllCpuSchedulerStates();
     const count = @min(smp.cpuCount(), scheduler_state.cpus.len);
+    @atomicStore(usize, &scheduler_state.cpu_count, count, .release);
     var i: usize = 0;
     while (i < scheduler_state.cpus.len) : (i += 1) {
         const observed = i < count and smp.cpuState(i) != .absent;

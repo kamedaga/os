@@ -2,7 +2,7 @@ const std = @import("std");
 const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
-const rtc = @import("../rtc.zig");
+const realtime_clock = @import("../realtime_clock.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const smp = @import("../smp.zig");
 const sc = @import("numbers.zig");
@@ -53,6 +53,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters), &futex_waiters));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters_lock), &futex_waiters_lock));
+    end = maxStaticEnd(end, realtime_clock.kernelStaticStorageEndAddr());
     return end;
 }
 
@@ -79,7 +80,7 @@ fn monotonicTicksAsTimespec() struct { sec: u64, nsec: u64 } {
 
 fn clockGettime(h: anytype, proc: kernel.PrincipalId, clock_id: u64, out_va: u64) u64 {
     return switch (clock_id) {
-        runtime_abi.clock_realtime => writeTimespec(h, proc, out_va, rtc.unixTimeSeconds(), 0),
+        runtime_abi.clock_realtime => writeTimespec(h, proc, out_va, realtime_clock.unixTimeSeconds(), 0),
         runtime_abi.clock_monotonic => blk: {
             const ts = monotonicTicksAsTimespec();
             break :blk writeTimespec(h, proc, out_va, ts.sec, ts.nsec);

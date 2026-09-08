@@ -81,10 +81,28 @@ uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events)
     lpr_memset(&pollfd, 0, sizeof(pollfd));
     pollfd.fd = pipe->native.raw;
     pollfd.events = lpr_pipe_poll_events_to_pacha(events);
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_FD_POLL,
-        (uint64_t)(uintptr_t)&pollfd,
-        1);
+    /* Linux POLLOUT promises room for a PIPE_BUF atomic write. Native pipes
+     * report even a single free byte by default; that can make two peers
+     * both enter blocking writes after poll instead of draining each other.
+     * WAIT_MANY with a zero timeout is an immediate probe with a write-size
+     * requirement, unlike the generic native FD_POLL operation. */
+    int64_t status;
+    if ((events & 0x0004u) != 0) {
+        pollfd.revents = LPR_LINUX_PIPE_BUF_BYTES;
+        status = lpr_pacha_syscall4(
+            PACHA_FD_SYSCALL_WAIT_MANY,
+            (uint64_t)(uintptr_t)&pollfd, 1, 0, 0);
+        /* An invalid native descriptor leaves the input-only write minimum
+         * untouched; it is not an event mask returned by a successful probe. */
+        if (pollfd.revents == LPR_LINUX_PIPE_BUF_BYTES) return 0x0020u;
+        if (pollfd.revents == 0 &&
+            (status == PACHA_SYSCALL_ERR_NOT_READY ||
+             status == -PACHA_SYSCALL_ERR_NOT_READY)) return 0;
+    } else {
+        status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_FD_POLL,
+            (uint64_t)(uintptr_t)&pollfd, 1);
+    }
     return status != 0 && pollfd.revents == 0 ?
         0x0020u : lpr_pipe_poll_events_from_pacha(pollfd.revents);
 }

@@ -93,6 +93,7 @@ add_custom_command(
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${INPUTD_ELF}"
   DEPENDS
     "${REPO_ROOT}/userland/filed/include/filed/payload.h"
+    "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
     "${REPO_ROOT}/userland/libfiled_client/include/filed_client/module_image.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/inputd/ipc_protocol.h"

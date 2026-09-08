@@ -1276,6 +1276,9 @@ int64_t lpr_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
     case FILED_OP_VFS_STAT:
         *out_payload_size = sizeof(filed_statx_t);
         return 0;
+    case FILED_OP_VFS_STATAT:
+        *out_payload_size = sizeof(filed_statat_t);
+        return 0;
     case FILED_OP_VFS_STATFS:
         *out_payload_size = sizeof(filed_statfs_t);
         return 0;

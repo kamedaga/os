@@ -1911,6 +1911,67 @@ test "fd close and munmap release native vmo lifetimes independently" {
     try std.testing.expect(s.vmaEntryConst(p0, 0x4200_0000) == null);
 }
 
+test "munmap visits unsorted active slots despite removal swaps" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const base: u64 = 0x4210_0000;
+    var refs: [3]kernel.NativeVmoRef = undefined;
+    for (&refs, 0..) |*ref, i| {
+        ref.* = try s.createAnonymousVmaWithPages(p0, base + i * 8192, 4096, vmaProt(.{ .read = true }), vmaProt(.{ .read = true }), mmapFlags(.{ .private = true, .anonymous = true }), &free_list);
+    }
+    try s.munmapRangeWithFreeList(p0, base, 4096, &free_list);
+    const table = s.getVmaTable(p0) orelse unreachable;
+    try std.testing.expect(table.active_indices[0] > table.active_indices[1]);
+    var prepared = try s.prepareMunmapRangeWithFreeList(p0, base + 8192, 12288, &free_list);
+    s.commitMunmapPrepared(&prepared, &free_list);
+    try std.testing.expectEqual(@as(usize, 0), table.active_count);
+    for (refs) |ref| try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(ref));
+}
+
+test "munmap snapshot preserves middle split before and after source slot" {
+    for ([_]bool{ false, true }) |prepared_path| {
+        for ([_]bool{ false, true }) |earlier_suffix| {
+            var s = try initFdState();
+            var free_list = FreePageList{};
+            const base: u64 = 0x4220_0000;
+            if (earlier_suffix) {
+                _ = try s.createAnonymousVmaWithPages(p0, base - 8192, 4096, vmaProt(.{ .read = true }), vmaProt(.{ .read = true }), mmapFlags(.{ .private = true, .anonymous = true }), &free_list);
+            }
+            const ref = try s.createAnonymousVmaWithPages(p0, base, 12288, vmaProt(.{ .read = true }), vmaProt(.{ .read = true }), mmapFlags(.{ .private = true, .anonymous = true }), &free_list);
+            if (earlier_suffix) try s.munmapRangeWithFreeList(p0, base - 8192, 4096, &free_list);
+            if (prepared_path) {
+                var prepared = try s.prepareMunmapRangeWithFreeList(p0, base + 4096, 4096, &free_list);
+                s.commitMunmapPrepared(&prepared, &free_list);
+            } else {
+                try s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free_list);
+            }
+            const table = s.getVmaTable(p0) orelse unreachable;
+            try std.testing.expectEqual(@as(usize, 2), table.active_count);
+            try std.testing.expectEqual(@as(u64, 4096), (s.vmaEntryConst(p0, base) orelse unreachable).size_bytes);
+            try std.testing.expect(s.vmaEntryConst(p0, base + 4096) == null);
+            try std.testing.expectEqual(@as(u64, 8192), (s.vmaEntryConst(p0, base + 8192) orelse unreachable).vmo_offset);
+            try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(ref));
+            try s.munmapRangeWithFreeList(p0, base, 12288, &free_list);
+            try std.testing.expectEqual(@as(usize, 0), table.active_count);
+            try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(ref));
+        }
+    }
+}
+
+test "munmap full table middle split failures preserve original range" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const base: u64 = 0x4230_0000;
+    const ref = try s.createAnonymousVmaWithPages(p0, base, 12288, vmaProt(.{ .read = true }), vmaProt(.{ .read = true }), mmapFlags(.{ .private = true, .anonymous = true }), &free_list);
+    const table = s.getVmaTable(p0) orelse unreachable;
+    fillVmaTableExcept(table, &.{});
+    try std.testing.expectError(KernelError.TableFull, s.prepareMunmapRangeWithFreeList(p0, base + 4096, 4096, &free_list));
+    try std.testing.expectError(KernelError.TableFull, s.munmapRangeWithFreeList(p0, base + 4096, 4096, &free_list));
+    try std.testing.expectEqual(kernel.max_vmas_per_process, table.active_count);
+    try std.testing.expectEqual(@as(u64, 12288), (s.vmaEntryConst(p0, base) orelse unreachable).size_bytes);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(ref));
+}
+
 test "process reset releases vma table and native vmo after fd close" {
     var s = try initFdState();
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
@@ -2375,6 +2436,92 @@ test "vmo revoke removes all fd vma and pending ipc references" {
     try std.testing.expectEqual(@as(u64, 7), received.words[0]);
 }
 
+fn returnVmoPagesForTest(s: *KernelState, vmo: kernel.NativeVmoRef, free_list: *FreePageList, comptime partial: bool) void {
+    if (partial) {
+        s.releaseUnmappedAnonymousVmoPageRange(p0, vmo, 0, 2, free_list);
+    } else {
+        // Inspect the owned-page helper before final release clears the slot.
+        KernelState.releaseNativeVmoOwnedPages(s.nativeVmoSlot(vmo).?, free_list);
+    }
+}
+
+test "VMO page return clears only successfully returned pages" {
+    inline for (.{ false, true }) |partial| {
+        var s = try initFdState();
+        var free_list = FreePageList{};
+        const vmo = try s.createNativeVmo(.anonymous, 8192);
+        try s.retainNativeVmo(vmo);
+        const pages = [_]u64{ 0x8000_0000, 0x8000_1000 };
+        try s.installNativeVmoPages(vmo, 0, &pages);
+        returnVmoPagesForTest(&s, vmo, &free_list, partial);
+        try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 0));
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 1));
+        try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
+        s.releaseNativeVmoWithFreeList(vmo, &free_list);
+        try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(vmo));
+        try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
+    }
+}
+
+test "VMO page return preserves failed page and continues with full-list merge" {
+    inline for (.{ false, true }) |partial| {
+        var s = try initFdState();
+        var free_list = FreePageList{};
+        // Construct a valid maximally fragmented fixture directly, avoiding
+        // quadratic append work merely to fill the test's range table.
+        for (&free_list.ranges, 0..) |*range, index| {
+            range.* = .{ .region_id = 0, .len = 1, .physical_start = 0x100_0000 + @as(u64, @intCast(index)) * 8192 };
+        }
+        free_list.range_len = FreePageList.max_ranges;
+        free_list.len = FreePageList.max_ranges;
+        const last = FreePageList.max_ranges - 1;
+        const pages = [_]u64{ 0x1_0000_0000, free_list.ranges[last].physical_start + 4096 };
+        const vmo = try s.createNativeVmo(.anonymous, 8192);
+        try s.retainNativeVmo(vmo);
+        try s.installNativeVmoPages(vmo, 0, &pages);
+        try std.testing.expectError(KernelError.TooManyFreeRanges, free_list.appendPage(0, pages[0]));
+        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.pageCount());
+
+        returnVmoPagesForTest(&s, vmo, &free_list, partial);
+        try std.testing.expectEqual(@as(?u64, pages[0]), s.nativeVmoPagePaddrOrHole(vmo, 0));
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 1));
+        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 1), free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges), free_list.rangeCount());
+        try std.testing.expectEqual(@as(usize, 2), free_list.ranges[last].len);
+        try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
+
+        // Capacity becomes available later: retry must return the held page
+        // exactly once and must not return the already-cleared second page.
+        _ = try free_list.popFront();
+        returnVmoPagesForTest(&s, vmo, &free_list, partial);
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 0));
+        try std.testing.expectEqual(@as(usize, FreePageList.max_ranges + 1), free_list.pageCount());
+        s.releaseNativeVmoWithFreeList(vmo, &free_list);
+    }
+}
+
+test "VMO page return rejects duplicate without clearing its backing pointer" {
+    inline for (.{ false, true }) |partial| {
+        var s = try initFdState();
+        var free_list = FreePageList{};
+        const pages = [_]u64{ 0x8100_0000, 0x8100_1000 };
+        const vmo = try s.createNativeVmo(.anonymous, 8192);
+        try s.retainNativeVmo(vmo);
+        try s.installNativeVmoPages(vmo, 0, &pages);
+        // Deliberately inconsistent ownership tests the defensive failure;
+        // production callers must never return an already-free physical page.
+        try free_list.appendPage(0, pages[0]);
+        returnVmoPagesForTest(&s, vmo, &free_list, partial);
+        try std.testing.expectEqual(@as(?u64, pages[0]), s.nativeVmoPagePaddrOrHole(vmo, 0));
+        try std.testing.expectEqual(@as(?u64, 0), s.nativeVmoPagePaddrOrHole(vmo, 1));
+        try std.testing.expectEqual(@as(usize, 2), free_list.pageCount());
+        try std.testing.expectEqual(@as(usize, 1), free_list.rangeCount());
+        s.releaseNativeVmo(vmo);
+    }
+}
+
 test "shared vmo fd pages survive munmap while fd remains open" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -2596,6 +2743,72 @@ test "DMA address derivation accepts contiguous pages and rejects fragmented pag
         @as(?u64, null),
         kernel.dmaAddressForResolvedPages(fragmented_pages[0..], 0x80),
     );
+}
+
+test "COW detach copies only a split VMA range with one free page" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x800_0000, 8);
+    const original = try s.createNativeCowTable(3, &free_list);
+    try s.retainNativeCowTable(original);
+    try s.retainNativeCowTable(original);
+    var pages: [3]u64 = undefined;
+    for (&pages, 0..) |*page, i| {
+        page.* = (try s.allocPhysicalPage(&free_list)).paddr;
+        try s.setNativeCowPagePaddr(original, @intCast(i), page.*);
+    }
+    var slice = kernel.VmaEntry{
+        .active = true,
+        .start_va = 0x4600_1000,
+        .size_bytes = 4096,
+        .cow_table = original,
+        .cow_page_offset = 1,
+    };
+    var copy_free = FreePageList{};
+    try copy_free.appendContiguousRange(0, 0x900_0000, 1);
+    try s.detachSharedEntryCowTable(&slice, &copy_free);
+    try std.testing.expectEqual(@as(usize, 0), copy_free.pageCount());
+    try std.testing.expectEqual(@as(u32, 0), slice.cow_page_offset);
+    try std.testing.expectEqual(@as(u32, 1), (s.nativeCowTableSlotConst(slice.cow_table) orelse unreachable).page_count);
+    try std.testing.expectEqual(@as(?u64, 0x900_0000), s.entryDirtyPagePaddr(&slice, slice.start_va));
+    for (pages, 0..) |page, i|
+        try std.testing.expectEqual(@as(?u64, page), s.nativeCowPagePaddr(original, @intCast(i)));
+    s.releaseNativeCowTable(slice.cow_table, &copy_free);
+    s.releaseNativeCowTable(original, &free_list);
+    try std.testing.expectEqual(@as(usize, 1), copy_free.pageCount());
+    try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
+}
+
+test "failed split COW detach preserves shared metadata and returns copied pages" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0xa00_0000, 8);
+    const original = try s.createNativeCowTable(3, &free_list);
+    try s.retainNativeCowTable(original);
+    try s.retainNativeCowTable(original);
+    for (0..3) |i| {
+        const page = (try s.allocPhysicalPage(&free_list)).paddr;
+        try s.setNativeCowPagePaddr(original, @intCast(i), page);
+    }
+    var slice = kernel.VmaEntry{
+        .active = true,
+        .start_va = 0x4600_1000,
+        .size_bytes = 8192,
+        .cow_table = original,
+        .cow_page_offset = 1,
+    };
+    const before = slice;
+    const store_before = kernel.vmObjectBackingStoreStats().used_entries;
+    var copy_free = FreePageList{};
+    try copy_free.appendContiguousRange(0, 0xb00_0000, 1);
+    try std.testing.expectError(KernelError.OutOfFreePages, s.detachSharedEntryCowTable(&slice, &copy_free));
+    try std.testing.expectEqualDeep(before, slice);
+    try std.testing.expectEqual(@as(usize, 1), copy_free.pageCount());
+    try std.testing.expectEqual(store_before, kernel.vmObjectBackingStoreStats().used_entries);
+    try std.testing.expectEqual(@as(u32, 2), (s.nativeCowTableSlotConst(original) orelse unreachable).ref_count);
+    s.releaseNativeCowTable(original, &free_list);
+    s.releaseNativeCowTable(original, &free_list);
+    try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
 }
 
 test "private file vma faults read-only then COWs on write" {

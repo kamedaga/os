@@ -796,6 +796,11 @@ static int filed_exec_linux_lpr_handle_mode(
     int prepared[FILED_EXEC_MAX_INHERIT_FDS + 1];
     uint64_t prepared_count = 0;
     size_t script_prefix_length = 0;
+#if defined(FILED_GUI_PROFILE) && FILED_GUI_PROFILE
+    uint64_t gui_stage_before[LPR_EXEC_STAGE_MAX];
+    for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i)
+        gui_stage_before[i] = lpr_exec_stage_metrics[i].total_cycles;
+#endif
 
     if (out_process_fd != NULL) *out_process_fd = -1;
     if (out_thread_fd != NULL) *out_thread_fd = -1;
@@ -921,6 +926,20 @@ static int filed_exec_linux_lpr_handle_mode(
         read_main_meta_cycles,
         load_plan_cycles,
         start_plan_cycles);
+#if defined(FILED_GUI_PROFILE) && FILED_GUI_PROFILE
+    /* Existing stage timers, restricted to these executables. Parent stages
+     * contain their children and must not be summed with them by the reader. */
+    const char *gui_base = strrchr(request->path, '/');
+    gui_base = gui_base != NULL ? gui_base + 1 : request->path;
+    if (strcmp(gui_base, "gtk4-demo") == 0 || strcmp(gui_base, "xfce4-terminal") == 0) {
+        for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i) {
+            const uint64_t span = lpr_exec_stage_metrics[i].total_cycles - gui_stage_before[i];
+            if (span != 0)
+                fprintf(stderr, "[gui-exec-cycles] %s %s %llu\n", gui_base,
+                    lpr_exec_stage_metrics[i].name, (unsigned long long)span);
+        }
+    }
+#endif
     return 0;
 }
 

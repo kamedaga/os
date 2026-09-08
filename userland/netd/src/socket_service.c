@@ -50,6 +50,25 @@ static struct netd_page_attachment *g_netd_page_attachments;
 static uint64_t g_netd_page_attachment_next = 1;
 static uint64_t g_netd_page_attachment_count;
 
+/* The current native descriptor window is 16..255 (also used by bootstrap).
+ * Check only requests that can retain received capabilities, not every data
+ * RPC. Leave room for a whole native message, including malformed requests,
+ * so resource pressure can never block CLOSE behind an unreceivable head.
+ * Backends retain received FDs; they do not allocate persistent native FDs
+ * during dispatch. Reply/SCM_RIGHTS sends MOVE existing descriptors.
+ */
+static int netd_socket_admit_fds(uint64_t received, uint64_t retained)
+{
+    if (retained == 0) return 0;
+    if (retained > received) return -22;
+    uint64_t available = received - retained;
+    for (int fd = 16; fd < 256 && available < PACHA_IPC_MAX_TRANSFER_FDS; ++fd) {
+        struct pacha_fd_info info;
+        if (pacha_fd_get_info(fd, &info) != 0) ++available;
+    }
+    return available >= PACHA_IPC_MAX_TRANSFER_FDS ? 0 : -24;
+}
+
 static int netd_socket_handle_dup(uint64_t handle)
 {
     return netd_netlink_socket_is_handle(handle) ?
@@ -170,6 +189,19 @@ static int netd_socket_send_reply(
     for (uint32_t i = 0; i < transfer_count; ++i)
         (void)pacha_fd_close(transfer_fds[i]);
     return reply_status;
+}
+
+static int netd_socket_reject_request(
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds,
+    int status)
+{
+    for (uint64_t i = 0; i + 1 < request->fd_count; ++i)
+        if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+    g_netd_socket_errors++;
+    return netd_socket_send_reply(request->word1,
+        (int)fds[request->fd_count - 1].fd, request->word3,
+        status, 0, NULL, 0);
 }
 
 static void *netd_socket_map_page(int page_fd)
@@ -444,21 +476,23 @@ static int netd_socket_dispatch_request(
         return -22;
     }
     if (request->fd_count < 1 || fds == NULL || fds[request->fd_count - 1].fd < 16) {
+        for (uint64_t i = 0; fds != NULL && i < request->fd_count; ++i)
+            if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
         return -22;
     }
 
     const int reply_fd = (int)fds[request->fd_count - 1].fd;
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC || request->word3 == 0) {
-        return netd_socket_send_reply(request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+        return netd_socket_reject_request(request, fds, -22);
     }
 
     if (request->word1 == NETD_OP_PAGE_ATTACH) {
         if (request->fd_count != 3 || fds[0].fd < 16 || fds[1].fd < 16) {
-            for (uint64_t i = 0; i + 1 < request->fd_count; ++i)
-                if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
-            return netd_socket_send_reply(
-                request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+            return netd_socket_reject_request(request, fds, -22);
         }
+        const int admission = netd_socket_admit_fds(request->fd_count, 1);
+        if (admission != 0)
+            return netd_socket_reject_request(request, fds, admission);
         const int page_fd = (int)fds[0].fd;
         const int lease_fd = (int)fds[1].fd;
         uint64_t attachment_id = 0;
@@ -511,8 +545,7 @@ static int netd_socket_dispatch_request(
     memset(transferred_fds, 0xff, sizeof(transferred_fds));
     const uint64_t transferred_count64 = request->fd_count - 1u;
     if (transferred_count64 > NETD_TRANSFER_MAX_CAPABILITIES) {
-        return netd_socket_send_reply(
-            request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+        return netd_socket_reject_request(request, fds, -22);
     }
     const uint32_t transferred_count = (uint32_t)transferred_count64;
     for (uint32_t i = 0; i < transferred_count; ++i)
@@ -541,6 +574,14 @@ static int netd_socket_dispatch_request(
     const int send_has_transfer = request->word1 == NETD_OP_SEND && page != NULL &&
         netd_unix_socket_is_handle(((const netd_io_t *)page)->handle) &&
         ((const netd_io_t *)page)->transfer_count != 0;
+    const int may_retain = request->word1 == NETD_OP_SOCKET ||
+        request->word1 == NETD_OP_SOCKETPAIR ||
+        request->word1 == NETD_OP_ATTACH_WAIT ||
+        request->word1 == NETD_OP_DUP || send_has_transfer;
+    const int admission = netd_socket_admit_fds(request->fd_count,
+        may_retain ? transferred_count : 0);
+    if (admission != 0)
+        return netd_socket_reject_request(request, fds, admission);
     uint64_t result = op_uses_page ? 0 : request->word2;
     int reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     uint32_t reply_transfer_count = 0;

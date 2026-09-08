@@ -140,6 +140,7 @@ int64_t filed_openat_path(filed_runtime_t *runtime, const filed_openat_t *openat
 filed_page_dispatch_result_t filed_dispatch_openat_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_stat_page(filed_runtime_t *runtime, void *page);
+filed_page_dispatch_result_t filed_dispatch_statat_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_statfs_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_utimens_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_chmod_page(filed_runtime_t *runtime, void *page);

@@ -111,3 +111,4 @@ AGENTS.md
 
 # kobox is a separate repository
 /_kobox/
+!tools/manifests/alpine-libreoffice-v3.22-x86_64.lock

@@ -30,9 +30,12 @@ pub const BootInfo = struct {
     trampoline_base: u64 = 0,
     lapic_ids: [max_cpus]u8 = [_]u8{0} ** max_cpus,
     lapic_count: u8 = 0,
+    // Fail closed for shorthand broadcast unless MADT described every CPU.
+    broadcast_topology_complete: bool = false,
 };
 
 var observed_cpu_count: u32 = 1;
+var broadcast_online_mask: u64 = 0;
 var ap_started: [max_cpus]u32 = [_]u32{0} ** max_cpus;
 var cpu_states: [max_cpus]u32 = [_]u32{cpu_state_absent} ** max_cpus;
 pub export var runtime_lapic_ids: [max_cpus]u8 = [_]u8{0xFF} ** max_cpus;
@@ -54,6 +57,7 @@ fn maxStaticEnd(a: usize, b: usize) usize {
 pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(observed_cpu_count), &observed_cpu_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(broadcast_online_mask), &broadcast_online_mask));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_started), &ap_started));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(cpu_states), &cpu_states));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_lapic_ids), &runtime_lapic_ids));
@@ -210,7 +214,10 @@ fn appendLapicId(info: *BootInfo, id: u8) void {
     while (i < info.lapic_count) : (i += 1) {
         if (info.lapic_ids[i] == id) return;
     }
-    if (info.lapic_count >= max_cpus) return;
+    if (info.lapic_count >= max_cpus or id == 0xFF) {
+        info.broadcast_topology_complete = false;
+        if (info.lapic_count >= max_cpus) return;
+    }
     info.lapic_ids[info.lapic_count] = id;
     info.lapic_count += 1;
 }
@@ -219,6 +226,7 @@ fn collectMadtLapicIds(info: *BootInfo, rsdp: u64) bool {
     const madt = findMadt(rsdp) orelse return false;
     const len = tableLength(madt);
     if (len < 44 or !checksumOk(madt, len)) return false;
+    info.broadcast_topology_complete = true;
     var off: usize = 44;
     while (off + 2 <= len) {
         const entry_addr = madt + off;
@@ -228,20 +236,28 @@ fn collectMadtLapicIds(info: *BootInfo, rsdp: u64) bool {
         switch (entry_type) {
             0 => if (entry_len >= 8 and (readU32(entry_addr + 4) & 0x1) != 0) {
                 appendLapicId(info, (@as([*]const u8, @ptrFromInt(entry_addr)))[3]);
+            } else {
+                info.broadcast_topology_complete = false;
             },
-            9 => if (entry_len >= 16 and (readU32(entry_addr + 4) & 0x1) != 0) {
-                const x2apic_id = readU32(entry_addr + 8);
-                if (x2apic_id <= std.math.maxInt(u8)) appendLapicId(info, @intCast(x2apic_id));
+            9 => {
+                // x2APIC enumeration is not sufficient to prove this xAPIC
+                // shorthand's complete destination set. Keep unicast here.
+                info.broadcast_topology_complete = false;
+                if (entry_len >= 16 and (readU32(entry_addr + 4) & 0x1) != 0) {
+                    const x2apic_id = readU32(entry_addr + 8);
+                    if (x2apic_id <= std.math.maxInt(u8)) appendLapicId(info, @intCast(x2apic_id));
+                }
             },
             else => {},
         }
         off += entry_len;
     }
+    if (off != len) info.broadcast_topology_complete = false;
     return info.lapic_count != 0;
 }
 
 pub fn prepareBootInfo(rsdp: u64, trampoline_base: u64) ?BootInfo {
-    const trampoline_bytes = @as(u64, @intCast(max_cpus * trampoline_page_bytes));
+    const trampoline_bytes = trampoline_page_bytes;
     if (trampoline_base == 0 or (trampoline_base & 0xFFF) != 0 or
         trampoline_base +| trampoline_bytes > 0x100000)
     {
@@ -448,6 +464,7 @@ fn setCpuState(cpu_slot: usize, state: CpuState) void {
 }
 
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
+    @atomicStore(u64, &broadcast_online_mask, 0, .release);
     if (info.trampoline_base == 0) {
         return false;
     }
@@ -476,7 +493,9 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
             setCpuState(cpu_slot, .absent);
             return false;
         };
-        const trampoline_base = info.trampoline_base + (@as(u64, @intCast(cpu_slot)) * trampoline_page_bytes);
+        // APs are started serially. isStarted() is published only after the
+        // AP has left this page and installed its permanent GDT and stack.
+        const trampoline_base = info.trampoline_base;
         const vector = buildTrampoline(
             trampoline_base,
             kernel_cr3,
@@ -501,7 +520,14 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
         }
         cpu_slot += 1;
     }
-    return cpu_slot == info.lapic_count;
+    const success = cpu_slot == info.lapic_count;
+    if (success and info.broadcast_topology_complete) {
+        const mask = onlineCpuMask();
+        if (@popCount(mask) == info.lapic_count) {
+            @atomicStore(u64, &broadcast_online_mask, mask, .release);
+        }
+    }
+    return success;
 }
 
 fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
@@ -564,6 +590,47 @@ pub fn interruptCpu(cpu_slot: usize) bool {
     if (cpuState(cpu_slot) == .absent) return false;
     if (wake_ipi_vector == 0) return false;
     return lapic.sendFixedIpi(apic_id, wake_ipi_vector);
+}
+
+/// IF must remain clear. Failure means the caller must use per-CPU sends;
+/// duplicate delivery is harmless for generation-acknowledged maintenance.
+pub fn interruptAllOtherOnlineCpus(target_mask: u64) bool {
+    const complete_mask = @atomicLoad(u64, &broadcast_online_mask, .acquire);
+    const current = currentCpuSlot();
+    if (wake_ipi_vector == 0 or !broadcastMaskMatches(complete_mask, target_mask, onlineCpuMask(), current)) return false;
+    if (@popCount(target_mask) <= 1) return true;
+    return lapic.sendFixedIpiAllExcludingSelf(wake_ipi_vector);
+}
+
+fn broadcastMaskMatches(complete: u64, target: u64, online: u64, current: usize) bool {
+    if (complete == 0 or target != complete or online != complete or current >= 64) return false;
+    return (target & (@as(u64, 1) << @intCast(current))) != 0;
+}
+
+test "broadcast gate rejects incomplete topology and supports 64 CPUs" {
+    try std.testing.expect(!broadcastMaskMatches(0, 3, 3, 0));
+    try std.testing.expect(!broadcastMaskMatches(3, 1, 3, 0));
+    try std.testing.expect(!broadcastMaskMatches(3, 3, 1, 0));
+    try std.testing.expect(!broadcastMaskMatches(3, 3, 3, 2));
+    try std.testing.expect(!broadcastMaskMatches(3, 3, 3, 64));
+    try std.testing.expect(broadcastMaskMatches(1, 1, 1, 0));
+    try std.testing.expect(broadcastMaskMatches(255, 255, 255, 7));
+    const all = std.math.maxInt(u64);
+    try std.testing.expect(broadcastMaskMatches(all, all, all, 63));
+}
+
+test "broadcast enumeration fails closed on capacity and reserved APIC ID" {
+    var info: BootInfo = .{ .broadcast_topology_complete = true };
+    for (0..64) |id| appendLapicId(&info, @intCast(id));
+    try std.testing.expect(info.broadcast_topology_complete);
+    appendLapicId(&info, 0); // Duplicate records do not drop a physical CPU.
+    try std.testing.expect(info.broadcast_topology_complete);
+    appendLapicId(&info, 64);
+    try std.testing.expect(!info.broadcast_topology_complete);
+    try std.testing.expectEqual(@as(u8, 64), info.lapic_count);
+    info = .{ .broadcast_topology_complete = true };
+    appendLapicId(&info, 0xff);
+    try std.testing.expect(!info.broadcast_topology_complete);
 }
 
 fn apIdleLoop(cpu_slot: usize) noreturn {

@@ -494,10 +494,8 @@ static int64_t lpr_proc_write_mounts(uint64_t fd)
 }
 
 typedef struct lpr_proc_root_entry {
-    /* Stored inline rather than as a pointer.  A static table of string
-     * pointers needs load-time relocation, which this runtime does not apply
-     * to its own image, so the names came out as garbage in every directory
-     * listing while direct string literal comparisons still worked. */
+    /* Inline names avoid pointer indirection and keep this small table compact.
+     * Native LPR pointer relocations are applied by FileD before child mapping. */
     char name[16];
     uint64_t mode;
 } lpr_proc_root_entry_t;
@@ -570,6 +568,38 @@ static lpr_proc_pid_kind_t lpr_proc_pid_kind(const char *leaf)
     if (lpr_strcmp(leaf, "wchan") == 0) return LPR_PROC_PID_WCHAN;
     if (lpr_strcmp(leaf, "syscall") == 0) return LPR_PROC_PID_SYSCALL;
     return LPR_PROC_PID_NONE;
+}
+
+int lpr_linux_proc_readlink(
+    const char *path, char *target, uint64_t capacity, int64_t *out_status)
+{
+    uint64_t pid = 0;
+    const char *leaf = 0;
+    if (path == 0 || !lpr_proc_pid_from_path(path, &pid, &leaf) ||
+        lpr_strcmp(leaf, "exe") != 0)
+        return 0;
+
+    lprs_process_query_t info;
+    lpr_memset(&info, 0, sizeof(info));
+    const int status = lpr_supervisor_query_process(pid, &info);
+    if (status != 0) {
+        *out_status = status == -LPR_LINUX_ESRCH ? -LPR_LINUX_ENOENT : status;
+        return 1;
+    }
+    if (info.run_state == LPRS_PROCESS_RUN_STATE_ZOMBIE ||
+        info.cmdline[0] != '/') {
+        *out_status = -LPR_LINUX_ENOENT;
+        return 1;
+    }
+    uint64_t length = lpr_strnlen(info.cmdline, sizeof(info.cmdline));
+    if (length == sizeof(info.cmdline)) {
+        *out_status = -LPR_LINUX_ENAMETOOLONG;
+        return 1;
+    }
+    if (length > capacity) length = capacity;
+    lpr_memcpy(target, info.cmdline, length);
+    *out_status = (int64_t)length;
+    return 1;
 }
 
 /* R for a process running its own code, S for one sitting inside a call, Z
@@ -792,6 +822,7 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
         { "meminfo", LPR_LINUX_S_IFREG },
         { "stat", LPR_LINUX_S_IFREG },
         { "mounts", LPR_LINUX_S_IFREG },
+        { "version", LPR_LINUX_S_IFREG },
         { "sys", LPR_LINUX_S_IFDIR },
         { "overflowuid", LPR_LINUX_S_IFREG },
         { "overflowgid", LPR_LINUX_S_IFREG },
@@ -874,6 +905,7 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         LPR_PROC_MEMINFO,
         LPR_PROC_STAT,
         LPR_PROC_MOUNTS,
+        LPR_PROC_VERSION,
     } kind = LPR_PROC_NONE;
     const char *name = 0;
     if (path == 0) return -LPR_LINUX_EFAULT;
@@ -889,6 +921,9 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
     } else if (lpr_strcmp(path, "/proc/mounts") == 0) {
         kind = LPR_PROC_MOUNTS;
         name = "proc-mounts";
+    } else if (lpr_strcmp(path, "/proc/version") == 0) {
+        kind = LPR_PROC_VERSION;
+        name = "proc-version";
     } else {
         uint64_t pid = 0;
         const char *leaf = 0;
@@ -919,6 +954,11 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         break;
     case LPR_PROC_MOUNTS:
         status = lpr_proc_write_mounts((uint64_t)staging_fd);
+        break;
+    case LPR_PROC_VERSION:
+        /* Match the Linux personality's uname identity, not the host kernel. */
+        status = lpr_proc_write_string((uint64_t)staging_fd,
+            "Linux version 6.12.0 (PachaOS Linux shim)\n");
         break;
     default:
         status = -LPR_LINUX_ENOENT;

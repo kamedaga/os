@@ -42,6 +42,7 @@ var metrics: [op_count]Metric = [_]Metric{.{}} ** op_count;
 var next_report: u64 = report_every;
 
 pub fn timestamp() u64 {
+    if (!enable_periodic_reports) return 0;
     return x86_platform.readTimestampCounter();
 }
 
@@ -94,6 +95,7 @@ fn reportLocked() void {
 }
 
 pub fn record(op: Op, start_tsc: u64) void {
+    if (!enable_periodic_reports) return;
     const end = timestamp();
     lock_state.lock();
     defer lock_state.unlock();
@@ -102,6 +104,7 @@ pub fn record(op: Op, start_tsc: u64) void {
 }
 
 pub fn recordElapsed(op: Op, cycles: u64) void {
+    if (!enable_periodic_reports) return;
     lock_state.lock();
     defer lock_state.unlock();
     addLocked(op, cycles);

@@ -6,6 +6,7 @@ const kernel_log = @import("../kernel_log.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const user_vm = @import("../memory/user_vm.zig");
 const sc = @import("numbers.zig");
+const smp_perf = @import("../smp_perf.zig");
 
 const fd_abi = abi_root.fd_abi;
 const vm_abi = abi_root.vm_abi;
@@ -1377,29 +1378,61 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
+            const profile_start = smp_perf.timestamp();
+            smp_perf.munmapAdd(.calls, 1);
+            defer smp_perf.munmapElapsed(.total_cycles, profile_start);
+            var profile_success = false;
+            defer smp_perf.munmapAdd(if (profile_success) .successes else .errors, 1);
             if (frame.rsi == 0 or (frame.rdi & 0xFFF) != 0) break :blk sc.syscall_err_invalid;
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
-            if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_invalid;
+            // Size histogram covers requests that pass length/alignment
+            // validation, including any later failure.
+            const pages = size / 4096;
+            smp_perf.munmapAdd(.requested_pages, pages);
+            smp_perf.munmapAdd(if (pages == 1) .size_1_page else if (pages <= 4)
+                .size_2_to_4_pages
+            else if (pages <= 64) .size_5_to_64_pages else .size_over_64_pages, 1);
+            var profile_stage = smp_perf.timestamp();
+            const transaction_locked = user_vm.lockVmTransaction(proc);
+            smp_perf.munmapElapsed(.transaction_lock_cycles, profile_stage);
+            if (!transaction_locked) break :blk sc.syscall_err_invalid;
             defer user_vm.unlockVmTransaction(proc);
-            if (state.rangeOverlapsPinnedUserObject(proc, frame.rdi, size)) break :blk sc.syscall_err_invalid;
-            const reservation_slots = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            profile_stage = smp_perf.timestamp();
+            const overlaps_pinned = state.rangeOverlapsPinnedUserObject(proc, frame.rdi, size);
+            smp_perf.munmapElapsed(.pinned_check_cycles, profile_stage);
+            if (overlaps_pinned) break :blk sc.syscall_err_invalid;
+            profile_stage = smp_perf.timestamp();
+            const reservation_slots_result = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
                 proc,
                 frame.rdi,
                 @intCast(size),
-            ) orelse break :blk sc.syscall_err_map;
-            if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) break :blk sc.syscall_err_alloc;
-            var prepared = state.prepareMunmapRangeWithFreeList(
+            );
+            smp_perf.munmapElapsed(.reservation_validate_cycles, profile_stage);
+            const reservation_slots = reservation_slots_result orelse break :blk sc.syscall_err_map;
+            profile_stage = smp_perf.timestamp();
+            const free_slots = user_vm.freeUserReservationSlotCount(proc);
+            smp_perf.munmapElapsed(.reservation_count_cycles, profile_stage);
+            if (reservation_slots > free_slots) break :blk sc.syscall_err_alloc;
+            profile_stage = smp_perf.timestamp();
+            const prepared_result = state.prepareMunmapRangeWithFreeList(
                 proc,
                 frame.rdi,
                 size,
                 h.free_list,
-            ) catch |err| break :blk switch (err) {
+            );
+            smp_perf.munmapElapsed(.prepare_cycles, profile_stage);
+            var prepared = prepared_result catch |err| break :blk switch (err) {
                 kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
                 else => sc.syscall_err_map,
             };
             defer state.discardMunmapPrepared(&prepared, h.free_list);
+            profile_stage = smp_perf.timestamp();
             if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) unreachable;
+            smp_perf.munmapElapsed(.unmap_cycles, profile_stage);
+            profile_stage = smp_perf.timestamp();
             state.commitMunmapPrepared(&prepared, h.free_list);
+            smp_perf.munmapElapsed(.commit_cycles, profile_stage);
+            profile_success = true;
             break :blk sc.syscall_ok;
         },
         sc.syscall_mprotect => mprotectVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),

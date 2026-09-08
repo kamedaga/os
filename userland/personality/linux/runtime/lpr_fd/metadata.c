@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_gui_detail.h"
 
 static int64_t lpr_linux_file_vmo_call(
     uint32_t op,
@@ -395,6 +396,16 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 {
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    const int gui_profile = lpr_gui_profile_current_thread();
+    uint64_t gui_begin = gui_profile ? pacha_trace_read_tsc() : 0;
+#define GUI_SEEK_MARK(k) do { if (gui_profile) { \
+    const uint64_t end = pacha_trace_read_tsc(); \
+    lpr_gui_profile_span((k), gui_begin, end); gui_begin = pacha_trace_read_tsc(); \
+} } while (0)
+#else
+#define GUI_SEEK_MARK(k) ((void)0)
+#endif
     if (fd > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_ESPIPE;
     }
@@ -404,6 +415,7 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     }
 
     int64_t result = -LPR_LINUX_ESPIPE;
+    GUI_SEEK_MARK(0);
     if (pin.ops_id == LPR_FD_OPS_DEVICE) {
         result = whence <= 2 ? 0 : -LPR_LINUX_EINVAL;
         goto out;
@@ -427,6 +439,14 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     }
 
     lpr_filed_backend_t *filed = (lpr_filed_backend_t *)pin.state;
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    if (gui_profile) {
+        lpr_gui_profile_file(8, whence, filed->flags, filed->offset_valid,
+            filed->pread_active, filed->stat_size, filed->open_path);
+        const uint64_t tick = pacha_trace_read_tsc();
+        lpr_gui_profile_span(whence <= 2 ? 8u+(unsigned)whence : 8u, tick, tick+1u);
+    }
+#endif
     if ((filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY &&
         filed->offset_valid && whence <= 1)
     {
@@ -444,10 +464,12 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
         }
         filed->pread_active = 1;
         result = (int64_t)new_offset;
+        GUI_SEEK_MARK(1);
         goto out;
     }
     void *page = 0;
     const int page_fd = lpr_create_wire_page(&page);
+    GUI_SEEK_MARK(2);
     if (page_fd < 0) {
         result = page_fd;
         goto out;
@@ -460,7 +482,9 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     uint64_t new_offset = 0;
     const int64_t status =
         lpr_filed_call(FILED_OP_VFS_SEEK, page_fd, 0, &new_offset);
+    GUI_SEEK_MARK(3);
     lpr_destroy_wire_page(page_fd, page);
+    GUI_SEEK_MARK(4);
     if (status == 0 &&
         (filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY)
     {
@@ -471,7 +495,10 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     result = status == 0 ? (int64_t)new_offset : status;
 
 out:
+    GUI_SEEK_MARK(5);
     lpr_fd_unpin(&pin);
+    GUI_SEEK_MARK(6);
+#undef GUI_SEEK_MARK
     return result;
 }
 
@@ -919,12 +946,35 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     }
     lpr_trace_process_event("newfstatat_begin", dirfd, flags, 0);
     const char *path = (const char *)(uintptr_t)path_raw;
-    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && path[0] == 0) {
-        const uint64_t empty_known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW;
-        if ((flags & ~empty_known_flags) != 0) {
-            return -LPR_LINUX_EINVAL;
-        }
+    if (path == 0) return -LPR_LINUX_EFAULT;
+    const uint64_t known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW | 0x800u; /* AT_NO_AUTOMOUNT */
+    if ((flags & ~known_flags) != 0) return -LPR_LINUX_EINVAL;
+    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path[0] == 0) {
         return lpr_linux_fstat(dirfd, statbuf);
+    }
+    if (path[0] == '\0') return -LPR_LINUX_ENOENT;
+    /* Virtual proc/device descriptors belong to LPR, not the FileD namespace.
+     * Keep their existing handling; regular filesystem paths need no Linux FD. */
+    const int virtual_path =
+        (lpr_strncmp(path, "/proc", 5) == 0 && (path[5] == '/' || path[5] == '\0')) ||
+        (lpr_strncmp(path, "/dev", 4) == 0 && (path[4] == '/' || path[4] == '\0'));
+    if (!virtual_path) {
+        uint64_t dir_handle = 0;
+        int64_t status = lpr_dir_handle_for(dirfd, path, &dir_handle);
+        if (status != 0) return status;
+        void *page = 0;
+        const int page_fd = lpr_create_wire_page(&page);
+        if (page_fd < 0) return page_fd;
+        filed_statat_t *request = page;
+        lpr_memset(request, 0, sizeof(*request));
+        request->dir_handle = dir_handle;
+        request->flags = (flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) ? FILED_STATAT_NOFOLLOW : 0;
+        status = lpr_copy_path(request->name, sizeof(request->name), path);
+        uint64_t ignored = 0;
+        if (status == 0) status = lpr_filed_call(FILED_OP_VFS_STATAT, page_fd, 0, &ignored);
+        if (status == 0) lpr_write_linux_stat((void *)(uintptr_t)statbuf, &request->stat);
+        lpr_destroy_wire_page(page_fd, page);
+        return status;
     }
     uint64_t open_flags = LPR_LINUX_O_RDONLY;
     if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
@@ -1312,6 +1362,7 @@ int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, u
 
 int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
 {
+    if (bufsiz == 0) return -LPR_LINUX_EINVAL;
     if (buf == 0 && bufsiz != 0) {
         return -LPR_LINUX_EFAULT;
     }

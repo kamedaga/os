@@ -796,6 +796,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     // that ABI while avoiding periodic timers on idle APs.
     _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count));
     scheduler.lapic_tick_count +%= 1;
+    @import("realtime_clock.zig").updateFromBootstrapTimer();
     if (!kernel_runtime.kernel_state_ready) return;
     deliverExpiredProcessSignalTimers(scheduler.lapic_tick_count);
     syscalls.completePendingIrqFdWaitersFromInterrupt();

@@ -1,6 +1,7 @@
 #include "lpr_socket.h"
 
 #include "lpr_filed_internal.h"
+#include "lpr_gui_detail.h"
 
 #include "support/string.h"
 #include "support/syscall.h"
@@ -1399,6 +1400,15 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
         lpr_netd_destroy_page(page_fd, page);
         if (status == 0) {
             lpr_socket_backend(fd)->connected = 1;
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+            if (lpr_gui_profile_current_thread()) {
+                unsigned n = (unsigned)(addrlen - sizeof(addr->family));
+                /* Abstract names are length-delimited, pathname names are not. */
+                if (n != 0 && addr->path[0] != 0)
+                    n = (unsigned)lpr_strnlen(addr->path, n);
+                lpr_gui_profile_peer(fd, lpr_socket_backend(fd)->handle, addr->path, n);
+            }
+#endif
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
             static const char dbus_path_prefix[] = "/tmp/dbus-";
             if (!abstract &&
@@ -3225,16 +3235,29 @@ static int64_t lpr_linux_poll_scan(
 
 static int64_t lpr_linux_poll_wait(lpr_linux_pollfd_t *fds, uint64_t nfds, int64_t timeout_ms)
 {
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    const int gui = lpr_gui_profile_current_thread();
+    uint64_t gui_start;
+#endif
     lpr_wait_deadline_t deadline;
     int64_t status = lpr_wait_deadline_init(&deadline, timeout_ms);
     if (status != 0) return status;
     for (;;) {
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        gui_start = gui ? pacha_trace_read_tsc() : 0;
+#endif
         const int64_t ready = lpr_linux_poll_scan(fds, nfds, 1);
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        if (gui) lpr_gui_profile_span(LPR_GUI_POLL_SCAN, gui_start, pacha_trace_read_tsc());
+#endif
         if (ready != 0 || timeout_ms == 0) return ready;
         int expired = 0;
         status = lpr_wait_deadline_expired(&deadline, &expired);
         if (status != 0) return status;
         if (expired) return 0;
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        gui_start = gui ? pacha_trace_read_tsc() : 0;
+#endif
         lpr_wait_graph_t graph;
         lpr_wait_graph_init(&graph);
         for (uint64_t i = 0; i < nfds; ++i) {
@@ -3245,7 +3268,14 @@ static int64_t lpr_linux_poll_wait(lpr_linux_pollfd_t *fds, uint64_t nfds, int64
                 (uint32_t)(uint16_t)fds[i].events);
             if (status != 0) return status;
         }
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        if (gui) lpr_gui_profile_span(LPR_GUI_POLL_GRAPH, gui_start, pacha_trace_read_tsc());
+        gui_start = gui ? pacha_trace_read_tsc() : 0;
+#endif
         status = lpr_wait_graph_block(&graph, &deadline);
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        if (gui) lpr_gui_profile_span(LPR_GUI_POLL_BLOCK, gui_start, pacha_trace_read_tsc());
+#endif
         if (status != 0) return status;
     }
 }

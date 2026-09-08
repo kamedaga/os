@@ -11,6 +11,10 @@
 static int failures;
 static unsigned char mock_backend_data[64];
 static uint64_t mock_backend_size;
+static unsigned char stream_backend_data[5u * 1024u * 1024u];
+static uint64_t stream_backend_size;
+static int stream_backend_write_error;
+static uint64_t stream_backend_read_error_at = UINT64_MAX;
 static int mock_vmo_revoke_calls;
 static int mock_fd_close_calls;
 static int mock_link_calls;
@@ -86,6 +90,13 @@ int filed_kobox_backend_statfs(
 int filed_kobox_backend_pread(filed_kobox_backend_t *backend, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes)
 {
     (void)backend;
+    if (object_id == 43 && buffer != NULL && out_bytes != NULL) {
+        if (offset >= stream_backend_read_error_at) { *out_bytes = 0; return -5; }
+        const uint64_t available = offset < stream_backend_size ? stream_backend_size - offset : 0;
+        *out_bytes = length < available ? length : available;
+        if (*out_bytes != 0) memcpy(buffer, stream_backend_data + offset, (size_t)*out_bytes);
+        return 0;
+    }
     if (object_id == 42 && buffer != NULL && out_bytes != NULL) {
         *out_bytes = 0;
         if (offset >= mock_backend_size) {
@@ -105,6 +116,14 @@ int filed_kobox_backend_pread(filed_kobox_backend_t *backend, uint64_t object_id
 int filed_kobox_backend_pwrite(filed_kobox_backend_t *backend, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes)
 {
     (void)backend;
+    if (object_id == 43 && buffer != NULL && out_bytes != NULL &&
+        offset <= sizeof(stream_backend_data) && length <= sizeof(stream_backend_data) - offset) {
+        if (stream_backend_write_error != 0) return stream_backend_write_error;
+        memcpy(stream_backend_data + offset, buffer, (size_t)length);
+        if (offset + length > stream_backend_size) stream_backend_size = offset + length;
+        *out_bytes = length;
+        return 0;
+    }
     if (object_id == 42 && buffer != NULL && out_bytes != NULL &&
         offset <= sizeof(mock_backend_data) && length <= sizeof(mock_backend_data) - offset)
     {
@@ -706,6 +725,147 @@ static void test_snapshot_vmo_pressure_reclaim_preserves_shared(void)
     expect_int("pressure reclaim closes owners", mock_fd_close_calls, 2);
 }
 
+static void test_partial_write_cache_is_not_eof(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char input[4096];
+    unsigned char output[8192];
+    for (int flush = 0; flush < 2; ++flush) {
+        init_runtime(&runtime, &dispatch);
+        stream_backend_size = 2u * FILED_PAGE_CACHE_BYTES;
+        memset(stream_backend_data, 'a', (size_t)stream_backend_size);
+        memset(input, 'b', sizeof(input));
+        uint64_t bytes = 0;
+        expect_int("partial overwrite", filed_cached_pwrite_ex(
+            &runtime, 43, 0, input, sizeof(input), &bytes, true), 0);
+        expect_u64("partial overwrite bytes", bytes, sizeof(input));
+        if (flush) expect_int("partial overwrite flush", filed_cache_flush_object(&runtime, 43), 0);
+        expect_int("read beyond cached write", filed_cached_pread(
+            &runtime, 43, sizeof(input), output, sizeof(output), &bytes), 0);
+        expect_u64("cached write end is not EOF", bytes, sizeof(output));
+        if (bytes == sizeof(output)) {
+            memset(input, 'a', sizeof(input));
+            expect_bytes("existing suffix preserved", output, input, sizeof(input));
+        }
+        expect_int("read across cached write", filed_cached_pread(
+            &runtime, 43, 0, output, sizeof(output), &bytes), 0);
+        expect_u64("read across cached write bytes", bytes, sizeof(output));
+        memset(input, 'b', sizeof(input));
+        expect_bytes("dirty prefix preserved", output, input, sizeof(input));
+    }
+}
+
+static void test_large_stream_cache_roundtrip(uint64_t request_bytes)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char input[FILED_IO_BYTES];
+    unsigned char output[FILED_IO_BYTES];
+    const uint64_t size = 4770488;
+    init_runtime(&runtime, &dispatch);
+    stream_backend_size = 0;
+    memset(stream_backend_data, 0, sizeof(stream_backend_data));
+    for (uint64_t offset = 0; offset < size;) {
+        uint64_t chunk = size - offset < sizeof(input) ? size - offset : sizeof(input);
+        const uint64_t request_remaining = request_bytes - offset % request_bytes;
+        if (chunk > request_remaining) chunk = request_remaining;
+        for (uint64_t i = 0; i < chunk; ++i) input[i] = (unsigned char)((offset + i) * 17u + (offset + i) / 4096u);
+        uint64_t bytes = 0;
+        expect_int("stream write", filed_cached_pwrite_ex(&runtime, 43, offset, input, chunk, &bytes, true), 0);
+        expect_u64("stream write bytes", bytes, chunk);
+        if (bytes != chunk) return;
+        offset += chunk;
+    }
+    expect_int("stream flush", filed_cache_flush_object(&runtime, 43), 0);
+    expect_u64("stream backing size", stream_backend_size, size);
+    for (uint64_t offset = 0; offset < size;) {
+        const uint64_t chunk = size - offset < sizeof(output) ? size - offset : sizeof(output);
+        uint64_t bytes = 0;
+        expect_int("stream read", filed_cached_pread(&runtime, 43, offset, output, chunk, &bytes), 0);
+        expect_u64("stream read bytes", bytes, chunk);
+        if (bytes != chunk) return;
+        for (uint64_t i = 0; i < chunk; ++i) input[i] = (unsigned char)((offset + i) * 17u + (offset + i) / 4096u);
+        expect_bytes("stream read contents", output, input, (size_t)chunk);
+        offset += chunk;
+    }
+}
+
+static void test_sparse_dirty_cache_read_hole(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char input[4096];
+    unsigned char output[4096];
+    init_runtime(&runtime, &dispatch);
+    stream_backend_size = 0;
+    memset(stream_backend_data, 0, sizeof(stream_backend_data));
+    memset(input, 'p', sizeof(input));
+    uint64_t bytes = 0;
+    expect_int("sparse prefix write", filed_cached_pwrite_ex(
+        &runtime, 43, 0, input, sizeof(input), &bytes, true), 0);
+    expect_u64("sparse prefix bytes", bytes, sizeof(input));
+    memset(input, 's', sizeof(input));
+    expect_int("sparse suffix write", filed_cached_pwrite_ex(
+        &runtime, 43, 3u * FILED_PAGE_CACHE_BYTES, input, sizeof(input), &bytes, true), 0);
+    expect_u64("sparse suffix bytes", bytes, sizeof(input));
+    /* Both writes are still dirty. A miss in the hole must not mistake the
+     * backend's pre-writeback size for the current file's EOF. */
+    stream_backend_write_error = -5;
+    expect_int("sparse read propagates flush failure", filed_cached_pread(
+        &runtime, 43, FILED_PAGE_CACHE_BYTES, output, sizeof(output), &bytes), -5);
+    expect_u64("failed sparse read bytes", bytes, 0);
+    expect_true("failed sparse flush retains dirty data", filed_cache_object_dirty(&runtime, 43));
+    stream_backend_write_error = 0;
+    expect_int("read sparse hole", filed_cached_pread(
+        &runtime, 43, FILED_PAGE_CACHE_BYTES, output, sizeof(output), &bytes), 0);
+    expect_u64("sparse hole is not EOF", bytes, sizeof(output));
+    if (bytes == sizeof(output)) {
+        memset(input, 0, sizeof(input));
+        expect_bytes("sparse hole zeros", output, input, sizeof(output));
+    }
+    expect_int("read sparse suffix", filed_cached_pread(
+        &runtime, 43, 3u * FILED_PAGE_CACHE_BYTES, output, sizeof(output), &bytes), 0);
+    expect_u64("sparse suffix read bytes", bytes, sizeof(output));
+    memset(input, 's', sizeof(input));
+    expect_bytes("sparse suffix preserved", output, input, sizeof(output));
+}
+
+static void test_partial_read_before_io_error(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    for (unsigned dirty = 0; dirty < 2; ++dirty) {
+        init_runtime(&runtime, &dispatch);
+        stream_backend_size = 2u * FILED_PAGE_CACHE_BYTES;
+        memset(stream_backend_data, 'a', (size_t)stream_backend_size);
+        uint64_t bytes = 0;
+        if (dirty) {
+            expect_int("partial-error dirty write", filed_cached_pwrite_ex(
+                &runtime,43,FILED_PAGE_CACHE_BYTES+1,"z",1,&bytes,true),0);
+            stream_backend_write_error = -5;
+        } else {
+            stream_backend_read_error_at = FILED_PAGE_CACHE_BYTES;
+        }
+        unsigned char output[8];
+        memset(output,'?',sizeof(output));
+        expect_int("partial-error returns completed prefix", filed_cached_pread(
+            &runtime,43,FILED_PAGE_CACHE_BYTES-4,output,sizeof(output),&bytes),0);
+        expect_u64("partial-error prefix length",bytes,4);
+        expect_bytes("partial-error prefix contents",output,"aaaa????",8);
+        expect_int("partial-error retry reports failure", filed_cached_pread(
+            &runtime,43,FILED_PAGE_CACHE_BYTES,output,4,&bytes),-5);
+        expect_u64("partial-error retry transferred nothing",bytes,0);
+        if (dirty) expect_true("partial-error retains dirty data",filed_cache_object_dirty(&runtime,43));
+        stream_backend_write_error = 0;
+        stream_backend_read_error_at = UINT64_MAX;
+        expect_int("partial-error recovered retry",filed_cached_pread(
+            &runtime,43,FILED_PAGE_CACHE_BYTES,output,4,&bytes),0);
+        expect_u64("partial-error recovered bytes",bytes,4);
+        expect_bytes("partial-error recovered contents",output,dirty ? "azaa" : "aaaa",4);
+    }
+}
+
 int main(void)
 {
     test_rename_clears_negative_lookup();
@@ -717,6 +877,14 @@ int main(void)
     test_snapshot_vmo_pins_backend_object();
     test_pinned_file_vmo_limit_preserves_costly_snapshot();
     test_snapshot_vmo_pressure_reclaim_preserves_shared();
+    test_partial_write_cache_is_not_eof();
+    test_sparse_dirty_cache_read_hole();
+    test_partial_read_before_io_error();
+    test_large_stream_cache_roundtrip(4096);
+    test_large_stream_cache_roundtrip(FILED_IO_BYTES);
+    test_large_stream_cache_roundtrip(32768);
+    test_large_stream_cache_roundtrip(65536);
+    test_large_stream_cache_roundtrip(131072);
     if (failures != 0) {
         return 1;
     }

@@ -1012,6 +1012,7 @@ int64_t lpr_linux_now(lpr_linux_timespec_t *out);
 int64_t lpr_linux_open_metadata(uint64_t dirfd, uint64_t path_raw, uint64_t flags);
 int64_t lpr_linux_openat(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode);
 int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags);
+int lpr_linux_proc_readlink(const char *path, char *target, uint64_t capacity, int64_t *out_status);
 int64_t lpr_linux_openat_once(uint64_t dirfd, uint64_t path_raw, uint64_t flags, uint64_t mode, uint64_t *out_kind);
 int64_t lpr_linux_pipe2(uint64_t fds_raw, uint64_t flags);
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);

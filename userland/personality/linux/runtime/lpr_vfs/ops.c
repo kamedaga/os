@@ -815,10 +815,14 @@ int64_t lpr_linux_openat_once(
 
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity)
 {
-    if (target == 0 || capacity == 0) {
+    if (path_raw == 0 || target == 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (capacity == 0) return -LPR_LINUX_EINVAL;
     const char *path = (const char *)(uintptr_t)path_raw;
+    int64_t proc_status = 0;
+    if (lpr_linux_proc_readlink(path, target, capacity, &proc_status))
+        return proc_status;
     uint64_t source_fd = 0;
     if (lpr_linux_proc_self_fd_number(path, &source_fd)) {
         const lpr_filed_backend_t *source = lpr_filed_backend(source_fd);

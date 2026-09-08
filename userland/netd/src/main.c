@@ -120,8 +120,7 @@ int main(int argc, char **argv)
                 wake_irq.fd, wake_irq.count, &next_irq_count) == 0)
             wake_irq.count = next_irq_count;
         netd_packet_io_pump_once();
-        if (netd_socket_service_poll() != 0)
-            continue;
+        const int busy = netd_socket_service_poll();
         static struct pacha_service_wait_set wait_set;
         status = pacha_service_wait_init(
             &wait_set, (int)cfg->socket_endpoint_fd);
@@ -151,7 +150,10 @@ int main(int argc, char **argv)
         if (status != 0)
             return netd_wait_set_failure(
                 "libuinet_socket", status, &wait_set);
-        (void)pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER);
+        /* A continuously readable endpoint or a backed-up notification must
+         * not starve lease/HANGUP reclamation. Poll once after every bounded
+         * drain, and block only when there is no work left to pump. */
+        (void)pacha_service_wait(&wait_set, busy ? 0 : PACHA_FD_WAIT_FOREVER);
         netd_socket_service_reap_hangups(&wait_set);
         netd_unix_socket_reap_hangups(&wait_set);
         netd_netlink_socket_reap_hangups(&wait_set);

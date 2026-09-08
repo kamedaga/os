@@ -36,7 +36,8 @@ pub fn smpBootResourcesOrHalt(requests: Requests) entry.LimineSmpResources {
     const memmap = requests.memmap.response orelse {
         halt.haltWithMessage("Limine memory map response missing");
     };
-    const required_bytes = @as(u64, @intCast(x86_platform.max_cpus)) * page_bytes;
+    // The serial AP handshake permits one shared low-memory trampoline.
+    const required_bytes = page_bytes;
     var trampoline_base: u64 = 0;
     var i: u64 = 0;
     while (i < memmap.entry_count) : (i += 1) {

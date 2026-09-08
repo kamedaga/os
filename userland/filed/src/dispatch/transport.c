@@ -310,6 +310,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_validate_open_cache_page(runtime, page);
     case FILED_OP_VFS_STAT:
         return filed_dispatch_stat_page(runtime, page);
+    case FILED_OP_VFS_STATAT:
+        return filed_dispatch_statat_page(runtime, page);
     case FILED_OP_VFS_STATFS:
         return filed_dispatch_statfs_page(runtime, page);
     case FILED_OP_VFS_UTIMENS:
@@ -784,6 +786,15 @@ static filed_route_result_t filed_dispatch_client_vfs(
             route.result = page_result.result;
         }
         break;
+    case FILED_OP_VFS_STATAT:
+        if (header->payload_size < sizeof(filed_statat_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result = filed_dispatch_statat_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
     case FILED_OP_VFS_STATFS:
         if (header->payload_size < sizeof(filed_statfs_t)) {
             route.status = -22;
@@ -1209,6 +1220,7 @@ static int filed_dispatch_client(
     case FILED_OP_VFS_OPENAT:
     case FILED_OP_VFS_CLOSE:
     case FILED_OP_VFS_STAT:
+    case FILED_OP_VFS_STATAT:
     case FILED_OP_VFS_STATFS:
     case FILED_OP_VFS_READ:
     case FILED_OP_VFS_PREAD:

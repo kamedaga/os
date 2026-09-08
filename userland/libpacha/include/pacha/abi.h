@@ -87,6 +87,8 @@
 #define PACHA_PROCESS_MAP_ANYWHERE 0xffffffffffffffffull
 #define PACHA_PROCESS_MAP_PRIVATE (1ull << 0)
 #define PACHA_PROCESS_MAP_SHARED (1ull << 1)
+/* Requires PRIVATE, vmo_fd == 0 and vmo_offset == 0; demand-zero pages. */
+#define PACHA_PROCESS_MAP_ANONYMOUS (1ull << 2)
 #define PACHA_PROCESS_MAP_BATCH_MAX_ENTRIES 32ull
 #define PACHA_PROCESS_EXEC_FROM_NONE 0ull
 #define PACHA_PROCESS_DEFAULT_STACK_SIZE 0x20000ull

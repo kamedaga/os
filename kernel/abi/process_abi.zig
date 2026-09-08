@@ -96,7 +96,10 @@ pub const signal_runtime_stack_size: u64 = 4096;
 pub const process_map_flag_none: u64 = 0;
 pub const process_map_flag_private: u64 = 1 << 0;
 pub const process_map_flag_shared: u64 = 1 << 1;
-pub const process_map_known_flags_mask: u64 = process_map_flag_private | process_map_flag_shared;
+// A private, demand-zero mapping authorized by the process MAP_INTO right.
+// There is no backing FD: vmo_fd and vmo_offset must both be zero.
+pub const process_map_flag_anonymous: u64 = 1 << 2;
+pub const process_map_known_flags_mask: u64 = process_map_flag_private | process_map_flag_shared | process_map_flag_anonymous;
 pub const process_map_offset_low_bits: u64 = 0xfff;
 pub const process_map_anywhere_va: u64 = 0xffff_ffff_ffff_ffff;
 pub const process_map_batch_max_entries: u64 = 32;

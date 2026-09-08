@@ -6,9 +6,13 @@
 
 static unsigned notifications[512];
 static uint32_t notification_events[512];
+static int notification_failure_fd = -1;
+static int hung_up_fd = -1;
+static unsigned closed_fds;
 
 int pacha_ipc_send(int fd, const struct pacha_ipc_msg *msg)
 {
+    if (fd == notification_failure_fd) return PACHA_ERR_ALLOC;
     if (fd >= 0 && (unsigned)fd < sizeof(notifications) / sizeof(notifications[0])) {
         notifications[fd]++;
         notification_events[fd] |= (uint32_t)msg->word0;
@@ -19,6 +23,7 @@ int pacha_ipc_send(int fd, const struct pacha_ipc_msg *msg)
 int pacha_fd_close(int fd)
 {
     (void)fd;
+    ++closed_fds;
     return 0;
 }
 
@@ -38,8 +43,7 @@ uint64_t pacha_service_wait_revents(
     int fd)
 {
     (void)set;
-    (void)fd;
-    return 0;
+    return fd == hung_up_fd ? PACHA_FD_EVENT_HANGUP : 0;
 }
 
 #include "../userland/netd/src/unix_socket.c"
@@ -643,6 +647,30 @@ int main(void)
         &received_caps, &received) == 0 &&
         received_caps == 1 && received_fds[0] == seq_capability,
         "SCM rights are anchored to their zero-length seqpacket");
+
+    /* The event loop now polls HANGUP after bounded drains even while a
+     * notification keeps retrying. Reaping that peer must remove its queued
+     * notification as well as release the retained native descriptor. */
+    const size_t before_orphan = socket_count;
+    const uint64_t orphan = open_socket(490);
+    notification_failure_fd = 490;
+    netd_unix_socket_set_notifications_deferred(1);
+    notify_events(find_socket(orphan), NETD_POLLIN);
+    for (unsigned i = 0; i < 1000; ++i)
+        (void)netd_unix_socket_flush_notification();
+    expect(find_socket(orphan)->notify_queued != 0,
+        "backed-up notification remains queued before HANGUP");
+    hung_up_fd = 490;
+    const unsigned before_close = closed_fds;
+    const struct pacha_service_wait_set hangups = {0};
+    netd_unix_socket_reap_hangups(&hangups);
+    expect(find_socket(orphan) == NULL && socket_count == before_orphan &&
+        closed_fds == before_close + 1,
+        "HANGUP reaps a peer despite its backed-up notification");
+    for (netd_unix_socket_state_t *s = notification_head; s; s = s->notification_next)
+        expect(s->handle != orphan, "reaped peer is unlinked from notification queue");
+    notification_failure_fd = hung_up_fd = -1;
+    netd_unix_socket_set_notifications_deferred(0);
 
     if (failures != 0) return 1;
     puts("netd unix socket unit: PASS");

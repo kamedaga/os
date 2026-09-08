@@ -551,7 +551,7 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
             return reportForkFailure("parent_write_protect", protect_status);
         }
         state.detachForkChildDirtyCowTables(child, h.free_list) catch |err| return switch (err) {
-            kernel.KernelError.TableFull => reportForkFailure("dirty_cow_detach", sc.syscall_err_alloc),
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => reportForkFailure("dirty_cow_detach", sc.syscall_err_alloc),
             else => reportForkFailure("dirty_cow_detach", sc.syscall_err_map),
         };
     }
@@ -1027,6 +1027,16 @@ fn prepareProcessMapRequest(
         return .{ .status = sc.syscall_err_invalid };
     };
     const private_map = (map_flags_bits & process_abi.process_map_flag_private) != 0;
+    const anonymous_map = (map_flags_bits & process_abi.process_map_flag_anonymous) != 0;
+    if (anonymous_map and (!private_map or vmo_fd != 0 or vmo_offset != 0)) {
+        return .{ .status = sc.syscall_err_invalid };
+    }
+    if (anonymous_map and !anywhere) {
+        const end_va, const overflow = @addWithOverflow(target_va, aligned_size);
+        if (overflow != 0 or target_va < boot_static.user_low_va or
+            end_va > boot_static.user_top_va)
+            return .{ .status = sc.syscall_err_invalid };
+    }
     return .{
         .status = sc.syscall_ok,
         .request = .{
@@ -1039,6 +1049,7 @@ fn prepareProcessMapRequest(
                 .fixed = true,
                 .private = private_map,
                 .shared = !private_map,
+                .anonymous = anonymous_map,
             },
             .vmo_offset = vmo_offset,
         },
@@ -1070,6 +1081,20 @@ fn installProcessMapLocked(
     } else if (!(state.userMapRangeIsFree(target_owner, target_va, req.aligned_size) catch false)) {
         kernel_log.write("process.map failed target-occupied\n");
         return .{ .status = sc.syscall_err_invalid };
+    }
+
+    if (req.flags.anonymous) {
+        // The caller's process capability was checked for MAP_INTO. Like
+        // local anonymous mmap, the reservation needs no eagerly backed VMO.
+        _ = state.createAnonymousVmaWithPages(
+            target_owner, target_va, req.aligned_size, req.prot,
+            .{ .read = true, .write = true, .exec = true, .pkey = req.prot.pkey },
+            req.flags, free_list,
+        ) catch |err| return .{ .status = switch (err) {
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        } };
+        return .{ .status = sc.syscall_ok, .mapped_va = target_va };
     }
 
     _ = state.mmapFdIntoProcess(proc, req.vmo_fd, target_owner, target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset) catch |err| switch (err) {

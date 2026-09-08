@@ -99,6 +99,24 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run kernel unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    const realtime_clock_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/realtime_clock.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(realtime_clock_tests).step);
+    const physical_layout_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/arch/x86_64/physical_layout.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(physical_layout_tests).step);
+    const cpu_stack_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/arch/x86_64/cpu_stack_layout.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(cpu_stack_tests).step);
 
     const fd_ipc_minimal_mod = b.createModule(.{
         .root_source_file = b.path("../tests/fd_ipc_minimal.zig"),
@@ -127,12 +145,37 @@ pub fn build(b: *std.Build) void {
     const run_scheduler_runqueue_tests = b.addRunArtifact(scheduler_runqueue_tests);
     test_step.dependOn(&run_scheduler_runqueue_tests.step);
 
+    const scheduler_context_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/scheduler_connection.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scheduler_context_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerHostObject(b, scheduler_context_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_context_test.o");
+    const scheduler_context_tests = b.addTest(.{
+        .root_module = scheduler_context_test_mod,
+        .filters = &.{ "migration waits", "preferred wake" },
+    });
+    test_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
+
+    const smp_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/smp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    smp_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const smp_tests = b.addTest(.{ .root_module = smp_test_mod, .filters = &.{"broadcast"} });
+    test_step.dependOn(&b.addRunArtifact(smp_tests).step);
+
+    const kernel_debug = b.option(bool, "kernel-debug", "Keep kernel debug information and symbols in the boot ELF") orelse false;
+    const smp_profile_options = b.addOptions();
+    smp_profile_options.addOption(bool, "enabled", b.option(bool, "smp-profile", "Enable per-CPU SMP diagnostic counters") orelse false);
     const limine_mod = b.createModule(.{
         .root_source_file = b.path("../bootloader/limine/kernel_entry.zig"),
         .target = limine_target,
         .optimize = .ReleaseSmall,
         .code_model = .kernel,
-        .strip = false,
+        .strip = !kernel_debug,
     });
     const kernel_boot_api_mod = b.createModule(.{
         .root_source_file = b.path("src/bootloader_api.zig"),
@@ -142,6 +185,7 @@ pub fn build(b: *std.Build) void {
     });
     kernel_boot_api_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    limine_mod.addOptions("smp_profile_options", smp_profile_options);
     limine_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
     addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_limine.o");
     const limine_kernel = b.addExecutable(.{

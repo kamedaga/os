@@ -1,4 +1,5 @@
 const std = @import("std");
+const perf = @import("smp_perf.zig");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig").connection;
@@ -45,6 +46,7 @@ var syscall_hooks_ready = false;
 
 const KernelStateSpinLock = struct {
     value: u8 = 0,
+    profile_start: u64 = 0,
 
     fn waitWithInterruptWindow() void {
         // Syscalls enter with IF clear.  A CPU waiting for the global state
@@ -54,8 +56,19 @@ const KernelStateSpinLock = struct {
     }
 
     fn lock(self: *KernelStateSpinLock) void {
+        const start = perf.timestamp();
+        var contended = false;
         while (true) {
-            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) return;
+            if (@cmpxchgWeak(u8, &self.value, 0, 1, .acquire, .monotonic) == null) {
+                if (perf.enabled) {
+                    self.profile_start = perf.timestamp();
+                    perf.add(.kernel_lock_wait_cycles, self.profile_start -% start);
+                    perf.add(.kernel_lock_acquires, 1);
+                    if (contended) perf.add(.kernel_lock_contended, 1);
+                }
+                return;
+            }
+            contended = true;
             while (@atomicLoad(u8, &self.value, .monotonic) != 0) {
                 waitWithInterruptWindow();
             }
@@ -63,10 +76,16 @@ const KernelStateSpinLock = struct {
     }
 
     fn tryLock(self: *KernelStateSpinLock) bool {
-        return @cmpxchgStrong(u8, &self.value, 0, 1, .acquire, .monotonic) == null;
+        if (@cmpxchgStrong(u8, &self.value, 0, 1, .acquire, .monotonic) != null) return false;
+        if (perf.enabled) {
+            self.profile_start = perf.timestamp();
+            perf.add(.kernel_lock_acquires, 1);
+        }
+        return true;
     }
 
     fn unlock(self: *KernelStateSpinLock) void {
+        perf.elapsed(.kernel_lock_hold_cycles, self.profile_start);
         @atomicStore(u8, &self.value, 0, .release);
     }
 };
@@ -154,6 +173,12 @@ pub fn kernelStaticStorageEndAddr() usize {
 }
 
 pub fn init(new_hooks: Hooks) void {
+    const realtime_clock = @import("realtime_clock.zig");
+    realtime_clock.initialize(@import("arch/x86_64/platform.zig").kernelPointerPaddr);
+    new_hooks.write(if (realtime_clock.usesKvmClock()) "clock: source=kvm\n" else "clock: source=tsc-or-rtc\n");
+    new_hooks.write("clock: realtime counter_hz=");
+    new_hooks.print_number(realtime_clock.counterFrequencyHz());
+    new_hooks.write("\n");
     syscall_hooks_storage = new_hooks;
     syscall_hooks_ready = true;
 }

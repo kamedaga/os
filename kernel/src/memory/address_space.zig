@@ -85,7 +85,7 @@ fn allocKernelSlice(comptime T: type, free_list: *types.FreePageList, count: usi
     if (count == 0) return null;
     const bytes = @sizeOf(T) * count;
     const page_count = (bytes + 4095) / 4096;
-    const paddr = free_list.popContiguousAtOrAbove(page_count, 0) catch return null;
+    const paddr = free_list.popContiguousBelow(page_count, @import("../arch/x86_64/physical_layout.zig").identity_limit) catch return null;
     const raw: [*]u8 = @ptrFromInt(paddr);
     @memset(raw[0 .. page_count * 4096], 0);
     const ptr: [*]T = @ptrCast(@alignCast(raw));

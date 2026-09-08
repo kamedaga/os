@@ -60,7 +60,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   -o "$scanner_object"
 
 /usr/bin/clang \
-  -std=c11 \
+  -std=c11 -O2 \
   -Wall -Wextra -Werror \
   -ffreestanding \
   -fPIC \

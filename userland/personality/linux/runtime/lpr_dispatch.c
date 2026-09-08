@@ -42,6 +42,8 @@ static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
 
 static uint32_t lpr_linux_private_expedited_registered;
 
+#include "lpr_gui_profile.h"
+
 const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
 {
     enum { LPR_FRAME_ANCHOR_MAX_DEPTH = 64 };
@@ -234,6 +236,16 @@ static uint64_t lpr_syscall_profile_owner_pid;
 #endif
 
 static lpr_trace_syscall_metric_t lpr_trace_syscall_metrics[] = {
+#if defined(LPR_SYSCALL_PROFILE) && LPR_SYSCALL_PROFILE
+    /* Diagnostic-only IDs: distinguish wall-clock RTC reads from monotonic
+     * calls without emitting a log for every clock_gettime invocation. */
+    { .nr = 10000u + LPR_LINUX_CLOCK_REALTIME },
+    { .nr = 10000u + LPR_LINUX_CLOCK_MONOTONIC },
+    { .nr = 10000u + LPR_LINUX_CLOCK_MONOTONIC_RAW },
+    { .nr = 10000u + LPR_LINUX_CLOCK_REALTIME_COARSE },
+    { .nr = 10000u + LPR_LINUX_CLOCK_MONOTONIC_COARSE },
+    { .nr = 10000u + LPR_LINUX_CLOCK_BOOTTIME },
+#endif
     { .nr = LPR_LINUX_SYS_READ },
     { .nr = LPR_LINUX_SYS_WRITE },
     { .nr = LPR_LINUX_SYS_OPEN },
@@ -349,6 +361,14 @@ static void lpr_syscall_profile_enable(void)
 {
     const uint64_t pid =
         (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
+#if defined(LPR_SYSCALL_PROFILE_PID)
+    if ((uint64_t)lpr_linux_getpid() != LPR_SYSCALL_PROFILE_PID) {
+        lpr_syscall_profile_enabled = 0;
+        lpr_syscall_profile_started_at = 0;
+        pacha_trace_set_masks(0, 0);
+        return;
+    }
+#endif
     if (lpr_syscall_profile_enabled != 0 &&
         lpr_syscall_profile_owner_pid == pid)
     {
@@ -416,8 +436,11 @@ static void lpr_trace_syscall_dump(uint64_t exit_nr)
         if (metric->count == 0) {
             continue;
         }
-        total_count += metric->count;
-        total_cycles += metric->total_cycles;
+        /* Clock-ID submetrics overlap the ordinary clock_gettime metric. */
+        if (metric->nr < 10000u) {
+            total_count += metric->count;
+            total_cycles += metric->total_cycles;
+        }
         pacha_trace6(
             PACHA_TRACE_COMPONENT_LPR,
             PACHA_TRACE_EVENT_LPR_SYSCALL_METRIC,
@@ -467,6 +490,7 @@ static void lpr_syscall_profile_maybe_dump(uint64_t nr)
     }
     lpr_syscall_profile_snapshot_dumped = 1;
     lpr_trace_syscall_dump(nr);
+    lpr_netd_profile_dump();
 #if defined(LPR_STARTUP_PROFILE) && LPR_STARTUP_PROFILE
     lpr_startup_profile_dump();
 #else
@@ -2865,6 +2889,7 @@ static int64_t lpr_sys_rt_sigreturn(uint64_t a0, uint64_t a1, uint64_t a2, uint6
 static int64_t lpr_sys_sigaltstack(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sigaltstack(a0, a1); }
 static int64_t lpr_sys_ioctl(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_ioctl(a0, a1, a2); }
 static int64_t lpr_sys_pread64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_pread64(a0, a1, a2, a3); }
+static int64_t lpr_sys_pwrite64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_pwrite64(a0, a1, a2, a3); }
 static int64_t lpr_sys_readv(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_readv(a0, a1, a2); }
 static int64_t lpr_sys_writev(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     (void)a3; (void)a4; (void)a5;
@@ -3465,6 +3490,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_RT_SIGRETURN, "rt_sigreturn", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_rt_sigreturn, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_IOCTL, "ioctl", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_ioctl, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_PREAD64, "pread64", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_pread64, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_PWRITE64, "pwrite64", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_pwrite64, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_READV, "readv", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_readv, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_WRITEV, "writev", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_writev, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_ACCESS, "access", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_access, 0),
@@ -3648,6 +3674,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_RT_SIGRETURN].handler = lpr_sys_rt_sigreturn;
     lpr_syscall_table[LPR_LINUX_SYS_IOCTL].handler = lpr_sys_ioctl;
     lpr_syscall_table[LPR_LINUX_SYS_PREAD64].handler = lpr_sys_pread64;
+    lpr_syscall_table[LPR_LINUX_SYS_PWRITE64].handler = lpr_sys_pwrite64;
     lpr_syscall_table[LPR_LINUX_SYS_READV].handler = lpr_sys_readv;
     lpr_syscall_table[LPR_LINUX_SYS_WRITEV].handler = lpr_sys_writev;
     lpr_syscall_table[LPR_LINUX_SYS_ACCESS].handler = lpr_sys_access;
@@ -3944,6 +3971,13 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         return result;
     }
     lpr_linux_signal_runtime_init();
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    lpr_gui_init();
+    const int gui_main = lpr_gui_selected && !lpr_gui_dumped &&
+        nr != LPR_LINUX_SYS_RT_SIGRETURN &&
+        (uint64_t)lpr_linux_gettid() == lpr_gui_tid;
+    if (gui_main && nr == LPR_LINUX_SYS_EXIT_GROUP) lpr_gui_dump();
+#endif
 #if defined(LPR_SYSCALL_PROFILE) && LPR_SYSCALL_PROFILE
     lpr_syscall_profile_enable();
 #endif
@@ -4020,9 +4054,17 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
 #endif
 #endif
     for (;;) {
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        const uint64_t gui_start = gui_main ? pacha_trace_read_tsc() : 0;
+#endif
         const uint64_t start_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
         result = lpr_dispatch_syscall_inner(entry, frame, a0, a1, a2, a3, a4, a5);
         const uint64_t end_cycles = trace_metrics ? pacha_trace_read_tsc() : 0;
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+        /* Delivering a signal can abandon this stack, so finish the span
+         * before every delivery/restart point. Count restarted attempts. */
+        if (gui_main) lpr_gui_record(lpr_gui_kind(nr, a3), gui_start, pacha_trace_read_tsc());
+#endif
         if (end_cycles >= start_cycles) cycles += end_cycles - start_cycles;
         if (result != LPR_WAIT_RESTART_SYSCALL) break;
 
@@ -4065,6 +4107,10 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
 #endif
     if (trace_metrics) {
         lpr_trace_syscall_record(nr, cycles, result);
+#if defined(LPR_SYSCALL_PROFILE) && LPR_SYSCALL_PROFILE
+        if (nr == LPR_LINUX_SYS_CLOCK_GETTIME && a0 <= LPR_LINUX_CLOCK_BOOTTIME)
+            lpr_trace_syscall_record(10000u + a0, cycles, result);
+#endif
     }
 #if defined(LPR_SYSCALL_PROFILE) && LPR_SYSCALL_PROFILE
     lpr_syscall_profile_maybe_dump(nr);

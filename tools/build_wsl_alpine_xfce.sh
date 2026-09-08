@@ -7,6 +7,7 @@ branch="${ALPINE_XFCE_VERSION:-v3.22}"
 arch="${ALPINE_XFCE_ARCH:-x86_64}"
 mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 lock="${repo_root}/tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+writer_lock="${repo_root}/tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
 cache="${repo_root}/.artifacts/third_party/alpine-xfce-${branch}-${arch}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 mesa_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-root"
@@ -64,6 +65,7 @@ require_locked thunar 4.20.3-r0
 require_locked xfce4-terminal 1.1.3-r0
 require_locked xfce4-notifyd 0.9.6-r0
 require_locked gtk+3.0-demo 3.24.50-r0
+require_locked gtk4.0-demo 4.18.6-r0
 require_locked json-c 0.18-r1
 
 if awk '$1 !~ /^#/ && $2 == "polkit-elogind-libs" { found=1 } END { exit found ? 0 : 1 }' "${lock}"; then
@@ -76,6 +78,17 @@ tmp="$(mktemp -d "${cache}/extract.XXXXXX")"
 trap 'rm -rf "${tmp}"' EXIT
 runtime="${tmp}/runtime"
 mkdir -p "${runtime}"
+# Keep the existing desktop pins intact and register Writer in the same apk
+# transaction. A separate overlay database would lose ownership of base files.
+base_lock="${lock}"
+lock="${tmp}/combined.lock"
+awk '$1 !~ /^#/' "${base_lock}" "${writer_lock}" | LC_ALL=C sort -k2,2 >"${lock}"
+if ! awk '{ if (seen[$2]++) exit 1 }' "${lock}"; then
+  echo "duplicate package between Xfce and Writer locks" >&2
+  exit 1
+fi
+locked_count="$(awk '$1 == "#" && $2 == "package-count" { n += $3 } END { print n }' "${base_lock}" "${writer_lock}")"
+printf '# package-count %s\n' "${locked_count}" >>"${lock}"
 package_count=0
 package_apks=()
 
@@ -136,15 +149,18 @@ locked_count="$(awk '$1 == "#" && $2 == "package-count" { print $3 }' "${lock}")
 # shipped Xfce stack from unmanaged files.  Running the target apk without
 # package scripts keeps this build deterministic while retaining upstream
 # package metadata, dependency edges, and file ownership records.
-command -v fakeroot >/dev/null 2>&1 || {
-  echo "fakeroot is required to construct the Xfce apk database" >&2
+command -v unshare >/dev/null 2>&1 || {
+  echo "unshare with user namespaces is required to construct the Xfce apk database" >&2
   exit 1
 }
 apk_bootstrap_libraries="${tmp}/apk-bootstrap-libraries"
 python3 "${repo_root}/tools/rootfs_overlay.py" library-view \
   "${apk_bootstrap_libraries}" \
   "${runtime}" "${mesa_root}" "${input_root}" "${clang_root}"
-fakeroot -- "${linux_musl}" --library-path "${apk_bootstrap_libraries}" \
+# Target apk uses musl, so glibc's fakeroot preload cannot emulate its xattr
+# calls. A root-mapped user namespace permits Alpine's file-capability xattrs
+# without host root privileges. Rootfs ownership is assigned by the packer.
+unshare --user --map-root-user -- "${linux_musl}" --library-path "${apk_bootstrap_libraries}" \
   "${runtime}/sbin/apk" \
   --root "${runtime}" \
   --initdb \
@@ -152,6 +168,7 @@ fakeroot -- "${linux_musl}" --library-path "${apk_bootstrap_libraries}" \
   --no-network \
   --no-progress \
   --no-scripts \
+  --no-chown \
   add "${package_apks[@]}" >"${tmp}/apk-install.log"
 
 LC_ALL=C awk '$1 !~ /^#/ { print $2 " " $3 }' "${lock}" |
@@ -188,6 +205,7 @@ rm -rf \
   "${runtime}"/var/cache/apk
 mkdir -p "${runtime}/usr/share/pacha"
 cp "${lock}" "${runtime}/usr/share/pacha/xfce-packages.lock"
+cp "${writer_lock}" "${runtime}/usr/share/pacha/libreoffice-packages.lock"
 
 # pack.yaml publishes the project-wide runtime loader, libc, /bin/sh, and CA
 # bundle at these exact paths. Keep their Alpine packages in the installed
@@ -206,7 +224,17 @@ rm -f \
 # These are ordinary rootfs policy; seed0root only needs to execute /sbin/init.
 ln -s ../bin/busybox "${runtime}/sbin/init"
 ln -s busybox "${runtime}/bin/sed"
+ln -s busybox "${runtime}/bin/grep"
 ln -s busybox "${runtime}/bin/hostname"
+install -D -m 0755 "${repo_root}/userland/fixtures/linux/libreoffice-launcher.sh" \
+  "${runtime}/usr/local/bin/libreoffice"
+ln -s libreoffice "${runtime}/usr/local/bin/lowriter"
+# Upstream absolute desktop links work in the guest but escape the staged
+# root during host-side cache generation. Equivalent relative links work in both.
+for desktop in startcenter writer xsltfilter; do
+  ln -sfn "../../lib/libreoffice/share/xdg/${desktop}.desktop" \
+    "${runtime}/usr/share/applications/libreoffice-${desktop}.desktop"
+done
 
 install -d -m 0700 "${runtime}/root"
 printf '%s\n' \
@@ -279,6 +307,8 @@ python3 "${repo_root}/tools/rootfs_overlay.py" library-view \
   "${library_root}" "${runtime}" "${mesa_root}" "${input_root}" "${clang_root}"
 
 for executable in \
+  usr/lib/libreoffice/program/soffice.bin \
+  usr/lib/libreoffice/program/oosplash \
   bin/bash \
   sbin/apk \
   usr/libexec/Xorg \
@@ -289,13 +319,14 @@ for executable in \
   usr/bin/xfsettingsd \
   usr/bin/xfce4-about \
   usr/bin/gtk3-demo \
+  usr/bin/gtk4-demo \
   usr/bin/thunar \
   usr/bin/xfce4-terminal \
   usr/bin/xprop \
   usr/bin/xwininfo \
   usr/bin/dbus-daemon; do
   report="${tmp}/$(basename "${executable}").loader"
-  if ! "${linux_musl}" --library-path "${library_root}" --list \
+  if ! "${linux_musl}" --library-path "${library_root}:${runtime}/usr/lib/libreoffice/program" --list \
       "${runtime}/${executable}" >"${report}" 2>&1; then
     cat "${report}" >&2
     echo "Xfce executable does not resolve: /${executable}" >&2
@@ -334,6 +365,7 @@ for required in \
   usr/bin/xfsettingsd \
   usr/bin/xfce4-about \
   usr/bin/gtk3-demo \
+  usr/bin/gtk4-demo \
   usr/bin/thunar \
   usr/bin/xfce4-terminal \
   usr/bin/xfce4-notifyd-config \

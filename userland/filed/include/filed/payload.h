@@ -184,6 +184,18 @@ typedef struct filed_statx {
     uint64_t rdev;
 } filed_statx_t;
 
+/* One metadata lookup; no client-visible handle is allocated or returned. */
+typedef struct filed_statat {
+    uint64_t dir_handle;
+    uint64_t flags;
+    char name[FILED_PATH_BYTES];
+    filed_statx_t stat;
+} filed_statat_t;
+
+enum { FILED_STATAT_NOFOLLOW = 1u << 0 };
+
+_Static_assert(sizeof(filed_statat_t) == 624, "filed_statat wire size");
+
 typedef struct filed_statfs {
     uint64_t handle;
     uint64_t type;

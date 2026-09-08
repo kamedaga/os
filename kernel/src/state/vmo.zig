@@ -1,4 +1,5 @@
 const std = @import("std");
+const smp_perf = @import("../smp_perf.zig");
 const builtin = @import("builtin");
 const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
@@ -172,10 +173,10 @@ pub fn releaseNativeVmoOwnedPages(slot: *NativeVmoSlot, free_list: *FreePageList
         while (page_index < slot.page_count) : (page_index += 1) {
             const paddr = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index) orelse continue;
             if (paddr == 0) continue;
-            if (free_list.canAppendPage(0, paddr)) {
-                free_list.appendPage(0, paddr) catch {};
-                setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, slot.page_store_owner, 0) catch {};
-            }
+            // appendPage validates capacity and duplicates under its own lock.
+            // A separate preflight repeats the scan and cannot reserve space.
+            free_list.appendPage(0, paddr) catch continue;
+            setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, page_index, slot.page_store_owner, 0) catch {};
         }
     }
 }
@@ -252,8 +253,16 @@ pub fn releaseNativeVmoWithFreeList(self: anytype, vmo_ref: NativeVmoRef, free_l
     slot.ref_count -= 1;
     if (slot.ref_count == 0) {
         const parent = slot.parent;
+        smp_perf.vmoAdd(.final_drop_calls, 1);
+        smp_perf.vmoAdd(.final_drop_logical_pages, slot.page_count);
+        if (slot.has_page_store) smp_perf.vmoAdd(.final_drop_with_store, 1);
+        var profile_stage = smp_perf.timestamp();
         @TypeOf(self.*).releaseNativeVmoOwnedPages(slot, free_list);
+        smp_perf.vmoElapsed(.final_owned_cycles, profile_stage);
+        profile_stage = smp_perf.timestamp();
         @TypeOf(self.*).clearNativeVmoSlot(slot);
+        smp_perf.vmoElapsed(.final_clear_cycles, profile_stage);
+        // Only local stages are timed; do not count recursive parent work twice.
         if (!parent.isNull()) self.releaseNativeVmoWithFreeList(parent, free_list);
     }
 }
@@ -582,14 +591,24 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
     if (self.nativeCowTableIsUnique(entry.cow_table)) return;
     const old_ref = entry.cow_table;
     const old_table = self.nativeCowTableSlotConst(old_ref) orelse return KernelError.InvalidState;
-    const new_ref = try self.createNativeCowTable(old_table.page_count, free_list);
+    // mprotect/munmap splits retain the original table with an offset. Only
+    // this VMA's slice belongs in its private snapshot; copying the whole
+    // original table duplicates unrelated pages once per split at fork.
+    const page_count_u64 = entry.size_bytes / native_page_size;
+    if (entry.size_bytes % native_page_size != 0 or page_count_u64 == 0 or
+        entry.cow_page_offset > old_table.page_count or
+        page_count_u64 > old_table.page_count - entry.cow_page_offset)
+        return KernelError.InvalidState;
+    const page_count: u32 = @intCast(page_count_u64);
+    const old_offset = entry.cow_page_offset;
+    const new_ref = try self.createNativeCowTable(page_count, free_list);
     try self.retainNativeCowTable(new_ref);
     var installed = false;
     errdefer if (!installed) self.releaseNativeCowTable(new_ref, free_list);
 
     var page_index: u32 = 0;
-    while (page_index < old_table.page_count) : (page_index += 1) {
-        const src_paddr = vmoBackingPageStorePaddr(old_table.page_store_start, old_table.page_count, page_index) orelse return KernelError.InvalidState;
+    while (page_index < page_count) : (page_index += 1) {
+        const src_paddr = vmoBackingPageStorePaddr(old_table.page_store_start, old_table.page_count, old_offset + page_index) orelse return KernelError.InvalidState;
         if (src_paddr == 0) continue;
         const copied_paddr = (self.allocPhysicalPage(free_list) catch return KernelError.OutOfFreePages).paddr;
         var copied_installed = false;
@@ -600,6 +619,7 @@ pub fn detachSharedEntryCowTable(self: anytype, entry: *VmaEntry, free_list: *Fr
     }
 
     entry.cow_table = new_ref;
+    entry.cow_page_offset = 0;
     self.releaseNativeCowTable(old_ref, free_list);
     installed = true;
 }
@@ -619,40 +639,61 @@ pub fn releaseUnmappedAnonymousVmoPageRange(
     if (first_page >= slot.page_count or page_count > @as(usize, slot.page_count) - first_page) return;
     const release_end = first_page + page_count;
 
-    for (self.fd_objects[0..]) |object_slot| {
-        if (object_slot.kind != .vmo or object_slot.ref_count == 0) continue;
-        const object_vmo = switch (object_slot.payload) {
-            .vmo => |object_ref| object_ref,
-            else => continue,
-        };
-        if (@TypeOf(self.*).nativeVmoRefsEqual(object_vmo, vmo_ref)) return;
+    const profile_start = smp_perf.timestamp();
+    defer smp_perf.vmoElapsed(.partial_total_cycles, profile_start);
+    smp_perf.vmoAdd(.partial_calls, 1);
+    smp_perf.vmoAdd(.partial_requested_pages, page_count);
+    if (!slot.has_page_store) smp_perf.vmoAdd(.partial_no_page_store, 1);
+    {
+        const profile_stage = smp_perf.timestamp();
+        defer smp_perf.vmoElapsed(.partial_fd_scan_cycles, profile_stage);
+        for (self.fd_objects[0..]) |object_slot| {
+            if (object_slot.kind != .vmo or object_slot.ref_count == 0) continue;
+            const object_vmo = switch (object_slot.payload) {
+                .vmo => |object_ref| object_ref,
+                else => continue,
+            };
+            if (@TypeOf(self.*).nativeVmoRefsEqual(object_vmo, vmo_ref)) {
+                smp_perf.vmoAdd(.partial_fd_alias, 1);
+                return;
+            }
+        }
     }
 
-    var process_index: usize = 0;
-    while (process_index < self.process_capacity) : (process_index += 1) {
-        const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
-        var active_index: usize = 0;
-        while (active_index < table.active_count) : (active_index += 1) {
-            const entry_index: usize = @intCast(table.active_indices[active_index]);
-            const entry = &table.entries[entry_index];
-            if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
-            const entry_first_page: usize = @intCast(entry.vmo_offset / native_page_size);
-            const entry_page_count: usize = @intCast(entry.size_bytes / native_page_size);
-            const entry_end_page = entry_first_page + entry_page_count;
-            if (first_page < entry_end_page and release_end > entry_first_page) return;
+    {
+        const profile_stage = smp_perf.timestamp();
+        defer smp_perf.vmoElapsed(.partial_vma_scan_cycles, profile_stage);
+        var process_index: usize = 0;
+        while (process_index < self.process_capacity) : (process_index += 1) {
+            const table = self.vmaTableForProcessIndexConst(process_index) orelse continue;
+            var active_index: usize = 0;
+            while (active_index < table.active_count) : (active_index += 1) {
+                const entry_index: usize = @intCast(table.active_indices[active_index]);
+                const entry = &table.entries[entry_index];
+                if (!@TypeOf(self.*).nativeVmoRefsEqual(entry.vmo, vmo_ref)) continue;
+                const entry_first_page: usize = @intCast(entry.vmo_offset / native_page_size);
+                const entry_page_count: usize = @intCast(entry.size_bytes / native_page_size);
+                const entry_end_page = entry_first_page + entry_page_count;
+                if (first_page < entry_end_page and release_end > entry_first_page) {
+                    smp_perf.vmoAdd(.partial_vma_alias, 1);
+                    return;
+                }
+            }
         }
     }
 
     if (!slot.has_page_store) return;
+    const profile_pages = smp_perf.timestamp();
+    defer smp_perf.vmoElapsed(.partial_page_cycles, profile_pages);
     var page_index: usize = 0;
     while (page_index < page_count) : (page_index += 1) {
         const vmo_page = first_page + page_index;
         const paddr = vmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page) orelse continue;
         if (paddr == 0) continue;
-        if (free_list.canAppendPage(0, paddr)) {
-            free_list.appendPage(0, paddr) catch {};
-            setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page, slot.page_store_owner, 0) catch {};
-        }
+        // Retain the backing pointer if the atomic append fails; keep trying
+        // later pages, which may still fit by merging with an existing range.
+        free_list.appendPage(0, paddr) catch continue;
+        setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, vmo_page, slot.page_store_owner, 0) catch {};
     }
 }
 

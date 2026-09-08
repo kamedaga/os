@@ -130,6 +130,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, @import("../smp_perf.zig").staticEnd());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
 }
@@ -290,6 +291,9 @@ fn initKernelRuntimeOrHalt() void {
 fn initMemoryModules() void {
     user_space_table.init(user_spaces);
     for (user_spaces) |*space| {
+        // First initialization owns the lock state; later address-space resets
+        // preserve it. Initialize in place to avoid a multi-MiB .{} constant.
+        space.lock_state = .{};
         user_vm.resetUserAddressSpaceStorage(space);
     }
 
@@ -345,7 +349,6 @@ pub fn prepareLimineKernelStorageOrHalt() void {
     }
 
     user_spaces = limine_user_spaces_storage[0..];
-    @memset(user_spaces, .{});
     boot_scratch.install(limine_boot_scratch_storage[0..]);
     initMemoryModules();
     if (image_range.virtual_base != 0) {
@@ -799,6 +802,11 @@ pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     ) orelse {
         halt.haltWithMessage("SMP boot information invalid");
     };
+    for (1..smp_info.lapic_count) |cpu_slot| {
+        if (!x86_platform.allocateApRuntimeStacks(cpu_slot, kernel_runtime.global_free_list)) {
+            halt.haltWithMessage("SMP application processor stack allocation failed");
+        }
+    }
     smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     smp.configureApUserTimer(
         boot_static.lapic_timer_vector,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const realtime_clock = @import("realtime_clock.zig");
 
 const ia32_apic_base_msr: u32 = 0x1B;
 const apic_enable_bit: u64 = 1 << 11;
@@ -87,7 +88,8 @@ fn mmioWrite(offset: u32, value: u32) void {
 
 fn waitIcrIdle() bool {
     var spins: u32 = 0;
-    while ((mmioRead(lapic_reg_icr_low) & icr_delivery_status) != 0 and spins < 1000000) : (spins += 1) {
+    while (spins < 1000000) : (spins += 1) {
+        if ((mmioRead(lapic_reg_icr_low) & icr_delivery_status) == 0) return true;
         asm volatile ("pause");
     }
     return (mmioRead(lapic_reg_icr_low) & icr_delivery_status) == 0;
@@ -179,6 +181,7 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
     }
 
     mmioWrite(lapic_reg_initial_count, std.math.maxInt(u32));
+    const counter_start = realtime_clock.readCounter();
     outb(0x61, (original_port_b & ~@as(u8, 0x02)) | 0x01);
 
     var polls: u64 = 0;
@@ -189,6 +192,7 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
         return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
     }
 
+    const counter_end = realtime_clock.readCounter();
     const current_count = mmioRead(lapic_reg_current_count);
     const elapsed_counts = std.math.maxInt(u32) - current_count;
     const frequency_hz = frequencyFromPitMeasurement(elapsed_counts, calibration_pit_ticks) orelse {
@@ -203,6 +207,8 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
     };
 
     bsp_timer_initial_count = initial_count;
+    if (counter_end > counter_start)
+        realtime_clock.configureCounter(counter_end - counter_start, calibration_pit_ticks, pit_frequency_hz);
     _ = armTimer(initial_count);
     return .{
         .calibrated = true,
@@ -268,6 +274,16 @@ pub fn sendFixedIpi(apic_id: u8, vector: u8) bool {
     if (!waitIcrIdle()) return false;
     mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
     mmioWrite(lapic_reg_icr_low, @as(u32, vector));
+    return waitIcrIdle();
+}
+
+/// Caller keeps interrupts disabled across the entire ICR transaction.
+/// Use only after SMP has established that every physical CPU is online.
+pub fn sendFixedIpiAllExcludingSelf(vector: u8) bool {
+    if (lapic_base_pa == 0) return false;
+    if (!waitIcrIdle()) return false;
+    // Fixed, edge-triggered, all excluding self. Destination high is ignored.
+    mmioWrite(lapic_reg_icr_low, (@as(u32, 3) << 18) | @as(u32, vector));
     return waitIcrIdle();
 }
 
