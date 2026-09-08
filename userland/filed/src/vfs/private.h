@@ -34,6 +34,9 @@ void filed_vnode_bump_dir_generation_locked(filed_vnode_t *vnode);
 void filed_file_init_locks(filed_file_t *file);
 filed_status_t filed_file_ref_inc(filed_file_t *file);
 uint32_t filed_file_ref_dec_if_nonzero(filed_file_t *file);
+/* Internal references, with no public handle number. */
+void filed_release_open_file(filed_vfs_t *vfs, filed_file_t *file,
+    filed_vfs_reclaim_result_t *out_reclaim);
 filed_status_t filed_file_offset_snapshot(const filed_file_t *file, uint64_t *out_offset);
 filed_status_t filed_file_offset_advance(filed_file_t *file, uint64_t amount);
 uint32_t filed_file_status_flags_snapshot(const filed_file_t *file);

@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_unix/cache.h"
 
 enum {
     LPR_CLONE_VM = 0x00000100ull,
@@ -17,7 +18,7 @@ enum {
     LPR_PR_GET_PDEATHSIG = 2u,
 };
 
-_Static_assert(sizeof(lpr_thread_record_t) == 72u, "thread launch record size");
+_Static_assert(offsetof(lpr_thread_record_t, unix_context) == 72u, "thread launch prefix size");
 
 /* Linux musl's x86_64 __unmapself switches directly from SYS_munmap to
  * SYS_exit without touching its former stack.  LPR's zpoline dispatch needs
@@ -117,9 +118,40 @@ static unsigned char lpr_fork_child_stack[LPR_FORK_CHILD_STACK_BYTES]
 static struct lpr_linux_user_frame lpr_fork_child_return_frame;
 static lpr_exec_transaction_t *lpr_fork_child_transaction;
 
+static int lpr_reserve_fork_bootstrap_fd(void)
+{
+    /* Private capabilities do not survive native fork. Reserve the vacated
+     * manifest slot before any child RPC can allocate reply capabilities.
+     * This empty event conveys no I/O or process authority; the management
+     * rights are only for self-exec's replacement/rollback of the slot. */
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE;
+    const int64_t event_fd = lpr_pacha_syscall3(
+        PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, rights, PACHA_FD_FLAG_PRIVATE);
+    if (event_fd < 16) return -1;
+    if (event_fd == LPR_BOOTSTRAP_FD) return 0;
+    const int64_t reserved_fd = lpr_pacha_syscall4(
+        PACHA_FD_SYSCALL_DUP, (uint64_t)event_fd, LPR_BOOTSTRAP_FD,
+        rights, PACHA_FD_FLAG_PRIVATE);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)event_fd);
+    if (reserved_fd == LPR_BOOTSTRAP_FD) return 0;
+    if (reserved_fd >= 16)
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reserved_fd);
+    return -1;
+}
+
 const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
 {
+    if (lpr_unix_cache_fork_child() != 0) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+        for (;;) {}
+    }
     lpr_exec_transaction_t *transaction = lpr_fork_child_transaction;
+    if (lpr_reserve_fork_bootstrap_fd() != 0) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+        for (;;) {
+        }
+    }
 
     /* Only the calling thread survives a process fork.  Locks owned by any
      * vanished sibling must not reach child-side transaction cleanup. */
@@ -142,6 +174,19 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
         }
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
         for (;;) {
+        }
+    }
+    if (lpr_supervisor_pending_child_token) {
+        void *page = 0;
+        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const int64_t status = page_fd < 16 ? page_fd :
+            lpr_process_client_activate(&lpr_request_id, lpr_pacha_status_to_errno,
+                transaction->supervisor_bootstrap_fd, lpr_supervisor_pending_child_token, page_fd, page);
+        if (page_fd >= 16) lpr_destroy_standalone_wire_page(page_fd, page);
+        if (status != 0) {
+            lpr_destroy_exec_transaction(transaction);
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+            for (;;) {}
         }
     }
     lpr_destroy_exec_transaction(transaction);
@@ -188,7 +233,7 @@ static lpr_thread_record_t *lpr_thread_record_find(uint32_t tid)
     return 0;
 }
 
-static int lpr_thread_ensure_current_record(void)
+static int lpr_thread_find_or_create_current(lpr_thread_record_t **out)
 {
     const int64_t raw_tid = lpr_linux_gettid();
     if (raw_tid < 0 || raw_tid > UINT32_MAX) {
@@ -196,8 +241,9 @@ static int lpr_thread_ensure_current_record(void)
     }
     const uint32_t tid = (uint32_t)raw_tid;
     lpr_state_lock(&lpr_state.threads.lock_word);
-    if (lpr_thread_record_find(tid) == 0) {
-        lpr_thread_record_t *record = &lpr_state.threads.main_thread;
+    lpr_thread_record_t *record = lpr_thread_record_find(tid);
+    if (record == NULL) {
+        record = &lpr_state.threads.main_thread;
         if (record->started != 0u && record->tid != tid) {
             lpr_state_unlock(&lpr_state.threads.lock_word);
             return -LPR_LINUX_EINVAL;
@@ -209,8 +255,22 @@ static int lpr_thread_ensure_current_record(void)
         record->next = lpr_state.threads.head;
         lpr_state.threads.head = record;
     }
+    if (out) *out = record;
     lpr_state_unlock(&lpr_state.threads.lock_word);
     return 0;
+}
+
+static int lpr_thread_ensure_current_record(void)
+{
+    return lpr_thread_find_or_create_current(NULL);
+}
+
+int lpr_thread_current_record(lpr_thread_record_t **out)
+{
+    if (!out) return -LPR_LINUX_EINVAL;
+    *out = NULL;
+    /* Only this thread removes its record, so it remains valid after unlock. */
+    return lpr_thread_find_or_create_current(out);
 }
 
 static void lpr_thread_count_start(void)
@@ -225,6 +285,9 @@ static void lpr_thread_count_start_failed(void)
 
 void lpr_thread_after_fork_child(void)
 {
+    /* Contexts are inline in the copied records, not heap allocations. Their
+     * PRIVATE capabilities were excluded by native fork; do not close the
+     * copied FD numbers or traverse another thread's inherited record. */
     lpr_memset(&lpr_state.threads, 0, sizeof(lpr_state.threads));
     __atomic_store_n(&lpr_state.thread_count, 1u, __ATOMIC_RELEASE);
     /* The child inherits the parent's "signal runtime already registered" flag,
@@ -291,6 +354,7 @@ void lpr_linux_exit_thread(uint64_t code)
     }
     lpr_state_unlock(&lpr_state.threads.lock_word);
 
+    if (record != NULL) lpr_unix_context_destroy(&record->unix_context);
     if (last_thread) {
         lpr_linux_prepare_process_exit(code);
     }
@@ -321,6 +385,7 @@ void lpr_linux_unmapself_exit(uint64_t base, uint64_t size)
     }
     lpr_state_unlock(&lpr_state.threads.lock_word);
 
+    if (record != NULL) lpr_unix_context_destroy(&record->unix_context);
     if (last_thread) {
         lpr_linux_prepare_process_exit(0);
     }
@@ -615,17 +680,18 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
         lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
         lprs_fork_t *fork_req = (lprs_fork_t *)lpr_supervisor_payload(page);
         fork_req->parent_token = lpr_supervisor_token;
-        const int64_t fork_status = lpr_supervisor_call(
+        const int64_t fork_status = lpr_process_client_call_with_reply_fd(
+            &lpr_request_id, lpr_pacha_status_to_errno,
             LPRS_OP_PROCESS_FORK_BEGIN,
             page_fd,
             page,
             sizeof(lprs_token_request_t),
             -1,
-            0);
+            0, &fork_transaction.supervisor_bootstrap_fd);
         if (fork_status == 0 &&
             fork_req->child_pid != 0 &&
             fork_req->child_pid <= INT32_MAX &&
-            fork_req->child_token != 0)
+            fork_req->child_token != 0 && fork_transaction.supervisor_bootstrap_fd >= 16)
         {
             child_pid = (int32_t)fork_req->child_pid;
             child_token = fork_req->child_token;
@@ -673,11 +739,13 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
     native_child_frame.rsp = (uint64_t)(uintptr_t)(
         lpr_fork_child_stack + sizeof(lpr_fork_child_stack));
     lpr_fork_child_transaction = &fork_transaction;
+    lpr_unix_cache_fork_lock();
     const int64_t ret = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_PROCESS_CLONE,
         child_process_rights,
         PACHA_PROCESS_CLONE_CURRENT_THREAD | PACHA_PROCESS_CLONE_USER_FRAME,
         (uint64_t)(uintptr_t)&native_child_frame);
+    lpr_unix_cache_fork_unlock();
     lpr_fork_child_transaction = 0;
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
     if (ret >= 16) {
@@ -1356,6 +1424,8 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)process_fd);
         return status;
     }
+    /* The installer consumed the donor. Later RPCs may reuse its FD number. */
+    bootstrap_fd = -1;
     lpr_trace_process_event("execve_commit", (uint64_t)(uint32_t)process_fd, (uint64_t)(uint32_t)thread_fd, 0);
     if (lpr_supervisor_enabled) {
         /* Publish the program name while this image can still read it.  The
@@ -1397,13 +1467,8 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
         (uint64_t)(uint32_t)process_fd,
         (uint64_t)(uint32_t)thread_fd,
         0);
-    if (commit_status != 0 && lpr_supervisor_enabled) {
-        (void)lpr_supervisor_call_token(
-            LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL,
-            lpr_supervisor_token,
-            -1,
-            0);
-    }
+    /* A successful native exec never returns to this image. On failure the
+     * transaction cancels only its own prepared supervisor handoff. */
     lpr_destroy_exec_transaction(&transaction);
     (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL, (uint64_t)(uint32_t)process_fd, 1);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)thread_fd);

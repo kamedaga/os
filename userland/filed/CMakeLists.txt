@@ -10,6 +10,7 @@ set(FILED_PROFILE_CFLAGS "$ENV{PACHAOS_FILED_EXTRA_CFLAGS}")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
 set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/source")
 set(FILED_DISPATCH_SHARDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/unix_path.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/cache/cache.c"
@@ -49,6 +50,7 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fd_ipc.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox_backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/unix_path.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/dir.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/file.c"

@@ -402,8 +402,122 @@ static int run_named_socket_trial(unsigned trial)
     return 0;
 }
 
+struct bulk_transfer {
+    int sender, receiver, type, error;
+    uint64_t bytes;
+    size_t chunk;
+    unsigned char *buffer;
+    const unsigned char *pattern;
+};
+
+static void *bulk_receiver(void *opaque)
+{
+    struct bulk_transfer *transfer = opaque;
+    unsigned char *buffer = transfer->buffer;
+    const unsigned char *expected = transfer->pattern;
+    uint64_t total = 0;
+    while (total < transfer->bytes) {
+        ssize_t count = recv(transfer->receiver, buffer, 65536, 0);
+        if (count < 0 && errno == EINTR) continue;
+        size_t packet = transfer->bytes - total < transfer->chunk ?
+            (size_t)(transfer->bytes - total) : transfer->chunk;
+        if (count <= 0 || (uint64_t)count > transfer->bytes - total ||
+            (transfer->type != SOCK_STREAM && (size_t)count != packet) ||
+            memcmp(buffer, expected, (size_t)count)) {
+            transfer->error = count < 0 ? errno : EPROTO;
+            /* Keep the descriptors open until join: no recycled FD can be
+             * shutdown accidentally, and failed DGRAM receives need an
+             * explicit shutdown of the sender's ACK receive direction. */
+            shutdown(transfer->sender, SHUT_RDWR);
+            return NULL;
+        }
+        total += (uint64_t)count;
+    }
+    if (send(transfer->receiver, expected, 1, MSG_NOSIGNAL) != 1) {
+        transfer->error = errno ? errno : EIO;
+        shutdown(transfer->sender, SHUT_RDWR);
+    }
+    return NULL;
+}
+
+static int bulk_trial(unsigned trial, int type, uint64_t bytes, size_t chunk)
+{
+    int fds[2];
+    if (socketpair(AF_UNIX, type | SOCK_CLOEXEC, 0, fds)) return 1;
+    unsigned char *storage = malloc(2u * 65536u);
+    if (!storage) { close(fds[0]); close(fds[1]); return 1; }
+    struct bulk_transfer transfer = { .sender = fds[0], .receiver = fds[1],
+        .type = type, .bytes = bytes, .chunk = chunk,
+        .pattern = storage, .buffer = storage + 65536 };
+    unsigned char *payload = storage, ack = 0;
+    memset(payload, 0xa5, 65536);
+    pthread_t thread;
+    int status = pthread_create(&thread, NULL, bulk_receiver, &transfer);
+    if (status) { close(fds[0]); close(fds[1]); free(storage); return 1; }
+    /* Creation is outside the timer. No per-send timer/profiling, no stop-
+     * and-wait ACKs: the reader drains concurrently until all bytes verify.
+     * Its last ACK is included; close/join and output are outside the timer. */
+    uint64_t started = monotonic_ns(), remaining = bytes;
+    while (remaining) {
+        size_t size = remaining < chunk ? (size_t)remaining : chunk;
+        ssize_t count = send(fds[0], payload, size, MSG_NOSIGNAL);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0 || (size_t)count > size || (type != SOCK_STREAM && (size_t)count != size)) {
+            status = 1; break;
+        }
+        remaining -= (uint64_t)count;
+    }
+    if (!status) {
+        ssize_t count;
+        do { count = recv(fds[0], &ack, 1, 0); } while (count < 0 && errno == EINTR);
+        if (count != 1 || ack != 0xa5) status = 1;
+    }
+    uint64_t ended = monotonic_ns();
+    if (status) { shutdown(fds[0], SHUT_RDWR); shutdown(fds[1], SHUT_RDWR); }
+    if (pthread_join(thread, NULL) || transfer.error) status = 1;
+    close(fds[0]); close(fds[1]);
+    free(storage);
+    if (status || !started || ended <= started) {
+        fprintf(stderr, "UNIXD_BULK_FAILED type=%d trial=%u receiver_error=%d errno=%d\n",
+            type, trial, transfer.error, errno);
+        return 1;
+    }
+    printf("UNIXD_BULK type=%d trial=%u bytes=%llu chunk=%zu elapsed_ns=%llu MiB_s=%.3f verified=1\n",
+        type, trial, (unsigned long long)bytes, chunk, (unsigned long long)(ended - started),
+        (double)bytes * 1000000000.0 / (double)(ended - started) / 1048576.0);
+    return 0;
+}
+
+static int bulk_main(int argc, char **argv)
+{
+    uint64_t options[4] = {64u * 1024u * 1024u, 16384, 3, 0};
+    if (argc > 6) return 2;
+    for (int i = 2; i < argc; i++) {
+        char *end;
+        errno = 0;
+        options[i - 2] = strtoull(argv[i], &end, 10);
+        if (errno || end == argv[i] || *end || argv[i][0] == '-') return 2;
+    }
+    if (!options[0] || options[0] > 1024u * 1024u * 1024u ||
+        !options[1] || options[1] > 65504 || !options[2] || options[2] > 100 ||
+        (options[3] && options[3] != SOCK_STREAM && options[3] != SOCK_SEQPACKET && options[3] != SOCK_DGRAM)) {
+        fprintf(stderr, "usage: --bulk [bytes 1..1073741824] [chunk 1..65504] [trials 1..100] [type 0=all/1/2/5]\n");
+        return 2;
+    }
+    setbuf(stdout, NULL);
+    const int types[] = {SOCK_STREAM, SOCK_SEQPACKET, SOCK_DGRAM};
+    for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        if (options[3] && options[3] != (uint64_t)types[i]) continue;
+        for (unsigned trial = 1; trial <= options[2]; trial++)
+            if (bulk_trial(trial, types[i], options[0], (size_t)options[1])) return 1;
+    }
+    puts("UNIXD_BULK_DONE");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && !strcmp(argv[1], "--bulk")) return bulk_main(argc, argv);
     unsigned trials = DEFAULT_TRIALS;
     iterations = DEFAULT_ITERATIONS;
     if (argc > 1) iterations = (unsigned)strtoul(argv[1], 0, 10);

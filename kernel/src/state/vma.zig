@@ -640,7 +640,15 @@ pub fn commitNativeVmaFaultMapping(
     if (paddr == 0) {
         if (!entry.flags.anonymous) return null;
         var page = [_]u64{candidate_paddr};
-        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch return null;
+        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch |err| {
+            const slot = self.nativeVmoSlotConst(entry.vmo);
+            kernel_log.writeFmt(
+                "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s}\n",
+                .{ @intFromEnum(owner), plan.fault_page_va, vmo_page,
+                    if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
+            );
+            return null;
+        };
         paddr = candidate_paddr;
     }
     return .{
@@ -1032,10 +1040,10 @@ pub fn setVmaProtRange(self: anytype, owner: PrincipalId, start_va: u64, size_by
 pub fn releaseFdTableForProcessIndex(self: anytype, index: usize) void {
     const table = self.fdTableForProcessIndex(index) orelse return;
     var fd: usize = 0;
-    while (fd < fd_table_entries) : (fd += 1) {
-        const object_ref = table.entries[fd].object;
+    while (fd < table.slots().len) : (fd += 1) {
+        const object_ref = table.slots()[fd].object;
         if (object_ref.isNull()) continue;
-        table.entries[fd] = .{};
+        table.slots()[fd] = .{};
         self.releaseKernelObject(object_ref);
     }
 }
@@ -1047,12 +1055,15 @@ pub fn releaseFdTableForProcessIndexWithFreeList(
 ) void {
     const table = self.fdTableForProcessIndex(index) orelse return;
     var fd: usize = 0;
-    while (fd < fd_table_entries) : (fd += 1) {
-        const object_ref = table.entries[fd].object;
+    while (fd < table.slots().len) : (fd += 1) {
+        const object_ref = table.slots()[fd].object;
         if (object_ref.isNull()) continue;
-        table.entries[fd] = .{};
+        table.slots()[fd] = .{};
         self.releaseKernelObjectWithFreeList(object_ref, free_list);
     }
+    @TypeOf(self.*).retireFdStorage(table, table.dynamic_entries);
+    table.dynamic_entries = &.{};
+    @TypeOf(self.*).reclaimFdStorage(table, free_list);
 }
 
 pub fn releaseVmaCowPageRange(self: anytype, entry: *const VmaEntry, first_page_delta: usize, page_count: usize, free_list: ?*FreePageList) void {

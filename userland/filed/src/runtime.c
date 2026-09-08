@@ -10,6 +10,8 @@
 #include "filed_direct_backend.h"
 #include "storage_runtime.h"
 #include "bootstrap.h"
+#include "filed/unix_path.h"
+#include "pacha/syscall.h"
 #include "internal/dispatch_state.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
@@ -244,6 +246,7 @@ void filed_runtime_init(filed_runtime_t *runtime)
     memset(runtime, 0, sizeof(*runtime));
     runtime->bootstrap_fd = -1;
     runtime->client_endpoint_fd = -1;
+    runtime->unix_path_fd = -1;
     runtime->syncer_timer_fd = -1;
     runtime->netd_socket_endpoint_fd = -1;
     runtime->termd_tty_endpoint_fd = -1;
@@ -277,6 +280,14 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
     memset(&storage_bootstrap, 0, sizeof(storage_bootstrap));
     status = filed_read_storage_bootstrap_fd(runtime->bootstrap_fd, &storage_bootstrap, &bootstrap_bytes);
     if (status == 0 && storage_bootstrap.magic == KOBOXD_BOOTSTRAP_MAGIC) {
+        if (storage_bootstrap.unix_path_fd < 16 || storage_bootstrap.unix_path_fd >= PACHA_FD_TABLE_LIMIT) return -22;
+        const long path = pacha_syscall4(PACHA_FD_SYSCALL_DUP, storage_bootstrap.unix_path_fd, 16,
+            PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_INSPECT,
+            PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
+        (void)pacha_fd_close((int)storage_bootstrap.unix_path_fd);
+        if (path < 16 || path >= PACHA_FD_TABLE_LIMIT) return -13;
+        runtime->unix_path_fd = (int)path;
         koboxd_storage_runtime_t *storage_runtime = filed_runtime_storage_runtime(runtime);
         if (storage_runtime == NULL) {
             return -12;
@@ -698,11 +709,11 @@ int filed_runtime_serve(filed_runtime_t *runtime)
 
     for (;;) {
         struct pacha_pollfd fds[
-            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+            3 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
         uint64_t session_indices[
-            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+            3 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
         filed_handle_id_t lease_handles[
-            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+            3 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
         memset(lease_handles, 0, sizeof(lease_handles));
         uint64_t count = 0;
         fds[count++] = (struct pacha_pollfd){
@@ -711,6 +722,11 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             .revents = 0,
         };
         session_indices[0] = UINT64_MAX;
+        if (runtime->unix_path_fd >= 16) {
+            session_indices[count] = UINT64_MAX;
+            fds[count++] = (struct pacha_pollfd){ .fd = runtime->unix_path_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP };
+        }
         if (runtime->syncer_timer_fd >= 16) {
             session_indices[count] = UINT64_MAX;
             fds[count++] = (struct pacha_pollfd){
@@ -768,6 +784,11 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             if (runtime->syncer_timer_fd >= 16 && fds[pos].fd == runtime->syncer_timer_fd) {
                 filed_runtime_drain_syncer_timer(runtime);
                 filed_runtime_syncer_tick(runtime);
+                continue;
+            }
+            if (fds[pos].fd == runtime->unix_path_fd) {
+                if (fds[pos].revents & PACHA_FD_EVENT_HANGUP) filed_unix_path_disconnect(runtime);
+                else (void)filed_unix_path_receive(runtime);
                 continue;
             }
             if (lease_handles[pos] != 0) {

@@ -138,6 +138,7 @@ uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id)
     case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
     case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
+    case LPR_FD_OPS_UNIX: return sizeof(struct lpr_unix_socket);
     case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
     case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
     case LPR_FD_OPS_SYNC_FILE: return sizeof(lpr_sync_file_backend_t);
@@ -311,7 +312,7 @@ static void *lpr_backend_state_for_fd(uint64_t fd, uint8_t ops_id)
     void *state = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
     const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[fd];
-    if (entry->active && entry->ofd_index < lpr_control_fd_table.ofd_count) {
+    if (entry->active == 1 && entry->ofd_index < lpr_control_fd_table.ofd_count) {
         const lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[entry->ofd_index];
         if (ofd->active && ofd->generation == entry->ofd_generation &&
             lpr_ofd_ops_id(ofd) == ops_id)
@@ -761,6 +762,7 @@ void lpr_control_sync_backend_flags(uint64_t fd)
     case LPR_FD_OPS_EVENT: backend_flags = &((lpr_event_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_PIPE: backend_flags = &((lpr_pipe_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_SOCKET: backend_flags = &((lpr_socket_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_UNIX: backend_flags = &((struct lpr_unix_socket *)pin.state)->flags; break;
     case LPR_FD_OPS_EPOLL: backend_flags = &((lpr_epoll_backend_t *)pin.state)->flags; break;
     default: break;
     }
@@ -795,6 +797,15 @@ int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
     if (ensure_status != 0) {
         return ensure_status;
     }
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) return -LPR_LINUX_EBADF;
+    if (pin.ops_id == LPR_FD_OPS_UNIX) {
+        uint32_t socket_flags = (uint32_t)flags;
+        const int status = lpr_unix_socket_flags(&pin, &socket_flags, 1);
+        lpr_fd_unpin(&pin);
+        return status;
+    }
+    lpr_fd_unpin(&pin);
     if (lpr_fd_table_set_status_flags(
             &lpr_control_fd_table,
             (uint32_t)fd,
@@ -842,6 +853,15 @@ int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
     if (ensure_status != 0) {
         return ensure_status;
     }
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) return -LPR_LINUX_EBADF;
+    if (pin.ops_id == LPR_FD_OPS_UNIX) {
+        uint32_t socket_flags;
+        const int status = lpr_unix_socket_flags(&pin, &socket_flags, 0);
+        lpr_fd_unpin(&pin);
+        return status ? status : (int64_t)socket_flags;
+    }
+    lpr_fd_unpin(&pin);
     uint32_t status_flags = 0;
     if (lpr_fd_table_get_status_flags(&lpr_control_fd_table, (uint32_t)fd, &status_flags) != 0) {
         return -LPR_LINUX_EBADF;

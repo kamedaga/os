@@ -39,7 +39,7 @@ static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
 
     const struct inputd_device_config *devices = inputd_boot_devices(cfg);
     for (uint32_t i = 0; i < cfg->device_count; i++) {
-        if (devices[i].device_fd < 16 || devices[i].device_fd >= 256 ||
+        if (devices[i].device_fd < 16 || devices[i].device_fd >= PACHA_FD_TABLE_LIMIT ||
             devices[i].pci_segment > UINT16_MAX || devices[i].pci_bus > UINT8_MAX ||
             devices[i].pci_device > 31 || devices[i].pci_function > 7 ||
             devices[i].vendor_id > UINT16_MAX || devices[i].device_id > UINT16_MAX ||

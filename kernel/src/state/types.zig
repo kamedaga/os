@@ -123,6 +123,7 @@ pub const invalid_dma_device_id: DmaDeviceId = 0;
 
 pub const Fd = u32;
 pub const fd_table_entries: usize = 256;
+pub const fd_table_limit: usize = 4096;
 pub const max_fd_objects: usize = 4096;
 pub const max_pipes: usize = 256;
 pub const pipe_buffer_bytes: usize = 4096;
@@ -407,8 +408,25 @@ pub const FdInfo = struct {
     extra: u64 = 0,
 };
 
+pub const RetiredFdStorage = struct {
+    next: ?*RetiredFdStorage,
+    page_count: usize,
+};
+
 pub const FdTable = struct {
     entries: [fd_table_entries]FdEntry = [_]FdEntry{.{}} ** fd_table_entries,
+    dynamic_entries: []FdEntry = &.{},
+    // Retain metadata if PMM temporarily cannot describe another free range.
+    // This list survives descriptor reuse; it contains no live FD references.
+    retired_storage: ?*RetiredFdStorage = null,
+
+    pub fn slots(self: anytype) if (@typeInfo(@TypeOf(self)).pointer.is_const) []const FdEntry else []FdEntry {
+        return if (self.dynamic_entries.len != 0) self.dynamic_entries else &self.entries;
+    }
+
+    pub fn index(self: *const FdTable, fd: Fd) ?usize {
+        return if (fd < self.slots().len) @intCast(fd) else null;
+    }
 };
 
 pub const FdTransferMode = enum(u8) {

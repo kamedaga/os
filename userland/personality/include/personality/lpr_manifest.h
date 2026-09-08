@@ -76,7 +76,9 @@ typedef struct lpr_manifest {
     uint64_t cwd_handle;
     uint64_t cwd_capability_index;
     uint64_t supervisor_token;
-    uint64_t supervisor_endpoint_fd;
+    /* One-shot activation channel, not the administrative endpoint or the
+     * running image's authenticated control channel. */
+    uint64_t supervisor_bootstrap_fd;
     uint64_t owner_generation;
     char ctty[LPR_MANIFEST_CTTY_BYTES];
     char cwd[LPR_MANIFEST_CWD_BYTES];

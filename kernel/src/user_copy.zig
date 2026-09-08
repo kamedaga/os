@@ -326,7 +326,11 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
             break :blk state.prepareNativeVmaFaultMapping(principal, page_va, write_access, instruction_fetch);
         };
         switch (plan.kind) {
-            .denied => return null,
+            .denied => {
+                kernel_log.writeFmt("vm: fault prepare denied principal={} va=0x{x} write={} exec={}\n",
+                    .{ @intFromEnum(principal), page_va, write_access, instruction_fetch });
+                return null;
+            },
             .ready => return plan.mapping,
             .allocate_zero => {},
             .allocate_copy, .locked_slow_path => return null,
@@ -348,6 +352,8 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
             if (resolved.paddr != candidate) free_list.appendPage(0, candidate) catch {};
             return resolved;
         }
+        kernel_log.writeFmt("vm: fault commit retry principal={} va=0x{x} attempt={}\n",
+            .{ @intFromEnum(principal), page_va, attempt });
         free_list.appendPage(0, candidate) catch {};
     }
     return null;

@@ -166,6 +166,14 @@ int pacha_process_map_batch(
     const struct pacha_process_map_batch_entry *entries,
     uint64_t entry_count);
 long pacha_getrandom(void *buf, uint64_t len, uint64_t flags);
+struct pacha_fd_table_info {
+    uint64_t capacity;
+    uint64_t maximum;
+    uint64_t free_slots;
+};
+/* Zero queries; nonzero ensures a minimum capacity. Free slots are a snapshot,
+ * not a reservation. Growth never changes existing descriptor numbers. */
+int pacha_fd_table(uint64_t minimum_capacity, struct pacha_fd_table_info *out);
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out);
 int pacha_fd_close(int fd);
 long pacha_fd_read(int fd, void *buf, uint64_t len);

@@ -11,5 +11,6 @@ mkdir -p .artifacts/tests/lpr-pipe-poll
   -Iuserland/daemons/common/include -Iuserland/filed/include \
   -Iuserland/termd/include -Iuserland/drmd/include -Iuserland/inputd/include \
   -Iuserland/netd/include -Iuserland/lpr_supervisor/include -I_kobox/include \
+  -Iuserland/unixd/include \
   tests/lpr_pipe_poll_unit.c -o .artifacts/tests/lpr-pipe-poll/unit
 .artifacts/tests/lpr-pipe-poll/unit

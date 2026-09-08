@@ -12,6 +12,7 @@ enum {
 };
 
 struct filed_dispatch_state;
+struct filed_unix_hold;
 
 typedef struct filed_session {
     int channel_fd;
@@ -28,6 +29,9 @@ typedef struct filed_runtime {
     filed_tmpfs_backend_t tmpfs;
     int bootstrap_fd;
     int client_endpoint_fd;
+    int unix_path_fd;
+    struct filed_unix_hold *unix_holds;
+    uint64_t unix_hold_sequence;
     int syncer_timer_fd;
     int netd_socket_endpoint_fd;
     int termd_tty_endpoint_fd;

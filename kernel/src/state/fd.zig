@@ -136,14 +136,14 @@ const runtimeStorageBytes = types.runtimeStorageBytes;
 const initRuntimeStorage = types.initRuntimeStorage;
 
 pub fn fdIndex(fd: Fd) ?usize {
-    if (fd >= fd_table_entries) return null;
+    if (fd >= types.fd_table_limit) return null;
     return @intCast(fd);
 }
 
 pub fn findFreeFd(table: *const FdTable, min_fd: Fd) ?usize {
     var index = fdIndex(min_fd) orelse return null;
-    while (index < fd_table_entries) : (index += 1) {
-        if (table.entries[index].isEmpty()) return index;
+    while (index < table.slots().len) : (index += 1) {
+        if (table.slots()[index].isEmpty()) return index;
     }
     return null;
 }
@@ -484,7 +484,7 @@ fn revokeKernelObjectEverywhereWithFreeList(
     var process_index: usize = 0;
     while (process_index < self.process_capacity) : (process_index += 1) {
         const table = self.fdTableForProcessIndex(process_index) orelse continue;
-        for (table.entries[0..]) |*entry| {
+        for (table.slots()[0..]) |*entry| {
             if (!sameKernelObjectRef(entry.object, object_ref)) continue;
             entry.* = .{};
             self.releaseKernelObjectWithFreeList(object_ref, free_list);
@@ -538,9 +538,9 @@ pub fn fdTableForActiveProcessConst(self: anytype, principal: PrincipalId) Kerne
 
 pub fn fdEntryConst(self: anytype, owner: PrincipalId, fd: Fd) ?*const FdEntry {
     const table = self.getFdTableConst(owner) orelse return null;
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return null;
-    if (table.entries[index].isEmpty()) return null;
-    return &table.entries[index];
+    const index = table.index(fd) orelse return null;
+    if (table.slots()[index].isEmpty()) return null;
+    return &table.slots()[index];
 }
 
 pub fn fdInfo(self: anytype, owner: PrincipalId, fd: Fd) ?FdInfo {
@@ -626,8 +626,8 @@ pub fn eventWakeOwnersForFd(
         if (!desc.active) continue;
         const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
         var fd_index: usize = 0;
-        while (fd_index < fd_table_entries) : (fd_index += 1) {
-            const candidate = table.entries[fd_index];
+        while (fd_index < table.slots().len) : (fd_index += 1) {
+            const candidate = table.slots()[fd_index];
             if (candidate.object.isNull()) continue;
             if (!candidate.rights.read or (!candidate.rights.wait and !candidate.rights.poll)) continue;
             if (candidate.object.kind != source.object.kind or
@@ -824,8 +824,8 @@ pub fn fdPayloadWithRights(
     required_rights: FdRights,
 ) ?struct { rights: FdRights, payload: *KernelObjectPayload } {
     const table = self.getFdTable(owner) orelse return null;
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return null;
-    const entry = &table.entries[index];
+    const index = table.index(fd) orelse return null;
+    const entry = &table.slots()[index];
     if (entry.isEmpty()) return null;
     if (!isFdRightsSubset(required_rights, entry.rights)) return null;
     const slot = self.kernelObjectSlot(entry.object) orelse return null;
@@ -1066,13 +1066,13 @@ pub fn createSerialFdAt(
     stream: u8,
 ) KernelError!void {
     try self.requireActiveProcess(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
     const table = try self.fdTableForActiveProcess(owner);
-    if (!table.entries[index].isEmpty()) return KernelError.InvalidState;
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    if (!table.slots()[index].isEmpty()) return KernelError.InvalidState;
     const object_ref = try self.createKernelObject(.serial, .{ .serial = .{ .stream = stream } });
     errdefer if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
     try self.retainKernelObject(object_ref);
-    table.entries[index] = .{
+    table.slots()[index] = .{
         .object = object_ref,
         .rights = .{
             .inspect = true,
@@ -1099,7 +1099,7 @@ pub fn installFd(
     const table = try self.fdTableForActiveProcess(owner);
     const index = @TypeOf(self.*).findFreeFd(table, min_fd) orelse return KernelError.TableFull;
     try self.retainKernelObject(object_ref);
-    table.entries[index] = .{
+    table.slots()[index] = .{
         .object = object_ref,
         .rights = fdRightsFromBits(fdRightsToBits(rights)),
         .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
@@ -1109,10 +1109,10 @@ pub fn installFd(
 
 pub fn closeFd(self: anytype, owner: PrincipalId, fd: Fd) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const object_ref = table.entries[index].object;
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const object_ref = table.slots()[index].object;
     if (object_ref.isNull()) return KernelError.InvalidState;
-    table.entries[index] = .{};
+    table.slots()[index] = .{};
     self.releaseKernelObject(object_ref);
 }
 
@@ -1123,10 +1123,10 @@ pub fn closeFdWithFreeList(
     free_list: *FreePageList,
 ) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const object_ref = table.entries[index].object;
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const object_ref = table.slots()[index].object;
     if (object_ref.isNull()) return KernelError.InvalidState;
-    table.entries[index] = .{};
+    table.slots()[index] = .{};
     self.releaseKernelObjectWithFreeList(object_ref, free_list);
 }
 
@@ -1137,10 +1137,10 @@ pub fn closeCloexecFdsWithFreeList(
 ) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
     var fd_index: usize = 0;
-    while (fd_index < fd_table_entries) : (fd_index += 1) {
-        const entry = table.entries[fd_index];
+    while (fd_index < table.slots().len) : (fd_index += 1) {
+        const entry = table.slots()[fd_index];
         if (entry.object.isNull() or !entry.flags.cloexec) continue;
-        table.entries[fd_index] = .{};
+        table.slots()[fd_index] = .{};
         self.releaseKernelObjectWithFreeList(entry.object, free_list);
     }
 }
@@ -1154,8 +1154,8 @@ pub fn dupFd(
     flags: FdFlags,
 ) KernelError!Fd {
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const source = table.entries[index];
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const source = table.slots()[index];
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.dup) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
@@ -1172,17 +1172,17 @@ pub fn replaceFd(
 ) KernelError!void {
     if (dst_fd == src_fd) return KernelError.InvalidState;
     const src_table = try self.fdTableForActiveProcessConst(owner);
-    const src_index = @TypeOf(self.*).fdIndex(src_fd) orelse return KernelError.InvalidState;
-    const dst_index = @TypeOf(self.*).fdIndex(dst_fd) orelse return KernelError.InvalidState;
-    const source = src_table.entries[src_index];
+    const src_index = src_table.index(src_fd) orelse return KernelError.InvalidState;
+    const dst_index = src_table.index(dst_fd) orelse return KernelError.InvalidState;
+    const source = src_table.slots()[src_index];
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.dup) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
 
     try self.retainKernelObject(source.object);
     const dst_table = try self.fdTableForActiveProcess(owner);
-    const old_object = dst_table.entries[dst_index].object;
-    dst_table.entries[dst_index] = .{
+    const old_object = dst_table.slots()[dst_index].object;
+    dst_table.slots()[dst_index] = .{
         .object = source.object,
         .rights = fdRightsFromBits(fdRightsToBits(rights)),
         .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
@@ -1198,8 +1198,8 @@ pub fn setFdFlags(
     mask: FdFlags,
 ) KernelError!void {
     const table = try self.fdTableForActiveProcess(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const entry = &table.entries[index];
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const entry = &table.slots()[index];
     if (entry.object.isNull()) return KernelError.InvalidState;
     if (!entry.rights.set_flags) return KernelError.InvalidState;
     const old_bits = fdFlagsToBits(entry.flags);
@@ -1220,8 +1220,8 @@ pub fn transferFd(
 ) KernelError!Fd {
     if (from == to) return KernelError.InvalidState;
     const source_table = try self.fdTableForActiveProcessConst(from);
-    const source_index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const source = source_table.entries[source_index];
+    const source_index = source_table.index(fd) orelse return KernelError.InvalidState;
+    const source = source_table.slots()[source_index];
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.transfer) return KernelError.InvalidState;
     if (!isFdRightsSubset(rights, source.rights)) return KernelError.InvalidState;
@@ -1234,7 +1234,7 @@ pub fn transferFd(
     switch (mode) {
         .copy => {
             try self.retainKernelObject(source.object);
-            dest_table.entries[dest_index] = .{
+            dest_table.slots()[dest_index] = .{
                 .object = source.object,
                 .rights = fdRightsFromBits(fdRightsToBits(rights)),
                 .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
@@ -1242,12 +1242,12 @@ pub fn transferFd(
         },
         .move => {
             const mutable_source_table = try self.fdTableForActiveProcess(from);
-            dest_table.entries[dest_index] = .{
+            dest_table.slots()[dest_index] = .{
                 .object = source.object,
                 .rights = fdRightsFromBits(fdRightsToBits(rights)),
                 .flags = fdFlagsFromBits(fdFlagsToBits(flags)),
             };
-            mutable_source_table.entries[source_index] = .{};
+            mutable_source_table.slots()[source_index] = .{};
         },
     }
     return @intCast(dest_index);
@@ -1362,6 +1362,16 @@ pub fn takeTaskReadableWaitersForPrincipal(
         if (waiter.object.kind != .process and waiter.object.kind != .thread) continue;
         if (waiter.principal_raw != principal_raw) continue;
         if ((waiter.events & fd_abi.event_readable) == 0) continue;
+        // A single thread may exit while its process and siblings remain
+        // alive. Only publish readiness for the actual terminal objects.
+        const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
+        const terminal = switch (slot.payload) {
+            .process => |process| process.state.isTerminal(),
+            .thread => |thread| thread.state.isTerminal(),
+            else => false,
+        };
+        if (!terminal) continue;
+        if (count == out.len) break;
         const target = ThreadWakeTarget{
             .owner = waiter.owner,
             .thread_index = @intCast(waiter.thread_index),

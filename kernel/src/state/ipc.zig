@@ -924,8 +924,8 @@ pub fn ipcRecvWakeOwnersForSendFd(
         if (!desc.active) continue;
         const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
         var fd_index: usize = 0;
-        while (fd_index < fd_table_entries) : (fd_index += 1) {
-            const candidate = table.entries[fd_index];
+        while (fd_index < table.slots().len) : (fd_index += 1) {
+            const candidate = table.slots()[fd_index];
             if (candidate.object.isNull()) continue;
             if (!candidate.rights.recv or (!candidate.rights.wait and !candidate.rights.poll)) continue;
             const recv_slot = self.kernelObjectSlotConst(candidate.object) orelse continue;
@@ -955,8 +955,8 @@ pub fn fdFreeCountFrom(self: anytype, owner: PrincipalId, min_fd: Fd) KernelErro
     const table = try self.fdTableForActiveProcessConst(owner);
     var index = @TypeOf(self.*).fdIndex(min_fd) orelse return KernelError.InvalidState;
     var count: usize = 0;
-    while (index < fd_table_entries) : (index += 1) {
-        if (table.entries[index].isEmpty()) count += 1;
+    while (index < table.slots().len) : (index += 1) {
+        if (table.slots()[index].isEmpty()) count += 1;
     }
     return count;
 }
@@ -979,8 +979,8 @@ pub fn appendIpcSendFd(
 ) KernelError!void {
     if (msg.fd_count >= max_ipc_message_fds) return KernelError.InvalidState;
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(spec.fd) orelse return KernelError.InvalidState;
-    const source = table.entries[index];
+    const index = table.index(spec.fd) orelse return KernelError.InvalidState;
+    const source = table.slots()[index];
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.transfer) return KernelError.InvalidState;
     if (!isFdRightsSubset(spec.rights, source.rights)) return KernelError.InvalidState;
@@ -1037,8 +1037,8 @@ pub fn enqueueIpcMessage(
     free_list: *FreePageList,
 ) KernelError!void {
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const entry = table.entries[index];
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const entry = table.slots()[index];
     if (entry.object.isNull()) return KernelError.InvalidState;
     if (require_call) {
         if (!entry.rights.call) return KernelError.InvalidState;
@@ -1108,8 +1108,8 @@ pub fn ipcCall(
     msg.fd_count += 1;
 
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const entry = table.entries[index];
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const entry = table.slots()[index];
     if (entry.object.isNull() or !entry.rights.call) return KernelError.InvalidState;
     const queue = try self.ipcMessageQueueForSend(entry.object);
     try queue.push(msg);

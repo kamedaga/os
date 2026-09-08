@@ -1123,6 +1123,22 @@ fn fixedMremapTargetIsVmaManaged(
     return true;
 }
 
+// Only fully VMA-owned ranges may treat supervisor seed PTEs as lazy holes.
+// The caller holds the process VM transaction throughout validation and unmap.
+fn nativeVmaCoversRange(state: *kernel.KernelState, proc: kernel.PrincipalId, start: u64, size: u64) bool {
+    if (size == 0) return false;
+    const end, const overflow = @addWithOverflow(start, size);
+    if (overflow != 0) return false;
+    var cursor = start;
+    while (cursor < end) {
+        const entry = state.vmaEntryForVaConst(proc, cursor) orelse return false;
+        const next = entry.endVa();
+        if (next <= cursor) return false;
+        cursor = next;
+    }
+    return true;
+}
+
 fn mremapVmaRange(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
@@ -1165,7 +1181,10 @@ fn mremapVmaRange(
     else if (fixed)
         new_va
     else
-        findMremapMoveTarget(state, proc, new_size) orelse return sc.syscall_err_map;
+        findMremapMoveTarget(state, proc, new_size) orelse {
+            @import("../kernel_log.zig").writeFmt("vm: mremap target search failed principal={} old=0x{x}/0x{x} size=0x{x}\n", .{ @intFromEnum(proc), old_va, old_size, new_size });
+            return sc.syscall_err_map;
+        };
     if (moves and state.rangeOverlapsPinnedUserObject(proc, target_va, new_size)) {
         return sc.syscall_err_invalid;
     }
@@ -1181,11 +1200,14 @@ fn mremapVmaRange(
 
     var reservation_split_slots: usize = 0;
     if (invalidate_size != 0) {
-        reservation_split_slots += user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+        reservation_split_slots += user_vm.unmapPresentVmaSourceSplitSlotsRequired(
             proc,
             invalidate_va,
             @intCast(invalidate_size),
-        ) orelse return sc.syscall_err_map;
+        ) orelse {
+            @import("../kernel_log.zig").writeFmt("vm: mremap source preflight failed principal={} va=0x{x} size=0x{x}\n", .{ @intFromEnum(proc), invalidate_va, invalidate_size });
+            return sc.syscall_err_map;
+        };
     }
     if (fixed) {
         reservation_split_slots += user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
@@ -1195,19 +1217,26 @@ fn mremapVmaRange(
         ) orelse return sc.syscall_err_map;
     }
     if (reservation_split_slots > user_vm.freeUserReservationSlotCount(proc)) {
+        @import("../kernel_log.zig").writeFmt("vm: mremap reservation capacity failed principal={} slots={}\n", .{ @intFromEnum(proc), reservation_split_slots });
         return sc.syscall_err_alloc;
     }
 
     if (invalidate_size != 0 and
         !user_vm.invalidatePresentUserLinearRegionPtes(proc, invalidate_va, @intCast(invalidate_size)))
     {
+        @import("../kernel_log.zig").writeFmt("vm: mremap invalidate failed principal={} va=0x{x} size=0x{x}\n", .{ @intFromEnum(proc), invalidate_va, invalidate_size });
         return sc.syscall_err_map;
     }
 
-    var prepared = state.prepareMremapWithFreeList(proc, old_va, old_size, new_size, target_va, may_move, fixed, free_list) catch |err| switch (err) {
-        kernel.KernelError.OutOfFreePages => return sc.syscall_err_alloc,
-        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
-        else => return sc.syscall_err_invalid,
+    var prepared = state.prepareMremapWithFreeList(proc, old_va, old_size, new_size, target_va, may_move, fixed, free_list) catch |err| {
+        @import("../kernel_log.zig").writeFmt(
+            "vm: mremap prepare failed principal={} old=0x{x}/0x{x} new=0x{x}/0x{x} free_pages={} error={s}\n",
+            .{ @intFromEnum(proc), old_va, old_size, target_va, new_size, free_list.pageCount(), @errorName(err) },
+        );
+        return switch (err) {
+            kernel.KernelError.OutOfFreePages, kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
     };
     defer state.discardMremapPrepared(&prepared, free_list);
 
@@ -1221,7 +1250,7 @@ fn mremapVmaRange(
     // cannot leave a translation pointing at metadata/backing just freed by
     // the successful state transaction.
     if (invalidate_size != 0 and
-        !user_vm.unmapPresentUserLinearRegion(proc, invalidate_va, @intCast(invalidate_size)))
+        !user_vm.unmapPresentVmaSource(proc, invalidate_va, @intCast(invalidate_size)))
     {
         unreachable;
     }
@@ -1319,8 +1348,49 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
     };
 }
 
+// Close and wake incrementally: lifecycle teardown must cover all descriptors
+// without an FD-capacity-sized stack array or a truncated wake snapshot.
+pub fn closeProcessFdsWithWakes(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, cloexec_only: bool) void {
+    const table = state.getFdTableConst(proc) orelse return;
+    for (0..table.slots().len) |index| {
+        const entry = table.slots()[index];
+        if (entry.object.isNull() or (cloexec_only and !entry.flags.cloexec)) continue;
+        const fd: kernel.Fd = @intCast(index);
+        const endpoint = state.pipeEndpointForFd(proc, fd);
+        const channel = ipcChannelHandleForFd(state, proc, fd);
+        if (!user_vm.lockVmTransaction(proc)) return;
+        const closed = state.closeFdWithFreeList(proc, fd, h.free_list);
+        user_vm.unlockVmTransaction(proc);
+        closed catch continue;
+        if (endpoint) |pipe| {
+            if (state.pipeReadyEventsForSide(pipe.pipe, !pipe.write)) |ready| {
+                if (ready != 0) _ = wakePipeWaiters(h, state, pipe.pipe, !pipe.write, ready);
+            }
+        }
+        if (channel) |handle| _ = wakeIpcChannelCloseWaiters(h, state, handle);
+    }
+}
+
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
+        sc.syscall_fd_table => blk: {
+            if (frame.rdi > fd_abi.fd_table_limit or frame.rsi == 0 or
+                frame.rsi > @import("std").math.maxInt(u64) - fd_abi.fd_table_info_size)
+                break :blk sc.syscall_err_invalid;
+            // Check the output before allocating. The returned free count is
+            // an observation, never an admission reservation for another call.
+            var bytes: [24]u8 = [_]u8{0} ** 24;
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, &bytes)) break :blk sc.syscall_err_invalid;
+            state.ensureFdTableCapacity(proc, @intCast(frame.rdi), h.free_list) catch |err|
+                break :blk statusFromKernelError(err);
+            const table = state.getFdTableConst(proc) orelse break :blk sc.syscall_err_invalid;
+            const free = state.fdFreeCountFrom(proc, first_dynamic_fd) catch break :blk sc.syscall_err_invalid;
+            @import("std").mem.writeInt(u64, bytes[0..8], table.slots().len, .little);
+            @import("std").mem.writeInt(u64, bytes[8..16], fd_abi.fd_table_limit, .little);
+            @import("std").mem.writeInt(u64, bytes[16..24], free, .little);
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, &bytes)) break :blk sc.syscall_err_invalid;
+            break :blk sc.syscall_ok;
+        },
         sc.syscall_fd_close => blk: {
             const fd: kernel.Fd = @intCast(frame.rdi);
             const pipe_endpoint = state.pipeEndpointForFd(proc, fd);
@@ -1337,13 +1407,30 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             }
             break :blk sc.syscall_ok;
         },
-        sc.syscall_fd_dup => state.dupFd(
-            proc,
-            @intCast(frame.rdi),
-            @intCast(frame.rsi),
-            kernel.fdRightsFromBits(frame.rdx),
-            kernel.fdFlagsFromBits(@truncate(frame.r10)),
-        ) catch sc.syscall_err_invalid,
+        sc.syscall_fd_dup => blk: {
+            if (frame.rdi == fd_abi.thread_self_fd) {
+                if ((frame.rdx & ~fd_abi.thread_self_rights_mask) != 0 or
+                    (frame.r10 & ~@as(u64, fd_abi.known_flags_mask)) != 0 or
+                    frame.rsi >= fd_abi.fd_table_limit) break :blk sc.syscall_err_invalid;
+                const current = scheduler.currentThread();
+                const generation = scheduler.generationOfThread(current) orelse
+                    break :blk sc.syscall_err_not_ready;
+                break :blk state.createThreadFd(proc, .{
+                    .owner_principal_raw = @intFromEnum(proc),
+                    .thread_index = @intCast(current),
+                    .thread_generation = generation,
+                    .state = .active,
+                    .exit_code = 0,
+                }, kernel.fdRightsFromBits(frame.rdx), kernel.fdFlagsFromBits(@truncate(frame.r10)), @intCast(frame.rsi)) catch |err| statusFromKernelError(err);
+            }
+            break :blk state.dupFd(
+                proc,
+                @intCast(frame.rdi),
+                @intCast(frame.rsi),
+                kernel.fdRightsFromBits(frame.rdx),
+                kernel.fdFlagsFromBits(@truncate(frame.r10)),
+            ) catch sc.syscall_err_invalid;
+        },
         sc.syscall_fd_get_info => writeFdInfo(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_fd_set_flags => blk: {
             state.setFdFlags(proc, @intCast(frame.rdi), kernel.fdFlagsFromBits(@truncate(frame.rsi)), kernel.fdFlagsFromBits(@truncate(frame.rdx))) catch break :blk sc.syscall_err_invalid;
@@ -1402,7 +1489,12 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             smp_perf.munmapElapsed(.pinned_check_cycles, profile_stage);
             if (overlaps_pinned) break :blk sc.syscall_err_invalid;
             profile_stage = smp_perf.timestamp();
-            const reservation_slots_result = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            const native_vma_source = nativeVmaCoversRange(state, proc, frame.rdi, size);
+            const reservation_slots_result = if (native_vma_source) user_vm.unmapPresentVmaSourceSplitSlotsRequired(
+                proc,
+                frame.rdi,
+                @intCast(size),
+            ) else user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
                 proc,
                 frame.rdi,
                 @intCast(size),
@@ -1427,7 +1519,10 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             };
             defer state.discardMunmapPrepared(&prepared, h.free_list);
             profile_stage = smp_perf.timestamp();
-            if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) unreachable;
+            const unmapped = if (native_vma_source)
+                user_vm.unmapPresentVmaSource(proc, frame.rdi, @intCast(size))
+            else user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size));
+            if (!unmapped) unreachable;
             smp_perf.munmapElapsed(.unmap_cycles, profile_stage);
             profile_stage = smp_perf.timestamp();
             state.commitMunmapPrepared(&prepared, h.free_list);

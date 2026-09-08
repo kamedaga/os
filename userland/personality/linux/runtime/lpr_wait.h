@@ -2,6 +2,7 @@
 
 #include <pacha/ipc.h>
 #include <stdint.h>
+#include <unixd/poll.h>
 
 enum {
     LPR_WAIT_GRAPH_MAX_LEAVES = 256u,
@@ -25,9 +26,19 @@ typedef struct lpr_wait_graph {
     uint32_t leaf_count;
     uint32_t reserved0;
     uint64_t relative_deadline_ns;
+    /* Deferred UNIX interests: no pin, capability, or shared slot is held
+     * until block(), so graph construction can fail without cleanup. */
+    struct { uint32_t fd, events, ignore_ready;
+        struct unix_poll_sequence sequence;
+    } unix_interests[LPR_WAIT_GRAPH_MAX_LEAVES];
+    uint32_t unix_count;
 } lpr_wait_graph_t;
 
 void lpr_wait_graph_init(lpr_wait_graph_t *graph);
+int64_t lpr_wait_graph_add_unix(lpr_wait_graph_t *graph, uint32_t fd,
+    uint32_t events, uint32_t ignore_ready);
+int64_t lpr_wait_graph_add_unix_sequence(lpr_wait_graph_t *graph, uint32_t fd,
+    uint32_t events, uint32_t ignore_ready, const struct unix_poll_sequence *sequence);
 int64_t lpr_wait_graph_add_native(
     lpr_wait_graph_t *graph,
     int native_fd,

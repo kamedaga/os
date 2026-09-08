@@ -1,5 +1,6 @@
 #include "lpr_supervisor/boot_config.h"
 #include "lpr_supervisor/ipc_protocol.h"
+#include "unixd/client.h"
 
 #include <pacha/abi.h>
 #include <pacha/ipc.h>
@@ -46,6 +47,15 @@ typedef struct lprs_process {
     uint32_t pdeath_signal;
     int process_fd;
     int pending_exec_fd;
+    int control_fd;
+    int bootstrap_server_fd;
+    int bootstrap_client_fd;
+    int activation_page_fd;
+    int activation_reply_fd;
+    int unix_fd;
+    uint64_t unix_session;
+    struct unix_credentials credentials;
+    pacha_service_envelope_t activation_header;
     char ctty[LPRS_CTTY_BYTES];
     char cwd[LPRS_CWD_BYTES];
     char comm[LPRS_PROCESS_COMM_BYTES];
@@ -69,7 +79,22 @@ typedef struct lprs_waiter {
     lprs_wait4_t request;
 } lprs_waiter_t;
 
+typedef struct lprs_reply_cap {
+    int fd;
+    uint64_t rights;
+    uint64_t transfer_flags;
+} lprs_reply_cap_t;
+
+#define LPRS_CHANNEL_RIGHTS (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | \
+    PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS | \
+    PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_SEND | \
+    PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)
+#define LPRS_CLIENT_RIGHTS (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL)
+#define LPRS_UNIX_CLIENT_RIGHTS (LPRS_CLIENT_RIGHTS | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)
+
 static int g_endpoint_fd = -1;
+static int g_unix_admin_fd = -1;
+static uint64_t g_unix_request;
 /* Shared diagnostic page.  Processes write their own slot without a system
  * call; the supervisor only ever reads, and maps it once for its own lifetime
  * so answering a query costs no extra round trip to the target. */
@@ -86,11 +111,12 @@ static lprs_waiter_t *g_waiters;
 static uint64_t g_waiter_count;
 static uint64_t g_waiter_capacity;
 
-static int lprs_service_one_pending_request(void);
+static int lprs_service_one_pending_request(int endpoint, uint64_t actor, int bootstrap);
 static void lprs_refresh_exited_children(void);
 static void lprs_complete_waiters(void);
 static void lprs_interrupt_waiters(uint64_t token);
 static int lprs_signal_process_fd(int process_fd, uint64_t signal);
+static void lprs_complete_activation(lprs_process_t *proc);
 
 static int lprs_status_to_errno(long status)
 {
@@ -184,7 +210,9 @@ static int lprs_read_bootstrap(int fd, struct lprs_boot_config *out)
     if (got != (long)sizeof(*out)) {
         return PACHA_STATUS_EIO;
     }
-    if (out->magic != LPRS_BOOT_CONFIG_MAGIC || out->endpoint_fd < 16) {
+    if (out->magic != LPRS_BOOT_CONFIG_MAGIC || out->endpoint_fd < 16 ||
+        out->endpoint_fd >= PACHA_FD_TABLE_LIMIT || out->unix_admin_fd < 16 || out->unix_admin_fd >= PACHA_FD_TABLE_LIMIT ||
+        out->endpoint_fd == out->unix_admin_fd || out->flags != 0) {
         return PACHA_STATUS_EINVAL;
     }
     return 0;
@@ -302,6 +330,13 @@ static void lprs_diag_release(lprs_process_t *proc)
     proc->diag_fd = -1;
 }
 
+static void lprs_unix_release(lprs_process_t *proc)
+{
+    if (proc->unix_fd >= 16) (void)pacha_fd_close(proc->unix_fd);
+    proc->unix_fd = -1;
+    proc->unix_session = 0;
+}
+
 static void lprs_process_release_owned(lprs_process_t *proc)
 {
     if (proc == NULL) {
@@ -310,11 +345,23 @@ static void lprs_process_release_owned(lprs_process_t *proc)
     if (proc->process_fd >= 16) {
         (void)pacha_fd_close(proc->process_fd);
     }
+    if (proc->control_fd >= 16) (void)pacha_fd_close(proc->control_fd);
+    if (proc->bootstrap_server_fd >= 16) (void)pacha_fd_close(proc->bootstrap_server_fd);
+    if (proc->bootstrap_client_fd >= 16) (void)pacha_fd_close(proc->bootstrap_client_fd);
+    if (proc->activation_page_fd >= 16) (void)pacha_fd_close(proc->activation_page_fd);
+    if (proc->activation_reply_fd >= 16) (void)pacha_fd_close(proc->activation_reply_fd);
+    lprs_unix_release(proc);
     lprs_diag_release(proc);
     lprs_discard_pending_exec(proc);
     memset(proc, 0, sizeof(*proc));
     proc->process_fd = -1;
     proc->pending_exec_fd = -1;
+    proc->control_fd = -1;
+    proc->bootstrap_server_fd = -1;
+    proc->bootstrap_client_fd = -1;
+    proc->activation_page_fd = -1;
+    proc->activation_reply_fd = -1;
+    proc->unix_fd = -1;
 }
 
 static void lprs_process_activate_empty(lprs_process_t *proc)
@@ -341,7 +388,7 @@ static void lprs_orphan_children(uint64_t parent_pid)
         if (!child->active || child->ppid != parent_pid) {
             continue;
         }
-        if (child->exit_ready) {
+        if (child->exit_ready || (child->process_fd < 16 && child->pending_exec_fd < 16)) {
             lprs_process_reap(child);
         } else {
             if (child->pdeath_signal != 0 && child->process_fd >= 16) {
@@ -395,6 +442,142 @@ static lprs_process_t *lprs_alloc_process(void)
     lprs_process_t *proc = &g_processes[g_process_count++];
     lprs_process_activate_empty(proc);
     return proc;
+}
+
+static int lprs_channel_admit(void)
+{
+    struct pacha_fd_table_info info;
+    if (pacha_fd_table(0, &info) != 0) return -PACHA_LINUX_EMFILE;
+    /* Keep room for an entire incoming request after allocating a pair. */
+    const uint64_t needed = PACHA_IPC_MAX_TRANSFER_FDS + 2;
+    if (info.free_slots < needed) {
+        const uint64_t target = info.capacity + needed - info.free_slots;
+        if (target > info.maximum || pacha_fd_table(target, &info) != 0)
+            return -PACHA_LINUX_EMFILE;
+    }
+    return info.free_slots >= needed ? 0 : -PACHA_LINUX_EMFILE;
+}
+
+static int lprs_unix_session(lprs_process_t *proc, lprs_reply_cap_t *reply, uint64_t *out_session)
+{
+    if (!proc || !proc->active || proc->exit_ready) return PACHA_STATUS_ESRCH;
+    if (proc->process_fd < 16 || proc->control_fd < 16) return PACHA_STATUS_EAGAIN;
+    if (proc->unix_fd < 16) {
+        if (g_unix_admin_fd < 16) return -PACHA_LINUX_ENOTCONN;
+        if (proc->pid > INT32_MAX || proc->credentials.pid != (int32_t)proc->pid ||
+            !proc->credentials.generation) return PACHA_STATUS_EINVAL;
+        if (g_unix_request == UINT64_MAX) return -PACHA_LINUX_EOVERFLOW;
+        const int capacity_status = lprs_channel_admit();
+        if (capacity_status != 0) return capacity_status;
+        struct unix_control request = { .operation = UNIX_OP_PROCESS_REGISTER,
+            .request = ++g_unix_request, .credentials = proc->credentials };
+        struct pacha_ipc_fd received = {0};
+        unsigned count = 0;
+        const int status = unix_client_call(g_unix_admin_fd, &request, NULL, 0, &received, 1, &count);
+        if (status != 0) return status;
+        struct pacha_fd_info info;
+        const uint64_t required = LPRS_UNIX_CLIENT_RIGHTS | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER;
+        if (count != 1 || !request.result || received.fd < 16 || received.fd >= PACHA_FD_TABLE_LIMIT ||
+            pacha_fd_get_info((int)received.fd, &info) != 0 || info.kind != PACHA_FD_KIND_CHANNEL ||
+            (info.rights & required) != required) {
+            if (count && received.fd >= 16) (void)pacha_fd_close((int)received.fd);
+            return -PACHA_LINUX_EIO;
+        }
+        /* This retained endpoint keeps the socket owner alive across the
+         * CLOEXEC close of the old image's private client. Release on native
+         * process exit, not when its parent eventually calls wait4. */
+        proc->unix_fd = (int)received.fd;
+        proc->unix_session = request.result;
+    }
+    *out_session = proc->unix_session;
+    /* Notification senders can outlive unixd; observe the session itself. */
+    *reply = (lprs_reply_cap_t){ .fd = proc->unix_fd, .rights = LPRS_UNIX_CLIENT_RIGHTS,
+        .transfer_flags = PACHA_IPC_TRANSFER_PRIVATE | PACHA_IPC_TRANSFER_CLOEXEC };
+    return 0;
+}
+
+static int lprs_prepare_control(lprs_process_t *proc, lprs_reply_cap_t *reply)
+{
+    if (!proc || !proc->active || proc->exit_ready) return PACHA_STATUS_ESRCH;
+    if (proc->bootstrap_server_fd >= 16 || proc->pending_exec_fd >= 16) return PACHA_STATUS_EAGAIN;
+    int status = lprs_channel_admit();
+    if (status != 0) return status;
+    struct pacha_ipc_channel_pair pair;
+    if (pacha_ipc_channel_create(&pair, LPRS_CHANNEL_RIGHTS, 0) != 0) return PACHA_STATUS_ENOMEM;
+    proc->bootstrap_server_fd = pair.a;
+    proc->bootstrap_client_fd = pair.b;
+    *reply = (lprs_reply_cap_t){ .fd = pair.b,
+        .rights = LPRS_CLIENT_RIGHTS | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS };
+    return 0;
+}
+
+static int lprs_prepare_exec_control(lprs_process_t *proc, lprs_reply_cap_t *reply)
+{
+    const int status = lprs_prepare_control(proc, reply);
+    if (status == 0) {
+        /* Self-exec retains the current FD table. No installer needs this
+         * capability, and a concurrent fork must not inherit the handoff. */
+        reply->rights = LPRS_CLIENT_RIGHTS;
+        reply->transfer_flags = PACHA_IPC_TRANSFER_PRIVATE;
+    }
+    return status;
+}
+
+static int lprs_activate_control(lprs_process_t *proc, lprs_reply_cap_t *reply)
+{
+    if (!proc || !proc->active || proc->bootstrap_server_fd < 16 || proc->exit_ready) return PACHA_STATUS_ESRCH;
+    if (proc->process_fd < 16 && proc->pending_exec_fd < 16) return PACHA_STATUS_EAGAIN;
+    if (proc->control_fd >= 16 && proc->pending_exec_fd < 16) return PACHA_STATUS_EAGAIN;
+    const int status = lprs_channel_admit();
+    if (status != 0) return status;
+    struct pacha_ipc_channel_pair pair;
+    if (pacha_ipc_channel_create(&pair, LPRS_CHANNEL_RIGHTS, 0) != 0) return PACHA_STATUS_ENOMEM;
+    if (proc->control_fd >= 16) (void)pacha_fd_close(proc->control_fd);
+    (void)pacha_fd_close(proc->bootstrap_server_fd);
+    (void)pacha_fd_close(proc->bootstrap_client_fd);
+    proc->bootstrap_server_fd = proc->bootstrap_client_fd = -1;
+    proc->control_fd = pair.a;
+    /* One-shot activation runs before any Linux user thread starts. Failure
+     * to receive this reply aborts bootstrap; the handoff cannot be reused
+     * to acquire another copy of the running process's authority. */
+    *reply = (lprs_reply_cap_t){ .fd = pair.b, .rights = LPRS_CLIENT_RIGHTS,
+        .transfer_flags = PACHA_IPC_TRANSFER_MOVE | PACHA_IPC_TRANSFER_PRIVATE |
+            PACHA_IPC_TRANSFER_CLOEXEC };
+    return 0;
+}
+
+static int lprs_authorize(uint64_t actor, int bootstrap, uint32_t op, uint64_t subject)
+{
+    if (!actor) {
+        switch (op) {
+        case LPRS_OP_HELLO:
+        case LPRS_OP_PROCESS_REGISTER_EXEC:
+        case LPRS_OP_PROCESS_REGISTER_FD:
+        case LPRS_OP_SIGNAL_DELIVER_TTY:
+            return 0;
+        case LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN:
+        case LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL: {
+            const lprs_process_t *proc = lprs_find_by_token(subject);
+            return proc && proc->control_fd < 16 ? 0 : -PACHA_LINUX_EPERM;
+        }
+        default:
+            return -PACHA_LINUX_EPERM;
+        }
+    }
+    const lprs_process_t *caller = lprs_find_by_token(actor);
+    if (!caller || caller->exit_ready) return PACHA_STATUS_ESRCH;
+    if (bootstrap) return caller->bootstrap_server_fd >= 16 &&
+        op == LPRS_OP_PROCESS_ACTIVATE && subject == actor ? 0 : -PACHA_LINUX_EPERM;
+    if (caller->control_fd < 16) return -PACHA_LINUX_EPERM;
+    if (op == LPRS_OP_HELLO) return 0;
+    if (op == LPRS_OP_PROCESS_ACTIVATE || op == LPRS_OP_PROCESS_REGISTER_EXEC ||
+        op == LPRS_OP_PROCESS_REGISTER_FD || op == LPRS_OP_SIGNAL_DELIVER_TTY)
+        return -PACHA_LINUX_EPERM;
+    if (op == LPRS_OP_PROCESS_FORK_CANCEL || op == LPRS_OP_PROCESS_FORK_PARENT_REGISTER) {
+        const lprs_process_t *child = lprs_find_by_token(subject);
+        return child && child->ppid == caller->pid && child->control_fd < 16 ? 0 : -PACHA_LINUX_EPERM;
+    }
+    return subject == actor ? 0 : -PACHA_LINUX_EPERM;
 }
 
 static void lprs_copy_string(char *dst, uint64_t dst_bytes, const char *src)
@@ -482,6 +665,7 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
         return PACHA_STATUS_EINVAL;
     }
     lprs_register_exec_t *req = (lprs_register_exec_t *)page;
+    if (g_next_pid > INT32_MAX) return -PACHA_LINUX_EOVERFLOW;
     lprs_process_t *proc = lprs_alloc_process();
     if (proc == NULL) {
         return PACHA_STATUS_ENOMEM;
@@ -489,6 +673,11 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     proc->token = g_next_token++;
     proc->generation = g_next_generation++;
     proc->pid = g_next_pid++;
+    /* Current LPR identity policy is root-only: nonzero set*id requests are
+     * rejected. Keep the authoritative identity here, never in an app page.
+     * Credential-changing operations must update this registry and unixd. */
+    proc->credentials = (struct unix_credentials){ .pid = (int32_t)proc->pid,
+        .generation = proc->generation };
     proc->ppid = req->state.ppid;
     proc->sid = proc->pid;
     proc->pgrp = proc->pid;
@@ -651,6 +840,12 @@ static int lprs_exec_commit_cancel(uint64_t token)
     if (proc == NULL) return PACHA_STATUS_ESRCH;
     const int initial_exec = proc->process_fd < 16;
     lprs_discard_pending_exec(proc);
+    if (proc->bootstrap_server_fd >= 16) (void)pacha_fd_close(proc->bootstrap_server_fd);
+    if (proc->bootstrap_client_fd >= 16) (void)pacha_fd_close(proc->bootstrap_client_fd);
+    proc->bootstrap_server_fd = proc->bootstrap_client_fd = -1;
+    if (proc->activation_page_fd >= 16) (void)pacha_fd_close(proc->activation_page_fd);
+    if (proc->activation_reply_fd >= 16) (void)pacha_fd_close(proc->activation_reply_fd);
+    proc->activation_page_fd = proc->activation_reply_fd = -1;
     if (initial_exec) lprs_process_reap(proc);
     return 0;
 }
@@ -732,6 +927,8 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     const uint64_t parent_pgrp = parent->pgrp;
     const uint64_t parent_foreground_pgrp = parent->foreground_pgrp;
     const uint64_t parent_cwd_handle = parent->cwd_handle;
+    const struct unix_credentials parent_credentials = parent->credentials;
+    if (g_next_pid > INT32_MAX) return -PACHA_LINUX_EOVERFLOW;
     char parent_ctty[LPRS_CTTY_BYTES];
     char parent_cwd[LPRS_CWD_BYTES];
     lprs_copy_string(parent_ctty, sizeof(parent_ctty), parent->ctty);
@@ -744,6 +941,9 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     child->token = g_next_token++;
     child->generation = g_next_generation++;
     child->pid = g_next_pid++;
+    child->credentials = parent_credentials;
+    child->credentials.pid = (int32_t)child->pid;
+    child->credentials.generation = child->generation;
     child->ppid = parent_pid;
     child->sid = parent_sid;
     child->pgrp = parent_pgrp;
@@ -1247,19 +1447,21 @@ static uint64_t lprs_token_from_payload(const void *payload, uint32_t payload_si
 
 static int lprs_dispatch(
     struct pacha_ipc_msg *request,
+    uint64_t actor,
+    int bootstrap,
     uint64_t *out_result,
     int *out_keep_fd,
-    int *out_reply_fd,
+    lprs_reply_cap_t *out_reply,
     uint64_t *out_error_token,
     uint64_t *out_request_id)
 {
     if (request == NULL || out_result == NULL || out_keep_fd == NULL ||
-        out_reply_fd == NULL) {
+        out_reply == NULL) {
         return PACHA_STATUS_EINVAL;
     }
     *out_result = 0;
     *out_keep_fd = -1;
-    *out_reply_fd = -1;
+    *out_reply = (lprs_reply_cap_t){ .fd = -1 };
     if (out_error_token != NULL) {
         *out_error_token = 0;
     }
@@ -1268,8 +1470,8 @@ static int lprs_dispatch(
     }
 
     int page_fd = -1;
-    void *page = lprs_map_request_page(request, &page_fd);
-    if (page == NULL) {
+    void *mapped_page = lprs_map_request_page(request, &page_fd);
+    if (mapped_page == NULL) {
         if (out_error_token != NULL) {
             *out_error_token = lprs_error_token(
                 PACHA_STATUS_EFAULT,
@@ -1285,6 +1487,11 @@ static int lprs_dispatch(
         return PACHA_STATUS_EFAULT;
     }
 
+    /* Authorization and execution must see the same request, even when
+     * another caller thread rewrites the shared page during dispatch. */
+    _Alignas(pacha_service_envelope_t) uint8_t snapshot[PACHA_SERVICE_PAGE_BYTES];
+    memcpy(snapshot, mapped_page, sizeof(snapshot));
+    void *page = snapshot;
     pacha_service_envelope_t header;
     memcpy(&header, page, sizeof(header));
     if (out_request_id != NULL) {
@@ -1300,12 +1507,15 @@ static int lprs_dispatch(
             PACHA_SERVICE_ERROR_ABI,
             0,
             0);
-        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        memcpy(mapped_page, page, sizeof(snapshot));
+        (void)pacha_munmap(mapped_page, PACHA_SERVICE_PAGE_BYTES);
         return PACHA_STATUS_EINVAL;
     }
 
     void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
     const uint64_t token = lprs_token_from_payload(payload, header.payload_size);
+    status = lprs_authorize(actor, bootstrap, header.op, token);
+    if (status != 0) goto reply;
     switch (header.op) {
     case LPRS_OP_HELLO:
         *out_result = PACHA_SERVICE_ABI_VERSION;
@@ -1316,8 +1526,36 @@ static int lprs_dispatch(
             status = PACHA_STATUS_EINVAL;
         } else {
             status = lprs_register_exec(payload, out_result);
+            if (status == 0) {
+                lprs_process_t *proc = lprs_find_by_token(*out_result);
+                status = lprs_prepare_control(proc, out_reply);
+                if (status != 0) lprs_process_reap(proc);
+            }
             reply_payload_size = sizeof(lprs_register_exec_t);
         }
+        break;
+    case LPRS_OP_PROCESS_ACTIVATE: {
+        lprs_process_t *proc = lprs_find_by_token(actor);
+        if (proc->activation_page_fd >= 16) { status = PACHA_STATUS_EAGAIN; break; }
+        status = lprs_activate_control(proc, out_reply);
+        if (status == PACHA_STATUS_EAGAIN) {
+            /* Native fork can schedule the child before the parent has
+             * registered its process FD. Hold the activation CALL, rather
+             * than making the child poll or exposing user code early. */
+            proc->activation_page_fd = page_fd;
+            proc->activation_reply_fd = (int)request->fds[request->fd_count - 1u].fd;
+            proc->activation_header = header;
+            *out_keep_fd = page_fd;
+            (void)pacha_munmap(mapped_page, PACHA_SERVICE_PAGE_BYTES);
+            return LPRS_DISPATCH_DEFERRED;
+        }
+        break;
+    }
+    case LPRS_OP_PROCESS_EXEC_PREPARE:
+        status = lprs_prepare_exec_control(lprs_find_by_token(actor), out_reply);
+        break;
+    case LPRS_OP_PROCESS_UNIX_SESSION:
+        status = lprs_unix_session(lprs_find_by_token(actor), out_reply, out_result);
         break;
     case LPRS_OP_PROCESS_REGISTER_FD:
     case LPRS_OP_PROCESS_FORK_PARENT_REGISTER:
@@ -1330,6 +1568,7 @@ static int lprs_dispatch(
                 lprs_register_process_fd_handle(token, (int)(uint32_t)request->fds[1].fd);
             if (status == 0) {
                 *out_keep_fd = (int)(uint32_t)request->fds[1].fd;
+                lprs_complete_activation(lprs_find_by_token(token));
             }
         }
         break;
@@ -1339,7 +1578,9 @@ static int lprs_dispatch(
         if (status == 0) {
             lprs_process_t *proc = lprs_find_by_token(token);
             if (proc == NULL || proc->process_fd < 16) status = PACHA_STATUS_ESRCH;
-            else *out_reply_fd = proc->process_fd;
+            else *out_reply = (lprs_reply_cap_t){ .fd = proc->process_fd,
+                .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
+                    PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE };
         }
         break;
     case LPRS_OP_PROCESS_LIST:
@@ -1351,6 +1592,9 @@ static int lprs_dispatch(
         status = token == 0 ? PACHA_STATUS_EINVAL : lprs_fork_begin(token, payload);
         if (status == 0) {
             *out_result = ((lprs_fork_t *)payload)->child_token;
+            lprs_process_t *child = lprs_find_by_token(*out_result);
+            status = lprs_prepare_control(child, out_reply);
+            if (status != 0) lprs_process_reap(child);
             reply_payload_size = sizeof(lprs_fork_t);
         }
         break;
@@ -1369,7 +1613,10 @@ static int lprs_dispatch(
         } else {
             status = lprs_exec_commit_begin(
                 token, (int)(uint32_t)request->fds[1].fd);
-            if (status == 0) *out_keep_fd = (int)(uint32_t)request->fds[1].fd;
+            if (status == 0) {
+                *out_keep_fd = (int)(uint32_t)request->fds[1].fd;
+                lprs_complete_activation(lprs_find_by_token(token));
+            }
         }
         break;
     case LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL:
@@ -1413,7 +1660,7 @@ static int lprs_dispatch(
                 status = lprs_queue_waiter(page_fd, reply_fd, &header, wait);
                 if (status == 0) {
                     *out_keep_fd = page_fd;
-                    (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+                    (void)pacha_munmap(mapped_page, PACHA_SERVICE_PAGE_BYTES);
                     return LPRS_DISPATCH_DEFERRED;
                 }
             }
@@ -1487,6 +1734,7 @@ static int lprs_dispatch(
         break;
     }
 
+reply:
     if (status < 0 && header.op != LPRS_OP_DIAG_ERROR_GET &&
         out_error_token != NULL && *out_error_token == 0)
     {
@@ -1508,7 +1756,8 @@ static int lprs_dispatch(
         status == PACHA_STATUS_EINVAL ? PACHA_SERVICE_ERROR_ABI : PACHA_SERVICE_ERROR_LPR_TRANSLATION,
         *out_result,
         reply_payload_size);
-    (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+    memcpy(mapped_page, page, sizeof(snapshot));
+    (void)pacha_munmap(mapped_page, PACHA_SERVICE_PAGE_BYTES);
     (void)page_fd;
     return status;
 }
@@ -1518,26 +1767,48 @@ static int lprs_reply(
     uint64_t request_id,
     int64_t status,
     uint64_t result,
-    int transfer_fd,
+    const lprs_reply_cap_t *cap,
     uint64_t error_token)
 {
     struct pacha_ipc_fd transferred = {
-        .fd = (uint64_t)(uint32_t)transfer_fd,
-        .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_WAIT |
-            PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE,
+        .fd = cap ? (uint64_t)(uint32_t)cap->fd : 0,
+        .rights = cap ? cap->rights : 0,
+        .transfer_flags = cap ? cap->transfer_flags : 0,
     };
     const struct pacha_ipc_msg reply = {
         .word0 = PACHA_SERVICE_REPLY_MAGIC,
         .word1 = (uint64_t)status,
         .word2 = status < 0 ? 0 : result,
         .word3 = request_id,
-        .fds = status == 0 && transfer_fd >= 16 ? &transferred : NULL,
-        .fd_count = status == 0 && transfer_fd >= 16 ? 1u : 0u,
+        .fds = status == 0 && cap && cap->fd >= 16 ? &transferred : NULL,
+        .fd_count = status == 0 && cap && cap->fd >= 16 ? 1u : 0u,
     };
     (void)error_token;
     const int reply_status = pacha_ipc_reply(reply_fd, &reply);
+    if (cap && cap->fd >= 16 && (cap->transfer_flags & PACHA_IPC_TRANSFER_MOVE))
+        (void)pacha_fd_close(cap->fd);
     (void)pacha_fd_close(reply_fd);
     return reply_status;
+}
+
+static void lprs_complete_activation(lprs_process_t *proc)
+{
+    if (!proc || proc->activation_page_fd < 16) return;
+    void *page = pacha_mmap(proc->activation_page_fd, PACHA_SERVICE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    lprs_reply_cap_t cap = { .fd = -1 };
+    const int status = page ? lprs_activate_control(proc, &cap) : PACHA_STATUS_EFAULT;
+    if (page) {
+        pacha_service_reply_init(page, &proc->activation_header, status,
+            PACHA_SERVICE_ERROR_LPR_TRANSLATION, 0, 0);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+    }
+    const int page_fd = proc->activation_page_fd;
+    const int reply_fd = proc->activation_reply_fd;
+    const uint64_t request = proc->activation_header.request_id;
+    proc->activation_page_fd = proc->activation_reply_fd = -1;
+    (void)pacha_fd_close(page_fd);
+    (void)lprs_reply(reply_fd, request, status, 0, &cap, 0);
 }
 
 static void lprs_finish_waiter(lprs_waiter_t *waiter, int status, uint64_t result)
@@ -1585,7 +1856,7 @@ static void lprs_finish_waiter(lprs_waiter_t *waiter, int status, uint64_t resul
     waiter->reply_fd = -1;
     (void)pacha_fd_close(page_fd);
     const int send_status =
-        lprs_reply(reply_fd, request_id, reply_status, result, -1, 0);
+        lprs_reply(reply_fd, request_id, reply_status, result, NULL, 0);
     fprintf(stderr,
         "[lprs-wait4] replied token=%llu request=%llu reply_fd=%d "
         "status=%d send_status=%d\n",
@@ -1622,7 +1893,7 @@ static void lprs_complete_waiters(void)
     }
 }
 
-static int lprs_handle_received_request(struct pacha_ipc_msg *request)
+static int lprs_handle_received_request(struct pacha_ipc_msg *request, uint64_t actor, int bootstrap)
 {
     if (request == NULL) {
         return PACHA_STATUS_EINVAL;
@@ -1634,14 +1905,14 @@ static int lprs_handle_received_request(struct pacha_ipc_msg *request)
         return PACHA_STATUS_EINVAL;
     }
     int keep_fd = -1;
-    int transfer_fd = -1;
+    lprs_reply_cap_t transferred = { .fd = -1 };
     uint64_t result = 0;
     uint64_t error_token = 0;
     uint64_t request_id = request->word3;
     const int dispatch_status =
         request->word0 == PACHA_SERVICE_REQUEST_MAGIC ?
             lprs_dispatch(
-                request, &result, &keep_fd, &transfer_fd,
+                request, actor, bootstrap, &result, &keep_fd, &transferred,
                 &error_token, &request_id) :
             PACHA_STATUS_EINVAL;
     lprs_close_unowned_fds(request, keep_fd, reply_fd);
@@ -1649,11 +1920,11 @@ static int lprs_handle_received_request(struct pacha_ipc_msg *request)
         return 0;
     }
     (void)lprs_reply(
-        reply_fd, request_id, dispatch_status, result, transfer_fd, error_token);
+        reply_fd, request_id, dispatch_status, result, &transferred, error_token);
     return 0;
 }
 
-static int lprs_service_one_pending_request(void)
+static int lprs_service_one_pending_request(int endpoint, uint64_t actor, int bootstrap)
 {
     struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
     struct pacha_ipc_msg request;
@@ -1661,7 +1932,7 @@ static int lprs_service_one_pending_request(void)
     memset(&request, 0, sizeof(request));
     request.fds = fds;
     request.fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS;
-    const int status = pacha_ipc_recv(g_endpoint_fd, &request);
+    const int status = pacha_ipc_recv(endpoint, &request);
     if (status != 0) {
         /* A request the descriptor table cannot hold is left at the head of
          * the queue, so the endpoint stays readable and nothing behind it is
@@ -1677,7 +1948,7 @@ static int lprs_service_one_pending_request(void)
         }
         return status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY ? PACHA_STATUS_EAGAIN : status;
     }
-    return lprs_handle_received_request(&request);
+    return lprs_handle_received_request(&request, actor, bootstrap);
 }
 
 static void lprs_notify_exited_child(
@@ -1694,6 +1965,7 @@ static void lprs_notify_exited_child(
     child->exit_status = (uint32_t)(exit_code & 0xffu);
     child->exit_state = (uint32_t)exit_state;
     child->exit_ready = 1;
+    lprs_unix_release(child);
     lprs_orphan_children(child->pid);
     if (child->ppid == 0) {
         lprs_process_reap(child);
@@ -1781,6 +2053,24 @@ int main(int argc, char **argv)
         return 1;
     }
     g_endpoint_fd = (int)(uint32_t)cfg.endpoint_fd;
+    (void)pacha_fd_close(bootstrap_fd);
+    /* Attenuate the bootstrap installation rights once in the destination:
+     * no DUP, TRANSFER, SET_FLAGS or RECV authority remains. */
+    const long admin_fd = pacha_syscall4(PACHA_FD_SYSCALL_DUP, cfg.unix_admin_fd, 16,
+        PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL, PACHA_FD_FLAG_PRIVATE);
+    (void)pacha_fd_close((int)cfg.unix_admin_fd);
+    if (admin_fd < 16 || admin_fd >= PACHA_FD_TABLE_LIMIT) return 1;
+    g_unix_admin_fd = (int)admin_fd;
+    struct unix_control hello = { .operation = UNIX_OP_HELLO, .request = 1 };
+    unsigned received = 0;
+    status = unix_client_call(g_unix_admin_fd, &hello, NULL, 0, NULL, 0, &received);
+    if (status != 0 || hello.result != UNIX_SERVICE_VERSION) {
+        fprintf(stderr, "[lprs] unixd bootstrap failed status=%d\n", status);
+        return 1;
+    }
+    /* Keep the admin capability here. Session issuance will use the
+     * authenticated per-process control channels, never a supplied token
+     * on the administrative endpoint as proof of process identity. */
 
     for (;;) {
         struct pacha_pollfd pollfds[LPRS_WAIT_FD_CAPACITY];
@@ -1797,6 +2087,20 @@ int main(int argc, char **argv)
             .fd = g_endpoint_fd,
             .events = PACHA_FD_EVENT_READABLE,
         };
+        for (uint64_t i = 0; i < g_process_count; ++i) {
+            const lprs_process_t *proc = &g_processes[i];
+            if (!proc->active || proc->exit_ready) continue;
+            const int controls[] = { proc->control_fd, proc->bootstrap_server_fd };
+            for (unsigned which = 0; which < 2; which++) {
+                if (controls[which] < 16) continue;
+                if (count == LPRS_WAIT_FD_CAPACITY) { wait_set_overflow = 1; continue; }
+                pollfds[count] = (struct pacha_pollfd){ .fd = controls[which],
+                    .events = PACHA_FD_EVENT_READABLE };
+                process_indices[count] = i;
+                pending_exec[count] = (uint8_t)(2 + which);
+                count++;
+            }
+        }
         for (uint64_t i = 0; i < g_process_count; ++i) {
             const lprs_process_t *proc = &g_processes[i];
             if (!proc->active || proc->exit_ready || proc->process_fd < 16)
@@ -1847,6 +2151,19 @@ int main(int argc, char **argv)
                 continue;
             }
             lprs_process_t *proc = &g_processes[process_index];
+            if (pending_exec[i] >= 2) {
+                const uint64_t actor = proc->token;
+                const int bootstrap = pending_exec[i] == 3;
+                const int endpoint = (int)pollfds[i].fd;
+                for (unsigned n = 0; n < 8; n++) {
+                    /* Dispatch can reallocate/reap the process table and
+                     * ACTIVATE closes this very bootstrap channel. */
+                    proc = lprs_find_by_token(actor);
+                    if (!proc || (bootstrap ? proc->bootstrap_server_fd : proc->control_fd) != endpoint ||
+                        lprs_service_one_pending_request(endpoint, actor, bootstrap) != 0) break;
+                }
+                continue;
+            }
             if (pending_exec[i]) {
                 if (!proc->active || proc->process_fd >= 16 ||
                     proc->pending_exec_fd != pollfds[i].fd)
@@ -1885,8 +2202,7 @@ int main(int argc, char **argv)
         }
         lprs_complete_waiters();
         if ((pollfds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
-            while (lprs_service_one_pending_request() == 0) {
-            }
+            for (unsigned n = 0; n < 8 && lprs_service_one_pending_request(g_endpoint_fd, 0, 0) == 0; n++) {}
             lprs_complete_waiters();
         }
     }

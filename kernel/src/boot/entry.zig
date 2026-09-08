@@ -37,16 +37,6 @@ const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 const fd_abi = abi_root.fd_abi;
 const enable_exit_teardown_metrics = false;
-const max_pipe_close_wakes = kernel.fd_table_entries;
-
-const PendingPipeCloseWake = struct {
-    pipe: kernel.PipeRef,
-    wake_side_write: bool,
-};
-
-const PendingIpcChannelCloseWake = struct {
-    handle: kernel.IpcChannelHandle,
-};
 
 // ---------------------------------------------------------------------------
 // Boot globals
@@ -406,27 +396,6 @@ fn scrubEndpointTargets(table: *kernel.EndpointTable, target: kernel.PrincipalId
     return changed;
 }
 
-fn collectPipeCloseWakesForProcess(
-    principal: kernel.PrincipalId,
-    out: []PendingPipeCloseWake,
-) usize {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    const table = kernel_runtime.kernel_state_global.fdTableForProcessIndexConst(process_index) orelse return 0;
-    var count: usize = 0;
-    for (table.entries[0..]) |entry| {
-        if (entry.object.isNull()) continue;
-        const slot = kernel_runtime.kernel_state_global.kernelObjectSlotConst(entry.object) orelse continue;
-        const endpoint = kernel.KernelState.pipeEndpointFromPayload(&slot.payload) orelse continue;
-        if (count >= out.len) break;
-        out[count] = .{
-            .pipe = endpoint.pipe,
-            .wake_side_write = !endpoint.write,
-        };
-        count += 1;
-    }
-    return count;
-}
-
 fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
     for (targets, 0..) |target, target_index| {
         if (target.wait_token == 0 or target.group.isNull()) continue;
@@ -476,48 +445,6 @@ fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
     }
 }
 
-fn wakeReadyPipeCloseWaiters(pending_wakes: []const PendingPipeCloseWake) void {
-    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
-    for (pending_wakes) |pending| {
-        const ready_events = kernel_runtime.kernel_state_global.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
-        if (ready_events == 0) continue;
-        const wake_count = kernel_runtime.kernel_state_global.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
-        wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
-    }
-}
-
-fn collectIpcChannelCloseWakesForProcess(
-    principal: kernel.PrincipalId,
-    out: []PendingIpcChannelCloseWake,
-) usize {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    const table = kernel_runtime.kernel_state_global.fdTableForProcessIndexConst(process_index) orelse return 0;
-    var count: usize = 0;
-    for (table.entries[0..]) |entry| {
-        if (entry.object.isNull()) continue;
-        const slot = kernel_runtime.kernel_state_global.kernelObjectSlotConst(entry.object) orelse continue;
-        const handle = switch (slot.payload) {
-            .channel => |channel_handle| channel_handle,
-            else => continue,
-        };
-        if (count >= out.len) break;
-        out[count] = .{ .handle = handle };
-        count += 1;
-    }
-    return count;
-}
-
-fn wakeIpcChannelCloseWaiters(pending_wakes: []const PendingIpcChannelCloseWake) void {
-    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
-    for (pending_wakes) |pending| {
-        const wake_count = kernel_runtime.kernel_state_global.takeIpcChannelPeerCloseWaiters(
-            pending.handle,
-            wake_storage[0..],
-        );
-        wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
-    }
-}
-
 fn wakeTaskFdWaiters(principal: kernel.PrincipalId) void {
     var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
     const wake_count = kernel_runtime.kernel_state_global.takeTaskReadableWaitersForPrincipal(
@@ -530,21 +457,19 @@ fn wakeTaskFdWaiters(principal: kernel.PrincipalId) void {
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
-    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
-    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(principal, pending_channel_wakes[0..]);
 
     kernel_runtime.kernel_state_global.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
 
+    @import("../syscall/fd.zig").closeProcessFdsWithWakes(.{
+        .free_list = kernel_runtime.global_free_list,
+        .write_user_u64 = user_copy.writeUserU64,
+    }, kernel_runtime.kernel_state_global, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockVmTransaction(principal);
-    wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
-    wakeIpcChannelCloseWaiters(pending_channel_wakes[0..pending_channel_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -576,15 +501,15 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
     const metric_start = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
-    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
-    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(principal, pending_channel_wakes[0..]);
 
     kernel_runtime.kernel_state_global.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
+    @import("../syscall/fd.zig").closeProcessFdsWithWakes(.{
+        .free_list = kernel_runtime.global_free_list,
+        .write_user_u64 = user_copy.writeUserU64,
+    }, kernel_runtime.kernel_state_global, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     const metric_after_clear_as = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
@@ -593,8 +518,6 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     user_vm.unlockVmTransaction(principal);
-    wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
-    wakeIpcChannelCloseWaiters(pending_channel_wakes[0..pending_channel_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
     const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 

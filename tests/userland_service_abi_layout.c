@@ -16,6 +16,9 @@
 #include "personality/lpr_client_abi.h"
 #include "personality/lpr_image_abi.h"
 #include "termd/ipc_protocol.h"
+#include "unixd/ipc_protocol.h"
+#include "pacha/abi.h"
+#include "pachaos/abi.h"
 
 static int expect(int condition, const char *message)
 {
@@ -29,6 +32,23 @@ static int expect(int condition, const char *message)
 int main(void)
 {
     int failures = 0;
+
+    failures += expect(PACHA_THREAD_SELF_FD == PACHAOS_THREAD_SELF_FD &&
+        PACHA_THREAD_SELF_FD != PACHA_PROCESS_SELF_FD, "thread observation pseudo fd");
+    failures += expect(sizeof(struct unix_attachment) == 80, "unix socket attachment size");
+    failures += expect(sizeof(struct unix_control) == 1304, "unix control size");
+    failures += expect(offsetof(struct unix_control, credentials) == 64,
+        "unix control header size");
+    failures += expect(offsetof(struct unix_control, diagnostic) == 1136,
+        "unix diagnostic offset");
+    failures += expect(sizeof(struct unix_socket_diagnostic) == 168,
+        "unix diagnostic size");
+    failures += expect(sizeof(struct unix_control) <= UNIX_CONTROL_BYTES,
+        "unix control fits page");
+    failures += expect(UNIX_RIGHTS_MAX == 253, "unix ancillary limit");
+    failures += expect(sizeof(struct lprs_boot_config) == 128 &&
+        offsetof(struct lprs_boot_config, unix_admin_fd) == 16 &&
+        offsetof(struct lprs_boot_config, flags) == 24, "supervisor unix admin bootstrap");
 
     failures += expect(sizeof(pacha_service_envelope_t) == 64, "service envelope size");
     failures += expect(
@@ -79,7 +99,6 @@ int main(void)
     failures += expect(KOBOXD_ENDPOINT_FS_BACKEND != KOBOXD_ENDPOINT_FILED, "kobox endpoint ids distinct");
     failures += expect(sizeof(netd_socket_t) == 64, "netd socket request size");
     failures += expect(sizeof(netd_connect_t) == 64, "netd connect request size");
-    failures += expect(sizeof(netd_listen_t) == 16, "netd listen request size");
     failures += expect(sizeof(netd_poll_t) == 64, "netd poll request size");
     failures += expect(sizeof(netd_io_t) <= NETD_PAGE_BYTES, "netd io fits page");
     failures += expect(sizeof(termd_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "termd io fits page");
@@ -93,15 +112,20 @@ int main(void)
         "lpr fixed service and bootstrap fds are distinct and contiguous");
     failures += expect(
         LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
-        LPRS_OP_PROCESS_GET_STATE == 3 && LPRS_OP_PROCESS_LIST == 4 &&
-        LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN == 9 &&
-        LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL == 10 &&
-        LPRS_OP_PROCESS_EXEC_COMMIT_DONE == 11 &&
-        LPRS_OP_PROCESS_GETSID == 16 &&
-        LPRS_OP_PROCESS_SET_PDEATHSIG == 17 &&
-        LPRS_OP_PROCESS_GET_PDEATHSIG == 18 &&
-        LPRS_OP_SIGNAL_KILL == 19 && LPRS_OP_CWD_GET == 21 &&
-        LPRS_OP_DIAG_ERROR_GET == 24,
+        LPRS_OP_PROCESS_ACTIVATE == 3 &&
+        LPRS_OP_PROCESS_UNIX_SESSION == 4 &&
+        LPRS_OP_PROCESS_GET_STATE == 5 && LPRS_OP_PROCESS_LIST == 6 &&
+        LPRS_OP_PROCESS_EXEC_PREPARE == 11 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN == 12 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL == 13 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_DONE == 14 &&
+        LPRS_OP_PROCESS_SET_COMM == 15 && LPRS_OP_PROCESS_QUERY == 16 &&
+        LPRS_OP_PROCESS_DIAG_ATTACH == 17 && LPRS_OP_PROCESS_WAIT4 == 18 &&
+        LPRS_OP_PROCESS_GETSID == 22 &&
+        LPRS_OP_PROCESS_SET_PDEATHSIG == 23 &&
+        LPRS_OP_PROCESS_GET_PDEATHSIG == 24 &&
+        LPRS_OP_SIGNAL_KILL == 25 && LPRS_OP_CWD_GET == 27 &&
+        LPRS_OP_DIAG_ERROR_GET == 30,
         "lpr supervisor process, signal, cwd, and diagnostic ops are contiguous");
     failures += expect(
         sizeof(lprs_process_list_t) == LPRS_PAYLOAD_BYTES,
@@ -139,10 +163,9 @@ int main(void)
         "storage statx inode identity offset");
     failures += expect(
         NETD_OP_HELLO == 0 && NETD_OP_PAGE_ATTACH == 1 &&
-        NETD_OP_SOCKET == 2 && NETD_OP_SOCKETPAIR == 3 &&
-        NETD_OP_SEND == 6 && NETD_OP_POLL == 8 && NETD_OP_BIND == 9 &&
-        NETD_OP_LISTEN == 10 && NETD_OP_ACCEPT == 11 &&
-        NETD_OP_DUP == 14 && NETD_OP_UNIX_NAME == 15,
+        NETD_OP_SOCKET == 2 && NETD_OP_CONNECT == 3 && NETD_OP_CLOSE == 4 &&
+        NETD_OP_SEND == 5 && NETD_OP_RECV == 6 && NETD_OP_POLL == 7 && NETD_OP_BIND == 8 &&
+        NETD_OP_UEVENT_PUBLISH == 9 && NETD_OP_DUP == 10,
         "netd ops are contiguous from zero");
     failures += expect(
         TERMD_OP_HELLO == 0 && TERMD_OP_OPEN_PTMX == 1 &&

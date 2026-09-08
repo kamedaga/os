@@ -2,7 +2,6 @@
 
 #include "libuinet_backend.h"
 #include "netlink_socket.h"
-#include "unix_socket.h"
 #include "netd/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pacha/trace.h"
@@ -73,18 +72,14 @@ static int netd_socket_handle_dup(uint64_t handle)
 {
     return netd_netlink_socket_is_handle(handle) ?
         netd_netlink_socket_dup(handle) :
-        netd_unix_socket_is_handle(handle) ?
-            netd_unix_socket_dup(handle) :
-            netd_libuinet_socket_dup(handle);
+        netd_libuinet_socket_dup(handle);
 }
 
 static int netd_socket_handle_close(uint64_t handle)
 {
     return netd_netlink_socket_is_handle(handle) ?
         netd_netlink_socket_close(handle) :
-        netd_unix_socket_is_handle(handle) ?
-            netd_unix_socket_close(handle) :
-            netd_libuinet_socket_close(handle);
+        netd_libuinet_socket_close(handle);
 }
 
 static void netd_socket_transfer_lease_destroy(
@@ -319,12 +314,6 @@ static int netd_socket_dispatch(
             return -22;
         }
         const netd_socket_t *req = (const netd_socket_t *)page;
-        if (req->domain == NETD_AF_UNIX) {
-            return netd_unix_socket_open(
-                req->type, req->protocol,
-                transferred_count == 1 ? transferred_fds[0] : -1,
-                out_result);
-        }
         if (req->domain == NETD_AF_NETLINK) {
             return netd_netlink_socket_open(
                 req->type, req->protocol,
@@ -336,28 +325,12 @@ static int netd_socket_dispatch(
             transferred_count == 1 ? transferred_fds[0] : -1,
             out_result);
     }
-    case NETD_OP_SOCKETPAIR: {
-        if (page == NULL || transferred_count != 2) {
-            return -22;
-        }
-        netd_socket_pair_t *req = (netd_socket_pair_t *)page;
-        if (req->domain != NETD_AF_UNIX) {
-            return -97;
-        }
-        return netd_unix_socket_pair(
-            req->type, req->protocol,
-            transferred_fds[0], transferred_fds[1],
-            req->handles);
-    }
     case NETD_OP_CONNECT: {
         if (page == NULL) {
             return -22;
         }
         const netd_connect_t *req = (const netd_connect_t *)page;
         *out_result = 0;
-        if (netd_unix_socket_is_handle(req->handle)) {
-            return netd_unix_socket_connect((const netd_unix_path_t *)page);
-        }
         return netd_libuinet_socket_connect(req->handle, req->addr.addr_be, req->addr.port_be, req->flags);
     }
     case NETD_OP_SEND: {
@@ -370,8 +343,7 @@ static int netd_socket_dispatch(
         }
         size_t sent = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ? -95 :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_send(
-                req, transferred_fds, transferred_count, &sent) : netd_libuinet_socket_send(
+            netd_libuinet_socket_send(
             req->handle,
             req->data,
             (size_t)req->length,
@@ -394,9 +366,6 @@ static int netd_socket_dispatch(
         size_t received = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
             netd_netlink_socket_recv(req, capacity, &received) :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_recv(
-                req, capacity, out_reply_fds,
-                NETD_TRANSFER_MAX_CAPABILITIES, out_reply_count, &received) :
             netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
         req->length = received;
         *out_result = received;
@@ -411,7 +380,6 @@ static int netd_socket_dispatch(
         int32_t error = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
             netd_netlink_socket_poll(req->handle, req->events, &revents, &error) :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_poll(req->handle, req->events, &revents, &error) :
             netd_libuinet_socket_poll(req->handle, req->events, &revents, &error);
         req->revents = revents;
         req->error = error;
@@ -437,26 +405,7 @@ static int netd_socket_dispatch(
         if (page == NULL) return -22;
         return netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle) ?
             netd_netlink_socket_bind((const netd_netlink_bind_t *)page) :
-            netd_unix_socket_bind((const netd_unix_path_t *)page);
-    case NETD_OP_LISTEN:
-        if (page == NULL) return -22;
-        return netd_unix_socket_listen((const netd_listen_t *)page);
-    case NETD_OP_ACCEPT:
-        if (page == NULL) return -22;
-        {
-            netd_accept_t *req = (netd_accept_t *)page;
-            const int status = netd_unix_socket_accept(req);
-            *out_result = status == 0 ? req->accepted_handle : 0;
-            return status;
-        }
-    case NETD_OP_ATTACH_WAIT:
-        if (page == NULL) return -22;
-        return netd_unix_socket_attach_wait(
-            ((const netd_accept_t *)page)->handle,
-            transferred_count == 1 ? transferred_fds[0] : -1);
-    case NETD_OP_UNIX_NAME:
-        if (page == NULL) return -22;
-        return netd_unix_socket_name((netd_unix_name_t *)page);
+            -95;
     case NETD_OP_UEVENT_PUBLISH:
         {
             const uint64_t device = *out_result;
@@ -515,16 +464,12 @@ static int netd_socket_dispatch_request(
 
     const int op_uses_page =
         request->word1 == NETD_OP_SOCKET ||
-        request->word1 == NETD_OP_SOCKETPAIR ||
         request->word1 == NETD_OP_CONNECT ||
         request->word1 == NETD_OP_SEND ||
         request->word1 == NETD_OP_RECV ||
         request->word1 == NETD_OP_POLL ||
         request->word1 == NETD_OP_BIND ||
-        request->word1 == NETD_OP_LISTEN ||
-        request->word1 == NETD_OP_ACCEPT ||
-        request->word1 == NETD_OP_ATTACH_WAIT ||
-        request->word1 == NETD_OP_UNIX_NAME;
+        0;
     struct netd_page_attachment *attachment = op_uses_page ?
         netd_page_attachment_find(request->word2) : NULL;
     if (op_uses_page && attachment == NULL) {
@@ -554,30 +499,8 @@ static int netd_socket_dispatch_request(
     void *const page = attachment != NULL ? attachment->page : NULL;
     if (page != NULL) __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
-#if NETD_DBUS_DIAG
-    const uint64_t diag_handle = page != NULL &&
-        (request->word1 == NETD_OP_SEND ||
-         request->word1 == NETD_OP_RECV ||
-         request->word1 == NETD_OP_POLL) ?
-        ((const netd_io_t *)page)->handle : 0;
-    const int diag_dbus = netd_unix_socket_is_handle(diag_handle) &&
-        netd_unix_socket_diag_dbus(diag_handle);
-    if (diag_dbus) {
-        printf("[netd-dbus-rpc] phase=dispatch-enter id=%llu op=%llu handle=%llu reply_fd=%d\n",
-            (unsigned long long)request->word3,
-            (unsigned long long)request->word1,
-            (unsigned long long)diag_handle,
-            reply_fd);
-    }
-#endif
 
-    const int send_has_transfer = request->word1 == NETD_OP_SEND && page != NULL &&
-        netd_unix_socket_is_handle(((const netd_io_t *)page)->handle) &&
-        ((const netd_io_t *)page)->transfer_count != 0;
-    const int may_retain = request->word1 == NETD_OP_SOCKET ||
-        request->word1 == NETD_OP_SOCKETPAIR ||
-        request->word1 == NETD_OP_ATTACH_WAIT ||
-        request->word1 == NETD_OP_DUP || send_has_transfer;
+    const int may_retain = request->word1 == NETD_OP_SOCKET || request->word1 == NETD_OP_DUP;
     const int admission = netd_socket_admit_fds(request->fd_count,
         may_retain ? transferred_count : 0);
     if (admission != 0)
@@ -586,20 +509,9 @@ static int netd_socket_dispatch_request(
     int reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     uint32_t reply_transfer_count = 0;
     memset(reply_transfer_fds, 0xff, sizeof(reply_transfer_fds));
-    netd_unix_socket_set_notifications_deferred(1);
     const int status = netd_socket_dispatch(
         request->word1, page, transferred_fds, transferred_count, &result,
         reply_transfer_fds, &reply_transfer_count);
-#if NETD_DBUS_DIAG
-    if (diag_dbus) {
-        printf("[netd-dbus-rpc] phase=dispatch-exit id=%llu op=%llu handle=%llu status=%d result=%llu\n",
-            (unsigned long long)request->word3,
-            (unsigned long long)request->word1,
-            (unsigned long long)diag_handle,
-            status,
-            (unsigned long long)result);
-    }
-#endif
     if (page != NULL) __atomic_thread_fence(__ATOMIC_RELEASE);
     if (g_netd_socket_trace) {
         netd_socket_trace_data_op(request->word1, status, result);
@@ -617,10 +529,7 @@ static int netd_socket_dispatch_request(
     const int transfer_retained = status == 0 &&
         ((request->word1 == NETD_OP_SOCKET &&
             result != 0) ||
-         request->word1 == NETD_OP_SOCKETPAIR ||
-         request->word1 == NETD_OP_ATTACH_WAIT ||
-         (request->word1 == NETD_OP_DUP && transferred_count == 1) ||
-         send_has_transfer);
+         (request->word1 == NETD_OP_DUP && transferred_count == 1));
     if (!transfer_retained)
         for (uint32_t i = 0; i < transferred_count; ++i)
             if (transferred_fds[i] >= 16) (void)pacha_fd_close(transferred_fds[i]);
@@ -630,16 +539,6 @@ static int netd_socket_dispatch_request(
     const int reply_status = netd_socket_send_reply(
         request->word1, reply_fd, request->word3, status, result,
         reply_transfer_fds, reply_transfer_count);
-    netd_unix_socket_set_notifications_deferred(0);
-#if NETD_DBUS_DIAG
-    if (diag_dbus) {
-        printf("[netd-dbus-rpc] phase=reply-exit id=%llu op=%llu handle=%llu status=%d\n",
-            (unsigned long long)request->word3,
-            (unsigned long long)request->word1,
-            (unsigned long long)diag_handle,
-            reply_status);
-    }
-#endif
     return reply_status;
 }
 
@@ -755,8 +654,7 @@ static void netd_report_recv_table_full(void)
 /* Returns non-zero when the drain budget ran out with the endpoint still
  * readable, so the caller must pump again instead of waiting.  A burst larger
  * than the budget otherwise left requests queued while netd slept until some
- * unrelated event woke it: a D-Bus service activation issues far more than 32
- * AF_UNIX operations at once, which stalled every client of that socket. */
+ * unrelated event woke it. */
 int netd_socket_service_poll(void)
 {
     if (g_netd_socket_endpoint_fd < 16) {
@@ -764,7 +662,6 @@ int netd_socket_service_poll(void)
     }
 
     for (unsigned i = 0; i < 32; i++) {
-        (void)netd_unix_socket_flush_notification();
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
         memset(fds, 0, sizeof(fds));
@@ -776,10 +673,7 @@ int netd_socket_service_poll(void)
         if (status != 0) {
             if (status == PACHA_ERR_ALLOC)
                 netd_report_recv_table_full();
-            /* No request is waiting, but one flush only advances the
-             * notification queue by a single socket.  Report the remainder so
-             * the caller pumps again rather than sleeping on it. */
-            return netd_unix_socket_notifications_pending();
+            return 0;
         }
         g_netd_socket_requests++;
         (void)netd_socket_dispatch_request(&request, fds);

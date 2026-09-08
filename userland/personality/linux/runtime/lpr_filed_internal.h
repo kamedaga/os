@@ -11,6 +11,8 @@
 #include "lpr_process/capability.h"
 #include "lpr_process/compat.h"
 #include "lpr_process/client.h"
+#include "lpr_unix/context.h"
+#include "lpr_unix/socket.h"
 #include "lpr_input/client.h"
 #include "lpr_socket.h"
 #include "support/string.h"
@@ -30,6 +32,7 @@
 #include <stdint.h>
 
 #define LPR_FD_TABLE_INITIAL_SIZE 256ull
+int lpr_user_range_plausible(uint64_t ptr, uint64_t bytes);
 #define LPR_FD_TABLE_MAX_SIZE (LPR_LINUX_FD_MAX + 1ull)
 #define LPR_LINUX_AT_FDCWD (-100)
 #define LPR_LINUX_AT_SYMLINK_NOFOLLOW 0x100ull
@@ -179,6 +182,7 @@ typedef struct lpr_file_image_cache_entry {
 
 typedef struct lpr_exec_transaction {
     int manifest_fd;
+    int supervisor_bootstrap_fd;
     uint64_t map_bytes;
     lpr_manifest_t *manifest;
     lpr_fd_pin_t *pins;
@@ -191,6 +195,7 @@ typedef struct lpr_exec_transaction {
     uint64_t fork_prepared_count;
     uint8_t fork_state;
     uint8_t file_image_cache_paused;
+    uint8_t supervisor_exec_prepared;
 } lpr_exec_transaction_t;
 
 typedef struct lpr_linux_stat {
@@ -381,6 +386,7 @@ typedef struct lpr_thread_record {
     volatile uint32_t parent_ready;
     uint32_t reserved0;
     uint64_t signal_mask;
+    struct lpr_unix_context unix_context;
 } lpr_thread_record_t;
 
 typedef struct lpr_thread_state {
@@ -736,7 +742,6 @@ int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_h
 int64_t lpr_filed_transfer_dup_handle(
     uint64_t handle, uint64_t fd_flags, int lease_fd, uint64_t *out_handle);
 int64_t lpr_netd_dup_handle(uint64_t handle);
-int64_t lpr_netd_transfer_dup_handle(uint64_t handle, int lease_fd);
 int64_t lpr_netd_close_handle(uint64_t handle);
 int lpr_create_standalone_wire_page(void **out_page);
 void lpr_destroy_standalone_wire_page(int fd, void *page);
@@ -827,18 +832,18 @@ void lpr_fd_unpin(const lpr_fd_pin_t *pin);
 int64_t lpr_fd_prepare_dup(uint64_t fd);
 int lpr_fd_transfer_prepare(
     const lpr_fd_pin_t *pin,
-    netd_transfer_occurrence_t *item,
+    struct unix_transfer_item *item,
     int *capability_fds,
     uint32_t capability_capacity,
     uint32_t *out_capability_count);
-int lpr_fd_transfer_import_batch(
-    const netd_transfer_occurrence_t *items,
+int64_t lpr_netd_transfer_dup_handle(uint64_t handle, int lease_fd);
+int lpr_fd_transfer_stage_batch(
+    const struct unix_transfer_item *items,
     uint32_t item_count,
     const int *capability_fds,
     uint32_t capability_count,
     uint32_t receive_flags,
     int *out_fds);
-void lpr_fd_transfer_cancel_ticket(const netd_transfer_occurrence_t *item);
 int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buffer, uint64_t count);
 int64_t lpr_backend_write(uint64_t fd, uint64_t buffer, uint64_t count);
 int64_t lpr_backend_readv(const lpr_fd_pin_t *pin, uint64_t iov, uint64_t count);
@@ -1140,6 +1145,7 @@ void lpr_linux_exit_group(uint64_t code) __attribute__((noreturn));
 void lpr_linux_unmapself_exit(uint64_t base, uint64_t size) __attribute__((noreturn));
 void lpr_clone_thread_entry(void) __attribute__((noreturn));
 void lpr_clone_thread_bootstrap(lpr_thread_record_t *record) __attribute__((noreturn));
+int lpr_thread_current_record(lpr_thread_record_t **out);
 void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t amount);
 void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset);
 void lpr_filed_session_drop(void);

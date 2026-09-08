@@ -18,6 +18,7 @@ mkdir -p "$out_dir"
   -I"$repo_root/userland/drmd/include" \
   -I"$repo_root/userland/inputd/include" \
   -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/lpr_supervisor/include" \
   -I"$repo_root/_kobox/include" \
   "$repo_root/tests/lpr_epoll_io_race_unit.c" \

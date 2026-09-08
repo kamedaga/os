@@ -412,6 +412,10 @@ python3 "${repo_root}/tools/rootfs_overlay.py" dedupe \
 # package-only rootfs has no init package to create an otherwise empty path.
 install -d -m 0755 "${runtime}/var/log"
 install -d -m 0700 "${runtime}/run/user/0"
+# This package-only rootfs has no xdg-user-dirs setup. xfdesktop queries the
+# Desktop folder while constructing its icon manager, before its later model
+# reload creates a missing folder. Supply the login user's directory up front.
+install -d -m 0700 "${runtime}/root/Desktop"
 
 rm -rf "${out_abs}.tmp" "${out_abs}"
 mkdir -p "$(dirname "${out_abs}")"

@@ -727,9 +727,9 @@ fn userPtSlotHasUserMappings(h: Hooks, space: *const UserAddressSpace, slot: usi
     return false;
 }
 
-fn releaseUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) void {
-    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return;
-    if (userPtSlotHasUserMappings(h, space, slot)) return;
+fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool {
+    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return false;
+    if (userPtSlotHasUserMappings(h, space, slot)) return false;
     const pml4_index = space.pt_page_pml4_index[slot];
     const pdp_index = space.pt_page_pdp_index[slot];
     const pd_index = space.pt_page_pd_index[slot];
@@ -737,20 +737,44 @@ fn releaseUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) voi
         pdp_index == UserAddressSpace.no_pd_index or
         pd_index == UserAddressSpace.no_pd_index)
     {
-        return;
+        return false;
     }
     if (findUserPdSlotForPdp(space, pml4_index, pdp_index)) |pd_slot| {
         const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
         const entry = pd_page[pd_index];
-        const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return;
+        const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return false;
         if ((entry & h.page_addr_mask) == pt_pa) {
             pd_page[pd_index] = 0;
         }
     }
-    @memset(space.pt_pages[slot][0..], 0);
-    space.pt_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
-    space.pt_page_pdp_index[slot] = UserAddressSpace.no_pd_index;
-    space.pt_page_pd_index[slot] = UserAddressSpace.no_pd_index;
+    return true;
+}
+
+fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId,
+    va_start: u64, size_bytes: usize, touched_slots: []u16) void
+{
+    var retired: usize = 0;
+    for (touched_slots) |slot| {
+        if (detachUserPtSlotIfEmpty(h, space, slot)) {
+            touched_slots[retired] = slot;
+            retired += 1;
+        }
+    }
+    // Remove the parent PDE before invalidating paging-structure caches.
+    // No CPU may acquire a new path to a PT after the shootdown and before
+    // that PT's storage is reused for a different virtual address.
+    const pt_bytes = 2 * 1024 * 1024;
+    const flush_start = if (retired != 0) va_start & ~@as(u64, pt_bytes - 1) else va_start;
+    const flush_end = if (retired != 0)
+        (va_start + size_bytes + pt_bytes - 1) & ~@as(u64, pt_bytes - 1)
+    else va_start + size_bytes;
+    h.flush_user_tlb_for_principal_range(principal, flush_start, @intCast(flush_end - flush_start));
+    for (touched_slots[0..retired]) |slot| {
+        @memset(space.pt_pages[slot][0..], 0);
+        space.pt_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
+        space.pt_page_pdp_index[slot] = UserAddressSpace.no_pd_index;
+        space.pt_page_pd_index[slot] = UserAddressSpace.no_pd_index;
+    }
 }
 
 fn ptSlotScanLimit(space: *const UserAddressSpace) usize {
@@ -1116,7 +1140,22 @@ pub fn mapLazyUserPaddrsWithProt(
     paddrs: []const u64,
     prot: kernel.MapProt,
 ) bool {
-    return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false, false);
+    if (mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false, false)) return true;
+    if (lockAddressSpace(principal)) {
+        defer unlockAddressSpace(principal);
+        if (getUserSpace(principal)) |space| {
+            var used: usize = 0;
+            for (space.pt_page_pd_index) |pd| {
+                if (pd != UserAddressSpace.no_pd_index) used += 1;
+            }
+            @import("../kernel_log.zig").writeFmt(
+                "vm: fault pte failed principal={} va=0x{x} pages={} pt_used={}/{} pd_high={} pdp_high={}\n",
+                .{ @intFromEnum(principal), va_start, paddrs.len, used,
+                    UserAddressSpace.max_dynamic_pt_pages, space.pd_page_used_len, space.pdp_page_used_len },
+            );
+        }
+    }
+    return false;
 }
 
 pub fn remapTrustedUserPaddrsWithProt(
@@ -1340,11 +1379,7 @@ pub fn unmapUserLinearRegion(
         }
     }
     if (!releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
-    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
-    var touched_index: usize = 0;
-    while (touched_index < touched_count) : (touched_index += 1) {
-        releaseUserPtSlotIfEmpty(h, space, touched_slots[touched_index]);
-    }
+    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
 
     return true;
 }
@@ -1356,6 +1391,25 @@ pub fn unmapPresentUserLinearRegionSplitSlotsRequired(
     principal: kernel.PrincipalId,
     va_start: u64,
     size_bytes: usize,
+) ?usize {
+    return unmapPresentSplitSlotsWithPolicy(principal, va_start, size_bytes, false);
+}
+
+/// Caller holds the VM transaction and has validated this entire source span
+/// lies in its native VMA. Supervisor seed PTEs in lazy holes remain untouched.
+pub fn unmapPresentVmaSourceSplitSlotsRequired(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) ?usize {
+    return unmapPresentSplitSlotsWithPolicy(principal, va_start, size_bytes, true);
+}
+
+fn unmapPresentSplitSlotsWithPolicy(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+    native_vma_source: bool,
 ) ?usize {
     if (!lockAddressSpace(principal)) return null;
     defer unlockAddressSpace(principal);
@@ -1371,7 +1425,7 @@ pub fn unmapPresentUserLinearRegionSplitSlotsRequired(
         const index = userPageIndexForVa(h, va) orelse return null;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
         const entry = space.pt_pages[pt_slot][index.pt];
-        if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0) return null;
+        if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0 and !native_vma_source) return null;
     }
 
     const release_start_page = va_start >> 12;
@@ -1406,6 +1460,25 @@ pub fn unmapPresentUserLinearRegion(
     va_start: u64,
     size_bytes: usize,
 ) bool {
+    return unmapPresentWithPolicy(principal, va_start, size_bytes, false);
+}
+
+/// Only for a source span validated under the native VMA transaction before
+/// commit; not for arbitrary fixed targets or capability-owned mappings.
+pub fn unmapPresentVmaSource(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) bool {
+    return unmapPresentWithPolicy(principal, va_start, size_bytes, true);
+}
+
+fn unmapPresentWithPolicy(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+    native_vma_source: bool,
+) bool {
     if (!lockAddressSpace(principal)) return false;
     defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
@@ -1426,10 +1499,8 @@ pub fn unmapPresentUserLinearRegion(
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
         const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
         const old_entry = pt_page[index.pt];
-        if ((old_entry & h.page_present) == 0) continue;
-        if ((old_entry & h.page_user) == 0) return false;
-        pt_page[index.pt] = 0;
-
+        // MREMAP invalidates the source PTEs before its state transaction.
+        // Already-empty PTs still belong to this final unmap's retirement set.
         var seen = false;
         var touched_index: usize = 0;
         while (touched_index < touched_count) : (touched_index += 1) {
@@ -1442,14 +1513,16 @@ pub fn unmapPresentUserLinearRegion(
             touched_slots[touched_count] = @intCast(pt_slot);
             touched_count += 1;
         }
+        if ((old_entry & h.page_present) == 0) continue;
+        if ((old_entry & h.page_user) == 0) {
+            if (native_vma_source) continue;
+            return false;
+        }
+        pt_page[index.pt] = 0;
     }
 
     _ = releaseUserMapping(principal, va_start, size_u64 / 4096);
-    h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
-    var touched_index: usize = 0;
-    while (touched_index < touched_count) : (touched_index += 1) {
-        releaseUserPtSlotIfEmpty(h, space, touched_slots[touched_index]);
-    }
+    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
 
     return true;
 }

@@ -20,38 +20,40 @@ enum {
 
     LPRS_OP_PROCESS_REGISTER_EXEC = 1u,
     LPRS_OP_PROCESS_REGISTER_FD = 2u,
-    LPRS_OP_PROCESS_GET_STATE = 3u,
-    LPRS_OP_PROCESS_LIST = 4u,
-    LPRS_OP_PROCESS_FORK_BEGIN = 5u,
-    LPRS_OP_PROCESS_FORK_CANCEL = 6u,
-    LPRS_OP_PROCESS_FORK_PARENT_REGISTER = 7u,
-    LPRS_OP_PROCESS_FORK_CHILD_READY = 8u,
-    LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN = 9u,
-    LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL = 10u,
-    LPRS_OP_PROCESS_EXEC_COMMIT_DONE = 11u,
-    LPRS_OP_PROCESS_WAIT4 = 12u,
-    LPRS_OP_PROCESS_SETPGID = 13u,
-    LPRS_OP_PROCESS_SETSID = 14u,
-    LPRS_OP_PROCESS_GETPGID = 15u,
-    LPRS_OP_PROCESS_GETSID = 16u,
-    LPRS_OP_PROCESS_SET_PDEATHSIG = 17u,
-    LPRS_OP_PROCESS_GET_PDEATHSIG = 18u,
-
-    LPRS_OP_SIGNAL_KILL = 19u,
-    LPRS_OP_SIGNAL_DELIVER_TTY = 20u,
-
-    LPRS_OP_CWD_GET = 21u,
-    LPRS_OP_CWD_SET = 22u,
-
-    LPRS_OP_DIAG_DUMP = 23u,
-    LPRS_OP_DIAG_ERROR_GET = 24u,
-
-    /* Process introspection behind /proc/<pid>.  Appended rather than grouped
-     * with the process operations above so every existing operation keeps the
-     * number already compiled into the personality images. */
-    LPRS_OP_PROCESS_SET_COMM = 25u,
-    LPRS_OP_PROCESS_QUERY = 26u,
-    LPRS_OP_PROCESS_DIAG_ATTACH = 27u,
+    /* One-shot bootstrap channel -> private, nonduplicable CALL channel.
+     * Only ACTIVATE is accepted on a bootstrap channel. A numeric token is
+     * an object identifier, never caller authentication. */
+    LPRS_OP_PROCESS_ACTIVATE = 3u,
+    /* Authenticated process only: token request -> session ID and one
+     * CALL/INSPECT/CLOSE, PRIVATE|CLOEXEC unixd capability. Repeated calls
+     * refer to the same process session, including after self-exec. */
+    LPRS_OP_PROCESS_UNIX_SESSION = 4u,
+    LPRS_OP_PROCESS_GET_STATE = 5u,
+    LPRS_OP_PROCESS_LIST = 6u,
+    LPRS_OP_PROCESS_FORK_BEGIN = 7u,
+    LPRS_OP_PROCESS_FORK_CANCEL = 8u,
+    LPRS_OP_PROCESS_FORK_PARENT_REGISTER = 9u,
+    LPRS_OP_PROCESS_FORK_CHILD_READY = 10u,
+    LPRS_OP_PROCESS_EXEC_PREPARE = 11u,
+    LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN = 12u,
+    LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL = 13u,
+    LPRS_OP_PROCESS_EXEC_COMMIT_DONE = 14u,
+    LPRS_OP_PROCESS_SET_COMM = 15u,
+    LPRS_OP_PROCESS_QUERY = 16u,
+    LPRS_OP_PROCESS_DIAG_ATTACH = 17u,
+    LPRS_OP_PROCESS_WAIT4 = 18u,
+    LPRS_OP_PROCESS_SETPGID = 19u,
+    LPRS_OP_PROCESS_SETSID = 20u,
+    LPRS_OP_PROCESS_GETPGID = 21u,
+    LPRS_OP_PROCESS_GETSID = 22u,
+    LPRS_OP_PROCESS_SET_PDEATHSIG = 23u,
+    LPRS_OP_PROCESS_GET_PDEATHSIG = 24u,
+    LPRS_OP_SIGNAL_KILL = 25u,
+    LPRS_OP_SIGNAL_DELIVER_TTY = 26u,
+    LPRS_OP_CWD_GET = 27u,
+    LPRS_OP_CWD_SET = 28u,
+    LPRS_OP_DIAG_DUMP = 29u,
+    LPRS_OP_DIAG_ERROR_GET = 30u,
 };
 
 enum {

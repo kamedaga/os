@@ -2834,7 +2834,7 @@ pub fn exitCurrentThread(
 ) bool {
     if (!isBootstrapSchedulerCpu()) {
         const current_thread = currentThread();
-        _ = releaseThread(current_thread);
+        if (!releaseThread(current_thread)) return false;
         if (after_release) |callback| callback.run(callback.context);
         if (before_ap_idle) |callback| callback.run(callback.context);
         smp.returnCurrentApToIdleFromInterrupt();

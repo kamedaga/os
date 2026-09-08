@@ -13,6 +13,7 @@
 #include "termd/boot_config.h"
 #include "drmd/boot_config.h"
 #include "inputd/boot_config.h"
+#include "unixd/ipc_protocol.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
 #define SEED0ROOT_DEFAULT_BOOT_PROFILE 0u
@@ -915,7 +916,7 @@ static int seed0root_filed_service_call(
     return 0;
 }
 
-static int seed0root_lprs_call(
+static int seed0root_lprs_call_cap(
     int endpoint_fd,
     uint32_t op,
     uint64_t request_id,
@@ -923,8 +924,10 @@ static int seed0root_lprs_call(
     void *page,
     uint32_t payload_size,
     int transfer_fd,
-    struct pacha_ipc_msg *out_reply)
+    struct pacha_ipc_msg *out_reply,
+    int *out_cap)
 {
+    if (out_cap) *out_cap = -1;
     if (endpoint_fd < 16 || request_id == 0 || out_reply == NULL ||
         payload_size > LPRS_PAYLOAD_BYTES)
     {
@@ -990,10 +993,16 @@ static int seed0root_lprs_call(
         return reply_fd;
     }
 
+    struct pacha_ipc_fd cap = {0};
     memset(out_reply, 0, sizeof(*out_reply));
+    out_reply->fds = &cap;
+    out_reply->fd_capacity = 1;
     const int recv_status = recv_ipc_wait(reply_fd, out_reply);
+    out_reply->fds = NULL;
+    out_reply->fd_capacity = 0;
     (void)pacha_fd_close(reply_fd);
     if (recv_status != 0) {
+        if (cap.fd >= 16) (void)pacha_fd_close((int)cap.fd);
         if (owned_page_fd >= 16) {
             seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
@@ -1005,14 +1014,18 @@ static int seed0root_lprs_call(
     if (out_reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
         out_reply->word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->request_id != request_id)
+        reply_header->request_id != request_id ||
+        reply_header->status != (int64_t)out_reply->word1 ||
+        out_reply->fd_count > 1)
     {
+        if (cap.fd >= 16) (void)pacha_fd_close((int)cap.fd);
         if (owned_page_fd >= 16) {
             seed0root_destroy_filed_page(owned_page_fd, owned_page);
         }
         return -2;
     }
     if ((int64_t)out_reply->word1 < 0) {
+        if (cap.fd >= 16) (void)pacha_fd_close((int)cap.fd);
         if (out_reply->word2 != 0) {
             seed0root_dump_lprs_error_token(
                 endpoint_fd,
@@ -1028,7 +1041,22 @@ static int seed0root_lprs_call(
     if (owned_page_fd >= 16) {
         seed0root_destroy_filed_page(owned_page_fd, owned_page);
     }
+    if (out_reply->fd_count) {
+        if (!out_cap || cap.fd < 16 || cap.fd >= PACHA_FD_TABLE_LIMIT) {
+            if (cap.fd >= 16) (void)pacha_fd_close((int)cap.fd);
+            return -5;
+        }
+        *out_cap = (int)cap.fd;
+    }
     return 0;
+}
+
+static int seed0root_lprs_call(int endpoint_fd, uint32_t op, uint64_t request_id,
+    int page_fd, void *page, uint32_t payload_size, int transfer_fd,
+    struct pacha_ipc_msg *out_reply)
+{
+    return seed0root_lprs_call_cap(endpoint_fd, op, request_id, page_fd, page,
+        payload_size, transfer_fd, out_reply, NULL);
 }
 
 static int seed0root_dump_filed_metrics(int filed_endpoint_fd)
@@ -2792,6 +2820,13 @@ static int seed0root_find_root_device(
     return -1;
 }
 
+#if defined(SEED0ROOT_UNIXD_CONTRACT_TEST) && SEED0ROOT_UNIXD_CONTRACT_TEST
+/* Test builds retain only the capability returned for this exact launch.
+ * No PID lookup, new kernel authority, or service control API is needed. */
+static int seed0root_test_netd_process = -1;
+static int seed0root_test_native_status;
+#endif
+
 static int seed0root_exec_native_service(
     int filed_endpoint_fd,
     const char *path,
@@ -2823,7 +2858,7 @@ static int seed0root_exec_native_service(
     snprintf(exec->path, sizeof(exec->path), "%s", path);
     status = seed0root_exec_add_string(exec, &exec->argv[0], path);
     for (uint64_t i = 0; status == 0 && i < inherit_count; i++) {
-        if (source_fds[i] < 16 || target_fds[i] < 16 || target_fds[i] >= 256)
+        if (source_fds[i] < 16 || target_fds[i] < 16 || target_fds[i] >= PACHA_FD_TABLE_LIMIT)
             status = -22;
         exec->inherit_fd_targets[i] = target_fds[i];
     }
@@ -2859,6 +2894,12 @@ static int seed0root_exec_native_service(
     seed0root_destroy_filed_page(page_fd, page);
     (void)pacha_fd_close(bootstrap_fd);
     if (status == 0 && reply.fd_count < 2) status = -5;
+#if defined(SEED0ROOT_UNIXD_CONTRACT_TEST) && SEED0ROOT_UNIXD_CONTRACT_TEST
+    if (status == 0 && strcmp(path, "/srv/netd.elf") == 0) {
+        seed0root_test_netd_process = (int)reply_fds[0].fd;
+        reply_fds[0].fd = 0;
+    }
+#endif
     for (uint64_t i = 0; i < 2; i++)
         if (reply_fds[i].fd >= 16) (void)pacha_fd_close((int)reply_fds[i].fd);
     return status;
@@ -2890,6 +2931,32 @@ static int seed0root_wait_service_ready(int channel_fd, uint64_t magic, const ch
             name, status, (unsigned long long)msg.word0);
         return status != 0 ? status : -5;
     }
+    return 0;
+}
+
+static int seed0root_start_unixd(int filed_endpoint_fd, int filed_path_fd, int *out_admin)
+{
+    *out_admin = -1;
+    const int admin = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (admin < 16) return -5;
+    struct pacha_ipc_channel_pair ready = { .a = -1, .b = -1 };
+    if (pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
+        (void)pacha_fd_close(admin);
+        return -5;
+    }
+    const struct unix_boot_config config = { .magic = UNIX_BOOT_MAGIC,
+        .version = UNIX_SERVICE_VERSION, .admin_endpoint = SEED0ROOT_SERVICE_ENDPOINT_FD,
+        .filed_path_channel = 234,
+        .ready_channel = SEED0ROOT_SERVICE_READY_FD };
+    const int fds[] = { admin, ready.b, filed_path_fd };
+    const uint64_t targets[] = { SEED0ROOT_SERVICE_ENDPOINT_FD, SEED0ROOT_SERVICE_READY_FD, 234 };
+    int status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/unixd.elf",
+        &config, sizeof(config), fds, targets, 3, 0x5eed2010u);
+    (void)pacha_fd_close(ready.b);
+    if (status == 0) status = seed0root_wait_service_ready(ready.a, UNIX_READY_MAGIC, "unixd");
+    else (void)pacha_fd_close(ready.a);
+    if (status != 0) { (void)pacha_fd_close(admin); return status; }
+    *out_admin = admin;
     return 0;
 }
 
@@ -3058,6 +3125,20 @@ static int seed0root_launch_root_services(
     if (status != 0) goto out;
     printf("[seed0root] rootfs services ready termd -> netd -> drmd -> inputd\n");
     fflush(stdout);
+#if defined(SEED0ROOT_UNIXD_CONTRACT_TEST) && SEED0ROOT_UNIXD_CONTRACT_TEST
+    {
+        const char *native_argv[] = { "/cmd/unix_native_contract.elf" };
+        seed0root_test_native_status = seed0root_run_exec_path_smoke(filed_endpoint_fd, native_argv[0],
+            native_argv, 1, "UNIXD_NATIVE_TEST=1", "unix native contract", 0);
+        const int netd_process = seed0root_test_netd_process;
+        struct pacha_fd_info info = {0};
+        status = netd_process < 16 ? -9 : (int)pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_STOP, (uint64_t)netd_process, 19);
+        if (!status && (pacha_fd_get_info(netd_process, &info) != 0 || info.extra != 4)) status = -5;
+        printf("UNIXD_NETD_STOPPED status=%d state=%llu\n", status, (unsigned long long)info.extra);
+        fflush(stdout);
+    }
+#endif
 
 out:
     if (ready.a >= 16) (void)pacha_fd_close(ready.a);
@@ -3086,9 +3167,9 @@ static int seed0root_send_storage_ready(int ready_channel_fd)
     return pacha_ipc_send(ready_channel_fd, &msg);
 }
 
-static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoint_fd)
+static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_fd, int *out_endpoint_fd)
 {
-    if (filed_endpoint_fd < 16 || out_endpoint_fd == NULL) {
+    if (filed_endpoint_fd < 16 || unix_admin_fd < 16 || out_endpoint_fd == NULL) {
         return -22;
     }
     *out_endpoint_fd = -1;
@@ -3101,6 +3182,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
     memset(&cfg, 0, sizeof(cfg));
     cfg.magic = LPRS_BOOT_CONFIG_MAGIC;
     cfg.endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
+    cfg.unix_admin_fd = LPRS_UNIX_ADMIN_FD;
     const int bootstrap_fd = create_inherited_vmo_from_bytes_with_extra_rights(
         &cfg,
         sizeof(cfg),
@@ -3122,9 +3204,10 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
     filed_exec_path_t *exec = (filed_exec_path_t *)page;
     exec->dir_handle = 0;
     exec->flags = FILED_EXEC_INHERIT_FDS;
-    exec->inherit_fd_count = 2;
+    exec->inherit_fd_count = 3;
     exec->inherit_fd_targets[0] = LPR_SUPERVISOR_ENDPOINT_FD;
     exec->inherit_fd_targets[1] = LPRS_BOOT_CONFIG_FD;
+    exec->inherit_fd_targets[2] = LPRS_UNIX_ADMIN_FD;
     exec->argc = 2;
     snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/lpr_supervisor.elf");
     status = seed0root_exec_add_string(exec, &exec->argv[0], "/sbin/lpr_supervisor.elf");
@@ -3144,7 +3227,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
         return status;
     }
 
-    struct pacha_ipc_fd fds[3];
+    struct pacha_ipc_fd fds[4];
     memset(fds, 0, sizeof(fds));
     fds[0].fd = (uint64_t)(uint32_t)page_fd;
     fds[0].rights =
@@ -3161,6 +3244,10 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_READ |
         PACHA_FD_RIGHT_MAP_READ;
+    fds[3].fd = (uint64_t)(uint32_t)unix_admin_fd;
+    fds[3].rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL; /* filed needs DUP/SET_FLAGS to install the target */
 
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
@@ -3170,7 +3257,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int *out_endpoi
         FILED_OP_EXEC_PATH,
         0x5eed1001u,
         fds,
-        3,
+        4,
         0,
         &reply,
         reply_fds,
@@ -3245,7 +3332,8 @@ static int seed0root_register_termd_signal_supervisor(
 
 static int seed0root_register_lpr_init(
     int supervisor_endpoint_fd,
-    lprs_process_state_t *out_state)
+    lprs_process_state_t *out_state,
+    int *out_bootstrap)
 {
     if (supervisor_endpoint_fd < 16 || out_state == NULL) {
         return -22;
@@ -3262,7 +3350,7 @@ static int seed0root_register_lpr_init(
     snprintf(reg->state.ctty, sizeof(reg->state.ctty), "%s", "/dev/hvc0");
     snprintf(reg->state.cwd, sizeof(reg->state.cwd), "%s", "/");
     struct pacha_ipc_msg reply;
-    status = seed0root_lprs_call(
+    status = seed0root_lprs_call_cap(
         supervisor_endpoint_fd,
         LPRS_OP_PROCESS_REGISTER_EXEC,
         0x5eed1003u,
@@ -3270,7 +3358,7 @@ static int seed0root_register_lpr_init(
         page,
         sizeof(*reg),
         -1,
-        &reply);
+        &reply, out_bootstrap);
     if (status == 0) {
         memcpy(out_state, &reg->state, sizeof(*out_state));
     }
@@ -3306,9 +3394,11 @@ static void seed0root_cancel_lpr_exec(
     seed0root_destroy_filed_page(page_fd, page);
 }
 
-static int seed0root_spawn_lpr_init(
+static int seed0root_spawn_registered_lpr_init(
     int filed_endpoint_fd,
-    int supervisor_endpoint_fd)
+    int supervisor_endpoint_fd,
+    const lprs_process_state_t *registered,
+    int bootstrap_fd)
 {
     static const char *const argv[] = {
         "/sbin/init",
@@ -3316,16 +3406,8 @@ static int seed0root_spawn_lpr_init(
     if (filed_endpoint_fd < 16 || supervisor_endpoint_fd < 16) {
         return -22;
     }
-    lprs_process_state_t init_state;
-    memset(&init_state, 0, sizeof(init_state));
-    int status = seed0root_register_lpr_init(
-        supervisor_endpoint_fd,
-        &init_state);
-    if (status != 0 || init_state.token == 0 ||
-        init_state.generation == 0 || init_state.pid == 0)
-    {
-        return status != 0 ? status : -5;
-    }
+    const lprs_process_state_t init_state = *registered;
+    int status;
 
     lpr_manifest_layout_t manifest_layout;
     memset(&manifest_layout, 0, sizeof(manifest_layout));
@@ -3391,7 +3473,7 @@ static int seed0root_spawn_lpr_init(
     manifest->linux_next_pid = 0;
     manifest->cwd_handle = init_state.cwd_handle;
     manifest->supervisor_token = init_state.token;
-    manifest->supervisor_endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
+    manifest->supervisor_bootstrap_fd = LPR_SUPERVISOR_ENDPOINT_FD;
     manifest->owner_generation = init_state.generation;
     snprintf(manifest->ctty, sizeof(manifest->ctty), "%s", init_state.ctty);
     snprintf(manifest->cwd, sizeof(manifest->cwd), "%s", init_state.cwd);
@@ -3441,8 +3523,9 @@ static int seed0root_spawn_lpr_init(
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    fds[1].fd = (uint64_t)(uint32_t)supervisor_endpoint_fd;
-    fds[1].rights = seed0root_channel_rights;
+    fds[1].fd = (uint64_t)(uint32_t)bootstrap_fd;
+    fds[1].rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS;
     fds[2].fd = (uint64_t)(uint32_t)manifest_fd;
     fds[2].rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -3539,7 +3622,21 @@ static int seed0root_spawn_lpr_init(
     return 0;
 }
 
-static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
+static int seed0root_spawn_lpr_init(int filed_endpoint_fd, int supervisor_endpoint_fd)
+{
+    lprs_process_state_t state = {0};
+    int bootstrap_fd = -1;
+    int status = seed0root_register_lpr_init(supervisor_endpoint_fd, &state, &bootstrap_fd);
+    if (status == 0 && (!state.token || !state.generation || !state.pid || bootstrap_fd < 16)) status = -5;
+    if (status == 0) status = seed0root_spawn_registered_lpr_init(
+        filed_endpoint_fd, supervisor_endpoint_fd, &state, bootstrap_fd);
+    else if (state.token) seed0root_cancel_lpr_exec(supervisor_endpoint_fd, state.token);
+    if (bootstrap_fd >= 16) (void)pacha_fd_close(bootstrap_fd);
+    return status;
+}
+
+static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap,
+    const struct pacha_ipc_channel_pair *unix_path)
 {
     if (bootstrap->magic != STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC ||
         bootstrap->filed_image_fd < 16 ||
@@ -3637,6 +3734,7 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
         return status;
     }
     printf("[seed0root] filed bootstrap ready\n");
+    filed_bootstrap.unix_path_fd = (uint64_t)unix_path->a;
     fflush(stdout);
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&filed_bootstrap, sizeof(filed_bootstrap), "filed bootstrap fd");
     if (bootstrap_fd < 16) {
@@ -3685,31 +3783,41 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
     }
     printf("[seed0root] storage ready signal sent\n");
     fflush(stdout);
+    /* Local IPC and its trusted authority do not depend on NIC/device
+     * discovery. The admin capability is not registered as a filed service
+     * endpoint and is never part of a Linux exec manifest. */
+    int unix_admin_fd = -1;
+    int lpr_supervisor_endpoint_fd = -1;
+    status = seed0root_start_unixd(filed_client_fd, unix_path->b, &unix_admin_fd);
+    if (status == 0) status = seed0root_start_lpr_supervisor(
+        filed_client_fd, unix_admin_fd, &lpr_supervisor_endpoint_fd);
+    if (unix_admin_fd >= 16) (void)pacha_fd_close(unix_admin_fd);
+    if (status != 0) {
+        (void)pacha_fd_close(filed_client_fd);
+        fprintf(stderr, "[seed0root] local IPC bootstrap failed status=%d\n", status);
+        return status;
+    }
     struct seed0root_root_devices root_devices;
     status = seed0root_receive_root_handoff(
         (int)bootstrap->service_ready_channel_fd,
         &root_devices);
     if (status != 0) {
+        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
         (void)pacha_fd_close(filed_client_fd);
         return status;
     }
     status = seed0root_launch_root_services(filed_client_fd, &root_devices);
     if (status != 0) {
+        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
         (void)pacha_fd_close(filed_client_fd);
         fprintf(stderr, "[seed0root] rootfs service launch failed status=%d\n", status);
         return status;
     }
     status = seed0root_run_storage_services(filed_client_fd);
     if (status != 0) {
+        (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
         (void)pacha_fd_close(filed_client_fd);
         fprintf(stderr, "[seed0root] filed service failed status=%d\n", status);
-        return status;
-    }
-    int lpr_supervisor_endpoint_fd = -1;
-    status = seed0root_start_lpr_supervisor(filed_client_fd, &lpr_supervisor_endpoint_fd);
-    if (status != 0) {
-        (void)pacha_fd_close(filed_client_fd);
-        fprintf(stderr, "[seed0root] lpr supervisor launch failed status=%d\n", status);
         return status;
     }
     status = seed0root_register_termd_signal_supervisor(
@@ -3726,6 +3834,47 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
     status = seed0root_spawn_lpr_init(
         filed_client_fd,
         lpr_supervisor_endpoint_fd);
+#if defined(SEED0ROOT_UNIXD_CONTRACT_TEST) && SEED0ROOT_UNIXD_CONTRACT_TEST
+    {
+        const uint64_t deadline = seed0root_now_ns() + 90000000000ull;
+        const int timer = pacha_timerfd_create(100000000, 100000000,
+            PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE, 0);
+        if (!status && timer < 16) status = -5;
+        int completed = 0;
+        while (!status && seed0root_now_ns() < deadline) {
+            char result[16] = {0};
+            if (seed0root_read_filed_text(filed_client_fd,
+                    "/tmp/unixd-stop-test.done", result, sizeof(result)) == 0 &&
+                strchr(result, '\n') != NULL) {
+                completed = 1;
+                if (strcmp(result, "0\n") != 0) status = -5;
+                break;
+            }
+            struct pacha_pollfd tick = { .fd = timer, .events = PACHA_FD_EVENT_READABLE };
+            uint64_t expirations;
+            if (pacha_fd_wait_many(&tick, 1, PACHA_FD_WAIT_FOREVER) != 1 ||
+                pacha_fd_read(timer, &expirations, sizeof(expirations)) != sizeof(expirations)) {
+                status = -5;
+                break;
+            }
+        }
+        if (timer >= 16) (void)pacha_fd_close(timer);
+        if (!status && !completed) status = -110;
+        struct pacha_fd_info info = {0};
+        const int netd_process = seed0root_test_netd_process;
+        const int inspected = pacha_fd_get_info(netd_process, &info);
+        if (!status && (inspected != 0 || info.extra != 4)) status = -5;
+        const int resumed = netd_process < 16 ? -9 : (int)pacha_syscall2(
+            PACHA_PROCESS_SYSCALL_CONTINUE, (uint64_t)netd_process, 18);
+        if (!status) status = resumed;
+        printf("UNIXD_NETD_STOP_TEST status=%d stopped_state=%llu resumed=%d native_status=%d\n",
+            status, (unsigned long long)info.extra, resumed, seed0root_test_native_status);
+        fflush(stdout);
+        if (!status) status = seed0root_test_native_status;
+        if (netd_process >= 16) (void)pacha_fd_close(netd_process);
+        seed0root_test_netd_process = -1;
+    }
+#endif
     (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
     (void)pacha_fd_close(filed_client_fd);
     if (status != 0) {
@@ -3734,6 +3883,18 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
     }
     printf("[seed0root] storage ready\n");
     return 0;
+}
+
+static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
+{
+    struct pacha_ipc_channel_pair path = { .a = -1, .b = -1 };
+    int status = pacha_ipc_channel_create(&path, seed0root_channel_rights, 0);
+    if (status != 0) return status;
+    status = mark_fd_inherit(path.a, "filed UNIX path channel");
+    if (status == 0) status = launch_filed_with_path(bootstrap, &path);
+    (void)pacha_fd_close(path.a);
+    (void)pacha_fd_close(path.b);
+    return status;
 }
 
 int main(int argc, char **argv)

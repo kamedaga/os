@@ -7,14 +7,20 @@ project(seed0root C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(SEED0ROOT_ELF "${CMAKE_BINARY_DIR}/seed0root.elf")
+option(SEED0ROOT_UNIXD_CONTRACT_TEST "Run native/UNIX probes with netd stopped (test image only)" OFF)
+set(SEED0ROOT_TEST_ENV)
+if(SEED0ROOT_UNIXD_CONTRACT_TEST)
+  list(APPEND SEED0ROOT_TEST_ENV "PACHAOS_MUSL_EXTRA_CFLAGS=$ENV{PACHAOS_MUSL_EXTRA_CFLAGS} -DSEED0ROOT_UNIXD_CONTRACT_TEST=1")
+endif()
 
 add_custom_command(
   OUTPUT "${SEED0ROOT_ELF}"
   COMMAND
     ${CMAKE_COMMAND} -E env
+      ${SEED0ROOT_TEST_ENV}
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/personality/src/lpr_manifest.c"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/drmd/include ${REPO_ROOT}/userland/inputd/include"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/drmd/include ${REPO_ROOT}/userland/inputd/include ${REPO_ROOT}/userland/unixd/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
@@ -36,6 +42,10 @@ add_custom_command(
     "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/root_handoff.h"
     "${REPO_ROOT}/userland/netd/include/netd/boot_config.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/poll.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/transport.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/transfer.h"
     "${REPO_ROOT}/userland/termd/include/termd/boot_config.h"
     "${REPO_ROOT}/userland/drmd/include/drmd/boot_config.h"
     "${REPO_ROOT}/userland/inputd/include/inputd/boot_config.h"

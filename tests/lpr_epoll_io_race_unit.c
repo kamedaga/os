@@ -10,7 +10,8 @@ static lpr_fd_entry_t entries[6];
 static lpr_ofd_t objects[2];
 static lpr_backend_record_t backends[2];
 static lpr_epoll_backend_t epoll_backend;
-static union { max_align_t align; unsigned char bytes[4096]; } storage;
+static union { max_align_t align; unsigned char bytes[LPR_EPOLL_INSTANCE_BYTES]; } storage;
+static struct unix_poll_sequence unix_sequence;
 static uint32_t ready_events;
 static unsigned notifications, failures, locked;
 
@@ -40,6 +41,15 @@ int64_t lpr_linux_poll_current(uint64_t raw, uint64_t count)
 int64_t lpr_linux_poll_cached(uint64_t raw, uint64_t count)
 {
     return lpr_linux_poll_current(raw, count);
+}
+
+int64_t lpr_unix_socket_poll_sequence(uint64_t fd, uint32_t events,
+    struct unix_poll_sequence *sequence)
+{
+    (void)fd;
+    assert(!locked);
+    *sequence = unix_sequence;
+    return ready_events & events;
 }
 
 static void expect(int condition, const char *name)
@@ -132,6 +142,24 @@ int main(void)
     expect(take_event() == LPR_EPOLLIN, "one-shot initial readiness");
     note_io(3, LPR_EPOLLIN, -LPR_LINUX_EAGAIN);
     expect(take_event() == 0 && notifications == 0, "EAGAIN does not rearm a disabled one-shot");
+
+    setup(both | LPR_EPOLLET);
+    backends[0].ops_id = LPR_FD_OPS_UNIX;
+    unix_sequence = (struct unix_poll_sequence){ .source = 9, .read = 1, .write = 1 };
+    ready_events = both;
+    expect(take_event() == both && take_event() == 0, "UNIX initial stamp consumed once");
+    unix_sequence.read++;
+    expect(take_event() == LPR_EPOLLIN && take_event() == 0,
+        "remote receive/refill reports IN without spuriously repeating OUT");
+    unix_sequence.write++;
+    expect(take_event() == LPR_EPOLLOUT && take_event() == 0,
+        "remote full/drain reports OUT without spuriously repeating IN");
+    setup(LPR_EPOLLIN | LPR_EPOLLET | LPR_EPOLLONESHOT);
+    backends[0].ops_id = LPR_FD_OPS_UNIX;
+    ready_events = LPR_EPOLLIN;
+    expect(take_event() == LPR_EPOLLIN, "UNIX one-shot initial event");
+    unix_sequence.read++;
+    expect(take_event() == 0, "remote progress does not rearm ONESHOT");
     if (failures) return 1;
     puts("LPR_EPOLL_IO_RACE_UNIT=OK");
     return 0;

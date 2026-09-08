@@ -3,6 +3,12 @@
 #include <string.h>
 #include "pacha/syscall.h"
 
+int pacha_fd_table(uint64_t minimum_capacity, struct pacha_fd_table_info *out) {
+    if (!out) return PACHA_ERR_INVALID;
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_TABLE,
+        minimum_capacity, (uint64_t)(uintptr_t)out));
+}
+
 int pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_ENDPOINT_CREATE, rights, flags));
 }

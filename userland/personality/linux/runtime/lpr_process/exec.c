@@ -211,6 +211,7 @@ static uint64_t lpr_exec_backend_record_bytes(uint8_t ops_id)
     case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
     case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
+    case LPR_FD_OPS_UNIX: return sizeof(struct lpr_unix_socket);
     case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
     case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
     case LPR_FD_OPS_SYNC_FILE: return sizeof(lpr_sync_file_backend_t);
@@ -240,6 +241,9 @@ static uint32_t lpr_exec_backend_native_fds(
     switch (ops_id) {
     case LPR_FD_OPS_FILED:
         LPR_EXEC_ADD_NATIVE(((const lpr_filed_backend_t *)state)->lease_fd.raw);
+        break;
+    case LPR_FD_OPS_UNIX:
+        LPR_EXEC_ADD_NATIVE(((const struct lpr_unix_socket *)state)->handoff_fd);
         break;
     case LPR_FD_OPS_TTY:
         LPR_EXEC_ADD_NATIVE(((const lpr_tty_backend_t *)state)->wait_fd.raw);
@@ -485,6 +489,7 @@ static const char *lpr_manifest_backend_stage(uint8_t ops_id)
     case LPR_FD_OPS_EVENT: return "backend-event";
     case LPR_FD_OPS_EPOLL: return "backend-epoll";
     case LPR_FD_OPS_SYNC_FILE: return "backend-sync-file";
+    case LPR_FD_OPS_UNIX: return "backend-unix";
     default: return "backend-unknown";
     }
 }
@@ -500,6 +505,26 @@ static int lpr_prepare_backend_record(
     if (transaction == 0 || original_state == 0 || prepared_state == 0)
         return -LPR_LINUX_EFAULT;
     int status = 0;
+    if (ops_id == LPR_FD_OPS_UNIX) {
+        /* Pins keep the real backend alive; the snapshot's native numbers
+         * and adoption lock are not independent objects we may consume. */
+        const lpr_fd_pin_t *pin = &transaction->pins[pin_index];
+        lpr_fd_table_lock(&lpr_control_fd_table);
+        lpr_backend_record_t *backend = &lpr_control_fd_table.backends[pin->backend_index];
+        struct lpr_unix_socket *socket = backend->active && backend->generation == pin->backend_generation ?
+            backend->state : NULL;
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+        if (!socket) return -LPR_LINUX_EBADF;
+        status = lpr_unix_socket_handoff(socket, prepared_state);
+        if (status) return status;
+        struct lpr_unix_socket *record = prepared_state;
+        status = lpr_transaction_track_lease(transaction, pin_index, record->handoff_fd);
+        if (status) {
+            (void)lpr_close_native_fd_if_open((uint32_t)record->handoff_fd);
+            record->handoff_fd = -1;
+        }
+        return status;
+    }
     if (lpr_backend_needs_transfer_lease(ops_id, original_state)) {
         int lease_fd = -1;
         int remote_lease_fd = -1;
@@ -732,6 +757,7 @@ static int lpr_prepare_manifest_impl(
     lpr_memset(transaction, 0, sizeof(*transaction));
     transaction->manifest_fd = -1;
     transaction->cwd_lease_fd = -1;
+    transaction->supervisor_bootstrap_fd = -1;
     lpr_fd_arrays_init();
     lpr_cwd_init();
     exec->dir_handle = lpr_cwd_handle;
@@ -884,6 +910,7 @@ static int lpr_prepare_manifest_impl(
     uint64_t capability_count = transaction->cwd_lease_fd >= 16 ? 1u : 0u;
     for (uint64_t i = 0; i < transaction->pin_count; ++i) {
         record_bytes += lpr_exec_backend_record_bytes(transaction->pins[i].ops_id);
+        if (transaction->pins[i].ops_id == LPR_FD_OPS_UNIX) { capability_count++; continue; }
         int32_t native_fds[2];
         capability_count += lpr_exec_backend_native_fds(
             transaction->pins[i].ops_id,
@@ -922,7 +949,7 @@ static int lpr_prepare_manifest_impl(
         if (lpr_supervisor_get_state(&state) == 0) manifest->owner_generation = state.generation;
         manifest->flags |= LPR_MANIFEST_FLAG_SUPERVISOR;
         manifest->supervisor_token = lpr_supervisor_token;
-        manifest->supervisor_endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
+        manifest->supervisor_bootstrap_fd = LPR_SUPERVISOR_ENDPOINT_FD;
     }
     const uint64_t cwd_len = lpr_strnlen(lpr_cwd_path, sizeof(lpr_cwd_path));
     if (cwd_len == 0 || cwd_len >= sizeof(manifest->cwd)) {
@@ -1019,6 +1046,20 @@ static int lpr_prepare_manifest_impl(
         lpr_exec_unpin(transaction);
         lpr_destroy_exec_transaction(transaction);
         return -LPR_LINUX_EIO;
+    }
+    if (lpr_supervisor_enabled && !fork_snapshot) {
+        void *page = 0;
+        const int page_fd = lpr_create_standalone_wire_page(&page);
+        const int64_t status = page_fd < 16 ? page_fd :
+            lpr_process_client_prepare_exec(&lpr_request_id, lpr_pacha_status_to_errno,
+                lpr_supervisor_token, page_fd, page, &transaction->supervisor_bootstrap_fd);
+        if (page_fd >= 16) lpr_destroy_standalone_wire_page(page_fd, page);
+        if (status != 0) {
+            lpr_destroy_exec_transaction(transaction);
+            return (int)status;
+        }
+        transaction->supervisor_exec_prepared = 1;
+        manifest->supervisor_bootstrap_fd = (uint64_t)(uint32_t)transaction->supervisor_bootstrap_fd;
     }
     if (lpr_manifest_seal(manifest, map_bytes) != 0) {
         lpr_manifest_diag("seal");
@@ -1160,6 +1201,8 @@ int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction)
         lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[pin->ofd_index];
         void *state = lpr_backend_state_from_ofd(ofd);
         const void *prepared = lpr_fork_manifest_record(transaction, i);
+        if (pin->ops_id == LPR_FD_OPS_UNIX)
+            lpr_unix_mapping_destroy(&((struct lpr_unix_socket *)state)->mapping);
         lpr_memcpy(
             state,
             prepared,
@@ -1244,6 +1287,15 @@ void lpr_exec_transaction_commit_self(lpr_exec_transaction_t *transaction)
 void lpr_destroy_exec_transaction(lpr_exec_transaction_t *transaction)
 {
     if (transaction == 0) return;
+    if (transaction->supervisor_exec_prepared) {
+        transaction->supervisor_exec_prepared = 0;
+        (void)lpr_supervisor_call_token(LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL,
+            lpr_supervisor_token, -1, 0);
+    }
+    if (transaction->supervisor_bootstrap_fd >= 16)
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)transaction->supervisor_bootstrap_fd);
+    transaction->supervisor_bootstrap_fd = -1;
     lpr_fork_transaction_rollback(transaction);
     for (uint64_t i = transaction->prepared_lease_count; i != 0; --i)
         if (transaction->prepared_leases != 0 &&
@@ -1350,6 +1402,8 @@ static int lpr_restore_exec_bootstrap_fd(
 
 int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
 {
+    /* A dynamic donor is consumed only on success. Failure always leaves
+     * it with the caller, including failures after replacing the slot. */
     if (bootstrap_fd < 16) {
         return -LPR_LINUX_EBADF;
     }
@@ -1413,8 +1467,6 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
             (int)(uint32_t)backup_fd, &backup_info);
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)backup_fd);
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)bootstrap_fd);
         return restore_status != 0 ? restore_status : -LPR_LINUX_EIO;
     }
     const int64_t flag_status = lpr_pacha_syscall4(
@@ -1429,8 +1481,6 @@ int lpr_install_exec_bootstrap_fd(int bootstrap_fd)
             (int)(uint32_t)backup_fd, &backup_info);
         (void)lpr_pacha_syscall1(
             PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)backup_fd);
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)bootstrap_fd);
         return restore_status != 0 ? restore_status :
             (int)lpr_pacha_status_to_errno(flag_status);
     }

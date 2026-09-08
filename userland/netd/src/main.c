@@ -6,7 +6,6 @@
 #include "libuinet_backend.h"
 #include "netlink_socket.h"
 #include "socket_service.h"
-#include "unix_socket.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
 #include "pacha/bootstrap.h"
@@ -139,9 +138,6 @@ int main(int argc, char **argv)
         if (status != 0)
             return netd_wait_set_failure(
                 "socket_service", status, &wait_set);
-        status = netd_unix_socket_collect_wait_sources(&wait_set);
-        if (status != 0)
-            return netd_wait_set_failure("unix_socket", status, &wait_set);
         status = netd_netlink_socket_collect_wait_sources(&wait_set);
         if (status != 0)
             return netd_wait_set_failure(
@@ -155,7 +151,6 @@ int main(int argc, char **argv)
          * drain, and block only when there is no work left to pump. */
         (void)pacha_service_wait(&wait_set, busy ? 0 : PACHA_FD_WAIT_FOREVER);
         netd_socket_service_reap_hangups(&wait_set);
-        netd_unix_socket_reap_hangups(&wait_set);
         netd_netlink_socket_reap_hangups(&wait_set);
         netd_libuinet_socket_reap_hangups(&wait_set);
     }

@@ -89,6 +89,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   -I"$repo_root/userland/filed/include" \
   -I"$repo_root/userland/lpr_supervisor/include" \
   -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/drmd/include" \
   -I"$repo_root/userland/inputd/include" \
@@ -103,6 +104,24 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_fd/table.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_error.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/cache.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/mapping.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/notify.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/wait.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/context.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/socket.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/address.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/poll.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/message.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/datagram.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/rights.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/handoff.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/options.c" \
+  "$repo_root/userland/unixd/src/client_wire.c" \
+  "$repo_root/userland/unixd/src/transport.c" \
+  "$repo_root/userland/unixd/src/notify.c" \
+  "$repo_root/userland/unixd/src/notify_client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_filed.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_common/runtime_support.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/client.c" \

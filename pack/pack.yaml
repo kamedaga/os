@@ -27,7 +27,9 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+# Overlay expansion omits empty directories. Desktop must exist before
+# xfdesktop constructs its regular-file icons on the first login.
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/root/Desktop", "/share", "/share/fastfetch", "/share/fonts", "/run"]
 skip:
   apps:
     - "alpine_go"
@@ -908,6 +910,11 @@ apps:
         - "userland/personality/include"
         - "userland/personality/linux/decoder"
         - "userland/personality/linux/runtime"
+        - "userland/unixd/include"
+        - "userland/unixd/src/client_wire.c"
+        - "userland/unixd/src/transport.c"
+        - "userland/unixd/src/notify.c"
+        - "userland/unixd/src/notify_client.c"
         - "userland/lpr_supervisor/include"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
@@ -1170,6 +1177,40 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_child_lifecycle_red.c"
     out: "LPRCHILD.ELF"
     rootfs: "/cmd/lpr_child_lifecycle_red.elf"
+  unix_native_contract:
+    file:
+      path: ".artifacts/tests/unix-native/unix_native_contract.elf"
+      rebuild: ["bash", "tests/build-unix-native-contract.sh"]
+      input:
+        - "tests/build-unix-native-contract.sh"
+        - "tests/unix_native_contract.c"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "UNIXNAT.ELF"
+    rootfs: "/cmd/unix_native_contract.elf"
+  lpr_unixd_pair_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_unixd_pair_probe.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_unixd_pair_probe", "userland/fixtures/src/wsl_musl/lpr_unixd_pair_probe.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_unixd_pair_probe.c"
+    out: "UNIXPAIR.ELF"
+    rootfs: "/cmd/lpr_unixd_pair_probe.elf"
+  lpr_mremap_growth_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_mremap_growth_probe.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_mremap_growth_probe", "userland/fixtures/src/wsl_musl/lpr_mremap_growth_probe.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_mremap_growth_probe.c"
+    out: "MREMAPGR.ELF"
+    rootfs: "/cmd/lpr_mremap_growth_probe.elf"
   lpr_fork_pthread_probe:
     file:
       path: ".artifacts/userland-fixtures/lpr_fork_pthread_probe.static.elf"
@@ -1500,6 +1541,25 @@ apps:
         - "userland/pachaos_capsule/include"
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
+  unixd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/unixd/unixd.elf"
+      rebuild: ["bash", "-lc", "cmake -S userland/unixd -B .artifacts/cmake/unixd && cmake --build .artifacts/cmake/unixd --parallel 1"]
+      input:
+        - "userland/unixd/CMakeLists.txt"
+        - "userland/unixd/src"
+        - "userland/unixd/include"
+        - "userland/filed/include/filed/unix_path.h"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "UNIXD.ELF"
+    rootfs: "/srv/unixd.elf"
   netd:
     role: "service"
     file:
@@ -1650,6 +1710,7 @@ apps:
       input:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
+        - "userland/unixd/include"
         - "userland/storage/include"
         - "userland/filed/include"
         - "userland/lpr_supervisor/include"
@@ -1706,6 +1767,9 @@ apps:
         - "userland/lpr_supervisor/CMakeLists.txt"
         - "userland/lpr_supervisor/include"
         - "userland/lpr_supervisor/src"
+        - "userland/unixd/include"
+        - "userland/unixd/src/client.c"
+        - "userland/unixd/src/client_wire.c"
         - "musl/pachaos/build/build-app-dynamic.sh"
         - "musl/pachaos/build/build-runtime.sh"
         - "userland/libipc/include"

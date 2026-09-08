@@ -813,10 +813,87 @@ test "one thread can wait on multiple process fds" {
     try s.armFdWaitGroup(group);
 
     var targets: [2]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), s.takeTaskReadableWaitersForPrincipal(p1, targets[0..]));
+    s.markProcessObjectsExited(p1, .exited, 0);
     try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p1, targets[0..]));
     try std.testing.expectEqual(@as(u64, 0x1000), targets[0].pollfd_va);
+    s.markProcessObjectsExited(p2, .exited, 0);
     try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p2, targets[0..]));
     try std.testing.expectEqual(@as(u64, 0x1018), targets[0].pollfd_va);
+}
+
+test "fork excludes private capabilities without changing parent references" {
+    var s = try initFdState();
+    const private_object = try createTestFdObject(&s, 501);
+    const ordinary_object = try createTestFdObject(&s, 502);
+    const private_fd = try s.installFd(p0, private_object, fdRights(.{ .inspect = true, .close = true }), .{ .private = true, .inherit = true }, 16);
+    const ordinary_fd = try s.installFd(p0, ordinary_object, fdRights(.{ .inspect = true, .close = true, .dup = true }), .{ .cloexec = true, .nonblock = true }, 16);
+    (s.getFdTable(p0) orelse unreachable).entries[ordinary_fd].offset = 12345;
+    const original = (s.getFdTable(p0) orelse unreachable).entries[ordinary_fd];
+    try s.cloneFdTableForFork(p0, p1);
+    try std.testing.expect(s.fdEntryConst(p1, private_fd) == null);
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(private_object));
+    try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(ordinary_object));
+    const copied = s.fdEntryConst(p1, ordinary_fd) orelse unreachable;
+    try std.testing.expectEqual(original.object, copied.object);
+    try std.testing.expectEqual(kernel.fdRightsToBits(original.rights), kernel.fdRightsToBits(copied.rights));
+    try std.testing.expectEqual(kernel.fdFlagsToBits(original.flags), kernel.fdFlagsToBits(copied.flags));
+    try std.testing.expectEqual(original.offset, copied.offset);
+    try s.closeFd(p1, ordinary_fd);
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(ordinary_object));
+    try std.testing.expect(s.fdEntryConst(p0, private_fd) != null);
+}
+
+test "thread observation wakes only terminal generation across objects and owners" {
+    var s = try initFdState();
+    const rights = fdRights(.{ .inspect = true, .wait = true, .poll = true, .transfer = true, .close = true });
+    var fds: [3]kernel.Fd = undefined;
+    for ([_]u32{ 3, 3, 4 }, 0..) |slot, i| {
+        const source = try s.createThreadFd(p1, .{
+            .owner_principal_raw = @intFromEnum(p1),
+            .thread_index = slot,
+            .thread_generation = 10,
+            .state = .active,
+            .exit_code = 0,
+        }, rights, .{}, 16);
+        fds[i] = try s.transferFd(p1, p0, source, 16, rights, .{}, .move);
+    }
+    const process_fd = try s.createProcessFd(p0, .{
+        .principal_raw = @intFromEnum(p1),
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    for (fds, 0..) |fd, i|
+        try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd, fd_abi.event_readable, 0x1000 + i * 24, 7, 11, 1, group));
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, process_fd, fd_abi.event_readable, 0x2000, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
+    var targets: [1]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), s.takeTaskReadableWaitersForPrincipal(p1, &targets));
+    s.markThreadObjectsExitedBySlot(3, 10, .exited, 23);
+    // A short output buffer must not consume an undelivered wake.
+    try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p1, &targets));
+    try std.testing.expectEqual(@as(u64, 0x1000), targets[0].pollfd_va);
+    try std.testing.expectEqual(@as(usize, 1), s.takeTaskReadableWaitersForPrincipal(p1, &targets));
+    try std.testing.expectEqual(@as(u64, 0x1018), targets[0].pollfd_va);
+    try std.testing.expectEqual(@as(usize, 0), s.takeTaskReadableWaitersForPrincipal(p1, &targets));
+    for (fds[0..2]) |fd| {
+        const thread = s.threadObjectForFd(p0, fd, .{ .wait = true }) orelse unreachable;
+        try std.testing.expectEqual(kernel.TaskObjectState.exited, thread.state);
+        try std.testing.expectEqual(@as(u32, 23), thread.exit_code);
+    }
+    try std.testing.expectEqual(@as(?u64, 0), s.fdPollEvents(p0, fds[2], fd_abi.event_readable, 0));
+    try std.testing.expectEqual(@as(?u64, 0), s.fdPollEvents(p0, process_fd, fd_abi.event_readable, 0));
+    const reused = try s.createThreadFd(p0, .{
+        .owner_principal_raw = @intFromEnum(p1),
+        .thread_index = 3,
+        .thread_generation = 11,
+        .state = .active,
+        .exit_code = 0,
+    }, rights, .{}, 16);
+    s.markThreadObjectsExitedBySlot(3, 11, .killed, 99);
+    try std.testing.expectEqual(@as(u32, 99), (s.threadObjectForFd(p0, reused, .{ .wait = true }) orelse unreachable).exit_code);
+    try std.testing.expectEqual(@as(u32, 23), (s.threadObjectForFd(p0, fds[0], .{ .wait = true }) orelse unreachable).exit_code);
 }
 
 test "thread fd stores owner slot generation and lifecycle state" {
@@ -915,6 +992,64 @@ test "fd process exit and remove release fd table" {
     _ = try s.installFd(p1, remove_obj, fdRights(.{}), .{}, 0);
     try std.testing.expect(s.removeProcessDescriptor(p1));
     try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(remove_obj));
+}
+
+test "dynamic fd table preserves capabilities through growth fork and teardown" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    const initial_pages = free_list.pageCount();
+    const object = try createTestFdObject(&s, 71);
+    const low = try s.installFd(p0, object, fdRights(.{ .dup = true, .close = true }), .{}, 16);
+    try s.ensureFdTableCapacity(p0, 512, &free_list);
+    try std.testing.expectEqual(@as(usize, 512), s.getFdTableConst(p0).?.slots().len);
+    const high = try s.dupFd(p0, low, 300, fdRights(.{ .dup = true, .close = true }), .{ .cloexec = true });
+    try std.testing.expectEqual(@as(kernel.Fd, 300), high);
+    try s.ensureFdTableCapacity(p0, 1024, &free_list);
+    try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(object));
+    try std.testing.expect(s.getFdTableConst(p0).?.entries[low].isEmpty());
+    try std.testing.expect(s.fdEntryConst(p0, 4096) == null);
+    try std.testing.expect(s.fdEntryConst(p1, high) == null);
+    try s.ensureFdTableCapacity(p1, 1024, &free_list);
+    try s.cloneFdTableForFork(p0, p1);
+    try std.testing.expect(s.fdEntryConst(p1, high) != null);
+    try s.closeCloexecFdsWithFreeList(p1, &free_list);
+    try std.testing.expect(s.fdEntryConst(p1, high) == null);
+    var empty = FreePageList{};
+    try std.testing.expectError(KernelError.OutOfFreePages, s.ensureFdTableCapacity(p0, 2048, &empty));
+    try std.testing.expect(s.fdEntryConst(p0, high) != null);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expectEqual(initial_pages, free_list.pageCount());
+    try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(object));
+    try std.testing.expectEqual(@as(usize, 256), s.getFdTableConst(p0).?.slots().len);
+}
+
+test "dynamic fd metadata survives full free range list and descriptor reuse" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), fd_capacity_backing.len / 4096);
+    const initial_pages = free_list.pageCount();
+    try s.ensureFdTableCapacity(p1, 512, &free_list);
+    const allocated_pages = initial_pages - free_list.pageCount();
+    var full = FreePageList{};
+    // Synthetic occupied PMM range records, never dereferenced as memory.
+    for (&full.ranges, 0..) |*range, i| {
+        range.* = .{ .region_id = 1, .physical_start = @as(u64, @intCast(i)) * 8192, .len = 1 };
+    }
+    full.range_len = full.ranges.len;
+    full.len = full.ranges.len;
+    s.releasePrincipalNativeMemory(p1, &full);
+    try std.testing.expect(s.getFdTable(p1).?.retired_storage != null);
+    try std.testing.expect(s.removeProcessDescriptor(p1));
+    try std.testing.expect(s.ensureProcessDescriptor(p1, "reused-retired-fds"));
+    try std.testing.expect(s.getFdTable(p1).?.retired_storage != null);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expect(s.getFdTable(p1).?.retired_storage == null);
+    try std.testing.expectEqual(initial_pages, free_list.pageCount());
+    try std.testing.expect(allocated_pages > 0);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expectEqual(initial_pages, free_list.pageCount());
 }
 
 test "fd process capacity growth preserves extra fd tables" {

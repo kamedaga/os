@@ -12,6 +12,7 @@ mkdir -p "$(dirname "$out")"
   -ffunction-sections \
   -fdata-sections \
   -Iuserland/lpr_supervisor/include \
+  -Iuserland/unixd/include \
   -Iuserland/libipc/include \
   -Iuserland/libpacha/include \
   tests/lpr_supervisor_child_notification_unit.c \

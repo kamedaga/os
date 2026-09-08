@@ -649,6 +649,20 @@ filed_status_t filed_vfs_open_parent(
     return filed_open_vnode(vfs, parent, rights, open_flags, out_open);
 }
 
+void filed_release_open_file(filed_vfs_t *vfs, filed_file_t *file,
+    filed_vfs_reclaim_result_t *out_reclaim)
+{
+    if (!file || !file->active) return;
+    if (filed_file_ref_dec_if_nonzero(file) == 0) {
+        filed_vnode_t *vnode = filed_find_vnode(vfs, file->vnode_id);
+        if (vnode) {
+            (void)filed_vnode_ref_dec_if_nonzero(vnode);
+            filed_reclaim_vnode_if_dead_ex(vfs, vnode, out_reclaim);
+        }
+        memset(file, 0, sizeof(*file));
+    }
+}
+
 filed_status_t filed_vfs_close_handle_ex(
     filed_vfs_t *vfs,
     filed_handle_id_t handle_id,
@@ -656,7 +670,6 @@ filed_status_t filed_vfs_close_handle_ex(
 {
     filed_handle_t *handle;
     filed_file_t *file;
-    filed_vnode_t *vnode;
     uint16_t lease_index = UINT16_MAX;
 
     if (out_reclaim != NULL) {
@@ -683,16 +696,7 @@ filed_status_t filed_vfs_close_handle_ex(
 
     if (handle->target_kind == FILED_HANDLE_FILE) {
         file = filed_find_file(vfs, (filed_file_id_t)handle->target_id);
-        if (file != NULL) {
-            if (filed_file_ref_dec_if_nonzero(file) == 0) {
-                vnode = filed_find_vnode(vfs, file->vnode_id);
-                if (vnode != NULL) {
-                    (void)filed_vnode_ref_dec_if_nonzero(vnode);
-                    filed_reclaim_vnode_if_dead_ex(vfs, vnode, out_reclaim);
-                }
-                memset(file, 0, sizeof(*file));
-            }
-        }
+        filed_release_open_file(vfs, file, out_reclaim);
     }
 
     if (lease_index != UINT16_MAX) {

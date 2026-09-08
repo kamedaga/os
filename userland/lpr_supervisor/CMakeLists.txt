@@ -13,14 +13,21 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libpacha/src/trace.c"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/unixd/src/client.c ${REPO_ROOT}/userland/unixd/src/client_wire.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libpacha/src/trace.c"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/unixd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__"
       bash "${REPO_ROOT}/musl/pachaos/build/build-app-dynamic.sh" "${LPR_SUPERVISOR_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/lpr_supervisor/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/lpr_supervisor/ipc_protocol.h"
+    "${REPO_ROOT}/userland/unixd/src/client.c"
+    "${REPO_ROOT}/userland/unixd/src/client_wire.c"
+    "${REPO_ROOT}/userland/unixd/include/unixd/client.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/poll.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/transport.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/transfer.h"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libipc/src/status.c"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"

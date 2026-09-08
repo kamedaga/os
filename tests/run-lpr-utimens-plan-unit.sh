@@ -22,6 +22,7 @@ mkdir -p "$out_dir"
   -I"$repo_root/userland/filed/include" \
   -I"$repo_root/userland/lpr_supervisor/include" \
   -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/drmd/include" \
   -I"$repo_root/userland/inputd/include" \

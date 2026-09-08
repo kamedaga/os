@@ -6,7 +6,7 @@ static int pacha_capsule_valid_width(unsigned width) {
 }
 
 int pacha_capsule_is_fd(int fd) {
-    return fd >= 16 && fd < 256;
+    return fd >= 16 && fd < PACHA_FD_TABLE_LIMIT;
 }
 
 int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rights) {

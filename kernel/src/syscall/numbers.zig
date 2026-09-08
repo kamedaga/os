@@ -40,6 +40,7 @@ pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
 pub const syscall_futex_requeue: u64 = runtime_abi.syscall_futex_requeue;
 pub const syscall_getrandom: u64 = runtime_abi.syscall_getrandom;
 
+pub const syscall_fd_table: u64 = fd_abi.syscall_fd_table;
 pub const syscall_fd_close: u64 = fd_abi.syscall_fd_close;
 pub const syscall_fd_dup: u64 = fd_abi.syscall_fd_dup;
 pub const syscall_fd_get_info: u64 = fd_abi.syscall_fd_get_info;
@@ -133,6 +134,7 @@ test "native syscall numbers are contiguous" {
         syscall_futex_wake,
         syscall_futex_requeue,
         syscall_getrandom,
+        syscall_fd_table,
         syscall_fd_close,
         syscall_fd_dup,
         syscall_fd_get_info,

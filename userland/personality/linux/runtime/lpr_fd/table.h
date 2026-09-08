@@ -12,10 +12,11 @@ enum {
     LPR_FD_OPS_PIPE = 6u,
     LPR_FD_OPS_EVENT = 7u,
     LPR_FD_OPS_SOCKET = 8u,
-    LPR_FD_OPS_EPOLL = 9u,
-    LPR_FD_OPS_DMABUF = 10u,
-    LPR_FD_OPS_SYNC_FILE = 11u,
-    LPR_FD_OPS_COUNT = 12u,
+    LPR_FD_OPS_UNIX = 9u,
+    LPR_FD_OPS_EPOLL = 10u,
+    LPR_FD_OPS_DMABUF = 11u,
+    LPR_FD_OPS_SYNC_FILE = 12u,
+    LPR_FD_OPS_COUNT = 13u,
 
     LPR_FD_ENTRY_CLOEXEC = 1u << 0,
 
@@ -177,7 +178,6 @@ typedef struct lpr_socket_backend {
     uint8_t connected;
     uint8_t connecting;
     uint8_t domain;
-    uint8_t notify_ack;
     uint16_t protocol;
     uint32_t flags;
     uint32_t sndbuf;
@@ -219,7 +219,7 @@ typedef struct lpr_backend_ref {
 } lpr_backend_ref_t;
 
 typedef struct lpr_linux_fd_entry {
-    uint8_t active;
+    uint8_t active; /* 0 free, 1 visible, 2 reserved SCM import */
     uint8_t reserved0;
     uint16_t fd_flags;
     uint32_t ofd_index;
@@ -344,6 +344,14 @@ int lpr_fd_table_close(
     lpr_fd_table_t *table,
     lpr_linux_fd_t fd,
     lpr_fd_drop_t *out_drop);
+/* Reserve all resources before the broker consumes a rights-bearing record.
+ * Reserved entries cannot be pinned, closed, duplicated or overwritten. */
+int lpr_fd_table_stage_batch(lpr_fd_table_t *table,
+    const lpr_fd_install_t *installs, uint32_t count, lpr_linux_fd_t *fds);
+int lpr_fd_table_publish_batch(lpr_fd_table_t *table,
+    const lpr_linux_fd_t *fds, uint32_t count);
+int lpr_fd_table_abort_staged(lpr_fd_table_t *table,
+    lpr_linux_fd_t fd, lpr_fd_drop_t *drop);
 int lpr_fd_table_dup(
     lpr_fd_table_t *table,
     lpr_linux_fd_t old_fd,

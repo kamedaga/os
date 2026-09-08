@@ -18,6 +18,7 @@ mkdir -p "$(dirname "$out")"
   -Iuserland/filed/include \
   -Iuserland/lpr_supervisor/include \
   -Iuserland/netd/include \
+  -Iuserland/unixd/include \
   -Iuserland/termd/include \
   -Iuserland/drmd/include \
   -Iuserland/inputd/include \

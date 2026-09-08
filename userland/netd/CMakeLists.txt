@@ -87,7 +87,6 @@ set(KOBOX_RUNTIME_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/netlink_socket.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/packet_io.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/socket_service.c
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/unix_socket.c
   ${CMAKE_CURRENT_SOURCE_DIR}/src/upper.c
 )
 
@@ -145,7 +144,6 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/netlink_socket.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/packet_io.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/socket_service.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/unix_socket.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/socket_service.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/upper.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/upper.h"

@@ -538,7 +538,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         default: return -LPR_LINUX_EINVAL;
         }
     }
-    if (lpr_linux_epoll_fd_active(fd)) {
+    if (lpr_linux_epoll_fd_active(fd) || lpr_unix_socket_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:
             return lpr_control_get_fd_flags(fd);

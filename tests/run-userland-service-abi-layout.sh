@@ -17,6 +17,8 @@ cc="${CC:-cc}"
   -I "$repo_root/userland/koboxd/include" \
   -I "$repo_root/userland/koboxd/src" \
   -I "$repo_root/userland/netd/include" \
+  -I "$repo_root/userland/unixd/include" \
+  -I "$repo_root/musl/pachaos/include" \
   -I "$repo_root/userland/termd/include" \
   -I "$repo_root/userland/drmd/include" \
   -I "$repo_root/userland/lpr_supervisor/include" \

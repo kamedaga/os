@@ -3,6 +3,23 @@
 #include <stdint.h>
 
 void *lpr_process_client_payload(void *page);
+/* Runs once in the initial thread, before Linux code can execute. The
+ * bootstrap handle is not the long-lived authenticated control channel. */
+int64_t lpr_process_client_activate(uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t), int bootstrap_fd, uint64_t token,
+    int page_fd, void *page);
+
+/* Returns an owned private, non-CLOEXEC handoff for the next image. The
+ * current control channel remains usable until successful native exec. */
+int64_t lpr_process_client_prepare_exec(uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t), uint64_t token,
+    int page_fd, void *page, int *out_bootstrap_fd);
+
+/* Obtain this process's unixd session through its authenticated control
+ * channel. Caller owns the returned PRIVATE|CLOEXEC, nontransferable FD. */
+int64_t lpr_process_client_unix_session(uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t), uint64_t token,
+    int page_fd, void *page, uint64_t *out_session, int *out_fd);
 
 int64_t lpr_process_client_call(
     uint64_t *request_counter,

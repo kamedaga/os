@@ -705,8 +705,8 @@ pub fn readFdVmoBytes(
 ) KernelError!usize {
     if (out.len == 0) return 0;
     const table = try self.fdTableForActiveProcess(owner);
-    const fd_index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const fd_entry = table.entries[fd_index];
+    const fd_index = table.index(fd) orelse return KernelError.InvalidState;
+    const fd_entry = table.slots()[fd_index];
     if (fd_entry.object.isNull() or !fd_entry.rights.read) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
@@ -728,7 +728,7 @@ pub fn readFdVmoBytes(
         copied += chunk;
     }
     const update_table = try self.fdTableForActiveProcess(owner);
-    update_table.entries[fd_index].offset = fd_entry.offset + @as(u64, @intCast(copied));
+    update_table.slots()[fd_index].offset = fd_entry.offset + @as(u64, @intCast(copied));
     return copied;
 }
 
@@ -810,11 +810,11 @@ pub fn revokeNativeVmoFromFdTablesWithFreeList(
     while (process_index < self.process_capacity) : (process_index += 1) {
         const table = self.fdTableForProcessIndex(process_index) orelse continue;
         var fd_index: usize = 0;
-        while (fd_index < fd_table_entries) : (fd_index += 1) {
-            const object_ref = table.entries[fd_index].object;
+        while (fd_index < table.slots().len) : (fd_index += 1) {
+            const object_ref = table.slots()[fd_index].object;
             if (object_ref.isNull()) continue;
             if (!self.kernelObjectMatchesNativeVmo(object_ref, vmo_ref)) continue;
-            table.entries[fd_index] = .{};
+            table.slots()[fd_index] = .{};
             self.releaseKernelObjectWithFreeList(object_ref, free_list);
         }
     }

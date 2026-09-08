@@ -100,6 +100,17 @@ int lpr_load_manifest(void)
     {
         lpr_supervisor_token = lpr_process_manifest.supervisor_token;
         lpr_supervisor_enabled = 1;
+        void *activation_page = 0;
+        const int activation_fd = lpr_create_standalone_wire_page(&activation_page);
+        int64_t activation_status = activation_fd < 16 ? activation_fd :
+            lpr_process_client_activate(&lpr_request_id, lpr_pacha_status_to_errno,
+                (int)lpr_process_manifest.supervisor_bootstrap_fd, lpr_supervisor_token,
+                activation_fd, activation_page);
+        if (activation_fd >= 16) lpr_destroy_standalone_wire_page(activation_fd, activation_page);
+        if (activation_status != 0) goto invalid;
+        if (lpr_process_manifest.supervisor_bootstrap_fd != LPR_SUPERVISOR_ENDPOINT_FD)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
+                lpr_process_manifest.supervisor_bootstrap_fd);
         const int64_t commit_status = lpr_supervisor_call_token(
             LPRS_OP_PROCESS_EXEC_COMMIT_DONE,
             lpr_supervisor_token,
