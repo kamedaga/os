@@ -20,6 +20,8 @@ static unsigned live[256], maps, calls, interruptions, thread_registrations;
 enum { NORMAL, ALLOC_ERROR, MAP_ERROR, CALL_ERROR, RECV_ERROR, BAD_REPLY };
 static unsigned mode, pending_caps;
 static uint64_t process_request;
+static uint64_t server_token = 1, missed_token;
+static unsigned attached_pages, reused_pages, executed, move_probe;
 
 void *lpr_memset(void *p, int value, size_t count) { return memset(p, value, count); }
 void lpr_linux_process_state_init(void) {}
@@ -75,20 +77,35 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
         assert(!live[71]); live[71] = 1; return 71;
     }
     assert(a0 == 80 && message->word0 == UNIX_SERVICE_MAGIC);
-    assert(message->fd_count == (message->word1 == UNIX_OP_THREAD_REGISTER ? 2u : 1u));
-    assert(message->fds[0].fd == 40 && live[40] && maps == 1);
-    assert(!(message->fds[0].rights & PACHA_FD_RIGHT_TRANSFER));
+    unsigned page_caps = message->word2 < 2;
+    assert(message->fd_count == page_caps + (message->word1 == UNIX_OP_THREAD_REGISTER) + move_probe);
+    if (move_probe) {
+        assert(page_caps == 1 && message->fds[1].fd == 50 && live[50]);
+        assert(message->fds[1].transfer_flags == PACHA_IPC_TRANSFER_MOVE);
+        live[50] = 0;
+    }
+    assert(live[40] && maps == 1);
+    if (page_caps) {
+        assert(message->word2 == 1 && message->fds[0].fd == 40);
+        assert(!(message->fds[0].rights & PACHA_FD_RIGHT_TRANSFER));
+        attached_pages++;
+        server_token++;
+    } else reused_pages++;
     calls++;
     if (mode == CALL_ERROR) return PACHA_SYSCALL_ERR_INVALID;
     struct unix_control *request = (struct unix_control *)unix_page;
     assert(request->request == message->word3 && request->operation == message->word1);
     pending_caps = 0;
+    missed_token = !page_caps && message->word2 != server_token ? message->word2 : 0;
+    if (missed_token) { assert(!live[41]); live[41] = 1; return 41; }
+    executed++;
+    request->buffer_token = server_token;
     switch (request->operation) {
     case UNIX_OP_THREAD_REGISTER:
-        assert(message->fds[1].fd == 50 && live[50]);
-        assert(message->fds[1].rights == (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT |
+        assert(message->fds[page_caps].fd == 50 && live[50]);
+        assert(message->fds[page_caps].rights == (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT |
             PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE));
-        assert(message->fds[1].transfer_flags == PACHA_IPC_TRANSFER_PRIVATE);
+        assert(message->fds[page_caps].transfer_flags == PACHA_IPC_TRANSFER_PRIVATE);
         request->result = ++thread_registrations;
         break;
     case UNIX_OP_HELLO: request->result = UNIX_SERVICE_VERSION; break;
@@ -156,6 +173,12 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t 
     if (interruptions) { interruptions--; return PACHA_SYSCALL_ERR_NOT_READY; }
     if (mode == RECV_ERROR) return PACHA_SYSCALL_ERR_INVALID;
     const struct unix_control *request = (const struct unix_control *)unix_page;
+    if (missed_token) {
+        reply->word0 = UNIX_BUFFER_MISS_MAGIC; reply->word1 = UNIX_SERVICE_VERSION;
+        reply->word2 = missed_token; reply->word3 = request->request + (mode == BAD_REPLY);
+        reply->fd_count = 0;
+        return 0;
+    }
     reply->word0 = mode == BAD_REPLY ? 0 : UNIX_REPLY_MAGIC;
     reply->word1 = (uint64_t)request->status;
     reply->word2 = request->result; reply->word3 = request->request;
@@ -200,6 +223,24 @@ int main(void)
     assert(lpr_unix_client_register_thread(&client, 20, &owner) == 0);
     assert(owner == 1 && thread_registrations == 1 && !live[50]);
     uint64_t pair[2] = { request.result, request.argument };
+    assert(attached_pages == 1 && reused_pages == 1);
+    unsigned before = executed, before_calls = calls;
+    server_token++; /* Eviction: cache miss must retry without double dispatch. */
+    struct unix_control hello = { .operation = UNIX_OP_HELLO, .request = 99 };
+    assert(lpr_unix_client_call(&client, &hello, NULL, 0, NULL, 0, &received) == 0);
+    assert(executed == before + 1 && calls == before_calls + 2 && attached_pages == 2);
+    live[50] = 1; move_probe = 1;
+    const struct pacha_ipc_fd moved = { .fd = 50, .rights = PACHA_FD_RIGHT_CLOSE,
+        .transfer_flags = PACHA_IPC_TRANSFER_MOVE };
+    before_calls = calls;
+    assert(lpr_unix_client_call(&client, &hello, &moved, 1, NULL, 0, &received) == 0);
+    assert(calls == before_calls + 1 && !live[50] && attached_pages == 3);
+    move_probe = 0;
+    server_token++;
+    before = executed; before_calls = calls; mode = BAD_REPLY;
+    assert(lpr_unix_client_call(&client, &hello, NULL, 0, NULL, 0, &received) == -EPROTO);
+    assert(executed == before && calls == before_calls + 1 && !maps);
+    mode = NORMAL;
     struct pacha_ipc_fd caps[4];
     request = (struct unix_control){ .operation = UNIX_OP_ATTACH, .request = 2, .socket = pair[0] };
     assert(lpr_unix_client_call(&client, &request, NULL, 0, caps, 4, &received) == 0);

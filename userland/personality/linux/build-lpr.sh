@@ -106,6 +106,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_process/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_unix/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_unix/cache.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/profile.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_unix/mapping.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_unix/notify.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_unix/wait.c" \

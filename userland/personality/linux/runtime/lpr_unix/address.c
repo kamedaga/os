@@ -1,4 +1,5 @@
 #include "socket.h"
+#include <unixd/profile.h>
 #include "diagnostic.h"
 #include "../lpr_filed_internal.h"
 #include <errno.h>
@@ -122,6 +123,7 @@ static int attach(struct lpr_unix_context *context, struct lpr_unix_socket *sock
 
 int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t address, uint64_t length)
 {
+    UP_BEGIN(total, UP_CONTROL, operation, UP_TOTAL);
     if (operation != UNIX_OP_BIND && operation != UNIX_OP_CONNECT) return -EINVAL;
     struct unix_control request = { .operation = (uint32_t)operation };
     int disconnect = 0;
@@ -154,6 +156,7 @@ int64_t lpr_unix_socket_address(uint64_t fd, uint64_t operation, uint64_t addres
 
 int64_t lpr_unix_socket_listen(uint64_t fd, uint64_t backlog)
 {
+    UP_BEGIN(total, UP_CONTROL, UNIX_OP_LISTEN, UP_TOTAL);
     lpr_fd_pin_t pin;
     struct lpr_unix_context *context;
     int status = pin_socket(fd, &pin, &context);
@@ -187,6 +190,7 @@ int64_t lpr_unix_socket_name(uint64_t fd, uint64_t address, uint64_t length, int
 
 int64_t lpr_unix_socket_accept(uint64_t fd, uint64_t address, uint64_t length, uint64_t flags)
 {
+    UP_BEGIN(total, UP_CONTROL, UNIX_OP_ACCEPT, UP_TOTAL);
     if (flags & ~(uint64_t)(UX_NONBLOCK | UX_CLOEXEC)) return -EINVAL;
     if (address) { int status = name_output_valid(address, length); if (status != 0) return status; }
     lpr_fd_pin_t pin;

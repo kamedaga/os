@@ -2,6 +2,7 @@
 #include "lpr_filed_internal.h"
 #include "lpr_memory.h"
 #include "lpr_socket.h"
+#include <unixd/profile.h>
 #include "lpr_vfs_local.h"
 #include "support/string.h"
 #include "support/syscall.h"
@@ -3993,6 +3994,7 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
         lpr_trace_socket_syscall_event("enter", nr, a0, a1, a2, 0);
     }
     lpr_linux_ensure_default_stdio();
+    if (nr == LPR_LINUX_SYS_EXIT_GROUP) unix_profile_dump();
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     const int glycin_diag_owner =
         __atomic_load_n(&lpr_glycin_diag_armed, __ATOMIC_ACQUIRE) != 0u &&

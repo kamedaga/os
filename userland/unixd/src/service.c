@@ -21,7 +21,44 @@ struct service_session {
     struct service_session *next;
     struct unix_session *session;
     int control_fd;
+#if defined(UNIXD_PROFILE) && UNIXD_PROFILE
+    unsigned profile_pid;
+    struct { uint64_t count, ticks; } profile[UNIX_OP_DIAG + 1][6];
+#endif
 };
+
+#if defined(UNIXD_PROFILE) && UNIXD_PROFILE
+static uint64_t server_ticks(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc; lfence" : "=a"(lo), "=d"(hi) :: "memory");
+    return ((uint64_t)hi << 32) | lo;
+}
+static void server_record(struct service_session *s, unsigned op, unsigned stage, uint64_t *start)
+{
+    uint64_t end = server_ticks();
+    if (s && op <= UNIX_OP_DIAG) {
+        s->profile[op][stage].count++;
+        s->profile[op][stage].ticks += end - *start;
+    }
+    *start = end;
+}
+static void server_dump(struct service_session *s)
+{
+    for (unsigned op = 0; op <= UNIX_OP_DIAG; op++)
+        for (unsigned stage = 0; stage < 6; stage++) if (s->profile[op][stage].count)
+            printf("UNIX_SERVER_PROFILE pid=%u op=%u stage=%u count=%llu ticks=%llu\n",
+                s->profile_pid, op, stage, (unsigned long long)s->profile[op][stage].count,
+                (unsigned long long)s->profile[op][stage].ticks);
+    fflush(stdout);
+}
+#define SERVER_START uint64_t profile_start = server_ticks()
+#define SERVER_RECORD(stage) server_record(session, (unsigned)message.word1, stage, &profile_start)
+#else
+#define SERVER_START ((void)0)
+#define SERVER_RECORD(stage) ((void)0)
+#define server_dump(s) ((void)0)
+#endif
 
 struct service_thread {
     struct service_thread *next;
@@ -65,7 +102,59 @@ struct unix_service {
     struct service_handoff *handoffs;
     struct unix_session *handoff_roots;
     uint64_t next_handoff;
+    /* Global bound, not multiplied by number of clients. Mappings retain
+     * their VMOs; received FDs still close at the end of every request. */
+    struct { struct unix_control *page; uint64_t session, token; } buffers[16];
+    uint64_t next_buffer_token;
+    unsigned next_buffer_slot;
 };
+
+static struct unix_control *find_buffer(struct unix_service *service,
+    struct service_session *session, uint64_t token)
+{
+    if (!session || token < 2) return NULL;
+    const uint64_t owner = unix_broker_session_id(session->session);
+    for (unsigned i = 0; i < 16; i++)
+        if (service->buffers[i].session == owner && service->buffers[i].token == token)
+            return service->buffers[i].page;
+    return NULL;
+}
+
+static int release_buffer(struct unix_service *service, unsigned i)
+{
+    if (service->buffers[i].page && pacha_munmap(service->buffers[i].page, UNIX_CONTROL_BYTES) != 0)
+        return -EIO;
+    memset(&service->buffers[i], 0, sizeof(service->buffers[i]));
+    return 0;
+}
+
+static uint64_t retain_buffer(struct unix_service *service, struct service_session *session,
+    struct unix_control *page)
+{
+    if (!session || service->next_buffer_token == UINT64_MAX) return 0;
+    for (unsigned n = 0; n < 16; n++) {
+        unsigned i = (service->next_buffer_slot + n) % 16;
+        if (release_buffer(service, i)) continue;
+        service->next_buffer_slot = (i + 1) % 16;
+        if (!service->next_buffer_token) service->next_buffer_token = 1;
+        service->buffers[i].page = page;
+        service->buffers[i].session = unix_broker_session_id(session->session);
+        return service->buffers[i].token = ++service->next_buffer_token;
+    }
+    return 0; /* No retainable slot: complete using the temporary mapping. */
+}
+
+static void release_session_buffers(struct unix_service *service, struct service_session *session)
+{
+    const uint64_t owner = unix_broker_session_id(session->session);
+    for (unsigned i = 0; i < 16; i++) if (service->buffers[i].session == owner) {
+        /* Failed unmaps stay tracked for eviction retry, but become
+         * inaccessible before the session ID / pointer is retired. */
+        service->buffers[i].session = 0;
+        service->buffers[i].token = 0;
+        (void)release_buffer(service, i);
+    }
+}
 
 static int filed_path_call(struct unix_service *service, struct filed_unix_path *request)
 {
@@ -598,6 +687,9 @@ static int register_session(struct unix_service *service, struct unix_control *r
     if (status != 0) return status;
     struct service_session *session = calloc(1, sizeof(*session));
     if (session == NULL) return -ENOMEM;
+#if defined(UNIXD_PROFILE) && UNIXD_PROFILE
+    session->profile_pid = request->credentials.pid;
+#endif
     status = unix_broker_session_create(service->broker, &request->credentials, &session->session);
     if (status != 0) { free(session); return status; }
     struct pacha_ipc_channel_pair pair = { .a = -1, .b = -1 };
@@ -896,55 +988,72 @@ static int receive_one(struct unix_service *service, struct service_session *ses
 {
     struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS] = {{0}};
     struct pacha_ipc_msg message = { .fds = fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS };
+    SERVER_START;
     const int received = pacha_ipc_recv(handoff ? handoff->fd : session ? session->control_fd : service->admin, &message);
     if (received != 0) return received;
+    SERVER_RECORD(0);
     struct response response = {0};
     struct unix_control *page = NULL;
     int status = -EPROTO;
     uint64_t result = 0;
     int reply_fd = -1;
+    uint64_t buffer_token = 0;
+    int buffer_miss = 0;
     if (message.fd_count >= 1 && message.fd_count <= PACHA_IPC_MAX_TRANSFER_FDS) {
         const unsigned index = (unsigned)message.fd_count - 1u;
         struct pacha_fd_info info;
         if (pacha_fd_get_info((int)fds[index].fd, &info) == 0 && info.kind == PACHA_FD_KIND_REPLY)
             reply_fd = (int)fds[index].fd;
     }
-    if (reply_fd >= 16 && message.word0 == UNIX_SERVICE_MAGIC && message.fd_count >= 2) {
+    const unsigned page_caps = message.word2 < 2;
+    if (reply_fd >= 16 && message.word0 == UNIX_SERVICE_MAGIC && message.fd_count >= page_caps + 1u) {
         struct pacha_fd_info info;
-        if (pacha_fd_get_info((int)fds[0].fd, &info) == 0 &&
+        if (!page_caps) {
+            page = find_buffer(service, session, message.word2);
+            buffer_miss = page == NULL;
+            if (page) buffer_token = message.word2;
+        } else if (pacha_fd_get_info((int)fds[0].fd, &info) == 0 &&
             info.kind == PACHA_FD_KIND_VMO && info.size >= UNIX_CONTROL_BYTES)
             page = pacha_mmap((int)fds[0].fd, UNIX_CONTROL_BYTES,
                 PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
         if (page) {
             /* Never dispatch from a page the caller can change under us. */
             struct unix_control request = *page;
+            SERVER_RECORD(1);
             if (request.magic == UNIX_SERVICE_MAGIC && request.version == UNIX_SERVICE_VERSION &&
                 request.request == message.word3 && request.operation == message.word1) {
+                if (message.word2 == 1) buffer_token = retain_buffer(service, session, page);
                 request.result = 0;
                 status = handoff ? authorize_handoff(service, handoff, &request,
-                    (unsigned)message.fd_count - 2u) : dispatch(service, session, &request, fds + 1,
-                    (unsigned)message.fd_count - 2u, &response);
+                    (unsigned)message.fd_count - page_caps - 1u) : dispatch(service, session, &request, fds + page_caps,
+                    (unsigned)message.fd_count - page_caps - 1u, &response);
                 request.status = status;
                 request.magic = UNIX_REPLY_MAGIC;
+                request.buffer_token = buffer_token;
                 *page = request;
                 result = request.result;
             }
+            SERVER_RECORD(2);
         }
     }
-    if (page) (void)pacha_munmap(page, UNIX_CONTROL_BYTES);
+    if (page && !buffer_token) (void)pacha_munmap(page, UNIX_CONTROL_BYTES);
+    SERVER_RECORD(3);
     if (reply_fd >= 16) {
         const struct pacha_ipc_msg reply = {
-            .word0 = UNIX_REPLY_MAGIC, .word1 = (uint64_t)(int64_t)status,
-            .word2 = result, .word3 = message.word3,
+            .word0 = buffer_miss ? UNIX_BUFFER_MISS_MAGIC : UNIX_REPLY_MAGIC,
+            .word1 = buffer_miss ? UNIX_SERVICE_VERSION : (uint64_t)(int64_t)status,
+            .word2 = buffer_miss ? message.word2 : result, .word3 = message.word3,
             .fds = response.capabilities, .fd_count = response.count,
         };
         (void)pacha_ipc_reply(reply_fd, &reply);
     }
+    SERVER_RECORD(4);
     for (unsigned i = 0; i < response.count; i++)
         if (response.capabilities[i].transfer_flags & PACHA_IPC_TRANSFER_MOVE)
             (void)pacha_fd_close((int)response.capabilities[i].fd);
     for (uint64_t i = 0; i < message.fd_count && i < PACHA_IPC_MAX_TRANSFER_FDS; i++)
         if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+    SERVER_RECORD(5);
     return 0;
 }
 
@@ -1000,9 +1109,11 @@ static void reap(struct unix_service *service, const struct pacha_service_wait_s
             (void)pacha_fd_close(thread->thread_fd);
             free(thread);
         }
+        release_session_buffers(service, session);
         unix_broker_session_destroy(service->broker, session->session);
         *cursor = session->next;
         (void)pacha_fd_close(session->control_fd);
+        server_dump(session);
         free(session);
     }
 }

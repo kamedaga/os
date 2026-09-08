@@ -36,10 +36,11 @@ int main(void)
     failures += expect(PACHA_THREAD_SELF_FD == PACHAOS_THREAD_SELF_FD &&
         PACHA_THREAD_SELF_FD != PACHA_PROCESS_SELF_FD, "thread observation pseudo fd");
     failures += expect(sizeof(struct unix_attachment) == 80, "unix socket attachment size");
-    failures += expect(sizeof(struct unix_control) == 1304, "unix control size");
+    failures += expect(UNIX_SERVICE_VERSION == 9, "unix control version");
+    failures += expect(sizeof(struct unix_control) == 1352, "unix control size");
     failures += expect(offsetof(struct unix_control, credentials) == 64,
         "unix control header size");
-    failures += expect(offsetof(struct unix_control, diagnostic) == 1136,
+    failures += expect(offsetof(struct unix_control, diagnostic) == 1184,
         "unix diagnostic offset");
     failures += expect(sizeof(struct unix_socket_diagnostic) == 168,
         "unix diagnostic size");

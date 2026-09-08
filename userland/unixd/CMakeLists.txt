@@ -2,6 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_SYSTEM_NAME Generic)
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(unixd C)
+option(UNIXD_PROFILE "Measure control request stages (test builds only)" OFF)
+set(UNIXD_PROFILE_FLAG "")
+if(UNIXD_PROFILE)
+  set(UNIXD_PROFILE_FLAG "-DUNIXD_PROFILE=1")
+endif()
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(UNIXD_ELF "${CMAKE_BINARY_DIR}/unixd.elf")
@@ -24,7 +29,7 @@ add_custom_command(
     "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "PACHAOS_MUSL_EXTRA_SOURCES=${UNIXD_SOURCE_ENV}"
     "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
-    "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__"
+    "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ ${UNIXD_PROFILE_FLAG}"
     bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${UNIXD_ELF}"
   DEPENDS ${UNIXD_SOURCES}
     src/main.c src/service.h src/broker.h src/broker_internal.h src/rights.h src/escrow.h

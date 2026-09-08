@@ -1,5 +1,6 @@
 #include "socket.h"
 #include "cache.h"
+#include <unixd/profile.h>
 #include "diagnostic.h"
 #include "../lpr_filed_internal.h"
 #include <errno.h>
@@ -29,6 +30,7 @@ int lpr_unix_socket_active(uint64_t fd)
 
 int64_t lpr_unix_socket_close(void *state)
 {
+    UP_BEGIN(total, UP_CONTROL, UNIX_OP_CLOSE, UP_TOTAL);
     struct lpr_unix_socket *socket = state;
     lpr_unix_cache_forget_socket(socket->socket);
     lpr_unix_mapping_destroy(&socket->mapping);
@@ -46,6 +48,7 @@ int64_t lpr_unix_socket_close(void *state)
 
 static int64_t create(uint64_t type_flags, uint64_t protocol, int pair, uint64_t output)
 {
+    UP_BEGIN(total, UP_CONTROL, pair ? UNIX_OP_SOCKETPAIR : UNIX_OP_SOCKET, UP_TOTAL);
     const uint32_t type = (uint32_t)(type_flags & ~(uint64_t)(UX_NONBLOCK | UX_CLOEXEC));
     if (type_flags > UINT32_MAX || (type != UNIX_TRANSPORT_STREAM &&
         type != UNIX_TRANSPORT_SEQPACKET && type != UNIX_TRANSPORT_DGRAM)) return -ESOCKTNOSUPPORT;
@@ -159,6 +162,8 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
     struct lpr_unix_socket *socket = pin->state;
     if (socket->type == UNIX_TRANSPORT_DGRAM)
         return lpr_unix_dgram_io(pin, vectors, count, length, writing, flags, message_flags, ancillary);
+    UP_BEGIN(total, UP_IO, socket->type * 2 + writing, UP_TOTAL);
+    UP_BEGIN(setup, UP_IO, socket->type * 2 + writing, UP_SETUP);
     int mapped_status = lpr_unix_socket_map(socket);
     if (mapped_status) { lpr_unix_diag('E', socket->socket, mapped_status, 1, writing); return mapped_status; }
     if (!length && socket->type == UNIX_TRANSPORT_STREAM) return 0;
@@ -182,17 +187,23 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
         status = lpr_unix_rights_prepare(context, socket->socket, ancillary);
         if (status) return status;
     }
+    UP_END(setup);
     int64_t result;
     for (;;) {
         if (writing) {
             struct unix_write write;
+            UP_BEGIN(reserve, UP_IO, socket->type * 2 + writing, UP_RESERVE);
             status = unix_transport_write_begin(map->outgoing_tx, map->outgoing_rx, map->generation,
                 context->waiter.owner, length, ancillary ? ancillary->ticket : 0,
                 ancillary ? ancillary->operation : 0, &write);
+            UP_END(reserve);
             if (status == 0) {
                 const struct unix_const_span spans[2] = {
                     {write.spans[0].base, write.spans[0].length}, {write.spans[1].base, write.spans[1].length} };
+                UP_BEGIN(copy, UP_IO, socket->type * 2 + writing, UP_COPY);
                 lpr_unix_copy_iov(vectors, count, spans, 1);
+                UP_END(copy);
+                UP_BEGIN(commit, UP_IO, socket->type * 2 + writing, UP_COMMIT);
                 status = ancillary && ancillary->ticket ?
                     lpr_unix_rights_commit(context, socket->socket, ancillary, &write) :
                     unix_transport_write_commit(map->outgoing_tx, &write);
@@ -201,11 +212,16 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
             } else result = status;
         } else {
             struct unix_read read;
+            UP_BEGIN(reserve, UP_IO, socket->type * 2 + writing, UP_RESERVE);
             status = unix_transport_read_begin(map->incoming_tx, map->incoming_rx, map->generation,
                 context->waiter.owner, length, &read);
+            UP_END(reserve);
             if (status == 0) {
                 {
+                    UP_BEGIN(copy, UP_IO, socket->type * 2 + writing, UP_COPY);
                     lpr_unix_copy_iov(vectors, count, read.spans, 0);
+                    UP_END(copy);
+                    UP_BEGIN(commit, UP_IO, socket->type * 2 + writing, UP_COMMIT);
                     if (read.ticket) {
                         status = lpr_unix_rights_receive(context, socket->socket, &read,
                             ancillary, flags, message_flags);
@@ -221,6 +237,7 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
             } else result = status;
         }
         if (status != -EBUSY) {
+            UP_BEGIN(notify_time, UP_IO, socket->type * 2 + writing, UP_NOTIFY);
             const int notify = lpr_unix_notifier_signal(&context->notifier, socket->socket,
                 writing ? map->outgoing_tx : map->incoming_tx,
                 writing ? map->outgoing_rx : map->incoming_rx);
@@ -237,11 +254,13 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
         result = lpr_wait_deadline_expired(&deadline, &expired);
         if (result != 0 || expired) { if (expired) result = -EAGAIN; break; }
         if (!watched) {
+            UP_BEGIN(watch, UP_IO, socket->type * 2 + writing, UP_WATCH);
             result = lpr_unix_waiter_watch(&context->waiter, socket->socket, &socket->wait_identity);
             if (result != 0) break;
             watched = 1;
         }
         struct readiness state = { socket, writing, length };
+        UP_BEGIN(wait_time, UP_IO, socket->type * 2 + writing, UP_WAIT);
         result = lpr_unix_waiter_wait(&context->waiter,
             writing ? &map->outgoing_tx->waiters : &map->incoming_rx->waiters,
             writing ? &map->outgoing_tx->changes : &map->incoming_tx->changes,
@@ -249,6 +268,7 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
             ready, &state, &deadline);
         if (result != 0) break;
     }
+    UP_BEGIN(cleanup, UP_IO, socket->type * 2 + writing, UP_CLEANUP);
     if (watched) (void)lpr_unix_waiter_unwatch(&context->waiter, socket->socket);
     if (writing && result < 0) lpr_unix_rights_cancel(context, ancillary);
     if (writing && result == -EPIPE && !(flags & UX_NOSIGNAL)) lpr_linux_raise_sigpipe();

@@ -1,5 +1,6 @@
 #include "socket.h"
 #include "cache.h"
+#include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 #include <errno.h>
 
@@ -25,6 +26,8 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
     uint32_t *message_flags, struct lpr_unix_ancillary *ancillary)
 {
     struct lpr_unix_socket *socket = pin->state;
+    UP_BEGIN(total, UP_IO, socket->type * 2 + writing, UP_TOTAL);
+    UP_BEGIN(setup, UP_IO, socket->type * 2 + writing, UP_SETUP);
     int64_t result = lpr_unix_socket_adopt(socket);
     if (result) return result;
     if (writing && length > UNIX_TRANSPORT_BYTES - sizeof(struct unix_record)) return -EMSGSIZE;
@@ -43,7 +46,9 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
     result = lpr_unix_cache_begin(&lease, &context->client, socket->socket, writing, NULL);
     if (result) return result;
     struct lpr_unix_route_mapping *mapping = &lease.mapping;
+    UP_END(setup);
     if (writing) {
+        UP_BEGIN(route_time, UP_IO, socket->type * 2 + writing, UP_ROUTE);
         struct unix_control route = { .operation = UNIX_OP_DGRAM_ROUTE,
             .socket = socket->socket, .cached_generation = lease.generation };
         lpr_memcpy(&route.address, &ancillary->address, sizeof(route.address));
@@ -54,9 +59,12 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
         struct pacha_ipc_fd caps[2];
         unsigned received;
         result = lpr_unix_context_call(context, &route, NULL, 0, caps, 2, &received);
+        UP_END(route_time);
         if (result) goto done;
         generation = route.argument;
+        UP_BEGIN(map_time, UP_IO, socket->type * 2 + writing, UP_MAP);
         result = lpr_unix_cache_import(&lease, caps, received, generation);
+        UP_END(map_time);
         if (result) goto done;
         ancillary->route = route.result;
         result = lpr_unix_rights_prepare(context, socket->socket, ancillary);
@@ -70,13 +78,18 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
         int released = 0;
         if (writing) {
             struct unix_write write;
+            UP_BEGIN(reserve, UP_IO, socket->type * 2 + writing, UP_RESERVE);
             result = unix_transport_write_begin(mapping->tx, mapping->rx, generation,
                 context->waiter.owner, length, ancillary->ticket, ancillary->operation, &write);
+            UP_END(reserve);
             if (!result) {
                 const struct unix_const_span spans[2] = {
                     {write.spans[0].base, write.spans[0].length},
                     {write.spans[1].base, write.spans[1].length} };
+                UP_BEGIN(copy, UP_IO, socket->type * 2 + writing, UP_COPY);
                 lpr_unix_copy_iov(vectors, count, spans, 1);
+                UP_END(copy);
+                UP_BEGIN(commit_time, UP_IO, socket->type * 2 + writing, UP_COMMIT);
                 struct unix_control commit = { .operation = UNIX_OP_DGRAM_COMMIT,
                     .socket = socket->socket, .argument = ancillary->route,
                     .io = { .owner = write.owner, .before = write.before,
@@ -88,11 +101,13 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
                 released = 1;
             }
         } else {
+            UP_BEGIN(route_time, UP_IO, socket->type * 2 + writing, UP_ROUTE);
             struct unix_control head = { .operation = UNIX_OP_DGRAM_HEAD,
                 .socket = socket->socket, .cached_generation = lease.generation };
             struct pacha_ipc_fd caps[2];
             unsigned received;
             result = lpr_unix_context_call(context, &head, NULL, 0, caps, 2, &received);
+            UP_END(route_time);
             if (!result && !head.result && !received) {
                 uint32_t socket_flags;
                 result = lpr_unix_socket_flags(pin, &socket_flags, 0);
@@ -102,14 +117,21 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
             if (!result) {
                 generation = head.delivery.generation;
                 ancillary->passcred = (head.transaction & UNIX_SOCKET_PASSCRED) != 0;
+                UP_BEGIN(map_time, UP_IO, socket->type * 2 + writing, UP_MAP);
                 result = lpr_unix_cache_import(&lease, caps, received, generation);
+                UP_END(map_time);
                 if (result) break;
                 struct unix_read read;
+                UP_BEGIN(reserve, UP_IO, socket->type * 2 + writing, UP_RESERVE);
                 result = unix_transport_packet_begin(mapping->tx, mapping->rx, generation,
                     context->waiter.owner, head.delivery.position, head.delivery.length,
                     head.delivery.ticket, head.delivery.operation, length, &read);
+                UP_END(reserve);
                 if (!result) {
+                    UP_BEGIN(copy, UP_IO, socket->type * 2 + writing, UP_COPY);
                     lpr_unix_copy_iov(vectors, count, read.spans, 0);
+                    UP_END(copy);
+                    UP_BEGIN(commit_time, UP_IO, socket->type * 2 + writing, UP_COMMIT);
                     struct unix_control consume = { .operation = UNIX_OP_DGRAM_CONSUME,
                         .socket = socket->socket, .argument = head.delivery.id,
                         .transaction = flags & UX_PEEK,
@@ -130,6 +152,7 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
             }
         }
         if (released) {
+            UP_BEGIN(notify_time, UP_IO, socket->type * 2 + writing, UP_NOTIFY);
             int status = lpr_unix_notifier_signal(&context->notifier, socket->socket, mapping->tx, mapping->rx);
             if (status) __atomic_store_n(&socket->error, -status, __ATOMIC_RELEASE);
         }
@@ -147,11 +170,13 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
         result = lpr_wait_deadline_expired(&deadline, &expired);
         if (result || expired) { if (expired) result = -EAGAIN; break; }
         if (!watched) {
+            UP_BEGIN(watch, UP_IO, socket->type * 2 + writing, UP_WATCH);
             result = lpr_unix_waiter_watch(&context->waiter, socket->socket, &socket->wait_identity);
             if (result) break;
             watched = 1;
             continue;
         }
+        UP_BEGIN(wait_time, UP_IO, socket->type * 2 + writing, UP_WAIT);
         if (busy) {
             /* Payload lock release can happen without a broker commit (PEEK
              * or cancel), so use the same arm/recheck protocol as STREAM. */
@@ -170,6 +195,8 @@ int64_t lpr_unix_dgram_io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vect
         if (result) break;
     }
 done:
+    ;
+    UP_BEGIN(cleanup, UP_IO, socket->type * 2 + writing, UP_CLEANUP);
     if (watched) (void)lpr_unix_waiter_unwatch(&context->waiter, socket->socket);
     if (writing && result < 0) lpr_unix_rights_cancel(context, ancillary);
     lpr_unix_cache_end(&lease, result >= 0 || result == -EAGAIN);

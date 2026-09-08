@@ -1,6 +1,7 @@
 #include "poll.h"
 #include "diagnostic.h"
 #include "context.h"
+#include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 #include <errno.h>
 
@@ -9,6 +10,7 @@ enum { UX_IN = 1, UX_OUT = 4, UX_ERR = 8, UX_HUP = 16, UX_RDHUP = 0x2000 };
 static int64_t poll_socket(struct lpr_unix_socket *socket, uint32_t events,
     struct unix_poll_sequence *sequence)
 {
+    UP_BEGIN(total, UP_CONTROL, UNIX_OP_POLL, UP_TOTAL);
     int adoption = lpr_unix_socket_adopt(socket);
     if (adoption) return adoption;
     if (!__atomic_load_n(&socket->mapped, __ATOMIC_ACQUIRE)) {

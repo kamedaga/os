@@ -1,5 +1,6 @@
 #include "client.h"
 #include "cache.h"
+#include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 
 static int native_page_create(struct unix_control **out)
@@ -83,10 +84,19 @@ int lpr_unix_client_call(const struct lpr_unix_client *client, struct unix_contr
         native_page_create, native_page_destroy, native_call, native_receive, native_close,
     };
     struct lpr_unix_cache_lease lease;
+    UP_BEGIN(total, UP_RPC, request->operation, UP_TOTAL);
+    UP_BEGIN(setup, UP_RPC, request->operation, UP_SETUP);
     int status = lpr_unix_cache_begin(&lease, client, 0, 0, &io);
+    UP_END(setup);
     if (status) return status;
+    if (lease.buffer.session != client->session || lease.buffer.endpoint != client->fd) {
+        lease.buffer.token = 0;
+        lease.buffer.session = client->session;
+        lease.buffer.endpoint = client->fd;
+    }
     status = unix_client_exchange_page(&io, client->fd, request, send, send_count,
         receive, capacity, received, &lease.buffer);
+    UP_BEGIN(cleanup, UP_RPC, request->operation, UP_CLEANUP);
     lpr_unix_cache_end(&lease, status == 0);
     return status;
 }

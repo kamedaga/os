@@ -9,6 +9,15 @@ static struct {
     int peer;
     unsigned pending;
 } native_fds[256];
+static unsigned control_unmaps, fail_unmap;
+int pacha_munmap(void *page, uint64_t bytes)
+{
+    assert(page && bytes == UNIX_CONTROL_BYTES);
+    if (fail_unmap) return -EIO;
+    control_unmaps++;
+    free(page);
+    return 0;
+}
 
 uint64_t pacha_service_wait_revents(const struct pacha_service_wait_set *set, int fd)
 {
@@ -98,6 +107,24 @@ int main(void)
     assert(unix_broker_session_create(service.broker, &credentials, &child.session) == 0);
     credentials.pid++;
     assert(unix_broker_session_create(service.broker, &credentials, &outsider.session) == 0);
+    uint64_t old_token = 0;
+    for (unsigned i = 0; i < 32; i++) {
+        struct unix_control *page = calloc(1, UNIX_CONTROL_BYTES);
+        assert(page);
+        uint64_t token = retain_buffer(&service, &parent, page);
+        assert(token >= 2 && token > old_token);
+        assert(find_buffer(&service, &parent, token) == page);
+        assert(!find_buffer(&service, &child, token));
+        if (i == 0) old_token = token;
+    }
+    assert(control_unmaps == 16 && !find_buffer(&service, &parent, old_token));
+    fail_unmap = 1;
+    release_session_buffers(&service, &parent);
+    for (unsigned i = 0; i < 16; i++)
+        assert(service.buffers[i].page && !service.buffers[i].session && !service.buffers[i].token);
+    fail_unmap = 0;
+    for (unsigned i = 0; i < 16; i++) assert(release_buffer(&service, i) == 0);
+    assert(control_unmaps == 32);
     struct service_thread thread = { .session = &child, .owner = 77 };
     service.threads = &thread;
     uint64_t pair[2], unrelated;

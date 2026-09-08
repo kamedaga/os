@@ -1202,6 +1202,15 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_unixd_pair_probe.c"
     out: "UNIXPAIR.ELF"
     rootfs: "/cmd/lpr_unixd_pair_probe.elf"
+  lpr_unix_stage_bench:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_unix_stage_bench.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_unix_stage_bench", "userland/fixtures/src/wsl_musl/lpr_unix_stage_bench.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_unix_stage_bench.c"
+    out: "UNIXSTG.ELF"
+    rootfs: "/cmd/lpr_unix_stage_bench.elf"
   lpr_mremap_growth_probe:
     file:
       path: ".artifacts/userland-fixtures/lpr_mremap_growth_probe.static.elf"

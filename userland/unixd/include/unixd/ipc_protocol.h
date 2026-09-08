@@ -11,7 +11,10 @@
 #define UNIX_SERVICE_MAGIC UINT64_C(0x3151455258494e55)
 #define UNIX_REPLY_MAGIC UINT64_C(0x3159505258494e55)
 #define UNIX_NOTIFY_MAGIC UINT64_C(0x315946544e495855)
-#define UNIX_SERVICE_VERSION 8u
+#define UNIX_SERVICE_VERSION 9u
+/* This reply guarantees that dispatch did not run. Retry the same request
+ * once with its VMO attached. word1=version, word2=missing token. */
+#define UNIX_BUFFER_MISS_MAGIC UINT64_C(0x3153494d58494e55)
 #define UNIX_CONTROL_BYTES 8192u
 #define UNIX_PATH_BYTES 108u
 #define UNIX_RIGHTS_MAX 253u
@@ -166,6 +169,9 @@ struct unix_control {
      * hint equals the broker-selected generation. Authorization, pathname
      * resolution, FIFO and current options are still evaluated every time. */
     uint64_t cached_generation;
+    /* Server-issued session-bound control-page token, never caller authority.
+     * IPC word2: 0=temporary VMO, 1=register attached VMO, >=2=reuse token. */
+    uint64_t buffer_token;
     struct {
         uint64_t id;
         uint64_t route;
