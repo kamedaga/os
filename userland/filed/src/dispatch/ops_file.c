@@ -998,8 +998,11 @@ int filed_dispatch_file_vmo(
         return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const filed_file_vmo_request_t *file_vmo =
-        (const filed_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    filed_file_vmo_request_t snapshot;
+    memcpy(&snapshot, (const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot));
+    const filed_file_vmo_request_t *file_vmo = &snapshot;
+    int allowed = filed_client_authorize(runtime, header->op, &snapshot, sizeof(snapshot), 0);
+    if (allowed) return filed_send_reply(reply_fd, reply_page, header, allowed, 0, 0);
     filed_page_dispatch_result_t result = filed_page_result(-22, 0);
     filed_file_vmo_cache_entry_t *entry = NULL;
     if (file_vmo->length != 0 &&
@@ -1066,8 +1069,10 @@ int filed_dispatch_file_vmo(
         .rights =
             PACHA_FD_RIGHT_CLOSE |
             PACHA_FD_RIGHT_MAP_READ |
-            PACHA_FD_RIGHT_MAP_WRITE |
-            PACHA_FD_RIGHT_MAP_EXEC,
+            /* Writable private copies do not require backing write authority.
+             * Never lend the shared snapshot cache's MAP_WRITE capability. */
+            ((!runtime->actor || (runtime->actor->identity.rights & FILED_RIGHT_EXEC)) ?
+                PACHA_FD_RIGHT_MAP_EXEC : 0),
         .flags = 0,
         .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
     };
@@ -1112,8 +1117,11 @@ int filed_dispatch_shared_file_vmo(
         return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const filed_file_vmo_request_t *shared_vmo =
-        (const filed_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    filed_file_vmo_request_t snapshot_request;
+    memcpy(&snapshot_request, (const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot_request));
+    const filed_file_vmo_request_t *shared_vmo = &snapshot_request;
+    int allowed = filed_client_authorize(runtime, header->op, shared_vmo, sizeof(*shared_vmo), 0);
+    if (allowed) return filed_send_reply(reply_fd, reply_page, header, allowed, 0, 0);
     int64_t reply_status = -22;
     filed_file_vmo_cache_entry_t *entry = NULL;
     filed_vfs_io_decision_t decision;

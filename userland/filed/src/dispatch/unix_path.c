@@ -39,6 +39,19 @@ void filed_unix_path_disconnect(filed_runtime_t *runtime)
 static int path_open(filed_runtime_t *runtime, struct filed_unix_path *request)
 {
     if (request->operation == FILED_UNIX_PATH_RELEASE) return release(runtime, request->hold);
+    struct filed_client *client = runtime->clients;
+    while (client && (client->identity.generation != request->generation ||
+        client->identity.pid != request->pid)) client = client->next;
+    if (!client || request->reserved) return -13;
+    runtime->actor = client;
+    runtime->vfs.actor_client = client->id;
+    runtime->vfs.actor_rights = client->identity.rights;
+    filed_openat_t check = { .dir_handle = request->directory,
+        .rights = FILED_RIGHT_STAT };
+    int allowed = filed_client_authorize(runtime,
+        request->operation == FILED_UNIX_PATH_CREATE ? FILED_OP_VFS_MKNOD : FILED_OP_VFS_OPENAT,
+        &check, sizeof(check), 0);
+    if (allowed) return allowed;
     if (request->operation > FILED_UNIX_PATH_CREATE || request->directory > UINT32_MAX ||
         !memchr(request->path, 0, sizeof(request->path)) || !request->path[0]) return -22;
     if (runtime->unix_hold_sequence == UINT64_MAX) return -75;

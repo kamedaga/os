@@ -22,6 +22,8 @@ static unsigned mode, pending_caps;
 static uint64_t process_request;
 static uint64_t server_token = 1, missed_token;
 static unsigned attached_pages, reused_pages, executed, move_probe;
+static unsigned queue_full, writable_waits, call_attempts;
+static int call_alloc_error;
 
 void *lpr_memset(void *p, int value, size_t count) { return memset(p, value, count); }
 void lpr_linux_process_state_init(void) {}
@@ -77,6 +79,13 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
         assert(!live[71]); live[71] = 1; return 71;
     }
     assert(a0 == 80 && message->word0 == UNIX_SERVICE_MAGIC);
+    call_attempts++;
+    if (call_alloc_error) return PACHA_SYSCALL_ERR_ALLOC;
+    if (queue_full) {
+        queue_full--;
+        if (move_probe) assert(live[50]);
+        return PACHA_SYSCALL_ERR_NOT_READY;
+    }
     unsigned page_caps = message->word2 < 2;
     assert(message->fd_count == page_caps + (message->word1 == UNIX_OP_THREAD_REGISTER) + move_probe);
     if (move_probe) {
@@ -153,6 +162,14 @@ int64_t lpr_pacha_syscall6(uint64_t nr, uint64_t fd, uint64_t address,
 
 int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t timeout, uint64_t flags)
 {
+    if (nr == PACHA_FD_SYSCALL_WAIT_MANY) {
+        struct pacha_pollfd *pollfd = (void *)(uintptr_t)fd;
+        assert(address == 1 && timeout == PACHA_FD_WAIT_FOREVER && !flags);
+        assert(pollfd->fd == 80 && pollfd->events == PACHA_FD_EVENT_WRITABLE);
+        writable_waits++;
+        pollfd->revents = PACHA_FD_EVENT_WRITABLE;
+        return 1;
+    }
     if (nr == PACHAOS_SYSCALL_FD_DUP) {
         assert(fd == PACHAOS_THREAD_SELF_FD && address == 16 && !live[50]);
         assert(timeout == (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
@@ -233,9 +250,18 @@ int main(void)
     const struct pacha_ipc_fd moved = { .fd = 50, .rights = PACHA_FD_RIGHT_CLOSE,
         .transfer_flags = PACHA_IPC_TRANSFER_MOVE };
     before_calls = calls;
+    queue_full = 3;
+    unsigned before_attempts = call_attempts;
     assert(lpr_unix_client_call(&client, &hello, &moved, 1, NULL, 0, &received) == 0);
     assert(calls == before_calls + 1 && !live[50] && attached_pages == 3);
+    assert(!queue_full && writable_waits == 3 && call_attempts == before_attempts + 4);
     move_probe = 0;
+    call_alloc_error = 1;
+    before_attempts = call_attempts;
+    assert(lpr_unix_client_call(&client, &hello, NULL, 0, NULL, 0, &received) == -ENOMEM);
+    assert(call_attempts == before_attempts + 1 && writable_waits == 3 && !maps);
+    call_alloc_error = 0;
+    assert(lpr_unix_client_call(&client, &hello, NULL, 0, NULL, 0, &received) == 0);
     server_token++;
     before = executed; before_calls = calls; mode = BAD_REPLY;
     assert(lpr_unix_client_call(&client, &hello, NULL, 0, NULL, 0, &received) == -EPROTO);

@@ -322,24 +322,41 @@ pub fn ensureFdTableCapacity(self: anytype, owner: PrincipalId, minimum: usize, 
     reclaimFdStorage(table, free_list);
 }
 
-pub fn inheritFdsForProcessCreate(self: anytype, from: PrincipalId, to: PrincipalId) KernelError!void {
+pub fn grantFdsForProcessCreate(self: anytype, from: PrincipalId, to: PrincipalId, grants: []const @import("kernel_abi_root").process_abi.ProcessFdGrant, free_list: *FreePageList) KernelError!void {
     if (from == to) return KernelError.InvalidState;
+    if (grants.len > @import("kernel_abi_root").process_abi.process_create_max_grants)
+        return KernelError.InvalidState;
     const source_table = try self.fdTableForActiveProcessConst(from);
     const dest_table = try self.fdTableForActiveProcess(to);
-    if (dest_table.slots().len < source_table.slots().len) return KernelError.TableFull;
-    var fd_index: usize = 0;
-    while (fd_index < source_table.slots().len) : (fd_index += 1) {
-        const source = source_table.slots()[fd_index];
-        if (source.object.isNull() or !source.flags.inherit or source.flags.private) continue;
-        if (self.kernelObjectIsPinnedUserObject(source.object)) continue;
-        if (!dest_table.slots()[fd_index].isEmpty()) return KernelError.InvalidState;
+    var capacity: usize = 0;
+    for (grants, 0..) |grant, i| {
+        if (grant.source_fd >= source_table.slots().len or grant.target_fd >= types.fd_table_limit or
+            (grant.rights & ~types.fd_known_rights_mask) != 0 or
+            (grant.flags & ~@as(u64, types.fd_known_flags_mask)) != 0) return KernelError.InvalidState;
+        for (grants[0..i]) |previous| if (previous.target_fd == grant.target_fd) return KernelError.InvalidState;
+        const source = source_table.slots()[@intCast(grant.source_fd)];
+        if (source.object.isNull() or !source.rights.transfer or
+            (grant.rights & ~fdRightsToBits(source.rights)) != 0 or
+            self.kernelObjectSlotConst(source.object) == null or
+            self.kernelObjectIsPinnedUserObject(source.object)) return KernelError.InvalidState;
+        if (grant.target_fd < dest_table.slots().len and
+            !dest_table.slots()[@intCast(grant.target_fd)].isEmpty()) return KernelError.InvalidState;
+        capacity = @max(capacity, @as(usize, @intCast(grant.target_fd)) + 1);
+    }
+    try self.ensureFdTableCapacity(to, capacity, free_list);
+    var installed: usize = 0;
+    errdefer for (grants[0..installed]) |grant|
+        self.closeFdWithFreeList(to, @intCast(grant.target_fd), free_list) catch {};
+    for (grants) |grant| {
+        const source = source_table.slots()[@intCast(grant.source_fd)];
         try self.retainKernelObject(source.object);
-        dest_table.slots()[fd_index] = .{
+        dest_table.slots()[@intCast(grant.target_fd)] = .{
             .object = source.object,
-            .rights = fdRightsFromBits(fdRightsToBits(source.rights)),
-            .flags = fdFlagsFromBits(fdFlagsToBits(source.flags)),
+            .rights = fdRightsFromBits(grant.rights),
+            .flags = fdFlagsFromBits(@intCast(grant.flags)),
             .offset = source.offset,
         };
+        installed += 1;
     }
 }
 

@@ -209,6 +209,19 @@ fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.Pipe
     return wakeThreadTargets(h, state, wake_storage[0..wake_count]);
 }
 
+/// Retirement is a terminal event even for aliases already sleeping in
+/// WAIT_MANY. Reuse the same wait-group claim/copy/wake protocol as normal I/O.
+pub fn wakeRetiredIrqWaiters(h: anytype, state: *kernel.KernelState) void {
+    var targets: [max_pollfds]kernel.ThreadWakeTarget = undefined;
+    while (true) {
+        const count = state.takeReadyIrqWaiters(&targets);
+        if (count == 0) return;
+        // A bad destination is reported to that waiter, not as a failed retire
+        // after the route's no-fail commit has already completed.
+        _ = wakeThreadTargets(h, state, targets[0..count]);
+    }
+}
+
 fn ipcChannelHandleForFd(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) ?kernel.IpcChannelHandle {
     const view = state.fdPayloadWithRightsConst(proc, fd, .{}) orelse return null;
     return switch (view.payload.*) {
@@ -266,9 +279,12 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
         if (count == 0) return sc.syscall_err_not_ready;
         return writeUserU64Bytes(h, proc, out_va, len, count);
     }
-    if (state.timerReadExpirations(proc, fd, scheduler.lapic_tick_count)) |count| {
+    if (state.timerReadExpirations(proc, fd, timerNowNs())) |count| {
         if (count == 0) return sc.syscall_err_not_ready;
         return writeUserU64Bytes(h, proc, out_va, len, count);
+    }
+    if (state.irqObjectForFd(proc, fd, .{ .read = true })) |irq| {
+        if (irq.retired) return sc.syscall_err_closed;
     }
     if (state.irqEventCountForFd(proc, fd, .{ .read = true })) |count| {
         if (count == 0) return sc.syscall_err_not_ready;
@@ -622,18 +638,12 @@ fn unregisterCachedWaitersForPoll(
     state.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
 }
 
-fn nextCachedPollWakeDelta(state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
-    var min_delta: ?u64 = null;
-    for (items) |item| {
-        const wake_tick = state.fdNextWakeTick(proc, item.fd, now_tick) orelse continue;
-        const delta = if (wake_tick <= now_tick) 1 else wake_tick - now_tick;
-        if (min_delta == null or delta < min_delta.?) min_delta = delta;
-    }
-    return min_delta;
+fn timerNowNs() u64 {
+    return @import("../realtime_clock.zig").monotonicNs() orelse scheduler.lapic_tick_count * 1_000_000;
 }
 
 fn fdPoll(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) u64 {
-    return pollOnce(h, state, proc, pollfds_va, count, scheduler.lapic_tick_count) orelse sc.syscall_err_invalid;
+    return pollOnce(h, state, proc, pollfds_va, count, timerNowNs()) orelse sc.syscall_err_invalid;
 }
 
 fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -642,7 +652,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const timeout_ticks = frame.rdx;
     const flags = frame.r10;
     if (flags != 0) return sc.syscall_err_invalid;
-    const now = scheduler.lapic_tick_count;
+    const now = timerNowNs();
     var poll_items_storage: [max_pollfds]PollItem = undefined;
     const poll_items = readPollItems(h, proc, pollfds_va, count, poll_items_storage[0..]) orelse return sc.syscall_err_invalid;
     const ready = pollCached(h, state, proc, poll_items, now) orelse return sc.syscall_err_invalid;
@@ -685,7 +695,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     };
     ipc_metric.record(.wait_register, register_start);
     const repoll_start = ipc_metric.timestamp();
-    const ready_after_register = pollCached(h, state, proc, poll_items, scheduler.lapic_tick_count) orelse {
+    const ready_after_register = pollCached(h, state, proc, poll_items, timerNowNs()) orelse {
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         state.cancelFdWaitGroup(group, wait_token);
         return sc.syscall_err_invalid;
@@ -697,10 +707,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         return ready_after_register;
     }
 
-    var block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
-    if (nextCachedPollWakeDelta(state, proc, poll_items, now)) |delta| {
-        if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
-    }
+    const block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
     if (h.block_current_thread_for_event(
         frame,
         true,
@@ -714,45 +721,38 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     return sc.syscall_err_not_ready;
 }
 
-fn nanosToTicks(nsec: u64) ?u64 {
-    const tick_nsec: u64 = 1_000_000;
-    if (nsec == 0) return 0;
-    if (nsec > @import("std").math.maxInt(u64) - tick_nsec + 1) return null;
-    return (nsec + tick_nsec - 1) / tick_nsec;
-}
-
-fn ticksToTimespec(ticks: u64) struct { sec: u64, nsec: u64 } {
+fn nanosToTimespec(ns: u64) struct { sec: u64, nsec: u64 } {
     return .{
-        .sec = ticks / 1000,
-        .nsec = (ticks % 1000) * 1_000_000,
+        .sec = ns / 1_000_000_000,
+        .nsec = ns % 1_000_000_000,
     };
 }
 
-fn timespecToTicks(sec: u64, nsec: u64) ?u64 {
+fn timespecToNanos(sec: u64, nsec: u64) ?u64 {
     if (nsec >= 1_000_000_000) return null;
     const sec_ns, const sec_overflow = @mulWithOverflow(sec, 1_000_000_000);
     if (sec_overflow != 0) return null;
     const total_ns, const add_overflow = @addWithOverflow(sec_ns, nsec);
     if (add_overflow != 0) return null;
-    return nanosToTicks(total_ns);
+    return total_ns;
 }
 
-fn readTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64) ?struct { value_ticks: u64, interval_ticks: u64 } {
+fn readTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64) ?struct { value_ns: u64, interval_ns: u64 } {
     if (spec_va == 0) return null;
     const interval_sec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_sec_offset) orelse return null;
     const interval_nsec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_nsec_offset) orelse return null;
     const value_sec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_sec_offset) orelse return null;
     const value_nsec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_nsec_offset) orelse return null;
     return .{
-        .value_ticks = timespecToTicks(value_sec, value_nsec) orelse return null,
-        .interval_ticks = timespecToTicks(interval_sec, interval_nsec) orelse return null,
+        .value_ns = timespecToNanos(value_sec, value_nsec) orelse return null,
+        .interval_ns = timespecToNanos(interval_sec, interval_nsec) orelse return null,
     };
 }
 
 fn writeTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64, state: kernel.TimerFdState) u64 {
     if (spec_va == 0) return sc.syscall_ok;
-    const interval = ticksToTimespec(state.interval_ticks);
-    const value = ticksToTimespec(state.remaining_ticks);
+    const interval = nanosToTimespec(state.interval_ns);
+    const value = nanosToTimespec(state.remaining_ns);
     if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_sec_offset, interval.sec)) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_nsec_offset, interval.nsec)) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_sec_offset, value.sec)) return sc.syscall_err_invalid;
@@ -763,22 +763,24 @@ fn writeTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64, state: ker
 fn timerfdCreate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if (frame.rdi != fd_abi.timerfd_clock_monotonic) return sc.syscall_err_invalid;
     if ((frame.rsi & ~fd_abi.timerfd_known_flags_mask) != 0) return sc.syscall_err_invalid;
-    const initial_ticks = nanosToTicks(frame.rdx) orelse return sc.syscall_err_invalid;
-    const interval_ticks = nanosToTicks(frame.r10) orelse return sc.syscall_err_invalid;
-    const deadline_tick = if (initial_ticks == 0)
-        0
-    else if ((frame.rsi & fd_abi.timerfd_flag_abstime) != 0)
-        initial_ticks
-    else
-        scheduler.lapic_tick_count + initial_ticks;
+    const deadline_ns = timerDeadline(frame.rdx, frame.rsi, timerNowNs()) orelse return sc.syscall_err_invalid;
     return state.createTimerFd(
         proc,
-        deadline_tick,
-        interval_ticks,
+        deadline_ns,
+        frame.r10,
         kernel.fdFlagsFromBits(@truncate(frame.r9)),
         kernel.fdRightsFromBits(frame.r8),
         first_dynamic_fd,
     ) catch |err| statusFromKernelError(err);
+}
+
+fn timerDeadline(value_ns: u64, flags: u64, now_ns: u64) ?u64 {
+    return if (value_ns == 0)
+        0
+    else if ((flags & fd_abi.timerfd_flag_abstime) != 0)
+        value_ns
+    else
+        @import("std").math.add(u64, now_ns, value_ns) catch null;
 }
 
 fn timerfdSettime(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -786,22 +788,18 @@ fn timerfdSettime(h: anytype, state: *kernel.KernelState, proc: kernel.Principal
     const flags = frame.rsi;
     if ((flags & ~fd_abi.timerfd_known_flags_mask) != 0) return sc.syscall_err_invalid;
     const spec = readTimerSpec(h, proc, frame.rdx) orelse return sc.syscall_err_invalid;
-    const old_state = state.timerFdState(proc, fd, scheduler.lapic_tick_count) orelse return sc.syscall_err_invalid;
+    const now_ns = timerNowNs();
+    const deadline_ns = timerDeadline(spec.value_ns, flags, now_ns) orelse return sc.syscall_err_invalid;
+    const old_state = state.timerFdState(proc, fd, now_ns) orelse return sc.syscall_err_invalid;
     const old_status = writeTimerSpec(h, proc, frame.r10, old_state);
     if (old_status != sc.syscall_ok) return old_status;
-    const deadline_tick = if (spec.value_ticks == 0)
-        0
-    else if ((flags & fd_abi.timerfd_flag_abstime) != 0)
-        spec.value_ticks
-    else
-        scheduler.lapic_tick_count + spec.value_ticks;
-    state.setTimerFd(proc, fd, deadline_tick, spec.interval_ticks, @truncate(flags)) catch return sc.syscall_err_invalid;
+    state.setTimerFd(proc, fd, deadline_ns, spec.interval_ns, @truncate(flags)) catch return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 
 fn timerfdGettime(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
-    const timer_state = state.timerFdState(proc, fd, scheduler.lapic_tick_count) orelse return sc.syscall_err_invalid;
+    const timer_state = state.timerFdState(proc, fd, timerNowNs()) orelse return sc.syscall_err_invalid;
     return writeTimerSpec(h, proc, out_va, timer_state);
 }
 
@@ -909,13 +907,9 @@ fn mapVmoFd(
         state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch return sc.syscall_err_map;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (flags.fixed) {
-        // File-backed shared/native-default mappings eagerly install PTEs.
-        // Until that PTE operation has its own prepare/commit token, reject
-        // it before touching the old MAP_FIXED target.  Anonymous mappings
-        // remain lazy and private file mappings fault through the VMA.
-        if (!flags.anonymous and (!flags.private or flags.shared)) {
-            return sc.syscall_err_invalid;
-        }
+        // Prepare validates shared backing before replacing anything. All
+        // fixed mappings install PTEs lazily through the native VMA fault
+        // path, so no fallible eager PTE work follows the atomic commit.
         if (state.rangeOverlapsPinnedUserObject(proc, base_va, aligned_size)) {
             return sc.syscall_err_invalid;
         }
@@ -1258,14 +1252,25 @@ fn mremapVmaRange(
 }
 
 fn madviseVmaRange(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
     base_va: u64,
     size_bytes: u64,
     advice: u64,
 ) u64 {
-    if (size_bytes == 0) return sc.syscall_ok;
+    // NORMAL/RANDOM/SEQUENTIAL/WILLNEED are paging hints. We accept them
+    // without extra prefetch; advice requiring discard or inheritance changes
+    // must not falsely succeed until those operations are implemented.
+    if (advice > 3) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
-    if (!(advice <= 4 or advice == 8 or (advice >= 14 and advice <= 17) or advice == 20 or advice == 21)) return sc.syscall_err_invalid;
-    _ = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
+    if (size_bytes == 0) return sc.syscall_ok;
+    const size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
+    const end, const overflow = @addWithOverflow(base_va, size);
+    _ = end;
+    if (overflow != 0) return sc.syscall_err_invalid;
+    if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransaction(proc);
+    if (!nativeVmaCoversRange(state, proc, base_va, size)) return sc.syscall_err_map;
     return sc.syscall_ok;
 }
 
@@ -1521,7 +1526,8 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             profile_stage = smp_perf.timestamp();
             const unmapped = if (native_vma_source)
                 user_vm.unmapPresentVmaSource(proc, frame.rdi, @intCast(size))
-            else user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size));
+            else
+                user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size));
             if (!unmapped) unreachable;
             smp_perf.munmapElapsed(.unmap_cycles, profile_stage);
             profile_stage = smp_perf.timestamp();
@@ -1532,7 +1538,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         },
         sc.syscall_mprotect => mprotectVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
         sc.syscall_mremap => mremapVmaRange(state, proc, h.free_list, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8),
-        sc.syscall_madvise => madviseVmaRange(frame.rdi, frame.rsi, frame.rdx),
+        sc.syscall_madvise => madviseVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
         else => null,
     };
 }

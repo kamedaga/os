@@ -1,0 +1,13 @@
+/tests/gpud-core-child.elf=../.artifacts/tests/native-gpud-device/child.elf
+/srv/kobox2/core.so=../.artifacts/kobox2-device-launch-runtime/linux-boot-runtime.so
+/srv/kobox2/modules/i2c-core.ko=../.artifacts/kobox2-device-launch-modules/drivers/i2c/i2c-core.ko
+/srv/kobox2/modules/drm_panel_orientation_quirks.ko=../.artifacts/kobox2-device-launch-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko
+/srv/kobox2/modules/drm.ko=../.artifacts/kobox2-device-launch-modules/drivers/gpu/drm/drm.ko
+/srv/kobox2/modules/drm_shmem_helper.ko=../.artifacts/kobox2-device-launch-modules/drivers/gpu/drm/drm_shmem_helper.ko
+/srv/kobox2/modules/virtio_ring.ko=../.artifacts/kobox2-device-launch-modules/drivers/virtio/virtio_ring.ko
+/srv/kobox2/modules/virtio.ko=../.artifacts/kobox2-device-launch-modules/drivers/virtio/virtio.ko
+/srv/kobox2/modules/virtio_pci_modern_dev.ko=../.artifacts/kobox2-device-launch-modules/drivers/virtio/virtio_pci_modern_dev.ko
+/srv/kobox2/modules/virtio_pci.ko=../.artifacts/kobox2-device-launch-modules/drivers/virtio/virtio_pci.ko
+/srv/kobox2/modules/virtio_dma_buf.ko=../.artifacts/kobox2-device-launch-modules/drivers/virtio/virtio_dma_buf.ko
+/srv/kobox2/modules/drm_kms_helper.ko=../.artifacts/kobox2-device-launch-modules/drivers/gpu/drm/drm_kms_helper.ko
+/srv/kobox2/modules/virtio-gpu.ko=../.artifacts/kobox2-device-launch-modules/drivers/gpu/drm/virtio/virtio-gpu.ko

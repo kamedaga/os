@@ -9,6 +9,7 @@
 #include "lpr_filed.h"
 #include "lpr_linux_syscall.h"
 #include "lpr_process/capability.h"
+#include "lpr_process/credentials.h"
 #include "lpr_process/compat.h"
 #include "lpr_process/client.h"
 #include "lpr_unix/context.h"
@@ -406,6 +407,10 @@ typedef struct lpr_process_state {
     int32_t current_ppid;
     int32_t current_sid;
     int32_t current_pgrp;
+    /* Read-only compatibility snapshot from the authenticated supervisor.
+     * Fork copies it; each exec reloads it. Never use it to authorize IPC. */
+    lprs_credentials_t credentials;
+    uint32_t filed_rights;
     int32_t next_pid;
     int32_t pending_child_pid;
     int32_t pending_child_ppid;
@@ -485,9 +490,12 @@ typedef struct lpr_rlimit_state {
 
 typedef struct lpr_filed_rpc_state {
     volatile uint32_t lock_word;
+    volatile uint32_t connection_lock;
     volatile uint32_t readv_lock_word;
     uint64_t request_id;
     int endpoint_checked;
+    int client_fd;
+    uint64_t client_id;
     int wire_page_fd;
     void *wire_page;
     int wire_page_busy;
@@ -611,6 +619,10 @@ void lpr_signal_thread_state_after_fork_child(void);
 #define lpr_file_image_cache_pause_count (lpr_state.caches.file_image_pause_count)
 #define lpr_request_id (lpr_state.filed_rpc.request_id)
 #define lpr_filed_endpoint_checked (lpr_state.filed_rpc.endpoint_checked)
+#define lpr_filed_client_fd (lpr_state.filed_rpc.client_fd)
+#define lpr_filed_client_id (lpr_state.filed_rpc.client_id)
+int lpr_filed_lease_pair(int *local, int *remote);
+int lpr_filed_adopt(uint64_t handle, int lease_fd);
 #define lpr_wire_page_fd (lpr_state.filed_rpc.wire_page_fd)
 #define lpr_wire_page (lpr_state.filed_rpc.wire_page)
 #define lpr_wire_page_busy (lpr_state.filed_rpc.wire_page_busy)

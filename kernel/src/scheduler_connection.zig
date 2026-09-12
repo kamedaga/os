@@ -15,6 +15,7 @@ pub const verified_sched = @import("verified_sched.zig");
 const scheduler_runqueue = @import("scheduler_runqueue.zig");
 
 const TrapFrame = interrupts.TrapFrame;
+const process_abi = @import("kernel_abi_root").process_abi;
 
 pub const BeforeCurrentThreadLeaveCallback = struct {
     context: *anyopaque,
@@ -138,6 +139,10 @@ pub const ThreadContext = struct {
     signal_inhibit_secondary_start: u64 = 0,
     signal_inhibit_secondary_end: u64 = 0,
     signal_owner: bool = false,
+    fault_entry: u64 = 0,
+    fault_stack_base: u64 = 0,
+    fault_stack_size: u64 = 0,
+    active_fault_frame: u64 = 0,
     wake_tick: u64 = 0,
     frame: TrapFrame = std.mem.zeroes(TrapFrame),
     x_state: [xstate_bytes]u8 align(x86_platform.xstate_alignment) = [_]u8{0} ** xstate_bytes,
@@ -2149,6 +2154,10 @@ fn initializeThreadContextWithReadyState(
     // sibling but is never the process signal owner; only an explicit REGISTER
     // (the main/event-loop thread) claims ownership.
     ctx.signal_owner = false;
+    ctx.fault_entry = 0;
+    ctx.fault_stack_base = 0;
+    ctx.fault_stack_size = 0;
+    ctx.active_fault_frame = 0;
     var inherit_index: usize = 0;
     while (inherit_index < scheduler_state.thread_table.contexts.len) : (inherit_index += 1) {
         if (inherit_index == thread_index) continue;
@@ -2446,6 +2455,99 @@ pub fn suspendedThreadImage(
     };
 }
 
+// The caller holds thread_table and all CPU ownership locks. A stopped
+// syscall wait can still receive a completion, so it is not an editable frame.
+fn controlledThreadAvailableLocked(ctx: *const ThreadContext, thread_index: usize,
+    generation: u32, owner: kernel.PrincipalId) bool
+{
+    if (!ctx.allocated or ctx.generation != generation or ctx.owner_process != owner or
+        ctx.ready or ctx.wait_mailbox or ctx.active_wait_token != 0 or
+        ctx.wait_completion_claimed or ctx.wait_completion_publish_pending or
+        ctx.wake_tick != 0 or ctx.active_fault_frame != 0) return false;
+    for (scheduler_state.cpus[0..scheduler_state.cpu_count]) |*cpu| {
+        if (!cpu.is_idle and cpu.current_thread == thread_index) return false;
+    }
+    return true;
+}
+
+pub fn getControlledThreadContext(thread_index: usize, generation: u32,
+    owner: kernel.PrincipalId, out: *process_abi.ThreadUserContext) bool
+{
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const ctx = threadContext(thread_index) orelse return false;
+    if (!controlledThreadAvailableLocked(ctx, thread_index, generation, owner)) return false;
+    out.* = .{ .size = process_abi.thread_user_context_size,
+        .xstate_features = process_abi.signal_xstate_feature_mask,
+        .fs_base = ctx.fs_base, .gs_base = ctx.gs_base, .pkru = ctx.pkru,
+        .reserved = .{ 0, 0, 0 }, .registers = undefined, .xstate = ctx.x_state };
+    inline for (std.meta.fields(process_abi.ThreadRegisters)) |field|
+        @field(out.registers, field.name) = @field(ctx.frame, field.name);
+    return true;
+}
+
+/// The syscall validated the complete architectural image before this commit.
+pub fn setControlledThreadContext(thread_index: usize, generation: u32,
+    owner: kernel.PrincipalId, image: *const process_abi.ThreadUserContext) bool
+{
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    lockAllCpuSchedulerStates();
+    defer unlockAllCpuSchedulerStates();
+    const ctx = threadContextMutable(thread_index) orelse return false;
+    if (!controlledThreadAvailableLocked(ctx, thread_index, generation, owner)) return false;
+    inline for (std.meta.fields(TrapFrame)) |field|
+        @field(ctx.frame, field.name) = @field(image.registers, field.name);
+    ctx.fs_base = image.fs_base;
+    ctx.gs_base = image.gs_base;
+    ctx.pkru = @intCast(image.pkru);
+    ctx.x_state = image.xstate;
+    return true;
+}
+
+test "controlled thread context requires quiescence and keeps wait lifecycle intact" {
+    initializeStaticStorage();
+    defer initializeStaticStorage();
+    const tid = 4;
+    const ctx = &initial_thread_contexts[tid];
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    ctx.* = .{ .id = tid, .allocated = true, .generation = 17, .owner_process = owner,
+        .stopped = true, .resume_after_stop = true, .fs_base = 0x4100_0000 };
+    defer ctx.* = .{ .id = tid, .scheduler_entity = &initial_scheduler_entities[tid] };
+    var image: process_abi.ThreadUserContext = undefined;
+    try std.testing.expect(!getControlledThreadContext(tid, 16, owner, &image));
+    try std.testing.expect(!getControlledThreadContext(tid, 17, kernel.processPrincipalFromIndex(1).?, &image));
+    scheduler_state.cpus[0].is_idle = false;
+    scheduler_state.cpus[0].current_thread = tid;
+    try std.testing.expect(!getControlledThreadContext(tid, 17, owner, &image));
+    scheduler_state.cpus[0].is_idle = true;
+    try std.testing.expect(getControlledThreadContext(tid, 17, owner, &image));
+    try std.testing.expectEqual(@as(u64, 0x4100_0000), image.fs_base);
+    image.registers.rax = 123;
+    image.gs_base = 0x4200_0000;
+    image.xstate[160] = 0x7f;
+    ctx.wait_mailbox = true;
+    try std.testing.expect(!setControlledThreadContext(tid, 17, owner, &image));
+    try std.testing.expectEqual(@as(u64, 0), ctx.frame.rax);
+    ctx.wait_mailbox = false;
+    ctx.wait_completion_publish_pending = true;
+    try std.testing.expect(!setControlledThreadContext(tid, 17, owner, &image));
+    ctx.wait_completion_publish_pending = false;
+    ctx.active_fault_frame = 4096;
+    try std.testing.expect(!getControlledThreadContext(tid, 17, owner, &image));
+    ctx.active_fault_frame = 0;
+    ctx.ready = true;
+    try std.testing.expect(!setControlledThreadContext(tid, 17, owner, &image));
+    ctx.ready = false;
+    try std.testing.expect(setControlledThreadContext(tid, 17, owner, &image));
+    try std.testing.expectEqual(@as(u64, 123), ctx.frame.rax);
+    try std.testing.expectEqual(@as(u64, 0x4200_0000), ctx.gs_base);
+    try std.testing.expectEqual(@as(u8, 0x7f), ctx.x_state[160]);
+    try std.testing.expect(ctx.stopped and ctx.resume_after_stop and !ctx.ready);
+}
+
 /// Capture the sole suspended thread of a staged process only while neither
 /// address space can have another executing or schedulable thread.  Holding
 /// the thread table, every CPU ownership record, and every runqueue together
@@ -2578,6 +2680,10 @@ pub fn installExecContextForCurrentThread(
         ctx.signal_inhibit_secondary_start = 0;
         ctx.signal_inhibit_secondary_end = 0;
         ctx.signal_owner = false;
+        ctx.fault_entry = 0;
+        ctx.fault_stack_base = 0;
+        ctx.fault_stack_size = 0;
+        ctx.active_fault_frame = 0;
         // The current private exec image contract does not carry a blocked
         // mask.  Keep kernel and the new LPR BSS in sync instead of retaining
         // a kernel-only value that userland would immediately overwrite.
@@ -3338,6 +3444,26 @@ pub fn deliverSignal(
         scheduler_state.thread_table.unlock();
         return null;
     };
+    return deliverSignalLocked(principal, target, ctx, signal_bit, blocked_resume_rax);
+}
+
+// Thread capabilities name one generation. Publication and blocked-wait
+// cancellation use the same lock as process-directed notification.
+pub fn deliverThreadSignal(principal: kernel.PrincipalId, target: usize, generation: u32, signo: u32, blocked_resume_rax: u64) ?SignalDelivery {
+    const signal_bit = signalBit(signo) orelse return null;
+    scheduler_state.thread_table.lock();
+    const ctx = threadContextMutable(target) orelse {
+        scheduler_state.thread_table.unlock();
+        return null;
+    };
+    if (ctx.generation != generation) {
+        scheduler_state.thread_table.unlock();
+        return null;
+    }
+    return deliverSignalLocked(principal, target, ctx, signal_bit, blocked_resume_rax);
+}
+
+fn deliverSignalLocked(principal: kernel.PrincipalId, target: usize, ctx: *ThreadContext, signal_bit: u64, blocked_resume_rax: u64) ?SignalDelivery {
     if (!ctx.allocated or ctx.owner_process != principal or ctx.stopped) {
         scheduler_state.thread_table.unlock();
         return null;
@@ -3345,6 +3471,7 @@ pub fn deliverSignal(
     const newly_pending = (ctx.pending_signal_mask & signal_bit) == 0;
     const should_interrupt = newly_pending and (ctx.signal_blocked_mask & signal_bit) == 0;
     const was_blocked = should_interrupt and !ctx.ready and
+        (ctx.wait_mailbox or ctx.wake_tick != 0) and
         !ctx.wait_completion_claimed;
     const generation = ctx.generation;
     ctx.pending_signal_mask |= signal_bit;
@@ -3375,7 +3502,12 @@ pub fn deliverSignal(
         setThreadHotCompletionClaimed(target, false);
         _ = verifiedWakeThreadGeneration(target, generation);
     }
+    const cpu_slot = ctx.cpu_slot;
     scheduler_state.thread_table.unlock();
+    // A CPU-bound target need not make another syscall to observe a signal.
+    // If it migrates during publication, the normal return/tick path still
+    // observes the per-thread pending bit; the IPI is only the prompt kick.
+    if (should_interrupt) _ = smp.interruptCpu(cpu_slot);
     return .{
         .thread_index = target,
         .thread_generation = generation,
@@ -3490,7 +3622,7 @@ pub fn claimCurrentSignalForUserReturn(rip: u64) ?ClaimedSignal {
         return null;
     };
     const signo = firstUnblockedPendingSignal(ctx);
-    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0) {
+    if (!ctx.allocated or signo == 0 or ctx.signal_entry == 0 or ctx.active_fault_frame != 0) {
         scheduler_state.thread_table.unlock();
         return null;
     }
@@ -3558,6 +3690,41 @@ pub fn restoreCurrentSignalXState(saved: *const [xstate_bytes]u8) bool {
     const ctx = threadContextMutable(currentThread()) orelse return false;
     if (!ctx.allocated) return false;
     ctx.x_state = saved.*;
+    return true;
+}
+
+pub const FaultDelivery = struct {
+    entry: u64,
+    frame_va: u64,
+};
+
+pub fn configureCurrentFaultDelivery(entry: u64, stack_base: u64, stack_size: u64) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(currentThread()) orelse return false;
+    if (!ctx.allocated or ctx.active_fault_frame != 0) return false;
+    ctx.fault_entry = entry;
+    ctx.fault_stack_base = stack_base;
+    ctx.fault_stack_size = stack_size;
+    return true;
+}
+
+pub fn claimCurrentFault() ?FaultDelivery {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(currentThread()) orelse return null;
+    if (!ctx.allocated or ctx.fault_entry == 0 or ctx.active_fault_frame != 0) return null;
+    const frame_va = (ctx.fault_stack_base + ctx.fault_stack_size - process_abi.fault_frame_size) & ~@as(u64, 63);
+    ctx.active_fault_frame = frame_va;
+    return .{ .entry = ctx.fault_entry, .frame_va = frame_va };
+}
+
+pub fn completeCurrentFault(frame_va: u64) bool {
+    scheduler_state.thread_table.lock();
+    defer scheduler_state.thread_table.unlock();
+    const ctx = threadContextMutable(currentThread()) orelse return false;
+    if (!ctx.allocated or frame_va == 0 or ctx.active_fault_frame != frame_va) return false;
+    ctx.active_fault_frame = 0;
     return true;
 }
 

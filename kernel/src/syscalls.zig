@@ -1,4 +1,5 @@
 const std = @import("std");
+const user_copy = @import("user_copy.zig");
 const perf = @import("smp_perf.zig");
 const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
@@ -85,8 +86,14 @@ const KernelStateSpinLock = struct {
     }
 
     fn unlock(self: *KernelStateSpinLock) void {
+        const clockevent = @import("clockevent.zig");
+        const changed = if (syscall_hooks_ready and syscall_hooks_storage.kernel_state_ready.*)
+            clockevent.publish(syscall_hooks_storage.state.nextTimerWaiterDeadline())
+        else
+            false;
         perf.elapsed(.kernel_lock_hold_cycles, self.profile_start);
         @atomicStore(u8, &self.value, 0, .release);
+        if (changed) clockevent.notifyChanged();
     }
 };
 
@@ -169,6 +176,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
     end = maxStaticEnd(end, runtime_syscalls.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, @import("clockevent.zig").kernelStaticStorageEndAddr());
     return end;
 }
 
@@ -199,6 +207,9 @@ fn getHooks() *const Hooks {
 /// the BSP timer retries any publication that loses this try-lock race.
 pub fn completePendingIrqFdWaitersFromInterrupt() void {
     if (!syscall_hooks_ready) return;
+    // Counter publication is already complete. Leave registrations pending
+    // for the BSP timer if copyout could reenter this CPU's TLB shootdown.
+    if (user_copy.tlbShootdownActiveOnCurrentCpu()) return;
     const h = getHooks();
     if (!h.kernel_state_ready.*) return;
     if (!kernel_state_lock.tryLock()) return;
@@ -206,6 +217,25 @@ pub fn completePendingIrqFdWaitersFromInterrupt() void {
 
     var targets: [kernel.fd_table_entries]kernel.ThreadWakeTarget = undefined;
     const count = h.state.takeReadyIrqWaiters(targets[0..]);
+    _ = fd_syscalls.wakeThreadTargets(h, h.state, targets[0..count]);
+}
+
+pub fn completePendingTimerFdWaitersFromInterrupt(now_ns: u64) void {
+    if (!syscall_hooks_ready or !getHooks().kernel_state_ready.*) return;
+    const clockevent = @import("clockevent.zig");
+    if (!clockevent.waiterIsDue(now_ns)) return;
+    if (user_copy.tlbShootdownActiveOnCurrentCpu()) {
+        clockevent.deferContendedDelivery(now_ns);
+        return;
+    }
+    if (!kernel_state_lock.tryLock()) {
+        clockevent.deferContendedDelivery(now_ns);
+        return;
+    }
+    defer kernel_state_lock.unlock();
+    const h = getHooks();
+    var targets: [kernel.fd_table_entries]kernel.ThreadWakeTarget = undefined;
+    const count = h.state.takeReadyTimerWaiters(now_ns, &targets);
     _ = fd_syscalls.wakeThreadTargets(h, h.state, targets[0..count]);
 }
 
@@ -331,7 +361,8 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64 {
     const result = dispatchCompactSyscall(frame);
     frame.rax = result;
-    return result;
+    @import("traps.zig").stagePendingSignalForUserReturn(frame);
+    return frame.rax;
 }
 
 test "explicit userlog label detection" {
@@ -340,4 +371,119 @@ test "explicit userlog label detection" {
     try std.testing.expect(!hasExplicitUserLogLabel("seed ready\n"));
     try std.testing.expect(!hasExplicitUserLogLabel("[seed"));
     try std.testing.expect(!hasExplicitUserLogLabel("[] bad\n"));
+}
+
+const InterruptWaiterTest = struct {
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    const clockevent = @import("clockevent.zig");
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const tid = 7;
+    const generation = 11;
+    const token = 41;
+    const poll_address = 0x1000;
+    var storage: [kernel.runtimeStorageBytes()]u8 align(4096) = undefined;
+    var state_ready = true;
+    var copies: usize = 0;
+    var notifications: usize = 0;
+
+    fn notify() void {
+        notifications += 1;
+    }
+
+    fn copy(principal: kernel.PrincipalId, address: u64, value: u64) bool {
+        std.debug.assert(principal == owner);
+        std.debug.assert(address == poll_address + fd_abi.pollfd_revents_offset);
+        std.debug.assert(value == fd_abi.event_readable);
+        copies += 1;
+        return true;
+    }
+
+    fn registered(state: *const kernel.KernelState) usize {
+        var count: usize = 0;
+        for (&state.task_fd_waiters) |*waiter| if (waiter.active) {
+            std.debug.assert(!waiter.binding.completion_pending);
+            count += 1;
+        };
+        return count;
+    }
+
+    fn complete(timer: bool) void {
+        if (timer) completePendingTimerFdWaitersFromInterrupt(100)
+        else completePendingIrqFdWaitersFromInterrupt();
+    }
+
+    fn run(timer: bool) !void {
+        scheduler.initializeStaticStorage();
+        defer scheduler.initializeStaticStorage();
+        const ctx = scheduler.threadContextMutable(tid).?;
+        const previous_context = ctx.*;
+        defer ctx.* = previous_context;
+        // A stopped native waiter can complete without dispatching a real
+        // host CPU. Its resume-after-stop state still uses the real token path.
+        ctx.* = .{ .id = tid, .allocated = true, .generation = generation,
+            .owner_process = owner, .stopped = true, .wait_mailbox = true,
+            .active_wait_token = token };
+        try std.testing.expect(kernel.initRuntimeStorage(&storage));
+        const state = try std.testing.allocator.create(kernel.KernelState);
+        defer std.testing.allocator.destroy(state);
+        state.* = try kernel.KernelState.initFromDetectedRegions(1);
+        const saved_ready = syscall_hooks_ready;
+        const saved_hooks = if (saved_ready) syscall_hooks_storage else undefined;
+        defer {
+            syscall_hooks_ready = saved_ready;
+            syscall_hooks_storage = saved_hooks;
+        }
+        const clock_state = clockevent.testInstallNotifier(notify);
+        defer clockevent.testRestoreState(clock_state);
+        copies = 0;
+        notifications = 0;
+        state_ready = true;
+        syscall_hooks_storage = undefined;
+        syscall_hooks_storage.state = state;
+        syscall_hooks_storage.kernel_state_ready = &state_ready;
+        syscall_hooks_storage.write_user_u64 = copy;
+        syscall_hooks_ready = true;
+        const rights = kernel.FdRights{ .poll = true, .read = true, .irq_wait = true, .close = true };
+        const fd = if (timer) try state.createTimerFd(owner, 100, 0, .{}, rights, 16)
+            else try state.createIrqFd(owner, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+        const group = try state.beginFdWaitGroup(owner, tid, generation, token);
+        try std.testing.expect(try state.registerTaskReadableWaiterForFd(
+            owner, fd, fd_abi.event_readable, poll_address, tid, generation, token, group));
+        try state.armFdWaitGroup(group);
+        if (timer) {
+            _ = clockevent.publish(100);
+        } else {
+            var owners: [4]kernel.PrincipalId = undefined;
+            try std.testing.expectEqual(@as(usize, 1), state.recordDeviceInterruptEvent(0x1001, 1, &owners));
+        }
+        const cpu = scheduler.currentCpu();
+        user_copy.testSetTlbShootdownActive(cpu, true);
+        defer user_copy.testSetTlbShootdownActive(cpu, false);
+        for (0..8) |_| {
+            complete(timer);
+            try std.testing.expectEqual(@as(usize, 1), registered(state));
+            try std.testing.expectEqual(@as(u64, token), ctx.active_wait_token);
+            try std.testing.expect(ctx.wait_mailbox and !ctx.wait_completion_claimed);
+            try std.testing.expectEqual(@as(usize, 0), copies);
+            try std.testing.expectEqual(@as(usize, 0), notifications);
+        }
+        user_copy.testSetTlbShootdownActive(cpu, false);
+        complete(timer);
+        try std.testing.expectEqual(@as(usize, 0), registered(state));
+        try std.testing.expectEqual(@as(usize, 1), copies);
+        try std.testing.expectEqual(@as(u64, 0), ctx.active_wait_token);
+        try std.testing.expectEqual(@as(u64, 1), ctx.frame.rax);
+        try std.testing.expect(ctx.resume_after_stop and !ctx.wait_mailbox and !ctx.wait_completion_claimed);
+        for (0..8) |_| complete(timer);
+        try std.testing.expectEqual(@as(usize, 1), copies);
+        try std.testing.expectEqual(@as(usize, if (timer) 1 else 0), notifications);
+    }
+};
+
+test "shootdown interrupt guard preserves timer waiters until one completion" {
+    try InterruptWaiterTest.run(true);
+}
+
+test "shootdown interrupt guard preserves IRQ waiters until one completion" {
+    try InterruptWaiterTest.run(false);
 }

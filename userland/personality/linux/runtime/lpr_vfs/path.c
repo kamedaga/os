@@ -1,27 +1,89 @@
 #include "../lpr_filed_internal.h"
+#include "filed/identity.h"
+
+static int lpr_filed_adopt_on_connection(uint64_t handle, int lease_fd);
 
 int64_t lpr_filed_endpoint_ready(void)
 {
-    if (lpr_filed_endpoint_checked > 0) {
-        return 0;
-    }
+    if (__atomic_load_n(&lpr_filed_endpoint_checked, __ATOMIC_ACQUIRE) > 0) return 0;
+    lpr_state_lock(&lpr_state.filed_rpc.connection_lock);
+    int64_t status = 0;
+    if (lpr_filed_endpoint_checked > 0) goto done;
     if (lpr_filed_endpoint_checked < 0) {
-        return -LPR_LINUX_ENOSYS;
+        status = -LPR_LINUX_ENOSYS;
+        goto done;
     }
-    struct pacha_fd_info info;
-    lpr_memset(&info, 0, sizeof(info));
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_FD_GET_INFO,
-        LPR_FILED_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&info);
-    if (status != 0 ||
-        (info.kind != PACHA_FD_KIND_ENDPOINT && info.kind != PACHA_FD_KIND_CHANNEL))
-    {
-        lpr_filed_endpoint_checked = -1;
-        return -LPR_LINUX_ENOSYS;
+    lpr_linux_process_state_init();
+    if (!lpr_supervisor_enabled) { status = -LPR_LINUX_ENOSYS; goto done; }
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 16) { status = page_fd; goto done; }
+    status = lpr_process_client_service_session(LPRS_OP_PROCESS_FILED_SESSION,
+        &lpr_request_id, lpr_pacha_status_to_errno, lpr_supervisor_token,
+        page_fd, page, &lpr_filed_client_id, &lpr_filed_client_fd);
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    if (status) goto done;
+    /* Manifest/fork leases are capabilities, not authority inferred from the
+     * serialized handle numbers. Bind each to this new process connection. */
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    for (uint32_t i = 0; i < lpr_control_fd_table.backend_count; i++) {
+        lpr_backend_record_t *record = &lpr_control_fd_table.backends[i];
+        if (!record->active || record->ops_id != LPR_FD_OPS_FILED) continue;
+        lpr_filed_backend_t *file = record->state;
+        if ((file->reserved2 & LPR_BACKEND_TRANSFER_LEASE) && file->lease_fd.raw >= 16) {
+            status = lpr_filed_adopt_on_connection(file->handle, file->lease_fd.raw);
+            if (status) break;
+        }
     }
-    lpr_filed_endpoint_checked = 1;
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    if (!status && lpr_cwd_lease_fd >= 16) {
+        lpr_cwd_init();
+        status = lpr_filed_adopt_on_connection(lpr_cwd_handle, lpr_cwd_lease_fd);
+    }
+    if (status) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)lpr_filed_client_fd);
+        lpr_filed_client_fd = -1;
+    }
+    __atomic_store_n(&lpr_filed_endpoint_checked, status ? -1 : 1, __ATOMIC_RELEASE);
+done:
+    lpr_state_unlock(&lpr_state.filed_rpc.connection_lock);
+    return status;
+}
+
+int lpr_filed_lease_pair(int *local, int *remote)
+{
+    uint64_t pair[2] = {0};
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    int64_t status = lpr_pacha_syscall3(PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
+        (uint64_t)(uintptr_t)pair, rights, 0);
+    if (status) return (int)lpr_pacha_status_to_errno(status);
+    *local = (int)pair[0];
+    *remote = (int)pair[1];
     return 0;
+}
+
+static int lpr_filed_adopt_on_connection(uint64_t handle, int lease_fd)
+{
+    struct pacha_ipc_msg request = { .word0 = FILED_LEASE_MAGIC, .word1 = handle,
+        .word2 = lpr_filed_client_id, .word3 = handle };
+    int64_t reply_fd = lpr_native_ipc_call_wait((uint64_t)lease_fd, &request);
+    if (reply_fd < 16) return (int)lpr_pacha_status_to_errno(reply_fd);
+    struct pacha_ipc_msg reply = {0};
+    int status = (int)lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+    if (status) return (int)lpr_pacha_status_to_errno(status);
+    if (reply.word0 != FILED_LEASE_MAGIC || reply.word2 != handle || reply.word3 != handle)
+        return -LPR_LINUX_EIO;
+    return (int)(int64_t)reply.word1;
+}
+
+int lpr_filed_adopt(uint64_t handle, int lease_fd)
+{
+    int status = (int)lpr_filed_endpoint_ready();
+    return status ? status : lpr_filed_adopt_on_connection(handle, lease_fd);
 }
 
 int64_t lpr_filed_session_connect(void)
@@ -149,6 +211,7 @@ int64_t lpr_filed_session_connect(void)
         PACHA_FD_RIGHT_MAP_WRITE;
     fds[1].fd = pair[1];
     fds[1].rights =
+        PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL |
@@ -162,7 +225,7 @@ int64_t lpr_filed_session_connect(void)
     request.fds = fds;
     request.fd_count = 3;
     const int64_t reply_fd = lpr_native_ipc_call_wait(
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         &request);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
     if (reply_fd < 16) {
@@ -636,6 +699,12 @@ void lpr_destroy_tty_wire_page(int fd, void *page)
 
 void lpr_reset_fork_child_rpc_state(void)
 {
+    /* PRIVATE control capability was not inherited. Its old numeric slot
+     * may now name another child capability; never close it by stale number. */
+    lpr_filed_client_fd = -1;
+    lpr_filed_client_id = 0;
+    lpr_filed_endpoint_checked = 0;
+    lpr_state.filed_rpc.connection_lock = 0;
     lpr_file_image_cache_after_fork_child();
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
@@ -855,6 +924,15 @@ int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_f
         0,
         out_process_fd);
     if (status == 0) {
+        const pacha_service_envelope_t *header = page;
+        if (header->reply_payload_size != sizeof(*out_state)) {
+            if (*out_process_fd >= 16) {
+                (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)*out_process_fd);
+                *out_process_fd = -1;
+            }
+            lpr_destroy_standalone_wire_page(page_fd, page);
+            return -LPR_LINUX_EIO;
+        }
         lpr_memcpy(out_state, lpr_supervisor_payload(page), sizeof(*out_state));
     }
     lpr_destroy_standalone_wire_page(page_fd, page);
@@ -1049,6 +1127,11 @@ int lpr_create_pread_vmo_wire_page(void **out_page)
         return -LPR_LINUX_EINVAL;
     }
     lpr_state_lock(&lpr_state.filed_rpc.lock_word);
+    const int ready = (int)lpr_filed_endpoint_ready();
+    if (ready) {
+        lpr_state_unlock(&lpr_state.filed_rpc.lock_word);
+        return ready;
+    }
     if (lpr_pread_vmo_page_fd >= 16 &&
         lpr_pread_vmo_page != 0 &&
         !lpr_pread_vmo_page_busy)
@@ -1475,7 +1558,7 @@ static int64_t lpr_filed_call_locked(
         .fd_count = fd_count,
     };
     const int64_t reply_fd = lpr_native_ipc_call_wait(
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         &request);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
@@ -1487,7 +1570,7 @@ static int64_t lpr_filed_call_locked(
             reply_fd,
             request_id,
             page_fd >= 16 ? 1u : 0u,
-            LPR_FILED_ENDPOINT_FD,
+            lpr_filed_client_fd,
             0,
             "filed ipc_call failed");
         if (page != owned_page) {

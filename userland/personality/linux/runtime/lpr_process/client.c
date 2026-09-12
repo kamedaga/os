@@ -148,10 +148,10 @@ int64_t lpr_process_client_call_with_transfer_rights(
         .fds = fds,
         .fd_count = fd_count,
     };
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
-        (uint64_t)(uint32_t)lpr_process_control_fd,
-        (uint64_t)(uintptr_t)&request);
+    /* Session acquisition can arrive concurrently from every Linux thread.
+     * As with socket RPCs, wait only for explicit pre-enqueue backpressure. */
+    const int64_t reply_fd = lpr_native_ipc_call_wait(
+        (uint64_t)(uint32_t)lpr_process_control_fd, &request);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (op == LPRS_OP_PROCESS_WAIT4) {
         lpr_process_rpc_diag("call-return", request_id, reply_fd, 0, 0, 0);
@@ -341,7 +341,8 @@ int64_t lpr_process_client_activate(uint64_t *request_counter,
     lpr_process_control_fd = -1;
     if (status != 0) return status;
     struct pacha_fd_info info;
-    const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL;
+    const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
     if (control < 16 || control >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
             (uint64_t)(uint32_t)control, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != allowed ||
@@ -368,7 +369,8 @@ int64_t lpr_process_client_prepare_exec(uint64_t *request_counter,
         LPRS_OP_PROCESS_EXEC_PREPARE, page_fd, page, sizeof(*payload), -1, NULL, &bootstrap);
     if (status != 0) return status;
     struct pacha_fd_info info;
-    const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL;
+    const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
     if (bootstrap < 16 || bootstrap >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
             (uint64_t)(uint32_t)bootstrap, (uint64_t)(uintptr_t)&info) != 0 ||
         info.kind != PACHA_FD_KIND_CHANNEL || info.rights != allowed ||
@@ -386,7 +388,7 @@ int64_t lpr_process_client_prepare_exec(uint64_t *request_counter,
     return 0;
 }
 
-int64_t lpr_process_client_unix_session(uint64_t *request_counter,
+int64_t lpr_process_client_service_session(uint32_t op, uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t), uint64_t token,
     int page_fd, void *page, uint64_t *out_session, int *out_fd)
 {
@@ -398,7 +400,7 @@ int64_t lpr_process_client_unix_session(uint64_t *request_counter,
     int fd = -1;
     uint64_t session = 0;
     const int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
-        LPRS_OP_PROCESS_UNIX_SESSION, page_fd, page, sizeof(*payload), -1, &session, &fd);
+        op, page_fd, page, sizeof(*payload), -1, &session, &fd);
     if (status != 0) return status;
     struct pacha_fd_info info;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
@@ -413,6 +415,14 @@ int64_t lpr_process_client_unix_session(uint64_t *request_counter,
     *out_session = session;
     *out_fd = fd;
     return 0;
+}
+
+int64_t lpr_process_client_unix_session(uint64_t *counter,
+    int64_t (*convert)(int64_t), uint64_t token,
+    int page_fd, void *page, uint64_t *session, int *fd)
+{
+    return lpr_process_client_service_session(LPRS_OP_PROCESS_UNIX_SESSION,
+        counter, convert, token, page_fd, page, session, fd);
 }
 
 int64_t lpr_process_client_call_token(

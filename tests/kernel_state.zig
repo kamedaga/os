@@ -1,6 +1,7 @@
 const std = @import("std");
 const kernel = @import("kernel");
 const fd_abi = @import("kernel_abi_root").fd_abi;
+const ProcessFdGrant = @import("kernel_abi_root").process_abi.ProcessFdGrant;
 
 const KernelState = kernel.KernelState;
 const KernelError = kernel.KernelError;
@@ -585,8 +586,9 @@ test "VT-d scatter DMA aliases do not relax other pinned objects or pass-through
     ));
 }
 
-test "pinned fds reject transfer and skip process-create inheritance" {
+test "process-create grants reject pinned objects and never inherit ambient fds" {
     var s = try initFdState();
+    var free_list = FreePageList{};
     const pin_fd = try s.createDmaBufferFd(p0, .{
         .device = 1,
         .user_va = 0x4100_0000,
@@ -610,7 +612,12 @@ test "pinned fds reject transfer and skip process-create inheritance" {
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(pin_ref));
     try std.testing.expect(s.ownerHasPinnedUserObject(p0));
 
-    try s.inheritFdsForProcessCreate(p0, p1);
+    try s.grantFdsForProcessCreate(p0, p1, &.{}, &free_list);
+    try std.testing.expect(s.fdEntryConst(p1, event_fd) == null);
+    const pin_grants = [_]ProcessFdGrant{.{ .source_fd = pin_fd, .target_fd = pin_fd, .rights = fd_abi.right_close, .flags = 0 }};
+    try std.testing.expectError(KernelError.InvalidState, s.grantFdsForProcessCreate(p0, p1, &pin_grants, &free_list));
+    const event_grants = [_]ProcessFdGrant{.{ .source_fd = event_fd, .target_fd = event_fd, .rights = fd_abi.right_close, .flags = 0 }};
+    try s.grantFdsForProcessCreate(p0, p1, &event_grants, &free_list);
     try std.testing.expect(s.fdEntryConst(p1, pin_fd) == null);
     try std.testing.expectEqual(
         event_ref,
@@ -618,6 +625,103 @@ test "pinned fds reject transfer and skip process-create inheritance" {
     );
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(pin_ref));
     try std.testing.expectEqual(@as(?u32, 2), s.kernelObjectRefCount(event_ref));
+}
+
+test "process-create grants require transfer and attenuate private sources without parent mutation" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const ref = try createTestFdObject(&s, 42);
+    const source = try s.installFd(p0, ref, fdRights(.{ .transfer = true, .close = true, .inspect = true }), fdFlags(.{ .private = true, .inherit = true }), 16);
+    const before = (s.fdEntryConst(p0, source) orelse unreachable).*;
+    const grants = [_]ProcessFdGrant{.{ .source_fd = source, .target_fd = 7, .rights = fd_abi.right_inspect, .flags = 0 }};
+    try s.grantFdsForProcessCreate(p0, p1, &grants, &free_list);
+    const child = s.fdEntryConst(p1, 7) orelse unreachable;
+    try std.testing.expectEqual(ref, child.object);
+    try std.testing.expectEqual(fd_abi.right_inspect, kernel.fdRightsToBits(child.rights));
+    try std.testing.expectEqual(@as(u32, 0), kernel.fdFlagsToBits(child.flags));
+    try std.testing.expectEqualDeep(before, (s.fdEntryConst(p0, source) orelse unreachable).*);
+    const no_transfer = try s.installFd(p0, ref, fdRights(.{ .close = true }), .{}, 16);
+    const invalid = [_]ProcessFdGrant{.{ .source_fd = no_transfer, .target_fd = 8, .rights = fd_abi.right_close, .flags = 0 }};
+    try std.testing.expectError(KernelError.InvalidState, s.grantFdsForProcessCreate(p0, p1, &invalid, &free_list));
+    try std.testing.expect(s.fdEntryConst(p1, 8) == null);
+}
+
+test "process-create rejects invalid grant batches before copying any reference" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const ref = try createTestFdObject(&s, 43);
+    const source = try s.installFd(p0, ref, fdRights(.{ .transfer = true, .close = true }), .{}, 16);
+    const first = ProcessFdGrant{ .source_fd = source, .target_fd = 4, .rights = fd_abi.right_close, .flags = 0 };
+    const invalid = [_]ProcessFdGrant{
+        first, // duplicate destination
+        .{ .source_fd = source, .target_fd = 4096, .rights = 0, .flags = 0 },
+        .{ .source_fd = source, .target_fd = 5, .rights = fd_abi.right_dup, .flags = 0 },
+        .{ .source_fd = source, .target_fd = 5, .rights = 1 << 63, .flags = 0 },
+        .{ .source_fd = source, .target_fd = 5, .rights = 0, .flags = 1 << 63 },
+    };
+    for (invalid) |bad| {
+        const grants = [_]ProcessFdGrant{ first, bad };
+        try std.testing.expectError(KernelError.InvalidState, s.grantFdsForProcessCreate(p0, p1, &grants, &free_list));
+        try std.testing.expect(s.fdEntryConst(p1, 4) == null);
+        try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(ref));
+    }
+    const high = [_]ProcessFdGrant{ first, .{ .source_fd = source, .target_fd = 4095, .rights = fd_abi.right_close, .flags = 0 } };
+    try std.testing.expectError(KernelError.OutOfFreePages, s.grantFdsForProcessCreate(p0, p1, &high, &free_list));
+    try std.testing.expect(s.fdEntryConst(p1, 4) == null);
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(ref));
+    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), 64);
+    const free_before = free_list.pageCount();
+    try s.grantFdsForProcessCreate(p0, p1, &high, &free_list);
+    try std.testing.expectEqual(ref, (s.fdEntryConst(p1, 4095) orelse unreachable).object);
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expectEqual(free_before, free_list.pageCount());
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(ref));
+}
+
+test "process-create rolls back partial retains including non-closeable grants" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const first = try createTestFdObject(&s, 44);
+    const second = try createTestFdObject(&s, 45);
+    const a = try s.installFd(p0, first, fdRights(.{ .transfer = true }), .{}, 16);
+    const b = try s.installFd(p0, second, fdRights(.{ .transfer = true }), .{}, 16);
+    const saturated = s.kernelObjectSlot(second) orelse unreachable;
+    saturated.ref_count = std.math.maxInt(u32);
+    defer saturated.ref_count = 1;
+    const grants = [_]ProcessFdGrant{
+        .{ .source_fd = a, .target_fd = 4, .rights = 0, .flags = 0 },
+        .{ .source_fd = b, .target_fd = 5, .rights = 0, .flags = 0 },
+    };
+    try std.testing.expectError(KernelError.TableFull, s.grantFdsForProcessCreate(p0, p1, &grants, &free_list));
+    try std.testing.expect(s.fdEntryConst(p1, 4) == null);
+    try std.testing.expect(s.fdEntryConst(p1, 5) == null);
+    try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(first));
+}
+
+test "process-create handle failure cleanup returns high grant pages and references" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, @intFromPtr(&fd_capacity_backing), 64);
+    const pages = free_list.pageCount();
+    const ref = try createTestFdObject(&s, 46);
+    const source = try s.installFd(p0, ref, fdRights(.{ .transfer = true }), .{}, 16);
+    while (true) {
+        _ = s.installFd(p0, ref, fdRights(.{}), .{}, 16) catch |err| {
+            try std.testing.expectEqual(KernelError.TableFull, err);
+            break;
+        };
+    }
+    const references = s.kernelObjectRefCount(ref);
+    const grants = [_]ProcessFdGrant{.{ .source_fd = source, .target_fd = 4095, .rights = 0, .flags = 0 }};
+    try s.grantFdsForProcessCreate(p0, p1, &grants, &free_list);
+    try std.testing.expect(free_list.pageCount() < pages);
+    try std.testing.expectError(KernelError.TableFull, s.createProcessFd(p0, .{ .principal_raw = @intFromEnum(p1), .state = .active, .exit_code = 0 }, fdRights(.{ .close = true }), .{}, 16));
+    // These are the state cleanup calls in the unpublished syscall transaction.
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    try std.testing.expect(s.removeProcessDescriptor(p1));
+    try std.testing.expectEqual(references, s.kernelObjectRefCount(ref));
+    try std.testing.expectEqual(pages, free_list.pageCount());
+    try std.testing.expect(s.fdEntryConst(p1, 4095) == null);
 }
 
 test "owner teardown revokes exact pinned aliases only" {
@@ -1160,7 +1264,7 @@ test "ipc writable waiter wakes when receive frees a full channel queue" {
         s.fdPollEvents(p0, pair.a, fd_abi.event_writable, 0),
     );
     try std.testing.expectError(
-        KernelError.TableFull,
+        KernelError.MailboxFull,
         s.ipcSend(p0, pair.a, .{}, &free_list),
     );
 
@@ -1554,6 +1658,88 @@ test "irq fd records only matching device and MSI-X entry" {
     try std.testing.expectEqual(@as(?u64, 0), s.fdPollEventsWithWriteMin(p0, irq_fd, 1, 0, 0));
 }
 
+test "retired irq aliases report hangup and cannot consume a replacement event" {
+    var s = try initFdState();
+    const rights = fdRights(.{ .irq_wait = true, .poll = true, .read = true, .close = true, .dup = true });
+    const fd = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+    const alias = try s.dupFd(p0, fd, 16, rights, .{});
+    const original = s.fdEntryConst(p0, fd).?.object;
+    const group = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, fd, fd_abi.event_readable, 0x1000, 7, 11, 1, group));
+    // A waiter interested only in terminal events must also be registered.
+    try std.testing.expect(try s.registerTaskReadableWaiterForFd(p0, alias, 0, 0x1018, 7, 11, 1, group));
+    try s.armFdWaitGroup(group);
+    var targets: [4]kernel.ThreadWakeTarget = undefined;
+    try std.testing.expectEqual(@as(usize, 0), s.takeReadyIrqWaiters(&targets));
+    s.unpublishIrqObject(original);
+    s.kernelObjectSlot(original).?.payload.irq.retired = true;
+    try std.testing.expectEqual(@as(usize, 2), s.takeReadyIrqWaiters(&targets));
+    for (targets[0..2]) |target| try std.testing.expectEqual(fd_abi.event_hangup, target.revents);
+    try std.testing.expectEqual(@as(?u64, fd_abi.event_hangup), s.fdPollEvents(p0, alias, 0, 0));
+    try std.testing.expect(s.irqEventCountForFd(p0, alias, .{ .read = true }) == null);
+    s.cancelFdWaitGroup(group, 1);
+    const replacement = try s.createIrqFd(p0, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+    var owners: [4]PrincipalId = undefined;
+    try std.testing.expectEqual(@as(usize, 1), s.recordDeviceInterruptEvent(0x1001, 1, &owners));
+    try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, replacement, .{ .read = true }));
+    try std.testing.expectEqual(@as(?u64, fd_abi.event_hangup), s.fdPollEvents(p0, fd, fd_abi.event_readable, 0));
+    try std.testing.expect(!s.acknowledgeIrqEventCountForFd(p0, alias, 1));
+    try s.closeFd(p0, fd);
+    try s.closeFd(p0, alias);
+    try std.testing.expectEqual(@as(?u64, 1), s.irqEventCountForFd(p0, replacement, .{ .read = true }));
+}
+
+test "irq publication retirement drains racing writer before slot reuse" {
+    var s = try initFdState();
+    const fd = try s.createIrqFd(p0, .{
+        .device = 0x1001,
+        .kind = .msix,
+        .vector = 1,
+    }, fdRights(.{ .irq_wait = true, .close = true }), .{}, 16);
+    const original = s.fdEntryConst(p0, fd).?.object;
+    const Producer = struct {
+        state: *KernelState,
+        stop: bool = false,
+        fn run(self: *@This()) void {
+            var owners: [4]PrincipalId = undefined;
+            while (!@atomicLoad(bool, &self.stop, .acquire))
+                _ = self.state.recordDeviceInterruptEvent(0x1001, 1, &owners);
+        }
+    };
+    var producer = Producer{ .state = &s };
+    const thread = try std.Thread.spawn(.{}, Producer.run, .{&producer});
+    defer {
+        @atomicStore(bool, &producer.stop, true, .release);
+        thread.join();
+    }
+    while (s.irqPublishedEventCount(original).? == 0) std.atomic.spinLoopHint();
+    s.unpublishIrqObject(original);
+    var generation = original.generation;
+    for (0..256) |_| {
+        const retiring = kernel.KernelObjectRef{ .kind = .irq, .index = original.index, .generation = generation };
+        s.publishIrqObject(retiring, .{
+            .owner_principal_raw = @intFromEnum(p0),
+            .device = 0x1001,
+            .kind = .msix,
+            .vector = 1,
+        });
+        while (s.irqPublishedEventCount(retiring).? == 0) std.atomic.spinLoopHint();
+        s.unpublishIrqObject(retiring);
+        generation = KernelState.nextObjectGeneration(generation);
+        const replacement = kernel.KernelObjectRef{ .kind = .irq, .index = original.index, .generation = generation };
+        s.publishIrqObject(replacement, .{
+            .owner_principal_raw = @intFromEnum(p1),
+            .device = 0x1002,
+            .kind = .msix,
+            .vector = 1,
+        });
+        for (0..128) |_| std.atomic.spinLoopHint();
+        try std.testing.expectEqual(@as(?u64, 0), s.irqPublishedEventCount(replacement));
+        s.unpublishIrqObject(replacement);
+        generation = KernelState.nextObjectGeneration(generation);
+    }
+}
+
 test "physical page allocation returns a page handle" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -1879,6 +2065,124 @@ test "mmap fd rejects rights escalation and overlapping vma" {
     ));
 }
 
+test "MMIO reservation admission covers whole ranges without mutating VMAs" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const base: u64 = 0x4100_0000;
+    const flags = mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true, .fixed = true });
+    const ceiling = vmaProt(.{ .read = true, .write = true });
+    _ = try s.createAnonymousVmaWithPages(p0, base, 3 * 4096, .{}, ceiling, flags, &free_list);
+    _ = try s.createAnonymousVmaWithPages(p0, base + 3 * 4096, 4096, .{}, ceiling, flags, &free_list);
+    const first = (s.vmaEntryForVaConst(p0, base) orelse unreachable).*;
+    const second = (s.vmaEntryForVaConst(p0, base + 3 * 4096) orelse unreachable).*;
+
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base, 4 * 4096));
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base + 4096, 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 5 * 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base - 4096, 2 * 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p1, base, 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base + 1, 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 1));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 0));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, 0, 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, 0xffff_ffff_ffff_f000, 4096));
+    try std.testing.expectEqual(first, (s.vmaEntryForVaConst(p0, base) orelse unreachable).*);
+    try std.testing.expectEqual(second, (s.vmaEntryForVaConst(p0, base + 3 * 4096) orelse unreachable).*);
+    try std.testing.expectEqual(@as(usize, 0), free_list.len);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+}
+
+test "MMIO reservation admission rejects used NONE RAM and COW" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const base: u64 = 0x4100_0000;
+    const flags = mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true });
+    const ceiling = vmaProt(.{ .read = true, .write = true });
+    const vmo = try s.createAnonymousVmaWithPages(p0, base, 3 * 4096, .{}, ceiling, flags, &free_list);
+    // Splitting a non-COW VMA also advances cow_page_offset. That inactive
+    // offset is not COW authority; backing checks must use the VMO offset.
+    try s.setVmaProtRange(p0, base + 4096, 4096, .{});
+    const middle = s.vmaEntryForVaConst(p0, base + 4096) orelse unreachable;
+    try std.testing.expect(middle.cow_table.isNull() and middle.cow_page_offset != 0);
+    try std.testing.expectEqual(@as(u64, 4096), middle.vmo_offset);
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base, 3 * 4096));
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base + 4096, 4096));
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base + 8192, 4096));
+    const entry = @constCast(s.vmaEntryForVaConst(p0, base) orelse unreachable);
+    const original = entry.*;
+
+    inline for (.{ "read", "write", "exec" }) |field| {
+        @field(entry.prot, field) = true;
+        try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+        entry.* = original;
+    }
+    inline for (.{ "anonymous", "private", "noreserve" }) |field| {
+        @field(entry.flags, field) = false;
+        try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+        entry.* = original;
+    }
+    inline for (.{ "shared", "fork_cow" }) |field| {
+        @field(entry.flags, field) = true;
+        try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+        entry.* = original;
+    }
+    entry.prot.pkey = 1;
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+    entry.* = original;
+    entry.cow_table = .{ .index = 0, .generation = 1 };
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+    entry.* = original;
+    const slot = s.nativeVmoSlot(vmo) orelse unreachable;
+    slot.parent = vmo;
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+    slot.parent = .{};
+    try kernel.setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, 1, slot.page_store_owner, 0x1234_5000);
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 3 * 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base + 4096, 4096));
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base + 2 * 4096, 4096));
+    try std.testing.expectEqual(@as(?u64, 0x1234_5000), s.nativeVmoPagePaddr(vmo, 1));
+    try kernel.setVmoBackingPageStorePaddr(slot.page_store_start, slot.page_count, 1, slot.page_store_owner, 0);
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base, 3 * 4096));
+    try s.cloneVmaTableForFork(p0, p1);
+    s.markForkCowVmasCommitted(p0);
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p1, base, 4096));
+    s.releasePrincipalNativeMemory(p1, &free_list);
+    s.releasePrincipalNativeMemory(p0, &free_list);
+}
+
+test "MMIO reservation admission rejects address-bound MMIO and DMA" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const base: u64 = 0x4100_0000;
+    _ = try s.createAnonymousVmaWithPages(p0, base, 4 * 4096, .{}, vmaProt(.{ .read = true, .write = true }), mmapFlags(.{ .private = true, .anonymous = true, .noreserve = true }), &free_list);
+    _ = try s.createMmioRegionFd(p0, .{
+        .device = 1,
+        .paddr = 0x8000_0000,
+        .user_va = base,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    _ = try s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = base + 4096,
+        .iova = 0x8001_0000,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    _ = try s.createDmaMappingFd(p0, .{
+        .device = 1,
+        .user_va = base + 8192,
+        .iova = 0x8002_0000,
+        .size = 4096,
+        .page_count = 1,
+        .direction = .to_device,
+    }, fdRights(.{ .close = true }), .{}, 16);
+    for (0..3) |page|
+        try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base + page * 4096, 4096));
+    try std.testing.expect(!s.userRangeIsUnbackedMmioReservation(p0, base, 4 * 4096));
+    try std.testing.expect(s.userRangeIsUnbackedMmioReservation(p0, base + 3 * 4096, 4096));
+}
+
 test "mmap and mprotect preserve combined write execute permissions" {
     var s = try initFdState();
     const fd = try s.createAnonymousVmoFd(
@@ -1930,7 +2234,7 @@ test "mprotect cannot exceed the mapping authority or change its pkey" {
         0x4110_0000,
         4096,
         vmaProt(.{ .read = true }),
-        mmapFlags(.{ .private = true }),
+        mmapFlags(.{ .shared = true }),
         0,
     );
     const read_vma = s.vmaEntryConst(p0, 0x4110_0000) orelse unreachable;
@@ -2946,6 +3250,37 @@ test "failed split COW detach preserves shared metadata and returns copied pages
     try std.testing.expectEqual(@as(usize, 8), free_list.pageCount());
 }
 
+test "read-only backing permits private COW but not shared or executable mappings" {
+    var s = try initFdState();
+    const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{ .map_read = true }), .{}, 0);
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const rx = vmaProt(.{ .read = true, .exec = true });
+    const va: u64 = 0x4500_0000;
+    const denied_flags = [_]kernel.MmapFlags{
+        .{},
+        mmapFlags(.{ .shared = true }),
+        mmapFlags(.{ .private = true, .shared = true }),
+        mmapFlags(.{ .private = true, .anonymous = true }),
+    };
+    for (denied_flags) |flags| {
+        try std.testing.expectError(KernelError.InvalidState, s.mmapFd(p0, fd, va, 4096, rw, flags, 0));
+        try std.testing.expectError(KernelError.InvalidState, s.mmapFdIntoProcess(p0, fd, p1, va, 4096, rw, flags, 0));
+        var free_list = FreePageList{};
+        try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(p0, fd, va, 4096, rw, flags, 0, &free_list));
+    }
+    const private = mmapFlags(.{ .private = true });
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFd(p0, fd, va, 4096, rx, private, 0));
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFdIntoProcess(p0, fd, p1, va, 4096, rx, private, 0));
+    _ = try s.mmapFd(p0, fd, va, 4096, .{}, private, 0);
+    try s.setVmaProtRange(p0, va, 4096, rw);
+    try std.testing.expectError(KernelError.InvalidState, s.setVmaProtRange(p0, va, 4096, rx));
+    try std.testing.expectError(KernelError.InvalidState, s.setVmaProtRange(p0, va, 4096, vmaProt(.{ .read = true, .pkey = 1 })));
+    _ = try s.mmapFdIntoProcess(p0, fd, p1, va, 4096, rw, private, 0);
+    const mapped = s.vmaEntryConst(p1, va) orelse unreachable;
+    try std.testing.expect(mapped.max_prot.write and !mapped.max_prot.exec);
+    try std.testing.expectEqual(rw, (s.vmaEntryConst(p0, va) orelse unreachable).prot);
+}
+
 test "private file vma faults read-only then COWs on write" {
     var s = try initFdState();
     var free_list = FreePageList{};
@@ -2954,7 +3289,6 @@ test "private file vma faults read-only then COWs on write" {
 
     const fd = try s.createAnonymousVmoFd(p0, 4096, fdRights(.{
         .map_read = true,
-        .map_write = true,
     }), .{}, 0);
     const source_vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
     try s.installNativeVmoPages(source_vmo, 0, &[_]u64{source_page});
@@ -3046,17 +3380,28 @@ test "fixed mmap prepare reuses a fully covered slot in a full vma table" {
     const dest_fd = try s.createAnonymousVmoFd(
         p0,
         4096,
-        fdRights(.{ .map_read = true, .map_write = true }),
+        fdRights(.{ .map_read = true }),
         .{},
         16,
     );
     const dest_vmo = s.nativeVmoRefForFd(p0, dest_fd) orelse unreachable;
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(
+        p0,
+        dest_fd,
+        target_va,
+        4096,
+        vmaProt(.{ .read = true, .exec = true }),
+        mmapFlags(.{ .fixed = true, .private = true }),
+        0,
+        &free_list,
+    ));
+    try std.testing.expectEqual(source_vmo, (s.vmaEntryConst(p0, target_va) orelse unreachable).vmo);
     var prepared = try s.prepareFixedFdMmap(
         p0,
         dest_fd,
         target_va,
         4096,
-        vmaProt(.{ .read = true }),
+        vmaProt(.{ .read = true, .write = true }),
         mmapFlags(.{ .fixed = true, .private = true }),
         0,
         &free_list,
@@ -3112,6 +3457,82 @@ test "fixed mmap middle cut fails atomically with only one spare vma slot" {
     try std.testing.expect(!table.entries[spare_index].active);
     try std.testing.expectEqual(source_refs, s.nativeVmoRefCount(source_vmo));
     try std.testing.expectEqual(dest_refs, s.nativeVmoRefCount(dest_vmo));
+}
+
+test "shared fixed mmap retains aliases offsets and neighbors through fd close" {
+    for ([_]kernel.MmapFlags{ .{ .fixed = true, .shared = true }, .{ .fixed = true } }) |flags| {
+        var s = try initFdState();
+        var free_list = FreePageList{};
+        const rw = vmaProt(.{ .read = true, .write = true });
+        const va: u64 = 0x5500_0000;
+        const fd = try s.createAnonymousVmoFd(p0, 3 * 4096, fdRights(.{ .map_read = true, .map_write = true, .close = true }), .{}, 16);
+        const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+        try s.installNativeVmoPages(vmo, 0, &.{ 0x1000, 0x2000, 0x3000 });
+        _ = try s.mmapFd(p0, fd, va, 3 * 4096, rw, .{ .shared = true }, 0);
+        _ = try s.mmapFd(p0, fd, va + 0x10000, 3 * 4096, rw, .{ .shared = true }, 0);
+        var prepared = try s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, flags, 8192, &free_list);
+        s.commitFixedMmapPrepared(&prepared, &free_list);
+        try s.closeFdWithFreeList(p0, fd, &free_list);
+        const replacement = s.nativeVmaFaultMapping(p0, va + 4096, true, false) orelse unreachable;
+        const alias = s.nativeVmaFaultMapping(p0, va + 0x10000 + 8192, true, false) orelse unreachable;
+        try std.testing.expectEqual(@as(u64, 0x3000), replacement.paddr);
+        try std.testing.expectEqual(alias.paddr, replacement.paddr);
+        try std.testing.expect(replacement.prot.write and alias.prot.write);
+        try std.testing.expectEqual(@as(u64, 0x1000), (s.nativeVmaFaultMapping(p0, va, false, false) orelse unreachable).paddr);
+        try std.testing.expectEqual(@as(u64, 0x3000), (s.nativeVmaFaultMapping(p0, va + 8192, false, false) orelse unreachable).paddr);
+        try std.testing.expectEqual(@as(?u32, 4), s.nativeVmoRefCount(vmo));
+    }
+}
+
+test "remote fixed mapping resolves only caller capabilities and preserves peer aliases" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const va: u64 = 0x5700_0000;
+    const fd = try s.createAnonymousVmoFd(p0, 8192, fdRights(.{ .map_read = true, .map_write = true, .close = true }), .{}, 16);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    try s.installNativeVmoPages(vmo, 0, &.{ 0x1000, 0x2000 });
+    _ = try s.mmapFdIntoProcess(p0, fd, p1, va, 8192, rw, .{ .shared = true }, 0);
+    _ = try s.mmapFd(p0, fd, va, 8192, rw, .{ .shared = true }, 0);
+    try std.testing.expect(s.fdEntryConst(p1, fd) == null);
+    const before = (s.vmaEntryConst(p1, va) orelse unreachable).*;
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmapIntoProcess(p1, fd, p1, va, 4096, rw, .{ .shared = true }, 4096, &free_list));
+    try std.testing.expectEqualDeep(before, (s.vmaEntryConst(p1, va) orelse unreachable).*);
+    var prepared = try s.prepareFixedFdMmapIntoProcess(p0, fd, p1, va, 4096, rw, .{ .shared = true }, 4096, &free_list);
+    s.commitFixedMmapPrepared(&prepared, &free_list);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(u64, 0x2000), s.nativeVmaFaultMapping(p1, va, true, false).?.paddr);
+    try std.testing.expectEqual(@as(u64, 0x1000), s.nativeVmaFaultMapping(p0, va, true, false).?.paddr);
+    var removal = try s.prepareMunmapRangeWithFreeList(p1, va, 4096, &free_list);
+    s.commitMunmapPrepared(&removal, &free_list);
+    try std.testing.expect(s.nativeVmaFaultMapping(p1, va, false, false) == null);
+    try std.testing.expectEqual(@as(u64, 0x2000), s.nativeVmaFaultMapping(p1, va + 4096, true, false).?.paddr);
+    try std.testing.expectEqual(@as(u64, 0x1000), s.nativeVmaFaultMapping(p0, va, true, false).?.paddr);
+}
+
+test "shared fixed mmap preflight failures leave old backing intact" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const va: u64 = 0x5600_0000;
+    const rw = vmaProt(.{ .read = true, .write = true });
+    const old = try s.createAnonymousVmaWithPages(p0, va, 3 * 4096, rw, rw, .{ .anonymous = true, .private = true }, &free_list);
+    const original = (s.vmaEntryConst(p0, va) orelse unreachable).*;
+    const fd = try s.createAnonymousVmoFd(p0, 3 * 4096, fdRights(.{ .map_read = true, .map_write = true }), .{}, 16);
+    const vmo = s.nativeVmoRefForFd(p0, fd) orelse unreachable;
+    const flags = mmapFlags(.{ .fixed = true, .shared = true });
+    // Missing backing, out-of-range offsets, denied execute and malformed flags.
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, flags, 0, &free_list));
+    try s.installNativeVmoPages(vmo, 0, &.{ 0x1000, 0x2000, 0x3000 });
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, flags, 3 * 4096, &free_list));
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, .{ .read = true, .exec = true }, flags, 0, &free_list));
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, .{ .private = true, .shared = true }, 0, &free_list));
+    try std.testing.expectEqual(original, (s.vmaEntryConst(p0, va) orelse unreachable).*);
+    const table = s.getVmaTable(p0) orelse unreachable;
+    fillVmaTableExcept(table, &.{1});
+    try std.testing.expectError(KernelError.TableFull, s.prepareFixedFdMmap(p0, fd, va + 4096, 4096, rw, flags, 4096, &free_list));
+    try std.testing.expectEqual(original, (s.vmaEntryConst(p0, va) orelse unreachable).*);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(old));
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(vmo));
 }
 
 test "fixed mmap validation and discard preserve the old mapping" {

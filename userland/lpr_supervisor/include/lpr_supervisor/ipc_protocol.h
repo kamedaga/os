@@ -12,6 +12,7 @@ enum {
     LPRS_PAYLOAD_BYTES = PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES,
     LPRS_CTTY_BYTES = 64u,
     LPRS_CWD_BYTES = 480u,
+    LPRS_MAX_GROUPS = 64u, /* Reject oversized memberships, never truncate. */
     LPRS_PROCESS_STATE_SIGCHLD_PENDING = 1ull << 0,
     LPRS_PROCESS_STATE_HAS_CHILDREN = 1ull << 1,
     LPRS_PROCESS_LIST_CAPACITY = (LPRS_PAYLOAD_BYTES - 32u) / 8u,
@@ -28,32 +29,34 @@ enum {
      * CALL/INSPECT/CLOSE, PRIVATE|CLOEXEC unixd capability. Repeated calls
      * refer to the same process session, including after self-exec. */
     LPRS_OP_PROCESS_UNIX_SESSION = 4u,
-    LPRS_OP_PROCESS_GET_STATE = 5u,
-    LPRS_OP_PROCESS_LIST = 6u,
-    LPRS_OP_PROCESS_FORK_BEGIN = 7u,
-    LPRS_OP_PROCESS_FORK_CANCEL = 8u,
-    LPRS_OP_PROCESS_FORK_PARENT_REGISTER = 9u,
-    LPRS_OP_PROCESS_FORK_CHILD_READY = 10u,
-    LPRS_OP_PROCESS_EXEC_PREPARE = 11u,
-    LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN = 12u,
-    LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL = 13u,
-    LPRS_OP_PROCESS_EXEC_COMMIT_DONE = 14u,
-    LPRS_OP_PROCESS_SET_COMM = 15u,
-    LPRS_OP_PROCESS_QUERY = 16u,
-    LPRS_OP_PROCESS_DIAG_ATTACH = 17u,
-    LPRS_OP_PROCESS_WAIT4 = 18u,
-    LPRS_OP_PROCESS_SETPGID = 19u,
-    LPRS_OP_PROCESS_SETSID = 20u,
-    LPRS_OP_PROCESS_GETPGID = 21u,
-    LPRS_OP_PROCESS_GETSID = 22u,
-    LPRS_OP_PROCESS_SET_PDEATHSIG = 23u,
-    LPRS_OP_PROCESS_GET_PDEATHSIG = 24u,
-    LPRS_OP_SIGNAL_KILL = 25u,
-    LPRS_OP_SIGNAL_DELIVER_TTY = 26u,
-    LPRS_OP_CWD_GET = 27u,
-    LPRS_OP_CWD_SET = 28u,
-    LPRS_OP_DIAG_DUMP = 29u,
-    LPRS_OP_DIAG_ERROR_GET = 30u,
+    LPRS_OP_PROCESS_FILED_SESSION = 5u,
+    LPRS_OP_PROCESS_GET_STATE = 6u,
+    LPRS_OP_PROCESS_CREDENTIALS = 7u,
+    LPRS_OP_PROCESS_LIST = 8u,
+    LPRS_OP_PROCESS_FORK_BEGIN = 9u,
+    LPRS_OP_PROCESS_FORK_CANCEL = 10u,
+    LPRS_OP_PROCESS_FORK_PARENT_REGISTER = 11u,
+    LPRS_OP_PROCESS_FORK_CHILD_READY = 12u,
+    LPRS_OP_PROCESS_EXEC_PREPARE = 13u,
+    LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN = 14u,
+    LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL = 15u,
+    LPRS_OP_PROCESS_EXEC_COMMIT_DONE = 16u,
+    LPRS_OP_PROCESS_SET_COMM = 17u,
+    LPRS_OP_PROCESS_QUERY = 18u,
+    LPRS_OP_PROCESS_DIAG_ATTACH = 19u,
+    LPRS_OP_PROCESS_WAIT4 = 20u,
+    LPRS_OP_PROCESS_SETPGID = 21u,
+    LPRS_OP_PROCESS_SETSID = 22u,
+    LPRS_OP_PROCESS_GETPGID = 23u,
+    LPRS_OP_PROCESS_GETSID = 24u,
+    LPRS_OP_PROCESS_SET_PDEATHSIG = 25u,
+    LPRS_OP_PROCESS_GET_PDEATHSIG = 26u,
+    LPRS_OP_SIGNAL_KILL = 27u,
+    LPRS_OP_SIGNAL_DELIVER_TTY = 28u,
+    LPRS_OP_CWD_GET = 29u,
+    LPRS_OP_CWD_SET = 30u,
+    LPRS_OP_DIAG_DUMP = 31u,
+    LPRS_OP_DIAG_ERROR_GET = 32u,
 };
 
 enum {
@@ -126,6 +129,15 @@ typedef struct lprs_token_request {
     uint64_t token;
 } lprs_token_request_t;
 
+/* Linux compatibility attributes, not native capability authority. Only the
+ * supervisor owns these values; state requests never change them. */
+typedef struct lprs_credentials {
+    uint32_t uid, euid, suid;
+    uint32_t gid, egid, sgid;
+    uint32_t group_count, reserved;
+    uint32_t groups[LPRS_MAX_GROUPS];
+} lprs_credentials_t;
+
 typedef struct lprs_process_state {
     uint64_t token;
     uint64_t generation;
@@ -134,6 +146,9 @@ typedef struct lprs_process_state {
     uint64_t ppid;
     uint64_t sid;
     uint64_t pgrp;
+    lprs_credentials_t credentials;
+    uint32_t filed_rights;
+    uint32_t credential_rights;
     uint64_t foreground_pgrp;
     uint64_t cwd_handle;
     uint64_t flags;
@@ -143,7 +158,30 @@ typedef struct lprs_process_state {
 
 typedef struct lprs_register_exec {
     lprs_process_state_t state;
+    /* Trusted launch endpoint only. Empty names and unknown rights fail closed. */
+    char account[64];
+    uint32_t filed_rights;
+    uint32_t credential_rights;
 } lprs_register_exec_t;
+
+enum {
+    LPRS_CREDENTIAL_SETUID = 1u,
+    LPRS_CREDENTIAL_SETGID = 2u,
+    LPRS_CREDENTIAL_READ = 0u,
+    LPRS_CREDENTIAL_UID = 1u,
+    LPRS_CREDENTIAL_GID = 2u,
+    LPRS_CREDENTIAL_REUID = 3u,
+    LPRS_CREDENTIAL_REGID = 4u,
+    LPRS_CREDENTIAL_RESUID = 5u,
+    LPRS_CREDENTIAL_RESGID = 6u,
+    LPRS_CREDENTIAL_GROUPS = 7u,
+};
+typedef struct lprs_credential_request {
+    uint64_t token;
+    uint32_t operation;
+    uint32_t ids[3];
+    lprs_credentials_t credentials; /* groups input; full authoritative output */
+} lprs_credential_request_t;
 
 typedef struct lprs_process_list {
     uint64_t token;
@@ -212,7 +250,8 @@ typedef struct lprs_diag_error_get {
     uint64_t token;
 } lprs_diag_error_get_t;
 
-_Static_assert(sizeof(lprs_process_state_t) == 624, "lprs_process_state size");
+_Static_assert(sizeof(lprs_credentials_t) == 288, "lprs_credentials size");
+_Static_assert(sizeof(lprs_process_state_t) == 920, "lprs_process_state size");
 _Static_assert(sizeof(lprs_process_list_t) == LPRS_PAYLOAD_BYTES,
     "lprs_process_list fills payload");
 _Static_assert(sizeof(lprs_fork_t) == 48, "lprs_fork size");

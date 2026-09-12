@@ -46,6 +46,8 @@ void lpr_linux_apply_pending_fork_child(void)
     lpr_linux_current_ppid = child_ppid;
     lpr_linux_current_sid = child_sid > 0 ? child_sid : child_pid;
     lpr_linux_current_pgrp = child_pgrp > 0 ? child_pgrp : child_pid;
+    /* The immutable credential snapshot is inherited with the process image,
+     * matching the supervisor's fork copy. Exec reloads it from GET_STATE. */
     lpr_linux_pending_child_pid = 0;
     lpr_linux_pending_child_ppid = 0;
     lpr_linux_pending_child_sid = 0;

@@ -113,6 +113,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
     end = maxStaticEnd(end, vtd.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, pci.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
@@ -187,6 +188,7 @@ pub export fn restoreCurrentThreadXState() callconv(.c) void {
 fn installInterruptTrampolines() void {
     x86_platform.installInterruptTrampolines(.{
         .divide_error_stub = @intFromPtr(&traps.divideErrorHandlerStub),
+        .breakpoint_stub = @intFromPtr(&traps.breakpointHandlerStub),
         .page_fault_stub = @intFromPtr(&traps.pageFaultHandlerStub),
         .general_protection_stub = @intFromPtr(&traps.generalProtectionHandlerStub),
         .double_fault_stub = @intFromPtr(&traps.doubleFaultHandlerStub),
@@ -245,6 +247,7 @@ fn initKernelRuntimeOrHalt() void {
         kernel_log.write("pku: ");
         kernel_log.write(if (pku_enabled) "enabled\n" else "unavailable\n");
         x86_platform.hardenKernelMappingsSupervisorOnly();
+        pci.initEcam(boot_rsdp_paddr);
     }
     x86_platform.loadGdtAndReloadSegments();
     installInterruptTrampolines();
@@ -910,6 +913,11 @@ pub fn bootWithResources(resources: BootResources) noreturn {
     kernel_log.writeOnly("boot: bootWithResources entry\n");
     kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
+    const highres_ready = @import("../realtime_clock.zig").initializeHighResolution(
+        boot_rsdp_paddr,
+        smp.ucMinusMmioAllowed,
+    );
+    kernel_log.write(if (highres_ready) "clock: monotonic=hpet deadline=lapic high-resolution=1\n" else "clock: monotonic=tick high-resolution=0\n");
     vtd.init(boot_rsdp_paddr, kernel_runtime.global_free_list);
     kernel_log.write("boot: discover devices\n");
     var devices = discoverDevices();
@@ -956,6 +964,9 @@ fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *
                 const resource_id = pci.resourceIdFromLocation(loc);
                 if (!pci.registerInterruptRoute(resource_id, descriptor_index.*)) {
                     halt.haltWithMessage("PCI interrupt route registration failed");
+                }
+                if (!pci.captureBarApertures(resource_id, descriptor_index.*)) {
+                    halt.haltWithMessage("PCI BAR aperture capture failed");
                 }
                 appendDetectedDevice(&result.devices, .{
                     .descriptor = descriptorFromPciFunction(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),

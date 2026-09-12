@@ -644,8 +644,7 @@ pub fn commitNativeVmaFaultMapping(
             const slot = self.nativeVmoSlotConst(entry.vmo);
             kernel_log.writeFmt(
                 "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s}\n",
-                .{ @intFromEnum(owner), plan.fault_page_va, vmo_page,
-                    if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
+                .{ @intFromEnum(owner), plan.fault_page_va, vmo_page, if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
             );
             return null;
         };
@@ -1265,6 +1264,49 @@ pub fn userMapRangeIsFree(
         !self.rangeOverlapsPinnedUserObject(owner, start_va, size_bytes);
 }
 
+/// Read-only admission check for a BAR overlay. The caller must hold the VM
+/// transaction through PTE publication and separately reject existing PTEs.
+/// Keep these VMAs in place during the lease: they reserve the address both
+/// before publication and after last-close, without an allocator-visible hole.
+pub fn userRangeIsUnbackedMmioReservation(
+    self: anytype,
+    owner: PrincipalId,
+    start_va: u64,
+    size_bytes: u64,
+) bool {
+    if (start_va == 0 or !@TypeOf(self.*).isPageAligned(start_va) or
+        !@TypeOf(self.*).isPageAligned(size_bytes)) return false;
+    const end_va = checkedEnd(start_va, size_bytes) catch return false;
+    if (self.rangeOverlapsPinnedUserObject(owner, start_va, size_bytes)) return false;
+
+    var cursor = start_va;
+    while (cursor < end_va) {
+        const entry = self.vmaEntryForVaConst(owner, cursor) orelse return false;
+        if (!entry.flags.anonymous or !entry.flags.private or entry.flags.shared or
+            !entry.flags.noreserve or entry.flags.fork_cow or
+            !entry.cow_table.isNull() or
+            entry.prot.read or entry.prot.write or entry.prot.exec or entry.prot.pkey != 0)
+            return false;
+        const vmo = self.nativeVmoSlotConst(entry.vmo) orelse return false;
+        if (vmo.kind != .anonymous or !vmo.parent.isNull()) return false;
+        const part_end = @min(end_va, entry.endVa());
+        const offset = std.math.add(u64, entry.vmo_offset, cursor - entry.start_va) catch return false;
+        const length = part_end - cursor;
+        if (!@TypeOf(self.*).isPageAligned(offset) or
+            offset > vmo.size_bytes or length > vmo.size_bytes - offset) return false;
+        var page: usize = @intCast(offset / native_page_size);
+        const end_page: usize = @intCast((offset + length) / native_page_size);
+        while (page < end_page) : (page += 1) {
+            const paddr = self.nativeVmoPagePaddrOrHole(entry.vmo, page) orelse return false;
+            // mprotect(NONE) does not turn used anonymous RAM into a virgin
+            // reservation; replacing it would silently discard its contents.
+            if (paddr != 0) return false;
+        }
+        cursor = part_end;
+    }
+    return true;
+}
+
 pub fn vmaProtAllowedByRights(prot: VmaProt, rights: FdRights) bool {
     if (prot.read and !rights.map_read) return false;
     if (prot.write and !rights.map_write) return false;
@@ -1279,6 +1321,16 @@ pub fn vmaMaxProtForRights(rights: FdRights, pkey: u4) VmaProt {
         .exec = rights.map_exec,
         .pkey = pkey,
     };
+}
+
+fn maxProtForFdMapping(rights: FdRights, flags: MmapFlags) VmaProt {
+    var max_prot = vmaMaxProtForRights(rights, flags.pkey);
+    // Reading a backing permits modifying one's own copy, not the shared
+    // object. Only this mapping mode goes through non-anonymous private COW.
+    // Shared/default mappings still require map_write; exec is independent.
+    if (rights.map_read and flags.private and !flags.shared and !flags.anonymous)
+        max_prot.write = true;
+    return max_prot;
 }
 
 pub fn vmaProtAllowedByMax(prot: VmaProt, max_prot: VmaProt) bool {
@@ -1580,8 +1632,8 @@ pub fn mmapFd(
     vmo_offset: u64,
 ) KernelError!u64 {
     const fd_entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
-    if (!@TypeOf(self.*).vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
-    const max_prot = @TypeOf(self.*).vmaMaxProtForRights(fd_entry.rights, flags.pkey);
+    const max_prot = maxProtForFdMapping(fd_entry.rights, flags);
+    if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
         .vmo => |ref| ref,
@@ -1605,8 +1657,8 @@ pub fn mmapFdIntoProcess(
     _ = try self.fdTableForActiveProcessConst(source_owner);
     try self.requireActiveProcess(target_owner);
     const fd_entry = self.fdEntryConst(source_owner, fd) orelse return KernelError.InvalidState;
-    if (!@TypeOf(self.*).vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
-    const max_prot = @TypeOf(self.*).vmaMaxProtForRights(fd_entry.rights, flags.pkey);
+    const max_prot = maxProtForFdMapping(fd_entry.rights, flags);
+    if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
         .vmo => |ref| ref,
@@ -1915,11 +1967,28 @@ pub fn prepareFixedFdMmap(
     vmo_offset: u64,
     free_list: *FreePageList,
 ) KernelError!FixedMmapPrepared {
-    if (flags.anonymous or !flags.private or flags.shared) return KernelError.InvalidState;
+    return prepareFixedFdMmapIntoProcess(self, owner, fd, owner, start_va, size_bytes, prot, flags, vmo_offset, free_list);
+}
+
+/// The caller holds both owners' VM transaction locks. The source capability
+/// stays in source_owner; only its authorized mapping enters target_owner.
+pub fn prepareFixedFdMmapIntoProcess(
+    self: anytype,
+    source_owner: PrincipalId,
+    fd: Fd,
+    target_owner: PrincipalId,
+    start_va: u64,
+    size_bytes: u64,
+    prot: VmaProt,
+    flags: MmapFlags,
+    vmo_offset: u64,
+    free_list: *FreePageList,
+) KernelError!FixedMmapPrepared {
+    if (flags.anonymous or (flags.private and flags.shared)) return KernelError.InvalidState;
     if (!@TypeOf(self.*).isPageAligned(vmo_offset)) return KernelError.InvalidState;
-    const fd_entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
-    if (!@TypeOf(self.*).vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
-    const max_prot = @TypeOf(self.*).vmaMaxProtForRights(fd_entry.rights, flags.pkey);
+    const fd_entry = self.fdEntryConst(source_owner, fd) orelse return KernelError.InvalidState;
+    const max_prot = maxProtForFdMapping(fd_entry.rights, flags);
+    if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
         .vmo => |ref| ref,
@@ -1930,7 +1999,18 @@ pub fn prepareFixedFdMmap(
     if (vmo_end > vmo.size_bytes or !@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) {
         return KernelError.InvalidState;
     }
-    var prepared = try prepareFixedMmapSlots(self, owner, start_va, size_bytes, free_list);
+    // Shared/default mappings retain the same fully backed pages as mmapFd.
+    // Unlike anonymous faults, file-VMO faults cannot allocate absent pages.
+    // Reject sparse backing before reserving slots or removing the old view.
+    if (!flags.private) {
+        if (!@TypeOf(self.*).isPageAligned(size_bytes)) return KernelError.InvalidState;
+        var offset = vmo_offset;
+        while (offset < vmo_end) : (offset += native_page_size) {
+            _ = self.nativeVmoResolvedPagePaddr(vmo_ref, @intCast(offset / native_page_size)) orelse
+                return KernelError.InvalidState;
+        }
+    }
+    var prepared = try prepareFixedMmapSlots(self, target_owner, start_va, size_bytes, free_list);
     errdefer discardFixedMmapPrepared(self, &prepared, free_list);
     try self.retainNativeVmo(vmo_ref);
     prepared.destination = .{

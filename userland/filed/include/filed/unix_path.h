@@ -9,9 +9,13 @@ struct filed_unix_path {
     uint64_t magic, operation, directory, mode;
     uint64_t hold, filesystem, inode;
     int64_t status;
+    /* Set by unixd from its manager-authenticated session, never its caller. */
+    uint64_t generation;
+    int32_t pid;
+    uint32_t reserved;
     char path[109];
 };
-_Static_assert(sizeof(struct filed_unix_path) == 176, "private UNIX pathname wire");
+_Static_assert(sizeof(struct filed_unix_path) == 192, "private UNIX pathname wire");
 struct filed_runtime;
 int filed_unix_path_receive(struct filed_runtime *runtime);
 void filed_unix_path_disconnect(struct filed_runtime *runtime);

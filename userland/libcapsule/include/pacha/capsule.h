@@ -32,8 +32,23 @@ enum {
     PACHA_CAPSULE_BAR_64BIT = 1ull << 3,
 
     PACHA_CAPSULE_MMIO_REPLACE_EXISTING = 1ull << 0,
+    PACHA_CAPSULE_MMIO_READ_ONLY = 1ull << 1,
+    PACHA_CAPSULE_MMIO_CACHE_UC = 0ull << 2,
+    PACHA_CAPSULE_MMIO_CACHE_UC_MINUS = 1ull << 2,
+    PACHA_CAPSULE_MMIO_CACHE_WC = 2ull << 2,
+    PACHA_CAPSULE_MMIO_CACHE_WB = 3ull << 2,
+    PACHA_CAPSULE_MMIO_CACHE_WT = 4ull << 2,
+    PACHA_CAPSULE_MMIO_CACHE_WP = 5ull << 2,
 
     PACHA_CAPSULE_DMA_IOVA_KERNEL_CHOOSE = UINT64_MAX,
+
+    /* Terminal domain failure: stop all DMA users before releasing or
+     * repurposing their RAM. Query the device also after a failed derive. */
+    PACHA_CAPSULE_DMA_QUARANTINED = UINT64_C(1) << 32,
+    /* Required for an isolated DMA host contract. Equal CPU/device addresses
+     * alone are not evidence of isolation. Absent on a quarantined device. */
+    PACHA_CAPSULE_DMA_TRANSLATED = UINT64_C(1) << 33,
+    PACHA_CAPSULE_IRQ_RETIRED = UINT64_C(1) << 34,
 
     PACHA_CAPSULE_IRQ_CURRENT_COUNT = UINT64_MAX,
 };
@@ -77,6 +92,12 @@ struct pacha_capsule_irq {
     uint64_t count;
 };
 
+struct pacha_capsule_irq_route {
+    uint64_t message_address;
+    uint64_t message_data;
+    uint64_t hwirq;
+};
+
 int pacha_capsule_is_fd(int fd);
 int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rights);
 
@@ -89,6 +110,9 @@ int pacha_capsule_pci_config_write(int device_fd, uint16_t offset, unsigned widt
 int pacha_capsule_pci_bar_info(int device_fd, unsigned bar, struct pacha_capsule_bar_info *out);
 
 int pacha_capsule_derive_mmio(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags);
+/* page_offset is relative to the page containing BAR start, not a physical
+ * address. Unsupported cache types fail; they are never silently substituted. */
+int pacha_capsule_derive_mmio_range(int device_fd, unsigned bar, void *addr, size_t len, uint64_t flags, uint64_t page_offset);
 int pacha_capsule_derive_dma_buffer(int device_fd, void *addr, uint64_t iova, size_t len, uint64_t flags);
 int pacha_capsule_derive_dma_mapping(int device_fd, void *addr, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
 /* Returns one DMA-mapping fd. out_page_dma[0] addresses user_va exactly;
@@ -96,6 +120,11 @@ int pacha_capsule_derive_dma_mapping(int device_fd, void *addr, uint64_t iova, s
  * range mapped and unchanged until the returned fd is closed. */
 int pacha_capsule_derive_dma_mapping_pages(int device_fd, void *user_va, size_t size, unsigned direction, uint64_t *out_page_dma, size_t out_capacity_entries);
 int pacha_capsule_derive_dma_mapping_from_buffer(int dma_buffer_fd, uint64_t iova, size_t len, unsigned direction, uint64_t flags);
+/* Requires DERIVE_DMA and BUS_MASTER. Controls the shared device domain,
+ * including mappings created through other aliases. Disable retains mapping
+ * FDs/IOVAs and synchronously drains DMA; failure is not a completed stop.
+ * Only isolated legacy VT-d domains with read/write drain are supported. */
+int pacha_capsule_dma_set_enabled(int device_fd, unsigned enabled);
 int pacha_capsule_derive_irq(int device_fd, unsigned kind, unsigned vector, uint64_t flags);
 
 int pacha_capsule_mmio_from_fd(int mmio_fd, struct pacha_capsule_mmio *out);
@@ -103,6 +132,16 @@ int pacha_capsule_mmio_mapping(int mmio_fd, void **addr, size_t *len);
 int pacha_capsule_dma_from_fd(int dma_fd, struct pacha_capsule_dma *out);
 int pacha_capsule_dma_mapping(int dma_fd, void **addr, size_t *len, uint64_t *iova);
 int pacha_capsule_irq_from_fd(int irq_fd, struct pacha_capsule_irq *out);
+int pacha_capsule_irq_route(int irq_fd, struct pacha_capsule_irq_route *out);
+/* Explicit MSI/MSI-X routes only. Both operations require IRQ_ACK and keep
+ * the source physically masked. Failure retains the lease/FD; it may still
+ * have masked the source. Quiesce drains without dropping the route.
+ * Retire ends the shared object, including dup/transfer aliases: WAIT_MANY
+ * reports HANGUP and route/poll/control operations report CLOSED. Closing an
+ * old alias never touches a replacement route. Caller must stop the device's
+ * interrupt source and synchronize its userspace collector/handlers first. */
+int pacha_capsule_irq_quiesce(int irq_fd);
+int pacha_capsule_irq_retire(int irq_fd);
 int pacha_capsule_irq_poll(int irq_fd, uint64_t last_count, uint64_t *out_count);
 int pacha_capsule_irq_wait(int irq_fd, uint64_t last_count, uint64_t *out_count);
 

@@ -15,6 +15,7 @@ const max_ipc_wake_threads = kernel.max_ipc_waiters;
 fn mapError(err: kernel.KernelError) u64 {
     return switch (err) {
         kernel.KernelError.MailboxEmpty => sc.syscall_err_empty,
+        kernel.KernelError.MailboxFull => sc.syscall_err_not_ready,
         kernel.KernelError.TableFull => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };

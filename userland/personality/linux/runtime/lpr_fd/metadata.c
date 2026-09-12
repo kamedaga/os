@@ -66,7 +66,7 @@ static int64_t lpr_linux_file_vmo_call(
 
     const int64_t call_reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         (uint64_t)(uintptr_t)&request);
     if (call_reply_fd < 16) {
         lpr_destroy_pread_vmo_wire_page(page_fd, page);

@@ -13,6 +13,7 @@ tools/*
 !tools/build_wsl_libinput_smoke.sh
 !tools/build_wsl_alpine_sway.sh
 !tools/build_wsl_alpine_xfce.sh
+!tools/build_dbus_system_config.sh
 !tools/rootfs_overlay.py
 !tools/manifests/
 tools/manifests/*

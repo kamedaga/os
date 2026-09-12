@@ -9,7 +9,7 @@ pub const two_mib: u64 = x86_platform.two_mib;
 pub const page_entries: usize = x86_platform.page_entries;
 
 pub const user_va: u64 = 0x20000000;
-pub const user_low_va: u64 = 0x00400000;
+pub const user_low_va: u64 = 0x00010000;
 pub const user_elf_base_va: u64 = user_va;
 pub const user_stack_top: u64 = process_abi.default_stack_top_va;
 pub const initial_user_stack_pages: usize = 16;

@@ -301,6 +301,7 @@ fn asmExceptionWithErrorHandlerBody(comptime vec_number: u64) []const u8 {
             \\and $0x3, %rax
             \\cmp $0x3, %rax
             \\jne 1f
+        , .{}) ++ asmCallAligned("saveCurrentThreadXState") ++ std.fmt.comptimePrint(
             \\mov ${d}, %rcx
             \\mov %r12, %rdx
         , .{vec_number}) ++
@@ -631,6 +632,13 @@ pub export fn exceptionWithErrorCommon(vec: u64, frame: *const ExceptionTrapFram
 
 pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const ExceptionTrapFrame) callconv(.winapi) void {
     asm volatile ("cli");
+    var context: TrapFrame = undefined;
+    inline for (std.meta.fields(TrapFrame)) |field| @field(context, field.name) = @field(frame, field.name);
+    const address = if (vec == 14) asm volatile ("mov %%cr2, %[value]" : [value] "=r" (-> u64)) else 0;
+    if (stageFaultForUserReturn(vec, frame.error_code, address, &context)) {
+        fatalExceptionResumeWorkFrameForCurrentCpuFromAsm().* = context;
+        return;
+    }
     writeExceptionWithErrorSummary(vec, frame);
     kernel_log.write("  ACTION=terminate process\n");
     resumeAfterFatalUserException(
@@ -688,10 +696,22 @@ pub export fn divideErrorHandlerCommon(frame: *const TrapFrame) callconv(.winapi
     halt.haltLoop();
 }
 
+pub export fn breakpointHandlerCommon(frame: *const TrapFrame) callconv(.winapi) noreturn {
+    asm volatile ("cli");
+    writeTrapSummary("BREAKPOINT", frame);
+    halt.haltLoop();
+}
+
 pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(.winapi) void {
     asm volatile ("cli");
+    var context = frame.*;
+    if (stageFaultForUserReturn(vec, 0, 0, &context)) {
+        fatalExceptionResumeWorkFrameForCurrentCpuFromAsm().* = context;
+        return;
+    }
     const label = switch (vec) {
         0 => "DIVIDE ERROR",
+        3 => "BREAKPOINT",
         6 => "INVALID OPCODE",
         else => "TRAP",
     };
@@ -719,7 +739,8 @@ comptime {
     if (@sizeOf(NativeSignalFrame) != process_abi.signal_frame_size) @compileError("native signal frame size mismatch");
 }
 
-fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
+pub fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
+    if ((frame.cs & 3) != 3 or (frame.ss & 3) != 3) return;
     const claimed = scheduler.claimCurrentSignalForUserReturn(frame.rip) orelse return;
     const stack_cost = process_abi.signal_red_zone_size +
         process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
@@ -754,6 +775,42 @@ fn stagePendingSignalForUserReturn(frame: *TrapFrame) void {
     frame.rsp = signal_frame_va - process_abi.signal_runtime_stack_size;
 }
 
+fn stageFaultForUserReturn(vector: u64, error_code: u64, address: u64, frame: *TrapFrame) bool {
+    const delivery = scheduler.claimCurrentFault() orelse return false;
+    const FaultFrame = extern struct {
+        signal: NativeSignalFrame,
+        vector: u64,
+        error_code: u64,
+        address: u64,
+    };
+    comptime std.debug.assert(@sizeOf(FaultFrame) == process_abi.fault_frame_size);
+    var fault: FaultFrame = .{
+        .signal = .{
+            .magic = process_abi.signal_frame_magic,
+            .size = process_abi.fault_frame_size,
+            .signo = 0,
+            .reserved0 = process_abi.signal_xstate_feature_mask,
+            .context = frame.*,
+            .x_state = undefined,
+        },
+        .vector = vector,
+        .error_code = error_code,
+        .address = address,
+    };
+    if (!scheduler.copyCurrentSignalXState(&fault.signal.x_state) or
+        !user_copy.copyBytesToUserVa(scheduler.currentPrincipal(), delivery.frame_va, std.mem.asBytes(&fault)))
+    {
+        _ = scheduler.completeCurrentFault(delivery.frame_va);
+        return false;
+    }
+    frame.rdi = delivery.frame_va;
+    frame.rip = delivery.entry;
+    // Dedicated stack grows below the saved frame. Registration reserves a
+    // full runtime stack below this pointer; do not skip that usable space.
+    frame.rsp = delivery.frame_va;
+    return true;
+}
+
 fn deliverExpiredProcessSignalTimers(now_tick: u64) void {
     while (scheduler.takeExpiredProcessSignalTimer(now_tick)) |expired| {
         const delivery = scheduler.deliverSignal(
@@ -777,11 +834,14 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             if (!scheduler.apUserThreadCanContinue()) {
                 smp.returnCurrentApToIdleFromInterrupt();
             }
+            // Stage pending state in the outgoing frame before preemption
+            // transfers CPU ownership. AP redispatch also stages signals
+            // which arrive after this snapshot or while the thread is idle.
+            stagePendingSignalForUserReturn(frame);
             switch (scheduler.preemptApUserThread(boot_static.scheduler_slice_ticks, frame)) {
                 .continue_running => {},
                 .preempt, .invalid => smp.returnCurrentApToIdleFromInterrupt(),
             }
-            stagePendingSignalForUserReturn(frame);
             _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
             return;
         }
@@ -792,12 +852,18 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
         _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
         return;
     }
-    // BSP owns the 1 ms monotonic/timeouts clock.  Software rearming keeps
-    // that ABI while avoiding periodic timers on idle APs.
-    _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count));
-    scheduler.lapic_tick_count +%= 1;
+    const clock = @import("realtime_clock.zig");
+    const clockevent = @import("clockevent.zig");
+    const now_ns = clock.monotonicNs();
+    const next_tick = if (now_ns) |now| now / 1_000_000 else scheduler.lapic_tick_count +% 1;
+    const tick_elapsed = next_tick > scheduler.lapic_tick_count;
+    if (tick_elapsed) scheduler.lapic_tick_count = next_tick;
+    defer clockevent.rearm();
     @import("realtime_clock.zig").updateFromBootstrapTimer();
     if (!kernel_runtime.kernel_state_ready) return;
+    syscalls.completePendingTimerFdWaitersFromInterrupt(now_ns orelse next_tick *| 1_000_000);
+    // A sub-ms deadline IRQ is not a scheduler tick.
+    if (!tick_elapsed) return;
     deliverExpiredProcessSignalTimers(scheduler.lapic_tick_count);
     syscalls.completePendingIrqFdWaitersFromInterrupt();
     scheduler.wakeExpiredTimers(scheduler.lapic_tick_count);
@@ -809,6 +875,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
 }
 
 pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
+    defer smp.acknowledgeInterruptDrain();
     const active_vector = lapic.activeInterruptVectorInRange(
         device_interrupt_vector,
         device_interrupt_vector_count,
@@ -832,7 +899,9 @@ pub export fn deviceInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void 
 pub export fn schedulerMaintenanceIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
     _ = frame;
     user_copy.acknowledgePendingTlbShootdown();
+    @import("clockevent.zig").rearm();
     lapic.eoi();
+    smp.acknowledgeInterruptDrain();
 }
 
 pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void {
@@ -856,6 +925,7 @@ pub export fn schedulerWakeIpiDispatch(frame: *TrapFrame) callconv(.winapi) void
     // queued on this CPU.  Switch at the interrupt boundary instead of merely
     // returning to an unrelated user thread and waiting for its timeslice.
     _ = scheduler.handoffToBestReadyThreadForWakeIpi(frame);
+    stagePendingSignalForUserReturn(frame);
 }
 
 pub export fn pageFaultHandlerStub() callconv(.naked) noreturn {
@@ -1361,6 +1431,7 @@ pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
+    ++ asmCallAligned("saveCurrentThreadXState") ++
         \\mov $0, %rcx
         \\mov %r12, %rdx
     ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
@@ -1368,6 +1439,46 @@ pub export fn divideErrorHandlerStub() callconv(.naked) noreturn {
         \\1:
         \\mov %r12, %rcx
     ++ asmCallAligned("divideErrorHandlerCommon") ++
+        \\ud2
+    );
+}
+
+pub export fn breakpointHandlerStub() callconv(.naked) noreturn {
+    asm volatile (
+        \\push %r10
+        \\mov kernel_cr3_value(%rip), %r10
+        \\mov %r10, %cr3
+        \\pop %r10
+        \\push %rax
+        \\push %rbx
+        \\push %rcx
+        \\push %rdx
+        \\push %rsi
+        \\push %rdi
+        \\push %rbp
+        \\push %r8
+        \\push %r9
+        \\push %r10
+        \\push %r11
+        \\push %r12
+        \\push %r13
+        \\push %r14
+        \\push %r15
+    ++ asmCallAligned("trapFaultWorkFrameForCurrentCpuFromAsm") ++
+        \\mov %rax, %r12
+    ++ asmCopyStackFrameToWorkFramePointer(trap_frame_qword_count) ++
+        \\mov 128(%r12), %rax
+        \\and $0x3, %rax
+        \\cmp $0x3, %rax
+        \\jne 1f
+    ++ asmCallAligned("saveCurrentThreadXState") ++
+        \\mov $3, %rcx
+        \\mov %r12, %rdx
+    ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++
+        \\jmp userReturnToSavedFrame
+        \\1:
+        \\mov %r12, %rcx
+    ++ asmCallAligned("breakpointHandlerCommon") ++
         \\ud2
     );
 }
@@ -1400,6 +1511,7 @@ pub export fn invalidOpcodeHandlerStub() callconv(.naked) noreturn {
         \\and $0x3, %rax
         \\cmp $0x3, %rax
         \\jne 1f
+    ++ asmCallAligned("saveCurrentThreadXState") ++
         \\mov $6, %rcx
         \\mov %r12, %rdx
     ++ asmCallAligned("fatalUserTrapDispatch") ++ asmCallAligned("restoreCurrentThreadXState") ++ asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++ asmStageUserReturnFromWorkFramePointer(trap_frame_iret_offset) ++

@@ -6,6 +6,7 @@
 #include "filed/kobox_backend.h"
 #include "filed/tmpfs_internal.h"
 #include "filed/vfs.h"
+#include "filed/identity.h"
 
 enum {
     FILED_RUNTIME_MAX_SESSIONS = 32,
@@ -19,6 +20,7 @@ typedef struct filed_session {
     int page_fd;
     void *page;
     uint64_t page_size;
+    struct filed_client *client;
     uint8_t active;
 } filed_session_t;
 
@@ -29,6 +31,9 @@ typedef struct filed_runtime {
     filed_tmpfs_backend_t tmpfs;
     int bootstrap_fd;
     int client_endpoint_fd;
+    struct filed_client *clients;
+    struct filed_client *actor;
+    uint64_t client_sequence;
     int unix_path_fd;
     struct filed_unix_hold *unix_holds;
     uint64_t unix_hold_sequence;

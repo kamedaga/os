@@ -130,6 +130,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_input/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/bootstrap_state.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/capability.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_process/credentials.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/compat.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/control.c" \

@@ -1,0 +1,47 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef PACHA_KOBOX_DEVICE_DMA_H
+#define PACHA_KOBOX_DEVICE_DMA_H
+
+#include "boot/dma_host.h"
+
+struct ph_dma_mapping {
+    uint64_t iova;
+    size_t length;
+    int fd;
+};
+
+struct ph_dma_config {
+    int device_fd;
+    uint64_t native_device;
+    uint64_t generation;
+    void *ram;
+    size_t ram_length;
+    uint64_t aperture_start;
+    uint64_t aperture_end;
+    struct ph_dma_mapping *mappings;
+    size_t mapping_capacity;
+};
+
+struct ph_dma {
+    struct kobox_linux_dma_host host;
+    struct ph_dma_config config;
+    unsigned int admitted;
+    unsigned int enabled;
+    unsigned int drained;
+};
+
+/* Sandbox-local DMA port, initialized from a zeroed object. The bootstrap
+ * owner must validate the RAM capability and keep its direct mapping stable
+ * until destroy. The device grant exclusively names this translation domain;
+ * the aperture is the caller's authorized envelope, not a guessed HW limit.
+ * Device FD, RAM and preallocated inventory remain caller-owned. Mapping FDs
+ * are private to this port: never duplicate/transfer them, since close must
+ * mean last-close and synchronous invalidation. Linux serializes leaf calls;
+ * stop all callers before revoke/destroy. No allocation or Linux reentry.
+ * A quarantined/unknown domain after failed publication terminates the sandbox
+ * rather than returning RAM to Linux while device access may still be live. */
+int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config);
+int ph_dma_revoke(struct ph_dma *dma, uint64_t generation);
+int ph_dma_destroy(struct ph_dma *dma);
+
+#endif

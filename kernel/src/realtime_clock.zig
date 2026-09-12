@@ -1,8 +1,10 @@
 const std = @import("std");
 const rtc = @import("rtc.zig");
+const hpet = @import("hpet.zig");
 
-// The BSP is the only counter reader/writer. APs read the published second,
-// so this does not assume that TSC offsets are synchronized across CPUs.
+// The fallback clock is published by the BSP. The high-resolution HPET
+// counter is shared by all CPUs, so initialization proves one cache policy
+// across the complete online set before enabling it.
 pub const Clock = struct {
     frequency_hz: u64 = 0,
     epoch_seconds: u64 = 0,
@@ -46,9 +48,35 @@ const PvTime = extern struct {
 };
 var pv_time: PvTime align(64) = .{};
 var pv_enabled: bool = false;
+var highres_realtime_offset_ns: u64 = 0;
 
 pub fn kernelStaticStorageEndAddr() usize {
-    return @max(@intFromPtr(&clock) + @sizeOf(Clock), @max(@intFromPtr(&pv_time) + @sizeOf(PvTime), @intFromPtr(&pv_enabled) + @sizeOf(bool)));
+    return @max(hpet.staticEnd(), @max(@intFromPtr(&highres_realtime_offset_ns) + @sizeOf(u64), @max(@intFromPtr(&clock) + @sizeOf(Clock), @max(@intFromPtr(&pv_time) + @sizeOf(PvTime), @intFromPtr(&pv_enabled) + @sizeOf(bool)))));
+}
+
+// The existing TSC/pvclock conversion is BSP-only. The HPET main counter
+// supplies one cross-CPU domain; LAPIC remains the deadline interrupt device.
+pub fn initializeHighResolution(
+    rsdp: u64,
+    mmio_allowed: *const fn (u64, u64) bool,
+) bool {
+    if (!@import("lapic.zig").highResolutionReady() or
+        !hpet.initialize(rsdp, mmio_allowed)) return false;
+    const now = hpet.monotonicNs() orelse return false;
+    highres_realtime_offset_ns = (unixTimeSeconds() *| 1_000_000_000) -| now;
+    return true;
+}
+
+pub fn monotonicNs() ?u64 {
+    return hpet.monotonicNs();
+}
+
+pub fn resolutionNs() ?u64 {
+    return hpet.resolutionNs();
+}
+
+pub fn realtimeNs() ?u64 {
+    return highres_realtime_offset_ns +| (hpet.monotonicNs() orelse return null);
 }
 
 fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {

@@ -3,58 +3,60 @@
 
 #define PACHAOS_SYSCALL_LOG 1
 #define PACHAOS_SYSCALL_PROCESS_EXIT 5
-#define PACHAOS_SYSCALL_PROCESS_SIGNAL 11
-#define PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL 12
-#define PACHAOS_SYSCALL_PROCESS_STOP 13
-#define PACHAOS_SYSCALL_PROCESS_CONTINUE 14
-#define PACHAOS_SYSCALL_THREAD_SET_FS_BASE 15
-#define PACHAOS_SYSCALL_THREAD_SET_GS_BASE 16
-#define PACHAOS_SYSCALL_PROCESS_CLONE 17
-#define PACHAOS_SYSCALL_PROCESS_MAP 18
-#define PACHAOS_SYSCALL_PROCESS_MAP_BATCH 19
-#define PACHAOS_SYSCALL_PROCESS_EXEC_FROM 20
-#define PACHAOS_SYSCALL_PROCESS_MEMORY_BARRIER 21
+#define PACHAOS_SYSCALL_THREAD_CONTEXT 8
+#define PACHAOS_SYSCALL_PROCESS_SIGNAL 13
+#define PACHAOS_SYSCALL_PROCESS_SIGNAL_CTL 14
+#define PACHAOS_SYSCALL_PROCESS_STOP 15
+#define PACHAOS_SYSCALL_PROCESS_CONTINUE 16
+#define PACHAOS_SYSCALL_THREAD_SET_FS_BASE 17
+#define PACHAOS_SYSCALL_THREAD_SET_GS_BASE 18
+#define PACHAOS_SYSCALL_PROCESS_CLONE 19
+#define PACHAOS_SYSCALL_PROCESS_MAP 20
+#define PACHAOS_SYSCALL_PROCESS_MAP_BATCH 21
+#define PACHAOS_SYSCALL_PROCESS_UNMAP 22
+#define PACHAOS_SYSCALL_PROCESS_EXEC_FROM 23
+#define PACHAOS_SYSCALL_PROCESS_MEMORY_BARRIER 24
 #define PACHAOS_PROCESS_MAP_ANYWHERE 0xffffffffffffffffULL
-#define PACHAOS_SYSCALL_GETPID 22
-#define PACHAOS_SYSCALL_GETTID 23
-#define PACHAOS_SYSCALL_SYSTEM_INFO 24
-#define PACHAOS_SYSCALL_CLOCK_GETTIME 25
-#define PACHAOS_SYSCALL_CLOCK_GETRES 26
-#define PACHAOS_SYSCALL_NANOSLEEP 27
-#define PACHAOS_SYSCALL_FUTEX_WAIT 28
-#define PACHAOS_SYSCALL_FUTEX_WAKE 29
-#define PACHAOS_SYSCALL_FUTEX_REQUEUE 30
-#define PACHAOS_SYSCALL_GETRANDOM 31
-#define PACHAOS_SYSCALL_FD_TABLE 32
-#define PACHAOS_SYSCALL_FD_CLOSE 33
-#define PACHAOS_SYSCALL_FD_READ 37
-#define PACHAOS_SYSCALL_FD_WRITE 38
-#define PACHAOS_SYSCALL_FD_READV 39
-#define PACHAOS_SYSCALL_FD_WRITEV 40
-#define PACHAOS_SYSCALL_FD_FCNTL 41
-#define PACHAOS_SYSCALL_FD_POLL 42
-#define PACHAOS_SYSCALL_FD_WAIT_MANY 43
-#define PACHAOS_SYSCALL_FD_IOCTL 44
-#define PACHAOS_SYSCALL_FD_STAT 45
-#define PACHAOS_SYSCALL_EVENTFD_CREATE 46
-#define PACHAOS_SYSCALL_PIPE_CREATE 47
-#define PACHAOS_SYSCALL_TIMERFD_CREATE 48
-#define PACHAOS_SYSCALL_TIMERFD_SETTIME 49
-#define PACHAOS_SYSCALL_TIMERFD_GETTIME 50
-#define PACHAOS_SYSCALL_VMO_CREATE 51
-#define PACHAOS_SYSCALL_VMO_REVOKE 52
-#define PACHAOS_SYSCALL_MMAP 53
-#define PACHAOS_SYSCALL_MUNMAP 54
-#define PACHAOS_SYSCALL_MPROTECT 55
-#define PACHAOS_SYSCALL_MREMAP 56
-#define PACHAOS_SYSCALL_MADVISE 57
-#define PACHAOS_SYSCALL_IPC_ENDPOINT_CREATE 58
-#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 59
-#define PACHAOS_SYSCALL_IPC_SEND 60
-#define PACHAOS_SYSCALL_IPC_RECV 61
-#define PACHAOS_SYSCALL_IPC_CALL 62
-#define PACHAOS_SYSCALL_IPC_REPLY 63
-#define PACHAOS_SYSCALL_IPC_RECV_WAIT 64
+#define PACHAOS_SYSCALL_GETPID 25
+#define PACHAOS_SYSCALL_GETTID 26
+#define PACHAOS_SYSCALL_SYSTEM_INFO 27
+#define PACHAOS_SYSCALL_CLOCK_GETTIME 28
+#define PACHAOS_SYSCALL_CLOCK_GETRES 29
+#define PACHAOS_SYSCALL_NANOSLEEP 30
+#define PACHAOS_SYSCALL_FUTEX_WAIT 31
+#define PACHAOS_SYSCALL_FUTEX_WAKE 32
+#define PACHAOS_SYSCALL_FUTEX_REQUEUE 33
+#define PACHAOS_SYSCALL_GETRANDOM 34
+#define PACHAOS_SYSCALL_FD_TABLE 35
+#define PACHAOS_SYSCALL_FD_CLOSE 36
+#define PACHAOS_SYSCALL_FD_READ 40
+#define PACHAOS_SYSCALL_FD_WRITE 41
+#define PACHAOS_SYSCALL_FD_READV 42
+#define PACHAOS_SYSCALL_FD_WRITEV 43
+#define PACHAOS_SYSCALL_FD_FCNTL 44
+#define PACHAOS_SYSCALL_FD_POLL 45
+#define PACHAOS_SYSCALL_FD_WAIT_MANY 46
+#define PACHAOS_SYSCALL_FD_IOCTL 47
+#define PACHAOS_SYSCALL_FD_STAT 48
+#define PACHAOS_SYSCALL_EVENTFD_CREATE 49
+#define PACHAOS_SYSCALL_PIPE_CREATE 50
+#define PACHAOS_SYSCALL_TIMERFD_CREATE 51
+#define PACHAOS_SYSCALL_TIMERFD_SETTIME 52
+#define PACHAOS_SYSCALL_TIMERFD_GETTIME 53
+#define PACHAOS_SYSCALL_VMO_CREATE 54
+#define PACHAOS_SYSCALL_VMO_REVOKE 55
+#define PACHAOS_SYSCALL_MMAP 56
+#define PACHAOS_SYSCALL_MUNMAP 57
+#define PACHAOS_SYSCALL_MPROTECT 58
+#define PACHAOS_SYSCALL_MREMAP 59
+#define PACHAOS_SYSCALL_MADVISE 60
+#define PACHAOS_SYSCALL_IPC_ENDPOINT_CREATE 61
+#define PACHAOS_SYSCALL_IPC_CHANNEL_CREATE 62
+#define PACHAOS_SYSCALL_IPC_SEND 63
+#define PACHAOS_SYSCALL_IPC_RECV 64
+#define PACHAOS_SYSCALL_IPC_CALL 65
+#define PACHAOS_SYSCALL_IPC_REPLY 66
+#define PACHAOS_SYSCALL_IPC_RECV_WAIT 67
 
 #define PACHAOS_FD_FLAG_CLOEXEC 1
 #define PACHAOS_FD_FLAG_NONBLOCK 2
@@ -163,7 +165,7 @@ extern int __pachaos_brk_lock;
 #define PACHAOS_FILED_OP_PREAD 6
 #define PACHAOS_FILED_OP_GETDENTS 7
 #define PACHAOS_FILED_OP_CLOSE 8
-#define PACHAOS_FILED_OP_EXEC_PATH 9
+#define PACHAOS_FILED_OP_EXEC_PATH 43 /* v2 service envelope, not legacy ring opcode */
 #define PACHAOS_FILED_OP_READ 10
 #define PACHAOS_FILED_OP_DUP 11
 #define PACHAOS_FILED_OP_GET_FLAGS 12
@@ -417,15 +419,11 @@ struct __pachaos_filed_exec_path {
 	unsigned long long string_bytes;
 	unsigned long long argc;
 	unsigned long long envc;
-	unsigned long long linux_pid;
-	unsigned long long linux_ppid;
-	unsigned long long linux_sid;
-	unsigned long long linux_pgrp;
-	unsigned long long linux_next_pid;
 	unsigned long long inherit_handles[PACHAOS_FILED_EXEC_MAX_INHERIT_HANDLES];
-	unsigned long long inherit_fd_targets[PACHAOS_FILED_EXEC_MAX_INHERIT_FDS];
+	struct { unsigned long long target, rights, flags; }
+		fd_grants[PACHAOS_FILED_EXEC_MAX_INHERIT_FDS];
 	struct __pachaos_filed_exec_fd_patch fd_patches[PACHAOS_FILED_EXEC_MAX_FD_PATCHES];
-	char path[PACHAOS_FILED_NAME_BYTES];
+	char path[480]; /* FILED_PATH_BYTES in the v2 exec payload */
 	struct __pachaos_filed_exec_string_ref argv[PACHAOS_FILED_EXEC_MAX_ARGS];
 	struct __pachaos_filed_exec_string_ref envp[PACHAOS_FILED_EXEC_MAX_ENVS];
 	char strings[PACHAOS_FILED_EXEC_STRING_BYTES];
@@ -3120,7 +3118,7 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 	if (status != 0) return status;
 	__pachaos_bzero(page, PACHAOS_FILED_PAGE_BYTES);
 	struct __pachaos_filed_exec_path *exec = (struct __pachaos_filed_exec_path *)page;
-	status = __pachaos_copy_path(exec->path, path, PACHAOS_FILED_NAME_BYTES);
+	status = __pachaos_copy_path(exec->path, path, sizeof exec->path);
 	if (status != 0) {
 		__pachaos_filed_page_destroy(page_fd, page);
 		return status;
@@ -3165,15 +3163,94 @@ static __inline long __pachaos_filed_execve(const char *path, char *const argv[]
 	}
 	exec->argc = argc;
 	exec->envc = envc;
-
-	struct __pachaos_ipc_msg reply;
-	status = __pachaos_filed_call(
-		PACHAOS_FILED_OP_EXEC_PATH,
-		0,
-		__pachaos_filed_next_request_id(),
-		page_fd,
-		&reply);
+	/* Native exec delegates the caller's filesystem client explicitly. Do not
+	 * ask filed to inherit its own descriptors or use the cap-less fast ring. */
+	const unsigned long long client_rights = PACHAOS_FD_RIGHT_INSPECT |
+		PACHAOS_FD_RIGHT_CLOSE | PACHAOS_FD_RIGHT_CALL | PACHAOS_FD_RIGHT_WAIT |
+		PACHAOS_FD_RIGHT_POLL | PACHAOS_FD_RIGHT_TRANSFER;
+	exec->flags = 1u << 1; /* FILED_EXEC_INHERIT_FDS */
+	exec->inherit_fd_count = 1;
+	exec->fd_grants[0].target = PACHAOS_FILED_ENDPOINT_FD;
+	exec->fd_grants[0].rights = client_rights;
+	const unsigned long long wire_rights = PACHAOS_FD_RIGHT_CLOSE |
+		PACHAOS_FD_RIGHT_MAP_READ | PACHAOS_FD_RIGHT_MAP_WRITE;
+	const long wire_fd = __pachaos_raw3(PACHAOS_SYSCALL_VMO_CREATE,
+		PACHAOS_FILED_PAGE_BYTES, wire_rights | PACHAOS_FD_RIGHT_TRANSFER, 0);
+	if (wire_fd < 16) {
+		__pachaos_filed_page_destroy(page_fd, page);
+		return wire_fd > 0 ? -wire_fd : wire_fd;
+	}
+	const long wire_addr = __pachaos_raw6(PACHAOS_SYSCALL_MMAP, wire_fd, 0,
+		PACHAOS_FILED_PAGE_BYTES, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE, PACHAOS_MMAP_SHARED, 0);
+	if (wire_addr < 4096) {
+		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, wire_fd);
+		__pachaos_filed_page_destroy(page_fd, page);
+		return -12;
+	}
+	/* pacha_service_envelope_t: the exec payload follows its 64-byte header. */
+	struct __pachaos_exec_envelope {
+		unsigned long long magic;
+		unsigned int version, service, op, flags;
+		unsigned long long request_id, trace_id;
+		union { struct { unsigned int payload_size, fd_count; }; long long status; };
+		unsigned long long reserved0, reserved1;
+	};
+	struct __pachaos_exec_envelope *header = (void *)wire_addr;
+	_Static_assert(sizeof(struct __pachaos_exec_envelope) == 64, "service envelope ABI");
+	_Static_assert(sizeof(struct __pachaos_exec_envelope) + sizeof *exec <= PACHAOS_FILED_PAGE_BYTES,
+		"exec payload fits service page");
+	__pachaos_bzero(header, sizeof *header);
+	for (unsigned long i = 0; i < sizeof *exec; ++i)
+		((unsigned char *)header)[sizeof *header + i] = ((unsigned char *)exec)[i];
+	header->magic = 0x3251455256434150ULL; /* PACHA_SERVICE_REQUEST_MAGIC */
+	header->version = 2;
+	header->service = 1; /* FILED */
+	header->op = PACHAOS_FILED_OP_EXEC_PATH;
+	header->flags = 1; /* PAGE_PAYLOAD */
+	header->request_id = __pachaos_filed_next_request_id();
+	header->trace_id = header->request_id;
+	header->payload_size = sizeof *exec;
+	header->fd_count = 1;
+	const unsigned long long request_id = header->request_id;
 	__pachaos_filed_page_destroy(page_fd, page);
+	struct __pachaos_ipc_fd send_fds[2], received[2];
+	struct __pachaos_ipc_msg request, reply;
+	__pachaos_bzero(send_fds, sizeof send_fds);
+	__pachaos_bzero(received, sizeof received);
+	__pachaos_bzero(&request, sizeof request);
+	__pachaos_bzero(&reply, sizeof reply);
+	send_fds[0].fd = wire_fd;
+	send_fds[0].rights = wire_rights;
+	send_fds[1].fd = PACHAOS_FILED_ENDPOINT_FD;
+	send_fds[1].rights = client_rights;
+	request.word0 = header->magic;
+	request.word3 = request_id;
+	request.fds = send_fds;
+	request.fd_count = 2;
+	reply.fds = received;
+	reply.fd_capacity = 2;
+	const long reply_fd = __pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL, PACHAOS_FILED_ENDPOINT_FD, (long)&request);
+	status = reply_fd < 16 ? -13 : 0;
+	if (reply_fd >= 16) {
+		do {
+			status = __pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT, reply_fd, (long)&reply, (long)~0ULL, 0);
+		} while (status == 2 || status == -2 || status == 5 || status == -5);
+		(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, reply_fd);
+		if (status == 0) {
+			status = header->magic == 0x3259505256434150ULL && header->version == 2 &&
+				header->service == 1 && header->op == PACHAOS_FILED_OP_EXEC_PATH &&
+				header->request_id == request_id && reply.word0 == header->magic &&
+				reply.word3 == request_id ? (long)header->status : -71;
+			if (status == 0 && (reply.fd_count != 2 || received[0].fd < 16 || received[1].fd < 16))
+				status = -71;
+			/* Failed IPC copyout has already rolled back installed descriptors. */
+			for (unsigned int i = 0; i < reply.fd_count && i < 2; ++i)
+				(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, (long)received[i].fd);
+		}
+	}
+	(void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, wire_addr, PACHAOS_FILED_PAGE_BYTES);
+	(void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, wire_fd);
+	if (status > 0) status = -status;
 	if (status != 0) return status;
 	(void)__pachaos_raw1(PACHAOS_SYSCALL_PROCESS_EXIT, 0);
 	for (;;) __asm__ __volatile__("pause");

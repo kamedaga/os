@@ -71,6 +71,7 @@ fn writeTimespec(h: anytype, proc: kernel.PrincipalId, out_va: u64, sec: u64, ns
 }
 
 fn monotonicTicksAsTimespec() struct { sec: u64, nsec: u64 } {
+    if (realtime_clock.monotonicNs()) |ns| return .{ .sec = ns / 1_000_000_000, .nsec = ns % 1_000_000_000 };
     const tick = scheduler.lapic_tick_count;
     return .{
         .sec = tick / 1000,
@@ -80,7 +81,10 @@ fn monotonicTicksAsTimespec() struct { sec: u64, nsec: u64 } {
 
 fn clockGettime(h: anytype, proc: kernel.PrincipalId, clock_id: u64, out_va: u64) u64 {
     return switch (clock_id) {
-        runtime_abi.clock_realtime => writeTimespec(h, proc, out_va, realtime_clock.unixTimeSeconds(), 0),
+        runtime_abi.clock_realtime => if (realtime_clock.realtimeNs()) |ns|
+            writeTimespec(h, proc, out_va, ns / 1_000_000_000, ns % 1_000_000_000)
+        else
+            writeTimespec(h, proc, out_va, realtime_clock.unixTimeSeconds(), 0),
         runtime_abi.clock_monotonic => blk: {
             const ts = monotonicTicksAsTimespec();
             break :blk writeTimespec(h, proc, out_va, ts.sec, ts.nsec);
@@ -90,6 +94,10 @@ fn clockGettime(h: anytype, proc: kernel.PrincipalId, clock_id: u64, out_va: u64
 }
 
 fn clockGetres(h: anytype, proc: kernel.PrincipalId, clock_id: u64, out_va: u64) u64 {
+    if (clock_id == runtime_abi.clock_monotonic or clock_id == runtime_abi.clock_realtime) {
+        if (realtime_clock.resolutionNs()) |resolution|
+            return writeTimespec(h, proc, out_va, 0, resolution);
+    }
     return switch (clock_id) {
         runtime_abi.clock_realtime => writeTimespec(
             h,
@@ -392,19 +400,28 @@ pub fn clearTidAndWake(h: anytype, proc: kernel.PrincipalId, user_va: u64) void 
 }
 
 fn getRandom(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    // This operation returns a byte count, not a status. Errors must be
+    // negative native statuses: +INVALID would be indistinguishable from
+    // a successful one-byte read. Linux flag/errno translation stays in LPR.
+    const invalid: u64 = @bitCast(-@as(i64, sc.syscall_err_invalid));
+    const map_error: u64 = @bitCast(-@as(i64, sc.syscall_err_map));
     const out_va = frame.rdi;
     const len = frame.rsi;
     const flags = frame.rdx;
-    if (flags != 0) return sc.syscall_err_invalid;
+    if (flags != 0 or len > 4096) return invalid;
     if (len == 0) return 0;
-    if (out_va == 0 or len > 4096) return sc.syscall_err_invalid;
+    if (out_va == 0) return map_error;
+    const end, const overflow = @addWithOverflow(out_va, len);
+    _ = end;
+    if (overflow != 0) return map_error;
 
     var written: u64 = 0;
     var chunk: [64]u8 = undefined;
     while (written < len) {
         const chunk_len: usize = @intCast(@min(len - written, chunk.len));
         state.fillRandomBytes(proc, chunk[0..chunk_len]);
-        if (!h.copy_bytes_to_user_va(proc, out_va + written, chunk[0..chunk_len])) return sc.syscall_err_invalid;
+        if (!h.copy_bytes_to_user_va(proc, out_va + written, chunk[0..chunk_len]))
+            return if (written != 0) written else map_error;
         written += chunk_len;
     }
     return written;

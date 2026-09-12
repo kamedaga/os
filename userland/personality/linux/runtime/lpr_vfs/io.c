@@ -1,5 +1,6 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_gui_detail.h"
+#include "../lpr_random.h"
 
 static int64_t lpr_filed_io_handle(
     uint32_t op,
@@ -299,8 +300,7 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
             return (int64_t)count;
         }
         if (device->minor == 8 || device->minor == 9) {
-            return lpr_pacha_syscall3(
-                PACHAOS_SYSCALL_GETRANDOM, buf, count, 0);
+            return lpr_linux_getrandom(buf, count, 0);
         }
         return 0;
     }
@@ -853,7 +853,7 @@ int64_t lpr_linux_pread_to_vmo(
 
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         (uint64_t)(uintptr_t)&request);
     if (reply_fd < 16) {
         lpr_destroy_pread_vmo_wire_page(page_fd, page);

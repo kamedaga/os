@@ -232,7 +232,7 @@ int lpr_fd_transfer_prepare(
             return -LPR_LINUX_EMSGSIZE;
         int lease_fd = -1;
         int remote_lease_fd = -1;
-        const int pair_status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        const int pair_status = lpr_filed_lease_pair(&lease_fd, &remote_lease_fd);
         if (pair_status != 0) return pair_status;
         uint64_t ticket = 0;
         const int64_t status = lpr_filed_transfer_dup_handle(
@@ -480,6 +480,12 @@ int lpr_fd_transfer_stage_batch(
         const uint64_t linux_flags = item->flags | receive_flags;
         if (item->provider == LPR_FD_OPS_FILED) {
             lpr_filed_backend_t *filed = states[prepared_count];
+            status = lpr_filed_adopt(handle, item_capabilities[0]);
+            if (status) {
+                (void)lpr_backend_state_free(states[prepared_count], state_bytes);
+                states[prepared_count] = 0;
+                break;
+            }
             filed->active = 1;
             filed->offset_valid = 1;
             filed->flags = (uint32_t)linux_flags;

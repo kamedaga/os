@@ -120,7 +120,7 @@ static void names_backlog_credentials(struct unix_broker *broker, struct fixture
     assert(unix_broker_bind(broker, server, other, &different) == 0);
     assert(unix_broker_listen(broker, server, listener, 1) == 0);
     /* SO_PEERCRED uses the listen-time snapshot, not credentials at accept. */
-    struct unix_credentials changed = { .generation = 2, .pid = 200,
+    struct unix_credentials changed = { .generation = 1, .pid = 200,
         .uid = 1001, .gid = 1001, .euid = 1002, .egid = 1002,
         .suid = 1003, .sgid = 1003 };
     assert(unix_broker_session_credentials(server, &changed) == 0);
@@ -133,7 +133,7 @@ static void names_backlog_credentials(struct unix_broker *broker, struct fixture
     claimed.pid = 201;
     assert(unix_broker_check_credentials(server, &claimed) == -EPERM);
     claimed = changed;
-    claimed.generation = 1;
+    claimed.generation = 2;
     assert(unix_broker_check_credentials(server, &claimed) == -ESTALE);
     uint64_t first = new_socket(broker, client);
     uint64_t second = new_socket(broker, client);

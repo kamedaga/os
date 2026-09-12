@@ -139,12 +139,53 @@ int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *msg, uint64_t timeout_tick
 int pacha_ipc_call(int fd, const struct pacha_ipc_msg *msg);
 int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg);
 
-int pacha_process_create(uint64_t rights, uint32_t flags);
+/* Explicit copy grants only. Empty list means an empty child FD table;
+ * INHERIT is not consulted. Sources must carry TRANSFER, rights may only
+ * shrink, and flags describe the child descriptor, not the source. */
+#define PACHA_PROCESS_CREATE_MAX_GRANTS 64u
+struct pacha_process_fd_grant {
+    uint64_t source_fd, target_fd, rights, flags;
+};
+int pacha_process_create(uint64_t rights, uint32_t flags,
+    const struct pacha_process_fd_grant *grants, uint64_t count);
 int pacha_process_clone(uint64_t rights, uint32_t flags);
 int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
 int pacha_thread_start(int thread_fd);
+struct pacha_thread_registers {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t rip, cs, rflags, rsp, ss;
+};
+struct pacha_thread_context {
+    uint64_t size, xstate_features, fs_base, gs_base, pkru, reserved[3];
+    struct pacha_thread_registers registers;
+    unsigned char xstate[832];
+};
+/* CPU-quiescent suspended threads only. Active waits/faults return NOT_READY.
+ * GET requires INSPECT; SET requires SET_CONTEXT. Neither resumes the thread. */
+int pacha_thread_get_context(int thread_fd, struct pacha_thread_context *context);
+int pacha_thread_set_context(int thread_fd, const struct pacha_thread_context *context);
+int pacha_thread_signal(int thread_fd, unsigned int notification);
+int pacha_thread_register_fault(uint64_t entry_rip, uint64_t stack_base, uint64_t stack_size);
+/* Trampolines receive this frame in RDI on a 16-byte aligned runtime stack.
+ * Register order follows the native x86-64 trap frame, not Linux pt_regs.
+ * Fault frames use signo=0 and append raw vector/error/address metadata;
+ * return both kinds through PROCESS_SIGNAL_CTL_RETURN. */
+struct pacha_native_signal_frame {
+    uint64_t magic, size, signo, xstate_features;
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    uint64_t rip, cs, rflags, rsp, ss;
+    unsigned char xstate[832];
+};
+struct pacha_native_fault_frame {
+    struct pacha_native_signal_frame signal;
+    uint64_t vector, error_code, address;
+};
 int pacha_thread_set_gs_base(uint64_t gs_base);
 long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
+/* MAP_INTO authority; returns only after cross-CPU range invalidation. */
+int pacha_process_unmap(int process_fd, uint64_t target_va, uint64_t size, uint64_t flags);
 struct pacha_process_map_batch_entry {
     uint64_t vmo_fd;
     uint64_t target_va;
@@ -165,6 +206,8 @@ int pacha_process_map_batch(
     int process_fd,
     const struct pacha_process_map_batch_entry *entries,
     uint64_t entry_count);
+/* Returns bytes written or negative native status (INVALID=-1, MAP=-4).
+ * Native flags must be zero; one request is limited to 4096 bytes. */
 long pacha_getrandom(void *buf, uint64_t len, uint64_t flags);
 struct pacha_fd_table_info {
     uint64_t capacity;

@@ -9,6 +9,7 @@ const apic_base_mask: u64 = 0xFFFF_F000;
 const lapic_reg_eoi: u32 = 0x0B0;
 const lapic_reg_id: u32 = 0x020;
 const lapic_reg_isr_base: u32 = 0x100;
+const lapic_reg_irr_base: u32 = 0x200;
 const lapic_reg_svr: u32 = 0x0F0;
 const lapic_reg_icr_low: u32 = 0x300;
 const lapic_reg_icr_high: u32 = 0x310;
@@ -30,6 +31,11 @@ const icr_delivery_startup: u32 = 0x6 << 8;
 
 var lapic_base_pa: u64 = 0;
 var bsp_timer_initial_count: u32 = 0;
+var timer_frequency_hz: u64 = 0;
+
+pub fn kernelStaticStorageEndAddr() usize {
+    return @max(@intFromPtr(&timer_frequency_hz) + @sizeOf(u64), @intFromPtr(&bsp_timer_initial_count) + @sizeOf(u32));
+}
 
 pub const TimerCalibration = struct {
     calibrated: bool,
@@ -151,6 +157,7 @@ pub fn initialCountForPeriod(frequency_hz: u64, period_ns: u64, rearm_overhead_n
 }
 
 fn fallbackCalibration(fallback_initial_count: u32, rearm_overhead_ns: u64) TimerCalibration {
+    timer_frequency_hz = 0;
     bsp_timer_initial_count = fallback_initial_count;
     _ = armTimer(fallback_initial_count);
     return .{
@@ -207,6 +214,7 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
     };
 
     bsp_timer_initial_count = initial_count;
+    timer_frequency_hz = frequency_hz;
     if (counter_end > counter_start)
         realtime_clock.configureCounter(counter_end - counter_start, calibration_pit_ticks, pit_frequency_hz);
     _ = armTimer(initial_count);
@@ -232,6 +240,29 @@ pub fn armTimer(initial_count: u32) bool {
 pub fn disarmTimer() void {
     if (lapic_base_pa == 0) return;
     mmioWrite(lapic_reg_initial_count, 0);
+}
+
+pub fn highResolutionReady() bool {
+    return timer_frequency_hz != 0;
+}
+
+pub fn deadlineCount(frequency: u64, now: u64, deadline: u64) ?u32 {
+    if (frequency == 0) return null;
+    const delay = if (deadline > now) deadline - now else 1;
+    // Round up: a conversion must never make a deadline fire early.
+    const count = (@as(u128, delay) * frequency + 999_999_999) / 1_000_000_000;
+    return @intCast(@min(@max(count, 1), std.math.maxInt(u32)));
+}
+
+pub fn armDeadline(now: u64, deadline: u64) bool {
+    return armTimer(deadlineCount(timer_frequency_hz, now, deadline) orelse return false);
+}
+
+test "absolute LAPIC deadline rounds up and bounds register count" {
+    try std.testing.expectEqual(@as(?u32, 2), deadlineCount(10_000_000, 100, 201));
+    try std.testing.expectEqual(@as(?u32, 1), deadlineCount(10_000_000, 100, 99));
+    try std.testing.expectEqual(@as(?u32, null), deadlineCount(0, 0, 1));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), deadlineCount(1_000_000_000, 0, std.math.maxInt(u64)));
 }
 
 pub fn enableLocalApic() bool {
@@ -304,6 +335,22 @@ pub fn activeInterruptVectorInRange(first: u8, count: u8) ?u8 {
         if ((bits & (@as(u32, 1) << bit_index)) != 0) return @intCast(vec);
     }
     return null;
+}
+
+/// A source must already be masked and its posted mask write read back.
+/// An empty ISR alone is insufficient: a pending IRR edge can be delivered
+/// after a new owner has installed its handler.
+pub fn interruptRangePending(first: u8, count: u8) bool {
+    if (lapic_base_pa == 0 or count == 0) return false;
+    const end = @as(u16, first) + count;
+    var vector: u16 = first;
+    while (vector < end and vector <= 255) : (vector += 1) {
+        const index: u32 = @intCast(vector / 32);
+        const bit = @as(u32, 1) << @as(u5, @intCast(vector & 31));
+        if (((mmioRead(lapic_reg_irr_base + index * 0x10) |
+            mmioRead(lapic_reg_isr_base + index * 0x10)) & bit) != 0) return true;
+    }
+    return false;
 }
 
 pub fn eoiLegacyPicMaster() void {

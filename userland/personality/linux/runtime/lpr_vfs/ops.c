@@ -2,6 +2,7 @@
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
+    lpr_linux_process_state_init();
     /*
      * Linux does not require O_DIRECTORY when opening a directory that will
      * later be used as an *at() dirfd.  The object kind is not known until
@@ -9,15 +10,17 @@ uint64_t lpr_open_rights(uint64_t flags)
      * up front.  Filed still rejects lookup/create/remove/rename when the
      * resulting vnode is not a directory.
      */
-    uint64_t rights = FILED_RIGHT_STAT |
-        FILED_RIGHT_SETATTR |
+    uint64_t optional = FILED_RIGHT_SETATTR |
         FILED_RIGHT_LOOKUP |
         FILED_RIGHT_CREATE |
         FILED_RIGHT_REMOVE |
-        FILED_RIGHT_RENAME;
+        FILED_RIGHT_RENAME | FILED_RIGHT_GETDENTS;
+    /* Optional directory/metadata rights may only come from this launch's
+     * namespace grant. Required read/write/create rights remain explicit, so
+     * an unauthorized access mode fails at open instead of being downgraded. */
+    uint64_t rights = FILED_RIGHT_STAT | (optional & lpr_state.process.filed_rights);
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
-        rights |= FILED_RIGHT_GETDENTS;
         if ((flags & LPR_LINUX_O_DIRECTORY) == 0) {
             rights |= FILED_RIGHT_READ;
         }
@@ -1101,7 +1104,7 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     int installed_lease_fd = -1;
     if (!root) {
         int remote_lease_fd = -1;
-        int status = lpr_native_wait_pair(
+        int status = lpr_filed_lease_pair(
             &installed_lease_fd,
             &remote_lease_fd);
         if (status == 0) {
@@ -1110,6 +1113,7 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
                 0,
                 remote_lease_fd,
                 &installed_handle);
+            if (!status) status = lpr_filed_adopt(installed_handle, installed_lease_fd);
         }
         if (status != 0 || installed_handle == 0) {
             (void)lpr_close_native_fd_if_open(

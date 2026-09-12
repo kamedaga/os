@@ -59,8 +59,11 @@ int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg) {
     return pacha_status_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_REPLY, (uint64_t)(uint32_t)reply_fd, (uint64_t)(uintptr_t)msg));
 }
 
-int pacha_process_create(uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall3(PACHA_PROCESS_SYSCALL_CREATE, 0, rights, flags));
+int pacha_process_create(uint64_t rights, uint32_t flags,
+    const struct pacha_process_fd_grant *grants, uint64_t count) {
+    if (count > PACHA_PROCESS_CREATE_MAX_GRANTS || (count && !grants)) return -1;
+    return pacha_fd_result_to_int(pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE,
+        0, rights, flags, (uint64_t)(uintptr_t)grants, count));
 }
 
 int pacha_process_clone(uint64_t rights, uint32_t flags) {
@@ -83,8 +86,29 @@ int pacha_thread_start(int thread_fd) {
     return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_START, (uint64_t)(uint32_t)thread_fd));
 }
 
+int pacha_thread_get_context(int thread_fd, struct pacha_thread_context *context) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_THREAD_SYSCALL_CONTEXT,
+        (uint64_t)(uint32_t)thread_fd, PACHA_THREAD_CONTEXT_GET,
+        (uint64_t)(uintptr_t)context, sizeof(*context)));
+}
+
+int pacha_thread_set_context(int thread_fd, const struct pacha_thread_context *context) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_THREAD_SYSCALL_CONTEXT,
+        (uint64_t)(uint32_t)thread_fd, PACHA_THREAD_CONTEXT_SET,
+        (uint64_t)(uintptr_t)context, sizeof(*context)));
+}
+
 int pacha_thread_set_gs_base(uint64_t gs_base) {
     return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, gs_base));
+}
+
+int pacha_thread_signal(int thread_fd, unsigned int notification) {
+    return pacha_status_to_int(pacha_syscall2(PACHA_THREAD_SYSCALL_SIGNAL, (uint64_t)(uint32_t)thread_fd, notification));
+}
+
+int pacha_thread_register_fault(uint64_t entry_rip, uint64_t stack_base, uint64_t stack_size) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
+        PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT, entry_rip, stack_base, stack_size));
 }
 
 long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
@@ -109,6 +133,11 @@ long pacha_process_map_flags(
         prot,
         vmo_offset | flags
     );
+}
+
+int pacha_process_unmap(int process_fd, uint64_t target_va, uint64_t size, uint64_t flags) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_PROCESS_SYSCALL_UNMAP,
+        (uint64_t)(uint32_t)process_fd, target_va, size, flags));
 }
 
 int pacha_process_map_batch(

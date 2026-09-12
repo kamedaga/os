@@ -28,8 +28,10 @@ static void native_page_destroy(int fd, struct unix_control *page)
 
 static int native_call(int endpoint, const struct pacha_ipc_msg *request)
 {
-    const int64_t fd = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_CALL,
-        (uint64_t)(uint32_t)endpoint, (uint64_t)(uintptr_t)request);
+    /* Threads share the process session's bounded request queue. A full
+     * queue has not accepted the request (or MOVE capabilities); wait for
+     * writable and retry only that explicit backpressure result. */
+    const int64_t fd = lpr_native_ipc_call_wait((uint64_t)(uint32_t)endpoint, request);
     return fd >= 16 ? (int)fd : fd ? (int)pacha_kernel_status_to_errno(fd) : -LPR_LINUX_EIO;
 }
 

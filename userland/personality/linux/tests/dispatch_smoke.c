@@ -13,6 +13,7 @@ struct mock_call {
 };
 
 static struct mock_call g_last;
+static int64_t g_random_error;
 
 int64_t lpr_pacha_syscall0(uint64_t nr) {
     g_last.nr = nr;
@@ -69,7 +70,7 @@ int64_t lpr_pacha_syscall3(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2) {
     g_last.a0 = a0;
     g_last.a1 = a1;
     g_last.a2 = a2;
-    if (nr == PACHAOS_SYSCALL_GETRANDOM) return (int64_t)a1;
+    if (nr == PACHAOS_SYSCALL_GETRANDOM) return g_random_error ? g_random_error : (int64_t)a1;
     return (int64_t)a2;
 }
 
@@ -219,6 +220,14 @@ int main(void) {
 
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETRANDOM, (uint64_t)(uintptr_t)text, 7, 0, 0, 0, 0) == 7)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETRANDOM)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETRANDOM, (uint64_t)(uintptr_t)text, 7, 1, 0, 0, 0) == 7)) return 1;
+    if (expect(g_last.a2 == 0)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETRANDOM, (uint64_t)(uintptr_t)text, 7, 0x8000, 0, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
+    g_random_error = -PACHAOS_SYSCALL_ERR_MAP;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETRANDOM, (uint64_t)(uintptr_t)text, 7, 0, 0, 0, 0) == -LPR_LINUX_EFAULT)) return 1;
+    g_random_error = -PACHAOS_SYSCALL_ERR_INVALID;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETRANDOM, (uint64_t)(uintptr_t)text, 7, 0, 0, 0, 0) == -LPR_LINUX_EINVAL)) return 1;
+    g_random_error = 0;
 
     info = lpr_linux_syscall_lookup(LPR_LINUX_SYS_MEMBARRIER);
     if (expect(info != 0)) return 1;

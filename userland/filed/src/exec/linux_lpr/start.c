@@ -12,65 +12,6 @@ enum {
     LPR_EXEC_LINUX_AUXV_WORDS = 32u,
 };
 
-static int set_inherit(int fd, int enabled)
-{
-    if (fd < 0) {
-        return -22;
-    }
-    const uint64_t flags = enabled ? PACHA_FD_FLAG_INHERIT : 0;
-    const long status = pacha_fd_fcntl(fd, PACHA_FD_FCNTL_SET_FLAGS, flags, PACHA_FD_FLAG_INHERIT);
-    return status == 0 ? 0 : -13;
-}
-
-int lpr_exec_prepare_inherit_fds(
-    const filed_exec_path_t *request,
-    const int *inherit_fds,
-    uint64_t inherit_fd_count,
-    int bootstrap_fd,
-    int *prepared,
-    uint64_t *out_prepared_count)
-{
-    uint64_t prepared_count = 0;
-    if (request == NULL || prepared == NULL || out_prepared_count == NULL) {
-        return -22;
-    }
-    *out_prepared_count = 0;
-    if (inherit_fd_count > FILED_EXEC_MAX_INHERIT_FDS) {
-        return -22;
-    }
-    if ((request->flags & FILED_EXEC_INHERIT_FDS) != 0) {
-        if (inherit_fds == NULL && inherit_fd_count != 0) {
-            return -22;
-        }
-        for (uint64_t i = 0; i < inherit_fd_count; ++i) {
-            const int fd = inherit_fds[i];
-            if (fd < 0 || set_inherit(fd, 1) != 0) {
-                return -13;
-            }
-            prepared[prepared_count++] = fd;
-        }
-    }
-    if ((request->flags & FILED_EXEC_BOOTSTRAP_FD) != 0) {
-        if (bootstrap_fd < 16 || set_inherit(bootstrap_fd, 1) != 0) {
-            return -13;
-        }
-        prepared[prepared_count++] = bootstrap_fd;
-    }
-    *out_prepared_count = prepared_count;
-    return 0;
-}
-
-void lpr_exec_clear_prepared_inherit_fds(const int *prepared, uint64_t count)
-{
-    if (prepared == NULL) {
-        return;
-    }
-    for (uint64_t i = 0; i < count; ++i) {
-        if (prepared[i] >= 0) {
-            (void)set_inherit(prepared[i], 0);
-        }
-    }
-}
 
 static int push_u64(unsigned char *stack, uint64_t *sp, uint64_t value)
 {
@@ -299,7 +240,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
     if (push_u64(stack, &sp, 0) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_NULL) != 0 ||
         (has_bootstrap &&
-            (push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 ||
+            (push_u64(stack, &sp, LPR_BOOTSTRAP_FD) != 0 ||
              push_u64(stack, &sp, LPR_IMAGE_AT_BOOTSTRAP_FD) != 0)) ||
         push_u64(stack, &sp, execfn_va) != 0 ||
         push_u64(stack, &sp, LPR_IMAGE_AT_EXECFN) != 0 ||

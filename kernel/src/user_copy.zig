@@ -89,6 +89,35 @@ var tlb_shootdown_lock: TlbShootdownLock = .{};
 var tlb_shootdown_target_cr3: u64 = 0;
 var tlb_shootdown_generation: u64 = 0;
 var tlb_shootdown_ack: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
+// Local interrupt completion may copy into a COW mapping and initiate another
+// shootdown. Keep it out of this CPU's non-recursive lock interval, including
+// acquisition waits. Maintenance IPIs and device event publication still run.
+var tlb_shootdown_active: [smp.max_cpus]u8 = [_]u8{0} ** smp.max_cpus;
+
+pub fn tlbShootdownActiveOnCurrentCpu() bool {
+    return @atomicLoad(u8, &tlb_shootdown_active[boundedCurrentCpuSlot()], .acquire) != 0;
+}
+
+pub fn testSetTlbShootdownActive(cpu: usize, active: bool) void {
+    if (!@import("builtin").is_test) @compileError("test-only shootdown injection");
+    std.debug.assert(cpu < tlb_shootdown_active.len);
+    @atomicStore(u8, &tlb_shootdown_active[cpu], @intFromBool(active), .release);
+}
+
+test "shootdown interrupt guard is CPU local and clears independently" {
+    const before = tlb_shootdown_active;
+    defer tlb_shootdown_active = before;
+    @memset(&tlb_shootdown_active, 0);
+    const cpu = boundedCurrentCpuSlot();
+    const other = (cpu + 1) % smp.max_cpus;
+    testSetTlbShootdownActive(other, true);
+    try std.testing.expect(!tlbShootdownActiveOnCurrentCpu());
+    testSetTlbShootdownActive(cpu, true);
+    try std.testing.expect(tlbShootdownActiveOnCurrentCpu());
+    testSetTlbShootdownActive(cpu, false);
+    try std.testing.expect(!tlbShootdownActiveOnCurrentCpu());
+    try std.testing.expectEqual(@as(u8, 1), tlb_shootdown_active[other]);
+}
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -106,6 +135,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_target_cr3), &tlb_shootdown_target_cr3));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_generation), &tlb_shootdown_generation));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_ack), &tlb_shootdown_ack));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_active), &tlb_shootdown_active));
     return end;
 }
 
@@ -116,6 +146,7 @@ pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) 
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_target_cr3), @sizeOf(@TypeOf(tlb_shootdown_target_cr3)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_generation), @sizeOf(@TypeOf(tlb_shootdown_generation)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_ack), @sizeOf(@TypeOf(tlb_shootdown_ack)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_active), @sizeOf(@TypeOf(tlb_shootdown_active)))) return false;
     return true;
 }
 
@@ -407,7 +438,11 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
             return mapping.paddr;
         }
     }
-    if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
+    // A present read-only PTE is not permission to copy out through its
+    // physical address when write lookup/COW resolution above failed.
+    if (!write_access) {
+        if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
+    }
     const mapping = resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         h.state,
         h.free_list,
@@ -416,6 +451,7 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
         write_access,
         false,
     ) orelse return null;
+    if (write_access and !mapping.prot.write) return null;
     var paddrs = [_]u64{mapping.paddr};
     if (!user_vm.mapLazyUserPaddrsWithProt(
         principal,
@@ -600,6 +636,11 @@ fn shootdownCr3Context(target_cr3: u64) void {
     const restore_interrupts = TlbShootdownLock.interruptsEnabled();
     defer if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
     asm volatile ("cli" ::: .{ .memory = true });
+    const guard_cpu = boundedCurrentCpuSlot();
+    @atomicStore(u8, &tlb_shootdown_active[guard_cpu], 1, .release);
+    // Registered before the lock's defer: unlock first, clear the guard next,
+    // and only then restore IF. No nested timer/IRQ copyout sees a false gap.
+    defer @atomicStore(u8, &tlb_shootdown_active[guard_cpu], 0, .release);
     const lock_start = perf.timestamp();
     tlb_shootdown_lock.lock();
     perf.elapsed(.tlb_lock_wait_cycles, lock_start);

@@ -436,6 +436,11 @@ enum {
         FILED_RIGHT_GETDENTS,
 };
 
+static uint32_t filed_walk_rights(const filed_runtime_t *runtime)
+{
+    return FILED_WALK_RIGHTS & (runtime->actor ? runtime->actor->identity.rights : UINT32_MAX);
+}
+
 const char *filed_skip_slashes(const char *path)
 {
     while (path != NULL && *path == '/') {
@@ -693,7 +698,7 @@ int64_t filed_resolve_parent_path(
         if (component_len == 2 && component[0] == '.' && component[1] == '.') {
             filed_vfs_open_result_t parent_open;
             filed_status_t status;
-            uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint32_t next_rights = filed_walk_rights(runtime);
 
             if (filed_path_is_single_component(after_slashes)) {
                 next_rights |= parent_rights;
@@ -733,7 +738,7 @@ int64_t filed_resolve_parent_path(
             return 0;
         } else {
             filed_vfs_open_result_t next_open;
-            uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint32_t next_rights = filed_walk_rights(runtime);
             uint64_t object_id = 0;
             bool lookup_owned = false;
             bool component_is_symlink = false;
@@ -1179,7 +1184,7 @@ int64_t filed_openat_path(
 
         if (component_len == 2 && component[0] == '.' && component[1] == '.') {
             filed_vfs_open_result_t parent_open;
-            const uint32_t next_rights = final_component ? rights : FILED_WALK_RIGHTS;
+            const uint32_t next_rights = final_component ? rights : filed_walk_rights(runtime);
             const uint32_t next_flags =
                 final_component ?
                     (open_flags | (require_directory ? FILED_OPEN_DIRECTORY : 0)) :
@@ -1291,7 +1296,7 @@ int64_t filed_openat_path(
             return reply_status;
         } else {
             filed_vfs_open_result_t next_open;
-            uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint32_t next_rights = filed_walk_rights(runtime);
             uint64_t object_id = 0;
             bool lookup_owned = false;
             bool component_is_symlink = false;

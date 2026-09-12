@@ -216,7 +216,8 @@ void lpr_linux_process_state_init(void)
                 state.pid > INT32_MAX ||
                 state.ppid > INT32_MAX ||
                 state.sid > INT32_MAX ||
-                state.pgrp > INT32_MAX)
+                state.pgrp > INT32_MAX ||
+                state.credentials.reserved || state.credentials.group_count > LPRS_MAX_GROUPS)
             {
                 (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
                 for (;;) {
@@ -226,6 +227,8 @@ void lpr_linux_process_state_init(void)
                 lpr_linux_current_ppid = (int32_t)state.ppid;
                 lpr_linux_current_sid = (int32_t)state.sid;
                 lpr_linux_current_pgrp = (int32_t)state.pgrp;
+                lpr_memcpy(&lpr_state.process.credentials, &state.credentials, sizeof(state.credentials));
+                lpr_state.process.filed_rights = state.filed_rights;
                 lpr_linux_next_pid = lpr_linux_current_pid + 1;
             }
         } else {

@@ -3,6 +3,7 @@ const x86_platform = @import("arch/x86_64/platform.zig");
 const lapic = @import("lapic.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler_observer = @import("scheduler_observer.zig");
+const mtrr = @import("arch/x86_64/mtrr.zig");
 
 pub const max_cpus: usize = x86_platform.max_cpus;
 const trampoline_page_bytes: usize = 4096;
@@ -44,6 +45,20 @@ var ap_user_timer_initial_count: u32 = 0;
 var ap_syscall_entry: usize = 0;
 var wake_ipi_vector: u8 = 0;
 
+// Serialized by the kernel-state lock, like native IRQ lease changes.
+var irq_drain_first: u8 = 0;
+var irq_drain_count: u8 = 0;
+var irq_drain_generation: u64 = 0;
+var irq_drain_ack: [max_cpus]u64 = [_]u64{0} ** max_cpus;
+
+// Captured once during serial CPU startup, immutable once userspace runs.
+// No partially booted or late/unverified topology may admit UC_MINUS aliases.
+// Keep each CPU's evidence available for diagnosis without rereading MSRs or
+// changing the boot-time admission decision. Slot zero belongs to the BSP.
+var mmio_cache_snapshots: [max_cpus]mtrr.CacheSnapshot = [_]mtrr.CacheSnapshot{.{}} ** max_cpus;
+var mmio_cache_matches: [max_cpus]u32 = [_]u32{0} ** max_cpus;
+var mmio_cache_online_mask: u64 = 0;
+
 extern fn stageUserReturnFromFramePointerForCurrentCpu(frame_addr: usize, iret_offset: usize) callconv(.winapi) void;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
@@ -64,6 +79,13 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_vector), &ap_user_timer_vector));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_user_timer_initial_count), &ap_user_timer_initial_count));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wake_ipi_vector), &wake_ipi_vector));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_first), &irq_drain_first));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_count), &irq_drain_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_generation), &irq_drain_generation));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(irq_drain_ack), &irq_drain_ack));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_snapshots), &mmio_cache_snapshots));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_matches), &mmio_cache_matches));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(mmio_cache_online_mask), &mmio_cache_online_mask));
     return end;
 }
 
@@ -465,6 +487,8 @@ fn setCpuState(cpu_slot: usize, state: CpuState) void {
 
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
     @atomicStore(u64, &broadcast_online_mask, 0, .release);
+    @atomicStore(u64, &mmio_cache_online_mask, 0, .release);
+    @atomicStore(u32, &mmio_cache_matches[0], @intFromBool(mtrr.captureCacheSnapshot(&mmio_cache_snapshots[0])), .release);
     if (info.trampoline_base == 0) {
         return false;
     }
@@ -483,6 +507,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
         const apic_id = info.lapic_ids[i];
         if (apic_id == bsp_id) continue;
         @atomicStore(u32, &ap_started[cpu_slot], 0, .release);
+        @atomicStore(u32, &mmio_cache_matches[cpu_slot], 0, .release);
         runtimeLapicIdPtr(cpu_slot).* = 0xFF;
         setCpuState(cpu_slot, .booting);
         if (!x86_platform.mapCpuRuntimeStacks(cpu_slot)) {
@@ -525,6 +550,11 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
         const mask = onlineCpuMask();
         if (@popCount(mask) == info.lapic_count) {
             @atomicStore(u64, &broadcast_online_mask, mask, .release);
+            var matching: u64 = 0;
+            for (&mmio_cache_matches, 0..) |*value, slot| {
+                if (@atomicLoad(u32, value, .acquire) != 0) matching |= @as(u64, 1) << @intCast(slot);
+            }
+            if (matching == mask) @atomicStore(u64, &mmio_cache_online_mask, mask, .release);
         }
     }
     return success;
@@ -554,10 +584,21 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     _ = x86_platform.enablePcidIfSupported();
     _ = x86_platform.enablePkuIfSupported();
     _ = lapic.enableLocalApic();
+    const cache_snapshot = &mmio_cache_snapshots[cpu_slot];
+    const cache_matches = mtrr.captureCacheSnapshot(cache_snapshot) and
+        @atomicLoad(u32, &mmio_cache_matches[0], .acquire) != 0 and
+        mmio_cache_snapshots[0].matches(cache_snapshot);
+    @atomicStore(u32, &mmio_cache_matches[cpu_slot], @intFromBool(cache_matches), .release);
     runtimeLapicIdPtr(cpu_slot).* = lapic.localApicId();
     setCpuState(cpu_slot, .idle);
     markStarted(cpu_slot);
     apIdleLoop(cpu_slot);
+}
+
+pub fn ucMinusMmioAllowed(paddr: u64, bytes: u64) bool {
+    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
+    return verified != 0 and verified == onlineCpuMask() and
+        mmio_cache_snapshots[0].rangeIsUncached(paddr, bytes);
 }
 
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {
@@ -590,6 +631,56 @@ pub fn interruptCpu(cpu_slot: usize) bool {
     if (cpuState(cpu_slot) == .absent) return false;
     if (wake_ipi_vector == 0) return false;
     return lapic.sendFixedIpi(apic_id, wake_ipi_vector);
+}
+
+/// Called after EOI and after device publication completes. A maintenance
+/// IPI must not acknowledge lower-priority device interrupts still in IRR.
+pub fn acknowledgeInterruptDrain() void {
+    const generation = @atomicLoad(u64, &irq_drain_generation, .acquire);
+    const cpu = currentCpuSlot();
+    if (cpu >= max_cpus or generation == 0 or
+        @atomicLoad(u64, &irq_drain_ack[cpu], .acquire) == generation) return;
+    const first = @atomicLoad(u8, &irq_drain_first, .acquire);
+    const count = @atomicLoad(u8, &irq_drain_count, .acquire);
+    if (lapic.interruptRangePending(first, count)) return;
+    @atomicStore(u64, &irq_drain_ack[cpu], generation, .release);
+}
+
+/// Drain every CPU because native MSI address programming belongs to the
+/// device owner. Source masking/readback precedes this call; no thread may
+/// re-enable that source until it returns. IRQ handlers only try the held
+/// kernel-state lock, so the interrupt window cannot recursively acquire it.
+pub fn drainInterruptRange(first: u8, count: u8) bool {
+    const targets = onlineCpuMask();
+    if (targets == 0 or count == 0) return false;
+    const prior = @atomicLoad(u64, &irq_drain_generation, .acquire);
+    if (prior == std.math.maxInt(u64)) return false;
+    const generation = prior + 1;
+    @atomicStore(u8, &irq_drain_first, first, .release);
+    @atomicStore(u8, &irq_drain_count, count, .release);
+    @atomicStore(u64, &irq_drain_generation, generation, .release);
+    var cpu: usize = 0;
+    var sent = true;
+    while (cpu < max_cpus and cpu < 64) : (cpu += 1) {
+        if ((targets & (@as(u64, 1) << @intCast(cpu))) != 0 and cpu != currentCpuSlot())
+            sent = interruptCpu(cpu) and sent;
+    }
+    if (!sent) return false;
+    var spins: usize = 0;
+    while (spins < 10_000_000) : (spins += 1) {
+        acknowledgeInterruptDrain();
+        var complete = true;
+        cpu = 0;
+        while (cpu < max_cpus and cpu < 64) : (cpu += 1) {
+            if ((targets & (@as(u64, 1) << @intCast(cpu))) != 0 and
+                @atomicLoad(u64, &irq_drain_ack[cpu], .acquire) != generation) complete = false;
+        }
+        if (complete) return true;
+        // Let pending device edges run after the maintenance ISR returned.
+        // Do not keep injecting a higher-priority maintenance IPI here.
+        asm volatile ("sti; pause; cli" ::: .{ .memory = true });
+    }
+    return false;
 }
 
 /// IF must remain clear. Failure means the caller must use per-CPU sends;
@@ -722,8 +813,13 @@ fn jumpToUserReturn() callconv(.winapi) void {
     asm volatile ("jmp userReturnToSavedFrame" ::: .{ .memory = true });
 }
 
-fn enterUserModeFromIdle(entry: *const scheduler_observer.UserEntry) noreturn {
+fn enterUserModeFromIdle(entry: *scheduler_observer.UserEntry) noreturn {
     asm volatile ("cli");
+    // A runnable thread may carry a pending signal whose IPI reached another
+    // thread or an inhibited/kernel context. Every AP redispatch is a user
+    // return boundary; do not depend on an uninterrupted timer slice to stage
+    // it. Stage before restoring the selected thread's live XState.
+    @import("traps.zig").stagePendingSignalForUserReturn(&entry.frame);
     if (ap_user_timer_vector != 0) {
         _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
     }

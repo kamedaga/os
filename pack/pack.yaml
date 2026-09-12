@@ -29,7 +29,7 @@ startupManifest:
   include: ["rootfs"]
 # Overlay expansion omits empty directories. Desktop must exist before
 # xfdesktop constructs its regular-file icons on the first login.
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/root/Desktop", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/root/Desktop", "/share", "/share/fastfetch", "/share/fonts", "/run", "/etc/polkit-1/rules.d", "/usr/local/share/polkit-1/rules.d", "/etc/polkit-1/actions", "/usr/local/share/polkit-1/actions"]
 skip:
   apps:
     - "alpine_go"
@@ -1177,6 +1177,118 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_child_lifecycle_red.c"
     out: "LPRCHILD.ELF"
     rootfs: "/cmd/lpr_child_lifecycle_red.elf"
+  lpr_credentials:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_credentials.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_credentials", "userland/fixtures/src/wsl_musl/lpr_credentials.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_credentials.c"
+    out: "CREDS.ELF"
+    rootfs: "/cmd/lpr_credentials.elf"
+  lpr_service_account:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_service_account.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_service_account", "userland/fixtures/src/wsl_musl/lpr_service_account.c"]
+    out: "SRVACCT.ELF"
+    rootfs: "/cmd/lpr_service_account.elf"
+  dbus_account_test_config:
+    file: "userland/fixtures/linux/dbus-account-test.conf"
+    out: "ACCTBUS.CONF"
+    rootfs: "/etc/dbus-1/pacha-account-test.conf"
+  dbus_system_config:
+    file:
+      path: ".artifacts/userland-fixtures/dbus-system.conf"
+      rebuild: ["bash", "tools/build_dbus_system_config.sh"]
+      input:
+        - "tools/build_dbus_system_config.sh"
+        - ".artifacts/userland-fixtures/alpine-xfce-root/usr/share/dbus-1/system.conf"
+    out: "DBUSSYST.CONF"
+    rootfs: "/etc/dbus-1/pacha-system.conf"
+  service_runtime:
+    file: "userland/fixtures/linux/service-runtime.sh"
+    out: "SRVRUN.SH"
+    rootfs: "/sbin/pacha-service-runtime"
+  system_services_test:
+    file: "tests/fixtures/system_services.sh"
+    out: "SYSSVCS.SH"
+    rootfs: "/cmd/system_services.sh"
+  lpr_real_service:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_real_service.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_real_service", "userland/fixtures/src/wsl_musl/lpr_real_service.c"]
+    out: "REALSRV.ELF"
+    rootfs: "/cmd/lpr_real_service.elf"
+  lpr_random:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_random.dynamic.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_random", "userland/fixtures/src/wsl_musl/lpr_random.c"]
+    out: "RANDOM.ELF"
+    rootfs: "/cmd/lpr_random.elf"
+  lpr_madvise:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_madvise.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_madvise", "userland/fixtures/src/wsl_musl/lpr_madvise.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_madvise.c"
+    out: "MADVISE.ELF"
+    rootfs: "/cmd/lpr_madvise.elf"
+  lpr_accounts:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_accounts.static.elf"
+      rebuild: ["bash", "-lc", "C_INCLUDE_PATH=userland/libaccount/include bash pack/scripts/build_lpr_pthread_smoke.sh .artifacts/userland-fixtures/lpr_accounts userland/fixtures/src/wsl_musl/lpr_accounts.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_accounts.c"
+        - "userland/libaccount"
+    out: "ACCOUNTS.ELF"
+    rootfs: "/cmd/lpr_accounts.elf"
+  native_host_primitives:
+    file:
+      path: ".artifacts/tests/native-host-primitives/native_host_primitives.elf"
+      rebuild: ["bash", "tests/build-native-host-primitives.sh"]
+      input:
+        - "tests/build-native-host-primitives.sh"
+        - "tests/native_execution_contract.c"
+        - "tests/native_clock_contract.c"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "userland/libipc/include"
+    out: "NATPRIM.ELF"
+    rootfs: "/cmd/native_host_primitives.elf"
+  native_device_contract:
+    file:
+      path: ".artifacts/tests/native-host-primitives/native_device_contract.elf"
+      rebuild: ["bash", "tests/build-native-device-contract.sh"]
+      input:
+        - "tests/build-native-device-contract.sh"
+        - "tests/native_device_contract.c"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "userland/libipc/include"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+    out: "NATDEV.ELF"
+    rootfs: "/cmd/native_device_contract.elf"
+  process_create_grants_native:
+    file:
+      path: ".artifacts/tests/process-create-grants/process_create_grants.elf"
+      rebuild: ["bash", "tests/build-process-create-grants-native.sh"]
+      input:
+        - "tests/build-process-create-grants-native.sh"
+        - "tests/process_create_grants_native.c"
+        - "tests/filed_identity_native.h"
+        - "userland/filed/include"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "GRANTS.ELF"
+    rootfs: "/cmd/process_create_grants.elf"
   unix_native_contract:
     file:
       path: ".artifacts/tests/unix-native/unix_native_contract.elf"
@@ -1615,15 +1727,18 @@ apps:
         - "_kobox/src"
     out: "TERMD.ELF"
     rootfs: "/srv/termd.elf"
-  drmd:
+  gpud:
     role: "service"
     file:
-      path: ".artifacts/cmake/drmd/drmd.elf"
-      rebuild: ["bash", "-lc", "cmake -S userland/drmd -B .artifacts/cmake/drmd && cmake --build .artifacts/cmake/drmd --parallel 1"]
+      path: ".artifacts/cmake/gpud/gpud.elf"
+      rebuild: ["bash", "-lc", "cmake -S userland/gpud -B .artifacts/cmake/gpud && cmake --build .artifacts/cmake/gpud --parallel 1"]
       input:
-        - "userland/drmd/CMakeLists.txt"
-        - "userland/drmd/src"
-        - "userland/drmd/include"
+        - "userland/gpud"
+        - "userland/kobox2_adapter"
+        - "kobox2/include"
+        - "kobox2/src"
+        - "kobox2/protocol"
+        - "kobox2/linux-sandbox/kobox"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
         - "userland/libpacha/include"
@@ -1632,12 +1747,97 @@ apps:
         - "userland/libipc/src"
         - "userland/filed/include"
         - "userland/libfiled_client"
-        - "_kobox/include"
-        - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
-    out: "DRMD.ELF"
-    rootfs: "/srv/drmd.elf"
+    out: "GPUD.ELF"
+    rootfs: "/srv/gpud.elf"
+  gpud_sandbox:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/gpud/sandbox.elf"
+      rebuild: ["bash", "-lc", "cmake -S userland/gpud -B .artifacts/cmake/gpud && cmake --build .artifacts/cmake/gpud --parallel 1"]
+      input:
+        - "userland/gpud"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "GPUDSBX.ELF"
+    rootfs: "/srv/kobox2/sandbox.elf"
+  gpud_core:
+    file:
+      path: ".artifacts/gpud-production-runtime/linux-boot-runtime.so"
+      rebuild: ["bash", "userland/gpud/build-package.sh"]
+      input:
+        - "userland/gpud/build-package.sh"
+        - "kobox2/linux-sandbox/kobox"
+    out: "GPUCORE.SO"
+    rootfs: "/srv/kobox2/core.so"
+  gpud_i2c_core:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/i2c/i2c-core.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/i2c/i2c-core.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUI2C.KO"
+    rootfs: "/srv/kobox2/modules/i2c-core.ko"
+  gpud_drm_panel_quirks:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUPANEL.KO"
+    rootfs: "/srv/kobox2/modules/drm_panel_orientation_quirks.ko"
+  gpud_drm:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/gpu/drm/drm.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUDRM.KO"
+    rootfs: "/srv/kobox2/modules/drm.ko"
+  gpud_drm_shmem:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm_shmem_helper.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/gpu/drm/drm_shmem_helper.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUSHMEM.KO"
+    rootfs: "/srv/kobox2/modules/drm_shmem_helper.ko"
+  gpud_virtio_ring:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_ring.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/virtio/virtio_ring.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUVRING.KO"
+    rootfs: "/srv/kobox2/modules/virtio_ring.ko"
+  gpud_virtio:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/virtio/virtio.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUVIRT.KO"
+    rootfs: "/srv/kobox2/modules/virtio.ko"
+  gpud_virtio_pci_modern:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_pci_modern_dev.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/virtio/virtio_pci_modern_dev.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUVPMOD.KO"
+    rootfs: "/srv/kobox2/modules/virtio_pci_modern_dev.ko"
+  gpud_virtio_pci:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_pci.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/virtio/virtio_pci.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUVPCI.KO"
+    rootfs: "/srv/kobox2/modules/virtio_pci.ko"
+  gpud_virtio_dma_buf:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_dma_buf.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/virtio/virtio_dma_buf.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUVDBUF.KO"
+    rootfs: "/srv/kobox2/modules/virtio_dma_buf.ko"
+  gpud_drm_kms:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm_kms_helper.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/gpu/drm/drm_kms_helper.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUKMS.KO"
+    rootfs: "/srv/kobox2/modules/drm_kms_helper.ko"
+  gpud_virtio_gpu:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/virtio/virtio-gpu.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/gpu/drm/virtio/virtio-gpu.ko || bash userland/gpud/build-package.sh"]
+    out: "GPUVIRGL.KO"
+    rootfs: "/srv/kobox2/modules/virtio-gpu.ko"
   inputd:
     role: "service"
     file:
@@ -1776,6 +1976,7 @@ apps:
         - "userland/lpr_supervisor/CMakeLists.txt"
         - "userland/lpr_supervisor/include"
         - "userland/lpr_supervisor/src"
+        - "userland/libaccount"
         - "userland/unixd/include"
         - "userland/unixd/src/client.c"
         - "userland/unixd/src/client_wire.c"

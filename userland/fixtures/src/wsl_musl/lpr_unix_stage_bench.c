@@ -93,9 +93,11 @@ static void *eviction_worker(void *opaque)
 {
     uint64_t value = (uintptr_t)opaque + 1, received = 0;
     int pair[2];
+    int started = pthread_barrier_wait(&eviction_barrier);
+    require(started == 0 || started == PTHREAD_BARRIER_SERIAL_THREAD, "pressure start barrier");
     require(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0, "evict pair");
-    /* Twenty live thread sessions exceed unixd's sixteen mapping slots.
-     * Every worker then uses its old local page/token again. */
+    /* Thread-local clients share one process session / request queue.
+     * Exercise concurrent RPC backpressure, not independent cache owners. */
     for (unsigned i = 0; i < 12; i++) {
         transfer(pair[0], (void *)&value, sizeof(value), 1, -1, 0);
         transfer(pair[1], (void *)&received, sizeof(received), 0, -1, 0);
@@ -217,7 +219,14 @@ static void connect_pair(int type, unsigned id, int abstract, int out[2])
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--eviction-test")) return eviction_test();
-    if (argc == 2 && !strcmp(argv[1], "--thread-pressure-test")) return thread_pressure_test();
+    if ((argc == 2 || argc == 3) && !strcmp(argv[1], "--thread-pressure-test")) {
+        char *end = NULL;
+        unsigned long cycles = argc == 3 ? strtoul(argv[2], &end, 10) : 1;
+        if (!cycles || cycles > 100 || (end && *end)) return 2;
+        for (unsigned long i = 0; i < cycles; i++) thread_pressure_test();
+        printf("UNIX_THREAD_PRESSURE=OK threads=20 rounds=12 cycles=%lu\n", cycles);
+        return 0;
+    }
     if (argc != 6) {
         fprintf(stderr, "usage: %s ready|rtt|poll|epoll|rights|named|abstract type bytes iterations trials\n", argv[0]);
         return 2;

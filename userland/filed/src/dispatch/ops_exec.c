@@ -4,7 +4,8 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_runtime_t *runtime,
     void *page)
 {
-    filed_exec_path_t *exec = (filed_exec_path_t *)page;
+    filed_exec_path_t snapshot = *(filed_exec_path_t *)page;
+    filed_exec_path_t *exec = &snapshot;
     const uint64_t known_flags =
         FILED_EXEC_INHERIT_HANDLES |
         FILED_EXEC_LINUX_LPR |
@@ -12,16 +13,6 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
-    int exec_filed_endpoint_fd = -1;
-    int exec_netd_socket_endpoint_fd = -1;
-    int exec_termd_tty_endpoint_fd = -1;
-    int exec_drmd_drm_endpoint_fd = -1;
-    int exec_inputd_input_endpoint_fd = -1;
-    int exec_filed_endpoint_borrowed = 0;
-    int exec_netd_socket_endpoint_borrowed = 0;
-    int exec_termd_tty_endpoint_borrowed = 0;
-    int exec_drmd_drm_endpoint_borrowed = 0;
-    int exec_inputd_input_endpoint_borrowed = 0;
     filed_handle_id_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
@@ -65,62 +56,6 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
         inherit_handles[i] = dup_handle;
     }
 
-    if (runtime->client_endpoint_fd >= 16) {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->client_endpoint_fd,
-            FILED_EXEC_FILED_ENDPOINT_FD,
-            &exec_filed_endpoint_fd,
-            &exec_filed_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->netd_socket_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->netd_socket_endpoint_fd,
-            FILED_EXEC_NETD_SOCKET_ENDPOINT_FD,
-            &exec_netd_socket_endpoint_fd,
-            &exec_netd_socket_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->termd_tty_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->termd_tty_endpoint_fd,
-            FILED_EXEC_TERMD_TTY_ENDPOINT_FD,
-            &exec_termd_tty_endpoint_fd,
-            &exec_termd_tty_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->drmd_drm_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->drmd_drm_endpoint_fd,
-            FILED_EXEC_DRMD_DRM_ENDPOINT_FD,
-            &exec_drmd_drm_endpoint_fd,
-            &exec_drmd_drm_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec->flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->inputd_input_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->inputd_input_endpoint_fd,
-            FILED_EXEC_INPUTD_INPUT_ENDPOINT_FD,
-            &exec_inputd_input_endpoint_fd,
-            &exec_inputd_input_endpoint_borrowed);
-        if (reply_status != 0) goto out;
-    }
     filed_openat_t openat;
     memset(&openat, 0, sizeof(openat));
     openat.dir_handle = exec->dir_handle;
@@ -149,11 +84,6 @@ filed_page_dispatch_result_t filed_dispatch_exec_path_session_page(
     filed_close_walk_handle(runtime, open_result.handle_id, 1);
 
 out:
-    filed_dispatch_close_prepared_endpoint(&exec_filed_endpoint_fd, exec_filed_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_drmd_drm_endpoint_fd, exec_drmd_drm_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_inputd_input_endpoint_fd, exec_inputd_input_endpoint_borrowed);
     if (reply_status != 0) {
         for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_HANDLES; ++i) {
             if (inherit_handles[i] != 0) {
@@ -191,7 +121,8 @@ int filed_dispatch_exec_path(
         return filed_send_reply(reply_fd, NULL, &request_header, -22, 0, 0);
     }
 
-    filed_exec_path_t *exec = (filed_exec_path_t *)page;
+    filed_exec_path_t snapshot = *(filed_exec_path_t *)page;
+    filed_exec_path_t *exec = &snapshot;
     const uint64_t known_flags =
         FILED_EXEC_BOOTSTRAP_FD |
         FILED_EXEC_INHERIT_FDS |
@@ -199,34 +130,22 @@ int filed_dispatch_exec_path(
         FILED_EXEC_INHERIT_HANDLES |
         FILED_EXEC_LINUX_LPR |
         FILED_EXEC_TRANSFER_PROCESS_FD |
-        FILED_EXEC_DEFER_START;
+        FILED_EXEC_DEFER_START |
+        FILED_EXEC_SERVICE_NETD | FILED_EXEC_SERVICE_TERMD |
+        FILED_EXEC_SERVICE_DRMD | FILED_EXEC_SERVICE_INPUTD;
     const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
     int process_fd = -1;
     int thread_fd = -1;
     int bootstrap_fd = -1;
-    int exec_filed_endpoint_fd = -1;
-    int exec_netd_socket_endpoint_fd = -1;
-    int exec_termd_tty_endpoint_fd = -1;
-    int exec_drmd_drm_endpoint_fd = -1;
-    int exec_inputd_input_endpoint_fd = -1;
-    int exec_lpr_bootstrap_fd = -1;
-    int exec_filed_endpoint_borrowed = 0;
-    int exec_netd_socket_endpoint_borrowed = 0;
-    int exec_termd_tty_endpoint_borrowed = 0;
-    int exec_drmd_drm_endpoint_borrowed = 0;
-    int exec_inputd_input_endpoint_borrowed = 0;
     int inherit_fds[FILED_EXEC_MAX_INHERIT_FDS];
-    filed_dispatch_saved_fd_t inherit_saved[FILED_EXEC_MAX_INHERIT_FDS];
-    filed_dispatch_saved_fd_t lpr_bootstrap_saved;
     filed_handle_id_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
     memset(inherit_fds, 0xff, sizeof(inherit_fds));
-    for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_FDS; ++i) {
-        filed_dispatch_saved_fd_init(&inherit_saved[i]);
-    }
-    filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
     memset(inherit_handles, 0, sizeof(inherit_handles));
 
+    reply_status = filed_client_authorize(runtime, FILED_OP_EXEC_PATH, exec, sizeof(*exec), 0);
+    if (reply_status) goto out;
+    reply_status = -22;
     if ((exec_flags & ~known_flags) != 0 ||
         ((exec_flags & FILED_EXEC_DEFER_START) != 0 &&
          (exec_flags & FILED_EXEC_LINUX_LPR) == 0) ||
@@ -298,17 +217,10 @@ int filed_dispatch_exec_path(
 
     for (uint64_t i = 0; i < inherit_fd_count; ++i) {
         const uint64_t fd_index = 1u + i;
-        if (request->fds[fd_index].fd >= FILED_EXEC_MAX_FDS) {
+        if (request->fds[fd_index].fd < 16 || request->fds[fd_index].fd >= PACHA_FD_TABLE_LIMIT) {
             goto out;
         }
-        reply_status = filed_dispatch_prepare_inherit_fd_to_target(
-            (int)request->fds[fd_index].fd,
-            exec->inherit_fd_targets[i],
-            &inherit_fds[i],
-            &inherit_saved[i]);
-        if (reply_status != 0) {
-            goto out;
-        }
+        inherit_fds[i] = (int)request->fds[fd_index].fd;
     }
 
     if ((exec_flags & FILED_EXEC_BOOTSTRAP_FD) != 0) {
@@ -332,77 +244,6 @@ int filed_dispatch_exec_path(
         inherit_handles[i] = dup_handle;
     }
 
-    if (runtime->client_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->client_endpoint_fd,
-            FILED_EXEC_FILED_ENDPOINT_FD,
-            &exec_filed_endpoint_fd,
-            &exec_filed_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->netd_socket_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->netd_socket_endpoint_fd,
-            FILED_EXEC_NETD_SOCKET_ENDPOINT_FD,
-            &exec_netd_socket_endpoint_fd,
-            &exec_netd_socket_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->termd_tty_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->termd_tty_endpoint_fd,
-            FILED_EXEC_TERMD_TTY_ENDPOINT_FD,
-            &exec_termd_tty_endpoint_fd,
-            &exec_termd_tty_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->drmd_drm_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->drmd_drm_endpoint_fd,
-            FILED_EXEC_DRMD_DRM_ENDPOINT_FD,
-            &exec_drmd_drm_endpoint_fd,
-            &exec_drmd_drm_endpoint_borrowed);
-        if (reply_status != 0) {
-            goto out;
-        }
-    }
-    if ((exec_flags & FILED_EXEC_LINUX_LPR) != 0 &&
-        runtime->inputd_input_endpoint_fd >= 16)
-    {
-        reply_status = filed_dispatch_prepare_endpoint_to_fixed(
-            runtime->inputd_input_endpoint_fd,
-            FILED_EXEC_INPUTD_INPUT_ENDPOINT_FD,
-            &exec_inputd_input_endpoint_fd,
-            &exec_inputd_input_endpoint_borrowed);
-        if (reply_status != 0) goto out;
-    }
-    if ((exec_flags & (FILED_EXEC_LINUX_LPR | FILED_EXEC_BOOTSTRAP_FD)) ==
-        (FILED_EXEC_LINUX_LPR | FILED_EXEC_BOOTSTRAP_FD))
-    {
-        const int bootstrap_source_fd = bootstrap_fd;
-        reply_status = filed_dispatch_prepare_inherit_fd_to_target(
-            bootstrap_source_fd,
-            FILED_EXEC_LPR_BOOTSTRAP_FD,
-            &exec_lpr_bootstrap_fd,
-            &lpr_bootstrap_saved);
-        if (reply_status != 0) {
-            goto out;
-        }
-        bootstrap_fd = -1;
-    }
 
     if ((exec_flags & FILED_EXEC_PATCH_BOOTSTRAP_FDS) != 0) {
         void *bootstrap_page = pacha_mmap(
@@ -427,13 +268,13 @@ int filed_dispatch_exec_path(
                     reply_status = -22;
                     break;
                 }
-                value = (uint64_t)(uint32_t)inherit_fds[patch->index];
+                value = exec->fd_grants[patch->index].target;
             } else if (patch->kind == FILED_EXEC_PATCH_BOOTSTRAP_FD) {
                 if (patch->index != 0) {
                     reply_status = -22;
                     break;
                 }
-                value = (uint64_t)(uint32_t)bootstrap_fd;
+                value = FILED_EXEC_NATIVE_BOOTSTRAP_FD;
             } else if (patch->kind == FILED_EXEC_PATCH_INHERIT_HANDLE) {
                 if (patch->index >= inherit_handle_count) {
                     reply_status = -22;
@@ -479,7 +320,7 @@ int filed_dispatch_exec_path(
         exec,
         inherit_fds,
         inherit_fd_count,
-        exec_lpr_bootstrap_fd >= 0 ? exec_lpr_bootstrap_fd : bootstrap_fd,
+        bootstrap_fd,
         &process_fd,
         &thread_fd);
     filed_close_walk_handle(runtime, open_result.handle_id, 1);
@@ -491,22 +332,7 @@ int filed_dispatch_exec_path(
         goto out;
     }
 
-out:
-    filed_dispatch_close_prepared_endpoint(&exec_filed_endpoint_fd, exec_filed_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_netd_socket_endpoint_fd, exec_netd_socket_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_termd_tty_endpoint_fd, exec_termd_tty_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_drmd_drm_endpoint_fd, exec_drmd_drm_endpoint_borrowed);
-    filed_dispatch_close_prepared_endpoint(&exec_inputd_input_endpoint_fd, exec_inputd_input_endpoint_borrowed);
-    if (exec_lpr_bootstrap_fd >= 0) {
-        if (lpr_bootstrap_saved.fd >= 0) {
-            filed_dispatch_restore_target_fd(exec_lpr_bootstrap_fd, &lpr_bootstrap_saved);
-        } else {
-            filed_dispatch_close_owned_fd(&exec_lpr_bootstrap_fd);
-        }
-    } else if (lpr_bootstrap_saved.fd >= 0) {
-        (void)pacha_fd_close(lpr_bootstrap_saved.fd);
-        filed_dispatch_saved_fd_init(&lpr_bootstrap_saved);
-    }
+out:;
     const uint64_t reply_result = reply_status == 0 ? (uint64_t)(uint32_t)process_fd : 0;
     if (reply_status != 0) {
         (void)filed_error_token(
@@ -534,14 +360,7 @@ out:
     }
     for (uint64_t i = 0; i < FILED_EXEC_MAX_INHERIT_FDS; ++i) {
         if (inherit_fds[i] >= 0) {
-            if (inherit_saved[i].fd >= 0) {
-                filed_dispatch_restore_target_fd(inherit_fds[i], &inherit_saved[i]);
-            } else {
-                filed_dispatch_close_owned_fd(&inherit_fds[i]);
-            }
-        } else if (inherit_saved[i].fd >= 0) {
-            (void)pacha_fd_close(inherit_saved[i].fd);
-            filed_dispatch_saved_fd_init(&inherit_saved[i]);
+            filed_dispatch_close_owned_fd(&inherit_fds[i]);
         }
     }
     if (reply_status != 0) {
@@ -592,7 +411,8 @@ int filed_dispatch_exec_self(
         return filed_send_reply(reply_fd, NULL, &request_header, -22, 0, 0);
     }
 
-    filed_exec_path_t *exec = (filed_exec_path_t *)page;
+    filed_exec_path_t snapshot = *(filed_exec_path_t *)page;
+    filed_exec_path_t *exec = &snapshot;
     const uint64_t known_flags =
         FILED_EXEC_BOOTSTRAP_FD |
         FILED_EXEC_LINUX_LPR |
@@ -608,6 +428,9 @@ int filed_dispatch_exec_self(
         bootstrap_fd = (int)request->fds[1].fd;
     }
 
+    reply_status = filed_client_authorize(runtime, FILED_OP_EXEC_SELF, exec, sizeof(*exec), 0);
+    if (reply_status) goto out;
+    reply_status = -22;
     if ((exec->flags & ~known_flags) != 0 ||
         (exec->flags & (FILED_EXEC_BOOTSTRAP_FD | FILED_EXEC_LINUX_LPR | FILED_EXEC_SELF)) !=
             (FILED_EXEC_BOOTSTRAP_FD | FILED_EXEC_LINUX_LPR | FILED_EXEC_SELF) ||
@@ -731,6 +554,14 @@ int filed_dispatch_session_open(
     uint64_t result = 0;
     const int channel_fd = (int)request->fds[1].fd;
     const int page_fd = (int)request->fds[2].fd;
+    if (runtime->actor) {
+        struct pacha_fd_info info;
+        const uint64_t required = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND |
+            PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+        if (pacha_fd_get_info(channel_fd, &info) != 0 || info.kind != PACHA_FD_KIND_CHANNEL ||
+            (info.rights & required) != required)
+            return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
+    }
     void *session_page = pacha_mmap(
         page_fd,
         FILED_SESSION_PAGE_BYTES,
@@ -766,6 +597,7 @@ int filed_dispatch_session_open(
         session->page_fd = page_fd;
         session->page = session_page;
         session->page_size = FILED_SESSION_PAGE_BYTES;
+        session->client = runtime->actor;
         session->active = 1;
         if (out_keep_fd != NULL) {
             *out_keep_fd = channel_fd;

@@ -1,5 +1,4 @@
 #include "filed/runtime.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,71 +83,7 @@ static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
     runtime->syncer_flushes++;
 }
 
-static int filed_clear_inherit_flag(int fd)
-{
-    if (fd < 16) {
-        return -1;
-    }
-    const long status = pacha_fd_fcntl(
-        fd,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        0,
-        PACHA_FD_FLAG_INHERIT);
-    return status == 0 ? 0 : -2;
-}
 
-static int filed_set_inherit_flag(int fd)
-{
-    if (fd < 16) {
-        return -1;
-    }
-    const long status = pacha_fd_fcntl(
-        fd,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        PACHA_FD_FLAG_INHERIT,
-        PACHA_FD_FLAG_INHERIT);
-    return status == 0 ? 0 : -2;
-}
-
-static int filed_pin_exec_endpoint_fd(int endpoint_fd, int *out_fd)
-{
-    if (out_fd != NULL) {
-        *out_fd = -1;
-    }
-    if (endpoint_fd < 16 || out_fd == NULL) {
-        return -1;
-    }
-    if (endpoint_fd == FILED_RUNTIME_EXEC_ENDPOINT_FD) {
-        *out_fd = endpoint_fd;
-        return 0;
-    }
-
-    const uint64_t endpoint_rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_DUP |
-        PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_SEND |
-        PACHA_FD_RIGHT_RECV |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CALL |
-        PACHA_FD_RIGHT_TRANSFER;
-    const long dup_fd = pacha_fd_fcntl(
-        endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        FILED_RUNTIME_EXEC_ENDPOINT_FD,
-        endpoint_rights);
-    if (dup_fd != FILED_RUNTIME_EXEC_ENDPOINT_FD) {
-        if (dup_fd >= 16) {
-            (void)pacha_fd_close((int)dup_fd);
-        }
-        return -24;
-    }
-    (void)pacha_fd_close(endpoint_fd);
-    *out_fd = (int)dup_fd;
-    return 0;
-}
 
 static int filed_find_bootstrap_fd(char **argv, int *out_fd)
 {
@@ -281,13 +216,7 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
     status = filed_read_storage_bootstrap_fd(runtime->bootstrap_fd, &storage_bootstrap, &bootstrap_bytes);
     if (status == 0 && storage_bootstrap.magic == KOBOXD_BOOTSTRAP_MAGIC) {
         if (storage_bootstrap.unix_path_fd < 16 || storage_bootstrap.unix_path_fd >= PACHA_FD_TABLE_LIMIT) return -22;
-        const long path = pacha_syscall4(PACHA_FD_SYSCALL_DUP, storage_bootstrap.unix_path_fd, 16,
-            PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
-            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_INSPECT,
-            PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
-        (void)pacha_fd_close((int)storage_bootstrap.unix_path_fd);
-        if (path < 16 || path >= PACHA_FD_TABLE_LIMIT) return -13;
-        runtime->unix_path_fd = (int)path;
+        runtime->unix_path_fd = (int)storage_bootstrap.unix_path_fd;
         koboxd_storage_runtime_t *storage_runtime = filed_runtime_storage_runtime(runtime);
         if (storage_runtime == NULL) {
             return -12;
@@ -306,31 +235,7 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
             &runtime->backend,
             koboxd_storage_runtime_fs_backend(storage_runtime),
             koboxd_filed_direct_ops());
-        status = filed_pin_exec_endpoint_fd(
-            (int)(uint32_t)storage_bootstrap.control_fd,
-            &runtime->client_endpoint_fd);
-        if (status != 0) {
-            return status;
-        }
-        status = filed_clear_inherit_flag(runtime->bootstrap_fd);
-        if (status != 0) {
-            return status;
-        }
-        status = filed_clear_inherit_flag((int)(uint32_t)storage_bootstrap.device_fd);
-        if (status != 0) {
-            return status;
-        }
-        for (uint64_t i = 0; i < storage_bootstrap.module_count; i++) {
-            status = filed_clear_inherit_flag(
-                (int)(uint32_t)storage_bootstrap.modules[i].image_fd);
-            if (status != 0) {
-                return status;
-            }
-        }
-        status = filed_set_inherit_flag(runtime->client_endpoint_fd);
-        if (status != 0) {
-            return status;
-        }
+        runtime->client_endpoint_fd = (int)storage_bootstrap.control_fd;
         return 0;
     }
 
@@ -353,20 +258,6 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
         &runtime->backend,
         (int)(uint32_t)runtime->bootstrap.fs_backend_fd);
     runtime->client_endpoint_fd = (int)(uint32_t)runtime->bootstrap.public_endpoint_fd;
-    status = filed_clear_inherit_flag(runtime->bootstrap_fd);
-    if (status != 0) {
-        return status;
-    }
-    if (runtime->backend.fs_fd >= 16) {
-        status = filed_clear_inherit_flag(runtime->backend.fs_fd);
-        if (status != 0) {
-            return status;
-        }
-    }
-    status = filed_clear_inherit_flag(runtime->client_endpoint_fd);
-    if (status != 0) {
-        return status;
-    }
 
     return 0;
 }
@@ -709,11 +600,11 @@ int filed_runtime_serve(filed_runtime_t *runtime)
 
     for (;;) {
         struct pacha_pollfd fds[
-            3 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+            PACHA_SERVICE_WAIT_MAX_FDS];
         uint64_t session_indices[
-            3 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+            PACHA_SERVICE_WAIT_MAX_FDS];
         filed_handle_id_t lease_handles[
-            3 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
+            PACHA_SERVICE_WAIT_MAX_FDS];
         memset(lease_handles, 0, sizeof(lease_handles));
         uint64_t count = 0;
         fds[count++] = (struct pacha_pollfd){
@@ -742,7 +633,7 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             session_indices[count] = i;
             fds[count++] = (struct pacha_pollfd){
                 .fd = runtime->sessions[i].channel_fd,
-                .events = PACHA_FD_EVENT_READABLE,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
                 .revents = 0,
             };
         }
@@ -754,9 +645,17 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             lease_handles[count] = handle_id;
             fds[count++] = (struct pacha_pollfd){
                 .fd = lease_fd,
-                .events = PACHA_FD_EVENT_HANGUP,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
                 .revents = 0,
             };
+        }
+
+        const uint64_t clients_begin = count;
+        for (struct filed_client *client = runtime->clients; client; client = client->next) {
+            if (count == PACHA_SERVICE_WAIT_MAX_FDS) return -24;
+            session_indices[count] = client->id;
+            fds[count++] = (struct pacha_pollfd){ .fd = client->fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP };
         }
 
         const long wait_status = pacha_fd_wait_many(
@@ -766,6 +665,8 @@ int filed_runtime_serve(filed_runtime_t *runtime)
         }
 
         if ((fds[0].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) != 0) {
+            runtime->actor = NULL;
+            runtime->vfs.actor_client = 0;
             const int status = filed_dispatch_client_once(runtime, runtime->client_endpoint_fd);
             if (status != 0 &&
                 status != PACHA_ERR_EMPTY &&
@@ -778,7 +679,22 @@ int filed_runtime_serve(filed_runtime_t *runtime)
         }
 
         for (uint64_t pos = 1; pos < count; ++pos) {
+            runtime->actor = NULL;
+            runtime->vfs.actor_client = 0;
             if ((fds[pos].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) == 0) {
+                continue;
+            }
+            if (pos >= clients_begin) {
+                struct filed_client *client = runtime->clients;
+                while (client && client->id != session_indices[pos]) client = client->next;
+                if (!client) continue;
+                if (fds[pos].revents & PACHA_FD_EVENT_HANGUP) filed_client_release(runtime, client);
+                else {
+                    runtime->actor = client;
+                    runtime->vfs.actor_client = client->id;
+                    runtime->vfs.actor_rights = client->identity.rights;
+                    (void)filed_dispatch_client_once(runtime, client->fd);
+                }
                 continue;
             }
             if (runtime->syncer_timer_fd >= 16 && fds[pos].fd == runtime->syncer_timer_fd) {
@@ -795,7 +711,7 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
                     const filed_handle_id_t handle_id = lease_handles[pos];
                     (void)filed_close_handle_runtime(runtime, handle_id);
-                }
+                } else (void)filed_lease_receive(runtime, lease_handles[pos]);
                 continue;
             }
             const uint64_t session_index = session_indices[pos];
@@ -803,6 +719,9 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 continue;
             }
             filed_session_t *session = &runtime->sessions[session_index];
+            runtime->actor = session->client;
+            runtime->vfs.actor_client = session->client ? session->client->id : 0;
+            runtime->vfs.actor_rights = session->client ? session->client->identity.rights : 0;
             if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
                 filed_runtime_release_session(runtime, session_index);
                 continue;
@@ -817,7 +736,8 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 status != PACHA_ERR_NOT_READY &&
                 status != -2)
             {
-                return status;
+                /* A malformed private fast page must not stop other clients. */
+                filed_runtime_release_session(runtime, session_index);
             }
         }
     }

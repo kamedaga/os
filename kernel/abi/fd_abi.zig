@@ -4,32 +4,32 @@ pub const fd_table_limit: u32 = 4096;
 // Returns capacity, maximum, and free slots from first_dynamic_fd as three u64s.
 pub const fd_table_info_size: u64 = 24;
 pub const first_dynamic_fd: u32 = 16;
-// FD_DUP only: mint an observation capability for the calling thread's
+// FD_DUP only: mint an observation/notification capability for the calling thread's
 // current generation, including the initial thread created by PROCESS_CLONE.
 pub const thread_self_fd: u32 = 0xffff_fffe;
 
-pub const syscall_fd_first: u64 = 32;
-pub const syscall_fd_table: u64 = 32;
-pub const syscall_fd_close: u64 = 33;
-pub const syscall_fd_dup: u64 = 34;
-pub const syscall_fd_get_info: u64 = 35;
-pub const syscall_fd_set_flags: u64 = 36;
-pub const syscall_fd_read: u64 = 37;
-pub const syscall_fd_write: u64 = 38;
-pub const syscall_fd_readv: u64 = 39;
-pub const syscall_fd_writev: u64 = 40;
-pub const syscall_fd_fcntl: u64 = 41;
-pub const syscall_fd_poll: u64 = 42;
-pub const syscall_fd_wait_many: u64 = 43;
-pub const syscall_fd_ioctl: u64 = 44;
-pub const syscall_fd_stat: u64 = 45;
-pub const syscall_eventfd_create: u64 = 46;
-pub const syscall_pipe_create: u64 = 47;
-pub const syscall_timerfd_create: u64 = 48;
-pub const syscall_timerfd_settime: u64 = 49;
-pub const syscall_timerfd_gettime: u64 = 50;
-pub const syscall_vmo_create: u64 = 51;
-pub const syscall_vmo_revoke: u64 = 52;
+pub const syscall_fd_first: u64 = 35;
+pub const syscall_fd_table: u64 = 35;
+pub const syscall_fd_close: u64 = 36;
+pub const syscall_fd_dup: u64 = 37;
+pub const syscall_fd_get_info: u64 = 38;
+pub const syscall_fd_set_flags: u64 = 39;
+pub const syscall_fd_read: u64 = 40;
+pub const syscall_fd_write: u64 = 41;
+pub const syscall_fd_readv: u64 = 42;
+pub const syscall_fd_writev: u64 = 43;
+pub const syscall_fd_fcntl: u64 = 44;
+pub const syscall_fd_poll: u64 = 45;
+pub const syscall_fd_wait_many: u64 = 46;
+pub const syscall_fd_ioctl: u64 = 47;
+pub const syscall_fd_stat: u64 = 48;
+pub const syscall_eventfd_create: u64 = 49;
+pub const syscall_pipe_create: u64 = 50;
+pub const syscall_timerfd_create: u64 = 51;
+pub const syscall_timerfd_settime: u64 = 52;
+pub const syscall_timerfd_gettime: u64 = 53;
+pub const syscall_vmo_create: u64 = 54;
+pub const syscall_vmo_revoke: u64 = 55;
 pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -50,8 +50,9 @@ pub const right_wait: u64 = 1 << 3;
 pub const right_poll: u64 = 1 << 4;
 pub const right_set_flags: u64 = 1 << 5;
 pub const right_close: u64 = 1 << 6;
+pub const right_process_signal: u64 = 1 << 26;
 pub const thread_self_rights_mask: u64 =
-    right_inspect | right_wait | right_poll | right_transfer | right_close;
+    right_inspect | right_wait | right_poll | right_transfer | right_close | right_process_signal;
 pub const right_read: u64 = 1 << 42;
 pub const right_write: u64 = 1 << 43;
 pub const right_revoke: u64 = 1 << 44;

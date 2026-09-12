@@ -13,6 +13,14 @@ static _Alignas(pacha_service_envelope_t) unsigned char activation_page[PACHA_SE
 static struct pacha_ipc_fd activated_cap;
 static unsigned activated;
 
+int pacha_fd_table(uint64_t minimum, struct pacha_fd_table_info *info)
+{
+    assert(minimum <= 256);
+    *info = (struct pacha_fd_table_info){ .capacity = 256, .maximum = 256 };
+    for (unsigned fd = 16; fd < 256; fd++) info->free_slots += !native_rights[fd];
+    return 0;
+}
+
 long pacha_syscall2(uint64_t number, uint64_t a0, uint64_t a1)
 {
     assert(number == PACHA_PROCESS_SYSCALL_KILL && a0 == 94 && a1 == 1 && native_rights[94]);

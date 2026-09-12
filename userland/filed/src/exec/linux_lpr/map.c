@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "pacha/ipc.h"
+#include "pacha/syscall.h"
 #include "pacha/trace.h"
 typedef struct lpr_exec_map_metric_record {
     const char *name;
@@ -161,6 +162,7 @@ static int create_segment_vmo(uint64_t map_size, int *out_vmo_fd, unsigned char 
 
     const uint64_t rights =
         PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
@@ -1163,6 +1165,17 @@ static int get_file_map_plan(
     return 0;
 }
 
+static int retain_cached_segment_vmo(int fd)
+{
+    /* Cache eviction can close/reuse its FD while later segments or the ELF
+     * interpreter are being prepared. A pending batch owns its own reference
+     * until commit/discard, independently of the cache entry's lifetime. */
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_EXEC;
+    const long held = pacha_syscall4(PACHA_FD_SYSCALL_DUP, (uint64_t)(uint32_t)fd, 16, rights, 0);
+    return held >= 16 ? (int)held : -12;
+}
+
 static int map_file_segment_batch(
     int process_fd,
     struct pacha_process_map_batch_entry *entries,
@@ -1177,6 +1190,17 @@ static int map_file_segment_batch(
     }
     const uint64_t map_start_ns = lpr_exec_map_now_ns();
     const int status = pacha_process_map_batch(process_fd, entries, *entry_count);
+    if (status != 0) {
+        for (uint64_t i = 0; i < *entry_count; ++i) {
+            struct pacha_fd_info info = {0};
+            const int inspected = pacha_fd_get_info((int)entries[i].vmo_fd, &info);
+            fprintf(stderr, "[filed] map batch failed index=%llu fd=%llu va=0x%llx size=%llu prot=0x%llx inspect=%d kind=%llu rights=0x%llx vmo_size=%llu\n",
+                (unsigned long long)i, (unsigned long long)entries[i].vmo_fd,
+                (unsigned long long)entries[i].target_va, (unsigned long long)entries[i].size,
+                (unsigned long long)entries[i].prot, inspected, (unsigned long long)info.kind,
+                (unsigned long long)info.rights, (unsigned long long)info.size);
+        }
+    }
     lpr_exec_map_metric_time("segment_map_batch", map_start_ns, lpr_exec_map_now_ns(), *entry_count);
     for (uint64_t i = 0; i < *entry_count; ++i) {
         if (close_fds[i] >= 16) {
@@ -2003,6 +2027,13 @@ static int lpr_exec_load_file_image_into_process(
                     break;
                 }
                 close_segment_vmo = 1;
+            } else {
+                segment_vmo_fd = retain_cached_segment_vmo(segment_vmo_fd);
+                if (segment_vmo_fd < 16) {
+                    status = segment_vmo_fd;
+                    break;
+                }
+                close_segment_vmo = 1;
             }
 
             if (map_entry_count >= PACHA_PROCESS_MAP_BATCH_MAX_ENTRIES) {
@@ -2152,6 +2183,14 @@ int lpr_exec_prepare_file_into_map_batch(
                 if (source_span_owned) {
                     free(source_span);
                 }
+                break;
+            }
+            close_segment_vmo = 1;
+        } else {
+            segment_vmo_fd = retain_cached_segment_vmo(segment_vmo_fd);
+            if (segment_vmo_fd < 16) {
+                if (source_span_owned) free(source_span);
+                status = segment_vmo_fd;
                 break;
             }
             close_segment_vmo = 1;

@@ -394,6 +394,14 @@ def main() -> int:
         console.close()
         qmp.close()
 
+    # A usable window alone must not pass a targeted runtime-error regression.
+    forbidden_log = os.environ.get("XFCE_STARTUP_FORBID_LOG")
+    if forbidden_log:
+        match = re.search(forbidden_log, transcript.decode(errors="replace"), re.IGNORECASE)
+        if match:
+            classification = "runtime-error"
+            error = "forbidden runtime diagnostic: " + match.group(0)
+
     serial_path = os.environ.get("PACGO_QEMU_SERIAL_LOG")
     if serial_path:
         serial = Path(serial_path).read_bytes()

@@ -6,6 +6,7 @@
 #include "bootstrap_abi.h"
 #include "next_stage_loader.h"
 #include "pacha/ipc.h"
+#include "pacha/launch.h"
 #include "storage_boot/boot_config.h"
 
 #include <stdint.h>
@@ -16,8 +17,6 @@ enum {
     SEED0_QEMU_NVME_VENDOR_ID = 0x1b36,
     SEED0_QEMU_NVME_DEVICE_ID = 0x0010,
 };
-
-static int mark_inherit(int fd);
 
 static const struct seed0_device_descriptor *find_nvme_device(
     const struct seed0_init_descriptor_page *desc)
@@ -46,7 +45,7 @@ static int create_inherited_vmo(const void *data, uint64_t size, const char *lab
         PACHA_FD_RIGHT_SET_FLAGS | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(map_size, rights, PACHA_FD_FLAG_INHERIT);
+    const int fd = pacha_vmo_create(map_size, rights, 0);
     if (fd < 16) return fd;
     void *mapped = pacha_mmap(fd, map_size,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
@@ -74,18 +73,7 @@ static int create_inherited_readonly_vmo(
         writable_fd, PACHA_FD_FCNTL_DUP, 16, rights);
     (void)pacha_fd_close(writable_fd);
     if (readonly_fd < 16) return (int)readonly_fd;
-    if (mark_inherit((int)readonly_fd) != 0) {
-        (void)pacha_fd_close((int)readonly_fd);
-        return -13;
-    }
     return (int)readonly_fd;
-}
-
-static int mark_inherit(int fd)
-{
-    if (fd < 16) return -22;
-    return (int)pacha_fd_fcntl(fd, PACHA_FD_FCNTL_SET_FLAGS,
-        PACHA_FD_FLAG_INHERIT, PACHA_FD_FLAG_INHERIT);
 }
 
 int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channel_fd)
@@ -110,11 +98,6 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channe
     if (bootfs_fd < 16) return bootfs_fd;
 
     const int device_fd = (int)nvme->init_device_fd;
-    if (mark_inherit(device_fd) != 0 || mark_inherit(ready_channel_fd) != 0 ||
-        mark_inherit(root_handoff_channel_fd) != 0) {
-        (void)pacha_fd_close(bootfs_fd);
-        return -13;
-    }
 
     struct storage_boot_config config;
     memset(&config, 0, sizeof(config));
@@ -133,8 +116,20 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channe
     }
 
     struct seed0_loaded_process loaded;
+    const struct pacha_process_fd_grant grants[] = {
+        PACHA_LAUNCH_LOG_GRANTS(PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(device_fd, device_fd,
+            PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(ready_channel_fd, ready_channel_fd,
+            PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(root_handoff_channel_fd, root_handoff_channel_fd,
+            PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(bootfs_fd, bootfs_fd, PACHA_LAUNCH_BLOB),
+        PACHA_LAUNCH_GRANT(config_fd, config_fd, PACHA_LAUNCH_BLOB),
+    };
     status = seed0_load_elf_process(
-        "/srv/storage_boot.elf", daemon, daemon_size, &loaded);
+        "/srv/storage_boot.elf", daemon, daemon_size,
+        grants, sizeof(grants) / sizeof(grants[0]), &loaded);
     if (status == 0)
         status = seed0_start_process(&loaded, "/srv/storage_boot.elf", config_fd);
     (void)pacha_fd_close(config_fd);

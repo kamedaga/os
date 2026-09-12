@@ -128,22 +128,23 @@ type SmokeResult struct {
 }
 
 type TTYTestOptions struct {
-	Timeout          time.Duration
-	NoKVM            bool
-	IOMMU            bool
-	CPUs             int
-	Display          string
-	GraphicsProfile  string
-	InputProfile     string
-	ExtraArgs        []string
-	BootMarker       string
-	Send             []string
-	Expect           []string
-	ScreendumpCheck  []string
-	ScreendumpDevice string
-	InputSendEvent   []string
-	Python           string
-	Progress         progress.Reporter
+	Timeout            time.Duration
+	NoKVM              bool
+	IOMMU              bool
+	CPUs               int
+	Display            string
+	GraphicsProfile    string
+	InputProfile       string
+	ExtraArgs          []string
+	BootMarker         string
+	ConsoleReadyMarker string
+	Send               []string
+	Expect             []string
+	ScreendumpCheck    []string
+	ScreendumpDevice   string
+	InputSendEvent     []string
+	Python             string
+	Progress           progress.Reporter
 }
 
 type TTYTestResult struct {
@@ -699,6 +700,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			return result, err
 		}
 		ttyClient.serialExpectations = serialExpectations
+		ttyClient.readyMarker = opts.ConsoleReadyMarker
 		defer ttyClient.Close()
 		if len(checks) != 0 || len(inputChecks) != 0 {
 			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, wait, 5*time.Second); waitErr != nil || exited {
@@ -849,6 +851,7 @@ func (client *ttyConsoleClient) RunScreendumpChecks(qmp *qmpClient, device strin
 }
 
 type ttyConsoleClient struct {
+	readyMarker        string
 	conn               net.Conn
 	consoleFile        *os.File
 	output             strings.Builder
@@ -910,6 +913,10 @@ func (client *ttyConsoleClient) Close() {
 }
 
 func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, timeout time.Duration) (int, []string, error) {
+	if err := client.WaitForOutput(client.readyMarker, timeout); err != nil {
+		client.Close()
+		return 0, nil, err
+	}
 	sent := 0
 	for _, value := range sends {
 		if value == "" {
@@ -979,6 +986,40 @@ func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, 
 			client.Close()
 			<-client.readDone
 			return sent, matched, fmt.Errorf("expected console output not found within %s: %s", timeout, strings.Join(missingExpectations(expects, seen), ", "))
+		}
+	}
+}
+
+// An opened TTY is not a ready shell: startup termios changes can discard
+// queued input. Observe the caller's console handshake before sending bytes.
+func (client *ttyConsoleClient) WaitForOutput(marker string, timeout time.Duration) error {
+	if marker == "" {
+		return nil
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		client.outputMu.Lock()
+		ready := strings.Contains(client.output.String(), marker)
+		client.outputMu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case err := <-client.readDone:
+			client.outputMu.Lock()
+			ready = strings.Contains(client.output.String(), marker)
+			client.outputMu.Unlock()
+			if ready {
+				client.readDone <- err
+				return nil
+			}
+			return fmt.Errorf("console closed before ready marker %q: %v", marker, err)
+		case <-deadline.C:
+			return fmt.Errorf("console ready marker %q not reached within %s", marker, timeout)
+		case <-ticker.C:
 		}
 	}
 }

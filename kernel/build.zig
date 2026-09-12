@@ -99,12 +99,51 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run kernel unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    const mmio_overlay_mod = b.createModule(.{
+        .root_source_file = b.path("src/mmio_overlay_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mmio_overlay_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerHostObject(b, mmio_overlay_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf.o");
+    const mmio_overlay_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"MMIO overlay"} });
+    mmio_overlay_tests.stack_size = 64 * 1024 * 1024;
+    test_step.dependOn(&b.addRunArtifact(mmio_overlay_tests).step);
+    const interrupt_waiter_mod = b.createModule(.{
+        .root_source_file = b.path("src/syscalls.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    interrupt_waiter_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    interrupt_waiter_mod.addCSourceFile(.{ .file = b.path("../tests/interrupt_waiter_host.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    addVerifiedSchedulerHostObject(b, interrupt_waiter_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_interrupt_test.o");
+    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{"shootdown interrupt guard"}, .use_llvm = true });
+    interrupt_waiter_tests.stack_size = 512 * 1024 * 1024;
+    test_step.dependOn(&b.addRunArtifact(interrupt_waiter_tests).step);
     const realtime_clock_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/realtime_clock.zig"),
         .target = target,
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(realtime_clock_tests).step);
+    for ([_][]const u8{ "src/hpet.zig", "src/clockevent.zig", "src/acpi_tables.zig", "src/pci.zig" }) |source| {
+        const clock_test_mod = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = target,
+            .optimize = optimize,
+        });
+        clock_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+        test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = clock_test_mod })).step);
+    }
+    const vtd_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/vtd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vtd_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const vtd_tests = b.addTest(.{ .root_module = vtd_test_mod, .filters = &.{"VT-d"} });
+    vtd_tests.stack_size = 512 * 1024 * 1024;
+    test_step.dependOn(&b.addRunArtifact(vtd_tests).step);
     const physical_layout_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/arch/x86_64/physical_layout.zig"),
         .target = target,
@@ -154,7 +193,7 @@ pub fn build(b: *std.Build) void {
     addVerifiedSchedulerHostObject(b, scheduler_context_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_context_test.o");
     const scheduler_context_tests = b.addTest(.{
         .root_module = scheduler_context_test_mod,
-        .filters = &.{ "migration waits", "preferred wake" },
+        .filters = &.{ "migration waits", "preferred wake", "controlled thread context" },
     });
     test_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
 

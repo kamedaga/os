@@ -26,6 +26,7 @@ set(FILED_DISPATCH_SHARDS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/internal/dispatch_state.h"
 )
 set(FILED_EXTRA_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/identity.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/backend_router.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/core.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/vfs/object.c"
@@ -163,6 +164,8 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/vfs.h"
     "${REPO_ROOT}/userland/termd/include/termd/ipc_protocol.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/ipc.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/launch.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/internal.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/exec/linux_lpr/script.h"

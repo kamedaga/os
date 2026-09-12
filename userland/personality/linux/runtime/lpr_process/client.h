@@ -1,6 +1,9 @@
 #pragma once
-
 #include <stdint.h>
+int64_t lpr_process_client_service_session(uint32_t op, uint64_t *counter,
+    int64_t (*convert)(int64_t), uint64_t token,
+    int page_fd, void *page, uint64_t *session, int *fd);
+
 
 void *lpr_process_client_payload(void *page);
 /* Runs once in the initial thread, before Linux code can execute. The

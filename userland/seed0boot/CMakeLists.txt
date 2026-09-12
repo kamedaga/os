@@ -28,6 +28,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/storage_boot/include/storage_boot/boot_config.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     "${REPO_ROOT}/userland/libipc/include/pacha/ipc.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/launch.h"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/syscall.h"

@@ -403,6 +403,92 @@ func TestRunSendExpectTTY(t *testing.T) {
 	}
 }
 
+func TestConsoleReadinessPrecedesCommandDelivery(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "console.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	serverDone := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer conn.Close()
+		// The TTY is open, but the prompt is incomplete. No command may arrive.
+		if _, err = io.WriteString(conn, "boot output\nbash-5."); err != nil {
+			serverDone <- err
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		buf := make([]byte, 128)
+		n, err := conn.Read(buf)
+		if n != 0 || err == nil {
+			serverDone <- io.ErrUnexpectedEOF
+			return
+		}
+		if timeout, ok := err.(net.Error); !ok || !timeout.Timeout() {
+			serverDone <- err
+			return
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err = io.WriteString(conn, "2# "); err != nil {
+			serverDone <- err
+			return
+		}
+		n, err = conn.Read(buf)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if string(buf[:n]) != "run-test\n" {
+			serverDone <- io.ErrUnexpectedEOF
+			return
+		}
+		_, err = io.WriteString(conn, "TEST=PASS\n")
+		serverDone <- err
+	}()
+	log, err := os.Create(filepath.Join(t.TempDir(), "console.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	client, err := startTTYConsoleClient(socketPath, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	client.readyMarker = "bash-5.2# "
+	sent, _, err := client.SendAndExpect([]string{"run-test"}, []string{"TEST=PASS"}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent != 1 {
+		t.Fatalf("sent=%d", sent)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConsoleReadinessTimeoutDoesNotSend(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	client := &ttyConsoleClient{conn: local, readDone: make(chan error, 1), readyMarker: "ready"}
+	sent, _, err := client.SendAndExpect([]string{"must-not-send"}, nil, 10*time.Millisecond)
+	if err == nil || sent != 0 {
+		t.Fatalf("sent=%d err=%v", sent, err)
+	}
+	buf := make([]byte, 1)
+	if n, _ := remote.Read(buf); n != 0 {
+		t.Fatal("sent before readiness")
+	}
+}
+
 func TestWaitForSocketOrExitBroadcastsImmediateExit(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-c", "exit 17")
 	if err := cmd.Start(); err != nil {

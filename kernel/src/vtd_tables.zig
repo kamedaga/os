@@ -63,6 +63,23 @@ pub const IovaAllocator = struct {
         return iova_window_start + @as(u64, @intCast(start)) * page_size;
     }
 
+    /// Reserve the caller's IOVA without changing any allocation on failure.
+    pub fn reserve(self: *IovaAllocator, iova: u64, page_count: usize) bool {
+        if (self.bitmap == null or page_count == 0 or
+            iova < iova_window_start or (iova & (page_size - 1)) != 0) return false;
+        const start: usize = @intCast((iova - iova_window_start) / page_size);
+        if (start >= iova_page_count or page_count > iova_page_count - start) return false;
+        var index: usize = 0;
+        while (index < page_count) : (index += 1) {
+            if (self.bitIsSet(start + index)) return false;
+        }
+        index = 0;
+        while (index < page_count) : (index += 1) self.setBit(start + index, true);
+        self.used_pages += page_count;
+        self.peak_pages = @max(self.peak_pages, self.used_pages);
+        return true;
+    }
+
     pub fn free(self: *IovaAllocator, iova: u64, page_count: usize) bool {
         if (self.bitmap == null or page_count == 0 or
             iova < iova_window_start or (iova & (page_size - 1)) != 0) return false;

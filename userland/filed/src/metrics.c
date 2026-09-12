@@ -189,7 +189,7 @@ filed_generation_entry_t *filed_session_generation_entries(
     {
         return NULL;
     }
-    return (filed_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
+    return (filed_generation_entry_t *)((uint8_t *)session->page + FILED_FAST_GENERATION_OFFSET);
 }
 
 void filed_session_publish_generation(
@@ -213,18 +213,18 @@ void filed_session_publish_generation(
         return;
     }
 
-    uint64_t free_slot = header->generation_capacity;
-    for (uint64_t i = 0; i < header->generation_capacity; ++i) {
+    uint64_t free_slot = FILED_FAST_GENERATION_CAPACITY;
+    for (uint64_t i = 0; i < FILED_FAST_GENERATION_CAPACITY; ++i) {
         if (entries[i].handle == (uint64_t)handle_id) {
             free_slot = i;
             break;
         }
-        if (free_slot == header->generation_capacity && entries[i].handle == 0) {
+        if (free_slot == FILED_FAST_GENERATION_CAPACITY && entries[i].handle == 0) {
             free_slot = i;
         }
     }
-    if (free_slot == header->generation_capacity) {
-        free_slot = ((uint64_t)handle_id) % header->generation_capacity;
+    if (free_slot == FILED_FAST_GENERATION_CAPACITY) {
+        free_slot = ((uint64_t)handle_id) % FILED_FAST_GENERATION_CAPACITY;
     }
 
     filed_generation_entry_t *entry = &entries[free_slot];

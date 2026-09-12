@@ -391,6 +391,8 @@ int seed0_load_elf_process(
     const char *path,
     const unsigned char *image,
     uint32_t image_size,
+    const struct pacha_process_fd_grant *grants,
+    uint64_t grant_count,
     struct seed0_loaded_process *out)
 {
     if (out == 0) {
@@ -418,7 +420,7 @@ int seed0_load_elf_process(
         PACHA_FD_RIGHT_SPAWN |
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int process_fd = pacha_process_create(process_rights, 0);
+    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
         fprintf(stderr, "[seed0boot] next-stage: process_create failed status=%d\n", process_fd);
         return -7;
@@ -465,7 +467,7 @@ int seed0_load_elf_process(
 int seed0_stage_next_elf(const char *path, const unsigned char *image, uint32_t image_size)
 {
     struct seed0_loaded_process loaded;
-    int status = seed0_load_elf_process(path, image, image_size, &loaded);
+    int status = seed0_load_elf_process(path, image, image_size, NULL, 0, &loaded);
     if (status != 0) return status;
     return seed0_start_process(&loaded, path, -1);
 }

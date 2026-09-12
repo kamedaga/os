@@ -211,6 +211,10 @@ static int path_address(struct unix_service *service, struct service_session *se
     if (binding && !path) return -ENOMEM;
     struct filed_unix_path file = { .operation = binding ? FILED_UNIX_PATH_CREATE : FILED_UNIX_PATH_OPEN,
         .directory = request->argument, .mode = request->transaction };
+    struct unix_credentials identity;
+    unix_broker_session_identity(session->session, &identity);
+    file.generation = identity.generation;
+    file.pid = identity.pid;
     memcpy(file.path, request->address.bytes, request->address.length);
     status = filed_path_call(service, &file);
     if (status != 0) { free(path); return status; }

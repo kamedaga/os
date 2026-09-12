@@ -41,6 +41,11 @@ enum {
     FILED_EXEC_SELF = 1u << 5,
     FILED_EXEC_TRANSFER_PROCESS_FD = 1u << 6,
     FILED_EXEC_DEFER_START = 1u << 7,
+    /* Explicit launch-manager grants, never an automatic Linux default. */
+    FILED_EXEC_SERVICE_NETD = 1u << 8,
+    FILED_EXEC_SERVICE_TERMD = 1u << 9,
+    FILED_EXEC_SERVICE_DRMD = 1u << 10,
+    FILED_EXEC_SERVICE_INPUTD = 1u << 11,
     FILED_EXEC_MAX_INHERIT_FDS = 16,
     FILED_EXEC_MAX_INHERIT_HANDLES = 4,
     FILED_EXEC_MAX_FD_PATCHES = 4,
@@ -342,6 +347,12 @@ typedef struct filed_exec_string_ref {
     uint16_t length;
 } filed_exec_string_ref_t;
 
+typedef struct filed_exec_fd_grant {
+    uint64_t target;
+    uint64_t rights;
+    uint64_t flags;
+} filed_exec_fd_grant_t;
+
 typedef struct filed_exec_path {
     uint64_t dir_handle;
     uint64_t flags;
@@ -352,7 +363,8 @@ typedef struct filed_exec_path {
     uint64_t argc;
     uint64_t envc;
     uint64_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
-    uint64_t inherit_fd_targets[FILED_EXEC_MAX_INHERIT_FDS];
+    /* Final child authority; transport TRANSFER is not implicitly retained. */
+    filed_exec_fd_grant_t fd_grants[FILED_EXEC_MAX_INHERIT_FDS];
     filed_exec_fd_patch_t fd_patches[FILED_EXEC_MAX_FD_PATCHES];
     char path[FILED_PATH_BYTES];
     filed_exec_string_ref_t argv[FILED_EXEC_MAX_ARGS];

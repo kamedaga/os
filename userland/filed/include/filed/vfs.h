@@ -137,10 +137,13 @@ typedef struct filed_handle {
     uint32_t fd_flags;
     filed_generation_t generation;
     uint32_t owner_session;
+    uint64_t owner_client;
     int32_t lease_fd;
 } filed_handle_t;
 
 typedef struct filed_vfs {
+    uint64_t actor_client;
+    uint32_t actor_rights;
     filed_mount_t mounts[FILED_MAX_MOUNTS];
     filed_vnode_t vnodes[FILED_MAX_VNODES];
     filed_file_t files[FILED_MAX_FILES];

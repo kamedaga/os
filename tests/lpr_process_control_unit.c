@@ -12,6 +12,7 @@ static int prepare_busy;
 static int activation_bootstrap = 246;
 static uint32_t current_op;
 static uint64_t current_request;
+static unsigned queue_full, writable_waits;
 
 void *lpr_memset(void *p, int value, size_t size) { return memset(p, value, size); }
 
@@ -40,7 +41,7 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
         struct pacha_fd_info *info = (struct pacha_fd_info *)(uintptr_t)a1;
         *info = (struct pacha_fd_info){ .kind = PACHA_FD_KIND_CHANNEL,
             .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
-                (a0 == 22 ? (PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL) & ~missing_unix_rights : 0) |
+                ((PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL) & ~(a0 == 22 ? missing_unix_rights : 0)) |
                 (bad_rights ? PACHA_FD_RIGHT_DUP : 0),
             .flags = bad_flags == 1 ? 0 : bad_flags == 2 ? PACHA_FD_FLAG_PRIVATE :
                 bad_flags == 3 ? (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC) :
@@ -54,6 +55,7 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
     assert(a0 == (current_op == LPRS_OP_PROCESS_ACTIVATE ? (uint64_t)activation_bootstrap : 20));
     if (current_op != LPRS_OP_PROCESS_ACTIVATE) assert(live_control);
     assert(request->word3 == header->request_id && request->fd_count == 1);
+    if (queue_full) { queue_full--; return PACHA_SYSCALL_ERR_NOT_READY; }
     current_request = header->request_id;
     header->magic = PACHA_SERVICE_REPLY_MAGIC;
     header->status = 0;
@@ -64,6 +66,14 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
 
 int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t timeout, uint64_t flags)
 {
+    if (nr == PACHA_FD_SYSCALL_WAIT_MANY) {
+        struct pacha_pollfd *pollfd = (void *)(uintptr_t)fd;
+        assert(address == 1 && timeout == PACHA_FD_WAIT_FOREVER && !flags);
+        assert(pollfd->fd == 20 && pollfd->events == PACHA_FD_EVENT_WRITABLE);
+        pollfd->revents = PACHA_FD_EVENT_WRITABLE;
+        writable_waits++;
+        return 1;
+    }
     assert(nr == PACHAOS_SYSCALL_IPC_RECV_WAIT && fd == 30 && live_reply && timeout == UINT64_MAX && !flags);
     struct pacha_ipc_msg *reply = (struct pacha_ipc_msg *)(uintptr_t)address;
     reply->word0 = PACHA_SERVICE_REPLY_MAGIC;
@@ -112,6 +122,7 @@ int main(void)
         }
         assert(!live_reply);
     }
+    queue_full = 3;
     for (unsigned test = 0; test < 7; test++) {
         bad_rights = test == 0;
         bad_flags = test == 1 ? 1 : test == 2 ? 2 : 0;
@@ -121,6 +132,7 @@ int main(void)
         int fd = 99;
         const int64_t result = lpr_process_client_unix_session(&request, status_to_errno,
             101, 40, page, &session, &fd);
+        assert(!queue_full && writable_waits == 3);
         if (test < 6) assert(result == -LPR_LINUX_EIO && session == 0 && fd == -1 && !live_unix);
         else {
             assert(result == 0 && session == 700 && fd == 22 && live_unix);

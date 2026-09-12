@@ -308,8 +308,8 @@ static int lpr_backend_needs_transfer_lease(uint8_t ops_id, const void *state)
     switch (ops_id) {
     case LPR_FD_OPS_FILED: {
         const lpr_filed_backend_t *backend = state;
-        return backend->handle != 0 &&
-            (backend->reserved2 & LPR_BACKEND_TRANSFER_LEASE) == 0;
+        /* Each recipient gets a fresh, connection-owned handle to the same OFD. */
+        return backend->handle != 0;
     }
     case LPR_FD_OPS_TTY: {
         const lpr_tty_backend_t *backend = state;
@@ -528,7 +528,9 @@ static int lpr_prepare_backend_record(
     if (lpr_backend_needs_transfer_lease(ops_id, original_state)) {
         int lease_fd = -1;
         int remote_lease_fd = -1;
-        status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        status = ops_id == LPR_FD_OPS_FILED ?
+            lpr_filed_lease_pair(&lease_fd, &remote_lease_fd) :
+            lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
         uint64_t handle = 0;
         if (status == 0) {
             switch (ops_id) {
@@ -664,7 +666,8 @@ static int lpr_prepare_backend_record(
     case LPR_FD_OPS_FILED: {
         const lpr_filed_backend_t *original = original_state;
         lpr_filed_backend_t *prepared = prepared_state;
-        if ((original->reserved2 & LPR_BACKEND_TRANSFER_LEASE) != 0)
+        if (prepared->lease_fd.raw == original->lease_fd.raw &&
+            (original->reserved2 & LPR_BACKEND_TRANSFER_LEASE) != 0)
             LPR_DUP_MANIFEST_FIELD(
                 original->lease_fd.raw, prepared->lease_fd.raw);
         break;
@@ -763,7 +766,7 @@ static int lpr_prepare_manifest_impl(
     exec->dir_handle = lpr_cwd_handle;
     if (lpr_cwd_handle != 0) {
         int remote_lease_fd = -1;
-        int status = lpr_native_wait_pair(
+        int status = lpr_filed_lease_pair(
             &transaction->cwd_lease_fd,
             &remote_lease_fd);
         if (status != 0) {
@@ -911,6 +914,11 @@ static int lpr_prepare_manifest_impl(
     for (uint64_t i = 0; i < transaction->pin_count; ++i) {
         record_bytes += lpr_exec_backend_record_bytes(transaction->pins[i].ops_id);
         if (transaction->pins[i].ops_id == LPR_FD_OPS_UNIX) { capability_count++; continue; }
+        if (transaction->pins[i].ops_id == LPR_FD_OPS_FILED) {
+            /* Replace, rather than append to, an already leased descriptor. */
+            capability_count += ((const lpr_filed_backend_t *)transaction->pins[i].state)->handle != 0;
+            continue;
+        }
         int32_t native_fds[2];
         capability_count += lpr_exec_backend_native_fds(
             transaction->pins[i].ops_id,
@@ -1508,6 +1516,8 @@ int64_t lpr_filed_exec_self(
     *out_thread_fd = -1;
     *out_manifest_fd = -1;
 
+    const int64_t endpoint_status = lpr_filed_endpoint_ready();
+    if (endpoint_status) return endpoint_status;
     void *page = 0;
     const int page_fd = lpr_create_standalone_wire_page(&page);
     if (page_fd < 0) {
@@ -1558,7 +1568,7 @@ int64_t lpr_filed_exec_self(
     lpr_trace_process_event("exec_self_call", 0, 1, 0);
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         (uint64_t)(uintptr_t)&request);
     if (reply_fd < 16) {
         lpr_destroy_standalone_wire_page(page_fd, page);

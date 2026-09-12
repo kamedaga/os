@@ -1,6 +1,10 @@
 #include "lpr_supervisor/boot_config.h"
 #include "lpr_supervisor/ipc_protocol.h"
 #include "unixd/client.h"
+#include "filed/identity.h"
+#include "filed/ipc_protocol.h"
+#include "accounts.h"
+#include "credentials.h"
 
 #include <pacha/abi.h>
 #include <pacha/ipc.h>
@@ -53,8 +57,14 @@ typedef struct lprs_process {
     int activation_page_fd;
     int activation_reply_fd;
     int unix_fd;
+    int filed_fd;
+    uint64_t filed_session;
     uint64_t unix_session;
     struct unix_credentials credentials;
+    uint32_t group_count;
+    uint32_t groups[LPRS_MAX_GROUPS];
+    uint32_t filed_rights;
+    uint32_t credential_rights;
     pacha_service_envelope_t activation_header;
     char ctty[LPRS_CTTY_BYTES];
     char cwd[LPRS_CWD_BYTES];
@@ -89,11 +99,32 @@ typedef struct lprs_reply_cap {
     PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS | \
     PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_RECV | PACHA_FD_RIGHT_SEND | \
     PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)
-#define LPRS_CLIENT_RIGHTS (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL)
-#define LPRS_UNIX_CLIENT_RIGHTS (LPRS_CLIENT_RIGHTS | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)
+/* A bounded process request queue needs writable observation for backpressure.
+ * These rights do not grant receive, duplication or transfer authority. */
+#define LPRS_CLIENT_RIGHTS (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL | \
+    PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL)
+#define LPRS_UNIX_CLIENT_RIGHTS LPRS_CLIENT_RIGHTS
 
 static int g_endpoint_fd = -1;
 static int g_unix_admin_fd = -1;
+static int g_filed_admin_fd = -1;
+static struct pacha_accounts g_accounts;
+static int g_accounts_ready;
+
+static int lprs_resolve_account(const struct pacha_accounts *db, const char *name,
+    lprs_credentials_t *out)
+{
+    const struct pacha_account *account = pacha_account_by_name(db, name);
+    if (!account) return -2;
+    lprs_credentials_t identity = { .uid = account->uid, .euid = account->uid,
+        .suid = account->uid, .gid = account->gid, .egid = account->gid, .sgid = account->gid };
+    size_t count = LPRS_MAX_GROUPS;
+    int status = pacha_account_groups(db, name, identity.groups, &count);
+    if (status) return -status;
+    identity.group_count = (uint32_t)count;
+    *out = identity;
+    return 0;
+}
 static uint64_t g_unix_request;
 /* Shared diagnostic page.  Processes write their own slot without a system
  * call; the supervisor only ever reads, and maps it once for its own lifetime
@@ -212,7 +243,9 @@ static int lprs_read_bootstrap(int fd, struct lprs_boot_config *out)
     }
     if (out->magic != LPRS_BOOT_CONFIG_MAGIC || out->endpoint_fd < 16 ||
         out->endpoint_fd >= PACHA_FD_TABLE_LIMIT || out->unix_admin_fd < 16 || out->unix_admin_fd >= PACHA_FD_TABLE_LIMIT ||
-        out->endpoint_fd == out->unix_admin_fd || out->flags != 0) {
+        out->endpoint_fd == out->unix_admin_fd || out->filed_admin_fd < 16 ||
+        out->filed_admin_fd >= PACHA_FD_TABLE_LIMIT || out->filed_admin_fd == out->endpoint_fd ||
+        out->filed_admin_fd == out->unix_admin_fd || out->flags != 0) {
         return PACHA_STATUS_EINVAL;
     }
     return 0;
@@ -332,6 +365,9 @@ static void lprs_diag_release(lprs_process_t *proc)
 
 static void lprs_unix_release(lprs_process_t *proc)
 {
+    if (proc->filed_fd >= 16) (void)pacha_fd_close(proc->filed_fd);
+    proc->filed_fd = -1;
+    proc->filed_session = 0;
     if (proc->unix_fd >= 16) (void)pacha_fd_close(proc->unix_fd);
     proc->unix_fd = -1;
     proc->unix_session = 0;
@@ -362,6 +398,7 @@ static void lprs_process_release_owned(lprs_process_t *proc)
     proc->activation_page_fd = -1;
     proc->activation_reply_fd = -1;
     proc->unix_fd = -1;
+    proc->filed_fd = -1;
 }
 
 static void lprs_process_activate_empty(lprs_process_t *proc)
@@ -458,8 +495,78 @@ static int lprs_channel_admit(void)
     return info.free_slots >= needed ? 0 : -PACHA_LINUX_EMFILE;
 }
 
+static int lprs_filed_session(lprs_process_t *proc, lprs_reply_cap_t *reply, uint64_t *out_session)
+{
+    if (!proc || !proc->active || proc->exit_ready) return PACHA_STATUS_ESRCH;
+    if (proc->process_fd < 16 || proc->control_fd < 16) return PACHA_STATUS_EAGAIN;
+    if (proc->filed_fd < 16) {
+        if (g_filed_admin_fd < 16) return -PACHA_LINUX_ENOTCONN;
+        int status = lprs_channel_admit();
+        if (status) return status;
+        const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+        int page_fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, rights, PACHA_FD_FLAG_PRIVATE);
+        if (page_fd < 16) return PACHA_STATUS_ENOMEM;
+        void *page = pacha_mmap(page_fd, PACHA_SERVICE_PAGE_BYTES,
+            PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+        if (!page) { (void)pacha_fd_close(page_fd); return PACHA_STATUS_ENOMEM; }
+        pacha_service_envelope_t *header = page;
+        *header = (pacha_service_envelope_t){ .magic = PACHA_SERVICE_REQUEST_MAGIC,
+            .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = FILED_SERVICE_ID,
+            .op = FILED_OP_CLIENT_REGISTER, .request_id = proc->token,
+            .trace_id = proc->token, .payload_size = sizeof(filed_identity_t) };
+        const struct unix_credentials *c = &proc->credentials;
+        filed_identity_t identity = { .generation = c->generation, .pid = c->pid,
+            .uid = c->uid, .gid = c->gid, .euid = c->euid, .egid = c->egid,
+            .suid = c->suid, .sgid = c->sgid,
+            .rights = proc->filed_rights };
+        memcpy((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, &identity, sizeof(identity));
+        struct pacha_ipc_fd cap = { .fd = (uint64_t)page_fd, .rights = rights & ~PACHA_FD_RIGHT_TRANSFER };
+        struct pacha_ipc_msg message = { .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+            .word3 = proc->token, .fds = &cap, .fd_count = 1 };
+        int reply_fd = pacha_ipc_call(g_filed_admin_fd, &message);
+        status = -PACHA_LINUX_EIO;
+        struct pacha_ipc_fd received[PACHA_IPC_MAX_TRANSFER_FDS] = {{0}};
+        struct pacha_ipc_msg response = { .fds = received, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS };
+        if (reply_fd >= 16) {
+            int received_status = pacha_ipc_recv_wait(reply_fd, &response, PACHA_FD_WAIT_FOREVER);
+            (void)pacha_fd_close(reply_fd);
+            if (!received_status) {
+                struct pacha_fd_info info;
+                uint64_t required = LPRS_CLIENT_RIGHTS | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER;
+                if (response.word0 == PACHA_SERVICE_REPLY_MAGIC && response.word3 == proc->token &&
+                    header->magic == PACHA_SERVICE_REPLY_MAGIC && header->request_id == proc->token &&
+                    header->status == 0 && header->result && response.fd_count == 1 &&
+                    received[0].fd >= 16 && received[0].fd < PACHA_FD_TABLE_LIMIT &&
+                    pacha_fd_get_info((int)received[0].fd, &info) == 0 &&
+                    info.kind == PACHA_FD_KIND_CHANNEL && info.rights == required) {
+                    proc->filed_fd = (int)received[0].fd;
+                    proc->filed_session = header->result;
+                    received[0].fd = 0;
+                    status = 0;
+                } else if (header->status < 0) status = (int)header->status;
+                for (unsigned i = 0; i < response.fd_count; i++)
+                    if (received[i].fd >= 16) (void)pacha_fd_close((int)received[i].fd);
+            }
+        }
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        (void)pacha_fd_close(page_fd);
+        if (status) return status;
+    }
+    *out_session = proc->filed_session;
+    *reply = (lprs_reply_cap_t){ .fd = proc->filed_fd, .rights = LPRS_CLIENT_RIGHTS,
+        .transfer_flags = PACHA_IPC_TRANSFER_PRIVATE | PACHA_IPC_TRANSFER_CLOEXEC };
+    return 0;
+}
+
 static int lprs_unix_session(lprs_process_t *proc, lprs_reply_cap_t *reply, uint64_t *out_session)
 {
+    /* Both services use the same manager-owned process identity. The private
+     * unixd pathname bridge can only act through this filed connection. */
+    lprs_reply_cap_t filed_reply = {0};
+    uint64_t filed_session = 0;
+    int filed_status = lprs_filed_session(proc, &filed_reply, &filed_session);
+    if (filed_status) return filed_status;
     if (!proc || !proc->active || proc->exit_ready) return PACHA_STATUS_ESRCH;
     if (proc->process_fd < 16 || proc->control_fd < 16) return PACHA_STATUS_EAGAIN;
     if (proc->unix_fd < 16) {
@@ -647,6 +754,15 @@ static void lprs_write_state(const lprs_process_t *proc, lprs_process_state_t *o
     out->ppid = proc->ppid;
     out->sid = proc->sid;
     out->pgrp = proc->pgrp;
+    out->credentials = (lprs_credentials_t){
+        .uid = proc->credentials.uid, .euid = proc->credentials.euid,
+        .suid = proc->credentials.suid, .gid = proc->credentials.gid,
+        .egid = proc->credentials.egid, .sgid = proc->credentials.sgid,
+        .group_count = proc->group_count,
+    };
+    memcpy(out->credentials.groups, proc->groups, sizeof(proc->groups));
+    out->filed_rights = proc->filed_rights;
+    out->credential_rights = proc->credential_rights;
     out->foreground_pgrp = proc->foreground_pgrp;
     out->cwd_handle = proc->cwd_handle;
     if (lprs_parent_has_unreported_exit(proc)) {
@@ -659,12 +775,102 @@ static void lprs_write_state(const lprs_process_t *proc, lprs_process_state_t *o
     lprs_copy_string(out->cwd, sizeof(out->cwd), proc->cwd);
 }
 
+static int lprs_publish_filed_credentials(lprs_process_t *proc, const struct unix_credentials *c,
+    int *may_have_published)
+{
+    *may_have_published = 0;
+    if (!proc->filed_session) return 0;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+    int fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, rights, PACHA_FD_FLAG_PRIVATE);
+    if (fd < 16) return -12;
+    void *page = pacha_mmap(fd, PACHA_SERVICE_PAGE_BYTES,
+        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    if (!page) { (void)pacha_fd_close(fd); return -12; }
+    pacha_service_envelope_t *header = page;
+    *header = (pacha_service_envelope_t){ .magic = PACHA_SERVICE_REQUEST_MAGIC,
+        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = FILED_SERVICE_ID,
+        .op = FILED_OP_CLIENT_CREDENTIALS, .request_id = proc->token,
+        .payload_size = sizeof(filed_identity_update_t) };
+    filed_identity_update_t update = { .client = proc->filed_session,
+        .identity = { .generation = c->generation, .pid = c->pid,
+            .uid = c->uid, .gid = c->gid, .euid = c->euid, .egid = c->egid,
+            .suid = c->suid, .sgid = c->sgid, .rights = proc->filed_rights } };
+    memcpy((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, &update, sizeof(update));
+    struct pacha_ipc_fd cap = { .fd = (uint64_t)fd, .rights = rights & ~PACHA_FD_RIGHT_TRANSFER };
+    struct pacha_ipc_msg message = { .word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word3 = proc->token, .fds = &cap, .fd_count = 1 };
+    int reply_fd = pacha_ipc_call(g_filed_admin_fd, &message);
+    int status = -5;
+    if (reply_fd >= 16) {
+        *may_have_published = 1;
+        struct pacha_ipc_msg response = {0};
+        int received = pacha_ipc_recv_wait(reply_fd, &response, PACHA_FD_WAIT_FOREVER);
+        (void)pacha_fd_close(reply_fd);
+        if (!received && response.word0 == PACHA_SERVICE_REPLY_MAGIC &&
+            response.word3 == proc->token && header->magic == PACHA_SERVICE_REPLY_MAGIC &&
+            header->request_id == proc->token && header->status <= 0) {
+            status = (int)header->status;
+            if (status) *may_have_published = 0; /* Valid rejection, no mutation. */
+        }
+    }
+    (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+    (void)pacha_fd_close(fd);
+    return status;
+}
+
+static int lprs_change_credentials(lprs_process_t *proc, lprs_credential_request_t *req)
+{
+    if (!proc || !proc->active || proc->exit_ready) return -3;
+    lprs_process_state_t state;
+    lprs_write_state(proc, &state);
+    lprs_credentials_t next;
+    int status = lprs_credentials_apply(&state.credentials, proc->credential_rights, req, &next);
+    if (status) return status;
+    if (!memcmp(&next, &state.credentials, sizeof(next))) {
+        req->credentials = next;
+        return 0;
+    }
+    struct unix_credentials identity = proc->credentials;
+    identity.uid = next.uid; identity.euid = next.euid; identity.suid = next.suid;
+    identity.gid = next.gid; identity.egid = next.egid; identity.sgid = next.sgid;
+    int may_have_published = 0;
+    status = lprs_publish_filed_credentials(proc, &identity, &may_have_published);
+    if (status && !may_have_published) return status;
+    if (!status && proc->unix_session) {
+        struct unix_control update = { .operation = UNIX_OP_PROCESS_CREDENTIALS,
+            .request = ++g_unix_request, .socket = proc->unix_session, .credentials = identity };
+        unsigned received = 0;
+        status = unix_client_call(g_unix_admin_fd, &update, NULL, 0, NULL, 0, &received);
+    }
+    if (status) {
+        /* Never resume a process with a partially published identity. A lost
+         * reply is indistinguishable from an applied update; fail closed. */
+        fprintf(stderr, "[lprs] credential publication failed pid=%llu status=%d\n",
+            (unsigned long long)proc->pid, status);
+        if (proc->process_fd >= 16)
+            (void)pacha_syscall2(PACHA_PROCESS_SYSCALL_KILL, (uint64_t)proc->process_fd, 1);
+        return status;
+    }
+    proc->credentials = identity;
+    proc->group_count = next.group_count;
+    memcpy(proc->groups, next.groups, sizeof(proc->groups));
+    req->credentials = next;
+    return 0;
+}
+
 static int lprs_register_exec(void *page, uint64_t *out_token)
 {
     if (page == NULL || out_token == NULL) {
         return PACHA_STATUS_EINVAL;
     }
     lprs_register_exec_t *req = (lprs_register_exec_t *)page;
+    if (!g_accounts_ready) return -5;
+    if (!req->account[0] || !memchr(req->account, 0, sizeof(req->account)) ||
+        (req->filed_rights & ~1023u) || (req->credential_rights & ~3u)) return -22;
+    lprs_credentials_t initial;
+    int status = lprs_resolve_account(&g_accounts, req->account, &initial);
+    if (status) return status;
     if (g_next_pid > INT32_MAX) return -PACHA_LINUX_EOVERFLOW;
     lprs_process_t *proc = lprs_alloc_process();
     if (proc == NULL) {
@@ -673,11 +879,23 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     proc->token = g_next_token++;
     proc->generation = g_next_generation++;
     proc->pid = g_next_pid++;
-    /* Current LPR identity policy is root-only: nonzero set*id requests are
-     * rejected. Keep the authoritative identity here, never in an app page.
-     * Credential-changing operations must update this registry and unixd. */
+    /* The launch account was resolved from the canonical files before HELLO.
+     * Never accept UID/GID or supplementary groups from the request page. */
     proc->credentials = (struct unix_credentials){ .pid = (int32_t)proc->pid,
-        .generation = proc->generation };
+        .generation = proc->generation,
+        .uid = initial.uid, .euid = initial.euid,
+        .suid = initial.suid, .gid = initial.gid,
+        .egid = initial.egid, .sgid = initial.sgid };
+    proc->group_count = initial.group_count;
+    memcpy(proc->groups, initial.groups, sizeof(proc->groups));
+    proc->filed_rights = req->filed_rights;
+    proc->credential_rights = req->credential_rights;
+#if defined(LPRS_TEST_CREDENTIALS) && LPRS_TEST_CREDENTIALS
+    /* Test image only: exercise nonzero/distinct IDs without introducing an
+     * identity-changing API or account-management policy in this step. */
+    proc->credentials.uid = 1001; proc->credentials.euid = 1002; proc->credentials.suid = 1003;
+    proc->credentials.gid = 2001; proc->credentials.egid = 2002; proc->credentials.sgid = 2003;
+#endif
     proc->ppid = req->state.ppid;
     proc->sid = proc->pid;
     proc->pgrp = proc->pid;
@@ -695,6 +913,9 @@ static int lprs_register_exec(void *page, uint64_t *out_token)
     lprs_copy_string(proc->ctty, sizeof(proc->ctty), req->state.ctty);
     lprs_copy_string(proc->cwd, sizeof(proc->cwd), req->state.cwd[0] != '\0' ? req->state.cwd : "/");
     lprs_write_state(proc, &req->state);
+    fprintf(stderr, "[lprs] launch account=%s pid=%llu uid=%u gid=%u filed=0x%x credentials=0x%x\n",
+        req->account, (unsigned long long)proc->pid, initial.uid, initial.gid,
+        proc->filed_rights, proc->credential_rights);
     *out_token = proc->token;
     return 0;
 }
@@ -928,6 +1149,11 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     const uint64_t parent_foreground_pgrp = parent->foreground_pgrp;
     const uint64_t parent_cwd_handle = parent->cwd_handle;
     const struct unix_credentials parent_credentials = parent->credentials;
+    const uint32_t parent_group_count = parent->group_count;
+    const uint32_t parent_filed_rights = parent->filed_rights;
+    const uint32_t parent_credential_rights = parent->credential_rights;
+    uint32_t parent_groups[LPRS_MAX_GROUPS];
+    memcpy(parent_groups, parent->groups, sizeof(parent_groups));
     if (g_next_pid > INT32_MAX) return -PACHA_LINUX_EOVERFLOW;
     char parent_ctty[LPRS_CTTY_BYTES];
     char parent_cwd[LPRS_CWD_BYTES];
@@ -944,6 +1170,10 @@ static int lprs_fork_begin(uint64_t parent_token, void *page)
     child->credentials = parent_credentials;
     child->credentials.pid = (int32_t)child->pid;
     child->credentials.generation = child->generation;
+    child->group_count = parent_group_count;
+    child->filed_rights = parent_filed_rights;
+    child->credential_rights = parent_credential_rights;
+    memcpy(child->groups, parent_groups, sizeof(child->groups));
     child->ppid = parent_pid;
     child->sid = parent_sid;
     child->pgrp = parent_pgrp;
@@ -1557,6 +1787,16 @@ static int lprs_dispatch(
     case LPRS_OP_PROCESS_UNIX_SESSION:
         status = lprs_unix_session(lprs_find_by_token(actor), out_reply, out_result);
         break;
+    case LPRS_OP_PROCESS_FILED_SESSION:
+        status = lprs_filed_session(lprs_find_by_token(actor), out_reply, out_result);
+        break;
+    case LPRS_OP_PROCESS_CREDENTIALS:
+        if (header.payload_size != sizeof(lprs_credential_request_t)) status = -22;
+        else {
+            status = lprs_change_credentials(lprs_find_by_token(actor), payload);
+            if (!status) reply_payload_size = sizeof(lprs_credential_request_t);
+        }
+        break;
     case LPRS_OP_PROCESS_REGISTER_FD:
     case LPRS_OP_PROCESS_FORK_PARENT_REGISTER:
         if (token == 0 || request->fds == NULL || request->fd_count < 2 ||
@@ -2054,13 +2294,17 @@ int main(int argc, char **argv)
     }
     g_endpoint_fd = (int)(uint32_t)cfg.endpoint_fd;
     (void)pacha_fd_close(bootstrap_fd);
-    /* Attenuate the bootstrap installation rights once in the destination:
-     * no DUP, TRANSFER, SET_FLAGS or RECV authority remains. */
-    const long admin_fd = pacha_syscall4(PACHA_FD_SYSCALL_DUP, cfg.unix_admin_fd, 16,
-        PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL, PACHA_FD_FLAG_PRIVATE);
-    (void)pacha_fd_close((int)cfg.unix_admin_fd);
-    if (admin_fd < 16 || admin_fd >= PACHA_FD_TABLE_LIMIT) return 1;
-    g_unix_admin_fd = (int)admin_fd;
+    /* Launch grants install the final client-only, private capability. */
+    if (cfg.unix_admin_fd < 16 || cfg.unix_admin_fd >= PACHA_FD_TABLE_LIMIT) return 1;
+    g_unix_admin_fd = (int)cfg.unix_admin_fd;
+    g_filed_admin_fd = (int)cfg.filed_admin_fd;
+    status = lprs_accounts_load(g_filed_admin_fd, &g_accounts);
+    if (status) {
+        fprintf(stderr, "[lprs] account definitions rejected status=%d\n", status);
+        return 1;
+    }
+    g_accounts_ready = 1;
+    fprintf(stderr, "[lprs] account definitions ready\n");
     struct unix_control hello = { .operation = UNIX_OP_HELLO, .request = 1 };
     unsigned received = 0;
     status = unix_client_call(g_unix_admin_fd, &hello, NULL, 0, NULL, 0, &received);

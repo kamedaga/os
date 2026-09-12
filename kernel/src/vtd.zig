@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const acpi_dmar = @import("acpi_dmar.zig");
 const kernel_log = @import("kernel_log.zig");
 const pci = @import("pci.zig");
+const smp = @import("smp.zig");
 const types = @import("state/types.zig");
 const user_copy = @import("user_copy.zig");
 const tables = @import("vtd_tables.zig");
@@ -47,18 +48,15 @@ const iotlb_iirg_global: u64 = @as(u64, 1) << 60;
 const iotlb_iirg_domain: u64 = @as(u64, 2) << 60;
 const iotlb_did_shift: u6 = 32;
 const iotlb_iaig_shift: u6 = 57;
+const iotlb_read_drain: u64 = @as(u64, 1) << 49;
+const iotlb_write_drain: u64 = @as(u64, 1) << 48;
 const fault_record_valid: u64 = @as(u64, 1) << 63;
-
-const mtrr_cap_msr: u32 = 0x0000_00fe;
-const mtrr_def_type_msr: u32 = 0x0000_02ff;
-const mtrr_physbase0_msr: u32 = 0x0000_0200;
-const mtrr_enabled: u64 = 1 << 11;
-const mtrr_valid: u64 = 1 << 11;
-const memory_type_uc: u8 = 0;
 
 const LeafMetadata = struct {
     table_paddr: u64 = 0,
     refcounts_paddr: u64 = 0,
+    domain_id: u16 = 0,
+    quarantined: bool = false,
 };
 
 pub const IovaAllocator = tables.IovaAllocator;
@@ -68,6 +66,8 @@ const Domain = struct {
     did: u16 = 0,
     second_level_root_paddr: u64 = 0,
     allocator: IovaAllocator = .{},
+    quarantined: bool = false,
+    enabled: bool = true,
 };
 
 comptime {
@@ -98,11 +98,20 @@ const DriverState = struct {
     gcmd_shadow: u32 = 0,
     context_count: usize = 0,
     rwbf: bool = false,
+    /// Zero for a coherent table walker, otherwise the CPUID CLFLUSH stride.
+    table_cache_line_bytes: usize = 0,
     active: bool = false,
+    has_quarantine: bool = false,
     lock_word: u8 = 0,
 };
 
 var driver_state: DriverState = .{};
+var test_fail_invalidation: bool = false;
+var test_last_invalidation: u64 = 0;
+const CacheFlushEvent = struct { address: u64 = 0, length: usize = 0, first_word: u64 = 0 };
+var test_cache_flush_events: [256]CacheFlushEvent = [_]CacheFlushEvent{.{}} ** 256;
+var test_cache_flush_count: usize = 0;
+var test_flush_count_at_invalidation: usize = 0;
 
 pub fn kernelStaticStorageStartAddr() usize {
     return @intFromPtr(&driver_state);
@@ -141,47 +150,40 @@ fn cpuid(leaf: u32) struct { eax: u32, ebx: u32, ecx: u32, edx: u32 } {
     return .{ .eax = eax, .ebx = ebx, .ecx = ecx, .edx = edx };
 }
 
-fn rdmsr(msr: u32) u64 {
-    var low: u32 = 0;
-    var high: u32 = 0;
-    asm volatile ("rdmsr"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-        : [msr] "{ecx}" (msr),
-    );
-    return (@as(u64, high) << 32) | low;
+fn tableCacheLineBytes(ecap: u64, cpu_ebx: u32, cpu_edx: u32) ?usize {
+    if ((ecap & 1) != 0) return 0;
+    if ((cpu_edx & (@as(u32, 1) << 19)) == 0) return null;
+    const bytes: usize = ((cpu_ebx >> 8) & 0xff) * 8;
+    if (bytes == 0 or bytes > page_size or !std.math.isPowerOfTwo(bytes)) return null;
+    return bytes;
 }
 
-fn physicalAddressBits() u8 {
-    if (cpuid(0x8000_0000).eax < 0x8000_0008) return 36;
-    const reported: u8 = @truncate(cpuid(0x8000_0008).eax);
-    return @min(reported, 52);
-}
-
-/// The kernel's low identity map covers this register page. Its paging entry
-/// uses the normal WB encoding, so firmware MTRRs must make the MMIO address
-/// UC before it is safe to dereference as a register block.
-fn mmioIsUncachedByMtrr(paddr: u64) bool {
-    if ((cpuid(1).edx & (@as(u32, 1) << 12)) == 0) return false;
-    const mtrr_cap = rdmsr(mtrr_cap_msr);
-    const def_type = rdmsr(mtrr_def_type_msr);
-    if ((def_type & mtrr_enabled) == 0) return false;
-
-    const address_bits = physicalAddressBits();
-    const physical_mask = ((@as(u64, 1) << @intCast(address_bits)) - 1) & tables.page_address_mask;
-    const variable_count: usize = @intCast(mtrr_cap & 0xff);
-    var matched = false;
-    var index: usize = 0;
-    while (index < variable_count) : (index += 1) {
-        const base = rdmsr(mtrr_physbase0_msr + @as(u32, @intCast(index * 2)));
-        const mask = rdmsr(mtrr_physbase0_msr + @as(u32, @intCast(index * 2 + 1)));
-        if ((mask & mtrr_valid) == 0) continue;
-        const range_mask = mask & physical_mask;
-        if ((paddr & range_mask) != (base & range_mask)) continue;
-        matched = true;
-        if (@as(u8, @truncate(base)) == memory_type_uc) return true;
+/// ECAP.C describes the remapping hardware's accesses to CPU-owned tables,
+/// not the coherency of device payload DMA. CLFLUSH writes those cache lines
+/// back before table links or invalidation commands may expose their contents.
+fn flushTableCache(address: u64, length: usize) void {
+    const stride = driver_state.table_cache_line_bytes;
+    if (stride == 0 or length == 0) return;
+    if (builtin.is_test) {
+        if (test_cache_flush_count < test_cache_flush_events.len) {
+            test_cache_flush_events[test_cache_flush_count] = .{
+                .address = address,
+                .length = length,
+                .first_word = @as(*const u64, @ptrFromInt(address)).*,
+            };
+        }
+        test_cache_flush_count += 1;
     }
-    return !matched and @as(u8, @truncate(def_type)) == memory_type_uc;
+    const end = address + length;
+    var current = address & ~(@as(u64, @intCast(stride)) - 1);
+    asm volatile ("mfence" ::: .{ .memory = true });
+    while (current < end) : (current += stride) {
+        asm volatile ("clflush (%%rax)"
+            :
+            : [address] "{rax}" (current),
+            : .{ .memory = true });
+    }
+    asm volatile ("mfence" ::: .{ .memory = true });
 }
 
 fn mmioRead32(offset: u64) u32 {
@@ -195,7 +197,11 @@ fn mmioWrite32(offset: u64, value: u32) void {
 }
 
 fn mmioRead64(offset: u64) u64 {
-    const ptr: *volatile u64 = @ptrFromInt(driver_state.register_base + offset);
+    return mmioRead64At(driver_state.register_base, offset);
+}
+
+fn mmioRead64At(register_base: u64, offset: u64) u64 {
+    const ptr: *volatile u64 = @ptrFromInt(register_base + offset);
     return ptr.*;
 }
 
@@ -246,6 +252,12 @@ fn allocZeroPage() ?u64 {
     return paddr;
 }
 
+fn allocTablePage() ?u64 {
+    const paddr = allocZeroPage() orelse return null;
+    flushTableCache(paddr, page_size);
+    return paddr;
+}
+
 fn allocIovaBitmap() ?*[iova_bitmap_bytes]u8 {
     const free_list = driver_state.free_list orelse return null;
     const paddr = if (builtin.is_test)
@@ -293,12 +305,28 @@ fn ensureChildTable(parent: *tables.TablePage, index: usize) ?u64 {
         const paddr = pageAddress(existing);
         return if (paddr != 0) paddr else null;
     }
-    const child = allocZeroPage() orelse return null;
+    const child = allocTablePage() orelse return null;
     if (!tables.setSecondLevelEntry(parent, index, child, true, true)) return null;
+    flushTableCache(@intFromPtr(&parent[index]), @sizeOf(u64));
     return child;
 }
 
-fn leafMetadata(table_paddr: u64, create: bool) ?*LeafMetadata {
+/// A disabled domain still owns its entire tree. Unlike ordinary child
+/// links, its root links intentionally carry an address with no R/W bits.
+fn ensureDomainRootChild(domain: *const Domain, index: usize) ?u64 {
+    const root = tableAt(domain.second_level_root_paddr);
+    const existing = pageAddress(root[index]);
+    if (existing != 0) return existing;
+    const child = allocTablePage() orelse return null;
+    root[index] = child | (if (domain.enabled)
+        tables.second_level_read | tables.second_level_write
+    else
+        @as(u64, 0));
+    flushTableCache(@intFromPtr(&root[index]), @sizeOf(u64));
+    return child;
+}
+
+fn leafMetadata(table_paddr: u64, create: bool, domain_id: u16) ?*LeafMetadata {
     const start: usize = @intCast((table_paddr >> 12) & (leaf_index_slots - 1));
     var probe: usize = 0;
     while (probe < driver_state.leaf_index.len) : (probe += 1) {
@@ -313,7 +341,7 @@ fn leafMetadata(table_paddr: u64, create: bool) ?*LeafMetadata {
         const refcounts = allocZeroPage() orelse return null;
         const metadata_index = driver_state.leaf_count;
         const result = &driver_state.leaf_metadata[metadata_index];
-        result.* = .{ .table_paddr = table_paddr, .refcounts_paddr = refcounts };
+        result.* = .{ .table_paddr = table_paddr, .refcounts_paddr = refcounts, .domain_id = domain_id };
         driver_state.leaf_count += 1;
         driver_state.leaf_index[slot_index] = @intCast(metadata_index + 1);
         return result;
@@ -329,7 +357,7 @@ fn walkToLeaf(domain: *const Domain, iova: u64, create: bool) ?struct { table: *
     const pml4 = tableAt(domain.second_level_root_paddr);
     const pml4_index: usize = @intCast((iova >> 39) & 0x1ff);
     const pdp_paddr = if (create)
-        ensureChildTable(pml4, pml4_index) orelse return null
+        ensureDomainRootChild(domain, pml4_index) orelse return null
     else
         pageAddress(pml4[pml4_index]);
     if (pdp_paddr == 0) return null;
@@ -349,7 +377,7 @@ fn walkToLeaf(domain: *const Domain, iova: u64, create: bool) ?struct { table: *
     else
         pageAddress(pd[pd_index]);
     if (pt_paddr == 0) return null;
-    const metadata = leafMetadata(pt_paddr, create) orelse return null;
+    const metadata = leafMetadata(pt_paddr, create, domain.did) orelse return null;
     return .{
         .table = tableAt(pt_paddr),
         .metadata = metadata,
@@ -366,7 +394,10 @@ fn mapPage(domain: *const Domain, iova: u64, paddr: u64, readable: bool, writabl
         (if (readable) tables.second_level_read else 0) |
         (if (writable) tables.second_level_write else 0);
     if (existing != 0 and existing != desired) return false;
-    if (existing == 0 and !tables.setSecondLevelEntry(leaf.table, leaf.index, paddr, readable, writable)) return false;
+    if (existing == 0) {
+        if (!tables.setSecondLevelEntry(leaf.table, leaf.index, paddr, readable, writable)) return false;
+        flushTableCache(@intFromPtr(&leaf.table[leaf.index]), @sizeOf(u64));
+    }
     if (refs[leaf.index] == 0) driver_state.mapped_page_count += 1;
     refs[leaf.index] += 1;
     driver_state.mapping_ref_count += 1;
@@ -381,8 +412,130 @@ fn unmapPage(domain: *const Domain, iova: u64) void {
     driver_state.mapping_ref_count -= 1;
     if (refs[leaf.index] == 0) {
         leaf.table[leaf.index] = 0;
+        flushTableCache(@intFromPtr(&leaf.table[leaf.index]), @sizeOf(u64));
         driver_state.mapped_page_count -= 1;
     }
+}
+
+/// Remove hardware permission before invalidation, but preserve the physical
+/// address and reference ledger until the IOMMU has acknowledged the drain.
+fn withdrawPage(domain: *const Domain, iova: u64) void {
+    const leaf = walkToLeaf(domain, iova, false) orelse return;
+    const refs = refcountsAt(leaf.metadata.refcounts_paddr);
+    if (refs[leaf.index] == 1) {
+        leaf.table[leaf.index] &= tables.page_address_mask;
+        flushTableCache(@intFromPtr(&leaf.table[leaf.index]), @sizeOf(u64));
+    }
+}
+
+fn quarantineDomain(domain: *Domain) void {
+    domain.quarantined = true;
+    for (driver_state.leaf_metadata[0..driver_state.leaf_count]) |*metadata| {
+        if (metadata.domain_id == domain.did) @atomicStore(bool, &metadata.quarantined, true, .release);
+    }
+    @atomicStore(bool, &driver_state.has_quarantine, true, .release);
+    // Never disable IOMMU translation on a runtime failure: that would turn
+    // stale accesses into unrestricted DMA. Stop bus mastering instead.
+    if (!builtin.is_test) {
+        if (pci.locationFromResourceId(domain.device)) |loc| {
+            const command = pci.readConfigU16(loc, 0x04);
+            pci.writeConfigU16(loc, 0x04, command & ~@as(u16, 4));
+            _ = pci.readConfigU16(loc, 0x04);
+        }
+        kernel_log.writeFmt("vtd: quarantined device=0x{x} did={} backing-retained=1\n", .{ domain.device, domain.did });
+    }
+}
+
+/// The retained leaf ledger is the physical-page quarantine owner, independent
+/// of FDs, VMAs and process lifetime. It is never cleared after a failed drain.
+/// Quarantined leaves become immutable before publication, so the PMM can
+/// inspect them without inverting the VT-d -> PMM allocation lock order.
+pub fn physicalRangeQuarantined(paddr: u64, page_count: usize) bool {
+    if (!@atomicLoad(bool, &driver_state.has_quarantine, .acquire)) return false;
+    if (page_count == 0) return false;
+    const length, const size_overflow = @mulWithOverflow(@as(u64, @intCast(page_count)), page_size);
+    const end, const end_overflow = @addWithOverflow(paddr, length);
+    if (size_overflow != 0 or end_overflow != 0) return true;
+    for (&driver_state.leaf_metadata) |*metadata| {
+        if (!@atomicLoad(bool, &metadata.quarantined, .acquire)) continue;
+        const entries = tableAt(metadata.table_paddr);
+        const refs = refcountsAt(metadata.refcounts_paddr);
+        for (entries, 0..) |entry, index| {
+            if (refs[index] == 0) continue;
+            const page = pageAddress(entry);
+            if (page < end and page + page_size > paddr) return true;
+        }
+    }
+    return false;
+}
+
+pub fn deviceQuarantined(device: types.DmaDeviceId) bool {
+    if (!@atomicLoad(bool, &driver_state.has_quarantine, .acquire)) return false;
+    lock();
+    defer unlock();
+    const domain = domainForDevice(device) orelse return false;
+    return domain.quarantined;
+}
+
+fn setDomainRootPermissions(domain: *Domain, enabled: bool) void {
+    const root = tableAt(domain.second_level_root_paddr);
+    for (root) |*entry| {
+        if (pageAddress(entry.*) == 0) continue;
+        entry.* = pageAddress(entry.*) | (if (enabled)
+            tables.second_level_read | tables.second_level_write
+        else
+            @as(u64, 0));
+    }
+    domain.enabled = enabled;
+    flushTableCache(domain.second_level_root_paddr, page_size);
+}
+
+/// Shared device-domain state, including all same-authority FD aliases.
+/// Legacy second-level contexts only (no Device-TLB/ATS or PASID domains).
+/// Keep the context, IOVA allocations, leaf permissions and RAM ledger intact.
+/// PCI bus-master writes cannot bypass withdrawn second-level root permission.
+pub fn setDeviceDmaEnabled(device: types.DmaDeviceId, enabled: bool) error{
+    Unsupported,
+    NoDevice,
+    Quarantined,
+    DrainFailed,
+}!void {
+    if (!isActive()) return error.Unsupported;
+    lock();
+    defer unlock();
+    const domain = domainForDevice(device) orelse return error.NoDevice;
+    if (domain.quarantined) return error.Quarantined;
+    const required_drain = (@as(u64, 1) << 55) | (@as(u64, 1) << 54);
+    if ((driver_state.cap & required_drain) != required_drain) return error.Unsupported;
+    setDomainRootPermissions(domain, enabled);
+    if (flushTranslationChanges(domain.did)) return;
+    // A failed enable may already have exposed translations. Remove root
+    // permission again, but never claim a successful stop without its drain.
+    setDomainRootPermissions(domain, false);
+    quarantineDomain(domain);
+    return error.DrainFailed;
+}
+
+pub fn dmaSnapshotFlags(device: types.DmaDeviceId) u64 {
+    if (!isActive()) return 0;
+    lock();
+    defer unlock();
+    const domain = domainForDevice(device) orelse return 0;
+    const abi = @import("kernel_abi_root").capsule_abi;
+    return if (domain.quarantined) abi.snapshot_flag_dma_quarantined else abi.snapshot_flag_dma_translated;
+}
+
+pub fn domainInvalidationCommand(cap: u64, did: u16) u64 {
+    return iotlb_ivt | iotlb_iirg_domain | (@as(u64, did) << iotlb_did_shift) |
+        (if ((cap & (@as(u64, 1) << 55)) != 0) iotlb_read_drain else 0) |
+        (if ((cap & (@as(u64, 1) << 54)) != 0) iotlb_write_drain else 0);
+}
+
+fn domainInvalidationCompleted(value: u64) bool {
+    if ((value & iotlb_ivt) != 0) return false;
+    const actual = (value >> iotlb_iaig_shift) & 3;
+    // Hardware may promote a domain flush to a stronger global flush.
+    return actual == 1 or actual == 2;
 }
 
 fn writeBufferFlush() bool {
@@ -405,16 +558,21 @@ fn invalidateIotlbGlobal() bool {
 }
 
 fn invalidateIotlbDomain(did: u16) bool {
-    if (builtin.is_test) return true;
+    const command = domainInvalidationCommand(driver_state.cap, did);
+    if (builtin.is_test) {
+        test_last_invalidation = command;
+        test_flush_count_at_invalidation = test_cache_flush_count;
+        return !test_fail_invalidation;
+    }
     const register = driver_state.iotlb_offset + 8;
-    mmioWrite64(register, iotlb_ivt | iotlb_iirg_domain | (@as(u64, did) << iotlb_did_shift));
+    mmioWrite64(register, command);
     if (!wait64Clear(register, iotlb_ivt)) return false;
-    return ((mmioRead64(register) >> iotlb_iaig_shift) & 0x3) == 2;
+    return domainInvalidationCompleted(mmioRead64(register));
 }
 
 fn flushTranslationChanges(did: u16) bool {
     asm volatile ("mfence" ::: .{ .memory = true });
-    if (builtin.is_test) return true;
+    if (builtin.is_test) return invalidateIotlbDomain(did);
     if (!writeBufferFlush()) return false;
     return invalidateIotlbDomain(did);
 }
@@ -483,7 +641,49 @@ fn logDeviceScopes(info: *const acpi_dmar.DmarInfo) void {
     }
 }
 
-fn pciFunctionCount() usize {
+fn samePciLocation(left: pci.Location, right: pci.Location) bool {
+    return left.bus == right.bus and
+        left.device == right.device and
+        left.function == right.function;
+}
+
+fn resolveEndpointScope(scope: *const acpi_dmar.DeviceScope) ?pci.Location {
+    if (scope.scope_type != 1 or scope.path_count == 0) return null;
+
+    var bus = scope.start_bus;
+    for (scope.path[0..scope.path_count], 0..) |path, path_index| {
+        if (path.device >= 32 or path.function >= 8) return null;
+        const location = pci.Location{
+            .bus = bus,
+            .device = path.device,
+            .function = path.function,
+        };
+        if (path_index + 1 == scope.path_count) return location;
+
+        if (pci.readVendorId(location) == 0xffff) return null;
+        if (pci.readClassCode(location) != 0x06 or
+            pci.readSubclass(location) != 0x04)
+        {
+            return null;
+        }
+        const secondary = pci.readConfigU8(location, 0x19);
+        const subordinate = pci.readConfigU8(location, 0x1a);
+        if (secondary == 0 or secondary > subordinate) return null;
+        bus = secondary;
+    }
+    return null;
+}
+
+fn drhdCoversPciFunction(drhd: *const acpi_dmar.Drhd, location: pci.Location) bool {
+    if (drhd.include_pci_all) return true;
+    for (drhd.scopes[0..drhd.scope_count]) |*scope| {
+        const endpoint = resolveEndpointScope(scope) orelse continue;
+        if (samePciLocation(endpoint, location)) return true;
+    }
+    return false;
+}
+
+fn pciFunctionCount(drhd: *const acpi_dmar.Drhd) ?usize {
     var count: usize = 0;
     var bus_number: usize = 0;
     while (bus_number < 256) : (bus_number += 1) {
@@ -503,15 +703,22 @@ fn pciFunctionCount() usize {
                     .device = @intCast(device_number),
                     .function = @intCast(function_number),
                 };
-                if (pci.readVendorId(location) != 0xffff) count += 1;
+                if (pci.readVendorId(location) == 0xffff) continue;
+                if (!drhdCoversPciFunction(drhd, location)) {
+                    kernel_log.writeFmt(
+                        "vtd: scope coverage failed bdf={}:{}:{}\n",
+                        .{ bus_number, device_number, function_number },
+                    );
+                    return null;
+                }
+                count += 1;
             }
         }
     }
     return count;
 }
 
-fn installPciContexts() bool {
-    const total_function_count = pciFunctionCount();
+fn installPciContexts(drhd: *const acpi_dmar.Drhd, total_function_count: usize) bool {
     if (total_function_count == 0) {
         kernel_log.write("vtd: context construction failed reason=no-pci-functions\n");
         return false;
@@ -552,8 +759,15 @@ fn installPciContexts() bool {
                 };
                 const vendor = pci.readVendorId(location);
                 if (vendor == 0xffff) continue;
+                if (!drhdCoversPciFunction(drhd, location)) {
+                    kernel_log.writeFmt(
+                        "vtd: context construction failed reason=scope-changed bdf={}:{}:{}\n",
+                        .{ bus_number, device_number, function_number },
+                    );
+                    return false;
+                }
                 if (driver_state.context_table_paddrs[bus_number] == 0) {
-                    const context_paddr = allocZeroPage() orelse return false;
+                    const context_paddr = allocTablePage() orelse return false;
                     if (!tables.setRootEntry(root, @intCast(bus_number), context_paddr)) return false;
                     driver_state.context_table_paddrs[bus_number] = context_paddr;
                 }
@@ -561,7 +775,7 @@ fn installPciContexts() bool {
                 const device_function: u8 = @intCast(device_number * 8 + function_number);
                 const domain_index = driver_state.domain_count;
                 if (domain_index >= driver_state.domains.len) return false;
-                const second_level_root_paddr = allocZeroPage() orelse return false;
+                const second_level_root_paddr = allocTablePage() orelse return false;
                 const did: u16 = @intCast(domain_index + 1);
                 const resource_id = pci.resourceIdFromLocation(location);
                 driver_state.domains[domain_index] = .{
@@ -582,7 +796,18 @@ fn installPciContexts() bool {
     return driver_state.context_count == total_function_count and driver_state.domain_count == total_function_count;
 }
 
+/// Context contents reach RAM before the root entries that point at them;
+/// both are visible before SRTP or translation enable touches either table.
+fn flushInitialTables() void {
+    for (driver_state.context_table_paddrs) |context| {
+        if (context != 0) flushTableCache(context, page_size);
+    }
+    flushTableCache(driver_state.root_paddr, page_size);
+}
+
 pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
+    // A second initialization must never discard retained hardware references.
+    if (driver_state.active or driver_state.has_quarantine) return;
     driver_state = .{};
     const table = acpi_dmar.findDmar(rsdp_paddr) orelse {
         kernel_log.write("vtd: mode=pass-through reason=dmar-not-found active=0 faults=0\n");
@@ -608,32 +833,68 @@ pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
         return;
     }
     const drhd = info.drhds[0];
-    if (drhd.segment != 0 or drhd.register_base == 0 or (drhd.register_base & (page_size - 1)) != 0) {
+    if (drhd.segment != 0 or
+        drhd.register_base == 0 or (drhd.register_base & (page_size - 1)) != 0)
+    {
         logInitFailure("unsupported DRHD segment or register base");
         return;
     }
-    if (drhd.register_base >= 16 * 1024 * 1024 * 1024) {
-        logInitFailure("DRHD register base is outside kernel identity map");
+    const pci_function_count = pciFunctionCount(&drhd) orelse {
+        logInitFailure("DRHD scopes do not cover every present PCI function");
+        return;
+    };
+    const identity_limit = @import("arch/x86_64/physical_layout.zig").identity_limit;
+    if (drhd.register_base >= identity_limit or
+        page_size > identity_limit - drhd.register_base)
+    {
+        logInitFailure("DRHD register page is outside kernel identity map");
         return;
     }
-    if (!mmioIsUncachedByMtrr(drhd.register_base)) {
-        logInitFailure("DRHD register page is not confirmed uncached by MTRR");
+    if (!smp.ucMinusMmioAllowed(drhd.register_base, page_size)) {
+        logInitFailure("DRHD register page lacks an all-CPU uncached proof");
         return;
     }
-    driver_state.register_base = drhd.register_base;
-    kernel_log.writeFmt("vtd: mmio base=0x{x} identity_mapped=1 cache=UC source=MTRR\n", .{drhd.register_base});
+    const cap = mmioRead64At(drhd.register_base, cap_reg);
+    const ecap = mmioRead64At(drhd.register_base, ecap_reg);
+    const cache_cpu = cpuid(1);
+    const table_cache_line_bytes = tableCacheLineBytes(ecap, cache_cpu.ebx, cache_cpu.edx) orelse {
+        logInitFailure("non-coherent page-table walker requires CLFLUSH");
+        return;
+    };
+    const sagaw: u5 = @truncate(cap >> 8);
+    const nd: u3 = @truncate(cap);
+    const cm = (cap & (@as(u64, 1) << 7)) != 0;
+    const rwbf = (cap & (@as(u64, 1) << 4)) != 0;
+    const fault_record_offset = ((cap >> 24) & 0x3ff) * 16;
+    const fault_record_count = @as(usize, @intCast((cap >> 40) & 0xff)) + 1;
+    const iotlb_offset = ((ecap >> 8) & 0x3ff) * 16;
+    const fault_end = fault_record_offset + @as(u64, @intCast(fault_record_count)) * 16;
+    const iotlb_end = iotlb_offset + 16;
+    const register_bytes = std.mem.alignForward(
+        u64,
+        @max(page_size, @max(fault_end, iotlb_end)),
+        page_size,
+    );
+    if (register_bytes > identity_limit - drhd.register_base or
+        !smp.ucMinusMmioAllowed(drhd.register_base, register_bytes))
+    {
+        logInitFailure("DRHD extended registers lack an all-CPU uncached mapping");
+        return;
+    }
 
-    driver_state.cap = mmioRead64(cap_reg);
-    driver_state.ecap = mmioRead64(ecap_reg);
-    const sagaw: u5 = @truncate(driver_state.cap >> 8);
-    const nd: u3 = @truncate(driver_state.cap);
-    const cm = (driver_state.cap & (@as(u64, 1) << 7)) != 0;
-    driver_state.rwbf = (driver_state.cap & (@as(u64, 1) << 4)) != 0;
-    driver_state.fault_record_offset = ((driver_state.cap >> 24) & 0x3ff) * 16;
-    driver_state.fault_record_count = @as(usize, @intCast((driver_state.cap >> 40) & 0xff)) + 1;
-    driver_state.iotlb_offset = ((driver_state.ecap >> 8) & 0x3ff) * 16;
+    // Publish the MMIO state only after every register range used by runtime
+    // fault reporting and invalidation has passed the identity/cache proof.
+    driver_state.register_base = drhd.register_base;
+    driver_state.cap = cap;
+    driver_state.ecap = ecap;
+    driver_state.table_cache_line_bytes = table_cache_line_bytes;
+    driver_state.rwbf = rwbf;
+    driver_state.fault_record_offset = fault_record_offset;
+    driver_state.fault_record_count = fault_record_count;
+    driver_state.iotlb_offset = iotlb_offset;
     driver_state.hardware_domain_count = domainCount(nd);
-    const qi = (driver_state.ecap & (@as(u64, 1) << 1)) != 0;
+    const qi = (ecap & (@as(u64, 1) << 1)) != 0;
+    kernel_log.writeFmt("vtd: mmio base=0x{x} identity_mapped=1 cache=UC source=MTRR\n", .{drhd.register_base});
     kernel_log.writeFmt(
         "vtd: CAP=0x{x} ECAP=0x{x} SAGAW=0x{x} aw48={} CM={} RWBF={} ND={} domains={} FRO=0x{x} IRO=0x{x} QI={}\n",
         .{ driver_state.cap, driver_state.ecap, sagaw, @intFromBool((sagaw & (1 << 2)) != 0), @intFromBool(cm), @intFromBool(driver_state.rwbf), nd, domainCount(nd), driver_state.fault_record_offset, driver_state.iotlb_offset, @intFromBool(qi) },
@@ -647,14 +908,15 @@ pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
         return;
     }
 
-    driver_state.root_paddr = allocZeroPage() orelse {
+    driver_state.root_paddr = allocTablePage() orelse {
         logInitFailure("root table allocation failed");
         return;
     };
-    if (!installPciContexts()) {
+    if (!installPciContexts(&drhd, pci_function_count)) {
         logInitFailure("PCI context construction failed");
         return;
     }
+    flushInitialTables();
     asm volatile ("mfence" ::: .{ .memory = true });
 
     mmioWrite64(rtaddr_reg, driver_state.root_paddr);
@@ -709,6 +971,7 @@ pub fn allocIova(device: types.DmaDeviceId, page_count: usize) ?u64 {
         kernel_log.writeFmt("vtd: iova alloc failed device=0x{x} reason=no-domain\n", .{device});
         return null;
     };
+    if (domain.quarantined) return null;
     if (!ensureDomainAllocator(domain)) {
         kernel_log.writeFmt("vtd: iova alloc failed device=0x{x} did={} reason=bitmap-allocation\n", .{ device, domain.did });
         return null;
@@ -723,11 +986,21 @@ pub fn allocIova(device: types.DmaDeviceId, page_count: usize) ?u64 {
     return iova;
 }
 
+pub fn reserveIova(device: types.DmaDeviceId, iova: u64, page_count: usize) bool {
+    if (!isActive()) return false;
+    lock();
+    defer unlock();
+    const domain = domainForDevice(device) orelse return false;
+    if (domain.quarantined or !ensureDomainAllocator(domain)) return false;
+    return domain.allocator.reserve(iova, page_count);
+}
+
 pub fn freeIova(device: types.DmaDeviceId, iova: u64, page_count: usize) void {
     if (!isActive()) return;
     lock();
     defer unlock();
     const domain = domainForDevice(device) orelse return;
+    if (domain.quarantined) return;
     _ = domain.allocator.free(iova, page_count);
 }
 
@@ -752,58 +1025,68 @@ pub fn mapPages(
         kernel_log.writeFmt("vtd: map failed device=0x{x} reason=no-domain\n", .{device});
         return false;
     };
+    if (domain.quarantined) return false;
     var mapped: usize = 0;
     while (mapped < paddrs.len) : (mapped += 1) {
         const page_iova = iova + @as(u64, @intCast(mapped)) * page_size;
         if (!mapPage(domain, page_iova, paddrs[mapped], readable, writable)) {
-            var rollback: usize = 0;
-            while (rollback < mapped) : (rollback += 1) {
-                unmapPage(domain, iova + @as(u64, @intCast(rollback)) * page_size);
-            }
-            _ = flushTranslationChanges(domain.did);
-            kernel_log.writeFmt(
+            _ = withdrawRange(domain, iova, mapped);
+            if (!builtin.is_test) kernel_log.writeFmt(
                 "vtd: map failed device=0x{x} did={} iova=0x{x} pages={} at={}\n",
                 .{ device, domain.did, iova, paddrs.len, mapped },
             );
-            dumpFaultsLocked();
+            if (!builtin.is_test) dumpFaultsLocked();
             return false;
         }
     }
     if (!flushTranslationChanges(domain.did)) {
-        var rollback: usize = 0;
-        while (rollback < paddrs.len) : (rollback += 1) {
-            unmapPage(domain, iova + @as(u64, @intCast(rollback)) * page_size);
-        }
-        _ = flushTranslationChanges(domain.did);
-        kernel_log.writeFmt(
+        _ = withdrawRange(domain, iova, paddrs.len);
+        if (!builtin.is_test) kernel_log.writeFmt(
             "vtd: map failed invalidation device=0x{x} did={} iova=0x{x} pages={}\n",
             .{ device, domain.did, iova, paddrs.len },
         );
-        dumpFaultsLocked();
+        if (!builtin.is_test) dumpFaultsLocked();
         return false;
     }
     return true;
 }
 
-pub fn unmapRangeForDevice(device: types.DmaDeviceId, iova: u64, size: u64) void {
-    if (!isActive() or !validIovaRange(iova, size)) return;
+fn withdrawRange(domain: *Domain, first: u64, page_count: usize) bool {
+    if (domain.quarantined) return false;
+    if (page_count == 0) return true;
+    var index: usize = 0;
+    while (index < page_count) : (index += 1) {
+        withdrawPage(domain, first + @as(u64, @intCast(index)) * page_size);
+    }
+    if (!flushTranslationChanges(domain.did)) {
+        quarantineDomain(domain);
+        return false;
+    }
+    index = 0;
+    while (index < page_count) : (index += 1) {
+        unmapPage(domain, first + @as(u64, @intCast(index)) * page_size);
+    }
+    return true;
+}
+
+pub fn unmapRangeForDevice(device: types.DmaDeviceId, iova: u64, size: u64) bool {
+    if (!isActive()) return true;
+    if (!validIovaRange(iova, size)) return false;
     const first = iova & ~(page_size - 1);
     const last_byte = iova + size - 1;
     const page_count = ((last_byte & ~(page_size - 1)) - first) / page_size + 1;
     lock();
     defer unlock();
-    const domain = domainForDevice(device) orelse return;
-    var index: u64 = 0;
-    while (index < page_count) : (index += 1) {
-        unmapPage(domain, first + index * page_size);
-    }
-    if (!flushTranslationChanges(domain.did)) {
-        kernel_log.writeFmt(
+    const domain = domainForDevice(device) orelse return false;
+    if (!withdrawRange(domain, first, @intCast(page_count))) {
+        if (!builtin.is_test) kernel_log.writeFmt(
             "vtd: unmap invalidation failed device=0x{x} did={} iova=0x{x} pages={}\n",
             .{ device, domain.did, iova, page_count },
         );
-        dumpFaultsLocked();
+        if (!builtin.is_test) dumpFaultsLocked();
+        return false;
     }
+    return true;
 }
 
 fn dumpFaultsLocked() void {
@@ -845,4 +1128,422 @@ pub fn dumpRuntimeCheckpoint() void {
         .{ @intFromBool(driver_state.active), driver_state.mapped_page_count, driver_state.mapping_ref_count },
     );
     dumpFaultsLocked();
+}
+
+/// Fault injection replaces only the register acknowledgement. Page tables,
+/// allocation, rollback, quarantine and PMM admission remain production paths.
+pub const TestSupport = if (builtin.is_test) struct {
+    pub fn begin(free_list: *types.FreePageList, device: types.DmaDeviceId) !void {
+        try beginWithTableCache(free_list, device, true);
+    }
+
+    pub fn beginWithTableCache(free_list: *types.FreePageList, device: types.DmaDeviceId, coherent: bool) !void {
+        driver_state = .{ .free_list = free_list, .ecap = if (coherent) 1 else 0xf42 };
+        const cpu = cpuid(1);
+        driver_state.table_cache_line_bytes = tableCacheLineBytes(driver_state.ecap, cpu.ebx, cpu.edx) orelse
+            return error.CacheMaintenanceUnavailable;
+        test_fail_invalidation = false;
+        test_last_invalidation = 0;
+        test_cache_flush_count = 0;
+        test_flush_count_at_invalidation = 0;
+        driver_state.domains[0] = .{
+            .device = device,
+            .did = 1,
+            .second_level_root_paddr = allocTablePage() orelse return error.OutOfMemory,
+        };
+        driver_state.domain_count = 1;
+        driver_state.cap = (@as(u64, 1) << 55) | (@as(u64, 1) << 54);
+        driver_state.active = true;
+    }
+
+    pub fn end() void {
+        driver_state = .{};
+        test_fail_invalidation = false;
+    }
+
+    pub fn failInvalidation(fail: bool) void {
+        test_fail_invalidation = fail;
+    }
+
+    pub fn lastInvalidation() u64 {
+        return test_last_invalidation;
+    }
+
+    pub fn mappingReferences() usize {
+        return driver_state.mapping_ref_count;
+    }
+
+    pub fn usedPages(device: types.DmaDeviceId) usize {
+        return (domainForDevice(device) orelse return 0).allocator.used_pages;
+    }
+} else void;
+
+test "VT-d endpoint scope coverage is exact and excludes non-PCI scopes" {
+    const location = pci.Location{ .bus = 0, .device = 3, .function = 0 };
+    var drhd = acpi_dmar.Drhd{};
+
+    try std.testing.expect(!drhdCoversPciFunction(&drhd, location));
+    drhd.scopes[0] = .{
+        .scope_type = 1,
+        .start_bus = 0,
+        .path = blk: {
+            var path = [_]acpi_dmar.DevicePath{.{}} ** acpi_dmar.max_device_scope_path_entries;
+            path[0] = .{ .device = 3, .function = 0 };
+            break :blk path;
+        },
+        .path_count = 1,
+    };
+    drhd.scope_count = 1;
+    try std.testing.expect(drhdCoversPciFunction(&drhd, location));
+    try std.testing.expect(!drhdCoversPciFunction(
+        &drhd,
+        .{ .bus = 0, .device = 4, .function = 0 },
+    ));
+
+    drhd.scopes[0].scope_type = 3;
+    try std.testing.expect(!drhdCoversPciFunction(&drhd, location));
+    drhd.scopes[0].scope_type = 1;
+    drhd.scopes[0].path[0].device = 32;
+    try std.testing.expect(!drhdCoversPciFunction(&drhd, location));
+    drhd.include_pci_all = true;
+    try std.testing.expect(drhdCoversPciFunction(&drhd, location));
+}
+
+test "VT-d lifetime domain stop retains tree and permits blocked mapping changes" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 64 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 64);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    const other = pci.resourceIdFromLocation(.{ .bus = 0, .device = 3, .function = 0 });
+    try TestSupport.beginWithTableCache(free_list, device, false);
+    defer TestSupport.end();
+    driver_state.domains[1] = .{
+        .device = other,
+        .did = 2,
+        .second_level_root_paddr = allocTablePage() orelse return error.OutOfMemory,
+    };
+    driver_state.domain_count = 2;
+    const page = try free_list.popFront();
+    const iova = iova_window_start;
+    try std.testing.expect(reserveIova(device, iova, 2));
+    try std.testing.expect(reserveIova(other, iova, 1));
+    try std.testing.expect(mapPages(other, iova, &.{page}, true, true));
+    const other_root = tableAt(driver_state.domains[1].second_level_root_paddr).*;
+    const domain = &driver_state.domains[0];
+    const root = tableAt(domain.second_level_root_paddr);
+    try setDeviceDmaEnabled(device, false);
+    try std.testing.expect(mapPages(device, iova, &.{page}, true, false));
+    const child = pageAddress(root[0]);
+    try std.testing.expect(child != 0);
+    try std.testing.expectEqual(@as(u64, 0), root[0] & 3);
+    const first_leaf = walkToLeaf(domain, iova, false).?;
+    const first_entry = first_leaf.table[first_leaf.index];
+    for (0..8) |_| {
+        // Alias the same RAM at a distinct IOVA while the original map lives.
+        try std.testing.expect(mapPages(device, iova + page_size, &.{page}, false, true));
+        try std.testing.expectEqual(child, root[0]);
+        try std.testing.expectEqual(first_entry, first_leaf.table[first_leaf.index]);
+        test_cache_flush_count = 0;
+        try setDeviceDmaEnabled(device, true);
+        try std.testing.expectEqual(child | 3, root[0]);
+        try std.testing.expectEqual(@as(usize, 3), TestSupport.mappingReferences());
+        try std.testing.expectEqual(@as(usize, 2), TestSupport.usedPages(device));
+        try std.testing.expectEqual(@as(usize, 1), test_flush_count_at_invalidation);
+        try std.testing.expectEqual(domain.second_level_root_paddr, test_cache_flush_events[0].address);
+        try std.testing.expectEqual(child | 3, test_cache_flush_events[0].first_word);
+        try setDeviceDmaEnabled(device, false);
+        try std.testing.expectEqual(child, root[0]);
+        try std.testing.expectEqual(iotlb_read_drain | iotlb_write_drain, TestSupport.lastInvalidation() & (iotlb_read_drain | iotlb_write_drain));
+        try std.testing.expect(unmapRangeForDevice(device, iova + page_size, page_size));
+        try std.testing.expectEqual(@as(usize, 2), TestSupport.mappingReferences());
+        try std.testing.expectEqualSlices(u64, &other_root, tableAt(driver_state.domains[1].second_level_root_paddr));
+    }
+    try std.testing.expect(unmapRangeForDevice(device, iova, page_size));
+    try setDeviceDmaEnabled(device, true);
+    try setDeviceDmaEnabled(device, false);
+    try std.testing.expectEqual(@as(usize, 1), TestSupport.mappingReferences());
+}
+
+test "VT-d lifetime domain stop fails closed and requires both drain capabilities" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    inline for (.{ false, true }) |enable| {
+        free_list.* = .{};
+        try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+        try TestSupport.begin(free_list, device);
+        defer TestSupport.end();
+        const page = try free_list.popFront();
+        const iova = iova_window_start;
+        try std.testing.expect(reserveIova(device, iova, 1));
+        try std.testing.expect(mapPages(device, iova, &.{page}, true, true));
+        const root = tableAt(driver_state.domains[0].second_level_root_paddr);
+        const entry = root[0];
+        for ([_]u64{ 0, @as(u64, 1) << 54, @as(u64, 1) << 55 }) |cap| {
+            driver_state.cap = cap;
+            try std.testing.expectError(error.Unsupported, setDeviceDmaEnabled(device, false));
+            try std.testing.expectEqual(entry, root[0]);
+            try std.testing.expect(!deviceQuarantined(device));
+        }
+        driver_state.cap = (@as(u64, 1) << 54) | (@as(u64, 1) << 55);
+        try setDeviceDmaEnabled(device, !enable);
+        TestSupport.failInvalidation(true);
+        try std.testing.expectError(error.DrainFailed, setDeviceDmaEnabled(device, enable));
+        try std.testing.expect(deviceQuarantined(device));
+        try std.testing.expectEqual(entry & tables.page_address_mask, root[0]);
+        try std.testing.expectEqual(@as(usize, 1), TestSupport.mappingReferences());
+        try std.testing.expectEqual(@as(usize, 1), TestSupport.usedPages(device));
+        try std.testing.expect(physicalRangeQuarantined(page, 1));
+        TestSupport.failInvalidation(false);
+        try std.testing.expectError(error.Quarantined, setDeviceDmaEnabled(device, true));
+        try std.testing.expect(!mapPages(device, iova + page_size, &.{page}, true, true));
+        try std.testing.expect(!unmapRangeForDevice(device, iova, page_size));
+        try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, page));
+    }
+}
+
+test "VT-d lifetime reserves exact IOVA and releases SG pages only after drain" {
+    try std.testing.expect(domainInvalidationCompleted(@as(u64, 1) << iotlb_iaig_shift));
+    try std.testing.expect(domainInvalidationCompleted(@as(u64, 2) << iotlb_iaig_shift));
+    try std.testing.expect(!domainInvalidationCompleted(0));
+    try std.testing.expect(!domainInvalidationCompleted(@as(u64, 3) << iotlb_iaig_shift));
+    try std.testing.expect(!domainInvalidationCompleted(iotlb_ivt | (@as(u64, 2) << iotlb_iaig_shift)));
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    const first = try free_list.popFront();
+    _ = try free_list.popFront();
+    const second = try free_list.popFront();
+    const iova = iova_window_start + 0x4000;
+    try std.testing.expect(reserveIova(device, iova, 2));
+    try std.testing.expect(!reserveIova(device, iova + page_size, 2));
+    try std.testing.expect(!reserveIova(device, iova_window_end, 1));
+    try std.testing.expect(!reserveIova(device, iova + 1, 1));
+    try std.testing.expectEqual(@as(usize, 2), TestSupport.usedPages(device));
+    try std.testing.expect(mapPages(device, iova, &.{ first, second }, true, true));
+    try std.testing.expectEqual(@as(usize, 0), test_cache_flush_count);
+    try std.testing.expectEqual(@as(usize, 2), TestSupport.mappingReferences());
+    try std.testing.expect(unmapRangeForDevice(device, iova, 2 * page_size));
+    try std.testing.expectEqual(iotlb_read_drain | iotlb_write_drain, TestSupport.lastInvalidation() & (iotlb_read_drain | iotlb_write_drain));
+    try std.testing.expectEqual(@as(usize, 0), TestSupport.mappingReferences());
+    freeIova(device, iova, 2);
+    try std.testing.expectEqual(@as(usize, 0), TestSupport.usedPages(device));
+    try std.testing.expect(reserveIova(device, iova, 2));
+    try free_list.appendPage(0, first);
+    try free_list.appendPage(0, second);
+}
+
+test "VT-d lifetime failed drain retains IOVA and actual PMM backing" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    const first = try free_list.popFront();
+    _ = try free_list.popFront();
+    const second = try free_list.popFront();
+    const iova = iova_window_start + 0x8000;
+    try std.testing.expect(reserveIova(device, iova, 2));
+    try std.testing.expect(mapPages(device, iova, &.{ first, second }, true, true));
+    try std.testing.expectEqual(@import("kernel_abi_root").capsule_abi.snapshot_flag_dma_translated, dmaSnapshotFlags(device));
+    try std.testing.expectEqual(@as(u64, 0), dmaSnapshotFlags(device + 1));
+    TestSupport.failInvalidation(true);
+    try std.testing.expect(!unmapRangeForDevice(device, iova, 2 * page_size));
+    try std.testing.expect(deviceQuarantined(device));
+    try std.testing.expectEqual(@import("kernel_abi_root").capsule_abi.snapshot_flag_dma_quarantined, dmaSnapshotFlags(device));
+    try std.testing.expectEqual(@as(usize, 2), TestSupport.mappingReferences());
+    freeIova(device, iova, 2);
+    try std.testing.expectEqual(@as(usize, 2), TestSupport.usedPages(device));
+    try std.testing.expect(!reserveIova(device, iova, 2));
+    try std.testing.expect(!mapPages(device, iova, &.{ first, second }, true, true));
+    const free_pages = free_list.pageCount();
+    try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, first));
+    try std.testing.expectError(types.KernelError.InvalidState, free_list.appendContiguousRange(0, first, 3));
+    try std.testing.expectEqual(free_pages, free_list.pageCount());
+    try std.testing.expect(physicalRangeQuarantined(first + 1, 1));
+    try std.testing.expect(!physicalRangeQuarantined(first + page_size, 1));
+    try std.testing.expect(physicalRangeQuarantined(std.math.maxInt(u64) - 1, 2));
+    // Reinitialization and a later successful register response must not
+    // discard the retained references of an already-faulted device.
+    init(0, free_list);
+    TestSupport.failInvalidation(false);
+    try std.testing.expect(!unmapRangeForDevice(device, iova, 2 * page_size));
+    try std.testing.expect(physicalRangeQuarantined(first, 1));
+}
+
+test "VT-d lifetime failed map rollback retains the published physical pages" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    const page = try free_list.popFront();
+    const iova = iova_window_start;
+    try std.testing.expect(reserveIova(device, iova, 1));
+    TestSupport.failInvalidation(true);
+    try std.testing.expect(!mapPages(device, iova, &.{page}, true, true));
+    freeIova(device, iova, 1);
+    try std.testing.expectEqual(@as(usize, 1), TestSupport.usedPages(device));
+    try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, page));
+}
+
+test "VT-d lifetime partial map allocation failure rolls back or quarantines only published pages" {
+    inline for (.{ false, true }) |fail_drain| {
+        const allocator = std.testing.allocator;
+        const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+        defer allocator.free(backing);
+        const free_list = try allocator.create(types.FreePageList);
+        defer allocator.destroy(free_list);
+        free_list.* = .{};
+        try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+        const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+        try TestSupport.begin(free_list, device);
+        defer TestSupport.end();
+        const first = try free_list.popFront();
+        const second = try free_list.popFront();
+        // A range crossing a PT boundary needs an additional leaf and ledger
+        // for its second page. Leave RAM for only the first page's walk.
+        const iova = iova_window_start + 2 * 1024 * 1024 - page_size;
+        try std.testing.expect(reserveIova(device, iova, 2));
+        while (free_list.pageCount() > 4) _ = try free_list.popFront();
+        TestSupport.failInvalidation(fail_drain);
+        try std.testing.expect(!mapPages(device, iova, &.{ first, second }, true, true));
+        try std.testing.expectEqual(@as(usize, @intFromBool(fail_drain)), TestSupport.mappingReferences());
+        freeIova(device, iova, 2);
+        try std.testing.expectEqual(@as(usize, if (fail_drain) 2 else 0), TestSupport.usedPages(device));
+        if (fail_drain) {
+            try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, first));
+        } else {
+            try free_list.appendPage(0, first);
+        }
+        try free_list.appendPage(0, second);
+    }
+}
+
+test "VT-d lifetime failed close retains FD and owner death cannot free backing" {
+    const kernel = @import("kernel.zig");
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const runtime = try allocator.alignedAlloc(u8, .fromByteUnits(4096), kernel.runtimeStorageBytes());
+    defer allocator.free(runtime);
+    try std.testing.expect(kernel.initRuntimeStorage(runtime));
+    const state = try allocator.create(kernel.KernelState);
+    defer allocator.destroy(state);
+    state.* = try kernel.KernelState.initFromDetectedRegions(1);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    const page = try free_list.popFront();
+    const vmo_fd = try state.createAnonymousVmoFd(owner, page_size, .{ .close = true, .map_read = true, .map_write = true }, .{}, 16);
+    const vmo = state.nativeVmoRefForFd(owner, vmo_fd).?;
+    try state.installNativeVmoPages(vmo, 0, &.{page});
+    const va: u64 = 0x4400_0000;
+    _ = try state.mmapFd(owner, vmo_fd, va, page_size, .{ .read = true, .write = true }, .{ .anonymous = true }, 0);
+    const iova = iova_window_start;
+    try std.testing.expect(reserveIova(device, iova, 1));
+    try std.testing.expect(mapPages(device, iova, &.{page}, true, true));
+    const dma_fd = try state.createDmaMappingFd(owner, .{ .device = device, .user_va = va, .iova = iova, .size = page_size }, .{ .close = true }, .{}, 16);
+    try state.closeFdWithFreeList(owner, vmo_fd, free_list);
+    TestSupport.failInvalidation(true);
+    try std.testing.expectError(types.KernelError.InvalidState, state.closeFdWithFreeList(owner, dma_fd, free_list));
+    try std.testing.expect(state.fdEntryConst(owner, dma_fd) != null);
+    const free_pages = free_list.pageCount();
+    state.releasePrincipalNativeMemory(owner, free_list);
+    try std.testing.expect(state.fdEntryConst(owner, dma_fd) == null);
+    try std.testing.expectEqual(@as(?u32, null), state.nativeVmoRefCount(vmo));
+    try std.testing.expectEqual(free_pages, free_list.pageCount());
+    try std.testing.expectEqual(@as(usize, 1), TestSupport.mappingReferences());
+    try std.testing.expect(physicalRangeQuarantined(page, 1));
+    try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, page));
+}
+
+test "VT-d lifetime noncoherent table cache publication precedes link and invalidation" {
+    try std.testing.expectEqual(@as(?usize, 0), tableCacheLineBytes(1, 0, 0));
+    try std.testing.expectEqual(@as(?usize, 64), tableCacheLineBytes(0xf42, 8 << 8, 1 << 19));
+    try std.testing.expectEqual(@as(?usize, null), tableCacheLineBytes(0xf42, 8 << 8, 0));
+    try std.testing.expectEqual(@as(?usize, null), tableCacheLineBytes(0xf42, 0, 1 << 19));
+    try std.testing.expectEqual(@as(?usize, null), tableCacheLineBytes(0xf42, 3 << 8, 1 << 19));
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.beginWithTableCache(free_list, device, false);
+    defer TestSupport.end();
+    try std.testing.expect(driver_state.table_cache_line_bytes != 0);
+    // Exercise the same initial-root publication helper that precedes SRTP.
+    driver_state.root_paddr = allocTablePage().?;
+    const context = allocTablePage().?;
+    driver_state.context_table_paddrs[0] = context;
+    try std.testing.expect(tables.setRootEntry(tableAt(driver_state.root_paddr), 0, context));
+    try std.testing.expect(tables.setContextEntry(tableAt(context), 0, driver_state.domains[0].second_level_root_paddr, 1));
+    test_cache_flush_count = 0;
+    flushInitialTables();
+    try std.testing.expectEqual(@as(usize, 2), test_cache_flush_count);
+    try std.testing.expectEqual(context, test_cache_flush_events[0].address);
+    try std.testing.expectEqual(driver_state.root_paddr, test_cache_flush_events[1].address);
+    try std.testing.expectEqual(context | tables.root_present, test_cache_flush_events[1].first_word);
+
+    const first = try free_list.popFront();
+    const second = try free_list.popFront();
+    const iova = iova_window_start;
+    try std.testing.expect(reserveIova(device, iova, 2));
+    test_cache_flush_count = 0;
+    try std.testing.expect(mapPages(device, iova, &.{ first, second }, true, true));
+    try std.testing.expectEqual(@as(usize, 8), test_cache_flush_count);
+    try std.testing.expectEqual(test_cache_flush_count, test_flush_count_at_invalidation);
+    // Each zeroed child reaches RAM before a parent entry publishes it.
+    for (0..3) |level| {
+        const child = test_cache_flush_events[level * 2];
+        const parent = test_cache_flush_events[level * 2 + 1];
+        try std.testing.expectEqual(@as(usize, page_size), child.length);
+        try std.testing.expectEqual(@as(u64, 0), child.first_word);
+        try std.testing.expectEqual(child.address | tables.second_level_read | tables.second_level_write, parent.first_word);
+    }
+    try std.testing.expectEqual(first | tables.second_level_read | tables.second_level_write, test_cache_flush_events[6].first_word);
+    try std.testing.expectEqual(second | tables.second_level_read | tables.second_level_write, test_cache_flush_events[7].first_word);
+    test_cache_flush_count = 0;
+    try std.testing.expect(unmapRangeForDevice(device, iova, 2 * page_size));
+    try std.testing.expectEqual(@as(usize, 2), test_flush_count_at_invalidation);
+    try std.testing.expectEqual(@as(usize, 4), test_cache_flush_count);
+    try std.testing.expectEqual(first, test_cache_flush_events[0].first_word);
+    try std.testing.expectEqual(second, test_cache_flush_events[1].first_word);
+    try std.testing.expectEqual(@as(u64, 0), test_cache_flush_events[2].first_word);
+    try std.testing.expectEqual(@as(u64, 0), test_cache_flush_events[3].first_word);
+    freeIova(device, iova, 2);
+    try free_list.appendPage(0, first);
+    try free_list.appendPage(0, second);
 }

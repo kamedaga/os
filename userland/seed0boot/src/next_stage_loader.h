@@ -2,6 +2,7 @@
 #define SEED0BOOT_NEXT_STAGE_LOADER_H
 
 #include <stdint.h>
+#include "pacha/ipc.h"
 
 struct seed0_loaded_process {
     int process_fd;
@@ -17,6 +18,8 @@ int seed0_load_elf_process(
     const char *path,
     const unsigned char *image,
     uint32_t image_size,
+    const struct pacha_process_fd_grant *grants,
+    uint64_t grant_count,
     struct seed0_loaded_process *out);
 int seed0_map_bytes_into_process(
     int process_fd,

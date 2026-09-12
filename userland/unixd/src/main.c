@@ -18,11 +18,7 @@ int main(int argc, char **argv)
         return 2;
     }
     (void)pacha_fd_close(bootstrap);
-    const long path = pacha_syscall4(PACHA_FD_SYSCALL_DUP, config.filed_path_channel, 16,
-        PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_INSPECT,
-        PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
-    (void)pacha_fd_close((int)config.filed_path_channel);
-    if (path < 16 || path >= 256) return 2;
-    config.filed_path_channel = (uint64_t)path;
+    /* The launch policy already supplies a private client-only path handle. */
+    if (config.filed_path_channel >= PACHA_FD_TABLE_LIMIT) return 2;
     return unix_service_run(&config);
 }

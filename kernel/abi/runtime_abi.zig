@@ -1,14 +1,16 @@
-pub const syscall_runtime_first: u64 = 22;
-pub const syscall_getpid: u64 = 22;
-pub const syscall_gettid: u64 = 23;
-pub const syscall_system_info: u64 = 24;
-pub const syscall_clock_gettime: u64 = 25;
-pub const syscall_clock_getres: u64 = 26;
-pub const syscall_nanosleep: u64 = 27;
-pub const syscall_futex_wait: u64 = 28;
-pub const syscall_futex_wake: u64 = 29;
-pub const syscall_futex_requeue: u64 = 30;
-pub const syscall_getrandom: u64 = 31;
+pub const syscall_runtime_first: u64 = 25;
+pub const syscall_getpid: u64 = 25;
+pub const syscall_gettid: u64 = 26;
+pub const syscall_system_info: u64 = 27;
+pub const syscall_clock_gettime: u64 = 28;
+pub const syscall_clock_getres: u64 = 29;
+pub const syscall_nanosleep: u64 = 30;
+pub const syscall_futex_wait: u64 = 31;
+pub const syscall_futex_wake: u64 = 32;
+pub const syscall_futex_requeue: u64 = 33;
+pub const syscall_getrandom: u64 = 34;
+// GETRANDOM: flags must be zero, length <= 4096. Returns bytes written or
+// negative native status (INVALID=1, MAP=4); positive errors are not counts.
 pub const syscall_runtime_last: u64 = syscall_getrandom;
 pub const syscall_runtime_count: u64 = syscall_runtime_last - syscall_runtime_first + 1;
 

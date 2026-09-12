@@ -64,6 +64,7 @@ const Tss = packed struct {
 
 pub const TrapTargets = struct {
     divide_error_stub: usize,
+    breakpoint_stub: usize,
     page_fault_stub: usize,
     general_protection_stub: usize,
     double_fault_stub: usize,
@@ -113,6 +114,7 @@ var runtime_identity_split_pts: [runtime_identity_split_pt_count][page_entries]u
 var runtime_identity_split_pt_used: usize = 0;
 var tss_tables: [max_cpus]Tss = [_]Tss{std.mem.zeroes(Tss)} ** max_cpus;
 var de_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var bp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var df_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -122,6 +124,7 @@ var np_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var ss_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var timer_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var de_trampoline_entry: usize = 0;
+var bp_trampoline_entry: usize = 0;
 var pf_trampoline_entry: usize = 0;
 var gp_trampoline_entry: usize = 0;
 var df_trampoline_entry: usize = 0;
@@ -177,6 +180,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     start = minStaticStart(start, staticStorageStart(@TypeOf(tss_tables), &tss_tables));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_page), &de_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(bp_trampoline_page), &bp_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_trampoline_page), &df_trampoline_page));
@@ -186,6 +190,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(bp_trampoline_entry), &bp_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
@@ -228,6 +233,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tss_tables), &tss_tables));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_page), &de_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(bp_trampoline_page), &bp_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_page), &df_trampoline_page));
@@ -237,6 +243,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(bp_trampoline_entry), &bp_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
@@ -601,6 +608,7 @@ fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
 
 pub fn installInterruptTrampolines(targets: TrapTargets) void {
     de_trampoline_entry = buildCr3SwitchTrampoline(&de_trampoline_page, targets.divide_error_stub);
+    bp_trampoline_entry = buildCr3SwitchTrampoline(&bp_trampoline_page, targets.breakpoint_stub);
     pf_trampoline_entry = buildCr3SwitchTrampoline(&pf_trampoline_page, targets.page_fault_stub);
     gp_trampoline_entry = buildCr3SwitchTrampoline(&gp_trampoline_page, targets.general_protection_stub);
     df_trampoline_entry = buildCr3SwitchTrampoline(&df_trampoline_page, targets.double_fault_stub);
@@ -611,6 +619,8 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     timer_trampoline_entry = buildCr3SwitchTrampoline(&timer_trampoline_page, targets.timer_interrupt_stub);
     interrupts.clearIdt(&idt);
     interrupts.setIdtEntry(&idt, 0, gdt_kernel_code_selector, de_trampoline_entry, 0x8E);
+    // INT3 is a user-callable trap; hardware saves the following instruction.
+    interrupts.setIdtEntry(&idt, 3, gdt_kernel_code_selector, bp_trampoline_entry, 0xEE);
     interrupts.setIdtEntry(&idt, 6, gdt_kernel_code_selector, ud_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 10, gdt_kernel_code_selector, ts_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 11, gdt_kernel_code_selector, np_trampoline_entry, 0x8E);
@@ -836,6 +846,46 @@ fn mapKernelIdentityRange(base: u64, bytes: usize) bool {
     return true;
 }
 
+/// Boot-only: called before APs or user address spaces exist, and before any
+/// access to the firmware-declared MMIO aperture. Change the identity mapping
+/// itself so there is no competing WB alias. Do not use this for live remaps.
+pub fn mapBootMmioIdentityRange(base: u64, bytes: u64) bool {
+    if (bytes == 0 or ((base | bytes) & 4095) != 0 or
+        base < 0x100000 or base >= physical_layout.identity_limit or
+        bytes > physical_layout.identity_limit - base) return false;
+    // PWT=PCD=1, PAT=0 selects PAT entry 3. Do not silently assume firmware
+    // left that entry UC, and do not change the global PAT configuration.
+    if (((readMsr(0x277) >> 24) & 0xff) != 0) return false;
+    const uc_flags = page_present | page_rw | page_nx | (1 << 3) | (1 << 4);
+    const end = base + bytes;
+    var address = base;
+    while (address < end) {
+        const pdp_index: usize = @intCast(address >> 30);
+        const pd_index: usize = @intCast((address >> 21) & 511);
+        const entry = &pd_tables[pdp_index][pd_index];
+        if ((entry.* & page_present) == 0) return false;
+        if ((address & (two_mib - 1)) == 0 and end - address >= two_mib and
+            (entry.* & page_ps) != 0)
+        {
+            if ((entry.* & page_addr_mask & ~(two_mib - 1)) != address) return false;
+            entry.* = address | uc_flags | page_ps;
+            address += two_mib;
+        } else {
+            if (!splitLargeKernelIdentityPage(entry)) return false;
+            const pt: *[page_entries]u64 = @ptrFromInt(entry.* & page_addr_mask);
+            const index: usize = @intCast((address >> 12) & 511);
+            if ((pt[index] & page_addr_mask) != address or (pt[index] & page_present) == 0)
+                return false;
+            pt[index] = address | uc_flags;
+            address += 4096;
+        }
+    }
+    // No other CPU can have accessed this aperture yet. Reload the current
+    // CR3 to discard any local paging-structure translations before use.
+    writeCr3(readCr3());
+    return true;
+}
+
 fn highKernelPdSlot(first_pdp_index: usize, pdp_index: usize) ?usize {
     if (pdp_index < first_pdp_index) return null;
     const slot = pdp_index - first_pdp_index;
@@ -915,6 +965,7 @@ fn mapPerCpuKernelStorage() bool {
     if (!mapKernelIdentityRange(@intFromPtr(&gp_trampoline_page), @sizeOf(@TypeOf(gp_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&df_trampoline_page), @sizeOf(@TypeOf(df_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ud_trampoline_page), @sizeOf(@TypeOf(ud_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&bp_trampoline_page), @sizeOf(@TypeOf(bp_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ts_trampoline_page), @sizeOf(@TypeOf(ts_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&np_trampoline_page), @sizeOf(@TypeOf(np_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ss_trampoline_page), @sizeOf(@TypeOf(ss_trampoline_page)))) return false;

@@ -155,6 +155,8 @@ static filed_status_t filed_open_vnode(
     if (vfs->next_file_id == 0 || vfs->next_handle_id == 0) {
         return FILED_ERR_OVERFLOW;
     }
+    if (vfs->actor_client && (rights & ~vfs->actor_rights))
+        return FILED_ERR_DENIED;
 
     file = filed_alloc_file(vfs);
     handle = filed_alloc_handle(vfs);
@@ -186,6 +188,7 @@ static filed_status_t filed_open_vnode(
     handle->target_kind = FILED_HANDLE_FILE;
     handle->target_id = file_id;
     handle->rights = rights;
+    handle->owner_client = vfs->actor_client;
     handle->fd_flags = filed_fd_flags_from_open(open_flags);
     handle->generation = 1;
 
@@ -970,6 +973,7 @@ filed_status_t filed_vfs_dup_handle(
     handle->target_kind = FILED_HANDLE_FILE;
     handle->target_id = source->target_id;
     handle->rights = source->rights;
+    handle->owner_client = vfs->actor_client;
     handle->fd_flags = fd_flags;
     handle->generation = 1;
 

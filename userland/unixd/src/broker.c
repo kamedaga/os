@@ -254,7 +254,10 @@ int unix_broker_session_credentials(struct unix_session *session,
     const struct unix_credentials *credentials)
 {
     if (session == NULL || credentials == NULL ||
-        credentials->generation <= session->credentials.generation ||
+        /* Generation identifies the process incarnation, not a credential
+         * revision. Only the manager's ordered private admin channel updates it. */
+        credentials->generation != session->credentials.generation ||
+        credentials->reserved ||
         credentials->pid != session->credentials.pid) return -EINVAL;
     session->credentials = *credentials;
     return 0;
@@ -406,9 +409,8 @@ int unix_broker_path_check(struct unix_broker *broker, struct unix_session *sess
 {
     const struct unix_socket *socket = owned(broker, session, id);
     if (!socket) return -EBADF;
-    /* Supervisor currently admits only the root credential domain. Do not
-     * silently apply that authority to a future non-root session. */
-    if (session->credentials.euid || session->credentials.egid) return -EACCES;
+    /* The private filed bridge checks pathname authority against this
+     * authenticated session. UID zero is not a namespace capability. */
     if (binding) return socket->bound ? -EINVAL : 0;
     if (socket->connection) return -EISCONN;
     return socket->listening ? -EINVAL : 0;

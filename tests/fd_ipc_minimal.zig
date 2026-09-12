@@ -24,6 +24,74 @@ fn rights(comptime fields: anytype) kernel.FdRights {
     return value;
 }
 
+fn liveIpcResources(s: *const KernelState) [2]usize {
+    var counts: [2]usize = .{ 0, 0 };
+    for (&s.fd_objects) |slot| if (slot.kind != .none) {
+        counts[0] += 1;
+    };
+    for (&s.ipc_replies) |slot| if (slot.active) {
+        counts[1] += 1;
+    };
+    return counts;
+}
+
+test "full ipc call preserves MOVE and resources until one successful retry" {
+    var s = try initState();
+    var free_list = FreePageList{};
+    const pair = try s.createIpcChannelPairFds(p0, rights(.{ .call = true, .send = true, .recv = true, .close = true }), .{}, 16);
+    const vmo = try s.createAnonymousVmoFd(p0, 4096, rights(.{ .transfer = true, .close = true, .map_read = true }), .{}, 16);
+    const object = (s.fdEntryConst(p0, vmo) orelse unreachable).object;
+    const moved = [_]kernel.IpcSendFd{.{ .fd = vmo, .rights = rights(.{ .close = true, .map_read = true }), .move = true }};
+    for (0..kernel.max_ipc_queue_messages) |i|
+        try s.ipcSend(p0, pair.a, .{ .words = .{ i, 0, 0, 0 } }, &free_list);
+    const resources = liveIpcResources(&s);
+    const free_fds = try s.fdFreeCountFrom(p0, 16);
+    const refs = s.kernelObjectRefCount(object);
+    for (0..128) |_| {
+        try std.testing.expectError(KernelError.MailboxFull, s.ipcCall(p0, pair.a, .{ .words = .{ 100, 0, 0, 0 }, .fds = &moved }, 16, &free_list));
+        try std.testing.expectEqual(resources, liveIpcResources(&s));
+        try std.testing.expectEqual(free_fds, try s.fdFreeCountFrom(p0, 16));
+        try std.testing.expectEqual(refs, s.kernelObjectRefCount(object));
+        try std.testing.expectEqual(object, (s.fdEntryConst(p0, vmo) orelse unreachable).object);
+    }
+    const first = try s.ipcRecv(p0, pair.b, 0, 16, &free_list);
+    try std.testing.expectEqual(@as(u64, 0), first.words[0]);
+    const reply = try s.ipcCall(p0, pair.a, .{ .words = .{ 100, 0, 0, 0 }, .fds = &moved }, 16, &free_list);
+    try std.testing.expect(s.fdEntryConst(p0, vmo) == null);
+    for (1..kernel.max_ipc_queue_messages) |i| {
+        const message = try s.ipcRecv(p0, pair.b, 0, 16, &free_list);
+        try std.testing.expectEqual(@as(u64, i), message.words[0]);
+    }
+    const request = try s.ipcRecv(p0, pair.b, 2, 16, &free_list);
+    try std.testing.expectEqual(@as(u64, 100), request.words[0]);
+    try std.testing.expectEqual(@as(usize, 2), request.fd_count);
+    try std.testing.expectEqual(object, (s.fdEntryConst(p0, request.fds[0].fd) orelse unreachable).object);
+    try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p0, pair.b, 2, 16, &free_list));
+    try s.ipcReply(p0, request.fds[1].fd, .{ .words = .{ 101, 0, 0, 0 } }, &free_list);
+    const response = try s.ipcRecv(p0, reply, 0, 16, &free_list);
+    try std.testing.expectEqual(@as(u64, 101), response.words[0]);
+    try s.closeFdWithFreeList(p0, reply, &free_list);
+    try s.closeFdWithFreeList(p0, request.fds[1].fd, &free_list);
+    try s.closeFdWithFreeList(p0, request.fds[0].fd, &free_list);
+    try s.closeFdWithFreeList(p0, pair.a, &free_list);
+    try s.closeFdWithFreeList(p0, pair.b, &free_list);
+    try std.testing.expectEqual([2]usize{ 0, 0 }, liveIpcResources(&s));
+}
+
+test "ipc call descriptor exhaustion remains allocation failure" {
+    var s = try initState();
+    var free_list = FreePageList{};
+    const endpoint = try s.createIpcEndpointFd(p0, rights(.{ .call = true, .recv = true, .close = true }), .{}, 16);
+    while (try s.fdFreeCountFrom(p0, 16) != 0)
+        _ = try s.createEventFd(p0, 0, .{}, .{ .close = true }, 16);
+    const resources = liveIpcResources(&s);
+    for (0..32) |_| {
+        try std.testing.expectError(KernelError.TableFull, s.ipcCall(p0, endpoint, .{}, 16, &free_list));
+        try std.testing.expectEqual(resources, liveIpcResources(&s));
+        try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p0, endpoint, 0, 16, &free_list));
+    }
+}
+
 test "minimal fd ipc call moves vmo fd and receives reply" {
     var s = try initState();
     var free_list = FreePageList{};

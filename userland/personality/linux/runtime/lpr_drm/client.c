@@ -1081,7 +1081,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     drmd_ioctl_request_t *ioctl = (drmd_ioctl_request_t *)lpr_drmd_payload(page);
     lpr_memset(ioctl, 0, sizeof(*ioctl));
     ioctl->handle = drm->handle;
-    ioctl->request = request;
+    /* Linux ioctl commands are unsigned 32-bit values.  musl's int
+     * parameter may arrive sign-extended in the syscall register. */
+    ioctl->request = command;
     int aux_fd = -1;
     void *aux_mapping = 0;
     uint64_t aux_map_size = 0;

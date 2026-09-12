@@ -1,1 +1,5 @@
 root:x:0:
+messagebus:x:81:
+polkitd:x:102:
+users:x:100:user
+user:x:1000:

@@ -28,6 +28,13 @@ cc="${CC:-cc}"
 
 "$out_dir/userland_service_abi_layout"
 
+# The native libc mirrors the exec wire payload without depending on libipc.
+# Compile both definitions together so drift cannot silently break native exec.
+"$cc" -std=c11 -I "$repo_root/userland/libipc/include" \
+  -I "$repo_root/userland/filed/include" \
+  "$repo_root/tests/native_exec_abi_layout.c" -o "$out_dir/native_exec_abi_layout"
+"$out_dir/native_exec_abi_layout"
+
 extract_right_shift() {
   local path="$1"
   local symbol="$2"
@@ -38,6 +45,13 @@ extract_right_shift() {
 
 common_flags="$repo_root/userland/filed/include/filed/flags.h"
 arch_flags="$repo_root/musl/upstream/arch/pachaos/syscall_arch.h"
+exec_op=$(sed -nE 's/^[[:space:]]*FILED_OP_EXEC_PATH = ([0-9]+)u,.*/\1/p' \
+  "$repo_root/userland/filed/include/filed/ipc_protocol.h")
+native_exec_op=$(sed -nE 's/^#define PACHAOS_FILED_OP_EXEC_PATH ([0-9]+).*/\1/p' "$arch_flags")
+if [[ -z "$exec_op" || "$native_exec_op" != "$exec_op" ]]; then
+  echo "native exec must use the filed v2 service opcode: filed=$exec_op native=$native_exec_op" >&2
+  exit 1
+fi
 smoke_flags="$repo_root/musl/pachaos/smoke/libc_vfs_exec.c"
 right_names=(LOOKUP READ WRITE EXEC STAT SETATTR GETDENTS CREATE REMOVE RENAME)
 

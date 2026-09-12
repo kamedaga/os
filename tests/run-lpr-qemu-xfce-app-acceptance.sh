@@ -437,11 +437,14 @@ run_startup_controller() {
 
 run_host() {
   local repo_root repeat timeout_seconds selected_app
-  local -a expected_apps expect_args
+  local -a expected_apps expect_args qemu_args=()
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   repeat=${XFCE_APP_REPEAT:-1}
   timeout_seconds=${XFCE_APP_TIMEOUT_SECONDS:-240}
   selected_app=${XFCE_APP_ONLY:-}
+  if [[ -n ${XFCE_APP_QMP_SOCKET:-} ]]; then
+    qemu_args+=(--qemu-arg=-qmp --qemu-arg="unix:${XFCE_APP_QMP_SOCKET},server=on,wait=off")
+  fi
   [[ "${repeat}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'XFCE_APP_REPEAT must be a positive integer: %s\n' "${repeat}" >&2
     return 2
@@ -478,10 +481,12 @@ run_host() {
 
   .artifacts/bin/pacgo qemu-test \
     --console-shell \
+    --console-ready-marker 'bash-5.2# ' \
     --cpus "${XFCE_APP_CPUS:-4}" \
     --timeout "${timeout_seconds}s" \
     --graphics 2d \
     --input-profile keyboard-tablet \
+    "${qemu_args[@]}" \
     --send "XFCE_APP_REPEAT=${repeat} XFCE_APP_ONLY=${selected_app} XFCE_APP_WINDOW_ATTEMPTS=${XFCE_APP_WINDOW_ATTEMPTS:-20} XFCE_APP_GEANY_ENV=${XFCE_APP_GEANY_ENV:-} /bin/bash ${script_guest} --guest-controller" \
     "${expect_args[@]}" \
     --expect 'XFCE_APP_ACCEPTANCE_DONE status='

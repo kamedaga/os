@@ -750,9 +750,7 @@ fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool
     return true;
 }
 
-fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId,
-    va_start: u64, size_bytes: usize, touched_slots: []u16) void
-{
+fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, va_start: u64, size_bytes: usize, touched_slots: []u16) void {
     var retired: usize = 0;
     for (touched_slots) |slot| {
         if (detachUserPtSlotIfEmpty(h, space, slot)) {
@@ -767,7 +765,8 @@ fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.
     const flush_start = if (retired != 0) va_start & ~@as(u64, pt_bytes - 1) else va_start;
     const flush_end = if (retired != 0)
         (va_start + size_bytes + pt_bytes - 1) & ~@as(u64, pt_bytes - 1)
-    else va_start + size_bytes;
+    else
+        va_start + size_bytes;
     h.flush_user_tlb_for_principal_range(principal, flush_start, @intCast(flush_end - flush_start));
     for (touched_slots[0..retired]) |slot| {
         @memset(space.pt_pages[slot][0..], 0);
@@ -957,9 +956,11 @@ fn pteFlagsForProt(h: Hooks, prot: kernel.MapProt) ?u64 {
         (@as(u64, prot.pkey) << pte_pkey_shift);
 }
 
-fn pteFlagsForUncachedProt(h: Hooks, prot: kernel.MapProt) ?u64 {
+pub const MmioCache = enum { uc, uc_minus };
+
+fn pteFlagsForMmioProt(h: Hooks, prot: kernel.MapProt, cache: MmioCache) ?u64 {
     const flags = pteFlagsForProt(h, prot) orelse return null;
-    return flags | pte_cache_write_through | pte_cache_disable;
+    return flags | pte_cache_disable | (if (cache == .uc) pte_cache_write_through else @as(u64, 0));
 }
 
 fn userRangeEndVa(h: Hooks, va_start: u64, size_bytes: u64) ?u64 {
@@ -997,7 +998,7 @@ pub fn mapUserLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
-    return mapUserLinearRegionWithPteFlags(principal, va_start, paddr_start, size_bytes, prot, false);
+    return mapUserLinearRegionWithPteFlags(principal, va_start, paddr_start, size_bytes, prot, null);
 }
 
 pub fn mapUserUncachedLinearRegionWithProt(
@@ -1007,7 +1008,211 @@ pub fn mapUserUncachedLinearRegionWithProt(
     size_bytes: usize,
     prot: kernel.MapProt,
 ) bool {
-    return mapUserLinearRegionWithPteFlags(principal, va_start, paddr_start, size_bytes, prot, true);
+    return mapUserMmioLinearRegionWithProt(principal, va_start, paddr_start, size_bytes, prot, .uc);
+}
+
+/// Caller proves the requested PAT/MTRR mode before publishing an MMIO FD.
+pub fn mapUserMmioLinearRegionWithProt(principal: kernel.PrincipalId, va_start: u64, paddr_start: u64, size_bytes: usize, prot: kernel.MapProt, cache: MmioCache) bool {
+    return mapUserLinearRegionWithPteFlags(principal, va_start, paddr_start, size_bytes, prot, cache);
+}
+
+/// Newly installed paging-structure links, not mappings or reservations. Keep
+/// their old parent entries so a failed BAR admission can undo even a partial
+/// ensureUserPtSlotForPd without consuming any PT/PD/PDP slots.
+const MmioTablePreparation = struct {
+    const Level = enum { pdp, pd, pt };
+    const Link = struct { parent: *u64, previous: u64, slot: usize, level: Level };
+    links: [
+        UserAddressSpace.max_dynamic_pdp_pages + UserAddressSpace.max_dynamic_pd_pages +
+            UserAddressSpace.max_dynamic_pt_pages
+    ]Link = undefined,
+    count: usize = 0,
+    old_pdp_used: u16,
+    old_pd_used: u16,
+    old_pt_used: u16,
+
+    fn remember(self: *@This(), parent: *u64, slot: usize, level: Level) void {
+        std.debug.assert(self.count < self.links.len);
+        self.links[self.count] = .{ .parent = parent, .previous = parent.*, .slot = slot, .level = level };
+        self.count += 1;
+    }
+
+    fn prepare(self: *@This(), space: *UserAddressSpace, index: UserPageIndex) ?usize {
+        if (findUserPdpSlotForPml4(space, index.pml4) == null) {
+            const slot = std.mem.indexOfScalar(u16, &space.pdp_page_pml4_index, UserAddressSpace.no_pd_index) orelse return null;
+            self.remember(&space.pml4[index.pml4], slot, .pdp);
+        }
+        const pdp = ensureUserPdpSlotForPml4(space, index.pml4) orelse return null;
+        if (findUserPdSlotForPdp(space, index.pml4, index.pdp) == null) {
+            const slot = std.mem.indexOfScalar(u16, &space.pd_page_pdp_index, UserAddressSpace.no_pd_index) orelse return null;
+            self.remember(&space.pdp_pages[pdp][index.pdp], slot, .pd);
+        }
+        const pd = ensureUserPdSlotForPdp(space, index.pml4, index.pdp) orelse return null;
+        if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) == null) {
+            const slot = std.mem.indexOfScalar(u16, &space.pt_page_pd_index, UserAddressSpace.no_pd_index) orelse return null;
+            self.remember(&space.pd_pages[pd][index.pd], slot, .pt);
+        }
+        return ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd);
+    }
+
+    fn rollback(self: *@This(), h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId) void {
+        if (self.count == 0) return;
+        var remaining = self.count;
+        while (remaining != 0) {
+            remaining -= 1;
+            const link = self.links[remaining];
+            link.parent.* = link.previous;
+        }
+        // Unlink before shootdown; only then may those inline tables be reused.
+        h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
+        for (self.links[0..self.count]) |link| {
+            switch (link.level) {
+                .pdp => {
+                    @memset(&space.pdp_pages[link.slot], 0);
+                    space.pdp_page_pml4_index[link.slot] = UserAddressSpace.no_pd_index;
+                },
+                .pd => {
+                    @memset(&space.pd_pages[link.slot], 0);
+                    space.pd_page_pml4_index[link.slot] = UserAddressSpace.no_pd_index;
+                    space.pd_page_pdp_index[link.slot] = UserAddressSpace.no_pd_index;
+                },
+                .pt => {
+                    @memset(&space.pt_pages[link.slot], 0);
+                    space.pt_page_pml4_index[link.slot] = UserAddressSpace.no_pd_index;
+                    space.pt_page_pdp_index[link.slot] = UserAddressSpace.no_pd_index;
+                    space.pt_page_pd_index[link.slot] = UserAddressSpace.no_pd_index;
+                },
+            }
+        }
+        space.pdp_page_used_len = self.old_pdp_used;
+        space.pd_page_used_len = self.old_pd_used;
+        space.pt_page_used_len = self.old_pt_used;
+    }
+};
+
+/// Caller holds a VM transaction and has validated an unbacked PROT_NONE VMA
+/// plus acquired an unpublished MMIO FD. This operation never changes either
+/// VMA or low-level reservation state. All failures precede the PTE stores.
+pub fn mapUserMmioOverlay(principal: kernel.PrincipalId, va_start: u64, paddr_start: u64, size_bytes: usize, prot: kernel.MapProt) bool {
+    return mapUserMmioOverlayWithCache(principal, va_start, paddr_start, size_bytes, prot, .uc);
+}
+
+pub fn mapUserMmioOverlayWithCache(principal: kernel.PrincipalId, va_start: u64, paddr_start: u64, size_bytes: usize, prot: kernel.MapProt, cache: MmioCache) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0 or ((va_start | paddr_start | size_bytes) & 4095) != 0 or
+        paddr_start == 0 or paddr_start >= h.physical_map_limit or
+        size_bytes > h.physical_map_limit - paddr_start or prot.exec or prot.pkey != 0) return false;
+    _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return false;
+    const flags = pteFlagsForMmioProt(h, prot, cache) orelse return false;
+    var preparation = MmioTablePreparation{
+        .old_pdp_used = space.pdp_page_used_len,
+        .old_pd_used = space.pd_page_used_len,
+        .old_pt_used = space.pt_page_used_len,
+    };
+    var committed = false;
+    defer if (!committed) preparation.rollback(h, space, principal);
+
+    var offset: u64 = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const index = userPageIndexForVa(h, va_start + offset) orelse return false;
+        const slot = preparation.prepare(space, index) orelse return false;
+        // Includes supervisor PTEs: overlay is not an arbitrary replacement.
+        if (space.pt_pages[slot][index.pt] & h.page_present != 0) return false;
+    }
+    offset = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const index = userPageIndexForVa(h, va_start + offset).?;
+        const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd).?;
+        space.pt_pages[slot][index.pt] = (paddr_start + offset) | flags;
+    }
+    committed = true;
+    return true;
+}
+
+/// Reclaim empty parent tables in the unmapped range. Do not remove tables
+/// containing supervisor seed mappings or another live user's mappings.
+fn retireEmptyMmioParents(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, start: u64, length: usize) void {
+    var pd_retired: [UserAddressSpace.max_dynamic_pd_pages]u16 = undefined;
+    var pdp_retired: [UserAddressSpace.max_dynamic_pdp_pages]u16 = undefined;
+    var pd_count: usize = 0;
+    var pdp_count: usize = 0;
+    const end = start + length;
+    for (&space.pd_pages, 0..) |*page, slot| {
+        const pml4 = space.pd_page_pml4_index[slot];
+        const pdp = space.pd_page_pdp_index[slot];
+        if (pdp == UserAddressSpace.no_pd_index or pml4 == UserAddressSpace.no_pd_index) continue;
+        const base = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30);
+        if (base >= end or base + (1 << 30) <= start or !std.mem.allEqual(u64, page, 0)) continue;
+        const parent = findUserPdpSlotForPml4(space, pml4) orelse continue;
+        space.pdp_pages[parent][pdp] = 0;
+        pd_retired[pd_count] = @intCast(slot);
+        pd_count += 1;
+    }
+    for (&space.pdp_pages, 0..) |*page, slot| {
+        const pml4 = space.pdp_page_pml4_index[slot];
+        if (pml4 == UserAddressSpace.no_pd_index) continue;
+        const base = @as(u64, pml4) << 39;
+        if (base >= end or base + (@as(u64, 1) << 39) <= start or !std.mem.allEqual(u64, page, 0)) continue;
+        space.pml4[pml4] = 0;
+        pdp_retired[pdp_count] = @intCast(slot);
+        pdp_count += 1;
+    }
+    if (pd_count == 0 and pdp_count == 0) return;
+    h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
+    for (pd_retired[0..pd_count]) |slot| {
+        space.pd_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
+        space.pd_page_pdp_index[slot] = UserAddressSpace.no_pd_index;
+    }
+    for (pdp_retired[0..pdp_count]) |slot| space.pdp_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
+}
+
+/// Last-close and teardown are idempotent if PTEs have already gone. Validate
+/// every remaining user PTE before removing any; never clear another backing.
+pub fn unmapUserMmioOverlay(principal: kernel.PrincipalId, va_start: u64, paddr_start: u64, size_bytes: usize) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0 or ((va_start | paddr_start | size_bytes) & 4095) != 0 or
+        paddr_start > std.math.maxInt(u64) - size_bytes) return false;
+    _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return false;
+    var offset: u64 = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const index = userPageIndexForVa(h, va_start + offset).?;
+        const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const pte = space.pt_pages[slot][index.pt];
+        if (pte & (h.page_present | h.page_user) != (h.page_present | h.page_user)) continue;
+        if (ptePaddr(pte) != paddr_start + offset) return false;
+    }
+    var touched: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
+    var touched_count: usize = 0;
+    var previous_slot: ?usize = null;
+    offset = 0;
+    while (offset < size_bytes) : (offset += 4096) {
+        const index = userPageIndexForVa(h, va_start + offset).?;
+        const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
+        const pte = &space.pt_pages[slot][index.pt];
+        if (pte.* & (h.page_present | h.page_user) == (h.page_present | h.page_user)) pte.* = 0;
+        if (previous_slot != slot) {
+            touched[touched_count] = @intCast(slot);
+            touched_count += 1;
+            previous_slot = slot;
+        }
+    }
+    // The ordinary user-unmap helper may retire supervisor seed PTEs too.
+    // An overlay owns only its target pages, not neighboring supervisor state.
+    var empty_count: usize = 0;
+    for (touched[0..touched_count]) |slot| {
+        if (!std.mem.allEqual(u64, &space.pt_pages[slot], 0)) continue;
+        touched[empty_count] = slot;
+        empty_count += 1;
+    }
+    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched[0..empty_count]);
+    retireEmptyMmioParents(h, space, principal, va_start, size_bytes);
+    return true;
 }
 
 fn mapUserLinearRegionWithPteFlags(
@@ -1016,13 +1221,13 @@ fn mapUserLinearRegionWithPteFlags(
     paddr_start: u64,
     size_bytes: usize,
     prot: kernel.MapProt,
-    uncached: bool,
+    cache: ?MmioCache,
 ) bool {
     if (!lockAddressSpace(principal)) return false;
     defer unlockAddressSpace(principal);
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
-    const pte_flags = if (uncached) pteFlagsForUncachedProt(h, prot) orelse return false else pteFlagsForProt(h, prot) orelse return false;
+    const pte_flags = if (cache) |mode| pteFlagsForMmioProt(h, prot, mode) orelse return false else pteFlagsForProt(h, prot) orelse return false;
     if (size_bytes == 0) return false;
     if ((va_start & 0xFFF) != 0 or (paddr_start & 0xFFF) != 0) return false;
 
@@ -1150,8 +1355,7 @@ pub fn mapLazyUserPaddrsWithProt(
             }
             @import("../kernel_log.zig").writeFmt(
                 "vm: fault pte failed principal={} va=0x{x} pages={} pt_used={}/{} pd_high={} pdp_high={}\n",
-                .{ @intFromEnum(principal), va_start, paddrs.len, used,
-                    UserAddressSpace.max_dynamic_pt_pages, space.pd_page_used_len, space.pdp_page_used_len },
+                .{ @intFromEnum(principal), va_start, paddrs.len, used, UserAddressSpace.max_dynamic_pt_pages, space.pd_page_used_len, space.pdp_page_used_len },
             );
         }
     }
@@ -1428,6 +1632,10 @@ fn unmapPresentSplitSlotsWithPolicy(
         if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0 and !native_vma_source) return null;
     }
 
+    return reservationSplitSlotsRequired(space, va_start, size_u64);
+}
+
+fn reservationSplitSlotsRequired(space: *const UserAddressSpace, va_start: u64, size_u64: u64) usize {
     const release_start_page = va_start >> 12;
     const release_end_page = release_start_page + size_u64 / 4096;
     var needs_split_slot = false;
@@ -1442,6 +1650,67 @@ fn unmapPresentSplitSlotsWithPolicy(
         }
     }
     return @intFromBool(needs_split_slot);
+}
+
+/// The caller holds the VM transaction, MAP_INTO authority, and has rejected
+/// pinned target ranges. Unlike a generic unmap, a remote range may contain
+/// arbitrary lazy holes backed by supervisor seed PTEs. Those are not user
+/// mappings to remove. This preflight and its commit must be used together.
+pub fn unmapPresentRemoteUserRegionSplitSlotsRequired(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) ?usize {
+    if (!lockAddressSpace(principal)) return null;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return null;
+    const space = getUserSpace(principal) orelse return null;
+    if (size_bytes == 0 or ((va_start | size_bytes) & 0xfff) != 0) return null;
+    _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return null;
+    return reservationSplitSlotsRequired(space, va_start, @intCast(size_bytes));
+}
+
+/// Commit a validated remote range without walking its potentially enormous
+/// unmapped gaps. Only allocated PTs intersecting the range are inspected.
+/// Existing retirement detaches an empty user PT before the synchronous
+/// shootdown and reuses its storage only after all target CPUs acknowledge.
+pub fn unmapPresentRemoteUserRegion(
+    principal: kernel.PrincipalId,
+    va_start: u64,
+    size_bytes: usize,
+) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    const space = getUserSpace(principal) orelse return false;
+    if (size_bytes == 0 or ((va_start | size_bytes) & 0xfff) != 0) return false;
+    _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return false;
+    const end = va_start + size_bytes;
+    var touched_slots: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
+    var touched_count: usize = 0;
+
+    for (0..ptSlotScanLimit(space)) |slot| {
+        const pml4 = space.pt_page_pml4_index[slot];
+        const pdp = space.pt_page_pdp_index[slot];
+        const pd = space.pt_page_pd_index[slot];
+        if (pml4 == UserAddressSpace.no_pd_index or
+            pdp == UserAddressSpace.no_pd_index or pd == UserAddressSpace.no_pd_index) continue;
+        const base = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) | (@as(u64, pd) << 21);
+        const overlap_start = @max(va_start, base);
+        const overlap_end = @min(end, base + 2 * 1024 * 1024);
+        if (overlap_start >= overlap_end) continue;
+        const first: usize = @intCast((overlap_start - base) >> 12);
+        const last: usize = @intCast((overlap_end - base) >> 12);
+        for (space.pt_pages[slot][first..last]) |*entry| {
+            if ((entry.* & (h.page_present | h.page_user)) == (h.page_present | h.page_user))
+                entry.* = 0;
+        }
+        touched_slots[touched_count] = @intCast(slot);
+        touched_count += 1;
+    }
+    _ = releaseUserMapping(principal, va_start, @as(u64, @intCast(size_bytes)) / 4096);
+    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
+    return true;
 }
 
 pub fn freeUserReservationSlotCount(principal: kernel.PrincipalId) usize {

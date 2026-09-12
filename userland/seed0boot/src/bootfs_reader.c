@@ -3,7 +3,9 @@
 #include "bootstrap_abi.h"
 
 #include <stdint.h>
+#ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
 #include <stdio.h>
+#endif
 #include <string.h>
 
 enum {
@@ -50,7 +52,9 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
         (desc->bootfs_archive.flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
         desc->bootfs_archive.image_va == 0 ||
         desc->bootfs_archive.size_bytes < SEED0_BOOTFS_HEADER_BYTES) {
+#ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
         fprintf(stderr, "[seed0boot] bootfs: descriptor unavailable\n");
+#endif
         return -2;
     }
 
@@ -72,10 +76,12 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
         entry_table_bytes != (uint64_t)entry_count * SEED0_BOOTFS_ENTRY_BYTES ||
         !range_fits(total_size, entry_table_offset, entry_table_bytes) ||
         !range_fits(total_size, string_table_offset, string_table_bytes)) {
+#ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
         fprintf(stderr, "[seed0boot] bootfs: invalid image magic=0x%x version=%u entries=%u\n",
             magic,
             version,
             entry_count);
+#endif
         return -3;
     }
 

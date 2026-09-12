@@ -191,7 +191,14 @@ pub fn unpublishIrqObject(self: anytype, object_ref: KernelObjectRef) void {
     const slot = self.irqPublishSlotForRef(object_ref) orelse return;
     const generation = @atomicLoad(u32, &slot.generation, .acquire);
     if (generation != object_ref.generation) return;
-    @atomicStore(u8, &slot.active, 0, .release);
+    // 1 is published; 2 is a publisher holding this slot. Merely storing
+    // inactive races an already validated handler incrementing a reused slot.
+    while (true) {
+        const active = @atomicLoad(u8, &slot.active, .acquire);
+        if (active == 0) return;
+        if (active == 1 and @cmpxchgWeak(u8, &slot.active, 1, 0, .acq_rel, .acquire) == null) return;
+        std.atomic.spinLoopHint();
+    }
 }
 
 pub fn irqPublishedEventCount(self: anytype, object_ref: KernelObjectRef) ?u64 {
@@ -238,37 +245,72 @@ pub fn releaseMmioRegionObject(self: anytype, mmio: MmioRegionObject) void {
     if (mmio.user_va == 0 or mmio.size == 0) return;
     const owner = @TypeOf(self.*).objectOwner(mmio.owner_principal_raw) orelse return;
     if (mmio.size > @as(u64, std.math.maxInt(usize))) return;
+    if (mmio.flags & @import("kernel_abi_root").capsule_abi.mmio_map_flag_replace_existing != 0) {
+        // The underlying reservation never left the VMA table. Remove only
+        // this lease's PTEs, including after an earlier process-VM teardown.
+        if (!@import("../memory/user_vm.zig").unmapUserMmioOverlay(
+            owner,
+            mmio.user_va,
+            mmio.paddr,
+            @intCast(mmio.size),
+        )) @panic("MMIO overlay last-close lost its address identity");
+        return;
+    }
     _ = @import("../memory/user_vm.zig").unmapUserLinearRegion(owner, mmio.user_va, @intCast(mmio.size));
 }
 
 pub fn releaseDmaBufferObject(self: anytype, dma: DmaBufferObject) void {
     _ = self;
     if (dma.size == 0) return;
-    releaseDmaIova(dma.device, dma.iova, dma.size);
+    _ = releaseDmaIova(dma.device, dma.iova, dma.size);
 }
 
 pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
     _ = self;
     if (mapping.size == 0) return;
-    releaseDmaIova(mapping.device, mapping.iova, mapping.size);
+    _ = releaseDmaIova(mapping.device, mapping.iova, mapping.size);
 }
 
-fn releaseDmaIova(device: DmaDeviceId, iova: u64, size: u64) void {
-    if (!vtd.isActive() or size == 0) return;
+fn releaseDmaIova(device: DmaDeviceId, iova: u64, size: u64) bool {
+    if (!vtd.isActive() or size == 0) return true;
     const page_size: u64 = 4096;
     const iova_base = iova & ~(page_size - 1);
     const span, const overflow = @addWithOverflow(iova - iova_base, size);
-    if (overflow != 0) return;
+    if (overflow != 0) return false;
     const aligned, const align_overflow = @addWithOverflow(span, page_size - 1);
-    if (align_overflow != 0) return;
+    if (align_overflow != 0) return false;
     const page_count: usize = @intCast((aligned & ~(page_size - 1)) / page_size);
-    vtd.unmapRangeForDevice(device, iova, size);
+    if (!vtd.unmapRangeForDevice(device, iova, size)) return false;
     vtd.freeIova(device, iova_base, page_count);
+    return true;
+}
+
+/// Explicit close must report a failed DMA drain and retain its FD. Forced
+/// owner cleanup cannot retain that FD, but the VT-d quarantine independently
+/// owns the physical-page ledger and excludes those pages from PMM reuse.
+fn prepareLastDmaClose(self: anytype, object_ref: KernelObjectRef) KernelError!void {
+    const slot = self.kernelObjectSlot(object_ref) orelse return KernelError.InvalidState;
+    if (slot.ref_count != 1) return;
+    switch (slot.payload) {
+        .dma_buffer => |*dma| {
+            if (!releaseDmaIova(dma.device, dma.iova, dma.size)) return KernelError.InvalidState;
+            dma.size = 0;
+        },
+        .dma_mapping => |*dma| {
+            if (!releaseDmaIova(dma.device, dma.iova, dma.size)) return KernelError.InvalidState;
+            dma.size = 0;
+        },
+        else => {},
+    }
 }
 
 pub fn releaseIrqObject(self: anytype, irq: IrqObject) void {
     _ = self;
-    _ = irq;
+    if (irq.retired) return;
+    // Last object reference, including process teardown: stop the real source
+    // and drain CPU-pending delivery before any subsequent route acquisition.
+    // Failure leaves publication removed and reacquisition fail-closed.
+    _ = @import("../pci.zig").releaseInterruptRoute(irq.device, @intFromEnum(irq.kind), irq.vector);
 }
 
 pub fn objectPayloadMatches(kind: KernelObjectKind, payload: KernelObjectPayload) bool {
@@ -567,8 +609,8 @@ pub fn fdInfo(self: anytype, owner: PrincipalId, fd: Fd) ?FdInfo {
             info.size_bytes = self.nativeVmoSize(vmo_ref) orelse 0;
         },
         .timer => |timer| {
-            info.size_bytes = timer.deadline_tick;
-            info.extra = timer.interval_ticks;
+            info.size_bytes = timer.deadline_ns;
+            info.extra = timer.interval_ns;
         },
         .serial => |serial| {
             info.extra = serial.stream;
@@ -640,45 +682,46 @@ pub fn eventWakeOwnersForFd(
     return count;
 }
 
-pub fn timerDueCount(timer: TimerObject, now_tick: u64) u64 {
-    if (timer.deadline_tick == 0 or now_tick < timer.deadline_tick) return 0;
-    if (timer.interval_ticks == 0) return 1;
-    return 1 + (now_tick - timer.deadline_tick) / timer.interval_ticks;
+pub fn timerDueCount(timer: TimerObject, now_ns: u64) u64 {
+    if (timer.deadline_ns == 0 or now_ns < timer.deadline_ns) return 0;
+    if (timer.interval_ns == 0) return 1;
+    return 1 + (now_ns - timer.deadline_ns) / timer.interval_ns;
 }
 
-pub fn timerNextWakeTick(timer: TimerObject, now_tick: u64) ?u64 {
-    if (timer.deadline_tick == 0) return null;
-    if (timerDueCount(timer, now_tick) != 0) return now_tick;
-    return timer.deadline_tick;
+pub fn timerNextWakeNs(timer: TimerObject, now_ns: u64) ?u64 {
+    if (timer.deadline_ns == 0) return null;
+    if (timerDueCount(timer, now_ns) != 0) return now_ns;
+    return timer.deadline_ns;
 }
 
-pub fn timerReadExpirations(self: anytype, owner: PrincipalId, fd: Fd, now_tick: u64) ?u64 {
+pub fn timerReadExpirations(self: anytype, owner: PrincipalId, fd: Fd, now_ns: u64) ?u64 {
     const view = self.fdPayloadWithRights(owner, fd, .{ .read = true }) orelse return null;
     var timer = switch (view.payload.*) {
         .timer => |timer| timer,
         else => return null,
     };
-    const count = @TypeOf(self.*).timerDueCount(timer, now_tick);
+    const count = @TypeOf(self.*).timerDueCount(timer, now_ns);
     if (count == 0) return 0;
-    if (timer.interval_ticks == 0) {
-        timer.deadline_tick = 0;
+    if (timer.interval_ns == 0) {
+        timer.deadline_ns = 0;
     } else {
-        timer.deadline_tick +%= count * timer.interval_ticks;
+        const next = @as(u128, timer.deadline_ns) + @as(u128, count) * timer.interval_ns;
+        timer.deadline_ns = if (next > std.math.maxInt(u64)) 0 else @intCast(next);
     }
     view.payload.* = .{ .timer = timer };
     return count;
 }
 
-pub fn timerFdState(self: anytype, owner: PrincipalId, fd: Fd, now_tick: u64) ?TimerFdState {
+pub fn timerFdState(self: anytype, owner: PrincipalId, fd: Fd, now_ns: u64) ?TimerFdState {
     const view = self.fdPayloadWithRightsConst(owner, fd, .{ .inspect = true }) orelse return null;
     const timer = switch (view.payload.*) {
         .timer => |timer| timer,
         else => return null,
     };
-    const remaining = if (timer.deadline_tick == 0 or now_tick >= timer.deadline_tick) 0 else timer.deadline_tick - now_tick;
+    const remaining = if (timer.deadline_ns == 0 or now_ns >= timer.deadline_ns) 0 else timer.deadline_ns - now_ns;
     return .{
-        .remaining_ticks = remaining,
-        .interval_ticks = timer.interval_ticks,
+        .remaining_ns = remaining,
+        .interval_ns = timer.interval_ns,
     };
 }
 
@@ -686,8 +729,8 @@ pub fn setTimerFd(
     self: anytype,
     owner: PrincipalId,
     fd: Fd,
-    deadline_tick: u64,
-    interval_ticks: u64,
+    deadline_ns: u64,
+    interval_ns: u64,
     flags: u32,
 ) KernelError!void {
     const view = self.fdPayloadWithRights(owner, fd, .{ .write = true }) orelse return KernelError.InvalidState;
@@ -695,8 +738,8 @@ pub fn setTimerFd(
         .timer => |timer| timer,
         else => return KernelError.InvalidState,
     };
-    timer.deadline_tick = deadline_tick;
-    timer.interval_ticks = interval_ticks;
+    timer.deadline_ns = deadline_ns;
+    timer.interval_ns = interval_ns;
     timer.flags = flags;
     view.payload.* = .{ .timer = timer };
 }
@@ -739,11 +782,11 @@ pub fn fdIpcWritable(self: anytype, payload: *const KernelObjectPayload) bool {
     };
 }
 
-pub fn fdPollEvents(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, now_tick: u64) ?u64 {
-    return self.fdPollEventsWithWriteMin(owner, fd, requested, now_tick, 0);
+pub fn fdPollEvents(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, now_ns: u64) ?u64 {
+    return self.fdPollEventsWithWriteMin(owner, fd, requested, now_ns, 0);
 }
 
-pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, now_tick: u64, min_write_bytes: u64) ?u64 {
+pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, requested: u64, now_ns: u64, min_write_bytes: u64) ?u64 {
     const entry = self.fdEntryConst(owner, fd) orelse return null;
     if (!entry.rights.poll) return null;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
@@ -755,7 +798,7 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
             .thread => |thread| thread.state.isTerminal(),
             .event => |counter| entry.rights.read and counter != 0,
             .irq => self.irqPublishedEventPending(entry.object) orelse false,
-            .timer => |timer| @TypeOf(self.*).timerDueCount(timer, now_tick) != 0,
+            .timer => |timer| @TypeOf(self.*).timerDueCount(timer, now_ns) != 0,
             .serial => false,
             .pipe => |endpoint| blk: {
                 const pipe = self.pipeSlotConst(endpoint.pipe) orelse break :blk false;
@@ -780,6 +823,9 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
         if (writable) ready |= @import("kernel_abi_root").fd_abi.event_writable;
     }
     switch (slot.payload) {
+        .irq => |irq| {
+            if (irq.retired) ready |= @import("kernel_abi_root").fd_abi.event_hangup;
+        },
         .channel => |handle| {
             if (handle.side > 1) return null;
             const channel = self.ipcChannelSlotConst(handle.channel) orelse return null;
@@ -795,12 +841,12 @@ pub fn fdPollEventsWithWriteMin(self: anytype, owner: PrincipalId, fd: Fd, reque
     return ready & (requested | @import("kernel_abi_root").fd_abi.event_error | @import("kernel_abi_root").fd_abi.event_hangup);
 }
 
-pub fn fdNextWakeTick(self: anytype, owner: PrincipalId, fd: Fd, now_tick: u64) ?u64 {
+pub fn fdNextWakeNs(self: anytype, owner: PrincipalId, fd: Fd, now_ns: u64) ?u64 {
     const entry = self.fdEntryConst(owner, fd) orelse return null;
     if (!entry.rights.wait and !entry.rights.poll) return null;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
     return switch (slot.payload) {
-        .timer => |timer| @TypeOf(self.*).timerNextWakeTick(timer, now_tick),
+        .timer => |timer| @TypeOf(self.*).timerNextWakeNs(timer, now_ns),
         else => null,
     };
 }
@@ -885,8 +931,14 @@ pub fn recordDeviceInterruptEvent(
     wake_owners: []PrincipalId,
 ) usize {
     var wake_count: usize = 0;
-    for (self.irq_publish_slots[0..]) |*slot| {
-        if (@atomicLoad(u8, &slot.active, .acquire) == 0) continue;
+    slots: for (self.irq_publish_slots[0..]) |*slot| {
+        while (true) {
+            const active = @atomicLoad(u8, &slot.active, .acquire);
+            if (active == 0) continue :slots;
+            if (active == 1 and @cmpxchgWeak(u8, &slot.active, 1, 2, .acquire, .monotonic) == null) break;
+            std.atomic.spinLoopHint();
+        }
+        defer @atomicStore(u8, &slot.active, 1, .release);
         const generation = @atomicLoad(u32, &slot.generation, .acquire);
         const irq_device = @atomicLoad(DmaDeviceId, &slot.device, .acquire);
         const kind = @atomicLoad(u8, &slot.kind, .acquire);
@@ -896,7 +948,6 @@ pub fn recordDeviceInterruptEvent(
         {
             continue;
         }
-        if (@atomicLoad(u8, &slot.active, .acquire) == 0) continue;
         if (@atomicLoad(u32, &slot.generation, .acquire) != generation) continue;
         _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);
         const owner_raw = @atomicLoad(PrincipalRaw, &slot.owner_principal_raw, .acquire);
@@ -911,6 +962,7 @@ pub fn irqEventCountForFd(self: anytype, owner: PrincipalId, fd: Fd, required_ri
     if (!isFdRightsSubset(required_rights, entry.rights)) return null;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
     if (slot.kind != .irq) return null;
+    if (slot.payload.irq.retired) return null;
     return self.irqPublishedEventCount(entry.object);
 }
 
@@ -1024,8 +1076,8 @@ pub fn createIrqFd(
 pub fn createTimerFd(
     self: anytype,
     owner: PrincipalId,
-    deadline_tick: u64,
-    interval_ticks: u64,
+    deadline_ns: u64,
+    interval_ns: u64,
     flags: FdFlags,
     rights: FdRights,
     min_fd: Fd,
@@ -1033,8 +1085,8 @@ pub fn createTimerFd(
     try self.requireActiveProcess(owner);
     const object_ref = try self.createKernelObject(.timer, .{ .timer = .{
         .owner_principal_raw = @intFromEnum(owner),
-        .deadline_tick = deadline_tick,
-        .interval_ticks = interval_ticks,
+        .deadline_ns = deadline_ns,
+        .interval_ns = interval_ns,
     } });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
@@ -1112,6 +1164,7 @@ pub fn closeFd(self: anytype, owner: PrincipalId, fd: Fd) KernelError!void {
     const index = table.index(fd) orelse return KernelError.InvalidState;
     const object_ref = table.slots()[index].object;
     if (object_ref.isNull()) return KernelError.InvalidState;
+    try prepareLastDmaClose(self, object_ref);
     table.slots()[index] = .{};
     self.releaseKernelObject(object_ref);
 }
@@ -1126,6 +1179,7 @@ pub fn closeFdWithFreeList(
     const index = table.index(fd) orelse return KernelError.InvalidState;
     const object_ref = table.slots()[index].object;
     if (object_ref.isNull()) return KernelError.InvalidState;
+    try prepareLastDmaClose(self, object_ref);
     table.slots()[index] = .{};
     self.releaseKernelObjectWithFreeList(object_ref, free_list);
 }
@@ -1265,16 +1319,17 @@ pub fn registerTaskReadableWaiterForFd(
     group: FdWaitGroupRef,
 ) KernelError!bool {
     const fd_abi = @import("kernel_abi_root").fd_abi;
-    if ((requested_events & fd_abi.event_readable) == 0) return false;
     if (thread_index > std.math.maxInt(u32) or wait_token == 0 or group.isNull())
         return KernelError.InvalidState;
     const entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
     if (!entry.rights.poll and !entry.rights.wait) return KernelError.InvalidState;
     const slot = self.kernelObjectSlotConst(entry.object) orelse return KernelError.InvalidState;
+    // IRQ retirement reports HANGUP independently of the requested event mask.
+    if ((requested_events & fd_abi.event_readable) == 0 and slot.kind != .irq) return false;
     const principal_raw: PrincipalRaw = switch (slot.payload) {
         .process => |process| process.principal_raw,
         .thread => |thread| thread.owner_principal_raw,
-        .event, .irq => 0,
+        .event, .irq, .timer => 0,
         else => return false,
     };
     const thread_index_u32: u32 = @intCast(thread_index);
@@ -1433,13 +1488,38 @@ pub fn takeReadyIrqWaiters(
     var count: usize = 0;
     for (&self.task_fd_waiters) |*waiter| {
         if (!waiter.active or waiter.binding.completion_pending) continue;
-        if (waiter.object.kind != .irq or
-            (waiter.events & fd_abi.event_readable) == 0 or
-            !(self.irqPublishedEventPending(waiter.object) orelse false))
-        {
-            continue;
-        }
+        if (waiter.object.kind != .irq) continue;
+        const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
+        const retired = slot.payload.irq.retired;
+        if (!retired and ((waiter.events & fd_abi.event_readable) == 0 or
+            !(self.irqPublishedEventPending(waiter.object) orelse false))) continue;
         if (count >= out.len) break;
+        out[count] = .{
+            .owner = waiter.owner,
+            .thread_index = waiter.thread_index,
+            .thread_generation = waiter.thread_generation,
+            .wait_token = waiter.binding.wait_token,
+            .pollfd_va = waiter.pollfd_va,
+            .revents = if (retired) fd_abi.event_hangup else fd_abi.event_readable,
+            .registration = waiter.registration,
+            .group = waiter.binding.group,
+            .group_link_index = waiter.binding.link_index,
+        };
+        waiter.binding.completion_pending = true;
+        count += 1;
+    }
+    return count;
+}
+
+pub fn takeReadyTimerWaiters(self: anytype, now_ns: u64, out: []ThreadWakeTarget) usize {
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    var count: usize = 0;
+    for (&self.task_fd_waiters) |*waiter| {
+        if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer or
+            (waiter.events & fd_abi.event_readable) == 0) continue;
+        const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
+        if (timerDueCount(slot.payload.timer, now_ns) == 0) continue;
+        if (count == out.len) break;
         out[count] = .{
             .owner = waiter.owner,
             .thread_index = waiter.thread_index,
@@ -1455,6 +1535,17 @@ pub fn takeReadyIrqWaiters(
         count += 1;
     }
     return count;
+}
+
+pub fn nextTimerWaiterDeadline(self: anytype) ?u64 {
+    var earliest: ?u64 = null;
+    for (&self.task_fd_waiters) |*waiter| {
+        if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer) continue;
+        const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
+        const deadline = slot.payload.timer.deadline_ns;
+        if (deadline != 0 and (earliest == null or deadline < earliest.?)) earliest = deadline;
+    }
+    return earliest;
 }
 
 fn fdWaitListForRegistration(

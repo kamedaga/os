@@ -12,6 +12,8 @@ mkdir -p "$(dirname "$out")"
   -ffunction-sections \
   -fdata-sections \
   -Iuserland/lpr_supervisor/include \
+  -Iuserland/libaccount/include \
+  -Iuserland/filed/include \
   -Iuserland/unixd/include \
   -Iuserland/libipc/include \
   -Iuserland/libpacha/include \

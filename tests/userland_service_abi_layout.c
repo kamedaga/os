@@ -18,6 +18,7 @@
 #include "termd/ipc_protocol.h"
 #include "unixd/ipc_protocol.h"
 #include "pacha/abi.h"
+#include "pacha/ipc.h"
 #include "pachaos/abi.h"
 
 static int expect(int condition, const char *message)
@@ -32,6 +33,29 @@ static int expect(int condition, const char *message)
 int main(void)
 {
     int failures = 0;
+    failures += expect(sizeof(lprs_register_exec_t) == 992 &&
+        offsetof(lprs_register_exec_t, account) == 920 &&
+        sizeof(lprs_credential_request_t) == 312,
+        "launch account and explicit rights; authenticated credential operation");
+
+    failures += expect(sizeof(lprs_credentials_t) == 288 &&
+        offsetof(lprs_process_state_t, credentials) == 56 &&
+        offsetof(lprs_credentials_t, groups) == 32 &&
+        offsetof(lprs_process_state_t, filed_rights) == 344 &&
+        offsetof(lprs_process_state_t, foreground_pgrp) == 352 &&
+        sizeof(lprs_process_state_t) == 920,
+        "supervisor state includes authoritative real/effective/saved UID and GID");
+
+    failures += expect(sizeof(struct pacha_process_fd_grant) == 32 &&
+        offsetof(struct pacha_process_fd_grant, source_fd) == 0 &&
+        offsetof(struct pacha_process_fd_grant, target_fd) == 8 &&
+        offsetof(struct pacha_process_fd_grant, rights) == 16 &&
+        offsetof(struct pacha_process_fd_grant, flags) == 24,
+        "PROCESS_CREATE explicit grant layout");
+    failures += expect(sizeof(filed_exec_fd_grant_t) == 24 &&
+        offsetof(filed_exec_fd_grant_t, rights) == 8 &&
+        offsetof(filed_exec_fd_grant_t, flags) == 16,
+        "filed exec separates child grant authority from IPC transport rights");
 
     failures += expect(PACHA_THREAD_SELF_FD == PACHAOS_THREAD_SELF_FD &&
         PACHA_THREAD_SELF_FD != PACHA_PROCESS_SELF_FD, "thread observation pseudo fd");
@@ -49,7 +73,8 @@ int main(void)
     failures += expect(UNIX_RIGHTS_MAX == 253, "unix ancillary limit");
     failures += expect(sizeof(struct lprs_boot_config) == 128 &&
         offsetof(struct lprs_boot_config, unix_admin_fd) == 16 &&
-        offsetof(struct lprs_boot_config, flags) == 24, "supervisor unix admin bootstrap");
+        offsetof(struct lprs_boot_config, filed_admin_fd) == 24 &&
+        offsetof(struct lprs_boot_config, flags) == 32, "supervisor service admin bootstrap");
 
     failures += expect(sizeof(pacha_service_envelope_t) == 64, "service envelope size");
     failures += expect(
@@ -114,19 +139,19 @@ int main(void)
     failures += expect(
         LPRS_OP_HELLO == 0 && LPRS_OP_PROCESS_REGISTER_EXEC == 1 &&
         LPRS_OP_PROCESS_ACTIVATE == 3 &&
-        LPRS_OP_PROCESS_UNIX_SESSION == 4 &&
-        LPRS_OP_PROCESS_GET_STATE == 5 && LPRS_OP_PROCESS_LIST == 6 &&
-        LPRS_OP_PROCESS_EXEC_PREPARE == 11 &&
-        LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN == 12 &&
-        LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL == 13 &&
-        LPRS_OP_PROCESS_EXEC_COMMIT_DONE == 14 &&
-        LPRS_OP_PROCESS_SET_COMM == 15 && LPRS_OP_PROCESS_QUERY == 16 &&
-        LPRS_OP_PROCESS_DIAG_ATTACH == 17 && LPRS_OP_PROCESS_WAIT4 == 18 &&
-        LPRS_OP_PROCESS_GETSID == 22 &&
-        LPRS_OP_PROCESS_SET_PDEATHSIG == 23 &&
-        LPRS_OP_PROCESS_GET_PDEATHSIG == 24 &&
-        LPRS_OP_SIGNAL_KILL == 25 && LPRS_OP_CWD_GET == 27 &&
-        LPRS_OP_DIAG_ERROR_GET == 30,
+        LPRS_OP_PROCESS_UNIX_SESSION == 4 && LPRS_OP_PROCESS_FILED_SESSION == 5 &&
+        LPRS_OP_PROCESS_GET_STATE == 6 && LPRS_OP_PROCESS_CREDENTIALS == 7 && LPRS_OP_PROCESS_LIST == 8 &&
+        LPRS_OP_PROCESS_EXEC_PREPARE == 13 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN == 14 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL == 15 &&
+        LPRS_OP_PROCESS_EXEC_COMMIT_DONE == 16 &&
+        LPRS_OP_PROCESS_SET_COMM == 17 && LPRS_OP_PROCESS_QUERY == 18 &&
+        LPRS_OP_PROCESS_DIAG_ATTACH == 19 && LPRS_OP_PROCESS_WAIT4 == 20 &&
+        LPRS_OP_PROCESS_GETSID == 24 &&
+        LPRS_OP_PROCESS_SET_PDEATHSIG == 25 &&
+        LPRS_OP_PROCESS_GET_PDEATHSIG == 26 &&
+        LPRS_OP_SIGNAL_KILL == 27 && LPRS_OP_CWD_GET == 29 &&
+        LPRS_OP_DIAG_ERROR_GET == 32,
         "lpr supervisor process, signal, cwd, and diagnostic ops are contiguous");
     failures += expect(
         sizeof(lprs_process_list_t) == LPRS_PAYLOAD_BYTES,

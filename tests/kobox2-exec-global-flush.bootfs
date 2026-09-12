@@ -1,0 +1,3 @@
+/srv/kobox2/core.so=../.artifacts/kobox2-global-flush-runtime/linux-boot-runtime.so
+/srv/kobox2/vm-client.elf=../.artifacts/tests/kobox2-pacha-vm/vm_client.elf
+/srv/kobox2/client.elf=../.artifacts/tests/kobox2-pacha-exec/linux_client.elf
