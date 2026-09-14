@@ -25,19 +25,21 @@ static const char *const artifact_paths[GPUD_PACKAGE_ARTIFACTS] = {
     "/srv/kobox2/modules/virtio_dma_buf.ko",
     "/srv/kobox2/modules/drm_kms_helper.ko",
     "/srv/kobox2/modules/virtio-gpu.ko",
+    "/srv/kobox2/modules/kobox-drm-mapping.ko",
 };
 
 static const char *const artifact_names[GPUD_PACKAGE_ARTIFACTS] = {
     "core", "i2c_core", "drm_panel_orientation_quirks", "drm",
     "drm_shmem_helper", "virtio_ring", "virtio", "virtio_pci_modern_dev",
     "virtio_pci", "virtio_dma_buf", "drm_kms_helper", "virtio_gpu",
+    "drm_mapping",
 };
 
 static const kb2_closure_manifest_dependency_t dependencies[] = {
     {2, 1},  {3, 1},  {4, 1},  {5, 1},  {6, 1},  {7, 1},  {8, 1},   {9, 1},
     {10, 1}, {11, 1}, {12, 1}, {4, 2},  {4, 3},  {5, 4},  {7, 6},   {9, 6},
     {9, 7},  {9, 8},  {11, 4}, {12, 4}, {12, 5}, {12, 6}, {12, 7}, {12, 10},
-    {12, 11},
+    {12, 11}, {13, 1}, {13, 4}, {13, 5}, {13, 12},
 };
 
 static const uint8_t device_schema[32] = KB2_PCI_FUNCTION_SCHEMA_SHA256_BYTES;
@@ -240,6 +242,8 @@ int gpud_package_configure_controller(
         status = kb2_closure_builder_mark_root(builder, 9);
     if (status == KB2_STATUS_OK)
         status = kb2_closure_builder_mark_root(builder, 12);
+    if (status == KB2_STATUS_OK)
+        status = kb2_closure_builder_mark_root(builder, 13);
     if (status == KB2_STATUS_OK)
         status = kb2_closure_builder_add_resource(builder, 1, KB2_RESOURCE_DEVICE,
             device_schema, sizeof(device_schema), 1, 1,

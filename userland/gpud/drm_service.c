@@ -10,11 +10,48 @@
 #include <stdio.h>
 #include <string.h>
 
+enum {
+    GPUD_LINUX_POLLIN = 0x0001u,
+    GPUD_LINUX_POLLRDNORM = 0x0040u,
+};
+
 static int valid_fd(uint64_t fd, uint64_t kind, uint64_t rights, uint64_t size) {
     struct pacha_fd_info info = {0};
     return fd >= 16 && fd < PACHA_FD_TABLE_LIMIT &&
         !pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, fd, (uintptr_t)&info) &&
         info.kind == kind && (info.rights & rights) == rights && (!size || info.size == size);
+}
+
+static int valid_aux_fd(const struct pacha_ipc_fd *fd, uint64_t size) {
+    const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
+    struct pacha_fd_info info = {0};
+    return fd && fd->fd >= 16 && fd->fd < PACHA_FD_TABLE_LIMIT &&
+        fd->rights == rights && !fd->flags && !fd->transfer_flags &&
+        !pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO, fd->fd, (uintptr_t)&info) &&
+        info.kind == PACHA_FD_KIND_VMO && info.rights == rights &&
+        !info.flags && info.size == size;
+}
+
+static int wait_fence(int fd) {
+    for (;;) {
+        struct pacha_pollfd event = {.fd = fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+        long result = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+            (uintptr_t)&event, 1, UINT64_MAX, 0);
+        if (result == 1 && (event.revents & PACHA_FD_EVENT_READABLE))
+            return 0;
+        if (result == 1 && (event.revents & PACHA_FD_EVENT_HANGUP))
+            return -EPIPE;
+        if (result != PACHA_SYSCALL_ERR_NOT_READY &&
+            result != -PACHA_SYSCALL_ERR_NOT_READY)
+            return -EIO;
+    }
+}
+
+static int signal_fence(int fd) {
+    const struct pacha_ipc_msg message = {0};
+    return pacha_ipc_send(fd, &message) ? -EIO : 0;
 }
 
 int gpud_drm_service_bind(struct gpud_drm_service *service, int endpoint_fd) {
@@ -44,6 +81,177 @@ static const struct gpud_drm_file *find_file(
     return NULL;
 }
 
+struct gpud_drm_reply_transfer {
+    struct pacha_ipc_fd fds[2];
+    struct gpud_drm_object_lease *lease;
+    uint64_t object_id;
+    int owner_fd, client_fd;
+    size_t count;
+};
+
+static struct gpud_drm_mapping *find_mapping(
+    struct gpud_drm_service *service, uint64_t id) {
+    if (id)
+        for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
+            if (service->mappings[i].id == id)
+                return &service->mappings[i];
+    return NULL;
+}
+
+static struct gpud_drm_mapping *empty_mapping(
+    struct gpud_drm_service *service) {
+    for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
+        if (!service->mappings[i].id)
+            return &service->mappings[i];
+    return NULL;
+}
+
+static struct gpud_drm_prime *find_prime(
+    struct gpud_drm_service *service, uint64_t token) {
+    if (token)
+        for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; ++i)
+            if (service->primes[i].token == token)
+                return &service->primes[i];
+    return NULL;
+}
+
+static struct gpud_drm_prime *empty_prime(struct gpud_drm_service *service) {
+    for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; ++i)
+        if (!service->primes[i].token)
+            return &service->primes[i];
+    return NULL;
+}
+
+static struct gpud_drm_object_lease *empty_object_lease(
+    struct gpud_drm_service *service) {
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i)
+        if (!service->object_leases[i].object_id)
+            return &service->object_leases[i];
+    return NULL;
+}
+
+static int object_has_leases(
+    const struct gpud_drm_service *service, uint64_t id) {
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i)
+        if (service->object_leases[i].object_id == id)
+            return 1;
+    return 0;
+}
+
+static uint64_t mapping_root_rights(uint32_t rights) {
+    uint64_t native = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_REVOKE;
+    if (rights & KB2_GPU_SPAN_RIGHT_READ)
+        native |= PACHA_FD_RIGHT_MAP_READ;
+    if (rights & KB2_GPU_SPAN_RIGHT_WRITE)
+        native |= PACHA_FD_RIGHT_MAP_WRITE;
+    return native;
+}
+
+static int adopt_mapping(struct gpud_drm_service *service,
+    uint64_t handle, uint64_t correlation,
+    const struct gpud_drm_translation *translation) {
+    struct gpud_drm_mapping *slot = empty_mapping(service);
+    struct pacha_ipc_fd received = {0};
+    if (!slot)
+        return -ENOSPC;
+    if (!translation->mapping_id || !translation->mapping_exchange ||
+        !translation->mapping_length || find_mapping(service, translation->mapping_id))
+        return -EPROTO;
+    int error = gpud_gpu_rpc_take_mapping(&service->gpu, correlation,
+        translation->mapping_exchange, &received);
+    if (error)
+        return error;
+    const uint64_t rights = mapping_root_rights(translation->mapping_rights);
+    struct pacha_fd_info info = {0};
+    int valid = received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT &&
+        received.rights == rights && received.flags == PACHA_FD_FLAG_CLOEXEC &&
+        !received.transfer_flags &&
+        !pacha_fd_get_info((int)received.fd, &info) &&
+        info.kind == PACHA_FD_KIND_VMO && info.size == translation->mapping_length &&
+        info.rights == rights && info.flags == PACHA_FD_FLAG_CLOEXEC;
+    if (!valid) {
+        if (received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT)
+            (void)pacha_fd_close((int)received.fd);
+        return -EPROTO;
+    }
+    *slot = (struct gpud_drm_mapping){
+        .id = translation->mapping_id,
+        .exchange = translation->mapping_exchange,
+        .handle = handle,
+        .length = translation->mapping_length,
+        .rights = translation->mapping_rights,
+        .cache_policy = translation->mapping_cache_policy,
+        .view_fd = (int)received.fd,
+    };
+    return 0;
+}
+
+static int release_mapping(struct gpud_drm_service *service,
+    struct gpud_drm_mapping *mapping) {
+    if (!mapping || !mapping->id || mapping->view_fd < 16 ||
+        service->correlation == UINT64_MAX)
+        return -EINVAL;
+    int error = pacha_vmo_revoke(mapping->view_fd);
+    if (!error) {
+        /* Revoke removes every capability for this VMO, including view_fd. */
+        mapping->view_fd = -1;
+        error = gpud_gpu_rpc_release_mapping(&service->gpu,
+            ++service->correlation, mapping->id);
+    }
+    if (!error)
+        memset(mapping, 0, sizeof(*mapping));
+    return error;
+}
+
+static int release_prime(struct gpud_drm_service *service,
+    struct gpud_drm_prime *prime) {
+    if (!prime || !prime->token || prime->view_fd < 16 ||
+        service->correlation == UINT64_MAX)
+        return -EINVAL;
+    int error = pacha_vmo_revoke(prime->view_fd);
+    if (!error) {
+        prime->view_fd = -1;
+        error = gpud_gpu_rpc_release_mapping(&service->gpu,
+            ++service->correlation, prime->token);
+    }
+    if (!error)
+        memset(prime, 0, sizeof(*prime));
+    return error;
+}
+
+static int release_closed_objects(struct gpud_drm_service *service) {
+    for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i) {
+        struct gpud_drm_mapping *mapping = &service->mappings[i];
+        if (!mapping->id || !mapping->owner_closed ||
+            object_has_leases(service, mapping->id))
+            continue;
+        int error = release_mapping(service, mapping);
+        if (error)
+            return gpud_drm_files_fault(
+                &service->files, service->files.generation, error);
+    }
+    for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; ++i) {
+        struct gpud_drm_prime *prime = &service->primes[i];
+        if (!prime->token || !prime->owner_closed ||
+            object_has_leases(service, prime->token))
+            continue;
+        int error = release_prime(service, prime);
+        if (error)
+            return gpud_drm_files_fault(
+                &service->files, service->files.generation, error);
+    }
+    return 0;
+}
+
+static void close_mapping_owner(
+    struct gpud_drm_service *service, uint64_t handle) {
+    for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
+        if (service->mappings[i].handle == handle)
+            service->mappings[i].owner_closed = 1;
+}
+
 static int retire_owner_watch(struct gpud_drm_service *service, uint64_t handle) {
     for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i) {
         struct gpud_drm_watch *watch = &service->watches[i];
@@ -66,6 +274,9 @@ static int control(struct gpud_drm_service *service, struct gpud_drm_control *pe
         reply, sizeof(reply), &reply_size);
     if (error)
         return gpud_drm_files_fault(&service->files, service->files.generation, error);
+    if (service->gpu.attachment.fd_count)
+        return gpud_drm_files_fault(
+            &service->files, service->files.generation, -EPROTO);
     return gpud_drm_control_complete(&service->files, pending, reply, reply_size, handle);
 }
 
@@ -95,7 +306,7 @@ static int close_draining(struct gpud_drm_service *service) {
 }
 
 static int ioctl_request(
-    struct gpud_drm_service *service, drmd_ioctl_request_t *request) {
+    struct gpud_drm_service *service, gpud_drm_ioctl_request_t *request) {
     struct gpud_drm_binding binding;
     uint64_t generation = service->files.generation;
     int error = gpud_drm_file_acquire(
@@ -104,9 +315,73 @@ static int ioctl_request(
         return error;
     struct gpud_drm_translation translation;
     error = gpud_drm_ioctl_encode(&translation, &binding, request, PH_GPU_QUERY_OUTPUT_REGION);
+    size_t fd_index = 1 + !!request->aux_size;
+    int input_fence = -1, output_fence = -1;
+    if (!error && (request->fd_flags & GPUD_DRM_IOCTL_FD_INPUT_WAIT)) {
+        input_fence = service->received.fds[fd_index++].fd;
+        if (!valid_fd(input_fence, PACHA_FD_KIND_CHANNEL,
+                PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
+                    PACHA_FD_RIGHT_CLOSE, 0))
+            error = -EACCES;
+    }
+    if (!error && (request->fd_flags & GPUD_DRM_IOCTL_FD_OUTPUT_NOTIFY)) {
+        output_fence = service->received.fds[fd_index++].fd;
+        if (!valid_fd(output_fence, PACHA_FD_KIND_CHANNEL,
+                PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE, 0))
+            error = -EACCES;
+    }
+    if (!error && input_fence >= 16)
+        error = wait_fence(input_fence);
+    void *aux = NULL;
+    size_t aux_mapping_size = 0;
+    if (!error && request->aux_size) {
+        aux_mapping_size = (request->aux_size + GPUD_GPU_CHANNEL_PAGE - 1) &
+            ~(size_t)(GPUD_GPU_CHANNEL_PAGE - 1);
+        const struct pacha_ipc_fd *received = &service->received.fds[1];
+        uint64_t aux_fd = received->fd;
+        if (request->aux_size > GPUD_GPU_AUX_CAPACITY ||
+            aux_mapping_size < request->aux_size ||
+            !valid_aux_fd(received, aux_mapping_size)) {
+            error = -EACCES;
+        } else {
+            long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, aux_fd, 0,
+                aux_mapping_size, PACHA_PROT_READ | PACHA_PROT_WRITE,
+                PACHA_MMAP_SHARED, 0);
+            if (address < GPUD_GPU_CHANNEL_PAGE)
+                error = -ENOMEM;
+            else {
+                aux = (void *)(uintptr_t)address;
+                if (translation.region.region_id != PH_GPU_QUERY_OUTPUT_REGION ||
+                    translation.region.length != request->aux_size) {
+                    error = -EPROTO;
+                } else if (translation.region.rights == KB2_GPU_SPAN_RIGHT_READ) {
+                    memcpy(service->gpu.mapping + GPUD_GPU_AUX_OFFSET,
+                        aux, request->aux_size);
+                } else if (translation.region.rights == KB2_GPU_SPAN_RIGHT_WRITE) {
+                    /* Output-only ioctls may write fewer bytes than requested. */
+                    memset(service->gpu.mapping + GPUD_GPU_AUX_OFFSET,
+                        0, request->aux_size);
+                } else {
+                    error = -EPROTO;
+                }
+            }
+        }
+    }
+    if (!error && translation.staged_input_size) {
+        if (request->aux_size ||
+            translation.region.region_id != PH_GPU_QUERY_OUTPUT_REGION ||
+            translation.region.rights != KB2_GPU_SPAN_RIGHT_READ ||
+            translation.region.length != translation.staged_input_size ||
+            translation.staged_input_size > GPUD_GPU_AUX_CAPACITY) {
+            error = -EPROTO;
+        } else {
+            memcpy(service->gpu.mapping + GPUD_GPU_AUX_OFFSET,
+                translation.staged_input, translation.staged_input_size);
+        }
+    }
     if (!error) {
         unsigned char bytes[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + GPUD_DRM_COMMAND_BYTES];
-        unsigned char reply[GPUD_GPU_CHANNEL_PAGE], output[GPUD_DRM_VERSION_BYTES];
+        unsigned char reply[GPUD_GPU_CHANNEL_PAGE], output[GPUD_GPU_CHANNEL_PAGE];
         size_t size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + translation.command_size, reply_size;
         kb2_protocol_message_envelope_t envelope = {.protocol_id = KB2_GPU_PROTOCOL_ID,
             .opcode = KB2_GPU_OPCODE_COMMAND, .generation = generation,
@@ -115,7 +390,9 @@ static int ioctl_request(
         if (!error) {
             memcpy(bytes + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
                 translation.command, translation.command_size);
-            error = gpud_gpu_rpc_call(&service->gpu, GPUD_GPU_QUEUE_EXECUTION,
+            error = gpud_gpu_rpc_call(&service->gpu,
+                translation.queue_class == KB2_GPU_QUEUE_DISPLAY ?
+                    GPUD_GPU_QUEUE_DISPLAY : GPUD_GPU_QUEUE_EXECUTION,
                 bytes, size, reply, sizeof(reply), &reply_size);
             if (error)
                 gpud_drm_files_fault(&service->files, generation, error);
@@ -123,17 +400,353 @@ static int ioctl_request(
                 memcpy(output, service->gpu.mapping + GPUD_GPU_OUTPUT_OFFSET, sizeof(output));
                 error = gpud_drm_ioctl_reply(request, &translation, service->correlation,
                     reply, reply_size, output, sizeof(output));
+                if (!error && translation.mapping_id) {
+                    error = adopt_mapping(service, request->handle,
+                        service->correlation, &translation);
+                } else if (!error && service->gpu.attachment.fd_count)
+                    error = -EPROTO;
+                if (!error && output_fence >= 16)
+                    error = signal_fence(output_fence);
+                if (!error && request->aux_size &&
+                    translation.region.rights == KB2_GPU_SPAN_RIGHT_WRITE)
+                    memcpy(aux, service->gpu.mapping + GPUD_GPU_AUX_OFFSET,
+                        request->aux_size);
                 if (error == -EPROTO)
                     gpud_drm_files_fault(&service->files, generation, error);
             }
         }
     }
+    if (aux && pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
+            (uintptr_t)aux, aux_mapping_size)) {
+        error = -EIO;
+        gpud_drm_files_fault(&service->files, generation, error);
+    }
     int release = gpud_drm_file_release(&service->files, generation, request->handle);
     return release ? release : error;
 }
 
+static int event_request(struct gpud_drm_service *service, uint32_t op,
+    void *payload, uint64_t *result) {
+    gpud_drm_read_request_t *read = payload;
+    gpud_drm_handle_request_t *poll = payload;
+    uint64_t handle = op == GPUD_DRM_OP_HANDLE_READ ? read->handle : poll->handle;
+    uint64_t generation = service->files.generation;
+    struct gpud_drm_binding binding;
+    int error = gpud_drm_file_acquire(&service->files, generation, handle, &binding);
+    if (error)
+        return error;
+    struct gpud_drm_translation translation;
+    uint32_t requested = op == GPUD_DRM_OP_HANDLE_POLL &&
+        (poll->arg0 & (GPUD_LINUX_POLLIN | GPUD_LINUX_POLLRDNORM)) ?
+        KB2_GPU_DRM_CORE_POLL_READABLE : 0;
+    error = op == GPUD_DRM_OP_HANDLE_POLL ?
+        gpud_drm_poll_encode(&translation, &binding, requested) :
+        gpud_drm_read_encode(&translation, &binding, (uint32_t)read->capacity,
+            PH_GPU_QUERY_OUTPUT_REGION);
+    if (!error) {
+        unsigned char bytes[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + GPUD_DRM_COMMAND_BYTES];
+        unsigned char reply[GPUD_GPU_CHANNEL_PAGE];
+        unsigned char output[GPUD_DRM_EVENT_READ_BYTES];
+        size_t size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + translation.command_size;
+        size_t reply_size;
+        kb2_protocol_message_envelope_t envelope = {.protocol_id = KB2_GPU_PROTOCOL_ID,
+            .opcode = KB2_GPU_OPCODE_COMMAND, .generation = generation,
+            .correlation_id = service->correlation,
+            .payload_length = translation.command_size};
+        error = kb2_protocol_message_envelope_encode(bytes, size, &envelope) ?
+            -EPROTO : 0;
+        if (!error) {
+            memcpy(bytes + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                translation.command, translation.command_size);
+            error = gpud_gpu_rpc_call(&service->gpu, GPUD_GPU_QUEUE_EXECUTION,
+                bytes, size, reply, sizeof(reply), &reply_size);
+        }
+        if (error) {
+            gpud_drm_files_fault(&service->files, generation, error);
+        } else if (service->gpu.attachment.fd_count) {
+            error = gpud_drm_files_fault(&service->files, generation, -EPROTO);
+        } else if (op == GPUD_DRM_OP_HANDLE_POLL) {
+            uint32_t ready = 0;
+            error = gpud_drm_poll_reply(requested, &ready, &translation,
+                service->correlation, reply, reply_size);
+            if (!error)
+                *result = ready ? poll->arg0 &
+                    (GPUD_LINUX_POLLIN | GPUD_LINUX_POLLRDNORM) : 0;
+        } else {
+            memcpy(output, service->gpu.mapping + GPUD_GPU_OUTPUT_OFFSET,
+                read->capacity);
+            error = gpud_drm_read_reply(read, &translation, service->correlation,
+                reply, reply_size, output, read->capacity);
+        }
+        if (error == -EPROTO)
+            gpud_drm_files_fault(&service->files, generation, error);
+    }
+    int release = gpud_drm_file_release(&service->files, generation, handle);
+    return release ? release : error;
+}
+
+static int execute_prime_command(struct gpud_drm_service *service,
+    const struct gpud_drm_translation *translation,
+    unsigned char *reply, size_t reply_capacity, size_t *reply_size) {
+    unsigned char bytes[
+        KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + GPUD_DRM_COMMAND_BYTES];
+    const size_t size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE +
+        translation->command_size;
+    const kb2_protocol_message_envelope_t envelope = {
+        .protocol_id = KB2_GPU_PROTOCOL_ID,
+        .opcode = KB2_GPU_OPCODE_COMMAND,
+        .generation = translation->generation,
+        .correlation_id = service->correlation,
+        .payload_length = translation->command_size,
+    };
+    if (kb2_protocol_message_envelope_encode(bytes, size, &envelope))
+        return -EPROTO;
+    memcpy(bytes + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+        translation->command, translation->command_size);
+    return gpud_gpu_rpc_call(&service->gpu, GPUD_GPU_QUEUE_EXECUTION,
+        bytes, size, reply, reply_capacity, reply_size);
+}
+
+static int adopt_prime(struct gpud_drm_service *service, uint64_t token,
+    struct gpud_drm_reply_transfer *transfer, uint64_t *result) {
+    struct gpud_drm_prime *slot = empty_prime(service);
+    struct pacha_ipc_fd received = {0};
+    if (!slot)
+        return -ENOSPC;
+    if (!token || find_prime(service, token) || find_mapping(service, token))
+        return -EPROTO;
+    int error = gpud_gpu_rpc_take_dma_buf(
+        &service->gpu, service->correlation, token, &received);
+    if (error)
+        return error;
+    const uint32_t span_rights =
+        KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE;
+    const uint64_t root_rights = mapping_root_rights(span_rights);
+    struct pacha_fd_info info = {0};
+    const int valid = received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT &&
+        received.rights == root_rights &&
+        received.flags == PACHA_FD_FLAG_CLOEXEC && !received.transfer_flags &&
+        !pacha_fd_get_info((int)received.fd, &info) &&
+        info.kind == PACHA_FD_KIND_VMO && info.size && !(info.size & 4095u) &&
+        info.rights == root_rights && info.flags == PACHA_FD_FLAG_CLOEXEC;
+    if (!valid) {
+        if (received.fd >= 16 && received.fd < PACHA_FD_TABLE_LIMIT)
+            (void)pacha_fd_close((int)received.fd);
+        return -EPROTO;
+    }
+    *slot = (struct gpud_drm_prime) {
+        .token = token,
+        .length = info.size,
+        .view_fd = (int)received.fd,
+    };
+    transfer->fds[0] = (struct pacha_ipc_fd) {
+        .fd = received.fd,
+        /* A Linux dma-buf is an FD-transferable object.  Keep revoke and
+         * inspect authority in gpud, but let LPR duplicate the narrowed view
+         * when the Linux application sends the dma-buf through SCM_RIGHTS. */
+        .rights = PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER |
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
+            PACHA_FD_RIGHT_MAP_WRITE,
+        .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
+    };
+    transfer->object_id = token;
+    transfer->count = 1;
+    *result = token;
+    return 0;
+}
+
+static int prime_export_request(struct gpud_drm_service *service,
+    const gpud_drm_prime_export_request_t *request,
+    struct gpud_drm_reply_transfer *transfer, uint64_t *result) {
+    if (!request->gem_handle ||
+        (request->flags & ~(GPUD_DRM_CLOEXEC | GPUD_DRM_RDWR)) ||
+        !empty_prime(service))
+        return -EINVAL;
+    const uint64_t generation = service->files.generation;
+    struct gpud_drm_binding binding;
+    int error = gpud_drm_file_acquire(
+        &service->files, generation, request->handle, &binding);
+    if (error)
+        return error;
+    struct gpud_drm_translation translation;
+    error = gpud_drm_prime_export_encode(&translation, &binding,
+        request->gem_handle, request->flags);
+    if (!error) {
+        unsigned char reply[GPUD_GPU_CHANNEL_PAGE];
+        size_t reply_size;
+        error = execute_prime_command(service, &translation,
+            reply, sizeof(reply), &reply_size);
+        uint64_t token = 0;
+        if (!error)
+            error = gpud_drm_prime_export_reply(&translation,
+                request->gem_handle, request->flags, service->correlation,
+                reply, reply_size, &token);
+        if (!error)
+            error = adopt_prime(service, token, transfer, result);
+        if (error == -EPROTO)
+            gpud_drm_files_fault(&service->files, generation, error);
+    }
+    int release = gpud_drm_file_release(
+        &service->files, generation, request->handle);
+    return release ? release : error;
+}
+
+static int prime_import_request(struct gpud_drm_service *service,
+    const gpud_drm_prime_import_request_t *request, uint64_t *result) {
+    if (!request->token || request->size || request->flags ||
+        request->reserved0 || !find_prime(service, request->token))
+        return -EINVAL;
+    const uint64_t generation = service->files.generation;
+    struct gpud_drm_binding binding;
+    int error = gpud_drm_file_acquire(
+        &service->files, generation, request->handle, &binding);
+    if (error)
+        return error;
+    struct gpud_drm_translation translation;
+    error = gpud_drm_prime_import_encode(
+        &translation, &binding, request->token);
+    if (!error) {
+        unsigned char reply[GPUD_GPU_CHANNEL_PAGE];
+        size_t reply_size;
+        error = execute_prime_command(service, &translation,
+            reply, sizeof(reply), &reply_size);
+        uint32_t handle = 0;
+        if (!error && service->gpu.attachment.fd_count)
+            error = -EPROTO;
+        if (!error)
+            error = gpud_drm_prime_import_reply(&translation,
+                request->token, service->correlation,
+                reply, reply_size, &handle);
+        if (!error)
+            *result = handle;
+        if (error == -EPROTO)
+            gpud_drm_files_fault(&service->files, generation, error);
+    }
+    int release = gpud_drm_file_release(
+        &service->files, generation, request->handle);
+    return release ? release : error;
+}
+
+static int prime_release_request(struct gpud_drm_service *service,
+    uint64_t token) {
+    struct gpud_drm_prime *prime = find_prime(service, token);
+    if (!prime || prime->owner_closed)
+        return -ENOENT;
+    prime->owner_closed = 1;
+    return release_closed_objects(service);
+}
+
+static int prime_acquire_request(struct gpud_drm_service *service,
+    uint64_t token) {
+    struct gpud_drm_prime *prime = find_prime(service, token);
+    const uint64_t fd = service->received.fds[1].fd;
+    if (!prime || (prime->owner_closed && !object_has_leases(service, token)) ||
+        !valid_fd(fd, PACHA_FD_KIND_CHANNEL,
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_WAIT |
+                PACHA_FD_RIGHT_POLL, 0))
+        return -EINVAL;
+    struct gpud_drm_object_lease *lease = empty_object_lease(service);
+    if (!lease)
+        return -EMFILE;
+    *lease = (struct gpud_drm_object_lease) {
+        .object_id = token,
+        .fd = (int)fd,
+    };
+    service->received.fds[1].fd = PH_IPC_NO_FD;
+    return 0;
+}
+
+static int mmap_request(struct gpud_drm_service *service,
+    const gpud_drm_mmap_request_t *request,
+    struct gpud_drm_reply_transfer *transfer, uint64_t *result) {
+    const uint64_t known_prot = PACHA_PROT_READ | PACHA_PROT_WRITE;
+    const uint64_t known_flags = PACHA_MMAP_FIXED |
+        PACHA_MMAP_FIXED_NOREPLACE | PACHA_MMAP_SHARED |
+        PACHA_MMAP_NORESERVE;
+    struct gpud_drm_mapping *mapping = find_mapping(service, request->offset);
+    const struct gpud_drm_file *file = find_file(service, request->handle);
+    if (!mapping || mapping->handle != request->handle || mapping->owner_closed ||
+        !file || file->state != GPUD_DRM_FILE_OPEN ||
+        !request->length || request->length > mapping->length ||
+        request->prot & ~known_prot || request->flags & ~known_flags ||
+        !(request->flags & PACHA_MMAP_SHARED) ||
+        ((request->prot & PACHA_PROT_READ) &&
+            !(mapping->rights & KB2_GPU_SPAN_RIGHT_READ)) ||
+        ((request->prot & PACHA_PROT_WRITE) &&
+            !(mapping->rights & KB2_GPU_SPAN_RIGHT_WRITE)))
+        return -EINVAL;
+    struct gpud_drm_object_lease *lease = empty_object_lease(service);
+    if (!lease)
+        return -EMFILE;
+    const uint64_t lease_rights = PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    struct pacha_ipc_channel_pair pair = {.a = -1, .b = -1};
+    int error = pacha_ipc_channel_create(
+        &pair, lease_rights, PACHA_FD_FLAG_CLOEXEC);
+    if (error)
+        return error;
+    uint64_t view_rights = PACHA_FD_RIGHT_CLOSE;
+    if (mapping->rights & KB2_GPU_SPAN_RIGHT_READ)
+        view_rights |= PACHA_FD_RIGHT_MAP_READ;
+    if (mapping->rights & KB2_GPU_SPAN_RIGHT_WRITE)
+        view_rights |= PACHA_FD_RIGHT_MAP_WRITE;
+    transfer->fds[0] = (struct pacha_ipc_fd){
+        .fd = (uint64_t)(uint32_t)mapping->view_fd,
+        .rights = view_rights,
+        .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
+    };
+    transfer->fds[1] = (struct pacha_ipc_fd){
+        .fd = (uint64_t)(uint32_t)pair.b,
+        .rights = PACHA_FD_RIGHT_CLOSE,
+        .transfer_flags = PACHA_IPC_TRANSFER_MOVE |
+            PACHA_IPC_TRANSFER_CLOEXEC | PACHA_IPC_TRANSFER_INHERIT,
+    };
+    transfer->lease = lease;
+    transfer->object_id = mapping->id;
+    transfer->owner_fd = pair.a;
+    transfer->client_fd = pair.b;
+    transfer->count = 2;
+    *result = mapping->length;
+    return 0;
+}
+
+static int cancel_reply_transfer(struct gpud_drm_service *service,
+    struct gpud_drm_reply_transfer *transfer) {
+    int error = 0;
+    if (transfer->owner_fd >= 16)
+        error = pacha_fd_close(transfer->owner_fd);
+    if (transfer->client_fd >= 16) {
+        int closed = pacha_fd_close(transfer->client_fd);
+        if (!error)
+            error = closed;
+    }
+    if (!transfer->lease && transfer->object_id) {
+        struct gpud_drm_prime *prime = find_prime(
+            service, transfer->object_id);
+        if (prime) {
+            int released = release_prime(service, prime);
+            if (!error)
+                error = released;
+        }
+    }
+    *transfer = (struct gpud_drm_reply_transfer){
+        .owner_fd = -1, .client_fd = -1};
+    return error;
+}
+
+static void finish_reply_transfer(struct gpud_drm_reply_transfer *transfer) {
+    if (transfer->lease)
+        *transfer->lease = (struct gpud_drm_object_lease){
+            .object_id = transfer->object_id,
+            .fd = transfer->owner_fd,
+        };
+    *transfer = (struct gpud_drm_reply_transfer){
+        .owner_fd = -1, .client_fd = -1};
+}
+
 static int dispatch(struct gpud_drm_service *service,
-    const pacha_service_envelope_t *header, void *payload, uint64_t *result) {
+    const pacha_service_envelope_t *header, void *payload, uint64_t *result,
+    struct gpud_drm_reply_transfer *transfer) {
     uint64_t generation = service->files.generation;
     size_t count = service->received.fd_count;
     if (service->files.terminal_error)
@@ -141,10 +754,10 @@ static int dispatch(struct gpud_drm_service *service,
     if (service->correlation == UINT64_MAX)
         return -EOVERFLOW;
     ++service->correlation;
-    if (header->op == DRMD_OP_HELLO)
+    if (header->op == GPUD_DRM_OP_HELLO)
         return header->payload_size || count != 2 ? -EINVAL : (*result = 1, 0);
-    if (header->op == DRMD_OP_OPEN_NODE) {
-        if (header->payload_size != sizeof(drmd_open_request_t) || count != 3 ||
+    if (header->op == GPUD_DRM_OP_OPEN_NODE) {
+        if (header->payload_size != sizeof(gpud_drm_open_request_t) || count != 3 ||
             !valid_fd(service->received.fds[1].fd, PACHA_FD_KIND_CHANNEL,
                 PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE, 0))
             return -EINVAL;
@@ -165,16 +778,70 @@ static int dispatch(struct gpud_drm_service *service,
         }
         return error;
     }
-    if (header->op == DRMD_OP_HANDLE_IOCTL) {
-        if (count != 2 || header->payload_size != sizeof(drmd_ioctl_request_t))
+    if (header->op == GPUD_DRM_OP_HANDLE_IOCTL) {
+        const gpud_drm_ioctl_request_t *request = payload;
+        size_t transferred = !!request->aux_size +
+            !!(request->fd_flags & GPUD_DRM_IOCTL_FD_INPUT_WAIT) +
+            !!(request->fd_flags & GPUD_DRM_IOCTL_FD_OUTPUT_NOTIFY);
+        if (header->payload_size != sizeof(*request) ||
+            (request->fd_flags & ~GPUD_DRM_IOCTL_FD_MASK) ||
+            count != 2 + transferred)
             return -EINVAL;
         return ioctl_request(service, payload);
     }
-    if (header->op == DRMD_OP_HANDLE_CLOSE || header->op == DRMD_OP_HANDLE_DUP) {
-        const drmd_handle_request_t *request = payload;
+    if (header->op == GPUD_DRM_OP_HANDLE_MMAP) {
+        const gpud_drm_mmap_request_t *request = payload;
+        if (header->payload_size != sizeof(*request) || count != 2)
+            return -EINVAL;
+        return mmap_request(service, request, transfer, result);
+    }
+    if (header->op == GPUD_DRM_OP_HANDLE_POLL) {
+        const gpud_drm_handle_request_t *request = payload;
+        if (header->payload_size != sizeof(*request) || count != 2 ||
+            request->arg0 > UINT32_MAX || request->arg1 || request->arg2)
+            return -EINVAL;
+        return event_request(service, header->op, payload, result);
+    }
+    if (header->op == GPUD_DRM_OP_HANDLE_READ) {
+        const gpud_drm_read_request_t *request = payload;
+        if (header->payload_size != sizeof(*request) || count != 2 ||
+            !request->capacity || request->capacity > GPUD_DRM_EVENT_READ_BYTES ||
+            request->data_size)
+            return -EINVAL;
+        return event_request(service, header->op, payload, result);
+    }
+    if (header->op == GPUD_DRM_OP_PRIME_EXPORT) {
+        if (header->payload_size != sizeof(gpud_drm_prime_export_request_t) ||
+            count != 2)
+            return -EINVAL;
+        return prime_export_request(service, payload, transfer, result);
+    }
+    if (header->op == GPUD_DRM_OP_PRIME_IMPORT) {
+        const gpud_drm_prime_import_request_t *request = payload;
+        if (header->payload_size != sizeof(*request))
+            return -EINVAL;
+        if (!request->token || count == 3)
+            return -EOPNOTSUPP;
+        if (count != 2)
+            return -EINVAL;
+        return prime_import_request(service, request, result);
+    }
+    if (header->op == GPUD_DRM_OP_PRIME_RELEASE ||
+        header->op == GPUD_DRM_OP_PRIME_ACQUIRE) {
+        const gpud_drm_prime_token_request_t *request = payload;
+        const size_t expected = header->op == GPUD_DRM_OP_PRIME_ACQUIRE ? 3 : 2;
+        if (header->payload_size != sizeof(*request) || !request->token ||
+            count != expected)
+            return -EINVAL;
+        return header->op == GPUD_DRM_OP_PRIME_ACQUIRE ?
+            prime_acquire_request(service, request->token) :
+            prime_release_request(service, request->token);
+    }
+    if (header->op == GPUD_DRM_OP_HANDLE_CLOSE || header->op == GPUD_DRM_OP_HANDLE_DUP) {
+        const gpud_drm_handle_request_t *request = payload;
         if (header->payload_size != sizeof(*request) || request->arg0 || request->arg1 || request->arg2)
             return -EINVAL;
-        if (header->op == DRMD_OP_HANDLE_DUP) {
+        if (header->op == GPUD_DRM_OP_HANDLE_DUP) {
             if (count != 2 && count != 3)
                 return -EOPNOTSUPP;
             struct gpud_drm_watch *watch = NULL;
@@ -205,9 +872,15 @@ static int dispatch(struct gpud_drm_service *service,
             return -EOPNOTSUPP;
         int error = gpud_drm_file_close(
             &service->files, generation, request->handle);
+        const struct gpud_drm_file *file =
+            error ? NULL : find_file(service, request->handle);
+        if (!error && file && file->state == GPUD_DRM_FILE_DRAINING)
+            close_mapping_owner(service, request->handle);
         if (!error)
             error = retire_owner_watch(service, request->handle);
-        return error ? error : close_draining(service);
+        if (!error)
+            error = close_draining(service);
+        return error ? error : release_closed_objects(service);
     }
     return -EOPNOTSUPP;
 }
@@ -220,6 +893,10 @@ size_t gpud_drm_service_collect_wait_sources(
     for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX && count < capacity; ++i)
         if (service->watches[i].handle && service->watches[i].fd >= 16)
             fds[count++] = service->watches[i].fd;
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX && count < capacity; ++i)
+        if (service->object_leases[i].object_id &&
+            service->object_leases[i].fd >= 16)
+            fds[count++] = service->object_leases[i].fd;
     return count;
 }
 
@@ -243,8 +920,12 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
             &service->files, service->files.generation, handle);
         const struct gpud_drm_file *file = error ? NULL : find_file(service, handle);
         int last = file && file->state == GPUD_DRM_FILE_DRAINING;
+        if (!error && last)
+            close_mapping_owner(service, handle);
         if (!error)
             error = close_draining(service);
+        if (!error)
+            error = release_closed_objects(service);
         if (error)
             return service->error = error;
         if (!transferred && last && !find_file(service, handle))
@@ -252,7 +933,90 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
                 (unsigned long long)handle,
                 (unsigned long long)service->files.generation);
     }
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i) {
+        struct gpud_drm_object_lease *lease = &service->object_leases[i];
+        if (!lease->object_id || lease->fd < 16)
+            continue;
+        struct pacha_pollfd poll = {
+            .fd = lease->fd, .events = PACHA_FD_EVENT_HANGUP};
+        if (pacha_fd_poll(&poll, 1) <= 0 ||
+            !(poll.revents & PACHA_FD_EVENT_HANGUP))
+            continue;
+        uint64_t object_id = lease->object_id;
+        int closed = pacha_fd_close(lease->fd);
+        if (closed)
+            return service->error = gpud_drm_files_fault(
+                &service->files, service->files.generation, -EIO);
+        memset(lease, 0, sizeof(*lease));
+        struct gpud_drm_mapping *mapping = find_mapping(service, object_id);
+        struct gpud_drm_prime *prime = find_prime(service, object_id);
+        if (!mapping && !prime)
+            return service->error = gpud_drm_files_fault(
+                &service->files, service->files.generation, -EPROTO);
+        if (mapping && mapping->owner_closed &&
+            !object_has_leases(service, object_id)) {
+            int error = release_mapping(service, mapping);
+            if (error)
+                return service->error = gpud_drm_files_fault(
+                    &service->files, service->files.generation, error);
+        }
+        if (prime && prime->owner_closed &&
+            !object_has_leases(service, object_id)) {
+            int error = release_prime(service, prime);
+            if (error)
+                return service->error = gpud_drm_files_fault(
+                    &service->files, service->files.generation, error);
+        }
+    }
     return 0;
+}
+
+int gpud_drm_service_retire_mappings(struct gpud_drm_service *service) {
+    if (!service)
+        return -EINVAL;
+    int first_error = 0;
+    for (size_t i = 0; i < GPUD_DRM_OBJECT_LEASES_MAX; ++i) {
+        struct gpud_drm_object_lease *lease = &service->object_leases[i];
+        if (lease->fd >= 16) {
+            int error = pacha_fd_close(lease->fd);
+            if (error && !first_error)
+                first_error = error;
+        }
+        memset(lease, 0, sizeof(*lease));
+    }
+    for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i) {
+        struct gpud_drm_mapping *mapping = &service->mappings[i];
+        if (mapping->view_fd >= 16) {
+            int error = pacha_vmo_revoke(mapping->view_fd);
+            if (error && !first_error)
+                first_error = error;
+            /* A successful revoke already removed the caller's FD. */
+            if (error) {
+                int closed = pacha_fd_close(mapping->view_fd);
+                if (closed && !first_error)
+                    first_error = closed;
+            }
+        }
+        memset(mapping, 0, sizeof(*mapping));
+    }
+    for (size_t i = 0; i < GPUD_DRM_PRIMES_MAX; ++i) {
+        struct gpud_drm_prime *prime = &service->primes[i];
+        if (prime->view_fd >= 16) {
+            int error = pacha_vmo_revoke(prime->view_fd);
+            if (error && !first_error)
+                first_error = error;
+            if (error) {
+                int closed = pacha_fd_close(prime->view_fd);
+                if (closed && !first_error)
+                    first_error = closed;
+            }
+        }
+        memset(prime, 0, sizeof(*prime));
+    }
+    int error = ph_ipc_packet_release(&service->gpu.attachment);
+    if (error && !first_error)
+        first_error = error;
+    return first_error;
 }
 
 int gpud_drm_service_receive(struct gpud_drm_service *service) {
@@ -269,44 +1033,64 @@ int gpud_drm_service_receive(struct gpud_drm_service *service) {
             -EAGAIN : (service->error = -EIO);
     service->received.fd_count = message.fd_count;
     int error = -EPROTO;
+    struct gpud_drm_reply_transfer transfer = {
+        .owner_fd = -1, .client_fd = -1};
     if (message.fd_count < 2)
         goto cleanup;
     uint64_t page_fd = message.fds[0].fd, reply_fd = message.fds[message.fd_count - 1].fd;
     if (!valid_fd(page_fd, PACHA_FD_KIND_VMO,
-            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE, DRMD_PAGE_BYTES) ||
+            PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE, GPUD_DRM_PAGE_BYTES) ||
         !valid_fd(reply_fd, PACHA_FD_KIND_REPLY, PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0))
         goto cleanup;
-    long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, page_fd, 0, DRMD_PAGE_BYTES,
+    long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, page_fd, 0, GPUD_DRM_PAGE_BYTES,
         PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
     if (address < 4096)
         goto cleanup;
     service->page = (void *)(uintptr_t)address;
     pacha_service_envelope_t header, response;
-    union { drmd_ioctl_request_t ioctl; drmd_open_request_t open; drmd_handle_request_t handle; } payload;
+    union {
+        gpud_drm_ioctl_request_t ioctl;
+        gpud_drm_open_request_t open;
+        gpud_drm_handle_request_t handle;
+        gpud_drm_mmap_request_t mmap;
+        gpud_drm_read_request_t read;
+    } payload;
     memcpy(&header, service->page, sizeof(header));
     int status = -EINVAL;
     uint64_t result = 0;
     uint32_t response_size = 0;
     if (message.word0 == PACHA_SERVICE_REQUEST_MAGIC && !message.word1 && !message.word2 &&
-        message.word3 == header.request_id && pacha_service_request_is_valid(&header, DRMD_SERVICE_ID) &&
+        message.word3 == header.request_id && pacha_service_request_is_valid(&header, GPUD_DRM_SERVICE_ID) &&
         header.flags == (header.payload_size ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0) &&
         !header.fd_count && !header.reserved0 && !header.reserved1 && header.payload_size <= sizeof(payload)) {
         memcpy(&payload, (unsigned char *)service->page + sizeof(header), header.payload_size);
-        status = dispatch(service, &header, &payload, &result);
-        if (!status && header.op == DRMD_OP_HANDLE_IOCTL) {
-            response_size = sizeof(payload.ioctl);
+        status = dispatch(service, &header, &payload, &result, &transfer);
+        if (!status && (header.op == GPUD_DRM_OP_HANDLE_IOCTL ||
+                header.op == GPUD_DRM_OP_HANDLE_READ)) {
+            response_size = header.op == GPUD_DRM_OP_HANDLE_IOCTL ?
+                sizeof(payload.ioctl) : sizeof(payload.read);
             memcpy((unsigned char *)service->page + sizeof(header), &payload, response_size);
         }
     }
-    pacha_service_reply_init(&response, &header, status, PACHA_SERVICE_ERROR_DRMD_DRM,
+    pacha_service_reply_init(&response, &header, status, PACHA_SERVICE_ERROR_GPUD_DRM,
         status ? 0 : result, response_size);
     memcpy(service->page, &response, sizeof(response));
     struct pacha_ipc_msg reply = {.word0 = PACHA_SERVICE_REPLY_MAGIC,
-        .word1 = (uint64_t)status, .word2 = status ? 0 : result, .word3 = header.request_id};
-    error = pacha_syscall2(PACHA_IPC_SYSCALL_REPLY, reply_fd, (uintptr_t)&reply) ? -EIO : 0;
+        .word1 = (uint64_t)status, .word2 = status ? 0 : result,
+        .word3 = header.request_id,
+        .fds = transfer.count ? transfer.fds : NULL,
+        .fd_count = transfer.count};
+    error = pacha_ipc_reply((int)reply_fd, &reply) ? -EIO : 0;
+    if (!error && transfer.count)
+        finish_reply_transfer(&transfer);
 cleanup:
+    if (transfer.count) {
+        int canceled = cancel_reply_transfer(service, &transfer);
+        if (canceled)
+            error = canceled;
+    }
     if (service->page) {
-        if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP, (uintptr_t)service->page, DRMD_PAGE_BYTES))
+        if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP, (uintptr_t)service->page, GPUD_DRM_PAGE_BYTES))
             error = -EIO;
         else
             service->page = NULL;

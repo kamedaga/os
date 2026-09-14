@@ -17,11 +17,12 @@ struct ph_gpu_session_service {
     struct gpud_gpu_sessions *sessions;
     uint64_t client_id, session_id, file_cookie, correlation, command_count;
     uint64_t last_control;
-    uint32_t opcode, status;
+    uint32_t opcode, status, node_type;
     int acquired;
-    int (*open)(struct kobox_linux_drm_service *, uint64_t *);
+    int (*open)(struct kobox_linux_drm_service *, uint32_t, uint64_t *);
     int (*file)(struct kobox_linux_drm_service *, uint64_t, struct kobox_linux_drm_file **);
     int (*close)(struct kobox_linux_drm_service *, uint64_t);
+    int (*unmap)(struct kobox_linux_drm_service *, uint64_t);
 };
 
 int ph_gpu_session_service_init(struct ph_gpu_session_service *service,

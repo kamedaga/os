@@ -132,7 +132,7 @@ int filed_dispatch_exec_path(
         FILED_EXEC_TRANSFER_PROCESS_FD |
         FILED_EXEC_DEFER_START |
         FILED_EXEC_SERVICE_NETD | FILED_EXEC_SERVICE_TERMD |
-        FILED_EXEC_SERVICE_DRMD | FILED_EXEC_SERVICE_INPUTD;
+        FILED_EXEC_SERVICE_GPUD_DRM | FILED_EXEC_SERVICE_INPUTD;
     const uint64_t exec_flags = exec->flags;
     int64_t reply_status = -22;
     int process_fd = -1;

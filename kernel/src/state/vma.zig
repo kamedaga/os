@@ -1604,6 +1604,9 @@ pub fn createVmaWithRetainedVmo(
     const vmo_end = try @TypeOf(self.*).checkedEnd(vmo_offset, size_bytes);
     if (vmo_end > vmo.size_bytes) return KernelError.InvalidState;
     if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
+    if (vmo.kind == .page_view and
+        (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
 
     const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
     if (try @TypeOf(self.*).vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
@@ -1999,6 +2002,9 @@ pub fn prepareFixedFdMmapIntoProcess(
     if (vmo_end > vmo.size_bytes or !@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) {
         return KernelError.InvalidState;
     }
+    if (vmo.kind == .page_view and
+        (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
     // Shared/default mappings retain the same fully backed pages as mmapFd.
     // Unlike anonymous faults, file-VMO faults cannot allocate absent pages.
     // Reject sparse backing before reserving slots or removing the old view.

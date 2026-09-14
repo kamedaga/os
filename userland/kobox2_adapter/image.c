@@ -343,7 +343,7 @@ static void allocate_image_memory(struct ph_image *image) {
     const uint64_t rights = PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC | PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WRITE |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_REVOKE;
+        PACHA_FD_RIGHT_REVOKE | PACHA_FD_RIGHT_SHARE | PACHA_FD_RIGHT_INSPECT;
 
     image->ram_fd = (int)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, PH_RAM_SIZE, rights, 0);
     PH_CHECK(image->ram_fd >= 16);

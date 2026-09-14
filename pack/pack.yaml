@@ -386,11 +386,6 @@ apps:
       path: "tests/fixtures/sway_input.sh"
     out: "SWAYM57.SH"
     rootfs: "/cmd/sway_input.sh"
-  sway_endurance_script:
-    file:
-      path: "tests/fixtures/sway_endurance.sh"
-    out: "SWAYM58.SH"
-    rootfs: "/cmd/sway_endurance.sh"
   sway_socket_repeat_script:
     file:
       path: "tests/fixtures/sway_socket_repeat.sh"
@@ -442,7 +437,7 @@ apps:
         - "tools/build_wsl_wayland_animation_bench.sh"
         - "tools/build_wsl_alpine_sway.sh"
         - "userland/fixtures/src/wsl_musl/lpr_wayland_animation_bench.c"
-        - "userland/drmd/include/drmd/kms_abi.h"
+        - "userland/gpud/include/gpud/drm_kms_abi.h"
         - "userland/inputd/include/inputd/ipc_protocol.h"
     out: "P4WLBEN.ELF"
     rootfs: "/cmd/lpr_wayland_animation_bench.elf"
@@ -905,7 +900,7 @@ apps:
       path: ".artifacts/lpr-linux-x86_64.so"
       rebuild: ["bash", "userland/personality/linux/build-lpr.sh", ".artifacts/lpr-linux-x86_64.so"]
       input:
-        - "userland/drmd/include"
+        - "userland/gpud/include"
         - "userland/filed/include/filed/flags.h"
         - "userland/personality/include"
         - "userland/personality/linux/decoder"
@@ -1456,6 +1451,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_mesa_cube_smoke.c"
     out: "LPRMCUBE.ELF"
     rootfs: "/cmd/lpr_mesa_cube_smoke.elf"
+  lpr_mesa_multi_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_mesa_multi_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_mesa_inventory.sh", ".artifacts/userland-fixtures/lpr_mesa_multi_smoke.elf", "userland/fixtures/src/wsl_musl/lpr_mesa_multi_smoke.c"]
+      input:
+        - "tools/build_wsl_mesa_inventory.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_mesa_multi_smoke.c"
+    out: "LPRMMULT.ELF"
+    rootfs: "/cmd/lpr_mesa_multi_smoke.elf"
   lpr_drm_page_flip_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_drm_page_flip_smoke.elf"
@@ -1838,6 +1843,18 @@ apps:
       rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/drivers/gpu/drm/virtio/virtio-gpu.ko || bash userland/gpud/build-package.sh"]
     out: "GPUVIRGL.KO"
     rootfs: "/srv/kobox2/modules/virtio-gpu.ko"
+  gpud_drm_mapping:
+    file:
+      path: ".artifacts/gpud-production-modules/kobox/gem/drm_mapping.ko"
+      rebuild: ["bash", "-lc", "test -f .artifacts/gpud-production-modules/kobox/gem/drm_mapping.ko || bash userland/gpud/build-package.sh"]
+      input:
+        - "userland/gpud/build-package.sh"
+        - "kobox2/linux-sandbox/kobox/boot/build_gem_modules.py"
+        - "kobox2/linux-sandbox/kobox/boot/drm_file.h"
+        - "kobox2/linux-sandbox/kobox/gem/Makefile"
+        - "kobox2/linux-sandbox/kobox/gem/drm_mapping.c"
+    out: "GPUMAP.KO"
+    rootfs: "/srv/kobox2/modules/kobox-drm-mapping.ko"
   inputd:
     role: "service"
     file:

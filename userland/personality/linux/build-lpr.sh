@@ -91,7 +91,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   -I"$repo_root/userland/netd/include" \
   -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/termd/include" \
-  -I"$repo_root/userland/drmd/include" \
+  -I"$repo_root/userland/gpud/include" \
   -I"$repo_root/userland/inputd/include" \
   "$repo_root/userland/personality/linux/runtime/lpr_signal.c" \
   "$scanner_object" \

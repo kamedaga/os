@@ -20,7 +20,7 @@ int gpud_drm_open_prepare(struct gpud_drm_files *files,
                           uint64_t generation,
                           uint64_t backend_client,
                           uint64_t correlation,
-                          const drmd_open_request_t *request,
+                          const gpud_drm_open_request_t *request,
                           struct gpud_drm_control *pending,
                           unsigned char *bytes,
                           size_t capacity,
@@ -32,7 +32,12 @@ int gpud_drm_open_prepare(struct gpud_drm_files *files,
      * description/descriptor policy, never raw kernel-open flag forwarding. */
     const uint64_t access_mask = 3, read_write = 2;
     const uint64_t nonblock = 04000, largefile = 0100000, cloexec = 02000000;
-    if (request->device_minor != 128)
+    uint32_t node_type;
+    if (request->device_minor == 0)
+        node_type = KB2_GPU_NODE_PRIMARY;
+    else if (request->device_minor == 128)
+        node_type = KB2_GPU_NODE_RENDER;
+    else
         return -EOPNOTSUPP;
     if ((request->flags & access_mask) != read_write ||
         request->flags & ~(access_mask | nonblock | largefile | cloexec))
@@ -41,7 +46,7 @@ int gpud_drm_open_prepare(struct gpud_drm_files *files,
     if (capacity < size)
         return -EMSGSIZE;
     unsigned char encoded[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + KB2_GPU_SESSION_OPEN_REQUEST_SIZE];
-    kb2_gpu_session_open_t open = {.node_type = KB2_GPU_NODE_RENDER, .client_id = backend_client};
+    kb2_gpu_session_open_t open = {.node_type = node_type, .client_id = backend_client};
     if (encode_envelope(encoded, size, KB2_GPU_OPCODE_SESSION_OPEN, generation, correlation) ||
         kb2_gpu_session_open_encode(
             encoded + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, KB2_GPU_SESSION_OPEN_REQUEST_SIZE, &open))

@@ -101,7 +101,7 @@ static void run_service(void *context) {
              !report.cleanup_result && lifecycle.token);
 #if PH_SANDBOX_DEVICE
     PH_CHECK(report.device.bound && report.device.primary_major && report.device.render_major &&
-             report.device.drained && modules.count == 11 && report.device.render_opened &&
+             report.device.drained && modules.count == 12 && report.device.render_opened &&
              report.device.drm_queried &&
              report.device.render_closed);
     PH_CHECK(!gpu_queue.mapping);
@@ -136,7 +136,7 @@ static void service_main(const struct kobox_linux_task_report *report, void *con
 
 void ph_main(void) {
     const struct ph_sandbox_config *config = (void *)PH_SANDBOX_CONFIG_ADDRESS;
-    PH_CHECK(config->artifact_count == (PH_SANDBOX_DEVICE ? 12u : 2u) &&
+    PH_CHECK(config->artifact_count == (PH_SANDBOX_DEVICE ? 13u : 2u) &&
              config->resource_count == (PH_SANDBOX_DEVICE ? 1u : 0u));
     PH_OK(ph_ipc_init(&bootstrap_ipc, PH_SANDBOX_CHANNEL_FD, config->identity.generation));
     PH_OK(ph_bootstrap_receiver_init(

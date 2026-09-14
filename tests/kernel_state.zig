@@ -2008,6 +2008,137 @@ test "native vmo page install rejects a bad batch without a partial write" {
     try std.testing.expectEqual(@as(?u64, null), s.nativeVmoPagePaddr(vmo, 1));
 }
 
+test "page view borrows scatter pages until its last reference closes" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const parent = try s.createNativeVmo(.anonymous, 3 * kernel.native_page_size);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{ 0x8100_0000, 0x8200_0000, 0x8300_0000 });
+
+    const view = try s.createNativePageView(parent, 2);
+    try s.installNativeVmoPages(view, 0, &.{ 0x8300_0000, 0x8100_0000 });
+    try std.testing.expectEqual(@as(?u32, 2), s.nativeVmoRefCount(parent));
+    try std.testing.expectEqual(@as(?u64, 0x8300_0000), s.nativeVmoResolvedPagePaddr(view, 0));
+    try std.testing.expectEqual(@as(?u64, 0x8100_0000), s.nativeVmoResolvedPagePaddr(view, 1));
+
+    s.releaseUnmappedAnonymousVmoPageRange(p0, parent, 0, 3, &free_list);
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    try std.testing.expectEqual(@as(?u64, 0x8200_0000), s.nativeVmoResolvedPagePaddr(parent, 1));
+
+    s.releaseNativeVmoWithFreeList(view, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(view));
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(parent));
+    try std.testing.expectEqual(@as(usize, 0), free_list.pageCount());
+    s.releaseNativeVmoWithFreeList(parent, &free_list);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(parent));
+    try std.testing.expectEqual(@as(usize, 3), free_list.pageCount());
+}
+
+test "page view mappings are shared non-executable in every map path" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    const parent = try s.createNativeVmo(.anonymous, kernel.native_page_size);
+    try s.retainNativeVmo(parent);
+    try s.installNativeVmoPages(parent, 0, &.{0x8400_0000});
+    const view = try s.createNativePageView(parent, 1);
+    try s.installNativeVmoPages(view, 0, &.{0x8400_0000});
+    const object = try s.createKernelObject(.vmo, .{ .vmo = view });
+    const fd = try s.installFd(
+        p0,
+        object,
+        fdRights(.{ .close = true, .map_read = true, .map_write = true }),
+        .{},
+        16,
+    );
+
+    try std.testing.expectError(KernelError.InvalidState, s.mmapFd(
+        p0,
+        fd,
+        0x4300_0000,
+        4096,
+        vmaProt(.{ .read = true }),
+        mmapFlags(.{ .private = true }),
+        0,
+    ));
+    try std.testing.expectError(KernelError.InvalidState, s.prepareFixedFdMmapIntoProcess(
+        p0,
+        fd,
+        p1,
+        0x4400_0000,
+        4096,
+        vmaProt(.{ .read = true }),
+        mmapFlags(.{ .fixed = true, .private = true }),
+        0,
+        &free_list,
+    ));
+    _ = try s.mmapFd(
+        p0,
+        fd,
+        0x4300_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .shared = true }),
+        0,
+    );
+    try std.testing.expectEqual(@as(u64, 0x8400_0000), (s.nativeVmaFaultMapping(p0, 0x4300_0000, true, false) orelse unreachable).paddr);
+
+    try s.munmapRangeWithFreeList(p0, 0x4300_0000, 4096, &free_list);
+    try s.closeFdWithFreeList(p0, fd, &free_list);
+    try std.testing.expectEqual(@as(?u32, 1), s.nativeVmoRefCount(parent));
+    s.releaseNativeVmoWithFreeList(parent, &free_list);
+    try std.testing.expectEqual(@as(usize, 1), free_list.pageCount());
+}
+
+test "parent revoke removes page view fds and mappings before freeing pages" {
+    var s = try initFdState();
+    var free_list = FreePageList{};
+    try free_list.appendContiguousRange(0, 0x8500_0000, 2);
+    const original_free = free_list.pageCount();
+    const parent_fd = try s.createAnonymousVmoFdWithPages(
+        p0,
+        8192,
+        fdRights(.{
+            .close = true,
+            .share = true,
+            .revoke = true,
+            .map_read = true,
+            .map_write = true,
+        }),
+        .{},
+        16,
+        &free_list,
+    );
+    const parent = s.nativeVmoRefForFd(p0, parent_fd) orelse unreachable;
+    const second_page = s.nativeVmoResolvedPagePaddr(parent, 1) orelse unreachable;
+    const view = try s.createNativePageView(parent, 1);
+    try s.installNativeVmoPages(view, 0, &.{second_page});
+    const object = try s.createKernelObject(.vmo, .{ .vmo = view });
+    const view_fd = try s.installFd(
+        p1,
+        object,
+        fdRights(.{ .close = true, .map_read = true, .map_write = true }),
+        .{},
+        16,
+    );
+    _ = try s.mmapFd(
+        p1,
+        view_fd,
+        0x4500_0000,
+        4096,
+        vmaProt(.{ .read = true, .write = true }),
+        mmapFlags(.{ .shared = true }),
+        0,
+    );
+
+    _ = try s.revokeVmoFdWithFreeList(p0, parent_fd, &free_list, NoopUnmapper{});
+    try std.testing.expect(s.fdEntryConst(p0, parent_fd) == null);
+    try std.testing.expect(s.fdEntryConst(p1, view_fd) == null);
+    try std.testing.expect(s.vmaEntryConst(p1, 0x4500_0000) == null);
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(view));
+    try std.testing.expectEqual(@as(?u32, null), s.nativeVmoRefCount(parent));
+    try std.testing.expectEqual(original_free, free_list.pageCount());
+}
+
 test "anonymous vmo fd maps through vma ledger without page capability install" {
     var s = try initFdState();
     const rights = fdRights(.{

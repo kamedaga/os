@@ -62,7 +62,7 @@ if [[ "${1:-}" == --device ]]; then
     >>"$out/package-inputs.sha256"
 fi
 "$compiler" "${common[@]}" "${device_flags[@]}" -I "$repo_root/kobox2/include" \
-  -I "$repo_root/userland/drmd/include" \
+  -I "$repo_root/userland/gpud/include" \
   -I "$repo_root/userland/libcapsule/include" -DSEED0_BOOTFS_NO_DIAGNOSTICS \
   "${parent[@]}" "${shared[@]}" -Wl,-e,_start,-z,noexecstack -o "$out/parent.elf"
 # Keep transitive project headers as well as the directly compiled files.

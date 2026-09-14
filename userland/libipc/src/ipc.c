@@ -297,6 +297,18 @@ int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
 
+int pacha_vmo_create_page_view(int parent_fd, const uint64_t *page_indices,
+                               uint64_t page_count, uint64_t rights, uint32_t flags) {
+    return pacha_fd_result_to_int(pacha_syscall5(
+        PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
+        (uint64_t)(uint32_t)parent_fd,
+        (uint64_t)(uintptr_t)page_indices,
+        page_count,
+        rights,
+        flags
+    ));
+}
+
 int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall4(
         PACHA_CAPSULE_SYSCALL_DMA_POOL_CREATE,

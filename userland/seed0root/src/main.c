@@ -3021,7 +3021,7 @@ static int seed0root_launch_root_services(
         INPUT_MODERN = 0x1052,
     };
     int status = 0;
-    int termd_endpoint = -1, netd_endpoint = -1, drmd_endpoint = -1;
+    int termd_endpoint = -1, netd_endpoint = -1, gpud_drm_endpoint = -1;
     int inputd_endpoint = -1;
     struct pacha_ipc_channel_pair ready = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair gpud_control = { .a = -1, .b = -1 };
@@ -3091,8 +3091,8 @@ static int seed0root_launch_root_services(
         status = gpu < 0 ? -19 : -5;
         goto out;
     }
-    drmd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
-    if (drmd_endpoint < 16) { status = -5; goto out; }
+    gpud_drm_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (gpud_drm_endpoint < 16) { status = -5; goto out; }
     struct gpud_boot_config gpud_cfg;
     memset(&gpud_cfg, 0, sizeof(gpud_cfg));
     gpud_cfg.magic = GPUD_BOOT_CONFIG_MAGIC;
@@ -3105,7 +3105,7 @@ static int seed0root_launch_root_services(
     const struct pacha_process_fd_grant gpud_grants[] = {
         PACHA_LAUNCH_GRANT(devices->fds[gpu], SEED0ROOT_SERVICE_DEVICE_FD,
             PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
-        PACHA_LAUNCH_GRANT(drmd_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
+        PACHA_LAUNCH_GRANT(gpud_drm_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
         PACHA_LAUNCH_GRANT(ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL),
         PACHA_LAUNCH_GRANT(gpud_control.b, SEED0ROOT_SERVICE_NETD_FD,
             PACHA_LAUNCH_SERVER | PACHA_FD_RIGHT_SEND),
@@ -3117,7 +3117,7 @@ static int seed0root_launch_root_services(
     (void)pacha_fd_close(gpud_control.b); gpud_control.b = -1;
     if (status != 0) goto out;
     status = seed0root_register_service_endpoint(filed_endpoint_fd,
-        FILED_OP_SERVICE_SET_DRMD_DRM, drmd_endpoint, 0x5eed2006u);
+        FILED_OP_SERVICE_SET_GPUD_DRM, gpud_drm_endpoint, 0x5eed2006u);
     if (status != 0) goto out;
     { const int ready_fd = ready.a; ready.a = -1;
       status = seed0root_wait_service_ready(ready_fd, GPUD_BOOT_READY_MAGIC, "gpud"); }
@@ -3188,7 +3188,7 @@ static int seed0root_launch_root_services(
     { const int ready_fd = ready.a; ready.a = -1;
       status = seed0root_wait_service_ready(ready_fd, INPUTD_BOOT_READY_MAGIC, "inputd"); }
     if (status != 0) goto out;
-    printf("[seed0root] rootfs services ready termd -> netd -> drmd -> inputd\n");
+    printf("[seed0root] rootfs services ready termd -> netd -> gpud -> inputd\n");
     fflush(stdout);
 #if defined(SEED0ROOT_LAUNCH_GRANT_TEST) && SEED0ROOT_LAUNCH_GRANT_TEST
     {
@@ -3240,7 +3240,7 @@ out:
     if (gpud_control.a >= 16) (void)pacha_fd_close(gpud_control.a);
     if (gpud_control.b >= 16) (void)pacha_fd_close(gpud_control.b);
     if (inputd_endpoint >= 16) (void)pacha_fd_close(inputd_endpoint);
-    if (drmd_endpoint >= 16) (void)pacha_fd_close(drmd_endpoint);
+    if (gpud_drm_endpoint >= 16) (void)pacha_fd_close(gpud_drm_endpoint);
     if (netd_endpoint >= 16) (void)pacha_fd_close(netd_endpoint);
     if (termd_endpoint >= 16) (void)pacha_fd_close(termd_endpoint);
     seed0root_close_root_devices(devices);

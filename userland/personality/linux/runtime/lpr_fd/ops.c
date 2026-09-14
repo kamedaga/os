@@ -118,7 +118,7 @@ static int64_t lpr_ops_dmabuf_close(void *state)
     const int transfer_lease =
         (dmabuf->reserved0 & LPR_BACKEND_TRANSFER_LEASE) != 0;
     const int64_t release_status = !transfer_lease && dmabuf->token != 0 ?
-        lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, dmabuf->token) : 0;
+        lpr_drm_prime_ref(GPUD_DRM_OP_PRIME_RELEASE, dmabuf->token) : 0;
     const int64_t lease_status = dmabuf->lease_fd.raw >= 16 ?
         lpr_close_native_fd_if_open((uint64_t)(uint32_t)dmabuf->lease_fd.raw) : 0;
     return close_status != 0 ? close_status :
@@ -369,6 +369,40 @@ int lpr_fd_transfer_prepare(
         *out_capability_count = 2;
         return 0;
     }
+    if (pin->ops_id == LPR_FD_OPS_DMABUF) {
+        const lpr_dmabuf_backend_t *dmabuf = pin->state;
+        if (dmabuf->token == 0 || dmabuf->native.raw < 16)
+            return -LPR_LINUX_EOPNOTSUPP;
+        if (capability_fds == 0 || capability_capacity < 2)
+            return -LPR_LINUX_EMSGSIZE;
+        const int native_fd =
+            lpr_transfer_duplicate_capability(dmabuf->native.raw);
+        if (native_fd < 0) return native_fd;
+        int lease_fd = -1;
+        int remote_lease_fd = -1;
+        int status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        if (status == 0)
+            status = (int)lpr_drm_prime_transfer_acquire(
+                dmabuf->token, remote_lease_fd);
+        if (status != 0) {
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)native_fd);
+            if (lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)lease_fd);
+            if (remote_lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)remote_lease_fd);
+            return status;
+        }
+        item->object = dmabuf->token;
+        item->flags = dmabuf->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count = 2;
+        capability_fds[0] = native_fd;
+        capability_fds[1] = lease_fd;
+        *out_capability_count = 2;
+        return 0;
+    }
     if (pin->ops_id == LPR_FD_OPS_SYNC_FILE) {
         const lpr_sync_file_backend_t *sync_file = pin->state;
         if (sync_file->wait_fd.raw < 16 || capability_fds == 0 ||
@@ -459,6 +493,31 @@ int lpr_fd_transfer_stage_batch(
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
+        } else if (item->provider == LPR_FD_OPS_DMABUF) {
+            struct pacha_fd_info view;
+            struct pacha_fd_info lease;
+            const uint64_t view_rights = PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+            const uint64_t lease_rights = PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE;
+            lpr_memset(&view, 0, sizeof(view));
+            lpr_memset(&lease, 0, sizeof(lease));
+            if (item->capability_count != 2 || item_capabilities[0] < 16 ||
+                item_capabilities[1] < 16 ||
+                !lpr_native_fd_info(
+                    (uint64_t)(uint32_t)item_capabilities[0], &view) ||
+                !lpr_native_fd_info(
+                    (uint64_t)(uint32_t)item_capabilities[1], &lease) ||
+                view.kind != PACHA_FD_KIND_VMO || !view.size ||
+                view.rights != view_rights ||
+                lease.kind != PACHA_FD_KIND_CHANNEL || lease.size ||
+                (lease.rights & lease_rights) != lease_rights ||
+                (item->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDWR)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
         } else if (item->provider == LPR_FD_OPS_SYNC_FILE) {
             if (item->object != 1 || item->capability_count != 1 ||
                 item_capabilities[0] < 16)
@@ -516,6 +575,26 @@ int lpr_fd_transfer_stage_batch(
             sync_file->active = 1;
             sync_file->flags = (uint32_t)linux_flags;
             sync_file->wait_fd.raw = item_capabilities[0];
+        } else if (item->provider == LPR_FD_OPS_DMABUF) {
+            struct pacha_fd_info view;
+            lpr_memset(&view, 0, sizeof(view));
+            if (!lpr_native_fd_info(
+                    (uint64_t)(uint32_t)item_capabilities[0], &view)) {
+                status = -LPR_LINUX_EBADF;
+                (void)lpr_backend_state_free(
+                    states[prepared_count], state_bytes);
+                states[prepared_count] = 0;
+                break;
+            }
+            lpr_dmabuf_backend_t *dmabuf = states[prepared_count];
+            dmabuf->active = 1;
+            dmabuf->writable = 1;
+            dmabuf->reserved0 |= LPR_BACKEND_TRANSFER_LEASE;
+            dmabuf->flags = (uint32_t)linux_flags;
+            dmabuf->token = handle;
+            dmabuf->size = view.size;
+            dmabuf->native.raw = item_capabilities[0];
+            dmabuf->lease_fd.raw = item_capabilities[1];
         } else {
             lpr_drm_backend_t *drm = states[prepared_count];
             drm->active = 1;

@@ -26,12 +26,6 @@ MODULE_ORDERS = {
         "linux_virtio_pci.ko", "linux_tty_core.ko", "linux_tty_n_null.ko",
         "linux_virtio_console.ko",
     ],
-    "userland/drmd/src/drm_island.c": [
-        "linux_virtio.ko", "linux_virtio_ring.ko",
-        "linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_legacy_dev.ko",
-        "linux_virtio_pci.ko", "linux_virtio_dma_buf.ko",
-        "linux_virtio_gpu.ko",
-    ],
     "userland/inputd/src/input_island.c": [
         "linux_virtio.ko", "linux_virtio_ring.ko",
         "linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_legacy_dev.ko",

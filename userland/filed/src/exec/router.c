@@ -27,7 +27,7 @@ int filed_exec_build_grants(struct filed_runtime *runtime,
     }
     const int linux = (request->flags & FILED_EXEC_LINUX_LPR) != 0;
     const uint64_t services = request->flags & (FILED_EXEC_SERVICE_NETD |
-        FILED_EXEC_SERVICE_TERMD | FILED_EXEC_SERVICE_DRMD | FILED_EXEC_SERVICE_INPUTD);
+        FILED_EXEC_SERVICE_TERMD | FILED_EXEC_SERVICE_GPUD_DRM | FILED_EXEC_SERVICE_INPUTD);
     if (services && (!linux || runtime->actor)) return -1;
     if (request->flags & FILED_EXEC_BOOTSTRAP_FD) {
         if (bootstrap_fd < 16) return -22;
@@ -45,7 +45,7 @@ int filed_exec_build_grants(struct filed_runtime *runtime,
         const struct pacha_process_fd_grant clients[] = {
             PACHA_LAUNCH_GRANT(runtime->netd_socket_endpoint_fd, FILED_EXEC_NETD_SOCKET_ENDPOINT_FD, client),
             PACHA_LAUNCH_GRANT(runtime->termd_tty_endpoint_fd, FILED_EXEC_TERMD_TTY_ENDPOINT_FD, client),
-            PACHA_LAUNCH_GRANT(runtime->drmd_drm_endpoint_fd, FILED_EXEC_DRMD_DRM_ENDPOINT_FD, client),
+            PACHA_LAUNCH_GRANT(runtime->gpud_drm_endpoint_fd, FILED_EXEC_GPUD_DRM_ENDPOINT_FD, client),
             PACHA_LAUNCH_GRANT(runtime->inputd_input_endpoint_fd, FILED_EXEC_INPUTD_INPUT_ENDPOINT_FD, client),
         };
         for (unsigned i = 0; i < sizeof(clients) / sizeof(clients[0]); ++i)

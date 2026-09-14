@@ -168,6 +168,9 @@ pub fn clearNativeVmoSlot(slot: *NativeVmoSlot) void {
 }
 
 pub fn releaseNativeVmoOwnedPages(slot: *NativeVmoSlot, free_list: *FreePageList) void {
+    // A page view borrows every page from its retained parent. Returning those
+    // pages here would put live parent memory into the PMM a second time.
+    if (slot.kind == .page_view) return;
     if (slot.has_page_store) {
         var page_index: usize = 0;
         while (page_index < slot.page_count) : (page_index += 1) {
@@ -221,6 +224,37 @@ pub fn createNativeVmoWithPageStore(
 
 pub fn createNativeVmo(self: anytype, kind: NativeVmoKind, size_bytes: u64) KernelError!NativeVmoRef {
     return self.createNativeVmoWithPageStore(kind, size_bytes, true);
+}
+
+/// Reserve a scatter view whose backing entries will be populated from one
+/// anonymous parent before publication as an FD. The returned reference owns
+/// one retain on itself; final release drops the parent retain but never frees
+/// the borrowed physical pages.
+pub fn createNativePageView(
+    self: anytype,
+    parent: NativeVmoRef,
+    page_count: usize,
+) KernelError!NativeVmoRef {
+    if (page_count == 0 or page_count > max_vmo_backing_pages)
+        return KernelError.InvalidState;
+    const parent_slot = self.nativeVmoSlotConst(parent) orelse
+        return KernelError.InvalidState;
+    if (parent_slot.kind != .anonymous or !parent_slot.parent.isNull() or
+        !parent_slot.has_page_store)
+        return KernelError.InvalidState;
+
+    const size_bytes = std.math.mul(u64, @intCast(page_count), native_page_size) catch
+        return KernelError.InvalidState;
+    const view = try self.createNativeVmo(.page_view, size_bytes);
+    try self.retainNativeVmo(view);
+    var keep_view = false;
+    errdefer if (!keep_view) self.releaseNativeVmo(view);
+    const view_slot = self.nativeVmoSlot(view) orelse
+        return KernelError.InvalidState;
+    try self.retainNativeVmo(parent);
+    view_slot.parent = parent;
+    keep_view = true;
+    return view;
 }
 
 pub fn ensureNativeVmoPageStore(slot: *NativeVmoSlot) KernelError!void {
@@ -366,7 +400,8 @@ pub fn nativeVmoHasParent(self: anytype, vmo_ref: NativeVmoRef) bool {
 }
 
 pub fn nativeVmoIsShadow(self: anytype, vmo_ref: NativeVmoRef) bool {
-    return self.nativeVmoHasParent(vmo_ref);
+    const slot = self.nativeVmoSlotConst(vmo_ref) orelse return false;
+    return slot.kind == .anonymous and !slot.parent.isNull();
 }
 
 pub fn nativeVmoRefsEqual(a: NativeVmoRef, b: NativeVmoRef) bool {
@@ -639,6 +674,14 @@ pub fn releaseUnmappedAnonymousVmoPageRange(
     if (first_page >= slot.page_count or page_count > @as(usize, slot.page_count) - first_page) return;
     const release_end = first_page + page_count;
 
+    // A page view borrows parent pages without owning them. Until every view
+    // is gone, keep the parent backing intact even if its FD and VMAs have
+    // otherwise disappeared. This deliberately pins the whole parent: views
+    // are bounded and do not form a deeper tree.
+    for (self.native_vmos[0..]) |*candidate| {
+        if (directPageViewOf(candidate, vmo_ref)) return;
+    }
+
     const profile_start = smp_perf.timestamp();
     defer smp_perf.vmoElapsed(.partial_total_cycles, profile_start);
     smp_perf.vmoAdd(.partial_calls, 1);
@@ -801,6 +844,28 @@ pub fn nativeVmoMappingsOverlapPinnedUserObjects(
     return false;
 }
 
+fn directPageViewOf(slot: *const NativeVmoSlot, parent: NativeVmoRef) bool {
+    return slot.kind == .page_view and
+        slot.parent.index == parent.index and
+        slot.parent.generation == parent.generation;
+}
+
+pub fn nativeVmoTreeMappingsOverlapPinnedUserObjects(
+    self: anytype,
+    vmo_ref: NativeVmoRef,
+) bool {
+    if (self.nativeVmoMappingsOverlapPinnedUserObjects(vmo_ref)) return true;
+    for (self.native_vmos[0..], 0..) |*slot, index| {
+        if (!directPageViewOf(slot, vmo_ref)) continue;
+        const child = NativeVmoRef{
+            .index = @intCast(index),
+            .generation = slot.generation,
+        };
+        if (self.nativeVmoMappingsOverlapPinnedUserObjects(child)) return true;
+    }
+    return false;
+}
+
 pub fn revokeNativeVmoFromFdTablesWithFreeList(
     self: anytype,
     vmo_ref: NativeVmoRef,
@@ -903,6 +968,23 @@ pub fn revokeVmoFdWithFreeList(
     unmapper: anytype,
 ) KernelError!NativeVmoRef {
     const vmo_ref = try self.nativeVmoRefForRevokeFd(owner, fd);
+    // Page views cannot derive further views, so one bounded direct-child
+    // scan is the complete descendant set. Revoke children before the parent:
+    // each child final drop releases its parent retain.
+    var child_index: usize = 0;
+    while (child_index < self.native_vmos.len) : (child_index += 1) {
+        const slot = &self.native_vmos[child_index];
+        if (!directPageViewOf(slot, vmo_ref)) continue;
+        const child = NativeVmoRef{
+            .index = @intCast(child_index),
+            .generation = slot.generation,
+        };
+        try self.revokeNativeVmoFromVmaTablesWithFreeList(child, free_list, unmapper);
+        self.revokeNativeVmoFromFdTablesWithFreeList(child, free_list);
+        self.revokeNativeVmoFromIpcMessagesWithFreeList(child, free_list);
+        if (self.nativeVmoSlotConst(child) != null)
+            return KernelError.InvalidState;
+    }
     try self.revokeNativeVmoFromVmaTablesWithFreeList(vmo_ref, free_list, unmapper);
     self.revokeNativeVmoFromFdTablesWithFreeList(vmo_ref, free_list);
     self.revokeNativeVmoFromIpcMessagesWithFreeList(vmo_ref, free_list);

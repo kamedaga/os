@@ -68,7 +68,8 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
             return -EBUSY;
         }
     }
-    if (!slot) return -ENOSPC;
+    if (!slot)
+        return -ENOSPC;
     switch (protection) {
     case KOBOX_DMA_DEVICE_READ: direction = PACHA_CAPSULE_DMA_TO_DEVICE; break;
     case KOBOX_DMA_DEVICE_WRITE: direction = PACHA_CAPSULE_DMA_FROM_DEVICE; break;
@@ -105,6 +106,7 @@ int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
     const uint64_t required = PACHA_FD_RIGHT_QUERY | PACHA_FD_RIGHT_DERIVE_DMA |
         PACHA_FD_RIGHT_DMA_READ | PACHA_FD_RIGHT_DMA_WRITE | PACHA_FD_RIGHT_BUS_MASTER;
     struct pacha_capsule_info info = {0};
+    struct pacha_fd_table_info fd_table = {0};
 
     if (!dma || !config || dma->config.generation || config->device_fd < 0 ||
         config->device_fd >= PACHA_FD_TABLE_LIMIT || !config->native_device ||
@@ -118,6 +120,11 @@ int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
     int result = dma_query(config, &info);
     if (result) return result;
     if ((info.rights & required) != required) return -EACCES;
+    result = dma_native_status(pacha_syscall2(PACHA_FD_SYSCALL_TABLE,
+        PACHA_FD_TABLE_LIMIT, (uintptr_t)&fd_table));
+    if (result) return result;
+    if (fd_table.capacity != PACHA_FD_TABLE_LIMIT ||
+        fd_table.free_slots < config->mapping_capacity) return -ENOSPC;
     result = dma_native_status(pacha_syscall2(PACHA_CAPSULE_SYSCALL_DMA_SET_ENABLED,
         config->device_fd, 0));
     if (result) return result;

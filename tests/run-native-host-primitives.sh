@@ -25,7 +25,7 @@ finish() {
 trap finish EXIT
 .artifacts/bin/pacgo build kernel
 for app in pachaos_musl_libc pachaos_musl_ldso linux_lpr_runtime \
-  pachaos_capsule seed0boot storage_boot filed lpr_supervisor unixd termd netd drmd inputd; do
+  pachaos_capsule seed0boot storage_boot filed lpr_supervisor unixd termd netd gpud inputd; do
   if ! .artifacts/bin/pacgo build userland "$app" --no-rootfs >"$out_dir/build-$app.log" 2>&1; then
     tail -n 60 "$out_dir/build-$app.log"
     exit 1

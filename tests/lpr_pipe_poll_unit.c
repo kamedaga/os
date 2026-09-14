@@ -5,13 +5,15 @@
 
 static lpr_pipe_backend_t pipe_state = {.native = {.raw = 40}};
 static uint64_t space, input_events;
-static int peer_closed, calls, native_error;
+static int peer_closed, calls, native_error, drm_active;
 lpr_pipe_backend_t *lpr_pipe_backend(uint64_t fd) { return fd == 3 ? &pipe_state : NULL; }
 void *lpr_memset(void *p, int v, size_t n) { return memset(p, v, n); }
 /* Non-pipe backends are outside this focused wait-graph fixture. */
 #define INACTIVE(name) int name(uint64_t fd) { (void)fd; return 0; }
 INACTIVE(lpr_linux_tty_fd_active)
-INACTIVE(lpr_linux_drm_fd_active)
+int lpr_linux_drm_fd_active(uint64_t fd) { return drm_active && fd == 5; }
+int lpr_drm_native_wait_fd(uint64_t fd) { return fd == 5 ? 41 : -1; }
+INACTIVE(lpr_unix_socket_active)
 INACTIVE(lpr_linux_input_fd_active)
 INACTIVE(lpr_linux_sync_file_fd_active)
 INACTIVE(lpr_linux_epoll_fd_active)
@@ -70,6 +72,11 @@ int main(void)
     lpr_wait_graph_init(&graph);
     assert(lpr_wait_graph_add_native_min(&graph, 40, PACHA_FD_EVENT_WRITABLE, 58) == 0);
     assert(graph.leaves[0].revents == 58);
+    drm_active = 1;
+    lpr_wait_graph_init(&graph);
+    assert(lpr_wait_graph_add_fd(&graph, 5, 1) == 0);
+    assert(graph.leaf_count == 1 && graph.leaves[0].fd == 41);
+    assert(graph.relative_deadline_ns == LPR_DRM_EVENT_RECHECK_NS);
     puts("LPR_PIPE_POLL_UNIT=OK");
     return 0;
 }

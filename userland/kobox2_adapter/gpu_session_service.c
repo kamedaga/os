@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "gpu_session_service.h"
+#include "../gpud/gpu_channel.h"
 
 #include <errno.h>
 #include <kobox2/gpu_session.h>
@@ -43,6 +44,10 @@ int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
     if (!symbol)
         return -ENOENT;
     memcpy(&service->close, &symbol, sizeof(service->close));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_unmap");
+    if (!symbol)
+        return -ENOENT;
+    memcpy(&service->unmap, &symbol, sizeof(service->unmap));
     service->client_id = client_id;
     service->sessions = sessions;
     return 0;
@@ -51,16 +56,18 @@ int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
 static int prepare_command(struct ph_gpu_session_service *service,
                            const unsigned char *bytes,
                            size_t size,
-                           size_t envelope_size) {
-    const kb2_gpu_region_t region = {.region_id = PH_GPU_QUERY_OUTPUT_REGION,
-                                     .rights = KB2_GPU_SPAN_RIGHT_WRITE,
-                                     .length = sizeof(service->query.output)};
+                           size_t envelope_size,
+                           uint32_t queue_class) {
+    const kb2_gpu_region_t region = {
+        .region_id = PH_GPU_QUERY_OUTPUT_REGION,
+        .rights = KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,
+        .length = GPUD_GPU_AUX_CAPACITY};
     kb2_gpu_command_t command;
     if (kb2_gpu_command_decode(bytes,
                                size,
                                service->query.generation,
                                KB2_GPU_PROFILE_VIRGL,
-                               KB2_GPU_QUEUE_EXECUTION,
+                               queue_class,
                                &region,
                                1,
                                &command))
@@ -79,7 +86,8 @@ static int prepare_command(struct ph_gpu_session_service *service,
     }
     service->acquired = 1;
     service->query.session_id = service->session_id;
-    return ph_gpu_query_prepare_snapshot(&service->query, envelope_size, service->correlation);
+    return ph_gpu_query_prepare_snapshot(&service->query, envelope_size,
+        service->correlation, queue_class);
 }
 
 int ph_gpu_session_prepare(struct ph_gpu_session_service *service,
@@ -99,14 +107,17 @@ int ph_gpu_session_prepare(struct ph_gpu_session_service *service,
     service->correlation = envelope.correlation_id;
     service->status = KB2_GPU_STATUS_OK;
     service->session_id = service->file_cookie = 0;
+    service->node_type = 0;
     service->query.terminal_after_completion = 0;
     service->query.reply_size = 0;
     memset(service->query.output, 0, sizeof(service->query.output));
     const unsigned char *bytes = service->query.request + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE;
     if (service->opcode == KB2_GPU_OPCODE_COMMAND) {
-        if (queue_class != KB2_GPU_QUEUE_EXECUTION)
+        if (queue_class != KB2_GPU_QUEUE_EXECUTION &&
+            queue_class != KB2_GPU_QUEUE_DISPLAY)
             return -EPROTO;
-        return prepare_command(service, bytes, envelope.payload_length, size);
+        return prepare_command(service, bytes, envelope.payload_length, size,
+            queue_class);
     }
     if (queue_class != KB2_GPU_QUEUE_CONTROL || service->correlation <= service->last_control)
         return -EPROTO;
@@ -119,6 +130,7 @@ int ph_gpu_session_prepare(struct ph_gpu_session_service *service,
             service->status = KB2_GPU_STATUS_DENIED;
             return 0;
         }
+        service->node_type = request.node_type;
         service->status = ph_gpu_session_open_begin(service->sessions,
                                                     service->query.generation,
                                                     service->client_id,
@@ -189,14 +201,16 @@ int ph_gpu_session_dispatch(struct ph_gpu_session_service *service, void *linux_
             service->query.terminal_after_completion = -ENODEV;
             result = command_error(service);
         } else {
-            result = service->query_service.dispatch(&service->query, file);
+            result = ph_gpu_query_dispatch(&service->query, owner,
+                service->file_cookie, file);
         }
         int released = ph_gpu_session_service_release(service);
         return result ? result : released;
     }
     if (!service->status && service->opcode == KB2_GPU_OPCODE_SESSION_OPEN) {
         uint64_t cookie = 0;
-        service->status = file_status(service->open(owner, &cookie));
+        service->status = file_status(
+            service->open(owner, service->node_type, &cookie));
         if (ph_gpu_session_open_finish(service->sessions,
                                        service->query.generation,
                                        service->client_id,
@@ -231,7 +245,9 @@ int ph_gpu_session_dispatch(struct ph_gpu_session_service *service, void *linux_
         if (service->status)
             completion.session_id = 0;
         else
-            completion.topology_epoch = 1; /* Render-only; no KMS topology is advertised. */
+            /* Topology epoch 1 belongs to this sandbox generation. A restart
+             * changes generation, so old object IDs cannot cross it. */
+            completion.topology_epoch = 1;
     }
     size_t size;
     if (kb2_gpu_session_completion_encode(service->query.reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,

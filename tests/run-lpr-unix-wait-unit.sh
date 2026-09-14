@@ -4,7 +4,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out_dir="$repo_root/.artifacts/tests/lpr-unix-wait"
 mkdir -p "$out_dir"
 includes=()
-for module in libipc libpacha personality daemons/common filed termd drmd inputd netd unixd lpr_supervisor; do
+for module in libipc libpacha personality daemons/common filed termd gpud inputd netd unixd lpr_supervisor; do
   includes+=("-I$repo_root/userland/$module/include")
 done
 clang -std=c11 -O2 -g -Wall -Wextra -Werror \

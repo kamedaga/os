@@ -4,7 +4,7 @@
 
 #include "filed/ipc_protocol.h"
 #include "filed/payload.h"
-#include "drmd/ipc_protocol.h"
+#include "gpud/drm_protocol.h"
 #include "koboxd/control_protocol.h"
 #include "koboxd/storage_protocol.h"
 #include "ipc_service.h"
@@ -128,11 +128,11 @@ int main(void)
     failures += expect(sizeof(netd_poll_t) == 64, "netd poll request size");
     failures += expect(sizeof(netd_io_t) <= NETD_PAGE_BYTES, "netd io fits page");
     failures += expect(sizeof(termd_io_request_t) <= PACHA_SERVICE_PAGE_BYTES, "termd io fits page");
-    failures += expect(sizeof(drmd_ioctl_request_t) <= PACHA_SERVICE_PAGE_BYTES, "drmd ioctl fits page");
-    failures += expect(sizeof(drmd_read_request_t) <= PACHA_SERVICE_PAGE_BYTES, "drmd read fits page");
+    failures += expect(sizeof(gpud_drm_ioctl_request_t) <= PACHA_SERVICE_PAGE_BYTES, "gpud ioctl fits page");
+    failures += expect(sizeof(gpud_drm_read_request_t) <= PACHA_SERVICE_PAGE_BYTES, "gpud read fits page");
     failures += expect(sizeof(lpr_client_path_request_t) == 496, "lpr client path size");
     failures += expect(
-        LPR_DRMD_DRM_ENDPOINT_FD == 243 && LPR_INPUTD_INPUT_ENDPOINT_FD == 244 &&
+        LPR_GPUD_DRM_ENDPOINT_FD == 243 && LPR_INPUTD_INPUT_ENDPOINT_FD == 244 &&
         LPR_BOOTSTRAP_FD == 245 &&
         LPR_SUPERVISOR_ENDPOINT_FD == 246 && LPRS_BOOT_CONFIG_FD == 247,
         "lpr fixed service and bootstrap fds are distinct and contiguous");
@@ -199,12 +199,12 @@ int main(void)
         TERMD_OP_SIGNAL_TAKE == 11 && TERMD_OP_DIAG_ERROR_GET == 14,
         "termd ops are contiguous from zero");
     failures += expect(
-        DRMD_OP_HELLO == 0 && DRMD_OP_OPEN_NODE == 1 &&
-        DRMD_OP_HANDLE_IOCTL == 4 && DRMD_OP_HANDLE_MMAP == 5 &&
-        DRMD_OP_HANDLE_READ == 6 && DRMD_OP_HANDLE_POLL == 7 &&
-        DRMD_OP_PRIME_EXPORT == 8 && DRMD_OP_PRIME_IMPORT_SYNC_FILE == 10 &&
-        DRMD_OP_PRIME_ACQUIRE == 12,
-        "drmd ops are contiguous from zero");
+        GPUD_DRM_OP_HELLO == 0 && GPUD_DRM_OP_OPEN_NODE == 1 &&
+        GPUD_DRM_OP_HANDLE_IOCTL == 4 && GPUD_DRM_OP_HANDLE_MMAP == 5 &&
+        GPUD_DRM_OP_HANDLE_READ == 6 && GPUD_DRM_OP_HANDLE_POLL == 7 &&
+        GPUD_DRM_OP_PRIME_EXPORT == 8 && GPUD_DRM_OP_PRIME_IMPORT_SYNC_FILE == 10 &&
+        GPUD_DRM_OP_PRIME_ACQUIRE == 12,
+        "gpud ops are contiguous from zero");
     failures += expect(
         LPR_COORD_OP_REGISTER_PROCESS == 0 && LPR_COORD_OP_SHARE_FD_TABLE == 7,
         "coordinator ops are contiguous from zero");

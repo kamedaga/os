@@ -8,7 +8,7 @@
 #include <kobox2/controller.h>
 #include <kobox2/closure_manifest.h>
 
-enum { GPUD_PACKAGE_ARTIFACTS = 12, GPUD_PACKAGE_ITEMS = 15 };
+enum { GPUD_PACKAGE_ARTIFACTS = 13, GPUD_PACKAGE_ITEMS = 16 };
 
 struct gpud_package {
     const unsigned char *sandbox;

@@ -864,12 +864,90 @@ fn revokeVmoFd(
     user_vm.lockAllVmTransactions();
     defer user_vm.unlockAllVmTransactions();
     const vmo_ref = state.nativeVmoRefForRevokeFd(proc, fd) catch return sc.syscall_err_invalid;
-    if (state.nativeVmoMappingsOverlapPinnedUserObjects(vmo_ref)) return sc.syscall_err_invalid;
+    if (state.nativeVmoTreeMappingsOverlapPinnedUserObjects(vmo_ref)) return sc.syscall_err_invalid;
     _ = state.revokeVmoFdWithFreeList(proc, fd, free_list, VmoRevokeUnmapper{}) catch |err| switch (err) {
         kernel.KernelError.TableFull => return sc.syscall_err_alloc,
         else => return sc.syscall_err_invalid,
     };
     return sc.syscall_ok;
+}
+
+fn createPageViewVmoFd(
+    h: anytype,
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    parent_fd: kernel.Fd,
+    indices_va: u64,
+    page_count_u64: u64,
+    rights_bits: u64,
+    flags_bits: u64,
+) u64 {
+    if (indices_va == 0 or page_count_u64 == 0 or
+        page_count_u64 > kernel.max_vmo_backing_pages or
+        page_count_u64 > (@import("std").math.maxInt(u64) / fd_abi.vmo_page_view_index_size) or
+        indices_va > @import("std").math.maxInt(u64) -
+            page_count_u64 * fd_abi.vmo_page_view_index_size or
+        (rights_bits & ~fd_abi.vmo_page_view_rights_mask) != 0 or
+        (flags_bits & ~fd_abi.vmo_page_view_known_flags_mask) != 0)
+        return sc.syscall_err_invalid;
+
+    const rights = kernel.fdRightsFromBits(rights_bits);
+    const flags = kernel.fdFlagsFromBits(@truncate(flags_bits));
+    if (!rights.close or (!rights.map_read and !rights.map_write))
+        return sc.syscall_err_invalid;
+    const parent_entry = state.fdEntryConst(proc, parent_fd) orelse
+        return sc.syscall_err_invalid;
+    if (!parent_entry.rights.share or
+        !kernel.isFdRightsSubset(rights, parent_entry.rights))
+        return sc.syscall_err_invalid;
+    const parent = state.nativeVmoRefForFd(proc, parent_fd) orelse
+        return sc.syscall_err_invalid;
+    const parent_slot = state.nativeVmoSlotConst(parent) orelse
+        return sc.syscall_err_invalid;
+    if (parent_slot.kind != .anonymous or !parent_slot.parent.isNull() or
+        !parent_slot.has_page_store)
+        return sc.syscall_err_invalid;
+
+    const page_count: usize = @intCast(page_count_u64);
+    const view = state.createNativePageView(parent, page_count) catch |err|
+        return statusFromKernelError(err);
+    var page_offset: usize = 0;
+    while (page_offset < page_count) {
+        var pages: [64]u64 = undefined;
+        const chunk_count = @min(pages.len, page_count - page_offset);
+        for (pages[0..chunk_count], 0..) |*paddr, chunk_index| {
+            const list_index = page_offset + chunk_index;
+            const list_va = indices_va +
+                @as(u64, @intCast(list_index)) * fd_abi.vmo_page_view_index_size;
+            const parent_page = h.read_user_u64(proc, list_va) orelse {
+                state.releaseNativeVmoWithFreeList(view, h.free_list);
+                return sc.syscall_err_invalid;
+            };
+            if (parent_page > @import("std").math.maxInt(usize)) {
+                state.releaseNativeVmoWithFreeList(view, h.free_list);
+                return sc.syscall_err_invalid;
+            }
+            paddr.* = state.nativeVmoResolvedPagePaddr(parent, @intCast(parent_page)) orelse {
+                state.releaseNativeVmoWithFreeList(view, h.free_list);
+                return sc.syscall_err_invalid;
+            };
+        }
+        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count]) catch |err| {
+            state.releaseNativeVmoWithFreeList(view, h.free_list);
+            return statusFromKernelError(err);
+        };
+        page_offset += chunk_count;
+    }
+
+    const object = state.createKernelObject(.vmo, .{ .vmo = view }) catch |err| {
+        state.releaseNativeVmoWithFreeList(view, h.free_list);
+        return statusFromKernelError(err);
+    };
+    return state.installFd(proc, object, rights, flags, first_dynamic_fd) catch |err| {
+        if (state.kernelObjectSlot(object)) |slot|
+            state.clearKernelObjectSlotWithFreeList(slot, h.free_list);
+        return statusFromKernelError(err);
+    };
 }
 
 fn mapVmoFd(
@@ -892,6 +970,15 @@ fn mapVmoFd(
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
     prot.pkey = flags.pkey;
+    if (!flags.anonymous) {
+        const vmo_ref = state.nativeVmoRefForFd(proc, fd) orelse
+            return sc.syscall_err_invalid;
+        const vmo = state.nativeVmoSlotConst(vmo_ref) orelse
+            return sc.syscall_err_invalid;
+        if (vmo.kind == .page_view and
+            (!flags.shared or flags.private or prot.exec))
+            return sc.syscall_err_invalid;
+    }
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
     defer user_vm.unlockVmTransaction(proc);
 
@@ -1468,6 +1555,16 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             ) catch |err| statusFromKernelError(err);
         },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
+        sc.syscall_vmo_create_page_view => createPageViewVmoFd(
+            h,
+            state,
+            proc,
+            @intCast(frame.rdi),
+            frame.rsi,
+            frame.rdx,
+            frame.r10,
+            frame.r8,
+        ),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
             const profile_start = smp_perf.timestamp();

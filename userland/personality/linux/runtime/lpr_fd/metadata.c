@@ -953,6 +953,8 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
         return lpr_linux_fstat(dirfd, statbuf);
     }
     if (path[0] == '\0') return -LPR_LINUX_ENOENT;
+    const int64_t drm_stat = lpr_drm_stat_path(path, statbuf);
+    if (drm_stat != -LPR_LINUX_ENOENT) return drm_stat;
     /* Virtual proc/device descriptors belong to LPR, not the FileD namespace.
      * Keep their existing handling; regular filesystem paths need no Linux FD. */
     const int virtual_path =

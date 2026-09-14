@@ -42,7 +42,7 @@ uint32_t ph_gpu_session_open_begin(struct gpud_gpu_sessions *sessions,
         return KB2_GPU_STATUS_INVALID;
     if (generation != sessions->generation)
         return KB2_GPU_STATUS_STALE_GENERATION;
-    if (node != KB2_GPU_NODE_RENDER)
+    if (node != KB2_GPU_NODE_RENDER && node != KB2_GPU_NODE_PRIMARY)
         return KB2_GPU_STATUS_UNSUPPORTED;
     if (sessions->occupied == sessions->limit || sessions->sequence == UINT64_MAX)
         return KB2_GPU_STATUS_LIMIT;

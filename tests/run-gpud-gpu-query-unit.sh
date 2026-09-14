@@ -19,7 +19,7 @@ sources=("$repo_root/tests/gpud_gpu_query_unit.c" "$repo_root/userland/gpud/drm_
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -I "$repo_root/kobox2/protocol/include" -I "$repo_root/kobox2/protocol/generated/include" \
   -I "$repo_root/kobox2/linux-sandbox/kobox" \
-  -isystem "$repo_root/userland/drmd/include" -isystem "$repo_root/userland/libipc/include" \
+  -isystem "$repo_root/userland/gpud/include" -isystem "$repo_root/userland/libipc/include" \
   -isystem "$repo_root/userland/libpacha/include" \
   "${sources[@]}" -o "$out/gpu-query-unit"
 "$out/gpu-query-unit" | tee "$out/result.log"

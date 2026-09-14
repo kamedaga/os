@@ -85,21 +85,18 @@ static void control(int defect) {
     unsigned char bytes[256], reply[256];
     size_t size = 777;
     assert(!gpud_drm_files_init(&files, 9, 2));
-    drmd_open_request_t request = {.device_minor = 128, .flags = 2 | 04000 | 02000000};
+    gpud_drm_open_request_t request = {.device_minor = 128, .flags = 2 | 04000 | 02000000};
     assert(gpud_drm_open_prepare(&files, 9, 100, 1, &request,
                &pending, bytes, 1, &size) == -EMSGSIZE);
     assert(!pending.handle && !files.handle_sequence && size == 777);
     request.device_minor = 0;
-    assert(gpud_drm_open_prepare(&files, 9, 100, 1, &request,
-               &pending, bytes, sizeof(bytes), &size) == -EOPNOTSUPP);
-    request.device_minor = 128;
     assert(!gpud_drm_open_prepare(&files, 9, 100, 1, &request,
         &pending, bytes, sizeof(bytes), &size));
     kb2_gpu_session_open_t open;
     assert(!kb2_gpu_session_open_decode(bytes + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
                                         size - KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
                                         &open));
-    assert(open.client_id == 100);
+    assert(open.client_id == 100 && open.node_type == KB2_GPU_NODE_PRIMARY);
     size = make_reply(reply, &pending,
         defect == 1 ? KB2_GPU_STATUS_NO_MEMORY : KB2_GPU_STATUS_OK,
         defect == 1 ? 0 : 101);

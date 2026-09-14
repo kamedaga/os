@@ -896,6 +896,10 @@ pub const native_cow_table_slots_per_chunk: usize = 128;
 pub const NativeVmoKind = enum(u8) {
     none = 0,
     anonymous = 1,
+    /// A read/write, non-executable scatter view of pages owned by an
+    /// anonymous parent VMO. The view owns only its page-index metadata; its
+    /// parent reference owns the physical pages.
+    page_view = 2,
 };
 
 pub const NativeVmoRef = struct {

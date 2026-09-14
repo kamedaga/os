@@ -4,7 +4,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out_dir="$repo_root/.artifacts/tests/lpr-inotify-close-race"
 mkdir -p "$out_dir"
 includes=()
-for component in libipc libpacha personality filed termd drmd inputd netd unixd lpr_supervisor; do
+for component in libipc libpacha personality filed termd gpud inputd netd unixd lpr_supervisor; do
   includes+=("-I$repo_root/userland/$component/include")
 done
 /usr/bin/clang -std=c11 -O1 -g -Wall -Wextra -Werror \

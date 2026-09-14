@@ -48,7 +48,7 @@ static int wait_readable(int fd, int process_fd) {
 static int wait_service(
     const struct gpud_drm_service *service, int endpoint_fd,
     int process_fd, int control_fd) {
-    struct pacha_pollfd events[GPUD_DRM_REFERENCES_MAX + 3] = {
+    struct pacha_pollfd events[GPUD_DRM_WAIT_SOURCES_MAX + 3] = {
         {.fd = endpoint_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
     };
@@ -61,9 +61,9 @@ static int wait_service(
             .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
         };
     }
-    int sources[GPUD_DRM_REFERENCES_MAX];
+    int sources[GPUD_DRM_WAIT_SOURCES_MAX];
     size_t source_count = gpud_drm_service_collect_wait_sources(
-        service, sources, GPUD_DRM_REFERENCES_MAX);
+        service, sources, GPUD_DRM_WAIT_SOURCES_MAX);
     for (size_t i = 0; i < source_count; ++i)
         events[event_count + i] = (struct pacha_pollfd){
             .fd = sources[i], .events = PACHA_FD_EVENT_HANGUP};
@@ -190,10 +190,14 @@ static int retire_drm_generation(
         *watch = (struct gpud_drm_watch){0};
     }
     int error = ph_ipc_packet_release(&service->received);
+    int cleanup = ph_ipc_packet_release(&service->gpu.incoming);
     if (!error)
-        error = ph_ipc_packet_release(&service->gpu.incoming);
+        error = cleanup;
+    cleanup = gpud_drm_service_retire_mappings(service);
+    if (!error)
+        error = cleanup;
     if (!error && service->page) {
-        error = pacha_munmap(service->page, DRMD_PAGE_BYTES);
+        error = pacha_munmap(service->page, GPUD_DRM_PAGE_BYTES);
         if (!error)
             service->page = NULL;
     }

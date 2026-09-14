@@ -16,11 +16,18 @@ struct gpud_gpu_rpc {
     kb2_vq_segment_t segments[2];
     kb2_vq_chain_t chain;
     struct ph_ipc_packet incoming;
+    struct ph_ipc_packet attachment;
     int error;
 };
 
 int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
     const unsigned char *request, size_t request_size,
     unsigned char *reply, size_t reply_capacity, size_t *reply_size);
+int gpud_gpu_rpc_take_mapping(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd);
+int gpud_gpu_rpc_take_dma_buf(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd);
+int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t mapping_id);
 
 #endif

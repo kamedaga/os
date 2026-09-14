@@ -2227,22 +2227,8 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         return -LPR_LINUX_EINVAL;
     }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_dmabuf_fd_active(fd)) {
-        lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend(fd);
-        if (dmabuf == 0 || dmabuf->native.raw < 0 ||
-            (offset & 4095ull) != 0 || offset > dmabuf->size ||
-            len > dmabuf->size - offset ||
-            ((prot & LPR_LINUX_PROT_WRITE) != 0 && !dmabuf->writable)) {
-            return -LPR_LINUX_EINVAL;
-        }
-        const int64_t mapped = lpr_pacha_syscall6(
-            PACHAOS_SYSCALL_MMAP,
-            (uint64_t)(uint32_t)dmabuf->native.raw,
-            addr,
-            len,
-            lpr_linux_prot_to_pacha(prot),
-            pacha_flags,
-            offset);
-        return mapped >= 4096 ? mapped : lpr_linux_pacha_status_to_errno(mapped);
+        return lpr_dmabuf_mmap(fd, addr, len,
+            lpr_linux_prot_to_pacha(prot), pacha_flags, offset);
     }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_drm_fd_active(fd)) {
         return lpr_drm_mmap(fd, addr, len, lpr_linux_prot_to_pacha(prot), pacha_flags, offset);
@@ -2815,7 +2801,15 @@ static int64_t lpr_sys_faccessat2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_
 static int64_t lpr_sys_stat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0); }
 static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_newfstatat(LPR_LINUX_AT_FDCWD, a0, a1, 0x100); }
 static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
-static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { return lpr_linux_mmap(a0, a1, a2, a3, a4, a5); }
+static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2,
+    uint64_t a3, uint64_t a4, uint64_t a5) {
+    int drm = !(a3 & LPR_LINUX_MAP_ANONYMOUS) &&
+        lpr_linux_drm_fd_active(a4);
+    int64_t result = lpr_linux_mmap(a0, a1, a2, a3, a4, a5);
+    if (result >= 4096 && (a3 & LPR_LINUX_MAP_FIXED) && !drm)
+        lpr_drm_mapping_unmapped((uint64_t)result, a1);
+    return result;
+}
 static int64_t lpr_sys_mremap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_mremap(a0, a1, a2, a3, a4); }
 static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
 {
@@ -2873,6 +2867,8 @@ static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
     }
     const int64_t result = lpr_linux_pacha_status_to_errno(
         lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1));
+    if (!result)
+        lpr_drm_mapping_unmapped(a0, a1);
     lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);
     return result;
 }

@@ -15,10 +15,7 @@ static void ownership(void) {
     assert(ph_gpu_sessions_init(&table, 10, 2) == -EINVAL);
     assert(ph_gpu_session_open_begin(&table, 8, 7, KB2_GPU_NODE_RENDER, &a) ==
            KB2_GPU_STATUS_STALE_GENERATION);
-    assert(ph_gpu_session_open_begin(&table, 9, 7, KB2_GPU_NODE_PRIMARY, &a) ==
-           KB2_GPU_STATUS_UNSUPPORTED);
-    assert(!a && !table.occupied && !table.sequence);
-    assert(!ph_gpu_session_open_begin(&table, 9, 7, KB2_GPU_NODE_RENDER, &a));
+    assert(!ph_gpu_session_open_begin(&table, 9, 7, KB2_GPU_NODE_PRIMARY, &a));
     assert(!ph_gpu_session_open_begin(&table, 9, 8, KB2_GPU_NODE_RENDER, &b));
     assert(a && b && a != b && table.occupied == 2);
     assert(ph_gpu_session_open_begin(&table, 9, 7, KB2_GPU_NODE_RENDER, &c) ==

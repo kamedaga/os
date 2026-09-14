@@ -13,7 +13,7 @@ sources=("$repo_root/tests/gpud_drm_files_unit.c"
 "${CC:-cc}" -std=c11 -O1 -g -Wall -Wextra -Wpedantic -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -I "$repo_root/kobox2/protocol/include" -I "$repo_root/kobox2/protocol/generated/include" \
-  -isystem "$repo_root/userland/drmd/include" -isystem "$repo_root/userland/libipc/include" \
+  -isystem "$repo_root/userland/gpud/include" -isystem "$repo_root/userland/libipc/include" \
   -isystem "$repo_root/userland/libpacha/include" "${sources[@]}" -o "$out/drm-files-unit"
 "$out/drm-files-unit" | tee "$out/result.log"
 sha256sum "${sources[@]}" "$repo_root/userland/gpud/drm_files.h" \

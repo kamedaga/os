@@ -44,7 +44,7 @@ enum {
     /* Explicit launch-manager grants, never an automatic Linux default. */
     FILED_EXEC_SERVICE_NETD = 1u << 8,
     FILED_EXEC_SERVICE_TERMD = 1u << 9,
-    FILED_EXEC_SERVICE_DRMD = 1u << 10,
+    FILED_EXEC_SERVICE_GPUD_DRM = 1u << 10,
     FILED_EXEC_SERVICE_INPUTD = 1u << 11,
     FILED_EXEC_MAX_INHERIT_FDS = 16,
     FILED_EXEC_MAX_INHERIT_HANDLES = 4,

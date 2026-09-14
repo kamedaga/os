@@ -10,7 +10,10 @@
 struct ph_gpu_query {
     uint64_t generation, session_id, correlation;
     void *mapping;
+    void *aux;
+    size_t aux_size, aux_mapping_size;
     struct kobox_drm_query plan;
+    struct kobox_drm_query_result result;
     struct kobox_drm_query_api api;
     size_t reply_size;
     int terminal_after_completion;
@@ -32,6 +35,16 @@ int ph_gpu_query_init(struct ph_gpu_query *query,
  */
 int ph_gpu_query_prepare_snapshot(struct ph_gpu_query *query,
                                   size_t size,
-                                  uint64_t expected_correlation);
+                                  uint64_t expected_correlation,
+                                  uint32_t queue_class);
+
+/* Drop the private native staging area only after completion publication. */
+int ph_gpu_query_release_aux(struct ph_gpu_query *query);
+int ph_gpu_query_dispatch(struct ph_gpu_query *query,
+                          struct kobox_linux_drm_service *service,
+                          uint64_t file_cookie,
+                          struct kobox_linux_drm_file *file);
+int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
+                                    struct ph_ipc *ipc);
 
 #endif

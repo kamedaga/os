@@ -29,7 +29,8 @@ pub const syscall_timerfd_create: u64 = 51;
 pub const syscall_timerfd_settime: u64 = 52;
 pub const syscall_timerfd_gettime: u64 = 53;
 pub const syscall_vmo_create: u64 = 54;
-pub const syscall_vmo_revoke: u64 = 55;
+pub const syscall_vmo_create_page_view: u64 = 55;
+pub const syscall_vmo_revoke: u64 = 56;
 pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -80,6 +81,21 @@ pub const known_common_rights_mask: u64 =
     right_share |
     right_pager_attach |
     right_pager_fault |
+    right_revoke;
+
+// VMO_CREATE_PAGE_VIEW(parent_fd, page_indices, page_count, rights, flags)
+// takes an array of parent-VMO page indices. A view may only map or transport
+// the borrowed pages; it cannot execute, read/write through FD offsets, resize,
+// share again, or act as a pager.
+pub const vmo_page_view_index_size: u64 = 8;
+pub const vmo_page_view_known_flags_mask: u64 = known_flags_mask;
+pub const vmo_page_view_rights_mask: u64 =
+    right_inspect |
+    right_dup |
+    right_transfer |
+    right_close |
+    right_map_read |
+    right_map_write |
     right_revoke;
 
 pub const fd_kind_none: u64 = 0;

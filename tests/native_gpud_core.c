@@ -334,9 +334,9 @@ static void query_bound_round(struct ph_ipc *ipc,
     struct gpud_drm_binding binding = *admitted;
     uint64_t session_id = binding.session_id;
     IPC_CHECK(binding.generation == ipc->generation);
-    drmd_ioctl_request_t request = {.handle = binding.frontend_handle};
+    gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle};
     if (test_case == 1 || test_case >= 5) {
-        drmd_version_wire_t version = {0};
+        gpud_drm_version_wire_t version = {0};
         if (test_case == 1) {
             version.name_capacity = sizeof(version.name);
             version.date_capacity = sizeof(version.date);
@@ -461,7 +461,7 @@ static void query_bound_round(struct ph_ipc *ipc,
                                 : test_case == 4 ? -EOPNOTSUPP
                                                  : 0));
     if (test_case == 1 && !closed) {
-        drmd_version_wire_t version;
+        gpud_drm_version_wire_t version;
         memcpy(&version, request.data, sizeof(version));
         IPC_CHECK(version.name_length == strlen("virtio_gpu") &&
                   !memcmp(version.name, "virtio_gpu", version.name_length));

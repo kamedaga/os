@@ -14,6 +14,8 @@ struct ph_gpu_queue {
     kb2_vq_chain_t request;
     void *mapping;
     uint64_t channel_id;
+    uint64_t release_mapping_id;
+    uint64_t release_correlation;
     unsigned int active_lane;
     unsigned int next_lane;
     int bound;

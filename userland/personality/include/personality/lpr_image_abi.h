@@ -79,7 +79,7 @@
 #define LPR_ZPOLINE_SHIM_JMP_R11_BYTE2 0xe3u
 
 /* Bootstrap VMO and fixed descriptor inherited by the new process. */
-#define LPR_DRMD_DRM_ENDPOINT_FD 243
+#define LPR_GPUD_DRM_ENDPOINT_FD 243
 #define LPR_INPUTD_INPUT_ENDPOINT_FD 244
 #define LPR_BOOTSTRAP_FD 245
 #define LPR_SUPERVISOR_ENDPOINT_FD 246

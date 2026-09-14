@@ -376,7 +376,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_page_snapshot(
     }
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
-    case FILED_OP_SERVICE_SET_DRMD_DRM:
+    case FILED_OP_SERVICE_SET_GPUD_DRM:
     case FILED_OP_SERVICE_SET_INPUTD_INPUT:
         return filed_page_result(-95, 0);
     default:
@@ -1391,7 +1391,7 @@ static int filed_dispatch_client(
     }
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
-    case FILED_OP_SERVICE_SET_DRMD_DRM:
+    case FILED_OP_SERVICE_SET_GPUD_DRM:
     case FILED_OP_SERVICE_SET_INPUTD_INPUT:
         if (header.payload_size < sizeof(filed_service_endpoint_request_t) ||
             request->fd_count < 3 ||
@@ -1410,16 +1410,19 @@ static int filed_dispatch_client(
                     (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
                 }
                 runtime->termd_tty_endpoint_fd = endpoint_fd;
+            } else if (header.op == FILED_OP_SERVICE_SET_GPUD_DRM) {
+                if (runtime->gpud_drm_endpoint_fd >= 16) {
+                    (void)pacha_fd_close(runtime->gpud_drm_endpoint_fd);
+                }
+                runtime->gpud_drm_endpoint_fd = endpoint_fd;
             } else if (header.op == FILED_OP_SERVICE_SET_INPUTD_INPUT) {
                 if (runtime->inputd_input_endpoint_fd >= 16) {
                     (void)pacha_fd_close(runtime->inputd_input_endpoint_fd);
                 }
                 runtime->inputd_input_endpoint_fd = endpoint_fd;
             } else {
-                if (runtime->drmd_drm_endpoint_fd >= 16) {
-                    (void)pacha_fd_close(runtime->drmd_drm_endpoint_fd);
-                }
-                runtime->drmd_drm_endpoint_fd = endpoint_fd;
+                status = -22;
+                break;
             }
             keep_fd = endpoint_fd;
             result = (uint64_t)(uint32_t)endpoint_fd;

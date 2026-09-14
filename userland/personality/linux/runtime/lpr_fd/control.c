@@ -443,7 +443,7 @@ int lpr_runtime_reserved_fd(uint64_t fd)
     return fd == LPR_FILED_ENDPOINT_FD ||
         fd == LPR_NETD_ENDPOINT_FD ||
         fd == LPR_TERMD_TTY_ENDPOINT_FD ||
-        fd == LPR_DRMD_DRM_ENDPOINT_FD ||
+        fd == LPR_GPUD_DRM_ENDPOINT_FD ||
         fd == LPR_INPUTD_INPUT_ENDPOINT_FD ||
         fd == LPR_BOOTSTRAP_FD ||
         fd == LPR_SUPERVISOR_ENDPOINT_FD;

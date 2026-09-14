@@ -361,16 +361,10 @@ static int lpr_duplicate_manifest_capability(
         16,
         info.rights);
     if (duplicate < 16) return (int)lpr_pacha_status_to_errno(duplicate);
-    const int64_t flag_status = lpr_pacha_syscall4(
-        PACHA_FD_SYSCALL_FCNTL,
-        (uint64_t)(uint32_t)duplicate,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        0,
-        PACHA_FD_FLAG_CLOEXEC);
-    if (flag_status != 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)duplicate);
-        return (int)lpr_pacha_status_to_errno(flag_status);
-    }
+    /* PACHA_FD_FCNTL_DUP installs the new capability with an empty flag set.
+     * Do not require SET_FLAGS merely to clear CLOEXEC: narrowed dma-buf VMO
+     * views deliberately carry DUP and TRANSFER, but no flag-management
+     * authority. */
     const int status = lpr_transaction_track_lease(
         transaction, pin_index, (int)duplicate);
     if (status != 0) {

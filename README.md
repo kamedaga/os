@@ -52,7 +52,7 @@
 | Scheduler | EEVDF / SMP |
 | seed | Init |
 | Termd | Linux TTY |
-| Drmd | DRM / KMS |
+| Gpud | DRM service / kobox2 sandbox owner |
 | LPR | Zpoline / LinuxShim ...|
 
 

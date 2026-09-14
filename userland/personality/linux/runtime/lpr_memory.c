@@ -39,7 +39,12 @@ int64_t lpr_linux_mremap(
         new_size,
         flags,
         target);
-    return result >= 4096 ? result : pacha_kernel_status_to_errno(result);
+    if (result >= 4096) {
+        lpr_drm_mapping_remapped(
+            old_address, old_size, (uint64_t)result, new_size);
+        return result;
+    }
+    return pacha_kernel_status_to_errno(result);
 }
 
 static uint64_t align_up_page(uint64_t value)

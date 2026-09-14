@@ -27,7 +27,7 @@
 #include <pachaos/abi.h>
 #include <personality/lpr_client_abi.h>
 #include <personality/linux_lpr.h>
-#include <drmd/ipc_protocol.h>
+#include <gpud/drm_protocol.h>
 #include <inputd/ipc_protocol.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -916,6 +916,7 @@ int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd);
 int64_t lpr_tty_open_peer(uint64_t fd, uint64_t flags);
 int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd);
 int64_t lpr_drm_open_path(const char *path, uint64_t flags);
+int64_t lpr_drm_stat_path(const char *path, uint64_t statbuf);
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_drm_close_handle(uint64_t handle);
 int64_t lpr_drm_dup_handle(uint64_t handle);
@@ -923,7 +924,13 @@ int64_t lpr_drm_transfer_dup_handle(
     uint64_t handle, int lease_fd, uint64_t *out_handle);
 int64_t lpr_drm_prime_ref(uint32_t op, uint64_t token);
 int64_t lpr_drm_prime_transfer_acquire(uint64_t token, int lease_fd);
+int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
+    uint64_t prot, uint64_t flags, uint64_t offset);
 void lpr_drm_after_fork_child(void);
+void lpr_drm_mapping_unmapped(uint64_t address, uint64_t length);
+void lpr_drm_mapping_remapped(
+    uint64_t old_address, uint64_t old_length,
+    uint64_t new_address, uint64_t new_length);
 int64_t lpr_dmabuf_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
 int64_t lpr_sync_file_create_signaled(void);
 int64_t lpr_sync_file_install_wait(int wait_fd);

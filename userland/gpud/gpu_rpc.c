@@ -22,6 +22,15 @@ static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t d
         if (!error) {
             int valid = packet->operation == PH_GPU_QUEUE_NOTIFY && !packet->correlation &&
                 !packet->fd_count && packet->value == notification;
+            if (!valid &&
+                (packet->operation == PH_GPU_MAPPING_ATTACHMENT ||
+                 packet->operation == PH_GPU_DMA_BUF_ATTACHMENT) &&
+                packet->correlation && packet->value && packet->fd_count == 1 &&
+                !rpc->attachment.fd_count) {
+                rpc->attachment = *packet;
+                *packet = (struct ph_ipc_packet){0};
+                continue;
+            }
             int cleanup = ph_ipc_packet_release(packet);
             return cleanup ? cleanup : valid ? 0 : -EPROTO;
         }
@@ -46,27 +55,138 @@ static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t d
     }
 }
 
+static int take_attachment(struct gpud_gpu_rpc *rpc, uint32_t operation,
+    uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd) {
+    if (!rpc || !fd || !correlation || !exchange_id)
+        return -EINVAL;
+    struct ph_ipc_packet *packet = &rpc->attachment;
+    if (!packet->fd_count)
+        return -ENOENT;
+    if (packet->operation != operation ||
+        packet->generation != rpc->ipc->generation ||
+        packet->correlation != correlation || packet->value != exchange_id ||
+        packet->fd_count != 1)
+        return -EPROTO;
+    *fd = packet->fds[0];
+    packet->fds[0].fd = PH_IPC_NO_FD;
+    *packet = (struct ph_ipc_packet){0};
+    return 0;
+}
+
+int gpud_gpu_rpc_take_mapping(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd) {
+    return take_attachment(rpc, PH_GPU_MAPPING_ATTACHMENT,
+        correlation, exchange_id, fd);
+}
+
+int gpud_gpu_rpc_take_dma_buf(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t exchange_id, struct pacha_ipc_fd *fd) {
+    return take_attachment(rpc, PH_GPU_DMA_BUF_ATTACHMENT,
+        correlation, exchange_id, fd);
+}
+
+int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
+    uint64_t correlation, uint64_t mapping_id) {
+    if (!rpc || !rpc->ipc || !correlation || !mapping_id)
+        return -EINVAL;
+    if (rpc->error)
+        return rpc->error;
+    if (rpc->attachment.fd_count || rpc->incoming.fd_count)
+        goto protocol_error;
+    struct ph_ipc_packet request = {
+        .operation = PH_GPU_MAPPING_RELEASE,
+        .generation = rpc->ipc->generation,
+        .correlation = correlation,
+        .value = mapping_id,
+    };
+    int error = ph_ipc_send(rpc->ipc, &request);
+    if (error)
+        goto failed;
+    uint64_t deadline;
+    error = now_ms(&deadline);
+    if (error)
+        goto failed;
+    deadline += 5000;
+    for (;;) {
+        error = ph_ipc_receive(rpc->ipc, rpc->ipc->generation, &rpc->incoming);
+        if (!error) {
+            const struct ph_ipc_packet *reply = &rpc->incoming;
+            int valid = reply->operation == PH_GPU_MAPPING_RELEASED &&
+                reply->generation == rpc->ipc->generation &&
+                reply->correlation == correlation && reply->value == mapping_id &&
+                !reply->fd_count;
+            int cleanup = ph_ipc_packet_release(&rpc->incoming);
+            if (cleanup) {
+                error = cleanup;
+                goto failed;
+            }
+            if (!valid)
+                goto protocol_error;
+            return 0;
+        }
+        if (error != -EAGAIN)
+            goto failed;
+        uint64_t now;
+        error = now_ms(&now);
+        if (error)
+            goto failed;
+        if (now >= deadline) {
+            error = -ETIMEDOUT;
+            goto failed;
+        }
+        struct pacha_pollfd event = {
+            .fd = rpc->ipc->fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
+        };
+        long waited = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+            (uintptr_t)&event, 1, deadline - now, 0);
+        if (waited == 1 && event.revents) {
+            if (event.revents & PACHA_FD_EVENT_HANGUP) {
+                error = -EPIPE;
+                goto failed;
+            }
+        } else if (event.revents ||
+                   (waited && waited != PACHA_SYSCALL_ERR_NOT_READY)) {
+            error = -EIO;
+            goto failed;
+        }
+    }
+protocol_error:
+    error = -EPROTO;
+failed:
+    rpc->error = error;
+    return error;
+}
+
 int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
     const unsigned char *request, size_t request_size,
     unsigned char *reply, size_t reply_capacity, size_t *reply_size) {
     if (!rpc || !rpc->ipc || !rpc->channel || !rpc->mapping || !request ||
         !reply || !reply_size || (queue != GPUD_GPU_QUEUE_CONTROL &&
+        queue != GPUD_GPU_QUEUE_DISPLAY &&
         queue != GPUD_GPU_QUEUE_EXECUTION))
         return -EINVAL;
     if (rpc->error)
         return rpc->error;
-    int control = queue == GPUD_GPU_QUEUE_CONTROL;
-    size_t request_offset = control ? GPUD_GPU_CONTROL_REQUEST_OFFSET : GPUD_GPU_REQUEST_OFFSET;
-    size_t response_offset = control ? GPUD_GPU_CONTROL_REPLY_OFFSET : GPUD_GPU_REPLY_OFFSET;
-    size_t capacity = control ? GPUD_GPU_CONTROL_REPLY_CAPACITY : GPUD_GPU_CHANNEL_PAGE;
-    if (!request_size || request_size > (control ? 2048u : GPUD_GPU_CHANNEL_PAGE) ||
+    const int control = queue == GPUD_GPU_QUEUE_CONTROL;
+    const int display = queue == GPUD_GPU_QUEUE_DISPLAY;
+    size_t request_offset = control ? GPUD_GPU_CONTROL_REQUEST_OFFSET :
+        display ? GPUD_GPU_DISPLAY_REQUEST_OFFSET : GPUD_GPU_REQUEST_OFFSET;
+    size_t response_offset = control ? GPUD_GPU_CONTROL_REPLY_OFFSET :
+        display ? GPUD_GPU_DISPLAY_REPLY_OFFSET : GPUD_GPU_REPLY_OFFSET;
+    size_t capacity = control ? GPUD_GPU_CONTROL_REPLY_CAPACITY :
+        display ? GPUD_GPU_DISPLAY_REPLY_CAPACITY : GPUD_GPU_CHANNEL_PAGE;
+    if (!request_size || request_size >
+        (control || display ? 2048u : GPUD_GPU_CHANNEL_PAGE) ||
         reply_capacity < capacity)
         return -EMSGSIZE;
     uint64_t deadline;
     int error = now_ms(&deadline);
     if (error)
         return error;
-    deadline += 5000;
+    /* GET_CAPS may wait up to 5*HZ in virtio-gpu. Execution must leave room
+     * for the Linux completion and the adapter's private-buffer copy-out. */
+    deadline += control ? 5000 : 15000;
     uint64_t generation = rpc->ipc->generation;
     kb2_vq_t *lane = &rpc->channel->lanes[queue];
     if (request != rpc->mapping + request_offset)

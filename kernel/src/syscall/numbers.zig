@@ -63,6 +63,7 @@ pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
+pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
 pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
 pub const syscall_munmap: u64 = vm_abi.syscall_munmap;
@@ -164,6 +165,7 @@ test "native syscall numbers are contiguous" {
         syscall_timerfd_settime,
         syscall_timerfd_gettime,
         syscall_vmo_create,
+        syscall_vmo_create_page_view,
         syscall_vmo_revoke,
         syscall_mmap,
         syscall_munmap,

@@ -34,7 +34,7 @@ mkdir -p "${build_dir}"
   -I"${repo_root}/userland/filed/src" \
   -I"${repo_root}/userland/koboxd/include" \
   -I"${repo_root}/userland/termd/include" \
-  -I"${repo_root}/userland/drmd/include" \
+  -I"${repo_root}/userland/gpud/include" \
   -I"${repo_root}/userland/inputd/include" \
   -I"${repo_root}/userland/lpr_supervisor/include" \
   -I"${repo_root}/userland/libipc/include" \
