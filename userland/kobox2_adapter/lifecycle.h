@@ -26,6 +26,9 @@ struct ph_lifecycle_service {
     /* After admission ends and no dispatch is active, including failures.
      * Retires persistent channel mappings; called once by the receiver. */
     int (*stop)(void *context);
+    /* Optional preallocated native doorbell. next drains and validates it;
+     * lifecycle only includes it in the receiver's blocking wait. */
+    int wake_fd;
 };
 
 struct ph_lifecycle {

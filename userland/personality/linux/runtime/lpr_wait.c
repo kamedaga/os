@@ -6,7 +6,6 @@
 
 #define LPR_WAIT_NS_PER_MS 1000000ull
 #define LPR_WAIT_NS_PER_SEC 1000000000ull
-#define LPR_DRM_EVENT_RECHECK_NS (16ull * LPR_WAIT_NS_PER_MS)
 
 enum {
     LPR_WAIT_DRAIN_NONE = 0u,
@@ -161,17 +160,8 @@ int64_t lpr_wait_graph_add_fd(
             -LPR_LINUX_EBADF;
     }
     if (lpr_linux_drm_fd_active(fd)) {
-        const int64_t status = lpr_wait_graph_add_native(
-            graph, lpr_drm_native_wait_fd(fd), PACHA_FD_EVENT_READABLE);
-        if (status == 0 && (events & 0x0001u) != 0) {
-            /* The channel wakes immediately when gpud closes the DRM file,
-             * while render/KMS readiness remains in the sandbox DRM event
-             * list. Recheck that list at display cadence instead of sleeping
-             * until the caller's entire timeout expires. */
-            lpr_wait_graph_add_relative_deadline(
-                graph, LPR_DRM_EVENT_RECHECK_NS);
-        }
-        return status;
+        return lpr_wait_graph_add_native(graph, lpr_drm_native_wait_fd(fd),
+            PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP);
     }
     if (lpr_linux_input_fd_active(fd))
         return lpr_wait_graph_add_leaf(

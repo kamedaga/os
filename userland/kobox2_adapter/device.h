@@ -5,9 +5,11 @@
 #include "device_pci.h"
 #include "device_dma.h"
 #include "device_irq.h"
+#include <pacha/abi.h>
 
 #define PH_DEVICE_MMIO_MAPPINGS 64u
-#define PH_DEVICE_DMA_MAPPINGS 1024u
+/* Each live mapping owns a native FD; inventory must not impose a lower limit. */
+#define PH_DEVICE_DMA_MAPPINGS PACHA_FD_TABLE_LIMIT
 
 struct ph_image;
 

@@ -76,7 +76,9 @@ int main(void)
     lpr_wait_graph_init(&graph);
     assert(lpr_wait_graph_add_fd(&graph, 5, 1) == 0);
     assert(graph.leaf_count == 1 && graph.leaves[0].fd == 41);
-    assert(graph.relative_deadline_ns == LPR_DRM_EVENT_RECHECK_NS);
+    assert(graph.leaves[0].events ==
+        (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP));
+    assert(graph.relative_deadline_ns == UINT64_MAX);
     puts("LPR_PIPE_POLL_UNIT=OK");
     return 0;
 }

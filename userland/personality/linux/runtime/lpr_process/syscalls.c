@@ -216,6 +216,12 @@ static int lpr_thread_record_remove(lpr_thread_record_t *record)
     if (*cursor == record) {
         *cursor = record->next;
         record->next = 0;
+        /* The registry lock also pins this capability during tkill. Close it
+         * before the thread's stack/record can disappear or its FD be reused. */
+        if (record->signal_fd >= 16) {
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, record->signal_fd);
+            record->signal_fd = 0;
+        }
     }
     return lpr_state.threads.head == 0;
 }
@@ -233,6 +239,15 @@ static lpr_thread_record_t *lpr_thread_record_find(uint32_t tid)
     return 0;
 }
 
+static int lpr_thread_open_signal_fd(void)
+{
+    const int64_t fd = lpr_pacha_syscall4(PACHAOS_SYSCALL_FD_DUP,
+        PACHAOS_THREAD_SELF_FD, 16,
+        PACHA_FD_RIGHT_PROCESS_SIGNAL | PACHA_FD_RIGHT_CLOSE,
+        PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
+    return fd >= 16 ? (int)fd : (fd ? lpr_pacha_status_to_errno(fd) : -LPR_LINUX_EIO);
+}
+
 static int lpr_thread_find_or_create_current(lpr_thread_record_t **out)
 {
     const int64_t raw_tid = lpr_linux_gettid();
@@ -248,7 +263,13 @@ static int lpr_thread_find_or_create_current(lpr_thread_record_t **out)
             lpr_state_unlock(&lpr_state.threads.lock_word);
             return -LPR_LINUX_EINVAL;
         }
+        const int signal_fd = lpr_thread_open_signal_fd();
+        if (signal_fd < 0) {
+            lpr_state_unlock(&lpr_state.threads.lock_word);
+            return signal_fd;
+        }
         lpr_memset(record, 0, sizeof(*record));
+        record->signal_fd = signal_fd;
         record->tid = tid;
         record->started = 1;
         record->parent_ready = 1;
@@ -479,6 +500,10 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
     }
     const uint32_t tid = (uint32_t)raw_tid;
     lpr_signal_thread_state_t *signal_state = lpr_signal_thread_state_current();
+    const int signal_fd = lpr_thread_open_signal_fd();
+    if (signal_fd < 0) {
+        lpr_clone_thread_bootstrap_abort("signal-capability", signal_fd);
+    }
     signal_state->mask = record->signal_mask;
     const int64_t mask_status = lpr_linux_sync_native_signal_mask();
     if (mask_status != 0) {
@@ -486,7 +511,10 @@ void lpr_clone_thread_bootstrap(lpr_thread_record_t *record)
          * fault than never letting its creator return from clone(). */
         lpr_thread_bootstrap_log("degraded", "signal-mask", mask_status);
     }
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    record->signal_fd = signal_fd;
     record->tid = tid;
+    lpr_state_unlock(&lpr_state.threads.lock_word);
     if ((record->clone_flags & LPR_CLONE_PARENT_SETTID) != 0) {
         __atomic_store_n(record->parent_tid, tid, __ATOMIC_RELEASE);
     }
@@ -1152,10 +1180,21 @@ int64_t lpr_linux_tkill(uint64_t tid_raw, uint64_t sig_raw)
         return current_tid;
     }
     if (tid != current_tid) {
-        /* Native process signals select an eligible thread; using that path
-         * here would silently violate tkill's thread-directed contract. */
-        return lpr_linux_thread_exists((uint64_t)tid) ?
-            -LPR_LINUX_ENOSYS : -LPR_LINUX_ESRCH;
+        lpr_state_lock(&lpr_state.threads.lock_word);
+        lpr_thread_record_t *record = lpr_thread_record_find((uint32_t)tid);
+        if (record == NULL) {
+            lpr_state_unlock(&lpr_state.threads.lock_word);
+            return -LPR_LINUX_ESRCH;
+        }
+        if (sig == 0 || sig == LPR_LINUX_SIGKILL) {
+            lpr_state_unlock(&lpr_state.threads.lock_word);
+            /* SIGKILL terminates the entire thread group, even for tkill. */
+            return sig == 0 ? 0 : lpr_linux_kill(lpr_linux_getpid(), sig);
+        }
+        const int64_t status = lpr_pacha_syscall2(
+            PACHAOS_SYSCALL_THREAD_SIGNAL, record->signal_fd, sig);
+        lpr_state_unlock(&lpr_state.threads.lock_word);
+        return status == PACHAOS_SYSCALL_OK ? 0 : -LPR_LINUX_ESRCH;
     }
     if (sig == 0) {
         return 0;

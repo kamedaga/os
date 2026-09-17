@@ -3,11 +3,13 @@
 #define PACHA_KOBOX_DEVICE_DMA_H
 
 #include "boot/dma_host.h"
+#include <stdatomic.h>
 
 struct ph_dma_mapping {
     uint64_t iova;
     size_t length;
     int fd;
+    void *view;
 };
 
 struct ph_dma_config {
@@ -15,6 +17,7 @@ struct ph_dma_config {
     uint64_t native_device;
     uint64_t generation;
     void *ram;
+    int ram_fd;
     size_t ram_length;
     uint64_t aperture_start;
     uint64_t aperture_end;
@@ -25,6 +28,7 @@ struct ph_dma_config {
 struct ph_dma {
     struct kobox_linux_dma_host host;
     struct ph_dma_config config;
+    atomic_uint lock;
     unsigned int admitted;
     unsigned int enabled;
     unsigned int drained;

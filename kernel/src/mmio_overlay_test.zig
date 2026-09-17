@@ -80,6 +80,64 @@ fn unchanged(copy: *const vm.UserAddressSpace) !void {
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(copy), std.mem.asBytes(&spaces[0]));
 }
 
+test "MMIO overlay no-op protection preserves range validation and PTEs" {
+    init();
+    try std.testing.expect(vm.mapTrustedLowPageZeroPaddrsWithProt(owner, 0, &.{physical}, .{ .read = true, .exec = true }));
+    const before = try snapshot();
+    defer std.testing.allocator.destroy(before);
+    try std.testing.expect(vm.validateUserLinearRegion(owner, base, 4096));
+    for ([_][2]u64{
+        .{ 0, 4096 },       .{ base + 1, 4096 },         .{ base, 0 },
+        .{ 1 << 47, 4096 }, .{ (1 << 47) - 4096, 8192 }, .{ 0xffff_ffff_ffff_f000, 8192 },
+    }) |range| {
+        try std.testing.expect(!vm.validateUserLinearRegion(owner, range[0], @intCast(range[1])));
+    }
+    try std.testing.expect(!vm.validateUserLinearRegion(kernel.processPrincipalFromIndex(1).?, base, 4096));
+    try unchanged(before);
+    try std.testing.expectEqual(@as(usize, 0), flushes);
+}
+
+test "MMIO overlay trusted remap preserves identical PTEs including hardware A/D" {
+    init();
+    const paddrs = [_]u64{ physical, physical + 4096 };
+    const prot: kernel.MapProt = .{ .read = true, .write = true };
+    try std.testing.expect(vm.mapTrustedUserPaddrsWithProt(owner, base, &paddrs, prot));
+    const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+    spaces[0].pt_pages[slot][0] |= 1 << 5;
+    spaces[0].pt_pages[slot][1] |= (1 << 5) | (1 << 6);
+    const before = try snapshot();
+    defer std.testing.allocator.destroy(before);
+    try std.testing.expect(vm.remapTrustedUserPaddrsWithProt(owner, base, &paddrs, prot));
+    try unchanged(before);
+    try std.testing.expectEqual(@as(usize, 0), flushes);
+    // Validate the entire input before the equality fast path or any store.
+    try std.testing.expect(!vm.remapTrustedUserPaddrsWithProt(owner, base, &.{ physical + 8192, physical + 1 }, prot));
+    try unchanged(before);
+    try std.testing.expectEqual(@as(usize, 0), flushes);
+}
+
+test "MMIO overlay trusted remap keeps full-range shootdown for every non-AD difference" {
+    const prot: kernel.MapProt = .{ .read = true, .write = true };
+    // Present, RW, user, PWT, PCD, PAT, physical address, pkey and NX.
+    for ([_]u6{ 0, 1, 2, 3, 4, 7, 12, 59, 63 }) |bit| {
+        init();
+        const paddrs = [_]u64{ physical, physical + 4096 };
+        try std.testing.expect(vm.mapTrustedUserPaddrsWithProt(owner, base, &paddrs, prot));
+        const slot = vm.ensureUserPtSlotForPd(&spaces[0], 1, 0, 0).?;
+        const expected = spaces[0].pt_pages[slot][0..2].*;
+        spaces[0].pt_pages[slot][0] |= (1 << 5) | (1 << 6);
+        spaces[0].pt_pages[slot][1] ^= @as(u64, 1) << bit;
+        try std.testing.expect(vm.remapTrustedUserPaddrsWithProt(owner, base, &paddrs, prot));
+        try std.testing.expectEqualSlices(u64, &expected, spaces[0].pt_pages[slot][0..2]);
+        try std.testing.expectEqual(@as(usize, 1), flushes);
+    }
+    // A missing PT must take the original allocation path, not report a no-op.
+    init();
+    try std.testing.expect(vm.remapTrustedUserPaddrsWithProt(owner, base, &.{physical}, prot));
+    try std.testing.expectEqual(@as(?u64, physical), vm.lookupUserMappedPaddrForVa(owner, base));
+    try std.testing.expectEqual(@as(usize, 1), flushes);
+}
+
 test "MMIO overlay retains reservations and retires PT PD PDP on repeated last-close" {
     init();
     // The VMA admission test is separate. Test both low-level reservation

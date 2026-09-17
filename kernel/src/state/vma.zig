@@ -199,7 +199,9 @@ pub fn rangeOverlapsPinnedUserObjectExcept(
     except_object: ?KernelObjectRef,
 ) bool {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
-    for (self.fd_objects[0..], 0..) |*slot, object_index| {
+    var candidates = self.pinned_object_slots.iterator(.{});
+    while (candidates.next()) |object_index| {
+        const slot = &self.fd_objects[object_index];
         const object_range = pinnedUserObjectRange(slot, owner_raw) orelse continue;
         if (except_object) |except| {
             if (except.kind == slot.kind and
@@ -235,7 +237,9 @@ pub fn rangeConflictsWithDmaDerivation(
     vtd_active: bool,
 ) bool {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
-    for (self.fd_objects[0..], 0..) |*slot, object_index| {
+    var candidates = self.pinned_object_slots.iterator(.{});
+    while (candidates.next()) |object_index| {
+        const slot = &self.fd_objects[object_index];
         const object_range = pinnedUserObjectRange(slot, owner_raw) orelse continue;
         if (!rangesOverlap(start_va, size_bytes, object_range.start_va, object_range.size_bytes)) continue;
 
@@ -968,6 +972,9 @@ pub fn setVmaProtRange(self: anytype, owner: PrincipalId, start_va: u64, size_by
         const entry_end = entry.endVa();
         if (start_va < entry.start_va or end_va > entry_end) continue;
         if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, entry.max_prot)) return KernelError.InvalidState;
+
+        // An unchanged subrange needs neither VMA slots nor extra backing refs.
+        if (@as(u8, @bitCast(entry.prot)) == @as(u8, @bitCast(prot))) return;
 
         if (entry.start_va == start_va and entry.size_bytes == size_bytes) {
             entry.prot = prot;

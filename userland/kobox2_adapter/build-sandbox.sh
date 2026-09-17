@@ -23,7 +23,7 @@ sources=("$adapter/sandbox_main.c" "$adapter/runtime.c" "$adapter/entry.S"
   "$adapter/boot.c" "$adapter/package.c" "$adapter/module_package.c"
   "$adapter/lifecycle.c" "$adapter/ipc.c" "$adapter/bootstrap.c"
   "$repo_root/userland/libpacha/src/syscall.c"
-  "$sandbox/boot/package.c" "$sandbox/arch/x86_64/elf.c"
+  "$sandbox/boot/package.c" "$sandbox/boot/fixed_image.c" "$sandbox/arch/x86_64/elf.c"
   "$sandbox/machine/domain.c" "$sandbox/boot/core.c"
   "$protocol/src/closure_manifest.c" "$protocol/src/resource_grant.c" "$protocol/src/sha256.c")
 flags=(-DPH_SANDBOX_DEVICE="$device")

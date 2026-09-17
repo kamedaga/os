@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 xfce_root="${repo_root}/.artifacts/userland-fixtures/alpine-xfce-root"
 lock="${repo_root}/tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+writer_lock="${repo_root}/tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
 manifest="${repo_root}/.artifacts/manifests/rootfs.generated.txt"
 linux_musl="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
@@ -14,13 +15,17 @@ pine2_root="${repo_root}/.artifacts/userland-fixtures/pine2-gtk-root"
 cd "${repo_root}"
 bash tools/build_wsl_alpine_xfce.sh
 
-package_count="$(awk '$1 !~ /^#/ { count++ } END { print count + 0 }' "${lock}")"
-locked_count="$(awk '$1 == "#" && $2 == "package-count" { print $3 }' "${lock}")"
+package_count="$(awk '$1 !~ /^#/ { count++ } END { print count + 0 }' \
+  "${lock}" "${writer_lock}")"
+locked_count="$(awk '$1 == "#" && $2 == "package-count" { count += $3 } END { print count + 0 }' \
+  "${lock}" "${writer_lock}")"
 [[ -n "${locked_count}" && "${package_count}" == "${locked_count}" ]] || {
   echo "Xfce package lock count mismatch: metadata=${locked_count:-missing} entries=${package_count}" >&2
   exit 1
 }
 cmp "${lock}" "${xfce_root}/usr/share/pacha/xfce-packages.lock"
+cmp "${writer_lock}" \
+  "${xfce_root}/usr/share/pacha/libreoffice-packages.lock"
 
 for required in \
   bin/busybox \

@@ -9,12 +9,24 @@ static int64_t tid = 1;
 static unsigned opens, registrations, closes, calls, lock_depth, tid_calls;
 static unsigned live[256];
 static int fail_open, fail_register;
+static int fail_signal_fd;
 
 void *lpr_memset(void *p, int c, size_t n) { return memset(p, c, n); }
 void lpr_state_lock(volatile uint32_t *word) { (void)word; assert(!lock_depth++); }
 void lpr_state_unlock(volatile uint32_t *word) { (void)word; assert(lock_depth-- == 1); }
 void lpr_linux_signal_hint_reset_for_fork_child(void) {}
 int64_t lpr_pacha_syscall0(uint64_t nr) { assert(nr == PACHAOS_SYSCALL_GETTID); tid_calls++; return tid; }
+int64_t lpr_pacha_status_to_errno(int64_t status) { (void)status; return -ENOMEM; }
+int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t minimum, uint64_t rights, uint64_t flags)
+{
+    assert(nr == PACHAOS_SYSCALL_FD_DUP && fd == PACHAOS_THREAD_SELF_FD && minimum == 16);
+    assert(rights == (PACHA_FD_RIGHT_PROCESS_SIGNAL | PACHA_FD_RIGHT_CLOSE));
+    assert(flags == (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC));
+    if (fail_signal_fd) return -1;
+    for (int i = 255; i >= 16; i--) if (!live[i]) { live[i] = 1; return i; }
+    assert(!"thread capability table exhausted");
+    return -1;
+}
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
 {
     (void)nr; (void)a0; (void)a1;
@@ -69,7 +81,8 @@ int lpr_unix_client_call(const struct lpr_unix_client *client, struct unix_contr
 
 static void empty(void)
 {
-    for (unsigned fd = 16; fd < 256; fd++) assert(!live[fd]);
+    for (unsigned fd = 16; fd < 256; fd++)
+        if (fd != (unsigned)lpr_state.threads.main_thread.signal_fd) assert(!live[fd]);
 }
 
 int main(void)
@@ -77,6 +90,10 @@ int main(void)
     lpr_supervisor_token = 101;
     struct lpr_unix_context *first = NULL;
     assert(lpr_unix_context_current(NULL) == -EINVAL);
+    fail_signal_fd = 1;
+    assert(lpr_unix_context_current(&first) == -ENOMEM && !first);
+    assert(!lpr_state.threads.head); empty();
+    fail_signal_fd = 0;
     fail_open = 1;
     assert(lpr_unix_context_current(&first) == -ENOMEM && !first); empty();
     fail_open = 0; fail_register = 1;
@@ -125,7 +142,11 @@ int main(void)
     assert(first->request == 1 && first->notifier.client == &first->client);
     first->request = UINT64_MAX;
     assert(lpr_unix_context_call(first, &request, NULL, 0, NULL, 0, &received) == -EOVERFLOW && !received);
-    lpr_unix_context_destroy(first); empty();
+    lpr_unix_context_destroy(first);
+    lpr_state_lock(&lpr_state.threads.lock_word);
+    assert(lpr_thread_record_remove(&lpr_state.threads.main_thread));
+    lpr_state_unlock(&lpr_state.threads.lock_word);
+    assert(!lpr_state.threads.main_thread.signal_fd); empty();
     tid = -1;
     assert(lpr_unix_context_current(&first) == -LPR_LINUX_EINVAL && !first);
     assert(!lock_depth);

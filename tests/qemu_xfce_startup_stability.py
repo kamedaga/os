@@ -214,7 +214,14 @@ def main() -> int:
                 # Snapshot the unperturbed CPU state first.  The diagnostic tty
                 # request intentionally wakes the guest only after this point.
                 cpu_activity = dump_cpu_state(qmp, cpu_path, cpus)
-                dump_screen(qmp, screenshot_path)
+                screenshot_error: str | None = None
+                try:
+                    dump_screen(qmp, screenshot_path)
+                except RuntimeError as exc:
+                    # The KMS device can legitimately have no QEMU surface
+                    # while startup is stalled.  Process state is still the
+                    # primary hang evidence, so do not lose it here.
+                    screenshot_error = str(exc)
                 if classification == "hang":
                     console.sendall(DIAG_REQUEST)
                 tree = wait_for_process_tree(
@@ -229,13 +236,13 @@ def main() -> int:
                 evidence_complete = (
                     cpu_path.is_file()
                     and cpu_path.stat().st_size > 0
-                    and screenshot_path.is_file()
-                    and screenshot_path.stat().st_size > 0
                     and tree_path.is_file()
                     and tree_path.stat().st_size > 0
                 )
                 if not evidence_complete:
                     error = "anomaly evidence incomplete"
+                elif screenshot_error is not None:
+                    error = "screenshot unavailable: " + screenshot_error
             else:
                 # Keep the real session alive for optional application checks;
                 # readiness alone is not evidence of a usable desktop.

@@ -425,12 +425,13 @@ test "capsule device authority is a native fd object" {
 test "pinned overlap exception is exact and other pins still reject" {
     var s = try initFdState();
     const base: u64 = 0x4000_0000;
+    s.next_fd_object_scan = kernel.max_fd_objects - 1;
     const source_fd = try s.createDmaBufferFd(p0, .{
         .device = 1,
         .user_va = base + 0x80,
         .iova = 0x8000_0080,
         .size = 64,
-    }, fdRights(.{ .close = true }), .{}, 16);
+    }, fdRights(.{ .close = true, .dup = true }), .{}, 16);
     const source_ref = (s.fdEntryConst(p0, source_fd) orelse unreachable).object;
 
     try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, base, 4096));
@@ -448,6 +449,30 @@ test "pinned overlap exception is exact and other pins still reject" {
         .direction = .to_device,
     }, fdRights(.{ .close = true }), .{}, 16);
     try std.testing.expect(s.rangeOverlapsPinnedUserObjectExcept(p0, base, 4096, source_ref));
+
+    const alias = try s.dupFd(p0, source_fd, 16, fdRights(.{ .close = true }), .{});
+    try s.closeFd(p0, source_fd);
+    try std.testing.expect(s.pinned_object_slots.isSet(source_ref.index));
+    var free_list = FreePageList{};
+    try s.closeFdWithFreeList(p0, alias, &free_list);
+    try std.testing.expect(!s.pinned_object_slots.isSet(source_ref.index));
+    try std.testing.expect(s.rangeOverlapsPinnedUserObject(p0, base, 4096));
+    s.next_fd_object_scan = source_ref.index;
+    const reused = try createTestFdObject(&s, 22);
+    try std.testing.expectEqual(source_ref.index, reused.index);
+    try std.testing.expect(reused.generation != source_ref.generation);
+    try std.testing.expect(!s.pinned_object_slots.isSet(reused.index));
+    s.resetKernelObjectTable();
+    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
+    try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, base, 4096));
+    // An unpublished object is indexed, but ref_count=0 is not a live pin.
+    const pending = try s.createKernelObject(.dma_mapping, .{ .dma_mapping = .{
+        .owner_principal_raw = @intFromEnum(p0), .user_va = base, .size = 64,
+    } });
+    try std.testing.expect(s.pinned_object_slots.isSet(pending.index));
+    try std.testing.expect(!s.rangeOverlapsPinnedUserObject(p0, base, 4096));
+    s.clearKernelObjectSlot(s.kernelObjectSlot(pending).?);
+    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
 }
 
 test "DMA derivation aliases DMA pins only when explicitly allowed" {
@@ -749,6 +774,8 @@ test "owner teardown revokes exact pinned aliases only" {
     try std.testing.expect(s.fdEntryConst(p0, owner_fd) == null);
     try std.testing.expect(s.fdEntryConst(p1, alias_fd) == null);
     try std.testing.expectEqual(@as(?u32, null), s.kernelObjectRefCount(owner_ref));
+    try std.testing.expect(!s.pinned_object_slots.isSet(owner_ref.index));
+    try std.testing.expect(s.pinned_object_slots.isSet(unrelated_ref.index));
     try std.testing.expectEqual(unrelated_ref, (s.fdEntryConst(p1, unrelated_fd) orelse unreachable).object);
     try std.testing.expectEqual(@as(?u32, 1), s.kernelObjectRefCount(unrelated_ref));
 }
@@ -787,6 +814,14 @@ test "scatter DMA mapping validates fd capacity without allocator side storage" 
         .size = 4096,
         .page_count = 1,
     }, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries)));
+    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
+    try std.testing.expectError(KernelError.TableFull, s.createDmaBufferFd(p0, .{
+        .device = 1,
+        .user_va = 0x4500_0000,
+        .iova = 0x8200_0000,
+        .size = 4096,
+    }, fdRights(.{ .close = true }), .{}, @intCast(kernel.fd_table_entries)));
+    try std.testing.expectEqual(@as(usize, 0), s.pinned_object_slots.count());
 }
 
 test "owner revoke tears down scatter DMA without side storage" {
@@ -1451,6 +1486,52 @@ test "fd wait group cancellation survives a destroyed object in the registration
     );
 }
 
+test "fd wait group counts preserve colliding threads and exact cancellation" {
+    var s = try initFdState();
+    const collision = 7 + kernel.max_fd_wait_groups;
+    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+    s.cancelFdWaitGroupsForThread(p0, 7, 11);
+    const first = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    _ = try s.beginFdWaitGroup(p0, 7, 11, 2);
+    const other_thread = try s.beginFdWaitGroup(p1, collision, 11, 3);
+    const other_generation = try s.beginFdWaitGroup(p0, 7, 12, 4);
+    try std.testing.expectEqual(@as(u16, 4), s.fd_wait_group_thread_counts[7]);
+    s.cancelFdWaitGroup(first, 99);
+    s.cancelFdWaitGroupsForThread(p1, 7, 11);
+    try std.testing.expectEqual(@as(u16, 4), s.fd_wait_group_thread_counts[7]);
+    s.cancelFdWaitGroupsForThread(p0, 7, 11);
+    try std.testing.expectEqual(@as(u16, 2), s.fd_wait_group_thread_counts[7]);
+    try std.testing.expect(s.fd_wait_groups[other_thread.index].state == .building);
+    try std.testing.expect(s.fd_wait_groups[other_generation.index].state == .building);
+    s.cancelFdWaitGroup(first, 1);
+    try std.testing.expectEqual(@as(u16, 2), s.fd_wait_group_thread_counts[7]);
+    s.cancelFdWaitGroupsForOwner(p1);
+    try std.testing.expectEqual(@as(u16, 1), s.fd_wait_group_thread_counts[7]);
+    s.cancelFdWaitGroupsForThread(p0, 7, 12);
+    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+}
+
+test "fd wait group counts survive failed setup full capacity and reset" {
+    var s = try initFdState();
+    try std.testing.expectError(KernelError.InvalidState, s.beginFdWaitGroup(p0, 7, 11, 0));
+    const failed_setup = try s.beginFdWaitGroup(p0, 7, 11, 1);
+    try std.testing.expectError(KernelError.InvalidState, s.linkFdWaitRegistration(failed_setup, .{}));
+    try s.armFdWaitGroup(failed_setup);
+    try std.testing.expectError(KernelError.InvalidState, s.armFdWaitGroup(failed_setup));
+    s.cancelFdWaitGroup(failed_setup, 1);
+    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+    for (0..kernel.max_fd_wait_groups) |i|
+        _ = try s.beginFdWaitGroup(p0, 7, 11, i + 1);
+    try std.testing.expectError(KernelError.TableFull, s.beginFdWaitGroup(p0, 7, 11, 999));
+    try std.testing.expectEqual(@as(u16, kernel.max_fd_wait_groups), s.fd_wait_group_thread_counts[7]);
+    s.cancelFdWaitGroupsForOwner(p0);
+    try std.testing.expectEqual(@as(u16, 0), s.fd_wait_group_thread_counts[7]);
+    _ = try s.beginFdWaitGroup(p0, 7, 11, 1000);
+    try s.initFromDetectedRegionsInPlace(1);
+    for (s.fd_wait_group_thread_counts) |count|
+        try std.testing.expectEqual(@as(u16, 0), count);
+}
+
 test "delayed target cannot cancel a reused fd wait group slot" {
     var s = try initFdState();
     const rights = fdRights(.{
@@ -1502,6 +1583,7 @@ test "delayed target cannot cancel a reused fd wait group slot" {
     try s.armFdWaitGroup(new_group);
 
     s.cancelFdWaitGroup(delayed[0].group, delayed[0].wait_token);
+    try std.testing.expectEqual(@as(u16, 1), s.fd_wait_group_thread_counts[7]);
     var current: [1]kernel.ThreadWakeTarget = undefined;
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -2232,6 +2314,7 @@ test "MMIO reservation admission rejects used NONE RAM and COW" {
     const vmo = try s.createAnonymousVmaWithPages(p0, base, 3 * 4096, .{}, ceiling, flags, &free_list);
     // Splitting a non-COW VMA also advances cow_page_offset. That inactive
     // offset is not COW authority; backing checks must use the VMO offset.
+    try s.setVmaProtRange(p0, base + 4096, 4096, vmaProt(.{ .read = true }));
     try s.setVmaProtRange(p0, base + 4096, 4096, .{});
     const middle = s.vmaEntryForVaConst(p0, base + 4096) orelse unreachable;
     try std.testing.expect(middle.cow_table.isNull() and middle.cow_page_offset != 0);
@@ -2798,6 +2881,16 @@ test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
     s.markForkCowVmasCommitted(p0);
     try std.testing.expect((s.vmaEntryConst(p0, arena_va) orelse unreachable).flags.fork_cow);
 
+    const child_before = child_after_fork.*;
+    const child_count = s.getVmaTable(p1).?.active_count;
+    const vmo_refs = s.nativeVmoRefCount(child_before.vmo);
+    const cow_refs: ?u32 = if (s.nativeCowTableSlotConst(child_before.cow_table)) |cow| cow.ref_count else null;
+    try s.setVmaProtRange(p1, arena_va + 4096, 4096, vmaProt(.{}));
+    try std.testing.expectEqualDeep(child_before, child_after_fork.*);
+    try std.testing.expectEqual(child_count, s.getVmaTable(p1).?.active_count);
+    try std.testing.expectEqual(vmo_refs, s.nativeVmoRefCount(child_before.vmo));
+    try std.testing.expectEqual(cow_refs, if (s.nativeCowTableSlotConst(child_before.cow_table)) |cow| @as(?u32, cow.ref_count) else null);
+
     try s.setVmaProtRange(p1, arena_va, 4096, vmaProt(.{ .read = true, .write = true }));
     const child_enabled = s.vmaEntryConst(p1, arena_va) orelse unreachable;
     try std.testing.expect(child_enabled.flags.fork_cow);
@@ -2812,6 +2905,11 @@ test "fork keeps PROT_NONE private mappings COW when mprotect enables writes" {
         &free_list,
     ) orelse unreachable;
     try std.testing.expect(child_write.prot.write);
+    const child_dirty = (s.vmaEntryConst(p1, arena_va) orelse unreachable).*;
+    const dirty_refs = s.nativeCowTableSlotConst(child_dirty.cow_table).?.ref_count;
+    try s.setVmaProtRange(p1, arena_va, 4096, child_dirty.prot);
+    try std.testing.expectEqualDeep(child_dirty, (s.vmaEntryConst(p1, arena_va) orelse unreachable).*);
+    try std.testing.expectEqual(dirty_refs, s.nativeCowTableSlotConst(child_dirty.cow_table).?.ref_count);
     try std.testing.expectEqual(
         @as(?u64, child_write.paddr),
         s.entryDirtyPagePaddr(s.vmaEntryConst(p1, arena_va) orelse unreachable, arena_va),
@@ -2867,6 +2965,11 @@ test "mprotect middle split fails atomically when only one VMA slot is free" {
     try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
     const original = table.entries[source_index];
     const original_refs = s.nativeVmoRefCount(vmo);
+
+    try s.setVmaProtRange(p0, mapping_va + 4096, 4096, original.prot);
+    try std.testing.expectEqual(original, table.entries[source_index]);
+    try std.testing.expectEqual(kernel.max_vmas_per_process - 1, table.active_count);
+    try std.testing.expectEqual(original_refs, s.nativeVmoRefCount(vmo));
 
     try std.testing.expectError(
         KernelError.TableFull,

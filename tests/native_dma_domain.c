@@ -19,6 +19,10 @@ _Noreturn void ph_fail(const char *file, unsigned line, uint64_t result) {
     fail_at(line);
 }
 
+void ph_log(const char *text) {
+    log_text(text);
+}
+
 static void acquire_device(void) {
     const struct seed0_init_descriptor_page *boot = seed0_bootstrap_descriptor();
     CHECK(boot && boot->device_count <= SEED0_INIT_MAX_DEVICE_DESCRIPTORS);

@@ -1386,6 +1386,20 @@ pub fn remapTrustedUserPaddrsWithProt(
         if ((paddr & 0xFFF) != 0 or paddr >= h.physical_map_limit) return false;
     }
 
+    // Hardware A/D updates do not change mapping identity. Leave an entirely
+    // identical range untouched, including its A/D bits, without a shootdown.
+    const accessed_dirty: u64 = (1 << 5) | (1 << 6);
+    page_index = 0;
+    while (page_index < paddrs.len) : (page_index += 1) {
+        const va = va_start + @as(u64, @intCast(page_index)) * 4096;
+        const index = userPageIndexForVa(h, va) orelse return false;
+        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse break;
+        const old = space.pt_pages[pt_slot][index.pt];
+        const desired = paddrs[page_index] | pte_flags;
+        if ((old & ~accessed_dirty) != (desired & ~accessed_dirty)) break;
+    }
+    if (page_index == paddrs.len) return true;
+
     page_index = 0;
     while (page_index < paddrs.len) : (page_index += 1) {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
@@ -1794,6 +1808,15 @@ fn unmapPresentWithPolicy(
     retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
 
     return true;
+}
+
+/// Validate a no-op VM operation without changing PTEs or issuing a shootdown.
+pub fn validateUserLinearRegion(principal: kernel.PrincipalId, va_start: u64, size_bytes: usize) bool {
+    if (!lockAddressSpace(principal)) return false;
+    defer unlockAddressSpace(principal);
+    const h = hooks orelse return false;
+    _ = getUserSpace(principal) orelse return false;
+    return userRangeEndVa(h, va_start, @intCast(size_bytes)) != null;
 }
 
 pub fn invalidatePresentUserLinearRegionPtes(

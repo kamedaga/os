@@ -23,7 +23,7 @@ static kobox_linux_task_notification_fn linux_notification_dispatch;
 
 static int monotonic(uint64_t *nanoseconds);
 
-/* All callers hold owner_lock and mask native notifications before taking it.
+/* All callers hold owner_lock and defer Linux notification entry before taking it.
  * Waiters snapshot the sequence while locked, then futex-wait after unlocking. */
 static void wake_cpu_waiters(struct ph_cpu *cpu) {
     atomic_fetch_add_explicit(&cpu->owner_sequence, 1, memory_order_release);

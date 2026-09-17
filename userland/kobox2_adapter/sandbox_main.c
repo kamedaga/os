@@ -50,6 +50,7 @@ static void prepare_device(const struct kobox_linux_boot_layout *layout, void *c
                                            .pci = &device.pci.host,
                                            .dma = &device.dma.host,
                                            .irq = &device.irq.host,
+                                           .drm_events = &gpu_queue.event_host,
                                            .render_file_limit = GPUD_GPU_NATIVE_SESSION_LIMIT};
 }
 #endif
@@ -92,6 +93,9 @@ static void run_service(void *context) {
     memcpy(&run, &symbol, sizeof(run));
     int result = run(&launch, &report);
     ph_lifecycle_finish(&lifecycle);
+#if PH_SANDBOX_DEVICE
+    PH_OK(ph_gpu_queue_finish(&gpu_queue));
+#endif
     ph_number("package modules loaded", report.loaded);
     ph_number("package modules unloaded", report.unloaded);
     ph_number("package module result", report.result);

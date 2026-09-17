@@ -106,6 +106,29 @@ uint32_t ph_gpu_session_acquire(struct gpud_gpu_sessions *sessions,
     return KB2_GPU_STATUS_OK;
 }
 
+uint32_t ph_gpu_session_event_acquire(struct gpud_gpu_sessions *sessions,
+                                      uint64_t generation,
+                                      uint64_t client,
+                                      uint64_t cookie,
+                                      uint64_t *id_out) {
+    if (!sessions || !sessions->generation || !client || !cookie || !id_out)
+        return KB2_GPU_STATUS_INVALID;
+    if (generation != sessions->generation)
+        return KB2_GPU_STATUS_STALE_GENERATION;
+    for (size_t i = 0; i < sessions->limit; ++i) {
+        struct gpud_gpu_session *entry = &sessions->entries[i];
+        if (entry->state != GPUD_GPU_SESSION_OPEN ||
+            entry->client != client || entry->file_cookie != cookie)
+            continue;
+        if (entry->in_flight == UINT32_MAX)
+            return KB2_GPU_STATUS_LIMIT;
+        ++entry->in_flight;
+        *id_out = entry->id;
+        return KB2_GPU_STATUS_OK;
+    }
+    return KB2_GPU_STATUS_NOT_FOUND;
+}
+
 uint32_t ph_gpu_session_release(struct gpud_gpu_sessions *sessions,
                                 uint64_t generation,
                                 uint64_t client,

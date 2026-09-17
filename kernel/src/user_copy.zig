@@ -166,8 +166,14 @@ fn mapPhysPageForKernelAccess(page_paddr: u64, cpu_slot: usize) ?[*]u8 {
     if (page_base >= h.physical_map_limit) return null;
     if (cpu_slot >= smp.max_cpus or cpu_slot >= h.phys_copy_window_pt.len) return null;
     const window_va = h.phys_copy_window_va + (@as(u64, @intCast(cpu_slot)) * 4096);
-    h.phys_copy_window_pt[cpu_slot] = page_base | h.page_present | h.page_rw;
-    h.invlpg(window_va);
+    const desired = page_base | h.page_present | h.page_rw;
+    const accessed_dirty: u64 = (1 << 5) | (1 << 6);
+    // The guard pins this CPU and excludes reentry. Reusing its current
+    // mapping requires neither a PTE store nor local TLB invalidation.
+    if ((h.phys_copy_window_pt[cpu_slot] & ~accessed_dirty) != desired) {
+        h.phys_copy_window_pt[cpu_slot] = desired;
+        h.invlpg(window_va);
+    }
     return @ptrFromInt(window_va);
 }
 
@@ -729,4 +735,61 @@ pub fn flushUserTlbForPrincipalRange(principal: kernel.PrincipalId, va: u64, siz
     const h = getHooks();
     const target_cr3 = h.user_space_cr3_for_principal(principal);
     flushTlbForCr3Range(target_cr3, va, size_bytes);
+}
+
+test "copy window preserves identical mappings and invalidates every semantic change" {
+    const Mock = struct {
+        var calls: usize = 0;
+        var last_va: u64 = 0;
+        fn invalidate(va: u64) void {
+            calls += 1;
+            last_va = va;
+        }
+    };
+    const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
+    defer {
+        if (saved) |h| init(h) else user_copy_hooks_ready = false;
+    }
+    var pt = [_]u64{0} ** 512;
+    init(.{
+        .state = undefined,
+        .free_list = undefined,
+        .physical_map_limit = 1 << 32,
+        .phys_copy_window_va = 0x400000,
+        .page_present = 1,
+        .page_rw = 2,
+        .kernel_cr3_value = undefined,
+        .user_space_cr3_for_principal = undefined,
+        .phys_copy_window_pt = &pt,
+        .read_cr3 = undefined,
+        .write_cr3 = undefined,
+        .invlpg = Mock.invalidate,
+    });
+    Mock.calls = 0;
+    try std.testing.expectEqual(@as(usize, 0x400000), @intFromPtr(mapPhysPageForKernelAccess(0x12345, 0).?));
+    try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    pt[0] |= (1 << 5) | (1 << 6);
+    _ = mapPhysPageForKernelAccess(0x12000, 0).?;
+    try std.testing.expectEqual(@as(u64, 0x12063), pt[0]);
+    try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    // A second CPU has a distinct slot and virtual window.
+    try std.testing.expectEqual(@as(usize, 0x401000), @intFromPtr(mapPhysPageForKernelAccess(0x13000, 1).?));
+    try std.testing.expectEqual(@as(u64, 0x401000), Mock.last_va);
+    try std.testing.expectEqual(@as(u64, 0x12063), pt[0]);
+    for ([_]u6{ 0, 1, 2, 3, 4, 7, 8, 12, 59, 63 }) |bit| {
+        pt[0] = 0x12063 ^ (@as(u64, 1) << bit);
+        Mock.calls = 0;
+        _ = mapPhysPageForKernelAccess(0x12000, 0).?;
+        try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
+        try std.testing.expectEqual(@as(u64, 0x400000), Mock.last_va);
+        try std.testing.expectEqual(@as(usize, 1), Mock.calls);
+    }
+    const before = pt;
+    Mock.calls = 0;
+    try std.testing.expect(mapPhysPageForKernelAccess(1 << 32, 0) == null);
+    try std.testing.expect(mapPhysPageForKernelAccess(0x12000, smp.max_cpus) == null);
+    try std.testing.expect(mapPhysPageForKernelAccess(0x12000, 512) == null);
+    try std.testing.expectEqualSlices(u64, &before, &pt);
+    try std.testing.expectEqual(@as(usize, 0), Mock.calls);
 }

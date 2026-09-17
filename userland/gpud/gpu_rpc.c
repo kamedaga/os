@@ -15,11 +15,26 @@ static int now_ms(uint64_t *now) {
     return 0;
 }
 
+static int is_event_notification(
+    const struct gpud_gpu_rpc *rpc, const struct ph_ipc_packet *packet) {
+    return packet->operation == PH_GPU_QUEUE_NOTIFY &&
+        !packet->correlation && !packet->fd_count &&
+        packet->value == rpc->channel->lanes[GPUD_GPU_QUEUE_EVENT]
+            .queue.used_notification_id;
+}
+
 static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t deadline) {
     for (;;) {
         struct ph_ipc_packet *packet = &rpc->incoming;
         int error = ph_ipc_receive(rpc->ipc, rpc->ipc->generation, packet);
         if (!error) {
+            if (is_event_notification(rpc, packet)) {
+                rpc->event_notification = 1;
+                int cleanup = ph_ipc_packet_release(packet);
+                if (cleanup)
+                    return cleanup;
+                continue;
+            }
             int valid = packet->operation == PH_GPU_QUEUE_NOTIFY && !packet->correlation &&
                 !packet->fd_count && packet->value == notification;
             if (!valid &&
@@ -53,6 +68,88 @@ static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t d
             return -EIO;
         }
     }
+}
+
+static int post_event_buffer(struct gpud_gpu_rpc *rpc) {
+    kb2_vq_t *lane = &rpc->channel->lanes[GPUD_GPU_QUEUE_EVENT];
+    int ready, notify;
+    if (kb2_vq_arm(lane, rpc->ipc->generation, &ready) || ready ||
+        kb2_vq_publish(lane, rpc->ipc->generation,
+            &rpc->event_chain, &notify))
+        return -EPROTO;
+    if (notify) {
+        struct ph_ipc_packet packet = {
+            .operation = PH_GPU_QUEUE_NOTIFY,
+            .generation = rpc->ipc->generation,
+            .value = lane->queue.available_notification_id,
+        };
+        return ph_ipc_send(rpc->ipc, &packet);
+    }
+    return 0;
+}
+
+int gpud_gpu_rpc_start_events(struct gpud_gpu_rpc *rpc) {
+    if (!rpc || !rpc->ipc || !rpc->channel || !rpc->mapping ||
+        rpc->error || rpc->event_started)
+        return -EINVAL;
+    rpc->event_segment = (kb2_vq_segment_t) {
+        .address = GPUD_GPU_EVENT_OFFSET,
+        .length = GPUD_GPU_CHANNEL_PAGE,
+        .writable = 1,
+    };
+    rpc->event_chain = (kb2_vq_chain_t) {
+        .segments = &rpc->event_segment,
+        .capacity = 1,
+        .count = 1,
+    };
+    int error = post_event_buffer(rpc);
+    if (error)
+        return rpc->error = error;
+    rpc->event_started = 1;
+    return 0;
+}
+
+int gpud_gpu_rpc_next_event(struct gpud_gpu_rpc *rpc,
+    unsigned char *message, size_t capacity, size_t *size_out) {
+    if (!rpc || !rpc->ipc || !rpc->channel || !rpc->mapping ||
+        !message || !size_out || capacity < GPUD_GPU_CHANNEL_PAGE ||
+        !rpc->event_started)
+        return -EINVAL;
+    if (rpc->error)
+        return rpc->error;
+    if (!rpc->event_notification) {
+        int error = ph_ipc_receive(
+            rpc->ipc, rpc->ipc->generation, &rpc->incoming);
+        if (error == -EAGAIN)
+            return 0;
+        if (error)
+            return rpc->error = error;
+        const struct ph_ipc_packet *packet = &rpc->incoming;
+        int valid = is_event_notification(rpc, packet);
+        int cleanup = ph_ipc_packet_release(&rpc->incoming);
+        if (cleanup)
+            return rpc->error = cleanup;
+        if (!valid)
+            return rpc->error = -EPROTO;
+        rpc->event_notification = 1;
+    }
+    kb2_vq_t *lane = &rpc->channel->lanes[GPUD_GPU_QUEUE_EVENT];
+    kb2_vq_chain_t *done = NULL;
+    if (kb2_vq_take_used(lane, rpc->ipc->generation, &done) ||
+        done != &rpc->event_chain || !done->used_length ||
+        done->used_length > GPUD_GPU_CHANNEL_PAGE ||
+        kb2_vq_copy_response(lane, rpc->ipc->generation, done, 0,
+            message, done->used_length))
+        return rpc->error = -EPROTO;
+    const size_t used = done->used_length;
+    if (kb2_vq_release(lane, rpc->ipc->generation, done))
+        return rpc->error = -EPROTO;
+    *size_out = used;
+    rpc->event_notification = 0;
+    int error = post_event_buffer(rpc);
+    if (error)
+        return rpc->error = error;
+    return 1;
 }
 
 static int take_attachment(struct gpud_gpu_rpc *rpc, uint32_t operation,
@@ -111,6 +208,15 @@ int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
         error = ph_ipc_receive(rpc->ipc, rpc->ipc->generation, &rpc->incoming);
         if (!error) {
             const struct ph_ipc_packet *reply = &rpc->incoming;
+            if (is_event_notification(rpc, reply)) {
+                rpc->event_notification = 1;
+                int cleanup = ph_ipc_packet_release(&rpc->incoming);
+                if (cleanup) {
+                    error = cleanup;
+                    goto failed;
+                }
+                continue;
+            }
             int valid = reply->operation == PH_GPU_MAPPING_RELEASED &&
                 reply->generation == rpc->ipc->generation &&
                 reply->correlation == correlation && reply->value == mapping_id &&

@@ -938,11 +938,10 @@ apps:
   lpr_linux_musl_libc:
     file:
       path: ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
-      rebuild: ["bash", "userland/personality/linux/build-musl-runtime.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
+      rebuild: ["bash", "tools/copy_lpr_linux_musl.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
       input:
-        - "musl/upstream"
-        - "userland/personality/linux/build-musl-runtime.sh"
-        - "userland/personality/linux/musl/synccall.c"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
     out: "LPRMUSL.SO"
     rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1", "/lib/libc.musl-x86_64.so.1"]
   lpr_ldmusl_smoke:
@@ -1152,6 +1151,15 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_async_signal_smoke.c"
     out: "LPRASIG.ELF"
     rootfs: "/cmd/lpr_async_signal_smoke.elf"
+  lpr_thread_signal:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_thread_signal.dynamic.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_thread_signal", "userland/fixtures/src/wsl_musl/lpr_thread_signal.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_thread_signal.c"
+    out: "LPRTHSIG.ELF"
+    rootfs: "/cmd/lpr_thread_signal.elf"
   lpr_signal_owner_red:
     file:
       path: ".artifacts/userland-fixtures/lpr_signal_owner_red.static.elf"

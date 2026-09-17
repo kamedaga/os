@@ -10,6 +10,8 @@
 #include <pacha/ipc.h>
 #include <pacha/syscall.h>
 #include "boot/core.h"
+#include "boot/fixed_image.h"
+#include "boot/image_layout.h"
 #include "machine/domain.h"
 
 /* Internal PachaOS host (ph_) API. One sandbox process owns one Linux core. */
@@ -19,7 +21,7 @@
 #define PH_NOTIFICATION_MASK (UINT64_C(1) << (PH_NOTIFICATION_SIGNAL - 1))
 #define PH_THREAD_STACK_SIZE (256ul * 1024)
 #define PH_RAM_SIZE (256ul << 20)
-#define PH_IMAGE_PHYSICAL_BASE (16ul << 20)
+#define PH_IMAGE_PHYSICAL_BASE ((size_t)KOBOX_CORE_PHYSICAL_BASE)
 
 struct ph_window {
     void *base;
@@ -32,15 +34,10 @@ struct ph_window {
 
 struct ph_image {
     struct kobox_boot_core core;
+    struct kobox_fixed_image fixed;
     void *base;              /* Executable image view into the RAM VMO. */
     void *direct;            /* Direct-map view of the entire RAM VMO. */
     size_t size;
-    size_t tls_size;
-    size_t tls_filesz;
-    size_t tls_align;
-    const void *tls_template;
-    const void *file;
-    size_t file_size;
     int ram_fd;
     struct ph_window window;
 };
@@ -50,8 +47,10 @@ struct ph_task {
     int fd;
     /* Borrowed boot thread; not joinable by the adapter. */
     bool bound;
-    /* Native notification masks, independent of Linux's logical IRQ depth. */
-    uint64_t notification_mask;
+    /* Protect host operations from notification-driven Linux entry.
+     * Native delivery stays enabled; Linux's logical IRQ depth is separate. */
+    atomic_ullong notification_mask;
+    atomic_uint notification_deferred;
     uint64_t saved_notification_mask; /* Mask before the most recent cpu_enter. */
     int logical_cpu;                  /* Owned CPU, or -1 outside Linux. */
     /* Counting wake permits preserve wake-before-park. */
@@ -60,8 +59,9 @@ struct ph_task {
     void *argument;
     void *stack;
     void *fault_stack;
-    void *tls; /* Hosted Linux TLS, separate from native FS:0. */
-    size_t tls_size;
+    /* The adapter keeps its native ABI state in FS. Hosted Linux machine
+     * state is explicit, so this object is portable to hosts using libc TLS. */
+    struct kobox_runtime_thread_state runtime;
 };
 
 static inline struct ph_task *ph_current_task(void) {

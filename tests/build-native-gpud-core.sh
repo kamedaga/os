@@ -20,10 +20,11 @@ gpud="$repo_root/userland/gpud"
 sandbox="$repo_root/kobox2/linux-sandbox/kobox"
 protocol="$repo_root/kobox2/protocol"
 compiler="${CAPOS_FREESTANDING_CC:-clang}"
-core="$repo_root/.artifacts/kobox2-device-launch-runtime/linux-boot-runtime.so"
+core="${KOBOX_NATIVE_CORE:-$repo_root/.artifacts/kobox2-device-launch-runtime/linux-boot-runtime.so}"
 mkdir -p "$out/musl"
 python3 "$sandbox/boot/inspect_core.py" --core "$core" \
   --inputs "$(dirname "$core")/linux-boot-inputs.json"
+cp --reflink=auto "$core" "$out/package-core.so"
 sha256sum "$core" \
   "$repo_root/.artifacts/kobox2-device-launch-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko" \
   >"$out/package-inputs.sha256"

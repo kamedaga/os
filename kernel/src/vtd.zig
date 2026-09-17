@@ -26,6 +26,7 @@ const leaf_index_slots: usize = max_leaf_tables * 2;
 const poll_limit: usize = 1_000_000;
 
 const cap_reg: u64 = 0x08;
+const cap_caching_mode: u64 = @as(u64, 1) << 7;
 const ecap_reg: u64 = 0x10;
 const gcmd_reg: u64 = 0x18;
 const gsts_reg: u64 = 0x1c;
@@ -577,6 +578,16 @@ fn flushTranslationChanges(did: u16) bool {
     return invalidateIotlbDomain(did);
 }
 
+fn flushMapChanges(did: u16) bool {
+    asm volatile ("mfence" ::: .{ .memory = true });
+    if (!builtin.is_test and !writeBufferFlush()) return false;
+    // mapPage only publishes absent entries or retains identical mappings.
+    // Without negative caching, publication (including WBF) is sufficient.
+    // Withdrawal and device stop still require invalidation and DMA drain.
+    if ((driver_state.cap & cap_caching_mode) == 0) return true;
+    return invalidateIotlbDomain(did);
+}
+
 fn disableTranslationAfterFailure() void {
     driver_state.gcmd_shadow &= ~gcmd_te;
     mmioWrite32(gcmd_reg, driver_state.gcmd_shadow);
@@ -1039,7 +1050,7 @@ pub fn mapPages(
             return false;
         }
     }
-    if (!flushTranslationChanges(domain.did)) {
+    if (!flushMapChanges(domain.did)) {
         _ = withdrawRange(domain, iova, paddrs.len);
         if (!builtin.is_test) kernel_log.writeFmt(
             "vtd: map failed invalidation device=0x{x} did={} iova=0x{x} pages={}\n",
@@ -1152,7 +1163,9 @@ pub const TestSupport = if (builtin.is_test) struct {
             .second_level_root_paddr = allocTablePage() orelse return error.OutOfMemory,
         };
         driver_state.domain_count = 1;
-        driver_state.cap = (@as(u64, 1) << 55) | (@as(u64, 1) << 54);
+        // Default to negative caching so existing map failure/publication
+        // tests exercise the invalidation path. CM=0 is tested separately.
+        driver_state.cap = cap_caching_mode | (@as(u64, 1) << 55) | (@as(u64, 1) << 54);
         driver_state.active = true;
     }
 
@@ -1177,6 +1190,35 @@ pub const TestSupport = if (builtin.is_test) struct {
         return (domainForDevice(device) orelse return 0).allocator.used_pages;
     }
 } else void;
+
+test "VT-d CM=0 map publication skips invalidation but withdrawal still drains" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    driver_state.cap &= ~cap_caching_mode;
+    const page = try free_list.popFront();
+    const other = try free_list.popFront();
+    try std.testing.expect(reserveIova(device, iova_window_start, 1));
+    TestSupport.failInvalidation(true);
+    try std.testing.expect(mapPages(device, iova_window_start, &.{page}, true, true));
+    try std.testing.expect(mapPages(device, iova_window_start, &.{page}, true, true));
+    try std.testing.expect(!mapPages(device, iova_window_start, &.{other}, true, true));
+    try std.testing.expect(!mapPages(device, iova_window_start, &.{page}, true, false));
+    try std.testing.expectEqual(@as(u64, 0), TestSupport.lastInvalidation());
+    try std.testing.expectEqual(@as(usize, 2), TestSupport.mappingReferences());
+    try std.testing.expect(!unmapRangeForDevice(device, iova_window_start, page_size));
+    try std.testing.expectEqual(domainInvalidationCommand(driver_state.cap, 1), TestSupport.lastInvalidation());
+    try std.testing.expect(deviceQuarantined(device));
+    try std.testing.expectEqual(@as(usize, 2), TestSupport.mappingReferences());
+    try std.testing.expectError(types.KernelError.InvalidState, free_list.appendPage(0, page));
+}
 
 test "VT-d endpoint scope coverage is exact and excludes non-PCI scopes" {
     const location = pci.Location{ .bus = 0, .device = 3, .function = 0 };

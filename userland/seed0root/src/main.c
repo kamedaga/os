@@ -3084,6 +3084,11 @@ static int seed0root_launch_root_services(
             FILED_OP_SERVICE_SET_NETD_SOCKET, netd_endpoint, 0x5eed2004u)) != 0)
         goto out;
 
+#if defined(SEED0ROOT_LPR_THREAD_SIGNAL_TEST) && SEED0ROOT_LPR_THREAD_SIGNAL_TEST
+    /* This LPR-only gate must remain runnable without a DRM core package. */
+    goto out;
+#endif
+
     const int gpu = seed0root_find_root_device(devices, VIRTIO_VENDOR,
         GPU_LEGACY, GPU_MODERN);
     if (gpu < 0 || pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0 ||

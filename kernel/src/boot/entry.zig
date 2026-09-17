@@ -256,6 +256,7 @@ fn initKernelRuntimeOrHalt() void {
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
     }
+    kernel_log.write(if (lapic.usesX2Apic()) "lapic: mode=x2apic\n" else "lapic: mode=xapic\n");
     const timer_calibration = lapic.calibrateTimer(
         boot_static.lapic_timer_initial_count,
         boot_static.lapic_timer_rearm_overhead_ns,
@@ -917,7 +918,15 @@ pub fn bootWithResources(resources: BootResources) noreturn {
         boot_rsdp_paddr,
         smp.ucMinusMmioAllowed,
     );
-    kernel_log.write(if (highres_ready) "clock: monotonic=hpet deadline=lapic high-resolution=1\n" else "clock: monotonic=tick high-resolution=0\n");
+    const clock = @import("../realtime_clock.zig");
+    kernel_log.writeFmt("clock: pvclock stable-mask=0x{x} online-mask=0x{x}\n", .{ clock.stableCpuMask(), smp.onlineCpuMask() });
+    if (highres_ready) {
+        kernel_log.writeFmt("clock: monotonic={s} deadline=lapic high-resolution=1\n", .{
+            if (clock.usesStableKvmClock()) "kvm" else "hpet",
+        });
+    } else {
+        kernel_log.write("clock: monotonic=tick high-resolution=0\n");
+    }
     vtd.init(boot_rsdp_paddr, kernel_runtime.global_free_list);
     kernel_log.write("boot: discover devices\n");
     var devices = discoverDevices();

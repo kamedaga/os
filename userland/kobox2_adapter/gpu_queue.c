@@ -4,6 +4,36 @@
 #include <errno.h>
 #include <string.h>
 
+static int notify_drm_event(void *context, uint32_t slot, uint64_t cookie) {
+    struct ph_gpu_queue *queue = context;
+    if (!queue || slot >= GPUD_GPU_NATIVE_SESSION_LIMIT || !cookie)
+        return -EINVAL;
+    if (!atomic_load_explicit(&queue->event_admitted, memory_order_acquire))
+        return 0;
+    atomic_store_explicit(&queue->event_cookies[slot], cookie, memory_order_release);
+    const uint64_t bit = UINT64_C(1) << slot;
+    const uint64_t previous = atomic_fetch_or_explicit(
+        &queue->event_pending, bit, memory_order_acq_rel);
+    if (previous)
+        return 0;
+    const uint64_t one = 1;
+    const long written = pacha_syscall3(PACHA_FD_SYSCALL_WRITE,
+        queue->event_fd, (uintptr_t)&one, sizeof(one));
+    if (written == (long)sizeof(one))
+        return 0;
+    atomic_store_explicit(&queue->event_error, -EIO, memory_order_release);
+    return -EIO;
+}
+
+static int drain_event_doorbell(struct ph_gpu_queue *queue) {
+    uint64_t count;
+    const long read = pacha_syscall3(PACHA_FD_SYSCALL_READ,
+        queue->event_fd, (uintptr_t)&count, sizeof(count));
+    if (read == (long)sizeof(count) || read == PACHA_SYSCALL_ERR_NOT_READY)
+        return 0;
+    return -EIO;
+}
+
 static int channel_fault(struct ph_gpu_queue *queue) {
     if (queue->bound)
         kb2_vq_channel_fault(&queue->channel.channel);
@@ -18,6 +48,7 @@ static int overlaps(uint64_t address, uint64_t length,
 
 static int stop(void *context) {
     struct ph_gpu_queue *queue = context;
+    atomic_store_explicit(&queue->event_admitted, 0, memory_order_release);
     int result = ph_gpu_query_release_aux(&queue->service.query);
     if (!queue->mapping)
         return result;
@@ -36,6 +67,70 @@ static int stop(void *context) {
     return result;
 }
 
+static int next_event(struct ph_gpu_queue *queue) {
+    int error = atomic_load_explicit(&queue->event_error, memory_order_acquire);
+    if (error)
+        return error;
+    error = drain_event_doorbell(queue);
+    if (error)
+        return error;
+    for (;;) {
+        uint64_t pending = atomic_load_explicit(
+            &queue->event_pending, memory_order_acquire);
+        if (!pending)
+            return PH_LIFECYCLE_SERVICE_IDLE;
+        const uint32_t slot = (uint32_t)__builtin_ctzll(pending);
+        const uint64_t bit = UINT64_C(1) << slot;
+        if (!(atomic_fetch_and_explicit(&queue->event_pending, ~bit,
+                memory_order_acq_rel) & bit))
+            continue;
+        const uint64_t cookie = atomic_load_explicit(
+            &queue->event_cookies[slot], memory_order_acquire);
+        uint64_t session = 0;
+        uint32_t session_status = ph_gpu_session_event_acquire(
+            queue->service.sessions, queue->service.query.generation,
+            queue->service.client_id, cookie, &session);
+        if (session_status == KB2_GPU_STATUS_NOT_FOUND)
+            continue;
+        if (session_status)
+            return channel_fault(queue);
+        kb2_vq_t *lane = &queue->channel.lanes[GPUD_GPU_QUEUE_EVENT];
+        kb2_vq_status_t status = kb2_vq_take_available(
+            lane, queue->service.query.generation, &queue->request);
+        if (status == KB2_VQ_EMPTY) {
+            int ready;
+            if (kb2_vq_arm(lane, queue->service.query.generation, &ready)) {
+                (void)ph_gpu_session_release(queue->service.sessions,
+                    queue->service.query.generation, queue->service.client_id,
+                    session);
+                return channel_fault(queue);
+            }
+            if (ready)
+                status = kb2_vq_take_available(
+                    lane, queue->service.query.generation, &queue->request);
+        }
+        if (status == KB2_VQ_EMPTY) {
+            (void)ph_gpu_session_release(queue->service.sessions,
+                queue->service.query.generation, queue->service.client_id,
+                session);
+            error = notify_drm_event(queue, slot, cookie);
+            return error ? error : PH_LIFECYCLE_SERVICE_IDLE;
+        }
+        if (status || queue->request.readable ||
+            queue->request.writable < PH_GPU_DRM_EVENT_MESSAGE_BYTES) {
+            (void)ph_gpu_session_release(queue->service.sessions,
+                queue->service.query.generation, queue->service.client_id,
+                session);
+            return channel_fault(queue);
+        }
+        queue->active_lane = GPUD_GPU_QUEUE_EVENT;
+        queue->event_cookie = cookie;
+        queue->event_session = session;
+        queue->event_active = 1;
+        return 0;
+    }
+}
+
 static int next_request(void *context) {
     struct ph_gpu_queue *queue = context;
     if (!queue->mapping || queue->release_mapping_id)
@@ -44,12 +139,9 @@ static int next_request(void *context) {
     if (query->terminal_after_completion)
         return query->terminal_after_completion;
     uint64_t generation = query->generation;
-    /* Events are delivered by DRM read/poll; no peer submissions belong on
-     * the protocol event lane. */
-    int event_ready;
-    if (kb2_vq_arm(&queue->channel.lanes[GPUD_GPU_QUEUE_EVENT], generation,
-                   &event_ready) || event_ready)
-        return channel_fault(queue);
+    int event = next_event(queue);
+    if (event != PH_LIFECYCLE_SERVICE_IDLE)
+        return event;
     kb2_vq_t *lane = NULL;
     kb2_vq_status_t status = KB2_VQ_EMPTY;
     /* One dispatch at a time, alternating lanes to prevent starvation. A
@@ -172,7 +264,9 @@ static int prepare(void *context, const struct ph_ipc_packet *packet) {
              packet->value !=
                  queue->channel.queues[GPUD_GPU_QUEUE_DISPLAY].available_notification_id &&
              packet->value !=
-                 queue->channel.queues[GPUD_GPU_QUEUE_CONTROL].available_notification_id))
+                 queue->channel.queues[GPUD_GPU_QUEUE_CONTROL].available_notification_id &&
+             packet->value !=
+                 queue->channel.queues[GPUD_GPU_QUEUE_EVENT].available_notification_id))
             return channel_fault(queue);
     } else {
         return channel_fault(queue);
@@ -182,6 +276,18 @@ static int prepare(void *context, const struct ph_ipc_packet *packet) {
 
 static int dispatch(void *context, void *linux_service) {
     struct ph_gpu_queue *queue = context;
+    if (queue->event_active) {
+        if (!linux_service)
+            return -ENODEV;
+        struct kobox_linux_drm_file *file = NULL;
+        int result = queue->service.file(linux_service,
+            queue->event_cookie, &file);
+        if (!result)
+            result = queue->service.query.api.read_events(file,
+                queue->event_data, sizeof(queue->event_data),
+                &queue->event_size);
+        return result;
+    }
     if (queue->release_mapping_id) {
         if (!linux_service || !queue->service.unmap)
             return -ENODEV;
@@ -192,6 +298,32 @@ static int dispatch(void *context, void *linux_service) {
 
 static int complete(void *context, struct ph_ipc *ipc) {
     struct ph_gpu_queue *queue = context;
+    if (queue->event_active) {
+        if (queue->event_sequence == UINT64_MAX ||
+            ph_gpu_drm_event_encode(queue->event_message,
+                sizeof(queue->event_message), &queue->event_message_size,
+                queue->service.query.generation, queue->event_session,
+                ++queue->event_sequence, queue->event_data,
+                queue->event_size))
+            return channel_fault(queue);
+        kb2_vq_t *lane = &queue->channel.lanes[GPUD_GPU_QUEUE_EVENT];
+        int notify;
+        if (kb2_vq_write_response(lane, queue->service.query.generation,
+                &queue->request, queue->event_message,
+                queue->event_message_size) ||
+            kb2_vq_complete(lane, queue->service.query.generation,
+                &queue->request, &notify))
+            return channel_fault(queue);
+        if (notify) {
+            struct ph_ipc_packet packet = {
+                .operation = PH_GPU_QUEUE_NOTIFY,
+                .generation = queue->service.query.generation,
+                .value = lane->queue.used_notification_id,
+            };
+            return ph_ipc_send(ipc, &packet);
+        }
+        return 0;
+    }
     if (queue->release_mapping_id) {
         struct ph_ipc_packet packet = {
             .operation = PH_GPU_MAPPING_RELEASED,
@@ -237,6 +369,17 @@ static int release_request(void *context) {
     /* Chains end at used publication. A failed chain remains owned until
      * terminal channel retirement; never drop it and admit more work. */
     struct ph_gpu_queue *queue = context;
+    if (queue->event_active) {
+        int result = ph_gpu_session_release(queue->service.sessions,
+            queue->service.query.generation, queue->service.client_id,
+            queue->event_session);
+        queue->event_cookie = 0;
+        queue->event_session = 0;
+        queue->event_size = 0;
+        queue->event_message_size = 0;
+        queue->event_active = 0;
+        return result ? -EPROTO : 0;
+    }
     if (queue->release_mapping_id) {
         queue->release_mapping_id = 0;
         queue->release_correlation = 0;
@@ -259,9 +402,33 @@ int ph_gpu_queue_init(struct ph_gpu_queue *queue,
     int result = ph_gpu_session_service_init(&queue->service, sessions, client_id);
     if (result)
         return result;
+    const uint64_t event_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WRITE |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
+    long event_fd = pacha_syscall3(
+        PACHA_FD_SYSCALL_EVENTFD_CREATE, 0, event_rights, 0);
+    if (event_fd < 16 || event_fd >= PACHA_FD_TABLE_LIMIT)
+        return -ENOMEM;
     queue->channel_id = channel_id;
+    queue->event_fd = (int)event_fd;
     queue->next_lane = GPUD_GPU_QUEUE_CONTROL;
     queue->atomics = *atomics;
+    atomic_init(&queue->event_admitted, 1);
+    atomic_init(&queue->event_pending, 0);
+    atomic_init(&queue->event_error, 0);
+    for (size_t i = 0; i < GPUD_GPU_NATIVE_SESSION_LIMIT; ++i)
+        atomic_init(&queue->event_cookies[i], 0);
+    if (!atomic_is_lock_free(&queue->event_admitted) ||
+        !atomic_is_lock_free(&queue->event_pending) ||
+        !atomic_is_lock_free(&queue->event_error)) {
+        (void)pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, queue->event_fd);
+        queue->event_fd = 0;
+        return -EOPNOTSUPP;
+    }
+    queue->event_host = (struct kobox_linux_drm_event_host) {
+        .size = sizeof(queue->event_host),
+        .context = queue,
+        .notify = notify_drm_event,
+    };
     queue->request = (kb2_vq_chain_t){.segments = queue->segments, .capacity = GPUD_GPU_QUEUE_SIZE};
     *service = (struct ph_lifecycle_service){.context = queue,
                                              .prepare = prepare,
@@ -269,6 +436,20 @@ int ph_gpu_queue_init(struct ph_gpu_queue *queue,
                                              .complete = complete,
                                              .release = release_request,
                                              .next = next_request,
-                                             .stop = stop};
+                                             .stop = stop,
+                                             .wake_fd = queue->event_fd};
+    return 0;
+}
+
+int ph_gpu_queue_finish(struct ph_gpu_queue *queue) {
+    if (!queue || queue->event_fd < 16 || queue->mapping ||
+        (queue->bound && atomic_load_explicit(
+            &queue->event_admitted, memory_order_acquire)))
+        return -EINVAL;
+    const long result = pacha_syscall1(
+        PACHA_FD_SYSCALL_CLOSE, queue->event_fd);
+    if (result)
+        return -EIO;
+    queue->event_fd = 0;
     return 0;
 }

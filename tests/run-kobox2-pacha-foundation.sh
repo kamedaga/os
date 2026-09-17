@@ -125,7 +125,7 @@ qemu-system-x86_64 \
   "${qemu_devices[@]}" \
   -drive "file=$out/boot.img,format=raw,if=ide" \
   -display none -serial "file:$out/serial.log" -monitor none -no-reboot \
-  -net none >"$out/qemu.log" 2>&1 &
+  >"$out/qemu.log" 2>&1 &
 qemu_pid=$!
 stop_qemu() {
   if kill -0 "$qemu_pid" 2>/dev/null; then kill "$qemu_pid"; fi

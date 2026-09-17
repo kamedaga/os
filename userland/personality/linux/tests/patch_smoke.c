@@ -225,6 +225,28 @@ int main(void) {
     if (expect(red_zone_transaction[24] == LPR_ZPOLINE_PATCH_FROM0 &&
                red_zone_transaction[25] == LPR_ZPOLINE_PATCH_FROM1)) return 1;
 
+    /* Search pairs at and across SIMD lanes/blocks, including the last
+     * complete pair in a range. A trailing lone 0f is not a candidate. */
+    const unsigned pair_positions[] = {14, 15, 16, 30, 31, 32, 62, 63, 64, 126, 127, 128};
+    for (unsigned i = 0; i < sizeof(pair_positions) / sizeof(pair_positions[0]); ++i) {
+        uint8_t boundary_code[132];
+        const unsigned pos = pair_positions[i];
+        memset(boundary_code, 0x90, sizeof(boundary_code));
+        boundary_code[pos] = LPR_ZPOLINE_PATCH_FROM0;
+        boundary_code[pos + 1] = LPR_ZPOLINE_PATCH_FROM1;
+        boundary_code[sizeof(boundary_code) - 1] = LPR_ZPOLINE_PATCH_FROM0;
+        const struct lpr_patch_mapping_request boundary_request = {
+            .start_va = (uint64_t)(uintptr_t)boundary_code,
+            .size_bytes = sizeof(boundary_code),
+            .flags = LPR_PATCH_FLAG_EXECUTABLE | LPR_PATCH_FLAG_PRIVATE,
+        };
+        if (expect(lpr_patch_mapping(&boundary_request, &result) == 0)) return 1;
+        if (expect(result.patched_sites == 1)) return 1;
+        if (expect(boundary_code[pos] == LPR_ZPOLINE_PATCH_TO0 &&
+                   boundary_code[pos + 1] == LPR_ZPOLINE_PATCH_TO1)) return 1;
+        if (expect(boundary_code[sizeof(boundary_code) - 1] == LPR_ZPOLINE_PATCH_FROM0)) return 1;
+    }
+
     uint8_t page[LPR_ZPOLINE_PAGE_SIZE];
     memset(page, 0, sizeof(page));
     if (expect(lpr_build_zpoline_page(page, 0x1122334455667788ull) == 0)) return 1;

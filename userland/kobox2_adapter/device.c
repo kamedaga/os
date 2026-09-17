@@ -25,6 +25,7 @@ int ph_device_init(struct ph_device *device, const struct ph_device_config *conf
     struct ph_dma_config dma = {
         .device_fd = config->device_fd, .native_device = device->pci.native_device,
         .generation = config->generation, .ram = config->memory.direct_map,
+        .ram_fd = config->image->ram_fd,
         .ram_length = config->memory.ram_size,
         .aperture_start = config->aperture_start, .aperture_end = config->aperture_end,
         .mappings = device->dma_mappings, .mapping_capacity = PH_DEVICE_DMA_MAPPINGS,

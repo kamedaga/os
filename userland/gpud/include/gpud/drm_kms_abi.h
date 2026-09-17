@@ -62,6 +62,11 @@ enum {
         GPUD_DRM_MODE_PAGE_FLIP_ASYNC |
         GPUD_DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE |
         GPUD_DRM_MODE_PAGE_FLIP_TARGET_RELATIVE,
+    GPUD_DRM_MODE_DIRTY_ANNOTATE_COPY = 1u << 0,
+    GPUD_DRM_MODE_DIRTY_ANNOTATE_FILL = 1u << 1,
+    GPUD_DRM_MODE_DIRTY_FLAGS = GPUD_DRM_MODE_DIRTY_ANNOTATE_COPY |
+        GPUD_DRM_MODE_DIRTY_ANNOTATE_FILL,
+    GPUD_DRM_MODE_DIRTY_MAX_CLIPS = 256u,
     GPUD_DRM_MODE_CURSOR_BO = 1u << 0,
     GPUD_DRM_MODE_CURSOR_MOVE = 1u << 1,
     GPUD_DRM_MODE_FB_MODIFIERS = 1u << 1,
@@ -392,6 +397,15 @@ typedef struct gpud_drm_mode_fb_dirty {
     uint64_t clips_ptr;
 } gpud_drm_mode_fb_dirty_t;
 
+/* Private LPR/gpud auxiliary wire format. Linux drm_clip_rect uses u16;
+ * canonical kobox2 rectangle records use one u32 for each coordinate. */
+typedef struct gpud_drm_mode_rectangle {
+    uint32_t x1;
+    uint32_t y1;
+    uint32_t x2;
+    uint32_t y2;
+} gpud_drm_mode_rectangle_t;
+
 typedef struct gpud_drm_mode_cursor {
     uint32_t flags;
     uint32_t crtc_id;
@@ -536,6 +550,8 @@ _Static_assert(sizeof(gpud_drm_mode_crtc_t) == 104, "drm crtc ABI");
 _Static_assert(sizeof(gpud_drm_mode_get_connector_t) == 80, "drm connector ABI");
 _Static_assert(sizeof(gpud_drm_mode_fb_cmd2_t) == 104, "drm fb2 ABI");
 _Static_assert(sizeof(gpud_drm_mode_fb_dirty_t) == 24, "drm dirtyfb ABI");
+_Static_assert(sizeof(gpud_drm_mode_rectangle_t) == 16,
+    "DRM dirty rectangle wire ABI");
 _Static_assert(sizeof(gpud_drm_event_vblank_t) == 32, "drm event vblank ABI");
 _Static_assert(sizeof(gpud_drm_wait_vblank_t) == 24, "drm wait vblank ABI");
 _Static_assert(sizeof(gpud_drm_crtc_get_sequence_t) == 24, "drm get sequence ABI");

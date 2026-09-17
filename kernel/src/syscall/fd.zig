@@ -279,9 +279,12 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
         if (count == 0) return sc.syscall_err_not_ready;
         return writeUserU64Bytes(h, proc, out_va, len, count);
     }
-    if (state.timerReadExpirations(proc, fd, timerNowNs())) |count| {
-        if (count == 0) return sc.syscall_err_not_ready;
-        return writeUserU64Bytes(h, proc, out_va, len, count);
+    if (state.fdPayloadWithRightsConst(proc, fd, .{ .read = true })) |view| {
+        if (view.payload.* == .timer) {
+            const count = state.timerReadExpirations(proc, fd, timerNowNs()) orelse return sc.syscall_err_invalid;
+            if (count == 0) return sc.syscall_err_not_ready;
+            return writeUserU64Bytes(h, proc, out_va, len, count);
+        }
     }
     if (state.irqObjectForFd(proc, fd, .{ .read = true })) |irq| {
         if (irq.retired) return sc.syscall_err_closed;
@@ -491,8 +494,21 @@ fn fdFcntl(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, 
     };
 }
 
-fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, now_tick: u64) ?u64 {
+// Only timer readability consumes time. Keep one fresh sample per pass,
+// including the separate pass after waiter registration, without MMIO for IPC.
+fn pollNowNs(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, events: u64, now: *?u64) u64 {
+    if (now.*) |sample| return sample;
+    if ((events & fd_abi.event_readable) == 0) return 0;
+    const view = state.fdPayloadWithRightsConst(proc, fd, .{ .poll = true }) orelse return 0;
+    if (view.payload.* != .timer) return 0;
+    const sample = timerNowNs();
+    now.* = sample;
+    return sample;
+}
+
+fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) ?u64 {
     if (pollfds_va == 0 or count > fd_abi.max_pollfds) return null;
+    var now: ?u64 = null;
     var ready_count: u64 = 0;
     var i: u64 = 0;
     while (i < count) : (i += 1) {
@@ -500,7 +516,8 @@ fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, po
         const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
         const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
         if ((events & ~fd_abi.event_known_mask) != 0) return null;
-        const revents = state.fdPollEvents(proc, @intCast(fd_u64), events, now_tick) orelse return null;
+        const now_ns = pollNowNs(state, proc, @intCast(fd_u64), events, &now);
+        const revents = state.fdPollEvents(proc, @intCast(fd_u64), events, now_ns) orelse return null;
         if (!h.write_user_u64(proc, item_va + fd_abi.pollfd_revents_offset, revents)) return null;
         if (revents != 0) ready_count += 1;
     }
@@ -512,9 +529,11 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const item_va = pollfds_va + @as(u64, @intCast(i)) * fd_abi.pollfd_size;
-        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
-        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
-        const min_write_bytes = h.read_user_u64(proc, item_va + fd_abi.pollfd_revents_offset) orelse return null;
+        var wire: [fd_abi.pollfd_size]u8 = undefined;
+        if (!h.copy_user_bytes_from_va(proc, item_va, &wire)) return null;
+        const fd_u64 = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_fd_offset..][0..8], .little);
+        const events = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_events_offset..][0..8], .little);
+        const min_write_bytes = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_revents_offset..][0..8], .little);
         if ((events & ~fd_abi.event_known_mask) != 0) return null;
         out[i] = .{
             .fd = @intCast(fd_u64),
@@ -526,10 +545,57 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
     return out[0..@intCast(count)];
 }
 
-fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
+test "poll item snapshot copies each ABI item once and preserves validation" {
+    const std = @import("std");
+    const Mock = struct {
+        const base: u64 = 0x1ff0; // Forward a page-crossing item unchanged.
+        var bytes: [48]u8 = undefined;
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        fn copy(_: kernel.PrincipalId, va: u64, dest: []u8) bool {
+            calls += 1;
+            if (calls == fail_at) return false;
+            std.debug.assert(dest.len == fd_abi.pollfd_size);
+            std.debug.assert(va == base + (calls - 1) * fd_abi.pollfd_size);
+            const offset: usize = @intCast(va - base);
+            @memcpy(dest, bytes[offset..][0..dest.len]);
+            return true;
+        }
+    };
+    const h = .{ .copy_user_bytes_from_va = Mock.copy };
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    var storage: [2]PollItem = undefined;
+    for ([_]u64{ 16, fd_abi.event_readable, 999, 17, fd_abi.event_writable, 123 }, 0..) |value, i|
+        std.mem.writeInt(u64, Mock.bytes[i * 8 ..][0..8], value, .little);
+    Mock.calls = 0;
+    Mock.fail_at = 0;
+    const items = readPollItems(&h, owner, Mock.base, 2, &storage).?;
+    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 16, .events = fd_abi.event_readable,
+        .min_write_bytes = 0, .item_va = Mock.base }, items[0]);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 17, .events = fd_abi.event_writable,
+        .min_write_bytes = 123, .item_va = Mock.base + 24 }, items[1]);
+    Mock.calls = 0;
+    try std.testing.expect(readPollItems(&h, owner, 0, 1, &storage) == null);
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, fd_abi.max_pollfds + 1, &storage) == null);
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, 3, &storage) == null);
+    try std.testing.expectEqual(@as(usize, 0), readPollItems(&h, owner, Mock.base, 0, &storage).?.len);
+    try std.testing.expectEqual(@as(usize, 0), Mock.calls);
+    Mock.fail_at = 2;
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, 2, &storage) == null);
+    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    Mock.fail_at = 0;
+    Mock.calls = 0;
+    std.mem.writeInt(u64, Mock.bytes[8..16], 1 << 63, .little);
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, 1, &storage) == null);
+}
+
+fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem) ?u64 {
     var ready_count: u64 = 0;
+    var now: ?u64 = null;
     for (items) |item| {
-        const revents = state.fdPollEventsWithWriteMin(proc, item.fd, item.events, now_tick, item.min_write_bytes) orelse return null;
+        const now_ns = pollNowNs(state, proc, item.fd, item.events, &now);
+        const revents = state.fdPollEventsWithWriteMin(proc, item.fd, item.events, now_ns, item.min_write_bytes) orelse return null;
         if (!h.write_user_u64(proc, item.item_va + fd_abi.pollfd_revents_offset, revents)) return null;
         if (revents != 0) ready_count += 1;
     }
@@ -643,7 +709,7 @@ fn timerNowNs() u64 {
 }
 
 fn fdPoll(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) u64 {
-    return pollOnce(h, state, proc, pollfds_va, count, timerNowNs()) orelse sc.syscall_err_invalid;
+    return pollOnce(h, state, proc, pollfds_va, count) orelse sc.syscall_err_invalid;
 }
 
 fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -652,10 +718,9 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const timeout_ticks = frame.rdx;
     const flags = frame.r10;
     if (flags != 0) return sc.syscall_err_invalid;
-    const now = timerNowNs();
     var poll_items_storage: [max_pollfds]PollItem = undefined;
     const poll_items = readPollItems(h, proc, pollfds_va, count, poll_items_storage[0..]) orelse return sc.syscall_err_invalid;
-    const ready = pollCached(h, state, proc, poll_items, now) orelse return sc.syscall_err_invalid;
+    const ready = pollCached(h, state, proc, poll_items) orelse return sc.syscall_err_invalid;
     if (ready != 0) return ready;
     if (timeout_ticks == 0) return sc.syscall_err_not_ready;
 
@@ -695,7 +760,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     };
     ipc_metric.record(.wait_register, register_start);
     const repoll_start = ipc_metric.timestamp();
-    const ready_after_register = pollCached(h, state, proc, poll_items, timerNowNs()) orelse {
+    const ready_after_register = pollCached(h, state, proc, poll_items) orelse {
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         state.cancelFdWaitGroup(group, wait_token);
         return sc.syscall_err_invalid;
@@ -1000,11 +1065,17 @@ fn mapVmoFd(
         if (state.rangeOverlapsPinnedUserObject(proc, base_va, aligned_size)) {
             return sc.syscall_err_invalid;
         }
-        const reservation_slots = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+        const native_vma_source = nativeVmaCoversRange(state, proc, base_va, aligned_size);
+        const reservation_slots_result = if (native_vma_source) user_vm.unmapPresentVmaSourceSplitSlotsRequired(
             proc,
             base_va,
             @intCast(aligned_size),
-        ) orelse return sc.syscall_err_map;
+        ) else user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            proc,
+            base_va,
+            @intCast(aligned_size),
+        );
+        const reservation_slots = reservation_slots_result orelse return sc.syscall_err_map;
         if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) return sc.syscall_err_alloc;
         const anonymous_max_prot = kernel.VmaProt{
             .read = true,
@@ -1034,7 +1105,11 @@ fn mapVmoFd(
                 free_list,
             )) catch |err| return statusFromKernelError(err);
         defer state.discardFixedMmapPrepared(&prepared, free_list);
-        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) unreachable;
+        const unmapped = if (native_vma_source)
+            user_vm.unmapPresentVmaSource(proc, base_va, @intCast(aligned_size))
+        else
+            user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size));
+        if (!unmapped) unreachable;
         state.commitFixedMmapPrepared(&prepared, free_list);
         return base_va;
     } else if (flags.fixed_noreplace) {
@@ -1146,6 +1221,7 @@ fn mprotectVmaRange(
     // mprotect does not select a protection key.  Preserve the mapping's
     // original key instead of silently resetting it to key zero.
     prot.pkey = start_vma.max_prot.pkey;
+    const unchanged_prot = @as(u8, @bitCast(start_vma.prot)) == @as(u8, @bitCast(prot));
 
     const page_count: usize = @intCast(aligned_size / 4096);
     var page_index: usize = 0;
@@ -1156,6 +1232,14 @@ fn mprotectVmaRange(
     }
 
     state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
+    // Keep COW's narrower PTEs when the VMA protection did not change, but
+    // retain the address-space validation normally performed by invalidation.
+    if (unchanged_prot) {
+        return if (user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size)))
+            sc.syscall_ok
+        else
+            sc.syscall_err_map;
+    }
     // Re-evaluate every present page from VMA/COW metadata after a protection
     // transition.  Directly restoring a writable PTE here bypassed the write
     // fault that separates fork-COW pages, including allocator arenas that

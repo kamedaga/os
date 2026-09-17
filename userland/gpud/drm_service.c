@@ -2,6 +2,7 @@
 #include "drm_service.h"
 #include "drm_control.h"
 #include "drm_reply.h"
+#include "../kobox2_adapter/gpu_event_message.h"
 #include "../kobox2_adapter/gpu_query_message.h"
 
 #include <errno.h>
@@ -73,12 +74,118 @@ static struct gpud_drm_watch *empty_watch(struct gpud_drm_service *service) {
     return NULL;
 }
 
+static struct gpud_drm_watch *find_watch(
+    struct gpud_drm_service *service, uint64_t handle) {
+    for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i)
+        if (service->watches[i].handle == handle)
+            return &service->watches[i];
+    return NULL;
+}
+
 static const struct gpud_drm_file *find_file(
     const struct gpud_drm_service *service, uint64_t handle) {
     for (size_t i = 0; i < service->files.limit; ++i)
         if (service->files.files[i].handle == handle)
             return &service->files.files[i];
     return NULL;
+}
+
+static struct gpud_drm_file *find_file_by_session(
+    struct gpud_drm_service *service, uint64_t session, size_t *index_out) {
+    if (!session)
+        return NULL;
+    for (size_t i = 0; i < service->files.limit; ++i) {
+        struct gpud_drm_file *file = &service->files.files[i];
+        if (file->session != session || file->state == GPUD_DRM_FILE_FREE)
+            continue;
+        if (index_out)
+            *index_out = i;
+        return file;
+    }
+    return NULL;
+}
+
+static struct gpud_drm_event_buffer *event_buffer(
+    struct gpud_drm_service *service, uint64_t handle) {
+    for (size_t i = 0; i < service->files.limit; ++i)
+        if (service->files.files[i].handle == handle)
+            return &service->events[i];
+    return NULL;
+}
+
+static int signal_event_hint(struct gpud_drm_service *service,
+    uint64_t handle) {
+    for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i) {
+        struct gpud_drm_watch *watch = &service->watches[i];
+        if (watch->handle != handle || watch->transferred || watch->fd < 16)
+            continue;
+        const struct pacha_ipc_msg message = {0};
+        int status = pacha_ipc_send(watch->fd, &message);
+        /* A queued hint already makes every duplicate of the LPR endpoint
+         * readable, so channel backpressure is successful coalescing. */
+        if (!status || status == PACHA_ERR_ALLOC)
+            return 0;
+        return -EIO;
+    }
+    return -ENOENT;
+}
+
+static int validate_event_records(const unsigned char *data, size_t bytes) {
+    size_t offset = 0;
+    while (offset < bytes) {
+        uint32_t header[2];
+        if (bytes - offset < sizeof(header))
+            return -EPROTO;
+        memcpy(header, data + offset, sizeof(header));
+        if (header[1] < sizeof(header) || header[1] > bytes - offset)
+            return -EPROTO;
+        offset += header[1];
+    }
+    return 0;
+}
+
+int gpud_drm_service_pump_events(struct gpud_drm_service *service) {
+    if (!service || service->error || service->files.terminal_error)
+        return service ? (service->error ? service->error :
+            service->files.terminal_error) : -EINVAL;
+    unsigned char bytes[GPUD_GPU_CHANNEL_PAGE];
+    for (;;) {
+        size_t size = 0;
+        int received = gpud_gpu_rpc_next_event(
+            &service->gpu, bytes, sizeof(bytes), &size);
+        if (received <= 0)
+            return received < 0 ? (service->error = received) : 0;
+        struct ph_gpu_drm_event_message event;
+        if (ph_gpu_drm_event_decode(bytes, size, service->files.generation,
+                &event) || event.sequence <= service->event_sequence ||
+            validate_event_records(event.data, event.data_size))
+            return service->error = gpud_drm_files_fault(
+                &service->files, service->files.generation, -EPROTO);
+        service->event_sequence = event.sequence;
+        size_t index = 0;
+        struct gpud_drm_file *file = find_file_by_session(
+            service, event.session_id, &index);
+        if (!file || file->state != GPUD_DRM_FILE_OPEN || !file->references ||
+            !event.data_size)
+            continue;
+        struct gpud_drm_event_buffer *buffer = &service->events[index];
+        if (buffer->handle != file->handle) {
+            memset(buffer, 0, sizeof(*buffer));
+            buffer->handle = file->handle;
+        }
+        if (event.data_size > sizeof(buffer->data) - buffer->bytes)
+            return service->error = gpud_drm_files_fault(
+                &service->files, service->files.generation, -ENOSPC);
+        const int was_empty = !buffer->bytes;
+        memcpy(buffer->data + buffer->bytes, event.data, event.data_size);
+        buffer->bytes += event.data_size;
+        if (was_empty) {
+            int error = signal_event_hint(service, file->handle);
+            if (error)
+                return service->error = gpud_drm_files_fault(
+                    &service->files, service->files.generation, error);
+        }
+    }
 }
 
 struct gpud_drm_reply_transfer {
@@ -394,12 +501,83 @@ static int ioctl_request(
                 translation.queue_class == KB2_GPU_QUEUE_DISPLAY ?
                     GPUD_GPU_QUEUE_DISPLAY : GPUD_GPU_QUEUE_EXECUTION,
                 bytes, size, reply, sizeof(reply), &reply_size);
-            if (error)
+            if (error) {
+                printf("[gpud] drm transport-fault generation=%llu correlation=%llu "
+                    "session=%llu handle=%llu ioctl=0x%llx set=%u command=%u "
+                    "queue=%u aux=%llu status=%d creates=%llu closes=%llu "
+                    "submits=%llu\n",
+                    (unsigned long long)generation,
+                    (unsigned long long)service->correlation,
+                    (unsigned long long)binding.session_id,
+                    (unsigned long long)request->handle,
+                    (unsigned long long)request->request,
+                    translation.command_set_id,
+                    translation.command_id,
+                    translation.queue_class,
+                    (unsigned long long)request->aux_size,
+                    error,
+                    (unsigned long long)service->resource_creates,
+                    (unsigned long long)service->gem_closes,
+                    (unsigned long long)service->exec_submits);
                 gpud_drm_files_fault(&service->files, generation, error);
-            else {
+            } else {
                 memcpy(output, service->gpu.mapping + GPUD_GPU_OUTPUT_OFFSET, sizeof(output));
                 error = gpud_drm_ioctl_reply(request, &translation, service->correlation,
                     reply, reply_size, output, sizeof(output));
+                if (error && request->request == GPUD_DRM_IOCTL_MODE_SETCRTC &&
+                    request->data_size == sizeof(gpud_drm_kms_crtc_wire_t)) {
+                    gpud_drm_kms_crtc_wire_t wire;
+                    memcpy(&wire, request->data, sizeof(wire));
+                    printf("[gpud] drm modeset-failed generation=%llu "
+                        "handle=%llu session=%llu crtc=%u fb=%u "
+                        "mode=%u connectors=%u connector0=%u status=%d\n",
+                        (unsigned long long)generation,
+                        (unsigned long long)request->handle,
+                        (unsigned long long)binding.session_id,
+                        wire.value.crtc_id, wire.value.fb_id,
+                        wire.value.mode_valid, wire.value.count_connectors,
+                        wire.value.count_connectors ? wire.connectors[0] : 0,
+                        error);
+                }
+                if (!error && request->request == GPUD_DRM_IOCTL_VIRTGPU_RESOURCE_CREATE)
+                    ++service->resource_creates;
+                else if (!error && request->request == GPUD_DRM_IOCTL_GEM_CLOSE)
+                    ++service->gem_closes;
+                else if (!error &&
+                    request->request == GPUD_DRM_IOCTL_VIRTGPU_EXECBUFFER)
+                    ++service->exec_submits;
+                if (!error && request->request == GPUD_DRM_IOCTL_VIRTGPU_EXECBUFFER) {
+                    struct gpud_drm_watch *watch = find_watch(
+                        service, request->handle);
+                    if (watch && !watch->submit_reported) {
+                        watch->submit_reported = 1;
+                        printf("[gpud] drm submit generation=%llu node=%llu "
+                            "handle=%llu session=%llu\n",
+                            (unsigned long long)generation,
+                            (unsigned long long)watch->device_minor,
+                            (unsigned long long)request->handle,
+                            (unsigned long long)binding.session_id);
+                    }
+                }
+                if (!error && request->request == GPUD_DRM_IOCTL_MODE_SETCRTC &&
+                    request->data_size == sizeof(gpud_drm_kms_crtc_wire_t)) {
+                    gpud_drm_kms_crtc_wire_t wire;
+                    memcpy(&wire, request->data, sizeof(wire));
+                    struct gpud_drm_watch *watch = find_watch(
+                        service, request->handle);
+                    if (watch && !watch->modeset_reported && wire.value.fb_id &&
+                        wire.value.mode_valid && wire.value.count_connectors) {
+                        watch->modeset_reported = 1;
+                        printf("[gpud] drm modeset generation=%llu node=%llu "
+                            "handle=%llu session=%llu crtc=%u fb=%u connectors=%u\n",
+                            (unsigned long long)generation,
+                            (unsigned long long)watch->device_minor,
+                            (unsigned long long)request->handle,
+                            (unsigned long long)binding.session_id,
+                            wire.value.crtc_id, wire.value.fb_id,
+                            wire.value.count_connectors);
+                    }
+                }
                 if (!error && translation.mapping_id) {
                     error = adopt_mapping(service, request->handle,
                         service->correlation, &translation);
@@ -421,6 +599,25 @@ static int ioctl_request(
         error = -EIO;
         gpud_drm_files_fault(&service->files, generation, error);
     }
+    if (request->request == GPUD_DRM_IOCTL_MODE_DIRTYFB &&
+        request->data_size == sizeof(gpud_drm_mode_fb_dirty_t)) {
+        gpud_drm_mode_fb_dirty_t dirty;
+        struct gpud_drm_watch *watch = find_watch(service, request->handle);
+        memcpy(&dirty, request->data, sizeof(dirty));
+        unsigned int *reported = dirty.num_clips ?
+            (watch ? &watch->dirty_update_reported : NULL) :
+            (watch ? &watch->dirty_probe_reported : NULL);
+        if (reported && !*reported) {
+            *reported = 1;
+            printf("[gpud] drm dirtyfb generation=%llu node=%llu "
+                "handle=%llu session=%llu clips=%u status=%d\n",
+                (unsigned long long)generation,
+                (unsigned long long)watch->device_minor,
+                (unsigned long long)request->handle,
+                (unsigned long long)binding.session_id,
+                dirty.num_clips, error);
+        }
+    }
     int release = gpud_drm_file_release(&service->files, generation, request->handle);
     return release ? release : error;
 }
@@ -435,53 +632,37 @@ static int event_request(struct gpud_drm_service *service, uint32_t op,
     int error = gpud_drm_file_acquire(&service->files, generation, handle, &binding);
     if (error)
         return error;
-    struct gpud_drm_translation translation;
-    uint32_t requested = op == GPUD_DRM_OP_HANDLE_POLL &&
-        (poll->arg0 & (GPUD_LINUX_POLLIN | GPUD_LINUX_POLLRDNORM)) ?
-        KB2_GPU_DRM_CORE_POLL_READABLE : 0;
-    error = op == GPUD_DRM_OP_HANDLE_POLL ?
-        gpud_drm_poll_encode(&translation, &binding, requested) :
-        gpud_drm_read_encode(&translation, &binding, (uint32_t)read->capacity,
-            PH_GPU_QUERY_OUTPUT_REGION);
-    if (!error) {
-        unsigned char bytes[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + GPUD_DRM_COMMAND_BYTES];
-        unsigned char reply[GPUD_GPU_CHANNEL_PAGE];
-        unsigned char output[GPUD_DRM_EVENT_READ_BYTES];
-        size_t size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + translation.command_size;
-        size_t reply_size;
-        kb2_protocol_message_envelope_t envelope = {.protocol_id = KB2_GPU_PROTOCOL_ID,
-            .opcode = KB2_GPU_OPCODE_COMMAND, .generation = generation,
-            .correlation_id = service->correlation,
-            .payload_length = translation.command_size};
-        error = kb2_protocol_message_envelope_encode(bytes, size, &envelope) ?
-            -EPROTO : 0;
-        if (!error) {
-            memcpy(bytes + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
-                translation.command, translation.command_size);
-            error = gpud_gpu_rpc_call(&service->gpu, GPUD_GPU_QUEUE_EXECUTION,
-                bytes, size, reply, sizeof(reply), &reply_size);
+    struct gpud_drm_event_buffer *buffer = event_buffer(service, handle);
+    if (!buffer || (buffer->handle && buffer->handle != handle)) {
+        error = -EPROTO;
+    } else if (op == GPUD_DRM_OP_HANDLE_POLL) {
+        *result = buffer->bytes ? poll->arg0 &
+            (GPUD_LINUX_POLLIN | GPUD_LINUX_POLLRDNORM) : 0;
+    } else {
+        size_t copied = 0;
+        while (copied < buffer->bytes) {
+            uint32_t header[2];
+            memcpy(header, buffer->data + copied, sizeof(header));
+            if (header[1] > read->capacity - copied)
+                break;
+            copied += header[1];
         }
-        if (error) {
-            gpud_drm_files_fault(&service->files, generation, error);
-        } else if (service->gpu.attachment.fd_count) {
-            error = gpud_drm_files_fault(&service->files, generation, -EPROTO);
-        } else if (op == GPUD_DRM_OP_HANDLE_POLL) {
-            uint32_t ready = 0;
-            error = gpud_drm_poll_reply(requested, &ready, &translation,
-                service->correlation, reply, reply_size);
-            if (!error)
-                *result = ready ? poll->arg0 &
-                    (GPUD_LINUX_POLLIN | GPUD_LINUX_POLLRDNORM) : 0;
+        if (!copied && buffer->bytes) {
+            error = -EMSGSIZE;
         } else {
-            memcpy(output, service->gpu.mapping + GPUD_GPU_OUTPUT_OFFSET,
-                read->capacity);
-            error = gpud_drm_read_reply(read, &translation, service->correlation,
-                reply, reply_size, output, read->capacity);
+            read->data_size = copied;
+            if (copied)
+                memcpy(read->data, buffer->data, copied);
+            buffer->bytes -= copied;
+            if (buffer->bytes)
+                memmove(buffer->data, buffer->data + copied, buffer->bytes);
+            if (buffer->bytes)
+                error = signal_event_hint(service, handle);
         }
-        if (error == -EPROTO)
-            gpud_drm_files_fault(&service->files, generation, error);
     }
     int release = gpud_drm_file_release(&service->files, generation, handle);
+    if (error == -EPROTO)
+        gpud_drm_files_fault(&service->files, generation, error);
     return release ? release : error;
 }
 
@@ -757,6 +938,7 @@ static int dispatch(struct gpud_drm_service *service,
     if (header->op == GPUD_DRM_OP_HELLO)
         return header->payload_size || count != 2 ? -EINVAL : (*result = 1, 0);
     if (header->op == GPUD_DRM_OP_OPEN_NODE) {
+        const gpud_drm_open_request_t *request = payload;
         if (header->payload_size != sizeof(gpud_drm_open_request_t) || count != 3 ||
             !valid_fd(service->received.fds[1].fd, PACHA_FD_KIND_CHANNEL,
                 PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE, 0))
@@ -773,6 +955,7 @@ static int dispatch(struct gpud_drm_service *service,
             error = control(service, &pending, size, result);
         if (!error) {
             *watch = (struct gpud_drm_watch){.handle = *result,
+                .device_minor = request->device_minor,
                 .fd = (int)service->received.fds[1].fd};
             service->received.fds[1].fd = PH_IPC_NO_FD;
         }
@@ -845,6 +1028,8 @@ static int dispatch(struct gpud_drm_service *service,
             if (count != 2 && count != 3)
                 return -EOPNOTSUPP;
             struct gpud_drm_watch *watch = NULL;
+            struct gpud_drm_watch *source = find_watch(
+                service, request->handle);
             if (count == 3) {
                 uint64_t fd = service->received.fds[1].fd;
                 if (fd == service->received.fds[0].fd ||
@@ -862,6 +1047,7 @@ static int dispatch(struct gpud_drm_service *service,
                 *result = request->handle;
                 if (watch) {
                     *watch = (struct gpud_drm_watch){.handle = request->handle,
+                        .device_minor = source ? source->device_minor : 0,
                         .fd = (int)service->received.fds[1].fd, .transferred = 1};
                     service->received.fds[1].fd = PH_IPC_NO_FD;
                 }
@@ -874,8 +1060,13 @@ static int dispatch(struct gpud_drm_service *service,
             &service->files, generation, request->handle);
         const struct gpud_drm_file *file =
             error ? NULL : find_file(service, request->handle);
-        if (!error && file && file->state == GPUD_DRM_FILE_DRAINING)
+        if (!error && file && file->state == GPUD_DRM_FILE_DRAINING) {
+            struct gpud_drm_event_buffer *buffer =
+                event_buffer(service, request->handle);
+            if (buffer)
+                memset(buffer, 0, sizeof(*buffer));
             close_mapping_owner(service, request->handle);
+        }
         if (!error)
             error = retire_owner_watch(service, request->handle);
         if (!error)
@@ -920,8 +1111,12 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
             &service->files, service->files.generation, handle);
         const struct gpud_drm_file *file = error ? NULL : find_file(service, handle);
         int last = file && file->state == GPUD_DRM_FILE_DRAINING;
-        if (!error && last)
+        if (!error && last) {
+            struct gpud_drm_event_buffer *buffer = event_buffer(service, handle);
+            if (buffer)
+                memset(buffer, 0, sizeof(*buffer));
             close_mapping_owner(service, handle);
+        }
         if (!error)
             error = close_draining(service);
         if (!error)

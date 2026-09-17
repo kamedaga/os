@@ -1,13 +1,12 @@
 /* SPDX-License-Identifier: MIT */
 #include "host.h"
-#include <elf.h>
 
-/* Native mapping flags are adapter details, not additions to the core ABI. */
-#define PH_MAP_FIXED (UINT64_C(1) << 0)
-#define PH_MAP_NORESERVE (UINT64_C(1) << 5)
 #define PH_PROTECTION_MASK (KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE | KOBOX_IMAGE_EXECUTE)
 #define PH_VMA_BOUNDARY 8u
-#define PH_CORE_TLS_MODULE 1ul
+
+_Static_assert(KOBOX_FIXED_IMAGE_READ == KOBOX_IMAGE_READ, "image read ABI");
+_Static_assert(KOBOX_FIXED_IMAGE_WRITE == KOBOX_IMAGE_WRITE, "image write ABI");
+_Static_assert(KOBOX_FIXED_IMAGE_EXECUTE == KOBOX_IMAGE_EXECUTE, "image execute ABI");
 
 /* Process-lifetime windows for the single hosted core. */
 static struct ph_window direct_window;
@@ -18,36 +17,45 @@ static bool contains_range(size_t total, size_t offset, size_t length) {
     return offset <= total && length <= total - offset;
 }
 
-static size_t page_align_up(size_t size) {
-    PH_CHECK(size <= SIZE_MAX - PH_PAGE_SIZE + 1);
-    return (size + PH_PAGE_SIZE - 1) & ~(PH_PAGE_SIZE - 1);
+static struct ph_window reserve_window_mapping(void *requested, size_t size) {
+    uint64_t flags = PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS | PACHA_MMAP_NORESERVE;
+
+    if (requested) {
+        flags |= PACHA_MMAP_FIXED_NOREPLACE;
+    }
+    long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, (uintptr_t)requested,
+        size, 0, flags, 0);
+    if (address < (long)PH_PAGE_SIZE ||
+        (requested != NULL && (uintptr_t)address != (uintptr_t)requested)) {
+        ph_number("reserve requested", (uintptr_t)requested);
+        ph_number("reserve bytes", size);
+        ph_number("reserve result", (uintptr_t)address);
+        ph_fail(__FILE__, __LINE__, address);
+    }
+
+    return (struct ph_window) {
+        .base = (void *)(uintptr_t)address,
+        .size = size,
+    };
 }
 
-static const void *image_file_range(struct ph_image *image, size_t offset, size_t size) {
-    PH_CHECK(contains_range(image->file_size, offset, size));
-    return (const char *)image->file + offset;
+static void initialize_window_tracking(struct ph_window *window) {
+    PH_CHECK(window != NULL && window->base != NULL && window->size != 0 &&
+        window->pages == NULL);
+    window->pages = ph_alloc(window->size / PH_PAGE_SIZE + 1);
+    window->pages[0] = PH_VMA_BOUNDARY;
+    window->pages[window->size / PH_PAGE_SIZE] = PH_VMA_BOUNDARY;
 }
 
-static const Elf64_Phdr *image_program_headers(struct ph_image *image) {
-    const Elf64_Ehdr *header = image->file;
+static struct ph_window reserve_window_at(void *requested, size_t size) {
+    struct ph_window window = reserve_window_mapping(requested, size);
 
-    return image_file_range(image, header->e_phoff,
-        (size_t)header->e_phnum * sizeof(Elf64_Phdr));
+    initialize_window_tracking(&window);
+    return window;
 }
 
 static struct ph_window reserve_window(size_t size) {
-    long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, 0, size, 0,
-        PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS | PH_MAP_NORESERVE, 0);
-    PH_CHECK(address >= (long)PH_PAGE_SIZE);
-
-    struct ph_window window = {
-        .base = (void *)(uintptr_t)address,
-        .size = size,
-        .pages = ph_alloc(size / PH_PAGE_SIZE + 1),
-    };
-    window.pages[0] = PH_VMA_BOUNDARY;
-    window.pages[size / PH_PAGE_SIZE] = PH_VMA_BOUNDARY;
-    return window;
+    return reserve_window_at(NULL, size);
 }
 
 /* Only this adapter mutates these windows. Keep native VMA splits so a later
@@ -81,9 +89,14 @@ static int memory_map(void *opaque, size_t offset, void *backing,
     ph_lock(&window->lock);
     uintptr_t requested = (uintptr_t)window->base + offset;
     long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, image->ram_fd, requested,
-        size, protection, PACHA_MMAP_SHARED | PH_MAP_FIXED, backing_offset);
+        size, protection, PACHA_MMAP_SHARED | PACHA_MMAP_FIXED, backing_offset);
 
     if ((uintptr_t)address != requested) {
+        ph_number("map window", (uintptr_t)window->base);
+        ph_number("map offset", offset);
+        ph_number("map backing", backing_offset);
+        ph_number("map bytes", size);
+        ph_number("map protection", protection);
         ph_fail(__FILE__, __LINE__, address);
     }
     record_mapping(window, offset, size, protection);
@@ -106,7 +119,8 @@ static int memory_reset(void *opaque, size_t offset, size_t size) {
     ph_lock(&window->lock);
     uintptr_t requested = (uintptr_t)window->base + offset;
     long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, requested, size, 0,
-        PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS | PH_MAP_FIXED | PH_MAP_NORESERVE, 0);
+        PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS | PACHA_MMAP_FIXED |
+            PACHA_MMAP_NORESERVE, 0);
 
     if ((uintptr_t)address != requested) {
         ph_fail(__FILE__, __LINE__, address);
@@ -171,9 +185,6 @@ const struct kobox_linux_memory_host_operations ph_memory_ops = {
 
 /* A range inside image->size may still be in a hole between PT_LOAD segments. */
 static bool image_range_is_mapped(struct ph_image *image, size_t offset, size_t length) {
-    const Elf64_Ehdr *header = image->file;
-    const Elf64_Phdr *segments = image_program_headers(image);
-
     if (!contains_range(image->size, offset, length)) {
         return false;
     }
@@ -181,17 +192,14 @@ static bool image_range_is_mapped(struct ph_image *image, size_t offset, size_t 
     size_t covered_until = offset;
     size_t requested_end = offset + length;
 
-    for (unsigned i = 0; i < header->e_phnum && covered_until < requested_end; ++i) {
-        const Elf64_Phdr *segment = &segments[i];
+    for (unsigned i = 0; i < image->fixed.segment_count && covered_until < requested_end; ++i) {
+        const struct kobox_fixed_image_segment *segment = &image->fixed.segments[i];
+        size_t segment_end = segment->image_offset + segment->mapping_size;
 
-        if (segment->p_type != PT_LOAD) {
-            continue;
-        }
-        size_t segment_end = segment->p_vaddr + page_align_up(segment->p_memsz);
         if (segment_end <= covered_until) {
             continue;
         }
-        if (segment->p_vaddr > covered_until) {
+        if (segment->image_offset > covered_until) {
             return false;
         }
         covered_until = segment_end < requested_end ? segment_end : requested_end;
@@ -221,122 +229,19 @@ int ph_image_protect(void *opaque, size_t offset, size_t length, unsigned protec
         length, direct_protection);
 }
 
-static void *tls_address(void *opaque, unsigned long module, unsigned long offset) {
-    struct ph_image *image = opaque;
-
-    PH_CHECK(module == PH_CORE_TLS_MODULE && offset < image->tls_size);
-    return (char *)ph_current_task()->tls + offset;
+static struct kobox_runtime_thread_state *thread_state(void *opaque) {
+    (void)opaque;
+    return &ph_current_task()->runtime;
 }
 
 void *ph_image_lookup(void *opaque, const char *name) {
     struct ph_image *image = opaque;
-    const Elf64_Ehdr *header = image->file;
-    const Elf64_Shdr *sections = image_file_range(image, header->e_shoff,
-        (size_t)header->e_shnum * sizeof(Elf64_Shdr));
+    size_t offset;
 
-    for (unsigned i = 0; i < header->e_shnum; ++i) {
-        const Elf64_Shdr *symbol_section = &sections[i];
-
-        if (symbol_section->sh_type != SHT_DYNSYM) {
-            continue;
-        }
-        PH_CHECK(symbol_section->sh_entsize == sizeof(Elf64_Sym));
-        PH_CHECK(symbol_section->sh_size % sizeof(Elf64_Sym) == 0);
-        PH_CHECK(symbol_section->sh_link < header->e_shnum);
-
-        const Elf64_Shdr *string_section = &sections[symbol_section->sh_link];
-        PH_CHECK(string_section->sh_type == SHT_STRTAB);
-
-        const char *strings = image_file_range(image,
-            string_section->sh_offset, string_section->sh_size);
-        const Elf64_Sym *symbols = image_file_range(image,
-            symbol_section->sh_offset, symbol_section->sh_size);
-
-        for (size_t j = 0; j < symbol_section->sh_size / sizeof(*symbols); ++j) {
-            const Elf64_Sym *symbol = &symbols[j];
-
-            unsigned type = ELF64_ST_TYPE(symbol->st_info);
-
-            if (symbol->st_shndx == SHN_UNDEF ||
-                (type != STT_FUNC && type != STT_OBJECT && type != STT_NOTYPE)) {
-                continue;
-            }
-            PH_CHECK(symbol->st_name < string_section->sh_size);
-            size_t available = string_section->sh_size - symbol->st_name;
-            size_t name_length = 0;
-
-            while (name_length < available && strings[symbol->st_name + name_length] != '\0') {
-                ++name_length;
-            }
-            PH_CHECK(name_length < available);
-            if (strcmp(strings + symbol->st_name, name) == 0) {
-                PH_CHECK(image_range_is_mapped(image, symbol->st_value, symbol->st_size));
-                return (char *)image->base + symbol->st_value;
-            }
-        }
+    if (kobox_fixed_image_symbol(&image->fixed, name, &offset) != KOBOX_FIXED_IMAGE_OK) {
+        return NULL;
     }
-    return NULL;
-}
-
-static void validate_elf_header(struct ph_image *image) {
-    const Elf64_Ehdr *header = image->file;
-
-    PH_CHECK(image->file_size >= sizeof(*header));
-    PH_CHECK(memcmp(header->e_ident, ELFMAG, SELFMAG) == 0);
-    PH_CHECK(header->e_ident[EI_CLASS] == ELFCLASS64);
-    PH_CHECK(header->e_ident[EI_DATA] == ELFDATA2LSB);
-    PH_CHECK(header->e_ident[EI_VERSION] == EV_CURRENT && header->e_version == EV_CURRENT);
-    PH_CHECK(header->e_machine == EM_X86_64 && header->e_type == ET_DYN);
-    PH_CHECK(header->e_ehsize == sizeof(*header));
-    PH_CHECK(header->e_phentsize == sizeof(Elf64_Phdr) && header->e_phnum != 0);
-    PH_CHECK(header->e_shentsize == sizeof(Elf64_Shdr) && header->e_shnum != 0);
-}
-
-/* Validate all load segments before creating or mutating native mappings. */
-static const Elf64_Phdr *inspect_image_segments(struct ph_image *image) {
-    const Elf64_Ehdr *header = image->file;
-    const Elf64_Phdr *segments = image_program_headers(image);
-    const Elf64_Phdr *dynamic = NULL;
-    const Elf64_Phdr *tls = NULL;
-    size_t image_end = 0;
-
-    for (unsigned i = 0; i < header->e_phnum; ++i) {
-        const Elf64_Phdr *segment = &segments[i];
-
-        if (segment->p_type == PT_INTERP) {
-            ph_fail(__FILE__, __LINE__, PT_INTERP);
-        }
-        if (segment->p_type == PT_DYNAMIC) {
-            PH_CHECK(dynamic == NULL);
-            dynamic = segment;
-        }
-        if (segment->p_type == PT_TLS) {
-            PH_CHECK(tls == NULL);
-            tls = segment;
-        }
-        if (segment->p_type != PT_LOAD) {
-            continue;
-        }
-
-        PH_CHECK(segment->p_vaddr % PH_PAGE_SIZE == 0 && segment->p_vaddr >= image_end);
-        PH_CHECK(segment->p_filesz <= segment->p_memsz);
-        PH_CHECK((segment->p_flags & (PF_X | PF_W)) != (PF_X | PF_W));
-        PH_CHECK(contains_range(PH_RAM_SIZE - PH_IMAGE_PHYSICAL_BASE,
-            segment->p_vaddr, page_align_up(segment->p_memsz)));
-        (void)image_file_range(image, segment->p_offset, segment->p_filesz);
-        image_end = segment->p_vaddr + page_align_up(segment->p_memsz);
-    }
-
-    PH_CHECK(image_end != 0 && dynamic != NULL && tls != NULL);
-    PH_CHECK(tls->p_memsz != 0 && tls->p_filesz <= tls->p_memsz);
-    PH_CHECK(tls->p_align != 0 && (tls->p_align & (tls->p_align - 1)) == 0);
-    PH_CHECK(tls->p_align <= PH_PAGE_SIZE);
-    image->size = image_end;
-    image->tls_size = tls->p_memsz;
-    image->tls_filesz = tls->p_filesz;
-    image->tls_align = tls->p_align;
-    image->tls_template = image_file_range(image, tls->p_offset, tls->p_filesz);
-    return dynamic;
+    return (char *)image->base + offset;
 }
 
 static void allocate_image_memory(struct ph_image *image) {
@@ -347,153 +252,78 @@ static void allocate_image_memory(struct ph_image *image) {
 
     image->ram_fd = (int)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, PH_RAM_SIZE, rights, 0);
     PH_CHECK(image->ram_fd >= 16);
+
+    /* Reserve every fixed core address before ph_alloc or a randomized window
+     * can occupy one of them. Tracking metadata is allocated only after all
+     * three reservations are present. */
+    image->window = reserve_window_mapping(
+        (void *)(uintptr_t)image->fixed.link_base, image->size);
+    vmemmap_window = reserve_window_mapping(
+        (void *)(uintptr_t)KOBOX_CORE_VMEMMAP_BASE, KOBOX_CORE_VMEMMAP_SIZE);
+    vmalloc_window = reserve_window_mapping(
+        (void *)(uintptr_t)KOBOX_CORE_VMALLOC_BASE, KOBOX_CORE_VMALLOC_SIZE);
+    initialize_window_tracking(&image->window);
+    initialize_window_tracking(&vmemmap_window);
+    initialize_window_tracking(&vmalloc_window);
+
     direct_window = reserve_window(PH_RAM_SIZE);
     PH_OK(memory_map(&direct_window, 0, image, 0, PH_RAM_SIZE,
         KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE, &image->direct));
-    image->window = reserve_window(image->size);
     image->base = image->window.base;
+    void *mapped;
+    PH_OK(memory_map(&image->window, 0, image, PH_IMAGE_PHYSICAL_BASE,
+        image->size, KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE, &mapped));
+    PH_CHECK(mapped == image->base);
 }
 
 static void copy_load_segments(struct ph_image *image) {
-    const Elf64_Ehdr *header = image->file;
-    const Elf64_Phdr *segments = image_program_headers(image);
+    for (unsigned i = 0; i < image->fixed.segment_count; ++i) {
+        const struct kobox_fixed_image_segment *segment = &image->fixed.segments[i];
 
-    for (unsigned i = 0; i < header->e_phnum; ++i) {
-        const Elf64_Phdr *segment = &segments[i];
-        void *mapped;
-
-        if (segment->p_type != PT_LOAD || segment->p_memsz == 0) {
-            continue;
-        }
-        PH_OK(memory_map(&image->window, segment->p_vaddr, image,
-            PH_IMAGE_PHYSICAL_BASE + segment->p_vaddr, page_align_up(segment->p_memsz),
-            KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE, &mapped));
-        memcpy(mapped, image_file_range(image, segment->p_offset, segment->p_filesz),
-            segment->p_filesz);
-    }
-}
-
-static void relocate_image(struct ph_image *image, const Elf64_Phdr *dynamic_segment) {
-    PH_CHECK(image_range_is_mapped(image, dynamic_segment->p_vaddr, dynamic_segment->p_memsz));
-    PH_CHECK(dynamic_segment->p_memsz % sizeof(Elf64_Dyn) == 0);
-
-    const Elf64_Dyn *dynamic = (void *)((char *)image->base + dynamic_segment->p_vaddr);
-    size_t relocation_offset = 0;
-    size_t relocation_bytes = 0;
-    size_t relocation_entry_size = 0;
-    bool terminated = false;
-
-    for (size_t i = 0; i < dynamic_segment->p_memsz / sizeof(*dynamic); ++i) {
-        Elf64_Sxword tag = dynamic[i].d_tag;
-
-        if (tag == DT_NULL) {
-            terminated = true;
-            break;
-        }
-        PH_CHECK(tag != DT_NEEDED && tag != DT_REL && tag != DT_JMPREL &&
-            tag != DT_INIT && tag != DT_INIT_ARRAY && tag != DT_RELR);
-        if (tag == DT_RELA) {
-            relocation_offset = dynamic[i].d_un.d_ptr;
-        }
-        if (tag == DT_RELASZ) {
-            relocation_bytes = dynamic[i].d_un.d_val;
-        }
-        if (tag == DT_RELAENT) {
-            relocation_entry_size = dynamic[i].d_un.d_val;
-        }
-    }
-
-    PH_CHECK(terminated && relocation_entry_size == sizeof(Elf64_Rela));
-    PH_CHECK(relocation_bytes % relocation_entry_size == 0);
-    PH_CHECK(image_range_is_mapped(image, relocation_offset, relocation_bytes));
-    const Elf64_Rela *relocations = (void *)((char *)image->base + relocation_offset);
-
-    for (size_t i = 0; i < relocation_bytes / relocation_entry_size; ++i) {
-        const Elf64_Rela *relocation = &relocations[i];
-        uint64_t value;
-
-        PH_CHECK(image_range_is_mapped(image, relocation->r_offset, sizeof(value)));
-        switch (ELF64_R_TYPE(relocation->r_info)) {
-        case R_X86_64_RELATIVE:
-            /* B + A is not necessarily an image pointer: initial page tables
-             * include address flags/biases. Only the destination is bounded. */
-            PH_CHECK(ELF64_R_SYM(relocation->r_info) == 0);
-            value = (uint64_t)(uintptr_t)image->base + (uint64_t)relocation->r_addend;
-            break;
-        case R_X86_64_DTPMOD64:
-            PH_CHECK(relocation->r_addend == 0);
-            value = PH_CORE_TLS_MODULE;
-            break;
-        default:
-            ph_fail(__FILE__, __LINE__, ELF64_R_TYPE(relocation->r_info));
-        }
-        memcpy((char *)image->base + relocation->r_offset, &value, sizeof(value));
+        memcpy((char *)image->base + segment->image_offset,
+            image->fixed.file + segment->file_offset, segment->file_size);
     }
 }
 
 static void protect_load_segments(struct ph_image *image) {
-    const Elf64_Ehdr *header = image->file;
-    const Elf64_Phdr *segments = image_program_headers(image);
+    PH_OK(memory_protect(&image->window, 0, image->size, 0));
+    for (unsigned i = 0; i < image->fixed.segment_count; ++i) {
+        const struct kobox_fixed_image_segment *segment = &image->fixed.segments[i];
 
-    for (unsigned i = 0; i < header->e_phnum; ++i) {
-        const Elf64_Phdr *segment = &segments[i];
-        unsigned protection = 0;
-
-        if (segment->p_type != PT_LOAD || segment->p_memsz == 0) {
-            continue;
-        }
-        if ((segment->p_flags & PF_R) != 0) {
-            protection |= KOBOX_IMAGE_READ;
-        }
-        if ((segment->p_flags & PF_W) != 0) {
-            protection |= KOBOX_IMAGE_WRITE;
-        }
-        if ((segment->p_flags & PF_X) != 0) {
-            protection |= KOBOX_IMAGE_EXECUTE;
-        }
-        PH_OK(memory_protect(&image->window, segment->p_vaddr,
-            page_align_up(segment->p_memsz), protection));
+        PH_OK(memory_protect(&image->window, segment->image_offset,
+            segment->mapping_size, segment->protection));
     }
 }
 
 static void bind_core_runtime(struct ph_image *image) {
-    struct ph_task *boot_thread = ph_current_task();
-
-    /* Boot-thread TLS must exist before calling even runtime_bind in the core. */
-    boot_thread->tls = ph_alloc(image->tls_size);
-    boot_thread->tls_size = image->tls_size;
-    memcpy(boot_thread->tls, image->tls_template, image->tls_filesz);
-
     struct kobox_runtime_host host = {
         .size = sizeof(host),
         .context = image,
-        .tls_address = tls_address,
+        .thread_state = thread_state,
     };
     PH_CHECK(kobox_boot_core_prepare(&image->core, image, ph_image_lookup, &host) ==
         KOBOX_BOOT_CORE_OK);
 }
 
 int ph_image_open(struct ph_image *image, const void *file, size_t size) {
-    image->file = file;
-    image->file_size = size;
-
-    validate_elf_header(image);
-    const Elf64_Phdr *dynamic = inspect_image_segments(image);
+    PH_CHECK(image && file);
+    PH_CHECK(kobox_fixed_image_open(file, size, PH_PAGE_SIZE, &image->fixed) ==
+        KOBOX_FIXED_IMAGE_OK);
+    PH_CHECK(image->fixed.link_base == KOBOX_CORE_LINK_BASE);
+    PH_CHECK(image->fixed.image_size <= PH_RAM_SIZE - PH_IMAGE_PHYSICAL_BASE);
+    image->size = image->fixed.image_size;
 
     allocate_image_memory(image);
     copy_load_segments(image);
-    relocate_image(image, dynamic);
     protect_load_segments(image);
     bind_core_runtime(image);
 
     ph_number("core image bytes", image->size);
-    ph_number("core TLS bytes", image->tls_size);
     return 0;
 }
 
 void ph_layout_init(struct ph_image *image, struct kobox_linux_boot_layout *layout) {
-    vmemmap_window = reserve_window(16ul << 20);
-    vmalloc_window = reserve_window(256ul << 20);
+    PH_CHECK(vmemmap_window.base != NULL && vmalloc_window.base != NULL);
     *layout = (struct kobox_linux_boot_layout) {
         .size = sizeof(*layout),
         .exceptions_install = ph_exceptions_install,

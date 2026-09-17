@@ -155,8 +155,11 @@ fn readStackPointer() u64 {
 }
 
 pub fn currentCpuSlot() usize {
-    if (x86_platform.cpuSlotForStackPointer(readStackPointer())) |slot| return slot;
-    return 0;
+    return currentCpuSlotIfKnown() orelse 0;
+}
+
+pub fn currentCpuSlotIfKnown() ?usize {
+    return x86_platform.cpuSlotForStackPointer(readStackPointer());
 }
 
 pub fn isBootstrapCpu() bool {
@@ -486,6 +489,7 @@ fn setCpuState(cpu_slot: usize, state: CpuState) void {
 }
 
 pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
+    @import("realtime_clock.zig").registerCpu(0, x86_platform.kernelPointerPaddr);
     @atomicStore(u64, &broadcast_online_mask, 0, .release);
     @atomicStore(u64, &mmio_cache_online_mask, 0, .release);
     @atomicStore(u32, &mmio_cache_matches[0], @intFromBool(mtrr.captureCacheSnapshot(&mmio_cache_snapshots[0])), .release);
@@ -583,13 +587,24 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     }
     _ = x86_platform.enablePcidIfSupported();
     _ = x86_platform.enablePkuIfSupported();
-    _ = lapic.enableLocalApic();
+    // Vector, divider and one-shot mode are CPU-local initialization. Leave
+    // the timer stopped until this AP dispatches a user thread.
+    const apic_ready = if (ap_user_timer_vector != 0)
+        lapic.initTimer(ap_user_timer_vector, 0)
+    else
+        lapic.enableLocalApic();
+    if (!apic_ready) {
+        setCpuState(cpu_slot, .absent);
+        markStarted(cpu_slot);
+        while (true) asm volatile ("hlt");
+    }
     const cache_snapshot = &mmio_cache_snapshots[cpu_slot];
     const cache_matches = mtrr.captureCacheSnapshot(cache_snapshot) and
         @atomicLoad(u32, &mmio_cache_matches[0], .acquire) != 0 and
         mmio_cache_snapshots[0].matches(cache_snapshot);
     @atomicStore(u32, &mmio_cache_matches[cpu_slot], @intFromBool(cache_matches), .release);
     runtimeLapicIdPtr(cpu_slot).* = lapic.localApicId();
+    @import("realtime_clock.zig").registerCpu(cpu_slot, x86_platform.kernelPointerPaddr);
     setCpuState(cpu_slot, .idle);
     markStarted(cpu_slot);
     apIdleLoop(cpu_slot);
@@ -821,7 +836,7 @@ fn enterUserModeFromIdle(entry: *scheduler_observer.UserEntry) noreturn {
     // it. Stage before restoring the selected thread's live XState.
     @import("traps.zig").stagePendingSignalForUserReturn(&entry.frame);
     if (ap_user_timer_vector != 0) {
-        _ = lapic.initTimer(ap_user_timer_vector, ap_user_timer_initial_count);
+        _ = lapic.armTimer(ap_user_timer_initial_count);
     }
     const x_state: *align(x86_platform.xstate_alignment) const [x86_platform.xstate_bytes]u8 =
         @ptrFromInt(entry.x_state_addr);

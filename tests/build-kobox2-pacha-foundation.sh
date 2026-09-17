@@ -136,7 +136,7 @@ adapter_sources=(
   "${extra_sources[@]}" \
   "$repo_root/tests/kobox2_native_mapping.c" \
   "$repo_root/userland/libpacha/src/syscall.c" \
-  "$sandbox/machine/domain.c" "$sandbox/boot/core.c" \
+  "$sandbox/machine/domain.c" "$sandbox/boot/core.c" "$sandbox/boot/fixed_image.c" \
   -Wl,-e,_start,-z,noexecstack \
   -o "$out/kobox2_foundation.elf"
 sha256sum "$core" "$out/kobox2_foundation.elf"

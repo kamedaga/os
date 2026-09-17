@@ -21,20 +21,169 @@ window_ids() {
   done
 }
 
-wait_for_xfce() {
+wait_for_window_manager() {
   local attempt wm_property
   for ((attempt = 0; attempt < 30; ++attempt)); do
     wm_property="$(
       x_query /usr/bin/xprop -root _NET_SUPPORTING_WM_CHECK
     )"
     if [[ "${wm_property}" == *'window id'* ]]; then
-      printf 'XFCE_APP_ACCEPTANCE_DESKTOP_READY display=%s\n' "${DISPLAY}"
+      printf 'XFCE_APP_ACCEPTANCE_WM_READY display=%s\n' "${DISPLAY}"
       return 0
     fi
     /bin/busybox sleep 0.5
   done
-  printf 'XFCE_APP_ACCEPTANCE_DESKTOP_FAIL reason=window-manager-timeout\n'
+  printf 'XFCE_APP_ACCEPTANCE_WM_FAIL reason=window-manager-timeout\n'
   return 1
+}
+
+xfce_window_candidate() {
+  local needle=$1 min_width=$2 min_height=$3
+  local line window width height area best_area=0 best_window=
+  while IFS= read -r line; do
+    [[ "${line}" == *"${needle}"* ]] || continue
+    [[ "${line}" =~ ^[[:space:]]*(0x[[:xdigit:]]+) ]] || continue
+    window=${BASH_REMATCH[1],,}
+    [[ "${line}" =~ [[:space:]]([0-9]+)x([0-9]+)[+-] ]] || continue
+    width=${BASH_REMATCH[1]}
+    height=${BASH_REMATCH[2]}
+    ((width >= min_width && height >= min_height)) || continue
+    area=$((width * height))
+    if ((area > best_area)); then
+      best_area=${area}
+      best_window=${window}
+    fi
+  done
+  [[ -n "${best_window}" ]] || return 1
+  printf '%s\n' "${best_window}"
+}
+
+window_is_viewable() {
+  local window_info
+  [[ -n "${1:-}" ]] || return 1
+  window_info="$(x_query /usr/bin/xwininfo -id "$1")"
+  [[ "${window_info}" == *'Map State: IsViewable'* ]]
+}
+
+wait_for_xfce_ui() {
+  local attempt tree desktop_window panel_window
+  local attempts=${XFCE_DESKTOP_ATTEMPTS:-12}
+  for ((attempt = 0; attempt < attempts; ++attempt)); do
+    tree="$(window_tree)"
+    desktop_window="$(
+      printf '%s\n' "${tree}" | xfce_window_candidate \
+        '"Desktop": ("xfdesktop" "Xfdesktop")' 100 100 || true
+    )"
+    panel_window="$(
+      printf '%s\n' "${tree}" | xfce_window_candidate \
+        '"xfce4-panel": ("xfce4-panel" "Xfce4-panel")' 100 10 || true
+    )"
+    if window_is_viewable "${desktop_window}" &&
+        window_is_viewable "${panel_window}"; then
+      printf 'XFCE_APP_ACCEPTANCE_DESKTOP_READY display=%s desktop=%s panel=%s\n' \
+        "${DISPLAY}" "${desktop_window}" "${panel_window}"
+      return 0
+    fi
+    /bin/busybox sleep 0.5
+  done
+  printf 'XFCE_APP_ACCEPTANCE_DESKTOP_FAIL reason=desktop-ui-timeout desktop=%s panel=%s\n' \
+    "${desktop_window:-missing}" "${panel_window:-missing}"
+  if [[ -n "${desktop_window:-}" ]]; then
+    x_query /usr/bin/xwininfo -id "${desktop_window}" | \
+      /bin/busybox grep -E 'Window id:|Width:|Height:|Map State:' || true
+  fi
+  if [[ -n "${panel_window:-}" ]]; then
+    x_query /usr/bin/xwininfo -id "${panel_window}" | \
+      /bin/busybox grep -E 'Window id:|Width:|Height:|Map State:' || true
+  fi
+  /bin/busybox printf '%s\n' "${tree}" | /bin/busybox tail -n 120
+  return 1
+}
+
+verify_xorg_gpu() {
+  local log=/var/log/Xorg.0.log renderer
+  if [[ ! -s "${log}" ]]; then
+    printf 'XFCE_GPU_XORG_FAIL reason=missing-log path=%s\n' "${log}"
+    return 1
+  fi
+  if ! /bin/busybox grep -Fq \
+      'Loading /usr/lib/xorg/modules/drivers/modesetting_drv.so' "${log}"; then
+    printf 'XFCE_GPU_XORG_FAIL reason=modesetting-driver\n'
+    return 1
+  fi
+  renderer="$({
+    /bin/busybox grep -F \
+      'glamor X acceleration enabled on virgl (D3D12 (' "${log}" || true
+  } | /bin/busybox tail -n 1)"
+  if [[ -z "${renderer}" ]]; then
+    printf 'XFCE_GPU_XORG_FAIL reason=glamor-renderer\n'
+    /bin/busybox grep -i 'glamor' "${log}" || true
+    return 1
+  fi
+  local extension
+  for extension in COMPOSITE Present DRI3; do
+    if ! /bin/busybox grep -Fq \
+        "Initializing extension ${extension}" "${log}"; then
+      printf 'XFCE_GPU_XORG_FAIL reason=extension extension=%s\n' \
+        "${extension}"
+      return 1
+    fi
+  done
+  if ! /bin/busybox grep -Fq 'Damage tracking initialized' "${log}"; then
+    printf 'XFCE_GPU_XORG_FAIL reason=damage-tracking\n'
+    return 1
+  fi
+  if /bin/busybox grep -Eiq \
+      'Refusing to try glamor|glamor initialization failed|glamor disabled' \
+      "${log}"; then
+    printf 'XFCE_GPU_XORG_FAIL reason=software-fallback\n'
+    return 1
+  fi
+  renderer=${renderer#*glamor X acceleration enabled on }
+  printf 'XFCE_GPU_XORG_INIT_PASS renderer=%s extensions=COMPOSITE,Present,DRI3 damage=initialized\n' \
+    "${renderer}"
+}
+
+activate_xorg_output() {
+  local attempt monitor state
+  monitor=
+  state=
+  for ((attempt = 0; attempt < 20; ++attempt)); do
+    if state="$(/bin/busybox timeout -k 1 10 /usr/bin/xrandr --query)"; then
+      monitor="$(/bin/busybox printf '%s\n' "${state}" | /bin/busybox sed -n \
+        's/^\([^ ]*\) connected.*/\1/p' | /bin/busybox head -n 1)"
+      [[ -z "${monitor}" ]] || break
+    fi
+    /bin/busybox sleep 0.25
+  done
+  printf 'XFCE_GPU_XRANDR_PROBE_BEGIN\n%s\nXFCE_GPU_XRANDR_PROBE_END\n' \
+    "${state}"
+  if [[ -z "${monitor}" ]]; then
+    printf 'XFCE_GPU_OUTPUT_FAIL reason=no-connected-output\n'
+    return 1
+  fi
+
+  # Force a real modeset.  Xorg's initial RandR state can already say active
+  # even when no SETCRTC reached pachagpu, in which case --auto alone is a
+  # no-op.  Do this before xfsettingsd snapshots the output state.
+  if ! /bin/busybox timeout -k 1 15 /usr/bin/xrandr \
+      --output "${monitor}" --off; then
+    printf 'XFCE_GPU_OUTPUT_FAIL reason=output-disable output=%s\n' "${monitor}"
+    return 1
+  fi
+  if ! /bin/busybox timeout -k 1 15 /usr/bin/xrandr \
+      --output "${monitor}" --auto --primary --pos 0x0; then
+    printf 'XFCE_GPU_OUTPUT_FAIL reason=output-enable output=%s\n' "${monitor}"
+    return 1
+  fi
+  state="$(/bin/busybox timeout -k 1 10 /usr/bin/xrandr --query)"
+  printf 'XFCE_GPU_XRANDR_STATE_BEGIN\n%s\nXFCE_GPU_XRANDR_STATE_END\n' "${state}"
+  if ! /bin/busybox printf '%s\n' "${state}" | /bin/busybox grep -Eq \
+      "^${monitor} connected( primary)? [0-9]+x[0-9]+\\+"; then
+    printf 'XFCE_GPU_OUTPUT_FAIL reason=output-inactive output=%s\n' "${monitor}"
+    return 1
+  fi
+  printf 'XFCE_GPU_OUTPUT_ACTIVE output=%s\n' "${monitor}"
 }
 
 # One dump after the wait gives a single frame of a moving picture, and three
@@ -277,15 +426,21 @@ run_x_session() {
   export XFCE_APP_WORK_DIR=${XFCE_APP_WORK_DIR:-/root/.xfce-app-acceptance/work}
   /bin/busybox mkdir -p "${XFCE_APP_WORK_DIR}"
 
-  if ! wait_for_xfce; then
+  if ! wait_for_window_manager; then
     printf 'XFCE_APP_ACCEPTANCE_DONE status=FAIL reason=window-manager-timeout\n'
     return 1
   fi
-
+  if ! wait_for_xfce_ui; then
+    printf 'XFCE_APP_ACCEPTANCE_DONE status=FAIL reason=desktop-ui-timeout\n'
+    return 1
+  fi
   local iteration app pass_count=0 fail_count=0
   local -a apps=(Thunar pine2-gtk about gtk3-demo terminal)
   if [[ -n "${XFCE_APP_ONLY:-}" ]]; then
     case "${XFCE_APP_ONLY}" in
+      xorg)
+        apps=()
+        ;;
       Thunar|pine2-gtk|about|gtk3-demo|terminal|geany)
         apps=("${XFCE_APP_ONLY}")
         ;;
@@ -369,27 +524,43 @@ run_guest_controller() {
   printf 'XFCE_APP_ACCEPTANCE_START repeat=%s\n' "${XFCE_APP_REPEAT}"
   printf 'XFCE_APP_INSTRUMENT controller repeat=%s only=%s\n' \
     "${XFCE_APP_REPEAT}" "${XFCE_APP_ONLY:-}"
-  exec /usr/bin/startx /bin/bash "${script_guest}" --x-session -- :0
+  local status
+  if /usr/bin/startx /bin/bash "${script_guest}" --x-session -- :0; then
+    status=0
+  else
+    status=$?
+  fi
+  printf 'XFCE_APP_XORG_EXIT status=%s\n' "${status}"
+  if ((status != 0)); then
+    /bin/busybox sed -n '1,240p' /var/log/Xorg.0.log 2>/dev/null || true
+    printf 'XFCE_APP_ACCEPTANCE_DONE status=FAIL reason=xorg-exit code=%s\n' \
+      "${status}"
+  fi
+  return "${status}"
 }
 
 dump_startup_process_tree() {
   local reason=${1:-unknown} pid state
   printf 'XFCE_STARTUP_PROCESS_TREE_BEGIN reason=%s\n' "${reason}"
   # busybox ps rejects the whole -o list if one field is unsupported, and it
-  # has no wchan, so asking for one printed nothing at all.  Read the blocking
-  # state straight out of procfs instead, which is what the tree is for.
-  /bin/busybox ps -o pid,ppid,stat,etime,args 2>&1 || true
+  # has no wchan.  Read blocking state first so a slow ps/proc enumeration
+  # cannot hide the per-process evidence this diagnostic exists to collect.
   for pid in /proc/[0-9]*; do
     pid=${pid#/proc/}
-    state=$(/bin/busybox sed -n 's/^State:[[:space:]]*//p' "/proc/${pid}/status" 2>/dev/null)
+    if ! state=$(/bin/busybox timeout -k 1 1 /bin/busybox sed -n \
+        's/^State:[[:space:]]*//p' "/proc/${pid}/status" 2>/dev/null); then
+      printf 'XFCE_STARTUP_PROC pid=%s query=timeout\n' "${pid}"
+      continue
+    fi
     [[ -n "${state}" ]] || continue
     printf 'XFCE_STARTUP_PROC pid=%s state=%s wchan=%s syscall=%s comm=%s\n' \
       "${pid}" \
       "${state}" \
-      "$(/bin/busybox cat "/proc/${pid}/wchan" 2>/dev/null || printf '?')" \
-      "$(/bin/busybox cat "/proc/${pid}/syscall" 2>/dev/null || printf '?')" \
-      "$(/bin/busybox cat "/proc/${pid}/comm" 2>/dev/null || printf '?')"
+      "$(/bin/busybox timeout -k 1 1 /bin/busybox cat "/proc/${pid}/wchan" 2>/dev/null || printf '?')" \
+      "$(/bin/busybox timeout -k 1 1 /bin/busybox cat "/proc/${pid}/syscall" 2>/dev/null || printf '?')" \
+      "$(/bin/busybox timeout -k 1 1 /bin/busybox cat "/proc/${pid}/comm" 2>/dev/null || printf '?')"
   done
+  /bin/busybox ps -o pid,ppid,stat,etime,args 2>&1 || true
   printf 'XFCE_STARTUP_PROCESS_TREE_END reason=%s\n' "${reason}"
 }
 
@@ -418,7 +589,19 @@ run_startup_controller() {
   printf 'XFCE_STARTUP_CONTROLLER_START\n'
 
   run_startup_diagnostic_listener &
-  local diagnostic_pid=$! status
+  local diagnostic_pid=$! auto_diagnostic_pid= status
+  if [[ -n "${XFCE_STARTUP_AUTO_DUMP_SECONDS:-}" ]]; then
+    if [[ ! "${XFCE_STARTUP_AUTO_DUMP_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+      printf 'XFCE_STARTUP_AUTO_DUMP_SECONDS must be a positive integer: %s\n' \
+        "${XFCE_STARTUP_AUTO_DUMP_SECONDS}"
+      return 2
+    fi
+    (
+      /bin/busybox sleep "${XFCE_STARTUP_AUTO_DUMP_SECONDS}"
+      dump_startup_process_tree auto-timeout
+    ) &
+    auto_diagnostic_pid=$!
+  fi
   if /usr/bin/startx /bin/bash "${script_guest}" --x-session -- :0; then
     status=0
   else
@@ -430,6 +613,10 @@ run_startup_controller() {
   # still the foreground tty job so no new shell command can race the dump.
   printf 'XFCE_STARTUP_SESSION_EXIT status=%s\n' "${status}"
   dump_startup_process_tree session-exit
+  if [[ -n "${auto_diagnostic_pid}" ]]; then
+    /bin/busybox kill "${auto_diagnostic_pid}" 2>/dev/null || true
+    wait "${auto_diagnostic_pid}" 2>/dev/null || true
+  fi
   /bin/busybox kill "${diagnostic_pid}" 2>/dev/null || true
   wait "${diagnostic_pid}" 2>/dev/null || true
   return "${status}"
@@ -437,7 +624,12 @@ run_startup_controller() {
 
 run_host() {
   local repo_root repeat timeout_seconds selected_app
-  local -a expected_apps expect_args qemu_args=()
+  local -a expected_apps expect_args qemu_args=(
+    --qemu-arg=-vga
+    --qemu-arg=none
+    --qemu-arg=-device
+    --qemu-arg=ramfb
+  )
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   repeat=${XFCE_APP_REPEAT:-1}
   timeout_seconds=${XFCE_APP_TIMEOUT_SECONDS:-240}
@@ -457,6 +649,9 @@ run_host() {
   case "${selected_app}" in
     '')
       expected_apps=(Thunar pine2-gtk about gtk3-demo terminal)
+      ;;
+    xorg)
+      expected_apps=()
       ;;
     Thunar|pine2-gtk|about|gtk3-demo|terminal|geany)
       expected_apps=("${selected_app}")
@@ -479,12 +674,14 @@ run_host() {
     PACGO_PROGRESS=plain .artifacts/bin/pacgo sync bootfs
   fi
 
+  GALLIUM_DRIVER="${VIRGL_HOST_DRIVER:-d3d12}" \
   .artifacts/bin/pacgo qemu-test \
     --console-shell \
     --console-ready-marker 'bash-5.2# ' \
     --cpus "${XFCE_APP_CPUS:-4}" \
     --timeout "${timeout_seconds}s" \
-    --graphics 2d \
+    --graphics virgl \
+    --display gtk \
     --input-profile keyboard-tablet \
     "${qemu_args[@]}" \
     --send "XFCE_APP_REPEAT=${repeat} XFCE_APP_ONLY=${selected_app} XFCE_APP_WINDOW_ATTEMPTS=${XFCE_APP_WINDOW_ATTEMPTS:-20} XFCE_APP_GEANY_ENV=${XFCE_APP_GEANY_ENV:-} /bin/bash ${script_guest} --guest-controller" \
@@ -495,6 +692,30 @@ run_host() {
       .artifacts/console-tty-test.log; then
     printf 'Xfce app acceptance reported a failure; see %s\n' \
       "${repo_root}/.artifacts/console-tty-test.log" >&2
+    return 1
+  fi
+  local marker
+  for marker in \
+      'XFCE_GPU_XORG_INIT_PASS renderer=virgl (D3D12 (' \
+      '[gpud] drm submit generation=1 node=0 ' \
+      '[gpud] drm modeset generation=1 node=0 ' \
+      'XFCE_GPU_OUTPUT_ACTIVE output=Virtual-1' \
+      'XFCE_APP_ACCEPTANCE_DESKTOP_READY'; do
+    if ! grep -Fq "${marker}" .artifacts/qemu-tty-host-time.log; then
+      printf 'Xfce GPU acceptance marker missing: %s\n' "${marker}" >&2
+      return 1
+    fi
+  done
+  if ! grep -Eq \
+      '\[gpud\] drm dirtyfb generation=1 node=0 .* clips=0 status=-2' \
+      .artifacts/qemu-tty-host-time.log; then
+    printf 'Xfce GPU acceptance marker missing: Linux-compatible DIRTYFB probe\n' >&2
+    return 1
+  fi
+  if ! grep -Eq \
+      '\[gpud\] drm dirtyfb generation=1 node=0 .* clips=[1-9][0-9]* status=0' \
+      .artifacts/qemu-tty-host-time.log; then
+    printf 'Xfce GPU acceptance marker missing: successful DIRTYFB update\n' >&2
     return 1
   fi
 }
@@ -514,6 +735,15 @@ case "${1:-}" in
     ;;
   --x-session)
     shift
+    if ! activate_xorg_output; then
+      printf 'XFCE_APP_ACCEPTANCE_DONE status=FAIL reason=xorg-output\n'
+      exit 1
+    fi
+    if ! verify_xorg_gpu; then
+      /bin/busybox sed -n '1,260p' /var/log/Xorg.0.log 2>/dev/null || true
+      printf 'XFCE_APP_ACCEPTANCE_DONE status=FAIL reason=xorg-gpu\n'
+      exit 1
+    fi
     exec /usr/bin/dbus-run-session -- /bin/bash "${script_guest}" --launch-xfce
     ;;
   --launch-xfce)

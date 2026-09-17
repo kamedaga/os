@@ -2338,10 +2338,21 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
              requested_end == 0 ||
              requested_end > private_file->stat_size))
         {
-            lpr_linux_stat_t stat_snapshot;
-            lpr_memset(&stat_snapshot, 0, sizeof(stat_snapshot));
-            (void)lpr_backend_fstat(
-                fd, (uint64_t)(uintptr_t)&stat_snapshot);
+            /* Page rounding alone can exceed EOF. Reuse the size only when
+             * FileD's live generation still validates the stat snapshot;
+             * a write/truncate through another handle must refresh it. */
+            uint64_t live_generation = 0;
+            const int size_current =
+                private_file->object_generation != 0 &&
+                lpr_filed_live_object_generation(
+                    private_file->handle, &live_generation) == 0 &&
+                live_generation == private_file->object_generation;
+            if (!size_current) {
+                lpr_linux_stat_t stat_snapshot;
+                lpr_memset(&stat_snapshot, 0, sizeof(stat_snapshot));
+                (void)lpr_backend_fstat(
+                    fd, (uint64_t)(uintptr_t)&stat_snapshot);
+            }
         }
         private_file = lpr_filed_backend(fd);
         const uint64_t whole_file_bytes = private_file != 0 ?

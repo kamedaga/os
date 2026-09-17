@@ -124,10 +124,8 @@ int main(int argc, char **argv)
     CHECK(!setuid(1000));
     pthread_t readers[4];
     for (unsigned i = 0; i < 4; i++) CHECK(!pthread_create(&readers[i],NULL,reader,NULL));
-    /* LPR credentials are process-wide. Exercise concurrent manager readers
-     * directly: musl's multi-thread wrapper additionally needs tkill, whose
-     * cross-thread delivery is currently unimplemented (a separate task). */
-    for (unsigned i = 0; i < 8; i++) CHECK(!syscall(SYS_setuid, i & 1 ? 1000 : 81));
+    /* Exercise musl's all-thread synchronization as well as manager readers. */
+    for (unsigned i = 0; i < 8; i++) CHECK(!setuid(i & 1 ? 1000 : 81));
     atomic_store(&stop_readers, 1);
     for (unsigned i = 0; i < 4; i++) CHECK(!pthread_join(readers[i],NULL));
     CHECK(!atomic_load(&reader_failed));

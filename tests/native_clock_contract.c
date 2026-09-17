@@ -182,8 +182,39 @@ static int concurrent_deadlines(int fd)
     return 0;
 }
 
+static int mixed_timer_ipc_poll(void)
+{
+    // Timer readiness needs POLL, not READ. Put IPC first to exercise the
+    // lazy clock sample, then wait through registration with both present.
+    long timer = pacha_syscall6(PACHA_FD_SYSCALL_TIMERFD_CREATE,
+        PACHA_TIMERFD_CLOCK_MONOTONIC, 0, 0, 0,
+        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_WRITE |
+        PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE, 0);
+    CHECK(timer >= 16);
+    uint64_t pair[2];
+    CHECK(pacha_syscall3(PACHA_IPC_SYSCALL_CHANNEL_CREATE, (uintptr_t)pair,
+        PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE, 0) == 0);
+    struct pacha_pollfd items[2] = {
+        { .fd = (int)pair[0], .events = PACHA_FD_EVENT_READABLE },
+        { .fd = (int)timer, .events = PACHA_FD_EVENT_READABLE }
+    };
+    CHECK(pacha_syscall2(PACHA_FD_SYSCALL_POLL, (uintptr_t)items, 2) == 0);
+    const uint64_t deadline = clock_now() + 10000000;
+    CHECK(arm(timer, deadline, 0) == 0);
+    CHECK(pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY, (uintptr_t)items, 2, 1000, 0) == 1);
+    CHECK(clock_now() >= deadline && items[0].revents == 0 &&
+        items[1].revents == PACHA_FD_EVENT_READABLE);
+    CHECK(pacha_syscall2(PACHA_FD_SYSCALL_POLL, (uintptr_t)items, 2) == 1);
+    CHECK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, timer) == 0);
+    CHECK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, pair[0]) == 0);
+    CHECK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, pair[1]) == 0);
+    return 0;
+}
+
 int native_clock_contract(void)
 {
+    CHECK(mixed_timer_ipc_poll() == 0);
     uint64_t resolution[2];
     CHECK(pacha_syscall2(PACHA_RUNTIME_SYSCALL_CLOCK_GETRES, 1,
         (uintptr_t)resolution) == 0);

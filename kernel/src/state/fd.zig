@@ -351,12 +351,20 @@ pub fn releaseKernelObjectPayloadWithFreeList(
     }
 }
 
-pub fn clearKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
-    self.releaseKernelObjectPayload(slot);
+// Invalidate identity without destroying the payload. DMA publication failure
+// leaves IOVA cleanup to its caller; normal destruction calls this afterwards.
+fn resetKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
+    const index = (@intFromPtr(slot) - @intFromPtr(&self.fd_objects[0])) / @sizeOf(KernelObjectSlot);
+    self.pinned_object_slots.unset(index);
     slot.kind = .none;
     slot.ref_count = 0;
     slot.payload = .{ .none = {} };
     slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+}
+
+pub fn clearKernelObjectSlot(self: anytype, slot: *KernelObjectSlot) void {
+    self.releaseKernelObjectPayload(slot);
+    resetKernelObjectSlot(self, slot);
 }
 
 pub fn clearKernelObjectSlotWithFreeList(
@@ -365,10 +373,7 @@ pub fn clearKernelObjectSlotWithFreeList(
     free_list: *FreePageList,
 ) void {
     self.releaseKernelObjectPayloadWithFreeList(slot, free_list);
-    slot.kind = .none;
-    slot.ref_count = 0;
-    slot.payload = .{ .none = {} };
-    slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+    resetKernelObjectSlot(self, slot);
 }
 
 pub fn resetKernelObjectTable(self: anytype) void {
@@ -380,6 +385,7 @@ pub fn resetKernelObjectTable(self: anytype) void {
         if (slot.kind != .none) self.releaseKernelObjectPayload(slot);
         slot.* = .{};
     }
+    self.pinned_object_slots = .initEmpty();
     for (self.pipes[0..]) |*slot| {
         slot.* = .{ .generation = @TypeOf(self.*).nextObjectGeneration(slot.generation) };
     }
@@ -407,6 +413,10 @@ pub fn createKernelObject(
         slot.kind = kind;
         slot.payload = payload;
         slot.ref_count = 0;
+        self.pinned_object_slots.setValue(index, switch (kind) {
+            .mmio_region, .dma_buffer, .dma_mapping => true,
+            else => false,
+        });
         self.next_fd_object_scan = (index + 1) % max_fd_objects;
         return .{
             .kind = kind,
@@ -565,7 +575,6 @@ pub fn revokeOwnedPinnedUserObjectsWithFreeList(
         };
         revokeKernelObjectEverywhereWithFreeList(self, object_ref, free_list);
     }
-    vtd.dumpRuntimeCheckpoint();
 }
 
 pub fn fdTableForActiveProcess(self: anytype, principal: PrincipalId) KernelError!*FdTable {
@@ -1021,10 +1030,7 @@ pub fn createDmaBufferFd(
         // would create a window where another thread can reuse the IOVA before
         // the caller's second unmap.
         if (self.kernelObjectSlot(object_ref)) |slot| {
-            slot.kind = .none;
-            slot.ref_count = 0;
-            slot.payload = .{ .none = {} };
-            slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+            resetKernelObjectSlot(self, slot);
         }
         return err;
     };
@@ -1044,10 +1050,7 @@ pub fn createDmaMappingFd(
     const object_ref = try self.createKernelObject(.dma_mapping, .{ .dma_mapping = payload });
     return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
         if (self.kernelObjectSlot(object_ref)) |slot| {
-            slot.kind = .none;
-            slot.ref_count = 0;
-            slot.payload = .{ .none = {} };
-            slot.generation = @TypeOf(self.*).nextObjectGeneration(slot.generation);
+            resetKernelObjectSlot(self, slot);
         }
         return err;
     };
@@ -1639,6 +1642,7 @@ pub fn beginFdWaitGroup(
             .thread_generation = thread_generation,
             .wait_token = wait_token,
         };
+        self.fd_wait_group_thread_counts[thread_index % self.fd_wait_group_thread_counts.len] += 1;
         self.next_fd_wait_group_scan = (index + 1) % self.fd_wait_groups.len;
         return .{ .index = @intCast(index), .generation = generation };
     }
@@ -1705,6 +1709,9 @@ pub fn cancelFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) 
         }
     }
     const next_generation = nextFdWaitGroupGeneration(slot.generation);
+    const bucket = slot.thread_index % self.fd_wait_group_thread_counts.len;
+    std.debug.assert(self.fd_wait_group_thread_counts[bucket] != 0);
+    self.fd_wait_group_thread_counts[bucket] -= 1;
     slot.* = .{ .generation = next_generation };
 }
 
@@ -1715,6 +1722,8 @@ pub fn cancelFdWaitGroupsForThread(
     thread_generation: u32,
 ) void {
     if (thread_index > std.math.maxInt(u32)) return;
+    if (self.fd_wait_group_thread_counts[thread_index % self.fd_wait_group_thread_counts.len] == 0)
+        return;
     const thread_index_u32: u32 = @intCast(thread_index);
     var index: usize = 0;
     while (index < self.fd_wait_groups.len) : (index += 1) {

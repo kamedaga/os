@@ -46,6 +46,14 @@ uint32_t ph_gpu_session_acquire(struct gpud_gpu_sessions *sessions,
                                 uint64_t client,
                                 uint64_t id,
                                 uint64_t *cookie_out);
+/* Event observers identify the private Linux file cookie, never a peer
+ * session ID. Resolve it only while OPEN and hold one in-flight reference
+ * through event read/publication. */
+uint32_t ph_gpu_session_event_acquire(struct gpud_gpu_sessions *sessions,
+                                      uint64_t generation,
+                                      uint64_t client,
+                                      uint64_t cookie,
+                                      uint64_t *id_out);
 uint32_t ph_gpu_session_release(struct gpud_gpu_sessions *sessions,
                                 uint64_t generation,
                                 uint64_t client,

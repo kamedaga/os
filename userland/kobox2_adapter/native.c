@@ -9,17 +9,19 @@ extern char __stop_ph_trampoline[];
 int ph_notifications_save(uint64_t *previous_mask) {
     struct ph_task *task = ph_current_task();
 
-    *previous_mask = task->notification_mask;
-    task->notification_mask = PH_NOTIFICATION_MASK;
-    return (int)pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
-        PACHA_PROCESS_SIGNAL_CTL_SET_MASK, PH_NOTIFICATION_MASK);
+    *previous_mask = atomic_exchange_explicit(&task->notification_mask,
+        PH_NOTIFICATION_MASK, memory_order_acq_rel);
+    return 0;
 }
 
 int ph_notifications_restore(uint64_t mask) {
     PH_CHECK(mask == 0 || mask == PH_NOTIFICATION_MASK);
-    ph_current_task()->notification_mask = mask;
-    return (int)pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
-        PACHA_PROCESS_SIGNAL_CTL_SET_MASK, mask);
+    struct ph_task *task = ph_current_task();
+    atomic_store_explicit(&task->notification_mask, mask, memory_order_release);
+    if (!mask && atomic_exchange_explicit(&task->notification_deferred,
+            0, memory_order_acq_rel))
+        ph_dispatch_notifications();
+    return 0;
 }
 
 /* Only the assembly prologue/return is inhibited. Linux may enable nested
@@ -33,17 +35,31 @@ void ph_notification_body(struct pacha_native_signal_frame *frame) {
     }
 
     PH_CHECK(frame->signo == PH_NOTIFICATION_SIGNAL);
+    /* Native delivery remains asynchronous. A protected host operation only
+     * defers Linux entry; the CPU domain retains every event and its count.
+     * Unmasking drains this hint before returning to the interrupted caller. */
+    struct ph_task *task = ph_current_task();
+    if (atomic_load_explicit(&task->notification_mask, memory_order_acquire)) {
+        atomic_store_explicit(&task->notification_deferred, 1, memory_order_release);
+        return;
+    }
     ph_dispatch_notifications();
 }
 
 void ph_thread_setup(struct ph_task *task) {
+    atomic_init(&task->notification_mask, PH_NOTIFICATION_MASK);
+    atomic_init(&task->notification_deferred, 0);
+    PH_CHECK(atomic_is_lock_free(&task->notification_mask) &&
+        atomic_is_lock_free(&task->notification_deferred));
     PH_OK(pacha_syscall6(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_REGISTER, (uintptr_t)ph_notification_entry,
         (uintptr_t)__start_ph_trampoline, (uintptr_t)__stop_ph_trampoline, 0, 0));
     PH_OK(pacha_syscall4(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
         PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT, (uintptr_t)ph_notification_entry,
         (uintptr_t)task->fault_stack, PH_THREAD_STACK_SIZE));
-    PH_OK(ph_notifications_restore(PH_NOTIFICATION_MASK));
+    /* New threads can inherit a blocked native mask from their creator. */
+    PH_OK(pacha_syscall2(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
+        PACHA_PROCESS_SIGNAL_CTL_SET_MASK, 0));
 }
 
 struct ph_task *ph_thread_create(void *(*entry)(void *), void *argument) {
@@ -58,10 +74,6 @@ struct ph_task *ph_thread_create(void *(*entry)(void *), void *argument) {
     task->argument = argument;
     task->stack = ph_alloc(PH_THREAD_STACK_SIZE);
     task->fault_stack = ph_alloc(PH_THREAD_STACK_SIZE);
-    task->tls_size = ph_core.tls_size;
-    task->tls = ph_alloc(task->tls_size);
-    memcpy(task->tls, ph_core.tls_template, ph_core.tls_filesz);
-
     long thread_fd = pacha_syscall6(PACHA_THREAD_SYSCALL_CREATE, PACHA_PROCESS_SELF_FD,
         (uintptr_t)ph_thread_entry, (uintptr_t)task->stack + PH_THREAD_STACK_SIZE, 0,
         (uintptr_t)task, rights);
@@ -106,7 +118,6 @@ int ph_thread_join(void *opaque) {
 
     ph_free(task->stack, PH_THREAD_STACK_SIZE);
     ph_free(task->fault_stack, PH_THREAD_STACK_SIZE);
-    ph_free(task->tls, task->tls_size);
     ph_free(task, sizeof(*task));
     return 0;
 }

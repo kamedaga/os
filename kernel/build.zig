@@ -117,7 +117,7 @@ pub fn build(b: *std.Build) void {
     interrupt_waiter_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     interrupt_waiter_mod.addCSourceFile(.{ .file = b.path("../tests/interrupt_waiter_host.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     addVerifiedSchedulerHostObject(b, interrupt_waiter_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_interrupt_test.o");
-    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{"shootdown interrupt guard"}, .use_llvm = true });
+    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{ "shootdown interrupt guard", "copy window", "poll item snapshot" }, .use_llvm = true });
     interrupt_waiter_tests.stack_size = 512 * 1024 * 1024;
     test_step.dependOn(&b.addRunArtifact(interrupt_waiter_tests).step);
     const realtime_clock_tests = b.addTest(.{ .root_module = b.createModule(.{

@@ -30,11 +30,51 @@ const icr_delivery_init: u32 = 0x5 << 8;
 const icr_delivery_startup: u32 = 0x6 << 8;
 
 var lapic_base_pa: u64 = 0;
+// Chosen by the BSP before AP startup, then read-only. Each AP must enable
+// and verify this mode before it is made online; a mismatch fails closed.
+var x2apic_mode: bool = false;
 var bsp_timer_initial_count: u32 = 0;
 var timer_frequency_hz: u64 = 0;
 
 pub fn kernelStaticStorageEndAddr() usize {
-    return @max(@intFromPtr(&timer_frequency_hz) + @sizeOf(u64), @intFromPtr(&bsp_timer_initial_count) + @sizeOf(u32));
+    return @max(@max(@intFromPtr(&timer_frequency_hz) + @sizeOf(u64), @intFromPtr(&bsp_timer_initial_count) + @sizeOf(u32)), @max(@intFromPtr(&lapic_base_pa) + @sizeOf(u64), @intFromPtr(&x2apic_mode) + @sizeOf(bool)));
+}
+
+pub fn usesX2Apic() bool {
+    return x2apic_mode;
+}
+
+fn cpuid(leaf: u32) struct { ebx: u32, ecx: u32, edx: u32 } {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (@as(u32, 0)),
+    );
+    return .{ .ebx = ebx, .ecx = ecx, .edx = edx };
+}
+
+fn kvmX2ApicSupported() bool {
+    const features = cpuid(1).ecx;
+    if (features & ((1 << 31) | (1 << 21)) != ((1 << 31) | (1 << 21))) return false;
+    const signature = cpuid(0x40000000);
+    // Physical x2APIC without interrupt remapping is supported by KVM.
+    // Do not make that assumption for bare metal or another hypervisor.
+    return signature.ebx == 0x4b4d564b and signature.ecx == 0x564b4d56 and signature.edx == 0x4d;
+}
+
+fn registerMsr(offset: u32) u32 {
+    return 0x800 + (offset >> 4);
+}
+
+fn x2Icr(destination: u8, command: u32) u64 {
+    return (@as(u64, destination) << 32) | command;
 }
 
 pub const TimerCalibration = struct {
@@ -64,7 +104,7 @@ fn wrmsr(msr: u32, value: u64) void {
         : [msr] "{ecx}" (msr),
           [low] "{eax}" (low),
           [high] "{edx}" (high),
-    );
+        : .{ .memory = true });
 }
 
 fn outb(port: u16, value: u8) void {
@@ -82,12 +122,17 @@ fn inb(port: u16) u8 {
     );
 }
 
-fn mmioRead(offset: u32) u32 {
+fn readRegister(offset: u32) u32 {
+    if (x2apic_mode) return @truncate(rdmsr(registerMsr(offset)));
     const reg: *volatile u32 = @ptrFromInt(lapic_base_pa + offset);
     return reg.*;
 }
 
-fn mmioWrite(offset: u32, value: u32) void {
+fn writeRegister(offset: u32, value: u32) void {
+    if (x2apic_mode) {
+        wrmsr(registerMsr(offset), value);
+        return;
+    }
     const reg: *volatile u32 = @ptrFromInt(lapic_base_pa + offset);
     reg.* = value;
 }
@@ -95,10 +140,26 @@ fn mmioWrite(offset: u32, value: u32) void {
 fn waitIcrIdle() bool {
     var spins: u32 = 0;
     while (spins < 1000000) : (spins += 1) {
-        if ((mmioRead(lapic_reg_icr_low) & icr_delivery_status) == 0) return true;
+        if ((readRegister(lapic_reg_icr_low) & icr_delivery_status) == 0) return true;
         asm volatile ("pause");
     }
-    return (mmioRead(lapic_reg_icr_low) & icr_delivery_status) == 0;
+    return (readRegister(lapic_reg_icr_low) & icr_delivery_status) == 0;
+}
+
+fn sendIcr(destination: u8, command: u32) bool {
+    if (x2apic_mode) {
+        // x2APIC WRMSR is not serializing. Publish prior memory updates
+        // before notifying the target CPU (Intel SDM, x2APIC ordering).
+        asm volatile ("mfence; lfence" ::: .{ .memory = true });
+        wrmsr(registerMsr(lapic_reg_icr_low), x2Icr(destination, command));
+        return true;
+    }
+    if (!waitIcrIdle()) return false;
+    // Shorthand delivery ignores the high destination register.
+    if (command & (@as(u32, 3) << 18) == 0)
+        writeRegister(lapic_reg_icr_high, @as(u32, destination) << 24);
+    writeRegister(lapic_reg_icr_low, command);
+    return waitIcrIdle();
 }
 
 fn delayIpi() void {
@@ -116,26 +177,14 @@ pub fn maskLegacyPic() void {
 
 pub fn initTimer(timer_vector: u8, initial_count: u32) bool {
     maskLegacyPic();
-
-    var apic_base = rdmsr(ia32_apic_base_msr);
-    if ((apic_base & x2apic_enable_bit) != 0) return false;
-    if ((apic_base & apic_enable_bit) == 0) {
-        apic_base |= apic_enable_bit;
-        wrmsr(ia32_apic_base_msr, apic_base);
-        apic_base = rdmsr(ia32_apic_base_msr);
-    }
-
-    lapic_base_pa = apic_base & apic_base_mask;
-    if (lapic_base_pa == 0) return false;
-
-    mmioWrite(lapic_reg_svr, 0x100 | 0xFF); // software enable LAPIC
-    mmioWrite(lapic_reg_divide_config, 0x3); // divide by 16
+    if (!enableLocalApic()) return false;
+    writeRegister(lapic_reg_divide_config, 0x3); // divide by 16
     // Keep the LAPIC timer in one-shot mode.  The BSP rearms its 1 ms
     // timekeeping deadline in the interrupt handler, while APs arm only when
     // they actually enter a user thread.
-    mmioWrite(lapic_reg_lvt_timer, @as(u32, timer_vector) & 0xFF);
-    mmioWrite(lapic_reg_initial_count, initial_count);
-    mmioWrite(lapic_reg_eoi, 0);
+    writeRegister(lapic_reg_lvt_timer, @as(u32, timer_vector) & 0xFF);
+    writeRegister(lapic_reg_initial_count, initial_count);
+    writeRegister(lapic_reg_eoi, 0);
     return true;
 }
 
@@ -187,7 +236,7 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
         return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
     }
 
-    mmioWrite(lapic_reg_initial_count, std.math.maxInt(u32));
+    writeRegister(lapic_reg_initial_count, std.math.maxInt(u32));
     const counter_start = realtime_clock.readCounter();
     outb(0x61, (original_port_b & ~@as(u8, 0x02)) | 0x01);
 
@@ -200,7 +249,7 @@ pub fn calibrateTimer(fallback_initial_count: u32, rearm_overhead_ns: u64) Timer
     }
 
     const counter_end = realtime_clock.readCounter();
-    const current_count = mmioRead(lapic_reg_current_count);
+    const current_count = readRegister(lapic_reg_current_count);
     const elapsed_counts = std.math.maxInt(u32) - current_count;
     const frequency_hz = frequencyFromPitMeasurement(elapsed_counts, calibration_pit_ticks) orelse {
         return fallbackCalibration(fallback_initial_count, rearm_overhead_ns);
@@ -233,13 +282,13 @@ pub fn timerInitialCount(fallback_initial_count: u32) u32 {
 
 pub fn armTimer(initial_count: u32) bool {
     if (lapic_base_pa == 0 or initial_count == 0) return false;
-    mmioWrite(lapic_reg_initial_count, initial_count);
+    writeRegister(lapic_reg_initial_count, initial_count);
     return true;
 }
 
 pub fn disarmTimer() void {
     if (lapic_base_pa == 0) return;
-    mmioWrite(lapic_reg_initial_count, 0);
+    writeRegister(lapic_reg_initial_count, 0);
 }
 
 pub fn highResolutionReady() bool {
@@ -267,60 +316,68 @@ test "absolute LAPIC deadline rounds up and bounds register count" {
 
 pub fn enableLocalApic() bool {
     var apic_base = rdmsr(ia32_apic_base_msr);
-    if ((apic_base & x2apic_enable_bit) != 0) return false;
+    const base = apic_base & apic_base_mask;
+    if (base == 0) return false;
+    const supported = kvmX2ApicSupported();
+    const selected = if (lapic_base_pa == 0) supported else x2apic_mode;
+    if (selected and !supported) return false;
+    // Never fall back by directly clearing x2APIC mode once enabled.
+    if (!selected and apic_base & x2apic_enable_bit != 0) return false;
+    if (lapic_base_pa != 0 and lapic_base_pa != base) return false;
     if ((apic_base & apic_enable_bit) == 0) {
         apic_base |= apic_enable_bit;
         wrmsr(ia32_apic_base_msr, apic_base);
         apic_base = rdmsr(ia32_apic_base_msr);
     }
-    lapic_base_pa = apic_base & apic_base_mask;
-    if (lapic_base_pa == 0) return false;
-    mmioWrite(lapic_reg_svr, 0x100 | 0xFF);
+    if (apic_base & apic_enable_bit == 0) return false;
+    if (selected and apic_base & x2apic_enable_bit == 0) {
+        // Disabled -> xAPIC -> x2APIC: the direct transition is illegal.
+        wrmsr(ia32_apic_base_msr, apic_base | x2apic_enable_bit);
+        apic_base = rdmsr(ia32_apic_base_msr);
+    }
+    if (apic_base & apic_enable_bit == 0 or
+        (apic_base & x2apic_enable_bit != 0) != selected) return false;
+    if (selected and rdmsr(registerMsr(lapic_reg_id)) >= 0xff) return false;
+    if (lapic_base_pa == 0) {
+        x2apic_mode = selected;
+        lapic_base_pa = base;
+    }
+    writeRegister(lapic_reg_svr, 0x100 | 0xFF);
     return true;
 }
 
 pub fn localApicId() u8 {
     if (lapic_base_pa == 0 and !enableLocalApic()) return 0;
-    return @truncate(mmioRead(lapic_reg_id) >> 24);
+    const raw = readRegister(lapic_reg_id);
+    const id = if (x2apic_mode) raw else raw >> 24;
+    return if (id < 0xff) @intCast(id) else 0xff;
 }
 
 pub fn sendInitSipi(apic_id: u8, startup_vector: u8) bool {
     if (lapic_base_pa == 0 and !enableLocalApic()) return false;
-    if (!waitIcrIdle()) return false;
-    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
-    mmioWrite(lapic_reg_icr_low, icr_delivery_init | icr_level_assert | icr_trigger_level);
-    if (!waitIcrIdle()) return false;
+    if (!sendIcr(apic_id, icr_delivery_init | icr_level_assert | icr_trigger_level)) return false;
     delayIpi();
-    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
-    mmioWrite(lapic_reg_icr_low, icr_delivery_startup | @as(u32, startup_vector));
-    if (!waitIcrIdle()) return false;
+    if (!sendIcr(apic_id, icr_delivery_startup | @as(u32, startup_vector))) return false;
     delayIpi();
-    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
-    mmioWrite(lapic_reg_icr_low, icr_delivery_startup | @as(u32, startup_vector));
-    return waitIcrIdle();
+    return sendIcr(apic_id, icr_delivery_startup | @as(u32, startup_vector));
 }
 
 pub fn sendFixedIpi(apic_id: u8, vector: u8) bool {
     if (lapic_base_pa == 0 and !enableLocalApic()) return false;
-    if (!waitIcrIdle()) return false;
-    mmioWrite(lapic_reg_icr_high, @as(u32, apic_id) << 24);
-    mmioWrite(lapic_reg_icr_low, @as(u32, vector));
-    return waitIcrIdle();
+    return sendIcr(apic_id, vector);
 }
 
 /// Caller keeps interrupts disabled across the entire ICR transaction.
 /// Use only after SMP has established that every physical CPU is online.
 pub fn sendFixedIpiAllExcludingSelf(vector: u8) bool {
     if (lapic_base_pa == 0) return false;
-    if (!waitIcrIdle()) return false;
     // Fixed, edge-triggered, all excluding self. Destination high is ignored.
-    mmioWrite(lapic_reg_icr_low, (@as(u32, 3) << 18) | @as(u32, vector));
-    return waitIcrIdle();
+    return sendIcr(0, (@as(u32, 3) << 18) | @as(u32, vector));
 }
 
 pub fn eoi() void {
     if (lapic_base_pa == 0) return;
-    mmioWrite(lapic_reg_eoi, 0);
+    writeRegister(lapic_reg_eoi, 0);
 }
 
 pub fn activeInterruptVectorInRange(first: u8, count: u8) ?u8 {
@@ -331,7 +388,7 @@ pub fn activeInterruptVectorInRange(first: u8, count: u8) ?u8 {
     while (vec < end_vec and vec <= std.math.maxInt(u8)) : (vec += 1) {
         const reg_index: u32 = @intCast(vec / 32);
         const bit_index: u5 = @intCast(vec & 31);
-        const bits = mmioRead(lapic_reg_isr_base + reg_index * 0x10);
+        const bits = readRegister(lapic_reg_isr_base + reg_index * 0x10);
         if ((bits & (@as(u32, 1) << bit_index)) != 0) return @intCast(vec);
     }
     return null;
@@ -347,8 +404,8 @@ pub fn interruptRangePending(first: u8, count: u8) bool {
     while (vector < end and vector <= 255) : (vector += 1) {
         const index: u32 = @intCast(vector / 32);
         const bit = @as(u32, 1) << @as(u5, @intCast(vector & 31));
-        if (((mmioRead(lapic_reg_irr_base + index * 0x10) |
-            mmioRead(lapic_reg_isr_base + index * 0x10)) & bit) != 0) return true;
+        if (((readRegister(lapic_reg_irr_base + index * 0x10) |
+            readRegister(lapic_reg_isr_base + index * 0x10)) & bit) != 0) return true;
     }
     return false;
 }
@@ -376,4 +433,12 @@ test "LAPIC calibration calculation rejects unusable inputs" {
     try std.testing.expect(frequencyFromPitMeasurement(1, 0) == null);
     try std.testing.expect(initialCountForPeriod(0, timer_target_period_ns, 37_160) == null);
     try std.testing.expect(initialCountForPeriod(62_531_245, timer_target_period_ns, timer_target_period_ns) == null);
+}
+
+test "x2APIC register mapping and physical ICR encoding" {
+    try std.testing.expectEqual(@as(u32, 0x802), registerMsr(lapic_reg_id));
+    try std.testing.expectEqual(@as(u32, 0x80b), registerMsr(lapic_reg_eoi));
+    try std.testing.expectEqual(@as(u32, 0x830), registerMsr(lapic_reg_icr_low));
+    try std.testing.expectEqual(@as(u64, 0x7e00000040), x2Icr(0x7e, 0x40));
+    try std.testing.expectEqual(@as(u64, 0xc0040), x2Icr(0, (3 << 18) | 0x40));
 }

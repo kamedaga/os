@@ -56,10 +56,19 @@ typedef struct lpr_drm_mode_create_blob {
     uint32_t blob_id;
 } lpr_drm_mode_create_blob_t;
 
+typedef struct lpr_drm_clip_rect {
+    uint16_t x1;
+    uint16_t y1;
+    uint16_t x2;
+    uint16_t y2;
+} lpr_drm_clip_rect_t;
+
 _Static_assert(sizeof(lpr_drm_mode_atomic_t) == 56,
     "Linux DRM atomic ioctl layout");
 _Static_assert(sizeof(lpr_drm_mode_create_blob_t) == 16,
     "Linux DRM create-blob ioctl layout");
+_Static_assert(sizeof(lpr_drm_clip_rect_t) == 8,
+    "Linux DRM clip rectangle layout");
 
 enum { LPR_DRM_EVENT_COOKIE_CAPACITY = 32u };
 
@@ -1397,6 +1406,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         LPR_DRM_WIRE_RESOURCES,
         LPR_DRM_WIRE_CONNECTOR,
         LPR_DRM_WIRE_CRTC,
+        LPR_DRM_WIRE_DIRTY_FB,
         LPR_DRM_WIRE_PLANE_RES,
         LPR_DRM_WIRE_PLANE,
         LPR_DRM_WIRE_OBJECT_PROPERTIES,
@@ -1518,6 +1528,47 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         lpr_memcpy(ioctl->data, &wire, sizeof(wire));
         ioctl->arg_size = sizeof(wire);
         ioctl->data_size = sizeof(wire);
+    } else if (command == GPUD_DRM_IOCTL_MODE_DIRTYFB) {
+        gpud_drm_mode_fb_dirty_t wire;
+        lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
+        if ((wire.flags & ~GPUD_DRM_MODE_DIRTY_FLAGS) ||
+            wire.num_clips > GPUD_DRM_MODE_DIRTY_MAX_CLIPS ||
+            (!!wire.num_clips != !!wire.clips_ptr) ||
+            ((wire.flags & GPUD_DRM_MODE_DIRTY_ANNOTATE_COPY) &&
+                (wire.num_clips & 1u))) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return -LPR_LINUX_EINVAL;
+        }
+        if (wire.num_clips) {
+            const uint64_t rectangle_bytes =
+                (uint64_t)wire.num_clips * sizeof(gpud_drm_mode_rectangle_t);
+            const int aux_status = lpr_drm_aux_create(
+                rectangle_bytes, &aux_fd, &aux_mapping, &aux_map_size);
+            if (aux_status != 0) {
+                lpr_destroy_tty_wire_page(page_fd, page);
+                return aux_status;
+            }
+            const lpr_drm_clip_rect_t *source =
+                (const void *)(uintptr_t)wire.clips_ptr;
+            gpud_drm_mode_rectangle_t *rectangles = aux_mapping;
+            for (uint32_t i = 0; i < wire.num_clips; ++i) {
+                lpr_drm_clip_rect_t rectangle;
+                lpr_memcpy(&rectangle, source + i, sizeof(rectangle));
+                rectangles[i] = (gpud_drm_mode_rectangle_t){
+                    .x1 = rectangle.x1,
+                    .y1 = rectangle.y1,
+                    .x2 = rectangle.x2,
+                    .y2 = rectangle.y2,
+                };
+            }
+        }
+        wire.clips_ptr = 0;
+        lpr_memcpy(ioctl->data, &wire, sizeof(wire));
+        ioctl->arg_size = sizeof(wire);
+        ioctl->data_size = sizeof(wire);
+        ioctl->aux_size =
+            (uint64_t)wire.num_clips * sizeof(gpud_drm_mode_rectangle_t);
+        wire_kind = LPR_DRM_WIRE_DIRTY_FB;
     } else if (command == GPUD_DRM_IOCTL_MODE_GETPLANERESOURCES) {
         gpud_drm_kms_plane_res_wire_t *wire = (gpud_drm_kms_plane_res_wire_t *)ioctl->data;
         lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
@@ -1945,6 +1996,8 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_CRTC) {
         gpud_drm_kms_crtc_wire_t *wire = (gpud_drm_kms_crtc_wire_t *)ioctl->data;
         lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_DIRTY_FB) {
+        /* DIRTYFB has no output fields. Preserve the caller's clips pointer. */
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PLANE_RES) {
         gpud_drm_kms_plane_res_wire_t *wire = (gpud_drm_kms_plane_res_wire_t *)ioctl->data;
         const gpud_drm_mode_get_plane_res_t *user = (const gpud_drm_mode_get_plane_res_t *)(uintptr_t)arg;
@@ -2104,18 +2157,39 @@ int64_t lpr_drm_poll_events(uint64_t fd, uint32_t events)
 {
     lpr_drm_backend_t *drm = lpr_drm_backend(fd);
     if (drm == 0) return -LPR_LINUX_EBADF;
-    void *page = 0;
-    const int page_fd = lpr_create_tty_wire_page(&page);
-    if (page_fd < 0) return page_fd;
-    gpud_drm_handle_request_t *poll = (gpud_drm_handle_request_t *)lpr_gpud_drm_payload(page);
-    lpr_memset(poll, 0, sizeof(*poll));
-    poll->handle = drm->handle;
-    poll->arg0 = events;
-    uint64_t revents = 0;
-    const int64_t status = lpr_gpud_drm_call(
-        GPUD_DRM_OP_HANDLE_POLL, page_fd, page, sizeof(*poll), &revents, 0);
-    lpr_destroy_tty_wire_page(page_fd, page);
-    return status == 0 ? (int64_t)revents : status;
+    if (drm->wait_fd.raw < 16) return -LPR_LINUX_EBADF;
+    struct pacha_pollfd pollfd = {
+        .fd = drm->wait_fd.raw,
+        .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
+    };
+    const int64_t status = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_FD_POLL, (uint64_t)(uintptr_t)&pollfd, 1);
+    if (status < 0) return lpr_pacha_status_to_errno(status);
+    uint32_t revents = 0;
+    if ((pollfd.revents & PACHA_FD_EVENT_READABLE) != 0)
+        revents |= events & (0x0001u | 0x0040u);
+    if ((pollfd.revents & PACHA_FD_EVENT_HANGUP) != 0)
+        revents |= 0x0010u;
+    return revents;
+}
+
+static int64_t lpr_drm_drain_one_event_hint(const lpr_drm_backend_t *drm)
+{
+    struct pacha_ipc_msg message;
+    lpr_memset(&message, 0, sizeof(message));
+    const int64_t status = lpr_pacha_syscall2(
+        PACHAOS_SYSCALL_IPC_RECV,
+        (uint64_t)(uint32_t)drm->wait_fd.raw,
+        (uint64_t)(uintptr_t)&message);
+    if (status == 0)
+        return message.word0 || message.word1 || message.word2 ||
+            message.word3 || message.fd_count ? -LPR_LINUX_EIO : 0;
+    if (status == PACHA_SYSCALL_ERR_EMPTY ||
+        status == PACHA_SYSCALL_ERR_NOT_READY ||
+        status == -PACHA_SYSCALL_ERR_EMPTY ||
+        status == -PACHA_SYSCALL_ERR_NOT_READY)
+        return 0;
+    return lpr_pacha_status_to_errno(status);
 }
 
 int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
@@ -2126,6 +2200,11 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
     if (buf == 0) return -LPR_LINUX_EFAULT;
     if (count < 4u * sizeof(uint64_t)) return -LPR_LINUX_EINVAL;
     for (;;) {
+        /* Drain before the service-side recheck. If an event races with this
+         * drain, gpud either includes it in this read or leaves data buffered
+         * and publishes a fresh hint. Draining after the read loses that wake. */
+        const int64_t hint_status = lpr_drm_drain_one_event_hint(drm);
+        if (hint_status != 0) return hint_status;
         void *page = 0;
         const int page_fd = lpr_create_tty_wire_page(&page);
         if (page_fd < 0) return page_fd;

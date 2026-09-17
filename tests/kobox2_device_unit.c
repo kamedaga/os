@@ -43,6 +43,7 @@ int ph_pci_destroy(struct ph_pci *pci) {
 int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
     ++calls;
     assert(config->native_device == 42 && config->mapping_capacity == PH_DEVICE_DMA_MAPPINGS);
+    assert(config->mapping_capacity >= PACHA_FD_TABLE_LIMIT);
     if (dma_error) return dma_error;
     dma->config = *config;
     dma->admitted = dma->drained = 1;
@@ -122,9 +123,9 @@ int main(void) {
     device.mmio_mappings[2].length = 4096;
     assert(ph_device_finish(&device, 7) == -EBUSY && calls == before);
     device.mmio_mappings[2].length = 0;
-    device.dma_mappings[2].length = 4096;
+    device.dma_mappings[PH_DEVICE_DMA_MAPPINGS - 1].length = 4096;
     assert(ph_device_finish(&device, 7) == -EBUSY && calls == before);
-    device.dma_mappings[2].length = 0;
+    device.dma_mappings[PH_DEVICE_DMA_MAPPINGS - 1].length = 0;
     device.irq.slots[2].route.cookie = 1;
     assert(ph_device_finish(&device, 7) == -EBUSY && calls == before);
     device.irq.slots[2].route.cookie = 0;

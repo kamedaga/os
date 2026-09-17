@@ -15,11 +15,18 @@ struct gpud_gpu_rpc {
     unsigned char *mapping;
     kb2_vq_segment_t segments[2];
     kb2_vq_chain_t chain;
+    kb2_vq_segment_t event_segment;
+    kb2_vq_chain_t event_chain;
     struct ph_ipc_packet incoming;
     struct ph_ipc_packet attachment;
-    int error;
+    int error, event_started, event_notification;
 };
 
+int gpud_gpu_rpc_start_events(struct gpud_gpu_rpc *rpc);
+/* Returns one for a copied event message, zero when no completed event lane
+ * entry exists, or a negative terminal transport error. */
+int gpud_gpu_rpc_next_event(struct gpud_gpu_rpc *rpc,
+    unsigned char *message, size_t capacity, size_t *size_out);
 int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
     const unsigned char *request, size_t request_size,
     unsigned char *reply, size_t reply_capacity, size_t *reply_size);

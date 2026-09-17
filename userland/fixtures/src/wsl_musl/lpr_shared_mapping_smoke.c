@@ -2,8 +2,10 @@
 
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -415,6 +417,50 @@ static int fork_shared_phase(int anonymous)
     return good;
 }
 
+static int private_size_generation_phase(void)
+{
+    char path[] = "/tmp/lpr-map-size-XXXXXX";
+    int writer = mkstemp(path);
+    if (writer < 0) return 0;
+    int good = ftruncate(writer, 513) == 0 &&
+        pwrite(writer, "Z", 1, 0) == 1;
+    close(writer);
+    int reader = open(path, O_RDONLY);
+    struct stat snapshot;
+    good = good && reader >= 0 && fstat(reader, &snapshot) == 0 &&
+        snapshot.st_size == 513;
+    const size_t sizes[] = {513, 777, 257, PAGE_BYTES + 17};
+    for (unsigned phase = 0; good && phase < 4; ++phase) {
+        const size_t size = sizes[phase];
+        const unsigned char marker = (unsigned char)('a' + phase);
+        pid_t child = fork();
+        if (child == 0) {
+            int fd = open(path, O_RDWR);
+            int changed = fd >= 0 && ftruncate(fd, size) == 0 &&
+                pwrite(fd, &marker, 1, size - 1) == 1;
+            if (fd >= 0) close(fd);
+            _exit(changed ? 0 : 1);
+        }
+        good = child > 0 && wait_child(child);
+        const size_t map_bytes = (size + PAGE_BYTES - 1) & ~(PAGE_BYTES - 1u);
+        /* No intervening fstat: first map must refresh a stale size; second
+         * map can reuse it. Both must preserve the last partial page. */
+        for (unsigned repeat = 0; good && repeat < 2; ++repeat) {
+            unsigned char *map = mmap(0, map_bytes, PROT_READ,
+                MAP_PRIVATE, reader, 0);
+            if (map == MAP_FAILED) { good = 0; break; }
+            good = map[0] == 'Z' && map[size - 1] == marker;
+            for (size_t i = size; good && i < map_bytes; ++i)
+                good = map[i] == 0;
+            good = munmap(map, map_bytes) == 0 && good;
+        }
+    }
+    if (reader >= 0) close(reader);
+    unlink(path);
+    if (good) emit("SHMAP_PRIVATE_SIZE_GENERATION=OK\n");
+    return good;
+}
+
 static int verify_phase(void)
 {
     if (!persistence_phase()) {
@@ -427,6 +473,9 @@ static int verify_phase(void)
         return 0;
     }
     if (!private_file_split_cow_phase()) {
+        return 0;
+    }
+    if (!private_size_generation_phase()) {
         return 0;
     }
     if (!mprotect_ceiling_phase()) {
@@ -455,6 +504,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(argv[1], "verify") == 0) {
         return verify_phase() ? 0 : 1;
+    }
+    if (strcmp(argv[1], "size-generation") == 0) {
+        return private_size_generation_phase() ? 0 : 1;
     }
     return 2;
 }

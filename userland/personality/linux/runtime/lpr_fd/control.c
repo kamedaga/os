@@ -260,7 +260,9 @@ int64_t lpr_backend_state_free(void *state, uint64_t state_bytes)
     lpr_memset(state, 0, LPR_BACKEND_SLAB_SLOT_BYTES);
     page->used_bitmap &= ~bit;
     page->used_count--;
-    const int release_page = page->used_count == 0;
+    /* Retain at most the empty head page for the next short-lived backend.
+     * Other empty pages are returned immediately; allocation still zeros slots. */
+    const int release_page = page->used_count == 0 && page != lpr_backend_slab_pages;
     if (release_page) {
         *link = page->next;
         page->magic = 0;

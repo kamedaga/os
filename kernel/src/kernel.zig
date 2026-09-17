@@ -192,10 +192,16 @@ pub const KernelState = struct {
     fd_tables_extra: []FdTable = empty_fd_tables_extra[0..],
     vma_tables_extra: []VmaTable = empty_vma_tables_extra[0..],
     fd_objects: [max_fd_objects]KernelObjectSlot = [_]KernelObjectSlot{.{}} ** max_fd_objects,
+    // Candidate slots only: overlap checks still validate live payload/owner.
+    pinned_object_slots: std.StaticBitSet(max_fd_objects) = .initEmpty(),
     pipes: [max_pipes]PipeSlot = [_]PipeSlot{.{}} ** max_pipes,
     task_fd_waiters: [max_task_fd_waiters]TaskFdWaiter = [_]TaskFdWaiter{.{}} ** max_task_fd_waiters,
     fd_wait_groups: [max_fd_wait_groups]FdWaitGroupSlot =
         [_]FdWaitGroupSlot{.{}} ** max_fd_wait_groups,
+    // Conservative thread buckets: zero proves that cancellation has no
+    // groups to scan. Collisions only retain the existing exact scan.
+    // Includes both building and armed groups; protected with KernelState.
+    fd_wait_group_thread_counts: [max_fd_wait_groups]u16 = [_]u16{0} ** max_fd_wait_groups,
     next_fd_wait_group_scan: usize = 0,
     irq_publish_slots: [max_fd_objects]IrqPublishSlot = [_]IrqPublishSlot{.{}} ** max_fd_objects,
     next_fd_object_scan: usize = 0,

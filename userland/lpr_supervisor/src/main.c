@@ -328,12 +328,6 @@ static int lprs_queue_waiter(
     waiter->reply_fd = reply_fd;
     waiter->header = *header;
     waiter->request = *request;
-    fprintf(stderr,
-        "[lprs-wait4] queued token=%llu requested=%lld page_fd=%d reply_fd=%d\n",
-        (unsigned long long)request->token,
-        (long long)request->requested_pid,
-        page_fd,
-        reply_fd);
     return 0;
 }
 
@@ -2083,28 +2077,12 @@ static void lprs_finish_waiter(lprs_waiter_t *waiter, int status, uint64_t resul
 
     const int page_fd = waiter->page_fd;
     const int reply_fd = waiter->reply_fd;
-    const uint64_t token = waiter->request.token;
     const uint64_t request_id = waiter->header.request_id;
-    fprintf(stderr,
-        "[lprs-wait4] finish token=%llu requested=%lld status=%d result=%llu\n",
-        (unsigned long long)token,
-        (long long)waiter->request.requested_pid,
-        status,
-        (unsigned long long)result);
     memset(waiter, 0, sizeof(*waiter));
     waiter->page_fd = -1;
     waiter->reply_fd = -1;
     (void)pacha_fd_close(page_fd);
-    const int send_status =
-        lprs_reply(reply_fd, request_id, reply_status, result, NULL, 0);
-    fprintf(stderr,
-        "[lprs-wait4] replied token=%llu request=%llu reply_fd=%d "
-        "status=%d send_status=%d\n",
-        (unsigned long long)token,
-        (unsigned long long)request_id,
-        reply_fd,
-        reply_status,
-        send_status);
+    (void)lprs_reply(reply_fd, request_id, reply_status, result, NULL, 0);
 }
 
 static void lprs_interrupt_waiters(uint64_t token)
@@ -2225,14 +2203,6 @@ static void lprs_notify_exited_child(
             child->exit_notified = 1;
         }
     }
-    fprintf(stderr,
-        "[lprs-wait4] exited child=%llu parent=%llu state=%llu code=%llu "
-        "notify=%d\n",
-        (unsigned long long)child->pid,
-        (unsigned long long)child->ppid,
-        (unsigned long long)exit_state,
-        (unsigned long long)exit_code,
-        notify_status);
 }
 
 static void lprs_refresh_exited_children(void)

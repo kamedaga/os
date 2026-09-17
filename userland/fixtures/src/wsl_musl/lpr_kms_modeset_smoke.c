@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -182,14 +183,33 @@ int main(void)
     struct connector connector;
     memset(&connector, 0, sizeof(connector));
     connector.connector_id = connector_id;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &connector) != 0 || connector.count_modes != 1 || connector.connection != 1) return fail("GETCONNECTOR-count");
-    struct modeinfo mode;
-    uint32_t connector_encoder = 0;
-    memset(&mode, 0, sizeof(mode));
-    connector.modes_ptr = (uint64_t)(uintptr_t)&mode;
-    connector.encoders_ptr = (uint64_t)(uintptr_t)&connector_encoder;
-    connector.count_modes = connector.count_encoders = 1;
-    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &connector) != 0 || mode.hdisplay == 0 || mode.vdisplay == 0 || connector_encoder != encoder_id) return fail("GETCONNECTOR-data");
+    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &connector) != 0 ||
+        connector.count_modes == 0 || connector.count_encoders == 0 ||
+        connector.connection != 1) return fail("GETCONNECTOR-count");
+    struct modeinfo *connector_modes =
+        calloc(connector.count_modes, sizeof(*connector_modes));
+    uint32_t *connector_props =
+        calloc(connector.count_props, sizeof(*connector_props));
+    uint64_t *connector_prop_values =
+        calloc(connector.count_props, sizeof(*connector_prop_values));
+    uint32_t *connector_encoders =
+        calloc(connector.count_encoders, sizeof(*connector_encoders));
+    if (!connector_modes ||
+        (connector.count_props && (!connector_props || !connector_prop_values)) ||
+        !connector_encoders) return fail("GETCONNECTOR-alloc");
+    connector.modes_ptr = (uint64_t)(uintptr_t)connector_modes;
+    connector.props_ptr = (uint64_t)(uintptr_t)connector_props;
+    connector.prop_values_ptr = (uint64_t)(uintptr_t)connector_prop_values;
+    connector.encoders_ptr = (uint64_t)(uintptr_t)connector_encoders;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &connector) != 0 ||
+        connector_modes[0].hdisplay == 0 ||
+        connector_modes[0].vdisplay == 0 ||
+        connector_encoders[0] != encoder_id) return fail("GETCONNECTOR-data");
+    struct modeinfo mode = connector_modes[0];
+    free(connector_encoders);
+    free(connector_prop_values);
+    free(connector_props);
+    free(connector_modes);
     struct encoder encoder = { .encoder_id = encoder_id };
     if (ioctl(fd, DRM_IOCTL_MODE_GETENCODER, &encoder) != 0 || encoder.possible_crtcs != 1) return fail("GETENCODER");
     struct crtc get_crtc = { .crtc_id = crtc_id };
@@ -208,6 +228,8 @@ int main(void)
     set_crtc.mode_valid = 1;
     set_crtc.mode = mode;
     if (ioctl(fd, DRM_IOCTL_MODE_SETCRTC, &set_crtc) != 0) return fail("SETCRTC");
+    struct mode_fb_dirty dirty_probe = { .fb_id = first.fb.fb_id };
+    if (ioctl(fd, DRM_IOCTL_MODE_DIRTYFB, &dirty_probe) != 0) return fail("DIRTYFB-probe");
     printf("KMS_FRAME1_READY color=ff0000 mode=%ux%u\n", mode.hdisplay, mode.vdisplay);
     fflush(stdout);
     sleep(2);

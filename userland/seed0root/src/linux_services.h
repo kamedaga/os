@@ -24,6 +24,21 @@ typedef struct seed0root_linux_service {
     FILED_RIGHT_EXEC | FILED_RIGHT_STAT | FILED_RIGHT_GETDENTS)
 
 static const seed0root_linux_service_t seed0root_linux_services[] = {
+#if defined(SEED0ROOT_LPR_THREAD_SIGNAL_TEST) && SEED0ROOT_LPR_THREAD_SIGNAL_TEST
+    { .account = "root", .filed_rights = SEED0ROOT_FILE_NAMESPACE,
+      .clients = FILED_EXEC_SERVICE_TERMD, .ctty = "/dev/hvc0",
+      .argc = 1, .argv = {"/cmd/lpr_thread_signal.elf"} },
+    { .account = "messagebus", .filed_rights = SEED0ROOT_FILE_NAMESPACE,
+      .clients = FILED_EXEC_SERVICE_TERMD, .ctty = "/dev/hvc0",
+      .credential_rights = LPRS_CREDENTIAL_SETUID | LPRS_CREDENTIAL_SETGID,
+      .argc = 2, .argv = {"/cmd/lpr_service_account.elf", "transitions"} },
+    { .account = "root", .filed_rights = SEED0ROOT_FILE_NAMESPACE,
+      .clients = FILED_EXEC_SERVICE_TERMD, .ctty = "/dev/hvc0",
+      .argc = 1, .argv = {"/cmd/lpr_pthread_static.elf"} },
+    { .account = "root", .filed_rights = SEED0ROOT_FILE_NAMESPACE,
+      .clients = FILED_EXEC_SERVICE_TERMD, .ctty = "/dev/hvc0",
+      .argc = 1, .argv = {"/cmd/lpr_signal_owner_red.elf"} },
+#else
     { .account = "root", .filed_rights = SEED0ROOT_FILE_NAMESPACE,
       .clients = SEED0ROOT_DESKTOP_CLIENTS, .ctty = "/dev/hvc0",
 #if defined(SEED0ROOT_CREDENTIAL_TEST) && SEED0ROOT_CREDENTIAL_TEST
@@ -80,5 +95,6 @@ static const seed0root_linux_service_t seed0root_linux_services[] = {
     { .account = "root", .filed_rights = 0,
       .clients = FILED_EXEC_SERVICE_TERMD, .ctty = "/dev/hvc0",
       .argc = 2, .argv = {"/cmd/lpr_service_account.elf", "no-grants"} },
+#endif
 #endif
 };

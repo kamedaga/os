@@ -385,7 +385,7 @@ typedef struct lpr_thread_record {
     volatile uint32_t started;
     uint32_t tid;
     volatile uint32_t parent_ready;
-    uint32_t reserved0;
+    int32_t signal_fd;
     uint64_t signal_mask;
     struct lpr_unix_context unix_context;
 } lpr_thread_record_t;

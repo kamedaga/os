@@ -48,11 +48,16 @@ static int wait_readable(int fd, int process_fd) {
 static int wait_service(
     const struct gpud_drm_service *service, int endpoint_fd,
     int process_fd, int control_fd) {
-    struct pacha_pollfd events[GPUD_DRM_WAIT_SOURCES_MAX + 3] = {
+    struct pacha_pollfd events[GPUD_DRM_WAIT_SOURCES_MAX + 4] = {
         {.fd = endpoint_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
     };
     size_t event_count = 2;
+    const size_t gpu_index = event_count++;
+    events[gpu_index] = (struct pacha_pollfd){
+        .fd = service->gpu.ipc->fd,
+        .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
+    };
     size_t control_index = SIZE_MAX;
     if (control_fd >= 16) {
         control_index = event_count++;
@@ -74,6 +79,8 @@ static int wait_service(
     if (result <= 0)
         return -EIO;
     if (events[0].revents & PACHA_FD_EVENT_READABLE)
+        return 0;
+    if (events[gpu_index].revents & PACHA_FD_EVENT_READABLE)
         return 0;
     if (control_index != SIZE_MAX && events[control_index].revents)
         return 0;
@@ -113,8 +120,17 @@ static int receive_control(int fd, uint64_t generation) {
         .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS,
     };
     int status = pacha_ipc_recv(fd, &message);
-    if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY)
-        return GPUD_CONTROL_IDLE;
+    if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
+        // An empty native channel returns EMPTY even after its peer closes.
+        // Drain any final message before retiring the level-triggered HANGUP.
+        struct pacha_pollfd event = {.fd = fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+        if (pacha_fd_poll(&event, 1) < 0)
+            return -EIO;
+        return !(event.revents & PACHA_FD_EVENT_READABLE) &&
+            (event.revents & PACHA_FD_EVENT_HANGUP) ?
+            GPUD_CONTROL_PEER_CLOSED : GPUD_CONTROL_IDLE;
+    }
     if (status == PACHA_ERR_CLOSED)
         return GPUD_CONTROL_PEER_CLOSED;
     if (status)
@@ -421,6 +437,8 @@ static int start_generation(const struct gpud_boot_config *config,
             .mapping = current->gpu_mapping,
         },
     };
+    if ((error = gpud_gpu_rpc_start_events(&current->service.gpu)))
+        return error;
     if ((error = gpud_drm_files_init(&current->service.files, generation,
             GPUD_GPU_NATIVE_SESSION_LIMIT)))
         return error;
@@ -450,7 +468,10 @@ static int serve_generation(
         } else if (control < 0) {
             return control;
         }
-        int error = gpud_drm_service_reap_hangups(&current->service);
+        int error = gpud_drm_service_pump_events(&current->service);
+        if (error)
+            return error;
+        error = gpud_drm_service_reap_hangups(&current->service);
         if (error)
             return error;
         error = gpud_drm_service_receive(&current->service);

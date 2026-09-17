@@ -223,12 +223,176 @@ static void dumb_buffer_commands(void) {
     expect_failure(&request, -EINVAL);
 }
 
+static void legacy_framebuffer_commands(void) {
+    gpud_drm_mode_fb_cmd_t framebuffer = {
+        .width = 1280,
+        .height = 720,
+        .pitch = 5120,
+        .bpp = 32,
+        .depth = 24,
+        .handle = 27,
+    };
+    gpud_drm_ioctl_request_t request = {
+        .handle = binding.frontend_handle,
+        .request = GPUD_DRM_IOCTL_MODE_ADDFB,
+        .arg_size = sizeof(framebuffer),
+        .data_size = sizeof(framebuffer),
+    };
+    memcpy(request.data, &framebuffer, sizeof(framebuffer));
+    struct gpud_drm_translation translation = {0};
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    kb2_gpu_command_t command = decode_queue(
+        &translation, KB2_GPU_QUEUE_DISPLAY);
+    size_t size;
+    const unsigned char *data = kb2_gpu_command_inline_data(&command, &size);
+    assert(command.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        command.command_id == KB2_GPU_DRM_MODE_COMMAND_ADD_FB &&
+        size == KB2_GPU_DRM_MODE_RECORD_FB_LEGACY_CREATE_SIZE);
+    assert(read_u64(data) == 1 && data[8] == 0 && data[9] == 5 &&
+        data[12] == 0xd0 && data[13] == 2 &&
+        data[16] == 0 && data[17] == 20 && data[20] == 32 &&
+        data[24] == 24 && data[28] == 27 && !data[32]);
+
+    framebuffer.fb_id = 1;
+    memcpy(request.data, &framebuffer, sizeof(framebuffer));
+    expect_failure(&request, -EINVAL);
+
+    const uint32_t fb_id = 43;
+    request.request = GPUD_DRM_IOCTL_MODE_RMFB;
+    request.arg_size = request.data_size = sizeof(fb_id);
+    memcpy(request.data, &fb_id, sizeof(fb_id));
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    command = decode_queue(&translation, KB2_GPU_QUEUE_DISPLAY);
+    data = kb2_gpu_command_inline_data(&command, &size);
+    assert(command.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        command.command_id == KB2_GPU_DRM_MODE_COMMAND_REMOVE_FB &&
+        size == KB2_GPU_DRM_MODE_RECORD_OBJECT_ID_REQUEST_SIZE &&
+        read_u64(data) == 1 && data[8] == fb_id && !data[12]);
+
+    memset(request.data, 0, sizeof(fb_id));
+    expect_failure(&request, -EINVAL);
+}
+
+static void get_crtc_command(void) {
+    gpud_drm_kms_crtc_wire_t crtc = {
+        .value = {.crtc_id = 12},
+    };
+    gpud_drm_ioctl_request_t request = {
+        .handle = binding.frontend_handle,
+        .request = GPUD_DRM_IOCTL_MODE_GETCRTC,
+        .arg_size = sizeof(crtc.value),
+        .data_size = sizeof(crtc),
+    };
+    memcpy(request.data, &crtc, sizeof(crtc));
+    struct gpud_drm_translation translation = {0};
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 9));
+    kb2_gpu_command_t command = decode_queue(
+        &translation, KB2_GPU_QUEUE_DISPLAY);
+    size_t size;
+    const unsigned char *data = kb2_gpu_command_inline_data(&command, &size);
+    kb2_gpu_span_t span;
+    assert(command.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        command.command_id == KB2_GPU_DRM_MODE_COMMAND_GET_CRTC &&
+        size == KB2_GPU_DRM_MODE_RECORD_CRTC_GET_REQUEST_SIZE &&
+        read_u64(data) == 1 && data[8] == 12 && !data[12] &&
+        command.counts[0] == 2 && command.counts[1] == 1 &&
+        !kb2_gpu_command_span(&command, 0, &span) &&
+        span.region_id == 9 &&
+        span.length == KB2_GPU_DRM_MODE_RECORD_MODE_INFO_SIZE &&
+        span.rights == KB2_GPU_SPAN_RIGHT_WRITE);
+
+    crtc.value.crtc_id = 0;
+    memcpy(request.data, &crtc, sizeof(crtc));
+    expect_failure(&request, -EINVAL);
+}
+
+static void dirty_fb_command(void) {
+    gpud_drm_mode_fb_dirty_t dirty = {
+        .fb_id = 43,
+        .color = UINT32_C(0x12345678),
+        .num_clips = 1,
+    };
+    gpud_drm_ioctl_request_t request = {
+        .handle = binding.frontend_handle,
+        .request = GPUD_DRM_IOCTL_MODE_DIRTYFB,
+        .arg_size = sizeof(dirty),
+        .data_size = sizeof(dirty),
+        .aux_size = sizeof(gpud_drm_mode_rectangle_t),
+    };
+    memcpy(request.data, &dirty, sizeof(dirty));
+    struct gpud_drm_translation translation = {0};
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 9));
+    kb2_gpu_command_t command = decode_queue(
+        &translation, KB2_GPU_QUEUE_DISPLAY);
+    size_t size;
+    const unsigned char *data = kb2_gpu_command_inline_data(&command, &size);
+    kb2_gpu_span_t span;
+    assert(command.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        command.command_id == KB2_GPU_DRM_MODE_COMMAND_DIRTY_FB &&
+        size == KB2_GPU_DRM_MODE_RECORD_DIRTY_FB_REQUEST_SIZE &&
+        read_u64(data) == 1 && data[8] == 43 &&
+        data[16] == 0x78 && data[17] == 0x56 &&
+        data[18] == 0x34 && data[19] == 0x12 && data[20] == 1 &&
+        command.counts[0] == 2 && command.counts[1] == 1 &&
+        !kb2_gpu_command_span(&command, 0, &span) &&
+        span.region_id == 9 && !span.offset &&
+        span.length == sizeof(gpud_drm_mode_rectangle_t) &&
+        span.rights == KB2_GPU_SPAN_RIGHT_READ &&
+        span.record_schema_id == KB2_GPU_DRM_MODE_RECORD_RECTANGLE);
+
+    dirty = (gpud_drm_mode_fb_dirty_t){0};
+    request.aux_size = 0;
+    memcpy(request.data, &dirty, sizeof(dirty));
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    command = decode_queue(&translation, KB2_GPU_QUEUE_DISPLAY);
+    data = kb2_gpu_command_inline_data(&command, &size);
+    assert(command.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        command.command_id == KB2_GPU_DRM_MODE_COMMAND_DIRTY_FB &&
+        size == KB2_GPU_DRM_MODE_RECORD_DIRTY_FB_REQUEST_SIZE &&
+        !data[KB2_GPU_DRM_MODE_RECORD_DIRTY_FB_REQUEST_FB_ID_OFFSET] &&
+        !data[KB2_GPU_DRM_MODE_RECORD_DIRTY_FB_REQUEST_FB_ID_OFFSET + 1] &&
+        !data[KB2_GPU_DRM_MODE_RECORD_DIRTY_FB_REQUEST_FB_ID_OFFSET + 2] &&
+        !data[KB2_GPU_DRM_MODE_RECORD_DIRTY_FB_REQUEST_FB_ID_OFFSET + 3] &&
+        command.counts[0] == 1 && !command.counts[1]);
+
+    dirty.clips_ptr = 1;
+    memcpy(request.data, &dirty, sizeof(dirty));
+    expect_failure(&request, -EINVAL);
+}
+
+static void magic_commands(void) {
+    gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
+        .request = GPUD_DRM_IOCTL_GET_MAGIC, .arg_size = 4, .data_size = 4};
+    struct gpud_drm_translation translation;
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    kb2_gpu_command_t command = decode_queue(&translation, KB2_GPU_QUEUE_DISPLAY);
+    assert(command.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        command.command_id == KB2_GPU_DRM_MODE_COMMAND_GET_MAGIC);
+    size_t size;
+    (void)kb2_gpu_command_inline_data(&command, &size);
+    assert(size == 0);
+    request.request = GPUD_DRM_IOCTL_AUTH_MAGIC;
+    request.data[0] = 0x34;
+    request.data[1] = 0x12;
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    command = decode_queue(&translation, KB2_GPU_QUEUE_DISPLAY);
+    const unsigned char *data = kb2_gpu_command_inline_data(&command, &size);
+    assert(command.command_id == KB2_GPU_DRM_MODE_COMMAND_AUTH_MAGIC &&
+        size == 4 && data[0] == 0x34 && data[1] == 0x12);
+    request.arg_size = 8;
+    expect_failure(&request, -EINVAL);
+}
+
 int main(void) {
+    magic_commands();
     scalar_commands();
     version_command();
     malformed_requests();
     virtgpu_input_commands();
     dumb_buffer_commands();
+    legacy_framebuffer_commands();
+    get_crtc_command();
+    dirty_fb_command();
     puts("gpud LPR DRM request translation: PASS canonical GPU commands (not service execution)");
     return 0;
 }

@@ -204,7 +204,7 @@ rm -rf \
   "${runtime}"/etc/init.d "${runtime}"/etc/conf.d \
   "${runtime}"/var/cache/apk
 mkdir -p "${runtime}/usr/share/pacha"
-cp "${lock}" "${runtime}/usr/share/pacha/xfce-packages.lock"
+cp "${base_lock}" "${runtime}/usr/share/pacha/xfce-packages.lock"
 cp "${writer_lock}" "${runtime}/usr/share/pacha/libreoffice-packages.lock"
 
 # pack.yaml publishes the project-wide runtime loader, libc, /bin/sh, and CA

@@ -6,9 +6,10 @@
 #include "gpu_rpc.h"
 
 struct gpud_drm_watch {
-    uint64_t handle;
+    uint64_t handle, device_minor;
     int fd;
-    unsigned int transferred;
+    unsigned int transferred, submit_reported, modeset_reported;
+    unsigned int dirty_probe_reported, dirty_update_reported;
 };
 
 enum {
@@ -17,6 +18,7 @@ enum {
     GPUD_DRM_OBJECT_LEASES_MAX = 64,
     GPUD_DRM_WAIT_SOURCES_MAX =
         GPUD_DRM_REFERENCES_MAX + GPUD_DRM_OBJECT_LEASES_MAX,
+    GPUD_DRM_EVENT_BACKLOG_BYTES = 4096,
 };
 
 struct gpud_drm_mapping {
@@ -37,6 +39,12 @@ struct gpud_drm_object_lease {
     int fd;
 };
 
+struct gpud_drm_event_buffer {
+    uint64_t handle;
+    size_t bytes;
+    unsigned char data[GPUD_DRM_EVENT_BACKLOG_BYTES];
+};
+
 /* filed supplies one process-lifetime endpoint. Each OPEN/DUP transfers a
  * notification capability that owns one frontend reference; request payloads
  * never supply lifetime authority. Call only after sandbox READY and channel
@@ -44,11 +52,13 @@ struct gpud_drm_object_lease {
 struct gpud_drm_service {
     struct gpud_drm_files files;
     struct gpud_gpu_rpc gpu;
-    uint64_t backend_client, correlation;
+    uint64_t backend_client, correlation, event_sequence;
+    uint64_t resource_creates, gem_closes, exec_submits;
     struct gpud_drm_watch watches[GPUD_DRM_REFERENCES_MAX];
     struct gpud_drm_mapping mappings[GPUD_DRM_MAPPINGS_MAX];
     struct gpud_drm_prime primes[GPUD_DRM_PRIMES_MAX];
     struct gpud_drm_object_lease object_leases[GPUD_DRM_OBJECT_LEASES_MAX];
+    struct gpud_drm_event_buffer events[GPUD_DRM_FILES_MAX];
     /* Received capabilities and mappings remain owned here if cleanup fails.
      * The launch owner must retire the process, not reuse failed state. */
     struct ph_ipc_packet received;
@@ -63,6 +73,9 @@ int gpud_drm_service_bind(struct gpud_drm_service *service, int endpoint_fd);
  * request; other errors stop the service. A Linux operation error is sent in
  * the reply, not returned here. CLOSE waits for the real backend completion. */
 int gpud_drm_service_receive(struct gpud_drm_service *service);
+/* Drain completed sandbox event-lane messages into the handle-local backlog
+ * and signal the original LPR notification channel on empty->nonempty. */
+int gpud_drm_service_pump_events(struct gpud_drm_service *service);
 /* Transfer leases and the original open notification each own one frontend
  * reference. HANGUP drops only that reference and closes the backend session
  * synchronously when it was the last one. */

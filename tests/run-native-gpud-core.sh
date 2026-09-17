@@ -31,7 +31,7 @@ qemu-system-x86_64 -machine q35 -cpu host -enable-kvm -m 2G -smp 2 \
   -device intel-iommu,intremap=off,aw-bits=48 \
   "${qemu_devices[@]}" \
   -drive "file=$out/boot.img,format=raw,if=ide" -display none \
-  -serial "file:$out/serial.log" -monitor none -no-reboot -net none >"$out/qemu.log" 2>&1 &
+  -serial "file:$out/serial.log" -monitor none -no-reboot >"$out/qemu.log" 2>&1 &
 qemu_pid=$!
 stop_qemu() {
   if kill -0 "$qemu_pid" 2>/dev/null; then kill "$qemu_pid"; fi

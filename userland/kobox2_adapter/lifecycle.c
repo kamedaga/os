@@ -92,9 +92,14 @@ static void *receive(void *context) {
                 continue;
             }
         }
-        struct pacha_pollfd event = {.fd = lifecycle->ipc->fd,
-            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
-        (void)ph_wait_readable(&event, 1);
+        struct pacha_pollfd events[2] = {{.fd = lifecycle->ipc->fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP}};
+        size_t count = 1;
+        if (lifecycle->service.wake_fd >= 16)
+            events[count++] = (struct pacha_pollfd){
+                .fd = lifecycle->service.wake_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+        (void)ph_wait_readable(events, count);
     }
     if (!result) {
         if (packet.operation != PH_LIFECYCLE_QUIESCE || !packet.correlation || packet.value || packet.fd_count)
