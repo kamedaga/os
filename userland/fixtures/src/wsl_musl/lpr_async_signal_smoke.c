@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -536,6 +537,52 @@ static void child_signal_after(pid_t parent, int signal, long delay_ns)
     (void)kill(parent, signal);
 }
 
+static int run_ppoll_suite(void)
+{
+    const int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (fd < 0) return 80;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    const struct timespec finite = { .tv_nsec = 12000000 };
+    uint64_t total_ns = 0;
+    for (unsigned i = 0; i < 32; ++i) {
+        struct timespec before, after;
+        if (clock_gettime(CLOCK_MONOTONIC, &before) != 0 ||
+            ppoll(&pfd, 1, &finite, NULL) != 0 || pfd.revents ||
+            clock_gettime(CLOCK_MONOTONIC, &after) != 0) return 81;
+        const int64_t elapsed = (after.tv_sec - before.tv_sec) * 1000000000ll +
+            after.tv_nsec - before.tv_nsec;
+        if (elapsed < finite.tv_nsec) return 82;
+        total_ns += (uint64_t)elapsed;
+    }
+    printf("ASYNC_PPOLL_TIMEOUT=OK requested_us=12000 mean_us=%llu\n",
+        (unsigned long long)(total_ns / 32 / 1000));
+
+    struct sigaction action = { .sa_handler = sigwait_interrupt_handler }, old_action;
+    sigemptyset(&action.sa_mask);
+    sigset_t blocked, old_mask, temporary, restored;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGUSR2);
+    if (sigaction(SIGUSR2, &action, &old_action) != 0 ||
+        sigprocmask(SIG_BLOCK, &blocked, &old_mask) != 0) return 83;
+    temporary = old_mask;
+    sigdelset(&temporary, SIGUSR2);
+    sigwait_interrupted = 0;
+    if (kill(getpid(), SIGUSR2) != 0) return 84;
+    errno = 0;
+    const int result = ppoll(&pfd, 1, &finite, &temporary);
+    const int interrupted = result == -1 && errno == EINTR && sigwait_interrupted;
+    if (sigprocmask(SIG_SETMASK, NULL, &restored) != 0 ||
+        !sigismember(&restored, SIGUSR2) || !interrupted) return 85;
+    if (sigprocmask(SIG_SETMASK, &old_mask, NULL) != 0 ||
+        sigaction(SIGUSR2, &old_action, NULL) != 0) return 86;
+    const uint64_t one = 1;
+    if (write(fd, &one, sizeof(one)) != sizeof(one) ||
+        poll(&pfd, 1, -1) != 1 || !(pfd.revents & POLLIN)) return 87;
+    close(fd);
+    write_marker("ASYNC_PPOLL_MASK_EINTR=OK\n");
+    return 0;
+}
+
 static int wait_child_ok(pid_t child)
 {
     int status = 0;
@@ -693,6 +740,7 @@ static int run_suite(const char *self)
     if (run_sigtimedwait_suite() != 0) {
         return 48;
     }
+    if (run_ppoll_suite() != 0) return 49;
     return 0;
 }
 
@@ -722,6 +770,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "suite") == 0) {
         return run_suite(argv[0]);
     }
+    if (strcmp(argv[1], "ppoll") == 0) return run_ppoll_suite();
     if (strcmp(argv[1], "avx") == 0) {
         return run_avx_signal_roundtrip();
     }

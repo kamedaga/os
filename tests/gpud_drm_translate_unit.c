@@ -218,6 +218,7 @@ static void dumb_buffer_commands(void) {
         size == KB2_GPU_DRM_MODE_RECORD_MAP_REQUEST_SIZE);
     assert(data[0] == 27 && data[4] ==
         (KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE));
+    assert(translation.mapping_handle == 27);
     map.pad = 1;
     memcpy(request.data, &map, sizeof(map));
     expect_failure(&request, -EINVAL);
@@ -383,7 +384,61 @@ static void magic_commands(void) {
     expect_failure(&request, -EINVAL);
 }
 
+static void inline_ioctl_bounds(void) {
+    gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
+        .request = GPUD_DRM_IOCTL_VIRTGPU_WAIT, .arg_size = 8, .data_size = 8};
+    request.data[0] = 1;
+    assert(gpud_drm_ioctl_can_inline(&request));
+    struct gpud_drm_translation translation;
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    kb2_gpu_command_t command;
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        binding.generation, KB2_GPU_PROFILE_VIRGL, KB2_GPU_QUEUE_EXECUTION,
+        NULL, 0, &command) == KB2_PROTOCOL_OK);
+    assert(command.command_id == KB2_GPU_DRM_VIRTGPU_COMMAND_WAIT &&
+        command.deadline_ns == UINT64_MAX);
+    request.data[4] = GPUD_DRM_VIRTGPU_WAIT_NOWAIT;
+    assert(gpud_drm_ioctl_can_inline(&request));
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        binding.generation, KB2_GPU_PROFILE_VIRGL, KB2_GPU_QUEUE_EXECUTION,
+        NULL, 0, &command) == KB2_PROTOCOL_OK);
+    assert(command.deadline_ns == 1);
+    /* Inline eligibility does not replace DRM validation. */
+    request.data[4] = 2;
+    assert(gpud_drm_ioctl_can_inline(&request));
+    expect_failure(&request, -EINVAL);
+    request.data[4] = 0;
+    request.aux_size = 4096;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.aux_size = 0;
+    request.fd_flags = GPUD_DRM_IOCTL_FD_INPUT_WAIT;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.fd_flags = 0;
+    request.reserved0 = 1;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.reserved0 = 0;
+    request.data_size = 9;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.data_size = 8;
+    request.arg_size = 9;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.arg_size = 8;
+    request.request |= UINT64_C(1) << 32;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.request = GPUD_DRM_IOCTL_VIRTGPU_GETPARAM;
+    request.arg_size = request.data_size = 16;
+    assert(!gpud_drm_ioctl_can_inline(&request));
+    request.request = GPUD_DRM_IOCTL_GET_MAGIC;
+    request.arg_size = request.data_size = 4;
+    assert(gpud_drm_ioctl_can_inline(&request));
+    request.request = GPUD_DRM_IOCTL_SET_MASTER;
+    request.arg_size = request.data_size = 0;
+    assert(gpud_drm_ioctl_can_inline(&request));
+}
+
 int main(void) {
+    inline_ioctl_bounds();
     magic_commands();
     scalar_commands();
     version_command();

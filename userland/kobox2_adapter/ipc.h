@@ -38,6 +38,11 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet);
 /* out must have fd_count == 0; failures leave it untouched. Native receive
  * errors do not confer FD ownership, including partial copyout failures. */
 int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet *out);
+/* Same validation/ownership as receive. Zero polls; UINT64_MAX waits forever.
+ * Finite ticks use the native wait clock. -EAGAIN may be an interrupted wait,
+ * so callers enforce their absolute deadline across retries. */
+int ph_ipc_receive_wait(struct ph_ipc *ipc, uint64_t generation,
+    struct ph_ipc_packet *out, uint64_t timeout_ticks);
 int ph_ipc_revoke(struct ph_ipc *ipc, uint64_t generation);
 /* Destroy also retries rejected-FD cleanup. Errors retain remaining ownership.
  * Successful destroy is idempotent for its generation, including after FD reuse. */

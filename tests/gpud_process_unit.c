@@ -14,6 +14,11 @@ static struct gpud_process_exit observed;
 static long info_error, wait_error, kill_error, close_error;
 static unsigned int calls, kills, closes, waits, exit_on_kill;
 
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)nr; (void)a; (void)b; (void)c; (void)d;
+    abort(); /* Process ownership tests do not use blocking IPC receive. */
+}
+
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
     assert(nr == PACHA_FD_SYSCALL_CLOSE && fd == 17);
     ++calls; ++closes;

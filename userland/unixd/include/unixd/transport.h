@@ -87,6 +87,7 @@ struct unix_read {
     uint64_t owner;
     uint64_t before;
     uint64_t after;
+    uint64_t published_limit; /* local transaction snapshot, not wire ABI */
     uint64_t ticket;
     uint64_t operation;
     uint32_t length;
@@ -110,6 +111,13 @@ int unix_transport_write_commit(struct unix_tx *tx, struct unix_write *write);
 void unix_transport_write_cancel(struct unix_tx *tx, struct unix_write *write);
 int unix_transport_read_begin(const struct unix_tx *tx, struct unix_rx *rx,
     uint64_t generation, uint64_t owner, size_t capacity, struct unix_read *out);
+/* After copying a plain STREAM record, advance within the original published
+ * snapshot while retaining the reader lock. Returns 1 for another span, 0 at
+ * the snapshot/ancillary boundary, or an error; 0/error leaves read unchanged.
+ * Commit/cancel once at the end. No new data is awaited and no FD ticket is
+ * crossed. Earlier copied bytes can still be committed on a later error. */
+int unix_transport_read_next(const struct unix_tx *tx, struct unix_rx *rx,
+    uint64_t generation, size_t capacity, struct unix_read *read);
 /* Datagram metadata comes from unixd's delivery queue, not the writable
  * sender header. A corrupt sender must not block other senders' datagrams. */
 int unix_transport_packet_begin(const struct unix_tx *tx, struct unix_rx *rx,

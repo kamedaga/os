@@ -336,6 +336,9 @@ int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation, uint64_t 
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_page_flip");
     if (!symbol) return -ENOENT;
     memcpy(&api.page_flip, &symbol, sizeof(api.page_flip));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_cursor");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.cursor, &symbol, sizeof(api.cursor));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_dirty_fb");
     if (!symbol) return -ENOENT;
     memcpy(&api.dirty_fb, &symbol, sizeof(api.dirty_fb));

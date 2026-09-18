@@ -13,6 +13,8 @@
 #include <string.h>
 
 static unsigned int calls;
+static int cursor(struct kobox_linux_drm_file *,
+                  const struct kobox_linux_drm_cursor *);
 
 static int version(struct kobox_linux_drm_file *file,
                    const size_t *capacity,
@@ -445,6 +447,7 @@ void *ph_image_lookup(void *image, const char *name) {
         .get_crtc = get_crtc,
         .set_crtc = set_crtc,
         .page_flip = page_flip,
+        .cursor = cursor,
         .dirty_fb = dirty_fb,
         .create_dumb = create_dumb,
         .add_fb = add_fb,
@@ -495,6 +498,8 @@ void *ph_image_lookup(void *image, const char *name) {
         memcpy(&symbol, &api.set_crtc, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_page_flip"))
         memcpy(&symbol, &api.page_flip, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_cursor"))
+        memcpy(&symbol, &api.cursor, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_dirty_fb"))
         memcpy(&symbol, &api.dirty_fb, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_create_dumb"))
@@ -774,6 +779,72 @@ static void virtgpu_input_execution(void) {
           KB2_GPU_ARGUMENT_DESCRIPTOR_SIZE] = 1;
     assert(gpud_drm_ioctl_reply(
         &request, &translation, 91, reply, reply_size, output, sizeof(output)) == -EPROTO);
+}
+
+static struct kobox_linux_drm_cursor observed_cursor;
+static int cursor_status;
+
+static int cursor(struct kobox_linux_drm_file *file,
+                  const struct kobox_linux_drm_cursor *value) {
+    assert(file);
+    observed_cursor = *value;
+    return cursor_status;
+}
+
+static void cursor_execution(void) {
+    const struct gpud_drm_binding binding = {
+        .generation = 9, .frontend_handle = 8, .session_id = 7};
+    const struct kobox_drm_query_api api = {.cursor = cursor};
+    const kb2_gpu_region_t region = {.region_id = 1,
+        .rights = KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,
+        .length = 4096};
+    /* Legacy move (negative coordinates), CURSOR2 show with hotspot, hide,
+     * and a real backend authorization failure, not synthetic success. */
+    for (unsigned int test = 0; test < 4; ++test) {
+        gpud_drm_mode_cursor2_t value = {.cursor = {
+            .flags = test ? GPUD_DRM_MODE_CURSOR_BO : GPUD_DRM_MODE_CURSOR_MOVE,
+            .crtc_id = 17, .x = -23, .y = -41,
+            .width = 64, .height = 64, .handle = test == 2 ? 0 : 27},
+            .hot_x = 3, .hot_y = 5};
+        gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
+            .request = test ? GPUD_DRM_IOCTL_MODE_CURSOR2 : GPUD_DRM_IOCTL_MODE_CURSOR,
+            .arg_size = test ? sizeof(value) : sizeof(value.cursor),
+            .data_size = test ? sizeof(value) : sizeof(value.cursor)};
+        memcpy(request.data, &value, request.data_size);
+        struct gpud_drm_translation translation;
+        struct kobox_drm_query query;
+        unsigned char completion[512], reply[1024];
+        size_t completion_size;
+        assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+        assert(translation.queue_class == KB2_GPU_QUEUE_DISPLAY);
+        assert(!kobox_drm_query_prepare(&query, binding.generation,
+            binding.session_id, translation.queue_class, translation.command,
+            translation.command_size, &region));
+        cursor_status = test == 3 ? -EACCES : 0;
+        assert(!kobox_drm_query_execute(&query, &api, (void *)&calls,
+            NULL, 0, NULL, 0, completion, sizeof(completion), &completion_size));
+        assert(observed_cursor.flags == value.cursor.flags &&
+            observed_cursor.crtc_id == 17 && observed_cursor.x == -23 &&
+            observed_cursor.y == -41 && observed_cursor.width == 64 &&
+            observed_cursor.height == 64 && observed_cursor.handle == value.cursor.handle &&
+            observed_cursor.hot_x == (test ? 3 : 0) &&
+            observed_cursor.hot_y == (test ? 5 : 0));
+        kb2_protocol_message_envelope_t envelope = {
+            .protocol_id = KB2_GPU_PROTOCOL_ID, .opcode = KB2_GPU_OPCODE_COMMAND,
+            .generation = binding.generation, .correlation_id = 41,
+            .payload_length = completion_size};
+        size_t reply_size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + completion_size;
+        assert(!kb2_protocol_message_envelope_encode(reply, reply_size, &envelope));
+        memcpy(reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, completion, completion_size);
+        assert(gpud_drm_ioctl_reply(&request, &translation, 41, reply,
+            reply_size, NULL, 0) == cursor_status);
+        --request.data_size;
+        assert(gpud_drm_ioctl_encode(&translation, &binding, &request, 0) == -EINVAL);
+        ++request.data_size;
+        value.cursor.flags = 4;
+        memcpy(request.data, &value, request.data_size);
+        assert(gpud_drm_ioctl_encode(&translation, &binding, &request, 0) == -EINVAL);
+    }
 }
 
 static void display_execution(void) {
@@ -1532,6 +1603,7 @@ int main(void) {
     native_transport_case(6, -EIO);
     virtgpu_input_execution();
     display_execution();
+    cursor_execution();
     for (unsigned int defect = 0; defect <= 7; ++defect)
         native_queue_case(defect);
     session_service_cases();

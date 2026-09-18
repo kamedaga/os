@@ -233,6 +233,43 @@ static int restart_sandbox(const char *path, int render, int old_fd)
     return new_fd;
 }
 
+static int mapping_churn(int fd)
+{
+    /* Keep the DRM file open while exceeding the service's 64 mapping slots.
+     * Each VMA must outlive GEM_CLOSE, then retire its lease on munmap. */
+    for (unsigned i = 0; i < 96; ++i) {
+        struct drm_virtgpu_resource_create create = {
+            .target = 2, .format = 1, .bind = 2,
+            .width = 16, .height = 16, .depth = 1, .array_size = 1,
+            .size = 4096, .stride = 64,
+        };
+        if (ioctl(fd, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE, &create) != 0)
+            return -1;
+        struct drm_virtgpu_map map = {.handle = create.bo_handle};
+        if (ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &map) != 0) {
+            fprintf(stderr, "DRM_MAP_CHURN_FAIL iteration=%u errno=%d\n", i, errno);
+            return -1;
+        }
+        struct drm_virtgpu_map repeated = {.handle = create.bo_handle};
+        if (!map.offset ||
+            ioctl(fd, DRM_IOCTL_VIRTGPU_MAP, &repeated) != 0 ||
+            repeated.offset != map.offset)
+            return -1;
+        volatile uint32_t *view = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+            MAP_SHARED, fd, map.offset);
+        if (view == MAP_FAILED) return -1;
+        view[0] = i;
+        struct drm_gem_close close_gem = {.handle = create.bo_handle};
+        if (ioctl(fd, DRM_IOCTL_GEM_CLOSE, &close_gem) != 0 || view[0] != i)
+            return -1;
+        view[1] = ~i;
+        if (view[1] != ~i || munmap((void *)view, 4096) != 0)
+            return -1;
+    }
+    puts("DRM_MAP_CHURN_OK iterations=96 gem_close_vma_alive=1");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const int render = argc >= 2 && strcmp(argv[1], "--render") == 0;
@@ -567,6 +604,10 @@ int main(int argc, char **argv)
             close(duplicate);
             return 6;
         }
+    }
+    if (render && mapping_churn(duplicate) != 0) {
+        close(duplicate);
+        return 7;
     }
     if (close(duplicate) != 0) {
         fprintf(stderr, "%s last close failed: errno=%d\n", path, errno);

@@ -451,6 +451,61 @@ static void controller_launch_rounds(const void *image, size_t image_size) {
     ipc_test_log("NATIVE_GPUD_CONTROLLER_LAUNCH=PASS failed-image launch terminate reap restart stale-action\n");
 }
 
+static void timed_receive_round(const void *image, size_t image_size) {
+    struct ph_ipc ipc = {0};
+    struct ipc_test_child child = start_child(&ipc, 2, IPC_TEST_TIMED,
+        image, image_size, NULL);
+    const uint64_t before = ipc_test_used_fds();
+    struct ph_ipc_packet expired = {.value = 0x1234};
+    uint64_t start = ipc_test_now();
+    IPC_CHECK(ph_ipc_receive_wait(&ipc, 2, &expired, 10) == -EAGAIN);
+    IPC_CHECK(ipc_test_now() - start >= UINT64_C(5000000));
+    IPC_CHECK(expired.value == 0x1234 && !expired.fd_count);
+    struct ph_ipc_packet request = {.operation = IPC_TEST_SHARE, .generation = 2};
+    ipc_test_send(&ipc, &request);
+    struct ph_ipc_packet returned = {0};
+    IPC_CHECK(!ph_ipc_receive_wait(&ipc, 2, &returned, UINT64_MAX - 1));
+    IPC_CHECK(returned.operation == IPC_TEST_RETURN && returned.fd_count == 1);
+    IPC_CHECK(expired.value == 0x1234 && !expired.fd_count);
+    IPC_CHECK(ipc_test_used_fds() == before + 1);
+    IPC_CHECK(!ph_ipc_packet_release(&returned));
+    ipc_test_send(&ipc, &request);
+    IPC_CHECK(ph_ipc_receive_wait(&ipc, 2, &expired, UINT64_MAX) == -EPIPE);
+    IPC_CHECK(ph_ipc_receive_wait(&ipc, 2, &expired, 1000) == -EPIPE);
+    IPC_CHECK(expired.value == 0x1234 && !expired.fd_count);
+    IPC_CHECK(ipc_test_used_fds() == before);
+    reap_child(&ipc, &child, 0);
+
+    // Raw RECV_WAIT also works without POLL/INSPECT rights. Drain the final
+    // queued message before CLOSED; zero timeout on an open empty peer polls.
+    uint64_t pair[2];
+    const uint64_t rights = PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP;
+    IPC_CHECK(!pacha_syscall3(PACHA_IPC_SYSCALL_CHANNEL_CREATE,
+        (uintptr_t)pair, rights, 0));
+    struct pacha_ipc_msg message = {0};
+    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
+        (uintptr_t)&message, 0, 0) == PACHA_SYSCALL_ERR_EMPTY);
+    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
+        (uintptr_t)&message, 1, 0) == PACHA_SYSCALL_ERR_NOT_READY);
+    long duplicate = pacha_syscall4(PACHA_FD_SYSCALL_DUP, pair[1], 16, rights, 0);
+    IPC_CHECK(duplicate >= 16);
+    ipc_test_close(pair[1]);
+    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
+        (uintptr_t)&message, 1, 0) == PACHA_SYSCALL_ERR_NOT_READY);
+    message.word0 = 789;
+    IPC_CHECK(!pacha_syscall2(PACHA_IPC_SYSCALL_SEND, duplicate, (uintptr_t)&message));
+    ipc_test_close(duplicate);
+    message.word0 = 0;
+    IPC_CHECK(!pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
+        (uintptr_t)&message, 1000, 0));
+    IPC_CHECK(message.word0 == 789);
+    IPC_CHECK(pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT, pair[0],
+        (uintptr_t)&message, 0, 0) == PACHA_SYSCALL_ERR_CLOSED);
+    ipc_test_close(pair[0]);
+    ipc_test_log("NATIVE_KOBOX2_IPC_TIMED=PASS timeout late-fd huge-wait hangup queued-no-poll\n");
+}
+
 int main(void) {
     const uint64_t before = ipc_test_used_fds();
     backpressure();
@@ -458,6 +513,8 @@ int main(void) {
     const unsigned char *image;
     uint32_t image_size;
     IPC_CHECK(!seed0_bootfs_open_file("/tests/kobox2-ipc-child.elf", &image, &image_size));
+    timed_receive_round(image, image_size);
+    IPC_CHECK(ipc_test_used_fds() == before);
     struct ph_ipc ipc = {0};
     int previous_fd = 0;
     shared_round(&ipc, 10, image, image_size, &previous_fd);

@@ -288,6 +288,7 @@ static int adopt_mapping(struct gpud_drm_service *service,
         .exchange = translation->mapping_exchange,
         .handle = handle,
         .length = translation->mapping_length,
+        .gem_handle = translation->mapping_handle,
         .rights = translation->mapping_rights,
         .cache_policy = translation->mapping_cache_policy,
         .view_fd = (int)received.fd,
@@ -353,9 +354,10 @@ static int release_closed_objects(struct gpud_drm_service *service) {
 }
 
 static void close_mapping_owner(
-    struct gpud_drm_service *service, uint64_t handle) {
+    struct gpud_drm_service *service, uint64_t handle, uint32_t gem_handle) {
     for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i)
-        if (service->mappings[i].handle == handle)
+        if (service->mappings[i].handle == handle &&
+            (!gem_handle || service->mappings[i].gem_handle == gem_handle))
             service->mappings[i].owner_closed = 1;
 }
 
@@ -422,6 +424,22 @@ static int ioctl_request(
         return error;
     struct gpud_drm_translation translation;
     error = gpud_drm_ioctl_encode(&translation, &binding, request, PH_GPU_QUERY_OUTPUT_REGION);
+    /* A MAP ioctl names the existing GEM object's mmap offset. Repeated
+     * queries must not create additional pins/slots. The validated request
+     * has no ancillary FDs, and a closed/reused GEM handle never matches. */
+    if (!error && translation.mapping_handle) {
+        for (size_t i = 0; i < GPUD_DRM_MAPPINGS_MAX; ++i) {
+            const struct gpud_drm_mapping *mapping = &service->mappings[i];
+            if (!mapping->id || mapping->owner_closed ||
+                mapping->handle != request->handle ||
+                mapping->gem_handle != translation.mapping_handle)
+                continue;
+            const size_t offset = request->request == GPUD_DRM_IOCTL_MODE_MAP_DUMB ?
+                offsetof(gpud_drm_mode_map_dumb_t, offset) : 0;
+            memcpy(request->data + offset, &mapping->id, sizeof(mapping->id));
+            return gpud_drm_file_release(&service->files, generation, request->handle);
+        }
+    }
     size_t fd_index = 1 + !!request->aux_size;
     int input_fence = -1, output_fence = -1;
     if (!error && (request->fd_flags & GPUD_DRM_IOCTL_FD_INPUT_WAIT)) {
@@ -541,8 +559,15 @@ static int ioctl_request(
                 }
                 if (!error && request->request == GPUD_DRM_IOCTL_VIRTGPU_RESOURCE_CREATE)
                     ++service->resource_creates;
-                else if (!error && request->request == GPUD_DRM_IOCTL_GEM_CLOSE)
+                else if (!error && request->request == GPUD_DRM_IOCTL_GEM_CLOSE) {
                     ++service->gem_closes;
+                    uint32_t gem_handle;
+                    memcpy(&gem_handle, request->data, sizeof(gem_handle));
+                    /* Existing VMAs retain their lease after GEM_CLOSE;
+                     * only unleased mappings can release the backend pin. */
+                    close_mapping_owner(service, request->handle, gem_handle);
+                    error = release_closed_objects(service);
+                }
                 else if (!error &&
                     request->request == GPUD_DRM_IOCTL_VIRTGPU_EXECBUFFER)
                     ++service->exec_submits;
@@ -927,7 +952,7 @@ static void finish_reply_transfer(struct gpud_drm_reply_transfer *transfer) {
 
 static int dispatch(struct gpud_drm_service *service,
     const pacha_service_envelope_t *header, void *payload, uint64_t *result,
-    struct gpud_drm_reply_transfer *transfer) {
+    struct gpud_drm_reply_transfer *transfer, int inline_ioctl) {
     uint64_t generation = service->files.generation;
     size_t count = service->received.fd_count;
     if (service->files.terminal_error)
@@ -935,6 +960,8 @@ static int dispatch(struct gpud_drm_service *service,
     if (service->correlation == UINT64_MAX)
         return -EOVERFLOW;
     ++service->correlation;
+    if (inline_ioctl && header->op != GPUD_DRM_OP_HANDLE_IOCTL)
+        return -EINVAL;
     if (header->op == GPUD_DRM_OP_HELLO)
         return header->payload_size || count != 2 ? -EINVAL : (*result = 1, 0);
     if (header->op == GPUD_DRM_OP_OPEN_NODE) {
@@ -968,7 +995,8 @@ static int dispatch(struct gpud_drm_service *service,
             !!(request->fd_flags & GPUD_DRM_IOCTL_FD_OUTPUT_NOTIFY);
         if (header->payload_size != sizeof(*request) ||
             (request->fd_flags & ~GPUD_DRM_IOCTL_FD_MASK) ||
-            count != 2 + transferred)
+            (inline_ioctl && !gpud_drm_ioctl_can_inline(request)) ||
+            count != (inline_ioctl ? 1u : 2u) + transferred)
             return -EINVAL;
         return ioctl_request(service, payload);
     }
@@ -1065,7 +1093,7 @@ static int dispatch(struct gpud_drm_service *service,
                 event_buffer(service, request->handle);
             if (buffer)
                 memset(buffer, 0, sizeof(*buffer));
-            close_mapping_owner(service, request->handle);
+            close_mapping_owner(service, request->handle, 0);
         }
         if (!error)
             error = retire_owner_watch(service, request->handle);
@@ -1094,6 +1122,21 @@ size_t gpud_drm_service_collect_wait_sources(
 int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
     if (!service || service->error || service->files.terminal_error)
         return service ? (service->error ? service->error : service->files.terminal_error) : -EINVAL;
+    /* This runs before every DRM request. Poll live references together:
+     * the usual no-hangup case needs one syscall, not one per client/lease.
+     * On readiness or error retain the individual checks below; closing a
+     * file can retire other watches, so do not reuse a stale poll snapshot. */
+    int sources[GPUD_DRM_WAIT_SOURCES_MAX];
+    const size_t count = gpud_drm_service_collect_wait_sources(
+        service, sources, GPUD_DRM_WAIT_SOURCES_MAX);
+    if (!count)
+        return 0;
+    struct pacha_pollfd events[GPUD_DRM_WAIT_SOURCES_MAX];
+    for (size_t i = 0; i < count; ++i)
+        events[i] = (struct pacha_pollfd){
+            .fd = sources[i], .events = PACHA_FD_EVENT_HANGUP};
+    if (pacha_fd_poll(events, count) == 0)
+        return 0;
     for (size_t i = 0; i < GPUD_DRM_REFERENCES_MAX; ++i) {
         struct gpud_drm_watch *watch = &service->watches[i];
         if (!watch->handle || watch->fd < 16)
@@ -1115,7 +1158,7 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service) {
             struct gpud_drm_event_buffer *buffer = event_buffer(service, handle);
             if (buffer)
                 memset(buffer, 0, sizeof(*buffer));
-            close_mapping_owner(service, handle);
+            close_mapping_owner(service, handle, 0);
         }
         if (!error)
             error = close_draining(service);
@@ -1230,6 +1273,35 @@ int gpud_drm_service_receive(struct gpud_drm_service *service) {
     int error = -EPROTO;
     struct gpud_drm_reply_transfer transfer = {
         .owner_fd = -1, .client_fd = -1};
+    if (message.word0 == GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC) {
+        /* Only the kernel-created reply capability is accepted. In particular,
+         * this path cannot smuggle auxiliary memory or fence capabilities. */
+        if (message.fd_count != 1 || message.flags ||
+            !valid_fd(message.fds[0].fd, PACHA_FD_KIND_REPLY,
+                PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0))
+            goto cleanup;
+        gpud_drm_ioctl_request_t request = {
+            .handle = message.word1, .request = message.word2,
+            .arg_size = (message.word2 >> 16) & 0x3fffu,
+            .data_size = (message.word2 >> 16) & 0x3fffu,
+        };
+        memcpy(request.data, &message.word3, sizeof(message.word3));
+        const pacha_service_envelope_t header = {
+            .op = GPUD_DRM_OP_HANDLE_IOCTL, .payload_size = sizeof(request),
+        };
+        uint64_t result = 0;
+        int status = dispatch(service, &header, &request, &result, &transfer, 1);
+        if (!status && !gpud_drm_ioctl_can_inline(&request))
+            status = -EPROTO;
+        struct pacha_ipc_msg reply = {
+            .word0 = GPUD_DRM_INLINE_IOCTL_REPLY_MAGIC,
+            .word1 = (uint64_t)status, .word2 = message.word2,
+        };
+        if (!status)
+            memcpy(&reply.word3, request.data, request.data_size);
+        error = pacha_ipc_reply((int)message.fds[0].fd, &reply) ? -EIO : 0;
+        goto cleanup;
+    }
     if (message.fd_count < 2)
         goto cleanup;
     uint64_t page_fd = message.fds[0].fd, reply_fd = message.fds[message.fd_count - 1].fd;
@@ -1259,7 +1331,7 @@ int gpud_drm_service_receive(struct gpud_drm_service *service) {
         header.flags == (header.payload_size ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0) &&
         !header.fd_count && !header.reserved0 && !header.reserved1 && header.payload_size <= sizeof(payload)) {
         memcpy(&payload, (unsigned char *)service->page + sizeof(header), header.payload_size);
-        status = dispatch(service, &header, &payload, &result, &transfer);
+        status = dispatch(service, &header, &payload, &result, &transfer, 0);
         if (!status && (header.op == GPUD_DRM_OP_HANDLE_IOCTL ||
                 header.op == GPUD_DRM_OP_HANDLE_READ)) {
             response_size = header.op == GPUD_DRM_OP_HANDLE_IOCTL ?

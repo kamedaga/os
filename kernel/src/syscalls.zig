@@ -176,6 +176,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
     end = maxStaticEnd(end, runtime_syscalls.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, @import("ipc_metric.zig").staticEnd());
     end = maxStaticEnd(end, @import("clockevent.zig").kernelStaticStorageEndAddr());
     return end;
 }
@@ -255,6 +256,7 @@ fn writeThreadUserLogPrefix(h: *const Hooks, thread_index: usize) void {
 fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     const base_hooks = getHooks();
     if (!base_hooks.kernel_state_ready.*) return sc.syscall_err_not_ready;
+    @import("ipc_metric.zig").recordSyscall(frame.rax);
 
     const state = base_hooks.state;
     const proc = scheduler.currentPrincipal();

@@ -1141,12 +1141,6 @@ int unix_service_run(const struct unix_boot_config *config)
     puts("[unixd] ready");
     fflush(stdout);
     for (;;) {
-        unsigned busy = 0;
-            for (unsigned i = 0; i < 8 && receive_one(&service, NULL, NULL) == 0; i++) busy++;
-        for (struct service_session *session = service.sessions; session; session = session->next)
-            for (unsigned i = 0; i < 8 && receive_one(&service, session, NULL) == 0; i++) busy++;
-        for (struct service_handoff *handoff = service.handoffs; handoff; handoff = handoff->next)
-            for (unsigned i = 0; i < 8 && receive_one(&service, NULL, handoff) == 0; i++) busy++;
         struct pacha_service_wait_set set;
         int status = pacha_service_wait_init(&set, service.admin);
         for (struct service_session *session = service.sessions; status == 0 && session; session = session->next)
@@ -1162,7 +1156,18 @@ int unix_service_run(const struct unix_boot_config *config)
             fprintf(stderr, "[unixd] wait capacity exhausted count=%llu\n", (unsigned long long)set.count);
             return 5;
         }
-        (void)pacha_service_wait(&set, busy ? 0 : PACHA_FD_WAIT_FOREVER);
+        (void)pacha_service_wait(&set, PACHA_FD_WAIT_FOREVER);
         reap(&service, &set);
+        /* WAIT_MANY is level-triggered: queues left nonempty by the fairness
+         * budget wake the next iteration. Do not probe every idle client on
+         * each request; newly added endpoints join the next wait snapshot. */
+        if (pacha_service_wait_revents(&set, service.admin) & PACHA_FD_EVENT_READABLE)
+            for (unsigned i = 0; i < 8 && receive_one(&service, NULL, NULL) == 0; i++) {}
+        for (struct service_session *session = service.sessions; session; session = session->next)
+            if (pacha_service_wait_revents(&set, session->control_fd) & PACHA_FD_EVENT_READABLE)
+                for (unsigned i = 0; i < 8 && receive_one(&service, session, NULL) == 0; i++) {}
+        for (struct service_handoff *handoff = service.handoffs; handoff; handoff = handoff->next)
+            if (pacha_service_wait_revents(&set, handoff->fd) & PACHA_FD_EVENT_READABLE)
+                for (unsigned i = 0; i < 8 && receive_one(&service, NULL, handoff) == 0; i++) {}
     }
 }

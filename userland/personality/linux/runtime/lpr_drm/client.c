@@ -478,6 +478,39 @@ static void *lpr_gpud_drm_payload(void *page)
     return page == 0 ? 0 : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
 }
 
+static int64_t lpr_gpud_drm_ioctl_inline(gpud_drm_ioctl_request_t *ioctl)
+{
+    struct pacha_ipc_msg request = {
+        .word0 = GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC,
+        .word1 = ioctl->handle,
+        .word2 = ioctl->request,
+    };
+    lpr_memcpy(&request.word3, ioctl->data, ioctl->data_size);
+    struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS] = {0};
+    struct pacha_ipc_msg reply = {
+        .fds = fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS,
+    };
+    const int64_t reply_fd = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_CALL,
+        LPR_GPUD_DRM_ENDPOINT_FD, (uint64_t)(uintptr_t)&request);
+    if (reply_fd < 16)
+        return lpr_pacha_status_to_errno(reply_fd);
+    const int64_t status = lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+    if (status != 0)
+        return lpr_pacha_status_to_errno(status);
+    /* Never leak unexpected capabilities, including a malformed error reply. */
+    for (uint32_t i = 0; i < reply.fd_count; ++i)
+        if (fds[i].fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fds[i].fd);
+    if (reply.word0 != GPUD_DRM_INLINE_IOCTL_REPLY_MAGIC ||
+        reply.word2 != ioctl->request || reply.fd_count || reply.flags)
+        return -LPR_LINUX_EIO;
+    if (reply.word1 != 0)
+        return (int64_t)reply.word1;
+    lpr_memcpy(ioctl->data, &reply.word3, ioctl->data_size);
+    return 0;
+}
+
 static int64_t lpr_gpud_drm_call_transfers_many(
     uint32_t op,
     int page_fd,
@@ -1901,7 +1934,11 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 #if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
     const uint64_t profile_ipc_begin = pacha_trace_read_tsc();
 #endif
-    int64_t status = lpr_gpud_drm_call_transfers(
+    const int inline_ioctl = !transfer_count &&
+        (wire_kind == LPR_DRM_WIRE_GENERIC || wire_kind == LPR_DRM_WIRE_NO_ARGUMENT) &&
+        gpud_drm_ioctl_can_inline(ioctl);
+    int64_t status = inline_ioctl ? lpr_gpud_drm_ioctl_inline(ioctl) :
+        lpr_gpud_drm_call_transfers(
         GPUD_DRM_OP_HANDLE_IOCTL,
         page_fd,
         page,

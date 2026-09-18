@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Keep upstream defaults available before xfwm4 creates its compositor.
+     Writing a missing use_compositing property during settings loading emits
+     a synchronous callback, before vblank_mode has been applied (xfwm4 4.20).
+     This is a system default, not a locked setting or a user-profile override. -->
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="true"/>
+    <property name="vblank_mode" type="string" value="auto"/>
+  </property>
+</channel>

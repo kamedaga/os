@@ -23,6 +23,66 @@ static int pending(void *context) {
     return atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_READY ? 2 : 0;
 }
 
+static void return_to_receiver(struct ph_lifecycle *lifecycle, int result) {
+    lifecycle->work_result = result;
+    atomic_store_explicit(&lifecycle->work, WORK_DONE, memory_order_release);
+    ph_wake(&lifecycle->work);
+}
+
+static int quiesce(struct ph_lifecycle *lifecycle, const struct ph_ipc_packet *packet) {
+    if (!packet->correlation || packet->value || packet->fd_count) return -EPROTO;
+    lifecycle->token = packet->correlation;
+    return 1;
+}
+
+/* While BUSY, the receiver is parked and this task owns IPC and staging.
+ * Check control before each ring request; a hot queue cannot hide QUIESCE.
+ * An empty probe keeps ownership until the Linux loop ends its bounded poll.
+ */
+static int poll_work(void *context) {
+    struct ph_lifecycle *lifecycle = context;
+    if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) != WORK_BUSY)
+        return pending(context);
+    struct ph_ipc_packet packet = {0};
+    int result = ph_ipc_receive(lifecycle->ipc, lifecycle->generation, &packet);
+    if (!result) {
+        if (packet.operation == PH_LIFECYCLE_QUIESCE) {
+            result = quiesce(lifecycle, &packet);
+            PH_OK(ph_ipc_packet_release(&packet));
+            return_to_receiver(lifecycle, result);
+            return 0;
+        }
+        result = lifecycle->service.prepare(lifecycle->service.context, &packet);
+        int closed = ph_ipc_packet_release(&packet);
+        if (closed) {
+            /* Match terminal receiver cleanup: never lose a capability
+             * still owned by this local packet after a failed close. */
+            PH_OK(ph_ipc_packet_release(&packet));
+            if (result >= 0) result = closed;
+        }
+    } else if (result == -EAGAIN) {
+        result = lifecycle->service.next(lifecycle->service.context);
+    } else {
+        return_to_receiver(lifecycle, result);
+        return 0;
+    }
+    if (result == PH_LIFECYCLE_SERVICE_IDLE) return 0;
+    if (result) {
+        if (result > 0) result = -EPROTO;
+        (void)lifecycle->service.release(lifecycle->service.context);
+        return_to_receiver(lifecycle, result);
+        return 0;
+    }
+    atomic_store_explicit(&lifecycle->work, WORK_READY, memory_order_release);
+    return 2;
+}
+
+static void idle(void *context) {
+    struct ph_lifecycle *lifecycle = context;
+    if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_BUSY)
+        return_to_receiver(lifecycle, 0);
+}
+
 static int dispatch(void *context, void *linux_service) {
     struct ph_lifecycle *lifecycle = context;
     unsigned int expected = WORK_READY;
@@ -30,9 +90,16 @@ static int dispatch(void *context, void *linux_service) {
         memory_order_acquire, memory_order_relaxed)) return -EPROTO;
     int result = lifecycle->service.dispatch(lifecycle->service.context, linux_service);
     if (result > 0) result = -EPROTO;
-    lifecycle->work_result = result;
-    atomic_store_explicit(&lifecycle->work, WORK_DONE, memory_order_release);
-    ph_wake(&lifecycle->work);
+    int completed = result ? result :
+        lifecycle->service.complete(lifecycle->service.context, lifecycle->ipc);
+    int closed = lifecycle->service.release(lifecycle->service.context);
+    completed = completed ? completed : closed;
+    /* A ring service retains ownership across the Linux loop's short poll.
+     * No staging is reused until completion publication and release finish. */
+    if (completed || !lifecycle->service.next)
+        return_to_receiver(lifecycle, completed);
+    /* Completion errors reach the core through terminal only after staging
+     * has been released and the receiver has stopped admission. */
     return result;
 }
 
@@ -46,8 +113,8 @@ static int run_prepared(struct ph_lifecycle *lifecycle, int result) {
         while ((state = atomic_load_explicit(&lifecycle->work, memory_order_acquire)) != WORK_DONE)
             ph_wait(&lifecycle->work, state);
         result = lifecycle->work_result;
-        if (!result) result = lifecycle->service.complete(lifecycle->service.context, lifecycle->ipc);
         atomic_store_explicit(&lifecycle->work, WORK_IDLE, memory_order_release);
+        return result; /* The opening task has already released staging. */
     }
     int closed = lifecycle->service.release(lifecycle->service.context);
     return result ? result : closed;
@@ -102,12 +169,10 @@ static void *receive(void *context) {
         (void)ph_wait_readable(events, count);
     }
     if (!result) {
-        if (packet.operation != PH_LIFECYCLE_QUIESCE || !packet.correlation || packet.value || packet.fd_count)
+        if (packet.operation != PH_LIFECYCLE_QUIESCE)
             result = -EPROTO;
-        else {
-            lifecycle->token = packet.correlation;
-            result = 1;
-        }
+        else
+            result = quiesce(lifecycle, &packet);
     }
     /* Even rejected ancillary FDs retain ownership until their closes
      * succeed. Cleanup failure is fatal to this sandbox, never a leaked FD. */
@@ -131,6 +196,10 @@ int ph_lifecycle_start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ip
         .port = {.size = sizeof(lifecycle->port), .context = lifecycle, .ready = ready,
             .pending = pending, .dispatch = service ? dispatch : NULL}};
     if (service) lifecycle->service = *service;
+    if (service && service->next) {
+        lifecycle->port.poll = poll_work;
+        lifecycle->port.idle = idle;
+    }
     atomic_init(&lifecycle->start, 0);
     atomic_init(&lifecycle->terminal, 0);
     atomic_init(&lifecycle->work, WORK_IDLE);

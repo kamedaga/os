@@ -117,7 +117,8 @@ int ph_ipc_packet_release(struct ph_ipc_packet *packet) {
     return first_error;
 }
 
-int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet *out) {
+int ph_ipc_receive_wait(struct ph_ipc *ipc, uint64_t generation,
+    struct ph_ipc_packet *out, uint64_t timeout_ticks) {
     int result = check_admission(ipc, generation);
     if (result) return result;
     if (!out || out == &ipc->rejected) return -EINVAL;
@@ -128,8 +129,11 @@ int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet
     struct pacha_ipc_msg message = {
         .fds = packet->fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS,
     };
-    result = native_status(pacha_syscall2(PACHA_IPC_SYSCALL_RECV,
-        (uint64_t)ipc->fd, (uintptr_t)&message));
+    result = native_status(timeout_ticks ?
+        pacha_syscall4(PACHA_IPC_SYSCALL_RECV_WAIT,
+            (uint64_t)ipc->fd, (uintptr_t)&message, timeout_ticks, 0) :
+        pacha_syscall2(PACHA_IPC_SYSCALL_RECV,
+            (uint64_t)ipc->fd, (uintptr_t)&message));
     if (result) {
         /* On failure native IPC rolls back installed FDs. Do not close any
          * numbers left by a partial copyout: they may have been recycled. */
@@ -152,6 +156,10 @@ int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet
     *out = *packet;
     *packet = (struct ph_ipc_packet){0};
     return 0;
+}
+
+int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet *out) {
+    return ph_ipc_receive_wait(ipc, generation, out, 0);
 }
 
 int ph_ipc_revoke(struct ph_ipc *ipc, uint64_t generation) {

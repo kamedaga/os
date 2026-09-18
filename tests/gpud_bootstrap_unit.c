@@ -12,6 +12,11 @@
 static long send_status;
 static unsigned int calls;
 
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)nr; (void)a; (void)b; (void)c; (void)d;
+    abort(); /* The bootstrap sender never waits for a receive. */
+}
+
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
     (void)nr; (void)fd;
     abort(); /* Transfer borrows all source capabilities; no close permitted. */

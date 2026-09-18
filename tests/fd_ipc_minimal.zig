@@ -92,6 +92,38 @@ test "ipc call descriptor exhaustion remains allocation failure" {
     }
 }
 
+test "ipc receive capacity preserves queued FDs and validates empty transfers" {
+    var s = try initState();
+    var free_list = FreePageList{};
+    const pair = try s.createIpcChannelPairFds(p0, rights(.{ .send = true, .recv = true, .close = true }), .{}, 16);
+    const vmo = try s.createAnonymousVmoFd(p0, 4096, rights(.{ .transfer = true, .close = true, .map_read = true }), .{}, 16);
+    const object = (s.fdEntryConst(p0, vmo) orelse unreachable).object;
+    const transfer = [_]kernel.IpcSendFd{.{ .fd = vmo, .rights = rights(.{ .close = true, .map_read = true }), .move = false }};
+    var last: kernel.Fd = undefined;
+    while (try s.fdFreeCountFrom(p0, 16) != 0)
+        last = try s.createEventFd(p0, 0, .{}, .{ .close = true }, 16);
+
+    // A full receiver can still receive words, but an invalid minimum is an
+    // error even without attached FDs and must leave the message queued.
+    try s.ipcSend(p0, pair.a, .{ .words = .{ 42, 0, 0, 0 } }, &free_list);
+    try std.testing.expectError(KernelError.InvalidState, s.ipcRecv(p0, pair.b, 0, std.math.maxInt(kernel.Fd), &free_list));
+    const words = try s.ipcRecv(p0, pair.b, 0, 16, &free_list);
+    try std.testing.expectEqual(@as(u64, 42), words.words[0]);
+    try std.testing.expectEqual(@as(usize, 0), words.fd_count);
+
+    try s.ipcSend(p0, pair.a, .{ .fds = &transfer }, &free_list);
+    const refs = s.kernelObjectRefCount(object);
+    try std.testing.expectError(KernelError.TableFull, s.ipcRecv(p0, pair.b, 1, 16, &free_list));
+    try std.testing.expectEqual(refs, s.kernelObjectRefCount(object));
+    try s.closeFdWithFreeList(p0, last, &free_list);
+    // Exactly one free slot, at the end of the table, must be sufficient.
+    const received = try s.ipcRecv(p0, pair.b, 1, 16, &free_list);
+    try std.testing.expectEqual(last, received.fds[0].fd);
+    try std.testing.expectEqual(object, (s.fdEntryConst(p0, last) orelse unreachable).object);
+    try std.testing.expectEqual(refs, s.kernelObjectRefCount(object));
+    try std.testing.expectError(KernelError.MailboxEmpty, s.ipcRecv(p0, pair.b, 1, 16, &free_list));
+}
+
 test "minimal fd ipc call moves vmo fd and receives reply" {
     var s = try initState();
     var free_list = FreePageList{};

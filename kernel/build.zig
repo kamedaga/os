@@ -209,11 +209,15 @@ pub fn build(b: *std.Build) void {
     const kernel_debug = b.option(bool, "kernel-debug", "Keep kernel debug information and symbols in the boot ELF") orelse false;
     const smp_profile_options = b.addOptions();
     smp_profile_options.addOption(bool, "enabled", b.option(bool, "smp-profile", "Enable per-CPU SMP diagnostic counters") orelse false);
+    const ipc_profile_options = b.addOptions();
+    ipc_profile_options.addOption(bool, "ipc_enabled", b.option(bool, "ipc-profile", "Enable per-CPU native IPC diagnostic counters") orelse false);
     const limine_mod = b.createModule(.{
         .root_source_file = b.path("../bootloader/limine/kernel_entry.zig"),
         .target = limine_target,
         .optimize = .ReleaseSmall,
         .code_model = .kernel,
+        // Ring-0 IRQs push onto the interrupted stack, including its red zone.
+        .red_zone = false,
         .strip = !kernel_debug,
     });
     const kernel_boot_api_mod = b.createModule(.{
@@ -221,10 +225,12 @@ pub fn build(b: *std.Build) void {
         .target = limine_target,
         .optimize = .ReleaseSmall,
         .code_model = .kernel,
+        .red_zone = false,
     });
     kernel_boot_api_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     limine_mod.addOptions("smp_profile_options", smp_profile_options);
+    limine_mod.addOptions("ipc_profile_options", ipc_profile_options);
     limine_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
     addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_limine.o");
     const limine_kernel = b.addExecutable(.{

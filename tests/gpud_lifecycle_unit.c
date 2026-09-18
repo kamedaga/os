@@ -14,6 +14,11 @@ static unsigned int calls, sends, closed;
 static struct gpud_process_exit exit_status;
 static uint64_t ready_operation, ready_generation, ready_value, ready_fd;
 
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)nr; (void)a; (void)b; (void)c; (void)d;
+    abort(); /* Lifecycle step tests only use nonblocking receive. */
+}
+
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
     assert(nr == PACHA_FD_SYSCALL_CLOSE && (fd == 17 || fd == 40));
     ++calls;

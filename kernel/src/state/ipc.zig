@@ -961,6 +961,21 @@ pub fn fdFreeCountFrom(self: anytype, owner: PrincipalId, min_fd: Fd) KernelErro
     return count;
 }
 
+fn hasReceiveFdCapacity(self: anytype, owner: PrincipalId, min_fd: Fd, needed: usize) KernelError!bool {
+    const table = try self.fdTableForActiveProcessConst(owner);
+    var index = @TypeOf(self.*).fdIndex(min_fd) orelse return KernelError.InvalidState;
+    // Replies commonly carry no FDs. Preserve min_fd validation, but only
+    // inspect as many free slots as this message needs under the state lock.
+    var remaining = needed;
+    if (remaining == 0) return true;
+    while (index < table.slots().len) : (index += 1) {
+        if (!table.slots()[index].isEmpty()) continue;
+        remaining -= 1;
+        if (remaining == 0) return true;
+    }
+    return false;
+}
+
 pub fn validateIpcSendFds(specs: []const IpcSendFd) KernelError!void {
     if (specs.len > max_ipc_message_fds) return KernelError.InvalidState;
     for (specs, 0..) |spec, i| {
@@ -1133,7 +1148,7 @@ pub fn ipcRecv(
     const queue = try self.ipcMessageQueueForRecv(entry.object);
     const pending = queue.peek() orelse return KernelError.MailboxEmpty;
     if (pending.fd_count > fd_capacity) return KernelError.TableFull;
-    if (try self.fdFreeCountFrom(owner, min_fd) < pending.fd_count) return KernelError.TableFull;
+    if (!try hasReceiveFdCapacity(self, owner, min_fd, pending.fd_count)) return KernelError.TableFull;
 
     var installed: [max_ipc_message_fds]Fd = [_]Fd{0} ** max_ipc_message_fds;
     var installed_count: usize = 0;

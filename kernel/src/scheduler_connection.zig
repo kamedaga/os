@@ -1411,7 +1411,7 @@ pub fn parkApThreadForBlock(
         ctx.wait_completion_claimed = false;
         ctx.wait_completion_publish_pending = false;
         ctx.wait_completion_rax = 0;
-        ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
+        ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count +| timeout_ticks;
         ctx.ready = false;
         setThreadHotCr3(current_thread, ctx.cr3);
         setThreadHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);
@@ -2505,6 +2505,56 @@ pub fn setControlledThreadContext(thread_index: usize, generation: u32,
     ctx.pkru = @intCast(image.pkru);
     ctx.x_state = image.xstate;
     return true;
+}
+
+test "controlled thread context timed wait completion ordering" {
+    for (0..3) |winner| {
+        initializeStaticStorage();
+        defer initializeStaticStorage();
+        const tid = 4;
+        const generation = 17;
+        const token = 11;
+        const owner = kernel.processPrincipalFromIndex(0).?;
+        const node = &initial_scheduler_entities[tid];
+        const ctx = &initial_thread_contexts[tid];
+        ctx.* = .{ .id = tid, .allocated = true, .generation = generation,
+            .owner_process = owner, .scheduler_entity = node,
+            .cpu_affinity_mask = 1, .ready = false, .wait_mailbox = true,
+            .active_wait_token = token, .wake_tick = 100 };
+        defer ctx.* = .{ .id = tid, .scheduler_entity = node };
+        defer initial_thread_hot_states[tid] = .{};
+        scheduler_state.cpu_count = 1;
+        scheduler_state.cpus[0].is_idle = true;
+        scheduler_state.cpus[0].current_thread = idleThreadMarker;
+        try std.testing.expect(verifiedAddThread(tid, generation, false));
+        syncHotStateFromContext(tid);
+        ctx.frame.rax = 123; // Timeout return value already saved by block.
+        if (winner == 0) {
+            try std.testing.expectEqual(.claimed,
+                claimWaitTokenCompletion(tid, generation, owner, token));
+            wakeIfTimerExpired(tid, 100);
+            try std.testing.expect(!ctx.ready and ctx.wait_completion_claimed);
+            try std.testing.expectEqual(@as(u64, 0), ctx.wake_tick);
+            try std.testing.expectEqual(.published,
+                publishClaimedWaitCompletion(tid, generation, owner, token, 456));
+        } else {
+            if (winner == 1) {
+                wakeIfTimerExpired(tid, 100);
+            } else {
+                try std.testing.expectEqual(.woke,
+                    wakeIfWaitingTokenGenerationWithRax(tid, generation, owner, token, 123));
+            }
+            try std.testing.expectEqual(.stale,
+                claimWaitTokenCompletion(tid, generation, owner, token));
+            try std.testing.expectEqual(.stale,
+                publishClaimedWaitCompletion(tid, generation, owner, token, 456));
+        }
+        wakeIfTimerExpired(tid, 101);
+        try std.testing.expect(ctx.ready and !ctx.wait_mailbox);
+        try std.testing.expectEqual(@as(u64, 0), ctx.active_wait_token);
+        try std.testing.expectEqual(@as(u64, if (winner == 0) 456 else 123), ctx.frame.rax);
+        try std.testing.expectEqual(@as(usize, 1), scheduler_state.cpus[0].runqueue.count);
+    }
 }
 
 test "controlled thread context requires quiescence and keeps wait lifecycle intact" {
@@ -3893,7 +3943,7 @@ pub fn blockCurrentThread(
     ctx.wait_completion_claimed = false;
     ctx.wait_completion_publish_pending = false;
     ctx.wait_completion_rax = 0;
-    ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count + timeout_ticks;
+    ctx.wake_tick = if (timeout_ticks == 0) 0 else lapic_tick_count +| timeout_ticks;
     ctx.ready = false;
     setThreadHotCr3(current_thread, ctx.cr3);
     setThreadHotWaitState(current_thread, wait_mailbox, ctx.wake_tick, false);

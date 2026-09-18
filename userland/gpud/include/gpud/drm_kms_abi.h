@@ -32,6 +32,7 @@ enum {
     GPUD_DRM_IOCTL_MODE_GETPLANE = 0xc02064b6u,
     GPUD_DRM_IOCTL_MODE_ADDFB2 = 0xc06864b8u,
     GPUD_DRM_IOCTL_MODE_OBJ_GETPROPERTIES = 0xc02064b9u,
+    GPUD_DRM_IOCTL_MODE_CURSOR2 = 0xc02464bbu,
     GPUD_DRM_IOCTL_MODE_ATOMIC = 0xc03864bcu,
     GPUD_DRM_IOCTL_MODE_CREATEPROPBLOB = 0xc01064bdu,
     GPUD_DRM_IOCTL_MODE_DESTROYPROPBLOB = 0xc00464beu,
@@ -416,6 +417,12 @@ typedef struct gpud_drm_mode_cursor {
     uint32_t handle;
 } gpud_drm_mode_cursor_t;
 
+typedef struct gpud_drm_mode_cursor2 {
+    gpud_drm_mode_cursor_t cursor;
+    int32_t hot_x;
+    int32_t hot_y;
+} gpud_drm_mode_cursor2_t;
+
 typedef struct gpud_drm_event_vblank {
     uint32_t type;
     uint32_t length;
@@ -561,6 +568,7 @@ _Static_assert(sizeof(gpud_drm_mode_get_property_t) == 64, "drm property ABI");
 _Static_assert(sizeof(gpud_drm_mode_obj_get_properties_t) == 32, "drm object properties ABI");
 _Static_assert(sizeof(gpud_drm_mode_get_blob_t) == 16, "drm property blob ABI");
 _Static_assert(sizeof(gpud_drm_mode_cursor_t) == 28, "drm cursor ABI");
+_Static_assert(sizeof(gpud_drm_mode_cursor2_t) == 36, "drm cursor2 ABI");
 _Static_assert(sizeof(gpud_drm_mode_create_blob_wire_t) == 136, "drm create blob wire ABI");
 _Static_assert(sizeof(gpud_drm_mode_atomic_wire_t) == 440, "drm atomic wire ABI");
 _Static_assert(sizeof(gpud_drm_syncobj_create_t) == 8, "drm syncobj create ABI");

@@ -23,10 +23,21 @@ static int is_event_notification(
             .queue.used_notification_id;
 }
 
+static int receive_until(struct gpud_gpu_rpc *rpc, uint64_t deadline) {
+    uint64_t now;
+    int error = now_ms(&now);
+    if (error)
+        return error;
+    if (now >= deadline)
+        return -ETIMEDOUT;
+    return ph_ipc_receive_wait(rpc->ipc, rpc->ipc->generation,
+        &rpc->incoming, deadline - now);
+}
+
 static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t deadline) {
     for (;;) {
         struct ph_ipc_packet *packet = &rpc->incoming;
-        int error = ph_ipc_receive(rpc->ipc, rpc->ipc->generation, packet);
+        int error = receive_until(rpc, deadline);
         if (!error) {
             if (is_event_notification(rpc, packet)) {
                 rpc->event_notification = 1;
@@ -51,22 +62,6 @@ static int wait_wake(struct gpud_gpu_rpc *rpc, uint64_t notification, uint64_t d
         }
         if (error != -EAGAIN)
             return error;
-        uint64_t now;
-        error = now_ms(&now);
-        if (error)
-            return error;
-        if (now >= deadline)
-            return -ETIMEDOUT;
-        struct pacha_pollfd event = {
-            .fd = rpc->ipc->fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
-        long result = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-            (uintptr_t)&event, 1, deadline - now, 0);
-        if (result == 1 && event.revents) {
-            if (event.revents & PACHA_FD_EVENT_HANGUP)
-                return -EPIPE;
-        } else if (event.revents || (result && result != PACHA_SYSCALL_ERR_NOT_READY)) {
-            return -EIO;
-        }
     }
 }
 
@@ -205,7 +200,7 @@ int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
         goto failed;
     deadline += 5000;
     for (;;) {
-        error = ph_ipc_receive(rpc->ipc, rpc->ipc->generation, &rpc->incoming);
+        error = receive_until(rpc, deadline);
         if (!error) {
             const struct ph_ipc_packet *reply = &rpc->incoming;
             if (is_event_notification(rpc, reply)) {
@@ -232,30 +227,6 @@ int gpud_gpu_rpc_release_mapping(struct gpud_gpu_rpc *rpc,
         }
         if (error != -EAGAIN)
             goto failed;
-        uint64_t now;
-        error = now_ms(&now);
-        if (error)
-            goto failed;
-        if (now >= deadline) {
-            error = -ETIMEDOUT;
-            goto failed;
-        }
-        struct pacha_pollfd event = {
-            .fd = rpc->ipc->fd,
-            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
-        };
-        long waited = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
-            (uintptr_t)&event, 1, deadline - now, 0);
-        if (waited == 1 && event.revents) {
-            if (event.revents & PACHA_FD_EVENT_HANGUP) {
-                error = -EPIPE;
-                goto failed;
-            }
-        } else if (event.revents ||
-                   (waited && waited != PACHA_SYSCALL_ERR_NOT_READY)) {
-            error = -EIO;
-            goto failed;
-        }
     }
 protocol_error:
     error = -EPROTO;

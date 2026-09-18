@@ -3,6 +3,7 @@
 /// requests and converts them into boot/entry.zig resources.
 const std = @import("std");
 pub const smp_profile_enabled = @import("smp_profile_options").enabled;
+pub const ipc_profile_enabled = @import("ipc_profile_options").ipc_enabled;
 const kernel_api = @import("kernel_boot_api");
 const x86_platform = kernel_api.x86_platform;
 const entry = kernel_api.entry;

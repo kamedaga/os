@@ -164,30 +164,22 @@ void unix_transport_write_cancel(struct unix_tx *tx, struct unix_write *write)
     }
 }
 
-int unix_transport_read_begin(const struct unix_tx *tx, struct unix_rx *rx,
-    uint64_t generation, uint64_t owner, size_t capacity, struct unix_read *out)
+static int read_record(const struct unix_tx *tx, uint64_t consumed,
+    uint64_t published, uint64_t owner, size_t capacity, struct unix_read *out)
 {
-    if (out == NULL || !valid_owner(owner)) return -UX_EINVAL;
     *out = (struct unix_read){0};
-    int status = valid(tx, rx, generation);
-    if (status != 0) return status;
-    if ((status = lock(&rx->owner, owner)) != 0) return status;
-    const uint64_t consumed = acquire(&rx->consumed);
-    const uint64_t published = acquire(&tx->published);
     uint32_t used;
-    status = positions(published, consumed, &used);
-    if (status != 0) goto fail;
+    int status = positions(published, consumed, &used);
+    if (status != 0) return status;
     if ((consumed & UNIX_TRANSPORT_CLOSED) != 0 ||
         (used == 0 && (published & UNIX_TRANSPORT_CLOSED) != 0)) {
         out->eof = 1;
-        status = 0;
-        goto fail;
+        return 0;
     }
     if (capacity == 0 && tx->type == UNIX_TRANSPORT_STREAM) {
-        status = 0;
-        goto fail;
+        return 0;
     }
-    if (used == 0) { status = -UX_EAGAIN; goto fail; }
+    if (used == 0) return -UX_EAGAIN;
     const uint32_t start = (uint32_t)consumed;
     const uint32_t partial = (uint32_t)(consumed >> 32);
     const struct unix_record *shared = (const void *)(tx->data + (start & (UNIX_TRANSPORT_BYTES - 1u)));
@@ -205,8 +197,7 @@ int unix_transport_read_begin(const struct unix_tx *tx, struct unix_rx *rx,
         record_size(record.length) > used || partial > record.length ||
         (tx->type != UNIX_TRANSPORT_STREAM && partial != 0) ||
         (tx->type == UNIX_TRANSPORT_STREAM && record.length == 0)) {
-        status = -UX_EPROTO;
-        goto fail;
+        return -UX_EPROTO;
     }
     const uint32_t remaining = record.length - partial;
     const uint32_t count = capacity < remaining ? (uint32_t)capacity : remaining;
@@ -219,6 +210,7 @@ int unix_transport_read_begin(const struct unix_tx *tx, struct unix_rx *rx,
     *out = (struct unix_read){
         .spans = {{ tx->data + offset, first }, { tx->data, count - first }},
         .owner = owner, .before = consumed, .after = after,
+        .published_limit = published,
         /* Credentials apply to every part of a record. The broker releases
          * FD references at first consumption and retains only metadata for
          * the remaining bytes, so partial reads cannot duplicate rights. */
@@ -228,9 +220,43 @@ int unix_transport_read_begin(const struct unix_tx *tx, struct unix_rx *rx,
         .truncated = tx->type != UNIX_TRANSPORT_STREAM && count < remaining,
     };
     return 0;
-fail:
-    unlock(&rx->owner, owner, &rx->changes);
+}
+
+int unix_transport_read_begin(const struct unix_tx *tx, struct unix_rx *rx,
+    uint64_t generation, uint64_t owner, size_t capacity, struct unix_read *out)
+{
+    if (out == NULL || !valid_owner(owner)) return -UX_EINVAL;
+    *out = (struct unix_read){0};
+    int status = valid(tx, rx, generation);
+    if (status != 0) return status;
+    if ((status = lock(&rx->owner, owner)) != 0) return status;
+    status = read_record(tx, acquire(&rx->consumed), acquire(&tx->published),
+        owner, capacity, out);
+    if (status != 0 || out->owner == 0)
+        unlock(&rx->owner, owner, &rx->changes);
     return status;
+}
+
+int unix_transport_read_next(const struct unix_tx *tx, struct unix_rx *rx,
+    uint64_t generation, size_t capacity, struct unix_read *read)
+{
+    if (read == NULL) return -UX_EINVAL;
+    int status = valid(tx, rx, generation);
+    if (status != 0) return status;
+    if (tx->type != UNIX_TRANSPORT_STREAM) return -UX_EINVAL;
+    if (!capacity || !read->owner || read->eof || read->ticket ||
+        (read->after >> 32) != 0) return 0;
+    if (acquire(&rx->owner) != read->owner || acquire(&rx->consumed) != read->before)
+        return -UX_ESTALE;
+    struct unix_read next;
+    status = read_record(tx, read->after, read->published_limit,
+        read->owner, capacity, &next);
+    if (status == -UX_EAGAIN) return 0;
+    if (status != 0) return status;
+    if (next.eof || next.ticket) return 0;
+    next.before = read->before;
+    *read = next;
+    return 1;
 }
 
 int unix_transport_read_commit(struct unix_rx *rx, struct unix_read *read)

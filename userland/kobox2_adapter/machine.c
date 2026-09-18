@@ -8,6 +8,7 @@ struct ph_cpu {
     struct kobox_machine_domain domain;
     atomic_uint owner_lock;
     atomic_uint owner_sequence;
+    bool owner_waiting; /* Under owner_lock; native Linux entry is deferred. */
 
     /* Timer programming and expiry publication use a separate lock.
      * Lock order is timer_lock -> owner_lock, never the reverse. */
@@ -188,9 +189,11 @@ static int cpu_wait(uint32_t index, uint64_t observed, uint64_t *sequence_out) {
         unsigned owner_sequence = atomic_load_explicit(
             &cpu->owner_sequence, memory_order_acquire);
 
+        cpu->owner_waiting = true;
         ph_unlock(&cpu->owner_lock);
         ph_wait(&cpu->owner_sequence, owner_sequence);
         ph_lock(&cpu->owner_lock);
+        cpu->owner_waiting = false;
     }
     *sequence_out = atomic_load_explicit(&cpu->domain.sequence, memory_order_acquire);
     ph_unlock(&cpu->owner_lock);
@@ -228,10 +231,16 @@ static int cpu_notify(uint32_t index, enum kobox_linux_task_notification kind) {
     PH_OK(kobox_machine_domain_notify(&cpu->domain, notification_kind(kind)));
     struct ph_task *owner = cpu->domain.owner;
 
+    /* cpu_wait defers Linux entry until after releasing owner_lock. Its
+     * sequence-checked wait supplies the wake; mark the same deferred hint
+     * a native signal would set, without entering and returning from one.
+     * A running owner still needs an asynchronous signal. */
+    if (owner && cpu->owner_waiting)
+        atomic_store_explicit(&owner->notification_deferred, 1, memory_order_release);
     wake_cpu_waiters(cpu);
     /* Keep the owner locked through SIGNAL: it must not exit and lose its FD
      * between lookup and delivery. The domain retains the actual event count. */
-    if (owner != NULL) {
+    if (owner != NULL && !cpu->owner_waiting) {
         PH_OK(pacha_syscall2(PACHA_THREAD_SYSCALL_SIGNAL, owner->fd, PH_NOTIFICATION_SIGNAL));
     }
     ph_unlock(&cpu->owner_lock);

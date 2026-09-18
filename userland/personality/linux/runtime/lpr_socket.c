@@ -2176,6 +2176,15 @@ static int64_t lpr_linux_poll_wait(lpr_linux_pollfd_t *fds, uint64_t nfds, int64
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
         if (gui) lpr_gui_profile_span(LPR_GUI_POLL_BLOCK, gui_start, pacha_trace_read_tsc());
 #endif
+        if (status == LPR_WAIT_RESTART_SYSCALL) {
+            /* The graph has released its watches and pins. Deliver signals
+             * while ppoll's temporary mask is still active; delivery may
+             * abandon this stack. A spurious/early timeout wake must retain
+             * this deadline, not restart the syscall's full relative wait. */
+            status = lpr_linux_dispatch_pending_signals_with_result(-LPR_LINUX_EINTR);
+            if (status != 0) return status;
+            lpr_linux_deliver_native_pending_frame(-LPR_LINUX_EINTR);
+        }
         if (status != 0) return status;
     }
 }

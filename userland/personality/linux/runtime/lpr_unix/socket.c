@@ -130,11 +130,14 @@ static int ready(void *opaque)
     return status == -EBUSY ? 0 : status != 0 ? status : result;
 }
 
-void lpr_unix_copy_iov(const lpr_linux_iovec_t *vectors, unsigned count,
-    const struct unix_const_span spans[2], int writing)
+static void copy_iov_at(const lpr_linux_iovec_t *vectors, unsigned count,
+    const struct unix_const_span spans[2], int writing, uint64_t offset)
 {
     unsigned vector = 0;
-    uint64_t offset = 0;
+    while (vector < count && offset >= vectors[vector].len) {
+        offset -= vectors[vector].len;
+        vector++;
+    }
     for (unsigned i = 0; i < 2; i++) {
         unsigned char *shared = (void *)spans[i].base;
         size_t left = spans[i].length;
@@ -149,6 +152,12 @@ void lpr_unix_copy_iov(const lpr_linux_iovec_t *vectors, unsigned count,
             shared += bytes; left -= bytes; offset += bytes;
         }
     }
+}
+
+void lpr_unix_copy_iov(const lpr_linux_iovec_t *vectors, unsigned count,
+    const struct unix_const_span spans[2], int writing)
+{
+    copy_iov_at(vectors, count, spans, writing, 0);
 }
 
 static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
@@ -219,7 +228,13 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
             if (status == 0) {
                 {
                     UP_BEGIN(copy, UP_IO, socket->type * 2 + writing, UP_COPY);
-                    lpr_unix_copy_iov(vectors, count, read.spans, 0);
+                    uint64_t received = 0;
+                    do {
+                        copy_iov_at(vectors, count, read.spans, 0, received);
+                        received += read.length;
+                    } while (socket->type == UNIX_TRANSPORT_STREAM && received < length &&
+                        unix_transport_read_next(map->incoming_tx, map->incoming_rx,
+                            map->generation, length - received, &read) == 1);
                     UP_END(copy);
                     UP_BEGIN(commit, UP_IO, socket->type * 2 + writing, UP_COMMIT);
                     if (read.ticket) {
@@ -232,7 +247,7 @@ static int64_t io(const lpr_fd_pin_t *pin, const lpr_linux_iovec_t *vectors,
                         lpr_unix_credentials_output(ancillary, NULL, message_flags);
                     if (status == 0 && message_flags && read.truncated) *message_flags |= UX_TRUNC;
                     result = status ? status : (int64_t)((flags & UX_TRUNC) &&
-                        socket->type != UNIX_TRANSPORT_STREAM ? read.message_length : read.length);
+                        socket->type != UNIX_TRANSPORT_STREAM ? read.message_length : received);
                 }
             } else result = status;
         }

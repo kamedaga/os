@@ -10,17 +10,23 @@ enum { PH_LIFECYCLE_SERVICE_IDLE = 1 };
 
 struct ph_lifecycle_service {
     void *context;
-    /* Receiver-thread methods. prepare snapshots one packet; complete
-     * publishes its response; release retires all staging, also on errors. */
+    /* The receiver prepares the first request, then transfers exclusive
+     * IPC/staging ownership to the opening task. For a ring service that
+     * task also prepares subsequent requests until its bounded poll ends.
+     * release retires staging after completion, or failed preparation. */
     int (*prepare)(void *context, const struct ph_ipc_packet *packet);
-    int (*complete)(void *context, struct ph_ipc *ipc);
     int (*release)(void *context);
-    /* The only method running in the opening Linux task. */
+    /* Opening Linux task, in order: dispatch executes the request, then
+     * complete publishes its response without another thread handoff.
+     * The receiver does not touch staging or IPC during these callbacks;
+     * release follows on the same task before the next request is admitted. */
     int (*dispatch)(void *context, void *linux_service);
+    int (*complete)(void *context, struct ph_ipc *ipc);
     /* Optional ring service: next snapshots another available request, or
      * arms notifications and returns IDLE after an empty recheck. prepare
      * may also return IDLE for an establishment/duplicate wake packet.
-     * No work is inferred from notification counts. Both run on receiver.
+     * No work is inferred from notification counts. Both run only on the
+     * current exclusive staging owner, never from an IRQ callback.
      */
     int (*next)(void *context);
     /* After admission ends and no dispatch is active, including failures.

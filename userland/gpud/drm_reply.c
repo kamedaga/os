@@ -165,6 +165,8 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
         case KB2_GPU_DRM_MODE_COMMAND_SET_MASTER:
         case KB2_GPU_DRM_MODE_COMMAND_DROP_MASTER:
         case KB2_GPU_DRM_MODE_COMMAND_SET_CRTC:
+        case KB2_GPU_DRM_MODE_COMMAND_CURSOR:
+        case KB2_GPU_DRM_MODE_COMMAND_CURSOR2:
         case KB2_GPU_DRM_MODE_COMMAND_PAGE_FLIP:
         case KB2_GPU_DRM_MODE_COMMAND_DIRTY_FB:
         case KB2_GPU_DRM_MODE_COMMAND_REMOVE_FB:

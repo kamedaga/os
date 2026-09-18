@@ -18,6 +18,11 @@ static long fault_value;
 static size_t segment_head;
 static uint64_t source_kind;
 
+long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+    (void)nr; (void)a; (void)b; (void)c; (void)d;
+    abort(); /* Launch tests do not use blocking IPC receive. */
+}
+
 static void write16(unsigned char *at, uint16_t value) {
     at[0] = value; at[1] = value >> 8;
 }

@@ -74,7 +74,8 @@ int ph_ipc_receive(struct ph_ipc *ipc, uint64_t generation, struct ph_ipc_packet
             *packet = (struct ph_ipc_packet){.operation = 0x200, .generation = generation};
             return 0;
         }
-        if ((ring_mode == 2 && step == 1) || step == 5) {
+        if ((ring_mode == 2 && step == 1) ||
+            (ring_mode == 6 && step == 2) || step == 5) {
             *packet = (struct ph_ipc_packet){.operation = PH_LIFECYCLE_QUIESCE,
                 .generation = generation, .correlation = 99};
             return 0;
@@ -105,12 +106,14 @@ long ph_wait_readable(struct pacha_pollfd *descriptors, size_t count) {
 }
 
 static int prepare(void *context, const struct ph_ipc_packet *packet) {
+    assert(pthread_equal(pthread_self(), receiver));
     assert(context == &lifecycle && packet->operation == 0x200);
     ++prepared;
     return failure == 1 ? -EIO : 0;
 }
 
 static int dispatch(void *context, void *service) {
+    assert(!pthread_equal(pthread_self(), receiver));
     assert(context == &lifecycle && service == &task);
     ++dispatched;
     /* Duplicate notifications during work cannot claim the BUSY slot. */
@@ -122,13 +125,18 @@ static int dispatch(void *context, void *service) {
 }
 
 static int complete(void *context, struct ph_ipc *ipc) {
+    assert(!pthread_equal(pthread_self(), receiver));
     assert(context == &lifecycle && ipc->generation == 9);
     ++completed;
     assert(dispatched == completed);
+    assert(!lifecycle.port.pending(&lifecycle));
+    assert(released + 1 == completed);
     return failure == 3 ? -EIO : 0;
 }
 
 static int release(void *context) {
+    assert(!!pthread_equal(pthread_self(), receiver) ==
+        (failure == 1 || ring_mode == 3));
     assert(context == &lifecycle);
     ++released;
     return failure == 4 ? -EIO : 0;
@@ -154,6 +162,7 @@ static void run_case(int injected) {
         pthread_mutex_unlock(&lock);
         if (result != 2) break;
         result = lifecycle.port.dispatch(&lifecycle, &task);
+        if (injected == 3) assert(!result); /* Completion failure waits for cleanup. */
         if (result) break;
     }
     ph_lifecycle_finish(&lifecycle);
@@ -178,8 +187,10 @@ static int ring_prepare(void *context, const struct ph_ipc_packet *packet) {
 
 static int ring_next(void *context) {
     assert(context == &lifecycle);
-    if (ring_mode == 3) return -EIO;
+    if (ring_mode == 3 || (ring_mode == 7 && prepared == 1)) return -EIO;
     if (!ring_pending) return PH_LIFECYCLE_SERVICE_IDLE;
+    /* Only the first request needs the native receiver handoff. */
+    assert(!!pthread_equal(pthread_self(), receiver) == !prepared);
     --ring_pending;
     ++prepared;
     return 0;
@@ -210,15 +221,27 @@ static void run_ring_case(int mode) {
     assert(!lifecycle.port.ready(&lifecycle));
     int result;
     for (;;) {
-        pthread_mutex_lock(&lock);
-        while (!(result = lifecycle.port.pending(&lifecycle))) pthread_cond_wait(&changed, &lock);
-        pthread_mutex_unlock(&lock);
+        result = lifecycle.port.poll(&lifecycle);
+        if (!result) {
+            lifecycle.port.idle(&lifecycle);
+            pthread_mutex_lock(&lock);
+            while (!lifecycle.port.pending(&lifecycle)) pthread_cond_wait(&changed, &lock);
+            pthread_mutex_unlock(&lock);
+            continue;
+        }
         if (result != 2) break;
         assert(!lifecycle.port.dispatch(&lifecycle, &task));
     }
     ph_lifecycle_finish(&lifecycle);
     assert(ring_stops == 1);
-    if (mode == 2) {
+    if (mode == 6) {
+        assert(result == 1 && lifecycle.token == 99 && next_packet == 3);
+        assert(prepared == 1 && dispatched == 1 && completed == 1 && released == 1);
+        assert(ring_pending == 1); /* STOP preempts the next queued request. */
+    } else if (mode == 7) {
+        assert(result == -EIO && next_packet == 3);
+        assert(prepared == 1 && dispatched == 1 && completed == 1 && released == 2);
+    } else if (mode == 2) {
         assert(result == 1 && ring_pending == 2 && !dispatched && next_packet == 2);
     } else if (mode == 3) {
         assert(result == -EIO && !dispatched && released == 1 && next_packet == 2);
@@ -233,7 +256,7 @@ int main(void) {
     for (int repeat = 0; repeat < 32; ++repeat)
         for (int injected = 0; injected <= 5; ++injected) run_case(injected);
     for (int repeat = 0; repeat < 32; ++repeat)
-        for (int mode = 1; mode <= 5; ++mode) run_ring_case(mode);
+        for (int mode = 1; mode <= 7; ++mode) run_ring_case(mode);
     puts("native lifecycle dispatch: PASS publication, duplicate notifications, STOP ordering, failure cleanup");
     return 0;
 }

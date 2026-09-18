@@ -4,6 +4,7 @@
 tools/*
 !tools/build_wsl_alpine_clang.sh
 !tools/build_wsl_alpine_mesa.sh
+!tools/build_mesa_virgl.sh
 !tools/build_wsl_mesa_inventory.sh
 !tools/build_wsl_drm_prime_smoke.sh
 !tools/build_virtio_gpu_sysfs.sh

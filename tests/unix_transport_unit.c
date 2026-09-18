@@ -95,6 +95,65 @@ static void packet_rules(void)
     assert(tx->owner == 0);
 }
 
+static void stream_batch(void)
+{
+    reset(UNIX_TRANSPORT_STREAM);
+    tx->published = rx->consumed = UINT32_MAX - 63u;
+    send_bytes("abc", 3, 0);
+    send_bytes("defg", 4, 0);
+    struct unix_read read, competing;
+    char bytes[8] = {0};
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 6, &read) == 0);
+    const uint64_t before = rx->consumed;
+    read_copy(&read, bytes);
+    assert(unix_transport_read_next(tx, rx, generation, 3, &read) == 1);
+    assert(read.before == before && read.length == 3);
+    read_copy(&read, bytes + 3);
+    assert(memcmp(bytes, "abcdef", 6) == 0);
+    assert(rx->consumed == before); /* one commit for the whole read */
+    assert(unix_transport_read_begin(tx, rx, generation, 3, 8, &competing) == -EBUSY);
+    unix_transport_read_cancel(rx, &read); /* batched PEEK */
+    assert(rx->consumed == before);
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 8, &read) == 0);
+    assert(read.length == 3);
+    assert(unix_transport_read_next(tx, rx, generation, 8, &read) == 1);
+    assert(read.length == 4);
+    send_bytes("later", 5, 0);
+    assert(unix_transport_read_next(tx, rx, generation, 8, &read) == 0);
+    assert(unix_transport_read_commit(rx, &read) == 0);
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 8, &read) == 0);
+    assert(read.length == 5); /* publication after begin was not consumed */
+    assert(unix_transport_read_commit(rx, &read) == 0);
+}
+
+static void stream_batch_boundaries(void)
+{
+    reset(UNIX_TRANSPORT_STREAM);
+    send_bytes("plain", 5, 0);
+    send_bytes("rights", 6, 91);
+    send_bytes("tail", 4, 0);
+    struct unix_read read;
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 32, &read) == 0);
+    assert(unix_transport_read_next(tx, rx, generation, 27, &read) == 0);
+    assert(read.ticket == 0 && read.length == 5);
+    assert(unix_transport_read_commit(rx, &read) == 0);
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 32, &read) == 0);
+    assert(read.ticket == 91);
+    assert(unix_transport_read_next(tx, rx, generation, 26, &read) == 0);
+    assert(unix_transport_read_commit(rx, &read) == 0);
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 32, &read) == 0);
+    send_bytes("corrupt", 7, 0);
+    unix_transport_read_cancel(rx, &read);
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 32, &read) == 0);
+    struct unix_record *next = (void *)(tx->data + ((uint32_t)read.after & (UNIX_TRANSPORT_BYTES - 1)));
+    next->length = UINT32_MAX;
+    assert(unix_transport_read_next(tx, rx, generation, 28, &read) == -EPROTO);
+    assert(read.length == 4); /* valid prefix can still be committed */
+    assert(unix_transport_read_commit(rx, &read) == 0);
+    assert(unix_transport_read_begin(tx, rx, generation, 2, 32, &read) == -EPROTO);
+    assert(rx->owner == 0);
+}
+
 static void capacity_and_shutdown(void)
 {
     reset(UNIX_TRANSPORT_STREAM);
@@ -247,6 +306,8 @@ int main(void)
     rx = mmap(NULL, sizeof(*rx), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     assert(tx != MAP_FAILED && rx != MAP_FAILED);
     stream_and_wrap();
+    stream_batch();
+    stream_batch_boundaries();
     packet_rules();
     capacity_and_shutdown();
     death_at_commit();

@@ -1,0 +1,26 @@
+Subject: [PATCH] virgl: cache combined render-target and sampler-view resources
+
+Allow resources whose bind flags are exactly RENDER_TARGET | SAMPLER_VIEW
+to use the existing DRM winsys resource cache. Xorg/glamor rendering can
+otherwise repeatedly create and destroy these resources instead of reusing
+compatible idle ones.
+
+Keep the existing compatibility, busy-state and external-resource checks.
+Do not enable caching for SAMPLER_VIEW alone or arbitrary flag combinations,
+and do not change submission or completion tracking.
+
+Target: Mesa 25.1.9.
+Measurements and limitations: pacha_docs/mesa-virgl-resource-cache.md in
+the PachaOS repository. This is a local patch, not an upstream submission.
+
+diff --git a/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c b/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
+--- a/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
++++ b/src/gallium/winsys/virgl/drm/virgl_drm_winsys.c
+@@ -65,6 +65,7 @@ static inline bool can_cache_resource(uint32_t bind)
+           bind == VIRGL_BIND_STAGING ||
+           bind == VIRGL_BIND_DEPTH_STENCIL ||
+           bind == VIRGL_BIND_RENDER_TARGET ||
++          bind == (VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW) ||
+           bind == 0;
+ }
+ 

@@ -22,7 +22,7 @@ enum { IPC_TEST_READY = 1, IPC_TEST_SHARE, IPC_TEST_RETURN, IPC_TEST_MOVE, IPC_T
     IPC_TEST_BOOTSTRAP_DONE, IPC_TEST_PACKAGE_SNAPSHOT, IPC_TEST_PACKAGE_MUTATED,
     IPC_TEST_PACKAGE_REJECTED };
 enum { IPC_TEST_NORMAL, IPC_TEST_STALE, IPC_TEST_BOOTSTRAP, IPC_TEST_BOOTSTRAP_BAD_ORDER,
-    IPC_TEST_PACKAGE, IPC_TEST_PACKAGE_CORRUPT, IPC_TEST_PACKAGE_OLD_GRANT };
+    IPC_TEST_TIMED, IPC_TEST_PACKAGE, IPC_TEST_PACKAGE_CORRUPT, IPC_TEST_PACKAGE_OLD_GRANT };
 #define IPC_TEST_BOOTSTRAP_ARTIFACTS 20u
 #define IPC_TEST_BOOTSTRAP_RESOURCES 3u
 #define IPC_TEST_BOOTSTRAP_ITEMS (2u + IPC_TEST_BOOTSTRAP_ARTIFACTS + IPC_TEST_BOOTSTRAP_RESOURCES)
@@ -100,7 +100,7 @@ static inline uint64_t ipc_test_now(void) {
 static inline int ipc_test_receive(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
     uint64_t deadline = ipc_test_now() + UINT64_C(5000000000);
     int result;
-    while ((result = ph_ipc_receive(ipc, ipc->generation, packet)) == -EAGAIN)
+    while ((result = ph_ipc_receive_wait(ipc, ipc->generation, packet, 5000)) == -EAGAIN)
         IPC_CHECK(ipc_test_now() < deadline);
     return result;
 }

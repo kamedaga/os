@@ -463,6 +463,7 @@ static int mode_plan(struct command_plan *plan,
         memcpy(&mapping, request->data, sizeof(mapping));
         if (!mapping.handle || mapping.pad)
             return -EINVAL;
+        out->mapping_handle = mapping.handle;
         plan->id = KB2_GPU_DRM_MODE_COMMAND_MAP_DUMB;
         plan->record = KB2_GPU_DRM_MODE_RECORD_MAP_REQUEST;
         plan->size = KB2_GPU_DRM_MODE_RECORD_MAP_REQUEST_SIZE;
@@ -589,6 +590,39 @@ static int mode_plan(struct command_plan *plan,
                 .rights = KB2_GPU_SPAN_RIGHT_READ,
                 .record_schema_id = KB2_GPU_DRM_MODE_RECORD_MODE_INFO,
                 .element_count = 1, .flags = KB2_GPU_SPAN_FLAG_INPUT};
+        }
+        return 0;
+    }
+    case GPUD_DRM_IOCTL_MODE_CURSOR:
+    case GPUD_DRM_IOCTL_MODE_CURSOR2: {
+        const int cursor2 = request->request == GPUD_DRM_IOCTL_MODE_CURSOR2;
+        gpud_drm_mode_cursor2_t value = {0};
+        const size_t size = cursor2 ? sizeof(value) : sizeof(value.cursor);
+        if (request->arg_size != size || request->data_size != size)
+            return -EINVAL;
+        memcpy(&value, request->data, size);
+        const gpud_drm_mode_cursor_t *cursor = &value.cursor;
+        if (!cursor->crtc_id || !cursor->flags ||
+            (cursor->flags & ~(GPUD_DRM_MODE_CURSOR_BO |
+                              GPUD_DRM_MODE_CURSOR_MOVE)))
+            return -EINVAL;
+        plan->id = cursor2 ? KB2_GPU_DRM_MODE_COMMAND_CURSOR2 :
+            KB2_GPU_DRM_MODE_COMMAND_CURSOR;
+        plan->record = cursor2 ? KB2_GPU_DRM_MODE_RECORD_CURSOR2_REQUEST :
+            KB2_GPU_DRM_MODE_RECORD_CURSOR_REQUEST;
+        plan->size = cursor2 ? KB2_GPU_DRM_MODE_RECORD_CURSOR2_REQUEST_SIZE :
+            KB2_GPU_DRM_MODE_RECORD_CURSOR_REQUEST_SIZE;
+        write_u64(plan->data, 1);
+        write_u32(plan->data + 8, cursor->flags);
+        write_u32(plan->data + 12, cursor->crtc_id);
+        write_u32(plan->data + 16, (uint32_t)cursor->x);
+        write_u32(plan->data + 20, (uint32_t)cursor->y);
+        write_u32(plan->data + 24, cursor->width);
+        write_u32(plan->data + 28, cursor->height);
+        write_u32(plan->data + 32, cursor->handle);
+        if (cursor2) {
+            write_u32(plan->data + 36, (uint32_t)value.hot_x);
+            write_u32(plan->data + 40, (uint32_t)value.hot_y);
         }
         return 0;
     }
@@ -757,6 +791,7 @@ static int virtgpu_plan(
             read_u64(request->data) || !read_u32(request->data + 8) ||
             read_u32(request->data + 12))
             return -EINVAL;
+        out->mapping_handle = read_u32(request->data + 8);
         plan->id = KB2_GPU_DRM_VIRTGPU_COMMAND_MAP;
         plan->record = KB2_GPU_DRM_VIRTGPU_RECORD_MAP_REQUEST;
         plan->size = KB2_GPU_DRM_VIRTGPU_RECORD_MAP_REQUEST_SIZE;

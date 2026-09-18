@@ -125,7 +125,9 @@ pub const invalid_dma_device_id: DmaDeviceId = 0;
 pub const Fd = u32;
 pub const fd_table_entries: usize = 256;
 pub const fd_table_limit: usize = 4096;
-pub const max_fd_objects: usize = 4096;
+// Shared by all processes, unlike the per-process descriptor limit above.
+// Leave room for a driver's live DMA objects alongside desktop services.
+pub const max_fd_objects: usize = 8192;
 pub const max_pipes: usize = 256;
 pub const pipe_buffer_bytes: usize = 4096;
 pub const fd_known_flags_mask: u32 = (@as(u32, 1) << 4) - 1;

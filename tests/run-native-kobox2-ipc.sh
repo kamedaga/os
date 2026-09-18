@@ -47,7 +47,8 @@ sha256sum "$repo_root/userland/kobox2_adapter/ipc.c" \
 qemu-system-x86_64 -machine q35 -cpu host -enable-kvm -m 2G -smp 2 \
   -device intel-iommu,intremap=off,aw-bits=48 \
   -drive "file=$out/boot.img,format=raw,if=ide" -display none \
-  -serial "file:$out/serial.log" -monitor none -no-reboot -net none >"$out/qemu.log" 2>&1 &
+  -serial "file:$out/serial.log" -monitor none -no-reboot \
+  -netdev user,id=net0 -device virtio-net-pci,netdev=net0 >"$out/qemu.log" 2>&1 &
 qemu_pid=$!
 stop_qemu() {
   if kill -0 "$qemu_pid" 2>/dev/null; then kill "$qemu_pid"; fi
@@ -62,6 +63,7 @@ done
 stop_qemu
 trap - EXIT
 if ! rg -q 'NATIVE_KOBOX2_IPC=PASS' "$out/serial.log" || \
+   ! rg -q 'NATIVE_KOBOX2_IPC_TIMED=PASS' "$out/serial.log" || \
    ! rg -q 'NATIVE_GPUD_PROCESS=PASS' "$out/serial.log" || \
    ! rg -q 'NATIVE_GPUD_LAUNCH=PASS' "$out/serial.log" || \
    ! rg -q 'NATIVE_GPUD_LAUNCH_ABORT=PASS' "$out/serial.log" || \

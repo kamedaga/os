@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const kernel_log = @import("../kernel_log.zig");
 const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
@@ -131,7 +133,9 @@ const vmoBackingPageStorePaddr = types.vmoBackingPageStorePaddr;
 const setVmoBackingPageStorePaddr = types.setVmoBackingPageStorePaddr;
 const freeVmoBackingPageStore = types.freeVmoBackingPageStore;
 const resetVmoBackingPageStore = types.resetVmoBackingPageStore;
-const kernelStaticStorageEndAddr = types.kernelStaticStorageEndAddr;
+pub fn kernelStaticStorageEndAddr() usize {
+    return @max(types.kernelStaticStorageEndAddr(), @max(@intFromPtr(&object_full_reports) + @sizeOf(usize), @intFromPtr(&fd_full_reports) + @sizeOf(usize)));
+}
 const runtimeStorageBytes = types.runtimeStorageBytes;
 const initRuntimeStorage = types.initRuntimeStorage;
 
@@ -398,6 +402,23 @@ pub fn resetNativeVmoTable(self: anytype) void {
     self.next_native_vmo_scan = 0;
 }
 
+// Temporary exhaustion diagnostic. Only failure paths scan and log; the
+// state lock serializes these reports with object and FD table mutation.
+var object_full_reports: usize = 0;
+var fd_full_reports: usize = 0;
+
+fn reportObjectTableFull(self: anytype, requested: KernelObjectKind) void {
+    if (builtin.is_test or object_full_reports >= 4) return;
+    object_full_reports += 1;
+    var counts = [_]usize{0} ** @typeInfo(KernelObjectKind).@"enum".fields.len;
+    for (self.fd_objects[0..]) |*slot| counts[@intFromEnum(slot.kind)] += 1;
+    kernel_log.writeFmt("fd: object-table-full requested={s} capacity={}\n", .{ @tagName(requested), max_fd_objects });
+    for (counts, 0..) |count, kind| {
+        if (count == 0) continue;
+        kernel_log.writeFmt("fd: occupied kind={s} count={}\n", .{ @tagName(@as(KernelObjectKind, @enumFromInt(kind))), count });
+    }
+}
+
 pub fn createKernelObject(
     self: anytype,
     kind: KernelObjectKind,
@@ -424,6 +445,7 @@ pub fn createKernelObject(
             .generation = slot.generation,
         };
     }
+    reportObjectTableFull(self, kind);
     return KernelError.TableFull;
 }
 
@@ -1152,7 +1174,17 @@ pub fn installFd(
     min_fd: Fd,
 ) KernelError!Fd {
     const table = try self.fdTableForActiveProcess(owner);
-    const index = @TypeOf(self.*).findFreeFd(table, min_fd) orelse return KernelError.TableFull;
+    const index = @TypeOf(self.*).findFreeFd(table, min_fd) orelse {
+        if (!builtin.is_test and fd_full_reports < 4) {
+            fd_full_reports += 1;
+            var free_slots: usize = 0;
+            for (table.slots()) |entry| {
+                if (entry.object.isNull()) free_slots += 1;
+            }
+            kernel_log.writeFmt("fd: process-table-full owner={} kind={s} capacity={} free={} min={}\n", .{ @intFromEnum(owner), @tagName(object_ref.kind), table.slots().len, free_slots, min_fd });
+        }
+        return KernelError.TableFull;
+    };
     try self.retainKernelObject(object_ref);
     table.slots()[index] = .{
         .object = object_ref,

@@ -153,6 +153,9 @@ apps:
       rebuild: ["bash", "tools/build_wsl_alpine_mesa.sh"]
       input:
         - "tools/build_wsl_alpine_mesa.sh"
+        - "tools/build_mesa_virgl.sh"
+        - "patches/mesa/0001-virgl-cache-render-target-sampler-view.patch"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
     out: "MESAROOT"
     rootfs: "/"
   alpine_input:
@@ -190,6 +193,10 @@ apps:
         - "tools/copy_lpr_linux_musl.sh"
     out: "XFCEROOT"
     rootfs: "/"
+  xfwm4_defaults:
+    file: "userland/fixtures/linux/xfwm4-defaults.xml"
+    out: "XFWM4.XML"
+    rootfs: "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
   pine2_gtk:
     file:
       path: ".artifacts/userland-fixtures/pine2-gtk-root"

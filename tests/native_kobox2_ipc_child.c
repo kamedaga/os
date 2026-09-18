@@ -113,6 +113,25 @@ int main(void) {
     IPC_CHECK(ipc_test_used_fds() == 17); /* Reserved slots + channel only. */
     IPC_CHECK(!ph_ipc_init(&ipc, IPC_TEST_CHILD_FD, generation));
     ipc_test_send(&ipc, &packet);
+    if (config->mode == IPC_TEST_TIMED) {
+        packet = (struct ph_ipc_packet){0};
+        IPC_CHECK(!ipc_test_receive(&ipc, &packet));
+        uint64_t until = ipc_test_now() + UINT64_C(20000000);
+        while (ipc_test_now() < until) __asm__ volatile("pause");
+        long fd = pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE,
+            IPC_TEST_PAGE, IPC_TEST_VMO_RIGHTS, 0);
+        IPC_CHECK(fd >= 16);
+        packet = (struct ph_ipc_packet){.operation = IPC_TEST_RETURN,
+            .generation = generation, .fd_count = 1,
+            .fds = {{.fd = (uint64_t)fd, .rights = IPC_TEST_VMO_RIGHTS,
+                .transfer_flags = PACHA_IPC_TRANSFER_MOVE}}};
+        ipc_test_send(&ipc, &packet);
+        packet = (struct ph_ipc_packet){0};
+        IPC_CHECK(!ipc_test_receive(&ipc, &packet));
+        until = ipc_test_now() + UINT64_C(20000000);
+        while (ipc_test_now() < until) __asm__ volatile("pause");
+        return 0; /* Actual process exit closes the last peer reference. */
+    }
     if (config->mode >= IPC_TEST_PACKAGE) return package_round(&ipc, config);
     if (config->mode == IPC_TEST_BOOTSTRAP || config->mode == IPC_TEST_BOOTSTRAP_BAD_ORDER)
         return bootstrap_round(&ipc, config->mode);

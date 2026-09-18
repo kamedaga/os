@@ -33,7 +33,9 @@ cmake -E remove "$build_dir/seed0root.elf"
   >"$out/build-client.log" 2>&1
 "$pacgo" build userland lpr_mesa_cube_smoke --no-rootfs \
   >"$out/build-mesa.log" 2>&1
-"$pacgo" sync rootfs --force >"$out/rootfs.log" 2>&1
+if [[ "${SKIP_SYNC:-0}" != "1" ]]; then
+  "$pacgo" sync rootfs --force >"$out/rootfs.log" 2>&1
+fi
 "$pacgo" sync bootfs --no-build >"$out/bootfs.log" 2>&1
 
 GALLIUM_DRIVER="${VIRGL_HOST_DRIVER:-d3d12}" \

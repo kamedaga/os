@@ -1217,8 +1217,10 @@ func appendGraphicsDeviceArgs(args []string, profile string, display string) ([]
 		} else if !strings.Contains(display, "gl=") {
 			display += ",gl=on"
 		}
+		// Let KVM deliver queue kicks through eventfd. Synchronous MMIO
+		// otherwise stalls the guest behind the renderer's main-loop lock.
 		return append(args,
-			"-device", "virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,id=pachagpu"), display, nil
+			"-device", "virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,ioeventfd=on,id=pachagpu"), display, nil
 	default:
 		return nil, "", fmt.Errorf("invalid graphics profile %q; expected 2d or virgl", profile)
 	}

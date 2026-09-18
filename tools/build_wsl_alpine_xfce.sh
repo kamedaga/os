@@ -183,6 +183,30 @@ if ! cmp -s "${tmp}/locked-packages" "${tmp}/installed-packages"; then
   exit 1
 fi
 
+# Mesa owns the one approved, rebuilt Gallium library. The desktop APK
+# transaction above installs its original copy; use the verified Mesa build
+# before dependency checks and strict overlay deduplication. All other
+# collisions must still match byte-for-byte.
+require_locked mesa 25.1.9-r0
+gallium="usr/lib/libgallium-25.1.9.so"
+mesa_record="${mesa_root}/usr/share/pacha/mesa-virgl-build.txt"
+mesa_patch="${repo_root}/patches/mesa/0001-virgl-cache-render-target-sampler-view.patch"
+[[ -f "${runtime}/${gallium}" && -f "${mesa_root}/${gallium}" && -f "${mesa_record}" ]] || {
+  echo "missing locked Mesa Gallium library or build provenance" >&2
+  exit 1
+}
+grep -Fxq "$(sha256sum "${mesa_patch}")" "${mesa_record}" || {
+  echo "shared Mesa does not record the approved cache patch" >&2
+  exit 1
+}
+mesa_digest="$(awk '$2 ~ /\/libgallium-25[.]1[.]9[.]so$/ { print $1 }' "${mesa_record}")"
+[[ "${mesa_digest}" =~ ^[0-9a-f]{64}$ ]] &&
+  echo "${mesa_digest}  ${mesa_root}/${gallium}" | sha256sum -c --status || {
+    echo "shared Mesa Gallium library differs from its build record" >&2
+    exit 1
+  }
+install -m 0755 "${mesa_root}/${gallium}" "${runtime}/${gallium}"
+
 # apk's build-time transaction leaves its process lock behind.  A lock is
 # runtime state, not package database content; shipping it also makes the first
 # guest transaction depend on the build host's file mode and ownership.  Let

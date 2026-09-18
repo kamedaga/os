@@ -61,6 +61,24 @@ typedef struct gpud_drm_ioctl_request {
     uint8_t data[GPUD_DRM_IOCTL_DATA_BYTES];
 } gpud_drm_ioctl_request_t;
 
+/* Small, pointer-free ioctl payloads fit in native IPC words; no VMO or client
+ * capability is transferred. The kernel supplies the one-shot reply capability.
+ * Request: magic, DRM handle, ioctl number, up to eight argument bytes.
+ * Reply: magic, signed status, echoed ioctl number, up to eight output bytes.
+ * The reply capability correlates calls (including concurrent calls).
+ * Large/translated payloads and ancillary FDs retain the page transport.
+ * Both transports use the same DRM validation and execution below gpud. */
+#define GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC UINT64_C(0x3151494d52444850)
+#define GPUD_DRM_INLINE_IOCTL_REPLY_MAGIC UINT64_C(0x3150494d52444850)
+
+static inline int gpud_drm_ioctl_can_inline(const gpud_drm_ioctl_request_t *request)
+{
+    const uint64_t size = (request->request >> 16) & 0x3fffu;
+    return request->request <= UINT32_MAX && size <= sizeof(uint64_t) &&
+        request->arg_size == size && request->data_size == size &&
+        !request->aux_size && !request->fd_flags && !request->reserved0;
+}
+
 typedef struct gpud_drm_mmap_request {
     uint64_t handle;
     uint64_t length;

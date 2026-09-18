@@ -30,6 +30,7 @@ GALLIUM_DRIVER="${VIRGL_HOST_DRIVER:-d3d12}" \
   --expect 'exec=1' \
   --expect 'resource=1' \
   --expect 'mmap=1' \
+  --expect 'DRM_MAP_CHURN_OK iterations=96 gem_close_vma_alive=1' \
   --expect 'poll=1 read=1' \
   --expect 'dup=1 fork_lease=1 last_close=1 client_kill=1 reopen_client=1' \
   --expect '[gpud] drm client-hangup' \

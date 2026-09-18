@@ -32,7 +32,7 @@ struct gpud_drm_translation {
     size_t staged_input_size;
     unsigned char staged_input[GPUD_DRM_STAGED_INPUT_BYTES];
     uint64_t mapping_id, mapping_length, mapping_exchange;
-    uint32_t mapping_rights, mapping_cache_policy;
+    uint32_t mapping_rights, mapping_cache_policy, mapping_handle;
 };
 
 /* Frontend only; never link this gpud DRM service ABI into the GPL core.

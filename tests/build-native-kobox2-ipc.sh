@@ -15,7 +15,7 @@ make -C "$out/musl" -f "$repo_root/musl/upstream/Makefile" \
   obj/src/stdlib/qsort.o obj/src/stdlib/qsort_nr.o
 sandbox="$repo_root/kobox2/linux-sandbox/kobox"
 protocol="$repo_root/kobox2/protocol"
-core="$repo_root/.artifacts/kobox2-memory-reclaim-runtime/linux-boot-runtime.so"
+core="$repo_root/.artifacts/gpud-production-runtime/linux-boot-runtime.so"
 module="$repo_root/.artifacts/kobox2-pacha-device-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko"
 sha256sum "$core" "$module" >"$out/package-inputs.sha256"
 python3 "$repo_root/tests/check-kobox2-pacha-modules.py" --profile virtio \

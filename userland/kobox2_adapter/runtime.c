@@ -161,12 +161,23 @@ void ph_wake(atomic_uint *word) {
 }
 
 void ph_lock(atomic_uint *lock) {
-    while (atomic_exchange_explicit(lock, 1, memory_order_acquire) != 0) {
-        ph_wait(lock, 1);
+    /* 0: free, 1: owned without known waiters, 2: owned with possible waiters.
+     * A failed fast path must not erase another waiter's state. */
+    unsigned expected = 0;
+    if (atomic_compare_exchange_strong_explicit(lock, &expected, 1,
+            memory_order_acquire, memory_order_relaxed)) {
+        return;
+    }
+    /* Keep state 2 when acquiring after contention, so our unlock also wakes
+     * sleepers left behind by another owner. The futex expected-value check
+     * handles release between publishing state 2 and entering the kernel. */
+    while (atomic_exchange_explicit(lock, 2, memory_order_acquire) != 0) {
+        ph_wait(lock, 2);
     }
 }
 
 void ph_unlock(atomic_uint *lock) {
-    atomic_store_explicit(lock, 0, memory_order_release);
-    ph_wake(lock);
+    if (atomic_exchange_explicit(lock, 0, memory_order_release) == 2) {
+        ph_wake(lock);
+    }
 }

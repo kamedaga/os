@@ -23,7 +23,7 @@ enum {
 
 struct gpud_drm_mapping {
     uint64_t id, exchange, handle, length;
-    uint32_t rights, cache_policy;
+    uint32_t rights, cache_policy, gem_handle;
     int view_fd;
     unsigned int owner_closed;
 };

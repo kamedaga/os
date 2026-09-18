@@ -161,6 +161,21 @@ pub fn wakeThreadTargets(
         // before touching userspace, while the scheduler claim keeps the
         // target non-runnable and excludes timeout/signal completion.
         state.cancelFdWaitGroup(target.group, target.wait_token);
+        if (target.recv_msg_va != 0) {
+            // No message was dequeued by this generic wake path. In
+            // particular, peer death must not masquerade as RECV success.
+            _ = scheduler.publishClaimedWaitCompletion(
+                target.thread_index,
+                target.thread_generation,
+                target.owner,
+                target.wait_token,
+                if ((target.revents & fd_abi.event_hangup) != 0)
+                    sc.syscall_err_closed
+                else
+                    sc.syscall_err_not_ready,
+            );
+            continue;
+        }
         var ready_count: u64 = 0;
         var copy_ok = true;
         for (targets, 0..) |member, member_index| {

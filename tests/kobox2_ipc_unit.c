@@ -11,6 +11,14 @@ static long info_status, send_status, recv_status;
 static unsigned int inspections, sends, receives, closes[PACHA_FD_TABLE_LIMIT];
 static unsigned int close_fail_fd;
 static int copyout_failure;
+static uint64_t waited_ticks;
+
+long pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address,
+    uint64_t timeout, uint64_t flags) {
+    assert(nr == PACHA_IPC_SYSCALL_RECV_WAIT && timeout && !flags);
+    waited_ticks = timeout;
+    return pacha_syscall2(PACHA_IPC_SYSCALL_RECV, fd, address);
+}
 
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
     assert(nr == PACHA_FD_SYSCALL_CLOSE && valid_fd(fd));
@@ -149,6 +157,12 @@ static void receiving(void) {
     recv_status = PACHA_SYSCALL_ERR_EMPTY;
     assert(ph_ipc_receive(&ipc, 7, &out) == -EAGAIN);
     assert(!memcmp(&out, &before, sizeof(out)));
+    recv_status = PACHA_SYSCALL_ERR_NOT_READY;
+    assert(ph_ipc_receive_wait(&ipc, 7, &out, 25) == -EAGAIN);
+    assert(waited_ticks == 25 && !memcmp(&out, &before, sizeof(out)));
+    recv_status = PACHA_SYSCALL_ERR_CLOSED;
+    assert(ph_ipc_receive_wait(&ipc, 7, &out, UINT64_MAX) == -EPIPE);
+    assert(waited_ticks == UINT64_MAX && !memcmp(&out, &before, sizeof(out)));
     recv_status = PACHA_SYSCALL_ERR_ALLOC;
     assert(ph_ipc_receive(&ipc, 7, &out) == -ENOMEM);
     copyout_failure = 1;
@@ -157,7 +171,8 @@ static void receiving(void) {
     copyout_failure = 0; recv_status = 0;
     unsigned int calls = receives;
     assert(ph_ipc_receive(&ipc, 6, &out) == -ESTALE && receives == calls);
-    assert(!ph_ipc_receive(&ipc, 7, &out));
+    assert(!ph_ipc_receive_wait(&ipc, 7, &out, 5000));
+    assert(waited_ticks == 5000);
     assert(!memcmp(&out, &incoming, sizeof(out)) && !ipc.rejected.fd_count);
     calls = receives;
     assert(ph_ipc_receive(&ipc, 7, &out) == -EBUSY && receives == calls);
