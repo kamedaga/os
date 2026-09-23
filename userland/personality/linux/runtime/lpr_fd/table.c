@@ -445,6 +445,15 @@ int lpr_fd_table_dup(
     uint16_t new_fd_flags,
     lpr_linux_fd_t *out_fd)
 {
+    return lpr_fd_table_dup_excluding(table, old_fd, min_fd, new_fd_flags,
+        0, 0, out_fd);
+}
+
+int lpr_fd_table_dup_excluding(lpr_fd_table_t *table,
+    lpr_linux_fd_t old_fd, lpr_linux_fd_t min_fd, uint16_t new_fd_flags,
+    const lpr_linux_fd_t *excluded, uint32_t excluded_count,
+    lpr_linux_fd_t *out_fd)
+{
     lpr_fd_table_lock(table);
     const lpr_fd_entry_t *old_entry = lpr_fd_entry_const(table, old_fd);
     lpr_ofd_t *ofd = lpr_fd_ofd_for_entry(table, old_entry);
@@ -456,6 +465,9 @@ int lpr_fd_table_dup(
         return -1;
     }
     for (lpr_linux_fd_t fd = min_fd; fd < table->entry_count; fd++) {
+        uint32_t i = 0;
+        while (i < excluded_count && excluded[i] != fd) ++i;
+        if (i != excluded_count) continue;
         if (!table->entries[fd].active) {
             table->entries[fd] = *old_entry;
             table->entries[fd].fd_flags = new_fd_flags;
@@ -468,6 +480,38 @@ int lpr_fd_table_dup(
     }
     lpr_fd_table_unlock(table);
     return -1;
+}
+
+int lpr_fd_table_dup_replace(lpr_fd_table_t *table,
+    lpr_linux_fd_t old_fd, lpr_linux_fd_t new_fd, uint16_t flags,
+    lpr_fd_drop_t *drop)
+{
+    if (!drop) return -1;
+    lpr_fd_zero(drop, sizeof(*drop));
+    lpr_fd_table_lock(table);
+    const lpr_fd_entry_t *old_entry = lpr_fd_entry_const(table, old_fd);
+    lpr_fd_entry_t *target = lpr_fd_entry(table, new_fd);
+    lpr_ofd_t *source = lpr_fd_ofd_for_entry(table, old_entry);
+    lpr_ofd_t *displaced = lpr_fd_ofd_for_entry(table, target);
+    if (!old_entry || !target || !source || source->closing ||
+        !(old_entry->effective_rights & LPR_FD_RIGHT_DUP) ||
+        target->active == 2 || (target->active && (!displaced || displaced->closing))) {
+        lpr_fd_table_unlock(table);
+        return -1;
+    }
+    if (old_fd != new_fd) {
+        /* Increment first: source and destination may name the same OFD. */
+        ++source->refcount;
+        *target = *old_entry;
+        target->fd_flags = flags;
+        if (displaced && --displaced->refcount == 0) {
+            displaced->closing = 1;
+            if (!displaced->pin_count) lpr_fd_prepare_drop(table, displaced, drop);
+        }
+        (void)lpr_fd_next_generation(table);
+    }
+    lpr_fd_table_unlock(table);
+    return 0;
 }
 
 int lpr_fd_table_dup_at(

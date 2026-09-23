@@ -76,9 +76,9 @@ static int path_open(filed_runtime_t *runtime, struct filed_unix_path *request)
     status = (int)filed_dispatch_stat_page(runtime, &stat).status;
     if (status == 0 && (stat.kind & 0170000u) != 0140000u) status = -111;
     filed_vnode_t *vnode = NULL;
-    for (unsigned i = 0; i < FILED_MAX_VNODES; i++) {
-        if (runtime->vfs.vnodes[i].active && runtime->vfs.vnodes[i].id == opened.vnode_id) {
-            vnode = &runtime->vfs.vnodes[i]; break;
+    for (unsigned i = 0; i < runtime->vfs.vnode_capacity; i++) {
+        if (filed_vfs_vnode_at(&runtime->vfs, i)->active && filed_vfs_vnode_at(&runtime->vfs, i)->id == opened.vnode_id) {
+            vnode = filed_vfs_vnode_at(&runtime->vfs, i); break;
         }
     }
     if (status == 0 && (!vnode || !stat.inode_number)) status = -5;

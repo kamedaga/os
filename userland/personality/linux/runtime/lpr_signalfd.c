@@ -1,4 +1,5 @@
 #include "lpr_filed_internal.h"
+#include "lpr_fd/allocate.h"
 
 #define LPR_SIGNALFD_CLOEXEC 02000000ull
 #define LPR_SIGNALFD_NONBLOCK 00004000ull
@@ -153,26 +154,23 @@ int64_t lpr_linux_signalfd4(
         return requested_fd;
     }
 
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) {
-        return fd;
-    }
     int wait_fd = -1;
     int notify_fd = -1;
     const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
     if (pair_status != 0) {
         return pair_status;
     }
-    const int install_status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_EVENT,
-        flags,
-        0,
-        mask);
-    if (install_status != 0) {
+    const lpr_event_backend_t record = {
+        .active = 1, .subtype = LPR_EVENT_BACKEND_SIGNALFD,
+        .flags = (uint32_t)flags, .counter = mask,
+        .wait_fd.raw = wait_fd, .notify_fd.raw = notify_fd,
+    };
+    const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EVENT, flags, mask,
+        &record, sizeof(record));
+    if (fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
-        return install_status;
+        return fd;
     }
     lpr_event_backend_t *event =
         lpr_event_backend((uint64_t)(uint32_t)fd);
@@ -182,12 +180,6 @@ int64_t lpr_linux_signalfd4(
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
         return -LPR_LINUX_EIO;
     }
-    event->active = 1;
-    event->subtype = LPR_EVENT_BACKEND_SIGNALFD;
-    event->flags = (uint32_t)flags;
-    event->counter = mask;
-    event->wait_fd.raw = wait_fd;
-    event->notify_fd.raw = notify_fd;
     lpr_signalfd_refresh_mask();
     const int64_t sync_status = lpr_linux_sync_native_signal_mask();
     if (sync_status != 0) {

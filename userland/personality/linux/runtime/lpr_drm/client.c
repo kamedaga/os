@@ -1,4 +1,7 @@
 #include "../lpr_filed_internal.h"
+#include "dmabuf.h"
+#include "../support/unmap_profile.h"
+#include "../../../../../kobox2/linux-sandbox/kobox/boot/drm_limits.h"
 
 enum {
     LPR_DRM_IOCTL_VERSION = 0xc0406400u,
@@ -80,12 +83,18 @@ typedef struct lpr_drm_event_cookie {
 
 static volatile uint32_t lpr_drm_event_cookie_lock;
 static volatile uint64_t lpr_drm_event_token_counter;
+/* Owned with the cached tty/DRM wire page under termd_rpc.lock_word. */
+static int lpr_drm_request_channel_fd;
+static int lpr_drm_aux_cache_fd;
+static void *lpr_drm_aux_cache;
+static int lpr_drm_aux_cache_busy;
 static lpr_drm_event_cookie_t
     lpr_drm_event_cookies[LPR_DRM_EVENT_COOKIE_CAPACITY];
 
 enum {
-    LPR_DRM_MAPPING_LEASE_CAPACITY = 64u,
-    LPR_DRM_MAPPING_FRAGMENT_CAPACITY = 128u,
+    LPR_DRM_MAPPING_LEASE_CAPACITY =
+        KOBOX_DRM_MAPPING_LIMIT + KOBOX_DRM_PRIME_LIMIT,
+    LPR_DRM_MAPPING_FRAGMENT_CAPACITY = 2 * LPR_DRM_MAPPING_LEASE_CAPACITY,
 };
 
 typedef struct lpr_drm_mapping_lease {
@@ -193,7 +202,7 @@ void lpr_drm_mapping_unmapped(uint64_t address, uint64_t length)
     lpr_state_unlock(&lpr_drm_mapping_lock);
 }
 
-void lpr_drm_mapping_remapped(
+static void lpr_drm_mapping_remapped_locked(
     uint64_t old_address, uint64_t old_length,
     uint64_t new_address, uint64_t new_length)
 {
@@ -203,7 +212,6 @@ void lpr_drm_mapping_remapped(
         old_address > UINT64_MAX - old_length ||
         new_address > UINT64_MAX - new_length)
         return;
-    lpr_state_lock(&lpr_drm_mapping_lock);
     uint32_t source = LPR_DRM_MAPPING_FRAGMENT_CAPACITY;
     for (uint32_t i = 0; i < LPR_DRM_MAPPING_FRAGMENT_CAPACITY; ++i) {
         if (lpr_drm_mapping_fragments[i].lease &&
@@ -238,7 +246,80 @@ void lpr_drm_mapping_remapped(
         }
         lpr_drm_mapping_drop_locked(new_address, new_length);
     }
+}
+
+void lpr_drm_mapping_remapped(uint64_t old_address, uint64_t old_length,
+    uint64_t new_address, uint64_t new_length)
+{
+    lpr_state_lock(&lpr_drm_mapping_lock);
+    lpr_drm_mapping_remapped_locked(old_address, old_length, new_address, new_length);
     lpr_state_unlock(&lpr_drm_mapping_lock);
+}
+
+/* Serialize native address reuse with lease accounting. A notification after
+ * munmap is too late: another thread can already have mapped a new GPU view
+ * at the same address, and the old notification would close its lease. */
+int64_t lpr_drm_native_munmap(uint64_t address, uint64_t length)
+{
+#if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
+    uint64_t stamp[4] = { lpr_unmap_profile_clock() };
+    lpr_unmap_profile_snapshot_t snapshot;
+#endif
+    lpr_state_lock(&lpr_drm_mapping_lock);
+#if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
+    stamp[1] = lpr_unmap_profile_clock();
+#endif
+    int64_t result = lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, address, length);
+#if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
+    stamp[2] = lpr_unmap_profile_clock();
+#endif
+    uint64_t span = lpr_drm_page_span(length);
+    if (!result && span && address <= UINT64_MAX - span)
+        lpr_drm_mapping_drop_locked(address, span);
+#if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
+    stamp[3] = lpr_unmap_profile_clock();
+    int emit = lpr_unmap_profile_record(length, result, stamp, &snapshot);
+#endif
+    lpr_state_unlock(&lpr_drm_mapping_lock);
+#if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
+    if (emit) lpr_unmap_profile_emit(&snapshot);
+#endif
+    return result;
+}
+
+int64_t lpr_drm_native_mmap(uint64_t fd, uint64_t address, uint64_t length,
+    uint64_t prot, uint64_t flags, uint64_t offset)
+{
+    lpr_state_lock(&lpr_drm_mapping_lock);
+    int64_t result = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
+        fd, address, length, prot, flags, offset);
+    uint64_t span = lpr_drm_page_span(length);
+    if (result >= 4096 && span && (flags & PACHAOS_MMAP_FIXED))
+        lpr_drm_mapping_drop_locked((uint64_t)result, span);
+    lpr_state_unlock(&lpr_drm_mapping_lock);
+    return result;
+}
+
+int64_t lpr_drm_native_mremap(uint64_t address, uint64_t length,
+    uint64_t new_length, uint64_t flags, uint64_t target)
+{
+    lpr_state_lock(&lpr_drm_mapping_lock);
+    int64_t result = lpr_pacha_syscall5(PACHA_VM_SYSCALL_MREMAP,
+        address, length, new_length, flags, target);
+    if (result >= 4096)
+        lpr_drm_mapping_remapped_locked(address, length, (uint64_t)result, new_length);
+    lpr_state_unlock(&lpr_drm_mapping_lock);
+    return result;
+}
+
+void lpr_drm_mapping_fork_lock(void) { lpr_state_lock(&lpr_drm_mapping_lock); }
+void lpr_drm_mapping_fork_unlock(void) { lpr_state_unlock(&lpr_drm_mapping_lock); }
+void lpr_drm_mapping_fork_child(void)
+{
+    lpr_drm_mapping_lock = 0;
+#if defined(LPR_UNMAP_PROFILE) && LPR_UNMAP_PROFILE
+    lpr_unmap_profile_reset();
+#endif
 }
 
 static int64_t lpr_drm_map_received(
@@ -469,6 +550,17 @@ static void lpr_drm_event_cookie_cancel_handle(uint64_t handle)
 
 void lpr_drm_after_fork_child(void)
 {
+    /* PRIVATE was not inherited: the copied number can already name an
+     * unrelated child FD. The child also obtains its own cached wire page. */
+    lpr_drm_request_channel_fd = 0;
+    /* The PRIVATE descriptor was not inherited, but fork copied its VMA.
+     * Remove only this child's alias; never close the copied FD number. */
+    if (lpr_drm_aux_cache)
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
+            (uintptr_t)lpr_drm_aux_cache, GPUD_DRM_AUX_REUSE_BYTES);
+    lpr_drm_aux_cache_fd = 0;
+    lpr_drm_aux_cache = 0;
+    lpr_drm_aux_cache_busy = 0;
     __atomic_store_n(&lpr_drm_event_cookie_lock, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&lpr_drm_mapping_lock, 0u, __ATOMIC_RELEASE);
 }
@@ -511,6 +603,64 @@ static int64_t lpr_gpud_drm_ioctl_inline(gpud_drm_ioctl_request_t *ioctl)
     return 0;
 }
 
+static void lpr_gpud_drm_drop_channel(int endpoint)
+{
+    if (endpoint < 16 || endpoint != lpr_drm_request_channel_fd) return;
+    lpr_drm_request_channel_fd = 0;
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)endpoint);
+}
+
+static int lpr_gpud_drm_bind_page(int page_fd, void *page)
+{
+    if (page_fd != lpr_tty_wire_page_fd || page != lpr_tty_wire_page)
+        return LPR_GPUD_DRM_ENDPOINT_FD;
+    if (lpr_drm_request_channel_fd >= 16) return lpr_drm_request_channel_fd;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    uint64_t pair[2] = {0, 0};
+    int64_t status = lpr_pacha_syscall3(PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
+        (uintptr_t)pair, rights, PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
+    if (status) return (int)lpr_pacha_status_to_errno(status);
+    const int auxiliary = lpr_drm_aux_cache_fd >= 16 && lpr_drm_aux_cache != 0;
+    struct pacha_ipc_fd fds[3] = {
+        {.fd = (uint64_t)(uint32_t)page_fd,
+         .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE},
+        {.fd = pair[1], .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_RECV |
+            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL},
+        {.fd = (uint64_t)(uint32_t)lpr_drm_aux_cache_fd,
+         .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE},
+    };
+    const struct pacha_ipc_msg request = {.word0 = GPUD_DRM_BIND_PAGE_REQUEST_MAGIC,
+        .word1 = auxiliary ? GPUD_DRM_AUX_REUSE_BYTES : 0,
+        .fds = fds, .fd_count = 2u + auxiliary};
+    struct pacha_ipc_fd reply_fds[PACHA_IPC_MAX_TRANSFER_FDS];
+    struct pacha_ipc_msg reply = {.fds = reply_fds, .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
+    int64_t reply_fd = lpr_pacha_syscall2(PACHAOS_SYSCALL_IPC_CALL,
+        LPR_GPUD_DRM_ENDPOINT_FD, (uintptr_t)&request);
+    if (reply_fd < 16) status = lpr_pacha_status_to_errno(reply_fd);
+    else {
+        status = lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+        if (status) status = lpr_pacha_status_to_errno(status);
+        else {
+            for (uint32_t i = 0; i < reply.fd_count; ++i)
+                if (reply_fds[i].fd >= 16)
+                    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, reply_fds[i].fd);
+            status = reply.word0 != GPUD_DRM_BIND_PAGE_REPLY_MAGIC ||
+                reply.word2 || reply.word3 || reply.flags || reply.fd_count ?
+                -LPR_LINUX_EIO : (int64_t)reply.word1;
+        }
+    }
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
+    if (status) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[0]);
+        return (int)status;
+    }
+    lpr_drm_request_channel_fd = (int)pair[0];
+    return lpr_drm_request_channel_fd;
+}
+
 static int64_t lpr_gpud_drm_call_transfers_many(
     uint32_t op,
     int page_fd,
@@ -532,6 +682,11 @@ static int64_t lpr_gpud_drm_call_transfers_many(
             (transfer_fds == 0 || temporary_vmos == 0))) {
         return -LPR_LINUX_ENODEV;
     }
+    const int endpoint = lpr_gpud_drm_bind_page(page_fd, page);
+    if (endpoint < 16) return endpoint;
+    const int bound = endpoint != LPR_GPUD_DRM_ENDPOINT_FD;
+    const int bound_aux = bound && transfer_count && temporary_vmos[0] &&
+        transfer_fds[0] == lpr_drm_aux_cache_fd && lpr_drm_aux_cache_busy;
     struct pacha_ipc_fd fds[4];
     struct pacha_ipc_msg request;
     struct pacha_ipc_msg reply;
@@ -590,27 +745,34 @@ static int64_t lpr_gpud_drm_call_transfers_many(
         fds[i + 1u].transfer_flags = 0;
     }
     request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
+    request.word1 = bound_aux ? GPUD_DRM_REQUEST_BOUND_AUX : 0;
     request.word3 = request_id;
-    request.fds = fds;
-    request.fd_count = 1u + transfer_count;
+    request.fds = fds + bound + bound_aux;
+    request.fd_count = 1u + transfer_count - bound - bound_aux;
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
-        LPR_GPUD_DRM_ENDPOINT_FD,
+        (uint64_t)(uint32_t)endpoint,
         (uint64_t)(uintptr_t)&request);
     if (reply_fd < 16) {
+        lpr_gpud_drm_drop_channel(endpoint);
         return lpr_pacha_status_to_errno(reply_fd);
     }
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
         &reply);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
-    if (recv_status != 0)
+    if (recv_status != 0) {
+        /* Submission may already have run. Forget the failed connection for
+         * a future call, but never replay this request on another endpoint. */
+        lpr_gpud_drm_drop_channel(endpoint);
         return lpr_pacha_status_to_errno(recv_status);
+    }
     const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
         reply_header->service_id != GPUD_DRM_SERVICE_ID ||
         reply_header->op != op || reply_header->request_id != request_id) {
+        lpr_gpud_drm_drop_channel(endpoint);
         for (uint32_t i = 0; i < reply.fd_count; ++i)
             if (reply_fds[i].fd >= 16)
                 (void)lpr_pacha_syscall1(
@@ -699,6 +861,7 @@ static int64_t lpr_gpud_drm_call(
 
 static int lpr_drm_aux_create(
     uint64_t size,
+    int reusable,
     int *out_fd,
     void **out_mapping,
     uint64_t *out_map_size)
@@ -707,12 +870,25 @@ static int lpr_drm_aux_create(
         out_mapping == 0 || out_map_size == 0) {
         return -LPR_LINUX_EINVAL;
     }
-    const uint64_t map_size = (size + 4095u) & ~UINT64_C(4095);
+    /* All callers hold termd_rpc.lock_word through the synchronous reply.
+     * A cached buffer must not be reused while that request owns it. */
+    if (reusable && size <= GPUD_DRM_AUX_REUSE_BYTES && lpr_drm_aux_cache && !lpr_drm_aux_cache_busy) {
+        lpr_drm_aux_cache_busy = 1;
+        lpr_memset(lpr_drm_aux_cache, 0, size);
+        *out_fd = lpr_drm_aux_cache_fd;
+        *out_mapping = lpr_drm_aux_cache;
+        *out_map_size = GPUD_DRM_AUX_REUSE_BYTES;
+        return 0;
+    }
+    const int cacheable = reusable && size <= GPUD_DRM_AUX_REUSE_BYTES && !lpr_drm_aux_cache;
+    const uint64_t map_size = cacheable ? GPUD_DRM_AUX_REUSE_BYTES :
+        (size + 4095u) & ~UINT64_C(4095);
     if (map_size < size) return -LPR_LINUX_EINVAL;
     const uint64_t rights = PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     const int64_t fd = lpr_pacha_syscall3(
-        PACHAOS_SYSCALL_VMO_CREATE, map_size, rights, 0);
+        PACHAOS_SYSCALL_VMO_CREATE, map_size, rights,
+        cacheable ? PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC : 0);
     if (fd < 16) return (int)lpr_pacha_status_to_errno(fd);
     const int64_t mapped = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_MMAP,
@@ -730,11 +906,24 @@ static int lpr_drm_aux_create(
     *out_fd = (int)(uint32_t)fd;
     *out_mapping = (void *)(uintptr_t)mapped;
     *out_map_size = map_size;
+    if (cacheable) {
+        lpr_drm_aux_cache_fd = *out_fd;
+        lpr_drm_aux_cache = *out_mapping;
+        lpr_drm_aux_cache_busy = 1;
+        /* The next binding transfers both pages. The old peer retains its
+         * old mapping until channel hangup; no in-flight call is replayed. */
+        lpr_gpud_drm_drop_channel(lpr_drm_request_channel_fd);
+    }
     return 0;
 }
 
 static void lpr_drm_aux_destroy(int fd, void *mapping, uint64_t map_size)
 {
+    if (fd == lpr_drm_aux_cache_fd && mapping == lpr_drm_aux_cache &&
+        map_size == GPUD_DRM_AUX_REUSE_BYTES) {
+        lpr_drm_aux_cache_busy = 0;
+        return;
+    }
     if (mapping != 0 && map_size != 0) {
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP, (uint64_t)(uintptr_t)mapping, map_size);
@@ -746,6 +935,7 @@ static void lpr_drm_aux_destroy(int fd, void *mapping, uint64_t map_size)
 
 static int lpr_drm_prepare_virtgpu_context(
     uint64_t argument,
+    int reusable_aux,
     gpud_drm_ioctl_request_t *request,
     int *aux_fd,
     void **aux_mapping,
@@ -809,7 +999,7 @@ static int lpr_drm_prepare_virtgpu_context(
         } while (bytes < GPUD_DRM_VIRTGPU_CONTEXT_DEBUG_NAME_MAX_BYTES &&
                  debug_name[bytes - 1] != '\0');
         int result = lpr_drm_aux_create(
-            bytes, aux_fd, aux_mapping, aux_map_size);
+            bytes, reusable_aux, aux_fd, aux_mapping, aux_map_size);
         if (result)
             return result;
         lpr_memcpy(*aux_mapping, debug_name, bytes);
@@ -908,28 +1098,6 @@ static int lpr_drm_prepare_atomic(
     return 0;
 }
 
-int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
-{
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) {
-        return fd;
-    }
-    const int status = lpr_control_install_fd(fd, LPR_FD_OPS_DRM, flags, handle, 0);
-    if (status != 0) {
-        return status;
-    }
-    lpr_drm_backend_t *drm = lpr_drm_backend(fd);
-    if (drm == 0) {
-        lpr_control_close_fd(fd);
-        return -LPR_LINUX_EIO;
-    }
-    drm->active = 1;
-    drm->flags = (uint32_t)flags;
-    drm->handle = handle;
-    drm->wait_fd.raw = native_wait_fd;
-    return fd;
-}
-
 int64_t lpr_drm_open_path(const char *path, uint64_t flags)
 {
     const int udmabuf = path != 0 && lpr_strcmp(path, "/dev/udmabuf") == 0;
@@ -965,13 +1133,11 @@ int64_t lpr_drm_open_path(const char *path, uint64_t flags)
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
         return status;
     }
-    const int fd = lpr_drm_fd_alloc(handle, flags, native_wait_fd);
+    const int fd = lpr_drm_install(handle, flags, native_wait_fd,
+        udmabuf ? LPR_DRM_NODE_UDMABUF : render ? LPR_DRM_NODE_RENDER : 0);
     if (fd < 0) {
         (void)lpr_drm_close_handle(handle);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_wait_fd);
-    } else if (udmabuf || render) {
-        lpr_drm_backend_t *drm = lpr_drm_backend((uint64_t)(uint32_t)fd);
-        if (drm != 0) drm->node_kind = udmabuf ? LPR_DRM_NODE_UDMABUF : LPR_DRM_NODE_RENDER;
     }
     return fd;
 }
@@ -1120,11 +1286,11 @@ int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
             (info.rights & PACHA_FD_RIGHT_DUP) == 0)
             return -LPR_LINUX_EBADF;
         const int64_t duplicate = lpr_pacha_syscall4(
-            PACHA_FD_SYSCALL_FCNTL,
+            PACHA_FD_SYSCALL_DUP,
             (uint64_t)(uint32_t)dmabuf->native.raw,
-            PACHA_FD_FCNTL_DUP,
             16,
-            PACHA_FD_RIGHT_CLOSE);
+            PACHA_FD_RIGHT_CLOSE,
+            PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT);
         if (duplicate < 16)
             return lpr_pacha_status_to_errno(duplicate);
         lease_fd = (int)duplicate;
@@ -1137,7 +1303,10 @@ int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
         return mapped;
     }
     int remote_lease_fd = -1;
-    int status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+    /* fork retains the mapping, exec replaces it. The new LPR image cannot
+     * recover this private mapping registry, so its lease must close on exec. */
+    int status = lpr_native_wait_pair_flags(&lease_fd, &remote_lease_fd,
+        PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT);
     if (!status)
         status = (int)lpr_drm_prime_transfer_acquire(
             dmabuf->token, remote_lease_fd);
@@ -1224,53 +1393,37 @@ static int64_t lpr_drm_prime_export(uint64_t drm_handle, uint32_t gem_handle, ui
     request->gem_handle = gem_handle;
     request->flags = flags;
     uint64_t token = 0;
-    int native_fd = -1;
-    int64_t status = lpr_gpud_drm_call(
-        GPUD_DRM_OP_PRIME_EXPORT, page_fd, page, sizeof(*request), &token, &native_fd);
+    int received[2] = {-1, -1};
+    uint32_t received_count = 0;
+    int64_t status = lpr_gpud_drm_call_transfers_many(
+        GPUD_DRM_OP_PRIME_EXPORT, page_fd, page, sizeof(*request),
+        &token, received, 2, &received_count, 0, 0, 0);
     lpr_destroy_tty_wire_page(page_fd, page);
     if (status != 0) return status;
     struct pacha_fd_info info;
+    struct pacha_fd_info lease;
+    const int native_fd = received[0];
     const uint64_t view_rights = PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    if (native_fd < 0 || token == 0 || !lpr_native_fd_info((uint64_t)(uint32_t)native_fd, &info) ||
+    if (received_count != 2 || native_fd < 16 || token == 0 || !lpr_native_fd_info((uint64_t)(uint32_t)native_fd, &info) ||
         info.kind != PACHA_FD_KIND_VMO || !info.size || (info.size & 4095u) ||
-        info.rights != view_rights || info.flags != PACHA_FD_FLAG_CLOEXEC) {
-        if (native_fd >= 0) (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        (void)lpr_drm_prime_ref(GPUD_DRM_OP_PRIME_RELEASE, token);
+        info.rights != view_rights || info.flags != PACHA_FD_FLAG_CLOEXEC ||
+        !lpr_native_fd_info((uint64_t)(uint32_t)received[1], &lease) ||
+        lease.kind != PACHA_FD_KIND_CHANNEL || lease.size ||
+        lease.rights != PACHA_FD_RIGHT_CLOSE ||
+        lease.flags != (PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_INHERIT)) {
+        for (uint32_t i = 0; i < received_count; ++i)
+            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)received[i]);
         return -LPR_LINUX_EIO;
-    }
-    const int linux_fd = lpr_fd_slot_alloc();
-    if (linux_fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        (void)lpr_drm_prime_ref(GPUD_DRM_OP_PRIME_RELEASE, token);
-        return linux_fd;
     }
     const uint64_t linux_flags = LPR_LINUX_O_RDWR |
         ((flags & GPUD_DRM_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
-    status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)linux_fd,
-        LPR_FD_OPS_DMABUF,
-        linux_flags,
-        token,
-        info.size);
-    if (status != 0) {
+    const int linux_fd = lpr_dmabuf_install(native_fd, received[1], token, info.size, linux_flags);
+    if (linux_fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        (void)lpr_drm_prime_ref(GPUD_DRM_OP_PRIME_RELEASE, token);
-        return status;
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)received[1]);
     }
-    lpr_dmabuf_backend_t *dmabuf = lpr_dmabuf_backend((uint64_t)(uint32_t)linux_fd);
-    if (dmabuf == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)linux_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        return -LPR_LINUX_EIO;
-    }
-    dmabuf->active = 1;
-    dmabuf->writable = 1;
-    dmabuf->flags = (uint32_t)linux_flags;
-    dmabuf->token = token;
-    dmabuf->size = info.size;
-    dmabuf->native.raw = native_fd;
     return linux_fd;
 }
 
@@ -1347,31 +1500,12 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
         return -LPR_LINUX_EIO;
     }
-    const int linux_fd = lpr_fd_slot_alloc();
-    if (linux_fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        return linux_fd;
-    }
     const uint64_t linux_flags = LPR_LINUX_O_RDWR |
         ((create->flags & 1u) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
-    const int install = lpr_control_install_fd(
-        (uint64_t)(uint32_t)linux_fd,
-        LPR_FD_OPS_DMABUF,
-        linux_flags,
-        0,
-        create->size);
-    if (install != 0) {
+    const int linux_fd = lpr_dmabuf_install((int)native_fd, -1, 0, create->size, linux_flags);
+    if (linux_fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        return install;
     }
-    lpr_dmabuf_backend_t *dmabuf =
-        lpr_dmabuf_backend((uint64_t)(uint32_t)linux_fd);
-    if (dmabuf == 0) {
-        (void)lpr_control_close_fd((uint64_t)(uint32_t)linux_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)native_fd);
-        return -LPR_LINUX_EIO;
-    }
-    dmabuf->native.raw = (int)native_fd;
     return linux_fd;
 }
 
@@ -1420,6 +1554,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     const uint64_t profile_page_end = pacha_trace_read_tsc();
 #endif
     gpud_drm_ioctl_request_t *ioctl = (gpud_drm_ioctl_request_t *)lpr_gpud_drm_payload(page);
+    /* Temporary control pages cannot borrow a connection-owned auxiliary
+     * mapping: their receiver still validates an exact-size temporary VMO. */
+    const int reusable_aux = page_fd == lpr_tty_wire_page_fd && page == lpr_tty_wire_page;
     lpr_memset(ioctl, 0, sizeof(*ioctl));
     ioctl->handle = drm->handle;
     /* Linux ioctl commands are unsigned 32-bit values.  musl's int
@@ -1466,7 +1603,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             wire.count_handles > GPUD_DRM_VIRTGPU_EXEC_HANDLE_MAX_COUNT ||
             handles_bytes > GPUD_DRM_IOCTL_AUX_MAX_BYTES || wire.pad ||
             (wire.flags & ~15u) || (!(wire.flags & 8u) && wire.deadline_nsec) ||
-            lpr_drm_aux_create(handles_bytes, &aux_fd, &aux_mapping,
+            lpr_drm_aux_create(handles_bytes, reusable_aux, &aux_fd, &aux_mapping,
                 &aux_map_size) != 0) {
             lpr_destroy_tty_wire_page(page_fd, page);
             return -LPR_LINUX_EINVAL;
@@ -1489,7 +1626,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         if (!wire.handles || !wire.count_handles ||
             wire.count_handles > GPUD_DRM_VIRTGPU_EXEC_HANDLE_MAX_COUNT ||
             handles_bytes > GPUD_DRM_IOCTL_AUX_MAX_BYTES || wire.pad ||
-            lpr_drm_aux_create(handles_bytes, &aux_fd, &aux_mapping,
+            lpr_drm_aux_create(handles_bytes, reusable_aux, &aux_fd, &aux_mapping,
                 &aux_map_size) != 0) {
             lpr_destroy_tty_wire_page(page_fd, page);
             return -LPR_LINUX_EINVAL;
@@ -1576,7 +1713,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             const uint64_t rectangle_bytes =
                 (uint64_t)wire.num_clips * sizeof(gpud_drm_mode_rectangle_t);
             const int aux_status = lpr_drm_aux_create(
-                rectangle_bytes, &aux_fd, &aux_mapping, &aux_map_size);
+                rectangle_bytes, reusable_aux, &aux_fd, &aux_mapping, &aux_map_size);
             if (aux_status != 0) {
                 lpr_destroy_tty_wire_page(page_fd, page);
                 return aux_status;
@@ -1761,7 +1898,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
         if (wire.addr == 0 || wire.size == 0 ||
             wire.size > GPUD_DRM_VIRTGPU_CAPSET_MAX_BYTES || wire.pad != 0 ||
-            lpr_drm_aux_create(wire.size, &aux_fd, &aux_mapping,
+            lpr_drm_aux_create(wire.size, reusable_aux, &aux_fd, &aux_mapping,
                 &aux_map_size) != 0) {
             lpr_destroy_tty_wire_page(page_fd, page);
             return -LPR_LINUX_EINVAL;
@@ -1774,7 +1911,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         wire_kind = LPR_DRM_WIRE_VIRTGPU_GET_CAPS;
     } else if (command == GPUD_DRM_IOCTL_VIRTGPU_CONTEXT_INIT) {
         const int context_status = lpr_drm_prepare_virtgpu_context(
-            arg, ioctl, &aux_fd, &aux_mapping, &aux_map_size);
+            arg, reusable_aux, ioctl, &aux_fd, &aux_mapping, &aux_map_size);
         if (context_status) {
             lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
             lpr_destroy_tty_wire_page(page_fd, page);
@@ -1836,7 +1973,7 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             output_offset < syncobj_offset ||
             (syncobj_count && total_bytes < output_offset) ||
             total_bytes > GPUD_DRM_IOCTL_AUX_MAX_BYTES ||
-            lpr_drm_aux_create(total_bytes, &aux_fd,
+            lpr_drm_aux_create(total_bytes, reusable_aux, &aux_fd,
                 &aux_mapping, &aux_map_size) != 0) {
             lpr_destroy_tty_wire_page(page_fd, page);
             return -LPR_LINUX_EINVAL;

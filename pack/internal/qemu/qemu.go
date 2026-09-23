@@ -1237,7 +1237,7 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, err
 	}
 	if opts.Memory == "" {
-		opts.Memory = "2G"
+		opts.Memory = "4G"
 	}
 	if opts.Display == "" {
 		opts.Display = "none"
@@ -1327,7 +1327,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, fmt.Errorf("missing OVMF vars template for Limine UEFI boot; set CAPOS_OVMF_VARS_TEMPLATE")
 	}
 	if opts.Memory == "" {
-		opts.Memory = "2G"
+		opts.Memory = "4G"
 	}
 	if opts.Display == "" {
 		opts.Display = "none"

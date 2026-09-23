@@ -1,22 +1,22 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 69;
-pub const syscall_capsule_query: u64 = 69;
-pub const syscall_capsule_derive_mmio: u64 = 70;
-pub const syscall_capsule_derive_dma_buffer: u64 = 71;
-pub const syscall_capsule_derive_dma_mapping: u64 = 72;
-pub const syscall_capsule_derive_dma_mapping_pages: u64 = 73;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 74;
-pub const syscall_capsule_dma_set_enabled: u64 = 75;
-pub const syscall_capsule_derive_irq: u64 = 76;
-pub const syscall_capsule_irq_route: u64 = 77;
-pub const syscall_capsule_irq_poll: u64 = 78;
-pub const syscall_capsule_irq_quiesce: u64 = 79;
-pub const syscall_capsule_irq_retire: u64 = 80;
-pub const syscall_capsule_pci_config_read: u64 = 81;
-pub const syscall_capsule_pci_config_write: u64 = 82;
-pub const syscall_capsule_pci_bar_info: u64 = 83;
-pub const syscall_capsule_dma_pool_create: u64 = 84;
+pub const syscall_capsule_first: u64 = 71;
+pub const syscall_capsule_query: u64 = 71;
+pub const syscall_capsule_derive_mmio: u64 = 72;
+pub const syscall_capsule_derive_dma_buffer: u64 = 73;
+pub const syscall_capsule_derive_dma_mapping: u64 = 74;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = 75;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 76;
+pub const syscall_capsule_dma_set_enabled: u64 = 77;
+pub const syscall_capsule_derive_irq: u64 = 78;
+pub const syscall_capsule_irq_route: u64 = 79;
+pub const syscall_capsule_irq_poll: u64 = 80;
+pub const syscall_capsule_irq_quiesce: u64 = 81;
+pub const syscall_capsule_irq_retire: u64 = 82;
+pub const syscall_capsule_pci_config_read: u64 = 83;
+pub const syscall_capsule_pci_config_write: u64 = 84;
+pub const syscall_capsule_pci_bar_info: u64 = 85;
+pub const syscall_capsule_dma_pool_create: u64 = 86;
 pub const syscall_capsule_last: u64 = syscall_capsule_dma_pool_create;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
@@ -82,6 +82,9 @@ pub const snapshot_device_index: usize = 4;
 pub const snapshot_object_id_index: usize = 5;
 pub const snapshot_user_va_index: usize = 6;
 pub const snapshot_iova_index: usize = 7;
+// DEVICE: iova/size describe one continuous translated DMA aperture (zero
+// size if unavailable), not a DMA mask. DMA_BUFFER/MAPPING retain their usual
+// allocation address/size meaning. No syscall or word-layout change.
 pub const snapshot_size_index: usize = 8;
 pub const snapshot_index_index: usize = 9;
 pub const snapshot_flags_index: usize = 10;

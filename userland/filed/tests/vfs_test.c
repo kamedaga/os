@@ -91,7 +91,7 @@ static void *concurrent_rename_worker(void *opaque)
 
 static void test_init_and_root_mount(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root = 0;
     filed_status_t status;
 
@@ -105,7 +105,7 @@ static void test_init_and_root_mount(void)
 
 static void test_mount_table_full(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root = 0;
     filed_status_t status = FILED_OK;
     unsigned int i;
@@ -123,7 +123,7 @@ static void test_mount_table_full(void)
 
 static void test_open_close_and_prepare(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -203,7 +203,7 @@ static void test_open_close_and_prepare(void)
 
 static void test_rights_denial_and_kind_checks(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t readonly_file;
@@ -247,7 +247,7 @@ static void test_rights_denial_and_kind_checks(void)
 
 static void test_self_and_parent_open(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t dir;
@@ -331,7 +331,7 @@ static void test_self_and_parent_open(void)
 
 static void test_directory_offset_and_exec_dup(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -419,7 +419,7 @@ static void test_directory_offset_and_exec_dup(void)
 
 static void test_dup_and_flags(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -520,7 +520,7 @@ static void test_dup_and_flags(void)
 
 static void test_write_pwrite_and_fsync(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -622,7 +622,7 @@ static void test_write_pwrite_and_fsync(void)
 
 static void test_generation_updates(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -709,7 +709,7 @@ static void test_concurrent_open_file_offset(void)
         ITERATIONS = 4096,
     };
 
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -776,7 +776,7 @@ static void test_concurrent_directory_unlink_parent_lock(void)
         ENTRIES = 12,
     };
 
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t files[ENTRIES];
@@ -846,7 +846,7 @@ static void test_concurrent_directory_unlink_parent_lock(void)
 
 static void test_concurrent_cross_directory_rename_ordering(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t dir_a;
@@ -965,7 +965,7 @@ static void test_concurrent_cross_directory_rename_ordering(void)
 
 static void test_unlink_keeps_open_files_alive(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -1032,7 +1032,7 @@ static void test_unlink_keeps_open_files_alive(void)
 
 static void test_hardlink_alias_lifetime_and_stat(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -1144,7 +1144,7 @@ static void test_hardlink_alias_lifetime_and_stat(void)
 
 static void test_rename_replace_keeps_replaced_open_file_alive(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t old_file;
@@ -1248,7 +1248,7 @@ static void test_rename_replace_keeps_replaced_open_file_alive(void)
 
 static void test_rename_keeps_open_directory_handle_alive(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t dir;
@@ -1387,7 +1387,7 @@ static void test_rename_keeps_open_directory_handle_alive(void)
 
 static void test_mutation_component_validation(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_io_decision_t first;
@@ -1436,7 +1436,7 @@ static void test_mutation_component_validation(void)
 
 static void test_setattr_right_is_independent_of_data_write(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t setattr_dir;
     filed_vfs_open_result_t stat_only_dir;
@@ -1660,7 +1660,7 @@ static void test_rights_and_flags(void)
 
 static void test_invalid_arguments(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root = 0;
 
     filed_vfs_init(&vfs);
@@ -1673,7 +1673,7 @@ static void test_service_width_component_name(void)
 {
     static const char name[] =
         "vnd.openxmlformats-officedocument.wordprocessingml.document.xml.new";
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     filed_vfs_open_result_t file;
@@ -1730,7 +1730,7 @@ static bool test_backend_object_evictable(void *context, filed_backend_object_id
 
 static void test_linked_vnode_lru_reuses_capacity(void)
 {
-    filed_vfs_t vfs;
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
     filed_mount_id_t root_mount = 0;
     filed_vfs_open_result_t root;
     unsigned int evictions = 0;
@@ -1789,8 +1789,102 @@ static void test_linked_vnode_lru_reuses_capacity(void)
     expect_status("linked vnode lru preserves invariant", filed_vfs_check_basic(&vfs), FILED_OK);
 }
 
+static void test_failed_open_does_not_cache_unowned_backend(void)
+{
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
+    filed_mount_id_t mount;
+    filed_vfs_open_result_t root, file;
+    filed_backend_object_id_t object;
+    filed_vfs_init(&vfs);
+    expect_status("rollback mount", filed_vfs_mount_root(&vfs,
+        FILED_FS_SYNTHETIC, 7, 11, &mount), FILED_OK);
+    expect_status("rollback root", filed_vfs_open_root(&vfs, mount,
+        FILED_RIGHT_LOOKUP, FILED_OPEN_DIRECTORY, &root), FILED_OK);
+    expect_status("new non-directory open fails", filed_vfs_open_backend_child(
+        &vfs, root.handle_id, 100, FILED_VNODE_REGULAR, "font.ttf",
+        FILED_RIGHT_READ, FILED_OPEN_DIRECTORY, &file), FILED_ERR_NOT_DIR);
+    expect_status("failed open owns no cached object", filed_vfs_cached_child_backend_object(
+        &vfs, root.handle_id, "font.ttf", &object), FILED_ERR_NOT_FOUND);
+    expect_status("normal open after failure", filed_vfs_open_backend_child(
+        &vfs, root.handle_id, 101, FILED_VNODE_REGULAR, "font.ttf",
+        FILED_RIGHT_READ, 0, &file), FILED_OK);
+    expect_status("existing non-directory open fails", filed_vfs_open_backend_child(
+        &vfs, root.handle_id, 101, FILED_VNODE_REGULAR, "font.ttf",
+        FILED_RIGHT_READ, FILED_OPEN_DIRECTORY, &file), FILED_ERR_NOT_DIR);
+    expect_status("existing vnode retains ownership", filed_vfs_cached_child_backend_object(
+        &vfs, root.handle_id, "font.ttf", &object), FILED_OK);
+    expect_true("existing object unchanged", object == 101);
+    expect_status("rollback invariant", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
+static void test_transfer_leases_follow_handle_lifetime(void)
+{
+    filed_vfs_t vfs __attribute__((cleanup(filed_vfs_destroy))) = {0};
+    filed_mount_id_t mount;
+    filed_vfs_open_result_t root, file;
+    enum { LEASE_COUNT = 382 };
+    filed_handle_id_t leased[LEASE_COUNT];
+    filed_vfs_init(&vfs);
+    expect_status("lease mount", filed_vfs_mount_root(&vfs,
+        FILED_FS_SYNTHETIC, 7, 11, &mount), FILED_OK);
+    expect_status("lease root", filed_vfs_open_root(&vfs, mount,
+        FILED_RIGHT_LOOKUP, FILED_OPEN_DIRECTORY, &root), FILED_OK);
+    expect_status("lease source", filed_vfs_open_backend_child(&vfs,
+        root.handle_id, 101, FILED_VNODE_REGULAR, "transfer",
+        FILED_RIGHT_READ, 0, &file), FILED_OK);
+    expect_status("lease invalid fd", filed_vfs_set_handle_lease(&vfs,
+        file.handle_id, 15), FILED_ERR_INVALID);
+    expect_status("lease owned handle", filed_vfs_set_handle_owner(&vfs,
+        file.handle_id, 1), FILED_OK);
+    expect_status("lease rejects session handle", filed_vfs_set_handle_lease(&vfs,
+        file.handle_id, 30), FILED_ERR_INVALID);
+
+    for (unsigned i = 0; i < LEASE_COUNT; ++i) {
+        expect_status("lease duplicate", filed_vfs_dup_handle(&vfs,
+            file.handle_id, 0, &leased[i]), FILED_OK);
+        expect_status("lease needs no separate slot", filed_vfs_set_handle_lease(&vfs,
+            leased[i], (int)(100 + i)), FILED_OK);
+    }
+    expect_true("leases exceed old 64 slot limit",
+        vfs.lease_handle_count == LEASE_COUNT);
+    expect_status("lease invariant at handle capacity", filed_vfs_check_basic(&vfs), FILED_OK);
+    expect_status("lease cannot be replaced", filed_vfs_set_handle_lease(&vfs,
+        leased[80], 900), FILED_ERR_INVALID);
+    expect_true("original lease preserved", filed_vfs_get_handle_lease(&vfs, leased[80]) == 180);
+    filed_handle_id_t extra = 0;
+    expect_status("handles grow past fixed limit", filed_vfs_dup_handle(&vfs,
+        file.handle_id, 0, &extra), FILED_OK);
+    expect_status("lease invariant after growth", filed_vfs_check_basic(&vfs), FILED_OK);
+    expect_status("close extra handle", filed_vfs_close_handle(&vfs, extra), FILED_OK);
+    filed_vfs_trim_open_objects(&vfs);
+
+    /* Old IDs must not enter the new lease chain when head, middle and tail
+     * handles are closed and their slots reused. */
+    const unsigned positions[] = { LEASE_COUNT - 1, 80, 0 };
+    for (unsigned j = 0; j < sizeof(positions) / sizeof(positions[0]); ++j) {
+        unsigned i = positions[j];
+        filed_handle_id_t old = leased[i];
+        expect_status("lease close linked position", filed_vfs_close_handle(&vfs, old), FILED_OK);
+        expect_true("closed lease unreachable", filed_vfs_get_handle_lease(&vfs, old) < 16);
+        expect_status("lease invariant after unlink", filed_vfs_check_basic(&vfs), FILED_OK);
+        expect_status("lease reuse handle slot", filed_vfs_dup_handle(&vfs,
+            file.handle_id, 0, &leased[i]), FILED_OK);
+        expect_true("reuse has new identity", leased[i] != old);
+        expect_status("lease attach reused slot", filed_vfs_set_handle_lease(&vfs,
+            leased[i], (int)(100 + i)), FILED_OK);
+        expect_status("stale close cannot unlink new lease", filed_vfs_close_handle(&vfs, old),
+            FILED_ERR_INVALID);
+        expect_status("lease invariant after reuse", filed_vfs_check_basic(&vfs), FILED_OK);
+    }
+    for (unsigned i = 0; i < LEASE_COUNT; ++i)
+        expect_status("lease close all", filed_vfs_close_handle(&vfs, leased[i]), FILED_OK);
+    expect_true("no residual lease chain", vfs.lease_handle_count == 0 && vfs.lease_head == 0);
+    expect_status("lease invariant after drain", filed_vfs_check_basic(&vfs), FILED_OK);
+}
+
 int main(void)
 {
+    test_transfer_leases_follow_handle_lifetime();
     test_init_and_root_mount();
     test_mount_table_full();
     test_open_close_and_prepare();
@@ -1813,6 +1907,7 @@ int main(void)
     test_invalid_arguments();
     test_service_width_component_name();
     test_linked_vnode_lru_reuses_capacity();
+    test_failed_open_does_not_cache_unowned_backend();
 
     if (failures != 0) {
         printf("filed vfs tests failed: %d\n", failures);

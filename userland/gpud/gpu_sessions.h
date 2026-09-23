@@ -2,9 +2,10 @@
 #ifndef PACHA_GPUD_GPU_SESSIONS_H
 #define PACHA_GPUD_GPU_SESSIONS_H
 
+#include "gpu_limits.h"
 #include <kobox2/gpu.h>
 
-enum { GPUD_GPU_SESSION_CAPACITY = 16 };
+enum { GPUD_GPU_SESSION_CAPACITY = GPUD_GPU_NATIVE_SESSION_LIMIT };
 enum gpud_gpu_session_state {
     GPUD_GPU_SESSION_FREE,
     GPUD_GPU_SESSION_OPENING,

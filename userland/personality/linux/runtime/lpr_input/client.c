@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/allocate.h"
 
 static void *lpr_inputd_payload(void *page)
 {
@@ -103,21 +104,12 @@ static int lpr_input_parse_event_index(const char *suffix, uint32_t *out_event_i
 
 static int lpr_input_fd_alloc(uint64_t handle, uint64_t flags, uint32_t event_index, int native_wait_fd)
 {
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) return fd;
-    if (lpr_control_install_fd(fd, LPR_FD_OPS_INPUT, flags, handle, 0) != 0)
-        return -LPR_LINUX_EMFILE;
-    lpr_input_backend_t *input = lpr_input_backend(fd);
-    if (input == 0) {
-        lpr_control_close_fd(fd);
-        return -LPR_LINUX_EIO;
-    }
-    input->active = 1;
-    input->event_index = (uint8_t)event_index;
-    input->flags = (uint32_t)flags;
-    input->handle = handle;
-    input->wait_fd.raw = native_wait_fd;
-    return fd;
+    const lpr_input_backend_t record = {
+        .active = 1, .event_index = (uint8_t)event_index,
+        .flags = (uint32_t)flags, .handle = handle,
+        .wait_fd.raw = native_wait_fd, .lease_fd.raw = -1,
+    };
+    return lpr_fd_alloc_state(LPR_FD_OPS_INPUT, flags, 0, &record, sizeof(record));
 }
 
 int64_t lpr_input_open_path(const char *path, uint64_t flags)

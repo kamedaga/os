@@ -41,9 +41,7 @@ static void prepare_device(const struct kobox_linux_boot_layout *layout, void *c
                                             .generation = device_grant.generation,
                                             .image = &ph_core,
                                             .memory = layout->task.memory,
-                                            .irq_cookie_sequence = &irq_cookie_sequence,
-                                            .aperture_start = UINT64_C(0x80000000),
-                                            .aperture_end = UINT64_C(0x8fffffff)};
+                                            .irq_cookie_sequence = &irq_cookie_sequence};
     PH_OK(ph_device_init(&device, &config));
     device_launch =
         (struct kobox_linux_device_launch){.size = sizeof(device_launch),

@@ -1,5 +1,6 @@
 #include "socket.h"
 #include "../lpr_filed_internal.h"
+#include "../support/browser_diag.h"
 #include <errno.h>
 
 static void close_caps(struct pacha_ipc_fd *caps, unsigned count)
@@ -77,15 +78,15 @@ int lpr_unix_socket_map(struct lpr_unix_socket *socket)
 int lpr_unix_socket_handoff(struct lpr_unix_socket *socket, struct lpr_unix_socket *record)
 {
     int status = lpr_unix_socket_adopt(socket);
-    if (status) return status;
+    if (status) { lpr_browser_diag("handoff-adopt", socket->socket, status, 0); return status; }
     struct lpr_unix_context *context;
     status = lpr_unix_context_current(&context);
-    if (status) return status;
+    if (status) { lpr_browser_diag("handoff-context", socket->socket, status, 0); return status; }
     struct unix_control request = { .operation = UNIX_OP_HANDOFF, .socket = socket->socket };
     struct pacha_ipc_fd cap = {0};
     unsigned count;
     status = lpr_unix_context_call(context, &request, NULL, 0, &cap, 1, &count);
-    if (status) return status;
+    if (status) { lpr_browser_diag("handoff-call", socket->socket, status, context->client.fd); return status; }
     struct pacha_fd_info info;
     const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CALL;

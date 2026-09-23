@@ -414,46 +414,223 @@ filed_mount_t *filed_alloc_mount(filed_vfs_t *vfs)
 filed_vnode_t *filed_alloc_vnode(filed_vfs_t *vfs)
 {
     const uint32_t start = vfs->next_vnode_slot;
-    for (uint32_t offset = 0; offset < FILED_MAX_VNODES; ++offset) {
-        const uint32_t slot = (start + offset) % FILED_MAX_VNODES;
-        if (!vfs->vnodes[slot].active) {
-            vfs->next_vnode_slot =
-                (uint16_t)((slot + 1u) % FILED_MAX_VNODES);
-            return &vfs->vnodes[slot];
+    for (uint32_t offset = 0; offset < vfs->vnode_capacity; ++offset) {
+        const uint32_t slot = (uint32_t)(((uint64_t)start + offset) % vfs->vnode_capacity);
+        if (!filed_vfs_vnode_at(vfs, slot)->active) {
+            vfs->next_vnode_slot = (slot + 1u) % vfs->vnode_capacity;
+            return filed_vfs_vnode_at(vfs, slot);
         }
     }
 
-    return NULL;
+    /* Only the 32-bit internal slot/ID representation bounds this store.
+     * Allocate the body first so directory failure leaves all old nodes
+     * and hints untouched. Locks/pointers into existing banks stay valid. */
+    if (vfs->vnode_capacity > UINT32_MAX - FILED_VNODE_BANK_ENTRIES)
+        return NULL;
+    const size_t banks = vfs->vnode_capacity / FILED_VNODE_BANK_ENTRIES;
+    if (banks + 1 > SIZE_MAX / sizeof(*vfs->vnode_banks)) return NULL;
+    filed_vnode_t *bank = calloc(FILED_VNODE_BANK_ENTRIES, sizeof(*bank));
+    if (bank == NULL) return NULL;
+    filed_vnode_t **directory = realloc(vfs->vnode_banks,
+        (banks + 1) * sizeof(*directory));
+    if (directory == NULL) {
+        free(bank);
+        return NULL;
+    }
+    directory[banks] = bank;
+    vfs->vnode_banks = directory;
+    vfs->next_vnode_slot = vfs->vnode_capacity + 1;
+    vfs->vnode_capacity += FILED_VNODE_BANK_ENTRIES;
+    return bank;
+}
+
+uint32_t filed_vnode_slot_index(const filed_vfs_t *vfs, const filed_vnode_t *vnode)
+{
+    const uintptr_t address = (uintptr_t)vnode;
+    for (uint32_t first = 0; first < vfs->vnode_capacity; first += FILED_VNODE_BANK_ENTRIES) {
+        const uintptr_t base = (uintptr_t)filed_vfs_vnode_at(vfs, first);
+        if (address >= base && address - base < FILED_VNODE_BANK_ENTRIES * sizeof(*vnode) &&
+            (address - base) % sizeof(*vnode) == 0)
+            return first + (uint32_t)((address - base) / sizeof(*vnode));
+    }
+    return UINT32_MAX;
+}
+
+void filed_vfs_trim_vnodes(filed_vfs_t *vfs)
+{
+    if (vfs == NULL) return;
+    uint32_t banks = vfs->vnode_capacity / FILED_VNODE_BANK_ENTRIES;
+    const uint32_t old_banks = banks;
+    for (uint32_t b = 0; b < banks;) {
+        bool active = false;
+        for (unsigned i = 0; i < FILED_VNODE_BANK_ENTRIES; ++i)
+            active |= vfs->vnode_banks[b][i].active;
+        if (active) { ++b; continue; }
+        free(vfs->vnode_banks[b]);
+        vfs->vnode_banks[b] = vfs->vnode_banks[--banks];
+    }
+    if (banks == old_banks) return;
+    vfs->vnode_capacity = banks * FILED_VNODE_BANK_ENTRIES;
+    vfs->next_vnode_slot = 0;
+    /* Bank directory positions changed, not vnode addresses or IDs. */
+    memset(vfs->vnode_slot_hints, 0, sizeof(vfs->vnode_slot_hints));
+    memset(vfs->child_slot_hints, 0, sizeof(vfs->child_slot_hints));
+    if (banks == 0) {
+        free(vfs->vnode_banks);
+        vfs->vnode_banks = NULL;
+    } else {
+        filed_vnode_t **directory = realloc(vfs->vnode_banks,
+            (size_t)banks * sizeof(*directory));
+        if (directory != NULL) vfs->vnode_banks = directory;
+    }
+}
+
+void filed_vfs_trim_open_objects(filed_vfs_t *vfs)
+{
+    if (vfs == NULL) return;
+    /* Only trailing empty banks can disappear without renumbering lease links.
+     * Keep the first bank warm; the syncer calls this between operations. */
+    {
+        uint32_t banks = vfs->file_capacity / FILED_FILE_BANK_ENTRIES;
+        const uint32_t old_banks = banks;
+        while (banks > 1) {
+            bool active = false;
+            for (unsigned i = 0; i < FILED_FILE_BANK_ENTRIES; ++i)
+                active |= vfs->file_banks[banks - 1][i].active;
+            if (active) break;
+            free(vfs->file_banks[--banks]);
+        }
+        if (banks != old_banks) {
+            vfs->file_capacity = banks * FILED_FILE_BANK_ENTRIES;
+            vfs->next_file_slot = 0;
+            memset(vfs->file_slot_hints, 0, sizeof(vfs->file_slot_hints));
+            filed_file_t **directory = realloc(vfs->file_banks, (size_t)banks * sizeof(*directory));
+            if (directory != NULL) vfs->file_banks = directory;
+        }
+    }
+    {
+        uint32_t banks = vfs->handle_capacity / FILED_HANDLE_BANK_ENTRIES;
+        const uint32_t old_banks = banks;
+        while (banks > 1) {
+            bool active = false;
+            for (unsigned i = 0; i < FILED_HANDLE_BANK_ENTRIES; ++i)
+                active |= vfs->handle_banks[banks - 1][i].active;
+            if (active) break;
+            free(vfs->handle_banks[--banks]);
+        }
+        if (banks != old_banks) {
+            vfs->handle_capacity = banks * FILED_HANDLE_BANK_ENTRIES;
+            vfs->next_handle_slot = 0;
+            memset(vfs->handle_slot_hints, 0, sizeof(vfs->handle_slot_hints));
+            filed_handle_t **directory = realloc(vfs->handle_banks, (size_t)banks * sizeof(*directory));
+            if (directory != NULL) vfs->handle_banks = directory;
+        }
+    }
+}
+
+void filed_vfs_destroy(filed_vfs_t *vfs)
+{
+    if (vfs == NULL) return;
+    for (uint32_t b = 0; b < vfs->vnode_capacity / FILED_VNODE_BANK_ENTRIES; ++b)
+        free(vfs->vnode_banks[b]);
+    free(vfs->vnode_banks);
+    for (uint32_t b = 0; b < vfs->file_capacity / FILED_FILE_BANK_ENTRIES; ++b)
+        free(vfs->file_banks[b]);
+    free(vfs->file_banks);
+    for (uint32_t b = 0; b < vfs->handle_capacity / FILED_HANDLE_BANK_ENTRIES; ++b)
+        free(vfs->handle_banks[b]);
+    free(vfs->handle_banks);
+    memset(vfs, 0, sizeof(*vfs));
 }
 
 filed_file_t *filed_alloc_file(filed_vfs_t *vfs)
 {
     const uint32_t start = vfs->next_file_slot;
-    for (uint32_t offset = 0; offset < FILED_MAX_FILES; ++offset) {
-        const uint32_t slot = (start + offset) % FILED_MAX_FILES;
-        if (!vfs->files[slot].active) {
-            vfs->next_file_slot =
-                (uint16_t)((slot + 1u) % FILED_MAX_FILES);
-            return &vfs->files[slot];
+    for (uint32_t offset = 0; offset < vfs->file_capacity; ++offset) {
+        const uint32_t slot = (uint32_t)(((uint64_t)start + offset) % vfs->file_capacity);
+        if (!filed_vfs_file_at(vfs, slot)->active) {
+            vfs->next_file_slot = (slot + 1u) % vfs->file_capacity;
+            return filed_vfs_file_at(vfs, slot);
         }
     }
 
-    return NULL;
+    /* Only the 32-bit internal slot/ID representation bounds this store.
+     * Allocate the body first so directory failure leaves all old nodes
+     * and hints untouched. Locks/pointers into existing banks stay valid. */
+    if (vfs->file_capacity > UINT32_MAX - FILED_FILE_BANK_ENTRIES)
+        return NULL;
+    const size_t banks = vfs->file_capacity / FILED_FILE_BANK_ENTRIES;
+    if (banks + 1 > SIZE_MAX / sizeof(*vfs->file_banks)) return NULL;
+    filed_file_t *bank = calloc(FILED_FILE_BANK_ENTRIES, sizeof(*bank));
+    if (bank == NULL) return NULL;
+    filed_file_t **directory = realloc(vfs->file_banks,
+        (banks + 1) * sizeof(*directory));
+    if (directory == NULL) {
+        free(bank);
+        return NULL;
+    }
+    directory[banks] = bank;
+    vfs->file_banks = directory;
+    vfs->next_file_slot = vfs->file_capacity + 1;
+    vfs->file_capacity += FILED_FILE_BANK_ENTRIES;
+    return bank;
+}
+
+uint32_t filed_file_slot_index(const filed_vfs_t *vfs, const filed_file_t *file)
+{
+    const uintptr_t address = (uintptr_t)file;
+    for (uint32_t first = 0; first < vfs->file_capacity; first += FILED_FILE_BANK_ENTRIES) {
+        const uintptr_t base = (uintptr_t)filed_vfs_file_at(vfs, first);
+        if (address >= base && address - base < FILED_FILE_BANK_ENTRIES * sizeof(*file) &&
+            (address - base) % sizeof(*file) == 0)
+            return first + (uint32_t)((address - base) / sizeof(*file));
+    }
+    return UINT32_MAX;
 }
 
 filed_handle_t *filed_alloc_handle(filed_vfs_t *vfs)
 {
     const uint32_t start = vfs->next_handle_slot;
-    for (uint32_t offset = 0; offset < FILED_MAX_HANDLES; ++offset) {
-        const uint32_t slot = (start + offset) % FILED_MAX_HANDLES;
-        if (!vfs->handles[slot].active) {
-            vfs->next_handle_slot =
-                (uint16_t)((slot + 1u) % FILED_MAX_HANDLES);
-            return &vfs->handles[slot];
+    for (uint32_t offset = 0; offset < vfs->handle_capacity; ++offset) {
+        const uint32_t slot = (uint32_t)(((uint64_t)start + offset) % vfs->handle_capacity);
+        if (!filed_vfs_handle_at(vfs, slot)->active) {
+            vfs->next_handle_slot = (slot + 1u) % vfs->handle_capacity;
+            return filed_vfs_handle_at(vfs, slot);
         }
     }
 
-    return NULL;
+    /* Only the 32-bit internal slot/ID representation bounds this store.
+     * Allocate the body first so directory failure leaves all old nodes
+     * and hints untouched. Locks/pointers into existing banks stay valid. */
+    if (vfs->handle_capacity > UINT32_MAX - FILED_HANDLE_BANK_ENTRIES)
+        return NULL;
+    const size_t banks = vfs->handle_capacity / FILED_HANDLE_BANK_ENTRIES;
+    if (banks + 1 > SIZE_MAX / sizeof(*vfs->handle_banks)) return NULL;
+    filed_handle_t *bank = calloc(FILED_HANDLE_BANK_ENTRIES, sizeof(*bank));
+    if (bank == NULL) return NULL;
+    filed_handle_t **directory = realloc(vfs->handle_banks,
+        (banks + 1) * sizeof(*directory));
+    if (directory == NULL) {
+        free(bank);
+        return NULL;
+    }
+    directory[banks] = bank;
+    vfs->handle_banks = directory;
+    vfs->next_handle_slot = vfs->handle_capacity + 1;
+    vfs->handle_capacity += FILED_HANDLE_BANK_ENTRIES;
+    return bank;
+}
+
+uint32_t filed_handle_slot_index(const filed_vfs_t *vfs, const filed_handle_t *handle)
+{
+    const uintptr_t address = (uintptr_t)handle;
+    for (uint32_t first = 0; first < vfs->handle_capacity; first += FILED_HANDLE_BANK_ENTRIES) {
+        const uintptr_t base = (uintptr_t)filed_vfs_handle_at(vfs, first);
+        if (address >= base && address - base < FILED_HANDLE_BANK_ENTRIES * sizeof(*handle) &&
+            (address - base) % sizeof(*handle) == 0)
+            return first + (uint32_t)((address - base) / sizeof(*handle));
+    }
+    return UINT32_MAX;
 }
 
 size_t filed_id_hint_index(uint32_t id)
@@ -466,11 +643,11 @@ void filed_remember_vnode_slot(filed_vfs_t *vfs, const filed_vnode_t *vnode)
     if (vfs == NULL || vnode == NULL || vnode->id == 0) {
         return;
     }
-    const ptrdiff_t slot = vnode - vfs->vnodes;
-    if (slot < 0 || slot >= (ptrdiff_t)FILED_MAX_VNODES) {
+    const uint32_t slot = filed_vnode_slot_index(vfs, vnode);
+    if (slot >= vfs->vnode_capacity) {
         return;
     }
-    vfs->vnode_slot_hints[filed_id_hint_index(vnode->id)] = (uint16_t)(slot + 1);
+    vfs->vnode_slot_hints[filed_id_hint_index(vnode->id)] = slot + 1;
 }
 
 void filed_remember_file_slot(filed_vfs_t *vfs, const filed_file_t *file)
@@ -478,11 +655,11 @@ void filed_remember_file_slot(filed_vfs_t *vfs, const filed_file_t *file)
     if (vfs == NULL || file == NULL || file->id == 0) {
         return;
     }
-    const ptrdiff_t slot = file - vfs->files;
-    if (slot < 0 || slot >= (ptrdiff_t)FILED_MAX_FILES) {
+    const uint32_t slot = filed_file_slot_index(vfs, file);
+    if (slot >= vfs->file_capacity) {
         return;
     }
-    vfs->file_slot_hints[filed_id_hint_index(file->id)] = (uint16_t)(slot + 1);
+    vfs->file_slot_hints[filed_id_hint_index(file->id)] = slot + 1;
 }
 
 void filed_remember_handle_slot(filed_vfs_t *vfs, const filed_handle_t *handle)
@@ -490,11 +667,11 @@ void filed_remember_handle_slot(filed_vfs_t *vfs, const filed_handle_t *handle)
     if (vfs == NULL || handle == NULL || handle->id == 0) {
         return;
     }
-    const ptrdiff_t slot = handle - vfs->handles;
-    if (slot < 0 || slot >= (ptrdiff_t)FILED_MAX_HANDLES) {
+    const uint32_t slot = filed_handle_slot_index(vfs, handle);
+    if (slot >= vfs->handle_capacity) {
         return;
     }
-    vfs->handle_slot_hints[filed_id_hint_index(handle->id)] = (uint16_t)(slot + 1);
+    vfs->handle_slot_hints[filed_id_hint_index(handle->id)] = slot + 1;
 }
 
 bool filed_mount_id_exists(const filed_vfs_t *vfs, filed_mount_id_t id)
@@ -514,8 +691,8 @@ bool filed_vnode_id_exists(const filed_vfs_t *vfs, filed_vnode_id_t id)
 {
     size_t i;
 
-    for (i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (vfs->vnodes[i].active && vfs->vnodes[i].id == id) {
+    for (i = 0; i < vfs->vnode_capacity; ++i) {
+        if (filed_vfs_vnode_at(vfs, i)->active && filed_vfs_vnode_at(vfs, i)->id == id) {
             return true;
         }
     }
@@ -539,24 +716,24 @@ filed_mount_t *filed_find_mount(filed_vfs_t *vfs, filed_mount_id_t id)
 filed_vnode_t *filed_find_vnode(filed_vfs_t *vfs, filed_vnode_id_t id)
 {
     size_t i;
-    uint16_t hinted_slot;
+    uint32_t hinted_slot;
 
     if (vfs == NULL || id == 0) {
         return NULL;
     }
 
     hinted_slot = vfs->vnode_slot_hints[filed_id_hint_index(id)];
-    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_VNODES) {
-        filed_vnode_t *candidate = &vfs->vnodes[hinted_slot - 1u];
+    if (hinted_slot != 0 && hinted_slot <= vfs->vnode_capacity) {
+        filed_vnode_t *candidate = filed_vfs_vnode_at(vfs, hinted_slot - 1u);
         if (candidate->active && candidate->id == id) {
             return candidate;
         }
     }
 
-    for (i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (vfs->vnodes[i].active && vfs->vnodes[i].id == id) {
-            filed_remember_vnode_slot(vfs, &vfs->vnodes[i]);
-            return &vfs->vnodes[i];
+    for (i = 0; i < vfs->vnode_capacity; ++i) {
+        if (filed_vfs_vnode_at(vfs, i)->active && filed_vfs_vnode_at(vfs, i)->id == id) {
+            filed_remember_vnode_slot(vfs, filed_vfs_vnode_at(vfs, i));
+            return filed_vfs_vnode_at(vfs, i);
         }
     }
 
@@ -571,24 +748,24 @@ const filed_vnode_t *filed_find_vnode_const(const filed_vfs_t *vfs, filed_vnode_
 filed_file_t *filed_find_file(filed_vfs_t *vfs, filed_file_id_t id)
 {
     size_t i;
-    uint16_t hinted_slot;
+    uint32_t hinted_slot;
 
     if (vfs == NULL || id == 0) {
         return NULL;
     }
 
     hinted_slot = vfs->file_slot_hints[filed_id_hint_index(id)];
-    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_FILES) {
-        filed_file_t *candidate = &vfs->files[hinted_slot - 1u];
+    if (hinted_slot != 0 && hinted_slot <= vfs->file_capacity) {
+        filed_file_t *candidate = filed_vfs_file_at(vfs, hinted_slot - 1u);
         if (candidate->active && candidate->id == id) {
             return candidate;
         }
     }
 
-    for (i = 0; i < FILED_MAX_FILES; ++i) {
-        if (vfs->files[i].active && vfs->files[i].id == id) {
-            filed_remember_file_slot(vfs, &vfs->files[i]);
-            return &vfs->files[i];
+    for (i = 0; i < vfs->file_capacity; ++i) {
+        if (filed_vfs_file_at(vfs, i)->active && filed_vfs_file_at(vfs, i)->id == id) {
+            filed_remember_file_slot(vfs, filed_vfs_file_at(vfs, i));
+            return filed_vfs_file_at(vfs, i);
         }
     }
 
@@ -603,24 +780,24 @@ const filed_file_t *filed_find_file_const(const filed_vfs_t *vfs, filed_file_id_
 filed_handle_t *filed_find_handle(filed_vfs_t *vfs, filed_handle_id_t id)
 {
     size_t i;
-    uint16_t hinted_slot;
+    uint32_t hinted_slot;
 
     if (vfs == NULL || id == 0) {
         return NULL;
     }
 
     hinted_slot = vfs->handle_slot_hints[filed_id_hint_index(id)];
-    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_HANDLES) {
-        filed_handle_t *candidate = &vfs->handles[hinted_slot - 1u];
+    if (hinted_slot != 0 && hinted_slot <= vfs->handle_capacity) {
+        filed_handle_t *candidate = filed_vfs_handle_at(vfs, hinted_slot - 1u);
         if (candidate->active && candidate->id == id) {
             return candidate;
         }
     }
 
-    for (i = 0; i < FILED_MAX_HANDLES; ++i) {
-        if (vfs->handles[i].active && vfs->handles[i].id == id) {
-            filed_remember_handle_slot(vfs, &vfs->handles[i]);
-            return &vfs->handles[i];
+    for (i = 0; i < vfs->handle_capacity; ++i) {
+        if (filed_vfs_handle_at(vfs, i)->active && filed_vfs_handle_at(vfs, i)->id == id) {
+            filed_remember_handle_slot(vfs, filed_vfs_handle_at(vfs, i));
+            return filed_vfs_handle_at(vfs, i);
         }
     }
 
@@ -644,15 +821,15 @@ filed_vnode_t *filed_find_backend_vnode(
     if (vfs == NULL || backend_object == 0 || parent == 0 || name == NULL) {
         return NULL;
     }
-    for (i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (vfs->vnodes[i].active &&
-            vfs->vnodes[i].linked &&
-            vfs->vnodes[i].mount_id == mount_id &&
-            vfs->vnodes[i].backend_object == backend_object &&
-            vfs->vnodes[i].parent == parent &&
-            strcmp(vfs->vnodes[i].name, name) == 0)
+    for (i = 0; i < vfs->vnode_capacity; ++i) {
+        if (filed_vfs_vnode_at(vfs, i)->active &&
+            filed_vfs_vnode_at(vfs, i)->linked &&
+            filed_vfs_vnode_at(vfs, i)->mount_id == mount_id &&
+            filed_vfs_vnode_at(vfs, i)->backend_object == backend_object &&
+            filed_vfs_vnode_at(vfs, i)->parent == parent &&
+            strcmp(filed_vfs_vnode_at(vfs, i)->name, name) == 0)
         {
-            return &vfs->vnodes[i];
+            return filed_vfs_vnode_at(vfs, i);
         }
     }
 
@@ -666,11 +843,11 @@ filed_vnode_t *filed_find_backend_object_vnode(
     if (vfs == NULL || backend_object == 0) {
         return NULL;
     }
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (vfs->vnodes[i].active &&
-            vfs->vnodes[i].backend_object == backend_object)
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        if (filed_vfs_vnode_at(vfs, i)->active &&
+            filed_vfs_vnode_at(vfs, i)->backend_object == backend_object)
         {
-            return &vfs->vnodes[i];
+            return filed_vfs_vnode_at(vfs, i);
         }
     }
     return NULL;

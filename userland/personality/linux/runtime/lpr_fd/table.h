@@ -358,6 +358,14 @@ int lpr_fd_table_dup(
     lpr_linux_fd_t min_fd,
     uint16_t new_fd_flags,
     lpr_linux_fd_t *out_fd);
+int lpr_fd_table_dup_excluding(lpr_fd_table_t *table,
+    lpr_linux_fd_t old_fd, lpr_linux_fd_t min_fd, uint16_t new_fd_flags,
+    const lpr_linux_fd_t *excluded, uint32_t excluded_count,
+    lpr_linux_fd_t *out_fd);
+/* Atomic dup2 replacement; finish the displaced backend after unlocking. */
+int lpr_fd_table_dup_replace(lpr_fd_table_t *table,
+    lpr_linux_fd_t old_fd, lpr_linux_fd_t new_fd, uint16_t new_fd_flags,
+    lpr_fd_drop_t *drop);
 int lpr_fd_table_dup_at(
     lpr_fd_table_t *table,
     lpr_linux_fd_t old_fd,

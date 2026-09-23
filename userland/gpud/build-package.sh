@@ -7,7 +7,7 @@ canonical="${GPUD_CANONICAL_BUILD:-$repo_root/.artifacts/kobox2-client-exec-cano
 provider="${GPUD_PROVIDER_BUILD:-$repo_root/.artifacts/kobox2-client-native-module-provider}"
 runtime="$repo_root/.artifacts/gpud-production-runtime"
 modules="$repo_root/.artifacts/gpud-production-modules"
-for required in "$canonical/vmlinux.a" "$provider/vmlinux.a"; do
+for required in "$canonical/vmlinux.a"; do
   if [[ ! -f "$required" ]]; then
     echo "Missing canonical Linux input: $required" >&2
     exit 1

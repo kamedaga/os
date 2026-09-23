@@ -60,6 +60,28 @@ static void ownership(void) {
            KB2_GPU_STATUS_LIMIT);
 }
 
+static void desktop_capacity_reuse(void) {
+    struct gpud_gpu_sessions table = {0};
+    uint64_t ids[GPUD_GPU_SESSION_CAPACITY], extra, cookie;
+    assert(GPUD_GPU_SESSION_CAPACITY >= 32);
+    assert(!ph_gpu_sessions_init(&table, 1, GPUD_GPU_SESSION_CAPACITY));
+    for (unsigned round = 0; round < 2; ++round) {
+        for (size_t i = 0; i < GPUD_GPU_SESSION_CAPACITY; ++i) {
+            assert(!ph_gpu_session_open_begin(&table, 1, 7, KB2_GPU_NODE_RENDER, &ids[i]));
+            assert(!ph_gpu_session_open_finish(&table, 1, 7, ids[i], ids[i], KB2_GPU_STATUS_OK));
+        }
+        assert(table.occupied == GPUD_GPU_SESSION_CAPACITY);
+        assert(ph_gpu_session_open_begin(&table, 1, 7, KB2_GPU_NODE_RENDER, &extra) == KB2_GPU_STATUS_LIMIT);
+        for (size_t i = 0; i < GPUD_GPU_SESSION_CAPACITY; ++i) {
+            assert(!ph_gpu_session_close_begin(&table, 1, 7, ids[i]));
+            assert(!ph_gpu_session_close_ready(&table, 1, 7, ids[i], &cookie));
+            assert(cookie == ids[i]);
+            assert(!ph_gpu_session_close_finish(&table, 1, 7, ids[i], KB2_GPU_STATUS_OK));
+        }
+        assert(!table.occupied);
+    }
+}
+
 static void request_codec(void) {
     unsigned char bytes[64];
     kb2_gpu_session_open_t open = {.node_type = KB2_GPU_NODE_RENDER, .client_id = UINT64_MAX};
@@ -153,6 +175,7 @@ static void completion_codec(void) {
 
 int main(void) {
     ownership();
+    desktop_capacity_reuse();
     request_codec();
     completion_codec();
     puts("GPUD_GPU_SESSIONS_UNIT=PASS authenticated-owner generation quota drain retained-close "

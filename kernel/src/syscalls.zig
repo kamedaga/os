@@ -87,10 +87,12 @@ const KernelStateSpinLock = struct {
 
     fn unlock(self: *KernelStateSpinLock) void {
         const clockevent = @import("clockevent.zig");
-        const changed = if (syscall_hooks_ready and syscall_hooks_storage.kernel_state_ready.*)
-            clockevent.publish(syscall_hooks_storage.state.nextTimerWaiterDeadline())
-        else
-            false;
+        const changed = if (syscall_hooks_ready and syscall_hooks_storage.kernel_state_ready.*) blk: {
+            const start = perf.timestamp();
+            const result = clockevent.publish(syscall_hooks_storage.state.nextTimerWaiterDeadline());
+            perf.timerScanRecord(start, result);
+            break :blk result;
+        } else false;
         perf.elapsed(.kernel_lock_hold_cycles, self.profile_start);
         @atomicStore(u8, &self.value, 0, .release);
         if (changed) clockevent.notifyChanged();
@@ -254,12 +256,12 @@ fn writeThreadUserLogPrefix(h: *const Hooks, thread_index: usize) void {
 }
 
 fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
+    const runtime_path = perf.runtimePath(frame.rax, frame.rdi);
     const base_hooks = getHooks();
     if (!base_hooks.kernel_state_ready.*) return sc.syscall_err_not_ready;
-    @import("ipc_metric.zig").recordSyscall(frame.rax);
-
     const state = base_hooks.state;
     const proc = scheduler.currentPrincipal();
+    @import("ipc_metric.zig").recordSyscall(frame.rax, proc);
     // Recorded on entry, not at deschedule: the trap frame's rax carries the
     // syscall number in and the result out, so by the time a thread is placed
     // again the number is gone.  rdi is kept alongside because it is the fd or
@@ -284,12 +286,18 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
         null;
     const h = &hooks;
 
+    const runtime_lock_start = perf.runtimeTimestamp(runtime_path);
     if (hold_kernel_state_lock) {
         kernel_state_lock.lock();
         lock_held = true;
     }
+    perf.runtimeElapsed(runtime_path, .lock_wait_cycles, runtime_lock_start);
+    const runtime_body_start = perf.runtimeTimestamp(runtime_path);
     defer {
+        perf.runtimeElapsed(runtime_path, .locked_body_cycles, runtime_body_start);
+        const runtime_unlock_start = perf.runtimeTimestamp(runtime_path);
         if (lock_held) kernel_state_lock.unlock();
+        perf.runtimeElapsed(runtime_path, .unlock_cycles, runtime_unlock_start);
     }
 
     if (!state.hasActivePrincipal(proc)) {
@@ -361,9 +369,18 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
 }
 
 pub export fn syscallDispatch(frame: *TrapFrame) callconv(.winapi) u64 {
+    // Save classification before delivery can replace the syscall frame.
+    const runtime_path = perf.runtimePath(frame.rax, frame.rdi);
+    const runtime_start = perf.runtimeTimestamp(runtime_path);
+    defer {
+        perf.runtimeAdd(runtime_path, .calls, 1);
+        perf.runtimeElapsed(runtime_path, .total_cycles, runtime_start);
+    }
     const result = dispatchCompactSyscall(frame);
     frame.rax = result;
+    const runtime_stage_start = perf.runtimeTimestamp(runtime_path);
     @import("traps.zig").stagePendingSignalForUserReturn(frame);
+    perf.runtimeElapsed(runtime_path, .return_stage_cycles, runtime_stage_start);
     return frame.rax;
 }
 

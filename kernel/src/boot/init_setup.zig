@@ -9,6 +9,7 @@ const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
 const boot_resources = @import("boot_resources.zig");
 const user_vm = @import("../memory/user_vm.zig");
+const user_copy = @import("../user_copy.zig");
 const halt = @import("../halt.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
@@ -107,11 +108,12 @@ pub fn mapBootFsImageIntoProcessOrHalt(
     while (page_index < page_count) : (page_index += 1) {
         const page = process_factory.allocPageForProcessOrHalt(state, principal, role_label, "bootfs image page", free_list);
         if (first_page_paddr == 0) first_page_paddr = page.paddr;
-        const dst: [*]u8 = @ptrFromInt(page.paddr);
-        @memset(dst[0..4096], 0);
+        // allocPhysicalPage already zeroed the whole page through the window.
         const remaining = image.len - copied;
         const chunk_len: usize = if (remaining > 4096) 4096 else remaining;
-        @memcpy(dst[0..chunk_len], image[copied .. copied + chunk_len]);
+        if (!user_copy.writePhysicalBytes(page.paddr, image[copied .. copied + chunk_len])) {
+            halt.haltWithRolePageMessage(role_label, "bootfs image page", "physical write failed");
+        }
         if (!user_vm.mapUserLinearRegion(
             principal,
             base_va + @as(u64, @intCast(page_index)) * 4096,
@@ -215,16 +217,19 @@ fn publishInitServiceRegistryPage(
 ) void {
     const page = findKernelBackedInitSpawnPage(pages, init_bootstrap_layout.sourceVa(.window_service_config)) orelse
         haltInitBootstrapDescriptor("missing window service config page");
-    service_registry_abi.initPage(page.page.paddr);
+    var bytes: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    service_registry_abi.initPage(@intFromPtr(&bytes));
     for (services) |descriptor| {
         const kind = std.enums.fromInt(service_registry_abi.ServiceKind, descriptor.kind) orelse
             haltInitBootstrapDescriptor("invalid init service descriptor kind");
         service_registry_abi.addService(
-            page.page.paddr,
+            @intFromPtr(&bytes),
             kind,
             descriptor.endpoint_id,
         );
     }
+    if (!user_copy.writePhysicalBytes(page.page.paddr, &bytes))
+        haltInitBootstrapDescriptor("service registry physical write failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -232,30 +237,32 @@ fn publishInitServiceRegistryPage(
 // ---------------------------------------------------------------------------
 
 fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64) void {
-    const page: *volatile init_bootstrap_abi.ConfigPage = @ptrFromInt(user_page_paddr);
+    var bytes: [4096]u8 align(@alignOf(init_bootstrap_abi.ConfigPage)) = [_]u8{0} ** 4096;
+    const page: *init_bootstrap_abi.ConfigPage = @ptrCast(&bytes);
     page.magic = init_bootstrap_abi.config_magic;
     page.version = init_bootstrap_abi.config_version;
     page.descriptor_page_va = descriptor_page_va;
     page.reserved0 = 0;
+    if (!user_copy.writePhysicalBytes(user_page_paddr, &bytes))
+        haltInitBootstrapDescriptor("config physical write failed");
 }
 
 pub fn refreshInitBootLogSnapshot(state: *kernel.KernelState, init_process_principal: kernel.PrincipalId) void {
     _ = state;
     const page_paddr = user_vm.lookupUserMappedPaddrForVa(init_process_principal, init_bootstrap_abi.boot_log_user_page_va) orelse
         haltInitBootstrapDescriptor("missing boot log snapshot page");
-    const page: [*]u8 = @ptrFromInt(page_paddr);
-    @memset(page[0..4096], 0);
+    var page: [4096]u8 = [_]u8{0} ** 4096;
     const copy_len: usize = @min(kernel_log.boot_log_len, init_bootstrap_abi.boot_log_page_payload_bytes);
-    const length_ptr: *volatile u32 = @ptrFromInt(page_paddr + init_bootstrap_abi.boot_log_page_length_offset);
-    const status_ptr: *volatile u32 = @ptrFromInt(page_paddr + init_bootstrap_abi.boot_log_page_status_offset);
-    length_ptr.* = @intCast(copy_len);
-    status_ptr.* = 1;
+    std.mem.writeInt(u32, page[init_bootstrap_abi.boot_log_page_length_offset..][0..4], @intCast(copy_len), .little);
+    std.mem.writeInt(u32, page[init_bootstrap_abi.boot_log_page_status_offset..][0..4], 1, .little);
     if (copy_len != 0) {
         @memcpy(
             page[init_bootstrap_abi.boot_log_page_header_bytes .. init_bootstrap_abi.boot_log_page_header_bytes + copy_len],
             kernel_log.boot_log_buffer[0..copy_len],
         );
     }
+    if (!user_copy.writePhysicalBytes(page_paddr, &page))
+        haltInitBootstrapDescriptor("boot log physical write failed");
 }
 
 pub fn publishInitBootstrapDescriptorPage(
@@ -264,7 +271,8 @@ pub fn publishInitBootstrapDescriptorPage(
     bootfs_setup: BootFsImageSetup,
     framebuffer_info: ?boot_resources.FramebufferInfo,
 ) void {
-    const page: *volatile init_bootstrap_abi.DescriptorPage = @ptrFromInt(user_page_paddr);
+    var bytes: [4096]u8 align(@alignOf(init_bootstrap_abi.DescriptorPage)) = [_]u8{0} ** 4096;
+    const page: *init_bootstrap_abi.DescriptorPage = @ptrCast(&bytes);
     page.magic = init_bootstrap_abi.magic;
     page.version = init_bootstrap_abi.version;
     page.spawn_page_count = init_bootstrap_layout.builtin_spawn_pages.len;
@@ -353,6 +361,8 @@ pub fn publishInitBootstrapDescriptorPage(
         device_count += 1;
     }
     page.device_count = device_count;
+    if (!user_copy.writePhysicalBytes(user_page_paddr, &bytes))
+        haltInitBootstrapDescriptor("descriptor physical write failed");
 }
 
 // ---------------------------------------------------------------------------

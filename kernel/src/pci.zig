@@ -1,7 +1,7 @@
 const std = @import("std");
 const init_bootstrap_abi = @import("kernel_abi_root").init_bootstrap_abi;
 const acpi_tables = @import("acpi_tables.zig");
-const mtrr = @import("arch/x86_64/mtrr.zig");
+const user_copy = @import("user_copy.zig");
 const identity_limit = @import("arch/x86_64/physical_layout.zig").identity_limit;
 
 pub const Location = struct {
@@ -86,6 +86,86 @@ const DeviceApertures = struct {
     bars: [6]?BarAperture = [_]?BarAperture{null} ** 6,
 };
 var device_apertures: [interrupt_device_count]DeviceApertures = [_]DeviceApertures{.{}} ** interrupt_device_count;
+
+/// Boot-only read-only bound for a continuous DMA window. Do not size-probe
+/// devices here: firmware may have left bus mastering enabled. Conservatively
+/// exclude everything from each assigned memory BAR base upward. A BAR below
+/// start makes the window empty (its extent is not proven disjoint).
+/// Like firmware-assigned BAR publication, this assumes unassigned zero-base
+/// BARs do not decode memory; it is not an arbitrary-firmware resource solver.
+pub fn bootDmaWindowEnd(start: u64, ceiling: u64) u64 {
+    const Reader = struct {
+        fn read(_: @This(), loc: Location, offset: u8) u32 {
+            return readConfigU32(loc, offset);
+        }
+    };
+    return bootDmaWindowEndWithReader(start, ceiling, ecam_windows.entries[0..ecam_windows.count], Reader{});
+}
+
+fn bootDmaWindowEndWithReader(start: u64, ceiling: u64, windows: []const EcamWindow, reader: anytype) u64 {
+    const exclude = @import("iova.zig").exclude;
+    var end = ceiling;
+    for (windows) |window| {
+        const base = window.base + (@as(u64, window.bus_start) << 20);
+        const last = window.base + ((@as(u64, window.bus_end) + 1) << 20) - 1;
+        end = exclude(start, end, base, last);
+    }
+    for (0..256) |bus| {
+        for (0..32) |device| {
+            var loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = 0 };
+            if (@as(u16, @truncate(reader.read(loc, 0))) == 0xffff) continue;
+            const functions: usize = if (@as(u8, @truncate(reader.read(loc, 0x0c) >> 16)) & 0x80 != 0) 8 else 1;
+            for (0..functions) |function| {
+                loc.function = @intCast(function);
+                if (@as(u16, @truncate(reader.read(loc, 0))) == 0xffff) continue;
+                const header = @as(u8, @truncate(reader.read(loc, 0x0c) >> 16)) & 0x7f;
+                const bar_count: u8 = switch (header) {
+                    0 => 6,
+                    1 => 2,
+                    else => return start, // CardBus/unknown windows unsupported.
+                };
+                var index: u8 = 0;
+                while (index < bar_count) : (index += 1) {
+                    const low = reader.read(loc, 0x10 + index * 4);
+                    if (low == 0 or low & 1 != 0) continue;
+                    const kind = (low >> 1) & 3;
+                    var base: u64 = low & 0xfffffff0;
+                    switch (kind) {
+                        0 => {},
+                        2 => {
+                            if (index + 1 >= bar_count) return start;
+                            index += 1;
+                            base |= @as(u64, reader.read(loc, 0x10 + index * 4)) << 32;
+                        },
+                        else => return start,
+                    }
+                    if (base != 0) end = exclude(start, end, base, std.math.maxInt(u64));
+                }
+                const rom = reader.read(loc, if (header == 0) 0x30 else 0x38);
+                const rom_base: u64 = rom & 0xfffff800;
+                if (rom_base != 0) end = exclude(start, end, rom_base, std.math.maxInt(u64));
+                if (header == 1) {
+                    end = dmaBridgeWindowEnd(start, end, reader.read(loc, 0x20), 0, 0, false);
+                    end = dmaBridgeWindowEnd(start, end, reader.read(loc, 0x24), reader.read(loc, 0x28), reader.read(loc, 0x2c), true);
+                }
+            }
+        }
+    }
+    return end;
+}
+
+fn dmaBridgeWindowEnd(start: u64, end: u64, low: u32, base_high: u32, last_high: u32, prefetch: bool) u64 {
+    const kind = low & 15;
+    if (kind != ((low >> 16) & 15) or kind > @intFromBool(prefetch)) return start;
+    var base = @as(u64, low & 0xfff0) << 16;
+    var last = @as(u64, low & 0xfff00000) | 0xfffff;
+    if (prefetch and kind == 1) {
+        base |= @as(u64, base_high) << 32;
+        last |= @as(u64, last_high) << 32;
+    }
+    // Base > limit is the architected disabled window encoding.
+    return @import("iova.zig").exclude(start, end, base, last);
+}
 
 /// Called once while boot owns the device, before exposing any device FD.
 /// The capability grants these firmware-assigned apertures, not later BAR
@@ -515,14 +595,10 @@ const NativeInterruptIo = struct {
         return authorizedBarInfo(resourceIdFromLocation(loc), bar);
     }
     fn readWord(_: @This(), address: u64) ?u32 {
-        if (address == 0 or address >= identity_limit or (address & 3) != 0 or
-            !mtrr.isUncached(address)) return null;
-        return @as(*volatile u32, @ptrFromInt(address)).*;
+        return user_copy.readUncachedMmioU32(address);
     }
-    fn writeWord(self: @This(), address: u64, value: u32) bool {
-        _ = self.readWord(address) orelse return false;
-        @as(*volatile u32, @ptrFromInt(address)).* = value;
-        return true;
+    fn writeWord(_: @This(), address: u64, value: u32) bool {
+        return user_copy.writeUncachedMmioU32(address, value);
     }
     fn drain(_: @This(), first: u8, count: u8) bool {
         return @import("smp.zig").drainInterruptRange(first, count);
@@ -533,7 +609,7 @@ fn interruptBarAddress(io: anytype, loc: Location, descriptor: u32, span: u64) ?
     const bar: u8 = @intCast(descriptor & 7);
     if (bar >= 6 or span == 0) return null;
     // Use the immutable capability aperture, including its live BAR identity
-    // check. UC identity mapping alone grants no authority to this device.
+    // check. An uncached mapping alone grants no authority to this device.
     const aperture = io.authorizedBar(loc, bar) orelse return null;
     if ((aperture.flags & bar_flag_mem) == 0) return null;
     _ = aperture.end() orelse return null;
@@ -778,6 +854,7 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
         fail_mmio_after_drain: bool = false,
         mmio_reads: usize = 0,
         mmio_writes: usize = 0,
+        bar_start: u64 = 0x1000,
         bar_size: u64 = 0x2000,
         fn config(self: *@This(), _: Location, offset: u8, width: u32) ?u32 {
             const word = self.registers[offset / 4] >> @as(u5, @intCast((offset & 3) * 8));
@@ -790,22 +867,24 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
             return true;
         }
         fn authorizedBar(self: *@This(), _: Location, bar: u8) ?BarInfo {
-            if (bar != 0 or self.registers[0x10 / 4] != 0x1000) return null;
-            return .{ .start = 0x1000, .size = self.bar_size, .flags = bar_flag_mem };
+            const live = @as(u64, self.registers[0x10 / 4]) |
+                (@as(u64, self.registers[0x14 / 4]) << 32);
+            if (bar != 0 or live != self.bar_start) return null;
+            return .{ .start = self.bar_start, .size = self.bar_size, .flags = bar_flag_mem };
         }
         fn readWord(self: *@This(), address: u64) ?u32 {
             self.mmio_reads += 1;
             if (!self.mmio_available) return null;
-            if (address == 0x2000) return self.pending;
-            if (address < 0x1000 or address >= 0x1100 or (address & 3) != 0) return null;
-            return self.table[@intCast((address - 0x1000) / 4)];
+            if (address == self.bar_start + 0x1000) return self.pending;
+            if (address < self.bar_start or address >= self.bar_start + 0x100 or (address & 3) != 0) return null;
+            return self.table[@intCast((address - self.bar_start) / 4)];
         }
         fn writeWord(self: *@This(), address: u64, value: u32) bool {
             self.mmio_writes += 1;
             if (self.ignore_mask_write) return true;
             // PBA is intentionally read-only, as on real MSI-X hardware.
-            if (address < 0x1000 or address >= 0x1100 or (address & 3) != 0) return false;
-            self.table[@intCast((address - 0x1000) / 4)] = value;
+            if (address < self.bar_start or address >= self.bar_start + 0x100 or (address & 3) != 0) return false;
+            self.table[@intCast((address - self.bar_start) / 4)] = value;
             return true;
         }
         fn drain(self: *@This(), first: u8, count: u8) bool {
@@ -830,6 +909,22 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
     // Malformed capability offsets/extent or a relocated BAR must fail before
     // even a read (and especially a mask write) reaches another MMIO region.
     const loc = locationFromResourceId(device).?;
+    // Table/PBA offsets retain all 64 BAR bits; relocating the upper DWORD
+    // must still be rejected before touching either MMIO structure.
+    var high = fixture;
+    high.bar_start = 0x380000000000;
+    high.registers[0x10 / 4] = 0;
+    high.registers[0x14 / 4] = 0x3800;
+    try std.testing.expect(!try maskInterruptSource(&high, loc, .msix, 3));
+    try std.testing.expectEqual(@as(u32, 1), high.table[15]);
+    high.pending = 1 << 3;
+    try std.testing.expect(try maskInterruptSource(&high, loc, .msix, 3));
+    high.registers[0x14 / 4] = 0x3801;
+    const reads_before_relocation = high.mmio_reads;
+    const writes_before_relocation = high.mmio_writes;
+    try std.testing.expectError(error.Unsupported, maskInterruptSource(&high, loc, .msix, 3));
+    try std.testing.expectEqual(reads_before_relocation, high.mmio_reads);
+    try std.testing.expectEqual(writes_before_relocation, high.mmio_writes);
     fixture.registers[0x10 / 4] = 0x3000;
     try std.testing.expectError(error.Unsupported, maskInterruptSource(&fixture, loc, .msix, 3));
     fixture.registers[0x10 / 4] = 0x1000;
@@ -1013,6 +1108,49 @@ fn probeBarInfo(loc: Location, bar_index: u8) ?BarInfo {
     const info: BarInfo = .{ .start = start, .size = size, .flags = flags };
     _ = info.end() orelse return null;
     return info;
+}
+
+test "PCI DMA boot scan skips upper BAR slots and clips ROM ECAM and unknown headers" {
+    const Reader = struct {
+        config: [64]u32 = @splat(0),
+        fn read(self: @This(), loc: Location, offset: u8) u32 {
+            if (loc.bus != 0 or loc.device != 0 or loc.function != 0) return 0xffffffff;
+            return self.config[offset / 4];
+        }
+    };
+    var reader = Reader{};
+    reader.config[0] = 0x12348086;
+    const start = 0x80000000;
+    const end = 0xfee00000;
+    // Unimplemented/zero-base slots do not constrain the platform window.
+    try std.testing.expectEqual(@as(u64, end), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+    reader.config[4] = 0x0000000c;
+    reader.config[5] = 0xa0000000; // High DWORD must not be parsed as a low BAR.
+    try std.testing.expectEqual(@as(u64, end), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+    reader.config[6] = 0xc0000000;
+    try std.testing.expectEqual(@as(u64, 0xc0000000), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+    reader.config[0x30 / 4] = 0xa0000001;
+    try std.testing.expectEqual(@as(u64, 0xa0000000), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+    reader.config[0x30 / 4] = 0;
+    const windows = [_]EcamWindow{.{ .base = 0xb0000000, .segment = 0, .bus_start = 0, .bus_end = 255 }};
+    try std.testing.expectEqual(@as(u64, 0xb0000000), bootDmaWindowEndWithReader(start, end, &windows, reader));
+    reader.config[6] = 0x40000000; // Unknown low BAR extent: fail closed.
+    try std.testing.expectEqual(@as(u64, start), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+    reader.config[6] = 0xc0000002; // Unsupported memory type.
+    try std.testing.expectEqual(@as(u64, start), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+    reader.config[6] = 0;
+    reader.config[3] = 2 << 16; // CardBus windows are not implemented.
+    try std.testing.expectEqual(@as(u64, start), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+}
+
+test "PCI DMA bridge windows clip 32-bit and 64-bit ranges and reject unknown types" {
+    const start = 0x80000000;
+    const end = 0xfee00000;
+    try std.testing.expectEqual(@as(u64, 0xa0000000), dmaBridgeWindowEnd(start, end, 0xa0f0a000, 0, 0, false));
+    try std.testing.expectEqual(@as(u64, end), dmaBridgeWindowEnd(start, end, 0x0000fff0, 0, 0, false));
+    try std.testing.expectEqual(@as(u64, end), dmaBridgeWindowEnd(start, end, 0x00010001, 0x3800, 0x3800, true));
+    try std.testing.expectEqual(@as(u64, start), dmaBridgeWindowEnd(start, end, 0xa0007000, 0, 0, false));
+    try std.testing.expectEqual(@as(u64, start), dmaBridgeWindowEnd(start, end, 0xa000a001, 0, 0, true));
 }
 
 test "config address encoding" {

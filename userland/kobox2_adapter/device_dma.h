@@ -10,6 +10,9 @@ struct ph_dma_mapping {
     size_t length;
     int fd;
     void *view;
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+    unsigned int profile_direction;
+#endif
 };
 
 struct ph_dma_config {
@@ -19,6 +22,7 @@ struct ph_dma_config {
     void *ram;
     int ram_fd;
     size_t ram_length;
+    /* Populated from the device capsule query by ph_dma_init, not input policy. */
     uint64_t aperture_start;
     uint64_t aperture_end;
     struct ph_dma_mapping *mappings;
@@ -32,12 +36,16 @@ struct ph_dma {
     unsigned int admitted;
     unsigned int enabled;
     unsigned int drained;
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+    /* Diagnostic only, serialized by this port's existing lock. */
+    uint64_t profile_counts[2][3][6][2];
+#endif
 };
 
 /* Sandbox-local DMA port, initialized from a zeroed object. The bootstrap
  * owner must validate the RAM capability and keep its direct mapping stable
  * until destroy. The device grant exclusively names this translation domain;
- * the aperture is the caller's authorized envelope, not a guessed HW limit.
+ * the aperture is queried from the native domain, not a guessed HW limit.
  * Device FD, RAM and preallocated inventory remain caller-owned. Mapping FDs
  * are private to this port: never duplicate/transfer them, since close must
  * mean last-close and synchronous invalidation. Linux serializes leaf calls;

@@ -54,8 +54,14 @@ print('WINDOW', hex(window), 'epoch', time.time(), flush=True)
 anchor = None
 def follow_host_log():
     global anchor
-    path = Path('/home/kamer/os/.artifacts/qemu-tty-host-time.log')
+    path = Path(os.environ.get('CAPTURE_HOST_LOG',
+                               '/home/kamer/os/.artifacts/qemu-tty-host-time.log'))
+    if not path.exists():
+        return
     with path.open() as stream:
+        # An old run's last record is not a newly received clock anchor.
+        # Without a live producer, leave host_elapsed/anchor_age unset.
+        stream.seek(0, 2)
         while True:
             lines = stream.readlines()
             now = time.monotonic()

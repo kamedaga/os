@@ -32,16 +32,13 @@ int64_t lpr_linux_mremap(
      * unless FIXED is set; do not forward an unspecified register value. */
     const uint64_t target =
         (flags & LPR_LINUX_MREMAP_FIXED) != 0 ? new_address : 0;
-    const int64_t result = lpr_pacha_syscall5(
-        PACHA_VM_SYSCALL_MREMAP,
+    const int64_t result = lpr_drm_native_mremap(
         old_address,
         old_size,
         new_size,
         flags,
         target);
     if (result >= 4096) {
-        lpr_drm_mapping_remapped(
-            old_address, old_size, (uint64_t)result, new_size);
         return result;
     }
     return pacha_kernel_status_to_errno(result);

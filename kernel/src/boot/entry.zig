@@ -282,16 +282,35 @@ fn initKernelRuntimeOrHalt() void {
     }
 }
 
+const pt_storage = @import("../memory/pt_storage.zig");
+
+fn allocatePtStoragePage(context: *anyopaque) ?pt_storage.PagePointer {
+    const free_list: *kernel.FreePageList = @ptrCast(@alignCast(context));
+    const paddr = free_list.popContiguousBelow(1, @import("../arch/x86_64/physical_layout.zig").identity_limit) catch return null;
+    return @ptrFromInt(paddr);
+}
+
+fn releasePtStoragePage(context: *anyopaque, page: pt_storage.PagePointer) bool {
+    const free_list: *kernel.FreePageList = @ptrCast(@alignCast(context));
+    free_list.appendPage(0, @intFromPtr(page)) catch return false;
+    return true;
+}
+
 fn initMemoryModules() void {
     user_space_table.init(user_spaces);
     for (user_spaces) |*space| {
         // First initialization owns the lock state; later address-space resets
         // preserve it. Initialize in place to avoid a multi-MiB .{} constant.
         space.lock_state = .{};
-        user_vm.resetUserAddressSpaceStorage(space);
+        user_vm.initializeUserAddressSpaceStorage(space);
     }
 
     user_vm.init(.{
+        .pt_allocator = .{
+            .context = kernel_runtime.global_free_list,
+            .allocate = allocatePtStoragePage,
+            .release = releasePtStoragePage,
+        },
         .user_spaces = &user_space_table,
         .four_gib = boot_static.four_gib,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,

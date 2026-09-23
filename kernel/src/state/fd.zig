@@ -134,7 +134,7 @@ const setVmoBackingPageStorePaddr = types.setVmoBackingPageStorePaddr;
 const freeVmoBackingPageStore = types.freeVmoBackingPageStore;
 const resetVmoBackingPageStore = types.resetVmoBackingPageStore;
 pub fn kernelStaticStorageEndAddr() usize {
-    return @max(types.kernelStaticStorageEndAddr(), @max(@intFromPtr(&object_full_reports) + @sizeOf(usize), @intFromPtr(&fd_full_reports) + @sizeOf(usize)));
+    return @max(@import("ipc.zig").channelDiagnosticStaticEndAddr(), @max(types.kernelStaticStorageEndAddr(), @max(@intFromPtr(&object_full_reports) + @sizeOf(usize), @intFromPtr(&fd_full_reports) + @sizeOf(usize))));
 }
 const runtimeStorageBytes = types.runtimeStorageBytes;
 const initRuntimeStorage = types.initRuntimeStorage;
@@ -188,6 +188,12 @@ pub fn publishIrqObject(self: anytype, object_ref: KernelObjectRef, irq: IrqObje
     @atomicStore(DmaDeviceId, &slot.device, irq.device, .release);
     @atomicStore(u8, &slot.kind, @intFromEnum(irq.kind), .release);
     @atomicStore(u32, &slot.vector, irq.vector, .release);
+    // Publish the conservative candidate before making the slot active. IRQ
+    // registration keeps the hardware route masked/drained until this returns.
+    // Never clear individual bits: retirement/reuse still uses the active
+    // handshake below, without adding a bitmap-clear/republication race.
+    const index: usize = @intCast(object_ref.index);
+    _ = @atomicRmw(u64, &self.irq_publish_candidates[index / 64], .Or, @as(u64, 1) << @as(u6, @intCast(index % 64)), .release);
     @atomicStore(u8, &slot.active, 1, .release);
 }
 
@@ -385,6 +391,8 @@ pub fn resetKernelObjectTable(self: anytype) void {
         @atomicStore(u8, &slot.active, 0, .release);
         slot.* = .{};
     }
+    // Like the existing slot reset, this requires all IRQ producers quiescent.
+    @memset(&self.irq_publish_candidates, 0);
     for (self.fd_objects[0..]) |*slot| {
         if (slot.kind != .none) self.releaseKernelObjectPayload(slot);
         slot.* = .{};
@@ -614,6 +622,22 @@ pub fn fdEntryConst(self: anytype, owner: PrincipalId, fd: Fd) ?*const FdEntry {
     const index = table.index(fd) orelse return null;
     if (table.slots()[index].isEmpty()) return null;
     return &table.slots()[index];
+}
+
+// Caller holds KernelState and shared-VM-object locks together. Keep this
+// separate from fdInfo: ordinary metadata callers do not hold the latter.
+pub fn fdVmoLifetimeInfo(self: anytype, owner: PrincipalId, fd: Fd) ?u64 {
+    const entry = self.fdEntryConst(owner, fd) orelse return null;
+    if (!entry.rights.inspect) return null;
+    const slot = self.kernelObjectSlotConst(entry.object) orelse return null;
+    const vmo = switch (slot.payload) {
+        .vmo => |vmo| vmo,
+        else => return null,
+    };
+    const native_refs = self.nativeVmoRefCount(vmo) orelse return null;
+    const fd_abi = @import("kernel_abi_root").fd_abi;
+    return @as(u64, slot.ref_count) |
+        (@as(u64, native_refs) << fd_abi.vmo_info_native_refs_shift);
 }
 
 pub fn fdInfo(self: anytype, owner: PrincipalId, fd: Fd) ?FdInfo {
@@ -962,28 +986,34 @@ pub fn recordDeviceInterruptEvent(
     wake_owners: []PrincipalId,
 ) usize {
     var wake_count: usize = 0;
-    slots: for (self.irq_publish_slots[0..]) |*slot| {
-        while (true) {
-            const active = @atomicLoad(u8, &slot.active, .acquire);
-            if (active == 0) continue :slots;
-            if (active == 1 and @cmpxchgWeak(u8, &slot.active, 1, 2, .acquire, .monotonic) == null) break;
-            std.atomic.spinLoopHint();
+    for (&self.irq_publish_candidates, 0..) |*word, word_index| {
+        var candidates = @atomicLoad(u64, word, .acquire);
+        slots: while (candidates != 0) : (candidates &= candidates - 1) {
+            const index = word_index * 64 + @ctz(candidates);
+            if (index >= self.irq_publish_slots.len) continue;
+            const slot = &self.irq_publish_slots[index];
+            while (true) {
+                const active = @atomicLoad(u8, &slot.active, .acquire);
+                if (active == 0) continue :slots;
+                if (active == 1 and @cmpxchgWeak(u8, &slot.active, 1, 2, .acquire, .monotonic) == null) break;
+                std.atomic.spinLoopHint();
+            }
+            defer @atomicStore(u8, &slot.active, 1, .release);
+            const generation = @atomicLoad(u32, &slot.generation, .acquire);
+            const irq_device = @atomicLoad(DmaDeviceId, &slot.device, .acquire);
+            const kind = @atomicLoad(u8, &slot.kind, .acquire);
+            const irq_entry = @atomicLoad(u32, &slot.vector, .acquire);
+            if (irq_device != device or
+                !@TypeOf(self.*).irqKindMatchesInterrupt(kind, irq_entry, entry))
+            {
+                continue;
+            }
+            if (@atomicLoad(u32, &slot.generation, .acquire) != generation) continue;
+            _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);
+            const owner_raw = @atomicLoad(PrincipalRaw, &slot.owner_principal_raw, .acquire);
+            const owner = @TypeOf(self.*).objectOwner(owner_raw) orelse continue;
+            @TypeOf(self.*).appendUniquePrincipal(wake_owners, &wake_count, owner);
         }
-        defer @atomicStore(u8, &slot.active, 1, .release);
-        const generation = @atomicLoad(u32, &slot.generation, .acquire);
-        const irq_device = @atomicLoad(DmaDeviceId, &slot.device, .acquire);
-        const kind = @atomicLoad(u8, &slot.kind, .acquire);
-        const irq_entry = @atomicLoad(u32, &slot.vector, .acquire);
-        if (irq_device != device or
-            !@TypeOf(self.*).irqKindMatchesInterrupt(kind, irq_entry, entry))
-        {
-            continue;
-        }
-        if (@atomicLoad(u32, &slot.generation, .acquire) != generation) continue;
-        _ = @atomicRmw(u64, &slot.event_count, .Add, 1, .acq_rel);
-        const owner_raw = @atomicLoad(PrincipalRaw, &slot.owner_principal_raw, .acquire);
-        const owner = @TypeOf(self.*).objectOwner(owner_raw) orelse continue;
-        @TypeOf(self.*).appendUniquePrincipal(wake_owners, &wake_count, owner);
     }
     return wake_count;
 }

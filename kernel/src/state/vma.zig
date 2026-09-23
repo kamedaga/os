@@ -446,7 +446,7 @@ pub fn copyForkAnonymousPresentPageToChild(
     const copied_paddr = (self.allocPhysicalPage(free_list) catch return KernelError.OutOfFreePages).paddr;
     var installed = false;
     defer if (!installed) free_list.appendPage(0, copied_paddr) catch {};
-    @TypeOf(self.*).copyPhysicalPage(copied_paddr, src_paddr);
+    if (!@TypeOf(self.*).copyPhysicalPage(copied_paddr, src_paddr)) return KernelError.InvalidState;
     self.ensureEntryCowTable(dest_entry, free_list) catch return KernelError.TableFull;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(dest_entry, va) orelse return KernelError.InvalidState;
     self.setNativeCowPagePaddr(dest_entry.cow_table, cow_page, copied_paddr) catch return KernelError.TableFull;
@@ -599,7 +599,7 @@ pub fn prepareNativeVmaFaultMapping(
         const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
         const vmo_page_index: usize = @intCast(vmo_page);
         const paddr = self.entryDirtyPagePaddr(entry, fault_page_va) orelse
-            (self.nativeVmoResolvedPagePaddr(entry.vmo, vmo_page_index) orelse 0);
+            (self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, vmo_page_index) orelse return .{});
         if (paddr != 0) {
             return .{
                 .kind = .ready,
@@ -609,7 +609,7 @@ pub fn prepareNativeVmaFaultMapping(
                 },
             };
         }
-        if (!entry.flags.anonymous or vmo_page > std.math.maxInt(u32)) return .{};
+        if ((!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) or vmo_page > std.math.maxInt(u32)) return .{};
         return .{
             .kind = .allocate_zero,
             .mapping = .{ .paddr = 0, .prot = @TypeOf(self.*).nativeFaultMappingProt(entry) },
@@ -640,16 +640,20 @@ pub fn commitNativeVmaFaultMapping(
     if (vmo_page != plan.vmo_page_index) return null;
 
     var paddr = self.entryDirtyPagePaddr(entry, plan.fault_page_va) orelse
-        (self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0);
+        (self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return null);
     if (paddr == 0) {
-        if (!entry.flags.anonymous) return null;
+        if (!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return null;
         var page = [_]u64{candidate_paddr};
         self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch |err| {
-            const slot = self.nativeVmoSlotConst(entry.vmo);
-            kernel_log.writeFmt(
-                "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s}\n",
-                .{ @intFromEnum(owner), plan.fault_page_va, vmo_page, if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
-            );
+            // Host unit tests intentionally exhaust this table; port I/O is
+            // available only in the guest. Keep the field diagnostic there.
+            if (!builtin.is_test) {
+                const slot = self.nativeVmoSlotConst(entry.vmo);
+                kernel_log.writeFmt(
+                    "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s}\n",
+                    .{ @intFromEnum(owner), plan.fault_page_va, vmo_page, if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
+                );
+            }
             return null;
         };
         paddr = candidate_paddr;
@@ -660,11 +664,9 @@ pub fn commitNativeVmaFaultMapping(
     };
 }
 
-pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) void {
-    if (builtin.is_test) return;
-    const dst: [*]u8 = @ptrFromInt(dst_paddr);
-    const src: [*]const u8 = @ptrFromInt(src_paddr);
-    @memcpy(dst[0..4096], src[0..4096]);
+pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) bool {
+    if (builtin.is_test) return true;
+    return @import("../user_copy.zig").copyPhysicalPage(dst_paddr, src_paddr);
 }
 
 pub fn replaceVmaPageWithAnonymousPrivatePage(
@@ -788,8 +790,8 @@ pub fn prepareNativeVmaCowMapping(
                 .mapping = writableCowFaultMapping(entry, owned_paddr),
             };
         }
-        const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
-        if (src_paddr == 0 and !entry.flags.anonymous) return .{};
+        const src_paddr = self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return .{};
+        if (src_paddr == 0 and !entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return .{};
         if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
             return .{ .kind = .locked_slow_path };
         }
@@ -832,33 +834,37 @@ pub fn commitNativeVmaCowMapping(
     const page_delta = (plan.fault_page_va - entry.start_va) / native_page_size;
     const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
     if (vmo_page != plan.vmo_page_index) return null;
-    const current_source = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
+    const current_source = self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return null;
     if (current_source != plan.source_paddr) return null;
 
     self.ensureEntryCowTable(entry, free_list) catch |err| {
-        const store = types.vmObjectBackingStoreStats();
-        kernel_log.writeFmt(
-            "cow: commit failure stage=ensure_table err={s} vma_start=0x{x} " ++
-                "vma_pages={} store_used={} store_capacity={} store_free={}\n",
-            .{
-                @errorName(err),
-                entry.start_va,
-                entry.size_bytes / native_page_size,
-                store.used_entries,
-                store.capacity,
-                store.free_entries,
-            },
-        );
+        if (!builtin.is_test) {
+            const store = types.vmObjectBackingStoreStats();
+            kernel_log.writeFmt(
+                "cow: commit failure stage=ensure_table err={s} vma_start=0x{x} " ++
+                    "vma_pages={} store_used={} store_capacity={} store_free={}\n",
+                .{
+                    @errorName(err),
+                    entry.start_va,
+                    entry.size_bytes / native_page_size,
+                    store.used_entries,
+                    store.capacity,
+                    store.free_entries,
+                },
+            );
+        }
         return null;
     };
     if (!self.nativeCowTableIsUnique(entry.cow_table)) return null;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, plan.fault_page_va) orelse return null;
     if (cow_page != plan.cow_page_index and !plan.cow_table.isNull()) return null;
     self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr) catch |err| {
-        kernel_log.writeFmt(
-            "cow: commit failure stage=install_page err={s} vma_start=0x{x} cow_page={}\n",
-            .{ @errorName(err), entry.start_va, cow_page },
-        );
+        if (!builtin.is_test) {
+            kernel_log.writeFmt(
+                "cow: commit failure stage=install_page err={s} vma_start=0x{x} cow_page={}\n",
+                .{ @errorName(err), entry.start_va, cow_page },
+            );
+        }
         return null;
     };
     return writableCowFaultMapping(entry, candidate_paddr);
@@ -923,8 +929,8 @@ pub fn ensureNativeVmaCowMappingLockedSlow(
             }
             return writableCowFaultMapping(entry, owned_paddr);
         }
-        const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
-        if (src_paddr == 0 and !entry.flags.anonymous) return null;
+        const src_paddr = self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return null;
+        if (src_paddr == 0 and !entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return null;
         var invalidate_start_va: u64 = 0;
         var invalidate_size_bytes: u64 = 0;
         if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
@@ -937,7 +943,7 @@ pub fn ensureNativeVmaCowMappingLockedSlow(
         defer if (!installed) free_list.appendPage(0, new_paddr) catch {};
 
         if (src_paddr != 0) {
-            @TypeOf(self.*).copyPhysicalPage(new_paddr, src_paddr);
+            if (!@TypeOf(self.*).copyPhysicalPage(new_paddr, src_paddr)) return null;
         }
         self.ensureEntryCowTable(entry, free_list) catch return null;
         const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, fault_page_va) orelse return null;
@@ -1398,9 +1404,27 @@ pub fn createAnonymousVmoFdWithPages(
         }
     }
     while (allocated < page_count_u64) : (allocated += 1) {
-        pages[allocated] = (try self.allocLowPhysicalPage(free_list)).paddr;
+        // Ordinary VMO pages are not DMA-constrained. Preserve low RAM for
+        // the separate contiguous DMA pool and kernel bootstrap structures.
+        pages[allocated] = (try self.allocPhysicalPage(free_list)).paddr;
     }
     try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
+    return fd;
+}
+
+pub fn createZeroOnDemandVmoFd(
+    self: anytype,
+    owner: PrincipalId,
+    size_bytes: u64,
+    rights: FdRights,
+    flags: FdFlags,
+    min_fd: Fd,
+) KernelError!Fd {
+    if (size_bytes == 0 or size_bytes > @as(u64, max_vmo_backing_pages) * native_page_size)
+        return KernelError.InvalidState;
+    const fd = try self.createAnonymousVmoFd(owner, @TypeOf(self.*).pageAlignUp(size_bytes), rights, flags, min_fd);
+    const ref = self.nativeVmoRefForFd(owner, fd).?;
+    self.nativeVmoSlot(ref).?.zero_on_demand = true;
     return fd;
 }
 
@@ -1547,7 +1571,11 @@ pub fn createAnonymousVmaWithPages(
     try self.requireActiveProcess(owner);
     if (!@TypeOf(self.*).isPageAligned(start_va) or !@TypeOf(self.*).isPageAligned(size_bytes)) return KernelError.InvalidState;
     const page_count_u64 = size_bytes / native_page_size;
-    if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
+    const limit = if (flags.anonymous and flags.private and !flags.shared and flags.noreserve)
+        types.max_vmo_logical_pages
+    else
+        max_vmo_backing_pages;
+    if (page_count_u64 == 0 or page_count_u64 > limit) return KernelError.InvalidState;
     if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
 
     const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
@@ -1949,7 +1977,11 @@ pub fn prepareFixedAnonymousMmap(
         return KernelError.InvalidState;
     }
     const page_count = size_bytes / native_page_size;
-    if (page_count == 0 or page_count > max_vmo_backing_pages) return KernelError.InvalidState;
+    const limit = if (flags.private and !flags.shared and flags.noreserve)
+        types.max_vmo_logical_pages
+    else
+        max_vmo_backing_pages;
+    if (page_count == 0 or page_count > limit) return KernelError.InvalidState;
     var prepared = try prepareFixedMmapSlots(self, owner, start_va, size_bytes, free_list);
     errdefer discardFixedMmapPrepared(self, &prepared, free_list);
     const vmo_ref = try self.createNativeVmo(.anonymous, size_bytes);
@@ -2012,10 +2044,9 @@ pub fn prepareFixedFdMmapIntoProcess(
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
         return KernelError.InvalidState;
-    // Shared/default mappings retain the same fully backed pages as mmapFd.
-    // Unlike anonymous faults, file-VMO faults cannot allocate absent pages.
-    // Reject sparse backing before reserving slots or removing the old view.
-    if (!flags.private) {
+    // Ordinary shared VMOs still promise full backing. Only explicit
+    // zero-on-demand objects may defer allocation until after replacement.
+    if (!flags.private and !self.nativeVmoIsZeroOnDemand(vmo_ref)) {
         if (!@TypeOf(self.*).isPageAligned(size_bytes)) return KernelError.InvalidState;
         var offset = vmo_offset;
         while (offset < vmo_end) : (offset += native_page_size) {
@@ -2383,7 +2414,10 @@ pub fn prepareMremapWithFreeList(
             }
             if (src_paddr == 0) continue;
             const dst_paddr = (try self.allocPhysicalPage(free_list)).paddr;
-            @TypeOf(self.*).copyPhysicalPage(dst_paddr, src_paddr);
+            if (!@TypeOf(self.*).copyPhysicalPage(dst_paddr, src_paddr)) {
+                free_list.appendPage(0, dst_paddr) catch {};
+                return KernelError.InvalidState;
+            }
             var page = [_]u64{dst_paddr};
             self.installNativeVmoPages(dst_vmo, page_index, page[0..]) catch |err| {
                 free_list.appendPage(0, dst_paddr) catch {};

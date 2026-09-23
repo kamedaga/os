@@ -1,4 +1,5 @@
 const std = @import("std");
+const iova = @import("iova.zig");
 
 const dmar_fixed_bytes: usize = 48;
 const remapping_header_bytes: usize = 4;
@@ -34,6 +35,9 @@ pub const Drhd = struct {
 };
 
 pub const DmarInfo = struct {
+    /// Conservative continuous window: exclude every RMRR, irrespective of
+    /// device scope. This is not RMRR identity-mapping support.
+    dma_window_end: u64 = iova.window_ceiling,
     /// ACPI encodes this field as one less than the supported address width.
     host_address_width: u8 = 0,
     flags: u8 = 0,
@@ -58,6 +62,7 @@ pub const ParseError = error{
     InvalidDeviceScopeLength,
     TooManyDeviceScopes,
     DeviceScopePathTooLong,
+    InvalidReservedRange,
 };
 
 pub const PhysicalTable = struct {
@@ -89,8 +94,8 @@ fn checksumOk(bytes: []const u8) bool {
 }
 
 /// Parse a complete DMAR byte sequence without accessing physical memory or
-/// producing output. Only type-0 DRHD structures are retained; all other
-/// well-formed remapping structures are skipped.
+/// producing output. DRHDs are retained; RMRRs clip the DMA window without a
+/// bounded reservation array. Other well-formed structures are skipped.
 pub fn parseDmar(bytes: []const u8) ParseError!DmarInfo {
     if (bytes.len < dmar_fixed_bytes) return error.TableTooShort;
     if (!std.mem.eql(u8, bytes[0..4], "DMAR")) return error.InvalidSignature;
@@ -156,6 +161,28 @@ pub fn parseDmar(bytes: []const u8) ParseError!DmarInfo {
             }
             result.drhds[result.drhd_count] = drhd;
             result.drhd_count += 1;
+        } else if (structure_type == 1) {
+            // ACPI DMAR RMRR: header, reserved, segment, base, inclusive limit,
+            // followed by device scopes. Bounds follow actbl1.h / DMAR format.
+            if (structure_len < 24 + 8) return error.InvalidStructureLength;
+            const base = readLe64(table, offset + 8);
+            const last = readLe64(table, offset + 16);
+            if (base > last or base % 4096 != 0 or last % 4096 != 4095)
+                return error.InvalidReservedRange;
+            var scope = offset + 24;
+            const end = offset + structure_len;
+            while (scope < end) {
+                if (end - scope < 8) return error.TruncatedDeviceScope;
+                const length: usize = table[scope + 1];
+                if (length < 8 or length % 2 != 0 or length > end - scope or
+                    (table[scope] != 1 and table[scope] != 2)) return error.InvalidDeviceScopeLength;
+                var path = scope + 6;
+                while (path < scope + length) : (path += 2) {
+                    if (table[path] >= 32 or table[path + 1] >= 8) return error.InvalidDeviceScopeLength;
+                }
+                scope += length;
+            }
+            result.dma_window_end = iova.exclude(iova.window_start, result.dma_window_end, base, last);
         }
         offset += structure_len;
     }

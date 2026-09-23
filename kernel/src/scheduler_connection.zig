@@ -2457,9 +2457,7 @@ pub fn suspendedThreadImage(
 
 // The caller holds thread_table and all CPU ownership locks. A stopped
 // syscall wait can still receive a completion, so it is not an editable frame.
-fn controlledThreadAvailableLocked(ctx: *const ThreadContext, thread_index: usize,
-    generation: u32, owner: kernel.PrincipalId) bool
-{
+fn controlledThreadAvailableLocked(ctx: *const ThreadContext, thread_index: usize, generation: u32, owner: kernel.PrincipalId) bool {
     if (!ctx.allocated or ctx.generation != generation or ctx.owner_process != owner or
         ctx.ready or ctx.wait_mailbox or ctx.active_wait_token != 0 or
         ctx.wait_completion_claimed or ctx.wait_completion_publish_pending or
@@ -2470,28 +2468,21 @@ fn controlledThreadAvailableLocked(ctx: *const ThreadContext, thread_index: usiz
     return true;
 }
 
-pub fn getControlledThreadContext(thread_index: usize, generation: u32,
-    owner: kernel.PrincipalId, out: *process_abi.ThreadUserContext) bool
-{
+pub fn getControlledThreadContext(thread_index: usize, generation: u32, owner: kernel.PrincipalId, out: *process_abi.ThreadUserContext) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     lockAllCpuSchedulerStates();
     defer unlockAllCpuSchedulerStates();
     const ctx = threadContext(thread_index) orelse return false;
     if (!controlledThreadAvailableLocked(ctx, thread_index, generation, owner)) return false;
-    out.* = .{ .size = process_abi.thread_user_context_size,
-        .xstate_features = process_abi.signal_xstate_feature_mask,
-        .fs_base = ctx.fs_base, .gs_base = ctx.gs_base, .pkru = ctx.pkru,
-        .reserved = .{ 0, 0, 0 }, .registers = undefined, .xstate = ctx.x_state };
+    out.* = .{ .size = process_abi.thread_user_context_size, .xstate_features = process_abi.signal_xstate_feature_mask, .fs_base = ctx.fs_base, .gs_base = ctx.gs_base, .pkru = ctx.pkru, .reserved = .{ 0, 0, 0 }, .registers = undefined, .xstate = ctx.x_state };
     inline for (std.meta.fields(process_abi.ThreadRegisters)) |field|
         @field(out.registers, field.name) = @field(ctx.frame, field.name);
     return true;
 }
 
 /// The syscall validated the complete architectural image before this commit.
-pub fn setControlledThreadContext(thread_index: usize, generation: u32,
-    owner: kernel.PrincipalId, image: *const process_abi.ThreadUserContext) bool
-{
+pub fn setControlledThreadContext(thread_index: usize, generation: u32, owner: kernel.PrincipalId, image: *const process_abi.ThreadUserContext) bool {
     scheduler_state.thread_table.lock();
     defer scheduler_state.thread_table.unlock();
     lockAllCpuSchedulerStates();
@@ -2517,10 +2508,7 @@ test "controlled thread context timed wait completion ordering" {
         const owner = kernel.processPrincipalFromIndex(0).?;
         const node = &initial_scheduler_entities[tid];
         const ctx = &initial_thread_contexts[tid];
-        ctx.* = .{ .id = tid, .allocated = true, .generation = generation,
-            .owner_process = owner, .scheduler_entity = node,
-            .cpu_affinity_mask = 1, .ready = false, .wait_mailbox = true,
-            .active_wait_token = token, .wake_tick = 100 };
+        ctx.* = .{ .id = tid, .allocated = true, .generation = generation, .owner_process = owner, .scheduler_entity = node, .cpu_affinity_mask = 1, .ready = false, .wait_mailbox = true, .active_wait_token = token, .wake_tick = 100 };
         defer ctx.* = .{ .id = tid, .scheduler_entity = node };
         defer initial_thread_hot_states[tid] = .{};
         scheduler_state.cpu_count = 1;
@@ -2530,24 +2518,19 @@ test "controlled thread context timed wait completion ordering" {
         syncHotStateFromContext(tid);
         ctx.frame.rax = 123; // Timeout return value already saved by block.
         if (winner == 0) {
-            try std.testing.expectEqual(.claimed,
-                claimWaitTokenCompletion(tid, generation, owner, token));
+            try std.testing.expectEqual(.claimed, claimWaitTokenCompletion(tid, generation, owner, token));
             wakeIfTimerExpired(tid, 100);
             try std.testing.expect(!ctx.ready and ctx.wait_completion_claimed);
             try std.testing.expectEqual(@as(u64, 0), ctx.wake_tick);
-            try std.testing.expectEqual(.published,
-                publishClaimedWaitCompletion(tid, generation, owner, token, 456));
+            try std.testing.expectEqual(.published, publishClaimedWaitCompletion(tid, generation, owner, token, 456));
         } else {
             if (winner == 1) {
                 wakeIfTimerExpired(tid, 100);
             } else {
-                try std.testing.expectEqual(.woke,
-                    wakeIfWaitingTokenGenerationWithRax(tid, generation, owner, token, 123));
+                try std.testing.expectEqual(.woke, wakeIfWaitingTokenGenerationWithRax(tid, generation, owner, token, 123));
             }
-            try std.testing.expectEqual(.stale,
-                claimWaitTokenCompletion(tid, generation, owner, token));
-            try std.testing.expectEqual(.stale,
-                publishClaimedWaitCompletion(tid, generation, owner, token, 456));
+            try std.testing.expectEqual(.stale, claimWaitTokenCompletion(tid, generation, owner, token));
+            try std.testing.expectEqual(.stale, publishClaimedWaitCompletion(tid, generation, owner, token, 456));
         }
         wakeIfTimerExpired(tid, 101);
         try std.testing.expect(ctx.ready and !ctx.wait_mailbox);
@@ -2563,8 +2546,7 @@ test "controlled thread context requires quiescence and keeps wait lifecycle int
     const tid = 4;
     const ctx = &initial_thread_contexts[tid];
     const owner = kernel.processPrincipalFromIndex(0).?;
-    ctx.* = .{ .id = tid, .allocated = true, .generation = 17, .owner_process = owner,
-        .stopped = true, .resume_after_stop = true, .fs_base = 0x4100_0000 };
+    ctx.* = .{ .id = tid, .allocated = true, .generation = 17, .owner_process = owner, .stopped = true, .resume_after_stop = true, .fs_base = 0x4100_0000 };
     defer ctx.* = .{ .id = tid, .scheduler_entity = &initial_scheduler_entities[tid] };
     var image: process_abi.ThreadUserContext = undefined;
     try std.testing.expect(!getControlledThreadContext(tid, 16, owner, &image));
@@ -2910,29 +2892,94 @@ pub fn handoffToReadyThreadGenerationWithRax(
 /// keeps the runqueue ownership transition atomic and preserves the
 /// interrupted thread as runnable on this CPU.
 pub fn handoffToBestReadyThreadForWakeIpi(frame: *TrapFrame) bool {
+    return handoffToBestReadyThreadWithRax(frame, frame.rax, null);
+}
+
+// Yield and wake-IPI handoff differ only in the outgoing return value and
+// the syscall lock-release callback. Keep selection and generation checks
+// shared so neither path can enqueue a running thread twice.
+pub fn handoffToBestReadyThreadWithRax(
+    frame: *TrapFrame,
+    sender_rax: u64,
+    before_current_thread_leave: ?BeforeCurrentThreadLeaveCallback,
+) bool {
     if (!verifiedCoreReady()) return false;
     const cpu_id = currentCpu();
     if (cpu_id >= verifiedCoreCpuCount()) return false;
     const current_thread = currentThread();
-    const state = schedulerStateForSlot(cpu_id) orelse return false;
+    const target = bestReadyThreadForCpu(cpu_id, current_thread) orelse return false;
+
+    return handoffToReadyThreadGenerationWithRax(
+        frame,
+        target.thread_index,
+        target.generation,
+        sender_rax,
+        before_current_thread_leave,
+    );
+}
+
+fn bestReadyThreadForCpu(cpu_id: usize, current_thread: usize) ?PickedThread {
+    const state = schedulerStateForSlot(cpu_id) orelse return null;
 
     state.runqueue_lock.lock();
     const target = state.runqueue.bestEligible(state.virtual_time) orelse {
         state.runqueue_lock.unlock();
-        return false;
+        return null;
     };
     const target_thread = target.thread_index;
     const target_generation = target.generation;
     state.runqueue_lock.unlock();
-    if (target_thread == current_thread) return false;
+    if (target_thread == current_thread) return null;
+    return .{ .thread_index = target_thread, .generation = target_generation };
+}
 
-    return handoffToReadyThreadGenerationWithRax(
-        frame,
-        target_thread,
-        target_generation,
-        frame.rax,
-        null,
-    );
+test "yield handoff keeps runnable ownership and rolls back without duplication" {
+    for ([_]usize{ 0, 1, 5, 63 }) |cpu| {
+        initializeStaticStorage();
+        defer initializeStaticStorage();
+        scheduler_state.cpu_count = cpu + 1;
+        const state = &scheduler_state.cpus[cpu];
+        state.enabled = true;
+        const tid = 4;
+        for (tid..tid + 2) |index| {
+            const node = &initial_scheduler_entities[index];
+            const ctx = &initial_thread_contexts[index];
+            ctx.* = .{ .id = @intCast(index), .allocated = true, .ready = true, .scheduler_entity = node, .cpu_slot = cpu };
+            node.cpu_slot = cpu;
+            try std.testing.expectEqual(.ok, verified_sched.pacha_eevdf_entity_init(
+                @intCast(index + 1),
+                1,
+                1024,
+                4_000_000,
+                0,
+                &node.entity,
+            ));
+            node.ownership = .runnable;
+            try std.testing.expect(state.runqueue.insert(node));
+            if (index == tid) {
+                const picked = verifiedPickThreadForCpu(cpu) orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, tid), picked.thread_index);
+                try std.testing.expect(bestReadyThreadForCpu(cpu, tid) == null);
+            }
+        }
+        defer for (tid..tid + 2) |index| {
+            initial_thread_contexts[index] = .{ .id = @intCast(index), .scheduler_entity = &initial_scheduler_entities[index] };
+        };
+        const peer = bestReadyThreadForCpu(cpu, tid) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, tid + 1), peer.thread_index);
+        try std.testing.expect(!verifiedHandoffToThreadOnCpu(cpu, peer.thread_index, peer.generation + 1, tid, 1));
+        try std.testing.expectEqual(@as(usize, 1), state.runqueue.count);
+        try std.testing.expect(verifiedHandoffToThreadOnCpu(cpu, peer.thread_index, peer.generation, tid, 1));
+        try std.testing.expectEqual(.runnable, initial_scheduler_entities[tid].ownership);
+        try std.testing.expectEqual(.running, initial_scheduler_entities[tid + 1].ownership);
+        try std.testing.expectEqual(@as(usize, 1), state.runqueue.count);
+        try std.testing.expect(!verifiedHandoffToThreadOnCpu(cpu, tid + 1, 1, tid, 1));
+        verifiedRollbackHandoff(cpu, tid, 1);
+        try std.testing.expectEqual(.running, initial_scheduler_entities[tid].ownership);
+        try std.testing.expectEqual(.runnable, initial_scheduler_entities[tid + 1].ownership);
+        try std.testing.expectEqual(@as(usize, 1), state.runqueue.count);
+        try std.testing.expect(state.current_entity == &initial_scheduler_entities[tid]);
+    }
 }
 
 pub fn prepareExitHandoffToReadyThreadGeneration(target_thread: usize, target_generation: u32) bool {

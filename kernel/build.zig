@@ -99,6 +99,26 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run kernel unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    const clock_copy_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime_clock_copy_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    clock_copy_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const clock_copy_tests = b.addTest(.{ .root_module = clock_copy_mod, .filters = &.{ "timespec copyout", "yield result" } });
+    const run_clock_copy = b.addRunArtifact(clock_copy_tests);
+    test_step.dependOn(&run_clock_copy.step);
+    b.step("test-runtime-clock", "Test checked timespec copyout").dependOn(&run_clock_copy.step);
+    const ipc_metric_mod = b.createModule(.{
+        .root_source_file = b.path("src/ipc_metric_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ipc_metric_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const ipc_metric_tests = b.addTest(.{ .root_module = ipc_metric_mod, .filters = &.{"principal syscall counts"} });
+    const run_ipc_metric = b.addRunArtifact(ipc_metric_tests);
+    test_step.dependOn(&run_ipc_metric.step);
+    b.step("test-ipc-metric", "Test bounded diagnostic syscall counts").dependOn(&run_ipc_metric.step);
     const mmio_overlay_mod = b.createModule(.{
         .root_source_file = b.path("src/mmio_overlay_test.zig"),
         .target = target,
@@ -126,7 +146,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }) });
     test_step.dependOn(&b.addRunArtifact(realtime_clock_tests).step);
-    for ([_][]const u8{ "src/hpet.zig", "src/clockevent.zig", "src/acpi_tables.zig", "src/pci.zig" }) |source| {
+    for ([_][]const u8{ "src/hpet.zig", "src/lapic.zig", "src/clockevent.zig", "src/acpi_tables.zig", "src/pci.zig" }) |source| {
         const clock_test_mod = b.createModule(.{
             .root_source_file = b.path(source),
             .target = target,
@@ -193,7 +213,7 @@ pub fn build(b: *std.Build) void {
     addVerifiedSchedulerHostObject(b, scheduler_context_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_context_test.o");
     const scheduler_context_tests = b.addTest(.{
         .root_module = scheduler_context_test_mod,
-        .filters = &.{ "migration waits", "preferred wake", "controlled thread context" },
+        .filters = &.{ "migration waits", "preferred wake", "controlled thread context", "yield handoff" },
     });
     test_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
 
@@ -203,7 +223,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     smp_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
-    const smp_tests = b.addTest(.{ .root_module = smp_test_mod, .filters = &.{"broadcast"} });
+    const smp_tests = b.addTest(.{ .root_module = smp_test_mod, .filters = &.{ "broadcast", "MMIO alias" } });
     test_step.dependOn(&b.addRunArtifact(smp_tests).step);
 
     const kernel_debug = b.option(bool, "kernel-debug", "Keep kernel debug information and symbols in the boot ELF") orelse false;

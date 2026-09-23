@@ -1,0 +1,8 @@
+# Alpine v3.22 x86_64 kernel module lock.
+# Populate deliberately with:
+# python3 pack/scripts/alpine_packages.py refresh \
+#   --lock tools/manifests/alpine-kobox-kernel-v3.22-x86_64.lock \
+#   --cache .artifacts/third_party/alpine-kobox-kernel-v3.22-x86_64
+# section package version sha256
+# package-count 1
+main linux-lts 6.12.110-r0 9533516cec2090a0a4af51c0bb697444b2e14ecdbff65cea05a44bf50e48f7b2

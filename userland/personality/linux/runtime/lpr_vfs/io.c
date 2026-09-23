@@ -144,7 +144,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
     if (batch_whole_file) {
         page_start = 0;
         fill_length = file->stat_size;
-        lpr_page_cache_invalidate_handle(file->handle);
+        lpr_page_cache_invalidate_handle_locked(file->handle);
     }
     lpr_filed_page_cache_entry_t *entry =
         lpr_page_cache_find_marker(file->handle, page_start);
@@ -225,7 +225,7 @@ static lpr_filed_page_cache_entry_t *lpr_page_cache_get(
     return lpr_page_cache_fill(file, fd, offset, requested);
 }
 
-static int64_t lpr_read_from_page_cache(
+static int64_t lpr_read_from_page_cache_locked(
     const lpr_filed_backend_t *file,
     uint64_t fd,
     uint64_t buf,
@@ -274,7 +274,86 @@ static int64_t lpr_read_from_page_cache(
     return (int64_t)requested;
 }
 
+static int64_t lpr_read_from_page_cache(
+    const lpr_filed_backend_t *file, uint64_t fd, uint64_t buf,
+    uint64_t requested, uint64_t offset)
+{
+    /* A fill can yield in IPC. Protect both slot selection and the final
+     * copy, otherwise another reader can reuse the same cache entry. */
+    lpr_state_lock(&lpr_state.caches.page_lock_word);
+    const int64_t result = lpr_read_from_page_cache_locked(file, fd, buf, requested, offset);
+    lpr_state_unlock(&lpr_state.caches.page_lock_word);
+    return result;
+}
+
+#if defined(LPR_ELF_READ_DIAG) && LPR_ELF_READ_DIAG
+/* Diagnostic level 2 suppresses structurally normal loader reads. Serial
+ * output for every library in every WebProcess distorts startup timings.
+ * This is only a log filter: never change the result or retry a failed read. */
+#if LPR_ELF_READ_DIAG > 1
+static int lpr_elf_read_diag_normal(uint64_t buf, int64_t result)
+{
+    if (result != 960 || buf == 0) return 0;
+    const unsigned char *b = (const unsigned char *)(uintptr_t)buf;
+    if (b[0] != 0x7f || b[1] != 'E' || b[2] != 'L' || b[3] != 'F' ||
+        b[4] != 2 || b[5] != 1 || (b[16] != 2 && b[16] != 3) || b[17])
+        return 0;
+    uint64_t phoff;
+    lpr_memcpy(&phoff, b + 32, sizeof(phoff));
+    const unsigned stride = b[54] | (unsigned)b[55] << 8;
+    const unsigned count = b[56] | (unsigned)b[57] << 8;
+    if (phoff > 960 || stride < 56 || count > (960 - phoff) / stride)
+        return 0;
+    for (unsigned i = 0; i < count; ++i) {
+        const unsigned char *ph = b + phoff + (uint64_t)i * stride;
+        uint32_t type;
+        uint64_t address;
+        lpr_memcpy(&type, ph, sizeof(type));
+        lpr_memcpy(&address, ph + 16, sizeof(address));
+        if (type == 2 && address != 0) return 1;
+    }
+    return 0;
+}
+#endif
+static int64_t lpr_backend_read_impl(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count);
 int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+{
+    const int64_t result = lpr_backend_read_impl(pin, buf, count);
+    if (pin && pin->ops_id == LPR_FD_OPS_FILED && count == 960) {
+#if LPR_ELF_READ_DIAG > 1
+        if (lpr_elf_read_diag_normal(buf, result)) return result;
+#endif
+        const lpr_filed_backend_t *file = pin->state;
+        /* The native LOG syscall rejects (not truncates) messages > 256
+         * bytes. Keep room for long library paths as well as the header. */
+        char line[256];
+        unsigned n = 0;
+        const char *prefix = "[lpr-elf-read] ";
+        while (*prefix) line[n++] = *prefix++;
+        uint64_t values[] = {lpr_linux_current_pid, pin->fd, (uint64_t)result,
+            file->handle, lpr_filed_control_offset(pin->fd)};
+        for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+            for (int shift = 60; shift >= 0; shift -= 4)
+                line[n++] = "0123456789abcdef"[(values[i] >> shift) & 15];
+            line[n++] = ' ';
+        }
+        const unsigned char *bytes = (const unsigned char *)(uintptr_t)buf;
+        for (unsigned i = 0; result > 0 && i < 32 && i < (uint64_t)result; ++i) {
+            line[n++] = "0123456789abcdef"[bytes[i] >> 4];
+            line[n++] = "0123456789abcdef"[bytes[i] & 15];
+        }
+        line[n++] = ' ';
+        for (unsigned i = 0; file->open_path[i] && n < sizeof(line)-1; ++i)
+            line[n++] = file->open_path[i];
+        line[n++] = '\n';
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG, (uint64_t)(uintptr_t)line, n);
+    }
+    return result;
+}
+static int64_t lpr_backend_read_impl(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+#else
+int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
+#endif
 {
     if (pin == 0 || pin->state == 0) {
         return -LPR_LINUX_EBADF;
@@ -591,6 +670,7 @@ int64_t lpr_backend_readv(
             lpr_readv_cache_bytes += requested;
             lpr_trace_readv_size(fd, iov_count, requested, 1, offset);
             if (requested <= LPR_FILED_PAGE_CACHE_BYTES) {
+                lpr_state_lock(&lpr_state.caches.page_lock_word);
                 const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
                 const uint64_t page_offset = offset - page_start;
                 if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
@@ -610,6 +690,7 @@ int64_t lpr_backend_readv(
                             requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
                         file->pread_active = 1;
+                        lpr_state_unlock(&lpr_state.caches.page_lock_word);
                         return (int64_t)requested;
                     }
                 } else {
@@ -642,9 +723,11 @@ int64_t lpr_backend_readv(
                         (void)lpr_scatter_iov(iov, iov_count, cache_scratch, requested);
                         lpr_filed_control_advance_offset(fd, offset, requested);
                         file->pread_active = 1;
+                        lpr_state_unlock(&lpr_state.caches.page_lock_word);
                         return (int64_t)requested;
                     }
                 }
+                lpr_state_unlock(&lpr_state.caches.page_lock_word);
             }
             lpr_readv_cache_fallback++;
             uint8_t scratch[FILED_IO_BYTES];

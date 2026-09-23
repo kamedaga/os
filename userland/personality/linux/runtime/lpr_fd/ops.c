@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../support/browser_diag.h"
 
 #define LPR_LINUX_EMSGSIZE 90
 
@@ -741,6 +742,7 @@ static int64_t lpr_fd_dispatch_io(
     }
     lpr_fd_pin_t pin;
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
+        lpr_browser_diag("io-missing", fd, operation, lpr_control_fd_table.entry_count);
         return -LPR_LINUX_EBADF;
     }
     uint32_t required_right = 0;
@@ -758,6 +760,10 @@ static int64_t lpr_fd_dispatch_io(
         result = -LPR_LINUX_EBADF;
     else if (required_right != 0 && lpr_fd_io_supported(pin.ops_id, operation))
         result = lpr_fd_dispatch_direct(&pin, arg0, arg1, operation);
+    if (pin.ops_id == LPR_FD_OPS_EVENT && result < 0 &&
+        result != -LPR_LINUX_EAGAIN && result != -LPR_LINUX_EINTR) {
+        lpr_browser_diag("event-io-error", fd, operation, (uint64_t)result);
+    }
     lpr_fd_unpin(&pin);
     if (operation <= 3)
         lpr_epoll_note_fd_state(
@@ -881,6 +887,8 @@ int64_t lpr_backend_finish_drop(const lpr_fd_drop_t *drop)
         return 0;
     }
     const int64_t close_status = lpr_fd_close_backend(drop->ops_id, drop->state);
+    if (close_status) lpr_browser_diag("backend-close", drop->ops_id,
+        (uint64_t)close_status, *(const uint64_t *)((const unsigned char *)drop->state + 8));
     const int64_t free_status =
         lpr_backend_state_free(drop->state, drop->state_bytes);
     return close_status != 0 ? close_status : free_status;

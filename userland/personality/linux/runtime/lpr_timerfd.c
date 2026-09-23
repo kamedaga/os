@@ -1,4 +1,5 @@
 #include "lpr_filed_internal.h"
+#include "lpr_fd/allocate.h"
 
 #define LPR_TIMERFD_CLOEXEC 02000000ull
 #define LPR_TIMERFD_NONBLOCK 00004000ull
@@ -87,38 +88,22 @@ int64_t lpr_linux_timerfd_create(uint64_t clock_id, uint64_t flags)
     if ((flags & ~(LPR_TIMERFD_CLOEXEC | LPR_TIMERFD_NONBLOCK)) != 0) {
         return -LPR_LINUX_EINVAL;
     }
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) {
-        return fd;
-    }
     int wait_fd = -1;
     int notify_fd = -1;
     const int pair_status = lpr_native_wait_pair(&wait_fd, &notify_fd);
     if (pair_status != 0) return pair_status;
-    const int status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_EVENT,
-        flags,
-        (uint64_t)(uint32_t)fd,
-        0);
-    if (status != 0) {
+    const lpr_event_backend_t record = {
+        .active = 1, .subtype = LPR_EVENT_BACKEND_TIMERFD,
+        .flags = (uint32_t)flags, .clock_id = (int32_t)clock_id,
+        .wait_fd.raw = wait_fd, .notify_fd.raw = notify_fd,
+    };
+    const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EVENT, flags, 0,
+        &record, sizeof(record));
+    if (fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
-        return status;
+        return fd;
     }
-    lpr_event_backend_t *timer = lpr_event_backend((uint64_t)(uint32_t)fd);
-    if (timer == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
-        return -LPR_LINUX_EIO;
-    }
-    timer->active = 1;
-    timer->subtype = LPR_EVENT_BACKEND_TIMERFD;
-    timer->flags = (uint32_t)flags;
-    timer->clock_id = (int32_t)clock_id;
-    timer->wait_fd.raw = wait_fd;
-    timer->notify_fd.raw = notify_fd;
     return fd;
 }
 

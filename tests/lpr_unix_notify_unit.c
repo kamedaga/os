@@ -2,10 +2,11 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 lpr_state_t lpr_state;
 static struct { unsigned live; uint32_t notification; } caps[256];
-static unsigned resolves, sends, relays, closes;
+static unsigned resolves, sends, relays, closes, logs;
 static int resolve_status, relay_status, bad_cap;
 static int64_t send_status;
 
@@ -17,6 +18,11 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address)
 {
+    if (nr == PACHAOS_SYSCALL_LOG) {
+        assert(address == 109 && memcmp((void *)(uintptr_t)fd, "[unix] ", 7) == 0);
+        ++logs;
+        return 0;
+    }
     assert(fd < 256 && caps[fd].live);
     if (nr == PACHAOS_SYSCALL_FD_GET_INFO) {
         struct pacha_fd_info *info = (struct pacha_fd_info *)(uintptr_t)address;
@@ -82,12 +88,15 @@ int main(void)
     unix_wait_disarm(&rx->waiters, &second);
     assert(unix_wait_arm(&tx->waiters, &tx->changes, &rx->changes, 1, 10, &first) == 0);
     assert(unix_wait_arm(&rx->waiters, &tx->changes, &rx->changes, 2, 11, &second) == 0);
-    send_status = PACHA_SYSCALL_ERR_ALLOC;
-    assert(lpr_unix_notifier_signal(&notifier, 10, tx, rx) == 0);
-    assert(resolves == 2 && !relays && !closes); /* full queue already has a wake */
     send_status = PACHA_SYSCALL_ERR_NOT_READY;
     assert(lpr_unix_notifier_signal(&notifier, 10, tx, rx) == 0);
-    assert(relays == 2 && closes == 2); /* NOT_READY is not proof of pending data */
+    assert(resolves == 2 && !relays && !closes); /* full queue already has a wake */
+    send_status = -PACHA_SYSCALL_ERR_NOT_READY;
+    assert(lpr_unix_notifier_signal(&notifier, 10, tx, rx) == 0);
+    assert(resolves == 2 && !relays && !closes && !logs);
+    send_status = PACHA_SYSCALL_ERR_ALLOC;
+    assert(lpr_unix_notifier_signal(&notifier, 10, tx, rx) == 0);
+    assert(relays == 2 && closes == 2); /* allocation failure is not a queued wake */
     empty_caps();
     send_status = 0; resolve_status = -EMFILE;
     assert(lpr_unix_notifier_signal(&notifier, 10, tx, rx) == 0);
@@ -121,5 +130,5 @@ int main(void)
     assert(lpr_unix_notifier_signal(&notifier, 10, tx, rx) == -EOVERFLOW);
     lpr_unix_notifier_destroy(&notifier); empty_caps();
     free(tx); free(rx);
-    puts("lpr unix notify: warm SEND, queue-full vs NOT_READY, FD-pressure relay, cap validation, forged ID, fork cleanup passed");
+    puts("lpr unix notify: warm SEND, NOT_READY queue-full vs ALLOC, FD-pressure relay, cap validation, forged ID, fork cleanup passed");
 }

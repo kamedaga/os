@@ -143,6 +143,81 @@ const IpcChannelPair = struct {
     b: Fd,
 };
 
+// Failure-only diagnostic, serialized by the kernel state lock. Keep scans
+// and serial output off the successful allocation path and bound the output.
+var channel_full_reports: usize = 0;
+
+pub fn channelDiagnosticStaticEndAddr() usize {
+    return @intFromPtr(&channel_full_reports) + @sizeOf(@TypeOf(channel_full_reports));
+}
+
+fn reportChannelTableFull(self: anytype) void {
+    if (builtin.is_test or channel_full_reports >= 4) return;
+    channel_full_reports += 1;
+    var active: usize = 0;
+    var refs = [_]usize{0} ** 4;
+    var queued: usize = 0;
+    for (&self.ipc_channels) |*slot| {
+        if (!slot.active) continue;
+        active += 1;
+        refs[@min(@as(usize, slot.ref_count), refs.len - 1)] += 1;
+        queued += @as(usize, slot.queues[0].len) + @as(usize, slot.queues[1].len);
+    }
+    var endpoint_objects: usize = 0;
+    var endpoint_refs: u64 = 0;
+    for (&self.fd_objects) |*slot| {
+        if (slot.kind != .channel) continue;
+        endpoint_objects += 1;
+        endpoint_refs += slot.ref_count;
+    }
+    @import("../kernel_log.zig").writeFmt(
+        "ipc: channel-table-full report={} active={} capacity={} refs0={} refs1={} refs2={} refs_other={} queued={} endpoint_objects={} endpoint_refs={}\n",
+        .{ channel_full_reports, active, max_ipc_channels, refs[0], refs[1], refs[2], refs[3], queued, endpoint_objects, endpoint_refs },
+    );
+    // FD counts include aliases and inherited descriptors. Unique channels
+    // distinguish those from independently allocated channel pairs. Rights
+    // counts overlap: one descriptor can contribute to several columns.
+    for (0..self.process_capacity) |process_index| {
+        const desc = self.processDescriptorSlotConst(process_index) orelse continue;
+        if (!desc.active) continue;
+        const principal = processPrincipalFromIndex(process_index) orelse continue;
+        const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
+        var channels = std.StaticBitSet(max_ipc_channels).initEmpty();
+        var counts = struct {
+            fds: usize = 0,
+            send: usize = 0,
+            recv: usize = 0,
+            call: usize = 0,
+            wait: usize = 0,
+            poll: usize = 0,
+            transfer: usize = 0,
+            dup: usize = 0,
+            cloexec: usize = 0,
+            private: usize = 0,
+        }{};
+        for (table.slots()) |entry| {
+            if (entry.object.kind != .channel) continue;
+            const object = self.kernelObjectSlotConst(entry.object) orelse continue;
+            counts.fds += 1;
+            counts.send += @intFromBool(entry.rights.send);
+            counts.recv += @intFromBool(entry.rights.recv);
+            counts.call += @intFromBool(entry.rights.call);
+            counts.wait += @intFromBool(entry.rights.wait);
+            counts.poll += @intFromBool(entry.rights.poll);
+            counts.transfer += @intFromBool(entry.rights.transfer);
+            counts.dup += @intFromBool(entry.rights.dup);
+            counts.cloexec += @intFromBool(entry.flags.cloexec);
+            counts.private += @intFromBool(entry.flags.private);
+            const channel = object.payload.channel.channel;
+            if (self.ipcChannelSlotConst(channel) != null) channels.set(@intCast(channel.index));
+        }
+        @import("../kernel_log.zig").writeFmt(
+            "ipc: channel-owner report={} principal={} label={s} fds={} channels={} send={} recv={} call={} wait={} poll={} transfer={} dup={} cloexec={} private={}\n",
+            .{ channel_full_reports, @intFromEnum(principal), desc.label, counts.fds, channels.count(), counts.send, counts.recv, counts.call, counts.wait, counts.poll, counts.transfer, counts.dup, counts.cloexec, counts.private },
+        );
+    }
+}
+
 pub fn releaseIpcMessage(self: anytype, msg: *IpcMessage) void {
     var i: usize = 0;
     while (i < msg.fd_count and i < max_ipc_message_fds) : (i += 1) {
@@ -260,6 +335,7 @@ pub fn createIpcChannel(self: anytype) KernelError!IpcChannelRef {
         self.next_ipc_channel_scan = (index + 1) % max_ipc_channels;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
+    reportChannelTableFull(self);
     return KernelError.TableFull;
 }
 

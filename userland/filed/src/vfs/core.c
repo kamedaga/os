@@ -4,8 +4,8 @@ static uint64_t filed_vfs_next_vnode_clock(filed_vfs_t *vfs)
 {
     if (vfs->vnode_clock == UINT64_MAX) {
         uint64_t next = 1;
-        for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-            filed_vnode_t *vnode = &vfs->vnodes[i];
+        for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+            filed_vnode_t *vnode = filed_vfs_vnode_at(vfs, i);
             if (vnode->active) {
                 vnode->last_used = next++;
             }
@@ -27,8 +27,8 @@ static void filed_reclaim_result_set(
     if (out_reclaim == NULL || vnode == NULL || vnode->backend_object == 0) {
         return;
     }
-    for (uint32_t i = 0; vfs != NULL && i < FILED_MAX_VNODES; ++i) {
-        const filed_vnode_t *alias = &vfs->vnodes[i];
+    for (uint32_t i = 0; vfs != NULL && i < vfs->vnode_capacity; ++i) {
+        const filed_vnode_t *alias = filed_vfs_vnode_at(vfs, i);
         if (alias != vnode &&
             alias->active &&
             alias->backend_object == vnode->backend_object &&
@@ -66,9 +66,9 @@ static filed_vnode_t *filed_find_child_vnode(
         hash = (hash ^ *p) * 16777619u;
     }
     const uint32_t hint_index = hash & (FILED_ID_HINT_SLOTS - 1u);
-    const uint16_t hinted_slot = vfs->child_slot_hints[hint_index];
-    if (hinted_slot != 0 && hinted_slot <= FILED_MAX_VNODES) {
-        filed_vnode_t *candidate = &vfs->vnodes[hinted_slot - 1u];
+    const uint32_t hinted_slot = vfs->child_slot_hints[hint_index];
+    if (hinted_slot != 0 && hinted_slot <= vfs->vnode_capacity) {
+        filed_vnode_t *candidate = filed_vfs_vnode_at(vfs, hinted_slot - 1u);
         if (candidate->active &&
             candidate->linked &&
             candidate->parent == parent &&
@@ -77,14 +77,14 @@ static filed_vnode_t *filed_find_child_vnode(
             return candidate;
         }
     }
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (vfs->vnodes[i].active &&
-            vfs->vnodes[i].linked &&
-            vfs->vnodes[i].parent == parent &&
-            strcmp(vfs->vnodes[i].name, name) == 0)
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        if (filed_vfs_vnode_at(vfs, i)->active &&
+            filed_vfs_vnode_at(vfs, i)->linked &&
+            filed_vfs_vnode_at(vfs, i)->parent == parent &&
+            strcmp(filed_vfs_vnode_at(vfs, i)->name, name) == 0)
         {
-            vfs->child_slot_hints[hint_index] = (uint16_t)(i + 1u);
-            return &vfs->vnodes[i];
+            vfs->child_slot_hints[hint_index] = i + 1u;
+            return filed_vfs_vnode_at(vfs, i);
         }
     }
     return NULL;
@@ -222,6 +222,7 @@ static filed_status_t filed_open_backend_child_at(
 {
     filed_vnode_t *child;
     filed_status_t status;
+    bool created = false;
 
     if (vfs == NULL ||
         parent_vnode == NULL ||
@@ -268,9 +269,16 @@ static filed_status_t filed_open_backend_child_at(
         }
         filed_remember_vnode_slot(vfs, child);
         ++vfs->next_vnode_id;
+        created = true;
     }
 
-    return filed_open_vnode(vfs, child, rights, open_flags, out_open);
+    status = filed_open_vnode(vfs, child, rights, open_flags, out_open);
+    /* The caller releases its backend lookup reference on failure. Do not
+     * leave a new cached vnode referring to that now-unowned object. */
+    if (status != FILED_OK && created) {
+        memset(child, 0, sizeof(*child));
+    }
+    return status;
 }
 
 filed_status_t filed_vfs_mount_root(
@@ -673,7 +681,7 @@ filed_status_t filed_vfs_close_handle_ex(
 {
     filed_handle_t *handle;
     filed_file_t *file;
-    uint16_t lease_index = UINT16_MAX;
+    uint32_t lease_slot = 0;
 
     if (out_reclaim != NULL) {
         memset(out_reclaim, 0, sizeof(*out_reclaim));
@@ -686,15 +694,18 @@ filed_status_t filed_vfs_close_handle_ex(
         return FILED_ERR_INVALID;
     }
     if (handle->lease_fd >= 16) {
-        for (uint16_t i = 0; i < vfs->lease_handle_count; ++i) {
-            if (vfs->lease_handle_ids[i] == handle_id) {
-                lease_index = i;
-                break;
-            }
-        }
-        if (lease_index == UINT16_MAX) {
+        lease_slot = filed_handle_slot_index(vfs, handle) + 1;
+        if (vfs->lease_handle_count == 0 ||
+            handle->lease_prev > vfs->handle_capacity ||
+            handle->lease_next > vfs->handle_capacity)
             return FILED_ERR_INVALID;
-        }
+        if (handle->lease_prev != 0) {
+            if (filed_vfs_handle_at(vfs, handle->lease_prev - 1)->lease_next != lease_slot)
+                return FILED_ERR_INVALID;
+        } else if (vfs->lease_head != lease_slot) return FILED_ERR_INVALID;
+        if (handle->lease_next != 0 &&
+            filed_vfs_handle_at(vfs, handle->lease_next - 1)->lease_prev != lease_slot)
+            return FILED_ERR_INVALID;
     }
 
     if (handle->target_kind == FILED_HANDLE_FILE) {
@@ -702,11 +713,13 @@ filed_status_t filed_vfs_close_handle_ex(
         filed_release_open_file(vfs, file, out_reclaim);
     }
 
-    if (lease_index != UINT16_MAX) {
+    if (lease_slot != 0) {
+        if (handle->lease_prev != 0)
+            filed_vfs_handle_at(vfs, handle->lease_prev - 1)->lease_next = handle->lease_next;
+        else vfs->lease_head = handle->lease_next;
+        if (handle->lease_next != 0)
+            filed_vfs_handle_at(vfs, handle->lease_next - 1)->lease_prev = handle->lease_prev;
         --vfs->lease_handle_count;
-        vfs->lease_handle_ids[lease_index] =
-            vfs->lease_handle_ids[vfs->lease_handle_count];
-        vfs->lease_handle_ids[vfs->lease_handle_count] = 0;
     }
 
     memset(handle, 0, sizeof(*handle));
@@ -741,10 +754,14 @@ filed_status_t filed_vfs_set_handle_lease(
     filed_handle_t *handle = filed_find_handle(vfs, handle_id);
     if (handle == NULL || handle->owner_session != 0 || handle->lease_fd >= 16)
         return FILED_ERR_INVALID;
-    if (vfs->lease_handle_count >= FILED_MAX_TRANSFER_LEASES)
-        return FILED_ERR_FULL;
+    if (vfs->lease_head > vfs->handle_capacity) return FILED_ERR_INVALID;
+    const uint32_t slot = filed_handle_slot_index(vfs, handle) + 1;
+    handle->lease_prev = 0;
+    handle->lease_next = vfs->lease_head;
+    if (vfs->lease_head != 0) filed_vfs_handle_at(vfs, vfs->lease_head - 1)->lease_prev = slot;
+    vfs->lease_head = slot;
     handle->lease_fd = lease_fd;
-    vfs->lease_handle_ids[vfs->lease_handle_count++] = handle_id;
+    ++vfs->lease_handle_count;
     return FILED_OK;
 }
 
@@ -766,8 +783,8 @@ static bool filed_vfs_backend_object_is_unused_linked_leaf(
     if (vfs == NULL || backend_object == 0) {
         return false;
     }
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        const filed_vnode_t *vnode = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        const filed_vnode_t *vnode = filed_vfs_vnode_at(vfs, i);
         if (!vnode->active || vnode->backend_object != backend_object) {
             continue;
         }
@@ -780,8 +797,8 @@ static bool filed_vfs_backend_object_is_unused_linked_leaf(
         if (vnode->last_used > last_used) {
             last_used = vnode->last_used;
         }
-        for (uint32_t j = 0; j < FILED_MAX_VNODES; ++j) {
-            if (vfs->vnodes[j].active && vfs->vnodes[j].parent == vnode->id) {
+        for (uint32_t j = 0; j < vfs->vnode_capacity; ++j) {
+            if (filed_vfs_vnode_at(vfs, j)->active && filed_vfs_vnode_at(vfs, j)->parent == vnode->id) {
                 return false;
             }
         }
@@ -802,12 +819,10 @@ filed_status_t filed_vfs_evict_lru_unused_linked(
     typedef struct filed_cached_object_scan {
         filed_backend_object_id_t backend_object;
         uint64_t last_used;
-        uint16_t alias_count;
+        uint32_t alias_count;
         bool unused_linked_leaf;
     } filed_cached_object_scan_t;
-    filed_cached_object_scan_t objects[FILED_MAX_VNODES];
-    uint16_t vnode_object[FILED_MAX_VNODES];
-    uint16_t object_count = 0;
+    uint32_t object_count = 0;
     filed_backend_object_id_t oldest_object = 0;
     uint64_t oldest_last_used = UINT64_MAX;
     uint32_t cached = 0;
@@ -815,20 +830,37 @@ filed_status_t filed_vfs_evict_lru_unused_linked(
         return FILED_ERR_INVALID;
     }
     memset(out_reclaim, 0, sizeof(*out_reclaim));
-    memset(objects, 0, sizeof(objects));
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        vnode_object[i] = UINT16_MAX;
+    /* A cheap upper bound avoids allocating scan scratch when eviction is
+     * impossible. Alias/child/mount exclusions below only reduce this count. */
+    uint32_t possible = 0;
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        const filed_vnode_t *vnode = filed_vfs_vnode_at(vfs, i);
+        possible += vnode->active && vnode->linked && vnode->refcount == 0;
+    }
+    if (possible <= max_cached) return FILED_OK;
+    const size_t capacity = vfs->vnode_capacity;
+    if (capacity > SIZE_MAX / sizeof(filed_cached_object_scan_t) ||
+        capacity > SIZE_MAX / sizeof(uint32_t)) return FILED_OK;
+    filed_cached_object_scan_t *objects = calloc(capacity, sizeof(*objects));
+    uint32_t *vnode_object = malloc(capacity * sizeof(*vnode_object));
+    if (objects == NULL || vnode_object == NULL) {
+        free(objects);
+        free(vnode_object);
+        return FILED_OK; /* Optional cache eviction, not an operation failure. */
+    }
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        vnode_object[i] = UINT32_MAX;
     }
 
     /* Build one record per backend object first.  The old scan rediscovered
      * aliases and children with nested full-table walks for every vnode, even
      * when the cache was below its limit and no eviction could occur. */
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        const filed_vnode_t *vnode = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        const filed_vnode_t *vnode = filed_vfs_vnode_at(vfs, i);
         if (!vnode->active || vnode->backend_object == 0) {
             continue;
         }
-        uint16_t object_index = 0;
+        uint32_t object_index = 0;
         while (object_index < object_count) {
             if (objects[object_index].backend_object == vnode->backend_object) {
                 break;
@@ -855,8 +887,8 @@ filed_status_t filed_vfs_evict_lru_unused_linked(
 
     /* A cached directory with any live child is not a leaf.  Resolve each
      * child once instead of searching for children once per candidate. */
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        const filed_vnode_t *child = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        const filed_vnode_t *child = filed_vfs_vnode_at(vfs, i);
         if (!child->active || child->parent == 0) {
             continue;
         }
@@ -864,40 +896,52 @@ filed_status_t filed_vfs_evict_lru_unused_linked(
         if (parent == NULL) {
             continue;
         }
-        const ptrdiff_t parent_slot = parent - vfs->vnodes;
-        if (parent_slot >= 0 && parent_slot < (ptrdiff_t)FILED_MAX_VNODES) {
-            const uint16_t object_index = vnode_object[parent_slot];
-            if (object_index != UINT16_MAX) {
+        const uint32_t parent_slot = filed_vnode_slot_index(vfs, parent);
+        if (parent_slot < vfs->vnode_capacity) {
+            const uint32_t object_index = vnode_object[parent_slot];
+            if (object_index != UINT32_MAX) {
                 objects[object_index].unused_linked_leaf = false;
             }
         }
     }
 
-    for (uint16_t i = 0; i < object_count; ++i) {
+    free(vnode_object);
+    for (uint32_t i = 0; i < object_count; ++i) {
+        if (objects[i].unused_linked_leaf) {
+            ++cached;
+        }
+    }
+    /* Eligibility may scan the file-VMO cache. Below the cache limit no
+     * object can be evicted, so do not query that policy at all. */
+    if (cached <= max_cached) {
+        free(objects);
+        return FILED_OK;
+    }
+    for (uint32_t i = 0; i < object_count; ++i) {
         const filed_cached_object_scan_t *object = &objects[i];
         if (!object->unused_linked_leaf) {
             continue;
         }
-        ++cached;
         /* Releasing a backend object with multiple linked aliases requires a
          * separate alias-cache design.  Do not let such an object hide an
          * older single-vnode candidate that can be reclaimed safely. */
         if (object->alias_count == 1 &&
-            (evictable == NULL || evictable(context, object->backend_object)) &&
-            (oldest_object == 0 || object->last_used < oldest_last_used))
+            (oldest_object == 0 || object->last_used < oldest_last_used) &&
+            (evictable == NULL || evictable(context, object->backend_object)))
         {
             oldest_object = object->backend_object;
             oldest_last_used = object->last_used;
         }
     }
-    if (cached <= max_cached || oldest_object == 0) {
+    free(objects);
+    if (oldest_object == 0) {
         return FILED_OK;
     }
     filed_vnode_t *candidate = NULL;
     filed_vnode_t *parent = NULL;
     uint32_t aliases = 0;
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        filed_vnode_t *vnode = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        filed_vnode_t *vnode = filed_vfs_vnode_at(vfs, i);
         if (vnode->active && vnode->backend_object == oldest_object) {
             candidate = vnode;
             ++aliases;
@@ -1329,8 +1373,8 @@ filed_status_t filed_vfs_update_stat_snapshot(
         return FILED_ERR_INVALID;
     }
 
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        filed_vnode_t *vnode = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        filed_vnode_t *vnode = filed_vfs_vnode_at(vfs, i);
         if (!vnode->active || vnode->backend_object != backend_object) {
             continue;
         }
@@ -1389,8 +1433,8 @@ filed_status_t filed_vfs_note_write(
         return FILED_ERR_INVALID;
     }
 
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        filed_vnode_t *alias = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        filed_vnode_t *alias = filed_vfs_vnode_at(vfs, i);
         if (!alias->active || alias->backend_object != vnode->backend_object) {
             continue;
         }
@@ -1429,8 +1473,8 @@ filed_status_t filed_vfs_note_truncate(
         return FILED_ERR_INVALID;
     }
 
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        filed_vnode_t *alias = &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        filed_vnode_t *alias = filed_vfs_vnode_at(vfs, i);
         if (!alias->active || alias->backend_object != vnode->backend_object) {
             continue;
         }
@@ -2202,8 +2246,8 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
         }
     }
 
-    for (i = 0; i < FILED_MAX_VNODES; ++i) {
-        const filed_vnode_t *node = &vfs->vnodes[i];
+    for (i = 0; i < vfs->vnode_capacity; ++i) {
+        const filed_vnode_t *node = filed_vfs_vnode_at(vfs, i);
         uint32_t expected_refcount;
         size_t j;
         if (!node->active) {
@@ -2228,8 +2272,8 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
             return FILED_ERR_INVALID;
         }
         expected_refcount = filed_vnode_mount_pins(vfs, node->id);
-        for (j = 0; j < FILED_MAX_FILES; ++j) {
-            if (vfs->files[j].active && vfs->files[j].vnode_id == node->id) {
+        for (j = 0; j < vfs->file_capacity; ++j) {
+            if (filed_vfs_file_at(vfs, j)->active && filed_vfs_file_at(vfs, j)->vnode_id == node->id) {
                 ++expected_refcount;
             }
         }
@@ -2237,8 +2281,8 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
             return FILED_ERR_INVALID;
         }
         if (node->linked) {
-            for (j = i + 1; j < FILED_MAX_VNODES; ++j) {
-                const filed_vnode_t *other = &vfs->vnodes[j];
+            for (j = i + 1; j < vfs->vnode_capacity; ++j) {
+                const filed_vnode_t *other = filed_vfs_vnode_at(vfs, j);
                 if (other->active &&
                     other->linked &&
                     other->mount_id == node->mount_id &&
@@ -2251,8 +2295,8 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
         }
     }
 
-    for (i = 0; i < FILED_MAX_FILES; ++i) {
-        const filed_file_t *file = &vfs->files[i];
+    for (i = 0; i < vfs->file_capacity; ++i) {
+        const filed_file_t *file = filed_vfs_file_at(vfs, i);
         uint32_t handle_count = 0;
         size_t j;
         if (!file->active) {
@@ -2265,10 +2309,10 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
         {
             return FILED_ERR_INVALID;
         }
-        for (j = 0; j < FILED_MAX_HANDLES; ++j) {
-            if (vfs->handles[j].active &&
-                vfs->handles[j].target_kind == FILED_HANDLE_FILE &&
-                vfs->handles[j].target_id == file->id)
+        for (j = 0; j < vfs->handle_capacity; ++j) {
+            if (filed_vfs_handle_at(vfs, j)->active &&
+                filed_vfs_handle_at(vfs, j)->target_kind == FILED_HANDLE_FILE &&
+                filed_vfs_handle_at(vfs, j)->target_id == file->id)
             {
                 ++handle_count;
             }
@@ -2278,8 +2322,8 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
         }
     }
 
-    for (i = 0; i < FILED_MAX_HANDLES; ++i) {
-        const filed_handle_t *handle = &vfs->handles[i];
+    for (i = 0; i < vfs->handle_capacity; ++i) {
+        const filed_handle_t *handle = filed_vfs_handle_at(vfs, i);
         if (!handle->active) {
             continue;
         }
@@ -2297,28 +2341,27 @@ filed_status_t filed_vfs_check_basic(const filed_vfs_t *vfs)
         }
     }
 
-    if (vfs->lease_handle_count > FILED_MAX_TRANSFER_LEASES) {
+    if (vfs->lease_handle_count > vfs->handle_capacity) {
         return FILED_ERR_INVALID;
     }
     uint32_t active_leases = 0;
-    for (i = 0; i < FILED_MAX_HANDLES; ++i) {
-        active_leases += vfs->handles[i].active && vfs->handles[i].lease_fd >= 16;
+    for (i = 0; i < vfs->handle_capacity; ++i) {
+        active_leases += filed_vfs_handle_at(vfs, i)->active && filed_vfs_handle_at(vfs, i)->lease_fd >= 16;
     }
     if (active_leases != vfs->lease_handle_count) {
         return FILED_ERR_INVALID;
     }
-    for (uint16_t lease = 0; lease < vfs->lease_handle_count; ++lease) {
-        const filed_handle_id_t handle_id = vfs->lease_handle_ids[lease];
-        const filed_handle_t *handle = filed_find_handle_const(vfs, handle_id);
-        if (handle == NULL || handle->lease_fd < 16) {
+    uint32_t link = vfs->lease_head;
+    uint32_t previous = 0;
+    for (uint32_t lease = 0; lease < vfs->lease_handle_count; ++lease) {
+        if (link == 0 || link > vfs->handle_capacity) return FILED_ERR_INVALID;
+        const filed_handle_t *handle = filed_vfs_handle_at(vfs, link - 1);
+        if (!handle->active || handle->lease_fd < 16 || handle->lease_prev != previous)
             return FILED_ERR_INVALID;
-        }
-        for (uint16_t previous = 0; previous < lease; ++previous) {
-            if (vfs->lease_handle_ids[previous] == handle_id) {
-                return FILED_ERR_INVALID;
-            }
-        }
+        previous = link;
+        link = handle->lease_next;
     }
+    if (link != 0) return FILED_ERR_INVALID;
 
     return FILED_OK;
 }

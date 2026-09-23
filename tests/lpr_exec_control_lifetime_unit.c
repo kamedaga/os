@@ -89,6 +89,21 @@ int64_t lpr_backend_finish_drop(const lpr_fd_drop_t *drop)
 
 int main(void)
 {
+    lpr_filed_backend_t old_file = { .lease_fd.raw = 60 };
+    lpr_filed_backend_t new_file = { .lease_fd.raw = 61 };
+    live[60] = live[61] = 1;
+    lpr_fork_close_displaced_capabilities(LPR_FD_OPS_FILED, &old_file, &new_file);
+    assert(!live[60] && live[61]);
+    lpr_fork_close_displaced_capabilities(LPR_FD_OPS_FILED, &new_file, &new_file);
+    assert(live[61]);
+    lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, 61);
+    lpr_drm_backend_t old_drm = { .wait_fd.raw = 60, .lease_fd.raw = 61 };
+    lpr_drm_backend_t new_drm = { .wait_fd.raw = 60, .lease_fd.raw = 62 };
+    live[60] = live[61] = live[62] = 1;
+    lpr_fork_close_displaced_capabilities(LPR_FD_OPS_DRM, &old_drm, &new_drm);
+    assert(live[60] && !live[61] && live[62]);
+    lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, 60);
+    lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, 62);
     lpr_supervisor_token = 101;
     lpr_exec_transaction_t transaction = {
         .manifest_fd = -1, .cwd_lease_fd = -1, .supervisor_bootstrap_fd = 21,

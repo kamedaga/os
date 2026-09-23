@@ -441,7 +441,10 @@ pub const FdTransferMode = enum(u8) {
 };
 
 pub const max_ipc_endpoints: usize = 1024;
-pub const max_ipc_channels: usize = 512;
+// Xfce plus the multi-process browser exceeds 512 live channel pairs.
+// 1024 keeps allocation bounded; the additional 512 slots cost ~8.6 MiB.
+// Repeated app exit must still reclaim channels; this is not leak recovery.
+pub const max_ipc_channels: usize = 1024;
 pub const max_ipc_replies: usize = 1024;
 pub const max_ipc_queue_messages: usize = 16;
 pub const max_ipc_message_fds: usize = 19;
@@ -630,7 +633,10 @@ pub const TaskFdWaiter = struct {
 };
 
 pub const max_task_fd_waiters: usize = fd_table_entries;
-pub const max_ipc_object_waiters: usize = 8;
+// Threads legitimately share a broker-session channel for death detection.
+// WebKit has 24 live threads in one such session; eight registrations made
+// later waits fail despite free global wait groups and physical memory.
+pub const max_ipc_object_waiters: usize = 32;
 
 pub const PipeSlot = struct {
     active: bool = false,
@@ -931,6 +937,7 @@ pub const NativeVmoSlot = struct {
     page_store_start: u64 = 0,
     page_store_owner: u64 = 0,
     has_page_store: bool = false,
+    zero_on_demand: bool = false,
     ref_count: u32 = 0,
     parent: NativeVmoRef = .{},
     parent_offset: u64 = 0,
@@ -1158,6 +1165,9 @@ pub const PublishedEndpointTable = struct {
 };
 
 pub const max_vmo_backing_pages: usize = 131072;
+// Logical sparse extents are not eager page arrays. Keep the latter bounded
+// separately; the backing key and VMA COW offsets use u32 page indices.
+pub const max_vmo_logical_pages: usize = std.math.maxInt(u32);
 pub const max_vmo_backing_store_pages: usize = 1048576;
 
 pub var empty_vmo_backing_page_store: [0]u64 = .{};
@@ -1362,7 +1372,7 @@ pub fn allocEmptyVmoBackingPageStore(page_count: usize, owner: u64) ?u64 {
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
     if (!vmoBackingPageStoreReadyLocked() or page_count == 0 or
-        page_count > max_vmo_backing_pages or owner == 0)
+        page_count > max_vmo_logical_pages or owner == 0)
     {
         return null;
     }
@@ -1378,7 +1388,7 @@ pub fn growVmoBackingPageStore(
 ) ?u64 {
     if (owner == 0 or start != owner or old_page_count == 0 or
         new_page_count <= old_page_count or
-        new_page_count > max_vmo_backing_pages)
+        new_page_count > max_vmo_logical_pages)
     {
         return null;
     }
@@ -1479,12 +1489,60 @@ pub fn freeVmoBackingPageStore(start: u64, page_count: u32, owner: u64) bool {
         recordVmoBackingStoreOwnershipFaultLocked(2, start, page_count, 0, owner, start);
         return false;
     }
-    var page_index: u32 = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const slot_index = findVmoBackingPageStoreSlotLocked(owner, page_index) orelse continue;
-        removeVmoBackingPageStoreSlotLocked(slot_index);
+    if (page_count <= max_vmo_backing_pages) {
+        var page_index: u32 = 0;
+        while (page_index < page_count) : (page_index += 1) {
+            const slot_index = findVmoBackingPageStoreSlotLocked(owner, page_index) orelse continue;
+            removeVmoBackingPageStoreSlotLocked(slot_index);
+        }
+    } else {
+        var slot: usize = 0;
+        while (slot < vmo_backing_page_store.len) {
+            if (vmo_backing_page_store_owners[slot] == owner and
+                vmo_backing_page_store_page_indices[slot] < page_count)
+            {
+                // Removal may shift another entry into this bucket.
+                removeVmoBackingPageStoreSlotLocked(slot);
+            } else slot += 1;
+        }
     }
     return true;
+}
+
+pub const BackedPage = struct { index: u32, paddr: u64 };
+
+/// Snapshot the next backed pages in logical order. A physical hash cursor
+/// cannot survive another owner's deletion/rehash between calls. Never hold
+/// this innermost lock while allocating, copying, or returning physical RAM.
+pub fn snapshotVmoBackingPages(start: u64, page_count: u32, owner: u64, first: usize, end: usize, out: []BackedPage) usize {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner or first >= end or
+        end > page_count or out.len == 0) return 0;
+    var count: usize = 0;
+    if (end - first <= max_vmo_backing_pages) {
+        var page = first;
+        while (page < end and count < out.len) : (page += 1) {
+            const slot = findVmoBackingPageStoreSlotLocked(start, @intCast(page)) orelse continue;
+            out[count] = .{ .index = @intCast(page), .paddr = vmo_backing_page_store[slot] };
+            count += 1;
+        }
+        return count;
+    }
+    for (vmo_backing_page_store_owners, 0..) |actual_owner, slot| {
+        if (actual_owner != owner) continue;
+        const page = vmo_backing_page_store_page_indices[slot];
+        if (page < first or page >= end) continue;
+        var position = count;
+        if (position == out.len) {
+            if (page >= out[position - 1].index) continue;
+            position -= 1;
+        } else count += 1;
+        while (position > 0 and out[position - 1].index > page) : (position -= 1)
+            out[position] = out[position - 1];
+        out[position] = .{ .index = page, .paddr = vmo_backing_page_store[slot] };
+    }
+    return count;
 }
 
 pub fn resetVmoBackingPageStore() void {
@@ -1639,11 +1697,11 @@ pub const FreePageList = struct {
     }
 
     fn removeRangeAt(self: *FreePageList, index: usize) void {
-        var r = index + 1;
-        while (r < self.range_len) : (r += 1) {
-            self.ranges[r - 1] = self.ranges[r];
-        }
+        // Ranges are unordered; adjacency is checked by address and region.
+        // Moving only the last entry avoids copying thousands of descriptors
+        // under the allocator lock when a fragmented range is exhausted.
         self.range_len -= 1;
+        if (index != self.range_len) self.ranges[index] = self.ranges[self.range_len];
     }
 
     pub fn appendRegion(
@@ -1788,11 +1846,7 @@ pub const FreePageList = struct {
         self.len -= 1;
 
         if (first.len == 0) {
-            var r: usize = 1;
-            while (r < self.range_len) : (r += 1) {
-                self.ranges[r - 1] = self.ranges[r];
-            }
-            self.range_len -= 1;
+            self.removeRangeAt(0);
         }
 
         return paddr;
@@ -1815,11 +1869,7 @@ pub const FreePageList = struct {
             self.len -= 1;
 
             if (range.len == 0) {
-                var r: usize = range_index + 1;
-                while (r < self.range_len) : (r += 1) {
-                    self.ranges[r - 1] = self.ranges[r];
-                }
-                self.range_len -= 1;
+                self.removeRangeAt(range_index);
             }
 
             return paddr;
@@ -1846,10 +1896,13 @@ pub const FreePageList = struct {
                 const paddr = range.physical_start + (@as(u64, skip_pages) * 4096);
                 const tail_len = range.len - skip_pages - 1;
                 const head_len = skip_pages;
+                // A failed split must leave all pages represented. Check the
+                // extra range before shortening the source or charging a page.
+                if (tail_len > 0 and self.range_len >= self.ranges.len)
+                    return KernelError.TooManyFreeRanges;
                 range.len = head_len;
                 self.len -= 1;
                 if (tail_len > 0) {
-                    if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
                     var move_index = self.range_len;
                     while (move_index > range_index + 1) : (move_index -= 1) {
                         self.ranges[move_index] = self.ranges[move_index - 1];
@@ -1870,11 +1923,7 @@ pub const FreePageList = struct {
             self.len -= 1;
 
             if (range.len == 0) {
-                var r: usize = range_index + 1;
-                while (r < self.range_len) : (r += 1) {
-                    self.ranges[r - 1] = self.ranges[r];
-                }
-                self.range_len -= 1;
+                self.removeRangeAt(range_index);
             }
 
             return paddr;
@@ -1931,9 +1980,12 @@ pub const FreePageList = struct {
                 range.len -= page_count;
                 if (range.len == 0) self.removeRangeAt(range_index);
             } else {
+                // Preserve the original range when no split descriptor fits;
+                // callers cannot roll back an allocation they never received.
+                if (tail_pages > 0 and self.range_len >= self.ranges.len)
+                    return KernelError.TooManyFreeRanges;
                 range.len = skip_pages;
                 if (tail_pages > 0) {
-                    if (self.range_len >= self.ranges.len) return KernelError.TooManyFreeRanges;
                     var move_index = self.range_len;
                     while (move_index > range_index + 1) : (move_index -= 1) {
                         self.ranges[move_index] = self.ranges[move_index - 1];

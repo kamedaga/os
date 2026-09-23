@@ -71,6 +71,20 @@ typedef struct gpud_drm_ioctl_request {
 #define GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC UINT64_C(0x3151494d52444850)
 #define GPUD_DRM_INLINE_IOCTL_REPLY_MAGIC UINT64_C(0x3150494d52444850)
 
+/* Bind [control VMO, channel server end, optional auxiliary VMO] once on the public endpoint.
+ * word1 is zero without the auxiliary VMO, otherwise its exact size below.
+ * Both sides deploy together. A bound channel carries ordinary page requests
+ * without the first VMO attachment; its capability identifies the mapping.
+ * Ancillary FD order and payload validation are otherwise unchanged. */
+#define GPUD_DRM_BIND_PAGE_REQUEST_MAGIC UINT64_C(0x3151424d52444850)
+#define GPUD_DRM_BIND_PAGE_REPLY_MAGIC UINT64_C(0x3150424d52444850)
+
+/* An idle-cache budget, not a transfer limit: larger payloads still carry a
+ * temporary VMO. This avoids retaining an occasional multi-megabyte command
+ * for every client while reusing the small buffers common in real drawing. */
+#define GPUD_DRM_AUX_REUSE_BYTES (64u * 1024u)
+#define GPUD_DRM_REQUEST_BOUND_AUX UINT64_C(1)
+
 static inline int gpud_drm_ioctl_can_inline(const gpud_drm_ioctl_request_t *request)
 {
     const uint64_t size = (request->request >> 16) & 0x3fffu;
@@ -94,6 +108,10 @@ typedef struct gpud_drm_read_request {
     uint8_t data[GPUD_DRM_EVENT_READ_BYTES];
 } gpud_drm_read_request_t;
 
+/* Successful PRIME_EXPORT replies carry [VMO view, owner lease channel].
+ * Both are mandatory: lease hangup recovers exports even after a client fault.
+ * The lease is close-only, CLOEXEC and INHERIT (fork retains ownership).
+ * LPR and gpud must be deployed together; one-FD replies are not supported. */
 typedef struct gpud_drm_prime_export_request {
     uint64_t handle;
     uint32_t gem_handle;

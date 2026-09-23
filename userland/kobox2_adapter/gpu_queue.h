@@ -19,6 +19,7 @@ struct ph_gpu_queue {
     uint64_t release_correlation;
     struct kobox_linux_drm_event_host event_host;
     atomic_uint event_admitted;
+    atomic_uint fence_pending;
     atomic_uint_fast64_t event_pending;
     atomic_uint_fast64_t event_cookies[GPUD_GPU_NATIVE_SESSION_LIMIT];
     atomic_int event_error;
@@ -29,7 +30,7 @@ struct ph_gpu_queue {
     unsigned int active_lane;
     unsigned int next_lane;
     int event_fd;
-    int bound, event_active;
+    int bound, event_active, event_fences;
 };
 
 int ph_gpu_queue_init(struct ph_gpu_queue *queue,

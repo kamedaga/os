@@ -14,7 +14,7 @@ int ph_gpu_query_release_aux(struct ph_gpu_query *query) {
         query->result = (struct kobox_drm_query_result){0};
         return 0;
     }
-    if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
+    if (query->aux != query->aux_cache && pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
                        (uintptr_t)query->aux,
                        query->aux_mapping_size))
         return -EIO;
@@ -22,6 +22,46 @@ int ph_gpu_query_release_aux(struct ph_gpu_query *query) {
     query->aux_size = 0;
     query->aux_mapping_size = 0;
     query->result = (struct kobox_drm_query_result){0};
+    return 0;
+}
+
+int ph_gpu_query_destroy_aux(struct ph_gpu_query *query) {
+    int result = ph_gpu_query_release_aux(query);
+    if (result || !query->aux_cache)
+        return result;
+    if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
+            (uintptr_t)query->aux_cache, PH_GPU_QUERY_AUX_REUSE_BYTES))
+        return -EIO;
+    query->aux_cache = NULL;
+    return 0;
+}
+
+static int allocate_aux(struct ph_gpu_query *query, size_t size) {
+    if (query->aux || !size || size > GPUD_GPU_AUX_CAPACITY)
+        return -EPROTO;
+    const size_t extent = (size + PH_GPU_QUERY_PAGE - 1) &
+        ~(size_t)(PH_GPU_QUERY_PAGE - 1);
+    if (extent < size)
+        return -EPROTO;
+    const int reusable = extent <= PH_GPU_QUERY_AUX_REUSE_BYTES;
+    const size_t mapping_size = reusable ? PH_GPU_QUERY_AUX_REUSE_BYTES : extent;
+    void *mapping = reusable ? query->aux_cache : NULL;
+    if (!mapping) {
+        long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, 0, mapping_size,
+            PACHA_PROT_READ | PACHA_PROT_WRITE,
+            PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS, 0);
+        if (address < PH_GPU_QUERY_PAGE)
+            return -ENOMEM;
+        mapping = (void *)(uintptr_t)address;
+        if (reusable)
+            query->aux_cache = mapping;
+    }
+    /* A request must not see bytes left by a previous session. Only the
+     * validated extent is exposed to typed dispatch; the peer retains no alias. */
+    memset(mapping, 0, extent);
+    query->aux = mapping;
+    query->aux_size = size;
+    query->aux_mapping_size = mapping_size;
     return 0;
 }
 
@@ -38,6 +78,12 @@ static int release(void *context) {
             query->mapping = NULL;
     }
     return aux_result ? aux_result : mapping_result;
+}
+
+static int stop(void *context) {
+    int result = release(context);
+    int aux_result = ph_gpu_query_destroy_aux(context);
+    return result ? result : aux_result;
 }
 
 static int prepare(void *context, const struct ph_ipc_packet *packet) {
@@ -94,21 +140,11 @@ int ph_gpu_query_prepare_snapshot(struct ph_gpu_query *query, size_t size,
         query->request + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
         envelope.payload_length, &region);
     if (result) return result;
+    query->plan.fence_correlation = envelope.correlation_id;
     if (query->plan.aux_size) {
-        size_t mapping_size = (query->plan.aux_size + PH_GPU_QUERY_PAGE - 1) &
-            ~(size_t)(PH_GPU_QUERY_PAGE - 1);
-        if (query->plan.aux_size > GPUD_GPU_AUX_CAPACITY ||
-            mapping_size < query->plan.aux_size)
-            return -EPROTO;
-        long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, 0, mapping_size,
-            PACHA_PROT_READ | PACHA_PROT_WRITE,
-            PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS, 0);
-        if (address < PH_GPU_QUERY_PAGE)
-            return -ENOMEM;
-        query->aux = (void *)(uintptr_t)address;
-        query->aux_size = query->plan.aux_size;
-        query->aux_mapping_size = mapping_size;
-        memset(query->aux, 0, mapping_size);
+        result = allocate_aux(query, query->plan.aux_size);
+        if (result)
+            return result;
     }
     query->correlation = envelope.correlation_id;
     return 0;
@@ -142,19 +178,11 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         if (page_count > capacity)
             page_count = capacity;
         size_t bytes = page_count * sizeof(uint64_t);
-        size_t mapping_size = (bytes + PH_GPU_QUERY_PAGE - 1) &
-            ~(size_t)(PH_GPU_QUERY_PAGE - 1);
-        long address = pacha_syscall6(PACHA_VM_SYSCALL_MMAP, 0, 0, mapping_size,
-            PACHA_PROT_READ | PACHA_PROT_WRITE,
-            PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS, 0);
-        if (address < PH_GPU_QUERY_PAGE)
-            return -ENOMEM;
-        query->aux = (void *)(uintptr_t)address;
-        query->aux_size = bytes;
-        query->aux_mapping_size = mapping_size;
+        int error = allocate_aux(query, bytes);
+        if (error)
+            return error;
         query->plan.mapping_page_capacity = page_count;
         query->plan.aux_size = bytes;
-        memset(query->aux, 0, mapping_size);
     }
     size_t size = 0;
     int result = kobox_drm_query_execute_service(&query->plan, &query->api,
@@ -393,7 +421,7 @@ int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation, uint64_t 
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_virtgpu_context_init");
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_context_init, &symbol, sizeof(api.virtgpu_context_init));
-    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_virtgpu_execbuffer");
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_execbuffer");
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_execbuffer, &symbol, sizeof(api.virtgpu_execbuffer));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_virtgpu_resource_create");
@@ -416,6 +444,7 @@ int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation, uint64_t 
     query->session_id = session_id;
     query->api = api;
     *service = (struct ph_lifecycle_service){.context = query,
-        .prepare = prepare, .dispatch = dispatch, .complete = complete, .release = release};
+        .prepare = prepare, .dispatch = dispatch, .complete = complete, .release = release,
+        .stop = stop};
     return 0;
 }

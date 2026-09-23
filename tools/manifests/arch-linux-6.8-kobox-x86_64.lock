@@ -1,0 +1,3 @@
+# package version url sha256
+linux 6.8.arch1-1 https://archive.archlinux.org/packages/l/linux/linux-6.8.arch1-1-x86_64.pkg.tar.zst 3cb23ffd6f0a54bd09d46fd684c3089a30e82a1e338c8f73815ab356805d4970
+linux-headers 6.8.arch1-1 https://archive.archlinux.org/packages/l/linux-headers/linux-headers-6.8.arch1-1-x86_64.pkg.tar.zst ec897a2a39c24eaf8a1e7c5b1bf8d473017cbb6ab5e47848fc7fb9cc38556fde

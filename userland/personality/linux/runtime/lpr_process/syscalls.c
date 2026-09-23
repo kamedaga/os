@@ -64,7 +64,8 @@ static char *lpr_fork_diag_append_i64(
     return out;
 }
 
-#if defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG
+#if (defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG) || \
+    (defined(LPR_EXEC_PATH_DIAG) && LPR_EXEC_PATH_DIAG)
 static void lpr_exec_diag(const char *path)
 {
     char line[384];
@@ -142,6 +143,7 @@ static int lpr_reserve_fork_bootstrap_fd(void)
 
 const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
 {
+    lpr_drm_mapping_fork_child();
     if (lpr_unix_cache_fork_child() != 0) {
         (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
         for (;;) {}
@@ -160,6 +162,8 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
     lpr_state.threads.lock_word = 0;
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
+    lpr_state.caches.page_lock_word = 0;
+    lpr_page_cache_clear();
     lpr_state.termd_rpc.lock_word = 0;
     lpr_state.netd_rpc.lock_word = 0;
     lpr_unmapself_lock = 0;
@@ -768,11 +772,18 @@ static int64_t lpr_linux_clone_frame_impl(const struct lpr_linux_user_frame *use
         lpr_fork_child_stack + sizeof(lpr_fork_child_stack));
     lpr_fork_child_transaction = &fork_transaction;
     lpr_unix_cache_fork_lock();
+    lpr_drm_mapping_fork_lock();
+    /* Child reconstruction may discard post-snapshot entries. Copy only a
+     * coherent table, never an allocator's half-published record. The child
+     * resets this inherited lock before committing its prepared snapshot. */
+    lpr_fd_table_lock(&lpr_control_fd_table);
     const int64_t ret = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_PROCESS_CLONE,
         child_process_rights,
         PACHA_PROCESS_CLONE_CURRENT_THREAD | PACHA_PROCESS_CLONE_USER_FRAME,
         (uint64_t)(uintptr_t)&native_child_frame);
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    lpr_drm_mapping_fork_unlock();
     lpr_unix_cache_fork_unlock();
     lpr_fork_child_transaction = 0;
     lpr_trace_clone_frame("after_syscall", &child_frame, ret);
@@ -1403,7 +1414,8 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     lpr_memcpy(exec.path, path, (size_t)path_len + 1u);
     int status = 0;
     lpr_linux_process_state_init();
-#if defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG
+#if (defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG) || \
+    (defined(LPR_EXEC_PATH_DIAG) && LPR_EXEC_PATH_DIAG)
     lpr_exec_diag(exec.path);
 #endif
     lpr_trace_process_event("execve_begin", path_len, 0, 0);

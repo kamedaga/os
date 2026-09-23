@@ -1,4 +1,5 @@
 #include "wait.h"
+#include "diagnostic.h"
 #include "../lpr_filed_internal.h"
 #include <errno.h>
 
@@ -161,7 +162,11 @@ static int healthy(struct lpr_unix_waiter *waiter)
     /* Native POLL returns a count, overlapping positive error numbers.
      * Require both output slots to have been written, not just status >= 0. */
     if (leaves[0].revents == UINT64_MAX || leaves[1].revents == UINT64_MAX ||
-        status < 0 || status > 2) return -EIO;
+        status < 0 || status > 2) {
+        lpr_unix_diag(8, waiter->id, -EIO, status, 101);
+        lpr_unix_diag(8, waiter->id, -EIO, leaves[0].revents, leaves[1].revents);
+        return -EIO;
+    }
     return (leaves[0].revents | leaves[1].revents) & PACHA_FD_EVENT_HANGUP ? -EPIPE : 0;
 }
 

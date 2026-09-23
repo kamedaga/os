@@ -220,6 +220,33 @@ func TestUEFIIOMMUIsFirstDevice(t *testing.T) {
 	}
 }
 
+func TestMemoryDefaultsAndOverride(t *testing.T) {
+	workspace, _ := testUEFIWorkspace(t)
+	for _, firmware := range []string{"bios", "uefi"} {
+		for _, memory := range []string{"", "2G"} {
+			t.Run(firmware+"/"+memory, func(t *testing.T) {
+				plan, err := commandArgs(workspace, Options{Firmware: firmware, Memory: memory, Console: "off", NoKVM: true, NoNet: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := memory
+				if want == "" {
+					want = "4G"
+				}
+				for i := 0; i+1 < len(plan.Args); i++ {
+					if plan.Args[i] == "-m" {
+						if plan.Args[i+1] != want {
+							t.Fatalf("memory = %q, want %q", plan.Args[i+1], want)
+						}
+						return
+					}
+				}
+				t.Fatal("missing -m argument")
+			})
+		}
+	}
+}
+
 func deviceArgs(args []string) []string {
 	devices := make([]string, 0)
 	for i := 0; i+1 < len(args); i++ {

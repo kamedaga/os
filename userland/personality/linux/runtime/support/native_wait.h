@@ -7,7 +7,8 @@
 #include <pachaos/abi.h>
 #include <stdint.h>
 
-static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
+static inline int lpr_native_wait_pair_flags(
+    int *out_local, int *out_remote, uint64_t flags)
 {
     if (out_local == 0 || out_remote == 0) return -22;
     uint64_t pair[2] = {0, 0};
@@ -18,7 +19,7 @@ static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
         PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
         (uint64_t)(uintptr_t)pair,
         rights,
-        PACHA_FD_FLAG_INHERIT);
+        flags);
     if (status != 0 || pair[0] < 16 || pair[1] < 16 ||
         pair[0] > INT32_MAX || pair[1] > INT32_MAX)
     {
@@ -29,6 +30,12 @@ static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
     *out_local = (int)pair[0];
     *out_remote = (int)pair[1];
     return 0;
+}
+
+static inline int lpr_native_wait_pair(int *out_local, int *out_remote)
+{
+    return lpr_native_wait_pair_flags(
+        out_local, out_remote, PACHA_FD_FLAG_INHERIT);
 }
 
 static inline uint64_t lpr_native_wait_drain_events(int fd)

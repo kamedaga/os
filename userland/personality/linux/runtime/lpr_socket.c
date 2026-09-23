@@ -1,6 +1,7 @@
 #include "lpr_socket.h"
 
 #include "lpr_filed_internal.h"
+#include "lpr_fd/allocate.h"
 #include "lpr_gui_detail.h"
 #include "lpr_unix/poll.h"
 
@@ -13,6 +14,7 @@
 #include <personality/linux_lpr.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <errno.h>
 
 #define LPR_LINUX_AF_UNIX 1ull
 #define LPR_LINUX_AF_INET 2ull
@@ -896,11 +898,6 @@ void lpr_linux_socket_mark_readable(uint64_t fd)
 
 
 
-static int lpr_socket_alloc_fd(void)
-{
-    return lpr_fd_slot_alloc_from(3);
-}
-
 static uint16_t lpr_socket_htons(uint16_t value)
 {
     return (uint16_t)((value << 8u) | (value >> 8u));
@@ -927,7 +924,21 @@ static int64_t lpr_socket_install_endpoint(
     uint32_t peer_uid,
     uint32_t peer_gid)
 {
-    const int fd = lpr_socket_alloc_fd();
+    const uint64_t linux_flags =
+        LPR_LINUX_O_RDWR |
+        ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0) |
+        ((flags & LPR_LINUX_SOCK_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
+    const lpr_socket_backend_t record = {
+        .active = 1, .type = (uint8_t)type, .connected = connected != 0,
+        .domain = (uint8_t)domain, .protocol = (uint16_t)protocol,
+        .handle = handle, .flags = (uint32_t)(linux_flags & ~LPR_LINUX_O_CLOEXEC),
+        .sndbuf = 256u * 1024u, .rcvbuf = 256u * 1024u,
+        .wait_fd.raw = native_wait_fd, .lease_fd.raw = -1,
+        .local_port_be = lpr_socket_next_port_be(),
+        .peer_pid = peer_pid, .peer_uid = peer_uid, .peer_gid = peer_gid,
+    };
+    const int fd = lpr_fd_alloc_state(LPR_FD_OPS_SOCKET, linux_flags, 0,
+        &record, sizeof(record));
     if (fd < 0) {
         (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
         if (native_wait_fd >= 16)
@@ -936,59 +947,6 @@ static int64_t lpr_socket_install_endpoint(
                 (uint64_t)(uint32_t)native_wait_fd);
         return fd;
     }
-    const uint64_t linux_flags =
-        LPR_LINUX_O_RDWR |
-        ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0) |
-        ((flags & LPR_LINUX_SOCK_CLOEXEC) != 0 ? LPR_LINUX_O_CLOEXEC : 0);
-    const int install_status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_SOCKET,
-        linux_flags,
-        handle,
-        0);
-    if (install_status != 0) {
-        (void)lpr_netd_call(NETD_OP_CLOSE, -1, handle, 0);
-        if (native_wait_fd >= 16)
-            (void)lpr_pacha_syscall1(
-                PACHAOS_SYSCALL_FD_CLOSE,
-                (uint64_t)(uint32_t)native_wait_fd);
-        return install_status;
-    }
-    lpr_socket_backend_t *socket = lpr_socket_backend((uint64_t)(uint32_t)fd);
-    if (socket == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)fd);
-        if (native_wait_fd >= 16)
-            (void)lpr_pacha_syscall1(
-                PACHAOS_SYSCALL_FD_CLOSE,
-                (uint64_t)(uint32_t)native_wait_fd);
-        return -LPR_LINUX_EIO;
-    }
-    socket->type = (uint8_t)type;
-    socket->readable_hint = 0;
-    socket->write_blocked = 0;
-    socket->connected = connected != 0;
-    socket->connecting = 0;
-    socket->domain = (uint8_t)domain;
-    socket->protocol = (uint16_t)protocol;
-    socket->flags =
-        LPR_LINUX_O_RDWR |
-        ((flags & LPR_LINUX_SOCK_NONBLOCK) != 0 ? LPR_LINUX_O_NONBLOCK : 0);
-    socket->sndbuf = 256u * 1024u;
-    socket->rcvbuf = 256u * 1024u;
-    socket->reuseaddr = 0;
-    socket->keepalive = 0;
-    socket->tcp_nodelay = 0;
-    socket->sndtimeo_ms = 0;
-    socket->rcvtimeo_ms = 0;
-    socket->last_error = 0;
-    socket->wait_fd.raw = native_wait_fd;
-    socket->local_addr_be = 0;
-    socket->local_port_be = lpr_socket_next_port_be();
-    socket->peer_addr_be = 0;
-    socket->peer_port_be = 0;
-    socket->peer_pid = peer_pid;
-    socket->peer_uid = peer_uid;
-    socket->peer_gid = peer_gid;
     return fd;
 }
 
@@ -1242,12 +1200,25 @@ int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t 
     return lpr_unix_socket_accept(fd, addr, addrlen, flags);
 }
 
+/* A valid pipe/file/event FD is not a bad descriptor. In particular,
+ * PulseAudio probes send(MSG_NOSIGNAL) and falls back to write only for
+ * ENOTSOCK. Returning EBADF here loses its mainloop wakeup. */
+static int64_t lpr_socket_non_socket_status(uint64_t fd)
+{
+    lpr_fd_pin_t pin;
+    if (fd > LPR_LINUX_FD_MAX ||
+        lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0)
+        return -LPR_LINUX_EBADF;
+    lpr_fd_unpin(&pin);
+    return -ENOTSOCK;
+}
+
 int64_t lpr_linux_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t dest_addr, uint64_t addrlen)
 {
     if (lpr_unix_socket_active(fd)) return
         lpr_unix_socket_address_io(fd, buf, len, 1, flags, dest_addr, addrlen);
     if (!lpr_linux_socket_fd_active(fd)) {
-        return -LPR_LINUX_EBADF;
+        return lpr_socket_non_socket_status(fd);
     }
     if (buf == 0 && len != 0) {
         return -LPR_LINUX_EFAULT;
@@ -1313,7 +1284,7 @@ int64_t lpr_linux_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fla
     if (lpr_unix_socket_active(fd)) return
         lpr_unix_socket_address_io(fd, buf, len, 0, flags, src_addr, addrlen_raw);
     if (!lpr_linux_socket_fd_active(fd)) {
-        return -LPR_LINUX_EBADF;
+        return lpr_socket_non_socket_status(fd);
     }
     if (buf == 0 && len != 0) {
         return -LPR_LINUX_EFAULT;
@@ -1492,8 +1463,9 @@ int64_t lpr_linux_sendmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         socket_pin.ops_id == LPR_FD_OPS_SOCKET ?
         (lpr_socket_backend_t *)socket_pin.state : 0;
     if (socket == 0 || !socket->active) {
+        const int64_t status = socket == 0 ? -ENOTSOCK : -LPR_LINUX_EBADF;
         lpr_fd_unpin(&socket_pin);
-        return -LPR_LINUX_EBADF;
+        return status;
     }
     lpr_fd_unpin(&socket_pin);
 
@@ -1518,7 +1490,7 @@ int64_t lpr_linux_recvmsg(uint64_t fd, uint64_t msg_raw, uint64_t flags)
         return -LPR_LINUX_EFAULT;
     }
     if (!lpr_linux_socket_fd_active(fd)) {
-        return -LPR_LINUX_EBADF;
+        return lpr_socket_non_socket_status(fd);
     }
     lpr_linux_msghdr_t *msg = (lpr_linux_msghdr_t *)(uintptr_t)msg_raw;
     if (msg->msg_iov == 0 && msg->msg_iovlen != 0) {

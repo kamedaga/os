@@ -8,6 +8,7 @@ arch="${ALPINE_XFCE_ARCH:-x86_64}"
 mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 lock="${repo_root}/tools/manifests/alpine-xfce-v3.22-x86_64.lock"
 writer_lock="${repo_root}/tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
+browser_lock="${repo_root}/tools/manifests/alpine-epiphany-v3.22-x86_64.lock"
 cache="${repo_root}/.artifacts/third_party/alpine-xfce-${branch}-${arch}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 mesa_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-root"
@@ -51,8 +52,8 @@ require_locked xf86-input-libinput 1.5.0-r0
 require_locked bash 5.2.37-r0
 require_locked readline 8.2.13-r1
 require_locked alpine-keys 2.5-r0
-require_locked apk-tools 2.14.10-r0
-require_locked libapk2 2.14.10-r0
+require_locked apk-tools 2.14.12-r0
+require_locked libapk2 2.14.12-r0
 require_locked musl 1.2.5-r12
 require_locked busybox 1.37.0-r20
 require_locked busybox-binsh 1.37.0-r20
@@ -82,12 +83,12 @@ mkdir -p "${runtime}"
 # transaction. A separate overlay database would lose ownership of base files.
 base_lock="${lock}"
 lock="${tmp}/combined.lock"
-awk '$1 !~ /^#/' "${base_lock}" "${writer_lock}" | LC_ALL=C sort -k2,2 >"${lock}"
+awk '$1 !~ /^#/' "${base_lock}" "${writer_lock}" "${browser_lock}" | LC_ALL=C sort -k2,2 >"${lock}"
 if ! awk '{ if (seen[$2]++) exit 1 }' "${lock}"; then
   echo "duplicate package between Xfce and Writer locks" >&2
   exit 1
 fi
-locked_count="$(awk '$1 == "#" && $2 == "package-count" { n += $3 } END { print n }' "${base_lock}" "${writer_lock}")"
+locked_count="$(awk '$1 == "#" && $2 == "package-count" { n += $3 } END { print n }' "${base_lock}" "${writer_lock}" "${browser_lock}")"
 printf '# package-count %s\n' "${locked_count}" >>"${lock}"
 package_count=0
 package_apks=()
@@ -230,6 +231,10 @@ rm -rf \
 mkdir -p "${runtime}/usr/share/pacha"
 cp "${base_lock}" "${runtime}/usr/share/pacha/xfce-packages.lock"
 cp "${writer_lock}" "${runtime}/usr/share/pacha/libreoffice-packages.lock"
+cp "${browser_lock}" "${runtime}/usr/share/pacha/epiphany-packages.lock"
+# Keep apk's original package records/fallback binaries. Select the verified
+# WebKit 6.0 build through an explicit rootfs overlay, leaving GTK3 WebKit alone.
+python3 "${repo_root}/tools/stage_void_webkit.py" "${runtime}"
 
 # pack.yaml publishes the project-wide runtime loader, libc, /bin/sh, and CA
 # bundle at these exact paths. Keep their Alpine packages in the installed
@@ -331,6 +336,9 @@ python3 "${repo_root}/tools/rootfs_overlay.py" library-view \
   "${library_root}" "${runtime}" "${mesa_root}" "${input_root}" "${clang_root}"
 
 for executable in \
+  usr/bin/epiphany \
+  usr/libexec/webkitgtk-6.0/WebKitWebProcess \
+  usr/libexec/webkitgtk-6.0/WebKitNetworkProcess \
   usr/lib/libreoffice/program/soffice.bin \
   usr/lib/libreoffice/program/oosplash \
   bin/bash \
@@ -350,7 +358,7 @@ for executable in \
   usr/bin/xwininfo \
   usr/bin/dbus-daemon; do
   report="${tmp}/$(basename "${executable}").loader"
-  if ! "${linux_musl}" --library-path "${library_root}:${runtime}/usr/lib/libreoffice/program" --list \
+  if ! "${linux_musl}" --library-path "${library_root}:${runtime}/usr/lib/libreoffice/program:${runtime}/usr/lib/epiphany" --list \
       "${runtime}/${executable}" >"${report}" 2>&1; then
     cat "${report}" >&2
     echo "Xfce executable does not resolve: /${executable}" >&2

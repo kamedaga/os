@@ -1,8 +1,11 @@
 #include "../dispatch/common.h"
 #include "internal.h"
+#include "filed/vmo_create.h"
 
 static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uint64_t backend_object);
 static void filed_file_vmo_cache_release_object(filed_runtime_t *runtime, uint64_t backend_object);
+static int filed_shared_vmo_reserve(filed_runtime_t *runtime,
+    filed_file_vmo_cache_entry_t *entry, uint64_t required_end);
 
 static uint64_t filed_cache_next_object_clock(filed_runtime_t *runtime)
 {
@@ -139,8 +142,9 @@ bool filed_cache_object_evictable(filed_runtime_t *runtime, uint64_t backend_obj
     if (runtime == NULL || backend_object == 0) {
         return false;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        const filed_file_vmo_cache_entry_t *entry = it.entry;
         /* All active entries keep their cache key valid.  Creation uses the
          * bounded pinned-slot allocator below, so immutable snapshots cannot
          * consume the entire vnode/backend-object table. */
@@ -162,8 +166,9 @@ uint64_t filed_cache_dirty_count(filed_runtime_t *runtime)
             count++;
         }
     }
-    for (size_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        const filed_file_vmo_cache_entry_t *entry = it.entry;
         if (entry->active && entry->shared && (entry->dirty || entry->writable_lent)) {
             count++;
         }
@@ -240,26 +245,64 @@ static int filed_shared_vmo_flush_entry(
     {
         return 0;
     }
+    /* Reading the mapping itself would instantiate every sparse hole. Native
+     * FD_READ returns zero without backing; each duplicate starts at offset 0
+     * and avoids sharing a mutable read cursor with any lent capability. */
+    int read_fd = -1;
+    if (entry->zero_on_demand) {
+        read_fd = (int)pacha_fd_fcntl(entry->vmo_fd, PACHA_FD_FCNTL_DUP, 16,
+            PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_CLOSE);
+        if (read_fd < 16) {
+            filed_page_cache.flush_errors++;
+            return -5;
+        }
+    }
+    uint8_t buffer[4096];
+    int result = 0;
     uint64_t offset = 0;
     while (offset < entry->logical_size) {
         uint64_t chunk = entry->logical_size - offset;
         if (chunk > STORAGE_IO_BYTES) {
             chunk = STORAGE_IO_BYTES;
         }
+        const uint8_t *data;
+        if (read_fd >= 16) {
+            if (chunk > sizeof(buffer)) chunk = sizeof(buffer);
+            const long got = pacha_fd_read(read_fd, buffer, chunk);
+            if (got < 0 || (uint64_t)got != chunk) {
+                filed_page_cache.flush_errors++;
+                fprintf(stderr, "FILED_STORAGE_FAULT layer=shared_vmo_read bytes=%ld offset=%llu length=%llu\n",
+                    got, (unsigned long long)offset, (unsigned long long)chunk);
+                result = -5;
+                break;
+            }
+            data = buffer;
+        } else {
+            data = (const uint8_t *)entry->mapped + offset;
+        }
         uint64_t bytes = 0;
         const int status = filed_backend_pwrite(
             runtime,
             entry->backend_object,
             offset,
-            (const uint8_t *)entry->mapped + offset,
+            data,
             chunk,
             &bytes);
         if (status != 0 || bytes != chunk) {
             filed_page_cache.flush_errors++;
-            return status != 0 ? status : -5;
+            fprintf(stderr,
+                "FILED_STORAGE_FAULT layer=shared_vmo_pwrite status=%d "
+                "object=%llu offset=%llu length=%llu logical_size=%llu bytes=%llu\n",
+                status, (unsigned long long)entry->backend_object,
+                (unsigned long long)offset, (unsigned long long)chunk,
+                (unsigned long long)entry->logical_size, (unsigned long long)bytes);
+            result = status != 0 ? status : -5;
+            break;
         }
         offset += bytes;
     }
+    if (read_fd >= 16 && pacha_fd_close(read_fd) != 0 && result == 0) result = -5;
+    if (result != 0) return result;
     entry->dirty = 0;
     filed_page_cache.flushes++;
     return 0;
@@ -268,22 +311,35 @@ static int filed_shared_vmo_flush_entry(
 int filed_cache_flush_object(filed_runtime_t *runtime, uint64_t backend_object)
 {
     filed_page_cache_ensure_configured(runtime);
-    for (size_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    int first_error = 0;
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (entry->active && entry->shared &&
             (backend_object == 0 || entry->backend_object == backend_object))
         {
+            /* tmpfs has no disk durability to establish. Its shared VMO is
+             * pinned and is the coherent source for reads/writes; copying
+             * every mapped surface into a second RAM store on global sync
+             * wastes memory and can exhaust the tmpfs backing quota. Keep
+             * dirty state for explicit object flushes before replacement,
+             * invalidation or backend-only consumers. */
+            if (backend_object == 0 &&
+                filed_backend_object_is_tmpfs(entry->backend_object))
+            {
+                continue;
+            }
             const int status = filed_shared_vmo_flush_entry(runtime, entry);
             if (status != 0) {
-                return status;
+                if (!first_error) first_error = status;
             }
         }
     }
     if (filed_backend_object_is_tmpfs(backend_object)) {
-        return 0;
+        return first_error;
     }
     if (filed_page_cache.active_slots == 0) {
-        return 0;
+        return first_error;
     }
     for (size_t i = 0; i < filed_page_cache.active_slots; ++i) {
         filed_page_cache_slot_t *slot = &filed_page_cache.slots[i];
@@ -292,11 +348,11 @@ int filed_cache_flush_object(filed_runtime_t *runtime, uint64_t backend_object)
         {
             const int status = filed_page_cache_flush_slot(runtime, slot);
             if (status != 0) {
-                return status;
+                if (!first_error) first_error = status;
             }
         }
     }
-    return 0;
+    return first_error;
 }
 
 static filed_page_cache_slot_t *filed_page_cache_choose_slot(filed_runtime_t *runtime)
@@ -744,21 +800,18 @@ int filed_cached_pwrite_ex(
     filed_file_vmo_cache_entry_t *shared =
         filed_file_vmo_cache_shared_lookup(runtime, backend_object);
     if (shared != NULL && shared->mapped != NULL) {
-        if (offset + length <= shared->length) {
-            memcpy((uint8_t *)shared->mapped + offset, buffer, (size_t)length);
-            if (offset + length > shared->logical_size) {
-                shared->logical_size = offset + length;
-            }
-            shared->dirty = 1;
-            shared->clock = ++filed_file_vmo_cache.clock;
-            *out_bytes = length;
-            return 0;
-        }
-        int status = filed_shared_vmo_flush_entry(runtime, shared);
-        if (status != 0) {
-            return status;
-        }
-        filed_file_vmo_cache_invalidate_object(runtime, backend_object);
+        int status = filed_shared_vmo_reserve(runtime, shared, offset + length);
+        if (status != 0) return status;
+        if (offset > shared->logical_size)
+            memset((uint8_t *)shared->mapped + shared->logical_size, 0,
+                (size_t)(offset - shared->logical_size));
+        memcpy((uint8_t *)shared->mapped + offset, buffer, (size_t)length);
+        if (offset + length > shared->logical_size)
+            shared->logical_size = offset + length;
+        shared->dirty = 1;
+        shared->clock = ++filed_file_vmo_cache.clock;
+        *out_bytes = length;
+        return 0;
     }
     if (filed_backend_object_is_tmpfs(backend_object)) {
         return filed_backend_pwrite(
@@ -1084,20 +1137,33 @@ static void filed_file_vmo_cache_clear_entry(
         return;
     }
     if (entry->shared && revoke_shared && entry->vmo_fd >= 16) {
-        if (pacha_vmo_revoke(entry->vmo_fd) != 0) {
-            if (entry->mapped != NULL) {
-                (void)pacha_munmap(entry->mapped, entry->length);
-            }
-            (void)pacha_fd_close(entry->vmo_fd);
-        }
-    } else {
-        if (entry->mapped != NULL && entry->vmo_fd >= 16) {
-            (void)pacha_munmap(entry->mapped, entry->length);
-        }
-        if (entry->vmo_fd >= 16) {
-            (void)pacha_fd_close(entry->vmo_fd);
-        }
+#if defined(FILED_SHARED_VMO_DIAG) && FILED_SHARED_VMO_DIAG
+        fprintf(stderr,
+            "[filed] shared_vmo_revoke object=%llu fd=%d length=%llu "
+            "logical_size=%llu writable_lent=%u dirty=%u\n",
+            (unsigned long long)entry->backend_object, entry->vmo_fd,
+            (unsigned long long)entry->length,
+            (unsigned long long)entry->logical_size,
+            (unsigned)entry->writable_lent, (unsigned)entry->dirty);
+#endif
+        if (pacha_vmo_revoke(entry->vmo_fd) == 0) goto cleared;
     }
+    if (entry->vmo_fd >= 16) {
+        /* Retain every alias until unmap succeeds; losing its address would
+         * pin the backing permanently after a failed local remap cleanup. */
+        if (entry->retired_mapping != NULL) {
+            if (pacha_munmap(entry->retired_mapping, entry->retired_length) != 0) return;
+            entry->retired_mapping = NULL;
+            entry->retired_length = 0;
+        }
+        if (entry->mapped != NULL) {
+            if (pacha_munmap(entry->mapped, entry->length) != 0) return;
+            entry->mapped = NULL;
+            entry->retiring = 1;
+        }
+        if (pacha_fd_close(entry->vmo_fd) != 0) return;
+    }
+cleared:
     memset(entry, 0, sizeof(*entry));
     entry->vmo_fd = -1;
 }
@@ -1107,8 +1173,9 @@ static void filed_file_vmo_cache_invalidate_object(filed_runtime_t *runtime, uin
     if (runtime == NULL || backend_object == 0) {
         return;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (entry->active && entry->backend_object == backend_object) {
             filed_file_vmo_cache_evictions++;
             filed_file_vmo_cache_clear_entry(entry, entry->shared != 0);
@@ -1121,8 +1188,9 @@ static void filed_file_vmo_cache_release_object(filed_runtime_t *runtime, uint64
     if (runtime == NULL || backend_object == 0) {
         return;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (entry->active && entry->backend_object == backend_object) {
             filed_file_vmo_cache_evictions++;
             filed_file_vmo_cache_clear_entry(entry, false);
@@ -1140,8 +1208,9 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_lookup(
     if (runtime == NULL || backend_object == 0 || length == 0) {
         return NULL;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (entry->active && !entry->shared &&
             entry->backend_object == backend_object &&
             entry->object_generation == object_generation &&
@@ -1169,8 +1238,9 @@ static filed_file_vmo_cache_entry_t *filed_file_vmo_cache_snapshot_victim(
     if (runtime == NULL) {
         return NULL;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (!entry->active || entry->shared) {
             continue;
         }
@@ -1189,51 +1259,138 @@ static filed_file_vmo_cache_entry_t *filed_file_vmo_cache_snapshot_victim(
     return victim;
 }
 
-filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
-    filed_runtime_t *runtime,
-    uint64_t length)
+void filed_file_vmo_cache_trim_empty_banks(filed_runtime_t *runtime)
 {
-    if (runtime == NULL || length > FILED_FILE_VMO_CACHE_TOTAL_BYTES) {
-        return NULL;
+    if (runtime == NULL) return;
+    filed_file_vmo_bank_t **link = &filed_file_vmo_cache.banks;
+    while (*link != NULL) {
+        filed_file_vmo_bank_t *bank = *link;
+        bool active = false;
+        for (unsigned i = 0; i < FILED_FILE_VMO_BANK_ENTRIES; ++i)
+            active |= bank->entries[i].active != 0;
+        if (active) {
+            link = &bank->next;
+        } else {
+            *link = bank->next;
+            free(bank);
+        }
     }
+}
+
+static uint32_t filed_file_vmo_cache_reclaim_idle_shared_except(
+    filed_runtime_t *runtime, const filed_file_vmo_cache_entry_t *keep)
+{
+    uint32_t reclaimed = 0;
+    if (runtime == NULL) return 0;
+    /* FileD dispatch is serial: retain the owner's FD while checking both
+     * reference layers, flushing, unmapping and closing. Never revoke a live
+     * client's VMO. Missing INSPECT/old kernels/query errors fail closed. */
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
+        if (entry == keep || !entry->active || !entry->shared || entry->vmo_fd < 16 ||
+            (entry->mapped == NULL && !entry->retiring)) continue;
+        if (entry->retired_mapping != NULL) {
+            if (pacha_munmap(entry->retired_mapping, entry->retired_length) != 0) continue;
+            entry->retired_mapping = NULL;
+            entry->retired_length = 0;
+        }
+        struct pacha_fd_info info = {0};
+        if (pacha_fd_get_info(entry->vmo_fd, &info) != 0 ||
+            info.kind != PACHA_FD_KIND_VMO ||
+            !(info.rights & PACHA_FD_RIGHT_INSPECT) ||
+            (info.extra & PACHA_VMO_INFO_OBJECT_REFS_MASK) != 1 ||
+            (info.extra >> PACHA_VMO_INFO_NATIVE_REFS_SHIFT) !=
+                (entry->mapped != NULL ? 2u : 1u)) continue;
+        if (filed_shared_vmo_flush_entry(runtime, entry) != 0) continue;
+        if (entry->mapped != NULL) {
+            if (pacha_munmap(entry->mapped, entry->length) != 0) continue;
+            entry->mapped = NULL;
+            entry->retiring = 1;
+            entry->dirty = entry->writable_lent = 0;
+        }
+        /* If close fails, retain the FD for retry but do not lend this
+         * unmapped entry again. Its data has already reached the backend. */
+        if (pacha_fd_close(entry->vmo_fd) != 0) continue;
+        memset(entry, 0, sizeof(*entry));
+        entry->vmo_fd = -1;
+        ++filed_file_vmo_cache_evictions;
+        ++reclaimed;
+    }
+    return reclaimed;
+}
+
+uint32_t filed_file_vmo_cache_reclaim_idle_shared(filed_runtime_t *runtime)
+{
+    return filed_file_vmo_cache_reclaim_idle_shared_except(runtime, NULL);
+}
+
+static bool filed_file_vmo_cache_reserve_bytes(filed_runtime_t *runtime,
+    uint64_t length, const filed_file_vmo_cache_entry_t *keep)
+{
+    if (runtime == NULL || length > FILED_FILE_VMO_CACHE_TOTAL_BYTES) return false;
+    bool checked_idle = false;
+retry:
     if (length != 0) {
         uint64_t active_bytes = 0;
-        for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-            const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+        for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+             it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+            const filed_file_vmo_cache_entry_t *entry = it.entry;
             if (entry->active) {
-                if (entry->length > FILED_FILE_VMO_CACHE_TOTAL_BYTES - active_bytes) {
+                const uint64_t bytes = filed_file_vmo_cache_bytes(entry);
+                if (bytes > FILED_FILE_VMO_CACHE_TOTAL_BYTES - active_bytes) {
                     active_bytes = FILED_FILE_VMO_CACHE_TOTAL_BYTES;
                     break;
                 }
-                active_bytes += entry->length;
+                active_bytes += bytes;
             }
         }
         while (active_bytes > FILED_FILE_VMO_CACHE_TOTAL_BYTES - length) {
+            if (!checked_idle) {
+                checked_idle = true;
+                if (filed_file_vmo_cache_reclaim_idle_shared_except(runtime, keep) != 0)
+                    goto retry;
+            }
             filed_file_vmo_cache_entry_t *victim =
                 filed_file_vmo_cache_snapshot_victim(runtime);
             if (victim == NULL) {
-                return NULL;
+                return false;
             }
             active_bytes = victim->length > active_bytes ?
                 0 : active_bytes - victim->length;
             filed_file_vmo_cache_evictions++;
             filed_file_vmo_cache_clear_entry(victim, false);
+            if (victim->active) return false;
+            filed_file_vmo_cache.byte_budget_evictions++;
         }
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    return true;
+}
+
+filed_file_vmo_cache_entry_t *filed_file_vmo_cache_slot_for_length(
+    filed_runtime_t *runtime, uint64_t length)
+{
+    if (!filed_file_vmo_cache_reserve_bytes(runtime, length, NULL)) return NULL;
+    filed_file_vmo_cache_trim_empty_banks(runtime);
+    bool checked_idle = false;
+retry:
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (!entry->active) {
             return entry;
         }
     }
-    filed_file_vmo_cache_entry_t *victim =
-        filed_file_vmo_cache_snapshot_victim(runtime);
-    if (victim == NULL) {
-        return NULL;
+    if (!checked_idle) {
+        checked_idle = true;
+        if (filed_file_vmo_cache_reclaim_idle_shared(runtime) != 0)
+            goto retry;
     }
-    filed_file_vmo_cache_evictions++;
-    filed_file_vmo_cache_clear_entry(victim, false);
-    return victim;
+    filed_file_vmo_bank_t *bank = calloc(1, sizeof(*bank));
+    if (bank == NULL) return NULL;
+    bank->next = filed_file_vmo_cache.banks;
+    filed_file_vmo_cache.banks = bank;
+    return &bank->entries[0];
 }
 
 filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
@@ -1244,8 +1401,9 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_pinned_slot_for_length(
     if (runtime == NULL) {
         return NULL;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (!entry->active) {
             continue;
         }
@@ -1277,8 +1435,9 @@ uint32_t filed_file_vmo_cache_reclaim_snapshots(
     if (runtime == NULL) {
         return 0;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
         if (!entry->active || entry->shared) {
             continue;
         }
@@ -1301,14 +1460,51 @@ filed_file_vmo_cache_entry_t *filed_file_vmo_cache_shared_lookup(
     if (runtime == NULL || backend_object == 0) {
         return NULL;
     }
-    for (uint64_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
-        if (entry->active && entry->shared && entry->backend_object == backend_object) {
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        filed_file_vmo_cache_entry_t *entry = it.entry;
+        if (entry->active && entry->shared && !entry->retiring &&
+            entry->backend_object == backend_object) {
             entry->clock = ++filed_file_vmo_cache.clock;
             return entry;
         }
     }
     return NULL;
+}
+
+static int filed_shared_vmo_reserve(filed_runtime_t *runtime,
+    filed_file_vmo_cache_entry_t *entry, uint64_t required_end)
+{
+    if (required_end <= entry->length) return 0;
+    if (required_end > UINT64_MAX - 4095u) return -75;
+    const uint64_t capacity = (required_end + 4095u) & ~4095ull;
+    const uint64_t old_capacity = filed_file_vmo_cache_bytes(entry);
+    if (entry->retired_mapping != NULL) {
+        if (pacha_munmap(entry->retired_mapping, entry->retired_length) != 0) return -5;
+        entry->retired_mapping = NULL;
+        entry->retired_length = 0;
+    }
+    if (capacity > old_capacity) {
+        if (!filed_file_vmo_cache_reserve_bytes(runtime, capacity - old_capacity, entry))
+            return -28;
+        /* Replacing/revoking this VMO would invalidate other processes' live
+         * aliases. Grow the same backing; only FileD has its RESIZE right. */
+        const int grow_status = pacha_vmo_grow(entry->vmo_fd, capacity);
+        if (grow_status != 0) return (int)pacha_kernel_status_to_errno(grow_status);
+        entry->capacity = capacity;
+    }
+    void *mapped = pacha_mmap(entry->vmo_fd, capacity,
+        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
+    if (mapped == NULL) return -12;
+    void *old_mapping = entry->mapped;
+    const uint64_t old_length = entry->length;
+    entry->mapped = mapped;
+    entry->length = capacity;
+    if (old_mapping != NULL && pacha_munmap(old_mapping, old_length) != 0) {
+        entry->retired_mapping = old_mapping;
+        entry->retired_length = old_length;
+    }
+    return 0;
 }
 
 int filed_cache_create_shared_vmo(
@@ -1336,25 +1532,35 @@ int filed_cache_create_shared_vmo(
     filed_file_vmo_cache_entry_t *existing =
         filed_file_vmo_cache_shared_lookup(runtime, backend_object);
     if (existing != NULL) {
-        if (existing->length >= capacity) {
-            if (logical_size > existing->logical_size) {
-                existing->logical_size = logical_size;
-            }
-            *out_entry = existing;
-            return 0;
+        const int grow_status = filed_shared_vmo_reserve(runtime, existing, capacity);
+        if (grow_status != 0) return grow_status;
+        /* Size changes through FileD update logical_size together with data.
+         * A backend-only extension must load its tail before exposing it. */
+        uint64_t loaded = existing->logical_size;
+        while (loaded < logical_size) {
+            uint64_t chunk = logical_size - loaded;
+            if (chunk > STORAGE_IO_BYTES) chunk = STORAGE_IO_BYTES;
+            uint64_t bytes = 0;
+            int status = filed_backend_pread(runtime, backend_object, loaded,
+                (uint8_t *)existing->mapped + loaded, chunk, &bytes);
+            if (status != 0) return status;
+            if (bytes == 0 || bytes > chunk) return -5;
+            loaded += bytes;
         }
-        const int flush_status = filed_shared_vmo_flush_entry(runtime, existing);
-        if (flush_status != 0) {
-            return flush_status;
-        }
-        filed_file_vmo_cache_clear_entry(existing, true);
+        if (logical_size > existing->logical_size) existing->logical_size = logical_size;
+        *out_entry = existing;
+        return 0;
     }
 
     int status = filed_cache_flush_object(runtime, backend_object);
     if (status != 0) {
         return status;
     }
+    const bool zero_on_demand = filed_backend_object_is_tmpfs(backend_object);
+    const uint32_t create_flags = zero_on_demand ? PACHA_VMO_CREATE_ZERO_ON_DEMAND : 0;
     const uint64_t rights =
+        (zero_on_demand ? PACHA_FD_RIGHT_READ : 0) |
+        PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_DUP |
@@ -1362,15 +1568,15 @@ int filed_cache_create_shared_vmo(
         PACHA_FD_RIGHT_MAP_READ |
         PACHA_FD_RIGHT_MAP_WRITE |
         PACHA_FD_RIGHT_MAP_EXEC |
+        PACHA_FD_RIGHT_RESIZE |
         PACHA_FD_RIGHT_REVOKE;
-    /* Enforce the cache byte budget before allocating the replacement.  This
-     * keeps resize/create from temporarily requiring old + new VMO capacity. */
+    /* Charge new backing before allocation, without evicting live aliases. */
     filed_file_vmo_cache_entry_t *entry =
         filed_file_vmo_cache_pinned_slot_for_length(runtime, capacity);
     if (entry == NULL) {
         return -28;
     }
-    int vmo_fd = pacha_vmo_create(capacity, rights, 0);
+    int vmo_fd = filed_vmo_create(capacity, rights, create_flags);
     if (vmo_fd < 16) {
         uint64_t reclaimed_bytes = 0;
         const uint32_t reclaimed_entries =
@@ -1382,7 +1588,7 @@ int filed_cache_create_shared_vmo(
                 (unsigned long long)capacity,
                 reclaimed_entries,
                 (unsigned long long)reclaimed_bytes);
-            vmo_fd = pacha_vmo_create(capacity, rights, 0);
+            vmo_fd = filed_vmo_create(capacity, rights, create_flags);
         }
     }
     if (vmo_fd < 16) {
@@ -1400,6 +1606,15 @@ int filed_cache_create_shared_vmo(
     }
 
     uint64_t loaded = 0;
+    if (zero_on_demand) {
+        status = filed_tmpfs_backend_copy_present(&runtime->tmpfs, backend_object, mapped, logical_size);
+        if (status != 0) {
+            (void)pacha_munmap(mapped, capacity);
+            (void)pacha_fd_close(vmo_fd);
+            return status;
+        }
+        loaded = logical_size;
+    }
     while (loaded < logical_size) {
         uint64_t chunk = logical_size - loaded;
         if (chunk > STORAGE_IO_BYTES) {
@@ -1428,10 +1643,12 @@ int filed_cache_create_shared_vmo(
     memset(entry, 0, sizeof(*entry));
     entry->active = 1;
     entry->shared = 1;
+    entry->zero_on_demand = zero_on_demand;
     entry->vmo_fd = vmo_fd;
     entry->backend_object = backend_object;
     entry->object_generation = object_generation;
     entry->length = capacity;
+    entry->capacity = capacity;
     entry->logical_size = logical_size;
     entry->clock = ++filed_file_vmo_cache.clock;
     entry->mapped = mapped;
@@ -1441,12 +1658,45 @@ int filed_cache_create_shared_vmo(
     return 0;
 }
 
-void filed_cache_invalidate(filed_runtime_t *runtime, uint64_t backend_object)
+int filed_cache_truncate(filed_runtime_t *runtime, uint64_t backend_object, uint64_t size)
+{
+    int status = filed_cache_flush_object(runtime, backend_object);
+    if (status != 0) return status;
+    filed_file_vmo_cache_entry_t *shared =
+        filed_file_vmo_cache_shared_lookup(runtime, backend_object);
+    const bool preserve = shared != NULL && size >= shared->logical_size;
+    if (preserve) {
+        status = filed_shared_vmo_reserve(runtime, shared, size);
+        if (status != 0) return status;
+    }
+    status = filed_backend_truncate(runtime, backend_object, size);
+    if (status != 0) return status;
+    if (!preserve) {
+        filed_cache_invalidate(runtime, backend_object);
+        return 0;
+    }
+    /* Extension changes neither prefix ownership nor existing VMAs. Bytes
+     * previously beyond EOF must become zero, including a partial old page. */
+    if (size > shared->logical_size) {
+        memset((uint8_t *)shared->mapped + shared->logical_size, 0,
+            (size_t)(size - shared->logical_size));
+        shared->logical_size = size;
+    }
+    filed_page_cache_invalidate_object(runtime, backend_object);
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        if (it.entry->active && !it.entry->shared &&
+            it.entry->backend_object == backend_object)
+            filed_file_vmo_cache_clear_entry(it.entry, false);
+    }
+    return 0;
+}
+
+void filed_cache_invalidate_namespace(filed_runtime_t *runtime, uint64_t backend_object)
 {
     if (runtime == NULL || backend_object == 0) {
         return;
     }
-    filed_page_cache_invalidate_object(runtime, backend_object);
     filed_dir_cache_invalidate_dir(runtime, backend_object);
     for (size_t i = 0; i < FILED_NEGATIVE_LOOKUP_CACHE_SLOTS; ++i) {
         filed_negative_lookup_cache_slot_t *slot = &filed_negative_lookup_cache.slots[i];
@@ -1454,6 +1704,13 @@ void filed_cache_invalidate(filed_runtime_t *runtime, uint64_t backend_object)
             memset(slot, 0, sizeof(*slot));
         }
     }
+}
+
+void filed_cache_invalidate(filed_runtime_t *runtime, uint64_t backend_object)
+{
+    if (runtime == NULL || backend_object == 0) return;
+    filed_cache_invalidate_namespace(runtime, backend_object);
+    filed_page_cache_invalidate_object(runtime, backend_object);
     filed_file_vmo_cache_invalidate_object(runtime, backend_object);
     for (size_t i = 0; i < FILED_CACHE_OBJECT_SLOTS; ++i) {
         filed_cache_object_entry_t *entry = &filed_cache.objects[i];

@@ -7,16 +7,22 @@
 #include "filed/vfs.h"
 
 enum {
-    FILED_TMPFS_MAX_INODES = 128,
-    FILED_TMPFS_MAX_DENTRIES = 256,
-    FILED_TMPFS_PAGE_POOL_PAGES = 4096,
+    /* /tmp, /run, /dev/shm and memfd share this bounded metadata pool.
+     * Desktop + WebKit exhausted 128 inodes with data pages still free. */
+    FILED_TMPFS_MAX_INODES = 256,
+    FILED_TMPFS_MAX_DENTRIES = 512,
+    /* Bounded backing budget, allocated only for nonzero written pages.
+     * Browser temporary files alone exceeded the old 16 MiB global pool. */
+    FILED_TMPFS_PAGE_POOL_PAGES = 16384,
     FILED_TMPFS_CHILD_HASH_BUCKETS = 256,
     FILED_TMPFS_NO_SLOT = 0xffffu,
 };
 
 typedef struct filed_tmpfs_page {
     bool used;
-    uint8_t data[FILED_TMPFS_PAGE_BYTES];
+    uint16_t next_inode_page;
+    uint32_t file_page_index;
+    uint8_t *data;
 } filed_tmpfs_page_t;
 
 typedef struct filed_tmpfs_inode {
@@ -32,8 +38,9 @@ typedef struct filed_tmpfs_inode {
     uint32_t nlink;
     filed_vnode_kind_t kind;
     uint16_t allocated_page_count;
-    uint16_t allocated_page_ids[FILED_TMPFS_MAX_ALLOCATED_PAGES];
-    uint32_t allocated_page_indices[FILED_TMPFS_MAX_ALLOCATED_PAGES];
+    /* Page ownership metadata belongs to the global page pool, not a large
+     * fixed array per inode. A single file may use the existing 64 MiB pool. */
+    uint16_t first_allocated_page;
 } filed_tmpfs_inode_t;
 
 typedef struct filed_tmpfs_dentry {

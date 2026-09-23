@@ -61,6 +61,8 @@ struct pacha_capsule_info {
     uint64_t device;
     uint64_t object_id;
     uint64_t user_va;
+    /* DEVICE: one continuous translated DMA aperture; size=0 if unavailable.
+     * This is not an endpoint DMA mask. DMA objects: allocation address/size. */
     uint64_t iova;
     uint64_t size;
     uint64_t index;

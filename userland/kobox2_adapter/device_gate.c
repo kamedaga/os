@@ -42,8 +42,6 @@ void ph_device_gate_prepare(const struct kobox_linux_boot_layout *layout) {
         /* Linux topology is local. The native FD still limits every operation
          * to the one discovered physical function. */
         .segment = 0, .bus = 0, .devfn = 0,
-        /* This test's explicit envelope is the existing native VT-d aperture. */
-        .aperture_start = UINT64_C(0x80000000), .aperture_end = UINT64_C(0x8fffffff),
         .irq_cookie_sequence = &irq_cookie_sequence, .image = &ph_core,
         .memory = layout->task.memory,
     };

@@ -10,6 +10,7 @@ static struct {
     unsigned pending;
 } native_fds[256];
 static unsigned control_unmaps, fail_unmap;
+static int send_error;
 int pacha_munmap(void *page, uint64_t bytes)
 {
     assert(page && bytes == UNIX_CONTROL_BYTES);
@@ -69,9 +70,10 @@ int pacha_ipc_send(int fd, const struct pacha_ipc_msg *message)
 {
     assert(fd >= 16 && fd < 256 && native_fds[fd].kind);
     assert(message->word0 == UNIX_NOTIFY_MAGIC && !message->fd_count);
+    if (send_error) return send_error;
     int peer = native_fds[fd].peer;
     if (!native_fds[peer].kind) return -1;
-    if (native_fds[peer].pending == 4) return PACHA_ERR_ALLOC;
+    if (native_fds[peer].pending == 4) return PACHA_ERR_NOT_READY;
     native_fds[peer].pending++;
     return 0;
 }
@@ -167,6 +169,11 @@ int main(void)
     for (unsigned i = 0; i < 8; i++)
         assert(sync_waiter(&service, &parent, &sync, &response) == 0);
     assert(native_fds[receiver].pending == 4 && !response.count); /* bounded/full coalescing */
+    send_error = PACHA_ERR_ALLOC;
+    assert(sync_waiter(&service, &parent, &sync, &response) == -EIO);
+    send_error = PACHA_ERR_INVALID;
+    assert(sync_waiter(&service, &parent, &sync, &response) == -EIO);
+    send_error = 0;
 
     struct unix_attachment attachment;
     struct unix_direction tx, rx;

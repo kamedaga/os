@@ -48,6 +48,10 @@ int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
     if (!symbol)
         return -ENOENT;
     memcpy(&service->unmap, &symbol, sizeof(service->unmap));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_take_fence");
+    if (!symbol)
+        return -ENOENT;
+    memcpy(&service->take_fence, &symbol, sizeof(service->take_fence));
     service->client_id = client_id;
     service->sessions = sessions;
     return 0;

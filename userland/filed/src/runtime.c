@@ -60,6 +60,7 @@ static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
     }
 
     runtime->syncer_ticks++;
+    filed_vfs_trim_open_objects(&runtime->vfs);
     const uint64_t dirty_count = filed_cache_dirty_count(runtime);
     const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
     if (dirty_count == 0 && backend_dirty_hint == 0) {
@@ -571,8 +572,8 @@ static void filed_runtime_release_session(
     filed_session_t *session = &runtime->sessions[session_index];
     if (session == NULL) return;
     const uint32_t owner_session = (uint32_t)session_index + 1u;
-    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
-        filed_handle_t *handle = &runtime->vfs.handles[i];
+    for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i) {
+        filed_handle_t *handle = filed_vfs_handle_at(&runtime->vfs, i);
         if (!handle->active || handle->owner_session != owner_session) continue;
         (void)filed_close_handle_runtime(runtime, handle->id);
     }
@@ -587,6 +588,47 @@ static void filed_runtime_release_session(
     session->channel_fd = -1;
 }
 
+struct filed_wait_storage {
+    struct pacha_pollfd *fds;
+    uint64_t *session_indices;
+    filed_handle_id_t *lease_handles;
+    size_t capacity;
+};
+
+static void filed_wait_destroy(struct filed_wait_storage *wait)
+{
+    free(wait->fds);
+    free(wait->session_indices);
+    free(wait->lease_handles);
+    memset(wait, 0, sizeof(*wait));
+}
+
+static int filed_wait_reserve(struct filed_wait_storage *wait, size_t needed)
+{
+    if (needed <= wait->capacity) return 0;
+    size_t capacity = wait->capacity ? wait->capacity : 32;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2) return -12;
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof(*wait->fds) ||
+        capacity > SIZE_MAX / sizeof(*wait->session_indices) ||
+        capacity > SIZE_MAX / sizeof(*wait->lease_handles)) return -12;
+    struct filed_wait_storage next = { .capacity = capacity };
+    next.fds = malloc(capacity * sizeof(*next.fds));
+    next.session_indices = malloc(capacity * sizeof(*next.session_indices));
+    next.lease_handles = malloc(capacity * sizeof(*next.lease_handles));
+    if (!next.fds || !next.session_indices || !next.lease_handles) {
+        filed_wait_destroy(&next);
+        return -12;
+    }
+    /* No snapshot is in flight here. Publish all three arrays together so an
+     * allocation failure cannot leave their capacities mismatched. */
+    filed_wait_destroy(wait);
+    *wait = next;
+    return 0;
+}
+
 int filed_runtime_serve(filed_runtime_t *runtime)
 {
     if (runtime == NULL || runtime->client_endpoint_fd < 16) {
@@ -598,14 +640,18 @@ int filed_runtime_serve(filed_runtime_t *runtime)
         return syncer_timer_status;
     }
 
+    struct filed_wait_storage wait __attribute__((cleanup(filed_wait_destroy))) = {0};
     for (;;) {
-        struct pacha_pollfd fds[
-            PACHA_SERVICE_WAIT_MAX_FDS];
-        uint64_t session_indices[
-            PACHA_SERVICE_WAIT_MAX_FDS];
-        filed_handle_id_t lease_handles[
-            PACHA_SERVICE_WAIT_MAX_FDS];
-        memset(lease_handles, 0, sizeof(lease_handles));
+        size_t needed = 3 + FILED_RUNTIME_MAX_SESSIONS + (size_t)runtime->vfs.lease_handle_count;
+        for (struct filed_client *client = runtime->clients; client; client = client->next) {
+            if (needed == SIZE_MAX) return -12;
+            ++needed;
+        }
+        if (filed_wait_reserve(&wait, needed) != 0) return -12;
+        struct pacha_pollfd *fds = wait.fds;
+        uint64_t *session_indices = wait.session_indices;
+        filed_handle_id_t *lease_handles = wait.lease_handles;
+        memset(lease_handles, 0, needed * sizeof(*lease_handles));
         uint64_t count = 0;
         fds[count++] = (struct pacha_pollfd){
             .fd = runtime->client_endpoint_fd,
@@ -637,10 +683,15 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 .revents = 0,
             };
         }
-        for (uint16_t i = 0; i < runtime->vfs.lease_handle_count; ++i) {
-            const filed_handle_id_t handle_id = runtime->vfs.lease_handle_ids[i];
-            const int lease_fd = filed_vfs_get_handle_lease(&runtime->vfs, handle_id);
-            if (lease_fd < 16) continue;
+        uint32_t leases = 0;
+        for (uint32_t link = runtime->vfs.lease_head; link != 0;) {
+            if (link > runtime->vfs.handle_capacity) return -22;
+            if (++leases > runtime->vfs.lease_handle_count || count >= needed) return -22;
+            const filed_handle_t *handle = filed_vfs_handle_at(&runtime->vfs, link - 1);
+            const filed_handle_id_t handle_id = handle->id;
+            const int lease_fd = handle->lease_fd;
+            link = handle->lease_next;
+            if (!handle->active || lease_fd < 16) return -22;
             session_indices[count] = UINT64_MAX;
             lease_handles[count] = handle_id;
             fds[count++] = (struct pacha_pollfd){
@@ -649,16 +700,17 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 .revents = 0,
             };
         }
+        if (leases != runtime->vfs.lease_handle_count) return -22;
 
         const uint64_t clients_begin = count;
         for (struct filed_client *client = runtime->clients; client; client = client->next) {
-            if (count == PACHA_SERVICE_WAIT_MAX_FDS) return -24;
+            if (count >= needed) return -22;
             session_indices[count] = client->id;
             fds[count++] = (struct pacha_pollfd){ .fd = client->fd,
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP };
         }
 
-        const long wait_status = pacha_fd_wait_many(
+        const long wait_status = pacha_fd_wait_many_batched(
             fds, count, PACHA_FD_WAIT_FOREVER);
         if (wait_status < 0) {
             return (int)wait_status;

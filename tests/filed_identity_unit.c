@@ -5,19 +5,23 @@
 
 const filed_handle_t *filed_find_handle_const(const filed_vfs_t *vfs, filed_handle_id_t id)
 {
-    for (unsigned i = 0; i < FILED_MAX_HANDLES; i++)
-        if (vfs->handles[i].active && vfs->handles[i].id == id) return &vfs->handles[i];
+    for (unsigned i = 0; i < vfs->handle_capacity; i++)
+        if (filed_vfs_handle_at(vfs, i)->active && filed_vfs_handle_at(vfs, i)->id == id) return filed_vfs_handle_at(vfs, i);
     return NULL;
 }
 
 static filed_runtime_t runtime;
 int main(void)
 {
+    filed_handle_t handles[FILED_HANDLE_BANK_ENTRIES] = {0};
+    filed_handle_t *banks[] = {handles};
+    runtime.vfs.handle_banks = banks;
+    runtime.vfs.handle_capacity = FILED_HANDLE_BANK_ENTRIES;
     struct filed_client root = { .id = 11, .identity = { .pid = 1, .generation = 1 } };
     struct filed_client user = { .id = 12, .identity = { .pid = 2, .generation = 2,
         .uid = 1001, .euid = 1001, .rights = 1023 } };
-    runtime.vfs.handles[0] = (filed_handle_t){ .active = true, .id = 70, .owner_client = 11 };
-    runtime.vfs.handles[1] = (filed_handle_t){ .active = true, .id = 71, .owner_client = 12 };
+    *filed_vfs_handle_at(&runtime.vfs, 0) = (filed_handle_t){ .active = true, .id = 70, .owner_client = 11 };
+    *filed_vfs_handle_at(&runtime.vfs, 1) = (filed_handle_t){ .active = true, .id = 71, .owner_client = 12 };
     runtime.actor = &root;
     filed_openat_t open = { .rights = FILED_RIGHT_READ, .name = "/etc/passwd" };
     assert(filed_client_authorize(&runtime, FILED_OP_VFS_OPENAT, &open, sizeof(open), 0) == -13);

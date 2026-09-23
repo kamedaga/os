@@ -53,31 +53,52 @@ pub const CacheSnapshot = struct {
         return true;
     }
 
-    pub fn rangeIsUncached(self: *const CacheSnapshot, start: u64, bytes: u64) bool {
+    /// PAT entry 3 can encode explicit UC throughout this physical range.
+    /// This does not prove that aliases using other PAT entries are also UC.
+    pub fn rangeSupportsUncachedMapping(self: *const CacheSnapshot, start: u64, bytes: u64) bool {
         if (!self.valid() or bytes == 0 or start < 0x100000 or ((start | bytes) & 4095) != 0)
             return false;
         const limit = @as(u64, 1) << @intCast(self.physical_bits);
-        if (start >= limit or bytes > limit - start) return false;
+        return start < limit and bytes <= limit - start;
+    }
+
+    pub fn rangeIsUncached(self: *const CacheSnapshot, start: u64, bytes: u64) bool {
+        return self.rangeIsUncachedForPat(start, bytes, false);
+    }
+
+    /// PAT UC_MINUS combined with MTRR UC or WB is effectively UC (Intel
+    /// SDM Vol. 3A, effective-memory-type table). WC is deliberately refused.
+    /// Callers must separately prove compatibility with any WB-encoded alias.
+    pub fn rangeIsUcMinusUncached(self: *const CacheSnapshot, start: u64, bytes: u64) bool {
+        return self.rangeIsUncachedForPat(start, bytes, true);
+    }
+
+    fn rangeIsUncachedForPat(self: *const CacheSnapshot, start: u64, bytes: u64, allow_wb: bool) bool {
+        if (!self.rangeSupportsUncachedMapping(start, bytes)) return false;
         var address = start;
         while (address < start + bytes) : (address += 4096) {
-            if (!self.pageIsUncached(address)) return false;
+            if (!self.pageIsUncached(address, allow_wb)) return false;
         }
         return true;
     }
 
-    fn pageIsUncached(self: *const CacheSnapshot, address: u64) bool {
+    fn pageIsUncached(self: *const CacheSnapshot, address: u64, allow_wb: bool) bool {
         const physical_mask = self.physicalMask();
         var matched = false;
+        var all_wb = true;
         for (self.ranges[0 .. self.capability & 0xff]) |range| {
             if (range.mask & mtrr_valid == 0) continue;
             const mask = range.mask & physical_mask;
             if ((address & mask) != (range.base & mask)) continue;
             matched = true;
-            // UC dominates overlapping variable ranges. Otherwise do not
-            // infer a type for overlaps: only a proven UC result is admitted.
+            // UC dominates overlaps. Without UC, admit only uniformly WB
+            // ranges for UC_MINUS; mixed/other types remain fail-closed.
             if (@as(u8, @truncate(range.base)) == memory_type_uc) return true;
+            if (@as(u8, @truncate(range.base)) != 6) all_wb = false;
         }
-        return !matched and @as(u8, @truncate(self.default_type)) == memory_type_uc;
+        if (matched) return allow_wb and all_wb;
+        const default: u8 = @truncate(self.default_type);
+        return default == memory_type_uc or (allow_wb and default == 6);
     }
 };
 

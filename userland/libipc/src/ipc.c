@@ -241,8 +241,42 @@ int pacha_service_wait_add(struct pacha_service_wait_set *set, int fd, uint32_t 
 
 long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks) {
     if (set == NULL || set->count == 0 || set->count > PACHA_SERVICE_WAIT_MAX_FDS) return -1;
-    for (uint64_t i = 0; i < set->count; i++) set->fds[i].revents = 0;
-    return pacha_fd_wait_many(set->fds, set->count, timeout_ticks);
+    return pacha_fd_wait_many_batched(set->fds, set->count, timeout_ticks);
+}
+
+long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t total,
+    uint64_t timeout_ticks) {
+    if (!fds || !total || total > SIZE_MAX / sizeof(*fds)) return PACHA_ERR_INVALID;
+    for (uint64_t i = 0; i < total; i++) fds[i].revents = 0;
+    /* kernel/abi/fd_abi.zig limits each native poll to 256 items, even
+     * when the service's descriptor table and wait set have grown larger. */
+    enum { NATIVE_WAIT_BATCH = 256 };
+    if (total <= NATIVE_WAIT_BATCH)
+        return pacha_fd_wait_many(fds, total, timeout_ticks);
+    uint64_t cursor = 0;
+    for (;;) {
+        long ready = 0;
+        for (uint64_t start = 0; start < total; start += NATIVE_WAIT_BATCH) {
+            const uint64_t remaining = total - start;
+            const uint64_t count = remaining < NATIVE_WAIT_BATCH ? remaining : NATIVE_WAIT_BATCH;
+            const long status = pacha_fd_wait_many(fds + start, count, 0);
+            if (status > 0) ready += status;
+            else if (status != PACHA_ERR_NOT_READY && status != 0) return status;
+        }
+        if (ready) return ready;
+        if (!timeout_ticks) return PACHA_ERR_NOT_READY;
+        /* Never wait forever on one subset: an event in another subset
+         * must be observed on the next sweep. Rotate the blocking subset
+         * and bound that sleep to one kernel tick. */
+        const uint64_t remaining = total - cursor;
+        const uint64_t count = remaining < NATIVE_WAIT_BATCH ? remaining : NATIVE_WAIT_BATCH;
+        const long status = pacha_fd_wait_many(fds + cursor, count, 1);
+        if (status > 0) return status;
+        if (status != PACHA_ERR_NOT_READY && status != 0) return status;
+        if (timeout_ticks != PACHA_FD_WAIT_FOREVER) --timeout_ticks;
+        cursor += count;
+        if (cursor == total) cursor = 0;
+    }
 }
 
 uint64_t pacha_service_wait_revents(
@@ -317,6 +351,11 @@ int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) 
         flags,
         0
     ));
+}
+
+int pacha_vmo_grow(int fd, uint64_t new_capacity) {
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_VMO_GROW,
+        (uint64_t)(uint32_t)fd, new_capacity));
 }
 
 int pacha_vmo_revoke(int fd) {

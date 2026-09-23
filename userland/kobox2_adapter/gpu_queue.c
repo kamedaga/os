@@ -34,6 +34,20 @@ static int drain_event_doorbell(struct ph_gpu_queue *queue) {
     return -EIO;
 }
 
+static int notify_fence_event(void *context) {
+    struct ph_gpu_queue *queue = context;
+    if (!atomic_load_explicit(&queue->event_admitted, memory_order_acquire))
+        return 0;
+    if (atomic_exchange_explicit(&queue->fence_pending, 1, memory_order_acq_rel))
+        return 0;
+    const uint64_t one = 1;
+    if (pacha_syscall3(PACHA_FD_SYSCALL_WRITE, queue->event_fd,
+            (uintptr_t)&one, sizeof(one)) == (long)sizeof(one))
+        return 0;
+    atomic_store_explicit(&queue->event_error, -EIO, memory_order_release);
+    return -EIO;
+}
+
 static int channel_fault(struct ph_gpu_queue *queue) {
     if (queue->bound)
         kb2_vq_channel_fault(&queue->channel.channel);
@@ -49,7 +63,7 @@ static int overlaps(uint64_t address, uint64_t length,
 static int stop(void *context) {
     struct ph_gpu_queue *queue = context;
     atomic_store_explicit(&queue->event_admitted, 0, memory_order_release);
-    int result = ph_gpu_query_release_aux(&queue->service.query);
+    int result = ph_gpu_query_destroy_aux(&queue->service.query);
     if (!queue->mapping)
         return result;
     /* This is terminal retirement, never an in-place restart. All queue
@@ -74,6 +88,31 @@ static int next_event(struct ph_gpu_queue *queue) {
     error = drain_event_doorbell(queue);
     if (error)
         return error;
+    if (atomic_exchange_explicit(&queue->fence_pending, 0, memory_order_acq_rel)) {
+        kb2_vq_t *lane = &queue->channel.lanes[GPUD_GPU_QUEUE_EVENT];
+        kb2_vq_status_t status = kb2_vq_take_available(
+            lane, queue->service.query.generation, &queue->request);
+        if (status == KB2_VQ_EMPTY) {
+            int ready;
+            if (kb2_vq_arm(lane, queue->service.query.generation, &ready))
+                return channel_fault(queue);
+            if (ready)
+                status = kb2_vq_take_available(
+                    lane, queue->service.query.generation, &queue->request);
+        }
+        if (status == KB2_VQ_EMPTY) {
+            atomic_store_explicit(&queue->fence_pending, 1, memory_order_release);
+            return PH_LIFECYCLE_SERVICE_IDLE;
+        }
+        if (status || queue->request.readable ||
+            queue->request.writable < PH_GPU_DRM_EVENT_MESSAGE_BYTES)
+            return channel_fault(queue);
+        queue->active_lane = GPUD_GPU_QUEUE_EVENT;
+        queue->event_session = 0;
+        queue->event_fences = 1;
+        queue->event_active = 1;
+        return 0;
+    }
     for (;;) {
         uint64_t pending = atomic_load_explicit(
             &queue->event_pending, memory_order_acquire);
@@ -279,6 +318,28 @@ static int dispatch(void *context, void *linux_service) {
     if (queue->event_active) {
         if (!linux_service)
             return -ENODEV;
+        if (queue->event_fences) {
+            queue->event_size = 0;
+            while (sizeof(queue->event_data) - queue->event_size >= PH_GPU_FENCE_RECORD_BYTES) {
+                struct kobox_drm_fence_result done;
+                int result = queue->service.take_fence(linux_service, &done);
+                if (result <= 0)
+                    return result;
+                if (result != 1 || !done.session || !done.correlation ||
+                    !done.status || done.status > 1)
+                    return -EPROTO;
+                unsigned char *record = queue->event_data + queue->event_size;
+                ph_gpu_event_store_u64(record, done.session);
+                ph_gpu_event_store_u64(record + 8, done.correlation);
+                ph_gpu_event_store_u32(record + 16, (uint32_t)done.status);
+                ph_gpu_event_store_u32(record + 20, 0);
+                queue->event_size += PH_GPU_FENCE_RECORD_BYTES;
+            }
+            /* A full batch may leave more completions. The next owner turn
+             * drains them; callbacks never allocate or send event payloads. */
+            atomic_store_explicit(&queue->fence_pending, 1, memory_order_release);
+            return 0;
+        }
         struct kobox_linux_drm_file *file = NULL;
         int result = queue->service.file(linux_service,
             queue->event_cookie, &file);
@@ -300,11 +361,11 @@ static int complete(void *context, struct ph_ipc *ipc) {
     struct ph_gpu_queue *queue = context;
     if (queue->event_active) {
         if (queue->event_sequence == UINT64_MAX ||
-            ph_gpu_drm_event_encode(queue->event_message,
+            ph_gpu_event_encode(queue->event_message,
                 sizeof(queue->event_message), &queue->event_message_size,
                 queue->service.query.generation, queue->event_session,
                 ++queue->event_sequence, queue->event_data,
-                queue->event_size))
+                queue->event_size, queue->event_fences))
             return channel_fault(queue);
         kb2_vq_t *lane = &queue->channel.lanes[GPUD_GPU_QUEUE_EVENT];
         int notify;
@@ -370,7 +431,7 @@ static int release_request(void *context) {
      * terminal channel retirement; never drop it and admit more work. */
     struct ph_gpu_queue *queue = context;
     if (queue->event_active) {
-        int result = ph_gpu_session_release(queue->service.sessions,
+        int result = queue->event_fences ? 0 : ph_gpu_session_release(queue->service.sessions,
             queue->service.query.generation, queue->service.client_id,
             queue->event_session);
         queue->event_cookie = 0;
@@ -378,6 +439,7 @@ static int release_request(void *context) {
         queue->event_size = 0;
         queue->event_message_size = 0;
         queue->event_active = 0;
+        queue->event_fences = 0;
         return result ? -EPROTO : 0;
     }
     if (queue->release_mapping_id) {
@@ -413,11 +475,13 @@ int ph_gpu_queue_init(struct ph_gpu_queue *queue,
     queue->next_lane = GPUD_GPU_QUEUE_CONTROL;
     queue->atomics = *atomics;
     atomic_init(&queue->event_admitted, 1);
+    atomic_init(&queue->fence_pending, 0);
     atomic_init(&queue->event_pending, 0);
     atomic_init(&queue->event_error, 0);
     for (size_t i = 0; i < GPUD_GPU_NATIVE_SESSION_LIMIT; ++i)
         atomic_init(&queue->event_cookies[i], 0);
     if (!atomic_is_lock_free(&queue->event_admitted) ||
+        !atomic_is_lock_free(&queue->fence_pending) ||
         !atomic_is_lock_free(&queue->event_pending) ||
         !atomic_is_lock_free(&queue->event_error)) {
         (void)pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, queue->event_fd);
@@ -428,6 +492,7 @@ int ph_gpu_queue_init(struct ph_gpu_queue *queue,
         .size = sizeof(queue->event_host),
         .context = queue,
         .notify = notify_drm_event,
+        .notify_fences = notify_fence_event,
     };
     queue->request = (kb2_vq_chain_t){.segments = queue->segments, .capacity = GPUD_GPU_QUEUE_SIZE};
     *service = (struct ph_lifecycle_service){.context = queue,

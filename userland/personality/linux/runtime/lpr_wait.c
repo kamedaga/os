@@ -173,9 +173,12 @@ int64_t lpr_wait_graph_add_fd(
              */
             0, LPR_WAIT_DRAIN_NONE, (uint32_t)fd);
     if (lpr_linux_sync_file_fd_active(fd))
-        return (events & 0x0001u) != 0 ? lpr_wait_graph_add_native(
+        /* Error is reported even when POLLIN was not requested. Keep the
+         * producer's loss wakeable so the rescan can return POLLERR. */
+        return lpr_wait_graph_add_native(
             graph, lpr_sync_file_native_wait_fd(fd),
-            PACHA_FD_EVENT_READABLE) : 0;
+            PACHA_FD_EVENT_HANGUP |
+                ((events & 0x0001u) ? PACHA_FD_EVENT_READABLE : 0));
     if (lpr_linux_epoll_fd_active(fd))
         return lpr_epoll_add_wait_graph(fd, graph);
     if (lpr_linux_socket_fd_active(fd)) {

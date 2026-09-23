@@ -17,7 +17,6 @@ struct ph_device_config {
     int device_fd;
     uint64_t generation;
     uint32_t segment, bus, devfn;
-    uint64_t aperture_start, aperture_end;
     uint64_t *irq_cookie_sequence;
     struct ph_image *image;
     struct kobox_linux_memory_layout memory;

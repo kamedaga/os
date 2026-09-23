@@ -4,6 +4,7 @@
 
 #include "drm_files.h"
 #include "gpu_rpc.h"
+#include "../../kobox2/linux-sandbox/kobox/boot/drm_limits.h"
 
 struct gpud_drm_watch {
     uint64_t handle, device_minor;
@@ -13,9 +14,12 @@ struct gpud_drm_watch {
 };
 
 enum {
-    GPUD_DRM_MAPPINGS_MAX = 64,
-    GPUD_DRM_PRIMES_MAX = 64,
-    GPUD_DRM_OBJECT_LEASES_MAX = 64,
+    GPUD_DRM_MAPPINGS_MAX = KOBOX_DRM_MAPPING_LIMIT,
+    GPUD_DRM_PRIMES_MAX = KOBOX_DRM_PRIME_LIMIT,
+    /* Mapping and PRIME pools are independent. Allow a reference per object
+     * plus a handoff reference while fork/exec transfers ownership. */
+    GPUD_DRM_OBJECT_LEASES_MAX =
+        2 * (GPUD_DRM_MAPPINGS_MAX + GPUD_DRM_PRIMES_MAX),
     GPUD_DRM_WAIT_SOURCES_MAX =
         GPUD_DRM_REFERENCES_MAX + GPUD_DRM_OBJECT_LEASES_MAX,
     GPUD_DRM_EVENT_BACKLOG_BYTES = 4096,
@@ -37,12 +41,21 @@ struct gpud_drm_prime {
 struct gpud_drm_object_lease {
     uint64_t object_id;
     int fd;
+    unsigned int prime_owner;
 };
 
 struct gpud_drm_event_buffer {
     uint64_t handle;
     size_t bytes;
     unsigned char data[GPUD_DRM_EVENT_BACKLOG_BYTES];
+};
+
+struct gpud_drm_connection {
+    struct gpud_drm_connection *next;
+    void *page;
+    int fd;
+    unsigned ready;
+    void *aux;
 };
 
 /* filed supplies one process-lifetime endpoint. Each OPEN/DUP transfers a
@@ -54,6 +67,12 @@ struct gpud_drm_service {
     struct gpud_gpu_rpc gpu;
     uint64_t backend_client, correlation, event_sequence;
     uint64_t resource_creates, gem_closes, exec_submits;
+    struct gpud_drm_pending_fence *fences;
+    struct gpud_drm_connection *connections;
+    struct pacha_pollfd *pollfds;
+    size_t poll_capacity;
+    unsigned prefer_connection;
+    size_t mapping_high_water;
     struct gpud_drm_watch watches[GPUD_DRM_REFERENCES_MAX];
     struct gpud_drm_mapping mappings[GPUD_DRM_MAPPINGS_MAX];
     struct gpud_drm_prime primes[GPUD_DRM_PRIMES_MAX];
@@ -63,6 +82,7 @@ struct gpud_drm_service {
      * The launch owner must retire the process, not reuse failed state. */
     struct ph_ipc_packet received;
     void *page;
+    void *request_aux;
     int endpoint_fd, error;
 };
 
@@ -83,7 +103,9 @@ int gpud_drm_service_reap_hangups(struct gpud_drm_service *service);
 /* Generation retirement revokes every exported view and closes all lease
  * endpoints. The stopped sandbox already quiesced its Linux mapping ledger. */
 int gpud_drm_service_retire_mappings(struct gpud_drm_service *service);
-size_t gpud_drm_service_collect_wait_sources(
-    const struct gpud_drm_service *service, int *fds, size_t capacity);
+/* Returns the full required count even when capacity is smaller. */
+size_t gpud_drm_service_pollfds(const struct gpud_drm_service *service,
+    struct pacha_pollfd *fds, size_t capacity);
+int gpud_drm_service_reserve_pollfds(struct gpud_drm_service *service, size_t extra);
 
 #endif

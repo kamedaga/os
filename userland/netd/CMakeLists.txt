@@ -129,6 +129,9 @@ add_custom_command(
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${NETD_ELF}"
   DEPENDS
     "${NETD_LIBUINET_ARCHIVE}"
+    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
+    "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     "${NETD_MBEDTLS_ARCHIVE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/netd_internal.h"

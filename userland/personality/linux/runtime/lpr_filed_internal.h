@@ -471,7 +471,9 @@ typedef struct lpr_signal_state {
     uint32_t runtime_registered;
     volatile uint32_t grow_lock_word;
     uint32_t start_reservations;
-    uint32_t reserved0;
+    /* Monotonic for this process image: once a thread queues a local signal,
+     * never use the no-local-signals fast path again (including after fork). */
+    uint32_t local_pending_ever_queued;
     lpr_signal_thread_chunk_t *overflow_head;
     lpr_signal_thread_slot_t threads[LPR_SIGNAL_THREAD_SLOT_COUNT];
 } lpr_signal_state_t;
@@ -540,6 +542,7 @@ typedef struct lpr_netd_rpc_state {
 } lpr_netd_rpc_state_t;
 
 typedef struct lpr_cache_state {
+    volatile uint32_t page_lock_word;
     lpr_readlink_cache_entry_t readlink[LPR_READLINK_CACHE_ENTRIES];
     lpr_filed_page_cache_entry_t page[LPR_FILED_PAGE_CACHE_ENTRIES];
     uint64_t readlink_clock;
@@ -773,6 +776,8 @@ int lpr_readlink_cache_lookup(const char *path, uint64_t length, int64_t *out_st
 void lpr_readlink_cache_store(const char *path, uint64_t length, int64_t status);
 void lpr_page_cache_clear(void);
 void lpr_page_cache_invalidate_handle(uint64_t handle);
+/* Caller holds caches.page_lock_word. */
+void lpr_page_cache_invalidate_handle_locked(uint64_t handle);
 lpr_filed_page_cache_entry_t *lpr_page_cache_lookup(uint64_t handle, uint64_t object_generation, uint64_t offset, uint64_t requested);
 lpr_filed_page_cache_entry_t *lpr_page_cache_find_marker(uint64_t handle, uint64_t page_start);
 lpr_filed_page_cache_entry_t *lpr_page_cache_slot(void);
@@ -914,7 +919,6 @@ int lpr_supervisor_get_state(lprs_process_state_t *out_state);
 int lpr_timespec_less_equal( const struct pachaos_timespec *lhs, const struct pachaos_timespec *rhs);
 int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd);
 int64_t lpr_tty_open_peer(uint64_t fd, uint64_t flags);
-int lpr_drm_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd);
 int64_t lpr_drm_open_path(const char *path, uint64_t flags);
 int64_t lpr_drm_stat_path(const char *path, uint64_t statbuf);
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg);
@@ -928,6 +932,14 @@ int64_t lpr_dmabuf_mmap(uint64_t fd, uint64_t address, uint64_t length,
     uint64_t prot, uint64_t flags, uint64_t offset);
 void lpr_drm_after_fork_child(void);
 void lpr_drm_mapping_unmapped(uint64_t address, uint64_t length);
+int64_t lpr_drm_native_munmap(uint64_t address, uint64_t length);
+int64_t lpr_drm_native_mmap(uint64_t fd, uint64_t address, uint64_t length,
+    uint64_t prot, uint64_t flags, uint64_t offset);
+int64_t lpr_drm_native_mremap(uint64_t address, uint64_t length,
+    uint64_t new_length, uint64_t flags, uint64_t target);
+void lpr_drm_mapping_fork_lock(void);
+void lpr_drm_mapping_fork_unlock(void);
+void lpr_drm_mapping_fork_child(void);
 void lpr_drm_mapping_remapped(
     uint64_t old_address, uint64_t old_length,
     uint64_t new_address, uint64_t new_length);
@@ -1000,6 +1012,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg);
 int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded);
 int lpr_filed_live_object_generation(uint64_t handle, uint64_t *out_generation);
 void lpr_file_image_cache_clear(void);
+void lpr_file_image_cache_drop_handle(uint64_t handle);
 void lpr_file_image_cache_after_fork_child(void);
 void lpr_file_image_cache_pause(void);
 void lpr_file_image_cache_resume(void);

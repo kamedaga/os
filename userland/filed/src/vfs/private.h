@@ -5,6 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+
+uint32_t filed_vnode_slot_index(const filed_vfs_t *vfs, const filed_vnode_t *vnode);
+uint32_t filed_file_slot_index(const filed_vfs_t *vfs, const filed_file_t *file);
+uint32_t filed_handle_slot_index(const filed_vfs_t *vfs, const filed_handle_t *handle);
 
 void filed_lock_init(filed_lock_t *lock);
 void filed_lock_acquire(filed_lock_t *lock);

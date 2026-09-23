@@ -8,6 +8,7 @@ static _Alignas(struct unix_control) unsigned char memory[UNIX_CONTROL_BYTES];
 static unsigned live[256], maps;
 enum { NORMAL, BAD_REPLY, BAD_PAGE, SERVICE_ERROR, CALL_ERROR, RECEIVE_ERROR, MAP_ERROR, ALLOC_ERROR };
 static int mode;
+static int expected_endpoint = 200;
 
 int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
 {
@@ -43,7 +44,7 @@ int pacha_fd_close(int fd)
 
 int pacha_ipc_call(int endpoint, const struct pacha_ipc_msg *request)
 {
-    assert(endpoint == 200 && request->fd_count == 1 && request->fds[0].fd == 20);
+    assert(endpoint == expected_endpoint && request->fd_count == 1 && request->fds[0].fd == 20);
     assert(!(request->fds[0].rights & PACHA_FD_RIGHT_TRANSFER));
     assert(request->word0 == UNIX_SERVICE_MAGIC && request->word1 == UNIX_OP_HELLO && request->word3 == 9);
     if (mode == CALL_ERROR) return PACHA_ERR_INVALID;
@@ -93,5 +94,23 @@ int main(void)
         for (int fd = 16; fd < 256; fd++) assert(!live[fd]);
     }
     assert(unix_client_call(200, &request, NULL, PACHA_IPC_MAX_TRANSFER_FDS, NULL, 0, &received) == -EINVAL);
-    puts("unix client: reply correlation, capability bounds, errors and cleanup passed");
+    mode = NORMAL;
+    const int endpoints[] = {255, 256, 511, PACHA_FD_TABLE_LIMIT - 1};
+    for (unsigned i = 0; i < sizeof(endpoints) / sizeof(endpoints[0]); i++) {
+        expected_endpoint = endpoints[i];
+        request = (struct unix_control){ .operation = UNIX_OP_HELLO, .request = 9 };
+        assert(unix_client_call(expected_endpoint, &request, NULL, 0, &received_cap, 1, &received) == 0);
+        assert(received == 1 && received_cap.fd == 22 && request.result == 41);
+        pacha_fd_close(22);
+        assert(!maps);
+        for (int fd = 16; fd < 256; fd++) assert(!live[fd]);
+    }
+    const int invalid_endpoints[] = {-1, 0, 15, PACHA_FD_TABLE_LIMIT};
+    for (unsigned i = 0; i < sizeof(invalid_endpoints) / sizeof(invalid_endpoints[0]); i++) {
+        request = (struct unix_control){ .operation = UNIX_OP_HELLO, .request = 9 };
+        assert(unix_client_call(invalid_endpoints[i], &request, NULL, 0, &received_cap, 1, &received) == -EINVAL);
+        assert(!maps);
+        for (int fd = 16; fd < 256; fd++) assert(!live[fd]);
+    }
+    puts("unix client: reply correlation, expanded FD range, capability bounds, errors and cleanup passed");
 }

@@ -21,6 +21,13 @@ mkdir -p "${build_dir}"
 
 "${build_dir}/vfs_test"
 
+bash "${repo_root}/tests/run-filed-vmo-fd-growth-unit.sh"
+bash "${repo_root}/tests/run-filed-vnode-eviction-scan-unit.sh"
+bash "${repo_root}/tests/run-filed-vnode-growth-unit.sh"
+bash "${repo_root}/tests/run-filed-open-growth-unit.sh"
+bash "${repo_root}/tests/run-kobox-fs-objects-unit.sh"
+bash "${repo_root}/tests/run-kobox-fs-readlink-unit.sh"
+
 "${cc_bin}" \
   -std=c11 \
   -Wall \
@@ -86,6 +93,7 @@ mkdir -p "${build_dir}"
   -I"${repo_root}/userland/personality/include" \
   "${repo_root}/userland/filed/src/backend.c" \
   "${repo_root}/userland/filed/src/cache/cache.c" \
+  "${repo_root}/userland/libipc/src/status.c" \
   "${repo_root}/userland/filed/src/tmpfs/backend.c" \
   "${repo_root}/userland/filed/src/tmpfs/dir.c" \
   "${repo_root}/userland/filed/src/tmpfs/file.c" \
@@ -93,6 +101,7 @@ mkdir -p "${build_dir}"
   "${repo_root}/userland/filed/src/tmpfs/node.c" \
   "${repo_root}/userland/filed/src/tmpfs/page.c" \
   "${repo_root}/userland/filed/tests/cache_consistency_test.c" \
+  -Wl,--wrap=calloc \
   -o "${build_dir}/cache_consistency_test"
 
 "${build_dir}/cache_consistency_test"

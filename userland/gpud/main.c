@@ -46,11 +46,15 @@ static int wait_readable(int fd, int process_fd) {
 }
 
 static int wait_service(
-    const struct gpud_drm_service *service, int endpoint_fd,
+    struct gpud_drm_service *service, int endpoint_fd,
     int process_fd, int control_fd) {
-    struct pacha_pollfd events[GPUD_DRM_WAIT_SOURCES_MAX + 4] = {
-        {.fd = endpoint_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
-        {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
+    int error = gpud_drm_service_reserve_pollfds(service, 4);
+    if (error) return error;
+    struct pacha_pollfd *events = service->pollfds;
+    events[0] = (struct pacha_pollfd){
+        .fd = endpoint_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+    events[1] = (struct pacha_pollfd){
+        .fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP
     };
     size_t event_count = 2;
     const size_t gpu_index = event_count++;
@@ -66,13 +70,9 @@ static int wait_service(
             .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
         };
     }
-    int sources[GPUD_DRM_WAIT_SOURCES_MAX];
-    size_t source_count = gpud_drm_service_collect_wait_sources(
-        service, sources, GPUD_DRM_WAIT_SOURCES_MAX);
-    for (size_t i = 0; i < source_count; ++i)
-        events[event_count + i] = (struct pacha_pollfd){
-            .fd = sources[i], .events = PACHA_FD_EVENT_HANGUP};
-    long result = pacha_fd_wait_many(
+    size_t source_count = gpud_drm_service_pollfds(
+        service, events + event_count, service->poll_capacity - event_count);
+    long result = pacha_fd_wait_many_batched(
         events, event_count + source_count, PACHA_FD_WAIT_FOREVER);
     if (events[1].revents)
         return -EPIPE;
@@ -85,7 +85,8 @@ static int wait_service(
     if (control_index != SIZE_MAX && events[control_index].revents)
         return 0;
     for (size_t i = 0; i < source_count; ++i)
-        if (events[event_count + i].revents & PACHA_FD_EVENT_HANGUP)
+        if (events[event_count + i].revents &
+            (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP))
             return 0;
     return -EIO;
 }
@@ -308,11 +309,10 @@ static int restart_generation(kb2_controller_t *controller,
 static int start_generation(const struct gpud_boot_config *config,
     kb2_controller_t *controller, struct gpud_package *package,
     uint64_t handle_sequence, struct gpud_generation *current) {
-    *current = (struct gpud_generation){
-        .id = kb2_controller_generation(controller),
-        .management = {.a = -1, .b = -1},
-        .gpu_fd = -1,
-    };
+    memset(current, 0, sizeof(*current));
+    current->id = kb2_controller_generation(controller);
+    current->management = (struct pacha_ipc_channel_pair){.a = -1, .b = -1};
+    current->gpu_fd = -1;
     const uint64_t generation = current->id;
     int error = gpud_package_bind(package, generation);
     if (!error)
@@ -429,14 +429,10 @@ static int start_generation(const struct gpud_boot_config *config,
     if ((error = ph_ipc_send(&current->ipc, &binding)))
         return error;
 
-    current->service = (struct gpud_drm_service){
-        .backend_client = sandbox_config.client_id,
-        .gpu = {
-            .ipc = &current->ipc,
-            .channel = &current->gpu_channel,
-            .mapping = current->gpu_mapping,
-        },
-    };
+    current->service.backend_client = sandbox_config.client_id;
+    current->service.gpu.ipc = &current->ipc;
+    current->service.gpu.channel = &current->gpu_channel;
+    current->service.gpu.mapping = current->gpu_mapping;
     if ((error = gpud_gpu_rpc_start_events(&current->service.gpu)))
         return error;
     if ((error = gpud_drm_files_init(&current->service.files, generation,
@@ -510,7 +506,10 @@ static int run(const struct gpud_boot_config *config) {
     int control_fd = (int)config->control_channel_fd;
     int notify_restart = 0;
     for (;;) {
-        struct gpud_generation current;
+        /* One owner serves one generation at a time and retires it fully
+         * before reuse. Its per-session event buffers are long-lived state,
+         * not call-stack scratch space. */
+        static struct gpud_generation current;
         error = start_generation(
             config, controller, &package, handle_sequence, &current);
         if (error)

@@ -17,7 +17,54 @@ static int stream_backend_write_error;
 static uint64_t stream_backend_read_error_at = UINT64_MAX;
 static int mock_vmo_revoke_calls;
 static int mock_fd_close_calls;
+static int mock_fd_close_error;
+static int mock_munmap_error;
+static int mock_grow_error = -3;
+static int mock_grow_calls;
+static uint64_t mock_grow_capacity;
+static void *mock_mmap_result;
+static int mock_create_result = -1;
+static uint64_t mock_create_rights;
+static uint32_t mock_create_flags;
+static int stream_backend_truncate_error;
+static int mock_info_error = -1;
+static struct pacha_fd_info mock_info;
+static int fail_next_bank_allocation;
+void *__real_calloc(size_t count, size_t size);
+void *__wrap_calloc(size_t count, size_t size)
+{
+    if (fail_next_bank_allocation && count == 1 && size == sizeof(filed_file_vmo_bank_t)) {
+        fail_next_bank_allocation = 0;
+        return NULL;
+    }
+    return __real_calloc(count, size);
+}
 static int mock_link_calls;
+static const unsigned char *mock_vmo_read_data;
+static uint64_t mock_vmo_read_size;
+static uint64_t mock_vmo_read_offset;
+static unsigned mock_vmo_read_calls;
+static long mock_vmo_dup_result = 90;
+static long mock_vmo_read_error;
+long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1)
+{
+    (void)fd;
+    if (cmd != PACHA_FD_FCNTL_DUP || arg0 != 16 ||
+        arg1 != (PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_CLOSE)) return -1;
+    mock_vmo_read_offset = 0;
+    return mock_vmo_dup_result;
+}
+long pacha_fd_read(int fd, void *buffer, uint64_t length)
+{
+    (void)fd;
+    ++mock_vmo_read_calls;
+    if (mock_vmo_read_error) return mock_vmo_read_error;
+    if (length > mock_vmo_read_size - mock_vmo_read_offset)
+        length = mock_vmo_read_size - mock_vmo_read_offset;
+    memcpy(buffer, mock_vmo_read_data + mock_vmo_read_offset, (size_t)length);
+    mock_vmo_read_offset += length;
+    return (long)length;
+}
 static uint64_t mock_link_old_object_id;
 static uint64_t mock_link_new_parent_object_id;
 static char mock_link_new_name[STORAGE_NAME_BYTES];
@@ -25,8 +72,15 @@ static char mock_link_new_name[STORAGE_NAME_BYTES];
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags)
 {
     (void)size;
-    (void)rights;
-    (void)flags;
+    mock_create_rights = rights;
+    mock_create_flags = flags;
+    return mock_create_result;
+}
+
+int pacha_fd_table(uint64_t minimum_capacity, struct pacha_fd_table_info *out)
+{
+    (void)minimum_capacity;
+    (void)out;
     return -1;
 }
 
@@ -37,6 +91,14 @@ int pacha_vmo_revoke(int fd)
     return 0;
 }
 
+int pacha_vmo_grow(int fd, uint64_t capacity)
+{
+    (void)fd;
+    ++mock_grow_calls;
+    mock_grow_capacity = capacity;
+    return mock_grow_error;
+}
+
 void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset)
 {
     (void)fd;
@@ -44,21 +106,28 @@ void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t 
     (void)prot;
     (void)flags;
     (void)offset;
-    return NULL;
+    return mock_mmap_result;
 }
 
 int pacha_munmap(void *addr, uint64_t size)
 {
     (void)addr;
     (void)size;
-    return 0;
+    return mock_munmap_error;
 }
 
 int pacha_fd_close(int fd)
 {
     (void)fd;
     ++mock_fd_close_calls;
-    return 0;
+    return mock_fd_close_error;
+}
+
+int pacha_fd_get_info(int fd, struct pacha_fd_info *out)
+{
+    (void)fd;
+    *out = mock_info;
+    return mock_info_error;
 }
 
 int filed_kobox_backend_lookup(filed_kobox_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t *out_object_id)
@@ -193,8 +262,14 @@ int filed_kobox_backend_mknod(filed_kobox_backend_t *backend, uint64_t parent_ob
 int filed_kobox_backend_truncate(filed_kobox_backend_t *backend, uint64_t object_id, uint64_t size)
 {
     (void)backend;
-    (void)object_id;
-    (void)size;
+    if (object_id == 43 && size <= sizeof(stream_backend_data)) {
+        if (stream_backend_truncate_error != 0) return stream_backend_truncate_error;
+        if (size > stream_backend_size)
+            memset(stream_backend_data + stream_backend_size, 0,
+                (size_t)(size - stream_backend_size));
+        stream_backend_size = size;
+        return 0;
+    }
     return -95;
 }
 
@@ -325,6 +400,14 @@ static void expect_true(const char *name, int value)
 
 static void init_runtime(filed_runtime_t *runtime, filed_dispatch_state_t *dispatch)
 {
+    /* Fixtures own only synthetic descriptors/mappings; release metadata
+     * without calling backend flush or touching expired stack buffers. */
+    filed_file_vmo_bank_t *bank = dispatch->cache.file_vmo.banks;
+    while (bank != NULL) {
+        filed_file_vmo_bank_t *next = bank->next;
+        free(bank);
+        bank = next;
+    }
     memset(runtime, 0, sizeof(*runtime));
     memset(dispatch, 0, sizeof(*dispatch));
     runtime->dispatch_state = dispatch;
@@ -527,6 +610,18 @@ static void test_shared_vmo_is_io_source_and_revoke_target(void)
     expect_u64("shared vmo backend size", mock_backend_size, 8);
     expect_bytes("shared vmo backend data", mock_backend_data, replacement, sizeof(replacement) - 1u);
 
+    filed_negative_lookup_cache_store(&runtime, 42, 1, "removed", -2);
+    filed_cache_invalidate_namespace(&runtime, 42);
+    expect_int("namespace change does not revoke shared mapping", mock_vmo_revoke_calls, 0);
+    expect_true("namespace change preserves shared I/O source",
+        filed_file_vmo_cache_shared_lookup(&runtime, 42) == entry);
+    int64_t negative_status = 0;
+    expect_true("namespace change clears negative lookup",
+        !filed_negative_lookup_cache_get(&runtime, 42, 1, "removed", &negative_status));
+    shared_bytes[1] = 'Z';
+    expect_int("namespace shared pread", filed_cached_pread(&runtime, 42, 1, readback, 1, &bytes), 0);
+    expect_int("namespace shared coherent byte", readback[0], 'Z');
+
     filed_cache_invalidate(&runtime, 42);
     expect_int("shared vmo revoke count", mock_vmo_revoke_calls, 1);
     expect_true("shared vmo invalidated", filed_file_vmo_cache_shared_lookup(&runtime, 42) == NULL);
@@ -546,6 +641,230 @@ static void test_shared_vmo_is_io_source_and_revoke_target(void)
     filed_cache_release_object(&runtime, 42);
     expect_int("shared vmo release does not revoke", mock_vmo_revoke_calls, 1);
     expect_int("shared vmo release closes owner", mock_fd_close_calls, 1);
+}
+
+static void test_shared_vmo_failed_growth_keeps_existing_mappings(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char data[4096];
+    memset(data, 0x5a, sizeof(data));
+    init_runtime(&runtime, &dispatch);
+    stream_backend_size = sizeof(data);
+    stream_backend_write_error = 0;
+    stream_backend_read_error_at = UINT64_MAX;
+    mock_info_error = -1;
+    mock_vmo_revoke_calls = 0;
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    expect_true("shared growth initial slot", entry != NULL);
+    if (!entry) return;
+    *entry = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .writable_lent = 1, .vmo_fd = 33,
+        .backend_object = 43, .length = sizeof(data),
+        .logical_size = sizeof(data), .mapped = data,
+    };
+    filed_file_vmo_cache_entry_t *grown = NULL;
+    /* Existing aliases must survive even when allocating the extension fails.
+     * The VMO allocator mock fails; losing those aliases turns a recoverable
+     * mmap error into a later unrelated reader/writer's native page fault. */
+    expect_int("shared growth reports allocation failure",
+        filed_cache_create_shared_vmo(&runtime, 43, 1, sizeof(data),
+            2 * sizeof(data), &grown), -12);
+    expect_true("failed growth has no new mapping", grown == NULL);
+    expect_int("failed shared growth must not revoke", mock_vmo_revoke_calls, 0);
+    expect_true("failed shared growth keeps old VMO",
+        filed_file_vmo_cache_shared_lookup(&runtime, 43) == entry &&
+        entry->vmo_fd == 33 && entry->mapped == data &&
+        entry->length == sizeof(data));
+}
+
+static void test_shared_vmo_growth_preserves_identity_and_failures(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char data[16384];
+    memset(data, 0x5a, sizeof(data));
+    init_runtime(&runtime, &dispatch);
+    stream_backend_size = 4000;
+    stream_backend_write_error = stream_backend_truncate_error = 0;
+    mock_info_error = -1;
+    mock_vmo_revoke_calls = mock_grow_calls = 0;
+    mock_grow_error = 0;
+    mock_mmap_result = data;
+    mock_munmap_error = 0;
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    expect_true("shared resize slot", entry != NULL);
+    if (!entry) return;
+    *entry = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .writable_lent = 1, .vmo_fd = 33,
+        .backend_object = 43, .length = 4096, .logical_size = 4000, .mapped = data,
+    };
+    expect_int("truncate within capacity", filed_cache_truncate(&runtime, 43, 4050), 0);
+    expect_int("within capacity does not grow", mock_grow_calls, 0);
+    expect_int("within capacity keeps prefix", data[48], 0x5a);
+    expect_int("truncate partial-page tail zero", data[4000], 0);
+    expect_int("truncate leaves beyond EOF alone", data[4050], 0x5a);
+    expect_int("truncate true growth", filed_cache_truncate(&runtime, 43, 8192), 0);
+    expect_int("truncate grows once", mock_grow_calls, 1);
+    expect_u64("native grow capacity", mock_grow_capacity, 8192);
+    expect_true("truncate keeps VMO identity", entry->vmo_fd == 33 && entry->mapped == data);
+    expect_u64("truncate logical size", entry->logical_size, 8192);
+    expect_int("truncate full tail zero", data[8191], 0);
+    expect_int("truncate never revokes", mock_vmo_revoke_calls, 0);
+
+    mock_mmap_result = NULL;
+    filed_file_vmo_cache_entry_t *grown = NULL;
+    expect_int("local remap failure", filed_cache_create_shared_vmo(&runtime,
+        43, 1, 8192, 12288, &grown), -12);
+    expect_true("local remap failure preserves prefix", entry->mapped == data && entry->length == 8192);
+    expect_u64("failed remap retains capacity charge", filed_file_vmo_cache_bytes(entry), 12288);
+    expect_u64("failed remap logical size unchanged", entry->logical_size, 8192);
+    const int grows_before_retry = mock_grow_calls;
+    mock_mmap_result = data;
+    expect_int("remap retry", filed_cache_create_shared_vmo(&runtime,
+        43, 1, 8192, 12288, &grown), 0);
+    expect_int("remap retry reuses backing", mock_grow_calls, grows_before_retry);
+    expect_true("remap retry same entry", grown == entry);
+    expect_u64("reserve does not extend file", entry->logical_size, 8192);
+
+    stream_backend_truncate_error = -28;
+    expect_int("backend truncate failure", filed_cache_truncate(&runtime, 43, 10000), -28);
+    expect_u64("backend failure retains old logical size", entry->logical_size, 8192);
+    expect_int("backend failure keeps prefix", data[48], 0x5a);
+    stream_backend_truncate_error = 0;
+    const unsigned char written = 0x37;
+    uint64_t bytes = 0;
+    expect_int("pwrite extends same shared backing", filed_cached_pwrite(&runtime,
+        43, 13000, &written, 1, &bytes), 0);
+    expect_u64("pwrite actual bytes", bytes, 1);
+    expect_u64("pwrite aligned backing", mock_grow_capacity, 16384);
+    expect_u64("pwrite logical size", entry->logical_size, 13001);
+    expect_int("pwrite zeroes hole", data[10000], 0);
+    expect_int("pwrite visible through old alias", data[13000], 0x37);
+    expect_int("all growth never revokes", mock_vmo_revoke_calls, 0);
+    mock_mmap_result = NULL;
+    mock_grow_error = -3;
+}
+
+static void test_shared_vmo_growth_budget_and_cleanup(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char old_data[4096], wider_data[12288];
+    init_runtime(&runtime, &dispatch);
+    mock_info_error = -1;
+    mock_vmo_revoke_calls = mock_grow_calls = 0;
+    mock_grow_error = 0;
+    mock_mmap_result = wider_data;
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    *entry = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .vmo_fd = 33,
+        .backend_object = 43, .length = 4096, .logical_size = 4096, .mapped = old_data,
+    };
+    mock_munmap_error = -1;
+    filed_file_vmo_cache_entry_t *grown = NULL;
+    expect_int("failed old alias cleanup preserves both mappings",
+        filed_cache_create_shared_vmo(&runtime, 43, 1, 4096, 8192, &grown), 0);
+    expect_true("old alias tracked until cleanup", entry->retired_mapping == old_data &&
+        entry->retired_length == 4096 && entry->mapped == wider_data);
+    expect_int("do not accumulate untracked aliases",
+        filed_cache_create_shared_vmo(&runtime, 43, 1, 4096, 12288, &grown), -5);
+    expect_int("pending cleanup prevents another grow", mock_grow_calls, 1);
+    mock_munmap_error = 0;
+    expect_int("old alias cleanup retry",
+        filed_cache_create_shared_vmo(&runtime, 43, 1, 4096, 12288, &grown), 0);
+    expect_true("old alias cleanup completed", entry->retired_mapping == NULL);
+
+    filed_file_vmo_cache_entry_t *held = filed_file_vmo_cache_slot(&runtime);
+    *held = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .vmo_fd = 34, .backend_object = 44,
+        .length = FILED_FILE_VMO_CACHE_TOTAL_BYTES - 12288,
+    };
+    expect_int("held backing enforces growth budget",
+        filed_cache_create_shared_vmo(&runtime, 43, 1, 4096, 16384, &grown), -28);
+    expect_true("budget failure retains both owners", entry->active && held->active);
+    expect_int("budget failure never revokes", mock_vmo_revoke_calls, 0);
+    mock_grow_error = -3;
+    mock_mmap_result = NULL;
+}
+
+static void test_global_sync_keeps_tmpfs_shared_vmo_authoritative(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char data[4096], readback[4096];
+    memset(data, 0x5a, sizeof(data));
+    init_runtime(&runtime, &dispatch);
+    uint64_t root = 0, object = 0, bytes = 0;
+    expect_int("sync tmpfs root", filed_tmpfs_backend_mount_root(&runtime.tmpfs, &root), 0);
+    expect_int("sync tmpfs file", filed_tmpfs_backend_create(&runtime.tmpfs, root,
+        "shared", 0600, &object), 0);
+    expect_int("sync tmpfs size", filed_tmpfs_backend_truncate(&runtime.tmpfs,
+        object, sizeof(data)), 0);
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    expect_true("sync tmpfs VMO slot", entry != NULL);
+    if (entry == NULL) return;
+    *entry = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .dirty = 1, .writable_lent = 1, .vmo_fd = -1,
+        .backend_object = object, .length = sizeof(data),
+        .logical_size = sizeof(data), .mapped = data,
+    };
+    const uint32_t free_pages = runtime.tmpfs.free_page_count;
+    /* A global disk sync must not need a second RAM copy, even at quota. */
+    runtime.tmpfs.free_page_count = 0;
+    expect_int("global sync needs no tmpfs backing", filed_cache_flush_object(&runtime, 0), 0);
+    expect_true("global sync preserves pending tmpfs backing", entry->dirty);
+    expect_true("global sync keeps shared source",
+        filed_file_vmo_cache_shared_lookup(&runtime, object) == entry);
+    expect_int("tmpfs coherent read after sync", filed_cached_pread(&runtime,
+        object, 0, readback, sizeof(readback), &bytes), 0);
+    expect_u64("tmpfs coherent read length", bytes, sizeof(readback));
+    expect_bytes("tmpfs coherent read data", readback, data, sizeof(data));
+    /* Explicit object flush (resize/invalidation/exec) still materializes it. */
+    expect_int("explicit flush reports quota", filed_cache_flush_object(&runtime, object), -28);
+    runtime.tmpfs.free_page_count = free_pages;
+    expect_int("explicit flush materializes data", filed_cache_flush_object(&runtime, object), 0);
+    expect_u64("one backing page on demand", runtime.tmpfs.free_page_count, free_pages - 1u);
+    memset(entry, 0, sizeof(*entry));
+    expect_int("backend read after explicit flush", filed_tmpfs_backend_pread(&runtime.tmpfs,
+        object, 0, readback, sizeof(readback), &bytes), 0);
+    expect_bytes("explicit flush backend data", readback, data, sizeof(data));
+    expect_int("sync tmpfs cleanup", filed_tmpfs_backend_truncate(&runtime.tmpfs, object, 0), 0);
+}
+
+static void test_flush_all_continues_after_shared_error(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char failed_data[] = "pending";
+    unsigned char healthy_data[] = "persist";
+    init_runtime(&runtime, &dispatch);
+    memset(mock_backend_data, 0, sizeof(mock_backend_data));
+    mock_backend_size = 0;
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    *entry = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .dirty = 1, .vmo_fd = -1,
+        .backend_object = 43, .length = sizeof(failed_data),
+        .logical_size = sizeof(failed_data), .mapped = failed_data,
+    };
+    filed_file_vmo_cache_entry_t *healthy = filed_file_vmo_cache_slot(&runtime);
+    *healthy = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .dirty = 1, .vmo_fd = -1,
+        .backend_object = 42, .length = sizeof(healthy_data),
+        .logical_size = sizeof(healthy_data), .mapped = healthy_data,
+    };
+    stream_backend_write_error = -28;
+    expect_int("flush-all retains first failure", filed_cache_flush_object(&runtime, 0), -28);
+    expect_true("failed shared data stays dirty", entry->dirty);
+    expect_bytes("other file flushed despite shared error", mock_backend_data,
+        healthy_data, sizeof(healthy_data));
+    stream_backend_write_error = 0;
+    expect_int("failed shared data can retry", filed_cache_flush_object(&runtime, 0), 0);
+    expect_true("retry clears shared dirty", !entry->dirty);
+    expect_bytes("retried shared data preserved", stream_backend_data,
+        failed_data, sizeof(failed_data));
+    memset(entry, 0, sizeof(*entry));
+    memset(healthy, 0, sizeof(*healthy));
 }
 
 static void test_file_vmo_cache_byte_budget(void)
@@ -589,6 +908,8 @@ static void test_file_vmo_cache_byte_budget(void)
     expect_true("vmo cache budget preserves costly snapshot", oldest->active);
     expect_true("vmo cache budget evicts cheaper snapshot", !newer->active);
     expect_true("vmo cache budget reuses cheaper slot", slot == newer);
+    expect_u64("vmo cache counts successful budget victims",
+        runtime.dispatch_state->cache.file_vmo.byte_budget_evictions, 1);
 }
 
 static void test_snapshot_vmo_pins_backend_object(void)
@@ -672,7 +993,59 @@ static void test_pinned_file_vmo_limit_preserves_costly_snapshot(void)
     expect_true(
         "pinned limit evicts cheapest snapshot",
         cheapest != NULL && !cheapest->active);
-    expect_true("pinned limit reuses cheapest slot", replacement == cheapest);
+    expect_true("pinned limit returns reusable metadata", replacement != NULL && !replacement->active);
+}
+
+static void test_many_library_snapshots_reused(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    init_runtime(&runtime, &dispatch);
+    /* A multi-process GTK/WebKit dependency set exceeds 24 files even
+     * while well below the byte budget. Eviction creates another physical
+     * image while the first process still maps the previous snapshot. */
+    for (unsigned i = 0; i < 64; ++i) {
+        filed_file_vmo_cache_entry_t *entry =
+            filed_file_vmo_cache_pinned_slot_for_length(&runtime, 4u * 1024u * 1024u);
+        expect_true("library snapshot slot", entry != NULL);
+        if (!entry) return;
+        *entry = (filed_file_vmo_cache_entry_t){
+            .active = 1, .vmo_fd = -1, .backend_object = 100 + i,
+            .object_generation = 1, .length = 4u * 1024u * 1024u,
+            .clock = i + 1,
+        };
+    }
+    for (unsigned round = 0; round < 3; ++round)
+        for (unsigned i = 0; i < 64; ++i)
+            expect_true("next process reuses library snapshot",
+                filed_file_vmo_cache_lookup(&runtime, 100 + i, 1, 0,
+                    4u * 1024u * 1024u) != NULL);
+}
+
+static void test_snapshot_exact_range_reuse(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    init_runtime(&runtime, &dispatch);
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    expect_true("prefix slot", entry != NULL);
+    if (!entry) return;
+    *entry = (filed_file_vmo_cache_entry_t){ .active = 1, .vmo_fd = -1,
+        .backend_object = 91, .object_generation = 3, .file_offset = 4096,
+        .length = 65536 };
+    expect_true("shorter snapshot is not an exact range hit",
+        filed_file_vmo_cache_lookup(&runtime, 91, 3, 4096, 8192) == NULL);
+    expect_true("exact snapshot still reused",
+        filed_file_vmo_cache_lookup(&runtime, 91, 3, 4096, 65536) == entry);
+    expect_true("larger snapshot is not a hit",
+        filed_file_vmo_cache_lookup(&runtime, 91, 3, 4096, 65537) == NULL);
+    expect_true("different start is not a hit",
+        filed_file_vmo_cache_lookup(&runtime, 91, 3, 8192, 8192) == NULL);
+    expect_true("different generation is not a hit",
+        filed_file_vmo_cache_lookup(&runtime, 91, 4, 4096, 8192) == NULL);
+    entry->shared = 1;
+    expect_true("mutable shared image is not a snapshot",
+        filed_file_vmo_cache_lookup(&runtime, 91, 3, 4096, 8192) == NULL);
 }
 
 static void test_snapshot_vmo_pressure_reclaim_preserves_shared(void)
@@ -866,6 +1239,201 @@ static void test_partial_read_before_io_error(void)
     }
 }
 
+static void test_shared_registry_grows_and_trims(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    filed_file_vmo_cache_entry_t *saved[641];
+    init_runtime(&runtime, &dispatch);
+    mock_info_error = -1;
+    mock_vmo_revoke_calls = 0;
+    for (unsigned i = 0; i < 641; ++i) {
+        saved[i] = filed_file_vmo_cache_slot_for_length(&runtime, 4096);
+        expect_true("dynamic registry accepts over 128 live entries", saved[i] != NULL);
+        if (saved[i] == NULL) return;
+        *saved[i] = (filed_file_vmo_cache_entry_t){
+            .active = 1, .shared = 1, .vmo_fd = 16 + (int)i,
+            .backend_object = 1000 + i, .length = 4096,
+        };
+    }
+    for (unsigned i = 0; i < 641; ++i) {
+        expect_true("registry growth preserves entry address",
+            filed_file_vmo_cache_shared_lookup(&runtime, 1000 + i) == saved[i]);
+        expect_true("all live entries pin their backend key",
+            !filed_cache_object_evictable(&runtime, 1000 + i));
+    }
+    expect_int("growth never revokes", mock_vmo_revoke_calls, 0);
+    /* Drop complete banks, leaving one live entry and stable address. */
+    for (unsigned i = 0; i < 640; ++i) saved[i]->active = 0;
+    filed_file_vmo_cache_trim_empty_banks(&runtime);
+    expect_true("trim preserves live entry", saved[640]->active);
+    expect_true("trim frees all empty banks",
+        dispatch.cache.file_vmo.banks && !dispatch.cache.file_vmo.banks->next);
+    saved[640]->active = 0;
+    filed_file_vmo_cache_trim_empty_banks(&runtime);
+    expect_true("empty registry returns all metadata", dispatch.cache.file_vmo.banks == NULL);
+}
+
+static void test_shared_idle_retirement(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char data[4096] = "shared write";
+    init_runtime(&runtime, &dispatch);
+    filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+    expect_true("retirement entry", entry != NULL);
+    if (entry == NULL) return;
+    *entry = (filed_file_vmo_cache_entry_t){
+        .active = 1, .shared = 1, .writable_lent = 1, .vmo_fd = 40,
+        .backend_object = 43, .length = sizeof(data),
+        .logical_size = sizeof(data), .mapped = data,
+    };
+    mock_info = (struct pacha_fd_info){
+        .kind = PACHA_FD_KIND_VMO, .rights = PACHA_FD_RIGHT_INSPECT,
+        .extra = 1ull | (2ull << PACHA_VMO_INFO_NATIVE_REFS_SHIFT),
+    };
+    mock_info_error = -1;
+    expect_u64("failed query preserves shared entry",
+        filed_file_vmo_cache_reclaim_idle_shared(&runtime), 0);
+    mock_info_error = 0;
+    const uint64_t exclusive = mock_info.extra;
+    const uint64_t protected_counts[] = {
+        0, /* Old kernel. */
+        2ull | (2ull << 32), /* Duplicated FD or queued transfer. */
+        1ull | (3ull << 32), /* Mapping without FD or backing view. */
+        1ull | (4ull << 32), /* Fork/split mappings. */
+    };
+    for (unsigned i = 0; i < sizeof(protected_counts) / sizeof(protected_counts[0]); ++i) {
+        mock_info.extra = protected_counts[i];
+        expect_u64("external/unknown refs prevent retirement",
+            filed_file_vmo_cache_reclaim_idle_shared(&runtime), 0);
+        expect_true("protected shared data retained", entry->active && entry->mapped == data);
+    }
+    mock_info.extra = exclusive;
+    mock_info.rights = 0;
+    expect_u64("missing INSPECT prevents retirement",
+        filed_file_vmo_cache_reclaim_idle_shared(&runtime), 0);
+    mock_info.rights = PACHA_FD_RIGHT_INSPECT;
+    stream_backend_write_error = -5;
+    expect_u64("flush failure prevents retirement",
+        filed_file_vmo_cache_reclaim_idle_shared(&runtime), 0);
+    expect_true("flush failure preserves writable data", entry->active && entry->mapped == data);
+    stream_backend_write_error = 0;
+    mock_munmap_error = -1;
+    expect_u64("unmap failure prevents retirement",
+        filed_file_vmo_cache_reclaim_idle_shared(&runtime), 0);
+    expect_true("unmap failure retains descriptor", entry->active && entry->mapped == data);
+    mock_munmap_error = 0;
+    mock_fd_close_error = -1;
+    expect_u64("close failure retained for retry",
+        filed_file_vmo_cache_reclaim_idle_shared(&runtime), 0);
+    expect_true("failed close cannot lend unmapped entry",
+        entry->active && entry->retiring &&
+        filed_file_vmo_cache_shared_lookup(&runtime, 43) == NULL);
+    mock_fd_close_error = 0;
+    mock_info.extra = 1ull | (1ull << 32);
+    mock_vmo_revoke_calls = 0;
+    expect_u64("exclusive shared entry retired",
+        filed_file_vmo_cache_reclaim_idle_shared(&runtime), 1);
+    expect_true("retirement clears metadata", !entry->active);
+    expect_bytes("retirement writes back contents", stream_backend_data, data, sizeof(data));
+    expect_int("idle retirement never revokes", mock_vmo_revoke_calls, 0);
+    filed_file_vmo_cache_trim_empty_banks(&runtime);
+    mock_info_error = -1;
+}
+
+static void test_registry_growth_failure_and_idle_reuse(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    unsigned char data[4096] = {0};
+    init_runtime(&runtime, &dispatch);
+    mock_info_error = -1;
+    for (unsigned i = 0; i < FILED_FILE_VMO_BANK_ENTRIES; ++i) {
+        filed_file_vmo_cache_entry_t *entry = filed_file_vmo_cache_slot(&runtime);
+        expect_true("growth failure fill", entry != NULL);
+        if (!entry) return;
+        *entry = (filed_file_vmo_cache_entry_t){
+            .active = 1, .shared = 1, .vmo_fd = 40 + (int)i,
+            .backend_object = 1000 + i, .length = sizeof(data), .mapped = data,
+        };
+    }
+    filed_file_vmo_bank_t *original = dispatch.cache.file_vmo.banks;
+    fail_next_bank_allocation = 1;
+    expect_true("metadata OOM returns failure", filed_file_vmo_cache_slot(&runtime) == NULL);
+    expect_true("metadata OOM retains bank", dispatch.cache.file_vmo.banks == original && !original->next);
+    for (unsigned i = 0; i < FILED_FILE_VMO_BANK_ENTRIES; ++i)
+        expect_true("metadata OOM preserves live entries",
+            filed_file_vmo_cache_shared_lookup(&runtime, 1000 + i) != NULL);
+    mock_info_error = 0;
+    mock_info = (struct pacha_fd_info){ .kind = PACHA_FD_KIND_VMO,
+        .rights = PACHA_FD_RIGHT_INSPECT, .extra = 1ull | (2ull << 32) };
+    mock_vmo_revoke_calls = 0;
+    expect_true("idle entries reused before growth", filed_file_vmo_cache_slot(&runtime) != NULL);
+    expect_true("idle reuse avoids new bank", dispatch.cache.file_vmo.banks == original && !original->next);
+    expect_int("idle reuse never revokes", mock_vmo_revoke_calls, 0);
+    filed_file_vmo_cache_trim_empty_banks(&runtime);
+    mock_info_error = -1;
+}
+
+static void test_sparse_shared_vmo_import_and_flush(void)
+{
+    static filed_runtime_t runtime;
+    static filed_dispatch_state_t dispatch;
+    static unsigned char mapping[3 * 4096], backing[3 * 4096];
+    init_runtime(&runtime, &dispatch);
+    uint64_t root = 0, object = 0, bytes = 0;
+    expect_int("sparse shared root", filed_tmpfs_backend_mount_root(&runtime.tmpfs, &root), 0);
+    expect_int("sparse shared file", filed_tmpfs_backend_create(&runtime.tmpfs, root, "import", 0600, &object), 0);
+    expect_int("sparse shared content", filed_tmpfs_backend_pwrite(&runtime.tmpfs, object, 4096 + 7, "ok", 2, &bytes), 0);
+    expect_int("sparse shared EOF", filed_tmpfs_backend_truncate(&runtime.tmpfs, object, sizeof(mapping)), 0);
+    memset(mapping, 0xa5, sizeof(mapping));
+    mock_create_result = 33;
+    mock_mmap_result = mapping;
+    filed_file_vmo_cache_entry_t *entry = NULL;
+    expect_int("sparse shared create", filed_cache_create_shared_vmo(&runtime, object, 1, sizeof(mapping), sizeof(mapping), &entry), 0);
+    expect_u64("sparse create flag", mock_create_flags, PACHA_VMO_CREATE_ZERO_ON_DEMAND);
+    expect_true("sparse owner can read", (mock_create_rights & PACHA_FD_RIGHT_READ) != 0);
+    expect_true("sparse entry mode", entry && entry->zero_on_demand);
+    expect_bytes("sparse initial bytes", mapping + 4096 + 7, (const unsigned char *)"ok", 2);
+    expect_int("sparse initial first hole untouched", mapping[0], 0xa5);
+    expect_int("sparse initial last hole untouched", mapping[8192], 0xa5);
+    if (entry) {
+        memset(backing, 0, sizeof(backing));
+        memcpy(backing + 4096 + 7, "new", 3);
+        mock_vmo_read_data = backing;
+        mock_vmo_read_size = sizeof(backing);
+        mock_vmo_read_calls = 0;
+        entry->dirty = 1;
+        entry->writable_lent = 1;
+        /* A non-dereferenceable mapping proves flush only uses FD_READ. */
+        entry->mapped = (void *)(uintptr_t)1;
+        const uint32_t free_before = runtime.tmpfs.free_page_count;
+        expect_int("sparse explicit flush", filed_cache_flush_object(&runtime, object), 0);
+        expect_u64("sparse bounded reads", mock_vmo_read_calls, 3);
+        expect_u64("sparse flush does not allocate zero backend pages", runtime.tmpfs.free_page_count, free_before);
+        unsigned char out[3];
+        expect_int("sparse flush data read", filed_tmpfs_backend_pread(&runtime.tmpfs, object, 4103, out, 3, &bytes), 0);
+        expect_bytes("sparse flush new bytes", out, (const unsigned char *)"new", 3);
+        expect_int("sparse repeat starts at zero", filed_cache_flush_object(&runtime, object), 0);
+        entry->dirty = 1;
+        const int closes = mock_fd_close_calls;
+        mock_vmo_read_error = -3;
+        expect_int("sparse read failure", filed_cache_flush_object(&runtime, object), -5);
+        expect_true("sparse failed flush keeps dirty", entry->dirty);
+        expect_int("sparse failed read closes duplicate", mock_fd_close_calls, closes + 1);
+        mock_vmo_read_error = 0;
+        mock_vmo_dup_result = -3;
+        expect_int("sparse dup failure", filed_cache_flush_object(&runtime, object), -5);
+        expect_true("sparse dup failure keeps dirty", entry->dirty);
+        mock_vmo_dup_result = 90;
+        entry->mapped = mapping;
+    }
+    expect_int("sparse test cleanup", filed_tmpfs_backend_truncate(&runtime.tmpfs, object, 0), 0);
+    mock_create_result = -1;
+    mock_mmap_result = NULL;
+}
+
 int main(void)
 {
     test_rename_clears_negative_lookup();
@@ -873,10 +1441,21 @@ int main(void)
     test_link_routes_to_matching_backend();
     test_truncate_clears_page_and_vmo_cache();
     test_shared_vmo_is_io_source_and_revoke_target();
+    test_shared_vmo_failed_growth_keeps_existing_mappings();
+    test_shared_vmo_growth_preserves_identity_and_failures();
+    test_shared_vmo_growth_budget_and_cleanup();
+    test_global_sync_keeps_tmpfs_shared_vmo_authoritative();
+    test_sparse_shared_vmo_import_and_flush();
+    test_flush_all_continues_after_shared_error();
     test_file_vmo_cache_byte_budget();
     test_snapshot_vmo_pins_backend_object();
     test_pinned_file_vmo_limit_preserves_costly_snapshot();
+    test_many_library_snapshots_reused();
+    test_snapshot_exact_range_reuse();
     test_snapshot_vmo_pressure_reclaim_preserves_shared();
+    test_shared_registry_grows_and_trims();
+    test_shared_idle_retirement();
+    test_registry_growth_failure_and_idle_reuse();
     test_partial_write_cache_is_not_eof();
     test_sparse_dirty_cache_read_hole();
     test_partial_read_before_io_error();

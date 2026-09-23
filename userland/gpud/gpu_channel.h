@@ -2,6 +2,7 @@
 #ifndef PACHA_GPUD_GPU_CHANNEL_H
 #define PACHA_GPUD_GPU_CHANNEL_H
 
+#include "gpu_limits.h"
 #include <kobox2/gpu_drm_virtgpu_layout.h>
 #include <kobox2/virtqueue_memory.h>
 
@@ -20,9 +21,6 @@ enum {
     GPUD_GPU_DISPLAY_REQUEST_OFFSET = 3 * GPUD_GPU_CHANNEL_PAGE,
     GPUD_GPU_DISPLAY_REPLY_OFFSET = 3 * GPUD_GPU_CHANNEL_PAGE + 2048,
     GPUD_GPU_DISPLAY_REPLY_CAPACITY = 1024,
-    /* Xorg keeps primary and render files open while DRI3 clients use their
-     * own DRM files. Match the 16-entry frontend and sandbox session tables. */
-    GPUD_GPU_NATIVE_SESSION_LIMIT = 16,
     GPUD_GPU_REQUEST_OFFSET = 4 * GPUD_GPU_CHANNEL_PAGE,
     GPUD_GPU_OUTPUT_OFFSET = 5 * GPUD_GPU_CHANNEL_PAGE,
     GPUD_GPU_REPLY_OFFSET = 6 * GPUD_GPU_CHANNEL_PAGE,

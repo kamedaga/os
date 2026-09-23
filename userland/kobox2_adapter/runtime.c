@@ -150,7 +150,8 @@ void ph_wait(atomic_uint *word, unsigned expected) {
         (uintptr_t)word, expected, 0);
 
     /* NOT_READY means the producer changed the word before we could sleep. */
-    PH_CHECK(result == 0 || result == PACHA_SYSCALL_ERR_NOT_READY);
+    if (result != 0 && result != PACHA_SYSCALL_ERR_NOT_READY)
+        ph_fail(__FILE__, __LINE__, result);
 }
 
 void ph_wake(atomic_uint *word) {

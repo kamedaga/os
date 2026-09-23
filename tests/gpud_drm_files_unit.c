@@ -54,6 +54,29 @@ static void capacity(void) {
     assert(files.terminal_error == -EPROTO);
 }
 
+static void desktop_capacity_reuse(void) {
+    struct gpud_drm_files files = {0};
+    uint64_t handles[GPUD_DRM_FILES_MAX], extra;
+    assert(GPUD_DRM_FILES_MAX >= 32);
+    assert(!gpud_drm_files_init(&files, 1, GPUD_DRM_FILES_MAX));
+    for (unsigned round = 0; round < 2; ++round) {
+        for (size_t i = 0; i < GPUD_DRM_FILES_MAX; ++i) {
+            assert(!gpud_drm_file_open_begin(&files, 1, &handles[i]));
+            assert(!gpud_drm_file_open_finish(&files, 1, handles[i], handles[i], 0));
+        }
+        assert(gpud_drm_file_open_begin(&files, 1, &extra) == -EMFILE);
+        for (size_t i = 0; i < GPUD_DRM_FILES_MAX; ++i) {
+            struct gpud_drm_binding binding;
+            assert(!gpud_drm_file_close(&files, 1, handles[i]));
+            assert(gpud_drm_file_next_close(&files, 1, &binding) == 1);
+            assert(binding.frontend_handle == handles[i]);
+            assert(!gpud_drm_file_close_finish(&files, 1, handles[i], 0));
+        }
+        for (size_t i = 0; i < GPUD_DRM_FILES_MAX; ++i)
+            assert(files.files[i].state == GPUD_DRM_FILE_FREE);
+    }
+}
+
 static size_t make_reply(unsigned char *bytes,
                          const struct gpud_drm_control *pending,
                          uint32_t status,
@@ -131,6 +154,7 @@ static void control(int defect) {
 int main(void) {
     descriptions();
     capacity();
+    desktop_capacity_reuse();
     for (int defect = 0; defect <= 3; ++defect)
         control(defect);
     puts("GPUD_DRM_FILES_UNIT=PASS OFD dup inflight last-close capacity close-fault control-codec");

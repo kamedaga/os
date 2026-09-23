@@ -708,6 +708,8 @@ void lpr_reset_fork_child_rpc_state(void)
     lpr_file_image_cache_after_fork_child();
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
+    lpr_state.caches.page_lock_word = 0;
+    lpr_page_cache_clear();
     lpr_state.termd_rpc.lock_word = 0;
     lpr_state.netd_rpc.lock_word = 0;
     lpr_state.netd_rpc.endpoint_checked = 0;

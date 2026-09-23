@@ -37,6 +37,7 @@ pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
 pub const syscall_system_info: u64 = runtime_abi.syscall_system_info;
 pub const syscall_clock_gettime: u64 = runtime_abi.syscall_clock_gettime;
 pub const syscall_clock_getres: u64 = runtime_abi.syscall_clock_getres;
+pub const syscall_yield: u64 = runtime_abi.syscall_yield;
 pub const syscall_nanosleep: u64 = runtime_abi.syscall_nanosleep;
 pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
 pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
@@ -63,6 +64,7 @@ pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
+pub const syscall_vmo_grow: u64 = fd_abi.syscall_vmo_grow;
 pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
 pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
@@ -140,6 +142,7 @@ test "native syscall numbers are contiguous" {
         syscall_system_info,
         syscall_clock_gettime,
         syscall_clock_getres,
+        syscall_yield,
         syscall_nanosleep,
         syscall_futex_wait,
         syscall_futex_wake,
@@ -165,6 +168,7 @@ test "native syscall numbers are contiguous" {
         syscall_timerfd_settime,
         syscall_timerfd_gettime,
         syscall_vmo_create,
+        syscall_vmo_grow,
         syscall_vmo_create_page_view,
         syscall_vmo_revoke,
         syscall_mmap,

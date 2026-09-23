@@ -4,9 +4,9 @@
 #define PH_PROTECTION_MASK (KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE | KOBOX_IMAGE_EXECUTE)
 #define PH_VMA_BOUNDARY 8u
 
-_Static_assert(KOBOX_FIXED_IMAGE_READ == KOBOX_IMAGE_READ, "image read ABI");
-_Static_assert(KOBOX_FIXED_IMAGE_WRITE == KOBOX_IMAGE_WRITE, "image write ABI");
-_Static_assert(KOBOX_FIXED_IMAGE_EXECUTE == KOBOX_IMAGE_EXECUTE, "image execute ABI");
+_Static_assert((unsigned)KOBOX_FIXED_IMAGE_READ == (unsigned)KOBOX_IMAGE_READ, "image read ABI");
+_Static_assert((unsigned)KOBOX_FIXED_IMAGE_WRITE == (unsigned)KOBOX_IMAGE_WRITE, "image write ABI");
+_Static_assert((unsigned)KOBOX_FIXED_IMAGE_EXECUTE == (unsigned)KOBOX_IMAGE_EXECUTE, "image execute ABI");
 
 /* Process-lifetime windows for the single hosted core. */
 static struct ph_window direct_window;

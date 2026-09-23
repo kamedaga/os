@@ -218,6 +218,9 @@ struct pacha_fd_table_info {
  * not a reservation. Growth never changes existing descriptor numbers. */
 int pacha_fd_table(uint64_t minimum_capacity, struct pacha_fd_table_info *out);
 int pacha_fd_get_info(int fd, struct pacha_fd_info *out);
+/* Caller-owned, dynamically sized array; preserves native wait batch bounds. */
+long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t count,
+    uint64_t timeout_ticks);
 int pacha_fd_close(int fd);
 long pacha_fd_read(int fd, void *buf, uint64_t len);
 long pacha_fd_write(int fd, const void *buf, uint64_t len);
@@ -237,6 +240,8 @@ int pacha_timerfd_create(uint64_t initial_ns, uint64_t interval_ns, uint64_t rig
 int pacha_timerfd_settime(int fd, uint64_t initial_ns, uint64_t interval_ns, uint64_t flags);
 
 int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
+/* Grow page-aligned capacity while preserving live aliases; requires RESIZE. */
+int pacha_vmo_grow(int fd, uint64_t new_capacity);
 int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags);
 int pacha_vmo_create_page_view(int parent_fd, const uint64_t *page_indices,
     uint64_t page_count, uint64_t rights, uint32_t flags);

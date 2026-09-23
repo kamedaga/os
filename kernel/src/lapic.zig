@@ -382,16 +382,69 @@ pub fn eoi() void {
 
 pub fn activeInterruptVectorInRange(first: u8, count: u8) ?u8 {
     if (lapic_base_pa == 0 or count == 0) return null;
-    const first_vec: u16 = first;
-    const end_vec: u16 = first_vec + @as(u16, count);
-    var vec = first_vec;
-    while (vec < end_vec and vec <= std.math.maxInt(u8)) : (vec += 1) {
-        const reg_index: u32 = @intCast(vec / 32);
-        const bit_index: u5 = @intCast(vec & 31);
-        const bits = readRegister(lapic_reg_isr_base + reg_index * 0x10);
-        if ((bits & (@as(u32, 1) << bit_index)) != 0) return @intCast(vec);
+    // Device interrupt-gate entry keeps IF=0 and has not issued EOI yet.
+    // The local ISR is stable here; read each word once, not once per bit.
+    // This does not apply to the asynchronous IRR/drain check below.
+    return activeVectorFromIsr(first, count, IsrReader{});
+}
+
+const IsrReader = struct {
+    fn read(_: @This(), index: u32) u32 {
+        return readRegister(lapic_reg_isr_base + index * 0x10);
+    }
+};
+
+fn activeVectorFromIsr(first: u8, count: u8, reader: anytype) ?u8 {
+    const end: u16 = @min(@as(u16, first) + count, 256);
+    var vector: u16 = first;
+    while (vector < end) {
+        const word_base = vector & ~@as(u16, 31);
+        const word_end = @min(word_base + 32, end);
+        const low: u5 = @intCast(vector - word_base);
+        const high_trim: u5 = @intCast(word_base + 32 - word_end);
+        const all_bits: u32 = std.math.maxInt(u32);
+        const mask = (all_bits << low) & (all_bits >> high_trim);
+        const bits = reader.read(@as(u32, word_base / 32)) & mask;
+        if (bits != 0) return @intCast(word_base + @ctz(bits));
+        vector = word_end;
     }
     return null;
+}
+
+test "LAPIC ISR scan preserves range and reads each word once" {
+    const Reader = struct {
+        words: [8]u32 = @splat(0),
+        reads: [8]u8 = @splat(0),
+        fn read(self: *@This(), index: u32) u32 {
+            self.reads[index] += 1;
+            return self.words[index];
+        }
+    };
+    const ranges = [_][2]u8{
+        .{ 0, 0 },     .{ 0, 255 }, .{ 1, 255 },   .{ 31, 1 },
+        .{ 31, 2 },    .{ 32, 32 }, .{ 63, 2 },    .{ 80, 128 },
+        .{ 254, 255 }, .{ 255, 1 }, .{ 255, 255 },
+    };
+    for (ranges) |range| {
+        for (0..256) |bit| {
+            var reader: Reader = .{};
+            reader.words[bit / 32] = @as(u32, 1) << @as(u5, @intCast(bit % 32));
+            const end = @min(@as(u16, range[0]) + range[1], 256);
+            const expected: ?u8 = if (bit >= range[0] and bit < end) @intCast(bit) else null;
+            try std.testing.expectEqual(expected, activeVectorFromIsr(range[0], range[1], &reader));
+            for (reader.reads, 0..) |reads, word| {
+                const intersects = range[1] != 0 and word * 32 < end and (word + 1) * 32 > range[0];
+                const visited = intersects and (expected == null or word <= bit / 32);
+                try std.testing.expectEqual(@as(u8, if (visited) 1 else 0), reads);
+            }
+        }
+    }
+    var reader: Reader = .{};
+    reader.words[0] = 1; // Below the range; must not shadow vector 35.
+    reader.words[1] = (@as(u32, 1) << 3) | (@as(u32, 1) << 31);
+    reader.words[2] = 1;
+    try std.testing.expectEqual(@as(?u8, 35), activeVectorFromIsr(31, 34, &reader));
+    try std.testing.expectEqual([8]u8{ 1, 1, 0, 0, 0, 0, 0, 0 }, reader.reads);
 }
 
 /// A source must already be masked and its posted mask write read back.

@@ -94,7 +94,6 @@ int main(void) {
     uint64_t sequence = 17;
     struct ph_device_config config = {
         .device_fd = 224, .generation = 7, .image = &image, .irq_cookie_sequence = &sequence,
-        .aperture_start = 0x80000000, .aperture_end = 0x8fffffff,
         .memory = {.size = sizeof(config.memory), .identity = KOBOX_LINUX_MEMORY_HOST_IDENTITY,
             .operations = &ph_memory_ops, .ram_backing = &image,
             .direct_map = image.direct, .ram_size = PH_RAM_SIZE,

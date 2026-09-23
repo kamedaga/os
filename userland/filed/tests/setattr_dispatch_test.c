@@ -9,6 +9,15 @@ static filed_runtime_t runtime;
 static filed_handle_id_t setattr_handle;
 static filed_handle_id_t inspect_handle;
 static int failures;
+static int flush_error, sync_error, sync_calls;
+uint64_t filed_cache_dirty_count(filed_runtime_t *instance)
+{ (void)instance; return 1; }
+uint64_t filed_kobox_backend_dirty_hint(const filed_kobox_backend_t *backend)
+{ (void)backend; return 1; }
+int filed_cache_flush_object(filed_runtime_t *instance, uint64_t object)
+{ (void)instance; (void)object; return flush_error; }
+int filed_kobox_backend_sync_all(filed_kobox_backend_t *backend)
+{ (void)backend; ++sync_calls; return sync_error; }
 static int statx_calls;
 static int chmod_calls;
 static int utimens_calls;
@@ -295,6 +304,14 @@ static filed_page_dispatch_result_t dispatch_utimens(
 
 int main(void)
 {
+    flush_error = -28;
+    expect_status("sync keeps cache error", filed_dispatch_sync_all(&runtime), -28);
+    expect_status("sync still reaches ext4", sync_calls, 1);
+    flush_error = 0;
+    sync_error = -5;
+    expect_status("sync keeps backend error", filed_dispatch_sync_all(&runtime), -5);
+    sync_error = 0;
+    expect_status("sync recovery", filed_dispatch_sync_all(&runtime), 0);
     filed_mount_id_t mount_id = 0;
     filed_vfs_open_result_t setattr_root;
     filed_vfs_open_result_t stat_root;
@@ -477,5 +494,6 @@ int main(void)
         return 1;
     }
     puts("setattr dispatch tests passed");
+    filed_vfs_destroy(&runtime.vfs);
     return 0;
 }

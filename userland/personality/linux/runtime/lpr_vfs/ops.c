@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/allocate.h"
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
@@ -106,6 +107,7 @@ int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
 
 int64_t lpr_filed_close_handle(uint64_t handle)
 {
+    lpr_file_image_cache_drop_handle(handle);
     uint64_t ignored = 0;
     return lpr_filed_call(FILED_OP_VFS_CLOSE, -1, handle, &ignored);
 }
@@ -754,14 +756,12 @@ int64_t lpr_linux_openat_once(
         {
             return -LPR_LINUX_EEXIST;
         }
-        const int fd = lpr_fd_slot_alloc_from(3);
-        if (fd < 0) {
-            return fd;
-        }
-        const uint64_t device_id = (1ull << 32u) | device_minor;
-        const int install = lpr_control_install_fd(
-            (uint64_t)(uint32_t)fd, LPR_FD_OPS_DEVICE, flags, device_id, 0);
-        return install == 0 ? fd : install;
+        const lpr_device_backend_t device = {
+            .active = 1, .major = 1, .minor = device_minor,
+            .flags = (uint32_t)flags,
+        };
+        return lpr_fd_alloc_state(LPR_FD_OPS_DEVICE, flags, 0,
+            &device, sizeof(device));
     }
     uint64_t handle = 0;
     uint64_t opened_kind = 0;

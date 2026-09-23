@@ -10,10 +10,12 @@ out="${1:-$repo_root/.artifacts/gpud/sandbox.elf}"
 [[ $# == 0 ]] || shift
 gates=0
 device=1
+dma_profile=0
 for argument in "$@"; do
   case "$argument" in
     --foundation-gates) gates=1 ;;
     --no-device) device=0 ;;
+    --dma-profile) dma_profile=1 ;;
     *) echo "Unknown sandbox build argument: $argument" >&2; exit 2 ;;
   esac
 done
@@ -27,6 +29,9 @@ sources=("$adapter/sandbox_main.c" "$adapter/runtime.c" "$adapter/entry.S"
   "$sandbox/machine/domain.c" "$sandbox/boot/core.c"
   "$protocol/src/closure_manifest.c" "$protocol/src/resource_grant.c" "$protocol/src/sha256.c")
 flags=(-DPH_SANDBOX_DEVICE="$device")
+if [[ "$dma_profile" == 1 ]]; then
+  flags+=(-DPH_DMA_PROFILE=1)
+fi
 if [[ "$gates" == 1 ]]; then
   flags+=(-DPH_SANDBOX_FOUNDATION_GATES=1 -DPH_CHAPTER2_CORE=1)
   sources+=("$adapter/foundation.c" "$adapter/chapter2.c" "$repo_root/tests/kobox2_native_mapping.c")

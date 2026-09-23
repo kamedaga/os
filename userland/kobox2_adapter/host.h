@@ -20,7 +20,10 @@
 #define PH_NOTIFICATION_SIGNAL 12u
 #define PH_NOTIFICATION_MASK (UINT64_C(1) << (PH_NOTIFICATION_SIGNAL - 1))
 #define PH_THREAD_STACK_SIZE (256ul * 1024)
-#define PH_RAM_SIZE (256ul << 20)
+/* At 256 MiB, real multi-tab 2560x1264 rendering reached the DRM allocation
+ * reserve and rejected even one-page resources. Add 128 MiB of hosted-core
+ * headroom without changing the VM's 4 GiB guest RAM configuration. */
+#define PH_RAM_SIZE (384ul << 20)
 #define PH_IMAGE_PHYSICAL_BASE ((size_t)KOBOX_CORE_PHYSICAL_BASE)
 
 struct ph_window {

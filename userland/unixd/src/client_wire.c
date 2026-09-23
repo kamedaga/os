@@ -16,8 +16,10 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
     struct unix_client_buffer *buffer, int *miss)
 {
     *miss = 0;
+    /* 256 is the initial table capacity, not the native descriptor limit.
+     * LPR can grow its table before creating per-thread UNIX sessions. */
     if (!io || !io->page_create || !io->page_destroy || !io->call || !io->receive || !io->close ||
-        !request || !request->request || !received || endpoint < 16 || endpoint >= 256 ||
+        !request || !request->request || !received || endpoint < 16 || endpoint >= PACHA_FD_TABLE_LIMIT ||
         (send_count && !send) || (capacity && !receive) ||
         send_count > PACHA_IPC_MAX_TRANSFER_FDS - 2 || capacity > PACHA_IPC_MAX_TRANSFER_FDS)
         return -EINVAL;

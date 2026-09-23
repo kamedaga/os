@@ -6,11 +6,15 @@
 #include "gpu_query_message.h"
 #include "lifecycle.h"
 
+/* Retain small private snapshots, not occasional large transfers, per owner. */
+#define PH_GPU_QUERY_AUX_REUSE_BYTES (64u * 1024u)
+
 /* Sandbox-only native adapter, not linked into the Apache controller. */
 struct ph_gpu_query {
     uint64_t generation, session_id, correlation;
     void *mapping;
     void *aux;
+    void *aux_cache;
     size_t aux_size, aux_mapping_size;
     struct kobox_drm_query plan;
     struct kobox_drm_query_result result;
@@ -38,8 +42,11 @@ int ph_gpu_query_prepare_snapshot(struct ph_gpu_query *query,
                                   uint64_t expected_correlation,
                                   uint32_t queue_class);
 
-/* Drop the private native staging area only after completion publication. */
+/* End snapshot ownership only after completion publication. Small private
+ * backing stays with the exclusive queue owner; it is never peer memory. */
 int ph_gpu_query_release_aux(struct ph_gpu_query *query);
+/* Terminal retirement after admission and dispatch have both stopped. */
+int ph_gpu_query_destroy_aux(struct ph_gpu_query *query);
 int ph_gpu_query_dispatch(struct ph_gpu_query *query,
                           struct kobox_linux_drm_service *service,
                           uint64_t file_cookie,

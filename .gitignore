@@ -14,6 +14,7 @@ tools/*
 !tools/build_wsl_libinput_smoke.sh
 !tools/build_wsl_alpine_sway.sh
 !tools/build_wsl_alpine_xfce.sh
+!tools/stage_void_webkit.py
 !tools/build_dbus_system_config.sh
 !tools/rootfs_overlay.py
 !tools/manifests/
@@ -54,6 +55,14 @@ target/
 *.lock
 !flake.lock
 !tools/manifests/alpine-xfce-v3.22-x86_64.lock
+!tools/manifests/alpine-epiphany-v3.22-x86_64.lock
+!tools/manifests/void-webkit-x86_64-musl.lock
+!tools/manifests/void-linux-public.pem
+!tools/manifests/alpine-kobox-kernel-v3.22-x86_64.lock
+!tools/manifests/alpine-wayland-dev-v3.22-x86_64.lock
+!tools/manifests/alpine-pine2-build-v3.22-x86_64.lock
+!tools/manifests/ubuntu-kobox-nvme-x86_64.lock
+!tools/manifests/arch-linux-6.8-kobox-x86_64.lock
 _disk_bootx64.efi
 
 # Temporary files

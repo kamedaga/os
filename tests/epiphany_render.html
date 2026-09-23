@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>PachaOS Epiphany test</title>
+<style>
+body { font: 22px sans-serif; margin: 3em; background: #edf3f7; color: #16324b; }
+main { background: white; padding: 2em; max-width: 850px; border-radius: 12px; }
+input, button { font: inherit; padding: .4em; } canvas { display: block; margin-top: 1em; }
+</style>
+<main>
+<h1>PachaOS / Epiphany</h1>
+<p>Local port verification — sandbox disabled for this test.</p>
+<p id="js">JavaScript has not run</p>
+<input id="entry" placeholder="Type here"><button id="check">Check input</button>
+<p id="result">Waiting for input</p>
+<canvas id="canvas" width="640" height="160"></canvas>
+</main>
+<script>
+document.title = 'PachaOS Epiphany JS OK';
+document.querySelector('#js').textContent = 'JavaScript OK';
+document.querySelector('#check').onclick = () => {
+  document.querySelector('#result').textContent = 'Input OK: ' + document.querySelector('#entry').value;
+};
+const ctx = document.querySelector('#canvas').getContext('2d');
+let frames = 0;
+function draw() {
+  ctx.fillStyle = '#16324b'; ctx.fillRect(0, 0, 640, 160);
+  ctx.fillStyle = '#49c5b6'; ctx.fillRect((frames * 3) % 580, 45, 60, 60);
+  ctx.fillStyle = 'white'; ctx.font = '20px sans-serif';
+  ctx.fillText('Canvas / animation frames: ' + frames++, 15, 140);
+  requestAnimationFrame(draw);
+}
+draw();
+</script>

@@ -3,33 +3,26 @@ set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cache="${repo_root}/.artifacts/arch-linux-headers-6.8"
-tools="${repo_root}/.artifacts/tools-zstd"
-pkg="linux-headers-6.8.arch1-1-x86_64.pkg.tar.zst"
-url="https://archive.archlinux.org/packages/l/linux-headers/${pkg}"
+lock="${repo_root}/tools/manifests/arch-linux-6.8-kobox-x86_64.lock"
+read -r _pkg _version url expected_sha < <(awk '$1 == "linux-headers" { print; exit }' "${lock}")
+pkg="${url##*/}"
 pkg_path="${cache}/${pkg}"
 root="${cache}/root"
 kdir="${root}/usr/lib/modules/6.8.0-arch1-1/build"
 
 mkdir -p "${cache}"
 
-if [ ! -x "${tools}/root/usr/bin/zstd" ]; then
-    mkdir -p "${tools}/deb" "${tools}/root"
-    (
-        cd "${tools}/deb"
-        apt-get download zstd >/tmp/apt-download-zstd.log 2>&1
-        dpkg-deb -x zstd_*.deb ../root
-    )
-fi
-zstd_bin="${tools}/root/usr/bin/zstd"
+command -v zstd >/dev/null || { echo "zstd is required" >&2; exit 1; }
 
-if [ ! -f "${pkg_path}" ]; then
+if [ ! -f "${pkg_path}" ] || [ "$(sha256sum "${pkg_path}" | awk '{print $1}')" != "${expected_sha}" ]; then
     curl -fL -o "${pkg_path}" "${url}"
 fi
+printf '%s  %s\n' "${expected_sha}" "${pkg_path}" | sha256sum -c - >/dev/null
 
 if [ ! -f "${kdir}/Makefile" ]; then
     rm -rf "${root}"
     mkdir -p "${root}"
-    "${zstd_bin}" -dc "${pkg_path}" | tar -xf - -C "${root}"
+    zstd -dc "${pkg_path}" | tar -xf - -C "${root}"
 fi
 
 printf '%s\n' "${kdir}"

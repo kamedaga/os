@@ -1,4 +1,5 @@
 #include "rights.h"
+#include "diagnostic.h"
 #include "../lpr_filed_internal.h"
 #include <errno.h>
 
@@ -275,6 +276,7 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
         if (request.rights.items[0].provider == UNIX_TRANSFER_SOCKET) {
             status = stage_socket(&request, caps, received, flags, &imported[taken]);
             if (!status) { taken++; continue; }
+            lpr_unix_diag('E', socket, status, 108, received);
             if (status == -EMFILE || status == -ENOMEM) status = 0;
             break;
         }
@@ -282,6 +284,7 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
         status = lpr_fd_transfer_stage_batch(request.rights.items, request.rights.count,
             native, received, flags & UINT64_C(0x40000000) ? LPR_LINUX_O_CLOEXEC : 0, descriptors);
         if (status) {
+            lpr_unix_diag('E', socket, status, 102, request.rights.items[0].provider);
             close_caps(native, received);
             if (status == -EMFILE || status == -ENOMEM || status == -EOPNOTSUPP) status = 0;
             break;
@@ -300,6 +303,7 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
     if (status) { abort_imports(imported, taken); return status; }
     activate_sockets(imported, taken);
     if (lpr_fd_table_publish_batch(&lpr_control_fd_table, imported, taken) != 0) {
+        lpr_unix_diag('E', socket, -EIO, 103, taken);
         abort_imports(imported, taken);
         ack(context, read->ticket, operation, 1);
         return -EIO;
@@ -312,7 +316,10 @@ int lpr_unix_rights_receive(struct lpr_unix_context *context, uint64_t socket,
         state->used += (header.length + 7) & ~UINT64_C(7);
         if (state->used > state->capacity) state->used = state->capacity;
     }
-    if (taken < total && message_flags) *message_flags |= 8; /* MSG_CTRUNC */
+    if (taken < total && message_flags) {
+        lpr_unix_diag('E', socket, 109, taken, total);
+        *message_flags |= 8; /* MSG_CTRUNC */
+    }
     ack(context, read->ticket, operation, 1);
     return 0;
 }

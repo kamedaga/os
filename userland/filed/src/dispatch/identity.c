@@ -7,11 +7,6 @@ int filed_client_create(filed_runtime_t *runtime, const filed_identity_t *identi
     if (!identity || identity->pid <= 0 || !identity->generation ||
         (identity->rights & ~1023u)) return -22;
     if (runtime->client_sequence == UINT64_MAX) return -75;
-    unsigned clients = 0;
-    for (struct filed_client *it = runtime->clients; it; it = it->next) clients++;
-    /* Reserve wait slots for every fast session and every live transfer lease. */
-    if (clients + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES + 4 >= PACHA_SERVICE_WAIT_MAX_FDS)
-        return -24;
     struct filed_client *client = calloc(1, sizeof(*client));
     if (!client) return -12;
     struct pacha_fd_table_info info;
@@ -59,8 +54,8 @@ void filed_client_release(filed_runtime_t *runtime, struct filed_client *client)
         (void)pacha_fd_close(session->channel_fd);
         *session = (filed_session_t){ .page_fd = -1, .channel_fd = -1 };
     }
-    for (unsigned i = 0; i < FILED_MAX_HANDLES; i++) {
-        filed_handle_t *handle = &runtime->vfs.handles[i];
+    for (unsigned i = 0; i < runtime->vfs.handle_capacity; i++) {
+        filed_handle_t *handle = filed_vfs_handle_at(&runtime->vfs, i);
         if (handle->active && handle->owner_client == client->id && handle->lease_fd < 16)
             (void)filed_close_handle_runtime(runtime, handle->id);
     }

@@ -1,5 +1,6 @@
 #include "client.h"
 #include "cache.h"
+#include "diagnostic.h"
 #include <unixd/profile.h>
 #include "../lpr_filed_internal.h"
 
@@ -32,13 +33,16 @@ static int native_call(int endpoint, const struct pacha_ipc_msg *request)
      * queue has not accepted the request (or MOVE capabilities); wait for
      * writable and retry only that explicit backpressure result. */
     const int64_t fd = lpr_native_ipc_call_wait((uint64_t)(uint32_t)endpoint, request);
+    if (fd < 16) lpr_unix_diag('E', (uint64_t)(uint32_t)endpoint, fd, 106, request->word1);
     return fd >= 16 ? (int)fd : fd ? (int)pacha_kernel_status_to_errno(fd) : -LPR_LINUX_EIO;
 }
 
 static int native_receive(int fd, struct pacha_ipc_msg *reply)
 {
     /* Finish the same reply after a native signal cancels its waiter. */
-    return (int)pacha_kernel_status_to_errno(lpr_native_ipc_recv_wait((uint64_t)(uint32_t)fd, reply));
+    const int64_t status = lpr_native_ipc_recv_wait((uint64_t)(uint32_t)fd, reply);
+    if (status) lpr_unix_diag('E', (uint64_t)(uint32_t)fd, status, 107, 0);
+    return (int)pacha_kernel_status_to_errno(status);
 }
 
 static void native_close(int fd)

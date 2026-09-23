@@ -7,6 +7,7 @@ const smp = @import("smp.zig");
 const types = @import("state/types.zig");
 const user_copy = @import("user_copy.zig");
 const tables = @import("vtd_tables.zig");
+const iova_storage = @import("iova.zig");
 
 pub const Discovery = struct {
     table_paddr: u64,
@@ -17,9 +18,6 @@ const page_size: u64 = 4096;
 const four_gib: u64 = 4 * 1024 * 1024 * 1024;
 pub const iova_window_start = tables.iova_window_start;
 pub const iova_window_end = tables.iova_window_end;
-const iova_page_count = tables.iova_page_count;
-const iova_bitmap_bytes = tables.iova_bitmap_bytes;
-const iova_bitmap_pages: usize = iova_bitmap_bytes / @as(usize, @intCast(page_size));
 const max_domains: usize = 256;
 const max_leaf_tables: usize = 4096;
 const leaf_index_slots: usize = max_leaf_tables * 2;
@@ -102,6 +100,10 @@ const DriverState = struct {
     /// Zero for a coherent table walker, otherwise the CPUID CLFLUSH stride.
     table_cache_line_bytes: usize = 0,
     active: bool = false,
+    iova_end: u64 = iova_window_end,
+    // PMM can temporarily reject a return when its free-range metadata is
+    // fragmented. Keep ownership and reuse such banks instead of leaking them.
+    iova_spares: ?*iova_storage.Bank = null,
     has_quarantine: bool = false,
     lock_word: u8 = 0,
 };
@@ -229,13 +231,20 @@ fn wait32Clear(offset: u64, mask: u32) bool {
     return false;
 }
 
-fn wait64Clear(offset: u64, mask: u64) bool {
+fn wait64Clear(offset: u64, mask: u64) ?u64 {
+    return wait64ClearWithReader(offset, mask, poll_limit, mmioRead64);
+}
+
+fn wait64ClearWithReader(offset: u64, mask: u64, comptime limit: usize, comptime read: fn (u64) u64) ?u64 {
     var spins: usize = 0;
-    while (spins < poll_limit) : (spins += 1) {
-        if ((mmioRead64(offset) & mask) == 0) return true;
+    while (spins < limit) : (spins += 1) {
+        const value = read(offset);
+        // VT-d reports CAIG/IAIG when ICC/IVT clears (11.4.6.1/11.4.6.3).
+        // Keep that sample so checking the result needs no second MMIO read.
+        if ((value & mask) == 0) return value;
         asm volatile ("pause");
     }
-    return false;
+    return null;
 }
 
 fn allocZeroPage() ?u64 {
@@ -259,23 +268,20 @@ fn allocTablePage() ?u64 {
     return paddr;
 }
 
-fn allocIovaBitmap() ?*[iova_bitmap_bytes]u8 {
-    const free_list = driver_state.free_list orelse return null;
-    const paddr = if (builtin.is_test)
-        free_list.popContiguousBelow(iova_bitmap_pages, std.math.maxInt(u64)) catch return null
-    else
-        free_list.popContiguousBelow(iova_bitmap_pages, four_gib) catch return null;
-    var page_index: usize = 0;
-    while (page_index < iova_bitmap_pages) : (page_index += 1) {
-        const page_paddr = paddr + @as(u64, @intCast(page_index)) * page_size;
-        if (builtin.is_test) {
-            @memset(tableAt(page_paddr)[0..], 0);
-        } else if (!user_copy.zeroPhysicalPage(page_paddr)) {
-            free_list.appendContiguousRange(0, paddr, iova_bitmap_pages) catch {};
-            return null;
-        }
+fn allocIovaBank(_: ?*anyopaque) ?*iova_storage.Bank {
+    if (driver_state.iova_spares) |bank| {
+        driver_state.iova_spares = bank.next;
+        return bank;
     }
-    return @ptrFromInt(paddr);
+    return @ptrFromInt(allocZeroPage() orelse return null);
+}
+
+fn freeIovaBank(_: ?*anyopaque, bank: *iova_storage.Bank) void {
+    const free_list = driver_state.free_list orelse unreachable;
+    free_list.appendPage(0, @intFromPtr(bank)) catch {
+        bank.next = driver_state.iova_spares;
+        driver_state.iova_spares = bank;
+    };
 }
 
 fn tableAt(paddr: u64) *tables.TablePage {
@@ -294,9 +300,12 @@ fn domainForDevice(device: types.DmaDeviceId) ?*Domain {
 }
 
 fn ensureDomainAllocator(domain: *Domain) bool {
-    if (domain.allocator.bitmap != null) return true;
-    const bitmap = allocIovaBitmap() orelse return false;
-    domain.allocator = IovaAllocator.init(bitmap);
+    if (domain.allocator.storage != null) return true;
+    if (driver_state.iova_end <= iova_window_start) return false;
+    domain.allocator = IovaAllocator.init(iova_window_start, driver_state.iova_end, .{
+        .allocate = allocIovaBank,
+        .release = freeIovaBank,
+    });
     return true;
 }
 
@@ -547,15 +556,15 @@ fn writeBufferFlush() bool {
 
 fn invalidateContextCacheGlobal() bool {
     mmioWrite64(ccmd_reg, ccmd_icc | ccmd_cirg_global);
-    if (!wait64Clear(ccmd_reg, ccmd_icc)) return false;
-    return ((mmioRead64(ccmd_reg) >> ccmd_caig_shift) & 0x3) == 1;
+    const completed = wait64Clear(ccmd_reg, ccmd_icc) orelse return false;
+    return ((completed >> ccmd_caig_shift) & 0x3) == 1;
 }
 
 fn invalidateIotlbGlobal() bool {
     const register = driver_state.iotlb_offset + 8;
     mmioWrite64(register, iotlb_ivt | iotlb_iirg_global);
-    if (!wait64Clear(register, iotlb_ivt)) return false;
-    return ((mmioRead64(register) >> iotlb_iaig_shift) & 0x3) == 1;
+    const completed = wait64Clear(register, iotlb_ivt) orelse return false;
+    return ((completed >> iotlb_iaig_shift) & 0x3) == 1;
 }
 
 fn invalidateIotlbDomain(did: u16) bool {
@@ -567,8 +576,8 @@ fn invalidateIotlbDomain(did: u16) bool {
     }
     const register = driver_state.iotlb_offset + 8;
     mmioWrite64(register, command);
-    if (!wait64Clear(register, iotlb_ivt)) return false;
-    return domainInvalidationCompleted(mmioRead64(register));
+    const completed = wait64Clear(register, iotlb_ivt) orelse return false;
+    return domainInvalidationCompleted(completed);
 }
 
 fn flushTranslationChanges(did: u16) bool {
@@ -919,6 +928,23 @@ pub fn init(rsdp_paddr: u64, free_list: *types.FreePageList) void {
         return;
     }
 
+    // Finalize once, before any reservation or device FD publication. Neither
+    // captureBarApertures (which runs later) nor live driver BAR writes define
+    // this window. CAP.MGAW constrains input addresses independently of SAGAW.
+    const mgaw: u7 = @as(u7, @intCast((cap >> 16) & 0x3f)) + 1;
+    if (mgaw < 32) {
+        logInitFailure("DMA input address width is below the 32-bit contract");
+        return;
+    }
+    driver_state.iova_end = pci.bootDmaWindowEnd(iova_window_start, info.dma_window_end);
+    kernel_log.writeFmt("vtd: IOVA window start=0x{x} end=0x{x} sparse-banks=1\n", .{
+        iova_window_start, driver_state.iova_end,
+    });
+    if (driver_state.iova_end <= iova_window_start) {
+        logInitFailure("no continuous DMA window outside firmware reservations");
+        return;
+    }
+
     driver_state.root_paddr = allocTablePage() orelse {
         logInitFailure("root table allocation failed");
         return;
@@ -969,9 +995,16 @@ pub fn isActive() bool {
 }
 
 fn validIovaRange(iova: u64, size: u64) bool {
-    if (size == 0 or iova < iova_window_start or iova >= iova_window_end) return false;
+    if (size == 0 or iova < iova_window_start or iova >= driver_state.iova_end) return false;
     const end, const overflow = @addWithOverflow(iova, size);
-    return overflow == 0 and end <= iova_window_end;
+    return overflow == 0 and end <= driver_state.iova_end;
+}
+
+/// The device snapshot describes one usable continuous IOVA window, not the
+/// endpoint's DMA mask. Untranslated/unknown devices have no such window.
+pub fn deviceIovaWindow(device: types.DmaDeviceId) struct { start: u64 = 0, size: u64 = 0 } {
+    if (!isActive() or domainForDevice(device) == null) return .{};
+    return .{ .start = iova_window_start, .size = driver_state.iova_end - iova_window_start };
 }
 
 pub fn allocIova(device: types.DmaDeviceId, page_count: usize) ?u64 {
@@ -984,13 +1017,13 @@ pub fn allocIova(device: types.DmaDeviceId, page_count: usize) ?u64 {
     };
     if (domain.quarantined) return null;
     if (!ensureDomainAllocator(domain)) {
-        kernel_log.writeFmt("vtd: iova alloc failed device=0x{x} did={} reason=bitmap-allocation\n", .{ device, domain.did });
+        kernel_log.writeFmt("vtd: iova alloc failed device=0x{x} did={} reason=no-window\n", .{ device, domain.did });
         return null;
     }
     const iova = domain.allocator.alloc(page_count) orelse {
         kernel_log.writeFmt(
             "vtd: iova alloc failed device=0x{x} did={} reason=exhausted pages={} used_pages={} window_pages={}\n",
-            .{ device, domain.did, page_count, domain.allocator.used_pages, iova_page_count },
+            .{ device, domain.did, page_count, domain.allocator.used_pages, domain.allocator.page_count },
         );
         return null;
     };
@@ -1190,6 +1223,90 @@ pub const TestSupport = if (builtin.is_test) struct {
         return (domainForDevice(device) orelse return 0).allocator.used_pages;
     }
 } else void;
+
+test "VT-d completion polling returns the clear sample without a second read" {
+    const Reader = struct {
+        var values: []const u64 = undefined;
+        var reads: usize = 0;
+        var last_offset: u64 = 0;
+
+        fn read(offset: u64) u64 {
+            last_offset = offset;
+            const value = values[reads];
+            reads += 1;
+            return value;
+        }
+    };
+    const completed = @as(u64, 2) << iotlb_iaig_shift;
+    const cases = [_]struct { samples: []const u64, expected: ?u64 }{
+        .{ .samples = &.{completed}, .expected = completed },
+        .{ .samples = &.{ iotlb_ivt, iotlb_ivt | completed, completed }, .expected = completed },
+        .{ .samples = &.{ iotlb_ivt, iotlb_ivt, iotlb_ivt }, .expected = null },
+        // Zero is a completed observation, not a timeout; the caller must
+        // still reject its missing actual invalidation granularity.
+        .{ .samples = &.{0}, .expected = 0 },
+    };
+    for (cases) |case| {
+        Reader.values = case.samples;
+        Reader.reads = 0;
+        try std.testing.expectEqual(case.expected, wait64ClearWithReader(0x108, iotlb_ivt, 3, Reader.read));
+        try std.testing.expectEqual(case.samples.len, Reader.reads);
+        try std.testing.expectEqual(@as(u64, 0x108), Reader.last_offset);
+    }
+}
+
+test "VT-d IOVA bank retains and reuses backing when PMM return metadata is full" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 4 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 4);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    const bank = allocIovaBank(null).?;
+    // Inject only PMM's metadata-full condition; the returned page and bank
+    // ownership transitions are real. Different region IDs prevent merging.
+    for (&free_list.ranges) |*range| range.* = .{ .region_id = 1, .physical_start = 0x1000, .len = 1 };
+    free_list.range_len = free_list.ranges.len;
+    freeIovaBank(null, bank);
+    try std.testing.expectEqual(bank, driver_state.iova_spares.?);
+    try std.testing.expectEqual(bank, allocIovaBank(null).?);
+    try std.testing.expect(driver_state.iova_spares == null);
+    free_list.* = .{};
+    freeIovaBank(null, bank);
+    try std.testing.expect(driver_state.iova_spares == null);
+    try std.testing.expectEqual(@intFromPtr(bank), try free_list.popFront());
+}
+
+test "VT-d device aperture admits beyond old fixed window and clips the real boundary" {
+    const allocator = std.testing.allocator;
+    const backing = try allocator.alignedAlloc(u8, .fromByteUnits(4096), 32 * 4096);
+    defer allocator.free(backing);
+    const free_list = try allocator.create(types.FreePageList);
+    defer allocator.destroy(free_list);
+    free_list.* = .{};
+    try free_list.appendContiguousRange(0, @intFromPtr(backing.ptr), 32);
+    const device = pci.resourceIdFromLocation(.{ .bus = 0, .device = 2, .function = 0 });
+    try TestSupport.begin(free_list, device);
+    defer TestSupport.end();
+    driver_state.iova_end = 0xb0000000;
+    const window = deviceIovaWindow(device);
+    try std.testing.expectEqual(iova_window_start, window.start);
+    try std.testing.expectEqual(@as(u64, 0x30000000), window.size);
+    try std.testing.expectEqual(@as(u64, 0), deviceIovaWindow(device + 1).size);
+    try std.testing.expect(!reserveIova(device, 0xb0000000, 1));
+    const page = try free_list.popFront();
+    const address = 0xa0000000;
+    try std.testing.expect(reserveIova(device, address, 1));
+    try std.testing.expect(mapPages(device, address, &.{page}, true, true));
+    try std.testing.expect(unmapRangeForDevice(device, address, page_size));
+    freeIova(device, address, 1);
+    try std.testing.expectEqual(@as(usize, 0), TestSupport.usedPages(device));
+    try std.testing.expect(domainForDevice(device).?.allocator.banks == null);
+}
 
 test "VT-d CM=0 map publication skips invalidation but withdrawal still drains" {
     const allocator = std.testing.allocator;

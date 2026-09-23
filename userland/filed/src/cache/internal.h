@@ -12,20 +12,22 @@ enum {
     FILED_PAGE_CACHE_SLOTS = 64,
     FILED_DIR_CACHE_SLOTS = 32,
     FILED_NEGATIVE_LOOKUP_CACHE_SLOTS = 64,
-    /* Leave room in the 256-entry native fd table for IPC and exec fds. */
-    FILED_RUNTIME_FILE_VMO_CACHE_SLOTS = 128,
-    /* Immutable snapshots are optional cache owners.  Keep their pins below
-     * half of the 48-entry linked-vnode LRU so concurrent path walks and exec
-     * can still retain working vnodes.  Shared VMOs are required I/O state and
-     * are deliberately not charged to this limit. */
-    FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT = 24,
+    /* Allocation granularity, not a limit on live shared mappings. */
+    FILED_FILE_VMO_BANK_ENTRIES = 32,
+    /* Keep the GTK/WebKit library working set reusable across processes.
+     * A 24-image limit evicts live-mapped libraries and creates physical
+     * duplicates on the next process load. The byte budget stays unchanged;
+     * shared I/O metadata grows independently. The unrelated unused-vnode LRU
+     * stays small to bound retained inactive metadata, independently of the
+     * dynamically allocated vnode registry. */
+    FILED_FILE_VMO_PINNED_SNAPSHOT_LIMIT = 96,
     FILED_FILE_VMO_MAX_BYTES = 256u * 1024u * 1024u,
     FILED_FILE_VMO_CACHE_TOTAL_BYTES = 512u * 1024u * 1024u,
     FILED_CACHE_OBJECT_SLOTS =
         FILED_PAGE_CACHE_SLOTS +
         FILED_DIR_CACHE_SLOTS +
         FILED_NEGATIVE_LOOKUP_CACHE_SLOTS +
-        FILED_RUNTIME_FILE_VMO_CACHE_SLOTS,
+        128, /* Evictable attachment hints, not the VMO registry. */
 };
 
 enum {
@@ -108,24 +110,73 @@ typedef struct filed_file_vmo_cache_entry {
     uint8_t shared;
     uint8_t writable_lent;
     uint8_t dirty;
+    uint8_t retiring;
+    uint8_t zero_on_demand;
     int vmo_fd;
     uint64_t backend_object;
     uint64_t object_generation;
     uint64_t file_offset;
     uint64_t length;
+    /* A successful grow can outlive a failed local remap. Charge the backing,
+     * not just the still usable prefix mapping, against the cache budget. */
+    uint64_t capacity;
     uint64_t logical_size;
     uint64_t clock;
     void *mapped;
+    void *retired_mapping;
+    uint64_t retired_length;
 } filed_file_vmo_cache_entry_t;
 
+static inline uint64_t filed_file_vmo_cache_bytes(const filed_file_vmo_cache_entry_t *entry)
+{
+    return entry->capacity > entry->length ? entry->capacity : entry->length;
+}
+
+typedef struct filed_file_vmo_bank {
+    struct filed_file_vmo_bank *next;
+    filed_file_vmo_cache_entry_t entries[FILED_FILE_VMO_BANK_ENTRIES];
+} filed_file_vmo_bank_t;
+
 typedef struct filed_file_vmo_cache {
-    filed_file_vmo_cache_entry_t entries[FILED_RUNTIME_FILE_VMO_CACHE_SLOTS];
+    filed_file_vmo_bank_t *banks;
     uint64_t hits;
     uint64_t misses;
     uint64_t stores;
     uint64_t evictions;
+    /* Aggregate evictions include invalidation; track successful byte-budget
+     * victims separately before attributing browser reload cost to pressure. */
+    uint64_t byte_budget_evictions;
     uint64_t clock;
 } filed_file_vmo_cache_t;
+
+/* Stable entry addresses, including while another bank is allocated. */
+typedef struct filed_file_vmo_iterator {
+    filed_file_vmo_bank_t *bank;
+    unsigned index;
+    filed_file_vmo_cache_entry_t *entry;
+} filed_file_vmo_iterator_t;
+
+static inline filed_file_vmo_iterator_t filed_file_vmo_cache_iterate(
+    filed_file_vmo_cache_t *cache)
+{
+    return (filed_file_vmo_iterator_t){
+        .bank = cache->banks,
+        .entry = cache->banks ? &cache->banks->entries[0] : NULL,
+    };
+}
+
+static inline void filed_file_vmo_cache_next(filed_file_vmo_iterator_t *it)
+{
+    if (++it->index == FILED_FILE_VMO_BANK_ENTRIES) {
+        it->bank = it->bank->next;
+        it->index = 0;
+    }
+    it->entry = it->bank ? &it->bank->entries[it->index] : NULL;
+}
+
+/* Only between operations: no caller may retain an inactive entry pointer. */
+void filed_file_vmo_cache_trim_empty_banks(filed_runtime_t *runtime);
+uint32_t filed_file_vmo_cache_reclaim_idle_shared(filed_runtime_t *runtime);
 
 typedef struct filed_cache {
     filed_cache_object_entry_t objects[FILED_CACHE_OBJECT_SLOTS];

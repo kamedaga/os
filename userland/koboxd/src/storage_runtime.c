@@ -4,6 +4,9 @@
 #include "kobox/device_pachaos_capsule.h"
 #include "kobox/shim.h"
 #include "linux_subsystem/block/block.h"
+#if defined(KOBOX_STORAGE_PAGE_DIAG) && KOBOX_STORAGE_PAGE_DIAG
+#include "linux_subsystem/kvm/kvm_symbols.h"
+#endif
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 
@@ -89,6 +92,18 @@ static int load_one_module(
     if (out_module != NULL) {
         *out_module = module;
     }
+
+#if defined(KOBOX_STORAGE_PAGE_DIAG) && KOBOX_STORAGE_PAGE_DIAG
+    void *init_address = NULL;
+    (void)kb_module_find_symbol(module, "init_module", &init_address);
+    printf("[filed-page-model] module=%s init=%p records=%p payload=%p "
+        "vmemmap=%llx directmap=%llx physical=%llx\n", name, init_address,
+        (void *)kb_linux_kvm_vmemmap_base(),
+        (void *)kb_linux_kvm_page_offset_base(),
+        (unsigned long long)kb_linux_kvm_exported_vmemmap_base(),
+        (unsigned long long)kb_linux_kvm_exported_page_offset_base(),
+        (unsigned long long)kb_linux_kvm_phys_base());
+#endif
 
     int init_result = 0;
     printf("[filed-storage] module init start name=%s module=%p\n", name, (void *)module);

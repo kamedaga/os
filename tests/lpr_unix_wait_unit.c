@@ -30,6 +30,11 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
 {
+    if (nr == PACHAOS_SYSCALL_LOG) {
+        const char *line = (void *)(uintptr_t)a0;
+        assert(a1 == 109 && !memcmp(line, "[unix] ", 7) && line[a1 - 1] == '\n');
+        return 0;
+    }
     if (nr == PACHAOS_SYSCALL_FD_GET_INFO) {
         assert(a0 == 40 && live);
         *(struct pacha_fd_info *)(uintptr_t)a1 = (struct pacha_fd_info){

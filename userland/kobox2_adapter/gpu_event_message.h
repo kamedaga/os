@@ -8,6 +8,9 @@
 enum {
     PH_GPU_DRM_EVENT_SET = KB2_GPU_DRM_CORE_SET_ID,
     PH_GPU_DRM_EVENT_READ = KB2_GPU_DRM_CORE_COMMAND_READ_EVENTS,
+    PH_GPU_FENCE_EVENT_SET = KB2_GPU_DRM_VIRTGPU_SET_ID,
+    PH_GPU_FENCE_EVENT_COMPLETE = KB2_GPU_DRM_VIRTGPU_COMMAND_EXECBUFFER,
+    PH_GPU_FENCE_RECORD_BYTES = 24,
     PH_GPU_DRM_EVENT_BYTES = KB2_GPU_DRM_CORE_MAX_EVENT_BYTES,
     PH_GPU_DRM_EVENT_HEADER_BYTES =
         KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + KB2_GPU_NOTIFY_HEADER_SIZE,
@@ -20,6 +23,7 @@ struct ph_gpu_drm_event_message {
     uint64_t sequence;
     const unsigned char *data;
     size_t data_size;
+    int fences;
 };
 
 static inline void ph_gpu_event_store_u32(unsigned char *out, uint32_t value) {
@@ -44,10 +48,11 @@ static inline uint64_t ph_gpu_event_load_u64(const unsigned char *in) {
         (uint64_t)ph_gpu_event_load_u32(in + 4) << 32u;
 }
 
-static inline int ph_gpu_drm_event_encode(unsigned char *out, size_t capacity,
+static inline int ph_gpu_event_encode(unsigned char *out, size_t capacity,
     size_t *size_out, uint64_t generation, uint64_t session_id,
-    uint64_t sequence, const unsigned char *data, size_t data_size) {
-    if (!out || !size_out || !generation || !session_id || !sequence ||
+    uint64_t sequence, const unsigned char *data, size_t data_size, int fences) {
+    if (!out || !size_out || !generation || !sequence ||
+        (fences ? session_id || data_size % PH_GPU_FENCE_RECORD_BYTES : !session_id) ||
         data_size > PH_GPU_DRM_EVENT_BYTES || (data_size && !data) ||
         capacity < PH_GPU_DRM_EVENT_HEADER_BYTES + data_size)
         return -1;
@@ -65,10 +70,10 @@ static inline int ph_gpu_drm_event_encode(unsigned char *out, size_t capacity,
         header + KB2_GPU_NOTIFY_HEADER_SESSION_ID_OFFSET, session_id);
     ph_gpu_event_store_u32(
         header + KB2_GPU_NOTIFY_HEADER_EVENT_SET_ID_OFFSET,
-        PH_GPU_DRM_EVENT_SET);
+        fences ? PH_GPU_FENCE_EVENT_SET : PH_GPU_DRM_EVENT_SET);
     ph_gpu_event_store_u32(
         header + KB2_GPU_NOTIFY_HEADER_EVENT_ID_OFFSET,
-        PH_GPU_DRM_EVENT_READ);
+        fences ? PH_GPU_FENCE_EVENT_COMPLETE : PH_GPU_DRM_EVENT_READ);
     ph_gpu_event_store_u64(
         header + KB2_GPU_NOTIFY_HEADER_EVENT_SEQUENCE_OFFSET, sequence);
     ph_gpu_event_store_u64(
@@ -83,6 +88,13 @@ static inline int ph_gpu_drm_event_encode(unsigned char *out, size_t capacity,
         memcpy(header + KB2_GPU_NOTIFY_HEADER_SIZE, data, data_size);
     *size_out = PH_GPU_DRM_EVENT_HEADER_BYTES + data_size;
     return 0;
+}
+
+static inline int ph_gpu_drm_event_encode(unsigned char *out, size_t capacity,
+    size_t *size_out, uint64_t generation, uint64_t session_id,
+    uint64_t sequence, const unsigned char *data, size_t data_size) {
+    return ph_gpu_event_encode(out, capacity, size_out, generation, session_id,
+        sequence, data, data_size, 0);
 }
 
 static inline int ph_gpu_drm_event_decode(const unsigned char *in, size_t size,
@@ -104,14 +116,19 @@ static inline int ph_gpu_drm_event_decode(const unsigned char *in, size_t size,
         header + KB2_GPU_NOTIFY_HEADER_SESSION_ID_OFFSET);
     const uint64_t sequence = ph_gpu_event_load_u64(
         header + KB2_GPU_NOTIFY_HEADER_EVENT_SEQUENCE_OFFSET);
-    if (!session_id || !sequence || payload_size > PH_GPU_DRM_EVENT_BYTES ||
+    const uint32_t event_set = ph_gpu_event_load_u32(
+        header + KB2_GPU_NOTIFY_HEADER_EVENT_SET_ID_OFFSET);
+    const uint32_t event_id = ph_gpu_event_load_u32(
+        header + KB2_GPU_NOTIFY_HEADER_EVENT_ID_OFFSET);
+    const int fences = event_set == PH_GPU_FENCE_EVENT_SET &&
+        event_id == PH_GPU_FENCE_EVENT_COMPLETE;
+    /* Fences outlive DRM sessions. Their individual records carry the
+     * submitting session/correlation; the batch belongs to the generation. */
+    if (!sequence || payload_size > PH_GPU_DRM_EVENT_BYTES ||
+        (fences ? session_id || payload_size % PH_GPU_FENCE_RECORD_BYTES :
+            !session_id || event_set != PH_GPU_DRM_EVENT_SET ||
+                event_id != PH_GPU_DRM_EVENT_READ) ||
         size != PH_GPU_DRM_EVENT_HEADER_BYTES + payload_size ||
-        ph_gpu_event_load_u32(
-            header + KB2_GPU_NOTIFY_HEADER_EVENT_SET_ID_OFFSET) !=
-                PH_GPU_DRM_EVENT_SET ||
-        ph_gpu_event_load_u32(
-            header + KB2_GPU_NOTIFY_HEADER_EVENT_ID_OFFSET) !=
-                PH_GPU_DRM_EVENT_READ ||
         ph_gpu_event_load_u64(
             header + KB2_GPU_NOTIFY_HEADER_TOPOLOGY_EPOCH_OFFSET) != 1 ||
         ph_gpu_event_load_u32(
@@ -134,6 +151,7 @@ static inline int ph_gpu_drm_event_decode(const unsigned char *in, size_t size,
         .sequence = sequence,
         .data = header + KB2_GPU_NOTIFY_HEADER_SIZE,
         .data_size = payload_size,
+        .fences = fences,
     };
     return 0;
 }

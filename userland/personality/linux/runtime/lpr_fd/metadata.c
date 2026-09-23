@@ -1,5 +1,13 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_gui_detail.h"
+#include "../support/browser_diag.h"
+#include "../support/mmap_profile.h"
+
+static void lpr_file_vmo_release_wire(int independent, int fd, void *page)
+{
+    if (independent) lpr_destroy_standalone_wire_page(fd, page);
+    else lpr_destroy_pread_vmo_wire_page(fd, page);
+}
 
 static int64_t lpr_linux_file_vmo_call(
     uint32_t op,
@@ -19,8 +27,22 @@ static int64_t lpr_linux_file_vmo_call(
         return -LPR_LINUX_EINVAL;
     }
 
+    /* start, wire/lock ready, call sent, reply received, reply closed, unlock */
+    uint64_t map_profile[6] = {lpr_map_profile_clock()};
+    /* Shared mappings can wait on other file operations for hundreds of ms.
+     * Their request/reply payload is entirely call-local; do not hold the
+     * general FileD RPC lock while waiting. Keep the private-image cache's
+     * existing wire-page policy. Endpoint setup still owns its own lock, and
+     * the mmap caller retains its normal descriptor pin and access checks. */
+    const int independent = op == FILED_OP_VFS_SHARED_FILE_VMO;
+    if (independent) {
+        const int64_t ready = lpr_filed_endpoint_ready();
+        if (ready != 0) return ready;
+    }
     void *page = 0;
-    const int page_fd = lpr_create_pread_vmo_wire_page(&page);
+    const int page_fd = independent ? lpr_create_standalone_wire_page(&page) :
+        lpr_create_pread_vmo_wire_page(&page);
+    map_profile[1] = lpr_map_profile_clock();
     if (page_fd < 0) {
         return page_fd;
     }
@@ -68,8 +90,9 @@ static int64_t lpr_linux_file_vmo_call(
         PACHAOS_SYSCALL_IPC_CALL,
         lpr_filed_client_fd,
         (uint64_t)(uintptr_t)&request);
+    map_profile[2] = lpr_map_profile_clock();
     if (call_reply_fd < 16) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return lpr_pacha_status_to_errno(call_reply_fd);
     }
 
@@ -78,9 +101,11 @@ static int64_t lpr_linux_file_vmo_call(
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)call_reply_fd,
         &reply);
+    map_profile[3] = lpr_map_profile_clock();
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)call_reply_fd);
+    map_profile[4] = lpr_map_profile_clock();
     if (recv_status != 0) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return lpr_pacha_status_to_errno(recv_status);
     }
     const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
@@ -91,22 +116,24 @@ static int64_t lpr_linux_file_vmo_call(
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return -LPR_LINUX_EIO;
     }
     if (reply_header->status < 0) {
         const int64_t status = reply_header->status;
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return status;
     }
     if (reply.fd_count != 1 || reply_fd_items[0].fd < 16) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return -LPR_LINUX_EIO;
     }
     if (out_loaded != 0) {
         *out_loaded = reply_header->result;
     }
-    lpr_destroy_pread_vmo_wire_page(page_fd, page);
+    lpr_file_vmo_release_wire(independent, page_fd, page);
+    map_profile[5] = lpr_map_profile_clock();
+    lpr_map_profile_emit("rpc", fd, length, op, map_profile);
     return (int64_t)reply_fd_items[0].fd;
 }
 
@@ -353,6 +380,7 @@ int64_t lpr_linux_close(uint64_t fd)
     if (fd > LPR_LINUX_FD_MAX || !lpr_control_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
+    lpr_browser_diag("close", fd, 0, 0);
     lpr_epoll_before_close(fd);
     lpr_fd_drop_t drop;
     if (lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd, &drop) != 0) {
@@ -363,6 +391,7 @@ int64_t lpr_linux_close(uint64_t fd)
 
 int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 {
+    lpr_browser_diag("close-range", first, last, flags);
     const uint64_t known_flags =
         LPR_LINUX_CLOSE_RANGE_UNSHARE |
         LPR_LINUX_CLOSE_RANGE_CLOEXEC;

@@ -266,6 +266,156 @@ static void test_rename_replace_and_getdents_offsets(void)
     expect_u64("getdents offset count", dents.count, 1);
 }
 
+static void test_metadata_capacity_and_reuse(void)
+{
+    static filed_tmpfs_backend_t tmpfs;
+    uint64_t root = 0, extra = 0;
+    uint64_t ids[FILED_TMPFS_MAX_INODES];
+    storage_statfs_reply_t before, full, after;
+    storage_statx_reply_t stat;
+    filed_tmpfs_backend_init(&tmpfs);
+    expect_int("capacity root", filed_tmpfs_backend_mount_root(&tmpfs, &root), 0);
+    expect_int("capacity before", filed_tmpfs_backend_statfs(&tmpfs, &before), 0);
+    /* Reserve enough distinct live objects for the observed desktop load. */
+    expect_int("desktop metadata headroom", before.files_free >= 180, 1);
+    for (uint64_t i = 0; i < before.files_free; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "capacity-%llu", (unsigned long long)i);
+        expect_int("capacity create", filed_tmpfs_backend_create(&tmpfs, root, name, 0600, &ids[i]), 0);
+    }
+    expect_int("capacity full", filed_tmpfs_backend_statfs(&tmpfs, &full), 0);
+    expect_u64("no free inodes", full.files_free, 0);
+    expect_u64("metadata does not allocate data pages", full.blocks_free, before.blocks_free);
+    expect_int("bounded exhaustion", filed_tmpfs_backend_create(&tmpfs, root, "overflow", 0600, &extra), -28);
+    for (uint64_t i = 0; i < before.files_free; ++i) {
+        char name[32];
+        snprintf(name, sizeof(name), "capacity-%llu", (unsigned long long)i);
+        expect_int("capacity unlink", filed_tmpfs_backend_unlink(&tmpfs, root, name), 0);
+        expect_int("unlinked retained until release", filed_tmpfs_backend_statx(&tmpfs, ids[i], &stat), 0);
+        expect_int("capacity release", filed_tmpfs_backend_release_object(&tmpfs, ids[i]), 0);
+        expect_int("released object stale", filed_tmpfs_backend_statx(&tmpfs, ids[i], &stat), -2);
+    }
+    expect_int("capacity after", filed_tmpfs_backend_statfs(&tmpfs, &after), 0);
+    expect_u64("all inodes recovered", after.files_free, before.files_free);
+    expect_int("reuse after exhaustion", filed_tmpfs_backend_create(&tmpfs, root, "reuse", 0600, &extra), 0);
+    expect_int("old generation remains stale", filed_tmpfs_backend_statx(&tmpfs, ids[before.files_free - 1], &stat), -2);
+}
+
+static void test_zero_writes_preserve_holes(void)
+{
+    static filed_tmpfs_backend_t tmpfs;
+    uint64_t root = 0, file = 0, bytes = 0;
+    unsigned char zeros[FILED_TMPFS_PAGE_BYTES] = {0};
+    unsigned char readback[FILED_TMPFS_PAGE_BYTES];
+    storage_statx_reply_t stat;
+    const uint64_t length = 24u * 1024u * 1024u;
+    filed_tmpfs_backend_init(&tmpfs);
+    expect_int("zero root", filed_tmpfs_backend_mount_root(&tmpfs, &root), 0);
+    expect_int("zero file", filed_tmpfs_backend_create(&tmpfs, root, "zero", 0600, &file), 0);
+    const uint32_t free_before = tmpfs.free_page_count;
+    for (uint64_t offset = 0; offset < length; offset += sizeof(zeros)) {
+        int status = filed_tmpfs_backend_pwrite(&tmpfs, file, offset, zeros, sizeof(zeros), &bytes);
+        if (status) { expect_int("zero write beyond pool capacity", status, 0); break; }
+        expect_u64("zero write bytes", bytes, sizeof(zeros));
+    }
+    expect_u64("zero writes do not consume backing", tmpfs.free_page_count, free_before);
+    expect_int("zero stat", filed_tmpfs_backend_statx(&tmpfs, file, &stat), 0);
+    expect_u64("zero logical size", stat.size, length);
+    expect_u64("zero allocated blocks", stat.blocks, 0);
+    expect_int("zero tail read", filed_tmpfs_backend_pread(&tmpfs, file,
+        length - sizeof(readback), readback, sizeof(readback), &bytes), 0);
+    expect_u64("zero tail bytes", bytes, sizeof(readback));
+    expect_bytes("zero tail contents", readback, zeros, sizeof(zeros));
+    expect_int("zero nonzero write", filed_tmpfs_backend_pwrite(&tmpfs, file, 10, "abc", 3, &bytes), 0);
+    expect_int("zero partial overwrite", filed_tmpfs_backend_pwrite(&tmpfs, file, 11, zeros, 1, &bytes), 0);
+    expect_int("zero neighbors read", filed_tmpfs_backend_pread(&tmpfs, file, 10, readback, 3, &bytes), 0);
+    expect_bytes("zero preserves neighbors", readback, (const unsigned char *)"a\0c", 3);
+    expect_u64("zero partial allocates only data page", tmpfs.free_page_count, free_before - 1);
+    expect_int("zero partial hole extends", filed_tmpfs_backend_pwrite(&tmpfs, file,
+        length + 17, zeros, 5, &bytes), 0);
+    expect_int("zero extended stat", filed_tmpfs_backend_statx(&tmpfs, file, &stat), 0);
+    expect_u64("zero partial logical size", stat.size, length + 22);
+    expect_u64("zero partial hole remains sparse", tmpfs.free_page_count, free_before - 1);
+}
+
+static void test_multiple_large_files_reclaim_pages(void)
+{
+    static filed_tmpfs_backend_t tmpfs;
+    enum { PAGES_PER_FILE = 5120, FILES = 2 };
+    unsigned char page[FILED_TMPFS_PAGE_BYTES];
+    unsigned char readback[FILED_TMPFS_PAGE_BYTES];
+    uint64_t files[FILES] = {0}, bytes;
+    filed_tmpfs_backend_init(&tmpfs);
+    const uint32_t initial_free = tmpfs.free_page_count;
+    for (unsigned i = 0; i < FILED_TMPFS_PAGE_POOL_PAGES; ++i)
+        expect_int("no backing allocation at init", tmpfs.pages[i].data == NULL, 1);
+    if (initial_free < PAGES_PER_FILE * FILES) {
+        expect_int("two 20 MiB files fit the tmpfs budget", 0, 1);
+        return;
+    }
+    uint64_t root = filed_tmpfs_backend_root_object(&tmpfs);
+    for (unsigned f = 0; f < FILES; ++f) {
+        expect_int("large concurrent create", filed_tmpfs_backend_create(
+            &tmpfs, root, f ? "second" : "first", 0600, &files[f]), 0);
+        memset(page, 0x51 + f, sizeof(page));
+        for (unsigned i = 0; i < PAGES_PER_FILE; ++i) {
+            int status = filed_tmpfs_backend_pwrite(
+                &tmpfs, files[f], (uint64_t)i * sizeof(page), page, sizeof(page), &bytes);
+            expect_int("large concurrent write", status, 0);
+            if (status) goto reclaim;
+            expect_u64("large concurrent write size", bytes, sizeof(page));
+        }
+        expect_int("large concurrent read", filed_tmpfs_backend_pread(
+            &tmpfs, files[f], (PAGES_PER_FILE - 1) * sizeof(page), readback, sizeof(readback), &bytes), 0);
+        expect_bytes("large concurrent data", readback, page, sizeof(page));
+    }
+    expect_u64("only actual pages charged", tmpfs.free_page_count,
+        initial_free - PAGES_PER_FILE * FILES);
+    /* Drop the newer head entries and retain the older tail, then reuse
+     * returned pool slots without exposing bytes from the other inode. */
+    expect_int("large partial truncate", filed_tmpfs_backend_truncate(
+        &tmpfs, files[0], FILED_TMPFS_PAGE_BYTES + 7), 0);
+    expect_int("large partial read", filed_tmpfs_backend_pread(
+        &tmpfs, files[0], FILED_TMPFS_PAGE_BYTES, readback, 7, &bytes), 0);
+    memset(page, 0x51, sizeof(page));
+    expect_bytes("large retained tail", readback, page, 7);
+reclaim:
+    for (unsigned f = 0; f < FILES; ++f)
+        if (files[f]) expect_int("large concurrent truncate", filed_tmpfs_backend_truncate(&tmpfs, files[f], 0), 0);
+    expect_u64("all backing pages reclaimed", tmpfs.free_page_count, initial_free);
+    for (unsigned i = 0; i < FILED_TMPFS_PAGE_POOL_PAGES; ++i)
+        expect_int("no retained page after truncate", tmpfs.pages[i].used, 0);
+    for (unsigned i = 0; i < FILED_TMPFS_PAGE_POOL_PAGES; ++i)
+        expect_int("backing memory freed after truncate", tmpfs.pages[i].data == NULL, 1);
+}
+
+static void test_copy_present_leaves_holes_untouched(void)
+{
+    static filed_tmpfs_backend_t tmpfs;
+    uint64_t root = 0, file = 0, bytes = 0;
+    unsigned char imported[3 * FILED_TMPFS_PAGE_BYTES + 7];
+    filed_tmpfs_backend_init(&tmpfs);
+    expect_int("import mount", filed_tmpfs_backend_mount_root(&tmpfs, &root), 0);
+    expect_int("import create", filed_tmpfs_backend_create(&tmpfs, root, "sparse", 0644, &file), 0);
+    expect_int("import first page", filed_tmpfs_backend_pwrite(&tmpfs, file, 3, "abc", 3, &bytes), 0);
+    expect_int("import last page", filed_tmpfs_backend_pwrite(&tmpfs, file, sizeof(imported) - 2, "xy", 2, &bytes), 0);
+    const uint32_t free_before = tmpfs.free_page_count;
+    /* Sentinel holes prove no read/zero/write of those destination pages. */
+    memset(imported, 0xa5, sizeof(imported));
+    expect_int("import present", filed_tmpfs_backend_copy_present(&tmpfs, file, imported, sizeof(imported)), 0);
+    expect_bytes("import first bytes", imported + 3, (const unsigned char *)"abc", 3);
+    expect_bytes("import last bytes", imported + sizeof(imported) - 2, (const unsigned char *)"xy", 2);
+    expect_int("import allocated page zeros", imported[0], 0);
+    expect_int("import last partial page zeros", imported[3 * FILED_TMPFS_PAGE_BYTES], 0);
+    for (size_t i = FILED_TMPFS_PAGE_BYTES; i < 3 * FILED_TMPFS_PAGE_BYTES; ++i)
+        expect_int("import hole untouched", imported[i], 0xa5);
+    expect_u64("import no backend allocation", tmpfs.free_page_count, free_before);
+    expect_int("import rejects directory", filed_tmpfs_backend_copy_present(&tmpfs, root, imported, 1), -22);
+    expect_int("import rejects past EOF", filed_tmpfs_backend_copy_present(&tmpfs, file, imported, sizeof(imported) + 1), -22);
+    expect_int("import cleanup", filed_tmpfs_backend_truncate(&tmpfs, file, 0), 0);
+    expect_u64("import pages freed", tmpfs.free_page_count, free_before + 2);
+}
+
 int main(void)
 {
     test_create_sparse_truncate_release();
@@ -274,6 +424,10 @@ int main(void)
     test_executable_sized_file();
     test_backend_instances_are_isolated();
     test_rename_replace_and_getdents_offsets();
+    test_metadata_capacity_and_reuse();
+    test_zero_writes_preserve_holes();
+    test_multiple_large_files_reclaim_pages();
+    test_copy_present_leaves_holes_untouched();
     if (failures != 0) {
         return 1;
     }

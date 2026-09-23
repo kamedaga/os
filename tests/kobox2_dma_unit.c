@@ -16,12 +16,29 @@
 static struct pacha_capsule_info device;
 static long query_result = 11, derive_result = 100, close_result, enable_result;
 static long view_result = VIEW_FD, mmap_result = VIEW;
+static long table_result, view_close_result;
+static unsigned int failure_logs, table_queries;
+static char failure_log[384];
 static unsigned int calls, enables, last_enabled, munmaps, page_views;
 static uint64_t last_address, last_iova, last_length, last_direction;
 static jmp_buf fatal_jump;
 static int expect_fatal;
 
 void ph_log(const char *text) {
+    if (!strncmp(text, "PH_DMA_ERROR stage=", 19)) {
+        assert(strlen(text) < sizeof(failure_log));
+        assert(text[strlen(text) - 1] == '\n');
+        strcpy(failure_log, text);
+        ++failure_logs;
+        return;
+    }
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+    if (!strncmp(text, "PH_DMA ", 7)) {
+        assert(strlen(text) < 256 && text[strlen(text) - 1] == '\n');
+        assert(strstr(text, " direction=0x") && strstr(text, " count=0x"));
+        return;
+    }
+#endif
     assert(!strcmp(text, "kobox DMA: mapping table exhausted\n"));
 }
 
@@ -41,13 +58,14 @@ long pacha_syscall3(uint64_t nr, uint64_t fd, uint64_t out, uint64_t words) {
 long pacha_syscall2(uint64_t nr, uint64_t first, uint64_t second) {
     ++calls;
     if (nr == PACHA_FD_SYSCALL_TABLE) {
-        assert(first == PACHA_FD_TABLE_LIMIT);
+        assert(first == 0 || first == PACHA_FD_TABLE_LIMIT);
+        if (!first) ++table_queries;
         *(struct pacha_fd_table_info *)(uintptr_t)second =
             (struct pacha_fd_table_info) {
                 .capacity = PACHA_FD_TABLE_LIMIT,
                 .free_slots = PACHA_FD_TABLE_LIMIT,
             };
-        return 0;
+        return first ? 0 : table_result;
     }
     if (nr == PACHA_VM_SYSCALL_MUNMAP) {
         assert(first == VIEW && second == last_length);
@@ -91,7 +109,7 @@ long pacha_syscall1(uint64_t nr, uint64_t fd) {
     ++calls;
     if (fd == VIEW_FD) {
         assert(nr == PACHA_FD_SYSCALL_CLOSE);
-        return 0;
+        return view_close_result;
     }
     assert(nr == PACHA_FD_SYSCALL_CLOSE && fd == 100);
     return close_result;
@@ -103,11 +121,13 @@ int main(void) {
     struct ph_dma_config config = {
         .device_fd = DEVICE_FD, .native_device = 42, .generation = 7,
         .ram = (void *)RAM, .ram_fd = RAM_FD, .ram_length = 0x10000,
-        .aperture_start = IOVA, .aperture_end = IOVA + 0xffff,
+        /* Input values are not authority; init must use the native query. */
+        .aperture_start = 1, .aperture_end = 2,
         .mappings = mappings, .mapping_capacity = 2,
     };
     device = (struct pacha_capsule_info){
         .kind = PACHA_CAPSULE_KIND_DEVICE, .device = 42,
+        .iova = IOVA, .size = 0x10000,
         .flags = PACHA_CAPSULE_DMA_TRANSLATED,
         .rights = PACHA_FD_RIGHT_QUERY | PACHA_FD_RIGHT_DERIVE_DMA |
             PACHA_FD_RIGHT_DMA_READ | PACHA_FD_RIGHT_DMA_WRITE | PACHA_FD_RIGHT_BUS_MASTER,
@@ -126,6 +146,10 @@ int main(void) {
         assert(!host->enable(&dma, 0) && !dma.enabled && dma.drained);
         assert(mappings[0].length == 8192); /* Disable retains mapping ownership. */
         assert(!host->unmap(&dma, IOVA, 8192));
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+        assert(dma.profile_counts[0][protection - 1][1][0] == 1);
+        assert(dma.profile_counts[1][protection - 1][1][0] == 1);
+#endif
     }
     const uint64_t pages[] = {1, 3, 15};
     assert(!host->map_page_list(&dma, IOVA, pages, 3, 3));
@@ -172,9 +196,51 @@ int main(void) {
     assert(host->map(&dma, IOVA + 8192, 0, 4096, 1) == -ENOSPC);
     close_result = PACHA_SYSCALL_ERR_MAP;
     assert(host->unmap(&dma, IOVA, 4096) == -EIO && mappings[0].fd == 100);
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+    assert(dma.profile_counts[0][2][0][0] == 2);
+    assert(dma.profile_counts[1][2][0][0] == 1);
+#endif
     close_result = 0;
     assert(!host->unmap(&dma, IOVA, 4096));
     assert(!host->unmap(&dma, IOVA + 4096, 4096));
+
+    /* Successful and rejected-input paths do not query or log diagnostics. */
+    assert(!failure_logs && !table_queries);
+    view_result = PACHA_SYSCALL_ERR_ALLOC;
+    assert(host->map_page_list(&dma, IOVA, pages, 3, 3) == -ENOMEM);
+    assert(failure_logs == 1 && table_queries == 1);
+    assert(strstr(failure_log, "stage=page-view "));
+    assert(strstr(failure_log, " native=0x0000000000000003 "));
+    assert(strstr(failure_log, " bytes=0x0000000000003000 "));
+    assert(!mappings[0].length && munmaps == 1);
+    view_result = VIEW_FD;
+    mmap_result = PACHA_SYSCALL_ERR_ALLOC;
+    assert(host->map_page_list(&dma, IOVA, pages, 3, 3) == -ENOMEM);
+    assert(strstr(failure_log, "stage=view-mmap "));
+    assert(!mappings[0].length && munmaps == 1);
+    mmap_result = VIEW;
+    view_close_result = PACHA_SYSCALL_ERR_MAP;
+    assert(host->map_page_list(&dma, IOVA, pages, 3, 3) == -EIO);
+    assert(strstr(failure_log, "stage=view-close "));
+    assert(!mappings[0].length && munmaps == 2);
+    view_close_result = 0;
+    assert(!host->map(&dma, IOVA + 0x4000, 0, 4096, 3));
+    derive_result = PACHA_SYSCALL_ERR_ALLOC;
+    assert(host->map_page_list(&dma, IOVA, pages, 3, 3) == -ENOMEM);
+    assert(strstr(failure_log, "stage=scattered-map "));
+    assert(strstr(failure_log, " mappings=0x0000000000000001 "));
+    assert(strstr(failure_log, " mapping_bytes=0x0000000000001000 "));
+    assert(!mappings[1].length && munmaps == 3);
+    assert(!host->unmap(&dma, IOVA + 0x4000, 4096));
+    table_result = PACHA_SYSCALL_ERR_INVALID;
+    assert(host->map(&dma, IOVA, 0, 4096, 3) == -ENOMEM);
+    assert(strstr(failure_log, "stage=direct-map "));
+    assert(strstr(failure_log, " fd_status=0x0000000000000001 "));
+    assert(strstr(failure_log, " fd_capacity=0x0000000000000000 "));
+    assert(strstr(failure_log, " fd_free=0x0000000000000000\n"));
+    assert(!mappings[0].length);
+    assert(failure_logs == 5 && table_queries == 5);
+    table_result = 0;
 
     const long errors[] = {0, 1, 2, 3, 4, 5, 6, PACHA_FD_TABLE_LIMIT};
     for (size_t i = 0; i < sizeof(errors) / sizeof(errors[0]); ++i) {
@@ -216,6 +282,17 @@ int main(void) {
     device.device = 43;
     assert(ph_dma_init(&dma, &config) == -ENODEV);
     device.device = 42;
+    device.size = 0;
+    before = enables;
+    assert(ph_dma_init(&dma, &config) == -ERANGE && enables == before);
+    device.size = 0x10001;
+    assert(ph_dma_init(&dma, &config) == -ERANGE && enables == before);
+    device.size = 0x10000;
+    device.iova = UINT64_MAX - 4095;
+    assert(ph_dma_init(&dma, &config) == -ERANGE && enables == before);
+    device.iova = IOVA + 1;
+    assert(ph_dma_init(&dma, &config) == -ERANGE && enables == before);
+    device.iova = IOVA;
     config.ram = (void *)(UINTPTR_MAX - 4095);
     assert(ph_dma_init(&dma, &config) == -EINVAL);
     puts("kobox2 DMA native-call/ownership unit: PASS");

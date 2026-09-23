@@ -52,7 +52,7 @@ static void log_text(const char *text)
 
 static void log_number(uint64_t value)
 {
-    char text[19] = "0x0000000000000000\n";
+    char text[20] = "0x0000000000000000\n";
     for (unsigned i = 0; i < 16; i++)
         text[17 - i] = "0123456789abcdef"[(value >> (4 * i)) & 15];
     log_text(text);

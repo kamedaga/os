@@ -1251,7 +1251,23 @@ static int filed_dispatch_client(
         memcpy(&snapshot, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot));
         void *payload = &snapshot;
         status = filed_client_authorize(runtime, header.op, payload, sizeof(snapshot), 0);
-        if (status) break;
+        if (status) {
+            const filed_handle_t *source = NULL;
+            for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i) {
+                if (filed_vfs_handle_at(&runtime->vfs, i)->active && filed_vfs_handle_at(&runtime->vfs, i)->id == snapshot.handle) {
+                    source = filed_vfs_handle_at(&runtime->vfs, i);
+                    break;
+                }
+            }
+            fprintf(stderr,
+                "[filed-transfer-diag] stage=authorize source=%llu status=%lld "
+                "client=%llu owner=%llu present=%u\n",
+                (unsigned long long)snapshot.handle, (long long)status,
+                (unsigned long long)(runtime->actor ? runtime->actor->id : 0),
+                (unsigned long long)(source ? source->owner_client : 0),
+                source != NULL);
+            break;
+        }
         const int lease_fd = (int)(uint32_t)request->fds[1].fd;
         struct pacha_fd_info lease_info;
         const uint64_t lease_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_RECV |
@@ -1280,9 +1296,9 @@ static int filed_dispatch_client(
             if (lease_status == FILED_OK) {
                 keep_fd = lease_fd;
                 /* Not usable by number until its lease capability names a recipient. */
-                for (unsigned i = 0; i < FILED_MAX_HANDLES; i++)
-                    if (runtime->vfs.handles[i].active && runtime->vfs.handles[i].id == result)
-                        runtime->vfs.handles[i].owner_client = 0;
+                for (unsigned i = 0; i < runtime->vfs.handle_capacity; i++)
+                    if (filed_vfs_handle_at(&runtime->vfs, i)->active && filed_vfs_handle_at(&runtime->vfs, i)->id == result)
+                        filed_vfs_handle_at(&runtime->vfs, i)->owner_client = 0;
             } else {
                 fprintf(stderr,
                     "[filed-transfer-diag] stage=lease source=%llu duplicate=%llu status=%d leases=%u\n",

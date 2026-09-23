@@ -534,6 +534,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
     const instruction_fetch = (ec & (1 << 4)) != 0;
     if (!user_vm.lockAddressSpace(principal)) return 0;
     defer user_vm.unlockAddressSpace(principal);
+    user_vm.reclaimEmptyUserPtSlotsForFaultWithAddressSpaceLocked(principal, fault_page_va);
     if (write_access) {
         const cow_mapping = user_copy.resolveNativeVmaCowMappingWithAddressSpaceLocked(
             kernel_runtime.kernel_state_global,
@@ -716,6 +717,7 @@ pub export fn fatalUserTrapDispatch(vec: u64, frame: *const TrapFrame) callconv(
         else => "TRAP",
     };
     writeTrapSummary(label, frame);
+    if (vec == 3) page_fault_log.logUserTrapStack(frame);
     kernel_log.write("  ACTION=terminate process\n");
     resumeAfterFatalUserException(
         scheduler.currentPrincipal(),

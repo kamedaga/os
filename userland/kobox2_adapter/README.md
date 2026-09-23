@@ -9,7 +9,7 @@ LinuxのGateの合格条件・期限は変更しない。
 
 | 担当 | 実装 |
 | --- | --- |
-| RAM・image・共有alias | `image.c`: 256 MiB RAM VMO、direct/vmemmap/vmalloc予約、共有MAP_FIXED、ELF再配置、TLS |
+| RAM・image・共有alias | `image.c`: 384 MiB RAM VMO、direct/vmemmap/vmalloc予約、共有MAP_FIXED、ELF再配置、TLS |
 | native thread・通知 | `native.c`, `entry.S`: thread FD、FS base、通知入口とframeの復帰 |
 | freestanding補助処理 | `runtime.c`: launcher自己再配置、文字列・ログ、nativeメモリ確保、futex待機 |
 | logical CPU・clockevent | `machine.c`: 共通`machine/domain.c`の所有権・IRQ状態、native timerfd/非同期通知 |

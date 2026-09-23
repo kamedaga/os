@@ -13,7 +13,9 @@ var runtime_storage: [kernel.runtimeStorageBytes()]u8 align(4096) = undefined;
 
 fn initState() !KernelState {
     try std.testing.expect(kernel.initRuntimeStorage(runtime_storage[0..]));
-    return KernelState.initFromDetectedRegions(1);
+    var state: KernelState = undefined;
+    try state.initFromDetectedRegionsInPlace(1);
+    return state;
 }
 
 fn rights(comptime fields: anytype) kernel.FdRights {

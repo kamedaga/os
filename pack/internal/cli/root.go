@@ -65,6 +65,7 @@ packaging, image sync, QEMU, and test tasks.`,
 	}
 	cmd.SetHelpTemplate(helpTemplate)
 	cmd.AddCommand(planCommand(ctx))
+	cmd.AddCommand(auditCommand(ctx))
 	cmd.AddCommand(appCommand(ctx))
 	cmd.AddCommand(buildCommand(ctx))
 	cmd.AddCommand(genCommand(ctx))

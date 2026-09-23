@@ -10,6 +10,7 @@ set(FILED_PROFILE_CFLAGS "$ENV{PACHAOS_FILED_EXTRA_CFLAGS}")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
 set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/source")
 set(FILED_DISPATCH_SHARDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/metric_clock.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/unix_path.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/metrics.c"

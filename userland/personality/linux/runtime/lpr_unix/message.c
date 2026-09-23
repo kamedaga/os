@@ -1,4 +1,5 @@
 #include "socket.h"
+#include "diagnostic.h"
 #include "../lpr_filed_internal.h"
 #include <errno.h>
 
@@ -35,6 +36,10 @@ int64_t lpr_unix_socket_message(uint64_t fd, uint64_t raw, uint64_t flags, int w
     uint32_t returned_flags = 0;
     result = lpr_unix_socket_message_iov(&pin, message.vectors, message.vector_count,
         writing, flags, &returned_flags, &ancillary);
+    /* Include credential truncation and identify the Linux FD, even when
+     * recvmsg succeeds. No logging/counters on the normal receive path. */
+    if (!writing && result >= 0 && (returned_flags & 8u))
+        lpr_unix_diag('E', fd, 110, ancillary.capacity, ancillary.used);
     if (!writing && result >= 0) {
         struct unix_linux_message *out = (void *)(uintptr_t)raw;
         if (datagram && message.name && ancillary.address.kind != UNIX_ADDRESS_UNNAMED) {

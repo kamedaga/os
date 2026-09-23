@@ -399,6 +399,9 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
     switch (view.payload.*) {
         .device => |device| {
             words[capsule_abi.snapshot_device_index] = device.device;
+            const window = vtd.deviceIovaWindow(device.device);
+            words[capsule_abi.snapshot_iova_index] = window.start;
+            words[capsule_abi.snapshot_size_index] = window.size;
             words[capsule_abi.snapshot_index_index] =
                 pci.interruptVectorBaseForResourceId(device.device) orelse 0;
             words[capsule_abi.snapshot_flags_index] = vtd.dmaSnapshotFlags(device.device);

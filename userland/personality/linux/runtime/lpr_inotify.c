@@ -1,4 +1,6 @@
 #include "lpr_filed_internal.h"
+#include "lpr_fd/allocate.h"
+#include "support/browser_diag.h"
 
 #define LPR_INOTIFY_INSTANCE_BYTES (64ull * 1024ull)
 #define LPR_INOTIFY_INSTANCE_MAGIC 0x31594649544f4e49ull
@@ -250,8 +252,6 @@ int64_t lpr_linux_inotify_init1(uint64_t flags)
     if ((flags & ~(LPR_LINUX_O_CLOEXEC | LPR_LINUX_O_NONBLOCK)) != 0) {
         return -LPR_LINUX_EINVAL;
     }
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) return fd;
     const int64_t mapped = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_MMAP,
         0,
@@ -285,38 +285,24 @@ int64_t lpr_linux_inotify_init1(uint64_t flags)
             LPR_INOTIFY_INSTANCE_BYTES);
         return lpr_pacha_status_to_errno(timer_fd);
     }
-    const int install_status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_EVENT,
-        flags,
-        0,
-        (uint64_t)(uintptr_t)instance);
-    if (install_status != 0) {
+    const lpr_event_backend_t record = {
+        .active = 1, .subtype = LPR_EVENT_BACKEND_INOTIFY,
+        .flags = (uint32_t)flags,
+        .counter = (uint64_t)(uintptr_t)instance,
+        .deadline_ns = LPR_INOTIFY_INSTANCE_BYTES,
+        .wait_fd.raw = (int32_t)timer_fd, .notify_fd.raw = -1,
+    };
+    const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EVENT, flags,
+        (uint64_t)(uintptr_t)instance, &record, sizeof(record));
+    lpr_browser_diag("inotify-create", fd, timer_fd, (uint64_t)(uintptr_t)instance);
+    if (fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)timer_fd);
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,
             (uint64_t)(uintptr_t)instance,
             LPR_INOTIFY_INSTANCE_BYTES);
-        return install_status;
+        return fd;
     }
-    lpr_event_backend_t *event =
-        lpr_event_backend((uint64_t)(uint32_t)fd);
-    if (event == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)timer_fd);
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)instance,
-            LPR_INOTIFY_INSTANCE_BYTES);
-        return -LPR_LINUX_EIO;
-    }
-    event->active = 1;
-    event->subtype = LPR_EVENT_BACKEND_INOTIFY;
-    event->flags = (uint32_t)flags;
-    event->counter = (uint64_t)(uintptr_t)instance;
-    event->deadline_ns = LPR_INOTIFY_INSTANCE_BYTES;
-    event->wait_fd.raw = (int32_t)timer_fd;
-    event->notify_fd.raw = -1;
     return fd;
 }
 

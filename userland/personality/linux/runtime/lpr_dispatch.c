@@ -7,6 +7,7 @@
 #include "lpr_vfs_local.h"
 #include "support/string.h"
 #include "support/syscall.h"
+#include "support/mmap_profile.h"
 #include <pacha/ipc.h>
 #include <pacha/status.h>
 #include <pacha/trace.h>
@@ -36,7 +37,13 @@
 #define LPR_LINUX_FUTEX_WAIT 0ull
 #define LPR_LINUX_FUTEX_WAKE 1ull
 #define LPR_LINUX_FUTEX_REQUEUE 3ull
+#define LPR_LINUX_FUTEX_LOCK_PI 6ull
+#define LPR_LINUX_FUTEX_UNLOCK_PI 7ull
+#define LPR_LINUX_FUTEX_TRYLOCK_PI 8ull
 #define LPR_LINUX_FUTEX_WAIT_BITSET 9ull
+#define LPR_LINUX_FUTEX_WAIT_REQUEUE_PI 11ull
+#define LPR_LINUX_FUTEX_CMP_REQUEUE_PI 12ull
+#define LPR_LINUX_FUTEX_LOCK_PI2 13ull
 #define LPR_LINUX_FUTEX_PRIVATE_FLAG 128ull
 #define LPR_LINUX_FUTEX_CLOCK_REALTIME 256ull
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status);
@@ -564,6 +571,36 @@ static char *lpr_mmap_diag_append_i64(
     }
     return lpr_mmap_diag_append_u64(out, end, magnitude);
 }
+
+#if defined(LPR_VM_ORIGIN_DIAG) && LPR_VM_ORIGIN_DIAG
+/* Sparse origin samples, not a per-PID total: fork inherits the sampling
+ * ordinal. One atomic increment per Linux mmap/munmap; no clocks or gettid.
+ * Native IPC helper mappings do not pass here. Never dereference user RIP. */
+static void lpr_vm_origin_diag(uint64_t nr, const struct lpr_linux_user_frame *frame,
+    uint64_t length, uint64_t flags, uint64_t fd, int64_t result)
+{
+    static uint64_t counts[2][5];
+    if (nr != LPR_LINUX_SYS_MMAP && nr != LPR_LINUX_SYS_MUNMAP) return;
+    const unsigned op = nr == LPR_LINUX_SYS_MUNMAP;
+    const unsigned bucket = length <= 4096 ? 0 : length <= 16384 ? 1 :
+        length <= 262144 ? 2 : length <= 4194304 ? 3 : 4;
+    const uint64_t count = __atomic_add_fetch(&counts[op][bucket], 1, __ATOMIC_RELAXED);
+    if (count < 256 || (count & (count - 1)) != 0) return;
+    char line[320];
+    char *out = line;
+    const char *end = line + sizeof(line) - 1;
+    const char *keys[] = { "LPR_VM_SAMPLE pid=", " nr=", " bucket=", " ordinal=",
+        " rip=", " len=", " flags=", " fd=", " result=" };
+    const uint64_t values[] = { (uint64_t)lpr_linux_current_pid, nr, bucket, count,
+        frame ? frame->rip : 0, length, op ? 0 : flags, op ? 0 : fd, (uint64_t)result };
+    for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+        out = lpr_mmap_diag_append_text(out, end, keys[i]);
+        out = lpr_mmap_diag_append_u64(out, end, values[i]);
+    }
+    *out++ = '\n';
+    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG, (uint64_t)(uintptr_t)line, out - line);
+}
+#endif
 
 #if defined(LPR_MMAP_IMAGE_DIAG) && LPR_MMAP_IMAGE_DIAG
 static void lpr_mmap_image_diag(
@@ -1962,6 +1999,24 @@ void lpr_file_image_cache_clear(void)
     lpr_state_unlock(&lpr_file_image_cache_lock);
 }
 
+void lpr_file_image_cache_drop_handle(uint64_t handle)
+{
+    if (handle == 0) return;
+    lpr_state_lock(&lpr_file_image_cache_lock);
+    for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
+        lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
+        if (!entry->active || entry->handle != handle) continue;
+        /* The cache is keyed by the open handle, not by path. Once closed,
+         * this key cannot be reused. VMAs retain their own backing references;
+         * close only our optional descriptor, never revoke or unmap it. */
+        if (entry->vmo_fd >= 16) {
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, entry->vmo_fd);
+        }
+        lpr_memset(entry, 0, sizeof(*entry));
+    }
+    lpr_state_unlock(&lpr_file_image_cache_lock);
+}
+
 void lpr_file_image_cache_pause(void)
 {
     lpr_state_lock(&lpr_file_image_cache_lock);
@@ -2178,8 +2233,7 @@ static int64_t lpr_map_private_file_image(
     uint64_t offset)
 {
     if (file_map_len == map_len) {
-        return lpr_pacha_syscall6(
-            PACHAOS_SYSCALL_MMAP,
+        return lpr_drm_native_mmap(
             vmo_fd,
             addr,
             map_len,
@@ -2189,8 +2243,7 @@ static int64_t lpr_map_private_file_image(
     }
     const uint64_t reservation_flags =
         (map_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED;
-    const int64_t reservation = lpr_pacha_syscall6(
-        PACHAOS_SYSCALL_MMAP,
+    const int64_t reservation = lpr_drm_native_mmap(
         0,
         addr,
         map_len,
@@ -2203,8 +2256,7 @@ static int64_t lpr_map_private_file_image(
     const uint64_t prefix_flags =
         ((map_flags | PACHAOS_MMAP_FIXED | PACHAOS_MMAP_PRIVATE) &
          ~(PACHAOS_MMAP_SHARED | PACHAOS_MMAP_FIXED_NOREPLACE));
-    const int64_t prefix = lpr_pacha_syscall6(
-        PACHAOS_SYSCALL_MMAP,
+    const int64_t prefix = lpr_drm_native_mmap(
         vmo_fd,
         (uint64_t)reservation,
         file_map_len,
@@ -2231,7 +2283,11 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             lpr_linux_prot_to_pacha(prot), pacha_flags, offset);
     }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_drm_fd_active(fd)) {
-        return lpr_drm_mmap(fd, addr, len, lpr_linux_prot_to_pacha(prot), pacha_flags, offset);
+        const int64_t mapped = lpr_drm_mmap(fd, addr, len,
+            lpr_linux_prot_to_pacha(prot), pacha_flags, offset);
+        if (mapped < 0)
+            lpr_trace_mmap_error("drm", addr, len, prot, flags, fd, offset, mapped);
+        return mapped;
     }
     if ((flags & LPR_LINUX_MAP_ANONYMOUS) == 0 && lpr_linux_filed_fd_active(fd)) {
         if ((offset & 4095ull) != 0) {
@@ -2253,6 +2309,9 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             return -LPR_LINUX_ENOMEM;
         }
         if ((flags & LPR_LINUX_MAP_SHARED) != 0) {
+            /* start, VMO RPC complete, native map complete, close complete.
+             * The last two repeated stamps keep one fixed diagnostic format. */
+            uint64_t map_profile[6] = {lpr_map_profile_clock()};
             uint64_t file_size = 0;
             /* The shared VMO's transferred rights are the lifetime ceiling
              * for mprotect, not merely the initial PTE protection.  Derive
@@ -2271,6 +2330,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 writable,
                 executable,
                 &file_size);
+            map_profile[1] = lpr_map_profile_clock();
             (void)file_size;
             if (shared_vmo_fd < 16) {
                 lpr_trace_mmap_error(
@@ -2284,17 +2344,20 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                     shared_vmo_fd);
                 return shared_vmo_fd;
             }
-            const int64_t mapped = lpr_pacha_syscall6(
-                PACHAOS_SYSCALL_MMAP,
+            const int64_t mapped = lpr_drm_native_mmap(
                 (uint64_t)(uint32_t)shared_vmo_fd,
                 addr,
                 map_len,
                 lpr_linux_prot_to_pacha(prot),
                 pacha_flags,
                 offset);
+            map_profile[2] = lpr_map_profile_clock();
             (void)lpr_pacha_syscall1(
                 PACHAOS_SYSCALL_FD_CLOSE,
                 (uint64_t)(uint32_t)shared_vmo_fd);
+            map_profile[3] = lpr_map_profile_clock();
+            map_profile[4] = map_profile[5] = map_profile[3];
+            lpr_map_profile_emit("shared", fd, len, flags, map_profile);
             if (mapped < 4096) {
                 lpr_trace_mmap_error(
                     "shared_mmap",
@@ -2383,8 +2446,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             lpr_startup_profile_mmap_route(
                 LPR_STARTUP_MMAP_ROUTE_PAST_FILE_IMAGE);
             profile_stage = lpr_startup_profile_stage_begin();
-            mapped = lpr_pacha_syscall6(
-                PACHAOS_SYSCALL_MMAP,
+            mapped = lpr_drm_native_mmap(
                 0,
                 addr,
                 map_len,
@@ -2576,8 +2638,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         }
         lpr_trace_mmap_load(len, done, prot, flags, fd, offset);
         profile_stage = lpr_startup_profile_stage_begin();
-        mapped = lpr_pacha_syscall6(
-            PACHAOS_SYSCALL_MMAP,
+        mapped = lpr_drm_native_mmap(
             (uint64_t)(uint32_t)vmo_fd,
             addr,
             map_len,
@@ -2590,8 +2651,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         if (mapped < 4096) {
             lpr_trace_mmap_error("direct_vmo_mmap", addr, len, prot, flags, fd, offset, mapped);
             profile_stage = lpr_startup_profile_stage_begin();
-            mapped = lpr_pacha_syscall6(
-                PACHAOS_SYSCALL_MMAP,
+            mapped = lpr_drm_native_mmap(
                 0,
                 addr,
                 map_len,
@@ -2607,8 +2667,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 return lpr_linux_pacha_status_to_errno(mapped);
             }
             profile_stage = lpr_startup_profile_stage_begin();
-            const int64_t source = lpr_pacha_syscall6(
-                PACHAOS_SYSCALL_MMAP,
+            const int64_t source = lpr_drm_native_mmap(
                 (uint64_t)(uint32_t)vmo_fd,
                 0,
                 map_len,
@@ -2679,8 +2738,7 @@ private_file_mapping_ready:
         return mmap_result;
     }
     const uint64_t pacha_fd = (flags & LPR_LINUX_MAP_ANONYMOUS) != 0 ? 0 : fd;
-    const int64_t ret = lpr_pacha_syscall6(
-        PACHAOS_SYSCALL_MMAP,
+    const int64_t ret = lpr_drm_native_mmap(
         pacha_fd,
         addr,
         len,
@@ -2814,12 +2872,7 @@ static int64_t lpr_sys_lstat(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_lseek(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_lseek(a0, a1, a2); }
 static int64_t lpr_sys_mmap(uint64_t a0, uint64_t a1, uint64_t a2,
     uint64_t a3, uint64_t a4, uint64_t a5) {
-    int drm = !(a3 & LPR_LINUX_MAP_ANONYMOUS) &&
-        lpr_linux_drm_fd_active(a4);
-    int64_t result = lpr_linux_mmap(a0, a1, a2, a3, a4, a5);
-    if (result >= 4096 && (a3 & LPR_LINUX_MAP_FIXED) && !drm)
-        lpr_drm_mapping_unmapped((uint64_t)result, a1);
-    return result;
+    return lpr_linux_mmap(a0, a1, a2, a3, a4, a5);
 }
 static int64_t lpr_sys_mremap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_linux_mremap(a0, a1, a2, a3, a4); }
 static int64_t lpr_sys_madvise(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
@@ -2877,9 +2930,7 @@ static int64_t lpr_sys_munmap(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3
         }
     }
     const int64_t result = lpr_linux_pacha_status_to_errno(
-        lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, a0, a1));
-    if (!result)
-        lpr_drm_mapping_unmapped(a0, a1);
+        lpr_drm_native_munmap(a0, a1));
     lpr_trace_mmap_call("munmap", a0, a1, 0, 0, 0, 0, result);
     return result;
 }
@@ -3054,6 +3105,23 @@ static int64_t lpr_sys_futex(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 {
     const uint64_t command = a1 & 0x7full;
     const uint64_t flags = a1 & ~0x7full;
+    /* This personality recognizes PI operations but cannot provide priority
+     * inheritance. Report ENOTSUP (EOPNOTSUPP on Linux), not success or an
+     * ordinary futex approximation. musl propagates the LOCK_PI probe errno
+     * through pthread_mutexattr_setprotocol; POSIX clients use ENOTSUP to
+     * select their non-PI path. This deliberately differs from Linux built
+     * without CONFIG_FUTEX_PI, which reports ENOSYS. Unknown ops still do so.
+     * Never access the word or enqueue a waiter on this unsupported path. */
+    if ((flags & ~(LPR_LINUX_FUTEX_PRIVATE_FLAG |
+                  LPR_LINUX_FUTEX_CLOCK_REALTIME)) == 0 &&
+        (command == LPR_LINUX_FUTEX_LOCK_PI ||
+         command == LPR_LINUX_FUTEX_UNLOCK_PI ||
+         command == LPR_LINUX_FUTEX_TRYLOCK_PI ||
+         command == LPR_LINUX_FUTEX_WAIT_REQUEUE_PI ||
+         command == LPR_LINUX_FUTEX_CMP_REQUEUE_PI ||
+         command == LPR_LINUX_FUTEX_LOCK_PI2)) {
+        return -LPR_LINUX_EOPNOTSUPP;
+    }
     const int wait_bitset = command == LPR_LINUX_FUTEX_WAIT_BITSET;
     const uint64_t allowed_flags = LPR_LINUX_FUTEX_PRIVATE_FLAG |
         (wait_bitset ? LPR_LINUX_FUTEX_CLOCK_REALTIME : 0ull);
@@ -3256,6 +3324,12 @@ static int64_t lpr_sys_rt_sigsuspend(uint64_t a0, uint64_t a1, uint64_t a2, uint
     (void)a5;
     if (a0 == 0) return -LPR_LINUX_EFAULT;
     return lpr_linux_ppoll(0, 0, 0, a0, a1);
+}
+
+static int64_t lpr_sys_sched_yield(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5;
+    return lpr_linux_pacha_status_to_errno(lpr_pacha_syscall0(PACHA_RUNTIME_SYSCALL_YIELD));
 }
 
 static int64_t lpr_sys_clock_gettime(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
@@ -3477,6 +3551,7 @@ static int64_t lpr_sys_poll(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, 
     [nr_value] = { nr_value, name_value, class_value, backend_value, 0, trace_value }
 
 static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
+    LPR_SYSCALL(LPR_LINUX_SYS_SCHED_YIELD, "sched_yield", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_sched_yield, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_READ, "read", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_read, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_WRITE, "write", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_write, LPR_SYSCALL_TRACE),
     LPR_SYSCALL(LPR_LINUX_SYS_OPEN, "open", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_open, 0),
@@ -3664,6 +3739,7 @@ static void lpr_syscall_table_init(void)
         return;
     }
     (void)lpr_load_manifest();
+    lpr_syscall_table[LPR_LINUX_SYS_SCHED_YIELD].handler = lpr_sys_sched_yield;
     lpr_syscall_table[LPR_LINUX_SYS_READ].handler = lpr_sys_read;
     lpr_syscall_table[LPR_LINUX_SYS_WRITE].handler = lpr_sys_write;
     lpr_syscall_table[LPR_LINUX_SYS_OPEN].handler = lpr_sys_open;
@@ -4154,6 +4230,9 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     /* The syscall has completed.  A failure while translating a subsequently
      * pending Linux signal into a native signal must leave that signal queued;
      * it is not the result of the completed Linux syscall. */
+#if defined(LPR_VM_ORIGIN_DIAG) && LPR_VM_ORIGIN_DIAG
+    lpr_vm_origin_diag(nr, frame, a1, a3, a4, result);
+#endif
     (void)lpr_linux_dispatch_pending_signals_with_result(result);
     if (result == -LPR_LINUX_ENOSYS) {
         lpr_trace_enosys_syscall(nr, a0, a1, a2, a3, a4, a5);

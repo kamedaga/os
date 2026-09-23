@@ -1,12 +1,15 @@
 const std = @import("std");
+const pt_storage = @import("pt_storage.zig");
 const address_space = @import("address_space.zig");
 const kernel = @import("../kernel.zig");
 const scheduler = @import("../scheduler.zig").connection;
+const perf = @import("../smp_perf.zig");
 
 pub const UserAddressSpace = address_space.UserAddressSpace;
 pub const UserAddressSpaceTable = address_space.UserAddressSpaceTable;
 
 pub const Hooks = struct {
+    pt_allocator: ?pt_storage.Allocator = null,
     user_spaces: *UserAddressSpaceTable,
     four_gib: u64,
     physical_map_limit: u64,
@@ -215,6 +218,11 @@ pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
     const h = hooks orelse return;
     const space = getUserSpace(principal) orelse return;
 
+    detachAndReleaseUserPtStorage(h, space, principal);
+    resetUserAddressSpaceStorage(space);
+}
+
+fn detachAndReleaseUserPtStorage(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId) void {
     // A process slot reuses both its page-table storage and its PCID.  Make
     // the old user tree unreachable before flushing that PCID on every CPU;
     // otherwise a later occupant can execute a cached translation after the
@@ -229,7 +237,7 @@ pub fn clearUserAddressSpace(principal: kernel.PrincipalId) void {
             @intCast(h.user_top_va - h.user_low_va),
         );
     }
-    resetUserAddressSpaceStorage(space);
+    if (h.pt_allocator) |allocator| space.pt_store.freeDetached(allocator);
 }
 
 pub fn currentUserSpace() *UserAddressSpace {
@@ -272,7 +280,7 @@ pub fn lookupUserMappedPaddrForVa(principal: kernel.PrincipalId, va: u64) ?u64 {
     const space = getUserSpace(principal) orelse return null;
     const index = userPageIndexForVa(h, va) orelse return null;
     const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
-    const entry = space.pt_pages[slot][index.pt];
+    const entry = space.ptPage(slot).*[index.pt];
     const is_user_mapping = (entry & h.page_present) != 0 and (entry & h.page_user) != 0;
     const paddr = entry & h.page_addr_mask;
     if (!is_user_mapping or paddr == 0) return null;
@@ -306,7 +314,7 @@ pub fn lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
     const space = getUserSpace(principal) orelse return null;
     const index = userPageIndexForVa(h, va) orelse return null;
     const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
-    const entry = space.pt_pages[slot][index.pt];
+    const entry = space.ptPage(slot).*[index.pt];
     if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return null;
     const paddr = entry & h.page_addr_mask;
     if (paddr == 0) return null;
@@ -329,11 +337,15 @@ pub fn resetUserReservations(space: *UserAddressSpace) void {
     space.next_dynamic_map_page = 0;
 }
 
+pub fn initializeUserAddressSpaceStorage(space: *UserAddressSpace) void {
+    address_space.initializeUserAddressSpaceStorage(space);
+}
+
 pub fn resetUserAddressSpaceStorage(space: *UserAddressSpace) void {
     address_space.resetUserAddressSpaceStorage(space);
 }
 
-fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
+fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace, principal: kernel.PrincipalId) bool {
     const h = hooks orelse return false;
     // Validate every fallible physical-address dependency before destroying
     // the live tables.  Exec must be able to return an error with its old
@@ -343,6 +355,7 @@ fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
     const first_pdp_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pdp_pages[0])) orelse return false;
     if (first_pdp_pa >= h.physical_map_limit) return false;
 
+    detachAndReleaseUserPtStorage(h, space, principal);
     @memset(space.pml4[0..], 0);
     h.seed_user_pml4_with_kernel(space.pml4[0..]);
     var pdp_slot_init: usize = 0;
@@ -356,17 +369,16 @@ fn resetUserPageTablesPreserveReservations(space: *UserAddressSpace) bool {
         space.pd_page_pdp_index[pd_slot_init] = UserAddressSpace.no_pd_index;
         @memset(space.pd_pages[pd_slot_init][0..], 0);
     }
-    var pt_slot_init: usize = 0;
-    while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
-        space.pt_page_pml4_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pdp_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        @memset(space.pt_pages[pt_slot_init][0..], 0);
-    }
+    space.pt_store.resetDetachedContents();
     space.pdp_page_used_len = 0;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;
-    _ = ensureUserPdpSlotForPml4(space, 0) orelse return false;
+    // All fallible address validation preceded detachment. Rebuild this one
+    // inline parent directly, using its already validated physical address.
+    h.seed_user_pdp_with_kernel_identity(space.pdp_pages[0][0..]);
+    space.pdp_page_pml4_index[0] = 0;
+    space.pdp_page_used_len = 1;
+    space.pml4[0] = first_pdp_pa | h.page_present | h.page_rw | h.page_user;
     space.cr3 = user_pml4_pa;
     return true;
 }
@@ -376,7 +388,7 @@ pub fn cloneAddressSpaceMetadataForFork(from: kernel.PrincipalId, to: kernel.Pri
     defer unlockAddressSpacePair(from, to);
     const source = getUserSpace(from) orelse return false;
     const dest = getUserSpace(to) orelse return false;
-    if (!resetUserPageTablesPreserveReservations(dest)) return false;
+    if (!resetUserPageTablesPreserveReservations(dest, to)) return false;
     dest.reservations = source.reservations;
     dest.reservation_generation = source.reservation_generation;
     dest.next_dynamic_map_page = source.next_dynamic_map_page;
@@ -391,7 +403,7 @@ pub fn presentUserPagePaddr(principal: kernel.PrincipalId, va: u64) ?u64 {
     if ((va & 0xFFF) != 0) return null;
     const index = userPageIndexForVa(h, va) orelse return null;
     const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
-    const pt_page: *const [512]u64 = &space.pt_pages[pt_slot];
+    const pt_page: *const [512]u64 = space.ptPage(pt_slot);
     const entry = pt_page[index.pt];
     if ((entry & h.page_present) == 0 or (entry & h.page_user) == 0) return null;
     return ptePaddr(entry);
@@ -417,7 +429,7 @@ pub fn writeProtectPresentUserPagesForForkCow(principal: kernel.PrincipalId, va_
         const remaining_pages: usize = @intCast((size_bytes - offset) / 4096);
         const segment_pages = @min(remaining_pages, h.page_entries - index.pt);
         if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
-            const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+            const pt_page: *[512]u64 = space.ptPage(pt_slot);
             for (pt_page[index.pt .. index.pt + segment_pages]) |*entry| {
                 const old_entry = entry.*;
                 if ((old_entry & h.page_present) == 0 or (old_entry & h.page_user) == 0) continue;
@@ -626,12 +638,31 @@ fn rangeOverlappingReservationEndPage(space: *const UserAddressSpace, base_va: u
 }
 
 fn rangeHasPresentUserMapping(principal: kernel.PrincipalId, base_va: u64, page_count: u64) bool {
-    var page_index: u64 = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const va = base_va + page_index * 4096;
-        if (lookupUserMappedPaddrForVa(principal, va) != null) return true;
+    const h = hooks orelse return true;
+    const space = getUserSpace(principal) orelse return true;
+    const bytes = std.math.mul(u64, page_count, 4096) catch return true;
+    _ = userRangeEndVa(h, base_va, bytes) orelse return true;
+    const end = base_va + bytes;
+    for (0..ptSlotScanLimit(space)) |slot| {
+        const span = ptSlotIntersection(space, slot, base_va, end) orelse continue;
+        for (space.ptPage(slot).*[span.first..span.last]) |entry| {
+            if ((entry & (h.page_present | h.page_user)) == (h.page_present | h.page_user)) return true;
+        }
     }
     return false;
+}
+
+fn ptSlotIntersection(space: *const UserAddressSpace, slot: usize, start: u64, end: u64) ?struct { first: usize, last: usize } {
+    const pml4 = space.ptPml4Index(slot).*;
+    const pdp = space.ptPdpIndex(slot).*;
+    const pd = space.ptPdIndex(slot).*;
+    if (pml4 == UserAddressSpace.no_pd_index or pdp == UserAddressSpace.no_pd_index or
+        pd == UserAddressSpace.no_pd_index) return null;
+    const base = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) | (@as(u64, pd) << 21);
+    const lo = @max(start, base);
+    const hi = @min(end, base + 2 * 1024 * 1024);
+    if (lo >= hi) return null;
+    return .{ .first = @intCast((lo - base) >> 12), .last = @intCast((hi - base) >> 12) };
 }
 
 pub fn userPageHasMappingOrReservation(principal: kernel.PrincipalId, va: u64) bool {
@@ -703,22 +734,24 @@ pub fn advanceFreeUserMappingSearch(principal: kernel.PrincipalId, next_va: u64)
 }
 
 fn findUserPtSlotForPd(space: *const UserAddressSpace, pml4_index: usize, pdp_index: usize, pd_index: usize) ?usize {
+    // Valid hardware indices cannot equal a retired descriptor's 0xffff.
+    // Check that once, then reject the common PD mismatch before reading
+    // its other indices; user-copy lookups scan this list under the AS lock.
+    if (pml4_index >= 256 or pdp_index >= 512 or pd_index >= 512) return null;
     const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
     while (slot < slot_limit) : (slot += 1) {
-        if (space.pt_page_pml4_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pt_page_pdp_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pt_page_pd_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pt_page_pml4_index[slot] != pml4_index) continue;
-        if (space.pt_page_pdp_index[slot] != pdp_index) continue;
-        if (space.pt_page_pd_index[slot] == pd_index) return slot;
+        const entry = space.pt_store.descriptorConst(slot).?;
+        if (entry.pd != pd_index) continue;
+        if (entry.pdp != pdp_index) continue;
+        if (entry.pml4 == pml4_index) return slot;
     }
     return null;
 }
 
 fn userPtSlotHasUserMappings(h: Hooks, space: *const UserAddressSpace, slot: usize) bool {
-    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return true;
-    const pt_page: *const [512]u64 = &space.pt_pages[slot];
+    if (slot >= space.ptCapacity()) return true;
+    const pt_page: *const [512]u64 = space.ptPage(slot);
     var i: usize = 0;
     while (i < h.page_entries) : (i += 1) {
         const entry = pt_page[i];
@@ -728,11 +761,12 @@ fn userPtSlotHasUserMappings(h: Hooks, space: *const UserAddressSpace, slot: usi
 }
 
 fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool {
-    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return false;
+    if (slot >= space.ptCapacity()) return false;
+    if (space.ptPdIndex(slot).* == UserAddressSpace.no_pd_index) return false;
     if (userPtSlotHasUserMappings(h, space, slot)) return false;
-    const pml4_index = space.pt_page_pml4_index[slot];
-    const pdp_index = space.pt_page_pdp_index[slot];
-    const pd_index = space.pt_page_pd_index[slot];
+    const pml4_index = space.ptPml4Index(slot).*;
+    const pdp_index = space.ptPdpIndex(slot).*;
+    const pd_index = space.ptPdIndex(slot).*;
     if (pml4_index == UserAddressSpace.no_pd_index or
         pdp_index == UserAddressSpace.no_pd_index or
         pd_index == UserAddressSpace.no_pd_index)
@@ -742,7 +776,7 @@ fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool
     if (findUserPdSlotForPdp(space, pml4_index, pdp_index)) |pd_slot| {
         const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
         const entry = pd_page[pd_index];
-        const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return false;
+        const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(space.ptPage(slot))) orelse return false;
         if ((entry & h.page_addr_mask) == pt_pa) {
             pd_page[pd_index] = 0;
         }
@@ -750,7 +784,8 @@ fn detachUserPtSlotIfEmpty(h: Hooks, space: *UserAddressSpace, slot: usize) bool
     return true;
 }
 
-fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, va_start: u64, size_bytes: usize, touched_slots: []u16) void {
+fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, va_start: u64, size_bytes: usize, touched_slots: []u16, leaf_changed: bool) void {
+    const detach_start = perf.timestamp();
     var retired: usize = 0;
     for (touched_slots) |slot| {
         if (detachUserPtSlotIfEmpty(h, space, slot)) {
@@ -758,6 +793,8 @@ fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.
             retired += 1;
         }
     }
+    perf.ptRetireElapsed(.detach_cycles, detach_start);
+    perf.ptRetireAdd(.retired_pts, retired);
     // Remove the parent PDE before invalidating paging-structure caches.
     // No CPU may acquire a new path to a PT after the shootdown and before
     // that PT's storage is reused for a different virtual address.
@@ -767,18 +804,114 @@ fn retireEmptyUserPtSlots(h: Hooks, space: *UserAddressSpace, principal: kernel.
         (va_start + size_bytes + pt_bytes - 1) & ~@as(u64, pt_bytes - 1)
     else
         va_start + size_bytes;
-    h.flush_user_tlb_for_principal_range(principal, flush_start, @intCast(flush_end - flush_start));
-    for (touched_slots[0..retired]) |slot| {
-        @memset(space.pt_pages[slot][0..], 0);
-        space.pt_page_pml4_index[slot] = UserAddressSpace.no_pd_index;
-        space.pt_page_pdp_index[slot] = UserAddressSpace.no_pd_index;
-        space.pt_page_pd_index[slot] = UserAddressSpace.no_pd_index;
+    // Under the address-space lock, a hole with no leaf change and no PT
+    // retirement has no new translation to revoke. Keep the barrier for
+    // retirement alone too: a cached parent may still reference the old PT.
+    if (leaf_changed or retired != 0) {
+        perf.ptRetireAdd(.flush_calls, 1);
+        const flush_start_cycles = perf.timestamp();
+        h.flush_user_tlb_for_principal_range(principal, flush_start, @intCast(flush_end - flush_start));
+        perf.ptRetireElapsed(.flush_cycles, flush_start_cycles);
     }
+    const release_start = perf.timestamp();
+    for (touched_slots[0..retired]) |slot| {
+        if (h.pt_allocator) |allocator| space.pt_store.releasePageDetached(slot, allocator);
+    }
+    perf.ptRetireElapsed(.release_cycles, release_start);
+}
+
+// PT storage can grow, but retirement scratch space must remain bounded.
+// All leaf writes precede this scan. The first barrier covers those writes,
+// including the case where no table can be retired.
+fn retireEmptyUserPtRange(h: Hooks, space: *UserAddressSpace, principal: kernel.PrincipalId, start: u64, bytes: usize, leaf_changed: bool, strict_zero: bool) void {
+    const range_start = perf.timestamp();
+    perf.ptRetireAdd(.range_calls, 1);
+    defer perf.ptRetireElapsed(.range_total_cycles, range_start);
+    var slots: [64]u16 = undefined;
+    var count: usize = 0;
+    var candidates: usize = 0;
+    var pending_leaf = leaf_changed;
+    var scan_start = perf.timestamp();
+    for (0..ptSlotScanLimit(space)) |slot| {
+        _ = ptSlotIntersection(space, slot, start, start + bytes) orelse continue;
+        if (strict_zero) {
+            if (!std.mem.allEqual(u64, space.ptPage(slot), 0)) continue;
+        } else if (userPtSlotHasUserMappings(h, space, slot)) continue;
+        if (perf.enabled) candidates += 1;
+        slots[count] = @intCast(slot);
+        count += 1;
+        if (count == slots.len) {
+            // Account for selection separately from the helper's nested
+            // detach interval; neither includes its shootdown or PMM return.
+            perf.ptRetireElapsed(.detach_cycles, scan_start);
+            retireEmptyUserPtSlots(h, space, principal, start, bytes, slots[0..count], pending_leaf);
+            scan_start = perf.timestamp();
+            pending_leaf = false;
+            count = 0;
+        }
+    }
+    perf.ptRetireElapsed(.detach_cycles, scan_start);
+    retireEmptyUserPtSlots(h, space, principal, start, bytes, slots[0..count], pending_leaf);
+    perf.ptRetireAdd(.range_candidate_pts, candidates);
+    if (candidates > slots.len) perf.ptRetireAdd(.range_multi_batch_calls, 1);
+}
+
+/// Only the user-mode fault entry may call this, before starting COW or mapping
+/// preparation. An empty PT inside an in-progress preflight is not reclaimable;
+/// do not call from ensure/map helpers or a reentrant user-copy fault path.
+pub fn reclaimEmptyUserPtSlotsForFaultWithAddressSpaceLocked(principal: kernel.PrincipalId, fault_va: u64) void {
+    const h = hooks orelse return;
+    const space = getUserSpace(principal) orelse return;
+    if (space.lock_state.depth != 1 or
+        space.lock_state.owner_cpu != scheduler.currentCpu() or
+        space.pt_page_used_len < space.ptCapacity()) return;
+    const index = userPageIndexForVaWithLowPageZero(h, fault_va, true) orelse return;
+    if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) != null) return;
+    if (space.firstFreePtSlot() != null) return;
+
+    var candidates: [64]u16 = undefined;
+    var count: usize = 0;
+    var first_va: u64 = std.math.maxInt(u64);
+    var end_va: u64 = 0;
+    for (0..space.ptCapacity()) |slot| {
+        if (space.ptPdIndex(slot).* == UserAddressSpace.no_pd_index) continue;
+        const page = space.ptPage(slot);
+        const pml4 = space.ptPml4Index(slot).*;
+        const pdp = space.ptPdpIndex(slot).*;
+        const pd = space.ptPdIndex(slot).*;
+        if (pml4 >= 256 or pdp >= h.page_entries or pd >= h.page_entries) continue;
+        // Unlike ordinary VMA retirement, preserve supervisor-only, mixed,
+        // and even nonpresent-but-nonzero entries without exception.
+        var empty = true;
+        for (page) |entry| {
+            if (entry != 0) {
+                empty = false;
+                break;
+            }
+        }
+        if (!empty) continue;
+        const pd_slot = findUserPdSlotForPdp(space, pml4, pdp) orelse continue;
+        const parent = space.pd_pages[pd_slot][pd];
+        if (parent & h.page_present == 0 or parent & h.page_ps != 0) continue;
+        const pt_pa = h.kernel_pointer_paddr(@intFromPtr(page)) orelse continue;
+        if (parent & h.page_addr_mask != pt_pa) continue;
+        const va = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) | (@as(u64, pd) << 21);
+        first_va = @min(first_va, va);
+        end_va = @max(end_va, va + (1 << 21));
+        candidates[count] = @intCast(slot);
+        count += 1;
+        if (count == candidates.len) break;
+    }
+    if (count == 0) return;
+    // The synchronous barrier covers every detached PDE, not merely fault_va.
+    // Metadata remains assigned until that barrier has completed.
+    perf.ptRetireAdd(.fault_reclaim_calls, 1);
+    retireEmptyUserPtSlots(h, space, principal, first_va, @intCast(end_va - first_va), candidates[0..count], false);
 }
 
 fn ptSlotScanLimit(space: *const UserAddressSpace) usize {
-    const used_len = @min(@as(usize, @intCast(space.pt_page_used_len)), UserAddressSpace.max_dynamic_pt_pages);
-    return if (used_len == 0) UserAddressSpace.max_dynamic_pt_pages else used_len;
+    const used_len = @min(@as(usize, @intCast(space.pt_page_used_len)), space.ptCapacity());
+    return if (used_len == 0) space.ptCapacity() else used_len;
 }
 
 fn pdSlotScanLimit(space: *const UserAddressSpace) usize {
@@ -883,7 +1016,7 @@ fn ensureUserPdSlotForPdp(space: *UserAddressSpace, pml4_index: usize, pdp_index
 
 fn seedPtSlotFromExistingPd(space: *UserAddressSpace, slot: usize, existing_pde: u64) void {
     const h = hooks orelse return;
-    const pt_page: *[512]u64 = &space.pt_pages[slot];
+    const pt_page: *[512]u64 = space.ptPage(slot);
     @memset(pt_page[0..], 0);
     if ((existing_pde & h.page_present) == 0) return;
     if ((existing_pde & h.page_ps) == 0) {
@@ -916,20 +1049,23 @@ pub fn ensureUserPtSlotForPd(space: *UserAddressSpace, pml4_index: usize, pdp_in
     const pd_slot = ensureUserPdSlotForPdp(space, pml4_index, pdp_index) orelse return null;
     if (findUserPtSlotForPd(space, pml4_index, pdp_index, pd_index)) |slot| return slot;
 
-    var slot: usize = 0;
-    while (slot < UserAddressSpace.max_dynamic_pt_pages) : (slot += 1) {
-        if (space.pt_page_pd_index[slot] != UserAddressSpace.no_pd_index) continue;
-        break;
+    const slot = space.firstFreePtSlot() orelse space.ptCapacity();
+    const allocator = h.pt_allocator orelse return null;
+    const page = space.pt_store.ensurePage(slot, allocator) orelse return null;
+    const pt_pa = h.kernel_pointer_paddr(@intFromPtr(page)) orelse {
+        space.pt_store.releasePageDetached(slot, allocator);
+        return null;
+    };
+    if (pt_pa >= h.physical_map_limit) {
+        space.pt_store.releasePageDetached(slot, allocator);
+        return null;
     }
-    if (slot >= UserAddressSpace.max_dynamic_pt_pages) return null;
-    space.pt_page_pml4_index[slot] = @intCast(pml4_index);
-    space.pt_page_pdp_index[slot] = @intCast(pdp_index);
-    space.pt_page_pd_index[slot] = @intCast(pd_index);
     const pd_page: *[512]u64 = &space.pd_pages[pd_slot];
     const existing_pde = pd_page[pd_index];
     seedPtSlotFromExistingPd(space, slot, existing_pde);
-    const pt_pa: u64 = h.kernel_pointer_paddr(@intFromPtr(&space.pt_pages[slot])) orelse return null;
-    if (pt_pa >= h.physical_map_limit) return null;
+    space.ptPml4Index(slot).* = @intCast(pml4_index);
+    space.ptPdpIndex(slot).* = @intCast(pdp_index);
+    space.ptPdIndex(slot).* = @intCast(pd_index);
     pd_page[pd_index] = pt_pa | h.page_present | h.page_rw | h.page_user;
     const next_len = slot + 1;
     if (next_len > space.pt_page_used_len) {
@@ -1024,33 +1160,34 @@ const MmioTablePreparation = struct {
     const Link = struct { parent: *u64, previous: u64, slot: usize, level: Level };
     links: [
         UserAddressSpace.max_dynamic_pdp_pages + UserAddressSpace.max_dynamic_pd_pages +
-            UserAddressSpace.max_dynamic_pt_pages
+            512 // Bounded transaction journal, not the total PT capacity.
     ]Link = undefined,
     count: usize = 0,
     old_pdp_used: u16,
     old_pd_used: u16,
     old_pt_used: u16,
 
-    fn remember(self: *@This(), parent: *u64, slot: usize, level: Level) void {
-        std.debug.assert(self.count < self.links.len);
+    fn remember(self: *@This(), parent: *u64, slot: usize, level: Level) bool {
+        if (self.count == self.links.len) return false;
         self.links[self.count] = .{ .parent = parent, .previous = parent.*, .slot = slot, .level = level };
         self.count += 1;
+        return true;
     }
 
     fn prepare(self: *@This(), space: *UserAddressSpace, index: UserPageIndex) ?usize {
         if (findUserPdpSlotForPml4(space, index.pml4) == null) {
             const slot = std.mem.indexOfScalar(u16, &space.pdp_page_pml4_index, UserAddressSpace.no_pd_index) orelse return null;
-            self.remember(&space.pml4[index.pml4], slot, .pdp);
+            if (!self.remember(&space.pml4[index.pml4], slot, .pdp)) return null;
         }
         const pdp = ensureUserPdpSlotForPml4(space, index.pml4) orelse return null;
         if (findUserPdSlotForPdp(space, index.pml4, index.pdp) == null) {
             const slot = std.mem.indexOfScalar(u16, &space.pd_page_pdp_index, UserAddressSpace.no_pd_index) orelse return null;
-            self.remember(&space.pdp_pages[pdp][index.pdp], slot, .pd);
+            if (!self.remember(&space.pdp_pages[pdp][index.pdp], slot, .pd)) return null;
         }
         const pd = ensureUserPdSlotForPdp(space, index.pml4, index.pdp) orelse return null;
         if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) == null) {
-            const slot = std.mem.indexOfScalar(u16, &space.pt_page_pd_index, UserAddressSpace.no_pd_index) orelse return null;
-            self.remember(&space.pd_pages[pd][index.pd], slot, .pt);
+            const slot = space.firstFreePtSlot() orelse space.ptCapacity();
+            if (!self.remember(&space.pd_pages[pd][index.pd], slot, .pt)) return null;
         }
         return ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd);
     }
@@ -1063,7 +1200,7 @@ const MmioTablePreparation = struct {
             const link = self.links[remaining];
             link.parent.* = link.previous;
         }
-        // Unlink before shootdown; only then may those inline tables be reused.
+        // Unlink before shootdown; only then may paging storage be returned.
         h.flush_user_tlb_for_principal_range(principal, h.user_low_va, @intCast(h.user_top_va - h.user_low_va));
         for (self.links[0..self.count]) |link| {
             switch (link.level) {
@@ -1077,10 +1214,7 @@ const MmioTablePreparation = struct {
                     space.pd_page_pdp_index[link.slot] = UserAddressSpace.no_pd_index;
                 },
                 .pt => {
-                    @memset(&space.pt_pages[link.slot], 0);
-                    space.pt_page_pml4_index[link.slot] = UserAddressSpace.no_pd_index;
-                    space.pt_page_pdp_index[link.slot] = UserAddressSpace.no_pd_index;
-                    space.pt_page_pd_index[link.slot] = UserAddressSpace.no_pd_index;
+                    if (h.pt_allocator) |allocator| space.pt_store.releasePageDetached(link.slot, allocator);
                 },
             }
         }
@@ -1120,13 +1254,13 @@ pub fn mapUserMmioOverlayWithCache(principal: kernel.PrincipalId, va_start: u64,
         const index = userPageIndexForVa(h, va_start + offset) orelse return false;
         const slot = preparation.prepare(space, index) orelse return false;
         // Includes supervisor PTEs: overlay is not an arbitrary replacement.
-        if (space.pt_pages[slot][index.pt] & h.page_present != 0) return false;
+        if (space.ptPage(slot).*[index.pt] & h.page_present != 0) return false;
     }
     offset = 0;
     while (offset < size_bytes) : (offset += 4096) {
         const index = userPageIndexForVa(h, va_start + offset).?;
         const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd).?;
-        space.pt_pages[slot][index.pt] = (paddr_start + offset) | flags;
+        space.ptPage(slot).*[index.pt] = (paddr_start + offset) | flags;
     }
     committed = true;
     return true;
@@ -1183,34 +1317,18 @@ pub fn unmapUserMmioOverlay(principal: kernel.PrincipalId, va_start: u64, paddr_
     while (offset < size_bytes) : (offset += 4096) {
         const index = userPageIndexForVa(h, va_start + offset).?;
         const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const pte = space.pt_pages[slot][index.pt];
+        const pte = space.ptPage(slot).*[index.pt];
         if (pte & (h.page_present | h.page_user) != (h.page_present | h.page_user)) continue;
         if (ptePaddr(pte) != paddr_start + offset) return false;
     }
-    var touched: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
-    var touched_count: usize = 0;
-    var previous_slot: ?usize = null;
     offset = 0;
     while (offset < size_bytes) : (offset += 4096) {
         const index = userPageIndexForVa(h, va_start + offset).?;
         const slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const pte = &space.pt_pages[slot][index.pt];
+        const pte = &space.ptPage(slot)[index.pt];
         if (pte.* & (h.page_present | h.page_user) == (h.page_present | h.page_user)) pte.* = 0;
-        if (previous_slot != slot) {
-            touched[touched_count] = @intCast(slot);
-            touched_count += 1;
-            previous_slot = slot;
-        }
     }
-    // The ordinary user-unmap helper may retire supervisor seed PTEs too.
-    // An overlay owns only its target pages, not neighboring supervisor state.
-    var empty_count: usize = 0;
-    for (touched[0..touched_count]) |slot| {
-        if (!std.mem.allEqual(u64, &space.pt_pages[slot], 0)) continue;
-        touched[empty_count] = slot;
-        empty_count += 1;
-    }
-    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched[0..empty_count]);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true, true);
     retireEmptyMmioParents(h, space, principal, va_start, size_bytes);
     return true;
 }
@@ -1243,7 +1361,7 @@ fn mapUserLinearRegionWithPteFlags(
         const va = va_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
     }
@@ -1255,7 +1373,7 @@ fn mapUserLinearRegionWithPteFlags(
         const paddr = paddr_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         pt_page[index.pt] = paddr | pte_flags;
     }
 
@@ -1290,7 +1408,7 @@ fn mapTrustedUserPaddrsWithProtInternal(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0) return false;
     }
@@ -1301,7 +1419,7 @@ fn mapTrustedUserPaddrsWithProtInternal(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVaWithLowPageZero(h, va, allow_low_page_zero) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         pt_page[index.pt] = paddrs[page_index] | pte_flags;
     }
 
@@ -1339,6 +1457,53 @@ pub fn mapLazyLowPageZeroPaddrsWithProt(
     return mapTrustedUserPaddrsWithProtInternal(principal, va_start, paddrs, prot, false, true);
 }
 
+pub const UserPtUsage = struct {
+    used: usize = 0,
+    empty: usize = 0,
+    user_tables: usize = 0,
+    supervisor_only: usize = 0,
+    nonpresent_tables: usize = 0,
+    user_entries: usize = 0,
+    supervisor_entries: usize = 0,
+    nonpresent_entries: usize = 0,
+};
+
+// Failure-only diagnostic. The caller holds the address-space lock; do not
+// scan these tables on successful faults or mistake reserved empty PTs for
+// live mappings. Supervisor-only helper tables are not reclaimable by count.
+pub fn userPtUsage(space: *const UserAddressSpace) UserPtUsage {
+    const h = hooks orelse return .{};
+    var usage = UserPtUsage{};
+    for (0..space.ptCapacity()) |slot| {
+        const pd = space.ptPdIndex(slot).*;
+        if (pd == UserAddressSpace.no_pd_index) continue;
+        usage.used += 1;
+        var user: usize = 0;
+        var supervisor: usize = 0;
+        var nonpresent: usize = 0;
+        for (space.ptPage(slot).*) |entry| {
+            if (entry & h.page_present == 0) {
+                if (entry != 0) nonpresent += 1;
+                continue;
+            }
+            if (entry & h.page_user != 0) user += 1 else supervisor += 1;
+        }
+        usage.user_entries += user;
+        usage.supervisor_entries += supervisor;
+        usage.nonpresent_entries += nonpresent;
+        if (user != 0) {
+            usage.user_tables += 1;
+        } else if (supervisor != 0) {
+            usage.supervisor_only += 1;
+        } else if (nonpresent != 0) {
+            usage.nonpresent_tables += 1;
+        } else {
+            usage.empty += 1;
+        }
+    }
+    return usage;
+}
+
 pub fn mapLazyUserPaddrsWithProt(
     principal: kernel.PrincipalId,
     va_start: u64,
@@ -1349,13 +1514,10 @@ pub fn mapLazyUserPaddrsWithProt(
     if (lockAddressSpace(principal)) {
         defer unlockAddressSpace(principal);
         if (getUserSpace(principal)) |space| {
-            var used: usize = 0;
-            for (space.pt_page_pd_index) |pd| {
-                if (pd != UserAddressSpace.no_pd_index) used += 1;
-            }
+            const usage = userPtUsage(space);
             @import("../kernel_log.zig").writeFmt(
-                "vm: fault pte failed principal={} va=0x{x} pages={} pt_used={}/{} pd_high={} pdp_high={}\n",
-                .{ @intFromEnum(principal), va_start, paddrs.len, used, UserAddressSpace.max_dynamic_pt_pages, space.pd_page_used_len, space.pdp_page_used_len },
+                "vm: fault pte failed principal={} va=0x{x} pages={} pt_used={}/{} pt_empty={} pt_user={} pt_supervisor={} pt_nonpresent={} pte_user={} pte_supervisor={} pte_nonpresent={} pd_high={} pdp_high={}\n",
+                .{ @intFromEnum(principal), va_start, paddrs.len, usage.used, space.ptCapacity(), usage.empty, usage.user_tables, usage.supervisor_only, usage.nonpresent_tables, usage.user_entries, usage.supervisor_entries, usage.nonpresent_entries, space.pd_page_used_len, space.pdp_page_used_len },
             );
         }
     }
@@ -1394,7 +1556,7 @@ pub fn remapTrustedUserPaddrsWithProt(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse break;
-        const old = space.pt_pages[pt_slot][index.pt];
+        const old = space.ptPage(pt_slot).*[index.pt];
         const desired = paddrs[page_index] | pte_flags;
         if ((old & ~accessed_dirty) != (desired & ~accessed_dirty)) break;
     }
@@ -1405,7 +1567,7 @@ pub fn remapTrustedUserPaddrsWithProt(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         pt_page[index.pt] = paddrs[page_index] | pte_flags;
     }
     h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
@@ -1438,7 +1600,7 @@ pub fn mapOrRemapTrustedUserPaddrsWithProt(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse return false;
         if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
-            const old_entry = space.pt_pages[pt_slot][index.pt];
+            const old_entry = space.ptPage(pt_slot).*[index.pt];
             if ((old_entry & h.page_present) != 0 and (old_entry & h.page_user) == 0) return false;
         }
     }
@@ -1449,7 +1611,7 @@ pub fn mapOrRemapTrustedUserPaddrsWithProt(
         const index = userPageIndexForVa(h, va) orelse return false;
         var present = false;
         if (findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd)) |pt_slot| {
-            const old_entry = space.pt_pages[pt_slot][index.pt];
+            const old_entry = space.ptPage(pt_slot).*[index.pt];
             present = (old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0;
         }
         if (!present and !reserveUserMapping(principal, va, 1, .linear_region, prot.write)) {
@@ -1459,7 +1621,7 @@ pub fn mapOrRemapTrustedUserPaddrsWithProt(
                 const rollback_page = userPageIndexForVa(h, rollback_va) orelse continue;
                 var rollback_present = false;
                 if (findUserPtSlotForPd(space, rollback_page.pml4, rollback_page.pdp, rollback_page.pd)) |pt_slot| {
-                    const old_entry = space.pt_pages[pt_slot][rollback_page.pt];
+                    const old_entry = space.ptPage(pt_slot).*[rollback_page.pt];
                     rollback_present = (old_entry & h.page_present) != 0 and (old_entry & h.page_user) != 0;
                 }
                 if (!rollback_present) _ = releaseUserMapping(principal, rollback_va, 1);
@@ -1473,7 +1635,7 @@ pub fn mapOrRemapTrustedUserPaddrsWithProt(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = ensureUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        space.pt_pages[pt_slot][index.pt] = paddrs[page_index] | pte_flags;
+        space.ptPage(pt_slot).*[index.pt] = paddrs[page_index] | pte_flags;
     }
     h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
 
@@ -1502,7 +1664,7 @@ pub fn protectUserLinearRegionWithProt(
         const va = va_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) == 0) return false;
         if ((old_entry & h.page_user) == 0) return false;
@@ -1536,7 +1698,7 @@ pub fn protectPresentUserLinearRegionWithProt(
         const va = va_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) == 0) continue;
         if ((old_entry & h.page_user) == 0) return false;
@@ -1567,37 +1729,22 @@ pub fn unmapUserLinearRegion(
         const va = va_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *const [512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *const [512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) == 0) return false;
         if ((old_entry & h.page_user) == 0) return false;
     }
-
-    var touched_slots: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
-    var touched_count: usize = 0;
 
     offset = 0;
     while (offset < size_u64) : (offset += 4096) {
         const va = va_start + offset;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *[512]u64 = space.ptPage(pt_slot);
         pt_page[index.pt] = 0;
-        var seen = false;
-        var touched_index: usize = 0;
-        while (touched_index < touched_count) : (touched_index += 1) {
-            if (touched_slots[touched_index] == pt_slot) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen and touched_count < touched_slots.len) {
-            touched_slots[touched_count] = @intCast(pt_slot);
-            touched_count += 1;
-        }
     }
     if (!releaseUserMapping(principal, va_start, size_u64 / 4096)) return false;
-    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true, false);
 
     return true;
 }
@@ -1637,13 +1784,11 @@ fn unmapPresentSplitSlotsWithPolicy(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return null;
 
-    var offset: u64 = 0;
-    while (offset < size_u64) : (offset += 4096) {
-        const va = va_start + offset;
-        const index = userPageIndexForVa(h, va) orelse return null;
-        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const entry = space.pt_pages[pt_slot][index.pt];
-        if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0 and !native_vma_source) return null;
+    for (0..ptSlotScanLimit(space)) |slot| {
+        const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
+        for (space.ptPage(slot).*[span.first..span.last]) |entry| {
+            if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0 and !native_vma_source) return null;
+        }
     }
 
     return reservationSplitSlotsRequired(space, va_start, size_u64);
@@ -1700,13 +1845,11 @@ pub fn unmapPresentRemoteUserRegion(
     if (size_bytes == 0 or ((va_start | size_bytes) & 0xfff) != 0) return false;
     _ = userRangeEndVa(h, va_start, @intCast(size_bytes)) orelse return false;
     const end = va_start + size_bytes;
-    var touched_slots: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
-    var touched_count: usize = 0;
 
     for (0..ptSlotScanLimit(space)) |slot| {
-        const pml4 = space.pt_page_pml4_index[slot];
-        const pdp = space.pt_page_pdp_index[slot];
-        const pd = space.pt_page_pd_index[slot];
+        const pml4 = space.ptPml4Index(slot).*;
+        const pdp = space.ptPdpIndex(slot).*;
+        const pd = space.ptPdIndex(slot).*;
         if (pml4 == UserAddressSpace.no_pd_index or
             pdp == UserAddressSpace.no_pd_index or pd == UserAddressSpace.no_pd_index) continue;
         const base = (@as(u64, pml4) << 39) | (@as(u64, pdp) << 30) | (@as(u64, pd) << 21);
@@ -1715,15 +1858,13 @@ pub fn unmapPresentRemoteUserRegion(
         if (overlap_start >= overlap_end) continue;
         const first: usize = @intCast((overlap_start - base) >> 12);
         const last: usize = @intCast((overlap_end - base) >> 12);
-        for (space.pt_pages[slot][first..last]) |*entry| {
+        for (space.ptPage(slot).*[first..last]) |*entry| {
             if ((entry.* & (h.page_present | h.page_user)) == (h.page_present | h.page_user))
                 entry.* = 0;
         }
-        touched_slots[touched_count] = @intCast(slot);
-        touched_count += 1;
     }
     _ = releaseUserMapping(principal, va_start, @as(u64, @intCast(size_bytes)) / 4096);
-    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, true, false);
     return true;
 }
 
@@ -1772,40 +1913,29 @@ fn unmapPresentWithPolicy(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
 
-    var touched_slots: [UserAddressSpace.max_dynamic_pt_pages]u16 = undefined;
-    var touched_count: usize = 0;
-
-    var offset: u64 = 0;
-    while (offset < size_u64) : (offset += 4096) {
-        const va = va_start + offset;
-        const index = userPageIndexForVa(h, va) orelse return false;
-        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
-        const old_entry = pt_page[index.pt];
-        // MREMAP invalidates the source PTEs before its state transaction.
-        // Already-empty PTs still belong to this final unmap's retirement set.
-        var seen = false;
-        var touched_index: usize = 0;
-        while (touched_index < touched_count) : (touched_index += 1) {
-            if (touched_slots[touched_index] == pt_slot) {
-                seen = true;
-                break;
+    // Validate before mutation; arbitrary fixed targets must not remove any
+    // user page if a supervisor seed page occurs later in the range.
+    if (!native_vma_source) {
+        for (0..ptSlotScanLimit(space)) |slot| {
+            const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
+            for (space.ptPage(slot).*[span.first..span.last]) |entry| {
+                if ((entry & h.page_present) != 0 and (entry & h.page_user) == 0) return false;
             }
         }
-        if (!seen and touched_count < touched_slots.len) {
-            touched_slots[touched_count] = @intCast(pt_slot);
-            touched_count += 1;
+    }
+    var leaf_changed = false;
+    for (0..ptSlotScanLimit(space)) |slot| {
+        const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
+        for (space.ptPage(slot).*[span.first..span.last]) |*entry| {
+            if ((entry.* & (h.page_present | h.page_user)) == (h.page_present | h.page_user)) {
+                entry.* = 0;
+                leaf_changed = true;
+            }
         }
-        if ((old_entry & h.page_present) == 0) continue;
-        if ((old_entry & h.page_user) == 0) {
-            if (native_vma_source) continue;
-            return false;
-        }
-        pt_page[index.pt] = 0;
     }
 
     _ = releaseUserMapping(principal, va_start, size_u64 / 4096);
-    retireEmptyUserPtSlots(h, space, principal, va_start, size_bytes, touched_slots[0..touched_count]);
+    retireEmptyUserPtRange(h, space, principal, va_start, size_bytes, leaf_changed, false);
 
     return true;
 }
@@ -1834,16 +1964,11 @@ pub fn invalidatePresentUserLinearRegionPtes(
     const size_u64: u64 = @intCast(size_bytes);
     _ = userRangeEndVa(h, va_start, size_u64) orelse return false;
 
-    var offset: u64 = 0;
-    while (offset < size_u64) : (offset += 4096) {
-        const va = va_start + offset;
-        const index = userPageIndexForVa(h, va) orelse return false;
-        const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse continue;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot];
-        const old_entry = pt_page[index.pt];
-        if ((old_entry & h.page_present) == 0) continue;
-        if ((old_entry & h.page_user) == 0) continue;
-        pt_page[index.pt] = 0;
+    for (0..ptSlotScanLimit(space)) |slot| {
+        const span = ptSlotIntersection(space, slot, va_start, va_start + size_u64) orelse continue;
+        for (space.ptPage(slot).*[span.first..span.last]) |*entry| {
+            if ((entry.* & (h.page_present | h.page_user)) == (h.page_present | h.page_user)) entry.* = 0;
+        }
     }
 
     h.flush_user_tlb_for_principal_range(principal, va_start, size_bytes);
@@ -1877,7 +2002,7 @@ pub fn invalidatePresentUserPaddrsIfCurrent(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        const old_entry = space.pt_pages[pt_slot][index.pt];
+        const old_entry = space.ptPage(pt_slot).*[index.pt];
         if ((old_entry & h.page_present) == 0 or (old_entry & h.page_user) == 0 or
             (old_entry & h.page_addr_mask) != expected)
         {
@@ -1888,7 +2013,7 @@ pub fn invalidatePresentUserPaddrsIfCurrent(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse unreachable;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse unreachable;
-        space.pt_pages[pt_slot][index.pt] = 0;
+        space.ptPage(pt_slot).*[index.pt] = 0;
     }
     h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
     return true;
@@ -1921,13 +2046,13 @@ pub fn installInvalidatedUserPaddrsWithProt(
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse return false;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return false;
-        if ((space.pt_pages[pt_slot][index.pt] & h.page_present) != 0) return false;
+        if ((space.ptPage(pt_slot).*[index.pt] & h.page_present) != 0) return false;
     }
     for (paddrs, 0..) |paddr, page_index| {
         const va = va_start + @as(u64, @intCast(page_index)) * 4096;
         const index = userPageIndexForVa(h, va) orelse unreachable;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse unreachable;
-        space.pt_pages[pt_slot][index.pt] = paddr | pte_flags;
+        space.ptPage(pt_slot).*[index.pt] = paddr | pte_flags;
     }
     h.flush_user_tlb_for_principal_range(principal, va_start, @intCast(size_u64));
     return true;
@@ -1955,7 +2080,7 @@ pub fn collectUserLinearRegionPaddrs(
         const va = va_start + @as(u64, @intCast(page_index * 4096));
         const index = userPageIndexForVa(h, va) orelse return null;
         const pt_slot = findUserPtSlotForPd(space, index.pml4, index.pdp, index.pd) orelse return null;
-        const pt_page: *const [512]u64 = &space.pt_pages[pt_slot];
+        const pt_page: *const [512]u64 = space.ptPage(pt_slot);
         const old_entry = pt_page[index.pt];
         if ((old_entry & h.page_present) == 0) return null;
         if ((old_entry & h.page_user) == 0) return null;
@@ -1974,9 +2099,9 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
     const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
     while (slot < slot_limit) : (slot += 1) {
-        const pd_index_meta = space.pt_page_pd_index[slot];
-        const pml4_index_meta = space.pt_page_pml4_index[slot];
-        const pdp_index_meta = space.pt_page_pdp_index[slot];
+        const pd_index_meta = space.ptPdIndex(slot).*;
+        const pml4_index_meta = space.ptPml4Index(slot).*;
+        const pdp_index_meta = space.ptPdpIndex(slot).*;
         if (pml4_index_meta == UserAddressSpace.no_pd_index) continue;
         if (pdp_index_meta == UserAddressSpace.no_pd_index) continue;
         if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
@@ -1985,7 +2110,7 @@ pub fn unmapUserMappedPaddr(principal: kernel.PrincipalId, paddr: u64) usize {
         const pd_index: usize = @intCast(pd_index_meta);
         var pt_index: usize = 0;
         while (pt_index < h.page_entries) : (pt_index += 1) {
-            const pt_page: *[512]u64 = &space.pt_pages[slot];
+            const pt_page: *[512]u64 = space.ptPage(slot);
             const old_entry = pt_page[pt_index];
             if ((old_entry & h.page_present) == 0) continue;
             if ((old_entry & h.page_user) == 0) continue;
@@ -2010,10 +2135,10 @@ pub fn collectUserMappedPaddrs(principal: kernel.PrincipalId, out_paddrs: []u64)
     const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
     while (slot < slot_limit) : (slot += 1) {
-        if (space.pt_page_pml4_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pt_page_pdp_index[slot] == UserAddressSpace.no_pd_index) continue;
-        if (space.pt_page_pd_index[slot] == UserAddressSpace.no_pd_index) continue;
-        const pt_page: *const [512]u64 = &space.pt_pages[slot];
+        if (space.ptPml4Index(slot).* == UserAddressSpace.no_pd_index) continue;
+        if (space.ptPdpIndex(slot).* == UserAddressSpace.no_pd_index) continue;
+        if (space.ptPdIndex(slot).* == UserAddressSpace.no_pd_index) continue;
+        const pt_page: *const [512]u64 = space.ptPage(slot);
         var pt_index: usize = 0;
         while (pt_index < h.page_entries) : (pt_index += 1) {
             const entry = pt_page[pt_index];
@@ -2051,16 +2176,16 @@ pub fn forEachUserMappedPage(principal: kernel.PrincipalId, context: *anyopaque,
     const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
     while (slot < slot_limit) : (slot += 1) {
-        const pd_index_meta = space.pt_page_pd_index[slot];
-        const pml4_index_meta = space.pt_page_pml4_index[slot];
-        const pdp_index_meta = space.pt_page_pdp_index[slot];
+        const pd_index_meta = space.ptPdIndex(slot).*;
+        const pml4_index_meta = space.ptPml4Index(slot).*;
+        const pdp_index_meta = space.ptPdpIndex(slot).*;
         if (pml4_index_meta == UserAddressSpace.no_pd_index) continue;
         if (pdp_index_meta == UserAddressSpace.no_pd_index) continue;
         if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
         const pml4_index: usize = @intCast(pml4_index_meta);
         const pdp_index: usize = @intCast(pdp_index_meta);
         const pd_index: usize = @intCast(pd_index_meta);
-        const pt_page: *const [512]u64 = &space.pt_pages[slot];
+        const pt_page: *const [512]u64 = space.ptPage(slot);
         var pt_index: usize = 0;
         while (pt_index < h.page_entries) : (pt_index += 1) {
             const entry = pt_page[pt_index];
@@ -2089,16 +2214,16 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
     const slot_limit = ptSlotScanLimit(space);
     var slot: usize = 0;
     while (slot < slot_limit) : (slot += 1) {
-        const pd_index_meta = space.pt_page_pd_index[slot];
-        const pml4_index_meta = space.pt_page_pml4_index[slot];
-        const pdp_index_meta = space.pt_page_pdp_index[slot];
+        const pd_index_meta = space.ptPdIndex(slot).*;
+        const pml4_index_meta = space.ptPml4Index(slot).*;
+        const pdp_index_meta = space.ptPdpIndex(slot).*;
         if (pml4_index_meta == UserAddressSpace.no_pd_index) continue;
         if (pdp_index_meta == UserAddressSpace.no_pd_index) continue;
         if (pd_index_meta == UserAddressSpace.no_pd_index) continue;
         const pml4_index: usize = @intCast(pml4_index_meta);
         const pdp_index: usize = @intCast(pdp_index_meta);
         const pd_index: usize = @intCast(pd_index_meta);
-        const pt_page: *const [512]u64 = &space.pt_pages[slot];
+        const pt_page: *const [512]u64 = space.ptPage(slot);
         var pt_index: usize = 0;
         while (pt_index < h.page_entries) : (pt_index += 1) {
             const entry = pt_page[pt_index];
@@ -2130,9 +2255,12 @@ pub fn collectUserMappedPages(principal: kernel.PrincipalId, out_pages: []Mapped
     return count;
 }
 
+/// Bootstrap builder: caller owns an unpublished/quiescent address space.
+/// Published address spaces require the caller's address-space exclusion.
 pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64, user_stack_paddr: u64) bool {
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
+    detachAndReleaseUserPtStorage(h, space, principal);
     @memset(space.pml4[0..], 0);
     h.seed_user_pml4_with_kernel(space.pml4[0..]);
     var pdp_slot_init: usize = 0;
@@ -2148,14 +2276,7 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
         const pd_page: *[512]u64 = &space.pd_pages[pd_slot_init];
         @memset(pd_page[0..], 0);
     }
-    var pt_slot_init: usize = 0;
-    while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
-        space.pt_page_pml4_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pdp_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot_init];
-        @memset(pt_page[0..], 0);
-    }
+    space.pt_store.resetDetachedContents();
     space.pdp_page_used_len = 0;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;
@@ -2176,8 +2297,8 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
 
     const user_slot = ensureUserPtSlotForPd(space, pml4_index, pdp_index, pd_index_base) orelse return false;
     const stack_slot = ensureUserPtSlotForPd(space, stack_pml4_index, stack_pdp_index, stack_pd_index) orelse return false;
-    const user_pt_page: *[512]u64 = &space.pt_pages[user_slot];
-    const stack_pt_page: *[512]u64 = &space.pt_pages[stack_slot];
+    const user_pt_page: *[512]u64 = space.ptPage(user_slot);
+    const stack_pt_page: *[512]u64 = space.ptPage(stack_slot);
     if (!reserveUserMapping(principal, h.user_va, 1, .bootstrap, true)) return false;
     if (!reserveUserMapping(principal, h.user_stack_page_va, 1, .bootstrap, true)) return false;
     user_pt_page[user_pt_index] = user_page_paddr | h.page_present | h.page_user;
@@ -2186,9 +2307,11 @@ pub fn buildUserAddressSpace(principal: kernel.PrincipalId, user_page_paddr: u64
     return true;
 }
 
+/// Staging builder with the same unpublished/quiescent ownership as above.
 pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
     const h = hooks orelse return false;
     const space = getUserSpace(principal) orelse return false;
+    detachAndReleaseUserPtStorage(h, space, principal);
     @memset(space.pml4[0..], 0);
     h.seed_user_pml4_with_kernel(space.pml4[0..]);
     var pdp_slot_init: usize = 0;
@@ -2204,14 +2327,7 @@ pub fn buildEmptyUserAddressSpace(principal: kernel.PrincipalId) bool {
         const pd_page: *[512]u64 = &space.pd_pages[pd_slot_init];
         @memset(pd_page[0..], 0);
     }
-    var pt_slot_init: usize = 0;
-    while (pt_slot_init < UserAddressSpace.max_dynamic_pt_pages) : (pt_slot_init += 1) {
-        space.pt_page_pml4_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pdp_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        space.pt_page_pd_index[pt_slot_init] = UserAddressSpace.no_pd_index;
-        const pt_page: *[512]u64 = &space.pt_pages[pt_slot_init];
-        @memset(pt_page[0..], 0);
-    }
+    space.pt_store.resetDetachedContents();
     space.pdp_page_used_len = 0;
     space.pd_page_used_len = 0;
     space.pt_page_used_len = 0;

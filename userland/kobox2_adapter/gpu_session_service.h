@@ -23,6 +23,7 @@ struct ph_gpu_session_service {
     int (*file)(struct kobox_linux_drm_service *, uint64_t, struct kobox_linux_drm_file **);
     int (*close)(struct kobox_linux_drm_service *, uint64_t);
     int (*unmap)(struct kobox_linux_drm_service *, uint64_t);
+    int (*take_fence)(struct kobox_linux_drm_service *, struct kobox_drm_fence_result *);
 };
 
 int ph_gpu_session_service_init(struct ph_gpu_session_service *service,

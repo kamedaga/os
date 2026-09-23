@@ -296,13 +296,29 @@ static int syncobj_array(struct kobox_linux_drm_file *file, const void *handles,
     return 0;
 }
 
-static int virtgpu_execbuffer(struct kobox_linux_drm_file *file,
+static size_t fence_results, fence_taken;
+static int take_fence(struct kobox_linux_drm_service *service,
+    struct kobox_drm_fence_result *result) {
+    assert(service && result);
+    if (fence_taken == fence_results)
+        return 0;
+    *result = (struct kobox_drm_fence_result) {
+        .session = 71, .correlation = 100 + fence_taken,
+        .status = fence_taken % 2 ? -EIO : 1,
+    };
+    ++fence_taken;
+    return 1;
+}
+
+static int virtgpu_execbuffer(struct kobox_linux_drm_service *service,
+    uint64_t cookie, uint64_t session, uint64_t correlation,
     uint32_t flags, uint32_t ring_index,
     const void *command, size_t command_size,
     const void *handles, size_t handle_count,
     const void *input_syncobjs, size_t input_count,
     const void *output_syncobjs, size_t output_count) {
-    assert(file && command && command_size);
+    (void)service; (void)cookie; (void)correlation;
+    assert(session && command && command_size);
     assert(!flags && !ring_index);
     assert((handles && handle_count) || (!handles && !handle_count));
     assert(!input_syncobjs && !input_count && !output_syncobjs && !output_count);
@@ -388,7 +404,10 @@ static int prime_import(struct kobox_linux_drm_service *service,
 struct ph_image ph_core;
 static unsigned char native_vmo[PH_GPU_QUERY_VMO_SIZE];
 static _Alignas(16) unsigned char queue_vmo[GPUD_GPU_CHANNEL_SIZE];
-static _Alignas(4096) unsigned char private_aux[4096];
+static _Alignas(4096) unsigned char private_aux[PH_GPU_QUERY_AUX_REUSE_BYTES];
+static _Alignas(4096) unsigned char large_aux[2 * PH_GPU_QUERY_AUX_REUSE_BYTES];
+static unsigned int aux_mapped;
+static int aux_map_failure, aux_unmap_failure;
 static void *active_vmo = native_vmo;
 static size_t active_size = sizeof(native_vmo);
 static struct ph_ipc_packet sent;
@@ -536,7 +555,7 @@ void *ph_image_lookup(void *image, const char *name) {
         memcpy(&symbol, &api.virtgpu_get_caps, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_virtgpu_context_init"))
         memcpy(&symbol, &api.virtgpu_context_init, sizeof(symbol));
-    if (!strcmp(name, "kobox_linux_drm_virtgpu_execbuffer"))
+    if (!strcmp(name, "kobox_linux_drm_service_execbuffer"))
         memcpy(&symbol, &api.virtgpu_execbuffer, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_virtgpu_resource_create"))
         memcpy(&symbol, &api.virtgpu_resource_create, sizeof(symbol));
@@ -550,7 +569,7 @@ void *ph_image_lookup(void *image, const char *name) {
         memcpy(&symbol, &api.virtgpu_map, sizeof(symbol));
     struct ph_gpu_session_service files = {
         .open = file_open, .file = file_lookup, .close = file_close,
-        .unmap = file_unmap};
+        .unmap = file_unmap, .take_fence = take_fence};
     if (!strcmp(name, "kobox_linux_drm_service_open"))
         memcpy(&symbol, &files.open, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_service_file"))
@@ -559,6 +578,8 @@ void *ph_image_lookup(void *image, const char *name) {
         memcpy(&symbol, &files.close, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_service_unmap"))
         memcpy(&symbol, &files.unmap, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_service_take_fence"))
+        memcpy(&symbol, &files.take_fence, sizeof(symbol));
     return symbol;
 }
 
@@ -572,8 +593,9 @@ long pacha_syscall2(uint64_t number, uint64_t a0, uint64_t a1) {
                                    .flags = PACHA_FD_FLAG_CLOEXEC};
     } else {
         assert(number == PACHA_VM_SYSCALL_MUNMAP);
-        if (a0 == (uintptr_t)private_aux) {
-            assert(a1 <= sizeof(private_aux));
+        if (a0 == (uintptr_t)private_aux || a0 == (uintptr_t)large_aux) {
+            assert(a1 <= (a0 == (uintptr_t)private_aux ? sizeof(private_aux) : sizeof(large_aux)));
+            if (aux_unmap_failure) return PACHA_SYSCALL_ERR_INVALID;
             ++aux_unmapped;
         } else {
             assert(a0 == (uintptr_t)active_vmo && a1 == active_size);
@@ -619,9 +641,11 @@ long pacha_syscall6(
     assert(number == PACHA_VM_SYSCALL_MMAP && !a1 &&
            a3 == (PACHA_PROT_READ | PACHA_PROT_WRITE) && !a5);
     if (!a0) {
-        assert(a2 <= sizeof(private_aux) &&
+        assert(a2 <= sizeof(large_aux) &&
                a4 == (PACHA_MMAP_PRIVATE | PACHA_MMAP_ANONYMOUS));
-        return (long)(uintptr_t)private_aux;
+        if (aux_map_failure) return PACHA_SYSCALL_ERR_ALLOC;
+        ++aux_mapped;
+        return (long)(uintptr_t)(a2 <= sizeof(private_aux) ? private_aux : large_aux);
     }
     assert(a0 == 16 && a2 == active_size && a4 == PACHA_MMAP_SHARED);
     ++mapped;
@@ -681,6 +705,62 @@ static void native_transport_case(uint64_t capability, int expected_error) {
                                 PH_GPU_QUERY_PAGE) == expected_error);
     assert(!service.release(service.context) && unmapped == 1 && !query.mapping);
     assert(service.prepare(service.context, &packet) == -EPROTO && mapped == 1); /* No replay. */
+    assert(!service.stop(service.context));
+}
+
+static int prepare_caps_snapshot(struct ph_gpu_query *query, uint64_t correlation, uint32_t bytes) {
+    struct gpud_drm_binding binding = {.generation = 9, .frontend_handle = 8, .session_id = 7};
+    gpud_drm_virtgpu_get_caps_t caps = {.cap_set_id = 1, .cap_set_ver = 2, .size = bytes};
+    gpud_drm_ioctl_request_t request = {.handle = 8,
+        .request = GPUD_DRM_IOCTL_VIRTGPU_GET_CAPS, .arg_size = sizeof(caps),
+        .data_size = sizeof(caps), .aux_size = bytes};
+    memcpy(request.data, &caps, sizeof(caps));
+    struct gpud_drm_translation translation;
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, PH_GPU_QUERY_OUTPUT_REGION));
+    kb2_protocol_message_envelope_t envelope = {.protocol_id = KB2_GPU_PROTOCOL_ID,
+        .opcode = KB2_GPU_OPCODE_COMMAND, .generation = 9, .correlation_id = correlation,
+        .payload_length = translation.command_size};
+    size_t size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + translation.command_size;
+    assert(!kb2_protocol_message_envelope_encode(query->request, size, &envelope));
+    memcpy(query->request + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+        translation.command, translation.command_size);
+    return ph_gpu_query_prepare_snapshot(query, size, correlation, KB2_GPU_QUEUE_EXECUTION);
+}
+
+static void private_aux_lifetime(void) {
+    struct ph_gpu_query query = {0};
+    struct ph_lifecycle_service service;
+    assert(!ph_gpu_query_init(&query, 9, 7, &service));
+    assert(ph_gpu_query_destroy_aux(NULL) == -EINVAL);
+    aux_mapped = aux_unmapped = 0;
+    aux_map_failure = 1;
+    assert(prepare_caps_snapshot(&query, 1, 5284) == -ENOMEM);
+    assert(!query.aux && !query.aux_cache && !query.correlation);
+    aux_map_failure = 0;
+    for (uint64_t i = 1; i <= 8; ++i) {
+        assert(!prepare_caps_snapshot(&query, i, i % 2 ? 5284 : 7276));
+        assert(query.aux == private_aux && query.aux_cache == private_aux);
+        assert(query.aux_mapping_size == sizeof(private_aux));
+        for (size_t j = 0; j < 8192; ++j) assert(!private_aux[j]);
+        memset(query.aux, 0xa5, 8192);
+        assert(prepare_caps_snapshot(&query, i + 1, 5284) == -EPROTO);
+        assert(!ph_gpu_query_release_aux(&query) && !query.aux && !query.aux_size);
+        assert(aux_mapped == 1 && !aux_unmapped);
+    }
+    assert(!prepare_caps_snapshot(&query, 9, sizeof(private_aux) + 1));
+    assert(query.aux == large_aux && query.aux_mapping_size == sizeof(private_aux) + 4096);
+    assert(query.aux_cache == private_aux && aux_mapped == 2);
+    aux_unmap_failure = 1;
+    assert(ph_gpu_query_release_aux(&query) == -EIO && query.aux == large_aux);
+    assert(prepare_caps_snapshot(&query, 10, 5284) == -EPROTO);
+    aux_unmap_failure = 0;
+    assert(!ph_gpu_query_release_aux(&query) && aux_unmapped == 1);
+    assert(!prepare_caps_snapshot(&query, 10, 5284) && query.aux == private_aux && aux_mapped == 2);
+    aux_unmap_failure = 1;
+    assert(service.stop(service.context) == -EIO && query.aux_cache == private_aux);
+    aux_unmap_failure = 0;
+    assert(!service.stop(service.context) && !query.aux && !query.aux_cache && aux_unmapped == 2);
+    assert(!service.stop(service.context) && aux_unmapped == 2);
 }
 
 static void codec_errors(const unsigned char *bytes, size_t size, uint64_t session) {
@@ -1127,6 +1207,81 @@ static void display_execution(void) {
         properties.props[1] == 102 && properties.prop_values[1] == 202);
 }
 
+static void native_fence_events(void) {
+    struct ph_gpu_queue queue = {0};
+    struct gpud_gpu_sessions sessions = {0};
+    struct gpud_gpu_channel frontend = {0};
+    struct ph_lifecycle_service service;
+    memset(queue_vmo, 0, sizeof(queue_vmo));
+    active_vmo = queue_vmo;
+    active_size = sizeof(queue_vmo);
+    mapped = unmapped = aux_unmapped = sends = 0;
+    assert(!ph_gpu_channel_bind(&frontend, queue_vmo, 9, 27,
+        KB2_VQ_DRIVER, &kb2_vq_x86_64_atomics));
+    assert(!ph_gpu_sessions_init(&sessions, 9, 2));
+    assert(!ph_gpu_queue_init(&queue, &sessions, 7, 27,
+        &kb2_vq_x86_64_atomics, &service));
+    struct ph_ipc_packet packet = {
+        .operation = PH_GPU_QUEUE_BIND, .generation = 9, .value = 27,
+        .fd_count = 1,
+        .fds = {{.fd = 16, .rights = PH_GPU_QUERY_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC}},
+    };
+    assert(service.prepare(service.context, &packet) == PH_LIFECYCLE_SERVICE_IDLE);
+    const size_t batch = PH_GPU_DRM_EVENT_BYTES / PH_GPU_FENCE_RECORD_BYTES;
+    /* No open file/session remains. Completions must survive that close,
+     * and a temporarily missing posted event buffer must not lose them. */
+    fence_taken = 0;
+    fence_results = 2 * batch;
+    assert(!queue.event_host.notify_fences(queue.event_host.context));
+    assert(!queue.event_host.notify_fences(queue.event_host.context));
+    assert(service.next(service.context) == PH_LIFECYCLE_SERVICE_IDLE);
+    assert(atomic_load(&queue.fence_pending) && !fence_taken);
+    kb2_vq_t *lane = &frontend.lanes[GPUD_GPU_QUEUE_EVENT];
+    size_t verified = 0;
+    for (unsigned int pass = 0; pass < 3; ++pass) {
+        kb2_vq_segment_t segment = {
+            .address = GPUD_GPU_EVENT_OFFSET,
+            .length = GPUD_GPU_CHANNEL_PAGE, .writable = 1,
+        };
+        kb2_vq_chain_t chain = {.segments = &segment, .capacity = 1, .count = 1};
+        int ready, notify;
+        assert(!kb2_vq_arm(lane, 9, &ready) && !ready);
+        assert(!kb2_vq_publish(lane, 9, &chain, &notify));
+        packet = (struct ph_ipc_packet) {
+            .operation = PH_GPU_QUEUE_NOTIFY, .generation = 9,
+            .value = lane->queue.available_notification_id,
+        };
+        assert(!service.prepare(service.context, &packet));
+        assert(queue.event_fences && !sessions.occupied);
+        assert(!service.dispatch(service.context, &calls));
+        struct ph_ipc ipc = {.generation = 9};
+        assert(!service.complete(service.context, &ipc));
+        assert(!service.release(service.context));
+        kb2_vq_chain_t *done = NULL;
+        assert(!kb2_vq_take_used(lane, 9, &done) && done == &chain);
+        unsigned char bytes[GPUD_GPU_CHANNEL_PAGE];
+        assert(!kb2_vq_copy_response(lane, 9, done, 0, bytes, done->used_length));
+        struct ph_gpu_drm_event_message event;
+        assert(!ph_gpu_drm_event_decode(bytes, done->used_length, 9, &event));
+        assert(event.fences && !event.session_id && event.sequence == pass + 1);
+        assert(event.data_size == (pass < 2 ? batch * PH_GPU_FENCE_RECORD_BYTES : 0));
+        for (size_t offset = 0; offset < event.data_size; offset += PH_GPU_FENCE_RECORD_BYTES) {
+            const unsigned char *record = event.data + offset;
+            assert(ph_gpu_event_load_u64(record) == 71);
+            assert(ph_gpu_event_load_u64(record + 8) == 100 + verified);
+            assert((int32_t)ph_gpu_event_load_u32(record + 16) == (verified % 2 ? -EIO : 1));
+            assert(!ph_gpu_event_load_u32(record + 20));
+            ++verified;
+        }
+        assert(!kb2_vq_release(lane, 9, done));
+    }
+    assert(verified == fence_results && fence_taken == fence_results);
+    assert(!atomic_load(&queue.fence_pending));
+    assert(service.next(service.context) == PH_LIFECYCLE_SERVICE_IDLE);
+    assert(!service.stop(service.context) && !queue.mapping && unmapped == 1);
+    fence_results = fence_taken = 0;
+}
+
 static void native_queue_case(unsigned int defect) {
     struct ph_gpu_queue queue = {0};
     struct gpud_gpu_sessions sessions = {0};
@@ -1218,11 +1373,11 @@ static void native_queue_case(unsigned int defect) {
     sends = 0;
     packet = (struct ph_ipc_packet){.operation = PH_GPU_QUEUE_NOTIFY, .generation = 9, .value = 7};
     assert(service.prepare(service.context, &packet) == PH_LIFECYCLE_SERVICE_IDLE);
-    const uint64_t command_count = defect ? 2 : 3;
+    const uint64_t command_count = defect ? 2 : 5;
     for (uint64_t correlation = 1; correlation <= command_count; ++correlation) {
         struct gpud_drm_binding binding = {
             .generation = 9, .frontend_handle = 8, .session_id = opened.session_id};
-        bool input = !defect && correlation == 2;
+        bool input = !defect && (correlation == 2 || correlation >= 4);
         bool display = !defect && correlation == 3;
         gpud_drm_ioctl_request_t request = {.handle = 8};
         if (display) {
@@ -1289,7 +1444,7 @@ static void native_queue_case(unsigned int defect) {
         struct ph_ipc ipc = {.generation = 9};
         assert(service.complete(service.context, &ipc) == (defect == 4 ? -ENODEV : 0));
         assert(!service.release(service.context) && !unmapped && mapped == 1);
-        assert(aux_unmapped == (!defect && correlation >= 2 ? 1u : 0u));
+        assert(!aux_unmapped); /* Published requests relinquish ownership, not reusable backing. */
         assert(sends == correlation && sent.operation == PH_GPU_QUEUE_NOTIFY &&
                sent.value == (display ? 6 : 8));
         kb2_vq_chain_t *done = NULL;
@@ -1311,6 +1466,7 @@ static void native_queue_case(unsigned int defect) {
         assert(service.prepare(service.context, &packet) == PH_LIFECYCLE_SERVICE_IDLE);
     }
     assert(!service.stop(service.context) && unmapped == 1 && !queue.mapping);
+    assert(aux_unmapped == (!defect ? 1u : 0u) && !queue.service.query.aux_cache);
     assert(!service.stop(service.context) && unmapped == 1);
 }
 
@@ -1601,12 +1757,14 @@ int main(void) {
     native_transport_case(5, 0);
     native_transport_case(UINT64_MAX, -EINVAL);
     native_transport_case(6, -EIO);
+    private_aux_lifetime();
     virtgpu_input_execution();
     display_execution();
     cursor_execution();
     for (unsigned int defect = 0; defect <= 7; ++defect)
         native_queue_case(defect);
     session_service_cases();
+    native_fence_events();
     puts("gpud GPU query pipeline: PASS encode, private plan, typed dispatch, canonical "
          "completion, loss admission");
     return 0;

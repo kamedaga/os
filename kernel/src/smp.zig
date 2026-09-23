@@ -607,13 +607,81 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     @import("realtime_clock.zig").registerCpu(cpu_slot, x86_platform.kernelPointerPaddr);
     setCpuState(cpu_slot, .idle);
     markStarted(cpu_slot);
+    lapic.disarmTimer();
     apIdleLoop(cpu_slot);
 }
 
 pub fn ucMinusMmioAllowed(paddr: u64, bytes: u64) bool {
     const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
     return verified != 0 and verified == onlineCpuMask() and
-        mmio_cache_snapshots[0].rangeIsUncached(paddr, bytes);
+        ucMinusMmioWithSnapshot(&mmio_cache_snapshots[0], paddr, bytes);
+}
+
+fn kernelIdentityRanges() [2][2]u64 {
+    return .{
+        .{ 0, @import("arch/x86_64/physical_layout.zig").identity_limit },
+        .{ x86_platform.phys_copy_window_va + (1 << 21), x86_platform.phys_copy_window_va +
+            (@as(u64, x86_platform.high_mmio_pdp_table_count) << 30) },
+    };
+}
+
+fn identityAliasesUncached(snapshot: *const mtrr.CacheSnapshot, paddr: u64, bytes: u64) bool {
+    // Caller already validated the entire aligned physical range and overflow.
+    for (kernelIdentityRanges()) |range| {
+        const start = @max(paddr, range[0]);
+        const end = @min(paddr + bytes, range[1]);
+        if (start < end and !snapshot.rangeIsUncached(start, end - start)) return false;
+    }
+    return true;
+}
+
+fn ucMinusMmioWithSnapshot(snapshot: *const mtrr.CacheSnapshot, paddr: u64, bytes: u64) bool {
+    return snapshot.rangeIsUcMinusUncached(paddr, bytes) and
+        identityAliasesUncached(snapshot, paddr, bytes);
+}
+
+/// Explicit UC for the kernel's temporary MMIO window. Existing WB-encoded
+/// identity aliases must remain effectively UC, including the high window.
+pub fn uncachedKernelMmioPageAllowed(paddr: u64) bool {
+    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
+    if (verified == 0 or verified != onlineCpuMask()) return false;
+    return uncachedKernelMmioPageWithSnapshot(&mmio_cache_snapshots[0], paddr);
+}
+
+fn uncachedKernelMmioPageWithSnapshot(snapshot: *const mtrr.CacheSnapshot, paddr: u64) bool {
+    if (!snapshot.rangeSupportsUncachedMapping(paddr, 4096)) return false;
+    return identityAliasesUncached(snapshot, paddr, 4096);
+}
+
+test "MMIO alias cache proof includes low and high identity boundaries" {
+    var snapshot = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 7) << 16),
+        .physical_bits = 46,
+        .default_type = (1 << 11) | 6,
+    };
+    const low_end = @import("arch/x86_64/physical_layout.zig").identity_limit;
+    const high_start = x86_platform.phys_copy_window_va + (1 << 21);
+    const high_end = x86_platform.phys_copy_window_va +
+        (@as(u64, x86_platform.high_mmio_pdp_table_count) << 30);
+    for ([_]u64{ low_end - 4096, high_start, high_end - 4096 }) |paddr| {
+        try std.testing.expect(!uncachedKernelMmioPageWithSnapshot(&snapshot, paddr));
+        try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, paddr, 4096));
+    }
+    for ([_]u64{ low_end, high_start - 4096, high_end, 0x380000000000 }) |paddr| {
+        try std.testing.expect(uncachedKernelMmioPageWithSnapshot(&snapshot, paddr));
+        try std.testing.expect(ucMinusMmioWithSnapshot(&snapshot, paddr, 4096));
+    }
+    for ([_]u64{ low_end - 4096, high_start - 4096, high_end - 4096 }) |paddr| {
+        try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, paddr, 8192));
+    }
+    try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, 0x380000000000, std.math.maxInt(u64)));
+    try std.testing.expect(!ucMinusMmioWithSnapshot(&snapshot, (1 << 46) - 4096, 8192));
+    snapshot.default_type = 1 << 11;
+    for ([_]u64{ low_end - 4096, high_start, high_end - 4096 }) |paddr| {
+        try std.testing.expect(uncachedKernelMmioPageWithSnapshot(&snapshot, paddr));
+        try std.testing.expect(ucMinusMmioWithSnapshot(&snapshot, paddr, 8192));
+    }
+    try std.testing.expect(!uncachedKernelMmioPageWithSnapshot(&snapshot, 1 << 46));
 }
 
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {
@@ -739,8 +807,10 @@ test "broadcast enumeration fails closed on capacity and reserved APIC ID" {
     try std.testing.expect(!info.broadcast_topology_complete);
 }
 
+// Both callers enter with IF clear and the local timer already stopped.
+// In particular, interrupt return stops it before changing CR3/CPU state;
+// repeating that hardware write here adds no protection.
 fn apIdleLoop(cpu_slot: usize) noreturn {
-    lapic.disarmTimer();
     while (true) {
         scheduler_observer.observeIdle(cpu_slot);
         scheduler_observer.pollIdleScheduler(cpu_slot);

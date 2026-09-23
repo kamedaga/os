@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../support/browser_diag.h"
 
 enum { LPR_EXEC_BACKEND_SNAPSHOT_BYTES = 256u };
 
@@ -147,7 +148,7 @@ static int lpr_exec_local_fd_preserve_unlocked(uint64_t fd)
         return 0;
     }
     const lpr_fd_entry_t *slot = &lpr_control_fd_table.entries[fd];
-    if (!slot->active || slot->ofd_index >= lpr_control_fd_table.ofd_count) {
+    if (slot->active != 1 || slot->ofd_index >= lpr_control_fd_table.ofd_count) {
         return 0;
     }
     const lpr_ofd_t *file = &lpr_control_fd_table.ofds[slot->ofd_index];
@@ -163,7 +164,7 @@ static int lpr_fork_local_fd_preserve_unlocked(uint64_t fd)
 {
     if (fd >= lpr_control_fd_table.entry_count) return 0;
     const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[fd];
-    if (!entry->active || entry->ofd_index >= lpr_control_fd_table.ofd_count)
+    if (entry->active != 1 || entry->ofd_index >= lpr_control_fd_table.ofd_count)
         return 0;
     const lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[entry->ofd_index];
     return ofd->active && lpr_ofd_ops_id(ofd) != LPR_FD_OPS_NONE;
@@ -287,6 +288,20 @@ static uint32_t lpr_exec_backend_native_fds(
     return count;
 }
 
+static void lpr_fork_close_displaced_capabilities(
+    uint8_t ops_id, const void *original, const void *prepared)
+{
+    int32_t old_fds[2], new_fds[2];
+    const uint32_t old_count = lpr_exec_backend_native_fds(ops_id, original, old_fds);
+    const uint32_t new_count = lpr_exec_backend_native_fds(ops_id, prepared, new_fds);
+    for (uint32_t i = 0; i < old_count; ++i) {
+        uint32_t j = 0;
+        while (j < new_count && new_fds[j] != old_fds[i]) ++j;
+        if (j == new_count && (i == 0 || old_fds[i] != old_fds[0]))
+            (void)lpr_close_native_fd_if_open((uint32_t)old_fds[i]);
+    }
+}
+
 static void lpr_exec_unpin(lpr_exec_transaction_t *transaction)
 {
     if (transaction == 0 || transaction->pins == 0) return;
@@ -339,6 +354,24 @@ static int lpr_backend_needs_transfer_lease(uint8_t ops_id, const void *state)
     default:
         return 0;
     }
+}
+
+static uint32_t lpr_exec_manifest_capability_count(uint8_t ops_id, const void *state)
+{
+    if (ops_id == LPR_FD_OPS_UNIX) return 1;
+    if (ops_id == LPR_FD_OPS_FILED)
+        return ((const lpr_filed_backend_t *)state)->handle != 0;
+    int32_t native_fds[2];
+    uint32_t count = lpr_exec_backend_native_fds(ops_id, state, native_fds);
+    if (lpr_backend_needs_transfer_lease(ops_id, state)) {
+        /* PRIME exports already have an original-owner lease. Preparing the
+         * recipient replaces it, unlike backends that start without a lease. */
+        if (ops_id == LPR_FD_OPS_DMABUF &&
+            ((const lpr_dmabuf_backend_t *)state)->lease_fd.raw >= 16)
+            --count;
+        ++count;
+    }
+    return count;
 }
 
 static int lpr_duplicate_manifest_capability(
@@ -395,7 +428,6 @@ static void lpr_manifest_diag(const char *stage)
         length);
 }
 
-#if defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG
 static char *lpr_manifest_diag_append_text(
     char *out,
     const char *end,
@@ -468,7 +500,6 @@ static void lpr_manifest_filed_diag(
         (uint64_t)(uintptr_t)line,
         (uint64_t)(out - line));
 }
-#endif
 
 static const char *lpr_manifest_backend_stage(uint8_t ops_id)
 {
@@ -597,6 +628,9 @@ static int lpr_prepare_backend_record(
                 transaction, pin_index, lease_fd);
         if (status != 0) {
             lpr_manifest_diag(lpr_manifest_backend_stage(ops_id));
+            if (ops_id == LPR_FD_OPS_FILED)
+                lpr_manifest_filed_diag("prepare-failed", pin_index,
+                    (const lpr_filed_backend_t *)original_state, status);
             if (lease_fd >= 16)
                 (void)lpr_close_native_fd_if_open(
                     (uint64_t)(uint32_t)lease_fd);
@@ -907,20 +941,9 @@ static int lpr_prepare_manifest_impl(
     uint64_t capability_count = transaction->cwd_lease_fd >= 16 ? 1u : 0u;
     for (uint64_t i = 0; i < transaction->pin_count; ++i) {
         record_bytes += lpr_exec_backend_record_bytes(transaction->pins[i].ops_id);
-        if (transaction->pins[i].ops_id == LPR_FD_OPS_UNIX) { capability_count++; continue; }
-        if (transaction->pins[i].ops_id == LPR_FD_OPS_FILED) {
-            /* Replace, rather than append to, an already leased descriptor. */
-            capability_count += ((const lpr_filed_backend_t *)transaction->pins[i].state)->handle != 0;
-            continue;
-        }
-        int32_t native_fds[2];
-        capability_count += lpr_exec_backend_native_fds(
+        capability_count += lpr_exec_manifest_capability_count(
             transaction->pins[i].ops_id,
-            transaction->pins[i].state,
-            native_fds);
-        capability_count += lpr_backend_needs_transfer_lease(
-            transaction->pins[i].ops_id,
-            transaction->pins[i].state) ? 1u : 0u;
+            transaction->pins[i].state);
     }
     lpr_manifest_layout_t layout;
     if (lpr_manifest_layout(entry_count, transaction->pin_count,
@@ -1180,6 +1203,62 @@ int lpr_fork_transaction_prepare(lpr_exec_transaction_t *transaction)
     return 0;
 }
 
+static int lpr_fork_restore_fd_snapshot(lpr_exec_transaction_t *transaction)
+{
+    lpr_fd_table_t *table = &lpr_control_fd_table;
+    lpr_manifest_t *manifest = transaction->manifest;
+    const lpr_manifest_entry_t *entries = lpr_manifest_entries(manifest);
+    for (uint64_t i = 0; i < manifest->entry_count; ++i) {
+        if (entries[i].fd >= table->entry_count ||
+            entries[i].ofd_index >= transaction->pin_count)
+            return -LPR_LINUX_EIO;
+    }
+
+    /* Other parent threads can open/close FDs between preparation and native
+     * clone. The prepared leases describe the earlier snapshot, not that
+     * later table. Discard only the child's displaced native capabilities;
+     * never send service CLOSE against a handle owned by the parent. */
+    for (uint32_t i = 0; i < table->backend_count; ++i) {
+        lpr_backend_record_t *backend = &table->backends[i];
+        if (!backend->active) continue;
+        uint64_t pin = 0;
+        while (pin < transaction->pin_count &&
+            transaction->pins[pin].backend_index != i) ++pin;
+        if (pin != transaction->pin_count) continue;
+        lpr_fork_close_displaced_capabilities(backend->ops_id, backend->state, 0);
+        if (backend->ops_id == LPR_FD_OPS_UNIX)
+            lpr_unix_mapping_destroy(&((struct lpr_unix_socket *)backend->state)->mapping);
+        (void)lpr_backend_state_free(backend->state, backend->state_bytes);
+        lpr_memset(backend, 0, sizeof(*backend));
+    }
+    for (uint32_t i = 0; i < table->ofd_count; ++i) {
+        lpr_ofd_t *ofd = &table->ofds[i];
+        uint64_t pin = 0;
+        while (pin < transaction->pin_count &&
+            transaction->pins[pin].ofd_index != i) ++pin;
+        if (pin == transaction->pin_count) {
+            lpr_memset(ofd, 0, sizeof(*ofd));
+            continue;
+        }
+        ofd->refcount = 0;
+        ofd->closing = 0;
+        /* Only this transaction's pin survives: sibling threads do not. */
+        ofd->pin_count = 1;
+    }
+    lpr_memset(table->entries, 0, table->entry_count * sizeof(*table->entries));
+    for (uint64_t i = 0; i < manifest->entry_count; ++i) {
+        const lpr_manifest_entry_t *entry = &entries[i];
+        const lpr_fd_pin_t *pin = &transaction->pins[entry->ofd_index];
+        table->entries[entry->fd] = (lpr_fd_entry_t){
+            .active = 1, .fd_flags = entry->fd_flags,
+            .ofd_index = pin->ofd_index, .ofd_generation = pin->ofd_generation,
+            .effective_rights = entry->effective_rights,
+        };
+        table->ofds[pin->ofd_index].refcount++;
+    }
+    return 0;
+}
+
 int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction)
 {
     enum { LPR_FORK_PREPARED = 1u, LPR_FORK_COMMITTED = 2u };
@@ -1198,6 +1277,8 @@ int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction)
             lpr_fork_manifest_record(transaction, i) == 0)
             return -LPR_LINUX_EIO;
     }
+    if (lpr_fork_restore_fd_snapshot(transaction) != 0)
+        return -LPR_LINUX_EIO;
     for (uint64_t i = 0; i < transaction->pin_count; ++i) {
         const lpr_fd_pin_t *pin = &transaction->pins[i];
         lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[pin->ofd_index];
@@ -1205,6 +1286,10 @@ int lpr_fork_transaction_commit_child(lpr_exec_transaction_t *transaction)
         const void *prepared = lpr_fork_manifest_record(transaction, i);
         if (pin->ops_id == LPR_FD_OPS_UNIX)
             lpr_unix_mapping_destroy(&((struct lpr_unix_socket *)state)->mapping);
+        /* Native fork inherited the original descriptors as well as the
+         * prepared ones. Replacing the record must relinquish the child's
+         * displaced ownership, without issuing CLOSE for the parent's OFD. */
+        lpr_fork_close_displaced_capabilities(pin->ops_id, state, prepared);
         lpr_memcpy(
             state,
             prepared,
@@ -1350,7 +1435,16 @@ void lpr_close_local_state_before_self_exec(void)
 
 void lpr_linux_prepare_process_exit(uint64_t exit_code)
 {
+    lpr_browser_diag("exit-prepare", exit_code, lpr_state.thread_count, 0);
     lpr_trace_process_event("exit_prepare", exit_code, 0, 0);
+    /* Closing the shared FD table while siblings still execute lets an
+     * otherwise normal exit become EBADF/fatal errors in those threads.
+     * Native PROCESS_EXIT stops every thread before dropping capabilities;
+     * service session/lease HANGUP handlers then reclaim remote ownership.
+     * Do not take userland cleanup locks that an exiting sibling may hold.
+     * thread_count can overestimate after joinable exits, which is safe here. */
+    if (__atomic_load_n(&lpr_state.thread_count, __ATOMIC_ACQUIRE) > 1u)
+        return;
     lpr_fd_arrays_init();
     for (uint64_t fd = 0; fd < lpr_fd_table_capacity; ++fd)
         if (!lpr_runtime_reserved_fd(fd) && lpr_control_fd_active(fd))

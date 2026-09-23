@@ -4,6 +4,87 @@
 #include <pacha/capsule.h>
 #include <errno.h>
 
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+/* Successful operations only. Log powers of two per size/direction/path
+ * bucket; no clocks or additional locks. Counts in logs are lower bounds.
+ * A private diagnostic build changes neither the wire nor native DMA ABI.
+ */
+static void dma_profile_record(struct ph_dma *dma, struct ph_dma_mapping *mapping,
+    unsigned int operation, unsigned int direction) {
+    const size_t pages = mapping->length / PH_PAGE_SIZE;
+    const unsigned int bucket = pages <= 1 ? 0 : pages <= 2 ? 1 :
+        pages <= 4 ? 2 : pages <= 16 ? 3 : pages <= 256 ? 4 : 5;
+    const unsigned int view = mapping->view != NULL;
+    uint64_t *count = &dma->profile_counts[operation][direction - 1][bucket][view];
+    if (*count == UINT64_MAX) return;
+    ++*count;
+    if ((*count & (*count - 1)) != 0) return;
+    const char *labels[] = {" op=", " device=", " direction=", " pages=",
+        " view=", " bucket=", " count="};
+    const uint64_t values[] = {operation, dma->config.native_device, direction,
+        pages, view, bucket, *count};
+    char buffer[256] = "PH_DMA";
+    size_t length = 6;
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+        for (const char *label = labels[i]; *label; ++label) buffer[length++] = *label;
+        buffer[length++] = '0';
+        buffer[length++] = 'x';
+        for (int shift = 60; shift >= 0; shift -= 4)
+            buffer[length++] = "0123456789abcdef"[(values[i] >> shift) & 15];
+    }
+    buffer[length++] = '\n';
+    buffer[length] = '\0';
+    ph_log(buffer);
+}
+#endif
+
+enum dma_failure_stage {
+    DMA_FAILURE_DIRECT, DMA_FAILURE_VIEW, DMA_FAILURE_MMAP,
+    DMA_FAILURE_VIEW_CLOSE, DMA_FAILURE_SCATTERED,
+};
+
+/* Failure-only snapshot under the existing port lock. No allocation, Linux
+ * entry, table growth or retry: native ENOMEM can mean exhausted metadata,
+ * not just a shortage of pages in the hosted Linux pool. */
+static void dma_failure_record(struct ph_dma *dma, enum dma_failure_stage stage,
+    long native_status, uint64_t iova, size_t bytes) {
+    static const char *const stages[] = {
+        "direct-map", "page-view", "view-mmap", "view-close", "scattered-map",
+    };
+    struct pacha_fd_table_info info = {0};
+    uint64_t mappings = 0, mapping_bytes = 0;
+    for (size_t i = 0; i < dma->config.mapping_capacity; ++i) {
+        if (dma->config.mappings[i].length) {
+            ++mappings;
+            mapping_bytes += dma->config.mappings[i].length;
+        }
+    }
+    long fd_status = pacha_syscall2(PACHA_FD_SYSCALL_TABLE, 0,
+        (uintptr_t)&info);
+    const char *labels[] = {" device=", " native=", " iova=", " bytes=",
+        " mappings=", " mapping_bytes=", " fd_status=", " fd_capacity=",
+        " fd_free="};
+    const uint64_t values[] = {dma->config.native_device, (uint64_t)native_status,
+        iova, bytes, mappings, mapping_bytes, (uint64_t)fd_status,
+        fd_status ? 0 : info.capacity, fd_status ? 0 : info.free_slots};
+    /* Fixed stage/label strings plus nine 64-bit hexadecimal values < 384. */
+    char buffer[384] = "PH_DMA_ERROR stage=";
+    size_t length = sizeof("PH_DMA_ERROR stage=") - 1;
+    for (const char *name = stages[stage]; *name; ++name)
+        buffer[length++] = *name;
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+        for (const char *label = labels[i]; *label; ++label)
+            buffer[length++] = *label;
+        buffer[length++] = '0';
+        buffer[length++] = 'x';
+        for (int shift = 60; shift >= 0; shift -= 4)
+            buffer[length++] = "0123456789abcdef"[(values[i] >> shift) & 15];
+    }
+    buffer[length++] = '\n';
+    buffer[length] = '\0';
+    ph_log(buffer);
+}
+
 static int dma_native_status(long result) {
     switch (result) {
     case 0: return 0;
@@ -110,6 +191,7 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
     if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT) {
         struct pacha_capsule_info info = {0};
         int query_result;
+        dma_failure_record(dma, DMA_FAILURE_DIRECT, fd, iova, length);
         /* Native rollback can quarantine on failed IOTLB drain. Returning a
          * recoverable map error then would let Linux reuse still-exposed RAM. */
         query_result = dma_query(config, &info);
@@ -122,6 +204,10 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
         return result;
     }
     *slot = (struct ph_dma_mapping){.iova = iova, .length = length, .fd = (int)fd};
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+    slot->profile_direction = direction;
+    dma_profile_record(dma, slot, 0, direction);
+#endif
     dma_unlock(dma);
     return 0;
 }
@@ -189,6 +275,7 @@ static int dma_map_page_list(void *context, uint64_t iova,
         (uint64_t)(uint32_t)config->ram_fd, (uintptr_t)ram_pages,
         page_count, rights, PACHA_FD_FLAG_CLOEXEC);
     if (view_fd < 16 || view_fd >= PACHA_FD_TABLE_LIMIT) {
+        dma_failure_record(dma, DMA_FAILURE_VIEW, view_fd, iova, length);
         result = view_fd ? dma_native_status(view_fd) : -EPROTO;
         dma_unlock(dma);
         return result;
@@ -197,6 +284,7 @@ static int dma_map_page_list(void *context, uint64_t iova,
         (uint64_t)(uint32_t)view_fd, 0, length, memory_protection,
         PACHA_MMAP_SHARED, 0);
     if (address < (long)PH_PAGE_SIZE) {
+        dma_failure_record(dma, DMA_FAILURE_MMAP, address, iova, length);
         result = address ? dma_native_status(address) : -EPROTO;
         (void)pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,
             (uint64_t)view_fd);
@@ -204,9 +292,10 @@ static int dma_map_page_list(void *context, uint64_t iova,
         return result;
     }
     void *view = (void *)(uintptr_t)address;
-    result = dma_native_status(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE,
-        (uint64_t)view_fd));
+    long closed = pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)view_fd);
+    result = dma_native_status(closed);
     if (result) {
+        dma_failure_record(dma, DMA_FAILURE_VIEW_CLOSE, closed, iova, length);
         (void)pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
             (uintptr_t)view, length);
         dma_unlock(dma);
@@ -216,6 +305,7 @@ static int dma_map_page_list(void *context, uint64_t iova,
         config->device_fd, (uintptr_t)view, iova, length, direction, 0);
     if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT) {
         struct pacha_capsule_info info = {0};
+        dma_failure_record(dma, DMA_FAILURE_SCATTERED, fd, iova, length);
         int query_result = dma_query(config, &info);
         if (query_result) {
             (void)pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
@@ -233,6 +323,10 @@ static int dma_map_page_list(void *context, uint64_t iova,
         .iova = iova, .length = length, .fd = (int)fd,
         .view = view,
     };
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+    slot->profile_direction = direction;
+    dma_profile_record(dma, slot, 0, direction);
+#endif
     dma_unlock(dma);
     return 0;
 }
@@ -262,6 +356,9 @@ static int dma_unmap(void *context, uint64_t iova, size_t length) {
                 return result;
             }
         }
+#if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
+        dma_profile_record(dma, mapping, 1, mapping->profile_direction);
+#endif
         *mapping = (struct ph_dma_mapping){0};
         dma_unlock(dma);
         return 0;
@@ -281,15 +378,17 @@ int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
         (config->ram_fd && (config->ram_fd < 16 || config->ram_fd >= PACHA_FD_TABLE_LIMIT)) ||
         !config->native_device ||
         !config->generation || !config->ram || !config->ram_length ||
-        ((uintptr_t)config->ram | config->ram_length | config->aperture_start) % PH_PAGE_SIZE ||
+        ((uintptr_t)config->ram | config->ram_length) % PH_PAGE_SIZE ||
         (uintptr_t)config->ram > UINTPTR_MAX - config->ram_length ||
-        config->aperture_start > config->aperture_end ||
-        config->aperture_end % PH_PAGE_SIZE != PH_PAGE_SIZE - 1 ||
         !config->mappings || !config->mapping_capacity ||
         config->mapping_capacity > SIZE_MAX / sizeof(*config->mappings)) return -EINVAL;
     int result = dma_query(config, &info);
     if (result) return result;
     if ((info.rights & required) != required) return -EACCES;
+    /* The kernel owns the immutable, reservation-free domain aperture. Never
+     * guess it from a hosted RAM budget or fall back to the old fixed window. */
+    if (!info.size || (info.iova | info.size) % PH_PAGE_SIZE ||
+        info.iova > UINT64_MAX - (info.size - 1)) return -ERANGE;
     result = dma_native_status(pacha_syscall2(PACHA_FD_SYSCALL_TABLE,
         PACHA_FD_TABLE_LIMIT, (uintptr_t)&fd_table));
     if (result) return result;
@@ -303,7 +402,7 @@ int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
         .config = *config, .admitted = 1, .drained = 1,
         .host = {
             .size = sizeof(dma->host), .context = dma,
-            .aperture_start = config->aperture_start, .aperture_end = config->aperture_end,
+            .aperture_start = info.iova, .aperture_end = info.iova + info.size - 1,
             .ram_size = config->ram_length,
             .coherent = 1, /* This native machine port is x86-64 coherent DMA. */
             .enable = dma_enable, .map = dma_map,
@@ -311,6 +410,8 @@ int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {
             .unmap = dma_unmap,
         },
     };
+    dma->config.aperture_start = dma->host.aperture_start;
+    dma->config.aperture_end = dma->host.aperture_end;
     return 0;
 }
 

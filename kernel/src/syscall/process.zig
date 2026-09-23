@@ -11,6 +11,7 @@ const sc = @import("numbers.zig");
 const runtime = @import("runtime.zig");
 const fd_syscall = @import("fd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
+const perf = @import("../smp_perf.zig");
 
 const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
@@ -497,10 +498,11 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         if (protect_status != sc.syscall_ok) {
             return reportForkFailure("parent_write_protect", protect_status);
         }
-        state.detachForkChildDirtyCowTables(child, h.free_list) catch |err| return switch (err) {
-            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => reportForkFailure("dirty_cow_detach", sc.syscall_err_alloc),
-            else => reportForkFailure("dirty_cow_detach", sc.syscall_err_map),
-        };
+        // Dirty COW tables remain shared and immutable. The child has no
+        // inherited leaf PTEs and the parent's writable PTEs have been revoked
+        // above. Detach on the first write, after invalidating that writer's
+        // entire VMA, rather than copying all dirty pages before fork returns.
+        // In particular, fork followed by exec need not copy untouched heaps.
     }
     // Publish the child to the scheduler only after the parent has a durable
     // process handle.  Before this point every rollback can release a
@@ -744,21 +746,39 @@ fn deliverPendingSignalToUserFrame(
     frame: *TrapFrame,
     user_frame_va: u64,
 ) u64 {
+    const body_start = perf.runtimeTimestamp(.pending_frame);
+    defer {
+        perf.runtimeAdd(.pending_frame, .body_calls, 1);
+        perf.runtimeElapsed(.pending_frame, .body_cycles, body_start);
+    }
     if (user_frame_va == 0 or !user_vm.isUserCanonicalVa(user_frame_va)) {
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
     var user_frame: ProcessCloneUserFrame = undefined;
-    if (!h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame)) or
-        !isUserEntryVa(user_frame.rip) or !isUserEntryVa(user_frame.rsp))
-    {
+    const copy_start = perf.runtimeTimestamp(.pending_frame);
+    const valid = h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame)) and
+        isUserEntryVa(user_frame.rip) and isUserEntryVa(user_frame.rsp);
+    perf.runtimeAdd(.pending_frame, .copy_calls, 1);
+    perf.runtimeElapsed(.pending_frame, .copy_cycles, copy_start);
+    if (!valid) {
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
-    const claimed = scheduler.claimCurrentSignalForUserReturn(user_frame.rip) orelse
+    const claim_start = perf.runtimeTimestamp(.pending_frame);
+    const claim_result = scheduler.claimCurrentSignalForUserReturn(user_frame.rip);
+    perf.runtimeAdd(.pending_frame, .claim_calls, 1);
+    perf.runtimeElapsed(.pending_frame, .claim_cycles, claim_start);
+    const claimed = claim_result orelse {
+        perf.runtimeAdd(.pending_frame, .no_claim, 1);
         return sc.syscall_ok;
+    };
+    perf.runtimeAdd(.pending_frame, .claimed, 1);
     const stack_cost = process_abi.signal_red_zone_size +
         process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
     if (user_frame.rsp <= stack_cost) {
         scheduler.restoreClaimedSignal(claimed);
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
     const signal_frame_va = (user_frame.rsp - process_abi.signal_red_zone_size -
@@ -775,6 +795,7 @@ fn deliverPendingSignalToUserFrame(
         !h.copy_bytes_to_user_va(proc, signal_frame_va, std.mem.asBytes(&signal_frame)))
     {
         scheduler.restoreClaimedSignal(claimed);
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
     frame.rdi = signal_frame_va;

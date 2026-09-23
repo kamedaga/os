@@ -586,10 +586,8 @@ test "poll item snapshot copies each ABI item once and preserves validation" {
     Mock.fail_at = 0;
     const items = readPollItems(&h, owner, Mock.base, 2, &storage).?;
     try std.testing.expectEqual(@as(usize, 2), Mock.calls);
-    try std.testing.expectEqualDeep(PollItem{ .fd = 16, .events = fd_abi.event_readable,
-        .min_write_bytes = 0, .item_va = Mock.base }, items[0]);
-    try std.testing.expectEqualDeep(PollItem{ .fd = 17, .events = fd_abi.event_writable,
-        .min_write_bytes = 123, .item_va = Mock.base + 24 }, items[1]);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 16, .events = fd_abi.event_readable, .min_write_bytes = 0, .item_va = Mock.base }, items[0]);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 17, .events = fd_abi.event_writable, .min_write_bytes = 123, .item_va = Mock.base + 24 }, items[1]);
     Mock.calls = 0;
     try std.testing.expect(readPollItems(&h, owner, 0, 1, &storage) == null);
     try std.testing.expect(readPollItems(&h, owner, Mock.base, fd_abi.max_pollfds + 1, &storage) == null);
@@ -1043,9 +1041,11 @@ fn mapVmoFd(
 ) u64 {
     if (size_bytes == 0) return sc.syscall_err_invalid;
     const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
+    const sparse_reservation = flags.anonymous and flags.private and !flags.shared and flags.noreserve;
+    const page_limit = if (sparse_reservation) kernel.max_vmo_logical_pages else kernel.max_vmo_backing_pages;
+    if (aligned_size / 4096 > page_limit) return sc.syscall_err_invalid;
     if (flags.anonymous and vmo_offset != 0) return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
@@ -1070,8 +1070,17 @@ fn mapVmoFd(
         (state.userMapRangeIsFree(proc, requested_va, aligned_size) catch false);
     const base_va = if (flags.fixed or flags.fixed_noreplace or use_requested_hint)
         requested_va
+    else if (sparse_reservation and aligned_size / 4096 > kernel.max_vmo_backing_pages)
+        findMremapMoveTarget(state, proc, aligned_size) orelse return sc.syscall_err_map
     else
-        state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch return sc.syscall_err_map;
+        state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch |err| blk: {
+            // Exhausting the preferred arena is a placement issue for every
+            // mapping kind, not a NORESERVE/physical backing policy decision.
+            // Fixed mappings and accepted hints never enter this fallback.
+            if (err != kernel.KernelError.TableFull) return sc.syscall_err_map;
+            break :blk findMremapMoveTarget(state, proc, aligned_size) orelse return sc.syscall_err_map;
+        };
+    if (!user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (flags.fixed) {
         // Prepare validates shared backing before replacing anything. All
@@ -1188,6 +1197,10 @@ fn mapVmoFd(
     if (flags.private and !flags.shared) {
         return base_va;
     }
+    const mapped_vmo = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
+    // These VMOs explicitly accept fault-time allocation failure. Leave even
+    // populated pages to the normal fault path rather than requiring all holes.
+    if (state.nativeVmoIsZeroOnDemand(mapped_vmo)) return base_va;
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
     var map_prot: ?kernel.MapProt = null;
@@ -1217,7 +1230,7 @@ fn mprotectVmaRange(
 ) u64 {
     if (size_bytes == 0 or (base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
+    if (aligned_size / 4096 > kernel.max_vmo_logical_pages) return sc.syscall_err_invalid;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
 
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
@@ -1232,20 +1245,14 @@ fn mprotectVmaRange(
     }
 
     const start_vma = state.vmaEntryForVaConst(proc, base_va) orelse return sc.syscall_err_invalid;
+    if (!user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_invalid;
     if (base_va + aligned_size > start_vma.endVa()) return sc.syscall_err_invalid;
     // mprotect does not select a protection key.  Preserve the mapping's
     // original key instead of silently resetting it to key zero.
     prot.pkey = start_vma.max_prot.pkey;
     const unchanged_prot = @as(u8, @bitCast(start_vma.prot)) == @as(u8, @bitCast(prot));
 
-    const page_count: usize = @intCast(aligned_size / 4096);
-    var page_index: usize = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const va = base_va + @as(u64, @intCast(page_index)) * 4096;
-        const vma = state.vmaEntryForVaConst(proc, va) orelse return sc.syscall_err_invalid;
-        if (va + 4096 > vma.endVa()) return sc.syscall_err_invalid;
-    }
-
+    // start_vma already covers the complete range; no per-page walk is needed.
     state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
     // Keep COW's narrower PTEs when the VMA protection did not change, but
     // retain the address-space validation normally performed by invalidation.
@@ -1353,8 +1360,20 @@ fn mremapVmaRange(
 
     const moves = fixed or new_size > old_size;
     const source = state.vmaEntryForVaConst(proc, old_va) orelse return sc.syscall_err_invalid;
-    if (old_end > source.endVa() or !source.flags.anonymous) return sc.syscall_err_invalid;
+    if (old_end > source.endVa()) return sc.syscall_err_invalid;
     if (state.rangeOverlapsPinnedUserObject(proc, old_va, old_size)) return sc.syscall_err_invalid;
+
+    // musl probes the initial (file-backed) stack with a no-MAYMOVE growth.
+    // A mapped but occupied extension is ENOMEM, not an unsupported-source
+    // error. Check before the anonymous-only implementation and before any
+    // PTE or VMA mutation; the source's own remaining pages also collide.
+    if (!may_move and new_size > old_size) {
+        if (@addWithOverflow(old_va, new_size)[1] != 0) return sc.syscall_err_invalid;
+        const tail_free = state.userMapRangeIsFree(proc, old_end, new_size - old_size) catch
+            return sc.syscall_err_invalid;
+        if (!tail_free) return sc.syscall_err_alloc;
+    }
+    if (!source.flags.anonymous) return sc.syscall_err_invalid;
 
     const target_va = if (!moves)
         old_va
@@ -1462,7 +1481,16 @@ fn madviseVmaRange(
 
 fn writeFdInfo(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
-    const info = state.fdInfo(proc, fd) orelse return sc.syscall_err_invalid;
+    // fd_get_info already holds KernelState. Release the shared VM lock
+    // before copyout, which can acquire an address-space lock and fault.
+    const info = blk: {
+        user_vm.lockSharedVmObjects();
+        defer user_vm.unlockSharedVmObjects();
+        var snapshot = state.fdInfo(proc, fd) orelse return sc.syscall_err_invalid;
+        if (snapshot.kind == .vmo)
+            snapshot.extra = state.fdVmoLifetimeInfo(proc, fd) orelse 0;
+        break :blk snapshot;
+    };
     if (!h.write_user_u64(proc, out_va + fd_abi.fd_info_kind_offset, @intFromEnum(info.kind))) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, out_va + fd_abi.fd_info_rights_offset, info.rights_bits)) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, out_va + fd_abi.fd_info_flags_offset, info.flags_bits)) return sc.syscall_err_invalid;
@@ -1642,16 +1670,35 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_timerfd_settime => timerfdSettime(h, state, proc, frame),
         sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_vmo_create => blk: {
+            if ((frame.rdx & ~fd_abi.vmo_create_known_flags_mask) != 0) break :blk sc.syscall_err_invalid;
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
+            const create_flags = kernel.fdFlagsFromBits(@intCast(frame.rdx & fd_abi.known_flags_mask));
+            if ((frame.rdx & fd_abi.vmo_create_zero_on_demand) != 0) {
+                break :blk state.createZeroOnDemandVmoFd(
+                    proc,
+                    frame.rdi,
+                    defaultVmoRights(kernel.fdRightsFromBits(frame.rsi)),
+                    create_flags,
+                    first_dynamic_fd,
+                ) catch |err| statusFromKernelError(err);
+            }
             break :blk state.createAnonymousVmoFdWithPages(
                 proc,
                 frame.rdi,
                 defaultVmoRights(kernel.fdRightsFromBits(frame.rsi)),
-                kernel.fdFlagsFromBits(@truncate(frame.rdx)),
+                create_flags,
                 first_dynamic_fd,
                 h.free_list,
             ) catch |err| statusFromKernelError(err);
+        },
+        sc.syscall_vmo_grow => blk: {
+            if (frame.rdi > @import("std").math.maxInt(kernel.Fd)) break :blk sc.syscall_err_invalid;
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            state.growVmoFdWithPages(proc, @intCast(frame.rdi), frame.rsi, h.free_list) catch |err|
+                break :blk statusFromKernelError(err);
+            break :blk sc.syscall_ok;
         },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
         sc.syscall_vmo_create_page_view => createPageViewVmoFd(

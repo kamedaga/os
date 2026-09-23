@@ -3,8 +3,9 @@
 #define PACHA_GPUD_DRM_FILES_H
 
 #include "drm_translate.h"
+#include "gpu_limits.h"
 
-enum { GPUD_DRM_FILES_MAX = 16, GPUD_DRM_REFERENCES_MAX = 64 };
+enum { GPUD_DRM_FILES_MAX = GPUD_GPU_NATIVE_SESSION_LIMIT, GPUD_DRM_REFERENCES_MAX = 64 };
 enum gpud_drm_file_state {
     GPUD_DRM_FILE_FREE,
     GPUD_DRM_FILE_OPENING,

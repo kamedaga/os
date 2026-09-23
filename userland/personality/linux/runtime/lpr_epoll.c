@@ -1,6 +1,7 @@
 #include "lpr_epoll.h"
 
 #include "lpr_filed_internal.h"
+#include "lpr_fd/allocate.h"
 #include "lpr_unix/poll.h"
 
 #define LPR_EPOLL_INSTANCE_BYTES 8192ull /* Preserve 127 interests with progress stamps. */
@@ -136,10 +137,6 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
     if ((flags & ~((uint64_t)LPR_EPOLL_CLOEXEC)) != 0) {
         return -LPR_LINUX_EINVAL;
     }
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) {
-        return fd;
-    }
     const int64_t mapped = lpr_pacha_syscall6(
         PACHAOS_SYSCALL_MMAP,
         0,
@@ -168,30 +165,23 @@ int64_t lpr_linux_epoll_create1(uint64_t flags)
         return pair_status;
     }
 
-    const int status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_EPOLL,
-        flags,
-        (uint64_t)(uintptr_t)instance,
-        LPR_EPOLL_INSTANCE_BYTES);
-    if (status != 0) {
+    const lpr_epoll_backend_t record = {
+        .active = 1, .flags = (uint32_t)flags,
+        .instance = (uint64_t)(uintptr_t)instance,
+        .map_bytes = LPR_EPOLL_INSTANCE_BYTES,
+        .wait_fd.raw = wait_fd, .notify_fd.raw = notify_fd,
+    };
+    const int fd = lpr_fd_alloc_state(LPR_FD_OPS_EPOLL, flags,
+        LPR_EPOLL_INSTANCE_BYTES, &record, sizeof(record));
+    if (fd < 0) {
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
         (void)lpr_pacha_syscall2(
             PACHAOS_SYSCALL_MUNMAP,
             (uint64_t)(uintptr_t)instance,
             LPR_EPOLL_INSTANCE_BYTES);
-        return status;
+        return fd;
     }
-    lpr_epoll_backend_t *backend = lpr_epoll_backend((uint64_t)(uint32_t)fd);
-    if (backend == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)notify_fd);
-        return -LPR_LINUX_EIO;
-    }
-    backend->wait_fd.raw = wait_fd;
-    backend->notify_fd.raw = notify_fd;
     return fd;
 }
 

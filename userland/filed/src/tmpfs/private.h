@@ -25,11 +25,12 @@ uint64_t filed_tmpfs_make_object_id(uint16_t slot, uint64_t object_generation);
 uint64_t filed_tmpfs_mode_for_kind(filed_vnode_kind_t kind, uint64_t mode);
 int filed_tmpfs_name_valid(const char *name);
 
-uint16_t filed_tmpfs_alloc_page(filed_tmpfs_backend_t *backend);
+int filed_tmpfs_alloc_page(filed_tmpfs_backend_t *backend);
 filed_tmpfs_page_t *filed_tmpfs_page_by_id(filed_tmpfs_backend_t *backend, uint16_t page_id);
 void filed_tmpfs_free_page(filed_tmpfs_backend_t *backend, uint16_t page_id);
-uint16_t filed_tmpfs_inode_page_id(const filed_tmpfs_inode_t *inode, uint64_t page_index);
+uint16_t filed_tmpfs_inode_page_id(filed_tmpfs_backend_t *backend, const filed_tmpfs_inode_t *inode, uint64_t page_index);
 int filed_tmpfs_note_inode_page(
+    filed_tmpfs_backend_t *backend,
     filed_tmpfs_inode_t *inode,
     uint64_t page_index,
     uint16_t page_id);

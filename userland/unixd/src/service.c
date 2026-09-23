@@ -636,9 +636,19 @@ static int sync_waiter(struct unix_service *service, struct service_session *ses
             const struct pacha_ipc_msg message = { .word0 = UNIX_NOTIFY_MAGIC,
                 .word1 = waiter->id };
             const int status = pacha_ipc_send(waiter->notify_fd, &message);
-            /* With no FD payload, native SEND's ALLOC means the destination
-             * queue is full (IpcQueue.push/TableFull), not a cap allocation. */
-            return status == 0 || status == PACHA_ERR_ALLOC ? 0 : -EIO;
+            if (status != 0 && status != PACHA_ERR_NOT_READY) {
+                static unsigned errors;
+                if (errors++ < 32) {
+                    struct pacha_fd_info info = {0};
+                    const int inspected = pacha_fd_get_info(waiter->notify_fd, &info);
+                    fprintf(stderr, "[unixd] notify failure id=%u fd=%d status=%d inspect=%d kind=%llu rights=%llx\n",
+                        waiter->id, waiter->notify_fd, status, inspected,
+                        (unsigned long long)info.kind, (unsigned long long)info.rights);
+                }
+            }
+            /* SEND reports MailboxFull as NOT_READY: the receiver already
+             * has a wake queued. ALLOC is not proof of a pending wake. */
+            return status == 0 || status == PACHA_ERR_NOT_READY ? 0 : -EIO;
         }
         append_cap(response, waiter->notify_fd,
             PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_SEND, 0);
@@ -1156,7 +1166,12 @@ int unix_service_run(const struct unix_boot_config *config)
             fprintf(stderr, "[unixd] wait capacity exhausted count=%llu\n", (unsigned long long)set.count);
             return 5;
         }
-        (void)pacha_service_wait(&set, PACHA_FD_WAIT_FOREVER);
+        const long wait_status = pacha_service_wait(&set, PACHA_FD_WAIT_FOREVER);
+        if (wait_status < 0) {
+            fprintf(stderr, "[unixd] wait failed status=%ld count=%llu\n",
+                wait_status, (unsigned long long)set.count);
+            return 6;
+        }
         reap(&service, &set);
         /* WAIT_MANY is level-triggered: queues left nonempty by the fairness
          * budget wake the next iteration. Do not probe every idle client on
