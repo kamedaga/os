@@ -10,9 +10,10 @@ pub const syscall_futex_wait: u64 = 32;
 pub const syscall_futex_wake: u64 = 33;
 pub const syscall_futex_requeue: u64 = 34;
 pub const syscall_getrandom: u64 = 35;
+pub const syscall_power_control: u64 = 36;
 // GETRANDOM: flags must be zero, length <= 4096. Returns bytes written or
 // negative native status (INVALID=1, MAP=4); positive errors are not counts.
-pub const syscall_runtime_last: u64 = syscall_getrandom;
+pub const syscall_runtime_last: u64 = syscall_power_control;
 pub const syscall_runtime_count: u64 = syscall_runtime_last - syscall_runtime_first + 1;
 
 pub const clock_realtime: u64 = 0;
@@ -54,6 +55,7 @@ test "runtime syscall range is contiguous" {
         syscall_futex_wake,
         syscall_futex_requeue,
         syscall_getrandom,
+        syscall_power_control,
     };
     try std.testing.expectEqual(@as(usize, syscall_runtime_count), expected.len);
     for (expected, 0..) |nr, offset| {

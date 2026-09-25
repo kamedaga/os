@@ -43,6 +43,7 @@ pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
 pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
 pub const syscall_futex_requeue: u64 = runtime_abi.syscall_futex_requeue;
 pub const syscall_getrandom: u64 = runtime_abi.syscall_getrandom;
+pub const syscall_power_control: u64 = runtime_abi.syscall_power_control;
 
 pub const syscall_fd_table: u64 = fd_abi.syscall_fd_table;
 pub const syscall_fd_close: u64 = fd_abi.syscall_fd_close;
@@ -92,6 +93,8 @@ pub const syscall_capsule_derive_irq: u64 = capsule_abi.syscall_capsule_derive_i
 pub const syscall_capsule_irq_route: u64 = capsule_abi.syscall_capsule_irq_route;
 pub const syscall_capsule_irq_quiesce: u64 = capsule_abi.syscall_capsule_irq_quiesce;
 pub const syscall_capsule_irq_retire: u64 = capsule_abi.syscall_capsule_irq_retire;
+pub const syscall_capsule_pci_enumerate: u64 = capsule_abi.syscall_capsule_pci_enumerate;
+pub const syscall_capsule_pci_claim: u64 = capsule_abi.syscall_capsule_pci_claim;
 pub const syscall_capsule_pci_config_read: u64 = capsule_abi.syscall_capsule_pci_config_read;
 pub const syscall_capsule_pci_config_write: u64 = capsule_abi.syscall_capsule_pci_config_write;
 pub const syscall_capsule_pci_bar_info: u64 = capsule_abi.syscall_capsule_pci_bar_info;
@@ -148,6 +151,7 @@ test "native syscall numbers are contiguous" {
         syscall_futex_wake,
         syscall_futex_requeue,
         syscall_getrandom,
+        syscall_power_control,
         syscall_fd_table,
         syscall_fd_close,
         syscall_fd_dup,
@@ -195,6 +199,8 @@ test "native syscall numbers are contiguous" {
         syscall_capsule_irq_poll,
         syscall_capsule_irq_quiesce,
         syscall_capsule_irq_retire,
+        syscall_capsule_pci_enumerate,
+        syscall_capsule_pci_claim,
         syscall_capsule_pci_config_read,
         syscall_capsule_pci_config_write,
         syscall_capsule_pci_bar_info,

@@ -12,6 +12,7 @@ sources=("$repo_root/tests/gpud_lifecycle_unit.c" "$repo_root/userland/gpud/life
 "${CC:-cc}" -std=c11 -O1 -g -Wall -Wextra -Werror -Wpedantic \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -I "$repo_root/kobox2/include" -I "$repo_root/kobox2/protocol/include" \
+  -I "$repo_root/kobox2/linux-sandbox/kobox" \
   -I "$repo_root/kobox2/protocol/generated/include" \
   -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
   "${sources[@]}" -o "$out/gpud-lifecycle-unit"

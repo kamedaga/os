@@ -2,6 +2,7 @@
 /* Real controller/IPC/process/lifecycle binding; only native syscalls modeled. */
 #include "../userland/gpud/lifecycle.h"
 #include "../userland/kobox2_adapter/lifecycle_message.h"
+#include "boot/module_launch.h"
 #include "gpud_controller_fixture.h"
 #include <pacha/syscall.h>
 #include <assert.h>
@@ -12,7 +13,7 @@
 static long receive_error, send_error, wait_error, close_error;
 static unsigned int calls, sends, closed;
 static struct gpud_process_exit exit_status;
-static uint64_t ready_operation, ready_generation, ready_value, ready_fd;
+static uint64_t ready_operation, ready_generation, ready_correlation, ready_value, ready_fd;
 
 long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)nr; (void)a; (void)b; (void)c; (void)d;
@@ -52,7 +53,7 @@ long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
     if (receive_error) return receive_error;
     message->word0 = ready_operation;
     message->word1 = ready_generation;
-    message->word2 = 0;
+    message->word2 = ready_correlation;
     message->word3 = ready_value;
     message->fd_count = ready_fd ? 1 : 0;
     if (ready_fd) message->fds[0] = (struct pacha_ipc_fd){.fd = ready_fd};
@@ -69,7 +70,8 @@ static kb2_controller_t *setup(struct gpud_process_watch *watch,
     receive_error = send_error = close_error = 0;
     wait_error = PACHA_SYSCALL_ERR_NOT_READY;
     exit_status = (struct gpud_process_exit){0};
-    ready_operation = PH_LIFECYCLE_READY; ready_generation = 1; ready_value = ready_fd = 0;
+    ready_operation = PH_LIFECYCLE_READY; ready_generation = 1;
+    ready_correlation = ready_value = ready_fd = 0;
     calls = sends = closed = 0;
     kb2_controller_t *controller = gpud_test_controller_create(allocate, deallocate, NULL);
     assert(kb2_controller_start(controller) == KB2_STATUS_OK);
@@ -157,8 +159,32 @@ static void quiesce_round(unsigned int mode) {
     cleanup(controller, &watch);
 }
 
+static void progress_metrics(void) {
+    struct gpud_process_watch watch = {0}; struct gpud_native_process process = {0};
+    struct ph_ipc ipc = {0}; struct gpud_lifecycle lifecycle = {0};
+    kb2_controller_t *controller = setup(&watch, &process, &ipc, &lifecycle);
+    ready_operation = PH_LIFECYCLE_PROGRESS;
+    ready_correlation = KOBOX_MODULE_PROGRESS_NET_FREE_PAGES;
+    ready_value = ((uint64_t)98304 << 32) | 90000;
+    assert(gpud_lifecycle_ready(&lifecycle) == KB2_STATUS_ACTION_PENDING);
+    assert(lifecycle.progress_phase == KOBOX_MODULE_PROGRESS_NET_FREE_PAGES);
+    assert(lifecycle.progress_module_index == 90000);
+    assert(lifecycle.progress_status == 98304);
+    ready_operation = PH_LIFECYCLE_READY;
+    ready_correlation = ready_value = 0;
+    assert(gpud_lifecycle_ready(&lifecycle) == KB2_STATUS_OK);
+    assert(kb2_controller_stop(controller) == KB2_STATUS_OK);
+    uint64_t token = kb2_action_token(kb2_controller_pending_action(controller));
+    wait_error = 0;
+    exit_status = (struct gpud_process_exit){.state = GPUD_PROCESS_EXITED};
+    assert(gpud_lifecycle_quiesce(&lifecycle, token) == KB2_STATUS_OK);
+    assert(!gpud_lifecycle_release(&lifecycle));
+    cleanup(controller, &watch);
+}
+
 int main(void) {
     ready_rejections();
+    progress_metrics();
     for (unsigned int mode = 0; mode < 3; ++mode) quiesce_round(mode);
     puts("gpud module lifecycle binding: PASS (not DRM service readiness)");
     return 0;

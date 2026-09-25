@@ -7,7 +7,7 @@ const pci = @import("../pci.zig");
 const user_copy = @import("../user_copy.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const sc = @import("numbers.zig");
-const vtd = @import("../vtd.zig");
+const iommu = @import("../iommu.zig");
 const smp = @import("../smp.zig");
 const fd_syscalls = @import("fd.zig");
 
@@ -165,7 +165,7 @@ fn resolveUserDmaPages(
         page_span,
         except_pinned_object,
         allow_dma_mapping_aliases,
-        vtd.isActive(),
+        iommu.isActive(),
     )) {
         return null;
     }
@@ -265,7 +265,7 @@ fn mapResolvedDmaPages(
     readable: bool,
     writable: bool,
 ) DmaPolicyError!u64 {
-    if (!vtd.isActive()) {
+    if (!iommu.isActive()) {
         const paddr = kernel.dmaAddressForResolvedPages(
             resolved.paddrs(),
             resolved.first_page_offset,
@@ -281,30 +281,30 @@ fn mapResolvedDmaPages(
         return paddr;
     }
     const iova_base = if (iova_arg == capsule_abi.dma_iova_kernel_choose)
-        vtd.allocIova(device, resolved.page_count) orelse return DmaPolicyError.Map
+        iommu.allocIova(device, resolved.page_count) orelse return DmaPolicyError.Map
     else blk: {
         if ((iova_arg & (page_size - 1)) != resolved.first_page_offset)
             return DmaPolicyError.Invalid;
         const base = pageAlignDown(iova_arg);
-        if (!vtd.reserveIova(device, base, resolved.page_count)) return DmaPolicyError.Map;
+        if (!iommu.reserveIova(device, base, resolved.page_count)) return DmaPolicyError.Map;
         break :blk base;
     };
-    if (!vtd.mapPages(device, iova_base, resolved.paddrs(), readable, writable)) {
-        vtd.freeIova(device, iova_base, resolved.page_count);
+    if (!iommu.mapPages(device, iova_base, resolved.paddrs(), readable, writable)) {
+        iommu.freeIova(device, iova_base, resolved.page_count);
         return DmaPolicyError.Map;
     }
     return iova_base + resolved.first_page_offset;
 }
 
 fn releaseDeviceIova(device: kernel.DmaDeviceId, iova: u64, size: u64) void {
-    if (!vtd.isActive() or size == 0) return;
+    if (!iommu.isActive() or size == 0) return;
     const iova_base = pageAlignDown(iova);
     const span, const overflow = @addWithOverflow(iova - iova_base, size);
     if (overflow != 0) return;
     const aligned_span = pageAlignUp(span) orelse return;
     const page_count: usize = @intCast(aligned_span / page_size);
-    if (!vtd.unmapRangeForDevice(device, iova, size)) return;
-    vtd.freeIova(device, iova_base, page_count);
+    if (!iommu.unmapRangeForDevice(device, iova, size)) return;
+    iommu.freeIova(device, iova_base, page_count);
 }
 
 fn rightsForMmio(parent: kernel.FdRights, write: bool) kernel.FdRights {
@@ -399,12 +399,12 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
     switch (view.payload.*) {
         .device => |device| {
             words[capsule_abi.snapshot_device_index] = device.device;
-            const window = vtd.deviceIovaWindow(device.device);
+            const window = iommu.deviceIovaWindow(device.device);
             words[capsule_abi.snapshot_iova_index] = window.start;
             words[capsule_abi.snapshot_size_index] = window.size;
             words[capsule_abi.snapshot_index_index] =
                 pci.interruptVectorBaseForResourceId(device.device) orelse 0;
-            words[capsule_abi.snapshot_flags_index] = vtd.dmaSnapshotFlags(device.device);
+            words[capsule_abi.snapshot_flags_index] = iommu.dmaSnapshotFlags(device.device);
         },
         .mmio_region => |mmio| {
             words[capsule_abi.snapshot_device_index] = mmio.device;
@@ -419,7 +419,7 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
             words[capsule_abi.snapshot_user_va_index] = dma.user_va;
             words[capsule_abi.snapshot_iova_index] = dma.iova;
             words[capsule_abi.snapshot_size_index] = dma.size;
-            words[capsule_abi.snapshot_flags_index] = @as(u64, dma.flags) | vtd.dmaSnapshotFlags(dma.device);
+            words[capsule_abi.snapshot_flags_index] = @as(u64, dma.flags) | iommu.dmaSnapshotFlags(dma.device);
         },
         .dma_mapping => |mapping| {
             words[capsule_abi.snapshot_device_index] = mapping.device;
@@ -428,7 +428,7 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
             words[capsule_abi.snapshot_size_index] = mapping.size;
             words[capsule_abi.snapshot_index_index] = mapping.page_count;
             words[capsule_abi.snapshot_flags_index] = @as(u64, mapping.flags) |
-                (@as(u32, @intFromEnum(mapping.direction)) & 0x3) | vtd.dmaSnapshotFlags(mapping.device);
+                (@as(u32, @intFromEnum(mapping.direction)) & 0x3) | iommu.dmaSnapshotFlags(mapping.device);
         },
         .irq => |irq| {
             words[capsule_abi.snapshot_device_index] = irq.device;
@@ -463,7 +463,7 @@ pub fn dispatch(
             };
             const bar_index = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const flags = flagsArg(frame.r8, capsule_abi.mmio_map_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            if (vtd.deviceQuarantined(device.device)) break :blk sc.syscall_err_invalid;
+            if (iommu.deviceQuarantined(device.device)) break :blk sc.syscall_err_invalid;
             const write = (flags & capsule_abi.mmio_map_flag_read_only) == 0;
             if (!view.rights.mmio_map_read or (write and !view.rights.mmio_map_write)) break :blk sc.syscall_err_invalid;
             if (bar_index >= capsule_abi.pci_bar_count) break :blk sc.syscall_err_invalid;
@@ -527,7 +527,7 @@ pub fn dispatch(
                 .derive_dma = true,
                 .bus_master = true,
             })) orelse break :blk sc.syscall_err_invalid;
-            vtd.setDeviceDmaEnabled(device.device, frame.rsi != 0) catch |err|
+            iommu.setDeviceDmaEnabled(device.device, frame.rsi != 0) catch |err|
                 break :blk switch (err) {
                     error.Unsupported, error.NoDevice => sc.syscall_err_invalid,
                     error.Quarantined, error.DrainFailed => sc.syscall_err_map,
@@ -602,7 +602,7 @@ pub fn dispatch(
                 frame.r10,
                 direction != .to_device,
                 null,
-                // Streaming mappings may share resolved pages. Under VT-d,
+                // Streaming mappings may share resolved pages. With translation,
                 // each derive owns an independent IOVA; in pass-through mode
                 // close does not tear down translation for either alias.
                 true,
@@ -693,19 +693,19 @@ pub fn dispatch(
             }
 
             var mapping_iova: u64 = undefined;
-            if (vtd.isActive()) {
-                // Scatter-page derivation is a first-class VT-d mapping: one
+            if (iommu.isActive()) {
+                // Scatter-page derivation is a first-class IOMMU mapping: one
                 // contiguous IOVA allocation covers every resolved page and
                 // is owned by the returned mapping capability.
-                const iova_base = vtd.allocIova(device.device, layout.page_count) orelse break :blk sc.syscall_err_map;
-                if (!vtd.mapPages(
+                const iova_base = iommu.allocIova(device.device, layout.page_count) orelse break :blk sc.syscall_err_map;
+                if (!iommu.mapPages(
                     device.device,
                     iova_base,
                     page_addresses[0..layout.page_count],
                     direction != .from_device,
                     direction != .to_device,
                 )) {
-                    vtd.freeIova(device.device, iova_base, layout.page_count);
+                    iommu.freeIova(device.device, iova_base, layout.page_count);
                     break :blk sc.syscall_err_map;
                 }
                 mapping_iova = iova_base + layout.first_page_offset;
@@ -800,14 +800,14 @@ pub fn dispatch(
             const kind = parseIrqKind(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const vector = u32Arg(frame.rdx) orelse break :blk sc.syscall_err_invalid;
             const flags = flagsArg(frame.r10, capsule_abi.irq_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            if (pci.interruptVectorBaseForResourceId(device.device) == null)
-                break :blk sc.syscall_err_invalid;
             switch (kind) {
                 .auto => if (vector != 0) break :blk sc.syscall_err_invalid,
                 .msi, .msix => if (vector >= pci.interrupt_vectors_per_device)
                     break :blk sc.syscall_err_invalid,
                 .intx => break :blk sc.syscall_err_invalid,
             }
+            if (!pci.ensureInterruptRoute(device.device))
+                break :blk sc.syscall_err_not_ready;
             const was_unmasked = pci.acquireInterruptRoute(device.device, @intFromEnum(kind), vector) catch |err|
                 break :blk switch (err) {
                     error.Busy, error.NotReady => sc.syscall_err_not_ready,
@@ -888,6 +888,48 @@ pub fn dispatch(
             }
             break :blk sc.syscall_err_not_ready;
         },
+        sc.syscall_capsule_pci_enumerate => blk: {
+            if (!state.isBootstrapOwner(proc)) break :blk sc.syscall_err_invalid;
+            if (frame.rdi == std.math.maxInt(u64)) {
+                if (!h.write_user_u64(proc, frame.rsi, @intCast(pci.bootFunctionCount())))
+                    break :blk sc.syscall_err_invalid;
+                break :blk sc.syscall_ok;
+            }
+            if (frame.rdi > std.math.maxInt(usize)) break :blk sc.syscall_err_invalid;
+            const function = pci.bootFunctionAt(@intCast(frame.rdi)) orelse break :blk sc.syscall_err_invalid;
+            if (frame.rdx < capsule_abi.pci_function_word_count) break :blk sc.syscall_err_invalid;
+            const words = [_]u64{
+                function.resource_id, function.vendor_id, function.device_id,
+                function.subsystem_id, function.class_code,
+                function.bus, function.device, function.function,
+            };
+            for (words, 0..) |word, index| {
+                const out_va = std.math.add(u64, frame.rsi, @as(u64, @intCast(index * 8))) catch
+                    break :blk sc.syscall_err_invalid;
+                if (!h.write_user_u64(proc, out_va, word))
+                    break :blk sc.syscall_err_invalid;
+            }
+            break :blk capsule_abi.pci_function_word_count;
+        },
+        sc.syscall_capsule_pci_claim => blk: {
+            if (!state.isBootstrapOwner(proc) or frame.rdi > std.math.maxInt(usize))
+                break :blk sc.syscall_err_invalid;
+            const index: usize = @intCast(frame.rdi);
+            const function = pci.bootFunctionAt(index) orelse break :blk sc.syscall_err_invalid;
+            if (pci.bootFunctionClaimed(index)) break :blk sc.syscall_err_invalid;
+            const fd = state.createDeviceFd(proc, function.resource_id, .{
+                .inspect = true, .dup = true, .transfer = true,
+                .set_flags = true, .close = true, .query = true,
+                .config_read = true, .config_write = true,
+                .derive_mmio = true, .derive_dma = true, .derive_irq = true,
+                .mmio_map_read = true, .mmio_map_write = true,
+                .cpu_read = true, .cpu_write = true,
+                .dma_read = true, .dma_write = true,
+                .irq_wait = true, .irq_ack = true, .bus_master = true,
+            }, .{}, first_dynamic_fd) catch |err| break :blk statusFromKernelError(err);
+            pci.markBootFunctionClaimed(index);
+            break :blk fd;
+        },
         sc.syscall_capsule_pci_config_read => blk: {
             const device = requireDeviceFd(state, proc, @intCast(frame.rdi), deviceRequired(.{ .config_read = true })) orelse break :blk sc.syscall_err_invalid;
             const offset = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
@@ -904,7 +946,7 @@ pub fn dispatch(
             const device = requireDeviceFd(state, proc, @intCast(frame.rdi), deviceRequired(.{ .config_write = true })) orelse break :blk sc.syscall_err_invalid;
             // A failed IOMMU drain is terminal for this device ownership.
             // Do not let config writes re-enable a quarantined bus master.
-            if (vtd.deviceQuarantined(device.device)) break :blk sc.syscall_err_invalid;
+            if (iommu.deviceQuarantined(device.device)) break :blk sc.syscall_err_invalid;
             const offset = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const len = u32Arg(frame.r10) orelse break :blk sc.syscall_err_invalid;
             const loc = pci.locationFromResourceId(device.device) orelse break :blk sc.syscall_err_invalid;

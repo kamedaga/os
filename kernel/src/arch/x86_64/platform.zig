@@ -886,6 +886,56 @@ pub fn mapBootMmioIdentityRange(base: u64, bytes: u64) bool {
     return true;
 }
 
+/// Prove the *current* low identity PTE is explicit UC, rather than trusting
+/// a previous map request. AMD IOMMU register access uses this identity VA;
+/// a failed/partial split must never be mistaken for a safe MMIO mapping.
+pub fn bootIdentityPageIsExplicitUc(page_base: u64) bool {
+    if ((page_base & 4095) != 0 or page_base >= physical_layout.identity_limit) return false;
+    const pdp_index: usize = @intCast(page_base >> 30);
+    const pd_index: usize = @intCast((page_base >> 21) & 511);
+    const entry = pd_tables[pdp_index][pd_index];
+    const required = page_present | page_rw | page_nx | (1 << 3) | (1 << 4);
+    if ((entry & page_present) == 0) return false;
+    if ((entry & page_ps) != 0) {
+        // For a 2 MiB leaf, bit 12 is PAT. The boot UC mapper selects PAT3.
+        return (entry & (required | page_ps)) == (required | page_ps) and
+            (entry & (1 << 12)) == 0 and
+            (entry & page_addr_mask & ~(two_mib - 1)) == (page_base & ~(two_mib - 1));
+    }
+    const pt_base = entry & page_addr_mask;
+    if (pt_base == 0) return false;
+    const pt: *const [page_entries]u64 = @ptrFromInt(pt_base);
+    const leaf = pt[@intCast((page_base >> 12) & 511)];
+    // For a 4 KiB leaf, bit 7 is PAT. Reject it even if PWT/PCD look UC.
+    return (leaf & required) == required and (leaf & page_ps) == 0 and
+        (leaf & page_addr_mask) == page_base;
+}
+
+test "boot MMIO UC proof checks the live identity leaf and physical page" {
+    const base: u64 = 0x0040_0000;
+    const old = pd_tables[0][2];
+    defer pd_tables[0][2] = old;
+    const uc = page_present | page_rw | page_nx | (1 << 3) | (1 << 4);
+    var pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+
+    pd_tables[0][2] = base | page_present | page_rw | page_ps;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base));
+    pd_tables[0][2] = base | uc | page_ps;
+    try std.testing.expect(bootIdentityPageIsExplicitUc(base));
+    pd_tables[0][2] |= 1 << 12;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base));
+
+    pd_tables[0][2] = @intFromPtr(&pt) | page_present | page_rw;
+    pt[0] = base | uc;
+    try std.testing.expect(bootIdentityPageIsExplicitUc(base));
+    pt[1] = (base + 0x2000) | uc;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base + 0x1000));
+    pt[1] = (base + 0x1000) | uc | page_ps;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base + 0x1000));
+    pt[1] = (base + 0x1000) | uc;
+    try std.testing.expect(bootIdentityPageIsExplicitUc(base + 0x1000));
+}
+
 fn highKernelPdSlot(first_pdp_index: usize, pdp_index: usize) ?usize {
     if (pdp_index < first_pdp_index) return null;
     const slot = pdp_index - first_pdp_index;

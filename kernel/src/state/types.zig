@@ -1717,7 +1717,7 @@ pub const FreePageList = struct {
     }
 
     pub fn appendPage(self: *FreePageList, region_id: u64, paddr: u64) KernelError!void {
-        if (@import("../vtd.zig").physicalRangeQuarantined(paddr, 1)) return KernelError.InvalidState;
+        if (@import("../iommu.zig").physicalRangeQuarantined(paddr, 1)) return KernelError.InvalidState;
         self.lock();
         defer self.unlock();
         const page_end = paddr + 4096;
@@ -1770,7 +1770,7 @@ pub const FreePageList = struct {
         physical_start: u64,
         page_count: usize,
     ) KernelError!void {
-        if (@import("../vtd.zig").physicalRangeQuarantined(physical_start, page_count)) return KernelError.InvalidState;
+        if (@import("../iommu.zig").physicalRangeQuarantined(physical_start, page_count)) return KernelError.InvalidState;
         self.lock();
         defer self.unlock();
         if (page_count == 0) return;

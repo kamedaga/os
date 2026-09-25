@@ -20,7 +20,7 @@ fn read32(bytes: []const u8, offset: usize) u32 {
     return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
-fn tableAt(address: u64, signature: *const [4]u8, minimum: usize) ?[]const u8 {
+pub fn tableAt(address: u64, signature: *const [4]u8, minimum: usize) ?[]const u8 {
     const header = physicalBytes(address, header_size) orelse return null;
     if (!std.mem.eql(u8, header[0..4], signature)) return null;
     const size = read32(header, 4);

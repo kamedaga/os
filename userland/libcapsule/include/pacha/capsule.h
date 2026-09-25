@@ -76,6 +76,17 @@ struct pacha_capsule_bar_info {
     uint64_t flags;
 };
 
+struct pacha_capsule_pci_function {
+    uint64_t resource_id;
+    uint64_t vendor_id;
+    uint64_t device_id;
+    uint64_t subsystem_id;
+    uint64_t class_code;
+    uint64_t bus;
+    uint64_t device;
+    uint64_t function;
+};
+
 struct pacha_capsule_mmio {
     int fd;
     void *addr;
@@ -106,6 +117,13 @@ int pacha_capsule_has_rights(const struct pacha_capsule_info *info, uint64_t rig
 int pacha_capsule_query(int fd, struct pacha_capsule_info *out);
 int pacha_capsule_expect_kind(int fd, uint64_t kind, struct pacha_capsule_info *out);
 int pacha_capsule_close(int fd);
+
+/* Enumeration and claiming are restricted to the bootstrap owner. The
+ * catalog includes all non-bridge functions captured before user drivers.
+ * Each entry may be claimed once and transferred to its driver. */
+long pacha_capsule_pci_function_count(void);
+int pacha_capsule_pci_function_at(uint64_t index, struct pacha_capsule_pci_function *out);
+int pacha_capsule_pci_claim(uint64_t index);
 
 int pacha_capsule_pci_config_read(int device_fd, uint16_t offset, unsigned width, uint32_t *out);
 int pacha_capsule_pci_config_write(int device_fd, uint16_t offset, unsigned width, uint32_t value);

@@ -78,6 +78,9 @@ static inline struct ph_task *ph_current_task(void) {
 void ph_log(const char *text);
 void ph_number(const char *name, uint64_t value);
 _Noreturn void ph_fail(const char *file, unsigned line, uint64_t result);
+void ph_set_failure_reporter(void (*reporter)(const char *, unsigned, uint64_t));
+void ph_set_exception_reporter(void (*reporter)(const struct pacha_native_fault_frame *));
+void ph_report_exception(const struct pacha_native_fault_frame *frame);
 
 #define PH_CHECK(condition) do { \
     if (!(condition)) { \

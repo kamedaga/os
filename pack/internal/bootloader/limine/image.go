@@ -20,15 +20,18 @@ const (
 )
 
 type Inputs struct {
-	KernelELF   string
-	InitELF     string
-	BootfsImage string
+	KernelELF     string
+	InitELF       string
+	BootfsImage   string
+	DiagnosticELF string // Optional manual rescue entry for real-hardware live media.
 }
 
 type Options struct {
-	Limine   string
-	Force    bool
-	Progress progress.Reporter
+	Limine     string
+	Force      bool
+	ImagePath  string
+	ConfigPath string
+	Progress   progress.Reporter
 }
 
 type Result struct {
@@ -57,6 +60,12 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 
 	imagePath := workspace.Path(workspace.Artifacts, imageName)
 	configPath := workspace.Path(workspace.Artifacts, "limine.conf")
+	if opts.ImagePath != "" {
+		imagePath = opts.ImagePath
+	}
+	if opts.ConfigPath != "" {
+		configPath = opts.ConfigPath
+	}
 	locks, err := imagelock.Acquire(imagePath)
 	if err != nil {
 		span.Fail("limine image lock failed")
@@ -95,7 +104,7 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 	}
 
 	span.Set(6, "copying boot files")
-	if err := writeConfig(configPath); err != nil {
+	if err := writeConfig(configPath, inputs.DiagnosticELF != ""); err != nil {
 		span.Fail("limine config write failed")
 		return Result{}, err
 	}
@@ -106,6 +115,9 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 		{inputs.InitELF, "::/INITAPP.ELF"},
 		{inputs.BootfsImage, "::/BOOTFS.IMG"},
 		{configPath, "::/limine.conf"},
+	}
+	if inputs.DiagnosticELF != "" {
+		copies = append(copies, [2]string{inputs.DiagnosticELF, "::/DIAGBOOT.ELF"})
 	}
 	for _, item := range copies {
 		if err := run("mcopy", "-o", "-i", mtoolsImage, item[0], item[1]); err != nil {
@@ -176,13 +188,17 @@ func locateLimine(explicit string) (string, string, error) {
 
 func checkInputs(inputs Inputs, dataDir string) (int64, error) {
 	var total int64
-	for _, path := range []string{
+	paths := []string{
 		inputs.KernelELF,
 		inputs.InitELF,
 		inputs.BootfsImage,
 		filepath.Join(dataDir, "limine-bios.sys"),
 		filepath.Join(dataDir, "BOOTX64.EFI"),
-	} {
+	}
+	if inputs.DiagnosticELF != "" {
+		paths = append(paths, inputs.DiagnosticELF)
+	}
+	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
 			return 0, err
@@ -204,7 +220,7 @@ func createEmptyImage(path string) error {
 	return file.Truncate(imageSizeBytes)
 }
 
-func writeConfig(path string) error {
+func writeConfig(path string, diagnostic bool) error {
 	content := "" +
 		"timeout: 0\n" +
 		"serial: yes\n" +
@@ -215,6 +231,24 @@ func writeConfig(path string) error {
 		"    protocol: limine\n" +
 		"    path: boot():/KERNEL.ELF\n" +
 		"    resolution: 640x480x32\n"
+	if diagnostic {
+		content = "" +
+			"timeout: 3\n" +
+			"default_entry: 1\n" +
+			"serial: yes\n" +
+			"graphics: no\n" +
+			"verbose: yes\n" +
+			"\n" +
+			"/PachaOS live (RAM only)\n" +
+			"    protocol: limine\n" +
+			"    path: boot():/KERNEL.ELF\n" +
+			"    resolution: 640x480x32\n" +
+			"\n" +
+			"/Hardware diagnostic (manual)\n" +
+			"    protocol: limine\n" +
+			"    path: boot():/DIAGBOOT.ELF\n" +
+			"    resolution: 640x480x32\n"
+	}
 	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, []byte(content)) {
 		return nil
 	}

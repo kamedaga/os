@@ -1,7 +1,6 @@
 const std = @import("std");
 const smp_perf = @import("../smp_perf.zig");
 const builtin = @import("builtin");
-const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
 const nextObjectGeneration = @import("fd.zig").nextObjectGeneration;

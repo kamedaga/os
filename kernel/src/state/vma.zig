@@ -225,7 +225,7 @@ pub fn rangeOverlapsPinnedUserObjectExcept(
 /// user-VA unmap, while a DMA buffer is a separately published bidirectional
 /// allocation. Streaming-mapping aliases are admitted only when the syscall's
 /// lifetime policy makes closing either mapping harmless to the other. Scatter
-/// mappings additionally require active VT-d so every alias owns an independent
+/// mappings additionally require an active IOMMU so every alias owns an independent
 /// IOVA allocation; pass-through retains only its existing linear-mapping alias.
 pub fn rangeConflictsWithDmaDerivation(
     self: anytype,
@@ -234,7 +234,7 @@ pub fn rangeConflictsWithDmaDerivation(
     size_bytes: u64,
     except_object: ?KernelObjectRef,
     allow_dma_mapping_aliases: bool,
-    vtd_active: bool,
+    iommu_active: bool,
 ) bool {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
     var candidates = self.pinned_object_slots.iterator(.{});
@@ -257,7 +257,7 @@ pub fn rangeConflictsWithDmaDerivation(
                     start_va,
                     size_bytes,
                     allow_dma_mapping_aliases,
-                    vtd_active,
+                    iommu_active,
                 );
                 return true;
             },
@@ -268,12 +268,12 @@ pub fn rangeConflictsWithDmaDerivation(
                     start_va,
                     size_bytes,
                     allow_dma_mapping_aliases,
-                    vtd_active,
+                    iommu_active,
                 );
                 return true;
             },
             .dma_mapping => |mapping| if (!is_except and
-                (!allow_dma_mapping_aliases or (mapping.page_count != 0 and !vtd_active)))
+                (!allow_dma_mapping_aliases or (mapping.page_count != 0 and !iommu_active)))
             {
                 pachaTraceDmaDerivationConflict(
                     "dma_mapping",
@@ -281,7 +281,7 @@ pub fn rangeConflictsWithDmaDerivation(
                     start_va,
                     size_bytes,
                     allow_dma_mapping_aliases,
-                    vtd_active,
+                    iommu_active,
                 );
                 return true;
             },
@@ -297,7 +297,7 @@ fn pachaTraceDmaDerivationConflict(
     requested_start: u64,
     requested_size: u64,
     allow_dma_mapping_aliases: bool,
-    vtd_active: bool,
+    iommu_active: bool,
 ) void {
     const requested_end, const overflow = @addWithOverflow(requested_start, requested_size);
     const range_end = if (overflow == 0) requested_end else std.math.maxInt(u64);
@@ -305,14 +305,14 @@ fn pachaTraceDmaDerivationConflict(
     const line = if (page_count) |pages|
         std.fmt.bufPrint(
             &buf,
-            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} page_count={} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} vtd_active={}\n",
-            .{ object_kind, pages, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(vtd_active) },
+            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} page_count={} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} iommu_active={}\n",
+            .{ object_kind, pages, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(iommu_active) },
         ) catch return
     else
         std.fmt.bufPrint(
             &buf,
-            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} vtd_active={}\n",
-            .{ object_kind, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(vtd_active) },
+            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} iommu_active={}\n",
+            .{ object_kind, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(iommu_active) },
         ) catch return;
     if (builtin.is_test) {
         kernel_log.appendText(line);

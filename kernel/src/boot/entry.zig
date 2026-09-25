@@ -11,7 +11,8 @@ const traps = @import("../traps.zig");
 const interrupts = @import("../interrupts.zig");
 const lapic = @import("../lapic.zig");
 const smp = @import("../smp.zig");
-const vtd = @import("../vtd.zig");
+const iommu = @import("../iommu.zig");
+const acpi_power = @import("../acpi_power.zig");
 const serial = @import("../serial.zig");
 const kernel_log = @import("../kernel_log.zig");
 const page_fault_log = @import("../page_fault_log.zig");
@@ -23,10 +24,9 @@ const user_vm = @import("../memory/user_vm.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const boot_static = @import("main_static.zig");
 const boot_resources = @import("boot_resources.zig");
+const boot_diag = @import("boot_diag.zig");
 const boot_scratch = @import("boot_scratch.zig");
 const image_range = @import("image_range.zig");
-const boot_abi = @import("abi.zig");
-const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
 const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
@@ -92,7 +92,8 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
-    start = minStaticStart(start, vtd.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, iommu.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, acpi_power.staticStart());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -112,7 +113,8 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
-    end = maxStaticEnd(end, vtd.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, iommu.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, acpi_power.staticEnd());
     end = maxStaticEnd(end, pci.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
@@ -216,6 +218,9 @@ fn initKernelRuntimeOrHalt() void {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
             halt.haltWithMessage("page table install failed");
         }
+        // The diagnostic image alone has a mapped GOP after this CR3 switch.
+        // Limine's framebuffer pointer must never be used from here onward.
+        boot_diag.afterCr3();
         if (!user_copy.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
             halt.haltWithMessage("user copy runtime mapping failed");
         }
@@ -248,6 +253,9 @@ fn initKernelRuntimeOrHalt() void {
         kernel_log.write(if (pku_enabled) "enabled\n" else "unavailable\n");
         x86_platform.hardenKernelMappingsSupervisorOnly();
         pci.initEcam(boot_rsdp_paddr);
+        if (!iommu.prepareBootMmio(boot_rsdp_paddr)) {
+            halt.haltWithMessage("IOMMU boot MMIO mapping failed");
+        }
     }
     x86_platform.loadGdtAndReloadSegments();
     installInterruptTrampolines();
@@ -726,10 +734,6 @@ pub const BootResources = struct {
     memory_stats: boot_static.MemoryStats,
 };
 
-const DetectedDevices = struct {
-    devices: [boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
-};
-
 pub const LimineSmpResources = struct {
     rsdp_paddr: u64,
     trampoline_base: u64,
@@ -738,6 +742,7 @@ pub const LimineSmpResources = struct {
 pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     boot_rsdp_paddr = smp_resources.rsdp_paddr;
     initKernelRuntimeOrHalt();
+    acpi_power.prepare(boot_rsdp_paddr);
     kernel_log.write("boot: scheduler static\n");
     scheduler.initializeStaticStorage();
     kernel_log.write("boot: idle hooks\n");
@@ -810,25 +815,10 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
 }
 
 // ---------------------------------------------------------------------------
-// Group 4 — device discovery
-// ---------------------------------------------------------------------------
-
-fn discoverDevices() DetectedDevices {
-    var result: DetectedDevices = .{
-        .devices = [_]?init_setup.DetectedDeviceBootstrap{null} ** boot_abi.init_bootstrap_abi.max_device_descriptors,
-    };
-
-    var descriptor_index: usize = 0;
-    appendGenericPciFunctionDevices(&result, &descriptor_index);
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------
 // Group 3 — boot process construction
 // ---------------------------------------------------------------------------
 
-fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
+fn constructBootProcesses(state: *kernel.KernelState, res: BootResources) void {
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
@@ -845,7 +835,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     init_setup.setupInitBootstrapResources(
         state,
         init_principal,
-        devs.devices[0..],
         res.bootfs_image,
         res.framebuffer_info,
         kernel_runtime.global_free_list,
@@ -867,6 +856,9 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         "init ELF load failed\n",
         kernel_runtime.global_free_list,
     );
+    // ELF and bootfs staging are released before this long-lived catalog.
+    if (!pci.captureBootFunctions())
+        halt.haltWithMessage("PCI function catalog capture failed");
     const init_thread = scheduler.threadForPrincipal(init_principal).?;
     const init_ctx = scheduler.threadContextMutable(init_thread).?;
     init_ctx.frame.rip = loaded_init.entry;
@@ -929,7 +921,7 @@ pub fn prepareBootPrelude() void {
     boot_init_principal = null;
 }
 
-pub fn bootWithResources(resources: BootResources) noreturn {
+pub fn bootWithResources(resources: BootResources, comptime checkpoint: fn (u8) void) noreturn {
     kernel_log.writeOnly("boot: bootWithResources entry\n");
     kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
@@ -946,115 +938,21 @@ pub fn bootWithResources(resources: BootResources) noreturn {
     } else {
         kernel_log.write("clock: monotonic=tick high-resolution=0\n");
     }
-    vtd.init(boot_rsdp_paddr, kernel_runtime.global_free_list);
-    kernel_log.write("boot: discover devices\n");
-    var devices = discoverDevices();
+    checkpoint('E');
+    iommu.init(boot_rsdp_paddr, kernel_runtime.global_free_list, checkpoint);
+    checkpoint('F');
     kernel_log.write("boot: construct processes\n");
-    constructBootProcesses(state, resources, &devices);
+    constructBootProcesses(state, resources);
+    checkpoint('G');
     kernel_log.write("boot: wire runtime\n");
     wireRuntimeSubsystems(state, resources.memory_stats);
 
     const boot_ctx = scheduler.threadContext(scheduler.currentThread()).?;
     kernel_log.write("boot: enter user\n");
+    checkpoint('H');
+    // The isolated diagnostic ELF has no serial cable on the target machine.
+    // Mirror subsequent existing log lines until userland owns the GOP, so
+    // an early user fault and a late console failure are distinguishable.
+    boot_diag.startPostUserLogMirror();
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
-}
-
-// ---------------------------------------------------------------------------
-// Helper: generic PCI device export
-// ---------------------------------------------------------------------------
-
-const virtio_vendor_id: u16 = 0x1AF4;
-
-fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *usize) void {
-    var bus: u16 = 0;
-    while (bus < 256) : (bus += 1) {
-        var device: u8 = 0;
-        while (device < 32) : (device += 1) {
-            const func0 = pci.Location{
-                .bus = @intCast(bus),
-                .device = device,
-                .function = 0,
-            };
-            if (pci.readVendorId(func0) == 0xFFFF) continue;
-            const header0 = pci.readHeaderType(func0);
-            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
-            var function: u8 = 0;
-            while (function < function_count) : (function += 1) {
-                const loc = pci.Location{
-                    .bus = @intCast(bus),
-                    .device = device,
-                    .function = function,
-                };
-                const vendor_id = pci.readVendorId(loc);
-                if (vendor_id == 0xFFFF) continue;
-                if (!shouldExposeGenericPciFunction(loc, vendor_id)) continue;
-                if (descriptor_index.* >= boot_abi.init_bootstrap_abi.max_device_descriptors) return;
-                const resource_id = pci.resourceIdFromLocation(loc);
-                if (!pci.registerInterruptRoute(resource_id, descriptor_index.*)) {
-                    halt.haltWithMessage("PCI interrupt route registration failed");
-                }
-                if (!pci.captureBarApertures(resource_id, descriptor_index.*)) {
-                    halt.haltWithMessage("PCI BAR aperture capture failed");
-                }
-                appendDetectedDevice(&result.devices, .{
-                    .descriptor = descriptorFromPciFunction(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),
-                    .dma_device = resource_id,
-                });
-                descriptor_index.* += 1;
-            }
-        }
-    }
-}
-
-fn shouldExposeGenericPciFunction(loc: pci.Location, vendor_id: u16) bool {
-    _ = vendor_id;
-    if (pci.readClassCode(loc) == 0x06) return false;
-    return true;
-}
-
-fn descriptorFromPciFunction(
-    loc: pci.Location,
-    bootstrap_source_va: u64,
-    resource_id: kernel.DmaDeviceId,
-) boot_abi.init_bootstrap_abi.DeviceDescriptor {
-    return .{
-        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.pci_function),
-        .flags = 0,
-        .bootstrap_source_va = bootstrap_source_va,
-        .vendor_id = pci.readVendorId(loc),
-        .device_id = pci.readDeviceId(loc),
-        .subsystem_id = pci.readSubsystemId(loc),
-        .pci_bus = loc.bus,
-        .pci_device = loc.device,
-        .pci_function = loc.function,
-        .resource_id = resource_id,
-        .queue_count = 0,
-        .common_page_paddr = 0,
-        .notify_page_paddr = 0,
-        .isr_page_paddr = 0,
-        .device_page_paddr = 0,
-        .common_page_offset = 0,
-        .notify_page_offset = 0,
-        .isr_page_offset = 0,
-        .device_page_offset = 0,
-        .notify_off_multiplier = 0,
-        .init_iommu_token = 0,
-        .init_queue_grant_count = 0,
-        .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
-        .init_command_token = 0,
-        .init_device_fd = 0,
-    };
-}
-
-fn appendDetectedDevice(
-    devices: *[boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
-    detected: init_setup.DetectedDeviceBootstrap,
-) void {
-    for (devices) |*entry| {
-        if (entry.* == null) {
-            entry.* = detected;
-            return;
-        }
-    }
-    halt.haltWithMessage("init bootstrap device table full");
 }

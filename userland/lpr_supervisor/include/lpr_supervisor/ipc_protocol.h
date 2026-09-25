@@ -57,6 +57,8 @@ enum {
     LPRS_OP_CWD_SET = 30u,
     LPRS_OP_DIAG_DUMP = 31u,
     LPRS_OP_DIAG_ERROR_GET = 32u,
+    LPRS_OP_SYSTEM_POWEROFF = 33u,
+    LPRS_OP_SYSTEM_REBOOT = 34u,
 };
 
 enum {

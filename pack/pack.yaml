@@ -68,6 +68,8 @@ skip:
     - "libc_musl"
     - "linux_abi_probe"
     - "linux_abi_server"
+    - "live_group"
+    - "live_passwd"
     - "lpr_apk_offline"
     - "lua_cli"
     - "lua_cli_workload"
@@ -545,6 +547,98 @@ apps:
         - "tools/build_wsl_curl.sh"
     out: "CURLROOT"
     rootfs: "/"
+  # The live archive selects only curl's ELF dependency closure, not the
+  # ordinary rootfs's entire curl-root directory.
+  live_curl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/cmd/curl.elf"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVCURL.ELF"
+  live_curl_libcurl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcurl.so.4"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBCURL.SO.4"
+  live_curl_libz:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libz.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBZ.SO.1"
+  live_curl_libcares:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcares.so.2"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBCARES.SO.2"
+  live_curl_libnghttp2:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libnghttp2.so.14"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBNGHTTP2.SO.14"
+  live_curl_libidn2:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libidn2.so.0"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBIDN2.SO.0"
+  live_curl_libpsl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libpsl.so.5"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBPSL.SO.5"
+  live_curl_libssl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libssl.so.3"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBSSL.SO.3"
+  live_curl_libcrypto:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcrypto.so.3"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBCRYPTO.SO.3"
+  live_curl_libzstd:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libzstd.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBZSTD.SO.1"
+  live_curl_libbrotlidec:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libbrotlidec.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBBROTLI.SO.1"
+  live_curl_libbrotlicommon:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libbrotlicommon.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBBROTLICOMMON.SO.1"
+  live_curl_libunistring:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libunistring.so.5"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBUNISTRING.SO.5"
+  live_dropbear:
+    file:
+      path: ".artifacts/userland-fixtures/live-dropbear/dropbear"
+      rebuild: ["bash", "pack/scripts/build_live_dropbear.sh"]
+      input: ["pack/scripts/build_live_dropbear.sh"]
+    out: "LVDROPBEAR.ELF"
+  live_dropbearkey:
+    file:
+      path: ".artifacts/userland-fixtures/live-dropbear/dropbearkey"
+      rebuild: ["bash", "pack/scripts/build_live_dropbear.sh"]
+      input: ["pack/scripts/build_live_dropbear.sh"]
+    out: "LVDROPBEARKEY.ELF"
   gnu_coreutils:
     file:
       path: ".artifacts/userland-fixtures/gnu-coreutils-root"
@@ -731,24 +825,6 @@ apps:
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "VIRTPCI.KO"
     rootfs: "/usr/lib/kobox/virtio_pci.ko"
-  kobox_failover:
-    file:
-      path: ".artifacts/userland-fixtures/kobox-modules/failover.ko"
-      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
-    out: "FAILOVER.KO"
-    rootfs: "/usr/lib/kobox/failover.ko"
-  kobox_net_failover:
-    file:
-      path: ".artifacts/userland-fixtures/kobox-modules/net_failover.ko"
-      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
-    out: "NETFAIL.KO"
-    rootfs: "/usr/lib/kobox/net_failover.ko"
-  kobox_virtio_net:
-    file:
-      path: ".artifacts/userland-fixtures/kobox-modules/virtio_net.ko"
-      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
-    out: "VIRTNET.KO"
-    rootfs: "/usr/lib/kobox/virtio_net.ko"
   kobox_linux_tty_core:
     file:
       path: ".artifacts/kobox-linux-tty/linux_tty_core.ko"
@@ -1683,6 +1759,7 @@ apps:
         - "userland/libpacha/src"
         - "userland/pachaos_capsule/src"
         - "userland/pachaos_capsule/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
   unixd:
@@ -1722,8 +1799,16 @@ apps:
         - "userland/libfiled_client"
         - "userland/netd/src"
         - "userland/netd/include"
-        - "_kobox/include"
-        - "_kobox/src"
+        - "userland/gpud/launch.c"
+        - "userland/gpud/launch_native.c"
+        - "userland/gpud/bootstrap.c"
+        - "userland/gpud/process.c"
+        - "userland/gpud/process_native.c"
+        - "userland/gpud/lifecycle.c"
+        - "userland/kobox2_adapter"
+        - "kobox2/include"
+        - "kobox2/src"
+        - "kobox2/protocol"
     out: "NETD.ELF"
     rootfs: "/srv/netd.elf"
   termd:
@@ -1882,6 +1967,262 @@ apps:
       input: *gpud_package_inputs
     out: "GPUMAP.KO"
     rootfs: "/srv/kobox2/modules/kobox-drm-mapping.ko"
+  kobox2_usb_hid_sandbox:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production/sandbox.elf"
+      rebuild: ["bash", "userland/kobox2_adapter/build-sandbox.sh", ".artifacts/kobox2-usb-hid-production/sandbox.elf", "--usb-hid"]
+      input:
+        - "userland/kobox2_adapter/build-sandbox.sh"
+        - "userland/kobox2_adapter"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2USBHID.ELF"
+    rootfs: "/srv/kobox2/usb-hid/sandbox.elf"
+  kobox2_usb_hid_core:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production/runtime/linux-boot-runtime.so"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: &kobox2_usb_hid_inputs
+        - "pack/scripts/build_usb_hid_package.sh"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2USBHID.SO"
+    rootfs: "/srv/kobox2/usb-hid/core.so"
+  kobox2_usb_hid_closure:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production/closure-inventory.json"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBHID.JSON"
+    rootfs: "/srv/kobox2/usb-hid/closure.json"
+  kobox2_usb_hid_hid:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/hid/hid.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2HID.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/hid.ko"
+  kobox2_usb_hid_generic:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/hid/hid-generic.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2HIDGEN.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/hid-generic.ko"
+  kobox2_usb_hid_evdev:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/input/evdev.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2EVDEV.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/evdev.ko"
+  kobox2_usb_hid_common:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/common/usb-common.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBCOM.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/usb-common.ko"
+  kobox2_usb_hid_nls:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/fs/nls/nls_base.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2NLS.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/nls_base.ko"
+  kobox2_usb_hid_usbcore:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/core/usbcore.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBCORE.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/usbcore.ko"
+  kobox2_usb_hid_usbhid:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/hid/usbhid/usbhid.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBHID.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/usbhid.ko"
+  kobox2_usb_hid_xhci_hcd:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/host/xhci-hcd.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2XHCIHCD.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/xhci-hcd.ko"
+  kobox2_usb_hid_xhci_pci:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/host/xhci-pci.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2XHCIPCI.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/xhci-pci.ko"
+  kobox2_network_sandbox:
+    file:
+      path: ".artifacts/kobox2-network-production/sandbox.elf"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: &kobox2_network_inputs
+        - "pack/scripts/build_network_package.sh"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2NET.ELF"
+    rootfs: "/srv/kobox2/network/sandbox.elf"
+  kobox2_network_core:
+    file:
+      path: ".artifacts/kobox2-network-production/runtime/linux-boot-runtime.so"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NET.SO"
+    rootfs: "/srv/kobox2/network/core.so"
+  kobox2_network_manifest:
+    file:
+      path: ".artifacts/kobox2-network-production/manifest.bin"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NET.BIN"
+    rootfs: "/srv/kobox2/network/manifest.bin"
+  kobox2_network_firmware_class:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/firmware_class.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NFW.KO"
+    rootfs: "/srv/kobox2/network/modules/firmware_class.ko"
+  kobox2_network_mdio_bus:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/mdio_bus.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NMDIO.KO"
+    rootfs: "/srv/kobox2/network/modules/mdio_bus.ko"
+  kobox2_network_libphy:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/libphy.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NPHY.KO"
+    rootfs: "/srv/kobox2/network/modules/libphy.ko"
+  kobox2_network_mdio_devres:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/mdio_devres.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NMDR.KO"
+    rootfs: "/srv/kobox2/network/modules/mdio_devres.ko"
+  kobox2_network_realtek_phy:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/realtek.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NRPHY.KO"
+    rootfs: "/srv/kobox2/network/modules/realtek.ko"
+  kobox2_network_virtio_modern:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_pci_modern_dev.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVMOD.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_pci_modern_dev.ko"
+  kobox2_network_virtio_ring:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_ring.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVRING.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_ring.ko"
+  kobox2_network_virtio:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVIRT.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio.ko"
+  kobox2_network_virtio_pci:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_pci.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVPCI.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_pci.ko"
+  kobox2_network_bitrev:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/bitrev.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NBIT.KO"
+    rootfs: "/srv/kobox2/network/modules/bitrev.ko"
+  kobox2_network_crc32:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/crc32.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NCRC.KO"
+    rootfs: "/srv/kobox2/network/modules/crc32.ko"
+  kobox2_network_r8169:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/r8169.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NR8169.KO"
+    rootfs: "/srv/kobox2/network/modules/r8169.ko"
+  kobox2_network_failover:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/failover.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NFAIL.KO"
+    rootfs: "/srv/kobox2/network/modules/failover.ko"
+  kobox2_network_net_failover:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/net_failover.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NNFAIL.KO"
+    rootfs: "/srv/kobox2/network/modules/net_failover.ko"
+  kobox2_network_virtio_net:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_net.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVNET.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_net.ko"
+  usbd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/usbd/usbd.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/usbd", ".artifacts/cmake/usbd", "usbd"]
+      input:
+        - "userland/usbd"
+        - "userland/gpud/launch.c"
+        - "userland/gpud/launch.h"
+        - "userland/gpud/launch_native.c"
+        - "userland/gpud/launch_native.h"
+        - "userland/gpud/arch/x86_64/launch_image.c"
+        - "userland/gpud/launch_image.h"
+        - "userland/gpud/bootstrap.c"
+        - "userland/gpud/bootstrap.h"
+        - "userland/gpud/process.c"
+        - "userland/gpud/process.h"
+        - "userland/gpud/process_native.c"
+        - "userland/gpud/process_native.h"
+        - "userland/gpud/lifecycle.c"
+        - "userland/gpud/lifecycle.h"
+        - "userland/kobox2_adapter"
+        - "userland/libfiled_client"
+        - "userland/libipc"
+        - "userland/libcapsule"
+        - "userland/libpacha"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "kobox2/include"
+        - "kobox2/protocol"
+        - "kobox2/src/controller"
+    out: "USBD.ELF"
+    rootfs: "/srv/usbd.elf"
   inputd:
     role: "service"
     file:
@@ -1904,6 +2245,7 @@ apps:
         - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "INPUTD.ELF"
     rootfs: "/srv/inputd.elf"
   storage_boot:
@@ -1953,6 +2295,8 @@ apps:
     file:
       path: ".artifacts/cmake/seed0_next/seed0_next.elf"
       rebuild: ["bash", "tools/build_seed0_next.sh"]
+      input:
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "SEED0NX.ELF"
     rootfs: "/srv/seed0_next.elf"
   seed0root:
@@ -1968,6 +2312,7 @@ apps:
         - "userland/filed/include"
         - "userland/lpr_supervisor/include"
         - "userland/personality/include"
+        - "userland/usbd/include"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
@@ -2056,6 +2401,15 @@ apps:
     file: "userland/fixtures/base/passwd"
     out: "PASSWD"
     rootfs: "/etc/passwd"
+  live_passwd:
+    file: "pack/live-bootfs/passwd"
+    out: "PASSWD"
+  live_shells:
+    file: "pack/live-bootfs/shells"
+    out: "SHELLS"
+  live_dropbear_directory:
+    file: "pack/live-bootfs/dropbear/README"
+    out: "DROPBEAR.README"
   pipe_probe:
     file:
       path: ".artifacts/userland-fixtures/pipe_probe.elf"
@@ -2076,6 +2430,12 @@ apps:
     file: "userland/fixtures/base/group"
     out: "GROUP"
     rootfs: "/etc/group"
+  live_group:
+    file: "pack/live-bootfs/group"
+    out: "GROUP"
+  live_boot_profile:
+    file: "pack/live-bootfs/profile"
+    out: "BOOT-PROFILE"
   rootfs_vfs:
     role: "service"
     file:

@@ -2,7 +2,10 @@
 //! backing; absent banks are entirely free. Caller serializes all operations.
 const std = @import("std");
 pub const page_size: u64 = 4096;
-pub const window_start: u64 = 0x8000_0000;
+// Start above legacy low-memory DMA/firmware space. UEFI can assign the first
+// PCI MMIO BAR at 0x8000_0000; starting there leaves no aperture even though
+// translated IOVAs below that BAR are free. PCI and ACPI still clip the end.
+pub const window_start: u64 = 0x0100_0000;
 pub const window_ceiling: u64 = 0xfee0_0000; // Below the x86 MSI window and 4 GiB.
 pub const bank_pages: usize = 16 * 1024;
 pub const Bank = struct {

@@ -61,10 +61,10 @@
 
 ## Linux Applications
 
-Trap delegation からLinux Personality Runtimeに切り替え、高速でシンプルに互換レイヤーが処理できるようになりました。以前動いたバイナリも、段階的に動くようにします。
+Zpolineを用いた互換レイヤー
 musl ビルドで確認済み。
 
-`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `Mesa`  &nbsp; `Sway` &nbsp; `Xfce`
+`apk` &nbsp; `Lua` &nbsp; `Chibicc` &nbsp; `busybox` &nbsp; `GNU Coreutils` &nbsp; `Python3` &nbsp; `Clang` &nbsp; `GCC` &nbsp; `Mesa`  &nbsp; `Sway` &nbsp; `Xfce` &nbsp; `Epiphany(GNOME Web)`
 
 
 
@@ -83,7 +83,18 @@ musl ビルドで確認済み。
 
 Kobox は capsule を使う Linux互換レイヤー です。
 
+**Kobox2**
 
+| Module |
+|---|
+| virtio-net |
+| r8169 |
+| virtio-gpu/virgl |
+
+
+Koboxの問題点を解決し、より重いドライバや特殊経路にも対応できる、sandboxベースのLinuxドライバ実行機構です。
+L4Linuxに似たアプローチを用いていますが、ドライバごとのサンドボックスによりOSを巻き込まない再起動機構や、並列なドライバの起動が容易に実装で来ます。
+さらにLinux core部分を共有ライブラリとしてコンパイルしているため、将来的にcoreを細分化しメモリ消費量を抑えることも可能でモジュラーです。
 ---
 
 ## Build

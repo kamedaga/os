@@ -6,6 +6,7 @@ build_dir="${repo_root}/.artifacts/filed-tests"
 cc_bin="${CC:-clang}"
 
 mkdir -p "${build_dir}"
+bash "${repo_root}/pack/scripts/download_miniz_tinfl.sh" >/dev/null
 
 "${cc_bin}" \
   -std=c11 \
@@ -77,6 +78,27 @@ bash "${repo_root}/tests/run-kobox-fs-readlink-unit.sh"
   -o "${build_dir}/tmpfs_backend_test"
 
 "${build_dir}/tmpfs_backend_test"
+
+"${cc_bin}" \
+  -std=c11 -Wall -Wextra -Werror -pthread \
+  -I"${repo_root}/userland/filed/include" \
+  -I"${repo_root}/.artifacts/third_party/miniz-3.0.2/source" \
+  -I"${repo_root}/userland/koboxd/include" \
+  -I"${repo_root}/userland/termd/include" \
+  -I"${repo_root}/userland/libipc/include" \
+  "${repo_root}/userland/filed/src/tmpfs/backend.c" \
+  "${repo_root}/userland/filed/src/tmpfs/dir.c" \
+  "${repo_root}/userland/filed/src/tmpfs/file.c" \
+  "${repo_root}/userland/filed/src/tmpfs/meta.c" \
+  "${repo_root}/userland/filed/src/tmpfs/node.c" \
+  "${repo_root}/userland/filed/src/tmpfs/page.c" \
+  "${repo_root}/userland/filed/src/live_bootfs.c" \
+  "${repo_root}/.artifacts/third_party/miniz-3.0.2/source/miniz_tinfl.c" \
+  "${repo_root}/userland/filed/tests/live_bootfs_test.c" \
+  -lz \
+  -o "${build_dir}/live_bootfs_test"
+
+"${build_dir}/live_bootfs_test"
 
 "${cc_bin}" \
   -std=c11 \

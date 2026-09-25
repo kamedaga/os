@@ -38,6 +38,35 @@ void ph_exception(struct pacha_native_fault_frame *native) {
         ph_number("fault ip", saved->rip);
         ph_number("core offset", saved->rip - (uintptr_t)ph_core.base);
         ph_number("fault address", native->address);
+        ph_number("fault logical cpu", (uint64_t)(int64_t)ph_current_task()->logical_cpu);
+        ph_number("fault stack", saved->rsp);
+        ph_number("fault rbp", saved->rbp);
+        /* The native exception stack hides Linux's interrupted call chain.
+         * Report only code pointers from the mapped stack page, never raw
+         * stack data, when the Linux exception bridge cannot resume it. */
+        if (saved->rsp >= 4096 && !(saved->rsp & 7)) {
+            const uintptr_t core_start = (uintptr_t)ph_core.base;
+            const size_t words = (4096 - (saved->rsp & 4095)) / sizeof(uintptr_t);
+            const uintptr_t *stack = (const uintptr_t *)(uintptr_t)saved->rsp;
+            unsigned shown = 0;
+            for (size_t i = 0; i < words && shown < 8; ++i) {
+                for (unsigned segment = 0; segment < ph_core.fixed.segment_count; ++segment) {
+                    const struct kobox_fixed_image_segment *code =
+                        &ph_core.fixed.segments[segment];
+                    const uintptr_t begin = core_start + code->image_offset;
+                    if ((code->protection & KOBOX_FIXED_IMAGE_EXECUTE) &&
+                        stack[i] >= begin && stack[i] - begin < code->mapping_size) {
+                        ph_number("core stack candidate", stack[i] - core_start);
+                        ++shown;
+                        break;
+                    }
+                }
+            }
+        }
+        /* GOP-only boots cannot see ph_number's serial output. Publish the
+         * exact fault location before the fatal process exit when a service
+         * has installed an owner-side diagnostic reporter. */
+        ph_report_exception(native);
         ph_fail(__FILE__, __LINE__, native->error_code);
     }
 

@@ -26,6 +26,7 @@
 #define LPR_LINUX_SOCK_CLOEXEC 02000000ull
 #define LPR_LINUX_IPPROTO_TCP 6ull
 #define LPR_LINUX_IPPROTO_UDP 17ull
+#define LPR_LINUX_IPPROTO_ICMP 1ull
 #define LPR_LINUX_IPPROTO_IP 0ull
 #define LPR_LINUX_IPPROTO_IPV6 41ull
 #define LPR_LINUX_NETLINK_KOBJECT_UEVENT 15ull
@@ -71,7 +72,6 @@
 #define LPR_LINUX_S_IFSOCK 0140000ull
 #define LPR_LINUX_UIO_MAXIOV 1024u
 #define LPR_LINUX_EMSGSIZE 90
-#define LPR_NETD_DEFAULT_ADDR_BE 0x0f02000au
 #define LPR_NETD_EPHEMERAL_PORT_BASE 49152u
 
 #define LPR_SOCKET_HINT_PENDING 0x01u
@@ -305,15 +305,6 @@ static void lpr_netd_debug_call(const char *phase, uint64_t op, uint64_t request
         request_id,
         (uint64_t)status,
         result);
-}
-
-static int lpr_socket_connect_target_supported(uint32_t addr_be)
-{
-    const uint8_t *addr = (const uint8_t *)&addr_be;
-    if (addr[0] == 10 && !(addr[1] == 0 && addr[2] == 2)) {
-        return 0;
-    }
-    return 1;
 }
 
 static int lpr_socket_op_nonblocking(uint64_t fd, uint64_t flags)
@@ -992,7 +983,9 @@ int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol)
             protocol = LPR_LINUX_IPPROTO_TCP;
         }
     } else if (type == LPR_LINUX_SOCK_DGRAM ||
-        (type == LPR_LINUX_SOCK_RAW && domain == LPR_LINUX_AF_NETLINK)) {
+        (type == LPR_LINUX_SOCK_RAW &&
+         (domain == LPR_LINUX_AF_NETLINK ||
+          (domain == LPR_LINUX_AF_INET && protocol == LPR_LINUX_IPPROTO_ICMP)))) {
         netd_type = type == LPR_LINUX_SOCK_RAW ? NETD_SOCK_RAW : NETD_SOCK_DGRAM;
         if (protocol == 0 && domain == LPR_LINUX_AF_INET) {
             protocol = LPR_LINUX_IPPROTO_UDP;
@@ -1092,13 +1085,6 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     if (addr->family != LPR_LINUX_AF_INET) {
         return -LPR_LINUX_EAFNOSUPPORT;
     }
-    if (!lpr_socket_connect_target_supported(addr->addr_be)) {
-        lpr_socket_debug_connect("reject", addr->addr_be, addr->port_be, -LPR_LINUX_ENETUNREACH);
-        lpr_socket_backend(fd)->connected = 0;
-        lpr_socket_backend(fd)->connecting = 0;
-        lpr_socket_backend(fd)->last_error = LPR_LINUX_ENETUNREACH;
-        return -LPR_LINUX_ENETUNREACH;
-    }
     void *page = 0;
     const int page_fd = lpr_netd_create_page(&page);
     if (page_fd < 0) {
@@ -1117,14 +1103,16 @@ int64_t lpr_linux_connect(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
         lpr_socket_backend(fd)->connected = 1;
         lpr_socket_backend(fd)->connecting = 0;
         lpr_socket_backend(fd)->last_error = 0;
-        lpr_socket_backend(fd)->local_addr_be = LPR_NETD_DEFAULT_ADDR_BE;
+        /* The local address belongs to netd's acquired LAN policy. A
+         * speculative guest-network address is worse than unspecified. */
+        lpr_socket_backend(fd)->local_addr_be = 0;
         lpr_socket_backend(fd)->peer_addr_be = addr->addr_be;
         lpr_socket_backend(fd)->peer_port_be = addr->port_be;
     } else if (status == -LPR_LINUX_EINPROGRESS || status == -LPR_LINUX_EALREADY) {
         lpr_socket_backend(fd)->connected = 0;
         lpr_socket_backend(fd)->connecting = 1;
         lpr_socket_backend(fd)->last_error = 0;
-        lpr_socket_backend(fd)->local_addr_be = LPR_NETD_DEFAULT_ADDR_BE;
+        lpr_socket_backend(fd)->local_addr_be = 0;
         lpr_socket_backend(fd)->peer_addr_be = addr->addr_be;
         lpr_socket_backend(fd)->peer_port_be = addr->port_be;
         if ((lpr_socket_backend(fd)->flags & LPR_LINUX_O_NONBLOCK) == 0) {
@@ -1185,19 +1173,119 @@ int64_t lpr_linux_bind(uint64_t fd, uint64_t addr_raw, uint64_t addrlen)
     if (addr->family != LPR_LINUX_AF_INET) {
         return -LPR_LINUX_EAFNOSUPPORT;
     }
-    lpr_socket_backend(fd)->local_addr_be = addr->addr_be;
-    lpr_socket_backend(fd)->local_port_be = addr->port_be != 0 ? addr->port_be : lpr_socket_next_port_be();
-    return 0;
+    void *page = 0;
+    const int page_fd = lpr_netd_create_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, sizeof(netd_inet_bind_t));
+    netd_inet_bind_t *req = (netd_inet_bind_t *)page;
+    req->handle = lpr_socket_backend(fd)->handle;
+    req->addr.addr_be = addr->addr_be;
+    req->addr.port_be = addr->port_be;
+    req->reuseaddr = lpr_socket_backend(fd)->reuseaddr != 0;
+    const int64_t status = lpr_netd_call(NETD_OP_BIND, page_fd, 0, 0);
+    if (status == 0) {
+        lpr_socket_backend(fd)->local_addr_be = req->addr.addr_be;
+        lpr_socket_backend(fd)->local_port_be = req->addr.port_be;
+    }
+    lpr_netd_destroy_page(page_fd, page);
+    return status;
 }
 
 int64_t lpr_linux_listen(uint64_t fd, uint64_t backlog)
 {
-    return lpr_unix_socket_listen(fd, backlog);
+    if (lpr_unix_socket_active(fd)) return lpr_unix_socket_listen(fd, backlog);
+    if (!lpr_linux_socket_fd_active(fd)) return -LPR_LINUX_EBADF;
+    if (lpr_socket_backend(fd)->domain != LPR_LINUX_AF_INET ||
+        lpr_socket_backend(fd)->type != LPR_LINUX_SOCK_STREAM)
+        return -LPR_LINUX_EOPNOTSUPP;
+    void *page = 0;
+    const int page_fd = lpr_netd_create_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, sizeof(netd_listen_t));
+    netd_listen_t *req = (netd_listen_t *)page;
+    req->handle = lpr_socket_backend(fd)->handle;
+    req->backlog = backlog > INT32_MAX ? INT32_MAX : (uint32_t)backlog;
+    const int64_t status = lpr_netd_call(NETD_OP_LISTEN, page_fd, 0, 0);
+    lpr_netd_destroy_page(page_fd, page);
+    return status;
 }
 
 int64_t lpr_linux_accept(uint64_t fd, uint64_t addr, uint64_t addrlen, uint64_t flags)
 {
-    return lpr_unix_socket_accept(fd, addr, addrlen, flags);
+    if (lpr_unix_socket_active(fd))
+        return lpr_unix_socket_accept(fd, addr, addrlen, flags);
+    if (!lpr_linux_socket_fd_active(fd)) return -LPR_LINUX_EBADF;
+    lpr_socket_backend_t *listener = lpr_socket_backend(fd);
+    if (listener->domain != LPR_LINUX_AF_INET ||
+        listener->type != LPR_LINUX_SOCK_STREAM)
+        return -LPR_LINUX_EOPNOTSUPP;
+    if ((flags & ~(LPR_LINUX_SOCK_NONBLOCK | LPR_LINUX_SOCK_CLOEXEC)) != 0)
+        return -LPR_LINUX_EINVAL;
+    if (addr != 0 && addrlen == 0) return -LPR_LINUX_EFAULT;
+    if (addrlen != 0 && addr == 0) return -LPR_LINUX_EFAULT;
+    if (addr != 0 &&
+        (!lpr_user_range_plausible(addrlen, sizeof(uint32_t)) ||
+         !lpr_user_range_plausible(addr, sizeof(lpr_linux_sockaddr_in_t))))
+        return -LPR_LINUX_EFAULT;
+    if (addr != 0 && *(uint32_t *)(uintptr_t)addrlen < sizeof(lpr_linux_sockaddr_in_t))
+        return -LPR_LINUX_EINVAL;
+
+    for (;;) {
+        void *page = 0;
+        const int page_fd = lpr_netd_create_page(&page);
+        if (page_fd < 0) return page_fd;
+        lpr_memset(page, 0, sizeof(netd_accept_t));
+        netd_accept_t *req = (netd_accept_t *)page;
+        req->handle = listener->handle;
+        int native_wait_fd = -1;
+        int remote_wait_fd = -1;
+        const int64_t pair_status = lpr_native_wait_pair(
+            &native_wait_fd, &remote_wait_fd);
+        if (pair_status != 0) {
+            lpr_netd_destroy_page(page_fd, page);
+            return pair_status;
+        }
+        uint64_t handle = 0;
+        const lpr_netd_fd_options_t options = {
+            .transfer_fds = &remote_wait_fd, .transfer_count = 1,
+            /* Retain the sender until the RPC finishes, even on EAGAIN. */
+            .move_transfer = 0,
+        };
+        const int64_t status = lpr_netd_call_with_fd(
+            NETD_OP_ACCEPT, page_fd, 0, &handle, &options);
+        uint32_t peer_addr_be = req->peer.addr_be;
+        uint16_t peer_port_be = req->peer.port_be;
+        uint32_t local_addr_be = req->local.addr_be;
+        uint16_t local_port_be = req->local.port_be;
+        lpr_netd_destroy_page(page_fd, page);
+        if (remote_wait_fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)remote_wait_fd);
+        if (status == 0 && handle != 0) {
+            const int64_t accepted_fd = lpr_socket_install_endpoint(
+                LPR_LINUX_AF_INET, LPR_LINUX_SOCK_STREAM,
+                LPR_LINUX_IPPROTO_TCP, flags, handle, native_wait_fd,
+                1, 0, 0, 0);
+            if (accepted_fd < 0) return accepted_fd;
+            lpr_socket_backend((uint64_t)accepted_fd)->peer_addr_be = peer_addr_be;
+            lpr_socket_backend((uint64_t)accepted_fd)->peer_port_be = peer_port_be;
+            lpr_socket_backend((uint64_t)accepted_fd)->local_addr_be = local_addr_be;
+            lpr_socket_backend((uint64_t)accepted_fd)->local_port_be = local_port_be;
+            if (addr != 0)
+                (void)lpr_socket_copy_sockaddr(addr, addrlen,
+                    peer_addr_be, peer_port_be);
+            return accepted_fd;
+        }
+        if (native_wait_fd >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
+                (uint64_t)(uint32_t)native_wait_fd);
+        if (status != -LPR_LINUX_EAGAIN ||
+            (listener->flags & LPR_LINUX_O_NONBLOCK) != 0)
+            return status == 0 ? -LPR_LINUX_EIO : status;
+        const int64_t wait_status = lpr_linux_socket_wait_events(
+            fd, LPR_LINUX_POLLIN, listener->rcvtimeo_ms);
+        if (wait_status != 0) return wait_status;
+    }
 }
 
 /* A valid pipe/file/event FD is not a bad descriptor. In particular,

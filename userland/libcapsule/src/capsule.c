@@ -47,6 +47,32 @@ int pacha_capsule_close(int fd) {
     return pacha_status_to_int(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, (uint64_t)(uint32_t)fd));
 }
 
+long pacha_capsule_pci_function_count(void) {
+    uint64_t count = 0;
+    const long ret = pacha_syscall2(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
+        UINT64_MAX, (uint64_t)(uintptr_t)&count);
+    return ret == 0 ? (long)count : -(long)ret;
+}
+
+int pacha_capsule_pci_function_at(uint64_t index, struct pacha_capsule_pci_function *out) {
+    if (!out || index == UINT64_MAX) return -1;
+    uint64_t words[8] = {0};
+    const long ret = pacha_syscall3(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
+        index, (uint64_t)(uintptr_t)words, 8);
+    if (ret != 8) return ret == 0 ? -1 : pacha_status_to_int(ret);
+    *out = (struct pacha_capsule_pci_function){
+        .resource_id = words[0], .vendor_id = words[1],
+        .device_id = words[2], .subsystem_id = words[3],
+        .class_code = words[4], .bus = words[5],
+        .device = words[6], .function = words[7],
+    };
+    return 0;
+}
+
+int pacha_capsule_pci_claim(uint64_t index) {
+    return pacha_fd_result_to_int(pacha_syscall1(PACHA_CAPSULE_SYSCALL_PCI_CLAIM, index));
+}
+
 int pacha_capsule_pci_config_read(int device_fd, uint16_t offset, unsigned width, uint32_t *out) {
     if (!out || !pacha_capsule_valid_width(width)) return -1;
     uint8_t bytes[4] = {0, 0, 0, 0};

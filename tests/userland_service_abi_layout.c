@@ -190,8 +190,9 @@ int main(void)
     failures += expect(
         NETD_OP_HELLO == 0 && NETD_OP_PAGE_ATTACH == 1 &&
         NETD_OP_SOCKET == 2 && NETD_OP_CONNECT == 3 && NETD_OP_CLOSE == 4 &&
-        NETD_OP_SEND == 5 && NETD_OP_RECV == 6 && NETD_OP_POLL == 7 && NETD_OP_BIND == 8 &&
-        NETD_OP_UEVENT_PUBLISH == 9 && NETD_OP_DUP == 10,
+        NETD_OP_SEND == 5 && NETD_OP_RECV == 6 && NETD_OP_POLL == 7 &&
+        NETD_OP_BIND == 8 && NETD_OP_LISTEN == 9 && NETD_OP_ACCEPT == 10 &&
+        NETD_OP_UEVENT_PUBLISH == 11 && NETD_OP_DUP == 12,
         "netd ops are contiguous from zero");
     failures += expect(
         TERMD_OP_HELLO == 0 && TERMD_OP_OPEN_PTMX == 1 &&

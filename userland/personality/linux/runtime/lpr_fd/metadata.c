@@ -912,6 +912,10 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         lpr_memset(st, 0, sizeof(*st));
         st->st_ino = 0x74747900ull + fd;
         st->st_nlink = 1;
+        /* The virtual PTY already reports mode 0620. Expose its matching
+         * conventional tty group too, so POSIX consumers need not chmod a
+         * synthetic device inode through the regular FileD path. */
+        st->st_gid = 5;
         st->st_mode = LPR_LINUX_S_IFCHR | 0620u;
         st->st_rdev = 0x8800ull;
         st->st_blksize = 4096;
@@ -1007,7 +1011,10 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
         lpr_destroy_wire_page(page_fd, page);
         return status;
     }
-    uint64_t open_flags = LPR_LINUX_O_RDONLY;
+    /* stat() must not acquire a controlling terminal when its virtual-device
+     * fallback temporarily opens /dev/pts/N.  A plain O_RDONLY open let the
+     * SSH daemon's metadata probe claim its child's future PTY. */
+    uint64_t open_flags = LPR_LINUX_O_RDONLY | LPR_LINUX_O_NOCTTY;
     if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
         open_flags |= LPR_LINUX_O_NOFOLLOW;
     }

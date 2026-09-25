@@ -10,13 +10,8 @@
 #include "native_device_contract.c"
 #undef main
 
-/* Native thread machinery is real. No Linux image is executed in this test;
- * provide only the TLS storage template required by ph_thread_create. */
-static const unsigned char fixture_tls[16];
-struct ph_image ph_core = {
-    .tls_size = sizeof(fixture_tls), .tls_filesz = sizeof(fixture_tls),
-    .tls_template = fixture_tls,
-};
+/* Native thread machinery is real, but no Linux image is loaded here. */
+struct ph_image ph_core;
 static struct ph_task boot_task;
 static struct ph_irq irq_port;
 static atomic_uint delivered_cpus;
@@ -39,17 +34,11 @@ static int record_doorbell(uint32_t cpu, enum kobox_linux_task_notification kind
 const struct kobox_linux_task_host_operations ph_task_ops = {.cpu_notify = record_doorbell};
 
 static void acquire_device(void) {
-    const struct seed0_init_descriptor_page *boot = seed0_bootstrap_descriptor();
-    CHECK(boot && boot->device_count <= SEED0_INIT_MAX_DEVICE_DESCRIPTORS);
-    uint64_t source = 0;
-    for (uint64_t i = 0; i < boot->device_count; ++i) {
-        if (boot->devices[i].vendor_id == 0x1af4 && boot->devices[i].device_id == 0x1044) {
-            CHECK(!source);
-            source = boot->devices[i].init_device_fd;
-        }
-    }
-    CHECK(is_fd(source));
-    CHECK(call(PACHA_FD_SYSCALL_DUP, source, DEVICE_FD, query(source).rights, 0, 0, 0) == DEVICE_FD);
+    CHECK(seed0_bootstrap_descriptor() != NULL);
+    const uint64_t source = claim_pci_device(0x1af4, 0x1044);
+    CHECK(call(PACHA_FD_SYSCALL_DUP, source, DEVICE_FD,
+        query(source).rights, 0, 0, 0) == DEVICE_FD);
+    close_fd(source);
 }
 
 static void program_route(struct kobox_linux_irq_route route) {

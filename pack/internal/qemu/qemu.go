@@ -31,6 +31,7 @@ type Options struct {
 	NoKVM           bool
 	IOMMU           bool
 	NoNet           bool
+	NoStorage       bool
 	Fast            bool
 	DryRun          bool
 	InputProfile    string
@@ -1191,8 +1192,14 @@ func appendInputDeviceArgs(args []string, profile string, iommu bool) ([]string,
 	case "mouse-keyboard":
 		args = append(args, mouse...)
 		args = append(args, keyboard...)
+	case "usb-hid":
+		args = append(args,
+			"-device", "qemu-xhci,id=pachaxhci",
+			"-device", "usb-kbd,bus=pachaxhci.0,id=pachausbkbd",
+			"-device", "usb-mouse,bus=pachaxhci.0,id=pachausbmouse",
+		)
 	default:
-		return nil, fmt.Errorf("invalid input profile %q; expected keyboard-mouse, keyboard-tablet, or mouse-keyboard", profile)
+		return nil, fmt.Errorf("invalid input profile %q; expected keyboard-mouse, keyboard-tablet, mouse-keyboard, or usb-hid", profile)
 	}
 	return args, nil
 }
@@ -1232,9 +1239,12 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if err != nil {
 		return commandPlan{}, err
 	}
-	diskPath, diskFormat, err := qemuDiskPathAndFormat(workspace, opts)
-	if err != nil {
-		return commandPlan{}, err
+	var diskPath, diskFormat string
+	if !opts.NoStorage {
+		diskPath, diskFormat, err = qemuDiskPathAndFormat(workspace, opts)
+		if err != nil {
+			return commandPlan{}, err
+		}
 	}
 	if opts.Memory == "" {
 		opts.Memory = "4G"
@@ -1260,11 +1270,12 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if opts.IOMMU {
 		args = append(args, "-device", "intel-iommu,intremap=off,aw-bits=48")
 	}
-	args = append(args,
-		"-drive", "file="+imagePath+",format=raw,if=ide",
-		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
-		"-device", "nvme,drive=rootdisk,serial=capos-root",
-	)
+	args = append(args, "-drive", "file="+imagePath+",format=raw,if=ide")
+	if !opts.NoStorage {
+		args = append(args,
+			"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
+			"-device", "nvme,drive=rootdisk,serial=capos-root")
+	}
 	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
 	if err != nil {
 		return commandPlan{}, err
@@ -1299,13 +1310,17 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, err
 	}
 	args = append(args, opts.ExtraArgs...)
+	imagePaths := []string{imagePath}
+	if !opts.NoStorage {
+		imagePaths = append(imagePaths, diskPath)
+	}
 	return commandPlan{
 		Args:          args,
 		LogPath:       logPath,
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
 		QMPSocket:     opts.QMP,
-		ImagePaths:    []string{imagePath, diskPath},
+		ImagePaths:    imagePaths,
 	}, nil
 }
 
@@ -1314,9 +1329,12 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if err != nil {
 		return commandPlan{}, err
 	}
-	diskPath, diskFormat, err := qemuDiskPathAndFormat(workspace, opts)
-	if err != nil {
-		return commandPlan{}, err
+	var diskPath, diskFormat string
+	if !opts.NoStorage {
+		diskPath, diskFormat, err = qemuDiskPathAndFormat(workspace, opts)
+		if err != nil {
+			return commandPlan{}, err
+		}
 	}
 	codePath := firstExisting(os.Getenv("CAPOS_OVMF_CODE"), "/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd")
 	varsTemplate := firstExisting(os.Getenv("CAPOS_OVMF_VARS_TEMPLATE"), "/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd")
@@ -1356,9 +1374,12 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=pflash,format=raw,file="+varsPath,
 		"-drive", "if=none,file="+imagePath+",format=raw,id=limineboot",
 		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
-		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
-		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
 	)
+	if !opts.NoStorage {
+		args = append(args,
+			"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
+			"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2")
+	}
 	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
 	if err != nil {
 		return commandPlan{}, err
@@ -1393,13 +1414,17 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, err
 	}
 	args = append(args, opts.ExtraArgs...)
+	imagePaths := []string{imagePath, varsPath}
+	if !opts.NoStorage {
+		imagePaths = append(imagePaths, diskPath)
+	}
 	return commandPlan{
 		Args:          args,
 		LogPath:       logPath,
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
 		QMPSocket:     opts.QMP,
-		ImagePaths:    []string{imagePath, diskPath, varsPath},
+		ImagePaths:    imagePaths,
 		Prepare: func() error {
 			return copyFile(varsTemplate, varsPath)
 		},
@@ -1412,7 +1437,7 @@ func appendNetworkArgs(args []string, noNet bool, iommu bool) []string {
 	}
 	return append(args,
 		"-net", "none",
-		"-netdev", "user,id=net0,hostfwd=udp:127.0.0.1:10015-10.0.2.15:7777,hostfwd=tcp:127.0.0.1:10016-10.0.2.15:7778",
+		"-netdev", "user,id=net0,hostfwd=udp:127.0.0.1:10015-:7777,hostfwd=tcp:127.0.0.1:10016-:7778",
 		"-device", "virtio-net-pci"+virtioIOMMUPlatformArg(iommu)+",netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
 	)
 }

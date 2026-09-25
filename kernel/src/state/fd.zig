@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const kernel_log = @import("../kernel_log.zig");
-const vtd = @import("../vtd.zig");
+const iommu = @import("../iommu.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
 const capsule = types.capsule;
@@ -282,7 +282,7 @@ pub fn releaseDmaMappingObject(self: anytype, mapping: DmaMappingObject) void {
 }
 
 fn releaseDmaIova(device: DmaDeviceId, iova: u64, size: u64) bool {
-    if (!vtd.isActive() or size == 0) return true;
+    if (!iommu.isActive() or size == 0) return true;
     const page_size: u64 = 4096;
     const iova_base = iova & ~(page_size - 1);
     const span, const overflow = @addWithOverflow(iova - iova_base, size);
@@ -290,13 +290,13 @@ fn releaseDmaIova(device: DmaDeviceId, iova: u64, size: u64) bool {
     const aligned, const align_overflow = @addWithOverflow(span, page_size - 1);
     if (align_overflow != 0) return false;
     const page_count: usize = @intCast((aligned & ~(page_size - 1)) / page_size);
-    if (!vtd.unmapRangeForDevice(device, iova, size)) return false;
-    vtd.freeIova(device, iova_base, page_count);
+    if (!iommu.unmapRangeForDevice(device, iova, size)) return false;
+    iommu.freeIova(device, iova_base, page_count);
     return true;
 }
 
 /// Explicit close must report a failed DMA drain and retain its FD. Forced
-/// owner cleanup cannot retain that FD, but the VT-d quarantine independently
+/// owner cleanup cannot retain that FD, but the IOMMU quarantine independently
 /// owns the physical-page ledger and excludes those pages from PMM reuse.
 fn prepareLastDmaClose(self: anytype, object_ref: KernelObjectRef) KernelError!void {
     const slot = self.kernelObjectSlot(object_ref) orelse return KernelError.InvalidState;

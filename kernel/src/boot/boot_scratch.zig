@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const default_bytes: usize = 16 * 1024 * 1024;
+pub const default_bytes: usize = 32 * 1024 * 1024;
 
 var empty_scratch: [0]u8 align(4096) = .{};
 var scratch: []align(4096) u8 = empty_scratch[0..];

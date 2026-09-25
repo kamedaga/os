@@ -1,22 +1,24 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 71;
-pub const syscall_capsule_query: u64 = 71;
-pub const syscall_capsule_derive_mmio: u64 = 72;
-pub const syscall_capsule_derive_dma_buffer: u64 = 73;
-pub const syscall_capsule_derive_dma_mapping: u64 = 74;
-pub const syscall_capsule_derive_dma_mapping_pages: u64 = 75;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 76;
-pub const syscall_capsule_dma_set_enabled: u64 = 77;
-pub const syscall_capsule_derive_irq: u64 = 78;
-pub const syscall_capsule_irq_route: u64 = 79;
-pub const syscall_capsule_irq_poll: u64 = 80;
-pub const syscall_capsule_irq_quiesce: u64 = 81;
-pub const syscall_capsule_irq_retire: u64 = 82;
-pub const syscall_capsule_pci_config_read: u64 = 83;
-pub const syscall_capsule_pci_config_write: u64 = 84;
-pub const syscall_capsule_pci_bar_info: u64 = 85;
-pub const syscall_capsule_dma_pool_create: u64 = 86;
+pub const syscall_capsule_first: u64 = 72;
+pub const syscall_capsule_query: u64 = 72;
+pub const syscall_capsule_derive_mmio: u64 = 73;
+pub const syscall_capsule_derive_dma_buffer: u64 = 74;
+pub const syscall_capsule_derive_dma_mapping: u64 = 75;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = 76;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 77;
+pub const syscall_capsule_dma_set_enabled: u64 = 78;
+pub const syscall_capsule_derive_irq: u64 = 79;
+pub const syscall_capsule_irq_route: u64 = 80;
+pub const syscall_capsule_irq_poll: u64 = 81;
+pub const syscall_capsule_irq_quiesce: u64 = 82;
+pub const syscall_capsule_irq_retire: u64 = 83;
+pub const syscall_capsule_pci_enumerate: u64 = 84;
+pub const syscall_capsule_pci_claim: u64 = 85;
+pub const syscall_capsule_pci_config_read: u64 = 86;
+pub const syscall_capsule_pci_config_write: u64 = 87;
+pub const syscall_capsule_pci_bar_info: u64 = 88;
+pub const syscall_capsule_dma_pool_create: u64 = 89;
 pub const syscall_capsule_last: u64 = syscall_capsule_dma_pool_create;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
@@ -96,6 +98,10 @@ pub const snapshot_flag_irq_retired: u64 = @as(u64, 1) << 34;
 pub const irq_route_word_count: usize = 3;
 
 pub const bar_info_word_count: usize = 4;
+/// Bootstrap-owner PCI_ENUMERATE: index=maxInt(u64) writes the count and
+/// returns 0; otherwise writes resource/vendor/device/subsystem/class/B/D/F.
+/// PCI_CLAIM(index) creates the sole transferable Device FD for that entry.
+pub const pci_function_word_count: usize = 8;
 pub const bar_info_start_index: usize = 0;
 pub const bar_info_end_index: usize = 1;
 pub const bar_info_size_index: usize = 2;
@@ -199,10 +205,12 @@ comptime {
     std.debug.assert(syscall_capsule_irq_poll == syscall_capsule_first + 9);
     std.debug.assert(syscall_capsule_irq_quiesce == syscall_capsule_first + 10);
     std.debug.assert(syscall_capsule_irq_retire == syscall_capsule_first + 11);
-    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 12);
-    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 13);
-    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 14);
-    std.debug.assert(syscall_capsule_dma_pool_create == syscall_capsule_first + 15);
+    std.debug.assert(syscall_capsule_pci_enumerate == syscall_capsule_first + 12);
+    std.debug.assert(syscall_capsule_pci_claim == syscall_capsule_first + 13);
+    std.debug.assert(syscall_capsule_pci_config_read == syscall_capsule_first + 14);
+    std.debug.assert(syscall_capsule_pci_config_write == syscall_capsule_first + 15);
+    std.debug.assert(syscall_capsule_pci_bar_info == syscall_capsule_first + 16);
+    std.debug.assert(syscall_capsule_dma_pool_create == syscall_capsule_first + 17);
 }
 
 test "capsule rights mask strips reserved bits" {

@@ -39,6 +39,7 @@ add_custom_command(
     ${REPO_ROOT}/userland/libipc/include/pacha/ipc.h
     ${REPO_ROOT}/userland/libpacha/include/pacha/abi.h
     ${REPO_ROOT}/musl/pachaos/build/build-smokes.sh
+    ${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM)
 add_custom_target(unixd ALL DEPENDS "${UNIXD_ELF}")

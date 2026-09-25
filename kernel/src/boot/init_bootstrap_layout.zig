@@ -16,22 +16,10 @@ pub const SourceSlot = enum(u64) {
     primary_panel_command = 2,
     pointer_shared = 3,
     window_service_config = 4,
-    device_config0 = 5,
-    device_config1 = 6,
-    device_config2 = 7,
-    device_config3 = 8,
-    device_config4 = 9,
-    device_config5 = 10,
 };
 
 pub fn sourceVa(slot: SourceSlot) u64 {
     return process_abi.auxPageVa(source_base_page_index + @intFromEnum(slot));
-}
-
-pub fn deviceConfigSourceVa(index: usize) u64 {
-    if (index >= init_bootstrap_abi.max_device_descriptors) unreachable;
-    const slot_value = @intFromEnum(SourceSlot.device_config0) + index;
-    return sourceVa(@enumFromInt(slot_value));
 }
 
 pub const builtin_spawn_pages = [_]init_bootstrap_abi.SpawnPageDescriptor{
@@ -91,6 +79,4 @@ test "init bootstrap layout uses aux page space" {
     try std.testing.expectEqual(process_abi.auxPageVa(7), descriptor_page_va);
     try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index), sourceVa(.primary_panel_config));
     try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index + 4), sourceVa(.window_service_config));
-    try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index + 5), deviceConfigSourceVa(0));
-    try std.testing.expectEqual(process_abi.auxPageVa(source_base_page_index + 10), deviceConfigSourceVa(5));
 }

@@ -28,6 +28,7 @@ struct ph_pci {
     struct ph_pci_config config;
     struct pacha_capsule_bar_info bars[KOBOX_PCI_MEMORY_WINDOWS];
     uint64_t native_device;
+    uint8_t hidden_io_bars;
     unsigned int admitted;
 };
 

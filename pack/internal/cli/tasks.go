@@ -18,6 +18,7 @@ import (
 	"capabilityos/pack/internal/config"
 	"capabilityos/pack/internal/diskimage"
 	"capabilityos/pack/internal/imagelock"
+	"capabilityos/pack/internal/livebootfs"
 	"capabilityos/pack/internal/manifests"
 	"capabilityos/pack/internal/qemu"
 	"capabilityos/pack/internal/rootsync"
@@ -59,6 +60,87 @@ func buildCommand(ctx *context) *cobra.Command {
 	}
 	cmd.AddCommand(buildKernelCommand(ctx))
 	cmd.AddCommand(buildUserlandCommand(ctx))
+	cmd.AddCommand(buildLiveBootfsCommand(ctx))
+	cmd.AddCommand(buildLiveImageCommand(ctx))
+	return cmd
+}
+
+func buildLiveImageCommand(ctx *context) *cobra.Command {
+	var authorizedKeys string
+	cmd := &cobra.Command{
+		Use:   "live-image",
+		Short: "Build a separate RAM-root Limine image without syncing rootfs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ui.Task("build:live-image")
+			kernel, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{StepOverride: "limine", Progress: ui.NewProgressReporter()})
+			if err != nil {
+				return err
+			}
+			diagnostic, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{StepOverride: "boot-diag", Progress: ui.NewProgressReporter()})
+			if err != nil {
+				return err
+			}
+			if _, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{AppID: "seed0boot", Progress: ui.NewProgressReporter()}); err != nil {
+				return err
+			}
+			bootfs, err := livebootfs.Build(ctx.workspace, livebootfs.Options{
+				AuthorizedKeysPath: authorizedKeys,
+			})
+			if err != nil {
+				return err
+			}
+			initApp, ok := ctx.workspace.App("seed0boot")
+			if !ok {
+				return fmt.Errorf("missing seed0boot app")
+			}
+			outputDir := ctx.workspace.Path(livebootfs.OutputDir)
+			result, err := bootloaderlimine.BuildImageWithOptions(ctx.workspace, bootloaderlimine.Inputs{
+				KernelELF: kernel.Output, InitELF: ctx.workspace.ArtifactPath(initApp),
+				BootfsImage: bootfs.Image, DiagnosticELF: diagnostic.Output,
+			}, bootloaderlimine.Options{
+				ImagePath:  filepath.Join(outputDir, "limine-boot.img"),
+				ConfigPath: filepath.Join(outputDir, "limine.conf"),
+				Progress:   ui.NewProgressReporter(),
+			})
+			if err != nil {
+				return err
+			}
+			ui.KeyValues("Live image", [][2]string{
+				{"image", ctx.workspace.Rel(result.Image)},
+				{"bootfs", ctx.workspace.Rel(bootfs.Image)},
+			})
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&authorizedKeys, "ssh-authorized-key-file", "", "embed one local SSH public key in the live RAM root")
+	return cmd
+}
+
+func buildLiveBootfsCommand(ctx *context) *cobra.Command {
+	var noBuild bool
+	var authorizedKeys string
+	cmd := &cobra.Command{
+		Use:   "live-bootfs",
+		Short: "Build a separate RAM-only console bootfs archive",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ui.Task("build:live-bootfs")
+			result, err := livebootfs.Build(ctx.workspace, livebootfs.Options{
+				NoBuild: noBuild, AuthorizedKeysPath: authorizedKeys,
+			})
+			if err != nil {
+				return err
+			}
+			ui.KeyValues("Live bootfs", [][2]string{
+				{"manifest", ctx.workspace.Rel(result.Manifest)},
+				{"image", ctx.workspace.Rel(result.Image)},
+				{"entries", fmt.Sprint(result.Entries)},
+				{"bytes", fmt.Sprint(result.Bytes)},
+			})
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&noBuild, "no-build", false, "package existing userland artifacts without rebuilding")
+	cmd.Flags().StringVar(&authorizedKeys, "ssh-authorized-key-file", "", "embed one local SSH public key in the live RAM root")
 	return cmd
 }
 
@@ -209,7 +291,7 @@ func qemuLimineCommand(ctx *context) *cobra.Command {
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
 	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")
-	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
+	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, mouse-keyboard, or usb-hid")
 	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
 	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")
 	cmd.Flags().StringArrayVar(&opts.ExtraArgs, "qemu-arg", nil, "append one raw QEMU argument; extra -drive image paths are not auto-locked")
@@ -352,13 +434,14 @@ func qemuCommand(ctx *context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without virtio-net")
+	cmd.Flags().BoolVar(&opts.NoStorage, "no-storage", false, "omit the installed root disk (live boot)")
 	cmd.Flags().BoolVar(&opts.Fast, "fast", true, "reduce QEMU-side diagnostics")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
 	cmd.Flags().StringVar(&opts.Memory, "memory", "4G", "QEMU memory size")
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
 	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")
-	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-tablet", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
+	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-tablet", "QEMU input devices: keyboard-mouse, keyboard-tablet, mouse-keyboard, or usb-hid")
 	cmd.Flags().StringVar(&opts.Console, "console", "pty", "virtio console backend: pty or off")
 	cmd.Flags().StringVar(&opts.Firmware, "firmware", "bios", "firmware path: bios or uefi")
 	cmd.Flags().StringVar(&opts.LimineImage, "image", "", "Limine boot image path")
@@ -636,7 +719,7 @@ func qemuTestCommand(ctx *context, use string) *cobra.Command {
 	cmd.Flags().IntVar(&opts.CPUs, "cpus", 4, "QEMU virtual CPU count (1..256)")
 	cmd.Flags().StringVar(&opts.Display, "display", "none", "QEMU display backend")
 	cmd.Flags().StringVar(&opts.GraphicsProfile, "graphics", "2d", "QEMU graphics device: 2d or virgl")
-	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, or mouse-keyboard")
+	cmd.Flags().StringVar(&opts.InputProfile, "input-profile", "keyboard-mouse", "QEMU input devices: keyboard-mouse, keyboard-tablet, mouse-keyboard, or usb-hid")
 	cmd.Flags().StringArrayVar(&opts.ScreendumpCheck, "screendump-check", nil, "capture at MARKER and require MARKER@X,Y,W,H=#RRGGBB[:TOLERANCE]; repeatable")
 	cmd.Flags().StringVar(&opts.ScreendumpDevice, "screendump-device", "pachagpu", "QEMU display device id captured by screendump")
 	cmd.Flags().StringArrayVar(&opts.InputSendEvent, "input-send-event", nil, "inject QMP input at MARKER using MARKER@key:a=down,rel:x=4; add repeat/interval metadata and separate patterns with ';' to alternate reports; repeatable")
@@ -733,17 +816,13 @@ func buildUserlandCommand(ctx *context) *cobra.Command {
 	var force bool
 	var noRootfs bool
 	cmd := &cobra.Command{
-		Use:   "userland [app]",
+		Use:   "userland [app ...]",
 		Short: "Build userland artifacts and sync rootfs",
-		Args:  cobra.MaximumNArgs(1),
+		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ui.Task("build:userland")
-			appID := ""
-			if len(args) == 1 {
-				appID = args[0]
-			}
 			result, err := buildsys.BuildUserland(ctx.workspace, buildsys.UserlandOptions{
-				AppID:    appID,
+				AppIDs:   args,
 				Force:    force,
 				Progress: ui.NewProgressReporter(),
 			})

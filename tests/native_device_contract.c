@@ -1,6 +1,6 @@
 /* Test-only driver for a dedicated modern virtio-rng QEMU function.
  * Uses native capabilities, real MMIO, DMA and MSI-X; no LPR or GPU service.
- * Launch grants exactly one spare RNG device to FD 224. */
+ * The bootstrap owner claims one spare RNG device and places it at FD 224. */
 #include <stdint.h>
 #include <stddef.h>
 #include "pacha/ipc.h"
@@ -110,6 +110,28 @@ static struct pacha_capsule_info query(uint64_t fd)
     return info;
 }
 
+__attribute__((unused)) static uint64_t claim_pci_device(uint64_t vendor, uint64_t device)
+{
+    uint64_t count = 0;
+    CHECK(call(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE, UINT64_MAX,
+        (uintptr_t)&count, 0, 0, 0, 0) == 0);
+    uint64_t selected = UINT64_MAX;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t words[8] = {0};
+        CHECK(call(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE, i,
+            (uintptr_t)words, 8, 0, 0, 0) == 8);
+        if (words[1] == vendor && words[2] == device) {
+            CHECK(selected == UINT64_MAX);
+            selected = i;
+        }
+    }
+    CHECK(selected != UINT64_MAX);
+    const uint64_t fd = call(PACHA_CAPSULE_SYSCALL_PCI_CLAIM,
+        selected, 0, 0, 0, 0, 0);
+    CHECK(is_fd(fd));
+    return fd;
+}
+
 static struct pacha_capsule_bar_info bar_info(unsigned bar)
 {
     struct pacha_capsule_bar_info info;
@@ -214,8 +236,9 @@ static void discover(void)
     CHECK(device.kind == PACHA_CAPSULE_KIND_DEVICE);
     CHECK(device.flags & PACHA_CAPSULE_DMA_TRANSLATED);
     CHECK(!(device.flags & PACHA_CAPSULE_DMA_QUARANTINED));
-    vector_base = (uint32_t)device.index;
-    CHECK(vector_base >= 0x50 && vector_base < 0xd0);
+    /* The vector block is assigned when the first IRQ is derived, not when
+     * this PCI function is enumerated or claimed. */
+    CHECK(device.index == 0);
     const uint32_t identity = config(0, 4);
     CHECK((identity & 0xffff) == 0x1af4 && (identity >> 16) == 0x1044);
     CHECK(config(0, 2) == (identity & 0xffff));
@@ -303,8 +326,13 @@ static void reset_device(void)
 
 static uint64_t derive_irq(void)
 {
-    return call(PACHA_CAPSULE_SYSCALL_DERIVE_IRQ, DEVICE_FD,
+    const uint64_t irq = call(PACHA_CAPSULE_SYSCALL_DERIVE_IRQ, DEVICE_FD,
         PACHA_CAPSULE_IRQ_MSIX, 0, 0, 0, 0);
+    if (is_fd(irq)) {
+        vector_base = (uint32_t)query(DEVICE_FD).index;
+        CHECK(vector_base >= 0x50 && vector_base < 0xf0);
+    }
+    return irq;
 }
 
 static uint64_t irq_count(uint64_t irq)
@@ -369,6 +397,10 @@ static void request_rng(unsigned index)
 
 int main(void)
 {
+    const uint64_t source = claim_pci_device(0x1af4, 0x1044);
+    CHECK(call(PACHA_FD_SYSCALL_DUP, source, DEVICE_FD,
+        query(source).rights, 0, 0, 0) == DEVICE_FD);
+    close_fd(source);
     CHECK(call(PACHA_PROCESS_SYSCALL_SIGNAL_CTL, PACHA_PROCESS_SIGNAL_CTL_REGISTER,
         (uintptr_t)fault_entry, (uintptr_t)__start_native_handlers,
         (uintptr_t)__stop_native_handlers, 0, 0) == 0);
@@ -396,6 +428,7 @@ int main(void)
         CHECK(!(r32(pba) & 1));
         const uint64_t irq = derive_irq();
         CHECK(is_fd(irq));
+        w32(table + 8, vector_base);
         CHECK(irq_count(irq) == 0);
         setup_queue();
         stage = round ? "irq-rederive-completion" : "dma-msix-completion";

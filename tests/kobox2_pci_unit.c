@@ -187,7 +187,40 @@ int main(void) {
     native_bars[2].end++;
     assert(ph_pci_init(&pci, &config) == -EPROTO);
     defaults();
-    configuration[4] |= 1;
+    /* A real endpoint may have an unused legacy I/O BAR alongside the MMIO
+     * BAR selected by its Linux driver. The guest must not claim port I/O. */
+    configuration[1] = 1;
+    configuration[4] = 0xf001;
+    configuration[5] = 0;
+    native_bars[0] = (struct pacha_capsule_bar_info){0};
+    assert(!ph_pci_init(&pci, &config));
+    host = &pci.host;
+    assert(pci.hidden_io_bars == 1 && host->window_count == 1);
+    assert(host->windows[0].start == 0x30000100);
+    assert(!(configuration[1] & 1));
+    assert(!host->config_read(&pci, 0x10, 4, &value) && value == 0);
+    assert(!host->config_read(&pci, 0x12, 2, &value) && value == 0);
+    assert(!host->config_write(&pci, 0x10, 4, UINT32_MAX));
+    assert(configuration[4] == 0xf001);
+    assert(!host->config_read(&pci, 0x10, 4, &value) && value == 0);
+    assert(!host->config_write(&pci, 0x04, 2, 7));
+    assert(configuration[1] == 6);
+    assert(!host->config_read(&pci, 0x04, 2, &value) && value == 6);
+    assert(!host->memory_map(&pci, (void *)BASE, 0x30000000, 4096, 3, 0));
+    assert(last_bar == 2);
+    assert(!host->memory_unmap(&pci, (void *)BASE, 4096));
+    assert(!ph_pci_revoke(&pci, 7));
+    assert(!ph_pci_destroy(&pci));
+
+    defaults();
+    configuration[4] = 0xf001;
+    configuration[5] = 0;
+    configuration[6] = 0;
+    native_bars[0] = (struct pacha_capsule_bar_info){0};
+    native_bars[2] = (struct pacha_capsule_bar_info){0};
+    assert(ph_pci_init(&pci, &config) == -EOPNOTSUPP);
+    defaults();
+    configuration[6] |= 2;
     assert(ph_pci_init(&pci, &config) == -EOPNOTSUPP);
     defaults();
     query_result = PACHA_SYSCALL_ERR_CLOSED;

@@ -97,6 +97,7 @@ enum {
     TERMD_LINUX_TIOCGWINSZ = 0x5413,
     TERMD_LINUX_TIOCSWINSZ = 0x5414,
     TERMD_LINUX_TIOCGPGRP = 0x540f,
+    TERMD_LINUX_TIOCSCTTY = 0x540e,
     TERMD_LINUX_TIOCSPGRP = 0x5410,
     TERMD_LINUX_FIONREAD = 0x541b,
     TERMD_LINUX_TIOCGPTN = 0x80045430,
@@ -159,6 +160,8 @@ typedef struct termd_linux_tty_handle {
     uint8_t mapping[TERMD_LINUX_FAKE_MAPPING_BYTES];
     uint8_t file[TERMD_LINUX_FAKE_FILE_BYTES];
     uint8_t path[TERMD_LINUX_FAKE_PATH_BYTES];
+    uint8_t slave_path[TERMD_LINUX_FAKE_PATH_BYTES];
+    uint8_t has_slave_path;
 } termd_linux_tty_handle_t;
 
 typedef struct termd_linux_transfer_lease {
@@ -525,7 +528,10 @@ static void termd_linux_tty_sync_current_state(
     /* Linux never installs a PTY master as the caller's controlling tty.
      * tty_ioctl() may operate on the linked slave for termios requests, but
      * the terminal emulator that owns /dev/ptmx must still have no ctty. */
-    void *controlling_tty = handle->master ? NULL : real_tty;
+    /* A PTY slave opened with O_NOCTTY belongs to no session yet.  In
+     * particular, pre-claiming it here makes a later TIOCSCTTY appear to
+     * succeed without Linux installing the new session's foreground pgrp. */
+    void *controlling_tty = NULL;
     termd_linux_owner_context_t context;
     const void *owner_function = function != NULL ?
         function :
@@ -537,6 +543,9 @@ static void termd_linux_tty_sync_current_state(
     void *process = ids.process_id != 0 ? kb_find_vpid((int)ids.process_id) : NULL;
     void *pgrp = kb_find_vpid((int)ids.pgrp_id);
     void *session = kb_find_vpid((int)ids.session_id);
+    if (!handle->master && real_tty != NULL && session != NULL &&
+        read_ptr_field(real_tty, TERMD_LINUX_TTY_CTRL_SESSION_OFFSET) == session)
+        controlling_tty = real_tty;
     if (process == NULL) {
         process = pgrp != NULL ? pgrp : session;
     }
@@ -580,7 +589,8 @@ static void termd_linux_tty_sync_current_state(
     /* Opening or using the master side must not claim the linked slave for
      * the terminal emulator's desktop session.  The slave side establishes
      * its own session/foreground group when it is opened and controlled. */
-    if (!handle->master && real_tty != NULL && session != NULL) {
+    if (!handle->master && real_tty != NULL && session != NULL &&
+        kb_linux_kernel_decode_major(handle->dev) == TERMD_LINUX_HVC_MAJOR) {
         const int hvc_foreground_open =
             install_initial_foreground &&
             kb_linux_kernel_decode_major(handle->dev) == TERMD_LINUX_HVC_MAJOR;
@@ -867,7 +877,6 @@ int termd_linux_tty_island_open_ptmx(
         memset(handle, 0, sizeof(*handle));
         return result;
     }
-
     result = termd_linux_tty_find_pts_index(handle, &handle->pts_index);
     if (result != 0) {
         pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("ptmx_index"), (uint64_t)result);
@@ -882,6 +891,22 @@ int termd_linux_tty_island_open_ptmx(
         memset(handle, 0, sizeof(*handle));
         return result;
     }
+
+    /* The devpts path cache does not own a dentry reference. A session can
+     * close and reopen its slave while the master remains live; pin that
+     * dentry for the master's lifetime so later /dev/pts/N opens work. */
+    result = kb_fs_subsystem_path_devpts_index(
+        handle->slave_path, handle->pts_index);
+    if (result != 0) {
+        termd_linux_owner_context_t context;
+        int has_context = enter_handle_function_context(handle, handle->release, &context);
+        (void)((termd_linux_fops_release_fn)handle->release)(handle->inode, handle->file);
+        if (has_context) leave_owner_context(&context);
+        memset(handle, 0, sizeof(*handle));
+        return result;
+    }
+    kb_fs_subsystem_path_get(handle->slave_path);
+    handle->has_slave_path = 1;
 
     handle->flags = (uint32_t)flags;
     handle->ref_count = 1;
@@ -974,7 +999,6 @@ int termd_linux_tty_island_open_pts(
         memset(handle, 0, sizeof(*handle));
         return result;
     }
-
     handle->flags = (uint32_t)request->flags;
     handle->ref_count = 1;
     handle->notify_fd = notify_fd;
@@ -1086,6 +1110,24 @@ int termd_linux_tty_island_open_ctty(
     if (request == NULL) {
         return -22;
     }
+    const uint32_t session = termd_linux_tty_wire_id(request->tty.session_id);
+    if (session != 0) {
+        for (size_t i = 0; i < TERMD_LINUX_TTY_HANDLE_MAX; i++) {
+            const termd_linux_tty_handle_t *handle = &tty_handles[i];
+            if (!handle->active || handle->master || handle->session_id != session)
+                continue;
+            if (kb_linux_kernel_decode_major(handle->dev) ==
+                TERMD_LINUX_UNIX98_PTY_SLAVE_MAJOR) {
+                /* /dev/tty follows the caller's controlling PTY. Routing it
+                 * unconditionally to hvc0 makes an interactive PTY session
+                 * lose job control when no virtio console is attached. */
+                termd_open_request_t pts_request = *request;
+                pts_request.pts_index = handle->pts_index;
+                return termd_linux_tty_island_open_pts(
+                    island, &pts_request, notify_fd, out_handle);
+            }
+        }
+    }
     termd_open_request_t hvc_request = *request;
     hvc_request.pts_index = 0;
     return termd_linux_tty_island_open_hvc(island, &hvc_request, notify_fd, out_handle);
@@ -1164,6 +1206,8 @@ static int termd_linux_tty_island_close_reason(
             leave_owner_context(&context);
         }
     }
+    if (handle->has_slave_path)
+        kb_fs_subsystem_path_put(handle->slave_path);
     log_tty_close_state("release-done", reason, handle);
     if (handle->notify_fd >= 16) {
         (void)pacha_fd_close(handle->notify_fd);
@@ -1391,6 +1435,15 @@ int termd_linux_tty_island_ioctl(
     if (result != 0) {
         pacha_trace4(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_TTY_STATE, PACHA_TRACE_CLASS_ERROR, pacha_trace_name_id("ioctl"), request->handle, request->request, (uint64_t)result);
         return (int)result;
+    }
+
+    if (request->request == TERMD_LINUX_TIOCSCTTY && !handle->master) {
+        /* TIOCSCTTY transfers the slave to the caller's new session. The
+         * Linux tty has already accepted it; keep the /dev/tty lookup in
+         * sync after a fork+setsid (notably an SSH PTY login). */
+        handle->session_id = caller_ids.session_id;
+        handle->process_id = caller_ids.process_id;
+        handle->pgrp_id = caller_ids.pgrp_id;
     }
 
     if (request->request == TERMD_LINUX_TIOCGWINSZ) {

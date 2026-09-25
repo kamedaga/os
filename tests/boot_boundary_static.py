@@ -16,10 +16,6 @@ STORAGE_CONSUMERS = (
 )
 
 MODULE_ORDERS = {
-    "userland/netd/src/module_stack.c": [
-        "virtio.ko", "virtio_ring.ko", "virtio_pci.ko", "failover.ko",
-        "net_failover.ko", "virtio_net.ko",
-    ],
     "userland/termd/src/linux_tty_island.c": [
         "linux_virtio.ko", "linux_virtio_ring.ko",
         "linux_virtio_pci_modern_dev.ko", "linux_virtio_pci_legacy_dev.ko",
@@ -38,7 +34,7 @@ def assert_order(path: str, names: list[str]) -> None:
     text = (ROOT / path).read_text()
     positions = []
     for name in names:
-        match = re.search(rf'"(?:/usr/lib/kobox/|/srv/kobox/)?{re.escape(name)}"', text)
+        match = re.search(rf'"[^"\n]*{re.escape(name)}"', text)
         assert match is not None, f"{path}: missing {name}"
         positions.append(match.start())
     assert positions == sorted(positions), f"{path}: module order changed"
@@ -72,6 +68,28 @@ def main() -> None:
 
     for path, module_names in MODULE_ORDERS.items():
         assert_order(path, module_names)
+
+    # The network closure is generated from Linux dependency inventory.
+    # Boot orchestration and netd must not acquire per-driver tables again.
+    for path in ("userland/seed0root/src/main.c", "userland/netd/src/kobox2_package.c"):
+        text = (ROOT / path).read_text()
+        for driver in ("r8169", "virtio_net.ko", "virtio-net", "0x8125", "0x10ec"):
+            assert driver not in text, f"driver name leaked into {path}: {driver}"
+
+    # Site/test IPv4 policy must not become a dependency of either normal
+    # image. The optional fixture is consumed only when placed in RAM later.
+    live_spec = (ROOT / "pack/live-bootfs.yaml").read_text()
+    assert "/etc/pacha/network.conf:" not in live_spec
+    assert "/run/pacha/network.conf:" not in live_spec
+    assert "network_policy:" not in pack
+    assert '"/etc/pacha/network.conf"' not in (ROOT / "userland/netd/src/main.c").read_text()
+    for path in ("userland/netd/src/main.c", "pack/internal/qemu/qemu.go"):
+        text = (ROOT / path).read_text()
+        assert "10.0.2.15" not in text, f"test IPv4 address leaked into {path}"
+    for path in ("userland/netd/src/main.c", "userland/personality/linux/runtime/lpr_socket.c"):
+        text = (ROOT / path).read_text()
+        assert "10.0.2." not in text, f"QEMU LAN leaked into {path}"
+        assert "0x0f02000a" not in text, f"QEMU guest address leaked into {path}"
 
     for consumer in STORAGE_CONSUMERS:
         text = (ROOT / consumer).read_text()

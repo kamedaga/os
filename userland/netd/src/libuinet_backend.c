@@ -2,6 +2,8 @@
 #include "libuinet_backend.h"
 
 #include "netd_internal.h"
+#include "link.h"
+#include "network_config.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -11,7 +13,6 @@
 
 #if defined(NETD_WITH_LIBUINET)
 #include "filed/ipc_protocol.h"
-#include "linux_subsystem/net/net_device.h"
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
@@ -45,20 +46,13 @@ static int netd_libuinet_errno_to_linux(int error)
     }
 }
 
-static int netd_libuinet_socket_connect_target_supported(uint32_t addr_be)
-{
-    const uint8_t *addr = (const uint8_t *)&addr_be;
-    if (addr[0] == 10 && !(addr[1] == 0 && addr[2] == 2)) {
-        return 0;
-    }
-    return 1;
-}
-
-#define NETD_IPV4_ADDR "10.0.2.15"
-#define NETD_IPV4_BROADCAST "10.0.2.255"
-#define NETD_IPV4_MASK "255.255.255.0"
-#define NETD_IPV4_GATEWAY "10.0.2.2"
-#define NETD_DNS_SERVER "10.0.2.3"
+#define NETD_IPV4_ADDR (netd_network_config_get()->address_text)
+#define NETD_IPV4_BROADCAST (netd_network_config_get()->broadcast_text)
+#define NETD_IPV4_MASK (netd_network_config_get()->mask_text)
+#define NETD_IPV4_GATEWAY (netd_network_config_get()->gateway_text)
+#define NETD_DNS_SERVER (netd_network_config_get()->dns_text)
+/* libuinet exports the ICMP protocol but not a public SOCK_RAW constant. */
+#define NETD_UINET_SOCK_RAW 3
 #define NETD_HTTP_HOST "example.com"
 #define NETD_HTTP_PATH "/"
 #define NETD_UDP_ECHO_PORT 7777u
@@ -71,14 +65,15 @@ static int netd_libuinet_socket_connect_target_supported(uint32_t addr_be)
 #define NETD_DNS_TXID 0x5030u
 #define NETD_CA_BUNDLE_PATH "/etc/ssl/certs/ca-certificates.crt"
 #define NETD_CA_BUNDLE_FALLBACK_PATH "/etc/ssl/cert.pem"
-#define NETD_FILED_ENDPOINT_FD 240
 
-static const uint8_t k_netd_local_mac[6] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
-static const uint8_t k_netd_local_ip[4] = { 10, 0, 2, 15 };
+/* These are link/boot policy, not assumptions about every NIC or LAN. */
+#define k_netd_local_mac (netd_network_config_get()->link_mac)
+#define k_netd_local_ip (netd_network_config_get()->address)
 static const uint8_t k_netd_smoke_peer_mac[6] = { 0x52, 0x55, 0x00, 0xaa, 0xbb, 0xcc };
-static const uint8_t k_netd_smoke_peer_ip[4] = { 10, 0, 2, 2 };
+#define k_netd_smoke_peer_ip (netd_network_config_get()->gateway)
 
 static uinet_if_t g_libuinet_if;
+static int g_filed_endpoint_fd;
 static struct uinet_socket *g_libuinet_udp_echo;
 static struct uinet_socket *g_libuinet_tcp_listener;
 static struct uinet_socket *g_libuinet_tcp_connections[NETD_TCP_ECHO_MAX_CONNECTIONS];
@@ -97,7 +92,8 @@ struct netd_libuinet_api_socket {
     uint8_t send_preview_logged;
     uint8_t recv_preview_logged;
     uint8_t notify_pending;
-    uint8_t reserved[3];
+    uint8_t listening;
+    uint8_t reserved[2];
     int notify_fd;
     struct uinet_socket *socket;
 };
@@ -693,7 +689,7 @@ static int netd_libuinet_send_frame(const void *frame, size_t frame_len)
 {
     g_libuinet_tx_frames++;
     netd_libuinet_observe_tx_frame(frame, frame_len);
-    int status = kb_net_device_tx_frame(frame, frame_len);
+    int status = netd_link_send(frame, frame_len);
     if (status != 0 || (g_libuinet_trace && frame_len > 1518)) {
         printf("[netd] tx frame status=%d len=%u tx=%llu\n",
                status,
@@ -706,7 +702,8 @@ static int netd_libuinet_send_frame(const void *frame, size_t frame_len)
 static int netd_libuinet_tx(void *arg, const void *frame, size_t frame_len)
 {
     (void)arg;
-    return netd_libuinet_send_frame(frame, frame_len);
+    int status = netd_libuinet_send_frame(frame, frame_len);
+    return status < 0 ? -status : status;
 }
 
 static int netd_libuinet_configure_ipv4(void)
@@ -742,6 +739,12 @@ static int netd_libuinet_configure_ipv4(void)
 
 static int netd_libuinet_configure_default_route(void)
 {
+    const struct netd_network_config *network = netd_network_config_get();
+    if (!network->gateway[0] && !network->gateway[1] &&
+        !network->gateway[2] && !network->gateway[3]) {
+        printf("[netd] no default route (local link only)\n");
+        return 0;
+    }
     int status = uinet_route_add_default(uinet_instance_default(), NETD_IPV4_GATEWAY);
     if (status != 0) {
         fprintf(stderr, "[netd] libuinet default route failed gateway=%s status=%d\n",
@@ -800,7 +803,7 @@ static int netd_libuinet_start_udp_echo(void)
     }
 
     uinet_sosetnonblocking(g_libuinet_udp_echo, 1);
-    printf("[netd] udp echo ready addr=%s port=%u hostfwd=127.0.0.1:10015\n",
+    printf("[netd] udp echo ready addr=%s port=%u\n",
            NETD_IPV4_ADDR,
            NETD_UDP_ECHO_PORT);
     return 0;
@@ -954,7 +957,7 @@ static int netd_libuinet_start_tcp_echo(void)
         return 7;
     }
 
-    printf("[netd] tcp echo ready addr=%s port=%u hostfwd=127.0.0.1:10016\n",
+    printf("[netd] tcp echo ready addr=%s port=%u\n",
            NETD_IPV4_ADDR,
            NETD_TCP_ECHO_PORT);
     return 0;
@@ -1541,7 +1544,7 @@ static int netd_filed_call(
     {
         return -22;
     }
-    if (NETD_FILED_ENDPOINT_FD < 16) {
+    if (g_filed_endpoint_fd < 16) {
         return -9;
     }
 
@@ -1572,7 +1575,7 @@ static int netd_filed_call(
         .fds = &fd_item,
         .fd_count = 1u,
     };
-    const int reply_fd = pacha_ipc_call(NETD_FILED_ENDPOINT_FD, &request);
+    const int reply_fd = pacha_ipc_call(g_filed_endpoint_fd, &request);
     if (reply_fd < 16) {
         return reply_fd;
     }
@@ -2593,9 +2596,11 @@ static int netd_libuinet_run_ping_smoke(void)
 
 int netd_libuinet_start(struct netd_runtime *runtime)
 {
-    if (runtime == NULL || runtime->cfg == NULL) {
+    if (runtime == NULL || runtime->cfg == NULL ||
+        netd_network_config_get() == NULL) {
         return 7;
     }
+    g_filed_endpoint_fd = (int)runtime->cfg->filed_endpoint_fd;
     g_libuinet_state = NETD_LIBUINET_UNLINKED;
     g_libuinet_rx_frames = 0;
     g_libuinet_rx_drops = 0;
@@ -2681,6 +2686,7 @@ int netd_libuinet_start(struct netd_runtime *runtime)
     if_cfg.alias = "net0";
     if_cfg.rx_batch_size = 64;
     if_cfg.tx_inject_queue_len = 256;
+    memcpy(if_cfg.type_cfg.pachaos.mac, k_netd_local_mac, 6);
 
     status = uinet_ifcreate(uinet_instance_default(), &if_cfg, &g_libuinet_if);
     if (status != 0) {
@@ -2744,7 +2750,6 @@ int netd_libuinet_receive_frame(const struct netd_upper_frame *frame)
 
 #if defined(NETD_WITH_LIBUINET)
     netd_libuinet_observe_rx_frame(frame->bytes, frame->len);
-    netd_libuinet_control_receive_frame(frame->bytes, frame->len);
     int status = uinet_pachaos_if_deliver(g_libuinet_if, frame->bytes, frame->len);
     if (status == 0) {
         g_libuinet_rx_frames++;
@@ -2775,6 +2780,7 @@ int netd_libuinet_collect_runtime_wait_sources(
     struct pacha_service_wait_set *wait_set)
 {
 #if defined(NETD_WITH_LIBUINET)
+    if (g_libuinet_state != NETD_LIBUINET_READY) return 0;
     if (wait_set == NULL || g_libuinet_sts_timer_fd < 16 ||
         g_libuinet_sts_error != 0)
         return -1;
@@ -2813,9 +2819,10 @@ int netd_libuinet_socket_open(
     }
     *out_handle = 0;
 #if defined(NETD_WITH_LIBUINET)
-    if (g_libuinet_state != NETD_LIBUINET_READY || domain != NETD_AF_INET) {
+    if (domain != NETD_AF_INET) {
         return -95;
     }
+    if (g_libuinet_state != NETD_LIBUINET_READY) return -100;
     int uinet_type = 0;
     int uinet_protocol = 0;
     if (type == NETD_SOCK_DGRAM) {
@@ -2830,6 +2837,9 @@ int netd_libuinet_socket_open(
         if (uinet_protocol != UINET_IPPROTO_TCP) {
             return -93;
         }
+    } else if (type == NETD_SOCK_RAW && protocol == NETD_IPPROTO_ICMP) {
+        uinet_type = NETD_UINET_SOCK_RAW;
+        uinet_protocol = UINET_IPPROTO_ICMP;
     } else {
         return -94;
     }
@@ -2963,16 +2973,6 @@ int netd_libuinet_socket_connect(uint64_t handle, uint32_t addr_be, uint16_t por
     if (slot == NULL) {
         return -9;
     }
-    if (!netd_libuinet_socket_connect_target_supported(addr_be)) {
-        const uint8_t *addr = (const uint8_t *)&addr_be;
-        printf("[netd] socket connect rejected addr=%u.%u.%u.%u errno=ENETUNREACH\n",
-               addr[0],
-               addr[1],
-               addr[2],
-               addr[3]);
-        fflush(stdout);
-        return -101;
-    }
     if (g_libuinet_trace) {
         const uint8_t *addr = (const uint8_t *)&addr_be;
         const uint8_t *port = (const uint8_t *)&port_be;
@@ -3005,6 +3005,129 @@ int netd_libuinet_socket_connect(uint64_t handle, uint32_t addr_be, uint16_t por
 #endif
 }
 
+int netd_libuinet_socket_bind(uint64_t handle, uint32_t addr_be,
+    uint16_t port_be, int reuseaddr, uint32_t *out_addr_be,
+    uint16_t *out_port_be)
+{
+    if (out_addr_be == NULL || out_port_be == NULL) return -22;
+#if defined(NETD_WITH_LIBUINET)
+    struct netd_libuinet_api_socket *slot = netd_libuinet_api_socket_find(handle);
+    if (slot == NULL) return -9;
+    if (slot->type != NETD_SOCK_STREAM && slot->type != NETD_SOCK_DGRAM)
+        return -95;
+    if (reuseaddr) {
+        int enabled = 1;
+        const int opt_status = uinet_sosetsockopt(slot->socket,
+            UINET_SOL_SOCKET, UINET_SO_REUSEADDR, &enabled, sizeof(enabled));
+        if (opt_status != 0) return -netd_libuinet_errno_to_linux(opt_status);
+    }
+    struct uinet_sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_len = sizeof(sin);
+    sin.sin_family = UINET_AF_INET;
+    sin.sin_port = port_be;
+    memcpy(&sin.sin_addr.s_addr, &addr_be, sizeof(addr_be));
+    const int status = uinet_sobind(slot->socket, (struct uinet_sockaddr *)&sin);
+    if (status != 0) return -netd_libuinet_errno_to_linux(status);
+    struct uinet_sockaddr *bound = NULL;
+    const int name_status = uinet_sogetsockaddr(slot->socket, &bound);
+    if (name_status != 0 || bound == NULL) {
+        if (bound != NULL) uinet_free_sockaddr(bound);
+        return name_status != 0 ? -netd_libuinet_errno_to_linux(name_status) : -5;
+    }
+    if (bound->sa_family != UINET_AF_INET) {
+        uinet_free_sockaddr(bound);
+        return -97;
+    }
+    const struct uinet_sockaddr_in *actual = (const struct uinet_sockaddr_in *)bound;
+    memcpy(out_addr_be, &actual->sin_addr.s_addr, sizeof(*out_addr_be));
+    *out_port_be = actual->sin_port;
+    uinet_free_sockaddr(bound);
+    return 0;
+#else
+    (void)handle; (void)addr_be; (void)port_be; (void)reuseaddr;
+    return -95;
+#endif
+}
+
+int netd_libuinet_socket_listen(uint64_t handle, uint32_t backlog)
+{
+#if defined(NETD_WITH_LIBUINET)
+    struct netd_libuinet_api_socket *slot = netd_libuinet_api_socket_find(handle);
+    if (slot == NULL) return -9;
+    if (slot->type != NETD_SOCK_STREAM) return -95;
+    if (backlog > INT_MAX) backlog = INT_MAX;
+    const int status = uinet_solisten(slot->socket, (int)backlog);
+    if (status != 0) return -netd_libuinet_errno_to_linux(status);
+    slot->listening = 1;
+    return 0;
+#else
+    (void)handle; (void)backlog;
+    return -95;
+#endif
+}
+
+int netd_libuinet_socket_accept(uint64_t handle, int notify_fd,
+    uint64_t *out_handle, uint32_t *out_peer_addr_be,
+    uint16_t *out_peer_port_be, uint32_t *out_local_addr_be,
+    uint16_t *out_local_port_be)
+{
+    if (notify_fd < 16 || out_handle == NULL || out_peer_addr_be == NULL ||
+        out_peer_port_be == NULL || out_local_addr_be == NULL ||
+        out_local_port_be == NULL) return -22;
+    *out_handle = 0;
+#if defined(NETD_WITH_LIBUINET)
+    struct netd_libuinet_api_socket *listener = netd_libuinet_api_socket_find(handle);
+    if (listener == NULL) return -9;
+    if (!listener->listening) return -22;
+    struct netd_libuinet_api_socket *slot = NULL;
+    for (unsigned i = 0; i < NETD_SOCKET_API_MAX_SOCKETS; ++i) {
+        if (g_libuinet_api_sockets[i].socket == NULL) {
+            slot = &g_libuinet_api_sockets[i];
+            break;
+        }
+    }
+    if (slot == NULL) return -24;
+    listener->notify_pending = 0;
+    if (uinet_soreadable(listener->socket, 0) <= 0) return -11;
+    struct uinet_socket *accepted = NULL;
+    struct uinet_sockaddr *peer = NULL;
+    const int status = uinet_soaccept(listener->socket, &peer, &accepted);
+    if (status != 0 || accepted == NULL) {
+        if (peer != NULL) uinet_free_sockaddr(peer);
+        return status != 0 ? -netd_libuinet_errno_to_linux(status) : -5;
+    }
+    uinet_sosetnonblocking(accepted, 1);
+    if (peer != NULL && peer->sa_family == UINET_AF_INET) {
+        const struct uinet_sockaddr_in *sin = (const struct uinet_sockaddr_in *)peer;
+        memcpy(out_peer_addr_be, &sin->sin_addr.s_addr, sizeof(*out_peer_addr_be));
+        *out_peer_port_be = sin->sin_port;
+    }
+    if (peer != NULL) uinet_free_sockaddr(peer);
+    struct uinet_sockaddr *local = NULL;
+    if (uinet_sogetsockaddr(accepted, &local) == 0 && local != NULL &&
+        local->sa_family == UINET_AF_INET) {
+        const struct uinet_sockaddr_in *sin = (const struct uinet_sockaddr_in *)local;
+        memcpy(out_local_addr_be, &sin->sin_addr.s_addr, sizeof(*out_local_addr_be));
+        *out_local_port_be = sin->sin_port;
+    }
+    if (local != NULL) uinet_free_sockaddr(local);
+    uint64_t accepted_handle = ++g_libuinet_api_next_handle;
+    if (accepted_handle == 0) accepted_handle = ++g_libuinet_api_next_handle;
+    slot->handle = accepted_handle;
+    slot->refcount = 1;
+    slot->type = NETD_SOCK_STREAM;
+    slot->protocol = NETD_IPPROTO_TCP;
+    slot->notify_fd = notify_fd;
+    slot->socket = accepted;
+    *out_handle = accepted_handle;
+    return 0;
+#else
+    (void)handle;
+    return -95;
+#endif
+}
+
 int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uint64_t flags, uint32_t addr_be, uint16_t port_be, size_t *out_sent)
 {
     (void)flags;
@@ -3020,7 +3143,8 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
     slot->notify_pending = 0;
     struct uinet_sockaddr_in sin;
     struct uinet_sockaddr *send_addr = NULL;
-    if (slot->type == NETD_SOCK_DGRAM && (addr_be != 0 || port_be != 0)) {
+    if ((slot->type == NETD_SOCK_DGRAM || slot->type == NETD_SOCK_RAW) &&
+        (addr_be != 0 || port_be != 0)) {
         memset(&sin, 0, sizeof(sin));
         sin.sin_len = sizeof(sin);
         sin.sin_family = UINET_AF_INET;
@@ -3060,13 +3184,18 @@ int netd_libuinet_socket_send(uint64_t handle, const void *data, size_t len, uin
 #endif
 }
 
-int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint64_t flags, size_t *out_received)
+int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity,
+    uint64_t flags, size_t *out_received, uint32_t *out_addr_be,
+    uint16_t *out_port_be)
 {
     (void)flags;
-    if (data == NULL || capacity == 0 || out_received == NULL) {
+    if (data == NULL || capacity == 0 || out_received == NULL ||
+        out_addr_be == NULL || out_port_be == NULL) {
         return -22;
     }
     *out_received = 0;
+    *out_addr_be = 0;
+    *out_port_be = 0;
 #if defined(NETD_WITH_LIBUINET)
     struct netd_libuinet_api_socket *slot = netd_libuinet_api_socket_find(handle);
     if (slot == NULL) {
@@ -3118,13 +3247,23 @@ int netd_libuinet_socket_recv(uint64_t handle, void *data, size_t capacity, uint
     uio.uio_offset = 0;
     uio.uio_resid = (int64_t)read_size;
 
-    int status = uinet_soreceive(slot->socket, NULL, &uio, NULL);
+    struct uinet_sockaddr *peer = NULL;
+    int status = uinet_soreceive(slot->socket, &peer, &uio, NULL);
     if (status == UINET_EWOULDBLOCK || status == UINET_EAGAIN) {
+        if (peer != NULL) uinet_free_sockaddr(peer);
         return -11;
     }
     if (status != 0) {
+        if (peer != NULL) uinet_free_sockaddr(peer);
         return -netd_libuinet_errno_to_linux(status);
     }
+    if (peer != NULL && peer->sa_family == UINET_AF_INET) {
+        const struct uinet_sockaddr_in *sin =
+            (const struct uinet_sockaddr_in *)peer;
+        memcpy(out_addr_be, &sin->sin_addr.s_addr, sizeof(*out_addr_be));
+        *out_port_be = sin->sin_port;
+    }
+    if (peer != NULL) uinet_free_sockaddr(peer);
     *out_received = read_size - (size_t)uio.uio_resid;
     slot->recv_calls++;
     slot->recv_bytes += (uint64_t)*out_received;

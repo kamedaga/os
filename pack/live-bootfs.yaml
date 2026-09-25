@@ -1,0 +1,86 @@
+schema: 1
+# This is the RAM-only console payload, not the installed rootfs.  Keep it
+# separate from pack.yaml's normal bootfs so ordinary boots stay unchanged.
+# The existing BusyBox fetch uses latest-stable; pin the extracted binary here
+# so a future installer image cannot silently change its shell on rebuild.
+sha256:
+  lpr_busybox_cmd: 01a989eb4d1d04b0d146c790ac536abd88f374ec74a2e110c58910b840d42045
+files:
+  /etc/pacha/boot-profile: live_boot_profile
+  /bin/ash: lpr_busybox_cmd
+  /bin/busybox: lpr_busybox_cmd
+  /bin/sh: lpr_busybox_cmd
+  /bin/curl: live_curl
+  /usr/sbin/dropbear: live_dropbear
+  /usr/bin/dropbearkey: live_dropbearkey
+  /etc/group: live_group
+  /etc/ld-musl-x86_64.path: ld_musl_path
+  /etc/passwd: live_passwd
+  /etc/shells: live_shells
+  /etc/dropbear/README: live_dropbear_directory
+  /etc/ssl/certs/ca-certificates.crt: ca_certificates
+  /lib/ld-musl-x86_64.so.1: pachaos_musl_ldso
+  /lib/libc.so: pachaos_musl_libc
+  /lib/libc.musl-x86_64.so.1: lpr_linux_musl_libc
+  /lib/linux/ld-musl-x86_64.so.1: lpr_linux_musl_libc
+  /lib/linux/libc.so: lpr_linux_musl_libc
+  /lib/libcurl.so.4: live_curl_libcurl
+  /lib/libz.so.1: live_curl_libz
+  /lib/libcares.so.2: live_curl_libcares
+  /lib/libnghttp2.so.14: live_curl_libnghttp2
+  /lib/libidn2.so.0: live_curl_libidn2
+  /lib/libpsl.so.5: live_curl_libpsl
+  /lib/libssl.so.3: live_curl_libssl
+  /lib/libcrypto.so.3: live_curl_libcrypto
+  /lib/libzstd.so.1: live_curl_libzstd
+  /lib/libbrotlidec.so.1: live_curl_libbrotlidec
+  /lib/libbrotlicommon.so.1: live_curl_libbrotlicommon
+  /lib/libunistring.so.5: live_curl_libunistring
+  /lib/pacha/lpr-linux-x86_64.so: linux_lpr_runtime
+  /sbin/filed.elf: filed
+  /sbin/lpr_supervisor.elf: lpr_supervisor
+  /sbin/seed0root.elf: seed0root
+  /srv/termd.elf: termd
+  /srv/unixd.elf: unixd
+  /srv/inputd.elf: inputd
+  /srv/usbd.elf: usbd
+  /srv/netd.elf: netd
+  /srv/kobox2/usb-hid/sandbox.elf: kobox2_usb_hid_sandbox
+  /srv/kobox2/usb-hid/core.so: kobox2_usb_hid_core
+  /srv/kobox2/usb-hid/closure.json: kobox2_usb_hid_closure
+  /srv/kobox2/usb-hid/modules/hid.ko: kobox2_usb_hid_hid
+  /srv/kobox2/usb-hid/modules/hid-generic.ko: kobox2_usb_hid_generic
+  /srv/kobox2/usb-hid/modules/evdev.ko: kobox2_usb_hid_evdev
+  /srv/kobox2/usb-hid/modules/usb-common.ko: kobox2_usb_hid_common
+  /srv/kobox2/usb-hid/modules/nls_base.ko: kobox2_usb_hid_nls
+  /srv/kobox2/usb-hid/modules/usbcore.ko: kobox2_usb_hid_usbcore
+  /srv/kobox2/usb-hid/modules/usbhid.ko: kobox2_usb_hid_usbhid
+  /srv/kobox2/usb-hid/modules/xhci-hcd.ko: kobox2_usb_hid_xhci_hcd
+  /srv/kobox2/usb-hid/modules/xhci-pci.ko: kobox2_usb_hid_xhci_pci
+  /srv/kobox2/network/sandbox.elf: kobox2_network_sandbox
+  /srv/kobox2/network/core.so: kobox2_network_core
+  /srv/kobox2/network/manifest.bin: kobox2_network_manifest
+  /srv/kobox2/network/modules/firmware_class.ko: kobox2_network_firmware_class
+  /srv/kobox2/network/modules/mdio_bus.ko: kobox2_network_mdio_bus
+  /srv/kobox2/network/modules/libphy.ko: kobox2_network_libphy
+  /srv/kobox2/network/modules/mdio_devres.ko: kobox2_network_mdio_devres
+  /srv/kobox2/network/modules/realtek.ko: kobox2_network_realtek_phy
+  /srv/kobox2/network/modules/virtio_pci_modern_dev.ko: kobox2_network_virtio_modern
+  /srv/kobox2/network/modules/virtio_ring.ko: kobox2_network_virtio_ring
+  /srv/kobox2/network/modules/virtio.ko: kobox2_network_virtio
+  /srv/kobox2/network/modules/virtio_pci.ko: kobox2_network_virtio_pci
+  /srv/kobox2/network/modules/bitrev.ko: kobox2_network_bitrev
+  /srv/kobox2/network/modules/crc32.ko: kobox2_network_crc32
+  /srv/kobox2/network/modules/r8169.ko: kobox2_network_r8169
+  /srv/kobox2/network/modules/failover.ko: kobox2_network_failover
+  /srv/kobox2/network/modules/net_failover.ko: kobox2_network_net_failover
+  /srv/kobox2/network/modules/virtio_net.ko: kobox2_network_virtio_net
+  # termd currently opens all eight modules, even with its null device backend.
+  /usr/lib/kobox/linux_tty_core.ko: kobox_linux_tty_core
+  /usr/lib/kobox/linux_tty_n_null.ko: kobox_linux_tty_n_null
+  /usr/lib/kobox/linux_virtio.ko: kobox_linux_virtio
+  /usr/lib/kobox/linux_virtio_ring.ko: kobox_linux_virtio_ring
+  /usr/lib/kobox/linux_virtio_pci_modern_dev.ko: kobox_linux_virtio_pci_modern_dev
+  /usr/lib/kobox/linux_virtio_pci_legacy_dev.ko: kobox_linux_virtio_pci_legacy_dev
+  /usr/lib/kobox/linux_virtio_pci.ko: kobox_linux_virtio_pci
+  /usr/lib/kobox/linux_virtio_console.ko: kobox_linux_virtio_console

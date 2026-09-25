@@ -115,7 +115,25 @@ void ph_number(const char *name, uint64_t value) {
     ph_log(buffer);
 }
 
+static void (*failure_reporter)(const char *, unsigned, uint64_t);
+static void (*exception_reporter)(const struct pacha_native_fault_frame *);
+
+void ph_set_failure_reporter(void (*reporter)(const char *, unsigned, uint64_t)) {
+    failure_reporter = reporter;
+}
+
+void ph_set_exception_reporter(void (*reporter)(const struct pacha_native_fault_frame *)) {
+    exception_reporter = reporter;
+}
+
+void ph_report_exception(const struct pacha_native_fault_frame *frame) {
+    if (exception_reporter) exception_reporter(frame);
+}
+
 _Noreturn void ph_fail(const char *file, unsigned line, uint64_t result) {
+    /* A fatal sandbox exit otherwise leaves an unobservable generic EIO on
+     * GOP-only live boots. Best-effort reporting must never delay exit. */
+    if (failure_reporter) failure_reporter(file, line, result);
     ph_log("PACHA_KOBOX_FOUNDATION=FAIL\n");
     ph_log(file);
     ph_number("line", line);

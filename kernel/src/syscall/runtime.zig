@@ -1,4 +1,5 @@
 const std = @import("std");
+const acpi_power = @import("../acpi_power.zig");
 const abi_root = @import("kernel_abi_root");
 const interrupts = @import("../interrupts.zig");
 const kernel = @import("../kernel.zig");
@@ -566,6 +567,18 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             frame.r10,
         ),
         sc.syscall_getrandom => getRandom(h, state, proc, frame),
+        sc.syscall_power_control => blk: {
+            // The boot owner is the sole receiver of authenticated shutdown
+            // requests. Linux guests and ordinary native processes cannot
+            // issue platform power transitions directly.
+            if (!state.isBootstrapOwner(proc)) break :blk sc.syscall_err_invalid;
+            const action: acpi_power.Action = switch (frame.rdi) {
+                1 => .poweroff,
+                2 => .reboot,
+                else => break :blk sc.syscall_err_invalid,
+            };
+            break :blk if (acpi_power.execute(action)) sc.syscall_ok else sc.syscall_err_not_ready;
+        },
         else => null,
     };
 }

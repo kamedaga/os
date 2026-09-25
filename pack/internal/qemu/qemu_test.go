@@ -131,6 +131,12 @@ func TestAppendInputDeviceArgs(t *testing.T) {
 			profile: "mouse-keyboard",
 			want:    "qemu -device virtio-mouse-pci,disable-legacy=on,id=pachamouse -device virtio-keyboard-pci,disable-legacy=on,id=pachakbd",
 		},
+		{
+			name:    "USB HID without virtio input",
+			profile: "usb-hid",
+			iommu:   true,
+			want:    "qemu -device qemu-xhci,id=pachaxhci -device usb-kbd,bus=pachaxhci.0,id=pachausbkbd -device usb-mouse,bus=pachaxhci.0,id=pachausbmouse",
+		},
 		{name: "unknown", profile: "keyboard-trackball", wantErr: true},
 	}
 	for _, test := range tests {
@@ -217,6 +223,28 @@ func TestUEFIIOMMUIsFirstDevice(t *testing.T) {
 	devices := deviceArgs(plan.Args)
 	if len(devices) == 0 || devices[0] != "intel-iommu,intremap=off,aw-bits=48" {
 		t.Fatalf("first UEFI device = %q, want intel-iommu; all devices: %#v", firstDevice(devices), devices)
+	}
+}
+
+func TestLiveBootOmitsInstalledRootDisk(t *testing.T) {
+	workspace, _ := testUEFIWorkspace(t)
+	workspace.Disk.Image = ".artifacts/nonexistent-installed-root.img"
+	for _, firmware := range []string{"bios", "uefi"} {
+		t.Run(firmware, func(t *testing.T) {
+			plan, err := commandArgs(workspace, Options{
+				Firmware: firmware, Console: "off", NoKVM: true,
+				NoNet: true, NoStorage: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(strings.Join(plan.Args, " "), "rootdisk") {
+				t.Fatalf("live command still attaches installed root: %#v", plan.Args)
+			}
+			if len(plan.ImagePaths) != map[string]int{"bios": 1, "uefi": 2}[firmware] {
+				t.Fatalf("unexpected image lock set: %#v", plan.ImagePaths)
+			}
+		})
 	}
 }
 

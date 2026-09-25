@@ -366,7 +366,9 @@ static int netd_socket_dispatch(
         size_t received = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
             netd_netlink_socket_recv(req, capacity, &received) :
-            netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
+            netd_libuinet_socket_recv(req->handle, req->data, capacity,
+                req->flags, &received, &req->addr.addr_be,
+                &req->addr.port_be);
         req->length = received;
         *out_result = received;
         return status;
@@ -403,9 +405,29 @@ static int netd_socket_dispatch(
         }
     case NETD_OP_BIND:
         if (page == NULL) return -22;
-        return netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle) ?
-            netd_netlink_socket_bind((const netd_netlink_bind_t *)page) :
-            -95;
+        if (netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle))
+            return netd_netlink_socket_bind((const netd_netlink_bind_t *)page);
+        {
+            netd_inet_bind_t *req = (netd_inet_bind_t *)page;
+            *out_result = 0;
+            return netd_libuinet_socket_bind(req->handle,
+                req->addr.addr_be, req->addr.port_be, req->reuseaddr != 0,
+                &req->addr.addr_be, &req->addr.port_be);
+        }
+    case NETD_OP_LISTEN: {
+        if (page == NULL) return -22;
+        const netd_listen_t *req = (const netd_listen_t *)page;
+        *out_result = 0;
+        return netd_libuinet_socket_listen(req->handle, req->backlog);
+    }
+    case NETD_OP_ACCEPT: {
+        if (page == NULL || transferred_count != 1) return -22;
+        netd_accept_t *req = (netd_accept_t *)page;
+        *out_result = 0;
+        return netd_libuinet_socket_accept(req->handle, transferred_fds[0],
+            out_result, &req->peer.addr_be, &req->peer.port_be,
+            &req->local.addr_be, &req->local.port_be);
+    }
     case NETD_OP_UEVENT_PUBLISH:
         {
             const uint64_t device = *out_result;
@@ -469,6 +491,8 @@ static int netd_socket_dispatch_request(
         request->word1 == NETD_OP_RECV ||
         request->word1 == NETD_OP_POLL ||
         request->word1 == NETD_OP_BIND ||
+        request->word1 == NETD_OP_LISTEN ||
+        request->word1 == NETD_OP_ACCEPT ||
         0;
     struct netd_page_attachment *attachment = op_uses_page ?
         netd_page_attachment_find(request->word2) : NULL;
@@ -500,7 +524,8 @@ static int netd_socket_dispatch_request(
     if (page != NULL) __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
 
-    const int may_retain = request->word1 == NETD_OP_SOCKET || request->word1 == NETD_OP_DUP;
+    const int may_retain = request->word1 == NETD_OP_SOCKET ||
+        request->word1 == NETD_OP_ACCEPT || request->word1 == NETD_OP_DUP;
     const int admission = netd_socket_admit_fds(request->fd_count,
         may_retain ? transferred_count : 0);
     if (admission != 0)
@@ -529,6 +554,7 @@ static int netd_socket_dispatch_request(
     const int transfer_retained = status == 0 &&
         ((request->word1 == NETD_OP_SOCKET &&
             result != 0) ||
+         (request->word1 == NETD_OP_ACCEPT && result != 0) ||
          (request->word1 == NETD_OP_DUP && transferred_count == 1));
     if (!transfer_retained)
         for (uint32_t i = 0; i < transferred_count; ++i)

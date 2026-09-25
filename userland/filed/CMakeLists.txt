@@ -9,6 +9,7 @@ set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(FILED_PROFILE_CFLAGS "$ENV{PACHAOS_FILED_EXTRA_CFLAGS}")
 set(FILED_ELF "${CMAKE_BINARY_DIR}/filed.elf")
 set(ZYDIS_SOURCE "${REPO_ROOT}/.artifacts/third_party/zydis-v4.1.1/source")
+set(MINIZ_SOURCE "${REPO_ROOT}/.artifacts/third_party/miniz-3.0.2/source")
 set(FILED_DISPATCH_SHARDS
   "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/metric_clock.h"
   "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/unix_path.h"
@@ -52,6 +53,8 @@ set(FILED_EXTRA_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fd_ipc.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox_backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/live_bootfs.c"
+  "${MINIZ_SOURCE}/miniz_tinfl.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/dispatch/unix_path.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/tmpfs/dir.c"
@@ -140,14 +143,19 @@ add_custom_command(
   COMMAND
     bash "${REPO_ROOT}/pack/scripts/download_zydis.sh"
   COMMAND
+    bash "${REPO_ROOT}/pack/scripts/download_miniz_tinfl.sh"
+  COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${FILED_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype ${FILED_PROFILE_CFLAGS}"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${MINIZ_SOURCE} ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/koboxd/src ${REPO_ROOT}/userland/koboxd/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/personality/linux/decoder ${ZYDIS_SOURCE}/include ${ZYDIS_SOURCE}/src ${ZYDIS_SOURCE}/dependencies/zycore/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
+      "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_DEFLATE_APIS -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype ${FILED_PROFILE_CFLAGS}"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/bootstrap.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/live_bootstrap.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/live_bootfs.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/miniz_export.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/backend_router.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/dispatch.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/exec.h"
@@ -186,7 +194,9 @@ add_custom_command(
     "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.c"
     "${REPO_ROOT}/userland/personality/linux/decoder/patch_scan.h"
     "${REPO_ROOT}/pack/scripts/download_zydis.sh"
+    "${REPO_ROOT}/pack/scripts/download_miniz_tinfl.sh"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

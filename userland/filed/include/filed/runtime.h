@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "filed/bootstrap.h"
+#include "filed/live_bootstrap.h"
 #include "filed/kobox_backend.h"
 #include "filed/tmpfs_internal.h"
 #include "filed/vfs.h"
@@ -30,6 +31,10 @@ typedef struct filed_runtime {
     filed_kobox_backend_t backend;
     filed_tmpfs_backend_t tmpfs;
     int bootstrap_fd;
+    int live_bootfs_fd;
+    int live_ready_fd;
+    uint64_t live_bootfs_size;
+    uint8_t live_root;
     int client_endpoint_fd;
     struct filed_client *clients;
     struct filed_client *actor;

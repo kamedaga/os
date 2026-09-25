@@ -52,15 +52,20 @@ static const kb2_closure_manifest_dependency_t dependencies[] = {
 static const uint8_t device_schema[32] = KB2_PCI_FUNCTION_SCHEMA_SHA256_BYTES;
 
 static void select_device(struct core_package *package) {
-    const struct seed0_init_descriptor_page *boot = seed0_bootstrap_descriptor();
-    IPC_CHECK(boot && boot->device_count <= SEED0_INIT_MAX_DEVICE_DESCRIPTORS);
-    for (uint64_t i = 0; i < boot->device_count; ++i) {
-        const struct seed0_device_descriptor *candidate = &boot->devices[i];
-        if (candidate->vendor_id != 0x1af4 || candidate->device_id != 0x1050)
+    IPC_CHECK(seed0_bootstrap_descriptor() != NULL);
+    uint64_t count = 0;
+    IPC_CHECK(pacha_syscall2(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
+        UINT64_MAX, (uintptr_t)&count) == 0);
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t words[8] = {0};
+        IPC_CHECK(pacha_syscall3(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
+            i, (uintptr_t)words, 8) == 8);
+        if (words[1] != 0x1af4 || words[2] != 0x1050)
             continue;
-        IPC_CHECK(!package->device_fd && candidate->init_device_fd >= 16 &&
-                  candidate->init_device_fd < PACHA_FD_TABLE_LIMIT);
-        package->device_fd = candidate->init_device_fd;
+        IPC_CHECK(!package->device_fd);
+        package->device_fd = (int)pacha_syscall1(PACHA_CAPSULE_SYSCALL_PCI_CLAIM, i);
+        IPC_CHECK(package->device_fd >= 16 &&
+            package->device_fd < PACHA_FD_TABLE_LIMIT);
     }
     IPC_CHECK(package->device_fd);
     struct pacha_capsule_info info = {0};

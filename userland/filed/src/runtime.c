@@ -4,7 +4,9 @@
 #include <string.h>
 
 #include "filed/dispatch.h"
+#include "filed/backend_router.h"
 #include "filed/fd_ipc.h"
+#include "filed/live_bootfs.h"
 #include "filed/page_cache.h"
 #include "filed_direct_backend.h"
 #include "storage_runtime.h"
@@ -181,6 +183,8 @@ void filed_runtime_init(filed_runtime_t *runtime)
 
     memset(runtime, 0, sizeof(*runtime));
     runtime->bootstrap_fd = -1;
+    runtime->live_bootfs_fd = -1;
+    runtime->live_ready_fd = -1;
     runtime->client_endpoint_fd = -1;
     runtime->unix_path_fd = -1;
     runtime->syncer_timer_fd = -1;
@@ -215,6 +219,30 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
 
     memset(&storage_bootstrap, 0, sizeof(storage_bootstrap));
     status = filed_read_storage_bootstrap_fd(runtime->bootstrap_fd, &storage_bootstrap, &bootstrap_bytes);
+    if (bootstrap_bytes >= (long)sizeof(filed_live_bootstrap_t) &&
+        storage_bootstrap.magic == FILED_LIVE_BOOTSTRAP_MAGIC) {
+        filed_live_bootstrap_t live;
+        memcpy(&live, &storage_bootstrap, sizeof(live));
+        if (live.unix_path_fd < 16 ||
+            live.unix_path_fd >= PACHA_FD_TABLE_LIMIT ||
+            live.bootfs_size < 104 ||
+            live.bootfs_size > FILED_LIVE_BOOTFS_MAX_BYTES ||
+            live.bootfs_fd < 16 || live.bootfs_fd >= PACHA_FD_TABLE_LIMIT ||
+            live.public_endpoint_fd < 16 ||
+            live.public_endpoint_fd >= PACHA_FD_TABLE_LIMIT ||
+            live.ready_channel_fd < 16 ||
+            live.ready_channel_fd >= PACHA_FD_TABLE_LIMIT) return -22;
+        struct pacha_fd_info info;
+        if (pacha_fd_get_info((int)live.bootfs_fd, &info) != 0 ||
+            info.size < live.bootfs_size) return -22;
+        runtime->live_bootfs_fd = (int)live.bootfs_fd;
+        runtime->live_bootfs_size = live.bootfs_size;
+        runtime->live_ready_fd = (int)live.ready_channel_fd;
+        runtime->client_endpoint_fd = (int)live.public_endpoint_fd;
+        runtime->unix_path_fd = (int)live.unix_path_fd;
+        runtime->live_root = 1;
+        return 0;
+    }
     if (status == 0 && storage_bootstrap.magic == KOBOXD_BOOTSTRAP_MAGIC) {
         if (storage_bootstrap.unix_path_fd < 16 || storage_bootstrap.unix_path_fd >= PACHA_FD_TABLE_LIMIT) return -22;
         runtime->unix_path_fd = (int)storage_bootstrap.unix_path_fd;
@@ -353,22 +381,22 @@ static int filed_runtime_mount_shm_tmpfs(filed_runtime_t *runtime)
     storage_statx_reply_t dev_stat;
     filed_vfs_open_result_t dev_open;
 
-    int status = filed_kobox_backend_lookup(
-        &runtime->backend,
-        runtime->backend.root_object_id,
-        "dev",
-        &dev_object);
+    const uint64_t root_object = runtime->live_root ?
+        filed_tmpfs_backend_root_object(&runtime->tmpfs) :
+        runtime->backend.root_object_id;
+    int status = filed_runtime_backend_lookup(runtime, root_object,
+        "dev", &dev_object);
     if (status != 0) {
         return status;
     }
     memset(&dev_stat, 0, sizeof(dev_stat));
-    status = filed_kobox_backend_statx(&runtime->backend, dev_object, &dev_stat);
+    status = filed_runtime_backend_statx(runtime, dev_object, &dev_stat);
     if (status != 0) {
-        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        (void)filed_runtime_backend_release_object(runtime, dev_object);
         return status;
     }
     if ((dev_stat.kind & 0170000u) != 0040000u) {
-        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        (void)filed_runtime_backend_release_object(runtime, dev_object);
         return -20;
     }
 
@@ -387,7 +415,7 @@ static int filed_runtime_mount_shm_tmpfs(filed_runtime_t *runtime)
         FILED_OPEN_DIRECTORY,
         &dev_open);
     if (vfs_status != FILED_OK) {
-        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        (void)filed_runtime_backend_release_object(runtime, dev_object);
         return -70 - (int)vfs_status;
     }
 
@@ -415,16 +443,32 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         return -1;
     }
 
-    int status = filed_kobox_backend_mount_root(&runtime->backend);
-    if (status != 0) {
-        return status;
+    uint64_t root_object = 0;
+    int status;
+    if (runtime->live_root) {
+        const uint64_t map_size = (runtime->live_bootfs_size + 4095u) & ~4095ull;
+        const unsigned char *archive = pacha_mmap(runtime->live_bootfs_fd,
+            map_size, PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
+        if (archive == NULL) return -5;
+        uint32_t files = 0;
+        uint64_t bytes = 0;
+        status = filed_live_bootfs_populate(&runtime->tmpfs, archive,
+            runtime->live_bootfs_size, &files, &bytes);
+        (void)pacha_munmap((void *)archive, map_size);
+        (void)pacha_fd_close(runtime->live_bootfs_fd);
+        runtime->live_bootfs_fd = -1;
+        if (status != 0) return status;
+        printf("[filed] RAM root populated files=%u bytes=%llu\n",
+            files, (unsigned long long)bytes);
+        root_object = filed_tmpfs_backend_root_object(&runtime->tmpfs);
+    } else {
+        status = filed_kobox_backend_mount_root(&runtime->backend);
+        if (status != 0) return status;
+        root_object = runtime->backend.root_object_id;
     }
 
     memset(&root_stat, 0, sizeof(root_stat));
-    status = filed_kobox_backend_statx(
-        &runtime->backend,
-        runtime->backend.root_object_id,
-        &root_stat);
+    status = filed_runtime_backend_statx(runtime, root_object, &root_stat);
     if (status != 0) {
         return status;
     }
@@ -432,9 +476,9 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
 
     vfs_status = filed_vfs_mount_root(
         &runtime->vfs,
-        FILED_FS_EXT4,
-        (filed_backend_id_t)(uint32_t)runtime->backend.fs_fd,
-        runtime->backend.root_object_id,
+        runtime->live_root ? FILED_FS_SYNTHETIC : FILED_FS_EXT4,
+        runtime->live_root ? 0 : (filed_backend_id_t)(uint32_t)runtime->backend.fs_fd,
+        root_object,
         &root_mount);
     if (vfs_status != FILED_OK) {
         return -20 - (int)vfs_status;
@@ -458,7 +502,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         root_snapshot.ctime_nsec = root_stat.ctime_nsec;
         (void)filed_vfs_update_stat_snapshot(
             &runtime->vfs,
-            runtime->backend.root_object_id,
+            root_object,
             &root_snapshot);
     }
     runtime->root_mount_id = root_mount;
@@ -483,7 +527,16 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
     }
     runtime->root_handle_id = root_open.handle_id;
 
-    {
+    if (runtime->live_root) {
+        /* The live root already owns tmpfs's primary root object. /tmp needs
+         * a detached root, otherwise /tmp aliases / and memfd entries leak
+         * into the filesystem root. */
+        status = filed_runtime_mount_detached_tmpfs_child(runtime,
+            runtime->root_handle_id, "tmp", &runtime->tmpfs_root_handle_id);
+        if (status != 0) return status;
+        runtime->tmpfs_root_handle_valid = 1u;
+        runtime->root_tmpfs_synthetic_dirent = 0u;
+    } else {
         uint64_t tmpfs_root = 0;
         uint64_t root_tmp_object = 0;
         filed_vfs_open_result_t tmp_open;
@@ -493,11 +546,8 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
             return status;
         }
         runtime->root_tmpfs_synthetic_dirent =
-            filed_kobox_backend_lookup(
-                &runtime->backend,
-                runtime->backend.root_object_id,
-                "tmp",
-                &root_tmp_object) == 0 ? 0u : 1u;
+            filed_runtime_backend_lookup(runtime, root_object,
+                "tmp", &root_tmp_object) == 0 ? 0u : 1u;
         vfs_status = filed_vfs_open_backend_child(
             &runtime->vfs,
             runtime->root_handle_id,

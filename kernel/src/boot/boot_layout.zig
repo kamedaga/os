@@ -29,7 +29,4 @@ pub const boot_log_console_stack_top: u64 = boot_log_console_stack_page_va + 0x1
 pub const boot_log_console_entry_rsp: u64 = boot_log_console_stack_top - 8;
 pub const boot_log_user_va: u64 = process_abi.auxPageVa(1);
 
-pub const framebuffer_window_bytes: u64 =
-    two_mib - (process_abi.auxPageVa(5) - user_aux_base_va);
-
 pub const phys_copy_window_va: u64 = kernel_vm.phys_copy_window_va;

@@ -37,3 +37,44 @@ func TestRenderMatchesBootFsAbiLayout(t *testing.T) {
 		}
 	}
 }
+
+func TestLiveExecutablePathsKeepExecutableMetadata(t *testing.T) {
+	for _, path := range []string{
+		"/bin/ash",
+		"/bin/sh",
+		"/bin/busybox",
+		"/usr/bin/dropbearkey",
+		"/usr/sbin/dropbear",
+		"/lib/pacha/lpr-linux-x86_64.so",
+		"/lib/ld-musl-x86_64.so.1",
+		"/lib/linux/ld-musl-x86_64.so.1",
+	} {
+		if modeBitsForPath(path) != 0o555 || flagsForPath(path) != flagExecutable {
+			t.Fatalf("%s is not executable in bootfs metadata", path)
+		}
+	}
+	for _, path := range []string{"/etc/passwd", "/usr/lib/kobox/linux_tty_core.ko"} {
+		if modeBitsForPath(path) != 0o444 || flagsForPath(path) != 0 {
+			t.Fatalf("%s unexpectedly executable in bootfs metadata", path)
+		}
+	}
+}
+
+func TestRenderSharesSameSourceBytesAcrossAliases(t *testing.T) {
+	items := []entry{
+		{ImagePath: "/bin/ash", SourcePath: "busybox", Data: []byte("busybox")},
+		{ImagePath: "/bin/sh", SourcePath: "busybox", Data: []byte("busybox")},
+	}
+	image, err := render(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := binary.LittleEndian.Uint64(image[headerBytes+8 : headerBytes+16])
+	second := binary.LittleEndian.Uint64(image[headerBytes+entryBytes+8 : headerBytes+entryBytes+16])
+	if first != second {
+		t.Fatalf("aliases have different data offsets: %d, %d", first, second)
+	}
+	if len(image) != int(first)+len("busybox") {
+		t.Fatalf("image contains duplicate payload: %d bytes", len(image))
+	}
+}

@@ -1,7 +1,7 @@
 const std = @import("std");
-const init_bootstrap_abi = @import("kernel_abi_root").init_bootstrap_abi;
 const acpi_tables = @import("acpi_tables.zig");
 const user_copy = @import("user_copy.zig");
+const boot_scratch = @import("boot/boot_scratch.zig");
 const identity_limit = @import("arch/x86_64/physical_layout.zig").identity_limit;
 
 pub const Location = struct {
@@ -15,7 +15,11 @@ pub const pci_resource_id_mask: u64 = 0xffffffff_00000000;
 
 pub const interrupt_vector_base: u8 = 0x50;
 pub const interrupt_vectors_per_device: u8 = 16;
-pub const interrupt_device_count: usize = init_bootstrap_abi.max_device_descriptors;
+// 0xf0..0xff stays outside device routing; each routed device needs a
+// contiguous MSI block. This finite APIC budget is independent of PCI count.
+pub const interrupt_vector_end_exclusive: u8 = 0xf0;
+pub const interrupt_device_count: usize =
+    (interrupt_vector_end_exclusive - interrupt_vector_base) / interrupt_vectors_per_device;
 pub const interrupt_vector_count: u8 =
     @intCast(interrupt_device_count * @as(usize, interrupt_vectors_per_device));
 
@@ -83,9 +87,107 @@ const BarAperture = struct {
 const DeviceApertures = struct {
     resource_id: u64 = 0,
     vendor_device: u32 = 0,
+    subsystem_id: u16 = 0,
+    class_code: u32 = 0,
+    claimed: bool = false,
     bars: [6]?BarAperture = [_]?BarAperture{null} ** 6,
 };
-var device_apertures: [interrupt_device_count]DeviceApertures = [_]DeviceApertures{.{}} ** interrupt_device_count;
+var device_apertures: []DeviceApertures = &.{};
+
+pub const BootFunction = struct {
+    resource_id: u64,
+    vendor_id: u16,
+    device_id: u16,
+    subsystem_id: u16,
+    class_code: u32,
+    bus: u8,
+    device: u8,
+    function: u8,
+};
+
+pub fn bootFunctionCount() usize {
+    return device_apertures.len;
+}
+
+pub fn bootFunctionClaimed(index: usize) bool {
+    return index >= device_apertures.len or device_apertures[index].claimed;
+}
+
+pub fn markBootFunctionClaimed(index: usize) void {
+    std.debug.assert(index < device_apertures.len and !device_apertures[index].claimed);
+    device_apertures[index].claimed = true;
+}
+
+pub fn bootFunctionAt(index: usize) ?BootFunction {
+    if (index >= device_apertures.len) return null;
+    const entry = device_apertures[index];
+    const loc = locationFromResourceId(entry.resource_id) orelse return null;
+    return .{
+        .resource_id = entry.resource_id,
+        .vendor_id = @truncate(entry.vendor_device),
+        .device_id = @truncate(entry.vendor_device >> 16),
+        .subsystem_id = entry.subsystem_id,
+        .class_code = entry.class_code,
+        .bus = loc.bus,
+        .device = loc.device,
+        .function = loc.function,
+    };
+}
+
+/// Capture firmware-assigned BARs before user drivers can enable bus mastering.
+/// The table is sized by discovery, rather than truncating at the IRQ budget.
+pub fn captureBootFunctions() bool {
+    var count: usize = 0;
+    for (0..256) |bus| for (0..32) |device| {
+        const first = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = 0 };
+        if (readVendorId(first) == 0xffff) continue;
+        const functions: usize = if ((readHeaderType(first) & 0x80) != 0) 8 else 1;
+        for (0..functions) |function| {
+            const loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = @intCast(function) };
+            if (readVendorId(loc) != 0xffff and readClassCode(loc) != 0x06) count += 1;
+        }
+    };
+    const size = std.math.mul(usize, count, @sizeOf(DeviceApertures)) catch return false;
+    const storage = boot_scratch.allocate(size) orelse return false;
+    const entries: [*]DeviceApertures = @ptrCast(@alignCast(storage.ptr));
+    device_apertures = entries[0..count];
+    @memset(device_apertures, .{});
+    var index: usize = 0;
+    for (0..256) |bus| for (0..32) |device| {
+        const first = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = 0 };
+        if (readVendorId(first) == 0xffff) continue;
+        const functions: usize = if ((readHeaderType(first) & 0x80) != 0) 8 else 1;
+        for (0..functions) |function| {
+            const loc = Location{ .bus = @intCast(bus), .device = @intCast(device), .function = @intCast(function) };
+            if (readVendorId(loc) == 0xffff or readClassCode(loc) == 0x06) continue;
+            if (index >= count or !captureBarApertures(resourceIdFromLocation(loc), index)) return false;
+            index += 1;
+        }
+    };
+    return index == count;
+}
+
+test "PCI catalog is not bounded by interrupt-route slots" {
+    var entries: [9]DeviceApertures = [_]DeviceApertures{.{}} ** 9;
+    const previous = device_apertures;
+    device_apertures = entries[0..];
+    defer device_apertures = previous;
+    clearInterruptRoutes();
+    defer clearInterruptRoutes();
+    for (&entries, 0..) |*entry, index| {
+        entry.resource_id = resourceIdFromLocation(.{
+            .bus = 0, .device = @intCast(index), .function = 0,
+        });
+        entry.vendor_device = 0x0010_1b36;
+    }
+    try std.testing.expectEqual(@as(usize, 9), bootFunctionCount());
+    try std.testing.expectEqual(entries[8].resource_id, bootFunctionAt(8).?.resource_id);
+    try std.testing.expect(!bootFunctionClaimed(8));
+    markBootFunctionClaimed(8);
+    try std.testing.expect(bootFunctionClaimed(8));
+    try std.testing.expect(ensureInterruptRoute(entries[8].resource_id));
+    try std.testing.expect(interruptVectorBaseForResourceId(entries[8].resource_id) != null);
+}
 
 /// Boot-only read-only bound for a continuous DMA window. Do not size-probe
 /// devices here: firmware may have left bus mastering enabled. Conservatively
@@ -173,7 +275,12 @@ fn dmaBridgeWindowEnd(start: u64, end: u64, low: u32, base_high: u32, last_high:
 pub fn captureBarApertures(resource_id: u64, device_index: usize) bool {
     const loc = locationFromResourceId(resource_id) orelse return false;
     if (device_index >= device_apertures.len or device_apertures[device_index].resource_id != 0) return false;
-    var captured = DeviceApertures{ .resource_id = resource_id, .vendor_device = readConfigU32(loc, 0) };
+    var captured = DeviceApertures{
+        .resource_id = resource_id,
+        .vendor_device = readConfigU32(loc, 0),
+        .subsystem_id = readSubsystemId(loc),
+        .class_code = readConfigU32(loc, 0x08) >> 8,
+    };
     if (@as(u16, @truncate(captured.vendor_device)) == 0xffff) return false;
     for (&captured.bars, 0..) |*entry, index| {
         const bar_index: u8 = @intCast(index);
@@ -197,7 +304,7 @@ fn apertureMatches(aperture: BarAperture, low: u32, high: u32) bool {
 pub fn authorizedBarInfo(resource_id: u64, bar_index: u8) ?BarInfo {
     if (bar_index >= 6) return null;
     const loc = locationFromResourceId(resource_id) orelse return null;
-    for (&device_apertures) |*device| {
+    for (device_apertures) |*device| {
         if (device.resource_id != resource_id) continue;
         const aperture = device.bars[bar_index] orelse return null;
         if (readConfigU32(loc, 0) != device.vendor_device) return null;
@@ -546,6 +653,17 @@ pub fn registerInterruptRoute(resource_id: u64, device_index: usize) bool {
     if (existing != 0 and existing != resource_id) return false;
     interrupt_route_devices[device_index] = resource_id;
     return true;
+}
+
+/// Assign a vector block only when a device actually derives an IRQ. PCI
+/// discovery and Device FD creation must not consume this finite APIC budget.
+pub fn ensureInterruptRoute(resource_id: u64) bool {
+    if (locationFromResourceId(resource_id) == null) return false;
+    if (interruptVectorBaseForResourceId(resource_id) != null) return true;
+    for (interrupt_route_devices, 0..) |device, index| {
+        if (device == 0) return registerInterruptRoute(resource_id, index);
+    }
+    return false;
 }
 
 pub fn interruptVectorBaseForResourceId(resource_id: u64) ?u8 {
@@ -1141,6 +1259,25 @@ test "PCI DMA boot scan skips upper BAR slots and clips ROM ECAM and unknown hea
     reader.config[6] = 0;
     reader.config[3] = 2 << 16; // CardBus windows are not implemented.
     try std.testing.expectEqual(@as(u64, start), bootDmaWindowEndWithReader(start, end, &.{}, reader));
+}
+
+test "PCI DMA boot scan leaves translated IOVAs below a UEFI GOP BAR" {
+    const Reader = struct {
+        fn read(_: @This(), loc: Location, offset: u8) u32 {
+            if (loc.bus != 0 or loc.device != 1 or loc.function != 0)
+                return 0xffffffff;
+            return switch (offset) {
+                0 => 0x11111234,
+                0x10 => 0x80000000,
+                else => 0,
+            };
+        }
+    };
+    const start = @import("iova.zig").window_start;
+    try std.testing.expectEqual(@as(u64, 0x01000000), start);
+    try std.testing.expectEqual(@as(u64, 0x80000000),
+        bootDmaWindowEndWithReader(start, @import("iova.zig").window_ceiling,
+            &.{}, Reader{}));
 }
 
 test "PCI DMA bridge windows clip 32-bit and 64-bit ranges and reject unknown types" {

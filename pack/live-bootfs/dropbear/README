@@ -1,0 +1,2 @@
+The SSH host key is generated in this RAM-backed directory on first use.
+It is not persistent across boots. Verify its fingerprint on each new boot.

@@ -3009,6 +3009,18 @@ static int64_t lpr_sys_fsync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_ftruncate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_ftruncate(a0, a1); }
 static int64_t lpr_sys_fallocate(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return -LPR_LINUX_EOPNOTSUPP; }
 static int64_t lpr_sys_sync(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_sync(); }
+static int64_t lpr_sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t command,
+    uint64_t arg, uint64_t a4, uint64_t a5)
+{
+    (void)arg; (void)a4; (void)a5;
+    if (magic1 != 0xfee1deadull || magic2 != 672274793ull)
+        return -LPR_LINUX_EINVAL;
+    uint32_t op;
+    if (command == 0x4321fedcull) op = LPRS_OP_SYSTEM_POWEROFF;
+    else if (command == 0x01234567ull) op = LPRS_OP_SYSTEM_REBOOT;
+    else return -LPR_LINUX_EINVAL;
+    return lpr_supervisor_call_token(op, lpr_supervisor_token, -1, NULL);
+}
 static int64_t lpr_sys_syncfs(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_syncfs(a0); }
 static int64_t lpr_sys_getcwd(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_getcwd(a0, a1); }
 static int64_t lpr_sys_chdir(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_chdir(a0); }
@@ -3665,6 +3677,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_SETRLIMIT, "setrlimit", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_setrlimit, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_PRCTL, "prctl", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_prctl, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SYNC, "sync", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_sync, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_REBOOT, "reboot", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_reboot, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_ARCH_PRCTL, "arch_prctl", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_arch_prctl, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETTID, "gettid", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_gettid, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_FUTEX, "futex", LPR_LINUX_SYSCALL_CLASS_THREAD_ARCH, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_futex, 0),
@@ -3853,6 +3866,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_SETRLIMIT].handler = lpr_sys_setrlimit;
     lpr_syscall_table[LPR_LINUX_SYS_PRCTL].handler = lpr_sys_prctl;
     lpr_syscall_table[LPR_LINUX_SYS_SYNC].handler = lpr_sys_sync;
+    lpr_syscall_table[LPR_LINUX_SYS_REBOOT].handler = lpr_sys_reboot;
     lpr_syscall_table[LPR_LINUX_SYS_ARCH_PRCTL].handler = lpr_sys_arch_prctl;
     lpr_syscall_table[LPR_LINUX_SYS_GETTID].handler = lpr_sys_gettid;
     lpr_syscall_table[LPR_LINUX_SYS_FUTEX].handler = lpr_sys_futex;

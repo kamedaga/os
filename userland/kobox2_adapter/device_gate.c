@@ -26,19 +26,23 @@ static int observe_mmio_map(void *context, void *address, uint64_t physical,
 }
 
 void ph_device_gate_prepare(const struct kobox_linux_boot_layout *layout) {
-    const struct seed0_init_descriptor_page *boot = seed0_bootstrap_descriptor();
-    const struct seed0_device_descriptor *gpu = NULL;
-    PH_CHECK(boot && boot->device_count <= SEED0_INIT_MAX_DEVICE_DESCRIPTORS);
-    for (uint64_t i = 0; i < boot->device_count; ++i) {
-        const struct seed0_device_descriptor *candidate = &boot->devices[i];
-        if (candidate->vendor_id == 0x1af4 && candidate->device_id == 0x1050) {
-            PH_CHECK(!gpu);
-            gpu = candidate;
+    PH_CHECK(seed0_bootstrap_descriptor() != NULL);
+    uint64_t count = 0;
+    PH_CHECK(pacha_syscall2(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
+        UINT64_MAX, (uint64_t)(uintptr_t)&count) == 0);
+    int gpu_fd = -1;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t words[8] = {0};
+        PH_CHECK(pacha_syscall3(PACHA_CAPSULE_SYSCALL_PCI_ENUMERATE,
+            i, (uint64_t)(uintptr_t)words, 8) == 8);
+        if (words[1] == 0x1af4 && words[2] == 0x1050) {
+            PH_CHECK(gpu_fd < 0);
+            gpu_fd = (int)pacha_syscall1(PACHA_CAPSULE_SYSCALL_PCI_CLAIM, i);
         }
     }
-    PH_CHECK(gpu && gpu->init_device_fd >= 16 && gpu->init_device_fd < PACHA_FD_TABLE_LIMIT);
+    PH_CHECK(gpu_fd >= 16 && gpu_fd < PACHA_FD_TABLE_LIMIT);
     config = (struct ph_device_config){
-        .device_fd = (int)gpu->init_device_fd, .generation = 1,
+        .device_fd = gpu_fd, .generation = 1,
         /* Linux topology is local. The native FD still limits every operation
          * to the one discovered physical function. */
         .segment = 0, .bus = 0, .devfn = 0,

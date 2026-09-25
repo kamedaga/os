@@ -7,11 +7,17 @@
 typedef struct inputd_service {
     const struct inputd_boot_config *cfg;
     struct inputd_input_island *input;
+    void *sources;
+    size_t source_count;
 } inputd_service_t;
 
 int inputd_service_send_boot_ready(inputd_service_t *service, int64_t status, uint64_t result);
 int inputd_service_publish_startup_devices(inputd_service_t *service);
 int inputd_service_dispatch(
+    inputd_service_t *service,
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds);
+int inputd_service_source_dispatch(
     inputd_service_t *service,
     const struct pacha_ipc_msg *request,
     const struct pacha_ipc_fd *fds);

@@ -16,8 +16,10 @@ enum {
     NETD_OP_RECV = 6u,
     NETD_OP_POLL = 7u,
     NETD_OP_BIND = 8u,
-    NETD_OP_UEVENT_PUBLISH = 9u,
-    NETD_OP_DUP = 10u,
+    NETD_OP_LISTEN = 9u,
+    NETD_OP_ACCEPT = 10u,
+    NETD_OP_UEVENT_PUBLISH = 11u,
+    NETD_OP_DUP = 12u,
 
     NETD_STATUS_STALE_ATTACHMENT = -116,
 
@@ -26,6 +28,7 @@ enum {
     NETD_SOCK_STREAM = 1,
     NETD_SOCK_DGRAM = 2,
     NETD_SOCK_RAW = 3,
+    NETD_IPPROTO_ICMP = 1,
     NETD_IPPROTO_TCP = 6,
     NETD_IPPROTO_UDP = 17,
     NETD_NETLINK_KOBJECT_UEVENT = 15,
@@ -47,7 +50,10 @@ enum {
 };
 
 #define NETD_UEVENT_INPUT_TAG (UINT64_C(1) << 63)
-#define NETD_UEVENT_INPUT_RESERVED_MASK UINT64_C(0x7f00000000000000)
+/* Action uses formerly reserved bits so the existing publish operation can
+ * distinguish hotplug add/remove without a second endpoint or opcode. */
+#define NETD_UEVENT_INPUT_RESERVED_MASK UINT64_C(0x7c00000000000000)
+#define NETD_UEVENT_INPUT_ACTION_SHIFT 56u
 #define NETD_UEVENT_INPUT_CAPABILITIES_SHIFT 48u
 #define NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT 32u
 
@@ -58,7 +64,14 @@ typedef struct netd_input_uevent_descriptor {
     uint8_t function;
     uint8_t capabilities;
     uint16_t event_index;
+    uint8_t action;
 } netd_input_uevent_descriptor_t;
+
+enum {
+    NETD_UEVENT_CHANGE = 0,
+    NETD_UEVENT_ADD = 1,
+    NETD_UEVENT_REMOVE = 2,
+};
 
 static inline uint64_t netd_input_uevent_encode(netd_input_uevent_descriptor_t descriptor)
 {
@@ -68,6 +81,7 @@ static inline uint64_t netd_input_uevent_encode(netd_input_uevent_descriptor_t d
         (((uint32_t)descriptor.device & 0x1fu) << 3u) |
         ((uint32_t)descriptor.function & 0x07u);
     return NETD_UEVENT_INPUT_TAG |
+        ((uint64_t)(descriptor.action & 3u) << NETD_UEVENT_INPUT_ACTION_SHIFT) |
         ((uint64_t)descriptor.capabilities << NETD_UEVENT_INPUT_CAPABILITIES_SHIFT) |
         ((uint64_t)descriptor.event_index << NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT) |
         bdf;
@@ -78,7 +92,8 @@ static inline int netd_input_uevent_decode(
     netd_input_uevent_descriptor_t *out_descriptor)
 {
     if (out_descriptor == 0 || (encoded & NETD_UEVENT_INPUT_TAG) == 0 ||
-        (encoded & NETD_UEVENT_INPUT_RESERVED_MASK) != 0)
+        (encoded & NETD_UEVENT_INPUT_RESERVED_MASK) != 0 ||
+        ((encoded >> NETD_UEVENT_INPUT_ACTION_SHIFT) & 3u) > NETD_UEVENT_REMOVE)
         return 0;
     const uint32_t bdf = (uint32_t)encoded;
     out_descriptor->segment = (uint16_t)(bdf >> 16u);
@@ -89,6 +104,8 @@ static inline int netd_input_uevent_decode(
         (uint8_t)(encoded >> NETD_UEVENT_INPUT_CAPABILITIES_SHIFT);
     out_descriptor->event_index =
         (uint16_t)(encoded >> NETD_UEVENT_INPUT_EVENT_INDEX_SHIFT);
+    out_descriptor->action =
+        (uint8_t)((encoded >> NETD_UEVENT_INPUT_ACTION_SHIFT) & 3u);
     return 1;
 }
 
@@ -123,6 +140,28 @@ typedef struct netd_netlink_bind {
     uint32_t pid;
     uint32_t groups;
 } netd_netlink_bind_t;
+
+/* AF_INET server operations use the same socket handle as outbound TCP.
+ * ACCEPT receives one notification capability for the new socket; on EAGAIN
+ * netd retains nothing.  The peer address is written back into the page. */
+typedef struct netd_inet_bind {
+    uint64_t handle;
+    netd_sockaddr_in_t addr;
+    uint32_t reuseaddr;
+    uint32_t reserved;
+} netd_inet_bind_t;
+
+typedef struct netd_listen {
+    uint64_t handle;
+    uint32_t backlog;
+    uint32_t reserved;
+} netd_listen_t;
+
+typedef struct netd_accept {
+    uint64_t handle;
+    netd_sockaddr_in_t peer;
+    netd_sockaddr_in_t local;
+} netd_accept_t;
 
 
 typedef struct netd_io {

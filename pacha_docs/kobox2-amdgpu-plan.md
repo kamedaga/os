@@ -86,10 +86,26 @@ timer、workqueue、RCU管理を持つ。現行 `boot/sources.py` のruntime入�
 `tests/linux/targets.cmake` ではcore lifecycle test / arena fixtureに使用される。
 現行full-core経路ではLinux自身がこれらの主要な意味論を持つ。
 
-この別経路を引き続き製品として維持する必要があるかを整理し、必要な検証を
-boot-core経路へ移してから廃止すれば、千行単位で保守対象を減らせる。
-ただしこれは実行時経路の短縮ではない。`provider`という名前のbuild入力や
-ビルド用Pythonは現行構成にも使われるので、ディレクトリごとの削除は不適切。
+この旧core providerと専用fixtureは2026-09-23に整理した。対応関係は次の通り。
+「同じ旧provider APIを再試験した」という意味ではなく、現行Linux coreが必要とする
+機能・失敗処理をどのテストが担うかを示す。
+
+| 旧fixtureが扱ったもの | 現行の確認先 |
+| --- | --- |
+| page/heap/cache/per-CPU allocation | boot-coreのmemory gate、allocation gate |
+| thread、同期、待機、timer | task/SMP gate、wait gate、cleanup gate |
+| workqueueとRCUの実行・終了 | workqueue gate、RCU gate、cleanup gate |
+| closureのload、init失敗時の巻き戻し、資源解放 | `kobox2.closure_loader`、`kobox2.resource_import_rollback` |
+| 旧coreの未解放arenaでclose失敗 | 旧provider固有の検査。現行coreで同じ戻り値を持つとは主張しない。実Linux moduleの解放はmodule gateが確認する |
+
+削除対象は `core_lifecycle.c`、そのテスト、`core_arena_consumer`、専用closure
+fixtureとCMakeターゲット、および未ビルドの旧core adapter/closure testに限定した。
+共用の`provider/arena.c`、`provider/lifecycle.c`、ビルド用Python、共通protocolは
+残した。これは実行時経路の短縮ではなく、使われない別実装の保守負担削減である。
+整理後、共用providerのarena/lifecycle、closure loader、resource import rollback、
+boot runtime buildの単体テストと、gate有効のboot coreによる
+`kobox2.linux_full_foundation_gate`を通した。旧arena leak fixture固有の戻り値は
+現行経路への同等移植を主張しない。
 
 ### 2. DRMの手書き変換を集約
 
@@ -103,23 +119,30 @@ boot-core経路へ移してから廃止すれば、千行単位で保守対象�
 | adapter `gpu_query.c` | 430 |
 | sandbox `boot/drm_query.c` | 1,650 |
 
-この全量が重複ではないが、同じcommandのfield、count、span、入出力方向を
-複数箇所で記述している。まず固定長queryと可変長queryを各1つ選び、
-既存schemaから変換記述を生成する試作で、正味削減量を測る。
-generator追加分・schema追加分も保守量に含め、生成コード増加と分けて報告する。
+この全量が重複ではない。各層に必要な権限・bounds確認、入力snapshot、
+FD/token変換、PRIMEやmapping leaseの寿命管理は維持する。
 
-次に、LPRがcanonicalなpointer-free commandを作り、gpudは資源・session・権限・
-generationを検証して中継、sandboxがLinux UAPIへ復元する形を検討する。
-これによりgpud固有の中間DRM表現と変換往復を減らせる可能性がある。
-AMDGPU20コマンドを現行の各層へ手作業で追加する前に決めたい。
+まず固定長queryを1つ選び、**同一ファイル内**の繰り返しだけを既存のhelperへ
+寄せられるか確認する。小さな変更でも読みやすくなり、変換・返信・エラーが
+既存テストで一致する場合に限って適用する。次に可変長queryを1つ調べ、
+共通化で分岐や状態が増えるなら変更しない。
 
-共有メモリのbounds/権限確認、各信頼境界での検証、入力snapshot、FD/token変換、
-PRIMEやmapping leaseの寿命は維持する。同一の検証コードを生成することと、
-独立した境界の検証を省くことは別である。
+schemaからの新しいgenerator、LPR↔gpudの通信形式変更、AMDGPU20コマンドを
+見越した汎用dispatch基盤は今回の整理には含めない。AMDGPU実装で同じ記述が
+実際に増えた時に、必要な最小単位で再検討する。
 
-中間表現をなくす案はLPR↔gpudサービス契約の変更を伴い得る。
-目的は重複表現の排除であり、Linux pointerやhost FDをwireへ流すことではない。
-`dev` interfaceとして送受信側を同時更新する。Pacha kernel ABI変更は前提にしない。
+2026-09-23の確認では、固定長の`GET_CAP`返信を選んだ。sandboxの
+`boot/drm_query.c`で64-bit値を`write_u32`二回で書く箇所だけを、同じファイルに
+既存の`write_u64`へ寄せた。変換と返信の64-bit値全体、失敗時のエラー・無変更を
+検査する`run-gpud-gpu-query-unit.sh`は変更前後とも通過した。
+可変長の`GET_RESOURCES`は、同ファイル内ですでに`output_span`がcount、
+record size、boundsを検証している。隣接する`GET_CONNECTOR`とはrecord種別、
+force-probe条件、返信時の不足容量の扱いが異なるため、両者をまとめるための
+追加分岐や状態は作らなかった。
+変更を含む製品用boot coreとDRM moduleを再ビルドし、QEMUのMesa multi-client
+smokeでcard0・renderD128とも`virgl (D3D12 (Intel(R) Graphics))`、3 clientの
+描画・共有・再接続完了を確認した。boot profile切替の既存生成スクリプトは検証中だけ
+一時調整し、テスト後に原状へ戻した。LLVMPIPEは合格判定に使っていない。
 
 ### 3. Linuxへの依存を下位境界へ集中
 
@@ -155,7 +178,7 @@ CPU/chipset、接続先が変わればprofileを見直す。
 
 | 段階 | 作業 | 次へ進む条件 |
 | --- | --- | --- |
-| A: 接続層整理 | 実リンク集合の棚卸し、providerの用途確定、DRM変換集約の試作 | 正味の手書き削減を計測。既存VirGLの動作・寿命試験が維持される |
+| A: 接続層整理 | 旧providerの参照とテスト対応を確認し、重複fixtureを段階的に整理。DRMは既存ファイル内の明白な重複だけを対象にする | 行数だけでなく読みやすさと検証範囲を確認。既存VirGLの動作・寿命試験が維持される |
 | B: AMD profile | Linux/config/compiler/firmware/Mesa/libdrmを固定し、AMDGPU/TTM/DRM scheduler/DC等をKconfigから構築 | strict link・modpost・module dependencyとinitcallが成立。成功stubなし |
 | C: 実機probe | capabilityによるdevice選択、BAR/ROM/BIOS、firmware、MSI、DMA、VRAM/GTT、ring初期化 | probe成功、render node、ring testとIRQ完了、確実な停止 |
 | D: メモリとrender | TTM mmap/fault、cache属性、mapping撤回、GEM/VA/CS/fenceを接続 | GPU copy/render結果一致、CPU↔GPU整合、memory pressure/eviction中もmappingが正しい |

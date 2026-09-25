@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "lifecycle.h"
 #include "../kobox2_adapter/lifecycle_message.h"
+#include "boot/module_launch.h"
 #include <errno.h>
 
 static kb2_status_t check(const struct gpud_lifecycle *lifecycle) {
@@ -10,6 +11,23 @@ static kb2_status_t check(const struct gpud_lifecycle *lifecycle) {
         watch->generation != watch->process->generation || watch->generation != watch->ipc->generation ||
         watch->generation != kb2_controller_generation(watch->controller)) return KB2_STATUS_STALE_GENERATION;
     return KB2_STATUS_OK;
+}
+
+static int valid_progress_value(unsigned int phase, uint32_t value) {
+    switch (phase) {
+    case KOBOX_MODULE_PROGRESS_MODULE_BEGIN:
+    case KOBOX_MODULE_PROGRESS_MODULE_FAILED:
+        return value < 64;
+    case KOBOX_MODULE_PROGRESS_MODULES_LOADED:
+        return value <= 64;
+    case KOBOX_MODULE_PROGRESS_NET_DMA_MAPS:
+    case KOBOX_MODULE_PROGRESS_NET_DMA_FAILURE:
+    case KOBOX_MODULE_PROGRESS_NET_DMA_FAILURE_DETAIL:
+    case KOBOX_MODULE_PROGRESS_NET_FREE_PAGES:
+        return 1;
+    default:
+        return value == 0;
+    }
 }
 
 static kb2_status_t ready_failure(struct gpud_lifecycle *lifecycle, int error) {
@@ -53,6 +71,43 @@ kb2_status_t gpud_lifecycle_ready(struct gpud_lifecycle *lifecycle) {
     if (result == -EAGAIN || result == -ENOMEM) return KB2_STATUS_ACTION_PENDING;
     if (result) return ready_failure(lifecycle, result);
     const struct ph_ipc_packet *packet = &lifecycle->incoming;
+    if (packet->operation == PH_LIFECYCLE_PROGRESS && !packet->fd_count) {
+        if (!packet->correlation ||
+            packet->correlation > KOBOX_MODULE_PROGRESS_LIFECYCLE_READY ||
+            !valid_progress_value((unsigned int)packet->correlation,
+                                  (uint32_t)packet->value))
+            return ready_failure(lifecycle, -EPROTO);
+        lifecycle->progress_phase = (unsigned int)packet->correlation;
+        lifecycle->progress_module_index = (uint32_t)packet->value;
+        lifecycle->progress_status = (int32_t)(packet->value >> 32);
+        lifecycle->progress_count++;
+        if (ph_ipc_packet_release(&lifecycle->incoming))
+            return ready_failure(lifecycle, -EIO);
+        return KB2_STATUS_ACTION_PENDING;
+    }
+    if (ph_lifecycle_is_fault_operation(packet->operation) && !packet->fd_count) {
+        lifecycle->failure_fault = 1;
+        lifecycle->failure_vector = (unsigned int)((packet->operation >> 16) & 0xffffu);
+        lifecycle->failure_error_code = (unsigned int)((packet->operation >> 32) & 0xffffu);
+        lifecycle->failure_core_relative = (unsigned int)((packet->operation >> 48) & 1u);
+        lifecycle->failure_ip = packet->correlation;
+        lifecycle->failure_address = packet->value;
+        return ready_failure(lifecycle, -EFAULT);
+    }
+    if (packet->operation == PH_LIFECYCLE_READY && !packet->fd_count &&
+        packet->correlation > 255 && (packet->value >> 32) != 0) {
+        lifecycle->failure_source = packet->correlation;
+        lifecycle->failure_line = (uint32_t)(packet->value >> 32);
+        const int fatal_result = (int32_t)packet->value;
+        return ready_failure(lifecycle, fatal_result ? fatal_result : -EFAULT);
+    }
+    if (packet->operation == PH_LIFECYCLE_READY && packet->value &&
+        !packet->fd_count && (int64_t)packet->value < 0 &&
+        (int64_t)packet->value >= INT32_MIN) {
+        lifecycle->failure_loaded = (unsigned int)(packet->correlation >> 1);
+        lifecycle->failure_pci_bound = (unsigned int)(packet->correlation & 1u);
+        return ready_failure(lifecycle, (int)(int64_t)packet->value);
+    }
     if (packet->operation != PH_LIFECYCLE_READY || packet->correlation || packet->value || packet->fd_count)
         return ready_failure(lifecycle, -EPROTO);
     result = gpud_native_process_poll(watch->process, lifecycle->generation);

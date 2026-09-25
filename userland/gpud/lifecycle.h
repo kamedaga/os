@@ -10,6 +10,16 @@ struct gpud_lifecycle {
     uint64_t generation, quiesce_token;
     unsigned int ready, quiesce_sent, completed;
     int native_error;
+    /* Progress is advisory and never advances controller readiness. */
+    unsigned int progress_count, progress_phase, progress_module_index;
+    int progress_status;
+    /* A failed module launch may report its Linux errno and probe progress
+     * before the sandbox exits; these are owner-visible diagnostics only. */
+    unsigned int failure_loaded, failure_pci_bound;
+    uint64_t failure_source;
+    uint32_t failure_line;
+    unsigned int failure_fault, failure_vector, failure_error_code, failure_core_relative;
+    uint64_t failure_ip, failure_address;
 };
 
 /* gpud only. Single owner; borrow an initialized process watch after TRANSFER

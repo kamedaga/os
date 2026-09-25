@@ -7,6 +7,7 @@
 #include "credentials.h"
 
 #include <pacha/abi.h>
+#include <pacha/live_bootstrap.h>
 #include <pacha/ipc.h>
 #include <pacha/status.h>
 #include <pacha/syscall.h>
@@ -108,6 +109,7 @@ typedef struct lprs_reply_cap {
 static int g_endpoint_fd = -1;
 static int g_unix_admin_fd = -1;
 static int g_filed_admin_fd = -1;
+static int g_power_fd = -1;
 static struct pacha_accounts g_accounts;
 static int g_accounts_ready;
 
@@ -245,7 +247,12 @@ static int lprs_read_bootstrap(int fd, struct lprs_boot_config *out)
         out->endpoint_fd >= PACHA_FD_TABLE_LIMIT || out->unix_admin_fd < 16 || out->unix_admin_fd >= PACHA_FD_TABLE_LIMIT ||
         out->endpoint_fd == out->unix_admin_fd || out->filed_admin_fd < 16 ||
         out->filed_admin_fd >= PACHA_FD_TABLE_LIMIT || out->filed_admin_fd == out->endpoint_fd ||
-        out->filed_admin_fd == out->unix_admin_fd || out->flags != 0) {
+        out->filed_admin_fd == out->unix_admin_fd ||
+        (out->power_fd != 0 && (out->power_fd < 16 ||
+            out->power_fd >= PACHA_FD_TABLE_LIMIT ||
+            out->power_fd == out->endpoint_fd ||
+            out->power_fd == out->unix_admin_fd ||
+            out->power_fd == out->filed_admin_fd)) || out->flags != 0) {
         return PACHA_STATUS_EINVAL;
     }
     return 0;
@@ -679,6 +686,27 @@ static int lprs_authorize(uint64_t actor, int bootstrap, uint32_t op, uint64_t s
         return child && child->ppid == caller->pid && child->control_fd < 16 ? 0 : -PACHA_LINUX_EPERM;
     }
     return subject == actor ? 0 : -PACHA_LINUX_EPERM;
+}
+
+static int lprs_power_transition(uint64_t actor, uint64_t action)
+{
+    const lprs_process_t *caller = lprs_find_by_token(actor);
+    if (!caller || caller->credentials.euid != 0) return -PACHA_LINUX_EPERM;
+    if (g_power_fd < 16) return PACHA_STATUS_ENOTSUP;
+    /* The process control channel authenticates actor; the private live
+     * power channel is never copied into a Linux process manifest. */
+    const struct pacha_ipc_msg request = {
+        .word0 = PACHA_LIVE_POWER_REQUEST_MAGIC,
+        .word1 = action,
+    };
+    const int reply_fd = pacha_ipc_call(g_power_fd, &request);
+    if (reply_fd < 16) return -PACHA_LINUX_EIO;
+    struct pacha_ipc_msg reply = {0};
+    const int status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
+    (void)pacha_fd_close(reply_fd);
+    if (status != 0 || reply.word0 != PACHA_LIVE_POWER_REQUEST_MAGIC)
+        return -PACHA_LINUX_EIO;
+    return reply.word1 == 2 ? PACHA_STATUS_ENOTSUP : -PACHA_LINUX_EIO;
 }
 
 static void lprs_copy_string(char *dst, uint64_t dst_bytes, const char *src)
@@ -1962,6 +1990,12 @@ static int lprs_dispatch(
         status = PACHA_STATUS_ENOTSUP;
         reply_payload_size = 0;
         break;
+    case LPRS_OP_SYSTEM_POWEROFF:
+    case LPRS_OP_SYSTEM_REBOOT:
+        status = lprs_power_transition(actor,
+            header.op == LPRS_OP_SYSTEM_POWEROFF ?
+                PACHA_LIVE_POWER_OFF : PACHA_LIVE_POWER_REBOOT);
+        break;
     case LPRS_OP_DIAG_DUMP:
     default:
         status = PACHA_STATUS_EINVAL;
@@ -2268,6 +2302,7 @@ int main(int argc, char **argv)
     if (cfg.unix_admin_fd < 16 || cfg.unix_admin_fd >= PACHA_FD_TABLE_LIMIT) return 1;
     g_unix_admin_fd = (int)cfg.unix_admin_fd;
     g_filed_admin_fd = (int)cfg.filed_admin_fd;
+    g_power_fd = cfg.power_fd ? (int)cfg.power_fd : -1;
     status = lprs_accounts_load(g_filed_admin_fd, &g_accounts);
     if (status) {
         fprintf(stderr, "[lprs] account definitions rejected status=%d\n", status);

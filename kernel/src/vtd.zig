@@ -1295,7 +1295,7 @@ test "VT-d device aperture admits beyond old fixed window and clips the real bou
     driver_state.iova_end = 0xb0000000;
     const window = deviceIovaWindow(device);
     try std.testing.expectEqual(iova_window_start, window.start);
-    try std.testing.expectEqual(@as(u64, 0x30000000), window.size);
+    try std.testing.expectEqual(driver_state.iova_end - iova_window_start, window.size);
     try std.testing.expectEqual(@as(u64, 0), deviceIovaWindow(device + 1).size);
     try std.testing.expect(!reserveIova(device, 0xb0000000, 1));
     const page = try free_list.popFront();

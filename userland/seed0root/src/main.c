@@ -9,11 +9,15 @@
 #include "personality/linux_lpr.h"
 #include "personality/lpr_manifest.h"
 #include "pacha/root_handoff.h"
+#include "pacha/live_bootstrap.h"
+#include "pacha/capsule.h"
+#include "live_console.h"
 #include "storage/bootstrap.h"
 #include "netd/boot_config.h"
 #include "termd/boot_config.h"
 #include "gpud/boot_config.h"
 #include "inputd/boot_config.h"
+#include "usbd/boot_config.h"
 #include "unixd/ipc_protocol.h"
 
 #ifndef SEED0ROOT_DEFAULT_BOOT_PROFILE
@@ -71,6 +75,7 @@ enum {
     SEED0ROOT_SERVICE_ENDPOINT_FD = 232,
     SEED0ROOT_SERVICE_READY_FD = 233,
     SEED0ROOT_SERVICE_NETD_FD = 234,
+    SEED0ROOT_SERVICE_INPUT_SOURCE_FD = 235,
 };
 
 struct seed0root_loaded_process {
@@ -2705,17 +2710,141 @@ static int prepare_filed_storage_bootstrap(
 }
 
 struct seed0root_root_devices {
-    struct pacha_root_handoff metadata;
-    int fds[PACHA_ROOT_HANDOFF_MAX_DEVICES];
+    struct {
+        uint64_t device_count;
+        struct pacha_root_device_record *devices;
+    } metadata;
+    int *fds;
 };
+
+struct seed0root_live_usb_ready {
+    int *fds;
+    size_t count;
+    size_t capacity;
+    int net_fd;
+    int net_state; /* 0 absent, 1 pending, 2 ready, 3 failed */
+    int net_ipv4_ready;
+    int net_status;
+    uint64_t net_stage;
+    unsigned net_carrier, net_mtu;
+    unsigned net_nic_step, net_loaded, net_pci_bound;
+    int net_detail;
+    uint64_t net_source;
+    unsigned net_line;
+    unsigned net_fault_vector, net_fault_error_code, net_fault_core_relative;
+    uint64_t net_fault_ip, net_fault_address;
+};
+
+static void seed0root_close_live_usb_ready(struct seed0root_live_usb_ready *ready)
+{
+    if (ready == NULL) return;
+    for (size_t i = 0; i < ready->count; i++)
+        if (ready->fds[i] >= 16) (void)pacha_fd_close(ready->fds[i]);
+    if (ready->net_fd >= 16) (void)pacha_fd_close(ready->net_fd);
+    free(ready->fds);
+    memset(ready, 0, sizeof(*ready));
+}
+
+static void seed0root_poll_live_usb_ready(void *context)
+{
+    struct seed0root_live_usb_ready *ready = context;
+    if (ready == NULL) return;
+    for (size_t i = 0; i < ready->count; i++) {
+        const int fd = ready->fds[i];
+        if (fd < 16) continue;
+        struct pacha_pollfd event = {
+            .fd = fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
+        };
+        const long polled = pacha_fd_wait_many(&event, 1, 0);
+        if (polled == PACHA_ERR_NOT_READY) continue;
+        struct pacha_ipc_msg message = {0};
+        const int received = polled == 1 &&
+            (event.revents & PACHA_FD_EVENT_READABLE) != 0 ?
+            pacha_ipc_recv(fd, &message) : -5;
+        const int healthy = received == 0 &&
+            message.word0 == USBD_BOOT_READY_MAGIC && message.word1 == 0 &&
+            message.word2 == 1 && message.fd_count == 0;
+        printf("[seed0root] usbd slot %zu %s receive=%d service=%lld\n",
+            i, healthy ? "ready" : "failed", received,
+            (long long)message.word1);
+        fflush(stdout);
+        (void)pacha_fd_close(fd);
+        /* Keep the first readiness result for the boot report without
+         * waiting for slow real USB hubs before launching ash. */
+        ready->fds[i] = healthy ? -1 : -2;
+    }
+    if (ready->net_fd >= 16) {
+        struct pacha_pollfd event = {.fd = ready->net_fd,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+        const long polled = pacha_fd_wait_many(&event, 1, 0);
+        if (polled != PACHA_ERR_NOT_READY) {
+            struct pacha_ipc_msg message = {0};
+            const int received = polled == 1 &&
+                (event.revents & PACHA_FD_EVENT_READABLE) != 0 ?
+                pacha_ipc_recv(ready->net_fd, &message) : -5;
+            const int fault_report = message.word0 == NETD_BOOT_FAULT_MAGIC;
+            if (received == 0 && message.fd_count == 0 &&
+                (fault_report || (message.word0 == NETD_BOOT_STATUS_MAGIC &&
+                (message.word2 & 0xffu) >= NETD_BOOT_STAGE_NIC &&
+                (message.word2 & 0xffu) <= NETD_BOOT_STAGE_LINK))) {
+                ready->net_status = (int)(int32_t)message.word1;
+                ready->net_stage = fault_report ? NETD_BOOT_STAGE_FAULT :
+                    message.word2 & 0xffu;
+                if (!fault_report && ready->net_status == 0 &&
+                    ready->net_stage == NETD_BOOT_STAGE_IPV4)
+                    ready->net_ipv4_ready = 1;
+                if (fault_report) {
+                    const unsigned encoded = (unsigned)(message.word1 >> 32);
+                    ready->net_fault_error_code = encoded & 0xffffu;
+                    ready->net_fault_vector = (encoded >> 16) & 0x7fffu;
+                    ready->net_fault_core_relative = encoded >> 31;
+                    ready->net_fault_ip = message.word2;
+                    ready->net_fault_address = message.word3;
+                } else if (ready->net_status && ready->net_stage == NETD_BOOT_STAGE_NIC) {
+                    ready->net_nic_step = (unsigned)((message.word2 >> 8) & 0xffu);
+                    ready->net_loaded = (unsigned)((message.word2 >> 16) & 0xffu);
+                    ready->net_pci_bound = (unsigned)((message.word2 >> 24) & 1u);
+                    ready->net_line = (unsigned)(message.word2 >> 32);
+                    ready->net_detail = (int)(int32_t)(message.word1 >> 32);
+                    ready->net_source = message.word3;
+                } else if (!ready->net_status) {
+                    ready->net_carrier = (unsigned)(message.word3 & 0xffu);
+                    ready->net_mtu = (unsigned)(message.word3 >> 8);
+                }
+                ready->net_state = ready->net_status ? 3 : 2;
+            } else {
+                ready->net_state = 3;
+                ready->net_status = received ? received : -22;
+                ready->net_stage = 0;
+            }
+            printf("[seed0root] netd state=%d stage=%llu status=%d nic_step=%u detail=%d loaded=%u pci_bound=%u source=0x%llx line=%u carrier=%u mtu=%u fault_vector=%u fault_code=%u fault_core=%u fault_ip=0x%llx fault_addr=0x%llx\n",
+                ready->net_state, (unsigned long long)ready->net_stage,
+                ready->net_status, ready->net_nic_step, ready->net_detail,
+                ready->net_loaded, ready->net_pci_bound,
+                (unsigned long long)ready->net_source, ready->net_line,
+                ready->net_carrier, ready->net_mtu,
+                ready->net_fault_vector, ready->net_fault_error_code,
+                ready->net_fault_core_relative,
+                (unsigned long long)ready->net_fault_ip,
+                (unsigned long long)ready->net_fault_address);
+            fflush(stdout);
+            if (ready->net_state == 3) {
+                (void)pacha_fd_close(ready->net_fd);
+                ready->net_fd = -1;
+            }
+        }
+    }
+}
 
 static void seed0root_close_root_devices(struct seed0root_root_devices *devices)
 {
     if (devices == NULL) return;
-    for (uint64_t i = 0; i < devices->metadata.device_count; i++) {
+    for (uint64_t i = 0; i < devices->metadata.device_count; i++)
         if (devices->fds[i] >= 16) (void)pacha_fd_close(devices->fds[i]);
-        devices->fds[i] = -1;
-    }
+    free(devices->fds);
+    free(devices->metadata.devices);
+    memset(devices, 0, sizeof(*devices));
 }
 
 static int seed0root_receive_root_handoff(
@@ -2724,79 +2853,114 @@ static int seed0root_receive_root_handoff(
 {
     if (channel_fd < 16 || out == NULL) return -22;
     memset(out, 0, sizeof(*out));
-    for (uint64_t i = 0; i < PACHA_ROOT_HANDOFF_MAX_DEVICES; i++) out->fds[i] = -1;
-
-    struct pacha_ipc_fd fds[1 + PACHA_ROOT_HANDOFF_MAX_DEVICES];
-    memset(fds, 0, sizeof(fds));
-    struct pacha_ipc_msg msg;
-    memset(&msg, 0, sizeof(msg));
-    msg.fds = fds;
-    msg.fd_capacity = 1 + PACHA_ROOT_HANDOFF_MAX_DEVICES;
-    int status = recv_ipc_wait(channel_fd, &msg);
-    (void)pacha_fd_close(channel_fd);
-    if (status != 0 || msg.word0 != PACHA_ROOT_HANDOFF_MAGIC ||
-        msg.word1 != PACHA_ROOT_HANDOFF_VERSION ||
-        msg.word2 > PACHA_ROOT_HANDOFF_MAX_DEVICES ||
-        msg.fd_count != msg.word2 + 1 || fds[0].fd < 16)
-        goto fail;
-
-    struct pacha_fd_info info;
-    memset(&info, 0, sizeof(info));
-    if (pacha_fd_get_info((int)fds[0].fd, &info) != 0 ||
-        info.kind != PACHA_FD_KIND_VMO ||
-        (info.rights & PACHA_FD_RIGHT_MAP_READ) == 0) {
-        status = -13;
-        goto fail;
-    }
-    const void *page = pacha_mmap((int)fds[0].fd, 4096, PACHA_PROT_READ,
-        PACHA_MMAP_SHARED, 0);
-    if (page == NULL) {
-        status = -5;
-        goto fail;
-    }
-    memcpy(&out->metadata, page, sizeof(out->metadata));
-    (void)pacha_munmap((void *)page, 4096);
-    (void)pacha_fd_close((int)fds[0].fd);
-    fds[0].fd = 0;
-    if (out->metadata.magic != PACHA_ROOT_HANDOFF_MAGIC ||
-        out->metadata.version != PACHA_ROOT_HANDOFF_VERSION ||
-        out->metadata.device_count != msg.word2) {
-        status = -22;
-        goto fail;
-    }
-
-    uint64_t seen = 0;
-    for (uint64_t i = 0; i < out->metadata.device_count; i++) {
-        const struct pacha_root_device_record *record = &out->metadata.devices[i];
-        if (record->transfer_index >= out->metadata.device_count ||
-            (seen & (1ull << record->transfer_index)) != 0) {
-            status = -22;
-            goto fail;
+    int status = 0;
+    for (;;) {
+        struct pacha_ipc_fd fds[1 + PACHA_ROOT_HANDOFF_BATCH_DEVICES];
+        memset(fds, 0, sizeof(fds));
+        struct pacha_ipc_msg msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.fds = fds;
+        msg.fd_capacity = 1 + PACHA_ROOT_HANDOFF_BATCH_DEVICES;
+        status = recv_ipc_wait(channel_fd, &msg);
+        if (status != 0 || msg.word0 != PACHA_ROOT_HANDOFF_MAGIC ||
+            msg.word1 != PACHA_ROOT_HANDOFF_VERSION ||
+            msg.word2 > PACHA_ROOT_HANDOFF_BATCH_DEVICES ||
+            msg.fd_count != msg.word2 + 1 || fds[0].fd < 16 ||
+            (msg.word3 & ~PACHA_ROOT_HANDOFF_FLAG_LAST) != 0) {
+            if (status == 0) status = -22;
+            goto fail_batch;
         }
-        seen |= 1ull << record->transfer_index;
-        const int fd = (int)fds[1 + record->transfer_index].fd;
+
+        struct pacha_fd_info info;
         memset(&info, 0, sizeof(info));
-        if (fd < 16 || pacha_fd_get_info(fd, &info) != 0 ||
-            info.kind != SEED0ROOT_FD_KIND_DEVICE ||
-            (info.rights & (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) !=
-                (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) {
+        if (pacha_fd_get_info((int)fds[0].fd, &info) != 0 ||
+            info.kind != PACHA_FD_KIND_VMO ||
+            (info.rights & PACHA_FD_RIGHT_MAP_READ) == 0) {
             status = -13;
-            goto fail;
+            goto fail_batch;
         }
-        out->fds[i] = fd;
-        fds[1 + record->transfer_index].fd = 0;
+        const void *page = pacha_mmap((int)fds[0].fd, 4096, PACHA_PROT_READ,
+            PACHA_MMAP_SHARED, 0);
+        if (page == NULL) {
+            status = -5;
+            goto fail_batch;
+        }
+        struct pacha_root_handoff batch;
+        memcpy(&batch, page, sizeof(batch));
+        (void)pacha_munmap((void *)page, 4096);
+        if (batch.magic != PACHA_ROOT_HANDOFF_MAGIC ||
+            batch.version != PACHA_ROOT_HANDOFF_VERSION ||
+            batch.device_count != msg.word2 || batch.flags != msg.word3) {
+            status = -22;
+            goto fail_batch;
+        }
+        uint32_t seen = 0;
+        for (uint64_t i = 0; i < batch.device_count; i++) {
+            const struct pacha_root_device_record *record = &batch.devices[i];
+            if (record->transfer_index >= batch.device_count ||
+                (seen & (1u << record->transfer_index)) != 0) {
+                status = -22;
+                goto fail_batch;
+            }
+            seen |= 1u << record->transfer_index;
+            const int fd = (int)fds[1 + record->transfer_index].fd;
+            memset(&info, 0, sizeof(info));
+            if (fd < 16 || pacha_fd_get_info(fd, &info) != 0 ||
+                info.kind != SEED0ROOT_FD_KIND_DEVICE ||
+                (info.rights & (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) !=
+                    (PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE)) {
+                status = -13;
+                goto fail_batch;
+            }
+        }
+        if (batch.device_count > (SIZE_MAX / sizeof(*out->fds)) -
+                out->metadata.device_count ||
+            batch.device_count > (SIZE_MAX / sizeof(*out->metadata.devices)) -
+                out->metadata.device_count) {
+            status = -7;
+            goto fail_batch;
+        }
+        const size_t total = (size_t)(out->metadata.device_count + batch.device_count);
+        if (total != 0) {
+            struct pacha_root_device_record *records =
+                realloc(out->metadata.devices, total * sizeof(*records));
+            if (records == NULL) {
+                status = -3;
+                goto fail_batch;
+            }
+            out->metadata.devices = records;
+            int *more_fds = realloc(out->fds, total * sizeof(*more_fds));
+            if (more_fds == NULL) {
+                status = -3;
+                goto fail_batch;
+            }
+            out->fds = more_fds;
+        }
+        for (uint64_t i = 0; i < batch.device_count; i++) {
+            const size_t slot = (size_t)out->metadata.device_count + (size_t)i;
+            out->metadata.devices[slot] = batch.devices[i];
+            out->fds[slot] = (int)fds[1 + batch.devices[i].transfer_index].fd;
+            fds[1 + batch.devices[i].transfer_index].fd = 0;
+        }
+        out->metadata.device_count += batch.device_count;
+        (void)pacha_fd_close((int)fds[0].fd);
+        fds[0].fd = 0;
+        if ((batch.flags & PACHA_ROOT_HANDOFF_FLAG_LAST) != 0) break;
+        continue;
+
+fail_batch:
+        for (uint64_t i = 0; i < 1 + PACHA_ROOT_HANDOFF_BATCH_DEVICES; i++)
+            if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+        (void)pacha_fd_close(channel_fd);
+        seed0root_close_root_devices(out);
+        fprintf(stderr, "[seed0root] invalid root capability handoff status=%d\n", status);
+        return status;
     }
+    (void)pacha_fd_close(channel_fd);
     printf("[seed0root] root capability handoff received devices=%llu\n",
         (unsigned long long)out->metadata.device_count);
     fflush(stdout);
     return 0;
-
-fail:
-    for (uint64_t i = 0; i < 1 + PACHA_ROOT_HANDOFF_MAX_DEVICES; i++)
-        if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
-    seed0root_close_root_devices(out);
-    fprintf(stderr, "[seed0root] invalid root capability handoff status=%d\n", status);
-    return status != 0 ? status : -5;
 }
 
 static int seed0root_find_root_device(
@@ -2812,6 +2976,15 @@ static int seed0root_find_root_device(
             (record->device_id == device_id || record->device_id == alternate_device_id))
             return (int)i;
     }
+    return -1;
+}
+
+static int seed0root_find_root_ethernet(const struct seed0root_root_devices *devices)
+{
+    if (devices == NULL) return -1;
+    for (uint64_t i = 0; i < devices->metadata.device_count; ++i)
+        if ((devices->metadata.devices[i].class_code >> 8) == 0x0200)
+            return (int)i;
     return -1;
 }
 
@@ -3008,21 +3181,30 @@ static int seed0root_start_unixd(int filed_endpoint_fd, int filed_path_fd, int *
 static int seed0root_launch_root_services(
     int filed_endpoint_fd,
     struct seed0root_root_devices *devices,
-    int *out_gpud_control_fd)
+    int *out_gpud_control_fd,
+    int live_mode,
+    int *out_live_termd_fd,
+    int *out_live_inputd_fd,
+    struct seed0root_live_usb_ready *out_live_usb_ready)
 {
-    if (out_gpud_control_fd == NULL)
+    if (out_gpud_control_fd == NULL ||
+        (live_mode && (out_live_termd_fd == NULL ||
+            out_live_inputd_fd == NULL || out_live_usb_ready == NULL)))
         return -22;
     *out_gpud_control_fd = -1;
+    if (live_mode) {
+        *out_live_termd_fd = -1;
+        *out_live_inputd_fd = -1;
+    }
     enum {
         VIRTIO_VENDOR = 0x1af4,
-        NET_LEGACY = 0x1000, NET_MODERN = 0x1041,
         CONSOLE_LEGACY = 0x1003, CONSOLE_MODERN = 0x1043,
         GPU_LEGACY = 0x1010, GPU_MODERN = 0x1050,
         INPUT_MODERN = 0x1052,
     };
     int status = 0;
     int termd_endpoint = -1, netd_endpoint = -1, gpud_drm_endpoint = -1;
-    int inputd_endpoint = -1;
+    int inputd_endpoint = -1, input_source_endpoint = -1;
     struct pacha_ipc_channel_pair ready = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair gpud_control = { .a = -1, .b = -1 };
 
@@ -3061,34 +3243,219 @@ static int seed0root_launch_root_services(
       status = seed0root_wait_service_ready(ready_fd, TERMD_BOOT_READY_MAGIC, "termd"); }
     if (status != 0) goto out;
 
-    const int net = seed0root_find_root_device(devices, VIRTIO_VENDOR,
-        NET_LEGACY, NET_MODERN);
-    if (net < 0) { status = -19; goto out; }
-    netd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
-    if (netd_endpoint < 16) { status = -5; goto out; }
-    struct netd_boot_config netd_cfg;
-    memset(&netd_cfg, 0, sizeof(netd_cfg));
-    netd_cfg.magic = NETD_BOOT_CONFIG_MAGIC;
-    netd_cfg.version = NETD_BOOT_CONFIG_VERSION;
-    netd_cfg.device_fd = SEED0ROOT_SERVICE_DEVICE_FD;
-    netd_cfg.socket_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
-    const struct pacha_process_fd_grant netd_grants[] = {
-        PACHA_LAUNCH_GRANT(devices->fds[net], SEED0ROOT_SERVICE_DEVICE_FD, PACHA_LAUNCH_DEVICE_DRIVER),
-        PACHA_LAUNCH_GRANT(netd_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
-        PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
-    };
-    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/netd.elf",
-        &netd_cfg, sizeof(netd_cfg), netd_grants, 3, 0x5eed2003u);
-    if (status != 0 ||
-        (status = seed0root_register_service_endpoint(filed_endpoint_fd,
-            FILED_OP_SERVICE_SET_NETD_SOCKET, netd_endpoint, 0x5eed2004u)) != 0)
-        goto out;
+    {
+        const int net = seed0root_find_root_ethernet(devices);
+        if (!live_mode && net < 0) { status = -19; goto out; }
+        if (net >= 0) {
+        struct pacha_ipc_channel_pair net_ready = {.a = -1, .b = -1};
+        if (live_mode) {
+            out_live_usb_ready->net_state = 1;
+            status = pacha_ipc_channel_create(&net_ready,
+                seed0root_channel_rights, 0);
+            if (status != 0) goto out;
+        }
+        netd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+        if (netd_endpoint < 16) {
+            if (net_ready.a >= 16) (void)pacha_fd_close(net_ready.a);
+            if (net_ready.b >= 16) (void)pacha_fd_close(net_ready.b);
+            status = -5;
+            goto out;
+        }
+        struct netd_boot_config netd_cfg;
+        memset(&netd_cfg, 0, sizeof(netd_cfg));
+        netd_cfg.magic = NETD_BOOT_CONFIG_MAGIC;
+        netd_cfg.version = NETD_BOOT_CONFIG_VERSION;
+        netd_cfg.device_fd = SEED0ROOT_SERVICE_DEVICE_FD;
+        netd_cfg.filed_endpoint_fd = 240;
+        netd_cfg.socket_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+        netd_cfg.status_channel_fd = live_mode ? SEED0ROOT_SERVICE_READY_FD : 0;
+        /* netd owns network policy; this handoff grants an Ethernet function. */
+        const struct pacha_process_fd_grant netd_grants[] = {
+            PACHA_LAUNCH_GRANT(devices->fds[net], SEED0ROOT_SERVICE_DEVICE_FD,
+                PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
+            PACHA_LAUNCH_GRANT(netd_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER),
+            PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
+            PACHA_LAUNCH_GRANT(net_ready.b, SEED0ROOT_SERVICE_READY_FD,
+                PACHA_LAUNCH_SIGNAL),
+        };
+        status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/netd.elf",
+            &netd_cfg, sizeof(netd_cfg), netd_grants, live_mode ? 4 : 3,
+            0x5eed2003u);
+        if (net_ready.b >= 16) (void)pacha_fd_close(net_ready.b);
+        if (status == 0)
+            status = seed0root_register_service_endpoint(filed_endpoint_fd,
+                FILED_OP_SERVICE_SET_NETD_SOCKET, netd_endpoint, 0x5eed2004u);
+        if (status != 0 && !live_mode) goto out;
+        if (status != 0) {
+            printf("[seed0root] optional live netd launch failed status=%d\n", status);
+            if (net_ready.a >= 16) (void)pacha_fd_close(net_ready.a);
+            out_live_usb_ready->net_state = 3;
+            out_live_usb_ready->net_status = status;
+            out_live_usb_ready->net_stage = 0;
+            (void)pacha_fd_close(netd_endpoint);
+            netd_endpoint = -1;
+            status = 0;
+        } else if (live_mode) {
+            out_live_usb_ready->net_fd = net_ready.a;
+            printf("[seed0root] live Ethernet service started independently of ash\n");
+        }
+        }
+    }
 
 #if defined(SEED0ROOT_LPR_THREAD_SIGNAL_TEST) && SEED0ROOT_LPR_THREAD_SIGNAL_TEST
     /* This LPR-only gate must remain runnable without a DRM core package. */
     goto out;
 #endif
 
+    int input_slots[FILED_EXEC_MAX_INHERIT_FDS];
+    uint64_t input_count = 0;
+    for (uint64_t i = 0; i < devices->metadata.device_count; i++) {
+        if (devices->metadata.devices[i].vendor_id == VIRTIO_VENDOR &&
+            devices->metadata.devices[i].device_id == INPUT_MODERN) {
+            if (input_count == FILED_EXEC_MAX_INHERIT_FDS) {
+                status = -7;
+                goto out;
+            }
+            input_slots[input_count++] = (int)i;
+        }
+    }
+    if (input_count + 5 > FILED_EXEC_MAX_INHERIT_FDS ||
+        pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
+        status = -7;
+        goto out;
+    }
+    inputd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (inputd_endpoint < 16) { status = -5; goto out; }
+    input_source_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (input_source_endpoint < 16) { status = -5; goto out; }
+    unsigned char input_blob[INPUTD_BOOT_CONFIG_MAX_BYTES];
+    memset(input_blob, 0, sizeof(input_blob));
+    struct inputd_boot_config *input_cfg = (struct inputd_boot_config *)input_blob;
+    const uint64_t input_size = sizeof(*input_cfg) +
+        input_count * sizeof(struct inputd_device_config);
+    input_cfg->magic = INPUTD_BOOT_CONFIG_MAGIC;
+    input_cfg->version = INPUTD_BOOT_CONFIG_VERSION;
+    input_cfg->header_size = sizeof(*input_cfg);
+    input_cfg->total_size = input_size;
+    input_cfg->input_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    input_cfg->ready_channel_fd = SEED0ROOT_SERVICE_READY_FD;
+    input_cfg->netd_endpoint_fd = live_mode ? 0 : SEED0ROOT_SERVICE_NETD_FD;
+    input_cfg->source_endpoint_fd = SEED0ROOT_SERVICE_INPUT_SOURCE_FD;
+    input_cfg->device_count = (uint32_t)input_count;
+    input_cfg->device_record_size = sizeof(struct inputd_device_config);
+    input_cfg->devices_offset = sizeof(*input_cfg);
+    struct inputd_device_config *records =
+        (struct inputd_device_config *)(input_blob + input_cfg->devices_offset);
+    struct pacha_process_fd_grant input_grants[FILED_EXEC_MAX_INHERIT_FDS];
+    for (uint64_t i = 0; i < input_count; i++) {
+        const int slot = input_slots[i];
+        const struct pacha_root_device_record *src = &devices->metadata.devices[slot];
+        records[i] = (struct inputd_device_config) {
+            .device_fd = SEED0ROOT_SERVICE_DEVICE_FD + i,
+            .resource_id = src->resource_id,
+            .pci_segment = src->pci_segment, .pci_bus = src->pci_bus,
+            .pci_device = src->pci_device, .pci_function = src->pci_function,
+            .vendor_id = (uint32_t)src->vendor_id,
+            .device_id = (uint32_t)src->device_id,
+            .subsystem_id = (uint32_t)src->subsystem_id,
+        };
+        input_grants[i] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+            devices->fds[slot], SEED0ROOT_SERVICE_DEVICE_FD + i, PACHA_LAUNCH_DEVICE_DRIVER);
+    }
+    uint64_t input_grant_count = input_count;
+    input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+        inputd_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER);
+    input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+        ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL);
+    if (!live_mode)
+        input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+            netd_endpoint, SEED0ROOT_SERVICE_NETD_FD, PACHA_LAUNCH_CLIENT);
+    input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+        filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT);
+    input_grants[input_grant_count++] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+        input_source_endpoint, SEED0ROOT_SERVICE_INPUT_SOURCE_FD, PACHA_LAUNCH_SERVER);
+    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/inputd.elf",
+        input_blob, input_size, input_grants, input_grant_count,
+        0x5eed2007u);
+    (void)pacha_fd_close(ready.b); ready.b = -1;
+    if (status != 0) goto out;
+    status = seed0root_register_service_endpoint(filed_endpoint_fd,
+        FILED_OP_SERVICE_SET_INPUTD_INPUT, inputd_endpoint, 0x5eed2008u);
+    if (status != 0) goto out;
+    { const int ready_fd = ready.a; ready.a = -1;
+      status = seed0root_wait_service_ready(ready_fd, INPUTD_BOOT_READY_MAGIC, "inputd"); }
+    if (status != 0) goto out;
+    /* Inputd owns the evdev names before a USB controller can publish input.
+     * Neither its startup nor USB enumeration depends on DRM readiness. */
+    for (uint64_t xhci = 0; xhci < devices->metadata.device_count; xhci++) {
+        if (devices->metadata.devices[xhci].class_code != 0x0c0330)
+            continue;
+        if (pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
+            status = -5;
+            goto out;
+        }
+        const struct usbd_boot_config usbd_cfg = {
+            .magic = USBD_BOOT_CONFIG_MAGIC,
+            .version = USBD_BOOT_CONFIG_VERSION,
+            .device_fd = SEED0ROOT_SERVICE_DEVICE_FD,
+            .filed_endpoint_fd = 240,
+            .ready_channel_fd = SEED0ROOT_SERVICE_READY_FD,
+            .input_source_endpoint_fd = SEED0ROOT_SERVICE_INPUT_SOURCE_FD,
+            .resource_id = devices->metadata.devices[xhci].resource_id,
+            .pci_segment = devices->metadata.devices[xhci].pci_segment,
+            .pci_bus = devices->metadata.devices[xhci].pci_bus,
+            .pci_device = devices->metadata.devices[xhci].pci_device,
+            .pci_function = devices->metadata.devices[xhci].pci_function,
+        };
+        const struct pacha_process_fd_grant usbd_grants[] = {
+            PACHA_LAUNCH_GRANT(devices->fds[xhci], SEED0ROOT_SERVICE_DEVICE_FD,
+                PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
+            PACHA_LAUNCH_GRANT(ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL),
+            PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
+            PACHA_LAUNCH_GRANT(input_source_endpoint, SEED0ROOT_SERVICE_INPUT_SOURCE_FD,
+                PACHA_LAUNCH_CLIENT),
+        };
+        status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/usbd.elf",
+            &usbd_cfg, sizeof(usbd_cfg), usbd_grants, 4, 0x5eed3000u + xhci);
+        (void)pacha_fd_close(ready.b); ready.b = -1;
+        if (status != 0) goto out;
+        if (live_mode) {
+            if (out_live_usb_ready->count == out_live_usb_ready->capacity) {
+                status = -7;
+                goto out;
+            }
+            const size_t slot = out_live_usb_ready->count++;
+            out_live_usb_ready->fds[slot] = ready.a;
+            ready.a = -1;
+            // USB enumeration may involve real hubs and composite devices.
+            // Its ready signal is still checked, but must not gate GOP/ash.
+            printf("[seed0root] usbd slot %zu PCI %u:%u.%u started; waiting asynchronously\n",
+                slot, devices->metadata.devices[xhci].pci_bus,
+                devices->metadata.devices[xhci].pci_device,
+                devices->metadata.devices[xhci].pci_function);
+            fflush(stdout);
+        } else {
+            const int ready_fd = ready.a; ready.a = -1;
+            status = seed0root_wait_service_ready(ready_fd, USBD_BOOT_READY_MAGIC, "usbd");
+            if (status != 0) goto out;
+        }
+    }
+#if defined(SEED0ROOT_USB_HID_INPUT_TEST) && SEED0ROOT_USB_HID_INPUT_TEST
+    extern int seed0root_usb_input_smoke(int inputd_endpoint);
+    status = seed0root_usb_input_smoke(inputd_endpoint);
+    if (status != 0) goto out;
+#endif
+    if (live_mode) {
+        *out_live_termd_fd = termd_endpoint;
+        *out_live_inputd_fd = inputd_endpoint;
+        termd_endpoint = -1;
+        inputd_endpoint = -1;
+        printf("[seed0root] live services ready: termd, inputd; usbd/netd independent; no gpud\n");
+        fflush(stdout);
+        goto out;
+    }
+    /* Input discovery must not be gated on DRM. A USB-only boot has no
+     * legacy virtio-input device at startup, so inputd starts empty. */
     const int gpu = seed0root_find_root_device(devices, VIRTIO_VENDOR,
         GPU_LEGACY, GPU_MODERN);
     if (gpu < 0 || pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0 ||
@@ -3127,73 +3494,7 @@ static int seed0root_launch_root_services(
     { const int ready_fd = ready.a; ready.a = -1;
       status = seed0root_wait_service_ready(ready_fd, GPUD_BOOT_READY_MAGIC, "gpud"); }
     if (status != 0) goto out;
-
-    int input_slots[PACHA_ROOT_HANDOFF_MAX_DEVICES];
-    uint64_t input_count = 0;
-    for (uint64_t i = 0; i < devices->metadata.device_count; i++)
-        if (devices->metadata.devices[i].vendor_id == VIRTIO_VENDOR &&
-            devices->metadata.devices[i].device_id == INPUT_MODERN)
-            input_slots[input_count++] = (int)i;
-    if (input_count == 0 || input_count + 4 > FILED_EXEC_MAX_INHERIT_FDS ||
-        pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0) != 0) {
-        status = input_count == 0 ? -19 : -7;
-        goto out;
-    }
-    inputd_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
-    if (inputd_endpoint < 16) { status = -5; goto out; }
-    unsigned char input_blob[INPUTD_BOOT_CONFIG_MAX_BYTES];
-    memset(input_blob, 0, sizeof(input_blob));
-    struct inputd_boot_config *input_cfg = (struct inputd_boot_config *)input_blob;
-    const uint64_t input_size = sizeof(*input_cfg) +
-        input_count * sizeof(struct inputd_device_config);
-    input_cfg->magic = INPUTD_BOOT_CONFIG_MAGIC;
-    input_cfg->version = INPUTD_BOOT_CONFIG_VERSION;
-    input_cfg->header_size = sizeof(*input_cfg);
-    input_cfg->total_size = input_size;
-    input_cfg->input_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
-    input_cfg->ready_channel_fd = SEED0ROOT_SERVICE_READY_FD;
-    input_cfg->netd_endpoint_fd = SEED0ROOT_SERVICE_NETD_FD;
-    input_cfg->device_count = (uint32_t)input_count;
-    input_cfg->device_record_size = sizeof(struct inputd_device_config);
-    input_cfg->devices_offset = sizeof(*input_cfg);
-    struct inputd_device_config *records =
-        (struct inputd_device_config *)(input_blob + input_cfg->devices_offset);
-    struct pacha_process_fd_grant input_grants[FILED_EXEC_MAX_INHERIT_FDS];
-    for (uint64_t i = 0; i < input_count; i++) {
-        const int slot = input_slots[i];
-        const struct pacha_root_device_record *src = &devices->metadata.devices[slot];
-        records[i] = (struct inputd_device_config) {
-            .device_fd = SEED0ROOT_SERVICE_DEVICE_FD + i,
-            .resource_id = src->resource_id,
-            .pci_segment = src->pci_segment, .pci_bus = src->pci_bus,
-            .pci_device = src->pci_device, .pci_function = src->pci_function,
-            .vendor_id = (uint32_t)src->vendor_id,
-            .device_id = (uint32_t)src->device_id,
-            .subsystem_id = (uint32_t)src->subsystem_id,
-        };
-        input_grants[i] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-            devices->fds[slot], SEED0ROOT_SERVICE_DEVICE_FD + i, PACHA_LAUNCH_DEVICE_DRIVER);
-    }
-    input_grants[input_count] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-        inputd_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD, PACHA_LAUNCH_SERVER);
-    input_grants[input_count + 1] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-        ready.b, SEED0ROOT_SERVICE_READY_FD, PACHA_LAUNCH_SIGNAL);
-    input_grants[input_count + 2] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-        netd_endpoint, SEED0ROOT_SERVICE_NETD_FD, PACHA_LAUNCH_CLIENT);
-    input_grants[input_count + 3] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-        filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT);
-    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/inputd.elf",
-        input_blob, input_size, input_grants, input_count + 4,
-        0x5eed2007u);
-    (void)pacha_fd_close(ready.b); ready.b = -1;
-    if (status != 0) goto out;
-    status = seed0root_register_service_endpoint(filed_endpoint_fd,
-        FILED_OP_SERVICE_SET_INPUTD_INPUT, inputd_endpoint, 0x5eed2008u);
-    if (status != 0) goto out;
-    { const int ready_fd = ready.a; ready.a = -1;
-      status = seed0root_wait_service_ready(ready_fd, INPUTD_BOOT_READY_MAGIC, "inputd"); }
-    if (status != 0) goto out;
-    printf("[seed0root] rootfs services ready termd -> netd -> gpud -> inputd\n");
+    printf("[seed0root] rootfs services ready termd -> netd -> usbd -> inputd -> gpud\n");
     fflush(stdout);
 #if defined(SEED0ROOT_LAUNCH_GRANT_TEST) && SEED0ROOT_LAUNCH_GRANT_TEST
     {
@@ -3245,10 +3546,11 @@ out:
     if (gpud_control.a >= 16) (void)pacha_fd_close(gpud_control.a);
     if (gpud_control.b >= 16) (void)pacha_fd_close(gpud_control.b);
     if (inputd_endpoint >= 16) (void)pacha_fd_close(inputd_endpoint);
+    if (input_source_endpoint >= 16) (void)pacha_fd_close(input_source_endpoint);
     if (gpud_drm_endpoint >= 16) (void)pacha_fd_close(gpud_drm_endpoint);
     if (netd_endpoint >= 16) (void)pacha_fd_close(netd_endpoint);
     if (termd_endpoint >= 16) (void)pacha_fd_close(termd_endpoint);
-    seed0root_close_root_devices(devices);
+    if (!live_mode || status != 0) seed0root_close_root_devices(devices);
     return status;
 }
 
@@ -3268,7 +3570,8 @@ static int seed0root_send_storage_ready(int ready_channel_fd)
     return pacha_ipc_send(ready_channel_fd, &msg);
 }
 
-static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_fd, int *out_endpoint_fd)
+static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_fd,
+    int power_fd, int *out_endpoint_fd)
 {
     if (filed_endpoint_fd < 16 || unix_admin_fd < 16 || out_endpoint_fd == NULL) {
         return -22;
@@ -3285,6 +3588,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_
     cfg.endpoint_fd = LPR_SUPERVISOR_ENDPOINT_FD;
     cfg.unix_admin_fd = LPRS_UNIX_ADMIN_FD;
     cfg.filed_admin_fd = LPRS_FILED_ADMIN_FD;
+    cfg.power_fd = power_fd >= 16 ? LPRS_POWER_FD : 0;
     const int bootstrap_fd = create_inherited_vmo_from_bytes_with_extra_rights(
         &cfg,
         sizeof(cfg),
@@ -3318,6 +3622,12 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_
     exec->fd_grants[3] = (filed_exec_fd_grant_t){
         .target = LPRS_FILED_ADMIN_FD, .rights = PACHA_LAUNCH_CLIENT,
         .flags = PACHA_FD_FLAG_PRIVATE };
+    if (power_fd >= 16) {
+        exec->inherit_fd_count = 5;
+        exec->fd_grants[4] = (filed_exec_fd_grant_t){
+            .target = LPRS_POWER_FD, .rights = PACHA_LAUNCH_CLIENT,
+            .flags = PACHA_FD_FLAG_PRIVATE };
+    }
     exec->argc = 2;
     snprintf(exec->path, sizeof(exec->path), "%s", "/sbin/lpr_supervisor.elf");
     status = seed0root_exec_add_string(exec, &exec->argv[0], "/sbin/lpr_supervisor.elf");
@@ -3337,7 +3647,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_
         return status;
     }
 
-    struct pacha_ipc_fd fds[5];
+    struct pacha_ipc_fd fds[6];
     memset(fds, 0, sizeof(fds));
     fds[0].fd = (uint64_t)(uint32_t)page_fd;
     fds[0].rights =
@@ -3352,6 +3662,10 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_
     fds[3].rights = exec->fd_grants[2].rights | PACHA_FD_RIGHT_TRANSFER;
     fds[4].fd = (uint64_t)(uint32_t)filed_endpoint_fd;
     fds[4].rights = exec->fd_grants[3].rights | PACHA_FD_RIGHT_TRANSFER;
+    if (power_fd >= 16) {
+        fds[5].fd = (uint64_t)(uint32_t)power_fd;
+        fds[5].rights = exec->fd_grants[4].rights | PACHA_FD_RIGHT_TRANSFER;
+    }
 
     struct pacha_ipc_fd reply_fds[2];
     memset(reply_fds, 0, sizeof(reply_fds));
@@ -3361,7 +3675,7 @@ static int seed0root_start_lpr_supervisor(int filed_endpoint_fd, int unix_admin_
         FILED_OP_EXEC_PATH,
         0x5eed1001u,
         fds,
-        5,
+        power_fd >= 16 ? 6 : 5,
         0,
         &reply,
         reply_fds,
@@ -3754,6 +4068,46 @@ static int seed0root_spawn_lpr_services(int filed_endpoint_fd, int supervisor_en
     return 0;
 }
 
+struct seed0root_live_ssh {
+    struct seed0root_live_usb_ready *devices;
+    int filed_fd;
+    int supervisor_fd;
+    int enabled;
+    int launched;
+};
+
+static void seed0root_poll_live_ssh(void *context)
+{
+    struct seed0root_live_ssh *ssh = context;
+    seed0root_poll_live_usb_ready(ssh->devices);
+    if (!ssh->enabled || ssh->launched ||
+        ssh->devices->net_state != 2 || !ssh->devices->net_ipv4_ready)
+        return;
+
+    ssh->launched = 1;
+    const seed0root_linux_service_t service = {
+        .account = "root",
+        .filed_rights = SEED0ROOT_FILE_NAMESPACE,
+        /* Dropbear performs setgid/initgroups/setuid after authentication.
+         * Keep this identity authority on the daemon, never on live ash. */
+        .credential_rights = LPRS_CREDENTIAL_SETUID | LPRS_CREDENTIAL_SETGID,
+        .clients = FILED_EXEC_SERVICE_NETD | FILED_EXEC_SERVICE_TERMD,
+        .argc = 2,
+        .argv = {"/usr/sbin/dropbear", "-FsjkmR"},
+    };
+    lprs_process_state_t state = {0};
+    int bootstrap_fd = -1;
+    int status = seed0root_register_lpr_service(ssh->supervisor_fd,
+        &service, &state, &bootstrap_fd);
+    if (status == 0) status = seed0root_spawn_registered_lpr_service(
+        ssh->filed_fd, ssh->supervisor_fd, &service, &state, bootstrap_fd);
+    else if (state.token) seed0root_cancel_lpr_exec(ssh->supervisor_fd, state.token);
+    if (bootstrap_fd >= 16) (void)pacha_fd_close(bootstrap_fd);
+    printf("[seed0root] live SSH %s status=%d (public key only)\n",
+        status == 0 ? "launched" : "launch failed", status);
+    fflush(stdout);
+}
+
 static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap,
     const struct pacha_ipc_channel_pair *unix_path)
 {
@@ -3909,7 +4263,7 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
     int gpud_control_fd = -1;
     status = seed0root_start_unixd(filed_client_fd, unix_path->b, &unix_admin_fd);
     if (status == 0) status = seed0root_start_lpr_supervisor(
-        filed_client_fd, unix_admin_fd, &lpr_supervisor_endpoint_fd);
+        filed_client_fd, unix_admin_fd, -1, &lpr_supervisor_endpoint_fd);
     if (unix_admin_fd >= 16) (void)pacha_fd_close(unix_admin_fd);
     if (status != 0) {
         (void)pacha_fd_close(filed_client_fd);
@@ -3926,7 +4280,7 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
         return status;
     }
     status = seed0root_launch_root_services(
-        filed_client_fd, &root_devices, &gpud_control_fd);
+        filed_client_fd, &root_devices, &gpud_control_fd, 0, NULL, NULL, NULL);
     if (status != 0) {
         (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
         (void)pacha_fd_close(filed_client_fd);
@@ -4027,6 +4381,152 @@ static int launch_filed(const storage_seed0root_bootstrap_t *bootstrap)
     return status;
 }
 
+static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
+{
+    if (bootstrap == NULL ||
+        bootstrap->magic != PACHA_LIVE_ROOT_BOOTSTRAP_MAGIC ||
+        bootstrap->version != PACHA_LIVE_ROOT_BOOTSTRAP_VERSION ||
+        bootstrap->filed_endpoint_fd < 16 || bootstrap->unix_path_fd < 16 ||
+        bootstrap->root_handoff_fd < 16 || bootstrap->power_channel_fd < 16)
+        return -22;
+    const int filed_fd = (int)bootstrap->filed_endpoint_fd;
+    int unix_admin_fd = -1;
+    int supervisor_fd = -1;
+    int termd_fd = -1;
+    int inputd_fd = -1;
+    int unused_gpud_fd = -1;
+    struct live_console *console = NULL;
+    struct seed0root_live_usb_ready usb_ready = {0};
+    usb_ready.net_fd = -1;
+    int status = seed0root_start_unixd(filed_fd,
+        (int)bootstrap->unix_path_fd, &unix_admin_fd);
+    if (status == 0) status = seed0root_start_lpr_supervisor(
+        filed_fd, unix_admin_fd, (int)bootstrap->power_channel_fd, &supervisor_fd);
+    (void)pacha_fd_close((int)bootstrap->power_channel_fd);
+    if (unix_admin_fd >= 16) (void)pacha_fd_close(unix_admin_fd);
+    if (status != 0) return status;
+    struct seed0root_root_devices devices;
+    status = seed0root_receive_root_handoff(
+        (int)bootstrap->root_handoff_fd, &devices);
+    if (status == 0) {
+        printf("[seed0root] live framebuffer paddr=0x%llx size=%llu %llux%llu pitch=%llu\n",
+            (unsigned long long)bootstrap->framebuffer_paddr,
+            (unsigned long long)bootstrap->framebuffer_size,
+            (unsigned long long)bootstrap->width,
+            (unsigned long long)bootstrap->height,
+            (unsigned long long)bootstrap->pitch);
+        for (uint64_t i = 0; i < devices.metadata.device_count; i++) {
+            const struct pacha_root_device_record *device = &devices.metadata.devices[i];
+            if ((device->class_code >> 16) != 3) continue;
+            for (unsigned bar = 0; bar < 6; bar++) {
+                struct pacha_capsule_bar_info info;
+                if (pacha_capsule_pci_bar_info(devices.fds[i], bar, &info) == 0 && info.size)
+                    printf("[seed0root] display %04llx:%04llx BAR%u [%llx,%llx] flags=%llx\n",
+                        (unsigned long long)device->vendor_id,
+                        (unsigned long long)device->device_id, bar,
+                        (unsigned long long)info.start,
+                        (unsigned long long)info.end,
+                        (unsigned long long)info.flags);
+            }
+        }
+        fflush(stdout);
+    }
+    if (status == 0) {
+        usb_ready.capacity = (size_t)devices.metadata.device_count;
+        if (usb_ready.capacity != 0) {
+            usb_ready.fds = calloc(usb_ready.capacity, sizeof(*usb_ready.fds));
+            if (usb_ready.fds == NULL) status = -12;
+        }
+    }
+    if (status == 0) status = seed0root_launch_root_services(
+        filed_fd, &devices, &unused_gpud_fd, 1, &termd_fd, &inputd_fd,
+        &usb_ready);
+    if (status == 0) status = live_console_prepare(bootstrap,
+        devices.metadata.devices, devices.fds, devices.metadata.device_count,
+        termd_fd, inputd_fd, &console);
+    seed0root_close_root_devices(&devices);
+    if (status == 0) status = seed0root_register_termd_signal_supervisor(
+        filed_fd, supervisor_fd);
+    if (status == 0) {
+        const seed0root_linux_service_t shell = {
+            .account = "root",
+            .filed_rights = SEED0ROOT_FILE_NAMESPACE,
+            /* The shell can start before DHCP, but its descendants still
+             * need the generic netd socket capability once it comes up. */
+            .clients = FILED_EXEC_SERVICE_TERMD |
+                (usb_ready.net_state == 1 ? FILED_EXEC_SERVICE_NETD : 0),
+            .ctty = live_console_ctty(console),
+            .argc = 1,
+            .argv = {"/bin/ash"},
+        };
+        lprs_process_state_t state = {0};
+        int shell_bootstrap_fd = -1;
+        status = seed0root_register_lpr_service(supervisor_fd, &shell,
+            &state, &shell_bootstrap_fd);
+        if (status == 0) status = seed0root_spawn_registered_lpr_service(
+            filed_fd, supervisor_fd, &shell, &state, shell_bootstrap_fd);
+        else if (state.token) seed0root_cancel_lpr_exec(supervisor_fd, state.token);
+        if (shell_bootstrap_fd >= 16) (void)pacha_fd_close(shell_bootstrap_fd);
+    }
+    if (status == 0) {
+        char authorized_key[256];
+        const int key_status = seed0root_read_filed_text(filed_fd,
+            "/root/.ssh/authorized_keys", authorized_key,
+            sizeof(authorized_key));
+        struct seed0root_live_ssh ssh = {
+            .devices = &usb_ready,
+            .filed_fd = filed_fd,
+            .supervisor_fd = supervisor_fd,
+            .enabled = key_status == 0 &&
+                strncmp(authorized_key, "ssh-ed25519 ", 12) == 0,
+        };
+        printf("[seed0root] live SSH %s\n",
+            ssh.enabled ? "public key configured; waiting for netd" :
+                "disabled (no Ed25519 authorized key)");
+        fflush(stdout);
+        /* Keep asynchronous netd independent of ash, but allow a bounded
+         * interval for a useful initial boot report. Never inject later
+         * status lines into an interactive TTY behind the shell's back. */
+        if (usb_ready.net_state == 1 && usb_ready.net_fd >= 16) {
+            struct pacha_pollfd event = {.fd = usb_ready.net_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+            /* FD wait deadlines are scheduler ticks (1 ms), not nanoseconds. */
+            (void)pacha_fd_wait_many(&event, 1, 5000);
+        }
+        seed0root_poll_live_usb_ready(&usb_ready);
+        /* Autonegotiation can finish immediately after probe. Sample one
+         * further bounded link event before freezing the boot history. */
+        if (usb_ready.net_state == 2 && !usb_ready.net_carrier &&
+            usb_ready.net_fd >= 16) {
+            struct pacha_pollfd event = {.fd = usb_ready.net_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+            (void)pacha_fd_wait_many(&event, 1, 2000);
+            seed0root_poll_live_usb_ready(&usb_ready);
+        }
+        live_console_report_usb_boot(console, usb_ready.fds, usb_ready.count);
+        live_console_report_net_boot(console, usb_ready.net_state,
+            usb_ready.net_status, usb_ready.net_stage,
+            usb_ready.net_carrier, usb_ready.net_mtu,
+            usb_ready.net_nic_step, usb_ready.net_detail,
+            usb_ready.net_loaded, usb_ready.net_pci_bound,
+            usb_ready.net_source, usb_ready.net_line,
+            usb_ready.net_fault_vector, usb_ready.net_fault_error_code,
+            usb_ready.net_fault_core_relative, usb_ready.net_fault_ip,
+            usb_ready.net_fault_address);
+        printf("[seed0root] live RAM services connected; ash ctty=%s\n",
+            live_console_ctty(console));
+        fflush(stdout);
+        live_console_finish_boot(console);
+        status = live_console_run(console, seed0root_poll_live_ssh, &ssh);
+    }
+    seed0root_close_live_usb_ready(&usb_ready);
+    live_console_destroy(console);
+    if (termd_fd >= 16) (void)pacha_fd_close(termd_fd);
+    if (inputd_fd >= 16) (void)pacha_fd_close(inputd_fd);
+    if (supervisor_fd >= 16) (void)pacha_fd_close(supervisor_fd);
+    return status;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -4045,6 +4545,16 @@ int main(int argc, char **argv)
     (void)pacha_fd_fcntl(bootstrap_fd, PACHA_FD_FCNTL_SET_FLAGS,
         0, PACHA_FD_FLAG_INHERIT);
     (void)pacha_fd_close(bootstrap_fd);
+    if (bootstrap_status == 0 &&
+        bootstrap.magic == PACHA_LIVE_ROOT_BOOTSTRAP_MAGIC) {
+        pacha_live_root_bootstrap_t live;
+        memcpy(&live, &bootstrap, sizeof(live));
+        const int live_status = launch_live(&live);
+        if (live_status != 0)
+            fprintf(stderr, "[seed0root] live launch failed status=%d\n",
+                live_status);
+        return live_status == 0 ? 0 : 4;
+    }
     printf("[seed0root] bootstrap read status=%d magic=0x%llx device_fd=%llu ready_fd=%llu service_ready_fd=%llu filed_fd=%llu filed_size=%llu modules=%llu\n",
         bootstrap_status,
         (unsigned long long)bootstrap.magic,

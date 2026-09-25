@@ -139,7 +139,7 @@ test "DMAR RMRR clips continuous DMA window and rejects malformed reservations" 
     writeLe64(&fixture, 72, 0x7ffff000);
     writeLe64(&fixture, 80, 0x80000fff);
     finishAcpiChecksum(&fixture);
-    try std.testing.expectEqual(@as(u64, 0x80000000), (try kernel.acpi_dmar.parseDmar(&fixture)).dma_window_end);
+    try std.testing.expectEqual(@as(u64, 0x7ffff000), (try kernel.acpi_dmar.parseDmar(&fixture)).dma_window_end);
     writeLe64(&fixture, 80, 0x80000000);
     finishAcpiChecksum(&fixture);
     try std.testing.expectError(error.InvalidReservedRange, kernel.acpi_dmar.parseDmar(&fixture));

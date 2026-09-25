@@ -69,17 +69,11 @@ void *memcpy(void *destination, const void *source, size_t length) {
 }
 
 static void acquire_device(void) {
-    const struct seed0_init_descriptor_page *boot = seed0_bootstrap_descriptor();
-    CHECK(boot && boot->device_count <= SEED0_INIT_MAX_DEVICE_DESCRIPTORS);
-    uint64_t source = 0;
-    for (uint64_t i = 0; i < boot->device_count; ++i) {
-        if (boot->devices[i].vendor_id == 0x1af4 && boot->devices[i].device_id == 0x1044) {
-            CHECK(!source);
-            source = boot->devices[i].init_device_fd;
-        }
-    }
-    CHECK(is_fd(source));
-    CHECK(call(PACHA_FD_SYSCALL_DUP, source, DEVICE_FD, query(source).rights, 0, 0, 0) == DEVICE_FD);
+    CHECK(seed0_bootstrap_descriptor() != NULL);
+    const uint64_t source = claim_pci_device(0x1af4, 0x1044);
+    CHECK(call(PACHA_FD_SYSCALL_DUP, source, DEVICE_FD,
+        query(source).rights, 0, 0, 0) == DEVICE_FD);
+    close_fd(source);
 }
 
 static void reserve_arena(void) {

@@ -550,15 +550,21 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
         cpu_slot += 1;
     }
     const success = cpu_slot == info.lapic_count;
-    if (success and info.broadcast_topology_complete) {
+    if (success) {
         const mask = onlineCpuMask();
         if (@popCount(mask) == info.lapic_count) {
-            @atomicStore(u64, &broadcast_online_mask, mask, .release);
+            // Shorthand IPI safety depends on complete MADT topology, but
+            // PAT/MTRR agreement is an independent all-online-CPU proof.
+            // x2APIC MADT entries deliberately disable shorthand without
+            // invalidating otherwise matching cache snapshots.
+            if (info.broadcast_topology_complete)
+                @atomicStore(u64, &broadcast_online_mask, mask, .release);
             var matching: u64 = 0;
             for (&mmio_cache_matches, 0..) |*value, slot| {
                 if (@atomicLoad(u32, value, .acquire) != 0) matching |= @as(u64, 1) << @intCast(slot);
             }
-            if (matching == mask) @atomicStore(u64, &mmio_cache_online_mask, mask, .release);
+            @atomicStore(u64, &mmio_cache_online_mask,
+                cacheEvidenceForOnlineCpus(success, info.lapic_count, mask, matching), .release);
         }
     }
     return success;
@@ -615,6 +621,55 @@ pub fn ucMinusMmioAllowed(paddr: u64, bytes: u64) bool {
     const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
     return verified != 0 and verified == onlineCpuMask() and
         ucMinusMmioWithSnapshot(&mmio_cache_snapshots[0], paddr, bytes);
+}
+
+pub const ExplicitUcMmioStatus = enum {
+    ready,
+    cache_evidence_missing,
+    invalid_range,
+    identity_not_uc,
+};
+
+/// The AMD IOMMU dereferences its register BAR through the low identity VA.
+/// Unlike UC_MINUS device leases, explicit PAT3 UC is safe with a WB MTRR
+/// when every actual identity leaf is UC; do not relax UC_MINUS admission.
+pub fn explicitUcIdentityMmioStatus(paddr: u64, bytes: u64) ExplicitUcMmioStatus {
+    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
+    if (verified == 0 or verified != onlineCpuMask()) return .cache_evidence_missing;
+    if (paddr >= @import("arch/x86_64/physical_layout.zig").identity_limit or
+        bytes > @import("arch/x86_64/physical_layout.zig").identity_limit - paddr or
+        !mmio_cache_snapshots[0].rangeSupportsUncachedMapping(paddr, bytes)) return .invalid_range;
+    var page = paddr;
+    const end = paddr + bytes;
+    while (page < end) : (page += 4096) {
+        if (!x86_platform.bootIdentityPageIsExplicitUc(page)) return .identity_not_uc;
+    }
+    return .ready;
+}
+
+pub fn mmioCacheEvidenceMasks() struct { verified: u64, matching: u64, online: u64 } {
+    var matching: u64 = 0;
+    for (&mmio_cache_matches, 0..) |*value, slot| {
+        if (@atomicLoad(u32, value, .acquire) != 0) matching |= @as(u64, 1) << @intCast(slot);
+    }
+    return .{
+        .verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire),
+        .matching = matching,
+        .online = onlineCpuMask(),
+    };
+}
+
+fn cacheEvidenceForOnlineCpus(success: bool, count: u8, online: u64, matching: u64) u64 {
+    if (!success or online == 0 or @popCount(online) != count or matching != online) return 0;
+    return online;
+}
+
+test "MMIO alias cache evidence does not depend on broadcast topology" {
+    try std.testing.expectEqual(@as(u64, 0), cacheEvidenceForOnlineCpus(false, 2, 3, 3));
+    try std.testing.expectEqual(@as(u64, 0), cacheEvidenceForOnlineCpus(true, 2, 3, 1));
+    try std.testing.expectEqual(@as(u64, 0), cacheEvidenceForOnlineCpus(true, 3, 3, 3));
+    try std.testing.expectEqual(@as(u64, 3), cacheEvidenceForOnlineCpus(true, 2, 3, 3));
+    try std.testing.expect(!broadcastMaskMatches(0, 3, 3, 0));
 }
 
 fn kernelIdentityRanges() [2][2]u64 {
