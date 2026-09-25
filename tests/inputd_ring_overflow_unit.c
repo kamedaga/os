@@ -13,6 +13,13 @@ enum {
 static inputd_registry_entry_t test_registry[2];
 static kb_input_device_snapshot_t ioctl_snapshot;
 
+int pacha_ipc_send(int fd, const struct pacha_ipc_msg *message)
+{
+    (void)fd;
+    (void)message;
+    return 0;
+}
+
 int kb_input_subsystem_for_each_device(
     int (*callback)(const kb_input_device_snapshot_t *device, void *ctx),
     void *ctx)
@@ -37,7 +44,7 @@ static void reset_inputd(size_t device_count)
     notify_ready_mask = 0;
     static struct inputd_input_island island;
     island = (struct inputd_input_island){
-        .registry = test_registry,
+        .registry = device_count ? test_registry : NULL,
         .device_count = device_count,
         .ready = 1,
     };
@@ -46,6 +53,7 @@ static void reset_inputd(size_t device_count)
 
 static void setup_device(size_t index, uint32_t device_id)
 {
+    test_registry[index].active = 1;
     test_registry[index].kobox_device_id = device_id;
     test_registry[index].public_device.event_index = (uint32_t)index;
 }
@@ -342,6 +350,93 @@ static int test_state_ioctl_flushes_pending_type(void)
     return 0;
 }
 
+static int test_usb_source_hotplug_and_read(void)
+{
+    reset_inputd(0);
+    struct inputd_input_island *island = active_island;
+    struct kobox_linux_input_device_info keyboard = {.id = 1,
+        .bus = 3, .vendor = 0x627, .product = 1,
+        .event_bits = (UINT64_C(1) << TEST_EV_KEY)};
+    keyboard.key_bits[30 / 64] = UINT64_C(1) << (30 % 64);
+    memcpy(keyboard.name, "QEMU USB Keyboard", sizeof("QEMU USB Keyboard"));
+    struct kobox_linux_input_device_info mouse = {.id = 2,
+        .bus = 3, .vendor = 0x627, .product = 1,
+        .event_bits = (UINT64_C(1) << TEST_EV_REL),
+        .rel_bits = (UINT64_C(1) << TEST_REL_X) | (UINT64_C(1) << TEST_REL_Y)};
+    memcpy(mouse.name, "QEMU USB Mouse", sizeof("QEMU USB Mouse"));
+    struct inputd_public_device first, second;
+    if (inputd_input_source_begin(island, 42, 1, 0) != 0 ||
+        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+            &keyboard, &first) != 1 ||
+        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+            &mouse, &second) != 1 ||
+        inputd_input_source_mark_published(island, 42, 1, 1) != 0 ||
+        inputd_input_source_mark_published(island, 42, 1, 2) != 0 ||
+        inputd_input_source_end(island, 42, 1, NULL, NULL) != 0)
+        return 1;
+    if (first.event_index == second.event_index ||
+        first.pci_device != second.pci_device ||
+        !(first.capabilities & INPUTD_INPUT_CAP_KEYBOARD) ||
+        !(second.capabilities & INPUTD_INPUT_CAP_RELATIVE)) return 2;
+    inputd_registry_entry_t *entry = lookup_registry_by_event(first.event_index);
+    if (!entry) return 3;
+    setup_handle(entry->kobox_device_id, next_sequence);
+    const struct kobox_linux_input_record frame[] = {
+        {.sequence = 1, .monotonic_ns = UINT64_C(1000000000),
+            .device_id = 1, .kind = KOBOX_INPUT_EVENT,
+            .type = TEST_EV_KEY, .code = 30, .value = 1},
+        {.sequence = 2, .monotonic_ns = UINT64_C(1000000000),
+            .device_id = 1, .kind = KOBOX_INPUT_EVENT,
+            .type = INPUTD_EV_SYN, .code = INPUTD_SYN_REPORT},
+    };
+    if (inputd_input_source_events(island, 42, 1, frame, 2) != 0)
+        return 4;
+    inputd_read_request_t read = {.handle = 1,
+        .event_capacity = INPUTD_EVENT_CAPACITY};
+    if (inputd_input_read(&read) != 0 || read.event_count != 2 ||
+        read.events[0].type != TEST_EV_KEY || read.events[0].code != 30 ||
+        read.events[0].value != 1 || read.events[1].type != INPUTD_EV_SYN)
+        return 5;
+    inputd_ioctl_request_t state = {.handle = 1,
+        .request = state_ioctl(0x18u, sizeof(entry->source_snapshot.key_state)),
+        .data_size = sizeof(entry->source_snapshot.key_state)};
+    if (inputd_input_ioctl(&state) != 0 ||
+        !(state.data[30 / 8] & (1u << (30 % 8)))) return 6;
+    if (inputd_input_source_begin(island, 42, 1, 0) != 0 ||
+        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+            &mouse, &second) != 0 ||
+        inputd_input_source_end(island, 42, 1, NULL, NULL) != 0)
+        return 7;
+    if (inputd_input_read(&read) != -19) return 8;
+    inputd_poll_request_t poll = {.handle = 1, .events = INPUTD_POLLIN};
+    if (inputd_input_poll(&poll) != 0 || poll.revents != INPUTD_POLLHUP)
+        return 9;
+    if (inputd_input_source_begin(island, 42, 1, 0) != 0 ||
+        inputd_input_source_device(island, 42, 1, 0, 0, 4, 0,
+            &keyboard, &first) != 1 ||
+        inputd_input_source_end(island, 42, 1, NULL, NULL) != 0 ||
+        first.event_index <= second.event_index)
+        return 10;
+    entry = lookup_registry_by_event(first.event_index);
+    if (!entry) return 11;
+    setup_handle(entry->kobox_device_id, next_sequence);
+    struct kobox_linux_input_record replugged[] = {
+        {.sequence = 3, .monotonic_ns = UINT64_C(2000000000),
+            .device_id = 1, .kind = KOBOX_INPUT_EVENT,
+            .type = TEST_EV_KEY, .code = 30, .value = 1},
+        {.sequence = 4, .monotonic_ns = UINT64_C(2000000000),
+            .device_id = 1, .kind = KOBOX_INPUT_EVENT,
+            .type = INPUTD_EV_SYN, .code = INPUTD_SYN_REPORT},
+    };
+    if (inputd_input_source_events(island, 42, 1, replugged, 2) != 0 ||
+        inputd_input_read(&read) != 0 || read.event_count != 2 ||
+        read.events[0].code != 30 || read.events[0].value != 1)
+        return 12;
+    free(island->registry);
+    island->registry = NULL;
+    return 0;
+}
+
 int main(void)
 {
     int status = test_other_device_overflow_does_not_drop();
@@ -356,5 +451,7 @@ int main(void)
     if (status != 0) return 70 + status;
     status = test_state_ioctl_flushes_pending_type();
     if (status != 0) return 80 + status;
+    status = test_usb_source_hotplug_and_read();
+    if (status != 0) return 90 + status;
     return 0;
 }

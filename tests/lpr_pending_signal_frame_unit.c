@@ -14,6 +14,8 @@ static uint64_t g_native_frame_count;
 static int64_t g_native_frame_result;
 static uint64_t g_handler_count;
 static struct lpr_linux_user_frame *g_active_user_frame;
+static unsigned g_thread_lookups;
+static unsigned g_thread_slot;
 
 const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
 {
@@ -68,7 +70,8 @@ void lpr_signal_source_diag(
  * reset_state()'s lpr_state wipe resets it, matching the real slot storage. */
 lpr_signal_thread_state_t *lpr_signal_thread_state_current(void)
 {
-    return &lpr_state.signal.threads[0].state;
+    ++g_thread_lookups;
+    return &lpr_state.signal.threads[g_thread_slot].state;
 }
 
 void lpr_signal_thread_state_after_fork_child(void)
@@ -107,12 +110,38 @@ static void reset_state(void)
     g_native_frame_result = 0;
     g_handler_count = 0;
     g_active_user_frame = 0;
+    g_thread_lookups = 0;
+    g_thread_slot = 0;
 }
 
 int main(void)
 {
     const uint32_t custom_signal = LPR_LINUX_SIGPIPE;
     const uint64_t custom_bit = lpr_linux_signal_bit(custom_signal);
+
+    reset_state();
+    for (unsigned i = 0; i < 10000; ++i)
+        CHECK(lpr_linux_dispatch_pending_signals() == 0);
+    CHECK(g_thread_lookups == 0 && g_syscall_count == 0);
+    lpr_linux_queue_signal(0);
+    lpr_linux_queue_signal(LPR_LINUX_SIGNAL_MAX + 1u);
+    CHECK(lpr_state.signal.local_pending_ever_queued == 0);
+
+    /* An empty consumer in another thread must not clear the hint for the
+     * owner. After the first queued signal, always use the existing path. */
+    lpr_linux_sigactions[custom_signal].handler = LPR_LINUX_SIG_IGN;
+    lpr_linux_queue_signal(custom_signal);
+    CHECK(lpr_state.signal.local_pending_ever_queued == 1);
+    g_thread_slot = 1;
+    CHECK(lpr_linux_dispatch_pending_signals() == 0);
+    CHECK(lpr_state.signal.local_pending_ever_queued == 1);
+    g_thread_slot = 0;
+    CHECK((lpr_linux_pending_signal_mask & custom_bit) != 0);
+    CHECK(lpr_linux_dispatch_pending_signals() == 0);
+    CHECK(lpr_linux_pending_signal_mask == 0);
+    CHECK(lpr_state.signal.local_pending_ever_queued == 1);
+    lpr_signal_thread_state_after_fork_child();
+    CHECK(lpr_state.signal.local_pending_ever_queued == 1);
 
     reset_state();
     lpr_linux_sigactions[custom_signal].handler = (uint64_t)(uintptr_t)fake_handler;

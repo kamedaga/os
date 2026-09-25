@@ -1,4 +1,13 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_gui_detail.h"
+#include "../support/browser_diag.h"
+#include "../support/mmap_profile.h"
+
+static void lpr_file_vmo_release_wire(int independent, int fd, void *page)
+{
+    if (independent) lpr_destroy_standalone_wire_page(fd, page);
+    else lpr_destroy_pread_vmo_wire_page(fd, page);
+}
 
 static int64_t lpr_linux_file_vmo_call(
     uint32_t op,
@@ -18,8 +27,22 @@ static int64_t lpr_linux_file_vmo_call(
         return -LPR_LINUX_EINVAL;
     }
 
+    /* start, wire/lock ready, call sent, reply received, reply closed, unlock */
+    uint64_t map_profile[6] = {lpr_map_profile_clock()};
+    /* Shared mappings can wait on other file operations for hundreds of ms.
+     * Their request/reply payload is entirely call-local; do not hold the
+     * general FileD RPC lock while waiting. Keep the private-image cache's
+     * existing wire-page policy. Endpoint setup still owns its own lock, and
+     * the mmap caller retains its normal descriptor pin and access checks. */
+    const int independent = op == FILED_OP_VFS_SHARED_FILE_VMO;
+    if (independent) {
+        const int64_t ready = lpr_filed_endpoint_ready();
+        if (ready != 0) return ready;
+    }
     void *page = 0;
-    const int page_fd = lpr_create_pread_vmo_wire_page(&page);
+    const int page_fd = independent ? lpr_create_standalone_wire_page(&page) :
+        lpr_create_pread_vmo_wire_page(&page);
+    map_profile[1] = lpr_map_profile_clock();
     if (page_fd < 0) {
         return page_fd;
     }
@@ -65,10 +88,11 @@ static int64_t lpr_linux_file_vmo_call(
 
     const int64_t call_reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         (uint64_t)(uintptr_t)&request);
+    map_profile[2] = lpr_map_profile_clock();
     if (call_reply_fd < 16) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return lpr_pacha_status_to_errno(call_reply_fd);
     }
 
@@ -77,9 +101,11 @@ static int64_t lpr_linux_file_vmo_call(
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)call_reply_fd,
         &reply);
+    map_profile[3] = lpr_map_profile_clock();
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)call_reply_fd);
+    map_profile[4] = lpr_map_profile_clock();
     if (recv_status != 0) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return lpr_pacha_status_to_errno(recv_status);
     }
     const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
@@ -90,22 +116,24 @@ static int64_t lpr_linux_file_vmo_call(
         reply_header->op != op ||
         reply_header->request_id != request_id)
     {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return -LPR_LINUX_EIO;
     }
     if (reply_header->status < 0) {
         const int64_t status = reply_header->status;
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return status;
     }
     if (reply.fd_count != 1 || reply_fd_items[0].fd < 16) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
+        lpr_file_vmo_release_wire(independent, page_fd, page);
         return -LPR_LINUX_EIO;
     }
     if (out_loaded != 0) {
         *out_loaded = reply_header->result;
     }
-    lpr_destroy_pread_vmo_wire_page(page_fd, page);
+    lpr_file_vmo_release_wire(independent, page_fd, page);
+    map_profile[5] = lpr_map_profile_clock();
+    lpr_map_profile_emit("rpc", fd, length, op, map_profile);
     return (int64_t)reply_fd_items[0].fd;
 }
 
@@ -352,6 +380,7 @@ int64_t lpr_linux_close(uint64_t fd)
     if (fd > LPR_LINUX_FD_MAX || !lpr_control_fd_active(fd)) {
         return -LPR_LINUX_EBADF;
     }
+    lpr_browser_diag("close", fd, 0, 0);
     lpr_epoll_before_close(fd);
     lpr_fd_drop_t drop;
     if (lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd, &drop) != 0) {
@@ -362,6 +391,7 @@ int64_t lpr_linux_close(uint64_t fd)
 
 int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 {
+    lpr_browser_diag("close-range", first, last, flags);
     const uint64_t known_flags =
         LPR_LINUX_CLOSE_RANGE_UNSHARE |
         LPR_LINUX_CLOSE_RANGE_CLOEXEC;
@@ -395,6 +425,16 @@ int64_t lpr_linux_close_range(uint64_t first, uint64_t last, uint64_t flags)
 
 int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
 {
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    const int gui_profile = lpr_gui_profile_current_thread();
+    uint64_t gui_begin = gui_profile ? pacha_trace_read_tsc() : 0;
+#define GUI_SEEK_MARK(k) do { if (gui_profile) { \
+    const uint64_t end = pacha_trace_read_tsc(); \
+    lpr_gui_profile_span((k), gui_begin, end); gui_begin = pacha_trace_read_tsc(); \
+} } while (0)
+#else
+#define GUI_SEEK_MARK(k) ((void)0)
+#endif
     if (fd > LPR_LINUX_FD_MAX) {
         return -LPR_LINUX_ESPIPE;
     }
@@ -404,6 +444,7 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     }
 
     int64_t result = -LPR_LINUX_ESPIPE;
+    GUI_SEEK_MARK(0);
     if (pin.ops_id == LPR_FD_OPS_DEVICE) {
         result = whence <= 2 ? 0 : -LPR_LINUX_EINVAL;
         goto out;
@@ -427,6 +468,14 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     }
 
     lpr_filed_backend_t *filed = (lpr_filed_backend_t *)pin.state;
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    if (gui_profile) {
+        lpr_gui_profile_file(8, whence, filed->flags, filed->offset_valid,
+            filed->pread_active, filed->stat_size, filed->open_path);
+        const uint64_t tick = pacha_trace_read_tsc();
+        lpr_gui_profile_span(whence <= 2 ? 8u+(unsigned)whence : 8u, tick, tick+1u);
+    }
+#endif
     if ((filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY &&
         filed->offset_valid && whence <= 1)
     {
@@ -444,10 +493,12 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
         }
         filed->pread_active = 1;
         result = (int64_t)new_offset;
+        GUI_SEEK_MARK(1);
         goto out;
     }
     void *page = 0;
     const int page_fd = lpr_create_wire_page(&page);
+    GUI_SEEK_MARK(2);
     if (page_fd < 0) {
         result = page_fd;
         goto out;
@@ -460,7 +511,9 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     uint64_t new_offset = 0;
     const int64_t status =
         lpr_filed_call(FILED_OP_VFS_SEEK, page_fd, 0, &new_offset);
+    GUI_SEEK_MARK(3);
     lpr_destroy_wire_page(page_fd, page);
+    GUI_SEEK_MARK(4);
     if (status == 0 &&
         (filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY)
     {
@@ -471,7 +524,10 @@ int64_t lpr_linux_lseek(uint64_t fd, uint64_t offset, uint64_t whence)
     result = status == 0 ? (int64_t)new_offset : status;
 
 out:
+    GUI_SEEK_MARK(5);
     lpr_fd_unpin(&pin);
+    GUI_SEEK_MARK(6);
+#undef GUI_SEEK_MARK
     return result;
 }
 
@@ -511,7 +567,7 @@ int64_t lpr_linux_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         default: return -LPR_LINUX_EINVAL;
         }
     }
-    if (lpr_linux_epoll_fd_active(fd)) {
+    if (lpr_linux_epoll_fd_active(fd) || lpr_unix_socket_active(fd)) {
         switch (cmd) {
         case LPR_LINUX_F_GETFD:
             return lpr_control_get_fd_flags(fd);
@@ -856,6 +912,10 @@ int64_t lpr_backend_fstat(uint64_t fd, uint64_t statbuf)
         lpr_memset(st, 0, sizeof(*st));
         st->st_ino = 0x74747900ull + fd;
         st->st_nlink = 1;
+        /* The virtual PTY already reports mode 0620. Expose its matching
+         * conventional tty group too, so POSIX consumers need not chmod a
+         * synthetic device inode through the regular FileD path. */
+        st->st_gid = 5;
         st->st_mode = LPR_LINUX_S_IFCHR | 0620u;
         st->st_rdev = 0x8800ull;
         st->st_blksize = 4096;
@@ -919,14 +979,42 @@ int64_t lpr_linux_newfstatat(uint64_t dirfd, uint64_t path_raw, uint64_t statbuf
     }
     lpr_trace_process_event("newfstatat_begin", dirfd, flags, 0);
     const char *path = (const char *)(uintptr_t)path_raw;
-    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path != 0 && path[0] == 0) {
-        const uint64_t empty_known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW;
-        if ((flags & ~empty_known_flags) != 0) {
-            return -LPR_LINUX_EINVAL;
-        }
+    if (path == 0) return -LPR_LINUX_EFAULT;
+    const uint64_t known_flags = LPR_LINUX_AT_EMPTY_PATH | LPR_LINUX_AT_SYMLINK_NOFOLLOW | 0x800u; /* AT_NO_AUTOMOUNT */
+    if ((flags & ~known_flags) != 0) return -LPR_LINUX_EINVAL;
+    if ((flags & LPR_LINUX_AT_EMPTY_PATH) != 0 && path[0] == 0) {
         return lpr_linux_fstat(dirfd, statbuf);
     }
-    uint64_t open_flags = LPR_LINUX_O_RDONLY;
+    if (path[0] == '\0') return -LPR_LINUX_ENOENT;
+    const int64_t drm_stat = lpr_drm_stat_path(path, statbuf);
+    if (drm_stat != -LPR_LINUX_ENOENT) return drm_stat;
+    /* Virtual proc/device descriptors belong to LPR, not the FileD namespace.
+     * Keep their existing handling; regular filesystem paths need no Linux FD. */
+    const int virtual_path =
+        (lpr_strncmp(path, "/proc", 5) == 0 && (path[5] == '/' || path[5] == '\0')) ||
+        (lpr_strncmp(path, "/dev", 4) == 0 && (path[4] == '/' || path[4] == '\0'));
+    if (!virtual_path) {
+        uint64_t dir_handle = 0;
+        int64_t status = lpr_dir_handle_for(dirfd, path, &dir_handle);
+        if (status != 0) return status;
+        void *page = 0;
+        const int page_fd = lpr_create_wire_page(&page);
+        if (page_fd < 0) return page_fd;
+        filed_statat_t *request = page;
+        lpr_memset(request, 0, sizeof(*request));
+        request->dir_handle = dir_handle;
+        request->flags = (flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) ? FILED_STATAT_NOFOLLOW : 0;
+        status = lpr_copy_path(request->name, sizeof(request->name), path);
+        uint64_t ignored = 0;
+        if (status == 0) status = lpr_filed_call(FILED_OP_VFS_STATAT, page_fd, 0, &ignored);
+        if (status == 0) lpr_write_linux_stat((void *)(uintptr_t)statbuf, &request->stat);
+        lpr_destroy_wire_page(page_fd, page);
+        return status;
+    }
+    /* stat() must not acquire a controlling terminal when its virtual-device
+     * fallback temporarily opens /dev/pts/N.  A plain O_RDONLY open let the
+     * SSH daemon's metadata probe claim its child's future PTY. */
+    uint64_t open_flags = LPR_LINUX_O_RDONLY | LPR_LINUX_O_NOCTTY;
     if ((flags & LPR_LINUX_AT_SYMLINK_NOFOLLOW) != 0) {
         open_flags |= LPR_LINUX_O_NOFOLLOW;
     }
@@ -1312,6 +1400,7 @@ int64_t lpr_linux_utimensat(uint64_t dirfd, uint64_t path_raw, uint64_t times, u
 
 int64_t lpr_linux_readlink(uint64_t path, uint64_t buf, uint64_t bufsiz)
 {
+    if (bufsiz == 0) return -LPR_LINUX_EINVAL;
     if (buf == 0 && bufsiz != 0) {
         return -LPR_LINUX_EFAULT;
     }

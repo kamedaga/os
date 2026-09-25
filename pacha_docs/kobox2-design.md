@@ -1,6 +1,6 @@
 # kobox2 の設計思想
 
-> **状態:** repository bootstrap と基本設計が完了。実装は未着手。
+> **状態:** Phase 3 のGPU base、DRM core 26、DRM mode 44、virtgpu 11、AMDGPU 20 command契約を`dev` schemaへ固定済み。
 > 全体の判断基準は [PachaOS の設計思想](./architecture.md) を参照すること。
 > 本文書は既存の [filed VFS design](./filed-vfs-design.md) の記述と一部衝突する。
 > §14 に整理した。
@@ -194,7 +194,7 @@ device-pci subsystem .so   device model / PCI core / DMA API / IRQ glue / ...
 blk subsystem .so          bio / request / blk-mq / block device core / ...
 fs subsystem .so           VFS / buffer_head / filesystem core / ...
 net subsystem .so          net_device / skb / NAPI / network core / ...
-drm subsystem .so          DRM / GEM / TTM / GPU scheduler / display core / ...
+drm subsystem .so          dma-buf / video / module が要求する組み込み provider / ...
 ```
 
 core を `mm.so` / `sched.so` / `rcu.so` のように機能ごとへ分割しません。Linux の
@@ -204,9 +204,9 @@ subsystem 境界に沿って `.so` 化します。そのため netd-kobox が使
 保つことを優先します。
 
 target profile は必要な `.so` と `.ko` だけを manifest に列挙し、sandbox はそれだけを
-ロードします。`gpud` の VirGL 段階なら core/primitive / device-pci / virtio / drm 系
-`.so` と `virtio-gpu.ko` の dependency closure、AMDGPU 段階なら core/primitive / device-pci /
-drm 系 `.so` と AMDGPU の dependency closure を使います。filed-kobox の NVMe 段階なら
+ロードします。`gpud` の VirGL 段階なら core/primitive / device-pci / drm 系`.so`と
+DRM / virtio / virtio-gpuの`.ko` dependency closure、AMDGPU段階ならcore/primitive /
+device-pci / drm系`.so`とAMDGPUのdependency closureを使います。filed-koboxのNVMe段階なら
 core/primitive / device-pci / blk 系 `.so` と
 `nvme-core.ko` / `nvme.ko`、ext4 まで載せる段階で初めて fs `.so` と `jbd2.ko` /
 `mbcache.ko` / `crc16.ko` / `ext4.ko` を追加します。netd-kobox なら
@@ -351,7 +351,7 @@ gpud process
 GPU sandbox process  (専用 restart / IOMMU domain)
      - .so / .ko self-loader
      - Linux core/primitive .so (kernel/mm/lib の共通機構)
-     - device-pci / virtio / drm subsystem .so → virtio-gpu.ko
+     - core / device-pci / drm .so → DRM / virtio / virtio-gpu の .ko closure
      - device-pci / drm subsystem .so → amdgpu.ko (長期 profile)
 ```
 
@@ -569,7 +569,7 @@ LKL (Linux Kernel Library) が最も近い先行例です。差は全て**どの
 |  | LKL | kobox2 |
 |---|---|---|
 | 切る位置 | kernel の**下** (`arch/lkl` として arch port) | kernel の**中** (`.ko` がリンクするコアを供給) |
-| Linux module 面 | Linux core 内部なので境界ではない | 対象 `.ko` が要求する **~350** symbol |
+| Linux module 面 | Linux core 内部なので境界ではない | profile ごとに機械導出する symbol closure |
 | OS host 面 | `lkl_host_operations` **~30** | §3.6 の小さい facet 群。正確な数は未決 |
 | 得られるもの | Linux 全部 | ロードしたモジュールだけ |
 | runtime 構成 | Linux core 全体を一つの library として載せる | 選択した core `.so` + role profile の subsystem `.so` / `.ko` |
@@ -676,8 +676,8 @@ wraparound、fault、generation rollover の test が通ること。
 ### Phase 4 — `gpud` で virtio-gpu / VirGL を動かす
 
 - `gpud` を PachaOS の新規 service として作り、既存 `drmd` は開発対象から外す
-- Linux core / device-pci / virtio / drm `.so` と `virtio-gpu.ko` の dependency closure を
-  profile に固定し、GPU protocol へ接続する
+- Linux core / device-pci / drm `.so` と DRM / virtio / virtio-gpu の11個の`.ko` closureを
+  build成果物から生成し、profileに固定してGPU protocolへ接続する
 - Mesa、Xorg、Xfce の render path と sandbox crash / restart を検証する
 
 **gate:** `SUBMIT_3D > 0`、`TRANSFER_TO_HOST_2D == 0`、renderer が VirGL であり、
@@ -786,6 +786,7 @@ kobox2 はこれを**反転させます** — process 分離を恒久的な設�
 
 - [PachaOS の設計思想](./architecture.md)
 - [filed VFS design](./filed-vfs-design.md)
+- [kobox2 GPU protocol](../kobox2/docs/gpu-protocol-jp.md)
 - [Userland service ABI](./userland-service-abi.md)
 
 by Claude Opus 5

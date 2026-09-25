@@ -1,0 +1,4 @@
+# Official Void Linux binary packages; verified RSA/SHA256 signatures.
+epiphany-48.5_1.x86_64-musl.xbps a5f00e129b3fc16fe5665e2bad44e83d874bc337d2d3715f834b0c5a397281a5
+libwebkitgtk60-2.50.4_1.x86_64-musl.xbps 018c6cdd8c88b3fd2d66d06aaa4d64da2830d29576776bce81509110502e9d74
+libicu78-78.3_1.x86_64-musl.xbps 0d5d06201dab0982527708f15a9f736d4fc5ad9f265224b165309f03aec6f47c

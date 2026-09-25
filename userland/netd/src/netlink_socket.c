@@ -176,6 +176,7 @@ typedef struct netd_device_fields {
     char pci_slot_name[64];
     uint8_t input_capabilities;
     uint8_t input;
+    uint8_t action;
 } netd_device_fields_t;
 
 static int format_fits(int written, size_t capacity)
@@ -217,6 +218,7 @@ static int device_fields(uint64_t device, netd_device_fields_t *out)
         return -22;
     out->input_capabilities = descriptor.capabilities;
     out->input = 1;
+    out->action = descriptor.action;
     return 0;
 }
 
@@ -235,8 +237,10 @@ int netd_netlink_publish_device(uint64_t device)
     int status = device_fields(device, &fields);
     if (status != 0) return status;
     char header[256], action[32], devpath[320], subsystem_field[64], devname_field[128], seqnum[64];
-    snprintf(header, sizeof(header), "change@%s", fields.path);
-    snprintf(action, sizeof(action), "ACTION=change");
+    const char *event_action = fields.action == NETD_UEVENT_ADD ? "add" :
+        fields.action == NETD_UEVENT_REMOVE ? "remove" : "change";
+    snprintf(header, sizeof(header), "%s@%s", event_action, fields.path);
+    snprintf(action, sizeof(action), "ACTION=%s", event_action);
     snprintf(devpath, sizeof(devpath), "DEVPATH=%s", fields.path);
     snprintf(subsystem_field, sizeof(subsystem_field), "SUBSYSTEM=%s", fields.subsystem);
     snprintf(devname_field, sizeof(devname_field), "DEVNAME=%s", fields.devname);
@@ -275,7 +279,7 @@ int netd_netlink_publish_device(uint64_t device)
         (void)notify(socket);
         delivered++;
     }
-    printf("[netd] uevent device=%llu action=change subscribers=%u\n",
-        (unsigned long long)device, delivered);
+    printf("[netd] uevent device=%llu action=%s subscribers=%u\n",
+        (unsigned long long)device, event_action, delivered);
     return 0;
 }

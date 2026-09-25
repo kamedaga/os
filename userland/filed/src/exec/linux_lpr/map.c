@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "relocate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,6 +7,7 @@
 #include <time.h>
 
 #include "pacha/ipc.h"
+#include "pacha/syscall.h"
 #include "pacha/trace.h"
 typedef struct lpr_exec_map_metric_record {
     const char *name;
@@ -160,6 +162,7 @@ static int create_segment_vmo(uint64_t map_size, int *out_vmo_fd, unsigned char 
 
     const uint64_t rights =
         PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_MAP_READ |
@@ -446,7 +449,11 @@ enum {
     LPR_EXEC_SEGMENT_VMO_CACHE_SLOTS = 24,
     LPR_EXEC_SEGMENT_VMO_CACHE_MAX_BYTES = 8u * 1024u * 1024u,
     LPR_EXEC_MEMORY_SPAN_VMO_CACHE_SLOTS = 4,
-    LPR_EXEC_MEMORY_SPAN_VMO_CACHE_MAX_BYTES = 4u * 1024u * 1024u,
+    /* The LPR image span is about 4.7 MiB. A 4 MiB ceiling silently made
+     * every process allocate another complete runtime, including its mostly
+     * untouched state arrays. Keep room for it and the small interpreter;
+     * mappings remain PRIVATE, so mutable process state is still COW. */
+    LPR_EXEC_MEMORY_SPAN_VMO_CACHE_MAX_BYTES = 8u * 1024u * 1024u,
     LPR_EXEC_FILE_MAP_PLAN_CACHE_SLOTS = 16,
     LPR_EXEC_FILE_MAP_PLAN_MAX_SEGMENTS = 16,
 };
@@ -513,6 +520,7 @@ typedef struct lpr_exec_memory_span_vmo_cache_slot {
     uint64_t span_base;
     uint64_t span_size;
     int patch_text;
+    int relocate_runtime;
     uint64_t last_used;
     int vmo_fd;
 } lpr_exec_memory_span_vmo_cache_slot_t;
@@ -729,7 +737,8 @@ static lpr_exec_memory_span_vmo_cache_slot_t *lpr_exec_memory_span_vmo_cache_fin
     uint64_t load_bias,
     uint64_t span_base,
     uint64_t span_size,
-    int patch_text)
+    int patch_text,
+    int relocate_runtime)
 {
     if (backend_object == 0 || span_size == 0) {
         return NULL;
@@ -743,7 +752,8 @@ static lpr_exec_memory_span_vmo_cache_slot_t *lpr_exec_memory_span_vmo_cache_fin
             slot->load_bias == load_bias &&
             slot->span_base == span_base &&
             slot->span_size == span_size &&
-            slot->patch_text == patch_text)
+            slot->patch_text == patch_text &&
+            slot->relocate_runtime == relocate_runtime)
         {
             return slot;
         }
@@ -1155,6 +1165,17 @@ static int get_file_map_plan(
     return 0;
 }
 
+static int retain_cached_segment_vmo(int fd)
+{
+    /* Cache eviction can close/reuse its FD while later segments or the ELF
+     * interpreter are being prepared. A pending batch owns its own reference
+     * until commit/discard, independently of the cache entry's lifetime. */
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_EXEC;
+    const long held = pacha_syscall4(PACHA_FD_SYSCALL_DUP, (uint64_t)(uint32_t)fd, 16, rights, 0);
+    return held >= 16 ? (int)held : -12;
+}
+
 static int map_file_segment_batch(
     int process_fd,
     struct pacha_process_map_batch_entry *entries,
@@ -1169,6 +1190,17 @@ static int map_file_segment_batch(
     }
     const uint64_t map_start_ns = lpr_exec_map_now_ns();
     const int status = pacha_process_map_batch(process_fd, entries, *entry_count);
+    if (status != 0) {
+        for (uint64_t i = 0; i < *entry_count; ++i) {
+            struct pacha_fd_info info = {0};
+            const int inspected = pacha_fd_get_info((int)entries[i].vmo_fd, &info);
+            fprintf(stderr, "[filed] map batch failed index=%llu fd=%llu va=0x%llx size=%llu prot=0x%llx inspect=%d kind=%llu rights=0x%llx vmo_size=%llu\n",
+                (unsigned long long)i, (unsigned long long)entries[i].vmo_fd,
+                (unsigned long long)entries[i].target_va, (unsigned long long)entries[i].size,
+                (unsigned long long)entries[i].prot, inspected, (unsigned long long)info.kind,
+                (unsigned long long)info.rights, (unsigned long long)info.size);
+        }
+    }
     lpr_exec_map_metric_time("segment_map_batch", map_start_ns, lpr_exec_map_now_ns(), *entry_count);
     for (uint64_t i = 0; i < *entry_count; ++i) {
         if (close_fds[i] >= 16) {
@@ -1461,6 +1493,7 @@ static int lpr_exec_load_memory_image_into_process(
     uint16_t phent,
     uint64_t load_bias,
     int patch_text,
+    int relocate_runtime,
     const struct pacha_process_map_batch_entry *extra_entries,
     uint64_t extra_count,
     uint16_t *out_load_segments)
@@ -1485,7 +1518,8 @@ static int lpr_exec_load_memory_image_into_process(
             load_bias,
             span_base,
             span_size,
-            patch_text);
+            patch_text,
+            relocate_runtime);
         if (slot != NULL && slot->vmo_fd >= 16) {
             slot->last_used = lpr_exec_memory_span_vmo_cache_next_clock();
             lpr_exec_map_metric_count("memory_span_hit", span_size);
@@ -1574,6 +1608,10 @@ static int lpr_exec_load_memory_image_into_process(
             }
         }
     }
+    if (status == 0 && relocate_runtime) {
+        status = lpr_exec_relocate_runtime(mapped, span_size, span_base,
+            load_bias, phdrs, phnum, phent);
+    }
     (void)pacha_munmap(mapped, span_size);
 
     int keep_vmo_cached = 0;
@@ -1610,6 +1648,7 @@ static int lpr_exec_load_memory_image_into_process(
             slot->span_base = span_base;
             slot->span_size = span_size;
             slot->patch_text = patch_text;
+            slot->relocate_runtime = relocate_runtime;
             slot->last_used = lpr_exec_memory_span_vmo_cache_next_clock();
             slot->vmo_fd = vmo_fd;
             lpr_exec_memory_span_vmo_cache_bytes += span_size;
@@ -1659,7 +1698,8 @@ static int lpr_exec_load_file_span_vmo_into_process(
             load_bias,
             span_base,
             span_size,
-            patch_text);
+            patch_text,
+            0);
         if (slot != NULL && slot->vmo_fd >= 16) {
             slot->last_used = lpr_exec_memory_span_vmo_cache_next_clock();
             lpr_exec_map_metric_count("file_span_hit", span_size);
@@ -1840,7 +1880,8 @@ static int lpr_exec_try_map_file_span_vmo_cache(
         load_bias,
         span_base,
         span_size,
-        patch_text);
+        patch_text,
+        0);
     if (slot == NULL || slot->vmo_fd < 16) {
         lpr_exec_map_metric_count("file_span_miss", span_size);
         return 0;
@@ -1983,6 +2024,13 @@ static int lpr_exec_load_file_image_into_process(
                     segment->patch_file_size,
                     &segment_vmo_fd);
                 if (status != 0) {
+                    break;
+                }
+                close_segment_vmo = 1;
+            } else {
+                segment_vmo_fd = retain_cached_segment_vmo(segment_vmo_fd);
+                if (segment_vmo_fd < 16) {
+                    status = segment_vmo_fd;
                     break;
                 }
                 close_segment_vmo = 1;
@@ -2135,6 +2183,14 @@ int lpr_exec_prepare_file_into_map_batch(
                 if (source_span_owned) {
                     free(source_span);
                 }
+                break;
+            }
+            close_segment_vmo = 1;
+        } else {
+            segment_vmo_fd = retain_cached_segment_vmo(segment_vmo_fd);
+            if (segment_vmo_fd < 16) {
+                if (source_span_owned) free(source_span);
+                status = segment_vmo_fd;
                 break;
             }
             close_segment_vmo = 1;
@@ -2307,6 +2363,7 @@ int lpr_exec_load_image_into_process(
         e_phentsize,
         load_bias,
         patch_text,
+        0,
         NULL,
         0,
         &load_segments);
@@ -2378,6 +2435,7 @@ int lpr_exec_load_image_with_low_layout_into_process(
         e_phentsize,
         load_bias,
         patch_text,
+        1,
         &low_layout_entry,
         1,
         &load_segments);

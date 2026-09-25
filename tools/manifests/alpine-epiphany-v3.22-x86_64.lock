@@ -1,0 +1,21 @@
+# Additional packages relative to the Xfce and LibreOffice locks.
+# Alpine WebKit metadata/fallback is retained; the signed Void overlay selects
+# WebKit 2.50.4 for API 6.0 without changing GTK3 WebKit, GTK, Mesa, or fonts.
+# package-count 17
+community appstream 1.0.5-r0 98f881f451ce89bd1cef19a4ce48e17063f07cc91198f555335dd5d362989257
+community epiphany 48.5-r0 c37f1c02c925fc83b56e00195f07663538cb01bb3e25a125e20b9f739d4b29a6
+community gcr4-base 4.4.0.1-r0 388ed3d04034f0565b5f99eb1354ade940e8410907c469ff3d5fffce3a8fd7fe
+community gst-plugins-good 1.26.3-r0 b8753de5b9818617ec4ab311aa2a4b09e2491eace9869ab073d9777229e35ad7
+community libadwaita 1.7.7-r0 0bf9a82a871494a6d564beba92f90e50e639b4fe7864f7771b83386b4248ffa4
+community libavc1394 0.5.4-r3 1771f26e8f7ead494ee46b96fea7a33e8c3ea843b173f9d6444eaccfb730df84
+community libdv 1.0.0-r8 d9852c8574e216c168a276e287a494d60af674572f25537912b85747eb9e697f
+community libiec61883 1.2.0-r4 be3e1b116cd76f35fef0d363716d6bbda7bdf1308fd8ae86f02747eaf0d98dd3
+community libportal 0.9.1-r0 b180e0204f5df98999609dd44331b73456e944886740a8d05fa9ba0d68692817
+community libportal-gtk4 0.9.1-r0 bf7100b307a83eb4cfd049924fc747e2b408d6e90a0f0ad4b139d9b8ba67dee4
+main libshout 2.4.6-r3 d52517a92935b58abcc55270cdf888e357ba74e1e4f30dc052eec46d691a6010
+community libtag 2.0.2-r0 099f1fd6b7759fa9c7d8b519a9e372065e2f3ddd077639682aa1e96140b013f7
+community libxmlb 0.3.22-r0 70967f79979d9965f7aabb98e033a3ac933c655c1714248325ea6489f22444f4
+community opencore-amr 0.1.6-r1 e1d7964b55f743d79632efb5e7f18bf418c4a9a661261793ecf772afca2ce8a5
+main speex 1.2.1-r2 1be7c6f252663f3564825e53ad86466115e3b82e25e0d7d4f43e5cf3f1115d94
+community wavpack-libs 5.8.0-r0 c281765819797cf466b795de8983e6ea82e23b45cb769b9d508ef81971db576b
+community webkit2gtk-6.0 2.48.1-r1 93b94e4bf1201a4b869c9af1ed33961a15e3ebacf537ea79d952a77a391a3ec4

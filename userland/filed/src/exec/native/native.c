@@ -1,4 +1,5 @@
 #include "filed/exec_native.h"
+#include "filed/exec.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -437,18 +438,6 @@ static int filed_exec_open_absolute_path(
     }
 }
 
-static int filed_exec_set_inherit(int fd, int enabled)
-{
-    if (fd < 0) {
-        return -22;
-    }
-    const long status = pacha_fd_fcntl(
-        fd,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        enabled ? PACHA_FD_FLAG_INHERIT : 0,
-        PACHA_FD_FLAG_INHERIT);
-    return status == 0 ? 0 : -22;
-}
 
 static void filed_exec_discard_process_fd(int process_fd)
 {
@@ -461,66 +450,6 @@ static void filed_exec_discard_process_fd(int process_fd)
     }
 }
 
-static int filed_exec_prepare_inherit_fds(
-    const filed_exec_path_t *request,
-    const int *inherit_fds,
-    uint64_t inherit_fd_count,
-    int bootstrap_fd,
-    int *prepared,
-    uint64_t *out_count)
-{
-    uint64_t count = 0;
-    if (request == NULL || prepared == NULL || out_count == NULL) {
-        return -22;
-    }
-
-    if (inherit_fd_count > FILED_EXEC_MAX_INHERIT_FDS) {
-        return -22;
-    }
-    if (inherit_fd_count != 0 && inherit_fds == NULL) {
-        return -22;
-    }
-
-    if ((request->flags & FILED_EXEC_INHERIT_FDS) != 0) {
-        for (uint64_t i = 0; i < inherit_fd_count; ++i) {
-            const int fd = inherit_fds[i];
-            if (fd < 0) {
-                return -22;
-            }
-            if (filed_exec_set_inherit(fd, 1) != 0) {
-                return -13;
-            }
-            prepared[count++] = fd;
-        }
-    } else if (inherit_fd_count != 0) {
-        return -22;
-    }
-
-    if ((request->flags & FILED_EXEC_BOOTSTRAP_FD) != 0) {
-        if (bootstrap_fd < 16) {
-            return -22;
-        }
-        if (filed_exec_set_inherit(bootstrap_fd, 1) != 0) {
-            return -13;
-        }
-        prepared[count++] = bootstrap_fd;
-    }
-
-    *out_count = count;
-    return 0;
-}
-
-static void filed_exec_clear_prepared_inherit_fds(const int *prepared, uint64_t count)
-{
-    if (prepared == NULL) {
-        return;
-    }
-    for (uint64_t i = 0; i < count; ++i) {
-        if (prepared[i] >= 0) {
-            (void)filed_exec_set_inherit(prepared[i], 0);
-        }
-    }
-}
 
 static int filed_exec_read_range(
     filed_runtime_t *runtime,
@@ -1016,6 +945,7 @@ static int filed_exec_read_interpreter(
 static int filed_exec_load_image(
     filed_runtime_t *runtime,
     const filed_exec_image_t *image,
+    const struct pacha_process_fd_grant *grants, uint64_t grant_count,
     filed_exec_plan_t *plan)
 {
     char interp_path[FILED_EXEC_MAX_INTERP_BYTES];
@@ -1050,7 +980,7 @@ static int filed_exec_load_image(
         PACHA_FD_RIGHT_SPAWN |
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
-    const int process_fd = pacha_process_create(process_rights, 0);
+    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
         return -12;
     }
@@ -1247,7 +1177,7 @@ static int filed_exec_start_plan(
     if (filed_exec_push_u64(stack, &sp, 0) != 0 ||
         filed_exec_push_u64(stack, &sp, FILED_EXEC_AT_NULL) != 0 ||
         (has_bootstrap &&
-            (filed_exec_push_u64(stack, &sp, (uint64_t)(uint32_t)bootstrap_fd) != 0 ||
+            (filed_exec_push_u64(stack, &sp, FILED_EXEC_NATIVE_BOOTSTRAP_FD) != 0 ||
              filed_exec_push_u64(stack, &sp, PACHA_AT_BOOTSTRAP_FD) != 0)) ||
         filed_exec_push_u64(stack, &sp, argv0_va) != 0 ||
         filed_exec_push_u64(stack, &sp, FILED_EXEC_AT_EXECFN) != 0 ||
@@ -1343,7 +1273,7 @@ int filed_exec_native_handle(
 {
     filed_exec_image_t image;
     filed_exec_plan_t plan;
-    int prepared[FILED_EXEC_MAX_INHERIT_FDS + 1];
+    struct pacha_process_fd_grant prepared[PACHA_PROCESS_CREATE_MAX_GRANTS];
     uint64_t prepared_count = 0;
 
     if (out_process_fd != NULL) *out_process_fd = -1;
@@ -1354,7 +1284,8 @@ int filed_exec_native_handle(
 
     memset(prepared, 0, sizeof(prepared));
     uint64_t stage_start = filed_exec_now_ns();
-    int status = filed_exec_prepare_inherit_fds(
+    int status = filed_exec_build_grants(
+        runtime,
         request,
         inherit_fds,
         inherit_fd_count,
@@ -1371,24 +1302,21 @@ int filed_exec_native_handle(
     filed_exec_metric("read_image", stage_start, filed_exec_now_ns());
     if (status != 0) {
         fprintf(stderr, "[filed] exec read image failed status=%d\n", status);
-        filed_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
 
     stage_start = filed_exec_now_ns();
-    status = filed_exec_load_image(runtime, &image, &plan);
+    status = filed_exec_load_image(runtime, &image, prepared, prepared_count, &plan);
     filed_exec_metric("load_image", stage_start, filed_exec_now_ns());
     free(image.bytes);
     if (status != 0) {
         fprintf(stderr, "[filed] exec load image failed status=%d\n", status);
-        filed_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
 
     stage_start = filed_exec_now_ns();
     status = filed_exec_start_plan(&plan, request, bootstrap_fd);
     filed_exec_metric("start_plan", stage_start, filed_exec_now_ns());
-    filed_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {
         fprintf(stderr, "[filed] exec start failed status=%d\n", status);
         if (plan.thread_fd >= 16) {

@@ -11,7 +11,8 @@ const traps = @import("../traps.zig");
 const interrupts = @import("../interrupts.zig");
 const lapic = @import("../lapic.zig");
 const smp = @import("../smp.zig");
-const vtd = @import("../vtd.zig");
+const iommu = @import("../iommu.zig");
+const acpi_power = @import("../acpi_power.zig");
 const serial = @import("../serial.zig");
 const kernel_log = @import("../kernel_log.zig");
 const page_fault_log = @import("../page_fault_log.zig");
@@ -23,10 +24,9 @@ const user_vm = @import("../memory/user_vm.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const boot_static = @import("main_static.zig");
 const boot_resources = @import("boot_resources.zig");
+const boot_diag = @import("boot_diag.zig");
 const boot_scratch = @import("boot_scratch.zig");
 const image_range = @import("image_range.zig");
-const boot_abi = @import("abi.zig");
-const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
 const elf_load = @import("elf_load.zig");
 const init_setup = @import("init_setup.zig");
@@ -37,16 +37,6 @@ const TrapFrame = interrupts.TrapFrame;
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 const fd_abi = abi_root.fd_abi;
 const enable_exit_teardown_metrics = false;
-const max_pipe_close_wakes = kernel.fd_table_entries;
-
-const PendingPipeCloseWake = struct {
-    pipe: kernel.PipeRef,
-    wake_side_write: bool,
-};
-
-const PendingIpcChannelCloseWake = struct {
-    handle: kernel.IpcChannelHandle,
-};
 
 // ---------------------------------------------------------------------------
 // Boot globals
@@ -102,7 +92,8 @@ fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     start = minStaticStart(start, staticStorageStart(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
-    start = minStaticStart(start, vtd.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, iommu.kernelStaticStorageStartAddr());
+    start = minStaticStart(start, acpi_power.staticStart());
     start = minStaticStart(start, x86_platform.kernelStaticStorageStartAddr());
     return start;
 }
@@ -122,7 +113,9 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_user_spaces_storage), &limine_user_spaces_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(limine_boot_scratch_storage), &limine_boot_scratch_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(boot_rsdp_paddr), &boot_rsdp_paddr));
-    end = maxStaticEnd(end, vtd.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, iommu.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, acpi_power.staticEnd());
+    end = maxStaticEnd(end, pci.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_copy.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, user_vm.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, page_fault_log.kernelStaticStorageEndAddr());
@@ -130,6 +123,7 @@ fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, traps.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, smp.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, @import("../smp_perf.zig").staticEnd());
     end = maxStaticEnd(end, x86_platform.kernelStaticStorageEndAddr());
     return end;
 }
@@ -196,6 +190,7 @@ pub export fn restoreCurrentThreadXState() callconv(.c) void {
 fn installInterruptTrampolines() void {
     x86_platform.installInterruptTrampolines(.{
         .divide_error_stub = @intFromPtr(&traps.divideErrorHandlerStub),
+        .breakpoint_stub = @intFromPtr(&traps.breakpointHandlerStub),
         .page_fault_stub = @intFromPtr(&traps.pageFaultHandlerStub),
         .general_protection_stub = @intFromPtr(&traps.generalProtectionHandlerStub),
         .double_fault_stub = @intFromPtr(&traps.doubleFaultHandlerStub),
@@ -223,6 +218,9 @@ fn initKernelRuntimeOrHalt() void {
         if (!x86_platform.installIdentityPageTables0To1GiB()) {
             halt.haltWithMessage("page table install failed");
         }
+        // The diagnostic image alone has a mapped GOP after this CR3 switch.
+        // Limine's framebuffer pointer must never be used from here onward.
+        boot_diag.afterCr3();
         if (!user_copy.mapKernelRuntimeStorage(x86_platform.mapKernelRuntimeIdentityRange)) {
             halt.haltWithMessage("user copy runtime mapping failed");
         }
@@ -254,6 +252,10 @@ fn initKernelRuntimeOrHalt() void {
         kernel_log.write("pku: ");
         kernel_log.write(if (pku_enabled) "enabled\n" else "unavailable\n");
         x86_platform.hardenKernelMappingsSupervisorOnly();
+        pci.initEcam(boot_rsdp_paddr);
+        if (!iommu.prepareBootMmio(boot_rsdp_paddr)) {
+            halt.haltWithMessage("IOMMU boot MMIO mapping failed");
+        }
     }
     x86_platform.loadGdtAndReloadSegments();
     installInterruptTrampolines();
@@ -262,6 +264,7 @@ fn initKernelRuntimeOrHalt() void {
     if (!lapic.initTimer(boot_static.lapic_timer_vector, boot_static.lapic_timer_initial_count)) {
         halt.haltWithMessage("LAPIC timer init failed");
     }
+    kernel_log.write(if (lapic.usesX2Apic()) "lapic: mode=x2apic\n" else "lapic: mode=xapic\n");
     const timer_calibration = lapic.calibrateTimer(
         boot_static.lapic_timer_initial_count,
         boot_static.lapic_timer_rearm_overhead_ns,
@@ -287,13 +290,35 @@ fn initKernelRuntimeOrHalt() void {
     }
 }
 
+const pt_storage = @import("../memory/pt_storage.zig");
+
+fn allocatePtStoragePage(context: *anyopaque) ?pt_storage.PagePointer {
+    const free_list: *kernel.FreePageList = @ptrCast(@alignCast(context));
+    const paddr = free_list.popContiguousBelow(1, @import("../arch/x86_64/physical_layout.zig").identity_limit) catch return null;
+    return @ptrFromInt(paddr);
+}
+
+fn releasePtStoragePage(context: *anyopaque, page: pt_storage.PagePointer) bool {
+    const free_list: *kernel.FreePageList = @ptrCast(@alignCast(context));
+    free_list.appendPage(0, @intFromPtr(page)) catch return false;
+    return true;
+}
+
 fn initMemoryModules() void {
     user_space_table.init(user_spaces);
     for (user_spaces) |*space| {
-        user_vm.resetUserAddressSpaceStorage(space);
+        // First initialization owns the lock state; later address-space resets
+        // preserve it. Initialize in place to avoid a multi-MiB .{} constant.
+        space.lock_state = .{};
+        user_vm.initializeUserAddressSpaceStorage(space);
     }
 
     user_vm.init(.{
+        .pt_allocator = .{
+            .context = kernel_runtime.global_free_list,
+            .allocate = allocatePtStoragePage,
+            .release = releasePtStoragePage,
+        },
         .user_spaces = &user_space_table,
         .four_gib = boot_static.four_gib,
         .physical_map_limit = boot_static.physical_map_limit_exclusive,
@@ -345,7 +370,6 @@ pub fn prepareLimineKernelStorageOrHalt() void {
     }
 
     user_spaces = limine_user_spaces_storage[0..];
-    @memset(user_spaces, .{});
     boot_scratch.install(limine_boot_scratch_storage[0..]);
     initMemoryModules();
     if (image_range.virtual_base != 0) {
@@ -403,27 +427,6 @@ fn scrubEndpointTargets(table: *kernel.EndpointTable, target: kernel.PrincipalId
     return changed;
 }
 
-fn collectPipeCloseWakesForProcess(
-    principal: kernel.PrincipalId,
-    out: []PendingPipeCloseWake,
-) usize {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    const table = kernel_runtime.kernel_state_global.fdTableForProcessIndexConst(process_index) orelse return 0;
-    var count: usize = 0;
-    for (table.entries[0..]) |entry| {
-        if (entry.object.isNull()) continue;
-        const slot = kernel_runtime.kernel_state_global.kernelObjectSlotConst(entry.object) orelse continue;
-        const endpoint = kernel.KernelState.pipeEndpointFromPayload(&slot.payload) orelse continue;
-        if (count >= out.len) break;
-        out[count] = .{
-            .pipe = endpoint.pipe,
-            .wake_side_write = !endpoint.write,
-        };
-        count += 1;
-    }
-    return count;
-}
-
 fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
     for (targets, 0..) |target, target_index| {
         if (target.wait_token == 0 or target.group.isNull()) continue;
@@ -473,48 +476,6 @@ fn wakeThreadTargetsFromBoot(targets: []const kernel.ThreadWakeTarget) void {
     }
 }
 
-fn wakeReadyPipeCloseWaiters(pending_wakes: []const PendingPipeCloseWake) void {
-    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
-    for (pending_wakes) |pending| {
-        const ready_events = kernel_runtime.kernel_state_global.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
-        if (ready_events == 0) continue;
-        const wake_count = kernel_runtime.kernel_state_global.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
-        wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
-    }
-}
-
-fn collectIpcChannelCloseWakesForProcess(
-    principal: kernel.PrincipalId,
-    out: []PendingIpcChannelCloseWake,
-) usize {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    const table = kernel_runtime.kernel_state_global.fdTableForProcessIndexConst(process_index) orelse return 0;
-    var count: usize = 0;
-    for (table.entries[0..]) |entry| {
-        if (entry.object.isNull()) continue;
-        const slot = kernel_runtime.kernel_state_global.kernelObjectSlotConst(entry.object) orelse continue;
-        const handle = switch (slot.payload) {
-            .channel => |channel_handle| channel_handle,
-            else => continue,
-        };
-        if (count >= out.len) break;
-        out[count] = .{ .handle = handle };
-        count += 1;
-    }
-    return count;
-}
-
-fn wakeIpcChannelCloseWaiters(pending_wakes: []const PendingIpcChannelCloseWake) void {
-    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
-    for (pending_wakes) |pending| {
-        const wake_count = kernel_runtime.kernel_state_global.takeIpcChannelPeerCloseWaiters(
-            pending.handle,
-            wake_storage[0..],
-        );
-        wakeThreadTargetsFromBoot(wake_storage[0..wake_count]);
-    }
-}
-
 fn wakeTaskFdWaiters(principal: kernel.PrincipalId) void {
     var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
     const wake_count = kernel_runtime.kernel_state_global.takeTaskReadableWaitersForPrincipal(
@@ -527,21 +488,19 @@ fn wakeTaskFdWaiters(principal: kernel.PrincipalId) void {
 fn teardownFaultedProcess(principal: kernel.PrincipalId, fault_vector: u8) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
-    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
-    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(principal, pending_channel_wakes[0..]);
 
     kernel_runtime.kernel_state_global.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
 
+    @import("../syscall/fd.zig").closeProcessFdsWithWakes(.{
+        .free_list = kernel_runtime.global_free_list,
+        .write_user_u64 = user_copy.writeUserU64,
+    }, kernel_runtime.kernel_state_global, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     kernel_runtime.kernel_state_global.releasePrincipalNativeMemory(principal, kernel_runtime.global_free_list);
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     user_vm.unlockVmTransaction(principal);
-    wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
-    wakeIpcChannelCloseWaiters(pending_channel_wakes[0..pending_channel_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
 
     var endpoint_targets_removed = false;
@@ -573,15 +532,15 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
     const spawn_parent = kernel_runtime.kernel_state_global.endpointTargetFor(principal, spawn_parent_endpoint_id);
     const metric_start = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
-    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(principal, pending_pipe_wakes[0..]);
-    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(principal, pending_channel_wakes[0..]);
 
     kernel_runtime.kernel_state_global.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
     const metric_after_release_threads = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
+    @import("../syscall/fd.zig").closeProcessFdsWithWakes(.{
+        .free_list = kernel_runtime.global_free_list,
+        .write_user_u64 = user_copy.writeUserU64,
+    }, kernel_runtime.kernel_state_global, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     const metric_after_clear_as = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
@@ -590,8 +549,6 @@ fn teardownExitedProcess(principal: kernel.PrincipalId) void {
     kernel_runtime.kernel_state_global.resetProcessRuntimeTables(process_index);
     const metric_after_reset_tables = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
     user_vm.unlockVmTransaction(principal);
-    wakeReadyPipeCloseWaiters(pending_pipe_wakes[0..pending_pipe_wake_count]);
-    wakeIpcChannelCloseWaiters(pending_channel_wakes[0..pending_channel_wake_count]);
     _ = kernel_runtime.kernel_state_global.unpublishServiceEndpointsForTarget(principal);
     const metric_after_unpublish = if (enable_exit_teardown_metrics) x86_platform.readTimestampCounter() else 0;
 
@@ -777,10 +734,6 @@ pub const BootResources = struct {
     memory_stats: boot_static.MemoryStats,
 };
 
-const DetectedDevices = struct {
-    devices: [boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
-};
-
 pub const LimineSmpResources = struct {
     rsdp_paddr: u64,
     trampoline_base: u64,
@@ -789,6 +742,7 @@ pub const LimineSmpResources = struct {
 pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     boot_rsdp_paddr = smp_resources.rsdp_paddr;
     initKernelRuntimeOrHalt();
+    acpi_power.prepare(boot_rsdp_paddr);
     kernel_log.write("boot: scheduler static\n");
     scheduler.initializeStaticStorage();
     kernel_log.write("boot: idle hooks\n");
@@ -799,6 +753,11 @@ pub fn initializeLimineRuntimeOrHalt(smp_resources: LimineSmpResources) void {
     ) orelse {
         halt.haltWithMessage("SMP boot information invalid");
     };
+    for (1..smp_info.lapic_count) |cpu_slot| {
+        if (!x86_platform.allocateApRuntimeStacks(cpu_slot, kernel_runtime.global_free_list)) {
+            halt.haltWithMessage("SMP application processor stack allocation failed");
+        }
+    }
     smp.configureApSyscallEntry(@intFromPtr(&traps.syscallEntryStub));
     smp.configureApUserTimer(
         boot_static.lapic_timer_vector,
@@ -856,25 +815,10 @@ fn initKernelSubsystems(memory_stats: boot_static.MemoryStats) *kernel.KernelSta
 }
 
 // ---------------------------------------------------------------------------
-// Group 4 — device discovery
-// ---------------------------------------------------------------------------
-
-fn discoverDevices() DetectedDevices {
-    var result: DetectedDevices = .{
-        .devices = [_]?init_setup.DetectedDeviceBootstrap{null} ** boot_abi.init_bootstrap_abi.max_device_descriptors,
-    };
-
-    var descriptor_index: usize = 0;
-    appendGenericPciFunctionDevices(&result, &descriptor_index);
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------
 // Group 3 — boot process construction
 // ---------------------------------------------------------------------------
 
-fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: *DetectedDevices) void {
+fn constructBootProcesses(state: *kernel.KernelState, res: BootResources) void {
     const init_principal = state.createProcessDescriptor("seed2_boot") orelse
         halt.haltWithMessage("seed2_boot process descriptor alloc failed");
     state.setBootstrapOwner(init_principal, true) catch |err| {
@@ -891,7 +835,6 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
     init_setup.setupInitBootstrapResources(
         state,
         init_principal,
-        devs.devices[0..],
         res.bootfs_image,
         res.framebuffer_info,
         kernel_runtime.global_free_list,
@@ -913,6 +856,9 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources, devs: 
         "init ELF load failed\n",
         kernel_runtime.global_free_list,
     );
+    // ELF and bootfs staging are released before this long-lived catalog.
+    if (!pci.captureBootFunctions())
+        halt.haltWithMessage("PCI function catalog capture failed");
     const init_thread = scheduler.threadForPrincipal(init_principal).?;
     const init_ctx = scheduler.threadContextMutable(init_thread).?;
     init_ctx.frame.rip = loaded_init.entry;
@@ -975,116 +921,38 @@ pub fn prepareBootPrelude() void {
     boot_init_principal = null;
 }
 
-pub fn bootWithResources(resources: BootResources) noreturn {
+pub fn bootWithResources(resources: BootResources, comptime checkpoint: fn (u8) void) noreturn {
     kernel_log.writeOnly("boot: bootWithResources entry\n");
     kernel_log.write("boot: init subsystems\n");
     const state = initKernelSubsystems(resources.memory_stats);
-    vtd.init(boot_rsdp_paddr, kernel_runtime.global_free_list);
-    kernel_log.write("boot: discover devices\n");
-    var devices = discoverDevices();
+    const highres_ready = @import("../realtime_clock.zig").initializeHighResolution(
+        boot_rsdp_paddr,
+        smp.ucMinusMmioAllowed,
+    );
+    const clock = @import("../realtime_clock.zig");
+    kernel_log.writeFmt("clock: pvclock stable-mask=0x{x} online-mask=0x{x}\n", .{ clock.stableCpuMask(), smp.onlineCpuMask() });
+    if (highres_ready) {
+        kernel_log.writeFmt("clock: monotonic={s} deadline=lapic high-resolution=1\n", .{
+            if (clock.usesStableKvmClock()) "kvm" else "hpet",
+        });
+    } else {
+        kernel_log.write("clock: monotonic=tick high-resolution=0\n");
+    }
+    checkpoint('E');
+    iommu.init(boot_rsdp_paddr, kernel_runtime.global_free_list, checkpoint);
+    checkpoint('F');
     kernel_log.write("boot: construct processes\n");
-    constructBootProcesses(state, resources, &devices);
+    constructBootProcesses(state, resources);
+    checkpoint('G');
     kernel_log.write("boot: wire runtime\n");
     wireRuntimeSubsystems(state, resources.memory_stats);
 
     const boot_ctx = scheduler.threadContext(scheduler.currentThread()).?;
     kernel_log.write("boot: enter user\n");
+    checkpoint('H');
+    // The isolated diagnostic ELF has no serial cable on the target machine.
+    // Mirror subsequent existing log lines until userland owns the GOP, so
+    // an early user fault and a late console failure are distinguishable.
+    boot_diag.startPostUserLogMirror();
     enterUserModeIretq(boot_ctx.frame.rip, boot_ctx.frame.rsp);
-}
-
-// ---------------------------------------------------------------------------
-// Helper: generic PCI device export
-// ---------------------------------------------------------------------------
-
-const virtio_vendor_id: u16 = 0x1AF4;
-
-fn appendGenericPciFunctionDevices(result: *DetectedDevices, descriptor_index: *usize) void {
-    var bus: u16 = 0;
-    while (bus < 256) : (bus += 1) {
-        var device: u8 = 0;
-        while (device < 32) : (device += 1) {
-            const func0 = pci.Location{
-                .bus = @intCast(bus),
-                .device = device,
-                .function = 0,
-            };
-            if (pci.readVendorId(func0) == 0xFFFF) continue;
-            const header0 = pci.readHeaderType(func0);
-            const function_count: u8 = if ((header0 & 0x80) != 0) 8 else 1;
-            var function: u8 = 0;
-            while (function < function_count) : (function += 1) {
-                const loc = pci.Location{
-                    .bus = @intCast(bus),
-                    .device = device,
-                    .function = function,
-                };
-                const vendor_id = pci.readVendorId(loc);
-                if (vendor_id == 0xFFFF) continue;
-                if (!shouldExposeGenericPciFunction(loc, vendor_id)) continue;
-                if (descriptor_index.* >= boot_abi.init_bootstrap_abi.max_device_descriptors) return;
-                const resource_id = pci.resourceIdFromLocation(loc);
-                if (!pci.registerInterruptRoute(resource_id, descriptor_index.*)) {
-                    halt.haltWithMessage("PCI interrupt route registration failed");
-                }
-                appendDetectedDevice(&result.devices, .{
-                    .descriptor = descriptorFromPciFunction(loc, init_bootstrap_layout.deviceConfigSourceVa(descriptor_index.*), resource_id),
-                    .dma_device = resource_id,
-                });
-                descriptor_index.* += 1;
-            }
-        }
-    }
-}
-
-fn shouldExposeGenericPciFunction(loc: pci.Location, vendor_id: u16) bool {
-    _ = vendor_id;
-    if (pci.readClassCode(loc) == 0x06) return false;
-    return true;
-}
-
-fn descriptorFromPciFunction(
-    loc: pci.Location,
-    bootstrap_source_va: u64,
-    resource_id: kernel.DmaDeviceId,
-) boot_abi.init_bootstrap_abi.DeviceDescriptor {
-    return .{
-        .transport = @intFromEnum(boot_abi.init_bootstrap_abi.DeviceTransport.pci_function),
-        .flags = 0,
-        .bootstrap_source_va = bootstrap_source_va,
-        .vendor_id = pci.readVendorId(loc),
-        .device_id = pci.readDeviceId(loc),
-        .subsystem_id = pci.readSubsystemId(loc),
-        .pci_bus = loc.bus,
-        .pci_device = loc.device,
-        .pci_function = loc.function,
-        .resource_id = resource_id,
-        .queue_count = 0,
-        .common_page_paddr = 0,
-        .notify_page_paddr = 0,
-        .isr_page_paddr = 0,
-        .device_page_paddr = 0,
-        .common_page_offset = 0,
-        .notify_page_offset = 0,
-        .isr_page_offset = 0,
-        .device_page_offset = 0,
-        .notify_off_multiplier = 0,
-        .init_iommu_token = 0,
-        .init_queue_grant_count = 0,
-        .init_queue_grants = [_]boot_abi.init_bootstrap_abi.DeviceQueueGrant{.{}} ** boot_abi.init_bootstrap_abi.max_device_queue_grants,
-        .init_command_token = 0,
-        .init_device_fd = 0,
-    };
-}
-
-fn appendDetectedDevice(
-    devices: *[boot_abi.init_bootstrap_abi.max_device_descriptors]?init_setup.DetectedDeviceBootstrap,
-    detected: init_setup.DetectedDeviceBootstrap,
-) void {
-    for (devices) |*entry| {
-        if (entry.* == null) {
-            entry.* = detected;
-            return;
-        }
-    }
-    halt.haltWithMessage("init bootstrap device table full");
 }

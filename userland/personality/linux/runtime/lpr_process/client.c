@@ -11,6 +11,8 @@
 #include <personality/linux_lpr.h>
 #include <stdint.h>
 
+static int lpr_process_control_fd = -1;
+
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
 static char *lpr_process_rpc_diag_text(
     char *out, const char *end, const char *text)
@@ -83,7 +85,11 @@ void *lpr_process_client_payload(void *page)
     return page == 0 ? 0 : (void *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES);
 }
 
-int64_t lpr_process_client_call_with_reply_fd(
+/* The rights a transferred descriptor carries are the receiver's whole
+ * authority over it, so the caller names them.  Handing every transfer the
+ * union of what any receiver might need would give a process capability the
+ * right to be mapped, which no receiver has a use for. */
+int64_t lpr_process_client_call_with_transfer_rights(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
     uint32_t op,
@@ -91,6 +97,7 @@ int64_t lpr_process_client_call_with_reply_fd(
     void *page,
     uint32_t payload_size,
     int transfer_fd,
+    uint64_t transfer_rights,
     uint64_t *out_result,
     int *out_reply_fd)
 {
@@ -102,6 +109,7 @@ int64_t lpr_process_client_call_with_reply_fd(
     {
         return -LPR_LINUX_EINVAL;
     }
+    if (lpr_process_control_fd < 16) return -LPR_LINUX_ENOTCONN;
 
     struct pacha_ipc_fd fds[2];
     uint64_t fd_count = 0;
@@ -128,13 +136,7 @@ int64_t lpr_process_client_call_with_reply_fd(
     fd_count++;
     if (transfer_fd >= 16) {
         fds[fd_count].fd = (uint64_t)(uint32_t)transfer_fd;
-        fds[fd_count].rights =
-            PACHA_FD_RIGHT_INSPECT |
-            PACHA_FD_RIGHT_TRANSFER |
-            PACHA_FD_RIGHT_WAIT |
-            PACHA_FD_RIGHT_POLL |
-            PACHA_FD_RIGHT_CLOSE |
-            PACHA_FD_RIGHT_KILL;
+        fds[fd_count].rights = transfer_rights;
         fd_count++;
     }
 
@@ -146,10 +148,10 @@ int64_t lpr_process_client_call_with_reply_fd(
         .fds = fds,
         .fd_count = fd_count,
     };
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
-        LPR_SUPERVISOR_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&request);
+    /* Session acquisition can arrive concurrently from every Linux thread.
+     * As with socket RPCs, wait only for explicit pre-enqueue backpressure. */
+    const int64_t reply_fd = lpr_native_ipc_call_wait(
+        (uint64_t)(uint32_t)lpr_process_control_fd, &request);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (op == LPRS_OP_PROCESS_WAIT4) {
         lpr_process_rpc_diag("call-return", request_id, reply_fd, 0, 0, 0);
@@ -165,7 +167,7 @@ int64_t lpr_process_client_call_with_reply_fd(
             reply_fd,
             request_id,
             fd_count,
-            LPR_SUPERVISOR_ENDPOINT_FD,
+            (uint64_t)(uint32_t)lpr_process_control_fd,
             0,
             "lpr process supervisor ipc_call failed");
         return err;
@@ -267,6 +269,40 @@ int64_t lpr_process_client_call_with_reply_fd(
     return 0;
 }
 
+/* What a service needs to own and watch a descriptor handed to it: the rights
+ * every existing transfer already relied on. */
+#define LPR_TRANSFER_RIGHTS_DEFAULT ( \
+    PACHA_FD_RIGHT_INSPECT | \
+    PACHA_FD_RIGHT_TRANSFER | \
+    PACHA_FD_RIGHT_WAIT | \
+    PACHA_FD_RIGHT_POLL | \
+    PACHA_FD_RIGHT_CLOSE | \
+    PACHA_FD_RIGHT_KILL)
+
+int64_t lpr_process_client_call_with_reply_fd(
+    uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t status),
+    uint32_t op,
+    int page_fd,
+    void *page,
+    uint32_t payload_size,
+    int transfer_fd,
+    uint64_t *out_result,
+    int *out_reply_fd)
+{
+    return lpr_process_client_call_with_transfer_rights(
+        request_counter,
+        status_to_errno,
+        op,
+        page_fd,
+        page,
+        payload_size,
+        transfer_fd,
+        LPR_TRANSFER_RIGHTS_DEFAULT,
+        out_result,
+        out_reply_fd);
+}
+
 int64_t lpr_process_client_call(
     uint64_t *request_counter,
     int64_t (*status_to_errno)(int64_t status),
@@ -287,6 +323,106 @@ int64_t lpr_process_client_call(
         transfer_fd,
         out_result,
         0);
+}
+
+int64_t lpr_process_client_activate(uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t), int bootstrap_fd, uint64_t token,
+    int page_fd, void *page)
+{
+    if (bootstrap_fd < 16 || bootstrap_fd >= PACHAOS_FD_TABLE_LIMIT || !token || !page) return -LPR_LINUX_EINVAL;
+    /* This is a single-threaded startup operation, including fork children.
+     * A copied parent descriptor number is never used for child requests. */
+    lpr_process_control_fd = bootstrap_fd;
+    lprs_token_request_t *payload = lpr_process_client_payload(page);
+    *payload = (lprs_token_request_t){ .token = token };
+    int control = -1;
+    int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
+        LPRS_OP_PROCESS_ACTIVATE, page_fd, page, sizeof(*payload), -1, NULL, &control);
+    lpr_process_control_fd = -1;
+    if (status != 0) return status;
+    struct pacha_fd_info info;
+    const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    if (control < 16 || control >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
+            (uint64_t)(uint32_t)control, (uint64_t)(uintptr_t)&info) != 0 ||
+        info.kind != PACHA_FD_KIND_CHANNEL || info.rights != allowed ||
+        info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
+        if (control >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)control);
+        return -LPR_LINUX_EIO;
+    }
+    lpr_process_control_fd = control;
+    /* Caller owns the disconnected bootstrap FD. Initial boot keeps its
+     * fixed-slot reservation; fork/exec close their dynamic handoff. */
+    return 0;
+}
+
+int64_t lpr_process_client_prepare_exec(uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t), uint64_t token,
+    int page_fd, void *page, int *out_bootstrap_fd)
+{
+    if (!token || !page || !out_bootstrap_fd) return -LPR_LINUX_EINVAL;
+    *out_bootstrap_fd = -1;
+    lprs_token_request_t *payload = lpr_process_client_payload(page);
+    *payload = (lprs_token_request_t){ .token = token };
+    int bootstrap = -1;
+    int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
+        LPRS_OP_PROCESS_EXEC_PREPARE, page_fd, page, sizeof(*payload), -1, NULL, &bootstrap);
+    if (status != 0) return status;
+    struct pacha_fd_info info;
+    const uint64_t allowed = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    if (bootstrap < 16 || bootstrap >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
+            (uint64_t)(uint32_t)bootstrap, (uint64_t)(uintptr_t)&info) != 0 ||
+        info.kind != PACHA_FD_KIND_CHANNEL || info.rights != allowed ||
+        info.flags != PACHA_FD_FLAG_PRIVATE) {
+        if (bootstrap >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
+            (uint64_t)(uint32_t)bootstrap);
+        /* A successful PREPARE reply owns this reservation, even if the
+         * returned capability fails validation. Do not strand it. */
+        *payload = (lprs_token_request_t){ .token = token };
+        (void)lpr_process_client_call(request_counter, status_to_errno,
+            LPRS_OP_PROCESS_EXEC_COMMIT_CANCEL, page_fd, page, sizeof(*payload), -1, NULL);
+        return -LPR_LINUX_EIO;
+    }
+    *out_bootstrap_fd = bootstrap;
+    return 0;
+}
+
+int64_t lpr_process_client_service_session(uint32_t op, uint64_t *request_counter,
+    int64_t (*status_to_errno)(int64_t), uint64_t token,
+    int page_fd, void *page, uint64_t *out_session, int *out_fd)
+{
+    if (!token || !page || !out_session || !out_fd) return -LPR_LINUX_EINVAL;
+    *out_session = 0;
+    *out_fd = -1;
+    lprs_token_request_t *payload = lpr_process_client_payload(page);
+    *payload = (lprs_token_request_t){ .token = token };
+    int fd = -1;
+    uint64_t session = 0;
+    const int64_t status = lpr_process_client_call_with_reply_fd(request_counter, status_to_errno,
+        op, page_fd, page, sizeof(*payload), -1, &session, &fd);
+    if (status != 0) return status;
+    struct pacha_fd_info info;
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    if (!session || fd < 16 || fd >= PACHAOS_FD_TABLE_LIMIT || lpr_pacha_syscall2(PACHAOS_SYSCALL_FD_GET_INFO,
+            (uint64_t)(uint32_t)fd, (uint64_t)(uintptr_t)&info) != 0 ||
+        info.kind != PACHA_FD_KIND_CHANNEL || info.rights != rights ||
+        info.flags != (PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC)) {
+        if (fd >= 16) (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)fd);
+        return -LPR_LINUX_EIO;
+    }
+    *out_session = session;
+    *out_fd = fd;
+    return 0;
+}
+
+int64_t lpr_process_client_unix_session(uint64_t *counter,
+    int64_t (*convert)(int64_t), uint64_t token,
+    int page_fd, void *page, uint64_t *session, int *fd)
+{
+    return lpr_process_client_service_session(LPRS_OP_PROCESS_UNIX_SESSION,
+        counter, convert, token, page_fd, page, session, fd);
 }
 
 int64_t lpr_process_client_call_token(

@@ -100,6 +100,13 @@ typedef struct inputd_frame_timing {
 typedef struct inputd_registry_entry {
     struct inputd_public_device public_device;
     uint32_t kobox_device_id;
+    uint64_t source_id;
+    uint64_t source_generation;
+    uint32_t source_local_id;
+    int active;
+    int seen;
+    int announced;
+    kb_input_device_snapshot_t source_snapshot;
     uint64_t grabbed_handle;
     uint32_t handle_mask;
     uint32_t stage_count;
@@ -113,6 +120,8 @@ typedef struct inputd_registry_entry {
 } inputd_registry_entry_t;
 
 static struct inputd_input_island *active_island;
+static uint32_t next_source_device_id = UINT32_MAX;
+static uint64_t next_source_stable_id = UINT64_C(1) << 63;
 
 static void bump_wait_generation(void)
 {
@@ -186,7 +195,8 @@ static inputd_registry_entry_t *lookup_registry_by_event(uint32_t event_index)
     if (active_island == NULL || active_island->registry == NULL) return NULL;
     inputd_registry_entry_t *registry = active_island->registry;
     for (uint32_t i = 0; i < active_island->device_count; i++)
-        if (registry[i].public_device.event_index == event_index) return &registry[i];
+        if (registry[i].active &&
+            registry[i].public_device.event_index == event_index) return &registry[i];
     return NULL;
 }
 
@@ -201,6 +211,12 @@ static inputd_registry_entry_t *lookup_registry_by_device_id(uint32_t device_id)
 
 static int lookup_device_by_id(uint32_t id, kb_input_device_snapshot_t *out)
 {
+    inputd_registry_entry_t *source = lookup_registry_by_device_id(id);
+    if (source && source->source_id) {
+        if (!source->active) return -19;
+        *out = source->source_snapshot;
+        return 0;
+    }
     inputd_device_lookup_t lookup = {
         .find_by_id = 1,
         .wanted_id = id,
@@ -385,6 +401,209 @@ static uint32_t input_capabilities(const kb_input_device_snapshot_t *device)
     return capabilities;
 }
 
+static inputd_registry_entry_t *source_entry(struct inputd_input_island *island,
+    uint64_t source_id, uint64_t generation, uint32_t local_id)
+{
+    inputd_registry_entry_t *registry = island->registry;
+    for (uint32_t i = 0; i < island->device_count; i++)
+        if (registry[i].active && registry[i].source_id == source_id &&
+            registry[i].source_generation == generation &&
+            registry[i].source_local_id == local_id)
+            return &registry[i];
+    return NULL;
+}
+
+static int copy_source_snapshot(kb_input_device_snapshot_t *target,
+    uint32_t id, const struct kobox_linux_input_device_info *source)
+{
+    if (!source->id || !memchr(source->name, 0, sizeof(source->name)) ||
+        !memchr(source->phys, 0, sizeof(source->phys)) ||
+        !memchr(source->uniq, 0, sizeof(source->uniq))) return -22;
+    memset(target, 0, sizeof(*target));
+    target->active = 1;
+    target->id = id;
+    target->opened = 1;
+    memcpy(target->name, source->name, sizeof(target->name));
+    memcpy(target->phys, source->phys, sizeof(target->phys));
+    memcpy(target->uniq, source->uniq, sizeof(target->uniq));
+    target->input_id = (kb_input_id_t){.bustype = source->bus,
+        .vendor = source->vendor, .product = source->product,
+        .version = source->version};
+    target->prop_bits = source->property_bits;
+    target->event_bits = source->event_bits;
+    memcpy(target->key_bits, source->key_bits, sizeof(target->key_bits));
+    memcpy(target->key_state, source->key_state, sizeof(target->key_state));
+    target->rel_bits = source->rel_bits;
+    target->abs_bits = source->abs_bits;
+    target->msc_bits = source->msc_bits;
+    target->led_bits = source->led_bits;
+    target->snd_bits = source->snd_bits;
+    target->sw_bits = source->sw_bits;
+    target->led_state = source->led_state;
+    target->snd_state = source->snd_state;
+    target->sw_state = source->sw_state;
+    for (unsigned axis = 0; axis < KB_INPUT_ABS_MAX; axis++) {
+        target->abs[axis].active = !!(source->abs_bits & (UINT64_C(1) << axis));
+        target->abs[axis].value = source->abs_value[axis];
+    }
+    return 0;
+}
+
+int inputd_input_source_begin(struct inputd_input_island *island,
+    uint64_t source_id, uint64_t generation, int lost_events)
+{
+    if (!island || !island->ready || !source_id || !generation) return -22;
+    inputd_registry_entry_t *registry = island->registry;
+    for (uint32_t i = 0; i < island->device_count; i++) {
+        inputd_registry_entry_t *entry = &registry[i];
+        if (!entry->active || entry->source_id != source_id) continue;
+        entry->seen = 0;
+        if (lost_events && entry->source_generation == generation) {
+            const kb_input_event_t dropped = {.device_id = entry->kobox_device_id,
+                .type = INPUTD_EV_SYN, .code = INPUTD_SYN_DROPPED};
+            const kb_input_event_t report = {.device_id = entry->kobox_device_id,
+                .type = INPUTD_EV_SYN, .code = INPUTD_SYN_REPORT};
+            stage_event(&dropped, monotonic_ns());
+            stage_event(&report, monotonic_ns());
+        }
+    }
+    return 0;
+}
+
+int inputd_input_source_device(struct inputd_input_island *island,
+    uint64_t source_id, uint64_t generation,
+    uint16_t pci_segment, uint8_t pci_bus, uint8_t pci_device, uint8_t pci_function,
+    const struct kobox_linux_input_device_info *info,
+    struct inputd_public_device *published)
+{
+    if (!island || !island->ready || !source_id || !generation || !info ||
+        !published || !info->id || pci_device > 31 || pci_function > 7 ||
+        !memchr(info->name, 0, sizeof(info->name)) ||
+        !memchr(info->phys, 0, sizeof(info->phys)) ||
+        !memchr(info->uniq, 0, sizeof(info->uniq)))
+        return -22;
+    inputd_registry_entry_t *entry = source_entry(island, source_id, generation, info->id);
+    const int fresh = entry == NULL;
+    int appended = 0;
+    if (fresh) {
+        if (next_source_device_id == 0)
+            return -28;
+        /* Recycle a detached event index only after its last open handle is
+         * gone; otherwise a hotplug could silently retarget an old fd. */
+        uint32_t slot = island->device_count;
+        inputd_registry_entry_t *registry = island->registry;
+        for (uint32_t i = 0; i < island->device_count; i++) {
+            if (registry[i].active) continue;
+            int held = 0;
+            for (size_t h = 0; h < INPUTD_HANDLE_MAX; h++)
+                if (handles[h].active &&
+                    handles[h].device_id == registry[i].kobox_device_id)
+                    held = 1;
+            if (!held) { slot = i; break; }
+        }
+        if (slot == island->device_count) {
+            if (island->device_count >= UINT16_MAX) return -28;
+            size_t count = (size_t)island->device_count + 1;
+            void *grown = realloc(island->registry,
+                count * sizeof(inputd_registry_entry_t));
+            if (!grown) return -12;
+            island->registry = grown;
+            island->device_count++;
+            appended = 1;
+        }
+        entry = &((inputd_registry_entry_t *)island->registry)[slot];
+        memset(entry, 0, sizeof(*entry));
+        entry->kobox_device_id = next_source_device_id--;
+        entry->source_id = source_id;
+        entry->source_generation = generation;
+        entry->source_local_id = info->id;
+        entry->public_device = (struct inputd_public_device){
+            .stable_id = next_source_stable_id++,
+            .event_index = slot,
+            .generation = 1,
+            .pci_segment = pci_segment, .pci_bus = pci_bus,
+            .pci_device = pci_device, .pci_function = pci_function,
+        };
+    }
+    int result = copy_source_snapshot(&entry->source_snapshot,
+        entry->kobox_device_id, info);
+    if (result) {
+        if (appended) island->device_count--;
+        return result;
+    }
+    entry->public_device.capabilities = input_capabilities(&entry->source_snapshot);
+    entry->active = 1;
+    entry->seen = 1;
+    *published = entry->public_device;
+    return !entry->announced;
+}
+
+int inputd_input_source_mark_published(struct inputd_input_island *island,
+    uint64_t source_id, uint64_t generation, uint32_t local_id)
+{
+    if (!island || !source_id || !generation || !local_id) return -22;
+    inputd_registry_entry_t *entry = source_entry(island, source_id,
+        generation, local_id);
+    if (!entry) return -19;
+    entry->announced = 1;
+    return 0;
+}
+
+int inputd_input_source_end(struct inputd_input_island *island,
+    uint64_t source_id, uint64_t generation,
+    int (*removed)(const struct inputd_public_device *, void *), void *context)
+{
+    if (!island || !island->ready || !source_id || !generation) return -22;
+    inputd_registry_entry_t *registry = island->registry;
+    for (uint32_t i = 0; i < island->device_count; i++) {
+        inputd_registry_entry_t *entry = &registry[i];
+        if (!entry->active || entry->source_id != source_id || entry->seen)
+            continue;
+        if (removed) {
+            int result = removed(&entry->public_device, context);
+            if (result) return result;
+        }
+        entry->active = 0;
+        for (size_t h = 0; h < INPUTD_HANDLE_MAX; h++) {
+            if (!handles[h].active || handles[h].device_id != entry->kobox_device_id)
+                continue;
+            handles[h].readable = 1;
+            notify_ready_mask |= UINT32_C(1) << h;
+        }
+    }
+    flush_notify_edges();
+    return 0;
+}
+
+int inputd_input_source_events(struct inputd_input_island *island,
+    uint64_t source_id, uint64_t generation,
+    const struct kobox_linux_input_record *records, size_t count)
+{
+    if (!island || !island->ready || !source_id || !generation ||
+        (!records && count) || count > INPUTD_SOURCE_RECORD_MAX) return -22;
+    for (size_t i = 0; i < count; i++) {
+        const struct kobox_linux_input_record *record = &records[i];
+        if (record->kind != KOBOX_INPUT_EVENT) return -22;
+        inputd_registry_entry_t *entry = source_entry(island,
+            source_id, generation, record->device_id);
+        if (!entry) return -116;
+        const kb_input_event_t event = {.device_id = entry->kobox_device_id,
+            .type = record->type, .code = record->code, .value = record->value};
+        if (record->type == INPUTD_EV_KEY &&
+            record->code < KB_INPUT_KEY_WORDS * 64) {
+            uint64_t bit = UINT64_C(1) << (record->code % 64);
+            if (record->value)
+                entry->source_snapshot.key_state[record->code / 64] |= bit;
+            else
+                entry->source_snapshot.key_state[record->code / 64] &= ~bit;
+        } else if (record->type == 3 && record->code < KB_INPUT_ABS_MAX) {
+            entry->source_snapshot.abs[record->code].value = record->value;
+        }
+        stage_event(&event, record->monotonic_ns);
+    }
+    return 0;
+}
+
 static int compare_registry_entry(const void *left, const void *right)
 {
     const struct inputd_public_device *a =
@@ -438,6 +657,7 @@ static int build_input_registry(
             .pci_function = devices[i].pci_function,
         };
         registry[i].kobox_device_id = snapshots[i].id;
+        registry[i].active = 1;
     }
     qsort(registry, cfg->device_count, sizeof(*registry), compare_registry_entry);
     for (uint32_t i = 0; i < cfg->device_count; i++) {
@@ -471,8 +691,15 @@ int inputd_input_island_init(
     struct inputd_input_island *island,
     const struct inputd_boot_config *cfg)
 {
-    if (island == NULL || cfg == NULL || cfg->device_count == 0) return -22;
+    if (island == NULL || cfg == NULL) return -22;
     memset(island, 0, sizeof(*island));
+    /* Device discovery is independent of controller discovery. A USB-only
+     * boot has no legacy virtio-input function at startup. */
+    if (cfg->device_count == 0) {
+        active_island = island;
+        island->ready = 1;
+        return 0;
+    }
     (void)setenv("KOBOX_DEVICE_BACKEND", "pachaos", 1);
     (void)setenv("KOBOX_PCI_LAYOUT", "arch68", 1);
     (void)setenv("KOBOX_VIRTIO_NO_INDIRECT", "1", 1);
@@ -750,6 +977,7 @@ int inputd_input_read(inputd_read_request_t *request)
     if (capacity == 0) return -22;
 
     inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+    if (entry && !entry->active) return -19;
     const uint64_t earliest = event_count == 0 ? next_sequence : event_ring[event_head].sequence;
     if (handle->resync_report_pending && request->event_count < capacity) {
         copy_event_time(handle, &handle->resync_report,
@@ -981,7 +1209,9 @@ int inputd_input_poll(inputd_poll_request_t *request)
     if (request == NULL) return -22;
     inputd_handle_t *handle = find_handle(request->handle);
     if (handle == NULL) return -9;
-    request->revents = handle->readable ? request->events & INPUTD_POLLIN : 0;
+    inputd_registry_entry_t *entry = lookup_registry_by_device_id(handle->device_id);
+    request->revents = entry && !entry->active ? INPUTD_POLLHUP :
+        handle->readable ? request->events & INPUTD_POLLIN : 0;
     return 0;
 }
 

@@ -1,5 +1,6 @@
 #include "filed/exec_linux_lpr.h"
 #include "internal.h"
+#include "filed/exec.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -459,6 +460,7 @@ static int load_plan(
     filed_runtime_t *runtime,
     const lpr_exec_file_t *main_file,
     const lpr_exec_meta_t *main_meta,
+    const struct pacha_process_fd_grant *grants, uint64_t grant_count,
     lpr_exec_plan_t *plan)
 {
     const lpr_exec_image_t *lpr_image = NULL;
@@ -506,7 +508,7 @@ static int load_plan(
         PACHA_FD_RIGHT_MAP_INTO |
         PACHA_FD_RIGHT_SET_CONTEXT;
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    const int process_fd = pacha_process_create(process_rights, 0);
+    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     LPR_EXEC_STAGE_RECORD("process_create", stage_start, stage_start_cycles);
     if (process_fd < 16) {
         fprintf(stderr,
@@ -647,7 +649,7 @@ static int lpr_exec_prewarm_runtime(filed_runtime_t *runtime)
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_KILL |
         PACHA_FD_RIGHT_MAP_INTO;
-    const int process_fd = pacha_process_create(process_rights, 0);
+    const int process_fd = pacha_process_create(process_rights, 0, NULL, 0);
     if (process_fd < 16) {
         return -12;
     }
@@ -793,9 +795,14 @@ static int filed_exec_linux_lpr_handle_mode(
     lpr_exec_script_file_context_t script_context;
     unsigned char script_prefix[LPR_EXEC_SCRIPT_PREFIX_BYTES];
     char executable_path[FILED_PATH_BYTES];
-    int prepared[FILED_EXEC_MAX_INHERIT_FDS + 1];
+    struct pacha_process_fd_grant prepared[PACHA_PROCESS_CREATE_MAX_GRANTS];
     uint64_t prepared_count = 0;
     size_t script_prefix_length = 0;
+#if defined(FILED_GUI_PROFILE) && FILED_GUI_PROFILE
+    uint64_t gui_stage_before[LPR_EXEC_STAGE_MAX];
+    for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i)
+        gui_stage_before[i] = lpr_exec_stage_metrics[i].total_cycles;
+#endif
 
     if (out_process_fd != NULL) *out_process_fd = -1;
     if (out_thread_fd != NULL) *out_thread_fd = -1;
@@ -826,7 +833,7 @@ static int filed_exec_linux_lpr_handle_mode(
     uint64_t load_plan_cycles = 0;
     uint64_t start_plan_cycles = 0;
     uint64_t total_before_reply_cycles = 0;
-    int status = lpr_exec_prepare_inherit_fds(request, inherit_fds, inherit_fd_count, bootstrap_fd, prepared, &prepared_count);
+    int status = filed_exec_build_grants(runtime, request, inherit_fds, inherit_fd_count, bootstrap_fd, prepared, &prepared_count);
     LPR_EXEC_STAGE_RECORD_TO("prepare_inherit_fds", stage_start, stage_start_cycles, prepare_inherit_cycles);
     if (status != 0) {
         return status;
@@ -836,7 +843,6 @@ static int filed_exec_linux_lpr_handle_mode(
     LPR_EXEC_STAGE_RECORD_TO("init_main_file", stage_start, stage_start_cycles, init_main_file_cycles);
     if (status != 0) {
         fprintf(stderr, "[filed] linux-lpr: init main file failed status=%d\n", status);
-        lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
@@ -873,11 +879,10 @@ static int filed_exec_linux_lpr_handle_mode(
         if (script_context.owns_file) {
             lpr_exec_close_file(runtime, &file);
         }
-        lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    status = load_plan(runtime, &file, &meta, &plan);
+    status = load_plan(runtime, &file, &meta, prepared, prepared_count, &plan);
     LPR_EXEC_STAGE_RECORD_TO("load_plan", stage_start, stage_start_cycles, load_plan_cycles);
     lpr_exec_free_meta(&meta);
     if (script_context.owns_file) {
@@ -890,13 +895,11 @@ static int filed_exec_linux_lpr_handle_mode(
             (unsigned long long)file.size,
             (unsigned long long)file.backend_object,
             (unsigned long long)file.object_generation);
-        lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = lpr_exec_start_plan(&plan, &resolved_request, bootstrap_fd, start_thread);
     LPR_EXEC_STAGE_RECORD_TO("start_plan", stage_start, stage_start_cycles, start_plan_cycles);
-    lpr_exec_clear_prepared_inherit_fds(prepared, prepared_count);
     if (status != 0) {
         fprintf(stderr, "[filed] linux-lpr: start plan failed status=%d\n", status);
         if (plan.thread_fd >= 16) {
@@ -921,6 +924,20 @@ static int filed_exec_linux_lpr_handle_mode(
         read_main_meta_cycles,
         load_plan_cycles,
         start_plan_cycles);
+#if defined(FILED_GUI_PROFILE) && FILED_GUI_PROFILE
+    /* Existing stage timers, restricted to these executables. Parent stages
+     * contain their children and must not be summed with them by the reader. */
+    const char *gui_base = strrchr(request->path, '/');
+    gui_base = gui_base != NULL ? gui_base + 1 : request->path;
+    if (strcmp(gui_base, "gtk4-demo") == 0 || strcmp(gui_base, "xfce4-terminal") == 0) {
+        for (unsigned i = 0; i < LPR_EXEC_STAGE_MAX; ++i) {
+            const uint64_t span = lpr_exec_stage_metrics[i].total_cycles - gui_stage_before[i];
+            if (span != 0)
+                fprintf(stderr, "[gui-exec-cycles] %s %s %llu\n", gui_base,
+                    lpr_exec_stage_metrics[i].name, (unsigned long long)span);
+        }
+    }
+#endif
     return 0;
 }
 

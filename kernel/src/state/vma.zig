@@ -1,4 +1,5 @@
 const std = @import("std");
+const smp_perf = @import("../smp_perf.zig");
 const builtin = @import("builtin");
 const kernel_log = @import("../kernel_log.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
@@ -198,7 +199,9 @@ pub fn rangeOverlapsPinnedUserObjectExcept(
     except_object: ?KernelObjectRef,
 ) bool {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
-    for (self.fd_objects[0..], 0..) |*slot, object_index| {
+    var candidates = self.pinned_object_slots.iterator(.{});
+    while (candidates.next()) |object_index| {
+        const slot = &self.fd_objects[object_index];
         const object_range = pinnedUserObjectRange(slot, owner_raw) orelse continue;
         if (except_object) |except| {
             if (except.kind == slot.kind and
@@ -222,7 +225,7 @@ pub fn rangeOverlapsPinnedUserObjectExcept(
 /// user-VA unmap, while a DMA buffer is a separately published bidirectional
 /// allocation. Streaming-mapping aliases are admitted only when the syscall's
 /// lifetime policy makes closing either mapping harmless to the other. Scatter
-/// mappings additionally require active VT-d so every alias owns an independent
+/// mappings additionally require an active IOMMU so every alias owns an independent
 /// IOVA allocation; pass-through retains only its existing linear-mapping alias.
 pub fn rangeConflictsWithDmaDerivation(
     self: anytype,
@@ -231,10 +234,12 @@ pub fn rangeConflictsWithDmaDerivation(
     size_bytes: u64,
     except_object: ?KernelObjectRef,
     allow_dma_mapping_aliases: bool,
-    vtd_active: bool,
+    iommu_active: bool,
 ) bool {
     const owner_raw: PrincipalRaw = @intFromEnum(owner);
-    for (self.fd_objects[0..], 0..) |*slot, object_index| {
+    var candidates = self.pinned_object_slots.iterator(.{});
+    while (candidates.next()) |object_index| {
+        const slot = &self.fd_objects[object_index];
         const object_range = pinnedUserObjectRange(slot, owner_raw) orelse continue;
         if (!rangesOverlap(start_va, size_bytes, object_range.start_va, object_range.size_bytes)) continue;
 
@@ -252,7 +257,7 @@ pub fn rangeConflictsWithDmaDerivation(
                     start_va,
                     size_bytes,
                     allow_dma_mapping_aliases,
-                    vtd_active,
+                    iommu_active,
                 );
                 return true;
             },
@@ -263,12 +268,12 @@ pub fn rangeConflictsWithDmaDerivation(
                     start_va,
                     size_bytes,
                     allow_dma_mapping_aliases,
-                    vtd_active,
+                    iommu_active,
                 );
                 return true;
             },
             .dma_mapping => |mapping| if (!is_except and
-                (!allow_dma_mapping_aliases or (mapping.page_count != 0 and !vtd_active)))
+                (!allow_dma_mapping_aliases or (mapping.page_count != 0 and !iommu_active)))
             {
                 pachaTraceDmaDerivationConflict(
                     "dma_mapping",
@@ -276,7 +281,7 @@ pub fn rangeConflictsWithDmaDerivation(
                     start_va,
                     size_bytes,
                     allow_dma_mapping_aliases,
-                    vtd_active,
+                    iommu_active,
                 );
                 return true;
             },
@@ -292,7 +297,7 @@ fn pachaTraceDmaDerivationConflict(
     requested_start: u64,
     requested_size: u64,
     allow_dma_mapping_aliases: bool,
-    vtd_active: bool,
+    iommu_active: bool,
 ) void {
     const requested_end, const overflow = @addWithOverflow(requested_start, requested_size);
     const range_end = if (overflow == 0) requested_end else std.math.maxInt(u64);
@@ -300,14 +305,14 @@ fn pachaTraceDmaDerivationConflict(
     const line = if (page_count) |pages|
         std.fmt.bufPrint(
             &buf,
-            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} page_count={} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} vtd_active={}\n",
-            .{ object_kind, pages, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(vtd_active) },
+            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} page_count={} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} iommu_active={}\n",
+            .{ object_kind, pages, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(iommu_active) },
         ) catch return
     else
         std.fmt.bufPrint(
             &buf,
-            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} vtd_active={}\n",
-            .{ object_kind, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(vtd_active) },
+            "[trace] c=kernel e=dma_derivation_conflict cls=1 kind={s} requested_start=0x{x} requested_end=0x{x} allow_dma_mapping_aliases={} iommu_active={}\n",
+            .{ object_kind, requested_start, range_end, @intFromBool(allow_dma_mapping_aliases), @intFromBool(iommu_active) },
         ) catch return;
     if (builtin.is_test) {
         kernel_log.appendText(line);
@@ -441,7 +446,7 @@ pub fn copyForkAnonymousPresentPageToChild(
     const copied_paddr = (self.allocPhysicalPage(free_list) catch return KernelError.OutOfFreePages).paddr;
     var installed = false;
     defer if (!installed) free_list.appendPage(0, copied_paddr) catch {};
-    @TypeOf(self.*).copyPhysicalPage(copied_paddr, src_paddr);
+    if (!@TypeOf(self.*).copyPhysicalPage(copied_paddr, src_paddr)) return KernelError.InvalidState;
     self.ensureEntryCowTable(dest_entry, free_list) catch return KernelError.TableFull;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(dest_entry, va) orelse return KernelError.InvalidState;
     self.setNativeCowPagePaddr(dest_entry.cow_table, cow_page, copied_paddr) catch return KernelError.TableFull;
@@ -594,7 +599,7 @@ pub fn prepareNativeVmaFaultMapping(
         const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
         const vmo_page_index: usize = @intCast(vmo_page);
         const paddr = self.entryDirtyPagePaddr(entry, fault_page_va) orelse
-            (self.nativeVmoResolvedPagePaddr(entry.vmo, vmo_page_index) orelse 0);
+            (self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, vmo_page_index) orelse return .{});
         if (paddr != 0) {
             return .{
                 .kind = .ready,
@@ -604,7 +609,7 @@ pub fn prepareNativeVmaFaultMapping(
                 },
             };
         }
-        if (!entry.flags.anonymous or vmo_page > std.math.maxInt(u32)) return .{};
+        if ((!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) or vmo_page > std.math.maxInt(u32)) return .{};
         return .{
             .kind = .allocate_zero,
             .mapping = .{ .paddr = 0, .prot = @TypeOf(self.*).nativeFaultMappingProt(entry) },
@@ -635,11 +640,22 @@ pub fn commitNativeVmaFaultMapping(
     if (vmo_page != plan.vmo_page_index) return null;
 
     var paddr = self.entryDirtyPagePaddr(entry, plan.fault_page_va) orelse
-        (self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0);
+        (self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return null);
     if (paddr == 0) {
-        if (!entry.flags.anonymous) return null;
+        if (!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return null;
         var page = [_]u64{candidate_paddr};
-        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch return null;
+        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch |err| {
+            // Host unit tests intentionally exhaust this table; port I/O is
+            // available only in the guest. Keep the field diagnostic there.
+            if (!builtin.is_test) {
+                const slot = self.nativeVmoSlotConst(entry.vmo);
+                kernel_log.writeFmt(
+                    "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s}\n",
+                    .{ @intFromEnum(owner), plan.fault_page_va, vmo_page, if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
+                );
+            }
+            return null;
+        };
         paddr = candidate_paddr;
     }
     return .{
@@ -648,11 +664,9 @@ pub fn commitNativeVmaFaultMapping(
     };
 }
 
-pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) void {
-    if (builtin.is_test) return;
-    const dst: [*]u8 = @ptrFromInt(dst_paddr);
-    const src: [*]const u8 = @ptrFromInt(src_paddr);
-    @memcpy(dst[0..4096], src[0..4096]);
+pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) bool {
+    if (builtin.is_test) return true;
+    return @import("../user_copy.zig").copyPhysicalPage(dst_paddr, src_paddr);
 }
 
 pub fn replaceVmaPageWithAnonymousPrivatePage(
@@ -776,8 +790,8 @@ pub fn prepareNativeVmaCowMapping(
                 .mapping = writableCowFaultMapping(entry, owned_paddr),
             };
         }
-        const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
-        if (src_paddr == 0 and !entry.flags.anonymous) return .{};
+        const src_paddr = self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return .{};
+        if (src_paddr == 0 and !entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return .{};
         if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
             return .{ .kind = .locked_slow_path };
         }
@@ -820,33 +834,37 @@ pub fn commitNativeVmaCowMapping(
     const page_delta = (plan.fault_page_va - entry.start_va) / native_page_size;
     const vmo_page = (entry.vmo_offset / native_page_size) + page_delta;
     if (vmo_page != plan.vmo_page_index) return null;
-    const current_source = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
+    const current_source = self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return null;
     if (current_source != plan.source_paddr) return null;
 
     self.ensureEntryCowTable(entry, free_list) catch |err| {
-        const store = types.vmObjectBackingStoreStats();
-        kernel_log.writeFmt(
-            "cow: commit failure stage=ensure_table err={s} vma_start=0x{x} " ++
-                "vma_pages={} store_used={} store_capacity={} store_free={}\n",
-            .{
-                @errorName(err),
-                entry.start_va,
-                entry.size_bytes / native_page_size,
-                store.used_entries,
-                store.capacity,
-                store.free_entries,
-            },
-        );
+        if (!builtin.is_test) {
+            const store = types.vmObjectBackingStoreStats();
+            kernel_log.writeFmt(
+                "cow: commit failure stage=ensure_table err={s} vma_start=0x{x} " ++
+                    "vma_pages={} store_used={} store_capacity={} store_free={}\n",
+                .{
+                    @errorName(err),
+                    entry.start_va,
+                    entry.size_bytes / native_page_size,
+                    store.used_entries,
+                    store.capacity,
+                    store.free_entries,
+                },
+            );
+        }
         return null;
     };
     if (!self.nativeCowTableIsUnique(entry.cow_table)) return null;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, plan.fault_page_va) orelse return null;
     if (cow_page != plan.cow_page_index and !plan.cow_table.isNull()) return null;
     self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr) catch |err| {
-        kernel_log.writeFmt(
-            "cow: commit failure stage=install_page err={s} vma_start=0x{x} cow_page={}\n",
-            .{ @errorName(err), entry.start_va, cow_page },
-        );
+        if (!builtin.is_test) {
+            kernel_log.writeFmt(
+                "cow: commit failure stage=install_page err={s} vma_start=0x{x} cow_page={}\n",
+                .{ @errorName(err), entry.start_va, cow_page },
+            );
+        }
         return null;
     };
     return writableCowFaultMapping(entry, candidate_paddr);
@@ -911,8 +929,8 @@ pub fn ensureNativeVmaCowMappingLockedSlow(
             }
             return writableCowFaultMapping(entry, owned_paddr);
         }
-        const src_paddr = self.nativeVmoResolvedPagePaddr(entry.vmo, @intCast(vmo_page)) orelse 0;
-        if (src_paddr == 0 and !entry.flags.anonymous) return null;
+        const src_paddr = self.nativeVmoResolvedPagePaddrOrZero(entry.vmo, @intCast(vmo_page)) orelse return null;
+        if (src_paddr == 0 and !entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return null;
         var invalidate_start_va: u64 = 0;
         var invalidate_size_bytes: u64 = 0;
         if (!entry.cow_table.isNull() and !self.nativeCowTableIsUnique(entry.cow_table)) {
@@ -925,7 +943,7 @@ pub fn ensureNativeVmaCowMappingLockedSlow(
         defer if (!installed) free_list.appendPage(0, new_paddr) catch {};
 
         if (src_paddr != 0) {
-            @TypeOf(self.*).copyPhysicalPage(new_paddr, src_paddr);
+            if (!@TypeOf(self.*).copyPhysicalPage(new_paddr, src_paddr)) return null;
         }
         self.ensureEntryCowTable(entry, free_list) catch return null;
         const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, fault_page_va) orelse return null;
@@ -960,6 +978,9 @@ pub fn setVmaProtRange(self: anytype, owner: PrincipalId, start_va: u64, size_by
         const entry_end = entry.endVa();
         if (start_va < entry.start_va or end_va > entry_end) continue;
         if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, entry.max_prot)) return KernelError.InvalidState;
+
+        // An unchanged subrange needs neither VMA slots nor extra backing refs.
+        if (@as(u8, @bitCast(entry.prot)) == @as(u8, @bitCast(prot))) return;
 
         if (entry.start_va == start_va and entry.size_bytes == size_bytes) {
             entry.prot = prot;
@@ -1031,10 +1052,10 @@ pub fn setVmaProtRange(self: anytype, owner: PrincipalId, start_va: u64, size_by
 pub fn releaseFdTableForProcessIndex(self: anytype, index: usize) void {
     const table = self.fdTableForProcessIndex(index) orelse return;
     var fd: usize = 0;
-    while (fd < fd_table_entries) : (fd += 1) {
-        const object_ref = table.entries[fd].object;
+    while (fd < table.slots().len) : (fd += 1) {
+        const object_ref = table.slots()[fd].object;
         if (object_ref.isNull()) continue;
-        table.entries[fd] = .{};
+        table.slots()[fd] = .{};
         self.releaseKernelObject(object_ref);
     }
 }
@@ -1046,12 +1067,15 @@ pub fn releaseFdTableForProcessIndexWithFreeList(
 ) void {
     const table = self.fdTableForProcessIndex(index) orelse return;
     var fd: usize = 0;
-    while (fd < fd_table_entries) : (fd += 1) {
-        const object_ref = table.entries[fd].object;
+    while (fd < table.slots().len) : (fd += 1) {
+        const object_ref = table.slots()[fd].object;
         if (object_ref.isNull()) continue;
-        table.entries[fd] = .{};
+        table.slots()[fd] = .{};
         self.releaseKernelObjectWithFreeList(object_ref, free_list);
     }
+    @TypeOf(self.*).retireFdStorage(table, table.dynamic_entries);
+    table.dynamic_entries = &.{};
+    @TypeOf(self.*).reclaimFdStorage(table, free_list);
 }
 
 pub fn releaseVmaCowPageRange(self: anytype, entry: *const VmaEntry, first_page_delta: usize, page_count: usize, free_list: ?*FreePageList) void {
@@ -1067,6 +1091,9 @@ pub fn releaseVmaCowPageRange(self: anytype, entry: *const VmaEntry, first_page_
 
 pub fn releaseVmaCowResources(self: anytype, entry: *const VmaEntry, free_list: ?*FreePageList) void {
     if (entry.cow_table.isNull()) return;
+    const profile_start = smp_perf.timestamp();
+    smp_perf.vmoAdd(.cow_calls, 1);
+    defer smp_perf.vmoElapsed(.cow_cycles, profile_start);
     const page_count: usize = @intCast(entry.size_bytes / native_page_size);
     self.releaseVmaCowPageRange(entry, 0, page_count, free_list);
     self.releaseNativeCowTable(entry.cow_table, free_list);
@@ -1250,6 +1277,49 @@ pub fn userMapRangeIsFree(
         !self.rangeOverlapsPinnedUserObject(owner, start_va, size_bytes);
 }
 
+/// Read-only admission check for a BAR overlay. The caller must hold the VM
+/// transaction through PTE publication and separately reject existing PTEs.
+/// Keep these VMAs in place during the lease: they reserve the address both
+/// before publication and after last-close, without an allocator-visible hole.
+pub fn userRangeIsUnbackedMmioReservation(
+    self: anytype,
+    owner: PrincipalId,
+    start_va: u64,
+    size_bytes: u64,
+) bool {
+    if (start_va == 0 or !@TypeOf(self.*).isPageAligned(start_va) or
+        !@TypeOf(self.*).isPageAligned(size_bytes)) return false;
+    const end_va = checkedEnd(start_va, size_bytes) catch return false;
+    if (self.rangeOverlapsPinnedUserObject(owner, start_va, size_bytes)) return false;
+
+    var cursor = start_va;
+    while (cursor < end_va) {
+        const entry = self.vmaEntryForVaConst(owner, cursor) orelse return false;
+        if (!entry.flags.anonymous or !entry.flags.private or entry.flags.shared or
+            !entry.flags.noreserve or entry.flags.fork_cow or
+            !entry.cow_table.isNull() or
+            entry.prot.read or entry.prot.write or entry.prot.exec or entry.prot.pkey != 0)
+            return false;
+        const vmo = self.nativeVmoSlotConst(entry.vmo) orelse return false;
+        if (vmo.kind != .anonymous or !vmo.parent.isNull()) return false;
+        const part_end = @min(end_va, entry.endVa());
+        const offset = std.math.add(u64, entry.vmo_offset, cursor - entry.start_va) catch return false;
+        const length = part_end - cursor;
+        if (!@TypeOf(self.*).isPageAligned(offset) or
+            offset > vmo.size_bytes or length > vmo.size_bytes - offset) return false;
+        var page: usize = @intCast(offset / native_page_size);
+        const end_page: usize = @intCast((offset + length) / native_page_size);
+        while (page < end_page) : (page += 1) {
+            const paddr = self.nativeVmoPagePaddrOrHole(entry.vmo, page) orelse return false;
+            // mprotect(NONE) does not turn used anonymous RAM into a virgin
+            // reservation; replacing it would silently discard its contents.
+            if (paddr != 0) return false;
+        }
+        cursor = part_end;
+    }
+    return true;
+}
+
 pub fn vmaProtAllowedByRights(prot: VmaProt, rights: FdRights) bool {
     if (prot.read and !rights.map_read) return false;
     if (prot.write and !rights.map_write) return false;
@@ -1264,6 +1334,16 @@ pub fn vmaMaxProtForRights(rights: FdRights, pkey: u4) VmaProt {
         .exec = rights.map_exec,
         .pkey = pkey,
     };
+}
+
+fn maxProtForFdMapping(rights: FdRights, flags: MmapFlags) VmaProt {
+    var max_prot = vmaMaxProtForRights(rights, flags.pkey);
+    // Reading a backing permits modifying one's own copy, not the shared
+    // object. Only this mapping mode goes through non-anonymous private COW.
+    // Shared/default mappings still require map_write; exec is independent.
+    if (rights.map_read and flags.private and !flags.shared and !flags.anonymous)
+        max_prot.write = true;
+    return max_prot;
 }
 
 pub fn vmaProtAllowedByMax(prot: VmaProt, max_prot: VmaProt) bool {
@@ -1324,9 +1404,27 @@ pub fn createAnonymousVmoFdWithPages(
         }
     }
     while (allocated < page_count_u64) : (allocated += 1) {
-        pages[allocated] = (try self.allocLowPhysicalPage(free_list)).paddr;
+        // Ordinary VMO pages are not DMA-constrained. Preserve low RAM for
+        // the separate contiguous DMA pool and kernel bootstrap structures.
+        pages[allocated] = (try self.allocPhysicalPage(free_list)).paddr;
     }
     try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
+    return fd;
+}
+
+pub fn createZeroOnDemandVmoFd(
+    self: anytype,
+    owner: PrincipalId,
+    size_bytes: u64,
+    rights: FdRights,
+    flags: FdFlags,
+    min_fd: Fd,
+) KernelError!Fd {
+    if (size_bytes == 0 or size_bytes > @as(u64, max_vmo_backing_pages) * native_page_size)
+        return KernelError.InvalidState;
+    const fd = try self.createAnonymousVmoFd(owner, @TypeOf(self.*).pageAlignUp(size_bytes), rights, flags, min_fd);
+    const ref = self.nativeVmoRefForFd(owner, fd).?;
+    self.nativeVmoSlot(ref).?.zero_on_demand = true;
     return fd;
 }
 
@@ -1473,7 +1571,11 @@ pub fn createAnonymousVmaWithPages(
     try self.requireActiveProcess(owner);
     if (!@TypeOf(self.*).isPageAligned(start_va) or !@TypeOf(self.*).isPageAligned(size_bytes)) return KernelError.InvalidState;
     const page_count_u64 = size_bytes / native_page_size;
-    if (page_count_u64 == 0 or page_count_u64 > max_vmo_backing_pages) return KernelError.InvalidState;
+    const limit = if (flags.anonymous and flags.private and !flags.shared and flags.noreserve)
+        types.max_vmo_logical_pages
+    else
+        max_vmo_backing_pages;
+    if (page_count_u64 == 0 or page_count_u64 > limit) return KernelError.InvalidState;
     if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
 
     const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
@@ -1537,6 +1639,9 @@ pub fn createVmaWithRetainedVmo(
     const vmo_end = try @TypeOf(self.*).checkedEnd(vmo_offset, size_bytes);
     if (vmo_end > vmo.size_bytes) return KernelError.InvalidState;
     if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
+    if (vmo.kind == .page_view and
+        (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
 
     const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
     if (try @TypeOf(self.*).vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
@@ -1565,8 +1670,8 @@ pub fn mmapFd(
     vmo_offset: u64,
 ) KernelError!u64 {
     const fd_entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
-    if (!@TypeOf(self.*).vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
-    const max_prot = @TypeOf(self.*).vmaMaxProtForRights(fd_entry.rights, flags.pkey);
+    const max_prot = maxProtForFdMapping(fd_entry.rights, flags);
+    if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
         .vmo => |ref| ref,
@@ -1590,8 +1695,8 @@ pub fn mmapFdIntoProcess(
     _ = try self.fdTableForActiveProcessConst(source_owner);
     try self.requireActiveProcess(target_owner);
     const fd_entry = self.fdEntryConst(source_owner, fd) orelse return KernelError.InvalidState;
-    if (!@TypeOf(self.*).vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
-    const max_prot = @TypeOf(self.*).vmaMaxProtForRights(fd_entry.rights, flags.pkey);
+    const max_prot = maxProtForFdMapping(fd_entry.rights, flags);
+    if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
         .vmo => |ref| ref,
@@ -1872,7 +1977,11 @@ pub fn prepareFixedAnonymousMmap(
         return KernelError.InvalidState;
     }
     const page_count = size_bytes / native_page_size;
-    if (page_count == 0 or page_count > max_vmo_backing_pages) return KernelError.InvalidState;
+    const limit = if (flags.private and !flags.shared and flags.noreserve)
+        types.max_vmo_logical_pages
+    else
+        max_vmo_backing_pages;
+    if (page_count == 0 or page_count > limit) return KernelError.InvalidState;
     var prepared = try prepareFixedMmapSlots(self, owner, start_va, size_bytes, free_list);
     errdefer discardFixedMmapPrepared(self, &prepared, free_list);
     const vmo_ref = try self.createNativeVmo(.anonymous, size_bytes);
@@ -1900,11 +2009,28 @@ pub fn prepareFixedFdMmap(
     vmo_offset: u64,
     free_list: *FreePageList,
 ) KernelError!FixedMmapPrepared {
-    if (flags.anonymous or !flags.private or flags.shared) return KernelError.InvalidState;
+    return prepareFixedFdMmapIntoProcess(self, owner, fd, owner, start_va, size_bytes, prot, flags, vmo_offset, free_list);
+}
+
+/// The caller holds both owners' VM transaction locks. The source capability
+/// stays in source_owner; only its authorized mapping enters target_owner.
+pub fn prepareFixedFdMmapIntoProcess(
+    self: anytype,
+    source_owner: PrincipalId,
+    fd: Fd,
+    target_owner: PrincipalId,
+    start_va: u64,
+    size_bytes: u64,
+    prot: VmaProt,
+    flags: MmapFlags,
+    vmo_offset: u64,
+    free_list: *FreePageList,
+) KernelError!FixedMmapPrepared {
+    if (flags.anonymous or (flags.private and flags.shared)) return KernelError.InvalidState;
     if (!@TypeOf(self.*).isPageAligned(vmo_offset)) return KernelError.InvalidState;
-    const fd_entry = self.fdEntryConst(owner, fd) orelse return KernelError.InvalidState;
-    if (!@TypeOf(self.*).vmaProtAllowedByRights(prot, fd_entry.rights)) return KernelError.InvalidState;
-    const max_prot = @TypeOf(self.*).vmaMaxProtForRights(fd_entry.rights, flags.pkey);
+    const fd_entry = self.fdEntryConst(source_owner, fd) orelse return KernelError.InvalidState;
+    const max_prot = maxProtForFdMapping(fd_entry.rights, flags);
+    if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     const object_slot = self.kernelObjectSlotConst(fd_entry.object) orelse return KernelError.InvalidState;
     const vmo_ref = switch (object_slot.payload) {
         .vmo => |ref| ref,
@@ -1915,7 +2041,20 @@ pub fn prepareFixedFdMmap(
     if (vmo_end > vmo.size_bytes or !@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) {
         return KernelError.InvalidState;
     }
-    var prepared = try prepareFixedMmapSlots(self, owner, start_va, size_bytes, free_list);
+    if (vmo.kind == .page_view and
+        (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
+    // Ordinary shared VMOs still promise full backing. Only explicit
+    // zero-on-demand objects may defer allocation until after replacement.
+    if (!flags.private and !self.nativeVmoIsZeroOnDemand(vmo_ref)) {
+        if (!@TypeOf(self.*).isPageAligned(size_bytes)) return KernelError.InvalidState;
+        var offset = vmo_offset;
+        while (offset < vmo_end) : (offset += native_page_size) {
+            _ = self.nativeVmoResolvedPagePaddr(vmo_ref, @intCast(offset / native_page_size)) orelse
+                return KernelError.InvalidState;
+        }
+    }
+    var prepared = try prepareFixedMmapSlots(self, target_owner, start_va, size_bytes, free_list);
     errdefer discardFixedMmapPrepared(self, &prepared, free_list);
     try self.retainNativeVmo(vmo_ref);
     prepared.destination = .{
@@ -1981,8 +2120,14 @@ fn munmapRangeWithFreeListInternal(
     const end_va = try @TypeOf(self.*).checkedEnd(start_va, size_bytes);
     const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
 
-    var index: usize = 0;
-    while (index < table.entries.len) : (index += 1) {
+    // Snapshot active slots in the original slot-index order. Clearing an
+    // entry swaps active_indices, and splitting can insert an earlier slot;
+    // neither must perturb this traversal. A newly created suffix starts at
+    // cut_end and is outside the removed range, so it needs no second visit.
+    var active_slots = std.StaticBitSet(max_vmas_per_process).initEmpty();
+    for (table.active_indices[0..table.active_count]) |index| active_slots.set(index);
+    var active_iterator = active_slots.iterator(.{ .direction = .forward });
+    while (active_iterator.next()) |index| {
         var entry = &table.entries[index];
         if (!entry.active) continue;
         const entry_start = entry.start_va;
@@ -2269,7 +2414,10 @@ pub fn prepareMremapWithFreeList(
             }
             if (src_paddr == 0) continue;
             const dst_paddr = (try self.allocPhysicalPage(free_list)).paddr;
-            @TypeOf(self.*).copyPhysicalPage(dst_paddr, src_paddr);
+            if (!@TypeOf(self.*).copyPhysicalPage(dst_paddr, src_paddr)) {
+                free_list.appendPage(0, dst_paddr) catch {};
+                return KernelError.InvalidState;
+            }
             var page = [_]u64{dst_paddr};
             self.installNativeVmoPages(dst_vmo, page_index, page[0..]) catch |err| {
                 free_list.appendPage(0, dst_paddr) catch {};

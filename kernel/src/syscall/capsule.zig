@@ -7,10 +7,11 @@ const pci = @import("../pci.zig");
 const user_copy = @import("../user_copy.zig");
 const user_vm = @import("../memory/user_vm.zig");
 const sc = @import("numbers.zig");
-const vtd = @import("../vtd.zig");
+const iommu = @import("../iommu.zig");
+const smp = @import("../smp.zig");
+const fd_syscalls = @import("fd.zig");
 
 const TrapFrame = interrupts.TrapFrame;
-const pci_config_size: usize = 256;
 const page_size: u64 = 4096;
 const first_dynamic_fd: kernel.Fd = abi_root.fd_abi.first_dynamic_fd;
 // Capsule syscalls run under the global kernel-state lock, so this bounded
@@ -70,13 +71,6 @@ fn requireDeviceFd(state: *const kernel.KernelState, proc: kernel.PrincipalId, f
     return device;
 }
 
-fn validatePciConfigRange(offset: u32, len: u32) bool {
-    const config_size: u32 = @intCast(pci_config_size);
-    if (len == 0 or offset >= config_size) return false;
-    const end, const overflow = @addWithOverflow(offset, len);
-    return overflow == 0 and end <= config_size;
-}
-
 fn writePciBarInfo(h: anytype, proc: kernel.PrincipalId, out_va: u64, max_words: u64, info: pci.BarInfo) bool {
     if (max_words < @as(u64, @intCast(capsule_abi.bar_info_word_count))) return false;
     const end = info.end() orelse return false;
@@ -92,6 +86,14 @@ fn writePciBarInfo(h: anytype, proc: kernel.PrincipalId, out_va: u64, max_words:
     return true;
 }
 
+fn mmioCacheForRange(flags: u64, paddr: u64, bytes: u64) ?user_vm.MmioCache {
+    return switch ((flags & capsule_abi.mmio_map_cache_mask) >> capsule_abi.mmio_map_cache_shift) {
+        @intFromEnum(capsule_abi.MmioCache.uc) => .uc,
+        @intFromEnum(capsule_abi.MmioCache.uc_minus) => if (smp.ucMinusMmioAllowed(paddr, bytes)) .uc_minus else null,
+        else => null,
+    };
+}
+
 fn mapPciBarIntoUser(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
@@ -99,20 +101,13 @@ fn mapPciBarIntoUser(
     map_size: u64,
     flags: u64,
     info: pci.BarInfo,
+    page_offset: u64,
 ) bool {
     if ((user_va & (page_size - 1)) != 0 or (map_size & (page_size - 1)) != 0) return false;
     if (map_size == 0 or map_size > @as(u64, std.math.maxInt(usize))) return false;
-    const paddr = pageAlignDown(info.start);
-    if (paddr == 0) return false;
-    const span, const span_overflow = @addWithOverflow(info.start - paddr, info.size);
-    if (span_overflow != 0) return false;
-    const required_size = pageAlignUp(span) orelse return false;
-    // The capability names one complete BAR, not an arbitrary physical span.
-    // Accepting an oversized length would expose adjacent MMIO resources.
-    if (map_size != required_size) return false;
-    const physical_end, const physical_end_overflow = @addWithOverflow(paddr, map_size - 1);
-    if (physical_end_overflow != 0) return false;
-    _ = physical_end;
+    const paddr = pci.barMappingPaddr(info, page_offset, map_size) orelse return false;
+    const cache = mmioCacheForRange(flags, paddr, map_size) orelse return false;
+    if ((flags & capsule_abi.mmio_map_flag_replace_existing) != 0) return false;
     const size_usize: usize = @intCast(map_size);
     if (!user_vm.lockVmTransaction(proc)) return false;
     defer user_vm.unlockVmTransaction(proc);
@@ -122,12 +117,11 @@ fn mapPciBarIntoUser(
     // ordinary and replace-existing forms fail-closed until replacement can
     // update those owners atomically.
     if (!(state.userMapRangeIsFree(proc, user_va, map_size) catch false)) return false;
-    if (user_vm.mapUserUncachedLinearRegionWithProt(proc, user_va, paddr, size_usize, .{
+    if (user_vm.mapUserMmioLinearRegionWithProt(proc, user_va, paddr, size_usize, .{
         .read = true,
-        .write = true,
+        .write = (flags & capsule_abi.mmio_map_flag_read_only) == 0,
         .exec = false,
-    })) return true;
-    _ = flags;
+    }, cache)) return true;
     return false;
 }
 
@@ -171,7 +165,7 @@ fn resolveUserDmaPages(
         page_span,
         except_pinned_object,
         allow_dma_mapping_aliases,
-        vtd.isActive(),
+        iommu.isActive(),
     )) {
         return null;
     }
@@ -271,7 +265,7 @@ fn mapResolvedDmaPages(
     readable: bool,
     writable: bool,
 ) DmaPolicyError!u64 {
-    if (!vtd.isActive()) {
+    if (!iommu.isActive()) {
         const paddr = kernel.dmaAddressForResolvedPages(
             resolved.paddrs(),
             resolved.first_page_offset,
@@ -282,29 +276,38 @@ fn mapResolvedDmaPages(
             );
             return DmaPolicyError.Invalid;
         };
-        return if (iova_arg == capsule_abi.dma_iova_kernel_choose) paddr else iova_arg;
+        if (iova_arg != capsule_abi.dma_iova_kernel_choose and iova_arg != paddr)
+            return DmaPolicyError.Invalid;
+        return paddr;
     }
-    if (iova_arg != capsule_abi.dma_iova_kernel_choose) return DmaPolicyError.Invalid;
-    const iova_base = vtd.allocIova(device, resolved.page_count) orelse return DmaPolicyError.Map;
-    if (!vtd.mapPages(device, iova_base, resolved.paddrs(), readable, writable)) {
-        vtd.freeIova(device, iova_base, resolved.page_count);
+    const iova_base = if (iova_arg == capsule_abi.dma_iova_kernel_choose)
+        iommu.allocIova(device, resolved.page_count) orelse return DmaPolicyError.Map
+    else blk: {
+        if ((iova_arg & (page_size - 1)) != resolved.first_page_offset)
+            return DmaPolicyError.Invalid;
+        const base = pageAlignDown(iova_arg);
+        if (!iommu.reserveIova(device, base, resolved.page_count)) return DmaPolicyError.Map;
+        break :blk base;
+    };
+    if (!iommu.mapPages(device, iova_base, resolved.paddrs(), readable, writable)) {
+        iommu.freeIova(device, iova_base, resolved.page_count);
         return DmaPolicyError.Map;
     }
     return iova_base + resolved.first_page_offset;
 }
 
 fn releaseDeviceIova(device: kernel.DmaDeviceId, iova: u64, size: u64) void {
-    if (!vtd.isActive() or size == 0) return;
+    if (!iommu.isActive() or size == 0) return;
     const iova_base = pageAlignDown(iova);
     const span, const overflow = @addWithOverflow(iova - iova_base, size);
     if (overflow != 0) return;
     const aligned_span = pageAlignUp(span) orelse return;
     const page_count: usize = @intCast(aligned_span / page_size);
-    vtd.unmapRangeForDevice(device, iova, size);
-    vtd.freeIova(device, iova_base, page_count);
+    if (!iommu.unmapRangeForDevice(device, iova, size)) return;
+    iommu.freeIova(device, iova_base, page_count);
 }
 
-fn rightsForMmio(parent: kernel.FdRights) kernel.FdRights {
+fn rightsForMmio(parent: kernel.FdRights, write: bool) kernel.FdRights {
     return .{
         .inspect = parent.inspect,
         .dup = parent.dup,
@@ -313,7 +316,7 @@ fn rightsForMmio(parent: kernel.FdRights) kernel.FdRights {
         .close = parent.close,
         .query = parent.query,
         .mmio_map_read = parent.mmio_map_read,
-        .mmio_map_write = parent.mmio_map_write,
+        .mmio_map_write = parent.mmio_map_write and write,
     };
 }
 
@@ -396,8 +399,12 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
     switch (view.payload.*) {
         .device => |device| {
             words[capsule_abi.snapshot_device_index] = device.device;
+            const window = iommu.deviceIovaWindow(device.device);
+            words[capsule_abi.snapshot_iova_index] = window.start;
+            words[capsule_abi.snapshot_size_index] = window.size;
             words[capsule_abi.snapshot_index_index] =
                 pci.interruptVectorBaseForResourceId(device.device) orelse 0;
+            words[capsule_abi.snapshot_flags_index] = iommu.dmaSnapshotFlags(device.device);
         },
         .mmio_region => |mmio| {
             words[capsule_abi.snapshot_device_index] = mmio.device;
@@ -412,7 +419,7 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
             words[capsule_abi.snapshot_user_va_index] = dma.user_va;
             words[capsule_abi.snapshot_iova_index] = dma.iova;
             words[capsule_abi.snapshot_size_index] = dma.size;
-            words[capsule_abi.snapshot_flags_index] = dma.flags;
+            words[capsule_abi.snapshot_flags_index] = @as(u64, dma.flags) | iommu.dmaSnapshotFlags(dma.device);
         },
         .dma_mapping => |mapping| {
             words[capsule_abi.snapshot_device_index] = mapping.device;
@@ -420,12 +427,15 @@ fn writeFdSnapshot(h: anytype, state: *const kernel.KernelState, proc: kernel.Pr
             words[capsule_abi.snapshot_iova_index] = mapping.iova;
             words[capsule_abi.snapshot_size_index] = mapping.size;
             words[capsule_abi.snapshot_index_index] = mapping.page_count;
-            words[capsule_abi.snapshot_flags_index] = mapping.flags | (@as(u32, @intFromEnum(mapping.direction)) & 0x3);
+            words[capsule_abi.snapshot_flags_index] = @as(u64, mapping.flags) |
+                (@as(u32, @intFromEnum(mapping.direction)) & 0x3) | iommu.dmaSnapshotFlags(mapping.device);
         },
         .irq => |irq| {
             words[capsule_abi.snapshot_device_index] = irq.device;
             words[capsule_abi.snapshot_index_index] = irq.vector;
-            words[capsule_abi.snapshot_flags_index] = irq.flags | ((@as(u32, @intFromEnum(irq.kind)) & 0x3) << 16);
+            words[capsule_abi.snapshot_flags_index] = @as(u64, irq.flags) |
+                ((@as(u64, @intFromEnum(irq.kind)) & 0x3) << 16) |
+                (if (irq.retired) capsule_abi.snapshot_flag_irq_retired else @as(u64, 0));
         },
         else => {},
     }
@@ -453,21 +463,55 @@ pub fn dispatch(
             };
             const bar_index = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const flags = flagsArg(frame.r8, capsule_abi.mmio_map_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
+            if (iommu.deviceQuarantined(device.device)) break :blk sc.syscall_err_invalid;
+            const write = (flags & capsule_abi.mmio_map_flag_read_only) == 0;
+            if (!view.rights.mmio_map_read or (write and !view.rights.mmio_map_write)) break :blk sc.syscall_err_invalid;
             if (bar_index >= capsule_abi.pci_bar_count) break :blk sc.syscall_err_invalid;
-            const loc = pci.locationFromResourceId(device.device) orelse break :blk sc.syscall_err_invalid;
-            const bar = pci.probeBarInfo(loc, @intCast(bar_index)) orelse break :blk sc.syscall_err_invalid;
+            const bar = pci.authorizedBarInfo(device.device, @intCast(bar_index)) orelse break :blk sc.syscall_err_invalid;
             if ((bar.flags & pci.bar_flag_mem) == 0) break :blk sc.syscall_err_invalid;
             if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_map;
             defer user_vm.unlockVmTransaction(proc);
-            if (!mapPciBarIntoUser(state, proc, frame.rdx, frame.r10, flags, bar)) break :blk sc.syscall_err_map;
+            const paddr = pci.barMappingPaddr(bar, frame.r9, frame.r10) orelse break :blk sc.syscall_err_invalid;
+            const cache = mmioCacheForRange(flags, paddr, frame.r10) orelse break :blk sc.syscall_err_map;
+            if (flags & capsule_abi.mmio_map_flag_replace_existing != 0) {
+                // Only a virgin reservation may carry an MMIO overlay. Leave
+                // its VMA/backing intact through publication and last-close.
+                if (frame.r10 > std.math.maxInt(usize) or
+                    !state.userRangeIsUnbackedMmioReservation(proc, frame.rdx, frame.r10))
+                    break :blk sc.syscall_err_map;
+                // The global KernelState lock makes this staged FD invisible
+                // to other syscalls. user_va=0 makes failed admission cleanup
+                // inert; there must be no lock drop until publication ends.
+                const fd = state.createMmioRegionFd(proc, .{
+                    .device = device.device,
+                    .bar_index = bar_index,
+                    .paddr = paddr,
+                    .user_va = 0,
+                    .size = frame.r10,
+                    .flags = flags,
+                }, rightsForMmio(view.rights, write), .{}, first_dynamic_fd) catch |err|
+                    break :blk statusFromKernelError(err);
+                if (!user_vm.mapUserMmioOverlayWithCache(proc, frame.rdx, paddr, @intCast(frame.r10), .{
+                    .read = true,
+                    .write = write,
+                    .exec = false,
+                }, cache)) {
+                    state.closeFd(proc, fd) catch unreachable;
+                    break :blk sc.syscall_err_map;
+                }
+                const published = state.fdPayloadWithRights(proc, fd, .{}) orelse unreachable;
+                published.payload.mmio_region.user_va = frame.rdx;
+                break :blk fd;
+            }
+            if (!mapPciBarIntoUser(state, proc, frame.rdx, frame.r10, flags, bar, frame.r9)) break :blk sc.syscall_err_map;
             break :blk state.createMmioRegionFd(proc, .{
                 .device = device.device,
                 .bar_index = bar_index,
-                .paddr = pageAlignDown(bar.start),
+                .paddr = paddr,
                 .user_va = frame.rdx,
                 .size = frame.r10,
                 .flags = flags,
-            }, rightsForMmio(view.rights), .{}, first_dynamic_fd) catch |err| {
+            }, rightsForMmio(view.rights, write), .{}, first_dynamic_fd) catch |err| {
                 // installFd failure already runs the MMIO destructor; object
                 // allocation/validation failure has no destructor yet.  The
                 // encompassing VM transaction makes this idempotent cleanup
@@ -475,6 +519,20 @@ pub fn dispatch(
                 _ = user_vm.unmapUserLinearRegion(proc, frame.rdx, @intCast(frame.r10));
                 break :blk statusFromKernelError(err);
             };
+        },
+        sc.syscall_capsule_dma_set_enabled => blk: {
+            const device_fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            if (frame.rsi > 1) break :blk sc.syscall_err_invalid;
+            const device = requireDeviceFd(state, proc, device_fd, deviceRequired(.{
+                .derive_dma = true,
+                .bus_master = true,
+            })) orelse break :blk sc.syscall_err_invalid;
+            iommu.setDeviceDmaEnabled(device.device, frame.rsi != 0) catch |err|
+                break :blk switch (err) {
+                    error.Unsupported, error.NoDevice => sc.syscall_err_invalid,
+                    error.Quarantined, error.DrainFailed => sc.syscall_err_map,
+                };
+            break :blk sc.syscall_ok;
         },
         sc.syscall_capsule_derive_dma_buffer => blk: {
             const device_fd: kernel.Fd = @intCast(frame.rdi);
@@ -490,8 +548,6 @@ pub fn dispatch(
                 else => break :blk sc.syscall_err_invalid,
             };
             const flags = flagsArg(frame.r8, capsule_abi.dma_buffer_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            if (vtd.isActive() and frame.rdx != capsule_abi.dma_iova_kernel_choose)
-                break :blk sc.syscall_err_invalid;
             const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
@@ -538,8 +594,6 @@ pub fn dispatch(
                 break :blk sc.syscall_err_invalid;
             }
             const flags = flagsArg(frame.r9, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            if (vtd.isActive() and frame.rdx != capsule_abi.dma_iova_kernel_choose)
-                break :blk sc.syscall_err_invalid;
             const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
@@ -548,7 +602,7 @@ pub fn dispatch(
                 frame.r10,
                 direction != .to_device,
                 null,
-                // Streaming mappings may share resolved pages. Under VT-d,
+                // Streaming mappings may share resolved pages. With translation,
                 // each derive owns an independent IOVA; in pass-through mode
                 // close does not tear down translation for either alias.
                 true,
@@ -639,19 +693,19 @@ pub fn dispatch(
             }
 
             var mapping_iova: u64 = undefined;
-            if (vtd.isActive()) {
-                // Scatter-page derivation is a first-class VT-d mapping: one
+            if (iommu.isActive()) {
+                // Scatter-page derivation is a first-class IOMMU mapping: one
                 // contiguous IOVA allocation covers every resolved page and
                 // is owned by the returned mapping capability.
-                const iova_base = vtd.allocIova(device.device, layout.page_count) orelse break :blk sc.syscall_err_map;
-                if (!vtd.mapPages(
+                const iova_base = iommu.allocIova(device.device, layout.page_count) orelse break :blk sc.syscall_err_map;
+                if (!iommu.mapPages(
                     device.device,
                     iova_base,
                     page_addresses[0..layout.page_count],
                     direction != .from_device,
                     direction != .to_device,
                 )) {
-                    vtd.freeIova(device.device, iova_base, layout.page_count);
+                    iommu.freeIova(device.device, iova_base, layout.page_count);
                     break :blk sc.syscall_err_map;
                 }
                 mapping_iova = iova_base + layout.first_page_offset;
@@ -701,8 +755,6 @@ pub fn dispatch(
             }
             const flags = flagsArg(frame.r8, capsule_abi.dma_mapping_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
             if (frame.rdx == 0 or frame.rdx > buffer.size) break :blk sc.syscall_err_invalid;
-            if (vtd.isActive() and frame.rsi != capsule_abi.dma_iova_kernel_choose)
-                break :blk sc.syscall_err_invalid;
             const resolved = resolveUserDmaPages(
                 state,
                 h.free_list,
@@ -748,22 +800,83 @@ pub fn dispatch(
             const kind = parseIrqKind(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const vector = u32Arg(frame.rdx) orelse break :blk sc.syscall_err_invalid;
             const flags = flagsArg(frame.r10, capsule_abi.irq_known_flags_mask) orelse break :blk sc.syscall_err_invalid;
-            if (pci.interruptVectorBaseForResourceId(device.device) == null)
-                break :blk sc.syscall_err_invalid;
             switch (kind) {
                 .auto => if (vector != 0) break :blk sc.syscall_err_invalid,
                 .msi, .msix => if (vector >= pci.interrupt_vectors_per_device)
                     break :blk sc.syscall_err_invalid,
                 .intx => break :blk sc.syscall_err_invalid,
             }
-            break :blk state.createIrqFd(proc, .{
+            if (!pci.ensureInterruptRoute(device.device))
+                break :blk sc.syscall_err_not_ready;
+            const was_unmasked = pci.acquireInterruptRoute(device.device, @intFromEnum(kind), vector) catch |err|
+                break :blk switch (err) {
+                    error.Busy, error.NotReady => sc.syscall_err_not_ready,
+                    error.Invalid, error.Unsupported => sc.syscall_err_invalid,
+                };
+            const irq_fd = state.createIrqFd(proc, .{
                 .device = device.device,
                 .kind = kind,
                 .vector = vector,
                 .flags = flags,
-            }, rightsForIrq(view.rights), .{}, first_dynamic_fd) catch |err| statusFromKernelError(err);
+            }, rightsForIrq(view.rights), .{}, first_dynamic_fd) catch |err| {
+                _ = pci.releaseInterruptRoute(device.device, @intFromEnum(kind), vector);
+                break :blk statusFromKernelError(err);
+            };
+            if (!pci.restoreInterruptRouteMask(device.device, @intFromEnum(kind), vector, was_unmasked)) {
+                state.closeFdWithFreeList(proc, irq_fd, h.free_list) catch {};
+                break :blk sc.syscall_err_not_ready;
+            }
+            break :blk irq_fd;
+        },
+        sc.syscall_capsule_irq_route => blk: {
+            const fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            const irq = state.irqObjectForFd(proc, fd, .{ .query = true }) orelse
+                break :blk sc.syscall_err_invalid;
+            if (irq.retired) break :blk sc.syscall_err_closed;
+            if (!pci.interruptRouteLeased(irq.device, @intFromEnum(irq.kind), irq.vector) or
+                frame.rdx < capsule_abi.irq_route_word_count) break :blk sc.syscall_err_invalid;
+            const bsp = smp.cpuInfo(0) orelse break :blk sc.syscall_err_not_ready;
+            const apic_id = bsp.lapic_id orelse break :blk sc.syscall_err_not_ready;
+            const vector = @as(u64, pci.interruptVectorBaseForResourceId(irq.device).?) + irq.vector;
+            const words = [_]u64{ 0xfee00000 | (@as(u64, apic_id) << 12), vector, vector };
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, std.mem.asBytes(&words)))
+                break :blk sc.syscall_err_invalid;
+            break :blk capsule_abi.irq_route_word_count;
+        },
+        sc.syscall_capsule_irq_quiesce, sc.syscall_capsule_irq_retire => blk: {
+            const fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            const view = state.fdPayloadWithRights(proc, fd, .{ .irq_ack = true }) orelse
+                break :blk sc.syscall_err_invalid;
+            const irq = switch (view.payload.*) {
+                .irq => |*value| value,
+                else => break :blk sc.syscall_err_invalid,
+            };
+            if (irq.retired) break :blk sc.syscall_err_closed;
+            pci.quiesceInterruptRoute(irq.device, @intFromEnum(irq.kind), irq.vector) catch |err|
+                break :blk switch (err) {
+                    error.Invalid, error.Unsupported => sc.syscall_err_invalid,
+                    error.Busy, error.NotReady => sc.syscall_err_not_ready,
+                };
+            const object = state.fdEntryConst(proc, fd).?.object;
+            const publication = state.irqPublishSlotForRef(object).?;
+            const count = @atomicLoad(u64, &publication.event_count, .acquire);
+            @atomicStore(u64, &publication.observed_count, count, .release);
+            if (frame.rax == sc.syscall_capsule_irq_retire) {
+                // All potentially failing hardware work precedes this commit.
+                // Old aliases must become terminal before a new owner can
+                // acquire the vector, and their destructors become inert.
+                state.unpublishIrqObject(object);
+                irq.retired = true;
+                pci.commitInterruptRouteRetirement(irq.device, @intFromEnum(irq.kind), irq.vector);
+                fd_syscalls.wakeRetiredIrqWaiters(h, state);
+            }
+            break :blk sc.syscall_ok;
         },
         sc.syscall_capsule_irq_poll => blk: {
+            const fd = u32Arg(frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            const irq = state.irqObjectForFd(proc, fd, .{ .irq_wait = true }) orelse
+                break :blk sc.syscall_err_invalid;
+            if (irq.retired) break :blk sc.syscall_err_closed;
             const count = state.irqEventCountForFd(proc, @intCast(frame.rdi), .{ .irq_wait = true }) orelse break :blk sc.syscall_err_invalid;
             const max_words = frame.r10;
             const flags = u32Arg(frame.r8) orelse break :blk sc.syscall_err_invalid;
@@ -775,44 +888,81 @@ pub fn dispatch(
             }
             break :blk sc.syscall_err_not_ready;
         },
+        sc.syscall_capsule_pci_enumerate => blk: {
+            if (!state.isBootstrapOwner(proc)) break :blk sc.syscall_err_invalid;
+            if (frame.rdi == std.math.maxInt(u64)) {
+                if (!h.write_user_u64(proc, frame.rsi, @intCast(pci.bootFunctionCount())))
+                    break :blk sc.syscall_err_invalid;
+                break :blk sc.syscall_ok;
+            }
+            if (frame.rdi > std.math.maxInt(usize)) break :blk sc.syscall_err_invalid;
+            const function = pci.bootFunctionAt(@intCast(frame.rdi)) orelse break :blk sc.syscall_err_invalid;
+            if (frame.rdx < capsule_abi.pci_function_word_count) break :blk sc.syscall_err_invalid;
+            const words = [_]u64{
+                function.resource_id, function.vendor_id, function.device_id,
+                function.subsystem_id, function.class_code,
+                function.bus, function.device, function.function,
+            };
+            for (words, 0..) |word, index| {
+                const out_va = std.math.add(u64, frame.rsi, @as(u64, @intCast(index * 8))) catch
+                    break :blk sc.syscall_err_invalid;
+                if (!h.write_user_u64(proc, out_va, word))
+                    break :blk sc.syscall_err_invalid;
+            }
+            break :blk capsule_abi.pci_function_word_count;
+        },
+        sc.syscall_capsule_pci_claim => blk: {
+            if (!state.isBootstrapOwner(proc) or frame.rdi > std.math.maxInt(usize))
+                break :blk sc.syscall_err_invalid;
+            const index: usize = @intCast(frame.rdi);
+            const function = pci.bootFunctionAt(index) orelse break :blk sc.syscall_err_invalid;
+            if (pci.bootFunctionClaimed(index)) break :blk sc.syscall_err_invalid;
+            const fd = state.createDeviceFd(proc, function.resource_id, .{
+                .inspect = true, .dup = true, .transfer = true,
+                .set_flags = true, .close = true, .query = true,
+                .config_read = true, .config_write = true,
+                .derive_mmio = true, .derive_dma = true, .derive_irq = true,
+                .mmio_map_read = true, .mmio_map_write = true,
+                .cpu_read = true, .cpu_write = true,
+                .dma_read = true, .dma_write = true,
+                .irq_wait = true, .irq_ack = true, .bus_master = true,
+            }, .{}, first_dynamic_fd) catch |err| break :blk statusFromKernelError(err);
+            pci.markBootFunctionClaimed(index);
+            break :blk fd;
+        },
         sc.syscall_capsule_pci_config_read => blk: {
             const device = requireDeviceFd(state, proc, @intCast(frame.rdi), deviceRequired(.{ .config_read = true })) orelse break :blk sc.syscall_err_invalid;
             const offset = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const len = u32Arg(frame.r10) orelse break :blk sc.syscall_err_invalid;
-            if (!validatePciConfigRange(offset, len)) break :blk sc.syscall_err_invalid;
             const loc = pci.locationFromResourceId(device.device) orelse break :blk sc.syscall_err_invalid;
-            var bytes: [pci_config_size]u8 = undefined;
+            const value = pci.readConfig(loc, offset, len) orelse break :blk sc.syscall_err_invalid;
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, value, .little);
             const len_usize: usize = @intCast(len);
-            var i: usize = 0;
-            while (i < len_usize) : (i += 1) {
-                const config_offset: u8 = @intCast(offset + @as(u32, @intCast(i)));
-                bytes[i] = pci.readConfigU8(loc, config_offset);
-            }
             if (!h.copy_bytes_to_user_va(proc, frame.rdx, bytes[0..len_usize])) break :blk sc.syscall_err_invalid;
             break :blk sc.syscall_ok;
         },
         sc.syscall_capsule_pci_config_write => blk: {
             const device = requireDeviceFd(state, proc, @intCast(frame.rdi), deviceRequired(.{ .config_write = true })) orelse break :blk sc.syscall_err_invalid;
+            // A failed IOMMU drain is terminal for this device ownership.
+            // Do not let config writes re-enable a quarantined bus master.
+            if (iommu.deviceQuarantined(device.device)) break :blk sc.syscall_err_invalid;
             const offset = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             const len = u32Arg(frame.r10) orelse break :blk sc.syscall_err_invalid;
-            if (!validatePciConfigRange(offset, len)) break :blk sc.syscall_err_invalid;
             const loc = pci.locationFromResourceId(device.device) orelse break :blk sc.syscall_err_invalid;
-            var bytes: [pci_config_size]u8 = undefined;
+            if (!pci.configAccessValid(loc, offset, len)) break :blk sc.syscall_err_invalid;
+            var bytes: [4]u8 = .{ 0, 0, 0, 0 };
             const len_usize: usize = @intCast(len);
             if (!h.copy_user_bytes_from_va(proc, frame.rdx, bytes[0..len_usize])) break :blk sc.syscall_err_invalid;
-            var i: usize = 0;
-            while (i < len_usize) : (i += 1) {
-                const config_offset: u8 = @intCast(offset + @as(u32, @intCast(i)));
-                pci.writeConfigU8(loc, config_offset, bytes[i]);
-            }
+            if (!pci.writeConfig(loc, offset, len, std.mem.readInt(u32, &bytes, .little)))
+                break :blk sc.syscall_err_invalid;
             break :blk sc.syscall_ok;
         },
         sc.syscall_capsule_pci_bar_info => blk: {
             const device = requireDeviceFd(state, proc, @intCast(frame.rdi), deviceRequired(.{})) orelse break :blk sc.syscall_err_invalid;
             const bar_index = u32Arg(frame.rsi) orelse break :blk sc.syscall_err_invalid;
             if (bar_index >= capsule_abi.pci_bar_count) break :blk sc.syscall_err_invalid;
-            const loc = pci.locationFromResourceId(device.device) orelse break :blk sc.syscall_err_invalid;
-            const info = pci.probeBarInfo(loc, @intCast(bar_index)) orelse break :blk sc.syscall_err_invalid;
+            const info = pci.authorizedBarInfo(device.device, @intCast(bar_index)) orelse break :blk sc.syscall_err_invalid;
             if (!writePciBarInfo(h, proc, frame.rdx, frame.r10, info)) break :blk sc.syscall_err_invalid;
             break :blk @as(u64, @intCast(capsule_abi.bar_info_word_count));
         },

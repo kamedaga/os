@@ -12,12 +12,24 @@
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <virtgpu_drm.h>
 #include <linux/memfd.h>
 #include <linux/udmabuf.h>
 
 #define DRM_FORMAT_XRGB8888 0x34325258u
-#define DRM_FORMAT_MOD_LINEAR 0ull
 
+/* The current virtio-gpu transfer request includes explicit row and layer
+ * strides. Alpine's build sysroot still carries the older public struct. */
+struct prime_virtgpu_transfer {
+    uint32_t bo_handle;
+    struct drm_virtgpu_3d_box box;
+    uint32_t level;
+    uint32_t offset;
+    uint32_t stride;
+    uint32_t layer_stride;
+};
+
+#define PRIME_IOCTL_VIRTGPU_TRANSFER_TO_HOST 0xc02c6447ul
 static int fail(const char *op)
 {
     fprintf(stderr, "PRIME_FAIL op=%s errno=%d\n", op, errno);
@@ -94,30 +106,38 @@ static int import_and_write_child(
     uint32_t gbm_handle = 0;
     if (drmPrimeFDToHandle(gbm_device_get_fd(gbm), prime_fd, &gbm_handle) != 0 ||
         gbm_handle == 0) return fail("child-gbm-card-prime-import");
-    struct gbm_import_fd_modifier_data data;
+    struct gbm_import_fd_data data;
     memset(&data, 0, sizeof(data));
     data.width = width;
     data.height = height;
     data.format = DRM_FORMAT_XRGB8888;
-    data.num_fds = 1;
-    data.fds[0] = prime_fd;
-    data.strides[0] = (int)stride;
-    data.modifier = DRM_FORMAT_MOD_LINEAR;
+    data.fd = prime_fd;
+    data.stride = stride;
     struct gbm_bo *imported = gbm_bo_import(
-        gbm, GBM_BO_IMPORT_FD_MODIFIER, &data, 0);
+        gbm, GBM_BO_IMPORT_FD, &data, 0);
     if (imported == NULL) return fail("child-gbm-import");
     if (gbm_bo_get_plane_count(imported) != 1) return fail("child-gbm-import-planes");
     int reexported = -1;
     if (drmPrimeHandleToFD(card, child_handle, DRM_CLOEXEC | DRM_RDWR, &reexported) != 0 ||
         reexported < 0) return fail("child-gbm-reexport");
     size_t bytes = (size_t)stride * height;
-    uint32_t *pixels = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, reexported, 0);
+    uint32_t *pixels = mmap(
+        NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, reexported, 0);
     if (pixels == MAP_FAILED) return fail("child-dmabuf-mmap");
     const uint32_t words = stride / 4u;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) pixels[y * words + x] = 0x0000ffffu;
     }
     if (munmap(pixels, bytes) != 0) return fail("child-dmabuf-munmap");
+    struct prime_virtgpu_transfer transfer = {
+        .bo_handle = child_handle,
+        .box = {.w = width, .h = height, .d = 1},
+    };
+    if (ioctl(card, PRIME_IOCTL_VIRTGPU_TRANSFER_TO_HOST, &transfer) != 0)
+        return fail("child-transfer-to-host");
+    struct drm_virtgpu_3d_wait wait = {.handle = child_handle};
+    if (ioctl(card, DRM_IOCTL_VIRTGPU_WAIT, &wait) != 0)
+        return fail("child-transfer-wait");
     printf("PRIME_CHILD_IMPORT_OK handle=%u reexport=1 color=00ffff\n",
         child_handle);
     fflush(stdout);
@@ -130,7 +150,6 @@ static int import_and_write_child(
 
 int main(int argc, char **argv)
 {
-    if (setenv("GBM_ALWAYS_SOFTWARE", "1", 1) != 0) return fail("set-gbm-software");
     if (argc == 6 && strcmp(argv[1], "--child") == 0) {
         return import_and_write_child(
             -1,
@@ -145,20 +164,17 @@ int main(int argc, char **argv)
     uint64_t prime_cap = 0, modifier_cap = 0;
     if (drmGetCap(card, DRM_CAP_PRIME, &prime_cap) != 0 ||
         prime_cap != (DRM_PRIME_CAP_IMPORT | DRM_PRIME_CAP_EXPORT)) return fail("cap-prime");
-    if (drmGetCap(card, DRM_CAP_ADDFB2_MODIFIERS, &modifier_cap) != 0 || modifier_cap != 1) {
-        return fail("cap-modifiers");
-    }
+    if (drmGetCap(card, DRM_CAP_ADDFB2_MODIFIERS, &modifier_cap) != 0 ||
+        modifier_cap != 0) return fail("cap-modifiers");
     drmModeRes *resources = drmModeGetResources(card);
     drmModeConnector *connector = resources != NULL ? connected_connector(card, resources) : NULL;
     if (resources == NULL || connector == NULL || resources->count_crtcs != 1) return fail("resources");
     drmModeModeInfo mode = connector->modes[0];
-    const uint64_t modifiers[] = { DRM_FORMAT_MOD_LINEAR };
     struct gbm_device *gbm = gbm_create_device(card);
     if (gbm == NULL) return fail("gbm-device");
-    struct gbm_bo *bo = gbm_bo_create_with_modifiers2(
-        gbm, mode.hdisplay, mode.vdisplay, DRM_FORMAT_XRGB8888,
-        modifiers, 1, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-    if (bo == NULL) return fail("gbm-create-modifier");
+    struct gbm_bo *bo = gbm_bo_create(gbm, mode.hdisplay, mode.vdisplay,
+        DRM_FORMAT_XRGB8888, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+    if (bo == NULL) return fail("gbm-create");
     if (gbm_bo_get_plane_count(bo) != 1) return fail("gbm-plane-count");
     const uint32_t stride = gbm_bo_get_stride(bo);
     int prime_fd = gbm_bo_get_fd(bo);
@@ -198,20 +214,37 @@ int main(int argc, char **argv)
         return fail("child-status");
     }
 
+    const size_t shared_bytes = (size_t)stride * mode.vdisplay;
+    const uint32_t shared_words = stride / 4u;
+    const uint32_t *shared_pixels = mmap(
+        NULL, shared_bytes, PROT_READ, MAP_SHARED, prime_fd, 0);
+    if (shared_pixels == MAP_FAILED) return fail("parent-dmabuf-map-verify");
+    for (uint32_t y = 0; y < mode.vdisplay; ++y) {
+        for (uint32_t x = 0; x < mode.hdisplay; ++x) {
+            if (shared_pixels[(size_t)y * shared_words + x] == 0x0000ffffu)
+                continue;
+            errno = EIO;
+            return fail("parent-dmabuf-pixel-verify");
+        }
+    }
+    if (munmap((void *)shared_pixels, shared_bytes) != 0)
+        return fail("parent-dmabuf-unmap-verify");
+    printf("PRIME_CROSS_PROCESS_PIXELS_OK pixels=%u color=00ffff\n",
+        mode.hdisplay * mode.vdisplay);
+    fflush(stdout);
+
     if (drmCloseBufferHandle(card, first_handle) != 0) return fail("close-first-handle");
     gbm_bo_destroy(bo);
     bo = NULL;
-    struct gbm_import_fd_modifier_data data;
+    struct gbm_import_fd_data data;
     memset(&data, 0, sizeof(data));
     data.width = mode.hdisplay;
     data.height = mode.vdisplay;
     data.format = DRM_FORMAT_XRGB8888;
-    data.num_fds = 1;
-    data.fds[0] = prime_fd;
-    data.strides[0] = (int)stride;
-    data.modifier = DRM_FORMAT_MOD_LINEAR;
+    data.fd = prime_fd;
+    data.stride = stride;
     struct gbm_bo *display_bo = gbm_bo_import(
-        gbm, GBM_BO_IMPORT_FD_MODIFIER, &data, GBM_BO_USE_SCANOUT);
+        gbm, GBM_BO_IMPORT_FD, &data, GBM_BO_USE_SCANOUT);
     if (display_bo == NULL || gbm_bo_get_plane_count(display_bo) != 1) {
         return fail("parent-gbm-reimport-after-handle-close");
     }
@@ -235,12 +268,11 @@ int main(int argc, char **argv)
     uint32_t handles[4] = { display_handle, 0, 0, 0 };
     uint32_t pitches[4] = { stride, 0, 0, 0 };
     uint32_t offsets[4] = { 0, 0, 0, 0 };
-    uint64_t fb_modifiers[4] = { DRM_FORMAT_MOD_LINEAR, 0, 0, 0 };
     uint32_t fb_id = 0;
-    if (drmModeAddFB2WithModifiers(
+    if (drmModeAddFB2(
         card, mode.hdisplay, mode.vdisplay, DRM_FORMAT_XRGB8888,
-        handles, pitches, offsets, fb_modifiers, &fb_id, DRM_MODE_FB_MODIFIERS) != 0) {
-        return fail("addfb2-modifier");
+        handles, pitches, offsets, &fb_id, 0) != 0) {
+        return fail("addfb2");
     }
     if (drmModeSetCrtc(
         card, resources->crtcs[0], fb_id, 0, 0, &connector->connector_id, 1, &mode) != 0) {
@@ -248,9 +280,9 @@ int main(int argc, char **argv)
     }
     printf("PRIME_CROSS_PROCESS_DISPLAY_OK imported_handle=%u fb=%u modifier=linear color=00ffff\n",
         display_handle, fb_id);
+    fflush(stdout);
     printf("PRIME_SMOKE_DONE\n");
     fflush(stdout);
-    sleep(1);
     close(card);
     return 0;
 }

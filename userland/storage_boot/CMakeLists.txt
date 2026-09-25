@@ -93,6 +93,8 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/storage_boot/boot_config.h"
     "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/ipc.h"
+    "${REPO_ROOT}/userland/libipc/include/pacha/launch.h"
     "${REPO_ROOT}/userland/storage/include/storage/stack.h"
     "${REPO_ROOT}/userland/storage/include/storage/stack.def"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"

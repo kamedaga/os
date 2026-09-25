@@ -36,7 +36,8 @@ pub fn smpBootResourcesOrHalt(requests: Requests) entry.LimineSmpResources {
     const memmap = requests.memmap.response orelse {
         halt.haltWithMessage("Limine memory map response missing");
     };
-    const required_bytes = @as(u64, @intCast(x86_platform.max_cpus)) * page_bytes;
+    // The serial AP handshake permits one shared low-memory trampoline.
+    const required_bytes = page_bytes;
     var trampoline_base: u64 = 0;
     var i: u64 = 0;
     while (i < memmap.entry_count) : (i += 1) {
@@ -116,16 +117,14 @@ pub fn framebufferInfoOrHalt(requests: Requests) boot_resources.FramebufferInfo 
         halt.haltWithMessage("Limine framebuffer mode unsupported");
     }
     const paddr = hhdmPtrToPaddr(requests, framebuffer.address);
-    const size_bytes_u64 = framebuffer.pitch * framebuffer.height;
-    if (size_bytes_u64 == 0 or size_bytes_u64 > boot_static.framebuffer_window_bytes) {
-        halt.haltWithMessage("Limine framebuffer too large");
-    }
-    if (paddr >= boot_static.four_gib or (paddr & 0xFFF) != 0) {
-        halt.haltWithMessage("Limine framebuffer physical address unsupported");
-    }
+    const size_bytes = boot_resources.framebufferBytes(paddr,
+        framebuffer.width, framebuffer.height, framebuffer.pitch,
+        boot_static.physical_map_limit_exclusive) catch |err| {
+        halt.haltWithError("Limine framebuffer invalid: ", err);
+    };
     return .{
         .paddr = paddr,
-        .size_bytes = @intCast(size_bytes_u64),
+        .size_bytes = size_bytes,
         .width = @intCast(framebuffer.width),
         .height = @intCast(framebuffer.height),
         .pixels_per_scan_line = @intCast(framebuffer.pitch / 4),

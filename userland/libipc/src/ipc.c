@@ -3,6 +3,12 @@
 #include <string.h>
 #include "pacha/syscall.h"
 
+int pacha_fd_table(uint64_t minimum_capacity, struct pacha_fd_table_info *out) {
+    if (!out) return PACHA_ERR_INVALID;
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_TABLE,
+        minimum_capacity, (uint64_t)(uintptr_t)out));
+}
+
 int pacha_ipc_endpoint_create(uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_ENDPOINT_CREATE, rights, flags));
 }
@@ -53,8 +59,11 @@ int pacha_ipc_reply(int reply_fd, const struct pacha_ipc_msg *msg) {
     return pacha_status_to_int(pacha_syscall2(PACHA_IPC_SYSCALL_REPLY, (uint64_t)(uint32_t)reply_fd, (uint64_t)(uintptr_t)msg));
 }
 
-int pacha_process_create(uint64_t rights, uint32_t flags) {
-    return pacha_fd_result_to_int(pacha_syscall3(PACHA_PROCESS_SYSCALL_CREATE, 0, rights, flags));
+int pacha_process_create(uint64_t rights, uint32_t flags,
+    const struct pacha_process_fd_grant *grants, uint64_t count) {
+    if (count > PACHA_PROCESS_CREATE_MAX_GRANTS || (count && !grants)) return -1;
+    return pacha_fd_result_to_int(pacha_syscall5(PACHA_PROCESS_SYSCALL_CREATE,
+        0, rights, flags, (uint64_t)(uintptr_t)grants, count));
 }
 
 int pacha_process_clone(uint64_t rights, uint32_t flags) {
@@ -77,8 +86,29 @@ int pacha_thread_start(int thread_fd) {
     return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_START, (uint64_t)(uint32_t)thread_fd));
 }
 
+int pacha_thread_get_context(int thread_fd, struct pacha_thread_context *context) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_THREAD_SYSCALL_CONTEXT,
+        (uint64_t)(uint32_t)thread_fd, PACHA_THREAD_CONTEXT_GET,
+        (uint64_t)(uintptr_t)context, sizeof(*context)));
+}
+
+int pacha_thread_set_context(int thread_fd, const struct pacha_thread_context *context) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_THREAD_SYSCALL_CONTEXT,
+        (uint64_t)(uint32_t)thread_fd, PACHA_THREAD_CONTEXT_SET,
+        (uint64_t)(uintptr_t)context, sizeof(*context)));
+}
+
 int pacha_thread_set_gs_base(uint64_t gs_base) {
     return pacha_status_to_int(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, gs_base));
+}
+
+int pacha_thread_signal(int thread_fd, unsigned int notification) {
+    return pacha_status_to_int(pacha_syscall2(PACHA_THREAD_SYSCALL_SIGNAL, (uint64_t)(uint32_t)thread_fd, notification));
+}
+
+int pacha_thread_register_fault(uint64_t entry_rip, uint64_t stack_base, uint64_t stack_size) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_PROCESS_SYSCALL_SIGNAL_CTL,
+        PACHA_PROCESS_SIGNAL_CTL_REGISTER_FAULT, entry_rip, stack_base, stack_size));
 }
 
 long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset) {
@@ -103,6 +133,11 @@ long pacha_process_map_flags(
         prot,
         vmo_offset | flags
     );
+}
+
+int pacha_process_unmap(int process_fd, uint64_t target_va, uint64_t size, uint64_t flags) {
+    return pacha_status_to_int(pacha_syscall4(PACHA_PROCESS_SYSCALL_UNMAP,
+        (uint64_t)(uint32_t)process_fd, target_va, size, flags));
 }
 
 int pacha_process_map_batch(
@@ -206,8 +241,42 @@ int pacha_service_wait_add(struct pacha_service_wait_set *set, int fd, uint32_t 
 
 long pacha_service_wait(struct pacha_service_wait_set *set, uint64_t timeout_ticks) {
     if (set == NULL || set->count == 0 || set->count > PACHA_SERVICE_WAIT_MAX_FDS) return -1;
-    for (uint64_t i = 0; i < set->count; i++) set->fds[i].revents = 0;
-    return pacha_fd_wait_many(set->fds, set->count, timeout_ticks);
+    return pacha_fd_wait_many_batched(set->fds, set->count, timeout_ticks);
+}
+
+long pacha_fd_wait_many_batched(struct pacha_pollfd *fds, uint64_t total,
+    uint64_t timeout_ticks) {
+    if (!fds || !total || total > SIZE_MAX / sizeof(*fds)) return PACHA_ERR_INVALID;
+    for (uint64_t i = 0; i < total; i++) fds[i].revents = 0;
+    /* kernel/abi/fd_abi.zig limits each native poll to 256 items, even
+     * when the service's descriptor table and wait set have grown larger. */
+    enum { NATIVE_WAIT_BATCH = 256 };
+    if (total <= NATIVE_WAIT_BATCH)
+        return pacha_fd_wait_many(fds, total, timeout_ticks);
+    uint64_t cursor = 0;
+    for (;;) {
+        long ready = 0;
+        for (uint64_t start = 0; start < total; start += NATIVE_WAIT_BATCH) {
+            const uint64_t remaining = total - start;
+            const uint64_t count = remaining < NATIVE_WAIT_BATCH ? remaining : NATIVE_WAIT_BATCH;
+            const long status = pacha_fd_wait_many(fds + start, count, 0);
+            if (status > 0) ready += status;
+            else if (status != PACHA_ERR_NOT_READY && status != 0) return status;
+        }
+        if (ready) return ready;
+        if (!timeout_ticks) return PACHA_ERR_NOT_READY;
+        /* Never wait forever on one subset: an event in another subset
+         * must be observed on the next sweep. Rotate the blocking subset
+         * and bound that sleep to one kernel tick. */
+        const uint64_t remaining = total - cursor;
+        const uint64_t count = remaining < NATIVE_WAIT_BATCH ? remaining : NATIVE_WAIT_BATCH;
+        const long status = pacha_fd_wait_many(fds + cursor, count, 1);
+        if (status > 0) return status;
+        if (status != PACHA_ERR_NOT_READY && status != 0) return status;
+        if (timeout_ticks != PACHA_FD_WAIT_FOREVER) --timeout_ticks;
+        cursor += count;
+        if (cursor == total) cursor = 0;
+    }
 }
 
 uint64_t pacha_service_wait_revents(
@@ -262,6 +331,18 @@ int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, size, rights, flags));
 }
 
+int pacha_vmo_create_page_view(int parent_fd, const uint64_t *page_indices,
+                               uint64_t page_count, uint64_t rights, uint32_t flags) {
+    return pacha_fd_result_to_int(pacha_syscall5(
+        PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
+        (uint64_t)(uint32_t)parent_fd,
+        (uint64_t)(uintptr_t)page_indices,
+        page_count,
+        rights,
+        flags
+    ));
+}
+
 int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) {
     return pacha_fd_result_to_int(pacha_syscall4(
         PACHA_CAPSULE_SYSCALL_DMA_POOL_CREATE,
@@ -270,6 +351,11 @@ int pacha_vmo_create_contiguous(uint64_t size, uint64_t rights, uint32_t flags) 
         flags,
         0
     ));
+}
+
+int pacha_vmo_grow(int fd, uint64_t new_capacity) {
+    return pacha_status_to_int(pacha_syscall2(PACHA_FD_SYSCALL_VMO_GROW,
+        (uint64_t)(uint32_t)fd, new_capacity));
 }
 
 int pacha_vmo_revoke(int fd) {

@@ -9,10 +9,9 @@
 #include "filed/limits.h"
 
 #define FILED_MAX_MOUNTS 16u
-#define FILED_MAX_VNODES 256u
-#define FILED_MAX_FILES 256u
-#define FILED_MAX_HANDLES 256u
-#define FILED_MAX_TRANSFER_LEASES 64u
+#define FILED_VNODE_BANK_ENTRIES 32u
+#define FILED_FILE_BANK_ENTRIES 32u
+#define FILED_HANDLE_BANK_ENTRIES 32u
 #define FILED_ID_HINT_SLOTS 1024u
 
 typedef uint32_t filed_mount_id_t;
@@ -137,29 +136,63 @@ typedef struct filed_handle {
     uint32_t fd_flags;
     filed_generation_t generation;
     uint32_t owner_session;
+    uint64_t owner_client;
     int32_t lease_fd;
+    /* Slot plus one, zero for no link. A lease consumes its existing handle,
+     * not a second independently bounded registry. */
+    uint32_t lease_prev;
+    uint32_t lease_next;
 } filed_handle_t;
 
 typedef struct filed_vfs {
+    uint64_t actor_client;
+    uint32_t actor_rights;
     filed_mount_t mounts[FILED_MAX_MOUNTS];
-    filed_vnode_t vnodes[FILED_MAX_VNODES];
-    filed_file_t files[FILED_MAX_FILES];
-    filed_handle_t handles[FILED_MAX_HANDLES];
-    uint16_t vnode_slot_hints[FILED_ID_HINT_SLOTS];
-    uint16_t file_slot_hints[FILED_ID_HINT_SLOTS];
-    uint16_t handle_slot_hints[FILED_ID_HINT_SLOTS];
-    uint16_t child_slot_hints[FILED_ID_HINT_SLOTS];
+    filed_vnode_t **vnode_banks;
+    uint32_t vnode_capacity;
+    filed_file_t **file_banks;
+    uint32_t file_capacity;
+    filed_handle_t **handle_banks;
+    uint32_t handle_capacity;
+    uint32_t vnode_slot_hints[FILED_ID_HINT_SLOTS];
+    uint32_t file_slot_hints[FILED_ID_HINT_SLOTS];
+    uint32_t handle_slot_hints[FILED_ID_HINT_SLOTS];
+    uint32_t child_slot_hints[FILED_ID_HINT_SLOTS];
     filed_mount_id_t next_mount_id;
     filed_vnode_id_t next_vnode_id;
     filed_file_id_t next_file_id;
     filed_handle_id_t next_handle_id;
     uint64_t vnode_clock;
-    uint16_t next_vnode_slot;
-    uint16_t next_file_slot;
-    uint16_t next_handle_slot;
-    uint16_t lease_handle_count;
-    filed_handle_id_t lease_handle_ids[FILED_MAX_TRANSFER_LEASES];
+    uint32_t next_vnode_slot;
+    uint32_t next_file_slot;
+    uint32_t next_handle_slot;
+    uint32_t lease_handle_count;
+    uint32_t lease_head;
 } filed_vfs_t;
+
+/* The directory may move during growth; vnode addresses never do. */
+static inline filed_vnode_t *filed_vfs_vnode_at(const filed_vfs_t *vfs, uint32_t slot)
+{
+    return &vfs->vnode_banks[slot / FILED_VNODE_BANK_ENTRIES]
+        [slot % FILED_VNODE_BANK_ENTRIES];
+}
+
+static inline filed_file_t *filed_vfs_file_at(const filed_vfs_t *vfs, uint32_t slot)
+{
+    return &vfs->file_banks[slot / FILED_FILE_BANK_ENTRIES]
+        [slot % FILED_FILE_BANK_ENTRIES];
+}
+
+static inline filed_handle_t *filed_vfs_handle_at(const filed_vfs_t *vfs, uint32_t slot)
+{
+    return &vfs->handle_banks[slot / FILED_HANDLE_BANK_ENTRIES]
+        [slot % FILED_HANDLE_BANK_ENTRIES];
+}
+
+/* Between operations only; active nodes and externally visible IDs survive. */
+void filed_vfs_trim_vnodes(filed_vfs_t *vfs);
+void filed_vfs_trim_open_objects(filed_vfs_t *vfs);
+void filed_vfs_destroy(filed_vfs_t *vfs);
 
 typedef struct filed_vfs_open_result {
     filed_handle_id_t handle_id;
@@ -215,6 +248,7 @@ typedef bool (*filed_vfs_backend_evictable_fn)(
     filed_backend_object_id_t backend_object);
 
 const char *filed_status_name(filed_status_t status);
+/* Initialize fresh storage; call destroy before reinitializing a used VFS. */
 void filed_vfs_init(filed_vfs_t *vfs);
 bool filed_rights_include(uint32_t available, uint32_t requested);
 uint32_t filed_fd_flags_from_open(uint32_t open_flags);

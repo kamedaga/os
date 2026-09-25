@@ -90,6 +90,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/pachaos_capsule/boot_config.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     ${KOBOX_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM

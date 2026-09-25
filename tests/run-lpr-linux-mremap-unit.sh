@@ -14,9 +14,10 @@ mkdir -p "$out_dir"
   -I"$repo_root/userland/daemons/common/include" \
   -I"$repo_root/userland/filed/include" \
   -I"$repo_root/userland/termd/include" \
-  -I"$repo_root/userland/drmd/include" \
+  -I"$repo_root/userland/gpud/include" \
   -I"$repo_root/userland/inputd/include" \
   -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/lpr_supervisor/include" \
   "$repo_root/userland/personality/linux/runtime/lpr_memory.c" \
   "$repo_root/userland/libipc/src/status.c" \

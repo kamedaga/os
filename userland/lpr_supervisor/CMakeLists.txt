@@ -7,20 +7,37 @@ project(lpr_supervisor C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(LPR_SUPERVISOR_ELF "${CMAKE_BINARY_DIR}/lpr_supervisor.elf")
+option(LPRS_TEST_CREDENTIALS "Seed distinct IDs for QEMU credential regression only" OFF)
+set(LPRS_TEST_CFLAGS "-D__pachaos__")
+if(LPRS_TEST_CREDENTIALS)
+  string(APPEND LPRS_TEST_CFLAGS " -DLPRS_TEST_CREDENTIALS=1")
+endif()
 
 add_custom_command(
   OUTPUT "${LPR_SUPERVISOR_ELF}"
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libpacha/src/trace.c"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${CMAKE_CURRENT_SOURCE_DIR}/src/accounts.c ${REPO_ROOT}/userland/libaccount/src/account.c ${REPO_ROOT}/userland/unixd/src/client.c ${REPO_ROOT}/userland/unixd/src/client_wire.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libpacha/src/trace.c"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libaccount/include ${REPO_ROOT}/userland/unixd/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
+      "PACHAOS_MUSL_EXTRA_CFLAGS=${LPRS_TEST_CFLAGS}"
       bash "${REPO_ROOT}/musl/pachaos/build/build-app-dynamic.sh" "${LPR_SUPERVISOR_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/accounts.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/accounts.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/credentials.h"
+    "${REPO_ROOT}/userland/libaccount/src/account.c"
+    "${REPO_ROOT}/userland/libaccount/include/pacha/account.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/lpr_supervisor/boot_config.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/lpr_supervisor/ipc_protocol.h"
+    "${REPO_ROOT}/userland/unixd/src/client.c"
+    "${REPO_ROOT}/userland/unixd/src/client_wire.c"
+    "${REPO_ROOT}/userland/unixd/include/unixd/client.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/ipc_protocol.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/poll.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/transport.h"
+    "${REPO_ROOT}/userland/unixd/include/unixd/transfer.h"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libipc/src/status.c"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"

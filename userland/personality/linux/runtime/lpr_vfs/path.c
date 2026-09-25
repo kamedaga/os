@@ -1,27 +1,89 @@
 #include "../lpr_filed_internal.h"
+#include "filed/identity.h"
+
+static int lpr_filed_adopt_on_connection(uint64_t handle, int lease_fd);
 
 int64_t lpr_filed_endpoint_ready(void)
 {
-    if (lpr_filed_endpoint_checked > 0) {
-        return 0;
-    }
+    if (__atomic_load_n(&lpr_filed_endpoint_checked, __ATOMIC_ACQUIRE) > 0) return 0;
+    lpr_state_lock(&lpr_state.filed_rpc.connection_lock);
+    int64_t status = 0;
+    if (lpr_filed_endpoint_checked > 0) goto done;
     if (lpr_filed_endpoint_checked < 0) {
-        return -LPR_LINUX_ENOSYS;
+        status = -LPR_LINUX_ENOSYS;
+        goto done;
     }
-    struct pacha_fd_info info;
-    lpr_memset(&info, 0, sizeof(info));
-    const int64_t status = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_FD_GET_INFO,
-        LPR_FILED_ENDPOINT_FD,
-        (uint64_t)(uintptr_t)&info);
-    if (status != 0 ||
-        (info.kind != PACHA_FD_KIND_ENDPOINT && info.kind != PACHA_FD_KIND_CHANNEL))
-    {
-        lpr_filed_endpoint_checked = -1;
-        return -LPR_LINUX_ENOSYS;
+    lpr_linux_process_state_init();
+    if (!lpr_supervisor_enabled) { status = -LPR_LINUX_ENOSYS; goto done; }
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 16) { status = page_fd; goto done; }
+    status = lpr_process_client_service_session(LPRS_OP_PROCESS_FILED_SESSION,
+        &lpr_request_id, lpr_pacha_status_to_errno, lpr_supervisor_token,
+        page_fd, page, &lpr_filed_client_id, &lpr_filed_client_fd);
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    if (status) goto done;
+    /* Manifest/fork leases are capabilities, not authority inferred from the
+     * serialized handle numbers. Bind each to this new process connection. */
+    lpr_fd_table_lock(&lpr_control_fd_table);
+    for (uint32_t i = 0; i < lpr_control_fd_table.backend_count; i++) {
+        lpr_backend_record_t *record = &lpr_control_fd_table.backends[i];
+        if (!record->active || record->ops_id != LPR_FD_OPS_FILED) continue;
+        lpr_filed_backend_t *file = record->state;
+        if ((file->reserved2 & LPR_BACKEND_TRANSFER_LEASE) && file->lease_fd.raw >= 16) {
+            status = lpr_filed_adopt_on_connection(file->handle, file->lease_fd.raw);
+            if (status) break;
+        }
     }
-    lpr_filed_endpoint_checked = 1;
+    lpr_fd_table_unlock(&lpr_control_fd_table);
+    if (!status && lpr_cwd_lease_fd >= 16) {
+        lpr_cwd_init();
+        status = lpr_filed_adopt_on_connection(lpr_cwd_handle, lpr_cwd_lease_fd);
+    }
+    if (status) {
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)lpr_filed_client_fd);
+        lpr_filed_client_fd = -1;
+    }
+    __atomic_store_n(&lpr_filed_endpoint_checked, status ? -1 : 1, __ATOMIC_RELEASE);
+done:
+    lpr_state_unlock(&lpr_state.filed_rpc.connection_lock);
+    return status;
+}
+
+int lpr_filed_lease_pair(int *local, int *remote)
+{
+    uint64_t pair[2] = {0};
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CALL | PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_RECV |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    int64_t status = lpr_pacha_syscall3(PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
+        (uint64_t)(uintptr_t)pair, rights, 0);
+    if (status) return (int)lpr_pacha_status_to_errno(status);
+    *local = (int)pair[0];
+    *remote = (int)pair[1];
     return 0;
+}
+
+static int lpr_filed_adopt_on_connection(uint64_t handle, int lease_fd)
+{
+    struct pacha_ipc_msg request = { .word0 = FILED_LEASE_MAGIC, .word1 = handle,
+        .word2 = lpr_filed_client_id, .word3 = handle };
+    int64_t reply_fd = lpr_native_ipc_call_wait((uint64_t)lease_fd, &request);
+    if (reply_fd < 16) return (int)lpr_pacha_status_to_errno(reply_fd);
+    struct pacha_ipc_msg reply = {0};
+    int status = (int)lpr_native_ipc_recv_wait((uint64_t)reply_fd, &reply);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)reply_fd);
+    if (status) return (int)lpr_pacha_status_to_errno(status);
+    if (reply.word0 != FILED_LEASE_MAGIC || reply.word2 != handle || reply.word3 != handle)
+        return -LPR_LINUX_EIO;
+    return (int)(int64_t)reply.word1;
+}
+
+int lpr_filed_adopt(uint64_t handle, int lease_fd)
+{
+    int status = (int)lpr_filed_endpoint_ready();
+    return status ? status : lpr_filed_adopt_on_connection(handle, lease_fd);
 }
 
 int64_t lpr_filed_session_connect(void)
@@ -149,6 +211,7 @@ int64_t lpr_filed_session_connect(void)
         PACHA_FD_RIGHT_MAP_WRITE;
     fds[1].fd = pair[1];
     fds[1].rights =
+        PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_WAIT |
         PACHA_FD_RIGHT_POLL |
@@ -162,7 +225,7 @@ int64_t lpr_filed_session_connect(void)
     request.fds = fds;
     request.fd_count = 3;
     const int64_t reply_fd = lpr_native_ipc_call_wait(
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         &request);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, pair[1]);
     if (reply_fd < 16) {
@@ -636,9 +699,17 @@ void lpr_destroy_tty_wire_page(int fd, void *page)
 
 void lpr_reset_fork_child_rpc_state(void)
 {
+    /* PRIVATE control capability was not inherited. Its old numeric slot
+     * may now name another child capability; never close it by stale number. */
+    lpr_filed_client_fd = -1;
+    lpr_filed_client_id = 0;
+    lpr_filed_endpoint_checked = 0;
+    lpr_state.filed_rpc.connection_lock = 0;
     lpr_file_image_cache_after_fork_child();
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
+    lpr_state.caches.page_lock_word = 0;
+    lpr_page_cache_clear();
     lpr_state.termd_rpc.lock_word = 0;
     lpr_state.netd_rpc.lock_word = 0;
     lpr_state.netd_rpc.endpoint_checked = 0;
@@ -855,6 +926,15 @@ int lpr_supervisor_get_owner(lprs_process_state_t *out_state, int *out_process_f
         0,
         out_process_fd);
     if (status == 0) {
+        const pacha_service_envelope_t *header = page;
+        if (header->reply_payload_size != sizeof(*out_state)) {
+            if (*out_process_fd >= 16) {
+                (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)*out_process_fd);
+                *out_process_fd = -1;
+            }
+            lpr_destroy_standalone_wire_page(page_fd, page);
+            return -LPR_LINUX_EIO;
+        }
         lpr_memcpy(out_state, lpr_supervisor_payload(page), sizeof(*out_state));
     }
     lpr_destroy_standalone_wire_page(page_fd, page);
@@ -914,12 +994,146 @@ int lpr_supervisor_list_processes(
     return raw_status == 0 ? 0 : (int)raw_status;
 }
 
+int lpr_supervisor_set_comm(const char *path)
+{
+    if (path == 0 || !lpr_supervisor_enabled || lpr_supervisor_token == 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    const uint64_t length = (uint64_t)lpr_strnlen(path, FILED_PATH_BYTES);
+    if (length == 0) return -LPR_LINUX_EINVAL;
+
+    /* comm is the last path component, the way Linux derives it. */
+    uint64_t base = length;
+    while (base > 0 && path[base - 1u] != '/') base -= 1u;
+
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_process_set_comm_t *req =
+        (lprs_process_set_comm_t *)lpr_supervisor_payload(page);
+    req->token = lpr_supervisor_token;
+
+    uint64_t comm_length = length - base;
+    if (comm_length > sizeof(req->comm) - 1u) comm_length = sizeof(req->comm) - 1u;
+    lpr_memcpy(req->comm, path + base, (size_t)comm_length);
+    req->comm[comm_length] = '\0';
+
+    uint64_t cmdline_length = length;
+    if (cmdline_length > sizeof(req->cmdline) - 1u)
+        cmdline_length = sizeof(req->cmdline) - 1u;
+    lpr_memcpy(req->cmdline, path, (size_t)cmdline_length);
+    req->cmdline[cmdline_length] = '\0';
+
+    const int64_t raw_status = lpr_supervisor_call(
+        LPRS_OP_PROCESS_SET_COMM,
+        page_fd,
+        page,
+        sizeof(*req),
+        -1,
+        0);
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    return raw_status == 0 ? 0 : (int)raw_status;
+}
+
+/* Hands the supervisor a page this process already owns and keeps writing to.
+ * The page travels as a transfer descriptor, which is the same path every
+ * other supervisor call uses, so nothing new has to work for the attach to
+ * succeed.  The reverse arrangement, mapping a page the supervisor owns, was
+ * tried first and left the system unable to reach a shell. */
+int lpr_supervisor_diag_attach(void)
+{
+    if (!lpr_supervisor_enabled || lpr_supervisor_token == 0) {
+        return -LPR_LINUX_EINVAL;
+    }
+    if (lpr_diag_slot != 0) return 0;
+
+    void *diag_page = 0;
+    const int diag_fd = lpr_create_standalone_wire_page(&diag_page);
+    if (diag_fd < 0) return diag_fd;
+    lpr_memset(diag_page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_diag_slot_t *slot = (lprs_diag_slot_t *)diag_page;
+    slot->syscall_nr = LPRS_DIAG_SYSCALL_NONE;
+
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) {
+        lpr_destroy_standalone_wire_page(diag_fd, diag_page);
+        return page_fd;
+    }
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_diag_attach_t *req =
+        (lprs_diag_attach_t *)lpr_supervisor_payload(page);
+    req->token = lpr_supervisor_token;
+    /* The supervisor has to map this page to read it, and read is all it ever
+     * needs: the process itself is the only writer. */
+    const int64_t status = lpr_process_client_call_with_transfer_rights(
+        &lpr_request_id,
+        lpr_pacha_status_to_errno,
+        LPRS_OP_PROCESS_DIAG_ATTACH,
+        page_fd,
+        page,
+        sizeof(*req),
+        diag_fd,
+        /* A subset of what the wire page itself holds: a transfer cannot grant
+         * a right the sender does not have, and asking for one it lacks fails
+         * the whole call.  Write access is deliberately not passed on. */
+        PACHA_FD_RIGHT_TRANSFER |
+            PACHA_FD_RIGHT_CLOSE |
+            PACHA_FD_RIGHT_MAP_READ,
+        0,
+        0);
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    if (status != 0) {
+        lpr_destroy_standalone_wire_page(diag_fd, diag_page);
+        return (int)status;
+    }
+    /* The supervisor holds the descriptor now.  This mapping stays for the
+     * life of the process and is what the syscall hooks write into. */
+    lpr_diag_slot = slot;
+    return 0;
+}
+
+int lpr_supervisor_query_process(uint64_t pid, lprs_process_query_t *out)
+{
+    if (out == 0 || pid == 0 || !lpr_supervisor_enabled ||
+        lpr_supervisor_token == 0)
+    {
+        return -LPR_LINUX_EINVAL;
+    }
+    void *page = 0;
+    const int page_fd = lpr_create_standalone_wire_page(&page);
+    if (page_fd < 0) return page_fd;
+    lpr_memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
+    lprs_process_query_t *req =
+        (lprs_process_query_t *)lpr_supervisor_payload(page);
+    req->token = lpr_supervisor_token;
+    req->pid = pid;
+    const int64_t raw_status = lpr_supervisor_call(
+        LPRS_OP_PROCESS_QUERY,
+        page_fd,
+        page,
+        sizeof(*req),
+        -1,
+        0);
+    if (raw_status == 0) {
+        lpr_memcpy(out, req, sizeof(*out));
+    }
+    lpr_destroy_standalone_wire_page(page_fd, page);
+    return raw_status == 0 ? 0 : (int)raw_status;
+}
+
 int lpr_create_pread_vmo_wire_page(void **out_page)
 {
     if (out_page == 0) {
         return -LPR_LINUX_EINVAL;
     }
     lpr_state_lock(&lpr_state.filed_rpc.lock_word);
+    const int ready = (int)lpr_filed_endpoint_ready();
+    if (ready) {
+        lpr_state_unlock(&lpr_state.filed_rpc.lock_word);
+        return ready;
+    }
     if (lpr_pread_vmo_page_fd >= 16 &&
         lpr_pread_vmo_page != 0 &&
         !lpr_pread_vmo_page_busy)
@@ -1147,6 +1361,9 @@ int64_t lpr_filed_payload_size(uint32_t op, uint32_t *out_payload_size)
     case FILED_OP_VFS_STAT:
         *out_payload_size = sizeof(filed_statx_t);
         return 0;
+    case FILED_OP_VFS_STATAT:
+        *out_payload_size = sizeof(filed_statat_t);
+        return 0;
     case FILED_OP_VFS_STATFS:
         *out_payload_size = sizeof(filed_statfs_t);
         return 0;
@@ -1343,7 +1560,7 @@ static int64_t lpr_filed_call_locked(
         .fd_count = fd_count,
     };
     const int64_t reply_fd = lpr_native_ipc_call_wait(
-        LPR_FILED_ENDPOINT_FD,
+        lpr_filed_client_fd,
         &request);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
@@ -1355,7 +1572,7 @@ static int64_t lpr_filed_call_locked(
             reply_fd,
             request_id,
             page_fd >= 16 ? 1u : 0u,
-            LPR_FILED_ENDPOINT_FD,
+            lpr_filed_client_fd,
             0,
             "filed ipc_call failed");
         if (page != owned_page) {

@@ -1,4 +1,5 @@
 #include "common.h"
+#include "filed/vmo_create.h"
 #include "kobox/device_pachaos_capsule.h"
 #include "linux_personality/linux_block.h"
 #include "linux_subsystem/fs/fs.h"
@@ -900,7 +901,7 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
         return filed_page_result(-28, 0);
     }
     uint64_t profile_stage = filed_profile_file_vmo_stage_begin();
-    int vmo_fd = pacha_vmo_create(length, rights, 0);
+    int vmo_fd = filed_vmo_create(length, rights, 0);
     if (vmo_fd < 16) {
         uint64_t reclaimed_bytes = 0;
         const uint32_t reclaimed_entries =
@@ -912,7 +913,7 @@ filed_page_dispatch_result_t filed_create_file_vmo_cache_entry(
                 (unsigned long long)length,
                 reclaimed_entries,
                 (unsigned long long)reclaimed_bytes);
-            vmo_fd = pacha_vmo_create(length, rights, 0);
+            vmo_fd = filed_vmo_create(length, rights, 0);
         }
     }
     filed_profile_file_vmo_stage_end(
@@ -998,8 +999,11 @@ int filed_dispatch_file_vmo(
         return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const filed_file_vmo_request_t *file_vmo =
-        (const filed_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    filed_file_vmo_request_t snapshot;
+    memcpy(&snapshot, (const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot));
+    const filed_file_vmo_request_t *file_vmo = &snapshot;
+    int allowed = filed_client_authorize(runtime, header->op, &snapshot, sizeof(snapshot), 0);
+    if (allowed) return filed_send_reply(reply_fd, reply_page, header, allowed, 0, 0);
     filed_page_dispatch_result_t result = filed_page_result(-22, 0);
     filed_file_vmo_cache_entry_t *entry = NULL;
     if (file_vmo->length != 0 &&
@@ -1066,8 +1070,10 @@ int filed_dispatch_file_vmo(
         .rights =
             PACHA_FD_RIGHT_CLOSE |
             PACHA_FD_RIGHT_MAP_READ |
-            PACHA_FD_RIGHT_MAP_WRITE |
-            PACHA_FD_RIGHT_MAP_EXEC,
+            /* Writable private copies do not require backing write authority.
+             * Never lend the shared snapshot cache's MAP_WRITE capability. */
+            ((!runtime->actor || (runtime->actor->identity.rights & FILED_RIGHT_EXEC)) ?
+                PACHA_FD_RIGHT_MAP_EXEC : 0),
         .flags = 0,
         .transfer_flags = PACHA_IPC_TRANSFER_CLOEXEC,
     };
@@ -1112,8 +1118,11 @@ int filed_dispatch_shared_file_vmo(
         return filed_send_reply(reply_fd, reply_page, header, -22, 0, 0);
     }
 
-    const filed_file_vmo_request_t *shared_vmo =
-        (const filed_file_vmo_request_t *)((const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES);
+    filed_file_vmo_request_t snapshot_request;
+    memcpy(&snapshot_request, (const uint8_t *)reply_page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot_request));
+    const filed_file_vmo_request_t *shared_vmo = &snapshot_request;
+    int allowed = filed_client_authorize(runtime, header->op, shared_vmo, sizeof(*shared_vmo), 0);
+    if (allowed) return filed_send_reply(reply_fd, reply_page, header, allowed, 0, 0);
     int64_t reply_status = -22;
     filed_file_vmo_cache_entry_t *entry = NULL;
     filed_vfs_io_decision_t decision;
@@ -1232,6 +1241,25 @@ int filed_dispatch_shared_file_vmo(
     return send_status;
 }
 
+static void filed_memfd_failure(
+    filed_runtime_t *runtime, const char *stage, int64_t status)
+{
+    /* A transient metadata shortage can strand a client's IPC send queue
+     * long after slots become free again. Record the failing stage, without
+     * file names or a success-path counter, and bound repeated error output. */
+    static uint64_t failures;
+    const uint64_t count = __atomic_add_fetch(&failures, 1u, __ATOMIC_RELAXED);
+    if (count > 4 && (count & (count - 1u)) != 0) return;
+    storage_statfs_reply_t stats = {0};
+    const int stats_status = filed_tmpfs_backend_statfs(&runtime->tmpfs, &stats);
+    printf("[filed] memfd failure stage=%s status=%lld count=%llu "
+           "stats_status=%d inodes_free=%llu inodes=%llu pages_free=%llu pages=%llu\n",
+        stage, (long long)status, (unsigned long long)count, stats_status,
+        (unsigned long long)stats.files_free, (unsigned long long)stats.files,
+        (unsigned long long)stats.blocks_free, (unsigned long long)stats.blocks);
+    fflush(stdout);
+}
+
 filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
     filed_runtime_t *runtime,
     void *page)
@@ -1271,6 +1299,7 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
         0600,
         &object_id);
     if (reply_status != 0) {
+        filed_memfd_failure(runtime, "tmpfs_create", reply_status);
         return filed_page_result(reply_status, 0);
     }
 
@@ -1288,6 +1317,7 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
         open_flags,
         &opened);
     if (status != FILED_OK) {
+        filed_memfd_failure(runtime, "vfs_open", filed_status_to_wire(status));
         (void)filed_tmpfs_backend_unlink(&runtime->tmpfs, root_object, internal_name);
         (void)filed_tmpfs_backend_release_object(&runtime->tmpfs, object_id);
         return filed_page_result(filed_status_to_wire(status), 0);
@@ -1314,6 +1344,7 @@ filed_page_dispatch_result_t filed_dispatch_memfd_create_page(
     }
     filed_cache_invalidate(runtime, root_object);
     if (reply_status != 0) {
+        filed_memfd_failure(runtime, "finalize", reply_status);
         (void)filed_close_handle_runtime(runtime, opened.handle_id);
         return filed_page_result(reply_status, 0);
     }
@@ -1633,8 +1664,9 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
             (unsigned long long)backend_dirty_hint,
             flush_status);
         fflush(stdout);
-        return flush_status;
     }
+    /* A full tmpfs/shared VMO must not starve unrelated ext4 writeback.
+     * Preserve the error for the caller, but still persist completed writes. */
     const int backend_status = filed_kobox_backend_sync_all(&runtime->backend);
     if (backend_status != 0) {
         printf(
@@ -1644,7 +1676,7 @@ int filed_dispatch_sync_all(filed_runtime_t *runtime)
             backend_status);
         fflush(stdout);
     }
-    return backend_status;
+    return flush_status != 0 ? flush_status : backend_status;
 }
 
 void filed_dispatch_log_state_checkpoint(filed_runtime_t *runtime, const char *source)
@@ -1653,13 +1685,21 @@ void filed_dispatch_log_state_checkpoint(filed_runtime_t *runtime, const char *s
         return;
     }
     uint32_t active_handles = 0;
+    uint32_t active_files = 0;
     uint32_t active_sessions = 0;
-    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i)
-        active_handles += runtime->vfs.handles[i].active ? 1u : 0u;
+    for (uint32_t i = 0; i < runtime->vfs.file_capacity; ++i)
+        active_files += filed_vfs_file_at(&runtime->vfs, i)->active ? 1u : 0u;
+    for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i)
+        active_handles += filed_vfs_handle_at(&runtime->vfs, i)->active ? 1u : 0u;
     for (uint32_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i)
         active_sessions += runtime->sessions[i].active ? 1u : 0u;
-    printf("[filed] state_checkpoint source=%s active_handles=%u active_sessions=%u\n",
-           source, active_handles, active_sessions);
+    printf("[filed] state_checkpoint source=%s active_handles=%u active_sessions=%u "
+           "active_files=%u file_capacity=%u handle_capacity=%u\n",
+           source, active_handles, active_sessions, active_files,
+           runtime->vfs.file_capacity, runtime->vfs.handle_capacity);
+    printf("[filed] tmpfs_backing source=%s pages=%u limit=%u\n",
+           source, FILED_TMPFS_PAGE_POOL_PAGES - runtime->tmpfs.free_page_count,
+           (unsigned)FILED_TMPFS_PAGE_POOL_PAGES);
     filed_kobox_object_stats_t object_stats;
     if (filed_kobox_backend_object_stats(&runtime->backend, &object_stats) == 0) {
         printf(
@@ -1675,27 +1715,41 @@ void filed_dispatch_log_state_checkpoint(filed_runtime_t *runtime, const char *s
     uint32_t file_vmo_entries = 0;
     uint32_t file_vmo_shared = 0;
     uint64_t file_vmo_bytes = 0;
-    for (uint32_t i = 0; i < FILED_RUNTIME_FILE_VMO_CACHE_SLOTS; ++i) {
-        const filed_file_vmo_cache_entry_t *entry = &filed_file_vmo_cache.entries[i];
+    uint64_t file_vmo_shared_bytes = 0;
+    uint64_t file_vmo_sparse_bytes = 0;
+    for (filed_file_vmo_iterator_t it = filed_file_vmo_cache_iterate(&filed_file_vmo_cache);
+         it.entry != NULL; filed_file_vmo_cache_next(&it)) {
+        const filed_file_vmo_cache_entry_t *entry = it.entry;
         if (!entry->active) {
             continue;
         }
         file_vmo_entries++;
         file_vmo_shared += entry->shared ? 1u : 0u;
-        file_vmo_bytes = entry->length > UINT64_MAX - file_vmo_bytes ?
-            UINT64_MAX : file_vmo_bytes + entry->length;
+        const uint64_t bytes = filed_file_vmo_cache_bytes(entry);
+        file_vmo_bytes = bytes > UINT64_MAX - file_vmo_bytes ?
+            UINT64_MAX : file_vmo_bytes + bytes;
+        if (entry->shared) {
+            file_vmo_shared_bytes += bytes;
+            if (entry->zero_on_demand) file_vmo_sparse_bytes += bytes;
+        }
     }
     printf(
         "[filed] file_vmo_cache source=%s entries=%u shared=%u bytes=%llu "
-        "hits=%llu misses=%llu stores=%llu evictions=%llu budget=%u\n",
+        "shared_bytes=%llu sparse_bytes=%llu snapshot_bytes=%llu "
+        "hits=%llu misses=%llu stores=%llu evictions=%llu "
+        "budget_evictions=%llu budget=%u\n",
         source,
         file_vmo_entries,
         file_vmo_shared,
         (unsigned long long)file_vmo_bytes,
+        (unsigned long long)file_vmo_shared_bytes,
+        (unsigned long long)file_vmo_sparse_bytes,
+        (unsigned long long)(file_vmo_bytes - file_vmo_shared_bytes),
         (unsigned long long)filed_file_vmo_cache_hits,
         (unsigned long long)filed_file_vmo_cache_misses,
         (unsigned long long)filed_file_vmo_cache_stores,
         (unsigned long long)filed_file_vmo_cache_evictions,
+        (unsigned long long)filed_file_vmo_cache.byte_budget_evictions,
         (unsigned)FILED_FILE_VMO_CACHE_TOTAL_BYTES);
     fflush(stdout);
 }
@@ -1716,22 +1770,15 @@ filed_page_dispatch_result_t filed_dispatch_truncate_page(
             &decision);
         reply_status = filed_status_to_wire(status);
         if (status == FILED_OK) {
-            reply_status = filed_cache_flush_object(runtime, decision.backend_object);
+            reply_status = filed_cache_truncate(runtime, decision.backend_object, truncate->size);
             if (reply_status == 0) {
-                reply_status = filed_backend_truncate(
-                    runtime,
-                    decision.backend_object,
+                (void)filed_vfs_note_truncate(
+                    &runtime->vfs,
+                    (filed_handle_id_t)(uint32_t)truncate->handle,
                     truncate->size);
-                if (reply_status == 0) {
-                    filed_cache_invalidate(runtime, decision.backend_object);
-                    (void)filed_vfs_note_truncate(
-                        &runtime->vfs,
-                        (filed_handle_id_t)(uint32_t)truncate->handle,
-                        truncate->size);
-                    filed_runtime_publish_backend_object_generation(
-                        runtime,
-                        decision.backend_object);
-                }
+                filed_runtime_publish_backend_object_generation(
+                    runtime,
+                    decision.backend_object);
             }
         }
     }
@@ -1788,7 +1835,10 @@ void filed_invalidate_mutated_object(
     filed_runtime_t *runtime,
     uint64_t backend_object)
 {
-    filed_cache_invalidate(runtime, backend_object);
+    /* unlink/rmdir and rename-over change names, not the open object's data.
+     * Keep its shared VMO as the coherent I/O source while handles remain.
+     * The last-handle reclaim drops only our reference, never client maps. */
+    filed_cache_invalidate_namespace(runtime, backend_object);
 }
 
 int filed_flush_mutated_object(

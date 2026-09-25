@@ -14,9 +14,11 @@ pub const syscall_process_wait: u64 = process_abi.syscall_process_wait;
 pub const syscall_process_exit: u64 = process_abi.syscall_process_exit;
 pub const syscall_thread_create: u64 = process_abi.syscall_thread_create;
 pub const syscall_thread_start: u64 = process_abi.syscall_thread_start;
+pub const syscall_thread_context: u64 = process_abi.syscall_thread_context;
 pub const syscall_thread_kill: u64 = process_abi.syscall_thread_kill;
 pub const syscall_thread_wait: u64 = process_abi.syscall_thread_wait;
 pub const syscall_thread_exit: u64 = process_abi.syscall_thread_exit;
+pub const syscall_thread_signal: u64 = process_abi.syscall_thread_signal;
 pub const syscall_process_signal: u64 = process_abi.syscall_process_signal;
 pub const syscall_process_signal_ctl: u64 = process_abi.syscall_process_signal_ctl;
 pub const syscall_process_stop: u64 = process_abi.syscall_process_stop;
@@ -26,6 +28,7 @@ pub const syscall_thread_set_gs_base: u64 = process_abi.syscall_thread_set_gs_ba
 pub const syscall_process_clone: u64 = process_abi.syscall_process_clone;
 pub const syscall_process_map: u64 = process_abi.syscall_process_map;
 pub const syscall_process_map_batch: u64 = process_abi.syscall_process_map_batch;
+pub const syscall_process_unmap: u64 = process_abi.syscall_process_unmap;
 pub const syscall_process_exec_from: u64 = process_abi.syscall_process_exec_from;
 pub const syscall_process_memory_barrier: u64 = process_abi.syscall_process_memory_barrier;
 
@@ -34,12 +37,15 @@ pub const syscall_gettid: u64 = runtime_abi.syscall_gettid;
 pub const syscall_system_info: u64 = runtime_abi.syscall_system_info;
 pub const syscall_clock_gettime: u64 = runtime_abi.syscall_clock_gettime;
 pub const syscall_clock_getres: u64 = runtime_abi.syscall_clock_getres;
+pub const syscall_yield: u64 = runtime_abi.syscall_yield;
 pub const syscall_nanosleep: u64 = runtime_abi.syscall_nanosleep;
 pub const syscall_futex_wait: u64 = runtime_abi.syscall_futex_wait;
 pub const syscall_futex_wake: u64 = runtime_abi.syscall_futex_wake;
 pub const syscall_futex_requeue: u64 = runtime_abi.syscall_futex_requeue;
 pub const syscall_getrandom: u64 = runtime_abi.syscall_getrandom;
+pub const syscall_power_control: u64 = runtime_abi.syscall_power_control;
 
+pub const syscall_fd_table: u64 = fd_abi.syscall_fd_table;
 pub const syscall_fd_close: u64 = fd_abi.syscall_fd_close;
 pub const syscall_fd_dup: u64 = fd_abi.syscall_fd_dup;
 pub const syscall_fd_get_info: u64 = fd_abi.syscall_fd_get_info;
@@ -59,6 +65,8 @@ pub const syscall_timerfd_create: u64 = fd_abi.syscall_timerfd_create;
 pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
+pub const syscall_vmo_grow: u64 = fd_abi.syscall_vmo_grow;
+pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
 pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
 pub const syscall_munmap: u64 = vm_abi.syscall_munmap;
@@ -80,7 +88,13 @@ pub const syscall_capsule_derive_dma_buffer: u64 = capsule_abi.syscall_capsule_d
 pub const syscall_capsule_derive_dma_mapping: u64 = capsule_abi.syscall_capsule_derive_dma_mapping;
 pub const syscall_capsule_derive_dma_mapping_pages: u64 = capsule_abi.syscall_capsule_derive_dma_mapping_pages;
 pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = capsule_abi.syscall_capsule_derive_dma_mapping_from_buffer;
+pub const syscall_capsule_dma_set_enabled: u64 = capsule_abi.syscall_capsule_dma_set_enabled;
 pub const syscall_capsule_derive_irq: u64 = capsule_abi.syscall_capsule_derive_irq;
+pub const syscall_capsule_irq_route: u64 = capsule_abi.syscall_capsule_irq_route;
+pub const syscall_capsule_irq_quiesce: u64 = capsule_abi.syscall_capsule_irq_quiesce;
+pub const syscall_capsule_irq_retire: u64 = capsule_abi.syscall_capsule_irq_retire;
+pub const syscall_capsule_pci_enumerate: u64 = capsule_abi.syscall_capsule_pci_enumerate;
+pub const syscall_capsule_pci_claim: u64 = capsule_abi.syscall_capsule_pci_claim;
 pub const syscall_capsule_pci_config_read: u64 = capsule_abi.syscall_capsule_pci_config_read;
 pub const syscall_capsule_pci_config_write: u64 = capsule_abi.syscall_capsule_pci_config_write;
 pub const syscall_capsule_pci_bar_info: u64 = capsule_abi.syscall_capsule_pci_bar_info;
@@ -109,9 +123,11 @@ test "native syscall numbers are contiguous" {
         syscall_process_exit,
         syscall_thread_create,
         syscall_thread_start,
+        syscall_thread_context,
         syscall_thread_kill,
         syscall_thread_wait,
         syscall_thread_exit,
+        syscall_thread_signal,
         syscall_process_signal,
         syscall_process_signal_ctl,
         syscall_process_stop,
@@ -121,6 +137,7 @@ test "native syscall numbers are contiguous" {
         syscall_process_clone,
         syscall_process_map,
         syscall_process_map_batch,
+        syscall_process_unmap,
         syscall_process_exec_from,
         syscall_process_memory_barrier,
         syscall_getpid,
@@ -128,11 +145,14 @@ test "native syscall numbers are contiguous" {
         syscall_system_info,
         syscall_clock_gettime,
         syscall_clock_getres,
+        syscall_yield,
         syscall_nanosleep,
         syscall_futex_wait,
         syscall_futex_wake,
         syscall_futex_requeue,
         syscall_getrandom,
+        syscall_power_control,
+        syscall_fd_table,
         syscall_fd_close,
         syscall_fd_dup,
         syscall_fd_get_info,
@@ -152,6 +172,8 @@ test "native syscall numbers are contiguous" {
         syscall_timerfd_settime,
         syscall_timerfd_gettime,
         syscall_vmo_create,
+        syscall_vmo_grow,
+        syscall_vmo_create_page_view,
         syscall_vmo_revoke,
         syscall_mmap,
         syscall_munmap,
@@ -171,11 +193,17 @@ test "native syscall numbers are contiguous" {
         syscall_capsule_derive_dma_mapping,
         syscall_capsule_derive_dma_mapping_pages,
         syscall_capsule_derive_dma_mapping_from_buffer,
+        syscall_capsule_dma_set_enabled,
         syscall_capsule_derive_irq,
+        syscall_capsule_irq_route,
+        syscall_capsule_irq_poll,
+        syscall_capsule_irq_quiesce,
+        syscall_capsule_irq_retire,
+        syscall_capsule_pci_enumerate,
+        syscall_capsule_pci_claim,
         syscall_capsule_pci_config_read,
         syscall_capsule_pci_config_write,
         syscall_capsule_pci_bar_info,
-        syscall_capsule_irq_poll,
         syscall_capsule_dma_pool_create,
     };
     try std.testing.expectEqual(@as(usize, syscall_last), expected.len);

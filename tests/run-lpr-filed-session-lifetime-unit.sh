@@ -15,9 +15,10 @@ mkdir -p "$out_dir"
   -I"$repo_root/userland/daemons/common/include" \
   -I"$repo_root/userland/filed/include" \
   -I"$repo_root/userland/termd/include" \
-  -I"$repo_root/userland/drmd/include" \
+  -I"$repo_root/userland/gpud/include" \
   -I"$repo_root/userland/inputd/include" \
   -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/lpr_supervisor/include" \
   "$repo_root/userland/personality/linux/runtime/lpr_common/runtime_support.c" \
   "$repo_root/tests/lpr_filed_session_lifetime_unit.c" \

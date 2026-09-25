@@ -1,15 +1,18 @@
 #include "filed/runtime.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "filed/dispatch.h"
+#include "filed/backend_router.h"
 #include "filed/fd_ipc.h"
+#include "filed/live_bootfs.h"
 #include "filed/page_cache.h"
 #include "filed_direct_backend.h"
 #include "storage_runtime.h"
 #include "bootstrap.h"
+#include "filed/unix_path.h"
+#include "pacha/syscall.h"
 #include "internal/dispatch_state.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
@@ -59,6 +62,7 @@ static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
     }
 
     runtime->syncer_ticks++;
+    filed_vfs_trim_open_objects(&runtime->vfs);
     const uint64_t dirty_count = filed_cache_dirty_count(runtime);
     const uint64_t backend_dirty_hint = filed_kobox_backend_dirty_hint(&runtime->backend);
     if (dirty_count == 0 && backend_dirty_hint == 0) {
@@ -82,71 +86,7 @@ static void filed_runtime_syncer_tick(filed_runtime_t *runtime)
     runtime->syncer_flushes++;
 }
 
-static int filed_clear_inherit_flag(int fd)
-{
-    if (fd < 16) {
-        return -1;
-    }
-    const long status = pacha_fd_fcntl(
-        fd,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        0,
-        PACHA_FD_FLAG_INHERIT);
-    return status == 0 ? 0 : -2;
-}
 
-static int filed_set_inherit_flag(int fd)
-{
-    if (fd < 16) {
-        return -1;
-    }
-    const long status = pacha_fd_fcntl(
-        fd,
-        PACHA_FD_FCNTL_SET_FLAGS,
-        PACHA_FD_FLAG_INHERIT,
-        PACHA_FD_FLAG_INHERIT);
-    return status == 0 ? 0 : -2;
-}
-
-static int filed_pin_exec_endpoint_fd(int endpoint_fd, int *out_fd)
-{
-    if (out_fd != NULL) {
-        *out_fd = -1;
-    }
-    if (endpoint_fd < 16 || out_fd == NULL) {
-        return -1;
-    }
-    if (endpoint_fd == FILED_RUNTIME_EXEC_ENDPOINT_FD) {
-        *out_fd = endpoint_fd;
-        return 0;
-    }
-
-    const uint64_t endpoint_rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_DUP |
-        PACHA_FD_RIGHT_WAIT |
-        PACHA_FD_RIGHT_POLL |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_SEND |
-        PACHA_FD_RIGHT_RECV |
-        PACHA_FD_RIGHT_SET_FLAGS |
-        PACHA_FD_RIGHT_CALL |
-        PACHA_FD_RIGHT_TRANSFER;
-    const long dup_fd = pacha_fd_fcntl(
-        endpoint_fd,
-        PACHA_FD_FCNTL_DUP,
-        FILED_RUNTIME_EXEC_ENDPOINT_FD,
-        endpoint_rights);
-    if (dup_fd != FILED_RUNTIME_EXEC_ENDPOINT_FD) {
-        if (dup_fd >= 16) {
-            (void)pacha_fd_close((int)dup_fd);
-        }
-        return -24;
-    }
-    (void)pacha_fd_close(endpoint_fd);
-    *out_fd = (int)dup_fd;
-    return 0;
-}
 
 static int filed_find_bootstrap_fd(char **argv, int *out_fd)
 {
@@ -243,11 +183,14 @@ void filed_runtime_init(filed_runtime_t *runtime)
 
     memset(runtime, 0, sizeof(*runtime));
     runtime->bootstrap_fd = -1;
+    runtime->live_bootfs_fd = -1;
+    runtime->live_ready_fd = -1;
     runtime->client_endpoint_fd = -1;
+    runtime->unix_path_fd = -1;
     runtime->syncer_timer_fd = -1;
     runtime->netd_socket_endpoint_fd = -1;
     runtime->termd_tty_endpoint_fd = -1;
-    runtime->drmd_drm_endpoint_fd = -1;
+    runtime->gpud_drm_endpoint_fd = -1;
     runtime->inputd_input_endpoint_fd = -1;
     for (uint64_t i = 0; i < FILED_RUNTIME_MAX_SESSIONS; ++i) {
         runtime->sessions[i].channel_fd = -1;
@@ -276,7 +219,33 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
 
     memset(&storage_bootstrap, 0, sizeof(storage_bootstrap));
     status = filed_read_storage_bootstrap_fd(runtime->bootstrap_fd, &storage_bootstrap, &bootstrap_bytes);
+    if (bootstrap_bytes >= (long)sizeof(filed_live_bootstrap_t) &&
+        storage_bootstrap.magic == FILED_LIVE_BOOTSTRAP_MAGIC) {
+        filed_live_bootstrap_t live;
+        memcpy(&live, &storage_bootstrap, sizeof(live));
+        if (live.unix_path_fd < 16 ||
+            live.unix_path_fd >= PACHA_FD_TABLE_LIMIT ||
+            live.bootfs_size < 104 ||
+            live.bootfs_size > FILED_LIVE_BOOTFS_MAX_BYTES ||
+            live.bootfs_fd < 16 || live.bootfs_fd >= PACHA_FD_TABLE_LIMIT ||
+            live.public_endpoint_fd < 16 ||
+            live.public_endpoint_fd >= PACHA_FD_TABLE_LIMIT ||
+            live.ready_channel_fd < 16 ||
+            live.ready_channel_fd >= PACHA_FD_TABLE_LIMIT) return -22;
+        struct pacha_fd_info info;
+        if (pacha_fd_get_info((int)live.bootfs_fd, &info) != 0 ||
+            info.size < live.bootfs_size) return -22;
+        runtime->live_bootfs_fd = (int)live.bootfs_fd;
+        runtime->live_bootfs_size = live.bootfs_size;
+        runtime->live_ready_fd = (int)live.ready_channel_fd;
+        runtime->client_endpoint_fd = (int)live.public_endpoint_fd;
+        runtime->unix_path_fd = (int)live.unix_path_fd;
+        runtime->live_root = 1;
+        return 0;
+    }
     if (status == 0 && storage_bootstrap.magic == KOBOXD_BOOTSTRAP_MAGIC) {
+        if (storage_bootstrap.unix_path_fd < 16 || storage_bootstrap.unix_path_fd >= PACHA_FD_TABLE_LIMIT) return -22;
+        runtime->unix_path_fd = (int)storage_bootstrap.unix_path_fd;
         koboxd_storage_runtime_t *storage_runtime = filed_runtime_storage_runtime(runtime);
         if (storage_runtime == NULL) {
             return -12;
@@ -295,31 +264,7 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
             &runtime->backend,
             koboxd_storage_runtime_fs_backend(storage_runtime),
             koboxd_filed_direct_ops());
-        status = filed_pin_exec_endpoint_fd(
-            (int)(uint32_t)storage_bootstrap.control_fd,
-            &runtime->client_endpoint_fd);
-        if (status != 0) {
-            return status;
-        }
-        status = filed_clear_inherit_flag(runtime->bootstrap_fd);
-        if (status != 0) {
-            return status;
-        }
-        status = filed_clear_inherit_flag((int)(uint32_t)storage_bootstrap.device_fd);
-        if (status != 0) {
-            return status;
-        }
-        for (uint64_t i = 0; i < storage_bootstrap.module_count; i++) {
-            status = filed_clear_inherit_flag(
-                (int)(uint32_t)storage_bootstrap.modules[i].image_fd);
-            if (status != 0) {
-                return status;
-            }
-        }
-        status = filed_set_inherit_flag(runtime->client_endpoint_fd);
-        if (status != 0) {
-            return status;
-        }
+        runtime->client_endpoint_fd = (int)storage_bootstrap.control_fd;
         return 0;
     }
 
@@ -342,20 +287,6 @@ int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv)
         &runtime->backend,
         (int)(uint32_t)runtime->bootstrap.fs_backend_fd);
     runtime->client_endpoint_fd = (int)(uint32_t)runtime->bootstrap.public_endpoint_fd;
-    status = filed_clear_inherit_flag(runtime->bootstrap_fd);
-    if (status != 0) {
-        return status;
-    }
-    if (runtime->backend.fs_fd >= 16) {
-        status = filed_clear_inherit_flag(runtime->backend.fs_fd);
-        if (status != 0) {
-            return status;
-        }
-    }
-    status = filed_clear_inherit_flag(runtime->client_endpoint_fd);
-    if (status != 0) {
-        return status;
-    }
 
     return 0;
 }
@@ -450,22 +381,22 @@ static int filed_runtime_mount_shm_tmpfs(filed_runtime_t *runtime)
     storage_statx_reply_t dev_stat;
     filed_vfs_open_result_t dev_open;
 
-    int status = filed_kobox_backend_lookup(
-        &runtime->backend,
-        runtime->backend.root_object_id,
-        "dev",
-        &dev_object);
+    const uint64_t root_object = runtime->live_root ?
+        filed_tmpfs_backend_root_object(&runtime->tmpfs) :
+        runtime->backend.root_object_id;
+    int status = filed_runtime_backend_lookup(runtime, root_object,
+        "dev", &dev_object);
     if (status != 0) {
         return status;
     }
     memset(&dev_stat, 0, sizeof(dev_stat));
-    status = filed_kobox_backend_statx(&runtime->backend, dev_object, &dev_stat);
+    status = filed_runtime_backend_statx(runtime, dev_object, &dev_stat);
     if (status != 0) {
-        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        (void)filed_runtime_backend_release_object(runtime, dev_object);
         return status;
     }
     if ((dev_stat.kind & 0170000u) != 0040000u) {
-        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        (void)filed_runtime_backend_release_object(runtime, dev_object);
         return -20;
     }
 
@@ -484,7 +415,7 @@ static int filed_runtime_mount_shm_tmpfs(filed_runtime_t *runtime)
         FILED_OPEN_DIRECTORY,
         &dev_open);
     if (vfs_status != FILED_OK) {
-        (void)filed_kobox_backend_release_object(&runtime->backend, dev_object);
+        (void)filed_runtime_backend_release_object(runtime, dev_object);
         return -70 - (int)vfs_status;
     }
 
@@ -512,16 +443,32 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         return -1;
     }
 
-    int status = filed_kobox_backend_mount_root(&runtime->backend);
-    if (status != 0) {
-        return status;
+    uint64_t root_object = 0;
+    int status;
+    if (runtime->live_root) {
+        const uint64_t map_size = (runtime->live_bootfs_size + 4095u) & ~4095ull;
+        const unsigned char *archive = pacha_mmap(runtime->live_bootfs_fd,
+            map_size, PACHA_PROT_READ, PACHA_MMAP_SHARED, 0);
+        if (archive == NULL) return -5;
+        uint32_t files = 0;
+        uint64_t bytes = 0;
+        status = filed_live_bootfs_populate(&runtime->tmpfs, archive,
+            runtime->live_bootfs_size, &files, &bytes);
+        (void)pacha_munmap((void *)archive, map_size);
+        (void)pacha_fd_close(runtime->live_bootfs_fd);
+        runtime->live_bootfs_fd = -1;
+        if (status != 0) return status;
+        printf("[filed] RAM root populated files=%u bytes=%llu\n",
+            files, (unsigned long long)bytes);
+        root_object = filed_tmpfs_backend_root_object(&runtime->tmpfs);
+    } else {
+        status = filed_kobox_backend_mount_root(&runtime->backend);
+        if (status != 0) return status;
+        root_object = runtime->backend.root_object_id;
     }
 
     memset(&root_stat, 0, sizeof(root_stat));
-    status = filed_kobox_backend_statx(
-        &runtime->backend,
-        runtime->backend.root_object_id,
-        &root_stat);
+    status = filed_runtime_backend_statx(runtime, root_object, &root_stat);
     if (status != 0) {
         return status;
     }
@@ -529,9 +476,9 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
 
     vfs_status = filed_vfs_mount_root(
         &runtime->vfs,
-        FILED_FS_EXT4,
-        (filed_backend_id_t)(uint32_t)runtime->backend.fs_fd,
-        runtime->backend.root_object_id,
+        runtime->live_root ? FILED_FS_SYNTHETIC : FILED_FS_EXT4,
+        runtime->live_root ? 0 : (filed_backend_id_t)(uint32_t)runtime->backend.fs_fd,
+        root_object,
         &root_mount);
     if (vfs_status != FILED_OK) {
         return -20 - (int)vfs_status;
@@ -555,7 +502,7 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
         root_snapshot.ctime_nsec = root_stat.ctime_nsec;
         (void)filed_vfs_update_stat_snapshot(
             &runtime->vfs,
-            runtime->backend.root_object_id,
+            root_object,
             &root_snapshot);
     }
     runtime->root_mount_id = root_mount;
@@ -580,7 +527,16 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
     }
     runtime->root_handle_id = root_open.handle_id;
 
-    {
+    if (runtime->live_root) {
+        /* The live root already owns tmpfs's primary root object. /tmp needs
+         * a detached root, otherwise /tmp aliases / and memfd entries leak
+         * into the filesystem root. */
+        status = filed_runtime_mount_detached_tmpfs_child(runtime,
+            runtime->root_handle_id, "tmp", &runtime->tmpfs_root_handle_id);
+        if (status != 0) return status;
+        runtime->tmpfs_root_handle_valid = 1u;
+        runtime->root_tmpfs_synthetic_dirent = 0u;
+    } else {
         uint64_t tmpfs_root = 0;
         uint64_t root_tmp_object = 0;
         filed_vfs_open_result_t tmp_open;
@@ -590,11 +546,8 @@ int filed_runtime_mount_root(filed_runtime_t *runtime)
             return status;
         }
         runtime->root_tmpfs_synthetic_dirent =
-            filed_kobox_backend_lookup(
-                &runtime->backend,
-                runtime->backend.root_object_id,
-                "tmp",
-                &root_tmp_object) == 0 ? 0u : 1u;
+            filed_runtime_backend_lookup(runtime, root_object,
+                "tmp", &root_tmp_object) == 0 ? 0u : 1u;
         vfs_status = filed_vfs_open_backend_child(
             &runtime->vfs,
             runtime->root_handle_id,
@@ -669,8 +622,8 @@ static void filed_runtime_release_session(
     filed_session_t *session = &runtime->sessions[session_index];
     if (session == NULL) return;
     const uint32_t owner_session = (uint32_t)session_index + 1u;
-    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
-        filed_handle_t *handle = &runtime->vfs.handles[i];
+    for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i) {
+        filed_handle_t *handle = filed_vfs_handle_at(&runtime->vfs, i);
         if (!handle->active || handle->owner_session != owner_session) continue;
         (void)filed_close_handle_runtime(runtime, handle->id);
     }
@@ -685,6 +638,47 @@ static void filed_runtime_release_session(
     session->channel_fd = -1;
 }
 
+struct filed_wait_storage {
+    struct pacha_pollfd *fds;
+    uint64_t *session_indices;
+    filed_handle_id_t *lease_handles;
+    size_t capacity;
+};
+
+static void filed_wait_destroy(struct filed_wait_storage *wait)
+{
+    free(wait->fds);
+    free(wait->session_indices);
+    free(wait->lease_handles);
+    memset(wait, 0, sizeof(*wait));
+}
+
+static int filed_wait_reserve(struct filed_wait_storage *wait, size_t needed)
+{
+    if (needed <= wait->capacity) return 0;
+    size_t capacity = wait->capacity ? wait->capacity : 32;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2) return -12;
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof(*wait->fds) ||
+        capacity > SIZE_MAX / sizeof(*wait->session_indices) ||
+        capacity > SIZE_MAX / sizeof(*wait->lease_handles)) return -12;
+    struct filed_wait_storage next = { .capacity = capacity };
+    next.fds = malloc(capacity * sizeof(*next.fds));
+    next.session_indices = malloc(capacity * sizeof(*next.session_indices));
+    next.lease_handles = malloc(capacity * sizeof(*next.lease_handles));
+    if (!next.fds || !next.session_indices || !next.lease_handles) {
+        filed_wait_destroy(&next);
+        return -12;
+    }
+    /* No snapshot is in flight here. Publish all three arrays together so an
+     * allocation failure cannot leave their capacities mismatched. */
+    filed_wait_destroy(wait);
+    *wait = next;
+    return 0;
+}
+
 int filed_runtime_serve(filed_runtime_t *runtime)
 {
     if (runtime == NULL || runtime->client_endpoint_fd < 16) {
@@ -696,14 +690,18 @@ int filed_runtime_serve(filed_runtime_t *runtime)
         return syncer_timer_status;
     }
 
+    struct filed_wait_storage wait __attribute__((cleanup(filed_wait_destroy))) = {0};
     for (;;) {
-        struct pacha_pollfd fds[
-            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
-        uint64_t session_indices[
-            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
-        filed_handle_id_t lease_handles[
-            2 + FILED_RUNTIME_MAX_SESSIONS + FILED_MAX_HANDLES];
-        memset(lease_handles, 0, sizeof(lease_handles));
+        size_t needed = 3 + FILED_RUNTIME_MAX_SESSIONS + (size_t)runtime->vfs.lease_handle_count;
+        for (struct filed_client *client = runtime->clients; client; client = client->next) {
+            if (needed == SIZE_MAX) return -12;
+            ++needed;
+        }
+        if (filed_wait_reserve(&wait, needed) != 0) return -12;
+        struct pacha_pollfd *fds = wait.fds;
+        uint64_t *session_indices = wait.session_indices;
+        filed_handle_id_t *lease_handles = wait.lease_handles;
+        memset(lease_handles, 0, needed * sizeof(*lease_handles));
         uint64_t count = 0;
         fds[count++] = (struct pacha_pollfd){
             .fd = runtime->client_endpoint_fd,
@@ -711,6 +709,11 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             .revents = 0,
         };
         session_indices[0] = UINT64_MAX;
+        if (runtime->unix_path_fd >= 16) {
+            session_indices[count] = UINT64_MAX;
+            fds[count++] = (struct pacha_pollfd){ .fd = runtime->unix_path_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP };
+        }
         if (runtime->syncer_timer_fd >= 16) {
             session_indices[count] = UINT64_MAX;
             fds[count++] = (struct pacha_pollfd){
@@ -726,30 +729,46 @@ int filed_runtime_serve(filed_runtime_t *runtime)
             session_indices[count] = i;
             fds[count++] = (struct pacha_pollfd){
                 .fd = runtime->sessions[i].channel_fd,
-                .events = PACHA_FD_EVENT_READABLE,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
                 .revents = 0,
             };
         }
-        for (uint16_t i = 0; i < runtime->vfs.lease_handle_count; ++i) {
-            const filed_handle_id_t handle_id = runtime->vfs.lease_handle_ids[i];
-            const int lease_fd = filed_vfs_get_handle_lease(&runtime->vfs, handle_id);
-            if (lease_fd < 16) continue;
+        uint32_t leases = 0;
+        for (uint32_t link = runtime->vfs.lease_head; link != 0;) {
+            if (link > runtime->vfs.handle_capacity) return -22;
+            if (++leases > runtime->vfs.lease_handle_count || count >= needed) return -22;
+            const filed_handle_t *handle = filed_vfs_handle_at(&runtime->vfs, link - 1);
+            const filed_handle_id_t handle_id = handle->id;
+            const int lease_fd = handle->lease_fd;
+            link = handle->lease_next;
+            if (!handle->active || lease_fd < 16) return -22;
             session_indices[count] = UINT64_MAX;
             lease_handles[count] = handle_id;
             fds[count++] = (struct pacha_pollfd){
                 .fd = lease_fd,
-                .events = PACHA_FD_EVENT_HANGUP,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
                 .revents = 0,
             };
         }
+        if (leases != runtime->vfs.lease_handle_count) return -22;
 
-        const long wait_status = pacha_fd_wait_many(
+        const uint64_t clients_begin = count;
+        for (struct filed_client *client = runtime->clients; client; client = client->next) {
+            if (count >= needed) return -22;
+            session_indices[count] = client->id;
+            fds[count++] = (struct pacha_pollfd){ .fd = client->fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP };
+        }
+
+        const long wait_status = pacha_fd_wait_many_batched(
             fds, count, PACHA_FD_WAIT_FOREVER);
         if (wait_status < 0) {
             return (int)wait_status;
         }
 
         if ((fds[0].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) != 0) {
+            runtime->actor = NULL;
+            runtime->vfs.actor_client = 0;
             const int status = filed_dispatch_client_once(runtime, runtime->client_endpoint_fd);
             if (status != 0 &&
                 status != PACHA_ERR_EMPTY &&
@@ -762,7 +781,22 @@ int filed_runtime_serve(filed_runtime_t *runtime)
         }
 
         for (uint64_t pos = 1; pos < count; ++pos) {
+            runtime->actor = NULL;
+            runtime->vfs.actor_client = 0;
             if ((fds[pos].revents & (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_ERROR | PACHA_FD_EVENT_HANGUP)) == 0) {
+                continue;
+            }
+            if (pos >= clients_begin) {
+                struct filed_client *client = runtime->clients;
+                while (client && client->id != session_indices[pos]) client = client->next;
+                if (!client) continue;
+                if (fds[pos].revents & PACHA_FD_EVENT_HANGUP) filed_client_release(runtime, client);
+                else {
+                    runtime->actor = client;
+                    runtime->vfs.actor_client = client->id;
+                    runtime->vfs.actor_rights = client->identity.rights;
+                    (void)filed_dispatch_client_once(runtime, client->fd);
+                }
                 continue;
             }
             if (runtime->syncer_timer_fd >= 16 && fds[pos].fd == runtime->syncer_timer_fd) {
@@ -770,11 +804,16 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 filed_runtime_syncer_tick(runtime);
                 continue;
             }
+            if (fds[pos].fd == runtime->unix_path_fd) {
+                if (fds[pos].revents & PACHA_FD_EVENT_HANGUP) filed_unix_path_disconnect(runtime);
+                else (void)filed_unix_path_receive(runtime);
+                continue;
+            }
             if (lease_handles[pos] != 0) {
                 if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
                     const filed_handle_id_t handle_id = lease_handles[pos];
                     (void)filed_close_handle_runtime(runtime, handle_id);
-                }
+                } else (void)filed_lease_receive(runtime, lease_handles[pos]);
                 continue;
             }
             const uint64_t session_index = session_indices[pos];
@@ -782,6 +821,9 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 continue;
             }
             filed_session_t *session = &runtime->sessions[session_index];
+            runtime->actor = session->client;
+            runtime->vfs.actor_client = session->client ? session->client->id : 0;
+            runtime->vfs.actor_rights = session->client ? session->client->identity.rights : 0;
             if ((fds[pos].revents & PACHA_FD_EVENT_HANGUP) != 0) {
                 filed_runtime_release_session(runtime, session_index);
                 continue;
@@ -796,7 +838,8 @@ int filed_runtime_serve(filed_runtime_t *runtime)
                 status != PACHA_ERR_NOT_READY &&
                 status != -2)
             {
-                return status;
+                /* A malformed private fast page must not stop other clients. */
+                filed_runtime_release_session(runtime, session_index);
             }
         }
     }

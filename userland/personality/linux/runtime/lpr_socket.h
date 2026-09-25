@@ -9,7 +9,6 @@ int lpr_linux_socket_fd_active(uint64_t fd);
 int lpr_linux_socket_fd_cloexec(uint64_t fd);
 int lpr_linux_socket_native_wait_fd(uint64_t fd);
 void lpr_linux_socket_mark_readable(uint64_t fd);
-void lpr_linux_socket_mark_events(uint64_t fd, uint64_t events);
 int64_t lpr_linux_socket(uint64_t domain, uint64_t type, uint64_t protocol);
 int64_t lpr_linux_socketpair(uint64_t domain, uint64_t type, uint64_t protocol, uint64_t sockets);
 int64_t lpr_linux_socket_close(uint64_t fd);

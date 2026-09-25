@@ -116,7 +116,18 @@ func render(items []entry) ([]byte, error) {
 	stringTableOffset := entryTableOffset + uint64(entryBytes*len(items))
 	dataOffset := align(stringTableOffset+uint64(stringBytes), dataAlign)
 	cursor := dataOffset
+	firstBySource := make(map[string]int, len(items))
 	for i := range items {
+		if items[i].SourcePath != "" {
+			if first, ok := firstBySource[items[i].SourcePath]; ok &&
+				bytes.Equal(items[first].Data, items[i].Data) {
+				// Multiple paths may name the same BusyBox or loader image. An
+				// entry owns its mode, but immutable payload bytes can be shared.
+				items[i].DataOffset = items[first].DataOffset
+				continue
+			}
+			firstBySource[items[i].SourcePath] = i
+		}
 		cursor = align(cursor, dataAlign)
 		items[i].DataOffset = cursor
 		cursor += uint64(len(items[i].Data))
@@ -162,17 +173,29 @@ func validateImagePath(path string) error {
 }
 
 func modeBitsForPath(path string) uint32 {
-	if strings.HasSuffix(path, ".elf") {
+	if executablePath(path) {
 		return 0o555
 	}
 	return 0o444
 }
 
 func flagsForPath(path string) byte {
-	if strings.HasSuffix(path, ".elf") {
+	if executablePath(path) {
 		return flagExecutable
 	}
 	return 0
+}
+
+func executablePath(path string) bool {
+	// The live archive carries BusyBox under its normal /bin names, not .elf
+	// suffixes. The archive has no symlink entries, so these aliases are files.
+	// The musl interpreter must also retain executable mode when staged in RAM.
+	return strings.HasSuffix(path, ".elf") ||
+		strings.HasPrefix(path, "/bin/") || strings.HasPrefix(path, "/sbin/") ||
+		strings.HasPrefix(path, "/usr/bin/") || strings.HasPrefix(path, "/usr/sbin/") ||
+		path == "/lib/pacha/lpr-linux-x86_64.so" ||
+		path == "/lib/ld-musl-x86_64.so.1" ||
+		path == "/lib/linux/ld-musl-x86_64.so.1"
 }
 
 func align(value uint64, boundary uint64) uint64 {

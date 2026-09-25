@@ -31,6 +31,7 @@ type Options struct {
 	NoKVM           bool
 	IOMMU           bool
 	NoNet           bool
+	NoStorage       bool
 	Fast            bool
 	DryRun          bool
 	InputProfile    string
@@ -128,22 +129,23 @@ type SmokeResult struct {
 }
 
 type TTYTestOptions struct {
-	Timeout          time.Duration
-	NoKVM            bool
-	IOMMU            bool
-	CPUs             int
-	Display          string
-	GraphicsProfile  string
-	InputProfile     string
-	ExtraArgs        []string
-	BootMarker       string
-	Send             []string
-	Expect           []string
-	ScreendumpCheck  []string
-	ScreendumpDevice string
-	InputSendEvent   []string
-	Python           string
-	Progress         progress.Reporter
+	Timeout            time.Duration
+	NoKVM              bool
+	IOMMU              bool
+	CPUs               int
+	Display            string
+	GraphicsProfile    string
+	InputProfile       string
+	ExtraArgs          []string
+	BootMarker         string
+	ConsoleReadyMarker string
+	Send               []string
+	Expect             []string
+	ScreendumpCheck    []string
+	ScreendumpDevice   string
+	InputSendEvent     []string
+	Python             string
+	Progress           progress.Reporter
 }
 
 type TTYTestResult struct {
@@ -699,6 +701,7 @@ func TTYTest(workspace *config.Workspace, opts TTYTestOptions) (TTYTestResult, e
 			return result, err
 		}
 		ttyClient.serialExpectations = serialExpectations
+		ttyClient.readyMarker = opts.ConsoleReadyMarker
 		defer ttyClient.Close()
 		if len(checks) != 0 || len(inputChecks) != 0 {
 			if exited, waitErr := waitForSocketOrExit(plan.QMPSocket, wait, 5*time.Second); waitErr != nil || exited {
@@ -849,6 +852,7 @@ func (client *ttyConsoleClient) RunScreendumpChecks(qmp *qmpClient, device strin
 }
 
 type ttyConsoleClient struct {
+	readyMarker        string
 	conn               net.Conn
 	consoleFile        *os.File
 	output             strings.Builder
@@ -910,6 +914,10 @@ func (client *ttyConsoleClient) Close() {
 }
 
 func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, timeout time.Duration) (int, []string, error) {
+	if err := client.WaitForOutput(client.readyMarker, timeout); err != nil {
+		client.Close()
+		return 0, nil, err
+	}
 	sent := 0
 	for _, value := range sends {
 		if value == "" {
@@ -979,6 +987,40 @@ func (client *ttyConsoleClient) SendAndExpect(sends []string, expects []string, 
 			client.Close()
 			<-client.readDone
 			return sent, matched, fmt.Errorf("expected console output not found within %s: %s", timeout, strings.Join(missingExpectations(expects, seen), ", "))
+		}
+	}
+}
+
+// An opened TTY is not a ready shell: startup termios changes can discard
+// queued input. Observe the caller's console handshake before sending bytes.
+func (client *ttyConsoleClient) WaitForOutput(marker string, timeout time.Duration) error {
+	if marker == "" {
+		return nil
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		client.outputMu.Lock()
+		ready := strings.Contains(client.output.String(), marker)
+		client.outputMu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case err := <-client.readDone:
+			client.outputMu.Lock()
+			ready = strings.Contains(client.output.String(), marker)
+			client.outputMu.Unlock()
+			if ready {
+				client.readDone <- err
+				return nil
+			}
+			return fmt.Errorf("console closed before ready marker %q: %v", marker, err)
+		case <-deadline.C:
+			return fmt.Errorf("console ready marker %q not reached within %s", marker, timeout)
+		case <-ticker.C:
 		}
 	}
 }
@@ -1150,8 +1192,14 @@ func appendInputDeviceArgs(args []string, profile string, iommu bool) ([]string,
 	case "mouse-keyboard":
 		args = append(args, mouse...)
 		args = append(args, keyboard...)
+	case "usb-hid":
+		args = append(args,
+			"-device", "qemu-xhci,id=pachaxhci",
+			"-device", "usb-kbd,bus=pachaxhci.0,id=pachausbkbd",
+			"-device", "usb-mouse,bus=pachaxhci.0,id=pachausbmouse",
+		)
 	default:
-		return nil, fmt.Errorf("invalid input profile %q; expected keyboard-mouse, keyboard-tablet, or mouse-keyboard", profile)
+		return nil, fmt.Errorf("invalid input profile %q; expected keyboard-mouse, keyboard-tablet, mouse-keyboard, or usb-hid", profile)
 	}
 	return args, nil
 }
@@ -1176,8 +1224,10 @@ func appendGraphicsDeviceArgs(args []string, profile string, display string) ([]
 		} else if !strings.Contains(display, "gl=") {
 			display += ",gl=on"
 		}
+		// Let KVM deliver queue kicks through eventfd. Synchronous MMIO
+		// otherwise stalls the guest behind the renderer's main-loop lock.
 		return append(args,
-			"-device", "virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,id=pachagpu"), display, nil
+			"-device", "virtio-gpu-gl-pci,disable-legacy=on,iommu_platform=on,ioeventfd=on,id=pachagpu"), display, nil
 	default:
 		return nil, "", fmt.Errorf("invalid graphics profile %q; expected 2d or virgl", profile)
 	}
@@ -1189,12 +1239,15 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if err != nil {
 		return commandPlan{}, err
 	}
-	diskPath, diskFormat, err := qemuDiskPathAndFormat(workspace, opts)
-	if err != nil {
-		return commandPlan{}, err
+	var diskPath, diskFormat string
+	if !opts.NoStorage {
+		diskPath, diskFormat, err = qemuDiskPathAndFormat(workspace, opts)
+		if err != nil {
+			return commandPlan{}, err
+		}
 	}
 	if opts.Memory == "" {
-		opts.Memory = "2G"
+		opts.Memory = "4G"
 	}
 	if opts.Display == "" {
 		opts.Display = "none"
@@ -1217,11 +1270,12 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if opts.IOMMU {
 		args = append(args, "-device", "intel-iommu,intremap=off,aw-bits=48")
 	}
-	args = append(args,
-		"-drive", "file="+imagePath+",format=raw,if=ide",
-		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
-		"-device", "nvme,drive=rootdisk,serial=capos-root",
-	)
+	args = append(args, "-drive", "file="+imagePath+",format=raw,if=ide")
+	if !opts.NoStorage {
+		args = append(args,
+			"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
+			"-device", "nvme,drive=rootdisk,serial=capos-root")
+	}
 	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
 	if err != nil {
 		return commandPlan{}, err
@@ -1256,13 +1310,17 @@ func limineBiosCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, err
 	}
 	args = append(args, opts.ExtraArgs...)
+	imagePaths := []string{imagePath}
+	if !opts.NoStorage {
+		imagePaths = append(imagePaths, diskPath)
+	}
 	return commandPlan{
 		Args:          args,
 		LogPath:       logPath,
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
 		QMPSocket:     opts.QMP,
-		ImagePaths:    []string{imagePath, diskPath},
+		ImagePaths:    imagePaths,
 	}, nil
 }
 
@@ -1271,9 +1329,12 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 	if err != nil {
 		return commandPlan{}, err
 	}
-	diskPath, diskFormat, err := qemuDiskPathAndFormat(workspace, opts)
-	if err != nil {
-		return commandPlan{}, err
+	var diskPath, diskFormat string
+	if !opts.NoStorage {
+		diskPath, diskFormat, err = qemuDiskPathAndFormat(workspace, opts)
+		if err != nil {
+			return commandPlan{}, err
+		}
 	}
 	codePath := firstExisting(os.Getenv("CAPOS_OVMF_CODE"), "/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/OVMF/OVMF_CODE.fd")
 	varsTemplate := firstExisting(os.Getenv("CAPOS_OVMF_VARS_TEMPLATE"), "/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/OVMF/OVMF_VARS.fd")
@@ -1284,7 +1345,7 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, fmt.Errorf("missing OVMF vars template for Limine UEFI boot; set CAPOS_OVMF_VARS_TEMPLATE")
 	}
 	if opts.Memory == "" {
-		opts.Memory = "2G"
+		opts.Memory = "4G"
 	}
 	if opts.Display == "" {
 		opts.Display = "none"
@@ -1313,9 +1374,12 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		"-drive", "if=pflash,format=raw,file="+varsPath,
 		"-drive", "if=none,file="+imagePath+",format=raw,id=limineboot",
 		"-device", "virtio-blk-pci,drive=limineboot,bootindex=1",
-		"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
-		"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2",
 	)
+	if !opts.NoStorage {
+		args = append(args,
+			"-drive", "if=none,file="+diskPath+",format="+diskFormat+",id=rootdisk",
+			"-device", "nvme,drive=rootdisk,serial=capos-root,bootindex=2")
+	}
 	args, opts.Display, err = appendGraphicsDeviceArgs(args, opts.GraphicsProfile, opts.Display)
 	if err != nil {
 		return commandPlan{}, err
@@ -1350,13 +1414,17 @@ func limineUefiCommandArgs(workspace *config.Workspace, qemuPath string, opts Op
 		return commandPlan{}, err
 	}
 	args = append(args, opts.ExtraArgs...)
+	imagePaths := []string{imagePath, varsPath}
+	if !opts.NoStorage {
+		imagePaths = append(imagePaths, diskPath)
+	}
 	return commandPlan{
 		Args:          args,
 		LogPath:       logPath,
 		HostTimeLog:   hostTimeLogPath,
 		ConsoleSocket: consoleSocket,
 		QMPSocket:     opts.QMP,
-		ImagePaths:    []string{imagePath, diskPath, varsPath},
+		ImagePaths:    imagePaths,
 		Prepare: func() error {
 			return copyFile(varsTemplate, varsPath)
 		},
@@ -1369,7 +1437,7 @@ func appendNetworkArgs(args []string, noNet bool, iommu bool) []string {
 	}
 	return append(args,
 		"-net", "none",
-		"-netdev", "user,id=net0,hostfwd=udp:127.0.0.1:10015-10.0.2.15:7777,hostfwd=tcp:127.0.0.1:10016-10.0.2.15:7778",
+		"-netdev", "user,id=net0,hostfwd=udp:127.0.0.1:10015-:7777,hostfwd=tcp:127.0.0.1:10016-:7778",
 		"-device", "virtio-net-pci"+virtioIOMMUPlatformArg(iommu)+",netdev=net0,mac=52:54:00:12:34:56,disable-legacy=on,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off",
 	)
 }

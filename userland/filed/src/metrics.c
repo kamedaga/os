@@ -1,5 +1,6 @@
 
 #include "dispatch/common.h"
+#include "filed/metric_clock.h"
 
 void filed_dispatch_lock_acquire(filed_lock_t *lock)
 {
@@ -20,11 +21,7 @@ void filed_dispatch_lock_release(filed_lock_t *lock)
 
 uint64_t filed_now_ns(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return filed_metric_now_ns();
 }
 
 uint64_t filed_read_tsc(void)
@@ -47,6 +44,7 @@ const char *filed_op_name(uint64_t op)
     case FILED_OP_VFS_ROOT_GETDENTS: return "root_getdents";
     case FILED_OP_VFS_OPENAT: return "openat";
     case FILED_OP_VFS_STAT: return "stat";
+    case FILED_OP_VFS_STATAT: return "statat";
     case FILED_OP_VFS_STATFS: return "statfs";
     case FILED_OP_VFS_UTIMENS: return "utimens";
     case FILED_OP_VFS_CHMOD: return "chmod";
@@ -105,15 +103,15 @@ void filed_record_dispatch_metric(
     uint64_t end_cycles,
     int status)
 {
-    if (op >= FILED_METRIC_OP_MAX || start_ns == 0 || end_ns < start_ns) {
+    if (op >= FILED_METRIC_OP_MAX) {
         return;
     }
     filed_dispatch_metric_t *metric = &filed_dispatch_metrics[op];
-    const uint64_t elapsed_ns = end_ns - start_ns;
     metric->count++;
-    metric->total_ns += elapsed_ns;
-    if (elapsed_ns > metric->max_ns) {
-        metric->max_ns = elapsed_ns;
+    if (start_ns != 0 && end_ns >= start_ns) {
+        const uint64_t elapsed_ns = end_ns - start_ns;
+        metric->total_ns += elapsed_ns;
+        if (elapsed_ns > metric->max_ns) metric->max_ns = elapsed_ns;
     }
     if (start_cycles != 0 && end_cycles >= start_cycles) {
         const uint64_t elapsed_cycles = end_cycles - start_cycles;
@@ -188,7 +186,7 @@ filed_generation_entry_t *filed_session_generation_entries(
     {
         return NULL;
     }
-    return (filed_generation_entry_t *)((uint8_t *)session->page + header->generation_offset);
+    return (filed_generation_entry_t *)((uint8_t *)session->page + FILED_FAST_GENERATION_OFFSET);
 }
 
 void filed_session_publish_generation(
@@ -212,18 +210,18 @@ void filed_session_publish_generation(
         return;
     }
 
-    uint64_t free_slot = header->generation_capacity;
-    for (uint64_t i = 0; i < header->generation_capacity; ++i) {
+    uint64_t free_slot = FILED_FAST_GENERATION_CAPACITY;
+    for (uint64_t i = 0; i < FILED_FAST_GENERATION_CAPACITY; ++i) {
         if (entries[i].handle == (uint64_t)handle_id) {
             free_slot = i;
             break;
         }
-        if (free_slot == header->generation_capacity && entries[i].handle == 0) {
+        if (free_slot == FILED_FAST_GENERATION_CAPACITY && entries[i].handle == 0) {
             free_slot = i;
         }
     }
-    if (free_slot == header->generation_capacity) {
-        free_slot = ((uint64_t)handle_id) % header->generation_capacity;
+    if (free_slot == FILED_FAST_GENERATION_CAPACITY) {
+        free_slot = ((uint64_t)handle_id) % FILED_FAST_GENERATION_CAPACITY;
     }
 
     filed_generation_entry_t *entry = &entries[free_slot];
@@ -261,9 +259,9 @@ filed_vnode_t *filed_dispatch_find_vnode_by_id(
     if (vfs == NULL || vnode_id == 0) {
         return NULL;
     }
-    for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-        if (vfs->vnodes[i].active && vfs->vnodes[i].id == vnode_id) {
-            return &vfs->vnodes[i];
+    for (uint32_t i = 0; i < vfs->vnode_capacity; ++i) {
+        if (filed_vfs_vnode_at(vfs, i)->active && filed_vfs_vnode_at(vfs, i)->id == vnode_id) {
+            return filed_vfs_vnode_at(vfs, i);
         }
     }
     return NULL;
@@ -276,9 +274,9 @@ filed_open_file_t *filed_dispatch_find_file_by_id(
     if (vfs == NULL || file_id == 0) {
         return NULL;
     }
-    for (uint32_t i = 0; i < FILED_MAX_FILES; ++i) {
-        if (vfs->files[i].active && vfs->files[i].id == file_id) {
-            return &vfs->files[i];
+    for (uint32_t i = 0; i < vfs->file_capacity; ++i) {
+        if (filed_vfs_file_at(vfs, i)->active && filed_vfs_file_at(vfs, i)->id == file_id) {
+            return filed_vfs_file_at(vfs, i);
         }
     }
     return NULL;
@@ -313,8 +311,8 @@ void filed_runtime_publish_backend_object_generation(
         return;
     }
     filed_exec_invalidate_backend_object(runtime, backend_object);
-    for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
-        filed_handle_t *handle = &runtime->vfs.handles[i];
+    for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i) {
+        filed_handle_t *handle = filed_vfs_handle_at(&runtime->vfs, i);
         filed_vnode_t *vnode = filed_dispatch_handle_vnode(&runtime->vfs, handle);
         if (vnode == NULL || vnode->backend_object != backend_object) {
             continue;
@@ -333,6 +331,8 @@ void filed_runtime_publish_backend_object_generation(
 
 void filed_dump_dispatch_metrics(filed_runtime_t *runtime)
 {
+    fprintf(stderr, "FILED_METRIC_CLOCK wall_time_enabled=%u (disabled ns fields are unavailable)\n",
+        (unsigned)(FILED_WALL_TIME_METRICS != 0));
     for (uint64_t op = 0; op < FILED_METRIC_OP_MAX; ++op) {
         const filed_dispatch_metric_t *metric = &filed_dispatch_metrics[op];
         if (metric->count == 0) {

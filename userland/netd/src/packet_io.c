@@ -1,17 +1,24 @@
 #include "netd_internal.h"
 
-#include "linux_subsystem/net/net_device.h"
+#include "link.h"
+#include "kobox2_nic.h"
+#include "network_config.h"
+#include "status_file.h"
 #include "upper.h"
 
+#include "pacha/ipc.h"
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 enum {
-    NETD_RX_QUEUE_CAP = 32,
+    NETD_RX_QUEUE_CAP = 64,
     NETD_FRAME_MAX = 2048,
 };
 
 struct netd_rx_frame {
+    uint64_t generation;
     void *dev;
     size_t len;
     unsigned char bytes[NETD_FRAME_MAX];
@@ -26,9 +33,32 @@ struct netd_packet_io {
     uint64_t tx_frames;
     uint64_t rx_drops;
     int trace;
+    int dhcp_started;
+    struct netd_dhcp_client dhcp;
 };
 
 static struct netd_packet_io g_packet_io;
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static int dhcp_send(void *context, const void *frame, size_t length)
+{
+    (void)context;
+    return netd_link_send(frame, length);
+}
+
+static void dhcp_event(void *context, const char *event, int detail)
+{
+    const struct netd_boot_config *cfg = context;
+    char phase[80];
+    (void)snprintf(phase, sizeof(phase), "DHCP %s status=%d", event, detail);
+    netd_status_file_note(cfg, phase);
+}
 
 static uint16_t read_be16(const unsigned char *bytes)
 {
@@ -41,19 +71,21 @@ static void write_be16(unsigned char *dst, uint16_t value)
     dst[1] = (unsigned char)value;
 }
 
-static void netd_packet_rx_callback(void *ctx, void *dev, const void *frame, size_t frame_len)
+static int netd_packet_rx_callback(void *ctx, uint64_t generation,
+    const void *frame, size_t frame_len)
 {
     struct netd_packet_io *io = ctx;
     if (io == NULL || frame == NULL || frame_len == 0) {
-        return;
+        return -22;
     }
     if (frame_len > NETD_FRAME_MAX || io->rx_count == NETD_RX_QUEUE_CAP) {
         io->rx_drops++;
-        return;
+        return -11;
     }
 
     struct netd_rx_frame *slot = &io->rx_queue[io->rx_tail];
-    slot->dev = dev;
+    slot->generation = generation;
+    slot->dev = NULL;
     slot->len = frame_len;
     memcpy(slot->bytes, frame, frame_len);
     io->rx_tail = (io->rx_tail + 1u) % NETD_RX_QUEUE_CAP;
@@ -62,22 +94,33 @@ static void netd_packet_rx_callback(void *ctx, void *dev, const void *frame, siz
 
     if (io->trace && frame_len >= 14) {
         printf("[netd] rx frame dev=%p len=%zu ethertype=0x%04x\n",
-            dev,
+            slot->dev,
             frame_len,
             read_be16(slot->bytes + 12));
     }
+    return 0;
 }
 
 static void netd_packet_io_drain_rx(void)
 {
     while (g_packet_io.rx_count != 0) {
         const struct netd_rx_frame *frame = &g_packet_io.rx_queue[g_packet_io.rx_head];
-        const struct netd_upper_frame upper_frame = {
-            .dev = frame->dev,
-            .bytes = frame->bytes,
-            .len = frame->len,
-        };
-        (void)netd_upper_receive_frame(&upper_frame);
+        const struct netd_link_info *link = netd_link_current();
+        if (link != NULL && link->carrier &&
+            link->generation == frame->generation) {
+            const struct netd_upper_frame upper_frame = {
+                .dev = frame->dev,
+                .bytes = frame->bytes,
+                .len = frame->len,
+            };
+            int dhcp_reply = g_packet_io.dhcp_started ?
+                netd_dhcp_receive(&g_packet_io.dhcp, frame->bytes,
+                    frame->len, monotonic_ms()) : 0;
+            if (!dhcp_reply)
+                (void)netd_upper_receive_frame(&upper_frame);
+        } else {
+            g_packet_io.rx_drops++;
+        }
         g_packet_io.rx_head = (g_packet_io.rx_head + 1u) % NETD_RX_QUEUE_CAP;
         g_packet_io.rx_count--;
     }
@@ -85,7 +128,7 @@ static void netd_packet_io_drain_rx(void)
 
 static int netd_packet_io_tx_frame(const void *frame, size_t frame_len)
 {
-    int status = kb_net_device_tx_frame(frame, frame_len);
+    int status = netd_link_send(frame, frame_len);
     if (status == 0) {
         g_packet_io.tx_frames++;
     }
@@ -94,26 +137,24 @@ static int netd_packet_io_tx_frame(const void *frame, size_t frame_len)
 
 static size_t build_arp_probe(unsigned char *frame, size_t frame_capacity)
 {
-    static const unsigned char source_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
-    static const unsigned char source_ip[4] = {10, 0, 2, 15};
-    static const unsigned char target_ip[4] = {10, 0, 2, 2};
+    const struct netd_network_config *network = netd_network_config_get();
     const size_t frame_len = 60;
 
-    if (frame == NULL || frame_capacity < frame_len) {
+    if (frame == NULL || network == NULL || frame_capacity < frame_len) {
         return 0;
     }
     memset(frame, 0, frame_capacity);
     memset(frame, 0xff, 6);
-    memcpy(frame + 6, source_mac, sizeof(source_mac));
+    memcpy(frame + 6, network->link_mac, sizeof(network->link_mac));
     write_be16(frame + 12, 0x0806);
     write_be16(frame + 14, 0x0001);
     write_be16(frame + 16, 0x0800);
     frame[18] = 6;
     frame[19] = 4;
     write_be16(frame + 20, 0x0001);
-    memcpy(frame + 22, source_mac, sizeof(source_mac));
-    memcpy(frame + 28, source_ip, sizeof(source_ip));
-    memcpy(frame + 38, target_ip, sizeof(target_ip));
+    memcpy(frame + 22, network->link_mac, sizeof(network->link_mac));
+    memcpy(frame + 28, network->address, sizeof(network->address));
+    memcpy(frame + 38, network->gateway, sizeof(network->gateway));
     return frame_len;
 }
 
@@ -146,26 +187,55 @@ int netd_packet_io_start(struct netd_runtime *runtime)
 
     memset(&g_packet_io, 0, sizeof(g_packet_io));
     g_packet_io.trace = (runtime->cfg->flags & NETD_BOOT_FLAG_TRACE) != 0;
-    int upper_status = netd_upper_start(runtime);
-    if (upper_status != 0) {
-        return upper_status;
-    }
-    kb_net_device_set_rx_frame_callback(netd_packet_rx_callback, &g_packet_io);
-
-    if ((runtime->cfg->flags & NETD_BOOT_FLAG_SMOKE) != 0) {
-        uint64_t stage_start_cycles = netd_metrics_read_tsc();
-        int smoke_status = netd_packet_io_smoke();
-        netd_metrics_record("packet_smoke", stage_start_cycles, netd_metrics_read_tsc());
-        if (smoke_status != 0) {
-            return smoke_status;
-        }
-    }
+    netd_link_init(netd_packet_rx_callback, &g_packet_io);
+    int nic_status = netd_kobox2_nic_start(runtime);
+    if (nic_status != 0) return nic_status;
     return 0;
+}
+
+int netd_packet_io_dhcp_start(struct netd_runtime *runtime)
+{
+    if (runtime == NULL || runtime->cfg == NULL) return -EINVAL;
+    if (g_packet_io.dhcp_started) return 0;
+    const struct netd_link_info *link = netd_link_current();
+    if (link == NULL) return -ENODEV;
+    uint32_t xid = 0;
+    if (pacha_getrandom(&xid, sizeof(xid), 0) != sizeof(xid))
+        return -EIO;
+    g_packet_io.dhcp_started = 1;
+    netd_dhcp_init(&g_packet_io.dhcp, link->mac, xid,
+        dhcp_send, dhcp_event, (void *)runtime->cfg);
+    netd_status_file_bind_dhcp(&g_packet_io.dhcp);
+    return 0;
+}
+
+void netd_packet_io_dhcp_disable(void)
+{
+    if (g_packet_io.dhcp_started)
+        netd_dhcp_disable(&g_packet_io.dhcp);
+}
+
+const struct netd_dhcp_client *netd_packet_io_dhcp_status(void)
+{
+    return g_packet_io.dhcp_started ? &g_packet_io.dhcp : NULL;
+}
+
+int netd_packet_io_smoke_after_ipv4(void)
+{
+    uint64_t start = netd_metrics_read_tsc();
+    int status = netd_packet_io_smoke();
+    netd_metrics_record("packet_smoke", start, netd_metrics_read_tsc());
+    return status;
 }
 
 void netd_packet_io_pump_once(void)
 {
-    kb_net_device_poll();
+    netd_link_poll();
+    if (g_packet_io.dhcp_started) {
+        const struct netd_link_info *link = netd_link_current();
+        netd_dhcp_poll(&g_packet_io.dhcp, monotonic_ms(),
+            link != NULL && link->carrier);
+    }
     netd_packet_io_drain_rx();
     netd_upper_poll();
 }

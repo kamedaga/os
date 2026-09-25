@@ -26,7 +26,8 @@ static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
         cfg->header_size != sizeof(*cfg) ||
         cfg->total_size > INPUTD_BOOT_CONFIG_MAX_BYTES ||
         cfg->input_endpoint_fd < 16 || cfg->ready_channel_fd < 16 ||
-        cfg->netd_endpoint_fd < 16 || cfg->device_count == 0 ||
+        (cfg->netd_endpoint_fd != 0 && cfg->netd_endpoint_fd < 16) ||
+        cfg->source_endpoint_fd < 16 ||
         cfg->device_record_size != sizeof(struct inputd_device_config) ||
         cfg->devices_offset != sizeof(*cfg)) return -22;
     const uint64_t device_capacity =
@@ -35,11 +36,11 @@ static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
     const uint64_t total_size = sizeof(*cfg) +
         (uint64_t)cfg->device_count * sizeof(struct inputd_device_config);
     if (cfg->total_size != total_size ||
-        cfg->device_count >= PACHA_SERVICE_WAIT_MAX_FDS - 1u) return -22;
+        cfg->device_count >= PACHA_SERVICE_WAIT_MAX_FDS - 2u) return -22;
 
     const struct inputd_device_config *devices = inputd_boot_devices(cfg);
     for (uint32_t i = 0; i < cfg->device_count; i++) {
-        if (devices[i].device_fd < 16 || devices[i].device_fd >= 256 ||
+        if (devices[i].device_fd < 16 || devices[i].device_fd >= PACHA_FD_TABLE_LIMIT ||
             devices[i].pci_segment > UINT16_MAX || devices[i].pci_bus > UINT8_MAX ||
             devices[i].pci_device > 31 || devices[i].pci_function > 7 ||
             devices[i].vendor_id > UINT16_MAX || devices[i].device_id > UINT16_MAX ||
@@ -65,7 +66,7 @@ int main(int argc, char **argv)
     int init_status = inputd_input_island_init(&island, cfg);
     struct pacha_capsule_irq *wake_irqs = NULL;
     const struct inputd_device_config *devices = inputd_boot_devices(cfg);
-    if (init_status == 0) {
+    if (init_status == 0 && cfg->device_count != 0) {
         wake_irqs = calloc(cfg->device_count, sizeof(*wake_irqs));
         if (wake_irqs == NULL) init_status = -12;
     }
@@ -92,6 +93,9 @@ int main(int argc, char **argv)
         if (built_wait_generation != current_wait_generation) {
             if (pacha_service_wait_init(&wait_set, (int)cfg->input_endpoint_fd) != 0)
                 return 1;
+            if (pacha_service_wait_add(&wait_set, (int)cfg->source_endpoint_fd,
+                    PACHA_FD_EVENT_READABLE) != 0)
+                return 1;
             for (size_t i = 0; i < cfg->device_count; i++) {
                 if (pacha_service_wait_add(
                         &wait_set, wake_irqs[i].fd, PACHA_FD_EVENT_READABLE) != 0)
@@ -99,7 +103,7 @@ int main(int argc, char **argv)
             }
             wait_source_count = inputd_input_collect_wait_sources(
                 wait_sources,
-                PACHA_SERVICE_WAIT_MAX_FDS - 1u - cfg->device_count);
+                PACHA_SERVICE_WAIT_MAX_FDS - 2u - cfg->device_count);
             for (size_t i = 0; i < wait_source_count; i++) {
                 if (pacha_service_wait_add(
                         &wait_set, wait_sources[i].fd, PACHA_FD_EVENT_HANGUP) != 0)
@@ -110,7 +114,7 @@ int main(int argc, char **argv)
         if (pacha_service_wait(&wait_set, PACHA_FD_WAIT_FOREVER) < 0) return 1;
 
         for (size_t i = 0; i < cfg->device_count; i++) {
-            const size_t wait_index = 1u + i;
+            const size_t wait_index = 2u + i;
             if ((wait_set.fds[wait_index].revents & PACHA_FD_EVENT_READABLE) == 0)
                 continue;
             const uint64_t irq_ready_ns = monotonic_ns();
@@ -122,6 +126,20 @@ int main(int argc, char **argv)
             (void)inputd_input_island_drain_device(&island, i, irq_ready_ns);
         }
         inputd_input_flush_notifications();
+
+        if ((wait_set.fds[1].revents & PACHA_FD_EVENT_READABLE) != 0) {
+            for (unsigned request_budget = 0; request_budget < 64; request_budget++) {
+                struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS] = {0};
+                struct pacha_ipc_msg request = {.fds = fds,
+                    .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
+                int received = pacha_ipc_recv((int)cfg->source_endpoint_fd, &request);
+                if (received == PACHA_ERR_EMPTY || received == PACHA_ERR_NOT_READY)
+                    break;
+                if (received) return 1;
+                (void)inputd_service_source_dispatch(&service, &request, fds);
+                inputd_input_flush_notifications();
+            }
+        }
 
         if ((wait_set.fds[0].revents & PACHA_FD_EVENT_READABLE) != 0) {
             for (unsigned request_budget = 0; request_budget < 64; request_budget++) {
@@ -144,7 +162,7 @@ int main(int argc, char **argv)
             }
         }
 
-        const size_t source_base = 1u + cfg->device_count;
+        const size_t source_base = 2u + cfg->device_count;
         for (size_t i = 0; i < wait_source_count; i++) {
             const uint64_t revents = wait_set.fds[source_base + i].revents;
             if (revents != 0)

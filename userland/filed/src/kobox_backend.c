@@ -1,4 +1,5 @@
 #include "filed/kobox_backend.h"
+#include "filed/metric_clock.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -18,11 +19,7 @@ static int filed_kobox_call_with_fd(
 
 static uint64_t filed_kobox_backend_now_ns(void)
 {
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
-        return 0;
-    }
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    return filed_metric_now_ns();
 }
 
 static uint64_t filed_kobox_backend_read_tsc(void)
@@ -130,18 +127,16 @@ static void filed_kobox_backend_record_metric(
     const uint64_t slot = filed_kobox_backend_metric_slot(op);
     if (backend == NULL ||
         slot == 0 ||
-        slot >= FILED_KOBOX_BACKEND_METRIC_OP_MAX ||
-        start_ns == 0 ||
-        end_ns < start_ns)
+        slot >= FILED_KOBOX_BACKEND_METRIC_OP_MAX)
     {
         return;
     }
     filed_kobox_backend_metric_t *metric = &backend->metrics[slot];
-    const uint64_t elapsed_ns = end_ns - start_ns;
     metric->count++;
-    metric->total_ns += elapsed_ns;
-    if (elapsed_ns > metric->max_ns) {
-        metric->max_ns = elapsed_ns;
+    if (start_ns != 0 && end_ns >= start_ns) {
+        const uint64_t elapsed_ns = end_ns - start_ns;
+        metric->total_ns += elapsed_ns;
+        if (elapsed_ns > metric->max_ns) metric->max_ns = elapsed_ns;
     }
     if (start_cycles != 0 && end_cycles >= start_cycles) {
         const uint64_t elapsed_cycles = end_cycles - start_cycles;
@@ -219,6 +214,8 @@ void filed_kobox_backend_dump_metrics(const filed_kobox_backend_t *backend)
     if (backend == NULL) {
         return;
     }
+    fprintf(stderr, "FILED_BACKEND_METRIC_CLOCK wall_time_enabled=%u (disabled ns fields are unavailable)\n",
+        (unsigned)(FILED_WALL_TIME_METRICS != 0));
     for (uint64_t op = 0; op < FILED_KOBOX_BACKEND_METRIC_OP_MAX; ++op) {
         const filed_kobox_backend_metric_t *metric = &backend->metrics[op];
         if (metric->count == 0) {

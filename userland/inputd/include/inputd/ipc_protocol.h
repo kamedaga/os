@@ -16,6 +16,7 @@ enum {
     INPUTD_EVENT_CAPACITY = 64u,
     INPUTD_IOCTL_DATA_BYTES = 1024u,
     INPUTD_POLLIN = 0x0001u,
+    INPUTD_POLLHUP = 0x0010u,
 };
 
 typedef struct inputd_open_request {

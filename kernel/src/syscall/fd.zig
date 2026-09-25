@@ -6,6 +6,7 @@ const kernel_log = @import("../kernel_log.zig");
 const scheduler = @import("../scheduler.zig").connection;
 const user_vm = @import("../memory/user_vm.zig");
 const sc = @import("numbers.zig");
+const smp_perf = @import("../smp_perf.zig");
 
 const fd_abi = abi_root.fd_abi;
 const vm_abi = abi_root.vm_abi;
@@ -160,6 +161,21 @@ pub fn wakeThreadTargets(
         // before touching userspace, while the scheduler claim keeps the
         // target non-runnable and excludes timeout/signal completion.
         state.cancelFdWaitGroup(target.group, target.wait_token);
+        if (target.recv_msg_va != 0) {
+            // No message was dequeued by this generic wake path. In
+            // particular, peer death must not masquerade as RECV success.
+            _ = scheduler.publishClaimedWaitCompletion(
+                target.thread_index,
+                target.thread_generation,
+                target.owner,
+                target.wait_token,
+                if ((target.revents & fd_abi.event_hangup) != 0)
+                    sc.syscall_err_closed
+                else
+                    sc.syscall_err_not_ready,
+            );
+            continue;
+        }
         var ready_count: u64 = 0;
         var copy_ok = true;
         for (targets, 0..) |member, member_index| {
@@ -206,6 +222,19 @@ fn wakePipeWaiters(h: anytype, state: *kernel.KernelState, pipe_ref: kernel.Pipe
     var wake_storage: [max_pollfds]kernel.ThreadWakeTarget = undefined;
     const wake_count = state.takePipeWaiters(pipe_ref, write_side, ready_events, wake_storage[0..]);
     return wakeThreadTargets(h, state, wake_storage[0..wake_count]);
+}
+
+/// Retirement is a terminal event even for aliases already sleeping in
+/// WAIT_MANY. Reuse the same wait-group claim/copy/wake protocol as normal I/O.
+pub fn wakeRetiredIrqWaiters(h: anytype, state: *kernel.KernelState) void {
+    var targets: [max_pollfds]kernel.ThreadWakeTarget = undefined;
+    while (true) {
+        const count = state.takeReadyIrqWaiters(&targets);
+        if (count == 0) return;
+        // A bad destination is reported to that waiter, not as a failed retire
+        // after the route's no-fail commit has already completed.
+        _ = wakeThreadTargets(h, state, targets[0..count]);
+    }
 }
 
 fn ipcChannelHandleForFd(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) ?kernel.IpcChannelHandle {
@@ -265,9 +294,15 @@ fn fdRead(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: 
         if (count == 0) return sc.syscall_err_not_ready;
         return writeUserU64Bytes(h, proc, out_va, len, count);
     }
-    if (state.timerReadExpirations(proc, fd, scheduler.lapic_tick_count)) |count| {
-        if (count == 0) return sc.syscall_err_not_ready;
-        return writeUserU64Bytes(h, proc, out_va, len, count);
+    if (state.fdPayloadWithRightsConst(proc, fd, .{ .read = true })) |view| {
+        if (view.payload.* == .timer) {
+            const count = state.timerReadExpirations(proc, fd, timerNowNs()) orelse return sc.syscall_err_invalid;
+            if (count == 0) return sc.syscall_err_not_ready;
+            return writeUserU64Bytes(h, proc, out_va, len, count);
+        }
+    }
+    if (state.irqObjectForFd(proc, fd, .{ .read = true })) |irq| {
+        if (irq.retired) return sc.syscall_err_closed;
     }
     if (state.irqEventCountForFd(proc, fd, .{ .read = true })) |count| {
         if (count == 0) return sc.syscall_err_not_ready;
@@ -474,8 +509,21 @@ fn fdFcntl(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, 
     };
 }
 
-fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64, now_tick: u64) ?u64 {
+// Only timer readability consumes time. Keep one fresh sample per pass,
+// including the separate pass after waiter registration, without MMIO for IPC.
+fn pollNowNs(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, events: u64, now: *?u64) u64 {
+    if (now.*) |sample| return sample;
+    if ((events & fd_abi.event_readable) == 0) return 0;
+    const view = state.fdPayloadWithRightsConst(proc, fd, .{ .poll = true }) orelse return 0;
+    if (view.payload.* != .timer) return 0;
+    const sample = timerNowNs();
+    now.* = sample;
+    return sample;
+}
+
+fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) ?u64 {
     if (pollfds_va == 0 or count > fd_abi.max_pollfds) return null;
+    var now: ?u64 = null;
     var ready_count: u64 = 0;
     var i: u64 = 0;
     while (i < count) : (i += 1) {
@@ -483,7 +531,8 @@ fn pollOnce(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, po
         const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
         const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
         if ((events & ~fd_abi.event_known_mask) != 0) return null;
-        const revents = state.fdPollEvents(proc, @intCast(fd_u64), events, now_tick) orelse return null;
+        const now_ns = pollNowNs(state, proc, @intCast(fd_u64), events, &now);
+        const revents = state.fdPollEvents(proc, @intCast(fd_u64), events, now_ns) orelse return null;
         if (!h.write_user_u64(proc, item_va + fd_abi.pollfd_revents_offset, revents)) return null;
         if (revents != 0) ready_count += 1;
     }
@@ -495,9 +544,11 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const item_va = pollfds_va + @as(u64, @intCast(i)) * fd_abi.pollfd_size;
-        const fd_u64 = h.read_user_u64(proc, item_va + fd_abi.pollfd_fd_offset) orelse return null;
-        const events = h.read_user_u64(proc, item_va + fd_abi.pollfd_events_offset) orelse return null;
-        const min_write_bytes = h.read_user_u64(proc, item_va + fd_abi.pollfd_revents_offset) orelse return null;
+        var wire: [fd_abi.pollfd_size]u8 = undefined;
+        if (!h.copy_user_bytes_from_va(proc, item_va, &wire)) return null;
+        const fd_u64 = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_fd_offset..][0..8], .little);
+        const events = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_events_offset..][0..8], .little);
+        const min_write_bytes = @import("std").mem.readInt(u64, wire[fd_abi.pollfd_revents_offset..][0..8], .little);
         if ((events & ~fd_abi.event_known_mask) != 0) return null;
         out[i] = .{
             .fd = @intCast(fd_u64),
@@ -509,10 +560,55 @@ fn readPollItems(h: anytype, proc: kernel.PrincipalId, pollfds_va: u64, count: u
     return out[0..@intCast(count)];
 }
 
-fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
+test "poll item snapshot copies each ABI item once and preserves validation" {
+    const std = @import("std");
+    const Mock = struct {
+        const base: u64 = 0x1ff0; // Forward a page-crossing item unchanged.
+        var bytes: [48]u8 = undefined;
+        var calls: usize = 0;
+        var fail_at: usize = 0;
+        fn copy(_: kernel.PrincipalId, va: u64, dest: []u8) bool {
+            calls += 1;
+            if (calls == fail_at) return false;
+            std.debug.assert(dest.len == fd_abi.pollfd_size);
+            std.debug.assert(va == base + (calls - 1) * fd_abi.pollfd_size);
+            const offset: usize = @intCast(va - base);
+            @memcpy(dest, bytes[offset..][0..dest.len]);
+            return true;
+        }
+    };
+    const h = .{ .copy_user_bytes_from_va = Mock.copy };
+    const owner = kernel.processPrincipalFromIndex(0).?;
+    var storage: [2]PollItem = undefined;
+    for ([_]u64{ 16, fd_abi.event_readable, 999, 17, fd_abi.event_writable, 123 }, 0..) |value, i|
+        std.mem.writeInt(u64, Mock.bytes[i * 8 ..][0..8], value, .little);
+    Mock.calls = 0;
+    Mock.fail_at = 0;
+    const items = readPollItems(&h, owner, Mock.base, 2, &storage).?;
+    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 16, .events = fd_abi.event_readable, .min_write_bytes = 0, .item_va = Mock.base }, items[0]);
+    try std.testing.expectEqualDeep(PollItem{ .fd = 17, .events = fd_abi.event_writable, .min_write_bytes = 123, .item_va = Mock.base + 24 }, items[1]);
+    Mock.calls = 0;
+    try std.testing.expect(readPollItems(&h, owner, 0, 1, &storage) == null);
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, fd_abi.max_pollfds + 1, &storage) == null);
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, 3, &storage) == null);
+    try std.testing.expectEqual(@as(usize, 0), readPollItems(&h, owner, Mock.base, 0, &storage).?.len);
+    try std.testing.expectEqual(@as(usize, 0), Mock.calls);
+    Mock.fail_at = 2;
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, 2, &storage) == null);
+    try std.testing.expectEqual(@as(usize, 2), Mock.calls);
+    Mock.fail_at = 0;
+    Mock.calls = 0;
+    std.mem.writeInt(u64, Mock.bytes[8..16], 1 << 63, .little);
+    try std.testing.expect(readPollItems(&h, owner, Mock.base, 1, &storage) == null);
+}
+
+fn pollCached(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem) ?u64 {
     var ready_count: u64 = 0;
+    var now: ?u64 = null;
     for (items) |item| {
-        const revents = state.fdPollEventsWithWriteMin(proc, item.fd, item.events, now_tick, item.min_write_bytes) orelse return null;
+        const now_ns = pollNowNs(state, proc, item.fd, item.events, &now);
+        const revents = state.fdPollEventsWithWriteMin(proc, item.fd, item.events, now_ns, item.min_write_bytes) orelse return null;
         if (!h.write_user_u64(proc, item.item_va + fd_abi.pollfd_revents_offset, revents)) return null;
         if (revents != 0) ready_count += 1;
     }
@@ -621,18 +717,12 @@ fn unregisterCachedWaitersForPoll(
     state.unregisterTaskReadableWaiterForThread(thread_index, thread_generation);
 }
 
-fn nextCachedPollWakeDelta(state: *kernel.KernelState, proc: kernel.PrincipalId, items: []const PollItem, now_tick: u64) ?u64 {
-    var min_delta: ?u64 = null;
-    for (items) |item| {
-        const wake_tick = state.fdNextWakeTick(proc, item.fd, now_tick) orelse continue;
-        const delta = if (wake_tick <= now_tick) 1 else wake_tick - now_tick;
-        if (min_delta == null or delta < min_delta.?) min_delta = delta;
-    }
-    return min_delta;
+fn timerNowNs() u64 {
+    return @import("../realtime_clock.zig").monotonicNs() orelse scheduler.lapic_tick_count * 1_000_000;
 }
 
 fn fdPoll(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, pollfds_va: u64, count: u64) u64 {
-    return pollOnce(h, state, proc, pollfds_va, count, scheduler.lapic_tick_count) orelse sc.syscall_err_invalid;
+    return pollOnce(h, state, proc, pollfds_va, count) orelse sc.syscall_err_invalid;
 }
 
 fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -641,10 +731,9 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     const timeout_ticks = frame.rdx;
     const flags = frame.r10;
     if (flags != 0) return sc.syscall_err_invalid;
-    const now = scheduler.lapic_tick_count;
     var poll_items_storage: [max_pollfds]PollItem = undefined;
     const poll_items = readPollItems(h, proc, pollfds_va, count, poll_items_storage[0..]) orelse return sc.syscall_err_invalid;
-    const ready = pollCached(h, state, proc, poll_items, now) orelse return sc.syscall_err_invalid;
+    const ready = pollCached(h, state, proc, poll_items) orelse return sc.syscall_err_invalid;
     if (ready != 0) return ready;
     if (timeout_ticks == 0) return sc.syscall_err_not_ready;
 
@@ -684,7 +773,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     };
     ipc_metric.record(.wait_register, register_start);
     const repoll_start = ipc_metric.timestamp();
-    const ready_after_register = pollCached(h, state, proc, poll_items, scheduler.lapic_tick_count) orelse {
+    const ready_after_register = pollCached(h, state, proc, poll_items) orelse {
         scheduler.cancelCurrentWaitToken(current_generation, wait_token);
         state.cancelFdWaitGroup(group, wait_token);
         return sc.syscall_err_invalid;
@@ -696,10 +785,7 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
         return ready_after_register;
     }
 
-    var block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
-    if (nextCachedPollWakeDelta(state, proc, poll_items, now)) |delta| {
-        if (block_ticks == 0 or delta < block_ticks) block_ticks = delta;
-    }
+    const block_ticks: u64 = if (timeout_ticks == fd_abi.wait_forever) 0 else timeout_ticks;
     if (h.block_current_thread_for_event(
         frame,
         true,
@@ -713,45 +799,38 @@ fn fdWaitMany(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, 
     return sc.syscall_err_not_ready;
 }
 
-fn nanosToTicks(nsec: u64) ?u64 {
-    const tick_nsec: u64 = 1_000_000;
-    if (nsec == 0) return 0;
-    if (nsec > @import("std").math.maxInt(u64) - tick_nsec + 1) return null;
-    return (nsec + tick_nsec - 1) / tick_nsec;
-}
-
-fn ticksToTimespec(ticks: u64) struct { sec: u64, nsec: u64 } {
+fn nanosToTimespec(ns: u64) struct { sec: u64, nsec: u64 } {
     return .{
-        .sec = ticks / 1000,
-        .nsec = (ticks % 1000) * 1_000_000,
+        .sec = ns / 1_000_000_000,
+        .nsec = ns % 1_000_000_000,
     };
 }
 
-fn timespecToTicks(sec: u64, nsec: u64) ?u64 {
+fn timespecToNanos(sec: u64, nsec: u64) ?u64 {
     if (nsec >= 1_000_000_000) return null;
     const sec_ns, const sec_overflow = @mulWithOverflow(sec, 1_000_000_000);
     if (sec_overflow != 0) return null;
     const total_ns, const add_overflow = @addWithOverflow(sec_ns, nsec);
     if (add_overflow != 0) return null;
-    return nanosToTicks(total_ns);
+    return total_ns;
 }
 
-fn readTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64) ?struct { value_ticks: u64, interval_ticks: u64 } {
+fn readTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64) ?struct { value_ns: u64, interval_ns: u64 } {
     if (spec_va == 0) return null;
     const interval_sec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_sec_offset) orelse return null;
     const interval_nsec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_nsec_offset) orelse return null;
     const value_sec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_sec_offset) orelse return null;
     const value_nsec = h.read_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_nsec_offset) orelse return null;
     return .{
-        .value_ticks = timespecToTicks(value_sec, value_nsec) orelse return null,
-        .interval_ticks = timespecToTicks(interval_sec, interval_nsec) orelse return null,
+        .value_ns = timespecToNanos(value_sec, value_nsec) orelse return null,
+        .interval_ns = timespecToNanos(interval_sec, interval_nsec) orelse return null,
     };
 }
 
 fn writeTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64, state: kernel.TimerFdState) u64 {
     if (spec_va == 0) return sc.syscall_ok;
-    const interval = ticksToTimespec(state.interval_ticks);
-    const value = ticksToTimespec(state.remaining_ticks);
+    const interval = nanosToTimespec(state.interval_ns);
+    const value = nanosToTimespec(state.remaining_ns);
     if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_sec_offset, interval.sec)) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_interval_nsec_offset, interval.nsec)) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, spec_va + fd_abi.timerfd_spec_value_sec_offset, value.sec)) return sc.syscall_err_invalid;
@@ -762,22 +841,24 @@ fn writeTimerSpec(h: anytype, proc: kernel.PrincipalId, spec_va: u64, state: ker
 fn timerfdCreate(state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if (frame.rdi != fd_abi.timerfd_clock_monotonic) return sc.syscall_err_invalid;
     if ((frame.rsi & ~fd_abi.timerfd_known_flags_mask) != 0) return sc.syscall_err_invalid;
-    const initial_ticks = nanosToTicks(frame.rdx) orelse return sc.syscall_err_invalid;
-    const interval_ticks = nanosToTicks(frame.r10) orelse return sc.syscall_err_invalid;
-    const deadline_tick = if (initial_ticks == 0)
-        0
-    else if ((frame.rsi & fd_abi.timerfd_flag_abstime) != 0)
-        initial_ticks
-    else
-        scheduler.lapic_tick_count + initial_ticks;
+    const deadline_ns = timerDeadline(frame.rdx, frame.rsi, timerNowNs()) orelse return sc.syscall_err_invalid;
     return state.createTimerFd(
         proc,
-        deadline_tick,
-        interval_ticks,
+        deadline_ns,
+        frame.r10,
         kernel.fdFlagsFromBits(@truncate(frame.r9)),
         kernel.fdRightsFromBits(frame.r8),
         first_dynamic_fd,
     ) catch |err| statusFromKernelError(err);
+}
+
+fn timerDeadline(value_ns: u64, flags: u64, now_ns: u64) ?u64 {
+    return if (value_ns == 0)
+        0
+    else if ((flags & fd_abi.timerfd_flag_abstime) != 0)
+        value_ns
+    else
+        @import("std").math.add(u64, now_ns, value_ns) catch null;
 }
 
 fn timerfdSettime(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -785,22 +866,18 @@ fn timerfdSettime(h: anytype, state: *kernel.KernelState, proc: kernel.Principal
     const flags = frame.rsi;
     if ((flags & ~fd_abi.timerfd_known_flags_mask) != 0) return sc.syscall_err_invalid;
     const spec = readTimerSpec(h, proc, frame.rdx) orelse return sc.syscall_err_invalid;
-    const old_state = state.timerFdState(proc, fd, scheduler.lapic_tick_count) orelse return sc.syscall_err_invalid;
+    const now_ns = timerNowNs();
+    const deadline_ns = timerDeadline(spec.value_ns, flags, now_ns) orelse return sc.syscall_err_invalid;
+    const old_state = state.timerFdState(proc, fd, now_ns) orelse return sc.syscall_err_invalid;
     const old_status = writeTimerSpec(h, proc, frame.r10, old_state);
     if (old_status != sc.syscall_ok) return old_status;
-    const deadline_tick = if (spec.value_ticks == 0)
-        0
-    else if ((flags & fd_abi.timerfd_flag_abstime) != 0)
-        spec.value_ticks
-    else
-        scheduler.lapic_tick_count + spec.value_ticks;
-    state.setTimerFd(proc, fd, deadline_tick, spec.interval_ticks, @truncate(flags)) catch return sc.syscall_err_invalid;
+    state.setTimerFd(proc, fd, deadline_ns, spec.interval_ns, @truncate(flags)) catch return sc.syscall_err_invalid;
     return sc.syscall_ok;
 }
 
 fn timerfdGettime(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
-    const timer_state = state.timerFdState(proc, fd, scheduler.lapic_tick_count) orelse return sc.syscall_err_invalid;
+    const timer_state = state.timerFdState(proc, fd, timerNowNs()) orelse return sc.syscall_err_invalid;
     return writeTimerSpec(h, proc, out_va, timer_state);
 }
 
@@ -865,12 +942,90 @@ fn revokeVmoFd(
     user_vm.lockAllVmTransactions();
     defer user_vm.unlockAllVmTransactions();
     const vmo_ref = state.nativeVmoRefForRevokeFd(proc, fd) catch return sc.syscall_err_invalid;
-    if (state.nativeVmoMappingsOverlapPinnedUserObjects(vmo_ref)) return sc.syscall_err_invalid;
+    if (state.nativeVmoTreeMappingsOverlapPinnedUserObjects(vmo_ref)) return sc.syscall_err_invalid;
     _ = state.revokeVmoFdWithFreeList(proc, fd, free_list, VmoRevokeUnmapper{}) catch |err| switch (err) {
         kernel.KernelError.TableFull => return sc.syscall_err_alloc,
         else => return sc.syscall_err_invalid,
     };
     return sc.syscall_ok;
+}
+
+fn createPageViewVmoFd(
+    h: anytype,
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    parent_fd: kernel.Fd,
+    indices_va: u64,
+    page_count_u64: u64,
+    rights_bits: u64,
+    flags_bits: u64,
+) u64 {
+    if (indices_va == 0 or page_count_u64 == 0 or
+        page_count_u64 > kernel.max_vmo_backing_pages or
+        page_count_u64 > (@import("std").math.maxInt(u64) / fd_abi.vmo_page_view_index_size) or
+        indices_va > @import("std").math.maxInt(u64) -
+            page_count_u64 * fd_abi.vmo_page_view_index_size or
+        (rights_bits & ~fd_abi.vmo_page_view_rights_mask) != 0 or
+        (flags_bits & ~fd_abi.vmo_page_view_known_flags_mask) != 0)
+        return sc.syscall_err_invalid;
+
+    const rights = kernel.fdRightsFromBits(rights_bits);
+    const flags = kernel.fdFlagsFromBits(@truncate(flags_bits));
+    if (!rights.close or (!rights.map_read and !rights.map_write))
+        return sc.syscall_err_invalid;
+    const parent_entry = state.fdEntryConst(proc, parent_fd) orelse
+        return sc.syscall_err_invalid;
+    if (!parent_entry.rights.share or
+        !kernel.isFdRightsSubset(rights, parent_entry.rights))
+        return sc.syscall_err_invalid;
+    const parent = state.nativeVmoRefForFd(proc, parent_fd) orelse
+        return sc.syscall_err_invalid;
+    const parent_slot = state.nativeVmoSlotConst(parent) orelse
+        return sc.syscall_err_invalid;
+    if (parent_slot.kind != .anonymous or !parent_slot.parent.isNull() or
+        !parent_slot.has_page_store)
+        return sc.syscall_err_invalid;
+
+    const page_count: usize = @intCast(page_count_u64);
+    const view = state.createNativePageView(parent, page_count) catch |err|
+        return statusFromKernelError(err);
+    var page_offset: usize = 0;
+    while (page_offset < page_count) {
+        var pages: [64]u64 = undefined;
+        const chunk_count = @min(pages.len, page_count - page_offset);
+        for (pages[0..chunk_count], 0..) |*paddr, chunk_index| {
+            const list_index = page_offset + chunk_index;
+            const list_va = indices_va +
+                @as(u64, @intCast(list_index)) * fd_abi.vmo_page_view_index_size;
+            const parent_page = h.read_user_u64(proc, list_va) orelse {
+                state.releaseNativeVmoWithFreeList(view, h.free_list);
+                return sc.syscall_err_invalid;
+            };
+            if (parent_page > @import("std").math.maxInt(usize)) {
+                state.releaseNativeVmoWithFreeList(view, h.free_list);
+                return sc.syscall_err_invalid;
+            }
+            paddr.* = state.nativeVmoResolvedPagePaddr(parent, @intCast(parent_page)) orelse {
+                state.releaseNativeVmoWithFreeList(view, h.free_list);
+                return sc.syscall_err_invalid;
+            };
+        }
+        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count]) catch |err| {
+            state.releaseNativeVmoWithFreeList(view, h.free_list);
+            return statusFromKernelError(err);
+        };
+        page_offset += chunk_count;
+    }
+
+    const object = state.createKernelObject(.vmo, .{ .vmo = view }) catch |err| {
+        state.releaseNativeVmoWithFreeList(view, h.free_list);
+        return statusFromKernelError(err);
+    };
+    return state.installFd(proc, object, rights, flags, first_dynamic_fd) catch |err| {
+        if (state.kernelObjectSlot(object)) |slot|
+            state.clearKernelObjectSlotWithFreeList(slot, h.free_list);
+        return statusFromKernelError(err);
+    };
 }
 
 fn mapVmoFd(
@@ -886,13 +1041,24 @@ fn mapVmoFd(
 ) u64 {
     if (size_bytes == 0) return sc.syscall_err_invalid;
     const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
     const flags = mmapFlagsFromBits(flags_bits) orelse return sc.syscall_err_invalid;
+    const sparse_reservation = flags.anonymous and flags.private and !flags.shared and flags.noreserve;
+    const page_limit = if (sparse_reservation) kernel.max_vmo_logical_pages else kernel.max_vmo_backing_pages;
+    if (aligned_size / 4096 > page_limit) return sc.syscall_err_invalid;
     if (flags.anonymous and vmo_offset != 0) return sc.syscall_err_invalid;
     if ((vmo_offset & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (requested_va == 0 and (flags.fixed or flags.fixed_noreplace)) return sc.syscall_err_invalid;
     prot.pkey = flags.pkey;
+    if (!flags.anonymous) {
+        const vmo_ref = state.nativeVmoRefForFd(proc, fd) orelse
+            return sc.syscall_err_invalid;
+        const vmo = state.nativeVmoSlotConst(vmo_ref) orelse
+            return sc.syscall_err_invalid;
+        if (vmo.kind == .page_view and
+            (!flags.shared or flags.private or prot.exec))
+            return sc.syscall_err_invalid;
+    }
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
     defer user_vm.unlockVmTransaction(proc);
 
@@ -904,25 +1070,36 @@ fn mapVmoFd(
         (state.userMapRangeIsFree(proc, requested_va, aligned_size) catch false);
     const base_va = if (flags.fixed or flags.fixed_noreplace or use_requested_hint)
         requested_va
+    else if (sparse_reservation and aligned_size / 4096 > kernel.max_vmo_backing_pages)
+        findMremapMoveTarget(state, proc, aligned_size) orelse return sc.syscall_err_map
     else
-        state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch return sc.syscall_err_map;
+        state.findRandomizedFreeUserMapVa(proc, aligned_size, 0x4644_4d4d_4150_0000 ^ scheduler.lapic_tick_count ^ @as(u64, fd)) catch |err| blk: {
+            // Exhausting the preferred arena is a placement issue for every
+            // mapping kind, not a NORESERVE/physical backing policy decision.
+            // Fixed mappings and accepted hints never enter this fallback.
+            if (err != kernel.KernelError.TableFull) return sc.syscall_err_map;
+            break :blk findMremapMoveTarget(state, proc, aligned_size) orelse return sc.syscall_err_map;
+        };
+    if (!user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     if (flags.fixed) {
-        // File-backed shared/native-default mappings eagerly install PTEs.
-        // Until that PTE operation has its own prepare/commit token, reject
-        // it before touching the old MAP_FIXED target.  Anonymous mappings
-        // remain lazy and private file mappings fault through the VMA.
-        if (!flags.anonymous and (!flags.private or flags.shared)) {
-            return sc.syscall_err_invalid;
-        }
+        // Prepare validates shared backing before replacing anything. All
+        // fixed mappings install PTEs lazily through the native VMA fault
+        // path, so no fallible eager PTE work follows the atomic commit.
         if (state.rangeOverlapsPinnedUserObject(proc, base_va, aligned_size)) {
             return sc.syscall_err_invalid;
         }
-        const reservation_slots = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+        const native_vma_source = nativeVmaCoversRange(state, proc, base_va, aligned_size);
+        const reservation_slots_result = if (native_vma_source) user_vm.unmapPresentVmaSourceSplitSlotsRequired(
             proc,
             base_va,
             @intCast(aligned_size),
-        ) orelse return sc.syscall_err_map;
+        ) else user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            proc,
+            base_va,
+            @intCast(aligned_size),
+        );
+        const reservation_slots = reservation_slots_result orelse return sc.syscall_err_map;
         if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) return sc.syscall_err_alloc;
         const anonymous_max_prot = kernel.VmaProt{
             .read = true,
@@ -952,7 +1129,11 @@ fn mapVmoFd(
                 free_list,
             )) catch |err| return statusFromKernelError(err);
         defer state.discardFixedMmapPrepared(&prepared, free_list);
-        if (!user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size))) unreachable;
+        const unmapped = if (native_vma_source)
+            user_vm.unmapPresentVmaSource(proc, base_va, @intCast(aligned_size))
+        else
+            user_vm.unmapPresentUserLinearRegion(proc, base_va, @intCast(aligned_size));
+        if (!unmapped) unreachable;
         state.commitFixedMmapPrepared(&prepared, free_list);
         return base_va;
     } else if (flags.fixed_noreplace) {
@@ -1016,6 +1197,10 @@ fn mapVmoFd(
     if (flags.private and !flags.shared) {
         return base_va;
     }
+    const mapped_vmo = state.nativeVmoRefForFd(proc, fd) orelse return sc.syscall_err_invalid;
+    // These VMOs explicitly accept fault-time allocation failure. Leave even
+    // populated pages to the normal fault path rather than requiring all holes.
+    if (state.nativeVmoIsZeroOnDemand(mapped_vmo)) return base_va;
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
     var map_prot: ?kernel.MapProt = null;
@@ -1045,7 +1230,7 @@ fn mprotectVmaRange(
 ) u64 {
     if (size_bytes == 0 or (base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
     const aligned_size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
-    if (aligned_size / 4096 > kernel.max_vmo_backing_pages) return sc.syscall_err_invalid;
+    if (aligned_size / 4096 > kernel.max_vmo_logical_pages) return sc.syscall_err_invalid;
     var prot = protFromBits(prot_bits) orelse return sc.syscall_err_invalid;
 
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
@@ -1060,20 +1245,23 @@ fn mprotectVmaRange(
     }
 
     const start_vma = state.vmaEntryForVaConst(proc, base_va) orelse return sc.syscall_err_invalid;
+    if (!user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size))) return sc.syscall_err_invalid;
     if (base_va + aligned_size > start_vma.endVa()) return sc.syscall_err_invalid;
     // mprotect does not select a protection key.  Preserve the mapping's
     // original key instead of silently resetting it to key zero.
     prot.pkey = start_vma.max_prot.pkey;
+    const unchanged_prot = @as(u8, @bitCast(start_vma.prot)) == @as(u8, @bitCast(prot));
 
-    const page_count: usize = @intCast(aligned_size / 4096);
-    var page_index: usize = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const va = base_va + @as(u64, @intCast(page_index)) * 4096;
-        const vma = state.vmaEntryForVaConst(proc, va) orelse return sc.syscall_err_invalid;
-        if (va + 4096 > vma.endVa()) return sc.syscall_err_invalid;
-    }
-
+    // start_vma already covers the complete range; no per-page walk is needed.
     state.setVmaProtRange(proc, base_va, aligned_size, prot) catch return sc.syscall_err_invalid;
+    // Keep COW's narrower PTEs when the VMA protection did not change, but
+    // retain the address-space validation normally performed by invalidation.
+    if (unchanged_prot) {
+        return if (user_vm.validateUserLinearRegion(proc, base_va, @intCast(aligned_size)))
+            sc.syscall_ok
+        else
+            sc.syscall_err_map;
+    }
     // Re-evaluate every present page from VMA/COW metadata after a protection
     // transition.  Directly restoring a writable PTE here bypassed the write
     // fault that separates fork-COW pages, including allocator arenas that
@@ -1122,6 +1310,22 @@ fn fixedMremapTargetIsVmaManaged(
     return true;
 }
 
+// Only fully VMA-owned ranges may treat supervisor seed PTEs as lazy holes.
+// The caller holds the process VM transaction throughout validation and unmap.
+fn nativeVmaCoversRange(state: *kernel.KernelState, proc: kernel.PrincipalId, start: u64, size: u64) bool {
+    if (size == 0) return false;
+    const end, const overflow = @addWithOverflow(start, size);
+    if (overflow != 0) return false;
+    var cursor = start;
+    while (cursor < end) {
+        const entry = state.vmaEntryForVaConst(proc, cursor) orelse return false;
+        const next = entry.endVa();
+        if (next <= cursor) return false;
+        cursor = next;
+    }
+    return true;
+}
+
 fn mremapVmaRange(
     state: *kernel.KernelState,
     proc: kernel.PrincipalId,
@@ -1156,15 +1360,30 @@ fn mremapVmaRange(
 
     const moves = fixed or new_size > old_size;
     const source = state.vmaEntryForVaConst(proc, old_va) orelse return sc.syscall_err_invalid;
-    if (old_end > source.endVa() or !source.flags.anonymous) return sc.syscall_err_invalid;
+    if (old_end > source.endVa()) return sc.syscall_err_invalid;
     if (state.rangeOverlapsPinnedUserObject(proc, old_va, old_size)) return sc.syscall_err_invalid;
+
+    // musl probes the initial (file-backed) stack with a no-MAYMOVE growth.
+    // A mapped but occupied extension is ENOMEM, not an unsupported-source
+    // error. Check before the anonymous-only implementation and before any
+    // PTE or VMA mutation; the source's own remaining pages also collide.
+    if (!may_move and new_size > old_size) {
+        if (@addWithOverflow(old_va, new_size)[1] != 0) return sc.syscall_err_invalid;
+        const tail_free = state.userMapRangeIsFree(proc, old_end, new_size - old_size) catch
+            return sc.syscall_err_invalid;
+        if (!tail_free) return sc.syscall_err_alloc;
+    }
+    if (!source.flags.anonymous) return sc.syscall_err_invalid;
 
     const target_va = if (!moves)
         old_va
     else if (fixed)
         new_va
     else
-        findMremapMoveTarget(state, proc, new_size) orelse return sc.syscall_err_map;
+        findMremapMoveTarget(state, proc, new_size) orelse {
+            @import("../kernel_log.zig").writeFmt("vm: mremap target search failed principal={} old=0x{x}/0x{x} size=0x{x}\n", .{ @intFromEnum(proc), old_va, old_size, new_size });
+            return sc.syscall_err_map;
+        };
     if (moves and state.rangeOverlapsPinnedUserObject(proc, target_va, new_size)) {
         return sc.syscall_err_invalid;
     }
@@ -1180,11 +1399,14 @@ fn mremapVmaRange(
 
     var reservation_split_slots: usize = 0;
     if (invalidate_size != 0) {
-        reservation_split_slots += user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+        reservation_split_slots += user_vm.unmapPresentVmaSourceSplitSlotsRequired(
             proc,
             invalidate_va,
             @intCast(invalidate_size),
-        ) orelse return sc.syscall_err_map;
+        ) orelse {
+            @import("../kernel_log.zig").writeFmt("vm: mremap source preflight failed principal={} va=0x{x} size=0x{x}\n", .{ @intFromEnum(proc), invalidate_va, invalidate_size });
+            return sc.syscall_err_map;
+        };
     }
     if (fixed) {
         reservation_split_slots += user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
@@ -1194,19 +1416,26 @@ fn mremapVmaRange(
         ) orelse return sc.syscall_err_map;
     }
     if (reservation_split_slots > user_vm.freeUserReservationSlotCount(proc)) {
+        @import("../kernel_log.zig").writeFmt("vm: mremap reservation capacity failed principal={} slots={}\n", .{ @intFromEnum(proc), reservation_split_slots });
         return sc.syscall_err_alloc;
     }
 
     if (invalidate_size != 0 and
         !user_vm.invalidatePresentUserLinearRegionPtes(proc, invalidate_va, @intCast(invalidate_size)))
     {
+        @import("../kernel_log.zig").writeFmt("vm: mremap invalidate failed principal={} va=0x{x} size=0x{x}\n", .{ @intFromEnum(proc), invalidate_va, invalidate_size });
         return sc.syscall_err_map;
     }
 
-    var prepared = state.prepareMremapWithFreeList(proc, old_va, old_size, new_size, target_va, may_move, fixed, free_list) catch |err| switch (err) {
-        kernel.KernelError.OutOfFreePages => return sc.syscall_err_alloc,
-        kernel.KernelError.TableFull => return sc.syscall_err_alloc,
-        else => return sc.syscall_err_invalid,
+    var prepared = state.prepareMremapWithFreeList(proc, old_va, old_size, new_size, target_va, may_move, fixed, free_list) catch |err| {
+        @import("../kernel_log.zig").writeFmt(
+            "vm: mremap prepare failed principal={} old=0x{x}/0x{x} new=0x{x}/0x{x} free_pages={} error={s}\n",
+            .{ @intFromEnum(proc), old_va, old_size, target_va, new_size, free_list.pageCount(), @errorName(err) },
+        );
+        return switch (err) {
+            kernel.KernelError.OutOfFreePages, kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
     };
     defer state.discardMremapPrepared(&prepared, free_list);
 
@@ -1220,7 +1449,7 @@ fn mremapVmaRange(
     // cannot leave a translation pointing at metadata/backing just freed by
     // the successful state transaction.
     if (invalidate_size != 0 and
-        !user_vm.unmapPresentUserLinearRegion(proc, invalidate_va, @intCast(invalidate_size)))
+        !user_vm.unmapPresentVmaSource(proc, invalidate_va, @intCast(invalidate_size)))
     {
         unreachable;
     }
@@ -1228,20 +1457,40 @@ fn mremapVmaRange(
 }
 
 fn madviseVmaRange(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
     base_va: u64,
     size_bytes: u64,
     advice: u64,
 ) u64 {
-    if (size_bytes == 0) return sc.syscall_ok;
+    // NORMAL/RANDOM/SEQUENTIAL/WILLNEED are paging hints. We accept them
+    // without extra prefetch; advice requiring discard or inheritance changes
+    // must not falsely succeed until those operations are implemented.
+    if (advice > 3) return sc.syscall_err_invalid;
     if ((base_va & 0xFFF) != 0) return sc.syscall_err_invalid;
-    if (!(advice <= 4 or advice == 8 or (advice >= 14 and advice <= 17) or advice == 20 or advice == 21)) return sc.syscall_err_invalid;
-    _ = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
+    if (size_bytes == 0) return sc.syscall_ok;
+    const size = pageAlignUp(size_bytes) orelse return sc.syscall_err_invalid;
+    const end, const overflow = @addWithOverflow(base_va, size);
+    _ = end;
+    if (overflow != 0) return sc.syscall_err_invalid;
+    if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransaction(proc);
+    if (!nativeVmaCoversRange(state, proc, base_va, size)) return sc.syscall_err_map;
     return sc.syscall_ok;
 }
 
 fn writeFdInfo(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, out_va: u64) u64 {
     if (out_va == 0) return sc.syscall_err_invalid;
-    const info = state.fdInfo(proc, fd) orelse return sc.syscall_err_invalid;
+    // fd_get_info already holds KernelState. Release the shared VM lock
+    // before copyout, which can acquire an address-space lock and fault.
+    const info = blk: {
+        user_vm.lockSharedVmObjects();
+        defer user_vm.unlockSharedVmObjects();
+        var snapshot = state.fdInfo(proc, fd) orelse return sc.syscall_err_invalid;
+        if (snapshot.kind == .vmo)
+            snapshot.extra = state.fdVmoLifetimeInfo(proc, fd) orelse 0;
+        break :blk snapshot;
+    };
     if (!h.write_user_u64(proc, out_va + fd_abi.fd_info_kind_offset, @intFromEnum(info.kind))) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, out_va + fd_abi.fd_info_rights_offset, info.rights_bits)) return sc.syscall_err_invalid;
     if (!h.write_user_u64(proc, out_va + fd_abi.fd_info_flags_offset, info.flags_bits)) return sc.syscall_err_invalid;
@@ -1318,8 +1567,49 @@ fn fdIoctl(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd:
     };
 }
 
+// Close and wake incrementally: lifecycle teardown must cover all descriptors
+// without an FD-capacity-sized stack array or a truncated wake snapshot.
+pub fn closeProcessFdsWithWakes(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, cloexec_only: bool) void {
+    const table = state.getFdTableConst(proc) orelse return;
+    for (0..table.slots().len) |index| {
+        const entry = table.slots()[index];
+        if (entry.object.isNull() or (cloexec_only and !entry.flags.cloexec)) continue;
+        const fd: kernel.Fd = @intCast(index);
+        const endpoint = state.pipeEndpointForFd(proc, fd);
+        const channel = ipcChannelHandleForFd(state, proc, fd);
+        if (!user_vm.lockVmTransaction(proc)) return;
+        const closed = state.closeFdWithFreeList(proc, fd, h.free_list);
+        user_vm.unlockVmTransaction(proc);
+        closed catch continue;
+        if (endpoint) |pipe| {
+            if (state.pipeReadyEventsForSide(pipe.pipe, !pipe.write)) |ready| {
+                if (ready != 0) _ = wakePipeWaiters(h, state, pipe.pipe, !pipe.write, ready);
+            }
+        }
+        if (channel) |handle| _ = wakeIpcChannelCloseWaiters(h, state, handle);
+    }
+}
+
 pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) ?u64 {
     return switch (frame.rax) {
+        sc.syscall_fd_table => blk: {
+            if (frame.rdi > fd_abi.fd_table_limit or frame.rsi == 0 or
+                frame.rsi > @import("std").math.maxInt(u64) - fd_abi.fd_table_info_size)
+                break :blk sc.syscall_err_invalid;
+            // Check the output before allocating. The returned free count is
+            // an observation, never an admission reservation for another call.
+            var bytes: [24]u8 = [_]u8{0} ** 24;
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, &bytes)) break :blk sc.syscall_err_invalid;
+            state.ensureFdTableCapacity(proc, @intCast(frame.rdi), h.free_list) catch |err|
+                break :blk statusFromKernelError(err);
+            const table = state.getFdTableConst(proc) orelse break :blk sc.syscall_err_invalid;
+            const free = state.fdFreeCountFrom(proc, first_dynamic_fd) catch break :blk sc.syscall_err_invalid;
+            @import("std").mem.writeInt(u64, bytes[0..8], table.slots().len, .little);
+            @import("std").mem.writeInt(u64, bytes[8..16], fd_abi.fd_table_limit, .little);
+            @import("std").mem.writeInt(u64, bytes[16..24], free, .little);
+            if (!h.copy_bytes_to_user_va(proc, frame.rsi, &bytes)) break :blk sc.syscall_err_invalid;
+            break :blk sc.syscall_ok;
+        },
         sc.syscall_fd_close => blk: {
             const fd: kernel.Fd = @intCast(frame.rdi);
             const pipe_endpoint = state.pipeEndpointForFd(proc, fd);
@@ -1336,13 +1626,30 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             }
             break :blk sc.syscall_ok;
         },
-        sc.syscall_fd_dup => state.dupFd(
-            proc,
-            @intCast(frame.rdi),
-            @intCast(frame.rsi),
-            kernel.fdRightsFromBits(frame.rdx),
-            kernel.fdFlagsFromBits(@truncate(frame.r10)),
-        ) catch sc.syscall_err_invalid,
+        sc.syscall_fd_dup => blk: {
+            if (frame.rdi == fd_abi.thread_self_fd) {
+                if ((frame.rdx & ~fd_abi.thread_self_rights_mask) != 0 or
+                    (frame.r10 & ~@as(u64, fd_abi.known_flags_mask)) != 0 or
+                    frame.rsi >= fd_abi.fd_table_limit) break :blk sc.syscall_err_invalid;
+                const current = scheduler.currentThread();
+                const generation = scheduler.generationOfThread(current) orelse
+                    break :blk sc.syscall_err_not_ready;
+                break :blk state.createThreadFd(proc, .{
+                    .owner_principal_raw = @intFromEnum(proc),
+                    .thread_index = @intCast(current),
+                    .thread_generation = generation,
+                    .state = .active,
+                    .exit_code = 0,
+                }, kernel.fdRightsFromBits(frame.rdx), kernel.fdFlagsFromBits(@truncate(frame.r10)), @intCast(frame.rsi)) catch |err| statusFromKernelError(err);
+            }
+            break :blk state.dupFd(
+                proc,
+                @intCast(frame.rdi),
+                @intCast(frame.rsi),
+                kernel.fdRightsFromBits(frame.rdx),
+                kernel.fdFlagsFromBits(@truncate(frame.r10)),
+            ) catch sc.syscall_err_invalid;
+        },
         sc.syscall_fd_get_info => writeFdInfo(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_fd_set_flags => blk: {
             state.setFdFlags(proc, @intCast(frame.rdi), kernel.fdFlagsFromBits(@truncate(frame.rsi)), kernel.fdFlagsFromBits(@truncate(frame.rdx))) catch break :blk sc.syscall_err_invalid;
@@ -1363,48 +1670,118 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_timerfd_settime => timerfdSettime(h, state, proc, frame),
         sc.syscall_timerfd_gettime => timerfdGettime(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_vmo_create => blk: {
+            if ((frame.rdx & ~fd_abi.vmo_create_known_flags_mask) != 0) break :blk sc.syscall_err_invalid;
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
+            const create_flags = kernel.fdFlagsFromBits(@intCast(frame.rdx & fd_abi.known_flags_mask));
+            if ((frame.rdx & fd_abi.vmo_create_zero_on_demand) != 0) {
+                break :blk state.createZeroOnDemandVmoFd(
+                    proc,
+                    frame.rdi,
+                    defaultVmoRights(kernel.fdRightsFromBits(frame.rsi)),
+                    create_flags,
+                    first_dynamic_fd,
+                ) catch |err| statusFromKernelError(err);
+            }
             break :blk state.createAnonymousVmoFdWithPages(
                 proc,
                 frame.rdi,
                 defaultVmoRights(kernel.fdRightsFromBits(frame.rsi)),
-                kernel.fdFlagsFromBits(@truncate(frame.rdx)),
+                create_flags,
                 first_dynamic_fd,
                 h.free_list,
             ) catch |err| statusFromKernelError(err);
         },
+        sc.syscall_vmo_grow => blk: {
+            if (frame.rdi > @import("std").math.maxInt(kernel.Fd)) break :blk sc.syscall_err_invalid;
+            user_vm.lockSharedVmObjects();
+            defer user_vm.unlockSharedVmObjects();
+            state.growVmoFdWithPages(proc, @intCast(frame.rdi), frame.rsi, h.free_list) catch |err|
+                break :blk statusFromKernelError(err);
+            break :blk sc.syscall_ok;
+        },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),
+        sc.syscall_vmo_create_page_view => createPageViewVmoFd(
+            h,
+            state,
+            proc,
+            @intCast(frame.rdi),
+            frame.rsi,
+            frame.rdx,
+            frame.r10,
+            frame.r8,
+        ),
         sc.syscall_mmap => mapVmoFd(state, proc, h.free_list, @intCast(frame.rdi), frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9),
         sc.syscall_munmap => blk: {
+            const profile_start = smp_perf.timestamp();
+            smp_perf.munmapAdd(.calls, 1);
+            defer smp_perf.munmapElapsed(.total_cycles, profile_start);
+            var profile_success = false;
+            defer smp_perf.munmapAdd(if (profile_success) .successes else .errors, 1);
             if (frame.rsi == 0 or (frame.rdi & 0xFFF) != 0) break :blk sc.syscall_err_invalid;
             const size = pageAlignUp(frame.rsi) orelse break :blk sc.syscall_err_invalid;
-            if (!user_vm.lockVmTransaction(proc)) break :blk sc.syscall_err_invalid;
+            // Size histogram covers requests that pass length/alignment
+            // validation, including any later failure.
+            const pages = size / 4096;
+            smp_perf.munmapAdd(.requested_pages, pages);
+            smp_perf.munmapAdd(if (pages == 1) .size_1_page else if (pages <= 4)
+                .size_2_to_4_pages
+            else if (pages <= 64) .size_5_to_64_pages else .size_over_64_pages, 1);
+            var profile_stage = smp_perf.timestamp();
+            const transaction_locked = user_vm.lockVmTransaction(proc);
+            smp_perf.munmapElapsed(.transaction_lock_cycles, profile_stage);
+            if (!transaction_locked) break :blk sc.syscall_err_invalid;
             defer user_vm.unlockVmTransaction(proc);
-            if (state.rangeOverlapsPinnedUserObject(proc, frame.rdi, size)) break :blk sc.syscall_err_invalid;
-            const reservation_slots = user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+            profile_stage = smp_perf.timestamp();
+            const overlaps_pinned = state.rangeOverlapsPinnedUserObject(proc, frame.rdi, size);
+            smp_perf.munmapElapsed(.pinned_check_cycles, profile_stage);
+            if (overlaps_pinned) break :blk sc.syscall_err_invalid;
+            profile_stage = smp_perf.timestamp();
+            const native_vma_source = nativeVmaCoversRange(state, proc, frame.rdi, size);
+            const reservation_slots_result = if (native_vma_source) user_vm.unmapPresentVmaSourceSplitSlotsRequired(
                 proc,
                 frame.rdi,
                 @intCast(size),
-            ) orelse break :blk sc.syscall_err_map;
-            if (reservation_slots > user_vm.freeUserReservationSlotCount(proc)) break :blk sc.syscall_err_alloc;
-            var prepared = state.prepareMunmapRangeWithFreeList(
+            ) else user_vm.unmapPresentUserLinearRegionSplitSlotsRequired(
+                proc,
+                frame.rdi,
+                @intCast(size),
+            );
+            smp_perf.munmapElapsed(.reservation_validate_cycles, profile_stage);
+            const reservation_slots = reservation_slots_result orelse break :blk sc.syscall_err_map;
+            profile_stage = smp_perf.timestamp();
+            const free_slots = user_vm.freeUserReservationSlotCount(proc);
+            smp_perf.munmapElapsed(.reservation_count_cycles, profile_stage);
+            if (reservation_slots > free_slots) break :blk sc.syscall_err_alloc;
+            profile_stage = smp_perf.timestamp();
+            const prepared_result = state.prepareMunmapRangeWithFreeList(
                 proc,
                 frame.rdi,
                 size,
                 h.free_list,
-            ) catch |err| break :blk switch (err) {
+            );
+            smp_perf.munmapElapsed(.prepare_cycles, profile_stage);
+            var prepared = prepared_result catch |err| break :blk switch (err) {
                 kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
                 else => sc.syscall_err_map,
             };
             defer state.discardMunmapPrepared(&prepared, h.free_list);
-            if (!user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size))) unreachable;
+            profile_stage = smp_perf.timestamp();
+            const unmapped = if (native_vma_source)
+                user_vm.unmapPresentVmaSource(proc, frame.rdi, @intCast(size))
+            else
+                user_vm.unmapPresentUserLinearRegion(proc, frame.rdi, @intCast(size));
+            if (!unmapped) unreachable;
+            smp_perf.munmapElapsed(.unmap_cycles, profile_stage);
+            profile_stage = smp_perf.timestamp();
             state.commitMunmapPrepared(&prepared, h.free_list);
+            smp_perf.munmapElapsed(.commit_cycles, profile_stage);
+            profile_success = true;
             break :blk sc.syscall_ok;
         },
         sc.syscall_mprotect => mprotectVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
         sc.syscall_mremap => mremapVmaRange(state, proc, h.free_list, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8),
-        sc.syscall_madvise => madviseVmaRange(frame.rdi, frame.rsi, frame.rdx),
+        sc.syscall_madvise => madviseVmaRange(state, proc, frame.rdi, frame.rsi, frame.rdx),
         else => null,
     };
 }

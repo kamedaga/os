@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+out="$repo_root/.artifacts/tests/kobox2-dma-unit/${CC:-cc}"
+mkdir -p "$out"
+"${CC:-cc}" -std=c11 -O1 -g -Wall -Wextra -Werror \
+  -fsanitize=address,undefined -fno-omit-frame-pointer \
+  -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
+  -I "$repo_root/userland/libcapsule/include" -I "$repo_root/kobox2/linux-sandbox/kobox" \
+  "$repo_root/tests/kobox2_dma_unit.c" -o "$out/dma-unit"
+"$out/dma-unit" | tee "$out/result.log"
+"${CC:-cc}" -std=c11 -O1 -g -Wall -Wextra -Werror -DPH_DMA_PROFILE=1 \
+  -fsanitize=address,undefined -fno-omit-frame-pointer \
+  -I "$repo_root/userland/libpacha/include" -I "$repo_root/userland/libipc/include" \
+  -I "$repo_root/userland/libcapsule/include" -I "$repo_root/kobox2/linux-sandbox/kobox" \
+  "$repo_root/tests/kobox2_dma_unit.c" -o "$out/dma-profile-unit"
+"$out/dma-profile-unit" | tee "$out/profile-result.log"
+sha256sum "$repo_root/userland/kobox2_adapter/device_dma.c" \
+  "$repo_root/userland/kobox2_adapter/device_dma.h" \
+  "$repo_root/tests/kobox2_dma_unit.c" "$repo_root/tests/run-kobox2-dma-unit.sh" \
+  >"$out/inputs.sha256"

@@ -110,7 +110,7 @@ static int run_process_thread_create_smoke(void) {
         PACHA_FD_RIGHT_KILL |
         PACHA_FD_RIGHT_SET_CONTEXT;
 
-    const int process_fd = pacha_process_create(process_rights, 0);
+    const int process_fd = pacha_process_create(process_rights, 0, NULL, 0);
     if (process_fd < 16) {
         log_hex("[fd_ipc_boot_smoke] process_create failed=", (u64)(long long)process_fd);
         return 0;

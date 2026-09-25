@@ -11,7 +11,9 @@
 enum {
     KOBOXD_FS_BACKEND_NAME_BYTES = STORAGE_NAME_BYTES,
     KOBOXD_FS_BACKEND_INLINE_DATA_BYTES = 64,
-    KOBOXD_FS_BACKEND_MAX_OBJECTS = 256,
+    KOBOXD_FS_OBJECT_BANK_ENTRIES = 32,
+    /* Cache budget, not a limit on referenced objects. */
+    KOBOXD_FS_CACHED_OBJECTS = 256,
 };
 
 typedef struct koboxd_fs_object {
@@ -45,6 +47,11 @@ typedef struct koboxd_fs_object {
     uint8_t release_prepared;
 } koboxd_fs_object_t;
 
+typedef struct koboxd_fs_object_bank {
+    struct koboxd_fs_object_bank *next;
+    koboxd_fs_object_t objects[KOBOXD_FS_OBJECT_BANK_ENTRIES];
+} koboxd_fs_object_bank_t;
+
 typedef struct koboxd_fs_object_stats {
     uint32_t capacity;
     uint32_t used;
@@ -73,7 +80,8 @@ typedef struct koboxd_fs_backend {
     koboxd_fs_lock_t lock;
     kb_module_t *ext4_module;
     kb_fs_mount_result_t mount_result;
-    koboxd_fs_object_t objects[KOBOXD_FS_BACKEND_MAX_OBJECTS];
+    koboxd_fs_object_bank_t *object_banks;
+    uint32_t object_capacity;
     uint64_t next_object_id;
     uint64_t object_clock;
     uint64_t object_evictions;

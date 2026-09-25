@@ -2,6 +2,7 @@ const kernel = @import("kernel.zig");
 const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig").connection;
 const user_vm = @import("memory/user_vm.zig");
+const user_copy = @import("user_copy.zig");
 
 const ExceptionTrapFrame = interrupts.ExceptionTrapFrame;
 
@@ -81,6 +82,111 @@ pub fn dumpPageWalkForVa(cr3: u64, va: u64) void {
     h.write("\n");
 }
 
+fn checkedStackWordVa(rsp: u64, index: usize) ?u64 {
+    if (index >= 8) return null;
+    const va, const overflow = @addWithOverflow(rsp, @as(u64, @intCast(index)) * 8);
+    if (overflow != 0) return null;
+    const range_end = @addWithOverflow(va, @as(u64, 7));
+    if (range_end[1] != 0 or (va & 4095) > 4088) return null;
+    return va;
+}
+
+fn stackWordInReadableVma(va: u64, entry: *const kernel.VmaEntry) bool {
+    return entry.active and entry.prot.read and va >= entry.start_va and
+        entry.size_bytes >= 8 and va - entry.start_va <= entry.size_bytes - 8;
+}
+
+// The caller holds the address-space lock. Never fault in stack pages, follow
+// arbitrary frame pointers, or read MMIO/pinned mappings without native VMAs.
+// These are candidate words, not an unwound backtrace. For leaf memcpy the
+// first word is the return address because memcpy does not change RSP.
+fn logPresentStackWords(h: *const Hooks, principal: kernel.PrincipalId, rsp: u64) void {
+    for (0..8) |index| {
+        const va = checkedStackWordVa(rsp, index) orelse {
+            h.write("  STACK_STOP=overflow_or_page_boundary\n");
+            return;
+        };
+        if (!user_vm.isUserCanonicalVa(va) or !user_vm.isUserCanonicalVa(va + 7)) {
+            h.write("  STACK_STOP=non_user_address\n");
+            return;
+        }
+        const entry = h.state.vmaEntryForVaConst(principal, va) orelse {
+            h.write("  STACK_STOP=no_native_vma\n");
+            return;
+        };
+        if (!stackWordInReadableVma(va, entry)) {
+            h.write("  STACK_STOP=not_readable_vma\n");
+            return;
+        }
+        const page_va = va & ~@as(u64, 4095);
+        const paddr = user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
+            principal,
+            page_va,
+            false,
+            false,
+        ) orelse {
+            h.write("  STACK_STOP=not_present\n");
+            return;
+        };
+        const word_paddr, const overflow = @addWithOverflow(paddr, va & 4095);
+        var word: u64 = undefined;
+        if (overflow != 0 or !user_copy.readPhysicalBytes(word_paddr, @import("std").mem.asBytes(&word))) {
+            h.write("  STACK_STOP=physical_read_failed\n");
+            return;
+        }
+        h.write("  STACK_WORD va=");
+        h.write_hex_raw(va);
+        h.write(" value=");
+        h.write_hex_raw(word);
+        if (user_vm.isUserCanonicalVa(word)) {
+            if (h.state.vmaEntryForVaConst(principal, word)) |candidate| {
+                if (candidate.prot.exec) {
+                    h.write(" exec_vma_start=");
+                    h.write_hex_raw(candidate.start_va);
+                    h.write(" exec_vma_size=");
+                    h.write_hex_raw(candidate.size_bytes);
+                    h.write(" exec_vmo_offset=");
+                    h.write_hex_raw(candidate.vmo_offset);
+                }
+            }
+        }
+        h.write("\n");
+    }
+}
+
+/// Fatal user traps without an error code do not run logStep2. Reuse exactly
+/// the same bounded, present-page-only stack reader before process teardown.
+pub fn logUserTrapStack(frame: *const interrupts.TrapFrame) void {
+    if ((frame.cs & 3) != 3 or !page_fault_log_hooks_ready) return;
+    const h = getHooks();
+    if (!h.kernel_state_ready.*) return;
+    const principal = scheduler.currentPrincipal();
+    if (!user_vm.lockAddressSpace(principal)) return;
+    defer user_vm.unlockAddressSpace(principal);
+    logPresentStackWords(h, principal, frame.rsp);
+}
+
+test "fault stack word bounds and readable VMA checks" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(@as(?u64, 0x7fb8), checkedStackWordVa(0x7fb8, 0));
+    try testing.expectEqual(@as(?u64, 0x7ff0), checkedStackWordVa(0x7fb8, 7));
+    try testing.expectEqual(@as(?u64, 0x8000), checkedStackWordVa(0x7ff8, 1));
+    try testing.expect(checkedStackWordVa(0x7fb8, 8) == null);
+    try testing.expect(checkedStackWordVa(0x7ffc, 0) == null);
+    try testing.expect(checkedStackWordVa(@import("std").math.maxInt(u64), 1) == null);
+    try testing.expect(checkedStackWordVa(@import("std").math.maxInt(u64) - 3, 0) == null);
+    var entry = kernel.VmaEntry{ .active = true, .start_va = 0x7000, .size_bytes = 4096, .prot = .{ .read = true } };
+    try testing.expect(stackWordInReadableVma(0x7ff8, &entry));
+    try testing.expect(!stackWordInReadableVma(0x6ff8, &entry));
+    try testing.expect(!stackWordInReadableVma(0x7ff9, &entry));
+    try testing.expect(!stackWordInReadableVma(0x8000, &entry));
+    entry.prot.read = false;
+    try testing.expect(!stackWordInReadableVma(0x7000, &entry));
+    entry.prot.read = true;
+    entry.active = false;
+    try testing.expect(!stackWordInReadableVma(0x7000, &entry));
+}
+
 pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
     const h = getHooks();
     const ec_user = (frame.error_code & (1 << 2)) != 0;
@@ -154,6 +260,8 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
         h.write("  RIP_VMA=none\n");
     }
 
+    logPresentStackWords(h, principal, frame.rsp);
+
     // TEMPORARY (apk network-install fault): the instruction itself, so the
     // faulting store can be decoded without first guessing which file the
     // address belongs to.
@@ -162,7 +270,9 @@ pub fn logStep2(cr2: u64, frame: *const ExceptionTrapFrame) void {
         const rip_offset = frame.rip & 4095;
         if (rip_offset + 16 <= 4096) {
             if (user_vm.lookupUserMappedPaddrForVa(principal, rip_page)) |rip_paddr| {
-                const words: *const [2]u64 = @ptrFromInt(rip_paddr + rip_offset);
+                var words: [2]u64 = undefined;
+                // Instruction addresses need not be DWORD/QWORD aligned.
+                if (!user_copy.readPhysicalBytes(rip_paddr + rip_offset, @import("std").mem.asBytes(&words))) return;
                 h.write("  RIP_BYTES0=");
                 h.write_hex_raw(words[0]);
                 h.write("\n  RIP_BYTES1=");

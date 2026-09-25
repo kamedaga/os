@@ -45,6 +45,9 @@ int filed_release_reclaimed_object(
     if (runtime == NULL || reclaim == NULL || !reclaim->released || reclaim->backend_object == 0) {
         return 0;
     }
+    /* Reclaim has no remaining file-handle observer. Drop our cache reference
+     * without writeback or revocation, preserving clients' surviving maps. */
+    filed_cache_release_object(runtime, reclaim->backend_object);
     return filed_backend_release_object(runtime, reclaim->backend_object);
 }
 
@@ -102,13 +105,6 @@ static int64_t filed_close_handle_runtime_impl(
         return filed_status_to_wire(status);
     }
     if (lease_fd >= 16) (void)pacha_fd_close(lease_fd);
-    if (reclaim.released && reclaim.backend_object != 0) {
-        const int flush_status = filed_cache_flush_object(runtime, reclaim.backend_object);
-        if (flush_status != 0) {
-            return flush_status;
-        }
-        filed_cache_release_object(runtime, reclaim.backend_object);
-    }
     const int release_status = filed_release_reclaimed_object(runtime, &reclaim);
     if (release_status != 0) {
         return release_status;
@@ -141,7 +137,9 @@ int filed_maintain_vnode_cache(filed_runtime_t *runtime)
         return 0;
     }
     runtime->vnode_eviction_pending = 0;
-    return filed_evict_unused_linked_vnodes(runtime);
+    const int status = filed_evict_unused_linked_vnodes(runtime);
+    filed_vfs_trim_vnodes(&runtime->vfs);
+    return status;
 }
 
 void filed_write_u64_le(void *base, uint64_t offset, uint64_t value)
@@ -436,6 +434,11 @@ enum {
         FILED_RIGHT_GETDENTS,
 };
 
+static uint32_t filed_walk_rights(const filed_runtime_t *runtime)
+{
+    return FILED_WALK_RIGHTS & (runtime->actor ? runtime->actor->identity.rights : UINT32_MAX);
+}
+
 const char *filed_skip_slashes(const char *path)
 {
     while (path != NULL && *path == '/') {
@@ -693,7 +696,7 @@ int64_t filed_resolve_parent_path(
         if (component_len == 2 && component[0] == '.' && component[1] == '.') {
             filed_vfs_open_result_t parent_open;
             filed_status_t status;
-            uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint32_t next_rights = filed_walk_rights(runtime);
 
             if (filed_path_is_single_component(after_slashes)) {
                 next_rights |= parent_rights;
@@ -733,7 +736,7 @@ int64_t filed_resolve_parent_path(
             return 0;
         } else {
             filed_vfs_open_result_t next_open;
-            uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint32_t next_rights = filed_walk_rights(runtime);
             uint64_t object_id = 0;
             bool lookup_owned = false;
             bool component_is_symlink = false;
@@ -959,19 +962,19 @@ int64_t filed_lookup_and_open_component(
             uint32_t referenced_vnodes = 0;
             uint32_t active_files = 0;
             uint32_t active_handles = 0;
-            for (uint32_t i = 0; i < FILED_MAX_VNODES; ++i) {
-                if (runtime->vfs.vnodes[i].active) {
+            for (uint32_t i = 0; i < runtime->vfs.vnode_capacity; ++i) {
+                if (filed_vfs_vnode_at(&runtime->vfs, i)->active) {
                     ++active_vnodes;
-                    if (runtime->vfs.vnodes[i].refcount != 0) {
+                    if (filed_vfs_vnode_at(&runtime->vfs, i)->refcount != 0) {
                         ++referenced_vnodes;
                     }
                 }
             }
-            for (uint32_t i = 0; i < FILED_MAX_FILES; ++i) {
-                active_files += runtime->vfs.files[i].active ? 1u : 0u;
+            for (uint32_t i = 0; i < runtime->vfs.file_capacity; ++i) {
+                active_files += filed_vfs_file_at(&runtime->vfs, i)->active ? 1u : 0u;
             }
-            for (uint32_t i = 0; i < FILED_MAX_HANDLES; ++i) {
-                active_handles += runtime->vfs.handles[i].active ? 1u : 0u;
+            for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i) {
+                active_handles += filed_vfs_handle_at(&runtime->vfs, i)->active ? 1u : 0u;
             }
             fprintf(stderr,
                 "FILED_STORAGE_FAULT layer=vfs_create status=%d "
@@ -1179,7 +1182,7 @@ int64_t filed_openat_path(
 
         if (component_len == 2 && component[0] == '.' && component[1] == '.') {
             filed_vfs_open_result_t parent_open;
-            const uint32_t next_rights = final_component ? rights : FILED_WALK_RIGHTS;
+            const uint32_t next_rights = final_component ? rights : filed_walk_rights(runtime);
             const uint32_t next_flags =
                 final_component ?
                     (open_flags | (require_directory ? FILED_OPEN_DIRECTORY : 0)) :
@@ -1291,7 +1294,7 @@ int64_t filed_openat_path(
             return reply_status;
         } else {
             filed_vfs_open_result_t next_open;
-            uint32_t next_rights = FILED_WALK_RIGHTS;
+            uint32_t next_rights = filed_walk_rights(runtime);
             uint64_t object_id = 0;
             bool lookup_owned = false;
             bool component_is_symlink = false;

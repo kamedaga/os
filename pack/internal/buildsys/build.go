@@ -19,6 +19,7 @@ import (
 
 type UserlandOptions struct {
 	AppID    string
+	AppIDs   []string
 	Force    bool
 	Progress progress.Reporter
 }
@@ -75,6 +76,7 @@ func BuildKernel(workspace *config.Workspace, opts KernelOptions) (KernelResult,
 			filepath.Join(kernelDir, "build.zig"),
 			filepath.Join(kernelDir, "src"),
 			filepath.Join(kernelDir, "abi"),
+			workspace.Path("bootloader", "limine"),
 		})
 		if err != nil {
 			span.Fail("kernel check failed")
@@ -111,13 +113,16 @@ func kernelOutputForStep(kernelDir string, step string) string {
 	if step == "limine" {
 		return filepath.Join(kernelDir, "zig-out", "bin", "limine", "pacha-kernel.elf")
 	}
+	if step == "boot-diag" {
+		return filepath.Join(kernelDir, "zig-out", "bin", "limine", "DIAGBOOT.ELF")
+	}
 	return filepath.Join(kernelDir, "zig-out", "bin", step)
 }
 
 func BuildUserland(workspace *config.Workspace, opts UserlandOptions) (UserlandResult, error) {
 	var result UserlandResult
 	rebuilds := map[string]bool{}
-	apps, err := selectApps(workspace, opts.AppID)
+	apps, err := selectApps(workspace, opts.AppID, opts.AppIDs)
 	if err != nil {
 		return result, err
 	}
@@ -162,7 +167,26 @@ func BuildUserland(workspace *config.Workspace, opts UserlandOptions) (UserlandR
 	return result, nil
 }
 
-func selectApps(workspace *config.Workspace, appID string) ([]config.App, error) {
+func selectApps(workspace *config.Workspace, appID string, appIDs []string) ([]config.App, error) {
+	if len(appIDs) != 0 {
+		if appID != "" {
+			return nil, fmt.Errorf("select either AppID or AppIDs")
+		}
+		apps := make([]config.App, 0, len(appIDs))
+		seen := make(map[string]bool, len(appIDs))
+		for _, id := range appIDs {
+			if seen[id] {
+				return nil, fmt.Errorf("duplicate app: %s", id)
+			}
+			app, ok := workspace.App(id)
+			if !ok {
+				return nil, fmt.Errorf("app not found: %s", id)
+			}
+			seen[id] = true
+			apps = append(apps, app)
+		}
+		return apps, nil
+	}
 	if appID != "" {
 		app, ok := workspace.App(appID)
 		if !ok {

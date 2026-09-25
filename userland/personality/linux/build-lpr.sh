@@ -60,7 +60,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   -o "$scanner_object"
 
 /usr/bin/clang \
-  -std=c11 \
+  -std=c11 -O2 \
   -Wall -Wextra -Werror \
   -ffreestanding \
   -fPIC \
@@ -89,8 +89,9 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   -I"$repo_root/userland/filed/include" \
   -I"$repo_root/userland/lpr_supervisor/include" \
   -I"$repo_root/userland/netd/include" \
+  -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/termd/include" \
-  -I"$repo_root/userland/drmd/include" \
+  -I"$repo_root/userland/gpud/include" \
   -I"$repo_root/userland/inputd/include" \
   "$repo_root/userland/personality/linux/runtime/lpr_signal.c" \
   "$scanner_object" \
@@ -103,6 +104,25 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_fd/table.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_error.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/cache.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/profile.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/mapping.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/notify.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/wait.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/context.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/socket.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/address.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/poll.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/message.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/datagram.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/rights.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/handoff.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_unix/options.c" \
+  "$repo_root/userland/unixd/src/client_wire.c" \
+  "$repo_root/userland/unixd/src/transport.c" \
+  "$repo_root/userland/unixd/src/notify.c" \
+  "$repo_root/userland/unixd/src/notify_client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_filed.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_common/runtime_support.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/client.c" \
@@ -110,6 +130,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_input/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/bootstrap_state.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/capability.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_process/credentials.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/compat.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/control.c" \

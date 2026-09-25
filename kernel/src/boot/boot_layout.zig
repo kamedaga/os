@@ -9,7 +9,7 @@ pub const two_mib: u64 = x86_platform.two_mib;
 pub const page_entries: usize = x86_platform.page_entries;
 
 pub const user_va: u64 = 0x20000000;
-pub const user_low_va: u64 = 0x00400000;
+pub const user_low_va: u64 = 0x00010000;
 pub const user_elf_base_va: u64 = user_va;
 pub const user_stack_top: u64 = process_abi.default_stack_top_va;
 pub const initial_user_stack_pages: usize = 16;
@@ -28,8 +28,5 @@ pub const boot_log_console_stack_page_va: u64 = process_abi.auxPageVa(0);
 pub const boot_log_console_stack_top: u64 = boot_log_console_stack_page_va + 0x1000;
 pub const boot_log_console_entry_rsp: u64 = boot_log_console_stack_top - 8;
 pub const boot_log_user_va: u64 = process_abi.auxPageVa(1);
-
-pub const framebuffer_window_bytes: u64 =
-    two_mib - (process_abi.auxPageVa(5) - user_aux_base_va);
 
 pub const phys_copy_window_va: u64 = kernel_vm.phys_copy_window_va;

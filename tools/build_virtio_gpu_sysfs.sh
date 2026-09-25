@@ -8,22 +8,35 @@ virtio="${pci}/virtio1"
 
 rm -rf "${out}"
 card="${virtio}/drm/card0"
-mkdir -p "${out}/dev/dri" "${card}" "${out}/sys/dev/char" \
+render="${virtio}/drm/renderD128"
+mkdir -p "${out}/dev/dri" "${card}" "${render}" "${out}/sys/dev/char" \
     "${out}/sys/class/drm" "${out}/sys/bus/pci" "${out}/sys/bus/virtio" \
     "${out}/sys/bus/drm"
 printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' 'c 226 0' >"${out}/dev/dri/card0"
+printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' 'c 226 128' >"${out}/dev/dri/renderD128"
 printf '%s\n' 'CAPABILITYOS_ROOTFS_DEVICE' 'c 10 60' >"${out}/dev/udmabuf"
-printf '%s\n' '226:0' >"${card}/dev"
-printf '%s\n' 'MAJOR=226' 'MINOR=0' 'DEVNAME=dri/card0' \
-    'DEVTYPE=drm_minor' >"${card}/uevent"
-printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '/sys/bus/drm' >"${card}/subsystem"
-printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../..' >"${card}/device"
+for node in card0 renderD128; do
+    directory="${virtio}/drm/${node}"
+    minor=0
+    [[ "${node}" == renderD128 ]] && minor=128
+    printf '%s\n' "226:${minor}" >"${directory}/dev"
+    printf '%s\n' 'MAJOR=226' "MINOR=${minor}" "DEVNAME=dri/${node}" \
+        'DEVTYPE=drm_minor' >"${directory}/uevent"
+    printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '/sys/bus/drm' >"${directory}/subsystem"
+    printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../..' >"${directory}/device"
+done
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' \
     '../../devices/pci0000:00/0000:00:03.0/virtio1/drm/card0' \
     >"${out}/sys/dev/char/226:0"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' \
+    '/sys/devices/pci0000:00/0000:00:03.0/virtio1/drm/renderD128' \
+    >"${out}/sys/dev/char/226:128"
+printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' \
     '../../devices/pci0000:00/0000:00:03.0/virtio1/drm/card0' \
     >"${out}/sys/class/drm/card0"
+printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' \
+    '/sys/devices/pci0000:00/0000:00:03.0/virtio1/drm/renderD128' \
+    >"${out}/sys/class/drm/renderD128"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../../../bus/pci' >"${pci}/subsystem"
 printf 'CAPABILITYOS_ROOTFS_SYMLINK\n%s' '../../../../bus/virtio' >"${virtio}/subsystem"
 

@@ -1,0 +1,43 @@
+Linux measurement only. Explicitly enabled per process; never for production.
+Use real monotonic progress without the refresh grid or minimum frame delay.
+Rendering, events, GPU synchronization and compositor settings are unchanged.
+
+--- a/gdk/gdkframeclockidle.c
++++ b/gdk/gdkframeclockidle.c
+@@ -70,6 +70,7 @@
+ 
+   guint in_paint_idle : 1;
+   guint paint_is_thaw : 1;
++  guint unlimited : 1;
+ #ifdef G_OS_WIN32
+   guint begin_period : 1;
+ #endif
+@@ -141,6 +142,8 @@
+     gdk_frame_clock_idle_get_instance_private (frame_clock_idle);
+ 
+   priv->freeze_count = 0;
++  priv->unlimited = g_strcmp0 (g_getenv ("GDK_FRAME_CLOCK_UNLIMITED"), "1") == 0;
++  g_printerr ("FRAME_CLOCK_TRIAL unlimited=%u\n", priv->unlimited);
+   priv->smoothed_frame_time_period = FRAME_INTERVAL;
+ }
+ 
+@@ -431,6 +434,9 @@
+               if (prev_timings && prev_timings->refresh_interval)
+                 frame_interval = prev_timings->refresh_interval;
+ 
++              if (priv->unlimited)
++                frame_interval = 1;
++
+               priv->frame_time = g_get_monotonic_time ();
+ 
+               /*
+@@ -655,7 +661,8 @@
+        */
+       gint64 smooth_cycle_start = priv->smoothed_frame_time_base - priv->smoothed_frame_time_phase;
+-      priv->min_next_frame_time = smooth_cycle_start + priv->smoothed_frame_time_period;
++      priv->min_next_frame_time = priv->unlimited ? 0 :
++        smooth_cycle_start + priv->smoothed_frame_time_period;
+ 
+       maybe_start_idle (clock_idle, FALSE);
+     }
+ 

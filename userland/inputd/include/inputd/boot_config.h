@@ -7,7 +7,7 @@
 #define INPUTD_BOOT_READY_MAGIC UINT64_C(0x3159445254504e49)
 
 enum {
-    INPUTD_BOOT_CONFIG_VERSION = 2,
+    INPUTD_BOOT_CONFIG_VERSION = 3,
     INPUTD_BOOT_CONFIG_MAX_BYTES = 4096,
 };
 
@@ -37,10 +37,11 @@ struct inputd_boot_config {
     uint64_t input_endpoint_fd;
     uint64_t ready_channel_fd;
     uint64_t netd_endpoint_fd;
+    uint64_t source_endpoint_fd;
     uint32_t device_count;
     uint32_t device_record_size;
     uint64_t devices_offset;
-    uint64_t reserved[6];
+    uint64_t reserved[5];
 };
 
 _Static_assert(sizeof(struct inputd_device_config) == 48,

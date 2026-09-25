@@ -1,7 +1,9 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/allocate.h"
 
 uint64_t lpr_open_rights(uint64_t flags)
 {
+    lpr_linux_process_state_init();
     /*
      * Linux does not require O_DIRECTORY when opening a directory that will
      * later be used as an *at() dirfd.  The object kind is not known until
@@ -9,15 +11,17 @@ uint64_t lpr_open_rights(uint64_t flags)
      * up front.  Filed still rejects lookup/create/remove/rename when the
      * resulting vnode is not a directory.
      */
-    uint64_t rights = FILED_RIGHT_STAT |
-        FILED_RIGHT_SETATTR |
+    uint64_t optional = FILED_RIGHT_SETATTR |
         FILED_RIGHT_LOOKUP |
         FILED_RIGHT_CREATE |
         FILED_RIGHT_REMOVE |
-        FILED_RIGHT_RENAME;
+        FILED_RIGHT_RENAME | FILED_RIGHT_GETDENTS;
+    /* Optional directory/metadata rights may only come from this launch's
+     * namespace grant. Required read/write/create rights remain explicit, so
+     * an unauthorized access mode fails at open instead of being downgraded. */
+    uint64_t rights = FILED_RIGHT_STAT | (optional & lpr_state.process.filed_rights);
     const uint64_t accmode = flags & LPR_LINUX_O_ACCMODE;
     if (accmode != LPR_LINUX_O_WRONLY) {
-        rights |= FILED_RIGHT_GETDENTS;
         if ((flags & LPR_LINUX_O_DIRECTORY) == 0) {
             rights |= FILED_RIGHT_READ;
         }
@@ -103,6 +107,7 @@ int64_t lpr_dir_handle_for(uint64_t dirfd, const char *path, uint64_t *out)
 
 int64_t lpr_filed_close_handle(uint64_t handle)
 {
+    lpr_file_image_cache_drop_handle(handle);
     uint64_t ignored = 0;
     return lpr_filed_call(FILED_OP_VFS_CLOSE, -1, handle, &ignored);
 }
@@ -751,14 +756,12 @@ int64_t lpr_linux_openat_once(
         {
             return -LPR_LINUX_EEXIST;
         }
-        const int fd = lpr_fd_slot_alloc_from(3);
-        if (fd < 0) {
-            return fd;
-        }
-        const uint64_t device_id = (1ull << 32u) | device_minor;
-        const int install = lpr_control_install_fd(
-            (uint64_t)(uint32_t)fd, LPR_FD_OPS_DEVICE, flags, device_id, 0);
-        return install == 0 ? fd : install;
+        const lpr_device_backend_t device = {
+            .active = 1, .major = 1, .minor = device_minor,
+            .flags = (uint32_t)flags,
+        };
+        return lpr_fd_alloc_state(LPR_FD_OPS_DEVICE, flags, 0,
+            &device, sizeof(device));
     }
     uint64_t handle = 0;
     uint64_t opened_kind = 0;
@@ -815,10 +818,14 @@ int64_t lpr_linux_openat_once(
 
 int64_t lpr_linux_readlinkat_to_buffer(uint64_t dirfd, uint64_t path_raw, char *target, uint64_t capacity)
 {
-    if (target == 0 || capacity == 0) {
+    if (path_raw == 0 || target == 0) {
         return -LPR_LINUX_EFAULT;
     }
+    if (capacity == 0) return -LPR_LINUX_EINVAL;
     const char *path = (const char *)(uintptr_t)path_raw;
+    int64_t proc_status = 0;
+    if (lpr_linux_proc_readlink(path, target, capacity, &proc_status))
+        return proc_status;
     uint64_t source_fd = 0;
     if (lpr_linux_proc_self_fd_number(path, &source_fd)) {
         const lpr_filed_backend_t *source = lpr_filed_backend(source_fd);
@@ -1097,7 +1104,7 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
     int installed_lease_fd = -1;
     if (!root) {
         int remote_lease_fd = -1;
-        int status = lpr_native_wait_pair(
+        int status = lpr_filed_lease_pair(
             &installed_lease_fd,
             &remote_lease_fd);
         if (status == 0) {
@@ -1106,6 +1113,7 @@ int64_t lpr_cwd_install(uint64_t handle, const char *path)
                 0,
                 remote_lease_fd,
                 &installed_handle);
+            if (!status) status = lpr_filed_adopt(installed_handle, installed_lease_fd);
         }
         if (status != 0 || installed_handle == 0) {
             (void)lpr_close_native_fd_if_open(

@@ -27,7 +27,9 @@ manifests:
 startupManifest:
   path: "/sys/startup_manifest.txt"
   include: ["rootfs"]
-rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/share", "/share/fastfetch", "/share/fonts", "/run"]
+# Overlay expansion omits empty directories. Desktop must exist before
+# xfdesktop constructs its regular-file icons on the first login.
+rootfsDirs: ["/cmd", "/bin", "/sbin", "/usr", "/usr/bin", "/usr/lib", "/usr/libexec", "/usr/lib/uutils", "/srv", "/dev", "/dev/dri", "/dev/input", "/dev/shm", "/etc", "/etc/apk", "/etc/apk/keys", "/etc/ssl", "/etc/ssl/certs", "/etc/fastfetch", "/proc", "/proc/sys", "/proc/sys/kernel", "/sys", "/sys/dev", "/sys/dev/block", "/sys/dev/char", "/sys/class", "/sys/class/drm", "/sys/class/input", "/tmp", "/var", "/var/cache", "/var/cache/apk", "/var/log", "/lib", "/lib/linux", "/lib/pacha", "/lib/apk", "/lib/apk/db", "/var/lib", "/var/lib/apk", "/opt", "/opt/apk-offline", "/opt/apk-offline/bin", "/opt/apk-offline/lib", "/home", "/root/Desktop", "/share", "/share/fastfetch", "/share/fonts", "/run", "/etc/polkit-1/rules.d", "/usr/local/share/polkit-1/rules.d", "/etc/polkit-1/actions", "/usr/local/share/polkit-1/actions"]
 skip:
   apps:
     - "alpine_go"
@@ -66,6 +68,8 @@ skip:
     - "libc_musl"
     - "linux_abi_probe"
     - "linux_abi_server"
+    - "live_group"
+    - "live_passwd"
     - "lpr_apk_offline"
     - "lua_cli"
     - "lua_cli_workload"
@@ -151,6 +155,9 @@ apps:
       rebuild: ["bash", "tools/build_wsl_alpine_mesa.sh"]
       input:
         - "tools/build_wsl_alpine_mesa.sh"
+        - "tools/build_mesa_virgl.sh"
+        - "patches/mesa/0001-virgl-cache-render-target-sampler-view.patch"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
     out: "MESAROOT"
     rootfs: "/"
   alpine_input:
@@ -180,18 +187,31 @@ apps:
       input:
         - "tools/build_wsl_alpine_xfce.sh"
         - "tools/rootfs_overlay.py"
+        - "tools/stage_void_webkit.py"
+        - "tools/manifests/alpine-epiphany-v3.22-x86_64.lock"
+        - "tools/manifests/void-webkit-x86_64-musl.lock"
+        - "tools/manifests/void-linux-public.pem"
+        - "userland/fixtures/linux/epiphany-launcher.sh"
         - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+        - "tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
+        - "userland/fixtures/linux/libreoffice-launcher.sh"
         - "tools/build_wsl_alpine_mesa.sh"
         - "tools/build_wsl_alpine_input.sh"
         - "tools/copy_lpr_linux_musl.sh"
     out: "XFCEROOT"
     rootfs: "/"
+  xfwm4_defaults:
+    file: "userland/fixtures/linux/xfwm4-defaults.xml"
+    out: "XFWM4.XML"
+    rootfs: "/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
   pine2_gtk:
     file:
       path: ".artifacts/userland-fixtures/pine2-gtk-root"
       rebuild: ["bash", "tools/build_wsl_pine2_gtk.sh", ".artifacts/userland-fixtures/pine2-gtk-root"]
       input:
         - "tools/build_wsl_pine2_gtk.sh"
+        - "pack/scripts/alpine_packages.py"
+        - "tools/manifests/alpine-pine2-build-v3.22-x86_64.lock"
         - "third_party/pine2-gtk/meson.build"
         - "third_party/pine2-gtk/.dockerignore"
         - "third_party/pine2-gtk/src"
@@ -265,6 +285,8 @@ apps:
       rebuild: ["bash", "tools/build_wsl_glycin_app_probe.sh"]
       input:
         - "tools/build_wsl_glycin_app_probe.sh"
+        - "tools/build_wsl_alpine_xfce.sh"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
         - "userland/fixtures/src/wsl_musl/lpr_glycin_app_probe.c"
     out: "LPRGLYAP.ELF"
     rootfs: "/cmd/lpr_glycin_app_probe.elf"
@@ -382,11 +404,6 @@ apps:
       path: "tests/fixtures/sway_input.sh"
     out: "SWAYM57.SH"
     rootfs: "/cmd/sway_input.sh"
-  sway_endurance_script:
-    file:
-      path: "tests/fixtures/sway_endurance.sh"
-    out: "SWAYM58.SH"
-    rootfs: "/cmd/sway_endurance.sh"
   sway_socket_repeat_script:
     file:
       path: "tests/fixtures/sway_socket_repeat.sh"
@@ -426,7 +443,11 @@ apps:
       rebuild: ["bash", "tools/build_wsl_wayland_shm_client.sh"]
       input:
         - "tools/build_wsl_wayland_shm_client.sh"
-        - "tools/build_wsl_alpine_sway.sh"
+        - "pack/scripts/fetch_alpine_wayland_dev.sh"
+        - "pack/scripts/alpine_packages.py"
+        - "tools/manifests/alpine-wayland-dev-v3.22-x86_64.lock"
+        - "tools/build_wsl_alpine_xfce.sh"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
         - "userland/fixtures/src/wsl_musl/lpr_wayland_shm_client.c"
     out: "LPRWLSHM.ELF"
     rootfs: "/cmd/lpr_wayland_shm_client.elf"
@@ -436,9 +457,13 @@ apps:
       rebuild: ["bash", "tools/build_wsl_wayland_animation_bench.sh"]
       input:
         - "tools/build_wsl_wayland_animation_bench.sh"
-        - "tools/build_wsl_alpine_sway.sh"
+        - "pack/scripts/fetch_alpine_wayland_dev.sh"
+        - "pack/scripts/alpine_packages.py"
+        - "tools/manifests/alpine-wayland-dev-v3.22-x86_64.lock"
+        - "tools/build_wsl_alpine_xfce.sh"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
         - "userland/fixtures/src/wsl_musl/lpr_wayland_animation_bench.c"
-        - "userland/drmd/include/drmd/kms_abi.h"
+        - "userland/gpud/include/gpud/drm_kms_abi.h"
         - "userland/inputd/include/inputd/ipc_protocol.h"
     out: "P4WLBEN.ELF"
     rootfs: "/cmd/lpr_wayland_animation_bench.elf"
@@ -522,6 +547,98 @@ apps:
         - "tools/build_wsl_curl.sh"
     out: "CURLROOT"
     rootfs: "/"
+  # The live archive selects only curl's ELF dependency closure, not the
+  # ordinary rootfs's entire curl-root directory.
+  live_curl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/cmd/curl.elf"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVCURL.ELF"
+  live_curl_libcurl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcurl.so.4"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBCURL.SO.4"
+  live_curl_libz:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libz.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBZ.SO.1"
+  live_curl_libcares:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcares.so.2"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBCARES.SO.2"
+  live_curl_libnghttp2:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libnghttp2.so.14"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBNGHTTP2.SO.14"
+  live_curl_libidn2:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libidn2.so.0"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBIDN2.SO.0"
+  live_curl_libpsl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libpsl.so.5"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBPSL.SO.5"
+  live_curl_libssl:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libssl.so.3"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBSSL.SO.3"
+  live_curl_libcrypto:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcrypto.so.3"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBCRYPTO.SO.3"
+  live_curl_libzstd:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libzstd.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBZSTD.SO.1"
+  live_curl_libbrotlidec:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libbrotlidec.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBBROTLI.SO.1"
+  live_curl_libbrotlicommon:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libbrotlicommon.so.1"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBBROTLICOMMON.SO.1"
+  live_curl_libunistring:
+    file:
+      path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libunistring.so.5"
+      rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
+      input: ["tools/build_wsl_curl.sh"]
+    out: "LVLIBUNISTRING.SO.5"
+  live_dropbear:
+    file:
+      path: ".artifacts/userland-fixtures/live-dropbear/dropbear"
+      rebuild: ["bash", "pack/scripts/build_live_dropbear.sh"]
+      input: ["pack/scripts/build_live_dropbear.sh"]
+    out: "LVDROPBEAR.ELF"
+  live_dropbearkey:
+    file:
+      path: ".artifacts/userland-fixtures/live-dropbear/dropbearkey"
+      rebuild: ["bash", "pack/scripts/build_live_dropbear.sh"]
+      input: ["pack/scripts/build_live_dropbear.sh"]
+    out: "LVDROPBEARKEY.ELF"
   gnu_coreutils:
     file:
       path: ".artifacts/userland-fixtures/gnu-coreutils-root"
@@ -630,43 +747,63 @@ apps:
     rootfs: ["/cmd/kobox-ls-devices.elf", "/bin/kobox-ls-devices"]
   kobox_nvme:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/nvme.ko"
+      path: ".artifacts/ubuntu-kobox-nvme/nvme.ko"
+      rebuild: ["bash", "pack/scripts/fetch_ubuntu_kobox_nvme.sh"]
+      input: &ubuntu_kobox_nvme_inputs
+        - "pack/scripts/fetch_ubuntu_kobox_nvme.sh"
+        - "tools/manifests/ubuntu-kobox-nvme-x86_64.lock"
     out: "NVME.KO"
     bootfs: "/srv/kobox/nvme.ko"
     rootfs: "/usr/lib/kobox/nvme.ko"
   kobox_nvme_auth:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/nvme-auth.ko"
+      path: ".artifacts/ubuntu-kobox-nvme/nvme-auth.ko"
+      rebuild: ["bash", "pack/scripts/fetch_ubuntu_kobox_nvme.sh"]
+      input: *ubuntu_kobox_nvme_inputs
     out: "NVMEAUTH.KO"
     bootfs: "/srv/kobox/nvme-auth.ko"
     rootfs: "/usr/lib/kobox/nvme-auth.ko"
   kobox_nvme_core:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/nvme-core.ko"
+      path: ".artifacts/ubuntu-kobox-nvme/nvme-core.ko"
+      rebuild: ["bash", "pack/scripts/fetch_ubuntu_kobox_nvme.sh"]
+      input: *ubuntu_kobox_nvme_inputs
     out: "NVMECOR.KO"
     bootfs: "/srv/kobox/nvme-core.ko"
     rootfs: "/usr/lib/kobox/nvme-core.ko"
   kobox_crc16:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/crc16.ko"
+      path: ".artifacts/alpine-kernel-modules/crc16.ko"
+      rebuild: ["bash", "pack/scripts/fetch_alpine_kobox_modules.sh"]
+      input: &alpine_kobox_module_inputs
+        - "pack/scripts/fetch_alpine_kobox_modules.sh"
+        - "pack/scripts/extract_alpine_modules.py"
+        - "pack/scripts/alpine_packages.py"
+        - "tools/manifests/alpine-kobox-kernel-v3.22-x86_64.lock"
     out: "CRC16.KO"
     bootfs: "/srv/kobox/crc16.ko"
     rootfs: "/usr/lib/kobox/crc16.ko"
   kobox_mbcache:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/mbcache.ko"
+      path: ".artifacts/alpine-kernel-modules/mbcache.ko"
+      rebuild: ["bash", "pack/scripts/fetch_alpine_kobox_modules.sh"]
+      input: *alpine_kobox_module_inputs
     out: "MBCACHE.KO"
     bootfs: "/srv/kobox/mbcache.ko"
     rootfs: "/usr/lib/kobox/mbcache.ko"
   kobox_jbd2:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/jbd2.ko"
+      path: ".artifacts/alpine-kernel-modules/jbd2.ko"
+      rebuild: ["bash", "pack/scripts/fetch_alpine_kobox_modules.sh"]
+      input: *alpine_kobox_module_inputs
     out: "JBD2.KO"
     bootfs: "/srv/kobox/jbd2.ko"
     rootfs: "/usr/lib/kobox/jbd2.ko"
   kobox_ext4:
     file:
-      path: ".artifacts/userland-fixtures/kobox-modules/ext4.ko"
+      path: ".artifacts/alpine-kernel-modules/ext4.ko"
+      rebuild: ["bash", "pack/scripts/fetch_alpine_kobox_modules.sh"]
+      input: *alpine_kobox_module_inputs
     out: "EXT4.KO"
     bootfs: "/srv/kobox/ext4.ko"
     rootfs: "/usr/lib/kobox/ext4.ko"
@@ -688,141 +825,87 @@ apps:
       rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
     out: "VIRTPCI.KO"
     rootfs: "/usr/lib/kobox/virtio_pci.ko"
-  kobox_failover:
-    file:
-      path: ".artifacts/userland-fixtures/kobox-modules/failover.ko"
-      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
-    out: "FAILOVER.KO"
-    rootfs: "/usr/lib/kobox/failover.ko"
-  kobox_net_failover:
-    file:
-      path: ".artifacts/userland-fixtures/kobox-modules/net_failover.ko"
-      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
-    out: "NETFAIL.KO"
-    rootfs: "/usr/lib/kobox/net_failover.ko"
-  kobox_virtio_net:
-    file:
-      path: ".artifacts/userland-fixtures/kobox-modules/virtio_net.ko"
-      rebuild: ["bash", "tools/download_kobox_virtio_modules.sh"]
-    out: "VIRTNET.KO"
-    rootfs: "/usr/lib/kobox/virtio_net.ko"
   kobox_linux_tty_core:
     file:
       path: ".artifacts/kobox-linux-tty/linux_tty_core.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: &linux_tty_module_inputs
+        - "pack/scripts/build_linux_tty_modules.sh"
         - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
         - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+        - "pack/scripts/build_linux_tty_ko.sh"
+        - "tools/manifests/arch-linux-6.8-kobox-x86_64.lock"
         - "third_party/linux-6.8-tty"
     out: "TTYCORE.KO"
     rootfs: "/usr/lib/kobox/linux_tty_core.ko"
   kobox_linux_tty_n_null:
     file:
       path: ".artifacts/kobox-linux-tty/linux_tty_n_null.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "TTYNULL.KO"
     rootfs: "/usr/lib/kobox/linux_tty_n_null.ko"
   kobox_linux_virtio:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "LXVIRT.KO"
     rootfs: "/usr/lib/kobox/linux_virtio.ko"
   kobox_linux_virtio_ring:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio_ring.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "LXVTRNG.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_ring.ko"
   kobox_linux_virtio_pci_modern_dev:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio_pci_modern_dev.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "LXVMODN.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_pci_modern_dev.ko"
   kobox_linux_virtio_pci_legacy_dev:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio_pci_legacy_dev.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "LXVLEGD.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_pci_legacy_dev.ko"
   kobox_linux_virtio_pci:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio_pci.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "LXVPCI.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_pci.ko"
   kobox_linux_virtio_console:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio_console.ko"
-      rebuild: ["bash", "-lc", "JOBS=2 bash pack/scripts/build_linux_kconfig_tools.sh >/dev/null && KDIR=$(bash pack/scripts/fetch_arch_linux_6_8_headers.sh | tail -n 1) bash pack/scripts/build_linux_tty_ko.sh .artifacts/kobox-linux-tty >/dev/null"]
-      input:
-        - "pack/scripts/build_linux_kconfig_tools.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_headers.sh"
-        - "pack/scripts/build_linux_tty_ko.sh"
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
-        - "third_party/linux-6.8-tty"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "TTYVCON.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_console.ko"
   kobox_linux_virtio_dma_buf:
     file:
-      path: ".artifacts/kobox-drm/linux_virtio_dma_buf.ko"
-      rebuild: ["bash", "tools/download_kobox_drm_modules.sh"]
-      input:
-        - "tools/download_kobox_drm_modules.sh"
+      path: ".artifacts/alpine-kernel-modules/virtio_dma_buf.ko"
+      rebuild: ["bash", "pack/scripts/fetch_alpine_kobox_modules.sh"]
+      input: *alpine_kobox_module_inputs
     out: "LXVDBUF.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_dma_buf.ko"
   kobox_linux_virtio_gpu:
     file:
-      path: ".artifacts/kobox-drm/linux_virtio_gpu.ko"
-      rebuild: ["bash", "tools/download_kobox_drm_modules.sh"]
-      input:
-        - "tools/download_kobox_drm_modules.sh"
+      path: ".artifacts/alpine-kernel-modules/virtio-gpu.ko"
+      rebuild: ["bash", "pack/scripts/fetch_alpine_kobox_modules.sh"]
+      input: *alpine_kobox_module_inputs
     out: "LXVIGPU.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_gpu.ko"
   kobox_linux_virtio_input:
     file:
       path: ".artifacts/kobox-linux-tty/linux_virtio_input.ko"
-      rebuild: ["bash", "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh", ".artifacts/kobox-linux-tty"]
-      input:
-        - "pack/scripts/fetch_arch_linux_6_8_virtio_ko.sh"
+      rebuild: ["bash", "pack/scripts/build_linux_tty_modules.sh", ".artifacts/kobox-linux-tty"]
+      input: *linux_tty_module_inputs
     out: "LXVINPUT.KO"
     rootfs: "/usr/lib/kobox/linux_virtio_input.ko"
   kobox_run:
@@ -901,11 +984,17 @@ apps:
       path: ".artifacts/lpr-linux-x86_64.so"
       rebuild: ["bash", "userland/personality/linux/build-lpr.sh", ".artifacts/lpr-linux-x86_64.so"]
       input:
-        - "userland/drmd/include"
+        - "kobox2/linux-sandbox/kobox/boot/drm_limits.h"
+        - "userland/gpud/include"
         - "userland/filed/include/filed/flags.h"
         - "userland/personality/include"
         - "userland/personality/linux/decoder"
         - "userland/personality/linux/runtime"
+        - "userland/unixd/include"
+        - "userland/unixd/src/client_wire.c"
+        - "userland/unixd/src/transport.c"
+        - "userland/unixd/src/notify.c"
+        - "userland/unixd/src/notify_client.c"
         - "userland/lpr_supervisor/include"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
@@ -934,11 +1023,10 @@ apps:
   lpr_linux_musl_libc:
     file:
       path: ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
-      rebuild: ["bash", "userland/personality/linux/build-musl-runtime.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
+      rebuild: ["bash", "tools/copy_lpr_linux_musl.sh", ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"]
       input:
-        - "musl/upstream"
-        - "userland/personality/linux/build-musl-runtime.sh"
-        - "userland/personality/linux/musl/synccall.c"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
     out: "LPRMUSL.SO"
     rootfs: ["/lib/linux/libc.so", "/lib/linux/ld-musl-x86_64.so.1", "/lib/libc.musl-x86_64.so.1"]
   lpr_ldmusl_smoke:
@@ -1148,6 +1236,15 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_async_signal_smoke.c"
     out: "LPRASIG.ELF"
     rootfs: "/cmd/lpr_async_signal_smoke.elf"
+  lpr_thread_signal:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_thread_signal.dynamic.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_thread_signal", "userland/fixtures/src/wsl_musl/lpr_thread_signal.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_thread_signal.c"
+    out: "LPRTHSIG.ELF"
+    rootfs: "/cmd/lpr_thread_signal.elf"
   lpr_signal_owner_red:
     file:
       path: ".artifacts/userland-fixtures/lpr_signal_owner_red.static.elf"
@@ -1168,6 +1265,162 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_child_lifecycle_red.c"
     out: "LPRCHILD.ELF"
     rootfs: "/cmd/lpr_child_lifecycle_red.elf"
+  lpr_credentials:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_credentials.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_credentials", "userland/fixtures/src/wsl_musl/lpr_credentials.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_credentials.c"
+    out: "CREDS.ELF"
+    rootfs: "/cmd/lpr_credentials.elf"
+  lpr_service_account:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_service_account.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_service_account", "userland/fixtures/src/wsl_musl/lpr_service_account.c"]
+    out: "SRVACCT.ELF"
+    rootfs: "/cmd/lpr_service_account.elf"
+  dbus_account_test_config:
+    file: "userland/fixtures/linux/dbus-account-test.conf"
+    out: "ACCTBUS.CONF"
+    rootfs: "/etc/dbus-1/pacha-account-test.conf"
+  dbus_system_config:
+    file:
+      path: ".artifacts/userland-fixtures/dbus-system.conf"
+      rebuild: ["bash", "tools/build_dbus_system_config.sh"]
+      input:
+        - "tools/build_dbus_system_config.sh"
+        - "tools/build_wsl_alpine_xfce.sh"
+        - "tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+    out: "DBUSSYST.CONF"
+    rootfs: "/etc/dbus-1/pacha-system.conf"
+  service_runtime:
+    file: "userland/fixtures/linux/service-runtime.sh"
+    out: "SRVRUN.SH"
+    rootfs: "/sbin/pacha-service-runtime"
+  system_services_test:
+    file: "tests/fixtures/system_services.sh"
+    out: "SYSSVCS.SH"
+    rootfs: "/cmd/system_services.sh"
+  lpr_real_service:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_real_service.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_real_service", "userland/fixtures/src/wsl_musl/lpr_real_service.c"]
+    out: "REALSRV.ELF"
+    rootfs: "/cmd/lpr_real_service.elf"
+  lpr_random:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_random.dynamic.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_random", "userland/fixtures/src/wsl_musl/lpr_random.c"]
+    out: "RANDOM.ELF"
+    rootfs: "/cmd/lpr_random.elf"
+  lpr_madvise:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_madvise.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_madvise", "userland/fixtures/src/wsl_musl/lpr_madvise.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_madvise.c"
+    out: "MADVISE.ELF"
+    rootfs: "/cmd/lpr_madvise.elf"
+  lpr_accounts:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_accounts.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_accounts.sh"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_accounts.c"
+        - "userland/libaccount"
+    out: "ACCOUNTS.ELF"
+    rootfs: "/cmd/lpr_accounts.elf"
+  native_host_primitives:
+    file:
+      path: ".artifacts/tests/native-host-primitives/native_host_primitives.elf"
+      rebuild: ["bash", "tests/build-native-host-primitives.sh"]
+      input:
+        - "tests/build-native-host-primitives.sh"
+        - "tests/native_execution_contract.c"
+        - "tests/native_clock_contract.c"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "userland/libipc/include"
+    out: "NATPRIM.ELF"
+    rootfs: "/cmd/native_host_primitives.elf"
+  native_device_contract:
+    file:
+      path: ".artifacts/tests/native-host-primitives/native_device_contract.elf"
+      rebuild: ["bash", "tests/build-native-device-contract.sh"]
+      input:
+        - "tests/build-native-device-contract.sh"
+        - "tests/native_device_contract.c"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "userland/libipc/include"
+        - "userland/libcapsule/include"
+        - "userland/libcapsule/src"
+    out: "NATDEV.ELF"
+    rootfs: "/cmd/native_device_contract.elf"
+  process_create_grants_native:
+    file:
+      path: ".artifacts/tests/process-create-grants/process_create_grants.elf"
+      rebuild: ["bash", "tests/build-process-create-grants-native.sh"]
+      input:
+        - "tests/build-process-create-grants-native.sh"
+        - "tests/process_create_grants_native.c"
+        - "tests/filed_identity_native.h"
+        - "userland/filed/include"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "GRANTS.ELF"
+    rootfs: "/cmd/process_create_grants.elf"
+  unix_native_contract:
+    file:
+      path: ".artifacts/tests/unix-native/unix_native_contract.elf"
+      rebuild: ["bash", "tests/build-unix-native-contract.sh"]
+      input:
+        - "tests/build-unix-native-contract.sh"
+        - "tests/unix_native_contract.c"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/pachaos/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "UNIXNAT.ELF"
+    rootfs: "/cmd/unix_native_contract.elf"
+  lpr_unixd_pair_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_unixd_pair_probe.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_unixd_pair_probe", "userland/fixtures/src/wsl_musl/lpr_unixd_pair_probe.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_unixd_pair_probe.c"
+    out: "UNIXPAIR.ELF"
+    rootfs: "/cmd/lpr_unixd_pair_probe.elf"
+  lpr_unix_stage_bench:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_unix_stage_bench.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_unix_stage_bench", "userland/fixtures/src/wsl_musl/lpr_unix_stage_bench.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_unix_stage_bench.c"
+    out: "UNIXSTG.ELF"
+    rootfs: "/cmd/lpr_unix_stage_bench.elf"
+  lpr_mremap_growth_probe:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_mremap_growth_probe.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_mremap_growth_probe", "userland/fixtures/src/wsl_musl/lpr_mremap_growth_probe.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_mremap_growth_probe.c"
+    out: "MREMAPGR.ELF"
+    rootfs: "/cmd/lpr_mremap_growth_probe.elf"
   lpr_fork_pthread_probe:
     file:
       path: ".artifacts/userland-fixtures/lpr_fork_pthread_probe.static.elf"
@@ -1292,6 +1545,16 @@ apps:
         - "userland/fixtures/src/wsl_musl/lpr_mesa_cube_smoke.c"
     out: "LPRMCUBE.ELF"
     rootfs: "/cmd/lpr_mesa_cube_smoke.elf"
+  lpr_mesa_multi_smoke:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_mesa_multi_smoke.elf"
+      rebuild: ["bash", "tools/build_wsl_mesa_inventory.sh", ".artifacts/userland-fixtures/lpr_mesa_multi_smoke.elf", "userland/fixtures/src/wsl_musl/lpr_mesa_multi_smoke.c"]
+      input:
+        - "tools/build_wsl_mesa_inventory.sh"
+        - "tools/build_wsl_alpine_mesa.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_mesa_multi_smoke.c"
+    out: "LPRMMULT.ELF"
+    rootfs: "/cmd/lpr_mesa_multi_smoke.elf"
   lpr_drm_page_flip_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_drm_page_flip_smoke.elf"
@@ -1309,7 +1572,7 @@ apps:
   libc_vfs_exec_smoke:
     file:
       path: ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"
-      rebuild: ["bash", "-lc", "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ PACHAOS_MUSL_APP_SOURCE=musl/pachaos/smoke/libc_vfs_exec.c bash musl/pachaos/build/build-smokes.sh .artifacts/musl-pachaos/libc_vfs_exec_smoke.elf"]
+      rebuild: ["bash", "pack/scripts/build_pachaos_smoke.sh", ".artifacts/musl-pachaos/libc_vfs_exec_smoke.elf", "musl/pachaos/smoke/libc_vfs_exec.c"]
       input:
         - "musl/pachaos/smoke/libc_vfs_exec.c"
         - "musl/pachaos/build/build-smokes.sh"
@@ -1325,7 +1588,7 @@ apps:
   libc_mix_bench:
     file:
       path: ".artifacts/musl-pachaos/libc_mix_bench.elf"
-      rebuild: ["bash", "-lc", "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ PACHAOS_MUSL_APP_SOURCE=musl/pachaos/smoke/libc_mix_bench.c bash musl/pachaos/build/build-smokes.sh .artifacts/musl-pachaos/libc_mix_bench.elf"]
+      rebuild: ["bash", "pack/scripts/build_pachaos_smoke.sh", ".artifacts/musl-pachaos/libc_mix_bench.elf", "musl/pachaos/smoke/libc_mix_bench.c"]
       input:
         - "musl/pachaos/smoke/libc_mix_bench.c"
         - "musl/pachaos/build/build-smokes.sh"
@@ -1345,7 +1608,7 @@ apps:
   libc_alloc_probe:
     file:
       path: ".artifacts/musl-pachaos/libc_alloc_probe.elf"
-      rebuild: ["bash", "-lc", "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ PACHAOS_MUSL_APP_SOURCE=musl/pachaos/smoke/libc_alloc_probe.c bash musl/pachaos/build/build-smokes.sh .artifacts/musl-pachaos/libc_alloc_probe.elf"]
+      rebuild: ["bash", "pack/scripts/build_pachaos_smoke.sh", ".artifacts/musl-pachaos/libc_alloc_probe.elf", "musl/pachaos/smoke/libc_alloc_probe.c"]
       input:
         - "musl/pachaos/smoke/libc_alloc_probe.c"
         - "musl/pachaos/build/build-smokes.sh"
@@ -1487,7 +1750,7 @@ apps:
     role: "service"
     file:
       path: ".artifacts/cmake/pachaos_capsule/pachaos_capsule.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/pachaos_capsule", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/pachaos_capsule", ".artifacts/cmake/pachaos_capsule", "pachaos_capsule"]
       input:
         - "userland/pachaos_capsule/CMakeLists.txt"
         - "userland/libcapsule/include"
@@ -1496,13 +1759,33 @@ apps:
         - "userland/libpacha/src"
         - "userland/pachaos_capsule/src"
         - "userland/pachaos_capsule/include"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
+  unixd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/unixd/unixd.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/unixd", ".artifacts/cmake/unixd", "unixd"]
+      input:
+        - "userland/unixd/CMakeLists.txt"
+        - "userland/unixd/src"
+        - "userland/unixd/include"
+        - "userland/filed/include/filed/unix_path.h"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "UNIXD.ELF"
+    rootfs: "/srv/unixd.elf"
   netd:
     role: "service"
     file:
       path: ".artifacts/cmake/netd/netd.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/netd", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/netd", ".artifacts/cmake/netd", "netd"]
       input:
         - "userland/netd/CMakeLists.txt"
         - "userland/libcapsule/include"
@@ -1516,15 +1799,23 @@ apps:
         - "userland/libfiled_client"
         - "userland/netd/src"
         - "userland/netd/include"
-        - "_kobox/include"
-        - "_kobox/src"
+        - "userland/gpud/launch.c"
+        - "userland/gpud/launch_native.c"
+        - "userland/gpud/bootstrap.c"
+        - "userland/gpud/process.c"
+        - "userland/gpud/process_native.c"
+        - "userland/gpud/lifecycle.c"
+        - "userland/kobox2_adapter"
+        - "kobox2/include"
+        - "kobox2/src"
+        - "kobox2/protocol"
     out: "NETD.ELF"
     rootfs: "/srv/netd.elf"
   termd:
     role: "service"
     file:
       path: ".artifacts/cmake/termd/termd.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/termd", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/termd", ".artifacts/cmake/termd", "termd"]
       input:
         - "userland/termd/CMakeLists.txt"
         - "userland/termd/src"
@@ -1544,15 +1835,18 @@ apps:
         - "_kobox/src"
     out: "TERMD.ELF"
     rootfs: "/srv/termd.elf"
-  drmd:
+  gpud:
     role: "service"
     file:
-      path: ".artifacts/cmake/drmd/drmd.elf"
-      rebuild: ["bash", "-lc", "cmake -S userland/drmd -B .artifacts/cmake/drmd && cmake --build .artifacts/cmake/drmd --parallel 1"]
+      path: ".artifacts/cmake/gpud/gpud.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/gpud", ".artifacts/cmake/gpud", "gpud", "gpud_sandbox"]
       input:
-        - "userland/drmd/CMakeLists.txt"
-        - "userland/drmd/src"
-        - "userland/drmd/include"
+        - "userland/gpud"
+        - "userland/kobox2_adapter"
+        - "kobox2/include"
+        - "kobox2/src"
+        - "kobox2/protocol"
+        - "kobox2/linux-sandbox/kobox"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
         - "userland/libpacha/include"
@@ -1561,17 +1855,379 @@ apps:
         - "userland/libipc/src"
         - "userland/filed/include"
         - "userland/libfiled_client"
-        - "_kobox/include"
-        - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
-    out: "DRMD.ELF"
-    rootfs: "/srv/drmd.elf"
+    out: "GPUD.ELF"
+    rootfs: "/srv/gpud.elf"
+  gpud_sandbox:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/gpud/sandbox.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/gpud", ".artifacts/cmake/gpud", "gpud", "gpud_sandbox"]
+      input:
+        - "userland/gpud"
+        - "userland/kobox2_adapter"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "GPUDSBX.ELF"
+    rootfs: "/srv/kobox2/sandbox.elf"
+  gpud_core:
+    file:
+      path: ".artifacts/gpud-production-runtime/linux-boot-runtime.so"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: &gpud_package_inputs
+        - "pack/scripts/build_gpud_package.sh"
+        - "userland/gpud/build-package.sh"
+        - "kobox2/linux-sandbox/kobox"
+    out: "GPUCORE.SO"
+    rootfs: "/srv/kobox2/core.so"
+  gpud_i2c_core:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/i2c/i2c-core.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUI2C.KO"
+    rootfs: "/srv/kobox2/modules/i2c-core.ko"
+  gpud_drm_panel_quirks:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUPANEL.KO"
+    rootfs: "/srv/kobox2/modules/drm_panel_orientation_quirks.ko"
+  gpud_drm:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUDRM.KO"
+    rootfs: "/srv/kobox2/modules/drm.ko"
+  gpud_drm_shmem:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm_shmem_helper.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUSHMEM.KO"
+    rootfs: "/srv/kobox2/modules/drm_shmem_helper.ko"
+  gpud_virtio_ring:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_ring.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUVRING.KO"
+    rootfs: "/srv/kobox2/modules/virtio_ring.ko"
+  gpud_virtio:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUVIRT.KO"
+    rootfs: "/srv/kobox2/modules/virtio.ko"
+  gpud_virtio_pci_modern:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_pci_modern_dev.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUVPMOD.KO"
+    rootfs: "/srv/kobox2/modules/virtio_pci_modern_dev.ko"
+  gpud_virtio_pci:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_pci.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUVPCI.KO"
+    rootfs: "/srv/kobox2/modules/virtio_pci.ko"
+  gpud_virtio_dma_buf:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/virtio/virtio_dma_buf.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUVDBUF.KO"
+    rootfs: "/srv/kobox2/modules/virtio_dma_buf.ko"
+  gpud_drm_kms:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/drm_kms_helper.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUKMS.KO"
+    rootfs: "/srv/kobox2/modules/drm_kms_helper.ko"
+  gpud_virtio_gpu:
+    file:
+      path: ".artifacts/gpud-production-modules/drivers/gpu/drm/virtio/virtio-gpu.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUVIRGL.KO"
+    rootfs: "/srv/kobox2/modules/virtio-gpu.ko"
+  gpud_drm_mapping:
+    file:
+      path: ".artifacts/gpud-production-modules/kobox/gem/drm_mapping.ko"
+      rebuild: ["bash", "pack/scripts/build_gpud_package.sh"]
+      input: *gpud_package_inputs
+    out: "GPUMAP.KO"
+    rootfs: "/srv/kobox2/modules/kobox-drm-mapping.ko"
+  kobox2_usb_hid_sandbox:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production/sandbox.elf"
+      rebuild: ["bash", "userland/kobox2_adapter/build-sandbox.sh", ".artifacts/kobox2-usb-hid-production/sandbox.elf", "--usb-hid"]
+      input:
+        - "userland/kobox2_adapter/build-sandbox.sh"
+        - "userland/kobox2_adapter"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2USBHID.ELF"
+    rootfs: "/srv/kobox2/usb-hid/sandbox.elf"
+  kobox2_usb_hid_core:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production/runtime/linux-boot-runtime.so"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: &kobox2_usb_hid_inputs
+        - "pack/scripts/build_usb_hid_package.sh"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2USBHID.SO"
+    rootfs: "/srv/kobox2/usb-hid/core.so"
+  kobox2_usb_hid_closure:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production/closure-inventory.json"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBHID.JSON"
+    rootfs: "/srv/kobox2/usb-hid/closure.json"
+  kobox2_usb_hid_hid:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/hid/hid.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2HID.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/hid.ko"
+  kobox2_usb_hid_generic:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/hid/hid-generic.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2HIDGEN.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/hid-generic.ko"
+  kobox2_usb_hid_evdev:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/input/evdev.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2EVDEV.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/evdev.ko"
+  kobox2_usb_hid_common:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/common/usb-common.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBCOM.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/usb-common.ko"
+  kobox2_usb_hid_nls:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/fs/nls/nls_base.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2NLS.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/nls_base.ko"
+  kobox2_usb_hid_usbcore:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/core/usbcore.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBCORE.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/usbcore.ko"
+  kobox2_usb_hid_usbhid:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/hid/usbhid/usbhid.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2USBHID.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/usbhid.ko"
+  kobox2_usb_hid_xhci_hcd:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/host/xhci-hcd.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2XHCIHCD.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/xhci-hcd.ko"
+  kobox2_usb_hid_xhci_pci:
+    file:
+      path: ".artifacts/kobox2-usb-hid-production-canonical/drivers/usb/host/xhci-pci.ko"
+      rebuild: ["bash", "pack/scripts/build_usb_hid_package.sh"]
+      input: *kobox2_usb_hid_inputs
+    out: "K2XHCIPCI.KO"
+    rootfs: "/srv/kobox2/usb-hid/modules/xhci-pci.ko"
+  kobox2_network_sandbox:
+    file:
+      path: ".artifacts/kobox2-network-production/sandbox.elf"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: &kobox2_network_inputs
+        - "pack/scripts/build_network_package.sh"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2NET.ELF"
+    rootfs: "/srv/kobox2/network/sandbox.elf"
+  kobox2_network_core:
+    file:
+      path: ".artifacts/kobox2-network-production/runtime/linux-boot-runtime.so"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NET.SO"
+    rootfs: "/srv/kobox2/network/core.so"
+  kobox2_network_manifest:
+    file:
+      path: ".artifacts/kobox2-network-production/manifest.bin"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NET.BIN"
+    rootfs: "/srv/kobox2/network/manifest.bin"
+  kobox2_network_firmware_class:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/firmware_class.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NFW.KO"
+    rootfs: "/srv/kobox2/network/modules/firmware_class.ko"
+  kobox2_network_mdio_bus:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/mdio_bus.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NMDIO.KO"
+    rootfs: "/srv/kobox2/network/modules/mdio_bus.ko"
+  kobox2_network_libphy:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/libphy.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NPHY.KO"
+    rootfs: "/srv/kobox2/network/modules/libphy.ko"
+  kobox2_network_mdio_devres:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/mdio_devres.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NMDR.KO"
+    rootfs: "/srv/kobox2/network/modules/mdio_devres.ko"
+  kobox2_network_realtek_phy:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/realtek.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NRPHY.KO"
+    rootfs: "/srv/kobox2/network/modules/realtek.ko"
+  kobox2_network_virtio_modern:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_pci_modern_dev.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVMOD.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_pci_modern_dev.ko"
+  kobox2_network_virtio_ring:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_ring.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVRING.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_ring.ko"
+  kobox2_network_virtio:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVIRT.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio.ko"
+  kobox2_network_virtio_pci:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_pci.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVPCI.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_pci.ko"
+  kobox2_network_bitrev:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/bitrev.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NBIT.KO"
+    rootfs: "/srv/kobox2/network/modules/bitrev.ko"
+  kobox2_network_crc32:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/crc32.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NCRC.KO"
+    rootfs: "/srv/kobox2/network/modules/crc32.ko"
+  kobox2_network_r8169:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/r8169.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NR8169.KO"
+    rootfs: "/srv/kobox2/network/modules/r8169.ko"
+  kobox2_network_failover:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/failover.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NFAIL.KO"
+    rootfs: "/srv/kobox2/network/modules/failover.ko"
+  kobox2_network_net_failover:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/net_failover.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NNFAIL.KO"
+    rootfs: "/srv/kobox2/network/modules/net_failover.ko"
+  kobox2_network_virtio_net:
+    file:
+      path: ".artifacts/kobox2-network-production/modules/virtio_net.ko"
+      rebuild: ["bash", "pack/scripts/build_network_package.sh"]
+      input: *kobox2_network_inputs
+    out: "K2NVNET.KO"
+    rootfs: "/srv/kobox2/network/modules/virtio_net.ko"
+  usbd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/usbd/usbd.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/usbd", ".artifacts/cmake/usbd", "usbd"]
+      input:
+        - "userland/usbd"
+        - "userland/gpud/launch.c"
+        - "userland/gpud/launch.h"
+        - "userland/gpud/launch_native.c"
+        - "userland/gpud/launch_native.h"
+        - "userland/gpud/arch/x86_64/launch_image.c"
+        - "userland/gpud/launch_image.h"
+        - "userland/gpud/bootstrap.c"
+        - "userland/gpud/bootstrap.h"
+        - "userland/gpud/process.c"
+        - "userland/gpud/process.h"
+        - "userland/gpud/process_native.c"
+        - "userland/gpud/process_native.h"
+        - "userland/gpud/lifecycle.c"
+        - "userland/gpud/lifecycle.h"
+        - "userland/kobox2_adapter"
+        - "userland/libfiled_client"
+        - "userland/libipc"
+        - "userland/libcapsule"
+        - "userland/libpacha"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "kobox2/include"
+        - "kobox2/protocol"
+        - "kobox2/src/controller"
+    out: "USBD.ELF"
+    rootfs: "/srv/usbd.elf"
   inputd:
     role: "service"
     file:
       path: ".artifacts/cmake/inputd/inputd.elf"
-      rebuild: ["bash", "-lc", "cmake -S userland/inputd -B .artifacts/cmake/inputd && cmake --build .artifacts/cmake/inputd --parallel 1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/inputd", ".artifacts/cmake/inputd", "inputd"]
       input:
         - "userland/inputd/CMakeLists.txt"
         - "userland/inputd/src"
@@ -1589,13 +2245,14 @@ apps:
         - "_kobox/src"
         - "musl/pachaos/include"
         - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "INPUTD.ELF"
     rootfs: "/srv/inputd.elf"
   storage_boot:
     role: "service"
     file:
       path: ".artifacts/cmake/storage_boot/storage_boot.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/storage_boot", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/storage_boot", ".artifacts/cmake/storage_boot", "storage_boot"]
       input:
         - "userland/storage_boot/CMakeLists.txt"
         - "userland/libcapsule/include"
@@ -1616,7 +2273,7 @@ apps:
     role: "boot"
     file:
       path: ".artifacts/cmake/seed0boot/seed0boot.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/seed0boot", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/seed0boot", ".artifacts/cmake/seed0boot", "seed0boot"]
       input:
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
@@ -1638,20 +2295,24 @@ apps:
     file:
       path: ".artifacts/cmake/seed0_next/seed0_next.elf"
       rebuild: ["bash", "tools/build_seed0_next.sh"]
+      input:
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
     out: "SEED0NX.ELF"
     rootfs: "/srv/seed0_next.elf"
   seed0root:
     role: "service"
     file:
       path: ".artifacts/cmake/seed0root/seed0root.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/seed0root", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/seed0root", ".artifacts/cmake/seed0root", "seed0root"]
       input:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
+        - "userland/unixd/include"
         - "userland/storage/include"
         - "userland/filed/include"
         - "userland/lpr_supervisor/include"
         - "userland/personality/include"
+        - "userland/usbd/include"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
@@ -1663,15 +2324,17 @@ apps:
   seed0root_boot_profile:
     file:
       path: ".artifacts/seed0root_boot_profile.txt"
-      rebuild: ["bash", "-lc", "mkdir -p .artifacts && : > .artifacts/seed0root_boot_profile.txt"]
+      rebuild: ["bash", "pack/scripts/create_empty_artifact.sh", ".artifacts/seed0root_boot_profile.txt"]
     out: "BOOTPROFILE.TXT"
     rootfs: "/etc/pacha_boot_profile"
   filed:
     role: "service"
     file:
       path: ".artifacts/cmake/filed/filed.elf"
-      rebuild: ["cmake", "--build", ".artifacts/cmake/filed", "--parallel", "1"]
+      rebuild: ["bash", "pack/scripts/build_filed.sh"]
       input:
+        - "pack/scripts/build_filed.sh"
+        - "pack/scripts/build_cmake_app.sh"
         - "userland/filed/CMakeLists.txt"
         - "userland/filed/include"
         - "userland/filed/src"
@@ -1699,11 +2362,15 @@ apps:
     role: "service"
     file:
       path: ".artifacts/cmake/lpr_supervisor/lpr_supervisor.elf"
-      rebuild: ["bash", "-lc", "cmake -S userland/lpr_supervisor -B .artifacts/cmake/lpr_supervisor && cmake --build .artifacts/cmake/lpr_supervisor --parallel 1"]
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/lpr_supervisor", ".artifacts/cmake/lpr_supervisor", "lpr_supervisor"]
       input:
         - "userland/lpr_supervisor/CMakeLists.txt"
         - "userland/lpr_supervisor/include"
         - "userland/lpr_supervisor/src"
+        - "userland/libaccount"
+        - "userland/unixd/include"
+        - "userland/unixd/src/client.c"
+        - "userland/unixd/src/client_wire.c"
         - "musl/pachaos/build/build-app-dynamic.sh"
         - "musl/pachaos/build/build-runtime.sh"
         - "userland/libipc/include"
@@ -1734,6 +2401,15 @@ apps:
     file: "userland/fixtures/base/passwd"
     out: "PASSWD"
     rootfs: "/etc/passwd"
+  live_passwd:
+    file: "pack/live-bootfs/passwd"
+    out: "PASSWD"
+  live_shells:
+    file: "pack/live-bootfs/shells"
+    out: "SHELLS"
+  live_dropbear_directory:
+    file: "pack/live-bootfs/dropbear/README"
+    out: "DROPBEAR.README"
   pipe_probe:
     file:
       path: ".artifacts/userland-fixtures/pipe_probe.elf"
@@ -1754,6 +2430,12 @@ apps:
     file: "userland/fixtures/base/group"
     out: "GROUP"
     rootfs: "/etc/group"
+  live_group:
+    file: "pack/live-bootfs/group"
+    out: "GROUP"
+  live_boot_profile:
+    file: "pack/live-bootfs/profile"
+    out: "BOOT-PROFILE"
   rootfs_vfs:
     role: "service"
     file:

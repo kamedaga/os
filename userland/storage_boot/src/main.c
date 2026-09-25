@@ -9,6 +9,7 @@
 #include "pacha/abi.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
+#include "pacha/launch.h"
 #include "storage/bootstrap.h"
 #include "storage_boot/boot_config.h"
 
@@ -127,7 +128,6 @@ struct storage_boot_module_image {
 
 static const char *status_name(kb_status_t status);
 
-int pacha_process_create(uint64_t rights, uint32_t flags);
 int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
 int pacha_thread_start(int thread_fd);
 long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
@@ -174,26 +174,6 @@ static int module_symbol(kb_module_t *module, const char *name, void **out_addre
     return 1;
 }
 
-static int mark_fd_inherit(int fd, const char *label)
-{
-    if (fd < 16) {
-        return -1;
-    }
-    const long status = pacha_fd_fcntl(
-        fd,
-        STORAGE_BOOT_FD_FCNTL_SET_FLAGS,
-        STORAGE_BOOT_FD_FLAG_INHERIT,
-        STORAGE_BOOT_FD_FLAG_INHERIT);
-    if (status != 0) {
-        fprintf(stderr, "[storage_boot] %s: mark fd inherit failed fd=%d status=%ld\n",
-            label,
-            fd,
-            status);
-        return -2;
-    }
-    return 0;
-}
-
 static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
 {
     if (data == NULL || size == 0) {
@@ -211,7 +191,7 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
         STORAGE_BOOT_FD_RIGHT_READ |
         STORAGE_BOOT_FD_RIGHT_MAP_READ |
         STORAGE_BOOT_FD_RIGHT_MAP_WRITE;
-    const int fd = pacha_vmo_create(map_size, rights, STORAGE_BOOT_FD_FLAG_INHERIT);
+    const int fd = pacha_vmo_create(map_size, rights, 0);
     if (fd < 16) {
         fprintf(stderr, "[storage_boot] %s: vmo_create failed status=%d\n", label, fd);
         return -3;
@@ -1364,6 +1344,8 @@ static int load_elf_process(
     const char *path,
     const unsigned char *image,
     uint64_t image_size,
+    const struct pacha_process_fd_grant *grants,
+    uint64_t grant_count,
     struct storage_boot_loaded_process *out)
 {
     if (out == NULL) {
@@ -1391,7 +1373,7 @@ static int load_elf_process(
         STORAGE_BOOT_FD_RIGHT_SPAWN |
         STORAGE_BOOT_FD_RIGHT_MAP_INTO |
         STORAGE_BOOT_FD_RIGHT_SET_CONTEXT;
-    const int process_fd = pacha_process_create(process_rights, 0);
+    const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
         fprintf(stderr, "[storage_boot] exec: process_create failed status=%d\n", process_fd);
         return -7;
@@ -1846,24 +1828,6 @@ static int launch_seed0root_from_ext4(
     storage_seed0root_bootstrap_t bootstrap_package = bootstrap;
     memcpy(bootstrap_package.modules, module_table, sizeof(module_table));
     free(filed_image);
-    status = mark_fd_inherit((int)device_fd, "seed0root device fd");
-    if (status != 0) {
-        free(image);
-        (void)pacha_fd_close(filed_image_fd);
-        return 31;
-    }
-    status = mark_fd_inherit((int)ready_channel_fd, "seed0root ready channel fd");
-    if (status != 0) {
-        free(image);
-        (void)pacha_fd_close(filed_image_fd);
-        return 31;
-    }
-    status = mark_fd_inherit((int)service_ready_channel_fd, "seed0root service ready channel fd");
-    if (status != 0) {
-        free(image);
-        (void)pacha_fd_close(filed_image_fd);
-        return 31;
-    }
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
     if (bootstrap_fd < 16) {
         free(image);
@@ -1872,7 +1836,23 @@ static int launch_seed0root_from_ext4(
     }
 
     struct storage_boot_loaded_process loaded;
-    status = load_elf_process(storage_boot_seed0root_argv0, image, image_size, &loaded);
+    struct pacha_process_fd_grant grants[7 + STORAGE_STACK_MODULE_CAPACITY] = {
+        PACHA_LAUNCH_LOG_GRANTS(PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(device_fd, device_fd,
+            PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(ready_channel_fd, ready_channel_fd, PACHA_LAUNCH_SIGNAL),
+        PACHA_LAUNCH_GRANT(service_ready_channel_fd, service_ready_channel_fd,
+            PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL),
+        PACHA_LAUNCH_GRANT(filed_image_fd, filed_image_fd, PACHA_LAUNCH_BLOB),
+        PACHA_LAUNCH_GRANT(bootstrap_fd, bootstrap_fd, PACHA_LAUNCH_BLOB),
+    };
+    for (size_t i = 0; i < module_count; ++i) {
+        grants[7 + i] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
+            module_images[i].image_fd, module_images[i].image_fd,
+            PACHA_LAUNCH_BLOB | PACHA_FD_RIGHT_TRANSFER);
+    }
+    status = load_elf_process(storage_boot_seed0root_argv0, image, image_size,
+        grants, 7 + module_count, &loaded);
     free(image);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
@@ -2050,8 +2030,6 @@ int main(int argc, char **argv)
             (unsigned long long)cfg.bootfs_size);
         return 2;
     }
-    (void)pacha_fd_fcntl(bootstrap_fd, STORAGE_BOOT_FD_FCNTL_SET_FLAGS,
-        0, STORAGE_BOOT_FD_FLAG_INHERIT);
     (void)pacha_fd_close(bootstrap_fd);
 
     const uint64_t module_count = STORAGE_STACK_MODULE_COUNT;

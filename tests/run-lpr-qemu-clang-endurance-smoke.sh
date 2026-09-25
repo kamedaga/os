@@ -13,6 +13,7 @@ start_seconds=$SECONDS
 iterations=5
 sample_count=$((iterations + 2))
 args=(
+  --console-shell
   --timeout 600s
   --boot-marker '[termd] linux tty hvc open ready index=0 handle='
   --send '. /cmd/clang_endurance_smoke.sh'

@@ -195,13 +195,13 @@ def main() -> int:
     cpu_activity: str | None = None
     tree: bytes | None = None
     error: str | None = None
+    input_attempted = False
 
     try:
         console_log_path = Path(os.environ["PACGO_QEMU_CONSOLE_LOG"])
         with console_log_path.open("ab") as console_log:
-            command = (
-                b"/bin/bash /cmd/xfce_app_acceptance.sh --startup-controller\n"
-            )
+            command = (os.environ.get("XFCE_STARTUP_COMMAND",
+                "/bin/bash /cmd/xfce_app_acceptance.sh --startup-controller") + "\n").encode()
             console.sendall(command)
             classification = wait_for_startup(
                 console,
@@ -214,7 +214,14 @@ def main() -> int:
                 # Snapshot the unperturbed CPU state first.  The diagnostic tty
                 # request intentionally wakes the guest only after this point.
                 cpu_activity = dump_cpu_state(qmp, cpu_path, cpus)
-                dump_screen(qmp, screenshot_path)
+                screenshot_error: str | None = None
+                try:
+                    dump_screen(qmp, screenshot_path)
+                except RuntimeError as exc:
+                    # The KMS device can legitimately have no QEMU surface
+                    # while startup is stalled.  Process state is still the
+                    # primary hang evidence, so do not lose it here.
+                    screenshot_error = str(exc)
                 if classification == "hang":
                     console.sendall(DIAG_REQUEST)
                 tree = wait_for_process_tree(
@@ -229,21 +236,185 @@ def main() -> int:
                 evidence_complete = (
                     cpu_path.is_file()
                     and cpu_path.stat().st_size > 0
-                    and screenshot_path.is_file()
-                    and screenshot_path.stat().st_size > 0
                     and tree_path.is_file()
                     and tree_path.stat().st_size > 0
                 )
                 if not evidence_complete:
                     error = "anomaly evidence incomplete"
+                elif screenshot_error is not None:
+                    error = "screenshot unavailable: " + screenshot_error
             else:
+                # Keep the real session alive for optional application checks;
+                # readiness alone is not evidence of a usable desktop.
+                application_timeout = float(os.environ.get("XFCE_STARTUP_APPLICATION_TIMEOUT", "0"))
+                if application_timeout:
+                    deadline = time.monotonic() + application_timeout
+                    while b"XFCE_APP_ACCEPTANCE_DONE status=" not in transcript and time.monotonic() < deadline:
+                        if not drain_once(console, console_log, transcript, 0.25):
+                            break
+                    if b"XFCE_APP_ACCEPTANCE_DONE status=PASS" not in transcript:
+                        classification = "application-failure"
+                        error = "application checks did not pass"
+                if os.environ.get("XFCE_STARTUP_INPUT_CHECK") == "1":
+                    input_attempted = True
+                    # Exercise the guest's tablet/button and keyboard devices.
+                    def held_keys(*codes):
+                        if SESSION_EXIT in transcript:
+                            raise RuntimeError("XFCE session exited during interactive checks")
+                        qmp.execute("input-send-event", {"events": [
+                            qmp.key_event(code, True) for code in codes]})
+                        time.sleep(0.12)
+                        qmp.execute("input-send-event", {"events": [
+                            qmp.key_event(code, False) for code in reversed(codes)]})
+                        time.sleep(0.05)
+
+                    def held_text(value):
+                        special = {" ": ("spc",), "/": ("slash",),
+                            ">": ("shift", "dot"), "&": ("shift", "7"),
+                            "|": ("shift", "backslash"), ";": ("semicolon",),
+                            "=": ("equal",), "-": ("minus",), ".": ("dot",),
+                            "_": ("shift", "minus"), "$": ("shift", "4"),
+                            "?": ("shift", "slash"), "'": ("apostrophe",)}
+                        events = []
+                        for char in value:
+                            if char in special:
+                                events.append(special[char])
+                            elif char.isascii() and char.isalnum():
+                                events.append(("shift", char.lower()) if char.isupper() else (char,))
+                            else:
+                                raise ValueError(f"unsupported input character: {char!r}")
+                        for codes in events:
+                            held_keys(*codes)
+
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "abs", "data": {"axis": "x", "value": 1600}},
+                        {"type": "abs", "data": {"axis": "y", "value": 500}},
+                    ]})
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "btn", "data": {"button": "left", "down": True}},
+                    ]})
+                    time.sleep(0.12)
+                    qmp.execute("input-send-event", {"events": [
+                        {"type": "btn", "data": {"button": "left", "down": False}},
+                    ]})
+                    time.sleep(1)
+                    dump_screen(qmp, screenshot_path.with_name("mouse-menu.png"))
+                    held_keys("esc")
+                    held_keys("ctrl", "alt", "t")
+                    time.sleep(6)
+                    dump_screen(qmp, screenshot_path.with_name("keyboard-terminal.png"))
+                    for code in "pwd":
+                        held_keys(code)
+                    held_keys("ret")
+                    time.sleep(1)
+                    dump_screen(qmp, screenshot_path.with_name("terminal-pwd.png"))
+                    terminal_command = os.environ.get("XFCE_STARTUP_TERMINAL_COMMAND")
+                    if terminal_command:
+                        time.sleep(2)
+                        held_text(terminal_command)
+                        held_keys("ret")
+                        deadline = time.monotonic() + float(os.environ.get(
+                            "XFCE_STARTUP_TERMINAL_COMMAND_TIMEOUT", "8"))
+                        while time.monotonic() < deadline:
+                            if not drain_once(console, console_log, transcript, 0.25):
+                                break
+                        dump_screen(qmp, screenshot_path.with_name("terminal-command.png"))
+                    writer_document = os.environ.get("XFCE_STARTUP_WRITER_DOCUMENT")
+                    if writer_document:
+                        # Screenshots and the persisted ODT content are checked
+                        # separately; injected keys alone never establish PASS.
+                        def writer_pause(seconds):
+                            deadline = time.monotonic() + seconds
+                            while time.monotonic() < deadline:
+                                if not drain_once(console, console_log, transcript, 0.25):
+                                    break
+
+                        held_text("unixd Writer save and reopen")
+                        writer_pause(2)
+                        dump_screen(qmp, screenshot_path.with_name("writer-edited.png"))
+                        held_keys("ctrl", "s")
+                        writer_pause(3)
+                        dump_screen(qmp, screenshot_path.with_name("writer-save-dialog.png"))
+                        held_keys("ctrl", "a")
+                        held_text(writer_document)
+                        held_keys("ret")
+                        writer_pause(8)
+                        dump_screen(qmp, screenshot_path.with_name("writer-saved.png"))
+                        held_keys("ctrl", "w")
+                        writer_pause(3)
+                        dump_screen(qmp, screenshot_path.with_name("writer-closed.png"))
+                        held_keys("ctrl", "o")
+                        writer_pause(2)
+                        held_text(writer_document)
+                        held_keys("ret")
+                        writer_pause(10)
+                        dump_screen(qmp, screenshot_path.with_name("writer-reopened.png"))
+                    if os.environ.get("XFCE_STARTUP_FILE_MANAGER_CHECK") == "1":
+                        for code in "thunar":
+                            held_keys(code)
+                        held_keys("ret")
+                        time.sleep(6)
+                        dump_screen(qmp, screenshot_path.with_name("thunar-open.png"))
+                        held_keys("ctrl", "l")
+                        held_keys("slash")
+                        for code in "usr":
+                            held_keys(code)
+                        held_keys("ret")
+                        time.sleep(3)
+                        dump_screen(qmp, screenshot_path.with_name("thunar-usr.png"))
+                    if os.environ.get("XFCE_STARTUP_DESKTOP_CHECK") == "1":
+                        held_keys("ctrl", "alt", "d")
+                        deadline = time.monotonic() + 15
+                        while time.monotonic() < deadline:
+                            if not drain_once(console, console_log, transcript, 0.25):
+                                break
+                        dump_screen(qmp, screenshot_path.with_name("desktop-icons.png"))
+                    while select.select([console], [], [], 0)[0]:
+                        if not drain_once(console, console_log, transcript, 0):
+                            break
+                dump_screen(qmp, screenshot_path)
                 evidence_complete = True
+                manual_seconds = float(os.environ.get("XFCE_STARTUP_MANUAL_SECONDS", "0"))
+                if manual_seconds:
+                    # Hand the single-client QMP socket to the operator while
+                    # continuing to collect console output in this same VM.
+                    qmp.close()
+                    ready_path = screenshot_path.with_name("manual-ready")
+                    done_path = screenshot_path.with_name("manual-done")
+                    ready_path.write_text("QMP released; session is not verified\n")
+                    deadline = time.monotonic() + manual_seconds
+                    while time.monotonic() < deadline and not done_path.exists():
+                        if not drain_once(console, console_log, transcript, 0.25):
+                            break
+                        if SESSION_EXIT in transcript:
+                            break
+                    if not done_path.exists():
+                        classification = "manual-incomplete"
+                        error = "manual verification did not finish"
+                if SESSION_EXIT in transcript:
+                    classification = "session-exit"
+                    error = "XFCE session exited after startup"
     except Exception as exc:
         detected_ms = round((time.monotonic() - started) * 1000, 3)
         error = f"{type(exc).__name__}: {exc}"
     finally:
         console.close()
         qmp.close()
+
+    # A usable window alone must not pass a targeted runtime-error regression.
+    forbidden_log = os.environ.get("XFCE_STARTUP_FORBID_LOG")
+    if forbidden_log:
+        match = re.search(forbidden_log, transcript.decode(errors="replace"), re.IGNORECASE)
+        if match:
+            classification = "runtime-error"
+            error = "forbidden runtime diagnostic: " + match.group(0)
+
+    serial_path = os.environ.get("PACGO_QEMU_SERIAL_LOG")
+    if serial_path:
+        serial = Path(serial_path).read_bytes()
+        if b"PAGE FAULT" in serial or b"GENERAL PROTECTION" in serial:
+            classification = "guest-fault"
+            error = "guest fault recorded during XFCE verification"
 
     result: dict[str, object] = {
         "classification": classification,
@@ -252,13 +423,14 @@ def main() -> int:
         "evidence_complete": evidence_complete,
         "cpu_activity": cpu_activity,
         "process_tree": str(tree_path) if tree is not None else None,
-        "screenshot": str(screenshot_path) if classification != "ready" else None,
+        "screenshot": str(screenshot_path) if screenshot_path.is_file() else None,
+        "input_check": "attempted-unverified" if input_attempted else "not-run",
     }
     if error is not None:
         result["error"] = error
     write_result(result_path, result)
     print("XFCE_STARTUP_PROBE_DONE " + json.dumps(result, sort_keys=True), flush=True)
-    return 0 if evidence_complete else 1
+    return 0 if evidence_complete and classification == "ready" and error is None else 1
 
 
 if __name__ == "__main__":

@@ -6,6 +6,14 @@ static int filed_tmpfs_inode_is_data_file(const filed_tmpfs_inode_t *inode)
         (inode->kind == FILED_VNODE_REGULAR || inode->kind == FILED_VNODE_SYMLINK);
 }
 
+static int filed_tmpfs_bytes_are_zero(const unsigned char *bytes, size_t length)
+{
+    for (size_t i = 0; i < length; ++i) {
+        if (bytes[i] != 0) return 0;
+    }
+    return 1;
+}
+
 int filed_tmpfs_backend_pread(
     filed_tmpfs_backend_t *backend,
     uint64_t object_id,
@@ -49,7 +57,7 @@ int filed_tmpfs_backend_pread(
         if (chunk > FILED_TMPFS_PAGE_BYTES - page_offset) {
             chunk = FILED_TMPFS_PAGE_BYTES - page_offset;
         }
-        const uint16_t page_id = filed_tmpfs_inode_page_id(inode, page_index);
+        const uint16_t page_id = filed_tmpfs_inode_page_id(backend, inode, page_index);
         filed_tmpfs_page_t *page = filed_tmpfs_page_by_id(backend, page_id);
         if (page != NULL) {
             memcpy((uint8_t *)buffer + total, page->data + page_offset, (size_t)chunk);
@@ -61,6 +69,37 @@ int filed_tmpfs_backend_pread(
     *out_bytes = total;
     filed_tmpfs_lock_release(&backend->lock);
     return 0;
+}
+
+int filed_tmpfs_backend_copy_present(
+    filed_tmpfs_backend_t *backend,
+    uint64_t object_id,
+    void *zero_buffer,
+    uint64_t length)
+{
+    if (backend == NULL || zero_buffer == NULL || length > FILED_TMPFS_MAX_FILE_BYTES) return -22;
+    filed_tmpfs_lock_acquire(&backend->lock);
+    filed_tmpfs_inode_t *inode = filed_tmpfs_find_inode(backend, object_id);
+    int status = 0;
+    if (inode == NULL) { status = -2; goto done; }
+    if (!filed_tmpfs_inode_is_data_file(inode)) { status = -22; goto done; }
+    if (length > inode->size) { status = -22; goto done; }
+    uint16_t id = inode->first_allocated_page;
+    for (uint32_t i = 0; i < inode->allocated_page_count; ++i) {
+        filed_tmpfs_page_t *page = filed_tmpfs_page_by_id(backend, id);
+        if (page == NULL || page->data == NULL) { status = -5; goto done; }
+        const uint64_t offset = (uint64_t)page->file_page_index * FILED_TMPFS_PAGE_BYTES;
+        if (offset < length) {
+            uint64_t bytes = length - offset;
+            if (bytes > FILED_TMPFS_PAGE_BYTES) bytes = FILED_TMPFS_PAGE_BYTES;
+            memcpy((uint8_t *)zero_buffer + offset, page->data, (size_t)bytes);
+        }
+        id = page->next_inode_page;
+    }
+    if (id != 0) status = -5;
+done:
+    filed_tmpfs_lock_release(&backend->lock);
+    return status;
 }
 
 int filed_tmpfs_backend_pwrite(
@@ -105,14 +144,39 @@ int filed_tmpfs_backend_pwrite(
             filed_tmpfs_lock_release(&backend->lock);
             return -27;
         }
-        uint16_t page_id = filed_tmpfs_inode_page_id(inode, page_index);
+        uint16_t page_id = filed_tmpfs_inode_page_id(backend, inode, page_index);
         if (page_id == 0) {
-            const uint16_t allocated_page_id = filed_tmpfs_alloc_page(backend);
-            if (allocated_page_id == 0) {
-                filed_tmpfs_lock_release(&backend->lock);
-                return -28;
+            /* Shared-VMO writeback includes untouched zero-filled ranges.
+             * A hole already reads as zero; materializing it duplicates the
+             * VMO's empty pages and can exhaust the bounded tmpfs pool.
+             * Still count the write and extend EOF below. Existing pages
+             * must follow the normal overwrite path to clear old bytes. */
+            if (filed_tmpfs_bytes_are_zero((const unsigned char *)buffer + total,
+                    (size_t)chunk)) {
+                total += chunk;
+                continue;
             }
-            if (!filed_tmpfs_note_inode_page(inode, page_index, allocated_page_id)) {
+            const int allocated_page_id = filed_tmpfs_alloc_page(backend);
+            if (allocated_page_id < 0) {
+                static bool exhaustion_reported;
+                if (!exhaustion_reported) {
+                    exhaustion_reported = true;
+                    fprintf(stderr, "[filed] tmpfs page allocation status=%d free=%u limit=%u object=%llu pages=%u offset=%llu\n",
+                        allocated_page_id, backend->free_page_count, FILED_TMPFS_PAGE_POOL_PAGES,
+                        (unsigned long long)object_id, inode->allocated_page_count,
+                        (unsigned long long)absolute);
+                    for (size_t i = 0; i < FILED_TMPFS_MAX_INODES; ++i) {
+                        const filed_tmpfs_inode_t *item = &backend->inodes[i];
+                        if (item->used && item->allocated_page_count >= 128)
+                            fprintf(stderr, "[filed] tmpfs large object=%llu pages=%u size=%llu links=%u\n",
+                                (unsigned long long)item->object_id, item->allocated_page_count,
+                                (unsigned long long)item->size, item->nlink);
+                    }
+                }
+                filed_tmpfs_lock_release(&backend->lock);
+                return allocated_page_id;
+            }
+            if (!filed_tmpfs_note_inode_page(backend, inode, page_index, allocated_page_id)) {
                 filed_tmpfs_free_page(backend, allocated_page_id);
                 filed_tmpfs_lock_release(&backend->lock);
                 return -28;
@@ -185,7 +249,7 @@ int filed_tmpfs_backend_truncate(filed_tmpfs_backend_t *backend, uint64_t object
         if ((size % FILED_TMPFS_PAGE_BYTES) != 0 && keep_pages <= FILED_TMPFS_MAX_FILE_PAGES) {
             filed_tmpfs_page_t *last = filed_tmpfs_page_by_id(
                 backend,
-                filed_tmpfs_inode_page_id(inode, keep_pages - 1u));
+                filed_tmpfs_inode_page_id(backend, inode, keep_pages - 1u));
             if (last != NULL) {
                 memset(
                     last->data + (size % FILED_TMPFS_PAGE_BYTES),

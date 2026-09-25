@@ -31,6 +31,7 @@ typedef struct storage_filed_bootstrap {
     uint64_t magic;
     uint64_t device_fd;
     uint64_t control_fd;
+    uint64_t unix_path_fd;
     uint64_t module_count;
     storage_module_image_desc_t modules[STORAGE_STACK_MODULE_CAPACITY];
 } storage_filed_bootstrap_t;
@@ -39,7 +40,7 @@ _Static_assert(sizeof(storage_module_image_desc_t) == 80,
     "storage module descriptor private ABI");
 _Static_assert(sizeof(storage_seed0root_bootstrap_t) == 696,
     "storage seed0root bootstrap private ABI");
-_Static_assert(sizeof(storage_filed_bootstrap_t) == 672,
+_Static_assert(sizeof(storage_filed_bootstrap_t) == 680,
     "storage filed bootstrap private ABI");
 
 static inline int storage_module_table_matches_manifest(

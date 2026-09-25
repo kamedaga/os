@@ -46,12 +46,6 @@ typedef struct filed_page_dispatch_result {
     int thread_fd;
 } filed_page_dispatch_result_t;
 
-typedef struct filed_dispatch_saved_fd {
-    int fd;
-    uint64_t rights;
-    uint64_t flags;
-} filed_dispatch_saved_fd_t;
-
 bool filed_backend_object_is_tmpfs(uint64_t backend_object);
 int filed_backend_lookup(filed_runtime_t *runtime, uint64_t parent_object_id, const char *name, uint64_t *out_object_id);
 int filed_backend_statx(filed_runtime_t *runtime, uint64_t object_id, storage_statx_reply_t *out_stat);
@@ -96,15 +90,7 @@ int filed_send_exec_reply(
     int transfer_process_fd,
     int thread_startable);
 int filed_send_exec_self_reply(int reply_fd, uint64_t request_id, int process_fd, int thread_fd, int bootstrap_fd);
-int filed_dispatch_set_inherit(int fd, int enabled);
-void filed_dispatch_saved_fd_init(filed_dispatch_saved_fd_t *saved);
 void filed_dispatch_close_owned_fd(int *fd);
-int filed_dispatch_save_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved);
-void filed_dispatch_restore_target_fd(int target_fd, filed_dispatch_saved_fd_t *saved);
-int filed_dispatch_prepare_inherit_fd_to_target(int source_fd, uint64_t target_raw, int *out_fd, filed_dispatch_saved_fd_t *saved);
-int filed_dispatch_dup_endpoint_to_fixed(int source_fd, int target_fd, int *out_fd);
-int filed_dispatch_prepare_endpoint_to_fixed(int source_fd, int target_fd, int *out_fd, int *out_borrowed);
-void filed_dispatch_close_prepared_endpoint(int *fd, int borrowed);
 
 int64_t filed_status_to_wire(filed_status_t status);
 int filed_release_reclaimed_object(filed_runtime_t *runtime, const filed_vfs_reclaim_result_t *reclaim);
@@ -140,6 +126,7 @@ int64_t filed_openat_path(filed_runtime_t *runtime, const filed_openat_t *openat
 filed_page_dispatch_result_t filed_dispatch_openat_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_validate_open_cache_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_stat_page(filed_runtime_t *runtime, void *page);
+filed_page_dispatch_result_t filed_dispatch_statat_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_statfs_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_utimens_page(filed_runtime_t *runtime, void *page);
 filed_page_dispatch_result_t filed_dispatch_chmod_page(filed_runtime_t *runtime, void *page);

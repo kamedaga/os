@@ -293,11 +293,14 @@ int filed_dispatch_runtime_init(filed_runtime_t *runtime)
     return 0;
 }
 
-static filed_page_dispatch_result_t filed_dispatch_session_page(
+static filed_page_dispatch_result_t filed_dispatch_session_page_snapshot(
     filed_runtime_t *runtime,
     const struct pacha_ipc_msg *request,
     void *page)
 {
+    const int allowed = filed_client_authorize(runtime, (uint32_t)request->word1,
+        page, FILED_PAGE_BYTES, request->word2);
+    if (allowed) return filed_page_result(allowed, 0);
     switch (request->word1) {
     case FILED_OP_DIAG_PING:
         return filed_page_result(0, request->word2);
@@ -310,6 +313,8 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
         return filed_dispatch_validate_open_cache_page(runtime, page);
     case FILED_OP_VFS_STAT:
         return filed_dispatch_stat_page(runtime, page);
+    case FILED_OP_VFS_STATAT:
+        return filed_dispatch_statat_page(runtime, page);
     case FILED_OP_VFS_STATFS:
         return filed_dispatch_statfs_page(runtime, page);
     case FILED_OP_VFS_UTIMENS:
@@ -371,12 +376,24 @@ static filed_page_dispatch_result_t filed_dispatch_session_page(
     }
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
-    case FILED_OP_SERVICE_SET_DRMD_DRM:
+    case FILED_OP_SERVICE_SET_GPUD_DRM:
     case FILED_OP_SERVICE_SET_INPUTD_INPUT:
         return filed_page_result(-95, 0);
     default:
         return filed_page_result(-95, 0);
     }
+}
+
+static filed_page_dispatch_result_t filed_dispatch_session_page(
+    filed_runtime_t *runtime, const struct pacha_ipc_msg *request, void *shared)
+{
+    /* Authorization and execution must read the same input, even if another
+     * client thread changes the shared page while filed is running. */
+    _Alignas(8) uint8_t snapshot[FILED_PAGE_BYTES];
+    memcpy(snapshot, shared, sizeof(snapshot));
+    filed_page_dispatch_result_t result = filed_dispatch_session_page_snapshot(runtime, request, snapshot);
+    memcpy(shared, snapshot, sizeof(snapshot));
+    return result;
 }
 
 static int filed_session_fast_validate(
@@ -413,7 +430,7 @@ static int filed_session_fast_validate(
     *out_header = header;
     *out_requests = (filed_fast_request_t *)((uint8_t *)session->page + sizeof(*header));
     *out_completions = (filed_fast_completion_t *)((uint8_t *)(*out_requests) +
-        sizeof(**out_requests) * header->request_capacity);
+        sizeof(**out_requests) * FILED_FAST_REQUEST_CAPACITY);
     return 0;
 }
 
@@ -424,12 +441,11 @@ static void *filed_session_fast_payload(
 {
     if (session == NULL ||
         header == NULL ||
-        payload_slot >= header->payload_slot_count ||
-        header->payload_slot_size != FILED_PAGE_BYTES)
+        payload_slot >= FILED_FAST_PAYLOAD_SLOT_COUNT)
     {
         return NULL;
     }
-    const uint64_t offset = header->payload_offset + payload_slot * header->payload_slot_size;
+    const uint64_t offset = FILED_FAST_PAYLOAD_OFFSET + payload_slot * FILED_PAGE_BYTES;
     if (offset + FILED_PAGE_BYTES > session->page_size) {
         return NULL;
     }
@@ -443,7 +459,7 @@ static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
     uint64_t batch_count,
     bool append)
 {
-    if (batch_count == 0 || batch_count > header->payload_slot_count) {
+    if (batch_count == 0 || batch_count > FILED_FAST_PAYLOAD_SLOT_COUNT) {
         return filed_page_result(-22, 0);
     }
 
@@ -457,7 +473,12 @@ static filed_page_dispatch_result_t filed_dispatch_session_write_batch(
             break;
         }
 
-        filed_io_t *io = (filed_io_t *)payload;
+        filed_io_t snapshot;
+        memcpy(&snapshot, payload, sizeof(snapshot));
+        filed_io_t *io = &snapshot;
+        payload = &snapshot;
+        status = filed_client_authorize(runtime, (uint32_t)op, payload, FILED_PAGE_BYTES, 0);
+        if (status) break;
         const uint64_t requested = io->length;
         const uint64_t start_cycles = filed_read_tsc();
         const filed_page_dispatch_result_t result = append ?
@@ -499,14 +520,14 @@ static uint64_t filed_dispatch_session_fast_drain(
         return 0;
     }
 
-    while (header->request_head != header->request_tail) {
-        if (header->completion_tail - header->completion_head >= header->completion_capacity) {
+    while (completed < FILED_FAST_REQUEST_CAPACITY && header->request_head != header->request_tail) {
+        if (header->completion_tail - header->completion_head >= FILED_FAST_COMPLETION_CAPACITY) {
             filed_fast_metrics.ring_full++;
             break;
         }
 
-        filed_fast_request_t *fast_request =
-            &requests[header->request_head % header->request_capacity];
+        filed_fast_request_t snapshot_request = requests[header->request_head % FILED_FAST_REQUEST_CAPACITY];
+        filed_fast_request_t *fast_request = &snapshot_request;
         const uint64_t fast_op_start_cycles = filed_read_tsc();
         void *payload = filed_session_fast_payload(session, header, fast_request->payload_slot);
         filed_page_dispatch_result_t result = filed_page_result(-22, 0);
@@ -564,7 +585,7 @@ static uint64_t filed_dispatch_session_fast_drain(
         }
 
         filed_fast_completion_t *completion =
-            &completions[header->completion_tail % header->completion_capacity];
+            &completions[header->completion_tail % FILED_FAST_COMPLETION_CAPACITY];
         memset(completion, 0, sizeof(*completion));
         completion->request_id = fast_request->request_id;
         completion->status = result.status;
@@ -741,7 +762,12 @@ static filed_route_result_t filed_dispatch_client_vfs(
     const pacha_service_envelope_t *header)
 {
     filed_route_result_t route = filed_route_pending();
-    void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
+    _Alignas(8) uint8_t snapshot[PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES];
+    memcpy(snapshot, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot));
+    void *payload = snapshot;
+    route.status = filed_client_authorize(runtime, header->op, payload, header->payload_size,
+        header->payload_size >= 8 ? *(uint64_t *)payload : 0);
+    if (route.status) return route;
 
     switch (header->op) {
     case FILED_OP_VFS_OPENAT:
@@ -780,6 +806,15 @@ static filed_route_result_t filed_dispatch_client_vfs(
         } else {
             const filed_page_dispatch_result_t page_result =
                 filed_dispatch_stat_page(runtime, payload);
+            route.status = page_result.status;
+            route.result = page_result.result;
+        }
+        break;
+    case FILED_OP_VFS_STATAT:
+        if (header->payload_size < sizeof(filed_statat_t)) {
+            route.status = -22;
+        } else {
+            const filed_page_dispatch_result_t page_result = filed_dispatch_statat_page(runtime, payload);
             route.status = page_result.status;
             route.result = page_result.result;
         }
@@ -1062,6 +1097,7 @@ static filed_route_result_t filed_dispatch_client_vfs(
         route.status = -95;
         break;
     }
+    memcpy((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, snapshot, sizeof(snapshot));
     return route;
 }
 
@@ -1139,7 +1175,46 @@ static int filed_dispatch_client(
     int64_t status = 0;
     uint64_t result = 0;
     uint64_t error_token = 0;
+    status = filed_client_authorize(runtime, header.op,
+        (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, header.payload_size,
+        header.payload_size >= 8 ? *(uint64_t *)((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES) : 0);
+    if (status) {
+        filed_close_received_fds_except(request, reply_fd, -1);
+        int sent = filed_send_reply(reply_fd, page, &header, status, 0, 0);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        return sent;
+    }
     switch (header.op) {
+    case FILED_OP_CLIENT_CREDENTIALS: {
+        if (header.payload_size != sizeof(filed_identity_update_t) || request->fd_count != 2) {
+            status = -22; break;
+        }
+        filed_identity_update_t update;
+        memcpy(&update, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(update));
+        status = filed_client_credentials(runtime, &update);
+        break;
+    }
+    case FILED_OP_CLIENT_REGISTER: {
+        int client_fd = -1;
+        if (header.payload_size != sizeof(filed_identity_t) || request->fd_count != 2) status = -22;
+        else {
+            filed_identity_t identity;
+            memcpy(&identity, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(identity));
+            status = filed_client_create(runtime, &identity, &client_fd, &result);
+        }
+        pacha_service_reply_init(page, &header, status, PACHA_SERVICE_ERROR_FILED_VFS, result, 0);
+        const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_CALL |
+            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER;
+        struct pacha_ipc_fd cap = { .fd = (uint64_t)client_fd, .rights = rights };
+        struct pacha_ipc_msg response = { .word0 = PACHA_SERVICE_REPLY_MAGIC,
+            .word1 = (uint64_t)status, .word2 = result, .word3 = header.request_id,
+            .fds = &cap, .fd_count = status ? 0 : 1 };
+        int sent = pacha_ipc_reply(reply_fd, &response);
+        if (client_fd >= 16) (void)pacha_fd_close(client_fd);
+        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
+        filed_close_received_fds_except(request, -1, -1);
+        return sent;
+    }
     case FILED_OP_HELLO:
         result = PACHA_SERVICE_ABI_VERSION;
         break;
@@ -1172,8 +1247,37 @@ static int filed_dispatch_client(
             status = -22;
             break;
         }
-        void *payload = (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
+        filed_handle_flags_t snapshot;
+        memcpy(&snapshot, (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, sizeof(snapshot));
+        void *payload = &snapshot;
+        status = filed_client_authorize(runtime, header.op, payload, sizeof(snapshot), 0);
+        if (status) {
+            const filed_handle_t *source = NULL;
+            for (uint32_t i = 0; i < runtime->vfs.handle_capacity; ++i) {
+                if (filed_vfs_handle_at(&runtime->vfs, i)->active && filed_vfs_handle_at(&runtime->vfs, i)->id == snapshot.handle) {
+                    source = filed_vfs_handle_at(&runtime->vfs, i);
+                    break;
+                }
+            }
+            fprintf(stderr,
+                "[filed-transfer-diag] stage=authorize source=%llu status=%lld "
+                "client=%llu owner=%llu present=%u\n",
+                (unsigned long long)snapshot.handle, (long long)status,
+                (unsigned long long)(runtime->actor ? runtime->actor->id : 0),
+                (unsigned long long)(source ? source->owner_client : 0),
+                source != NULL);
+            break;
+        }
         const int lease_fd = (int)(uint32_t)request->fds[1].fd;
+        struct pacha_fd_info lease_info;
+        const uint64_t lease_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_RECV |
+            PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+        if (pacha_fd_get_info(lease_fd, &lease_info) != 0 ||
+            lease_info.kind != PACHA_FD_KIND_CHANNEL ||
+            (lease_info.rights & lease_rights) != lease_rights) {
+            status = -22;
+            break;
+        }
         const filed_page_dispatch_result_t dup =
             filed_dispatch_dup_page(runtime, payload);
         status = dup.status;
@@ -1191,6 +1295,10 @@ static int filed_dispatch_client(
                 &runtime->vfs, (filed_handle_id_t)result, lease_fd);
             if (lease_status == FILED_OK) {
                 keep_fd = lease_fd;
+                /* Not usable by number until its lease capability names a recipient. */
+                for (unsigned i = 0; i < runtime->vfs.handle_capacity; i++)
+                    if (filed_vfs_handle_at(&runtime->vfs, i)->active && filed_vfs_handle_at(&runtime->vfs, i)->id == result)
+                        filed_vfs_handle_at(&runtime->vfs, i)->owner_client = 0;
             } else {
                 fprintf(stderr,
                     "[filed-transfer-diag] stage=lease source=%llu duplicate=%llu status=%d leases=%u\n",
@@ -1209,6 +1317,7 @@ static int filed_dispatch_client(
     case FILED_OP_VFS_OPENAT:
     case FILED_OP_VFS_CLOSE:
     case FILED_OP_VFS_STAT:
+    case FILED_OP_VFS_STATAT:
     case FILED_OP_VFS_STATFS:
     case FILED_OP_VFS_READ:
     case FILED_OP_VFS_PREAD:
@@ -1298,7 +1407,7 @@ static int filed_dispatch_client(
     }
     case FILED_OP_SERVICE_SET_NETD_SOCKET:
     case FILED_OP_SERVICE_SET_TERMD_TTY:
-    case FILED_OP_SERVICE_SET_DRMD_DRM:
+    case FILED_OP_SERVICE_SET_GPUD_DRM:
     case FILED_OP_SERVICE_SET_INPUTD_INPUT:
         if (header.payload_size < sizeof(filed_service_endpoint_request_t) ||
             request->fd_count < 3 ||
@@ -1317,16 +1426,19 @@ static int filed_dispatch_client(
                     (void)pacha_fd_close(runtime->termd_tty_endpoint_fd);
                 }
                 runtime->termd_tty_endpoint_fd = endpoint_fd;
+            } else if (header.op == FILED_OP_SERVICE_SET_GPUD_DRM) {
+                if (runtime->gpud_drm_endpoint_fd >= 16) {
+                    (void)pacha_fd_close(runtime->gpud_drm_endpoint_fd);
+                }
+                runtime->gpud_drm_endpoint_fd = endpoint_fd;
             } else if (header.op == FILED_OP_SERVICE_SET_INPUTD_INPUT) {
                 if (runtime->inputd_input_endpoint_fd >= 16) {
                     (void)pacha_fd_close(runtime->inputd_input_endpoint_fd);
                 }
                 runtime->inputd_input_endpoint_fd = endpoint_fd;
             } else {
-                if (runtime->drmd_drm_endpoint_fd >= 16) {
-                    (void)pacha_fd_close(runtime->drmd_drm_endpoint_fd);
-                }
-                runtime->drmd_drm_endpoint_fd = endpoint_fd;
+                status = -22;
+                break;
             }
             keep_fd = endpoint_fd;
             result = (uint64_t)(uint32_t)endpoint_fd;

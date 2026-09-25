@@ -494,9 +494,297 @@ static int64_t lpr_proc_write_mounts(uint64_t fd)
 }
 
 typedef struct lpr_proc_root_entry {
-    const char *name;
+    /* Inline names avoid pointer indirection and keep this small table compact.
+     * Native LPR pointer relocations are applied by FileD before child mapping. */
+    char name[16];
     uint64_t mode;
 } lpr_proc_root_entry_t;
+
+/* /proc/<pid> ------------------------------------------------------------
+ * The supervisor owns process lifetime, so these files report what it knows:
+ * identity, parentage, session, and whether the process has exited without
+ * being reaped.  It does not observe scheduling, so a live process is always
+ * reported as running. */
+
+typedef enum {
+    LPR_PROC_PID_NONE = 0,
+    LPR_PROC_PID_DIR,
+    LPR_PROC_PID_COMM,
+    LPR_PROC_PID_CMDLINE,
+    LPR_PROC_PID_STAT,
+    LPR_PROC_PID_STATUS,
+    LPR_PROC_PID_WCHAN,
+    LPR_PROC_PID_SYSCALL,
+} lpr_proc_pid_kind_t;
+
+/* Splits /proc/<pid>/<leaf> and /proc/self/<leaf>.  Returns 0 for anything
+ * else so the caller can fall through to the other /proc handlers, notably
+ * /proc/self/fd/<n>, which this must not claim. */
+static int lpr_proc_pid_from_path(
+    const char *path,
+    uint64_t *out_pid,
+    const char **out_leaf)
+{
+    static const char prefix[] = "/proc/";
+    const uint64_t prefix_length = (uint64_t)(sizeof(prefix) - 1u);
+    for (uint64_t i = 0; i < prefix_length; ++i) {
+        if (path[i] != prefix[i]) return 0;
+    }
+
+    const char *cursor = path + prefix_length;
+    uint64_t pid = 0;
+    if (cursor[0] == 's' && cursor[1] == 'e' && cursor[2] == 'l' &&
+        cursor[3] == 'f' && (cursor[4] == '\0' || cursor[4] == '/'))
+    {
+        const int64_t own = lpr_linux_getpid();
+        if (own <= 0) return 0;
+        pid = (uint64_t)own;
+        cursor += 4;
+    } else {
+        if (*cursor < '0' || *cursor > '9') return 0;
+        while (*cursor >= '0' && *cursor <= '9') {
+            if (pid > 0x1999999999999999ull) return 0;
+            pid = pid * 10u + (uint64_t)(*cursor - '0');
+            cursor += 1;
+        }
+    }
+    if (*cursor == '/') {
+        cursor += 1;
+    } else if (*cursor != '\0') {
+        return 0;
+    }
+    *out_pid = pid;
+    *out_leaf = cursor;
+    return 1;
+}
+
+static lpr_proc_pid_kind_t lpr_proc_pid_kind(const char *leaf)
+{
+    if (leaf[0] == '\0') return LPR_PROC_PID_DIR;
+    if (lpr_strcmp(leaf, "comm") == 0) return LPR_PROC_PID_COMM;
+    if (lpr_strcmp(leaf, "cmdline") == 0) return LPR_PROC_PID_CMDLINE;
+    if (lpr_strcmp(leaf, "stat") == 0) return LPR_PROC_PID_STAT;
+    if (lpr_strcmp(leaf, "status") == 0) return LPR_PROC_PID_STATUS;
+    if (lpr_strcmp(leaf, "wchan") == 0) return LPR_PROC_PID_WCHAN;
+    if (lpr_strcmp(leaf, "syscall") == 0) return LPR_PROC_PID_SYSCALL;
+    return LPR_PROC_PID_NONE;
+}
+
+int lpr_linux_proc_readlink(
+    const char *path, char *target, uint64_t capacity, int64_t *out_status)
+{
+    uint64_t pid = 0;
+    const char *leaf = 0;
+    if (path == 0 || !lpr_proc_pid_from_path(path, &pid, &leaf) ||
+        lpr_strcmp(leaf, "exe") != 0)
+        return 0;
+
+    lprs_process_query_t info;
+    lpr_memset(&info, 0, sizeof(info));
+    const int status = lpr_supervisor_query_process(pid, &info);
+    if (status != 0) {
+        *out_status = status == -LPR_LINUX_ESRCH ? -LPR_LINUX_ENOENT : status;
+        return 1;
+    }
+    if (info.run_state == LPRS_PROCESS_RUN_STATE_ZOMBIE ||
+        info.cmdline[0] != '/') {
+        *out_status = -LPR_LINUX_ENOENT;
+        return 1;
+    }
+    uint64_t length = lpr_strnlen(info.cmdline, sizeof(info.cmdline));
+    if (length == sizeof(info.cmdline)) {
+        *out_status = -LPR_LINUX_ENAMETOOLONG;
+        return 1;
+    }
+    if (length > capacity) length = capacity;
+    lpr_memcpy(target, info.cmdline, length);
+    *out_status = (int64_t)length;
+    return 1;
+}
+
+/* R for a process running its own code, S for one sitting inside a call, Z
+ * once it has exited without being reaped.  Without a diagnostic sample the
+ * only honest answer is R, since the supervisor cannot see scheduling. */
+static char lpr_proc_pid_state_char(const lprs_process_query_t *info)
+{
+    if (info->run_state == LPRS_PROCESS_RUN_STATE_ZOMBIE) return 'Z';
+    if (info->diag_valid != 0 && info->syscall_nr != LPRS_DIAG_SYSCALL_NONE)
+        return 'S';
+    return 'R';
+}
+
+static const char *lpr_proc_pid_state_text(char state)
+{
+    if (state == 'Z') return "Z (zombie)";
+    if (state == 'S') return "S (sleeping)";
+    return "R (running)";
+}
+
+/* Linux names a kernel function here.  There is no kernel function to name, so
+ * report the call the process is inside, which is what the field is read for. */
+static int64_t lpr_proc_write_pid_wchan(
+    uint64_t fd,
+    const lprs_process_query_t *info)
+{
+    if (info->diag_valid == 0) return lpr_proc_write_string(fd, "0");
+    if (info->syscall_nr == LPRS_DIAG_SYSCALL_NONE)
+        return lpr_proc_write_string(fd, "0");
+    int64_t status = lpr_proc_write_string(fd, "syscall_");
+    if (status == 0) status = lpr_proc_write_u64(fd, info->syscall_nr);
+    return status;
+}
+
+/* Linux prints "nr arg0 ... arg5 sp pc", or "running" outside a call. */
+static int64_t lpr_proc_write_pid_syscall(
+    uint64_t fd,
+    const lprs_process_query_t *info)
+{
+    if (info->diag_valid == 0 || info->syscall_nr == LPRS_DIAG_SYSCALL_NONE) {
+        return lpr_proc_write_string(fd, "running\n");
+    }
+    int64_t status = lpr_proc_write_u64(fd, info->syscall_nr);
+    if (status == 0)
+        status = lpr_proc_write_field_u64(fd, " 0x", info->syscall_arg0, "");
+    if (status == 0)
+        status = lpr_proc_write_field_u64(fd, " 0x", info->syscall_arg1, "");
+    if (status == 0)
+        status = lpr_proc_write_field_u64(
+            fd, " enter_tsc=", info->syscall_enter_tick, "");
+    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+    return status;
+}
+
+static int64_t lpr_proc_write_pid_comm(
+    uint64_t fd,
+    const lprs_process_query_t *info)
+{
+    int64_t status = lpr_proc_write_string(
+        fd, info->comm[0] != '\0' ? info->comm : "unknown");
+    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+    return status;
+}
+
+static int64_t lpr_proc_write_pid_cmdline(
+    uint64_t fd,
+    const lprs_process_query_t *info)
+{
+    /* Linux separates arguments with NUL bytes.  Only the executed path is
+     * recorded, so emit that single entry in the same shape. */
+    if (info->cmdline[0] == '\0') return 0;
+    const uint64_t length = (uint64_t)lpr_strnlen(
+        info->cmdline, sizeof(info->cmdline));
+    const int64_t status = lpr_proc_write_all(fd, info->cmdline, length);
+    if (status != 0) return status;
+    return lpr_proc_write_all(fd, "", 1u);
+}
+
+static int64_t lpr_proc_write_pid_status(
+    uint64_t fd,
+    uint64_t pid,
+    const lprs_process_query_t *info)
+{
+    const char state = lpr_proc_pid_state_char(info);
+    int64_t status = lpr_proc_write_string(fd, "Name:\t");
+    if (status == 0)
+        status = lpr_proc_write_string(
+            fd, info->comm[0] != '\0' ? info->comm : "unknown");
+    if (status == 0) status = lpr_proc_write_string(fd, "\nState:\t");
+    if (status == 0)
+        status = lpr_proc_write_string(fd, lpr_proc_pid_state_text(state));
+    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+    if (status == 0) status = lpr_proc_write_field_u64(fd, "Tgid:\t", pid, "\n");
+    if (status == 0) status = lpr_proc_write_field_u64(fd, "Pid:\t", pid, "\n");
+    if (status == 0)
+        status = lpr_proc_write_field_u64(fd, "PPid:\t", info->ppid, "\n");
+    if (status == 0)
+        status = lpr_proc_write_field_u64(fd, "NSpid:\t", pid, "\n");
+    if (status == 0) status = lpr_proc_write_string(fd, "Threads:\t1\n");
+    return status;
+}
+
+static int64_t lpr_proc_write_pid_stat(
+    uint64_t fd,
+    uint64_t pid,
+    const lprs_process_query_t *info)
+{
+    /* Fields 1..24 of the Linux layout.  Everything the supervisor cannot
+     * observe is reported as zero rather than invented, with the scheduling
+     * constants at their defaults so parsers keep working. */
+    int64_t status = lpr_proc_write_u64(fd, pid);
+    if (status == 0) status = lpr_proc_write_string(fd, " (");
+    if (status == 0)
+        status = lpr_proc_write_string(
+            fd, info->comm[0] != '\0' ? info->comm : "unknown");
+    if (status == 0) status = lpr_proc_write_string(fd, ") ");
+    char state[2] = { lpr_proc_pid_state_char(info), '\0' };
+    if (status == 0) status = lpr_proc_write_string(fd, state);
+    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->ppid, "");
+    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->pgrp, "");
+    if (status == 0) status = lpr_proc_write_field_u64(fd, " ", info->sid, "");
+    /* Fields 7..52.  procps parses a fixed count and fails outright on a short
+     * line, so the row is emitted at full width: tty_nr, tpgid, then zeros for
+     * everything the supervisor cannot observe, with priority 20, nice 0 and a
+     * single thread. */
+    if (status == 0)
+        status = lpr_proc_write_string(
+            fd,
+            " 0 -1 0 0 0 0 0"     /* 7-13  tty_nr tpgid flags minflt cminflt majflt cmajflt */
+            " 0 0 0 0"            /* 14-17 utime stime cutime cstime */
+            " 20 0 1 0 0"         /* 18-22 priority nice num_threads itrealvalue starttime */
+            " 0 0 0"              /* 23-25 vsize rss rsslim */
+            " 0 0 0 0 0 0 0"      /* 26-32 startcode..signal blocked */
+            " 0 0 0 0 0"          /* 33-37 sigignore sigcatch wchan nswap cnswap */
+            " 0 0 0 0 0"          /* 38-42 exit_signal processor rt_priority policy blkio */
+            " 0 0 0"              /* 43-45 guest_time cguest_time start_data */
+            " 0 0 0 0 0 0"        /* 46-51 end_data..env_end */
+            " 0");                /* 52    exit_code */
+    if (status == 0) status = lpr_proc_write_string(fd, "\n");
+    return status;
+}
+
+static int64_t lpr_proc_pid_snapshot_open(
+    const char *path,
+    uint64_t pid,
+    lpr_proc_pid_kind_t kind,
+    uint64_t flags)
+{
+    lprs_process_query_t info;
+    lpr_memset(&info, 0, sizeof(info));
+    const int query_status = lpr_supervisor_query_process(pid, &info);
+    if (query_status != 0) return -LPR_LINUX_ENOENT;
+
+    const int64_t staging_fd = lpr_proc_snapshot_create("proc-pid", flags);
+    if (staging_fd < 0) return staging_fd;
+    int64_t status = 0;
+    switch (kind) {
+    case LPR_PROC_PID_COMM:
+        status = lpr_proc_write_pid_comm((uint64_t)staging_fd, &info);
+        break;
+    case LPR_PROC_PID_CMDLINE:
+        status = lpr_proc_write_pid_cmdline((uint64_t)staging_fd, &info);
+        break;
+    case LPR_PROC_PID_STAT:
+        status = lpr_proc_write_pid_stat((uint64_t)staging_fd, pid, &info);
+        break;
+    case LPR_PROC_PID_STATUS:
+        status = lpr_proc_write_pid_status((uint64_t)staging_fd, pid, &info);
+        break;
+    case LPR_PROC_PID_WCHAN:
+        status = lpr_proc_write_pid_wchan((uint64_t)staging_fd, &info);
+        break;
+    case LPR_PROC_PID_SYSCALL:
+        status = lpr_proc_write_pid_syscall((uint64_t)staging_fd, &info);
+        break;
+    default:
+        status = -LPR_LINUX_ENOENT;
+        break;
+    }
+    if (status != 0) {
+        (void)lpr_linux_close((uint64_t)staging_fd);
+        return status;
+    }
+    return lpr_proc_snapshot_finish((uint64_t)staging_fd, path, flags);
+}
 
 static int lpr_proc_emit_dirent(
     uint8_t *out,
@@ -534,6 +822,7 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
         { "meminfo", LPR_LINUX_S_IFREG },
         { "stat", LPR_LINUX_S_IFREG },
         { "mounts", LPR_LINUX_S_IFREG },
+        { "version", LPR_LINUX_S_IFREG },
         { "sys", LPR_LINUX_S_IFDIR },
         { "overflowuid", LPR_LINUX_S_IFREG },
         { "overflowgid", LPR_LINUX_S_IFREG },
@@ -616,6 +905,7 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         LPR_PROC_MEMINFO,
         LPR_PROC_STAT,
         LPR_PROC_MOUNTS,
+        LPR_PROC_VERSION,
     } kind = LPR_PROC_NONE;
     const char *name = 0;
     if (path == 0) return -LPR_LINUX_EFAULT;
@@ -631,8 +921,22 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
     } else if (lpr_strcmp(path, "/proc/mounts") == 0) {
         kind = LPR_PROC_MOUNTS;
         name = "proc-mounts";
+    } else if (lpr_strcmp(path, "/proc/version") == 0) {
+        kind = LPR_PROC_VERSION;
+        name = "proc-version";
     } else {
-        return -LPR_LINUX_ENOENT;
+        uint64_t pid = 0;
+        const char *leaf = 0;
+        if (!lpr_proc_pid_from_path(path, &pid, &leaf)) {
+            return -LPR_LINUX_ENOENT;
+        }
+        const lpr_proc_pid_kind_t pid_kind = lpr_proc_pid_kind(leaf);
+        /* An unknown leaf must fall through: /proc/self/fd/<n> is served by a
+         * separate handler that runs after this one. */
+        if (pid_kind == LPR_PROC_PID_NONE || pid_kind == LPR_PROC_PID_DIR) {
+            return -LPR_LINUX_ENOENT;
+        }
+        return lpr_proc_pid_snapshot_open(path, pid, pid_kind, flags);
     }
 
     const int64_t staging_fd = lpr_proc_snapshot_create(name, flags);
@@ -650,6 +954,11 @@ int64_t lpr_linux_proc_snapshot_open(const char *path, uint64_t flags)
         break;
     case LPR_PROC_MOUNTS:
         status = lpr_proc_write_mounts((uint64_t)staging_fd);
+        break;
+    case LPR_PROC_VERSION:
+        /* Match the Linux personality's uname identity, not the host kernel. */
+        status = lpr_proc_write_string((uint64_t)staging_fd,
+            "Linux version 6.12.0 (PachaOS Linux shim)\n");
         break;
     default:
         status = -LPR_LINUX_ENOENT;

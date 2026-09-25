@@ -6,6 +6,7 @@ const kernel = @import("../kernel.zig");
 const boot_static = @import("main_static.zig");
 const elf_loader = @import("../elf_loader.zig");
 const user_vm = @import("../memory/user_vm.zig");
+const user_copy = @import("../user_copy.zig");
 const kernel_vm = @import("../memory/kernel_vm.zig");
 const boot_scratch = @import("boot_scratch.zig");
 const log_util = @import("../log_util.zig");
@@ -45,8 +46,10 @@ fn protForLoadPage(loaded: elf_loader.Image, page_index: usize) ?kernel.VmaProt 
 
 pub fn loadUserElfIntoUserPage(user_page_paddr: u64, image_bytes: []const u8) ?elf_loader.Image {
     if ((user_page_paddr & 0xFFF) != 0) return null;
-    const page: [*]u8 = @ptrFromInt(user_page_paddr);
-    return elf_loader.loadToSinglePage(image_bytes, boot_static.user_elf_base_va, page[0..4096]) catch null;
+    var page: [4096]u8 = [_]u8{0} ** 4096;
+    const image = elf_loader.loadToSinglePage(image_bytes, boot_static.user_elf_base_va, &page) catch return null;
+    if (!user_copy.writePhysicalBytes(user_page_paddr, &page)) return null;
+    return image;
 }
 
 pub fn loadUserElfIntoUserPageOrHalt(user_page_paddr: u64, image_bytes: []const u8, fail_message: []const u8) elf_loader.Image {
@@ -99,8 +102,10 @@ pub fn loadUserElfIntoProcessPages(
         log_util.logMessage("loadUserElfIntoProcessPages: invalid page 0 protections");
         return null;
     };
-    const page0: [*]u8 = @ptrFromInt(page0_paddr);
-    @memcpy(page0[0..4096], load_window[0..4096]);
+    if (!user_copy.writePhysicalBytes(page0_paddr, load_window[0..4096])) {
+        log_util.logMessage("loadUserElfIntoProcessPages: write page 0 failed");
+        return null;
+    }
     if (!user_vm.protectPresentUserLinearRegionWithProt(principal, boot_static.user_va, 4096, .{
         .read = page0_prot.read,
         .write = page0_prot.write,
@@ -169,9 +174,12 @@ pub fn loadUserElfIntoProcessPages(
             if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;
         };
-        const page_bytes: [*]u8 = @ptrFromInt(extra_page.paddr);
         const off = page_index * 4096;
-        @memcpy(page_bytes[0..4096], load_window[off .. off + 4096]);
+        if (!user_copy.writePhysicalBytes(extra_page.paddr, load_window[off .. off + 4096])) {
+            log_util.logMessage("loadUserElfIntoProcessPages: write physical page failed");
+            if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
+            return null;
+        }
         const fd = extra_vmo_fd.?;
         _ = state.mmapFd(
             principal,

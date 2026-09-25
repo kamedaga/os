@@ -2,7 +2,7 @@
 set -euo pipefail
 
 apk_path=$(command -v apk)
-if [[ $apk_path != /bin/apk && $apk_path != /usr/bin/apk ]]; then
+if [[ $apk_path != /bin/apk && $apk_path != /sbin/apk && $apk_path != /usr/bin/apk ]]; then
     printf 'APK_SHELL_FAIL stage=path value=%s\n' "${apk_path:-missing}"
     exit 1
 fi
@@ -11,11 +11,11 @@ printf 'APK_SHELL_PATH=%s\n' "$apk_path"
 apk --version
 printf 'APK_SHELL_VERSION=OK\n'
 
-apk --progress=no update
+apk --no-progress update
 printf 'APK_SHELL_UPDATE=OK\n'
 
 if apk info -e nano >/dev/null 2>&1; then
-    apk --progress=no del nano
+    apk --no-progress del nano
 fi
 
 # Exercise apk's real package database, archive extraction, rename, unlink,
@@ -24,11 +24,11 @@ fi
 # local acceptance test into an endurance run.
 apk_iterations=${APK_SHELL_ITERATIONS:-3}
 for iteration in $(seq 1 "$apk_iterations"); do
-    apk --progress=no add nano
+    apk --no-progress add nano
     command -v nano
     printf 'APK_SHELL_NANO_ADD iteration=%s\n' "$iteration"
 
-    apk --progress=no del nano
+    apk --no-progress del nano
     if apk info -e nano >/dev/null 2>&1; then
         printf 'APK_SHELL_FAIL stage=del-nano-still-installed iteration=%s\n' "$iteration"
         exit 1
@@ -42,18 +42,18 @@ for iteration in $(seq 1 "$apk_iterations"); do
 done
 printf 'APK_SHELL_NANO_CYCLES=OK iterations=%s\n' "$apk_iterations"
 
-apk --progress=no add grep
+apk --no-progress add grep
 grep_version=$(grep --version)
 printf '%s\n' "${grep_version%%$'\n'*}"
 printf 'APK_SHELL_ADD_GREP=OK\n'
 
-apk --progress=no add wget
+apk --no-progress add wget
 wget_version=$(wget --version)
 printf '%s\n' "${wget_version%%$'\n'*}"
 test "$(stat -c '%a' /usr/bin/wget)" = 755
 printf 'APK_SHELL_ADD_WGET=OK\n'
 
-apk --progress=no add fastfetch
+apk --no-progress add fastfetch
 fastfetch --version
 test "$(stat -c '%a' /usr/bin/fastfetch)" = 755
 printf 'APK_SHELL_ADD_FASTFETCH=OK\n'

@@ -11,7 +11,10 @@ out="${repo_root}/${out_rel}"
 
 make -C "${src}" config
 make -C "${src}/lib/libuinet" clean
-make -C "${src}/lib/libuinet" PACHAOS_ONLY=1 MK_SSP=no libuinet.a
+# This pinned FreeBSD-derived tree treats every host-compiler warning as an
+# error.  New GCC predefined macros and diagnostics are outside its source
+# contract, so keep the upstream sources untouched and do not promote them.
+make -C "${src}/lib/libuinet" PACHAOS_ONLY=1 MK_SSP=no WERROR= libuinet.a
 
 rm -rf "${out}"
 mkdir -p "${out}/lib" "${out}/include"

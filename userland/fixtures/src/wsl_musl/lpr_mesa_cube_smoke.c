@@ -42,7 +42,12 @@ struct cube_state {
     unsigned completed_sequence;
     unsigned completed_sec;
     unsigned completed_usec;
+    uint64_t final_checksum;
+    GLubyte final_rgba[4];
+    int final_pixels_verified;
 };
+
+static uint64_t monotonic_ns(void);
 
 static int fail(const char *stage, const char *operation)
 {
@@ -320,6 +325,53 @@ static int present_initial(struct cube_state *state)
     return 0;
 }
 
+static int finish_render(struct cube_state *state)
+{
+    enum { SAMPLE_WIDTH = 8, SAMPLE_HEIGHT = 8 };
+    GLubyte pixels[SAMPLE_WIDTH * SAMPLE_HEIGHT * 4];
+    const uint64_t start_ns = monotonic_ns();
+    glFinish();
+    const uint64_t elapsed_ns = monotonic_ns() - start_ns;
+    if (glGetError() != GL_NO_ERROR)
+        return fail("fence", "glFinish");
+    printf("CUBE_FENCE_PASS api=glFinish elapsed_ns=%llu\n",
+        (unsigned long long)elapsed_ns);
+
+    memset(pixels, 0, sizeof(pixels));
+    glReadPixels((GLint)state->mode.hdisplay / 2 - SAMPLE_WIDTH / 2,
+        (GLint)state->mode.vdisplay / 2 - SAMPLE_HEIGHT / 2,
+        SAMPLE_WIDTH, SAMPLE_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    if (glGetError() != GL_NO_ERROR)
+        return fail("pixel-readback", "glReadPixels");
+
+    uint64_t checksum = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < sizeof(pixels); i++) {
+        checksum ^= pixels[i];
+        checksum *= UINT64_C(1099511628211);
+    }
+    for (size_t i = 0; i < SAMPLE_WIDTH * SAMPLE_HEIGHT; i++) {
+        const GLubyte *pixel = pixels + i * 4;
+        if (pixel[0] <= 32 && pixel[1] >= 192 && pixel[2] <= 32)
+            continue;
+        fprintf(stderr,
+            "CUBE_FAIL stage=pixel-readback op=expected-green pixel=%zu rgba=%u,%u,%u,%u checksum=%016llx\n",
+            i, pixel[0], pixel[1], pixel[2], pixel[3],
+            (unsigned long long)checksum);
+        fflush(stderr);
+        return 1;
+    }
+    const GLubyte *center = pixels +
+        ((SAMPLE_HEIGHT / 2 * SAMPLE_WIDTH + SAMPLE_WIDTH / 2) * 4);
+    printf("CUBE_PIXEL_CHECKSUM algorithm=fnv1a64 region=%ux%u rgba=%u,%u,%u,%u value=%016llx\n",
+        SAMPLE_WIDTH, SAMPLE_HEIGHT, center[0], center[1], center[2], center[3],
+        (unsigned long long)checksum);
+    state->final_checksum = checksum;
+    memcpy(state->final_rgba, center, sizeof(state->final_rgba));
+    state->final_pixels_verified = 1;
+    fflush(stdout);
+    return 0;
+}
+
 static int draw_frames(struct cube_state *state, unsigned frames)
 {
     const float half_pi = 1.57079632679f;
@@ -327,6 +379,8 @@ static int draw_frames(struct cube_state *state, unsigned frames)
         const float angle = frames == 1 ? half_pi :
             ((float)(frame - 1u) * half_pi) / (float)(frames - 1u);
         draw_cube(state, angle);
+        if (frame == frames && finish_render(state) != 0)
+            return 1;
         if (glGetError() != GL_NO_ERROR || !eglSwapBuffers(state->display, state->surface))
             return fail("draw", "eglSwapBuffers");
         struct gbm_bo *next = gbm_surface_lock_front_buffer(state->gbm_surface);
@@ -347,6 +401,17 @@ static int draw_frames(struct cube_state *state, unsigned frames)
         if (state->displayed_bo != NULL)
             gbm_surface_release_buffer(state->gbm_surface, state->displayed_bo);
         state->displayed_bo = next;
+        if (frame == frames) {
+            if (!state->final_pixels_verified) {
+                errno = EPROTO;
+                return fail("scanout", "missing-pixel-verification");
+            }
+            printf("CUBE_SCANOUT_PASS frame=%u event=%u rgba=%u,%u,%u,%u checksum=%016llx\n",
+                frame, state->completed_frame,
+                state->final_rgba[0], state->final_rgba[1],
+                state->final_rgba[2], state->final_rgba[3],
+                (unsigned long long)state->final_checksum);
+        }
         if (frame == 1 || frame == frames) {
             printf("CUBE_FRAME_READY frame=%u phase=%s\n",
                 frame, frame == 1 ? "front-red" : "side-green");
@@ -392,7 +457,5 @@ int main(int argc, char **argv)
     fflush(stdout);
     sleep(1);
     close(state.fd);
-    printf("P6_PAGE_DIAG_CUBE_EXIT_CALL\n");
-    fflush(stdout);
     _Exit(EXIT_SUCCESS);
 }

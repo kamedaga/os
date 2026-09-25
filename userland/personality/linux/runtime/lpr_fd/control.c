@@ -1,4 +1,6 @@
 #include "../lpr_filed_internal.h"
+#include "../support/browser_diag.h"
+#include "allocate.h"
 
 #define LPR_BACKEND_SLAB_PAGE_BYTES 4096u
 #define LPR_BACKEND_SLAB_SLOT_BYTES 256u
@@ -138,6 +140,7 @@ uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id)
     case LPR_FD_OPS_PIPE: return sizeof(lpr_pipe_backend_t);
     case LPR_FD_OPS_EVENT: return sizeof(lpr_event_backend_t);
     case LPR_FD_OPS_SOCKET: return sizeof(lpr_socket_backend_t);
+    case LPR_FD_OPS_UNIX: return sizeof(struct lpr_unix_socket);
     case LPR_FD_OPS_EPOLL: return sizeof(lpr_epoll_backend_t);
     case LPR_FD_OPS_DMABUF: return sizeof(lpr_dmabuf_backend_t);
     case LPR_FD_OPS_SYNC_FILE: return sizeof(lpr_sync_file_backend_t);
@@ -259,7 +262,9 @@ int64_t lpr_backend_state_free(void *state, uint64_t state_bytes)
     lpr_memset(state, 0, LPR_BACKEND_SLAB_SLOT_BYTES);
     page->used_bitmap &= ~bit;
     page->used_count--;
-    const int release_page = page->used_count == 0;
+    /* Retain at most the empty head page for the next short-lived backend.
+     * Other empty pages are returned immediately; allocation still zeros slots. */
+    const int release_page = page->used_count == 0 && page != lpr_backend_slab_pages;
     if (release_page) {
         *link = page->next;
         page->magic = 0;
@@ -311,7 +316,7 @@ static void *lpr_backend_state_for_fd(uint64_t fd, uint8_t ops_id)
     void *state = 0;
     lpr_fd_table_lock(&lpr_control_fd_table);
     const lpr_fd_entry_t *entry = &lpr_control_fd_table.entries[fd];
-    if (entry->active && entry->ofd_index < lpr_control_fd_table.ofd_count) {
+    if (entry->active == 1 && entry->ofd_index < lpr_control_fd_table.ofd_count) {
         const lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[entry->ofd_index];
         if (ofd->active && ofd->generation == entry->ofd_generation &&
             lpr_ofd_ops_id(ofd) == ops_id)
@@ -442,7 +447,7 @@ int lpr_runtime_reserved_fd(uint64_t fd)
     return fd == LPR_FILED_ENDPOINT_FD ||
         fd == LPR_NETD_ENDPOINT_FD ||
         fd == LPR_TERMD_TTY_ENDPOINT_FD ||
-        fd == LPR_DRMD_DRM_ENDPOINT_FD ||
+        fd == LPR_GPUD_DRM_ENDPOINT_FD ||
         fd == LPR_INPUTD_INPUT_ENDPOINT_FD ||
         fd == LPR_BOOTSTRAP_FD ||
         fd == LPR_SUPERVISOR_ENDPOINT_FD;
@@ -547,6 +552,27 @@ uint32_t lpr_control_merge_backend_flags(
     return flags;
 }
 
+int lpr_fd_alloc_state(uint8_t ops_id, uint64_t flags,
+    uint64_t offset, const void *record, size_t bytes)
+{
+    if (!record || !bytes || bytes != lpr_backend_state_bytes_for_ops(ops_id))
+        return -LPR_LINUX_EINVAL;
+    void *state = lpr_backend_state_alloc(bytes);
+    if (!state) return -LPR_LINUX_ENOMEM;
+    lpr_memcpy(state, record, bytes);
+    const lpr_fd_install_t install = {
+        .ops_id = ops_id,
+        .fd_flags = lpr_control_fd_flags_from_linux(flags),
+        .access_mode = (uint16_t)(flags & LPR_LINUX_O_ACCMODE),
+        .status_flags = lpr_control_status_flags_from_linux(flags),
+        .rights = lpr_backend_rights(ops_id, flags),
+        .offset = offset, .backend_state = state, .backend_state_bytes = bytes,
+    };
+    const int fd = lpr_fd_alloc_initialized(&install);
+    if (fd < 0) (void)lpr_backend_state_free(state, bytes);
+    return fd;
+}
+
 int lpr_control_install_fd(
     uint64_t fd,
     uint8_t ops_id,
@@ -564,6 +590,7 @@ int lpr_control_install_fd(
     }
     uint16_t existing_flags = 0;
     if (lpr_fd_table_get_fd_flags(&lpr_control_fd_table, (uint32_t)fd, &existing_flags) == 0) {
+        lpr_browser_diag("install-occupied", fd, ops_id, existing_flags);
         return -LPR_LINUX_EMFILE;
     }
     void *state = lpr_backend_state_alloc(state_bytes);
@@ -685,6 +712,7 @@ int lpr_control_install_fd(
         .backend_state_bytes = state_bytes,
     };
     if (lpr_fd_table_install_at(&lpr_control_fd_table, (uint32_t)fd, &install) != 0) {
+        lpr_browser_diag("install-race", fd, ops_id, lpr_fd_table_capacity);
         (void)lpr_backend_state_free(state, state_bytes);
         return -LPR_LINUX_EMFILE;
     }
@@ -693,6 +721,7 @@ int lpr_control_install_fd(
 
 void lpr_control_close_fd(uint64_t fd)
 {
+    lpr_browser_diag("control-close", fd, 0, 0);
     if (fd < lpr_fd_table_capacity) {
         lpr_epoll_before_close(fd);
         lpr_fd_drop_t drop;
@@ -761,6 +790,7 @@ void lpr_control_sync_backend_flags(uint64_t fd)
     case LPR_FD_OPS_EVENT: backend_flags = &((lpr_event_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_PIPE: backend_flags = &((lpr_pipe_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_SOCKET: backend_flags = &((lpr_socket_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_UNIX: backend_flags = &((struct lpr_unix_socket *)pin.state)->flags; break;
     case LPR_FD_OPS_EPOLL: backend_flags = &((lpr_epoll_backend_t *)pin.state)->flags; break;
     default: break;
     }
@@ -795,6 +825,15 @@ int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
     if (ensure_status != 0) {
         return ensure_status;
     }
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) return -LPR_LINUX_EBADF;
+    if (pin.ops_id == LPR_FD_OPS_UNIX) {
+        uint32_t socket_flags = (uint32_t)flags;
+        const int status = lpr_unix_socket_flags(&pin, &socket_flags, 1);
+        lpr_fd_unpin(&pin);
+        return status;
+    }
+    lpr_fd_unpin(&pin);
     if (lpr_fd_table_set_status_flags(
             &lpr_control_fd_table,
             (uint32_t)fd,
@@ -842,6 +881,15 @@ int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
     if (ensure_status != 0) {
         return ensure_status;
     }
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) return -LPR_LINUX_EBADF;
+    if (pin.ops_id == LPR_FD_OPS_UNIX) {
+        uint32_t socket_flags;
+        const int status = lpr_unix_socket_flags(&pin, &socket_flags, 0);
+        lpr_fd_unpin(&pin);
+        return status ? status : (int64_t)socket_flags;
+    }
+    lpr_fd_unpin(&pin);
     uint32_t status_flags = 0;
     if (lpr_fd_table_get_status_flags(&lpr_control_fd_table, (uint32_t)fd, &status_flags) != 0) {
         return -LPR_LINUX_EBADF;
@@ -928,31 +976,23 @@ int lpr_fd_linux_visible_active(uint64_t fd)
 
 int lpr_fd_alloc(uint64_t handle, uint64_t flags)
 {
-    const int fd = lpr_fd_slot_alloc_from(3);
-    if (fd < 0) {
-        return fd;
-    }
-    const int control_status = lpr_control_install_fd(
-        (uint64_t)fd,
-        LPR_FD_OPS_FILED,
-        flags,
-        handle,
-        0);
-    if (control_status != 0) {
-        return control_status;
-    }
-    lpr_filed_backend_t *filed = lpr_filed_backend((uint64_t)fd);
-    if (filed == 0) {
-        lpr_control_close_fd((uint64_t)fd);
-        return -LPR_LINUX_EIO;
-    }
-    filed->active = 1;
-    filed->offset_valid =
-        ((flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) ? 1u : 0u;
-    filed->pread_active = 0;
-    filed->flags = (uint32_t)flags;
-    filed->handle = handle;
-    filed->offset = 0;
+    lpr_filed_backend_t *filed = lpr_backend_state_alloc(sizeof(*filed));
+    if (filed == 0) return -LPR_LINUX_ENOMEM;
+    *filed = (lpr_filed_backend_t){
+        .active = 1,
+        .offset_valid = ((flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) ? 1u : 0u,
+        .flags = (uint32_t)flags, .handle = handle, .lease_fd.raw = -1,
+    };
+    const lpr_fd_install_t install = {
+        .ops_id = LPR_FD_OPS_FILED,
+        .fd_flags = lpr_control_fd_flags_from_linux(flags),
+        .access_mode = (uint16_t)(flags & LPR_LINUX_O_ACCMODE),
+        .status_flags = lpr_control_status_flags_from_linux(flags),
+        .rights = lpr_backend_rights(LPR_FD_OPS_FILED, flags),
+        .backend_state = filed, .backend_state_bytes = sizeof(*filed),
+    };
+    const int fd = lpr_fd_alloc_initialized(&install);
+    if (fd < 0) (void)lpr_backend_state_free(filed, sizeof(*filed));
     return fd;
 }
 
@@ -989,6 +1029,7 @@ int lpr_fd_slot_alloc_from(uint64_t min_fd)
             fd++;
         }
         if (lpr_fd_table_capacity >= LPR_FD_TABLE_MAX_SIZE) {
+            lpr_browser_diag("linux-fd-full", min_fd, fd, lpr_fd_table_capacity);
             return -LPR_LINUX_EMFILE;
         }
     }

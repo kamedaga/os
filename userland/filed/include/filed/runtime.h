@@ -3,21 +3,25 @@
 #include <stdint.h>
 
 #include "filed/bootstrap.h"
+#include "filed/live_bootstrap.h"
 #include "filed/kobox_backend.h"
 #include "filed/tmpfs_internal.h"
 #include "filed/vfs.h"
+#include "filed/identity.h"
 
 enum {
     FILED_RUNTIME_MAX_SESSIONS = 32,
 };
 
 struct filed_dispatch_state;
+struct filed_unix_hold;
 
 typedef struct filed_session {
     int channel_fd;
     int page_fd;
     void *page;
     uint64_t page_size;
+    struct filed_client *client;
     uint8_t active;
 } filed_session_t;
 
@@ -27,11 +31,21 @@ typedef struct filed_runtime {
     filed_kobox_backend_t backend;
     filed_tmpfs_backend_t tmpfs;
     int bootstrap_fd;
+    int live_bootfs_fd;
+    int live_ready_fd;
+    uint64_t live_bootfs_size;
+    uint8_t live_root;
     int client_endpoint_fd;
+    struct filed_client *clients;
+    struct filed_client *actor;
+    uint64_t client_sequence;
+    int unix_path_fd;
+    struct filed_unix_hold *unix_holds;
+    uint64_t unix_hold_sequence;
     int syncer_timer_fd;
     int netd_socket_endpoint_fd;
     int termd_tty_endpoint_fd;
-    int drmd_drm_endpoint_fd;
+    int gpud_drm_endpoint_fd;
     int inputd_input_endpoint_fd;
     filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
     struct filed_dispatch_state *dispatch_state;

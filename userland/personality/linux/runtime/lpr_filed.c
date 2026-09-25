@@ -9,6 +9,7 @@ void *memset(void *dst, int c, size_t n)
 lpr_state_t lpr_state = {
     .thread_count = 1,
     .filed_rpc = {
+        .client_fd = -1,
         .request_id = 0x4c505246494c4501ull,
         .wire_page_fd = -1,
         .session_fd = -1,

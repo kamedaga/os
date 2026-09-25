@@ -32,14 +32,16 @@ int64_t lpr_linux_mremap(
      * unless FIXED is set; do not forward an unspecified register value. */
     const uint64_t target =
         (flags & LPR_LINUX_MREMAP_FIXED) != 0 ? new_address : 0;
-    const int64_t result = lpr_pacha_syscall5(
-        PACHA_VM_SYSCALL_MREMAP,
+    const int64_t result = lpr_drm_native_mremap(
         old_address,
         old_size,
         new_size,
         flags,
         target);
-    return result >= 4096 ? result : pacha_kernel_status_to_errno(result);
+    if (result >= 4096) {
+        return result;
+    }
+    return pacha_kernel_status_to_errno(result);
 }
 
 static uint64_t align_up_page(uint64_t value)

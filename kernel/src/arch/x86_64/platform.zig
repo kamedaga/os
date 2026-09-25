@@ -2,13 +2,17 @@ const std = @import("std");
 const interrupts = @import("../../interrupts.zig");
 const image_range = @import("../../boot/image_range.zig");
 const xstate_format = @import("xstate.zig");
+const physical_layout = @import("physical_layout.zig");
+const cpu_stacks = @import("cpu_stack_layout.zig");
 
-pub const max_cpus: usize = 4;
+// CPU affinity, online membership and TLB shootdown targets use u64 masks.
+// Support their full capacity; exceeding this requires a bitmap ABI redesign.
+pub const max_cpus: usize = cpu_stacks.max_cpus;
 pub const page_entries: usize = 512;
 pub const two_mib: u64 = 2 * 1024 * 1024;
 pub const four_gib: u64 = 4 * 1024 * 1024 * 1024;
 pub const one_tib: u64 = 1024 * 1024 * 1024 * 1024;
-pub const pd_table_count: usize = 16;
+pub const pd_table_count: usize = physical_layout.identity_pdp_entries;
 pub const high_mmio_pml4_index: usize = 1;
 pub const high_mmio_pdp_table_count: usize = page_entries;
 pub const guard_page_bytes: usize = 4096;
@@ -18,8 +22,6 @@ pub const stack_region_raw_bytes: usize = stack_region_bytes + @as(usize, @intCa
 pub const stack_region_chunk_count: usize = stack_region_bytes / @as(usize, @intCast(two_mib));
 pub const ring0_stack_bytes: usize = stack_region_bytes - (2 * guard_page_bytes);
 pub const ist_stack_bytes: usize = 2 * 1024 * 1024;
-const ap_ring0_stack_bytes: usize = 2 * 1024 * 1024;
-const ap_ist_stack_bytes: usize = 256 * 1024;
 const runtime_identity_split_pt_count: usize = 256;
 const high_kernel_pd_table_count: usize = 4;
 const high_kernel_pt_table_count: usize = 128;
@@ -62,6 +64,7 @@ const Tss = packed struct {
 
 pub const TrapTargets = struct {
     divide_error_stub: usize,
+    breakpoint_stub: usize,
     page_fault_stub: usize,
     general_protection_stub: usize,
     double_fault_stub: usize,
@@ -102,9 +105,8 @@ var gdt_tables: [max_cpus][7]u64 align(16) = [_][7]u64{gdt_template} ** max_cpus
 var ring0_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var pf_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
 var df_ist_stack_region_raw: [stack_region_raw_bytes]u8 align(4096) = [_]u8{0} ** stack_region_raw_bytes;
-var ap_ring0_stacks: [max_cpus - 1][ap_ring0_stack_bytes]u8 align(4096) = [_][ap_ring0_stack_bytes]u8{[_]u8{0} ** ap_ring0_stack_bytes} ** (max_cpus - 1);
-var ap_pf_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(4096) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
-var ap_df_ist_stacks: [max_cpus - 1][ap_ist_stack_bytes]u8 align(4096) = [_][ap_ist_stack_bytes]u8{[_]u8{0} ** ap_ist_stack_bytes} ** (max_cpus - 1);
+var ap_stack_backing: [max_cpus - 1]u64 = [_]u64{0} ** (max_cpus - 1);
+var ap_stack_pts: [max_cpus - 1][2][page_entries]u64 align(4096) = std.mem.zeroes([max_cpus - 1][2][page_entries]u64);
 var ring0_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var pf_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
@@ -112,6 +114,7 @@ var runtime_identity_split_pts: [runtime_identity_split_pt_count][page_entries]u
 var runtime_identity_split_pt_used: usize = 0;
 var tss_tables: [max_cpus]Tss = [_]Tss{std.mem.zeroes(Tss)} ** max_cpus;
 var de_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+var bp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var pf_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var gp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var df_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -121,6 +124,7 @@ var np_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var ss_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var timer_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var de_trampoline_entry: usize = 0;
+var bp_trampoline_entry: usize = 0;
 var pf_trampoline_entry: usize = 0;
 var gp_trampoline_entry: usize = 0;
 var df_trampoline_entry: usize = 0;
@@ -167,9 +171,8 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(ring0_stack_region_raw), &ring0_stack_region_raw));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_ist_stack_region_raw), &pf_ist_stack_region_raw));
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_ist_stack_region_raw), &df_ist_stack_region_raw));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_ring0_stacks), &ap_ring0_stacks));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_pf_ist_stacks), &ap_pf_ist_stacks));
-    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_df_ist_stacks), &ap_df_ist_stacks));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_stack_backing), &ap_stack_backing));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(ap_stack_pts), &ap_stack_pts));
     start = minStaticStart(start, staticStorageStart(@TypeOf(ring0_stack_guard_pt), &ring0_stack_guard_pt));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_ist_stack_guard_pt), &pf_ist_stack_guard_pt));
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
@@ -177,6 +180,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     start = minStaticStart(start, staticStorageStart(@TypeOf(tss_tables), &tss_tables));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_page), &de_trampoline_page));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(bp_trampoline_page), &bp_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_trampoline_page), &df_trampoline_page));
@@ -186,6 +190,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(bp_trampoline_entry), &bp_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
@@ -219,9 +224,8 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ring0_stack_region_raw), &ring0_stack_region_raw));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_ist_stack_region_raw), &pf_ist_stack_region_raw));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_ist_stack_region_raw), &df_ist_stack_region_raw));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_ring0_stacks), &ap_ring0_stacks));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_pf_ist_stacks), &ap_pf_ist_stacks));
-    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_df_ist_stacks), &ap_df_ist_stacks));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_stack_backing), &ap_stack_backing));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ap_stack_pts), &ap_stack_pts));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ring0_stack_guard_pt), &ring0_stack_guard_pt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_ist_stack_guard_pt), &pf_ist_stack_guard_pt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
@@ -229,6 +233,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tss_tables), &tss_tables));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_page), &de_trampoline_page));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(bp_trampoline_page), &bp_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_page), &pf_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_page), &gp_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_page), &df_trampoline_page));
@@ -238,6 +243,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ss_trampoline_page), &ss_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(timer_trampoline_page), &timer_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_entry), &de_trampoline_entry));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(bp_trampoline_entry), &bp_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(pf_trampoline_entry), &pf_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(gp_trampoline_entry), &gp_trampoline_entry));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_trampoline_entry), &df_trampoline_entry));
@@ -602,6 +608,7 @@ fn buildCr3SwitchTrampoline(page: *[4096]u8, target: usize) usize {
 
 pub fn installInterruptTrampolines(targets: TrapTargets) void {
     de_trampoline_entry = buildCr3SwitchTrampoline(&de_trampoline_page, targets.divide_error_stub);
+    bp_trampoline_entry = buildCr3SwitchTrampoline(&bp_trampoline_page, targets.breakpoint_stub);
     pf_trampoline_entry = buildCr3SwitchTrampoline(&pf_trampoline_page, targets.page_fault_stub);
     gp_trampoline_entry = buildCr3SwitchTrampoline(&gp_trampoline_page, targets.general_protection_stub);
     df_trampoline_entry = buildCr3SwitchTrampoline(&df_trampoline_page, targets.double_fault_stub);
@@ -612,6 +619,8 @@ pub fn installInterruptTrampolines(targets: TrapTargets) void {
     timer_trampoline_entry = buildCr3SwitchTrampoline(&timer_trampoline_page, targets.timer_interrupt_stub);
     interrupts.clearIdt(&idt);
     interrupts.setIdtEntry(&idt, 0, gdt_kernel_code_selector, de_trampoline_entry, 0x8E);
+    // INT3 is a user-callable trap; hardware saves the following instruction.
+    interrupts.setIdtEntry(&idt, 3, gdt_kernel_code_selector, bp_trampoline_entry, 0xEE);
     interrupts.setIdtEntry(&idt, 6, gdt_kernel_code_selector, ud_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 10, gdt_kernel_code_selector, ts_trampoline_entry, 0x8E);
     interrupts.setIdtEntry(&idt, 11, gdt_kernel_code_selector, np_trampoline_entry, 0x8E);
@@ -696,8 +705,8 @@ fn alignedStackRegion(raw: []u8) []u8 {
 pub fn cpuKernelStackTop(cpu_slot: usize) ?u64 {
     if (cpu_slot == 0) return stackTop(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes);
     if (cpu_slot >= max_cpus) return null;
-    const stack = &ap_ring0_stacks[cpu_slot - 1];
-    return (@intFromPtr(stack) + ap_ring0_stack_bytes) & ~@as(u64, 0xF);
+    if (ap_stack_backing[cpu_slot - 1] == 0) return null;
+    return cpu_stacks.stackBase(cpu_slot, 0).? + cpu_stacks.kernel_bytes;
 }
 
 pub fn cpuSlotForStackPointer(rsp: u64) ?usize {
@@ -718,20 +727,11 @@ pub fn cpuSlotForStackPointer(rsp: u64) ?usize {
 
     var cpu_slot: usize = 1;
     while (cpu_slot < max_cpus) : (cpu_slot += 1) {
-        const ring0_stack = &ap_ring0_stacks[cpu_slot - 1];
-        const ring0_base = @intFromPtr(ring0_stack);
-        const ring0_end = ring0_base + ap_ring0_stack_bytes;
-        if (rsp >= ring0_base and rsp <= ring0_end) return cpu_slot;
-
-        const pf_stack = &ap_pf_ist_stacks[cpu_slot - 1];
-        const pf_base = @intFromPtr(pf_stack);
-        const pf_end = pf_base + ap_ist_stack_bytes;
-        if (rsp >= pf_base and rsp <= pf_end) return cpu_slot;
-
-        const df_stack = &ap_df_ist_stacks[cpu_slot - 1];
-        const df_base = @intFromPtr(df_stack);
-        const df_end = df_base + ap_ist_stack_bytes;
-        if (rsp >= df_base and rsp <= df_end) return cpu_slot;
+        if (ap_stack_backing[cpu_slot - 1] == 0) continue;
+        for (cpu_stacks.sizes, 0..) |bytes, stack| {
+            const base = cpu_stacks.stackBase(cpu_slot, stack).?;
+            if (rsp >= base and rsp <= base + bytes) return cpu_slot;
+        }
     }
     return null;
 }
@@ -739,15 +739,15 @@ pub fn cpuSlotForStackPointer(rsp: u64) ?usize {
 fn cpuPageFaultIstTop(cpu_slot: usize) ?u64 {
     if (cpu_slot == 0) return stackTop(alignedStackRegion(pf_ist_stack_region_raw[0..]), ist_stack_bytes);
     if (cpu_slot >= max_cpus) return null;
-    const stack = &ap_pf_ist_stacks[cpu_slot - 1];
-    return (@intFromPtr(stack) + ap_ist_stack_bytes) & ~@as(u64, 0xF);
+    if (ap_stack_backing[cpu_slot - 1] == 0) return null;
+    return cpu_stacks.stackBase(cpu_slot, 1).? + cpu_stacks.ist_bytes;
 }
 
 fn cpuDoubleFaultIstTop(cpu_slot: usize) ?u64 {
     if (cpu_slot == 0) return stackTop(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes);
     if (cpu_slot >= max_cpus) return null;
-    const stack = &ap_df_ist_stacks[cpu_slot - 1];
-    return (@intFromPtr(stack) + ap_ist_stack_bytes) & ~@as(u64, 0xF);
+    if (ap_stack_backing[cpu_slot - 1] == 0) return null;
+    return cpu_stacks.stackBase(cpu_slot, 2).? + cpu_stacks.ist_bytes;
 }
 
 fn kernelHighMappingActive() bool {
@@ -755,14 +755,7 @@ fn kernelHighMappingActive() bool {
 }
 
 fn kernelVirtToPhys(addr: u64) ?u64 {
-    if (kernelHighMappingActive() and addr >= image_range.virtual_base) {
-        const offset = addr - image_range.virtual_base;
-        if (image_range.size_bytes == 0 or offset < image_range.size_bytes) {
-            return image_range.base_paddr + offset;
-        }
-    }
-    if (addr < four_gib) return addr;
-    return null;
+    return physical_layout.kernelPointerPaddr(addr, image_range.virtual_base, image_range.base_paddr, image_range.size_bytes);
 }
 
 fn kernelPtrPaddr(ptr: anytype) ?u64 {
@@ -853,6 +846,96 @@ fn mapKernelIdentityRange(base: u64, bytes: usize) bool {
     return true;
 }
 
+/// Boot-only: called before APs or user address spaces exist, and before any
+/// access to the firmware-declared MMIO aperture. Change the identity mapping
+/// itself so there is no competing WB alias. Do not use this for live remaps.
+pub fn mapBootMmioIdentityRange(base: u64, bytes: u64) bool {
+    if (bytes == 0 or ((base | bytes) & 4095) != 0 or
+        base < 0x100000 or base >= physical_layout.identity_limit or
+        bytes > physical_layout.identity_limit - base) return false;
+    // PWT=PCD=1, PAT=0 selects PAT entry 3. Do not silently assume firmware
+    // left that entry UC, and do not change the global PAT configuration.
+    if (((readMsr(0x277) >> 24) & 0xff) != 0) return false;
+    const uc_flags = page_present | page_rw | page_nx | (1 << 3) | (1 << 4);
+    const end = base + bytes;
+    var address = base;
+    while (address < end) {
+        const pdp_index: usize = @intCast(address >> 30);
+        const pd_index: usize = @intCast((address >> 21) & 511);
+        const entry = &pd_tables[pdp_index][pd_index];
+        if ((entry.* & page_present) == 0) return false;
+        if ((address & (two_mib - 1)) == 0 and end - address >= two_mib and
+            (entry.* & page_ps) != 0)
+        {
+            if ((entry.* & page_addr_mask & ~(two_mib - 1)) != address) return false;
+            entry.* = address | uc_flags | page_ps;
+            address += two_mib;
+        } else {
+            if (!splitLargeKernelIdentityPage(entry)) return false;
+            const pt: *[page_entries]u64 = @ptrFromInt(entry.* & page_addr_mask);
+            const index: usize = @intCast((address >> 12) & 511);
+            if ((pt[index] & page_addr_mask) != address or (pt[index] & page_present) == 0)
+                return false;
+            pt[index] = address | uc_flags;
+            address += 4096;
+        }
+    }
+    // No other CPU can have accessed this aperture yet. Reload the current
+    // CR3 to discard any local paging-structure translations before use.
+    writeCr3(readCr3());
+    return true;
+}
+
+/// Prove the *current* low identity PTE is explicit UC, rather than trusting
+/// a previous map request. AMD IOMMU register access uses this identity VA;
+/// a failed/partial split must never be mistaken for a safe MMIO mapping.
+pub fn bootIdentityPageIsExplicitUc(page_base: u64) bool {
+    if ((page_base & 4095) != 0 or page_base >= physical_layout.identity_limit) return false;
+    const pdp_index: usize = @intCast(page_base >> 30);
+    const pd_index: usize = @intCast((page_base >> 21) & 511);
+    const entry = pd_tables[pdp_index][pd_index];
+    const required = page_present | page_rw | page_nx | (1 << 3) | (1 << 4);
+    if ((entry & page_present) == 0) return false;
+    if ((entry & page_ps) != 0) {
+        // For a 2 MiB leaf, bit 12 is PAT. The boot UC mapper selects PAT3.
+        return (entry & (required | page_ps)) == (required | page_ps) and
+            (entry & (1 << 12)) == 0 and
+            (entry & page_addr_mask & ~(two_mib - 1)) == (page_base & ~(two_mib - 1));
+    }
+    const pt_base = entry & page_addr_mask;
+    if (pt_base == 0) return false;
+    const pt: *const [page_entries]u64 = @ptrFromInt(pt_base);
+    const leaf = pt[@intCast((page_base >> 12) & 511)];
+    // For a 4 KiB leaf, bit 7 is PAT. Reject it even if PWT/PCD look UC.
+    return (leaf & required) == required and (leaf & page_ps) == 0 and
+        (leaf & page_addr_mask) == page_base;
+}
+
+test "boot MMIO UC proof checks the live identity leaf and physical page" {
+    const base: u64 = 0x0040_0000;
+    const old = pd_tables[0][2];
+    defer pd_tables[0][2] = old;
+    const uc = page_present | page_rw | page_nx | (1 << 3) | (1 << 4);
+    var pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+
+    pd_tables[0][2] = base | page_present | page_rw | page_ps;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base));
+    pd_tables[0][2] = base | uc | page_ps;
+    try std.testing.expect(bootIdentityPageIsExplicitUc(base));
+    pd_tables[0][2] |= 1 << 12;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base));
+
+    pd_tables[0][2] = @intFromPtr(&pt) | page_present | page_rw;
+    pt[0] = base | uc;
+    try std.testing.expect(bootIdentityPageIsExplicitUc(base));
+    pt[1] = (base + 0x2000) | uc;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base + 0x1000));
+    pt[1] = (base + 0x1000) | uc | page_ps;
+    try std.testing.expect(!bootIdentityPageIsExplicitUc(base + 0x1000));
+    pt[1] = (base + 0x1000) | uc;
+    try std.testing.expect(bootIdentityPageIsExplicitUc(base + 0x1000));
+}
+
 fn highKernelPdSlot(first_pdp_index: usize, pdp_index: usize) ?usize {
     if (pdp_index < first_pdp_index) return null;
     const slot = pdp_index - first_pdp_index;
@@ -924,15 +1007,15 @@ fn mapPerCpuKernelStorage() bool {
     if (!mapKernelIdentityRange(@intFromPtr(&phys_copy_window_pt), @sizeOf(@TypeOf(phys_copy_window_pt)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&gdt_tables), @sizeOf(@TypeOf(gdt_tables)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&tss_tables), @sizeOf(@TypeOf(tss_tables)))) return false;
-    if (!mapKernelIdentityRange(@intFromPtr(&ap_ring0_stacks), @sizeOf(@TypeOf(ap_ring0_stacks)))) return false;
-    if (!mapKernelIdentityRange(@intFromPtr(&ap_pf_ist_stacks), @sizeOf(@TypeOf(ap_pf_ist_stacks)))) return false;
-    if (!mapKernelIdentityRange(@intFromPtr(&ap_df_ist_stacks), @sizeOf(@TypeOf(ap_df_ist_stacks)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_stack_backing), @sizeOf(@TypeOf(ap_stack_backing)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&ap_stack_pts), @sizeOf(@TypeOf(ap_stack_pts)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&runtime_identity_split_pts), @sizeOf(@TypeOf(runtime_identity_split_pts)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&runtime_identity_split_pt_used), @sizeOf(@TypeOf(runtime_identity_split_pt_used)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&pf_trampoline_page), @sizeOf(@TypeOf(pf_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&gp_trampoline_page), @sizeOf(@TypeOf(gp_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&df_trampoline_page), @sizeOf(@TypeOf(df_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ud_trampoline_page), @sizeOf(@TypeOf(ud_trampoline_page)))) return false;
+    if (!mapKernelIdentityRange(@intFromPtr(&bp_trampoline_page), @sizeOf(@TypeOf(bp_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ts_trampoline_page), @sizeOf(@TypeOf(ts_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&np_trampoline_page), @sizeOf(@TypeOf(np_trampoline_page)))) return false;
     if (!mapKernelIdentityRange(@intFromPtr(&ss_trampoline_page), @sizeOf(@TypeOf(ss_trampoline_page)))) return false;
@@ -940,8 +1023,45 @@ fn mapPerCpuKernelStorage() bool {
     return true;
 }
 
+// Called on the BSP before AP startup and before user address spaces exist.
+// Backing is lifetime-pinned, but only CPUs actually present consume it.
+pub fn allocateApRuntimeStacks(cpu_slot: usize, free_list: anytype) bool {
+    if (cpu_slot == 0 or cpu_slot >= max_cpus or !kernelHighMappingActive()) return false;
+    if (ap_stack_backing[cpu_slot - 1] != 0) return true;
+    const first_pdp: usize = @intCast((image_range.virtual_base >> 30) & 0x1ff);
+    const stack_pdp: usize = @intCast((cpu_stacks.base >> 30) & 0x1ff);
+    if ((image_range.virtual_base >> 39) != (cpu_stacks.base >> 39)) return false;
+    if (image_range.virtual_base + image_range.size_bytes > cpu_stacks.base) return false;
+    const pd_slot = highKernelPdSlot(first_pdp, stack_pdp) orelse return false;
+    const pd_pa = kernelPtrPaddr(&high_kernel_pd_tables[pd_slot]) orelse return false;
+    const pd_index = (cpu_slot - 1) * 2;
+    const tables = &ap_stack_pts[cpu_slot - 1];
+    const pt0_pa = kernelPtrPaddr(&tables[0]) orelse return false;
+    const pt1_pa = kernelPtrPaddr(&tables[1]) orelse return false;
+    if (high_kernel_pd_tables[pd_slot][pd_index] != 0 or
+        high_kernel_pd_tables[pd_slot][pd_index + 1] != 0) return false;
+    const backing = free_list.popContiguousBelow(cpu_stacks.backing_bytes / 4096, physical_layout.identity_limit) catch return false;
+    const raw: [*]u8 = @ptrFromInt(backing);
+    @memset(raw[0..cpu_stacks.backing_bytes], 0);
+    var phys = backing;
+    for (cpu_stacks.sizes, 0..) |bytes, stack| {
+        var offset = cpu_stacks.offsets[stack];
+        const end = offset + bytes;
+        while (offset < end) : (offset += 4096) {
+            tables[offset / two_mib][(offset / 4096) % page_entries] = phys | page_present | page_rw | page_nx;
+            phys += 4096;
+        }
+    }
+    high_kernel_pd_tables[pd_slot][pd_index] = pt0_pa | page_present | page_rw;
+    high_kernel_pd_tables[pd_slot][pd_index + 1] = pt1_pa | page_present | page_rw;
+    high_kernel_pdp_table[stack_pdp] = pd_pa | page_present | page_rw;
+    ap_stack_backing[cpu_slot - 1] = backing;
+    return true;
+}
+
 pub fn mapCpuRuntimeStacks(cpu_slot: usize) bool {
     if (cpu_slot >= max_cpus) return false;
+    if (cpu_slot != 0) return ap_stack_backing[cpu_slot - 1] != 0;
     if (kernelHighMappingActive()) return true;
     if (cpu_slot == 0) {
         if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(ring0_stack_region_raw[0..]), ring0_stack_bytes), ring0_stack_bytes)) return false;
@@ -949,9 +1069,6 @@ pub fn mapCpuRuntimeStacks(cpu_slot: usize) bool {
         if (!mapKernelIdentityRange(stackBottom(alignedStackRegion(df_ist_stack_region_raw[0..]), ist_stack_bytes), ist_stack_bytes)) return false;
         return true;
     }
-    if (!mapKernelIdentityRange(@intFromPtr(&ap_ring0_stacks[cpu_slot - 1]), ap_ring0_stack_bytes)) return false;
-    if (!mapKernelIdentityRange(@intFromPtr(&ap_pf_ist_stacks[cpu_slot - 1]), ap_ist_stack_bytes)) return false;
-    if (!mapKernelIdentityRange(@intFromPtr(&ap_df_ist_stacks[cpu_slot - 1]), ap_ist_stack_bytes)) return false;
     return true;
 }
 

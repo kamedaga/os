@@ -9,7 +9,6 @@
 enum {
     FILED_TMPFS_NAME_BYTES = STORAGE_NAME_BYTES,
     FILED_TMPFS_PAGE_BYTES = 4096,
-    FILED_TMPFS_MAX_ALLOCATED_PAGES = 4096,
     FILED_TMPFS_MAX_FILE_PAGES = 128 * 1024,
     FILED_TMPFS_MAX_FILE_BYTES = FILED_TMPFS_PAGE_BYTES * FILED_TMPFS_MAX_FILE_PAGES,
 };
@@ -25,6 +24,9 @@ int filed_tmpfs_backend_lookup(filed_tmpfs_backend_t *backend, uint64_t parent_o
 int filed_tmpfs_backend_statx(filed_tmpfs_backend_t *backend, uint64_t object_id, storage_statx_reply_t *out_stat);
 int filed_tmpfs_backend_statfs(filed_tmpfs_backend_t *backend, storage_statfs_reply_t *out_statfs);
 int filed_tmpfs_backend_pread(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, void *buffer, uint64_t length, uint64_t *out_bytes);
+/* Destination must be freshly zero-filled. Holes are deliberately untouched
+ * so importing a sparse file does not fault every page of its shared VMO. */
+int filed_tmpfs_backend_copy_present(filed_tmpfs_backend_t *backend, uint64_t object_id, void *zero_buffer, uint64_t length);
 int filed_tmpfs_backend_pwrite(filed_tmpfs_backend_t *backend, uint64_t object_id, uint64_t offset, const void *buffer, uint64_t length, uint64_t *out_bytes);
 int filed_tmpfs_backend_fsync(filed_tmpfs_backend_t *backend, uint64_t object_id);
 int filed_tmpfs_backend_create(filed_tmpfs_backend_t *backend, uint64_t parent_object_id, const char *name, uint64_t mode, uint64_t *out_object_id);

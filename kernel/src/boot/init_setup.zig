@@ -9,6 +9,7 @@ const init_bootstrap_layout = @import("init_bootstrap_layout.zig");
 const process_factory = @import("process_factory.zig");
 const boot_resources = @import("boot_resources.zig");
 const user_vm = @import("../memory/user_vm.zig");
+const user_copy = @import("../user_copy.zig");
 const halt = @import("../halt.zig");
 
 const init_bootstrap_abi = boot_abi.init_bootstrap_abi;
@@ -17,11 +18,6 @@ const service_registry_abi = boot_abi.service_registry_abi;
 pub const MmioPageWithOffset = struct {
     page_paddr: u64,
     page_offset: u64,
-};
-
-pub const DetectedDeviceBootstrap = struct {
-    descriptor: init_bootstrap_abi.DeviceDescriptor,
-    dma_device: kernel.DmaDeviceId,
 };
 
 pub const BootFsImageSetup = struct {
@@ -43,10 +39,6 @@ fn haltInitBootstrapDescriptor(message: []const u8) noreturn {
     halt.haltWithLabelMessage("init bootstrap descriptor invalid:", message);
 }
 
-fn haltInitDeviceBootstrapError(label: []const u8, step: []const u8, err: anyerror) noreturn {
-    halt.haltWithStepError("init ", label, step, err);
-}
-
 // ---------------------------------------------------------------------------
 // Spawn page descriptor helpers
 // ---------------------------------------------------------------------------
@@ -65,11 +57,6 @@ fn spawnPageMirrorWritable(descriptor: init_bootstrap_abi.SpawnPageDescriptor) b
 
 fn initSpawnPageLabel(_: init_bootstrap_abi.SpawnPageDescriptor) []const u8 {
     return "spawn page";
-}
-
-fn deviceLabel(device: kernel.DmaDeviceId) []const u8 {
-    _ = device;
-    return "device resource";
 }
 
 // ---------------------------------------------------------------------------
@@ -107,11 +94,12 @@ pub fn mapBootFsImageIntoProcessOrHalt(
     while (page_index < page_count) : (page_index += 1) {
         const page = process_factory.allocPageForProcessOrHalt(state, principal, role_label, "bootfs image page", free_list);
         if (first_page_paddr == 0) first_page_paddr = page.paddr;
-        const dst: [*]u8 = @ptrFromInt(page.paddr);
-        @memset(dst[0..4096], 0);
+        // allocPhysicalPage already zeroed the whole page through the window.
         const remaining = image.len - copied;
         const chunk_len: usize = if (remaining > 4096) 4096 else remaining;
-        @memcpy(dst[0..chunk_len], image[copied .. copied + chunk_len]);
+        if (!user_copy.writePhysicalBytes(page.paddr, image[copied .. copied + chunk_len])) {
+            halt.haltWithRolePageMessage(role_label, "bootfs image page", "physical write failed");
+        }
         if (!user_vm.mapUserLinearRegion(
             principal,
             base_va + @as(u64, @intCast(page_index)) * 4096,
@@ -215,16 +203,19 @@ fn publishInitServiceRegistryPage(
 ) void {
     const page = findKernelBackedInitSpawnPage(pages, init_bootstrap_layout.sourceVa(.window_service_config)) orelse
         haltInitBootstrapDescriptor("missing window service config page");
-    service_registry_abi.initPage(page.page.paddr);
+    var bytes: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    service_registry_abi.initPage(@intFromPtr(&bytes));
     for (services) |descriptor| {
         const kind = std.enums.fromInt(service_registry_abi.ServiceKind, descriptor.kind) orelse
             haltInitBootstrapDescriptor("invalid init service descriptor kind");
         service_registry_abi.addService(
-            page.page.paddr,
+            @intFromPtr(&bytes),
             kind,
             descriptor.endpoint_id,
         );
     }
+    if (!user_copy.writePhysicalBytes(page.page.paddr, &bytes))
+        haltInitBootstrapDescriptor("service registry physical write failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -232,39 +223,41 @@ fn publishInitServiceRegistryPage(
 // ---------------------------------------------------------------------------
 
 fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64) void {
-    const page: *volatile init_bootstrap_abi.ConfigPage = @ptrFromInt(user_page_paddr);
+    var bytes: [4096]u8 align(@alignOf(init_bootstrap_abi.ConfigPage)) = [_]u8{0} ** 4096;
+    const page: *init_bootstrap_abi.ConfigPage = @ptrCast(&bytes);
     page.magic = init_bootstrap_abi.config_magic;
     page.version = init_bootstrap_abi.config_version;
     page.descriptor_page_va = descriptor_page_va;
     page.reserved0 = 0;
+    if (!user_copy.writePhysicalBytes(user_page_paddr, &bytes))
+        haltInitBootstrapDescriptor("config physical write failed");
 }
 
 pub fn refreshInitBootLogSnapshot(state: *kernel.KernelState, init_process_principal: kernel.PrincipalId) void {
     _ = state;
     const page_paddr = user_vm.lookupUserMappedPaddrForVa(init_process_principal, init_bootstrap_abi.boot_log_user_page_va) orelse
         haltInitBootstrapDescriptor("missing boot log snapshot page");
-    const page: [*]u8 = @ptrFromInt(page_paddr);
-    @memset(page[0..4096], 0);
+    var page: [4096]u8 = [_]u8{0} ** 4096;
     const copy_len: usize = @min(kernel_log.boot_log_len, init_bootstrap_abi.boot_log_page_payload_bytes);
-    const length_ptr: *volatile u32 = @ptrFromInt(page_paddr + init_bootstrap_abi.boot_log_page_length_offset);
-    const status_ptr: *volatile u32 = @ptrFromInt(page_paddr + init_bootstrap_abi.boot_log_page_status_offset);
-    length_ptr.* = @intCast(copy_len);
-    status_ptr.* = 1;
+    std.mem.writeInt(u32, page[init_bootstrap_abi.boot_log_page_length_offset..][0..4], @intCast(copy_len), .little);
+    std.mem.writeInt(u32, page[init_bootstrap_abi.boot_log_page_status_offset..][0..4], 1, .little);
     if (copy_len != 0) {
         @memcpy(
             page[init_bootstrap_abi.boot_log_page_header_bytes .. init_bootstrap_abi.boot_log_page_header_bytes + copy_len],
             kernel_log.boot_log_buffer[0..copy_len],
         );
     }
+    if (!user_copy.writePhysicalBytes(page_paddr, &page))
+        haltInitBootstrapDescriptor("boot log physical write failed");
 }
 
 pub fn publishInitBootstrapDescriptorPage(
     user_page_paddr: u64,
-    devices: []const ?DetectedDeviceBootstrap,
     bootfs_setup: BootFsImageSetup,
     framebuffer_info: ?boot_resources.FramebufferInfo,
 ) void {
-    const page: *volatile init_bootstrap_abi.DescriptorPage = @ptrFromInt(user_page_paddr);
+    var bytes: [4096]u8 align(@alignOf(init_bootstrap_abi.DescriptorPage)) = [_]u8{0} ** 4096;
+    const page: *init_bootstrap_abi.DescriptorPage = @ptrCast(&bytes);
     page.magic = init_bootstrap_abi.magic;
     page.version = init_bootstrap_abi.version;
     page.spawn_page_count = init_bootstrap_layout.builtin_spawn_pages.len;
@@ -313,115 +306,8 @@ pub fn publishInitBootstrapDescriptorPage(
         page.boot_images[idx] = updated;
     }
 
-    var device_count: usize = 0;
-    while (device_count < init_bootstrap_abi.max_device_descriptors) : (device_count += 1) {
-        page.devices[device_count] = .{
-            .transport = 0,
-            .flags = 0,
-            .bootstrap_source_va = 0,
-            .vendor_id = 0,
-            .device_id = 0,
-            .subsystem_id = 0,
-            .pci_bus = 0,
-            .pci_device = 0,
-            .pci_function = 0,
-            .resource_id = 0,
-            .queue_count = 0,
-            .common_page_paddr = 0,
-            .notify_page_paddr = 0,
-            .isr_page_paddr = 0,
-            .device_page_paddr = 0,
-            .common_page_offset = 0,
-            .notify_page_offset = 0,
-            .isr_page_offset = 0,
-            .device_page_offset = 0,
-            .notify_off_multiplier = 0,
-            .init_iommu_token = 0,
-            .init_queue_grant_count = 0,
-            .init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants,
-            .init_command_token = 0,
-            .init_device_fd = 0,
-        };
-    }
-    device_count = 0;
-    for (devices) |entry| {
-        const device = entry orelse continue;
-        if (device_count >= init_bootstrap_abi.max_device_descriptors) break;
-        var descriptor = device.descriptor;
-        descriptor.flags |= init_bootstrap_abi.device_flag_present;
-        page.devices[device_count] = descriptor;
-        device_count += 1;
-    }
-    page.device_count = device_count;
-}
-
-// ---------------------------------------------------------------------------
-// Generic device bootstrap for init
-// ---------------------------------------------------------------------------
-
-fn grantInitDeviceFdOrHalt(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    device: kernel.DmaDeviceId,
-    label: []const u8,
-    step_label: []const u8,
-) u64 {
-    return state.createDeviceFd(init_process_principal, device, .{
-        .inspect = true,
-        .dup = true,
-        .transfer = true,
-        .set_flags = true,
-        .close = true,
-        .query = true,
-        .config_read = true,
-        .config_write = true,
-        .derive_mmio = true,
-        .derive_dma = true,
-        .derive_irq = true,
-        .mmio_map_read = true,
-        .mmio_map_write = true,
-        .cpu_read = true,
-        .cpu_write = true,
-        .dma_read = true,
-        .dma_write = true,
-        .irq_wait = true,
-        .irq_ack = true,
-        .bus_master = true,
-    }, .{}, 16) catch |err| {
-        haltInitDeviceBootstrapError(label, step_label, err);
-    };
-}
-
-pub fn setupDeviceBootstrapForInit(
-    state: *kernel.KernelState,
-    init_process_principal: kernel.PrincipalId,
-    device: DetectedDeviceBootstrap,
-    free_list: *kernel.FreePageList,
-) DetectedDeviceBootstrap {
-    const label = deviceLabel(device.dma_device);
-    _ = process_factory.allocAndMapOwnedPageForProcessOrHalt(
-        state,
-        init_process_principal,
-        "init",
-        "device bootstrap page",
-        device.descriptor.bootstrap_source_va,
-        true,
-        free_list,
-    );
-    const init_device_fd = grantInitDeviceFdOrHalt(
-        state,
-        init_process_principal,
-        device.dma_device,
-        label,
-        "device fd grant",
-    );
-    var updated = device;
-    updated.descriptor.init_iommu_token = 0;
-    updated.descriptor.init_queue_grant_count = 0;
-    updated.descriptor.init_queue_grants = [_]init_bootstrap_abi.DeviceQueueGrant{.{}} ** init_bootstrap_abi.max_device_queue_grants;
-    updated.descriptor.init_command_token = 0;
-    updated.descriptor.init_device_fd = init_device_fd;
-    return updated;
+    if (!user_copy.writePhysicalBytes(user_page_paddr, &bytes))
+        haltInitBootstrapDescriptor("descriptor physical write failed");
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +317,6 @@ pub fn setupDeviceBootstrapForInit(
 pub fn setupInitBootstrapResources(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
-    devices: []?DetectedDeviceBootstrap,
     bootfs_image: []const u8,
     framebuffer_info: ?boot_resources.FramebufferInfo,
     free_list: *kernel.FreePageList,
@@ -478,14 +363,9 @@ pub fn setupInitBootstrapResources(
         bootfs_image,
         free_list,
     );
-    for (devices) |*entry| {
-        const device = entry.* orelse continue;
-        entry.* = setupDeviceBootstrapForInit(state, init_process_principal, device, free_list);
-    }
     publishInitBootstrapConfigPage(config_page.paddr, init_bootstrap_layout.descriptor_page_va);
     publishInitBootstrapDescriptorPage(
         descriptor_page.paddr,
-        devices,
         bootfs_setup,
         framebuffer_info,
     );

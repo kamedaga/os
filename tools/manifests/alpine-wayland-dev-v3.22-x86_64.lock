@@ -1,0 +1,5 @@
+# Locked Alpine v3.22 packages used only to compile Wayland fixtures.
+# Refresh explicitly with pack/scripts/alpine_packages.py refresh.
+# package-count 2
+main wayland-dev 1.23.1-r3 f1c36a2b5293f9cfac82e43b7f8379b26bec3261b97b34796e35be82832d45a0
+main wayland-protocols 1.44-r0 a1cf9e5f6a0b70e0d914ffa3b84656e92645007d59f7f13acc679e7b8deea47b

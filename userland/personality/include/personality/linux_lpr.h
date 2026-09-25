@@ -27,13 +27,16 @@
 #define LPR_LINUX_SYS_RT_SIGRETURN 15ull
 #define LPR_LINUX_SYS_IOCTL 16ull
 #define LPR_LINUX_SYS_PREAD64 17ull
+#define LPR_LINUX_SYS_PWRITE64 18ull
 #define LPR_LINUX_SYS_READV 19ull
 #define LPR_LINUX_SYS_WRITEV 20ull
 #define LPR_LINUX_SYS_ACCESS 21ull
 #define LPR_LINUX_SYS_PIPE 22ull
 #define LPR_LINUX_SYS_SELECT 23ull
+#define LPR_LINUX_SYS_SCHED_YIELD 24ull
 #define LPR_LINUX_SYS_MREMAP 25ull
 #define LPR_LINUX_SYS_MSYNC 26ull
+#define LPR_LINUX_SYS_MADVISE 28ull
 #define LPR_LINUX_SYS_DUP 32ull
 #define LPR_LINUX_SYS_DUP2 33ull
 #define LPR_LINUX_SYS_NANOSLEEP 35ull
@@ -96,6 +99,10 @@
 #define LPR_LINUX_SYS_GETPPID 110ull
 #define LPR_LINUX_SYS_GETPGRP 111ull
 #define LPR_LINUX_SYS_SETSID 112ull
+#define LPR_LINUX_SYS_SETREUID 113ull
+#define LPR_LINUX_SYS_SETREGID 114ull
+#define LPR_LINUX_SYS_GETGROUPS 115ull
+#define LPR_LINUX_SYS_SETGROUPS 116ull
 #define LPR_LINUX_SYS_SETRESUID 117ull
 #define LPR_LINUX_SYS_GETRESUID 118ull
 #define LPR_LINUX_SYS_SETRESGID 119ull
@@ -111,8 +118,26 @@
 #define LPR_LINUX_SYS_STATFS 137ull
 #define LPR_LINUX_SYS_FSTATFS 138ull
 #define LPR_LINUX_SYS_SETPRIORITY 141ull
+
+/* Extended attributes.  The rootfs image carries no xattr store, so these
+ * report the same "filesystem does not support it" answer Linux gives for a
+ * mount without xattr support.  Leaving them unimplemented instead returns
+ * ENOSYS, which apk reports as a hard error while extracting packages. */
+#define LPR_LINUX_SYS_SETXATTR 188ull
+#define LPR_LINUX_SYS_LSETXATTR 189ull
+#define LPR_LINUX_SYS_FSETXATTR 190ull
+#define LPR_LINUX_SYS_GETXATTR 191ull
+#define LPR_LINUX_SYS_LGETXATTR 192ull
+#define LPR_LINUX_SYS_FGETXATTR 193ull
+#define LPR_LINUX_SYS_LISTXATTR 194ull
+#define LPR_LINUX_SYS_LLISTXATTR 195ull
+#define LPR_LINUX_SYS_FLISTXATTR 196ull
+#define LPR_LINUX_SYS_REMOVEXATTR 197ull
+#define LPR_LINUX_SYS_LREMOVEXATTR 198ull
+#define LPR_LINUX_SYS_FREMOVEXATTR 199ull
 #define LPR_LINUX_SYS_SETRLIMIT 160ull
 #define LPR_LINUX_SYS_SYNC 162ull
+#define LPR_LINUX_SYS_REBOOT 169ull
 #define LPR_LINUX_SYS_ARCH_PRCTL 158ull
 #define LPR_LINUX_SYS_PRCTL 157ull
 #define LPR_LINUX_SYS_GETTID 186ull

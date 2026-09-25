@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
 const capsule = types.capsule;
@@ -143,6 +142,81 @@ const IpcChannelPair = struct {
     b: Fd,
 };
 
+// Failure-only diagnostic, serialized by the kernel state lock. Keep scans
+// and serial output off the successful allocation path and bound the output.
+var channel_full_reports: usize = 0;
+
+pub fn channelDiagnosticStaticEndAddr() usize {
+    return @intFromPtr(&channel_full_reports) + @sizeOf(@TypeOf(channel_full_reports));
+}
+
+fn reportChannelTableFull(self: anytype) void {
+    if (builtin.is_test or channel_full_reports >= 4) return;
+    channel_full_reports += 1;
+    var active: usize = 0;
+    var refs = [_]usize{0} ** 4;
+    var queued: usize = 0;
+    for (&self.ipc_channels) |*slot| {
+        if (!slot.active) continue;
+        active += 1;
+        refs[@min(@as(usize, slot.ref_count), refs.len - 1)] += 1;
+        queued += @as(usize, slot.queues[0].len) + @as(usize, slot.queues[1].len);
+    }
+    var endpoint_objects: usize = 0;
+    var endpoint_refs: u64 = 0;
+    for (&self.fd_objects) |*slot| {
+        if (slot.kind != .channel) continue;
+        endpoint_objects += 1;
+        endpoint_refs += slot.ref_count;
+    }
+    @import("../kernel_log.zig").writeFmt(
+        "ipc: channel-table-full report={} active={} capacity={} refs0={} refs1={} refs2={} refs_other={} queued={} endpoint_objects={} endpoint_refs={}\n",
+        .{ channel_full_reports, active, max_ipc_channels, refs[0], refs[1], refs[2], refs[3], queued, endpoint_objects, endpoint_refs },
+    );
+    // FD counts include aliases and inherited descriptors. Unique channels
+    // distinguish those from independently allocated channel pairs. Rights
+    // counts overlap: one descriptor can contribute to several columns.
+    for (0..self.process_capacity) |process_index| {
+        const desc = self.processDescriptorSlotConst(process_index) orelse continue;
+        if (!desc.active) continue;
+        const principal = processPrincipalFromIndex(process_index) orelse continue;
+        const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
+        var channels = std.StaticBitSet(max_ipc_channels).initEmpty();
+        var counts = struct {
+            fds: usize = 0,
+            send: usize = 0,
+            recv: usize = 0,
+            call: usize = 0,
+            wait: usize = 0,
+            poll: usize = 0,
+            transfer: usize = 0,
+            dup: usize = 0,
+            cloexec: usize = 0,
+            private: usize = 0,
+        }{};
+        for (table.slots()) |entry| {
+            if (entry.object.kind != .channel) continue;
+            const object = self.kernelObjectSlotConst(entry.object) orelse continue;
+            counts.fds += 1;
+            counts.send += @intFromBool(entry.rights.send);
+            counts.recv += @intFromBool(entry.rights.recv);
+            counts.call += @intFromBool(entry.rights.call);
+            counts.wait += @intFromBool(entry.rights.wait);
+            counts.poll += @intFromBool(entry.rights.poll);
+            counts.transfer += @intFromBool(entry.rights.transfer);
+            counts.dup += @intFromBool(entry.rights.dup);
+            counts.cloexec += @intFromBool(entry.flags.cloexec);
+            counts.private += @intFromBool(entry.flags.private);
+            const channel = object.payload.channel.channel;
+            if (self.ipcChannelSlotConst(channel) != null) channels.set(@intCast(channel.index));
+        }
+        @import("../kernel_log.zig").writeFmt(
+            "ipc: channel-owner report={} principal={} label={s} fds={} channels={} send={} recv={} call={} wait={} poll={} transfer={} dup={} cloexec={} private={}\n",
+            .{ channel_full_reports, @intFromEnum(principal), desc.label, counts.fds, channels.count(), counts.send, counts.recv, counts.call, counts.wait, counts.poll, counts.transfer, counts.dup, counts.cloexec, counts.private },
+        );
+    }
+}
+
 pub fn releaseIpcMessage(self: anytype, msg: *IpcMessage) void {
     var i: usize = 0;
     while (i < msg.fd_count and i < max_ipc_message_fds) : (i += 1) {
@@ -260,6 +334,7 @@ pub fn createIpcChannel(self: anytype) KernelError!IpcChannelRef {
         self.next_ipc_channel_scan = (index + 1) % max_ipc_channels;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
+    reportChannelTableFull(self);
     return KernelError.TableFull;
 }
 
@@ -924,8 +999,8 @@ pub fn ipcRecvWakeOwnersForSendFd(
         if (!desc.active) continue;
         const table = self.fdTableForProcessIndexConst(process_index) orelse continue;
         var fd_index: usize = 0;
-        while (fd_index < fd_table_entries) : (fd_index += 1) {
-            const candidate = table.entries[fd_index];
+        while (fd_index < table.slots().len) : (fd_index += 1) {
+            const candidate = table.slots()[fd_index];
             if (candidate.object.isNull()) continue;
             if (!candidate.rights.recv or (!candidate.rights.wait and !candidate.rights.poll)) continue;
             const recv_slot = self.kernelObjectSlotConst(candidate.object) orelse continue;
@@ -955,10 +1030,25 @@ pub fn fdFreeCountFrom(self: anytype, owner: PrincipalId, min_fd: Fd) KernelErro
     const table = try self.fdTableForActiveProcessConst(owner);
     var index = @TypeOf(self.*).fdIndex(min_fd) orelse return KernelError.InvalidState;
     var count: usize = 0;
-    while (index < fd_table_entries) : (index += 1) {
-        if (table.entries[index].isEmpty()) count += 1;
+    while (index < table.slots().len) : (index += 1) {
+        if (table.slots()[index].isEmpty()) count += 1;
     }
     return count;
+}
+
+fn hasReceiveFdCapacity(self: anytype, owner: PrincipalId, min_fd: Fd, needed: usize) KernelError!bool {
+    const table = try self.fdTableForActiveProcessConst(owner);
+    var index = @TypeOf(self.*).fdIndex(min_fd) orelse return KernelError.InvalidState;
+    // Replies commonly carry no FDs. Preserve min_fd validation, but only
+    // inspect as many free slots as this message needs under the state lock.
+    var remaining = needed;
+    if (remaining == 0) return true;
+    while (index < table.slots().len) : (index += 1) {
+        if (!table.slots()[index].isEmpty()) continue;
+        remaining -= 1;
+        if (remaining == 0) return true;
+    }
+    return false;
 }
 
 pub fn validateIpcSendFds(specs: []const IpcSendFd) KernelError!void {
@@ -979,8 +1069,8 @@ pub fn appendIpcSendFd(
 ) KernelError!void {
     if (msg.fd_count >= max_ipc_message_fds) return KernelError.InvalidState;
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(spec.fd) orelse return KernelError.InvalidState;
-    const source = table.entries[index];
+    const index = table.index(spec.fd) orelse return KernelError.InvalidState;
+    const source = table.slots()[index];
     if (source.object.isNull()) return KernelError.InvalidState;
     if (!source.rights.transfer) return KernelError.InvalidState;
     if (!isFdRightsSubset(spec.rights, source.rights)) return KernelError.InvalidState;
@@ -1037,8 +1127,8 @@ pub fn enqueueIpcMessage(
     free_list: *FreePageList,
 ) KernelError!void {
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const entry = table.entries[index];
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const entry = table.slots()[index];
     if (entry.object.isNull()) return KernelError.InvalidState;
     if (require_call) {
         if (!entry.rights.call) return KernelError.InvalidState;
@@ -1108,8 +1198,8 @@ pub fn ipcCall(
     msg.fd_count += 1;
 
     const table = try self.fdTableForActiveProcessConst(owner);
-    const index = @TypeOf(self.*).fdIndex(fd) orelse return KernelError.InvalidState;
-    const entry = table.entries[index];
+    const index = table.index(fd) orelse return KernelError.InvalidState;
+    const entry = table.slots()[index];
     if (entry.object.isNull() or !entry.rights.call) return KernelError.InvalidState;
     const queue = try self.ipcMessageQueueForSend(entry.object);
     try queue.push(msg);
@@ -1133,7 +1223,7 @@ pub fn ipcRecv(
     const queue = try self.ipcMessageQueueForRecv(entry.object);
     const pending = queue.peek() orelse return KernelError.MailboxEmpty;
     if (pending.fd_count > fd_capacity) return KernelError.TableFull;
-    if (try self.fdFreeCountFrom(owner, min_fd) < pending.fd_count) return KernelError.TableFull;
+    if (!try hasReceiveFdCapacity(self, owner, min_fd, pending.fd_count)) return KernelError.TableFull;
 
     var installed: [max_ipc_message_fds]Fd = [_]Fd{0} ** max_ipc_message_fds;
     var installed_count: usize = 0;

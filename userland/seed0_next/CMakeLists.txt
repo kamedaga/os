@@ -17,6 +17,7 @@ add_custom_command(
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

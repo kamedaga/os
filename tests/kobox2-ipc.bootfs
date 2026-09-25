@@ -1,0 +1,3 @@
+/tests/kobox2-ipc-child.elf=../.artifacts/tests/native-kobox2-ipc/child.elf
+/tests/package-core.so=../.artifacts/gpud-production-runtime/linux-boot-runtime.so
+/tests/package-module.ko=../.artifacts/kobox2-pacha-device-modules/drivers/gpu/drm/drm_panel_orientation_quirks.ko

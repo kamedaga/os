@@ -8,6 +8,7 @@
 #include <pacha/bootstrap.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 int main(int argc, char **argv)
@@ -70,6 +71,11 @@ int main(int argc, char **argv)
         return 1;
     }
     if (ready_status != 0) {
+        fprintf(stderr,
+            "[termd] startup failed status=%d load=%d init=%d devpts=%d modules=%u/%u\n",
+            ready_status, tty_island.load_status, tty_island.init_status,
+            tty_island.devpts_status, tty_island.loaded_module_count,
+            tty_island.configured_module_count);
         return 1;
     }
 
@@ -99,7 +105,10 @@ int main(int argc, char **argv)
         } else {
             termd_service_forward_pending_tty_signals(&service);
         }
-        (void)termd_linux_tty_island_reap_hangups(&tty_island);
+        /* Reaping a slave lease can make its master readable/HUP. Publish
+         * that transition before sleeping, even if no new IPC arrives. */
+        if (termd_linux_tty_island_reap_hangups(&tty_island) > 0)
+            termd_linux_tty_island_pump(&tty_island);
         if (status == PACHA_ERR_EMPTY || status == PACHA_ERR_NOT_READY) {
             static struct pacha_service_wait_set wait_set;
             static int notify_fds[PACHA_SERVICE_WAIT_MAX_FDS];
@@ -129,7 +138,8 @@ int main(int argc, char **argv)
                 pacha_trace_name_id("wait"),
                 notify_count,
                 (uint64_t)wait_status);
-            (void)termd_linux_tty_island_reap_hangups(&tty_island);
+            if (termd_linux_tty_island_reap_hangups(&tty_island) > 0)
+                termd_linux_tty_island_pump(&tty_island);
         }
     }
 }

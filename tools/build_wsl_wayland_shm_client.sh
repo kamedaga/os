@@ -6,12 +6,13 @@ out="${1:-.artifacts/userland-fixtures/lpr_wayland_shm_client.elf}"
 src="${repo_root}/userland/fixtures/src/wsl_musl/lpr_wayland_shm_client.c"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 mesa_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-root"
-sway_root="${repo_root}/.artifacts/userland-fixtures/alpine-sway-root"
-sway_dev="${repo_root}/.artifacts/userland-fixtures/alpine-sway-dev-root"
+runtime_root="${repo_root}/.artifacts/userland-fixtures/alpine-xfce-root"
+wayland_dev="${repo_root}/.artifacts/userland-fixtures/alpine-wayland-dev-root"
 runtime_libc="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 cc="${PACHAOS_HOST_CLANG:-/usr/bin/clang}"
 
-[[ -d "${sway_root}" && -d "${sway_dev}" ]] || bash "${repo_root}/tools/build_wsl_alpine_sway.sh"
+[[ -d "${runtime_root}" ]] || bash "${repo_root}/tools/build_wsl_alpine_xfce.sh"
+[[ -d "${wayland_dev}" ]] || bash "${repo_root}/pack/scripts/fetch_alpine_wayland_dev.sh"
 [[ -e "${runtime_libc}" ]] || bash "${repo_root}/tools/copy_lpr_linux_musl.sh" ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 
 work="${repo_root}/.artifacts/userland-fixtures/wayland-shm-client-build"
@@ -22,7 +23,7 @@ mkdir -p "${host_libs}" "${generated}"
 
 link_runtime_library() {
   local name="$1" target
-  target="$(find "${clang_root}/usr/lib" "${mesa_root}/usr/lib" "${sway_root}/usr/lib" \
+  target="$(find "${clang_root}/usr/lib" "${mesa_root}/usr/lib" "${runtime_root}/usr/lib" \
     -maxdepth 1 -type f -name "${name}.*" | sort | tail -n 1)"
   [[ -n "${target}" ]] || { echo "missing host scanner library ${name}" >&2; exit 1; }
   ln -sf "${target}" "${host_libs}/${name}"
@@ -31,8 +32,8 @@ for name in libexpat.so.1 libxml2.so.2 libz.so.1 liblzma.so.5; do
   link_runtime_library "${name}"
 done
 
-scanner="${sway_dev}/usr/bin/wayland-scanner"
-protocol="${sway_dev}/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml"
+scanner="${wayland_dev}/usr/bin/wayland-scanner"
+protocol="${wayland_dev}/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml"
 LD_LIBRARY_PATH="${host_libs}" "${scanner}" client-header "${protocol}" "${generated}/xdg-shell-client-protocol.h"
 LD_LIBRARY_PATH="${host_libs}" "${scanner}" private-code "${protocol}" "${generated}/xdg-shell-protocol.c"
 
@@ -40,10 +41,10 @@ out_abs="${repo_root}/${out}"
 client_obj="${work}/client.o"
 protocol_obj="${work}/protocol.o"
 mkdir -p "$(dirname "${out_abs}")"
-common=(-target x86_64-linux-musl --sysroot="${clang_root}" -isystem "${sway_dev}/usr/include" -I"${generated}" -std=c11 -O2 -fPIC)
+common=(-target x86_64-linux-musl --sysroot="${clang_root}" -isystem "${wayland_dev}/usr/include" -I"${generated}" -std=c11 -O2 -fPIC)
 "${cc}" "${common[@]}" -c "${src}" -o "${client_obj}"
 "${cc}" "${common[@]}" -c "${generated}/xdg-shell-protocol.c" -o "${protocol_obj}"
-wayland_client="$(find "${mesa_root}/usr/lib" "${sway_root}/usr/lib" -maxdepth 1 -type f -name 'libwayland-client.so.*.*' | sort | tail -n 1)"
+wayland_client="$(find "${mesa_root}/usr/lib" "${runtime_root}/usr/lib" -maxdepth 1 -type f -name 'libwayland-client.so.*.*' | sort | tail -n 1)"
 [[ -n "${wayland_client}" ]] || { echo "missing Wayland client library" >&2; exit 1; }
 "${cc}" -target x86_64-linux-musl --sysroot="${clang_root}" -nostdlib \
   "${clang_root}/usr/lib/Scrt1.o" "${clang_root}/usr/lib/crti.o" \

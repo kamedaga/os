@@ -2,7 +2,6 @@
 
 #include "libuinet_backend.h"
 #include "netlink_socket.h"
-#include "unix_socket.h"
 #include "netd/ipc_protocol.h"
 #include "pacha/ipc.h"
 #include "pacha/trace.h"
@@ -42,7 +41,6 @@ struct netd_page_attachment {
     struct netd_page_attachment *next;
     uint64_t id;
     uint64_t wait_index;
-    int page_fd;
     int lease_fd;
     void *page;
 };
@@ -51,22 +49,37 @@ static struct netd_page_attachment *g_netd_page_attachments;
 static uint64_t g_netd_page_attachment_next = 1;
 static uint64_t g_netd_page_attachment_count;
 
+/* The current native descriptor window is 16..255 (also used by bootstrap).
+ * Check only requests that can retain received capabilities, not every data
+ * RPC. Leave room for a whole native message, including malformed requests,
+ * so resource pressure can never block CLOSE behind an unreceivable head.
+ * Backends retain received FDs; they do not allocate persistent native FDs
+ * during dispatch. Reply/SCM_RIGHTS sends MOVE existing descriptors.
+ */
+static int netd_socket_admit_fds(uint64_t received, uint64_t retained)
+{
+    if (retained == 0) return 0;
+    if (retained > received) return -22;
+    uint64_t available = received - retained;
+    for (int fd = 16; fd < 256 && available < PACHA_IPC_MAX_TRANSFER_FDS; ++fd) {
+        struct pacha_fd_info info;
+        if (pacha_fd_get_info(fd, &info) != 0) ++available;
+    }
+    return available >= PACHA_IPC_MAX_TRANSFER_FDS ? 0 : -24;
+}
+
 static int netd_socket_handle_dup(uint64_t handle)
 {
     return netd_netlink_socket_is_handle(handle) ?
         netd_netlink_socket_dup(handle) :
-        netd_unix_socket_is_handle(handle) ?
-            netd_unix_socket_dup(handle) :
-            netd_libuinet_socket_dup(handle);
+        netd_libuinet_socket_dup(handle);
 }
 
 static int netd_socket_handle_close(uint64_t handle)
 {
     return netd_netlink_socket_is_handle(handle) ?
         netd_netlink_socket_close(handle) :
-        netd_unix_socket_is_handle(handle) ?
-            netd_unix_socket_close(handle) :
-            netd_libuinet_socket_close(handle);
+        netd_libuinet_socket_close(handle);
 }
 
 static void netd_socket_transfer_lease_destroy(
@@ -173,6 +186,19 @@ static int netd_socket_send_reply(
     return reply_status;
 }
 
+static int netd_socket_reject_request(
+    const struct pacha_ipc_msg *request,
+    const struct pacha_ipc_fd *fds,
+    int status)
+{
+    for (uint64_t i = 0; i + 1 < request->fd_count; ++i)
+        if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
+    g_netd_socket_errors++;
+    return netd_socket_send_reply(request->word1,
+        (int)fds[request->fd_count - 1].fd, request->word3,
+        status, 0, NULL, 0);
+}
+
 static void *netd_socket_map_page(int page_fd)
 {
     if (page_fd < 16) {
@@ -205,8 +231,6 @@ static void netd_page_attachment_destroy(
     if (attachment == NULL) return;
     if (attachment->page != NULL)
         (void)pacha_munmap(attachment->page, NETD_PAGE_BYTES);
-    if (attachment->page_fd >= 16)
-        (void)pacha_fd_close(attachment->page_fd);
     if (attachment->lease_fd >= 16)
         (void)pacha_fd_close(attachment->lease_fd);
     free(attachment);
@@ -256,7 +280,9 @@ static int netd_page_attachment_add(
     }
 
     attachment->id = id;
-    attachment->page_fd = page_fd;
+    /* The shared mapping retains the VMO. Keeping its descriptor as well
+     * consumes the slots needed to receive new IPC requests during a fork. */
+    (void)pacha_fd_close(page_fd);
     attachment->lease_fd = lease_fd;
     attachment->page = page;
     attachment->next = g_netd_page_attachments;
@@ -288,12 +314,6 @@ static int netd_socket_dispatch(
             return -22;
         }
         const netd_socket_t *req = (const netd_socket_t *)page;
-        if (req->domain == NETD_AF_UNIX) {
-            return netd_unix_socket_open(
-                req->type, req->protocol,
-                transferred_count == 1 ? transferred_fds[0] : -1,
-                out_result);
-        }
         if (req->domain == NETD_AF_NETLINK) {
             return netd_netlink_socket_open(
                 req->type, req->protocol,
@@ -305,28 +325,12 @@ static int netd_socket_dispatch(
             transferred_count == 1 ? transferred_fds[0] : -1,
             out_result);
     }
-    case NETD_OP_SOCKETPAIR: {
-        if (page == NULL || transferred_count != 2) {
-            return -22;
-        }
-        netd_socket_pair_t *req = (netd_socket_pair_t *)page;
-        if (req->domain != NETD_AF_UNIX) {
-            return -97;
-        }
-        return netd_unix_socket_pair(
-            req->type, req->protocol,
-            transferred_fds[0], transferred_fds[1],
-            req->handles);
-    }
     case NETD_OP_CONNECT: {
         if (page == NULL) {
             return -22;
         }
         const netd_connect_t *req = (const netd_connect_t *)page;
         *out_result = 0;
-        if (netd_unix_socket_is_handle(req->handle)) {
-            return netd_unix_socket_connect((const netd_unix_path_t *)page);
-        }
         return netd_libuinet_socket_connect(req->handle, req->addr.addr_be, req->addr.port_be, req->flags);
     }
     case NETD_OP_SEND: {
@@ -339,8 +343,7 @@ static int netd_socket_dispatch(
         }
         size_t sent = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ? -95 :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_send(
-                req, transferred_fds, transferred_count, &sent) : netd_libuinet_socket_send(
+            netd_libuinet_socket_send(
             req->handle,
             req->data,
             (size_t)req->length,
@@ -363,10 +366,9 @@ static int netd_socket_dispatch(
         size_t received = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
             netd_netlink_socket_recv(req, capacity, &received) :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_recv(
-                req, capacity, out_reply_fds,
-                NETD_TRANSFER_MAX_CAPABILITIES, out_reply_count, &received) :
-            netd_libuinet_socket_recv(req->handle, req->data, capacity, req->flags, &received);
+            netd_libuinet_socket_recv(req->handle, req->data, capacity,
+                req->flags, &received, &req->addr.addr_be,
+                &req->addr.port_be);
         req->length = received;
         *out_result = received;
         return status;
@@ -380,7 +382,6 @@ static int netd_socket_dispatch(
         int32_t error = 0;
         int status = netd_netlink_socket_is_handle(req->handle) ?
             netd_netlink_socket_poll(req->handle, req->events, &revents, &error) :
-            netd_unix_socket_is_handle(req->handle) ? netd_unix_socket_poll(req->handle, req->events, &revents, &error) :
             netd_libuinet_socket_poll(req->handle, req->events, &revents, &error);
         req->revents = revents;
         req->error = error;
@@ -404,28 +405,29 @@ static int netd_socket_dispatch(
         }
     case NETD_OP_BIND:
         if (page == NULL) return -22;
-        return netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle) ?
-            netd_netlink_socket_bind((const netd_netlink_bind_t *)page) :
-            netd_unix_socket_bind((const netd_unix_path_t *)page);
-    case NETD_OP_LISTEN:
-        if (page == NULL) return -22;
-        return netd_unix_socket_listen((const netd_listen_t *)page);
-    case NETD_OP_ACCEPT:
-        if (page == NULL) return -22;
+        if (netd_netlink_socket_is_handle(((const netd_netlink_bind_t *)page)->handle))
+            return netd_netlink_socket_bind((const netd_netlink_bind_t *)page);
         {
-            netd_accept_t *req = (netd_accept_t *)page;
-            const int status = netd_unix_socket_accept(req);
-            *out_result = status == 0 ? req->accepted_handle : 0;
-            return status;
+            netd_inet_bind_t *req = (netd_inet_bind_t *)page;
+            *out_result = 0;
+            return netd_libuinet_socket_bind(req->handle,
+                req->addr.addr_be, req->addr.port_be, req->reuseaddr != 0,
+                &req->addr.addr_be, &req->addr.port_be);
         }
-    case NETD_OP_ATTACH_WAIT:
+    case NETD_OP_LISTEN: {
         if (page == NULL) return -22;
-        return netd_unix_socket_attach_wait(
-            ((const netd_accept_t *)page)->handle,
-            transferred_count == 1 ? transferred_fds[0] : -1);
-    case NETD_OP_UNIX_NAME:
-        if (page == NULL) return -22;
-        return netd_unix_socket_name((netd_unix_name_t *)page);
+        const netd_listen_t *req = (const netd_listen_t *)page;
+        *out_result = 0;
+        return netd_libuinet_socket_listen(req->handle, req->backlog);
+    }
+    case NETD_OP_ACCEPT: {
+        if (page == NULL || transferred_count != 1) return -22;
+        netd_accept_t *req = (netd_accept_t *)page;
+        *out_result = 0;
+        return netd_libuinet_socket_accept(req->handle, transferred_fds[0],
+            out_result, &req->peer.addr_be, &req->peer.port_be,
+            &req->local.addr_be, &req->local.port_be);
+    }
     case NETD_OP_UEVENT_PUBLISH:
         {
             const uint64_t device = *out_result;
@@ -445,21 +447,23 @@ static int netd_socket_dispatch_request(
         return -22;
     }
     if (request->fd_count < 1 || fds == NULL || fds[request->fd_count - 1].fd < 16) {
+        for (uint64_t i = 0; fds != NULL && i < request->fd_count; ++i)
+            if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
         return -22;
     }
 
     const int reply_fd = (int)fds[request->fd_count - 1].fd;
     if (request->word0 != PACHA_SERVICE_REQUEST_MAGIC || request->word3 == 0) {
-        return netd_socket_send_reply(request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+        return netd_socket_reject_request(request, fds, -22);
     }
 
     if (request->word1 == NETD_OP_PAGE_ATTACH) {
         if (request->fd_count != 3 || fds[0].fd < 16 || fds[1].fd < 16) {
-            for (uint64_t i = 0; i + 1 < request->fd_count; ++i)
-                if (fds[i].fd >= 16) (void)pacha_fd_close((int)fds[i].fd);
-            return netd_socket_send_reply(
-                request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+            return netd_socket_reject_request(request, fds, -22);
         }
+        const int admission = netd_socket_admit_fds(request->fd_count, 1);
+        if (admission != 0)
+            return netd_socket_reject_request(request, fds, admission);
         const int page_fd = (int)fds[0].fd;
         const int lease_fd = (int)fds[1].fd;
         uint64_t attachment_id = 0;
@@ -482,7 +486,6 @@ static int netd_socket_dispatch_request(
 
     const int op_uses_page =
         request->word1 == NETD_OP_SOCKET ||
-        request->word1 == NETD_OP_SOCKETPAIR ||
         request->word1 == NETD_OP_CONNECT ||
         request->word1 == NETD_OP_SEND ||
         request->word1 == NETD_OP_RECV ||
@@ -490,8 +493,7 @@ static int netd_socket_dispatch_request(
         request->word1 == NETD_OP_BIND ||
         request->word1 == NETD_OP_LISTEN ||
         request->word1 == NETD_OP_ACCEPT ||
-        request->word1 == NETD_OP_ATTACH_WAIT ||
-        request->word1 == NETD_OP_UNIX_NAME;
+        0;
     struct netd_page_attachment *attachment = op_uses_page ?
         netd_page_attachment_find(request->word2) : NULL;
     if (op_uses_page && attachment == NULL) {
@@ -512,8 +514,7 @@ static int netd_socket_dispatch_request(
     memset(transferred_fds, 0xff, sizeof(transferred_fds));
     const uint64_t transferred_count64 = request->fd_count - 1u;
     if (transferred_count64 > NETD_TRANSFER_MAX_CAPABILITIES) {
-        return netd_socket_send_reply(
-            request->word1, reply_fd, request->word3, -22, 0, NULL, 0);
+        return netd_socket_reject_request(request, fds, -22);
     }
     const uint32_t transferred_count = (uint32_t)transferred_count64;
     for (uint32_t i = 0; i < transferred_count; ++i)
@@ -522,44 +523,20 @@ static int netd_socket_dispatch_request(
     void *const page = attachment != NULL ? attachment->page : NULL;
     if (page != NULL) __atomic_thread_fence(__ATOMIC_ACQUIRE);
 
-#if NETD_DBUS_DIAG
-    const uint64_t diag_handle = page != NULL &&
-        (request->word1 == NETD_OP_SEND ||
-         request->word1 == NETD_OP_RECV ||
-         request->word1 == NETD_OP_POLL) ?
-        ((const netd_io_t *)page)->handle : 0;
-    const int diag_dbus = netd_unix_socket_is_handle(diag_handle) &&
-        netd_unix_socket_diag_dbus(diag_handle);
-    if (diag_dbus) {
-        printf("[netd-dbus-rpc] phase=dispatch-enter id=%llu op=%llu handle=%llu reply_fd=%d\n",
-            (unsigned long long)request->word3,
-            (unsigned long long)request->word1,
-            (unsigned long long)diag_handle,
-            reply_fd);
-    }
-#endif
 
-    const int send_has_transfer = request->word1 == NETD_OP_SEND && page != NULL &&
-        netd_unix_socket_is_handle(((const netd_io_t *)page)->handle) &&
-        ((const netd_io_t *)page)->transfer_count != 0;
+    const int may_retain = request->word1 == NETD_OP_SOCKET ||
+        request->word1 == NETD_OP_ACCEPT || request->word1 == NETD_OP_DUP;
+    const int admission = netd_socket_admit_fds(request->fd_count,
+        may_retain ? transferred_count : 0);
+    if (admission != 0)
+        return netd_socket_reject_request(request, fds, admission);
     uint64_t result = op_uses_page ? 0 : request->word2;
     int reply_transfer_fds[NETD_TRANSFER_MAX_CAPABILITIES];
     uint32_t reply_transfer_count = 0;
     memset(reply_transfer_fds, 0xff, sizeof(reply_transfer_fds));
-    netd_unix_socket_set_notifications_deferred(1);
     const int status = netd_socket_dispatch(
         request->word1, page, transferred_fds, transferred_count, &result,
         reply_transfer_fds, &reply_transfer_count);
-#if NETD_DBUS_DIAG
-    if (diag_dbus) {
-        printf("[netd-dbus-rpc] phase=dispatch-exit id=%llu op=%llu handle=%llu status=%d result=%llu\n",
-            (unsigned long long)request->word3,
-            (unsigned long long)request->word1,
-            (unsigned long long)diag_handle,
-            status,
-            (unsigned long long)result);
-    }
-#endif
     if (page != NULL) __atomic_thread_fence(__ATOMIC_RELEASE);
     if (g_netd_socket_trace) {
         netd_socket_trace_data_op(request->word1, status, result);
@@ -577,10 +554,8 @@ static int netd_socket_dispatch_request(
     const int transfer_retained = status == 0 &&
         ((request->word1 == NETD_OP_SOCKET &&
             result != 0) ||
-         request->word1 == NETD_OP_SOCKETPAIR ||
-         request->word1 == NETD_OP_ATTACH_WAIT ||
-         (request->word1 == NETD_OP_DUP && transferred_count == 1) ||
-         send_has_transfer);
+         (request->word1 == NETD_OP_ACCEPT && result != 0) ||
+         (request->word1 == NETD_OP_DUP && transferred_count == 1));
     if (!transfer_retained)
         for (uint32_t i = 0; i < transferred_count; ++i)
             if (transferred_fds[i] >= 16) (void)pacha_fd_close(transferred_fds[i]);
@@ -590,16 +565,6 @@ static int netd_socket_dispatch_request(
     const int reply_status = netd_socket_send_reply(
         request->word1, reply_fd, request->word3, status, result,
         reply_transfer_fds, reply_transfer_count);
-    netd_unix_socket_set_notifications_deferred(0);
-#if NETD_DBUS_DIAG
-    if (diag_dbus) {
-        printf("[netd-dbus-rpc] phase=reply-exit id=%llu op=%llu handle=%llu status=%d\n",
-            (unsigned long long)request->word3,
-            (unsigned long long)request->word1,
-            (unsigned long long)diag_handle,
-            reply_status);
-    }
-#endif
     return reply_status;
 }
 
@@ -696,14 +661,33 @@ void netd_socket_service_reap_hangups(
     }
 }
 
-void netd_socket_service_poll(void)
+/* A request that cannot be received is not popped from the queue, so the
+ * endpoint stays readable and every later request is blocked behind it too.
+ * The service then spins without progress and looks merely idle, which is how
+ * a full descriptor table cost hours of diagnosis once already.  Say it once:
+ * the condition is permanent, so one line is enough and cannot flood. */
+static void netd_report_recv_table_full(void)
+{
+    static int reported;
+    if (reported) return;
+    reported = 1;
+    fprintf(stderr,
+        "[netd] recv blocked: descriptor table full, endpoint stalled after %llu requests\n",
+        (unsigned long long)g_netd_socket_requests);
+    fflush(stderr);
+}
+
+/* Returns non-zero when the drain budget ran out with the endpoint still
+ * readable, so the caller must pump again instead of waiting.  A burst larger
+ * than the budget otherwise left requests queued while netd slept until some
+ * unrelated event woke it. */
+int netd_socket_service_poll(void)
 {
     if (g_netd_socket_endpoint_fd < 16) {
-        return;
+        return 0;
     }
 
     for (unsigned i = 0; i < 32; i++) {
-        (void)netd_unix_socket_flush_notification();
         struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
         struct pacha_ipc_msg request;
         memset(fds, 0, sizeof(fds));
@@ -713,10 +697,13 @@ void netd_socket_service_poll(void)
 
         int status = pacha_ipc_recv(g_netd_socket_endpoint_fd, &request);
         if (status != 0) {
-            break;
+            if (status == PACHA_ERR_ALLOC)
+                netd_report_recv_table_full();
+            return 0;
         }
         g_netd_socket_requests++;
         (void)netd_socket_dispatch_request(&request, fds);
     }
 
+    return 1;
 }

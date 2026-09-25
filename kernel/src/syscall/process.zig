@@ -11,6 +11,7 @@ const sc = @import("numbers.zig");
 const runtime = @import("runtime.zig");
 const fd_syscall = @import("fd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
+const perf = @import("../smp_perf.zig");
 
 const fd_abi = abi_root.fd_abi;
 const process_abi = abi_root.process_abi;
@@ -19,7 +20,6 @@ const TrapFrame = interrupts.TrapFrame;
 const first_dynamic_fd: kernel.Fd = fd_abi.first_dynamic_fd;
 const max_process_map_batch_entries: usize = @intCast(process_abi.process_map_batch_max_entries);
 const process_map_batch_entry_size: usize = @intCast(process_abi.process_map_batch_entry_size);
-const max_pipe_close_wakes = kernel.fd_table_entries;
 
 var fork_failure_count: u64 = 0;
 
@@ -35,15 +35,23 @@ fn reportForkFailure(stage: []const u8, status: u64) u64 {
     return status;
 }
 
-fn ThreadExitClearContext(comptime Handler: type) type {
+fn ThreadExitPublishContext(comptime Handler: type) type {
     return struct {
         handler: Handler,
+        state: *kernel.KernelState,
         proc: kernel.PrincipalId,
         user_va: u64,
+        clear_tid: bool,
+        thread_index: usize,
+        thread_generation: u32,
+        exit_code: u32,
 
         fn run(raw_context: *anyopaque) void {
             const context: *@This() = @ptrCast(@alignCast(raw_context));
-            runtime.clearTidAndWake(context.handler, context.proc, context.user_va);
+            if (context.clear_tid)
+                runtime.clearTidAndWake(context.handler, context.proc, context.user_va);
+            context.state.markThreadObjectsExitedBySlot(context.thread_index, context.thread_generation, .exited, context.exit_code);
+            _ = wakeTaskFdWaiters(context.handler, context.state, context.proc);
         }
     };
 }
@@ -69,15 +77,6 @@ fn ProcessExitPublishContext(comptime Handler: type) type {
         }
     };
 }
-
-const PendingPipeCloseWake = struct {
-    pipe: kernel.PipeRef,
-    wake_side_write: bool,
-};
-
-const PendingIpcChannelCloseWake = struct {
-    handle: kernel.IpcChannelHandle,
-};
 
 const ProcessCloneUserFrame = extern struct {
     r15: u64,
@@ -124,7 +123,8 @@ fn isUserEntryVa(va: u64) bool {
 }
 
 fn isUserSignalInhibitRange(start: u64, end: u64) bool {
-    return start < end and user_vm.isUserCanonicalVa(start) and isUserEntryVa(end);
+    return (start == 0 and end == 0) or
+        (start < end and user_vm.isUserCanonicalVa(start) and isUserEntryVa(end));
 }
 
 fn buildUserTrapFrame(entry_rip: u64, stack_rsp: u64) TrapFrame {
@@ -197,6 +197,11 @@ fn processRunnable(state: kernel.TaskObjectState) bool {
     return state == .active or state == .continued;
 }
 
+fn processAddressSpaceAvailable(state: kernel.TaskObjectState) bool {
+    // Mapping control must work without resuming a stopped target.
+    return processRunnable(state) or state == .stopped;
+}
+
 fn writeProcessStatus(h: anytype, proc: kernel.PrincipalId, out_va: u64, process: kernel.ProcessObject) u64 {
     if (out_va == 0) return sc.syscall_ok;
     if (!h.write_user_u64(proc, out_va + process_abi.status_word_state_offset, stateWord(process.state))) return sc.syscall_err_invalid;
@@ -226,92 +231,12 @@ fn wakeThreadTargets(h: anytype, state: *kernel.KernelState, targets: []const ke
     _ = fd_syscall.wakeThreadTargets(h, state, targets);
 }
 
-fn collectPipeCloseWakesForProcess(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    cloexec_only: bool,
-    out: []PendingPipeCloseWake,
-) usize {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    const table = state.fdTableForProcessIndexConst(process_index) orelse return 0;
-    var count: usize = 0;
-    for (table.entries[0..]) |entry| {
-        if (entry.object.isNull()) continue;
-        if (cloexec_only and !entry.flags.cloexec) continue;
-        const slot = state.kernelObjectSlotConst(entry.object) orelse continue;
-        const endpoint = kernel.KernelState.pipeEndpointFromPayload(&slot.payload) orelse continue;
-        if (count >= out.len) break;
-        out[count] = .{
-            .pipe = endpoint.pipe,
-            .wake_side_write = !endpoint.write,
-        };
-        count += 1;
-    }
-    return count;
-}
-
-fn wakeReadyPipeCloseWaiters(
-    h: anytype,
-    state: *kernel.KernelState,
-    pending_wakes: []const PendingPipeCloseWake,
-) void {
-    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
-    for (pending_wakes) |pending| {
-        const ready_events = state.pipeReadyEventsForSide(pending.pipe, pending.wake_side_write) orelse continue;
-        if (ready_events == 0) continue;
-        const wake_count = state.takePipeWaiters(pending.pipe, pending.wake_side_write, ready_events, wake_storage[0..]);
-        wakeThreadTargets(h, state, wake_storage[0..wake_count]);
-    }
-}
-
-fn collectIpcChannelCloseWakesForProcess(
-    state: *kernel.KernelState,
-    principal: kernel.PrincipalId,
-    cloexec_only: bool,
-    out: []PendingIpcChannelCloseWake,
-) usize {
-    const process_index = kernel.processIndexFromPrincipal(principal) orelse return 0;
-    const table = state.fdTableForProcessIndexConst(process_index) orelse return 0;
-    var count: usize = 0;
-    for (table.entries[0..]) |entry| {
-        if (entry.object.isNull()) continue;
-        if (cloexec_only and !entry.flags.cloexec) continue;
-        const slot = state.kernelObjectSlotConst(entry.object) orelse continue;
-        const handle = switch (slot.payload) {
-            .channel => |channel_handle| channel_handle,
-            else => continue,
-        };
-        if (count >= out.len) break;
-        out[count] = .{ .handle = handle };
-        count += 1;
-    }
-    return count;
-}
-
-fn wakeIpcChannelCloseWaiters(
-    h: anytype,
-    state: *kernel.KernelState,
-    pending_wakes: []const PendingIpcChannelCloseWake,
-) void {
-    var wake_storage: [@as(usize, @intCast(fd_abi.max_pollfds))]kernel.ThreadWakeTarget = undefined;
-    for (pending_wakes) |pending| {
-        const wake_count = state.takeIpcChannelPeerCloseWaiters(pending.handle, wake_storage[0..]);
-        wakeThreadTargets(h, state, wake_storage[0..wake_count]);
-    }
-}
-
 fn closeCloexecFdsWithWakes(
     h: anytype,
     state: *kernel.KernelState,
     principal: kernel.PrincipalId,
 ) kernel.KernelError!void {
-    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, true, pending_pipe_wakes[0..]);
-    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(state, principal, true, pending_channel_wakes[0..]);
-    try state.closeCloexecFdsWithFreeList(principal, h.free_list);
-    wakeReadyPipeCloseWaiters(h, state, pending_pipe_wakes[0..pending_pipe_wake_count]);
-    wakeIpcChannelCloseWaiters(h, state, pending_channel_wakes[0..pending_channel_wake_count]);
+    fd_syscall.closeProcessFdsWithWakes(h, state, principal, true);
 }
 
 fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
@@ -323,19 +248,14 @@ fn threadObjectIsLive(thread: kernel.ThreadObject) bool {
 
 fn cleanupProcess(h: anytype, state: *kernel.KernelState, principal: kernel.PrincipalId, exit_state: kernel.TaskObjectState, exit_code: u32) void {
     const process_index = kernel.processIndexFromPrincipal(principal) orelse return;
-    var pending_pipe_wakes: [max_pipe_close_wakes]PendingPipeCloseWake = undefined;
-    const pending_pipe_wake_count = collectPipeCloseWakesForProcess(state, principal, false, pending_pipe_wakes[0..]);
-    var pending_channel_wakes: [kernel.fd_table_entries]PendingIpcChannelCloseWake = undefined;
-    const pending_channel_wake_count = collectIpcChannelCloseWakesForProcess(state, principal, false, pending_channel_wakes[0..]);
     state.cancelFdWaitGroupsForOwner(principal);
     _ = scheduler.releasePrincipalThreads(principal);
+    fd_syscall.closeProcessFdsWithWakes(h, state, principal, false);
     if (!user_vm.lockVmTransaction(principal)) return;
     user_vm.clearUserAddressSpace(principal);
     state.releasePrincipalNativeMemory(principal, h.free_list);
     state.resetProcessRuntimeTables(process_index);
     user_vm.unlockVmTransaction(principal);
-    wakeReadyPipeCloseWaiters(h, state, pending_pipe_wakes[0..pending_pipe_wake_count]);
-    wakeIpcChannelCloseWaiters(h, state, pending_channel_wakes[0..pending_channel_wake_count]);
     _ = state.unpublishServiceEndpointsForTarget(principal);
     _ = state.markProcessExited(principal);
     state.markThreadObjectsExitedForPrincipal(principal, exit_state, exit_code);
@@ -378,33 +298,58 @@ fn exitProcessAfterTeardown(
 
 fn createProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     if ((frame.rdi & ~process_abi.process_known_flags_mask) != 0) return sc.syscall_err_invalid;
+    if ((frame.rsi & ~kernel.fd_known_rights_mask) != 0 or
+        (frame.rdx & ~@as(u64, kernel.fd_known_flags_mask)) != 0 or
+        frame.r8 > process_abi.process_create_max_grants) return sc.syscall_err_invalid;
+    const count: usize = @intCast(frame.r8);
+    var grants: [process_abi.process_create_max_grants]process_abi.ProcessFdGrant = undefined;
+    const bytes = count * @sizeOf(process_abi.ProcessFdGrant);
+    if (count != 0 and (frame.r10 == 0 or frame.r10 > std.math.maxInt(u64) - bytes))
+        return sc.syscall_err_invalid;
+    for (grants[0..count], 0..) |*grant, i| {
+        const address = frame.r10 + i * @sizeOf(process_abi.ProcessFdGrant);
+        grant.* = .{
+            .source_fd = h.read_user_u64(proc, address) orelse return sc.syscall_err_invalid,
+            .target_fd = h.read_user_u64(proc, address + 8) orelse return sc.syscall_err_invalid,
+            .rights = h.read_user_u64(proc, address + 16) orelse return sc.syscall_err_invalid,
+            .flags = h.read_user_u64(proc, address + 24) orelse return sc.syscall_err_invalid,
+        };
+    }
     const principal = state.createProcessDescriptorWithUserAddressSpaceChecked(
         "fd-process",
         h.free_list,
         h.user_spaces,
         scheduler.principalSlotReusable,
     ) orelse return sc.syscall_err_alloc;
-    if (!user_vm.buildEmptyUserAddressSpace(principal)) {
+    var published = false;
+    defer if (!published) {
+        if (user_vm.lockVmTransaction(principal)) {
+            defer user_vm.unlockVmTransaction(principal);
+            user_vm.clearUserAddressSpace(principal);
+            state.releasePrincipalNativeMemory(principal, h.free_list);
+        }
         _ = state.removeProcessDescriptor(principal);
+    };
+    if (!user_vm.buildEmptyUserAddressSpace(principal)) {
         return sc.syscall_err_map;
     }
-    state.inheritFdsForProcessCreate(proc, principal) catch |err| {
-        state.releasePrincipalNativeMemory(principal, h.free_list);
-        _ = state.removeProcessDescriptor(principal);
+    state.grantFdsForProcessCreate(proc, principal, grants[0..count], h.free_list) catch |err| {
         return switch (err) {
-            kernel.KernelError.TableFull => sc.syscall_err_alloc,
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
             else => sc.syscall_err_invalid,
         };
     };
     const rights = kernel.fdRightsFromBits(frame.rsi);
-    return state.createProcessFd(proc, .{
+    const result = state.createProcessFd(proc, .{
         .principal_raw = @intFromEnum(principal),
         .state = .active,
         .exit_code = 0,
-    }, rights, kernel.fdFlagsFromBits(@truncate(frame.rdx)), first_dynamic_fd) catch |err| switch (err) {
+    }, rights, kernel.fdFlagsFromBits(@truncate(frame.rdx)), first_dynamic_fd) catch |err| return switch (err) {
         kernel.KernelError.TableFull => sc.syscall_err_alloc,
         else => sc.syscall_err_invalid,
     };
+    published = true;
+    return result;
 }
 
 fn createThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -486,6 +431,9 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     if (!user_vm.buildEmptyUserAddressSpace(child)) {
         return reportForkFailure("address_space", sc.syscall_err_map);
     }
+    const source_table = state.getFdTableConst(proc) orelse return sc.syscall_err_invalid;
+    state.ensureFdTableCapacity(child, source_table.slots().len, h.free_list) catch
+        return reportForkFailure("fd_table_capacity", sc.syscall_err_alloc);
     state.cloneFdTableForFork(proc, child) catch |err| return switch (err) {
         kernel.KernelError.TableFull => reportForkFailure("fd_table", sc.syscall_err_alloc),
         else => sc.syscall_err_invalid,
@@ -550,10 +498,11 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
         if (protect_status != sc.syscall_ok) {
             return reportForkFailure("parent_write_protect", protect_status);
         }
-        state.detachForkChildDirtyCowTables(child, h.free_list) catch |err| return switch (err) {
-            kernel.KernelError.TableFull => reportForkFailure("dirty_cow_detach", sc.syscall_err_alloc),
-            else => reportForkFailure("dirty_cow_detach", sc.syscall_err_map),
-        };
+        // Dirty COW tables remain shared and immutable. The child has no
+        // inherited leaf PTEs and the parent's writable PTEs have been revoked
+        // above. Detach on the first write, after invalidating that writer's
+        // entire VMA, rather than copying all dirty pages before fork returns.
+        // In particular, fork followed by exec need not copy untouched heaps.
     }
     // Publish the child to the scheduler only after the parent has a durable
     // process handle.  Before this point every rollback can release a
@@ -568,6 +517,45 @@ fn cloneCurrentProcessForFork(h: anytype, state: *kernel.KernelState, proc: kern
     return process_fd;
 }
 
+fn controlThreadContext(h: anytype, state: *kernel.KernelState,
+    proc: kernel.PrincipalId, frame: *TrapFrame) u64
+{
+    if (frame.rdi > std.math.maxInt(kernel.Fd) or frame.rdx == 0 or
+        frame.r10 != process_abi.thread_user_context_size or
+        (frame.rsi != process_abi.thread_context_get and frame.rsi != process_abi.thread_context_set))
+        return sc.syscall_err_invalid;
+    const writing = frame.rsi == process_abi.thread_context_set;
+    const thread = state.threadObjectForFd(proc, @intCast(frame.rdi),
+        if (writing) .{ .set_context = true } else .{ .inspect = true }) orelse return sc.syscall_err_invalid;
+    if (!processAddressSpaceAvailable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
+    const owner: kernel.PrincipalId = @enumFromInt(thread.owner_principal_raw);
+    const index: usize = @intCast(thread.thread_index);
+    var context: process_abi.ThreadUserContext = undefined;
+    if (!writing) {
+        if (!scheduler.getControlledThreadContext(index, thread.thread_generation, owner, &context))
+            return sc.syscall_err_not_ready;
+        return if (h.copy_bytes_to_user_va(proc, frame.rdx, std.mem.asBytes(&context)))
+            sc.syscall_ok else sc.syscall_err_invalid;
+    }
+    // Copy and validate the entire caller image before touching the target.
+    if (!h.copy_user_bytes_from_va(proc, frame.rdx, std.mem.asBytes(&context)) or
+        context.size != process_abi.thread_user_context_size or
+        context.xstate_features != process_abi.signal_xstate_feature_mask or
+        context.reserved[0] != 0 or context.reserved[1] != 0 or context.reserved[2] != 0 or
+        context.pkru > std.math.maxInt(u32) or
+        !user_vm.isUserCanonicalVa(context.fs_base) or !user_vm.isUserCanonicalVa(context.gs_base) or
+        !x86_platform.validateUserXState(&context.xstate)) return sc.syscall_err_invalid;
+    var registers: TrapFrame = undefined;
+    inline for (std.meta.fields(TrapFrame)) |field|
+        @field(registers, field.name) = @field(context.registers, field.name);
+    if (!validReturnedSignalContext(&registers)) return sc.syscall_err_invalid;
+    // User IF must stay enabled; IOPL, NT, VM and reserved flags cannot escape
+    // through the externally controlled return frame.
+    context.registers.rflags = (context.registers.rflags & 0x0020_0ed5) | 0x202;
+    return if (scheduler.setControlledThreadContext(index, thread.thread_generation, owner, &context))
+        sc.syscall_ok else sc.syscall_err_not_ready;
+}
+
 fn startThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd) u64 {
     const thread = state.threadObjectForFd(proc, fd, .{ .start = true }) orelse return sc.syscall_err_invalid;
     if (!processRunnable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
@@ -575,11 +563,19 @@ fn startThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.
     return sc.syscall_ok;
 }
 
-fn killThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
-    const thread = state.setThreadObjectStateForFd(proc, fd, .{ .kill = true }, .killed, code) catch return sc.syscall_err_invalid;
+fn killThread(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, code: u32) u64 {
+    const thread = state.threadObjectForFd(proc, fd, .{ .kill = true }) orelse return sc.syscall_err_invalid;
+    if (thread.state.isTerminal()) return sc.syscall_ok;
     if (threadObjectIsLive(thread)) {
-        _ = scheduler.releaseThread(@intCast(thread.thread_index));
+        // This syscall returns to its caller. Self termination must instead
+        // use THREAD_EXIT, which cannot return to the released user context.
+        if (thread.thread_index == scheduler.currentThread()) return sc.syscall_err_invalid;
+        // In particular, a remote CPU may still be executing this generation.
+        // Never release a shared-memory lock based on an uncompleted kill.
+        if (!scheduler.releaseThread(@intCast(thread.thread_index))) return sc.syscall_err_not_ready;
     }
+    state.markThreadObjectsExitedBySlot(thread.thread_index, thread.thread_generation, .killed, code);
+    _ = wakeTaskFdWaiters(h, state, @enumFromInt(thread.owner_principal_raw));
     return sc.syscall_ok;
 }
 
@@ -691,6 +687,16 @@ fn signalProcess(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalI
     return sc.syscall_ok;
 }
 
+fn signalThread(state: *kernel.KernelState, proc: kernel.PrincipalId, fd: kernel.Fd, signo: u32) u64 {
+    if (signo == 0 or signo > process_abi.signal_max or signo == process_abi.signal_kill)
+        return sc.syscall_err_invalid;
+    const thread = state.threadObjectForFd(proc, fd, .{ .process_signal = true }) orelse return sc.syscall_err_invalid;
+    if (!processRunnable(thread.state) or !threadObjectIsLive(thread)) return sc.syscall_err_invalid;
+    _ = scheduler.deliverThreadSignal(@enumFromInt(thread.owner_principal_raw), @intCast(thread.thread_index), thread.thread_generation, signo, sc.syscall_err_not_ready) orelse
+        return sc.syscall_err_not_ready;
+    return sc.syscall_ok;
+}
+
 const NativeSignalFrame = extern struct {
     magic: u64,
     size: u64,
@@ -740,21 +746,39 @@ fn deliverPendingSignalToUserFrame(
     frame: *TrapFrame,
     user_frame_va: u64,
 ) u64 {
+    const body_start = perf.runtimeTimestamp(.pending_frame);
+    defer {
+        perf.runtimeAdd(.pending_frame, .body_calls, 1);
+        perf.runtimeElapsed(.pending_frame, .body_cycles, body_start);
+    }
     if (user_frame_va == 0 or !user_vm.isUserCanonicalVa(user_frame_va)) {
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
     var user_frame: ProcessCloneUserFrame = undefined;
-    if (!h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame)) or
-        !isUserEntryVa(user_frame.rip) or !isUserEntryVa(user_frame.rsp))
-    {
+    const copy_start = perf.runtimeTimestamp(.pending_frame);
+    const valid = h.copy_user_bytes_from_va(proc, user_frame_va, std.mem.asBytes(&user_frame)) and
+        isUserEntryVa(user_frame.rip) and isUserEntryVa(user_frame.rsp);
+    perf.runtimeAdd(.pending_frame, .copy_calls, 1);
+    perf.runtimeElapsed(.pending_frame, .copy_cycles, copy_start);
+    if (!valid) {
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
-    const claimed = scheduler.claimCurrentSignalForUserReturn(user_frame.rip) orelse
+    const claim_start = perf.runtimeTimestamp(.pending_frame);
+    const claim_result = scheduler.claimCurrentSignalForUserReturn(user_frame.rip);
+    perf.runtimeAdd(.pending_frame, .claim_calls, 1);
+    perf.runtimeElapsed(.pending_frame, .claim_cycles, claim_start);
+    const claimed = claim_result orelse {
+        perf.runtimeAdd(.pending_frame, .no_claim, 1);
         return sc.syscall_ok;
+    };
+    perf.runtimeAdd(.pending_frame, .claimed, 1);
     const stack_cost = process_abi.signal_red_zone_size +
         process_abi.signal_frame_size + process_abi.signal_runtime_stack_size;
     if (user_frame.rsp <= stack_cost) {
         scheduler.restoreClaimedSignal(claimed);
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
     const signal_frame_va = (user_frame.rsp - process_abi.signal_red_zone_size -
@@ -771,6 +795,7 @@ fn deliverPendingSignalToUserFrame(
         !h.copy_bytes_to_user_va(proc, signal_frame_va, std.mem.asBytes(&signal_frame)))
     {
         scheduler.restoreClaimedSignal(claimed);
+        perf.runtimeAdd(.pending_frame, .invalid, 1);
         return sc.syscall_err_invalid;
     }
     frame.rdi = signal_frame_va;
@@ -815,7 +840,7 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             if (!isUserEntryVa(entry) or
                 !isUserSignalInhibitRange(inhibit_start, inhibit_end) or
                 !isUserSignalInhibitRange(inhibit_secondary_start, inhibit_secondary_end) or
-                entry < inhibit_start or entry >= inhibit_end)
+                (inhibit_start != inhibit_end and (entry < inhibit_start or entry >= inhibit_end)))
             {
                 return sc.syscall_err_invalid;
             }
@@ -834,9 +859,9 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             var returned: NativeSignalFrame = undefined;
             if (!h.copy_user_bytes_from_va(proc, frame.rsi, std.mem.asBytes(&returned))) return sc.syscall_err_invalid;
             if (returned.magic != process_abi.signal_frame_magic or
-                returned.size != process_abi.signal_frame_size or
+                (returned.size != process_abi.signal_frame_size and returned.size != process_abi.fault_frame_size) or
                 returned.reserved0 != process_abi.signal_xstate_feature_mask or
-                returned.signo == 0 or returned.signo > process_abi.signal_max or
+                (if (returned.size == process_abi.fault_frame_size) returned.signo != 0 else returned.signo == 0 or returned.signo > process_abi.signal_max) or
                 !validReturnedSignalContext(&returned.context) or
                 !x86_platform.validateUserXState(&returned.x_state))
             {
@@ -846,6 +871,8 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
             returned.context.rflags &= ~(@as(u64, 1) << 14);
             returned.context.rflags &= ~(@as(u64, 1) << 17);
             returned.context.rflags |= (@as(u64, 1) << 1) | (@as(u64, 1) << 9);
+            if (returned.size == process_abi.fault_frame_size and !scheduler.completeCurrentFault(frame.rsi))
+                return sc.syscall_err_invalid;
             if (!scheduler.restoreCurrentSignalXState(&returned.x_state)) return sc.syscall_err_not_ready;
             frame.* = returned.context;
             return returned.context.rax;
@@ -876,6 +903,19 @@ fn signalControl(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
                 sc.syscall_ok
             else
                 writeSignalTimerState(h, proc, frame.r8, old);
+        },
+        process_abi.signal_ctl_register_fault => {
+            const entry = frame.rsi;
+            const stack_base = frame.rdx;
+            const stack_size = frame.r10;
+            if (entry == 0 and stack_base == 0 and stack_size == 0)
+                return if (scheduler.configureCurrentFaultDelivery(0, 0, 0)) sc.syscall_ok else sc.syscall_err_not_ready;
+            const minimum_stack = process_abi.fault_frame_size + process_abi.signal_runtime_stack_size + 63;
+            const stack_end = std.math.add(u64, stack_base, stack_size) catch return sc.syscall_err_invalid;
+            if (!isUserEntryVa(entry) or !isUserEntryVa(stack_base) or
+                !isUserEntryVa(stack_end) or stack_size < minimum_stack)
+                return sc.syscall_err_invalid;
+            return if (scheduler.configureCurrentFaultDelivery(entry, stack_base, stack_size)) sc.syscall_ok else sc.syscall_err_not_ready;
         },
         process_abi.signal_ctl_set_pending_hint => {
             if (frame.rsi != 0 and !isUserEntryVa(frame.rsi)) return sc.syscall_err_invalid;
@@ -977,6 +1017,7 @@ const ProcessMapRequest = struct {
     prot: kernel.VmaProt,
     flags: kernel.MmapFlags,
     vmo_offset: u64,
+    replace: bool,
 };
 
 const ProcessMapPrepareResult = struct {
@@ -999,6 +1040,9 @@ fn prepareProcessMapRequest(
     allow_anywhere: bool,
 ) ProcessMapPrepareResult {
     const anywhere = target_va == process_abi.process_map_anywhere_va;
+    const replace = (map_flags_bits & process_abi.process_map_flag_replace) != 0;
+    // Batch rollback only owns newly inserted mappings, never old targets.
+    if (replace and (anywhere or !allow_anywhere)) return .{ .status = sc.syscall_err_invalid };
     if (anywhere and !allow_anywhere) return .{ .status = sc.syscall_err_invalid };
     if ((map_flags_bits & ~process_abi.process_map_known_flags_mask) != 0) return .{ .status = sc.syscall_err_invalid };
     if ((map_flags_bits & process_abi.process_map_flag_private) != 0 and
@@ -1027,6 +1071,16 @@ fn prepareProcessMapRequest(
         return .{ .status = sc.syscall_err_invalid };
     };
     const private_map = (map_flags_bits & process_abi.process_map_flag_private) != 0;
+    const anonymous_map = (map_flags_bits & process_abi.process_map_flag_anonymous) != 0;
+    if (anonymous_map and (!private_map or vmo_fd != 0 or vmo_offset != 0)) {
+        return .{ .status = sc.syscall_err_invalid };
+    }
+    if (anonymous_map and !anywhere) {
+        const end_va, const overflow = @addWithOverflow(target_va, aligned_size);
+        if (overflow != 0 or target_va < boot_static.user_low_va or
+            end_va > boot_static.user_top_va)
+            return .{ .status = sc.syscall_err_invalid };
+    }
     return .{
         .status = sc.syscall_ok,
         .request = .{
@@ -1039,8 +1093,10 @@ fn prepareProcessMapRequest(
                 .fixed = true,
                 .private = private_map,
                 .shared = !private_map,
+                .anonymous = anonymous_map,
             },
             .vmo_offset = vmo_offset,
+            .replace = replace,
         },
     };
 }
@@ -1054,6 +1110,31 @@ fn installProcessMapLocked(
     req: ProcessMapRequest,
 ) ProcessMapInstallResult {
     var target_va = req.target_va;
+    if (req.replace) {
+        if (state.rangeOverlapsPinnedUserObject(target_owner, target_va, req.aligned_size))
+            return .{ .status = sc.syscall_err_invalid };
+        const slots = user_vm.unmapPresentRemoteUserRegionSplitSlotsRequired(
+            target_owner, target_va, @intCast(req.aligned_size),
+        ) orelse return .{ .status = sc.syscall_err_map };
+        if (slots > user_vm.freeUserReservationSlotCount(target_owner))
+            return .{ .status = sc.syscall_err_alloc };
+        var prepared = (if (req.flags.anonymous)
+            state.prepareFixedAnonymousMmap(target_owner, target_va, req.aligned_size,
+                req.prot, .{ .read = true, .write = true, .exec = true }, req.flags, free_list)
+        else
+            state.prepareFixedFdMmapIntoProcess(proc, req.vmo_fd, target_owner,
+                target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset, free_list)) catch |err|
+            return .{ .status = switch (err) {
+                kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+                else => sc.syscall_err_invalid,
+            } };
+        defer state.discardFixedMmapPrepared(&prepared, free_list);
+        // No fallible work after invalidation. The shared VMO's pages were
+        // resolved during prepare; native faults lazily install the new PTEs.
+        if (!user_vm.unmapPresentRemoteUserRegion(target_owner, target_va, @intCast(req.aligned_size))) unreachable;
+        state.commitFixedMmapPrepared(&prepared, free_list);
+        return .{ .status = sc.syscall_ok, .mapped_va = target_va };
+    }
     const anywhere = target_va == process_abi.process_map_anywhere_va;
     if (anywhere) {
         const purpose = 0x5052_4f43_4d41_5000 ^ scheduler.lapic_tick_count ^ (@as(u64, process_fd) << 32) ^ @as(u64, req.vmo_fd);
@@ -1070,6 +1151,24 @@ fn installProcessMapLocked(
     } else if (!(state.userMapRangeIsFree(target_owner, target_va, req.aligned_size) catch false)) {
         kernel_log.write("process.map failed target-occupied\n");
         return .{ .status = sc.syscall_err_invalid };
+    }
+
+    if (req.flags.anonymous) {
+        // The caller's process capability was checked for MAP_INTO. Like
+        // local anonymous mmap, the reservation needs no eagerly backed VMO.
+        _ = state.createAnonymousVmaWithPages(
+            target_owner,
+            target_va,
+            req.aligned_size,
+            req.prot,
+            .{ .read = true, .write = true, .exec = true, .pkey = req.prot.pkey },
+            req.flags,
+            free_list,
+        ) catch |err| return .{ .status = switch (err) {
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        } };
+        return .{ .status = sc.syscall_ok, .mapped_va = target_va };
     }
 
     _ = state.mmapFdIntoProcess(proc, req.vmo_fd, target_owner, target_va, req.aligned_size, req.prot, req.flags, req.vmo_offset) catch |err| switch (err) {
@@ -1144,7 +1243,7 @@ fn mapIntoProcess(
         kernel_log.write("process.map failed process-fd\n");
         return sc.syscall_err_invalid;
     };
-    if (!processRunnable(process.state)) {
+    if (!processAddressSpaceAvailable(process.state)) {
         kernel_log.write("process.map failed process-state\n");
         return sc.syscall_err_invalid;
     }
@@ -1157,6 +1256,39 @@ fn mapIntoProcess(
     defer user_vm.unlockVmTransactionPair(proc, target_owner);
     const installed = installProcessMapLocked(state, proc, free_list, process_fd, target_owner, prepared.request);
     return if (installed.status == sc.syscall_ok) installed.mapped_va else installed.status;
+}
+
+fn unmapFromProcess(
+    state: *kernel.KernelState,
+    proc: kernel.PrincipalId,
+    free_list: *kernel.FreePageList,
+    frame: *TrapFrame,
+) u64 {
+    if (frame.rdi > std.math.maxInt(kernel.Fd) or frame.r10 != 0 or
+        frame.rdx == 0 or (frame.rsi & 0xfff) != 0) return sc.syscall_err_invalid;
+    const size = pageAlignUp(frame.rdx) orelse return sc.syscall_err_invalid;
+    const process_fd: kernel.Fd = @intCast(frame.rdi);
+    const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse return sc.syscall_err_invalid;
+    if (!processAddressSpaceAvailable(process.state)) return sc.syscall_err_invalid;
+    const target: kernel.PrincipalId = @enumFromInt(process.principal_raw);
+    if (!state.hasActivePrincipal(target)) return sc.syscall_err_invalid;
+    if (!user_vm.lockVmTransactionPair(proc, target)) return sc.syscall_err_invalid;
+    defer user_vm.unlockVmTransactionPair(proc, target);
+    if (state.rangeOverlapsPinnedUserObject(target, frame.rsi, size)) return sc.syscall_err_invalid;
+    const slots = user_vm.unmapPresentRemoteUserRegionSplitSlotsRequired(
+        target, frame.rsi, @intCast(size),
+    ) orelse return sc.syscall_err_map;
+    if (slots > user_vm.freeUserReservationSlotCount(target)) return sc.syscall_err_alloc;
+    var prepared = state.prepareMunmapRangeWithFreeList(target, frame.rsi, size, free_list) catch |err| return switch (err) {
+        kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+        else => sc.syscall_err_invalid,
+    };
+    defer state.discardMunmapPrepared(&prepared, free_list);
+    // The cross-CPU shootdown completes before VMO references are released.
+    // No target user thread must run for this operation to make progress.
+    if (!user_vm.unmapPresentRemoteUserRegion(target, frame.rsi, @intCast(size))) unreachable;
+    state.commitMunmapPrepared(&prepared, free_list);
+    return sc.syscall_ok;
 }
 
 fn readBatchEntryU64(bytes: []const u8, entry_index: usize, field_offset: u64) u64 {
@@ -1201,7 +1333,7 @@ fn mapBatchIntoProcess(
     }
 
     const process = state.processObjectForFd(proc, process_fd, .{ .map_into = true }) orelse return sc.syscall_err_invalid;
-    if (!processRunnable(process.state)) return sc.syscall_err_invalid;
+    if (!processAddressSpaceAvailable(process.state)) return sc.syscall_err_invalid;
     const target_owner: kernel.PrincipalId = @enumFromInt(process.principal_raw);
     if (!state.hasActivePrincipal(target_owner)) return sc.syscall_err_invalid;
 
@@ -1309,19 +1441,27 @@ fn exitCurrentThread(h: anytype, state: *kernel.KernelState, proc: kernel.Princi
         exitProcessAfterTeardown(h, state, proc, .exited, code, frame);
         return frame.rax;
     };
-    state.markThreadObjectsExitedBySlot(current, generation, .exited, code);
     if (scheduler.liveThreadCount(proc) <= 1) {
         if (clear_tid) runtime.clearTidAndWake(h, proc, frame.rsi);
         exitProcessAfterTeardown(h, state, proc, .exited, code, frame);
         return frame.rax;
     }
-    const ClearContext = ThreadExitClearContext(@TypeOf(h));
-    var clear_context = ClearContext{ .handler = h, .proc = proc, .user_va = frame.rsi };
-    const clear_callback: ?scheduler.BeforeCurrentThreadLeaveCallback = if (clear_tid) .{
-        .context = @ptrCast(&clear_context),
-        .run = ClearContext.run,
-    } else null;
-    if (!scheduler.exitCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave, clear_callback)) {
+    const PublishContext = ThreadExitPublishContext(@TypeOf(h));
+    var publish_context = PublishContext{
+        .handler = h,
+        .state = state,
+        .proc = proc,
+        .user_va = frame.rsi,
+        .clear_tid = clear_tid,
+        .thread_index = current,
+        .thread_generation = generation,
+        .exit_code = code,
+    };
+    const publish_callback: scheduler.BeforeCurrentThreadLeaveCallback = .{
+        .context = @ptrCast(&publish_context),
+        .run = PublishContext.run,
+    };
+    if (!scheduler.exitCurrentThread(frame, sc.syscall_ok, h.before_current_thread_leave, publish_callback)) {
         exitProcessAfterTeardown(h, state, proc, .exited, code, frame);
     }
     return frame.rax;
@@ -1338,10 +1478,15 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         },
         sc.syscall_thread_create => createThread(h, state, proc, frame),
         sc.syscall_thread_start => startThread(state, proc, @intCast(frame.rdi)),
-        sc.syscall_thread_kill => killThread(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
+        sc.syscall_thread_context => controlThreadContext(h, state, proc, frame),
+        sc.syscall_thread_kill => killThread(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
         sc.syscall_thread_wait => waitThread(h, state, proc, @intCast(frame.rdi), frame.rsi),
         sc.syscall_thread_exit => exitCurrentThread(h, state, proc, frame, @truncate(frame.rdi)),
         sc.syscall_process_signal => signalProcess(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi), frame),
+        sc.syscall_thread_signal => if (frame.rdi > std.math.maxInt(kernel.Fd) or frame.rsi > process_abi.signal_max)
+            sc.syscall_err_invalid
+        else
+            signalThread(state, proc, @intCast(frame.rdi), @intCast(frame.rsi)),
         sc.syscall_process_signal_ctl => signalControl(h, proc, frame),
         sc.syscall_process_stop => stopProcess(h, state, proc, @intCast(frame.rdi), @truncate(frame.rsi), frame),
         sc.syscall_process_continue => continueProcess(state, proc, @intCast(frame.rdi), @truncate(frame.rsi)),
@@ -1360,6 +1505,7 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         sc.syscall_process_clone => cloneCurrentProcessForFork(h, state, proc, frame),
         sc.syscall_process_map => mapIntoProcess(state, proc, h.free_list, frame),
         sc.syscall_process_map_batch => mapBatchIntoProcess(h, state, proc, h.free_list, frame),
+        sc.syscall_process_unmap => unmapFromProcess(state, proc, h.free_list, frame),
         sc.syscall_process_exec_from => execFromStagedProcess(h, state, proc, frame),
         sc.syscall_process_memory_barrier => synchronizeProcessMemory(proc, frame.rdi),
         else => null,

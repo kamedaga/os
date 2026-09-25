@@ -18,6 +18,17 @@ let
     '';
   };
   clangFreestanding = pkgs.llvmPackages.clang-unwrapped;
+  linuxLlvm18 = pkgs.runCommand "capabilityos-linux-llvm-18"
+    { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+    mkdir -p "$out/bin"
+    makeWrapper "${pkgs.llvmPackages_18.clang-unwrapped}/bin/clang" "$out/bin/clang-18" \
+      --add-flags "-resource-dir ${pkgs.llvmPackages_18.clang-unwrapped.lib}/lib/clang/18"
+    ln -s "${pkgs.llvmPackages_18.lld}/bin/ld.lld" "$out/bin/ld.lld"
+    ln -s "${pkgs.llvmPackages_18.lld}/bin/ld.lld" "$out/bin/ld.lld-18"
+    for tool in llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-readobj; do
+      ln -s "${pkgs.llvmPackages_18.llvm}/bin/$tool" "$out/bin/$tool-18"
+    done
+  '';
   coqCompCert = pkgs.coqPackages.compcert;
   coqCompCertContrib =
     "${coqCompCert.lib}/lib/coq/${pkgs.coq.coq-version}/user-contrib";
@@ -47,28 +58,37 @@ in
 {
   inherit zig;
   inherit clangFreestanding;
+  inherit linuxLlvm18;
   inherit coqCompCertContrib;
 
   devPackages = with pkgs; [
     bash
+    bc
+    bison
     clang
     cmake
     coqVstTools
     dosfstools
     e2fsprogs
     e2tools
+    elfutils
     fakeroot
+    flex
     gcc
     go
     gptfdisk
     lld
+    linuxLlvm18
     mtools
     ninja
+    openssl
     patchelf
+    perl
     pkg-config
     qemu
     ripgrep
     socat
     zig
+    zstd
   ];
 }

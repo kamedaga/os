@@ -129,7 +129,7 @@ static lpr_ofd_t *lpr_fd_ofd_for_entry(
     lpr_fd_table_t *table,
     const lpr_fd_entry_t *entry)
 {
-    if (entry == 0 || !entry->active) {
+    if (entry == 0 || entry->active != 1) {
         return 0;
     }
     return lpr_fd_ofd(table, entry->ofd_index, entry->ofd_generation);
@@ -139,7 +139,7 @@ static const lpr_ofd_t *lpr_fd_ofd_for_entry_const(
     const lpr_fd_table_t *table,
     const lpr_fd_entry_t *entry)
 {
-    if (entry == 0 || !entry->active) {
+    if (entry == 0 || entry->active != 1) {
         return 0;
     }
     return lpr_fd_ofd_const(table, entry->ofd_index, entry->ofd_generation);
@@ -280,14 +280,14 @@ int lpr_fd_table_alloc(
     return -1;
 }
 
-int lpr_fd_table_alloc_batch(
+static int alloc_batch(
     lpr_fd_table_t *table,
     lpr_linux_fd_t min_fd,
     const lpr_fd_install_t *installs,
     uint32_t install_count,
     const lpr_linux_fd_t *excluded_fds,
     uint32_t excluded_count,
-    lpr_linux_fd_t *out_fds)
+    lpr_linux_fd_t *out_fds, int staged)
 {
     if (install_count == 0) return 0;
     lpr_fd_table_lock(table);
@@ -341,6 +341,35 @@ int lpr_fd_table_alloc_batch(
             return -1;
         }
     }
+    if (staged) for (uint32_t i = 0; i < install_count; i++)
+        table->entries[out_fds[i]].active = 2;
+    lpr_fd_table_unlock(table);
+    return 0;
+}
+
+int lpr_fd_table_alloc_batch(lpr_fd_table_t *table, lpr_linux_fd_t min_fd,
+    const lpr_fd_install_t *installs, uint32_t count, const lpr_linux_fd_t *excluded,
+    uint32_t excluded_count, lpr_linux_fd_t *fds)
+{
+    return alloc_batch(table, min_fd, installs, count, excluded, excluded_count, fds, 0);
+}
+
+int lpr_fd_table_stage_batch(lpr_fd_table_t *table,
+    const lpr_fd_install_t *installs, uint32_t count, lpr_linux_fd_t *fds)
+{
+    return alloc_batch(table, 0, installs, count, 0, 0, fds, 1);
+}
+
+int lpr_fd_table_publish_batch(lpr_fd_table_t *table,
+    const lpr_linux_fd_t *fds, uint32_t count)
+{
+    lpr_fd_table_lock(table);
+    for (uint32_t i = 0; i < count; i++) {
+        lpr_fd_entry_t *entry = lpr_fd_entry(table, fds[i]);
+        if (!entry || entry->active != 2) { lpr_fd_table_unlock(table); return -1; }
+    }
+    for (uint32_t i = 0; i < count; i++) table->entries[fds[i]].active = 1;
+    (void)lpr_fd_next_generation(table);
     lpr_fd_table_unlock(table);
     return 0;
 }
@@ -366,6 +395,19 @@ static void lpr_fd_prepare_drop(
     }
     lpr_fd_zero(ofd, sizeof(*ofd));
     (void)lpr_fd_next_generation(table);
+}
+
+int lpr_fd_table_abort_staged(lpr_fd_table_t *table, lpr_linux_fd_t fd, lpr_fd_drop_t *drop)
+{
+    lpr_fd_table_lock(table);
+    lpr_fd_entry_t *entry = lpr_fd_entry(table, fd);
+    if (!entry || entry->active != 2) { lpr_fd_table_unlock(table); return -1; }
+    lpr_ofd_t *ofd = lpr_fd_ofd(table, entry->ofd_index, entry->ofd_generation);
+    if (!ofd) { lpr_fd_table_unlock(table); return -1; }
+    lpr_fd_zero(entry, sizeof(*entry));
+    lpr_fd_prepare_drop(table, ofd, drop);
+    lpr_fd_table_unlock(table);
+    return 0;
 }
 
 int lpr_fd_table_close(
@@ -403,6 +445,15 @@ int lpr_fd_table_dup(
     uint16_t new_fd_flags,
     lpr_linux_fd_t *out_fd)
 {
+    return lpr_fd_table_dup_excluding(table, old_fd, min_fd, new_fd_flags,
+        0, 0, out_fd);
+}
+
+int lpr_fd_table_dup_excluding(lpr_fd_table_t *table,
+    lpr_linux_fd_t old_fd, lpr_linux_fd_t min_fd, uint16_t new_fd_flags,
+    const lpr_linux_fd_t *excluded, uint32_t excluded_count,
+    lpr_linux_fd_t *out_fd)
+{
     lpr_fd_table_lock(table);
     const lpr_fd_entry_t *old_entry = lpr_fd_entry_const(table, old_fd);
     lpr_ofd_t *ofd = lpr_fd_ofd_for_entry(table, old_entry);
@@ -414,6 +465,9 @@ int lpr_fd_table_dup(
         return -1;
     }
     for (lpr_linux_fd_t fd = min_fd; fd < table->entry_count; fd++) {
+        uint32_t i = 0;
+        while (i < excluded_count && excluded[i] != fd) ++i;
+        if (i != excluded_count) continue;
         if (!table->entries[fd].active) {
             table->entries[fd] = *old_entry;
             table->entries[fd].fd_flags = new_fd_flags;
@@ -426,6 +480,38 @@ int lpr_fd_table_dup(
     }
     lpr_fd_table_unlock(table);
     return -1;
+}
+
+int lpr_fd_table_dup_replace(lpr_fd_table_t *table,
+    lpr_linux_fd_t old_fd, lpr_linux_fd_t new_fd, uint16_t flags,
+    lpr_fd_drop_t *drop)
+{
+    if (!drop) return -1;
+    lpr_fd_zero(drop, sizeof(*drop));
+    lpr_fd_table_lock(table);
+    const lpr_fd_entry_t *old_entry = lpr_fd_entry_const(table, old_fd);
+    lpr_fd_entry_t *target = lpr_fd_entry(table, new_fd);
+    lpr_ofd_t *source = lpr_fd_ofd_for_entry(table, old_entry);
+    lpr_ofd_t *displaced = lpr_fd_ofd_for_entry(table, target);
+    if (!old_entry || !target || !source || source->closing ||
+        !(old_entry->effective_rights & LPR_FD_RIGHT_DUP) ||
+        target->active == 2 || (target->active && (!displaced || displaced->closing))) {
+        lpr_fd_table_unlock(table);
+        return -1;
+    }
+    if (old_fd != new_fd) {
+        /* Increment first: source and destination may name the same OFD. */
+        ++source->refcount;
+        *target = *old_entry;
+        target->fd_flags = flags;
+        if (displaced && --displaced->refcount == 0) {
+            displaced->closing = 1;
+            if (!displaced->pin_count) lpr_fd_prepare_drop(table, displaced, drop);
+        }
+        (void)lpr_fd_next_generation(table);
+    }
+    lpr_fd_table_unlock(table);
+    return 0;
 }
 
 int lpr_fd_table_dup_at(
@@ -585,7 +671,7 @@ int lpr_fd_table_get_fd_flags(
 {
     lpr_fd_table_lock((lpr_fd_table_t *)table);
     const lpr_fd_entry_t *entry = lpr_fd_entry_const(table, fd);
-    if (entry == 0 || !entry->active || out_flags == 0) {
+    if (entry == 0 || entry->active != 1 || out_flags == 0) {
         lpr_fd_table_unlock((lpr_fd_table_t *)table);
         return -1;
     }
@@ -598,7 +684,7 @@ int lpr_fd_table_set_fd_flags(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint16_t
 {
     lpr_fd_table_lock(table);
     lpr_fd_entry_t *entry = lpr_fd_entry(table, fd);
-    if (entry == 0 || !entry->active) {
+    if (entry == 0 || entry->active != 1) {
         lpr_fd_table_unlock(table);
         return -1;
     }

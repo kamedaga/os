@@ -9,8 +9,14 @@ arch="${ALPINE_MESA_ARCH:-x86_64}"
 mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 cache="${repo_root}/.artifacts/third_party/alpine-mesa-${alpine_version}-${arch}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
+desktop_lock="${repo_root}/tools/manifests/alpine-xfce-v3.22-x86_64.lock"
 out_abs="${repo_root}/${out}"
 dev_out_abs="${repo_root}/${dev_out}"
+
+[[ "${alpine_version}" == v3.22 && "${arch}" == x86_64 ]] || {
+  echo "patched Mesa is verified only for Alpine v3.22 x86_64" >&2
+  exit 1
+}
 
 if [[ ! -d "${clang_root}" ]]; then
   bash "${repo_root}/tools/build_wsl_alpine_clang.sh"
@@ -124,26 +130,46 @@ for pkg in mesa-gl mesa-egl mesa-gbm mesa-gles mesa-dri-gallium; do
   enqueue "${pkg}"
 done
 
+download_package() {
+  local pkg="$1"
+  local version section apk locked checksum=""
+  version="$(package_field "${pkg}" V)"
+  section="$(package_section "${pkg}")"
+  # Shared runtime dependencies must match the shipped desktop, not today's
+  # rolling APKINDEX. Keep the existing byte-for-byte overlay collision check.
+  locked="$(awk -v pkg="${pkg}" '$1 !~ /^#/ && $2 == pkg { print $1, $3, $4 }' "${desktop_lock}")"
+  if [[ -n "${locked}" ]]; then
+    read -r section version checksum <<<"${locked}"
+  fi
+  apk="${cache}/${pkg}-${version}.apk"
+  if [[ ! -f "${apk}" ]]; then
+    curl -fsSL "${mirror}/${alpine_version}/${section}/${arch}/${pkg}-${version}.apk" -o "${apk}"
+  fi
+  if [[ -n "${checksum}" ]]; then
+    echo "${checksum}  ${apk}" | sha256sum -c --status || {
+      echo "locked Mesa dependency checksum mismatch: ${pkg}-${version}" >&2
+      return 1
+    }
+  fi
+  printf '%s\n' "${apk}"
+}
+
 for ((i = 0; i < ${#queue[@]}; ++i)); do
   pkg="${queue[$i]}"
   wanted["${pkg}"]=1
-  deps="$(package_field "${pkg}" D || true)"
+  apk="$(download_package "${pkg}")"
+  deps="$(tar --warning=no-unknown-keyword -xOzf "${apk}" .PKGINFO | sed -n 's/^depend = //p')"
   for dep in ${deps}; do
     enqueue "$(normalize_dep "${dep}")"
   done
 done
 
-download_package() {
-  local pkg="$1"
-  local version section apk
-  version="$(package_field "${pkg}" V)"
-  section="$(package_section "${pkg}")"
-  apk="${cache}/${pkg}-${version}.apk"
-  if [[ ! -f "${apk}" ]]; then
-    curl -fsSL "${mirror}/${alpine_version}/${section}/${arch}/${pkg}-${version}.apk" -o "${apk}"
-  fi
-  printf '%s\n' "${apk}"
-}
+for pkg in mesa mesa-dev mesa-dri-gallium mesa-gl mesa-egl mesa-gbm mesa-gles; do
+  [[ "$(package_field "${pkg}" V)" == 25.1.9-r0 ]] || {
+    echo "patched Mesa requires ${pkg}=25.1.9-r0; review the patch before upgrading" >&2
+    exit 1
+  }
+done
 
 install_root="${tmp}/root"
 mkdir -p "${install_root}"
@@ -171,6 +197,8 @@ rm -rf \
   "${dev_root}"/etc \
   "${dev_root}"/var \
   "${dev_root}"/usr/share
+
+bash "${repo_root}/tools/build_mesa_virgl.sh" "${install_root}"
 
 python3 - "${install_root}" "${dev_root}" "${clang_root}" <<'PY'
 import os

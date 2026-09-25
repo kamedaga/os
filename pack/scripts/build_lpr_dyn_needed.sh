@@ -3,16 +3,16 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 out="${1:-.artifacts/userland-fixtures/lpr-dyn-needed-root}"
-cache="${repo_root}/.artifacts/third_party/alpine-lua-cli"
-sysroot="${cache}/alpine-sysroot"
+sysroot="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 cc="${PACHAOS_HOST_CLANG:-/usr/bin/clang}"
 out_abs="${repo_root}/${out}"
+runtime_libc="${repo_root}/.artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 
-if [[ ! -e "${repo_root}/.artifacts/userland/lpr_linux_musl_libc/LPRMUSL.SO" ]]; then
-  bash "${repo_root}/tools/copy_lpr_linux_musl.sh" ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
-fi
 if [[ ! -e "${sysroot}/usr/lib/Scrt1.o" ]]; then
-  bash "${repo_root}/tools/build_lpr_lua_launcher.sh" ".artifacts/userland-fixtures/lpr_lua_launcher.elf"
+  bash "${repo_root}/tools/build_wsl_alpine_clang.sh"
+fi
+if [[ ! -e "${runtime_libc}" ]]; then
+  bash "${repo_root}/tools/copy_lpr_linux_musl.sh" ".artifacts/userland-fixtures/lpr-linux-musl-libc.so"
 fi
 
 rm -rf "${out_abs}"
@@ -50,7 +50,7 @@ obj="${out_abs}/lpr_dyn_needed_main.o"
   -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1 \
   -Wl,--allow-shlib-undefined \
   -l:liblprneed.so \
-  -lc \
+  "${runtime_libc}" \
   "${sysroot}/usr/lib/crtn.o" \
   -o "${out_abs}/cmd/lpr_dyn_needed.elf"
 

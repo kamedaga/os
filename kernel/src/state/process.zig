@@ -1,9 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const vtd = @import("../vtd.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
-const table = @import("table.zig");
+const table_util = @import("table.zig");
 const capsule = types.capsule;
 const initial_process_count = types.initial_process_count;
 const initial_process_capacity = types.initial_process_capacity;
@@ -106,10 +105,10 @@ const VmaEntry = types.VmaEntry;
 const VmaTable = types.VmaTable;
 const NativeVmaFaultMapping = types.NativeVmaFaultMapping;
 const EndpointTable = types.EndpointTable;
-const ProcessDescriptorTable = table.StaticPlusExtra(ProcessDescriptor, process_count);
-const EndpointRuntimeTable = table.StaticPlusExtra(EndpointTable, process_count);
-const FdRuntimeTable = table.StaticPlusExtra(FdTable, process_count);
-const VmaRuntimeTable = table.StaticPlusExtra(VmaTable, process_count);
+const ProcessDescriptorTable = table_util.StaticPlusExtra(ProcessDescriptor, process_count);
+const EndpointRuntimeTable = table_util.StaticPlusExtra(EndpointTable, process_count);
+const FdRuntimeTable = table_util.StaticPlusExtra(FdTable, process_count);
+const VmaRuntimeTable = table_util.StaticPlusExtra(VmaTable, process_count);
 const PublishedEndpointTable = types.PublishedEndpointTable;
 const max_vmo_backing_pages = types.max_vmo_backing_pages;
 const max_vmo_backing_store_pages = types.max_vmo_backing_store_pages;
@@ -143,7 +142,7 @@ pub fn allocKernelSlice(comptime T: type, free_list: *FreePageList, count: usize
     if (count == 0) return null;
     const bytes = @sizeOf(T) * count;
     const page_count = (bytes + 4095) / 4096;
-    const paddr = free_list.popContiguousAtOrAbove(page_count, 0) catch return null;
+    const paddr = free_list.popContiguousBelow(page_count, @import("../arch/x86_64/physical_layout.zig").identity_limit) catch return null;
     const raw: [*]u8 = @ptrFromInt(paddr);
     @memset(raw[0 .. page_count * 4096], 0);
     const ptr: [*]T = @ptrCast(@alignCast(raw));
@@ -283,23 +282,80 @@ pub fn getFdTableConst(self: anytype, principal: PrincipalId) ?*const FdTable {
     return self.fdTableForProcessIndexConst(index);
 }
 
-pub fn inheritFdsForProcessCreate(self: anytype, from: PrincipalId, to: PrincipalId) KernelError!void {
+pub fn retireFdStorage(table: *FdTable, storage: []FdEntry) void {
+    if (storage.len == 0) return;
+    const node: *types.RetiredFdStorage = @ptrCast(@alignCast(storage.ptr));
+    node.* = .{ .next = table.retired_storage, .page_count = (storage.len * @sizeOf(FdEntry) + 4095) / 4096 };
+    table.retired_storage = node;
+}
+
+pub fn reclaimFdStorage(table: *FdTable, free_list: *FreePageList) void {
+    var link = &table.retired_storage;
+    while (link.*) |node| {
+        const next = node.next;
+        const page_count = node.page_count;
+        free_list.appendContiguousRange(0, @intFromPtr(node), page_count) catch |err| switch (err) {
+            error.TooManyFreeRanges => {
+                link = &node.next;
+                continue;
+            },
+            else => @panic("invalid FD table metadata release"),
+        };
+        link.* = next;
+    }
+}
+
+pub fn ensureFdTableCapacity(self: anytype, owner: PrincipalId, minimum: usize, free_list: *FreePageList) KernelError!void {
+    if (minimum > types.fd_table_limit) return KernelError.InvalidState;
+    const table = try self.fdTableForActiveProcess(owner);
+    reclaimFdStorage(table, free_list);
+    if (minimum <= table.slots().len) return;
+    const capacity = @min(types.fd_table_limit, @max(minimum, table.slots().len * 2));
+    const storage = allocKernelSlice(FdEntry, free_list, capacity) orelse return KernelError.OutOfFreePages;
+    @memcpy(storage[0..table.slots().len], table.slots());
+    const old = table.dynamic_entries;
+    table.dynamic_entries = storage;
+    // This is a move, not a duplicate of the capability references.
+    @memset(&table.entries, .{});
+    retireFdStorage(table, old);
+    reclaimFdStorage(table, free_list);
+}
+
+pub fn grantFdsForProcessCreate(self: anytype, from: PrincipalId, to: PrincipalId, grants: []const @import("kernel_abi_root").process_abi.ProcessFdGrant, free_list: *FreePageList) KernelError!void {
     if (from == to) return KernelError.InvalidState;
+    if (grants.len > @import("kernel_abi_root").process_abi.process_create_max_grants)
+        return KernelError.InvalidState;
     const source_table = try self.fdTableForActiveProcessConst(from);
     const dest_table = try self.fdTableForActiveProcess(to);
-    var fd_index: usize = 0;
-    while (fd_index < fd_table_entries) : (fd_index += 1) {
-        const source = source_table.entries[fd_index];
-        if (source.object.isNull() or !source.flags.inherit or source.flags.private) continue;
-        if (self.kernelObjectIsPinnedUserObject(source.object)) continue;
-        if (!dest_table.entries[fd_index].isEmpty()) return KernelError.InvalidState;
+    var capacity: usize = 0;
+    for (grants, 0..) |grant, i| {
+        if (grant.source_fd >= source_table.slots().len or grant.target_fd >= types.fd_table_limit or
+            (grant.rights & ~types.fd_known_rights_mask) != 0 or
+            (grant.flags & ~@as(u64, types.fd_known_flags_mask)) != 0) return KernelError.InvalidState;
+        for (grants[0..i]) |previous| if (previous.target_fd == grant.target_fd) return KernelError.InvalidState;
+        const source = source_table.slots()[@intCast(grant.source_fd)];
+        if (source.object.isNull() or !source.rights.transfer or
+            (grant.rights & ~fdRightsToBits(source.rights)) != 0 or
+            self.kernelObjectSlotConst(source.object) == null or
+            self.kernelObjectIsPinnedUserObject(source.object)) return KernelError.InvalidState;
+        if (grant.target_fd < dest_table.slots().len and
+            !dest_table.slots()[@intCast(grant.target_fd)].isEmpty()) return KernelError.InvalidState;
+        capacity = @max(capacity, @as(usize, @intCast(grant.target_fd)) + 1);
+    }
+    try self.ensureFdTableCapacity(to, capacity, free_list);
+    var installed: usize = 0;
+    errdefer for (grants[0..installed]) |grant|
+        self.closeFdWithFreeList(to, @intCast(grant.target_fd), free_list) catch {};
+    for (grants) |grant| {
+        const source = source_table.slots()[@intCast(grant.source_fd)];
         try self.retainKernelObject(source.object);
-        dest_table.entries[fd_index] = .{
+        dest_table.slots()[@intCast(grant.target_fd)] = .{
             .object = source.object,
-            .rights = fdRightsFromBits(fdRightsToBits(source.rights)),
-            .flags = fdFlagsFromBits(fdFlagsToBits(source.flags)),
+            .rights = fdRightsFromBits(grant.rights),
+            .flags = fdFlagsFromBits(@intCast(grant.flags)),
             .offset = source.offset,
         };
+        installed += 1;
     }
 }
 
@@ -307,22 +363,23 @@ pub fn cloneFdTableForFork(self: anytype, from: PrincipalId, to: PrincipalId) Ke
     if (from == to) return KernelError.InvalidState;
     const source_table = try self.fdTableForActiveProcessConst(from);
     const dest_table = try self.fdTableForActiveProcess(to);
+    if (dest_table.slots().len < source_table.slots().len) return KernelError.TableFull;
     var fd_index: usize = 0;
     errdefer {
         var release_index: usize = 0;
-        while (release_index < fd_table_entries) : (release_index += 1) {
-            const object_ref = dest_table.entries[release_index].object;
+        while (release_index < dest_table.slots().len) : (release_index += 1) {
+            const object_ref = dest_table.slots()[release_index].object;
             if (object_ref.isNull()) continue;
-            dest_table.entries[release_index] = .{};
+            dest_table.slots()[release_index] = .{};
             self.releaseKernelObject(object_ref);
         }
     }
-    while (fd_index < fd_table_entries) : (fd_index += 1) {
-        const source = source_table.entries[fd_index];
-        if (source.object.isNull()) continue;
-        if (!dest_table.entries[fd_index].isEmpty()) return KernelError.InvalidState;
+    while (fd_index < source_table.slots().len) : (fd_index += 1) {
+        const source = source_table.slots()[fd_index];
+        if (source.object.isNull() or source.flags.private) continue;
+        if (!dest_table.slots()[fd_index].isEmpty()) return KernelError.InvalidState;
         try self.retainKernelObject(source.object);
-        dest_table.entries[fd_index] = .{
+        dest_table.slots()[fd_index] = .{
             .object = source.object,
             .rights = fdRightsFromBits(fdRightsToBits(source.rights)),
             .flags = fdFlagsFromBits(fdFlagsToBits(source.flags)),
@@ -485,7 +542,7 @@ pub fn markThreadObjectsExitedBySlot(self: anytype, thread_index: usize, thread_
 }
 
 pub fn nextProcessCapacity(self: anytype, required: usize) ?usize {
-    return table.nextGeometricCapacity(
+    return table_util.nextGeometricCapacity(
         self.process_capacity,
         process_count,
         max_process_slots,

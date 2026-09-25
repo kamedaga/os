@@ -25,7 +25,6 @@ pub const boot_log_console_stack_page_va = boot_layout.boot_log_console_stack_pa
 pub const boot_log_console_stack_top = boot_layout.boot_log_console_stack_top;
 pub const boot_log_console_entry_rsp = boot_layout.boot_log_console_entry_rsp;
 pub const boot_log_user_va = boot_layout.boot_log_user_va;
-pub const framebuffer_window_bytes = boot_layout.framebuffer_window_bytes;
 pub const phys_copy_window_va = boot_layout.phys_copy_window_va;
 
 pub const user_entry_rflags: u64 = 0x202;

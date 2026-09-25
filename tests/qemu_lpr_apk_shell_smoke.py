@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import os
+import re
 import select
 import socket
 import sys
 import time
 
 
-PROMPT = b"bash-5.3# "
+# The rootfs bash version moves with Alpine, so pin the shape of the prompt
+# rather than one release.  A literal went stale and made this probe wait for a
+# prompt the guest could never print.
+PROMPT = re.compile(rb"bash-\d+\.\d+# ")
 MARKERS = (
     b"APK_SHELL_VERSION=OK",
     b"APK_SHELL_UPDATE=OK",
@@ -19,17 +23,23 @@ MARKERS = (
 )
 
 
+def seen(needle, output: bytearray) -> bool:
+    if isinstance(needle, re.Pattern):
+        return needle.search(output) is not None
+    return needle in output
+
+
 def wait_for(
     sock: socket.socket,
     output: bytearray,
-    needle: bytes,
+    needle,
     deadline: float,
     fail_on_prompt: bool = False,
 ) -> None:
     while time.monotonic() < deadline:
-        if needle in output:
+        if seen(needle, output):
             return
-        if fail_on_prompt and PROMPT in output:
+        if fail_on_prompt and seen(PROMPT, output):
             raise AssertionError(
                 f"shell returned before {needle!r}; tail={bytes(output[-4000:])!r}"
             )

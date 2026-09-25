@@ -1,12 +1,10 @@
 const std = @import("std");
+const iova = @import("iova.zig");
 
-const acpi_header_bytes: usize = 36;
 const dmar_fixed_bytes: usize = 48;
 const remapping_header_bytes: usize = 4;
 const drhd_fixed_bytes: usize = 16;
 const device_scope_fixed_bytes: usize = 6;
-const max_physical_table_bytes: usize = 1024 * 1024;
-const max_rsdp_bytes: usize = 4096;
 
 pub const max_drhd_count: usize = 32;
 pub const max_device_scopes_per_drhd: usize = 32;
@@ -37,6 +35,9 @@ pub const Drhd = struct {
 };
 
 pub const DmarInfo = struct {
+    /// Conservative continuous window: exclude every RMRR, irrespective of
+    /// device scope. This is not RMRR identity-mapping support.
+    dma_window_end: u64 = iova.window_ceiling,
     /// ACPI encodes this field as one less than the supported address width.
     host_address_width: u8 = 0,
     flags: u8 = 0,
@@ -61,6 +62,7 @@ pub const ParseError = error{
     InvalidDeviceScopeLength,
     TooManyDeviceScopes,
     DeviceScopePathTooLong,
+    InvalidReservedRange,
 };
 
 pub const PhysicalTable = struct {
@@ -92,8 +94,8 @@ fn checksumOk(bytes: []const u8) bool {
 }
 
 /// Parse a complete DMAR byte sequence without accessing physical memory or
-/// producing output. Only type-0 DRHD structures are retained; all other
-/// well-formed remapping structures are skipped.
+/// producing output. DRHDs are retained; RMRRs clip the DMA window without a
+/// bounded reservation array. Other well-formed structures are skipped.
 pub fn parseDmar(bytes: []const u8) ParseError!DmarInfo {
     if (bytes.len < dmar_fixed_bytes) return error.TableTooShort;
     if (!std.mem.eql(u8, bytes[0..4], "DMAR")) return error.InvalidSignature;
@@ -159,77 +161,37 @@ pub fn parseDmar(bytes: []const u8) ParseError!DmarInfo {
             }
             result.drhds[result.drhd_count] = drhd;
             result.drhd_count += 1;
+        } else if (structure_type == 1) {
+            // ACPI DMAR RMRR: header, reserved, segment, base, inclusive limit,
+            // followed by device scopes. Bounds follow actbl1.h / DMAR format.
+            if (structure_len < 24 + 8) return error.InvalidStructureLength;
+            const base = readLe64(table, offset + 8);
+            const last = readLe64(table, offset + 16);
+            if (base > last or base % 4096 != 0 or last % 4096 != 4095)
+                return error.InvalidReservedRange;
+            var scope = offset + 24;
+            const end = offset + structure_len;
+            while (scope < end) {
+                if (end - scope < 8) return error.TruncatedDeviceScope;
+                const length: usize = table[scope + 1];
+                if (length < 8 or length % 2 != 0 or length > end - scope or
+                    (table[scope] != 1 and table[scope] != 2)) return error.InvalidDeviceScopeLength;
+                var path = scope + 6;
+                while (path < scope + length) : (path += 2) {
+                    if (table[path] >= 32 or table[path + 1] >= 8) return error.InvalidDeviceScopeLength;
+                }
+                scope += length;
+            }
+            result.dma_window_end = iova.exclude(iova.window_start, result.dma_window_end, base, last);
         }
         offset += structure_len;
     }
     return result;
 }
 
-fn physicalBytes(addr: u64, len: usize) []const u8 {
-    const ptr: [*]const u8 = @ptrFromInt(addr);
-    return ptr[0..len];
-}
-
-fn physicalSignatureEquals(addr: u64, expected: []const u8) bool {
-    return std.mem.eql(u8, physicalBytes(addr, expected.len), expected);
-}
-
-fn physicalReadU32(addr: u64) u32 {
-    return readLe32(physicalBytes(addr, 4), 0);
-}
-
-fn physicalReadU64(addr: u64) u64 {
-    return readLe64(physicalBytes(addr, 8), 0);
-}
-
-fn physicalChecksumOk(addr: u64, len: usize) bool {
-    return checksumOk(physicalBytes(addr, len));
-}
-
-fn findDmarFromRoot(root_addr: u64, xsdt: bool) ?PhysicalTable {
-    if (!physicalSignatureEquals(root_addr, if (xsdt) "XSDT" else "RSDT")) return null;
-    const root_len: usize = @intCast(physicalReadU32(root_addr + 4));
-    if (root_len < acpi_header_bytes or root_len > max_physical_table_bytes) return null;
-    if (!physicalChecksumOk(root_addr, root_len)) return null;
-
-    const entry_size: usize = if (xsdt) 8 else 4;
-    var offset: usize = acpi_header_bytes;
-    while (offset + entry_size <= root_len) : (offset += entry_size) {
-        const entry_addr = root_addr + offset;
-        const table_addr = if (xsdt)
-            physicalReadU64(entry_addr)
-        else
-            @as(u64, physicalReadU32(entry_addr));
-        if (table_addr == 0 or !physicalSignatureEquals(table_addr, "DMAR")) continue;
-        const table_len: usize = @intCast(physicalReadU32(table_addr + 4));
-        if (table_len < 8 or table_len > max_physical_table_bytes) return null;
-        return .{
-            .paddr = table_addr,
-            .bytes = physicalBytes(table_addr, table_len),
-        };
-    }
-    return null;
-}
-
 /// Locate DMAR through the Limine-provided RSDP, following the same checked
 /// RSDP -> XSDT/RSDT traversal used by SMP MADT discovery.
 pub fn findDmar(rsdp_addr: u64) ?PhysicalTable {
-    if (rsdp_addr == 0 or !physicalSignatureEquals(rsdp_addr, "RSD PTR ")) return null;
-    if (!physicalChecksumOk(rsdp_addr, 20)) return null;
-
-    const legacy_rsdp = physicalBytes(rsdp_addr, 20);
-    if (legacy_rsdp[15] >= 2) {
-        const extended_rsdp = physicalBytes(rsdp_addr, 36);
-        const rsdp_len: usize = @intCast(readLe32(extended_rsdp, 20));
-        const xsdt_addr = readLe64(extended_rsdp, 24);
-        if (rsdp_len >= 36 and rsdp_len <= max_rsdp_bytes and xsdt_addr != 0 and
-            physicalChecksumOk(rsdp_addr, rsdp_len))
-        {
-            if (findDmarFromRoot(xsdt_addr, true)) |dmar| return dmar;
-        }
-    }
-
-    const rsdt_addr = readLe32(legacy_rsdp, 16);
-    if (rsdt_addr == 0) return null;
-    return findDmarFromRoot(rsdt_addr, false);
+    const bytes = @import("acpi_tables.zig").find(rsdp_addr, "DMAR", dmar_fixed_bytes) orelse return null;
+    return .{ .paddr = @intFromPtr(bytes.ptr), .bytes = bytes };
 }

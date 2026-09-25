@@ -1,0 +1,2 @@
+/srv/kobox2/core.so=../.artifacts/kobox2-client-task-diagnostic-runtime/linux-boot-runtime.so
+/srv/kobox2/vm-client.elf=../.artifacts/tests/kobox2-pacha-vm/vm_client.elf

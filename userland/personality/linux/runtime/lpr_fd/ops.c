@@ -1,11 +1,8 @@
 #include "../lpr_filed_internal.h"
+#include "../support/browser_diag.h"
 
 #define LPR_LINUX_EMSGSIZE 90
 
-enum {
-    LPR_TRANSFER_AF_UNIX = 1u,
-    LPR_TRANSFER_SOCK_STREAM = 1u,
-};
 
 static int64_t lpr_ops_filed_close(void *state)
 {
@@ -122,7 +119,7 @@ static int64_t lpr_ops_dmabuf_close(void *state)
     const int transfer_lease =
         (dmabuf->reserved0 & LPR_BACKEND_TRANSFER_LEASE) != 0;
     const int64_t release_status = !transfer_lease && dmabuf->token != 0 ?
-        lpr_drm_prime_ref(DRMD_OP_PRIME_RELEASE, dmabuf->token) : 0;
+        lpr_drm_prime_ref(GPUD_DRM_OP_PRIME_RELEASE, dmabuf->token) : 0;
     const int64_t lease_status = dmabuf->lease_fd.raw >= 16 ?
         lpr_close_native_fd_if_open((uint64_t)(uint32_t)dmabuf->lease_fd.raw) : 0;
     return close_status != 0 ? close_status :
@@ -170,6 +167,7 @@ static int64_t lpr_fd_close_backend(uint8_t ops_id, void *state)
     case LPR_FD_OPS_PIPE: return lpr_ops_pipe_close(state);
     case LPR_FD_OPS_EVENT: return lpr_ops_event_close(state);
     case LPR_FD_OPS_SOCKET: return lpr_socket_close_backend(state);
+    case LPR_FD_OPS_UNIX: return lpr_unix_socket_close(state);
     case LPR_FD_OPS_EPOLL: return lpr_ops_epoll_close(state);
     case LPR_FD_OPS_DMABUF: return lpr_ops_dmabuf_close(state);
     case LPR_FD_OPS_SYNC_FILE: return lpr_ops_sync_file_close(state);
@@ -202,7 +200,7 @@ static int lpr_transfer_duplicate_capability(int source_fd)
 
 int lpr_fd_transfer_prepare(
     const lpr_fd_pin_t *pin,
-    netd_transfer_occurrence_t *item,
+    struct unix_transfer_item *item,
     int *capability_fds,
     uint32_t capability_capacity,
     uint32_t *out_capability_count)
@@ -211,8 +209,19 @@ int lpr_fd_transfer_prepare(
         return -LPR_LINUX_EINVAL;
     lpr_memset(item, 0, sizeof(*item));
     *out_capability_count = 0;
-    item->provider_id = pin->ops_id;
+    item->provider = pin->ops_id;
     item->rights = pin->effective_rights;
+    if (pin->ops_id == LPR_FD_OPS_UNIX) {
+        struct lpr_unix_socket *socket = pin->state;
+        int status = lpr_unix_socket_adopt(socket);
+        if (status) return status;
+        const uint32_t rights = LPR_FD_RIGHT_READ | LPR_FD_RIGHT_WRITE | LPR_FD_RIGHT_DUP |
+            LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_IOCTL;
+        if (socket->process_token != lpr_supervisor_token || !socket->socket) return -LPR_LINUX_ENOTCONN;
+        if (pin->effective_rights != rights) return -LPR_LINUX_EOPNOTSUPP;
+        *item = (struct unix_transfer_item){ .provider = UNIX_TRANSFER_SOCKET, .object = socket->socket };
+        return 0; /* unixd retains the authenticated OFD, not local VMO numbers. */
+    }
     if (pin->ops_id == LPR_FD_OPS_FILED) {
         const lpr_filed_backend_t *filed = pin->state;
         /* SCM_RIGHTS transfers an open file description, not a pathname or a
@@ -224,7 +233,7 @@ int lpr_fd_transfer_prepare(
             return -LPR_LINUX_EMSGSIZE;
         int lease_fd = -1;
         int remote_lease_fd = -1;
-        const int pair_status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        const int pair_status = lpr_filed_lease_pair(&lease_fd, &remote_lease_fd);
         if (pair_status != 0) return pair_status;
         uint64_t ticket = 0;
         const int64_t status = lpr_filed_transfer_dup_handle(
@@ -238,9 +247,9 @@ int lpr_fd_transfer_prepare(
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
             return -LPR_LINUX_EIO;
         }
-        item->transfer_token = ticket |
+        item->object = ticket |
             ((uint64_t)filed->reserved1 << 32u);
-        item->fd_flags = filed->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->flags = filed->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 1;
         capability_fds[0] = lease_fd;
         *out_capability_count = 1;
@@ -248,12 +257,11 @@ int lpr_fd_transfer_prepare(
     }
     if (pin->ops_id == LPR_FD_OPS_TTY) {
         const lpr_tty_backend_t *tty = pin->state;
-        /* GApplication forwards the invoking process' stdin over
-         * SCM_RIGHTS.  The Xfce session stdin is the console TTY.  PTY
-         * master/slave roles need additional metadata, so keep this transfer
-         * deliberately limited to the role-less console handle. */
+        /* Preserve the open endpoint's role, including across repeated
+         * transfers (GApplication forwards the invoking terminal's stdin).
+         * termd's lease retains that same open description. */
         if (!tty->active || tty->handle == 0 || tty->wait_fd.raw < 16 ||
-            tty->reserved0 != 0)
+            tty->reserved0 > LPR_TTY_BACKEND_PTY_SLAVE)
             return -LPR_LINUX_EOPNOTSUPP;
         if (capability_fds == 0 || capability_capacity < 2)
             return -LPR_LINUX_EMSGSIZE;
@@ -278,8 +286,9 @@ int lpr_fd_transfer_prepare(
                 (uint64_t)(uint32_t)remote_lease_fd);
             return status != 0 ? (int)status : -LPR_LINUX_EIO;
         }
-        item->transfer_token = handle;
-        item->fd_flags = tty->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->object = handle;
+        item->provider_data = tty->reserved0;
+        item->flags = tty->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 2;
         capability_fds[0] = wait_fd;
         capability_fds[1] = lease_fd;
@@ -316,8 +325,8 @@ int lpr_fd_transfer_prepare(
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
             return -LPR_LINUX_EIO;
         }
-        item->transfer_token = ticket | ((uint64_t)input->event_index << 56u);
-        item->fd_flags = input->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->object = ticket | ((uint64_t)input->event_index << 56u);
+        item->flags = input->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 2;
         capability_fds[0] = wait_fd;
         capability_fds[1] = lease_fd;
@@ -353,10 +362,44 @@ int lpr_fd_transfer_prepare(
             (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
             return -LPR_LINUX_EIO;
         }
-        item->transfer_token = ticket;
-        item->fd_flags = drm->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->object = ticket;
+        item->flags = drm->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 2;
         capability_fds[0] = wait_fd;
+        capability_fds[1] = lease_fd;
+        *out_capability_count = 2;
+        return 0;
+    }
+    if (pin->ops_id == LPR_FD_OPS_DMABUF) {
+        const lpr_dmabuf_backend_t *dmabuf = pin->state;
+        if (dmabuf->token == 0 || dmabuf->native.raw < 16)
+            return -LPR_LINUX_EOPNOTSUPP;
+        if (capability_fds == 0 || capability_capacity < 2)
+            return -LPR_LINUX_EMSGSIZE;
+        const int native_fd =
+            lpr_transfer_duplicate_capability(dmabuf->native.raw);
+        if (native_fd < 0) return native_fd;
+        int lease_fd = -1;
+        int remote_lease_fd = -1;
+        int status = lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
+        if (status == 0)
+            status = (int)lpr_drm_prime_transfer_acquire(
+                dmabuf->token, remote_lease_fd);
+        if (status != 0) {
+            (void)lpr_close_native_fd_if_open(
+                (uint64_t)(uint32_t)native_fd);
+            if (lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)lease_fd);
+            if (remote_lease_fd >= 16)
+                (void)lpr_close_native_fd_if_open(
+                    (uint64_t)(uint32_t)remote_lease_fd);
+            return status;
+        }
+        item->object = dmabuf->token;
+        item->flags = dmabuf->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count = 2;
+        capability_fds[0] = native_fd;
         capability_fds[1] = lease_fd;
         *out_capability_count = 2;
         return 0;
@@ -369,68 +412,20 @@ int lpr_fd_transfer_prepare(
         const int wait_fd =
             lpr_transfer_duplicate_capability(sync_file->wait_fd.raw);
         if (wait_fd < 0) return wait_fd;
-        item->transfer_token = 1;
-        item->fd_flags =
+        item->object = 1;
+        item->flags =
             sync_file->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
         item->capability_count = 1;
         capability_fds[0] = wait_fd;
         *out_capability_count = 1;
         return 0;
     }
-    if (pin->ops_id == LPR_FD_OPS_SOCKET) {
-        const lpr_socket_backend_t *socket = pin->state;
-        /* Glycin passes its image input as one end of an AF_UNIX stream
-         * socket.  Keep this support deliberately narrower than arbitrary
-         * socket migration: the receiver can reconstruct every relevant
-         * property of a connected Unix stream without inventing an ABI for
-         * TCP, netlink, or sequenced-packet state. */
-        if (!socket->active || socket->handle == 0 ||
-            socket->domain != LPR_TRANSFER_AF_UNIX ||
-            socket->type != LPR_TRANSFER_SOCK_STREAM ||
-            !socket->connected || socket->protocol != 0 ||
-            socket->wait_fd.raw < 16)
-            return -LPR_LINUX_EOPNOTSUPP;
-        if (capability_fds == 0 || capability_capacity < 2)
-            return -LPR_LINUX_EMSGSIZE;
-
-        const int wait_fd =
-            lpr_transfer_duplicate_capability(socket->wait_fd.raw);
-        if (wait_fd < 0) return wait_fd;
-        int lease_fd = -1;
-        int remote_lease_fd = -1;
-        const int pair_status =
-            lpr_native_wait_pair(&lease_fd, &remote_lease_fd);
-        if (pair_status != 0) {
-            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-            return pair_status;
-        }
-        const int64_t status = lpr_netd_transfer_dup_handle(
-            socket->handle, remote_lease_fd);
-        if (status != 0) {
-            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-            (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)lease_fd);
-            (void)lpr_close_native_fd_if_open(
-                (uint64_t)(uint32_t)remote_lease_fd);
-            return (int)status;
-        }
-        item->transfer_token = socket->handle;
-        item->fd_flags = socket->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
-        item->capability_count = 2;
-        capability_fds[0] = wait_fd;
-        capability_fds[1] = lease_fd;
-        *out_capability_count = 2;
-        return 0;
-    }
     return -LPR_LINUX_EOPNOTSUPP;
 }
 
-void lpr_fd_transfer_cancel_ticket(const netd_transfer_occurrence_t *item)
-{
-    (void)item;
-}
 
-int lpr_fd_transfer_import_batch(
-    const netd_transfer_occurrence_t *items,
+int lpr_fd_transfer_stage_batch(
+    const struct unix_transfer_item *items,
     uint32_t item_count,
     const int *capability_fds,
     uint32_t capability_count,
@@ -441,14 +436,14 @@ int lpr_fd_transfer_import_batch(
         LPR_FD_RIGHT_IOCTL | LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_MMAP |
         LPR_FD_RIGHT_DUP;
     if (items == 0 || out_fds == 0 || item_count == 0 ||
-        item_count > NETD_TRANSFER_MAX_ITEMS ||
-        capability_count > NETD_TRANSFER_MAX_CAPABILITIES ||
+        item_count > UNIX_TRANSFER_BATCH ||
+        capability_count > PACHA_IPC_MAX_TRANSFER_FDS ||
         capability_fds == 0 ||
         (receive_flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC) != 0)
         return -LPR_LINUX_EINVAL;
-    lpr_fd_install_t installs[NETD_TRANSFER_MAX_ITEMS];
-    void *states[NETD_TRANSFER_MAX_ITEMS];
-    lpr_linux_fd_t installed[NETD_TRANSFER_MAX_ITEMS];
+    lpr_fd_install_t installs[UNIX_TRANSFER_BATCH];
+    void *states[UNIX_TRANSFER_BATCH];
+    lpr_linux_fd_t installed[UNIX_TRANSFER_BATCH];
     lpr_memset(installs, 0, sizeof(installs));
     lpr_memset(states, 0, sizeof(states));
     lpr_memset(installed, 0, sizeof(installed));
@@ -456,8 +451,9 @@ int lpr_fd_transfer_import_batch(
     uint32_t next_capability = 0;
     int status = 0;
     for (; prepared_count < item_count; ++prepared_count) {
-        const netd_transfer_occurrence_t *item = &items[prepared_count];
-        if (item->transfer_token == 0 || item->reserved0 != 0 ||
+        const struct unix_transfer_item *item = &items[prepared_count];
+        if (item->object == 0 ||
+            (item->provider != LPR_FD_OPS_TTY && item->provider_data != 0) ||
             (item->rights & ~known_rights) != 0 ||
             item->capability_first != next_capability ||
             item->capability_count > capability_count - next_capability)
@@ -466,48 +462,66 @@ int lpr_fd_transfer_import_batch(
             break;
         }
         const int *item_capabilities = capability_fds + next_capability;
-        uint64_t handle = item->transfer_token;
-        if (item->provider_id == LPR_FD_OPS_FILED) {
+        uint64_t handle = item->object;
+        if (item->provider == LPR_FD_OPS_FILED) {
             if (item->capability_count != 1 || item_capabilities[0] < 16 ||
-                (item->transfer_token >> 40u) != 0)
+                (item->object >> 40u) != 0)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
-            handle = (uint32_t)item->transfer_token;
-        } else if (item->provider_id == LPR_FD_OPS_TTY) {
+            handle = (uint32_t)item->object;
+        } else if (item->provider == LPR_FD_OPS_TTY) {
             if (item->capability_count != 2 ||
+                item->provider_data > LPR_TTY_BACKEND_PTY_SLAVE ||
                 item_capabilities[0] < 16 || item_capabilities[1] < 16)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
-        } else if (item->provider_id == LPR_FD_OPS_INPUT) {
+        } else if (item->provider == LPR_FD_OPS_INPUT) {
             if (item->capability_count != 2 || item_capabilities[0] < 16 ||
                 item_capabilities[1] < 16)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
-            handle = lpr_transfer_input_handle(item->transfer_token);
-        } else if (item->provider_id == LPR_FD_OPS_DRM) {
+            handle = lpr_transfer_input_handle(item->object);
+        } else if (item->provider == LPR_FD_OPS_DRM) {
             if (item->capability_count != 2 || item_capabilities[0] < 16 ||
                 item_capabilities[1] < 16)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
             }
-        } else if (item->provider_id == LPR_FD_OPS_SYNC_FILE) {
-            if (item->transfer_token != 1 || item->capability_count != 1 ||
+        } else if (item->provider == LPR_FD_OPS_DMABUF) {
+            struct pacha_fd_info view;
+            struct pacha_fd_info lease;
+            const uint64_t view_rights = PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
+            const uint64_t lease_rights = PACHA_FD_RIGHT_DUP |
+                PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE;
+            lpr_memset(&view, 0, sizeof(view));
+            lpr_memset(&lease, 0, sizeof(lease));
+            if (item->capability_count != 2 || item_capabilities[0] < 16 ||
+                item_capabilities[1] < 16 ||
+                !lpr_native_fd_info(
+                    (uint64_t)(uint32_t)item_capabilities[0], &view) ||
+                !lpr_native_fd_info(
+                    (uint64_t)(uint32_t)item_capabilities[1], &lease) ||
+                view.kind != PACHA_FD_KIND_VMO || !view.size ||
+                view.rights != view_rights ||
+                lease.kind != PACHA_FD_KIND_CHANNEL || lease.size ||
+                (lease.rights & lease_rights) != lease_rights ||
+                (item->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDWR)
+            {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
+        } else if (item->provider == LPR_FD_OPS_SYNC_FILE) {
+            if (item->object != 1 || item->capability_count != 1 ||
                 item_capabilities[0] < 16)
-            {
-                status = -LPR_LINUX_EINVAL;
-                break;
-            }
-        } else if (item->provider_id == LPR_FD_OPS_SOCKET) {
-            if (item->capability_count != 2 ||
-                item_capabilities[0] < 16 || item_capabilities[1] < 16 ||
-                item->transfer_token == 0)
             {
                 status = -LPR_LINUX_EINVAL;
                 break;
@@ -517,58 +531,71 @@ int lpr_fd_transfer_import_batch(
             break;
         }
         const uint64_t state_bytes =
-            lpr_backend_state_bytes_for_ops((uint8_t)item->provider_id);
+            lpr_backend_state_bytes_for_ops((uint8_t)item->provider);
         states[prepared_count] = lpr_backend_state_alloc(state_bytes);
         if (states[prepared_count] == 0) {
             status = -LPR_LINUX_ENOMEM;
             break;
         }
-        const uint64_t linux_flags = item->fd_flags | receive_flags;
-        if (item->provider_id == LPR_FD_OPS_FILED) {
+        const uint64_t linux_flags = item->flags | receive_flags;
+        if (item->provider == LPR_FD_OPS_FILED) {
             lpr_filed_backend_t *filed = states[prepared_count];
+            status = lpr_filed_adopt(handle, item_capabilities[0]);
+            if (status) {
+                (void)lpr_backend_state_free(states[prepared_count], state_bytes);
+                states[prepared_count] = 0;
+                break;
+            }
             filed->active = 1;
             filed->offset_valid = 1;
             filed->flags = (uint32_t)linux_flags;
             filed->handle = handle;
-            filed->reserved1 = (uint8_t)(item->transfer_token >> 32u);
+            filed->reserved1 = (uint8_t)(item->object >> 32u);
             filed->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
             filed->lease_fd.raw = item_capabilities[0];
-        } else if (item->provider_id == LPR_FD_OPS_TTY) {
+        } else if (item->provider == LPR_FD_OPS_TTY) {
             lpr_tty_backend_t *tty = states[prepared_count];
             tty->active = 1;
             tty->flags = (uint32_t)linux_flags;
             tty->handle = handle;
+            tty->reserved0 = (uint8_t)item->provider_data;
             tty->wait_fd.raw = item_capabilities[0];
             tty->lease_fd.raw = item_capabilities[1];
             tty->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
-        } else if (item->provider_id == LPR_FD_OPS_INPUT) {
+        } else if (item->provider == LPR_FD_OPS_INPUT) {
             lpr_input_backend_t *input = states[prepared_count];
             input->active = 1;
             input->flags = (uint32_t)linux_flags;
             input->handle = handle;
-            input->event_index = (uint8_t)(item->transfer_token >> 56u);
+            input->event_index = (uint8_t)(item->object >> 56u);
             input->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
             input->wait_fd.raw = item_capabilities[0];
             input->lease_fd.raw = item_capabilities[1];
-        } else if (item->provider_id == LPR_FD_OPS_SYNC_FILE) {
+        } else if (item->provider == LPR_FD_OPS_SYNC_FILE) {
             lpr_sync_file_backend_t *sync_file = states[prepared_count];
             sync_file->active = 1;
             sync_file->flags = (uint32_t)linux_flags;
             sync_file->wait_fd.raw = item_capabilities[0];
-        } else if (item->provider_id == LPR_FD_OPS_SOCKET) {
-            lpr_socket_backend_t *socket = states[prepared_count];
-            socket->active = 1;
-            socket->type = LPR_TRANSFER_SOCK_STREAM;
-            socket->connected = 1;
-            socket->domain = LPR_TRANSFER_AF_UNIX;
-            socket->protocol = 0;
-            socket->flags = (uint32_t)linux_flags;
-            socket->sndbuf = 256u * 1024u;
-            socket->rcvbuf = 256u * 1024u;
-            socket->handle = handle;
-            socket->reserved1 |= LPR_BACKEND_TRANSFER_LEASE;
-            socket->wait_fd.raw = item_capabilities[0];
-            socket->lease_fd.raw = item_capabilities[1];
+        } else if (item->provider == LPR_FD_OPS_DMABUF) {
+            struct pacha_fd_info view;
+            lpr_memset(&view, 0, sizeof(view));
+            if (!lpr_native_fd_info(
+                    (uint64_t)(uint32_t)item_capabilities[0], &view)) {
+                status = -LPR_LINUX_EBADF;
+                (void)lpr_backend_state_free(
+                    states[prepared_count], state_bytes);
+                states[prepared_count] = 0;
+                break;
+            }
+            lpr_dmabuf_backend_t *dmabuf = states[prepared_count];
+            dmabuf->active = 1;
+            dmabuf->writable = 1;
+            dmabuf->reserved0 |= LPR_BACKEND_TRANSFER_LEASE;
+            dmabuf->flags = (uint32_t)linux_flags;
+            dmabuf->token = handle;
+            dmabuf->size = view.size;
+            dmabuf->native.raw = item_capabilities[0];
+            dmabuf->lease_fd.raw = item_capabilities[1];
         } else {
             lpr_drm_backend_t *drm = states[prepared_count];
             drm->active = 1;
@@ -579,7 +606,7 @@ int lpr_fd_transfer_import_batch(
             drm->lease_fd.raw = item_capabilities[1];
         }
         lpr_fd_install_t *install = &installs[prepared_count];
-        install->ops_id = (uint8_t)item->provider_id;
+        install->ops_id = (uint8_t)item->provider;
         install->fd_flags = lpr_control_fd_flags_from_linux(linux_flags);
         install->access_mode =
             (uint16_t)(linux_flags & LPR_LINUX_O_ACCMODE);
@@ -594,41 +621,12 @@ int lpr_fd_transfer_import_batch(
     if (status == 0 && next_capability != capability_count)
         status = -LPR_LINUX_EINVAL;
     if (status == 0) {
-        const lpr_linux_fd_t excluded[] = {
-            LPR_FILED_ENDPOINT_FD,
-            LPR_NETD_ENDPOINT_FD,
-            LPR_TERMD_TTY_ENDPOINT_FD,
-            LPR_DRMD_DRM_ENDPOINT_FD,
-            LPR_INPUTD_INPUT_ENDPOINT_FD,
-            LPR_BOOTSTRAP_FD,
-            LPR_SUPERVISOR_ENDPOINT_FD,
-        };
-        int batch_status = lpr_fd_table_alloc_batch(
-                &lpr_control_fd_table,
-                3,
-                installs,
-                item_count,
-                excluded,
-                (uint32_t)(sizeof(excluded) / sizeof(excluded[0])),
-                installed);
-        if (batch_status != 0) {
-            const uint64_t required_capacity =
-                lpr_fd_table_capacity + (uint64_t)item_count;
-            if (required_capacity == 0 ||
-                required_capacity > LPR_FD_TABLE_MAX_SIZE ||
-                lpr_fd_table_ensure_capacity(required_capacity) != 0)
-            {
+        while (lpr_fd_table_stage_batch(&lpr_control_fd_table, installs, item_count, installed) != 0) {
+            const uint64_t capacity = lpr_fd_table_capacity;
+            if (capacity >= LPR_FD_TABLE_MAX_SIZE ||
+                lpr_fd_table_ensure_capacity(capacity + item_count) != 0) {
                 status = -LPR_LINUX_EMFILE;
-            } else {
-                batch_status = lpr_fd_table_alloc_batch(
-                    &lpr_control_fd_table,
-                    3,
-                    installs,
-                    item_count,
-                    excluded,
-                    (uint32_t)(sizeof(excluded) / sizeof(excluded[0])),
-                    installed);
-                if (batch_status != 0) status = -LPR_LINUX_EMFILE;
+                break;
             }
         }
     }
@@ -682,6 +680,8 @@ static int lpr_fd_io_supported(uint8_t ops_id, uint32_t operation)
     case LPR_FD_OPS_EVENT:
     case LPR_FD_OPS_SOCKET:
         return operation <= 5;
+    case LPR_FD_OPS_UNIX:
+        return operation <= 5;
     case LPR_FD_OPS_DRM:
     case LPR_FD_OPS_INPUT:
         return operation == 0 || operation == 2 || operation == 4 || operation == 5;
@@ -701,6 +701,14 @@ static int64_t lpr_fd_dispatch_direct(
     uint64_t arg1,
     uint32_t operation)
 {
+    if (pin->ops_id == LPR_FD_OPS_UNIX) {
+        if (operation <= 1) return lpr_unix_socket_io(pin, arg0, arg1, operation == 1, 0);
+        if (operation <= 3) return arg1 > 1024 ? -LPR_LINUX_EINVAL : arg1 == 0 ? 0 :
+            lpr_unix_socket_iov(pin, arg0, arg1, operation == 3, 0, NULL);
+        if (operation == 4) return lpr_unix_socket_ioctl(pin, arg0, arg1);
+        if (operation == 5) return lpr_unix_socket_stat(pin, arg0);
+        return -LPR_LINUX_EOPNOTSUPP;
+    }
     if (pin->ops_id == LPR_FD_OPS_SOCKET) {
         switch (operation) {
         case 0: return lpr_linux_socket_read(pin->fd, arg0, arg1);
@@ -734,6 +742,7 @@ static int64_t lpr_fd_dispatch_io(
     }
     lpr_fd_pin_t pin;
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
+        lpr_browser_diag("io-missing", fd, operation, lpr_control_fd_table.entry_count);
         return -LPR_LINUX_EBADF;
     }
     uint32_t required_right = 0;
@@ -751,8 +760,15 @@ static int64_t lpr_fd_dispatch_io(
         result = -LPR_LINUX_EBADF;
     else if (required_right != 0 && lpr_fd_io_supported(pin.ops_id, operation))
         result = lpr_fd_dispatch_direct(&pin, arg0, arg1, operation);
+    if (pin.ops_id == LPR_FD_OPS_EVENT && result < 0 &&
+        result != -LPR_LINUX_EAGAIN && result != -LPR_LINUX_EINTR) {
+        lpr_browser_diag("event-io-error", fd, operation, (uint64_t)result);
+    }
     lpr_fd_unpin(&pin);
-    if (operation <= 3) lpr_epoll_note_fd_state(fd);
+    if (operation <= 3)
+        lpr_epoll_note_fd_state(
+            fd, (operation & 1u) ? LPR_EPOLL_IO_WRITE : LPR_EPOLL_IO_READ,
+            result);
     return result;
 }
 
@@ -871,6 +887,8 @@ int64_t lpr_backend_finish_drop(const lpr_fd_drop_t *drop)
         return 0;
     }
     const int64_t close_status = lpr_fd_close_backend(drop->ops_id, drop->state);
+    if (close_status) lpr_browser_diag("backend-close", drop->ops_id,
+        (uint64_t)close_status, *(const uint64_t *)((const unsigned char *)drop->state + 8));
     const int64_t free_status =
         lpr_backend_state_free(drop->state, drop->state_bytes);
     return close_status != 0 ? close_status : free_status;

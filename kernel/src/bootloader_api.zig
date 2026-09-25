@@ -1,4 +1,5 @@
 pub const boot_resources = @import("boot/boot_resources.zig");
+pub const boot_diag = @import("boot/boot_diag.zig");
 pub const boot_static = @import("boot/main_static.zig");
 pub const entry = @import("boot/entry.zig");
 pub const halt = @import("halt.zig");

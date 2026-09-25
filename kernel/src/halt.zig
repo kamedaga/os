@@ -1,8 +1,10 @@
 const kernel_log = @import("kernel_log.zig");
+const boot_diag = @import("boot/boot_diag.zig");
 
 const serialWrite = kernel_log.write;
 
 pub fn haltLoop() noreturn {
+    boot_diag.showHalt();
     while (true) asm volatile ("hlt");
 }
 

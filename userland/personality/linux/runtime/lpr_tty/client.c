@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_fd/allocate.h"
 
 void *lpr_termd_payload(void *page)
 {
@@ -217,29 +218,11 @@ int64_t lpr_termd_transfer_dup_handle(
 
 int lpr_tty_fd_alloc(uint64_t handle, uint64_t flags, int native_wait_fd)
 {
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) {
-        return fd;
-    }
-    const int control_status = lpr_control_install_fd(
-        (uint64_t)fd,
-        LPR_FD_OPS_TTY,
-        flags,
-        handle,
-        0);
-    if (control_status != 0) {
-        return control_status;
-    }
-    lpr_tty_backend_t *tty = lpr_tty_backend((uint64_t)fd);
-    if (tty == 0) {
-        lpr_control_close_fd((uint64_t)fd);
-        return -LPR_LINUX_EIO;
-    }
-    tty->active = 1;
-    tty->flags = (uint32_t)flags;
-    tty->handle = handle;
-    tty->wait_fd.raw = native_wait_fd;
-    return fd;
+    const lpr_tty_backend_t record = {
+        .active = 1, .flags = (uint32_t)flags, .handle = handle,
+        .wait_fd.raw = native_wait_fd, .lease_fd.raw = -1,
+    };
+    return lpr_fd_alloc_state(LPR_FD_OPS_TTY, flags, 0, &record, sizeof(record));
 }
 
 int64_t lpr_tty_open_peer(uint64_t master_fd, uint64_t flags)
@@ -379,6 +362,7 @@ void lpr_linux_queue_signal(uint32_t sig)
 {
     const uint64_t bit = lpr_linux_signal_bit(sig);
     if (bit != 0) {
+        __atomic_store_n(&lpr_state.signal.local_pending_ever_queued, 1u, __ATOMIC_RELEASE);
         lpr_linux_pending_signal_mask |= bit;
     }
 }
@@ -446,6 +430,13 @@ uint32_t lpr_linux_first_pending_signal(uint64_t mask)
 
 int64_t lpr_linux_dispatch_pending_signals_with_result(int64_t interrupted_result)
 {
+    /* No thread-local lookup (and native GETTID) is needed until a local
+     * signal has ever been queued. This flag is NEVER cleared by a consumer,
+     * so another thread cannot hide pending work. Native pending signals are
+     * still checked separately by lpr_linux_deliver_native_pending_frame. */
+    if (__atomic_load_n(&lpr_state.signal.local_pending_ever_queued, __ATOMIC_ACQUIRE) == 0u) {
+        return 0;
+    }
     if (lpr_linux_signal_dispatching) {
         return 0;
     }

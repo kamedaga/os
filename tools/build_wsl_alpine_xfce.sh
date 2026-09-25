@@ -7,6 +7,8 @@ branch="${ALPINE_XFCE_VERSION:-v3.22}"
 arch="${ALPINE_XFCE_ARCH:-x86_64}"
 mirror="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 lock="${repo_root}/tools/manifests/alpine-xfce-v3.22-x86_64.lock"
+writer_lock="${repo_root}/tools/manifests/alpine-libreoffice-v3.22-x86_64.lock"
+browser_lock="${repo_root}/tools/manifests/alpine-epiphany-v3.22-x86_64.lock"
 cache="${repo_root}/.artifacts/third_party/alpine-xfce-${branch}-${arch}"
 clang_root="${repo_root}/.artifacts/userland-fixtures/alpine-clang-root"
 mesa_root="${repo_root}/.artifacts/userland-fixtures/alpine-mesa-root"
@@ -50,8 +52,8 @@ require_locked xf86-input-libinput 1.5.0-r0
 require_locked bash 5.2.37-r0
 require_locked readline 8.2.13-r1
 require_locked alpine-keys 2.5-r0
-require_locked apk-tools 2.14.10-r0
-require_locked libapk2 2.14.10-r0
+require_locked apk-tools 2.14.12-r0
+require_locked libapk2 2.14.12-r0
 require_locked musl 1.2.5-r12
 require_locked busybox 1.37.0-r20
 require_locked busybox-binsh 1.37.0-r20
@@ -64,6 +66,7 @@ require_locked thunar 4.20.3-r0
 require_locked xfce4-terminal 1.1.3-r0
 require_locked xfce4-notifyd 0.9.6-r0
 require_locked gtk+3.0-demo 3.24.50-r0
+require_locked gtk4.0-demo 4.18.6-r0
 require_locked json-c 0.18-r1
 
 if awk '$1 !~ /^#/ && $2 == "polkit-elogind-libs" { found=1 } END { exit found ? 0 : 1 }' "${lock}"; then
@@ -76,6 +79,17 @@ tmp="$(mktemp -d "${cache}/extract.XXXXXX")"
 trap 'rm -rf "${tmp}"' EXIT
 runtime="${tmp}/runtime"
 mkdir -p "${runtime}"
+# Keep the existing desktop pins intact and register Writer in the same apk
+# transaction. A separate overlay database would lose ownership of base files.
+base_lock="${lock}"
+lock="${tmp}/combined.lock"
+awk '$1 !~ /^#/' "${base_lock}" "${writer_lock}" "${browser_lock}" | LC_ALL=C sort -k2,2 >"${lock}"
+if ! awk '{ if (seen[$2]++) exit 1 }' "${lock}"; then
+  echo "duplicate package between Xfce and Writer locks" >&2
+  exit 1
+fi
+locked_count="$(awk '$1 == "#" && $2 == "package-count" { n += $3 } END { print n }' "${base_lock}" "${writer_lock}" "${browser_lock}")"
+printf '# package-count %s\n' "${locked_count}" >>"${lock}"
 package_count=0
 package_apks=()
 
@@ -136,15 +150,18 @@ locked_count="$(awk '$1 == "#" && $2 == "package-count" { print $3 }' "${lock}")
 # shipped Xfce stack from unmanaged files.  Running the target apk without
 # package scripts keeps this build deterministic while retaining upstream
 # package metadata, dependency edges, and file ownership records.
-command -v fakeroot >/dev/null 2>&1 || {
-  echo "fakeroot is required to construct the Xfce apk database" >&2
+command -v unshare >/dev/null 2>&1 || {
+  echo "unshare with user namespaces is required to construct the Xfce apk database" >&2
   exit 1
 }
 apk_bootstrap_libraries="${tmp}/apk-bootstrap-libraries"
 python3 "${repo_root}/tools/rootfs_overlay.py" library-view \
   "${apk_bootstrap_libraries}" \
   "${runtime}" "${mesa_root}" "${input_root}" "${clang_root}"
-fakeroot -- "${linux_musl}" --library-path "${apk_bootstrap_libraries}" \
+# Target apk uses musl, so glibc's fakeroot preload cannot emulate its xattr
+# calls. A root-mapped user namespace permits Alpine's file-capability xattrs
+# without host root privileges. Rootfs ownership is assigned by the packer.
+unshare --user --map-root-user -- "${linux_musl}" --library-path "${apk_bootstrap_libraries}" \
   "${runtime}/sbin/apk" \
   --root "${runtime}" \
   --initdb \
@@ -152,6 +169,7 @@ fakeroot -- "${linux_musl}" --library-path "${apk_bootstrap_libraries}" \
   --no-network \
   --no-progress \
   --no-scripts \
+  --no-chown \
   add "${package_apks[@]}" >"${tmp}/apk-install.log"
 
 LC_ALL=C awk '$1 !~ /^#/ { print $2 " " $3 }' "${lock}" |
@@ -165,6 +183,30 @@ if ! cmp -s "${tmp}/locked-packages" "${tmp}/installed-packages"; then
   echo "Xfce apk installed database differs from the package lock" >&2
   exit 1
 fi
+
+# Mesa owns the one approved, rebuilt Gallium library. The desktop APK
+# transaction above installs its original copy; use the verified Mesa build
+# before dependency checks and strict overlay deduplication. All other
+# collisions must still match byte-for-byte.
+require_locked mesa 25.1.9-r0
+gallium="usr/lib/libgallium-25.1.9.so"
+mesa_record="${mesa_root}/usr/share/pacha/mesa-virgl-build.txt"
+mesa_patch="${repo_root}/patches/mesa/0001-virgl-cache-render-target-sampler-view.patch"
+[[ -f "${runtime}/${gallium}" && -f "${mesa_root}/${gallium}" && -f "${mesa_record}" ]] || {
+  echo "missing locked Mesa Gallium library or build provenance" >&2
+  exit 1
+}
+grep -Fxq "$(sha256sum "${mesa_patch}")" "${mesa_record}" || {
+  echo "shared Mesa does not record the approved cache patch" >&2
+  exit 1
+}
+mesa_digest="$(awk '$2 ~ /\/libgallium-25[.]1[.]9[.]so$/ { print $1 }' "${mesa_record}")"
+[[ "${mesa_digest}" =~ ^[0-9a-f]{64}$ ]] &&
+  echo "${mesa_digest}  ${mesa_root}/${gallium}" | sha256sum -c --status || {
+    echo "shared Mesa Gallium library differs from its build record" >&2
+    exit 1
+  }
+install -m 0755 "${mesa_root}/${gallium}" "${runtime}/${gallium}"
 
 # apk's build-time transaction leaves its process lock behind.  A lock is
 # runtime state, not package database content; shipping it also makes the first
@@ -187,7 +229,12 @@ rm -rf \
   "${runtime}"/etc/init.d "${runtime}"/etc/conf.d \
   "${runtime}"/var/cache/apk
 mkdir -p "${runtime}/usr/share/pacha"
-cp "${lock}" "${runtime}/usr/share/pacha/xfce-packages.lock"
+cp "${base_lock}" "${runtime}/usr/share/pacha/xfce-packages.lock"
+cp "${writer_lock}" "${runtime}/usr/share/pacha/libreoffice-packages.lock"
+cp "${browser_lock}" "${runtime}/usr/share/pacha/epiphany-packages.lock"
+# Keep apk's original package records/fallback binaries. Select the verified
+# WebKit 6.0 build through an explicit rootfs overlay, leaving GTK3 WebKit alone.
+python3 "${repo_root}/tools/stage_void_webkit.py" "${runtime}"
 
 # pack.yaml publishes the project-wide runtime loader, libc, /bin/sh, and CA
 # bundle at these exact paths. Keep their Alpine packages in the installed
@@ -206,7 +253,17 @@ rm -f \
 # These are ordinary rootfs policy; seed0root only needs to execute /sbin/init.
 ln -s ../bin/busybox "${runtime}/sbin/init"
 ln -s busybox "${runtime}/bin/sed"
+ln -s busybox "${runtime}/bin/grep"
 ln -s busybox "${runtime}/bin/hostname"
+install -D -m 0755 "${repo_root}/userland/fixtures/linux/libreoffice-launcher.sh" \
+  "${runtime}/usr/local/bin/libreoffice"
+ln -s libreoffice "${runtime}/usr/local/bin/lowriter"
+# Upstream absolute desktop links work in the guest but escape the staged
+# root during host-side cache generation. Equivalent relative links work in both.
+for desktop in startcenter writer xsltfilter; do
+  ln -sfn "../../lib/libreoffice/share/xdg/${desktop}.desktop" \
+    "${runtime}/usr/share/applications/libreoffice-${desktop}.desktop"
+done
 
 install -d -m 0700 "${runtime}/root"
 printf '%s\n' \
@@ -279,6 +336,11 @@ python3 "${repo_root}/tools/rootfs_overlay.py" library-view \
   "${library_root}" "${runtime}" "${mesa_root}" "${input_root}" "${clang_root}"
 
 for executable in \
+  usr/bin/epiphany \
+  usr/libexec/webkitgtk-6.0/WebKitWebProcess \
+  usr/libexec/webkitgtk-6.0/WebKitNetworkProcess \
+  usr/lib/libreoffice/program/soffice.bin \
+  usr/lib/libreoffice/program/oosplash \
   bin/bash \
   sbin/apk \
   usr/libexec/Xorg \
@@ -289,13 +351,14 @@ for executable in \
   usr/bin/xfsettingsd \
   usr/bin/xfce4-about \
   usr/bin/gtk3-demo \
+  usr/bin/gtk4-demo \
   usr/bin/thunar \
   usr/bin/xfce4-terminal \
   usr/bin/xprop \
   usr/bin/xwininfo \
   usr/bin/dbus-daemon; do
   report="${tmp}/$(basename "${executable}").loader"
-  if ! "${linux_musl}" --library-path "${library_root}" --list \
+  if ! "${linux_musl}" --library-path "${library_root}:${runtime}/usr/lib/libreoffice/program:${runtime}/usr/lib/epiphany" --list \
       "${runtime}/${executable}" >"${report}" 2>&1; then
     cat "${report}" >&2
     echo "Xfce executable does not resolve: /${executable}" >&2
@@ -334,6 +397,7 @@ for required in \
   usr/bin/xfsettingsd \
   usr/bin/xfce4-about \
   usr/bin/gtk3-demo \
+  usr/bin/gtk4-demo \
   usr/bin/thunar \
   usr/bin/xfce4-terminal \
   usr/bin/xfce4-notifyd-config \
@@ -380,6 +444,10 @@ python3 "${repo_root}/tools/rootfs_overlay.py" dedupe \
 # package-only rootfs has no init package to create an otherwise empty path.
 install -d -m 0755 "${runtime}/var/log"
 install -d -m 0700 "${runtime}/run/user/0"
+# This package-only rootfs has no xdg-user-dirs setup. xfdesktop queries the
+# Desktop folder while constructing its icon manager, before its later model
+# reload creates a missing folder. Supply the login user's directory up front.
+install -d -m 0700 "${runtime}/root/Desktop"
 
 rm -rf "${out_abs}.tmp" "${out_abs}"
 mkdir -p "$(dirname "${out_abs}")"

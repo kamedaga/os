@@ -3,7 +3,9 @@
 #include "bootstrap_abi.h"
 
 #include <stdint.h>
+#ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
 #include <stdio.h>
+#endif
 #include <string.h>
 
 enum {
@@ -47,10 +49,25 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
 
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
     if (desc == 0 ||
-        (desc->bootfs_archive.flags & SEED0_INIT_DEVICE_FLAG_PRESENT) == 0 ||
+        (desc->bootfs_archive.flags & SEED0_INIT_BOOT_ARCHIVE_FLAG_PRESENT) == 0 ||
         desc->bootfs_archive.image_va == 0 ||
         desc->bootfs_archive.size_bytes < SEED0_BOOTFS_HEADER_BYTES) {
-        fprintf(stderr, "[seed0boot] bootfs: descriptor unavailable\n");
+#ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
+        const struct seed0_init_config_page *cfg =
+            (const struct seed0_init_config_page *)SEED0_PROCESS_STANDARD_CONFIG_TARGET_VA;
+        fprintf(stderr,
+            "[seed0boot] bootfs: descriptor unavailable config=%llx/%llu descriptor=%llx",
+            (unsigned long long)cfg->magic,
+            (unsigned long long)cfg->version,
+            (unsigned long long)cfg->descriptor_page_va);
+        if (desc != 0) {
+            fprintf(stderr, " archive=%llx/%llx/%llu",
+                (unsigned long long)desc->bootfs_archive.flags,
+                (unsigned long long)desc->bootfs_archive.image_va,
+                (unsigned long long)desc->bootfs_archive.size_bytes);
+        }
+        fputc('\n', stderr);
+#endif
         return -2;
     }
 
@@ -72,10 +89,12 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
         entry_table_bytes != (uint64_t)entry_count * SEED0_BOOTFS_ENTRY_BYTES ||
         !range_fits(total_size, entry_table_offset, entry_table_bytes) ||
         !range_fits(total_size, string_table_offset, string_table_bytes)) {
+#ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
         fprintf(stderr, "[seed0boot] bootfs: invalid image magic=0x%x version=%u entries=%u\n",
             magic,
             version,
             entry_count);
+#endif
         return -3;
     }
 

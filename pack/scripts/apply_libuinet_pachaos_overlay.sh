@@ -24,6 +24,29 @@ timeout_c="${tree}/lib/libuinet/uinet_kern_timeout.c"
 init_c="${tree}/lib/libuinet/uinet_init.c"
 kthread_c="${tree}/lib/libuinet/uinet_kern_kthread.c"
 igmp_c="${tree}/sys/netinet/igmp.c"
+pkt_desc_c="${tree}/lib/libuinet/uinet_pkt_desc.c"
+
+# The pinned libuinet revision stores the packet context in ext_arg2, but
+# its final-release callback reads arg1 (NULL). Every received packet leaks.
+if ! grep -q 'PACHAOS: ext_arg2 owns the packet context' "${pkt_desc_c}"; then
+  perl -0pi -e 's/pdctx = arg1;/pdctx = arg2; \/\* PACHAOS: ext_arg2 owns the packet context. \*\//' "${pkt_desc_c}"
+fi
+
+# UMA derives an embedded slab header by rounding an object address down to
+# PAGE_SIZE. Its bootstrap arena must obey the same alignment as later mmap
+# allocations; malloc is not a page allocator. The arena lives for the stack
+# lifetime, as in the upstream bootstrap path.
+if ! grep -q 'PACHAOS: page-aligned UMA bootstrap' "${init_c}"; then
+  perl -0pi -e 's/uma_startup\(malloc\(boot_pages\*PAGE_SIZE, M_DEVBUF, M_ZERO\), boot_pages\);/\/\* PACHAOS: page-aligned UMA bootstrap. \*\/\n\tvoid *uma_bootmem = uhi_mmap(NULL, boot_pages * PAGE_SIZE,\n\t    UHI_PROT_READ | UHI_PROT_WRITE, UHI_MAP_ANON | UHI_MAP_PRIVATE, -1, 0);\n\tif (uma_bootmem == UHI_MAP_FAILED)\n\t\tpanic("UMA bootstrap allocation failed");\n\tbzero(uma_bootmem, boot_pages * PAGE_SIZE);\n\tuma_startup(uma_bootmem, boot_pages);/' "${init_c}"
+fi
+grep -q 'pdctx = arg2; /\* PACHAOS: ext_arg2 owns the packet context' "${pkt_desc_c}" || {
+  printf 'libuinet packet-context patch did not match\n' >&2
+  exit 1
+}
+grep -q 'uma_startup(uma_bootmem, boot_pages);' "${init_c}" || {
+  printf 'libuinet UMA bootstrap patch did not match\n' >&2
+  exit 1
+}
 
 if ! grep -q "UINET_IFTYPE_PACHAOS" "${api_types}"; then
   perl -0pi -e 's/(\tUINET_IFTYPE_PCAP,\n)/$1\tUINET_IFTYPE_PACHAOS,\n/' "${api_types}"

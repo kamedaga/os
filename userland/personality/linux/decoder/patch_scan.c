@@ -142,6 +142,7 @@ static uint64_t lpr_find_raw_candidate(const uint8_t *bytes, uint64_t size,
     return UINT64_MAX;
 #else
     const __m128i needle = _mm_set1_epi8((char)LPR_ZPOLINE_PATCH_FROM0);
+    const __m128i second = _mm_set1_epi8((char)LPR_ZPOLINE_PATCH_FROM1);
     uint64_t pos = start;
     while (pos <= size && size - pos >= 4u * sizeof(__m128i)) {
         const __m128i block0 =
@@ -152,7 +153,7 @@ static uint64_t lpr_find_raw_candidate(const uint8_t *bytes, uint64_t size,
             _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos + 32u));
         const __m128i block3 =
             _mm_loadu_si128((const __m128i *)(const void *)(bytes + pos + 48u));
-        const uint64_t candidates =
+        const uint64_t first_bytes =
             (uint64_t)(uint32_t)_mm_movemask_epi8(
                 _mm_cmpeq_epi8(block0, needle)) |
             ((uint64_t)(uint32_t)_mm_movemask_epi8(
@@ -161,19 +162,24 @@ static uint64_t lpr_find_raw_candidate(const uint8_t *bytes, uint64_t size,
                 _mm_cmpeq_epi8(block2, needle)) << 32) |
             ((uint64_t)(uint32_t)_mm_movemask_epi8(
                 _mm_cmpeq_epi8(block3, needle)) << 48);
+        const uint64_t second_bytes =
+            (uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block0, second)) |
+            ((uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block1, second)) << 16) |
+            ((uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block2, second)) << 32) |
+            ((uint64_t)(uint32_t)_mm_movemask_epi8(
+                _mm_cmpeq_epi8(block3, second)) << 48);
+        /* Include a pair crossing the block end without reading past size. */
+        const uint64_t continuation = size - pos > 64u &&
+            bytes[pos + 64u] == LPR_ZPOLINE_PATCH_FROM1 ? UINT64_C(1) << 63 : 0;
+        const uint64_t candidates = first_bytes & ((second_bytes >> 1) | continuation);
         if (candidates == 0) {
             pos += 4u * sizeof(__m128i);
             continue;
         }
-        uint64_t remaining = candidates;
-        while (remaining != 0) {
-            const uint32_t lane = (uint32_t)__builtin_ctzll(remaining);
-            if (lpr_is_raw_candidate(bytes, size, pos + lane)) {
-                return pos + lane;
-            }
-            remaining &= remaining - 1u;
-        }
-        pos += 4u * sizeof(__m128i);
+        return pos + (uint32_t)__builtin_ctzll(candidates);
     }
     while (pos <= size && size - pos >= sizeof(__m128i)) {
         const __m128i block =

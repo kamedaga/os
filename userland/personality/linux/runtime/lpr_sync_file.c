@@ -1,4 +1,5 @@
 #include "lpr_filed_internal.h"
+#include "lpr_fd/allocate.h"
 
 int64_t lpr_sync_file_install_wait(int wait_fd)
 {
@@ -17,30 +18,29 @@ int64_t lpr_sync_file_install_wait(int wait_fd)
         return -LPR_LINUX_EBADF;
     }
 
-    const int fd = lpr_fd_slot_alloc();
-    if (fd < 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        return fd;
-    }
-
     const uint64_t flags = LPR_LINUX_O_RDONLY | LPR_LINUX_O_CLOEXEC;
-    const int install_status = lpr_control_install_fd(
-        (uint64_t)(uint32_t)fd,
-        LPR_FD_OPS_SYNC_FILE,
-        flags,
-        0,
-        0);
-    if (install_status != 0) {
-        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        return install_status;
-    }
-    lpr_sync_file_backend_t *sync_file = lpr_sync_file_backend(fd);
+    lpr_sync_file_backend_t *sync_file = lpr_backend_state_alloc(sizeof(*sync_file));
     if (sync_file == 0) {
-        lpr_control_close_fd((uint64_t)(uint32_t)fd);
         (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
-        return -LPR_LINUX_EIO;
+        return -LPR_LINUX_ENOMEM;
     }
-    sync_file->wait_fd.raw = wait_fd;
+    *sync_file = (lpr_sync_file_backend_t){
+        .active = 1, .flags = (uint32_t)flags, .wait_fd.raw = wait_fd,
+    };
+    const lpr_fd_install_t install = {
+        .ops_id = LPR_FD_OPS_SYNC_FILE, .fd_flags = LPR_FD_ENTRY_CLOEXEC,
+        .access_mode = LPR_LINUX_O_RDONLY,
+        .rights = LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_DUP,
+        .backend_state = sync_file, .backend_state_bytes = sizeof(*sync_file),
+    };
+    /* Selecting a free number and publishing its initialized backend must
+     * be atomic with respect to other threads (including SCM_RIGHTS import).
+     * Do not report EMFILE merely because a previously observed slot moved. */
+    const int fd = lpr_fd_alloc_initialized(&install);
+    if (fd < 0) {
+        (void)lpr_backend_state_free(sync_file, sizeof(*sync_file));
+        (void)lpr_close_native_fd_if_open((uint64_t)(uint32_t)wait_fd);
+    }
     return fd;
 }
 
@@ -94,15 +94,20 @@ int lpr_sync_file_duplicate_wait(uint64_t fd)
 uint32_t lpr_sync_file_poll_events(uint64_t fd, uint32_t events)
 {
     const int wait_fd = lpr_sync_file_native_wait_fd(fd);
-    if (wait_fd < 16 || (events & 0x0001u) == 0) return 0;
+    if (wait_fd < 16) return 0;
     struct pacha_pollfd pollfd = {
         .fd = wait_fd,
-        .events = PACHA_FD_EVENT_READABLE,
+        .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
     };
     const int64_t status = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_FD_POLL,
         (uint64_t)(uintptr_t)&pollfd,
         1);
-    return status >= 0 &&
-        (pollfd.revents & PACHA_FD_EVENT_READABLE) != 0 ? 0x0001u : 0;
+    if (status < 0)
+        return 0;
+    /* A queued completion stays readable after the notifier closes. A bare
+     * hangup instead means backend loss/failed work, never successful signal. */
+    if (pollfd.revents & PACHA_FD_EVENT_READABLE)
+        return events & 0x0001u;
+    return pollfd.revents & PACHA_FD_EVENT_HANGUP ? 0x0008u : 0;
 }

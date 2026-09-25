@@ -28,6 +28,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
+    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

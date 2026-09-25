@@ -138,6 +138,12 @@ func writeDebugFSCommands(path string, manifest Manifest, span progress.Span) (u
 			if _, err := fmt.Fprintf(file, "write %s %s\n", debugFSQuote(spec.SourcePath), debugFSQuote(spec.ImagePath)); err != nil {
 				return 0, err
 			}
+			// debugfs 1.47 can leave i_size at the last written block when
+			// the source ends in a sparse hole. Preserve the logical EOF,
+			// including a zero-filled tail (ELF section headers use it).
+			if _, err := fmt.Fprintf(file, "set_inode_field %s size %d\n", debugFSQuote(spec.ImagePath), spec.Size); err != nil {
+				return 0, err
+			}
 			bytesWritten += spec.Size
 		}
 		step++

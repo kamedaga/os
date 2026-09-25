@@ -18,7 +18,19 @@ static uint64_t syscall_nr;
 static uint64_t syscall_args[5];
 static int64_t syscall_result;
 static unsigned int syscall_count;
+static unsigned int remap_notifications;
+static uint64_t remap_args[4];
 static int failures;
+
+void lpr_drm_mapping_remapped(uint64_t old_address, uint64_t old_size,
+    uint64_t new_address, uint64_t new_size)
+{
+    remap_notifications++;
+    remap_args[0] = old_address;
+    remap_args[1] = old_size;
+    remap_args[2] = new_address;
+    remap_args[3] = new_size;
+}
 
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
 {
@@ -44,6 +56,16 @@ int64_t lpr_pacha_syscall5(
     syscall_args[4] = a4;
     syscall_count++;
     return syscall_result;
+}
+
+int64_t lpr_drm_native_mremap(uint64_t address, uint64_t length,
+    uint64_t new_length, uint64_t flags, uint64_t target)
+{
+    int64_t result = lpr_pacha_syscall5(PACHA_VM_SYSCALL_MREMAP,
+        address, length, new_length, flags, target);
+    if (result >= 4096)
+        lpr_drm_mapping_remapped(address, length, (uint64_t)result, new_length);
+    return result;
 }
 
 int64_t lpr_pacha_syscall6(
@@ -80,6 +102,10 @@ int main(void)
                0x10000000, 135168, 266240,
                MREMAP_MAYMOVE, 0xdeadbeef) == syscall_result,
            "MAYMOVE returns the CapabilityOS mapping address");
+    expect(remap_notifications == 1 && remap_args[0] == 0x10000000 &&
+               remap_args[1] == 135168 && remap_args[2] == 0x20000000 &&
+               remap_args[3] == 266240,
+           "successful remap updates tracked DRM mappings");
     expect(syscall_count == 1 && syscall_nr == PACHA_VM_SYSCALL_MREMAP,
            "mremap uses the existing VM syscall");
     expect(syscall_args[0] == 0x10000000 &&
@@ -116,6 +142,8 @@ int main(void)
                0x10000000, 4096, 8192,
                MREMAP_MAYMOVE, 0) == -LPR_LINUX_ENOMEM,
            "CapabilityOS allocation failure maps to Linux ENOMEM");
+    expect(remap_notifications == 2,
+           "failed remap does not notify mapping trackers");
 
     if (failures != 0) return 1;
     puts("lpr linux mremap unit: PASS");
