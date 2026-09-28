@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "lifecycle.h"
 #include "../kobox2_adapter/lifecycle_message.h"
-#include "boot/module_launch.h"
+#include <kobox2/module_progress.h>
 #include <errno.h>
 
 static kb2_status_t check(const struct gpud_lifecycle *lifecycle) {

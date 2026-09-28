@@ -17,6 +17,21 @@ static long derive_result = 100, close_result, query_result = 11;
 static uint64_t last_bar, last_offset, last_flags;
 static uintptr_t last_target;
 static size_t last_length;
+static unsigned long export_refusal_reason, export_refusal_bar;
+static unsigned long export_refusal_first, export_refusal_last;
+static long export_refusal_status;
+
+void ph_boot_log_gpu_bar_export_failure(unsigned long reason, long status,
+    unsigned long bar, unsigned long protection, unsigned long cache,
+    unsigned long page_count, unsigned long first_page,
+    unsigned long last_page) {
+    (void)protection; (void)cache; (void)page_count;
+    export_refusal_reason = reason;
+    export_refusal_status = status;
+    export_refusal_bar = bar;
+    export_refusal_first = first_page;
+    export_refusal_last = last_page;
+}
 
 long pacha_syscall3(uint64_t number, uint64_t fd, uint64_t output, uint64_t words) {
     ++calls;
@@ -104,6 +119,34 @@ int main(void) {
     assert(host->window_count == 2 && host->windows[0].start == BAR_BASE);
     assert(host->windows[1].length == 0x100 && pci.native_device == 42);
     assert(!host->memory_read && !host->memory_write);
+    uint64_t export_pages[] = {BAR_BASE / 4096 + 3, BAR_BASE / 4096};
+    assert(ph_pci_export_pages(&pci, export_pages, 2, 3, KOBOX_MMIO_WC) == 100);
+    assert(export_pages[0] == 0x3000 && export_pages[1] == 0);
+    assert(last_bar == 0 && last_length == 8192 && !last_offset);
+    assert(last_flags == (PACHA_CAPSULE_MMIO_EXPORT_VMO | PACHA_CAPSULE_MMIO_CACHE_WC));
+    export_pages[0] = BAR_BASE / 4096;
+    assert(ph_pci_export_pages(&pci, export_pages, 1, 1, KOBOX_MMIO_UC) == 100);
+    assert(last_flags & PACHA_CAPSULE_MMIO_READ_ONLY);
+    export_pages[0] = BAR_BASE / 4096;
+    export_pages[1] = UINT64_MAX;
+    const unsigned int export_calls = calls;
+    assert(ph_pci_export_pages(&pci, export_pages, 2, 3, KOBOX_MMIO_WC) == PACHA_SYSCALL_ERR_INVALID);
+    assert(ph_pci_export_pages(&pci, export_pages, 1, 3, KOBOX_MMIO_WB) == PACHA_SYSCALL_ERR_INVALID);
+    assert(ph_pci_export_pages(&pci, export_pages, 1, 2, KOBOX_MMIO_WC) == PACHA_SYSCALL_ERR_INVALID);
+    export_pages[1] = 0x30000000 / 4096;
+    assert(ph_pci_export_pages(&pci, export_pages, 2, 3, KOBOX_MMIO_WC) == PACHA_SYSCALL_ERR_INVALID);
+    assert(export_refusal_reason == 2 && export_refusal_bar == KOBOX_PCI_MEMORY_WINDOWS &&
+        export_refusal_status == PACHA_SYSCALL_ERR_INVALID &&
+        export_refusal_first == BAR_BASE / 4096 &&
+        export_refusal_last == 0x30000000 / 4096);
+    assert(calls == export_calls && export_pages[0] == BAR_BASE / 4096);
+    derive_result = PACHA_SYSCALL_ERR_INVALID;
+    assert(ph_pci_export_pages(&pci, export_pages, 1, 3, KOBOX_MMIO_WC) ==
+        PACHA_SYSCALL_ERR_INVALID);
+    assert(export_refusal_reason == 3 && export_refusal_bar == 0 &&
+        export_refusal_first == BAR_BASE / 4096);
+    derive_result = 100;
+    derives = 0;
     uint32_t value;
     assert(!host->config_read(&pci, 0, 4, &value) && value == 0x10501af4);
     assert(!host->config_read(&pci, 1, 1, &value) && value == 0x1a);
@@ -129,6 +172,16 @@ int main(void) {
         assert(!host->memory_unmap(&pci, (void *)BASE, 4096));
     }
     assert(derives == 6 && closes == 6);
+
+    /* One contiguous Linux ioremap must consume one native mapping lease,
+     * regardless of the number of pages in the BAR span. */
+    assert(!host->memory_map(&pci, (void *)BASE, BAR_BASE, 0x4000,
+        KOBOX_LINUX_MEMORY_READ, KOBOX_MMIO_UC));
+    assert(last_target == BASE && last_length == 0x4000 && last_offset == 0);
+    assert(mappings[0].length == 0x4000 && !mappings[1].length);
+    assert(host->memory_unmap(&pci, (void *)BASE, 0x1000) == -ENOENT);
+    assert(!host->memory_unmap(&pci, (void *)BASE, 0x4000));
+    assert(derives == 7 && closes == 7);
 
     before = calls;
     assert(host->memory_map(&pci, (void *)BASE, BAR_BASE, 4096, 2, KOBOX_MMIO_UC) == -EINVAL);
@@ -158,10 +211,19 @@ int main(void) {
     close_result = 0;
     assert(!host->memory_unmap(&pci, (void *)BASE, 4096));
 
-    const long failures[] = {0, 1, 2, 3, 4, 5, 6, PACHA_FD_TABLE_LIMIT};
+    const struct { long raw; int expected; } failures[] = {
+        {0, -EPROTO},
+        {PACHA_SYSCALL_ERR_INVALID, -EINVAL},
+        {PACHA_SYSCALL_ERR_NOT_READY, -EBUSY},
+        {PACHA_SYSCALL_ERR_ALLOC, -ENOMEM},
+        {PACHA_SYSCALL_ERR_MAP, -EIO},
+        {5, -EPROTO}, {PACHA_SYSCALL_ERR_CLOSED, -ENODEV},
+        {PACHA_FD_TABLE_LIMIT, -EPROTO},
+    };
     for (size_t i = 0; i < sizeof(failures) / sizeof(failures[0]); ++i) {
-        derive_result = failures[i];
-        assert(host->memory_map(&pci, (void *)BASE, BAR_BASE, 4096, 1, 0) < 0);
+        derive_result = failures[i].raw;
+        assert(host->memory_map(&pci, (void *)BASE, BAR_BASE, 4096, 1, 0) ==
+            failures[i].expected);
         assert(!mappings[0].length);
     }
     derive_result = 100;

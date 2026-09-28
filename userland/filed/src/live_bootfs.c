@@ -3,6 +3,7 @@
 #include "miniz_tinfl.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 enum {
@@ -13,7 +14,7 @@ enum {
     BOOTFS_KIND_REGULAR = 1,
     BOOTFS_PATH_BYTES = 512,
     PACKED_ROOT_HEADER_BYTES = 16,
-    LIVE_ROOT_MAX_BYTES = 64u * 1024u * 1024u,
+    LIVE_ROOT_MAX_BYTES = 192u * 1024u * 1024u,
 };
 
 static uint16_t rd16(const unsigned char *p)
@@ -128,7 +129,11 @@ static int populate_archive(filed_tmpfs_backend_t *tmpfs,
         if (expanded_size < BOOTFS_HEADER_BYTES ||
             expanded_size > LIVE_ROOT_MAX_BYTES) return -22;
         unsigned char *expanded = malloc((size_t)expanded_size);
-        if (expanded == NULL) return -12;
+        if (expanded == NULL) {
+            fprintf(stderr, "[filed] live bootfs expansion allocation failed bytes=%llu\n",
+                (unsigned long long)expanded_size);
+            return -12;
+        }
         const size_t got = tinfl_decompress_mem_to_mem(expanded,
             (size_t)expanded_size, packed + PACKED_ROOT_HEADER_BYTES,
             (size_t)packed_size - PACKED_ROOT_HEADER_BYTES,
@@ -170,7 +175,11 @@ static int populate_archive(filed_tmpfs_backend_t *tmpfs,
         uint64_t written = 0;
         status = filed_tmpfs_backend_pwrite(tmpfs, file, 0,
             image + data_offset, data_size, &written);
-        if (status != 0 || written != data_size) return status != 0 ? status : -5;
+        if (status != 0 || written != data_size) {
+            fprintf(stderr, "[filed] live bootfs write failed path=%s status=%d bytes=%llu written=%llu\n",
+                path, status, (unsigned long long)data_size, (unsigned long long)written);
+            return status != 0 ? status : -5;
+        }
         ++*out_files;
         *out_bytes += data_size;
     }

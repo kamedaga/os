@@ -44,5 +44,9 @@ struct ph_pci {
 int ph_pci_init(struct ph_pci *pci, const struct ph_pci_config *config);
 int ph_pci_revoke(struct ph_pci *pci, uint64_t generation);
 int ph_pci_destroy(struct ph_pci *pci);
+/* Consume private PFNs, validate one authorized BAR, then replace them with
+ * BAR-relative offsets. No physical address is exposed to the client. */
+long ph_pci_export_pages(struct ph_pci *pci, uint64_t *pages, size_t count,
+                        unsigned int protection, enum kobox_mmio_cache cache);
 
 #endif

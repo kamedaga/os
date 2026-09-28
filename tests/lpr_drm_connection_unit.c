@@ -10,6 +10,14 @@ static int vmo_creates, maps, unmaps, allocation_failure, mapping_failure;
 static uint64_t allocation_size, allocation_flags, request_marker;
 static int creates, registrations, requests, closed[128], fail_recv, fail_call, bad_reply, bind_error;
 static uint64_t last_magic, last_id;
+static char diagnostic[256];
+int64_t lpr_linux_write(uint64_t fd, uint64_t data, uint64_t bytes)
+{
+    assert(fd == 2 && bytes < sizeof(diagnostic));
+    memcpy(diagnostic, (const void *)(uintptr_t)data, bytes);
+    diagnostic[bytes] = 0;
+    return (int64_t)bytes;
+}
 void *lpr_memset(void *p, int c, size_t n) { return memset(p, c, n); }
 void *lpr_memcpy(void *p, const void *s, size_t n) { return memcpy(p, s, n); }
 uint64_t lpr_next_request_id(volatile uint64_t *counter) { return ++*counter; }
@@ -100,6 +108,8 @@ static int64_t hello(void)
 }
 int main(void)
 {
+    assert(amdgpu_info_failure(22, 440, "validate", -22) == -22);
+    assert(strstr(diagnostic, "phase=validate query=22 bytes=440 errno=22"));
     lpr_tty_wire_page_fd = 90; lpr_tty_wire_page = page;
     assert(!hello() && creates == 1 && registrations == 1 && requests == 1);
     assert(!closed[80] && closed[81] == 1);
@@ -164,6 +174,36 @@ int main(void)
     lpr_drm_after_fork_child();
     assert(!lpr_drm_aux_cache && !lpr_drm_aux_cache_fd && !lpr_drm_aux_cache_busy);
     assert(unmaps == saved_unmaps + 1 && closed[91] == before);
+
+    /* Mesa poisons ignored BO fields and sends several IB/fence/sync chunks. */
+    gpud_drm_amdgpu_cs_ib_t ib={.va_start=0x10000,.ib_bytes=64};
+    gpud_drm_amdgpu_bo_entry_t bo={.handle=9};
+    gpud_drm_amdgpu_bo_list_in_t list={.operation=UINT32_MAX,.list_handle=UINT32_MAX,
+        .bo_number=1,.bo_info_size=8,.bo_info_ptr=(uintptr_t)&bo};
+    uint32_t sync=5, fence[2]={9,0};
+    gpud_drm_amdgpu_cs_chunk_t chunks[]={
+        {6,6,(uintptr_t)&list},{5,1,(uintptr_t)&sync},{2,2,(uintptr_t)fence},
+        {1,8,(uintptr_t)&ib},{1,8,(uintptr_t)&ib}};
+    uint64_t pointers[5];
+    for(unsigned i=0;i<5;++i) pointers[i]=(uintptr_t)&chunks[i];
+    gpud_drm_amdgpu_cs_t cs={.ctx_id=7,.num_chunks=5,.chunks=(uintptr_t)pointers};
+    gpud_drm_ioctl_request_t request={0};
+    assert(!lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes));
+    gpud_drm_amdgpu_cs_wire_t wire;
+    memcpy(&wire,request.data,sizeof(wire));
+    assert(wire.chunk_count==5 && request.aux_size==84);
+    assert(wire.parts[3].offset==20 && wire.parts[4].offset==52);
+    lpr_drm_aux_destroy(tmp_fd,tmp,tmp_bytes);
+    chunks[1].length_dw=2; /* A sem array is valid, not just a single handle. */
+    uint32_t sems[2]={5,6}; chunks[1].chunk_data=(uintptr_t)sems;
+    assert(!lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes));
+    lpr_drm_aux_destroy(tmp_fd,tmp,tmp_bytes);
+    chunks[1].chunk_id=99;
+    assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes)==-LPR_LINUX_EOPNOTSUPP);
+    chunks[1].chunk_id=5; ib.pad=1;
+    assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes)==-LPR_LINUX_EINVAL);
+    assert(tmp_fd==-1 && !tmp && !tmp_bytes);
+    puts("LPR Mesa CS: multiple IBs, ignored BO fields, sync/fence, rejects and cleanup PASS");
     puts("LPR page connection: one bind, no VMO per call, loss/no replay, fork, errors PASS");
     puts("LPR auxiliary reuse: zeroing, bounded retention, temporary fallback, fork and errors PASS");
 }

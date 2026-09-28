@@ -11,7 +11,9 @@
 
 /* Sandbox-only native adapter, not linked into the Apache controller. */
 struct ph_gpu_query {
+    struct ph_pci *pci;
     uint64_t generation, session_id, correlation;
+    uint32_t profile_kind;
     void *mapping;
     void *aux;
     void *aux_cache;
@@ -21,7 +23,7 @@ struct ph_gpu_query {
     struct kobox_drm_query_api api;
     size_t reply_size;
     int terminal_after_completion;
-    unsigned char request[PH_GPU_QUERY_PAGE];
+    unsigned char request[PH_GPU_QUERY_REQUEST_BYTES];
     unsigned char output[PH_GPU_QUERY_PAGE];
     unsigned char reply[PH_GPU_QUERY_PAGE];
 };
@@ -31,6 +33,10 @@ struct ph_gpu_query {
 int ph_gpu_query_init(struct ph_gpu_query *query,
                       uint64_t generation,
                       uint64_t session_id,
+                      struct ph_lifecycle_service *service);
+int ph_gpu_query_init_profile(struct ph_gpu_query *query,
+                      uint64_t generation, uint64_t session_id,
+                      uint32_t profile_kind,
                       struct ph_lifecycle_service *service);
 
 /* Receiver has already copied the full request into query->request. Only

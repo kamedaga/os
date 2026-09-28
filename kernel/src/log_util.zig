@@ -1,14 +1,12 @@
 const std = @import("std");
-const serial = @import("serial.zig");
 const kernel_log = @import("kernel_log.zig");
 
 const serialWrite = kernel_log.write;
 
 pub fn printNumber(value: anytype) void {
-    serial.printNumber(value);
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(buf[0..], "{}", .{value}) catch return;
-    kernel_log.appendText(s);
+    kernel_log.write(s);
 }
 
 pub fn printNumberU64(value: u64) void {
@@ -16,21 +14,7 @@ pub fn printNumberU64(value: u64) void {
 }
 
 pub fn printHex(value: u64) void {
-    const hex = "0123456789abcdef";
-    serial.write("0x");
-    kernel_log.appendText("0x");
-    var started = false;
-    var shift: u6 = 60;
-    while (true) {
-        const nibble: u4 = @intCast((value >> shift) & 0xF);
-        if (started or nibble != 0 or shift == 0) {
-            serial.writeByte(hex[nibble]);
-            kernel_log.appendByte(hex[nibble]);
-            started = true;
-        }
-        if (shift == 0) break;
-        shift -= 4;
-    }
+    kernel_log.writeFmt("0x{x}", .{value});
 }
 
 pub fn writeErrorName(err: anyerror) void {

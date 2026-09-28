@@ -25,8 +25,9 @@ struct gpud_launch_transaction {
  * serialized with controller/IPC/launch mutations. Resources come from an
  * owner table; IDs are opaque, not FD casts. The owner must validate native
  * executable identity and pair its startup config with the selected closure.
- * Initially grant only the bootstrap channel; transfer device resources only
- * AFTER successful action completion. This keeps failed-launch rollback from
+ * Initially grant only the bootstrap channel and, for inspection, the
+ * write-only log endpoint; transfer device resources only AFTER successful
+ * action completion. This keeps failed-launch rollback from
  * bypassing device revoke/reset. Source channel/config/image remain immutable
  * and borrowed during begin only; the three mutable objects stay borrowed.
  *

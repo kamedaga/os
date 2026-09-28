@@ -452,16 +452,18 @@ static int release_request(void *context) {
     return session_result ? session_result : aux_result;
 }
 
-int ph_gpu_queue_init(struct ph_gpu_queue *queue,
+int ph_gpu_queue_init_profile(struct ph_gpu_queue *queue,
                       struct gpud_gpu_sessions *sessions,
                       uint64_t client_id,
                       uint64_t channel_id,
+                      uint32_t profile_kind,
                       const kb2_vq_atomic_ops_t *atomics,
                       struct ph_lifecycle_service *service) {
     if (!queue || queue->channel_id || !channel_id || !service || !atomics ||
         !atomics->load_acquire || !atomics->store_release || !atomics->fence)
         return -EINVAL;
-    int result = ph_gpu_session_service_init(&queue->service, sessions, client_id);
+    int result = ph_gpu_session_service_init_profile(&queue->service, sessions,
+        client_id, profile_kind);
     if (result)
         return result;
     const uint64_t event_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WRITE |
@@ -504,6 +506,15 @@ int ph_gpu_queue_init(struct ph_gpu_queue *queue,
                                              .stop = stop,
                                              .wake_fd = queue->event_fd};
     return 0;
+}
+
+int ph_gpu_queue_init(struct ph_gpu_queue *queue,
+                      struct gpud_gpu_sessions *sessions,
+                      uint64_t client_id, uint64_t channel_id,
+                      const kb2_vq_atomic_ops_t *atomics,
+                      struct ph_lifecycle_service *service) {
+    return ph_gpu_queue_init_profile(queue, sessions, client_id, channel_id,
+        KB2_GPU_PROFILE_VIRGL, atomics, service);
 }
 
 int ph_gpu_queue_finish(struct ph_gpu_queue *queue) {

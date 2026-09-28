@@ -1,0 +1,11 @@
+schema: 1
+# The ordinary live bootfs remains unchanged. This optional image embeds only
+# the checked Mesa and driver closures. GPU probe remains explicitly manual.
+sha256:
+  amdgpu_mesa_runtime: d911b9bc22daf4ac44c373bbbaa0c72b36bd9bed2cf5bd04716d7c9fb3d4e457
+files:
+  /etc/pacha/gpu-probe.conf: amdgpu_probe_policy
+  /srv/gpud.elf: gpud
+  /srv/amdgpu-mesa-runtime.tar.gz: amdgpu_mesa_runtime
+  /srv/amdgpu-driver-package.tar.gz: amdgpu_driver_archive
+  /srv/amdgpu-driver-package.tar.gz.sha256: amdgpu_driver_archive_digest

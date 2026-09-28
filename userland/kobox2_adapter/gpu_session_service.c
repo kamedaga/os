@@ -23,13 +23,14 @@ static uint32_t file_status(int result) {
     }
 }
 
-int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
+int ph_gpu_session_service_init_profile(struct ph_gpu_session_service *service,
                                 struct gpud_gpu_sessions *sessions,
-                                uint64_t client_id) {
+                                uint64_t client_id, uint32_t profile_kind) {
     if (!service || service->client_id || !sessions || !sessions->generation || !client_id)
         return -EINVAL;
     int result =
-        ph_gpu_query_init(&service->query, sessions->generation, 0, &service->query_service);
+        ph_gpu_query_init_profile(&service->query, sessions->generation, 0,
+            profile_kind, &service->query_service);
     if (result)
         return result;
     void *symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_open");
@@ -53,8 +54,16 @@ int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
         return -ENOENT;
     memcpy(&service->take_fence, &symbol, sizeof(service->take_fence));
     service->client_id = client_id;
+    service->profile_kind = profile_kind;
     service->sessions = sessions;
     return 0;
+}
+
+int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
+                                struct gpud_gpu_sessions *sessions,
+                                uint64_t client_id) {
+    return ph_gpu_session_service_init_profile(service, sessions, client_id,
+        KB2_GPU_PROFILE_VIRGL);
 }
 
 static int prepare_command(struct ph_gpu_session_service *service,
@@ -70,7 +79,7 @@ static int prepare_command(struct ph_gpu_session_service *service,
     if (kb2_gpu_command_decode(bytes,
                                size,
                                service->query.generation,
-                               KB2_GPU_PROFILE_VIRGL,
+                               service->profile_kind,
                                queue_class,
                                &region,
                                1,

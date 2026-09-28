@@ -1,4 +1,5 @@
 const abi_root = @import("kernel_abi_root");
+const std_rc = @import("std");
 const interrupts = @import("../interrupts.zig");
 const ipc_metric = @import("../ipc_metric.zig");
 const kernel = @import("../kernel.zig");
@@ -71,6 +72,20 @@ fn reportRefusal(site: []const u8, err: kernel.KernelError) void {
     );
 }
 
+var ram_cache_refusal_count: u64 = 0;
+
+fn reportRamCacheRefusal(err: anyerror, offset: u64, bytes: u64, mode: @import("../memory/ram_cache_transition.zig").Mode) void {
+    const count = @atomicRmw(u64, &ram_cache_refusal_count, .Add, 1, .monotonic) + 1;
+    if (count > 24 and count % 256 != 0) return;
+    // The syscall deliberately returns a small stable status set. Its MAP
+    // status combines distinct ownership, alias, and cache-proof failures;
+    // retain the internal reason in the existing kernel log for diagnosis.
+    kernel_log.writeFmt(
+        "ram-cache: syscall refused reason={s} offset=0x{x} pages={} mode={s} n={}\n",
+        .{ @errorName(err), offset, bytes / 4096, @tagName(mode), count },
+    );
+}
+
 fn statusFromKernelError(err: kernel.KernelError) u64 {
     const status: u64 = switch (err) {
         kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
@@ -78,6 +93,21 @@ fn statusFromKernelError(err: kernel.KernelError) u64 {
     };
     reportRefusal("kernel_error", err);
     return status;
+}
+
+var page_view_refusal_count: u64 = 0;
+
+fn reportPageViewRefusal(comptime stage: []const u8, page_count: u64, list_index: ?usize, parent_page: ?u64, reason: []const u8) void {
+    if (comptime !kernel_log.ring_enabled) return;
+    const count = @atomicRmw(u64, &page_view_refusal_count, .Add, 1, .monotonic) + 1;
+    if (count > 24 and count % 256 != 0) return;
+    // The public status deliberately does not expose VMO internals. A single
+    // failure-only ring line distinguishes the kernel's refusal without
+    // logging user pointers, physical addresses, or every input page.
+    kernel_log.writeFmt(
+        "page-view: refused stage={s} index={} page_known={} parent_page={} pages={} reason={s} n={}\n",
+        .{ stage, if (list_index) |index| @as(i64, @intCast(index)) else -1, @intFromBool(parent_page != null), parent_page orelse 0, page_count, reason, count },
+    );
 }
 
 fn writeUserU64Bytes(h: anytype, proc: kernel.PrincipalId, out_va: u64, len: u64, value: u64) u64 {
@@ -370,7 +400,9 @@ fn fdWriteSerial(h: anytype, proc: kernel.PrincipalId, in_va: u64, len: u64) ?u6
         const remaining = len - total;
         const chunk_len: usize = @intCast(@min(remaining, buf.len));
         if (!h.copy_user_bytes_from_va(proc, in_va + total, buf[0..chunk_len])) return null;
-        kernel_log.write(buf[0..chunk_len]);
+        // Serial is also a user-visible FD. Keep user output on the serial
+        // stream, but do not present it as kernel-originated ring content.
+        kernel_log.writeUser(buf[0..chunk_len]);
         total += chunk_len;
     }
     return total;
@@ -967,28 +999,47 @@ fn createPageViewVmoFd(
             page_count_u64 * fd_abi.vmo_page_view_index_size or
         (rights_bits & ~fd_abi.vmo_page_view_rights_mask) != 0 or
         (flags_bits & ~fd_abi.vmo_page_view_known_flags_mask) != 0)
+    {
+        reportPageViewRefusal("input", page_count_u64, null, null, "invalid-range-or-flags");
         return sc.syscall_err_invalid;
+    }
 
     const rights = kernel.fdRightsFromBits(rights_bits);
     const flags = kernel.fdFlagsFromBits(@truncate(flags_bits));
-    if (!rights.close or (!rights.map_read and !rights.map_write))
+    if (!rights.close or (!rights.map_read and !rights.map_write)) {
+        reportPageViewRefusal("rights", page_count_u64, null, null, "missing-map-or-close");
         return sc.syscall_err_invalid;
-    const parent_entry = state.fdEntryConst(proc, parent_fd) orelse
+    }
+    const parent_entry = state.fdEntryConst(proc, parent_fd) orelse {
+        reportPageViewRefusal("parent-fd", page_count_u64, null, null, "not-found");
         return sc.syscall_err_invalid;
+    };
     if (!parent_entry.rights.share or
         !kernel.isFdRightsSubset(rights, parent_entry.rights))
+    {
+        reportPageViewRefusal("parent-rights", page_count_u64, null, null, "not-subset");
         return sc.syscall_err_invalid;
-    const parent = state.nativeVmoRefForFd(proc, parent_fd) orelse
+    }
+    const parent = state.nativeVmoRefForFd(proc, parent_fd) orelse {
+        reportPageViewRefusal("parent-vmo", page_count_u64, null, null, "not-vmo");
         return sc.syscall_err_invalid;
-    const parent_slot = state.nativeVmoSlotConst(parent) orelse
+    };
+    const parent_slot = state.nativeVmoSlotConst(parent) orelse {
+        reportPageViewRefusal("parent-vmo", page_count_u64, null, null, "stale");
         return sc.syscall_err_invalid;
-    if (parent_slot.kind != .anonymous or !parent_slot.parent.isNull() or
+    };
+    if (parent_slot.kind != .anonymous or !parent_slot.backing.parent.ref.isNull() or
         !parent_slot.has_page_store)
+    {
+        reportPageViewRefusal("parent-kind", page_count_u64, null, null, "not-owned-ram");
         return sc.syscall_err_invalid;
+    }
 
     const page_count: usize = @intCast(page_count_u64);
-    const view = state.createNativePageView(parent, page_count) catch |err|
+    const view = state.createNativePageView(parent, page_count) catch |err| {
+        reportPageViewRefusal("create", page_count_u64, null, null, @errorName(err));
         return statusFromKernelError(err);
+    };
     var page_offset: usize = 0;
     while (page_offset < page_count) {
         var pages: [64]u64 = undefined;
@@ -998,19 +1049,23 @@ fn createPageViewVmoFd(
             const list_va = indices_va +
                 @as(u64, @intCast(list_index)) * fd_abi.vmo_page_view_index_size;
             const parent_page = h.read_user_u64(proc, list_va) orelse {
+                reportPageViewRefusal("index-read", page_count_u64, list_index, null, "unreadable");
                 state.releaseNativeVmoWithFreeList(view, h.free_list);
                 return sc.syscall_err_invalid;
             };
             if (parent_page > @import("std").math.maxInt(usize)) {
+                reportPageViewRefusal("index-range", page_count_u64, list_index, parent_page, "overflow");
                 state.releaseNativeVmoWithFreeList(view, h.free_list);
                 return sc.syscall_err_invalid;
             }
             paddr.* = state.nativeVmoResolvedPagePaddr(parent, @intCast(parent_page)) orelse {
+                reportPageViewRefusal("page-resolve", page_count_u64, list_index, parent_page, "absent-or-invalid");
                 state.releaseNativeVmoWithFreeList(view, h.free_list);
                 return sc.syscall_err_invalid;
             };
         }
         state.installNativeVmoPages(view, page_offset, pages[0..chunk_count]) catch |err| {
+            reportPageViewRefusal("install", page_count_u64, page_offset, null, @errorName(err));
             state.releaseNativeVmoWithFreeList(view, h.free_list);
             return statusFromKernelError(err);
         };
@@ -1018,10 +1073,12 @@ fn createPageViewVmoFd(
     }
 
     const object = state.createKernelObject(.vmo, .{ .vmo = view }) catch |err| {
+        reportPageViewRefusal("object", page_count_u64, null, null, @errorName(err));
         state.releaseNativeVmoWithFreeList(view, h.free_list);
         return statusFromKernelError(err);
     };
     return state.installFd(proc, object, rights, flags, first_dynamic_fd) catch |err| {
+        reportPageViewRefusal("fd-install", page_count_u64, null, null, @errorName(err));
         if (state.kernelObjectSlot(object)) |slot|
             state.clearKernelObjectSlotWithFreeList(slot, h.free_list);
         return statusFromKernelError(err);
@@ -1201,6 +1258,9 @@ fn mapVmoFd(
     // These VMOs explicitly accept fault-time allocation failure. Leave even
     // populated pages to the normal fault path rather than requiring all holes.
     if (state.nativeVmoIsZeroOnDemand(mapped_vmo)) return base_va;
+    // Device PTEs must carry the admitted PAT slot; the ordinary eager
+    // shared-RAM path below deliberately has no device-cache parameter.
+    if (state.nativeVmoDevicePatSlot(mapped_vmo) != null) return base_va;
     var paddrs: [kernel.max_vmo_backing_pages]u64 = undefined;
     const page_count: usize = @intCast(aligned_size / 4096);
     var map_prot: ?kernel.MapProt = null;
@@ -1577,9 +1637,14 @@ pub fn closeProcessFdsWithWakes(h: anytype, state: *kernel.KernelState, proc: ke
         const fd: kernel.Fd = @intCast(index);
         const endpoint = state.pipeEndpointForFd(proc, fd);
         const channel = ipcChannelHandleForFd(state, proc, fd);
-        if (!user_vm.lockVmTransaction(proc)) return;
+        // The MMIO last-close destructor acquires all VM locks itself when
+        // it owns a WC identity lease. Holding any VM lock here would nest
+        // that acquisition and deadlock process teardown. Other descriptors
+        // retain the ordinary per-process transaction around their close.
+        const mmio = entry.object.kind == .mmio_region;
+        if (!mmio and !user_vm.lockVmTransaction(proc)) return;
         const closed = state.closeFdWithFreeList(proc, fd, h.free_list);
-        user_vm.unlockVmTransaction(proc);
+        if (!mmio) user_vm.unlockVmTransaction(proc);
         closed catch continue;
         if (endpoint) |pipe| {
             if (state.pipeReadyEventsForSide(pipe.pipe, !pipe.write)) |ready| {
@@ -1698,6 +1763,43 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             defer user_vm.unlockSharedVmObjects();
             state.growVmoFdWithPages(proc, @intCast(frame.rdi), frame.rsi, h.free_list) catch |err|
                 break :blk statusFromKernelError(err);
+            break :blk sc.syscall_ok;
+        },
+        sc.syscall_vmo_cache_policy => blk: {
+            const fd = std_rc.math.cast(kernel.Fd, frame.rdi) orelse break :blk sc.syscall_err_invalid;
+            if ((frame.rsi | frame.rdx) & 4095 != 0 or frame.rdx == 0 or
+                frame.rsi / 4096 > std_rc.math.maxInt(usize) or
+                frame.rdx / 4096 > std_rc.math.maxInt(usize)) break :blk sc.syscall_err_invalid;
+            const mode: @import("../memory/ram_cache_transition.zig").Mode = switch (frame.r10) {
+                fd_abi.vmo_cache_wb => .wb,
+                fd_abi.vmo_cache_uc_minus => .uc_minus,
+                fd_abi.vmo_cache_uc => .uc,
+                fd_abi.vmo_cache_wc => .wc,
+                else => break :blk sc.syscall_err_invalid,
+            };
+            const view = state.fdPayloadWithRightsConst(proc, fd, .{
+                .cache_policy = true,
+                .map_write = true,
+            }) orelse break :blk sc.syscall_err_invalid;
+            const ref = switch (view.payload.*) {
+                .vmo => |vmo_ref| vmo_ref,
+                else => break :blk sc.syscall_err_invalid,
+            };
+            @import("ram_cache.zig").change(
+                state,
+                h.free_list,
+                ref,
+                @intCast(frame.rsi / 4096),
+                @intCast(frame.rdx / 4096),
+                mode,
+            ) catch |err| {
+                reportRamCacheRefusal(err, frame.rsi, frame.rdx, mode);
+                break :blk switch (err) {
+                    error.UntranslatedDmaUnsupported => sc.syscall_err_not_ready,
+                    error.OutOfMemory, error.OutOfFreePages, error.NoSpace => sc.syscall_err_alloc,
+                    else => sc.syscall_err_map,
+                };
+            };
             break :blk sc.syscall_ok;
         },
         sc.syscall_vmo_revoke => revokeVmoFd(state, proc, @intCast(frame.rdi), h.free_list),

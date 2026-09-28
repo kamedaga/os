@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "launch.h"
+#include "../kobox2_adapter/sandbox_config.h"
 #include <kobox2/closure.h>
 #include <pacha/syscall.h>
 #include <errno.h>
@@ -31,12 +32,15 @@ kb2_status_t gpud_launch_begin(struct gpud_launch_transaction *transaction,
     if (result != KB2_STATUS_OK) return result;
     if (memcmp(expected, resources->manifest_digest, sizeof(expected))) return KB2_STATUS_RESOURCE_DENIED;
     const struct gpud_launch_request *request = resources->request;
-    if (request->grant_count != 1 || !request->grants) return KB2_STATUS_RESOURCE_DENIED;
+    /* Inspection adds only a write-only diagnostic endpoint. Keep the
+     * bootstrap channel as the sole resource-bearing launch grant. */
+    if ((request->grant_count != 1 && request->grant_count != 2) ||
+        !request->grants) return KB2_STATUS_RESOURCE_DENIED;
     const struct pacha_process_fd_grant *grant = request->grants;
     const uint64_t allowed = PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_CLOSE;
     if (grant->source_fd < 16 || grant->source_fd >= PACHA_FD_TABLE_LIMIT ||
-        grant->source_fd == (uint64_t)ipc->fd || grant->target_fd < 16 ||
-        grant->target_fd >= PACHA_FD_TABLE_LIMIT || grant->rights & ~allowed ||
+        grant->source_fd == (uint64_t)ipc->fd ||
+        grant->target_fd != PH_SANDBOX_CHANNEL_FD || grant->rights & ~allowed ||
         (grant->rights & PH_IPC_CHANNEL_RIGHTS) != PH_IPC_CHANNEL_RIGHTS ||
         grant->flags & ~PACHA_FD_FLAG_CLOEXEC) return KB2_STATUS_RESOURCE_DENIED;
     struct pacha_fd_info info = {0};
@@ -45,6 +49,25 @@ kb2_status_t gpud_launch_begin(struct gpud_launch_transaction *transaction,
     if (info.kind != PACHA_FD_KIND_CHANNEL ||
         (info.rights & (grant->rights | PACHA_FD_RIGHT_TRANSFER)) !=
             (grant->rights | PACHA_FD_RIGHT_TRANSFER)) return KB2_STATUS_RESOURCE_DENIED;
+    if (request->grant_count == 2) {
+        const struct pacha_process_fd_grant *log = &request->grants[1];
+        const uint64_t log_rights = PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE;
+        if (log->source_fd < 16 || log->source_fd >= PACHA_FD_TABLE_LIMIT ||
+            log->source_fd == grant->source_fd ||
+            log->source_fd == (uint64_t)ipc->fd ||
+            log->target_fd != PH_SANDBOX_LOG_FD ||
+            log->rights != log_rights ||
+            log->flags & ~PACHA_FD_FLAG_CLOEXEC)
+            return KB2_STATUS_RESOURCE_DENIED;
+        info = (struct pacha_fd_info){0};
+        native = pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO,
+            log->source_fd, (uintptr_t)&info);
+        if (native) return KB2_STATUS_HOST_FAILURE;
+        if (info.kind != PACHA_FD_KIND_ENDPOINT ||
+            (info.rights & (log_rights | PACHA_FD_RIGHT_TRANSFER)) !=
+                (log_rights | PACHA_FD_RIGHT_TRANSFER))
+            return KB2_STATUS_RESOURCE_DENIED;
+    }
     *transaction = (struct gpud_launch_transaction){.controller = controller,
         .launch = launch, .ipc = ipc, .generation = generation,
         .action_token = kb2_action_token(action), .resource_set_id = resources->resource_set_id,

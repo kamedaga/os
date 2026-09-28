@@ -42,6 +42,9 @@ struct ph_image {
     void *direct;            /* Direct-map view of the entire RAM VMO. */
     size_t size;
     int ram_fd;
+    unsigned char *ram_cache_modes; /* One byte per physical RAM page. */
+    struct ph_dma *device_dma; /* Borrowed until the Linux device is detached. */
+    bool cache_drain_completed;
     struct ph_window window;
 };
 

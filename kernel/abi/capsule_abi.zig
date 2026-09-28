@@ -1,24 +1,24 @@
 const std = @import("std");
 
-pub const syscall_capsule_first: u64 = 72;
-pub const syscall_capsule_query: u64 = 72;
-pub const syscall_capsule_derive_mmio: u64 = 73;
-pub const syscall_capsule_derive_dma_buffer: u64 = 74;
-pub const syscall_capsule_derive_dma_mapping: u64 = 75;
-pub const syscall_capsule_derive_dma_mapping_pages: u64 = 76;
-pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 77;
-pub const syscall_capsule_dma_set_enabled: u64 = 78;
-pub const syscall_capsule_derive_irq: u64 = 79;
-pub const syscall_capsule_irq_route: u64 = 80;
-pub const syscall_capsule_irq_poll: u64 = 81;
-pub const syscall_capsule_irq_quiesce: u64 = 82;
-pub const syscall_capsule_irq_retire: u64 = 83;
-pub const syscall_capsule_pci_enumerate: u64 = 84;
-pub const syscall_capsule_pci_claim: u64 = 85;
-pub const syscall_capsule_pci_config_read: u64 = 86;
-pub const syscall_capsule_pci_config_write: u64 = 87;
-pub const syscall_capsule_pci_bar_info: u64 = 88;
-pub const syscall_capsule_dma_pool_create: u64 = 89;
+pub const syscall_capsule_first: u64 = 74;
+pub const syscall_capsule_query: u64 = 74;
+pub const syscall_capsule_derive_mmio: u64 = 75;
+pub const syscall_capsule_derive_dma_buffer: u64 = 76;
+pub const syscall_capsule_derive_dma_mapping: u64 = 77;
+pub const syscall_capsule_derive_dma_mapping_pages: u64 = 78;
+pub const syscall_capsule_derive_dma_mapping_from_buffer: u64 = 79;
+pub const syscall_capsule_dma_set_enabled: u64 = 80;
+pub const syscall_capsule_derive_irq: u64 = 81;
+pub const syscall_capsule_irq_route: u64 = 82;
+pub const syscall_capsule_irq_poll: u64 = 83;
+pub const syscall_capsule_irq_quiesce: u64 = 84;
+pub const syscall_capsule_irq_retire: u64 = 85;
+pub const syscall_capsule_pci_enumerate: u64 = 86;
+pub const syscall_capsule_pci_claim: u64 = 87;
+pub const syscall_capsule_pci_config_read: u64 = 88;
+pub const syscall_capsule_pci_config_write: u64 = 89;
+pub const syscall_capsule_pci_bar_info: u64 = 90;
+pub const syscall_capsule_dma_pool_create: u64 = 91;
 pub const syscall_capsule_last: u64 = syscall_capsule_dma_pool_create;
 pub const syscall_capsule_count: usize = @intCast(syscall_capsule_last - syscall_capsule_first + 1);
 
@@ -119,11 +119,15 @@ pub const known_bar_flags_mask: u64 =
 
 pub const mmio_map_flag_replace_existing: u64 = 1 << 0;
 pub const mmio_map_flag_read_only: u64 = 1 << 1;
+// Export a revocable memory object instead of mapping into the caller.
+// address names a u64 array of BAR-relative page offsets, size is the
+// resulting logical byte length, and the scalar BAR offset must be zero.
+pub const mmio_map_flag_export_vmo: u64 = 1 << 5;
 pub const MmioCache = enum(u3) { uc = 0, uc_minus = 1, wc = 2, wb = 3, wt = 4, wp = 5 };
 pub const mmio_map_cache_shift: u6 = 2;
 pub const mmio_map_cache_mask: u64 = 7 << mmio_map_cache_shift;
 pub const mmio_map_known_flags_mask: u64 = mmio_map_flag_replace_existing |
-    mmio_map_flag_read_only | mmio_map_cache_mask;
+    mmio_map_flag_read_only | mmio_map_cache_mask | mmio_map_flag_export_vmo;
 pub const dma_iova_kernel_choose: u64 = std.math.maxInt(u64);
 pub const dma_buffer_known_flags_mask: u64 = 0;
 pub const dma_mapping_known_flags_mask: u64 = 0;

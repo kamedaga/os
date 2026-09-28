@@ -24,6 +24,7 @@ struct ph_device_config {
 
 struct ph_device {
     uint64_t generation;
+    struct ph_image *image;
     struct ph_pci pci;
     struct ph_dma dma;
     struct ph_irq irq;

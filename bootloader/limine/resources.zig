@@ -66,7 +66,7 @@ fn cstrEq(value: [*:0]const u8, expected: []const u8) bool {
     return std.mem.eql(u8, std.mem.span(value), expected);
 }
 
-fn hhdmOffsetOrHalt(requests: Requests) u64 {
+pub fn hhdmOffsetOrHalt(requests: Requests) u64 {
     const response = requests.hhdm.response orelse {
         halt.haltWithMessage("Limine HHDM response missing");
     };
@@ -117,9 +117,7 @@ pub fn framebufferInfoOrHalt(requests: Requests) boot_resources.FramebufferInfo 
         halt.haltWithMessage("Limine framebuffer mode unsupported");
     }
     const paddr = hhdmPtrToPaddr(requests, framebuffer.address);
-    const size_bytes = boot_resources.framebufferBytes(paddr,
-        framebuffer.width, framebuffer.height, framebuffer.pitch,
-        boot_static.physical_map_limit_exclusive) catch |err| {
+    const size_bytes = boot_resources.framebufferBytes(paddr, framebuffer.width, framebuffer.height, framebuffer.pitch, boot_static.physical_map_limit_exclusive) catch |err| {
         halt.haltWithError("Limine framebuffer invalid: ", err);
     };
     return .{

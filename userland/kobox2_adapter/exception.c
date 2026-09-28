@@ -34,6 +34,9 @@ void ph_exception(struct pacha_native_fault_frame *native) {
 
     if (linux_exception_dispatch == NULL || ph_current_task()->logical_cpu < 0 ||
         linux_exception_dispatch(&exception) != KOBOX_EXCEPTION_RESUME) {
+        /* Publish the primary fault before best-effort stack inspection can
+         * itself fault, and before process exit closes the service channel. */
+        ph_report_exception(native);
         ph_number("fault vector", native->vector);
         ph_number("fault ip", saved->rip);
         ph_number("core offset", saved->rip - (uintptr_t)ph_core.base);
@@ -63,10 +66,6 @@ void ph_exception(struct pacha_native_fault_frame *native) {
                 }
             }
         }
-        /* GOP-only boots cannot see ph_number's serial output. Publish the
-         * exact fault location before the fatal process exit when a service
-         * has installed an owner-side diagnostic reporter. */
-        ph_report_exception(native);
         ph_fail(__FILE__, __LINE__, native->error_code);
     }
 

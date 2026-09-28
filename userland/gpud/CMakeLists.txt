@@ -24,6 +24,7 @@ file(GLOB_RECURSE SANDBOX_INPUTS CONFIGURE_DEPENDS
   "${REPO_ROOT}/userland/kobox2_adapter/*.S"
   "${REPO_ROOT}/userland/libpacha/include/*.h"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+  "${REPO_ROOT}/userland/libpacha/src/log.c"
   "${REPO_ROOT}/kobox2/linux-sandbox/kobox/*.c"
   "${REPO_ROOT}/kobox2/linux-sandbox/kobox/*.h"
   "${PROTOCOL}/*.c" "${PROTOCOL}/*.h")
@@ -36,6 +37,9 @@ add_custom_command(
 add_custom_target(gpud_sandbox DEPENDS "${SANDBOX_ELF}")
 
 set(GPUD_SOURCES
+  "${CMAKE_CURRENT_SOURCE_DIR}/discovery.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/discovery_filed.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/inspect_policy.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/package.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/launch.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/launch_native.c"
@@ -58,6 +62,7 @@ set(GPUD_SOURCES
   "${REPO_ROOT}/userland/libipc/src/status.c"
   "${REPO_ROOT}/userland/libcapsule/src/capsule.c"
   "${REPO_ROOT}/userland/libpacha/src/syscall.c"
+  "${REPO_ROOT}/userland/libpacha/src/log.c"
   "${REPO_ROOT}/kobox2/src/controller/controller.c"
   "${REPO_ROOT}/kobox2/src/closure.c"
   "${PROTOCOL}/src/closure_manifest.c"

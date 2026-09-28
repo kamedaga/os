@@ -1811,6 +1811,25 @@ apps:
         - "kobox2/protocol"
     out: "NETD.ELF"
     rootfs: "/srv/netd.elf"
+  logd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/logd/logd.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/logd", ".artifacts/cmake/logd", "logd"]
+      input:
+        - "userland/logd/CMakeLists.txt"
+        - "userland/logd/src"
+        - "userland/logd/include"
+        - "userland/libipc/include"
+        - "userland/libipc/src"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src"
+        - "userland/filed/include"
+        - "musl/pachaos/include"
+        - "musl/pachaos/build/build-smokes.sh"
+        - "musl/upstream/arch/pachaos/syscall_arch.h"
+    out: "LOGD.ELF"
+    rootfs: "/srv/logd.elf"
   termd:
     role: "service"
     file:
@@ -2436,6 +2455,45 @@ apps:
   live_boot_profile:
     file: "pack/live-bootfs/profile"
     out: "BOOT-PROFILE"
+  amdgpu_probe_policy:
+    file:
+      path: ".artifacts/kobox2-amdgpu-package/owner-policy.conf"
+      rebuild: ["bash", "pack/scripts/build_amdgpu_package.sh"]
+      input:
+        - "pack/live-amdgpu-probe.conf"
+        - "pack/scripts/build_amdgpu_package.sh"
+        - "pack/scripts/build_amdgpu_firmware_bundle.py"
+        - "kobox2/linux-sandbox/kobox/manifest/profiles/amdgpu-firmware.sha256"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+    out: "GPU-PROBE.CONF"
+  amdgpu_mesa_runtime:
+    file:
+      path: ".artifacts/kobox2-amdgpu-mesa-runtime.tar.gz"
+      rebuild: ["python3", "pack/scripts/build_amdgpu_mesa_package.py", "--archive-output", ".artifacts/kobox2-amdgpu-mesa-runtime.tar.gz"]
+      input:
+        - "pack/scripts/build_amdgpu_mesa_package.py"
+        - "pack/live-bootfs.yaml"
+    out: "AMDMESA.TGZ"
+  amdgpu_driver_archive:
+    file:
+      path: ".artifacts/kobox2-amdgpu-driver.tar.gz"
+      rebuild: ["bash", "pack/scripts/build_amdgpu_package.sh"]
+      input:
+        - "pack/scripts/build_amdgpu_driver_archive.sh"
+        - "pack/scripts/build_amdgpu_package.sh"
+        - "pack/live-amdgpu-probe.conf"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+    out: "AMDGPUPKG.TGZ"
+  amdgpu_driver_archive_digest:
+    file:
+      path: ".artifacts/kobox2-amdgpu-driver.tar.gz.sha256"
+      rebuild: ["bash", "pack/scripts/build_amdgpu_driver_archive.sh"]
+      input:
+        - ".artifacts/kobox2-amdgpu-driver.tar.gz"
+        - "pack/scripts/build_amdgpu_driver_archive.sh"
+    out: "AMDGPUPKG.SHA256"
   rootfs_vfs:
     role: "service"
     file:

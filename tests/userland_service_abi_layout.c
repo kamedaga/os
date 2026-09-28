@@ -74,7 +74,8 @@ int main(void)
     failures += expect(sizeof(struct lprs_boot_config) == 128 &&
         offsetof(struct lprs_boot_config, unix_admin_fd) == 16 &&
         offsetof(struct lprs_boot_config, filed_admin_fd) == 24 &&
-        offsetof(struct lprs_boot_config, flags) == 32, "supervisor service admin bootstrap");
+        offsetof(struct lprs_boot_config, power_fd) == 32 &&
+        offsetof(struct lprs_boot_config, flags) == 40, "supervisor service admin bootstrap");
 
     failures += expect(sizeof(pacha_service_envelope_t) == 64, "service envelope size");
     failures += expect(

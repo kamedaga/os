@@ -492,6 +492,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
     @import("realtime_clock.zig").registerCpu(0, x86_platform.kernelPointerPaddr);
     @atomicStore(u64, &broadcast_online_mask, 0, .release);
     @atomicStore(u64, &mmio_cache_online_mask, 0, .release);
+    _ = mtrr.ensureWcPatSlot4();
     @atomicStore(u32, &mmio_cache_matches[0], @intFromBool(mtrr.captureCacheSnapshot(&mmio_cache_snapshots[0])), .release);
     if (info.trampoline_base == 0) {
         return false;
@@ -563,8 +564,7 @@ pub fn startIdleAps(info: *BootInfo, kernel_cr3: u64) bool {
             for (&mmio_cache_matches, 0..) |*value, slot| {
                 if (@atomicLoad(u32, value, .acquire) != 0) matching |= @as(u64, 1) << @intCast(slot);
             }
-            @atomicStore(u64, &mmio_cache_online_mask,
-                cacheEvidenceForOnlineCpus(success, info.lapic_count, mask, matching), .release);
+            @atomicStore(u64, &mmio_cache_online_mask, cacheEvidenceForOnlineCpus(success, info.lapic_count, mask, matching), .release);
         }
     }
     return success;
@@ -604,6 +604,7 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
         markStarted(cpu_slot);
         while (true) asm volatile ("hlt");
     }
+    _ = mtrr.ensureWcPatSlot4();
     const cache_snapshot = &mmio_cache_snapshots[cpu_slot];
     const cache_matches = mtrr.captureCacheSnapshot(cache_snapshot) and
         @atomicLoad(u32, &mmio_cache_matches[0], .acquire) != 0 and
@@ -617,10 +618,232 @@ fn apIdleEntry(cpu_slot: usize) callconv(.winapi) noreturn {
     apIdleLoop(cpu_slot);
 }
 
-pub fn ucMinusMmioAllowed(paddr: u64, bytes: u64) bool {
+pub const UcMinusMmioStatus = enum { ready, cache_evidence_missing, unsafe_range };
+
+fn ucMinusMmioStatusWithSnapshot(
+    snapshot: *const mtrr.CacheSnapshot,
+    verified: u64,
+    online: u64,
+    paddr: u64,
+    bytes: u64,
+) UcMinusMmioStatus {
+    if (verified == 0 or verified != online) return .cache_evidence_missing;
+    return if (ucMinusMmioWithSnapshot(snapshot, paddr, bytes)) .ready else .unsafe_range;
+}
+
+pub fn ucMinusMmioStatus(paddr: u64, bytes: u64) UcMinusMmioStatus {
     const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
-    return verified != 0 and verified == onlineCpuMask() and
-        ucMinusMmioWithSnapshot(&mmio_cache_snapshots[0], paddr, bytes);
+    return ucMinusMmioStatusWithSnapshot(&mmio_cache_snapshots[0], verified, onlineCpuMask(), paddr, bytes);
+}
+
+pub fn ucMinusMmioAllowed(paddr: u64, bytes: u64) bool {
+    return ucMinusMmioStatus(paddr, bytes) == .ready;
+}
+
+pub const WcMmioProof = struct {
+    pat_slot: u3,
+    mtrr_type: mtrr.MemoryType,
+};
+
+pub const RamCacheProofError = error{ CacheEvidenceMissing, InvalidRange, RamNotWriteBack, WcPatUnavailable };
+
+/// RAM must be restorable to actual WB, not merely a PTE spelling of WB.
+/// This is separate from BAR proof, which can legitimately admit MTRR UC/WC.
+/// Caller excludes CPU topology/PAT/MTRR changes until commit completes.
+pub fn ramCachePatProof(pages: []const u64, mode: @import("memory/ram_cache_transition.zig").Mode) RamCacheProofError!u3 {
+    return ramCachePatProofWithSnapshots(&mmio_cache_snapshots, @atomicLoad(u64, &mmio_cache_online_mask, .acquire), onlineCpuMask(), pages, mode);
+}
+
+fn ramCachePatProofWithSnapshots(
+    snapshots: []const mtrr.CacheSnapshot,
+    verified: u64,
+    online: u64,
+    pages: []const u64,
+    mode: @import("memory/ram_cache_transition.zig").Mode,
+) RamCacheProofError!u3 {
+    if (verified == 0 or verified != online or online & 1 == 0 or snapshots.len == 0)
+        return error.CacheEvidenceMissing;
+    @import("memory/ram_cache_paging.zig").validatePages(pages, @as(u64, 1) << 52) catch return error.InvalidRange;
+    const boot = &snapshots[0];
+    if (!boot.valid()) return error.CacheEvidenceMissing;
+    var seen: u64 = 0;
+    var common_wc: u8 = 0xff;
+    for (snapshots, 0..) |*snapshot, cpu| {
+        if (cpu >= 64) break;
+        const bit = @as(u64, 1) << @as(u6, @intCast(cpu));
+        if (online & bit == 0) continue;
+        if (!boot.matches(snapshot)) return error.CacheEvidenceMissing;
+        seen |= bit;
+        var wc: u8 = 0;
+        for (0..8) |slot| {
+            if (snapshot.patSlotIsWc(@intCast(slot))) wc |= @as(u8, 1) << @as(u3, @intCast(slot));
+        }
+        common_wc &= wc;
+    }
+    if (seen != online) return error.CacheEvidenceMissing;
+    // Matching snapshots prove all CPUs share the MTRR interpretation.
+    // The snapshot deliberately cannot prove fixed-MTRR RAM below 1 MiB.
+    for (pages) |pa| {
+        const kind = boot.uniformMtrrType(pa, 4096) orelse return error.InvalidRange;
+        if (kind != .wb) {
+            if (!@import("builtin").is_test) {
+                // A VMO offset does not identify the CPU cache type. Keep the
+                // first rejected physical page and boot MSR evidence in the
+                // existing debug ring; never weaken the WB proof on failure.
+                @import("kernel_log.zig").writeFmt(
+                    "ram-cache: proof paddr=0x{x} mtrr={s} syscfg=0x{x} top_mem2=0x{x} def_type=0x{x}\n",
+                    .{ pa, @tagName(kind), boot.amd_syscfg, boot.amd_top_mem2, boot.default_type },
+                );
+            }
+            return error.RamNotWriteBack;
+        }
+    }
+    return switch (mode) {
+        .wb => 0, // valid()/matches() prove slots 0/2/3 on every CPU.
+        .uc_minus => 2,
+        .uc => 3,
+        .wc => if (common_wc != 0) @intCast(@ctz(common_wc)) else error.WcPatUnavailable,
+    };
+}
+
+test "MMIO alias RAM proof requires restorable WB and common PAT on all CPUs" {
+    const base = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 7) << 16) | (@as(u64, 1) << 32),
+        .capability = 1 | (1 << 10),
+        .default_type = (1 << 11) | 6,
+        .physical_bits = 40,
+    };
+    var snapshots = [_]mtrr.CacheSnapshot{ base, base };
+    const pages = [_]u64{ 0x200000, 0x203000 };
+    for ([_]@import("memory/ram_cache_transition.zig").Mode{ .wb, .uc_minus, .uc, .wc }, [_]u3{ 0, 2, 3, 4 }) |mode, pat|
+        try std.testing.expectEqual(pat, try ramCachePatProofWithSnapshots(&snapshots, 3, 3, &pages, mode));
+    try std.testing.expectError(error.CacheEvidenceMissing, ramCachePatProofWithSnapshots(&snapshots, 1, 3, &pages, .wc));
+    snapshots[1].pat &= ~(@as(u64, 0xff) << 32);
+    try std.testing.expectError(error.WcPatUnavailable, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &pages, .wc));
+    snapshots[1] = base;
+    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x80000}, .wb));
+    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{@as(u64, 1) << 40}, .wb));
+    try std.testing.expectError(error.InvalidRange, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{ 0x200000, 0x200000 }, .wb));
+    const mask: u64 = (((@as(u64, 1) << 40) - 1) & ~@as(u64, 4095)) | (1 << 11);
+    for (&snapshots) |*snapshot| snapshot.ranges[0] = .{ .base = pages[1], .mask = mask };
+    try std.testing.expectError(error.RamNotWriteBack, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &pages, .wc));
+}
+
+test "MMIO alias RAM proof accepts AMD TOM2 default only with matching CPU evidence" {
+    const base = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 7) << 16),
+        .capability = 1,
+        .default_type = 1 << 11, // UC outside TOM2.
+        .physical_bits = 46,
+        .amd_pat_mtrr_semantics = true,
+        .amd_syscfg = (1 << 21) | (1 << 22),
+        .amd_top_mem2 = 0x8_0000_0000,
+    };
+    var snapshots = [_]mtrr.CacheSnapshot{ base, base };
+    try std.testing.expectEqual(@as(u3, 2), try ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x1_4000_0000}, .uc_minus));
+    try std.testing.expectError(error.RamNotWriteBack, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x8_0000_0000}, .uc_minus));
+    snapshots[1].amd_top_mem2 -= 0x80_0000;
+    try std.testing.expectError(error.CacheEvidenceMissing, ramCachePatProofWithSnapshots(&snapshots, 3, 3, &.{0x1_4000_0000}, .uc_minus));
+}
+
+pub const WcMmioProofError = error{ CacheEvidenceMissing, InvalidRange, UnsupportedCpu, WcPatUnavailable };
+
+fn wcMmioProofWithSnapshots(
+    snapshots: []const mtrr.CacheSnapshot,
+    verified: u64,
+    online: u64,
+    paddr: u64,
+    bytes: u64,
+) WcMmioProofError!WcMmioProof {
+    if (verified == 0 or verified != online or online & 1 == 0 or snapshots.len == 0)
+        return error.CacheEvidenceMissing;
+    const boot = &snapshots[0];
+    if (!boot.valid()) return error.CacheEvidenceMissing;
+    var seen: u64 = 0;
+    for (snapshots, 0..) |*snapshot, cpu_slot| {
+        if (cpu_slot >= 64) break;
+        const bit = @as(u64, 1) << @as(u6, @intCast(cpu_slot));
+        if (online & bit == 0) continue;
+        if (!boot.matches(snapshot)) return error.CacheEvidenceMissing;
+        seen |= bit;
+    }
+    if (seen != online) return error.CacheEvidenceMissing;
+
+    const mtrr_type = boot.uniformMtrrType(paddr, bytes) orelse return error.InvalidRange;
+    // AMD APM Vol. 2, effective-type table: PAT0 WB + MTRR WC is WC.
+    // No firmware WC PAT entry is required for this proven combination.
+    if (mtrr_type == .wc) return .{ .pat_slot = 0, .mtrr_type = .wc };
+
+    // PAT WC overrides other supported MTRR types on AMD, but not on every
+    // x86 implementation. Never infer this from the PAT MSR alone.
+    if (!boot.amd_pat_mtrr_semantics) return error.UnsupportedCpu;
+    // This proves only the proposed mapping's effective type; the caller
+    // must settle every preexisting physical alias before publishing its PTE.
+    for ([_]u3{ 1, 4, 5, 6, 7 }) |pat_slot| {
+        var common = true;
+        for (snapshots, 0..) |*snapshot, cpu_slot| {
+            if (cpu_slot >= 64) break;
+            const bit = @as(u64, 1) << @as(u6, @intCast(cpu_slot));
+            if (online & bit != 0 and !snapshot.patSlotIsWc(pat_slot)) {
+                common = false;
+                break;
+            }
+        }
+        if (common) return .{ .pat_slot = pat_slot, .mtrr_type = mtrr_type };
+    }
+    return error.WcPatUnavailable;
+}
+
+/// Read-only cache proof for the actual CPU PAT/MTRR state. This does not
+/// authorize a BAR lease or modify any identity mapping.
+pub fn wcMmioProof(paddr: u64, bytes: u64) WcMmioProofError!WcMmioProof {
+    const verified = @atomicLoad(u64, &mmio_cache_online_mask, .acquire);
+    return wcMmioProofWithSnapshots(&mmio_cache_snapshots, verified, onlineCpuMask(), paddr, bytes);
+}
+
+test "MMIO alias WC proof requires all online CPUs to share a usable PAT slot" {
+    const address: u64 = 0xd0000000;
+    const base = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 1) << 8) | (@as(u64, 7) << 16),
+        .capability = 1 << 10,
+        .default_type = 1 << 11, // MTRR default UC.
+        .physical_bits = 46,
+        .amd_pat_mtrr_semantics = true,
+    };
+    var snapshots = [_]mtrr.CacheSnapshot{ base, base };
+    const ready = try wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192);
+    try std.testing.expectEqual(@as(u3, 1), ready.pat_slot);
+    try std.testing.expectEqual(mtrr.MemoryType.uc, ready.mtrr_type);
+
+    snapshots[1].pat &= ~(@as(u64, 0xff) << 8);
+    try std.testing.expectError(error.WcPatUnavailable, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192));
+    snapshots[0].pat = 6 | (@as(u64, 7) << 16) | (@as(u64, 1) << 32);
+    snapshots[1].pat |= @as(u64, 1) << 32;
+    const high_slot = try wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192);
+    try std.testing.expectEqual(@as(u3, 4), high_slot.pat_slot);
+
+    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, 0b01, 0b11, address, 8192));
+    try std.testing.expectError(error.InvalidRange, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address + 1, 8192));
+    snapshots[0].amd_pat_mtrr_semantics = false;
+    snapshots[1].amd_pat_mtrr_semantics = false;
+    try std.testing.expectError(error.UnsupportedCpu, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192));
+}
+
+test "MMIO alias WC proof admits PAT0 when every MTRR is WC" {
+    const address: u64 = 0xd0000000;
+    const base = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 7) << 16), // No PAT entry contains WC.
+        .capability = 1 << 10,
+        .default_type = (1 << 11) | 1, // MTRR default WC.
+        .physical_bits = 46,
+    };
+    var snapshots = [_]mtrr.CacheSnapshot{ base, base };
+    const proof = try wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192);
+    try std.testing.expectEqual(@as(u3, 0), proof.pat_slot);
+    try std.testing.expectEqual(mtrr.MemoryType.wc, proof.mtrr_type);
+
+    snapshots[1].default_type = (1 << 11) | 6;
+    try std.testing.expectError(error.CacheEvidenceMissing, wcMmioProofWithSnapshots(&snapshots, 0b11, 0b11, address, 8192));
 }
 
 pub const ExplicitUcMmioStatus = enum {
@@ -737,6 +960,19 @@ test "MMIO alias cache proof includes low and high identity boundaries" {
         try std.testing.expect(ucMinusMmioWithSnapshot(&snapshot, paddr, 8192));
     }
     try std.testing.expect(!uncachedKernelMmioPageWithSnapshot(&snapshot, 1 << 46));
+}
+
+test "MMIO alias cache status separates missing evidence from unsafe range" {
+    const snapshot = mtrr.CacheSnapshot{
+        .pat = 6 | (@as(u64, 7) << 16),
+        .physical_bits = 46,
+        .default_type = 1 << 11,
+    };
+    const paddr: u64 = 0xfce00000;
+    try std.testing.expectEqual(UcMinusMmioStatus.cache_evidence_missing, ucMinusMmioStatusWithSnapshot(&snapshot, 0, 0b11, paddr, 0x80000));
+    try std.testing.expectEqual(UcMinusMmioStatus.cache_evidence_missing, ucMinusMmioStatusWithSnapshot(&snapshot, 0b01, 0b11, paddr, 0x80000));
+    try std.testing.expectEqual(UcMinusMmioStatus.ready, ucMinusMmioStatusWithSnapshot(&snapshot, 0b11, 0b11, paddr, 0x80000));
+    try std.testing.expectEqual(UcMinusMmioStatus.unsafe_range, ucMinusMmioStatusWithSnapshot(&snapshot, 0b11, 0b11, paddr, 0));
 }
 
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {

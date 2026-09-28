@@ -113,13 +113,15 @@ static int close_handle(int endpoint_fd, uint64_t handle)
     return status;
 }
 
-int filed_client_load_module_image(
+int filed_client_load_module_image_limited(
     int endpoint_fd,
     const char *path,
     const char *name,
+    size_t max_bytes,
     struct filed_client_module_image *out)
 {
-    if (endpoint_fd < 16 || path == NULL || name == NULL || out == NULL)
+    if (endpoint_fd < 16 || path == NULL || name == NULL || out == NULL ||
+        max_bytes == 0 || max_bytes > FILED_CLIENT_LARGE_MODULE_MAX_BYTES)
         return -22;
     memset(out, 0, sizeof(*out));
 
@@ -151,7 +153,7 @@ int filed_client_load_module_image(
     const uint64_t image_size = stat->size;
     destroy_page(page_fd, page);
     if (status != 0 || image_size == 0 ||
-        image_size > FILED_CLIENT_MODULE_MAX_BYTES) {
+        image_size > max_bytes) {
         (void)close_handle(endpoint_fd, handle);
         return status != 0 ? status : -7;
     }
@@ -174,7 +176,7 @@ int filed_client_load_module_image(
     destroy_page(page_fd, page);
     const int close_status = close_handle(endpoint_fd, handle);
     if (status != 0) return status;
-    if (close_status != 0 || loaded == 0 || loaded > FILED_CLIENT_MODULE_MAX_BYTES) {
+    if (close_status != 0 || loaded == 0 || loaded > max_bytes) {
         (void)pacha_fd_close((int)image_fd.fd);
         return close_status != 0 ? close_status : -5;
     }
@@ -198,6 +200,13 @@ int filed_client_load_module_image(
     out->size = (size_t)loaded;
     out->name = name;
     return 0;
+}
+
+int filed_client_load_module_image(int endpoint_fd, const char *path,
+    const char *name, struct filed_client_module_image *out)
+{
+    return filed_client_load_module_image_limited(endpoint_fd, path, name,
+        FILED_CLIENT_MODULE_MAX_BYTES, out);
 }
 
 void filed_client_release_module_image(struct filed_client_module_image *image)

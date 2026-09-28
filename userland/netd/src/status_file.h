@@ -13,6 +13,8 @@ void netd_status_file_publish(const struct netd_boot_config *cfg,
     const char *state, uint64_t stage, int status);
 void netd_status_file_progress(const struct netd_boot_config *cfg,
     const char *phase);
+void netd_status_file_kobox_progress(const struct netd_boot_config *cfg,
+    const char *phase);
 void netd_status_file_note(const struct netd_boot_config *cfg,
     const char *phase);
 int netd_policy_file_create(int filed_endpoint_fd,

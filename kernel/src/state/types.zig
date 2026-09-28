@@ -131,7 +131,7 @@ pub const max_fd_objects: usize = 8192;
 pub const max_pipes: usize = 256;
 pub const pipe_buffer_bytes: usize = 4096;
 pub const fd_known_flags_mask: u32 = (@as(u32, 1) << 4) - 1;
-pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 45) - 1;
+pub const fd_known_rights_mask: u64 = (@as(u64, 1) << 46) - 1;
 
 pub const FdFlags = packed struct(u32) {
     cloexec: bool = false,
@@ -167,6 +167,7 @@ pub const FdRights = packed struct(u64) {
     map_write: bool = false,
     map_exec: bool = false,
     resize: bool = false,
+    cache_policy: bool = false,
     share: bool = false,
     pager_attach: bool = false,
     pager_fault: bool = false,
@@ -195,7 +196,7 @@ pub const FdRights = packed struct(u64) {
     read: bool = false,
     write: bool = false,
     revoke: bool = false,
-    _reserved: u19 = 0,
+    _reserved: u18 = 0,
 };
 
 pub fn fdRightsFromBits(bits: u64) FdRights {
@@ -271,6 +272,10 @@ pub const MmioRegionObject = struct {
     user_va: u64 = 0,
     size: u64 = 0,
     flags: u32 = 0,
+    // Internal ownership of the physical WC copy-window guard and, for
+    // low addresses, temporary identity alias suppression.
+    // This is not part of the capsule ABI.
+    wc_window_lease_token: u16 = 0,
 };
 
 pub const DmaBufferObject = struct {
@@ -908,6 +913,20 @@ pub const NativeVmoKind = enum(u8) {
     /// anonymous parent VMO. The view owns only its page-index metadata; its
     /// parent reference owns the physical pages.
     page_view = 2,
+    /// Borrowed BAR pages, never allocator-owned RAM. Admission and cache
+    /// leases must be established before this backing can acquire VMAs.
+    device_memory = 3,
+};
+
+pub const DeviceMemoryCache = enum(u8) { uc, wc };
+
+pub const DeviceMemoryBacking = struct {
+    device: DmaDeviceId,
+    bar_index: u8,
+    cache: DeviceMemoryCache,
+    state: enum(u8) { staged, active, retiring } = .staged,
+    pat_slot: u8 = 0,
+    wc_lease_token: u16 = 0,
 };
 
 pub const NativeVmoRef = struct {
@@ -938,9 +957,16 @@ pub const NativeVmoSlot = struct {
     page_store_owner: u64 = 0,
     has_page_store: bool = false,
     zero_on_demand: bool = false,
+    // Cached RAM cannot be recycled at final drop under an inner VM lock.
+    // The outer retirement path restores WB before returning owned pages.
+    ram_cache_state: enum(u8) { wb, cached, retiring } = .wb,
     ref_count: u32 = 0,
-    parent: NativeVmoRef = .{},
-    parent_offset: u64 = 0,
+    // Device backing has no anonymous parent. Sharing their storage keeps
+    // the slot within one cache line, including the union's safety tag.
+    backing: union {
+        parent: struct { ref: NativeVmoRef = .{}, offset: u64 = 0 },
+        device: DeviceMemoryBacking,
+    } = .{ .parent = .{} },
 };
 
 pub const NativeCowTableSlot = struct {
@@ -1018,6 +1044,7 @@ pub const VmaTable = struct {
 pub const NativeVmaFaultMapping = struct {
     paddr: u64,
     prot: MapProt,
+    device_pat_slot: ?u3 = null,
     invalidate_start_va: u64 = 0,
     invalidate_size_bytes: u64 = 0,
 };
@@ -1692,6 +1719,26 @@ pub const FreePageList = struct {
         return self.range_len;
     }
 
+    pub const AvailablePages = struct {
+        total: usize = 0,
+        largest_run: usize = 0,
+    };
+
+    // Allocation failures need a coherent view of the address-constrained
+    // pool, not the unrelated amount of free high RAM.
+    pub fn availableBelow(self: *const FreePageList, limit_exclusive: u64) AvailablePages {
+        self.lock();
+        defer self.unlock();
+        var result: AvailablePages = .{};
+        for (self.ranges[0..self.range_len]) |range| {
+            if (range.physical_start >= limit_exclusive) continue;
+            const pages = @min(range.len, (limit_exclusive - range.physical_start) / 4096);
+            result.total += pages;
+            result.largest_run = @max(result.largest_run, pages);
+        }
+        return result;
+    }
+
     fn rangeEnd(range: *const RegionFreeRange) u64 {
         return range.physical_start + (@as(u64, @intCast(range.len)) * 4096);
     }
@@ -1954,24 +2001,33 @@ pub const FreePageList = struct {
         page_count: usize,
         min_inclusive: u64,
     ) KernelError!u64 {
+        return self.popContiguousInRange(page_count, min_inclusive, std.math.maxInt(u64));
+    }
+
+    pub fn popContiguousInRange(
+        self: *FreePageList,
+        page_count: usize,
+        min_inclusive: u64,
+        max_exclusive: u64,
+    ) KernelError!u64 {
         self.lock();
         defer self.unlock();
         if (page_count == 0) return KernelError.InvalidState;
+        if (min_inclusive >= max_exclusive) return KernelError.OutOfFreePages;
+        const rounded_min = std.math.add(u64, min_inclusive, 4095) catch return KernelError.OutOfFreePages;
+        const aligned_min = rounded_min & ~@as(u64, 4095);
         if (self.len < page_count or self.range_len == 0) return KernelError.OutOfFreePages;
 
         var range_index: usize = 0;
         while (range_index < self.range_len) : (range_index += 1) {
             const range = &self.ranges[range_index];
             if (range.len == 0) continue;
-            const aligned_start = if (range.physical_start < min_inclusive)
-                ((min_inclusive + 4095) & ~@as(u64, 4095))
-            else
-                range.physical_start;
-            if (aligned_start < range.physical_start) continue;
+            const aligned_start = @max(range.physical_start, aligned_min);
+            if (aligned_start >= max_exclusive) continue;
             const skip_pages: usize = @intCast((aligned_start - range.physical_start) / 4096);
             if (skip_pages > range.len) continue;
             const available = range.len - skip_pages;
-            if (available < page_count) continue;
+            if (@min(available, (max_exclusive - aligned_start) / 4096) < page_count) continue;
 
             const alloc_start = aligned_start;
             const tail_pages = available - page_count;

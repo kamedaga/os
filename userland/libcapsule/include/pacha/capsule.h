@@ -33,6 +33,9 @@ enum {
 
     PACHA_CAPSULE_MMIO_REPLACE_EXISTING = 1ull << 0,
     PACHA_CAPSULE_MMIO_READ_ONLY = 1ull << 1,
+    /* address is a u64 BAR-relative page-offset array, size is logical
+     * bytes, scalar offset is zero; returns a revocable VMO, not a VA. */
+    PACHA_CAPSULE_MMIO_EXPORT_VMO = 1ull << 5,
     PACHA_CAPSULE_MMIO_CACHE_UC = 0ull << 2,
     PACHA_CAPSULE_MMIO_CACHE_UC_MINUS = 1ull << 2,
     PACHA_CAPSULE_MMIO_CACHE_WC = 2ull << 2,

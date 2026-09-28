@@ -23,6 +23,14 @@ pub const stack_region_chunk_count: usize = stack_region_bytes / @as(usize, @int
 pub const ring0_stack_bytes: usize = stack_region_bytes - (2 * guard_page_bytes);
 pub const ist_stack_bytes: usize = 2 * 1024 * 1024;
 const runtime_identity_split_pt_count: usize = 256;
+const wc_identity_chunk_count: usize = 256;
+const wc_identity_marker: u64 = 1 << 9;
+const WcIdentityChunk = struct {
+    base: u64 = 0,
+    active: bool = false,
+    refs: [page_entries]u16 = [_]u16{0} ** page_entries,
+    original: [page_entries]u64 = [_]u64{0} ** page_entries,
+};
 const high_kernel_pd_table_count: usize = 4;
 const high_kernel_pt_table_count: usize = 128;
 pub const phys_copy_window_va: u64 = (@as(u64, @intCast(high_mmio_pml4_index)) << 39);
@@ -112,6 +120,7 @@ var pf_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(409
 var df_ist_stack_guard_pt: [stack_region_chunk_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** stack_region_chunk_count;
 var runtime_identity_split_pts: [runtime_identity_split_pt_count][page_entries]u64 align(4096) = [_][page_entries]u64{[_]u64{0} ** page_entries} ** runtime_identity_split_pt_count;
 var runtime_identity_split_pt_used: usize = 0;
+var wc_identity_chunks: [wc_identity_chunk_count]WcIdentityChunk = [_]WcIdentityChunk{.{}} ** wc_identity_chunk_count;
 var tss_tables: [max_cpus]Tss = [_]Tss{std.mem.zeroes(Tss)} ** max_cpus;
 var de_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
 var bp_trampoline_page: [4096]u8 align(4096) = [_]u8{0} ** 4096;
@@ -178,6 +187,7 @@ pub fn kernelStaticStorageStartAddr() usize {
     start = minStaticStart(start, staticStorageStart(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
     start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pts), &runtime_identity_split_pts));
     start = minStaticStart(start, staticStorageStart(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
+    start = minStaticStart(start, staticStorageStart(@TypeOf(wc_identity_chunks), &wc_identity_chunks));
     start = minStaticStart(start, staticStorageStart(@TypeOf(tss_tables), &tss_tables));
     start = minStaticStart(start, staticStorageStart(@TypeOf(de_trampoline_page), &de_trampoline_page));
     start = minStaticStart(start, staticStorageStart(@TypeOf(bp_trampoline_page), &bp_trampoline_page));
@@ -231,6 +241,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(df_ist_stack_guard_pt), &df_ist_stack_guard_pt));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pts), &runtime_identity_split_pts));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(runtime_identity_split_pt_used), &runtime_identity_split_pt_used));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wc_identity_chunks), &wc_identity_chunks));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tss_tables), &tss_tables));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(de_trampoline_page), &de_trampoline_page));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(bp_trampoline_page), &bp_trampoline_page));
@@ -805,17 +816,11 @@ fn splitLargeKernelIdentityPage(pd_entry: *u64) bool {
     if ((pd_entry.* & page_ps) == 0) return true;
     if (runtime_identity_split_pt_used >= runtime_identity_split_pts.len) return false;
     const pt = &runtime_identity_split_pts[runtime_identity_split_pt_used];
-    runtime_identity_split_pt_used += 1;
-
-    const large_base = pd_entry.* & ~@as(u64, 0x1F_FFFF);
-    const pte_flags = (pd_entry.* & 0xFFF) & ~page_ps;
-    var page_index: usize = 0;
-    while (page_index < page_entries) : (page_index += 1) {
-        const page_base = large_base + (@as(u64, @intCast(page_index)) * 4096);
-        pt[page_index] = page_base | pte_flags;
-    }
+    const large_base = pd_entry.* & page_addr_mask & ~@as(u64, 0x1F_FFFF);
     const pt_pa = kernelPtrPaddr(pt) orelse return false;
-    pd_entry.* = pt_pa | pte_flags;
+    const split = @import("../../memory/ram_cache_paging.zig").IdentitySplit.prepare(pd_entry, large_base, pt, pt_pa) catch return false;
+    runtime_identity_split_pt_used += 1;
+    split.publishEquivalent();
     return true;
 }
 
@@ -909,6 +914,272 @@ pub fn bootIdentityPageIsExplicitUc(page_base: u64) bool {
     // For a 4 KiB leaf, bit 7 is PAT. Reject it even if PWT/PCD look UC.
     return (leaf & required) == required and (leaf & page_ps) == 0 and
         (leaf & page_addr_mask) == page_base;
+}
+
+pub fn kernelIdentityPdEntry(page_base: u64) ?u64 {
+    if (page_base >= physical_layout.identity_limit) return null;
+    const pdp_index: usize = @intCast(page_base >> 30);
+    const pd_index: usize = @intCast((page_base >> 21) & 511);
+    return pd_tables[pdp_index][pd_index];
+}
+
+/// Enumerate the native runtime's persistent identity aliases. The temporary
+/// physical-copy windows are retired by the writer's all-CPU rendezvous, not
+/// treated as permanent identity leaves. Canonical VMO ownership is required
+/// separately; in particular it excludes kernel stacks and page-table pages.
+pub fn visitRamCacheIdentityAliases(pages: []const u64, context: anytype, comptime visit: anytype) !void {
+    const paging = @import("../../memory/ram_cache_paging.zig");
+    try paging.validatePages(pages, @as(u64, 1) << 52);
+    if (kernelHighMappingActive()) {
+        const delta = image_range.virtual_base & 4095;
+        if (image_range.base_paddr < delta) return error.Invalid;
+        const bytes = if (image_range.size_bytes == 0) @as(u64, 256 * 1024 * 1024) else std.math.add(u64, image_range.size_bytes, delta) catch return error.Invalid;
+        const rounded = std.math.add(u64, bytes, 4095) catch return error.Invalid;
+        if (paging.pagesIntersect(pages, image_range.base_paddr - delta, rounded & ~@as(u64, 4095)))
+            return error.KernelImageAlias;
+    }
+    const high_base = @as(u64, high_mmio_pml4_index) << 39;
+    const high_bytes = @as(u64, high_mmio_pdp_table_count) << 30;
+    var last_large: ?*u64 = null;
+    for (pages) |pa| {
+        const directory = if (pa < physical_layout.identity_limit)
+            identityPdPointer(pa)
+        else if (pa >= high_base and pa - high_base < high_bytes) blk: {
+            // The first PDE of this region is deliberately replaced by the
+            // per-CPU copy windows and has no permanent identity translation.
+            if (pa - high_base < two_mib) continue;
+            break :blk &high_mmio_pd_tables[@intCast((pa - high_base) >> 30)][@intCast((pa >> 21) & 511)];
+        } else continue;
+        const entry = @atomicLoad(u64, directory, .acquire);
+        if ((entry & page_present) == 0 or (entry & page_user) != 0) return error.Unsupported;
+        if ((entry & page_ps) != 0) {
+            if (last_large == directory) continue;
+            const base = pa & ~(two_mib - 1);
+            try paging.IdentitySplit.validateSource(entry, base);
+            try visit(context, paging.AliasSource{ .identity = .{ .directory = directory, .base = base } });
+            last_large = directory;
+        } else {
+            const table_pa = entry & page_addr_mask;
+            if (table_pa == 0 or table_pa >= physical_layout.identity_limit) return error.Unsupported;
+            if (!ramCacheOwnedIdentityPt(pa & ~(two_mib - 1), table_pa)) return error.UnknownKernelTable;
+            const table: *[512]u64 = @ptrFromInt(table_pa);
+            const leaf = &table[@intCast((pa >> 12) & 511)];
+            const value = @atomicLoad(u64, leaf, .acquire);
+            if ((value & (page_present | page_user | (1 << 8))) != page_present or
+                (value & page_addr_mask) != pa) return error.Unsupported;
+            try visit(context, paging.AliasSource{ .leaf = leaf });
+        }
+    }
+}
+
+test "WC identity lease RAM enumeration deduplicates large directories and excludes kernel image" {
+    const Source = @import("../../memory/ram_cache_paging.zig").AliasSource;
+    const Collector = struct {
+        count: usize = 0,
+        fn visit(self: *@This(), source: Source) !void {
+            try std.testing.expect(source == .identity);
+            self.count += 1;
+        }
+    };
+    const old = pd_tables[0][2];
+    defer pd_tables[0][2] = old;
+    const old_virtual = image_range.virtual_base;
+    const old_physical = image_range.base_paddr;
+    const old_size = image_range.size_bytes;
+    defer {
+        image_range.virtual_base = old_virtual;
+        image_range.base_paddr = old_physical;
+        image_range.size_bytes = old_size;
+    }
+    image_range.virtual_base = 0;
+    pd_tables[0][2] = 0x400000 | 0x83;
+    var collector: Collector = .{};
+    try visitRamCacheIdentityAliases(&.{ 0x400000, 0x401000, 0x500000 }, &collector, Collector.visit);
+    try std.testing.expectEqual(@as(usize, 1), collector.count);
+    pd_tables[0][2] |= 1 << 8;
+    try std.testing.expectError(error.Unsupported, visitRamCacheIdentityAliases(&.{0x400000}, &collector, Collector.visit));
+    pd_tables[0][2] &= ~@as(u64, 1 << 8);
+    image_range.virtual_base = 0xffff_ffff_8000_0000;
+    image_range.base_paddr = 0x400000;
+    image_range.size_bytes = 0;
+    try std.testing.expectError(error.KernelImageAlias, visitRamCacheIdentityAliases(&.{0x400000}, &collector, Collector.visit));
+    try std.testing.expectError(error.KernelImageAlias, visitRamCacheIdentityAliases(&.{0x800000}, &collector, Collector.visit));
+    try std.testing.expectEqual(@as(usize, 1), collector.count);
+}
+
+fn wcChunk(base: u64) ?*WcIdentityChunk {
+    for (&wc_identity_chunks) |*chunk| {
+        if (chunk.active and chunk.base == base) return chunk;
+    }
+    return null;
+}
+
+fn identityPdPointer(page: u64) *u64 {
+    return &pd_tables[@intCast(page >> 30)][@intCast((page >> 21) & 511)];
+}
+
+fn identityPtePointer(page: u64) ?*u64 {
+    const pde = identityPdPointer(page).*;
+    if ((pde & page_present) == 0 or (pde & page_ps) != 0) return null;
+    const pt: *[page_entries]u64 = @ptrFromInt(pde & page_addr_mask);
+    return &pt[@intCast((page >> 12) & 511)];
+}
+
+fn identityPageCanBeHidden(page: u64) bool {
+    const chunk = wcChunk(page & ~(two_mib - 1));
+    const index: usize = @intCast((page >> 12) & 511);
+    if (chunk) |existing| {
+        if (existing.refs[index] != 0) {
+            const pte = identityPtePointer(page) orelse return false;
+            return (pte.* & (page_addr_mask | wc_identity_marker | page_present)) ==
+                (page | wc_identity_marker) and existing.refs[index] != std.math.maxInt(u16);
+        }
+    }
+    const pde = identityPdPointer(page).*;
+    if ((pde & page_present) == 0) return false;
+    if ((pde & page_ps) != 0) {
+        @import("../../memory/ram_cache_paging.zig").IdentitySplit.validateSource(
+            pde,
+            page & ~(two_mib - 1),
+        ) catch return false;
+        // Only the kernel's known PAT0/PAT3 identity encodings may be
+        // transitioned. A prior effective WB/WT/WP type requires the
+        // caller's all-CPU cache flush after these leaves are removed.
+        const cache = pde & ((1 << 3) | (1 << 4) | (1 << 12));
+        return cache == 0 or cache == ((1 << 3) | (1 << 4));
+    }
+    const pte = identityPtePointer(page) orelse return false;
+    if ((pte.* & page_present) == 0 or (pte.* & page_addr_mask) != page) return false;
+    const cache = pte.* & ((1 << 3) | (1 << 4) | (1 << 7));
+    return cache == 0 or cache == ((1 << 3) | (1 << 4));
+}
+
+/// Preflight is side-effect free. Caller holds all VM transactions and has
+/// proved the range is PCI MMIO with effective UC old aliases. A successful
+/// acquire cannot fail after this check under the global state lock.
+pub fn wcIdentityCanAcquire(base: u64, bytes: u64) bool {
+    if (bytes == 0 or ((base | bytes) & 4095) != 0 or base < 0x100000 or
+        base >= physical_layout.identity_limit or
+        bytes > physical_layout.identity_limit - base) return false;
+    var needed_chunks: usize = 0;
+    var needed_splits: usize = 0;
+    var page = base;
+    while (page < base + bytes) : (page += 4096) {
+        if (!identityPageCanBeHidden(page)) return false;
+        if ((page & (two_mib - 1)) == 0 or page == base) {
+            const chunk_base = page & ~(two_mib - 1);
+            if (wcChunk(chunk_base) == null) needed_chunks += 1;
+            if ((identityPdPointer(page).* & page_ps) != 0) needed_splits += 1;
+        }
+    }
+    var free_chunks: usize = 0;
+    for (&wc_identity_chunks) |*chunk| if (!chunk.active) {
+        free_chunks += 1;
+    };
+    return needed_chunks <= free_chunks and
+        needed_splits <= runtime_identity_split_pts.len - runtime_identity_split_pt_used;
+}
+
+/// Leave no low supervisor identity alias while a WC user mapping is live.
+/// The caller must synchronously shoot down every CR3 before publishing WC.
+pub fn wcIdentityAcquire(base: u64, bytes: u64) void {
+    var page = base;
+    while (page < base + bytes) : (page += 4096) {
+        const chunk_base = page & ~(two_mib - 1);
+        var chunk = wcChunk(chunk_base);
+        if (chunk == null) {
+            for (&wc_identity_chunks) |*slot| {
+                if (slot.active) continue;
+                slot.base = chunk_base;
+                slot.active = true;
+                chunk = slot;
+                break;
+            }
+        }
+        const current = chunk orelse unreachable;
+        const pde = identityPdPointer(page);
+        if ((pde.* & page_ps) != 0 and !splitLargeKernelIdentityPage(pde)) unreachable;
+        const pte = identityPtePointer(page) orelse unreachable;
+        const index: usize = @intCast((page >> 12) & 511);
+        if (current.refs[index] == 0) {
+            current.original[index] = pte.*;
+            pte.* = (pte.* & ~page_present) | wc_identity_marker;
+        }
+        current.refs[index] += 1;
+    }
+}
+
+/// Mark last-reference leaves restorable, but keep them non-present until
+/// callers have drained the old WC mapping from all CPU TLBs and caches.
+pub fn wcIdentityRelease(base: u64, bytes: u64) void {
+    var page = base;
+    while (page < base + bytes) : (page += 4096) {
+        const chunk = wcChunk(page & ~(two_mib - 1)) orelse unreachable;
+        const index: usize = @intCast((page >> 12) & 511);
+        if (chunk.refs[index] == 0) unreachable;
+        chunk.refs[index] -= 1;
+    }
+}
+
+/// Called after an all-CPU old-type barrier. The original PTE is reinstated
+/// only for pages whose final WC lease has gone away.
+pub fn wcIdentityRestore(base: u64, bytes: u64) void {
+    var page = base;
+    while (page < base + bytes) : (page += 4096) {
+        const chunk = wcChunk(page & ~(two_mib - 1)) orelse unreachable;
+        const index: usize = @intCast((page >> 12) & 511);
+        if (chunk.refs[index] != 0) continue;
+        const pte = identityPtePointer(page) orelse unreachable;
+        pte.* = chunk.original[index];
+        chunk.original[index] = 0;
+    }
+    for (&wc_identity_chunks) |*chunk| {
+        if (!chunk.active) continue;
+        var live = false;
+        for (chunk.refs) |refs| {
+            if (refs != 0) {
+                live = true;
+                break;
+            }
+        }
+        if (!live) chunk.active = false;
+    }
+}
+
+pub fn wcIdentityPageNeedsRestore(page: u64) bool {
+    if (page >= physical_layout.identity_limit) return false;
+    const chunk = wcChunk(page & ~(two_mib - 1)) orelse return true;
+    return chunk.refs[@intCast((page >> 12) & 511)] == 0;
+}
+
+test "WC identity lease hides exact pages, counts overlaps, and restores UC" {
+    const base: u64 = 0x0040_0000;
+    const old_pde = pd_tables[0][2];
+    defer pd_tables[0][2] = old_pde;
+    var pt: [page_entries]u64 align(4096) = [_]u64{0} ** page_entries;
+    for (&pt, 0..) |*entry, index| {
+        entry.* = base + @as(u64, @intCast(index)) * 4096 |
+            page_present | page_rw | page_nx;
+    }
+    const uc = (1 << 3) | (1 << 4);
+    pt[1] |= uc;
+    pd_tables[0][2] = @intFromPtr(&pt) | page_present | page_rw;
+    try std.testing.expect(wcIdentityCanAcquire(base, 8192));
+    wcIdentityAcquire(base, 8192);
+    try std.testing.expectEqual(@as(u64, 0), pt[0] & page_present);
+    try std.testing.expectEqual(@as(u64, 0), pt[1] & page_present);
+    try std.testing.expectEqual(@as(u64, page_present), pt[2] & page_present);
+    try std.testing.expect(wcIdentityCanAcquire(base + 4096, 4096));
+    wcIdentityAcquire(base + 4096, 4096);
+    wcIdentityRelease(base, 8192);
+    wcIdentityRestore(base, 8192);
+    try std.testing.expectEqual(@as(u64, page_present), pt[0] & page_present);
+    try std.testing.expectEqual(@as(u64, 0), pt[1] & page_present);
+    try std.testing.expect(!wcIdentityPageNeedsRestore(base + 4096));
+    wcIdentityRelease(base + 4096, 4096);
+    wcIdentityRestore(base + 4096, 4096);
+    try std.testing.expectEqual(@as(u64, page_present | page_rw | page_nx | uc | base + 4096), pt[1]);
+    try std.testing.expect(wcIdentityPageNeedsRestore(base + 4096));
 }
 
 test "boot MMIO UC proof checks the live identity leaf and physical page" {
@@ -1174,6 +1445,150 @@ pub fn seedUserPml4WithKernel(pml4: []u64) void {
     if (pml4_index >= pml4.len) return;
     const high_pdp_pa = kernelPtrPaddr(&high_kernel_pdp_table) orelse return;
     pml4[pml4_index] = high_pdp_pa | page_present | page_rw;
+}
+
+// The cache writer validates shared parent pointers without following an
+// unrecognized table supplied by corrupted/stale address-space metadata.
+pub fn ramCacheSharedPml4Entry(index: usize) ?u64 {
+    if (!kernelHighMappingActive() or index != ((image_range.virtual_base >> 39) & 511)) return null;
+    const pa = kernelPtrPaddr(&high_kernel_pdp_table) orelse return null;
+    return pa | page_present | page_rw;
+}
+
+pub fn ramCacheSharedPdpEntry(pml4: usize, index: usize) ?u64 {
+    if (pml4 != 0 or index == 0 or index >= pd_table_count) return null;
+    const pa = kernelPtrPaddr(&pd_tables[index]) orelse return null;
+    return pa | page_present | page_rw;
+}
+
+fn ramCacheTableLinkMatches(entry: u64, table: anytype) bool {
+    const pa = kernelPtrPaddr(table) orelse return false;
+    return (entry & ~@as(u64, 1 << 5)) == (pa | page_present | page_rw);
+}
+
+/// Prove the persistent roots before inspecting their known table arrays.
+/// Metadata arrays alone do not prove that hardware uses those same parents.
+/// This proves root links; lower split tables still need their ownership and
+/// target-leaf checks before cache policy can be published.
+pub fn validateRamCacheKernelRoots() !void {
+    const root = kernelPtrPaddr(&pml4_table) orelse return error.UnknownKernelRoot;
+    if ((kernel_cr3_value & page_addr_mask) != root or
+        (kernel_cr3_value & ~(page_addr_mask | @as(u64, 4095))) != 0)
+        return error.UnknownKernelRoot;
+    for (pml4_table, 0..) |entry, index| {
+        if (index == 0) {
+            if (!ramCacheTableLinkMatches(entry, &pdp_table)) return error.UnknownKernelRoot;
+        } else if (index == high_mmio_pml4_index) {
+            if (!ramCacheTableLinkMatches(entry, &high_mmio_pdp_table)) return error.UnknownKernelRoot;
+        } else if (kernelHighMappingActive() and index == ((image_range.virtual_base >> 39) & 511)) {
+            if (!ramCacheTableLinkMatches(entry, &high_kernel_pdp_table)) return error.UnknownKernelRoot;
+        } else if ((entry & page_present) != 0) return error.UnknownKernelRoot;
+    }
+    for (pdp_table, 0..) |entry, index| {
+        if (index < pd_tables.len) {
+            if (!ramCacheTableLinkMatches(entry, &pd_tables[index])) return error.UnknownKernelRoot;
+        } else if ((entry & page_present) != 0) return error.UnknownKernelRoot;
+    }
+    for (high_mmio_pdp_table, 0..) |entry, index| {
+        if (index < high_mmio_pd_tables.len) {
+            if (!ramCacheTableLinkMatches(entry, &high_mmio_pd_tables[index])) return error.UnknownKernelRoot;
+        } else if ((entry & page_present) != 0) return error.UnknownKernelRoot;
+    }
+    if (kernelHighMappingActive()) {
+        const first: usize = @intCast((image_range.virtual_base >> 30) & 511);
+        for (high_kernel_pdp_table, 0..) |entry, index| {
+            if ((entry & page_present) == 0) continue;
+            const slot = highKernelPdSlot(first, index) orelse return error.UnknownKernelRoot;
+            if (!ramCacheTableLinkMatches(entry, &high_kernel_pd_tables[slot])) return error.UnknownKernelRoot;
+        }
+    }
+}
+
+fn ramCacheStaticIdentityPt(base: u64, pa: u64) bool {
+    const begin = kernelPtrPaddr(&runtime_identity_split_pts) orelse return false;
+    const used = runtime_identity_split_pt_used;
+    if (pa >= begin and pa - begin < used * 4096 and (pa - begin) & 4095 == 0) {
+        const index: usize = @intCast((pa - begin) / 4096);
+        // The first leaf's address survives cache-attribute changes. It
+        // binds a reused static PT to the PDE's exact identity range.
+        return (runtime_identity_split_pts[index][0] & page_addr_mask) == base;
+    }
+    if (kernelHighMappingActive()) return false;
+    for ([_]struct { base: u64, tables: []const [page_entries]u64 }{
+        .{ .base = @intFromPtr(&ring0_stack_guard_pt), .tables = &ring0_stack_guard_pt },
+        .{ .base = @intFromPtr(&pf_ist_stack_guard_pt), .tables = &pf_ist_stack_guard_pt },
+        .{ .base = @intFromPtr(&df_ist_stack_guard_pt), .tables = &df_ist_stack_guard_pt },
+    }) |guard| {
+        if (base < guard.base or base - guard.base >= guard.tables.len * two_mib or
+            (base - guard.base) & (two_mib - 1) != 0) continue;
+        const index: usize = @intCast((base - guard.base) / two_mib);
+        if ((kernelPtrPaddr(&guard.tables[index]) orelse return false) == pa) return true;
+    }
+    return false;
+}
+
+fn ramCacheOwnedIdentityPt(base: u64, pa: u64) bool {
+    return ramCacheStaticIdentityPt(base, pa) or
+        @import("../../memory/user_vm.zig").ramCacheKernelSplitOwns(base, pa);
+}
+
+test "WC identity lease RAM rejects foreign kernel roots before following tables" {
+    const saved_root = pml4_table;
+    const saved_pdp = pdp_table;
+    const saved_high = high_mmio_pdp_table;
+    const saved_image_pdp = high_kernel_pdp_table;
+    const saved_virtual = image_range.virtual_base;
+    const saved_physical = image_range.base_paddr;
+    const saved_size = image_range.size_bytes;
+    const saved_cr3 = kernel_cr3_value;
+    defer {
+        pml4_table = saved_root;
+        pdp_table = saved_pdp;
+        high_mmio_pdp_table = saved_high;
+        high_kernel_pdp_table = saved_image_pdp;
+        image_range.virtual_base = saved_virtual;
+        image_range.base_paddr = saved_physical;
+        image_range.size_bytes = saved_size;
+        kernel_cr3_value = saved_cr3;
+    }
+    image_range.virtual_base = 0;
+    image_range.base_paddr = 0;
+    image_range.size_bytes = 0;
+    @memset(&pml4_table, 0);
+    @memset(&pdp_table, 0);
+    @memset(&high_mmio_pdp_table, 0);
+    kernel_cr3_value = @intFromPtr(&pml4_table) | 7;
+    pml4_table[0] = @intFromPtr(&pdp_table) | 3;
+    pml4_table[high_mmio_pml4_index] = @intFromPtr(&high_mmio_pdp_table) | 3;
+    for (&pd_tables, 0..) |*pd, index| pdp_table[index] = @intFromPtr(pd) | 3;
+    for (&high_mmio_pd_tables, 0..) |*pd, index| high_mmio_pdp_table[index] = @intFromPtr(pd) | 3;
+    try validateRamCacheKernelRoots();
+    pml4_table[510] = 0xdead000 | 3;
+    try std.testing.expectError(error.UnknownKernelRoot, validateRamCacheKernelRoots());
+    pml4_table[510] = 0;
+    pdp_table[0] ^= 4096;
+    try std.testing.expectError(error.UnknownKernelRoot, validateRamCacheKernelRoots());
+    pdp_table[0] ^= 4096;
+    high_mmio_pdp_table[0] |= 0x10;
+    try std.testing.expectError(error.UnknownKernelRoot, validateRamCacheKernelRoots());
+    high_mmio_pdp_table[0] &= ~@as(u64, 0x10);
+    pml4_table[0] |= 1 << 5;
+    try validateRamCacheKernelRoots();
+    kernel_cr3_value ^= 4096;
+    try std.testing.expectError(error.UnknownKernelRoot, validateRamCacheKernelRoots());
+    kernel_cr3_value ^= 4096;
+    image_range.virtual_base = 0xffff_ffff_8000_0000;
+    image_range.base_paddr = 0x200000;
+    image_range.size_bytes = 0x100000;
+    @memset(&high_kernel_pdp_table, 0);
+    pml4_table[511] = @intFromPtr(&high_kernel_pdp_table) | 3;
+    high_kernel_pdp_table[510] = @intFromPtr(&high_kernel_pd_tables[0]) | 3;
+    try validateRamCacheKernelRoots();
+    high_kernel_pdp_table[510] ^= 4096;
+    try std.testing.expectError(error.UnknownKernelRoot, validateRamCacheKernelRoots());
+    high_kernel_pdp_table[510] ^= 4096;
+    high_kernel_pdp_table[509] = @intFromPtr(&high_kernel_pd_tables[0]) | 3;
+    try std.testing.expectError(error.UnknownKernelRoot, validateRamCacheKernelRoots());
 }
 
 pub fn seedUserPdWithKernelIdentity(pd: []u64) void {

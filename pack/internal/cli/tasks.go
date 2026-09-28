@@ -67,6 +67,7 @@ func buildCommand(ctx *context) *cobra.Command {
 
 func buildLiveImageCommand(ctx *context) *cobra.Command {
 	var authorizedKeys string
+	var overlaySpec, outputDir string
 	cmd := &cobra.Command{
 		Use:   "live-image",
 		Short: "Build a separate RAM-root Limine image without syncing rootfs",
@@ -85,6 +86,7 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 			}
 			bootfs, err := livebootfs.Build(ctx.workspace, livebootfs.Options{
 				AuthorizedKeysPath: authorizedKeys,
+				OverlaySpecPath:    overlaySpec, OutputDir: outputDir,
 			})
 			if err != nil {
 				return err
@@ -93,13 +95,16 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 			if !ok {
 				return fmt.Errorf("missing seed0boot app")
 			}
-			outputDir := ctx.workspace.Path(livebootfs.OutputDir)
+			imageOutputDir := ctx.workspace.Path(livebootfs.OutputDir)
+			if outputDir != "" {
+				imageOutputDir = ctx.workspace.Path(outputDir)
+			}
 			result, err := bootloaderlimine.BuildImageWithOptions(ctx.workspace, bootloaderlimine.Inputs{
 				KernelELF: kernel.Output, InitELF: ctx.workspace.ArtifactPath(initApp),
 				BootfsImage: bootfs.Image, DiagnosticELF: diagnostic.Output,
 			}, bootloaderlimine.Options{
-				ImagePath:  filepath.Join(outputDir, "limine-boot.img"),
-				ConfigPath: filepath.Join(outputDir, "limine.conf"),
+				ImagePath:  filepath.Join(imageOutputDir, "limine-boot.img"),
+				ConfigPath: filepath.Join(imageOutputDir, "limine.conf"),
 				Progress:   ui.NewProgressReporter(),
 			})
 			if err != nil {
@@ -113,12 +118,15 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&authorizedKeys, "ssh-authorized-key-file", "", "embed one local SSH public key in the live RAM root")
+	cmd.Flags().StringVar(&overlaySpec, "overlay-spec", "", "add files from an optional live bootfs overlay")
+	cmd.Flags().StringVar(&outputDir, "output-dir", "", "write a separate live image under this directory")
 	return cmd
 }
 
 func buildLiveBootfsCommand(ctx *context) *cobra.Command {
 	var noBuild bool
 	var authorizedKeys string
+	var overlaySpec, outputDir string
 	cmd := &cobra.Command{
 		Use:   "live-bootfs",
 		Short: "Build a separate RAM-only console bootfs archive",
@@ -126,6 +134,7 @@ func buildLiveBootfsCommand(ctx *context) *cobra.Command {
 			ui.Task("build:live-bootfs")
 			result, err := livebootfs.Build(ctx.workspace, livebootfs.Options{
 				NoBuild: noBuild, AuthorizedKeysPath: authorizedKeys,
+				OverlaySpecPath: overlaySpec, OutputDir: outputDir,
 			})
 			if err != nil {
 				return err
@@ -141,6 +150,8 @@ func buildLiveBootfsCommand(ctx *context) *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&noBuild, "no-build", false, "package existing userland artifacts without rebuilding")
 	cmd.Flags().StringVar(&authorizedKeys, "ssh-authorized-key-file", "", "embed one local SSH public key in the live RAM root")
+	cmd.Flags().StringVar(&overlaySpec, "overlay-spec", "", "add files from an optional live bootfs overlay")
+	cmd.Flags().StringVar(&outputDir, "output-dir", "", "write a separate live bootfs under this directory")
 	return cmd
 }
 
@@ -285,6 +296,7 @@ func qemuLimineCommand(ctx *context) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.NoKVM, "no-kvm", false, "run QEMU without KVM")
 	addIOMMUFlags(cmd, &opts.IOMMU)
 	cmd.Flags().BoolVar(&opts.NoNet, "no-net", false, "run QEMU without network")
+	cmd.Flags().BoolVar(&opts.NoStorage, "no-storage", false, "omit the installed root disk (live boot)")
 	cmd.Flags().BoolVar(&opts.Fast, "fast", true, "reduce QEMU-side diagnostics")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the QEMU command without launching")
 	cmd.Flags().StringVar(&opts.Memory, "memory", "4G", "QEMU memory size")

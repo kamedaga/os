@@ -57,7 +57,7 @@ int filed_tmpfs_backend_pread(
         if (chunk > FILED_TMPFS_PAGE_BYTES - page_offset) {
             chunk = FILED_TMPFS_PAGE_BYTES - page_offset;
         }
-        const uint16_t page_id = filed_tmpfs_inode_page_id(backend, inode, page_index);
+        const uint32_t page_id = filed_tmpfs_inode_page_id(backend, inode, page_index);
         filed_tmpfs_page_t *page = filed_tmpfs_page_by_id(backend, page_id);
         if (page != NULL) {
             memcpy((uint8_t *)buffer + total, page->data + page_offset, (size_t)chunk);
@@ -84,7 +84,7 @@ int filed_tmpfs_backend_copy_present(
     if (inode == NULL) { status = -2; goto done; }
     if (!filed_tmpfs_inode_is_data_file(inode)) { status = -22; goto done; }
     if (length > inode->size) { status = -22; goto done; }
-    uint16_t id = inode->first_allocated_page;
+    uint32_t id = inode->first_allocated_page;
     for (uint32_t i = 0; i < inode->allocated_page_count; ++i) {
         filed_tmpfs_page_t *page = filed_tmpfs_page_by_id(backend, id);
         if (page == NULL || page->data == NULL) { status = -5; goto done; }
@@ -144,7 +144,7 @@ int filed_tmpfs_backend_pwrite(
             filed_tmpfs_lock_release(&backend->lock);
             return -27;
         }
-        uint16_t page_id = filed_tmpfs_inode_page_id(backend, inode, page_index);
+        uint32_t page_id = filed_tmpfs_inode_page_id(backend, inode, page_index);
         if (page_id == 0) {
             /* Shared-VMO writeback includes untouched zero-filled ranges.
              * A hole already reads as zero; materializing it duplicates the

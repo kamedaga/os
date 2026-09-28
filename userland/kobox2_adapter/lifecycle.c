@@ -23,6 +23,17 @@ static int pending(void *context) {
     return atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_READY ? 2 : 0;
 }
 
+static int abort_monitor(void *context, int error) {
+    struct ph_lifecycle *lifecycle = context;
+    int expected = 0;
+
+    if (!lifecycle->monitored || error >= 0)
+        return -EINVAL;
+    return atomic_compare_exchange_strong_explicit(&lifecycle->monitor_abort,
+        &expected, error, memory_order_release, memory_order_relaxed) ?
+        0 : -EALREADY;
+}
+
 static void return_to_receiver(struct ph_lifecycle *lifecycle, int result) {
     lifecycle->work_result = result;
     atomic_store_explicit(&lifecycle->work, WORK_DONE, memory_order_release);
@@ -140,6 +151,10 @@ static void *receive(void *context) {
     int result;
     struct ph_ipc_packet packet = {0};
     for (;;) {
+        if (lifecycle->monitored &&
+            (result = atomic_load_explicit(&lifecycle->monitor_abort,
+                memory_order_acquire)))
+            break;
         result = ph_ipc_receive(lifecycle->ipc, lifecycle->generation, &packet);
         if (!result) {
             if (packet.operation == PH_LIFECYCLE_QUIESCE) break;
@@ -166,7 +181,26 @@ static void *receive(void *context) {
             events[count++] = (struct pacha_pollfd){
                 .fd = lifecycle->service.wake_fd,
                 .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
-        (void)ph_wait_readable(events, count);
+        if (lifecycle->monitored) {
+            /* The Linux opening task can abort for temperature or elapsed
+             * time while this native receiver has no incoming IPC. Polling
+             * only this inspection profile bounds its join to one second.
+             */
+            long waited = pacha_syscall4(PACHA_FD_SYSCALL_WAIT_MANY,
+                (uintptr_t)events, count, 1000, 0);
+            size_t ready = 0;
+            for (size_t i = 0; i < count; ++i)
+                ready += events[i].revents != 0;
+            if (waited == 0 ||
+                (waited == PACHA_SYSCALL_ERR_NOT_READY && !ready))
+                continue;
+            if (waited < 0 || (size_t)waited != ready) {
+                result = -EIO;
+                break;
+            }
+        } else {
+            (void)ph_wait_readable(events, count);
+        }
     }
     if (!result) {
         if (packet.operation != PH_LIFECYCLE_QUIESCE)
@@ -186,15 +220,17 @@ static void *receive(void *context) {
     return NULL;
 }
 
-int ph_lifecycle_start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
-    const struct ph_lifecycle_service *service) {
+static int start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
+    const struct ph_lifecycle_service *service, bool monitored) {
     if (!lifecycle || lifecycle->generation || !ipc || !ipc->generation || !ipc->admitted)
         return -EINVAL;
     if (service && (!service->context || !service->prepare || !service->dispatch ||
         !service->complete || !service->release)) return -EINVAL;
     *lifecycle = (struct ph_lifecycle){.ipc = ipc, .generation = ipc->generation,
         .port = {.size = sizeof(lifecycle->port), .context = lifecycle, .ready = ready,
-            .pending = pending, .dispatch = service ? dispatch : NULL}};
+            .pending = pending, .dispatch = service ? dispatch : NULL,
+            .abort = monitored ? abort_monitor : NULL},
+        .monitored = monitored};
     if (service) lifecycle->service = *service;
     if (service && service->next) {
         lifecycle->port.poll = poll_work;
@@ -202,9 +238,11 @@ int ph_lifecycle_start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ip
     }
     atomic_init(&lifecycle->start, 0);
     atomic_init(&lifecycle->terminal, 0);
+    atomic_init(&lifecycle->monitor_abort, 0);
     atomic_init(&lifecycle->work, WORK_IDLE);
     if (!atomic_is_lock_free(&lifecycle->terminal) || !atomic_is_lock_free(&lifecycle->start) ||
-        !atomic_is_lock_free(&lifecycle->work)) {
+        !atomic_is_lock_free(&lifecycle->work) ||
+        !atomic_is_lock_free(&lifecycle->monitor_abort)) {
         *lifecycle = (struct ph_lifecycle){0};
         return -EOPNOTSUPP;
     }
@@ -212,8 +250,23 @@ int ph_lifecycle_start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ip
     return 0;
 }
 
+int ph_lifecycle_start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
+    const struct ph_lifecycle_service *service) {
+    return start_service(lifecycle, ipc, service, false);
+}
+
 int ph_lifecycle_start(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc) {
     return ph_lifecycle_start_service(lifecycle, ipc, NULL);
+}
+
+int ph_lifecycle_start_inspected(struct ph_lifecycle *lifecycle,
+    struct ph_ipc *ipc) {
+    return start_service(lifecycle, ipc, NULL, true);
+}
+
+int ph_lifecycle_start_monitored_service(struct ph_lifecycle *lifecycle,
+    struct ph_ipc *ipc, const struct ph_lifecycle_service *service) {
+    return start_service(lifecycle, ipc, service, true);
 }
 
 void ph_lifecycle_finish(struct ph_lifecycle *lifecycle) {

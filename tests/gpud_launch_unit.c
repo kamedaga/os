@@ -16,7 +16,8 @@ static unsigned char *scratch;
 static size_t scratch_size;
 static long fault_value;
 static size_t segment_head;
-static uint64_t source_kind;
+static uint64_t source_kind, log_source_kind;
+static unsigned int expect_log_grant;
 
 long pacha_syscall4(uint64_t nr, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
     (void)nr; (void)a; (void)b; (void)c; (void)d;
@@ -95,9 +96,13 @@ long pacha_syscall1(uint64_t nr, uint64_t fd) {
 long pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b) {
     if (injected()) return fault_value;
     if (nr == PACHA_FD_SYSCALL_GET_INFO) {
-        assert(a == 120);
-        *(struct pacha_fd_info *)(uintptr_t)b = (struct pacha_fd_info){.kind = source_kind,
-            .rights = PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_TRANSFER};
+        assert(a == 120 || a == 121);
+        *(struct pacha_fd_info *)(uintptr_t)b = a == 120 ?
+            (struct pacha_fd_info){.kind = source_kind,
+                .rights = PH_IPC_CHANNEL_RIGHTS | PACHA_FD_RIGHT_TRANSFER} :
+            (struct pacha_fd_info){.kind = log_source_kind,
+                .rights = PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE |
+                    PACHA_FD_RIGHT_TRANSFER};
         return 0;
     }
     if (nr == PACHA_VM_SYSCALL_MUNMAP) {
@@ -133,10 +138,15 @@ long pacha_syscall3(uint64_t nr, uint64_t size, uint64_t rights, uint64_t flags)
 long pacha_syscall5(uint64_t nr, uint64_t flags, uint64_t rights, uint64_t fd_flags,
     uint64_t grants, uint64_t count) {
     if (injected()) return fault_value;
-    assert(nr == PACHA_PROCESS_SYSCALL_CREATE && !flags && !fd_flags && count == 1);
+    assert(nr == PACHA_PROCESS_SYSCALL_CREATE && !flags && !fd_flags &&
+        count == (expect_log_grant ? 2u : 1u));
     assert(rights & PACHA_FD_RIGHT_SET_CONTEXT);
     const struct pacha_process_fd_grant *grant = (const void *)(uintptr_t)grants;
     assert(grant->source_fd == 120 && grant->target_fd == 16 && grant->rights == PH_IPC_CHANNEL_RIGHTS);
+    if (expect_log_grant) {
+        assert(grant[1].source_fd == 121 && grant[1].target_fd == 17);
+        assert(grant[1].rights == (PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE));
+    }
     assert(!process_owned);
     process_live = process_owned = 1;
     return 17;
@@ -184,6 +194,8 @@ static void reset_native(void) {
     calls = fail_at = started = mapped = process_live = 0;
     fault_value = PACHA_SYSCALL_ERR_ALLOC;
     source_kind = PACHA_FD_KIND_CHANNEL;
+    log_source_kind = PACHA_FD_KIND_ENDPOINT;
+    expect_log_grant = 0;
 }
 
 static void test_prepare_failures(void) {
@@ -308,7 +320,7 @@ static void controller_free(void *context, void *pointer, size_t size) {
 
 static void test_controller_binding(void) {
     unsigned int begin_calls = 0;
-    for (unsigned int mode = 0; mode < 5; ++mode) {
+    for (unsigned int mode = 0; mode < 6; ++mode) {
         fixture_image(); reset_native();
         kb2_controller_t *controller = gpud_test_controller_create(controller_allocate, controller_free, NULL);
         assert(kb2_controller_start(controller) == KB2_STATUS_OK);
@@ -340,6 +352,26 @@ static void test_controller_binding(void) {
         assert(gpud_launch_begin(&transaction, controller, &launch, &ipc, &resources) ==
             KB2_STATUS_RESOURCE_DENIED && !transaction.controller && !process_owned);
         reset_native();
+        struct pacha_process_fd_grant log_grants[2];
+        if (mode == 5) {
+            log_grants[0] = *input.grants;
+            log_grants[1] = (struct pacha_process_fd_grant){
+                .source_fd = 121, .target_fd = 17,
+                .rights = PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE,
+                .flags = PACHA_FD_FLAG_CLOEXEC};
+            input.grants = log_grants;
+            input.grant_count = 2;
+            log_grants[1].target_fd = 18;
+            assert(gpud_launch_begin(&transaction, controller, &launch,
+                &ipc, &resources) == KB2_STATUS_RESOURCE_DENIED && !process_owned);
+            log_grants[1].target_fd = 17;
+            reset_native();
+            log_source_kind = PACHA_FD_KIND_VMO;
+            assert(gpud_launch_begin(&transaction, controller, &launch,
+                &ipc, &resources) == KB2_STATUS_RESOURCE_DENIED && !process_owned);
+            reset_native();
+            expect_log_grant = 1;
+        }
         if (mode == 1) input.image_size = 1;
         if (mode == 2 || mode == 4) fail_at = begin_calls;
         assert(gpud_launch_begin(&transaction, controller, &launch, &ipc, &resources) == KB2_STATUS_OK);
@@ -361,11 +393,12 @@ static void test_controller_binding(void) {
             assert(kb2_action_type(kb2_controller_pending_action(controller)) == KB2_ACTION_LAUNCH_SANDBOX);
             fail_at = 0;
         }
-        assert(gpud_launch_step(&transaction) == (mode ? KB2_STATUS_HOST_FAILURE : KB2_STATUS_OK));
+        assert(gpud_launch_step(&transaction) ==
+            (mode == 0 || mode == 5 ? KB2_STATUS_OK : KB2_STATUS_HOST_FAILURE));
         assert(transaction.completed);
         before = calls;
         assert(gpud_launch_step(&transaction) == KB2_STATUS_INVALID_STATE && calls == before);
-        if (!mode) {
+        if (mode == 0 || mode == 5) {
             assert(kb2_controller_state(controller) == KB2_STATE_STARTING && ipc.admitted);
             assert(kb2_action_type(kb2_controller_pending_action(controller)) == KB2_ACTION_TRANSFER_RESOURCES);
             struct gpud_process_watch watch = {0};

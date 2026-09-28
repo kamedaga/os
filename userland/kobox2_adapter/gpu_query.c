@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: MIT */
 #include "gpu_query.h"
 #include "gpu_queue_message.h"
+#include "boot.h"
 #include "host.h"
+#include "device_pci.h"
 #include "../gpud/gpu_channel.h"
 
 #include <errno.h>
@@ -91,7 +93,7 @@ static int prepare(void *context, const struct ph_ipc_packet *packet) {
     if (query->mapping || packet->operation != PH_GPU_QUERY_OPERATION ||
         packet->generation != query->generation || !packet->correlation ||
         packet->correlation <= query->correlation || packet->fd_count != 1 ||
-        packet->value < KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE || packet->value > PH_GPU_QUERY_PAGE)
+        packet->value < KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE || packet->value > PH_GPU_QUERY_REQUEST_BYTES)
         return -EPROTO;
     const struct pacha_ipc_fd *fd = &packet->fds[0];
     struct pacha_fd_info info = {0};
@@ -135,8 +137,8 @@ int ph_gpu_query_prepare_snapshot(struct ph_gpu_query *query, size_t size,
     const kb2_gpu_region_t region = {.region_id = PH_GPU_QUERY_OUTPUT_REGION,
         .rights = KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,
         .length = GPUD_GPU_AUX_CAPACITY};
-    int result = kobox_drm_query_prepare(&query->plan, query->generation,
-        query->session_id, queue_class,
+    int result = kobox_drm_query_prepare_profile(&query->plan, query->generation,
+        query->session_id, query->profile_kind, queue_class,
         query->request + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
         envelope.payload_length, &region);
     if (result) return result;
@@ -159,7 +161,9 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         query->plan.command_id == KB2_GPU_DRM_MODE_COMMAND_MAP_DUMB;
     const int map = mode_map ||
         (query->plan.command_set_id == KB2_GPU_DRM_VIRTGPU_SET_ID &&
-         query->plan.command_id == KB2_GPU_DRM_VIRTGPU_COMMAND_MAP);
+         query->plan.command_id == KB2_GPU_DRM_VIRTGPU_COMMAND_MAP) ||
+        (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID &&
+         query->plan.command_id == KB2_GPU_DRM_AMDGPU_COMMAND_GEM_MMAP);
     const int prime_export =
         query->plan.command_set_id == KB2_GPU_DRM_CORE_SET_ID &&
         query->plan.command_id ==
@@ -169,7 +173,16 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
             .bo_handle = map ? query->plan.mapping_handle : query->plan.prime_handle,
         };
         size_t page_count = 1;
-        if (!query->api.virtgpu_resource_info(file, &resource)) {
+        if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID) {
+            uint64_t length = 0;
+            int found = query->api.gem_size(file, resource.bo_handle, &length);
+            if (found || !length || length % PH_PAGE_SIZE) {
+                ph_boot_log_gpu_map_failure(1,
+                    found ? found : -EPROTO, resource.bo_handle, length);
+                return found ? found : -EPROTO;
+            }
+            page_count = length / PH_PAGE_SIZE;
+        } else if (!query->api.virtgpu_resource_info(file, &resource)) {
             if (!resource.size || resource.size % PH_PAGE_SIZE)
                 return -EPROTO;
             page_count = resource.size / PH_PAGE_SIZE;
@@ -179,8 +192,12 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
             page_count = capacity;
         size_t bytes = page_count * sizeof(uint64_t);
         int error = allocate_aux(query, bytes);
-        if (error)
+        if (error) {
+            if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID)
+                ph_boot_log_gpu_map_failure(2, error,
+                    resource.bo_handle, bytes);
             return error;
+        }
         query->plan.mapping_page_capacity = page_count;
         query->plan.aux_size = bytes;
     }
@@ -191,11 +208,21 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         query->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
         sizeof(query->reply) - KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, &size,
         &query->result);
-    if (result) return result;
+    if (result) {
+        if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID && map)
+            ph_boot_log_gpu_map_failure(3, result,
+                query->plan.mapping_handle, query->plan.aux_size);
+        return result;
+    }
     if (query->result.mapping_id &&
         query->result.attachment_class == KB2_GPU_ATTACHMENT_MEMORY) {
         kb2_gpu_virtgpu_map_completion_t completion;
-        kb2_protocol_status_t decoded = mode_map ?
+        kb2_protocol_status_t decoded =
+            query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID ?
+            kb2_gpu_amdgpu_map_completion_decode(
+                query->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, size,
+                query->session_id, query->generation, &completion) :
+            mode_map ?
             kb2_gpu_mode_map_completion_decode(
                 query->reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, size,
                 query->session_id, query->generation, &completion) :
@@ -205,8 +232,13 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         if (decoded ||
             completion.mapping_id != query->result.mapping_id ||
             completion.length != query->result.mapping_length ||
-            completion.rights != query->result.mapping_rights)
+            completion.rights != query->result.mapping_rights) {
+            if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID)
+                ph_boot_log_gpu_map_failure(4, -EPROTO,
+                    query->plan.mapping_handle,
+                    query->result.mapping_length);
             return -EPROTO;
+        }
     } else if (query->result.mapping_id &&
                query->result.attachment_class == KB2_GPU_ATTACHMENT_DMA_BUF) {
         kb2_gpu_attachment_completion_t completion;
@@ -260,10 +292,7 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
         query->result.mapping_length !=
             query->result.mapping_page_count * PH_PAGE_SIZE)
         return -EPROTO;
-    const uint64_t *pages = query->aux;
-    for (uint64_t index = 0; index < query->result.mapping_page_count; ++index)
-        if (pages[index] >= PH_RAM_SIZE / PH_PAGE_SIZE)
-            return -EPROTO;
+    uint64_t *pages = query->aux;
     uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_DUP |
         PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_CLOSE |
         PACHA_FD_RIGHT_REVOKE;
@@ -271,11 +300,40 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
         rights |= PACHA_FD_RIGHT_MAP_READ;
     if (query->result.mapping_rights & KB2_GPU_SPAN_RIGHT_WRITE)
         rights |= PACHA_FD_RIGHT_MAP_WRITE;
-    long native_fd = pacha_syscall5(
-        PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
-        (uint64_t)(uint32_t)ph_core.ram_fd, (uintptr_t)pages,
-        query->result.mapping_page_count, rights, PACHA_FD_FLAG_CLOEXEC);
+    long native_fd;
+    if (query->result.mapping_backing_kind == KOBOX_DRM_BACKING_DEVICE) {
+        unsigned int protection = 0;
+        if (rights & PACHA_FD_RIGHT_MAP_READ) protection |= KOBOX_LINUX_MEMORY_READ;
+        if (rights & PACHA_FD_RIGHT_MAP_WRITE) protection |= KOBOX_LINUX_MEMORY_WRITE;
+        const uint32_t cache = query->result.mapping_cache_policy;
+        if (cache != KOBOX_DRM_CACHE_WC && cache != KOBOX_DRM_CACHE_UC)
+            return -EPROTO;
+        native_fd = ph_pci_export_pages(query->pci, pages,
+            query->result.mapping_page_count, protection,
+            cache == KOBOX_DRM_CACHE_WC ? KOBOX_MMIO_WC : KOBOX_MMIO_UC);
+    } else if (query->result.mapping_backing_kind == KOBOX_DRM_BACKING_RAM) {
+        const uint32_t cache = query->result.mapping_cache_policy;
+        if (cache != KOBOX_DRM_CACHE_WB && cache != KOBOX_DRM_CACHE_WC)
+            return -EPROTO;
+        /* Native PAGE_VIEW maps the parent's actual physical cache policy;
+         * it must not create an independent WB alias of TTM's WC pages. */
+        for (uint64_t index = 0; index < query->result.mapping_page_count; ++index)
+            if (pages[index] >= PH_RAM_SIZE / PH_PAGE_SIZE) return -EPROTO;
+        native_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
+            (uint64_t)(uint32_t)ph_core.ram_fd, (uintptr_t)pages,
+            query->result.mapping_page_count, rights, PACHA_FD_FLAG_CLOEXEC);
+        if (native_fd < 16)
+            ph_boot_log_gpu_page_view_failure(native_fd,
+                (uint32_t)ph_core.ram_fd, rights, cache,
+                query->result.mapping_page_count, pages[0],
+                pages[query->result.mapping_page_count / 2],
+                pages[query->result.mapping_page_count - 1]);
+    } else {
+        return -EPROTO;
+    }
     if (native_fd < 16) {
+        ph_boot_log_gpu_map_failure(5, (int)native_fd,
+            query->plan.mapping_handle, query->result.mapping_length);
         switch (native_fd) {
         case PACHA_SYSCALL_ERR_NOT_READY:
         case PACHA_SYSCALL_ERR_EMPTY:
@@ -324,16 +382,36 @@ static int complete(void *context, struct ph_ipc *ipc) {
     return result ? result : query->terminal_after_completion;
 }
 
-int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation, uint64_t session_id,
+int ph_gpu_query_init_profile(struct ph_gpu_query *query, uint64_t generation,
+    uint64_t session_id, uint32_t profile_kind,
     struct ph_lifecycle_service *service) {
-    if (!query || query->generation || !generation || !service) return -EINVAL;
-    struct kobox_drm_query_api api;
+    if (!query || query->generation || !generation || !service ||
+        (profile_kind != KB2_GPU_PROFILE_VIRGL &&
+         profile_kind != KB2_GPU_PROFILE_AMDGPU)) return -EINVAL;
+    struct kobox_drm_query_api api = {0};
     void *symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_version");
     if (!symbol) return -ENOENT;
     memcpy(&api.version, &symbol, sizeof(api.version));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_get_cap");
     if (!symbol) return -ENOENT;
     memcpy(&api.get_cap, &symbol, sizeof(api.get_cap));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_amdgpu_info");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.amdgpu_info, &symbol,
+        sizeof(api.amdgpu_info));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_amdgpu_simple");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.amdgpu_simple, &symbol, sizeof(api.amdgpu_simple));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_gem_size");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.gem_size, &symbol, sizeof(api.gem_size));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_amdgpu_mmap_validate");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.amdgpu_mmap_validate, &symbol,
+        sizeof(api.amdgpu_mmap_validate));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_amdgpu_cs");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.amdgpu_cs, &symbol, sizeof(api.amdgpu_cs));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_set_client_cap");
     if (!symbol) return -ENOENT;
     memcpy(&api.set_client_cap, &symbol, sizeof(api.set_client_cap));
@@ -412,6 +490,7 @@ int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation, uint64_t 
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_syncobj_array");
     if (!symbol) return -ENOENT;
     memcpy(&api.syncobj_array, &symbol, sizeof(api.syncobj_array));
+    if (profile_kind == KB2_GPU_PROFILE_VIRGL) {
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_virtgpu_getparam");
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_getparam, &symbol, sizeof(api.virtgpu_getparam));
@@ -436,15 +515,23 @@ int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation, uint64_t 
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_virtgpu_wait");
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_wait, &symbol, sizeof(api.virtgpu_wait));
+    }
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_service_map");
     if (!symbol) return -ENOENT;
     memcpy(&api.virtgpu_map, &symbol, sizeof(api.virtgpu_map));
     memset(query, 0, sizeof(*query));
     query->generation = generation;
     query->session_id = session_id;
+    query->profile_kind = profile_kind;
     query->api = api;
     *service = (struct ph_lifecycle_service){.context = query,
         .prepare = prepare, .dispatch = dispatch, .complete = complete, .release = release,
         .stop = stop};
     return 0;
+}
+
+int ph_gpu_query_init(struct ph_gpu_query *query, uint64_t generation,
+    uint64_t session_id, struct ph_lifecycle_service *service) {
+    return ph_gpu_query_init_profile(query, generation, session_id,
+        KB2_GPU_PROFILE_VIRGL, service);
 }

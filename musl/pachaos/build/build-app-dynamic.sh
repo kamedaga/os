@@ -24,7 +24,12 @@ sysroot="$out_dir/sysroot/$build_id"
 
 if [ ! -f "$runtime_lib/libc.so" ] ||
    [ ! -f "$runtime_lib/Scrt1.o" ] ||
-   [ ! -f "$runtime_lib/crt1.o" ]; then
+   [ ! -f "$runtime_lib/crt1.o" ] ||
+   [ "$upstream/arch/pachaos/syscall_arch.h" -nt "$runtime_lib/libc.so" ] ||
+   [ "$repo_root/musl/pachaos/include/pachaos/abi.h" -nt "$runtime_lib/libc.so" ]; then
+  # The dynamic loader contains the native syscall translation itself. A
+  # freshly linked service cannot compensate for a stale loader after an ABI
+  # renumbering, even when its own source and link step are current.
   bash "$repo_root/musl/pachaos/build/build-runtime.sh"
 fi
 

@@ -36,6 +36,9 @@ struct ph_irq {
     unsigned int admitted;
     unsigned int stopping;
     uint64_t wait_epoch;
+    uint64_t received_events;
+    uint64_t dispatched_events;
+    uint64_t acknowledged_events;
 };
 
 /* Initialize a zeroed port on a registered ph_task after core image/TLS setup,
@@ -53,6 +56,9 @@ struct ph_irq {
  * caller. Destroy joins the real collector before reclaiming its storage. */
 int ph_irq_init(struct ph_irq *irq, const struct ph_irq_config *config);
 int ph_irq_revoke(struct ph_irq *irq, uint64_t generation);
+/* Snapshot under the port lock. The caller logs only after it is released. */
+int ph_irq_snapshot(struct ph_irq *irq, uint64_t *received,
+    uint64_t *dispatched, uint64_t *acknowledged);
 int ph_irq_destroy(struct ph_irq *irq);
 
 #endif

@@ -254,7 +254,7 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *rpc, unsigned int queue,
     size_t capacity = control ? GPUD_GPU_CONTROL_REPLY_CAPACITY :
         display ? GPUD_GPU_DISPLAY_REPLY_CAPACITY : GPUD_GPU_CHANNEL_PAGE;
     if (!request_size || request_size >
-        (control || display ? 2048u : GPUD_GPU_CHANNEL_PAGE) ||
+        (control || display ? 2048u : GPUD_GPU_OUTPUT_OFFSET - GPUD_GPU_REQUEST_OFFSET) ||
         reply_capacity < capacity)
         return -EMSGSIZE;
     uint64_t deadline;

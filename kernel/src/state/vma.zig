@@ -376,6 +376,10 @@ pub fn cloneVmaTableForFork(self: anytype, from: PrincipalId, to: PrincipalId) K
     const source_table = self.getVmaTable(from) orelse return KernelError.InvalidState;
     const dest_table = self.getVmaTable(to) orelse return KernelError.InvalidState;
     if (dest_table.active_count != 0) return KernelError.InvalidState;
+    for (source_table.active_indices[0..source_table.active_count]) |entry_index| {
+        const entry = source_table.entries[entry_index];
+        try validateRamAdmission(self, entry.vmo, entry.vmo_offset, entry.size_bytes, entry.prot, entry.flags);
+    }
     errdefer {
         while (dest_table.active_count != 0) {
             const vma_index: usize = @intCast(dest_table.active_indices[dest_table.active_count - 1]);
@@ -522,6 +526,7 @@ pub fn nativeVmaFaultMapping(
     return .{
         .paddr = paddr,
         .prot = if (dirty_paddr != null) self.dirtyCowMappingProt(entry) else @TypeOf(self.*).nativeFaultMappingProt(entry),
+        .device_pat_slot = self.nativeVmoDevicePatSlot(entry.vmo),
     };
 }
 
@@ -533,6 +538,9 @@ pub fn nativeVmaDmaPinMode(
 ) ?NativeVmaDmaPinMode {
     if (!@TypeOf(self.*).isPageAligned(page_va)) return null;
     const entry = self.vmaEntryForVaConst(owner, page_va) orelse return null;
+    const backing = self.nativeVmoSlotConst(entry.vmo) orelse return null;
+    // Peer BAR memory is not ordinary RAM eligible for DMA page pinning.
+    if (backing.kind == .device_memory) return null;
     if (!entry.prot.read or (device_writes and !entry.prot.write)) return null;
     if (!entry.prot.write) return .read_only;
     if (entry.flags.private and
@@ -576,6 +584,7 @@ pub fn nativeVmaInitialMapping(
     return .{
         .paddr = paddr,
         .prot = if (dirty_paddr != null) self.dirtyCowMappingProt(entry) else @TypeOf(self.*).nativeFaultMappingProt(entry),
+        .device_pat_slot = self.nativeVmoDevicePatSlot(entry.vmo),
     };
 }
 
@@ -606,6 +615,7 @@ pub fn prepareNativeVmaFaultMapping(
                 .mapping = .{
                     .paddr = paddr,
                     .prot = @TypeOf(self.*).nativeFaultMappingProt(entry),
+                    .device_pat_slot = self.nativeVmoDevicePatSlot(entry.vmo),
                 },
             };
         }
@@ -978,6 +988,7 @@ pub fn setVmaProtRange(self: anytype, owner: PrincipalId, start_va: u64, size_by
         const entry_end = entry.endVa();
         if (start_va < entry.start_va or end_va > entry_end) continue;
         if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, entry.max_prot)) return KernelError.InvalidState;
+        try validateRamAdmission(self, entry.vmo, entry.vmo_offset + (start_va - entry.start_va), size_bytes, prot, entry.flags);
 
         // An unchanged subrange needs neither VMA slots nor extra backing refs.
         if (@as(u8, @bitCast(entry.prot)) == @as(u8, @bitCast(prot))) return;
@@ -1301,7 +1312,7 @@ pub fn userRangeIsUnbackedMmioReservation(
             entry.prot.read or entry.prot.write or entry.prot.exec or entry.prot.pkey != 0)
             return false;
         const vmo = self.nativeVmoSlotConst(entry.vmo) orelse return false;
-        if (vmo.kind != .anonymous or !vmo.parent.isNull()) return false;
+        if (vmo.kind != .anonymous or !vmo.backing.parent.ref.isNull()) return false;
         const part_end = @min(end_va, entry.endVa());
         const offset = std.math.add(u64, entry.vmo_offset, cursor - entry.start_va) catch return false;
         const length = part_end - cursor;
@@ -1622,6 +1633,68 @@ pub fn createAnonymousVmaWithPages(
     return vmo_ref;
 }
 
+// VMA metadata must not promise a future private/executable cached-RAM alias
+// just because its PTE is absent. Caller holds the writer-excluding VM lock.
+fn validateRamAdmission(self: anytype, ref: NativeVmoRef, offset: u64, bytes: u64, prot: VmaProt, flags: MmapFlags) KernelError!void {
+    const copy = @import("../user_copy.zig");
+    if (!copy.hasRamCachePolicyLocked()) return;
+    const slot = self.nativeVmoSlotConst(ref) orelse return KernelError.InvalidState;
+    // BAR authority and cache proof remain in device-memory admission.
+    if (slot.kind == .device_memory) return;
+    const shadow = slot.kind == .anonymous and !slot.backing.parent.ref.isNull();
+    const end = try @TypeOf(self.*).checkedEnd(offset, bytes);
+    var position = offset;
+    while (position < end) : (position += native_page_size) {
+        const pa = self.nativeVmoResolvedPagePaddrOrZero(ref, @intCast(position / native_page_size)) orelse return KernelError.InvalidState;
+        if (pa == 0) continue;
+        switch (copy.ramCachePolicyForLockedPage(pa)) {
+            .ordinary => {},
+            .blocked => return KernelError.InvalidState,
+            .cached => if (prot.exec or !flags.shared or flags.private or flags.fork_cow or shadow)
+                return KernelError.InvalidState,
+        }
+    }
+}
+
+test "MMIO overlay RAM VMA admission checks only resolved target PFNs including pending-only policy" {
+    const copy = @import("../user_copy.zig");
+    const policy = @import("../memory/ram_cache_policy.zig");
+    const Fixture = struct {
+        shadow: bool = false,
+        const Slot = struct {
+            kind: enum { anonymous, device_memory } = .anonymous,
+            backing: struct { parent: struct { ref: NativeVmoRef } },
+        };
+        pub fn nativeVmoSlotConst(self: @This(), _: NativeVmoRef) ?Slot {
+            return .{ .backing = .{ .parent = .{ .ref = if (self.shadow) .{ .index = 1, .generation = 1 } else .{} } } };
+        }
+        pub fn nativeVmoResolvedPagePaddrOrZero(_: @This(), _: NativeVmoRef, page: usize) ?u64 {
+            return switch (page) {
+                0 => 0x1000,
+                1 => 0x2000,
+                2 => 0,
+                else => null,
+            };
+        }
+        pub const checkedEnd = @import("vma.zig").checkedEnd;
+    };
+    var f = Fixture{};
+    const ref: NativeVmoRef = .{ .index = 0, .generation = 1 };
+    const spans = [_]policy.Span{.{ .base = 0x2000, .bytes = 4096, .owner = 1, .mode = .wc, .pat_slot = 4 }};
+    const active: policy.Snapshot = .{ .policy = &spans };
+    const pending: policy.Snapshot = .{ .pending = &spans };
+    defer copy.publishRamCacheSnapshot(null);
+    copy.publishRamCacheSnapshot(&pending);
+    try std.testing.expectError(KernelError.InvalidState, validateRamAdmission(&f, ref, 4096, 4096, .{ .read = true }, .{ .shared = true }));
+    copy.publishRamCacheSnapshot(&active);
+    try validateRamAdmission(&f, ref, 0, 4096, .{ .exec = true }, .{ .private = true });
+    try validateRamAdmission(&f, ref, 0, 3 * 4096, .{ .read = true }, .{ .shared = true });
+    try std.testing.expectError(KernelError.InvalidState, validateRamAdmission(&f, ref, 0, 8192, .{ .exec = true }, .{ .shared = true }));
+    try std.testing.expectError(KernelError.InvalidState, validateRamAdmission(&f, ref, 4096, 4096, .{ .read = true }, .{ .private = true }));
+    f.shadow = true;
+    try std.testing.expectError(KernelError.InvalidState, validateRamAdmission(&f, ref, 4096, 4096, .{ .read = true }, .{ .shared = true }));
+}
+
 pub fn createVmaWithRetainedVmo(
     self: anytype,
     owner: PrincipalId,
@@ -1638,11 +1711,15 @@ pub fn createVmaWithRetainedVmo(
     const vmo = self.nativeVmoSlotConst(vmo_ref) orelse return KernelError.InvalidState;
     const vmo_end = try @TypeOf(self.*).checkedEnd(vmo_offset, size_bytes);
     if (vmo_end > vmo.size_bytes) return KernelError.InvalidState;
+    if (vmo.kind == .device_memory and (vmo.backing.device.state != .active or
+        !flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
     if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
         return KernelError.InvalidState;
 
+    try validateRamAdmission(self, vmo_ref, vmo_offset, size_bytes, prot, flags);
     const vma_table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
     if (try @TypeOf(self.*).vmaRangeOverlaps(vma_table, start_va, size_bytes)) return KernelError.InvalidState;
     const vma_index = @TypeOf(self.*).findFreeVma(vma_table) orelse return KernelError.TableFull;
@@ -2041,11 +2118,15 @@ pub fn prepareFixedFdMmapIntoProcess(
     if (vmo_end > vmo.size_bytes or !@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) {
         return KernelError.InvalidState;
     }
+    if (vmo.kind == .device_memory and (vmo.backing.device.state != .active or
+        !flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
         return KernelError.InvalidState;
     // Ordinary shared VMOs still promise full backing. Only explicit
     // zero-on-demand objects may defer allocation until after replacement.
+    try validateRamAdmission(self, vmo_ref, vmo_offset, size_bytes, prot, flags);
     if (!flags.private and !self.nativeVmoIsZeroOnDemand(vmo_ref)) {
         if (!@TypeOf(self.*).isPageAligned(size_bytes)) return KernelError.InvalidState;
         var offset = vmo_offset;
@@ -2256,6 +2337,7 @@ pub fn prepareMremapWithFreeList(
     const source_snapshot = source.*;
     const source_delta = old_start - source_snapshot.start_va;
     const source_vmo_offset = source_snapshot.vmo_offset + source_delta;
+    try validateRamAdmission(self, source_snapshot.vmo, source_vmo_offset, @min(old_size, new_size), source_snapshot.prot, source_snapshot.flags);
     const table = self.getVmaTable(owner) orelse return KernelError.InvalidState;
     if (new_size > old_size and source_snapshot.flags.shared) return KernelError.InvalidState;
 

@@ -138,8 +138,20 @@ int main(void) {
     assert(dma.host.coherent == 1 && dma.host.context == &dma);
     assert(dma.host.ram_size == config.ram_length && dma.host.map_page_list);
     const struct kobox_linux_dma_host *host = &dma.host;
+    size_t direct = 0, scattered = 0;
+    uint64_t sample_iova = 0;
+    atomic_store_explicit(&dma.lock, 1, memory_order_relaxed);
+    assert(ph_dma_cache_overlap(&dma, 0, 4096,
+        &direct, &scattered, &sample_iova) == -EBUSY);
+    atomic_store_explicit(&dma.lock, 0, memory_order_relaxed);
     for (unsigned int protection = 1; protection <= 3; ++protection) {
         assert(!host->map(&dma, IOVA, 4096, 8192, protection));
+        assert(!ph_dma_cache_overlap(&dma, 8192, 4096,
+            &direct, &scattered, &sample_iova));
+        assert(direct == 1 && scattered == 0 && sample_iova == IOVA);
+        assert(!ph_dma_cache_overlap(&dma, 12288, 4096,
+            &direct, &scattered, &sample_iova));
+        assert(direct == 0 && scattered == 0 && sample_iova == 0);
         assert(last_address == RAM + 4096 && last_iova == IOVA && last_length == 8192);
         assert(last_direction == protection);
         assert(!host->enable(&dma, 1) && dma.enabled && !dma.drained);
@@ -156,6 +168,9 @@ int main(void) {
     assert(page_views == 1 && last_address == VIEW && last_iova == IOVA &&
         last_length == 3 * 4096 && last_direction == PACHA_CAPSULE_DMA_BIDIRECTIONAL);
     assert(mappings[0].view == (void *)VIEW && mappings[0].fd == 100);
+    assert(!ph_dma_cache_overlap(&dma, 4096, 4096,
+        &direct, &scattered, &sample_iova));
+    assert(direct == 0 && scattered == 1 && sample_iova == 0);
     assert(!host->unmap(&dma, IOVA, 3 * 4096) && munmaps == 1);
     const uint64_t consecutive[] = {1, 2, 3}, last_page[] = {15};
     for (unsigned int protection = 1; protection <= 3; ++protection) {

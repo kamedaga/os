@@ -45,6 +45,7 @@ files:
   /srv/inputd.elf: inputd
   /srv/usbd.elf: usbd
   /srv/netd.elf: netd
+  /srv/logd.elf: logd
   /srv/kobox2/usb-hid/sandbox.elf: kobox2_usb_hid_sandbox
   /srv/kobox2/usb-hid/core.so: kobox2_usb_hid_core
   /srv/kobox2/usb-hid/closure.json: kobox2_usb_hid_closure

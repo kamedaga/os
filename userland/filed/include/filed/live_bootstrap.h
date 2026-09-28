@@ -8,9 +8,9 @@
 enum {
     FILED_LIVE_BOOTSTRAP_MAGIC = 0x324d4152444c4946ull,
     FILED_LIVE_READY_MAGIC = 0x315944524d415246ull,
-    /* The outer archive shares the 32 MiB boot scratch with seed0boot;
-     * the unpacked RAM root has a separate 64 MiB bound. */
-    FILED_LIVE_BOOTFS_MAX_BYTES = 32u * 1024u * 1024u,
+    /* Bootfs now uses bounded allocated boot pages, separate from the
+     * seed0boot ELF scratch. This also bounds untrusted bootstrap input. */
+    FILED_LIVE_BOOTFS_MAX_BYTES = 192u * 1024u * 1024u,
 };
 
 typedef struct filed_live_bootstrap {

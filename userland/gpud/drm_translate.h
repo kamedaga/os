@@ -5,7 +5,7 @@
 #include <gpud/drm_protocol.h>
 #include <kobox2/gpu.h>
 
-#define GPUD_DRM_COMMAND_BYTES 1024u
+#define GPUD_DRM_COMMAND_BYTES 16384u
 #define GPUD_DRM_VERSION_BYTES \
     (GPUD_DRM_VERSION_NAME_BYTES + GPUD_DRM_VERSION_DATE_BYTES + GPUD_DRM_VERSION_DESC_BYTES)
 #define GPUD_DRM_STAGED_INPUT_BYTES \
@@ -17,11 +17,12 @@
  * its independently resolved sandbox session in this generation. */
 struct gpud_drm_binding {
     uint64_t generation, frontend_handle, session_id;
+    uint32_t profile_kind;
 };
 
 struct gpud_drm_translation {
     uint64_t generation, frontend_handle, session_id;
-    uint32_t command_set_id, command_id, queue_class;
+    uint32_t profile_kind, command_set_id, command_id, queue_class;
     size_t command_size;
     unsigned char command[GPUD_DRM_COMMAND_BYTES];
     /* Independently registered command data. VERSION and GET_CAPS write it;

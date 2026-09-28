@@ -14,6 +14,7 @@
 #include "live_console.h"
 #include "storage/bootstrap.h"
 #include "netd/boot_config.h"
+#include "logd/boot_config.h"
 #include "termd/boot_config.h"
 #include "gpud/boot_config.h"
 #include "inputd/boot_config.h"
@@ -76,6 +77,7 @@ enum {
     SEED0ROOT_SERVICE_READY_FD = 233,
     SEED0ROOT_SERVICE_NETD_FD = 234,
     SEED0ROOT_SERVICE_INPUT_SOURCE_FD = 235,
+    SEED0ROOT_SERVICE_LOG_FD = 236,
 };
 
 struct seed0root_loaded_process {
@@ -2988,6 +2990,55 @@ static int seed0root_find_root_ethernet(const struct seed0root_root_devices *dev
     return -1;
 }
 
+static int seed0root_parse_hex_sha_line(const char *text, const char *key,
+    uint8_t digest[32], const char **next)
+{
+    const size_t key_length = strlen(key);
+    if (strncmp(text, key, key_length))
+        return -22;
+    const char *hex = text + key_length;
+    for (unsigned i = 0; i < 32; i++) {
+        unsigned value = 0;
+        for (unsigned j = 0; j < 2; j++) {
+            const char c = hex[i * 2 + j];
+            const unsigned digit = c >= '0' && c <= '9' ? (unsigned)(c - '0') :
+                c >= 'a' && c <= 'f' ? (unsigned)(c - 'a' + 10) : 16;
+            if (digit == 16)
+                return -22;
+            value = value * 16 + digit;
+        }
+        digest[i] = (uint8_t)value;
+    }
+    if (hex[64] != '\n')
+        return -22;
+    *next = hex + 65;
+    return 0;
+}
+
+static int seed0root_parse_gpu_probe_policy(const char *text,
+    struct gpud_boot_config *config)
+{
+    static const char root_key[] = "package_root=";
+    if (!text || !config || strncmp(text, root_key, sizeof(root_key) - 1))
+        return -22;
+    const char *root = text + sizeof(root_key) - 1;
+    const char *newline = strchr(root, '\n');
+    if (!newline || newline == root ||
+        (size_t)(newline - root) >= sizeof(config->package_root))
+        return -22;
+    memcpy(config->package_root, root, (size_t)(newline - root));
+    config->package_root[newline - root] = 0;
+    const char *next = newline + 1;
+    if (seed0root_parse_hex_sha_line(next, "firmware_sha256=",
+            config->firmware_sha256, &next) ||
+        seed0root_parse_hex_sha_line(next, "manifest_sha256=",
+            config->manifest_sha256, &next) ||
+        seed0root_parse_hex_sha_line(next, "sandbox_sha256=",
+            config->sandbox_sha256, &next) || *next)
+        return -22;
+    return 0;
+}
+
 #if defined(SEED0ROOT_UNIXD_CONTRACT_TEST) && SEED0ROOT_UNIXD_CONTRACT_TEST
 /* Test builds retain only the capability returned for this exact launch.
  * No PID lookup, new kernel authority, or service control API is needed. */
@@ -3178,11 +3229,167 @@ static int seed0root_start_unixd(int filed_endpoint_fd, int filed_path_fd, int *
     return 0;
 }
 
+static int seed0root_start_logd(int filed_endpoint_fd, int *out_endpoint)
+{
+    *out_endpoint = -1;
+    const int endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (endpoint < 16) return endpoint;
+    struct pacha_ipc_channel_pair ready = {.a = -1, .b = -1};
+    int status = pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0);
+    if (status != 0) {
+        (void)pacha_fd_close(endpoint);
+        return status;
+    }
+    const struct logd_boot_config config = {
+        .magic = LOGD_BOOT_MAGIC,
+        .version = LOGD_BOOT_VERSION,
+        .endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD,
+        .filed_endpoint_fd = 240,
+        .ready_channel_fd = SEED0ROOT_SERVICE_READY_FD,
+    };
+    const struct pacha_process_fd_grant grants[] = {
+        PACHA_LAUNCH_GRANT(endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD,
+            PACHA_LAUNCH_SERVER),
+        PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
+        PACHA_LAUNCH_GRANT(ready.b, SEED0ROOT_SERVICE_READY_FD,
+            PACHA_LAUNCH_SIGNAL),
+    };
+    status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/logd.elf",
+        &config, sizeof(config), grants, 3, 0x5eed2011u);
+    (void)pacha_fd_close(ready.b);
+    if (status == 0) {
+        struct pacha_pollfd event = {
+            .fd = ready.a,
+            .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP,
+        };
+        /* An optional diagnostics daemon must never delay the live shell
+         * indefinitely if its startup filesystem call fails to complete. */
+        const long waited = pacha_fd_wait_many(&event, 1, 3000);
+        if (waited == 1 && (event.revents & PACHA_FD_EVENT_READABLE))
+            status = seed0root_wait_service_ready(ready.a, LOGD_READY_MAGIC, "logd");
+        else {
+            (void)pacha_fd_close(ready.a);
+            status = -110;
+        }
+    } else (void)pacha_fd_close(ready.a);
+    if (status != 0) {
+        (void)pacha_fd_close(endpoint);
+        return status;
+    }
+    *out_endpoint = endpoint;
+    return 0;
+}
+
+/* A separate live profile may arm one generic display-class PCI capability.
+ * This owner neither knows a GPU PCI ID nor starts a driver: gpud waits for
+ * an explicit RAM command after SSH is available. Ambiguous hosts fail
+ * closed rather than silently selecting a different physical GPU. */
+static int seed0root_start_optional_gpu_probe(int filed_fd,
+    const struct seed0root_root_devices *devices, int log_fd,
+    int network_started,
+    int *out_control_fd, int *out_ready_fd)
+{
+    *out_control_fd = -1;
+    *out_ready_fd = -1;
+    char policy[384];
+    int status = seed0root_read_filed_text(filed_fd,
+        "/etc/pacha/gpu-probe.conf", policy, sizeof(policy));
+    if (status == -2)
+        return 0; /* The ordinary live image never arms the GPU. */
+    if (status)
+        return status;
+    /* GOP can disappear during probe. Do not arm this profile without both
+     * independent remote access and a RAM log sink. */
+    char authorized_key[256];
+    if (log_fd < 16 || !network_started ||
+        seed0root_read_filed_text(filed_fd, "/root/.ssh/authorized_keys",
+            authorized_key, sizeof(authorized_key)) != 0 ||
+        strncmp(authorized_key, "ssh-ed25519 ", 12))
+        return -19;
+    struct gpud_boot_config config = {.magic = GPUD_BOOT_CONFIG_MAGIC,
+        .version = GPUD_BOOT_CONFIG_VERSION,
+        .backend = GPUD_BACKEND_PCI_DRM_INSPECT,
+        .device_fd = SEED0ROOT_SERVICE_DEVICE_FD,
+        .filed_endpoint_fd = 240,
+        .control_channel_fd = SEED0ROOT_SERVICE_NETD_FD,
+        .ready_channel_fd = SEED0ROOT_SERVICE_READY_FD,
+        .log_endpoint_fd = log_fd >= 16 ? SEED0ROOT_SERVICE_LOG_FD : 0};
+    status = seed0root_parse_gpu_probe_policy(policy, &config);
+    if (status)
+        return status;
+    int selected = -1;
+    for (uint64_t i = 0; i < devices->metadata.device_count; ++i) {
+        if ((devices->metadata.devices[i].class_code >> 16) != 3)
+            continue;
+        if (selected >= 0)
+            return -17;
+        selected = (int)i;
+    }
+    if (selected < 0)
+        return -19;
+    struct pacha_capsule_info info = {0};
+    status = pacha_capsule_query(devices->fds[selected], &info);
+    if (status || info.kind != PACHA_CAPSULE_KIND_DEVICE ||
+        !(info.flags & PACHA_CAPSULE_DMA_TRANSLATED) ||
+        (info.flags & PACHA_CAPSULE_DMA_QUARANTINED))
+        return status ? status : -13;
+    struct pacha_ipc_channel_pair control = {.a = -1, .b = -1};
+    struct pacha_ipc_channel_pair ready = {.a = -1, .b = -1};
+    int drm_endpoint = -1;
+    status = pacha_ipc_channel_create(&control, seed0root_channel_rights, 0);
+    if (!status)
+        status = pacha_ipc_channel_create(&ready, seed0root_channel_rights, 0);
+    if (status)
+        goto fail;
+    drm_endpoint = pacha_ipc_endpoint_create(seed0root_channel_rights, 0);
+    if (drm_endpoint < 16) { status = -5; goto fail; }
+    config.drm_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
+    struct pacha_process_fd_grant grants[] = {
+        PACHA_LAUNCH_GRANT(devices->fds[selected], SEED0ROOT_SERVICE_DEVICE_FD,
+            PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(drm_endpoint, SEED0ROOT_SERVICE_ENDPOINT_FD,
+            PACHA_LAUNCH_SERVER),
+        PACHA_LAUNCH_GRANT(filed_fd, 240, PACHA_LAUNCH_CLIENT),
+        PACHA_LAUNCH_GRANT(control.b, SEED0ROOT_SERVICE_NETD_FD,
+            PACHA_LAUNCH_SERVER | PACHA_FD_RIGHT_SEND),
+        PACHA_LAUNCH_GRANT(ready.b, SEED0ROOT_SERVICE_READY_FD,
+            PACHA_LAUNCH_SIGNAL),
+        PACHA_LAUNCH_GRANT(log_fd, SEED0ROOT_SERVICE_LOG_FD,
+            PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
+    };
+    status = seed0root_exec_native_service(filed_fd, "/srv/gpud.elf",
+        &config, sizeof(config), grants, log_fd >= 16 ? 6 : 5,
+        0x5eed2012u);
+    if (status)
+        goto fail;
+    status = seed0root_register_service_endpoint(filed_fd,
+        FILED_OP_SERVICE_SET_GPUD_DRM, drm_endpoint, 0x5eed2013u);
+    if (status)
+        goto fail;
+    (void)pacha_fd_close(drm_endpoint);
+    drm_endpoint = -1;
+    (void)pacha_fd_close(control.b);
+    (void)pacha_fd_close(ready.b);
+    *out_control_fd = control.a;
+    *out_ready_fd = ready.a;
+    printf("[seed0root] optional GPU inspection armed: display capability %d; no probe until RAM command\n",
+        selected);
+    return 0;
+fail:
+    if (drm_endpoint >= 16) (void)pacha_fd_close(drm_endpoint);
+    if (control.a >= 16) (void)pacha_fd_close(control.a);
+    if (control.b >= 16) (void)pacha_fd_close(control.b);
+    if (ready.a >= 16) (void)pacha_fd_close(ready.a);
+    if (ready.b >= 16) (void)pacha_fd_close(ready.b);
+    return status;
+}
+
 static int seed0root_launch_root_services(
     int filed_endpoint_fd,
     struct seed0root_root_devices *devices,
     int *out_gpud_control_fd,
     int live_mode,
+    int log_endpoint_fd,
     int *out_live_termd_fd,
     int *out_live_inputd_fd,
     struct seed0root_live_usb_ready *out_live_usb_ready)
@@ -3269,6 +3476,8 @@ static int seed0root_launch_root_services(
         netd_cfg.filed_endpoint_fd = 240;
         netd_cfg.socket_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
         netd_cfg.status_channel_fd = live_mode ? SEED0ROOT_SERVICE_READY_FD : 0;
+        netd_cfg.log_endpoint_fd = live_mode && log_endpoint_fd >= 16 ?
+            SEED0ROOT_SERVICE_LOG_FD : 0;
         /* netd owns network policy; this handoff grants an Ethernet function. */
         const struct pacha_process_fd_grant netd_grants[] = {
             PACHA_LAUNCH_GRANT(devices->fds[net], SEED0ROOT_SERVICE_DEVICE_FD,
@@ -3277,9 +3486,12 @@ static int seed0root_launch_root_services(
             PACHA_LAUNCH_GRANT(filed_endpoint_fd, 240, PACHA_LAUNCH_CLIENT),
             PACHA_LAUNCH_GRANT(net_ready.b, SEED0ROOT_SERVICE_READY_FD,
                 PACHA_LAUNCH_SIGNAL),
+            PACHA_LAUNCH_GRANT(log_endpoint_fd, SEED0ROOT_SERVICE_LOG_FD,
+                PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
         };
         status = seed0root_exec_native_service(filed_endpoint_fd, "/srv/netd.elf",
-            &netd_cfg, sizeof(netd_cfg), netd_grants, live_mode ? 4 : 3,
+            &netd_cfg, sizeof(netd_cfg), netd_grants,
+            live_mode ? (log_endpoint_fd >= 16 ? 5 : 4) : 3,
             0x5eed2003u);
         if (net_ready.b >= 16) (void)pacha_fd_close(net_ready.b);
         if (status == 0)
@@ -3469,6 +3681,9 @@ static int seed0root_launch_root_services(
     memset(&gpud_cfg, 0, sizeof(gpud_cfg));
     gpud_cfg.magic = GPUD_BOOT_CONFIG_MAGIC;
     gpud_cfg.version = GPUD_BOOT_CONFIG_VERSION;
+    gpud_cfg.backend = GPUD_BACKEND_VIRTIO;
+    memcpy(gpud_cfg.package_root, "/srv/kobox2",
+        sizeof("/srv/kobox2"));
     gpud_cfg.drm_endpoint_fd = SEED0ROOT_SERVICE_ENDPOINT_FD;
     gpud_cfg.device_fd = SEED0ROOT_SERVICE_DEVICE_FD;
     gpud_cfg.filed_endpoint_fd = 240;
@@ -4073,6 +4288,7 @@ struct seed0root_live_ssh {
     int filed_fd;
     int supervisor_fd;
     int enabled;
+    int gpu_client;
     int launched;
 };
 
@@ -4091,7 +4307,8 @@ static void seed0root_poll_live_ssh(void *context)
         /* Dropbear performs setgid/initgroups/setuid after authentication.
          * Keep this identity authority on the daemon, never on live ash. */
         .credential_rights = LPRS_CREDENTIAL_SETUID | LPRS_CREDENTIAL_SETGID,
-        .clients = FILED_EXEC_SERVICE_NETD | FILED_EXEC_SERVICE_TERMD,
+        .clients = FILED_EXEC_SERVICE_NETD | FILED_EXEC_SERVICE_TERMD |
+            (ssh->gpu_client ? FILED_EXEC_SERVICE_GPUD_DRM : 0),
         .argc = 2,
         .argv = {"/usr/sbin/dropbear", "-FsjkmR"},
     };
@@ -4105,6 +4322,40 @@ static void seed0root_poll_live_ssh(void *context)
     if (bootstrap_fd >= 16) (void)pacha_fd_close(bootstrap_fd);
     printf("[seed0root] live SSH %s status=%d (public key only)\n",
         status == 0 ? "launched" : "launch failed", status);
+    fflush(stdout);
+}
+
+struct seed0root_live_runtime {
+    struct seed0root_live_ssh *ssh;
+    struct live_console *console;
+    int gpu_control_fd;
+};
+
+static void seed0root_poll_live_runtime(void *context)
+{
+    struct seed0root_live_runtime *runtime = context;
+    seed0root_poll_live_ssh(runtime->ssh);
+    if (runtime->gpu_control_fd < 16) return;
+    struct pacha_pollfd event = {.fd = runtime->gpu_control_fd,
+        .events = PACHA_FD_EVENT_READABLE};
+    if (pacha_fd_poll(&event, 1) != 1 ||
+        !(event.revents & PACHA_FD_EVENT_READABLE)) return;
+    struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
+    struct pacha_ipc_msg request = {.fds = fds,
+        .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
+    if (pacha_ipc_recv(runtime->gpu_control_fd, &request) != 0) return;
+    const int valid = request.word0 == GPUD_CONTROL_DISPLAY_RELEASE_MAGIC &&
+        !request.word1 && !request.word2 && !request.word3 &&
+        !request.fd_count;
+    for (size_t i = 0; i < request.fd_count; ++i)
+        (void)pacha_fd_close((int)fds[i].fd);
+    const int status = valid ? live_console_release_framebuffer(runtime->console) : -22;
+    const struct pacha_ipc_msg reply = {
+        .word0 = GPUD_CONTROL_DISPLAY_RELEASED_MAGIC,
+        .word1 = (uint64_t)(int64_t)status,
+    };
+    (void)pacha_ipc_send(runtime->gpu_control_fd, &reply);
+    printf("[seed0root] GOP framebuffer handoff status=%d\n", status);
     fflush(stdout);
 }
 
@@ -4280,7 +4531,7 @@ static int launch_filed_with_path(const storage_seed0root_bootstrap_t *bootstrap
         return status;
     }
     status = seed0root_launch_root_services(
-        filed_client_fd, &root_devices, &gpud_control_fd, 0, NULL, NULL, NULL);
+        filed_client_fd, &root_devices, &gpud_control_fd, 0, 0, NULL, NULL, NULL);
     if (status != 0) {
         (void)pacha_fd_close(lpr_supervisor_endpoint_fd);
         (void)pacha_fd_close(filed_client_fd);
@@ -4395,6 +4646,9 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
     int termd_fd = -1;
     int inputd_fd = -1;
     int unused_gpud_fd = -1;
+    int gpu_probe_control_fd = -1;
+    int gpu_probe_ready_fd = -1;
+    int log_endpoint_fd = -1;
     struct live_console *console = NULL;
     struct seed0root_live_usb_ready usb_ready = {0};
     usb_ready.net_fd = -1;
@@ -4405,6 +4659,13 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
     (void)pacha_fd_close((int)bootstrap->power_channel_fd);
     if (unix_admin_fd >= 16) (void)pacha_fd_close(unix_admin_fd);
     if (status != 0) return status;
+    /* Diagnostic storage is optional: failure must not prevent an offline
+     * live shell, and producers retain their early serial fallback. */
+    const int log_status = seed0root_start_logd(filed_fd, &log_endpoint_fd);
+    printf("[seed0root] live service log %s%s\n",
+        log_status == 0 ? "/run/pacha/service.log" : "unavailable",
+        log_status == 0 ? "" : " (serial fallback)");
+    fflush(stdout);
     struct seed0root_root_devices devices;
     status = seed0root_receive_root_handoff(
         (int)bootstrap->root_handoff_fd, &devices);
@@ -4439,8 +4700,22 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
         }
     }
     if (status == 0) status = seed0root_launch_root_services(
-        filed_fd, &devices, &unused_gpud_fd, 1, &termd_fd, &inputd_fd,
+        filed_fd, &devices, &unused_gpud_fd, 1, log_endpoint_fd,
+        &termd_fd, &inputd_fd,
         &usb_ready);
+    if (status == 0) {
+        const int gpu_status = seed0root_start_optional_gpu_probe(filed_fd,
+            &devices, log_endpoint_fd, usb_ready.net_state == 1,
+            &gpu_probe_control_fd,
+            &gpu_probe_ready_fd);
+        if (gpu_status != 0)
+            printf("[seed0root] optional GPU inspection unavailable status=%d; live shell continues\n",
+                gpu_status);
+    }
+    if (log_endpoint_fd >= 16) {
+        (void)pacha_fd_close(log_endpoint_fd);
+        log_endpoint_fd = -1;
+    }
     if (status == 0) status = live_console_prepare(bootstrap,
         devices.metadata.devices, devices.fds, devices.metadata.device_count,
         termd_fd, inputd_fd, &console);
@@ -4454,7 +4729,8 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
             /* The shell can start before DHCP, but its descendants still
              * need the generic netd socket capability once it comes up. */
             .clients = FILED_EXEC_SERVICE_TERMD |
-                (usb_ready.net_state == 1 ? FILED_EXEC_SERVICE_NETD : 0),
+                (usb_ready.net_state == 1 ? FILED_EXEC_SERVICE_NETD : 0) |
+                (gpu_probe_ready_fd >= 16 ? FILED_EXEC_SERVICE_GPUD_DRM : 0),
             .ctty = live_console_ctty(console),
             .argc = 1,
             .argv = {"/bin/ash"},
@@ -4477,6 +4753,7 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
             .devices = &usb_ready,
             .filed_fd = filed_fd,
             .supervisor_fd = supervisor_fd,
+            .gpu_client = gpu_probe_ready_fd >= 16,
             .enabled = key_status == 0 &&
                 strncmp(authorized_key, "ssh-ed25519 ", 12) == 0,
         };
@@ -4517,9 +4794,16 @@ static int launch_live(const pacha_live_root_bootstrap_t *bootstrap)
             live_console_ctty(console));
         fflush(stdout);
         live_console_finish_boot(console);
-        status = live_console_run(console, seed0root_poll_live_ssh, &ssh);
+        struct seed0root_live_runtime runtime = {
+            .ssh = &ssh,
+            .console = console,
+            .gpu_control_fd = gpu_probe_control_fd,
+        };
+        status = live_console_run(console, seed0root_poll_live_runtime, &runtime);
     }
     seed0root_close_live_usb_ready(&usb_ready);
+    if (gpu_probe_control_fd >= 16) (void)pacha_fd_close(gpu_probe_control_fd);
+    if (gpu_probe_ready_fd >= 16) (void)pacha_fd_close(gpu_probe_ready_fd);
     live_console_destroy(console);
     if (termd_fd >= 16) (void)pacha_fd_close(termd_fd);
     if (inputd_fd >= 16) (void)pacha_fd_close(inputd_fd);

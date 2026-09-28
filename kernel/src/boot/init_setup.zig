@@ -68,10 +68,13 @@ pub fn mapBootFsImageIntoProcessOrHalt(
     principal: kernel.PrincipalId,
     role_label: []const u8,
     base_va: u64,
-    image: []const u8,
+    staged_pages: []const u64,
+    image_size: usize,
     free_list: *kernel.FreePageList,
 ) BootFsImageSetup {
-    const page_count = std.math.divCeil(usize, image.len, 4096) catch unreachable;
+    const page_count = std.math.divCeil(usize, image_size, 4096) catch unreachable;
+    if (image_size == 0 or staged_pages.len != page_count)
+        haltInitBootstrapDescriptor("bootfs staging page count invalid");
     var first_page_paddr: u64 = 0;
     var copied: usize = 0;
     const tracked_size = @as(u64, @intCast(page_count)) * kernel.native_page_size;
@@ -95,9 +98,10 @@ pub fn mapBootFsImageIntoProcessOrHalt(
         const page = process_factory.allocPageForProcessOrHalt(state, principal, role_label, "bootfs image page", free_list);
         if (first_page_paddr == 0) first_page_paddr = page.paddr;
         // allocPhysicalPage already zeroed the whole page through the window.
-        const remaining = image.len - copied;
+        const remaining = image_size - copied;
         const chunk_len: usize = if (remaining > 4096) 4096 else remaining;
-        if (!user_copy.writePhysicalBytes(page.paddr, image[copied .. copied + chunk_len])) {
+        const source: [*]const u8 = @ptrFromInt(staged_pages[page_index]);
+        if (!user_copy.writePhysicalBytes(page.paddr, source[0..chunk_len])) {
             halt.haltWithRolePageMessage(role_label, "bootfs image page", "physical write failed");
         }
         if (!user_vm.mapUserLinearRegion(
@@ -133,7 +137,7 @@ pub fn mapBootFsImageIntoProcessOrHalt(
     };
     return .{
         .first_page_paddr = first_page_paddr,
-        .size_bytes = image.len,
+        .size_bytes = image_size,
         .page_count = page_count,
     };
 }
@@ -317,7 +321,8 @@ pub fn publishInitBootstrapDescriptorPage(
 pub fn setupInitBootstrapResources(
     state: *kernel.KernelState,
     init_process_principal: kernel.PrincipalId,
-    bootfs_image: []const u8,
+    bootfs_stage_pages: []const u64,
+    bootfs_size: usize,
     framebuffer_info: ?boot_resources.FramebufferInfo,
     free_list: *kernel.FreePageList,
 ) void {
@@ -360,7 +365,8 @@ pub fn setupInitBootstrapResources(
         init_process_principal,
         "init",
         init_bootstrap_layout.bootfs_image_va,
-        bootfs_image,
+        bootfs_stage_pages,
+        bootfs_size,
         free_list,
     );
     publishInitBootstrapConfigPage(config_page.paddr, init_bootstrap_layout.descriptor_page_va);

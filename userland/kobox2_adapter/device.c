@@ -43,6 +43,8 @@ int ph_device_init(struct ph_device *device, const struct ph_device_config *conf
         PH_OK(ph_dma_destroy(&device->dma));
         goto release_pci;
     }
+    config->image->device_dma = &device->dma;
+    device->image = config->image;
     device->generation = config->generation;
     return 0;
 release_pci:
@@ -64,8 +66,12 @@ int ph_device_finish(struct ph_device *device, uint64_t generation) {
     if (result) return result;
     PH_OK(ph_pci_revoke(&device->pci, generation));
     PH_OK(ph_irq_destroy(&device->irq));
+    /* Device finish runs after Linux has stopped all callbacks. */
+    if (device->image)
+        device->image->device_dma = NULL;
     PH_OK(ph_dma_destroy(&device->dma));
     PH_OK(ph_pci_destroy(&device->pci));
+    device->image = NULL;
     device->generation = 0;
     return 0;
 }

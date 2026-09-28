@@ -5,21 +5,201 @@
 #include "launch.h"
 #include "lifecycle.h"
 #include "package.h"
+#include "inspect_policy.h"
+#include "discovery.h"
 #include "process.h"
 #include "../kobox2_adapter/gpu_query_message.h"
 #include "../kobox2_adapter/gpu_queue_message.h"
 #include "../kobox2_adapter/sandbox_config.h"
 
 #include <kobox2/virtqueue_x86_64.h>
+#include <kobox2/module_progress.h>
 #include <pacha/bootstrap.h>
 #include <pacha/capsule.h>
 #include <pacha/ipc.h>
+#include <pacha/log.h>
+#include <filed_client/module_image.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 enum { GPUD_RESOURCE_SET_ID = 1, GPUD_SANDBOX_ID = 1 };
+
+/* An opt-in, root-owned RAM command file is only the one-shot diagnostic
+ * trigger. Device ownership and package verification remain capabilities in
+ * gpud; the ordinary virtio service never reads this path. */
+#define GPUD_INSPECT_CONTROL_PATH "/run/pacha/gpu-control"
+#define GPUD_INSPECT_POLICY_PATH "/run/pacha/gpu-probe.conf"
+
+static void log_runtime_event(const struct gpud_boot_config *config,
+    const char *event, int status) {
+    char line[160];
+    int size = snprintf(line, sizeof(line), "%s status=%d", event, status);
+    if (size <= 0 || (size_t)size >= sizeof(line))
+        return;
+    if (config->log_endpoint_fd >= 16)
+        (void)pacha_log_emit((int)config->log_endpoint_fd,
+            PACHA_LOG_SOURCE_GPUD, line, (size_t)size);
+    else
+        printf("[gpud] %s\n", line);
+}
+
+/* 0: absent/incomplete, 1: probe, 2: stop. A truncated shell write is not
+ * a command. The file lives only in the RAM root and is never an authority
+ * to select a PCI function or bypass package/firmware verification. */
+static int manual_control(int filed_fd) {
+    struct filed_client_module_image image = {0};
+    int error = filed_client_load_module_image_limited(filed_fd,
+        GPUD_INSPECT_CONTROL_PATH, "gpu-control", 16, &image);
+    if (error)
+        return error == -ENOENT || error == -7 ? 0 : error;
+    int command = image.size == 6 &&
+        !memcmp(image.data, "probe\n", 6) ? 1 :
+        image.size == 5 && !memcmp(image.data, "stop\n", 5) ? 2 : 0;
+    filed_client_release_module_image(&image);
+    return command;
+}
+
+static int wait_manual_probe(const struct gpud_boot_config *config) {
+    log_runtime_event(config, "PCI DRM inspection armed; awaiting RAM command", 0);
+    for (;;) {
+        int command = manual_control((int)config->filed_endpoint_fd);
+        if (command == 1) {
+            log_runtime_event(config, "manual PCI DRM probe requested", 0);
+            return 0;
+        }
+        if (command == 2)
+            return -ECANCELED;
+        if (command < 0)
+            return command;
+        /* filed can expose this optional node before the one-shot probe. A
+         * caller must get ENODEV, never block on an unserviced endpoint. */
+        int rejected = gpud_drm_service_reject_unavailable(
+            (int)config->drm_endpoint_fd);
+        if (rejected != -EAGAIN && rejected)
+            return rejected;
+        struct pacha_pollfd events[2] = {
+            {.fd = (int)config->control_channel_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
+            {.fd = (int)config->drm_endpoint_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
+        };
+        long waited = pacha_fd_wait_many(events, 2, 1000);
+        if (waited == PACHA_ERR_NOT_READY)
+            continue;
+        if (waited < 0 || events[0].revents ||
+            (events[1].revents & PACHA_FD_EVENT_HANGUP))
+            return -EPIPE;
+    }
+}
+
+static int request_display_release(const struct gpud_boot_config *config) {
+    const struct pacha_ipc_msg request = {
+        .word0 = GPUD_CONTROL_DISPLAY_RELEASE_MAGIC,
+    };
+    int status = pacha_ipc_send((int)config->control_channel_fd, &request);
+    if (status) return status;
+    struct pacha_pollfd event = {.fd = (int)config->control_channel_fd,
+        .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+    /* The owner services this channel from its 20 ms live-console loop.
+     * Never start the driver if it cannot attest that GOP stopped writing. */
+    long waited = pacha_fd_wait_many(&event, 1, 5000);
+    if (waited != 1 || !(event.revents & PACHA_FD_EVENT_READABLE))
+        return waited < 0 ? (int)waited : -ETIMEDOUT;
+    struct pacha_ipc_fd fds[PACHA_IPC_MAX_TRANSFER_FDS];
+    struct pacha_ipc_msg reply = {.fds = fds,
+        .fd_capacity = PACHA_IPC_MAX_TRANSFER_FDS};
+    status = pacha_ipc_recv((int)config->control_channel_fd, &reply);
+    for (size_t i = 0; i < reply.fd_count; ++i)
+        (void)pacha_fd_close((int)fds[i].fd);
+    if (status) return status;
+    if (reply.word0 != GPUD_CONTROL_DISPLAY_RELEASED_MAGIC ||
+        reply.word2 || reply.word3 || reply.fd_count)
+        return -EPROTO;
+    return (int)(int64_t)reply.word1;
+}
+
+/* The trusted boot profile grants the PCI capability and arms this process.
+ * An authenticated live root may replace only the expected package digests
+ * in RAM for a later one-shot probe; no PCI selection or automatic probe is
+ * derived from the uploaded file. This keeps Kobox2 rebuilds off the USB. */
+static int refresh_inspection_policy(struct gpud_boot_config *config) {
+    struct filed_client_module_image image = {0};
+    int error = filed_client_load_module_image_limited(
+        (int)config->filed_endpoint_fd, GPUD_INSPECT_POLICY_PATH,
+        "gpu-probe-policy", 384, &image);
+    if (error == -ENOENT) return 0;
+    if (error) return error;
+    error = gpud_inspect_policy_parse(image.data, image.size, config);
+    filed_client_release_module_image(&image);
+    if (!error)
+        log_runtime_event(config, "RAM GPU package policy selected", 0);
+    return error;
+}
+
+static void log_progress(const struct gpud_boot_config *config,
+    const struct gpud_package *package, const struct gpud_lifecycle *lifecycle) {
+    char line[192];
+    const unsigned phase = lifecycle->progress_phase;
+    const unsigned index = lifecycle->progress_module_index;
+    const char *name = "";
+    int name_length = 0;
+    kb2_closure_manifest_artifact_t artifact;
+    if ((phase == KOBOX_MODULE_PROGRESS_MODULE_BEGIN ||
+         phase == KOBOX_MODULE_PROGRESS_MODULE_FAILED) &&
+        index + 1 < package->artifact_count &&
+        kb2_closure_manifest_artifact(&package->decoded, index + 1,
+            &artifact) == KB2_PROTOCOL_OK) {
+        name = artifact.namespace_name.data;
+        name_length = (int)(artifact.namespace_name.length < 48 ?
+            artifact.namespace_name.length : 48);
+    }
+    int length = snprintf(line, sizeof(line),
+        "Linux phase=%u module=%u/%zu name=%.*s status=%d",
+        phase, index + 1, package->artifact_count - 1,
+        name_length, name, lifecycle->progress_status);
+    if (length <= 0 || (size_t)length >= sizeof(line))
+        return;
+    if (config->log_endpoint_fd >= 16)
+        (void)pacha_log_emit((int)config->log_endpoint_fd,
+            PACHA_LOG_SOURCE_KOBOX2_GPU, line, (size_t)length);
+    else
+        printf("[gpud] %s\n", line);
+}
+
+static void log_probe_failure(const struct gpud_boot_config *config,
+    const struct gpud_lifecycle *lifecycle) {
+    char line[192];
+    int length;
+    if (lifecycle->failure_fault) {
+        length = snprintf(line, sizeof(line),
+            "Linux fault vector=%u error=0x%x core_relative=%u ip=0x%llx address=0x%llx",
+            lifecycle->failure_vector, lifecycle->failure_error_code,
+            lifecycle->failure_core_relative,
+            (unsigned long long)lifecycle->failure_ip,
+            (unsigned long long)lifecycle->failure_address);
+    } else if (lifecycle->failure_source) {
+        length = snprintf(line, sizeof(line),
+            "Linux failure source=%llu line=%u errno=%d",
+            (unsigned long long)lifecycle->failure_source,
+            lifecycle->failure_line, lifecycle->native_error);
+    } else {
+        length = snprintf(line, sizeof(line),
+            "Linux probe failed errno=%d loaded=%u pci_bound=%u phase=%u module=%u",
+            lifecycle->native_error, lifecycle->failure_loaded,
+            lifecycle->failure_pci_bound, lifecycle->progress_phase,
+            lifecycle->progress_module_index);
+    }
+    if (length <= 0 || (size_t)length >= sizeof(line))
+        return;
+    if (config->log_endpoint_fd >= 16)
+        (void)pacha_log_emit((int)config->log_endpoint_fd,
+            PACHA_LOG_SOURCE_KOBOX2_GPU, line, (size_t)length);
+    else
+        printf("[gpud] %s\n", line);
+}
 
 static void *controller_allocate(void *context, size_t size) {
     (void)context;
@@ -32,14 +212,16 @@ static void controller_deallocate(void *context, void *pointer, size_t size) {
     free(pointer);
 }
 
-static int wait_readable(int fd, int process_fd) {
+static int wait_readable(int fd, int process_fd, uint64_t deadline_ticks) {
     struct pacha_pollfd events[2] = {
         {.fd = fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
     };
-    long result = pacha_fd_wait_many(events, 2, PACHA_FD_WAIT_FOREVER);
+    long result = pacha_fd_wait_many(events, 2, deadline_ticks);
     if (events[1].revents)
         return -EPIPE;
+    if (result == PACHA_ERR_NOT_READY || result == 0)
+        return -ETIMEDOUT;
     if (result > 0 && events[0].revents == PACHA_FD_EVENT_READABLE)
         return 0;
     return -EIO;
@@ -47,7 +229,7 @@ static int wait_readable(int fd, int process_fd) {
 
 static int wait_service(
     struct gpud_drm_service *service, int endpoint_fd,
-    int process_fd, int control_fd) {
+    int process_fd, int control_fd, uint64_t timeout_ticks) {
     int error = gpud_drm_service_reserve_pollfds(service, 4);
     if (error) return error;
     struct pacha_pollfd *events = service->pollfds;
@@ -73,9 +255,11 @@ static int wait_service(
     size_t source_count = gpud_drm_service_pollfds(
         service, events + event_count, service->poll_capacity - event_count);
     long result = pacha_fd_wait_many_batched(
-        events, event_count + source_count, PACHA_FD_WAIT_FOREVER);
+        events, event_count + source_count, timeout_ticks);
     if (events[1].revents)
         return -EPIPE;
+    if (result == PACHA_ERR_NOT_READY || result == 0)
+        return -EAGAIN;
     if (result <= 0)
         return -EIO;
     if (events[0].revents & PACHA_FD_EVENT_READABLE)
@@ -100,6 +284,16 @@ static int wait_process(int process_fd) {
     return result > 0 && event.revents ? 0 : -EIO;
 }
 
+static int wait_process_bounded(int process_fd) {
+    struct pacha_pollfd event = {.fd = process_fd,
+        .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP};
+    /* Native wait deadlines are scheduler ticks. A failed module unload
+     * must not leave an authorized GPU doing DMA indefinitely. */
+    long result = pacha_fd_wait_many(&event, 1, 30000);
+    return result > 0 && event.revents ? 0 :
+        (result == PACHA_ERR_NOT_READY || result == 0) ? -ETIMEDOUT : -EIO;
+}
+
 static int send_ready(const struct gpud_boot_config *config, int status) {
     const struct pacha_ipc_msg message = {.word0 = GPUD_BOOT_READY_MAGIC,
         .word1 = (uint64_t)(int64_t)status, .word2 = status ? 0 : 1};
@@ -109,6 +303,7 @@ static int send_ready(const struct gpud_boot_config *config, int status) {
 enum gpud_control_result {
     GPUD_CONTROL_IDLE,
     GPUD_CONTROL_FORCE_RESTART,
+    GPUD_CONTROL_STOP,
     GPUD_CONTROL_PEER_CLOSED,
 };
 
@@ -136,13 +331,15 @@ static int receive_control(int fd, uint64_t generation) {
         return GPUD_CONTROL_PEER_CLOSED;
     if (status)
         return -EIO;
-    int valid = message.word0 == GPUD_CONTROL_FORCE_RESTART_MAGIC &&
+    int valid = (message.word0 == GPUD_CONTROL_FORCE_RESTART_MAGIC ||
+        message.word0 == GPUD_CONTROL_STOP_MAGIC) &&
         message.word1 == generation && !message.word2 && !message.word3 &&
         !message.fd_count;
     for (size_t i = 0; i < message.fd_count; ++i)
         if (pacha_fd_close((int)message.fds[i].fd))
             return -EIO;
-    return valid ? GPUD_CONTROL_FORCE_RESTART : -EPROTO;
+    return valid ? (message.word0 == GPUD_CONTROL_STOP_MAGIC ?
+        GPUD_CONTROL_STOP : GPUD_CONTROL_FORCE_RESTART) : -EPROTO;
 }
 
 static int terminate_sandbox(
@@ -306,9 +503,102 @@ static int restart_generation(kb2_controller_t *controller,
     }
 }
 
+static int stop_generation(kb2_controller_t *controller,
+    struct gpud_package *package, struct gpud_generation *current,
+    uint64_t *handle_sequence, int inspect) {
+    const uint64_t generation = current->id;
+    int quiesce_error = 0;
+    if (kb2_controller_stop(controller) != KB2_STATUS_OK)
+        return -EIO;
+    for (;;) {
+        const kb2_action_t *action = kb2_controller_pending_action(controller);
+        if (!action)
+            return kb2_controller_state(controller) == KB2_STATE_IDLE ?
+                quiesce_error : -EIO;
+        const kb2_action_type_t type = kb2_action_type(action);
+        const uint64_t token = kb2_action_token(action);
+        if (type == KB2_ACTION_QUIESCE_SANDBOX) {
+            kb2_status_t status = gpud_lifecycle_quiesce(&current->lifecycle, token);
+            if (status == KB2_STATUS_ACTION_PENDING) {
+                int error = wait_process_bounded(current->launch.process.fd);
+                if (!error)
+                    continue;
+                /* A nonterminating driver can still access the device.
+                 * Quarantine DMA before escalating to forced termination. */
+                if (!quiesce_error)
+                    quiesce_error = error;
+                (void)pacha_capsule_dma_set_enabled(package->device_fd, 0);
+                if (kb2_controller_complete_action(controller, generation, token,
+                        KB2_STATUS_HOST_FAILURE, 0, 0) != KB2_STATUS_HOST_FAILURE ||
+                    kb2_controller_stop(controller) != KB2_STATUS_OK)
+                    return error;
+                continue;
+            }
+            if (status != KB2_STATUS_OK) {
+                /* Continue resource revoke/release, but do not turn an
+                 * abnormal sandbox exit into a successful GPU stop. */
+                if (!quiesce_error)
+                    quiesce_error = current->lifecycle.native_error ?
+                        current->lifecycle.native_error : -EIO;
+                (void)pacha_capsule_dma_set_enabled(package->device_fd, 0);
+                if (kb2_controller_pending_action(controller) &&
+                    kb2_controller_complete_action(controller, generation, token,
+                        KB2_STATUS_HOST_FAILURE, 0, 0) != KB2_STATUS_HOST_FAILURE)
+                    return -EIO;
+                if (kb2_controller_stop(controller) != KB2_STATUS_OK)
+                    return -EIO;
+            }
+            continue;
+        }
+        if (type == KB2_ACTION_TERMINATE_SANDBOX ||
+            type == KB2_ACTION_REAP_SANDBOX) {
+            kb2_status_t status = gpud_process_action(&current->watch,
+                generation, token, 9);
+            if (status == KB2_STATUS_ACTION_PENDING) {
+                int error = wait_process_bounded(current->launch.process.fd);
+                if (error) {
+                    (void)pacha_capsule_dma_set_enabled(package->device_fd, 0);
+                    return error;
+                }
+                continue;
+            }
+            if (status != KB2_STATUS_OK)
+                return -EIO;
+            if (type == KB2_ACTION_REAP_SANDBOX) {
+                int error = gpud_native_launch_discard(&current->launch, generation);
+                if (!error)
+                    error = gpud_lifecycle_release(&current->lifecycle);
+                if (!error)
+                    error = ph_ipc_destroy(&current->ipc, generation);
+                if (error)
+                    return error;
+            }
+            continue;
+        }
+        if (type == KB2_ACTION_REVOKE_RESOURCES) {
+            int error = pacha_capsule_dma_set_enabled(package->device_fd, 0);
+            if (!error && !inspect)
+                error = retire_drm_generation(current, handle_sequence);
+            if (error)
+                return error;
+            if (complete_action(controller, type, 0, 0))
+                return -EIO;
+            continue;
+        }
+        if (type == KB2_ACTION_RELEASE_RESOURCES) {
+            int error = gpud_package_unbind(package, generation);
+            if (error || complete_action(controller, type, 0, 0))
+                return error ? error : -EIO;
+            continue;
+        }
+        return -EOPNOTSUPP;
+    }
+}
+
 static int start_generation(const struct gpud_boot_config *config,
     kb2_controller_t *controller, struct gpud_package *package,
     uint64_t handle_sequence, struct gpud_generation *current) {
+    const int inspect = config->backend == GPUD_BACKEND_PCI_DRM_INSPECT;
     memset(current, 0, sizeof(*current));
     current->id = kb2_controller_generation(controller);
     current->management = (struct pacha_ipc_channel_pair){.a = -1, .b = -1};
@@ -320,8 +610,12 @@ static int start_generation(const struct gpud_boot_config *config,
             GPUD_RESOURCE_SET_ID, 0);
     if (error) {
         printf("[gpud] stage=resource-bind status=%d\n", error);
+        if (inspect)
+            log_runtime_event(config, "resource bind failed", error);
         return error;
     }
+    if (inspect)
+        log_runtime_event(config, "PCI resource bound to Kobox2 owner", 0);
 
     const uint64_t channel_rights = PH_IPC_CHANNEL_RIGHTS |
         PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER;
@@ -329,81 +623,188 @@ static int start_generation(const struct gpud_boot_config *config,
         &current->management, channel_rights, 0);
     if (error) {
         printf("[gpud] stage=management-channel status=%d\n", error);
+        if (inspect)
+            log_runtime_event(config, "management channel creation failed", error);
         return error;
     }
     error = ph_ipc_init(
         &current->ipc, current->management.a, generation);
     if (error) {
         printf("[gpud] stage=management-adopt status=%d\n", error);
+        if (inspect)
+            log_runtime_event(config, "management channel adoption failed", error);
         return error;
     }
-    struct ph_sandbox_config sandbox_config = {.identity = package->identity,
-        .artifact_count = GPUD_PACKAGE_ARTIFACTS, .resource_count = 1,
-        .client_id = 1, .gpu_channel_id = 1, .device = package->device};
-    struct gpud_launch_blob blob = {.bytes = &sandbox_config,
-        .size = sizeof(sandbox_config), .address = PH_SANDBOX_CONFIG_ADDRESS};
-    struct pacha_process_fd_grant grant = {
-        .source_fd = (uint64_t)current->management.b,
-        .target_fd = PH_SANDBOX_CHANNEL_FD, .rights = PH_IPC_CHANNEL_RIGHTS,
-        .flags = PACHA_FD_FLAG_CLOEXEC};
+    struct ph_sandbox_config sandbox_config = {.version = PH_SANDBOX_CONFIG_VERSION,
+        .identity = package->identity,
+        .artifact_count = package->artifact_count, .resource_count = 1,
+        .client_id = 1, .gpu_channel_id = 1,
+        .device = package->device};
+    struct gpud_launch_blob blobs[2] = {
+        {.bytes = &sandbox_config,
+         .size = sizeof(sandbox_config), .address = PH_SANDBOX_CONFIG_ADDRESS},
+    };
+    if (inspect) {
+        if (!package->firmware || !package->firmware_size)
+            return -EINVAL;
+        sandbox_config.firmware_address = PH_SANDBOX_FIRMWARE_ADDRESS;
+        sandbox_config.firmware_size = package->firmware_size;
+        memcpy(sandbox_config.firmware_sha256, package->firmware_sha256, 32);
+        blobs[1] = (struct gpud_launch_blob){.bytes = package->firmware,
+            .size = package->firmware_size, .address = PH_SANDBOX_FIRMWARE_ADDRESS};
+        sandbox_config.log_endpoint_fd = config->log_endpoint_fd >= 16 ?
+            PH_SANDBOX_LOG_FD : 0;
+    }
+    struct pacha_process_fd_grant grants[2] = {
+        {.source_fd = (uint64_t)current->management.b,
+         .target_fd = PH_SANDBOX_CHANNEL_FD, .rights = PH_IPC_CHANNEL_RIGHTS,
+         .flags = PACHA_FD_FLAG_CLOEXEC},
+    };
+    if (inspect && config->log_endpoint_fd >= 16)
+        grants[1] = (struct pacha_process_fd_grant){
+            .source_fd = config->log_endpoint_fd,
+            .target_fd = PH_SANDBOX_LOG_FD,
+            .rights = PACHA_FD_RIGHT_SEND | PACHA_FD_RIGHT_CLOSE,
+            .flags = PACHA_FD_FLAG_CLOEXEC};
     struct gpud_launch_request launch_request = {.generation = generation,
         .load_bias = UINT64_C(0x40000000), .stack_address = UINT64_C(0x45000000),
         .stack_size = 256 * 1024, .image = package->sandbox,
-        .image_size = package->sandbox_size, .blobs = &blob, .blob_count = 1,
-        .grants = &grant, .grant_count = 1};
+        .image_size = package->sandbox_size, .blobs = blobs,
+        .blob_count = inspect ? 2 : 1,
+        .grants = grants,
+        .grant_count = inspect && config->log_endpoint_fd >= 16 ? 2 : 1};
     struct gpud_launch_resources launch_resources = {.generation = generation,
         .resource_set_id = GPUD_RESOURCE_SET_ID, .sandbox_id = GPUD_SANDBOX_ID,
         .request = &launch_request};
     memcpy(launch_resources.manifest_digest,
         package->identity.manifest_digest, 32);
     struct gpud_launch_transaction transaction = {0};
-    if (gpud_launch_begin(&transaction, controller, &current->launch,
-            &current->ipc,
-            &launch_resources) != KB2_STATUS_OK ||
-        gpud_launch_step(&transaction) != KB2_STATUS_OK || !transaction.completed) {
+    kb2_status_t begin_status = gpud_launch_begin(&transaction, controller,
+        &current->launch, &current->ipc, &launch_resources);
+    kb2_status_t step_status = begin_status == KB2_STATUS_OK ?
+        gpud_launch_step(&transaction) : begin_status;
+    if (begin_status != KB2_STATUS_OK || step_status != KB2_STATUS_OK ||
+        !transaction.completed) {
         printf("[gpud] stage=sandbox-launch status=%d\n", transaction.launch_error);
+        if (inspect) {
+            char detail[144];
+            int length = snprintf(detail, sizeof(detail),
+                "sandbox launch failed begin=%u step=%u native=%d cleanup=%d completed=%u",
+                begin_status, step_status, transaction.launch_error,
+                transaction.cleanup_error, transaction.completed);
+            if (length > 0 && (size_t)length < sizeof(detail))
+                log_runtime_event(config, detail, -EIO);
+        }
         return -5;
     }
+    if (inspect)
+        log_runtime_event(config, "sandbox process launched", 0);
     (void)pacha_fd_close(current->management.b);
     current->management.b = -1;
     if (gpud_process_watch_init(&current->watch, controller,
             &current->launch.process, &current->ipc,
             GPUD_RESOURCE_SET_ID, GPUD_SANDBOX_ID) != KB2_STATUS_OK) {
         printf("[gpud] stage=process-watch status=-5\n");
+        if (inspect)
+            log_runtime_event(config, "sandbox process watch failed", -EIO);
         return -5;
     }
     struct gpud_bootstrap_resources transfer = {.generation = generation,
         .resource_set_id = GPUD_RESOURCE_SET_ID, .sandbox_id = GPUD_SANDBOX_ID,
-        .items = package->items, .artifact_count = GPUD_PACKAGE_ARTIFACTS,
+        .items = package->items, .artifact_count = package->artifact_count,
         .resource_handle_count = 1};
     memcpy(transfer.manifest_digest, package->identity.manifest_digest, 32);
     struct gpud_bootstrap_transfer bootstrap = {0};
     if (gpud_bootstrap_begin(
             &bootstrap, controller, &current->ipc, &transfer) != KB2_STATUS_OK) {
         printf("[gpud] stage=bootstrap-begin status=-5\n");
+        if (inspect)
+            log_runtime_event(config, "sandbox module transfer setup failed", -EIO);
         return -5;
     }
+    struct timespec transfer_started = {0};
+    if (inspect && clock_gettime(CLOCK_MONOTONIC, &transfer_started))
+        return -EIO;
     while (!bootstrap.completed) {
         kb2_status_t status = gpud_bootstrap_step(&bootstrap);
         if (status != KB2_STATUS_OK && status != KB2_STATUS_ACTION_PENDING) {
             printf("[gpud] stage=bootstrap-transfer status=%u native=%d\n",
                 status, bootstrap.native_error);
+            if (inspect)
+                log_runtime_event(config, "sandbox module transfer failed",
+                    bootstrap.native_error ? bootstrap.native_error : -EIO);
             return -5;
         }
+        if (inspect && !bootstrap.completed) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now))
+                return -EIO;
+            if (now.tv_sec - transfer_started.tv_sec >= 180)
+                return -ETIMEDOUT;
+            int command = manual_control((int)config->filed_endpoint_fd);
+            if (command == 2)
+                return -ECANCELED;
+            if (command < 0)
+                return command;
+            if (bootstrap.native_error == -EAGAIN ||
+                bootstrap.native_error == -ENOMEM) {
+                struct pacha_pollfd events[2] = {
+                    {.fd = current->ipc.fd,
+                     .events = PACHA_FD_EVENT_WRITABLE | PACHA_FD_EVENT_HANGUP},
+                    {.fd = current->launch.process.fd,
+                     .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
+                };
+                long waited = pacha_fd_wait_many(events, 2, 1000);
+                if (waited == PACHA_ERR_NOT_READY)
+                    continue;
+                if (waited < 0 || events[1].revents ||
+                    (events[0].revents & PACHA_FD_EVENT_HANGUP))
+                    return -EPIPE;
+            }
+        }
     }
+    if (inspect)
+        log_runtime_event(config, "sandbox modules transferred", 0);
     if (gpud_lifecycle_init(
             &current->lifecycle, &current->watch) != KB2_STATUS_OK) {
         printf("[gpud] stage=lifecycle-init status=-5\n");
+        if (inspect)
+            log_runtime_event(config, "Linux lifecycle setup failed", -EIO);
         return -5;
     }
+    struct timespec inspect_started = {0};
+    if (inspect && clock_gettime(CLOCK_MONOTONIC, &inspect_started))
+        return -EIO;
     for (;;) {
+        if (inspect) {
+            struct timespec now;
+            if (clock_gettime(CLOCK_MONOTONIC, &now))
+                return -EIO;
+            if (now.tv_sec - inspect_started.tv_sec >= 180)
+                return -ETIMEDOUT;
+        }
+        const unsigned previous_progress = current->lifecycle.progress_count;
         kb2_status_t status = gpud_lifecycle_ready(&current->lifecycle);
+        if (current->lifecycle.progress_count != previous_progress)
+            log_progress(config, package, &current->lifecycle);
         if (status == KB2_STATUS_OK)
             break;
-        if (status != KB2_STATUS_ACTION_PENDING ||
-            wait_readable(current->ipc.fd, current->launch.process.fd)) {
+        int waited = status == KB2_STATUS_ACTION_PENDING ?
+            wait_readable(current->ipc.fd, current->launch.process.fd,
+                inspect ? 1000 : PACHA_FD_WAIT_FOREVER) : -EIO;
+        if (inspect && waited == -ETIMEDOUT) {
+            int command = manual_control((int)config->filed_endpoint_fd);
+            if (command == 2)
+                return -ECANCELED;
+            if (command < 0)
+                return command;
+            continue;
+        }
+        if (status != KB2_STATUS_ACTION_PENDING || waited) {
             printf("[gpud] stage=sandbox-ready status=%u native=%d\n",
                 status, current->lifecycle.native_error);
+            if (inspect)
+                log_probe_failure(config, &current->lifecycle);
             return -5;
         }
     }
@@ -430,6 +831,9 @@ static int start_generation(const struct gpud_boot_config *config,
         return error;
 
     current->service.backend_client = sandbox_config.client_id;
+    current->service.profile_kind = inspect ? KB2_GPU_PROFILE_AMDGPU :
+        KB2_GPU_PROFILE_VIRGL;
+    current->service.log_endpoint_fd = (int)config->log_endpoint_fd;
     current->service.gpu.ipc = &current->ipc;
     current->service.gpu.channel = &current->gpu_channel;
     current->service.gpu.mapping = current->gpu_mapping;
@@ -446,17 +850,35 @@ static int start_generation(const struct gpud_boot_config *config,
 }
 
 static int serve_generation(
-    struct gpud_generation *current, int *control_fd, int *forced) {
+    struct gpud_generation *current, int filed_fd, int *control_fd, int inspect,
+    int *forced, int *stop_requested) {
     *forced = 0;
+    *stop_requested = 0;
     for (;;) {
+        if (inspect) {
+            int command = manual_control(filed_fd);
+            if (command == 2) {
+                *stop_requested = 1;
+                return 0;
+            }
+            if (command < 0)
+                return command;
+        }
         int control = receive_control(*control_fd, current->id);
+        if (control == GPUD_CONTROL_STOP ||
+            (inspect && control == GPUD_CONTROL_PEER_CLOSED)) {
+            *stop_requested = 1;
+            return 0;
+        }
         if (control == GPUD_CONTROL_PEER_CLOSED) {
             (void)pacha_fd_close(*control_fd);
             *control_fd = -1;
         } else if (control == GPUD_CONTROL_FORCE_RESTART) {
+            if (inspect)
+                return -EOPNOTSUPP;
             int error = terminate_sandbox(&current->launch, current->id);
             if (error)
-                return error;
+                return -EIO;
             printf("[gpud] sandbox-force-killed generation=%llu\n",
                 (unsigned long long)current->id);
             *forced = 1;
@@ -476,21 +898,55 @@ static int serve_generation(
         if (error != -EAGAIN)
             return error;
         error = wait_service(&current->service, current->service.endpoint_fd,
-            current->launch.process.fd, *control_fd);
+            current->launch.process.fd, *control_fd,
+            inspect ? 1000 : PACHA_FD_WAIT_FOREVER);
+        if (inspect && error == -EAGAIN)
+            continue;
         if (error)
             return error;
     }
 }
 
 static int run(const struct gpud_boot_config *config) {
+    struct gpud_boot_config active = *config;
     struct gpud_package package = {0};
-    int error = gpud_package_open(&package,
-        (int)config->filed_endpoint_fd, (int)config->device_fd);
-    if (error) {
-        printf("[gpud] stage=package-open status=%d\n", error);
+    struct gpud_discovery discovery = {0};
+    int error;
+    if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT &&
+        (error = wait_manual_probe(config))) {
+        log_runtime_event(config, "manual probe not started", error);
         return error;
     }
-    printf("[gpud] package artifacts=%u\n", GPUD_PACKAGE_ARTIFACTS);
+    if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT &&
+        (error = refresh_inspection_policy(&active))) {
+        log_runtime_event(config, "RAM GPU package policy rejected", error);
+        return error;
+    }
+    config = &active;
+    if (config->backend == GPUD_BACKEND_VIRTIO) {
+        error = gpud_package_open(&package,
+            (int)config->filed_endpoint_fd, (int)config->device_fd);
+    } else {
+        error = gpud_package_open_at(&package,
+            (int)config->filed_endpoint_fd, (int)config->device_fd,
+            config->package_root, config->firmware_sha256,
+            config->manifest_sha256, config->sandbox_sha256);
+    }
+    if (error) {
+        printf("[gpud] stage=package-open status=%d\n", error);
+        log_runtime_event(config, "package verification failed", error);
+        return error;
+    }
+    printf("[gpud] package artifacts=%zu\n", package.artifact_count);
+    error = gpud_discovery_prepare(&discovery, package.device_fd,
+        config->backend == GPUD_BACKEND_VIRTIO);
+    if (error) {
+        log_runtime_event(config, "DRM discovery capability snapshot failed", error);
+        (void)gpud_package_close(&package);
+        return error;
+    }
+    if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT)
+        log_runtime_event(config, "package manifest, sandbox and firmware verified", 0);
 
     kb2_controller_t *controller = NULL;
     if (kb2_controller_create(controller_allocate, controller_deallocate, NULL,
@@ -499,8 +955,17 @@ static int run(const struct gpud_boot_config *config) {
         kb2_controller_start(controller) != KB2_STATUS_OK) {
         error = error ? error : -5;
         printf("[gpud] stage=controller-config status=%d\n", error);
+        log_runtime_event(config, "controller configuration failed", error);
         return error;
     }
+
+    if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT &&
+        (error = request_display_release(config))) {
+        log_runtime_event(config, "GOP display handoff failed", error);
+        return error;
+    }
+    if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT)
+        log_runtime_event(config, "GOP display MMIO released", 0);
 
     uint64_t handle_sequence = 0;
     int control_fd = (int)config->control_channel_fd;
@@ -512,12 +977,63 @@ static int run(const struct gpud_boot_config *config) {
         static struct gpud_generation current;
         error = start_generation(
             config, controller, &package, handle_sequence, &current);
-        if (error)
+        if (error) {
+            if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT) {
+                /* Startup may fail after the PCI grant reached Linux. The
+                 * owner must quarantine DMA before it returns an error or
+                 * lets the process tree disappear. */
+                const int quarantine = pacha_capsule_dma_set_enabled(
+                    package.device_fd, 0);
+                printf("[gpud] startup quarantine status=%d generation=%llu\n",
+                    quarantine, (unsigned long long)current.id);
+                log_runtime_event(config, "startup DMA quarantine", quarantine);
+                if (current.launch.process.fd >= 16) {
+                    /* Preserve the terminal reason before cleanup's KILL can
+                     * replace it. An early native failure may have no Linux
+                     * lifecycle packet and no usable serial console. */
+                    const int observed = gpud_native_process_poll(
+                        &current.launch.process, current.id);
+                    if (!observed) {
+                        char detail[160];
+                        const struct gpud_process_exit *exit =
+                            &current.launch.process.exit;
+                        const int length = snprintf(detail, sizeof(detail),
+                            "sandbox exit state=%llu code=%llu principal=%llu",
+                            (unsigned long long)exit->state,
+                            (unsigned long long)exit->code,
+                            (unsigned long long)exit->principal);
+                        if (length > 0 && (size_t)length < sizeof(detail))
+                            log_runtime_event(config, detail, 0);
+                    } else if (observed != -EAGAIN) {
+                        log_runtime_event(config, "sandbox exit observation failed", observed);
+                    }
+                    int killed = gpud_native_process_terminate(
+                        &current.launch.process, current.id, 9);
+                    if (killed == -EAGAIN &&
+                        !wait_process_bounded(current.launch.process.fd))
+                        killed = gpud_native_process_poll(
+                            &current.launch.process, current.id);
+                    printf("[gpud] startup process stop status=%d\n", killed);
+                    log_runtime_event(config, "startup process stop", killed);
+                }
+            }
+            log_runtime_event(config, "sandbox startup failed", error);
             return error;
+        }
+        error = gpud_discovery_publish(&discovery, (int)config->filed_endpoint_fd);
+        if (error) {
+            log_runtime_event(config, "DRM discovery publication failed", error);
+            (void)stop_generation(controller, &package, &current,
+                &handle_sequence, config->backend == GPUD_BACKEND_PCI_DRM_INSPECT);
+            return error;
+        }
+        log_runtime_event(config, "DRM render node and PCI discovery published", 0);
         if (current.id == 1 && (error = send_ready(config, 0)))
             return error;
         printf("[gpud] ready generation=%llu\n",
             (unsigned long long)current.id);
+        if (config->backend == GPUD_BACKEND_PCI_DRM_INSPECT)
+            log_runtime_event(config, "PCI DRM probe ready", 0);
         if (notify_restart) {
             error = send_restarted(control_fd, current.id);
             if (error)
@@ -525,9 +1041,37 @@ static int run(const struct gpud_boot_config *config) {
             notify_restart = 0;
         }
 
-        int forced = 0;
+        int forced = 0, stop_requested = 0;
         const int restart_error = serve_generation(
-            &current, &control_fd, &forced);
+            &current, (int)config->filed_endpoint_fd, &control_fd,
+            config->backend == GPUD_BACKEND_PCI_DRM_INSPECT,
+            &forced, &stop_requested);
+        int discovery_error = gpud_discovery_remove(&discovery,
+            (int)config->filed_endpoint_fd);
+        if (discovery_error)
+            log_runtime_event(config, "DRM discovery removal failed", discovery_error);
+        if (stop_requested || config->backend == GPUD_BACKEND_PCI_DRM_INSPECT) {
+            if (!stop_requested) {
+                /* An inspection probe is one-shot; never auto-reprobe a
+                 * physical GPU after an unexpected process exit. */
+                if (gpud_process_observe(&current.watch, current.id) != KB2_STATUS_OK)
+                    (void)pacha_capsule_dma_set_enabled(package.device_fd, 0);
+            }
+            error = stop_generation(controller, &package, &current,
+                &handle_sequence,
+                config->backend == GPUD_BACKEND_PCI_DRM_INSPECT);
+            printf("[gpud] generation=%llu stopped status=%d cause=%d\n",
+                (unsigned long long)current.id, error, restart_error);
+            log_runtime_event(config, "PCI DRM probe stopped", error ? error : restart_error);
+            if (error)
+                (void)pacha_capsule_dma_set_enabled(package.device_fd, 0);
+            if (!error)
+                error = gpud_package_close(&package);
+            kb2_controller_destroy(controller);
+            if (control_fd >= 16)
+                (void)pacha_fd_close(control_fd);
+            return error ? error : restart_error;
+        }
         printf("[gpud] generation=%llu fault=%d restarting\n",
             (unsigned long long)current.id, restart_error);
         current.service.error = restart_error;
@@ -553,12 +1097,22 @@ int main(int argc, char **argv) {
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         config.magic != GPUD_BOOT_CONFIG_MAGIC ||
         config.version != GPUD_BOOT_CONFIG_VERSION ||
-        config.drm_endpoint_fd < 16 || config.device_fd < 16 ||
+        (config.backend != GPUD_BACKEND_VIRTIO &&
+         config.backend != GPUD_BACKEND_PCI_DRM_INSPECT) ||
+        config.package_root[sizeof(config.package_root) - 1] != 0 ||
+        (config.backend == GPUD_BACKEND_VIRTIO &&
+         (config.drm_endpoint_fd < 16 ||
+          strcmp(config.package_root, "/srv/kobox2"))) ||
+        (config.backend == GPUD_BACKEND_PCI_DRM_INSPECT &&
+         (config.log_endpoint_fd < 16 || config.drm_endpoint_fd < 16)) ||
+        config.device_fd < 16 ||
         config.filed_endpoint_fd < 16 || config.control_channel_fd < 16 ||
-        config.ready_channel_fd < 16)
+        config.ready_channel_fd < 16 ||
+        (config.log_endpoint_fd != 0 && config.log_endpoint_fd < 16))
         return 1;
     int status = run(&config);
     fprintf(stderr, "[gpud] stopped status=%d\n", status);
-    (void)send_ready(&config, status);
-    return 1;
+    if (status)
+        (void)send_ready(&config, status);
+    return status ? 1 : 0;
 }

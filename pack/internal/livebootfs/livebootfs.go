@@ -2,7 +2,6 @@ package livebootfs
 
 import (
 	"bytes"
-	"compress/zlib"
 	"crypto/sha256"
 	"debug/elf"
 	"encoding/base64"
@@ -27,13 +26,11 @@ const (
 	OutputDir    = ".artifacts/live-bootfs"
 	ManifestName = "bootfs.generated.txt"
 	ImageName    = "BOOTFS.IMG"
-	// Limine boot copies INITAPP.ELF and the archive into this same kernel scratch.
-	// Keep this in sync with kernel/src/boot/boot_scratch.zig.
+	// Only seed0boot and a page-address list use fixed kernel scratch. Bootfs
+	// contents are staged in allocated physical pages before the CR3 switch.
 	bootScratchBytes = 32 * 1024 * 1024
-	maxLiveRootBytes = 64 * 1024 * 1024
-	// A content header identifies a packed inner bootfs independently of its
-	// archive pathname. The following uint64 is the expanded byte count.
-	packedRootMagic = "PACHAZ1\x00"
+	maxBootfsBytes   = 192 * 1024 * 1024
+	maxLiveRootBytes = 192 * 1024 * 1024
 )
 
 type Spec struct {
@@ -45,6 +42,8 @@ type Spec struct {
 type Options struct {
 	NoBuild            bool
 	AuthorizedKeysPath string
+	OverlaySpecPath    string
+	OutputDir          string
 }
 
 type Result struct {
@@ -94,6 +93,27 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if opts.OverlaySpecPath != "" {
+		if opts.OutputDir == "" {
+			return Result{}, fmt.Errorf("live bootfs: an overlay requires a separate output directory")
+		}
+		overlay, err := LoadSpec(workspace.Path(opts.OverlaySpecPath))
+		if err != nil {
+			return Result{}, err
+		}
+		for destination, appID := range overlay.Files {
+			if _, exists := spec.Files[destination]; exists {
+				return Result{}, fmt.Errorf("live bootfs: overlay replaces %s", destination)
+			}
+			spec.Files[destination] = appID
+		}
+		for appID, digest := range overlay.SHA256 {
+			if existing, exists := spec.SHA256[appID]; exists && existing != digest {
+				return Result{}, fmt.Errorf("live bootfs: overlay changes sha256 for %s", appID)
+			}
+			spec.SHA256[appID] = digest
+		}
+	}
 	selected := make(map[string]config.App)
 	paths := make([]string, 0, len(spec.Files))
 	for destination, appID := range spec.Files {
@@ -140,6 +160,9 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 	}
 
 	outputDir := workspace.Path(OutputDir)
+	if opts.OutputDir != "" {
+		outputDir = workspace.Path(opts.OutputDir)
+	}
 	manifestPath := filepath.Join(outputDir, ManifestName)
 	imagePath := filepath.Join(outputDir, ImageName)
 	var manifest strings.Builder
@@ -202,7 +225,7 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 		upperBound += int64(len(destination) + len(key) + 64)
 	}
 	if upperBound >= maxLiveRootBytes {
-		return Result{}, fmt.Errorf("live bootfs: estimated RAM root %d bytes exceeds 64 MiB limit", upperBound)
+		return Result{}, fmt.Errorf("live bootfs: estimated RAM root %d bytes exceeds %d-byte limit", upperBound, maxLiveRootBytes)
 	}
 	if err := validateELFClosure(workspace, spec, paths, available); err != nil {
 		return Result{}, err
@@ -219,75 +242,22 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	if image.Bytes >= maxLiveRootBytes {
-		return Result{}, fmt.Errorf("live bootfs: RAM root archive %d bytes exceeds 64 MiB limit", image.Bytes)
+		return Result{}, fmt.Errorf("live bootfs: RAM root archive %d bytes exceeds %d-byte limit", image.Bytes, maxLiveRootBytes)
 	}
-	if fitsBootScratch(initBytes, initLoadBytes, int64(image.Bytes)) {
-		data, err := os.ReadFile(rootImagePath)
-		if err != nil {
-			return Result{}, err
-		}
-		if err := writeIfChanged(imagePath, data); err != nil {
-			return Result{}, err
-		}
-		return Result{Manifest: manifestPath, Image: imagePath, Entries: image.Entries, Bytes: int64(image.Bytes)}, nil
+	if !fitsBootScratch(initBytes, initLoadBytes, int64(image.Bytes)) {
+		return Result{}, fmt.Errorf("live bootfs: archive %d bytes exceeds boot staging capacity", image.Bytes)
 	}
-	// The boot scratch stages only the outer archive. filed expands this
-	// immutable inner archive into its RAM root after boot.
-	filedID := spec.Files["/sbin/filed.elf"]
-	profileID := spec.Files["/etc/pacha/boot-profile"]
-	rootID := spec.Files["/sbin/seed0root.elf"]
-	if filedID == "" || profileID == "" || rootID == "" {
-		return Result{}, fmt.Errorf("live bootfs: large archive needs filed, seed0root and boot profile in the outer archive")
-	}
+	// Directly stage the bounded archive in scattered boot pages. A packed
+	// inner root needs one process-sized decompression allocation and fails
+	// for Mesa's 155 MiB runtime even when physical RAM is abundant.
 	data, err := os.ReadFile(rootImagePath)
 	if err != nil {
 		return Result{}, err
 	}
-	var compressed bytes.Buffer
-	var length [8]byte
-	binary.LittleEndian.PutUint64(length[:], uint64(len(data)))
-	compressed.WriteString(packedRootMagic)
-	compressed.Write(length[:])
-	writer, err := zlib.NewWriterLevel(&compressed, zlib.BestCompression)
-	if err != nil {
+	if err := writeIfChanged(imagePath, data); err != nil {
 		return Result{}, err
 	}
-	if _, err := writer.Write(data); err != nil {
-		return Result{}, err
-	}
-	if err := writer.Close(); err != nil {
-		return Result{}, err
-	}
-	compressedPath := filepath.Join(outputDir, "ROOTFS.Z")
-	if err := writeIfChanged(compressedPath, compressed.Bytes()); err != nil {
-		return Result{}, err
-	}
-	outerManifestPath := filepath.Join(outputDir, "limine-bootfs.generated.txt")
-	var outer strings.Builder
-	outer.WriteString("# Generated by pacgo live-bootfs. DO NOT EDIT.\n")
-	for _, item := range []struct{ destination, source string }{
-		{"/etc/pacha/boot-profile", workspace.ArtifactPath(selected[profileID])},
-		{"/sbin/filed.elf", workspace.ArtifactPath(selected[filedID])},
-		{"/sbin/seed0root.elf", workspace.ArtifactPath(selected[rootID])},
-		{"/srv/live-rootfs.z", compressedPath},
-	} {
-		rel, err := filepath.Rel(outputDir, item.source)
-		if err != nil {
-			return Result{}, err
-		}
-		fmt.Fprintf(&outer, "%s=%s\n", item.destination, filepath.ToSlash(rel))
-	}
-	if err := writeIfChanged(outerManifestPath, []byte(outer.String())); err != nil {
-		return Result{}, err
-	}
-	outerImage, err := bootfs.BuildImage(outerManifestPath, imagePath)
-	if err != nil {
-		return Result{}, err
-	}
-	if !fitsBootScratch(initBytes, initLoadBytes, int64(outerImage.Bytes)) {
-		return Result{}, fmt.Errorf("live bootfs: compressed outer archive %d bytes plus init %d bytes exceeds %d-byte boot scratch", outerImage.Bytes, initBytes, bootScratchBytes)
-	}
-	return Result{Manifest: outerManifestPath, Image: imagePath, Entries: image.Entries, Bytes: int64(outerImage.Bytes)}, nil
+	return Result{Manifest: manifestPath, Image: imagePath, Entries: image.Entries, Bytes: int64(image.Bytes)}, nil
 }
 
 func validateAuthorizedKey(data []byte) error {
@@ -346,13 +316,14 @@ func bootInitScratchUse(filename string) (imageBytes, loadBytes int64, err error
 
 func fitsBootScratch(initBytes, initLoadBytes, archiveBytes int64) bool {
 	if initBytes <= 0 || initLoadBytes <= 0 || archiveBytes < 0 ||
-		initBytes > bootScratchBytes || initLoadBytes > bootScratchBytes || archiveBytes > bootScratchBytes {
+		initBytes > bootScratchBytes || initLoadBytes > bootScratchBytes || archiveBytes > maxBootfsBytes {
 		return false
 	}
 	align8 := func(n int64) int64 { return (n + 7) &^ 7 }
-	// Bootfs is freed before the init ELF load window is allocated, but the
-	// original init image remains in scratch throughout both stages.
-	return align8(initBytes)+align8(archiveBytes) <= bootScratchBytes &&
+	// The address list is kept until the init VMO has copied all staged pages.
+	pages := (archiveBytes + 4095) / 4096
+	metadataBytes := pages * 8
+	return align8(initBytes)+align8(metadataBytes) <= bootScratchBytes &&
 		align8(initBytes)+align8(initLoadBytes) <= bootScratchBytes
 }
 

@@ -93,7 +93,7 @@ void filed_tmpfs_backend_init(filed_tmpfs_backend_t *backend)
     }
     backend->free_page_count = FILED_TMPFS_PAGE_POOL_PAGES;
     for (size_t i = 0; i < FILED_TMPFS_PAGE_POOL_PAGES; ++i) {
-        backend->free_page_stack[i] = (uint16_t)(FILED_TMPFS_PAGE_POOL_PAGES - i);
+        backend->free_page_stack[i] = (uint32_t)(FILED_TMPFS_PAGE_POOL_PAGES - i);
     }
     for (size_t i = 0; i < FILED_TMPFS_CHILD_HASH_BUCKETS; ++i) {
         backend->child_hash_buckets[i] = FILED_TMPFS_NO_SLOT;

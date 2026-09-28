@@ -1,6 +1,16 @@
 #include <assert.h>
 #include "../userland/gpud/drm_service.c"
 
+static char diagnostic[256];
+int pacha_log_emit(int endpoint_fd, unsigned source, const char *message, size_t length)
+{
+    assert(endpoint_fd == 29 && source == PACHA_LOG_SOURCE_GPUD);
+    assert(length < sizeof(diagnostic));
+    memcpy(diagnostic, message, length);
+    diagnostic[length] = 0;
+    return 0;
+}
+
 static unsigned char page[GPUD_DRM_PAGE_BYTES];
 static unsigned char auxiliary[GPUD_DRM_AUX_REUSE_BYTES];
 static uint64_t auxiliary_size = sizeof(auxiliary), auxiliary_rights;
@@ -180,6 +190,38 @@ int main(void)
 {
     static struct gpud_drm_service service;
     service.endpoint_fd = 16; service.backend_client = 1; service.files.generation = 1;
+    /* The optional physical GPU endpoint is published before manual probe.
+     * Both the cached-page handshake and uncached request must fail promptly. */
+    queued = (struct pacha_ipc_msg){.word0 = GPUD_DRM_BIND_PAGE_REQUEST_MAGIC,
+        .fd_count = 3};
+    queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
+    queued_fds[1] = (struct pacha_ipc_fd){.fd = 21};
+    queued_fds[2] = (struct pacha_ipc_fd){.fd = 22};
+    ready_fd = 16;
+    assert(!gpud_drm_service_reject_unavailable(16));
+    assert(last_reply.word0 == GPUD_DRM_BIND_PAGE_REPLY_MAGIC &&
+        (int64_t)last_reply.word1 == -ENODEV);
+    pacha_service_envelope_t *offline_header = (void *)page;
+    *offline_header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
+        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = GPUD_DRM_SERVICE_ID,
+        .op = GPUD_DRM_OP_OPEN_NODE, .request_id = 17};
+    queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word3 = 17, .fd_count = 2};
+    queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
+    queued_fds[1] = (struct pacha_ipc_fd){.fd = 22};
+    ready_fd = 16;
+    assert(!gpud_drm_service_reject_unavailable(16));
+    assert(offline_header->magic == PACHA_SERVICE_REPLY_MAGIC &&
+        offline_header->status == -ENODEV && last_reply.word3 == 17);
+    assert(maps == 1 && unmaps == 1);
+    queued = (struct pacha_ipc_msg){.word0 = GPUD_DRM_INLINE_IOCTL_REQUEST_MAGIC,
+        .word2 = UINT64_C(0xc010640c), .fd_count = 1};
+    queued_fds[0] = (struct pacha_ipc_fd){.fd = 22};
+    ready_fd = 16;
+    assert(!gpud_drm_service_reject_unavailable(16));
+    assert(last_reply.word0 == GPUD_DRM_INLINE_IOCTL_REPLY_MAGIC &&
+        (int64_t)last_reply.word1 == -ENODEV && last_reply.word2 == queued.word2);
+    maps = unmaps = closes = replies = 0;
     auxiliary_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
     struct pacha_ipc_fd auxiliary_fd = {.fd = 23, .rights = auxiliary_rights};
     assert(valid_aux_fd(&auxiliary_fd, sizeof(auxiliary)));
@@ -246,6 +288,17 @@ int main(void)
     uint64_t handle;
     assert(!gpud_drm_file_open_begin(&service.files, 1, &handle));
     assert(!gpud_drm_file_open_finish(&service.files, 1, handle, 7, 0));
+    service.profile_kind = KB2_GPU_PROFILE_AMDGPU;
+    service.log_endpoint_fd = 29;
+    gpud_drm_ioctl_request_t unsupported = {.handle = handle,
+        .request = UINT32_C(0xc004644f), .arg_size = 4, .data_size = 4};
+    memcpy(unsupported.data, "test", 4);
+    assert(ioctl_request(&service, &unsupported) == -EOPNOTSUPP);
+    assert(strstr(diagnostic, "phase=translate request=0xc004644f") != NULL);
+    assert(strstr(diagnostic, "arg=4 wire=4 aux=0") != NULL);
+    assert(strstr(diagnostic, "test") == NULL);
+    service.profile_kind = 0;
+    service.log_endpoint_fd = 0;
     service.gpu.mapping = calloc(1, GPUD_GPU_AUX_OFFSET + sizeof(auxiliary));
     assert(service.gpu.mapping);
     before = unmaps; int before_maps = maps;

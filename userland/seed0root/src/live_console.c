@@ -346,6 +346,7 @@ static uint32_t cell_color(VTermScreen *screen, VTermColor color, uint32_t fallb
 static void render(struct live_console *console)
 {
     vterm_screen_flush_damage(console->screen);
+    if (console->pixels == NULL) return;
     for (int row = 0; row < console->rows; row++) {
         for (int col = 0; col < console->cols; col++) {
             VTermScreenCell cell;
@@ -1000,6 +1001,24 @@ int live_console_run(struct live_console *console,
     }
     (void)pacha_fd_close(timer_fd);
     return status;
+}
+
+int live_console_release_framebuffer(struct live_console *console)
+{
+    if (console == NULL) return -22;
+    if (console->mmio_fd < 16) return 0;
+    /* Rendering must stop before the final close. That close revokes the UC
+     * physical lease; the still-live shell and termd remain reachable by SSH. */
+    console->pixels = NULL;
+    if (pacha_fd_close(console->mmio_fd) != 0) return -5;
+    console->mmio_fd = -1;
+    if (console->framebuffer_reservation != NULL) {
+        (void)pacha_munmap(console->framebuffer_reservation,
+            console->framebuffer_reservation_size);
+        console->framebuffer_reservation = NULL;
+        console->framebuffer_reservation_size = 0;
+    }
+    return 0;
 }
 
 void live_console_destroy(struct live_console *console)

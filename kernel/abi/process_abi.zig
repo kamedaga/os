@@ -1,7 +1,7 @@
 pub const spawn_flag_bootstrap_page_writable: u64 = 1 << 0;
 
-pub const syscall_process_first: u64 = 2;
-pub const syscall_process_create: u64 = 2;
+pub const syscall_process_first: u64 = 3;
+pub const syscall_process_create: u64 = 3;
 // PROCESS_CREATE: rdi=process flags, rsi=process handle rights,
 // rdx=handle flags, r10=grant array, r8=count. No ambient FD inheritance.
 pub const process_create_max_grants: usize = 64;
@@ -11,32 +11,32 @@ pub const ProcessFdGrant = extern struct {
     rights: u64,
     flags: u64,
 };
-pub const syscall_process_kill: u64 = 3;
-pub const syscall_process_wait: u64 = 4;
-pub const syscall_process_exit: u64 = 5;
-pub const syscall_thread_create: u64 = 6;
-pub const syscall_thread_start: u64 = 7;
+pub const syscall_process_kill: u64 = 4;
+pub const syscall_process_wait: u64 = 5;
+pub const syscall_process_exit: u64 = 6;
+pub const syscall_thread_create: u64 = 7;
+pub const syscall_thread_start: u64 = 8;
 // THREAD_CONTEXT: rdi=thread capability, rsi=GET/SET, rdx=context, r10=size.
 // Only a suspended, CPU-quiescent thread without an active wait/fault qualifies.
-pub const syscall_thread_context: u64 = 8;
-pub const syscall_thread_kill: u64 = 9;
-pub const syscall_thread_wait: u64 = 10;
-pub const syscall_thread_exit: u64 = 11;
-pub const syscall_thread_signal: u64 = 12;
-pub const syscall_process_signal: u64 = 13;
-pub const syscall_process_signal_ctl: u64 = 14;
-pub const syscall_process_stop: u64 = 15;
-pub const syscall_process_continue: u64 = 16;
-pub const syscall_thread_set_fs_base: u64 = 17;
-pub const syscall_thread_set_gs_base: u64 = 18;
-pub const syscall_process_clone: u64 = 19;
-pub const syscall_process_map: u64 = 20;
-pub const syscall_process_map_batch: u64 = 21;
+pub const syscall_thread_context: u64 = 9;
+pub const syscall_thread_kill: u64 = 10;
+pub const syscall_thread_wait: u64 = 11;
+pub const syscall_thread_exit: u64 = 12;
+pub const syscall_thread_signal: u64 = 13;
+pub const syscall_process_signal: u64 = 14;
+pub const syscall_process_signal_ctl: u64 = 15;
+pub const syscall_process_stop: u64 = 16;
+pub const syscall_process_continue: u64 = 17;
+pub const syscall_thread_set_fs_base: u64 = 18;
+pub const syscall_thread_set_gs_base: u64 = 19;
+pub const syscall_process_clone: u64 = 20;
+pub const syscall_process_map: u64 = 21;
+pub const syscall_process_map_batch: u64 = 22;
 // UNMAP: rdi=process MAP_INTO capability, rsi=VA, rdx=length, r10=0.
 // Synchronous range invalidation, including every CPU's cached translations.
-pub const syscall_process_unmap: u64 = 22;
-pub const syscall_process_exec_from: u64 = 23;
-pub const syscall_process_memory_barrier: u64 = 24;
+pub const syscall_process_unmap: u64 = 23;
+pub const syscall_process_exec_from: u64 = 24;
+pub const syscall_process_memory_barrier: u64 = 25;
 pub const syscall_process_last: u64 = syscall_process_memory_barrier;
 pub const syscall_process_count: u64 = syscall_process_last - syscall_process_first + 1;
 
@@ -72,9 +72,26 @@ pub const thread_flag_none: u64 = 0;
 pub const thread_context_get: u64 = 0;
 pub const thread_context_set: u64 = 1;
 pub const ThreadRegisters = extern struct {
-    r15: u64, r14: u64, r13: u64, r12: u64, r11: u64, r10: u64, r9: u64, r8: u64,
-    rbp: u64, rdi: u64, rsi: u64, rdx: u64, rcx: u64, rbx: u64, rax: u64,
-    rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64,
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    r11: u64,
+    r10: u64,
+    r9: u64,
+    r8: u64,
+    rbp: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rcx: u64,
+    rbx: u64,
+    rax: u64,
+    rip: u64,
+    cs: u64,
+    rflags: u64,
+    rsp: u64,
+    ss: u64,
 };
 // Native architectural state, not a Linux ptrace or syscall frame. XSAVE uses
 // the same validated standard x87/SSE/AVX format as native notification return.

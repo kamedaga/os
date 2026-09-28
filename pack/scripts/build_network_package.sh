@@ -81,7 +81,7 @@ python3 "$source_tree/kobox/boot/build_boot_runtime.py" \
     --link --jobs "$jobs"
 bash "$repo_root/userland/kobox2_adapter/build-sandbox.sh" \
     "$output/sandbox.elf" --net
-python3 "$source_tree/kobox/manifest/build_network_package.py" \
+python3 "$source_tree/kobox/manifest/build_pci_package.py" \
     --inventory "$output/closure-inventory.json" \
     --runtime-dir "$output/runtime" --output-dir "$output" \
     --protocol-dir "$repo_root/kobox2/protocol"

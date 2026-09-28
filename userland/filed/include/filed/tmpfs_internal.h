@@ -11,16 +11,17 @@ enum {
      * Desktop + WebKit exhausted 128 inodes with data pages still free. */
     FILED_TMPFS_MAX_INODES = 256,
     FILED_TMPFS_MAX_DENTRIES = 512,
-    /* Bounded backing budget, allocated only for nonzero written pages.
-     * Browser temporary files alone exceeded the old 16 MiB global pool. */
-    FILED_TMPFS_PAGE_POOL_PAGES = 16384,
+    /* The optional Mesa live image keeps a compressed archive plus its
+     * extracted runtime in RAM. Backing pages are still allocated on demand;
+     * the 512 MiB budget is shared by root, /run, /tmp and driver packages. */
+    FILED_TMPFS_PAGE_POOL_PAGES = 131072,
     FILED_TMPFS_CHILD_HASH_BUCKETS = 256,
     FILED_TMPFS_NO_SLOT = 0xffffu,
 };
 
 typedef struct filed_tmpfs_page {
     bool used;
-    uint16_t next_inode_page;
+    uint32_t next_inode_page;
     uint32_t file_page_index;
     uint8_t *data;
 } filed_tmpfs_page_t;
@@ -37,10 +38,12 @@ typedef struct filed_tmpfs_inode {
     uint64_t rdev;
     uint32_t nlink;
     filed_vnode_kind_t kind;
-    uint16_t allocated_page_count;
+    uint32_t allocated_page_count;
     /* Page ownership metadata belongs to the global page pool, not a large
-     * fixed array per inode. A single file may use the existing 64 MiB pool. */
-    uint16_t first_allocated_page;
+     * fixed array per inode. A single file may use the bounded global pool. */
+    uint32_t first_allocated_page;
+    uint32_t last_allocated_page;
+    uint32_t lookup_page;
 } filed_tmpfs_inode_t;
 
 typedef struct filed_tmpfs_dentry {
@@ -63,7 +66,7 @@ struct filed_tmpfs_backend {
     uint32_t free_page_count;
     uint16_t free_inode_stack[FILED_TMPFS_MAX_INODES];
     uint16_t free_dentry_stack[FILED_TMPFS_MAX_DENTRIES];
-    uint16_t free_page_stack[FILED_TMPFS_PAGE_POOL_PAGES];
+    uint32_t free_page_stack[FILED_TMPFS_PAGE_POOL_PAGES];
     uint16_t child_hash_buckets[FILED_TMPFS_CHILD_HASH_BUCKETS];
     filed_tmpfs_inode_t inodes[FILED_TMPFS_MAX_INODES];
     filed_tmpfs_dentry_t dentries[FILED_TMPFS_MAX_DENTRIES];

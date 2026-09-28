@@ -2,10 +2,8 @@ package livebootfs
 
 import (
 	"bytes"
-	"compress/zlib"
 	"encoding/base64"
 	"encoding/binary"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,6 +48,13 @@ func TestDefaultSpecUsesExistingAppsAndHasShellClosure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for _, destination := range []string{
+		"/etc/pacha/gpu-probe.conf", "/srv/gpud.elf",
+	} {
+		if _, present := spec.Files[destination]; present {
+			t.Errorf("ordinary live bootfs must not arm GPU inspection: %s", destination)
+		}
+	}
 	for destination, appID := range spec.Files {
 		if _, ok := workspace.App(appID); !ok {
 			t.Errorf("%s refers to missing app %s", destination, appID)
@@ -73,6 +78,40 @@ func TestDefaultSpecUsesExistingAppsAndHasShellClosure(t *testing.T) {
 	}
 }
 
+func TestAMDGPUProbeOverlayContainsOnlyOptionalPackages(t *testing.T) {
+	root, err := config.FindRoot(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := config.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay, err := LoadSpec(workspace.Path("pack/live-amdgpu-probe.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(overlay.Files) != 5 ||
+		overlay.Files["/etc/pacha/gpu-probe.conf"] != "amdgpu_probe_policy" ||
+		overlay.Files["/srv/gpud.elf"] != "gpud" ||
+		overlay.Files["/srv/amdgpu-mesa-runtime.tar.gz"] != "amdgpu_mesa_runtime" ||
+		overlay.Files["/srv/amdgpu-driver-package.tar.gz"] != "amdgpu_driver_archive" ||
+		overlay.Files["/srv/amdgpu-driver-package.tar.gz.sha256"] != "amdgpu_driver_archive_digest" {
+		t.Fatalf("unexpected AMDGPU probe overlay: %+v", overlay.Files)
+	}
+	if overlay.SHA256["amdgpu_mesa_runtime"] == "" {
+		t.Fatal("optional Mesa archive must be pinned by digest")
+	}
+	for destination, appID := range overlay.Files {
+		if _, ok := workspace.App(appID); !ok {
+			t.Errorf("%s refers to missing app %s", destination, appID)
+		}
+		if strings.Contains(destination, "firmware") || strings.Contains(destination, "modules") {
+			t.Errorf("driver bytes must not enter the bootfs overlay: %s", destination)
+		}
+	}
+}
+
 func TestBootScratchLimitMatchesKernel(t *testing.T) {
 	if bootScratchBytes != 32*1024*1024 {
 		t.Fatal("pack boot scratch limit changed without updating kernel agreement test")
@@ -90,7 +129,7 @@ func TestBootScratchLimitMatchesKernel(t *testing.T) {
 	}
 }
 
-func TestLargeLiveRootIsPackedBelowBootScratchLimit(t *testing.T) {
+func TestLargeLiveRootStagesDirectlyWithoutProcessSizedExpansion(t *testing.T) {
 	root := t.TempDir()
 	workspace := &config.Workspace{
 		Root: root, Artifacts: ".artifacts",
@@ -104,7 +143,7 @@ func TestLargeLiveRootIsPackedBelowBootScratchLimit(t *testing.T) {
 		}
 		data := []byte(name)
 		if name == "payload" {
-			data = bytes.Repeat([]byte("reproducible live RAM payload\n"), 1200000)
+			data = bytes.Repeat([]byte("reproducible live RAM payload\n"), 4500000)
 		} else if name == "seed0boot" {
 			data = testBootInitELF()
 		}
@@ -131,32 +170,16 @@ func TestLargeLiveRootIsPackedBelowBootScratchLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(inner) < bootScratchBytes || !fitsBootScratch(int64(len(testBootInitELF())), 4096, result.Bytes) {
-		t.Fatalf("expected packed root; inner=%d outer=%d", len(inner), result.Bytes)
+	if len(inner) <= 128*1024*1024 || len(inner) >= maxBootfsBytes ||
+		!fitsBootScratch(int64(len(testBootInitELF())), 4096, result.Bytes) {
+		t.Fatalf("unexpected direct root size; root=%d bootfs=%d", len(inner), result.Bytes)
 	}
-	packed, err := os.ReadFile(workspace.Path(OutputDir, "ROOTFS.Z"))
-	if err != nil {
-		t.Fatal(err)
+	staged, err := os.ReadFile(result.Image)
+	if err != nil || !bytes.Equal(staged, inner) {
+		t.Fatalf("large live root was not staged directly: %v", err)
 	}
-	if string(packed[:8]) != packedRootMagic {
-		t.Fatalf("packed magic = %q, want %q", packed[:8], packedRootMagic)
-	}
-	if got := binary.LittleEndian.Uint64(packed[8:16]); got != uint64(len(inner)) {
-		t.Fatalf("packed length = %d, want %d", got, len(inner))
-	}
-	reader, err := zlib.NewReader(bytes.NewReader(packed[16:]))
-	if err != nil {
-		t.Fatal(err)
-	}
-	expanded, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(expanded, inner) {
-		t.Fatal("compressed live root does not round-trip")
+	if result.Manifest != workspace.Path(OutputDir, ManifestName) {
+		t.Fatalf("unexpected manifest: %s", result.Manifest)
 	}
 }
 
@@ -237,11 +260,11 @@ func TestBuildNoBuildLeavesNormalImagesUntouched(t *testing.T) {
 }
 
 func TestBootScratchIncludesInitImageAndLoadWindow(t *testing.T) {
-	if !fitsBootScratch(9, 4096, bootScratchBytes-16) {
-		t.Fatal("aligned init plus archive should fit exactly")
+	if !fitsBootScratch(9, 4096, maxBootfsBytes) {
+		t.Fatal("bootfs staging cap should be independent of init scratch")
 	}
-	if fitsBootScratch(9, 4096, bootScratchBytes-15) {
-		t.Fatal("archive accepted beyond aligned boot scratch capacity")
+	if fitsBootScratch(9, 4096, maxBootfsBytes+1) {
+		t.Fatal("archive accepted beyond bootfs staging capacity")
 	}
 	if fitsBootScratch(9, bootScratchBytes-15, 0) {
 		t.Fatal("init ELF load window accepted beyond boot scratch capacity")

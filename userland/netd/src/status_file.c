@@ -10,6 +10,7 @@
 #include "filed/payload.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
+#include "pacha/log.h"
 
 #include <stddef.h>
 #include <errno.h>
@@ -365,13 +366,17 @@ void netd_status_file_note(const struct netd_boot_config *cfg,
         NETD_STATUS_LOG_LINE_BYTES, "#%u %s", progress_sequence + 1, phase);
     ++progress_sequence;
     if (progress_count < NETD_STATUS_LOG_LINES) ++progress_count;
-    printf("[netd] progress #%u %s\n", progress_sequence, phase);
-    fflush(stdout);
+    if (cfg->log_endpoint_fd < 16 ||
+        pacha_log_emit((int)cfg->log_endpoint_fd,
+            PACHA_LOG_SOURCE_NETD, phase, strlen(phase)) != 0) {
+        printf("[netd] progress #%u %s\n", progress_sequence, phase);
+        fflush(stdout);
+    }
     netd_status_file_publish(cfg, last_state, last_stage, last_status);
 }
 
-void netd_status_file_progress(const struct netd_boot_config *cfg,
-    const char *phase)
+static void status_file_progress(const struct netd_boot_config *cfg,
+    const char *phase, unsigned source)
 {
     if (!cfg || !phase) return;
     (void)snprintf(current_phase, sizeof(current_phase), "%s", phase);
@@ -379,7 +384,23 @@ void netd_status_file_progress(const struct netd_boot_config *cfg,
         NETD_STATUS_LOG_LINE_BYTES, "#%u %s", progress_sequence + 1, phase);
     ++progress_sequence;
     if (progress_count < NETD_STATUS_LOG_LINES) ++progress_count;
-    printf("[netd] nic progress #%u %s\n", progress_sequence, phase);
-    fflush(stdout);
+    if (cfg->log_endpoint_fd < 16 ||
+        pacha_log_emit((int)cfg->log_endpoint_fd,
+            source, phase, strlen(phase)) != 0) {
+        printf("[netd] nic progress #%u %s\n", progress_sequence, phase);
+        fflush(stdout);
+    }
     netd_status_file_publish(cfg, "initializing", NETD_BOOT_STAGE_NIC, 0);
+}
+
+void netd_status_file_progress(const struct netd_boot_config *cfg,
+    const char *phase)
+{
+    status_file_progress(cfg, phase, PACHA_LOG_SOURCE_NETD);
+}
+
+void netd_status_file_kobox_progress(const struct netd_boot_config *cfg,
+    const char *phase)
+{
+    status_file_progress(cfg, phase, PACHA_LOG_SOURCE_KOBOX2_NET);
 }

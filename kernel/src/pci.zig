@@ -34,11 +34,17 @@ var interrupt_route_leases: [interrupt_device_count]u16 =
     [_]u16{0} ** interrupt_device_count;
 var interrupt_route_retired: [interrupt_device_count][4]u16 =
     [_][4]u16{.{ 0, 0, 0, 0 }} ** interrupt_device_count;
+// A single-message MSI without per-vector pending bits can be stopped, but
+// cannot prove that the device has no latent source after its owner retires.
+// Keep its vector unavailable until a reset-aware handoff exists.
+var interrupt_route_no_pending_reuse: [interrupt_device_count]u16 =
+    [_]u16{0} ** interrupt_device_count;
 
 pub fn kernelStaticStorageEndAddr() usize {
     var end = @intFromPtr(&interrupt_route_devices) + @sizeOf(@TypeOf(interrupt_route_devices));
     end = @max(end, @intFromPtr(&interrupt_route_leases) + @sizeOf(@TypeOf(interrupt_route_leases)));
     end = @max(end, @intFromPtr(&interrupt_route_retired) + @sizeOf(@TypeOf(interrupt_route_retired)));
+    end = @max(end, @intFromPtr(&interrupt_route_no_pending_reuse) + @sizeOf(@TypeOf(interrupt_route_no_pending_reuse)));
     end = @max(end, @intFromPtr(&device_apertures) + @sizeOf(@TypeOf(device_apertures)));
     end = @max(end, @intFromPtr(&ecam_windows) + @sizeOf(@TypeOf(ecam_windows)));
     return @max(end, @intFromPtr(&config_lock) + @sizeOf(@TypeOf(config_lock)));
@@ -176,7 +182,9 @@ test "PCI catalog is not bounded by interrupt-route slots" {
     defer clearInterruptRoutes();
     for (&entries, 0..) |*entry, index| {
         entry.resource_id = resourceIdFromLocation(.{
-            .bus = 0, .device = @intCast(index), .function = 0,
+            .bus = 0,
+            .device = @intCast(index),
+            .function = 0,
         });
         entry.vendor_device = 0x0010_1b36;
     }
@@ -638,6 +646,7 @@ pub fn clearInterruptRoutes() void {
     @memset(interrupt_route_devices[0..], 0);
     @memset(interrupt_route_leases[0..], 0);
     @memset(interrupt_route_retired[0..], .{ 0, 0, 0, 0 });
+    @memset(interrupt_route_no_pending_reuse[0..], 0);
 }
 
 pub fn registerInterruptRoute(resource_id: u64, device_index: usize) bool {
@@ -742,7 +751,11 @@ fn interruptBarAddress(io: anytype, loc: Location, descriptor: u32, span: u64) ?
 /// Mask and read back the physical source. Pending MSI/MSI-X bits are device
 /// owned and read-only: they are checked, never cleared by a software counter.
 /// GPU reset/source quiescence remains with the upstream driver/device owner.
-const InterruptSourceState = struct { pending: bool, was_unmasked: bool };
+const InterruptSourceState = struct {
+    pending: bool,
+    was_unmasked: bool,
+    no_pending_proof: bool = false,
+};
 
 fn changeInterruptSourceMask(io: anytype, loc: Location, kind: InterruptKind, entry: u32, masked: bool) InterruptLeaseError!InterruptSourceState {
     if ((io.config(loc, 0x06, 2) orelse return error.Unsupported) & 0x10 == 0)
@@ -762,12 +775,18 @@ fn changeInterruptSourceMask(io: anytype, loc: Location, kind: InterruptKind, en
         const control: u16 = @truncate(header >> 16);
         if (id == 0x05 and (kind == .msi or kind == .auto)) {
             found = true;
-            // Without per-vector masking/pending bits there is no generic
-            // way to prove that an old source is safe to hand to a new owner.
+            // A one-message MSI can be stopped through its function-wide
+            // Enable bit. With no pending register, its route must never be
+            // reassigned in this boot after the first owner has used it.
             if ((control & 0x100) == 0) {
-                _ = io.setConfig(loc, cap + 2, 2, control & ~@as(u16, 1));
-                _ = io.config(loc, cap + 2, 2);
-                return error.Unsupported;
+                if (kind != .msi or entry != 0 or
+                    ((control >> 1) & 7) != 0 or ((control >> 4) & 7) != 0)
+                    return error.Unsupported;
+                const next_control = if (masked) control & ~@as(u16, 1) else control | 1;
+                if (!io.setConfig(loc, cap + 2, 2, next_control)) return error.Unsupported;
+                const readback = io.config(loc, cap + 2, 2) orelse return error.Unsupported;
+                if ((readback & 1) != (next_control & 1)) return error.NotReady;
+                return .{ .pending = false, .was_unmasked = (control & 1) != 0, .no_pending_proof = true };
             }
             const messages = @as(u32, 1) << @as(u5, @intCast((control >> 1) & 7));
             if (messages > 32 or (kind != .auto and entry >= messages)) return error.Invalid;
@@ -833,7 +852,12 @@ fn acquireInterruptLease(io: anytype, resource_id: u64, kind: InterruptKind, ent
         if (interrupt_route_leases[index] == 0) return error.NotReady;
         return;
     }
+    // Retiring a maskless MSI proves only that CPU delivery stopped. The
+    // device may still hold an unobservable pending source, so a new owner
+    // cannot take this vector without a separately attested device reset.
     if ((interrupt_route_leases[index] & mask) != 0) return error.Busy;
+    if ((interrupt_route_no_pending_reuse[index] & mask) != 0)
+        return error.NotReady;
     const loc = locationFromResourceId(resource_id) orelse return error.Invalid;
     // A failed close cannot be bypassed by deriving a different IRQ kind.
     // Retry the original physical source's quiescence before reusing its
@@ -864,8 +888,11 @@ fn acquireInterruptLease(io: anytype, resource_id: u64, kind: InterruptKind, ent
     const count: u8 = if (kind == .auto) interrupt_vectors_per_device else 1;
     if (!io.drain(vector, count)) return error.NotReady;
     // Source remains masked throughout the CPU ACK barrier and publication.
-    if (try maskInterruptSource(io, loc, kind, entry)) return error.NotReady;
+    const final_mask = try changeInterruptSourceMask(io, loc, kind, entry, true);
+    if (final_mask.pending) return error.NotReady;
     interrupt_route_leases[index] |= mask;
+    if (final_mask.no_pending_proof)
+        interrupt_route_no_pending_reuse[index] |= mask;
 }
 
 fn prepareInterruptLease(io: anytype, resource_id: u64, kind: InterruptKind, entry: u32) InterruptLeaseError!bool {
@@ -877,6 +904,8 @@ fn prepareInterruptLease(io: anytype, resource_id: u64, kind: InterruptKind, ent
     const first = interruptVectorBaseForResourceId(resource_id) orelse return error.Invalid;
     const index = (first - interrupt_vector_base) / interrupt_vectors_per_device;
     if ((interrupt_route_leases[index] & mask) != 0) return error.Busy;
+    if ((interrupt_route_no_pending_reuse[index] & mask) != 0)
+        return error.NotReady;
     const loc = locationFromResourceId(resource_id) orelse return error.Invalid;
     interrupt_route_retired[index][@intFromEnum(kind)] |= mask;
     const prior = try changeInterruptSourceMask(io, loc, kind, entry, true);
@@ -968,17 +997,20 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
         drain_ok: bool = true,
         mmio_available: bool = true,
         ignore_mask_write: bool = false,
+        ignore_config_write: bool = false,
         pending_after_drain: u32 = 0,
         fail_mmio_after_drain: bool = false,
         mmio_reads: usize = 0,
         mmio_writes: usize = 0,
         bar_start: u64 = 0x1000,
         bar_size: u64 = 0x2000,
+        drain_first: u8 = 0x53,
         fn config(self: *@This(), _: Location, offset: u8, width: u32) ?u32 {
             const word = self.registers[offset / 4] >> @as(u5, @intCast((offset & 3) * 8));
             return word & (if (width == 4) std.math.maxInt(u32) else (@as(u32, 1) << @as(u5, @intCast(width * 8))) - 1);
         }
         fn setConfig(self: *@This(), _: Location, offset: u8, width: u32, value: u32) bool {
+            if (self.ignore_config_write) return true;
             const shift: u5 = @intCast((offset & 3) * 8);
             const mask: u32 = if (width == 4) std.math.maxInt(u32) else ((@as(u32, 1) << @as(u5, @intCast(width * 8))) - 1) << shift;
             self.registers[offset / 4] = (self.registers[offset / 4] & ~mask) | ((value << shift) & mask);
@@ -1006,7 +1038,7 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
             return true;
         }
         fn drain(self: *@This(), first: u8, count: u8) bool {
-            if (first != 0x53 or count != 1) return false;
+            if (first != self.drain_first or count != 1) return false;
             self.drains += 1;
             self.pending |= self.pending_after_drain;
             if (self.fail_mmio_after_drain) self.mmio_available = false;
@@ -1139,7 +1171,78 @@ test "IRQ release masks source and pending MSI-X blocks same-vector reuse until 
     try std.testing.expect(releaseInterruptLease(&fixture, device, .msi, 3));
     fixture.registers[0x40 / 4] = 0x00050005; // No per-vector mask support.
     try std.testing.expectError(error.Unsupported, prepareInterruptLease(&fixture, device, .msi, 3));
+    // An unsupported multi-message request must not alter another owner's
+    // function-wide MSI Enable bit.
+    try std.testing.expectEqual(@as(u32, 0x00010000), fixture.registers[0x40 / 4] & 0x00010000);
+
+    // Function-wide MSI Enable is a usable mask only for one message. Once
+    // that route has existed, no pending register can prove safe reuse.
+    clearInterruptRoutes();
+    try std.testing.expect(registerInterruptRoute(device, 0));
+    fixture = Fixture{ .drain_first = 0x50 };
+    fixture.registers[0x04 / 4] = 0x00100002;
+    fixture.registers[0x34 / 4] = 0x40;
+    fixture.registers[0x40 / 4] = 0x00810005; // enabled, 64-bit, one MSI, no PVM
+    const single_was_unmasked = try prepareInterruptLease(&fixture, device, .msi, 0);
+    try std.testing.expect(single_was_unmasked);
     try std.testing.expectEqual(@as(u32, 0), fixture.registers[0x40 / 4] & 0x00010000);
+    try std.testing.expect(fixture.drains > 0);
+    try std.testing.expect(restoreInterruptLeaseMask(&fixture, device, .msi, 0, single_was_unmasked));
+    try std.testing.expectEqual(@as(u32, 0x00010000), fixture.registers[0x40 / 4] & 0x00010000);
+    try quiesceInterruptLease(&fixture, device, .msi, 0);
+    try std.testing.expectEqual(@as(u32, 0), fixture.registers[0x40 / 4] & 0x00010000);
+    commitInterruptRouteRetirement(device, @intFromEnum(InterruptKind.msi), 0);
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msix, 0));
+
+    // An implicit FD close after a partially completed native launch must
+    // preserve the same tombstone as explicit retirement.
+    clearInterruptRoutes();
+    try std.testing.expect(registerInterruptRoute(device, 0));
+    fixture.registers[0x40 / 4] = 0x00800005;
+    _ = try prepareInterruptLease(&fixture, device, .msi, 0);
+    try std.testing.expect(releaseInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+
+    // Even if implicit close cannot confirm the MSI Enable write, the
+    // route remains unusable by a later owner in this boot.
+    clearInterruptRoutes();
+    try std.testing.expect(registerInterruptRoute(device, 0));
+    fixture.registers[0x40 / 4] = 0x00800005;
+    _ = try prepareInterruptLease(&fixture, device, .msi, 0);
+    fixture.registers[0x40 / 4] |= 0x00010000;
+    fixture.ignore_config_write = true;
+    try std.testing.expect(!releaseInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+
+    // An incomplete CPU-side drain on implicit close has the same result.
+    clearInterruptRoutes();
+    try std.testing.expect(registerInterruptRoute(device, 0));
+    fixture.ignore_config_write = false;
+    fixture.registers[0x40 / 4] = 0x00800005;
+    _ = try prepareInterruptLease(&fixture, device, .msi, 0);
+    fixture.drain_ok = false;
+    try std.testing.expect(!releaseInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+
+    // Reject multi-message capability and a failed function-wide readback
+    // before publishing any lease; the CPU barrier must also succeed.
+    clearInterruptRoutes();
+    try std.testing.expect(registerInterruptRoute(device, 0));
+    fixture = Fixture{ .drain_first = 0x50 };
+    fixture.registers[0x04 / 4] = 0x00100002;
+    fixture.registers[0x34 / 4] = 0x40;
+    fixture.registers[0x40 / 4] = 0x00850005; // four-message capable
+    try std.testing.expectError(error.Unsupported, prepareInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expectEqual(@as(u32, 0x00010000), fixture.registers[0x40 / 4] & 0x00010000);
+    fixture.registers[0x40 / 4] = 0x00810005;
+    fixture.ignore_config_write = true;
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expectEqual(@as(usize, 0), fixture.drains);
+    fixture.ignore_config_write = false;
+    fixture.drain_ok = false;
+    try std.testing.expectError(error.NotReady, prepareInterruptLease(&fixture, device, .msi, 0));
+    try std.testing.expect(!interruptRouteLeased(device, @intFromEnum(InterruptKind.msi), 0));
 }
 
 fn barSizeFromMask32(mask: u32) ?u64 {
@@ -1275,9 +1378,7 @@ test "PCI DMA boot scan leaves translated IOVAs below a UEFI GOP BAR" {
     };
     const start = @import("iova.zig").window_start;
     try std.testing.expectEqual(@as(u64, 0x01000000), start);
-    try std.testing.expectEqual(@as(u64, 0x80000000),
-        bootDmaWindowEndWithReader(start, @import("iova.zig").window_ceiling,
-            &.{}, Reader{}));
+    try std.testing.expectEqual(@as(u64, 0x80000000), bootDmaWindowEndWithReader(start, @import("iova.zig").window_ceiling, &.{}, Reader{}));
 }
 
 test "PCI DMA bridge windows clip 32-bit and 64-bit ranges and reject unknown types" {

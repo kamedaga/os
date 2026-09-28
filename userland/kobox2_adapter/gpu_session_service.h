@@ -17,7 +17,7 @@ struct ph_gpu_session_service {
     struct gpud_gpu_sessions *sessions;
     uint64_t client_id, session_id, file_cookie, correlation, command_count;
     uint64_t last_control;
-    uint32_t opcode, status, node_type;
+    uint32_t opcode, status, node_type, profile_kind;
     int acquired;
     int (*open)(struct kobox_linux_drm_service *, uint32_t, uint64_t *);
     int (*file)(struct kobox_linux_drm_service *, uint64_t, struct kobox_linux_drm_file **);
@@ -29,6 +29,9 @@ struct ph_gpu_session_service {
 int ph_gpu_session_service_init(struct ph_gpu_session_service *service,
                                 struct gpud_gpu_sessions *sessions,
                                 uint64_t client_id);
+int ph_gpu_session_service_init_profile(struct ph_gpu_session_service *service,
+                                struct gpud_gpu_sessions *sessions,
+                                uint64_t client_id, uint32_t profile_kind);
 /* query.request already contains the private complete envelope snapshot. */
 int ph_gpu_session_prepare(struct ph_gpu_session_service *service,
                            uint32_t queue_class,

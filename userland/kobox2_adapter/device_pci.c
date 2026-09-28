@@ -1,10 +1,55 @@
 /* SPDX-License-Identifier: MIT */
 #include "device_pci.h"
+#include "boot.h"
 #include <pacha/syscall.h>
 #include <errno.h>
 #include <string.h>
 
 #define PH_PCI_PAGE_SIZE 4096ul
+
+long ph_pci_export_pages(struct ph_pci *pci, uint64_t *pages, size_t count,
+                        unsigned int protection, enum kobox_mmio_cache cache) {
+    if (!pci || !pci->admitted || !pages || !count ||
+        count > SIZE_MAX / PH_PCI_PAGE_SIZE ||
+        !(protection & KOBOX_LINUX_MEMORY_READ) ||
+        protection & ~(KOBOX_LINUX_MEMORY_READ | KOBOX_LINUX_MEMORY_WRITE) ||
+        (cache != KOBOX_MMIO_UC && cache != KOBOX_MMIO_WC)) {
+        ph_boot_log_gpu_bar_export_failure(1, PACHA_SYSCALL_ERR_INVALID,
+            KOBOX_PCI_MEMORY_WINDOWS, protection, cache, count, 0, 0);
+        return PACHA_SYSCALL_ERR_INVALID;
+    }
+    const uint64_t first_page = pages[0];
+    const uint64_t last_page = pages[count - 1];
+    for (unsigned int bar = 0; bar < KOBOX_PCI_MEMORY_WINDOWS; ++bar) {
+        const struct pacha_capsule_bar_info *info = &pci->bars[bar];
+        if (!info->size || info->end > UINT64_MAX - PH_PCI_PAGE_SIZE) continue;
+        const uint64_t first = info->start & ~(uint64_t)(PH_PCI_PAGE_SIZE - 1);
+        const uint64_t end = (info->end + PH_PCI_PAGE_SIZE) &
+            ~(uint64_t)(PH_PCI_PAGE_SIZE - 1);
+        size_t i;
+        for (i = 0; i < count; ++i) {
+            if (pages[i] > UINT64_MAX / PH_PCI_PAGE_SIZE) break;
+            const uint64_t physical = pages[i] * PH_PCI_PAGE_SIZE;
+            if (physical < first || physical >= end) break;
+        }
+        if (i != count) continue;
+        for (i = 0; i < count; ++i) pages[i] = pages[i] * PH_PCI_PAGE_SIZE - first;
+        uint64_t flags = PACHA_CAPSULE_MMIO_EXPORT_VMO |
+            (cache == KOBOX_MMIO_WC ? PACHA_CAPSULE_MMIO_CACHE_WC : PACHA_CAPSULE_MMIO_CACHE_UC);
+        if (!(protection & KOBOX_LINUX_MEMORY_WRITE)) flags |= PACHA_CAPSULE_MMIO_READ_ONLY;
+        long result = pacha_syscall6(PACHA_CAPSULE_SYSCALL_DERIVE_MMIO,
+            pci->config.device_fd, bar, (uintptr_t)pages,
+            count * PH_PCI_PAGE_SIZE, flags, 0);
+        if (result < 16)
+            ph_boot_log_gpu_bar_export_failure(3, result, bar,
+                protection, cache, count, first_page, last_page);
+        return result;
+    }
+    ph_boot_log_gpu_bar_export_failure(2, PACHA_SYSCALL_ERR_INVALID,
+        KOBOX_PCI_MEMORY_WINDOWS, protection, cache, count,
+        first_page, last_page);
+    return PACHA_SYSCALL_ERR_INVALID;
+}
 
 static int native_status(long result) {
     switch (result) {

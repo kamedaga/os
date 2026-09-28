@@ -4,6 +4,7 @@
 const std = @import("std");
 pub const smp_profile_enabled = @import("smp_profile_options").enabled;
 pub const ipc_profile_enabled = @import("ipc_profile_options").ipc_enabled;
+pub const kernel_log_ring_enabled = @import("kernel_log_ring_options").log_ring_enabled;
 const kernel_api = @import("kernel_boot_api");
 const x86_platform = kernel_api.x86_platform;
 const entry = kernel_api.entry;
@@ -21,7 +22,9 @@ pub const boot_diagnostic_enabled = std.mem.eql(u8, boot_checkpoint_name, "DIAG"
 // complete normal boot path linked in every checkpoint image; otherwise the
 // compiler would strip later phases and change Limine's loading layout.
 var selected_boot_checkpoint: u8 = if (std.mem.eql(u8, boot_checkpoint_name, "off"))
-    0 else boot_checkpoint_name[0];
+    0
+else
+    boot_checkpoint_name[0];
 
 // ---------------------------------------------------------------------------
 // Exported symbols accessed by assembly stubs in traps.zig / syscalls.zig
@@ -147,7 +150,7 @@ fn limineKernelMain() noreturn {
         requests,
         kernel_runtime.global_free_list,
         entry.currentUserSpaces(),
-    ));
+    ), limine_boot.hhdmOffsetOrHalt(requests));
     if (comptime boot_diagnostic_enabled) {
         markEarlyGopStage(if (boot_diag.arm(resources.framebuffer_info)) 6 else 7);
     }
@@ -179,7 +182,5 @@ fn markEarlyGopStage(stage: usize) void {
     const response = framebuffer_request.response orelse return;
     if (response.framebuffer_count == 0) return;
     const framebuffer = response.framebuffers[0] orelse return;
-    _ = early_gop_marker.mark(framebuffer.address, framebuffer.width,
-        framebuffer.height, framebuffer.pitch, framebuffer.bpp,
-        framebuffer.memory_model == limine.framebuffer_rgb, stage);
+    _ = early_gop_marker.mark(framebuffer.address, framebuffer.width, framebuffer.height, framebuffer.pitch, framebuffer.bpp, framebuffer.memory_model == limine.framebuffer_rgb, stage);
 }

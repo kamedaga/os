@@ -5,6 +5,7 @@
 #include "pacha/service_abi.h"
 #include "gpud/drm_kms_abi.h"
 #include "gpud/drm_virtgpu_abi.h"
+#include "gpud/drm_amdgpu_abi.h"
 
 enum {
     GPUD_DRM_SERVICE_ID = PACHA_SERVICE_ID_GPUD_DRM,

@@ -152,6 +152,7 @@ add_custom_command(
       "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -D__pachaos__ -DMINIZ_NO_ARCHIVE_APIS -DMINIZ_NO_STDIO -DMINIZ_NO_TIME -DMINIZ_NO_DEFLATE_APIS -DZYDIS_STATIC_BUILD -DZYDIS_MINIMAL_MODE -DZYDIS_DISABLE_ENCODER -DZYDIS_DISABLE_FORMATTER -DZYDIS_DISABLE_SEGMENT -DZYAN_NO_LIBC -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype ${FILED_PROFILE_CFLAGS}"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${FILED_ELF}"
   DEPENDS
+    "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/live_bootstrap.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/filed/live_bootfs.h"

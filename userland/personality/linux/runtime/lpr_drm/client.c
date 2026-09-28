@@ -2,6 +2,33 @@
 #include "dmabuf.h"
 #include "../support/unmap_profile.h"
 #include "../../../../../kobox2/linux-sandbox/kobox/boot/drm_limits.h"
+#include "../../../../../kobox2/protocol/generated/include/kobox2/gpu_drm_amdgpu_layout.h"
+#include "../../../../../kobox2/protocol/include/kobox2/amdgpu_info_bridge.h"
+#include "amdgpu_info.h"
+#include "../../../../../kobox2/protocol/include/kobox2/amdgpu_cs_shape.h"
+
+static int64_t amdgpu_info_failure(uint32_t query, uint32_t bytes,
+    const char *phase, int64_t status)
+{
+    char line[192], *out = line;
+    const char *prefix = "LPR DRM AMDGPU_INFO failed phase=";
+    while (*prefix) *out++ = *prefix++;
+    while (*phase) *out++ = *phase++;
+    const char *labels[] = {" query=", " bytes=", " errno="};
+    uint64_t values[] = {query, bytes, (uint64_t)(status < 0 ? -status : status)};
+    for (unsigned i = 0; i < 3; ++i) {
+        const char *label = labels[i];
+        while (*label) *out++ = *label++;
+        char digits[20]; unsigned n = 0;
+        do { digits[n++] = '0' + values[i] % 10; values[i] /= 10; } while (values[i]);
+        while (n) *out++ = digits[--n];
+    }
+    *out++ = '\n';
+    /* stderr follows the application's RAM log redirection, not kernel log
+     * storage. In particular, pre-RPC validation failures remain visible. */
+    (void)lpr_linux_write(2, (uint64_t)(uintptr_t)line, (uint64_t)(out - line));
+    return status;
+}
 
 enum {
     LPR_DRM_IOCTL_VERSION = 0xc0406400u,
@@ -1509,6 +1536,158 @@ static int64_t lpr_udmabuf_create(uint64_t drm_handle, uint64_t arg)
     return linux_fd;
 }
 
+static char *lpr_drm_diag_text(char *out, const char *end, const char *value)
+{
+    while (*value && out < end) *out++ = *value++;
+    return out;
+}
+
+static char *lpr_drm_diag_uint(char *out, const char *end, uint64_t value,
+    unsigned base)
+{
+    char digits[17];
+    unsigned length = 0;
+    do {
+        const unsigned digit = (unsigned)(value % base);
+        digits[length++] = "0123456789abcdef"[digit];
+        value /= base;
+    } while (value && length < sizeof(digits));
+    while (length && out < end) *out++ = digits[--length];
+    return out;
+}
+
+static int lpr_drm_cs_reject(const char *reason,
+    const gpud_drm_amdgpu_cs_t *user, uint32_t chunk_id,
+    uint32_t length_dw, int error)
+{
+    char line[240];
+    char *out = line;
+    const char *end = line + sizeof(line) - 1;
+    out = lpr_drm_diag_text(out, end,
+        "LPR DRM ioctl rejected phase=prepare-amdgpu-cs request=0x");
+    out = lpr_drm_diag_uint(out, end, GPUD_DRM_IOCTL_AMDGPU_CS, 16);
+    out = lpr_drm_diag_text(out, end, " chunks=");
+    out = lpr_drm_diag_uint(out, end, user ? user->num_chunks : 0, 10);
+    out = lpr_drm_diag_text(out, end, " ctx=");
+    out = lpr_drm_diag_uint(out, end, user ? user->ctx_id : 0, 10);
+    out = lpr_drm_diag_text(out, end, " chunk_id=");
+    out = lpr_drm_diag_uint(out, end, chunk_id, 10);
+    out = lpr_drm_diag_text(out, end, " length_dw=");
+    out = lpr_drm_diag_uint(out, end, length_dw, 10);
+    out = lpr_drm_diag_text(out, end, " reason=");
+    out = lpr_drm_diag_text(out, end, reason);
+    out = lpr_drm_diag_text(out, end, " status=-");
+    out = lpr_drm_diag_uint(out, end, (unsigned)-error, 10);
+    if (out < end) *out++ = '\n';
+    /* The test client's stderr is redirected into a RAM transcript. Early
+     * LPR rejection cannot reach gpud, so it needs its own userland record. */
+    (void)lpr_linux_write(2, (uintptr_t)line, (uint64_t)(out - line));
+    return error;
+}
+
+static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
+    gpud_drm_ioctl_request_t *request, int *aux_fd,
+    void **aux_mapping, uint64_t *aux_map_size)
+{
+    gpud_drm_amdgpu_cs_t user = {0};
+    gpud_drm_amdgpu_cs_wire_t wire = {0};
+    uint64_t sources[KB2_AMDGPU_CS_PARTS] = {0};
+    uint32_t total = 0, ibs = 0, bos = 0;
+    const uint32_t records[] = {0,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_USER_FENCE,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_DEPENDENCY,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_SYNCOBJ_IN,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_SYNCOBJ_OUT,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_BO_HANDLE,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_SCHEDULED_DEPENDENCY,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_TIMELINE_WAIT,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_TIMELINE_SIGNAL,
+        KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_GFX_SHADOW};
+    if (!arg || !request || !aux_fd || !aux_mapping || !aux_map_size)
+        return lpr_drm_cs_reject("null-argument", NULL, 0, 0, -LPR_LINUX_EFAULT);
+    lpr_memcpy(&user, (const void *)(uintptr_t)arg, sizeof(user));
+    if (!user.ctx_id || !user.chunks || user.flags || !user.num_chunks ||
+        user.num_chunks > KB2_AMDGPU_CS_PARTS ||
+        user.chunks > UINT64_MAX - user.num_chunks * sizeof(uint64_t))
+        return lpr_drm_cs_reject("header-shape", &user, 0, 0, -LPR_LINUX_EINVAL);
+    for (uint32_t i = 0; i < user.num_chunks; ++i) {
+        uint64_t pointer;
+        gpud_drm_amdgpu_cs_chunk_t chunk;
+        lpr_memcpy(&pointer, (const void *)(uintptr_t)(user.chunks + i * 8), 8);
+        if (!pointer || pointer > UINT64_MAX - sizeof(chunk))
+            return lpr_drm_cs_reject("chunk-pointer", &user, 0, 0, -LPR_LINUX_EFAULT);
+        lpr_memcpy(&chunk, (const void *)(uintptr_t)pointer, sizeof(chunk));
+        if (!chunk.chunk_id || chunk.chunk_id >= sizeof(records)/sizeof(records[0]))
+            return lpr_drm_cs_reject("unsupported-chunk", &user, chunk.chunk_id,
+                chunk.length_dw, -LPR_LINUX_EOPNOTSUPP);
+        if (!chunk.chunk_data || !chunk.length_dw ||
+            chunk.length_dw > KB2_AMDGPU_CS_BYTES / 4 ||
+            chunk.chunk_data > UINT64_MAX - (uint64_t)chunk.length_dw * 4)
+            return lpr_drm_cs_reject("chunk-range", &user, chunk.chunk_id,
+                chunk.length_dw, -LPR_LINUX_EINVAL);
+        gpud_drm_amdgpu_cs_part_t *p = &wire.parts[i];
+        p->record = records[chunk.chunk_id];
+        p->offset = total;
+        p->bytes = chunk.length_dw * 4;
+        sources[i] = chunk.chunk_data;
+        if (chunk.chunk_id == 6) {
+            gpud_drm_amdgpu_bo_list_in_t list;
+            if (p->bytes != sizeof(list) || ++bos > 1 || user.bo_list_handle)
+                return lpr_drm_cs_reject("bo-list-shape", &user, 6, chunk.length_dw, -LPR_LINUX_EINVAL);
+            lpr_memcpy(&list, (const void *)(uintptr_t)chunk.chunk_data, sizeof(list));
+            /* CS BO_HANDLES ignores operation/list_handle, unlike BO_LIST.
+             * Mesa intentionally poisons those unused fields with ~0. */
+            if (!list.bo_number || list.bo_number > 65536 ||
+                list.bo_info_size != sizeof(gpud_drm_amdgpu_bo_entry_t) ||
+                !list.bo_info_ptr || list.bo_info_ptr >
+                UINT64_MAX - (uint64_t)list.bo_number * list.bo_info_size)
+                return lpr_drm_cs_reject("bo-list-range", &user, 6, chunk.length_dw, -LPR_LINUX_EINVAL);
+            p->bytes = list.bo_number * list.bo_info_size;
+            sources[i] = list.bo_info_ptr;
+        }
+        uint32_t size = kb2_amdgpu_cs_element_size(p->record);
+        if (!size || p->bytes % size)
+            return lpr_drm_cs_reject("chunk-element-size", &user, chunk.chunk_id,
+                chunk.length_dw, -LPR_LINUX_EINVAL);
+        p->count = p->bytes / size;
+        struct kb2_amdgpu_cs_part shape = {p->record, p->count, p->offset, p->bytes};
+        if (!kb2_amdgpu_cs_part_valid(&shape))
+            return lpr_drm_cs_reject("chunk-capacity", &user, chunk.chunk_id,
+                chunk.length_dw, -LPR_LINUX_EINVAL);
+        total += p->bytes;
+        ibs += chunk.chunk_id == 1;
+    }
+    if (!ibs) return lpr_drm_cs_reject("missing-ib", &user, 0, 0, -LPR_LINUX_EINVAL);
+    int result = lpr_drm_aux_create(total, reusable_aux, aux_fd, aux_mapping, aux_map_size);
+    if (result) return lpr_drm_cs_reject("aux-allocation", &user, 0, 0, result);
+    for (uint32_t i = 0; i < user.num_chunks; ++i) {
+        const gpud_drm_amdgpu_cs_part_t *p = &wire.parts[i];
+        uint8_t *dst = (uint8_t *)*aux_mapping + p->offset;
+        if (p->record == KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB) {
+            gpud_drm_amdgpu_cs_ib_t ib;
+            lpr_memcpy(&ib, (const void *)(uintptr_t)sources[i], sizeof(ib));
+            if (ib.pad || !ib.va_start || !ib.ib_bytes) {
+                lpr_drm_aux_destroy(*aux_fd, *aux_mapping, *aux_map_size);
+                *aux_fd = -1; *aux_mapping = 0; *aux_map_size = 0;
+                return lpr_drm_cs_reject("ib-shape", &user, 1, 8, -LPR_LINUX_EINVAL);
+            }
+            lpr_memset(dst, 0, p->bytes);
+            lpr_memcpy(dst, &ib.flags, 4); lpr_memcpy(dst + 4, &ib.ip_type, 4);
+            lpr_memcpy(dst + 8, &ib.ip_instance, 4); lpr_memcpy(dst + 12, &ib.ring, 4);
+            lpr_memcpy(dst + 16, &ib.va_start, 8); lpr_memcpy(dst + 24, &ib.ib_bytes, 4);
+        } else {
+            lpr_memcpy(dst, (const void *)(uintptr_t)sources[i], p->bytes);
+        }
+    }
+    wire.ctx_id = user.ctx_id; wire.bo_list_handle = user.bo_list_handle;
+    wire.chunk_count = user.num_chunks;
+    lpr_memcpy(request->data, &wire, sizeof(wire));
+    request->arg_size = sizeof(user); request->data_size = sizeof(wire);
+    request->aux_size = total;
+    return 0;
+}
+
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
 #if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
@@ -1570,6 +1749,9 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     int output_notify_fd = -1;
     int output_sync_fd = -1;
     uint64_t event_token = 0;
+    uint64_t amdgpu_info_pointer = 0;
+    uint32_t amdgpu_info_query = 0;
+    uint32_t amdgpu_info_capacity = 0;
     enum {
         LPR_DRM_WIRE_GENERIC,
         LPR_DRM_WIRE_VERSION,
@@ -1593,6 +1775,8 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         LPR_DRM_WIRE_VIRTGPU_GET_CAPS,
         LPR_DRM_WIRE_VIRTGPU_EXECBUFFER,
         LPR_DRM_WIRE_VIRTGPU_CONTEXT_INIT,
+        LPR_DRM_WIRE_AMDGPU_INFO,
+        LPR_DRM_WIRE_AMDGPU_CS,
     } wire_kind = LPR_DRM_WIRE_GENERIC;
     if (command == LPR_DRM_IOCTL_SYNCOBJ_WAIT) {
         gpud_drm_syncobj_wait_t wire;
@@ -1881,6 +2065,38 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         ioctl->arg_size = sizeof(*user);
         ioctl->data_size = sizeof(*wire);
         wire_kind = LPR_DRM_WIRE_SYNCOBJ_HANDLE_TO_FD;
+    } else if (command == GPUD_DRM_IOCTL_AMDGPU_CS) {
+        const int cs_status = lpr_drm_prepare_amdgpu_cs(arg,
+            reusable_aux, ioctl, &aux_fd, &aux_mapping, &aux_map_size);
+        if (cs_status) {
+            lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return cs_status;
+        }
+        wire_kind = LPR_DRM_WIRE_AMDGPU_CS;
+    } else if (command == GPUD_DRM_IOCTL_AMDGPU_INFO) {
+        gpud_drm_amdgpu_info_t wire;
+        lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
+        amdgpu_info_query = wire.query;
+        amdgpu_info_capacity = wire.return_size;
+        int prepared = lpr_amdgpu_info_prepare(&wire);
+        if (prepared) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return amdgpu_info_failure(wire.query, amdgpu_info_capacity, "validate", prepared);
+        }
+        const int aux_status = lpr_drm_aux_create(wire.return_size,
+            reusable_aux, &aux_fd, &aux_mapping, &aux_map_size);
+        if (aux_status) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return amdgpu_info_failure(wire.query, amdgpu_info_capacity, "aux-map", aux_status);
+        }
+        amdgpu_info_pointer = wire.return_pointer;
+        wire.return_pointer = 0;
+        lpr_memcpy(ioctl->data, &wire, sizeof(wire));
+        ioctl->arg_size = sizeof(wire);
+        ioctl->data_size = sizeof(wire);
+        ioctl->aux_size = wire.return_size;
+        wire_kind = LPR_DRM_WIRE_AMDGPU_INFO;
     } else if (command == GPUD_DRM_IOCTL_VIRTGPU_GETPARAM) {
         gpud_drm_virtgpu_getparam_t wire;
         lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
@@ -2119,6 +2335,8 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             output_sync_fd = -1;
         }
     }
+    if (status != 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_INFO)
+        (void)amdgpu_info_failure(amdgpu_info_query, amdgpu_info_capacity, "rpc", status);
     if (status == 0 && wire_kind == LPR_DRM_WIRE_VERSION) {
         lpr_drm_version_t *version = (lpr_drm_version_t *)(uintptr_t)arg;
         const gpud_drm_version_wire_t *wire = (const gpud_drm_version_wire_t *)ioctl->data;
@@ -2239,6 +2457,35 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         user->first_signaled = wire->first_signaled;
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_SYNCOBJ_ARRAY) {
         /* RESET and SIGNAL have no output fields. */
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_INFO) {
+        const gpud_drm_amdgpu_info_t *wire =
+            (const gpud_drm_amdgpu_info_t *)ioctl->data;
+        if (amdgpu_info_query == KB2_GPU_DRM_AMDGPU_INFO_QUERY_DEVICE_INFO) {
+            gpud_drm_amdgpu_device_native_t device = {0};
+#define UNPACK_DEVICE(member, field) \
+            lpr_memcpy(&device.member, (const unsigned char *)aux_mapping + \
+                KB2_GPU_DRM_AMDGPU_RECORD_INFO_DEVICE_##field##_OFFSET, \
+                sizeof(device.member));
+            KB2_AMDGPU_DEVICE_FIELDS(UNPACK_DEVICE)
+#undef UNPACK_DEVICE
+            lpr_memcpy((void *)(uintptr_t)amdgpu_info_pointer,
+                &device, lpr_amdgpu_info_copy_size(amdgpu_info_capacity, sizeof(device)));
+        } else if (amdgpu_info_query == KB2_GPU_DRM_AMDGPU_INFO_QUERY_HW_IP_INFO) {
+            gpud_drm_amdgpu_hw_ip_native_t hw_ip = {0};
+#define UNPACK_HW_IP(member, field) \
+            lpr_memcpy(&hw_ip.member, (const unsigned char *)aux_mapping + \
+                KB2_GPU_DRM_AMDGPU_RECORD_INFO_HW_IP_##field##_OFFSET, \
+                sizeof(hw_ip.member));
+            KB2_AMDGPU_HW_IP_FIELDS(UNPACK_HW_IP)
+#undef UNPACK_HW_IP
+            lpr_memcpy((void *)(uintptr_t)amdgpu_info_pointer,
+                &hw_ip, lpr_amdgpu_info_copy_size(amdgpu_info_capacity, sizeof(hw_ip)));
+        } else {
+            lpr_memcpy((void *)(uintptr_t)amdgpu_info_pointer,
+                aux_mapping, lpr_amdgpu_info_copy_size(amdgpu_info_capacity, wire->return_size));
+        }
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_CS) {
+        lpr_memcpy((void *)(uintptr_t)arg, ioctl->data, sizeof(uint64_t));
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_VIRTGPU_GETPARAM) {
         const gpud_drm_virtgpu_getparam_t *user =
             (const gpud_drm_virtgpu_getparam_t *)(uintptr_t)arg;

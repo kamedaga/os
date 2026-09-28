@@ -8,32 +8,39 @@ pub const first_dynamic_fd: u32 = 16;
 // current generation, including the initial thread created by PROCESS_CLONE.
 pub const thread_self_fd: u32 = 0xffff_fffe;
 
-pub const syscall_fd_first: u64 = 37;
-pub const syscall_fd_table: u64 = 37;
-pub const syscall_fd_close: u64 = 38;
-pub const syscall_fd_dup: u64 = 39;
-pub const syscall_fd_get_info: u64 = 40;
-pub const syscall_fd_set_flags: u64 = 41;
-pub const syscall_fd_read: u64 = 42;
-pub const syscall_fd_write: u64 = 43;
-pub const syscall_fd_readv: u64 = 44;
-pub const syscall_fd_writev: u64 = 45;
-pub const syscall_fd_fcntl: u64 = 46;
-pub const syscall_fd_poll: u64 = 47;
-pub const syscall_fd_wait_many: u64 = 48;
-pub const syscall_fd_ioctl: u64 = 49;
-pub const syscall_fd_stat: u64 = 50;
-pub const syscall_eventfd_create: u64 = 51;
-pub const syscall_pipe_create: u64 = 52;
-pub const syscall_timerfd_create: u64 = 53;
-pub const syscall_timerfd_settime: u64 = 54;
-pub const syscall_timerfd_gettime: u64 = 55;
-pub const syscall_vmo_create: u64 = 56;
+pub const syscall_fd_first: u64 = 38;
+pub const syscall_fd_table: u64 = 38;
+pub const syscall_fd_close: u64 = 39;
+pub const syscall_fd_dup: u64 = 40;
+pub const syscall_fd_get_info: u64 = 41;
+pub const syscall_fd_set_flags: u64 = 42;
+pub const syscall_fd_read: u64 = 43;
+pub const syscall_fd_write: u64 = 44;
+pub const syscall_fd_readv: u64 = 45;
+pub const syscall_fd_writev: u64 = 46;
+pub const syscall_fd_fcntl: u64 = 47;
+pub const syscall_fd_poll: u64 = 48;
+pub const syscall_fd_wait_many: u64 = 49;
+pub const syscall_fd_ioctl: u64 = 50;
+pub const syscall_fd_stat: u64 = 51;
+pub const syscall_eventfd_create: u64 = 52;
+pub const syscall_pipe_create: u64 = 53;
+pub const syscall_timerfd_create: u64 = 54;
+pub const syscall_timerfd_settime: u64 = 55;
+pub const syscall_timerfd_gettime: u64 = 56;
+pub const syscall_vmo_create: u64 = 57;
 // VMO_GROW(fd, page-aligned capacity): append zeroed backing without replacing
 // live aliases. Requires RESIZE; shrinking and page-view growth are rejected.
-pub const syscall_vmo_grow: u64 = 57;
-pub const syscall_vmo_create_page_view: u64 = 58;
-pub const syscall_vmo_revoke: u64 = 59;
+pub const syscall_vmo_grow: u64 = 58;
+// Changes the physical cache type of populated canonical RAM, including
+// aliases held by other processes. Requires an explicit cache-policy right.
+pub const syscall_vmo_cache_policy: u64 = 59;
+pub const vmo_cache_wb: u64 = 0;
+pub const vmo_cache_uc_minus: u64 = 1;
+pub const vmo_cache_uc: u64 = 2;
+pub const vmo_cache_wc: u64 = 3;
+pub const syscall_vmo_create_page_view: u64 = 60;
+pub const syscall_vmo_revoke: u64 = 61;
 pub const syscall_fd_last: u64 = syscall_vmo_revoke;
 pub const syscall_fd_count: u64 = syscall_fd_last - syscall_fd_first + 1;
 
@@ -59,19 +66,20 @@ pub const right_wait: u64 = 1 << 3;
 pub const right_poll: u64 = 1 << 4;
 pub const right_set_flags: u64 = 1 << 5;
 pub const right_close: u64 = 1 << 6;
-pub const right_process_signal: u64 = 1 << 26;
+pub const right_process_signal: u64 = 1 << 27;
 pub const thread_self_rights_mask: u64 =
     right_inspect | right_wait | right_poll | right_transfer | right_close | right_process_signal;
-pub const right_read: u64 = 1 << 42;
-pub const right_write: u64 = 1 << 43;
-pub const right_revoke: u64 = 1 << 44;
+pub const right_read: u64 = 1 << 43;
+pub const right_write: u64 = 1 << 44;
+pub const right_revoke: u64 = 1 << 45;
 pub const right_map_read: u64 = 1 << 13;
 pub const right_map_write: u64 = 1 << 14;
 pub const right_map_exec: u64 = 1 << 15;
 pub const right_resize: u64 = 1 << 16;
-pub const right_share: u64 = 1 << 17;
-pub const right_pager_attach: u64 = 1 << 18;
-pub const right_pager_fault: u64 = 1 << 19;
+pub const right_cache_policy: u64 = 1 << 17;
+pub const right_share: u64 = 1 << 18;
+pub const right_pager_attach: u64 = 1 << 19;
+pub const right_pager_fault: u64 = 1 << 20;
 pub const known_common_rights_mask: u64 =
     right_inspect |
     right_dup |
@@ -86,6 +94,7 @@ pub const known_common_rights_mask: u64 =
     right_map_write |
     right_map_exec |
     right_resize |
+    right_cache_policy |
     right_share |
     right_pager_attach |
     right_pager_fault |

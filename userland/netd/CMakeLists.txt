@@ -18,6 +18,7 @@ set(NETD_SOURCES
   ${REPO_ROOT}/userland/libfiled_client/src/module_image.c
   ${REPO_ROOT}/userland/libcapsule/src/capsule.c
   ${REPO_ROOT}/userland/libpacha/src/syscall.c
+  ${REPO_ROOT}/userland/libpacha/src/log.c
   ${REPO_ROOT}/userland/libpacha/src/trace.c
   ${REPO_ROOT}/userland/gpud/launch.c
   ${REPO_ROOT}/userland/gpud/launch_native.c
@@ -89,6 +90,8 @@ add_custom_command(
   DEPENDS
     "${NETD_LIBUINET_ARCHIVE}"
     "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
+    "${REPO_ROOT}/userland/libpacha/include/pacha/log.h"
+    "${REPO_ROOT}/userland/libpacha/src/log.c"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
     "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     "${NETD_MBEDTLS_ARCHIVE}"

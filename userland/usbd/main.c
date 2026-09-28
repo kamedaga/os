@@ -110,7 +110,8 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
         error = ph_ipc_init(&current->ipc, current->management.a, generation);
     if (error)
         return error;
-    struct ph_sandbox_config sandbox_config = {.identity = package->identity,
+    struct ph_sandbox_config sandbox_config = {.version = PH_SANDBOX_CONFIG_VERSION,
+        .identity = package->identity,
         .artifact_count = USBD_PACKAGE_ARTIFACTS, .resource_count = 1,
         .device = package->device};
     struct gpud_launch_blob blob = {.bytes = &sandbox_config,

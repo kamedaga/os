@@ -13,6 +13,8 @@ device=1
 dma_profile=0
 usb_hid=0
 net=0
+amdgpu=0
+cache_preflight=0
 for argument in "$@"; do
   case "$argument" in
     --foundation-gates) gates=1 ;;
@@ -20,6 +22,8 @@ for argument in "$@"; do
     --dma-profile) dma_profile=1 ;;
     --usb-hid) usb_hid=1 ;;
     --virtio-net|--net) net=1 ;;
+    --amdgpu) amdgpu=1 ;;
+    --cache-preflight) cache_preflight=1 ;;
     *) echo "Unknown sandbox build argument: $argument" >&2; exit 2 ;;
   esac
 done
@@ -32,14 +36,18 @@ sources=("$adapter/sandbox_main.c" "$adapter/runtime.c" "$adapter/entry.S"
   "$sandbox/boot/package.c" "$sandbox/boot/fixed_image.c" "$sandbox/arch/x86_64/elf.c"
   "$sandbox/machine/domain.c" "$sandbox/boot/core.c"
   "$protocol/src/closure_manifest.c" "$protocol/src/resource_grant.c" "$protocol/src/sha256.c")
-if [[ "$usb_hid" == 1 && "$net" == 1 ]]; then
+if (( usb_hid + net + amdgpu > 1 )); then
   echo 'select one sandbox device profile' >&2; exit 2
 fi
-if [[ ( "$usb_hid" == 1 || "$net" == 1 ) && "$device" != 1 ]]; then
+if [[ ( "$usb_hid" == 1 || "$net" == 1 || "$amdgpu" == 1 ) && "$device" != 1 ]]; then
   echo 'hosted PCI profile requires a granted PCI device' >&2; exit 2
 fi
+if [[ "$cache_preflight" == 1 && "$amdgpu" != 1 ]]; then
+  echo 'cache preflight requires the AMDGPU sandbox log profile' >&2; exit 2
+fi
 flags=(-DPH_SANDBOX_DEVICE="$device" -DPH_SANDBOX_USB_HID="$usb_hid"
-  -DPH_SANDBOX_NET="$net")
+  -DPH_SANDBOX_NET="$net" -DPH_SANDBOX_AMDGPU="$amdgpu"
+  -DPH_CACHE_PREFLIGHT="$cache_preflight")
 if [[ "$dma_profile" == 1 ]]; then
   flags+=(-DPH_DMA_PROFILE=1)
 fi
@@ -54,7 +62,18 @@ if [[ "$device" == 1 ]]; then
     sources+=("$adapter/usb_input_service.c")
   elif [[ "$net" == 1 ]]; then
     sources+=("$adapter/net_frame_service.c")
+  elif [[ "$amdgpu" == 1 ]]; then
+    sources+=("$adapter/firmware_bundle.c" "$repo_root/userland/libpacha/src/log.c")
   else
+    sources+=("$adapter/gpu_query.c" "$sandbox/boot/drm_query.c"
+      "$adapter/gpu_session_service.c" "$gpud/gpu_sessions.c"
+      "$protocol/src/gpu_session.c" "$adapter/gpu_queue.c"
+      "$gpud/gpu_channel.c" "$protocol/src/virtqueue.c"
+      "$protocol/src/virtqueue_memory.c"
+      "$protocol/arch/x86_64/virtqueue_atomic.c" "$protocol/src/gpu.c"
+      "$protocol/src/gpu_completion.c" "$protocol/src/protocol.c")
+  fi
+  if [[ "$amdgpu" == 1 ]]; then
     sources+=("$adapter/gpu_query.c" "$sandbox/boot/drm_query.c"
       "$adapter/gpu_session_service.c" "$gpud/gpu_sessions.c"
       "$protocol/src/gpu_session.c" "$adapter/gpu_queue.c"

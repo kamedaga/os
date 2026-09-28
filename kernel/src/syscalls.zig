@@ -6,8 +6,11 @@ const interrupts = @import("interrupts.zig");
 const scheduler = @import("scheduler.zig").connection;
 const boot_static = @import("boot/main_static.zig");
 const sc = @import("syscall/numbers.zig");
+const kernel_log = @import("kernel_log.zig");
+const kernel_log_abi = @import("kernel_abi_root").kernel_log_abi;
 const syscall_lock_policy = @import("syscall/lock_policy.zig");
 const capsule_syscalls = @import("syscall/capsule.zig");
+const ram_cache_syscalls = @import("syscall/ram_cache.zig");
 const fd_syscalls = @import("syscall/fd.zig");
 const native_ipc_syscalls = @import("syscall/native_ipc.zig");
 const process_syscalls = @import("syscall/process.zig");
@@ -21,6 +24,7 @@ pub const Hooks = struct {
     user_spaces: *boot_static.UserAddressSpaceTable,
     kernel_state_ready: *const bool,
     write: *const fn ([]const u8) void,
+    write_user: ?*const fn ([]const u8) void = null,
     print_hex: *const fn (u64) void,
     print_number: *const fn (u64) void,
     principal_label: *const fn (kernel.PrincipalId) []const u8,
@@ -142,6 +146,8 @@ pub fn beginExternalPrincipalTeardown(
 }
 
 pub fn endExternalPrincipalTeardown() void {
+    capsule_syscalls.drainDeviceMemoryRetirements(getHooks().state);
+    ram_cache_syscalls.drain(getHooks().state, getHooks().free_list);
     scheduler.endPrincipalLifecycle();
     kernel_state_lock.unlock();
 }
@@ -153,6 +159,8 @@ const KernelStateLockDropContext = struct {
 fn dropKernelStateLockBeforeCurrentThreadLeave(ctx_ptr: *anyopaque) void {
     const ctx: *KernelStateLockDropContext = @ptrCast(@alignCast(ctx_ptr));
     if (!ctx.lock_held.*) return;
+    capsule_syscalls.drainDeviceMemoryRetirements(getHooks().state);
+    ram_cache_syscalls.drain(getHooks().state, getHooks().free_list);
     kernel_state_lock.unlock();
     ctx.lock_held.* = false;
 }
@@ -178,6 +186,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(syscall_hooks_ready), &syscall_hooks_ready));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(kernel_state_lock), &kernel_state_lock));
     end = maxStaticEnd(end, runtime_syscalls.kernelStaticStorageEndAddr());
+    end = maxStaticEnd(end, ram_cache_syscalls.kernelStaticStorageEndAddr());
     end = maxStaticEnd(end, @import("ipc_metric.zig").staticEnd());
     end = maxStaticEnd(end, @import("clockevent.zig").kernelStaticStorageEndAddr());
     return end;
@@ -250,9 +259,9 @@ fn hasExplicitUserLogLabel(message: []const u8) bool {
 }
 
 fn writeThreadUserLogPrefix(h: *const Hooks, thread_index: usize) void {
-    h.write("[Thread ");
-    h.print_number(@intCast(thread_index));
-    h.write("] ");
+    var buffer: [40]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&buffer, "[Thread {d}] ", .{thread_index}) catch return;
+    (h.write_user orelse h.write)(prefix);
 }
 
 fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
@@ -296,7 +305,11 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     defer {
         perf.runtimeElapsed(runtime_path, .locked_body_cycles, runtime_body_start);
         const runtime_unlock_start = perf.runtimeTimestamp(runtime_path);
-        if (lock_held) kernel_state_lock.unlock();
+        if (lock_held) {
+            capsule_syscalls.drainDeviceMemoryRetirements(state);
+            ram_cache_syscalls.drain(state, h.free_list);
+            kernel_state_lock.unlock();
+        }
         perf.runtimeElapsed(runtime_path, .unlock_cycles, runtime_unlock_start);
     }
 
@@ -350,6 +363,21 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     }
 
     return switch (frame.rax) {
+        sc.syscall_kernel_log_read => blk: {
+            if (comptime !kernel_log.ring_enabled) break :blk sc.syscall_err_not_ready;
+            if (frame.rsi != @sizeOf(kernel_log_abi.Read)) break :blk sc.syscall_err_invalid;
+            var reply = std.mem.zeroes(kernel_log_abi.Read);
+            if (!h.copy_user_bytes_from_va(proc, frame.rdi, std.mem.asBytes(&reply)[0..32]))
+                break :blk sc.syscall_err_invalid;
+            if (reply.version != kernel_log_abi.read_version or reply.reserved != 0 or
+                reply.limit == 0 or reply.limit > kernel_log_abi.read_max_bytes)
+                break :blk sc.syscall_err_invalid;
+            if (!kernel_log.readDebug(reply.cursor, reply.bytes[0..@intCast(reply.limit)], &reply))
+                break :blk sc.syscall_err_empty;
+            if (!h.copy_bytes_to_user_va(proc, frame.rdi, std.mem.asBytes(&reply)))
+                break :blk sc.syscall_err_invalid;
+            break :blk sc.syscall_ok;
+        },
         sc.syscall_log => blk: {
             const req_len_u64 = frame.rsi;
             if (req_len_u64 == 0) break :blk sc.syscall_ok;
@@ -361,7 +389,7 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
             if (!hasExplicitUserLogLabel(msg)) {
                 writeThreadUserLogPrefix(h, scheduler.currentThread());
             }
-            h.write(msg);
+            (h.write_user orelse h.write)(msg);
             break :blk sc.syscall_ok;
         },
         else => sc.syscall_err_invalid,
@@ -427,8 +455,7 @@ const InterruptWaiterTest = struct {
     }
 
     fn complete(timer: bool) void {
-        if (timer) completePendingTimerFdWaitersFromInterrupt(100)
-        else completePendingIrqFdWaitersFromInterrupt();
+        if (timer) completePendingTimerFdWaitersFromInterrupt(100) else completePendingIrqFdWaitersFromInterrupt();
     }
 
     fn run(timer: bool) !void {
@@ -439,9 +466,7 @@ const InterruptWaiterTest = struct {
         defer ctx.* = previous_context;
         // A stopped native waiter can complete without dispatching a real
         // host CPU. Its resume-after-stop state still uses the real token path.
-        ctx.* = .{ .id = tid, .allocated = true, .generation = generation,
-            .owner_process = owner, .stopped = true, .wait_mailbox = true,
-            .active_wait_token = token };
+        ctx.* = .{ .id = tid, .allocated = true, .generation = generation, .owner_process = owner, .stopped = true, .wait_mailbox = true, .active_wait_token = token };
         try std.testing.expect(kernel.initRuntimeStorage(&storage));
         const state = try std.testing.allocator.create(kernel.KernelState);
         defer std.testing.allocator.destroy(state);
@@ -463,11 +488,9 @@ const InterruptWaiterTest = struct {
         syscall_hooks_storage.write_user_u64 = copy;
         syscall_hooks_ready = true;
         const rights = kernel.FdRights{ .poll = true, .read = true, .irq_wait = true, .close = true };
-        const fd = if (timer) try state.createTimerFd(owner, 100, 0, .{}, rights, 16)
-            else try state.createIrqFd(owner, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
+        const fd = if (timer) try state.createTimerFd(owner, 100, 0, .{}, rights, 16) else try state.createIrqFd(owner, .{ .device = 0x1001, .kind = .msix, .vector = 1 }, rights, .{}, 16);
         const group = try state.beginFdWaitGroup(owner, tid, generation, token);
-        try std.testing.expect(try state.registerTaskReadableWaiterForFd(
-            owner, fd, fd_abi.event_readable, poll_address, tid, generation, token, group));
+        try std.testing.expect(try state.registerTaskReadableWaiterForFd(owner, fd, fd_abi.event_readable, poll_address, tid, generation, token, group));
         try state.armFdWaitGroup(group);
         if (timer) {
             _ = clockevent.publish(100);

@@ -41,18 +41,29 @@ int main(void)
         assert(backend.pages[0].data[i] == 0);
     filed_tmpfs_free_page(&backend, 1);
     assert(!live_pages);
-    /* One inode can own the entire unchanged global budget. Ownership
+    /* One inode can own the entire global budget. Ownership
      * metadata must not impose the former 4096-page per-file ceiling. */
     filed_tmpfs_inode_t inode = {0};
-    backend.free_page_count = FILED_TMPFS_PAGE_POOL_PAGES;
-    for (unsigned i = 0; i < FILED_TMPFS_PAGE_POOL_PAGES; ++i)
-        backend.free_page_stack[i] = (uint16_t)(i + 1);
-    for (unsigned i = 0; i < FILED_TMPFS_PAGE_POOL_PAGES; ++i) {
+    /* Page IDs now cross the old uint16_t ceiling without allocating the
+     * entire 512 MiB budget merely to exercise the widened metadata. */
+    backend.free_page_count = 1;
+    backend.free_page_stack[0] = 65536;
+    int high_id = filed_tmpfs_alloc_page(&backend);
+    assert(high_id == 65536);
+    assert(filed_tmpfs_note_inode_page(&backend, &inode, 100, (uint32_t)high_id));
+    assert(filed_tmpfs_inode_page_id(&backend, &inode, 100) == 65536);
+    filed_tmpfs_free_inode_pages(&backend, &inode, 0);
+    assert(!live_pages);
+    enum { TEST_PAGES = 8192 };
+    backend.free_page_count = TEST_PAGES;
+    for (unsigned i = 0; i < TEST_PAGES; ++i)
+        backend.free_page_stack[i] = (uint32_t)(i + 1);
+    for (unsigned i = 0; i < TEST_PAGES; ++i) {
         int id = filed_tmpfs_alloc_page(&backend);
         assert(id > 0);
-        assert(filed_tmpfs_note_inode_page(&backend, &inode, i * 2, (uint16_t)id));
+        assert(filed_tmpfs_note_inode_page(&backend, &inode, i * 2, (uint32_t)id));
     }
-    assert(inode.allocated_page_count == FILED_TMPFS_PAGE_POOL_PAGES);
+    assert(inode.allocated_page_count == TEST_PAGES);
     assert(filed_tmpfs_alloc_page(&backend) == -28);
     assert(filed_tmpfs_inode_page_id(&backend, &inode, 8192));
     assert(!filed_tmpfs_inode_page_id(&backend, &inode, 8193));
@@ -62,10 +73,10 @@ int main(void)
     assert(filed_tmpfs_inode_page_id(&backend, &inode, 8190));
     int reused = filed_tmpfs_alloc_page(&backend);
     assert(reused > 0);
-    assert(filed_tmpfs_note_inode_page(&backend, &inode, 9000, (uint16_t)reused));
+    assert(filed_tmpfs_note_inode_page(&backend, &inode, 9000, (uint32_t)reused));
     filed_tmpfs_free_inode_pages(&backend, &inode, 0);
     assert(!inode.allocated_page_count && !inode.first_allocated_page);
-    assert(backend.free_page_count == FILED_TMPFS_PAGE_POOL_PAGES && !live_pages);
+    assert(backend.free_page_count == TEST_PAGES && !live_pages);
     puts("tmpfs lazy allocation failure, reclaim and zeroed reuse PASS");
     puts("tmpfs full-pool single inode, quota, sparse lookup and partial reclaim PASS");
 }

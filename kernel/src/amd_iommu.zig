@@ -193,14 +193,36 @@ fn pageAddress(entry: u64) u64 {
 }
 
 fn allocZeroPage() ?u64 {
-    const free_list = state.free_list orelse return null;
+    return allocZeroPageForPreparation(null);
+}
+
+const Preparation = struct { unit: usize, stage: []const u8 };
+
+fn preparationFailure(context: Preparation, reason: []const u8, paddr: u64, pages: usize) void {
+    log.writeFmt("amd-iommu: unit={} stage={s} error={s}\n", .{ context.unit, context.stage, reason });
+    log.writeFmt("amd-iommu: requested_pages={} paddr=0x{x}\n", .{ pages, paddr });
+    if (state.free_list) |list| {
+        const available = list.availableBelow(four_gib);
+        log.writeFmt("amd-iommu: below4G free_pages={} largest_run={}\n", .{ available.total, available.largest_run });
+    }
+}
+
+fn allocZeroPageForPreparation(context: ?Preparation) ?u64 {
+    const free_list = state.free_list orelse {
+        if (context) |where| preparationFailure(where, "MissingFreeList", 0, 1);
+        return null;
+    };
     const paddr = if (builtin.is_test)
         free_list.popFront() catch return null
     else
-        free_list.popFrontBelow(four_gib) catch return null;
+        free_list.popFrontBelow(four_gib) catch |err| {
+            if (context) |where| preparationFailure(where, @errorName(err), 0, 1);
+            return null;
+        };
     if (builtin.is_test) {
         @memset(pageAt(paddr)[0..], 0);
     } else if (!user_copy.zeroPhysicalPage(paddr)) {
+        if (context) |where| preparationFailure(where, "PhysicalZeroFailed", paddr, 1);
         free_list.appendPage(0, paddr) catch {};
         return null;
     }
@@ -607,9 +629,7 @@ fn sourceIsExclusive(candidate: Candidate) bool {
     return count == 1;
 }
 
-fn translatedPreparedDte(definition: *const ivrs.Unit, source: u16,
-    current: Dte, root: u64, did: u16) ?Dte
-{
+fn translatedPreparedDte(definition: *const ivrs.Unit, source: u16, current: Dte, root: u64, did: u16) ?Dte {
     const initial = initialDteWords(definition, source);
     // A SysMgt=1 requester starts with IW set for AMD Erratum 63. Compare
     // against the IVRS-derived initial state, not a hard-coded bare V bit;
@@ -647,10 +667,8 @@ fn installDomains() bool {
             return false;
         }
         const dte = deviceTableAt(unit, source);
-        dte.* = translatedPreparedDte(&state.info.units[candidate.unit_index],
-            source, dte.*, root, did) orelse {
-            log.writeFmt("amd-iommu: prepared DTE mismatch source=0x{x} word0=0x{x} word1=0x{x}\n",
-                .{ source, dte[0], dte[1] });
+        dte.* = translatedPreparedDte(&state.info.units[candidate.unit_index], source, dte.*, root, did) orelse {
+            log.writeFmt("amd-iommu: prepared DTE mismatch source=0x{x} word0=0x{x} word1=0x{x}\n", .{ source, dte[0], dte[1] });
             return false;
         };
         state.domains[state.domain_count] = .{
@@ -738,8 +756,7 @@ fn prepareUnit(index: usize) bool {
     const mmio_status = smp.explicitUcIdentityMmioStatus(definition.mmio_base, unit_register_bytes);
     if (mmio_status != .ready) {
         const evidence = smp.mmioCacheEvidenceMasks();
-        log.writeFmt("amd-iommu: unit={} MMIO UC proof failed reason={s} base=0x{x} verified=0x{x} matching=0x{x} online=0x{x}\n",
-            .{ index, @tagName(mmio_status), definition.mmio_base, evidence.verified, evidence.matching, evidence.online });
+        log.writeFmt("amd-iommu: unit={} MMIO UC proof failed reason={s} base=0x{x} verified=0x{x} matching=0x{x} online=0x{x}\n", .{ index, @tagName(mmio_status), definition.mmio_base, evidence.verified, evidence.matching, evidence.online });
         return false;
     }
     unit.register_base = definition.mmio_base;
@@ -755,15 +772,24 @@ fn prepareUnit(index: usize) bool {
     }
     for (definition.special_sources[0..definition.special_count]) |special| largest = @max(largest, special.source);
     const pages = (@as(usize, largest) / 128) + 1;
-    const list = state.free_list orelse return false;
-    const base = list.popContiguousBelow(pages, four_gib) catch return false;
+    const list = state.free_list orelse {
+        preparationFailure(.{ .unit = index, .stage = "device-table" }, "MissingFreeList", 0, pages);
+        return false;
+    };
+    const base = list.popContiguousBelow(pages, four_gib) catch |err| {
+        preparationFailure(.{ .unit = index, .stage = "device-table" }, @errorName(err), 0, pages);
+        return false;
+    };
     unit.device_table_paddr = base;
     unit.device_table_pages = pages;
     for (0..pages) |page_index| {
         const paddr = base + @as(u64, @intCast(page_index)) * page_size;
         if (builtin.is_test) {
             @memset(pageAt(paddr)[0..], 0);
-        } else if (!user_copy.zeroPhysicalPage(paddr)) return false;
+        } else if (!user_copy.zeroPhysicalPage(paddr)) {
+            preparationFailure(.{ .unit = index, .stage = "device-table-zero" }, "PhysicalZeroFailed", paddr, pages);
+            return false;
+        }
     }
     // DTE[V]=0 passes ordinary DMA through. Fill even unused slots with
     // V=1, TV=0 so they fault rather than bypass the isolation boundary.
@@ -774,9 +800,9 @@ fn prepareUnit(index: usize) bool {
         dte[0] = initial[0];
         dte[1] = initial[1];
     }
-    unit.command_paddr = allocZeroPage() orelse return false;
-    unit.event_paddr = allocZeroPage() orelse return false;
-    unit.completion_paddr = allocZeroPage() orelse return false;
+    unit.command_paddr = allocZeroPageForPreparation(.{ .unit = index, .stage = "command" }) orelse return false;
+    unit.event_paddr = allocZeroPageForPreparation(.{ .unit = index, .stage = "event" }) orelse return false;
+    unit.completion_paddr = allocZeroPageForPreparation(.{ .unit = index, .stage = "completion" }) orelse return false;
     return true;
 }
 
@@ -1056,16 +1082,12 @@ test "AMD IOMMU domain accepts IVRS SysMgt IW without dropping it" {
     definition.special_count = 1;
     const initial = initialDteWords(&definition, 0x00a0);
     const prepared = Dte{ initial[0], initial[1], 0, 0 };
-    const translated = translatedPreparedDte(&definition, 0x00a0,
-        prepared, 0x0040_0000, 7) orelse return error.ExpectedTranslatedDte;
+    const translated = translatedPreparedDte(&definition, 0x00a0, prepared, 0x0040_0000, 7) orelse return error.ExpectedTranslatedDte;
     try std.testing.expectEqual(@as(u64, 0x0040_0000 | (@as(u64, 4) << 9) | 3 | read_bit | write_bit), translated[0]);
     try std.testing.expectEqual(@as(u64, 7 | (@as(u64, 1) << 40)), translated[1]);
-    try std.testing.expect(translatedPreparedDte(&definition, 0x00a0,
-        .{ 1, initial[1], 0, 0 }, 0x0040_0000, 7) == null);
-    try std.testing.expect(translatedPreparedDte(&definition, 0x00a0,
-        .{ initial[0], initial[1], 1, 0 }, 0x0040_0000, 7) == null);
-    try std.testing.expect(translatedPreparedDte(&definition, 0x00a0,
-        prepared, 0x0040_0001, 7) == null);
+    try std.testing.expect(translatedPreparedDte(&definition, 0x00a0, .{ 1, initial[1], 0, 0 }, 0x0040_0000, 7) == null);
+    try std.testing.expect(translatedPreparedDte(&definition, 0x00a0, .{ initial[0], initial[1], 1, 0 }, 0x0040_0000, 7) == null);
+    try std.testing.expect(translatedPreparedDte(&definition, 0x00a0, prepared, 0x0040_0001, 7) == null);
 }
 
 test "AMD IOMMU DTE puts DMA permissions in first word" {

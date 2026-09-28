@@ -7,6 +7,9 @@ if [ "$#" -lt 3 ]; then
 fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+# Native musl has its own PachaOS syscall table; a mismatch can boot but
+# silently break malloc/mmap before any service can report a useful error.
+python3 "$repo_root/tests/check_native_syscall_numbers.py" >/dev/null
 source_dir=$1
 build_dir=$2
 shift 2

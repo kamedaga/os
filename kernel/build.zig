@@ -99,6 +99,14 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run kernel unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    const kernel_log_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/kernel_log.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kernel_log_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const kernel_log_tests = b.addTest(.{ .root_module = kernel_log_test_mod });
+    test_step.dependOn(&b.addRunArtifact(kernel_log_tests).step);
     const clock_copy_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime_clock_copy_test.zig"),
         .target = target,
@@ -129,6 +137,18 @@ pub fn build(b: *std.Build) void {
     const mmio_overlay_tests = b.addTest(.{ .root_module = mmio_overlay_mod, .filters = &.{"MMIO overlay"} });
     mmio_overlay_tests.stack_size = 64 * 1024 * 1024;
     test_step.dependOn(&b.addRunArtifact(mmio_overlay_tests).step);
+    const ram_cache_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/memory/ram_cache_policy.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(ram_cache_tests).step);
+    const ram_cache_paging_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/memory/ram_cache_paging.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(ram_cache_paging_tests).step);
     const interrupt_waiter_mod = b.createModule(.{
         .root_source_file = b.path("src/syscalls.zig"),
         .target = target,
@@ -137,7 +157,7 @@ pub fn build(b: *std.Build) void {
     interrupt_waiter_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     interrupt_waiter_mod.addCSourceFile(.{ .file = b.path("../tests/interrupt_waiter_host.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     addVerifiedSchedulerHostObject(b, interrupt_waiter_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_interrupt_test.o");
-    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{ "shootdown interrupt guard", "copy window", "poll item snapshot" }, .use_llvm = true });
+    const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{ "shootdown interrupt guard", "copy window", "poll item snapshot", "MMIO cache admission", "WC identity lease", "WC physical window leases" }, .use_llvm = true });
     interrupt_waiter_tests.stack_size = 512 * 1024 * 1024;
     test_step.dependOn(&b.addRunArtifact(interrupt_waiter_tests).step);
     const realtime_clock_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -241,10 +261,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     smp_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
-    const smp_tests = b.addTest(.{ .root_module = smp_test_mod, .filters = &.{ "broadcast", "MMIO alias" } });
+    const smp_tests = b.addTest(.{ .root_module = smp_test_mod, .filters = &.{ "broadcast", "MMIO alias", "MMIO WC snapshot", "WC PAT setup" } });
     test_step.dependOn(&b.addRunArtifact(smp_tests).step);
 
     const kernel_debug = b.option(bool, "kernel-debug", "Keep kernel debug information and symbols in the boot ELF") orelse false;
+    const log_ring_options = b.addOptions();
+    log_ring_options.addOption(bool, "log_ring_enabled", b.option(bool, "kernel-log-ring", "Expose a bounded kernel-only log to user space for debugging") orelse false);
     const smp_profile_options = b.addOptions();
     smp_profile_options.addOption(bool, "enabled", b.option(bool, "smp-profile", "Enable per-CPU SMP diagnostic counters") orelse false);
     const ipc_profile_options = b.addOptions();
@@ -275,6 +297,7 @@ pub fn build(b: *std.Build) void {
     limine_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     limine_mod.addOptions("smp_profile_options", smp_profile_options);
     limine_mod.addOptions("ipc_profile_options", ipc_profile_options);
+    limine_mod.addOptions("kernel_log_ring_options", log_ring_options);
     limine_mod.addOptions("boot_checkpoint_options", normal_checkpoint_options);
     limine_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
     addVerifiedSchedulerElfObject(b, limine_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_limine.o");
@@ -306,6 +329,7 @@ pub fn build(b: *std.Build) void {
     diag_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     diag_mod.addOptions("smp_profile_options", smp_profile_options);
     diag_mod.addOptions("ipc_profile_options", ipc_profile_options);
+    diag_mod.addOptions("kernel_log_ring_options", log_ring_options);
     diag_mod.addOptions("boot_checkpoint_options", diag_options);
     diag_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
     addVerifiedSchedulerElfObject(b, diag_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_diag.o");
@@ -332,6 +356,7 @@ pub fn build(b: *std.Build) void {
     diag_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
     diag_test_mod.addOptions("smp_profile_options", smp_profile_options);
     diag_test_mod.addOptions("ipc_profile_options", ipc_profile_options);
+    diag_test_mod.addOptions("kernel_log_ring_options", log_ring_options);
     diag_test_mod.addOptions("boot_checkpoint_options", diag_test_options);
     diag_test_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
     addVerifiedSchedulerElfObject(b, diag_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_diag_test.o");
@@ -361,11 +386,10 @@ pub fn build(b: *std.Build) void {
         checkpoint_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
         checkpoint_mod.addOptions("smp_profile_options", smp_profile_options);
         checkpoint_mod.addOptions("ipc_profile_options", ipc_profile_options);
+        checkpoint_mod.addOptions("kernel_log_ring_options", log_ring_options);
         checkpoint_mod.addOptions("boot_checkpoint_options", checkpoint_options);
         checkpoint_mod.addImport("kernel_boot_api", kernel_boot_api_mod);
-        addVerifiedSchedulerElfObject(b, checkpoint_mod,
-            "../verified/scheduling/src/pacha_eevdf.c",
-            b.fmt("pacha_eevdf_checkpoint_{s}.o", .{checkpoint}));
+        addVerifiedSchedulerElfObject(b, checkpoint_mod, "../verified/scheduling/src/pacha_eevdf.c", b.fmt("pacha_eevdf_checkpoint_{s}.o", .{checkpoint}));
         const checkpoint_exe = b.addExecutable(.{
             .name = b.fmt("pacha-checkpoint-{s}", .{checkpoint}),
             .root_module = checkpoint_mod,

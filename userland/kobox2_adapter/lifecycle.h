@@ -43,10 +43,12 @@ struct ph_lifecycle {
     struct ph_task *receiver;
     atomic_uint start;
     atomic_int terminal;
+    atomic_int monitor_abort;
     atomic_uint work;
     int work_result;
     struct ph_lifecycle_service service;
     uint64_t generation, token;
+    bool monitored;
 };
 
 /* After bootstrap/package verification, on a registered task with core TLS
@@ -56,6 +58,12 @@ struct ph_lifecycle {
  * ready() sends once, then releases the receiver; neither callback allocates
  * or enters Linux. A transport error is terminal, not graceful quiescence. */
 int ph_lifecycle_start(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc);
+/* AMDGPU inspection only: a Linux-side sensor/time abort also retires the
+ * native receiver, so normal module cleanup cannot hang at join. */
+int ph_lifecycle_start_inspected(struct ph_lifecycle *lifecycle,
+    struct ph_ipc *ipc);
+int ph_lifecycle_start_monitored_service(struct ph_lifecycle *lifecycle,
+    struct ph_ipc *ipc, const struct ph_lifecycle_service *service);
 int ph_lifecycle_start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
     const struct ph_lifecycle_service *service);
 /* After modules_run returns (including init failure). Joins the native

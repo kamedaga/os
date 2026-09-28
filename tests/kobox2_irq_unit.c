@@ -27,6 +27,24 @@ static void *(*collector_entry)(void *);
 static void *collector_argument;
 static struct kobox_linux_irq_route replacement;
 static jmp_buf fatal_jump;
+static unsigned int irq_summaries;
+static unsigned long last_received, last_dispatched, last_acknowledged;
+
+void ph_boot_log_irq_failure(unsigned long mode, unsigned long index,
+    unsigned long count, unsigned long cpu, unsigned long step,
+    unsigned long raw, unsigned long result) {
+    (void)mode; (void)index; (void)count; (void)cpu;
+    (void)step; (void)raw; (void)result;
+}
+
+void ph_boot_log_irq_summary(unsigned long received,
+    unsigned long dispatched, unsigned long acknowledged) {
+    assert(!locked);
+    ++irq_summaries;
+    last_received = received;
+    last_dispatched = dispatched;
+    last_acknowledged = acknowledged;
+}
 
 _Noreturn void ph_fail(const char *file, unsigned line, uint64_t result) {
     if (!expect_fatal) fprintf(stderr, "%s:%u result=%llu\n", file, line,
@@ -297,7 +315,14 @@ int main(void) {
     assert(host->allocate(&port, KOBOX_IRQ_MSIX, 1, 1, 0, &replacement) == -ENODEV);
     assert(host->mask(&port, 0, routes[0].cookie, 0) == -ENODEV);
     assert(!host->release(&port, 0, routes[0].cookie));
+    uint64_t received = 0, dispatched = 0, acknowledged = 0;
+    assert(!ph_irq_snapshot(&port, &received, &dispatched, &acknowledged));
+    assert(received >= 2 && dispatched >= 2 && acknowledged == dispatched);
+    assert(!locked && ph_irq_snapshot(&port, NULL, &dispatched,
+        &acknowledged) == -EINVAL);
     assert(!ph_irq_destroy(&port) && creates == joins);
+    assert(irq_summaries == 1 && last_received >= 2 &&
+        last_dispatched >= 2 && last_acknowledged == last_dispatched);
     uint64_t old_sequence = cookie_sequence;
     init_port();
     assert(!host->allocate(&port, KOBOX_IRQ_MSIX, 0, 1, 0, routes));
@@ -331,6 +356,7 @@ int main(void) {
     before = calls;
     assert(host->allocate(&port, KOBOX_IRQ_MSIX, 0, 1, 0, routes) == -EOVERFLOW);
     assert(calls == before && !ph_irq_destroy(&port));
+    assert(irq_summaries == 2);
     assert(!locked && !notification_mask && creates == joins);
     puts("kobox2 IRQ native-wrapper/collector unit: PASS");
     return 0;

@@ -65,6 +65,8 @@ struct gpud_drm_connection {
 struct gpud_drm_service {
     struct gpud_drm_files files;
     struct gpud_gpu_rpc gpu;
+    uint32_t profile_kind;
+    int log_endpoint_fd;
     uint64_t backend_client, correlation, event_sequence;
     uint64_t resource_creates, gem_closes, exec_submits;
     struct gpud_drm_pending_fence *fences;
@@ -93,6 +95,9 @@ int gpud_drm_service_bind(struct gpud_drm_service *service, int endpoint_fd);
  * request; other errors stop the service. A Linux operation error is sent in
  * the reply, not returned here. CLOSE waits for the real backend completion. */
 int gpud_drm_service_receive(struct gpud_drm_service *service);
+/* While an optional physical GPU is armed but not probed, the public node
+ * must answer clients instead of leaving an IPC_CALL waiting indefinitely. */
+int gpud_drm_service_reject_unavailable(int endpoint_fd);
 /* Drain completed sandbox event-lane messages into the handle-local backlog
  * and signal the original LPR notification channel on empty->nonempty. */
 int gpud_drm_service_pump_events(struct gpud_drm_service *service);

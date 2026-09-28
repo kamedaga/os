@@ -5,7 +5,7 @@
 
 enum {
     NETD_BOOT_CONFIG_MAGIC = 0x4e455444424f4f54ull,
-    NETD_BOOT_CONFIG_VERSION = 8,
+    NETD_BOOT_CONFIG_VERSION = 9,
     NETD_BOOT_STATUS_MAGIC = 0x3153544154454e4eull,
     NETD_BOOT_FAULT_MAGIC = 0x31544c5541464e4eull,
     NETD_BOOT_STAGE_NIC = 1,
@@ -59,7 +59,10 @@ struct netd_boot_config {
      * This private bootstrap ABI is rebuilt with its consumer; v8 also
      * carries unhandled fault location without accepting older layouts. */
     uint64_t status_channel_fd;
-    uint64_t reserved[5];
+    /* Optional SEND-only userland diagnostics sink. Zero keeps standalone
+     * and non-live launches independent of logd. */
+    uint64_t log_endpoint_fd;
+    uint64_t reserved[4];
 };
 
 _Static_assert(sizeof(struct netd_boot_config) == 120,

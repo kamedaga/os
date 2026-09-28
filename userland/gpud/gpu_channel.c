@@ -39,7 +39,7 @@ int ph_gpu_channel_bind(struct gpud_gpu_channel *channel,
             .queue_id = i + 1,
             .rights = KB2_PROTOCOL_REGION_RIGHT_READ | KB2_PROTOCOL_REGION_RIGHT_WRITE,
             .transport_base = (i + 1) * GPUD_GPU_CHANNEL_PAGE,
-            .length = (i == GPUD_GPU_QUEUE_EXECUTION ? 3 : 1) * GPUD_GPU_CHANNEL_PAGE};
+            .length = (i == GPUD_GPU_QUEUE_EXECUTION ? 6 : 1) * GPUD_GPU_CHANNEL_PAGE};
     }
     channel->region = (kb2_protocol_region_t){.region_id = 1,
                                               .rights = KB2_PROTOCOL_REGION_RIGHT_READ |

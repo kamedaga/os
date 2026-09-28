@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 #include "drm_reply.h"
 
+#include <kobox2/amdgpu_info_shape.h>
+
 #include <errno.h>
 #include <limits.h>
 #include <stddef.h>
@@ -42,7 +44,8 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
     /* Bind output conversion to the exact request admitted by the owner. */
     struct gpud_drm_translation expected;
     struct gpud_drm_binding binding = {.generation = translation->generation,
-        .frontend_handle = translation->frontend_handle, .session_id = translation->session_id};
+        .frontend_handle = translation->frontend_handle, .session_id = translation->session_id,
+        .profile_kind = translation->profile_kind};
     if (gpud_drm_ioctl_encode(&expected, &binding, request, translation->region.region_id) ||
         expected.command_size != translation->command_size ||
         expected.command_set_id != translation->command_set_id ||
@@ -63,9 +66,17 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
     const int virtgpu_map =
         expected.command_set_id == KB2_GPU_DRM_VIRTGPU_SET_ID &&
         expected.command_id == KB2_GPU_DRM_VIRTGPU_COMMAND_MAP;
-    if (mode_map || virtgpu_map) {
+    const int amdgpu_map =
+        expected.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_AMDGPU_COMMAND_GEM_MMAP;
+    if (mode_map || virtgpu_map || amdgpu_map) {
         kb2_gpu_virtgpu_map_completion_t mapped;
-        const kb2_protocol_status_t decoded = mode_map ?
+        const kb2_protocol_status_t decoded = amdgpu_map ?
+            kb2_gpu_amdgpu_map_completion_decode(
+                reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                envelope.payload_length, binding.session_id,
+                binding.generation, &mapped) :
+            mode_map ?
             kb2_gpu_mode_map_completion_decode(
                 reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
                 envelope.payload_length, binding.session_id,
@@ -74,13 +85,23 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
                 reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
                 envelope.payload_length, binding.session_id,
                 binding.generation, &mapped);
-        if (decoded)
-            return -EPROTO;
+        if (decoded) {
+            /* Failed mappings carry the ordinary typed status envelope, not
+             * a memory attachment. Preserve the driver error instead of
+             * turning every rejected map into an artificial EPROTO. */
+            if (kb2_gpu_inline_completion_decode(
+                    reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+                    envelope.payload_length, binding.session_id,
+                    &completion) || completion.status == KB2_GPU_STATUS_OK ||
+                completion.record_schema_id || completion.length)
+                return -EPROTO;
+            return gpud_drm_status_errno(completion.status);
+        }
         int result = gpud_drm_status_errno(mapped.status);
         if (result) return result;
         if (mapped.rights !=
                 (KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE) ||
-            mapped.cache_policy || mapped.length > UINT32_MAX)
+            mapped.cache_policy > KB2_GPU_MAPPING_CACHE_UC || mapped.length > UINT32_MAX)
             return -EPROTO;
         translation->mapping_id = mapped.mapping_id;
         translation->mapping_length = mapped.length;
@@ -161,6 +182,7 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
                 return -EPROTO;
             memcpy(request->data, completion.data, sizeof(uint32_t));
             return 0;
+
         case KB2_GPU_DRM_MODE_COMMAND_AUTH_MAGIC:
         case KB2_GPU_DRM_MODE_COMMAND_SET_MASTER:
         case KB2_GPU_DRM_MODE_COMMAND_DROP_MASTER:
@@ -345,6 +367,104 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
             memcpy(request->data, &wire, sizeof(wire));
             return 0;
         }
+        default:
+            return -EOPNOTSUPP;
+        }
+    }
+    if (expected.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_AMDGPU_COMMAND_INFO) {
+        uint32_t query = read_u32(request->data + 12);
+        uint32_t selectors[4];
+        struct kb2_amdgpu_info_shape shape;
+        for (unsigned int i = 0; i < 4; ++i)
+            selectors[i] = read_u32(request->data + 16 + i * 4);
+        if (!kb2_amdgpu_info_shape(query, selectors, &shape) ||
+            request->aux_size != shape.bytes) return -EPROTO;
+        uint32_t record = shape.record, count = shape.count;
+        if (completion.record_schema_id != KB2_GPU_DRM_AMDGPU_RECORD_INFO_RESULT ||
+            completion.length != KB2_GPU_DRM_AMDGPU_RECORD_INFO_RESULT_SIZE ||
+            read_u32(completion.data +
+                KB2_GPU_DRM_AMDGPU_RECORD_INFO_RESULT_RESPONSE_RECORD_ID_OFFSET) != record ||
+            read_u32(completion.data +
+                KB2_GPU_DRM_AMDGPU_RECORD_INFO_RESULT_RESPONSE_COUNT_OFFSET) != count ||
+            read_u32(completion.data +
+                KB2_GPU_DRM_AMDGPU_RECORD_INFO_RESULT_RESPONSE_BYTES_OFFSET) != request->aux_size ||
+            read_u32(completion.data +
+                KB2_GPU_DRM_AMDGPU_RECORD_INFO_RESULT_REQUIRED_COUNT_OFFSET) != count)
+            return -EPROTO;
+        return 0;
+    }
+    if (expected.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID) {
+        switch (expected.command_id) {
+        case KB2_GPU_DRM_AMDGPU_COMMAND_GEM_CREATE:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_GEM_HANDLE_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_GEM_HANDLE_RESULT_SIZE ||
+                !read_u32(completion.data) || read_u32(completion.data + 4))
+                return -EPROTO;
+            memcpy(request->data, completion.data, sizeof(uint32_t));
+            return 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_CONTEXT:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_CONTEXT_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_CONTEXT_RESULT_SIZE ||
+                read_u32(completion.data) != read_u32(request->data) ||
+                (read_u32(request->data) == 1 &&
+                 !read_u32(completion.data + 4)))
+                return -EPROTO;
+            if (read_u32(request->data) == 1)
+                memcpy(request->data, completion.data + 4, sizeof(uint32_t));
+
+            else if (read_u32(request->data) == 3 || read_u32(request->data) == 4)
+                memcpy(request->data, completion.data + 8, 16);
+            return 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_GEM_METADATA:
+            if (completion.record_schema_id != KB2_GPU_DRM_AMDGPU_RECORD_GEM_METADATA_RESULT ||
+                completion.length != KB2_GPU_DRM_AMDGPU_RECORD_GEM_METADATA_RESULT_SIZE ||
+                read_u32(completion.data + 16) > 256 || read_u32(completion.data + 20))
+                return -EPROTO;
+            memcpy(request->data + 8, completion.data, 20);
+            memset(request->data + 28, 0, 260);
+            memcpy(request->data + 28, completion.data + 24, read_u32(completion.data + 16));
+            return 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_GEM_WAIT_IDLE:
+            if (completion.record_schema_id != KB2_GPU_DRM_AMDGPU_RECORD_GEM_WAIT_IDLE_RESULT ||
+                completion.length != KB2_GPU_DRM_AMDGPU_RECORD_GEM_WAIT_IDLE_RESULT_SIZE ||
+                read_u32(completion.data) > 1) return -EPROTO;
+            memcpy(request->data, completion.data, 8);
+            return 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_CS:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_CS_RESULT ||
+                completion.length != KB2_GPU_DRM_AMDGPU_RECORD_CS_RESULT_SIZE ||
+                !read_u64(completion.data))
+                return -EPROTO;
+            memcpy(request->data, completion.data, sizeof(uint64_t));
+            return 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_GEM_VA:
+            return completion.record_schema_id || completion.length ?
+                -EPROTO : 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_WAIT_CS:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_WAIT_STATUS_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_WAIT_STATUS_RESULT_SIZE ||
+                read_u32(completion.data) > 1 ||
+                read_u32(completion.data + 4))
+                return -EPROTO;
+            memset(request->data, 0, sizeof(uint64_t));
+            memcpy(request->data, completion.data, sizeof(uint32_t));
+            return 0;
+        case KB2_GPU_DRM_AMDGPU_COMMAND_VM:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_VM_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_AMDGPU_RECORD_VM_RESULT_SIZE)
+                return -EPROTO;
+            memcpy(request->data, completion.data, sizeof(uint64_t));
+            return 0;
         default:
             return -EOPNOTSUPP;
         }

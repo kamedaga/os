@@ -8,6 +8,7 @@ const runtime_abi = abi_root.runtime_abi;
 const vm_abi = abi_root.vm_abi;
 
 pub const syscall_log: u64 = 1;
+pub const syscall_kernel_log_read: u64 = 2;
 pub const syscall_process_create: u64 = process_abi.syscall_process_create;
 pub const syscall_process_kill: u64 = process_abi.syscall_process_kill;
 pub const syscall_process_wait: u64 = process_abi.syscall_process_wait;
@@ -66,6 +67,7 @@ pub const syscall_timerfd_settime: u64 = fd_abi.syscall_timerfd_settime;
 pub const syscall_timerfd_gettime: u64 = fd_abi.syscall_timerfd_gettime;
 pub const syscall_vmo_create: u64 = fd_abi.syscall_vmo_create;
 pub const syscall_vmo_grow: u64 = fd_abi.syscall_vmo_grow;
+pub const syscall_vmo_cache_policy: u64 = fd_abi.syscall_vmo_cache_policy;
 pub const syscall_vmo_create_page_view: u64 = fd_abi.syscall_vmo_create_page_view;
 pub const syscall_vmo_revoke: u64 = fd_abi.syscall_vmo_revoke;
 pub const syscall_mmap: u64 = vm_abi.syscall_mmap;
@@ -117,6 +119,7 @@ test "native syscall numbers are contiguous" {
     const std = @import("std");
     const expected = [_]u64{
         syscall_log,
+        syscall_kernel_log_read,
         syscall_process_create,
         syscall_process_kill,
         syscall_process_wait,
@@ -173,6 +176,7 @@ test "native syscall numbers are contiguous" {
         syscall_timerfd_gettime,
         syscall_vmo_create,
         syscall_vmo_grow,
+        syscall_vmo_cache_policy,
         syscall_vmo_create_page_view,
         syscall_vmo_revoke,
         syscall_mmap,

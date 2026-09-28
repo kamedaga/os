@@ -1,6 +1,7 @@
 /// Kernel boot entry point and primary boot globals.
 /// Bootloader-specific entry code switches to the ring-0 stack before entering
 /// this module.
+const std = @import("std");
 const abi_root = @import("kernel_abi_root");
 const kernel = @import("../kernel.zig");
 const kernel_runtime = @import("../kernel_runtime.zig");
@@ -396,11 +397,43 @@ fn copyBootBytesToScratchOrHalt(bytes: []const u8, label: []const u8) []const u8
     return out[0..bytes.len];
 }
 
-pub fn persistBootResourcesOrHalt(resources: BootResources) BootResources {
+pub fn persistBootResourcesOrHalt(resources: BootResources, hhdm_offset: u64) BootResources {
+    const bootfs = resources.bootfs_image;
+    // The init ELF remains resident while the page-address list is released
+    // in LIFO order after the bootfs has been copied into init's VMO.
+    const staged_init = copyBootBytesToScratchOrHalt(resources.init_elf, "init");
+    const max_bootfs_bytes: usize = 192 * 1024 * 1024;
+    if (bootfs.len == 0 or bootfs.len > max_bootfs_bytes)
+        halt.haltWithMessage("bootfs staging size invalid");
+    const page_count = std.math.divCeil(usize, bootfs.len, 4096) catch unreachable;
+    // The fixed scratch holds only physical addresses. Copying through
+    // Limine's HHDM before CR3 changes preserves the module without putting
+    // the whole image in kernel BSS or requiring contiguous physical RAM.
+    const metadata = boot_scratch.allocate(page_count * @sizeOf(u64)) orelse
+        halt.haltWithMessage("bootfs staging metadata unavailable");
+    const pages = std.mem.bytesAsSlice(u64, metadata);
+    const low_before = kernel_runtime.global_free_list.availableBelow(1 << 32);
+    var low_pages: usize = 0;
+    for (pages, 0..) |*slot, index| {
+        const paddr = kernel.boot_resource_pages.allocate(kernel_runtime.global_free_list) catch
+            halt.haltWithMessage("bootfs staging page unavailable");
+        if (paddr < 1 << 32) low_pages += 1;
+        const hhdm_va = std.math.add(u64, hhdm_offset, paddr) catch
+            halt.haltWithMessage("bootfs staging HHDM overflow");
+        const offset = index * 4096;
+        const length = @min(bootfs.len - offset, 4096);
+        const target: [*]u8 = @ptrFromInt(hhdm_va);
+        @memcpy(target[0..length], bootfs[offset .. offset + length]);
+        slot.* = paddr;
+    }
+    const low_after = kernel_runtime.global_free_list.availableBelow(1 << 32);
+    kernel_log.writeFmt("bootfs: staged pages={} below4G={} free_low_before={} free_low_after={}\n", .{ page_count, low_pages, low_before.total, low_after.total });
     return .{
         .framebuffer_info = resources.framebuffer_info,
-        .init_elf = copyBootBytesToScratchOrHalt(resources.init_elf, "init"),
-        .bootfs_image = copyBootBytesToScratchOrHalt(resources.bootfs_image, "bootfs"),
+        .init_elf = staged_init,
+        .bootfs_image = &.{},
+        .bootfs_stage_pages = pages,
+        .bootfs_size = bootfs.len,
         .memory_stats = resources.memory_stats,
     };
 }
@@ -731,6 +764,8 @@ pub const BootResources = struct {
     framebuffer_info: boot_resources.FramebufferInfo,
     init_elf: []const u8,
     bootfs_image: []const u8,
+    bootfs_stage_pages: []const u64 = &.{},
+    bootfs_size: usize = 0,
     memory_stats: boot_static.MemoryStats,
 };
 
@@ -835,14 +870,18 @@ fn constructBootProcesses(state: *kernel.KernelState, res: BootResources) void {
     init_setup.setupInitBootstrapResources(
         state,
         init_principal,
-        res.bootfs_image,
+        res.bootfs_stage_pages,
+        res.bootfs_size,
         res.framebuffer_info,
         kernel_runtime.global_free_list,
     );
-    // setupInitBootstrapResources copies every bootfs page into the init VMO.
-    // The persisted bootfs is the most recent boot-scratch allocation, so its
-    // staging storage can now be released before the init ELF load window.
-    boot_scratch.free(res.bootfs_image);
+    // The init VMO now owns independent copies. Release staged RAM before
+    // the init ELF load window reuses this scratch metadata.
+    for (res.bootfs_stage_pages) |paddr| {
+        kernel_runtime.global_free_list.appendPage(0, paddr) catch
+            halt.haltWithMessage("bootfs staging page release failed");
+    }
+    boot_scratch.free(std.mem.sliceAsBytes(res.bootfs_stage_pages));
     scheduler.scheduler_tick_accum = 0;
     scheduler.scheduler_switch_count = 0;
     init_setup.refreshInitBootLogSnapshot(state, init_principal);
@@ -891,6 +930,7 @@ fn wireRuntimeSubsystems(state: *kernel.KernelState, memory_stats: boot_static.M
         .user_spaces = &user_space_table,
         .kernel_state_ready = &kernel_runtime.kernel_state_ready,
         .write = kernel_log.write,
+        .write_user = kernel_log.writeUser,
         .print_hex = log_util.printHex,
         .print_number = log_util.printNumberU64,
         .principal_label = kernel_runtime.principalLabel,

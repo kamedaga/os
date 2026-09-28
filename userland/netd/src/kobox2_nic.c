@@ -5,7 +5,7 @@
 #include "link.h"
 #include "netd_internal.h"
 #include "status_file.h"
-#include "boot/module_launch.h"
+#include <kobox2/module_progress.h>
 #include "../../gpud/bootstrap.h"
 #include "../../gpud/launch.h"
 #include "../../gpud/lifecycle.h"
@@ -214,7 +214,9 @@ static void nic_sandbox_progress(const struct gpud_lifecycle *lifecycle)
     default:
         return;
     }
-    nic_progress(NETD_NIC_STEP_LIFECYCLE, message);
+    diagnostic.step = NETD_NIC_STEP_LIFECYCLE;
+    diagnostic.detail = 0;
+    netd_status_file_kobox_progress(status_config, message);
 }
 
 static int start_generation(void)
@@ -238,7 +240,8 @@ static int start_generation(void)
     error = pacha_ipc_channel_create(&current->management, channel_rights, 0);
     if (!error) error = ph_ipc_init(&current->ipc, current->management.a, generation);
     if (error) return nic_failure(NETD_NIC_STEP_CHANNEL, error, error, 0, 0);
-    struct ph_sandbox_config sandbox_config = {.identity = nic.package.identity,
+    struct ph_sandbox_config sandbox_config = {.version = PH_SANDBOX_CONFIG_VERSION,
+        .identity = nic.package.identity,
         .artifact_count = nic.package.artifact_count, .resource_count = 1,
         .device = nic.package.device};
     struct gpud_launch_blob blob = {.bytes = &sandbox_config,

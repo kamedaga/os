@@ -39,6 +39,12 @@ int ph_gpu_queue_init(struct ph_gpu_queue *queue,
                       uint64_t channel_id,
                       const kb2_vq_atomic_ops_t *atomics,
                       struct ph_lifecycle_service *service);
+int ph_gpu_queue_init_profile(struct ph_gpu_queue *queue,
+                      struct gpud_gpu_sessions *sessions,
+                      uint64_t client_id, uint64_t channel_id,
+                      uint32_t profile_kind,
+                      const kb2_vq_atomic_ops_t *atomics,
+                      struct ph_lifecycle_service *service);
 /* After Linux device quiesce removed every DRM waitqueue observer and the
  * lifecycle receiver joined. */
 int ph_gpu_queue_finish(struct ph_gpu_queue *queue);

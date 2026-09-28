@@ -1,4 +1,5 @@
 pub const ipc_abi = @import("ipc_abi.zig");
+pub const kernel_log_abi = @import("kernel_log_abi.zig");
 pub const fd_abi = @import("fd_abi.zig");
 pub const init_bootstrap_abi = @import("init_bootstrap_abi.zig");
 pub const capsule_abi = @import("capsule_abi.zig");

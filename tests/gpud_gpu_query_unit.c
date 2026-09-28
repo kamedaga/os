@@ -4,15 +4,29 @@
 #include "../userland/gpud/drm_translate.h"
 #include "../userland/kobox2_adapter/gpu_query.h"
 #include "../userland/kobox2_adapter/gpu_queue.h"
+#include "../userland/kobox2_adapter/device_pci.h"
 #include <kobox2/gpu_session.h>
 #include <kobox2/virtqueue_x86_64.h>
 
 #include <assert.h>
+#include <kobox2/amdgpu_info_shape.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
 static unsigned int calls;
+static unsigned int device_exports;
+static unsigned int page_view_creates;
+static int expect_page_view;
+static long device_export_result = 19;
+long ph_pci_export_pages(struct ph_pci *pci, uint64_t *pages, size_t count,
+    unsigned int protection, enum kobox_mmio_cache cache) {
+    assert(pci && pages && count == 1);
+    assert(protection == (KOBOX_LINUX_MEMORY_READ | KOBOX_LINUX_MEMORY_WRITE));
+    assert(cache == KOBOX_MMIO_WC || cache == KOBOX_MMIO_UC);
+    ++device_exports;
+    return device_export_result;
+}
 static int cursor(struct kobox_linux_drm_file *,
                   const struct kobox_linux_drm_cursor *);
 
@@ -451,11 +465,90 @@ static int file_unmap(struct kobox_linux_drm_service *owner, uint64_t mapping_id
     return 0;
 }
 
+static int amdgpu_info_mock(struct kobox_linux_drm_file *file,
+    uint32_t query, const uint32_t *selectors, void *output,
+    size_t output_size) {
+    (void)file;
+    if (query == KB2_GPU_DRM_AMDGPU_INFO_QUERY_READ_MMR_REGISTER) {
+        assert(selectors[0] == 0x263e && selectors[1] == 32 &&
+            selectors[2] == UINT32_MAX && selectors[3] == 0 && output_size == 128);
+        for (unsigned i=0; i<32; ++i) ((uint32_t *)output)[i]=0x12340000+i;
+        return 0;
+    }
+    struct kb2_amdgpu_info_shape shape;
+    assert(kb2_amdgpu_info_shape(query,selectors,&shape));
+    assert(output_size==shape.bytes);
+    memset(output,0x5a,output_size);
+    return 0;
+}
+
+static int amdgpu_simple_mock(struct kobox_linux_drm_file *file,
+    uint32_t command, const void *input, size_t input_size, uint64_t scalar,
+    void *output, size_t output_size, uint32_t *result, size_t *result_size) {
+    (void)file; (void)command; (void)input; (void)input_size; (void)scalar;
+    (void)output; (void)output_size; (void)result; (void)result_size;
+    return -ENOSYS;
+}
+
+static unsigned int mesa_cs_calls;
+static int mesa_cs_mock(struct kobox_linux_drm_file *file,
+    uint32_t context, uint32_t bo_list, const struct kb2_amdgpu_cs_part *parts,
+    size_t count, const void *data, size_t bytes, uint64_t *sequence) {
+    assert(file && context == 7 && !bo_list && count == 5 && bytes == 88 && data);
+    assert(parts[0].record == KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_BO_HANDLE);
+    assert(parts[1].record == KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_SYNCOBJ_OUT);
+    assert(parts[2].record == KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_USER_FENCE);
+    assert(parts[3].record == KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB);
+    assert(parts[4].record == KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB);
+    *sequence = 123; ++mesa_cs_calls; return 0;
+}
+
+static int amdgpu_cs_mock(struct kobox_linux_drm_file *file,
+    uint32_t context, uint32_t ring, const struct kb2_amdgpu_cs_part *ib,
+    size_t bo_count, const void *bos, size_t bytes, uint64_t *sequence) {
+    (void)file; (void)context; (void)ring; (void)ib; (void)bos;
+    (void)bo_count; (void)sequence; (void)bytes;
+    return -ENOSYS;
+}
+
+static int gem_size_mock(struct kobox_linux_drm_file *file,
+    uint32_t handle, uint64_t *bytes) {
+    assert(file && handle == 27 && bytes);
+    *bytes = 4096;
+    return 0;
+}
+
+static int amdgpu_map_error;
+
+void ph_boot_log_gpu_map_failure(unsigned long stage, long status,
+    unsigned long handle, unsigned long bytes) {
+    (void)stage; (void)status; (void)handle; (void)bytes;
+}
+
+void ph_boot_log_gpu_page_view_failure(long status, unsigned long parent_fd,
+    unsigned long rights, unsigned long cache, unsigned long page_count,
+    unsigned long first_page, unsigned long middle_page,
+    unsigned long last_page) {
+    (void)status; (void)parent_fd; (void)rights; (void)cache;
+    (void)page_count; (void)first_page; (void)middle_page; (void)last_page;
+}
+
+static int amdgpu_mmap_validate_mock(struct kobox_linux_drm_file *file,
+    uint32_t handle) {
+    assert(file && handle == 27);
+    return amdgpu_map_error;
+}
+
 void *ph_image_lookup(void *image, const char *name) {
     assert(image == &ph_core);
     struct kobox_drm_query_api api = {
         .version = version,
         .get_cap = get_cap,
+        .amdgpu_info = amdgpu_info_mock,
+        .amdgpu_simple = amdgpu_simple_mock,
+        .amdgpu_cs = amdgpu_cs_mock,
+        .gem_size = gem_size_mock,
+        .amdgpu_mmap_validate = amdgpu_mmap_validate_mock,
         .set_client_cap = set_client_cap,
         .master = master,
         .get_magic = get_magic,
@@ -497,6 +590,16 @@ void *ph_image_lookup(void *image, const char *name) {
         memcpy(&symbol, &api.version, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_get_cap"))
         memcpy(&symbol, &api.get_cap, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_amdgpu_info"))
+        memcpy(&symbol, &api.amdgpu_info, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_amdgpu_simple"))
+        memcpy(&symbol, &api.amdgpu_simple, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_amdgpu_cs"))
+        memcpy(&symbol, &api.amdgpu_cs, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_gem_size"))
+        memcpy(&symbol, &api.gem_size, sizeof(symbol));
+    if (!strcmp(name, "kobox_linux_drm_amdgpu_mmap_validate"))
+        memcpy(&symbol, &api.amdgpu_mmap_validate, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_set_client_cap"))
         memcpy(&symbol, &api.set_client_cap, sizeof(symbol));
     if (!strcmp(name, "kobox_linux_drm_master"))
@@ -627,12 +730,16 @@ long pacha_syscall1(uint64_t number, uint64_t a0) {
 
 long pacha_syscall5(uint64_t number, uint64_t a0, uint64_t a1,
     uint64_t a2, uint64_t a3, uint64_t a4) {
-    (void)number;
-    (void)a0;
-    (void)a1;
-    (void)a2;
-    (void)a3;
-    (void)a4;
+    if (expect_page_view) {
+        assert(number == PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW);
+        assert(a0 == (uint64_t)(uint32_t)ph_core.ram_fd);
+        assert(a1 && ((const uint64_t *)(uintptr_t)a1)[0] == 11);
+        assert(a2 == 1 && (a3 & PACHA_FD_RIGHT_MAP_READ) &&
+            (a3 & PACHA_FD_RIGHT_MAP_WRITE));
+        assert(a4 == PACHA_FD_FLAG_CLOEXEC);
+        ++page_view_creates;
+        return 19;
+    }
     return -1;
 }
 
@@ -659,17 +766,19 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
     return mock_send_error;
 }
 
-static void native_transport_case(uint64_t capability, int expected_error) {
+static void native_transport_case(uint64_t capability, int expected_error,
+    uint32_t profile_kind) {
     static struct ph_gpu_query query;
     memset(&query, 0, sizeof(query));
     memset(native_vmo, 0xa5, sizeof(native_vmo));
     mapped = unmapped = aux_unmapped = sends = 0;
     struct ph_lifecycle_service service;
-    struct gpud_drm_binding binding = {.generation = 9, .frontend_handle = 8, .session_id = 7};
+    struct gpud_drm_binding binding = {.generation = 9, .frontend_handle = 8,
+        .session_id = 7, .profile_kind = profile_kind};
     gpud_drm_ioctl_request_t request = {
         .handle = 8, .request = UINT64_C(0xc010640c), .arg_size = 16, .data_size = 16};
     memcpy(request.data, &capability, sizeof(capability));
-    struct gpud_drm_translation encoded;
+    static struct gpud_drm_translation encoded;
     assert(!gpud_drm_ioctl_encode(&encoded, &binding, &request, 1));
     kb2_protocol_message_envelope_t envelope = {.protocol_id = KB2_GPU_PROTOCOL_ID,
                                                 .opcode = KB2_GPU_OPCODE_COMMAND,
@@ -686,7 +795,7 @@ static void native_transport_case(uint64_t capability, int expected_error) {
         .value = size,
         .fd_count = 1,
         .fds = {{.fd = 16, .rights = PH_GPU_QUERY_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC}}};
-    assert(!ph_gpu_query_init(&query, 9, 7, &service));
+    assert(!ph_gpu_query_init_profile(&query, 9, 7, profile_kind, &service));
     packet.fds[0].rights ^= PACHA_FD_RIGHT_MAP_WRITE;
     assert(service.prepare(service.context, &packet) == -EACCES && !mapped);
     packet.fds[0].rights ^= PACHA_FD_RIGHT_MAP_WRITE;
@@ -706,6 +815,274 @@ static void native_transport_case(uint64_t capability, int expected_error) {
     assert(!service.release(service.context) && unmapped == 1 && !query.mapping);
     assert(service.prepare(service.context, &packet) == -EPROTO && mapped == 1); /* No replay. */
     assert(!service.stop(service.context));
+}
+
+static void amdgpu_map_prepare_case(void) {
+    struct gpud_drm_binding binding = {.generation = 9, .frontend_handle = 8,
+        .session_id = 7, .profile_kind = KB2_GPU_PROFILE_AMDGPU};
+    gpud_drm_ioctl_request_t request = {.handle = 8,
+        .request = GPUD_DRM_IOCTL_AMDGPU_GEM_MMAP,
+        .arg_size = 8, .data_size = 8};
+    const uint32_t handle = 27;
+    memcpy(request.data, &handle, sizeof(handle));
+    static struct gpud_drm_translation encoded;
+    assert(!gpud_drm_ioctl_encode(&encoded, &binding, &request, 0));
+    static struct kobox_drm_query query;
+    kb2_gpu_region_t region = {.region_id = PH_GPU_QUERY_OUTPUT_REGION,
+        .rights = KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE,
+        .length = GPUD_GPU_AUX_CAPACITY};
+    assert(!kobox_drm_query_prepare_profile(&query, binding.generation,
+        binding.session_id, binding.profile_kind, encoded.queue_class, encoded.command,
+        encoded.command_size, &region));
+    assert(query.mapping_handle == handle &&
+        query.mapping_rights ==
+            (KB2_GPU_SPAN_RIGHT_READ | KB2_GPU_SPAN_RIGHT_WRITE));
+    query.mapping_page_capacity = 1;
+    query.aux_size = sizeof(uint64_t);
+    struct kobox_drm_query_api api = {
+        .virtgpu_map = virtgpu_map,
+        .amdgpu_mmap_validate = amdgpu_mmap_validate_mock,
+    };
+    static unsigned char output[GPUD_GPU_AUX_CAPACITY];
+    uint64_t pages[1] = {0};
+    unsigned char completion[4096] = {0};
+    size_t completion_size = 0;
+    struct kobox_drm_query_result result = {0};
+    assert(!kobox_drm_query_execute_service(&query, &api,
+        (struct kobox_linux_drm_service *)(void *)&calls, 3,
+        (struct kobox_linux_drm_file *)(void *)&calls,
+        output, sizeof(output), (unsigned char *)pages, sizeof(pages),
+        completion, sizeof(completion), &completion_size, &result));
+    kb2_gpu_virtgpu_map_completion_t mapped;
+    assert(!kb2_gpu_amdgpu_map_completion_decode(completion,
+        completion_size, binding.session_id, binding.generation, &mapped));
+    assert(result.mapping_id == 4096 && result.mapping_length == 4096 &&
+        result.mapping_page_count == 1 && pages[0] == 11);
+    for (uint32_t cache = KB2_GPU_MAPPING_CACHE_WB;
+         cache <= KB2_GPU_MAPPING_CACHE_UC; ++cache) {
+        memset(request.data, 0, sizeof(request.data));
+        memcpy(request.data, &handle, sizeof(handle));
+        unsigned char cached_reply[8192] = {0};
+        size_t cached_size = 0;
+        mapped.cache_policy = cache;
+        assert(!kb2_gpu_amdgpu_map_completion_encode(completion,
+            sizeof(completion), &cached_size, &mapped));
+        kb2_protocol_message_envelope_t cached_envelope = {
+            .protocol_id = KB2_GPU_PROTOCOL_ID, .opcode = KB2_GPU_OPCODE_COMMAND,
+            .generation = binding.generation, .correlation_id = 47,
+            .payload_length = cached_size};
+        const size_t reply_bytes = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + cached_size;
+        assert(!kb2_protocol_message_envelope_encode(cached_reply, reply_bytes,
+            &cached_envelope));
+        memcpy(cached_reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, completion, cached_size);
+        assert(!gpud_drm_ioctl_reply(&request, &encoded, 47, cached_reply,
+            reply_bytes, output, sizeof(output)));
+        assert(encoded.mapping_cache_policy == cache);
+    }
+    mapped.cache_policy = KB2_GPU_MAPPING_CACHE_UC + 1;
+    assert(kb2_gpu_amdgpu_map_completion_encode(completion,
+        sizeof(completion), &completion_size, &mapped));
+    memset(request.data, 0, sizeof(request.data));
+    memcpy(request.data, &handle, sizeof(handle));
+
+    amdgpu_map_error = -EOPNOTSUPP;
+    result = (struct kobox_drm_query_result){0};
+    assert(!kobox_drm_query_execute_service(&query, &api,
+        (struct kobox_linux_drm_service *)(void *)&calls, 3,
+        (struct kobox_linux_drm_file *)(void *)&calls,
+        output, sizeof(output), (unsigned char *)pages, sizeof(pages),
+        completion, sizeof(completion), &completion_size, &result));
+    assert(!result.mapping_id);
+    unsigned char reply[8192] = {0};
+    kb2_protocol_message_envelope_t envelope = {
+        .protocol_id = KB2_GPU_PROTOCOL_ID,
+        .opcode = KB2_GPU_OPCODE_COMMAND,
+        .generation = binding.generation,
+        .correlation_id = 47,
+        .payload_length = completion_size,
+    };
+    const size_t reply_size = KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE +
+        completion_size;
+    assert(!kb2_protocol_message_envelope_encode(reply, reply_size,
+        &envelope));
+    memcpy(reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+        completion, completion_size);
+    assert(gpud_drm_ioctl_reply(&request, &encoded, 47, reply, reply_size,
+        output, sizeof(output)) == -EOPNOTSUPP);
+    amdgpu_map_error = 0;
+}
+
+static void amdgpu_mmr_case(void) {
+    const struct gpud_drm_binding binding = {.generation=7,.frontend_handle=51,
+        .session_id=103,.profile_kind=KB2_GPU_PROFILE_AMDGPU};
+    gpud_drm_ioctl_request_t request = {.handle=51,.request=GPUD_DRM_IOCTL_AMDGPU_INFO,
+        .arg_size=32,.data_size=32,.aux_size=128};
+    gpud_drm_amdgpu_info_t info = {.query=KB2_GPU_DRM_AMDGPU_INFO_QUERY_READ_MMR_REGISTER,
+        .return_size=128,.selector={0x263e,32,UINT32_MAX,0}};
+    memcpy(request.data,&info,sizeof(info));
+    struct gpud_drm_translation encoded;
+    assert(!gpud_drm_ioctl_encode(&encoded,&binding,&request,PH_GPU_QUERY_OUTPUT_REGION));
+    struct kobox_drm_query query;
+    assert(!kobox_drm_query_prepare_profile(&query,7,103,KB2_GPU_PROFILE_AMDGPU,
+        KB2_GPU_QUEUE_EXECUTION,encoded.command,encoded.command_size,&encoded.region));
+    uint32_t values[32]={0};
+    unsigned char output[4096]={0},completion[4096]={0},reply[8192]={0};
+    size_t size=0;
+    struct kobox_drm_query_result result={0};
+    struct kobox_drm_query_api api={.amdgpu_info=amdgpu_info_mock};
+    assert(!kobox_drm_query_execute_service(&query,&api,
+        (struct kobox_linux_drm_service *)(void *)&calls,3,
+        (struct kobox_linux_drm_file *)(void *)&calls,
+        output,sizeof(output),(unsigned char *)values,sizeof(values),
+        completion,sizeof(completion),&size,&result));
+    assert(values[0]==0x12340000 && values[31]==0x1234001f);
+    kb2_protocol_message_envelope_t env={.protocol_id=KB2_GPU_PROTOCOL_ID,
+        .opcode=KB2_GPU_OPCODE_COMMAND,.generation=7,.correlation_id=47,.payload_length=size};
+    size_t reply_size=KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+size;
+    assert(!kb2_protocol_message_envelope_encode(reply,reply_size,&env));
+    memcpy(reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,completion,size);
+    assert(!gpud_drm_ioctl_reply(&request,&encoded,47,reply,reply_size,output,sizeof(output)));
+}
+
+static void mesa_info_batch_case(void) {
+    const uint32_t queries[]={14,20,25,33,34};
+    const uint32_t bytes[]={8,24,96,192,40};
+    for(unsigned i=0;i<5;++i) {
+        const struct gpud_drm_binding binding={.generation=7,.frontend_handle=51,
+            .session_id=103,.profile_kind=KB2_GPU_PROFILE_AMDGPU};
+        gpud_drm_ioctl_request_t request={.handle=51,.request=GPUD_DRM_IOCTL_AMDGPU_INFO,
+            .arg_size=32,.data_size=32,.aux_size=bytes[i]};
+        gpud_drm_amdgpu_info_t info={.query=queries[i],.return_size=bytes[i]};
+        if(!i) { info.selector[0]=4; info.selector[2]=2; }
+        memcpy(request.data,&info,sizeof(info));
+        struct gpud_drm_translation encoded;
+        assert(!gpud_drm_ioctl_encode(&encoded,&binding,&request,PH_GPU_QUERY_OUTPUT_REGION));
+        struct kobox_drm_query query;
+        assert(!kobox_drm_query_prepare_profile(&query,7,103,KB2_GPU_PROFILE_AMDGPU,
+            KB2_GPU_QUEUE_EXECUTION,encoded.command,encoded.command_size,&encoded.region));
+        unsigned char aux[194],output[4096]={0},completion[4096]={0},reply[8192]={0};
+        memset(aux,0xa5,sizeof(aux));
+        size_t size=0;
+        struct kobox_drm_query_result result={0};
+        struct kobox_drm_query_api api={.amdgpu_info=amdgpu_info_mock};
+        assert(!kobox_drm_query_execute_service(&query,&api,
+            (struct kobox_linux_drm_service *)(void *)&calls,3,
+            (struct kobox_linux_drm_file *)(void *)&calls,
+            output,sizeof(output),aux+1,bytes[i],completion,sizeof(completion),&size,&result));
+        assert(aux[0]==0xa5 && aux[bytes[i]+1]==0xa5 && aux[bytes[i]]==0x5a);
+        kb2_protocol_message_envelope_t env={.protocol_id=KB2_GPU_PROTOCOL_ID,
+            .opcode=KB2_GPU_OPCODE_COMMAND,.generation=7,.correlation_id=47,.payload_length=size};
+        size_t reply_size=KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+size;
+        assert(!kb2_protocol_message_envelope_encode(reply,reply_size,&env));
+        memcpy(reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,completion,size);
+        assert(!gpud_drm_ioctl_reply(&request,&encoded,47,reply,reply_size,output,sizeof(output)));
+    }
+}
+
+static void mesa_cs_case(void) {
+    const struct gpud_drm_binding binding={.generation=7,.frontend_handle=51,
+        .session_id=103,.profile_kind=KB2_GPU_PROFILE_AMDGPU};
+    gpud_drm_amdgpu_cs_wire_t wire={.ctx_id=7,.chunk_count=5,.parts={
+        {KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_BO_HANDLE,1,0,8},
+        {KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_SYNCOBJ_OUT,2,8,8},
+        {KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_USER_FENCE,1,16,8},
+        {KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB,1,24,32},
+        {KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB,1,56,32}}};
+    gpud_drm_ioctl_request_t request={.handle=51,.request=GPUD_DRM_IOCTL_AMDGPU_CS,
+        .arg_size=24,.data_size=sizeof(wire),.aux_size=88};
+    memcpy(request.data,&wire,sizeof(wire));
+    struct gpud_drm_translation encoded;
+    assert(!gpud_drm_ioctl_encode(&encoded,&binding,&request,PH_GPU_QUERY_OUTPUT_REGION));
+    struct kobox_drm_query query;
+    assert(!kobox_drm_query_prepare_profile(&query,7,103,KB2_GPU_PROFILE_AMDGPU,
+        KB2_GPU_QUEUE_EXECUTION,encoded.command,encoded.command_size,&encoded.region));
+    unsigned char aux[88]={0},output[4096]={0},completion[4096]={0},reply[8192]={0};
+    size_t size=0;
+    struct kobox_drm_query_result result={0};
+    struct kobox_drm_query_api api={.amdgpu_cs=mesa_cs_mock};
+    assert(!kobox_drm_query_execute_service(&query,&api,
+        (struct kobox_linux_drm_service *)(void *)&calls,3,
+        (struct kobox_linux_drm_file *)(void *)&calls,
+        output,sizeof(output),aux,sizeof(aux),completion,sizeof(completion),&size,&result));
+    assert(mesa_cs_calls==1);
+
+    wire=(gpud_drm_amdgpu_cs_wire_t){.ctx_id=7,.chunk_count=64};
+    for(unsigned i=0;i<64;++i)
+        wire.parts[i]=(gpud_drm_amdgpu_cs_part_t){
+            KB2_GPU_DRM_AMDGPU_RECORD_CS_CHUNK_IB,1,i*32,32};
+    memcpy(request.data,&wire,sizeof(wire)); request.aux_size=64*32;
+    assert(!gpud_drm_ioctl_encode(&encoded,&binding,&request,PH_GPU_QUERY_OUTPUT_REGION));
+    assert(encoded.command_size>4096 &&
+        encoded.command_size+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE<=PH_GPU_QUERY_REQUEST_BYTES);
+    assert(!kobox_drm_query_prepare_profile(&query,7,103,KB2_GPU_PROFILE_AMDGPU,
+        KB2_GPU_QUEUE_EXECUTION,encoded.command,encoded.command_size,&encoded.region));
+    assert(query.cs_count==64 && query.aux_size==2048);
+    kb2_protocol_message_envelope_t env={.protocol_id=KB2_GPU_PROTOCOL_ID,
+        .opcode=KB2_GPU_OPCODE_COMMAND,.generation=7,.correlation_id=47,.payload_length=size};
+    size_t reply_size=KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+size;
+    assert(!kb2_protocol_message_envelope_encode(reply,reply_size,&env));
+    memcpy(reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,completion,size);
+    assert(!gpud_drm_ioctl_reply(&request,&encoded,47,reply,reply_size,output,sizeof(output)));
+    assert(*(uint64_t *)request.data==123);
+    wire.parts[4].offset--; memcpy(request.data,&wire,sizeof(wire));
+    assert(gpud_drm_ioctl_encode(&encoded,&binding,&request,PH_GPU_QUERY_OUTPUT_REGION)==-EINVAL);
+    assert(mesa_cs_calls==1);
+}
+
+static int mesa_simple_mock(struct kobox_linux_drm_file *file, uint32_t command,
+    const void *input, size_t input_size, uint64_t deadline, void *output,
+    size_t capacity, uint32_t *record, size_t *bytes) {
+    assert(file && input && capacity >= 280);
+    memset(output,0,capacity);
+    if(command==KB2_GPU_DRM_AMDGPU_COMMAND_GEM_METADATA) {
+        assert(input_size==288 && !deadline);
+        assert(((const unsigned char *)input)[32]==0x5a);
+        *record=KB2_GPU_DRM_AMDGPU_RECORD_GEM_METADATA_RESULT; *bytes=280;
+        uint32_t length=256; memcpy((unsigned char *)output+16,&length,4);
+        memset((unsigned char *)output+24,0x6b,256);
+    } else {
+        assert(command==KB2_GPU_DRM_AMDGPU_COMMAND_GEM_WAIT_IDLE && input_size==8);
+        *record=KB2_GPU_DRM_AMDGPU_RECORD_GEM_WAIT_IDLE_RESULT; *bytes=8;
+    }
+    return 0;
+}
+static void mesa_simple_case(void) {
+    for(unsigned i=0;i<3;++i) {
+        const struct gpud_drm_binding binding={.generation=7,.frontend_handle=51,
+            .session_id=103,.profile_kind=KB2_GPU_PROFILE_AMDGPU};
+        gpud_drm_ioctl_request_t request={.handle=51,
+            .request=i?GPUD_DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE:GPUD_DRM_IOCTL_AMDGPU_GEM_METADATA,
+            .arg_size=i?16:288,.data_size=i?16:288};
+        uint32_t handle=7,op=1,length=256;
+        memcpy(request.data,&handle,4);
+        if(!i) {
+            memcpy(request.data+4,&op,4); memcpy(request.data+24,&length,4);
+            memset(request.data+28,0x5a,256);
+        } else if(i==2) {
+            uint64_t deadline=UINT64_MAX; memcpy(request.data+8,&deadline,8);
+        }
+        struct gpud_drm_translation encoded;
+        assert(!gpud_drm_ioctl_encode(&encoded,&binding,&request,0));
+        struct kobox_drm_query query;
+        assert(!kobox_drm_query_prepare_profile(&query,7,103,KB2_GPU_PROFILE_AMDGPU,
+            KB2_GPU_QUEUE_EXECUTION,encoded.command,encoded.command_size,
+            &(kb2_gpu_region_t){.region_id=1,.rights=KB2_GPU_SPAN_RIGHT_WRITE,.length=4096}));
+        unsigned char output[4096]={0},completion[4096]={0},reply[8192]={0};
+        size_t size=0; struct kobox_drm_query_result result={0};
+        struct kobox_drm_query_api api={.amdgpu_simple=mesa_simple_mock};
+        assert(!kobox_drm_query_execute_service(&query,&api,
+            (struct kobox_linux_drm_service *)(void *)&calls,3,
+            (struct kobox_linux_drm_file *)(void *)&calls,output,sizeof(output),
+            NULL,0,completion,sizeof(completion),&size,&result));
+        kb2_protocol_message_envelope_t env={.protocol_id=KB2_GPU_PROTOCOL_ID,
+            .opcode=KB2_GPU_OPCODE_COMMAND,.generation=7,.correlation_id=47,.payload_length=size};
+        size_t reply_size=KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE+size;
+        assert(!kb2_protocol_message_envelope_encode(reply,reply_size,&env));
+        memcpy(reply+KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,completion,size);
+        assert(!gpud_drm_ioctl_reply(&request,&encoded,47,reply,reply_size,output,sizeof(output)));
+        if(!i) assert(request.data[28]==0x6b && request.data[283]==0x6b &&
+            !request.data[284] && !request.data[287]);
+    }
 }
 
 static int prepare_caps_snapshot(struct ph_gpu_query *query, uint64_t correlation, uint32_t bytes) {
@@ -1592,6 +1969,46 @@ static void magic_execution(void) {
 }
 
 int main(void) {
+    {
+        struct ph_pci pci = {0};
+        uint64_t pages[] = {UINT64_C(0xd0000)};
+        struct ph_gpu_query query = {.pci = &pci, .generation = 7, .correlation = 1,
+            .aux = pages, .plan = {.mapping_page_capacity = 1},
+            .result = {.mapping_id = 4096, .mapping_length = 4096,
+                .mapping_page_count = 1, .mapping_rights = 3,
+                .mapping_cache_policy = KOBOX_DRM_CACHE_WC,
+                .mapping_backing_kind = KOBOX_DRM_BACKING_DEVICE,
+                .attachment_class = KB2_GPU_ATTACHMENT_MEMORY}};
+        struct ph_ipc ipc = {.generation = 7};
+        assert(!ph_gpu_query_publish_attachment(&query, &ipc));
+        assert(device_exports == 1 && sent.fds[0].fd == 19);
+        device_export_result = PACHA_SYSCALL_ERR_ALLOC;
+        assert(ph_gpu_query_publish_attachment(&query, &ipc) == -ENOMEM);
+        device_export_result = 19;
+        query.result.mapping_cache_policy = KOBOX_DRM_CACHE_WB;
+        assert(ph_gpu_query_publish_attachment(&query, &ipc) == -EPROTO);
+        query.result.mapping_backing_kind = 99;
+        assert(ph_gpu_query_publish_attachment(&query, &ipc) == -EPROTO);
+        query.result.mapping_backing_kind = KOBOX_DRM_BACKING_RAM;
+        pages[0] = 11;
+        ph_core.ram_fd = 20;
+        expect_page_view = 1;
+        query.result.mapping_cache_policy = KOBOX_DRM_CACHE_WB;
+        assert(!ph_gpu_query_publish_attachment(&query, &ipc));
+        query.result.mapping_cache_policy = KOBOX_DRM_CACHE_WC;
+        assert(!ph_gpu_query_publish_attachment(&query, &ipc));
+        assert(page_view_creates == 2 && sends == 3);
+        query.result.mapping_cache_policy = KOBOX_DRM_CACHE_UC;
+        assert(ph_gpu_query_publish_attachment(&query, &ipc) == -EPROTO);
+        query.result.mapping_cache_policy = 99;
+        assert(ph_gpu_query_publish_attachment(&query, &ipc) == -EPROTO);
+        query.result.mapping_cache_policy = KOBOX_DRM_CACHE_WC;
+        pages[0] = PH_RAM_SIZE / PH_PAGE_SIZE;
+        assert(ph_gpu_query_publish_attachment(&query, &ipc) == -EPROTO);
+        expect_page_view = 0;
+        assert(device_exports == 2);
+        sends = 0;
+    }
     magic_execution();
     struct gpud_drm_binding binding = {.generation = 9, .frontend_handle = 8, .session_id = 7};
     struct kobox_drm_query_api api = {
@@ -1754,9 +2171,15 @@ int main(void) {
             }
         }
     }
-    native_transport_case(5, 0);
-    native_transport_case(UINT64_MAX, -EINVAL);
-    native_transport_case(6, -EIO);
+    native_transport_case(5, 0, KB2_GPU_PROFILE_VIRGL);
+    native_transport_case(UINT64_MAX, -EINVAL, KB2_GPU_PROFILE_VIRGL);
+    native_transport_case(6, -EIO, KB2_GPU_PROFILE_VIRGL);
+    native_transport_case(5, 0, KB2_GPU_PROFILE_AMDGPU);
+    amdgpu_map_prepare_case();
+    amdgpu_mmr_case();
+    mesa_cs_case();
+    mesa_info_batch_case();
+    mesa_simple_case();
     private_aux_lifetime();
     virtgpu_input_execution();
     display_execution();

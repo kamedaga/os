@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "device_irq.h"
+#include "boot.h"
 #include "host.h"
 #include <pacha/capsule.h>
 #include <errno.h>
@@ -51,9 +52,12 @@ static int sample_route(struct ph_irq *irq, unsigned int index, bool discard) {
     long result = pacha_syscall5(PACHA_CAPSULE_SYSCALL_IRQ_POLL, native->fd,
         native->count, (uintptr_t)&count, 1, 0);
     if (result == 1 && count != native->count) {
+        const uint64_t accepted = count - native->count;
         native->count = count;
-        if (!discard)
+        if (!discard) {
+            irq->received_events += accepted;
             PH_OK(ph_irq_queue_raise(&irq->queue, index, irq->slots[index].route.cookie));
+        }
         return 0;
     }
     if (result == PACHA_SYSCALL_ERR_NOT_READY && count == native->count) return 0;
@@ -80,6 +84,8 @@ static int allocate_routes(void *context, enum kobox_linux_irq_mode mode,
     uint32_t index, uint32_t count, uint32_t cpu, struct kobox_linux_irq_route *routes) {
     struct ph_irq *irq = context;
     unsigned int kind;
+    unsigned int step = 1;
+    long raw = 0;
     if (mode == KOBOX_IRQ_INTX) return -EOPNOTSUPP;
     if (mode == KOBOX_IRQ_MSI) kind = PACHA_CAPSULE_IRQ_MSI;
     else if (mode == KOBOX_IRQ_MSIX) kind = PACHA_CAPSULE_IRQ_MSIX;
@@ -89,29 +95,39 @@ static int allocate_routes(void *context, enum kobox_linux_irq_mode mode,
 
     uint64_t previous = irq_lock(irq);
     int result = irq->admitted ? ph_irq_queue_reserve(&irq->queue, index, count, cpu) : -ENODEV;
+    raw = result;
     if (result) goto out;
     for (uint32_t i = 0; i < count; ++i) {
         struct ph_irq_slot *slot = &irq->slots[index + i];
         struct pacha_capsule_irq_route message = {0};
+        step = 2;
         long fd = pacha_syscall4(PACHA_CAPSULE_SYSCALL_DERIVE_IRQ,
             irq->config.device_fd, kind, index + i, 0);
+        raw = fd;
         if (fd < 16 || fd >= PACHA_FD_TABLE_LIMIT) {
             result = fd ? irq_status(fd) : -EPROTO;
             goto rollback;
         }
         irq->native[index + i].fd = (int)fd;
-        result = irq_status(pacha_syscall1(PACHA_CAPSULE_SYSCALL_IRQ_QUIESCE, fd));
+        step = 3;
+        raw = pacha_syscall1(PACHA_CAPSULE_SYSCALL_IRQ_QUIESCE, fd);
+        result = irq_status(raw);
         if (result) goto rollback;
+        step = 4;
         result = sample_route(irq, index + i, true);
+        raw = result;
         if (result) goto rollback;
+        step = 5;
         long words = pacha_syscall3(PACHA_CAPSULE_SYSCALL_IRQ_ROUTE,
             fd, (uintptr_t)&message, 3);
+        raw = words;
         if (words != 3 || !message.message_address || message.message_data > UINT32_MAX) {
             result = words == 3 || !words ? -EPROTO : irq_status(words);
             goto rollback;
         }
         slot->route.address = message.message_address;
         slot->route.data = (uint32_t)message.message_data;
+        step = 6;
         if (mode == KOBOX_IRQ_MSI && (irq->slots[index].route.data % count ||
             slot->route.address != irq->slots[index].route.address ||
             (uint64_t)slot->route.data != (uint64_t)irq->slots[index].route.data + i)) {
@@ -131,6 +147,9 @@ rollback:
     }
 out:
     irq_unlock(irq, previous, false);
+    if (result)
+        ph_boot_log_irq_failure(mode, index, count, cpu, step,
+            (unsigned long)raw, (unsigned long)result);
     return result;
 }
 
@@ -166,6 +185,7 @@ static int ack_route(void *context, uint64_t hwirq, uint64_t cookie) {
     struct ph_irq *irq = context;
     uint64_t previous = irq_lock(irq);
     int result = ph_irq_queue_ack(&irq->queue, hwirq, cookie);
+    if (!result) ++irq->acknowledged_events;
     irq_unlock(irq, previous, !result);
     return result;
 }
@@ -225,6 +245,7 @@ static int next_event(void *context, uint32_t cpu, struct kobox_linux_irq_event 
     struct ph_irq *irq = context;
     uint64_t previous = irq_lock(irq);
     int result = ph_irq_queue_next(&irq->queue, cpu, event);
+    if (!result) ++irq->dispatched_events;
     irq_unlock(irq, previous, false);
     return result;
 }
@@ -313,6 +334,18 @@ int ph_irq_revoke(struct ph_irq *irq, uint64_t generation) {
     return 0;
 }
 
+int ph_irq_snapshot(struct ph_irq *irq, uint64_t *received,
+    uint64_t *dispatched, uint64_t *acknowledged) {
+    if (!irq || !received || !dispatched || !acknowledged ||
+        !irq->config.generation) return -EINVAL;
+    uint64_t previous = irq_lock(irq);
+    *received = irq->received_events;
+    *dispatched = irq->dispatched_events;
+    *acknowledged = irq->acknowledged_events;
+    irq_unlock(irq, previous, false);
+    return 0;
+}
+
 int ph_irq_destroy(struct ph_irq *irq) {
     if (!irq || !irq->config.generation) return -EINVAL;
     uint64_t previous = irq_lock(irq);
@@ -327,6 +360,8 @@ int ph_irq_destroy(struct ph_irq *irq) {
     wake_collector(irq);
     irq_unlock(irq, previous, false);
     PH_OK(ph_thread_join(irq->collector));
+    ph_boot_log_irq_summary(irq->received_events,
+        irq->dispatched_events, irq->acknowledged_events);
     PH_OK(pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, irq->control_fd));
     *irq = (struct ph_irq){0};
     return 0;

@@ -5,6 +5,7 @@ const kernel_log = @import("kernel_log.zig");
 const scheduler = @import("scheduler_connection.zig");
 const smp = @import("smp.zig");
 const user_vm = @import("memory/user_vm.zig");
+const ram_cache = @import("memory/ram_cache_policy.zig");
 
 pub const Hooks = struct {
     state: *kernel.KernelState,
@@ -23,6 +24,34 @@ pub const Hooks = struct {
 
 var user_copy_hooks_storage: Hooks = undefined;
 var user_copy_hooks_ready = false;
+var ram_cache_snapshot: ?*const ram_cache.Snapshot = null;
+
+/// Only the serialized physical-cache transition owner may publish. The
+/// snapshot and its slices stay immutable and mapped until an acknowledged
+/// all-CPU rendezvous after replacement; the caller owns their reclamation.
+pub fn publishRamCacheSnapshot(snapshot: ?*const ram_cache.Snapshot) void {
+    @atomicStore(?*const ram_cache.Snapshot, &ram_cache_snapshot, snapshot, .release);
+}
+
+/// Writer-side identity check without lending out the immutable snapshot.
+pub fn ramCacheSnapshotIsCurrent(snapshot: ?*const ram_cache.Snapshot) bool {
+    return @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire) == snapshot;
+}
+
+/// Caller holds either its IRQ-disabled copy guard or an address-space lock
+/// included in every writer's all-VM transaction. Return values own no borrow
+/// into a snapshot, so they remain valid after the short lookup completes.
+pub fn ramCachePolicyForLockedPage(paddr: u64) ram_cache.Snapshot.Decision {
+    const snapshot = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire) orelse
+        return .ordinary;
+    return snapshot.query(paddr);
+}
+
+/// Same exclusion as the per-page lookup; pending-only snapshots are active.
+pub fn hasRamCachePolicyLocked() bool {
+    const snapshot = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire) orelse return false;
+    return snapshot.policy.len != 0 or snapshot.pending.len != 0;
+}
 
 const PhysCopyWindowGuard = struct {
     cpu_slot: usize,
@@ -48,6 +77,11 @@ const PhysCopyWindowGuard = struct {
     }
 
     fn unlock(self: PhysCopyWindowGuard) void {
+        // Non-WB RAM copies may leave WC stores buffered even when no device
+        // VMA was involved. Finish them before allowing a transition IPI.
+        if (user_copy_hooks_ready and
+            (user_copy_hooks_storage.phys_copy_window_pt[self.cpu_slot] & 0x98) != 0)
+            asm volatile ("mfence" ::: .{ .memory = true });
         if (self.interrupts_were_enabled) asm volatile ("sti" ::: .{ .memory = true });
     }
 };
@@ -87,12 +121,91 @@ const TlbShootdownLock = struct {
 
 var tlb_shootdown_lock: TlbShootdownLock = .{};
 var tlb_shootdown_target_cr3: u64 = 0;
+var tlb_shootdown_flush_caches: u8 = 0;
+var tlb_shootdown_retire_phys_base: u64 = 0;
+var tlb_shootdown_retire_phys_size: u64 = 0;
 var tlb_shootdown_generation: u64 = 0;
 var tlb_shootdown_ack: [smp.max_cpus]u64 = [_]u64{0} ** smp.max_cpus;
 // Local interrupt completion may copy into a COW mapping and initiate another
 // shootdown. Keep it out of this CPU's non-recursive lock interval, including
 // acquisition waits. Maintenance IPIs and device event publication still run.
 var tlb_shootdown_active: [smp.max_cpus]u8 = [_]u8{0} ** smp.max_cpus;
+
+const WcWindowLease = struct {
+    sequence: u64 = 0,
+    base: u64 = 0,
+    size: u64 = 0,
+    active: u8 = 0,
+};
+const wc_window_lease_capacity = 128;
+var wc_window_leases: [wc_window_lease_capacity]WcWindowLease =
+    [_]WcWindowLease{.{}} ** wc_window_lease_capacity;
+var wc_window_active_count: u16 = 0;
+
+/// The state lock serializes writers. Readers in the pinned copy window use
+/// the sequence so a rapid close/reprobe cannot mix an old active bit with a
+/// new physical range. Token zero means no lease.
+pub fn acquireWcPhysicalWindowLease(base: u64, size: u64) ?u16 {
+    if (size == 0 or ((base | size) & 4095) != 0 or
+        base > std.math.maxInt(u64) - size) return null;
+    for (&wc_window_leases, 0..) |*slot, index| {
+        if (@atomicLoad(u8, &slot.active, .acquire) != 0) continue;
+        _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .acq_rel);
+        @atomicStore(u64, &slot.base, base, .monotonic);
+        @atomicStore(u64, &slot.size, size, .monotonic);
+        @atomicStore(u8, &slot.active, 1, .release);
+        _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .release);
+        _ = @atomicRmw(u16, &wc_window_active_count, .Add, 1, .release);
+        return @intCast(index + 1);
+    }
+    return null;
+}
+
+pub fn releaseWcPhysicalWindowLease(token: u16) void {
+    if (token == 0 or token > wc_window_leases.len) unreachable;
+    const slot = &wc_window_leases[token - 1];
+    if (@atomicLoad(u8, &slot.active, .acquire) == 0) unreachable;
+    _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .acq_rel);
+    @atomicStore(u8, &slot.active, 0, .release);
+    _ = @atomicRmw(u64, &slot.sequence, .Add, 1, .release);
+    _ = @atomicRmw(u16, &wc_window_active_count, .Sub, 1, .release);
+}
+
+fn wcPhysicalWindowLeaseBlocks(page: u64) bool {
+    // In the ordinary system there are no WC leases; keep RAM copy traffic
+    // off the physical-range scan. A concurrent first acquire is followed by
+    // an all-CPU retirement IPI before its WC PTE becomes visible.
+    if (@atomicLoad(u16, &wc_window_active_count, .acquire) == 0) return false;
+    for (&wc_window_leases) |*slot| {
+        const first = @atomicLoad(u64, &slot.sequence, .acquire);
+        // A reader may run from an interrupt on the CPU updating this slot.
+        // Fail closed for the few instructions of the update; spinning here
+        // would deadlock the interrupted writer.
+        if ((first & 1) != 0) return true;
+        const active = @atomicLoad(u8, &slot.active, .acquire) != 0;
+        const base = @atomicLoad(u64, &slot.base, .monotonic);
+        const size = @atomicLoad(u64, &slot.size, .monotonic);
+        if (first != @atomicLoad(u64, &slot.sequence, .acquire)) return true;
+        if (active and page >= base and page - base < size) return true;
+    }
+    return false;
+}
+
+test "WC physical window leases block only overlapping pages and survive slot reuse" {
+    const first = acquireWcPhysicalWindowLease(0xd0000000, 8192).?;
+    var first_live = true;
+    defer if (first_live) releaseWcPhysicalWindowLease(first);
+    try std.testing.expect(wcPhysicalWindowLeaseBlocks(0xd0000000));
+    try std.testing.expect(wcPhysicalWindowLeaseBlocks(0xd0001000));
+    try std.testing.expect(!wcPhysicalWindowLeaseBlocks(0xd0002000));
+    releaseWcPhysicalWindowLease(first);
+    first_live = false;
+    const second = acquireWcPhysicalWindowLease(0x380000000000, 4096).?;
+    defer releaseWcPhysicalWindowLease(second);
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(!wcPhysicalWindowLeaseBlocks(0xd0000000));
+    try std.testing.expect(wcPhysicalWindowLeaseBlocks(0x380000000000));
+}
 
 pub fn tlbShootdownActiveOnCurrentCpu() bool {
     return @atomicLoad(u8, &tlb_shootdown_active[boundedCurrentCpuSlot()], .acquire) != 0;
@@ -131,22 +244,34 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_storage), &user_copy_hooks_storage));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(user_copy_hooks_ready), &user_copy_hooks_ready));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(ram_cache_snapshot), &ram_cache_snapshot));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_lock), &tlb_shootdown_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_target_cr3), &tlb_shootdown_target_cr3));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_flush_caches), &tlb_shootdown_flush_caches));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_retire_phys_base), &tlb_shootdown_retire_phys_base));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_retire_phys_size), &tlb_shootdown_retire_phys_size));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_generation), &tlb_shootdown_generation));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_ack), &tlb_shootdown_ack));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(tlb_shootdown_active), &tlb_shootdown_active));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wc_window_leases), &wc_window_leases));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(wc_window_active_count), &wc_window_active_count));
     return end;
 }
 
 pub fn mapKernelRuntimeStorage(map_identity_range: *const fn (u64, usize) bool) bool {
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_storage), @sizeOf(@TypeOf(user_copy_hooks_storage)))) return false;
     if (!map_identity_range(@intFromPtr(&user_copy_hooks_ready), @sizeOf(@TypeOf(user_copy_hooks_ready)))) return false;
+    if (!map_identity_range(@intFromPtr(&ram_cache_snapshot), @sizeOf(@TypeOf(ram_cache_snapshot)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_lock), @sizeOf(@TypeOf(tlb_shootdown_lock)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_target_cr3), @sizeOf(@TypeOf(tlb_shootdown_target_cr3)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_flush_caches), @sizeOf(@TypeOf(tlb_shootdown_flush_caches)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_retire_phys_base), @sizeOf(@TypeOf(tlb_shootdown_retire_phys_base)))) return false;
+    if (!map_identity_range(@intFromPtr(&tlb_shootdown_retire_phys_size), @sizeOf(@TypeOf(tlb_shootdown_retire_phys_size)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_generation), @sizeOf(@TypeOf(tlb_shootdown_generation)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_ack), @sizeOf(@TypeOf(tlb_shootdown_ack)))) return false;
     if (!map_identity_range(@intFromPtr(&tlb_shootdown_active), @sizeOf(@TypeOf(tlb_shootdown_active)))) return false;
+    if (!map_identity_range(@intFromPtr(&wc_window_leases), @sizeOf(@TypeOf(wc_window_leases)))) return false;
+    if (!map_identity_range(@intFromPtr(&wc_window_active_count), @sizeOf(@TypeOf(wc_window_active_count)))) return false;
     return true;
 }
 
@@ -164,17 +289,36 @@ fn mapPhysPageForKernelAccess(page_paddr: u64, cpu_slot: usize) ?[*]u8 {
     return mapPhysPageWithCache(page_paddr, cpu_slot, .ram);
 }
 
-const PhysWindowCache = enum { ram, uncached_mmio };
+const PhysWindowCache = union(enum) { ram, uncached_mmio, device: u3 };
 
 fn mapPhysPageWithCache(page_paddr: u64, cpu_slot: usize, cache: PhysWindowCache) ?[*]u8 {
     const h = getHooks();
     const page_base = page_paddr & ~@as(u64, 0xFFF);
+    // This window retains its last PTE. Once a physical page is leased as
+    // WC, neither generic RAM copy nor explicit UC access may recreate a
+    // conflicting live alias. The transition IPI retires the old PTE first.
+    if (cache != .device and wcPhysicalWindowLeaseBlocks(page_base)) return null;
     if (page_base >= h.physical_map_limit) return null;
     if (cpu_slot >= smp.max_cpus or cpu_slot >= h.phys_copy_window_pt.len) return null;
     const window_va = h.phys_copy_window_va + (@as(u64, @intCast(cpu_slot)) * 4096);
     // PCD|PWT selects PAT entry 3 (UC); MMIO callers prove that encoding and
     // alias compatibility before mapping. RAM continues to use entry 0.
-    const cache_flags: u64 = if (cache == .uncached_mmio) (1 << 4) | (1 << 3) else 0;
+    var pat: u3 = switch (cache) {
+        .ram => 0,
+        .uncached_mmio => 3,
+        .device => |slot| slot,
+    };
+    // This load is inside the IRQ-disabled copy guard. Never wait for a
+    // writer here: that writer may be waiting for this CPU's shootdown ack.
+    switch (ramCachePolicyForLockedPage(page_base)) {
+        .blocked => return null,
+        .ordinary => {},
+        .cached => |policy| {
+            if (cache != .ram and pat != policy.pat_slot) return null;
+            pat = policy.pat_slot;
+        },
+    }
+    const cache_flags = (@as(u64, pat & 3) << 3) | (@as(u64, pat >> 2) << 7);
     const desired = page_base | h.page_present | h.page_rw | cache_flags;
     const accessed_dirty: u64 = (1 << 5) | (1 << 6);
     // The guard pins this CPU and excludes reentry. Reusing its current
@@ -331,7 +475,9 @@ pub fn resolveNativeVmaCowMappingWithAddressSpaceLocked(
                     {
                         if (entry.size_bytes > std.math.maxInt(usize) or
                             !user_vm.invalidatePresentUserLinearRegionPtes(
-                                principal, entry.start_va, @intCast(entry.size_bytes),
+                                principal,
+                                entry.start_va,
+                                @intCast(entry.size_bytes),
                             )) return null;
                         invalidated = true;
                     }
@@ -486,13 +632,7 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
         false,
     ) orelse return null;
     if (write_access and !mapping.prot.write) return null;
-    var paddrs = [_]u64{mapping.paddr};
-    if (!user_vm.mapLazyUserPaddrsWithProt(
-        principal,
-        page_va,
-        paddrs[0..],
-        mapping.prot,
-    )) return null;
+    if (!user_vm.mapNativeVmaFaultPage(principal, page_va, mapping)) return null;
     return mapping.paddr;
 }
 
@@ -616,6 +756,29 @@ pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) bool {
     return copyPhysicalPageInWindow(dst_paddr, src_paddr, window.cpu_slot);
 }
 
+// The caller holds the address-space lock through the copy. A device PAT is
+// accepted only from the backing of that exact mapped page, never from an
+// arbitrary physical address. Teardown therefore cannot retire its lease.
+fn userPageCopyCache(principal: kernel.PrincipalId, va: u64, paddr: u64, write: bool) PhysWindowCache {
+    user_vm.lockSharedVmObjects();
+    defer user_vm.unlockSharedVmObjects();
+    const mapping = getHooks().state.nativeVmaFaultMapping(principal, va, write, false) orelse return .ram;
+    if (mapping.paddr == paddr) {
+        if (mapping.device_pat_slot) |slot| return .{ .device = slot };
+    }
+    return .ram;
+}
+
+fn retireDeviceCopyWindow(cache: PhysWindowCache, cpu: usize) void {
+    if (cache != .device) return;
+    // The transient alias must not outlive the VMA whose lease proved its
+    // cache type; draining WC stores also precedes a possible BO unpin.
+    asm volatile ("mfence" ::: .{ .memory = true });
+    const h = getHooks();
+    h.phys_copy_window_pt[cpu] = 0;
+    h.invlpg(h.phys_copy_window_va + @as(u64, @intCast(cpu)) * 4096);
+}
+
 pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
     const h = getHooks();
     if (dest.len == 0) return true;
@@ -638,7 +801,10 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
 
         const page_va = cur_va & ~@as(u64, 0xFFF);
         const page_off: usize = @intCast(cur_va & 0xFFF);
+        if (!user_vm.lockAddressSpace(principal)) return false;
+        defer user_vm.unlockAddressSpace(principal);
         const page_paddr = ensureUserPageMappedForCopy(principal, page_va, false) orelse return false;
+        const cache = userPageCopyCache(principal, page_va, page_paddr, false);
         if (page_paddr >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
@@ -655,7 +821,8 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
         {
             const window = PhysCopyWindowGuard.lock();
             defer window.unlock();
-            const src_page = mapPhysPageForKernelAccess(src_paddr, window.cpu_slot) orelse return false;
+            defer retireDeviceCopyWindow(cache, window.cpu_slot);
+            const src_page = mapPhysPageWithCache(src_paddr, window.cpu_slot, cache) orelse return false;
             const src: [*]const u8 = @ptrCast(src_page + page_off);
             @memcpy(dest[copied .. copied + chunk_len], src[0..chunk_len]);
         }
@@ -686,7 +853,10 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
 
         const page_va = cur_va & ~@as(u64, 0xFFF);
         const page_off: usize = @intCast(cur_va & 0xFFF);
+        if (!user_vm.lockAddressSpace(principal)) return false;
+        defer user_vm.unlockAddressSpace(principal);
         const page_paddr = ensureUserPageMappedForCopy(principal, page_va, true) orelse return false;
+        const cache = userPageCopyCache(principal, page_va, page_paddr, true);
         if (page_paddr >= h.physical_map_limit) return false;
 
         const page_remaining: usize = 4096 - page_off;
@@ -703,7 +873,8 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
         {
             const window = PhysCopyWindowGuard.lock();
             defer window.unlock();
-            const dst_page = mapPhysPageForKernelAccess(dst_paddr, window.cpu_slot) orelse return false;
+            defer retireDeviceCopyWindow(cache, window.cpu_slot);
+            const dst_page = mapPhysPageWithCache(dst_paddr, window.cpu_slot, cache) orelse return false;
             const dst: [*]u8 = @ptrCast(dst_page + page_off);
             @memcpy(dst[0..chunk_len], src[copied .. copied + chunk_len]);
         }
@@ -731,6 +902,27 @@ fn flushCr3ContextOnCurrentCpu(target_cr3: u64) void {
     if (current_cr3 != target_cr3) h.write_cr3(current_cr3);
 }
 
+fn flushCurrentCpuCaches() void {
+    // The native Zig test backend does not assemble this privileged opcode;
+    // production uses LLVM and executes it only in ring 0 after all old
+    // aliases have been made non-present.
+    if (comptime @import("builtin").is_test) return;
+    asm volatile ("wbinvd" ::: .{ .memory = true });
+}
+
+fn retirePhysCopyWindowOnCurrentCpu(base: u64, size_bytes: u64) void {
+    if (size_bytes == 0) return;
+    const h = getHooks();
+    const cpu_slot = boundedCurrentCpuSlot();
+    if (cpu_slot >= h.phys_copy_window_pt.len) return;
+    const entry = h.phys_copy_window_pt[cpu_slot];
+    if ((entry & h.page_present) == 0) return;
+    const paddr = entry & 0x000f_ffff_ffff_f000;
+    if (paddr < base or paddr - base >= size_bytes) return;
+    h.phys_copy_window_pt[cpu_slot] = 0;
+    h.invlpg(h.phys_copy_window_va + @as(u64, @intCast(cpu_slot)) * 4096);
+}
+
 /// Called from the scheduler IPI with the kernel page table active.
 pub fn acknowledgePendingTlbShootdown() void {
     const cpu_slot = smp.currentCpuSlot();
@@ -739,11 +931,22 @@ pub fn acknowledgePendingTlbShootdown() void {
     if (generation == 0 or @atomicLoad(u64, &tlb_shootdown_ack[cpu_slot], .monotonic) == generation) return;
     perf.add(.tlb_received, 1);
     const target_cr3 = @atomicLoad(u64, &tlb_shootdown_target_cr3, .monotonic);
+    retirePhysCopyWindowOnCurrentCpu(@atomicLoad(u64, &tlb_shootdown_retire_phys_base, .monotonic), @atomicLoad(u64, &tlb_shootdown_retire_phys_size, .monotonic));
     if (target_cr3 != 0) flushCr3ContextOnCurrentCpu(target_cr3);
+    if (@atomicLoad(u8, &tlb_shootdown_flush_caches, .monotonic) != 0)
+        flushCurrentCpuCaches();
     @atomicStore(u64, &tlb_shootdown_ack[cpu_slot], generation, .release);
 }
 
 fn shootdownCr3Context(target_cr3: u64) void {
+    shootdownCr3ContextWithOptions(target_cr3, false, 0, 0);
+}
+
+fn shootdownCr3ContextWithCache(target_cr3: u64, flush_caches: bool) void {
+    shootdownCr3ContextWithOptions(target_cr3, flush_caches, 0, 0);
+}
+
+fn shootdownCr3ContextWithOptions(target_cr3: u64, flush_caches: bool, retire_base: u64, retire_size: u64) void {
     if (target_cr3 == 0) return;
     const restore_interrupts = TlbShootdownLock.interruptsEnabled();
     defer if (restore_interrupts) asm volatile ("sti" ::: .{ .memory = true });
@@ -767,10 +970,15 @@ fn shootdownCr3Context(target_cr3: u64) void {
     var generation = @atomicLoad(u64, &tlb_shootdown_generation, .monotonic) +% 1;
     if (generation == 0) generation = 1;
     @atomicStore(u64, &tlb_shootdown_target_cr3, target_cr3, .monotonic);
+    @atomicStore(u8, &tlb_shootdown_flush_caches, @intFromBool(flush_caches), .monotonic);
+    @atomicStore(u64, &tlb_shootdown_retire_phys_base, retire_base, .monotonic);
+    @atomicStore(u64, &tlb_shootdown_retire_phys_size, retire_size, .monotonic);
     @atomicStore(u64, &tlb_shootdown_generation, generation, .release);
 
     const current_cpu = smp.currentCpuSlot();
+    retirePhysCopyWindowOnCurrentCpu(retire_base, retire_size);
     flushCr3ContextOnCurrentCpu(target_cr3);
+    if (flush_caches) flushCurrentCpuCaches();
     if (current_cpu < tlb_shootdown_ack.len) {
         @atomicStore(u64, &tlb_shootdown_ack[current_cpu], generation, .release);
     }
@@ -829,6 +1037,24 @@ pub fn flushTlbForCr3Range(target_cr3: u64, va: u64, size_bytes: usize) void {
     _ = va;
     if (size_bytes == 0) return;
     shootdownCr3Context(target_cr3);
+}
+
+/// Final phase of a physical memory-type transition. All old aliases must
+/// already be non-present and every other CR3 context shot down. Acknowledged
+/// WBINVD on every online CPU drains even speculative old WB cache lines.
+pub fn flushTlbAndCachesForCr3Range(target_cr3: u64, va: u64, size_bytes: usize) void {
+    _ = va;
+    if (size_bytes == 0) return;
+    shootdownCr3ContextWithCache(target_cr3, true);
+}
+
+/// First phase of a WC transition: each CPU drains any in-flight use of its
+/// pinned physical-copy window (interrupts are disabled while it is in use),
+/// removes an old alias to this physical range, and acknowledges the IPI.
+/// The caller then invalidates every user CR3 and performs the cache barrier.
+pub fn retirePhysCopyWindowsForRange(kernel_cr3: u64, paddr: u64, size_bytes: usize) void {
+    if (size_bytes == 0) return;
+    shootdownCr3ContextWithOptions(kernel_cr3, false, paddr, @intCast(size_bytes));
 }
 
 pub fn flushUserTlbForPrincipalVa(principal: kernel.PrincipalId, va: u64) void {
@@ -990,4 +1216,95 @@ test "copy window preserves identical mappings and invalidates every semantic ch
     _ = mapPhysPageForKernelAccess(0x12000, 0).?;
     try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
     try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    retirePhysCopyWindowOnCurrentCpu(0x13000, 4096);
+    try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
+    try std.testing.expectEqual(@as(usize, 3), Mock.calls);
+    retirePhysCopyWindowOnCurrentCpu(0x12000, 4096);
+    try std.testing.expectEqual(@as(u64, 0), pt[0]);
+    try std.testing.expectEqual(@as(u64, 0x400000), Mock.last_va);
+    try std.testing.expectEqual(@as(usize, 4), Mock.calls);
+    const lease = acquireWcPhysicalWindowLease(high_bar, 4096).?;
+    defer releaseWcPhysicalWindowLease(lease);
+    try std.testing.expect(mapPhysPageForKernelAccess(high_bar, 0) == null);
+    try std.testing.expect(mapPhysPageWithCache(high_bar, 0, .uncached_mmio) == null);
+    _ = mapPhysPageWithCache(high_bar, 0, .{ .device = 5 }).?;
+    try std.testing.expectEqual(high_bar | 3 | (1 << 3) | (1 << 7), pt[0]);
+    retireDeviceCopyWindow(.{ .device = 5 }, 0);
+    try std.testing.expectEqual(@as(u64, 0), pt[0]);
+
+    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
+    defer publishRamCacheSnapshot(saved_policy);
+    const cached = [_]ram_cache.Span{.{
+        .base = 0x12000,
+        .bytes = 8192,
+        .owner = 9,
+        .mode = .wc,
+        .pat_slot = 4,
+    }};
+    const active: ram_cache.Snapshot = .{ .policy = &cached };
+    publishRamCacheSnapshot(&active);
+    _ = mapPhysPageForKernelAccess(0x12000, 0).?;
+    try std.testing.expectEqual(@as(u64, 0x12083), pt[0]);
+    _ = mapPhysPageForKernelAccess(0x13000, 1).?;
+    try std.testing.expectEqual(@as(u64, 0x13083), pt[1]);
+    try std.testing.expect(mapPhysPageWithCache(0x12000, 0, .uncached_mmio) == null);
+
+    const pending: ram_cache.Snapshot = .{ .policy = &cached, .pending = &cached };
+    publishRamCacheSnapshot(&pending);
+    const pending_before = pt;
+    try std.testing.expect(mapPhysPageForKernelAccess(0x12000, 0) == null);
+    try std.testing.expect(mapPhysPageWithCache(0x12000, 0, .{ .device = 4 }) == null);
+    try std.testing.expectEqualSlices(u64, &pending_before, &pt);
+    // The production writer retires these windows and waits for every CPU
+    // before exposing the replacement. Host tests do not execute real IPIs.
+    retirePhysCopyWindowOnCurrentCpu(0x12000, 8192);
+    const restored: ram_cache.Snapshot = .{};
+    publishRamCacheSnapshot(&restored);
+    _ = mapPhysPageForKernelAccess(0x12000, 0).?;
+    try std.testing.expectEqual(@as(u64, 0x12003), pt[0]);
+}
+
+test "copy-window retirement may cover sparse holes without changing other windows" {
+    const Mock = struct {
+        var invalidations: usize = 0;
+        fn invalidate(_: u64) void {
+            invalidations += 1;
+        }
+    };
+    const saved: ?Hooks = if (user_copy_hooks_ready) user_copy_hooks_storage else null;
+    const saved_policy = @atomicLoad(?*const ram_cache.Snapshot, &ram_cache_snapshot, .acquire);
+    defer {
+        if (saved) |h| init(h) else user_copy_hooks_ready = false;
+        publishRamCacheSnapshot(saved_policy);
+    }
+    publishRamCacheSnapshot(null);
+    var pt = [_]u64{0} ** 512;
+    init(.{
+        .state = undefined,
+        .free_list = undefined,
+        .physical_map_limit = 1 << 32,
+        .phys_copy_window_va = 0x400000,
+        .page_present = 1,
+        .page_rw = 2,
+        .kernel_cr3_value = undefined,
+        .user_space_cr3_for_principal = undefined,
+        .phys_copy_window_pt = &pt,
+        .read_cr3 = undefined,
+        .write_cr3 = undefined,
+        .invlpg = Mock.invalidate,
+    });
+    Mock.invalidations = 0;
+    // Requested pages 0x12000 and 0x15000 bound an unrelated 0x13000
+    // cached window. Evicting it is safe: its next use remaps it.
+    pt[0] = 0x13003;
+    retirePhysCopyWindowOnCurrentCpu(0x12000, 0x4000);
+    try std.testing.expectEqual(@as(u64, 0), pt[0]);
+    try std.testing.expectEqual(@as(usize, 1), Mock.invalidations);
+    _ = mapPhysPageForKernelAccess(0x13000, 0).?;
+    try std.testing.expectEqual(@as(u64, 0x13003), pt[0]);
+    try std.testing.expectEqual(@as(usize, 2), Mock.invalidations);
+    pt[0] = 0x16003;
+    retirePhysCopyWindowOnCurrentCpu(0x12000, 0x4000);
+    try std.testing.expectEqual(@as(u64, 0x16003), pt[0]);
+    try std.testing.expectEqual(@as(usize, 2), Mock.invalidations);
 }

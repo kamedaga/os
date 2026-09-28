@@ -4,7 +4,7 @@ from pathlib import Path
 import re
 
 root = Path(__file__).resolve().parents[1]
-kernel = {"log": 1}
+kernel = {"log": 1, "kernel_log_read": 2}
 for group in ("process", "runtime", "fd", "vm", "ipc", "capsule"):
     source = (root / f"kernel/abi/{group}_abi.zig").read_text()
     for name, number in re.findall(r"pub const syscall_(\w+): u64 = (\d+);", source):

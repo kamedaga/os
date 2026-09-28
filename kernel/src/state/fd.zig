@@ -255,18 +255,40 @@ pub fn releaseMmioRegionObject(self: anytype, mmio: MmioRegionObject) void {
     if (mmio.user_va == 0 or mmio.size == 0) return;
     const owner = @TypeOf(self.*).objectOwner(mmio.owner_principal_raw) orelse return;
     if (mmio.size > @as(u64, std.math.maxInt(usize))) return;
+    const user_vm = @import("../memory/user_vm.zig");
+    if (mmio.wc_window_lease_token != 0) user_vm.lockAllVmTransactions();
+    defer if (mmio.wc_window_lease_token != 0) user_vm.unlockAllVmTransactions();
     if (mmio.flags & @import("kernel_abi_root").capsule_abi.mmio_map_flag_replace_existing != 0) {
         // The underlying reservation never left the VMA table. Remove only
         // this lease's PTEs, including after an earlier process-VM teardown.
-        if (!@import("../memory/user_vm.zig").unmapUserMmioOverlay(
+        if (!user_vm.unmapUserMmioOverlay(
             owner,
             mmio.user_va,
             mmio.paddr,
             @intCast(mmio.size),
         )) @panic("MMIO overlay last-close lost its address identity");
-        return;
+    } else {
+        const unmapped = user_vm.unmapUserLinearRegion(owner, mmio.user_va, @intCast(mmio.size));
+        if (!unmapped and mmio.wc_window_lease_token != 0)
+            @panic("WC MMIO last-close lost its user mapping");
     }
-    _ = @import("../memory/user_vm.zig").unmapUserLinearRegion(owner, mmio.user_va, @intCast(mmio.size));
+    if (mmio.wc_window_lease_token != 0) {
+        const x86 = @import("../arch/x86_64/platform.zig");
+        const limit = @import("../arch/x86_64/physical_layout.zig").identity_limit;
+        const low_size = if (mmio.paddr < limit) @min(mmio.size, limit - mmio.paddr) else 0;
+        if (low_size != 0) x86.wcIdentityRelease(mmio.paddr, low_size);
+        @import("../user_copy.zig").retirePhysCopyWindowsForRange(x86.kernel_cr3_value, mmio.paddr, @intCast(mmio.size));
+        if (low_size != 0)
+            user_vm.flushAllUserIdentityContexts(mmio.paddr, @intCast(low_size));
+        @import("../user_copy.zig").flushTlbAndCachesForCr3Range(x86.kernel_cr3_value, mmio.paddr, @intCast(mmio.size));
+        if (low_size != 0) {
+            x86.wcIdentityRestore(mmio.paddr, low_size);
+            user_vm.restorePrivateIdentityMarkers(mmio.paddr, low_size);
+            @import("../user_copy.zig").flushTlbForCr3Range(x86.kernel_cr3_value, mmio.paddr, @intCast(low_size));
+            user_vm.flushAllUserIdentityContexts(mmio.paddr, @intCast(low_size));
+        }
+        @import("../user_copy.zig").releaseWcPhysicalWindowLease(mmio.wc_window_lease_token);
+    }
 }
 
 pub fn releaseDmaBufferObject(self: anytype, dma: DmaBufferObject) void {
@@ -1062,6 +1084,27 @@ pub fn createMmioRegionFd(
         if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
         return err;
     };
+}
+
+/// The global KernelState lock serializes this check with MMIO FD publication
+/// and final close. Compare actual physical pages, not BAR ownership: a UC
+/// register window and a disjoint WC VRAM window may coexist on one device.
+pub fn mmioPhysicalCacheConflict(self: anytype, paddr: u64, size: u64, wc: bool) bool {
+    if (self.deviceMemoryCacheConflict(paddr, size, wc)) return true;
+    if (size == 0 or paddr > std.math.maxInt(u64) - size) return true;
+    const end = paddr + size;
+    const capsule_abi = @import("kernel_abi_root").capsule_abi;
+    for (&self.fd_objects) |*slot| {
+        if (slot.kind != .mmio_region or slot.ref_count == 0) continue;
+        const mmio = slot.payload.mmio_region;
+        if (mmio.user_va == 0 or mmio.size == 0 or
+            mmio.paddr > std.math.maxInt(u64) - mmio.size) continue;
+        if (paddr >= mmio.paddr + mmio.size or mmio.paddr >= end) continue;
+        const kind = (mmio.flags & capsule_abi.mmio_map_cache_mask) >>
+            capsule_abi.mmio_map_cache_shift;
+        if ((kind == @intFromEnum(capsule_abi.MmioCache.wc)) != wc) return true;
+    }
+    return false;
 }
 
 pub fn createDmaBufferFd(

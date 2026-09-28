@@ -203,7 +203,9 @@ static int dma_map(void *context, uint64_t iova, uint64_t ram_offset,
         dma_unlock(dma);
         return result;
     }
-    *slot = (struct ph_dma_mapping){.iova = iova, .length = length, .fd = (int)fd};
+    *slot = (struct ph_dma_mapping){
+        .iova = iova, .ram_offset = ram_offset, .length = length, .fd = (int)fd,
+    };
 #if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
     slot->profile_direction = direction;
     dma_profile_record(dma, slot, 0, direction);
@@ -365,6 +367,31 @@ static int dma_unmap(void *context, uint64_t iova, size_t length) {
     }
     dma_unlock(dma);
     return -ENOENT;
+}
+
+int ph_dma_cache_overlap(struct ph_dma *dma, size_t ram_offset, size_t length,
+    size_t *direct_count, size_t *scatter_count, uint64_t *sample_iova) {
+    if (!dma || !length || !direct_count || !scatter_count || !sample_iova)
+        return -EINVAL;
+    /* A cache-policy failure may occur under Linux's CPA lock. Never wait
+     * for another DMA operation just to produce a diagnostic snapshot. */
+    if (atomic_exchange_explicit(&dma->lock, 1, memory_order_acquire))
+        return -EBUSY;
+    *direct_count = 0;
+    *scatter_count = 0;
+    *sample_iova = 0;
+    for (size_t i = 0; i < dma->config.mapping_capacity; ++i) {
+        const struct ph_dma_mapping *mapping = &dma->config.mappings[i];
+        if (!mapping->length) continue;
+        if (mapping->view) {
+            ++*scatter_count;
+        } else if (ram_offset < mapping->ram_offset + mapping->length &&
+            mapping->ram_offset < ram_offset + length) {
+            if ((*direct_count)++ == 0) *sample_iova = mapping->iova;
+        }
+    }
+    dma_unlock(dma);
+    return 0;
 }
 
 int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config) {

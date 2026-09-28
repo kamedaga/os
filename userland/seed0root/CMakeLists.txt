@@ -62,7 +62,7 @@ add_custom_command(
       ${SEED0ROOT_TEST_ENV}
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/seed0root/src/live_console.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libcapsule/src/capsule.c ${REPO_ROOT}/userland/personality/src/lpr_manifest.c ${SEED0ROOT_USB_HID_TEST_SOURCE}${LIVE_VTERM_SOURCES}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/seed0root/src ${LIVE_VTERM_BUILD} ${LIVE_VTERM_BUILD}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/gpud/include ${REPO_ROOT}/userland/usbd/include ${REPO_ROOT}/userland/inputd/include ${REPO_ROOT}/userland/unixd/include"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/seed0root/src ${LIVE_VTERM_BUILD} ${LIVE_VTERM_BUILD}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/logd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/gpud/include ${REPO_ROOT}/userland/usbd/include ${REPO_ROOT}/userland/inputd/include ${REPO_ROOT}/userland/unixd/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
   DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
@@ -92,6 +92,7 @@ add_custom_command(
     "${REPO_ROOT}/userland/libpacha/include/pacha/live_bootstrap.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/root_handoff.h"
     "${REPO_ROOT}/userland/netd/include/netd/boot_config.h"
+    "${REPO_ROOT}/userland/logd/include/logd/boot_config.h"
     "${REPO_ROOT}/userland/unixd/include/unixd/ipc_protocol.h"
     "${REPO_ROOT}/userland/unixd/include/unixd/poll.h"
     "${REPO_ROOT}/userland/unixd/include/unixd/transport.h"

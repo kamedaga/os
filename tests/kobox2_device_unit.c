@@ -114,6 +114,7 @@ int main(void) {
     assert(ph_device_init(&device, &config) == -ENOMEM && !device.dma.config.generation && destroys == 3);
     irq_error = 0;
     assert(!ph_device_init(&device, &config) && device.generation == 7);
+    assert(image.device_dma == &device.dma && device.image == &image);
     assert(device.pci.config.reservation == config.memory.vmalloc_base);
     assert(device.dma.config.ram == image.direct && device.irq.config.cookie_sequence == &sequence);
     unsigned int before = calls;
@@ -130,9 +131,11 @@ int main(void) {
     device.irq.slots[2].route.cookie = 0;
     drain_error = -EIO;
     assert(ph_device_finish(&device, 7) == -EIO && device.generation == 7 && destroys == 3);
+    assert(image.device_dma == &device.dma);
     assert(!device.irq.admitted && !device.dma.admitted && device.pci.admitted && irq_revokes == 1);
     drain_error = 0;
     assert(!ph_device_finish(&device, 7) && !device.generation && destroys == 6);
+    assert(image.device_dma == NULL && device.image == NULL);
     assert(sequence == 17); /* Composition never rewinds a route counter. */
     config.generation = 8;
     assert(!ph_device_init(&device, &config));

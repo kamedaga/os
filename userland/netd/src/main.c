@@ -12,6 +12,7 @@
 #include "upper.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
+#include "pacha/log.h"
 #include "pacha/bootstrap.h"
 
 #include <stdint.h>
@@ -29,6 +30,7 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
         cfg->filed_endpoint_fd < 16 ||
         cfg->socket_endpoint_fd < 16 ||
         (cfg->status_channel_fd != 0 && cfg->status_channel_fd < 16) ||
+        (cfg->log_endpoint_fd != 0 && cfg->log_endpoint_fd < 16) ||
         (cfg->flags & ~(NETD_BOOT_FLAG_SMOKE | NETD_BOOT_FLAG_TRACE | NETD_BOOT_FLAG_METRIC)) != 0) {
         if (cfg != NULL) {
             fprintf(stderr,
@@ -47,6 +49,18 @@ static int report_link_status(const struct netd_boot_config *cfg,
     int status, uint64_t stage)
 {
     netd_status_file_publish(cfg, status ? "failed" : "ready", stage, status);
+    if (cfg->log_endpoint_fd >= 16) {
+        char line[128];
+        const struct netd_nic_diagnostic *diagnostic =
+            netd_kobox2_nic_diagnostic();
+        int size = snprintf(line, sizeof(line),
+            "network stage=%llu status=%d nic_step=%u detail=%d loaded=%u pci_bound=%u",
+            (unsigned long long)stage, status, diagnostic->step,
+            diagnostic->detail, diagnostic->loaded, diagnostic->pci_bound);
+        if (size > 0 && (size_t)size < sizeof(line))
+            (void)pacha_log_emit((int)cfg->log_endpoint_fd,
+                PACHA_LOG_SOURCE_NETD, line, (size_t)size);
+    }
     if (cfg->status_channel_fd < 16) return 0;
     const struct netd_link_info *link = status == 0 ? netd_link_current() : NULL;
     uint64_t metadata = stage;

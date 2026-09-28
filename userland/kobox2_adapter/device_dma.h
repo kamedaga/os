@@ -7,6 +7,7 @@
 
 struct ph_dma_mapping {
     uint64_t iova;
+    uint64_t ram_offset; /* Valid for direct RAM mappings (view == NULL). */
     size_t length;
     int fd;
     void *view;
@@ -55,5 +56,10 @@ struct ph_dma {
 int ph_dma_init(struct ph_dma *dma, const struct ph_dma_config *config);
 int ph_dma_revoke(struct ph_dma *dma, uint64_t generation);
 int ph_dma_destroy(struct ph_dma *dma);
+
+/* Failure-path snapshot only. Scattered views are counted separately because
+ * their page list is not retained after the native mapping has been made. */
+int ph_dma_cache_overlap(struct ph_dma *dma, size_t ram_offset, size_t length,
+    size_t *direct_count, size_t *scatter_count, uint64_t *sample_iova);
 
 #endif

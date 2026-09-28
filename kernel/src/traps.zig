@@ -302,9 +302,9 @@ fn asmExceptionWithErrorHandlerBody(comptime vec_number: u64) []const u8 {
             \\cmp $0x3, %rax
             \\jne 1f
         , .{}) ++ asmCallAligned("saveCurrentThreadXState") ++ std.fmt.comptimePrint(
-            \\mov ${d}, %rcx
-            \\mov %r12, %rdx
-        , .{vec_number}) ++
+        \\mov ${d}, %rcx
+        \\mov %r12, %rdx
+    , .{vec_number}) ++
         asmCallAligned("fatalUserExceptionWithErrorDispatch") ++
         asmCallAligned("restoreCurrentThreadXState") ++
         asmCallAligned("fatalExceptionResumeWorkFrameForCurrentCpuFromAsm") ++
@@ -614,12 +614,7 @@ pub export fn pageFaultDispatch(frame: *ExceptionTrapFrame) callconv(.winapi) u6
                 mapping.prot,
             )
         else
-            user_vm.mapLazyUserPaddrsWithProt(
-                principal,
-                fault_page_va,
-                paddrs[0..],
-                mapping.prot,
-            );
+            user_vm.mapNativeVmaFaultPage(principal, fault_page_va, mapping);
         if (mapped) return 1;
     }
     return 0;
@@ -635,7 +630,9 @@ pub export fn fatalUserExceptionWithErrorDispatch(vec: u64, frame: *const Except
     asm volatile ("cli");
     var context: TrapFrame = undefined;
     inline for (std.meta.fields(TrapFrame)) |field| @field(context, field.name) = @field(frame, field.name);
-    const address = if (vec == 14) asm volatile ("mov %%cr2, %[value]" : [value] "=r" (-> u64)) else 0;
+    const address = if (vec == 14) asm volatile ("mov %%cr2, %[value]"
+        : [value] "=r" (-> u64),
+    ) else 0;
     if (stageFaultForUserReturn(vec, frame.error_code, address, &context)) {
         fatalExceptionResumeWorkFrameForCurrentCpuFromAsm().* = context;
         return;

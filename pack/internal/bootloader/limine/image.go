@@ -3,6 +3,7 @@ package limine
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,9 +15,10 @@ import (
 )
 
 const (
-	imageName        = "limine-boot.img"
-	imageSizeBytes   = int64(64 * 1024 * 1024)
-	fatPartitionByte = int64(2 * 1024 * 1024)
+	imageName          = "limine-boot.img"
+	minImageSizeBytes  = int64(64 * 1024 * 1024)
+	imageSizeStepBytes = int64(64 * 1024 * 1024)
+	fatPartitionByte   = int64(2 * 1024 * 1024)
 )
 
 type Inputs struct {
@@ -77,7 +79,14 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 		span.Fail("limine image directory failed")
 		return Result{}, err
 	}
-	if err := createEmptyImage(imagePath); err != nil {
+	// USB file updates use these same snapshots. A stale loose KERNEL.ELF
+	// must never accompany a newly built, QEMU-tested image.
+	inputs, err = stageBootInputs(filepath.Dir(imagePath), inputs)
+	if err != nil {
+		span.Fail("limine input staging failed")
+		return Result{}, err
+	}
+	if err := createEmptyImage(imagePath, total); err != nil {
 		span.Fail("limine image create failed")
 		return Result{}, err
 	}
@@ -90,7 +99,15 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 
 	span.Set(5, "formatting FAT partition")
 	mtoolsImage := fmt.Sprintf("%s@@%d", imagePath, fatPartitionByte)
-	if err := run("mformat", "-i", mtoolsImage, "-F", "-v", "LIMINEBOOT", "::"); err != nil {
+	imageInfo, err := os.Stat(imagePath)
+	if err != nil {
+		return Result{}, err
+	}
+	sectors, err := fatPartitionSectors(imageInfo.Size())
+	if err != nil {
+		return Result{}, err
+	}
+	if err := run("mformat", "-i", mtoolsImage, "-T", fmt.Sprint(sectors), "-F", "-v", "LIMINEBOOT", "::"); err != nil {
 		span.Fail("limine FAT format failed")
 		return Result{}, err
 	}
@@ -142,6 +159,69 @@ func BuildImageWithOptions(workspace *config.Workspace, inputs Inputs, opts Opti
 	}
 	span.Done("limine boot image ready")
 	return Result{Image: imagePath, Limine: limine, Config: configPath, FilesBytes: total}, nil
+}
+
+func fatPartitionSectors(imageBytes int64) (int64, error) {
+	// An offset alone lets mtools consume the backup GPT. Keep the FAT BPB
+	// extent equal to partition 2, excluding its 32 table sectors and header.
+	const backupGPTSectors = int64(33)
+	if imageBytes%512 != 0 || imageBytes <= fatPartitionByte+backupGPTSectors*512 {
+		return 0, fmt.Errorf("invalid Limine image extent: %d", imageBytes)
+	}
+	return imageBytes/512 - fatPartitionByte/512 - backupGPTSectors, nil
+}
+
+func stageBootInputs(dir string, inputs Inputs) (Inputs, error) {
+	for _, item := range []struct {
+		path *string
+		name string
+	}{
+		{&inputs.KernelELF, "KERNEL.ELF"},
+		{&inputs.InitELF, "INITAPP.ELF"},
+		{&inputs.BootfsImage, "BOOTFS.IMG"},
+		{&inputs.DiagnosticELF, "DIAGBOOT.ELF"},
+	} {
+		if *item.path == "" {
+			continue
+		}
+		destination := filepath.Join(dir, item.name)
+		if err := copyBootInput(*item.path, destination); err != nil {
+			return Inputs{}, fmt.Errorf("stage %s: %w", item.name, err)
+		}
+		*item.path = destination
+	}
+	return inputs, nil
+}
+
+func copyBootInput(source, destination string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	sourceInfo, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if destinationInfo, err := os.Stat(destination); err == nil && os.SameFile(sourceInfo, destinationInfo) {
+		return nil
+	}
+	out, err := os.CreateTemp(filepath.Dir(destination), ".boot-input-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	if err := out.Chmod(0o644); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(out.Name(), destination)
 }
 
 func locateLimine(explicit string) (string, string, error) {
@@ -211,13 +291,20 @@ func checkInputs(inputs Inputs, dataDir string) (int64, error) {
 	return total, nil
 }
 
-func createEmptyImage(path string) error {
+func createEmptyImage(path string, filesBytes int64) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	return file.Truncate(imageSizeBytes)
+	// FAT metadata and boot partitions need room beyond input files. Ordinary
+	// images remain 64 MiB; optional Mesa images grow in bounded steps.
+	bytes := filesBytes + 32*1024*1024
+	if bytes < minImageSizeBytes {
+		bytes = minImageSizeBytes
+	}
+	bytes = (bytes + imageSizeStepBytes - 1) / imageSizeStepBytes * imageSizeStepBytes
+	return file.Truncate(bytes)
 }
 
 func writeConfig(path string, diagnostic bool) error {
