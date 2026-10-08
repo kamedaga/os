@@ -16,10 +16,29 @@ if [[ "${1:-}" == --native-primitives ]]; then
   mkdir -p "$out"
   bash "$repo_root/tests/build-native-host-primitives.sh" --init
   init="$repo_root/.artifacts/tests/native-host-primitives/native_host_primitives_init.elf"
+  manifest="$repo_root/tests/native-primitives.bootfs"
+  core=""
   gates=(NATIVE_PENDING_NOTIFICATION_RETURN NATIVE_THREAD_NOTIFICATION NATIVE_FAULT_RETURN NATIVE_EXECUTION NATIVE_CLOCK_CONTRACT)
   terminal='NATIVE_CLOCK_CONTRACT=PASS|NATIVE_[A-Z_]+=FAIL'
 else
-  if [[ $# == 1 && "$1" == --device ]]; then
+  if [[ $# == 1 && "$1" == --exception ]]; then
+    out="$repo_root/.artifacts/tests/kobox2-pacha-exception"
+    init="$out/kobox2_foundation.elf"
+    gates=(PACHA_KOBOX_NATIVE_MAPPING PACHA_KOBOX_BOOT_SMP PACHA_KOBOX_EXCEPTION PACHA_KOBOX_FOCUSED)
+    terminal='PACHA_KOBOX_FOCUSED=PASS|PACHA_KOBOX_FOUNDATION=FAIL'
+  elif [[ $# == 1 && "$1" == --nvme ]]; then
+    [[ -n "${KOBOX_PACHA_MANIFEST:-}" ]] || exit 2
+    out="$repo_root/.artifacts/tests/kobox2-pacha-nvme"
+    init="$out/kobox2_foundation.elf"
+    gates=(PACHA_KOBOX_NATIVE_MAPPING PACHA_KOBOX_BOOT_SMP PACHA_KOBOX_NVME_READ PACHA_KOBOX_NVME PACHA_KOBOX_FOCUSED)
+    terminal='PACHA_KOBOX_FOCUSED=PASS|PACHA_KOBOX_FOUNDATION=FAIL'
+    scratch="${KOBOX_PACHA_OUTPUT:-$out}/nvme-scratch.img"
+    mkdir -p "$(dirname "$scratch")"
+    [[ ! -e "$scratch" ]] || { echo "Refusing to overwrite NVMe scratch" >&2; exit 2; }
+    qemu-img create -q -f raw "$scratch" 16M
+    qemu_devices=(-drive "file=$scratch,format=raw,if=none,id=probe,readonly=on"
+      -device nvme,drive=probe,serial=fiber-nvme-gate)
+  elif [[ $# == 1 && "$1" == --device ]]; then
     out="$repo_root/.artifacts/tests/kobox2-pacha-device"
     init="$out/kobox2_foundation.elf"
     # Make the selected manifest explicit to both the builder and the runner.
@@ -90,14 +109,18 @@ else
     core="$(dirname "$manifest")/$core"
   fi
   core="$(realpath -e "$core")"
+  if [[ -n "${KOBOX_PACHA_OUTPUT:-}" ]]; then
+    out="$(realpath -m "$KOBOX_PACHA_OUTPUT")"
+    init="$out/kobox2_foundation.elf"
+  fi
   KOBOX_PACHA_CORE="$core" bash "$repo_root/tests/build-kobox2-pacha-foundation.sh" "$@"
 fi
 (cd "$repo_root/kernel" && zig build limine)
 (cd "$repo_root/pack" && go run ./cmd/bootfs-image \
   --manifest "$manifest" --output "$out/bootfs.img")
-sha256sum "$core" \
-  "$repo_root/kernel/zig-out/bin/limine/pacha-kernel.elf" "$init" "$out/bootfs.img" \
+sha256sum "$repo_root/kernel/zig-out/bin/limine/pacha-kernel.elf" "$init" "$out/bootfs.img" \
   >"$out/inputs.sha256"
+if [[ -n "$core" ]]; then sha256sum "$core" >>"$out/inputs.sha256"; fi
 if [[ "${1:-}" == --vm* || "${1:-}" == --syscall* || "${1:-}" == --exec* || "${1:-}" == --gem* ]]; then
   sha256sum "$repo_root/.artifacts/tests/kobox2-pacha-vm/vm_client.elf" \
     >>"$out/inputs.sha256"

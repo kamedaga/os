@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(seed0root C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(SEED0ROOT_ELF "${CMAKE_BINARY_DIR}/seed0root.elf")
 set(LIVE_VTERM_BUILD "${REPO_ROOT}/.artifacts/third_party/libvterm-0.3.3/build")
 set(LIVE_VTERM_SOURCES "")
@@ -61,25 +62,32 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       ${SEED0ROOT_TEST_ENV}
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/seed0root/src/live_console.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libcapsule/src/capsule.c ${REPO_ROOT}/userland/personality/src/lpr_manifest.c ${SEED0ROOT_USB_HID_TEST_SOURCE}${LIVE_VTERM_SOURCES}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/seed0root/src ${LIVE_VTERM_BUILD} ${LIVE_VTERM_BUILD}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/logd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/gpud/include ${REPO_ROOT}/userland/usbd/include ${REPO_ROOT}/userland/inputd/include ${REPO_ROOT}/userland/unixd/include"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${REPO_ROOT}/userland/seed0root/src/live_console.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libipc/src/status.c ${REPO_ROOT}/userland/libpacha/src/syscall.c ${REPO_ROOT}/userland/libcapsule/src/capsule.c ${REPO_ROOT}/userland/personality/src/lpr_manifest.c ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/userland/filed/src/exec_payload.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c ${SEED0ROOT_USB_HID_TEST_SOURCE}${LIVE_VTERM_SOURCES}"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/seed0root/src ${LIVE_VTERM_BUILD} ${LIVE_VTERM_BUILD}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/storage/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/personality/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/netd/include ${REPO_ROOT}/userland/logd/include ${REPO_ROOT}/userland/termd/include ${REPO_ROOT}/userland/gpud/include ${REPO_ROOT}/userland/usbd/include ${REPO_ROOT}/userland/inputd/include ${REPO_ROOT}/userland/unixd/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0ROOT_ELF}"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
+    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/client.h"
+    "${REPO_ROOT}/userland/libfiled_client/src/client.c"
+    "${REPO_ROOT}/userland/filed/src/exec_payload.c"
+    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/live_console.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/live_console.h"
     "${REPO_ROOT}/pack/scripts/prepare_live_console_assets.sh"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/usb_input_smoke.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_services.h"
-    "${REPO_ROOT}/userland/filed/include/filed/bootstrap.h"
+    "${REPO_ROOT}/userland/installer/bootstrap.h"
     "${REPO_ROOT}/userland/filed/include/filed/flags.h"
     "${REPO_ROOT}/userland/filed/include/filed/payload.h"
+    "${REPO_ROOT}/userland/filed_smoke/include/filed_smoke/bootstrap.h"
     "${REPO_ROOT}/userland/filed/include/filed/ipc_protocol.h"
     "${REPO_ROOT}/userland/storage/include/storage/bootstrap.h"
     "${REPO_ROOT}/userland/storage/include/storage/stack.h"
     "${REPO_ROOT}/userland/storage/include/storage/stack.def"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/boot_config.h"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
+    "${REPO_ROOT}/userland/termd/include/termd/ipc_protocol.h"
     "${REPO_ROOT}/userland/personality/include/personality/linux_lpr.h"
     "${REPO_ROOT}/userland/personality/include/personality/lpr_manifest.h"
     "${REPO_ROOT}/userland/personality/src/lpr_manifest.c"
@@ -106,7 +114,6 @@ add_custom_command(
     "${REPO_ROOT}/userland/libcapsule/include/pacha/capsule.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

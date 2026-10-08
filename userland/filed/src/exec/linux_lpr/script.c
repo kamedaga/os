@@ -74,112 +74,67 @@ int lpr_exec_parse_shebang(
     return 1;
 }
 
-static int lpr_exec_script_append(
-    char *strings,
-    uint64_t *string_bytes,
-    filed_exec_string_ref_t *out_ref,
-    const char *value)
+static int append_string(char *strings, size_t capacity, uint64_t *used,
+                          filed_exec_string_ref_t *ref, const char *value)
 {
-    if (strings == NULL || string_bytes == NULL || out_ref == NULL || value == NULL) {
-        return -22;
-    }
-    const size_t length = strlen(value) + 1u;
-    if (length > UINT16_MAX || *string_bytes > FILED_EXEC_STRING_BYTES ||
-        length > FILED_EXEC_STRING_BYTES - *string_bytes)
-    {
-        return -7;
-    }
-    out_ref->offset = (uint16_t)*string_bytes;
-    out_ref->length = (uint16_t)length;
-    memcpy(strings + *string_bytes, value, length);
-    *string_bytes += length;
+    if (!value) return -22;
+    size_t size = strlen(value)+1;
+    if (*used > capacity || size > capacity-*used) return -7;
+    *ref = (filed_exec_string_ref_t){*used,size};
+    memcpy(strings + *used, value, size);
+    *used += size;
     return 0;
 }
-
-int lpr_exec_rewrite_script_request(
-    filed_exec_path_t *request,
-    const char *interpreter,
-    const char *argument,
-    const char *script_path)
+int lpr_exec_rewrite_script_request(filed_exec_path_t *r,
+    const char *interpreter, const char *argument, const char *path)
 {
-    if (request == NULL || interpreter == NULL || interpreter[0] == '\0' ||
-        argument == NULL || script_path == NULL || script_path[0] == '\0' ||
-        request->argc > FILED_EXEC_MAX_ARGS || request->envc > FILED_EXEC_MAX_ENVS ||
-        request->string_bytes > FILED_EXEC_STRING_BYTES)
-    {
+    if (!r || !interpreter || !*interpreter || !argument || !path || !*path)
         return -22;
-    }
-
-    const uint64_t tail_count = request->argc > 0 ? request->argc - 1u : 0;
-    const uint64_t argument_count = argument[0] != '\0' ? 1u : 0u;
-    const uint64_t new_argc = 2u + argument_count + tail_count;
-    if (new_argc > FILED_EXEC_MAX_ARGS) {
-        return -7;
-    }
-
-    char *new_strings = malloc(FILED_EXEC_STRING_BYTES);
-    if (new_strings == NULL) {
-        return -12;
-    }
-    filed_exec_string_ref_t new_argv[FILED_EXEC_MAX_ARGS];
-    filed_exec_string_ref_t new_envp[FILED_EXEC_MAX_ENVS];
-    memset(new_argv, 0, sizeof(new_argv));
-    memset(new_envp, 0, sizeof(new_envp));
-    uint64_t new_string_bytes = 0;
-    uint64_t new_index = 0;
-    int status = lpr_exec_script_append(
-        new_strings,
-        &new_string_bytes,
-        &new_argv[new_index++],
-        interpreter);
-    if (status == 0 && argument_count != 0) {
-        status = lpr_exec_script_append(
-            new_strings,
-            &new_string_bytes,
-            &new_argv[new_index++],
-            argument);
-    }
-    if (status == 0) {
-        status = lpr_exec_script_append(
-            new_strings,
-            &new_string_bytes,
-            &new_argv[new_index++],
-            script_path);
-    }
-    for (uint64_t i = 1; status == 0 && i < request->argc; ++i) {
-        if (!filed_exec_string_ref_valid(request, request->argv[i])) {
-            status = -22;
-            break;
+    uint64_t tail = r->argc ? r->argc-1 : 0;
+    uint64_t extra = *argument ? 3 : 2;
+    if (tail > UINT64_MAX-extra) return -7;
+    uint64_t argc = tail+extra;
+    if (argc > SIZE_MAX / sizeof(filed_exec_string_ref_t) ||
+        r->envc > SIZE_MAX / sizeof(filed_exec_string_ref_t)-argc) return -7;
+    size_t bytes = strlen(interpreter)+1;
+    size_t addition = strlen(path)+1 + (*argument ? strlen(argument)+1 : 0);
+    if (addition > SIZE_MAX-bytes) return -7;
+    bytes += addition;
+    for (unsigned list=0; list<2; ++list) {
+        uint64_t start = list ? 0 : 1;
+        uint64_t count = list ? r->envc : r->argc;
+        filed_exec_string_ref_t *refs = list ? r->envp : r->argv;
+        for (uint64_t i=start; i<count; ++i) {
+            if (!filed_exec_string_ref_valid(r,refs[i])) return -22;
+            if (refs[i].length > SIZE_MAX-bytes) return -7;
+            bytes += (size_t)refs[i].length;
         }
-        status = lpr_exec_script_append(
-            new_strings,
-            &new_string_bytes,
-            &new_argv[new_index++],
-            filed_exec_string(request, request->argv[i]));
     }
-    for (uint64_t i = 0; status == 0 && i < request->envc; ++i) {
-        if (!filed_exec_string_ref_valid(request, request->envp[i])) {
-            status = -22;
-            break;
-        }
-        status = lpr_exec_script_append(
-            new_strings,
-            &new_string_bytes,
-            &new_envp[i],
-            filed_exec_string(request, request->envp[i]));
-    }
-    if (status == 0) {
-        memset(request->argv, 0, sizeof(request->argv));
-        memset(request->envp, 0, sizeof(request->envp));
-        memset(request->strings, 0, sizeof(request->strings));
-        memcpy(request->argv, new_argv, sizeof(new_argv));
-        memcpy(request->envp, new_envp, sizeof(new_envp));
-        memcpy(request->strings, new_strings, (size_t)new_string_bytes);
-        request->argc = new_argc;
-        request->string_bytes = new_string_bytes;
-    }
-    free(new_strings);
-    return status;
+    size_t array_bytes = (size_t)(argc+r->envc)*sizeof(filed_exec_string_ref_t);
+    if (bytes > SIZE_MAX-array_bytes) return -7;
+    void *owned = malloc(array_bytes+bytes);
+    if (!owned) return -12;
+    filed_exec_string_ref_t *argv = owned, *envp = argv+argc;
+    char *strings = (char *)owned+array_bytes;
+    uint64_t used=0,index=0;
+    int status = append_string(strings,bytes,&used,&argv[index++],interpreter);
+    if (!status && *argument) status=append_string(strings,bytes,&used,&argv[index++],argument);
+    if (!status) status=append_string(strings,bytes,&used,&argv[index++],path);
+    for (uint64_t i=1; !status && i<r->argc; ++i)
+        status=append_string(strings,bytes,&used,&argv[index++],filed_exec_string(r,r->argv[i]));
+    for (uint64_t i=0; !status && i<r->envc; ++i)
+        status=append_string(strings,bytes,&used,&envp[i],filed_exec_string(r,r->envp[i]));
+    if (status) { free(owned); return status; }
+    /* resolved_request borrows launch grants from the immutable request.
+     * Its allocation owns only the rewritten argv/env strings. */
+    free(r->allocation);
+    r->allocation=owned;
+    r->argv=argv;
+    r->envp=envp;
+    r->strings=strings;
+    r->argc=argc;
+    r->string_bytes=used;
+    return 0;
 }
 
 int lpr_exec_resolve_script_chain(
@@ -194,14 +149,14 @@ int lpr_exec_resolve_script_chain(
     if (request == NULL || initial_prefix == NULL ||
         initial_prefix_length > LPR_EXEC_SCRIPT_PREFIX_BYTES || open_prefix == NULL ||
         out_executable_path == NULL || executable_path_capacity == 0 ||
-        strnlen(request->path, sizeof(request->path)) >= sizeof(request->path))
+        !request->path || strlen(request->path) >= 4096)
     {
         return -22;
     }
 
     unsigned char prefix[LPR_EXEC_SCRIPT_PREFIX_BYTES];
-    char current_path[FILED_PATH_BYTES];
-    char interpreter[FILED_PATH_BYTES];
+    char current_path[4096];
+    char interpreter[4096];
     char argument[LPR_EXEC_SCRIPT_PREFIX_BYTES + 1u];
     memset(prefix, 0, sizeof(prefix));
     memcpy(prefix, initial_prefix, initial_prefix_length);

@@ -85,7 +85,7 @@ static int client_call(struct live_client *client, uint32_t op,
     pacha_service_envelope_t *header = client->page;
     *header = (pacha_service_envelope_t){
         .magic = PACHA_SERVICE_REQUEST_MAGIC,
-        .abi_version = PACHA_SERVICE_ABI_VERSION,
+        .header_size = sizeof(pacha_service_envelope_t),
         .service_id = client->service,
         .op = op,
         .flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD,
@@ -121,6 +121,7 @@ static int client_call(struct live_client *client, uint32_t op,
     if (received != 0) return received;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != id ||
         header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        header->header_size != sizeof(*header) ||
         header->service_id != client->service || header->op != op ||
         header->request_id != id) return -5;
     if (out_result != NULL) *out_result = header->result;
@@ -968,6 +969,23 @@ void live_console_finish_boot(struct live_console *console)
     render(console);
 }
 
+int live_console_step(struct live_console *console)
+{
+    if (console == NULL) return -22;
+    int changed = 0;
+    int status = scan_inputs(console);
+    if (status == 0) {
+        for (size_t i = 0; i < console->slot_count; i++) {
+            status = drain_input_slot(console, i);
+            if (status != 0) break;
+        }
+    }
+    if (status == 0) status = flush_keyboard(console);
+    if (status == 0) status = drain_master(console, &changed);
+    if (status == 0 && (changed || console->redraw)) render(console);
+    return status;
+}
+
 int live_console_run(struct live_console *console,
     void (*on_tick)(void *context), void *tick_context)
 {
@@ -979,18 +997,8 @@ int live_console_run(struct live_console *console,
     int status = 0;
     for (;;) {
         if (on_tick != NULL) on_tick(tick_context);
-        int changed = 0;
-        status = scan_inputs(console);
-        if (status == 0) {
-            for (size_t i = 0; i < console->slot_count; i++) {
-                status = drain_input_slot(console, i);
-                if (status != 0) break;
-            }
-        }
-        if (status == 0) status = flush_keyboard(console);
-        if (status == 0) status = drain_master(console, &changed);
+        status = live_console_step(console);
         if (status != 0) break;
-        if (changed || console->redraw) render(console);
         struct pacha_pollfd tick = {.fd = timer_fd, .events = PACHA_FD_EVENT_READABLE};
         uint64_t count = 0;
         if (pacha_fd_wait_many(&tick, 1, PACHA_FD_WAIT_FOREVER) != 1 ||

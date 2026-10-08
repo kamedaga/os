@@ -27,6 +27,16 @@ struct ph_ipc {
     struct ph_ipc_packet rejected;
 };
 
+/* Immutable FD-free send view. Its owner pins the endpoint through every
+ * sender's return; revoke/close must wait for those references. Unlike ph_ipc,
+ * this object has no receive inventory or mutable admission state. Native
+ * SEND serializes enqueue; independent senders need no shared syscall buffer. */
+struct ph_ipc_notice {
+    int fd;
+    uint64_t operation, generation, correlation, value;
+};
+int ph_ipc_notify(const struct ph_ipc_notice *notice);
+
 /* Single owner, no concurrent calls, closes, packet mutation or unmapping of
  * syscall buffers. Zero-initialize the endpoint. Successful init takes the FD;
  * failed init leaves it with the caller. No hidden allocation/thread/TLS use.

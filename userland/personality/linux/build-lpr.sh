@@ -93,6 +93,9 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   -I"$repo_root/userland/termd/include" \
   -I"$repo_root/userland/gpud/include" \
   -I"$repo_root/userland/inputd/include" \
+  -I"$repo_root/userland" \
+  -I"$repo_root/kobox2/protocol/include" \
+  -I"$repo_root/kobox2/protocol/generated/include" \
   "$repo_root/userland/personality/linux/runtime/lpr_signal.c" \
   "$scanner_object" \
   "$patch_scan_object" \
@@ -127,6 +130,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_common/runtime_support.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_drm/client.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_block/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_input/client.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/bootstrap_state.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_process/capability.c" \
@@ -134,6 +138,7 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_process/compat.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_tty/runtime.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/control.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_fd/device.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/memfd.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/ops.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_fd/dup_pipe.c" \
@@ -143,8 +148,15 @@ patch_scan_object="$zydis_obj_dir/patch_scan.o"
   "$repo_root/userland/personality/linux/runtime/lpr_signalfd.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_sync_file.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_wait.c" \
-  "$repo_root/userland/personality/linux/runtime/lpr_vfs/cache.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/path.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_vfs/rpc.c" \
+  "$repo_root/userland/personality/linux/runtime/lpr_vfs/session.c" \
+  "$repo_root/userland/kobox2_owner/fs_channel.c" \
+  "$repo_root/kobox2/protocol/src/filesystem.c" \
+  "$repo_root/kobox2/protocol/src/protocol.c" \
+  "$repo_root/kobox2/protocol/src/virtqueue.c" \
+  "$repo_root/kobox2/protocol/src/virtqueue_memory.c" \
+  "$repo_root/kobox2/protocol/arch/x86_64/virtqueue_atomic.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/io.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/proc.c" \
   "$repo_root/userland/personality/linux/runtime/lpr_vfs/ops.c" \

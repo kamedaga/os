@@ -10,10 +10,6 @@
 #include "termd/ipc_protocol.h"
 
 enum {
-    LPR_CLIENT_ABI_VERSION = PACHA_SERVICE_ABI_VERSION,
-    LPR_CLIENT_MAX_IOV = 16u,
-    LPR_CLIENT_MAX_PATH = 480u,
-
     LPR_CLIENT_FD_KIND_EMPTY = 0u,
     LPR_CLIENT_FD_KIND_FILED_HANDLE = 1u,
     LPR_CLIENT_FD_KIND_TERMD_HANDLE = 2u,
@@ -45,13 +41,6 @@ typedef struct lpr_client_fd_ref {
     uint64_t rights;
 } lpr_client_fd_ref_t;
 
-typedef struct lpr_client_path_request {
-    int32_t dirfd;
-    uint32_t flags;
-    uint64_t mode;
-    char path[LPR_CLIENT_MAX_PATH];
-} lpr_client_path_request_t;
-
 typedef struct lpr_client_io_request {
     int32_t linux_fd;
     uint32_t flags;
@@ -70,6 +59,5 @@ typedef struct lpr_client_tty_context {
 
 _Static_assert(sizeof(lpr_client_result_t) == 32, "lpr_client_result size");
 _Static_assert(sizeof(lpr_client_fd_ref_t) == 32, "lpr_client_fd_ref size");
-_Static_assert(sizeof(lpr_client_path_request_t) == 496, "lpr_client_path_request size");
 _Static_assert(sizeof(lpr_client_io_request_t) == 32, "lpr_client_io_request size");
 _Static_assert(sizeof(lpr_client_tty_context_t) == 40, "lpr_client_tty_context size");

@@ -795,7 +795,7 @@ static int dispatch(struct unix_service *service, struct service_session *sessio
     const uint32_t op = request->operation;
     if (op == UNIX_OP_HELLO) {
         if (count != 0) return -EINVAL;
-        request->result = UNIX_SERVICE_VERSION;
+        request->result = 0;
         if (session) unix_broker_session_identity(session->session, &request->credentials);
         return 0;
     }
@@ -1034,7 +1034,7 @@ static int receive_one(struct unix_service *service, struct service_session *ses
             /* Never dispatch from a page the caller can change under us. */
             struct unix_control request = *page;
             SERVER_RECORD(1);
-            if (request.magic == UNIX_SERVICE_MAGIC && request.version == UNIX_SERVICE_VERSION &&
+            if (request.magic == UNIX_SERVICE_MAGIC && request.size == sizeof(request) &&
                 request.request == message.word3 && request.operation == message.word1) {
                 if (message.word2 == 1) buffer_token = retain_buffer(service, session, page);
                 request.result = 0;
@@ -1055,7 +1055,7 @@ static int receive_one(struct unix_service *service, struct service_session *ses
     if (reply_fd >= 16) {
         const struct pacha_ipc_msg reply = {
             .word0 = buffer_miss ? UNIX_BUFFER_MISS_MAGIC : UNIX_REPLY_MAGIC,
-            .word1 = buffer_miss ? UNIX_SERVICE_VERSION : (uint64_t)(int64_t)status,
+            .word1 = buffer_miss ? 0 : (uint64_t)(int64_t)status,
             .word2 = buffer_miss ? message.word2 : result, .word3 = message.word3,
             .fds = response.capabilities, .fd_count = response.count,
         };

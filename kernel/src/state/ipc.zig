@@ -331,6 +331,7 @@ pub fn createIpcChannel(self: anytype) KernelError!IpcChannelRef {
         slot.active = true;
         slot.ref_count = 2;
         slot.queues = .{ .{}, .{} };
+        slot.receiver_hints = .{ .{}, .{} };
         self.next_ipc_channel_scan = (index + 1) % max_ipc_channels;
         return .{ .index = @intCast(index), .generation = slot.generation };
     }
@@ -883,7 +884,7 @@ pub fn wakeIpcWaitersForSendFd(
     return waiters.takeReadable(out);
 }
 
-/// Remember a thread that has demonstrably consumed from an endpoint, or the
+/// Remember a thread that has demonstrably consumed from an endpoint/channel, or the
 /// creator that owns the receive side of a one-shot reply.  This is only a
 /// scheduling hint: it never registers a wait or changes thread readiness.
 pub fn noteIpcReceiverForFd(
@@ -912,6 +913,11 @@ pub fn noteIpcReceiverForFd(
             const reply = self.ipcReplySlot(reply_ref) orelse return false;
             reply.receiver_hint = hint;
         },
+        .channel => |handle| {
+            if (handle.side > 1) return false;
+            const channel = self.ipcChannelSlot(handle.channel) orelse return false;
+            channel.receiver_hints[handle.side] = hint;
+        },
         else => return false,
     }
     return true;
@@ -926,10 +932,17 @@ pub fn ipcReceiverHandoffHintForSendFd(
     fd: Fd,
 ) ?ThreadWakeTarget {
     const entry = self.fdEntryConst(owner, fd) orelse return null;
+    if (!entry.rights.send and !entry.rights.call) return null;
     const object_slot = self.kernelObjectSlotConst(entry.object) orelse return null;
     const hint = switch (object_slot.payload) {
         .endpoint => |endpoint_ref| (self.ipcEndpointSlotConst(endpoint_ref) orelse return null).receiver_hint,
         .reply => |reply_ref| (self.ipcReplySlotConst(reply_ref) orelse return null).receiver_hint,
+        .channel => |handle| blk: {
+            if (handle.side > 1) return null;
+            const channel = self.ipcChannelSlotConst(handle.channel) orelse return null;
+            // A send targets the peer's queue, never this handle's receiver.
+            break :blk channel.receiver_hints[handle.side ^ 1];
+        },
         else => return null,
     };
     if (!hint.active) return null;

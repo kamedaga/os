@@ -33,6 +33,10 @@ struct inputd_input_island {
     int ready;
 };
 
+struct kb_input_device_snapshot;
+int inputd_input_device_snapshot(uint32_t event_index,
+    struct kb_input_device_snapshot *out);
+
 enum inputd_wait_source_kind {
     INPUTD_WAIT_SOURCE_HANDLE = 1,
     INPUTD_WAIT_SOURCE_TRANSFER_LEASE = 2,

@@ -2,7 +2,8 @@
 #include "lpr_fd/allocate.h"
 #include "support/browser_diag.h"
 
-#define LPR_INOTIFY_INSTANCE_BYTES (64ull * 1024ull)
+#define LPR_INOTIFY_INSTANCE_BYTES \
+    ((sizeof(lpr_inotify_instance_t) + 4095ull) & ~4095ull)
 #define LPR_INOTIFY_INSTANCE_MAGIC 0x31594649544f4e49ull
 #define LPR_INOTIFY_POLL_INTERVAL_NS (100ull * 1000ull * 1000ull)
 #define LPR_INOTIFY_MAX_WATCHES 32u
@@ -64,7 +65,7 @@ typedef struct lpr_inotify_watch {
     int64_t mtime_nsec;
     int64_t ctime_sec;
     int64_t ctime_nsec;
-    char path[FILED_PATH_BYTES];
+    char path[LPR_LINUX_PATH_MAX];
 } lpr_inotify_watch_t;
 
 typedef struct lpr_inotify_instance {
@@ -316,12 +317,27 @@ static int64_t lpr_inotify_add_watch_pinned(
     {
         return -LPR_LINUX_EINVAL;
     }
-    char normalized[FILED_PATH_BYTES];
-    const int64_t normalize_status = lpr_cwd_normalize(
-        (const char *)(uintptr_t)path_raw,
-        normalized,
-        sizeof(normalized));
-    if (normalize_status != 0) return normalize_status;
+    char normalized[LPR_LINUX_PATH_MAX];
+    const char *path = (const char *)(uintptr_t)path_raw;
+    if (!path[0]) return -LPR_LINUX_ENOENT;
+    uint64_t prefix_bytes = 0;
+    if (path[0] != '/') {
+        const int64_t cwd_bytes = lpr_linux_getcwd(
+            (uint64_t)(uintptr_t)normalized, sizeof(normalized));
+        if (cwd_bytes < 0) return cwd_bytes;
+        prefix_bytes = (uint64_t)cwd_bytes - 1u;
+        if (prefix_bytes && normalized[prefix_bytes - 1u] != '/') {
+            if (prefix_bytes + 1u >= sizeof(normalized))
+                return -LPR_LINUX_ENAMETOOLONG;
+            normalized[prefix_bytes++] = '/';
+        }
+    }
+    /* Preserve Linux pathname resolution, including symlinks before '..'.
+     * Only anchor the polling watch to the actual cwd at registration; a
+     * lexical LPR normalizer would silently select a different inode. */
+    const int64_t path_status = lpr_copy_path(normalized + prefix_bytes,
+        sizeof(normalized) - prefix_bytes, path);
+    if (path_status) return path_status;
 
     lpr_inotify_watch_t candidate;
     lpr_memset(&candidate, 0, sizeof(candidate));

@@ -6,7 +6,6 @@
 
 enum {
     GPUD_BOOT_CONFIG_MAGIC = 0x47505544424f4f54ull,
-    GPUD_BOOT_CONFIG_VERSION = 6,
     GPUD_BACKEND_VIRTIO = 1,
     GPUD_BACKEND_PCI_DRM_INSPECT = 2,
     GPUD_BOOT_READY_MAGIC = 0x3159445244555047ull,
@@ -19,7 +18,7 @@ enum {
 };
 
 struct gpud_boot_config {
-    uint64_t magic, version;
+    uint64_t magic, size;
     uint64_t drm_endpoint_fd, device_fd, filed_endpoint_fd;
     uint64_t control_channel_fd, ready_channel_fd;
     /* Private owner-to-gpud policy, never a PCI ID or sandbox-supplied hint. */

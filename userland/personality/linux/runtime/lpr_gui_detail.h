@@ -4,6 +4,7 @@
 #include <stdint.h>
 int lpr_gui_profile_current_thread(void);
 void lpr_gui_profile_span(unsigned kind, uint64_t start, uint64_t end);
+void lpr_gui_profile_process(unsigned phase, uint64_t start, int64_t result);
 void lpr_gui_profile_file(uint64_t nr, uint64_t argument, uint64_t flags,
     uint64_t offset_valid, uint64_t pread_active, uint64_t size, const char *path);
 enum {

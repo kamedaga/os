@@ -131,14 +131,14 @@ int main(int argc, char **argv)
     const struct pachaos_capsule_boot_config *cfg =
         (const struct pachaos_capsule_boot_config *)(uintptr_t)PACHAOS_CAPSULE_BOOT_CONFIG_VA;
     if (cfg->magic != PACHAOS_CAPSULE_BOOT_CONFIG_MAGIC ||
-        cfg->version != PACHAOS_CAPSULE_BOOT_CONFIG_VERSION ||
+        cfg->size != sizeof(*cfg) ||
         cfg->device_fd < 16 ||
         cfg->module_count == 0 ||
         cfg->module_count > PACHAOS_CAPSULE_MAX_MODULES) {
         fprintf(stderr,
-            "[pachaos_capsule] invalid boot config magic=0x%llx version=%llu fd=%llu modules=%llu\n",
+            "[pachaos_capsule] invalid boot config magic=0x%llx size=%llu fd=%llu modules=%llu\n",
             (unsigned long long)cfg->magic,
-            (unsigned long long)cfg->version,
+            (unsigned long long)cfg->size,
             (unsigned long long)cfg->device_fd,
             (unsigned long long)cfg->module_count);
         return 2;

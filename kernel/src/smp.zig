@@ -976,10 +976,63 @@ test "MMIO alias cache status separates missing evidence from unsafe range" {
 }
 
 pub fn returnCurrentApToIdleFromInterrupt() noreturn {
+    redispatchCurrentAp(false);
+}
+
+pub fn returnCurrentApAfterTimerInterrupt() noreturn {
+    redispatchCurrentAp(true);
+}
+
+const ApRedispatch = enum { idle, fresh_slice, inherited_slice };
+
+const ApRedispatchBackend = struct {
+    fn enterKernel() void {
+        x86_platform.writeCr3(x86_platform.kernel_cr3_value);
+    }
+    fn markIdle(cpu: usize) void {
+        setCpuState(cpu, .idle);
+    }
+    fn observeIdle(cpu: usize) void {
+        scheduler_observer.observeIdle(cpu);
+    }
+    fn poll(cpu: usize) void {
+        scheduler_observer.pollIdleScheduler(cpu);
+    }
+    fn claim(cpu: usize, entry: *scheduler_observer.UserEntry) bool {
+        return scheduler_observer.claimIdleUserEntry(cpu, entry);
+    }
+    fn stopTimer() void {
+        lapic.disarmTimer();
+    }
+    fn markUser(cpu: usize) void {
+        setCpuState(cpu, .user);
+    }
+};
+
+fn prepareApRedispatch(comptime Backend: type, cpu: usize, timer_expired: bool, entry: *scheduler_observer.UserEntry) ApRedispatch {
+    // IF stays clear: this is a continuous busy-CPU handoff, not a timer
+    // lease across HLT. Drop the old context's ownership before claiming the
+    // next one, using the same observer/claim/rollback path as the idle loop.
+    Backend.enterKernel();
+    Backend.markIdle(cpu);
+    Backend.observeIdle(cpu);
+    Backend.poll(cpu);
+    if (!Backend.claim(cpu, entry)) {
+        Backend.stopTimer();
+        return .idle;
+    }
+    Backend.markUser(cpu);
+    // A pending IRQ is deliberately not drained or hidden. A normal handoff
+    // inherits the busy CPU's remaining slice, as IPC/futex handoffs do; an
+    // actual timer IRQ has consumed that lease and must start another one.
+    return if (timer_expired) .fresh_slice else .inherited_slice;
+}
+
+fn redispatchCurrentAp(timer_expired: bool) noreturn {
     const cpu_slot = currentCpuSlot();
-    lapic.disarmTimer();
-    x86_platform.writeCr3(x86_platform.kernel_cr3_value);
-    setCpuState(cpu_slot, .idle);
+    var entry: scheduler_observer.UserEntry = undefined;
+    const dispatch = prepareApRedispatch(ApRedispatchBackend, cpu_slot, timer_expired, &entry);
+    if (dispatch != .idle) enterUserModeFromIdle(&entry, dispatch);
     apIdleLoop(cpu_slot);
 }
 
@@ -1099,8 +1152,8 @@ test "broadcast enumeration fails closed on capacity and reserved APIC ID" {
 }
 
 // Both callers enter with IF clear and the local timer already stopped.
-// In particular, interrupt return stops it before changing CR3/CPU state;
-// repeating that hardware write here adds no protection.
+// Immediate redispatch never reaches this loop; a failed claim stops the
+// timer so real idle time cannot become the next task's inherited slice.
 fn apIdleLoop(cpu_slot: usize) noreturn {
     while (true) {
         scheduler_observer.observeIdle(cpu_slot);
@@ -1108,7 +1161,7 @@ fn apIdleLoop(cpu_slot: usize) noreturn {
         var user_entry: scheduler_observer.UserEntry = undefined;
         if (scheduler_observer.claimIdleUserEntry(cpu_slot, &user_entry)) {
             setCpuState(cpu_slot, .user);
-            enterUserModeFromIdle(&user_entry);
+            enterUserModeFromIdle(&user_entry, .fresh_slice);
         }
         asm volatile ("sti; hlt; cli" ::: .{ .memory = true });
     }
@@ -1189,26 +1242,99 @@ fn jumpToUserReturn() callconv(.winapi) void {
     asm volatile ("jmp userReturnToSavedFrame" ::: .{ .memory = true });
 }
 
-fn enterUserModeFromIdle(entry: *scheduler_observer.UserEntry) noreturn {
+fn startApUserSlice(comptime Timer: type, dispatch: ApRedispatch, vector: u8, initial_count: u32) void {
+    std.debug.assert(dispatch != .idle);
+    if (dispatch == .fresh_slice and vector != 0) _ = Timer.armTimer(initial_count);
+}
+
+fn enterUserModeFromIdle(entry: *scheduler_observer.UserEntry, dispatch: ApRedispatch) noreturn {
     asm volatile ("cli");
     // A runnable thread may carry a pending signal whose IPI reached another
     // thread or an inhibited/kernel context. Every AP redispatch is a user
     // return boundary; do not depend on an uninterrupted timer slice to stage
     // it. Stage before restoring the selected thread's live XState.
     @import("traps.zig").stagePendingSignalForUserReturn(&entry.frame);
-    if (ap_user_timer_vector != 0) {
-        _ = lapic.armTimer(ap_user_timer_initial_count);
-    }
+    startApUserSlice(lapic, dispatch, ap_user_timer_vector, ap_user_timer_initial_count);
     const x_state: *align(x86_platform.xstate_alignment) const [x86_platform.xstate_bytes]u8 =
         @ptrFromInt(entry.x_state_addr);
     x86_platform.restoreXState(x_state);
-    x86_platform.writeFsBase(entry.fs_base);
-    x86_platform.writeGsBase(entry.gs_base);
-    x86_platform.writePkru(entry.pkru);
+    // The common user return installs this published thread's FS/GS/PKRU
+    // after XRSTOR. Staging the frame needs none of them; doing it here too
+    // repeats privileged register writes on every AP block/wake redispatch.
     stageUserReturnFromFramePointerForCurrentCpu(
         @intFromPtr(&entry.frame),
         @offsetOf(interrupts.TrapFrame, "rip"),
     );
     jumpToUserReturn();
     while (true) asm volatile ("hlt");
+}
+
+test "AP immediate redispatch inherits only an unconsumed busy slice" {
+    const Probe = struct {
+        var events: [16]u8 = undefined;
+        var count: usize = 0;
+        var ready: bool = true;
+        fn event(value: u8) void {
+            events[count] = value;
+            count += 1;
+        }
+        fn enterKernel() void {
+            event(1);
+        }
+        fn markIdle(cpu: usize) void {
+            std.debug.assert(cpu == 2);
+            event(2);
+        }
+        fn observeIdle(_: usize) void {
+            event(3);
+        }
+        fn poll(_: usize) void {
+            event(4);
+        }
+        fn claim(_: usize, entry: *scheduler_observer.UserEntry) bool {
+            event(5);
+            if (ready) entry.thread_index = 7;
+            return ready;
+        }
+        fn stopTimer() void {
+            event(6);
+        }
+        fn markUser(_: usize) void {
+            event(7);
+        }
+        fn armTimer(countdown: u32) bool {
+            std.debug.assert(countdown == 42);
+            event(8);
+            return true;
+        }
+    };
+    var entry: scheduler_observer.UserEntry = undefined;
+    Probe.count = 0;
+    Probe.ready = true;
+    var dispatch = prepareApRedispatch(Probe, 2, false, &entry);
+    try std.testing.expectEqual(ApRedispatch.inherited_slice, dispatch);
+    startApUserSlice(Probe, dispatch, 0x40, 42);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 7 }, Probe.events[0..Probe.count]);
+    try std.testing.expectEqual(@as(usize, 7), entry.thread_index);
+
+    Probe.count = 0;
+    dispatch = prepareApRedispatch(Probe, 2, true, &entry);
+    try std.testing.expectEqual(ApRedispatch.fresh_slice, dispatch);
+    startApUserSlice(Probe, dispatch, 0x40, 42);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 7, 8 }, Probe.events[0..Probe.count]);
+
+    for ([_]bool{ false, true }) |expired| {
+        Probe.count = 0;
+        Probe.ready = false;
+        dispatch = prepareApRedispatch(Probe, 2, expired, &entry);
+        try std.testing.expectEqual(ApRedispatch.idle, dispatch);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6 }, Probe.events[0..Probe.count]);
+        // An actual idle-loop claim always starts a new lease, even when
+        // the previous failed fast claim had not consumed its timer IRQ.
+        startApUserSlice(Probe, .fresh_slice, 0x40, 42);
+        try std.testing.expectEqual(@as(u8, 8), Probe.events[Probe.count - 1]);
+    }
+    Probe.count = 0;
+    startApUserSlice(Probe, .fresh_slice, 0, 42);
+    try std.testing.expectEqual(@as(usize, 0), Probe.count);
 }

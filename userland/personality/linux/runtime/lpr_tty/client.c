@@ -1,5 +1,6 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_fd/allocate.h"
+#include "../lpr_common/boot_diagnostic.h"
 
 void *lpr_termd_payload(void *page)
 {
@@ -34,7 +35,7 @@ static int64_t lpr_termd_call_with_fd(
     pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = TERMD_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
@@ -71,10 +72,16 @@ static int64_t lpr_termd_call_with_fd(
     request->word3 = request_id;
     request->fds = fds;
     request->fd_count = fd_count;
+    if (lpr_boot_diagnostic_tty_active())
+        lpr_boot_diagnostic_emit("tty.call.enter", op, LPR_TERMD_TTY_ENDPOINT_FD,
+            request_id, 0, 0);
     const int64_t reply_fd = lpr_pacha_syscall2(
         PACHAOS_SYSCALL_IPC_CALL,
         LPR_TERMD_TTY_ENDPOINT_FD,
         (uint64_t)(uintptr_t)request);
+    if (lpr_boot_diagnostic_tty_active())
+        lpr_boot_diagnostic_emit("tty.call.return", op, request_id, fd_count,
+            reply_fd < 16 ? lpr_pacha_status_to_errno(reply_fd) : 0, reply_fd);
     if (reply_fd < 16) {
         const int64_t err = lpr_pacha_status_to_errno(reply_fd);
         lpr_trace_error_record(
@@ -90,9 +97,14 @@ static int64_t lpr_termd_call_with_fd(
             "termd ipc_call failed");
         return lpr_pacha_status_to_errno(reply_fd);
     }
+    if (lpr_boot_diagnostic_tty_active())
+        lpr_boot_diagnostic_emit("tty.recv.enter", op, request_id, reply_fd, 0, 0);
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
         reply);
+    if (lpr_boot_diagnostic_tty_active())
+        lpr_boot_diagnostic_emit("tty.recv.return", op, request_id, reply->word0,
+            recv_status ? lpr_pacha_status_to_errno(recv_status) : 0, recv_status);
     (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
     if (recv_status != 0) {
         const int64_t err = lpr_pacha_status_to_errno(recv_status);
@@ -111,9 +123,13 @@ static int64_t lpr_termd_call_with_fd(
     }
     const pacha_service_envelope_t *reply_header =
         (const pacha_service_envelope_t *)page;
+    if (lpr_boot_diagnostic_tty_active())
+        lpr_boot_diagnostic_emit("tty.envelope", op, reply_header->result,
+            reply_header->request_id, reply_header->status, (int64_t)reply->word1);
     if (reply->word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply->word3 != request->word3 ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        reply_header->header_size != sizeof(*reply_header) ||
         reply_header->request_id != request->word3 ||
         reply_header->service_id != TERMD_SERVICE_ID ||
         reply_header->op != op)

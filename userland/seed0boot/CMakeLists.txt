@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(seed0boot C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(SEED0BOOT_ELF "${CMAKE_BINARY_DIR}/seed0boot.elf")
 
 add_custom_command(
@@ -16,7 +17,7 @@ add_custom_command(
       "PACHAOS_MUSL_EXTRA_SOURCES=${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.c ${CMAKE_CURRENT_SOURCE_DIR}/src/next_stage_loader.c ${CMAKE_CURRENT_SOURCE_DIR}/src/pachaos_capsule_launcher.c ${REPO_ROOT}/userland/libipc/src/ipc.c ${REPO_ROOT}/userland/libcapsule/src/capsule.c ${REPO_ROOT}/userland/libpacha/src/syscall.c"
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/storage_boot/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0BOOT_ELF}"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap_abi.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/bootfs_reader.h"
@@ -38,7 +39,6 @@ add_custom_command(
     "${REPO_ROOT}/userland/libpacha/include/pacha/syscall.h"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

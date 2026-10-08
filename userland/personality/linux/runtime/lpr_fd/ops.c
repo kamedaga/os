@@ -1,5 +1,7 @@
 #include "../lpr_filed_internal.h"
 #include "../support/browser_diag.h"
+#include "device.h"
+#include "../lpr_common/boot_diagnostic.h"
 
 #define LPR_LINUX_EMSGSIZE 90
 
@@ -7,9 +9,7 @@
 static int64_t lpr_ops_filed_close(void *state)
 {
     const lpr_filed_backend_t *filed = state;
-    const int transfer_lease =
-        (filed->reserved2 & LPR_BACKEND_TRANSFER_LEASE) != 0;
-    const int64_t handle_status = !transfer_lease && filed->handle != 0 ?
+    const int64_t handle_status = filed->handle != 0 ?
         lpr_filed_close_handle(filed->handle) : 0;
     const int64_t lease_status = filed->lease_fd.raw >= 16 ?
         lpr_close_native_fd_if_open((uint64_t)(uint32_t)filed->lease_fd.raw) : 0;
@@ -160,7 +160,9 @@ static int64_t lpr_fd_close_backend(uint8_t ops_id, void *state)
 {
     switch (ops_id) {
     case LPR_FD_OPS_FILED: return lpr_ops_filed_close(state);
-    case LPR_FD_OPS_DEVICE: return 0;
+    case LPR_FD_OPS_DEVICE: return lpr_device_description_close(state);
+    case LPR_FD_OPS_INSTALL_DISK:
+        return lpr_block_close_state(state);
     case LPR_FD_OPS_TTY: return lpr_ops_tty_close(state);
     case LPR_FD_OPS_DRM: return lpr_ops_drm_close(state);
     case LPR_FD_OPS_INPUT: return lpr_ops_input_close(state);
@@ -211,6 +213,22 @@ int lpr_fd_transfer_prepare(
     *out_capability_count = 0;
     item->provider = pin->ops_id;
     item->rights = pin->effective_rights;
+    if (pin->ops_id == LPR_FD_OPS_DEVICE) {
+        lpr_device_backend_t *device = pin->state;
+        if (!device->active || !lpr_device_kind_supported(device->major, device->minor))
+            return -LPR_LINUX_EOPNOTSUPP;
+        if (!capability_fds || capability_capacity < 1) return -LPR_LINUX_EMSGSIZE;
+        const int status = lpr_device_description_ensure(device);
+        if (status) return status;
+        const int description = lpr_transfer_duplicate_capability(device->description_fd.raw);
+        if (description < 0) return description;
+        item->object = ((uint64_t)device->major << 8) | device->minor;
+        item->flags = device->flags & ~(uint32_t)LPR_LINUX_O_CLOEXEC;
+        item->capability_count = 1;
+        capability_fds[0] = description;
+        *out_capability_count = 1;
+        return 0;
+    }
     if (pin->ops_id == LPR_FD_OPS_UNIX) {
         struct lpr_unix_socket *socket = pin->state;
         int status = lpr_unix_socket_adopt(socket);
@@ -224,6 +242,8 @@ int lpr_fd_transfer_prepare(
     }
     if (pin->ops_id == LPR_FD_OPS_FILED) {
         const lpr_filed_backend_t *filed = pin->state;
+        const int64_t binding_status = lpr_filed_endpoint_ready();
+        if (binding_status) return binding_status;
         /* SCM_RIGHTS transfers an open file description, not a pathname or a
          * memfd-only object.  filed's transfer lease already preserves that
          * description for every regular filed handle, including POSIX shm. */
@@ -463,7 +483,19 @@ int lpr_fd_transfer_stage_batch(
         }
         const int *item_capabilities = capability_fds + next_capability;
         uint64_t handle = item->object;
-        if (item->provider == LPR_FD_OPS_FILED) {
+        if (item->provider == LPR_FD_OPS_DEVICE) {
+            const uint32_t access = item->flags & LPR_LINUX_O_ACCMODE;
+            const uint64_t allowed = LPR_FD_RIGHT_STAT | LPR_FD_RIGHT_DUP | LPR_FD_RIGHT_IOCTL |
+                (access != LPR_LINUX_O_WRONLY ? LPR_FD_RIGHT_READ : 0) |
+                (access != LPR_LINUX_O_RDONLY ? LPR_FD_RIGHT_WRITE : 0);
+            if (item->object > 0xffff || access > LPR_LINUX_O_RDWR ||
+                !lpr_device_kind_supported((unsigned)(item->object >> 8), (unsigned)(item->object & 255)) ||
+                (item->rights & ~allowed) || item->capability_count != 1 ||
+                !lpr_device_description_capability_valid(item_capabilities[0])) {
+                status = -LPR_LINUX_EINVAL;
+                break;
+            }
+        } else if (item->provider == LPR_FD_OPS_FILED) {
             if (item->capability_count != 1 || item_capabilities[0] < 16 ||
                 (item->object >> 40u) != 0)
             {
@@ -538,18 +570,32 @@ int lpr_fd_transfer_stage_batch(
             break;
         }
         const uint64_t linux_flags = item->flags | receive_flags;
-        if (item->provider == LPR_FD_OPS_FILED) {
+        if (item->provider == LPR_FD_OPS_DEVICE) {
+            lpr_device_backend_t *device = states[prepared_count];
+            device->active = 1;
+            device->major = (uint8_t)(item->object >> 8);
+            device->minor = (uint8_t)item->object;
+            device->flags = (uint32_t)linux_flags;
+            device->description_fd.raw = item_capabilities[0];
+            status = lpr_device_description_map(device);
+            if (status) {
+                (void)lpr_backend_state_free(states[prepared_count], state_bytes);
+                states[prepared_count] = 0;
+                break;
+            }
+        } else if (item->provider == LPR_FD_OPS_FILED) {
             lpr_filed_backend_t *filed = states[prepared_count];
-            status = lpr_filed_adopt(handle, item_capabilities[0]);
+            const uint64_t escrow_handle = handle;
+            status = lpr_filed_adopt(&handle, item_capabilities[0]);
             if (status) {
                 (void)lpr_backend_state_free(states[prepared_count], state_bytes);
                 states[prepared_count] = 0;
                 break;
             }
             filed->active = 1;
-            filed->offset_valid = 1;
             filed->flags = (uint32_t)linux_flags;
             filed->handle = handle;
+            filed->lease_handle = escrow_handle;
             filed->reserved1 = (uint8_t)(item->object >> 32u);
             filed->reserved2 |= LPR_BACKEND_TRANSFER_LEASE;
             filed->lease_fd.raw = item_capabilities[0];
@@ -633,6 +679,14 @@ int lpr_fd_transfer_stage_batch(
     if (status != 0) {
         for (uint32_t i = 0; i < prepared_count; ++i) {
             if (states[i] != 0) {
+                /* Until staging succeeds the caller still owns received
+                 * capabilities. Release only our speculative mapping. */
+                if (installs[i].ops_id == LPR_FD_OPS_DEVICE) {
+                    const lpr_device_backend_t *device = states[i];
+                    if (device->description_map)
+                        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP,
+                            device->description_map, LPR_DEVICE_DESCRIPTION_BYTES);
+                }
                 (void)lpr_backend_state_free(
                     states[i], installs[i].backend_state_bytes);
             }
@@ -675,6 +729,7 @@ static int lpr_fd_io_supported(uint8_t ops_id, uint32_t operation)
     switch (ops_id) {
     case LPR_FD_OPS_FILED:
     case LPR_FD_OPS_DEVICE:
+    case LPR_FD_OPS_INSTALL_DISK:
     case LPR_FD_OPS_TTY:
     case LPR_FD_OPS_PIPE:
     case LPR_FD_OPS_EVENT:
@@ -720,6 +775,17 @@ static int64_t lpr_fd_dispatch_direct(
         default: return -LPR_LINUX_EOPNOTSUPP;
         }
     }
+    /* These public operations already hold an OFD pin. Preserve that
+     * identity across adoption, rather than re-looking up a reused FD. */
+    if (pin->ops_id == LPR_FD_OPS_FILED &&
+        (operation == 1 || operation == 3 || operation == 5)) {
+        if (operation == 5) return lpr_filed_fstat_pinned(pin, arg0);
+        const int64_t status = lpr_filed_endpoint_ready();
+        if (status) return status;
+        const lpr_filed_backend_t *file = pin->state;
+        return operation == 1 ? lpr_filed_io_handle(KB2_FILESYSTEM_OP_WRITE,
+            file->handle, arg0, arg1, 0) : lpr_fs_iov(file->handle, arg0, arg1, 1);
+    }
     switch (operation) {
     case 0: return lpr_backend_read(pin, arg0, arg1);
     case 1: return lpr_backend_write(pin->fd, arg0, arg1);
@@ -741,10 +807,18 @@ static int64_t lpr_fd_dispatch_io(
         return -LPR_LINUX_EBADF;
     }
     lpr_fd_pin_t pin;
+    const int boot_observed = lpr_boot_diagnostic_stdio_begin(fd, operation);
     if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin) != 0) {
         lpr_browser_diag("io-missing", fd, operation, lpr_control_fd_table.entry_count);
+        if (boot_observed)
+            lpr_boot_diagnostic_emit("stdio.io.missing", fd, operation, 0, -LPR_LINUX_EBADF, 0);
+        lpr_boot_diagnostic_stdio_end(boot_observed);
         return -LPR_LINUX_EBADF;
     }
+    if (boot_observed)
+        lpr_boot_diagnostic_emit("stdio.io.enter", fd, operation,
+            ((uint64_t)pin.ops_id << 32) | pin.effective_rights, 0, 0);
+    lpr_boot_diagnostic_read_enter(operation, pin.fd, pin.ops_id, arg1);
     uint32_t required_right = 0;
     switch (operation) {
     case 0: required_right = LPR_FD_RIGHT_READ; break;
@@ -765,6 +839,9 @@ static int64_t lpr_fd_dispatch_io(
         lpr_browser_diag("event-io-error", fd, operation, (uint64_t)result);
     }
     lpr_fd_unpin(&pin);
+    if (boot_observed)
+        lpr_boot_diagnostic_emit("stdio.io.return", fd, operation, 0, result, 0);
+    lpr_boot_diagnostic_stdio_end(boot_observed);
     if (operation <= 3)
         lpr_epoll_note_fd_state(
             fd, (operation & 1u) ? LPR_EPOLL_IO_WRITE : LPR_EPOLL_IO_READ,
@@ -805,25 +882,12 @@ int64_t lpr_linux_fstat(uint64_t fd, uint64_t statbuf)
 static int64_t lpr_filed_statfs_handle(uint64_t handle, uint64_t statfsbuf)
 {
     if (statfsbuf == 0) return -LPR_LINUX_EFAULT;
-    void *page = 0;
-    const int page_fd = lpr_create_wire_page(&page);
-    if (page_fd < 0) return page_fd;
-
-    filed_statfs_t *request = (filed_statfs_t *)page;
-    lpr_memset(request, 0, sizeof(*request));
-    request->handle = handle;
-    uint64_t ignored = 0;
-    const int64_t status = lpr_filed_call(
-        FILED_OP_VFS_STATFS,
-        page_fd,
-        0,
-        &ignored);
-    if (status == 0) {
-        lpr_linux_statfs_t *result =
-            (lpr_linux_statfs_t *)(uintptr_t)statfsbuf;
-        lpr_memcpy(result, &request->type, sizeof(*result));
-    }
-    lpr_destroy_wire_page(page_fd, page);
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_STATFS, .handle = handle};
+    kb2_fs_response_t response;
+    uint8_t wire[KB2_FILESYSTEM_STATFS_SIZE];
+    const int64_t status = lpr_fs_call(&request, 0, 0, 0, 0, wire, sizeof(wire), &response, -1, 0);
+    if (!status && response.data_length != sizeof(wire)) return -LPR_LINUX_EIO;
+    if (!status) lpr_memcpy((void *)(uintptr_t)statfsbuf, wire, sizeof(wire));
     return status;
 }
 
@@ -831,6 +895,8 @@ int64_t lpr_linux_fstatfs(uint64_t fd, uint64_t statfsbuf)
 {
     if (statfsbuf == 0) return -LPR_LINUX_EFAULT;
     if (!lpr_fd_is_filed(fd)) return -LPR_LINUX_EBADF;
+    const int64_t binding_status = lpr_filed_endpoint_ready();
+    if (binding_status) return binding_status;
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
     if (file == 0 || file->handle == 0) return -LPR_LINUX_EBADF;
     return lpr_filed_statfs_handle(file->handle, statfsbuf);

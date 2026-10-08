@@ -15,16 +15,22 @@ int main(void)
     assert(!lpr_fd_table_install_at(&table, 3, &install));
     install.backend_state = &b;
     assert(!lpr_fd_table_install_at(&table, 4, &install));
+    assert(lpr_fd_table_compare_ofd(&table, 3, 3) == 0);
+    assert(lpr_fd_table_compare_ofd(&table, 3, 4) == 1);
+    assert(lpr_fd_table_compare_ofd(&table, 3, 15) == -1);
     const lpr_linux_fd_t excluded[] = {5, 6};
     lpr_linux_fd_t copy;
     assert(!lpr_fd_table_dup_excluding(&table, 3, 5, LPR_FD_ENTRY_CLOEXEC,
         excluded, 2, &copy) && copy == 7);
     assert(entries[7].fd_flags == LPR_FD_ENTRY_CLOEXEC);
+    assert(lpr_fd_table_compare_ofd(&table, 3, 7) == 0);
+    assert(lpr_fd_table_compare_ofd(&table, 4, 7) == 1);
     lpr_fd_pin_t pin;
     assert(!lpr_fd_table_pin(&table, 4, &pin));
     lpr_fd_drop_t drop;
     assert(!lpr_fd_table_dup_replace(&table, 3, 4, 0, &drop) && !drop.ready);
     assert(entries[3].ofd_index == entries[4].ofd_index);
+    assert(lpr_fd_table_compare_ofd(&table, 3, 4) == 0);
     assert(!lpr_fd_table_unpin(&table, &pin, &drop) && drop.ready && drop.state == &b);
     /* Replacing an alias must not destroy its shared OFD. */
     assert(!lpr_fd_table_dup_replace(&table, 3, 4, LPR_FD_ENTRY_CLOEXEC, &drop));

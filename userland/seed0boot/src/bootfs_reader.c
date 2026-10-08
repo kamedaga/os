@@ -10,7 +10,6 @@
 
 enum {
     SEED0_BOOTFS_MAGIC = 0x53465442u,
-    SEED0_BOOTFS_VERSION = 1,
     SEED0_BOOTFS_HEADER_BYTES = 104,
     SEED0_BOOTFS_ENTRY_BYTES = 48,
     SEED0_BOOTFS_KIND_REGULAR = 1,
@@ -58,7 +57,7 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
         fprintf(stderr,
             "[seed0boot] bootfs: descriptor unavailable config=%llx/%llu descriptor=%llx",
             (unsigned long long)cfg->magic,
-            (unsigned long long)cfg->version,
+            (unsigned long long)cfg->size,
             (unsigned long long)cfg->descriptor_page_va);
         if (desc != 0) {
             fprintf(stderr, " archive=%llx/%llx/%llu",
@@ -74,8 +73,7 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
     const unsigned char *image = (const unsigned char *)(uintptr_t)desc->bootfs_archive.image_va;
     const uint64_t image_size = desc->bootfs_archive.size_bytes;
     const uint32_t magic = rd32(image + 0);
-    const uint16_t version = rd16(image + 4);
-    const uint16_t header_bytes = rd16(image + 6);
+    const uint32_t header_bytes = rd32(image + 4);
     const uint64_t total_size = rd64(image + 8);
     const uint32_t entry_count = rd32(image + 16);
     const uint32_t entry_table_bytes = rd32(image + 20);
@@ -83,16 +81,15 @@ int seed0_bootfs_open_file(const char *path, const unsigned char **out_data, uin
     const uint64_t string_table_offset = rd64(image + 32);
     const uint64_t string_table_bytes = rd64(image + 40);
     if (magic != SEED0_BOOTFS_MAGIC ||
-        version != SEED0_BOOTFS_VERSION ||
-        header_bytes < SEED0_BOOTFS_HEADER_BYTES ||
+        header_bytes != SEED0_BOOTFS_HEADER_BYTES ||
         total_size > image_size ||
         entry_table_bytes != (uint64_t)entry_count * SEED0_BOOTFS_ENTRY_BYTES ||
         !range_fits(total_size, entry_table_offset, entry_table_bytes) ||
         !range_fits(total_size, string_table_offset, string_table_bytes)) {
 #ifndef SEED0_BOOTFS_NO_DIAGNOSTICS
-        fprintf(stderr, "[seed0boot] bootfs: invalid image magic=0x%x version=%u entries=%u\n",
+        fprintf(stderr, "[seed0boot] bootfs: invalid image magic=0x%x header_bytes=%u entries=%u\n",
             magic,
-            version,
+            header_bytes,
             entry_count);
 #endif
         return -3;

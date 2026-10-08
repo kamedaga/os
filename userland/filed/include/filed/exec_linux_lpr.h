@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #include "filed/payload.h"
-#include "filed/vfs.h"
+#include "filed/storage.h"
 
 struct filed_runtime;
 
@@ -24,6 +24,5 @@ int filed_exec_linux_lpr_prepare_self(
     int *out_process_fd,
     int *out_thread_fd);
 
-void filed_exec_linux_lpr_invalidate_backend_object(struct filed_runtime *runtime, uint64_t backend_object);
 void filed_exec_linux_lpr_dump_metrics(void);
 int filed_exec_linux_lpr_prewarm(struct filed_runtime *runtime);

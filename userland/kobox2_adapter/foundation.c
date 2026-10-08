@@ -199,6 +199,12 @@ static void kernel_main(const struct kobox_linux_task_report *task_report, void 
     struct foundation_gates gates = resolve_foundation_gates();
 
     run_boot_gate(&gates, task_report);
+#ifdef PH_EXCEPTION_GATE
+    int (*verify_exception)(void);
+    RESOLVE_GATE(verify_exception, "kobox_linux_exception_verify");
+    PH_OK(verify_exception());
+    ph_log("PACHA_KOBOX_EXCEPTION=PASS\n");
+#endif
 #ifndef PH_FOCUSED_GATE
     run_memory_gate(&gates);
     run_wait_gate(&gates);

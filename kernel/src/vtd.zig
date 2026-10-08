@@ -1625,7 +1625,7 @@ test "VT-d lifetime failed close retains FD and owner death cannot free backing"
     const page = try free_list.popFront();
     const vmo_fd = try state.createAnonymousVmoFd(owner, page_size, .{ .close = true, .map_read = true, .map_write = true }, .{}, 16);
     const vmo = state.nativeVmoRefForFd(owner, vmo_fd).?;
-    try state.installNativeVmoPages(vmo, 0, &.{page});
+    try state.installNativeVmoPages(vmo, 0, &.{page}, free_list);
     const va: u64 = 0x4400_0000;
     _ = try state.mmapFd(owner, vmo_fd, va, page_size, .{ .read = true, .write = true }, .{ .anonymous = true }, 0);
     const iova = iova_window_start;

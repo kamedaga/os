@@ -1,38 +1,9 @@
 #pragma once
-
-/*
- * Filed payload and fast-session layouts used by the filed ABI.
- *
- * Do not add request/reply envelope fields or compatibility shims here. The
- * common service envelope and op numbering live in ipc_protocol.h.
- */
-
 #include <stddef.h>
 #include <stdint.h>
-
 #include "filed/flags.h"
 #include "filed/ipc_protocol.h"
-
 enum {
-    FILED_PAGE_BYTES = 8192,
-    FILED_SYMLINK_TARGET_BYTES =
-        FILED_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES -
-        FILED_PATH_BYTES - 2u * sizeof(uint64_t),
-    FILED_SESSION_PAGE_BYTES = 40960,
-    FILED_FAST_MAGIC = 0x31545341464c4446ull,
-    FILED_FAST_VERSION = PACHA_SERVICE_ABI_VERSION,
-    FILED_FAST_REQUEST_CAPACITY = 8,
-    FILED_FAST_COMPLETION_CAPACITY = 8,
-    FILED_FAST_PAYLOAD_SLOT_COUNT = 4,
-    FILED_FAST_PAYLOAD_OFFSET = 4096,
-    FILED_FAST_GENERATION_OFFSET =
-        FILED_FAST_PAYLOAD_OFFSET +
-        FILED_FAST_PAYLOAD_SLOT_COUNT * FILED_PAGE_BYTES,
-    FILED_FAST_GENERATION_CAPACITY = 64,
-
-    FILED_UTIMENS_ATIME = 1u << 0,
-    FILED_UTIMENS_MTIME = 1u << 1,
-
     FILED_EXEC_BOOTSTRAP_FD = 1u << 0,
     FILED_EXEC_INHERIT_FDS = 1u << 1,
     FILED_EXEC_PATCH_BOOTSTRAP_FDS = 1u << 2,
@@ -46,359 +17,52 @@ enum {
     FILED_EXEC_SERVICE_TERMD = 1u << 9,
     FILED_EXEC_SERVICE_GPUD_DRM = 1u << 10,
     FILED_EXEC_SERVICE_INPUTD = 1u << 11,
-    FILED_EXEC_MAX_INHERIT_FDS = 16,
-    FILED_EXEC_MAX_INHERIT_HANDLES = 4,
-    FILED_EXEC_MAX_FD_PATCHES = 4,
-    FILED_EXEC_MAX_ARGS = 128,
-    FILED_EXEC_MAX_ENVS = 64,
-    FILED_EXEC_STRING_BYTES = 6144,
-
     FILED_EXEC_PATCH_INHERIT_FD = 1,
     FILED_EXEC_PATCH_BOOTSTRAP_FD = 2,
     FILED_EXEC_PATCH_INHERIT_HANDLE = 3,
 };
-
-enum {
-    FILED_OPENED_KIND_UNKNOWN = 0,
-    FILED_OPENED_KIND_REGULAR = 1,
-    FILED_OPENED_KIND_DIRECTORY = 2,
-    FILED_OPENED_KIND_SYMLINK = 3,
-    FILED_OPENED_KIND_DEVICE = 4,
-};
-
-#define FILED_CREATE_MODE_VALID (1ull << 63)
-
-typedef struct filed_openat {
-    uint64_t dir_handle;
-    uint64_t rights;
-    uint64_t open_flags;
-    uint64_t create_mode;
-    uint64_t object_generation;
-    uint64_t dir_generation;
-    uint64_t opened_kind;
-    char name[FILED_PATH_BYTES];
-} filed_openat_t;
-
-typedef struct filed_validate_open_cache {
-    uint64_t cached_handle;
-    uint64_t dir_handle;
-    uint64_t rights;
-    uint64_t open_flags;
-    uint64_t object_generation;
-    uint64_t dir_generation;
-    uint64_t reserved0;
-    uint64_t reserved1;
-    char name[FILED_NAME_BYTES];
-} filed_validate_open_cache_t;
-
-typedef struct filed_io {
-    uint64_t handle;
-    uint64_t offset;
-    uint64_t length;
-    uint8_t data[FILED_IO_BYTES];
-} filed_io_t;
-
-typedef struct filed_pread_vmo {
-    uint64_t handle;
-    uint64_t file_offset;
-    uint64_t vmo_offset;
-    uint64_t length;
-    uint64_t reserved0;
-    uint64_t reserved1;
-} filed_pread_vmo_t;
-
-typedef struct filed_file_vmo {
-    uint64_t handle;
-    uint64_t file_offset;
-    uint64_t length;
-    uint64_t flags;
-    uint64_t reserved0;
-    uint64_t reserved1;
-} filed_file_vmo_t;
-
-typedef struct filed_memfd_create {
-    uint64_t flags;
-    uint64_t reserved0;
-    char name[FILED_MEMFD_NAME_BYTES];
-} filed_memfd_create_t;
-
-typedef struct filed_fast_header {
-    uint64_t magic;
-    uint64_t version;
-    uint64_t flags;
-    uint64_t request_capacity;
-    uint64_t completion_capacity;
-    uint64_t payload_slot_count;
-    uint64_t payload_slot_size;
-    uint64_t payload_offset;
-    uint64_t request_head;
-    uint64_t request_tail;
-    uint64_t completion_head;
-    uint64_t completion_tail;
-    uint64_t doorbell_seq;
-    uint64_t completion_seq;
-    uint64_t generation_offset;
-    uint64_t generation_capacity;
-} filed_fast_header_t;
-
-typedef struct filed_fast_request {
-    uint64_t request_id;
-    uint64_t opcode;
-    uint64_t flags;
-    uint64_t handle;
-    uint64_t word2;
-    uint64_t offset;
-    uint64_t length;
-    uint64_t payload_slot;
-    uint64_t payload_length;
-    uint64_t timeout_ns;
-} filed_fast_request_t;
-
-typedef struct filed_fast_completion {
-    uint64_t request_id;
-    int64_t status;
-    uint64_t result;
-    uint64_t bytes;
-    uint64_t flags;
-} filed_fast_completion_t;
-
-typedef struct filed_generation_entry {
-    uint64_t seq;
-    uint64_t handle;
-    uint64_t object_generation;
-    uint64_t dir_generation;
-} filed_generation_entry_t;
-
-typedef struct filed_statx {
-    uint64_t handle;
-    /* Filesystem identity; unlike the path handle, equal across hard links. */
-    uint64_t inode_number;
-    uint64_t mode;
-    uint64_t size;
-    uint64_t blocks;
-    uint64_t nlink;
-    uint64_t kind;
-    int64_t atime_sec;
-    int64_t atime_nsec;
-    int64_t mtime_sec;
-    int64_t mtime_nsec;
-    int64_t ctime_sec;
-    int64_t ctime_nsec;
-    uint64_t object_generation;
-    uint64_t dir_generation;
-    uint64_t rdev;
-} filed_statx_t;
-
-/* One metadata lookup; no client-visible handle is allocated or returned. */
-typedef struct filed_statat {
-    uint64_t dir_handle;
-    uint64_t flags;
-    char name[FILED_PATH_BYTES];
-    filed_statx_t stat;
-} filed_statat_t;
-
-enum { FILED_STATAT_NOFOLLOW = 1u << 0 };
-
-_Static_assert(sizeof(filed_statat_t) == 624, "filed_statat wire size");
-
-typedef struct filed_statfs {
-    uint64_t handle;
-    uint64_t type;
-    uint64_t block_size;
-    uint64_t blocks;
-    uint64_t blocks_free;
-    uint64_t blocks_available;
-    uint64_t files;
-    uint64_t files_free;
-    uint32_t fsid[2];
-    uint64_t name_length;
-    uint64_t fragment_size;
-    uint64_t flags;
-    uint64_t spare[4];
-} filed_statfs_t;
-
-_Static_assert(sizeof(filed_statfs_t) == 128, "filed_statfs size");
-
-typedef struct filed_utimens {
-    uint64_t handle;
-    uint64_t mask;
-    int64_t atime_sec;
-    int64_t atime_nsec;
-    int64_t mtime_sec;
-    int64_t mtime_nsec;
-} filed_utimens_t;
-
-typedef struct filed_chmod {
-    uint64_t handle;
-    uint64_t mode;
-    uint64_t reserved0;
-    uint64_t reserved1;
-} filed_chmod_t;
-
-typedef struct filed_truncate {
-    uint64_t handle;
-    uint64_t size;
-    uint64_t reserved0;
-    uint64_t reserved1;
-} filed_truncate_t;
-
-typedef struct filed_seek {
-    uint64_t handle;
-    int64_t offset;
-    uint64_t whence;
-    uint64_t reserved0;
-} filed_seek_t;
-
-typedef struct filed_unlink {
-    uint64_t dir_handle;
-    uint64_t reserved0;
-    char name[FILED_PATH_BYTES];
-} filed_unlink_t;
-
-typedef struct filed_mkdir {
-    uint64_t dir_handle;
-    uint64_t mode;
-    char name[FILED_PATH_BYTES];
-} filed_mkdir_t;
-
-typedef struct filed_mknod {
-    uint64_t dir_handle;
-    uint64_t mode;
-    uint64_t dev;
-    char name[FILED_PATH_BYTES];
-} filed_mknod_t;
-
-typedef struct filed_rmdir {
-    uint64_t dir_handle;
-    uint64_t reserved0;
-    char name[FILED_PATH_BYTES];
-} filed_rmdir_t;
-
-typedef struct filed_symlink {
-    uint64_t dir_handle;
-    uint64_t target_length;
-    char name[FILED_PATH_BYTES];
-    char target[FILED_SYMLINK_TARGET_BYTES];
-} filed_symlink_t;
-
-typedef struct filed_readlink {
-    uint64_t dir_handle;
-    uint64_t target_length;
-    char name[FILED_PATH_BYTES];
-    char target[FILED_SYMLINK_TARGET_BYTES];
-} filed_readlink_t;
-
-typedef char filed_symlink_fits_wire_page[
-    sizeof(filed_symlink_t) <=
-        FILED_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES ? 1 : -1];
-typedef char filed_readlink_fits_wire_page[
-    sizeof(filed_readlink_t) <=
-        FILED_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES ? 1 : -1];
-
-typedef struct filed_link {
-    uint64_t old_dir_handle;
-    uint64_t new_dir_handle;
-    uint64_t flags;
-    uint64_t reserved0;
-    char old_name[FILED_PATH_BYTES];
-    char new_name[FILED_PATH_BYTES];
-} filed_link_t;
-
-typedef struct filed_rename {
-    uint64_t old_dir_handle;
-    uint64_t new_dir_handle;
-    char old_name[FILED_PATH_BYTES];
-    char new_name[FILED_PATH_BYTES];
-} filed_rename_t;
-
-typedef struct filed_handle_flags {
-    uint64_t handle;
-    uint64_t fd_flags;
-    uint64_t status_flags;
-    uint64_t reserved0;
-} filed_handle_flags_t;
-
-typedef struct filed_dirent {
-    uint64_t handle;
-    uint64_t kind;
-    uint64_t name_len;
-    char name[FILED_DIRENT_NAME_BYTES];
-} filed_dirent_t;
-
-typedef struct filed_getdents {
-    uint64_t dir_handle;
-    uint64_t offset;
-    uint64_t capacity;
-    uint64_t count;
-    uint64_t dir_generation;
-    uint64_t reserved0;
-    filed_dirent_t entries[FILED_DIRENT_CAPACITY];
-} filed_getdents_t;
-
 typedef struct filed_exec_fd_patch {
-    uint64_t kind;
-    uint64_t index;
-    uint64_t offset;
-    uint64_t reserved0;
+    uint64_t kind, index, offset, reserved0;
 } filed_exec_fd_patch_t;
-
 typedef struct filed_exec_string_ref {
-    uint16_t offset;
-    uint16_t length;
+    uint64_t offset, length;
 } filed_exec_string_ref_t;
-
 typedef struct filed_exec_fd_grant {
-    uint64_t target;
-    uint64_t rights;
-    uint64_t flags;
+    uint64_t target, rights, flags;
 } filed_exec_fd_grant_t;
-
+/* Decoded process-local values. Only the little-endian encoder below may
+ * serialize these values; pointers never cross the ABI. */
 typedef struct filed_exec_path {
-    uint64_t dir_handle;
-    uint64_t flags;
-    uint64_t inherit_fd_count;
-    uint64_t fd_patch_count;
-    uint64_t inherit_handle_count;
-    uint64_t string_bytes;
-    uint64_t argc;
-    uint64_t envc;
-    uint64_t inherit_handles[FILED_EXEC_MAX_INHERIT_HANDLES];
-    /* Final child authority; transport TRANSFER is not implicitly retained. */
-    filed_exec_fd_grant_t fd_grants[FILED_EXEC_MAX_INHERIT_FDS];
-    filed_exec_fd_patch_t fd_patches[FILED_EXEC_MAX_FD_PATCHES];
-    char path[FILED_PATH_BYTES];
-    filed_exec_string_ref_t argv[FILED_EXEC_MAX_ARGS];
-    filed_exec_string_ref_t envp[FILED_EXEC_MAX_ENVS];
-    char strings[FILED_EXEC_STRING_BYTES];
+    uint64_t dir_handle, flags, inherit_fd_count, fd_patch_count;
+    uint64_t inherit_handle_count, string_bytes, argc, envc;
+    uint64_t *inherit_handles;
+    filed_exec_fd_grant_t *fd_grants;
+    filed_exec_fd_patch_t *fd_patches;
+    char *path;
+    filed_exec_string_ref_t *argv, *envp;
+    char *strings;
+    void *allocation;
 } filed_exec_path_t;
-
-typedef char filed_exec_path_fits_wire_page[
-    sizeof(filed_exec_path_t) <=
-        FILED_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES ? 1 : -1];
-
 static inline int filed_exec_string_ref_empty(filed_exec_string_ref_t ref)
 {
     return ref.offset == 0 && ref.length == 0;
 }
-
-static inline int filed_exec_string_ref_valid(
-    const filed_exec_path_t *request,
-    filed_exec_string_ref_t ref)
+static inline int filed_exec_string_ref_valid(const filed_exec_path_t *r,
+                                             filed_exec_string_ref_t ref)
 {
-    if (request == NULL ||
-        request->string_bytes > FILED_EXEC_STRING_BYTES ||
-        ref.length == 0 ||
-        ref.offset >= request->string_bytes ||
-        (uint64_t)ref.offset + (uint64_t)ref.length > request->string_bytes)
-    {
-        return 0;
-    }
-    return request->strings[(uint64_t)ref.offset + (uint64_t)ref.length - 1u] == '\0';
+    if (!r || !r->strings || !ref.length || ref.offset > r->string_bytes ||
+        ref.length > r->string_bytes - ref.offset) return 0;
+    const char *s = r->strings + ref.offset;
+    if (s[ref.length - 1]) return 0;
+    for (uint64_t i = 0; i + 1 < ref.length; ++i) if (!s[i]) return 0;
+    return 1;
 }
-
-static inline const char *filed_exec_string(
-    const filed_exec_path_t *request,
-    filed_exec_string_ref_t ref)
+static inline const char *filed_exec_string(const filed_exec_path_t *r,
+                                          filed_exec_string_ref_t ref)
 {
-    return &request->strings[ref.offset];
+    return filed_exec_string_ref_valid(r, ref) ? r->strings + ref.offset : NULL;
 }
+int filed_exec_payload_encode(const filed_exec_path_t *, uint8_t **, size_t *);
+int filed_exec_payload_decode(const uint8_t *, size_t, const char *, uint64_t,
+                              uint64_t, filed_exec_path_t *);
+void filed_exec_payload_destroy(filed_exec_path_t *);

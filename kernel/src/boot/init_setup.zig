@@ -114,7 +114,7 @@ pub fn mapBootFsImageIntoProcessOrHalt(
             halt.haltWithRolePageMessage(role_label, "bootfs image page", "map failed");
         }
         var paddrs = [_]u64{page.paddr};
-        state.installNativeVmoPages(vmo_ref, page_index, paddrs[0..]) catch |err| {
+        state.installNativeVmoPages(vmo_ref, page_index, paddrs[0..], free_list) catch |err| {
             _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             halt.haltWithRolePageError(role_label, "bootfs image page", "install native VMO page", err);
         };
@@ -230,7 +230,7 @@ fn publishInitBootstrapConfigPage(user_page_paddr: u64, descriptor_page_va: u64)
     var bytes: [4096]u8 align(@alignOf(init_bootstrap_abi.ConfigPage)) = [_]u8{0} ** 4096;
     const page: *init_bootstrap_abi.ConfigPage = @ptrCast(&bytes);
     page.magic = init_bootstrap_abi.config_magic;
-    page.version = init_bootstrap_abi.config_version;
+    page.size = @sizeOf(init_bootstrap_abi.ConfigPage);
     page.descriptor_page_va = descriptor_page_va;
     page.reserved0 = 0;
     if (!user_copy.writePhysicalBytes(user_page_paddr, &bytes))
@@ -263,7 +263,7 @@ pub fn publishInitBootstrapDescriptorPage(
     var bytes: [4096]u8 align(@alignOf(init_bootstrap_abi.DescriptorPage)) = [_]u8{0} ** 4096;
     const page: *init_bootstrap_abi.DescriptorPage = @ptrCast(&bytes);
     page.magic = init_bootstrap_abi.magic;
-    page.version = init_bootstrap_abi.version;
+    page.size = @sizeOf(init_bootstrap_abi.DescriptorPage);
     page.spawn_page_count = init_bootstrap_layout.builtin_spawn_pages.len;
     page.boot_image_count = init_bootstrap_abi.builtin_boot_images.len;
     page.bootfs_archive = .{

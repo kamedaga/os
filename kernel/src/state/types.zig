@@ -861,6 +861,7 @@ pub const IpcChannelSlot = struct {
     ref_count: u8 = 0,
     queues: [2]IpcQueue = .{ .{}, .{} },
     waiters: [2]IpcWaitList = .{ .{}, .{} },
+    receiver_hints: [2]IpcReceiverHint = .{ .{}, .{} },
 };
 
 pub const IpcReplySlot = struct {
@@ -916,6 +917,10 @@ pub const NativeVmoKind = enum(u8) {
     /// Borrowed BAR pages, never allocator-owned RAM. Admission and cache
     /// leases must be established before this backing can acquire VMAs.
     device_memory = 3,
+    /// The kernel-image clock page, never allocator-owned RAM. One permanent
+    /// kernel reference keeps it alive; it is mapped shared and read-only only,
+    /// and is excluded from DMA pinning, cache policy, growth and page views.
+    kernel_page = 4,
 };
 
 pub const DeviceMemoryCache = enum(u8) { uc, wc };
@@ -966,6 +971,7 @@ pub const NativeVmoSlot = struct {
     backing: union {
         parent: struct { ref: NativeVmoRef = .{}, offset: u64 = 0 },
         device: DeviceMemoryBacking,
+        kernel_page: struct { paddr: u64 },
     } = .{ .parent = .{} },
 };
 
@@ -1091,6 +1097,8 @@ pub const VmObjectBackingStoreStats = struct {
     capacity: u64,
     used_entries: u64,
     free_entries: u64,
+    growth_count: u64,
+    retired_pages: usize,
 };
 
 pub fn vmObjectBackingStoreStats() VmObjectBackingStoreStats {
@@ -1105,7 +1113,98 @@ pub fn vmObjectBackingStoreStats() VmObjectBackingStoreStats {
         .capacity = capacity,
         .used_entries = used,
         .free_entries = if (capacity > used) capacity - used else 0,
+        .growth_count = vmo_backing_growth_count,
+        .retired_pages = vmo_backing_retired_pages,
     };
+}
+
+pub const VmObjectBackingStoreBreakdown = struct {
+    native_entries: u64 = 0,
+    cow_entries: u64 = 0,
+    invalid_native_entries: u64 = 0,
+    demand_zero_entries: u64 = 0,
+    live_vmos: u64 = 0,
+    live_demand_zero_vmos: u64 = 0,
+    anonymous_logical_pages: u64 = 0,
+    anonymous_entries: u64 = 0,
+    page_view_entries: u64 = 0,
+    largest: [8]VmObjectBackingOwner = [_]VmObjectBackingOwner{.{}} ** 8,
+};
+
+pub const VmObjectBackingOwner = struct {
+    owner: u64 = 0,
+    entries: u32 = 0,
+    pages: u32 = 0,
+    refs: u32 = 0,
+    kind: NativeVmoKind = .none,
+    parent: NativeVmoRef = .{},
+};
+
+// Failure-only scratch is protected by the store lock. It cannot live on a
+// fault stack, and allocating it on the failing allocator would lose evidence.
+var backing_census_counts: [max_native_vmos]u32 = .{0} ** max_native_vmos;
+
+/// Failure-only census; caller already holds shared VM ownership. Copy scalar
+/// results under the innermost store lock, never log or allocate while holding
+/// it. Counts are owner/page entries, not distinct physical RAM pages.
+pub fn vmObjectBackingStoreBreakdown(vmos: []const NativeVmoSlot) VmObjectBackingStoreBreakdown {
+    vmo_backing_page_store_lock.lock();
+    defer vmo_backing_page_store_lock.unlock();
+    var result: VmObjectBackingStoreBreakdown = .{};
+    @memset(&backing_census_counts, 0);
+    for (vmos) |vmo| {
+        if (vmo.kind == .none or vmo.ref_count == 0) continue;
+        result.live_vmos += 1;
+        if (vmo.zero_on_demand) {
+            result.live_demand_zero_vmos += 1;
+        }
+        if (vmo.kind == .anonymous) result.anonymous_logical_pages += vmo.page_count;
+    }
+    for (vmo_backing_page_store_owners, 0..) |owner, index| {
+        if (owner == 0) continue;
+        if (owner >> 63 != 0) {
+            result.cow_entries += 1;
+            continue;
+        }
+        result.native_entries += 1;
+        const slot_index: usize = @intCast(owner & std.math.maxInt(u31));
+        if (slot_index >= vmos.len) {
+            result.invalid_native_entries += 1;
+            continue;
+        }
+        const vmo = &vmos[slot_index];
+        backing_census_counts[slot_index] += 1;
+        if (vmo.kind == .anonymous) result.anonymous_entries += 1;
+        if (vmo.kind == .page_view) result.page_view_entries += 1;
+        if (vmo.kind == .none or vmo.ref_count == 0 or
+            vmo.page_store_owner != owner or !vmo.has_page_store or
+            vmoBackingStoreOwner(.native_vmo, @intCast(slot_index), vmo.generation) != owner or
+            vmo_backing_page_store_page_indices[index] >= vmo.page_count)
+        {
+            result.invalid_native_entries += 1;
+        } else if (vmo.zero_on_demand) {
+            result.demand_zero_entries += 1;
+        }
+    }
+    for (vmos, 0..) |vmo, index| {
+        const count = backing_census_counts[index];
+        if (count == 0) continue;
+        for (&result.largest, 0..) |*place, rank| {
+            if (count <= place.entries) continue;
+            var move = result.largest.len - 1;
+            while (move > rank) : (move -= 1) result.largest[move] = result.largest[move - 1];
+            place.* = .{
+                .owner = vmo.page_store_owner,
+                .entries = count,
+                .pages = vmo.page_count,
+                .refs = vmo.ref_count,
+                .kind = vmo.kind,
+                .parent = if (vmo.kind == .page_view) vmo.backing.parent.ref else .{},
+            };
+            break;
+        }
+    }
+    return result;
 }
 
 pub const EndpointTable = struct {
@@ -1195,6 +1294,7 @@ pub const max_vmo_backing_pages: usize = 131072;
 // Logical sparse extents are not eager page arrays. Keep the latter bounded
 // separately; the backing key and VMA COW offsets use u32 page indices.
 pub const max_vmo_logical_pages: usize = std.math.maxInt(u32);
+// Bootstrap capacity only; runtime metadata grows independently of VMO RAM.
 pub const max_vmo_backing_store_pages: usize = 1048576;
 
 pub var empty_vmo_backing_page_store: [0]u64 = .{};
@@ -1204,6 +1304,18 @@ pub var vmo_backing_page_store_owners: []u64 = empty_vmo_backing_page_store_owne
 pub var empty_vmo_backing_page_store_page_indices: [0]u32 = .{};
 pub var vmo_backing_page_store_page_indices: []u32 = empty_vmo_backing_page_store_page_indices[0..];
 pub var vmo_backing_page_store_used: usize = 0;
+
+// Bootstrap storage belongs to the kernel image. Only replacement tables
+// carry this header, so a rehash must never return the bootstrap BSS to PMM.
+const VmoBackingStorage = struct {
+    allocator: *FreePageList,
+    pages: usize,
+    next: ?*VmoBackingStorage = null,
+};
+var vmo_backing_dynamic_storage: ?*VmoBackingStorage = null;
+var vmo_backing_retired_storage: ?*VmoBackingStorage = null;
+var vmo_backing_growth_count: u64 = 0;
+var vmo_backing_retired_pages: usize = 0;
 
 /// The VM-object backing arrays are reached from both syscall and fault paths,
 /// whose outer locks are intentionally unrelated. This lock is therefore the
@@ -1301,6 +1413,123 @@ fn vmoBackingPageStoreReadyLocked() bool {
         vmo_backing_page_store_owners.len == vmo_backing_page_store.len and
         vmo_backing_page_store_page_indices.len == vmo_backing_page_store.len and
         vmo_backing_page_store_used < vmo_backing_page_store.len;
+}
+
+fn backingStoreLoadLimit(capacity: usize) usize {
+    // Linear probing and cluster-repair deletion become pathological near
+    // 100% occupancy, well before the last empty slot disappears.
+    return (capacity / 10) * 7 + ((capacity % 10) * 7) / 10;
+}
+
+fn releaseVmoBackingStorage(storage: *VmoBackingStorage) void {
+    const pages = storage.pages;
+    storage.allocator.appendContiguousRange(0, @intFromPtr(storage), pages) catch |err| {
+        // A rejected PMM return is still owned memory, not a successful free.
+        // Keep an intrusive quarantine even if the range ledger itself is full.
+        vmo_backing_page_store_lock.lock();
+        storage.next = vmo_backing_retired_storage;
+        vmo_backing_retired_storage = storage;
+        vmo_backing_retired_pages += pages;
+        vmo_backing_page_store_lock.unlock();
+        if (!builtin.is_test) @import("../kernel_log.zig").writeFmt(
+            "vm: backing metadata return quarantined pages={} error={s}\n",
+            .{ pages, @errorName(err) },
+        );
+    };
+}
+
+pub fn reclaimVmoBackingStorage() void {
+    // Detach a finite batch under the innermost lock. A failed return rejoins
+    // quarantine for a future attempt rather than spinning on a full PMM ledger.
+    vmo_backing_page_store_lock.lock();
+    var pending = vmo_backing_retired_storage;
+    vmo_backing_retired_storage = null;
+    vmo_backing_retired_pages = 0;
+    vmo_backing_page_store_lock.unlock();
+    while (pending) |storage| {
+        pending = storage.next;
+        releaseVmoBackingStorage(storage);
+    }
+}
+
+/// Enter and return with the store lock held. Allocation/zeroing and PMM
+/// returns happen outside it. A true result means callers must revalidate
+/// their complete transaction: another CPU could mutate keys while unlocked.
+fn ensureVmoBackingStoreCapacityLocked(required: usize, free_list: ?*FreePageList) KernelError!bool {
+    const needed = std.math.add(usize, vmo_backing_page_store_used, required) catch
+        return KernelError.OutOfFreePages;
+    if (needed <= backingStoreLoadLimit(vmo_backing_page_store.len)) return false;
+    const allocator = free_list orelse {
+        // Fixed backing is used by ownership/capacity failure tests only.
+        if (needed <= vmo_backing_page_store.len - 1) return false;
+        return KernelError.TableFull;
+    };
+    var capacity = vmo_backing_page_store.len;
+    while (needed > backingStoreLoadLimit(capacity)) {
+        capacity = std.math.mul(usize, capacity, 2) catch return KernelError.OutOfFreePages;
+    }
+    const header_bytes = std.mem.alignForward(usize, @sizeOf(VmoBackingStorage), @alignOf(u64));
+    const entries_bytes = std.math.mul(usize, capacity, 20) catch return KernelError.OutOfFreePages;
+    const bytes = std.math.add(usize, entries_bytes, header_bytes) catch return KernelError.OutOfFreePages;
+    const rounded = std.math.add(usize, bytes, 4095) catch return KernelError.OutOfFreePages;
+    const pages = rounded / 4096;
+
+    vmo_backing_page_store_lock.unlock();
+    reclaimVmoBackingStorage();
+    const allocation = allocator.popContiguousBelow(pages, @import("../arch/x86_64/physical_layout.zig").identity_limit);
+    if (allocation) |paddr| {
+        const raw: [*]align(4096) u8 = @ptrFromInt(paddr);
+        @memset(raw[0 .. pages * 4096], 0);
+        const storage: *VmoBackingStorage = @ptrCast(raw);
+        storage.* = .{ .allocator = allocator, .pages = pages };
+        const new_paddrs: [*]u64 = @ptrCast(@alignCast(raw + header_bytes));
+        const new_owners: [*]u64 = new_paddrs + capacity;
+        const new_indices: [*]u32 = @ptrCast(new_owners + capacity);
+        vmo_backing_page_store_lock.lock();
+        const current_needed = std.math.add(usize, vmo_backing_page_store_used, required) catch std.math.maxInt(usize);
+        if (current_needed <= backingStoreLoadLimit(vmo_backing_page_store.len) or
+            current_needed > backingStoreLoadLimit(capacity))
+        {
+            // A competing grow won, or concurrent inserts need a larger
+            // candidate. Never install an obsolete/smaller replacement.
+            vmo_backing_page_store_lock.unlock();
+            releaseVmoBackingStorage(storage);
+            vmo_backing_page_store_lock.lock();
+            return true;
+        }
+        const old_capacity = vmo_backing_page_store.len;
+        const old_storage = vmo_backing_dynamic_storage;
+        const old_paddrs = vmo_backing_page_store;
+        const old_owners = vmo_backing_page_store_owners;
+        const old_indices = vmo_backing_page_store_page_indices;
+        const old_used = vmo_backing_page_store_used;
+        vmo_backing_page_store = new_paddrs[0..capacity];
+        vmo_backing_page_store_owners = new_owners[0..capacity];
+        vmo_backing_page_store_page_indices = new_indices[0..capacity];
+        vmo_backing_page_store_used = 0;
+        for (old_owners, 0..) |owner, index| {
+            if (owner == 0) continue;
+            _ = insertVmoBackingPageStoreSlotLocked(owner, old_indices[index], old_paddrs[index]) catch unreachable;
+        }
+        std.debug.assert(vmo_backing_page_store_used == old_used);
+        vmo_backing_dynamic_storage = storage;
+        vmo_backing_growth_count += 1;
+        vmo_backing_page_store_lock.unlock();
+        if (old_storage) |old| releaseVmoBackingStorage(old);
+        if (!builtin.is_test) @import("../kernel_log.zig").writeFmt(
+            "vm: backing metadata grew slots={} -> {} used={} pages={}\n",
+            .{ old_capacity, capacity, old_used, pages },
+        );
+        vmo_backing_page_store_lock.lock();
+        return true;
+    } else |_| {
+        vmo_backing_page_store_lock.lock();
+        // Allocation failure can race a successful competing grow.
+        const current_needed = std.math.add(usize, vmo_backing_page_store_used, required) catch
+            return KernelError.OutOfFreePages;
+        if (current_needed <= backingStoreLoadLimit(vmo_backing_page_store.len)) return true;
+        return KernelError.OutOfFreePages;
+    }
 }
 
 fn mixVmoBackingPageStoreKey(owner: u64, page_index: u32) u64 {
@@ -1441,7 +1670,7 @@ pub fn vmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize) 
     return paddr;
 }
 
-pub fn setVmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize, owner: u64, paddr: u64) KernelError!void {
+pub fn setVmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usize, owner: u64, paddr: u64, free_list: ?*FreePageList) KernelError!void {
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
     if (!vmoBackingPageStoreReadyLocked() or owner == 0 or start != owner or
@@ -1464,6 +1693,9 @@ pub fn setVmoBackingPageStorePaddr(start: u64, page_count: u32, page_index: usiz
         removeVmoBackingPageStoreSlotLocked(slot_index);
         return;
     }
+    while (findVmoBackingPageStoreSlotLocked(owner, key_index) == null) {
+        if (!try ensureVmoBackingStoreCapacityLocked(1, free_list)) break;
+    }
     _ = try insertVmoBackingPageStoreSlotLocked(owner, key_index, paddr);
 }
 
@@ -1473,6 +1705,7 @@ pub fn setVmoBackingPageStorePaddrs(
     page_offset: usize,
     owner: u64,
     paddrs: []const u64,
+    free_list: ?*FreePageList,
 ) KernelError!void {
     vmo_backing_page_store_lock.lock();
     defer vmo_backing_page_store_lock.unlock();
@@ -1483,28 +1716,30 @@ pub fn setVmoBackingPageStorePaddrs(
         return KernelError.InvalidState;
     }
 
-    var required: usize = 0;
-    for (paddrs, 0..) |paddr, offset| {
-        if ((paddr & 0xFFF) != 0 or page_offset + offset > std.math.maxInt(u32)) {
-            return KernelError.InvalidState;
+    while (true) {
+        var required: usize = 0;
+        for (paddrs, 0..) |paddr, offset| {
+            if ((paddr & 0xFFF) != 0 or page_offset + offset > std.math.maxInt(u32)) {
+                return KernelError.InvalidState;
+            }
+            const page_index: u32 = @intCast(page_offset + offset);
+            if (findVmoBackingPageStoreSlotLocked(owner, page_index)) |slot_index| {
+                if (vmo_backing_page_store[slot_index] != 0) return KernelError.InvalidState;
+            } else if (paddr != 0) {
+                required += 1;
+            }
         }
-        const page_index: u32 = @intCast(page_offset + offset);
-        if (findVmoBackingPageStoreSlotLocked(owner, page_index)) |slot_index| {
-            if (vmo_backing_page_store[slot_index] != 0) return KernelError.InvalidState;
-        } else if (paddr != 0) {
-            required += 1;
-        }
-    }
-    const usable_capacity = vmo_backing_page_store.len - 1;
-    if (required > usable_capacity - vmo_backing_page_store_used) return KernelError.TableFull;
+        if (required != 0 and try ensureVmoBackingStoreCapacityLocked(required, free_list)) continue;
 
-    for (paddrs, 0..) |paddr, offset| {
-        if (paddr == 0) continue;
-        _ = insertVmoBackingPageStoreSlotLocked(
-            owner,
-            @intCast(page_offset + offset),
-            paddr,
-        ) catch unreachable;
+        for (paddrs, 0..) |paddr, offset| {
+            if (paddr == 0) continue;
+            _ = insertVmoBackingPageStoreSlotLocked(
+                owner,
+                @intCast(page_offset + offset),
+                paddr,
+            ) catch unreachable;
+        }
+        return;
     }
 }
 
@@ -1601,7 +1836,8 @@ pub fn initVmoBackingPageStoreForTest(
         return false;
     }
     vmo_backing_page_store_lock.lock();
-    defer vmo_backing_page_store_lock.unlock();
+    const old_storage = vmo_backing_dynamic_storage;
+    vmo_backing_dynamic_storage = null;
     vmo_backing_page_store = paddrs;
     vmo_backing_page_store_owners = owners;
     vmo_backing_page_store_page_indices = page_indices;
@@ -1610,6 +1846,9 @@ pub fn initVmoBackingPageStoreForTest(
     @memset(vmo_backing_page_store_page_indices, 0);
     vmo_backing_page_store_used = 0;
     vmo_backing_store_ownership_fault = .{};
+    vmo_backing_growth_count = 0;
+    vmo_backing_page_store_lock.unlock();
+    if (old_storage) |old| releaseVmoBackingStorage(old);
     return true;
 }
 
@@ -1640,6 +1879,11 @@ pub fn kernelStaticStorageEndAddr() usize {
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_used), &vmo_backing_page_store_used));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_page_store_lock), &vmo_backing_page_store_lock));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_store_ownership_fault), &vmo_backing_store_ownership_fault));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_dynamic_storage), &vmo_backing_dynamic_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_retired_storage), &vmo_backing_retired_storage));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_growth_count), &vmo_backing_growth_count));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(vmo_backing_retired_pages), &vmo_backing_retired_pages));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(backing_census_counts), &backing_census_counts));
     return end;
 }
 
@@ -1664,18 +1908,25 @@ pub fn runtimeStorageBytes() usize {
 }
 
 pub fn initRuntimeStorage(storage: []align(4096) u8) bool {
-    vmo_backing_page_store_lock.lock();
-    defer vmo_backing_page_store_lock.unlock();
     var cursor: usize = 0;
-    vmo_backing_page_store = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
-    vmo_backing_page_store_owners = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
-    vmo_backing_page_store_page_indices = runtimeStorageSlice(u32, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
+    const paddrs = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
+    const owners = runtimeStorageSlice(u64, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
+    const indices = runtimeStorageSlice(u32, storage, &cursor, max_vmo_backing_store_pages) orelse return false;
+    vmo_backing_page_store_lock.lock();
+    const old_storage = vmo_backing_dynamic_storage;
+    vmo_backing_dynamic_storage = null;
+    vmo_backing_page_store = paddrs;
+    vmo_backing_page_store_owners = owners;
+    vmo_backing_page_store_page_indices = indices;
 
     @memset(vmo_backing_page_store, 0);
     @memset(vmo_backing_page_store_owners, 0);
     @memset(vmo_backing_page_store_page_indices, 0);
     vmo_backing_page_store_used = 0;
     vmo_backing_store_ownership_fault = .{};
+    vmo_backing_growth_count = 0;
+    vmo_backing_page_store_lock.unlock();
+    if (old_storage) |old| releaseVmoBackingStorage(old);
     return true;
 }
 

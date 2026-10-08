@@ -1,82 +1,34 @@
 #pragma once
-
+#include <stddef.h>
 #include <stdint.h>
-
-#include "filed/bootstrap.h"
-#include "filed/live_bootstrap.h"
-#include "filed/kobox_backend.h"
-#include "filed/tmpfs_internal.h"
-#include "filed/vfs.h"
 #include "filed/identity.h"
+#include "filed/storage.h"
+#include "storage/bootstrap.h"
 
-enum {
-    FILED_RUNTIME_MAX_SESSIONS = 32,
-};
-
-struct filed_dispatch_state;
+struct filed_storage_owner;
+struct filed_session;
+struct filed_lease;
 struct filed_unix_hold;
-
-typedef struct filed_session {
-    int channel_fd;
-    int page_fd;
-    void *page;
-    uint64_t page_size;
-    struct filed_client *client;
-    uint8_t active;
-} filed_session_t;
-
 typedef struct filed_runtime {
-    filed_vfs_t vfs;
-    filed_bootstrap_t bootstrap;
-    filed_kobox_backend_t backend;
-    filed_tmpfs_backend_t tmpfs;
-    int bootstrap_fd;
-    int live_bootfs_fd;
-    int live_ready_fd;
+    storage_filed_bootstrap_t bootstrap;
+    struct filed_storage_owner *storage;
+    int bootstrap_fd, client_endpoint_fd, unix_path_fd;
+    int live_bootfs_fd, live_ready_fd;
     uint64_t live_bootfs_size;
     uint8_t live_root;
-    int client_endpoint_fd;
-    struct filed_client *clients;
-    struct filed_client *actor;
-    uint64_t client_sequence;
-    int unix_path_fd;
+    struct filed_client *clients, *actor;
+    struct filed_session *sessions;
+    struct filed_lease *leases;
     struct filed_unix_hold *unix_holds;
     uint64_t unix_hold_sequence;
-    int syncer_timer_fd;
-    int netd_socket_endpoint_fd;
-    int termd_tty_endpoint_fd;
-    int gpud_drm_endpoint_fd;
-    int inputd_input_endpoint_fd;
-    filed_session_t sessions[FILED_RUNTIME_MAX_SESSIONS];
-    struct filed_dispatch_state *dispatch_state;
-    void *storage_runtime;
-    uint64_t request_sequence;
-    uint64_t memfd_sequence;
-    uint64_t syncer_ticks;
-    uint64_t syncer_flushes;
-    uint64_t syncer_errors;
-    int syncer_last_status;
-    uint64_t root_size;
-    filed_mount_id_t root_mount_id;
-    filed_handle_id_t root_handle_id;
-    filed_handle_id_t tmpfs_root_handle_id;
-    filed_handle_id_t run_tmpfs_root_handle_id;
-    filed_handle_id_t shm_tmpfs_root_handle_id;
-    uint8_t root_tmpfs_synthetic_dirent;
-    uint8_t tmpfs_root_handle_valid;
-    uint8_t run_tmpfs_root_handle_valid;
-    uint8_t shm_tmpfs_root_handle_valid;
-    uint8_t vnode_eviction_pending;
+    uint64_t client_sequence, request_sequence, storage_generation;
+    int netd_socket_endpoint_fd, termd_tty_endpoint_fd;
+    int gpud_drm_endpoint_fd, inputd_input_endpoint_fd;
 } filed_runtime_t;
-
-void filed_runtime_init(filed_runtime_t *runtime);
-int filed_runtime_bootstrap(filed_runtime_t *runtime, char **argv);
-int filed_runtime_mount_root(filed_runtime_t *runtime);
-int filed_runtime_serve(filed_runtime_t *runtime);
-int64_t filed_close_handle_runtime(
-    filed_runtime_t *runtime,
-    filed_handle_id_t handle_id);
-int64_t filed_close_handle_runtime_deferred(
-    filed_runtime_t *runtime,
-    filed_handle_id_t handle_id);
-int filed_maintain_vnode_cache(filed_runtime_t *runtime);
+void filed_runtime_init(filed_runtime_t *);
+int filed_runtime_bootstrap(filed_runtime_t *, char **);
+int filed_runtime_mount_root(filed_runtime_t *);
+int filed_runtime_serve(filed_runtime_t *);
+int filed_sessions_release_client(filed_runtime_t *, struct filed_client *);
+int filed_owner_control(filed_runtime_t *, kb2_fs_request_t *, const uint8_t *,
+                       size_t, kb2_fs_response_t *);

@@ -11,6 +11,7 @@ if(GPUD_DRM_RPC_PROFILE)
 endif()
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(GPUD_ELF "${CMAKE_BINARY_DIR}/gpud.elf")
 set(SANDBOX_ELF "${CMAKE_BINARY_DIR}/sandbox.elf")
 set(PROTOCOL "${REPO_ROOT}/kobox2/protocol")
@@ -37,6 +38,7 @@ add_custom_command(
 add_custom_target(gpud_sandbox DEPENDS "${SANDBOX_ELF}")
 
 set(GPUD_SOURCES
+  "${REPO_ROOT}/userland/kobox2_owner/boot.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/discovery.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/discovery_filed.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/inspect_policy.c"
@@ -82,15 +84,20 @@ add_custom_command(
   OUTPUT "${GPUD_ELF}"
   COMMAND ${CMAKE_COMMAND} -E env
     "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/main.c"
-    "PACHAOS_MUSL_EXTRA_SOURCES=${GPUD_SOURCES_ENV}"
-    "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/kobox2/include ${PROTOCOL}/include ${PROTOCOL}/generated/include"
+    "PACHAOS_MUSL_EXTRA_SOURCES=${GPUD_SOURCES_ENV} ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+    "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/kobox2/include ${PROTOCOL}/include ${PROTOCOL}/generated/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include"
     "PACHAOS_MUSL_EXTRA_CFLAGS=-std=c11 -Oz -ffunction-sections -fdata-sections -Wframe-larger-than=65536 -Werror=frame-larger-than ${GPUD_DRM_PROFILE_FLAGS}"
     "PACHAOS_MUSL_EXTRA_LINK_FLAGS=-Wl,--gc-sections"
     bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${GPUD_ELF}"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/main.c" ${GPUD_SOURCES} ${GPUD_HEADERS}
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES} "${CMAKE_CURRENT_SOURCE_DIR}/main.c" ${GPUD_SOURCES} ${GPUD_HEADERS}
+    "${REPO_ROOT}/userland/libfiled_client/src/client.c"
+    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/client.h"
+    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+    "${REPO_ROOT}/kobox2/protocol/include/kobox2/filesystem.h"
+    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
+    "${REPO_ROOT}/userland/kobox2_owner/boot.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SANDBOX_ELF}"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM)

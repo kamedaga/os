@@ -4,7 +4,7 @@
 #include <string.h>
 
 lpr_state_t lpr_state;
-static unsigned closed[64], freed;
+static unsigned closed[64], freed, device_unmapped;
 void *lpr_memset(void *p, int c, size_t n) { return memset(p, c, n); }
 int64_t lpr_close_native_fd_if_open(uint64_t fd)
 {
@@ -14,7 +14,7 @@ int64_t lpr_close_native_fd_if_open(uint64_t fd)
 }
 int64_t lpr_backend_state_free(void *state, uint64_t size)
 {
-    assert(state && size == sizeof(lpr_filed_backend_t));
+    assert(state && (size == sizeof(lpr_filed_backend_t) || size == sizeof(lpr_device_backend_t)));
     freed++;
     return 0;
 }
@@ -22,6 +22,13 @@ void lpr_unix_mapping_destroy(struct lpr_unix_mapping *mapping)
 {
     (void)mapping;
     assert(!"unexpected Unix backend");
+}
+int64_t lpr_device_description_unmap(lpr_device_backend_t *device)
+{
+    assert(device->description_map == 0x10000);
+    device->description_map = 0;
+    device_unmapped++;
+    return 0;
 }
 
 int main(void)
@@ -54,6 +61,11 @@ int main(void)
             .backend = {.index = i, .generation = i + 1},
             .refcount = i == 1, .pin_count = 5, .closing = i != 1};
     }
+    lpr_device_backend_t displaced_device = { .description_fd.raw = 41,
+        .description_map = 0x10000 };
+    backends[2].ops_id = LPR_FD_OPS_DEVICE;
+    backends[2].state = &displaced_device;
+    backends[2].state_bytes = sizeof(displaced_device);
     /* After snapshot: parent closes both old aliases, reuses FD 3, publishes
      * FD 11, and leaves a staged import and a sibling's orphaned pin. */
     entries[3] = entries[11] = (lpr_fd_entry_t){.active = 1, .ofd_index = 1};
@@ -80,5 +92,6 @@ int main(void)
     assert(!ofds[1].active && !ofds[2].active);
     assert(backends[0].active && !backends[1].active && !backends[2].active);
     assert(freed == 2 && closed[40] == 1 && closed[41] == 1 && !closed[37]);
+    assert(device_unmapped == 1 && !displaced_device.description_map);
     puts("Fork FD snapshot: reused slots, restored aliases, orphan pins and child-only close PASS");
 }

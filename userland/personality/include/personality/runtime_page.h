@@ -4,8 +4,7 @@
 #include <stdint.h>
 #include "personality_abi.h"
 
-#define LPR_RUNTIME_MAGIC 0x32504c5841484350ull
-#define LPR_RUNTIME_VERSION PERSONALITY_ABI_VERSION
+#define LPR_RUNTIME_MAGIC 0x00504c5841484350ull
 #define LPR_INLINE_FD_COUNT 32u
 #define LPR_INLINE_VMA_COUNT 24u
 #define LPR_INLINE_SITE_COUNT 16u
@@ -49,7 +48,7 @@ struct lpr_site_entry {
 
 struct lpr_runtime_page {
     uint64_t magic;
-    uint32_t version;
+    uint32_t size;
     uint32_t personality_id;
     uint32_t flags;
     uint32_t reserved0;

@@ -52,30 +52,13 @@ static uint64_t lpr_linux_prot_to_pacha(uint64_t prot);
 static uint32_t lpr_linux_private_expedited_registered;
 
 #include "lpr_gui_profile.h"
+#include "lpr_frame_anchor.h"
 
 const struct lpr_linux_user_frame *lpr_current_linux_user_frame(void)
 {
-    enum { LPR_FRAME_ANCHOR_MAX_DEPTH = 64 };
-    const uint64_t anchor_magic = 0x4c50524652414d45ull;
-    const uint64_t anchor_guard = 0x454d41524652504cull;
-    const uintptr_t max_frame_step = 1024u * 1024u;
     uintptr_t cursor;
     __asm__ volatile("mov %%rbp, %0" : "=r"(cursor));
-    for (unsigned depth = 0; depth < LPR_FRAME_ANCHOR_MAX_DEPTH; ++depth) {
-        if (cursor == 0 || (cursor & (sizeof(uintptr_t) - 1u)) != 0) {
-            return 0;
-        }
-        const uintptr_t next = *(const uintptr_t *)(uintptr_t)cursor;
-        if (next <= cursor || next - cursor > max_frame_step) {
-            return 0;
-        }
-        const uint64_t *anchor = (const uint64_t *)(uintptr_t)next;
-        if (anchor[0] == anchor_magic && anchor[2] == anchor_guard) {
-            return (const struct lpr_linux_user_frame *)(uintptr_t)anchor[1];
-        }
-        cursor = next;
-    }
-    return 0;
+    return lpr_frame_anchor_find(cursor);
 }
 
 static void lpr_linux_rlimits_init(void)
@@ -637,10 +620,8 @@ static void lpr_mmap_image_diag(
     out = lpr_mmap_diag_append_u64(out, end, map_len);
     out = lpr_mmap_diag_append_text(out, end, " offset=");
     out = lpr_mmap_diag_append_u64(out, end, offset);
-    out = lpr_mmap_diag_append_text(out, end, " file_size=");
-    out = lpr_mmap_diag_append_u64(out, end, file->stat_size);
-    out = lpr_mmap_diag_append_text(out, end, " path=");
-    out = lpr_mmap_diag_append_text(out, end, file->open_path);
+    out = lpr_mmap_diag_append_text(out, end, " handle=");
+    out = lpr_mmap_diag_append_u64(out, end, file->handle);
     if (out < end) {
         *out++ = '\n';
     }
@@ -1611,13 +1592,6 @@ static void lpr_startup_profile_dump(void)
     {
         return;
     }
-    if (lpr_startup_profile_mapped_bytes >=
-        LPR_STARTUP_PROFILE_FILED_DUMP_BYTES)
-    {
-        uint64_t ignored = 0;
-        (void)lpr_filed_call(
-            FILED_OP_DIAG_DUMP_METRICS, -1, 0, &ignored);
-    }
     const uint64_t pid =
         (uint64_t)lpr_pacha_syscall0(PACHAOS_SYSCALL_GETPID);
     const uint64_t cycles_marker =
@@ -1977,187 +1951,6 @@ static int64_t lpr_linux_uname(uint64_t uts_raw)
     return 0;
 }
 
-static void lpr_file_image_cache_clear_locked(void)
-{
-    for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
-        lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
-        if (entry->active) {
-            if (entry->vmo_fd >= 16) {
-                (void)lpr_pacha_syscall1(
-                    PACHAOS_SYSCALL_FD_CLOSE, entry->vmo_fd);
-            }
-            lpr_memset(entry, 0, sizeof(*entry));
-        }
-    }
-    lpr_file_image_cache_clock = 0;
-}
-
-void lpr_file_image_cache_clear(void)
-{
-    lpr_state_lock(&lpr_file_image_cache_lock);
-    lpr_file_image_cache_clear_locked();
-    lpr_state_unlock(&lpr_file_image_cache_lock);
-}
-
-void lpr_file_image_cache_drop_handle(uint64_t handle)
-{
-    if (handle == 0) return;
-    lpr_state_lock(&lpr_file_image_cache_lock);
-    for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
-        lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
-        if (!entry->active || entry->handle != handle) continue;
-        /* The cache is keyed by the open handle, not by path. Once closed,
-         * this key cannot be reused. VMAs retain their own backing references;
-         * close only our optional descriptor, never revoke or unmap it. */
-        if (entry->vmo_fd >= 16) {
-            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, entry->vmo_fd);
-        }
-        lpr_memset(entry, 0, sizeof(*entry));
-    }
-    lpr_state_unlock(&lpr_file_image_cache_lock);
-}
-
-void lpr_file_image_cache_pause(void)
-{
-    lpr_state_lock(&lpr_file_image_cache_lock);
-    if (lpr_file_image_cache_pause_count == 0) {
-        /* A mapped VMA retains its VMO independently of this descriptor-only
-         * lookup cache.  Drop the cache before a manifest reserves transient
-         * transfer leases so cached ELF images cannot exhaust native FDs. */
-        lpr_file_image_cache_clear_locked();
-    }
-    lpr_file_image_cache_pause_count++;
-    lpr_state_unlock(&lpr_file_image_cache_lock);
-}
-
-void lpr_file_image_cache_resume(void)
-{
-    lpr_state_lock(&lpr_file_image_cache_lock);
-    if (lpr_file_image_cache_pause_count != 0) {
-        lpr_file_image_cache_pause_count--;
-    }
-    lpr_state_unlock(&lpr_file_image_cache_lock);
-}
-
-void lpr_file_image_cache_after_fork_child(void)
-{
-    __atomic_store_n(&lpr_file_image_cache_lock, 0u, __ATOMIC_RELEASE);
-    lpr_file_image_cache_pause_count = 0;
-    lpr_file_image_cache_clear();
-}
-
-static lpr_file_image_cache_entry_t *lpr_file_image_cache_acquire(
-    uint64_t handle,
-    uint64_t length,
-    uint64_t *out_generation)
-{
-    uint64_t generation = 0;
-    if (out_generation != 0) {
-        *out_generation = 0;
-    }
-    const int generation_status =
-        lpr_filed_live_object_generation(handle, &generation);
-    lpr_state_lock(&lpr_file_image_cache_lock);
-    if (lpr_file_image_cache_pause_count != 0) {
-        lpr_state_unlock(&lpr_file_image_cache_lock);
-        return 0;
-    }
-    lpr_file_image_cache_entry_t *hit = 0;
-    for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
-        lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
-        if (!entry->active || entry->handle != handle) {
-            continue;
-        }
-        if (generation_status != 0 ||
-            entry->object_generation != generation ||
-            entry->length != length)
-        {
-            if (entry->vmo_fd >= 16) {
-                (void)lpr_pacha_syscall1(
-                    PACHAOS_SYSCALL_FD_CLOSE, entry->vmo_fd);
-            }
-            lpr_memset(entry, 0, sizeof(*entry));
-            continue;
-        }
-        entry->clock = ++lpr_file_image_cache_clock;
-        hit = entry;
-        break;
-    }
-    if (hit == 0) {
-        lpr_state_unlock(&lpr_file_image_cache_lock);
-    } else if (out_generation != 0) {
-        *out_generation = generation;
-    }
-    return hit;
-}
-
-static void lpr_file_image_cache_release(void)
-{
-    lpr_state_unlock(&lpr_file_image_cache_lock);
-}
-
-static void lpr_file_image_cache_store(
-    uint64_t handle,
-    uint64_t object_generation,
-    uint64_t length,
-    int64_t vmo_fd)
-{
-    if (handle == 0 || object_generation == 0 || length == 0 || vmo_fd < 16) {
-        return;
-    }
-    lpr_state_lock(&lpr_file_image_cache_lock);
-    if (lpr_file_image_cache_pause_count != 0) {
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
-        lpr_state_unlock(&lpr_file_image_cache_lock);
-        return;
-    }
-    lpr_file_image_cache_entry_t *slot = 0;
-    lpr_file_image_cache_entry_t *oldest = 0;
-    for (uint64_t i = 0; i < LPR_FILE_IMAGE_CACHE_ENTRIES; ++i) {
-        lpr_file_image_cache_entry_t *entry = &lpr_file_image_cache[i];
-        if (entry->active &&
-            entry->handle == handle &&
-            entry->object_generation == object_generation &&
-            entry->length == length)
-        {
-            (void)lpr_pacha_syscall1(
-                PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
-            entry->clock = ++lpr_file_image_cache_clock;
-            lpr_state_unlock(&lpr_file_image_cache_lock);
-            return;
-        }
-        if (!entry->active && slot == 0) {
-            slot = entry;
-        }
-        if (entry->active && (oldest == 0 || entry->clock < oldest->clock)) {
-            oldest = entry;
-        }
-    }
-    if (slot == 0) {
-        slot = oldest;
-        if (slot != 0) {
-            if (slot->vmo_fd >= 16) {
-                (void)lpr_pacha_syscall1(
-                    PACHAOS_SYSCALL_FD_CLOSE, slot->vmo_fd);
-            }
-            lpr_memset(slot, 0, sizeof(*slot));
-        }
-    }
-    if (slot != 0) {
-        slot->active = 1;
-        slot->vmo_fd = (uint32_t)vmo_fd;
-        slot->handle = handle;
-        slot->object_generation = object_generation;
-        slot->length = length;
-        slot->clock = ++lpr_file_image_cache_clock;
-    } else {
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
-    }
-    lpr_state_unlock(&lpr_file_image_cache_lock);
-}
-
 static int64_t lpr_linux_pacha_status_to_errno(int64_t status)
 {
     return pacha_kernel_status_to_errno(status);
@@ -2223,6 +2016,25 @@ static int64_t lpr_dispatch_arch_prctl(uint64_t code, uint64_t value)
     }
 }
 
+static int64_t lpr_map_private_zero_range(
+    uint64_t addr, uint64_t map_len, uint64_t prot,
+    uint64_t map_flags, int executable)
+{
+    /* An anonymous reservation has an unrestricted EXEC ceiling. A file's
+     * zero tail must instead retain the authority established for that file,
+     * including when mprotect runs after the initial non-executable mmap. */
+    const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE | (executable ? PACHA_FD_RIGHT_MAP_EXEC : 0);
+    const int64_t vmo = lpr_pacha_syscall3(PACHAOS_SYSCALL_VMO_CREATE,
+        map_len, rights, PACHA_FD_FLAG_PRIVATE | PACHA_FD_FLAG_CLOEXEC);
+    if (vmo < 16) return vmo;
+    const int64_t mapped = lpr_drm_native_mmap(vmo, addr, map_len, prot,
+        (map_flags | PACHAOS_MMAP_PRIVATE) &
+            ~(PACHAOS_MMAP_ANONYMOUS | PACHAOS_MMAP_SHARED), 0);
+    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, vmo);
+    return mapped;
+}
+
 static int64_t lpr_map_private_file_image(
     uint64_t vmo_fd,
     uint64_t addr,
@@ -2230,7 +2042,8 @@ static int64_t lpr_map_private_file_image(
     uint64_t file_map_len,
     uint64_t prot,
     uint64_t map_flags,
-    uint64_t offset)
+    uint64_t offset,
+    int executable)
 {
     if (file_map_len == map_len) {
         return lpr_drm_native_mmap(
@@ -2241,15 +2054,8 @@ static int64_t lpr_map_private_file_image(
             map_flags,
             offset);
     }
-    const uint64_t reservation_flags =
-        (map_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED;
-    const int64_t reservation = lpr_drm_native_mmap(
-        0,
-        addr,
-        map_len,
-        prot,
-        reservation_flags,
-        0);
+    const int64_t reservation = lpr_map_private_zero_range(
+        addr, map_len, prot, map_flags, executable);
     if (reservation < 4096) {
         return reservation;
     }
@@ -2370,7 +2176,6 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                     mapped);
                 return lpr_linux_pacha_status_to_errno(mapped);
             }
-            lpr_page_cache_clear();
             lpr_shared_file_mapping_active = 1;
             lpr_trace_mmap_call("mmap", addr, len, prot, flags, fd, offset, mapped);
             return mapped;
@@ -2394,68 +2199,72 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         const uint64_t direct_map_flags = private_file_map_flags;
         uint64_t profile_stage = 0;
         lpr_filed_backend_t *private_file = lpr_filed_backend(fd);
+        const int executable = (prot & LPR_LINUX_PROT_EXEC) != 0;
         const uint64_t requested_end =
             offset <= UINT64_MAX - map_len ? offset + map_len : 0;
-        if (private_file != 0 &&
-            (private_file->object_generation == 0 ||
-             requested_end == 0 ||
-             requested_end > private_file->stat_size))
-        {
-            /* Page rounding alone can exceed EOF. Reuse the size only when
-             * FileD's live generation still validates the stat snapshot;
-             * a write/truncate through another handle must refresh it. */
-            uint64_t live_generation = 0;
-            const int size_current =
-                private_file->object_generation != 0 &&
-                lpr_filed_live_object_generation(
-                    private_file->handle, &live_generation) == 0 &&
-                live_generation == private_file->object_generation;
-            if (!size_current) {
-                lpr_linux_stat_t stat_snapshot;
-                lpr_memset(&stat_snapshot, 0, sizeof(stat_snapshot));
-                (void)lpr_backend_fstat(
-                    fd, (uint64_t)(uintptr_t)&stat_snapshot);
-            }
-        }
-        private_file = lpr_filed_backend(fd);
-        const uint64_t whole_file_bytes = private_file != 0 ?
-            private_file->stat_size : 0;
+        lpr_linux_stat_t fresh_stat;
+        const int64_t fresh_stat_status = private_file ?
+            lpr_linux_fstat(fd, (uint64_t)(uintptr_t)&fresh_stat) :
+            -LPR_LINUX_EBADF;
+        const int fresh_stat_valid = !fresh_stat_status && fresh_stat.st_size >= 0;
+        /* File size is operation-local metadata, never an LPR cache validated
+         * by a personality generation table. Linux owns coherence. */
+        const uint64_t whole_file_bytes = fresh_stat_valid ?
+            (uint64_t)fresh_stat.st_size : 0;
         const uint64_t whole_file_map_len =
             lpr_mmap_page_align_up(whole_file_bytes);
         const uint8_t split_file_image =
             private_file != 0 &&
-            private_file->object_generation != 0 &&
+            fresh_stat_valid &&
             requested_end != 0 &&
             whole_file_bytes != 0 &&
             offset < whole_file_map_len &&
             requested_end > whole_file_map_len;
         const uint64_t direct_file_map_len = split_file_image ?
             whole_file_map_len - offset : map_len;
+        /* Each mmap needs only its file range, not a second complete image
+         * for every PT_LOAD. Whole-file snapshots multiply LLVM-sized images
+         * and keep unrelated pages alive for the lifetime of each VMA. */
+        const uint64_t snapshot_offset = offset < whole_file_bytes ? offset : 0;
+        const uint64_t snapshot_length = offset < whole_file_bytes ? direct_file_map_len :
+            (whole_file_bytes < 4096 ? whole_file_bytes : 4096);
+        int64_t authorized_vmo = -1;
+        uint64_t authorized_loaded = 0;
+        if (executable) {
+            /* A local anonymous copy cannot establish the file's execution
+             * authority. Obtain a positive FILE_VMO EXEC grant before any
+             * split/EOF reservation, and never hide an uncertain grant with
+             * the non-executable read-copy fallback below. */
+            if (fresh_stat_status) return fresh_stat_status;
+            if (!fresh_stat_valid || !whole_file_bytes || !whole_file_map_len)
+                return -LPR_LINUX_EINVAL;
+            if (!requested_end) return -LPR_LINUX_EOVERFLOW;
+            authorized_vmo = lpr_linux_file_vmo(
+                fd, snapshot_offset, snapshot_length, 1, &authorized_loaded);
+            if (authorized_vmo < 16)
+                return authorized_vmo < 0 ? authorized_vmo : -LPR_LINUX_EIO;
+        }
         if (split_file_image) {
             lpr_startup_profile_mmap_route(
                 LPR_STARTUP_MMAP_ROUTE_PAST_FILE_IMAGE);
         }
         const uint8_t anonymous_eof_tail =
             private_file != 0 &&
-            private_file->object_generation != 0 &&
+            fresh_stat_valid &&
             requested_end != 0 &&
             whole_file_bytes != 0 &&
             offset == whole_file_map_len &&
             requested_end > whole_file_map_len;
         if (anonymous_eof_tail) {
+            if (authorized_vmo >= 16) {
+                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, authorized_vmo);
+                authorized_vmo = -1;
+            }
             lpr_startup_profile_mmap_route(
                 LPR_STARTUP_MMAP_ROUTE_PAST_FILE_IMAGE);
             profile_stage = lpr_startup_profile_stage_begin();
-            mapped = lpr_drm_native_mmap(
-                0,
-                addr,
-                map_len,
-                initial_prot,
-                ((direct_map_flags | PACHAOS_MMAP_ANONYMOUS |
-                  PACHAOS_MMAP_FIXED) &
-                 ~(PACHAOS_MMAP_SHARED |
-                   PACHAOS_MMAP_FIXED_NOREPLACE)),
-                0);
+            mapped = lpr_map_private_zero_range(
+                addr, map_len, initial_prot, direct_map_flags, executable);
             lpr_startup_profile_stage_end(
                 LPR_STARTUP_MMAP_STAGE_NATIVE_MMAP, profile_stage);
             if (mapped >= 4096) {
@@ -2465,55 +2274,25 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 mapped_prot = initial_prot;
                 goto private_file_mapping_ready;
             }
+            return lpr_linux_pacha_status_to_errno(mapped);
         }
         if (private_file != 0 &&
-            private_file->object_generation != 0 &&
+            fresh_stat_valid &&
             requested_end != 0 &&
             whole_file_bytes != 0 &&
             (whole_file_map_len >= requested_end || split_file_image))
         {
-            uint64_t live_generation = 0;
-            profile_stage = lpr_startup_profile_stage_begin();
-            lpr_file_image_cache_entry_t *image =
-                lpr_file_image_cache_acquire(
-                    private_file->handle,
-                    whole_file_bytes,
-                    &live_generation);
-            lpr_startup_profile_stage_end(
-                LPR_STARTUP_MMAP_STAGE_CACHE_LOOKUP, profile_stage);
-            if (image != 0) {
-                profile_stage = lpr_startup_profile_stage_begin();
-                mapped = lpr_map_private_file_image(
-                    image->vmo_fd,
-                    addr,
-                    map_len,
-                    direct_file_map_len,
-                    initial_prot,
-                    direct_map_flags,
-                    offset);
-                lpr_startup_profile_stage_end(
-                    LPR_STARTUP_MMAP_STAGE_NATIVE_MMAP, profile_stage);
-                if (mapped >= 4096 && split_file_image) {
-                    lpr_startup_profile_mmap_route(
-                        LPR_STARTUP_MMAP_ROUTE_SPLIT_IMAGE_AND_ANON_TAIL);
-                }
-                lpr_file_image_cache_release();
-                if (mapped >= 4096) {
-                    lpr_startup_profile_mmap_route(
-                        LPR_STARTUP_MMAP_ROUTE_CACHE_HIT);
-                    const uint64_t available = whole_file_bytes > offset ?
-                        whole_file_bytes - offset : 0;
-                    done = available < len ? available : len;
-                    mapped_prot = initial_prot;
-                    goto private_file_mapping_ready;
-                }
-                lpr_startup_profile_mmap_route(
-                    LPR_STARTUP_MMAP_ROUTE_CACHE_MAP_FAILED);
-            }
             uint64_t loaded = 0;
             profile_stage = lpr_startup_profile_stage_begin();
-            int64_t file_vmo_fd = lpr_linux_file_vmo(
-                fd, 0, whole_file_bytes, &loaded);
+            int64_t file_vmo_fd;
+            if (authorized_vmo >= 16) {
+                file_vmo_fd = authorized_vmo;
+                authorized_vmo = -1;
+                loaded = authorized_loaded;
+            } else {
+                file_vmo_fd = lpr_linux_file_vmo(
+                    fd, snapshot_offset, snapshot_length, 0, &loaded);
+            }
             const uint64_t file_vmo_cycles = lpr_startup_profile_stage_end(
                 LPR_STARTUP_MMAP_STAGE_FILE_VMO, profile_stage);
             lpr_startup_profile_mmap_backend(fd, 1, file_vmo_cycles);
@@ -2526,7 +2305,8 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                     direct_file_map_len,
                     initial_prot,
                     direct_map_flags,
-                    offset);
+                    0,
+                    executable);
                 lpr_startup_profile_stage_end(
                     LPR_STARTUP_MMAP_STAGE_NATIVE_MMAP, profile_stage);
                 if (mapped >= 4096 && split_file_image) {
@@ -2536,19 +2316,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 if (mapped >= 4096) {
                     lpr_startup_profile_mmap_route(
                         LPR_STARTUP_MMAP_ROUTE_FILE_VMO_MAPPED);
-                    live_generation = 0;
-                    if (lpr_filed_live_object_generation(
-                            private_file->handle,
-                            &live_generation) == 0)
-                    {
-                        lpr_file_image_cache_store(
-                            private_file->handle,
-                            live_generation,
-                            whole_file_bytes,
-                            file_vmo_fd);
-                        file_vmo_fd = -1;
-                    }
-                    const uint64_t available = loaded > offset ? loaded - offset : 0;
+                    const uint64_t available = loaded;
                     done = available < len ? available : len;
                     mapped_prot = initial_prot;
                     if (file_vmo_fd >= 16) {
@@ -2563,6 +2331,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
                 (void)lpr_pacha_syscall1(
                     PACHAOS_SYSCALL_FD_CLOSE,
                     (uint64_t)(uint32_t)file_vmo_fd);
+                return lpr_linux_pacha_status_to_errno(mapped);
             } else {
                 lpr_startup_profile_mmap_route(
                     LPR_STARTUP_MMAP_ROUTE_FILE_VMO_RPC_FAILED);
@@ -2570,7 +2339,7 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         } else if (private_file == 0) {
             lpr_startup_profile_mmap_route(
                 LPR_STARTUP_MMAP_ROUTE_NO_FILED_BACKEND);
-        } else if (private_file->object_generation == 0) {
+        } else if (!fresh_stat_valid) {
             lpr_startup_profile_mmap_route(
                 LPR_STARTUP_MMAP_ROUTE_NO_GENERATION);
         } else if (requested_end == 0) {
@@ -2583,14 +2352,16 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
             lpr_startup_profile_mmap_route(
                 LPR_STARTUP_MMAP_ROUTE_PAST_FILE_IMAGE);
         }
+        if (authorized_vmo >= 16)
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, authorized_vmo);
+        if (executable) return -LPR_LINUX_EINVAL;
         lpr_startup_profile_mmap_route(
             LPR_STARTUP_MMAP_ROUTE_LOCAL_FALLBACK);
         const uint64_t vmo_rights =
             PACHA_FD_RIGHT_CLOSE |
             PACHA_FD_RIGHT_TRANSFER |
             PACHA_FD_RIGHT_MAP_READ |
-            PACHA_FD_RIGHT_MAP_WRITE |
-            PACHA_FD_RIGHT_MAP_EXEC;
+            PACHA_FD_RIGHT_MAP_WRITE;
         profile_stage = lpr_startup_profile_stage_begin();
         vmo_fd = lpr_pacha_syscall3(
             PACHAOS_SYSCALL_VMO_CREATE,
@@ -2650,45 +2421,10 @@ int64_t lpr_backend_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fl
         mapped_prot = initial_prot;
         if (mapped < 4096) {
             lpr_trace_mmap_error("direct_vmo_mmap", addr, len, prot, flags, fd, offset, mapped);
-            profile_stage = lpr_startup_profile_stage_begin();
-            mapped = lpr_drm_native_mmap(
-                0,
-                addr,
-                map_len,
-                load_prot,
-                (pacha_flags | PACHAOS_MMAP_ANONYMOUS) & ~PACHAOS_MMAP_SHARED,
-                0);
-            lpr_startup_profile_stage_end(
-                LPR_STARTUP_MMAP_STAGE_NATIVE_MMAP, profile_stage);
-            mapped_prot = load_prot;
-            if (mapped < 4096) {
-                lpr_trace_mmap_error("target_mmap", addr, len, prot, flags, fd, offset, mapped);
-                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
-                return lpr_linux_pacha_status_to_errno(mapped);
-            }
-            profile_stage = lpr_startup_profile_stage_begin();
-            const int64_t source = lpr_drm_native_mmap(
-                (uint64_t)(uint32_t)vmo_fd,
-                0,
-                map_len,
-                PACHAOS_PROT_READ,
-                PACHAOS_MMAP_SHARED,
-                0);
-            lpr_startup_profile_stage_end(
-                LPR_STARTUP_MMAP_STAGE_NATIVE_MMAP, profile_stage);
-            if (source < 4096) {
-                lpr_trace_mmap_error("source_mmap", addr, len, prot, flags, fd, offset, source);
-                (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
-                (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)mapped, map_len);
-                return lpr_linux_pacha_status_to_errno(source);
-            }
-            profile_stage = lpr_startup_profile_stage_begin();
-            if (done != 0) {
-                lpr_memcpy((void *)(uintptr_t)mapped, (const void *)(uintptr_t)source, (size_t)done);
-            }
-            lpr_startup_profile_stage_end(
-                LPR_STARTUP_MMAP_STAGE_FALLBACK_COPY, profile_stage);
-            (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, (uint64_t)source, map_len);
+            /* Copying into a fresh anonymous mapping would silently widen
+             * the file's maximum protection after a capability map failed. */
+            (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
+            return lpr_linux_pacha_status_to_errno(mapped);
         }
         if (vmo_fd >= 16) {
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)vmo_fd);
@@ -2714,11 +2450,17 @@ private_file_mapping_ready:
         }
         if (final_prot != mapped_prot) {
             profile_stage = lpr_startup_profile_stage_begin();
-            const int64_t protect_status = lpr_pacha_syscall3(
+            const uint64_t protect_prefix = split_file_image ? direct_file_map_len : map_len;
+            int64_t protect_status = lpr_pacha_syscall3(
                 PACHAOS_SYSCALL_MPROTECT,
                 (uint64_t)mapped,
-                map_len,
+                protect_prefix,
                 final_prot);
+            /* A split file image and its zero tail are distinct native VMAs.
+             * Protect each established range, not a single spanning range. */
+            if (!protect_status && protect_prefix < map_len)
+                protect_status = lpr_pacha_syscall3(PACHAOS_SYSCALL_MPROTECT,
+                    (uint64_t)mapped + protect_prefix, map_len - protect_prefix, final_prot);
             lpr_startup_profile_stage_end(
                 LPR_STARTUP_MMAP_STAGE_MPROTECT, profile_stage);
             if (protect_status != 0) {
@@ -2863,6 +2605,9 @@ static int64_t lpr_sys_write(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
     return lpr_linux_write(a0, a1, a2);
 }
 static int64_t lpr_sys_open(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_openat(LPR_LINUX_AT_FDCWD, a0, a1, a2); }
+/* Existing Linux tools still issue mknod, not mknodat. Both must enter the
+ * same authenticated direct-queue path instead of returning ENOSYS here. */
+static int64_t lpr_sys_mknod(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_mknodat(LPR_LINUX_AT_FDCWD, a0, a1, a2); }
 static int64_t lpr_sys_close(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_close(a0); }
 static int64_t lpr_sys_close_range(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_close_range(a0, a1, a2); }
 static int64_t lpr_sys_sched_getaffinity(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_dispatch_sched_getaffinity(a0, a1, a2); }
@@ -3526,6 +3271,23 @@ static int64_t lpr_sys_pipe2(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
 static int64_t lpr_sys_recvmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_READ, lpr_linux_recvmmsg(a0, a1, a2, a3, a4)); }
 static int64_t lpr_sys_prlimit64(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_linux_prlimit64(a0, a1, a2, a3); }
 static int64_t lpr_sys_sendmmsg(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a4; (void)a5; return lpr_epoll_note_result(a0, LPR_EPOLL_IO_WRITE, lpr_linux_sendmmsg(a0, a1, a2, a3)); }
+static int64_t lpr_sys_kcmp(uint64_t pid1, uint64_t pid2, uint64_t type,
+    uint64_t fd1, uint64_t fd2, uint64_t unused)
+{
+    (void)unused;
+    /* Mesa checks KCMP_FILE to distinguish a dup from a second DRM open.
+     * Our FD table already owns that OFD identity, so no kernel operation or
+     * cross-process inspection is needed for the self-comparison it uses. */
+    if (pid1 != (uint64_t)lpr_linux_getpid() || pid2 != pid1)
+        return -LPR_LINUX_ESRCH;
+    if (type != 0) return -LPR_LINUX_EINVAL;
+    if (fd1 >= LPR_LINUX_FD_LIMIT || fd2 >= LPR_LINUX_FD_LIMIT)
+        return -LPR_LINUX_EBADF;
+    lpr_fd_arrays_init();
+    const int comparison = lpr_fd_table_compare_ofd(&lpr_control_fd_table,
+        (lpr_linux_fd_t)fd1, (lpr_linux_fd_t)fd2);
+    return comparison < 0 ? -LPR_LINUX_EBADF : comparison;
+}
 static int64_t lpr_sys_getrandom(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a3; (void)a4; (void)a5; return lpr_linux_getrandom(a0, a1, a2); }
 static int64_t lpr_sys_memfd_create(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) { (void)a2; (void)a3; (void)a4; (void)a5; return lpr_linux_memfd_create(a0, a1); }
 static int64_t lpr_sys_membarrier(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5)
@@ -3633,6 +3395,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_FCHDIR, "fchdir", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_fchdir, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RENAME, "rename", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_rename, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MKDIR, "mkdir", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_mkdir, 0),
+    LPR_SYSCALL(LPR_LINUX_SYS_MKNOD, "mknod", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_mknod, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_RMDIR, "rmdir", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_rmdir, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_LINK, "link", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_link, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_UNLINK, "unlink", LPR_LINUX_SYSCALL_CLASS_VFS_PATH, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_unlink, 0),
@@ -3735,6 +3498,7 @@ static lpr_syscall_entry_t lpr_syscall_table[LPR_LINUX_SYS_LAST + 1u] = {
     LPR_SYSCALL(LPR_LINUX_SYS_PRLIMIT64, "prlimit64", LPR_LINUX_SYSCALL_CLASS_PROCESS, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_prlimit64, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SYNCFS, "syncfs", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_syncfs, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_SENDMMSG, "sendmmsg", LPR_LINUX_SYSCALL_CLASS_FD_IO, LPR_LINUX_SYSCALL_BACKEND_COORDINATOR, lpr_sys_sendmmsg, LPR_SYSCALL_TRACE),
+    LPR_SYSCALL(LPR_LINUX_SYS_KCMP, "kcmp", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_LOCAL_STATE, lpr_sys_kcmp, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_GETRANDOM, "getrandom", LPR_LINUX_SYSCALL_CLASS_TIME_RANDOM, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_getrandom, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MEMFD_CREATE, "memfd_create", LPR_LINUX_SYSCALL_CLASS_FD_CONTROL, LPR_LINUX_SYSCALL_BACKEND_FILED, lpr_sys_memfd_create, 0),
     LPR_SYSCALL(LPR_LINUX_SYS_MEMBARRIER, "membarrier", LPR_LINUX_SYSCALL_CLASS_MEMORY, LPR_LINUX_SYSCALL_BACKEND_PACHA_DIRECT, lpr_sys_membarrier, 0),
@@ -3824,6 +3588,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_FCHDIR].handler = lpr_sys_fchdir;
     lpr_syscall_table[LPR_LINUX_SYS_RENAME].handler = lpr_sys_rename;
     lpr_syscall_table[LPR_LINUX_SYS_MKDIR].handler = lpr_sys_mkdir;
+    lpr_syscall_table[LPR_LINUX_SYS_MKNOD].handler = lpr_sys_mknod;
     lpr_syscall_table[LPR_LINUX_SYS_RMDIR].handler = lpr_sys_rmdir;
     lpr_syscall_table[LPR_LINUX_SYS_LINK].handler = lpr_sys_link;
     lpr_syscall_table[LPR_LINUX_SYS_UNLINK].handler = lpr_sys_unlink;
@@ -3924,6 +3689,7 @@ static void lpr_syscall_table_init(void)
     lpr_syscall_table[LPR_LINUX_SYS_PRLIMIT64].handler = lpr_sys_prlimit64;
     lpr_syscall_table[LPR_LINUX_SYS_SYNCFS].handler = lpr_sys_syncfs;
     lpr_syscall_table[LPR_LINUX_SYS_SENDMMSG].handler = lpr_sys_sendmmsg;
+    lpr_syscall_table[LPR_LINUX_SYS_KCMP].handler = lpr_sys_kcmp;
     lpr_syscall_table[LPR_LINUX_SYS_GETRANDOM].handler = lpr_sys_getrandom;
     lpr_syscall_table[LPR_LINUX_SYS_MEMFD_CREATE].handler = lpr_sys_memfd_create;
     lpr_syscall_table[LPR_LINUX_SYS_MEMBARRIER].handler = lpr_sys_membarrier;
@@ -4083,7 +3849,8 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     const int gui_main = lpr_gui_selected && !lpr_gui_dumped &&
         nr != LPR_LINUX_SYS_RT_SIGRETURN &&
         (uint64_t)lpr_linux_gettid() == lpr_gui_tid;
-    if (gui_main && nr == LPR_LINUX_SYS_EXIT_GROUP) lpr_gui_dump();
+    if (gui_main && (nr == LPR_LINUX_SYS_EXIT_GROUP || nr == LPR_LINUX_SYS_EXIT))
+        lpr_gui_dump();
 #endif
 #if defined(LPR_SYSCALL_PROFILE) && LPR_SYSCALL_PROFILE
     lpr_syscall_profile_enable();
@@ -4126,7 +3893,6 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
     const int trace_metrics = pacha_trace_enabled(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_CLASS_METRIC);
     if (trace_metrics && (nr == LPR_LINUX_SYS_EXIT || nr == LPR_LINUX_SYS_EXIT_GROUP)) {
         lpr_trace_syscall_record(nr, 0, 0);
-        lpr_linux_readv_cache_trace_dump();
         lpr_trace_syscall_dump(nr);
 #if defined(LPR_SYSCALL_PROFILE) && LPR_SYSCALL_PROFILE
         lpr_netd_profile_dump();
@@ -4171,7 +3937,18 @@ int64_t lpr_dispatch_syscall_frame(struct lpr_linux_user_frame *frame,
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
         /* Delivering a signal can abandon this stack, so finish the span
          * before every delivery/restart point. Count restarted attempts. */
-        if (gui_main) lpr_gui_record(lpr_gui_kind(nr, a3), gui_start, pacha_trace_read_tsc());
+        if (gui_main) {
+            const uint64_t gui_end = pacha_trace_read_tsc();
+            lpr_gui_server_slow(nr, a0, a1, gui_start, gui_end, result);
+            lpr_gui_record(lpr_gui_kind(nr, a3), gui_start, gui_end);
+            if (nr == LPR_LINUX_SYS_FORK || nr == LPR_LINUX_SYS_VFORK ||
+                nr == LPR_LINUX_SYS_CLONE)
+                lpr_gui_profile_process((unsigned)nr, gui_start, result);
+            if (nr == LPR_LINUX_SYS_PREAD64)
+                lpr_gui_pread(a0, gui_end - gui_start, result > 0 ? (uint64_t)result : 0);
+            if (lpr_gui_kind(nr, a3) == 4)
+                lpr_gui_stat(nr, a0, a1, gui_end - gui_start, result);
+        }
 #endif
         if (end_cycles >= start_cycles) cycles += end_cycles - start_cycles;
         if (result != LPR_WAIT_RESTART_SYSCALL) break;

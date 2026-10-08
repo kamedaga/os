@@ -341,6 +341,7 @@ fn maybeHandoffToRecvWaiter(
     const target = handoff_target orelse {
         return null;
     };
+    if (!scheduler.threadWakeTargetIsLive(target.thread_index, target.thread_generation, target.owner)) return null;
     const start = ipc_metric.timestamp();
     defer ipc_metric.record(.handoff, start);
     if (!scheduler.handoffToReadyThreadGenerationWithRax(
@@ -383,6 +384,12 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
             const wake_start = ipc_metric.timestamp();
             var handoff_target: ?kernel.ThreadWakeTarget = null;
             if (!wakeIpcWaitersForSendFd(h, state, proc, send_fd, &handoff_target)) break :blk sc.syscall_err_invalid;
+            // Fast ring producers can publish while the receiver is already
+            // runnable. No wait token exists then, but its last confirmed
+            // receive still identifies a useful handoff without waking it.
+            if (handoff_target == null) {
+                handoff_target = state.ipcReceiverHandoffHintForSendFd(proc, send_fd);
+            }
             ipc_metric.record(.send_wake, wake_start);
             if (maybeHandoffToRecvWaiter(h, frame, handoff_target, sc.syscall_ok)) |handoff_rax| {
                 break :blk handoff_rax;

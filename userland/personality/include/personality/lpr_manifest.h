@@ -8,13 +8,17 @@
 enum {
     LPR_MANIFEST_FLAG_DEFAULT_STDIO = 1ull << 0,
     LPR_MANIFEST_FLAG_SUPERVISOR = 1ull << 1,
+    /* Open the configured default stdio terminal without making it the
+     * initial process's controlling terminal.  Session managers such as
+     * init can then give the inherited terminal to a child after setsid(),
+     * using the normal TIOCSCTTY contract. */
+    LPR_MANIFEST_FLAG_STDIO_NOCTTY = 1ull << 2,
 
     LPR_MANIFEST_ENTRY_OPEN = 1u,
 
     LPR_MANIFEST_CAPABILITY_CWD_LEASE = 1u << 0,
 
     LPR_MANIFEST_CTTY_BYTES = 64u,
-    LPR_MANIFEST_CWD_BYTES = 480u,
 };
 
 #define LPR_MANIFEST_MAGIC 0x3154464e4d52504cull
@@ -81,7 +85,6 @@ typedef struct lpr_manifest {
     uint64_t supervisor_bootstrap_fd;
     uint64_t owner_generation;
     char ctty[LPR_MANIFEST_CTTY_BYTES];
-    char cwd[LPR_MANIFEST_CWD_BYTES];
 } lpr_manifest_t;
 
 typedef struct lpr_manifest_layout {
@@ -128,4 +131,4 @@ static inline lpr_manifest_capability_t *lpr_manifest_capabilities(lpr_manifest_
 _Static_assert(sizeof(lpr_manifest_entry_t) == 32, "lpr manifest entry size");
 _Static_assert(sizeof(lpr_manifest_ofd_t) == 64, "lpr manifest ofd size");
 _Static_assert(sizeof(lpr_manifest_capability_t) == 24, "lpr manifest capability size");
-_Static_assert(sizeof(lpr_manifest_t) == 752, "lpr manifest header size");
+_Static_assert(sizeof(lpr_manifest_t) == 272, "lpr manifest header size");

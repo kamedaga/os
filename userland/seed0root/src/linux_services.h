@@ -10,9 +10,17 @@ typedef struct seed0root_linux_service {
     uint32_t filed_rights;
     uint32_t credential_rights;
     uint64_t clients;
+    uint64_t manifest_flags;
     const char *ctty;
     unsigned argc;
-    const char *argv[8];
+    const char *argv[10];
+    unsigned inherit_count;
+    struct {
+        int source_fd;
+        uint32_t target_fd;
+        uint64_t rights;
+        uint32_t flags;
+    } inherit[3];
 } seed0root_linux_service_t;
 
 #define SEED0ROOT_FILE_NAMESPACE (FILED_RIGHT_LOOKUP | FILED_RIGHT_READ | FILED_RIGHT_WRITE | \
@@ -41,6 +49,10 @@ static const seed0root_linux_service_t seed0root_linux_services[] = {
 #else
     { .account = "root", .filed_rights = SEED0ROOT_FILE_NAMESPACE,
       .clients = SEED0ROOT_DESKTOP_CLIENTS, .ctty = "/dev/hvc0",
+      /* init passes the inherited console to a new session.  It must not
+       * consume that terminal as its own CTTY before the inittab child can
+       * claim it through the standard setsid/TIOCSCTTY sequence. */
+      .manifest_flags = LPR_MANIFEST_FLAG_STDIO_NOCTTY,
 #if defined(SEED0ROOT_CREDENTIAL_TEST) && SEED0ROOT_CREDENTIAL_TEST
       .argc = 2, .argv = {"/cmd/lpr_credentials.elf", "--nonzero"} },
 #else

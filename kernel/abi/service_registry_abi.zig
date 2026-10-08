@@ -1,7 +1,6 @@
 const process_abi = @import("process_abi.zig");
 
 pub const magic: u64 = 0x53525643; // "SRVC"
-pub const version: u64 = 1;
 pub const page_va: u64 = process_abi.auxPageVa(5);
 pub const max_entries: usize = 8;
 pub const dynamic_endpoint_id_base: u64 = 0x80;
@@ -26,7 +25,7 @@ pub const ServiceEntry = extern struct {
 
 pub const RegistryPage = extern struct {
     magic: u64,
-    version: u64,
+    size: u64,
     entry_count: u64,
     reserved0: u64,
     entries: [max_entries]ServiceEntry,
@@ -44,13 +43,13 @@ pub fn initPage(base_va: u64) void {
     clearPage(base_va);
     const page: *volatile RegistryPage = @ptrFromInt(base_va);
     page.magic = magic;
-    page.version = version;
+    page.size = @sizeOf(RegistryPage);
     page.entry_count = 0;
 }
 
 pub fn addService(base_va: u64, kind: ServiceKind, endpoint_id: u64) void {
     const page: *volatile RegistryPage = @ptrFromInt(base_va);
-    if (page.magic != magic or page.version != version) initPage(base_va);
+    if (page.magic != magic or page.size != @sizeOf(RegistryPage)) initPage(base_va);
     if (page.entry_count >= max_entries) return;
     const index: usize = @intCast(page.entry_count);
     const slot = &page.entries[index];
@@ -59,4 +58,25 @@ pub fn addService(base_va: u64, kind: ServiceKind, endpoint_id: u64) void {
     slot.endpoint_id = endpoint_id;
     slot.flags = service_flag_process_slot_compat;
     page.entry_count += 1;
+}
+
+comptime {
+    if (@sizeOf(RegistryPage) != 288)
+        @compileError("service registry record layout mismatch");
+}
+
+test "registry publisher and validator use the complete record extent" {
+    const std = @import("std");
+    var bytes: [4096]u8 align(@alignOf(RegistryPage)) = undefined;
+    const base = @intFromPtr(&bytes);
+    initPage(base);
+    const page: *RegistryPage = @ptrCast(&bytes);
+    try std.testing.expectEqual(@as(u64, @sizeOf(RegistryPage)), page.size);
+    addService(base, .window, 42);
+    try std.testing.expectEqual(@as(u64, 1), page.entry_count);
+    page.size -= 1;
+    addService(base, .gpu, 43);
+    try std.testing.expectEqual(@as(u64, @sizeOf(RegistryPage)), page.size);
+    try std.testing.expectEqual(@as(u64, 1), page.entry_count);
+    try std.testing.expectEqual(@as(u64, 43), page.entries[0].endpoint_id);
 }

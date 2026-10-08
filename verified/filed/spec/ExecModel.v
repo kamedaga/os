@@ -1,5 +1,5 @@
 From Stdlib Require Import Bool.Bool Lists.List Strings.String ZArith.ZArith.
-From Pacha.Filed Require Import FiledTypes VfsModel.
+From Pacha.Filed Require Import FiledTypes.
 
 Import ListNotations.
 Open Scope Z_scope.
@@ -262,9 +262,9 @@ Definition build_fd_inherit_plan
   filter (fd_inherited request) (er_inherit_fds request).
 
 Definition build_handle_inherit_plan
-    (handles : list vfs_handle)
+    (handles : list exec_handle)
   : list handle_id :=
-  map vh_id (filter handle_inheritable handles).
+  map eh_id (filter handle_inheritable handles).
 
 Definition auxv_entry_with_key
     (key : auxv_key)
@@ -348,7 +348,7 @@ Definition build_stack_plan
 Definition build_exec_plan_with_handles
     (request : exec_request)
     (image : elf_image)
-    (handles : list vfs_handle)
+    (handles : list exec_handle)
   : exec_result :=
   if validate_elf_header image then
     match build_mapping_plan request image with

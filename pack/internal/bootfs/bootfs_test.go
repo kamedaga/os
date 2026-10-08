@@ -15,7 +15,7 @@ func TestRenderMatchesBootFsAbiLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got := binary.LittleEndian.Uint16(image[6:8]); got != headerBytes {
+	if got := binary.LittleEndian.Uint32(image[4:8]); got != headerBytes {
 		t.Fatalf("header bytes = %d, want %d", got, headerBytes)
 	}
 	if got := binary.LittleEndian.Uint32(image[20:24]); got != entryBytes*uint32(len(items)) {

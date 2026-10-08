@@ -29,6 +29,13 @@ int main(int argc, char **argv)
         fflush(stdout);
         return 1;
     }
+#ifdef FILED_INTERNAL_MICROBENCH
+    extern int filed_internal_microbench(filed_runtime_t *);
+    if (filed_internal_microbench(&runtime)) return 1;
+#ifdef FILED_INTERNAL_RING_ONLY
+    return 0;
+#endif
+#endif
     printf("[filed] ready\n");
     fflush(stdout);
     if (runtime.live_root) {

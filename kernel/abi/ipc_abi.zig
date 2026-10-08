@@ -1,11 +1,11 @@
-pub const syscall_ipc_first: u64 = 67;
-pub const syscall_ipc_endpoint_create: u64 = 67;
-pub const syscall_ipc_channel_create: u64 = 68;
-pub const syscall_ipc_send: u64 = 69;
-pub const syscall_ipc_recv: u64 = 70;
-pub const syscall_ipc_call: u64 = 71;
-pub const syscall_ipc_reply: u64 = 72;
-pub const syscall_ipc_recv_wait: u64 = 73;
+pub const syscall_ipc_first: u64 = 70;
+pub const syscall_ipc_endpoint_create: u64 = 70;
+pub const syscall_ipc_channel_create: u64 = 71;
+pub const syscall_ipc_send: u64 = 72;
+pub const syscall_ipc_recv: u64 = 73;
+pub const syscall_ipc_call: u64 = 74;
+pub const syscall_ipc_reply: u64 = 75;
+pub const syscall_ipc_recv_wait: u64 = 76;
 pub const syscall_ipc_last: u64 = syscall_ipc_recv_wait;
 pub const syscall_ipc_count: u64 = syscall_ipc_last - syscall_ipc_first + 1;
 

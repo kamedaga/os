@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -14,6 +15,54 @@
 #include "../userland/personality/linux/runtime/lpr_filed_internal.h"
 
 static int failures;
+static unsigned rpc_calls;
+static int64_t rpc_result;
+static lpr_linux_timespec_t observed[2];
+static uint64_t observed_flags;
+static int observed_null;
+
+static uint64_t get64(const unsigned char *bytes)
+{
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i) value |= (uint64_t)bytes[i] << (8 * i);
+    return value;
+}
+
+lpr_filed_backend_t *lpr_filed_backend(uint64_t fd)
+{
+    static lpr_filed_backend_t file = {.active = 1, .handle = 42};
+    return fd == 3 ? &file : NULL;
+}
+
+int64_t lpr_dir_handle_for(uint64_t fd, const char *path, uint64_t *handle)
+{
+    if (fd != 3 && (int64_t)fd != LPR_LINUX_AT_FDCWD && path[0] != '/')
+        return -LPR_LINUX_EBADF;
+    *handle = 42;
+    return 0;
+}
+
+int64_t lpr_fs_call(kb2_fs_request_t *request, const char *path,
+    const char *second, const void *data, uint64_t bytes,
+    void *output, uint64_t output_bytes, kb2_fs_response_t *response,
+    int transfer, int *cap)
+{
+    assert(request->opcode == KB2_FILESYSTEM_OP_UTIMENSAT && request->handle == 42);
+    assert(path && !second && !output && !output_bytes && transfer == -1 && !cap);
+    (void)response;
+    rpc_calls++;
+    observed_flags = request->flags;
+    observed_null = !data;
+    if (data) {
+        assert(bytes == 32);
+        const unsigned char *wire = data;
+        for (unsigned n = 0; n < 2; ++n) {
+            observed[n].tv_sec = (int64_t)get64(wire + n * 16);
+            observed[n].tv_nsec = (int64_t)get64(wire + n * 16 + 8);
+        }
+    } else assert(!bytes);
+    return rpc_result;
+}
 
 static void expect_true(const char *name, int condition)
 {
@@ -25,52 +74,43 @@ static void expect_true(const char *name, int condition)
 
 static void test_production_plan(void)
 {
-    lpr_linux_timespec_t values[2];
-    lpr_linux_utimens_plan_t plan;
-    int64_t status;
-
-    values[0].tv_sec = 1;
-    values[0].tv_nsec = LPR_LINUX_UTIME_OMIT;
-    values[1].tv_sec = 2;
-    values[1].tv_nsec = LPR_LINUX_UTIME_OMIT;
+    lpr_linux_timespec_t values[2] = {{1, LPR_LINUX_UTIME_OMIT},
+        {2, LPR_LINUX_UTIME_OMIT}};
     expect_true("both OMIT recognized", lpr_linux_utimens_both_omit(values));
-    status = lpr_linux_utimens_plan(values, &plan);
-    expect_true("both OMIT plan succeeds", status == 0);
-    expect_true("both OMIT is a no-op", plan.mask == 0 && plan.needs_now == 0);
+    expect_true("both OMIT bypasses missing dirfd and unknown flags",
+        !lpr_linux_utimensat(UINT64_MAX, (uintptr_t)"missing",
+            (uintptr_t)values, 0x80000000u) && !rpc_calls);
+    expect_true("both OMIT bypasses NULL path validation",
+        !lpr_linux_utimensat(UINT64_MAX, 0, (uintptr_t)values,
+            0x80000000u) && !rpc_calls);
+    expect_true("NULL times forwarded for Linux realtime clock",
+        !lpr_linux_utimensat(3, (uintptr_t)"file", 0, 0) && observed_null && rpc_calls == 1);
 
-    status = lpr_linux_utimens_plan(0, &plan);
-    expect_true("NULL times plan succeeds", status == 0);
-    expect_true(
-        "NULL times updates both from now",
-        plan.mask == (FILED_UTIMENS_ATIME | FILED_UTIMENS_MTIME) &&
-            plan.needs_now == 1);
-
+    values[0].tv_sec = -123;
     values[0].tv_nsec = 0;
     values[1].tv_nsec = 999999999ll;
-    status = lpr_linux_utimens_plan(values, &plan);
-    expect_true("explicit boundary plan succeeds", status == 0);
-    expect_true(
-        "explicit values do not request a clock read",
-        plan.mask == (FILED_UTIMENS_ATIME | FILED_UTIMENS_MTIME) &&
-            plan.needs_now == 0);
-
+    expect_true("explicit boundaries serialized little-endian without host clock",
+        !lpr_filed_utimens_handle(42, (uintptr_t)values) && !observed_null &&
+        !memcmp(values, observed, sizeof(values)) &&
+        observed_flags == LPR_LINUX_AT_EMPTY_PATH);
     values[0].tv_nsec = LPR_LINUX_UTIME_NOW;
     values[1].tv_nsec = LPR_LINUX_UTIME_OMIT;
-    status = lpr_linux_utimens_plan(values, &plan);
-    expect_true("one-sided NOW plan succeeds", status == 0);
-    expect_true(
-        "one-sided NOW requests one update and a clock read",
-        plan.mask == FILED_UTIMENS_ATIME && plan.needs_now == 1);
-
+    expect_true("NOW/OMIT sentinels preserved for Linux permission decisions",
+        !lpr_linux_utimensat(3, 0, (uintptr_t)values, 0) &&
+        !memcmp(values, observed, sizeof(values)) && observed_flags == LPR_LINUX_AT_EMPTY_PATH);
+    const unsigned before = rpc_calls;
+    expect_true("NULL path rejects nonzero flags before RPC",
+        lpr_linux_utimensat(3, 0, (uintptr_t)values, LPR_LINUX_AT_SYMLINK_NOFOLLOW) ==
+            -LPR_LINUX_EINVAL && rpc_calls == before);
+    rpc_result = -LPR_LINUX_EINVAL;
     values[0].tv_nsec = -1;
-    values[1].tv_nsec = LPR_LINUX_UTIME_OMIT;
-    expect_true(
-        "negative explicit nsec rejected",
-        lpr_linux_utimens_plan(values, &plan) == -LPR_LINUX_EINVAL);
+    expect_true("negative nanoseconds sent unchanged and Linux EINVAL propagated",
+        lpr_filed_utimens_handle(42, (uintptr_t)values) == -LPR_LINUX_EINVAL &&
+        observed[0].tv_nsec == -1);
     values[0].tv_nsec = 1000000000ll;
-    expect_true(
-        "one billion explicit nsec rejected",
-        lpr_linux_utimens_plan(values, &plan) == -LPR_LINUX_EINVAL);
+    expect_true("one billion nanoseconds sent unchanged and Linux EINVAL propagated",
+        lpr_filed_utimens_handle(42, (uintptr_t)values) == -LPR_LINUX_EINVAL &&
+        observed[0].tv_nsec == 1000000000ll);
 }
 
 static void test_host_linux_ordering(void)

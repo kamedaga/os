@@ -372,7 +372,7 @@ pub fn trackMappedNativePageOrHalt(
         halt.haltWithRolePageMessage(role_label, page_label, "native VMO fd missing");
     };
     var paddrs = [_]u64{page.paddr};
-    state.installNativeVmoPages(vmo_ref, 0, paddrs[0..]) catch |err| {
+    state.installNativeVmoPages(vmo_ref, 0, paddrs[0..], free_list) catch |err| {
         _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
         halt.haltWithRolePageError(role_label, page_label, "install native VMO page", err);
     };

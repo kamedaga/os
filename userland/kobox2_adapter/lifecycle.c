@@ -54,6 +54,16 @@ static int poll_work(void *context) {
     struct ph_lifecycle *lifecycle = context;
     if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) != WORK_BUSY)
         return pending(context);
+    if (lifecycle->service.poll_ready) {
+        int queued = lifecycle->service.poll_ready(lifecycle->service.context);
+        if (!queued) return 0;
+        if (queued < 0) {
+            return_to_receiver(lifecycle, queued);
+            return 0;
+        }
+        /* Empty polls need no syscall. A queued request still checks native
+         * control first, so continuous traffic cannot hide QUIESCE. */
+    }
     struct ph_ipc_packet packet = {0};
     int result = ph_ipc_receive(lifecycle->ipc, lifecycle->generation, &packet);
     if (!result) {
@@ -138,6 +148,146 @@ static int run_service(struct ph_lifecycle *lifecycle, struct ph_ipc_packet *pac
     return run_prepared(lifecycle, result);
 }
 
+static void async_signal_linux(struct ph_lifecycle *lifecycle) {
+    unsigned state = atomic_load_explicit(&lifecycle->work, memory_order_relaxed);
+    do {
+        if (state == WORK_DONE) return;
+    } while (!atomic_compare_exchange_weak_explicit(&lifecycle->work, &state,
+        WORK_READY, memory_order_release, memory_order_relaxed));
+    PH_OK(ph_task_ops.cpu_notify(0, KOBOX_LINUX_TASK_CONTROL_EVENT));
+}
+
+static int async_start(void *context, void *service) {
+    struct ph_lifecycle *lifecycle = context;
+    int result = lifecycle->service.start(lifecycle->service.context, service);
+    return result > 0 ? -EPROTO : result;
+}
+
+static void async_fault(struct ph_lifecycle *lifecycle, int error) {
+    int expected = 0;
+    atomic_compare_exchange_strong_explicit(&lifecycle->async_error, &expected,
+        error < 0 ? error : -EPROTO, memory_order_release, memory_order_relaxed);
+    atomic_store_explicit(&lifecycle->quiescing, 1, memory_order_release);
+}
+
+static void async_unpark(struct ph_lifecycle *lifecycle, unsigned state) {
+    atomic_store_explicit(&lifecycle->work, state, memory_order_release);
+    /* Paired with the helper's arm/fenced recheck: neither side can miss
+     * both the new state and the other's intent to sleep. */
+    atomic_thread_fence(memory_order_seq_cst);
+    if (atomic_load_explicit(&lifecycle->helper_parked, memory_order_acquire))
+        ph_wake(&lifecycle->work);
+}
+
+static int async_advance(void *context, void *service) {
+    struct ph_lifecycle *lifecycle = context;
+    atomic_exchange_explicit(&lifecycle->work, WORK_BUSY, memory_order_acquire);
+    bool progressed = false;
+    if (!atomic_load_explicit(&lifecycle->quiescing, memory_order_acquire)) {
+        /* Check control once per bounded ring quantum. A hot data queue
+         * cannot hide credential changes or QUIESCE from its sole owner. */
+        struct ph_ipc_packet packet = {0};
+        int result = ph_ipc_receive(lifecycle->ipc, lifecycle->generation, &packet);
+        if (!result) {
+            progressed = true;
+            if (packet.operation == PH_LIFECYCLE_QUIESCE) {
+                result = quiesce(lifecycle, &packet);
+                if (result == 1) {
+                    atomic_store_explicit(&lifecycle->quiescing, 1, memory_order_release);
+                    result = 0;
+                }
+            } else {
+                result = lifecycle->service.prepare(lifecycle->service.context, &packet);
+                if (!result) {
+                    result = lifecycle->service.complete(lifecycle->service.context,
+                        lifecycle->ipc);
+                    int released = lifecycle->service.release(lifecycle->service.context);
+                    if (!result) result = released;
+                } else if (result == PH_LIFECYCLE_SERVICE_IDLE) result = 0;
+                else (void)lifecycle->service.release(lifecycle->service.context);
+            }
+            PH_OK(ph_ipc_packet_release(&packet));
+        } else if (result == -EAGAIN) result = 0;
+        if (result) async_fault(lifecycle, result);
+    }
+    bool stopping = atomic_load_explicit(&lifecycle->quiescing, memory_order_acquire) != 0;
+    int result = lifecycle->service.advance(lifecycle->service.context, service,
+        lifecycle->ipc, stopping);
+    if (result == PH_LIFECYCLE_SERVICE_IDLE && stopping) {
+        int error = atomic_load_explicit(&lifecycle->async_error, memory_order_acquire);
+        atomic_store_explicit(&lifecycle->terminal, error ? error : 1, memory_order_release);
+        async_unpark(lifecycle, WORK_DONE);
+        PH_OK(lifecycle->service.wake(lifecycle->service.context));
+        return 0;
+    }
+    if (result != 0 && result != PH_LIFECYCLE_SERVICE_PROGRESS) {
+        async_fault(lifecycle, result);
+        return PH_LIFECYCLE_SERVICE_PROGRESS;
+    }
+    if (!result && progressed) result = PH_LIFECYCLE_SERVICE_PROGRESS;
+    if (!result) async_unpark(lifecycle, WORK_IDLE);
+    return result;
+}
+
+static int async_finish(void *context, void *service) {
+    struct ph_lifecycle *lifecycle = context;
+    unsigned expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&lifecycle->start, &expected, 2,
+        memory_order_release, memory_order_relaxed)) ph_wake(&lifecycle->start);
+    /* READY failure leaves the helper unstarted. Normal shutdown interrupts
+     * its non-consuming FD wait before any watched capability is closed. */
+    async_unpark(lifecycle, WORK_DONE);
+    PH_OK(lifecycle->service.wake(lifecycle->service.context));
+    PH_OK(ph_thread_join(lifecycle->receiver));
+    lifecycle->receiver = NULL;
+    int result = lifecycle->service.finish(lifecycle->service.context, service);
+    if (lifecycle->service.stop) {
+        int stopped = lifecycle->service.stop(lifecycle->service.context);
+        if (!result) result = stopped;
+    }
+    return result > 0 ? -EPROTO : result;
+}
+
+static int receive_async(struct ph_lifecycle *lifecycle) {
+    for (;;) {
+        if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_DONE)
+            return 0;
+        atomic_store_explicit(&lifecycle->helper_parked, 1, memory_order_release);
+        atomic_thread_fence(memory_order_seq_cst);
+        unsigned state = atomic_load_explicit(&lifecycle->work, memory_order_acquire);
+        if (state == WORK_DONE) return 0;
+        if (state != WORK_IDLE ||
+            atomic_load_explicit(&lifecycle->quiescing, memory_order_acquire)) {
+            ph_wait(&lifecycle->work, state);
+            atomic_store_explicit(&lifecycle->helper_parked, 0, memory_order_release);
+            continue;
+        }
+        atomic_store_explicit(&lifecycle->helper_parked, 0, memory_order_release);
+        int result;
+        if (lifecycle->service.wait) {
+            result = lifecycle->service.wait(lifecycle->service.context,
+                lifecycle->ipc->fd, PACHA_FD_WAIT_FOREVER);
+        } else {
+            struct pacha_pollfd events[2] = {{.fd = lifecycle->service.wake_fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
+                {.fd = lifecycle->ipc->fd,
+                .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP}};
+            result = ph_wait_readable(events, 2) < 0 ? -EIO : 0;
+        }
+        if (atomic_load_explicit(&lifecycle->work, memory_order_acquire) == WORK_DONE)
+            return 0;
+        if (result) {
+            async_fault(lifecycle, result);
+            async_signal_linux(lifecycle);
+        } else {
+            unsigned expected = WORK_IDLE;
+            if (atomic_compare_exchange_strong_explicit(&lifecycle->work, &expected,
+                WORK_READY, memory_order_release, memory_order_relaxed))
+                PH_OK(ph_task_ops.cpu_notify(0, KOBOX_LINUX_TASK_CONTROL_EVENT));
+        }
+    }
+}
+
 static void *receive(void *context) {
     struct ph_lifecycle *lifecycle = context;
     unsigned int start;
@@ -145,7 +295,12 @@ static void *receive(void *context) {
         ph_wait(&lifecycle->start, 0);
     if (start == 2) {
         /* Module init/READY failed before admission. */
-        if (lifecycle->service.stop) PH_OK(lifecycle->service.stop(lifecycle->service.context));
+        if (!lifecycle->service.advance && lifecycle->service.stop)
+            PH_OK(lifecycle->service.stop(lifecycle->service.context));
+        return NULL;
+    }
+    if (lifecycle->service.advance) {
+        (void)receive_async(lifecycle);
         return NULL;
     }
     int result;
@@ -173,6 +328,12 @@ static void *receive(void *context) {
                 if (result) break;
                 continue;
             }
+        }
+        if (lifecycle->service.wait) {
+            result = lifecycle->service.wait(lifecycle->service.context,
+                lifecycle->ipc->fd, lifecycle->monitored ? 1000 : PACHA_FD_WAIT_FOREVER);
+            if (result) break;
+            continue;
         }
         struct pacha_pollfd events[2] = {{.fd = lifecycle->ipc->fd,
             .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP}};
@@ -224,14 +385,26 @@ static int start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
     const struct ph_lifecycle_service *service, bool monitored) {
     if (!lifecycle || lifecycle->generation || !ipc || !ipc->generation || !ipc->admitted)
         return -EINVAL;
-    if (service && (!service->context || !service->prepare || !service->dispatch ||
+    if (service && (!service->context || !service->prepare ||
         !service->complete || !service->release)) return -EINVAL;
+    if (service && service->advance) {
+        if (!service->start || !service->finish || !service->wake ||
+            service->wake_fd < 16 || service->dispatch || service->next ||
+            service->poll_ready || monitored) return -EINVAL;
+    } else if (service && (!service->dispatch || service->start || service->finish ||
+        service->wake)) return -EINVAL;
     *lifecycle = (struct ph_lifecycle){.ipc = ipc, .generation = ipc->generation,
         .port = {.size = sizeof(lifecycle->port), .context = lifecycle, .ready = ready,
             .pending = pending, .dispatch = service ? dispatch : NULL,
             .abort = monitored ? abort_monitor : NULL},
         .monitored = monitored};
     if (service) lifecycle->service = *service;
+    if (service && service->advance) {
+        lifecycle->port.dispatch = NULL;
+        lifecycle->port.start = async_start;
+        lifecycle->port.advance = async_advance;
+        lifecycle->port.finish = async_finish;
+    }
     if (service && service->next) {
         lifecycle->port.poll = poll_work;
         lifecycle->port.idle = idle;
@@ -240,9 +413,15 @@ static int start_service(struct ph_lifecycle *lifecycle, struct ph_ipc *ipc,
     atomic_init(&lifecycle->terminal, 0);
     atomic_init(&lifecycle->monitor_abort, 0);
     atomic_init(&lifecycle->work, WORK_IDLE);
+    atomic_init(&lifecycle->quiescing, 0);
+    atomic_init(&lifecycle->async_error, 0);
+    atomic_init(&lifecycle->helper_parked, 0);
     if (!atomic_is_lock_free(&lifecycle->terminal) || !atomic_is_lock_free(&lifecycle->start) ||
         !atomic_is_lock_free(&lifecycle->work) ||
-        !atomic_is_lock_free(&lifecycle->monitor_abort)) {
+        !atomic_is_lock_free(&lifecycle->monitor_abort) ||
+        !atomic_is_lock_free(&lifecycle->quiescing) ||
+        !atomic_is_lock_free(&lifecycle->async_error) ||
+        !atomic_is_lock_free(&lifecycle->helper_parked)) {
         *lifecycle = (struct ph_lifecycle){0};
         return -EOPNOTSUPP;
     }
@@ -270,7 +449,9 @@ int ph_lifecycle_start_monitored_service(struct ph_lifecycle *lifecycle,
 }
 
 void ph_lifecycle_finish(struct ph_lifecycle *lifecycle) {
-    PH_CHECK(lifecycle && lifecycle->receiver);
+    PH_CHECK(lifecycle);
+    if (lifecycle->service.advance && !lifecycle->receiver) return;
+    PH_CHECK(lifecycle->receiver);
     /* Only unstarted receiver cancellation is permitted. If READY succeeded,
      * modules_run cannot return until its control-event completion fired. */
     unsigned int expected = 0;
@@ -278,4 +459,8 @@ void ph_lifecycle_finish(struct ph_lifecycle *lifecycle) {
         memory_order_release, memory_order_relaxed)) ph_wake(&lifecycle->start);
     PH_OK(ph_thread_join(lifecycle->receiver));
     lifecycle->receiver = NULL;
+    /* Async start failed before READY: no admission/worker survives start's
+     * rollback, but native mappings still belong to the original caller. */
+    if (lifecycle->service.advance && lifecycle->service.stop)
+        PH_OK(lifecycle->service.stop(lifecycle->service.context));
 }

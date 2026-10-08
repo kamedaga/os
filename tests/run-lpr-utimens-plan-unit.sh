@@ -15,6 +15,9 @@ mkdir -p "$out_dir"
   -ffunction-sections \
   -fdata-sections \
   -Wl,--gc-sections \
+  -I"$repo_root/kobox2/protocol/include" \
+  -I"$repo_root/kobox2/protocol/generated/include" \
+  -I"$repo_root/userland" \
   -I"$repo_root/userland/personality/include" \
   -I"$repo_root/musl/pachaos/include" \
   -I"$repo_root/userland/libpacha/include" \

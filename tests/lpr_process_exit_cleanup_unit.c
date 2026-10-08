@@ -12,7 +12,8 @@ int lpr_control_fd_active(uint64_t fd) { return fd == 3; }
 void lpr_control_close_fd(uint64_t fd) { assert(fd == 3); ++closed; }
 int64_t lpr_close_native_fd_if_open(uint64_t fd) { (void)fd; assert(0); return -1; }
 int64_t lpr_filed_close_handle(uint64_t handle) { (void)handle; assert(0); return -1; }
-void lpr_filed_session_drop(void) { ++sessions; }
+int64_t lpr_filed_session_drop(void) { ++sessions; return 0; }
+int64_t lpr_filed_endpoint_ready(void) { assert(0); return -1; }
 
 int main(void)
 {

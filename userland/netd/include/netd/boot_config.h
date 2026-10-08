@@ -5,7 +5,6 @@
 
 enum {
     NETD_BOOT_CONFIG_MAGIC = 0x4e455444424f4f54ull,
-    NETD_BOOT_CONFIG_VERSION = 9,
     NETD_BOOT_STATUS_MAGIC = 0x3153544154454e4eull,
     NETD_BOOT_FAULT_MAGIC = 0x31544c5541464e4eull,
     NETD_BOOT_STAGE_NIC = 1,
@@ -49,15 +48,14 @@ struct netd_ipv4_boot_config {
 
 struct netd_boot_config {
     uint64_t magic;
-    uint64_t version;
+    uint64_t size;
     uint64_t device_fd;
     uint64_t filed_endpoint_fd;
     uint64_t socket_endpoint_fd;
     uint64_t flags;
     struct netd_ipv4_boot_config ipv4;
     /* Optional seed0root status channel. Zero for non-live service launches.
-     * This private bootstrap ABI is rebuilt with its consumer; v8 also
-     * carries unhandled fault location without accepting older layouts. */
+     * The fixed record size must match its producer and consumer. */
     uint64_t status_channel_fd;
     /* Optional SEND-only userland diagnostics sink. Zero keeps standalone
      * and non-live launches independent of logd. */

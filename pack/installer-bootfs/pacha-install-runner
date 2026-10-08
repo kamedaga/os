@@ -1,0 +1,187 @@
+#!/bin/ash
+# SPDX-License-Identifier: MIT
+# This process receives only three data-only ports selected and bounded by the
+# native installer. It cannot enumerate hardware or widen write authority.
+set -eu
+
+log="${PACHA_INSTALL_LOG:-/run/pacha/installer.log}"
+busybox mkdir -p "${log%/*}"
+
+flags="$1"
+esp_offset="$2"
+esp_bytes="$3"
+root_bytes="$4"
+media_esp_offset="$5"
+media_data_offset="$6"
+
+target="${PACHA_INSTALL_TARGET:-/dev/pacha/install-target}"
+media="${PACHA_INSTALL_MEDIA:-/dev/pacha/install-media}"
+root="${PACHA_INSTALL_ROOT:-/dev/pacha/install-root}"
+stage="${PACHA_INSTALL_STAGE:-/tmp/pacha-installer-stage}"
+tree="${PACHA_INSTALL_TREE:-/tmp/pacha-installer-root}"
+progress="${PACHA_INSTALL_PROGRESS:-/sbin/pacha-install-progress}"
+
+# Version-2 runner modes are exclusive. Live import needs only the media
+# reader; it must not execute formatter or installation preflight branches.
+case "$flags" in
+    4) exec /sbin/pacha-live-import "$media" "$media_data_offset";;
+    1|2|3|8) ;;
+    *) exit 64;;
+esac
+
+exec >>"$log" 2>&1
+phase=start
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "installer: failed phase=$phase status=$rc"; fi' EXIT
+
+busybox rm -rf "$stage" "$tree"
+busybox mkdir -p "$stage" "$tree"
+
+report_progress() {
+    progress_phase="$1"
+    progress_total="$2"
+    if ! "$progress" "$media" "$progress_phase" 0 "$progress_total"; then
+        echo "installer: progress report failed phase=$progress_phase" >&2
+    fi
+}
+
+# The image builder records the byte size of every payload used below.  Parse
+# only fixed-position decimal fields; never evaluate text from installation
+# media.  Missing or malformed metadata makes the preflight fail before the
+# target receives write authority.
+phase=copy-install-metadata
+mcopy -o -i "$media@@$media_data_offset" ::/INSTALL.META "$stage/INSTALL.META"
+set -- $(busybox cat "$stage/INSTALL.META")
+[ "$#" -eq 7 ] && [ "$1" = 1 ]
+for field in "$2" "$3" "$4" "$5" "$6" "$7"; do
+    case "$field" in ''|*[!0-9]*) exit 65;; esac
+done
+rootfs_bytes="$2"
+system_bootfs_bytes="$3"
+kernel_bytes="$4"
+initapp_bytes="$5"
+limine_bytes="$6"
+config_bytes="$7"
+boot_payload_bytes=$((system_bootfs_bytes + kernel_bytes + initapp_bytes + limine_bytes + config_bytes))
+uefi_payload_bytes=$((system_bootfs_bytes + kernel_bytes + initapp_bytes + limine_bytes * 2 + config_bytes))
+
+if [ $((flags & 8)) -ne 0 ]; then
+    files_phase=1
+    rootfs_phase=2
+else
+    files_phase=3
+    rootfs_phase=4
+fi
+
+# Validate every payload and every boot component before the target is armed.
+phase=copy-rootfs-hash
+echo "installer: begin flags=$flags phase=$phase"
+report_progress "$files_phase" "$boot_payload_bytes"
+mcopy -o -i "$media@@$media_data_offset" ::/ROOTFS.SHA "$stage/ROOTFS.SHA"
+phase=copy-system-bootfs
+mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.BOOTFS "$stage/SYSTEM.BOOTFS"
+phase=copy-system-hash
+mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.SHA "$stage/SYSTEM.SHA"
+phase=copy-system-config
+mcopy -o -i "$media@@$media_data_offset" ::/SYSTEM.CONF "$stage/SYSTEM.CONF"
+phase=copy-kernel
+mcopy -o -i "$media@@$media_esp_offset" ::/KERNEL.ELF "$stage/KERNEL.ELF"
+phase=copy-initapp
+mcopy -o -i "$media@@$media_esp_offset" ::/INITAPP.ELF "$stage/INITAPP.ELF"
+phase=copy-uefi-loader
+mcopy -o -i "$media@@$media_esp_offset" ::/EFI/PachaOS/LIMINE.EFI "$stage/LIMINE.EFI"
+phase=verify-rootfs
+# ROOTFS.TAR is deliberately not copied into tmpfs.  A normal Alpine image is
+# large enough that retaining both the archive and its extracted tree exhausts
+# the live environment before mke2fs can issue its first write.  Read the
+# immutable installer-data file once for verification and again for extraction.
+expected_rootfs_hash="$(busybox head -n 1 "$stage/ROOTFS.SHA")"
+expected_rootfs_hash="${expected_rootfs_hash%% *}"
+[ "${#expected_rootfs_hash}" -eq 64 ]
+report_progress "$rootfs_phase" "$rootfs_bytes"
+actual_rootfs_hash="$(mcopy -i "$media@@$media_data_offset" ::/ROOTFS.TAR - | busybox sha256sum)"
+actual_rootfs_hash="${actual_rootfs_hash%% *}"
+[ "$actual_rootfs_hash" = "$expected_rootfs_hash" ]
+phase=verify-system
+(cd "$stage" && busybox sha256sum -c SYSTEM.SHA)
+
+if [ $((flags & 8)) -ne 0 ]; then
+    echo "installer: payload and boot files verified before target authorization"
+    exit 0
+fi
+
+# A root view starts at the selected partition, so unmodified mke2fs sees a
+# complete regular device without learning the whole-disk offset.
+if [ $((flags & 2)) -eq 0 ]; then
+    echo "installer: reusing an ext4 root is not supported for deployment" >&2
+    exit 64
+fi
+phase=extract-rootfs
+report_progress 5 "$rootfs_bytes"
+mcopy -i "$media@@$media_data_offset" ::/ROOTFS.TAR - | busybox tar -xf - -C "$tree"
+root_blocks=$((root_bytes / 4096))
+phase=format-root-ext4
+# orphan_file is an optional ext4 optimisation.  It leaves orphan_present set
+# while mounted and therefore requires a full unmount transaction to clear it.
+# PachaOS currently flushes the mounted filesystem before firmware power-off
+# but does not yet provide Linux's unmount choreography, so create a portable
+# ext4 volume whose clean state is represented without that transient feature.
+# The formatter writes filesystem metadata in addition to file data, so the
+# archive length is not a byte-perfect denominator.  It is nevertheless a
+# measured lower bound for the populated tree and lets the native UI advance
+# from actual target writes instead of holding one percentage for the whole
+# mke2fs transaction; the following phase transition closes the range.
+report_progress 6 "$rootfs_bytes"
+mke2fs -F -q -t ext4 -O ^orphan_file -b 4096 -L pacha-root -d "$tree" "$root" "$root_blocks"
+phase=verify-root-ext4
+report_progress 7 0
+e2fsck -fn "$root"
+
+if [ $((flags & 1)) -ne 0 ]; then
+    # dosfstools defines its trailing BLOCK-COUNT in 1024-byte blocks even
+    # when the FAT logical sector is 512 bytes.  Passing sectors here would
+    # create a filesystem twice the selected ESP and overlap the ext4 root.
+    esp_blocks=$((esp_bytes / 1024))
+    phase=format-esp-fat32
+    report_progress 8 0
+    # The port exposes only the ESP. A whole-disk offset view makes dosfstools
+    # choose clusters from the SSD size, producing an invalid small FAT32.
+    mkfs.fat -F 32 -n PACHAESP "$target" "$esp_blocks"
+fi
+
+esp="$target"
+phase=deploy-uefi
+report_progress 9 "$uefi_payload_bytes"
+mmd -D o -i "$esp" ::/EFI
+mmd -D o -i "$esp" ::/EFI/BOOT
+mmd -D o -i "$esp" ::/EFI/PachaOS
+# Keep the standard fallback path as well as a stable vendor path.  The
+# installer-media UEFI entry consumes INSTALL.PENDING before ExitBootServices,
+# creates the fixed-disk Boot#### option and chainloads this exact Limine file.
+mcopy -o -i "$esp" "$stage/LIMINE.EFI" ::/EFI/BOOT/BOOTX64.EFI
+mcopy -o -i "$esp" "$stage/LIMINE.EFI" ::/EFI/PachaOS/LIMINE.EFI
+busybox printf 'PachaOS fixed-disk boot registration pending\n' > "$stage/INSTALL.PENDING"
+mcopy -o -i "$esp" "$stage/INSTALL.PENDING" ::/EFI/PachaOS/INSTALL.PENDING
+mcopy -o -i "$esp" "$stage/KERNEL.ELF" ::/KERNEL.ELF
+mcopy -o -i "$esp" "$stage/INITAPP.ELF" ::/INITAPP.ELF
+mcopy -o -i "$esp" "$stage/SYSTEM.BOOTFS" ::/BOOTFS.IMG
+mcopy -o -i "$esp" "$stage/SYSTEM.CONF" ::/limine.conf
+
+# Read every installed boot file back through the bounded target port.
+phase=readback-boot
+report_progress 10 "$uefi_payload_bytes"
+for name in KERNEL.ELF INITAPP.ELF BOOTFS.IMG limine.conf; do
+    mcopy -o -i "$esp" "::/$name" "$stage/readback-$name"
+done
+mcopy -o -i "$esp" ::/EFI/BOOT/BOOTX64.EFI "$stage/readback-BOOTX64.EFI"
+mcopy -o -i "$esp" ::/EFI/PachaOS/LIMINE.EFI "$stage/readback-LIMINE.EFI"
+mcopy -o -i "$esp" ::/EFI/PachaOS/INSTALL.PENDING "$stage/readback-INSTALL.PENDING"
+busybox cmp "$stage/KERNEL.ELF" "$stage/readback-KERNEL.ELF"
+busybox cmp "$stage/INITAPP.ELF" "$stage/readback-INITAPP.ELF"
+busybox cmp "$stage/SYSTEM.BOOTFS" "$stage/readback-BOOTFS.IMG"
+busybox cmp "$stage/SYSTEM.CONF" "$stage/readback-limine.conf"
+busybox cmp "$stage/LIMINE.EFI" "$stage/readback-BOOTX64.EFI"
+busybox cmp "$stage/LIMINE.EFI" "$stage/readback-LIMINE.EFI"
+busybox cmp "$stage/INSTALL.PENDING" "$stage/readback-INSTALL.PENDING"
+phase=complete
+report_progress 11 0
+echo "installer: ext4 root and UEFI boot files verified; fixed-disk registration pending next USB boot"

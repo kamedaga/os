@@ -68,11 +68,15 @@ func buildCommand(ctx *context) *cobra.Command {
 func buildLiveImageCommand(ctx *context) *cobra.Command {
 	var authorizedKeys string
 	var overlaySpec, outputDir string
+	var installerRootfs, installerSystemBootfs, liveDesktopBundle string
 	cmd := &cobra.Command{
 		Use:   "live-image",
 		Short: "Build a separate RAM-root Limine image without syncing rootfs",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ui.Task("build:live-image")
+			if installerRootfs != "" && outputDir == "" {
+				outputDir = ".artifacts/installer-bootfs"
+			}
 			kernel, err := buildsys.BuildKernel(ctx.workspace, buildsys.KernelOptions{StepOverride: "limine", Progress: ui.NewProgressReporter()})
 			if err != nil {
 				return err
@@ -86,7 +90,8 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 			}
 			bootfs, err := livebootfs.Build(ctx.workspace, livebootfs.Options{
 				AuthorizedKeysPath: authorizedKeys,
-				OverlaySpecPath:    overlaySpec, OutputDir: outputDir,
+				OverlaySpecPath:    overlaySpec, InstallerMode: installerRootfs != "",
+				OutputDir: outputDir,
 			})
 			if err != nil {
 				return err
@@ -99,13 +104,35 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 			if outputDir != "" {
 				imageOutputDir = ctx.workspace.Path(outputDir)
 			}
+			if installerRootfs != "" && !filepath.IsAbs(installerRootfs) {
+				installerRootfs = ctx.workspace.Path(installerRootfs)
+			}
+			if installerSystemBootfs != "" && !filepath.IsAbs(installerSystemBootfs) {
+				installerSystemBootfs = ctx.workspace.Path(installerSystemBootfs)
+			}
+			if liveDesktopBundle != "" && !filepath.IsAbs(liveDesktopBundle) {
+				liveDesktopBundle = ctx.workspace.Path(liveDesktopBundle)
+			}
+			installerUEFIEntry := ""
+			if installerRootfs != "" {
+				installerUEFIEntry = filepath.Join(imageOutputDir, "INSTALLER.EFI")
+				if err := runExternal("bash",
+					ctx.workspace.Path("pack", "scripts", "build_installer_uefi_entry.sh"),
+					installerUEFIEntry); err != nil {
+					return err
+				}
+			}
 			result, err := bootloaderlimine.BuildImageWithOptions(ctx.workspace, bootloaderlimine.Inputs{
 				KernelELF: kernel.Output, InitELF: ctx.workspace.ArtifactPath(initApp),
 				BootfsImage: bootfs.Image, DiagnosticELF: diagnostic.Output,
 			}, bootloaderlimine.Options{
-				ImagePath:  filepath.Join(imageOutputDir, "limine-boot.img"),
-				ConfigPath: filepath.Join(imageOutputDir, "limine.conf"),
-				Progress:   ui.NewProgressReporter(),
+				ImagePath:             filepath.Join(imageOutputDir, "limine-boot.img"),
+				ConfigPath:            filepath.Join(imageOutputDir, "limine.conf"),
+				InstallerPayload:      installerRootfs,
+				InstallerSystemBootfs: installerSystemBootfs,
+				LiveDesktopBundle:     liveDesktopBundle,
+				InstallerUEFIEntry:    installerUEFIEntry,
+				Progress:              ui.NewProgressReporter(),
 			})
 			if err != nil {
 				return err
@@ -120,11 +147,15 @@ func buildLiveImageCommand(ctx *context) *cobra.Command {
 	cmd.Flags().StringVar(&authorizedKeys, "ssh-authorized-key-file", "", "embed one local SSH public key in the live RAM root")
 	cmd.Flags().StringVar(&overlaySpec, "overlay-spec", "", "add files from an optional live bootfs overlay")
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "write a separate live image under this directory")
+	cmd.Flags().StringVar(&installerRootfs, "installer-rootfs", "", "place an explicitly selected rootfs archive on a separate installer-data partition")
+	cmd.Flags().StringVar(&installerSystemBootfs, "installer-system-bootfs", "", "ordinary storage-boot BOOTFS.IMG installed beside the selected rootfs")
+	cmd.Flags().StringVar(&liveDesktopBundle, "live-desktop-bundle", "", "place an optional desktop archive on the installer-data partition")
 	return cmd
 }
 
 func buildLiveBootfsCommand(ctx *context) *cobra.Command {
 	var noBuild bool
+	var installerMode bool
 	var authorizedKeys string
 	var overlaySpec, outputDir string
 	cmd := &cobra.Command{
@@ -134,7 +165,7 @@ func buildLiveBootfsCommand(ctx *context) *cobra.Command {
 			ui.Task("build:live-bootfs")
 			result, err := livebootfs.Build(ctx.workspace, livebootfs.Options{
 				NoBuild: noBuild, AuthorizedKeysPath: authorizedKeys,
-				OverlaySpecPath: overlaySpec, OutputDir: outputDir,
+				OverlaySpecPath: overlaySpec, InstallerMode: installerMode, OutputDir: outputDir,
 			})
 			if err != nil {
 				return err
@@ -149,6 +180,7 @@ func buildLiveBootfsCommand(ctx *context) *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&noBuild, "no-build", false, "package existing userland artifacts without rebuilding")
+	cmd.Flags().BoolVar(&installerMode, "installer", false, "include installer tools and read-only live package preparation")
 	cmd.Flags().StringVar(&authorizedKeys, "ssh-authorized-key-file", "", "embed one local SSH public key in the live RAM root")
 	cmd.Flags().StringVar(&overlaySpec, "overlay-spec", "", "add files from an optional live bootfs overlay")
 	cmd.Flags().StringVar(&outputDir, "output-dir", "", "write a separate live bootfs under this directory")
@@ -347,7 +379,7 @@ func prepareLimineBootImage(ctx *context, opts *qemu.Options) error {
 
 	ui.Task("build:bootfs")
 	bootfsPath := ctx.workspace.Path(ctx.workspace.Artifacts, "BOOTFS.IMG")
-	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter()})
+	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter(), Storage: &bootfs.StorageOptions{DiskPath: ctx.workspace.Path(ctx.workspace.Disk.Image), RootPartition: ctx.workspace.Disk.Partitions["rootfs"].Index, RAMBytes: ctx.workspace.Storage.SandboxRAMMiB << 20, QueueSize: ctx.workspace.Storage.QueueSize, ArenaBytes: ctx.workspace.Storage.QueueArenaMiB << 20}})
 	if err != nil {
 		return err
 	}
@@ -1051,7 +1083,7 @@ func runBootfsSync(ctx *context, force bool) error {
 
 	ui.Task("build:bootfs")
 	bootfsPath := ctx.workspace.Path(ctx.workspace.Artifacts, "BOOTFS.IMG")
-	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter()})
+	image, err := bootfs.BuildImageWithOptions(generated.Outputs.Bootfs, bootfsPath, bootfs.Options{Progress: ui.NewProgressReporter(), Storage: &bootfs.StorageOptions{DiskPath: ctx.workspace.Path(ctx.workspace.Disk.Image), RootPartition: ctx.workspace.Disk.Partitions["rootfs"].Index, RAMBytes: ctx.workspace.Storage.SandboxRAMMiB << 20, QueueSize: ctx.workspace.Storage.QueueSize, ArenaBytes: ctx.workspace.Storage.QueueArenaMiB << 20}})
 	if err != nil {
 		return err
 	}

@@ -1,13 +1,23 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_common/boot_diagnostic.h"
+
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+lpr_boot_diagnostic_state_t lpr_boot_diagnostic_state;
+#endif
 
 
-static const char *lpr_take_boot_ctty_env(void)
+static const char *lpr_take_boot_stdio_path(void)
 {
     if (lpr_load_manifest() &&
-        (lpr_process_manifest.flags & LPR_MANIFEST_FLAG_DEFAULT_STDIO) != 0 &&
-        lpr_process_manifest.ctty[0] != 0)
+        (lpr_process_manifest.flags & LPR_MANIFEST_FLAG_DEFAULT_STDIO) != 0)
     {
-        return lpr_process_manifest.ctty;
+        /* A manager-launched service without a console still needs valid
+         * standard descriptors. Otherwise its listening/accepted sockets
+         * can occupy stderr and receive plaintext diagnostics. Exec/fork
+         * inheritance does not request DEFAULT_STDIO, so deliberately closed
+         * descriptors remain closed in ordinary Linux children. */
+        return lpr_process_manifest.ctty[0] != 0 ?
+            lpr_process_manifest.ctty : "/dev/null";
     }
     return 0;
 }
@@ -30,7 +40,7 @@ void lpr_linux_ensure_default_stdio(void)
     }
     lpr_default_stdio_checked = 1;
 
-    const char *path = lpr_take_boot_ctty_env();
+    const char *path = lpr_take_boot_stdio_path();
     if (path == 0 || path[0] == 0) {
         return;
     }
@@ -41,24 +51,37 @@ void lpr_linux_ensure_default_stdio(void)
         return;
     }
 
-    const int64_t tty_fd = lpr_tty_open_path(path, LPR_LINUX_O_RDWR);
+    uint64_t open_flags = LPR_LINUX_O_RDWR;
+    if ((lpr_process_manifest.flags &
+            LPR_MANIFEST_FLAG_STDIO_NOCTTY) != 0)
+        open_flags |= LPR_LINUX_O_NOCTTY;
+    const int64_t tty_fd = lpr_linux_openat(
+        LPR_LINUX_AT_FDCWD, (uint64_t)(uintptr_t)path, open_flags, 0);
+    lpr_boot_diagnostic_emit("stdio.open", open_flags, lpr_process_manifest.flags,
+        (uint64_t)tty_fd, tty_fd, 0);
     if (tty_fd < 0) {
         return;
     }
-    if (need_stdin &&
-        lpr_install_stdio_fd_from_tty((uint64_t)(uint32_t)tty_fd, 0) < 0)
+    const int64_t stdin_status = need_stdin ?
+        lpr_install_stdio_fd_from_tty((uint64_t)(uint32_t)tty_fd, 0) : 0;
+    lpr_boot_diagnostic_emit("stdio.dup0", tty_fd, 0, need_stdin, stdin_status, 0);
+    if (stdin_status < 0)
     {
         (void)lpr_linux_close((uint64_t)(uint32_t)tty_fd);
         return;
     }
-    if (need_stdout &&
-        lpr_install_stdio_fd_from_tty((uint64_t)(uint32_t)tty_fd, 1) < 0)
+    const int64_t stdout_status = need_stdout ?
+        lpr_install_stdio_fd_from_tty((uint64_t)(uint32_t)tty_fd, 1) : 0;
+    lpr_boot_diagnostic_emit("stdio.dup1", tty_fd, 1, need_stdout, stdout_status, 0);
+    if (stdout_status < 0)
     {
         (void)lpr_linux_close((uint64_t)(uint32_t)tty_fd);
         return;
     }
-    if (need_stderr &&
-        lpr_install_stdio_fd_from_tty((uint64_t)(uint32_t)tty_fd, 2) < 0)
+    const int64_t stderr_status = need_stderr ?
+        lpr_install_stdio_fd_from_tty((uint64_t)(uint32_t)tty_fd, 2) : 0;
+    lpr_boot_diagnostic_emit("stdio.dup2", tty_fd, 2, need_stderr, stderr_status, 0);
+    if (stderr_status < 0)
     {
         (void)lpr_linux_close((uint64_t)(uint32_t)tty_fd);
         return;
@@ -66,6 +89,22 @@ void lpr_linux_ensure_default_stdio(void)
     if (tty_fd > 2) {
         (void)lpr_linux_close((uint64_t)(uint32_t)tty_fd);
     }
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    for (uint32_t fd = 0; fd < 3; ++fd) {
+        lpr_fd_pin_t pin;
+        const int pinned = lpr_fd_table_pin(&lpr_control_fd_table, fd, &pin);
+        lpr_boot_diagnostic_emit("stdio.snapshot", fd,
+            pinned ? 0 : pin.ops_id,
+            pinned ? 0 : ((uint64_t)pin.fd_flags << 32) | pin.effective_rights,
+            pinned, 0);
+        if (!pinned && pin.ops_id == LPR_FD_OPS_TTY && pin.state) {
+            const lpr_tty_backend_t *tty = pin.state;
+            lpr_boot_diagnostic_emit("stdio.tty", fd, tty->handle,
+                (uint64_t)(int64_t)tty->wait_fd.raw, 0, tty->lease_fd.raw);
+        }
+        if (!pinned) lpr_fd_unpin(&pin);
+    }
+#endif
 }
 
 int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
@@ -101,6 +140,8 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         }
         uint64_t result = 0;
         const int64_t status = lpr_termd_call(op, page_fd, page, sizeof(*io), &result);
+        if (lpr_boot_diagnostic_tty_active())
+            lpr_boot_diagnostic_emit("tty.io.reply", op, io->handle, result, status, 0);
         if (status == 0 && op == TERMD_OP_HANDLE_READ && result != 0) {
             lpr_memcpy((void *)(uintptr_t)buf, io->data, (size_t)result);
         }
@@ -128,7 +169,11 @@ int64_t lpr_tty_io(uint64_t op, uint64_t fd, uint64_t buf, uint64_t count)
         {
             return status;
         }
+        if (lpr_boot_diagnostic_tty_active())
+            lpr_boot_diagnostic_emit("tty.wait.enter", fd, wait_events, 0, status, 0);
         const int64_t wait_status = lpr_tty_wait(fd, wait_events);
+        if (lpr_boot_diagnostic_tty_active())
+            lpr_boot_diagnostic_emit("tty.wait.return", fd, wait_events, 0, wait_status, 0);
         if (wait_status != 0) {
             return wait_status;
         }

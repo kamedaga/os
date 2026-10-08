@@ -26,175 +26,23 @@ static const char *lpr_exec_interpreter_namespace_path(const char *interp_path)
     return interp_path;
 }
 
-typedef struct lpr_runtime_image_cache {
-    lpr_exec_image_t image;
-    uint64_t backend_object;
-    uint64_t object_generation;
-    uint64_t size;
-    uint64_t syscall_entry_offset;
-    int valid;
-} lpr_runtime_image_cache_t;
-
-static lpr_runtime_image_cache_t lpr_runtime_image_cache;
-
-typedef struct lpr_interpreter_cache {
-    lpr_exec_file_t file;
-    lpr_exec_meta_t meta;
-    char path[LPR_EXEC_MAX_INTERP_BYTES];
-    int valid;
-} lpr_interpreter_cache_t;
-
-static lpr_interpreter_cache_t lpr_interpreter_cache;
-
-static void lpr_exec_clear_interpreter_cache(filed_runtime_t *runtime)
+static int lpr_exec_read_runtime_image(filed_runtime_t *runtime,
+    lpr_exec_image_t *image, uint64_t *entry)
 {
-    if (!lpr_interpreter_cache.valid) {
-        return;
-    }
-    lpr_exec_free_meta(&lpr_interpreter_cache.meta);
-    if (runtime != NULL) {
-        lpr_exec_close_file(runtime, &lpr_interpreter_cache.file);
-    } else {
-        memset(&lpr_interpreter_cache.file, 0, sizeof(lpr_interpreter_cache.file));
-    }
-    memset(&lpr_interpreter_cache, 0, sizeof(lpr_interpreter_cache));
+    int status = lpr_exec_read_absolute_image(runtime, LPR_IMAGE_RUNTIME_PATH, image);
+    if (!status) status = lpr_exec_image_find_symbol(image,
+        LPR_IMAGE_SYSCALL_ENTRY_SYMBOL, entry);
+    if (!status && !*entry) status = -8;
+    if (status) { free(image->bytes); memset(image, 0, sizeof(*image)); }
+    return status;
 }
-
-static int lpr_exec_get_interpreter_file(
-    filed_runtime_t *runtime,
-    const char *path,
-    const lpr_exec_file_t **out_file,
-    const lpr_exec_meta_t **out_meta)
+static int lpr_exec_read_interpreter(filed_runtime_t *runtime, const char *path,
+    lpr_exec_file_t *file, lpr_exec_meta_t *meta)
 {
-    if (runtime == NULL || path == NULL || out_file == NULL || out_meta == NULL || path[0] == '\0') {
-        return -22;
-    }
-    *out_file = NULL;
-    *out_meta = NULL;
-    if (lpr_interpreter_cache.valid && strcmp(lpr_interpreter_cache.path, path) == 0) {
-        const uint64_t now = lpr_exec_now_ns();
-        lpr_exec_metric("interpreter_cache_hit", now, now);
-        *out_file = &lpr_interpreter_cache.file;
-        *out_meta = &lpr_interpreter_cache.meta;
-        return 0;
-    }
-
-    {
-        const uint64_t now = lpr_exec_now_ns();
-        lpr_exec_metric("interpreter_cache_miss", now, now);
-    }
-
-    lpr_exec_file_t file;
-    lpr_exec_meta_t meta;
-    memset(&file, 0, sizeof(file));
-    memset(&meta, 0, sizeof(meta));
-    int status = lpr_exec_open_absolute_file(runtime, path, &file);
-    if (status != 0) {
-        return status;
-    }
-    status = lpr_exec_read_meta(runtime, &file, &meta);
-    if (status != 0) {
-        lpr_exec_close_file(runtime, &file);
-        return status;
-    }
-
-    lpr_exec_clear_interpreter_cache(runtime);
-    lpr_interpreter_cache.file = file;
-    lpr_interpreter_cache.meta = meta;
-    strncpy(lpr_interpreter_cache.path, path, sizeof(lpr_interpreter_cache.path) - 1u);
-    lpr_interpreter_cache.path[sizeof(lpr_interpreter_cache.path) - 1u] = '\0';
-    lpr_interpreter_cache.valid = 1;
-    *out_file = &lpr_interpreter_cache.file;
-    *out_meta = &lpr_interpreter_cache.meta;
-    return 0;
-}
-
-static int lpr_exec_get_runtime_image(
-    filed_runtime_t *runtime,
-    const lpr_exec_image_t **out_image,
-    uint64_t *out_syscall_entry_offset)
-{
-    lpr_exec_file_t file;
-
-    if (runtime == NULL || out_image == NULL || out_syscall_entry_offset == NULL) {
-        return -22;
-    }
-    *out_image = NULL;
-    *out_syscall_entry_offset = 0;
-    memset(&file, 0, sizeof(file));
-
-    if (lpr_runtime_image_cache.valid) {
-        *out_image = &lpr_runtime_image_cache.image;
-        *out_syscall_entry_offset = lpr_runtime_image_cache.syscall_entry_offset;
-        return 0;
-    }
-
-    int status = lpr_exec_open_absolute_file(runtime, LPR_IMAGE_RUNTIME_PATH, &file);
-    if (status != 0) {
-        return status;
-    }
-    if (lpr_runtime_image_cache.valid &&
-        lpr_runtime_image_cache.backend_object == file.backend_object &&
-        lpr_runtime_image_cache.object_generation == file.object_generation &&
-        lpr_runtime_image_cache.size == file.size)
-    {
-        lpr_exec_close_file(runtime, &file);
-        *out_image = &lpr_runtime_image_cache.image;
-        *out_syscall_entry_offset = lpr_runtime_image_cache.syscall_entry_offset;
-        return 0;
-    }
-
-    lpr_exec_image_t image;
-    memset(&image, 0, sizeof(image));
-    status = lpr_exec_read_full_file_image(runtime, &file, &image);
-    if (status != 0) {
-        lpr_exec_close_file(runtime, &file);
-        return status;
-    }
-    uint64_t syscall_entry_offset = 0;
-    status = lpr_exec_image_find_symbol(&image, LPR_IMAGE_SYSCALL_ENTRY_SYMBOL, &syscall_entry_offset);
-    if (status != 0 || syscall_entry_offset == 0) {
-        free(image.bytes);
-        lpr_exec_close_file(runtime, &file);
-        return status != 0 ? status : -8;
-    }
-
-    free(lpr_runtime_image_cache.image.bytes);
-    memset(&lpr_runtime_image_cache, 0, sizeof(lpr_runtime_image_cache));
-    lpr_runtime_image_cache.image = image;
-    lpr_runtime_image_cache.backend_object = file.backend_object;
-    lpr_runtime_image_cache.object_generation = file.object_generation;
-    lpr_runtime_image_cache.size = file.size;
-    lpr_runtime_image_cache.syscall_entry_offset = syscall_entry_offset;
-    lpr_runtime_image_cache.valid = 1;
-    lpr_exec_close_file(runtime, &file);
-
-    *out_image = &lpr_runtime_image_cache.image;
-    *out_syscall_entry_offset = syscall_entry_offset;
-    return 0;
-}
-
-void lpr_exec_invalidate_runtime_image_cache(uint64_t backend_object)
-{
-    if (backend_object == 0 ||
-        !lpr_runtime_image_cache.valid ||
-        lpr_runtime_image_cache.backend_object != backend_object)
-    {
-        return;
-    }
-    free(lpr_runtime_image_cache.image.bytes);
-    memset(&lpr_runtime_image_cache, 0, sizeof(lpr_runtime_image_cache));
-}
-
-void lpr_exec_invalidate_interpreter_cache(filed_runtime_t *runtime, uint64_t backend_object)
-{
-    if (backend_object == 0 ||
-        !lpr_interpreter_cache.valid ||
-        lpr_interpreter_cache.file.backend_object != backend_object)
-    {
-        return;
-    }
-    lpr_exec_clear_interpreter_cache(runtime);
+    int status = lpr_exec_open_absolute_file(runtime, path, file);
+    if (!status) status = lpr_exec_read_meta(runtime, file, meta);
+    if (status) lpr_exec_close_file(runtime, file);
+    return status;
 }
 
 typedef enum lpr_exec_stage_metric_id {
@@ -207,8 +55,6 @@ typedef enum lpr_exec_stage_metric_id {
     LPR_EXEC_STAGE_LOAD_LPR_RUNTIME,
     LPR_EXEC_STAGE_INSTALL_LOW_LAYOUT,
     LPR_EXEC_STAGE_LOAD_MAIN,
-    LPR_EXEC_STAGE_INTERPRETER_CACHE_HIT,
-    LPR_EXEC_STAGE_INTERPRETER_CACHE_MISS,
     LPR_EXEC_STAGE_OPEN_INTERPRETER,
     LPR_EXEC_STAGE_READ_INTERPRETER_META,
     LPR_EXEC_STAGE_LOAD_INTERPRETER,
@@ -236,7 +82,7 @@ typedef struct lpr_exec_stage_metric {
 } lpr_exec_stage_metric_t;
 
 typedef struct lpr_exec_one_metric {
-    char path[FILED_NAME_BYTES];
+    char path[LPR_EXEC_MAX_INTERP_BYTES];
     uint64_t total_before_reply_cycles;
     uint64_t prepare_inherit_cycles;
     uint64_t init_main_file_cycles;
@@ -259,8 +105,6 @@ static lpr_exec_stage_metric_t lpr_exec_stage_metrics[LPR_EXEC_STAGE_MAX] = {
     [LPR_EXEC_STAGE_LOAD_LPR_RUNTIME] = { .name = "load_lpr_runtime" },
     [LPR_EXEC_STAGE_INSTALL_LOW_LAYOUT] = { .name = "install_low_layout" },
     [LPR_EXEC_STAGE_LOAD_MAIN] = { .name = "load_main" },
-    [LPR_EXEC_STAGE_INTERPRETER_CACHE_HIT] = { .name = "interpreter_cache_hit" },
-    [LPR_EXEC_STAGE_INTERPRETER_CACHE_MISS] = { .name = "interpreter_cache_miss" },
     [LPR_EXEC_STAGE_OPEN_INTERPRETER] = { .name = "open_interpreter" },
     [LPR_EXEC_STAGE_READ_INTERPRETER_META] = { .name = "read_interpreter_meta" },
     [LPR_EXEC_STAGE_LOAD_INTERPRETER] = { .name = "load_interpreter" },
@@ -428,7 +272,6 @@ void filed_exec_linux_lpr_dump_metrics(void)
             metric->count == 0 ? 0 : metric->total_cycles / metric->count,
             metric->max_cycles);
     }
-    lpr_exec_image_dump_metrics();
     lpr_exec_map_dump_metrics();
 }
 
@@ -463,9 +306,12 @@ static int load_plan(
     const struct pacha_process_fd_grant *grants, uint64_t grant_count,
     lpr_exec_plan_t *plan)
 {
-    const lpr_exec_image_t *lpr_image = NULL;
-    const lpr_exec_file_t *interp_file = NULL;
-    const lpr_exec_meta_t *interp_meta = NULL;
+    lpr_exec_image_t owned_image = {0};
+    const lpr_exec_image_t *lpr_image = &owned_image;
+    lpr_exec_file_t owned_file = {0};
+    const lpr_exec_file_t *interp_file = &owned_file;
+    lpr_exec_meta_t owned_meta = {0};
+    const lpr_exec_meta_t *interp_meta = &owned_meta;
     lpr_exec_loaded_t lpr_loaded;
     lpr_exec_loaded_t main_loaded;
     lpr_exec_loaded_t interp_loaded;
@@ -487,14 +333,14 @@ static int load_plan(
     int status = lpr_exec_meta_get_interp_path(runtime, main_file, main_meta, interp_path, sizeof(interp_path));
     LPR_EXEC_STAGE_RECORD("get_interp", stage_start, stage_start_cycles);
     if (status != 0) {
-        return status;
+        goto cleanup;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-    status = lpr_exec_get_runtime_image(runtime, &lpr_image, &syscall_entry_offset);
+    status = lpr_exec_read_runtime_image(runtime, &owned_image, &syscall_entry_offset);
     LPR_EXEC_STAGE_RECORD("get_lpr_runtime", stage_start, stage_start_cycles);
     if (status != 0) {
         fprintf(stderr, "[filed] linux-lpr: runtime missing path=%s status=%d\n", LPR_IMAGE_RUNTIME_PATH, status);
-        return status;
+        goto cleanup;
     }
 
     const uint64_t process_rights =
@@ -514,7 +360,8 @@ static int load_plan(
         fprintf(stderr,
             "[filed] linux-lpr: load plan stage=process_create result=%d\n",
             process_fd);
-        return -12;
+        status = -12;
+        goto cleanup;
     }
     plan->process_fd = process_fd;
 
@@ -532,14 +379,14 @@ static int load_plan(
             "[filed] linux-lpr: load plan stage=load_lpr_runtime status=%d\n",
             status);
         lpr_exec_discard_process_fd(process_fd);
-        return status;
+        goto cleanup;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = 0;
     LPR_EXEC_STAGE_RECORD("install_low_layout", stage_start, stage_start_cycles);
     if (status != 0) {
         lpr_exec_discard_process_fd(process_fd);
-        return status;
+        goto cleanup;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
     status = lpr_exec_prepare_file_into_map_batch(
@@ -557,7 +404,7 @@ static int load_plan(
             status);
         lpr_exec_pending_map_batch_discard(&file_map_batch);
         lpr_exec_discard_process_fd(process_fd);
-        return status;
+        goto cleanup;
     }
 #if FILED_LPR_TRACE_BASES
     fprintf(stderr,
@@ -578,7 +425,7 @@ static int load_plan(
     if (interp_path[0] != '\0') {
         const char *load_interp_path = lpr_exec_interpreter_namespace_path(interp_path);
         LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
-        status = lpr_exec_get_interpreter_file(runtime, load_interp_path, &interp_file, &interp_meta);
+        status = lpr_exec_read_interpreter(runtime, load_interp_path, &owned_file, &owned_meta);
         LPR_EXEC_STAGE_RECORD("open_interpreter", stage_start, stage_start_cycles);
         if (status != 0) {
             fprintf(stderr,
@@ -588,7 +435,7 @@ static int load_plan(
                 status);
             lpr_exec_pending_map_batch_discard(&file_map_batch);
             lpr_exec_discard_process_fd(process_fd);
-            return status;
+            goto cleanup;
         }
         lpr_exec_metric_span("read_interpreter_meta", stage_start, stage_start, stage_start_cycles, stage_start_cycles);
         LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
@@ -607,7 +454,7 @@ static int load_plan(
                 status);
             lpr_exec_pending_map_batch_discard(&file_map_batch);
             lpr_exec_discard_process_fd(process_fd);
-            return status;
+            goto cleanup;
         }
 #if FILED_LPR_TRACE_BASES
         fprintf(stderr,
@@ -627,86 +474,14 @@ static int load_plan(
             status);
         lpr_exec_pending_map_batch_discard(&file_map_batch);
         lpr_exec_discard_process_fd(process_fd);
-        return status;
+        goto cleanup;
     }
-    return 0;
-}
-
-static int lpr_exec_prewarm_runtime(filed_runtime_t *runtime)
-{
-    const lpr_exec_image_t *lpr_image = NULL;
-    uint64_t syscall_entry_offset = 0;
-    lpr_exec_loaded_t loaded;
-
-    memset(&loaded, 0, sizeof(loaded));
-    int status = lpr_exec_get_runtime_image(runtime, &lpr_image, &syscall_entry_offset);
-    if (status != 0) {
-        return status;
-    }
-
-    const uint64_t process_rights =
-        PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_KILL |
-        PACHA_FD_RIGHT_MAP_INTO;
-    const int process_fd = pacha_process_create(process_rights, 0, NULL, 0);
-    if (process_fd < 16) {
-        return -12;
-    }
-    status = lpr_exec_load_image_with_low_layout_into_process(
-        process_fd,
-        lpr_image,
-        LPR_IMAGE_RUNTIME_BASE_VA,
-        0,
-        syscall_entry_offset,
-        &loaded);
-    lpr_exec_discard_process_fd(process_fd);
+    status = 0;
+cleanup:
+    free(owned_image.bytes);
+    lpr_exec_free_meta(&owned_meta);
+    lpr_exec_close_file(runtime, &owned_file);
     return status;
-}
-
-static int lpr_exec_prewarm_interpreter(filed_runtime_t *runtime)
-{
-    const lpr_exec_file_t *interp_file = NULL;
-    const lpr_exec_meta_t *interp_meta = NULL;
-    lpr_exec_pending_map_batch_t batch;
-    lpr_exec_loaded_t loaded;
-
-    lpr_exec_pending_map_batch_init(&batch);
-    memset(&loaded, 0, sizeof(loaded));
-    int status = lpr_exec_get_interpreter_file(
-        runtime,
-        "/lib/linux/ld-musl-x86_64.so.1",
-        &interp_file,
-        &interp_meta);
-    if (status != 0) {
-        return status;
-    }
-    status = lpr_exec_prepare_file_into_map_batch(
-        runtime,
-        interp_file,
-        interp_meta,
-        LPR_IMAGE_INTERP_DYN_BASE_VA,
-        1,
-        &batch,
-        &loaded);
-    lpr_exec_pending_map_batch_discard(&batch);
-    return status;
-}
-
-int filed_exec_linux_lpr_prewarm(struct filed_runtime *runtime)
-{
-    if (runtime == NULL) {
-        return -22;
-    }
-    int status = lpr_exec_prewarm_runtime(runtime);
-    if (status != 0) {
-        return status;
-    }
-    status = lpr_exec_prewarm_interpreter(runtime);
-    if (status != 0) {
-        return status;
-    }
-    return 0;
 }
 
 typedef struct lpr_exec_script_file_context {
@@ -794,7 +569,7 @@ static int filed_exec_linux_lpr_handle_mode(
     filed_exec_path_t resolved_request;
     lpr_exec_script_file_context_t script_context;
     unsigned char script_prefix[LPR_EXEC_SCRIPT_PREFIX_BYTES];
-    char executable_path[FILED_PATH_BYTES];
+    char executable_path[LPR_EXEC_MAX_INTERP_BYTES];
     struct pacha_process_fd_grant prepared[PACHA_PROCESS_CREATE_MAX_GRANTS];
     uint64_t prepared_count = 0;
     size_t script_prefix_length = 0;
@@ -813,6 +588,7 @@ static int filed_exec_linux_lpr_handle_mode(
     memset(&meta, 0, sizeof(meta));
     memset(&plan, 0, sizeof(plan));
     resolved_request = *request;
+    resolved_request.allocation = NULL;
     memset(&script_context, 0, sizeof(script_context));
     memset(script_prefix, 0, sizeof(script_prefix));
     memset(executable_path, 0, sizeof(executable_path));
@@ -836,6 +612,7 @@ static int filed_exec_linux_lpr_handle_mode(
     int status = filed_exec_build_grants(runtime, request, inherit_fds, inherit_fd_count, bootstrap_fd, prepared, &prepared_count);
     LPR_EXEC_STAGE_RECORD_TO("prepare_inherit_fds", stage_start, stage_start_cycles, prepare_inherit_cycles);
     if (status != 0) {
+        filed_exec_payload_destroy(&resolved_request);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
@@ -843,6 +620,7 @@ static int filed_exec_linux_lpr_handle_mode(
     LPR_EXEC_STAGE_RECORD_TO("init_main_file", stage_start, stage_start_cycles, init_main_file_cycles);
     if (status != 0) {
         fprintf(stderr, "[filed] linux-lpr: init main file failed status=%d\n", status);
+        filed_exec_payload_destroy(&resolved_request);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
@@ -874,11 +652,12 @@ static int filed_exec_linux_lpr_handle_mode(
             "[filed] linux-lpr: read main meta failed status=%d size=%llu backend=0x%llx generation=%llu\n",
             status,
             (unsigned long long)file.size,
-            (unsigned long long)file.backend_object,
-            (unsigned long long)file.object_generation);
+            (unsigned long long)file.handle_id,
+            (unsigned long long)0);
         if (script_context.owns_file) {
             lpr_exec_close_file(runtime, &file);
         }
+        filed_exec_payload_destroy(&resolved_request);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
@@ -893,8 +672,9 @@ static int filed_exec_linux_lpr_handle_mode(
             "[filed] linux-lpr: load plan failed status=%d size=%llu backend=0x%llx generation=%llu\n",
             status,
             (unsigned long long)file.size,
-            (unsigned long long)file.backend_object,
-            (unsigned long long)file.object_generation);
+            (unsigned long long)file.handle_id,
+            (unsigned long long)0);
+        filed_exec_payload_destroy(&resolved_request);
         return status;
     }
     LPR_EXEC_STAGE_BEGIN(stage_start, stage_start_cycles);
@@ -906,6 +686,7 @@ static int filed_exec_linux_lpr_handle_mode(
             (void)pacha_fd_close(plan.thread_fd);
         }
         lpr_exec_discard_process_fd(plan.process_fd);
+        filed_exec_payload_destroy(&resolved_request);
         return status;
     }
     *out_process_fd = plan.process_fd;
@@ -938,6 +719,7 @@ static int filed_exec_linux_lpr_handle_mode(
         }
     }
 #endif
+    filed_exec_payload_destroy(&resolved_request);
     return 0;
 }
 

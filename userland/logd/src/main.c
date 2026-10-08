@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: MIT */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "logd/boot_config.h"
 #include "pacha/log.h"
 #include "pacha/bootstrap.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
-#include "filed/payload.h"
-#include "filed/ipc_protocol.h"
+#include "filed_client/client.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -28,9 +31,7 @@ struct logd_pending {
 };
 
 struct logd_state {
-    int filed_fd, page_fd;
-    void *page;
-    uint64_t request_id;
+    int filed_fd;
     uint64_t line_sequence;
     unsigned next_slot;
     struct logd_pending pending[LOGD_PENDING_SLOTS];
@@ -44,99 +45,43 @@ struct logd_state {
     unsigned kernel_publish_pending;
 };
 
-static int filed_call(struct logd_state *state, uint32_t operation,
-    size_t payload_size, uint64_t *out_result)
+static int filed_call(struct logd_state *state, kb2_fs_request_t *request,
+    const char *path, const void *data, size_t length, kb2_fs_response_t *response)
 {
-    pacha_service_envelope_t *header = state->page;
-    const uint64_t id = ++state->request_id;
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_SERVICE_ID;
-    header->op = operation;
-    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
-    header->request_id = id;
-    header->trace_id = id;
-    header->payload_size = payload_size;
-    header->fd_count = 0;
-    struct pacha_ipc_fd transfer = {
-        .fd = (uint64_t)(uint32_t)state->page_fd,
-        .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
-    };
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word3 = id,
-        .fds = &transfer,
-        .fd_count = 1,
-    };
-    const int reply_fd = pacha_ipc_call(state->filed_fd, &request);
-    if (reply_fd < 16) return reply_fd;
-    struct pacha_ipc_msg reply = {0};
-    const int received = pacha_ipc_recv_wait(reply_fd, &reply,
-        PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    if (received != 0) return received;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        header->service_id != FILED_SERVICE_ID || header->op != operation ||
-        header->request_id != id)
-        return -EIO;
-    if (header->status != 0) return (int)header->status;
-    if (out_result) *out_result = header->result;
-    return 0;
+    int status = filedfs_call(state->filed_fd, request, path, NULL, data, length,
+        NULL, 0, response, NULL, 0, NULL, NULL);
+    return status ? status : response->result < 0 ? (int)response->result : 0;
 }
 
 static int ensure_directory(struct logd_state *state)
 {
-    memset(state->page, 0, FILED_PAGE_BYTES);
-    filed_mkdir_t *request = (void *)((char *)state->page +
-        PACHA_SERVICE_HEADER_BYTES);
-    request->mode = 0755;
-    memcpy(request->name, LOGD_DIR, sizeof(LOGD_DIR));
-    const int result = filed_call(state, FILED_OP_VFS_MKDIR,
-        sizeof(*request), NULL);
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_MKDIRAT, .mode = 0755};
+    kb2_fs_response_t response;
+    int result = filed_call(state, &request, LOGD_DIR, NULL, 0, &response);
     return result == -EEXIST ? 0 : result;
 }
 
 static int publish_file(struct logd_state *state, const char *path,
     const char *bytes, size_t length)
 {
-    memset(state->page, 0, FILED_PAGE_BYTES);
-    filed_path_request_t *open = (void *)((char *)state->page +
-        PACHA_SERVICE_HEADER_BYTES);
-    open->rights = FILED_RIGHT_WRITE | FILED_RIGHT_STAT;
-    open->flags = FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE | FILED_OPEN_CLOEXEC;
-    open->create_mode_or_result_kind = FILED_CREATE_MODE_VALID | 0600;
-    snprintf(open->path, sizeof(open->path), "%s", path);
-    uint64_t handle = 0;
-    int result = filed_call(state, FILED_OP_VFS_OPENAT,
-        sizeof(*open), &handle);
-    if (result != 0) return result;
-
-    for (size_t offset = 0; result == 0 && offset < length;) {
-        const size_t chunk = length - offset < FILED_IO_BYTES ?
-            length - offset : FILED_IO_BYTES;
-        memset(state->page, 0, FILED_PAGE_BYTES);
-        filed_io_t *write = (void *)((char *)state->page +
-            PACHA_SERVICE_HEADER_BYTES);
-        write->handle = handle;
-        write->offset = offset;
-        write->length = chunk;
-        memcpy(write->data, bytes + offset, chunk);
-        uint64_t written = 0;
-        result = filed_call(state, FILED_OP_VFS_PWRITE,
-            sizeof(*write), &written);
-        if (result == 0 && written != chunk) result = -EIO;
-        offset += chunk;
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
+        .flags = O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, .mode = 0600};
+    kb2_fs_response_t response;
+    int result = filed_call(state, &request, path, NULL, 0, &response);
+    if (result) return result;
+    const uint64_t handle = response.handle;
+    for (size_t offset = 0; !result && offset < length;) {
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_PWRITE,
+            .handle = handle, .offset = (int64_t)offset, .length = length - offset};
+        result = filed_call(state, &request, NULL, bytes + offset,
+            length - offset, &response);
+        if (!result && (response.result <= 0 ||
+            (uint64_t)response.result > length - offset)) result = -EIO;
+        if (!result) offset += (size_t)response.result;
     }
-
-    memset(state->page, 0, FILED_PAGE_BYTES);
-    filed_handle_request_t *close = (void *)((char *)state->page +
-        PACHA_SERVICE_HEADER_BYTES);
-    close->handle = handle;
-    const int closed = filed_call(state, FILED_OP_VFS_CLOSE,
-        sizeof(*close), NULL);
-    return result != 0 ? result : closed;
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_CLOSE, .handle = handle};
+    int closed = filed_call(state, &request, NULL, NULL, 0, &response);
+    return result ? result : closed;
 }
 
 static int publish(struct logd_state *state)
@@ -171,7 +116,6 @@ static int drain_kernel_log(struct logd_state *state)
     int dirty = 0;
     for (unsigned i = 0; i < 64; ++i) {
         struct pacha_kernel_log_read request = {
-            .version = PACHA_KERNEL_LOG_READ_VERSION,
             .cursor = state->kernel_cursor,
             .limit = PACHA_KERNEL_LOG_READ_MAX_BYTES,
         };
@@ -303,26 +247,16 @@ int main(int argc, char **argv)
     struct logd_boot_config config = {0};
     if (bootstrap < 16 ||
         pacha_fd_read(bootstrap, &config, sizeof(config)) != (long)sizeof(config) ||
-        config.magic != LOGD_BOOT_MAGIC || config.version != LOGD_BOOT_VERSION ||
+        config.magic != LOGD_BOOT_MAGIC || config.size != sizeof(config) ||
         config.endpoint_fd < 16 || config.filed_endpoint_fd < 16 ||
         config.ready_channel_fd < 16)
         return 2;
     (void)pacha_fd_close(bootstrap);
     struct logd_state state = {
         .filed_fd = (int)config.filed_endpoint_fd,
-        .page_fd = -1,
         .kernel_timer_fd = -1,
     };
-    const uint64_t page_rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    state.page_fd = pacha_vmo_create(FILED_PAGE_BYTES, page_rights, 0);
-    int status = state.page_fd < 16 ? -ENOMEM : 0;
-    if (status == 0) {
-        state.page = pacha_mmap(state.page_fd, FILED_PAGE_BYTES,
-            PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
-        if (!state.page) status = -ENOMEM;
-    }
-    if (status == 0) status = ensure_directory(&state);
+    int status = ensure_directory(&state);
     if (status == 0) {
         ring_append(&state, 0, "RAM service log started", 23);
         status = publish(&state);

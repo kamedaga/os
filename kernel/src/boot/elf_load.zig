@@ -169,7 +169,7 @@ pub fn loadUserElfIntoProcessPages(
             return null;
         }
         var paddrs = [_]u64{extra_page.paddr};
-        state.installNativeVmoPages(extra_vmo_ref, page_index - 1, paddrs[0..]) catch |err| {
+        state.installNativeVmoPages(extra_vmo_ref, page_index - 1, paddrs[0..], free_list) catch |err| {
             log_util.logIndexedError("loadUserElfIntoProcessPages: install extra VMO page failed idx=", page_index, err);
             if (extra_vmo_fd) |fd| _ = state.closeFdWithFreeList(principal, fd, free_list) catch {};
             return null;

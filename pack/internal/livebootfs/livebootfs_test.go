@@ -50,6 +50,7 @@ func TestDefaultSpecUsesExistingAppsAndHasShellClosure(t *testing.T) {
 	}
 	for _, destination := range []string{
 		"/etc/pacha/gpu-probe.conf", "/srv/gpud.elf",
+		"/etc/pacha/installer-mode",
 	} {
 		if _, present := spec.Files[destination]; present {
 			t.Errorf("ordinary live bootfs must not arm GPU inspection: %s", destination)
@@ -63,6 +64,7 @@ func TestDefaultSpecUsesExistingAppsAndHasShellClosure(t *testing.T) {
 	for _, destination := range []string{
 		"/etc/pacha/boot-profile",
 		"/bin/ash", "/bin/sh", "/bin/busybox",
+		"/usr/lib/pachaos/ld-musl-x86_64.so.1", "/usr/lib/pachaos/libc.so",
 		"/lib/ld-musl-x86_64.so.1", "/lib/libc.so",
 		"/lib/linux/ld-musl-x86_64.so.1",
 		"/lib/libc.musl-x86_64.so.1",
@@ -75,6 +77,45 @@ func TestDefaultSpecUsesExistingAppsAndHasShellClosure(t *testing.T) {
 		if spec.Files[destination] == "" {
 			t.Errorf("missing console dependency %s", destination)
 		}
+	}
+	for destination, appID := range map[string]string{
+		"/usr/lib/pachaos/ld-musl-x86_64.so.1": "pachaos_musl_ldso",
+		"/usr/lib/pachaos/libc.so":             "pachaos_musl_libc",
+		"/lib/ld-musl-x86_64.so.1":             "lpr_linux_musl_libc",
+		"/lib/libc.so":                         "lpr_linux_musl_libc",
+	} {
+		if spec.Files[destination] != appID {
+			t.Errorf("runtime ABI mismatch: %s is %s, want %s", destination, spec.Files[destination], appID)
+		}
+	}
+}
+
+func TestInstallerMarkerIsSeparateFromOrdinaryLiveProfile(t *testing.T) {
+	root, err := config.FindRoot(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := config.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay, err := LoadSpec(workspace.Path("pack/installer-bootfs.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overlay.Files["/etc/pacha/installer-mode"] != "installer_mode_marker" ||
+		overlay.Files["/srv/kobox2/nvme/modules/nvme.ko"] != "kobox2_nvme_module" ||
+		overlay.Files["/srv/installerd.elf"] != "installerd" ||
+		overlay.Files["/sbin/pacha-install-runner"] != "installer_runner" ||
+		overlay.Files["/sbin/pacha-live-import"] != "live_desktop_import" ||
+		overlay.Files["/usr/bin/pacha-live-desktop"] != "live_desktop_launcher" ||
+		overlay.Files["/sbin/pacha-install-progress"] != "installer_progress" ||
+		overlay.Files["/sbin/e2fsck"] != "installer_e2fsck" {
+		t.Fatalf("unexpected installer overlay: %+v", overlay.Files)
+	}
+	marker, err := os.ReadFile(workspace.Path("pack/installer-bootfs/marker"))
+	if err != nil || string(marker) != "installer-v1\n" {
+		t.Fatalf("invalid installer marker %q: %v", marker, err)
 	}
 }
 
@@ -91,12 +132,14 @@ func TestAMDGPUProbeOverlayContainsOnlyOptionalPackages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(overlay.Files) != 5 ||
+	if len(overlay.Files) != 7 ||
 		overlay.Files["/etc/pacha/gpu-probe.conf"] != "amdgpu_probe_policy" ||
 		overlay.Files["/srv/gpud.elf"] != "gpud" ||
 		overlay.Files["/srv/amdgpu-mesa-runtime.tar.gz"] != "amdgpu_mesa_runtime" ||
 		overlay.Files["/srv/amdgpu-driver-package.tar.gz"] != "amdgpu_driver_archive" ||
-		overlay.Files["/srv/amdgpu-driver-package.tar.gz.sha256"] != "amdgpu_driver_archive_digest" {
+		overlay.Files["/srv/amdgpu-driver-package.tar.gz.sha256"] != "amdgpu_driver_archive_digest" ||
+		overlay.Files["/srv/frame-profile.tar.gz"] != "live_frame_profile" ||
+		overlay.Files["/usr/bin/pacha-frame-profile"] != "live_frame_runner" {
 		t.Fatalf("unexpected AMDGPU probe overlay: %+v", overlay.Files)
 	}
 	if overlay.SHA256["amdgpu_mesa_runtime"] == "" {
@@ -245,6 +288,21 @@ func TestBuildNoBuildLeavesNormalImagesUntouched(t *testing.T) {
 		if err != nil || string(data) != "preserve" {
 			t.Fatalf("normal image %s changed: %q, %v", filename, data, err)
 		}
+	}
+	if err := os.WriteFile(workspace.Path("unused"), []byte("updated script"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(workspace, Options{NoBuild: true}); err == nil || !strings.Contains(err.Error(), "stale staged file") {
+		t.Fatalf("stale source accepted: %v", err)
+	}
+	if after, err := os.ReadFile(result.Image); err != nil || !bytes.Equal(after, image) {
+		t.Fatalf("stale source failure changed prior image: %v", err)
+	}
+	if err := os.WriteFile(workspace.Path("unused"), []byte("test shell image"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(workspace, Options{NoBuild: true}); err != nil {
+		t.Fatalf("matching copied source rejected: %v", err)
 	}
 	badLock := "schema: 1\nsha256:\n  ash: " + strings.Repeat("0", 64) + "\nfiles:\n  /bin/ash: ash\n"
 	if err := os.WriteFile(workspace.Path(SpecPath), []byte(badLock), 0o644); err != nil {

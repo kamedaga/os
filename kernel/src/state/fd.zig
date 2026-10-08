@@ -1485,7 +1485,19 @@ pub fn registerTaskReadableWaiterForFd(
         self.task_fd_waiters[target] = .{};
         return err;
     };
+    if (entry.object.kind == .timer) self.task_timer_waiter_slots.set(target);
     return true;
+}
+
+fn retireTaskReadableWaiter(self: anytype, slot_index: usize) void {
+    const waiter = &self.task_fd_waiters[slot_index];
+    // The object may already be destroyed or reused; unindex using the
+    // linked record's kind, not the current payload in the object table.
+    if (waiter.active and waiter.object.kind == .timer) {
+        std.debug.assert(self.task_timer_waiter_slots.isSet(slot_index));
+        self.task_timer_waiter_slots.unset(slot_index);
+    }
+    waiter.* = .{};
 }
 
 pub fn unregisterTaskReadableWaiterForThread(
@@ -1495,10 +1507,10 @@ pub fn unregisterTaskReadableWaiterForThread(
 ) void {
     if (thread_index > std.math.maxInt(u32)) return;
     const thread_index_u32: u32 = @intCast(thread_index);
-    for (&self.task_fd_waiters) |*waiter| {
+    for (&self.task_fd_waiters, 0..) |*waiter, slot_index| {
         if (!waiter.active or waiter.binding.completion_pending) continue;
         if (waiter.thread_index == thread_index_u32 and waiter.thread_generation == thread_generation) {
-            waiter.* = .{};
+            retireTaskReadableWaiter(self, slot_index);
         }
     }
 }
@@ -1622,7 +1634,9 @@ pub fn takeReadyIrqWaiters(
 pub fn takeReadyTimerWaiters(self: anytype, now_ns: u64, out: []ThreadWakeTarget) usize {
     const fd_abi = @import("kernel_abi_root").fd_abi;
     var count: usize = 0;
-    for (&self.task_fd_waiters) |*waiter| {
+    var slots = self.task_timer_waiter_slots.iterator(.{ .direction = .forward });
+    while (slots.next()) |slot_index| {
+        const waiter = &self.task_fd_waiters[slot_index];
         if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer or
             (waiter.events & fd_abi.event_readable) == 0) continue;
         const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
@@ -1647,7 +1661,9 @@ pub fn takeReadyTimerWaiters(self: anytype, now_ns: u64, out: []ThreadWakeTarget
 
 pub fn nextTimerWaiterDeadline(self: anytype) ?u64 {
     var earliest: ?u64 = null;
-    for (&self.task_fd_waiters) |*waiter| {
+    var slots = self.task_timer_waiter_slots.iterator(.{ .direction = .forward });
+    while (slots.next()) |slot_index| {
+        const waiter = &self.task_fd_waiters[slot_index];
         if (!waiter.active or waiter.binding.completion_pending or waiter.object.kind != .timer) continue;
         const slot = self.kernelObjectSlotConst(waiter.object) orelse continue;
         const deadline = slot.payload.timer.deadline_ns;
@@ -1799,7 +1815,7 @@ pub fn cancelFdWaitGroup(self: anytype, group: FdWaitGroupRef, wait_token: u64) 
                     waiter.binding.group.matches(group) and
                     waiter.binding.link_index == link_index)
                 {
-                    waiter.* = .{};
+                    retireTaskReadableWaiter(self, registration.slot);
                 }
             }
             continue;

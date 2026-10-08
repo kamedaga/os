@@ -1,0 +1,23 @@
+#!/bin/ash
+# SPDX-License-Identifier: MIT
+set -eu
+[ -f /run/pacha/live-desktop.ready ] || {
+    echo "Desktop files are not prepared; see /run/pacha/live-desktop.log" >&2
+    exit 1
+}
+[ -c /dev/dri/card0 ] && [ -c /dev/dri/renderD128 ] || {
+    echo "GPU nodes are not ready. Complete the manual GPU probe first." >&2
+    exit 1
+}
+busybox mkdir -p /run/user/0 /var/log /var/cache/fontconfig
+busybox chmod 0700 /run/user/0
+# Keep the ordinary upstream startx -> xinit -> Xorg -> Xfce path. No monitor
+# geometry, PCI ID, software-renderer fallback or rootfs fixture is selected.
+export HOME=/root USER=root LOGNAME=root SHELL=/bin/ash
+export XDG_RUNTIME_DIR=/run/user/0
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LD_LIBRARY_PATH=/usr/lib:/lib
+export LIBGL_DRIVERS_PATH=/usr/lib/dri
+export GBM_BACKENDS_PATH=/usr/lib/gbm
+unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER MESA_LOADER_DRIVER_OVERRIDE
+exec /usr/bin/startx /root/.xinitrc -- :0 -nolisten tcp -logfile /run/pacha/Xorg.0.log

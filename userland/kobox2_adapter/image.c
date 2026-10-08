@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "host.h"
 #include "boot.h"
+#include "arch/x86_64/fp_entry.h"
 #if defined(PH_SANDBOX_DEVICE) && PH_SANDBOX_DEVICE
 #include "device_dma.h"
 #endif
@@ -88,7 +89,7 @@ static int memory_map(void *opaque, size_t offset, void *backing,
         (protection & ~PH_PROTECTION_MASK) != 0 ||
         (offset | backing_offset | size) % PH_PAGE_SIZE != 0 ||
         !contains_range(window->size, offset, size) ||
-        !contains_range(PH_RAM_SIZE, backing_offset, size)) {
+        !contains_range(image->ram_size, backing_offset, size)) {
         return 1;
     }
 
@@ -135,7 +136,7 @@ static int memory_map_pages(void *opaque, size_t offset, void *backing,
     }
     size = page_count * PH_PAGE_SIZE;
     for (size_t i = 0; i < page_count; ++i) {
-        if (page_indices[i] >= PH_RAM_SIZE / PH_PAGE_SIZE) return 1;
+        if (page_indices[i] >= image->ram_size / PH_PAGE_SIZE) return 1;
     }
 
     PH_OK(ph_notifications_save(&previous_mask));
@@ -245,7 +246,7 @@ static int memory_protect(void *opaque, size_t offset, size_t size, unsigned pro
 static int memory_set_cache(void *backing, size_t offset, size_t size, unsigned int cache) {
     struct ph_image *image = backing;
     if (image == NULL || image->ram_fd < 16 || size == 0 ||
-        (offset | size) % PH_PAGE_SIZE != 0 || !contains_range(PH_RAM_SIZE, offset, size) ||
+        (offset | size) % PH_PAGE_SIZE != 0 || !contains_range(image->ram_size, offset, size) ||
         cache > KOBOX_LINUX_MEMORY_CACHE_WC || !image->ram_cache_modes) return 1;
     size_t page = offset / PH_PAGE_SIZE;
     const size_t end = page + size / PH_PAGE_SIZE;
@@ -272,10 +273,17 @@ static int memory_set_cache(void *backing, size_t offset, size_t size, unsigned 
 #if defined(PH_SANDBOX_DEVICE) && PH_SANDBOX_DEVICE
             size_t direct = 0, scattered = 0;
             uint64_t sample_iova = 0;
-            const int inventory_status = image->device_dma ?
-                ph_dma_cache_overlap(image->device_dma,
-                    first * PH_PAGE_SIZE, bytes, &direct, &scattered,
-                    &sample_iova) : -1;
+            int inventory_status = image->device_dma ? 0 : -1;
+            for (struct ph_dma *dma = image->device_dma; dma; dma = dma->image_next) {
+                size_t local_direct = 0, local_scattered = 0;
+                uint64_t local_iova = 0;
+                int status = ph_dma_cache_overlap(dma, first * PH_PAGE_SIZE,
+                    bytes, &local_direct, &local_scattered, &local_iova);
+                direct += local_direct;
+                scattered += local_scattered;
+                if (!sample_iova) sample_iova = local_iova;
+                if (status) inventory_status = status;
+            }
             ph_boot_log_gpu_cache_reject(result, first * PH_PAGE_SIZE, bytes,
                 direct, scattered, sample_iova, inventory_status);
 #endif
@@ -356,9 +364,13 @@ int ph_image_protect(void *opaque, size_t offset, size_t length, unsigned protec
         length, direct_protection);
 }
 
-static struct kobox_runtime_thread_state *thread_state(void *opaque) {
+/* CPU/IRQ queries run with Linux's FP bank live, so TLS lookup must remain
+ * an integer-only leaf, including its compiler entry/return instructions.
+ * Linux reads this unmasked: the fiber comes from one %fs-relative load, and
+ * its state follows the task, so the pointer stays right after migration. */
+static KOBOX_GPR_LEAF struct kobox_runtime_thread_state *thread_state(void *opaque) {
     (void)opaque;
-    return &ph_current_task()->runtime;
+    return &ph_current_fiber()->runtime;
 }
 
 void *ph_image_lookup(void *opaque, const char *name) {
@@ -378,12 +390,12 @@ static void allocate_image_memory(struct ph_image *image) {
         PACHA_FD_RIGHT_REVOKE | PACHA_FD_RIGHT_SHARE | PACHA_FD_RIGHT_INSPECT |
         PACHA_FD_RIGHT_CACHE_POLICY;
 
-    image->ram_fd = (int)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, PH_RAM_SIZE, rights, 0);
+    image->ram_fd = (int)pacha_syscall3(PACHA_FD_SYSCALL_VMO_CREATE, image->ram_size, rights, 0);
     PH_CHECK(image->ram_fd >= 16);
-    image->ram_cache_modes = ph_alloc(PH_RAM_SIZE / PH_PAGE_SIZE);
+    image->ram_cache_modes = ph_alloc(image->ram_size / PH_PAGE_SIZE);
     PH_CHECK(image->ram_cache_modes != NULL);
     memset(image->ram_cache_modes, KOBOX_LINUX_MEMORY_CACHE_WB,
-        PH_RAM_SIZE / PH_PAGE_SIZE);
+        image->ram_size / PH_PAGE_SIZE);
     image->cache_drain_completed = false;
     cache_image = image;
 
@@ -400,8 +412,8 @@ static void allocate_image_memory(struct ph_image *image) {
     initialize_window_tracking(&vmemmap_window);
     initialize_window_tracking(&vmalloc_window);
 
-    direct_window = reserve_window(PH_RAM_SIZE);
-    PH_OK(memory_map(&direct_window, 0, image, 0, PH_RAM_SIZE,
+    direct_window = reserve_window(image->ram_size);
+    PH_OK(memory_map(&direct_window, 0, image, 0, image->ram_size,
         KOBOX_IMAGE_READ | KOBOX_IMAGE_WRITE, &image->direct));
     image->base = image->window.base;
     void *mapped;
@@ -491,10 +503,13 @@ static void bind_core_runtime(struct ph_image *image) {
 
 int ph_image_open(struct ph_image *image, const void *file, size_t size) {
     PH_CHECK(image && file);
+    if (!image->ram_size) image->ram_size = PH_RAM_SIZE;
+    PH_CHECK(!(image->ram_size % PH_PAGE_SIZE) &&
+        image->ram_size > PH_IMAGE_PHYSICAL_BASE);
     PH_CHECK(kobox_fixed_image_open(file, size, PH_PAGE_SIZE, &image->fixed) ==
         KOBOX_FIXED_IMAGE_OK);
     PH_CHECK(image->fixed.link_base == KOBOX_CORE_LINK_BASE);
-    PH_CHECK(image->fixed.image_size <= PH_RAM_SIZE - PH_IMAGE_PHYSICAL_BASE);
+    PH_CHECK(image->fixed.image_size <= image->ram_size - PH_IMAGE_PHYSICAL_BASE);
     image->size = image->fixed.image_size;
 
     allocate_image_memory(image);
@@ -521,7 +536,7 @@ void ph_layout_init(struct ph_image *image, struct kobox_linux_boot_layout *layo
             .size = sizeof(layout->task),
             .identity = KOBOX_LINUX_TASK_HOST_IDENTITY,
             .operations = &ph_task_ops,
-            .boot_task = ph_current_task(),
+            .boot_task = ph_current_fiber(),
             .memory = {
                 .size = sizeof(layout->task.memory),
                 .identity = KOBOX_LINUX_MEMORY_HOST_IDENTITY,
@@ -531,7 +546,7 @@ void ph_layout_init(struct ph_image *image, struct kobox_linux_boot_layout *layo
                 .vmemmap_window = &vmemmap_window,
                 .vmalloc_window = &vmalloc_window,
                 .direct_map = image->direct,
-                .ram_size = PH_RAM_SIZE,
+                .ram_size = image->ram_size,
                 .vmemmap_base = vmemmap_window.base,
                 .vmemmap_size = vmemmap_window.size,
                 .vmalloc_base = vmalloc_window.base,

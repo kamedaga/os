@@ -1,0 +1,24 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+set -eu
+case "${1:-}" in pipeline|split|queued|clock|clock-stress) ;; *) echo 'usage: pacha-frame-profile pipeline|split|queued|clock|clock-stress' >&2; exit 2;; esac
+if [ "$#" -ne 1 ]; then exit 2; fi
+case "$1" in clock|clock-stress) ;; *)
+if [ ! -S /tmp/.X11-unix/X0 ]; then
+    echo 'Frame profiling requires the running live desktop.' >&2
+    exit 1
+fi
+;; esac
+# The desktop supplies GL/X11, not the base bootfs. Import only our two small
+# diagnostic files into RAM; neither SSD nor USB is a write target.
+if [ ! -x /usr/libexec/pacha/frame-profile.elf ] || [ ! -x /usr/libexec/pacha/clock-rate.elf ]; then
+    busybox tar -xzf /srv/frame-profile.tar.gz -C /
+fi
+case "$1" in
+clock) exec /usr/libexec/pacha/clock-rate.elf idle;;
+clock-stress) exec /usr/libexec/pacha/clock-rate.elf stress;;
+esac
+exec busybox env DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-/root/.Xauthority}" \
+    LD_LIBRARY_PATH=/usr/lib:/lib LIBGL_DRIVERS_PATH=/usr/lib/dri \
+    GBM_BACKENDS_PATH=/usr/lib/gbm LD_PRELOAD=/usr/lib/pacha/frame-trace.so \
+    /usr/libexec/pacha/frame-profile.elf "$1"

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "kobox2_package.h"
+#include "../../kobox2_owner/boot.h"
 
 #include <filed_client/module_image.h>
 #include <kobox2/closure.h>
@@ -275,7 +276,7 @@ int netd_kobox2_package_configure_controller(
     kb2_closure_builder_destroy(builder);
     if (status != KB2_STATUS_OK) return -22;
     uint8_t capability_digest[32], channel_digest[32];
-    static const char channel_contract[] = "kobox2-lifecycle-ipc-v1";
+    static const char channel_contract[] = PH_OWNER_CHANNEL_CONTRACT;
     kb2_sha256(device_schema, sizeof(device_schema), capability_digest);
     kb2_sha256(channel_contract, sizeof(channel_contract) - 1, channel_digest);
     const uint8_t *const digests[] = {

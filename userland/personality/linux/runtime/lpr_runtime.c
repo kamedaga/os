@@ -17,7 +17,7 @@ static uint64_t lpr_read_tsc(void)
 __attribute__((section(".lpr_note"), used))
 const struct personality_lpr_note lpr_personality_note = {
     .magic = PERSONALITY_LPR_NOTE_MAGIC,
-    .version = PERSONALITY_ABI_VERSION,
+    .size = sizeof(struct personality_lpr_note),
     .personality_id = PERSONALITY_ID_LINUX,
     .flags = 0,
     .lpr_start_offset = 0,
@@ -34,7 +34,7 @@ int64_t lpr_start(struct lpr_runtime_page *runtime) {
         return -PERSONALITY_STATUS_INVALID;
     }
     runtime->magic = LPR_RUNTIME_MAGIC;
-    runtime->version = LPR_RUNTIME_VERSION;
+    runtime->size = sizeof(*runtime);
     runtime->personality_id = PERSONALITY_ID_LINUX;
     runtime->flags = 0;
     runtime->fd_generation = 1;

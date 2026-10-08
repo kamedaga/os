@@ -9,8 +9,10 @@
 #define GPUD_DRM_VERSION_BYTES \
     (GPUD_DRM_VERSION_NAME_BYTES + GPUD_DRM_VERSION_DATE_BYTES + GPUD_DRM_VERSION_DESC_BYTES)
 #define GPUD_DRM_STAGED_INPUT_BYTES \
-    (GPUD_DRM_KMS_CONNECTOR_CAPACITY * sizeof(uint32_t) + \
-     sizeof(gpud_drm_modeinfo_t))
+    (GPUD_DRM_ATOMIC_OBJECT_CAPACITY * \
+         KB2_GPU_DRM_MODE_RECORD_ATOMIC_OBJECT_SIZE + \
+     GPUD_DRM_ATOMIC_PROPERTY_CAPACITY * \
+         KB2_GPU_DRM_MODE_RECORD_ATOMIC_PROPERTY_SIZE)
 
 /* Resolved by the authenticated gpud session owner, not copied from a peer.
  * The frontend handle identifies an LPR open-file description. session_id is

@@ -17,7 +17,7 @@ existing wire offsets.
 | Offset | Size | Request | Reply |
 |---:|---:|---|---|
 | 0 | 8 | `magic = PACHA_SERVICE_REQUEST_MAGIC` | `magic = PACHA_SERVICE_REPLY_MAGIC` |
-| 8 | 4 | `abi_version` | `abi_version` |
+| 8 | 4 | `header_size = sizeof(pacha_service_envelope_t)` | same actual header size |
 | 12 | 4 | `service_id` | `service_id` |
 | 16 | 4 | `op` | `op` |
 | 20 | 4 | `flags` | `flags` |
@@ -31,6 +31,9 @@ existing wire offsets.
 `reply_payload_size` exclude the 64-byte envelope. The envelope size is fixed by
 `PACHA_SERVICE_HEADER_BYTES`; the normal page size is
 `PACHA_SERVICE_PAGE_BYTES`.
+
+There is no numeric ABI version. The receiver checks the actual header extent;
+all producers and consumers are rebuilt together, without accepting old layouts.
 
 Compact `pacha_ipc_msg` boundaries use the same request/reply magic constants.
 Their first four words retain the layout `magic`, `op` or `status`, payload or

@@ -157,6 +157,8 @@ pub const fdRightsFromBits = types.fdRightsFromBits;
 pub const fdRightsToBits = types.fdRightsToBits;
 pub const isFdRightsSubset = types.isFdRightsSubset;
 pub const vmObjectBackingStoreStats = types.vmObjectBackingStoreStats;
+pub const vmObjectBackingStoreBreakdown = types.vmObjectBackingStoreBreakdown;
+pub const reclaimVmoBackingStorage = types.reclaimVmoBackingStorage;
 pub const AnonymousMapCapacity = vma_state.AnonymousMapCapacity;
 pub const VmoBackingStoreOwnerKind = types.VmoBackingStoreOwnerKind;
 pub const vmoBackingStoreOwner = types.vmoBackingStoreOwner;
@@ -201,6 +203,10 @@ pub const KernelState = struct {
     pinned_object_slots: std.StaticBitSet(max_fd_objects) = .initEmpty(),
     pipes: [max_pipes]PipeSlot = [_]PipeSlot{.{}} ** max_pipes,
     task_fd_waiters: [max_task_fd_waiters]TaskFdWaiter = [_]TaskFdWaiter{.{}} ** max_task_fd_waiters,
+    // Enumerate timer records without scanning unrelated task FD waiters.
+    // Pending completions and stale/disarmed objects stay indexed until
+    // record retirement, so the index cannot hide a live registration.
+    task_timer_waiter_slots: std.StaticBitSet(max_task_fd_waiters) = .initEmpty(),
     fd_wait_groups: [max_fd_wait_groups]FdWaitGroupSlot =
         [_]FdWaitGroupSlot{.{}} ** max_fd_wait_groups,
     // Conservative thread buckets: zero proves that cancellation has no
@@ -217,6 +223,8 @@ pub const KernelState = struct {
     native_vmos: [max_native_vmos]NativeVmoSlot = [_]NativeVmoSlot{.{}} ** max_native_vmos,
     next_native_vmo_scan: usize = 0,
     pending_device_retirements: usize = 0,
+    // Permanent reference to the read-only kernel clock page, created on first open.
+    kernel_clock_page_vmo: NativeVmoRef = .{},
     pending_ram_cache_retirements: usize = 0,
     native_cow_table_initial: NativeCowTableChunk = .{},
     native_cow_table_overflow_head: ?*NativeCowTableChunk = null,
@@ -255,6 +263,7 @@ pub const KernelState = struct {
     pub const createNativeVmo = vmo_state.createNativeVmo;
     pub const createNativePageView = vmo_state.createNativePageView;
     pub const createNativeDeviceMemoryBacking = vmo_state.createNativeDeviceMemoryBacking;
+    pub const kernelClockPageVmo = vmo_state.kernelClockPageVmo;
     pub const activateNativeDeviceMemory = vmo_state.activateNativeDeviceMemory;
     pub const nextDeviceMemoryRetirement = vmo_state.nextDeviceMemoryRetirement;
     pub const finishDeviceMemoryRetirement = vmo_state.finishDeviceMemoryRetirement;
@@ -462,6 +471,7 @@ pub const KernelState = struct {
     pub const vmaProtAllowedByMax = vma_state.vmaProtAllowedByMax;
     pub const createAnonymousVmoFd = vma_state.createAnonymousVmoFd;
     pub const createAnonymousVmoFdWithPages = vma_state.createAnonymousVmoFdWithPages;
+    pub const openKernelClockPageFd = vma_state.openKernelClockPageFd;
     pub const createZeroOnDemandVmoFd = vma_state.createZeroOnDemandVmoFd;
     pub const createContiguousVmoFdWithPages = vma_state.createContiguousVmoFdWithPages;
     pub const createAnonymousVmaWithPages = vma_state.createAnonymousVmaWithPages;

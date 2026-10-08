@@ -7,12 +7,11 @@
 /* Bootfs wire offsets, decoded explicitly rather than cast to native structs. */
 enum {
     BOOTFS_MAGIC = 0x53465442,
-    BOOTFS_VERSION = 1,
     BOOTFS_HEADER_SIZE = 104,
     BOOTFS_ENTRY_SIZE = 48,
     BOOTFS_FILE_KIND = 1,
     HEADER_MAGIC = 0,
-    HEADER_VERSION = 4,
+    HEADER_SIZE = 4,
     HEADER_LENGTH = 8,
     HEADER_ENTRY_COUNT = 16,
     HEADER_TABLE_SIZE = 20,
@@ -65,7 +64,7 @@ static struct boot_archive open_boot_archive(void) {
     const unsigned char *bytes = (void *)(uintptr_t)descriptor->bootfs_archive.image_va;
 
     PH_CHECK(read_u32(bytes + HEADER_MAGIC) == BOOTFS_MAGIC);
-    PH_CHECK(read_u16(bytes + HEADER_VERSION) == BOOTFS_VERSION);
+    PH_CHECK(read_u32(bytes + HEADER_SIZE) == BOOTFS_HEADER_SIZE);
     struct boot_archive archive = {
         .bytes = bytes,
         .length = read_u64(bytes + HEADER_LENGTH),

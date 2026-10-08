@@ -3,11 +3,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out_dir="$repo_root/.artifacts/tests/lpr-exec-control-lifetime"
 mkdir -p "$out_dir"
-includes=()
+includes=("-I$repo_root/kobox2/protocol/include" "-I$repo_root/kobox2/protocol/generated/include")
 for module in libipc libpacha personality daemons/common filed termd gpud inputd netd unixd lpr_supervisor; do
   includes+=("-I$repo_root/userland/$module/include")
 done
-clang -std=c11 -O2 -g -Wall -Wextra -Werror \
+${CC:-clang} -std=c11 -O2 -g -Wall -Wextra -Werror \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   "${includes[@]}" -I"$repo_root/musl/pachaos/include" \

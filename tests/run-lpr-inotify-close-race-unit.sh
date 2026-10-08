@@ -3,7 +3,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out_dir="$repo_root/.artifacts/tests/lpr-inotify-close-race"
 mkdir -p "$out_dir"
-includes=()
+includes=("-I$repo_root/kobox2/protocol/include" "-I$repo_root/kobox2/protocol/generated/include")
 for component in libipc libpacha personality filed termd gpud inputd netd unixd lpr_supervisor; do
   includes+=("-I$repo_root/userland/$component/include")
 done

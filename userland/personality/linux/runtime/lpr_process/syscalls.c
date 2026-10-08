@@ -1,5 +1,9 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_gui_detail.h"
 #include "../lpr_unix/cache.h"
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+#include "../lpr_common/boot_diagnostic.h"
+#endif
 
 enum {
     LPR_CLONE_VM = 0x00000100ull,
@@ -162,8 +166,6 @@ const struct lpr_linux_user_frame *lpr_fork_child_bootstrap(void)
     lpr_state.threads.lock_word = 0;
     lpr_state.filed_rpc.lock_word = 0;
     lpr_state.filed_rpc.readv_lock_word = 0;
-    lpr_state.caches.page_lock_word = 0;
-    lpr_page_cache_clear();
     lpr_state.termd_rpc.lock_word = 0;
     lpr_state.netd_rpc.lock_word = 0;
     lpr_unmapself_lock = 0;
@@ -1403,55 +1405,44 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     if (path == 0) {
         return -LPR_LINUX_EFAULT;
     }
-    const uint64_t path_len = (uint64_t)lpr_strnlen(path, FILED_PATH_BYTES);
-    if (path_len == 0 || path_len >= FILED_PATH_BYTES) {
+    const uint64_t path_len = (uint64_t)lpr_strnlen(path, LPR_LINUX_PATH_MAX);
+    if (path_len == 0 || path_len >= LPR_LINUX_PATH_MAX) {
         return -LPR_LINUX_ENAMETOOLONG;
     }
 
     filed_exec_path_t exec;
     lpr_memset(&exec, 0, sizeof(exec));
     exec.flags = FILED_EXEC_LINUX_LPR | FILED_EXEC_SELF;
-    lpr_memcpy(exec.path, path, (size_t)path_len + 1u);
-    int status = 0;
+    int status = lpr_exec_values_prepare(&exec, path, argv_raw, envp_raw);
+    if (status) return status;
     lpr_linux_process_state_init();
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("exec-request", path_len, exec.argc, exec.envc, 0, 0);
+#endif
 #if (defined(LPR_EXEC_DIAG) && LPR_EXEC_DIAG) || \
     (defined(LPR_EXEC_PATH_DIAG) && LPR_EXEC_PATH_DIAG)
     lpr_exec_diag(exec.path);
 #endif
     lpr_trace_process_event("execve_begin", path_len, 0, 0);
 
-    status = lpr_exec_copy_string_vector(
-        &exec,
-        exec.argv,
-        FILED_EXEC_MAX_ARGS,
-        argv_raw,
-        &exec.argc);
-    if (status != 0) {
-        return status;
-    }
-    if (exec.argc == 0) {
-        status = lpr_exec_add_string(&exec, &exec.argv[0], path);
-        if (status != 0) {
-            return status;
-        }
-        exec.argc = 1;
-    }
-    status = lpr_exec_copy_string_vector(
-        &exec,
-        exec.envp,
-        FILED_EXEC_MAX_ENVS,
-        envp_raw,
-        &exec.envc);
-    if (status != 0) {
-        return status;
-    }
-
     lpr_exec_transaction_t transaction;
     lpr_memset(&transaction, 0, sizeof(transaction));
     transaction.manifest_fd = -1;
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    uint64_t gui_phase_start = pacha_trace_read_tsc();
+#endif
     status = lpr_prepare_exec_manifest(&exec, &transaction);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("exec-manifest-prepared", transaction.manifest_fd,
+        transaction.supervisor_bootstrap_fd, 0, status, status);
+#endif
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    lpr_gui_profile_process(100, gui_phase_start, status);
+    gui_phase_start = pacha_trace_read_tsc();
+#endif
     if (status != 0) {
         lpr_destroy_exec_transaction(&transaction);
+        lpr_exec_values_destroy(&exec);
         return status;
     }
     int process_fd = -1;
@@ -1459,13 +1450,26 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
     int bootstrap_fd = -1;
     const int64_t exec_status =
         lpr_filed_exec_self(&exec, &transaction, &process_fd, &thread_fd, &bootstrap_fd);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("exec-filed-reply", process_fd, thread_fd, bootstrap_fd,
+        exec_status, exec_status);
+#endif
+#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
+    lpr_gui_profile_process(101, gui_phase_start, exec_status);
+#endif
     if (exec_status != 0) {
+        lpr_exec_values_destroy(&exec);
         lpr_destroy_exec_transaction(&transaction);
         lpr_trace_process_event("execve_error", path_len, 0, exec_status);
         return exec_status;
     }
     status = lpr_install_exec_bootstrap_fd(bootstrap_fd);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("exec-bootstrap-installed", bootstrap_fd,
+        LPR_BOOTSTRAP_FD, 0, status, status);
+#endif
     if (status != 0) {
+        lpr_exec_values_destroy(&exec);
         lpr_destroy_exec_transaction(&transaction);
         if (bootstrap_fd >= 16) {
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)bootstrap_fd);
@@ -1485,12 +1489,19 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
          * here only costs a name, so it must not abort the exec. */
         (void)lpr_supervisor_set_comm(exec.path);
     }
+    /* SET_COMM reads the copied path, so release its allocation only after
+     * publication; later commit RPCs no longer consume exec arguments. */
+    lpr_exec_values_destroy(&exec);
     if (lpr_supervisor_enabled) {
         const int64_t supervisor_status = lpr_supervisor_call_token(
             LPRS_OP_PROCESS_EXEC_COMMIT_BEGIN,
             lpr_supervisor_token,
             process_fd,
             0);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+        lpr_boot_diagnostic_emit("exec-commit-begin", process_fd, thread_fd, 0,
+            supervisor_status, supervisor_status);
+#endif
         if (supervisor_status != 0) {
             lpr_destroy_exec_transaction(&transaction);
             if (bootstrap_fd >= 16) {
@@ -1511,13 +1522,33 @@ int64_t lpr_linux_execve(uint64_t path_raw, uint64_t argv_raw, uint64_t envp_raw
             return supervisor_status;
         }
     }
-    lpr_close_local_state_before_self_exec();
+    const int64_t cleanup_status = lpr_close_local_state_before_self_exec(&transaction);
+    if (cleanup_status) {
+        /* Linux descriptors and cwd are already gone. Returning an exec errno
+         * would falsely expose the old image as intact; replacing it without a
+         * retirement ACK could discard peer-owned inventory. Cancel only this
+         * transaction/donor, then native exit retires the current ownership. */
+        lpr_destroy_exec_transaction(&transaction);
+        (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_PROCESS_KILL,
+            (uint64_t)(uint32_t)process_fd, 1);
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)thread_fd);
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)process_fd);
+        (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
+        for (;;) {}
+    }
     lpr_exec_transaction_commit_self(&transaction);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("exec-replace-enter", process_fd, thread_fd, 0, 0, 0);
+#endif
     const int64_t commit_status = lpr_pacha_syscall3(
         PACHAOS_SYSCALL_PROCESS_EXEC_FROM,
         (uint64_t)(uint32_t)process_fd,
         (uint64_t)(uint32_t)thread_fd,
         0);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("exec-replace-return", process_fd, thread_fd, 0,
+        lpr_pacha_status_to_errno(commit_status), commit_status);
+#endif
     /* A successful native exec never returns to this image. On failure the
      * transaction cancels only its own prepared supervisor handoff. */
     lpr_destroy_exec_transaction(&transaction);

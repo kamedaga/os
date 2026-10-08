@@ -19,7 +19,7 @@ static int64_t lpr_inputd_call_transfer(
     const uint64_t request_id = lpr_next_request_id(&lpr_termd_request_id);
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = INPUTD_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
@@ -65,6 +65,7 @@ static int64_t lpr_inputd_call_transfer(
     if (recv_status != 0) return lpr_pacha_status_to_errno(recv_status);
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request_id ||
         header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        header->header_size != sizeof(*header) ||
         header->service_id != INPUTD_SERVICE_ID || header->op != op ||
         header->request_id != request_id)
         return -LPR_LINUX_EIO;

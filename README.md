@@ -90,7 +90,7 @@ Kobox は capsule を使う Linux互換レイヤー です。
 | virtio-net |
 | r8169 |
 | virtio-gpu/virgl |
-
+| AMDGPU |
 
 Koboxの問題点を解決し、より重いドライバや特殊経路にも対応できる、sandboxベースのLinuxドライバ実行機構です。
 L4Linuxに似たアプローチを用いていますが、ドライバごとのサンドボックスによりOSを巻き込まない再起動機構や、並列なドライバの起動が容易に実装で来ます。

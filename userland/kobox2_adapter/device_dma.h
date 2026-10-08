@@ -37,6 +37,7 @@ struct ph_dma {
     unsigned int admitted;
     unsigned int enabled;
     unsigned int drained;
+    struct ph_dma *image_next; /* Owner's immutable attached-domain registry. */
 #if defined(PH_DMA_PROFILE) && PH_DMA_PROFILE
     /* Diagnostic only, serialized by this port's existing lock. */
     uint64_t profile_counts[2][3][6][2];

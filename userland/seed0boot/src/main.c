@@ -78,7 +78,7 @@ static int send_root_batch(int channel_fd,
     }
     const struct pacha_ipc_msg msg = {
         .word0 = PACHA_ROOT_HANDOFF_MAGIC,
-        .word1 = PACHA_ROOT_HANDOFF_VERSION,
+        .word1 = sizeof(*handoff),
         .word2 = handoff->device_count,
         .word3 = handoff->flags,
         .fds = fds,
@@ -101,7 +101,7 @@ static int send_root_batch(int channel_fd,
     return status;
 }
 
-static int send_root_handoff(int channel_fd, int live_mode)
+static int send_root_handoff(int channel_fd, int live_mode, int installer_mode)
 {
     if (channel_fd < 16 || seed0_bootstrap_descriptor() == NULL) return -22;
     const long function_count = pacha_capsule_pci_function_count();
@@ -110,7 +110,7 @@ static int send_root_handoff(int channel_fd, int live_mode)
     struct pacha_root_handoff handoff;
     memset(&handoff, 0, sizeof(handoff));
     handoff.magic = PACHA_ROOT_HANDOFF_MAGIC;
-    handoff.version = PACHA_ROOT_HANDOFF_VERSION;
+    handoff.size = sizeof(handoff);
     int selected[PACHA_ROOT_HANDOFF_BATCH_DEVICES];
     int status = 0;
     for (uint64_t index = 0; index < (uint64_t)function_count; index++) {
@@ -121,7 +121,10 @@ static int send_root_handoff(int channel_fd, int live_mode)
             const int xhci = device.class_code == 0x0c0330;
             const int display = (device.class_code >> 16) == 0x03;
             const int ethernet = (device.class_code >> 8) == 0x0200;
-            if (!xhci && !display && !ethernet) continue;
+            /* Only the explicit installer image gets an NVMe capability.
+             * Ordinary RAM-only live boot cannot probe an untested disk. */
+            if (!xhci && !display && !ethernet &&
+                !(installer_mode && is_nvme(&device))) continue;
         } else if (is_nvme(&device)) continue;
         if (handoff.device_count == PACHA_ROOT_HANDOFF_BATCH_DEVICES) {
             status = send_root_batch(channel_fd, &handoff, selected);
@@ -158,17 +161,59 @@ fail:
     return status;
 }
 
-static int wait_parked(void)
+static int serve_power_requests(int power_fd)
 {
-    struct pacha_ipc_channel_pair park = { .a = -1, .b = -1 };
-    if (pacha_ipc_channel_create(&park, channel_rights, 0) != 0) return 14;
-    struct pacha_ipc_msg ignored;
-    memset(&ignored, 0, sizeof(ignored));
-    return pacha_ipc_recv_wait(park.a, &ignored, PACHA_FD_WAIT_FOREVER);
+    if (power_fd < 16) return -22;
+    for (;;) {
+        struct pacha_ipc_fd reply_fd = {0};
+        struct pacha_ipc_msg request;
+        memset(&request, 0, sizeof(request));
+        request.fds = &reply_fd;
+        request.fd_capacity = 1;
+        const int status = pacha_ipc_recv_wait(
+            power_fd, &request, PACHA_FD_WAIT_FOREVER);
+        if (status != 0) {
+            fprintf(stderr, "[seed0boot] power channel closed status=%d\n", status);
+            return status;
+        }
+        if (request.word0 != PACHA_LIVE_POWER_REQUEST_MAGIC ||
+            (request.word1 != PACHA_LIVE_POWER_OFF &&
+             request.word1 != PACHA_LIVE_POWER_REBOOT) || request.fd_count != 1 ||
+            reply_fd.fd < 16) {
+            fprintf(stderr, "[seed0boot] invalid power request\n");
+            if (request.fd_count == 1 && reply_fd.fd >= 16)
+                (void)pacha_fd_close((int)reply_fd.fd);
+            continue;
+        }
+        printf("[seed0boot] ACPI %s requested\n",
+            request.word1 == PACHA_LIVE_POWER_OFF ? "poweroff" : "reboot");
+        fflush(stdout);
+        const long result = pacha_syscall1(PACHA_RUNTIME_SYSCALL_POWER_CONTROL,
+            request.word1);
+        fprintf(stderr, "[seed0boot] ACPI %s failed status=%ld\n",
+            request.word1 == PACHA_LIVE_POWER_OFF ? "poweroff" : "reboot", result);
+        const struct pacha_ipc_msg response = {
+            .word0 = PACHA_LIVE_POWER_REQUEST_MAGIC,
+            .word1 = (uint64_t)result,
+        };
+        (void)pacha_ipc_reply((int)reply_fd.fd, &response);
+        (void)pacha_fd_close((int)reply_fd.fd);
+    }
 }
 
 static int launch_live_root(void)
 {
+    const unsigned char *installer_marker = NULL;
+    uint32_t installer_marker_size = 0;
+    const int marker_status = seed0_bootfs_open_file(
+        "/etc/pacha/installer-mode", &installer_marker, &installer_marker_size);
+    static const char expected_marker[] = "installer-v1\n";
+    if (marker_status != 0 && marker_status != -5) return 25;
+    if (marker_status == 0 &&
+        (installer_marker_size != sizeof(expected_marker) - 1 ||
+         memcmp(installer_marker, expected_marker, sizeof(expected_marker) - 1)))
+        return 25;
+    const int installer_mode = marker_status == 0;
     struct pacha_ipc_channel_pair ready = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair unix_path = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair root_handoff = { .a = -1, .b = -1 };
@@ -213,47 +258,14 @@ static int launch_live_root(void)
         (void)pacha_fd_close(root_handoff.b);
         return 23;
     }
-    status = send_root_handoff(root_handoff.b, 1);
+    status = send_root_handoff(root_handoff.b, 1, installer_mode);
     (void)pacha_fd_close(root_handoff.b);
     if (status != 0) {
         fprintf(stderr, "[seed0boot] live device handoff failed status=%d\n",
             status);
         return 24;
     }
-    for (;;) {
-        struct pacha_ipc_fd reply_fd = {0};
-        struct pacha_ipc_msg request;
-        memset(&request, 0, sizeof(request));
-        request.fds = &reply_fd;
-        request.fd_capacity = 1;
-        status = pacha_ipc_recv_wait(power.a, &request, PACHA_FD_WAIT_FOREVER);
-        if (status != 0) {
-            fprintf(stderr, "[seed0boot] power channel closed status=%d\n", status);
-            return status;
-        }
-        if (request.word0 != PACHA_LIVE_POWER_REQUEST_MAGIC ||
-            (request.word1 != PACHA_LIVE_POWER_OFF &&
-             request.word1 != PACHA_LIVE_POWER_REBOOT) || request.fd_count != 1 ||
-            reply_fd.fd < 16) {
-            fprintf(stderr, "[seed0boot] invalid power request\n");
-            if (request.fd_count == 1 && reply_fd.fd >= 16)
-                (void)pacha_fd_close((int)reply_fd.fd);
-            continue;
-        }
-        printf("[seed0boot] ACPI %s requested\n",
-            request.word1 == PACHA_LIVE_POWER_OFF ? "poweroff" : "reboot");
-        fflush(stdout);
-        const long result = pacha_syscall1(PACHA_RUNTIME_SYSCALL_POWER_CONTROL,
-            request.word1);
-        fprintf(stderr, "[seed0boot] ACPI %s failed status=%ld\n",
-            request.word1 == PACHA_LIVE_POWER_OFF ? "poweroff" : "reboot", result);
-        const struct pacha_ipc_msg response = {
-            .word0 = PACHA_LIVE_POWER_REQUEST_MAGIC,
-            .word1 = (uint64_t)result,
-        };
-        (void)pacha_ipc_reply((int)reply_fd.fd, &response);
-        (void)pacha_fd_close((int)reply_fd.fd);
-    }
+    return serve_power_requests(power.a);
 }
 
 int main(void)
@@ -275,22 +287,26 @@ int main(void)
     if (profile_status != -5) return 18;
     struct pacha_ipc_channel_pair root_ready = { .a = -1, .b = -1 };
     struct pacha_ipc_channel_pair root_handoff = { .a = -1, .b = -1 };
+    struct pacha_ipc_channel_pair power = { .a = -1, .b = -1 };
     if (pacha_ipc_channel_create(&root_ready, channel_rights,
             PACHA_FD_FLAG_INHERIT) != 0 ||
         pacha_ipc_channel_create(&root_handoff, channel_rights,
-            PACHA_FD_FLAG_INHERIT) != 0)
+            PACHA_FD_FLAG_INHERIT) != 0 ||
+        pacha_ipc_channel_create(&power, channel_rights, 0) != 0)
         return 10;
     if (set_inherit(root_ready.a, 0) != 0 ||
         set_inherit(root_handoff.a, 0) != 0)
         return 10;
 
-    int status = seed0_launch_storage_boot_nvme(root_ready.b, root_handoff.b);
+    int status = seed0_launch_storage_boot_nvme(
+        root_ready.b, root_handoff.b, power.b);
     if (status != 0) {
         fprintf(stderr, "[seed0boot] storage_boot launch failed status=%d\n", status);
         return 11;
     }
     (void)pacha_fd_close(root_ready.b);
     (void)pacha_fd_close(root_handoff.b);
+    (void)pacha_fd_close(power.b);
 
     struct pacha_ipc_msg ready;
     memset(&ready, 0, sizeof(ready));
@@ -303,7 +319,7 @@ int main(void)
             (unsigned long long)ready.fd_count);
         return 12;
     }
-    status = send_root_handoff(root_handoff.a, 0);
+    status = send_root_handoff(root_handoff.a, 0, 0);
     (void)pacha_fd_close(root_handoff.a);
     if (status != 0) {
         fprintf(stderr, "[seed0boot] root capability handoff failed status=%d\n", status);
@@ -313,5 +329,5 @@ int main(void)
     fflush(stdout);
     fflush(stderr);
 
-    return wait_parked();
+    return serve_power_requests(power.a);
 }

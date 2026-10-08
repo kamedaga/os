@@ -1,20 +1,11 @@
 #pragma once
 
-#include "storage/stack.h"
-
 #include <stdint.h>
-#include <string.h>
 
 enum {
-    STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC = 0x305254424f4f5453ull,
-    STORAGE_FILED_BOOTSTRAP_MAGIC = 0x3150474b42584f4bull,
+    STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC = 0x315254424f4f5453ull,
+    STORAGE_FILED_BOOTSTRAP_MAGIC = 0x3250474b42584f4bull,
 };
-
-typedef struct storage_module_image_desc {
-    char name[STORAGE_STACK_MODULE_NAME_BYTES];
-    uint64_t image_fd;
-    uint64_t image_size;
-} storage_module_image_desc_t;
 
 typedef struct storage_seed0root_bootstrap {
     uint64_t magic;
@@ -23,8 +14,23 @@ typedef struct storage_seed0root_bootstrap {
     uint64_t service_ready_channel_fd;
     uint64_t filed_image_fd;
     uint64_t filed_image_size;
-    uint64_t module_count;
-    storage_module_image_desc_t modules[STORAGE_STACK_MODULE_CAPACITY];
+    /* The archive is transferred read-only so filed can start its sandbox
+     * before any filesystem RPC exists; v1 module handoffs are not retained. */
+    uint64_t bootfs_fd;
+    uint64_t bootfs_size;
+    uint8_t root_uuid[16];
+    uint64_t sandbox_ram_bytes;
+    uint64_t queue_size;
+    uint64_t queue_arena_bytes;
+    /* Installed roots use the same GOP-backed terminal as the live system.
+     * These are descriptive values; the display device capability arrives
+     * independently in the root handoff and remains the mapping authority. */
+    uint64_t power_channel_fd;
+    uint64_t framebuffer_paddr;
+    uint64_t framebuffer_size;
+    uint64_t framebuffer_width;
+    uint64_t framebuffer_height;
+    uint64_t framebuffer_pitch;
 } storage_seed0root_bootstrap_t;
 
 typedef struct storage_filed_bootstrap {
@@ -32,33 +38,22 @@ typedef struct storage_filed_bootstrap {
     uint64_t device_fd;
     uint64_t control_fd;
     uint64_t unix_path_fd;
-    uint64_t module_count;
-    storage_module_image_desc_t modules[STORAGE_STACK_MODULE_CAPACITY];
+    uint64_t bootfs_fd;
+    uint64_t bootfs_size;
+    uint8_t root_uuid[16];
+    uint64_t sandbox_ram_bytes;
+    uint64_t queue_size;
+    uint64_t queue_arena_bytes;
 } storage_filed_bootstrap_t;
 
-_Static_assert(sizeof(storage_module_image_desc_t) == 80,
-    "storage module descriptor private ABI");
-_Static_assert(sizeof(storage_seed0root_bootstrap_t) == 696,
+_Static_assert(sizeof(storage_seed0root_bootstrap_t) == 152,
     "storage seed0root bootstrap private ABI");
-_Static_assert(sizeof(storage_filed_bootstrap_t) == 680,
+_Static_assert(sizeof(storage_filed_bootstrap_t) == 88,
     "storage filed bootstrap private ABI");
 
-static inline int storage_module_table_matches_manifest(
-    const storage_module_image_desc_t *modules,
-    uint64_t module_count)
+static inline int storage_root_uuid_valid(const uint8_t uuid[16])
 {
-    if (modules == NULL || module_count != STORAGE_STACK_MODULE_COUNT) {
-        return 0;
-    }
-    for (uint64_t i = 0; i < module_count; ++i) {
-        if (strncmp(
-                modules[i].name,
-                storage_stack_modules[i].name,
-                STORAGE_STACK_MODULE_NAME_BYTES) != 0 ||
-            modules[i].name[STORAGE_STACK_MODULE_NAME_BYTES - 1u] != '\0')
-        {
-            return 0;
-        }
-    }
-    return 1;
+    unsigned nonzero = 0;
+    for (unsigned i = 0; i < 16; ++i) nonzero |= uuid[i];
+    return nonzero != 0;
 }

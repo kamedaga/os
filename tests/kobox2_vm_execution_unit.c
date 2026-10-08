@@ -89,7 +89,7 @@ static long native_four(long number, uint64_t first, uint64_t second,
     return step.result;
 }
 
-static int monotonic(uint64_t *now) {
+static __attribute__((target("no-sse,no-sse2,no-avx,no-mmx"))) int monotonic(uint64_t *now) {
     *now = time_now;
     time_now += time_step;
     return 0;

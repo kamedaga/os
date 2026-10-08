@@ -17,7 +17,10 @@ enum {
 
 #define PH_USB_INPUT_SHARED_MAGIC UINT64_C(0x315455504e495542)
 
-/* One management request owns this buffer until its matching reply. The
+/* ATTACH receives a VMO and replies with a read/wait-only event doorbell.
+ * Doorbells are coalesced hints, not event counts: the ring owns the data.
+ * Native FD capabilities are ancillary IPC data, never payload numbers.
+ * One management request owns this buffer until its matching reply. The
  * sandbox writes only after Linux has finished the operation; a sequence gap
  * or overwritten count obliges the consumer to take a fresh snapshot. */
 struct ph_usb_input_shared {

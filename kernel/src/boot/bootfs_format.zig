@@ -1,11 +1,9 @@
 pub const magic: u32 = 0x5346_5442; // "BTFS"
-pub const version: u16 = 1;
 pub const kind_regular: u8 = 1;
 
 pub const BootFsHeader = extern struct {
     magic: u32,
-    version: u16,
-    header_bytes: u16,
+    header_bytes: u32,
     image_bytes: u64,
     entry_count: u32,
     entry_bytes: u32,
@@ -30,3 +28,9 @@ pub const BootFsEntry = extern struct {
     reserved0: u32 = 0,
     reserved1: [2]u64 = [_]u64{0} ** 2,
 };
+
+comptime {
+    if (@sizeOf(BootFsHeader) != 104 or @offsetOf(BootFsHeader, "header_bytes") != 4 or
+        @offsetOf(BootFsHeader, "image_bytes") != 8)
+        @compileError("bootfs header layout mismatch");
+}

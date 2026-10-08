@@ -89,6 +89,10 @@ static void reset(void)
     memset(&allocated, 0, sizeof(allocated));
     memset(&allocated_event, 0, sizeof(allocated_event));
     lpr_fd_table_init(&lpr_control_fd_table, entries, 64, ofds, 64, backends, 64);
+    /* Allocation now correctly starts at zero. This fixture represents an
+     * already-running process whose standard streams occupy those slots. */
+    for (unsigned i = 0; i < 3; ++i)
+        assert(lpr_fd_table_install_at(&lpr_control_fd_table, i, &competitor) == 0);
     lpr_fd_table_capacity = 64;
     compete = fail_alloc = bad_kind = closes = frees = 0;
 }

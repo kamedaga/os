@@ -1,4 +1,11 @@
 #include "../lpr_filed_internal.h"
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+#include "../lpr_common/boot_diagnostic.h"
+#define LPR_BOOT_FAILURE(stage, raw) \
+    lpr_boot_diagnostic_emit(stage, 127, 0, 0, -LPR_LINUX_EIO, (raw))
+#else
+#define LPR_BOOT_FAILURE(stage, raw) ((void)0)
+#endif
 
 int lpr_load_manifest(void)
 {
@@ -18,7 +25,10 @@ int lpr_load_manifest(void)
         PACHAOS_PROT_READ,
         PACHAOS_MMAP_SHARED,
         0);
-    if (header_mapped < 4096) goto invalid;
+    if (header_mapped < 4096) {
+        LPR_BOOT_FAILURE("bootstrap-header-map-failed", header_mapped);
+        goto invalid;
+    }
     lpr_memcpy(
         &lpr_process_manifest,
         (const void *)(uintptr_t)header_mapped,
@@ -27,10 +37,14 @@ int lpr_load_manifest(void)
         PACHAOS_SYSCALL_MUNMAP,
         (uint64_t)(uintptr_t)header_mapped,
         sizeof(lpr_process_manifest));
-    if (lpr_process_manifest.magic != LPR_MANIFEST_MAGIC) goto invalid;
+    if (lpr_process_manifest.magic != LPR_MANIFEST_MAGIC) {
+        LPR_BOOT_FAILURE("bootstrap-magic-invalid", lpr_process_manifest.magic);
+        goto invalid;
+    }
     if (lpr_process_manifest.byte_size < sizeof(lpr_process_manifest) ||
         lpr_process_manifest.entry_count > LPR_FD_TABLE_MAX_SIZE)
     {
+        LPR_BOOT_FAILURE("bootstrap-layout-invalid", lpr_process_manifest.byte_size);
         goto invalid;
     }
     const int64_t mapped = lpr_pacha_syscall6(
@@ -41,7 +55,10 @@ int lpr_load_manifest(void)
         PACHAOS_PROT_READ,
         PACHAOS_MMAP_SHARED,
         0);
-    if (mapped < 4096) goto invalid;
+    if (mapped < 4096) {
+        LPR_BOOT_FAILURE("bootstrap-manifest-map-failed", mapped);
+        goto invalid;
+    }
     const lpr_manifest_t *mapped_manifest =
         (const lpr_manifest_t *)(uintptr_t)mapped;
     int cwd_lease_fd = -1;
@@ -74,12 +91,17 @@ int lpr_load_manifest(void)
         (uint64_t)(uintptr_t)mapped,
         lpr_process_manifest.byte_size);
     if (!install_ok) {
+        LPR_BOOT_FAILURE("bootstrap-fds-invalid", manifest_ok);
         if (cwd_lease_fd >= 16)
             (void)lpr_close_native_fd_if_open(
                 (uint64_t)(uint32_t)cwd_lease_fd);
         goto invalid;
     }
-    if (lpr_install_exec_bootstrap_fd(LPR_BOOTSTRAP_FD) != 0) goto invalid;
+    const int bootstrap_status = lpr_install_exec_bootstrap_fd(LPR_BOOTSTRAP_FD);
+    if (bootstrap_status != 0) {
+        LPR_BOOT_FAILURE("bootstrap-fd-install-failed", bootstrap_status);
+        goto invalid;
+    }
     lpr_linux_signal_mask =
         lpr_process_manifest.signal_mask &
         ~lpr_linux_unblockable_signal_mask();
@@ -102,12 +124,24 @@ int lpr_load_manifest(void)
         lpr_supervisor_enabled = 1;
         void *activation_page = 0;
         const int activation_fd = lpr_create_standalone_wire_page(&activation_page);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+        lpr_boot_diagnostic_emit("bootstrap-activate-enter", activation_fd,
+            lpr_process_manifest.supervisor_bootstrap_fd, 0, 0, 0);
+#endif
         int64_t activation_status = activation_fd < 16 ? activation_fd :
             lpr_process_client_activate(&lpr_request_id, lpr_pacha_status_to_errno,
                 (int)lpr_process_manifest.supervisor_bootstrap_fd, lpr_supervisor_token,
                 activation_fd, activation_page);
         if (activation_fd >= 16) lpr_destroy_standalone_wire_page(activation_fd, activation_page);
-        if (activation_status != 0) goto invalid;
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+        lpr_boot_diagnostic_emit("bootstrap-activate-return", activation_fd,
+            lpr_process_manifest.supervisor_bootstrap_fd, 0,
+            activation_status, activation_status);
+#endif
+        if (activation_status != 0) {
+            LPR_BOOT_FAILURE("bootstrap-activation-failed", activation_status);
+            goto invalid;
+        }
         if (lpr_process_manifest.supervisor_bootstrap_fd != LPR_SUPERVISOR_ENDPOINT_FD)
             (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE,
                 lpr_process_manifest.supervisor_bootstrap_fd);
@@ -116,7 +150,12 @@ int lpr_load_manifest(void)
             lpr_supervisor_token,
             -1,
             0);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+        lpr_boot_diagnostic_emit("bootstrap-commit-done", 0, 0, 0,
+            commit_status, commit_status);
+#endif
         if (commit_status != 0) {
+            LPR_BOOT_FAILURE("bootstrap-commit-failed", commit_status);
             (void)lpr_pacha_syscall1(
                 PACHAOS_SYSCALL_PROCESS_EXIT,
                 127u);
@@ -125,6 +164,10 @@ int lpr_load_manifest(void)
         }
     }
     lpr_manifest_valid = 1;
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+    lpr_boot_diagnostic_emit("bootstrap-ready", lpr_process_manifest.entry_count,
+        lpr_process_manifest.ofd_count, 0, 0, 0);
+#endif
     /* Keep the consumed manifest capability as the reservation for the fixed
      * bootstrap slot.  A later self-exec replaces it only after filed has
      * returned all donor capabilities, so native allocation cannot hand fd
@@ -152,8 +195,7 @@ int lpr_path_is_terminated(const char *path, uint64_t capacity)
 void lpr_cwd_set_root(void)
 {
     lpr_cwd_handle = 0;
-    lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
-    lpr_cwd_path[0] = '/';
+    lpr_cwd_lease_handle = 0;
 }
 
 void lpr_cwd_init(void)
@@ -166,34 +208,10 @@ void lpr_cwd_init(void)
     if (!lpr_load_manifest()) {
         return;
     }
-    /* The exec bootstrap owns the transferred cwd handle.  The supervisor's
-     * process metadata is only a fallback because its fork copy may be stale. */
-    if (lpr_process_manifest.cwd[0] == '/' &&
-        lpr_path_is_terminated(lpr_process_manifest.cwd, sizeof(lpr_process_manifest.cwd)))
-    {
-        const uint64_t len = (uint64_t)lpr_strnlen(
-            lpr_process_manifest.cwd, sizeof(lpr_process_manifest.cwd));
-        if (len < sizeof(lpr_cwd_path)) {
-            lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
-            lpr_memcpy(lpr_cwd_path, lpr_process_manifest.cwd, (size_t)len + 1u);
-            lpr_cwd_handle = lpr_process_manifest.cwd_handle;
-        }
-        return;
-    }
-    if (lpr_supervisor_enabled) {
-        lprs_process_state_t state;
-        if (lpr_supervisor_get_state(&state) == 0 &&
-            state.cwd[0] == '/' &&
-            lpr_path_is_terminated(state.cwd, sizeof(state.cwd)))
-        {
-            const uint64_t len = (uint64_t)lpr_strnlen(state.cwd, sizeof(state.cwd));
-            if (len < sizeof(lpr_cwd_path)) {
-                lpr_memset(lpr_cwd_path, 0, sizeof(lpr_cwd_path));
-                lpr_memcpy(lpr_cwd_path, state.cwd, (size_t)len + 1u);
-                lpr_cwd_handle = state.cwd_handle;
-            }
-        }
-    }
+    /* Only the manifest's transferred lease gives this process authority over
+     * its cwd. Serialized pathnames and another client's handle do not. */
+    lpr_cwd_handle = lpr_process_manifest.cwd_handle;
+    lpr_cwd_lease_handle = lpr_process_manifest.cwd_handle;
 }
 
 void lpr_linux_process_state_init(void)
@@ -211,6 +229,10 @@ void lpr_linux_process_state_init(void)
         if (lpr_supervisor_enabled) {
             lprs_process_state_t state;
             const int state_status = lpr_supervisor_get_state(&state);
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+            lpr_boot_diagnostic_emit("bootstrap-process-state", 0, 0, 0,
+                state_status, state_status);
+#endif
             if (state_status != 0 ||
                 state.pid == 0 ||
                 state.pid > INT32_MAX ||
@@ -219,6 +241,7 @@ void lpr_linux_process_state_init(void)
                 state.pgrp > INT32_MAX ||
                 state.credentials.reserved || state.credentials.group_count > LPRS_MAX_GROUPS)
             {
+                LPR_BOOT_FAILURE("bootstrap-process-state-invalid", state_status);
                 (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_PROCESS_EXIT, 127);
                 for (;;) {
                 }

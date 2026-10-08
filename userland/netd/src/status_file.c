@@ -1,19 +1,21 @@
 /* SPDX-License-Identifier: MIT */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "status_file.h"
 
 #include "dhcp.h"
 #include "kobox2_nic.h"
 #include "link.h"
 #include "netd/boot_config.h"
-#include "filed/flags.h"
-#include "filed/ipc_protocol.h"
-#include "filed/payload.h"
+#include "filed_client/client.h"
 #include "pacha/capsule.h"
 #include "pacha/ipc.h"
 #include "pacha/log.h"
 
 #include <stddef.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -32,153 +34,61 @@ static char last_state[24] = "initializing";
 static uint64_t last_stage = NETD_BOOT_STAGE_NIC;
 static int last_status;
 
-/* netd is a native service: its ordinary libc file calls do not go through
- * the Linux personality. Use the filed endpoint it was already granted. */
-static int status_file_call(int endpoint_fd, int page_fd, void *page,
-    uint32_t operation, uint64_t payload_size, uint64_t *out_result)
+/* Native netd uses its granted filed endpoint; personality libc is not
+ * present here. Request VMOs grow to the actual payload, not an inline cap. */
+static int status_file_call(int endpoint, kb2_fs_request_t *request,
+    const char *path, const void *data, size_t bytes, void *output, size_t capacity,
+    kb2_fs_response_t *response)
 {
-    static uint64_t request_id;
-    pacha_service_envelope_t *header = page;
-    const uint64_t id = ++request_id;
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_SERVICE_ID;
-    header->op = operation;
-    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
-    header->request_id = id;
-    header->trace_id = id;
-    header->payload_size = payload_size;
-    header->fd_count = 0;
-
-    struct pacha_ipc_fd transfer = {
-        .fd = (uint64_t)(uint32_t)page_fd,
-        .rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-            PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE,
-    };
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word3 = id,
-        .fds = &transfer,
-        .fd_count = 1,
-    };
-    const int reply_fd = pacha_ipc_call(endpoint_fd, &request);
-    if (reply_fd < 16) return reply_fd;
-    struct pacha_ipc_msg reply = {0};
-    const int received = pacha_ipc_recv_wait(reply_fd, &reply,
-        PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    if (received != 0) return received;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        header->service_id != FILED_SERVICE_ID || header->op != operation ||
-        header->request_id != id || header->status != 0)
-        return header->status ? (int)header->status : -5;
-    if (out_result) *out_result = header->result;
-    return 0;
+    int status = filedfs_call(endpoint, request, path, NULL, data, bytes,
+        output, capacity, response, NULL, 0, NULL, NULL);
+    return status ? status : response->result < 0 ? (int)response->result : 0;
 }
-
-static int status_file_write(int endpoint_fd, const char *path,
+static int status_file_write(int endpoint, const char *path,
     const char *text, size_t length, uint64_t flags)
 {
-    if (endpoint_fd < 16 || path == NULL ||
-        strlen(path) >= FILED_PATH_BYTES || length > FILED_IO_BYTES)
-        return -EINVAL;
+    if (endpoint < 16 || !path || (!text && length)) return -EINVAL;
     const int policy_write = strcmp(path, NETD_POLICY_PATH) == 0;
-    if (policy_write && memchr(text, 0, length) != NULL)
-        return -EINVAL;
-    const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const int page_fd = pacha_vmo_create(FILED_PAGE_BYTES, rights, 0);
-    if (page_fd < 16) return page_fd;
-    void *page = pacha_mmap(page_fd, FILED_PAGE_BYTES,
-        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
-    if (!page) {
-        (void)pacha_fd_close(page_fd);
-        return -5;
+    if (policy_write && memchr(text, 0, length)) return -EINVAL;
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
+        .flags = flags | O_WRONLY | O_CLOEXEC, .mode = 0644};
+    kb2_fs_response_t response;
+    int result = status_file_call(endpoint, &request, path, NULL, 0, NULL, 0, &response);
+    if (result) return result;
+    const uint64_t handle = response.handle;
+    for (size_t offset = 0; !result && offset < length;) {
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_PWRITE,
+            .handle = handle, .offset = (int64_t)offset, .length = length - offset};
+        result = status_file_call(endpoint, &request, NULL, text + offset,
+            length - offset, NULL, 0, &response);
+        if (!result && (response.result <= 0 ||
+            (uint64_t)response.result > length - offset)) result = -EIO;
+        if (!result) offset += (size_t)response.result;
     }
-    memset(page, 0, FILED_PAGE_BYTES);
-    filed_path_request_t *open = (void *)((unsigned char *)page +
-        PACHA_SERVICE_HEADER_BYTES);
-    open->dir_handle = 0;
-    open->rights = FILED_RIGHT_WRITE | FILED_RIGHT_STAT;
-    open->flags = flags | FILED_OPEN_CLOEXEC;
-    (void)snprintf(open->path, sizeof(open->path), "%s", path);
-    uint64_t handle = 0;
-    int result = status_file_call(endpoint_fd, page_fd, page,
-        FILED_OP_VFS_OPENAT, sizeof(*open), &handle);
-    const int created_policy = policy_write && result == 0;
-    if (result == 0) {
-        memset(page, 0, FILED_PAGE_BYTES);
-        /* Filed's page operations consume filed_io_t (24-byte prefix), not
-         * the older 32-byte filed_io_request_t transport declaration. */
-        filed_io_t *io = (void *)((unsigned char *)page +
-            PACHA_SERVICE_HEADER_BYTES);
-        io->handle = handle;
-        io->length = length;
-        memcpy(io->data, text, length);
-        if (policy_write && memcmp(io->data, text, length) != 0)
-            result = -EIO;
-        uint64_t written = 0;
-        if (result == 0)
-            result = status_file_call(endpoint_fd, page_fd, page,
-                FILED_OP_VFS_PWRITE, sizeof(*io), &written);
-        if (result == 0 && written != length) result = -5;
-        if (policy_write && result == 0 &&
-            memcmp(io->data, text, length) != 0)
-            fprintf(stderr,
-                "[netd] policy payload changed during filed PWRITE\n");
-
-        memset(page, 0, FILED_PAGE_BYTES);
-        filed_handle_request_t *close = (void *)((unsigned char *)page +
-            PACHA_SERVICE_HEADER_BYTES);
-        close->handle = handle;
-        const int closed = status_file_call(endpoint_fd, page_fd, page,
-            FILED_OP_VFS_CLOSE, sizeof(*close), NULL);
-        if (result == 0) result = closed;
-    }
-    if (created_policy && result != 0) {
-        /* A failed first write must not leave an exclusive but unusable
-         * network.conf that prevents the next DHCP ACK from committing. */
-        memset(page, 0, FILED_PAGE_BYTES);
-        filed_unlink_t *unlink = (void *)((uint8_t *)page +
-            PACHA_SERVICE_HEADER_BYTES);
-        memcpy(unlink->name, NETD_POLICY_PATH, sizeof(NETD_POLICY_PATH));
-        const int cleanup = status_file_call(endpoint_fd, page_fd, page,
-            FILED_OP_VFS_UNLINK, sizeof(*unlink), NULL);
-        if (cleanup != 0)
-            fprintf(stderr,
-                "[netd] incomplete DHCP policy cleanup failed status=%d\n",
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_CLOSE, .handle = handle};
+    const int closed = status_file_call(endpoint, &request, NULL, NULL, 0,
+        NULL, 0, &response);
+    if (!result) result = closed;
+    if (policy_write && result) {
+        /* A failed first exclusive write must not leave an unusable policy
+         * that prevents the next DHCP ACK from committing. */
+        request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_UNLINKAT};
+        int cleanup = status_file_call(endpoint, &request, NETD_POLICY_PATH,
+            NULL, 0, NULL, 0, &response);
+        if (cleanup)
+            fprintf(stderr, "[netd] incomplete DHCP policy cleanup failed status=%d\n",
                 cleanup);
     }
-    (void)pacha_munmap(page, FILED_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
     return result;
 }
-
-static int policy_dir_create(int endpoint_fd)
+static int policy_dir_create(int endpoint)
 {
-    const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    int page_fd = pacha_vmo_create(FILED_PAGE_BYTES, rights, 0);
-    if (page_fd < 16) return page_fd;
-    void *page = pacha_mmap(page_fd, FILED_PAGE_BYTES,
-        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
-    if (page == NULL) {
-        (void)pacha_fd_close(page_fd);
-        return -EIO;
-    }
-    memset(page, 0, FILED_PAGE_BYTES);
-    filed_mkdir_t *mkdir = (void *)((uint8_t *)page +
-        PACHA_SERVICE_HEADER_BYTES);
-    mkdir->mode = 0755;
-    memcpy(mkdir->name, NETD_POLICY_DIR, sizeof(NETD_POLICY_DIR));
-    int result = status_file_call(endpoint_fd, page_fd, page,
-        FILED_OP_VFS_MKDIR, sizeof(*mkdir), NULL);
-    (void)pacha_munmap(page, FILED_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_MKDIRAT, .mode = 0755};
+    kb2_fs_response_t response;
+    int result = status_file_call(endpoint, &request, NETD_POLICY_DIR,
+        NULL, 0, NULL, 0, &response);
     return result == -EEXIST ? 0 : result;
 }
-
 int netd_policy_file_create(int filed_endpoint_fd,
     const struct netd_dhcp_lease *lease)
 {
@@ -198,7 +108,7 @@ int netd_policy_file_create(int filed_endpoint_fd,
     if (strlen(text) != (size_t)length) return -EIO;
     /* Exclusive creation keeps a manually supplied RAM policy authoritative. */
     return status_file_write(filed_endpoint_fd, NETD_POLICY_PATH,
-        text, (size_t)length, FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE);
+        text, (size_t)length, O_CREAT | O_EXCL);
 }
 
 int netd_resolver_file_create(int filed_endpoint_fd, const uint8_t dns[4])
@@ -214,70 +124,40 @@ int netd_resolver_file_create(int filed_endpoint_fd, const uint8_t dns[4])
     /* This is a RAM-root file. Exclusive creation preserves a resolver
      * policy supplied by the user before netd applies its IPv4 policy. */
     return status_file_write(filed_endpoint_fd, NETD_RESOLVER_PATH,
-        text, (size_t)length, FILED_OPEN_CREATE | FILED_OPEN_EXCLUSIVE);
+        text, (size_t)length, O_CREAT | O_EXCL);
 }
 
-int netd_policy_file_read(int endpoint_fd, char *text,
+int netd_policy_file_read(int endpoint, char *text,
     size_t capacity, size_t *out_length)
 {
-    if (endpoint_fd < 16 || text == NULL || out_length == NULL ||
-        capacity < 2 || capacity > FILED_IO_BYTES)
-        return -EINVAL;
-    const uint64_t rights = PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_MAP_READ | PACHA_FD_RIGHT_MAP_WRITE;
-    const int page_fd = pacha_vmo_create(FILED_PAGE_BYTES, rights, 0);
-    if (page_fd < 16) return page_fd;
-    void *page = pacha_mmap(page_fd, FILED_PAGE_BYTES,
-        PACHA_PROT_READ | PACHA_PROT_WRITE, PACHA_MMAP_SHARED, 0);
-    if (page == NULL) {
-        (void)pacha_fd_close(page_fd);
-        return -EIO;
-    }
-    memset(page, 0, FILED_PAGE_BYTES);
-    filed_path_request_t *open = (void *)((uint8_t *)page +
-        PACHA_SERVICE_HEADER_BYTES);
-    open->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
-    open->flags = FILED_OPEN_CLOEXEC;
-    memcpy(open->path, NETD_POLICY_PATH, sizeof(NETD_POLICY_PATH));
-    uint64_t handle = 0;
-    int result = status_file_call(endpoint_fd, page_fd, page,
-        FILED_OP_VFS_OPENAT, sizeof(*open), &handle);
-    if (result == 0) {
-        memset(page, 0, FILED_PAGE_BYTES);
-        filed_io_t *io = (void *)((uint8_t *)page +
-            PACHA_SERVICE_HEADER_BYTES);
-        io->handle = handle;
-        io->length = capacity;
-        uint64_t read_count = 0;
-        result = status_file_call(endpoint_fd, page_fd, page,
-            FILED_OP_VFS_PREAD, sizeof(*io), &read_count);
-        if (result == 0) {
-            if (read_count == 0 || read_count >= capacity) {
-                result = read_count == 0 ? -EINVAL : -E2BIG;
-            } else {
-                memcpy(text, io->data, (size_t)read_count);
-                text[read_count] = '\0';
-                size_t actual = strnlen(text, (size_t)read_count);
-                if (actual != (size_t)read_count) {
-                    fprintf(stderr,
-                        "[netd] IPv4 policy contains NUL at %zu of %llu bytes\n",
-                        actual, (unsigned long long)read_count);
-                    result = -EPROTO;
-                }
-                *out_length = (size_t)read_count;
-            }
+    if (endpoint < 16 || !text || !out_length || capacity < 2) return -EINVAL;
+    *out_length = 0;
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
+        .flags = O_RDONLY | O_CLOEXEC};
+    kb2_fs_response_t response;
+    int result = status_file_call(endpoint, &request, NETD_POLICY_PATH,
+        NULL, 0, NULL, 0, &response);
+    if (result) return result;
+    const uint64_t handle = response.handle;
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_PREAD,
+        .handle = handle, .length = capacity};
+    result = status_file_call(endpoint, &request, NULL, NULL, 0,
+        text, capacity, &response);
+    if (!result) {
+        if (response.result <= 0 || (uint64_t)response.result >= capacity)
+            result = response.result == 0 ? -EINVAL : -E2BIG;
+        else if (response.data_length != (uint64_t)response.result ||
+            memchr(text, 0, (size_t)response.result))
+            result = -EPROTO;
+        else {
+            text[response.result] = 0;
+            *out_length = (size_t)response.result;
         }
-        memset(page, 0, FILED_PAGE_BYTES);
-        filed_handle_request_t *close = (void *)((uint8_t *)page +
-            PACHA_SERVICE_HEADER_BYTES);
-        close->handle = handle;
-        const int closed = status_file_call(endpoint_fd, page_fd, page,
-            FILED_OP_VFS_CLOSE, sizeof(*close), NULL);
-        if (result == 0) result = closed;
     }
-    (void)pacha_munmap(page, FILED_PAGE_BYTES);
-    (void)pacha_fd_close(page_fd);
-    return result;
+    request = (kb2_fs_request_t){.opcode = KB2_FILESYSTEM_OP_CLOSE, .handle = handle};
+    int closed = status_file_call(endpoint, &request, NULL, NULL, 0,
+        NULL, 0, &response);
+    return result ? result : closed;
 }
 
 void netd_status_file_bind_dhcp(const struct netd_dhcp_client *client)
@@ -353,7 +233,7 @@ void netd_status_file_publish(const struct netd_boot_config *cfg,
     }
     const int written = status_file_write((int)cfg->filed_endpoint_fd,
         NETD_STATUS_PATH, report, used,
-        FILED_OPEN_CREATE | FILED_OPEN_TRUNCATE);
+        O_CREAT | O_TRUNC);
     if (written != 0)
         fprintf(stderr, "[netd] status file update failed status=%d\n", written);
 }

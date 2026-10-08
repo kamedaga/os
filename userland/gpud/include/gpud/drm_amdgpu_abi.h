@@ -26,7 +26,17 @@ typedef struct gpud_drm_amdgpu_cs_part {
  * variant while retaining the driver's input-only argument semantics. */
 #define GPUD_DRM_IOCTL_AMDGPU_GEM_VA_RDWR UINT32_C(0xc0406448)
 #define GPUD_DRM_IOCTL_AMDGPU_WAIT_CS UINT32_C(0xc0206449)
+#define GPUD_DRM_IOCTL_AMDGPU_GEM_OP UINT32_C(0xc0106450)
+#define GPUD_DRM_IOCTL_AMDGPU_GEM_OP_EXT UINT32_C(0xc0186450)
 #define GPUD_DRM_IOCTL_AMDGPU_VM UINT32_C(0xc0086453)
+
+/* The extended Linux argument retains the original 16-byte prefix. LPR
+ * reads only the size encoded by the caller, then removes output pointers. */
+typedef struct gpud_drm_amdgpu_gem_op {
+    uint32_t handle, op;
+    uint64_t value;
+    uint32_t num_entries, padding;
+} gpud_drm_amdgpu_gem_op_t;
 
 typedef struct gpud_drm_amdgpu_info {
     uint64_t return_pointer;

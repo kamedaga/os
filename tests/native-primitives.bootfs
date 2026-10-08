@@ -1,0 +1,2 @@
+# The native contract init consumes no Linux core or filesystem payload.
+# Keep a valid empty boot archive instead of depending on Kobox build outputs.

@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(seed0_next C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(SEED0_NEXT_ELF "${CMAKE_BINARY_DIR}/seed0_next.elf")
 
 add_custom_command(
@@ -14,10 +15,9 @@ add_custom_command(
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SEED0_NEXT_ELF}"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

@@ -17,8 +17,7 @@ assert sorted(kernel.values()) == list(range(1, len(kernel) + 1)), kernel
 paths = (
     "userland/libpacha/include/pacha/abi.h",
     "musl/pachaos/include/pachaos/abi.h",
-    "musl/upstream/arch/pachaos/syscall_arch.h",
-    "musl/pachaos/smoke/libc_vfs_exec.c",
+    "musl/pachaos/syscall/native_raw.h",
 )
 for path in paths:
     source = (root / path).read_text()
@@ -44,3 +43,12 @@ for path in paths:
         assert seen == set(kernel) - {"log"}, (path, set(kernel) - seen)
     print(f"{path}: {len(seen)} numbers agree")
 print(f"native syscall ABI: {len(kernel)} contiguous entries PASS")
+
+# A synchronized header does not catch literal numbers hidden in native glue.
+for path in (root / 'musl/pachaos', root / 'userland', root / 'tests'):
+    for source in path.rglob('*'):
+        if source.suffix not in ('.c', '.h', '.S'):
+            continue
+        calls = re.findall(r'(?:pacha_syscall[0-6]|__pachaos_raw[0-6]|native)\(\s*(\d+)\b', source.read_text())
+        assert all(int(n) < 29 for n in calls), (source, calls)
+print('native source callers: no renumberable syscall literals PASS')

@@ -7,13 +7,18 @@ static const lpr_linux_fd_t lpr_fd_allocation_excluded[] = {
         LPR_FILED_ENDPOINT_FD, LPR_NETD_ENDPOINT_FD, LPR_TERMD_TTY_ENDPOINT_FD,
         LPR_GPUD_DRM_ENDPOINT_FD, LPR_INPUTD_INPUT_ENDPOINT_FD,
         LPR_BOOTSTRAP_FD, LPR_SUPERVISOR_ENDPOINT_FD,
+        LPR_INSTALL_DISK_ENDPOINT_FD, LPR_INSTALL_MEDIA_ENDPOINT_FD,
+        LPR_INSTALL_ROOT_ENDPOINT_FD,
 };
 
 static inline int lpr_fd_alloc_initialized_batch(
     const lpr_fd_install_t *installs, uint32_t count, lpr_linux_fd_t *fds)
 {
     lpr_fd_arrays_init();
-    while (lpr_fd_table_alloc_batch(&lpr_control_fd_table, 3, installs, count,
+    /* Standard descriptors are ordinary Linux table entries, not reserved
+     * numbers. ash closes stdin before reopening /dev/null for an async job
+     * and requires that open to return 0; skipping 0..2 breaks that contract. */
+    while (lpr_fd_table_alloc_batch(&lpr_control_fd_table, 0, installs, count,
             lpr_fd_allocation_excluded, sizeof(lpr_fd_allocation_excluded) /
                 sizeof(lpr_fd_allocation_excluded[0]), fds) != 0) {
         const uint64_t capacity = lpr_fd_table_capacity;

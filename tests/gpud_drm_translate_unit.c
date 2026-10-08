@@ -65,7 +65,20 @@ static void scalar_commands(void) {
     size_t size;
     const unsigned char *data = kb2_gpu_command_inline_data(&command, &size);
     assert(size == 8 && read_u64(data) == 12 && !command.counts[1]);
+    request.request = 0xc0286405;
+    request.arg_size = request.data_size = 40;
+    memset(request.data, 0xa5, 40);
+    write_u32(request.data, 0);
+    assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
+    command = decode(&translation);
+    data = kb2_gpu_command_inline_data(&command, &size);
+    assert(command.command_id == KB2_GPU_DRM_CORE_COMMAND_GET_CLIENT &&
+        size == KB2_GPU_DRM_CORE_RECORD_CLIENT_REQUEST_SIZE &&
+        !read_u64(data) && !command.counts[1]);
     request.request = 0x4010640d;
+    request.arg_size = request.data_size = 16;
+    memset(request.data, 0, 16);
+    request.data[0] = 12;
     memset(request.data + 8, 0, 8);
     request.data[8] = 1;
     assert(!gpud_drm_ioctl_encode(&translation, &binding, &request, 0));
@@ -133,6 +146,10 @@ static void amdgpu_render_profile(void) {
         NULL, 0, &command) == KB2_PROTOCOL_OK);
     assert(command.command_set_id == KB2_GPU_DRM_CORE_SET_ID &&
         command.command_id == KB2_GPU_DRM_CORE_COMMAND_GET_CAP);
+    request.request = 0xc0286405;
+    request.arg_size = request.data_size = 40;
+    assert(!gpud_drm_ioctl_encode(&translation, &render, &request, 0));
+    assert(translation.command_id == KB2_GPU_DRM_CORE_COMMAND_GET_CLIENT);
     request.request = 0xc0406400;
     request.arg_size = 64;
     request.data_size = sizeof(gpud_drm_version_wire_t);
@@ -144,8 +161,82 @@ static void amdgpu_render_profile(void) {
     request.request = GPUD_DRM_IOCTL_VIRTGPU_GETPARAM;
     request.arg_size = request.data_size = 16;
     assert(gpud_drm_ioctl_encode(&translation, &render, &request, 0) == -EOPNOTSUPP);
+    request.request = GPUD_DRM_IOCTL_SET_MASTER;
+    request.arg_size = request.data_size = 0;
+    assert(!gpud_drm_ioctl_encode(&translation, &render, &request, 0));
+    assert(translation.queue_class == KB2_GPU_QUEUE_DISPLAY &&
+        translation.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        translation.command_id == KB2_GPU_DRM_MODE_COMMAND_SET_MASTER);
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        render.generation, KB2_GPU_PROFILE_AMDGPU, KB2_GPU_QUEUE_DISPLAY,
+        NULL, 0, &command) == KB2_PROTOCOL_OK);
+    request.request = GPUD_DRM_IOCTL_DROP_MASTER;
+    assert(!gpud_drm_ioctl_encode(&translation, &render, &request, 0));
+    assert(translation.queue_class == KB2_GPU_QUEUE_DISPLAY &&
+        translation.command_id == KB2_GPU_DRM_MODE_COMMAND_DROP_MASTER);
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        render.generation, KB2_GPU_PROFILE_AMDGPU, KB2_GPU_QUEUE_DISPLAY,
+        NULL, 0, &command) == KB2_PROTOCOL_OK);
     request.request = GPUD_DRM_IOCTL_MODE_GETRESOURCES;
-    assert(gpud_drm_ioctl_encode(&translation, &render, &request, 0) == -EOPNOTSUPP);
+    gpud_drm_kms_resources_wire_t resources = {0};
+    resources.value.count_crtcs = 1;
+    request.arg_size = sizeof(resources.value);
+    request.data_size = sizeof(gpud_drm_kms_resources_wire_t);
+    memcpy(request.data, &resources, sizeof(resources));
+    assert(!gpud_drm_ioctl_encode(&translation, &render, &request, 9));
+    assert(translation.queue_class == KB2_GPU_QUEUE_DISPLAY &&
+        translation.command_id == KB2_GPU_DRM_MODE_COMMAND_GET_RESOURCES);
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        render.generation, KB2_GPU_PROFILE_AMDGPU, KB2_GPU_QUEUE_DISPLAY,
+        &translation.region, 1, &command) == KB2_PROTOCOL_OK);
+    memset(request.data, 0, sizeof(resources));
+    assert(!gpud_drm_ioctl_encode(&translation, &render, &request, 9));
+    assert(!translation.region.region_id);
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        render.generation, KB2_GPU_PROFILE_AMDGPU, KB2_GPU_QUEUE_DISPLAY,
+        NULL, 0, &command) == KB2_PROTOCOL_OK);
+    request.request = GPUD_DRM_IOCTL_MODE_SETCRTC;
+    assert(gpud_drm_ioctl_encode(&translation, &render, &request, 9) == -EINVAL);
+}
+
+static void amdgpu_atomic_multi_output(void) {
+    const struct gpud_drm_binding render = {.generation = 7,
+        .frontend_handle = 51, .session_id = 103,
+        .profile_kind = KB2_GPU_PROFILE_AMDGPU};
+    gpud_drm_ioctl_request_t request = {.handle = 51,
+        .request = GPUD_DRM_IOCTL_MODE_ATOMIC, .arg_size = 56,
+        .data_size = sizeof(gpud_drm_mode_atomic_wire_t)};
+    gpud_drm_mode_atomic_wire_t wire = {.flags =
+        GPUD_DRM_MODE_PAGE_FLIP_EVENT | GPUD_DRM_MODE_ATOMIC_NONBLOCK,
+        .count_objs = 6, .total_props = 48,
+        .user_data = UINT64_C(0x123456789abcdef0)};
+    for (unsigned i = 0; i < wire.count_objs; ++i) {
+        wire.objects[i] = 100 + i;
+        wire.object_prop_counts[i] = 8;
+    }
+    for (unsigned i = 0; i < wire.total_props; ++i) {
+        wire.props[i] = 200 + i;
+        wire.prop_values[i] = 300 + i;
+    }
+    memcpy(request.data, &wire, sizeof(wire));
+    struct gpud_drm_translation translation = {0};
+    assert(!gpud_drm_ioctl_encode(&translation, &render, &request, 9));
+    kb2_gpu_command_t command;
+    assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+        render.generation, KB2_GPU_PROFILE_AMDGPU, KB2_GPU_QUEUE_DISPLAY,
+        &translation.region, 1, &command) == KB2_PROTOCOL_OK);
+    size_t length = 0;
+    const unsigned char *data = kb2_gpu_command_inline_data(&command, &length);
+    assert(command.command_id == KB2_GPU_DRM_MODE_COMMAND_ATOMIC);
+    assert(length == KB2_GPU_DRM_MODE_RECORD_ATOMIC_REQUEST_SIZE);
+    assert(read_u64(data + KB2_GPU_DRM_MODE_RECORD_ATOMIC_REQUEST_EVENT_TOKEN_OFFSET) ==
+        wire.user_data);
+    assert(translation.staged_input_size == 6 *
+        KB2_GPU_DRM_MODE_RECORD_ATOMIC_OBJECT_SIZE + 48 *
+        KB2_GPU_DRM_MODE_RECORD_ATOMIC_PROPERTY_SIZE);
+    wire.flags = GPUD_DRM_MODE_ATOMIC_NONBLOCK;
+    memcpy(request.data, &wire, sizeof(wire));
+    assert(gpud_drm_ioctl_encode(&translation, &render, &request, 9) == -EINVAL);
 }
 
 static void amdgpu_va_libdrm_direction(void) {
@@ -638,12 +729,70 @@ static void inline_ioctl_bounds(void) {
     assert(gpud_drm_ioctl_can_inline(&request));
 }
 
+static void common_syncobj_profiles(void) {
+    const uint32_t profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_AMDGPU};
+    const uint32_t requests[] = {0xc02864c3, 0xc01064c4, 0xc01064c5};
+    for (unsigned int p = 0; p < 2; ++p) for (unsigned int i = 0; i < 3; ++i) {
+        struct gpud_drm_binding sync_binding = binding;
+        sync_binding.profile_kind = profiles[p];
+        gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
+            .request = requests[i], .arg_size = i ? 16 : 40,
+            .data_size = i ? 16 : 40, .aux_size = 4};
+        write_u32(request.data + (i ? 8 : 16), 1);
+        if (!i) write_u64(request.data + 8, UINT64_MAX);
+        struct gpud_drm_translation translation;
+        assert(!gpud_drm_ioctl_encode(&translation, &sync_binding, &request, 9));
+        kb2_gpu_command_t command;
+        assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+            binding.generation, profiles[p], KB2_GPU_QUEUE_EXECUTION,
+            &translation.region, 1, &command) == KB2_PROTOCOL_OK);
+        assert(command.command_set_id == KB2_GPU_DRM_CORE_SET_ID);
+        assert(command.deadline_ns == (i ? 0 : UINT64_MAX));
+        assert(translation.region.length == 4);
+        --request.aux_size;
+        assert(gpud_drm_ioctl_encode(&translation, &sync_binding, &request, 9) == -EINVAL);
+    }
+}
+
+static void display_timing_commands(void) {
+    const uint32_t profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_AMDGPU};
+    for (unsigned int i = 0; i < 2; ++i) {
+        struct gpud_drm_binding timing_binding = binding;
+        timing_binding.profile_kind = profiles[i];
+        gpud_drm_ioctl_request_t request = {.handle = binding.frontend_handle,
+            .request = GPUD_DRM_IOCTL_CRTC_GET_SEQUENCE,
+            .arg_size = sizeof(gpud_drm_crtc_get_sequence_t),
+            .data_size = sizeof(gpud_drm_crtc_get_sequence_t)};
+        write_u32(request.data, 86);
+        struct gpud_drm_translation translation;
+        assert(!gpud_drm_ioctl_encode(&translation, &timing_binding, &request, 0));
+        kb2_gpu_command_t command;
+        assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+            binding.generation, profiles[i], KB2_GPU_QUEUE_DISPLAY,
+            NULL, 0, &command) == KB2_PROTOCOL_OK);
+        assert(command.command_id == KB2_GPU_DRM_MODE_COMMAND_CRTC_GET_SEQUENCE);
+        request.request = GPUD_DRM_IOCTL_WAIT_VBLANK;
+        memset(request.data, 0, sizeof(gpud_drm_wait_vblank_t));
+        request.arg_size = request.data_size = sizeof(gpud_drm_wait_vblank_t);
+        write_u32(request.data, 1); /* Relative zero reads the current counter. */
+        assert(!gpud_drm_ioctl_encode(&translation, &timing_binding, &request, 0));
+        assert(kb2_gpu_command_decode(translation.command, translation.command_size,
+            binding.generation, profiles[i], KB2_GPU_QUEUE_DISPLAY,
+            NULL, 0, &command) == KB2_PROTOCOL_OK);
+        assert(command.command_id == KB2_GPU_DRM_MODE_COMMAND_WAIT_VBLANK &&
+            command.deadline_ns == UINT64_MAX);
+    }
+}
+
 int main(void) {
+    common_syncobj_profiles();
+    display_timing_commands();
     inline_ioctl_bounds();
     magic_commands();
     scalar_commands();
     version_command();
     amdgpu_render_profile();
+    amdgpu_atomic_multi_output();
     amdgpu_job_translation();
     amdgpu_va_libdrm_direction();
     mesa_static_requests();

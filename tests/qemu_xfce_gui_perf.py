@@ -9,6 +9,7 @@ Screenshots used for polling stay in /dev/shm. Only named checkpoints persist.
 import argparse
 import atexit
 import json
+import os
 from pathlib import Path
 import re
 import socket
@@ -43,51 +44,92 @@ def type_text(qmp, text):
 
 
 class VM:
-    def __init__(self, run, cpus=8, overlay=None, boot=None):
+    def __init__(self, run, cpus=8, overlay=None, boot=None, graphics='2d', display='none', disk=None,
+                 input_profile='virtio', extra_qemu_args=(), keep_overlay=False,
+                 boot_framebuffer=False, memory='4G'):
+        if graphics not in ('2d', 'virgl'):
+            raise ValueError('graphics must be 2d or virgl')
+        if graphics == 'virgl' and (display == 'none' or 'gl=off' in display):
+            raise ValueError('accelerated GUI observations require a GL display')
         self.out = ROOT/'.artifacts/gui-performance'/run
         self.out.mkdir(parents=True, exist_ok=False)
         self.tmp = tempfile.TemporaryDirectory(prefix='gui-perf-', dir='/dev/shm')
         self.overlay = Path(overlay).resolve() if overlay else self.out/'changes.qcow2'
+        backing = Path(disk).resolve() if disk else ROOT/'.artifacts/disk.img'
         if overlay:
             info = json.loads(subprocess.check_output(
                 ['qemu-img', 'info', '--output=json', str(self.overlay)]))
             assert info['format'] == 'qcow2'
-            assert Path(info['full-backing-filename']).resolve() == ROOT/'.artifacts/disk.img'
+            assert Path(info['full-backing-filename']).resolve() == backing
         else:
             subprocess.run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-F', 'raw',
-                            '-b', str(ROOT/'.artifacts/disk.img'), str(self.overlay)], check=True)
-        self.keep_overlay = False
-        cmd = ['qemu-system-x86_64', '-machine', 'q35', '-enable-kvm', '-cpu', 'host',
-               '-m', '4G', '-smp', str(cpus), '-S', '-no-reboot', '-display', 'none',
+                            '-b', str(backing), str(self.overlay)], check=True)
+        self.keep_overlay = keep_overlay
+        if input_profile == 'virtio':
+            input_args = ['-device', 'virtio-keyboard-pci,disable-legacy=on,iommu_platform=on',
+                          '-device', 'virtio-tablet-pci,disable-legacy=on,iommu_platform=on']
+        elif input_profile in ('usb-hid', 'usb-tablet'):
+            pointer = 'usb-tablet' if input_profile == 'usb-tablet' else 'usb-mouse'
+            input_args = ['-device', 'qemu-xhci,id=pachaxhci',
+                          '-device', 'usb-kbd,bus=pachaxhci.0,id=pachausbkbd',
+                          '-device', f'{pointer},bus=pachaxhci.0,id=pachausbmouse']
+        else:
+            raise ValueError('unknown input profile')
+        cmd = [os.environ.get('CAPOS_QEMU', 'qemu-system-x86_64'),
+               '-machine', 'q35', '-enable-kvm', '-cpu', 'host',
+               '-m', memory, '-smp', str(cpus), '-S', '-no-reboot', '-display', display,
                '-monitor', 'none', '-serial', 'stdio', '-boot', 'order=c',
                '-device', 'intel-iommu,intremap=off,aw-bits=48',
                '-qmp', f'unix:{self.out}/qmp.sock,server=on,wait=off',
                '-drive', f'file={Path(boot).resolve() if boot else ROOT/".artifacts/limine-boot.img"},format=raw,if=ide,snapshot=on',
                '-drive', f'if=none,file={self.overlay},format=qcow2,id=rootdisk',
                '-device', 'nvme,drive=rootdisk,serial=capos-root',
-               '-device', 'virtio-gpu-pci,disable-legacy=on,iommu_platform=on,id=pachagpu',
-               '-device', 'virtio-keyboard-pci,disable-legacy=on,iommu_platform=on',
-               '-device', 'virtio-tablet-pci,disable-legacy=on,iommu_platform=on',
+               '-device', (('virtio-gpu-gl-pci' if boot_framebuffer else 'virtio-vga-gl')
+                           if graphics == 'virgl' else 'virtio-gpu-pci') +
+               ',disable-legacy=on,iommu_platform=on,id=pachagpu',
+               *input_args,
                '-chardev', f'socket,id=virtcon0,path={self.out}/console.sock,server=on,wait=off',
                '-device', 'virtio-serial-pci,disable-legacy=on,iommu_platform=on,id=virtserial0',
                '-device', 'virtconsole,chardev=virtcon0,name=org.pachaos.console.0',
                '-net', 'none', '-netdev', 'user,id=net0', '-device',
                'virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on,csum=off,gso=off,'
                'guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,'
-               'host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off']
+               'host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off',
+               *extra_qemu_args]
+        if boot_framebuffer:
+            # Preserve the existing acceptance boot/GOP path independently of
+            # the GPU device that Xorg later takes over.
+            cmd += ['-device', 'ramfb']
+        if graphics == 'virgl':
+            # Make the accelerated device the visible boot/display adapter;
+            # a second default VGA can leave GTK showing the wrong console.
+            cmd += ['-vga', 'none']
         (self.out/'command.json').write_text(json.dumps(cmd, indent=2))
+        environment = os.environ.copy()
+        if graphics == 'virgl':
+            # WSL can otherwise silently choose LLVMpipe. Force the host GPU
+            # driver; guest GL_RENDERER must still be checked before timing.
+            environment['GALLIUM_DRIVER'] = 'd3d12'
+            environment['GDK_BACKEND'] = 'x11'
         self.started = time.monotonic()
+        self.graphics = graphics
+        self.acceleration_verified = False
         self.rows = []
         self.capture_costs = []
         self.fault = threading.Event()
         self.closed = False
         self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     env=environment)
         self.qmp = None
         atexit.register(self.close)
         deadline = time.monotonic() + 10
         while not (self.out/'console.sock').exists():
             if self.proc.poll() is not None or time.monotonic() > deadline:
+                if self.proc.poll() is not None:
+                    stdout, stderr = self.proc.communicate(timeout=2)
+                    (self.out/'serial.log').write_bytes(stdout)
+                    (self.out/'stderr.log').write_bytes(stderr)
                 raise RuntimeError('QEMU did not open console')
             time.sleep(.02)
         self.qmp = QMP(str(self.out/'qmp.sock'))
@@ -99,13 +141,56 @@ class VM:
             threading.Thread(target=self.drain, args=(stream, name), daemon=True).start()
         self.qmp.execute('cont')
 
+    def console_command(self, command):
+        """Use the independent guest console, not keystrokes into an app."""
+        if '\n' in command or '\r' in command:
+            raise ValueError('one console command at a time')
+        self.console.sendall(command.encode() + b'\n')
+
+    def wait_console(self, pattern, timeout=60):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            log = (self.out/'console.log').read_text(errors='replace')
+            found = re.search(pattern, log, re.M)
+            if found:
+                return found
+            if self.fault.is_set() or self.proc.poll() is not None:
+                raise RuntimeError('guest failed while waiting for console output')
+            time.sleep(.05)
+        raise TimeoutError(pattern)
+
+    def verify_acceleration(self, timeout=90):
+        """A forced host environment alone does not prove guest acceleration."""
+        if self.graphics != 'virgl':
+            raise RuntimeError('application performance requires accelerated virgl')
+        self.console_command('DISPLAY=:0 LD_PRELOAD=/usr/libexec/pacha/frame-trace.so '
+            '/usr/libexec/pacha/frame-profile.elf queued; echo GPU_CHECK_DONE=$?')
+        self.wait_console(r'GPU_CHECK_DONE=\d+\s*$', timeout)
+        log = (self.out/'console.log').read_text(errors='replace')
+        renderers = re.findall(r'FRAME_RENDERER (.+)', log)
+        renderer = renderers[-1] if renderers else ''
+        if (not re.search(r'GPU_CHECK_DONE=0\s*$', log, re.M) or
+                'virgl' not in renderer.lower() or 'd3d12' not in renderer.lower() or
+                re.search(r'llvmpipe|softpipe', renderer, re.I)):
+            raise RuntimeError(f'accelerated drawing/presentation not verified: {renderer!r}')
+        self.acceleration_verified = True
+        (self.out/'renderer.json').write_text(json.dumps({'renderer':renderer,
+            'host_driver':'d3d12', 'drawing_and_swap_completion':True}, indent=2))
+        return renderer
+
     def drain(self, stream, name):
         with (self.out/(name+'.log')).open('wb') as log:
-            for line in stream:
+            # A shell prompt has no terminating newline. Line-buffered reads
+            # can hide a ready prompt until the command we are waiting to send.
+            chunks = iter(lambda: stream.read1(65536), b'') if name == 'console' else stream
+            for line in chunks:
                 elapsed = time.monotonic() - self.started
-                log.write(f'{elapsed:.6f} '.encode() + line)
+                log.write(line if name == 'console' else f'{elapsed:.6f} '.encode() + line)
                 log.flush()
-                if re.search(rb'PAGE FAULT|GENERAL PROTECTION|USER fault|KERNEL PANIC', line):
+                if re.search(rb'PAGE FAULT|GENERAL PROTECTION|USER fault|KERNEL PANIC|'
+                             rb'\[seed0root\] (?:rootfs service|filed) launch failed|'
+                             rb'PANIC.*limine:|PACHA_KOBOX_FOUNDATION=FAIL|'
+                             rb'\[filed\] fatal failure', line):
                     self.fault.set()
                     print('GUEST FAULT', name, elapsed, flush=True)
 
@@ -362,8 +447,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('run')
     parser.add_argument('--cpus', type=int, default=8)
+    parser.add_argument('--graphics', choices=('2d', 'virgl'), default='2d')
+    parser.add_argument('--display', default='none')
+    parser.add_argument('--disk')
+    parser.add_argument('--boot')
     args = parser.parse_args()
-    vm = VM(args.run, args.cpus)
+    vm = VM(args.run, args.cpus, graphics=args.graphics, display=args.display,
+            disk=args.disk, boot=args.boot)
     if not __import__('sys').flags.interactive:
         try:
             vm.wallpaper()

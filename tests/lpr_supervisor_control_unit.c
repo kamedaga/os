@@ -129,7 +129,7 @@ int main(void)
     processes[1].activation_page_fd = 70;
     processes[1].activation_reply_fd = 71;
     processes[1].activation_header = (pacha_service_envelope_t){ .request_id = 55,
-        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = LPRS_SERVICE_ID,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = LPRS_SERVICE_ID,
         .op = LPRS_OP_PROCESS_ACTIVATE };
     native_rights[70] = native_rights[71] = PACHA_FD_RIGHT_CLOSE;
     lprs_complete_activation(&processes[1]);

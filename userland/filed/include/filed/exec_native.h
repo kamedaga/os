@@ -3,7 +3,7 @@
 #include <stdint.h>
 
 #include "filed/payload.h"
-#include "filed/vfs.h"
+#include "filed/storage.h"
 
 struct filed_runtime;
 

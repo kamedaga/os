@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(pachaos_capsule C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(PACHAOS_CAPSULE_ELF "${CMAKE_BINARY_DIR}/pachaos_capsule.elf")
 
 set(KOBOX_RUNTIME_SOURCES
@@ -85,12 +86,11 @@ add_custom_command(
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${PACHAOS_CAPSULE_ELF}"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/fops_smoke_stub.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/pachaos_capsule/boot_config.h"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     ${KOBOX_RUNTIME_SOURCES}
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM

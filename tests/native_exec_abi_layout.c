@@ -1,18 +1,11 @@
 #include <stddef.h>
-#include <asm/unistd.h>
-#include "../musl/upstream/arch/pachaos/syscall_arch.h"
+#include "kobox2/filesystem.h"
 #include "filed/payload.h"
 
-_Static_assert(PACHAOS_FILED_OP_EXEC_PATH == FILED_OP_EXEC_PATH, "native exec operation");
-_Static_assert(sizeof(struct __pachaos_filed_exec_path) == sizeof(filed_exec_path_t),
-    "native exec payload size");
-#define CHECK_FIELD(field) _Static_assert(offsetof(struct __pachaos_filed_exec_path, field) == \
-    offsetof(filed_exec_path_t, field), "native exec field: " #field)
-CHECK_FIELD(inherit_handles);
-CHECK_FIELD(fd_grants);
-CHECK_FIELD(fd_patches);
-CHECK_FIELD(path);
-CHECK_FIELD(argv);
-CHECK_FIELD(envp);
-CHECK_FIELD(strings);
+/* Native libc links the shared codec; it has no independent wire mirror. */
+_Static_assert(KB2_FILESYSTEM_EXEC_PAYLOAD_SIZE == 128, "exec header");
+_Static_assert(sizeof(filed_exec_string_ref_t) == KB2_FILESYSTEM_EXEC_STRING_SIZE, "string span");
+_Static_assert(sizeof(filed_exec_fd_grant_t) == KB2_FILESYSTEM_EXEC_GRANT_SIZE, "grant fields");
+_Static_assert(sizeof(filed_exec_fd_patch_t) == KB2_FILESYSTEM_EXEC_PATCH_SIZE, "patch fields");
+_Static_assert(KB2_FILESYSTEM_OP_EXEC_SELF == KB2_FILESYSTEM_OP_EXEC_PATH + 1, "exec grouping");
 int main(void) { return 0; }

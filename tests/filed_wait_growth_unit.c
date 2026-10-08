@@ -35,6 +35,28 @@ int main(void)
     saved = wait;
     assert(filed_wait_reserve(&wait, 2049) == 0 && wait.fds == saved.fds);
     assert(filed_wait_reserve(&wait, SIZE_MAX) == -12 && wait.fds == saved.fds);
+    /* Request endpoints stay in the first batch even when the following
+     * lifetime-only lease set grows past the native wait bound. */
+    static filed_runtime_t runtime;
+    struct filed_client second = { .id = 202, .fd = 52 };
+    struct filed_client first = { .id = 201, .fd = 51, .next = &second };
+    runtime.clients = &first;
+    uint64_t count = 35;
+    const uint64_t clients_begin = count;
+    assert(filed_wait_add_clients(&runtime, &wait, wait.capacity, &count) == 0);
+    const uint64_t clients_end = count;
+    assert(clients_begin == 35 && clients_end == 37);
+    assert(wait.fds[35].fd == 51 && wait.session_indices[35] == 201);
+    assert(wait.fds[36].fd == 52 && wait.session_indices[36] == 202);
+    assert(wait.fds[35].events == (PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP));
+    assert(clients_end < 256);
+    for (; count < 2049; count++) {
+        wait.lease_handles[count] = count;
+        assert(!(count >= clients_begin && count < clients_end));
+    }
+    count = wait.capacity;
+    assert(filed_wait_add_clients(&runtime, &wait, wait.capacity, &count) == -22);
+    assert(count == wait.capacity);
     filed_wait_destroy(&wait);
     assert(!wait.fds && !wait.session_indices && !wait.lease_handles && !wait.capacity);
     puts("FileD wait storage: grows beyond fixed wait limit, all allocation failures atomic, overflow checked PASS");

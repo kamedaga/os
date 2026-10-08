@@ -9,7 +9,7 @@ static int identity_call(int endpoint, int page_fd, void *page, unsigned op,
     memset(page, 0, FILED_PAGE_BYTES);
     pacha_service_envelope_t *header = page;
     *header = (pacha_service_envelope_t){ .magic = PACHA_SERVICE_REQUEST_MAGIC,
-        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = FILED_SERVICE_ID,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = FILED_SERVICE_ID,
         .op = op, .request_id = ++sequence, .trace_id = sequence, .payload_size = size };
     if (size) memcpy((char *)page + PACHA_SERVICE_HEADER_BYTES, payload, size);
     struct pacha_ipc_fd caps[2] = {{ .fd = (uint64_t)page_fd,

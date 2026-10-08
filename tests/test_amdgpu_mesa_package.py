@@ -55,13 +55,19 @@ class PackageTests(unittest.TestCase):
             payload.parent.mkdir(parents=True)
             payload.write_bytes(b"original")
             manifest = {
-                "schema": 1, "profile": "amdgpu", "mesa_version": PACKAGE.VERSION,
+                "profile": "amdgpu", "mesa_version": PACKAGE.VERSION,
                 "external": sorted(PACKAGE.EXTERNAL), "total_bytes": len(b"original"),
                 "entries": [{"path": "/usr/lib/example.so", "bytes": len(b"original"),
                              "sha256": PACKAGE.digest(payload)}],
             }
             (output / "manifest.json").write_text(json.dumps(manifest))
             PACKAGE.verify(output)
+            manifest["schema"] = 1
+            (output / "manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "invalid AMDGPU Mesa manifest"):
+                PACKAGE.verify(output)
+            del manifest["schema"]
+            (output / "manifest.json").write_text(json.dumps(manifest))
             payload.write_bytes(b"modified")
             with self.assertRaisesRegex(ValueError, "digest mismatch"):
                 PACKAGE.verify(output)
@@ -79,8 +85,14 @@ class PackageTests(unittest.TestCase):
                 entries.append({"path": f"/usr/lib/{name}",
                                 "bytes": payload.stat().st_size,
                                 "sha256": PACKAGE.digest(payload)})
+            gears = package / "rootfs" / PACKAGE.GEARS_PATH
+            gears.parent.mkdir(parents=True)
+            gears.write_bytes(b"client")
+            entries.append({"path": "/" + PACKAGE.GEARS_PATH,
+                            "bytes": gears.stat().st_size,
+                            "sha256": PACKAGE.digest(gears)})
             (package / "manifest.json").write_text(json.dumps({
-                "schema": 1, "profile": "amdgpu", "mesa_version": PACKAGE.VERSION,
+                "profile": "amdgpu", "mesa_version": PACKAGE.VERSION,
                 "external": sorted(PACKAGE.EXTERNAL),
                 "total_bytes": sum(entry["bytes"] for entry in entries),
                 "entries": entries,
@@ -96,6 +108,9 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(alias.linkname, "real.so")
                 self.assertEqual(archive.extractfile("usr/lib/real.so").read(),
                                  b"payload")
+                client = archive.getmember(PACKAGE.GEARS_PATH)
+                self.assertEqual(client.mode, 0o755)
+                self.assertEqual(archive.extractfile(client).read(), b"client")
 
 
 if __name__ == "__main__":

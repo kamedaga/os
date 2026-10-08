@@ -437,6 +437,107 @@ static int test_usb_source_hotplug_and_read(void)
     return 0;
 }
 
+/* Delivery may batch 1000-Hz frames, but must never interpolate, sum relative
+ * deltas or replace capture times with the later publication time. Include a
+ * report split between transport packets, as batch boundaries are not frames. */
+static int test_usb_relative_frames_preserve_time(void)
+{
+    reset_inputd(1);
+    setup_device(0, 7);
+    test_registry[0].source_id = 42;
+    test_registry[0].source_generation = 1;
+    test_registry[0].source_local_id = 2;
+    setup_handle(7, 1);
+    struct kobox_linux_input_record records[60] = {0};
+    for (unsigned frame = 0; frame < 20; ++frame) {
+        for (unsigned component = 0; component < 3; ++component) {
+            unsigned index = frame * 3 + component;
+            records[index] = (struct kobox_linux_input_record){
+                .sequence = index + 1,
+                .monotonic_ns = UINT64_C(1000000000) + frame * UINT64_C(1000000),
+                .device_id = 2, .kind = KOBOX_INPUT_EVENT,
+                .type = component < 2 ? TEST_EV_REL : INPUTD_EV_SYN,
+                .code = component < 2 ? component : INPUTD_SYN_REPORT,
+                .value = component < 2 ? (int)frame * (component ? -1 : 1) : 0,
+            };
+        }
+    }
+    if (inputd_input_source_events(active_island, 42, 1, records, 31) ||
+        inputd_input_source_events(active_island, 42, 1, records + 31, 29)) return 1;
+    inputd_read_request_t request = {.handle = 1, .event_capacity = 64};
+    if (inputd_input_read(&request) || request.event_count != 60) return 2;
+    for (unsigned i = 0; i < 60; ++i) {
+        if (request.events[i].type != records[i].type ||
+            request.events[i].code != records[i].code ||
+            request.events[i].value != records[i].value ||
+            request.events[i].seconds != 1 ||
+            request.events[i].microseconds != (int64_t)(i / 3) * 1000) return 3;
+    }
+    return 0;
+}
+
+/* A second observer must not consume Xorg's clicks. Exercise short button
+ * transitions amid signed motion, with both transport and read splitting a
+ * report. Values beyond HID byte range also catch an accidental narrowing
+ * in the bridge; this does not test the USB HID decoder itself. */
+static int test_mouse_clicks_and_signed_motion_independent_readers(void)
+{
+    reset_inputd(1);
+    setup_device(0, 7);
+    test_registry[0].source_id = 42;
+    test_registry[0].source_generation = 1;
+    test_registry[0].source_local_id = 2;
+    setup_handle(7, 1);
+    handles[1] = handles[0];
+    handles[1].id = 2;
+    test_registry[0].handle_mask |= UINT32_C(1) << 1;
+    const int32_t deltas[] = {127, -128, 128, -129, 32767, -32768, 1, -1};
+    struct kobox_linux_input_record records[32] = {0};
+    for (unsigned frame = 0; frame < 8; ++frame) {
+        for (unsigned component = 0; component < 4; ++component) {
+            unsigned index = frame * 4 + component;
+            records[index] = (struct kobox_linux_input_record){
+                .sequence = index + 1,
+                .monotonic_ns = UINT64_C(1000000000) + frame * UINT64_C(1000000),
+                .device_id = 2, .kind = KOBOX_INPUT_EVENT,
+                .type = component < 2 ? TEST_EV_REL :
+                    component == 2 ? TEST_EV_KEY : INPUTD_EV_SYN,
+                .code = component < 2 ? component :
+                    component == 2 ? 272 : INPUTD_SYN_REPORT,
+                .value = component < 2 ? deltas[frame] * (component ? -1 : 1) :
+                    component == 2 ? (frame % 2 == 0) : 0,
+            };
+        }
+    }
+    if (inputd_input_source_events(active_island, 42, 1, records, 17) ||
+        inputd_input_source_events(active_island, 42, 1, records + 17, 15)) return 1;
+    for (unsigned reader = 0; reader < 2; ++reader) {
+        unsigned consumed = 0;
+        while (consumed < 32) {
+            inputd_read_request_t read = {.handle = reader + 1,
+                .event_capacity = reader ? 7 : 1};
+            if (inputd_input_read(&read) || !read.event_count ||
+                read.event_count > read.event_capacity ||
+                read.event_count > 32 - consumed) return 2;
+            for (unsigned i = 0; i < read.event_count; ++i) {
+                const struct kobox_linux_input_record *expected = &records[consumed + i];
+                if (read.events[i].type != expected->type ||
+                    read.events[i].code != expected->code ||
+                    read.events[i].value != expected->value ||
+                    read.events[i].seconds != 1 ||
+                    read.events[i].microseconds != (int64_t)((consumed + i) / 4) * 1000)
+                    return 3;
+            }
+            consumed += read.event_count;
+        }
+        inputd_read_request_t empty = {.handle = reader + 1, .event_capacity = 1};
+        if (inputd_input_read(&empty) != -11 || empty.event_count) return 4;
+    }
+    if (test_registry[0].source_snapshot.key_state[272 / 64] &
+        (UINT64_C(1) << (272 % 64))) return 5;
+    return 0;
+}
+
 int main(void)
 {
     int status = test_other_device_overflow_does_not_drop();
@@ -453,5 +554,9 @@ int main(void)
     if (status != 0) return 80 + status;
     status = test_usb_source_hotplug_and_read();
     if (status != 0) return 90 + status;
+    status = test_usb_relative_frames_preserve_time();
+    if (status != 0) return 110 + status;
+    status = test_mouse_clicks_and_signed_motion_independent_readers();
+    if (status != 0) return 120 + status;
     return 0;
 }

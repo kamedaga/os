@@ -113,7 +113,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     clock_copy_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
-    const clock_copy_tests = b.addTest(.{ .root_module = clock_copy_mod, .filters = &.{ "timespec copyout", "yield result" } });
+    const clock_copy_tests = b.addTest(.{ .root_module = clock_copy_mod, .filters = &.{ "timespec copyout", "yield result", "clock read register" } });
     const run_clock_copy = b.addRunArtifact(clock_copy_tests);
     test_step.dependOn(&run_clock_copy.step);
     b.step("test-runtime-clock", "Test checked timespec copyout").dependOn(&run_clock_copy.step);
@@ -160,11 +160,14 @@ pub fn build(b: *std.Build) void {
     const interrupt_waiter_tests = b.addTest(.{ .root_module = interrupt_waiter_mod, .filters = &.{ "shootdown interrupt guard", "copy window", "poll item snapshot", "MMIO cache admission", "WC identity lease", "WC physical window leases" }, .use_llvm = true });
     interrupt_waiter_tests.stack_size = 512 * 1024 * 1024;
     test_step.dependOn(&b.addRunArtifact(interrupt_waiter_tests).step);
-    const realtime_clock_tests = b.addTest(.{ .root_module = b.createModule(.{
+    const realtime_clock_mod = b.createModule(.{
         .root_source_file = b.path("src/realtime_clock.zig"),
         .target = target,
         .optimize = optimize,
-    }) });
+    });
+    // The clock page layout is checked against the runtime ABI at comptime.
+    realtime_clock_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    const realtime_clock_tests = b.addTest(.{ .root_module = realtime_clock_mod });
     test_step.dependOn(&b.addRunArtifact(realtime_clock_tests).step);
     for ([_][]const u8{ "src/hpet.zig", "src/lapic.zig", "src/clockevent.zig", "src/acpi_tables.zig", "src/acpi_ivrs.zig", "src/pci.zig" }) |source| {
         const clock_test_mod = b.createModule(.{
@@ -251,9 +254,28 @@ pub fn build(b: *std.Build) void {
     addVerifiedSchedulerHostObject(b, scheduler_context_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_context_test.o");
     const scheduler_context_tests = b.addTest(.{
         .root_module = scheduler_context_test_mod,
-        .filters = &.{ "migration waits", "preferred wake", "controlled thread context", "yield handoff" },
+        // Handoff negative tests reach the PKRU save/restore instructions;
+        // Zig's self-hosted x86 backend cannot encode rdpkru/wrpkru yet.
+        .use_llvm = true,
+        .filters = &.{ "migration waits", "preferred wake", "controlled thread context", "yield handoff", "futex", "context transfer", "clock read admission" },
     });
     test_step.dependOn(&b.addRunArtifact(scheduler_context_tests).step);
+
+    const futex_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/futex_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    futex_runtime_test_mod.addImport("kernel_abi_root", kernel_abi_root_mod);
+    addVerifiedSchedulerHostObject(b, futex_runtime_test_mod, "../verified/scheduling/src/pacha_eevdf.c", "pacha_eevdf_futex_test.o");
+    // Collector retirement and scheduler publication share a transaction;
+    // testing only scheduler roots misses the runtime's lock/callback edge.
+    const futex_runtime_tests = b.addTest(.{
+        .root_module = futex_runtime_test_mod,
+        .use_llvm = true,
+        .filters = &.{"futex"},
+    });
+    test_step.dependOn(&b.addRunArtifact(futex_runtime_tests).step);
 
     const smp_test_mod = b.createModule(.{
         .root_source_file = b.path("src/smp.zig"),

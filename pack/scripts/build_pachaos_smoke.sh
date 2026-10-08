@@ -14,5 +14,6 @@ case "$output" in /*) ;; *) output="$repo_root/$output" ;; esac
 case "$source" in /*) ;; *) source="$repo_root/$source" ;; esac
 
 PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ \
+PACHAOS_MUSL_EXTRA_INCLUDE_DIRS="$repo_root/kobox2/protocol/include $repo_root/kobox2/protocol/generated/include${PACHAOS_MUSL_EXTRA_INCLUDE_DIRS:+ $PACHAOS_MUSL_EXTRA_INCLUDE_DIRS}" \
 PACHAOS_MUSL_APP_SOURCE="$source" \
     bash "$repo_root/musl/pachaos/build/build-smokes.sh" "$output"

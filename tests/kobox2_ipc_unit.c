@@ -12,6 +12,7 @@ static unsigned int inspections, sends, receives, closes[PACHA_FD_TABLE_LIMIT];
 static unsigned int close_fail_fd;
 static int copyout_failure;
 static uint64_t waited_ticks;
+static int notice_mode;
 
 long pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address,
     uint64_t timeout, uint64_t flags) {
@@ -38,8 +39,9 @@ long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t address) {
     if (nr == PACHA_IPC_SYSCALL_SEND) {
         ++sends;
         assert(message->word0 == 1 && message->word1 == 7 && message->word2 == 19);
-        assert(message->word3 == 123 && message->fd_count == 2);
-        assert(message->fds[0].fd == 100 && message->fds[1].fd == 101);
+        assert(message->word3 == 123 && message->fd_count == (notice_mode ? 0 : 2));
+        if (notice_mode) assert(!message->fds);
+        else assert(message->fds[0].fd == 100 && message->fds[1].fd == 101);
         return send_status;
     }
     assert(nr == PACHA_IPC_SYSCALL_RECV);
@@ -187,6 +189,23 @@ static void receiving(void) {
     assert(!ph_ipc_destroy(&ipc, 7));
 }
 
+static void notices(void) {
+    reset(); notice_mode = 1;
+    const struct ph_ipc_notice notice = {.fd = 16, .operation = 1,
+        .generation = 7, .correlation = 19, .value = 123};
+    struct ph_ipc_notice before = notice;
+    assert(ph_ipc_notify(NULL) == -EINVAL);
+    struct ph_ipc_notice invalid = notice; invalid.fd = -1;
+    assert(ph_ipc_notify(&invalid) == -EINVAL && !sends);
+    assert(!ph_ipc_notify(&notice) && sends == 1 && !inspections);
+    send_status = PACHA_SYSCALL_ERR_NOT_READY;
+    assert(ph_ipc_notify(&notice) == -EAGAIN);
+    send_status = PACHA_SYSCALL_ERR_CLOSED;
+    assert(ph_ipc_notify(&notice) == -EPIPE);
+    assert(!memcmp(&notice, &before, sizeof(notice)) && !closes[16]);
+    notice_mode = 0;
+}
+
 static void rejected_cleanup(void) {
     for (unsigned int stale = 0; stale < 2; ++stale) {
         reset();
@@ -225,6 +244,7 @@ static void rejected_cleanup(void) {
 int main(void) {
     initialization();
     sending();
+    notices();
     receiving();
     rejected_cleanup();
     puts("kobox2 native IPC ownership/generation unit: PASS");

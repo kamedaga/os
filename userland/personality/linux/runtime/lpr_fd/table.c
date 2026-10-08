@@ -410,9 +410,10 @@ int lpr_fd_table_abort_staged(lpr_fd_table_t *table, lpr_linux_fd_t fd, lpr_fd_d
     return 0;
 }
 
-int lpr_fd_table_close(
+static int lpr_fd_table_close_expected(
     lpr_fd_table_t *table,
     lpr_linux_fd_t fd,
+    const lpr_fd_pin_t *expected,
     lpr_fd_drop_t *out_drop)
 {
     if (out_drop != 0) {
@@ -421,7 +422,9 @@ int lpr_fd_table_close(
     lpr_fd_table_lock(table);
     lpr_fd_entry_t *entry = lpr_fd_entry(table, fd);
     lpr_ofd_t *ofd = lpr_fd_ofd_for_entry(table, entry);
-    if (entry == 0 || ofd == 0 || ofd->refcount == 0 || ofd->closing) {
+    if (entry == 0 || ofd == 0 || ofd->refcount == 0 || ofd->closing ||
+        (expected && (entry->ofd_index != expected->ofd_index ||
+            entry->ofd_generation != expected->ofd_generation))) {
         lpr_fd_table_unlock(table);
         return -1;
     }
@@ -436,6 +439,19 @@ int lpr_fd_table_close(
     (void)lpr_fd_next_generation(table);
     lpr_fd_table_unlock(table);
     return 0;
+}
+
+int lpr_fd_table_close(lpr_fd_table_t *table, lpr_linux_fd_t fd,
+    lpr_fd_drop_t *out_drop)
+{
+    return lpr_fd_table_close_expected(table, fd, 0, out_drop);
+}
+
+int lpr_fd_table_close_pinned(lpr_fd_table_t *table,
+    const lpr_fd_pin_t *pin, lpr_fd_drop_t *out_drop)
+{
+    if (!pin) return -1;
+    return lpr_fd_table_close_expected(table, pin->fd, pin, out_drop);
 }
 
 int lpr_fd_table_dup(
@@ -653,11 +669,6 @@ int lpr_fd_table_seek_pinned(
     }
 
     ofd->offset = next;
-    if (backend->ops_id == LPR_FD_OPS_FILED &&
-        backend->state_bytes >= sizeof(lpr_filed_backend_t))
-    {
-        ((lpr_filed_backend_t *)backend->state)->offset = next;
-    }
     (void)lpr_fd_next_generation(table);
     *out_offset = next;
     lpr_fd_table_unlock(table);
@@ -773,6 +784,25 @@ int lpr_fd_table_get_refcount(
     *out_refcount = ofd->refcount;
     lpr_fd_table_unlock((lpr_fd_table_t *)table);
     return 0;
+}
+
+int lpr_fd_table_compare_ofd(const lpr_fd_table_t *table,
+    lpr_linux_fd_t first, lpr_linux_fd_t second)
+{
+    lpr_fd_table_lock((lpr_fd_table_t *)table);
+    const lpr_fd_entry_t *left = lpr_fd_entry_const(table, first);
+    const lpr_fd_entry_t *right = lpr_fd_entry_const(table, second);
+    const lpr_ofd_t *left_ofd = lpr_fd_ofd_for_entry_const(table, left);
+    const lpr_ofd_t *right_ofd = lpr_fd_ofd_for_entry_const(table, right);
+    int result = -1;
+    if (left_ofd && right_ofd) {
+        /* Duplicate descriptors share one OFD, even when their fd flags
+         * differ. Comparing backend handles would conflate separate opens. */
+        result = left->ofd_index == right->ofd_index &&
+            left->ofd_generation == right->ofd_generation ? 0 : 1;
+    }
+    lpr_fd_table_unlock((lpr_fd_table_t *)table);
+    return result;
 }
 
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table)

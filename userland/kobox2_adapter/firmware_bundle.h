@@ -7,7 +7,6 @@
 #include "boot/firmware_files.h"
 
 #define PH_FIRMWARE_BUNDLE_MAGIC UINT64_C(0x314c444e424d5746)
-#define PH_FIRMWARE_BUNDLE_VERSION UINT64_C(1)
 #define PH_FIRMWARE_BUNDLE_MAX_BYTES (64u * 1024u * 1024u)
 
 struct ph_firmware_bundle_entry {
@@ -17,7 +16,7 @@ struct ph_firmware_bundle_entry {
 };
 
 struct ph_firmware_bundle {
-    uint64_t magic, version, count, bytes;
+    uint64_t magic, header_bytes, count, bytes;
     struct ph_firmware_bundle_entry entries[KOBOX_FIRMWARE_MAX_FILES];
     unsigned char payload[];
 };

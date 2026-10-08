@@ -62,14 +62,9 @@ static const char *request_arg(const filed_exec_path_t *request, uint64_t index)
     return request->path;
 }
 
-int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request, int bootstrap_fd, int start_thread)
+static int lpr_exec_start_plan_impl(lpr_exec_plan_t *plan, const filed_exec_path_t *request, int bootstrap_fd, int start_thread, uint64_t *argv_va, uint64_t *envp_va)
 {
     if (plan == NULL || request == NULL || plan->process_fd < 16) {
-        return -22;
-    }
-    if (request->argc > FILED_EXEC_MAX_ARGS ||
-        request->envc > FILED_EXEC_MAX_ENVS)
-    {
         return -22;
     }
     /* References may repeat the same string. Charge every copied occurrence,
@@ -167,11 +162,7 @@ int lpr_exec_start_plan(lpr_exec_plan_t *plan, const filed_exec_path_t *request,
     uint64_t sp = initial_bytes;
     const uint64_t argc = request_argc(request);
     const uint64_t envc = request->envc;
-    uint64_t argv_va[FILED_EXEC_MAX_ARGS];
-    uint64_t envp_va[FILED_EXEC_MAX_ENVS];
     uint64_t execfn_va = 0;
-    memset(argv_va, 0, sizeof(argv_va));
-    memset(envp_va, 0, sizeof(envp_va));
 
     stage_start = lpr_exec_now_ns();
     stage_start_cycles = lpr_exec_now_cycles();
@@ -362,4 +353,20 @@ void lpr_exec_discard_process_fd(int process_fd)
             1);
         (void)pacha_fd_close(process_fd);
     }
+}
+
+int lpr_exec_start_plan(lpr_exec_plan_t *plan,
+    const filed_exec_path_t *request, int bootstrap_fd, int start_thread)
+{
+    if (!request || request->argc > SIZE_MAX / sizeof(uint64_t) - 1 ||
+        request->envc > SIZE_MAX / sizeof(uint64_t)) return -7;
+    size_t argc = request->argc ? (size_t)request->argc : 1;
+    size_t envc = (size_t)request->envc;
+    if (argc > SIZE_MAX / sizeof(uint64_t) - envc) return -7;
+    uint64_t *vectors = calloc(argc + envc, sizeof(*vectors));
+    if (!vectors) return -12;
+    int status = lpr_exec_start_plan_impl(plan,request,bootstrap_fd,start_thread,
+                                vectors,vectors+argc);
+    free(vectors);
+    return status;
 }

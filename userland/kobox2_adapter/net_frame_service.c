@@ -6,7 +6,7 @@
 #include <errno.h>
 #include <string.h>
 
-static int prepare(void *context, const struct ph_ipc_packet *packet) {
+static int prepare(void *context, struct ph_ipc_packet *packet) {
     struct ph_net_frame_service *net = context;
     if (!packet->correlation || packet->generation != net->generation || net->operation)
         return -EPROTO;

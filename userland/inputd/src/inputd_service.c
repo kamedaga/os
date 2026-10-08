@@ -1,4 +1,7 @@
 #include "inputd_service.h"
+#include "input_namespace.h"
+#include "linux_subsystem/input/input.h"
+#include <filed_client/module_image.h>
 
 #include <pacha/abi.h>
 #include <pacha/service_abi.h>
@@ -6,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 _Static_assert(INPUTD_INPUT_CAP_KEYBOARD == NETD_INPUT_CAP_KEYBOARD,
@@ -26,6 +30,22 @@ static int publish_device(
         input_device->pci_segment > UINT16_MAX || input_device->pci_bus > UINT8_MAX ||
         input_device->pci_device > 31 || input_device->pci_function > 7)
         return -22;
+    /* Publish the namespace before its uevent: Xorg may enumerate immediately
+     * on ADD, including on a live system without netd or a fixture rootfs. */
+    int status;
+    if (action == NETD_UEVENT_REMOVE) {
+        status = inputd_namespace_remove(FILED_CLIENT_ENDPOINT_FD, input_device->event_index);
+    } else {
+        kb_input_device_snapshot_t snapshot;
+        status = inputd_input_device_snapshot(input_device->event_index, &snapshot);
+        if (!status) status = inputd_namespace_publish(FILED_CLIENT_ENDPOINT_FD,
+            input_device, &snapshot);
+    }
+    if (status) {
+        fprintf(stderr, "[inputd] event%u namespace action=%u failed status=%d\n",
+            input_device->event_index, action, status);
+        return status;
+    }
     /* A RAM-only live session has no network service. Input publication to
      * clients still works; only netlink uevents are intentionally absent. */
     if (service->cfg->netd_endpoint_fd == 0) return 0;

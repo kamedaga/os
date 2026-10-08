@@ -48,21 +48,21 @@ static void add_string(
     const char *value)
 {
     const size_t length = strlen(value) + 1u;
-    if (request->string_bytes + length > sizeof(request->strings)) {
+    if (request->string_bytes + length > 65536) {
         fail("test request string capacity");
     }
-    ref->offset = (uint16_t)request->string_bytes;
-    ref->length = (uint16_t)length;
+    ref->offset = request->string_bytes;
+    ref->length = length;
     memcpy(request->strings + request->string_bytes, value, length);
     request->string_bytes += length;
 }
 
 static void init_request(filed_exec_path_t *request, const char *path)
 {
-    memset(request, 0, sizeof(*request));
-    if (snprintf(request->path, sizeof(request->path), "%s", path) >= (int)sizeof(request->path)) {
-        fail("test request path capacity");
-    }
+    static char strings[65536];
+    static filed_exec_string_ref_t argv[512],envp[512];
+    filed_exec_payload_destroy(request);
+    *request=(filed_exec_path_t){.path=(char *)path,.strings=strings,.argv=argv,.envp=envp};
     add_string(request, &request->argv[request->argc++], "discard-me");
     add_string(request, &request->argv[request->argc++], "tail-one");
     add_string(request, &request->argv[request->argc++], "tail-two");
@@ -111,10 +111,10 @@ static void test_argument_and_argv_order(void)
         { "/bin/probe", "\177ELF", 0 },
     };
     fake_files_t context = { files, sizeof(files) / sizeof(files[0]), 0 };
-    filed_exec_path_t request;
+    filed_exec_path_t request __attribute__((cleanup(filed_exec_payload_destroy))) = {0};
     init_request(&request, "/tmp/top-script");
     const unsigned char prefix[] = "#!  /bin/probe\t--flag with spaces  \nignored";
-    char executable[FILED_PATH_BYTES];
+    char executable[4096];
     expect_status(
         "resolve argument script",
         lpr_exec_resolve_script_chain(
@@ -151,10 +151,10 @@ static void test_four_level_nesting(void)
         { "/bin/final", "\177ELF", 0 },
     };
     fake_files_t context = { files, sizeof(files) / sizeof(files[0]), 0 };
-    filed_exec_path_t request;
+    filed_exec_path_t request __attribute__((cleanup(filed_exec_payload_destroy))) = {0};
     init_request(&request, "/s1");
     const unsigned char prefix[] = "#!/s2 a1\n";
-    char executable[FILED_PATH_BYTES];
+    char executable[4096];
     expect_status(
         "four nested scripts",
         lpr_exec_resolve_script_chain(
@@ -187,10 +187,10 @@ static void test_nesting_limit(void)
         { "/s4", "#!/bin/final\n", 0 },
     };
     fake_files_t context = { files, sizeof(files) / sizeof(files[0]), 0 };
-    filed_exec_path_t request;
+    filed_exec_path_t request __attribute__((cleanup(filed_exec_payload_destroy))) = {0};
     init_request(&request, "/s0");
     const unsigned char prefix[] = "#!/s1\n";
-    char executable[FILED_PATH_BYTES];
+    char executable[4096];
     expect_status(
         "fifth nested script returns ELOOP",
         lpr_exec_resolve_script_chain(
@@ -207,8 +207,8 @@ static void test_nesting_limit(void)
 
 static void test_interpreter_open_errno(void)
 {
-    filed_exec_path_t request;
-    char executable[FILED_PATH_BYTES];
+    filed_exec_path_t request __attribute__((cleanup(filed_exec_payload_destroy))) = {0};
+    char executable[4096];
     const unsigned char missing_prefix[] = "#!/missing\n";
     fake_files_t missing = { NULL, 0, 0 };
     init_request(&request, "/missing-script");
@@ -243,18 +243,18 @@ static void test_interpreter_open_errno(void)
         -13);
 }
 
-static void test_127_byte_line_cutoff(void)
+static void test_linux_line_cutoff(void)
 {
     unsigned char prefix[LPR_EXEC_SCRIPT_PREFIX_BYTES];
     memset(prefix, 'x', sizeof(prefix));
     prefix[0] = '#';
     prefix[1] = '!';
-    prefix[126] = ' ';
-    prefix[127] = 'Z';
-    char interpreter[FILED_PATH_BYTES];
+    prefix[254] = ' ';
+    prefix[255] = 'Z';
+    char interpreter[4096];
     char argument[LPR_EXEC_SCRIPT_PREFIX_BYTES + 1u];
     expect_status(
-        "127 byte shebang cutoff",
+        "255 byte shebang cutoff",
         lpr_exec_parse_shebang(
             prefix,
             sizeof(prefix),
@@ -263,8 +263,8 @@ static void test_127_byte_line_cutoff(void)
             argument,
             sizeof(argument)),
         1);
-    if (strlen(interpreter) != 124) fail("127 byte interpreter length");
-    expect_string("byte 128 ignored", argument, "");
+    if (strlen(interpreter) != 252) fail("255 byte interpreter length");
+    expect_string("byte 256 ignored", argument, "");
 }
 
 int main(void)
@@ -273,7 +273,7 @@ int main(void)
     test_four_level_nesting();
     test_nesting_limit();
     test_interpreter_open_errno();
-    test_127_byte_line_cutoff();
+    test_linux_line_cutoff();
     puts("shebang_test: PASS");
     return 0;
 }

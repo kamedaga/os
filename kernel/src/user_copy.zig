@@ -558,7 +558,7 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         const mapping = blk: {
             user_vm.lockSharedVmObjects();
             defer user_vm.unlockSharedVmObjects();
-            break :blk state.commitNativeVmaFaultMapping(principal, plan, candidate);
+            break :blk state.commitNativeVmaFaultMapping(principal, plan, candidate, free_list);
         };
         if (mapping) |resolved| {
             if (resolved.paddr != candidate) free_list.appendPage(0, candidate) catch {};
@@ -570,20 +570,17 @@ pub fn resolveNativeVmaFaultMappingWithAddressSpaceLocked(
     return null;
 }
 
-fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, write_access: bool) ?u64 {
-    if (!write_access) {
-        if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
-    }
+// Both private callers hold the address-space lock through cache selection
+// and the physical copy. Reacquiring it here adds no lifetime protection.
+fn ensureUserPageMappedForCopyWithAddressSpaceLocked(principal: kernel.PrincipalId, page_va: u64, write_access: bool) ?u64 {
+    if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
+        principal,
+        page_va,
+        write_access,
+        false,
+    )) |paddr| return paddr;
     const h = getHooks();
-    if (!user_vm.lockAddressSpace(principal)) return null;
-    defer user_vm.unlockAddressSpace(principal);
     if (write_access) {
-        if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(
-            principal,
-            page_va,
-            true,
-            false,
-        )) |paddr| return paddr;
         const cow_mapping = resolveNativeVmaCowMappingWithAddressSpaceLocked(
             h.state,
             h.free_list,
@@ -602,7 +599,7 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
                 )) return null;
             }
             var paddrs = [_]u64{mapping.paddr};
-            if (user_vm.lookupUserMappedPaddrForVa(principal, page_va) != null) {
+            if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(principal, page_va, false, false) != null) {
                 if (!user_vm.remapTrustedUserPaddrsWithProt(
                     principal,
                     page_va,
@@ -621,7 +618,7 @@ fn ensureUserPageMappedForCopy(principal: kernel.PrincipalId, page_va: u64, writ
     // A present read-only PTE is not permission to copy out through its
     // physical address when write lookup/COW resolution above failed.
     if (!write_access) {
-        if (user_vm.lookupUserMappedPaddrForVa(principal, page_va)) |paddr| return paddr;
+        if (user_vm.lookupUserMappedPaddrForAccessWithAddressSpaceLocked(principal, page_va, false, false)) |paddr| return paddr;
     }
     const mapping = resolveNativeVmaFaultMappingWithAddressSpaceLocked(
         h.state,
@@ -762,11 +759,73 @@ pub fn copyPhysicalPage(dst_paddr: u64, src_paddr: u64) bool {
 fn userPageCopyCache(principal: kernel.PrincipalId, va: u64, paddr: u64, write: bool) PhysWindowCache {
     user_vm.lockSharedVmObjects();
     defer user_vm.unlockSharedVmObjects();
-    const mapping = getHooks().state.nativeVmaFaultMapping(principal, va, write, false) orelse return .ram;
+    return userPageCopyCacheWithState(getHooks().state, principal, va, paddr, write);
+}
+
+fn userPageCopyCacheWithState(state: anytype, principal: kernel.PrincipalId, va: u64, paddr: u64, write: bool) PhysWindowCache {
+    const entry = state.vmaEntryForVaConst(principal, va) orelse return .ram;
+    // With the same AS/shared-object exclusion, a backing without a device
+    // PAT can only produce the old RAM result. Do not re-resolve its COW/VMO
+    // pages just to classify it; access/COW and RAM cache leases remain the
+    // checked-copy and physical-window paths' responsibility.
+    if (state.nativeVmoDevicePatSlot(entry.vmo) == null) return .ram;
+    const mapping = state.nativeVmaFaultMapping(principal, va, write, false) orelse return .ram;
     if (mapping.paddr == paddr) {
         if (mapping.device_pat_slot) |slot| return .{ .device = slot };
     }
     return .ram;
+}
+
+test "copy cache classification skips RAM backing resolution but validates every device candidate" {
+    const Mock = struct {
+        const Entry = struct { vmo: u32 = 41 };
+        const Mapping = struct { paddr: u64, device_pat_slot: ?u3 };
+        entry: ?Entry = .{},
+        pat: ?u3 = null,
+        mapping: ?Mapping = null,
+        calls: [3]usize = .{ 0, 0, 0 },
+        last_write: bool = false,
+        fn vmaEntryForVaConst(self: *@This(), owner: kernel.PrincipalId, va: u64) ?Entry {
+            std.debug.assert(@intFromEnum(owner) == 0 and va == 0x1000);
+            self.calls[0] += 1;
+            return self.entry;
+        }
+        fn nativeVmoDevicePatSlot(self: *@This(), vmo: u32) ?u3 {
+            std.debug.assert(vmo == 41);
+            self.calls[1] += 1;
+            return self.pat;
+        }
+        fn nativeVmaFaultMapping(self: *@This(), owner: kernel.PrincipalId, va: u64, write: bool, exec: bool) ?Mapping {
+            std.debug.assert(@intFromEnum(owner) == 0 and va == 0x1000 and !exec);
+            self.calls[2] += 1;
+            self.last_write = write;
+            return self.mapping;
+        }
+    };
+    const owner: kernel.PrincipalId = @enumFromInt(0);
+    var absent = Mock{ .entry = null };
+    try std.testing.expect(userPageCopyCacheWithState(&absent, owner, 0x1000, 0x9000, true) == .ram);
+    try std.testing.expectEqual([3]usize{ 1, 0, 0 }, absent.calls);
+    // Covers no-device PAT, including ordinary RAM, stale or retiring backing.
+    var ram = Mock{ .mapping = .{ .paddr = 0x9000, .device_pat_slot = null } };
+    try std.testing.expect(userPageCopyCacheWithState(&ram, owner, 0x1000, 0x9000, true) == .ram);
+    try std.testing.expectEqual([3]usize{ 1, 1, 0 }, ram.calls);
+    for ([_]u3{ 0, 1, 3, 7 }) |pat| {
+        for ([_]bool{ false, true }) |write| {
+            var device = Mock{ .pat = pat, .mapping = .{ .paddr = 0x9000, .device_pat_slot = pat } };
+            try std.testing.expectEqualDeep(PhysWindowCache{ .device = pat }, userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write));
+            try std.testing.expectEqual([3]usize{ 1, 1, 1 }, device.calls);
+            try std.testing.expectEqual(write, device.last_write);
+            // Permissions/generation failure still delegates to the full mapping.
+            device.mapping = null;
+            try std.testing.expect(userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write) == .ram);
+            device.mapping = .{ .paddr = 0xa000, .device_pat_slot = pat };
+            try std.testing.expect(userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write) == .ram);
+            device.mapping = .{ .paddr = 0x9000, .device_pat_slot = null };
+            try std.testing.expect(userPageCopyCacheWithState(&device, owner, 0x1000, 0x9000, write) == .ram);
+            try std.testing.expectEqual(@as(usize, 4), device.calls[2]);
+        }
+    }
 }
 
 fn retireDeviceCopyWindow(cache: PhysWindowCache, cpu: usize) void {
@@ -779,7 +838,119 @@ fn retireDeviceCopyWindow(cache: PhysWindowCache, cpu: usize) void {
     h.invlpg(h.phys_copy_window_va + @as(u64, @intCast(cpu)) * 4096);
 }
 
+// Diagnostic-only mirror keeps the normal copy's code generation untouched.
+// Shared permission/cache/fault/window helpers own all protection decisions.
+fn copyUserWordBytesProfiled(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
+    const h = getHooks();
+    if (dest.len == 0) return true;
+
+    // Private diagnosis only: a word may cross a page, so entries and chunks
+    // have separate denominators. No address/word data leaves the copy path.
+    const profile: ?perf.RuntimePath = if (comptime perf.enabled)
+        (if (dest.len == 4) .checked_word_copy else null)
+    else
+        null;
+    const copy_start = perf.runtimeTimestamp(profile);
+    perf.runtimeAdd(profile, .calls, 1);
+    // Registered first so the timer includes AS/window/CR3 deferred cleanup.
+    defer perf.runtimeElapsed(profile, .total_cycles, copy_start);
+
+    const original_cr3 = h.read_cr3();
+    if (original_cr3 != h.kernel_cr3_value.*) {
+        h.write_cr3(h.kernel_cr3_value.*);
+    }
+    defer {
+        if (original_cr3 != h.kernel_cr3_value.*) {
+            h.write_cr3(original_cr3);
+        }
+    }
+
+    var copied: usize = 0;
+    while (copied < dest.len) {
+        const copied_u64: u64 = @intCast(copied);
+        const cur_va, const va_overflow = @addWithOverflow(src_user_va, copied_u64);
+        if (va_overflow != 0) return false;
+
+        const page_va = cur_va & ~@as(u64, 0xFFF);
+        const page_off: usize = @intCast(cur_va & 0xFFF);
+        if (comptime perf.enabled) {
+            const lock_start = perf.runtimeTimestamp(profile);
+            const locked = user_vm.lockAddressSpace(principal);
+            perf.runtimeElapsed(profile, .lock_wait_cycles, lock_start);
+            if (!locked) return false;
+        } else if (!user_vm.lockAddressSpace(principal)) return false;
+        defer {
+            if (comptime perf.enabled) {
+                const unlock_start = perf.runtimeTimestamp(profile);
+                user_vm.unlockAddressSpace(principal);
+                perf.runtimeElapsed(profile, .unlock_cycles, unlock_start);
+            } else user_vm.unlockAddressSpace(principal);
+        }
+        const page_paddr = if (comptime perf.enabled) blk: {
+            perf.runtimeAdd(profile, .body_calls, 1);
+            const lookup_start = perf.runtimeTimestamp(profile);
+            const mapped_page = ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, false);
+            perf.runtimeElapsed(profile, .body_cycles, lookup_start);
+            break :blk mapped_page orelse return false;
+        } else ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, false) orelse return false;
+        const cache = if (comptime perf.enabled) blk: {
+            perf.runtimeAdd(profile, .copy_calls, 1);
+            const cache_start = perf.runtimeTimestamp(profile);
+            const cache = userPageCopyCache(principal, page_va, page_paddr, false);
+            perf.runtimeElapsed(profile, .copy_cycles, cache_start);
+            break :blk cache;
+        } else userPageCopyCache(principal, page_va, page_paddr, false);
+        if (page_paddr >= h.physical_map_limit) return false;
+
+        const page_remaining: usize = 4096 - page_off;
+        const total_remaining: usize = dest.len - copied;
+        const chunk_len: usize = if (total_remaining < page_remaining) total_remaining else page_remaining;
+
+        const page_off_u64: u64 = @intCast(page_off);
+        const src_paddr, const paddr_overflow = @addWithOverflow(page_paddr, page_off_u64);
+        if (paddr_overflow != 0 or src_paddr >= h.physical_map_limit) return false;
+        if (chunk_len == 0) return false;
+        const last_paddr, const last_overflow = @addWithOverflow(src_paddr, @as(u64, @intCast(chunk_len - 1)));
+        if (last_overflow != 0 or last_paddr >= h.physical_map_limit) return false;
+
+        {
+            perf.runtimeAdd(profile, .claim_calls, 1);
+            const window_start = perf.runtimeTimestamp(profile);
+            // Runs after retirement and IRQ restoration; elapsed time may
+            // include interrupts after STI, not just window CPU instructions.
+            defer perf.runtimeElapsed(profile, .claim_cycles, window_start);
+            const window = PhysCopyWindowGuard.lock();
+            defer window.unlock();
+            defer {
+                retireDeviceCopyWindow(cache, window.cpu_slot);
+                if (comptime perf.enabled) {
+                    if (cache == .device) perf.runtimeAdd(profile, .reserved, 1);
+                }
+            }
+            const src_page = if (comptime perf.enabled) blk: {
+                const pte_before = if (profile != null) h.phys_copy_window_pt[window.cpu_slot] else 0;
+                const mapped_window = mapPhysPageWithCache(src_paddr, window.cpu_slot, cache);
+                if (profile != null) {
+                    if (mapped_window != null) {
+                        const accessed_dirty: u64 = (1 << 5) | (1 << 6);
+                        const changed = ((pte_before ^ h.phys_copy_window_pt[window.cpu_slot]) & ~accessed_dirty) != 0;
+                        perf.runtimeAdd(profile, if (changed) .claimed else .no_claim, 1);
+                    } else perf.runtimeAdd(profile, .invalid, 1);
+                }
+                break :blk mapped_window orelse return false;
+            } else mapPhysPageWithCache(src_paddr, window.cpu_slot, cache) orelse return false;
+            const src: [*]const u8 = @ptrCast(src_page + page_off);
+            @memcpy(dest[copied .. copied + chunk_len], src[0..chunk_len]);
+        }
+        copied += chunk_len;
+    }
+    return true;
+}
+
 pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest: []u8) bool {
+    if (comptime perf.enabled) {
+        if (dest.len == 4) return copyUserWordBytesProfiled(principal, src_user_va, dest);
+    }
     const h = getHooks();
     if (dest.len == 0) return true;
 
@@ -803,7 +974,7 @@ pub fn copyUserBytesFromVa(principal: kernel.PrincipalId, src_user_va: u64, dest
         const page_off: usize = @intCast(cur_va & 0xFFF);
         if (!user_vm.lockAddressSpace(principal)) return false;
         defer user_vm.unlockAddressSpace(principal);
-        const page_paddr = ensureUserPageMappedForCopy(principal, page_va, false) orelse return false;
+        const page_paddr = ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, false) orelse return false;
         const cache = userPageCopyCache(principal, page_va, page_paddr, false);
         if (page_paddr >= h.physical_map_limit) return false;
 
@@ -855,7 +1026,7 @@ pub fn copyBytesToUserVa(principal: kernel.PrincipalId, dest_user_va: u64, src: 
         const page_off: usize = @intCast(cur_va & 0xFFF);
         if (!user_vm.lockAddressSpace(principal)) return false;
         defer user_vm.unlockAddressSpace(principal);
-        const page_paddr = ensureUserPageMappedForCopy(principal, page_va, true) orelse return false;
+        const page_paddr = ensureUserPageMappedForCopyWithAddressSpaceLocked(principal, page_va, true) orelse return false;
         const cache = userPageCopyCache(principal, page_va, page_paddr, true);
         if (page_paddr >= h.physical_map_limit) return false;
 

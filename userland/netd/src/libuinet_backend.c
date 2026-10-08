@@ -12,7 +12,9 @@
 #include <time.h>
 
 #if defined(NETD_WITH_LIBUINET)
-#include "filed/ipc_protocol.h"
+#include "filed_client/client.h"
+#include <errno.h>
+#include <fcntl.h>
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
@@ -1479,245 +1481,50 @@ static void netd_mbedtls_error_text(int status, char *buffer, size_t buffer_len)
     buffer[buffer_len - 1] = '\0';
 }
 
-static uint64_t g_netd_filed_request_id;
-
-static int netd_filed_create_wire_page(int *out_fd, void **out_page)
-{
-    if (out_fd == NULL || out_page == NULL) {
-        return -22;
-    }
-    *out_fd = -1;
-    *out_page = NULL;
-
-    const uint64_t rights =
-        PACHA_FD_RIGHT_TRANSFER |
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-    int fd = pacha_vmo_create(PACHA_SERVICE_PAGE_BYTES, rights, 0);
-    if (fd < 16) {
-        return fd;
-    }
-    void *page = pacha_mmap(
-        fd,
-        PACHA_SERVICE_PAGE_BYTES,
-        PACHA_PROT_READ | PACHA_PROT_WRITE,
-        PACHA_MMAP_SHARED,
-        0);
-    if (page == NULL) {
-        (void)pacha_fd_close(fd);
-        return -2;
-    }
-    memset(page, 0, PACHA_SERVICE_PAGE_BYTES);
-    *out_fd = fd;
-    *out_page = page;
-    return 0;
-}
-
-static void netd_filed_destroy_wire_page(int page_fd, void *page)
-{
-    if (page != NULL) {
-        (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);
-    }
-    if (page_fd >= 16) {
-        (void)pacha_fd_close(page_fd);
-    }
-}
-
-static void *netd_filed_payload(void *page)
-{
-    return page == NULL ? NULL : (uint8_t *)page + PACHA_SERVICE_HEADER_BYTES;
-}
-
-static int netd_filed_call(
-    uint32_t op,
-    int page_fd,
-    void *page,
-    uint32_t payload_size,
-    uint64_t *out_result,
-    struct pacha_ipc_msg *out_reply,
-    struct pacha_ipc_fd *reply_fds,
-    uint64_t reply_fd_capacity)
-{
-    if (out_result == NULL || page_fd < 16 || page == NULL ||
-        payload_size > PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES)
-    {
-        return -22;
-    }
-    if (g_filed_endpoint_fd < 16) {
-        return -9;
-    }
-
-    const uint64_t request_id = ++g_netd_filed_request_id;
-    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_SERVICE_ID;
-    header->op = op;
-    header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
-    header->request_id = request_id;
-    header->trace_id = request_id;
-    header->payload_size = payload_size;
-
-    struct pacha_ipc_fd fd_item;
-    memset(&fd_item, 0, sizeof(fd_item));
-    fd_item.fd = (uint64_t)(uint32_t)page_fd;
-    fd_item.rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-
-    const struct pacha_ipc_msg request = {
-        .word0 = PACHA_SERVICE_REQUEST_MAGIC,
-        .word1 = 0,
-        .word2 = 0,
-        .word3 = request_id,
-        .fds = &fd_item,
-        .fd_count = 1u,
-    };
-    const int reply_fd = pacha_ipc_call(g_filed_endpoint_fd, &request);
-    if (reply_fd < 16) {
-        return reply_fd;
-    }
-
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    reply.fds = reply_fds;
-    reply.fd_capacity = reply_fd_capacity;
-    const int recv_status = pacha_ipc_recv_wait(reply_fd, &reply, PACHA_FD_WAIT_FOREVER);
-    (void)pacha_fd_close(reply_fd);
-    if (recv_status != 0) {
-        return recv_status;
-    }
-    const pacha_service_envelope_t *reply_header =
-        (const pacha_service_envelope_t *)page;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        reply.word3 != request_id ||
-        reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_SERVICE_ID ||
-        reply_header->op != op ||
-        reply_header->request_id != request_id)
-    {
-        return -71;
-    }
-    if (reply_header->status < 0) {
-        return (int)reply_header->status;
-    }
-    if (out_reply != NULL) {
-        *out_reply = reply;
-    }
-    *out_result = reply_header->result;
-    return 0;
-}
-
 int netd_filed_close_handle(uint64_t handle)
 {
-    int page_fd = -1;
-    void *page = NULL;
-    uint64_t ignored = 0;
-    int status = netd_filed_create_wire_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-    filed_handle_request_t *request = (filed_handle_request_t *)netd_filed_payload(page);
-    request->handle = handle;
-    status = netd_filed_call(
-        FILED_OP_VFS_CLOSE,
-        page_fd,
-        page,
-        sizeof(*request),
-        &ignored,
-        NULL,
-        NULL,
-        0);
-    netd_filed_destroy_wire_page(page_fd, page);
-    return status;
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_CLOSE, .handle = handle};
+    kb2_fs_response_t response;
+    int status = filedfs_call(g_filed_endpoint_fd, &request, NULL, NULL, NULL, 0,
+        NULL, 0, &response, NULL, 0, NULL, NULL);
+    return status ? status : response.result < 0 ? (int)response.result : 0;
 }
 
-static int netd_filed_file_vmo(uint64_t handle, uint64_t file_offset, uint64_t length, uint64_t *out_loaded)
+static int netd_filed_file_vmo(uint64_t handle, uint64_t offset,
+    uint64_t length, uint64_t *out_loaded)
 {
-    if (handle == 0 || length == 0 || out_loaded == NULL) {
-        return -22;
-    }
+    if (!handle || !length || !out_loaded || offset > INT64_MAX) return -EINVAL;
     *out_loaded = 0;
-
-    int page_fd = -1;
-    void *page = NULL;
-    int status = netd_filed_create_wire_page(&page_fd, &page);
-    if (status != 0) {
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_FILE_VMO,
+        .handle = handle, .offset = (int64_t)offset, .length = length};
+    kb2_fs_response_t response;
+    int fd = -1;
+    size_t count = 1;
+    int status = filedfs_call(g_filed_endpoint_fd, &request, NULL, NULL, NULL, 0,
+        NULL, 0, &response, NULL, 0, &fd, &count);
+    if (!status && response.result < 0) status = (int)response.result;
+    if (!status && (count != 1 || fd < 16 ||
+        (uint64_t)response.result > length)) status = -EPROTO;
+    if (status) {
+        if (count && fd >= 16) (void)pacha_fd_close(fd);
         return status;
     }
-
-    filed_file_vmo_request_t *file_vmo =
-        (filed_file_vmo_request_t *)netd_filed_payload(page);
-    memset(file_vmo, 0, sizeof(*file_vmo));
-    file_vmo->handle = handle;
-    file_vmo->file_offset = file_offset;
-    file_vmo->length = length;
-
-    struct pacha_ipc_fd reply_fd_item;
-    memset(&reply_fd_item, 0, sizeof(reply_fd_item));
-    struct pacha_ipc_msg reply;
-    memset(&reply, 0, sizeof(reply));
-    status = netd_filed_call(
-        FILED_OP_VFS_FILE_VMO,
-        page_fd,
-        page,
-        sizeof(*file_vmo),
-        out_loaded,
-        &reply,
-        &reply_fd_item,
-        1);
-    netd_filed_destroy_wire_page(page_fd, page);
-    if (status != 0) {
-        return status;
-    }
-    if (reply.fd_count != 1 || reply_fd_item.fd < 16) {
-        return -5;
-    }
-    return (int)reply_fd_item.fd;
+    *out_loaded = (uint64_t)response.result;
+    return fd;
 }
 
 static int netd_filed_open_readonly(const char *path, uint64_t *out_handle)
 {
-    if (path == NULL || out_handle == NULL) {
-        return -22;
-    }
-    int page_fd = -1;
-    void *page = NULL;
-    int status = netd_filed_create_wire_page(&page_fd, &page);
-    if (status != 0) {
-        return status;
-    }
-
-    filed_path_request_t *open_req = (filed_path_request_t *)netd_filed_payload(page);
-    memset(open_req, 0, sizeof(*open_req));
-    open_req->dir_handle = 0;
-    open_req->rights = FILED_RIGHT_READ | FILED_RIGHT_STAT;
-    open_req->flags = FILED_OPEN_CLOEXEC;
-    snprintf(open_req->path, sizeof(open_req->path), "%s", path);
-
-    printf("[netd] filed open begin path=%s\n", path);
-    uint64_t handle = 0;
-    status = netd_filed_call(
-        FILED_OP_VFS_OPENAT,
-        page_fd,
-        page,
-        sizeof(*open_req),
-        &handle,
-        NULL,
-        NULL,
-        0);
-    printf("[netd] filed open done path=%s status=%d handle=%llu\n",
-           path,
-           status,
-           (unsigned long long)handle);
-    netd_filed_destroy_wire_page(page_fd, page);
-    if (status != 0) {
-        return status;
-    }
-    *out_handle = handle;
-    return 0;
+    if (!path || !out_handle) return -EINVAL;
+    kb2_fs_request_t request = {.opcode = KB2_FILESYSTEM_OP_OPENAT2,
+        .flags = O_RDONLY | O_CLOEXEC};
+    kb2_fs_response_t response;
+    int status = filedfs_call(g_filed_endpoint_fd, &request, path, NULL, NULL, 0,
+        NULL, 0, &response, NULL, 0, NULL, NULL);
+    if (!status && response.result < 0) status = (int)response.result;
+    if (!status && !response.handle) status = -EPROTO;
+    if (!status) *out_handle = response.handle;
+    return status;
 }
 
 static int netd_read_file_alloc(const char *path, unsigned char **out_data, size_t *out_len)

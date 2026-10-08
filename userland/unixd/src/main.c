@@ -12,7 +12,7 @@ int main(int argc, char **argv)
     const int bootstrap = pacha_bootstrap_fd_from_argv(argv);
     if (bootstrap < 16 ||
         pacha_fd_read(bootstrap, &config, sizeof(config)) != (long)sizeof(config) ||
-        config.magic != UNIX_BOOT_MAGIC || config.version != UNIX_SERVICE_VERSION ||
+        config.magic != UNIX_BOOT_MAGIC || config.size != sizeof(config) ||
         config.admin_endpoint < 16 || config.filed_path_channel < 16 || config.ready_channel < 16) {
         fputs("[unixd] invalid bootstrap\n", stderr);
         return 2;

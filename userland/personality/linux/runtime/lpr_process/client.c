@@ -11,6 +11,11 @@
 #include <personality/linux_lpr.h>
 #include <stdint.h>
 
+#if defined(LPR_BOOT_DIAGNOSTICS) && LPR_BOOT_DIAGNOSTICS
+#include "../lpr_filed_internal.h"
+#endif
+#include "../lpr_common/boot_diagnostic.h"
+
 static int lpr_process_control_fd = -1;
 
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
@@ -117,7 +122,7 @@ int64_t lpr_process_client_call_with_transfer_rights(
     pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = LPRS_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
@@ -150,8 +155,14 @@ int64_t lpr_process_client_call_with_transfer_rights(
     };
     /* Session acquisition can arrive concurrently from every Linux thread.
      * As with socket RPCs, wait only for explicit pre-enqueue backpressure. */
+    if (op == LPRS_OP_PROCESS_FILED_SESSION)
+        lpr_boot_diagnostic_fs_emit("fs.supervisor.call", op, request_id,
+            lpr_process_control_fd, 0, 0);
     const int64_t reply_fd = lpr_native_ipc_call_wait(
         (uint64_t)(uint32_t)lpr_process_control_fd, &request);
+    if (op == LPRS_OP_PROCESS_FILED_SESSION)
+        lpr_boot_diagnostic_fs_emit("fs.supervisor.called", op, request_id, reply_fd,
+            reply_fd < 16 ? status_to_errno(reply_fd) : 0, reply_fd);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (op == LPRS_OP_PROCESS_WAIT4) {
         lpr_process_rpc_diag("call-return", request_id, reply_fd, 0, 0, 0);
@@ -187,9 +198,15 @@ int64_t lpr_process_client_call_with_transfer_rights(
         lpr_process_rpc_diag("recv-enter", request_id, reply_fd, 0, 0, 0);
     }
 #endif
+    if (op == LPRS_OP_PROCESS_FILED_SESSION)
+        lpr_boot_diagnostic_fs_emit("fs.supervisor.recv", op, request_id, reply_fd, 0, 0);
     const int64_t recv_status = lpr_native_ipc_recv_wait(
         (uint64_t)(uint32_t)reply_fd,
         &reply);
+    if (op == LPRS_OP_PROCESS_FILED_SESSION)
+        lpr_boot_diagnostic_fs_emit("fs.supervisor.received", reply.word0,
+            reply.word3, reply.word2,
+            recv_status ? status_to_errno(recv_status) : (int64_t)reply.word1, recv_status);
 #if defined(LPR_GLYCIN_DIAG) && LPR_GLYCIN_DIAG
     if (op == LPRS_OP_PROCESS_WAIT4) {
         lpr_process_rpc_diag(
@@ -222,6 +239,7 @@ int64_t lpr_process_client_call_with_transfer_rights(
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        reply_header->header_size != sizeof(*reply_header) ||
         reply_header->request_id != request_id)
     {
         if (reply.fd_count != 0 && reply_item.fd >= 16)

@@ -7,7 +7,6 @@
  * never an authority to map arbitrary physical memory. */
 enum {
     PACHA_LIVE_ROOT_BOOTSTRAP_MAGIC = 0x3154524f4f524d52ull,
-    PACHA_LIVE_ROOT_BOOTSTRAP_VERSION = 2,
     PACHA_LIVE_POWER_REQUEST_MAGIC = 0x5257515041434841ull,
     PACHA_LIVE_POWER_OFF = 1,
     PACHA_LIVE_POWER_REBOOT = 2,
@@ -15,7 +14,7 @@ enum {
 
 typedef struct pacha_live_root_bootstrap {
     uint64_t magic;
-    uint64_t version;
+    uint64_t size;
     uint64_t filed_endpoint_fd;
     uint64_t unix_path_fd;
     uint64_t root_handoff_fd;

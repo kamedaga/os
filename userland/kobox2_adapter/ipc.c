@@ -96,6 +96,16 @@ int ph_ipc_send(struct ph_ipc *ipc, struct ph_ipc_packet *packet) {
     return 0;
 }
 
+int ph_ipc_notify(const struct ph_ipc_notice *notice) {
+    if (!notice || !valid_fd((uint64_t)notice->fd) ||
+        !notice->operation || !notice->generation) return -EINVAL;
+    struct pacha_ipc_msg message = {.word0 = notice->operation,
+        .word1 = notice->generation, .word2 = notice->correlation,
+        .word3 = notice->value};
+    return native_status(pacha_syscall2(PACHA_IPC_SYSCALL_SEND,
+        (uint64_t)notice->fd, (uintptr_t)&message));
+}
+
 int ph_ipc_packet_release(struct ph_ipc_packet *packet) {
     if (!packet || packet->fd_count > PACHA_IPC_MAX_TRANSFER_FDS) return -EINVAL;
     int first_error = 0;

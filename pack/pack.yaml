@@ -2,6 +2,10 @@ schema: 1
 name: "CapabilityOS"
 artifacts: ".artifacts"
 state: ".artifacts/pack"
+storage:
+  sandboxRAMMiB: 512
+  queueSize: 64
+  queueArenaMiB: 16
 kernel:
   dir: "kernel"
   step: "limine"
@@ -555,6 +559,107 @@ apps:
       rebuild: ["bash", "tools/build_wsl_curl.sh", ".artifacts/userland-fixtures/curl-root"]
       input: ["tools/build_wsl_curl.sh"]
     out: "LVCURL.ELF"
+  installer_mkfs_fat:
+    file:
+      path: ".artifacts/installer-tools/sbin/mkfs.fat"
+      rebuild: ["bash", "pack/scripts/build_installer_tools.sh"]
+      input: ["pack/scripts/build_installer_tools.sh", "pack/scripts/alpine_packages.py", "tools/manifests/alpine-installer-v3.22-x86_64.lock"]
+    out: "INMKFAT.ELF"
+  installer_mke2fs:
+    file:
+      path: ".artifacts/installer-tools/sbin/mke2fs"
+      rebuild: ["bash", "pack/scripts/build_installer_tools.sh"]
+      input: ["pack/scripts/build_installer_tools.sh", "pack/scripts/alpine_packages.py", "tools/manifests/alpine-installer-v3.22-x86_64.lock"]
+    out: "INMKE2FS.ELF"
+  installer_e2fsck:
+    file:
+      path: ".artifacts/installer-tools/sbin/e2fsck"
+      rebuild: ["bash", "pack/scripts/build_installer_tools.sh"]
+      input: ["pack/scripts/build_installer_tools.sh", "pack/scripts/alpine_packages.py", "tools/manifests/alpine-installer-v3.22-x86_64.lock"]
+    out: "INE2FSCK.ELF"
+  installer_runner:
+    file: "pack/installer-bootfs/pacha-install-runner"
+    out: "INRUNNER.SH"
+  live_desktop_import:
+    file: "pack/installer-bootfs/pacha-live-import"
+    out: "LIVEIMPORT.SH"
+  live_desktop_launcher:
+    file: "pack/installer-bootfs/pacha-live-desktop"
+    out: "LIVEDESKTOP.SH"
+  live_frame_profile:
+    file:
+      path: ".artifacts/live-desktop-frame-profile/frame-profile.tar.gz"
+      rebuild: ["bash", "pack/scripts/build_live_frame_profile.sh"]
+      input: ["pack/scripts/build_live_frame_profile.sh", "tests/live_desktop_frame_profile.c", "tests/live_clock_rate.c", "tests/live_desktop_frame_profile.h", "tests/live_desktop_frame_trace.c", "tests/live_desktop_frame_trace_unit.c"]
+    out: "FRAMEPRO.TGZ"
+  live_frame_runner:
+    file: "pack/installer-bootfs/pacha-frame-profile"
+    out: "FRAMERUN.SH"
+  live_pointer_profile:
+    file:
+      path: ".artifacts/live-pointer-profile/pointer-profile.elf"
+      rebuild: ["bash", "pack/scripts/build_live_pointer_profile.sh"]
+      input: ["pack/scripts/build_live_pointer_profile.sh", "tests/live_pointer_profile.c"]
+    out: "POINTER.ELF"
+  installer_progress:
+    file:
+      path: ".artifacts/installer-tools/sbin/pacha-install-progress"
+      rebuild: ["bash", "pack/scripts/build_installer_progress.sh"]
+      input: ["pack/scripts/build_installer_progress.sh", "userland/installer/linux_progress.c", "userland/installer/progress_protocol.h"]
+    out: "INPROGRESS.ELF"
+  installerd:
+    role: "service"
+    file:
+      path: ".artifacts/cmake/installerd/installerd.elf"
+      rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/installer", ".artifacts/cmake/installerd", "installerd"]
+      input:
+        - "userland/installer"
+        - "userland/libipc"
+        - "userland/libpacha"
+        - "userland/termd/include"
+        - "userland/kobox2_adapter/block_ipc.h"
+        - "kobox2/protocol"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/syscall"
+        - "musl/pachaos/cli"
+        - "musl/pachaos/include"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include"
+    out: "INSTALLD.ELF"
+  installer_mke2fs_conf:
+    file:
+      path: ".artifacts/installer-tools/etc/mke2fs.conf"
+      rebuild: ["bash", "pack/scripts/build_installer_tools.sh"]
+      input: ["pack/scripts/build_installer_tools.sh", "tools/manifests/alpine-installer-v3.22-x86_64.lock"]
+    out: "INMKE2FS.CONF"
+  installer_mcopy:
+    file: {path: ".artifacts/installer-tools/usr/bin/mtools", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INMCOPY.ELF"
+  installer_mmd:
+    file: {path: ".artifacts/installer-tools/usr/bin/mtools", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INMMD.ELF"
+  installer_mdir:
+    file: {path: ".artifacts/installer-tools/usr/bin/mtools", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INMDIR.ELF"
+  installer_libblkid:
+    file: {path: ".artifacts/installer-tools/usr/lib/libblkid.so.1.1.0", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INLBLKID.SO.1"
+  installer_libeconf:
+    file: {path: ".artifacts/installer-tools/usr/lib/libeconf.so.0.6.2", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INLECONF.SO.0"
+  installer_libcomerr:
+    file: {path: ".artifacts/installer-tools/usr/lib/libcom_err.so.2.1", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INLCOMERR.SO.2"
+  installer_libe2p:
+    file: {path: ".artifacts/installer-tools/usr/lib/libe2p.so.2.3", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INLE2P.SO.2"
+  installer_libext2fs:
+    file: {path: ".artifacts/installer-tools/usr/lib/libext2fs.so.2.4", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INLEXT2FS.SO.2"
+  installer_libuuid:
+    file: {path: ".artifacts/installer-tools/usr/lib/libuuid.so.1.3.0", rebuild: ["bash", "pack/scripts/build_installer_tools.sh"], input: ["tools/manifests/alpine-installer-v3.22-x86_64.lock"]}
+    out: "INLUUID.SO.1"
   live_curl_libcurl:
     file:
       path: ".artifacts/userland-fixtures/curl-root/opt/curl/lib/libcurl.so.4"
@@ -957,37 +1062,58 @@ apps:
     rootfs: ["/lib/libc.so", "/lib/ld-musl-x86_64.so.1"]
   pachaos_musl_libc:
     file:
-      path: ".artifacts/musl-pachaos-runtime/rootfs/lib/libc.so"
+      path: ".artifacts/musl-pachaos-runtime/rootfs/usr/lib/pachaos/libc.so"
       rebuild: ["bash", "musl/pachaos/build/build-runtime.sh"]
       input:
         - "musl/pachaos/build/build-runtime.sh"
+        - "musl/pachaos/build/runtime.mk"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include"
+        - "userland/libipc/include"
         - "musl/pachaos/include"
         - "musl/upstream/arch/pachaos"
         - "musl/upstream/src/thread/pachaos"
         - "musl/upstream/src/setjmp/pachaos"
     out: "PAMUSLLC.SO"
-    rootfs: "/lib/libc.so"
+    rootfs: "/usr/lib/pachaos/libc.so"
   pachaos_musl_ldso:
     file:
-      path: ".artifacts/musl-pachaos-runtime/rootfs/lib/ld-musl-x86_64.so.1"
+      path: ".artifacts/musl-pachaos-runtime/rootfs/usr/lib/pachaos/ld-musl-x86_64.so.1"
       rebuild: ["bash", "musl/pachaos/build/build-runtime.sh"]
       input:
         - "musl/pachaos/build/build-runtime.sh"
+        - "musl/pachaos/build/runtime.mk"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include"
+        - "userland/libipc/include"
         - "musl/pachaos/include"
         - "musl/upstream/arch/pachaos"
         - "musl/upstream/src/thread/pachaos"
         - "musl/upstream/src/setjmp/pachaos"
     out: "PAMUSLLD.SO"
-    rootfs: "/lib/ld-musl-x86_64.so.1"
+    rootfs: "/usr/lib/pachaos/ld-musl-x86_64.so.1"
   linux_lpr_runtime:
     file:
       path: ".artifacts/lpr-linux-x86_64.so"
       rebuild: ["bash", "userland/personality/linux/build-lpr.sh", ".artifacts/lpr-linux-x86_64.so"]
       input:
+        - "kobox2/protocol"
+        - "userland/kobox2_owner/fs_channel.c"
+        - "userland/kobox2_owner/fs_channel.h"
+        - "userland/libipc/include"
+        - "userland/libipc/src/status.c"
         - "kobox2/linux-sandbox/kobox/boot/drm_limits.h"
         - "userland/gpud/include"
-        - "userland/filed/include/filed/flags.h"
+        - "userland/filed/include"
+        - "userland/netd/include"
+        - "userland/termd/include"
+        - "userland/inputd/include"
         - "userland/personality/include"
+        - "userland/personality/src/lpr_manifest.c"
         - "userland/personality/linux/decoder"
         - "userland/personality/linux/runtime"
         - "userland/unixd/include"
@@ -1002,8 +1128,11 @@ apps:
         - "userland/personality/linux/build-lpr.sh"
         - "userland/personality/linux/check-lpr-namespace.sh"
         - "userland/personality/linux/THIRD_PARTY.md"
-        - "userland/personality/linux/runtime/lpr_namespace.map"
         - "pack/scripts/download_zydis.sh"
+        - "userland/installer/disk_port.h"
+        - "userland/installer/block_transport.h"
+        - "userland/installer/block_protocol.h"
+        - "userland/installer/progress_protocol.h"
     out: "LPRLINUX.SO"
     rootfs: "/lib/pacha/lpr-linux-x86_64.so"
   linux_lpr_third_party_license:
@@ -1206,6 +1335,20 @@ apps:
     file: "tests/fixtures/lpr_futex_pingpong_bench.sh"
     out: "LPRFTXBN.SH"
     rootfs: "/cmd/lpr_futex_pingpong_bench.sh"
+  lpr_fs_microbench:
+    file:
+      path: ".artifacts/userland-fixtures/lpr_fs_microbench.static.elf"
+      rebuild: ["bash", "pack/scripts/build_lpr_pthread_smoke.sh", ".artifacts/userland-fixtures/lpr_fs_microbench", "userland/fixtures/src/wsl_musl/lpr_fs_microbench.c"]
+      input:
+        - "pack/scripts/build_lpr_pthread_smoke.sh"
+        - "tools/copy_lpr_linux_musl.sh"
+        - "userland/fixtures/src/wsl_musl/lpr_fs_microbench.c"
+    out: "LPRFSBN.ELF"
+    rootfs: "/cmd/lpr_fs_microbench.elf"
+  lpr_fs_microbench_script:
+    file: "tests/fixtures/lpr_fs_microbench.sh"
+    out: "LPRFSBN.SH"
+    rootfs: "/cmd/lpr_fs_microbench.sh"
   lpr_shared_mapping_smoke:
     file:
       path: ".artifacts/userland-fixtures/lpr_shared_mapping_smoke.static.elf"
@@ -1341,6 +1484,10 @@ apps:
         - "tests/build-native-host-primitives.sh"
         - "tests/native_execution_contract.c"
         - "tests/native_clock_contract.c"
+        - "tests/native_clock_lifecycle.c"
+        - "tests/native_thread_bases_contract.c"
+        - "tests/native_ap_slice_contract.c"
+        - "tests/native_wake_wait_contract.c"
         - "userland/libpacha/include"
         - "userland/libpacha/src/syscall.c"
         - "userland/libipc/include"
@@ -1375,7 +1522,11 @@ apps:
         - "userland/libipc/src"
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include/filed/exec.h"
+        - "userland/filed/include/filed/payload.h"
     out: "GRANTS.ELF"
     rootfs: "/cmd/process_create_grants.elf"
   unix_native_contract:
@@ -1391,7 +1542,11 @@ apps:
         - "userland/libipc/src"
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include/filed/exec.h"
+        - "userland/filed/include/filed/payload.h"
     out: "UNIXNAT.ELF"
     rootfs: "/cmd/unix_native_contract.elf"
   lpr_unixd_pair_probe:
@@ -1576,7 +1731,11 @@ apps:
       input:
         - "musl/pachaos/smoke/libc_vfs_exec.c"
         - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include/filed/exec.h"
+        - "userland/filed/include/filed/payload.h"
         - "musl/upstream/src/dirent/closedir.c"
         - "musl/upstream/src/dirent/opendir.c"
         - "musl/upstream/src/fcntl/open.c"
@@ -1592,7 +1751,11 @@ apps:
       input:
         - "musl/pachaos/smoke/libc_mix_bench.c"
         - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include/filed/exec.h"
+        - "userland/filed/include/filed/payload.h"
         - "musl/upstream/src/dirent/closedir.c"
         - "musl/upstream/src/dirent/opendir.c"
         - "musl/upstream/src/dirent/readdir.c"
@@ -1613,7 +1776,11 @@ apps:
         - "musl/pachaos/smoke/libc_alloc_probe.c"
         - "musl/pachaos/build/build-smokes.sh"
         - "musl/pachaos/cli/pachaos_cli_shim.c"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include/filed/exec.h"
+        - "userland/filed/include/filed/payload.h"
     out: "LIBCALOC.ELF"
     rootfs: "/cmd/libc_alloc_probe.elf"
   lua_runtime:
@@ -1759,7 +1926,15 @@ apps:
         - "userland/libpacha/src"
         - "userland/pachaos_capsule/src"
         - "userland/pachaos_capsule/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "musl/pachaos/include"
+        - "userland/filed/include"
+        - "userland/libipc/include"
     out: "PCAPSULE.ELF"
     rootfs: "/srv/pachaos_capsule.elf"
   unixd:
@@ -1771,14 +1946,18 @@ apps:
         - "userland/unixd/CMakeLists.txt"
         - "userland/unixd/src"
         - "userland/unixd/include"
-        - "userland/filed/include/filed/unix_path.h"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "userland/filed/include"
     out: "UNIXD.ELF"
     rootfs: "/srv/unixd.elf"
   netd:
@@ -1793,12 +1972,14 @@ apps:
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
         - "userland/filed/include"
         - "userland/libfiled_client"
         - "userland/netd/src"
         - "userland/netd/include"
+        - "userland/kobox2_owner"
         - "userland/gpud/launch.c"
         - "userland/gpud/launch_native.c"
         - "userland/gpud/bootstrap.c"
@@ -1808,7 +1989,10 @@ apps:
         - "userland/kobox2_adapter"
         - "kobox2/include"
         - "kobox2/src"
-        - "kobox2/protocol"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "userland/libipc/include"
     out: "NETD.ELF"
     rootfs: "/srv/netd.elf"
   logd:
@@ -1826,8 +2010,12 @@ apps:
         - "userland/libpacha/src"
         - "userland/filed/include"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
     out: "LOGD.ELF"
     rootfs: "/srv/logd.elf"
   termd:
@@ -1848,10 +2036,14 @@ apps:
         - "userland/filed/include"
         - "userland/libfiled_client"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
         - "_kobox/include"
         - "_kobox/src"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
     out: "TERMD.ELF"
     rootfs: "/srv/termd.elf"
   gpud:
@@ -1861,6 +2053,7 @@ apps:
       rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/gpud", ".artifacts/cmake/gpud", "gpud", "gpud_sandbox"]
       input:
         - "userland/gpud"
+        - "userland/kobox2_owner"
         - "userland/kobox2_adapter"
         - "kobox2/include"
         - "kobox2/src"
@@ -1875,7 +2068,11 @@ apps:
         - "userland/filed/include"
         - "userland/libfiled_client"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/syscall"
+        - "musl/pachaos/cli"
+        - "userland/filed/src/exec_payload.c"
     out: "GPUD.ELF"
     rootfs: "/srv/gpud.elf"
   gpud_sandbox:
@@ -2080,6 +2277,98 @@ apps:
       input: *kobox2_usb_hid_inputs
     out: "K2XHCIPCI.KO"
     rootfs: "/srv/kobox2/usb-hid/modules/xhci-pci.ko"
+  kobox2_storage_package:
+    file:
+      path: ".artifacts/kobox2-storage-production/package"
+      rebuild: ["bash", "pack/scripts/build_storage_package.sh"]
+      input:
+        - "pack/scripts/build_storage_package.sh"
+        - "userland/kobox2_adapter"
+        - "userland/kobox2_owner/fs_channel.c"
+        - "userland/kobox2_owner/fs_channel.h"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2STORAGE"
+    bootfs: "/srv/kobox2/storage"
+  kobox2_usb_storage_sandbox:
+    file:
+      path: ".artifacts/kobox2-usb-storage-xhci-production/sandbox.elf"
+      rebuild: ["bash", "pack/scripts/build_block_packages.sh"]
+      input: &kobox2_usb_storage_inputs
+        - "pack/scripts/build_block_packages.sh"
+        - "userland/kobox2_adapter"
+        - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+    out: "K2USBST.ELF"
+  kobox2_usb_storage_core:
+    file:
+      path: ".artifacts/kobox2-usb-storage-xhci-production/core.so"
+      rebuild: ["bash", "pack/scripts/build_block_packages.sh"]
+      input: *kobox2_usb_storage_inputs
+    out: "K2USBST.SO"
+  kobox2_usb_storage_manifest:
+    file:
+      path: ".artifacts/kobox2-usb-storage-xhci-production/manifest.bin"
+      rebuild: ["bash", "pack/scripts/build_block_packages.sh"]
+      input: *kobox2_usb_storage_inputs
+    out: "K2USBST.MF"
+  kobox2_usb_storage_bsg:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/bsg.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STBSG.KO"
+  kobox2_usb_storage_hid:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/hid.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STHID.KO"
+  kobox2_usb_storage_hid_generic:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/hid_generic.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STHGEN.KO"
+  kobox2_usb_storage_evdev:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/evdev.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STEV.KO"
+  kobox2_usb_storage_scsi_common:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/scsi_common.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STSCOM.KO"
+  kobox2_usb_storage_scsi_mod:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/scsi_mod.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STSCSI.KO"
+  kobox2_usb_storage_sd_mod:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/sd_mod.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STSD.KO"
+  kobox2_usb_storage_usb_common:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/usb_common.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STUCOM.KO"
+  kobox2_usb_storage_nls_base:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/nls_base.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STNLS.KO"
+  kobox2_usb_storage_usbcore:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/usbcore.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STUCORE.KO"
+  kobox2_usb_storage_usbhid:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/usbhid.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STUHID.KO"
+  kobox2_usb_storage_xhci_hcd:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/xhci_hcd.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STXHCD.KO"
+  kobox2_usb_storage_xhci_pci:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/xhci_pci.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STXPCI.KO"
+  kobox2_usb_storage_usb_storage:
+    file: {path: ".artifacts/kobox2-usb-storage-xhci-production/modules/usb_storage.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2STUST.KO"
+  kobox2_nvme_sandbox:
+    file: {path: ".artifacts/kobox2-nvme-production/sandbox.elf", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2NVMES.ELF"
+  kobox2_nvme_core:
+    file: {path: ".artifacts/kobox2-nvme-production/core.so", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2NVMEC.SO"
+  kobox2_nvme_manifest:
+    file: {path: ".artifacts/kobox2-nvme-production/manifest.bin", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2NVMEM.MF"
+  kobox2_nvme_core_module:
+    file: {path: ".artifacts/kobox2-nvme-production/modules/nvme_core.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2NVMEC.KO"
+  kobox2_nvme_module:
+    file: {path: ".artifacts/kobox2-nvme-production/modules/nvme.ko", rebuild: ["bash", "pack/scripts/build_block_packages.sh"], input: *kobox2_usb_storage_inputs}
+    out: "K2NVME.KO"
   kobox2_network_sandbox:
     file:
       path: ".artifacts/kobox2-network-production/sandbox.elf"
@@ -2217,6 +2506,7 @@ apps:
       rebuild: ["bash", "pack/scripts/build_cmake_app.sh", "userland/usbd", ".artifacts/cmake/usbd", "usbd"]
       input:
         - "userland/usbd"
+        - "userland/kobox2_owner"
         - "userland/gpud/launch.c"
         - "userland/gpud/launch.h"
         - "userland/gpud/launch_native.c"
@@ -2236,10 +2526,16 @@ apps:
         - "userland/libipc"
         - "userland/libcapsule"
         - "userland/libpacha"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
-        - "kobox2/include"
+        - "musl/pachaos/syscall"
         - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "kobox2/include"
         - "kobox2/src/controller"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "musl/pachaos/include"
+        - "userland/filed/include"
     out: "USBD.ELF"
     rootfs: "/srv/usbd.elf"
   inputd:
@@ -2263,8 +2559,12 @@ apps:
         - "_kobox/include"
         - "_kobox/src"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
     out: "INPUTD.ELF"
     rootfs: "/srv/inputd.elf"
   storage_boot:
@@ -2279,12 +2579,19 @@ apps:
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
         - "userland/storage_boot/src"
         - "userland/storage_boot/include"
         - "userland/storage/include"
-        - "_kobox/include"
-        - "_kobox/src"
+        - "userland/kobox2_owner/bootfs.c"
+        - "userland/kobox2_owner/bootfs.h"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "userland/filed/include"
+        - "userland/libipc/include"
     out: "STRGBOOT.ELF"
     bootfs: "/srv/storage_boot.elf"
     rootfs: "/srv/storage_boot.elf"
@@ -2301,13 +2608,19 @@ apps:
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
         - "userland/seed0boot/src"
         - "userland/netd/include"
         - "userland/termd/include"
         - "userland/pachaos_capsule/include"
         - "userland/storage_boot/include"
         - "userland/inputd/include"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "userland/filed/include"
     out: "SEED0BT.ELF"
   seed0_next:
     role: "service"
@@ -2315,7 +2628,11 @@ apps:
       path: ".artifacts/cmake/seed0_next/seed0_next.elf"
       rebuild: ["bash", "tools/build_seed0_next.sh"]
       input:
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/filed/include/filed/exec.h"
+        - "userland/filed/include/filed/payload.h"
     out: "SEED0NX.ELF"
     rootfs: "/srv/seed0_next.elf"
   seed0root:
@@ -2326,6 +2643,10 @@ apps:
       input:
         - "userland/seed0root/CMakeLists.txt"
         - "userland/seed0root/src"
+        - "userland/libfiled_client/include"
+        - "userland/libfiled_client/src/client.c"
+        - "userland/filed/src/exec_payload.c"
+        - "kobox2/protocol"
         - "userland/unixd/include"
         - "userland/storage/include"
         - "userland/filed/include"
@@ -2337,8 +2658,12 @@ apps:
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
     out: "SEED0RT.ELF"
+    bootfs: "/sbin/seed0root.elf"
     rootfs: "/sbin/seed0root.elf"
   seed0root_boot_profile:
     file:
@@ -2357,8 +2682,13 @@ apps:
         - "userland/filed/CMakeLists.txt"
         - "userland/filed/include"
         - "userland/filed/src"
-        - "userland/koboxd/include"
-        - "userland/koboxd/src"
+        - "userland/kobox2_owner"
+        - "userland/kobox2_adapter"
+        - "userland/gpud"
+        - "kobox2/include"
+        - "kobox2/src/controller"
+        - "kobox2/src/closure.c"
+        - "kobox2/protocol"
         - "userland/storage/include"
         - "userland/libcapsule/include"
         - "userland/libcapsule/src"
@@ -2366,16 +2696,17 @@ apps:
         - "userland/libipc/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
-        - "_kobox/include"
-        - "_kobox/src"
         - "musl/pachaos/include"
-        - "musl/pachaos/build/build-smokes.sh"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
         - "userland/personality/include"
         - "userland/personality/linux/decoder"
         - "pack/scripts/download_zydis.sh"
         - "userland/personality/linux/THIRD_PARTY.md"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
     out: "FILED.ELF"
+    bootfs: "/sbin/filed.elf"
     rootfs: "/sbin/filed.elf"
   lpr_supervisor:
     role: "service"
@@ -2390,14 +2721,18 @@ apps:
         - "userland/unixd/include"
         - "userland/unixd/src/client.c"
         - "userland/unixd/src/client_wire.c"
-        - "musl/pachaos/build/build-app-dynamic.sh"
-        - "musl/pachaos/build/build-runtime.sh"
         - "userland/libipc/include"
         - "userland/libipc/src"
         - "userland/libpacha/include"
         - "userland/libpacha/src"
         - "musl/pachaos/include"
-        - "musl/upstream/arch/pachaos/syscall_arch.h"
+        - "musl/pachaos/syscall"
+        - "kobox2/protocol"
+        - "userland/filed/src/exec_payload.c"
+        - "userland/cmake"
+        - "musl/pachaos/build"
+        - "musl/pachaos/cli"
+        - "userland/filed/include"
     out: "LPRSUP.ELF"
     rootfs: "/sbin/lpr_supervisor.elf"
   net_bench:
@@ -2455,6 +2790,9 @@ apps:
   live_boot_profile:
     file: "pack/live-bootfs/profile"
     out: "BOOT-PROFILE"
+  installer_mode_marker:
+    file: "pack/installer-bootfs/marker"
+    out: "INSTALLER-MODE"
   amdgpu_probe_policy:
     file:
       path: ".artifacts/kobox2-amdgpu-package/owner-policy.conf"
@@ -2463,17 +2801,31 @@ apps:
         - "pack/live-amdgpu-probe.conf"
         - "pack/scripts/build_amdgpu_package.sh"
         - "pack/scripts/build_amdgpu_firmware_bundle.py"
-        - "kobox2/linux-sandbox/kobox/manifest/profiles/amdgpu-firmware.sha256"
         - "userland/kobox2_adapter"
         - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+        - "userland/gpud/gpu_sessions.c"
+        - "userland/gpud/gpu_sessions.h"
+        - "userland/gpud/gpu_channel.c"
+        - "userland/gpud/gpu_channel.h"
+        - "userland/gpud/gpu_limits.h"
+        - "userland/gpud/gpu_rpc.h"
+        - "userland/gpud/include"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "userland/libpacha/src/log.c"
+        - "userland/libipc/include"
     out: "GPU-PROBE.CONF"
   amdgpu_mesa_runtime:
     file:
       path: ".artifacts/kobox2-amdgpu-mesa-runtime.tar.gz"
-      rebuild: ["python3", "pack/scripts/build_amdgpu_mesa_package.py", "--archive-output", ".artifacts/kobox2-amdgpu-mesa-runtime.tar.gz"]
+      rebuild: ["bash", "pack/scripts/build_amdgpu_mesa_bundle.sh"]
       input:
+        - "pack/scripts/build_amdgpu_mesa_bundle.sh"
+        - "pack/scripts/build_amdgpu_mesa_gears.sh"
         - "pack/scripts/build_amdgpu_mesa_package.py"
         - "pack/live-bootfs.yaml"
+        - "tests/amdgpu_mesa_gears.c"
     out: "AMDMESA.TGZ"
   amdgpu_driver_archive:
     file:
@@ -2485,6 +2837,18 @@ apps:
         - "pack/live-amdgpu-probe.conf"
         - "userland/kobox2_adapter"
         - "kobox2/linux-sandbox/kobox"
+        - "kobox2/protocol"
+        - "userland/gpud/gpu_sessions.c"
+        - "userland/gpud/gpu_sessions.h"
+        - "userland/gpud/gpu_channel.c"
+        - "userland/gpud/gpu_channel.h"
+        - "userland/gpud/gpu_limits.h"
+        - "userland/gpud/gpu_rpc.h"
+        - "userland/gpud/include"
+        - "userland/libpacha/include"
+        - "userland/libpacha/src/syscall.c"
+        - "userland/libpacha/src/log.c"
+        - "userland/libipc/include"
     out: "AMDGPUPKG.TGZ"
   amdgpu_driver_archive_digest:
     file:

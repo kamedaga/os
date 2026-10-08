@@ -11,6 +11,9 @@ struct ph_usb_input_service {
     uint64_t generation;
     uint64_t operation;
     uint64_t correlation;
+    int event_fd;
+    struct kobox_linux_input_notify notify;
+    int (*bind_notify)(void *, const struct kobox_linux_input_notify *);
     int (*read)(void *, struct kobox_linux_input_record *, size_t,
         size_t *, uint64_t *);
     int (*snapshot)(void *, struct kobox_linux_input_device_info *, size_t,

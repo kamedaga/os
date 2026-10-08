@@ -21,6 +21,19 @@ case "${1:-}" in
     out="$repo_root/.artifacts/tests/kobox2-pacha-chapter2-core"
     extra_flags+=(-DPH_CHAPTER2_CORE=1)
     ;;
+  --exception)
+    [[ $# == 1 ]] || exit 2
+    out="$repo_root/.artifacts/tests/kobox2-pacha-exception"
+    extra_flags+=(-DPH_FOCUSED_GATE=1 -DPH_EXCEPTION_GATE=1)
+    ;;
+  --nvme)
+    [[ $# == 1 && -n "${KOBOX_PACHA_MANIFEST:-}" ]] || exit 2
+    out="$repo_root/.artifacts/tests/kobox2-pacha-nvme"
+    extra_flags+=(-DPH_FOCUSED_GATE=1 -DPH_DEVICE_GATE=1)
+    extra_flags+=(-I "$repo_root/kobox2/protocol/include")
+    extra_sources+=("$repo_root/tests/kobox2_nvme_device_gate.c" "$adapter/device.c"
+      "$adapter/device_pci.c" "$adapter/device_dma.c" "$adapter/device_irq.c" "$adapter/device_irq_queue.c")
+    ;;
   --device)
     [[ $# == 1 && -n "${KOBOX_PACHA_MANIFEST:-}" ]] || exit 2
     out="$repo_root/.artifacts/tests/kobox2-pacha-device"
@@ -94,6 +107,7 @@ core="${KOBOX_PACHA_CORE:-$repo_root/.artifacts/kobox2-separated-gate-runtime/li
 if [[ -n "${KOBOX_PACHA_MANIFEST:-}" ]]; then
   out+="-diagnostic"
 fi
+out="${KOBOX_PACHA_OUTPUT:-$out}"
 mkdir -p "$out"
 if [[ "${1:-}" == --gem* ]]; then
   python3 "$repo_root/tests/check-kobox2-pacha-modules.py" \
@@ -112,6 +126,7 @@ python3 "$sandbox/boot/inspect_core.py" --core "$core" \
 adapter_sources=(
   "$adapter/runtime.c"
   "$adapter/native.c"
+  "$adapter/fiber.S"
   "$adapter/machine.c"
   "$adapter/image.c"
   "$adapter/exception.c"

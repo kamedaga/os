@@ -22,9 +22,35 @@ x.XGetPixel.argtypes = [c.c_void_p, c.c_int, c.c_int]
 x.XGetPixel.restype = c.c_ulong
 x.XDestroyImage.argtypes = [c.c_void_p]
 x.XFree.argtypes = [c.c_void_p]
+x.XInternAtom.argtypes = [display_t, c.c_char_p, c.c_int]
+x.XInternAtom.restype = c.c_ulong
+x.XGetWindowProperty.argtypes = [display_t, window_t, c.c_ulong,
+    c.c_long, c.c_long, c.c_int, c.c_ulong, c.POINTER(c.c_ulong),
+    c.POINTER(c.c_int), c.POINTER(c.c_ulong), c.POINTER(c.c_ulong),
+    c.POINTER(c.POINTER(c.c_ubyte))]
 d = x.XOpenDisplay(None)
 assert d
 root = x.XDefaultRootWindow(d)
+requested_pid = int(os.environ['CAPTURE_QEMU_PID']) if os.environ.get('CAPTURE_QEMU_PID') else None
+
+def matches_pid(candidate):
+    if requested_pid is None:
+        return True
+    atom = x.XInternAtom(d, b'_NET_WM_PID', 1)
+    if not atom:
+        return False
+    actual, count, remaining = c.c_ulong(), c.c_ulong(), c.c_ulong()
+    format = c.c_int()
+    value = c.POINTER(c.c_ubyte)()
+    status = x.XGetWindowProperty(d, candidate, atom, 0, 1, 0, 6,
+        c.byref(actual), c.byref(format), c.byref(count), c.byref(remaining), c.byref(value))
+    try:
+        return (status == 0 and actual.value == 6 and format.value == 32 and
+                count.value == 1 and bool(value) and
+                c.cast(value, c.POINTER(c.c_ulong))[0] == requested_pid)
+    finally:
+        if value:
+            x.XFree(value)
 start = time.monotonic()
 window = None
 while time.monotonic() - start < 90:
@@ -35,7 +61,7 @@ while time.monotonic() - start < 90:
         current = pending.pop()
         name = c.c_char_p()
         if x.XFetchName(d, current, c.byref(name)) and name.value:
-            if b'QEMU' in name.value:
+            if b'QEMU' in name.value and matches_pid(current):
                 window = current
             x.XFree(name)
         x.XQueryTree(d, current, c.byref(r), c.byref(parent), c.byref(children), c.byref(n))

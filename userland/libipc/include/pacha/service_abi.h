@@ -4,9 +4,8 @@
 #include <stdint.h>
 
 enum {
-    PACHA_SERVICE_ABI_VERSION = 2u,
-    PACHA_SERVICE_REQUEST_MAGIC = 0x3251455256434150ull,
-    PACHA_SERVICE_REPLY_MAGIC = 0x3259505256434150ull,
+    PACHA_SERVICE_REQUEST_MAGIC = 0x0051455256434150ull,
+    PACHA_SERVICE_REPLY_MAGIC = 0x0059505256434150ull,
 
     PACHA_SERVICE_HEADER_BYTES = 64u,
     PACHA_SERVICE_PAGE_BYTES = 8192u,
@@ -38,7 +37,8 @@ enum {
 
 typedef struct pacha_service_envelope {
     uint64_t magic;
-    uint32_t abi_version;
+    /* The receiver must bound the actual envelope before reading its payload. */
+    uint32_t header_size;
     uint32_t service_id;
     uint32_t op;
     uint32_t flags;
@@ -71,7 +71,7 @@ static inline int pacha_service_request_is_valid(
 {
     return header != NULL &&
         header->magic == PACHA_SERVICE_REQUEST_MAGIC &&
-        header->abi_version == PACHA_SERVICE_ABI_VERSION &&
+        header->header_size == sizeof(*header) &&
         header->service_id == service_id &&
         header->payload_size <= PACHA_SERVICE_PAGE_BYTES - PACHA_SERVICE_HEADER_BYTES;
 }
@@ -88,7 +88,7 @@ static inline void pacha_service_reply_init(
         return;
     }
     header->magic = PACHA_SERVICE_REPLY_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = request != NULL ? request->service_id : 0;
     header->op = request != NULL ? request->op : 0;
     header->flags = request != NULL ? request->flags : 0;

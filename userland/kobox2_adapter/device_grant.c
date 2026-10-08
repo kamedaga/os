@@ -36,18 +36,24 @@ static int select_handle(const kb2_resource_grant_t *grant,
         if (slot.slot_id != authority->slot_id) continue;
         if (slot.resource_type != KB2_CLOSURE_RESOURCE_DEVICE ||
             memcmp(slot.interface_schema_digest, schema, sizeof(schema)) ||
-            slot.state != KB2_RESOURCE_GRANT_SLOT_PRESENT || slot.object_count != 1) return -EACCES;
-        kb2_resource_grant_object_t object;
-        if (kb2_resource_grant_object(grant, slot.object_start, &object) != KB2_PROTOCOL_OK) return -EINVAL;
-        if (object.object_id != authority->object_id || object.slot_id != authority->slot_id ||
-            object.granted_rights != KB2_PCI_FUNCTION_REQUIRED_RIGHTS || object.handle_count != 1) return -EACCES;
-        kb2_resource_grant_handle_binding_t binding;
-        if (kb2_resource_grant_handle_binding(grant, object.handle_start, &binding) != KB2_PROTOCOL_OK)
-            return -EINVAL;
-        if (binding.object_id != authority->object_id || binding.role != KB2_PCI_FUNCTION_NATIVE_HANDLE_ROLE_DEVICE)
-            return -EACCES;
-        *index = binding.transfer_handle_index;
-        return 0;
+            slot.state != KB2_RESOURCE_GRANT_SLOT_PRESENT) return -EACCES;
+        for (size_t j = 0; j < slot.object_count; ++j) {
+            kb2_resource_grant_object_t object;
+            if (kb2_resource_grant_object(grant, slot.object_start + j, &object) != KB2_PROTOCOL_OK)
+                return -EINVAL;
+            if (object.object_id != authority->object_id) continue;
+            if (object.slot_id != authority->slot_id ||
+                object.granted_rights != KB2_PCI_FUNCTION_REQUIRED_RIGHTS || object.handle_count != 1)
+                return -EACCES;
+            kb2_resource_grant_handle_binding_t binding;
+            if (kb2_resource_grant_handle_binding(grant, object.handle_start, &binding) != KB2_PROTOCOL_OK)
+                return -EINVAL;
+            if (binding.object_id != authority->object_id ||
+                binding.role != KB2_PCI_FUNCTION_NATIVE_HANDLE_ROLE_DEVICE) return -EACCES;
+            *index = binding.transfer_handle_index;
+            return 0;
+        }
+        return -EACCES;
     }
     return -ENOENT;
 }

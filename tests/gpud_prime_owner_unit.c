@@ -57,9 +57,12 @@ int gpud_gpu_rpc_call(struct gpud_gpu_rpc *r, unsigned int q,
     const unsigned char *b, size_t n, unsigned char *o, size_t cap, size_t *s)
 { (void)r;(void)q;(void)b;(void)n;(void)o;(void)cap;(void)s; assert(0); return -EIO; }
 
-int main(void)
+static void owner_lifetime(unsigned int profile)
 {
     static struct gpud_drm_service service;
+    memset(&service, 0, sizeof(service));
+    revoked = released = closed = fail_pair = hungup = 0;
+    service.profile_kind = profile;
     service.files.generation = 1;
     struct gpud_drm_reply_transfer transfer = {.owner_fd = -1, .client_fd = -1};
     uint64_t result = 0;
@@ -101,5 +104,11 @@ int main(void)
     assert(adopt_prime(&service, 203, &transfer, &result) == -EMFILE);
     assert(!find_prime(&service, 203) && released == 195);
     free(service.pollfds);
-    puts("PRIME owner death, surviving leases, 192 reuses and reply rollback: PASS");
+}
+
+int main(void)
+{
+    owner_lifetime(KB2_GPU_PROFILE_VIRGL);
+    owner_lifetime(KB2_GPU_PROFILE_AMDGPU);
+    puts("PRIME VIRGL/AMDGPU owner death, surviving leases, 192 reuses and reply rollback: PASS");
 }

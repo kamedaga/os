@@ -569,7 +569,7 @@ fn exportDeviceMemoryVmo(h: anytype, state: *kernel.KernelState, proc: kernel.Pr
         .device = device,
         .bar_index = @intCast(bar_index),
         .cache = if (wc) .wc else .uc,
-    }, first, bar_bytes, dma_resolved_paddrs[0..count]) catch |err| return statusFromKernelError(err);
+    }, first, bar_bytes, dma_resolved_paddrs[0..count], h.free_list) catch |err| return statusFromKernelError(err);
     var owned = true;
     defer if (owned) state.releaseNativeVmo(ref);
     const range = state.deviceMemoryPhysicalBounds(ref) orelse return sc.syscall_err_invalid;

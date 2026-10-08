@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "drm_reply.h"
+#include <gpud/drm_kms_query.h>
 
 #include <kobox2/amdgpu_info_shape.h>
 
@@ -32,6 +33,64 @@ int gpud_drm_status_errno(uint32_t status) {
     case KB2_GPU_STATUS_CANCELED: return -ECANCELED;
     case KB2_GPU_STATUS_SESSION_LOST:
     case KB2_GPU_STATUS_DEVICE_LOST: return -EIO;
+    default: return -EPROTO;
+    }
+}
+
+static int mode_query_aux_reply(gpud_drm_ioctl_request_t *request,
+    const struct gpud_drm_translation *expected,
+    const kb2_gpu_inline_completion_t *completion)
+{
+    if (request->aux_size != expected->region.length || completion->length < 8 ||
+        read_u64(completion->data) != 1) return -EPROTO;
+    const unsigned char *data = completion->data;
+    switch (request->request) {
+    case GPUD_DRM_IOCTL_MODE_GETRESOURCES: {
+        if (completion->record_schema_id != KB2_GPU_DRM_MODE_RECORD_RESOURCES_RESULT ||
+            completion->length != KB2_GPU_DRM_MODE_RECORD_RESOURCES_RESULT_SIZE)
+            return -EPROTO;
+        gpud_drm_mode_card_res_t value;
+        memcpy(&value, request->data, sizeof(value));
+        memcpy(&value.count_fbs, data + 8, 32);
+        memcpy(request->data, &value, sizeof(value));
+        return 0;
+    }
+    case GPUD_DRM_IOCTL_MODE_GETPLANERESOURCES:
+    case GPUD_DRM_IOCTL_MODE_OBJ_GETPROPERTIES: {
+        if (completion->record_schema_id != KB2_GPU_DRM_MODE_RECORD_TOPOLOGY_COUNT_RESULT ||
+            completion->length != KB2_GPU_DRM_MODE_RECORD_TOPOLOGY_COUNT_RESULT_SIZE)
+            return -EPROTO;
+        const uint32_t required = read_u32(data + 12);
+        const uint32_t capacity = expected->output_capacity[0];
+        if (read_u32(data + 8) != (required < capacity ? required : capacity))
+            return -EPROTO;
+        const size_t count_offset = request->request == GPUD_DRM_IOCTL_MODE_GETPLANERESOURCES ?
+            offsetof(gpud_drm_mode_get_plane_res_t, count_planes) :
+            offsetof(gpud_drm_mode_obj_get_properties_t, count_props);
+        memcpy(request->data + count_offset, data + 12, 4);
+        return 0;
+    }
+    case GPUD_DRM_IOCTL_MODE_GETPLANE: {
+        if (completion->record_schema_id != KB2_GPU_DRM_MODE_RECORD_PLANE_RESULT ||
+            completion->length != KB2_GPU_DRM_MODE_RECORD_PLANE_RESULT_SIZE ||
+            read_u32(data + 8) != read_u32(request->data) || read_u32(data + 32))
+            return -EPROTO;
+        memcpy(request->data + 4, data + 12, 20);
+        return 0;
+    }
+    case GPUD_DRM_IOCTL_MODE_GETPROPERTY: {
+        if (completion->record_schema_id != KB2_GPU_DRM_MODE_RECORD_PROPERTY_RESULT ||
+            completion->length != KB2_GPU_DRM_MODE_RECORD_PROPERTY_RESULT_SIZE ||
+            read_u32(data + 20)) return -EPROTO;
+        gpud_drm_mode_get_property_t value;
+        memcpy(&value, request->data, sizeof(value));
+        value.flags = read_u32(data + 8);
+        value.count_values = read_u32(data + 12);
+        value.count_enum_blobs = read_u32(data + 16);
+        memcpy(value.name, data + 24, sizeof(value.name));
+        memcpy(request->data, &value, sizeof(value));
+        return 0;
+    }
     default: return -EPROTO;
     }
 }
@@ -115,6 +174,15 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
     }
     if (kb2_gpu_inline_completion_decode(reply + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
         envelope.payload_length, binding.session_id, &completion)) return -EPROTO;
+    /* Linux's DIRTYFB reports ENOSYS when a framebuffer has no dirty hook.
+     * The protocol's UNSUPPORTED class intentionally groups ENOSYS/ENOTTY/
+     * EOPNOTSUPP. Restore this operation's UAPI meaning here: Xorg disables
+     * unnecessary dirty tracking on ENOSYS, but retries EOPNOTSUPP on every
+     * damaged frame. Other operations retain their own unsupported mapping. */
+    if (completion.status == KB2_GPU_STATUS_UNSUPPORTED &&
+        expected.command_set_id == KB2_GPU_DRM_MODE_SET_ID &&
+        expected.command_id == KB2_GPU_DRM_MODE_COMMAND_DIRTY_FB)
+        return -ENOSYS;
     int result = gpud_drm_status_errno(completion.status);
     if (result) return result;
     if (expected.command_set_id == KB2_GPU_DRM_CORE_SET_ID) switch (expected.command_id) {
@@ -145,6 +213,17 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
         memcpy(request->data, &version, sizeof(version));
         return 0;
     }
+    case KB2_GPU_DRM_CORE_COMMAND_GET_CLIENT:
+        if (completion.record_schema_id != KB2_GPU_DRM_CORE_RECORD_CLIENT_RESULT ||
+            completion.length != KB2_GPU_DRM_CORE_RECORD_CLIENT_RESULT_SIZE ||
+            read_u32(completion.data + KB2_GPU_DRM_CORE_RECORD_CLIENT_RESULT_RESERVED_OFFSET) ||
+            read_u32(completion.data + KB2_GPU_DRM_CORE_RECORD_CLIENT_RESULT_AUTHENTICATED_OFFSET) > 1)
+            return -EPROTO;
+        memcpy(request->data + 4,
+            completion.data + KB2_GPU_DRM_CORE_RECORD_CLIENT_RESULT_AUTHENTICATED_OFFSET, 4);
+        memcpy(request->data + 8,
+            completion.data + KB2_GPU_DRM_CORE_RECORD_CLIENT_RESULT_PROCESS_ID_OFFSET, 32);
+        return 0;
     case KB2_GPU_DRM_CORE_COMMAND_GET_CAP:
         if (completion.record_schema_id != KB2_GPU_DRM_CORE_RECORD_SCALAR_U64 ||
             completion.length != KB2_GPU_DRM_CORE_RECORD_SCALAR_U64_SIZE) return -EPROTO;
@@ -175,6 +254,10 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
         return -EOPNOTSUPP;
     }
     if (expected.command_set_id == KB2_GPU_DRM_MODE_SET_ID) {
+        struct gpud_kms_query_shape query_shape;
+        if (gpud_kms_query_shape(request->request, &query_shape) &&
+            request->data_size == query_shape.scalar_size)
+            return mode_query_aux_reply(request, &expected, &completion);
         switch (expected.command_id) {
         case KB2_GPU_DRM_MODE_COMMAND_GET_MAGIC:
             if (completion.record_schema_id != KB2_GPU_DRM_MODE_RECORD_MAGIC ||
@@ -183,15 +266,89 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
             memcpy(request->data, completion.data, sizeof(uint32_t));
             return 0;
 
+        case KB2_GPU_DRM_MODE_COMMAND_WAIT_VBLANK: {
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_MODE_RECORD_WAIT_VBLANK_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_MODE_RECORD_WAIT_VBLANK_RESULT_SIZE)
+                return -EPROTO;
+            const uint64_t timestamp = read_u64(completion.data + 8);
+            if (timestamp / UINT64_C(1000000000) > INT64_MAX)
+                return -EPROTO;
+            memcpy(request->data, completion.data, 8);
+            const int64_t seconds = (int64_t)(timestamp / UINT64_C(1000000000));
+            const int64_t microseconds =
+                (int64_t)((timestamp % UINT64_C(1000000000)) / 1000);
+            memcpy(request->data + 8, &seconds, sizeof(seconds));
+            memcpy(request->data + 16, &microseconds, sizeof(microseconds));
+            return 0;
+        }
+        case KB2_GPU_DRM_MODE_COMMAND_CRTC_GET_SEQUENCE:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_MODE_RECORD_CRTC_SEQUENCE_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_MODE_RECORD_CRTC_SEQUENCE_RESULT_SIZE ||
+                read_u32(completion.data) > 1 ||
+                read_u32(completion.data + 4) ||
+                read_u64(completion.data + 16) > INT64_MAX)
+                return -EPROTO;
+            memcpy(request->data + 4, completion.data, 4);
+            memcpy(request->data + 8, completion.data + 8, 16);
+            return 0;
+        case KB2_GPU_DRM_MODE_COMMAND_CRTC_QUEUE_SEQUENCE:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_MODE_RECORD_SEQUENCE_RESULT ||
+                completion.length !=
+                    KB2_GPU_DRM_MODE_RECORD_SEQUENCE_RESULT_SIZE)
+                return -EPROTO;
+            memcpy(request->data + 8, completion.data, 8);
+            return 0;
+        case KB2_GPU_DRM_MODE_COMMAND_GET_FB:
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_MODE_RECORD_FB_LEGACY ||
+                completion.length != KB2_GPU_DRM_MODE_RECORD_FB_LEGACY_SIZE ||
+                read_u64(completion.data) != 1 ||
+                read_u32(completion.data + 8) != read_u32(request->data) ||
+                read_u32(completion.data + 36))
+                return -EPROTO;
+            memcpy(request->data, completion.data + 8,
+                sizeof(gpud_drm_mode_fb_cmd_t));
+            return 0;
+        case KB2_GPU_DRM_MODE_COMMAND_GET_FB2:
+            if (completion.record_schema_id != KB2_GPU_DRM_MODE_RECORD_FB2 ||
+                completion.length != KB2_GPU_DRM_MODE_RECORD_FB2_SIZE ||
+                read_u64(completion.data) != 1 ||
+                read_u32(completion.data + 8) != read_u32(request->data))
+                return -EPROTO;
+            memcpy(request->data, completion.data + 8, 20);
+            memcpy(request->data + 20, completion.data + 28, 48);
+            memset(request->data + 68, 0, 4);
+            memcpy(request->data + 72, completion.data + 76, 32);
+            return 0;
+        case KB2_GPU_DRM_MODE_COMMAND_GET_GAMMA: {
+            const uint32_t count = read_u32(request->data + 4);
+            return completion.record_schema_id ==
+                    KB2_GPU_DRM_MODE_RECORD_COUNT_RESULT &&
+                completion.length == KB2_GPU_DRM_MODE_RECORD_COUNT_RESULT_SIZE &&
+                read_u32(completion.data) == count &&
+                read_u32(completion.data + 4) == count &&
+                request->aux_size == (uint64_t)count * 6 ? 0 : -EPROTO;
+        }
+
         case KB2_GPU_DRM_MODE_COMMAND_AUTH_MAGIC:
         case KB2_GPU_DRM_MODE_COMMAND_SET_MASTER:
         case KB2_GPU_DRM_MODE_COMMAND_DROP_MASTER:
         case KB2_GPU_DRM_MODE_COMMAND_SET_CRTC:
+        case KB2_GPU_DRM_MODE_COMMAND_SET_PLANE:
+        case KB2_GPU_DRM_MODE_COMMAND_SET_GAMMA:
         case KB2_GPU_DRM_MODE_COMMAND_CURSOR:
         case KB2_GPU_DRM_MODE_COMMAND_CURSOR2:
         case KB2_GPU_DRM_MODE_COMMAND_PAGE_FLIP:
         case KB2_GPU_DRM_MODE_COMMAND_DIRTY_FB:
         case KB2_GPU_DRM_MODE_COMMAND_REMOVE_FB:
+        case KB2_GPU_DRM_MODE_COMMAND_DESTROY_DUMB:
+        case KB2_GPU_DRM_MODE_COMMAND_SET_PROPERTY:
+        case KB2_GPU_DRM_MODE_COMMAND_DESTROY_PROPERTY_BLOB:
             return completion.length || completion.record_schema_id ?
                 -EPROTO : 0;
         case KB2_GPU_DRM_MODE_COMMAND_CREATE_DUMB:
@@ -225,10 +382,12 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
             memcpy(&wire, request->data, sizeof(wire));
             uint32_t *arrays[4] = {wire.fbs, wire.crtcs,
                 wire.connectors, wire.encoders};
-            for (size_t i = 0; i < 4; ++i)
-                if (expected.output_capacity[i])
+            for (size_t i = 0; i < 4; ++i) {
+                const uint32_t count = read_u32(completion.data + 8 + i * 4);
+                if (count && count <= expected.output_capacity[i])
                     memcpy(arrays[i], output + expected.output_offset[i],
-                        expected.output_capacity[i] * sizeof(uint32_t));
+                        count * sizeof(uint32_t));
+            }
             wire.value.count_fbs = read_u32(completion.data + 8);
             wire.value.count_crtcs = read_u32(completion.data + 12);
             wire.value.count_connectors = read_u32(completion.data + 16);
@@ -242,7 +401,9 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
         }
         case KB2_GPU_DRM_MODE_COMMAND_GET_CONNECTOR: {
             gpud_drm_kms_connector_wire_t wire;
-            memcpy(&wire, request->data, sizeof(wire));
+            const int large = request->data_size == sizeof(wire.value);
+            memset(&wire, 0, sizeof(wire));
+            memcpy(&wire, request->data, request->data_size);
             if (completion.record_schema_id !=
                     KB2_GPU_DRM_MODE_RECORD_CONNECTOR_RESULT ||
                 completion.length !=
@@ -251,13 +412,19 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
                 read_u32(completion.data + 4) ||
                 read_u32(completion.data + 12) != wire.value.connector_id ||
                 read_u32(completion.data + 52) ||
-                (!output && expected.region.length) ||
-                output_size < expected.region.length)
+                (large ? request->aux_size != expected.region.length :
+                    ((!output && expected.region.length) ||
+                     output_size < expected.region.length)))
                 return -EPROTO;
-            if (expected.output_capacity[0])
+            const uint32_t mode_count = read_u32(completion.data + 40);
+            const uint32_t prop_count = read_u32(completion.data + 44);
+            const uint32_t encoder_count = read_u32(completion.data + 48);
+            if (!large && mode_count <= expected.output_capacity[0] &&
+                expected.output_capacity[0])
                 memcpy(wire.modes, output + expected.output_offset[0],
-                    expected.output_capacity[0] * sizeof(wire.modes[0]));
-            for (size_t i = 0; i < expected.output_capacity[1]; ++i) {
+                    mode_count * sizeof(wire.modes[0]));
+            for (size_t i = 0; !large && prop_count <= expected.output_capacity[1] &&
+                i < prop_count; ++i) {
                 const unsigned char *property = output +
                     expected.output_offset[1] +
                     i * KB2_GPU_DRM_MODE_RECORD_PROPERTY_VALUE_SIZE;
@@ -266,9 +433,10 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
                 wire.props[i] = read_u32(property);
                 wire.prop_values[i] = read_u64(property + 8);
             }
-            if (expected.output_capacity[2])
+            if (!large && encoder_count <= expected.output_capacity[2] &&
+                expected.output_capacity[2])
                 memcpy(wire.encoders, output + expected.output_offset[2],
-                    expected.output_capacity[2] * sizeof(wire.encoders[0]));
+                    encoder_count * sizeof(wire.encoders[0]));
             wire.value.encoder_id = read_u32(completion.data + 8);
             wire.value.connector_type = read_u32(completion.data + 16);
             wire.value.connector_type_id = read_u32(completion.data + 20);
@@ -276,11 +444,12 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
             wire.value.mm_width = read_u32(completion.data + 28);
             wire.value.mm_height = read_u32(completion.data + 32);
             wire.value.subpixel = read_u32(completion.data + 36);
-            wire.value.count_modes = read_u32(completion.data + 40);
-            wire.value.count_props = read_u32(completion.data + 44);
-            wire.value.count_encoders = read_u32(completion.data + 48);
+            wire.value.count_modes = mode_count;
+            wire.value.count_props = prop_count;
+            wire.value.count_encoders = encoder_count;
             wire.value.pad = 0;
-            memcpy(request->data, &wire, sizeof(wire));
+            memcpy(request->data, &wire,
+                large ? sizeof(wire.value) : sizeof(wire));
             return 0;
         }
         case KB2_GPU_DRM_MODE_COMMAND_GET_ENCODER: {
@@ -324,6 +493,7 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
         }
         case KB2_GPU_DRM_MODE_COMMAND_ADD_FB:
         case KB2_GPU_DRM_MODE_COMMAND_ADD_FB2:
+        case KB2_GPU_DRM_MODE_COMMAND_CREATE_PROPERTY_BLOB:
             if (completion.record_schema_id !=
                     KB2_GPU_DRM_MODE_RECORD_OBJECT_ID_RESULT ||
                 completion.length !=
@@ -332,8 +502,107 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
                 !read_u32(completion.data + 8) ||
                 read_u32(completion.data + 12))
                 return -EPROTO;
-            memcpy(request->data, completion.data + 8, sizeof(uint32_t));
+            if (expected.command_id ==
+                    KB2_GPU_DRM_MODE_COMMAND_CREATE_PROPERTY_BLOB)
+                memcpy(request->data +
+                    offsetof(gpud_drm_mode_create_blob_wire_t, blob_id),
+                    completion.data + 8, sizeof(uint32_t));
+            else
+                memcpy(request->data, completion.data + 8, sizeof(uint32_t));
             return 0;
+        case KB2_GPU_DRM_MODE_COMMAND_GET_PLANE_RESOURCES: {
+            gpud_drm_kms_plane_res_wire_t wire;
+            if (completion.record_schema_id !=
+                    KB2_GPU_DRM_MODE_RECORD_TOPOLOGY_COUNT_RESULT ||
+                completion.length != KB2_GPU_DRM_MODE_RECORD_TOPOLOGY_COUNT_RESULT_SIZE ||
+                read_u64(completion.data) != 1 ||
+                (!output && expected.region.length) ||
+                output_size < expected.region.length) return -EPROTO;
+            memcpy(&wire, request->data, sizeof(wire));
+            uint32_t count = read_u32(completion.data + 8);
+            uint32_t required = read_u32(completion.data + 12);
+            if (count != (required < expected.output_capacity[0] ?
+                required : expected.output_capacity[0])) return -EPROTO;
+            if (count) memcpy(wire.planes, output, count * sizeof(uint32_t));
+            wire.value.count_planes = required;
+            memcpy(request->data, &wire, sizeof(wire));
+            return 0;
+        }
+        case KB2_GPU_DRM_MODE_COMMAND_GET_PLANE: {
+            gpud_drm_kms_plane_wire_t wire;
+            if (completion.record_schema_id != KB2_GPU_DRM_MODE_RECORD_PLANE_RESULT ||
+                completion.length != KB2_GPU_DRM_MODE_RECORD_PLANE_RESULT_SIZE ||
+                read_u64(completion.data) != 1 ||
+                (!output && expected.region.length) ||
+                output_size < expected.region.length) return -EPROTO;
+            memcpy(&wire, request->data, sizeof(wire));
+            if (read_u32(completion.data + 8) != wire.value.plane_id ||
+                read_u32(completion.data + 32)) return -EPROTO;
+            uint32_t required = read_u32(completion.data + 28);
+            uint32_t count = required <= expected.output_capacity[0] ? required : 0;
+            if (count) memcpy(wire.formats, output, count * sizeof(uint32_t));
+            wire.value.crtc_id = read_u32(completion.data + 12);
+            wire.value.fb_id = read_u32(completion.data + 16);
+            wire.value.possible_crtcs = read_u32(completion.data + 20);
+            wire.value.gamma_size = read_u32(completion.data + 24);
+            wire.value.count_format_types = required;
+            memcpy(request->data, &wire, sizeof(wire));
+            return 0;
+        }
+        case KB2_GPU_DRM_MODE_COMMAND_GET_PROPERTY: {
+            gpud_drm_kms_property_wire_t wire;
+            if (completion.record_schema_id != KB2_GPU_DRM_MODE_RECORD_PROPERTY_RESULT ||
+                completion.length != KB2_GPU_DRM_MODE_RECORD_PROPERTY_RESULT_SIZE ||
+                read_u64(completion.data) != 1 || read_u32(completion.data + 20) ||
+                (!output && expected.region.length) ||
+                output_size < expected.region.length) return -EPROTO;
+            memcpy(&wire, request->data, sizeof(wire));
+            uint32_t values = read_u32(completion.data + 12);
+            uint32_t enums = read_u32(completion.data + 16);
+            uint32_t value_count = values < expected.output_capacity[0] ?
+                values : expected.output_capacity[0];
+            uint32_t enum_count = enums < expected.output_capacity[1] ?
+                enums : expected.output_capacity[1];
+            if (value_count) memcpy(wire.values,
+                output + expected.output_offset[0], value_count * sizeof(uint64_t));
+            if (enum_count) memcpy(wire.enums,
+                output + expected.output_offset[1],
+                enum_count * sizeof(wire.enums[0]));
+            wire.value.flags = read_u32(completion.data + 8);
+            wire.value.count_values = values;
+            wire.value.count_enum_blobs = enums;
+            memcpy(wire.value.name, completion.data + 24,
+                sizeof(wire.value.name));
+            memcpy(request->data, &wire, sizeof(wire));
+            return 0;
+        }
+        case KB2_GPU_DRM_MODE_COMMAND_GET_PROPERTY_BLOB: {
+            gpud_drm_kms_property_blob_wire_t wire;
+            const int large = request->data_size == sizeof(wire.value);
+            if (completion.record_schema_id != KB2_GPU_DRM_MODE_RECORD_LENGTH_RESULT ||
+                completion.length != KB2_GPU_DRM_MODE_RECORD_LENGTH_RESULT_SIZE ||
+                (large ? request->aux_size != expected.region.length :
+                    ((!output && expected.region.length) ||
+                     output_size < expected.region.length))) return -EPROTO;
+            memset(&wire, 0, sizeof(wire));
+            memcpy(&wire, request->data,
+                large ? sizeof(wire.value) : sizeof(wire));
+            uint32_t copied = read_u32(completion.data);
+            uint32_t required = read_u32(completion.data + 4);
+            if (copied != (required == expected.output_capacity[0] ?
+                required : 0)) return -EPROTO;
+            if (copied && !large) memcpy(wire.data, output, copied);
+            wire.value.length = required;
+            memcpy(request->data, &wire,
+                large ? sizeof(wire.value) : sizeof(wire));
+            return 0;
+        }
+        case KB2_GPU_DRM_MODE_COMMAND_ATOMIC:
+            return completion.record_schema_id == KB2_GPU_DRM_MODE_RECORD_ATOMIC_RESULT &&
+                completion.length == KB2_GPU_DRM_MODE_RECORD_ATOMIC_RESULT_SIZE &&
+                read_u64(completion.data) == 1 &&
+                read_u32(completion.data + 8) == 0 &&
+                read_u32(completion.data + 12) == 0 ? 0 : -EPROTO;
         case KB2_GPU_DRM_MODE_COMMAND_OBJECT_GET_PROPERTIES: {
             gpud_drm_kms_object_properties_wire_t wire;
             if (completion.record_schema_id !=
@@ -396,6 +665,18 @@ int gpud_drm_ioctl_reply(gpud_drm_ioctl_request_t *request,
     }
     if (expected.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID) {
         switch (expected.command_id) {
+        case KB2_GPU_DRM_AMDGPU_COMMAND_GEM_OP: {
+            const int get_info = read_u32(request->data + 4) == 0;
+            if (completion.record_schema_id != KB2_GPU_DRM_AMDGPU_RECORD_GEM_OP_RESULT ||
+                completion.length != KB2_GPU_DRM_AMDGPU_RECORD_GEM_OP_RESULT_SIZE ||
+                read_u32(completion.data) != (get_info ?
+                    KB2_GPU_DRM_AMDGPU_RECORD_GEM_CREATE_INFO : 0) ||
+                read_u32(completion.data + 4) != (uint32_t)get_info ||
+                read_u32(completion.data + 8) != (uint32_t)get_info ||
+                read_u32(completion.data + 12) || request->aux_size != (get_info ? 32u : 0u))
+                return -EPROTO;
+            return 0;
+        }
         case KB2_GPU_DRM_AMDGPU_COMMAND_GEM_CREATE:
             if (completion.record_schema_id !=
                     KB2_GPU_DRM_AMDGPU_RECORD_GEM_HANDLE_RESULT ||

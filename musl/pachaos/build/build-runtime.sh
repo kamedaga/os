@@ -4,10 +4,17 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../../.." && pwd)"
 
-artifact_dir="${repo_root}/.artifacts/musl-pachaos-runtime"
+artifact_dir="$(realpath -m "${PACHAOS_MUSL_RUNTIME_DIR:-${repo_root}/.artifacts/musl-pachaos-runtime}")"
+# ABI comparisons need independent runtimes without overwriting a verified
+# baseline. Constrain the clean rebuild to a concrete artifact subdirectory.
+case "$artifact_dir" in
+  "$repo_root/.artifacts/"?*) ;;
+  *) echo 'native runtime output must be an artifact subdirectory' >&2; exit 2 ;;
+esac
 build_dir="${artifact_dir}/build"
 install_dir="${artifact_dir}/install"
-rootfs_lib_dir="${artifact_dir}/rootfs/lib"
+# Never deploy the native syscall ABI over Alpine's Linux /lib interpreter.
+rootfs_lib_dir="${artifact_dir}/rootfs/usr/lib/pachaos"
 build_log="${artifact_dir}/build.log"
 jobs="${PACHAOS_MUSL_JOBS:-$(nproc)}"
 builtins_archive="${PACHAOS_MUSL_LIBCC:-}"
@@ -23,9 +30,10 @@ rm -rf "${artifact_dir}"
 mkdir -p "${build_dir}" "${install_dir}/usr/lib" "${rootfs_lib_dir}"
 
 make_common=(
-  -f "${repo_root}/musl/upstream/Makefile"
+  -f "${repo_root}/musl/pachaos/build/runtime.mk"
   "srcdir=${repo_root}/musl/upstream"
   "ARCH=pachaos"
+  "syslibdir=/usr/lib/pachaos"
   "CC=clang"
   "AR=ar"
   "RANLIB=ranlib"

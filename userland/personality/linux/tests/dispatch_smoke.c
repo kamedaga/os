@@ -125,6 +125,11 @@ int main(void) {
 
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETPID, 0, 0, 0, 0, 0, 0) == 1234)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETPID)) return 1;
+    if (expect(lpr_linux_syscall_lookup(LPR_LINUX_SYS_KCMP) != 0)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_KCMP, 1235, 1234, 0,
+            3, 3, 0) == -LPR_LINUX_ESRCH)) return 1;
+    if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_KCMP, 1234, 1234, 1,
+            3, 3, 0) == -LPR_LINUX_EINVAL)) return 1;
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_GETTID, 0, 0, 0, 0, 0, 0) == 5678)) return 1;
     if (expect(g_last.nr == PACHAOS_SYSCALL_GETTID)) return 1;
     if (expect(lpr_dispatch_syscall(LPR_LINUX_SYS_SET_TID_ADDRESS, 0x1000, 0, 0, 0, 0, 0) == 5678)) return 1;

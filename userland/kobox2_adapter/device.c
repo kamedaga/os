@@ -12,7 +12,8 @@ int ph_device_init(struct ph_device *device, const struct ph_device_config *conf
         config->memory.operations != &ph_memory_ops ||
         config->memory.ram_backing != config->image ||
         config->memory.direct_map != config->image->direct ||
-        config->image->ram_fd < 16 || config->memory.ram_size != PH_RAM_SIZE) return -EINVAL;
+        config->image->ram_fd < 16 ||
+        config->memory.ram_size != config->image->ram_size) return -EINVAL;
     struct ph_pci_config pci = {
         .device_fd = config->device_fd, .generation = config->generation,
         .segment = config->segment, .bus = config->bus, .devfn = config->devfn,
@@ -43,6 +44,7 @@ int ph_device_init(struct ph_device *device, const struct ph_device_config *conf
         PH_OK(ph_dma_destroy(&device->dma));
         goto release_pci;
     }
+    device->dma.image_next = config->image->device_dma;
     config->image->device_dma = &device->dma;
     device->image = config->image;
     device->generation = config->generation;
@@ -67,8 +69,13 @@ int ph_device_finish(struct ph_device *device, uint64_t generation) {
     PH_OK(ph_pci_revoke(&device->pci, generation));
     PH_OK(ph_irq_destroy(&device->irq));
     /* Device finish runs after Linux has stopped all callbacks. */
-    if (device->image)
-        device->image->device_dma = NULL;
+    if (device->image) {
+        struct ph_dma **link = &device->image->device_dma;
+        while (*link && *link != &device->dma) link = &(*link)->image_next;
+        PH_CHECK(*link == &device->dma);
+        *link = device->dma.image_next;
+        device->dma.image_next = NULL;
+    }
     PH_OK(ph_dma_destroy(&device->dma));
     PH_OK(ph_pci_destroy(&device->pci));
     device->image = NULL;

@@ -19,7 +19,7 @@ static int invoke(struct probe *probe, uint32_t op, uint32_t size,
     pacha_service_envelope_t *header = probe->page;
     const uint64_t id = ++probe->request_id;
     *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
-        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = INPUTD_SERVICE_ID,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = INPUTD_SERVICE_ID,
         .op = op, .flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD,
         .request_id = id, .trace_id = id, .payload_size = size};
     struct pacha_ipc_fd fds[2] = {{.fd = (uint64_t)probe->page_fd,
@@ -42,6 +42,7 @@ static int invoke(struct probe *probe, uint32_t op, uint32_t size,
     if (result) return result;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != id ||
         header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        header->header_size != sizeof(*header) ||
         header->service_id != INPUTD_SERVICE_ID || header->op != op ||
         header->request_id != id) return -5;
     *out = header->result;

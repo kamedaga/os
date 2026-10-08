@@ -89,7 +89,8 @@ int ph_irq_destroy(struct ph_irq *irq) {
 }
 
 int main(void) {
-    struct ph_image image = {.ram_fd = 100, .direct = (void *)UINT64_C(0x200000000)};
+    struct ph_image image = {.ram_fd = 100, .ram_size = PH_RAM_SIZE,
+        .direct = (void *)UINT64_C(0x200000000)};
     static struct ph_device device;
     uint64_t sequence = 17;
     struct ph_device_config config = {
@@ -141,6 +142,18 @@ int main(void) {
     assert(!ph_device_init(&device, &config));
     assert(ph_device_finish(&device, 7) == -ESTALE);
     assert(!ph_device_finish(&device, 8));
+    static struct ph_device second_device;
+    image.ram_size = config.memory.ram_size = 512ul << 20;
+    config.generation = 9;
+    assert(!ph_device_init(&device, &config));
+    config.segment = 1;
+    assert(!ph_device_init(&second_device, &config));
+    assert(image.device_dma == &second_device.dma &&
+        second_device.dma.image_next == &device.dma);
+    assert(!ph_device_finish(&device, 9));
+    assert(image.device_dma == &second_device.dma && !second_device.dma.image_next);
+    assert(!ph_device_finish(&second_device, 9) && !image.device_dma);
+    config.generation = 8; config.segment = 0;
     irq_error = -ENOMEM; drain_error = -EIO; expect_fatal = 1;
     if (!setjmp(fatal_jump)) {
         ph_device_init(&device, &config);

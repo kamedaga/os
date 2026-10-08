@@ -1,12 +1,15 @@
 /* Diagnostic only: exclusive main-thread syscall spans in fixed TSC bins.
  * No per-call logging, kernel ABI changes, or changes to Linux applications.
- * Dump after EXIT_GROUP; the host selects bins ending before first paint.
+ * Dump at process exit; the host compares bins with the window-map marker.
  * Time includes descheduling inside calls, not CPU time. Other threads are
  * deliberately excluded so their waits cannot be added to launch wall time.
  */
 #if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
 #include "lpr_gui_detail.h"
-enum { LPR_GUI_BINS = 4096, LPR_GUI_KINDS = 40 };
+#ifndef LPR_GUI_BINS
+#define LPR_GUI_BINS 4096
+#endif
+enum { LPR_GUI_KINDS = 40 };
 #define LPR_GUI_BIN_CYCLES 36000000ull
 static struct { uint64_t cycles, count; } lpr_gui_bins[LPR_GUI_BINS][LPR_GUI_KINDS];
 static uint64_t lpr_gui_pid, lpr_gui_tid, lpr_gui_start, lpr_gui_start_ns;
@@ -23,6 +26,10 @@ static struct {
 static struct { uint64_t tsc, fd, handle; char path[128]; } lpr_gui_peers[64];
 static unsigned lpr_gui_wait_count, lpr_gui_peer_count;
 static uint64_t lpr_gui_wait_dropped, lpr_gui_peer_dropped;
+static struct { char path[128]; uint64_t cycles, count, bytes; } lpr_gui_preads[64];
+static unsigned lpr_gui_pread_count;
+static struct { char path[128]; uint64_t cycles, count, missing; } lpr_gui_stats[128];
+static unsigned lpr_gui_stat_count;
 
 /* The native debug UART can interleave bytes from different CPUs. Measured
  * applications redirect stderr to /dev/hvc0; TERMD serializes each short
@@ -68,6 +75,10 @@ static void lpr_gui_init(void)
     lpr_gui_dumped = 0;
     lpr_gui_file_count = 0;
     lpr_gui_wait_count = lpr_gui_peer_count = 0;
+    lpr_gui_pread_count = 0;
+    lpr_memset(lpr_gui_preads, 0, sizeof(lpr_gui_preads));
+    lpr_gui_stat_count = 0;
+    lpr_memset(lpr_gui_stats, 0, sizeof(lpr_gui_stats));
     lpr_gui_wait_dropped = lpr_gui_peer_dropped = 0;
     lpr_gui_file_seen[0] = lpr_gui_file_seen[1] = 0;
     char path[256] = {0};
@@ -78,6 +89,14 @@ static void lpr_gui_init(void)
     base = base ? base + 1 : path;
     if (lpr_strcmp(base, "gtk4-demo") == 0) lpr_gui_selected = 1;
     else if (lpr_strcmp(base, "xfce4-terminal") == 0) lpr_gui_selected = 2;
+    /* A panel launch traverses helpers before the application. Include each
+     * process separately so helper waits are not blamed on GTK startup. */
+    else if (lpr_strcmp(base, "Thunar") == 0 || lpr_strcmp(base, "thunar") == 0)
+        lpr_gui_selected = 3;
+    else if (lpr_strcmp(base, "exo-open") == 0) lpr_gui_selected = 4;
+    else if (lpr_strcmp(base, "xfce4-mime-helper") == 0) lpr_gui_selected = 5;
+    else if (lpr_strcmp(base, "xfce4-panel") == 0) lpr_gui_selected = 6;
+    else if (lpr_strcmp(base, "Xorg") == 0) lpr_gui_selected = 7;
     else return;
     lpr_gui_tid = (uint64_t)lpr_linux_gettid();
     lpr_memset(lpr_gui_bins, 0, sizeof(lpr_gui_bins));
@@ -146,6 +165,31 @@ void lpr_gui_profile_span(unsigned kind, uint64_t start, uint64_t end)
     if (kind < LPR_GUI_KINDS - 24u) lpr_gui_record(24u + kind, start, end);
 }
 
+void lpr_gui_profile_process(unsigned phase, uint64_t start, int64_t result)
+{
+    if (!lpr_gui_profile_current_thread()) return;
+    const uint64_t row[] = {lpr_gui_pid, phase, start,
+        pacha_trace_read_tsc(), (uint64_t)result};
+    /* Process boundaries are sparse. Emit before exec replaces this runtime
+     * so time spent creating the next image is not lost with its old bins. */
+    lpr_gui_log("process", row, 5);
+}
+
+static void lpr_gui_server_slow(uint64_t nr, uint64_t fd, uint64_t argument,
+    uint64_t start, uint64_t end, int64_t result)
+{
+    if (lpr_gui_selected != 7 || end <= start || end-start < LPR_GUI_BIN_CYCLES)
+        return;
+    /* Idle event waits are expected, not a server stall. Keep only slow
+     * work so long-lived Xorg can be inspected without stopping the desktop
+     * or logging each render/socket request. */
+    const unsigned kind = lpr_gui_kind(nr, 0);
+    if (kind == 16 || kind == 17 || kind == 19) return;
+    const uint64_t row[] = {lpr_gui_pid, nr, fd, argument, start, end,
+        (uint64_t)result};
+    lpr_gui_log("server-slow", row, 7);
+}
+
 void lpr_gui_profile_file(uint64_t nr, uint64_t argument, uint64_t flags,
     uint64_t offset_valid, uint64_t pread_active, uint64_t size, const char *path)
 {
@@ -198,6 +242,54 @@ void lpr_gui_profile_wait(uint64_t start, uint64_t end, uint64_t fd,
     lpr_gui_waits[i].type = type;
 }
 
+static void lpr_gui_pread(uint64_t fd, uint64_t cycles, uint64_t bytes)
+{
+    lpr_fd_pin_t pin;
+    if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)fd, &pin)) return;
+    if (pin.ops_id == LPR_FD_OPS_FILED) {
+        const char *path = "(Linux handle)";
+        unsigned i = 0;
+        while (i < lpr_gui_pread_count && lpr_strcmp(path, lpr_gui_preads[i].path)) i++;
+        if (i < 64) {
+            if (i == lpr_gui_pread_count) {
+                const unsigned length = (unsigned)lpr_strnlen(path, 127);
+                lpr_memcpy(lpr_gui_preads[i].path, path, length);
+                lpr_gui_pread_count++;
+            }
+            lpr_gui_preads[i].cycles += cycles;
+            lpr_gui_preads[i].count++;
+            lpr_gui_preads[i].bytes += bytes;
+        }
+    }
+    lpr_fd_unpin(&pin);
+}
+
+static void lpr_gui_stat(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t cycles, int64_t result)
+{
+    if (result == -LPR_LINUX_EFAULT) return;
+    lpr_fd_pin_t pin = {0};
+    const char *path = 0;
+    if (nr == 5) {
+        if (lpr_fd_table_pin(&lpr_control_fd_table, (uint32_t)a0, &pin)) return;
+        if (pin.ops_id == LPR_FD_OPS_FILED)
+            path = "(Linux handle)";
+    } else path = (const char *)(uintptr_t)((nr == 262 || nr == 332) ? a1 : a0);
+    if (path) {
+        unsigned i = 0;
+        while (i < lpr_gui_stat_count && lpr_strcmp(path, lpr_gui_stats[i].path)) i++;
+        if (i < 128) {
+            if (i == lpr_gui_stat_count) {
+                lpr_memcpy(lpr_gui_stats[i].path, path, lpr_strnlen(path, 127));
+                lpr_gui_stat_count++;
+            }
+            lpr_gui_stats[i].cycles += cycles;
+            lpr_gui_stats[i].count++;
+            lpr_gui_stats[i].missing += result == -LPR_LINUX_ENOENT;
+        }
+    }
+    if (pin.state) lpr_fd_unpin(&pin);
+}
+
 static void lpr_gui_dump(void)
 {
     if (lpr_gui_dumped) return;
@@ -206,6 +298,32 @@ static void lpr_gui_dump(void)
     const uint64_t tsc = pacha_trace_read_tsc();
     const uint64_t end[] = {lpr_gui_pid, tsc, ns};
     lpr_gui_log("end", end, 3);
+    for (unsigned i = 0; i < lpr_gui_stat_count; i++) {
+        const uint64_t row[] = { lpr_gui_pid, i, lpr_gui_stats[i].cycles,
+            lpr_gui_stats[i].count, lpr_gui_stats[i].missing };
+        lpr_gui_log("stat-file", row, 5);
+        char line[160];
+        char *out = line;
+        const char *p = "[gui-stat-path] ";
+        while (*p) *out++ = *p++;
+        p = lpr_gui_stats[i].path;
+        while (*p) *out++ = *p++;
+        *out++ = '\n';
+        lpr_gui_emit(line, (uint64_t)(out-line));
+    }
+    for (unsigned i = 0; i < lpr_gui_pread_count; i++) {
+        const uint64_t row[] = { lpr_gui_pid, i, lpr_gui_preads[i].cycles,
+            lpr_gui_preads[i].count, lpr_gui_preads[i].bytes };
+        lpr_gui_log("pread-file", row, 5);
+        char line[160];
+        char *out = line;
+        const char *p = "[gui-pread-path] ";
+        while (*p) *out++ = *p++;
+        p = lpr_gui_preads[i].path;
+        while (*p) *out++ = *p++;
+        *out++ = '\n';
+        lpr_gui_emit(line, (uint64_t)(out-line));
+    }
     for (unsigned b = 0; b < LPR_GUI_BINS; ++b)
         for (unsigned k = 0; k < LPR_GUI_KINDS; ++k) {
             if (!lpr_gui_bins[b][k].cycles) continue;

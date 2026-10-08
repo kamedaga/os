@@ -54,7 +54,7 @@ def main():
         payload.extend(content)
     descriptors.extend(bytes(176 * (MAX_FILES - len(entries))))
     total_bytes = HEADER_BYTES + len(payload)
-    bundle = (struct.pack("<QQQQ", MAGIC, 1, len(entries), total_bytes) +
+    bundle = (struct.pack("<QQQQ", MAGIC, HEADER_BYTES, len(entries), total_bytes) +
               descriptors + payload)
     if len(bundle) != total_bytes:
         raise AssertionError("firmware bundle layout mismatch")

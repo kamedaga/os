@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(smp_stress C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${CMAKE_CURRENT_LIST_DIR}/../../cmake/pachaos_native_dependencies.cmake")
 set(SMP_STRESS_ELF "${CMAKE_BINARY_DIR}/smp_stress.elf")
 
 set(SMP_STRESS_RUNTIME_SOURCES
@@ -23,12 +24,11 @@ add_custom_command(
       "PACHAOS_MUSL_EXTRA_SOURCES=${SMP_STRESS_RUNTIME_SOURCES_ENV}"
       "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${SMP_STRESS_ELF}"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${REPO_ROOT}/userland/libipc/src/ipc.c"
     "${REPO_ROOT}/userland/libpacha/src/syscall.c"
     "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM
 )

@@ -4,14 +4,13 @@
 #include "filed/exec_native.h"
 #include "filed/runtime.h"
 #include "pacha/launch.h"
-#include "../internal/dispatch_state.h"
 
 int filed_exec_build_grants(struct filed_runtime *runtime,
     const filed_exec_path_t *request, const int *sources, uint64_t source_count,
     int bootstrap_fd, struct pacha_process_fd_grant *grants, uint64_t *count)
 {
     if (!runtime || !request || !grants || !count ||
-        source_count > FILED_EXEC_MAX_INHERIT_FDS ||
+        source_count > PACHA_PROCESS_CREATE_MAX_GRANTS - 7 ||
         source_count != request->inherit_fd_count || (source_count && !sources) ||
         (!(request->flags & FILED_EXEC_INHERIT_FDS) && source_count)) return -22;
     *count = 0;
@@ -92,9 +91,4 @@ int filed_exec_handle(
         bootstrap_fd,
         out_process_fd,
         out_thread_fd);
-}
-
-void filed_exec_invalidate_backend_object(struct filed_runtime *runtime, uint64_t backend_object)
-{
-    filed_exec_linux_lpr_invalidate_backend_object(runtime, backend_object);
 }

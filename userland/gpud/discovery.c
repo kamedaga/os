@@ -33,9 +33,12 @@ int gpud_discovery_prepare(struct gpud_discovery *d, int device_fd, int primary)
         (err = pacha_capsule_pci_config_read(device_fd, 14, 1, &header)) ||
         (err = pacha_capsule_pci_config_read(device_fd, 44, 4, &sub))) return err;
     if ((id & 0xffffu) == 0xffffu || (header & 0x7f)) return -ENODEV;
-    const char *parents[] = {"/sys", "/sys/dev", "/sys/dev/char",
+    /* Both standard indexes exist even when this publisher provides only
+     * character devices; an absent block index aborts libudev enumeration. */
+    const char *parents[] = {"/sys", "/sys/dev", "/sys/dev/char", "/sys/dev/block",
         "/sys/bus", "/sys/bus/pci", "/sys/class", "/sys/class/drm", "/dev/dri"};
-    for (size_t i = 0; i < sizeof(parents)/sizeof(*parents); ++i)
+    d->ancestor_count = sizeof(parents)/sizeof(*parents);
+    for (size_t i = 0; i < d->ancestor_count; ++i)
         add(d, GPUD_DISC_DIR, parents[i], NULL, 0);
     const char *base = "/sys/dev/char/226:128";
     char path[160], value[160];
@@ -62,6 +65,11 @@ int gpud_discovery_prepare(struct gpud_discovery *d, int device_fd, int primary)
     }
     snprintf(path, sizeof(path), "%s/dev", base);
     add(d, GPUD_DISC_TEXT, path, "226:128\n", 0);
+    /* libdrm resolves an already-open DRM fd through the node's DEVNAME,
+     * not the PCI device's uevent. Xorg caches this path for DRI3 client
+     * opens, so enumeration alone is insufficient even when glamor works. */
+    snprintf(path, sizeof(path), "%s/uevent", base);
+    add(d, GPUD_DISC_TEXT, path, "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\n", 0);
     add(d, GPUD_DISC_LINK, "/sys/class/drm/renderD128", base, 0);
     /* Publish the directory entry last. LPR already dispatches this node's
      * operations to gpud; filed supplies enumeration for unmodified libdrm. */
@@ -70,6 +78,8 @@ int gpud_discovery_prepare(struct gpud_discovery *d, int device_fd, int primary)
         add(d, GPUD_DISC_DIR, "/sys/dev/char/226:0", NULL, 0);
         add(d, GPUD_DISC_LINK, "/sys/dev/char/226:0/device", "/sys/dev/char/226:128/device", 0);
         add(d, GPUD_DISC_TEXT, "/sys/dev/char/226:0/dev", "226:0\n", 0);
+        add(d, GPUD_DISC_TEXT, "/sys/dev/char/226:0/uevent",
+            "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\n", 0);
         add(d, GPUD_DISC_LINK, "/sys/class/drm/card0", "/sys/dev/char/226:0", 0);
         add(d, GPUD_DISC_LINK, "/sys/dev/char/226:128/device/drm/card0", "/sys/dev/char/226:0", 0);
         add(d, GPUD_DISC_NODE, "/dev/dri/card0", NULL, 226u << 8);

@@ -6,7 +6,17 @@
 #include <errno.h>
 #include <string.h>
 
-static int prepare(void *context, const struct ph_ipc_packet *packet) {
+/* Ring publication is already serialized by Linux. This nonblocking doorbell
+ * carries no events; its write capability lives until module teardown has
+ * quiesced the input handler, before the lifecycle invokes stop. */
+static int notify_input(void *context) {
+    struct ph_usb_input_service *input = context;
+    const uint64_t one = 1;
+    return pacha_syscall3(PACHA_FD_SYSCALL_WRITE, input->event_fd,
+        (uintptr_t)&one, sizeof(one)) == (long)sizeof(one) ? 0 : -EIO;
+}
+
+static int prepare(void *context, struct ph_ipc_packet *packet) {
     struct ph_usb_input_service *input = context;
     if (!packet->correlation || packet->generation != input->generation ||
         input->operation) return -EPROTO;
@@ -73,7 +83,9 @@ static int dispatch(void *context, void *linux_service) {
             (struct kobox_linux_input_record *)shared->payload,
             capacity, &count, &cursor);
         shared->overwritten = cursor;
-    } else if (input->operation != PH_USB_INPUT_ATTACH) {
+    } else if (input->operation == PH_USB_INPUT_ATTACH) {
+        result = input->bind_notify(linux_service, &input->notify);
+    } else {
         return -EPROTO;
     }
     shared->status = result;
@@ -87,6 +99,13 @@ static int complete(void *context, struct ph_ipc *ipc) {
     struct ph_ipc_packet reply = {.operation = input->operation,
         .generation = input->generation, .correlation = input->correlation,
         .value = (uint64_t)(int64_t)input->shared->status};
+    if (input->operation == PH_USB_INPUT_ATTACH && !input->shared->status) {
+        reply.fd_count = 1;
+        reply.fds[0] = (struct pacha_ipc_fd){.fd = (uint64_t)input->event_fd,
+            .rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+                PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL,
+            .flags = PACHA_FD_FLAG_CLOEXEC | PACHA_FD_FLAG_NONBLOCK};
+    }
     return ph_ipc_send(ipc, &reply);
 }
 
@@ -99,11 +118,14 @@ static int release(void *context) {
 
 static int stop(void *context) {
     struct ph_usb_input_service *input = context;
-    if (!input->shared) return 0;
-    if (pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
+    if (input->shared && pacha_syscall2(PACHA_VM_SYSCALL_MUNMAP,
             (uintptr_t)input->shared, input->shared_size)) return -EIO;
     input->shared = NULL;
     input->shared_size = 0;
+    if (input->event_fd >= 16) {
+        if (pacha_syscall1(PACHA_FD_SYSCALL_CLOSE, input->event_fd)) return -EIO;
+        input->event_fd = 0;
+    }
     return 0;
 }
 
@@ -112,10 +134,21 @@ int ph_usb_input_service_init(struct ph_usb_input_service *input, void *core,
     if (!input || !core || !generation || !service) return -EINVAL;
     void *read = ph_image_lookup(core, "kobox_linux_input_port_read");
     void *snapshot = ph_image_lookup(core, "kobox_linux_input_port_snapshot");
-    if (!read || !snapshot) return -ENOENT;
+    void *bind = ph_image_lookup(core, "kobox_linux_input_port_bind_notify");
+    if (!read || !snapshot || !bind) return -ENOENT;
     memset(input, 0, sizeof(*input));
     memcpy(&input->read, &read, sizeof(read));
     memcpy(&input->snapshot, &snapshot, sizeof(snapshot));
+    memcpy(&input->bind_notify, &bind, sizeof(bind));
+    const uint64_t rights = PACHA_FD_RIGHT_INSPECT | PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_TRANSFER | PACHA_FD_RIGHT_WRITE | PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL;
+    long event = pacha_syscall3(PACHA_FD_SYSCALL_EVENTFD_CREATE,
+        0, rights, PACHA_FD_FLAG_NONBLOCK);
+    if (event < 16 || event >= PACHA_FD_TABLE_LIMIT) return -ENOMEM;
+    input->event_fd = (int)event;
+    input->notify = (struct kobox_linux_input_notify){
+        .context = input, .notify = notify_input};
     input->generation = generation;
     *service = (struct ph_lifecycle_service){.context = input,
         .prepare = prepare, .dispatch = dispatch, .complete = complete,

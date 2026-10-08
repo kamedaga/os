@@ -1,0 +1,94 @@
+#!/bin/ash
+# SPDX-License-Identifier: MIT
+set -eu
+set -o pipefail
+
+media="$1"
+offset="$2"
+verify=0
+case "${3:-}" in '' ) ;; --verify) verify=1;; *) exit 64;; esac
+case "$offset" in ''|*[!0-9]*) exit 64;; esac
+root="${PACHA_LIVE_ROOT:-/}"
+state="$root/run/pacha"
+log="$state/live-desktop.log"
+busybox mkdir -p "$state"
+started="$(busybox date +%s)"
+phase=media
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "live desktop: failed phase=$phase status=$rc; recovery Shell only"; echo "live desktop: failed phase=$phase status=$rc" >>"$log"; fi' EXIT
+note() {
+    elapsed=$(( $(busybox date +%s) - started ))
+    echo "live desktop: $*"
+    echo "live desktop: elapsed=${elapsed}s phase=$phase $*" >>"$log"
+}
+
+# Imports belong to the RAM-only live root. The installed system uses APK,
+# not this media transaction, and may never be overwritten by this runner.
+[ "$(busybox cat "$root/etc/pacha/boot-profile")" = ram-tmpfs-v1 ]
+if [ -f "$state/live-desktop.ready" ]; then
+    note "already prepared in RAM"
+    exit 0
+fi
+image="$media@@$offset"
+if ! mdir -i "$image" ::/DESKTOP.TGZ >/dev/null 2>&1; then
+    note "no optional desktop bundle on this medium; continuing to Shell"
+    exit 0
+fi
+# Local desktop testing uses media verified by the host image writer. Reading
+# the entire USB archive again, then hashing every extracted file over FileD,
+# doubles media traffic and adds a full RAM-filesystem pass to every boot.
+# Keep explicit verification available for media diagnostics, not installation.
+expected=host-verified-media
+if [ "$verify" -eq 1 ]; then
+    phase=digest
+    mcopy -o -i "$image" ::/DESKTOP.SHA "$state/live-desktop.sha256"
+    set -- $(busybox cat "$state/live-desktop.sha256")
+    [ "$#" -eq 2 ] && [ "$2" = DESKTOP.TGZ ]
+    expected="$1"
+    case "$expected" in *[!0-9a-f]*) exit 65;; esac
+    [ "${#expected}" -eq 64 ]
+    note "verifying the selected desktop archive (SHA-256)"
+    phase=verify
+    actual="$(mcopy -i "$image" ::/DESKTOP.TGZ - | busybox sha256sum)"
+    actual="${actual%% *}"
+    [ "$actual" = "$expected" ]
+else
+    note "local test import; boot-time SHA-256 scans disabled"
+fi
+phase=extract
+note "extracting desktop files into RAM; the SSD is not a write target"
+# Do not retain the compressed archive beside its extracted tree in tmpfs.
+# The builder permits only package-owned paths and real bounded symlinks.
+mcopy -i "$image" ::/DESKTOP.TGZ - | busybox tar -xzf - -C "$root"
+note "archive extraction complete"
+phase=inventory
+if [ "$verify" -eq 1 ]; then
+    (cd "$root" && busybox sha256sum -c usr/share/pacha/live-desktop-files.sha256) >>"$log" 2>&1
+    while IFS="$(busybox printf '\t')" read -r path target; do
+        [ "$(busybox readlink "$root/$path")" = "$target" ]
+    done <"$root/usr/share/pacha/live-desktop-links"
+fi
+for command in usr/libexec/Xorg usr/bin/startx usr/bin/startxfce4 sbin/apk usr/bin/gtk3-demo usr/bin/dbus-uuidgen; do
+    [ -x "$root/$command" ]
+done
+phase=commands
+# APK's BusyBox trigger is not run when package files are extracted directly.
+# Install its ordinary applet symlinks in RAM, without shell wrappers or
+# replacing commands already supplied by other packages.
+busybox mkdir -p "$root/bin"
+# BusyBox falls back to argv[0] if /proc/self/exe is unavailable. Invoke the
+# actual executable by its absolute PATH entry so applet links do not depend
+# on procfs being mounted in the RAM-only live environment.
+busybox_path="$(command -v busybox)"
+case "$busybox_path" in /*) ;; *) note "BusyBox executable path is not absolute"; exit 1;; esac
+"$busybox_path" --install -s "$root/bin"
+for command in id mkdir cat cp rm; do
+    [ -x "$root/bin/$command" ]
+done
+busybox mkdir -p "$root/run/user/0" "$root/var/log" "$root/var/cache/fontconfig"
+busybox chmod 0700 "$root/run/user/0"
+phase=session-state
+# This is per-boot RAM state, not an identifier copied from a developer's
+# rootfs. D-Bus clients need a valid local machine ID even for a session bus.
+"$root/usr/bin/dbus-uuidgen" --ensure="$root/etc/machine-id"
+echo "$expected" >"$state/live-desktop.ready"
+note "ready; GPU probe remains manual. After probe, run pacha-live-desktop from the local Shell"

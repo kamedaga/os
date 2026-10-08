@@ -5,11 +5,10 @@
 
 #include "pacha/service_abi.h"
 
-#define PERSONALITY_ABI_VERSION PACHA_SERVICE_ABI_VERSION
 #define PERSONALITY_PAGE_SIZE 4096ull
 
-#define PERSONALITY_LPR_NOTE_MAGIC 0x3250524c50414348ull
-#define PERSONALITY_TRAP_FRAME_MAGIC 0x325241505052534full
+#define PERSONALITY_LPR_NOTE_MAGIC 0x0050524c50414348ull
+#define PERSONALITY_TRAP_FRAME_MAGIC 0x005241505052534full
 
 enum personality_id {
     PERSONALITY_ID_NONE = 0,
@@ -27,7 +26,7 @@ enum personality_status {
 
 struct personality_lpr_note {
     uint64_t magic;
-    uint32_t version;
+    uint32_t size;
     uint32_t personality_id;
     uint64_t flags;
     uint64_t lpr_start_offset;
@@ -41,7 +40,7 @@ struct personality_lpr_note {
 
 struct personality_trap_frame {
     uint64_t magic;
-    uint32_t version;
+    uint32_t size;
     uint32_t personality_id;
     uint64_t syscall_nr;
     uint64_t args[6];

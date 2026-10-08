@@ -274,6 +274,8 @@ int64_t lpr_linux_dup_into(uint64_t fd, int target_fd, uint64_t min_fd, uint64_t
     if (fd == new_fd) {
         return (int64_t)new_fd;
     }
+    const int64_t binding_status = lpr_filed_fd_binding(new_fd);
+    if (binding_status) return binding_status;
     const int ensure_status = lpr_fd_table_ensure_fd(new_fd);
     if (ensure_status != 0) {
         return ensure_status;

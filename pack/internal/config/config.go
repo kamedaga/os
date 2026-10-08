@@ -21,6 +21,7 @@ type Workspace struct {
 	State           string            `yaml:"state"`
 	Kernel          Kernel            `yaml:"kernel"`
 	Disk            Disk              `yaml:"disk"`
+	Storage         Storage           `yaml:"storage"`
 	Manifests       Manifests         `yaml:"manifests"`
 	StartupManifest StartupManifest   `yaml:"startupManifest"`
 	RootfsDirs      []string          `yaml:"rootfsDirs"`
@@ -39,6 +40,13 @@ type Disk struct {
 	SizeMiB    int                  `yaml:"sizeMiB"`
 	Recreate   string               `yaml:"recreate"`
 	Partitions map[string]Partition `yaml:"partitions"`
+}
+
+// Storage budgets are explicit owner policy, not inode/path/cache limits.
+type Storage struct {
+	SandboxRAMMiB uint64 `yaml:"sandboxRAMMiB"`
+	QueueSize     uint64 `yaml:"queueSize"`
+	QueueArenaMiB uint64 `yaml:"queueArenaMiB"`
 }
 
 type Partition struct {

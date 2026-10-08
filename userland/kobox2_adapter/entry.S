@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include <pacha/abi.h>
+#include "stack_layout.h"
 .text
 .global _start
 _start:
@@ -7,6 +8,8 @@ _start:
     and $-16, %rsp
     lea __ehdr_start(%rip), %rdi
     call ph_relocate_self
+    /* Known native bounds let Linux reject direct DMA of stack objects. */
+    lea ph_boot_stack_end(%rip), %rsp
     call ph_main
     ud2
 .global ph_thread_entry
@@ -25,4 +28,10 @@ ph_notification_entry:
     syscall
     ud2
 .popsection
+.bss
+.balign 4096
+.global ph_boot_stack
+ph_boot_stack:
+    .skip PH_THREAD_STACK_SIZE
+ph_boot_stack_end:
 .section .note.GNU-stack,"",@progbits

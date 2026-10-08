@@ -1,4 +1,5 @@
 #include "../lpr_filed_internal.h"
+#include "../lpr_vfs/session.h"
 
 
 int lpr_create_wire_page(void **out_page);
@@ -32,52 +33,27 @@ int64_t lpr_filed_dup_handle(uint64_t handle, uint64_t fd_flags, uint64_t *out_h
 int lpr_exec_local_fd_preserve(uint64_t fd, int *out_preserve);
 int lpr_count_exec_local_fds(uint64_t *out_count);
 
-void lpr_filed_session_drop(void)
+int64_t lpr_filed_session_drop(void)
 {
-    lpr_file_image_cache_clear();
-
-    /* The filed RPC lock is also the fast-session lifetime lock.  Every
-     * request that can retain a session-page pointer holds it until the
-     * request and any payload access have finished, so acquiring it here
-     * drains existing users before the mapping is detached. */
-    lpr_state_lock(&lpr_state.filed_rpc.lock_word);
-    void *const page = lpr_session_page;
-    const int page_fd = lpr_session_page_fd;
-    const int session_fd = lpr_session_fd;
-    lpr_session_fd = -1;
-    lpr_session_page_fd = -1;
-    lpr_session_page = 0;
-    lpr_session_checked = 0;
-    lpr_session_payload_busy = 0;
-
-    if (page != 0) {
-        (void)lpr_pacha_syscall2(
-            PACHAOS_SYSCALL_MUNMAP,
-            (uint64_t)(uintptr_t)page,
-            FILED_SESSION_PAGE_BYTES);
-    }
-    if (page_fd >= 16) {
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE,
-            (uint64_t)(uint32_t)page_fd);
-    }
-    if (session_fd >= 16) {
-        (void)lpr_pacha_syscall1(
-            PACHAOS_SYSCALL_FD_CLOSE,
-            (uint64_t)(uint32_t)session_fd);
-    }
-    lpr_state_unlock(&lpr_state.filed_rpc.lock_word);
+    /* SESSION_DETACH is control-only and may acquire connection_lock. Do not
+     * hold that lock across the session-lock/RPC path or close before ACK. */
+    const int64_t status = lpr_fs_session_drop();
+    lpr_state_lock(&lpr_state.filed_rpc.connection_lock);
+    const int client = lpr_filed_client_fd;
+    lpr_filed_client_id = 0;
+    /* Teardown is terminal for this image. Prevent a sibling control request
+     * from re-binding after the final queue ACK; fork/new-image resets it. */
+    lpr_filed_endpoint_checked = -1;
+    int64_t close_status = 0;
+    if (client >= 16)
+        close_status = lpr_pacha_status_to_errno(
+            lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint32_t)client));
+    /* A failed local CLOSE does not destroy the FD. Keep its number as
+     * cleanup inventory, but never authenticate another RPC through it. */
+    if (!close_status) lpr_filed_client_fd = -1;
+    lpr_state_unlock(&lpr_state.filed_rpc.connection_lock);
+    return status ? status : close_status;
 }
-void *lpr_session_payload_slot(uint64_t slot)
-{
-    if (lpr_session_page == 0 || slot >= FILED_FAST_PAYLOAD_SLOT_COUNT) {
-        return 0;
-    }
-    return (void *)((uintptr_t)lpr_session_page +
-        FILED_FAST_PAYLOAD_OFFSET +
-        slot * FILED_PAGE_BYTES);
-}
-
 void lpr_zero_bytes(void *ptr, uint64_t len)
 {
     unsigned char *p = (unsigned char *)ptr;
@@ -384,26 +360,6 @@ void lpr_trace_readv_size(uint64_t fd, uint64_t iov_count, uint64_t requested, u
 void lpr_trace_readv_to_vmo_status(uint64_t fd, uint64_t requested, int64_t status)
 {
     pacha_trace3(PACHA_TRACE_COMPONENT_LPR, PACHA_TRACE_EVENT_LPR_READV_TO_VMO_STATUS, PACHA_TRACE_CLASS_DEBUG, fd, requested, (uint64_t)status);
-}
-
-void lpr_linux_readv_cache_trace_dump(void)
-{
-    pacha_trace6(
-        PACHA_TRACE_COMPONENT_LPR,
-        PACHA_TRACE_EVENT_LPR_READV_CACHE_METRIC,
-        PACHA_TRACE_CLASS_METRIC,
-        lpr_readv_cache_total,
-        lpr_readv_cache_coalesced,
-        lpr_readv_cache_hit,
-        lpr_readv_cache_fill,
-        lpr_readv_cache_fallback,
-        lpr_readv_cache_bytes);
-    pacha_trace2(
-        PACHA_TRACE_COMPONENT_LPR,
-        PACHA_TRACE_EVENT_LPR_READV_CACHE_METRIC,
-        PACHA_TRACE_CLASS_METRIC,
-        lpr_readv_cache_cross_page,
-        lpr_readv_cache_to_vmo);
 }
 
 int64_t lpr_pacha_status_to_errno(int64_t status)

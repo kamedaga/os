@@ -26,7 +26,7 @@ static int file_call(int page_fd, void *page, unsigned op, unsigned size, uint64
     pacha_service_envelope_t *header = page;
     memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = FILED_SERVICE_ID;
     header->op = op;
     header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;

@@ -8,6 +8,7 @@
 #include <kobox2/module_progress.h>
 #include "../../gpud/bootstrap.h"
 #include "../../gpud/launch.h"
+#include "../../kobox2_owner/boot.h"
 #include "../../gpud/lifecycle.h"
 #include "../../gpud/process.h"
 #include "../../kobox2_adapter/sandbox_config.h"
@@ -234,71 +235,31 @@ static int start_generation(void)
             NETD_RESOURCE_SET_ID, 0);
     if (error) return nic_failure(NETD_NIC_STEP_RESOURCE, error, error, 0, 0);
 
-    const uint64_t channel_rights = PH_IPC_CHANNEL_RIGHTS |
-        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER;
-    nic_progress(NETD_NIC_STEP_CHANNEL, "create sandbox management channel");
-    error = pacha_ipc_channel_create(&current->management, channel_rights, 0);
-    if (!error) error = ph_ipc_init(&current->ipc, current->management.a, generation);
-    if (error) return nic_failure(NETD_NIC_STEP_CHANNEL, error, error, 0, 0);
-    struct ph_sandbox_config sandbox_config = {.version = PH_SANDBOX_CONFIG_VERSION,
+    struct ph_sandbox_config sandbox_config = {.size = sizeof(struct ph_sandbox_config),
         .identity = nic.package.identity,
         .artifact_count = nic.package.artifact_count, .resource_count = 1,
         .device = nic.package.device};
-    struct gpud_launch_blob blob = {.bytes = &sandbox_config,
-        .size = sizeof(sandbox_config), .address = PH_SANDBOX_CONFIG_ADDRESS};
-    struct pacha_process_fd_grant grant = {
-        .source_fd = (uint64_t)current->management.b,
-        .target_fd = PH_SANDBOX_CHANNEL_FD, .rights = PH_IPC_CHANNEL_RIGHTS,
-        .flags = PACHA_FD_FLAG_CLOEXEC};
-    struct gpud_launch_request request = {.generation = generation,
-        .load_bias = UINT64_C(0x40000000), .stack_address = UINT64_C(0x45000000),
-        .stack_size = 256 * 1024, .image = nic.package.sandbox,
-        .image_size = nic.package.sandbox_size, .blobs = &blob, .blob_count = 1,
-        .grants = &grant, .grant_count = 1};
-    struct gpud_launch_resources resources = {.generation = generation,
+    const struct ph_owner_boot_config start = {.controller = nic.controller,
+        .launch = &current->launch, .ipc = &current->ipc,
+        .management = &current->management, .watch = &current->watch,
+        .lifecycle = &current->lifecycle,
         .resource_set_id = NETD_RESOURCE_SET_ID, .sandbox_id = NETD_SANDBOX_ID,
-        .request = &request};
-    memcpy(resources.manifest_digest, nic.package.identity.manifest_digest, 32);
-    struct gpud_launch_transaction transaction = {0};
-    nic_progress(NETD_NIC_STEP_SANDBOX_LAUNCH, "prepare and start sandbox process");
-    kb2_status_t step_status = gpud_launch_begin(&transaction, nic.controller,
-        &current->launch, &current->ipc, &resources);
-    if (step_status == KB2_STATUS_OK) {
-        nic_progress(NETD_NIC_STEP_SANDBOX_LAUNCH, "complete sandbox launch action");
-        step_status = gpud_launch_step(&transaction);
-    }
-    if (step_status != KB2_STATUS_OK || !transaction.completed)
-        return nic_failure(NETD_NIC_STEP_SANDBOX_LAUNCH, -EIO,
-            transaction.launch_error ? transaction.launch_error : (int)step_status, 0, 0);
-    (void)pacha_fd_close(current->management.b);
-    current->management.b = -1;
-    nic_progress(NETD_NIC_STEP_PROCESS_WATCH, "register sandbox process watch");
-    if (gpud_process_watch_init(&current->watch, nic.controller,
-            &current->launch.process, &current->ipc,
-            NETD_RESOURCE_SET_ID, NETD_SANDBOX_ID) != KB2_STATUS_OK)
-        return nic_failure(NETD_NIC_STEP_PROCESS_WATCH, -EIO, -EIO, 0, 0);
-    struct gpud_bootstrap_resources transfer = {.generation = generation,
-        .resource_set_id = NETD_RESOURCE_SET_ID, .sandbox_id = NETD_SANDBOX_ID,
+        .sandbox_config = &sandbox_config, .image = nic.package.sandbox,
+        .image_size = nic.package.sandbox_size,
         .items = nic.package.items, .artifact_count = nic.package.artifact_count,
-        .resource_handle_count = 1};
-    memcpy(transfer.manifest_digest, nic.package.identity.manifest_digest, 32);
-    struct gpud_bootstrap_transfer bootstrap = {0};
-    nic_progress(NETD_NIC_STEP_TRANSFER, "prepare sandbox module transfer");
-    step_status = gpud_bootstrap_begin(&bootstrap, nic.controller,
-        &current->ipc, &transfer);
+        .resource_count = 1, .log_endpoint_fd = -1};
+    struct ph_owner_boot boot = {0};
+    nic_progress(NETD_NIC_STEP_SANDBOX_LAUNCH, "start shared sandbox boot sequence");
+    kb2_status_t step_status = ph_owner_boot_begin(&boot, &start);
     if (step_status != KB2_STATUS_OK)
-        return nic_failure(NETD_NIC_STEP_TRANSFER, -EIO, (int)step_status, 0, 0);
-    nic_progress(NETD_NIC_STEP_TRANSFER, "send sandbox modules and PCI handle");
-    while (!bootstrap.completed) {
-        kb2_status_t status = gpud_bootstrap_step(&bootstrap);
+        return nic_failure(NETD_NIC_STEP_SANDBOX_LAUNCH, -EIO,
+            boot.native_error ? boot.native_error : (int)step_status, 0, 0);
+    while (boot.phase != PH_OWNER_BOOT_COMPLETE) {
+        kb2_status_t status = ph_owner_boot_step(&boot);
         if (status != KB2_STATUS_OK && status != KB2_STATUS_ACTION_PENDING)
             return nic_failure(NETD_NIC_STEP_TRANSFER, -EIO,
-                bootstrap.native_error ? bootstrap.native_error : (int)status, 0, 0);
+                boot.native_error ? boot.native_error : (int)status, 0, 0);
     }
-    nic_progress(NETD_NIC_STEP_LIFECYCLE, "initialize Linux module lifecycle");
-    step_status = gpud_lifecycle_init(&current->lifecycle, &current->watch);
-    if (step_status != KB2_STATUS_OK)
-        return nic_failure(NETD_NIC_STEP_LIFECYCLE, -EIO, (int)step_status, 0, 0);
     nic_progress(NETD_NIC_STEP_LIFECYCLE, "wait for sandbox Linux modules and NIC probe");
     unsigned observed_progress = 0;
     for (;;) {

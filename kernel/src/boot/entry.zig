@@ -257,6 +257,12 @@ fn initKernelRuntimeOrHalt() void {
         if (!iommu.prepareBootMmio(boot_rsdp_paddr)) {
             halt.haltWithMessage("IOMMU boot MMIO mapping failed");
         }
+        const hpet = @import("../hpet.zig");
+        const hpet_mapped = hpet.prepareBootMmio(boot_rsdp_paddr);
+        const hpet_map = hpet.diagnostic();
+        kernel_log.writeFmt("clock: HPET boot UC map={} reason={s} base=0x{x}\n", .{
+            @intFromBool(hpet_mapped), @tagName(hpet_map.reason), hpet_map.address,
+        });
     }
     x86_platform.loadGdtAndReloadSegments();
     installInterruptTrampolines();
@@ -967,16 +973,35 @@ pub fn bootWithResources(resources: BootResources, comptime checkpoint: fn (u8) 
     const state = initKernelSubsystems(resources.memory_stats);
     const highres_ready = @import("../realtime_clock.zig").initializeHighResolution(
         boot_rsdp_paddr,
-        smp.ucMinusMmioAllowed,
+        struct {
+            fn allowed(base: u64, bytes: u64) bool {
+                const status = smp.explicitUcIdentityMmioStatus(base, bytes);
+                if (status != .ready) {
+                    const masks = smp.mmioCacheEvidenceMasks();
+                    kernel_log.writeFmt("clock: HPET UC proof failed reason={s} base=0x{x} bytes=0x{x} verified=0x{x} matching=0x{x} online=0x{x}\n", .{
+                        @tagName(status), base, bytes, masks.verified, masks.matching, masks.online,
+                    });
+                }
+                return status == .ready;
+            }
+        }.allowed,
     );
     const clock = @import("../realtime_clock.zig");
+    const hpet = @import("../hpet.zig").diagnostic();
+    kernel_log.writeFmt("clock: HPET init={s} base=0x{x} caps=0x{x} period_fs={} lapic-calibrated={}\n", .{
+        @tagName(hpet.reason),                     hpet.address, hpet.capabilities, hpet.period_fs,
+        @intFromBool(lapic.highResolutionReady()),
+    });
     kernel_log.writeFmt("clock: pvclock stable-mask=0x{x} online-mask=0x{x}\n", .{ clock.stableCpuMask(), smp.onlineCpuMask() });
     if (highres_ready) {
-        kernel_log.writeFmt("clock: monotonic={s} deadline=lapic high-resolution=1\n", .{
+        kernel_log.writeFmt("clock: monotonic={s} deadline={s} high-resolution=1\n", .{
             if (clock.usesStableKvmClock()) "kvm" else "hpet",
+            if (lapic.highResolutionReady()) "lapic" else "periodic-fallback",
         });
     } else {
-        kernel_log.write("clock: monotonic=tick high-resolution=0\n");
+        kernel_log.writeFmt("clock: monotonic=tick high-resolution=0 bsp-tsc-hz={} rearm=expiry-only\n", .{
+            clock.bootstrapCounterFrequencyHz(),
+        });
     }
     checkpoint('E');
     iommu.init(boot_rsdp_paddr, kernel_runtime.global_free_list, checkpoint);

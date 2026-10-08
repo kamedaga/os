@@ -7,8 +7,9 @@
 
 #include <kobox2/controller.h>
 #include <kobox2/closure_manifest.h>
+#include <stdint.h>
 
-enum { USBD_PACKAGE_ARTIFACTS = 10, USBD_PACKAGE_ITEMS = 13 };
+enum { USBD_PACKAGE_MAX_ARTIFACTS = 64, USBD_PACKAGE_ITEMS = 67 };
 
 struct usbd_package {
     const unsigned char *sandbox;
@@ -16,7 +17,8 @@ struct usbd_package {
     void *sandbox_storage;
     unsigned char manifest[8192], grant[4096];
     size_t manifest_size, grant_size;
-    kb2_closure_manifest_artifact_t artifacts[USBD_PACKAGE_ARTIFACTS];
+    kb2_closure_manifest_t decoded;
+    size_t artifact_count;
     struct ph_bootstrap_item items[USBD_PACKAGE_ITEMS];
     struct ph_package_identity identity;
     struct ph_device_authority device;
@@ -25,7 +27,8 @@ struct usbd_package {
 
 /* The fixed closure is checked against its immutable manifest before any
  * upstream module is initialized. The capsule remains owned by usbd. */
-int usbd_package_open(struct usbd_package *package, int filed_fd, int device_fd);
+int usbd_package_open(struct usbd_package *package, int filed_fd, int device_fd,
+    uint32_t kind);
 int usbd_package_bind(struct usbd_package *package, uint64_t generation);
 int usbd_package_unbind(struct usbd_package *package, uint64_t generation);
 int usbd_package_configure_controller(

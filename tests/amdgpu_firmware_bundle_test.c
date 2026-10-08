@@ -43,6 +43,15 @@ int main(int argc, char **argv)
 
     if (inspect(bytes, (size_t)length, 0, 15))
         return 1;
+    for (size_t i = 0; i < 4; ++i) {
+        const uint64_t invalid_headers[] = {
+            0, 1, sizeof(*bundle) - 1, sizeof(*bundle) + 1,
+        };
+        bundle->header_bytes = invalid_headers[i];
+        if (inspect(bytes, (size_t)length, -EINVAL, 0))
+            return 1;
+    }
+    bundle->header_bytes = sizeof(*bundle);
     digest[0] ^= 1;
     if (ph_firmware_bundle_open(bytes, (size_t)length, digest, files,
                                 &count) != -EBADMSG || count)
@@ -58,7 +67,7 @@ int main(int argc, char **argv)
     bytes[original.offset] ^= 1;
     if (inspect(bytes, (size_t)length, -EBADMSG, 0))
         return 1;
-    puts("AMDGPU_FIRMWARE_BUNDLE=PASS digest traversal overlap file-hash");
+    puts("AMDGPU_FIRMWARE_BUNDLE=PASS extent legacy-rejection digest traversal overlap file-hash");
     free(bytes);
     return 0;
 }

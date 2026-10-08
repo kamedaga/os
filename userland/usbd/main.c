@@ -3,8 +3,13 @@
 #include "package.h"
 #include "input_bridge.h"
 #include "source_client.h"
+#include "media_probe.h"
+#include "install_port.h"
+#include "../kobox2_adapter/block_client.h"
+#include "../kobox2_adapter/block_policy.h"
 #include "../gpud/bootstrap.h"
 #include "../gpud/launch.h"
+#include "../kobox2_owner/boot.h"
 #include "../gpud/lifecycle.h"
 #include "../gpud/process.h"
 #include "../kobox2_adapter/sandbox_config.h"
@@ -50,14 +55,33 @@ static int wait_process(int process_fd) {
     return result > 0 && event.revents ? 0 : -EIO;
 }
 
-static int wait_process_or_tick(int process_fd, int timer_fd) {
-    struct pacha_pollfd events[2] = {
+/* Independent capabilities keep storage maintenance out of input cadence.
+ * Leave lower-priority ready FDs undrained: the next wait sees them again. */
+static int wait_process_or_tick(int process_fd, int timer_fd,
+    int installer_fd, int input_fd) {
+    struct pacha_pollfd events[4] = {
         {.fd = process_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
         {.fd = timer_fd, .events = PACHA_FD_EVENT_READABLE},
+        {.fd = installer_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
+        {.fd = input_fd, .events = PACHA_FD_EVENT_READABLE | PACHA_FD_EVENT_HANGUP},
     };
-    long result = pacha_fd_wait_many(events, 2, PACHA_FD_WAIT_FOREVER);
+    size_t count = 2;
+    const size_t installer_index = count;
+    if (installer_fd >= 16) events[count++] = events[2];
+    const size_t input_index = count;
+    if (input_fd >= 16) events[count++] = events[3];
+    long result = pacha_fd_wait_many(events, count,
+        PACHA_FD_WAIT_FOREVER);
     if (result <= 0) return -EIO;
     if (events[0].revents) return 0;
+    if (installer_fd >= 16 && events[installer_index].revents)
+        return events[installer_index].revents == PACHA_FD_EVENT_READABLE ? 2 : -EPIPE;
+    if (!events[1].revents && input_fd >= 16 && events[input_index].revents) {
+        uint64_t notifications = 0;
+        if (events[input_index].revents != PACHA_FD_EVENT_READABLE) return -EPIPE;
+        return pacha_fd_read(input_fd, &notifications, sizeof(notifications)) ==
+            (long)sizeof(notifications) ? 3 : -EIO;
+    }
     if (events[1].revents != PACHA_FD_EVENT_READABLE) return -EIO;
     uint64_t expirations = 0;
     return pacha_fd_read(timer_fd, &expirations, sizeof(expirations)) ==
@@ -88,10 +112,14 @@ struct usbd_generation {
     struct gpud_lifecycle lifecycle;
     struct usbd_input_bridge input;
     struct usbd_source_client source;
+    struct ph_block_client block;
+    kb2_block_disk_t disks[KB2_BLOCK_DEVICE_MAX_DISKS];
+    size_t disk_count;
 };
 
 static int start_generation(kb2_controller_t *controller, struct usbd_package *package,
-    struct usbd_generation *current, const struct usbd_boot_config *config) {
+    struct usbd_generation *current, const struct usbd_boot_config *config,
+    const kb2_block_disk_t *write_disk) {
     memset(current, 0, sizeof(*current));
     current->id = kb2_controller_generation(controller);
     current->management = (struct pacha_ipc_channel_pair){.a = -1, .b = -1};
@@ -103,73 +131,60 @@ static int start_generation(kb2_controller_t *controller, struct usbd_package *p
     if (error)
         return error;
 
-    const uint64_t channel_rights = PH_IPC_CHANNEL_RIGHTS |
-        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_TRANSFER;
-    error = pacha_ipc_channel_create(&current->management, channel_rights, 0);
-    if (!error)
-        error = ph_ipc_init(&current->ipc, current->management.a, generation);
-    if (error)
-        return error;
-    struct ph_sandbox_config sandbox_config = {.version = PH_SANDBOX_CONFIG_VERSION,
+    struct ph_sandbox_config sandbox_config = {.size = sizeof(struct ph_sandbox_config),
         .identity = package->identity,
-        .artifact_count = USBD_PACKAGE_ARTIFACTS, .resource_count = 1,
+        .artifact_count = package->artifact_count, .resource_count = 1,
         .device = package->device};
-    struct gpud_launch_blob blob = {.bytes = &sandbox_config,
-        .size = sizeof(sandbox_config), .address = PH_SANDBOX_CONFIG_ADDRESS};
-    struct pacha_process_fd_grant grant = {
-        .source_fd = (uint64_t)current->management.b,
-        .target_fd = PH_SANDBOX_CHANNEL_FD, .rights = PH_IPC_CHANNEL_RIGHTS,
-        .flags = PACHA_FD_FLAG_CLOEXEC};
-    struct gpud_launch_request request = {.generation = generation,
-        .load_bias = UINT64_C(0x40000000), .stack_address = UINT64_C(0x45000000),
-        .stack_size = 256 * 1024, .image = package->sandbox,
-        .image_size = package->sandbox_size, .blobs = &blob, .blob_count = 1,
-        .grants = &grant, .grant_count = 1};
-    struct gpud_launch_resources resources = {.generation = generation,
+    const struct ph_block_write_policy block_policy = {
+        .magic = PH_BLOCK_POLICY_MAGIC,
+        .generation = generation,
+        .native_device = package->device.native_device,
+        .enabled = write_disk != NULL,
+        .diskseq = write_disk ? write_disk->diskseq : 0,
+        .major = write_disk ? write_disk->major : 0,
+        .minor = write_disk ? write_disk->minor : 0,
+    };
+    const struct gpud_launch_blob blobs[] = {
+        {.bytes = &block_policy, .size = sizeof(block_policy),
+         .address = PH_BLOCK_POLICY_ADDRESS},
+    };
+    const struct ph_owner_boot_config start = {.controller = controller,
+        .launch = &current->launch, .ipc = &current->ipc,
+        .management = &current->management, .watch = &current->watch,
+        .lifecycle = &current->lifecycle,
         .resource_set_id = USBD_RESOURCE_SET_ID, .sandbox_id = USBD_SANDBOX_ID,
-        .request = &request};
-    memcpy(resources.manifest_digest, package->identity.manifest_digest, 32);
-    struct gpud_launch_transaction transaction = {0};
-    if (gpud_launch_begin(&transaction, controller, &current->launch,
-            &current->ipc, &resources) != KB2_STATUS_OK ||
-        gpud_launch_step(&transaction) != KB2_STATUS_OK || !transaction.completed)
+        .sandbox_config = &sandbox_config, .image = package->sandbox,
+        .image_size = package->sandbox_size, .extra_blobs = blobs, .extra_blob_count = 1,
+        .items = package->items, .artifact_count = package->artifact_count,
+        .resource_count = 1, .log_endpoint_fd = -1};
+    struct ph_owner_boot boot = {0};
+    if (ph_owner_boot_begin(&boot, &start) != KB2_STATUS_OK)
         return -EIO;
-    (void)pacha_fd_close(current->management.b);
-    current->management.b = -1;
-    if (gpud_process_watch_init(&current->watch, controller,
-            &current->launch.process, &current->ipc,
-            USBD_RESOURCE_SET_ID, USBD_SANDBOX_ID) != KB2_STATUS_OK)
-        return -EIO;
-    struct gpud_bootstrap_resources transfer = {.generation = generation,
-        .resource_set_id = USBD_RESOURCE_SET_ID, .sandbox_id = USBD_SANDBOX_ID,
-        .items = package->items, .artifact_count = USBD_PACKAGE_ARTIFACTS,
-        .resource_handle_count = 1};
-    memcpy(transfer.manifest_digest, package->identity.manifest_digest, 32);
-    struct gpud_bootstrap_transfer bootstrap = {0};
-    if (gpud_bootstrap_begin(&bootstrap, controller, &current->ipc,
-            &transfer) != KB2_STATUS_OK)
-        return -EIO;
-    while (!bootstrap.completed) {
-        kb2_status_t status = gpud_bootstrap_step(&bootstrap);
+    while (boot.phase != PH_OWNER_BOOT_COMPLETE) {
+        kb2_status_t status = ph_owner_boot_step(&boot);
         if (status != KB2_STATUS_OK && status != KB2_STATUS_ACTION_PENDING)
             return -EIO;
     }
-    if (gpud_lifecycle_init(&current->lifecycle, &current->watch) != KB2_STATUS_OK)
-        return -EIO;
     for (;;) {
         kb2_status_t status = gpud_lifecycle_ready(&current->lifecycle);
         if (status == KB2_STATUS_OK) {
-            int connected = usbd_input_bridge_open(&current->input, &current->ipc,
-                current->launch.process.fd, generation);
+            int connected = 0;
+            if (config->kind == USBD_KIND_USB_XHCI) {
+                connected = usbd_input_bridge_open(&current->input, &current->ipc,
+                    current->launch.process.fd, generation);
+                if (!connected)
+                    connected = usbd_source_open(&current->source,
+                        (int)config->input_source_endpoint_fd, config->resource_id,
+                        generation, config->pci_segment, config->pci_bus,
+                        config->pci_device, config->pci_function);
+                if (!connected)
+                    connected = usbd_source_sync(&current->source,
+                        &current->input, &current->ipc,
+                        current->launch.process.fd, 0);
+            }
             if (!connected)
-                connected = usbd_source_open(&current->source,
-                    (int)config->input_source_endpoint_fd, config->resource_id,
-                    generation, config->pci_segment, config->pci_bus,
-                    config->pci_device, config->pci_function);
-            if (!connected)
-                connected = usbd_source_sync(&current->source,
-                    &current->input, &current->ipc,
-                    current->launch.process.fd, 0);
+                connected = ph_block_client_open(&current->block,
+                    &current->ipc, current->launch.process.fd, generation);
             return connected;
         }
         if (status != KB2_STATUS_ACTION_PENDING ||
@@ -214,10 +229,12 @@ static int restart_generation(kb2_controller_t *controller,
                 int error = gpud_native_launch_discard(&current->launch, generation);
                 if (!error)
                     error = gpud_lifecycle_release(&current->lifecycle);
-                if (!error)
+                if (!error && current->input.shared)
                     error = usbd_input_bridge_close(&current->input);
-                if (!error)
+                if (!error && current->source.endpoint_fd >= 16)
                     error = usbd_source_close(&current->source);
+                if (!error)
+                    error = ph_block_client_close(&current->block);
                 if (!error)
                     error = ph_ipc_destroy(&current->ipc, generation);
                 if (error)
@@ -248,7 +265,7 @@ static int restart_generation(kb2_controller_t *controller,
 static int run(const struct usbd_boot_config *config) {
     struct usbd_package package = {0};
     int error = usbd_package_open(&package,
-        (int)config->filed_endpoint_fd, (int)config->device_fd);
+        (int)config->filed_endpoint_fd, (int)config->device_fd, config->kind);
     if (error) {
         printf("[usbd] stage=package-open status=%d\n", error);
         return error;
@@ -259,30 +276,90 @@ static int run(const struct usbd_boot_config *config) {
         (error = usbd_package_configure_controller(&package, controller)) ||
         kb2_controller_start(controller) != KB2_STATUS_OK)
         return error ? error : -EIO;
+    struct usbd_install_port install_port = {
+        .fd = config->installer_channel_fd >= 16 ?
+            (int)config->installer_channel_fd : -1,
+        .shared_fd = -1};
+    kb2_block_disk_t write_disk = {0};
     for (;;) {
         static struct usbd_generation current;
-        error = start_generation(controller, &package, &current, config);
+        error = start_generation(controller, &package, &current, config,
+            write_disk.diskseq ? &write_disk : NULL);
         if (error) {
             printf("[usbd] stage=sandbox-ready status=%d\n", error);
             return error;
         }
         if (current.id == 1 && (error = send_ready(config, 0)))
             return error;
-        printf("[usbd] xhci ready generation=%llu modules=%u\n",
-            (unsigned long long)current.id, USBD_PACKAGE_ARTIFACTS - 1);
+        printf("[usbd] %s ready generation=%llu modules=%u\n",
+            config->kind == USBD_KIND_NVME ? "nvme" : "xhci",
+            (unsigned long long)current.id, (unsigned)(package.artifact_count - 1));
         fflush(stdout);
         const uint64_t timer_rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
             PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE;
-        int timer_fd = pacha_timerfd_create(UINT64_C(10000000),
-            UINT64_C(10000000), timer_rights, 0);
+        int timer_fd = pacha_timerfd_create(UINT64_C(1000000000),
+            UINT64_C(1000000000), timer_rights, 0);
         if (timer_fd < 16) return timer_fd < 0 ? timer_fd : -EIO;
+        if (config->kind == USBD_KIND_USB_XHCI) {
+            printf("[usbd] input transport=event-driven frames=preserved\n");
+            fflush(stdout);
+        }
         for (;;) {
-            int wake = wait_process_or_tick(current.launch.process.fd, timer_fd);
+            int wake = wait_process_or_tick(current.launch.process.fd,
+                timer_fd, install_port.fd, current.input.event_fd);
+            if (wake == -EPIPE && install_port.fd >= 16) {
+                /* Loss of the only installer control channel revokes the
+                 * launch-time key before this controller can be reused. */
+                usbd_install_port_close(&install_port);
+                write_disk = (kb2_block_disk_t){0};
+                error = 0;
+                break;
+            }
             if (wake < 0) { error = wake; break; }
             if (wake == 0) break;
-            error = usbd_source_pump(&current.source,
-                &current.input, &current.ipc, current.launch.process.fd);
-            if (error) break;
+            if (wake == 2) {
+                int restart_requested = 0;
+                error = usbd_install_port_pump(&install_port,
+                    &current.block, &current.ipc, current.launch.process.fd,
+                    config->resource_id, &write_disk, &restart_requested);
+                if (error || restart_requested) break;
+                continue;
+            }
+            if (wake == 3) {
+                error = usbd_source_pump(&current.source,
+                    &current.input, &current.ipc, current.launch.process.fd);
+                if (error) break;
+                continue;
+            }
+            if (wake == 1) {
+                size_t count = 0;
+                uint64_t next = 0;
+                error = ph_block_client_snapshot(&current.block, &current.ipc,
+                    current.launch.process.fd, 0, current.disks,
+                    KB2_BLOCK_DEVICE_MAX_DISKS, &count, &next);
+                if (error) break;
+                if (count != current.disk_count) {
+                    printf("[usbd] block devices=%zu generation=%llu%s\n",
+                        count, (unsigned long long)current.id,
+                        next ? " truncated" : "");
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        int install_media = 0;
+                        int gpt_status = usbd_media_probe(&current.block,
+                            &current.ipc, current.launch.process.fd,
+                            &current.disks[i], &install_media);
+                        printf("[usbd] block %s diskseq=%llu bytes=%llu logical=%u ro=%u gpt=%d install_media=%d\n",
+                            current.disks[i].name,
+                            (unsigned long long)current.disks[i].diskseq,
+                            (unsigned long long)current.disks[i].bytes,
+                            current.disks[i].logical_block_size,
+                            current.disks[i].read_only, gpt_status,
+                            install_media);
+                    }
+                    fflush(stdout);
+                    current.disk_count = count;
+                }
+            }
         }
         (void)pacha_fd_close(timer_fd);
         if (error) return error;
@@ -299,9 +376,12 @@ int main(int argc, char **argv) {
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         config.magic != USBD_BOOT_CONFIG_MAGIC ||
-        config.version != USBD_BOOT_CONFIG_VERSION ||
+        config.size != sizeof(config) ||
         config.device_fd < 16 || config.filed_endpoint_fd < 16 ||
-        config.ready_channel_fd < 16 || config.input_source_endpoint_fd < 16 ||
+        config.ready_channel_fd < 16 ||
+        (config.kind != USBD_KIND_USB_XHCI && config.kind != USBD_KIND_NVME) ||
+        (config.kind == USBD_KIND_USB_XHCI && config.input_source_endpoint_fd < 16) ||
+        (config.installer_channel_fd && config.installer_channel_fd < 16) ||
         !config.resource_id || config.pci_device > 31 || config.pci_function > 7)
         return 1;
     int status = run(&config);

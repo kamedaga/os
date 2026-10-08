@@ -6,7 +6,7 @@
 #include <string.h>
 
 lpr_state_t lpr_state;
-static unsigned live[256], cancelled, resumed, unmapped;
+static unsigned live[256], cancelled, unmapped;
 static unsigned fail_install_stage;
 
 void *lpr_memset(void *p, int value, size_t bytes) { return memset(p, value, bytes); }
@@ -71,8 +71,6 @@ int64_t lpr_close_native_fd_if_open(uint64_t fd)
     return lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, fd);
 }
 
-void lpr_file_image_cache_resume(void) { resumed++; }
-
 int lpr_fd_table_unpin(lpr_fd_table_t *table, const lpr_fd_pin_t *pin, lpr_fd_drop_t *drop)
 {
     (void)table; (void)pin; (void)drop;
@@ -107,13 +105,13 @@ int main(void)
     lpr_supervisor_token = 101;
     lpr_exec_transaction_t transaction = {
         .manifest_fd = -1, .cwd_lease_fd = -1, .supervisor_bootstrap_fd = 21,
-        .supervisor_exec_prepared = 1, .file_image_cache_paused = 1,
+        .supervisor_exec_prepared = 1,
     };
     live[21] = 1;
     lpr_destroy_exec_transaction(&transaction);
-    assert(cancelled == 1 && resumed == 1 && !live[21]);
+    assert(cancelled == 1 && !live[21]);
     lpr_destroy_exec_transaction(&transaction);
-    assert(cancelled == 1 && resumed == 1); /* repeated failure cleanup is harmless */
+    assert(cancelled == 1); /* repeated failure cleanup is harmless */
 
     transaction = (lpr_exec_transaction_t){
         .manifest_fd = -1, .cwd_lease_fd = -1, .supervisor_bootstrap_fd = 21,

@@ -10,6 +10,8 @@
 
 struct ph_image ph_core;
 static struct ph_task boot_task;
+/* The boot context: the first Linux task, on the boot thread's own stack. */
+static struct ph_fiber boot_fiber;
 static struct kobox_linux_task_report task_report;
 static void (*service_main)(const struct kobox_linux_task_report *, void *);
 static void *service_context;
@@ -359,8 +361,18 @@ _Noreturn void ph_boot_run(const void *core, size_t size,
     service_main = main;
     service_context = context;
     boot_task.self = &boot_task;
-    boot_task.logical_cpu = -1;
     boot_task.bound = true;
+    extern char ph_boot_stack[];
+    boot_task.stack = ph_boot_stack;
+    /* Same overflow guard as every other fiber: its lowest page. */
+    PH_OK(pacha_syscall3(PACHA_VM_SYSCALL_MPROTECT, (uintptr_t)ph_boot_stack,
+        PH_PAGE_SIZE, 0));
+    boot_fiber.stack = ph_boot_stack + PH_PAGE_SIZE;
+    boot_fiber.stack_size = PH_THREAD_STACK_SIZE - PH_PAGE_SIZE;
+    boot_fiber.state = PH_FIBER_RUNNING;
+    boot_fiber.bound = true;
+    boot_fiber.logical_cpu = -1;
+    boot_task.fiber = &boot_fiber;
     PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_FS_BASE, (uintptr_t)&boot_task));
     boot_task.fault_stack = ph_alloc(PH_THREAD_STACK_SIZE);
     ph_thread_setup(&boot_task);
@@ -379,7 +391,7 @@ _Noreturn void ph_boot_run(const void *core, size_t size,
     ph_machine_init(&ph_core);
     if (prepare)
         prepare(&layout, context);
-    PH_OK(ph_task_ops.cpu_enter(0, &boot_task));
+    PH_OK(ph_task_ops.cpu_enter(0, &boot_fiber));
     PH_OK(ph_task_ops.cpu_irq_disable(0));
     ph_log("PACHA_KOBOX_CORE=START\n");
     int status;

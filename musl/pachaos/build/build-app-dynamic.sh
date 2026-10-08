@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../../.." && pwd)"
 
-runtime_dir="$repo_root/.artifacts/musl-pachaos-runtime"
+runtime_dir="${PACHAOS_MUSL_RUNTIME_DIR:-$repo_root/.artifacts/musl-pachaos-runtime}"
 runtime_install="$runtime_dir/install"
 runtime_lib="$runtime_install/usr/lib"
 out_dir="$repo_root/.artifacts/musl-pachaos-dynamic"
@@ -22,11 +22,31 @@ build_id="$(printf '%s' "$app_out" | sed 's#[^A-Za-z0-9_.-]#_#g')"
 obj_dir="$out_dir/obj/$build_id"
 sysroot="$out_dir/sysroot/$build_id"
 
-if [ ! -f "$runtime_lib/libc.so" ] ||
-   [ ! -f "$runtime_lib/Scrt1.o" ] ||
-   [ ! -f "$runtime_lib/crt1.o" ] ||
-   [ "$upstream/arch/pachaos/syscall_arch.h" -nt "$runtime_lib/libc.so" ] ||
-   [ "$repo_root/musl/pachaos/include/pachaos/abi.h" -nt "$runtime_lib/libc.so" ]; then
+runtime_stale=0
+for runtime_output in libc.so Scrt1.o crt1.o; do
+  [ -f "$runtime_lib/$runtime_output" ] || runtime_stale=1
+done
+for runtime_input in \
+  musl/pachaos/build/build-runtime.sh \
+  musl/pachaos/build/runtime.mk \
+  musl/pachaos/syscall/native.c \
+  musl/pachaos/syscall/syscall_arch.h \
+  musl/pachaos/syscall/native_raw.h \
+  musl/pachaos/syscall/thread_area.c \
+  musl/pachaos/cli/pachaos_cli_shim.c \
+  musl/pachaos/include/pachaos/abi.h \
+  kobox2/protocol/schema/filesystem.json \
+  kobox2/protocol/include/kobox2/filesystem.h \
+  kobox2/protocol/generated/include/kobox2/filesystem_layout.h \
+  kobox2/protocol/src/filesystem.c \
+  userland/filed/src/exec_payload.c \
+  userland/filed/include/filed/payload.h \
+  userland/filed/include/filed/flags.h \
+  userland/filed/include/filed/ipc_protocol.h \
+  userland/libipc/include/pacha/service_abi.h; do
+  [ "$repo_root/$runtime_input" -nt "$runtime_lib/libc.so" ] && runtime_stale=1
+done
+if [ "$runtime_stale" = 1 ]; then
   # The dynamic loader contains the native syscall translation itself. A
   # freshly linked service cannot compensate for a stale loader after an ABI
   # renumbering, even when its own source and link step are current.
@@ -116,7 +136,9 @@ link_flags=(
   -fno-plt
   -mno-red-zone
   -Wl,-e,_start
-  -Wl,--dynamic-linker=/lib/ld-musl-x86_64.so.1
+  # Linux LPR programs retain /lib's Linux syscall ABI. Native applications
+  # must select the PachaOS loader even when both live in the same filesystem.
+  -Wl,--dynamic-linker=/usr/lib/pachaos/ld-musl-x86_64.so.1
   -Wl,-z,common-page-size=4096
   -Wl,-z,max-page-size=4096
   -L "$sysroot/usr/lib"

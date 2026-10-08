@@ -49,7 +49,7 @@ int ph_firmware_bundle_open(const void *mapping, size_t size,
     if (memcmp(digest, expected_sha256, sizeof(digest)))
         return -EBADMSG;
     if (bundle->magic != PH_FIRMWARE_BUNDLE_MAGIC ||
-        bundle->version != PH_FIRMWARE_BUNDLE_VERSION ||
+        bundle->header_bytes != sizeof(*bundle) ||
         bundle->bytes != size || !bundle->count ||
         bundle->count > KOBOX_FIRMWARE_MAX_FILES)
         return -EINVAL;

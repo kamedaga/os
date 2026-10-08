@@ -7,7 +7,6 @@
 #define INPUTD_BOOT_READY_MAGIC UINT64_C(0x3159445254504e49)
 
 enum {
-    INPUTD_BOOT_CONFIG_VERSION = 3,
     INPUTD_BOOT_CONFIG_MAX_BYTES = 4096,
 };
 
@@ -31,7 +30,6 @@ struct inputd_device_config {
  */
 struct inputd_boot_config {
     uint64_t magic;
-    uint32_t version;
     uint32_t header_size;
     uint64_t total_size;
     uint64_t input_endpoint_fd;

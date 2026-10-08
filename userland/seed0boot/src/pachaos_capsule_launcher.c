@@ -70,10 +70,12 @@ static int create_inherited_readonly_vmo(
     return (int)readonly_fd;
 }
 
-int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channel_fd)
+int seed0_launch_storage_boot_nvme(int ready_channel_fd,
+    int root_handoff_channel_fd, int power_channel_fd)
 {
     const struct seed0_init_descriptor_page *desc = seed0_bootstrap_descriptor();
-    if (desc == NULL || ready_channel_fd < 16 || root_handoff_channel_fd < 16)
+    if (desc == NULL || ready_channel_fd < 16 || root_handoff_channel_fd < 16 ||
+        power_channel_fd < 16)
         return -22;
     const long nvme_index = find_nvme_index();
     if (nvme_index < 0) return (int)nvme_index;
@@ -101,12 +103,18 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channe
     struct storage_boot_config config;
     memset(&config, 0, sizeof(config));
     config.magic = STORAGE_BOOT_CONFIG_MAGIC;
-    config.version = STORAGE_BOOT_CONFIG_VERSION;
+    config.size = sizeof(config);
     config.device_fd = (uint64_t)(uint32_t)device_fd;
     config.ready_channel_fd = (uint64_t)(uint32_t)ready_channel_fd;
     config.root_handoff_channel_fd = (uint64_t)(uint32_t)root_handoff_channel_fd;
     config.bootfs_fd = (uint64_t)(uint32_t)bootfs_fd;
     config.bootfs_size = desc->bootfs_archive.size_bytes;
+    config.power_channel_fd = (uint64_t)(uint32_t)power_channel_fd;
+    config.framebuffer_paddr = desc->primary_display.framebuffer_paddr;
+    config.framebuffer_size = desc->primary_display.framebuffer_size_bytes;
+    config.framebuffer_width = desc->primary_display.width;
+    config.framebuffer_height = desc->primary_display.height;
+    config.framebuffer_pitch = desc->primary_display.pitch;
     const int config_fd = create_inherited_vmo(&config, sizeof(config),
         "storage_boot config");
     if (config_fd < 16) {
@@ -124,7 +132,12 @@ int seed0_launch_storage_boot_nvme(int ready_channel_fd, int root_handoff_channe
             PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(root_handoff_channel_fd, root_handoff_channel_fd,
             PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL | PACHA_FD_RIGHT_TRANSFER),
-        PACHA_LAUNCH_GRANT(bootfs_fd, bootfs_fd, PACHA_LAUNCH_BLOB),
+        PACHA_LAUNCH_GRANT(power_channel_fd, power_channel_fd,
+            PACHA_LAUNCH_CLIENT | PACHA_FD_RIGHT_TRANSFER),
+        /* The same read-only archive capability must reach filed through
+         * both boot stages; stripping TRANSFER here prevents that handoff. */
+        PACHA_LAUNCH_GRANT(bootfs_fd, bootfs_fd,
+            PACHA_LAUNCH_BLOB | PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(config_fd, config_fd, PACHA_LAUNCH_BLOB),
     };
     status = seed0_load_elf_process(
@@ -220,7 +233,7 @@ int seed0_launch_live_seed0root(int filed_endpoint_fd, int unix_path_fd,
     if (status != 0) return status;
     const pacha_live_root_bootstrap_t config = {
         .magic = PACHA_LIVE_ROOT_BOOTSTRAP_MAGIC,
-        .version = PACHA_LIVE_ROOT_BOOTSTRAP_VERSION,
+        .size = sizeof(pacha_live_root_bootstrap_t),
         .filed_endpoint_fd = (uint64_t)(uint32_t)filed_endpoint_fd,
         .unix_path_fd = (uint64_t)(uint32_t)unix_path_fd,
         .root_handoff_fd = (uint64_t)(uint32_t)root_handoff_fd,

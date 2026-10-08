@@ -36,6 +36,30 @@ pub const Clock = struct {
 };
 
 var clock: Clock = .{};
+
+// This fallback samples the TSC on the BSP only. Invariant TSC does not by
+// itself prove cross-CPU synchronization, so AP clock reads still consume
+// published ticks; IRQ latency must not be mistaken for elapsed time.
+const BootstrapCounter = struct {
+    frequency_hz: u64 = 0,
+    origin: u64 = 0,
+    epoch_tick: u64 = 0,
+    started: bool = false,
+
+    fn start(self: *BootstrapCounter, value: u64, starting_tick: u64) void {
+        self.origin = value;
+        self.epoch_tick = starting_tick;
+        self.started = self.frequency_hz != 0;
+    }
+
+    fn tick(self: *const BootstrapCounter, value: u64, previous: u64) ?u64 {
+        if (!self.started or self.frequency_hz == 0 or value < self.origin) return null;
+        const elapsed = @as(u128, value - self.origin) * 1000 / self.frequency_hz;
+        const delta: u64 = @intCast(@min(elapsed, std.math.maxInt(u64)));
+        return @max(previous, self.epoch_tick +| delta);
+    }
+};
+var bootstrap_counter: BootstrapCounter = .{};
 const PvTime = extern struct {
     version: u32 = 0,
     pad: u32 = 0,
@@ -54,30 +78,127 @@ const PvSlot = struct {
 var pv_slots: [@import("smp.zig").max_cpus]PvSlot = @splat(.{});
 var pv_enabled: bool = false;
 var highres_realtime_offset_ns: u64 = 0;
-const PvMonotonic = struct {
-    enabled: bool = false,
+
+const runtime_abi = @import("kernel_abi_root").runtime_abi;
+
+/// Kernel-written part of the read-only clock page (runtime_abi clock_page_*).
+/// floor_ns is the kernel's monotonic floor itself, not a copy, so a fast
+/// reader that returns max(ns, floor_ns) never undercuts a kernel result.
+pub const ClockPageHeader = extern struct {
+    fast: u32 = 0,
+    reserved0: u32 = 0,
     pv_origin: u64 = 0,
     ns_origin: u64 = 0,
-    last_ns: u64 = 0,
+    floor_ns: u64 = 0,
+    ceiling_ns: u64 = 0,
+    reserved: [3]u64 = .{ 0, 0, 0 },
+};
+
+/// One whole page: user processes map it read-only, so nothing else may share
+/// it. Only vCPU 0's pvclock lives here; a stable-bit reader may use it from any
+/// CPU (as Linux's vDSO does), and keeping the other vCPUs' records in pv_slots
+/// avoids exposing them and keeps each record on its own cache line.
+const ClockPage = extern struct {
+    header: ClockPageHeader align(64) = .{},
+    pv0: PvTime align(64) = .{},
+    unused: [4096 - 128]u8 = @splat(0),
+};
+var clock_page: ClockPage align(4096) = .{};
+
+comptime {
+    std.debug.assert(@sizeOf(ClockPage) == runtime_abi.clock_page_size);
+    std.debug.assert(@offsetOf(ClockPageHeader, "fast") == runtime_abi.clock_page_fast_offset);
+    std.debug.assert(@offsetOf(ClockPageHeader, "pv_origin") == runtime_abi.clock_page_pv_origin_offset);
+    std.debug.assert(@offsetOf(ClockPageHeader, "ns_origin") == runtime_abi.clock_page_ns_origin_offset);
+    std.debug.assert(@offsetOf(ClockPageHeader, "floor_ns") == runtime_abi.clock_page_floor_ns_offset);
+    std.debug.assert(@offsetOf(ClockPageHeader, "ceiling_ns") == runtime_abi.clock_page_ceiling_ns_offset);
+    std.debug.assert(@offsetOf(ClockPage, "pv0") == runtime_abi.clock_page_pv0_offset);
+    std.debug.assert(@offsetOf(PvTime, "version") == runtime_abi.clock_page_pv_version_offset);
+    std.debug.assert(@offsetOf(PvTime, "tsc_timestamp") == runtime_abi.clock_page_pv_tsc_timestamp_offset);
+    std.debug.assert(@offsetOf(PvTime, "system_time") == runtime_abi.clock_page_pv_system_time_offset);
+    std.debug.assert(@offsetOf(PvTime, "multiplier") == runtime_abi.clock_page_pv_multiplier_offset);
+    std.debug.assert(@offsetOf(PvTime, "shift") == runtime_abi.clock_page_pv_shift_offset);
+    std.debug.assert(@offsetOf(PvTime, "flags") == runtime_abi.clock_page_pv_flags_offset);
+}
+
+fn slotTime(slot: usize) *PvTime {
+    return if (slot == 0) &clock_page.pv0 else &pv_slots[slot].time;
+}
+
+pub fn clockPagePaddr(kernel_pointer_paddr: *const fn (usize) ?u64) ?u64 {
+    return kernel_pointer_paddr(@intFromPtr(&clock_page));
+}
+
+/// How far above the last kernel-published value a fast read may go. A fallback
+/// starts at least at the ceiling, so this also bounds its one forward step.
+/// One 250 Hz tick keeps CLOCK_READ refreshes rare for a busy reader.
+const fast_read_window_ns: u64 = 4_000_000;
+
+/// Fast reads rely on one invariant: ceiling_ns is written only under
+/// publication_lock while the fallback phase is 0. beginFallback clears fast,
+/// then reads the ceiling under that lock, so the value it sees bounds every
+/// ceiling any accepted fast read observed, and it lifts the floor to it before
+/// the HPET anchors are installed from the floor.
+const PvMonotonic = struct {
+    enabled: bool = false,
+    page: *ClockPageHeader = &clock_page.header,
     fallback: HpetFallback = .{},
     publication_lock: u8 = 0,
 
     fn last(self: *const PvMonotonic) u64 {
-        return @atomicLoad(u64, &self.last_ns, .monotonic);
+        return @atomicLoad(u64, &self.page.floor_ns, .monotonic);
+    }
+
+    fn ceiling(self: *const PvMonotonic) u64 {
+        return @atomicLoad(u64, &self.page.ceiling_ns, .acquire);
     }
 
     fn tryPublishPv(self: *PvMonotonic, ns: u64) u64 {
-        if (@cmpxchgStrong(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null)
-            return self.last();
+        if (@cmpxchgStrong(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null) {
+            // Returning only the old floor could undercut a fast read already
+            // returned from this same PV clock. The ceiling clamp keeps the
+            // value at or below where any later fallback starts; the atomic
+            // floor update needs no lock because fallback starts above it.
+            return publishMonotonic(&self.page.floor_ns, @min(ns, self.ceiling()));
+        }
         defer @atomicStore(u8, &self.publication_lock, 0, .release);
         if (self.fallback.state() != 0) return self.last();
-        return publishMonotonic(&self.last_ns, ns);
+        const published = publishMonotonic(&self.page.floor_ns, ns);
+        self.raiseCeilingLocked(published);
+        return published;
+    }
+
+    /// Caller holds publication_lock and has seen fallback phase 0.
+    fn raiseCeilingLocked(self: *PvMonotonic, published: u64) void {
+        if (published +| fast_read_window_ns / 2 <= self.page.ceiling_ns) return;
+        @atomicStore(u64, &self.page.ceiling_ns, published +| fast_read_window_ns, .release);
+    }
+
+    /// Publish the epoch and open fast reads, unless a fallback already began.
+    fn enable(self: *PvMonotonic, pv_origin: u64, ns_origin: u64) void {
+        while (@cmpxchgWeak(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null)
+            std.atomic.spinLoopHint();
+        defer @atomicStore(u8, &self.publication_lock, 0, .release);
+        if (self.fallback.state() != 0) return;
+        self.page.pv_origin = pv_origin;
+        self.page.ns_origin = ns_origin;
+        _ = publishMonotonic(&self.page.floor_ns, ns_origin);
+        self.raiseCeilingLocked(self.last());
+        @atomicStore(bool, &self.enabled, true, .release);
+        @atomicStore(u32, &self.page.fast, 1, .release);
     }
 
     fn beginFallback(self: *PvMonotonic) bool {
         if (@cmpxchgStrong(u8, &self.publication_lock, 0, 1, .acquire, .monotonic) != null)
             return false;
         defer @atomicStore(u8, &self.publication_lock, 0, .release);
+        if (self.fallback.state() != 0) return false;
+        // The sequentially consistent store is a full barrier on x86: a reader
+        // that still sees fast == 1 afterwards loaded its ceiling before this
+        // point, so the ceiling read below is at least that value.
+        @atomicStore(u32, &self.page.fast, 0, .seq_cst);
+        const ceiling_ns = @atomicLoad(u64, &self.page.ceiling_ns, .seq_cst);
+        _ = publishMonotonic(&self.page.floor_ns, ceiling_ns);
         return self.fallback.begin();
     }
 };
@@ -86,8 +207,10 @@ var pv_monotonic: PvMonotonic = .{};
 pub fn kernelStaticStorageEndAddr() usize {
     var end = hpet.staticEnd();
     end = @max(end, @intFromPtr(&clock) + @sizeOf(Clock));
+    end = @max(end, @intFromPtr(&bootstrap_counter) + @sizeOf(BootstrapCounter));
     end = @max(end, @intFromPtr(&pv_slots) + @sizeOf(@TypeOf(pv_slots)));
     end = @max(end, @intFromPtr(&pv_monotonic) + @sizeOf(PvMonotonic));
+    end = @max(end, @intFromPtr(&clock_page) + @sizeOf(ClockPage));
     end = @max(end, @intFromPtr(&pv_enabled) + @sizeOf(bool));
     return @max(end, @intFromPtr(&highres_realtime_offset_ns) + @sizeOf(u64));
 }
@@ -98,19 +221,18 @@ pub fn initializeHighResolution(
     rsdp: u64,
     mmio_allowed: *const fn (u64, u64) bool,
 ) bool {
-    if (!@import("lapic.zig").highResolutionReady() or
-        !hpet.initialize(rsdp, mmio_allowed)) return false;
+    bootstrap_counter.start(readCounter(), @import("scheduler_connection.zig").lapic_tick_count);
+    // A clocksource does not require a calibrated LAPIC clockevent. If PIT
+    // calibration fails, HPET still supplies elapsed time and tick catch-up.
+    if (!hpet.initialize(rsdp, mmio_allowed)) return false;
     const now = hpet.monotonicNs() orelse return false;
     highres_realtime_offset_ns = (unixTimeSeconds() *| 1_000_000_000) -| now;
     const online = @import("smp.zig").onlineCpuMask();
     if (online != 0 and (stableCpuMask() & online) == online) {
-        if (readPvCounter(&pv_slots[0].time, true)) |pv_now| {
+        if (readPvCounter(slotTime(0), true)) |pv_now| {
             // Pair the KVM clock with the existing monotonic epoch. KVM's
             // system_time is not the HPET epoch and must never be returned raw.
-            pv_monotonic.pv_origin = pv_now;
-            pv_monotonic.ns_origin = hpet.monotonicNs() orelse return false;
-            pv_monotonic.last_ns = pv_monotonic.ns_origin;
-            @atomicStore(bool, &pv_monotonic.enabled, true, .release);
+            pv_monotonic.enable(pv_now, hpet.monotonicNs() orelse return false);
         }
     }
     return true;
@@ -153,17 +275,16 @@ const HpetFallback = struct {
 };
 
 fn fallbackMonotonicNs() u64 {
-    const last = @atomicLoad(u64, &pv_monotonic.last_ns, .monotonic);
+    const last = pv_monotonic.last();
     if (pv_monotonic.fallback.state() != 2) return last;
     const raw = hpet.monotonicNs() orelse return last;
-    return publishMonotonic(&pv_monotonic.last_ns,
-        pv_monotonic.fallback.sample(raw, last));
+    return publishMonotonic(&pv_monotonic.page.floor_ns, pv_monotonic.fallback.sample(raw, last));
 }
 
 fn stablePvNs(slot: usize) ?u64 {
     if (!@atomicLoad(bool, &pv_slots[slot].registered, .acquire)) return null;
-    const value = readPvCounter(&pv_slots[slot].time, true) orelse return null;
-    return pvEpochNs(value, pv_monotonic.pv_origin, pv_monotonic.ns_origin);
+    const value = readPvCounter(slotTime(slot), true) orelse return null;
+    return pvEpochNs(value, pv_monotonic.page.pv_origin, pv_monotonic.page.ns_origin);
 }
 
 pub fn monotonicNs() ?u64 {
@@ -183,8 +304,8 @@ pub fn monotonicNs() ?u64 {
         // HPET and PV need not advance at identical rates. Never publish raw
         // HPET into the PV floor and then wait for PV to catch up.
         const raw = hpet.monotonicNs() orelse 0;
-        pv_monotonic.fallback.finish(raw,
-            @atomicLoad(u64, &pv_monotonic.last_ns, .monotonic));
+        // beginFallback already lifted the floor to the fast-read ceiling.
+        pv_monotonic.fallback.finish(raw, pv_monotonic.last());
     }
     return fallbackMonotonicNs();
 }
@@ -235,7 +356,34 @@ pub fn configureCounter(cycles: u64, pit_ticks: u64, pit_hz: u64) void {
     // A variable-rate/stopping TSC cannot be used as an elapsed-time source.
     if (cpuid(0x80000000).eax < 0x80000007 or
         (cpuid(0x80000007).edx & (1 << 8)) == 0) return;
-    clock.frequency_hz = frequencyFromMeasurement(cycles, pit_ticks, pit_hz) orelse 0;
+    const hz = frequencyFromMeasurement(cycles, pit_ticks, pit_hz) orelse 0;
+    clock.frequency_hz = hz;
+    // Independent of RTC readiness and later KVM realtime setup.
+    bootstrap_counter.frequency_hz = hz;
+}
+
+pub fn bootstrapFallbackTick(previous: u64) u64 {
+    std.debug.assert(@import("scheduler_connection.zig").isBootstrapSchedulerCpu());
+    return bootstrap_counter.tick(readCounter(), previous) orelse previous +| 1;
+}
+
+pub fn bootstrapCounterFrequencyHz() u64 {
+    return bootstrap_counter.frequency_hz;
+}
+
+test "BSP fallback clock catches up missed IRQs without AP TSC assumptions" {
+    var source: BootstrapCounter = .{ .frequency_hz = 3_500_000_000 };
+    try std.testing.expect(source.tick(42, 0) == null);
+    source.start(9000, 7);
+    try std.testing.expectEqual(@as(?u64, 7), source.tick(9000, 7));
+    try std.testing.expectEqual(@as(?u64, 8), source.tick(9000 + 3_500_000, 7));
+    try std.testing.expectEqual(@as(?u64, 1007), source.tick(9000 + 3_500_000_000, 8));
+    try std.testing.expectEqual(@as(?u64, 1007), source.tick(9000 + 3_500_000, 1007));
+    try std.testing.expect(source.tick(8999, 1007) == null);
+    source.start(9000, std.math.maxInt(u64) - 1);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), source.tick(9000 + 7_000_000, 0));
+    source.frequency_hz = 0;
+    try std.testing.expect(source.tick(9000, 0) == null);
 }
 
 fn writePvMsr(value: u64) void {
@@ -289,11 +437,12 @@ pub fn registerCpu(slot: usize, kernel_pointer_paddr: *const fn (usize) ?u64) vo
         (cpuid(0x40000001).eax & (1 << 3)) != 0)
     {
         const local = &pv_slots[slot];
-        if (kernel_pointer_paddr(@intFromPtr(&local.time))) |paddr| {
+        const time = slotTime(slot);
+        if (kernel_pointer_paddr(@intFromPtr(time))) |paddr| {
             writePvMsr(paddr | 1);
-            if (readPvCounter(&local.time, false) != null) {
+            if (readPvCounter(time, false) != null) {
                 local.stable = (cpuid(0x40000001).eax & (1 << 24)) != 0 and
-                    readPvCounter(&local.time, true) != null;
+                    readPvCounter(time, true) != null;
                 @atomicStore(bool, &local.registered, true, .release);
                 return;
             }
@@ -319,7 +468,7 @@ pub fn initialize(kernel_pointer_paddr: *const fn (usize) ?u64) void {
     registerCpu(0, kernel_pointer_paddr);
     if (@atomicLoad(bool, &pv_slots[0].registered, .acquire)) {
         const seconds = rtc.unixTimeSeconds();
-        if (readPvCounter(&pv_slots[0].time, false)) |counter| {
+        if (readPvCounter(slotTime(0), false)) |counter| {
             if (seconds != 0) {
                 pv_enabled = true;
                 clock.frequency_hz = 1_000_000_000;
@@ -335,13 +484,19 @@ pub fn initialize(kernel_pointer_paddr: *const fn (usize) ?u64) void {
 
 pub fn updateFromBootstrapTimer() void {
     if (!@atomicLoad(bool, &clock.ready, .acquire)) return;
-    clock.update(if (pv_enabled) readPvCounter(&pv_slots[0].time, false) orelse return else readCounter());
+    clock.update(if (pv_enabled) readPvCounter(slotTime(0), false) orelse return else readCounter());
 }
 
 pub fn unixTimeSeconds() u64 {
     // Preserve the existing RTC behavior when calibration/RTC initialization
     // fails, or neither KVM pvclock nor an invariant TSC is available.
     return clock.read() orelse rtc.unixTimeSeconds();
+}
+
+// Value-only syscall readers may use published seconds without entering the
+// shared CMOS index/data transaction. An absent value requires the old lock.
+pub fn publishedUnixTimeSeconds() ?u64 {
+    return clock.read();
 }
 
 pub fn counterFrequencyHz() u64 {
@@ -434,19 +589,117 @@ test "HPET fallback rebases once without exposing a faster clock epoch" {
 }
 
 test "PV sample cannot publish after HPET rebase or spin in an interrupt" {
-    var time: PvMonotonic = .{ .last_ns = 1000 };
+    var header: ClockPageHeader = .{ .floor_ns = 1000, .ceiling_ns = 1000 };
+    var time: PvMonotonic = .{ .page = &header };
     const in_flight_pv = 2000;
     try std.testing.expect(time.beginFallback());
     time.fallback.finish(9_000_000_000, time.last());
     try std.testing.expectEqual(@as(u64, 1000), time.tryPublishPv(in_flight_pv));
     try std.testing.expectEqual(@as(u64, 1000), time.last());
 
-    time = .{ .last_ns = 1000, .publication_lock = 1 };
-    try std.testing.expectEqual(@as(u64, 1000), time.tryPublishPv(in_flight_pv));
+    header = .{ .floor_ns = 1000, .ceiling_ns = 1000 + fast_read_window_ns };
+    time = .{ .page = &header, .publication_lock = 1 };
     try std.testing.expect(!time.beginFallback());
     time.publication_lock = 0;
     try std.testing.expectEqual(@as(u64, 2000), time.tryPublishPv(in_flight_pv));
     try std.testing.expect(time.beginFallback());
     time.fallback.finish(9_000_000_000, time.last());
-    try std.testing.expectEqual(@as(u64, 2000), time.fallback.sample(9_000_000_000, time.last()));
+    // The fallback starts at the fast-read ceiling, not at the last PV value.
+    try std.testing.expectEqual(@as(u64, 1000 + fast_read_window_ns), time.fallback.sample(9_000_000_000, time.last()));
+}
+
+/// Model of the user reader (userland/kobox2_adapter/clock_page.h) for one
+/// already-validated pv0 counter value: fast, ceiling and floor are loaded
+/// before the value is accepted, and fast is checked again afterwards.
+fn modelFastRead(page: *const ClockPageHeader, pv: u64) ?u64 {
+    if (@atomicLoad(u32, &page.fast, .acquire) != 1) return null;
+    const ceiling = @atomicLoad(u64, &page.ceiling_ns, .acquire);
+    const floor = @atomicLoad(u64, &page.floor_ns, .acquire);
+    const ns = pvEpochNs(pv, page.pv_origin, page.ns_origin) orelse return null;
+    if (ns > ceiling) return null;
+    const result = @max(ns, floor);
+    if (@atomicLoad(u32, &page.fast, .acquire) != 1) return null;
+    return result;
+}
+
+test "clock page opens fast reads only with a ceiling above the floor" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(50_000, 1_000_000);
+    try std.testing.expectEqual(@as(u32, 1), header.fast);
+    try std.testing.expectEqual(@as(u64, 1_000_000), header.floor_ns);
+    try std.testing.expectEqual(@as(u64, 1_000_000 + fast_read_window_ns), header.ceiling_ns);
+    // pv 50_000 + 2_000 maps to ns_origin + 2_000.
+    try std.testing.expectEqual(@as(?u64, 1_002_000), modelFastRead(&header, 52_000));
+    // Beyond the ceiling the reader must take CLOCK_READ instead.
+    try std.testing.expect(modelFastRead(&header, 50_000 + fast_read_window_ns + 1) == null);
+    // Kernel publication keeps floor <= ceiling and moves the ceiling ahead.
+    const published = time.tryPublishPv(1_000_000 + 3 * fast_read_window_ns / 4);
+    try std.testing.expect(header.floor_ns == published and header.floor_ns < header.ceiling_ns);
+    try std.testing.expectEqual(published + fast_read_window_ns, header.ceiling_ns);
+}
+
+test "contended PV publication never undercuts an earlier fast read (counterexample A)" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(0, 1_000);
+    const fast = modelFastRead(&header, 2_000).?; // floor 1_000 < fast 3_000
+    try std.testing.expectEqual(@as(u64, 3_000), fast);
+    time.publication_lock = 1; // another CPU publishes or enters fallback
+    const later = time.tryPublishPv(3_500);
+    try std.testing.expect(later >= fast);
+    try std.testing.expect(header.floor_ns >= later);
+    // A contended value far in the future is clamped to the ceiling, so it
+    // cannot exceed where a fallback would start.
+    const clamped = time.tryPublishPv(header.ceiling_ns + 99);
+    try std.testing.expectEqual(header.ceiling_ns, clamped);
+}
+
+test "fallback entry never returns below an accepted fast read (counterexample B)" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(0, 1_000);
+    const fast = modelFastRead(&header, fast_read_window_ns - 1).?; // ns = ceiling - 1
+    try std.testing.expect(time.beginFallback());
+    // Phase 1 and HPET-unavailable readers return the floor.
+    try std.testing.expectEqual(@as(u64, 1), time.fallback.state());
+    try std.testing.expect(time.last() >= fast);
+    try std.testing.expectEqual(@as(u32, 0), header.fast);
+    try std.testing.expect(modelFastRead(&header, 1_000) == null);
+    time.fallback.finish(77, time.last());
+    try std.testing.expect(time.fallback.sample(77, time.last()) >= fast);
+    try std.testing.expect(time.fallback.sample(78, time.last()) > fast);
+}
+
+test "fast reads cannot reopen after a fallback began (counterexample C)" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    try std.testing.expect(time.beginFallback());
+    time.enable(0, 1_000);
+    try std.testing.expectEqual(@as(u32, 0), header.fast);
+    try std.testing.expect(!time.enabled);
+    try std.testing.expect(modelFastRead(&header, 2_000) == null);
+}
+
+test "ceiling seen by a completed fast read bounds the fallback anchor" {
+    var header: ClockPageHeader = .{};
+    var time: PvMonotonic = .{ .page = &header };
+    time.enable(0, 1_000);
+    // Reader samples its ceiling, then the kernel raises it and falls back.
+    const seen_ceiling = header.ceiling_ns;
+    const fast = modelFastRead(&header, seen_ceiling - 1_000).?;
+    _ = time.tryPublishPv(1_000 + fast_read_window_ns);
+    try std.testing.expect(header.ceiling_ns >= seen_ceiling);
+    try std.testing.expect(time.beginFallback());
+    time.fallback.finish(5, time.last());
+    try std.testing.expect(time.last() >= header.ceiling_ns);
+    try std.testing.expect(time.fallback.sample(5, time.last()) >= fast);
+}
+
+test "clock page is one exclusive page holding only vCPU 0's pvclock" {
+    // slotTime(0) is &clock_page.pv0 by construction; other slots stay in
+    // pv_slots (not referenced here, it would pull smp.zig into this test).
+    try std.testing.expectEqual(@as(usize, 0), @intFromPtr(&clock_page) % 4096);
+    try std.testing.expectEqual(@as(usize, 4096), @sizeOf(@TypeOf(clock_page)));
+    try std.testing.expectEqual(@as(usize, 64), @intFromPtr(&clock_page.pv0) - @intFromPtr(&clock_page));
 }

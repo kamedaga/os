@@ -5,7 +5,6 @@
 enum {
     PACHA_ROOT_READY_MAGIC = 0x3159445252545330ull,
     PACHA_ROOT_HANDOFF_MAGIC = 0x32464f444e414852ull,
-    PACHA_ROOT_HANDOFF_VERSION = 2,
     /* One VMO plus these Device FDs fits the IPC transfer limit. This is a
      * batch size, not a total device count. */
     PACHA_ROOT_HANDOFF_BATCH_DEVICES = 18,
@@ -27,7 +26,7 @@ struct pacha_root_device_record {
 
 struct pacha_root_handoff {
     uint64_t magic;
-    uint64_t version;
+    uint64_t size;
     uint64_t device_count;
     uint64_t flags;
     struct pacha_root_device_record devices[PACHA_ROOT_HANDOFF_BATCH_DEVICES];

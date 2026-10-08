@@ -12,7 +12,7 @@ int64_t lpr_linux_readv(uint64_t fd, uint64_t iov, uint64_t iov_count);
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset);
 int64_t lpr_linux_pread_to_vmo(uint64_t fd, uint64_t vmo_fd, uint64_t vmo_offset, uint64_t count, uint64_t file_offset);
-int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, uint64_t *out_loaded);
+int64_t lpr_linux_file_vmo(uint64_t fd, uint64_t file_offset, uint64_t length, int executable, uint64_t *out_loaded);
 int64_t lpr_linux_write(uint64_t fd, uint64_t buf, uint64_t count);
 int64_t lpr_linux_writev(uint64_t fd, uint64_t iov, uint64_t iov_count);
 int64_t lpr_linux_close(uint64_t fd);
@@ -80,6 +80,5 @@ uint32_t lpr_linux_tty_poll_events(uint64_t fd, uint32_t events);
 int lpr_linux_pipe_fd_active(uint64_t fd);
 uint32_t lpr_linux_pipe_poll_events(uint64_t fd, uint32_t events);
 void lpr_linux_ensure_default_stdio(void);
-void lpr_linux_readv_cache_trace_dump(void);
 
 #endif

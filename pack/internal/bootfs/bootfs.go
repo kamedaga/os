@@ -15,7 +15,6 @@ import (
 
 const (
 	magic          = 0x53465442
-	version        = 1
 	kindRegular    = 1
 	flagExecutable = 1 << 0
 	dataAlign      = 16
@@ -32,6 +31,7 @@ type Result struct {
 
 type Options struct {
 	Progress progress.Reporter
+	Storage  *StorageOptions
 }
 
 type entry struct {
@@ -77,6 +77,18 @@ func BuildImageWithOptions(manifestPath string, outputPath string, opts Options)
 			SourcePath: spec.SourcePath,
 			Data:       data,
 		})
+	}
+	if opts.Storage != nil {
+		policy, err := storageEntries(*opts.Storage)
+		if err != nil {
+			return Result{}, err
+		}
+		for _, existing := range items {
+			if existing.ImagePath == "/etc/pacha/root-uuid" || existing.ImagePath == "/etc/pacha/storage-policy" {
+				return Result{}, fmt.Errorf("storage launch policy must be generated from the configured disk")
+			}
+		}
+		items = append(items, policy...)
 	}
 	span.Set(int64(len(items)+1), "rendering bootfs image")
 	sort.Slice(items, func(i, j int) bool { return items[i].ImagePath < items[j].ImagePath })
@@ -134,8 +146,9 @@ func render(items []entry) ([]byte, error) {
 	}
 	image := make([]byte, cursor)
 	binary.LittleEndian.PutUint32(image[0:4], magic)
-	binary.LittleEndian.PutUint16(image[4:6], version)
-	binary.LittleEndian.PutUint16(image[6:8], headerBytes)
+	// The complete header extent is encoded directly; readers reject layouts
+	// whose metadata does not describe this record, without version aliases.
+	binary.LittleEndian.PutUint32(image[4:8], headerBytes)
 	binary.LittleEndian.PutUint64(image[8:16], uint64(len(image)))
 	binary.LittleEndian.PutUint32(image[16:20], uint32(len(items)))
 	binary.LittleEndian.PutUint32(image[20:24], uint32(entryBytes*len(items)))

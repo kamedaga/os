@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 out=.artifacts/tests/lpr-shared-vmo-rpc
 mkdir -p "$out"
-includes=()
+includes=(-Ikobox2/protocol/include -Ikobox2/protocol/generated/include -Iuserland)
 for module in libipc libpacha personality daemons/common filed termd gpud inputd netd unixd lpr_supervisor; do
   includes+=("-Iuserland/$module/include")
 done

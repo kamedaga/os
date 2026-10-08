@@ -178,7 +178,7 @@ static int termd_send_tty_signal_to_supervisor(termd_service_t *service, uint32_
     pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = LPRS_SERVICE_ID;
     header->op = LPRS_OP_SIGNAL_DELIVER_TTY;
     header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
@@ -223,6 +223,7 @@ static int termd_send_tty_signal_to_supervisor(termd_service_t *service, uint32_
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
         reply.word3 != request.word3 ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        reply_header->header_size != sizeof(*reply_header) ||
         reply_header->request_id != request.word3)
     {
         (void)pacha_munmap(page, PACHA_SERVICE_PAGE_BYTES);

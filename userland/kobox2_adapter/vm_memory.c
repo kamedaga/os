@@ -130,7 +130,7 @@ bool ph_vm_read_executable(const struct ph_vm_space *space, uint64_t address,
         }
         uint64_t physical = mapping->physical + cursor - mapping->start;
 
-        PH_CHECK(physical <= PH_RAM_SIZE && count <= PH_RAM_SIZE - physical);
+        PH_CHECK(physical <= ph_core.ram_size && count <= ph_core.ram_size - physical);
         memcpy((char *)bytes + copied, (char *)ph_core.direct + physical, count);
         copied += count;
     }
@@ -270,7 +270,7 @@ int ph_vm_map_pages(void *opaque, uint64_t address, uint64_t physical,
     struct ph_vm_space *space = opaque;
 
     if (!valid_range(space, address, length) || (physical & (PH_PAGE_SIZE - 1)) ||
-        physical > PH_RAM_SIZE || length > PH_RAM_SIZE - physical ||
+        physical > ph_core.ram_size || length > ph_core.ram_size - physical ||
         (protection & ~(KOBOX_VM_READ | KOBOX_VM_WRITE | KOBOX_VM_EXECUTE))) {
         return -EINVAL;
     }

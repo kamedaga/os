@@ -27,7 +27,7 @@ enum lpr_coordinator_status {
 
 struct lpr_coordinator_request {
     uint64_t magic;
-    uint32_t version;
+    uint32_t size;
     uint32_t op;
     uint64_t pid;
     uint64_t tid;
@@ -39,7 +39,7 @@ struct lpr_coordinator_request {
 
 struct lpr_coordinator_response {
     uint64_t magic;
-    uint32_t version;
+    uint32_t size;
     uint32_t status;
     uint64_t value0;
     uint64_t value1;

@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const kernel_log = @import("../kernel_log.zig");
 const x86_platform = @import("../arch/x86_64/platform.zig");
 const types = @import("types.zig");
+var backing_failure_diagnosed: u8 = 0;
 const capsule = types.capsule;
 const initial_process_count = types.initial_process_count;
 const initial_process_capacity = types.initial_process_capacity;
@@ -453,7 +454,7 @@ pub fn copyForkAnonymousPresentPageToChild(
     if (!@TypeOf(self.*).copyPhysicalPage(copied_paddr, src_paddr)) return KernelError.InvalidState;
     self.ensureEntryCowTable(dest_entry, free_list) catch return KernelError.TableFull;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(dest_entry, va) orelse return KernelError.InvalidState;
-    self.setNativeCowPagePaddr(dest_entry.cow_table, cow_page, copied_paddr) catch return KernelError.TableFull;
+    try self.setNativeCowPagePaddr(dest_entry.cow_table, cow_page, copied_paddr, free_list);
     installed = true;
 }
 
@@ -539,8 +540,9 @@ pub fn nativeVmaDmaPinMode(
     if (!@TypeOf(self.*).isPageAligned(page_va)) return null;
     const entry = self.vmaEntryForVaConst(owner, page_va) orelse return null;
     const backing = self.nativeVmoSlotConst(entry.vmo) orelse return null;
-    // Peer BAR memory is not ordinary RAM eligible for DMA page pinning.
-    if (backing.kind == .device_memory) return null;
+    // Peer BAR memory is not ordinary RAM eligible for DMA page pinning, and
+    // the kernel clock page must never become a device-visible IOMMU target.
+    if (backing.kind == .device_memory or backing.kind == .kernel_page) return null;
     if (!entry.prot.read or (device_writes and !entry.prot.write)) return null;
     if (!entry.prot.write) return .read_only;
     if (entry.flags.private and
@@ -637,6 +639,7 @@ pub fn commitNativeVmaFaultMapping(
     owner: PrincipalId,
     plan: NativeVmaFaultPlan,
     candidate_paddr: u64,
+    free_list: ?*FreePageList,
 ) ?NativeVmaFaultMapping {
     if (plan.kind != .allocate_zero or candidate_paddr == 0 or (candidate_paddr & 0xFFF) != 0) return null;
     const table = self.getVmaTable(owner) orelse return null;
@@ -654,15 +657,32 @@ pub fn commitNativeVmaFaultMapping(
     if (paddr == 0) {
         if (!entry.flags.anonymous and !self.nativeVmoIsZeroOnDemand(entry.vmo)) return null;
         var page = [_]u64{candidate_paddr};
-        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..]) catch |err| {
+        self.installNativeVmoPages(entry.vmo, @intCast(vmo_page), page[0..], free_list) catch |err| {
             // Host unit tests intentionally exhaust this table; port I/O is
             // available only in the guest. Keep the field diagnostic there.
             if (!builtin.is_test) {
                 const slot = self.nativeVmoSlotConst(entry.vmo);
+                const store = types.vmObjectBackingStoreStats();
                 kernel_log.writeFmt(
-                    "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s}\n",
-                    .{ @intFromEnum(owner), plan.fault_page_va, vmo_page, if (slot) |vmo| vmo.page_count else 0, @errorName(err) },
+                    "vm: fault install failed principal={} va=0x{x} page={} vmo_pages={} error={s} store_used={} store_capacity={} store_free={}\n",
+                    .{ @intFromEnum(owner), plan.fault_page_va, vmo_page, if (slot) |vmo| vmo.page_count else 0, @errorName(err), store.used_entries, store.capacity, store.free_entries },
                 );
+                // A single failure census separates live backing from stale
+                // owners without repeatedly scanning a full table on retries.
+                if (@cmpxchgStrong(u8, &backing_failure_diagnosed, 0, 1, .monotonic, .monotonic) == null) {
+                    const census = types.vmObjectBackingStoreBreakdown(&self.native_vmos);
+                    kernel_log.writeFmt(
+                        "vm: backing census native={} cow={} invalid_native={} demand_zero={} live_vmos={} live_demand_zero={} anonymous_logical_pages={} anonymous={} views={}\n",
+                        .{ census.native_entries, census.cow_entries, census.invalid_native_entries, census.demand_zero_entries, census.live_vmos, census.live_demand_zero_vmos, census.anonymous_logical_pages, census.anonymous_entries, census.page_view_entries },
+                    );
+                    for (census.largest) |heavy| {
+                        if (heavy.entries == 0) continue;
+                        kernel_log.writeFmt(
+                            "vm: backing owner token=0x{x} entries={} pages={} refs={} kind={s} parent={}:{}\n",
+                            .{ heavy.owner, heavy.entries, heavy.pages, heavy.refs, @tagName(heavy.kind), heavy.parent.index, heavy.parent.generation },
+                        );
+                    }
+                }
             }
             return null;
         };
@@ -713,7 +733,7 @@ pub fn replaceVmaPageWithAnonymousPrivatePage(
     try self.retainNativeVmo(private_vmo);
     errdefer self.releaseNativeVmoWithFreeList(private_vmo, free_list);
     var page = [_]u64{new_paddr};
-    try self.installNativeVmoPages(private_vmo, 0, page[0..]);
+    try self.installNativeVmoPages(private_vmo, 0, page[0..], free_list);
 
     if (has_before) try self.retainNativeVmo(original.vmo);
     errdefer if (has_before) self.releaseNativeVmo(original.vmo);
@@ -868,7 +888,7 @@ pub fn commitNativeVmaCowMapping(
     if (!self.nativeCowTableIsUnique(entry.cow_table)) return null;
     const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, plan.fault_page_va) orelse return null;
     if (cow_page != plan.cow_page_index and !plan.cow_table.isNull()) return null;
-    self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr) catch |err| {
+    self.setNativeCowPagePaddr(entry.cow_table, cow_page, candidate_paddr, free_list) catch |err| {
         if (!builtin.is_test) {
             kernel_log.writeFmt(
                 "cow: commit failure stage=install_page err={s} vma_start=0x{x} cow_page={}\n",
@@ -957,7 +977,7 @@ pub fn ensureNativeVmaCowMappingLockedSlow(
         }
         self.ensureEntryCowTable(entry, free_list) catch return null;
         const cow_page = @TypeOf(self.*).entryCowPageIndex(entry, fault_page_va) orelse return null;
-        self.setNativeCowPagePaddr(entry.cow_table, cow_page, new_paddr) catch return null;
+        self.setNativeCowPagePaddr(entry.cow_table, cow_page, new_paddr, free_list) catch return null;
         installed = true;
         return .{
             .paddr = new_paddr,
@@ -1389,6 +1409,31 @@ pub fn createAnonymousVmoFd(
     };
 }
 
+/// Install a new read-only FD for the kernel clock page. Each FD owns one
+/// kernel object and one VMO reference; the VMO itself is shared and kept alive
+/// by the kernel's permanent reference.
+pub fn openKernelClockPageFd(
+    self: anytype,
+    owner: PrincipalId,
+    paddr: u64,
+    flags: FdFlags,
+    min_fd: Fd,
+    free_list: ?*FreePageList,
+) KernelError!Fd {
+    try self.requireActiveProcess(owner);
+    const vmo_ref = try self.kernelClockPageVmo(paddr, free_list);
+    try self.retainNativeVmo(vmo_ref);
+    const object_ref = self.createKernelObject(.vmo, .{ .vmo = vmo_ref }) catch |err| {
+        self.releaseNativeVmo(vmo_ref);
+        return err;
+    };
+    const rights: FdRights = .{ .inspect = true, .close = true, .map_read = true, .dup = true, .transfer = true };
+    return self.installFd(owner, object_ref, rights, flags, min_fd) catch |err| {
+        if (self.kernelObjectSlot(object_ref)) |slot| self.clearKernelObjectSlot(slot);
+        return err;
+    };
+}
+
 pub fn createAnonymousVmoFdWithPages(
     self: anytype,
     owner: PrincipalId,
@@ -1419,7 +1464,7 @@ pub fn createAnonymousVmoFdWithPages(
         // the separate contiguous DMA pool and kernel bootstrap structures.
         pages[allocated] = (try self.allocPhysicalPage(free_list)).paddr;
     }
-    try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated]);
+    try self.installNativeVmoPages(vmo_ref, 0, pages[0..allocated], free_list);
     return fd;
 }
 
@@ -1466,7 +1511,7 @@ pub fn createContiguousVmoFdWithPages(
         paddr.* = base + (@as(u64, @intCast(page_index)) * native_page_size);
         try self.zeroAllocatedPage(paddr.*);
     }
-    try self.installNativeVmoPages(vmo_ref, 0, pages[0..page_count]);
+    try self.installNativeVmoPages(vmo_ref, 0, pages[0..page_count], free_list);
     return fd;
 }
 
@@ -1639,8 +1684,9 @@ fn validateRamAdmission(self: anytype, ref: NativeVmoRef, offset: u64, bytes: u6
     const copy = @import("../user_copy.zig");
     if (!copy.hasRamCachePolicyLocked()) return;
     const slot = self.nativeVmoSlotConst(ref) orelse return KernelError.InvalidState;
-    // BAR authority and cache proof remain in device-memory admission.
-    if (slot.kind == .device_memory) return;
+    // BAR authority and cache proof remain in device-memory admission; the
+    // kernel clock page is never subject to RAM cache policy.
+    if (slot.kind == .device_memory or slot.kind == .kernel_page) return;
     const shadow = slot.kind == .anonymous and !slot.backing.parent.ref.isNull();
     const end = try @TypeOf(self.*).checkedEnd(offset, bytes);
     var position = offset;
@@ -1662,7 +1708,7 @@ test "MMIO overlay RAM VMA admission checks only resolved target PFNs including 
     const Fixture = struct {
         shadow: bool = false,
         const Slot = struct {
-            kind: enum { anonymous, device_memory } = .anonymous,
+            kind: enum { anonymous, device_memory, kernel_page } = .anonymous,
             backing: struct { parent: struct { ref: NativeVmoRef } },
         };
         pub fn nativeVmoSlotConst(self: @This(), _: NativeVmoRef) ?Slot {
@@ -1695,6 +1741,15 @@ test "MMIO overlay RAM VMA admission checks only resolved target PFNs including 
     try std.testing.expectError(KernelError.InvalidState, validateRamAdmission(&f, ref, 4096, 4096, .{ .read = true }, .{ .shared = true }));
 }
 
+/// The kernel clock page is published by the kernel and KVM. A private
+/// mapping would copy it on a write fault and a writable/executable one would
+/// let user code alter or run kernel-image memory, so only a shared read-only
+/// view is accepted, independent of the FD rights that produced it.
+pub fn kernelPageMappingAllowed(prot: VmaProt, max_prot: VmaProt, flags: MmapFlags) bool {
+    return flags.shared and !flags.private and !flags.anonymous and !flags.fork_cow and
+        !prot.write and !prot.exec and !max_prot.write and !max_prot.exec;
+}
+
 pub fn createVmaWithRetainedVmo(
     self: anytype,
     owner: PrincipalId,
@@ -1717,6 +1772,8 @@ pub fn createVmaWithRetainedVmo(
     if (!@TypeOf(self.*).vmaProtAllowedByMax(prot, max_prot)) return KernelError.InvalidState;
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
+        return KernelError.InvalidState;
+    if (vmo.kind == .kernel_page and !kernelPageMappingAllowed(prot, max_prot, flags))
         return KernelError.InvalidState;
 
     try validateRamAdmission(self, vmo_ref, vmo_offset, size_bytes, prot, flags);
@@ -2124,6 +2181,8 @@ pub fn prepareFixedFdMmapIntoProcess(
     if (vmo.kind == .page_view and
         (!flags.shared or flags.private or flags.anonymous or prot.exec or max_prot.exec))
         return KernelError.InvalidState;
+    if (vmo.kind == .kernel_page and !kernelPageMappingAllowed(prot, max_prot, flags))
+        return KernelError.InvalidState;
     // Ordinary shared VMOs still promise full backing. Only explicit
     // zero-on-demand objects may defer allocation until after replacement.
     try validateRamAdmission(self, vmo_ref, vmo_offset, size_bytes, prot, flags);
@@ -2501,7 +2560,7 @@ pub fn prepareMremapWithFreeList(
                 return KernelError.InvalidState;
             }
             var page = [_]u64{dst_paddr};
-            self.installNativeVmoPages(dst_vmo, page_index, page[0..]) catch |err| {
+            self.installNativeVmoPages(dst_vmo, page_index, page[0..], free_list) catch |err| {
                 free_list.appendPage(0, dst_paddr) catch {};
                 return err;
             };

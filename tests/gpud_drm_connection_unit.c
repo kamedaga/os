@@ -1,13 +1,28 @@
+#if defined(GPUD_DRM_STACK_BUDGET)
+#define _GNU_SOURCE
+#endif
 #include <assert.h>
-#include "../userland/gpud/drm_service.c"
+#if defined(GPUD_DRM_STACK_BUDGET)
+#include <pthread.h>
+#endif
+#ifndef GPUD_DRM_SERVICE_SOURCE
+#define GPUD_DRM_SERVICE_SOURCE "../userland/gpud/drm_service.c"
+#endif
+#include GPUD_DRM_SERVICE_SOURCE
 
 static char diagnostic[256];
+static unsigned int observed_phases;
 int pacha_log_emit(int endpoint_fd, unsigned source, const char *message, size_t length)
 {
     assert(endpoint_fd == 29 && source == PACHA_LOG_SOURCE_GPUD);
     assert(length < sizeof(diagnostic));
     memcpy(diagnostic, message, length);
     diagnostic[length] = 0;
+    if (strstr(diagnostic, "phase=acquire status=0")) observed_phases |= 1;
+    if (strstr(diagnostic, "phase=encode status=0")) observed_phases |= 2;
+    if (strstr(diagnostic, "phase=wire status=0")) observed_phases |= 4;
+    if (strstr(diagnostic, "phase=transport status=0")) observed_phases |= 8;
+    if (strstr(diagnostic, "phase=transport-return status=0")) observed_phases |= 16;
     return 0;
 }
 
@@ -15,10 +30,174 @@ static unsigned char page[GPUD_DRM_PAGE_BYTES];
 static unsigned char auxiliary[GPUD_DRM_AUX_REUSE_BYTES];
 static uint64_t auxiliary_size = sizeof(auxiliary), auxiliary_rights;
 static int auxiliary_map_failure, gpu_calls, output_request, fence_request, fence_waits;
+static int resources_request;
 static struct pacha_ipc_msg queued;
 static struct pacha_ipc_fd queued_fds[PACHA_IPC_MAX_TRANSFER_FDS];
 static int maps, unmaps, closes, replies, ready_fd, hungup_fd, map_failure, unmap_failure, close_failure;
 static struct pacha_ipc_msg last_reply;
+
+static void bounded_startup_journal(void)
+{
+    static struct gpud_drm_service service;
+    service.profile_kind = KB2_GPU_PROFILE_AMDGPU;
+    service.log_endpoint_fd = 29;
+    service.files.generation = 9;
+    gpud_drm_ioctl_request_t request = {.handle = 17,
+        .request = GPUD_DRM_IOCTL_MODE_GETRESOURCES,
+        .arg_size = 64, .data_size = 256};
+    pacha_service_envelope_t header = {.op = GPUD_DRM_OP_HANDLE_IOCTL,
+        .payload_size = sizeof(request)};
+    assert(log_request_begin(&service, &header, &request) == 1);
+    assert(strstr(diagnostic, "DRM request begin seq=1 generation=9"));
+    assert(strstr(diagnostic, "handle=17 ioctl=0xc04064a0 arg=64 wire=256 aux=0"));
+    header = (pacha_service_envelope_t){.op = GPUD_DRM_OP_HELLO};
+    uint64_t result = 0;
+    struct gpud_drm_reply_transfer transfer = {0};
+    assert(dispatch(&service, &header, NULL, &result, &transfer, 0) == -EINVAL);
+    assert(strstr(diagnostic, "DRM request end seq=2 generation=9"));
+    assert(strstr(diagnostic, "status=-22"));
+    for (unsigned int i = 3; i <= 64; i++)
+        assert(log_request_begin(&service, &header, NULL) == i);
+    assert(strstr(diagnostic, "startup-log-limit=64"));
+    assert(!log_request_begin(&service, &header, NULL));
+    assert(service.startup_requests_logged == 64);
+    assert(strstr(diagnostic, "startup-log-limit=64"));
+    service.startup_requests_logged = 0;
+    service.profile_kind = KB2_GPU_PROFILE_VIRGL;
+    assert(!log_request_begin(&service, &header, NULL));
+}
+
+static void prime_profile_admission(void)
+{
+    static struct gpud_drm_service service;
+    const unsigned profiles[] = {KB2_GPU_PROFILE_VIRGL, KB2_GPU_PROFILE_AMDGPU};
+    uint64_t result = 0;
+    struct gpud_drm_reply_transfer transfer = {0};
+    for (size_t i = 0; i < 2; ++i) {
+        service.profile_kind = profiles[i];
+        service.files.generation = 1;
+        service.received.fd_count = 2;
+        gpud_drm_prime_export_request_t export = {0};
+        pacha_service_envelope_t header = {.op = GPUD_DRM_OP_PRIME_EXPORT,
+            .payload_size = sizeof(export)};
+        /* A missing GEM handle is an invalid request for either profile,
+         * not evidence that the GPU cannot share images. */
+        assert(dispatch_request(&service, &header, &export, &result,
+            &transfer, 0) == -EINVAL);
+        gpud_drm_prime_import_request_t import = {.token = 1};
+        header.op = GPUD_DRM_OP_PRIME_IMPORT;
+        header.payload_size = sizeof(import) - 1;
+        assert(dispatch_request(&service, &header, &import, &result,
+            &transfer, 0) == -EINVAL);
+        header.payload_size = sizeof(import);
+        service.received.fd_count = 1;
+        assert(dispatch_request(&service, &header, &import, &result,
+            &transfer, 0) == -EINVAL);
+        service.received.fd_count = 2;
+        gpud_drm_prime_token_request_t token = {.token = 1};
+        header = (pacha_service_envelope_t){.op = GPUD_DRM_OP_PRIME_RELEASE,
+            .payload_size = sizeof(token)};
+        assert(dispatch_request(&service, &header, &token, &result,
+            &transfer, 0) == -ENOENT);
+        service.received.fd_count = 3;
+        header.op = GPUD_DRM_OP_PRIME_ACQUIRE;
+        assert(dispatch_request(&service, &header, &token, &result,
+            &transfer, 0) == -EINVAL);
+    }
+}
+
+static void primary_master_lifetime(void)
+{
+    static struct gpud_drm_service service;
+    service.files.generation = 7;
+    service.log_endpoint_fd = 29;
+    service.watches[0] = (struct gpud_drm_watch){.handle = 41, .device_minor = 0};
+    service.watches[1] = (struct gpud_drm_watch){.handle = 42, .device_minor = 0};
+    service.watches[2] = (struct gpud_drm_watch){.handle = 43, .device_minor = 128};
+    gpud_drm_ioctl_request_t set = {.handle = 41,
+        .request = GPUD_DRM_IOCTL_SET_MASTER};
+    gpud_drm_ioctl_request_t drop = {.handle = 41,
+        .request = GPUD_DRM_IOCTL_DROP_MASTER};
+    primary_opened(&service, 41);
+    assert(service.master_handle == 41);
+    assert(strstr(diagnostic, "master acquired by open generation=7 handle=41"));
+    primary_opened(&service, 42);
+    assert(service.master_handle == 41);
+    set.handle = 42;
+    assert(primary_master_check(&service, &set) == -EBUSY);
+    set.handle = 43;
+    assert(primary_master_check(&service, &set) == -EINVAL);
+    drop.handle = 42;
+    assert(primary_master_check(&service, &drop) == -EINVAL);
+    drop.handle = 41;
+    assert(!primary_master_check(&service, &drop));
+    primary_master_completed(&service, &drop);
+    assert(!service.master_handle);
+    set.handle = 42;
+    assert(!primary_master_check(&service, &set));
+    primary_master_completed(&service, &set);
+    assert(service.master_handle == 42);
+    primary_closed(&service, 41);
+    assert(service.master_handle == 42);
+    primary_closed(&service, 42);
+    assert(!service.master_handle);
+    assert(strstr(diagnostic, "master released by close generation=7 handle=42"));
+    primary_opened(&service, 41);
+    assert(service.master_handle == 41);
+}
+
+static void kms_session_lifetime(void)
+{
+    static struct gpud_drm_service service;
+    service.files.generation = 8;
+    service.watches[0] = (struct gpud_drm_watch){.handle = 51, .device_minor = 0};
+    primary_opened(&service, 51);
+    gpud_drm_mode_atomic_wire_t wire = {
+        .flags = GPUD_DRM_MODE_ATOMIC_ALLOW_MODESET |
+            GPUD_DRM_MODE_ATOMIC_TEST_ONLY,
+        .count_objs = 3, .total_props = 3,
+        .objects = {101, 102, 103},
+        .object_prop_counts = {1, 1, 1},
+        .props = {201, 202, 203},
+        .prop_values = {102, 301, 1}};
+    gpud_drm_ioctl_request_t request = {.handle = 51,
+        .request = GPUD_DRM_IOCTL_MODE_ATOMIC,
+        .arg_size = 56, .data_size = sizeof(wire)};
+    memcpy(request.data, &wire, sizeof(wire));
+    assert(!display_session_check(&service, &request));
+    wire.flags &= ~GPUD_DRM_MODE_ATOMIC_TEST_ONLY;
+    memcpy(request.data, &wire, sizeof(wire));
+    assert(!display_session_check(&service, &request));
+    wire.flags |= GPUD_DRM_MODE_ATOMIC_TEST_ONLY;
+    memcpy(request.data, &wire, sizeof(wire));
+    display_session_completed(&service, &request);
+    assert(!service.kms_session_mode);
+    wire.flags &= ~GPUD_DRM_MODE_ATOMIC_TEST_ONLY;
+    memcpy(request.data, &wire, sizeof(wire));
+    assert(!display_session_check(&service, &request));
+    request.handle = 52;
+    assert(display_session_check(&service, &request) == -EACCES);
+    request.handle = 51;
+    gpud_drm_ioctl_request_t legacy = {.handle = 51,
+        .request = GPUD_DRM_IOCTL_MODE_SETCRTC};
+    assert(!display_session_check(&service, &legacy));
+    display_session_completed(&service, &request);
+    assert(display_session_check(&service, &legacy) == -EBUSY);
+    wire.prop_values[2] = 2; /* A later frame has different plane state. */
+    memcpy(request.data, &wire, sizeof(wire));
+    assert(!display_session_check(&service, &request));
+    gpud_drm_ioctl_request_t drop = {.handle = 51,
+        .request = GPUD_DRM_IOCTL_DROP_MASTER};
+    primary_master_completed(&service, &drop);
+    primary_opened(&service, 51);
+    assert(!display_session_check(&service, &legacy));
+    display_session_completed(&service, &legacy);
+    wire.flags |= GPUD_DRM_MODE_ATOMIC_TEST_ONLY;
+    memcpy(request.data, &wire, sizeof(wire));
+    assert(display_session_check(&service, &request) == -EBUSY);
+    primary_closed(&service, 51);
+    assert(!service.kms_session_mode);
+}
 
 long pacha_syscall2(uint64_t nr, uint64_t a, uint64_t b)
 {
@@ -70,15 +249,30 @@ int ph_ipc_packet_release(struct ph_ipc_packet *packet)
 int gpud_gpu_rpc_call(struct gpud_gpu_rpc *r, unsigned int q,
     const unsigned char *b, size_t n, unsigned char *o, size_t cap, size_t *s)
 {
-    assert(q == GPUD_GPU_QUEUE_EXECUTION); ++gpu_calls;
+    assert(q == (resources_request ? GPUD_GPU_QUEUE_DISPLAY : GPUD_GPU_QUEUE_EXECUTION));
+    ++gpu_calls;
     kb2_protocol_message_envelope_t envelope;
     assert(!kb2_protocol_message_envelope_decode(b, n, &envelope));
-    unsigned char result[8] = {0};
+    unsigned char result[KB2_GPU_DRM_MODE_RECORD_RESOURCES_RESULT_SIZE] = {0};
     kb2_gpu_inline_completion_t completion = {.session_id = 7,
-        .status = KB2_GPU_STATUS_OK, .length = sizeof(result), .data = result,
+        .status = KB2_GPU_STATUS_OK, .length = 8, .data = result,
         .record_schema_id = output_request ? KB2_GPU_DRM_VIRTGPU_RECORD_GET_CAPS_RESULT :
             KB2_GPU_DRM_VIRTGPU_RECORD_EXECBUFFER_RESULT};
-    if (output_request) {
+    if (resources_request) {
+        kb2_gpu_command_t command;
+        assert(!kb2_gpu_command_decode(b + KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE,
+            envelope.payload_length, envelope.generation, KB2_GPU_PROFILE_AMDGPU,
+            KB2_GPU_QUEUE_DISPLAY, NULL, 0, &command));
+        assert(command.command_id == KB2_GPU_DRM_MODE_COMMAND_GET_RESOURCES);
+        assert(command.counts[0] == 1 && !command.counts[1]);
+        completion.record_schema_id = KB2_GPU_DRM_MODE_RECORD_RESOURCES_RESULT;
+        completion.length = sizeof(result);
+        result[0] = 1;
+        result[12] = result[16] = result[20] = 1;
+        uint32_t maximum = 4096;
+        memcpy(result + 28, &maximum, sizeof(maximum));
+        memcpy(result + 36, &maximum, sizeof(maximum));
+    } else if (output_request) {
         for (size_t i = 0; i < 12; ++i) assert(!r->mapping[GPUD_GPU_AUX_OFFSET + i]);
         memset(r->mapping + GPUD_GPU_AUX_OFFSET, 0x5a, 4);
         result[0] = result[4] = 12;
@@ -145,7 +339,7 @@ static void auxiliary_call(struct gpud_drm_service *service, uint64_t handle, in
 {
     pacha_service_envelope_t *header = (void *)page;
     *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
-        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = GPUD_DRM_SERVICE_ID,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
         .op = GPUD_DRM_OP_HANDLE_IOCTL, .request_id = 30 + gpu_calls,
         .flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD, .payload_size = sizeof(gpud_drm_ioctl_request_t)};
     gpud_drm_ioctl_request_t *request = (void *)(page + sizeof(*header));
@@ -186,8 +380,95 @@ static void auxiliary_call(struct gpud_drm_service *service, uint64_t handle, in
         for (size_t i = 0; i < 12; ++i) assert(auxiliary[i] == (i < 4 ? 0x5a : 0));
     }
 }
+static void resources_call(struct gpud_drm_service *service)
+{
+    observed_phases = 0;
+    pacha_service_envelope_t *header = (void *)page;
+    *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
+        .op = GPUD_DRM_OP_HANDLE_IOCTL, .request_id = 99,
+        .flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD, .payload_size = sizeof(gpud_drm_ioctl_request_t)};
+    gpud_drm_ioctl_request_t *request = (void *)(page + sizeof(*header));
+    *request = (gpud_drm_ioctl_request_t){.handle = 1,
+        .request = GPUD_DRM_IOCTL_MODE_GETRESOURCES,
+        .arg_size = sizeof(gpud_drm_mode_card_res_t),
+        .data_size = sizeof(gpud_drm_kms_resources_wire_t)};
+    queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC,
+        .word3 = 99, .fd_count = 1};
+    queued_fds[0] = (struct pacha_ipc_fd){.fd = 22};
+    service->connections->ready = 1;
+    ready_fd = 21;
+    resources_request = 1;
+    assert(!gpud_drm_service_receive(service));
+    assert(!header->status && !service->files.files[0].in_flight);
+    gpud_drm_kms_resources_wire_t wire;
+    memcpy(&wire, request->data, sizeof(wire));
+    assert(!wire.value.count_fbs && wire.value.count_crtcs == 1 &&
+        wire.value.count_connectors == 1 && wire.value.count_encoders == 1);
+    assert(wire.value.max_width == 4096 && wire.value.max_height == 4096);
+    assert(strstr(diagnostic, "DRM request end seq=1"));
+    assert(observed_phases == 31);
+    assert(!service->active_request_sequence);
+    resources_request = 0;
+}
+
+static struct gpud_drm_service *resources_service(void)
+{
+    static struct gpud_drm_service service;
+    static struct gpud_drm_connection connection;
+    service.endpoint_fd = 16;
+    service.backend_client = 1;
+    service.profile_kind = KB2_GPU_PROFILE_AMDGPU;
+    service.log_endpoint_fd = 29;
+    assert(!gpud_drm_files_init(&service.files, 1, 4));
+    uint64_t handle;
+    assert(!gpud_drm_file_open_begin(&service.files, 1, &handle) && handle == 1);
+    assert(!gpud_drm_file_open_finish(&service.files, 1, handle, 7, 0));
+    connection = (struct gpud_drm_connection){.fd = 21, .page = page};
+    service.connections = &connection;
+    service.gpu.mapping = calloc(1, GPUD_GPU_CHANNEL_SIZE);
+    assert(service.gpu.mapping);
+    return &service;
+}
+
+#if defined(GPUD_DRM_STACK_BUDGET)
+static void *resources_stack(void *argument)
+{
+    /* The release binary retains about 30 KiB in main/run while serving.
+     * Model that live caller frame on the actual 128 KiB service budget;
+     * host sanitizer stacks are deliberately not used for this regression. */
+    volatile unsigned char caller[30 * 1024];
+    for (size_t i = 0; i < sizeof(caller); ++i) caller[i] = (unsigned char)i;
+    resources_call(argument);
+    for (size_t i = 0; i < sizeof(caller); ++i) assert(caller[i] == (unsigned char)i);
+    return NULL;
+}
+#endif
+
 int main(void)
 {
+#if defined(GPUD_DRM_STACK_BUDGET)
+    struct gpud_drm_service *service = resources_service();
+    pthread_attr_t attributes;
+    pthread_t thread;
+    assert(!pthread_attr_init(&attributes));
+    assert(!pthread_attr_setstacksize(&attributes, PACHA_PROCESS_DEFAULT_STACK_SIZE));
+    assert(!pthread_create(&thread, &attributes, resources_stack, service));
+    assert(!pthread_join(thread, NULL));
+    assert(!pthread_attr_destroy(&attributes));
+    free(service->gpu.mapping);
+    puts("GPUD count-only GETRESOURCES on 128 KiB service stack PASS");
+    return 0;
+#else
+    struct gpud_drm_service *resources = resources_service();
+    resources_call(resources);
+    free(resources->gpu.mapping);
+    resources->gpu.mapping = NULL;
+    gpu_calls = 0;
+    bounded_startup_journal();
+    prime_profile_admission();
+    kms_session_lifetime();
+    primary_master_lifetime();
     static struct gpud_drm_service service;
     service.endpoint_fd = 16; service.backend_client = 1; service.files.generation = 1;
     /* The optional physical GPU endpoint is published before manual probe.
@@ -203,7 +484,7 @@ int main(void)
         (int64_t)last_reply.word1 == -ENODEV);
     pacha_service_envelope_t *offline_header = (void *)page;
     *offline_header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
-        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = GPUD_DRM_SERVICE_ID,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
         .op = GPUD_DRM_OP_OPEN_NODE, .request_id = 17};
     queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC,
         .word3 = 17, .fd_count = 2};
@@ -236,7 +517,7 @@ int main(void)
     for (unsigned i = 1; i <= 8; ++i) {
         pacha_service_envelope_t *header = (void *)page;
         *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
-            .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = GPUD_DRM_SERVICE_ID,
+            .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
             .op = GPUD_DRM_OP_HELLO, .request_id = i};
         queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = i, .fd_count = 1};
         queued_fds[0] = (struct pacha_ipc_fd){.fd = 22};
@@ -251,7 +532,7 @@ int main(void)
      * meaning. The normal HELLO validator sees and rejects the extra FD. */
     pacha_service_envelope_t *header = (void *)page;
     *header = (pacha_service_envelope_t){.magic = PACHA_SERVICE_REQUEST_MAGIC,
-        .abi_version = PACHA_SERVICE_ABI_VERSION, .service_id = GPUD_DRM_SERVICE_ID,
+        .header_size = sizeof(pacha_service_envelope_t), .service_id = GPUD_DRM_SERVICE_ID,
         .op = GPUD_DRM_OP_HELLO, .request_id = 9};
     queued = (struct pacha_ipc_msg){.word0 = PACHA_SERVICE_REQUEST_MAGIC, .word3 = 9, .fd_count = 2};
     queued_fds[0] = (struct pacha_ipc_fd){.fd = 20};
@@ -327,4 +608,5 @@ int main(void)
     free(service.pollfds);
     puts("GPUD page connection: bind, actual HELLO reuse/correlation, cleanup failures PASS");
     puts("GPUD auxiliary connection: real execbuffer/caps codecs, copy/zero, fallback, lifetime PASS");
+#endif
 }

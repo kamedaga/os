@@ -10,8 +10,9 @@ static uint64_t native_rights[256];
 static unsigned registrations, signals;
 static int fail_registration, bad_cap;
 static struct unix_credentials registered_credentials;
-static _Alignas(8) unsigned char filed_page[PACHA_SERVICE_PAGE_BYTES];
-static filed_identity_t filed_identity;
+static _Alignas(8) unsigned char filed_page[4096];
+static kb2_fs_request_t filed_request;
+static kb2_fs_credentials_t filed_credentials;
 static unsigned filed_registrations;
 static unsigned filed_updates, unix_updates;
 
@@ -25,7 +26,7 @@ static int allocate_filed_fd(uint64_t rights)
 }
 int pacha_vmo_create(uint64_t bytes, uint64_t rights, uint32_t flags)
 {
-    assert(bytes == sizeof(filed_page) && flags == PACHA_FD_FLAG_PRIVATE);
+    assert(bytes == sizeof(filed_page) && !flags);
     memset(filed_page, 0, sizeof(filed_page));
     return allocate_filed_fd(rights);
 }
@@ -38,16 +39,16 @@ void *pacha_mmap(int fd, uint64_t bytes, uint64_t prot, uint64_t flags, uint64_t
 int pacha_ipc_call(int fd, const struct pacha_ipc_msg *message)
 {
     assert(fd == 33 && message->fd_count == 1);
-    pacha_service_envelope_t *header = (void *)filed_page;
-    assert(header->service_id == FILED_SERVICE_ID);
-    if (header->op == FILED_OP_CLIENT_REGISTER) {
-        memcpy(&filed_identity, filed_page + PACHA_SERVICE_HEADER_BYTES, sizeof(filed_identity));
+    assert(!kb2_fs_request_decode(filed_page, message->word1, message->word1, &filed_request));
+    assert(filed_request.opcode == message->word0 && filed_request.sequence == message->word3);
+    assert(!kb2_fs_credentials_decode(filed_page + filed_request.data.offset,
+        filed_request.data.length, &filed_credentials));
+    assert(filed_request.second_handle && filed_request.offset > 0);
+    if (filed_request.opcode == KB2_FILESYSTEM_OP_CLIENT_REGISTER) {
         filed_registrations++;
     } else {
-        assert(header->op == FILED_OP_CLIENT_CREDENTIALS);
-        filed_identity_update_t *update = (void *)(filed_page + PACHA_SERVICE_HEADER_BYTES);
-        assert(update->client == 1 && update->identity.rights == filed_identity.rights);
-        filed_identity = update->identity;
+        assert(filed_request.opcode == KB2_FILESYSTEM_OP_CLIENT_CREDENTIALS);
+        assert(filed_request.client == 1 && filed_request.capabilities == 1023);
         filed_updates++;
     }
     return allocate_filed_fd(PACHA_FD_RIGHT_CLOSE);
@@ -55,13 +56,17 @@ int pacha_ipc_call(int fd, const struct pacha_ipc_msg *message)
 int pacha_ipc_recv_wait(int fd, struct pacha_ipc_msg *response, uint64_t timeout)
 {
     assert(fd >= 200 && timeout == PACHA_FD_WAIT_FOREVER);
-    pacha_service_envelope_t header = *(pacha_service_envelope_t *)filed_page;
-    pacha_service_reply_init((void *)filed_page, &header, 0, 0, filed_registrations, 0);
-    response->word0 = PACHA_SERVICE_REPLY_MAGIC;
-    response->word3 = header.request_id;
-    if (header.op == FILED_OP_CLIENT_CREDENTIALS) { response->fd_count = 0; return 0; }
+    kb2_fs_response_t result = {.opcode = filed_request.opcode,
+        .generation = filed_request.generation, .sequence = filed_request.sequence,
+        .handle = filed_registrations};
+    assert(!kb2_fs_response_encode(filed_page, sizeof(filed_page), &result));
+    response->word0 = result.opcode;
+    response->word1 = 0;
+    response->word2 = KB2_FILESYSTEM_RESPONSE_SIZE;
+    response->word3 = result.sequence;
+    if (filed_request.opcode == KB2_FILESYSTEM_OP_CLIENT_CREDENTIALS) { response->fd_count = 0; return 0; }
     response->fd_count = 1;
-    response->fds[0].fd = allocate_filed_fd(LPRS_CLIENT_RIGHTS | PACHA_FD_RIGHT_DUP | PACHA_FD_RIGHT_TRANSFER);
+    response->fds[0].fd = allocate_filed_fd(FILED_CLIENT_REGISTER_RIGHTS);
     return 0;
 }
 
@@ -202,7 +207,7 @@ int main(void)
     assert(reply.rights == LPRS_UNIX_CLIENT_RIGHTS && reply.transfer_flags ==
         (PACHA_IPC_TRANSFER_PRIVATE | PACHA_IPC_TRANSFER_CLOEXEC));
     const unsigned created = registrations;
-    assert(filed_identity.pid == 1 && filed_identity.generation == parent->credentials.generation);
+    assert(filed_request.offset == 1 && filed_request.second_handle == parent->credentials.generation);
     assert(parent->filed_fd >= 200 && parent->filed_session == 1);
     const int retained = reply.fd;
     const uint64_t identity_generation = parent->credentials.generation;
@@ -224,8 +229,9 @@ int main(void)
     parent->credential_rights = LPRS_CREDENTIAL_SETUID | LPRS_CREDENTIAL_SETGID;
     assert(!lprs_change_credentials(parent, &change));
     assert(filed_updates == 1 && unix_updates == 1);
-    assert(filed_identity.uid == 81 && registered_credentials.uid == 81 && change.credentials.uid == 81);
-    assert(filed_identity.generation == identity_generation);
+    assert(filed_credentials.uid == 81 && registered_credentials.uid == 81 && change.credentials.uid == 81);
+    assert(filed_request.second_handle == identity_generation);
+    assert(parent->filed_credential_generation == 2);
     assert(lprs_authorize(token, 0, LPRS_OP_PROCESS_CREDENTIALS, token) == 0);
     assert(lprs_authorize(0, 0, LPRS_OP_PROCESS_CREDENTIALS, token) == -1);
 
@@ -242,6 +248,8 @@ int main(void)
     native_rights[43] = native_rights[44] = PACHA_FD_RIGHT_CLOSE;
     assert(lprs_unix_session(child, &reply, &session) == 0);
     assert(registered_credentials.pid == 2 && session != parent->unix_session && reply.fd != retained);
+    assert(filed_request.offset == 2 && filed_request.second_handle == child->generation);
+    assert(filed_request.credential_generation == 1 && filed_request.second_handle != 1);
     const int child_retained = reply.fd;
     lprs_notify_exited_child(child, LPRS_NATIVE_PROCESS_EXITED, 0);
     assert(signals == 1 && child->active && child->exit_ready); /* unreaped zombie */

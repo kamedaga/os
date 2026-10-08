@@ -72,6 +72,10 @@ extern unsigned char __start_native_handlers[], __stop_native_handlers[];
 extern unsigned char __start_native_inhibited[], __stop_native_inhibited[];
 extern void inhibited_wait(volatile unsigned *, volatile unsigned *, unsigned);
 extern int native_clock_contract(void);
+extern int native_thread_bases_contract(void);
+extern int native_ap_slice_contract(void);
+extern int native_wake_wait_contract(void);
+extern int native_wake_wait_lifecycle_contract(void);
 
 __attribute__((used, noinline, section("native_handlers")))
 static void notification_body(struct pacha_native_signal_frame *frame)
@@ -202,6 +206,8 @@ static uint64_t create_worker(unsigned i)
 
 int main(void)
 {
+    if (native_ap_slice_contract()) fail();
+    if (native_thread_bases_contract()) fail();
     _Static_assert(sizeof(struct pacha_native_signal_frame) == 1024, "signal frame");
     _Static_assert(sizeof(struct pacha_native_fault_frame) == 1048, "fault frame");
     /* Children inherit a blocked delivery configuration before START. */
@@ -322,6 +328,8 @@ int main(void)
         0, 0, 0, 0, 0) || native(PACHA_VM_SYSCALL_MUNMAP, mapping, 4096, 0, 0, 0, 0)) fail();
     log_line("NATIVE_FAULT_RETURN=PASS\n");
     log_line("NATIVE_EXECUTION=PASS\n");
+    if (native_wake_wait_contract()) fail();
+    if (native_wake_wait_lifecycle_contract()) fail();
     if (native_clock_contract()) fail();
     log_line("NATIVE_CLOCK_CONTRACT=PASS\n");
     return 0;

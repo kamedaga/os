@@ -6,20 +6,35 @@ void *memset(void *dst, int c, size_t n)
     return lpr_memset(dst, c, n);
 }
 
+__attribute__((visibility("hidden")))
+void *memcpy(void *dst, const void *src, size_t n)
+{
+    return lpr_memcpy(dst, src, n);
+}
+
+__attribute__((visibility("hidden")))
+int memcmp(const void *a, const void *b, size_t n)
+{
+    return lpr_memcmp(a, b, n);
+}
+
+__attribute__((visibility("hidden")))
+void *memchr(const void *bytes, int value, size_t n)
+{
+    const unsigned char *p = bytes;
+    for (size_t i = 0; i < n; ++i)
+        if (p[i] == (unsigned char)value) return (void *)(p + i);
+    return 0;
+}
+
 lpr_state_t lpr_state = {
     .thread_count = 1,
     .filed_rpc = {
         .client_fd = -1,
         .request_id = 0x4c505246494c4501ull,
-        .wire_page_fd = -1,
-        .session_fd = -1,
-        .session_page_fd = -1,
-        .readv_vmo_fd = -1,
-        .pread_vmo_page_fd = -1,
     },
     .termd_rpc = {
         .request_id = 0x4c50525445524d01ull,
-        .wire_page_fd = -1,
     },
     .netd_rpc = {
         .request_id = 0x4c50524e45544401ull,

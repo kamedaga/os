@@ -1,6 +1,7 @@
 const std = @import("std");
 const acpi = @import("acpi_tables.zig");
 const physical_layout = @import("arch/x86_64/physical_layout.zig");
+const mtrr = @import("arch/x86_64/mtrr.zig");
 
 // IA-PC HPET 1.0a, sections 2.3.4-2.3.7 and 3.2.4. The shared main
 // counter is the clocksource; interrupt comparators remain disabled.
@@ -11,6 +12,82 @@ const counter_offset = 0xf0;
 const fs_per_ns: u64 = 1_000_000;
 const register_bytes: u64 = 0x500;
 const page_size: u64 = 4096;
+
+pub const InitReason = enum {
+    not_attempted,
+    acpi_missing_or_invalid,
+    invalid_address,
+    outside_identity_range,
+    bsp_cache_evidence_missing,
+    bsp_cache_unsupported,
+    boot_mapping_failed,
+    boot_mapped,
+    mmio_not_uc,
+    invalid_capabilities,
+    counter_32bit,
+    counter_not_advancing,
+    ready,
+};
+pub const Diagnostic = struct {
+    reason: InitReason = .not_attempted,
+    address: u64 = 0,
+    capabilities: u64 = 0,
+    period_fs: u32 = 0,
+};
+var init_diagnostic: Diagnostic = .{};
+
+pub fn diagnostic() Diagnostic {
+    return init_diagnostic;
+}
+
+const RegisterRange = struct { base: u64, bytes: u64 };
+fn registerRange(address: u64) ?RegisterRange {
+    if (address < 0x100000 or address >= physical_layout.identity_limit or
+        register_bytes > physical_layout.identity_limit - address) return null;
+    const base = address & ~(page_size - 1);
+    const end = std.mem.alignForward(u64, address + register_bytes, page_size);
+    return .{ .base = base, .bytes = end - base };
+}
+
+fn discover(rsdp: u64) ?u64 {
+    init_diagnostic = .{};
+    const table = acpi.find(rsdp, "HPET", 56) orelse {
+        init_diagnostic.reason = .acpi_missing_or_invalid;
+        return null;
+    };
+    const address = registerAddress(table) orelse {
+        init_diagnostic.reason = .invalid_address;
+        return null;
+    };
+    init_diagnostic.address = address;
+    return address;
+}
+
+/// Before AP startup, change the firmware-declared identity aperture itself.
+/// UC_MINUS over a WB MTRR is not sufficient, and a late remap would require
+/// a global cache/TLB transition. Do not weaken the existing MMIO proof.
+pub fn prepareBootMmio(rsdp: u64) bool {
+    const address = discover(rsdp) orelse return false;
+    const range = registerRange(address) orelse {
+        init_diagnostic.reason = .outside_identity_range;
+        return false;
+    };
+    var snapshot: mtrr.CacheSnapshot = .{};
+    if (!mtrr.captureCacheSnapshot(&snapshot)) {
+        init_diagnostic.reason = .bsp_cache_evidence_missing;
+        return false;
+    }
+    if (!snapshot.rangeSupportsUncachedMapping(range.base, range.bytes)) {
+        init_diagnostic.reason = .bsp_cache_unsupported;
+        return false;
+    }
+    if (!@import("arch/x86_64/platform.zig").mapBootMmioIdentityRange(range.base, range.bytes)) {
+        init_diagnostic.reason = .boot_mapping_failed;
+        return false;
+    }
+    init_diagnostic.reason = .boot_mapped;
+    return true;
+}
 
 pub fn registerAddress(table: []const u8) ?u64 {
     if (table.len < 56 or !std.mem.eql(u8, table[0..4], "HPET")) return null;
@@ -61,22 +138,29 @@ const Counter = struct {
 var counter: Counter = .{};
 
 pub fn staticEnd() usize {
-    return @intFromPtr(&counter) + @sizeOf(Counter);
+    return @max(@intFromPtr(&counter) + @sizeOf(Counter), @intFromPtr(&init_diagnostic) + @sizeOf(Diagnostic));
 }
 
 // Called after all CPUs have published immutable cache snapshots and before
 // user execution. Reject the complete register mapping before MMIO access.
 pub fn initialize(rsdp: u64, mmio_allowed: *const fn (u64, u64) bool) bool {
-    const table = acpi.find(rsdp, "HPET", 56) orelse return false;
-    const address = registerAddress(table) orelse return false;
-    if (address >= physical_layout.identity_limit or
-        register_bytes > physical_layout.identity_limit - address) return false;
-    const mapping_base = address & ~(page_size - 1);
-    const mapping_end = std.mem.alignForward(u64, address + register_bytes, page_size);
-    if (!mmio_allowed(mapping_base, mapping_end - mapping_base)) return false;
+    const address = discover(rsdp) orelse return false;
+    const range = registerRange(address) orelse {
+        init_diagnostic.reason = .outside_identity_range;
+        return false;
+    };
+    if (!mmio_allowed(range.base, range.bytes)) {
+        init_diagnostic.reason = .mmio_not_uc;
+        return false;
+    }
     var candidate: Counter = .{ .address = address };
     const caps = candidate.read(capabilities_offset);
-    candidate.period_fs = period(caps) orelse return false;
+    init_diagnostic.capabilities = caps;
+    init_diagnostic.period_fs = @truncate(caps >> 32);
+    candidate.period_fs = period(caps) orelse {
+        init_diagnostic.reason = if ((caps & (1 << 13)) == 0) .counter_32bit else .invalid_capabilities;
+        return false;
+    };
     const config = candidate.read(configuration_offset);
     candidate.write(configuration_offset, config & ~@as(u64, 3));
     const comparators = ((caps >> 8) & 31) + 1;
@@ -93,12 +177,25 @@ pub fn initialize(rsdp: u64, mmio_allowed: *const fn (u64, u64) bool) bool {
     for (0..10000) |_| {
         if (candidate.read(counter_offset) > candidate.origin) {
             counter = candidate;
+            init_diagnostic.reason = .ready;
             return true;
         }
         asm volatile ("pause");
     }
     candidate.write(configuration_offset, config & ~@as(u64, 3));
+    init_diagnostic.reason = .counter_not_advancing;
     return false;
+}
+
+test "HPET boot mapping bounds only the firmware-declared register pages" {
+    const aligned = registerRange(0xfed00000).?;
+    try std.testing.expectEqual(@as(u64, 0xfed00000), aligned.base);
+    try std.testing.expectEqual(@as(u64, 4096), aligned.bytes);
+    const crossing = registerRange(0xfed00c00).?;
+    try std.testing.expectEqual(@as(u64, 8192), crossing.bytes);
+    try std.testing.expect(registerRange(0) == null);
+    try std.testing.expect(registerRange(physical_layout.identity_limit - 1024) == null);
+    try std.testing.expect(registerRange(std.math.maxInt(u64)) == null);
 }
 
 pub fn monotonicNs() ?u64 {

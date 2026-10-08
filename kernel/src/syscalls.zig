@@ -266,8 +266,30 @@ fn writeThreadUserLogPrefix(h: *const Hooks, thread_index: usize) void {
 
 fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
     const runtime_path = perf.runtimePath(frame.rax, frame.rdi);
+    if (frame.rax == sc.syscall_clock_read) frame.rdx = 0;
+    // Admission may reject before runtime dispatch. Output-only RDX must
+    // still distinguish an unperformed wake from a committed wake count.
+    if (frame.rax == sc.syscall_futex_wake_wait) frame.rdx = std.math.maxInt(u64);
     const base_hooks = getHooks();
     if (!base_hooks.kernel_state_ready.*) return sc.syscall_err_not_ready;
+    if (frame.rax == sc.syscall_clock_read) {
+        // Scalar time reads touch no capability, user mapping or KernelState
+        // object. Keep the live CPU reference and ordinary signal/user return;
+        // uncertain admission and CMOS fall back to the existing exclusion.
+        if ((frame.cs & 3) == 3 and (frame.ss & 3) == 3) {
+            switch (scheduler.currentClockReadAdmission()) {
+                .blocked => return sc.syscall_err_not_ready,
+                .fast => {
+                    if (runtime_syscalls.tryClockRead(frame)) |result| {
+                        perf.runtimeAdd(runtime_path, .reserved, 1);
+                        return result;
+                    }
+                },
+                .slow => {},
+            }
+        }
+        perf.runtimeAdd(runtime_path, .no_claim, 1);
+    }
     const state = base_hooks.state;
     const proc = scheduler.currentPrincipal();
     @import("ipc_metric.zig").recordSyscall(frame.rax, proc);
@@ -369,8 +391,7 @@ fn dispatchCompactSyscall(frame: *TrapFrame) u64 {
             var reply = std.mem.zeroes(kernel_log_abi.Read);
             if (!h.copy_user_bytes_from_va(proc, frame.rdi, std.mem.asBytes(&reply)[0..32]))
                 break :blk sc.syscall_err_invalid;
-            if (reply.version != kernel_log_abi.read_version or reply.reserved != 0 or
-                reply.limit == 0 or reply.limit > kernel_log_abi.read_max_bytes)
+            if (!kernel_log_abi.requestIsValid(&reply))
                 break :blk sc.syscall_err_invalid;
             if (!kernel_log.readDebug(reply.cursor, reply.bytes[0..@intCast(reply.limit)], &reply))
                 break :blk sc.syscall_err_empty;

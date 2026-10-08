@@ -4,6 +4,12 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+# The kobox2 core is pinned to nix's LLVM 18.1.8, and kbuild host tools
+# (fixdep, objtool) must link against nix's glibc and libelf. Only this build
+# enters nix; pacgo and every other build stay outside it.
+if [[ -z "${IN_NIX_SHELL:-}" ]]; then
+    exec nix develop "$repo_root" --command bash "$0" "$@"
+fi
 source_tree="$repo_root/kobox2/linux-sandbox"
 canonical="$repo_root/.artifacts/kobox2-amdgpu-canonical"
 inventory="$repo_root/.artifacts/kobox2-amdgpu-profile/closure-inventory.json"

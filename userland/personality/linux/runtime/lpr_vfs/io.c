@@ -1,288 +1,78 @@
 #include "../lpr_filed_internal.h"
 #include "../lpr_gui_detail.h"
 #include "../lpr_random.h"
+#include "session.h"
 
-static int64_t lpr_filed_io_handle(
-    uint32_t op,
-    uint64_t handle,
-    uint64_t buf,
-    uint64_t count,
-    uint64_t offset)
+int64_t lpr_filed_io_handle(
+    uint32_t op, uint64_t handle, uint64_t buf, uint64_t count, uint64_t offset)
 {
-    if (buf == 0 && count != 0) {
+    if ((!buf && count) || (count && buf > UINT64_MAX - (count - 1u)))
         return -LPR_LINUX_EFAULT;
-    }
-    void *page = 0;
-    const int page_fd = lpr_create_wire_page(&page);
-    if (page_fd < 0) {
-        return page_fd;
-    }
-    filed_io_t *io = (filed_io_t *)page;
-    lpr_memset(io, 0, sizeof(*io));
-    io->handle = handle;
-    io->offset = offset;
-    io->length = count > FILED_IO_BYTES ? FILED_IO_BYTES : count;
-    const int writing = op == FILED_OP_VFS_WRITE || op == FILED_OP_VFS_PWRITE;
-    if (writing && io->length != 0) {
-        lpr_memcpy(io->data, (const void *)(uintptr_t)buf, (size_t)io->length);
-    }
-    uint64_t result = 0;
-    const int64_t status = lpr_filed_call(op, page_fd, 0, &result);
-    if (status == 0 && result > io->length) {
-        result = io->length;
-    }
-    if (status == 0 && !writing && result != 0) {
-        lpr_memcpy((void *)(uintptr_t)buf, io->data, (size_t)result);
-    }
-    lpr_destroy_wire_page(page_fd, page);
-    return status == 0 ? (int64_t)result : status;
-}
-
-static int64_t lpr_filed_io_chunked(
-    uint32_t op,
-    uint64_t handle,
-    uint64_t buf,
-    uint64_t count,
-    uint64_t offset);
-
-/* Keep a writable file's shared stream cursor in FileD. A small readv can
- * still use one ordinary READ request and scatter the returned bytes locally;
- * splitting it into one READ per iovec adds IPC and permits another reader
- * to advance the shared open-file-description cursor between vector entries.
- * No cached size, positional read, or client-owned cursor is used here. */
-static int64_t lpr_filed_readv_inline(
-    uint64_t handle, const lpr_linux_iovec_t *iov, uint64_t count, uint64_t requested)
-{
-    if (requested > FILED_IO_BYTES) return -LPR_LINUX_EINVAL;
-    for (uint64_t i = 0; i < count; ++i) {
-        if (iov[i].len != 0 && (iov[i].base == 0 ||
-            iov[i].base > UINT64_MAX - (iov[i].len - 1u)))
-            return -LPR_LINUX_EFAULT;
-    }
-    unsigned char scratch[FILED_IO_BYTES];
-    const int64_t got = lpr_filed_io_handle(
-        FILED_OP_VFS_READ, handle, (uint64_t)(uintptr_t)scratch, requested, 0);
-    if (got > 0) (void)lpr_scatter_iov(iov, count, scratch, (uint64_t)got);
-    return got;
+    if (count > 0x7ffff000u) count = 0x7ffff000u;
+    const int writing = op == KB2_FILESYSTEM_OP_WRITE || op == KB2_FILESYSTEM_OP_PWRITE;
+    kb2_fs_request_t request = {.opcode = op, .handle = handle,
+        .offset = (int64_t)offset, .length = count};
+    kb2_fs_response_t response;
+    const int64_t result = lpr_fs_call(&request, 0, 0,
+        writing ? (const void *)(uintptr_t)buf : 0, writing ? count : 0,
+        writing ? 0 : (void *)(uintptr_t)buf, writing ? 0 : count,
+        &response, -1, 0);
+    if (result >= 0 && ((uint64_t)result > count ||
+        (!writing && response.data_length != (uint64_t)result)))
+        return -LPR_LINUX_EIO;
+    return result;
 }
 
 int64_t lpr_filed_io(uint32_t op, uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
+    const int64_t binding_status = lpr_filed_fd_binding(fd);
+    if (binding_status) return binding_status;
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
-    if (file == 0) {
-        return -LPR_LINUX_EBADF;
-    }
-    if (count > FILED_IO_BYTES) {
-        return lpr_filed_io_chunked(op, file->handle, buf, count, offset);
-    }
-    return lpr_filed_io_handle(op, file->handle, buf, count, offset);
+    return file ? lpr_filed_io_handle(op, file->handle, buf, count, offset) :
+        -LPR_LINUX_EBADF;
 }
 
-static int64_t lpr_filed_io_chunked(
-    uint32_t op,
-    uint64_t handle,
-    uint64_t buf,
-    uint64_t count,
-    uint64_t offset)
+int64_t lpr_fs_iov(uint64_t handle, uint64_t iov_raw, uint64_t iov_count, int writing)
 {
-    if (buf == 0 && count != 0) {
-        return -LPR_LINUX_EFAULT;
+    if (iov_count > 1024u) return -LPR_LINUX_EINVAL;
+    if (!iov_raw && iov_count) return -LPR_LINUX_EFAULT;
+    const lpr_linux_iovec_t *iov = (const void *)(uintptr_t)iov_raw;
+    struct lpr_fs_buffer buffers[1024];
+    uint64_t requested = 0;
+    for (uint64_t i = 0; i < iov_count; ++i) {
+        lpr_linux_iovec_t element;
+        lpr_memcpy(&element, &iov[i], sizeof(element));
+        if (element.len && (!element.base ||
+            element.base > UINT64_MAX - (element.len - 1u)))
+            return -LPR_LINUX_EFAULT;
+        if (element.len > INT64_MAX - requested) return -LPR_LINUX_EINVAL;
+        requested += element.len;
+        buffers[i] = (struct lpr_fs_buffer){(const void *)(uintptr_t)element.base, element.len};
     }
-    if (count != 0 && buf > UINT64_MAX - (count - 1u)) {
-        return -LPR_LINUX_EFAULT;
+    if (requested > 0x7ffff000u) requested = 0x7ffff000u;
+    if (!requested) return lpr_filed_io_handle(writing ? KB2_FILESYSTEM_OP_WRITE :
+        KB2_FILESYSTEM_OP_READ, handle, 0, 0, 0);
+    /* Fixed-size private vector metadata follows Linux UIO_MAXIOV, not an
+     * I/O-byte ceiling. Payload copy/scatter happens only after admission into
+     * the charged arena; blocked callers do not allocate full-vector scratch. */
+    unsigned parts = 0;
+    uint64_t remaining = requested;
+    for (uint64_t i = 0; i < iov_count && remaining; ++i) {
+        uint64_t bytes = buffers[i].length;
+        if (bytes > remaining) bytes = remaining;
+        buffers[parts++].length = bytes;
+        remaining -= bytes;
     }
-    if (op == FILED_OP_VFS_PREAD && count != 0 && offset > UINT64_MAX - (count - 1u)) {
-        return -LPR_LINUX_EINVAL;
-    }
-    uint64_t total = 0;
-    while (total < count) {
-        const uint64_t remaining = count - total;
-        const uint64_t chunk = remaining > FILED_IO_BYTES ? FILED_IO_BYTES : remaining;
-        const uint64_t chunk_offset = op == FILED_OP_VFS_PREAD ? offset + total : 0;
-        const int64_t n = lpr_filed_io_handle(
-            op, handle, buf + total, chunk, chunk_offset);
-        if (n < 0) {
-            return total != 0 ? (int64_t)total : n;
-        }
-        if (n == 0) {
-            break;
-        }
-        total += (uint64_t)n;
-        if ((uint64_t)n < chunk) {
-            break;
-        }
-    }
-    return (int64_t)total;
-}
-
-static lpr_filed_page_cache_entry_t *lpr_page_cache_fill(
-    const lpr_filed_backend_t *file,
-    uint64_t fd,
-    uint64_t offset,
-    uint64_t requested)
-{
-    if (lpr_shared_file_mapping_active ||
-        (file->flags & LPR_LINUX_O_ACCMODE) != LPR_LINUX_O_RDONLY ||
-        requested == 0 ||
-        requested > LPR_FILED_PAGE_CACHE_BYTES)
-    {
-        return 0;
-    }
-    uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
-    if (requested > LPR_FILED_PAGE_CACHE_BYTES - (offset - page_start)) {
-        return 0;
-    }
-    uint64_t fill_length = LPR_FILED_PAGE_CACHE_BYTES;
-    uint64_t live_generation = 0;
-    const int batch_whole_file =
-        file->pread_active &&
-        file->stat_size > LPR_FILED_PAGE_CACHE_BYTES &&
-        file->stat_size <= LPR_FILED_BATCH_CACHE_BYTES &&
-        file->object_generation != 0 &&
-        lpr_filed_live_object_generation(file->handle, &live_generation) == 0 &&
-        live_generation == file->object_generation;
-    if (batch_whole_file) {
-        page_start = 0;
-        fill_length = file->stat_size;
-        lpr_page_cache_invalidate_handle_locked(file->handle);
-    }
-    lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_find_marker(file->handle, page_start);
-    if (entry == 0) {
-        entry = lpr_page_cache_slot();
-    }
-    int64_t n = -1;
-    if (batch_whole_file) {
-        int vmo_fd = -1;
-        unsigned char *mapped = 0;
-        uint64_t map_len = 0;
-        lpr_state_lock(&lpr_state.filed_rpc.readv_lock_word);
-        if (lpr_readv_scratch_vmo(fill_length, &vmo_fd, &mapped, &map_len) == 0) {
-            n = lpr_linux_pread_to_vmo(
-                fd,
-                (uint64_t)(uint32_t)vmo_fd,
-                0,
-                fill_length,
-                0);
-            if (n > 0) {
-                lpr_memcpy(entry->data, mapped, (size_t)n);
-            }
-        }
-        lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
-    } else {
-        n = lpr_filed_io_handle(
-            FILED_OP_VFS_PREAD,
-            file->handle,
-            (uint64_t)(uintptr_t)entry->data,
-            fill_length,
-            page_start);
-    }
-    if (n <= 0) {
-        return 0;
-    }
-    lpr_memset(entry, 0, offsetof(lpr_filed_page_cache_entry_t, data));
-    entry->active = 1;
-    entry->handle = file->handle;
-    entry->page_start = page_start;
-    entry->length = (uint64_t)n;
-    entry->object_generation = batch_whole_file ? live_generation : 0;
-    entry->clock = ++lpr_page_cache_clock;
-    if (offset + requested < offset ||
-        offset + requested > entry->page_start + entry->length)
-    {
-        return 0;
-    }
-    return entry;
-}
-
-static lpr_filed_page_cache_entry_t *lpr_page_cache_get(
-    const lpr_filed_backend_t *file,
-    uint64_t fd,
-    uint64_t offset,
-    uint64_t requested,
-    int *out_hit)
-{
-    lpr_filed_page_cache_entry_t *entry =
-        lpr_page_cache_lookup(
-            file->handle, file->object_generation, offset, requested);
-    if (entry != 0 &&
-        file->pread_active &&
-        file->stat_size > LPR_FILED_PAGE_CACHE_BYTES &&
-        file->stat_size <= LPR_FILED_BATCH_CACHE_BYTES &&
-        entry->length < file->stat_size)
-    {
-        entry = 0;
-    }
-    if (entry != 0) {
-        if (out_hit != 0) {
-            *out_hit = 1;
-        }
-        return entry;
-    }
-    if (out_hit != 0) {
-        *out_hit = 0;
-    }
-    return lpr_page_cache_fill(file, fd, offset, requested);
-}
-
-static int64_t lpr_read_from_page_cache_locked(
-    const lpr_filed_backend_t *file,
-    uint64_t fd,
-    uint64_t buf,
-    uint64_t requested,
-    uint64_t offset)
-{
-    if (requested == 0) {
-        return 0;
-    }
-    if (buf == 0 || requested > LPR_FILED_PAGE_CACHE_BYTES) {
-        return -1;
-    }
-    const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
-    const uint64_t page_offset = offset - page_start;
-    if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
-        lpr_filed_page_cache_entry_t *entry = lpr_page_cache_get(
-            file, fd, offset, requested, 0);
-        if (entry == 0) {
-            return -1;
-        }
-        lpr_memcpy(
-            (void *)(uintptr_t)buf,
-            entry->data + (offset - entry->page_start),
-            (size_t)requested);
-        return (int64_t)requested;
-    }
-
-    const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
-    const uint64_t second_len = requested - first_len;
-    lpr_filed_page_cache_entry_t *first = lpr_page_cache_get(
-        file, fd, offset, first_len, 0);
-    lpr_filed_page_cache_entry_t *second =
-        first != 0 ? lpr_page_cache_get(file, fd, offset + first_len, second_len, 0) : 0;
-    if (first == 0 || second == 0) {
-        return -1;
-    }
-    unsigned char *dst = (unsigned char *)(uintptr_t)buf;
-    lpr_memcpy(
-        dst,
-        first->data + (offset - first->page_start),
-        (size_t)first_len);
-    lpr_memcpy(
-        dst + first_len,
-        second->data + (offset + first_len - second->page_start),
-        (size_t)second_len);
-    return (int64_t)requested;
-}
-
-static int64_t lpr_read_from_page_cache(
-    const lpr_filed_backend_t *file, uint64_t fd, uint64_t buf,
-    uint64_t requested, uint64_t offset)
-{
-    /* A fill can yield in IPC. Protect both slot selection and the final
-     * copy, otherwise another reader can reuse the same cache entry. */
-    lpr_state_lock(&lpr_state.caches.page_lock_word);
-    const int64_t result = lpr_read_from_page_cache_locked(file, fd, buf, requested, offset);
-    lpr_state_unlock(&lpr_state.caches.page_lock_word);
+    /* One Linux stream operation covers the entire vector, so a dup/fork
+     * sibling cannot interleave a cursor advance between vector elements. */
+    kb2_fs_request_t request = {.opcode = writing ? KB2_FILESYSTEM_OP_WRITE : KB2_FILESYSTEM_OP_READ,
+        .handle = handle, .length = requested,
+        .data = writing ? (kb2_fs_span_t){KB2_FILESYSTEM_REQUEST_SIZE, requested} : (kb2_fs_span_t){0}};
+    kb2_fs_response_t response;
+    const int64_t result = lpr_fs_call_buffers(&request, writing ? buffers : 0, writing ? parts : 0,
+        &response, writing ? 0 : buffers, writing ? 0 : parts);
+    if (result >= 0 && ((uint64_t)result > requested ||
+        (!writing && response.data_length != (uint64_t)result))) return -LPR_LINUX_EIO;
     return result;
 }
 
@@ -342,9 +132,6 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
             line[n++] = "0123456789abcdef"[bytes[i] >> 4];
             line[n++] = "0123456789abcdef"[bytes[i] & 15];
         }
-        line[n++] = ' ';
-        for (unsigned i = 0; file->open_path[i] && n < sizeof(line)-1; ++i)
-            line[n++] = file->open_path[i];
         line[n++] = '\n';
         (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_LOG, (uint64_t)(uintptr_t)line, n);
     }
@@ -360,6 +147,12 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
     }
     const uint64_t fd = pin->fd;
     switch (pin->ops_id) {
+    case LPR_FD_OPS_INSTALL_DISK: {
+        const uint64_t offset = lpr_filed_control_offset(fd);
+        const int64_t n = lpr_block_io(fd, buf, count, offset, 0);
+        if (n > 0) lpr_filed_control_advance_offset(fd, offset, (uint64_t)n);
+        return n;
+    }
     case LPR_FD_OPS_DEVICE: {
         const lpr_device_backend_t *device = pin->state;
         if ((device->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_WRONLY) {
@@ -496,48 +289,13 @@ int64_t lpr_backend_read(const lpr_fd_pin_t *pin, uint64_t buf, uint64_t count)
         }
     }
     case LPR_FD_OPS_FILED: {
-        lpr_filed_backend_t *file = pin->state;
-        const int shadow_offset =
-            (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY;
-        if (count == 0) {
-            return 0;
-        }
-        if (shadow_offset &&
-            file->offset_valid &&
-            count <= LPR_FILED_PAGE_CACHE_BYTES)
-        {
-            const uint64_t offset = lpr_filed_control_offset(fd);
-            const int64_t cached = lpr_read_from_page_cache(
-                file, fd, buf, count, offset);
-            if (cached >= 0) {
-                lpr_filed_control_advance_offset(fd, offset, (uint64_t)cached);
-                file->pread_active = 1;
-                return cached;
-            }
-        }
-        if (shadow_offset && file->offset_valid && file->pread_active)
-        {
-            const uint64_t offset = lpr_filed_control_offset(fd);
-            const int64_t n = count > FILED_IO_BYTES ?
-                lpr_filed_io_chunked(
-                    FILED_OP_VFS_PREAD, file->handle, buf, count, offset) :
-                lpr_filed_io_handle(
-                    FILED_OP_VFS_PREAD, file->handle, buf, count, offset);
-            if (n > 0) {
-                lpr_filed_control_advance_offset(fd, offset, (uint64_t)n);
-            }
-            return n;
-        }
-        const int64_t n = count > FILED_IO_BYTES ?
-            lpr_filed_io_chunked(
-                FILED_OP_VFS_READ, file->handle, buf, count, 0) :
-            lpr_filed_io_handle(
-                FILED_OP_VFS_READ, file->handle, buf, count, 0);
-        if (n >= 0 && shadow_offset) {
-            const uint64_t old_offset = lpr_filed_control_offset(fd);
-            lpr_filed_control_advance_offset(fd, old_offset, (uint64_t)n);
-        }
-        return n;
+        const lpr_filed_backend_t *file = pin->state;
+        const int64_t binding_status = lpr_filed_endpoint_ready();
+        if (binding_status) return binding_status;
+        /* READ, including readonly descriptors, advances Linux's shared
+         * struct file cursor. A personality-owned shadow cursor breaks dup
+         * and fork and cannot observe other clients' reads. */
+        return lpr_filed_io_handle(KB2_FILESYSTEM_OP_READ, file->handle, buf, count, 0);
     }
     default:
         return -LPR_LINUX_EBADF;
@@ -549,7 +307,6 @@ int64_t lpr_backend_readv(
     uint64_t iov_raw,
     uint64_t iov_count)
 {
-    lpr_readv_cache_total++;
     if (pin == 0 || pin->state == 0) {
         return -LPR_LINUX_EBADF;
     }
@@ -558,6 +315,8 @@ int64_t lpr_backend_readv(
     }
     const uint64_t fd = pin->fd;
     switch (pin->ops_id) {
+    case LPR_FD_OPS_INSTALL_DISK:
+        return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
     case LPR_FD_OPS_DEVICE:
         return lpr_iov_scalar_io(fd, iov_raw, iov_count, 0);
     case LPR_FD_OPS_PIPE: {
@@ -621,201 +380,30 @@ int64_t lpr_backend_readv(
     default:
         return -LPR_LINUX_EBADF;
     }
-    lpr_filed_backend_t *file = pin->state;
-    const lpr_linux_iovec_t *iov = (const lpr_linux_iovec_t *)(uintptr_t)iov_raw;
-    uint64_t trace_requested = 0;
-    int trace_requested_valid = 1;
-    int inline_iov_valid = 1;
-    for (uint64_t i = 0; i < iov_count; i += 1) {
-        /* Keep the scalar fallback for a known bad later buffer: Linux can
-         * return bytes from earlier entries before reaching that EFAULT. */
-        if (iov[i].len != 0 && (iov[i].base == 0 ||
-            iov[i].base > UINT64_MAX - (iov[i].len - 1u)))
-            inline_iov_valid = 0;
-        if (iov[i].len != 0 && trace_requested <= UINT64_MAX - iov[i].len) {
-            trace_requested += iov[i].len;
-        } else if (iov[i].len != 0) {
-            trace_requested_valid = 0;
-        }
-    }
-#if defined(LPR_GUI_PROFILE) && LPR_GUI_PROFILE
-    if (lpr_gui_profile_current_thread())
-        lpr_gui_profile_file(19, trace_requested, file->flags, file->offset_valid,
-            file->pread_active, file->stat_size, file->open_path);
-#endif
-    if (iov_count > 1 && trace_requested_valid && inline_iov_valid &&
-        trace_requested != 0 && trace_requested <= FILED_IO_BYTES &&
-        (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDWR)
-    {
-        lpr_trace_readv_size(fd, iov_count, trace_requested, 3, 0);
-        return lpr_filed_readv_inline(file->handle, iov, iov_count, trace_requested);
-    }
-    if (iov_count > 1 &&
-        (file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY &&
-        file->offset_valid)
-    {
-        uint64_t requested = 0;
-        for (uint64_t i = 0; i < iov_count; i += 1) {
-            if (iov[i].len == 0) {
-                continue;
-            }
-            if (iov[i].base == 0 || requested > UINT64_MAX - iov[i].len) {
-                return -LPR_LINUX_EFAULT;
-            }
-            requested += iov[i].len;
-        }
-        if (requested != 0 && requested <= FILED_IO_BYTES) {
-            const uint64_t offset = lpr_filed_control_offset(fd);
-            lpr_readv_cache_coalesced++;
-            lpr_readv_cache_bytes += requested;
-            lpr_trace_readv_size(fd, iov_count, requested, 1, offset);
-            if (requested <= LPR_FILED_PAGE_CACHE_BYTES) {
-                lpr_state_lock(&lpr_state.caches.page_lock_word);
-                const uint64_t page_start = offset & ~(LPR_FILED_PAGE_CACHE_BYTES - 1ull);
-                const uint64_t page_offset = offset - page_start;
-                if (requested <= LPR_FILED_PAGE_CACHE_BYTES - page_offset) {
-                    int cache_hit = 0;
-                    lpr_filed_page_cache_entry_t *entry =
-                        lpr_page_cache_get(file, fd, offset, requested, &cache_hit);
-                    if (entry != 0) {
-                        if (cache_hit) {
-                            lpr_readv_cache_hit++;
-                        } else {
-                            lpr_readv_cache_fill++;
-                        }
-                        (void)lpr_scatter_iov(
-                            iov,
-                            iov_count,
-                            entry->data + (offset - entry->page_start),
-                            requested);
-                        lpr_filed_control_advance_offset(fd, offset, requested);
-                        file->pread_active = 1;
-                        lpr_state_unlock(&lpr_state.caches.page_lock_word);
-                        return (int64_t)requested;
-                    }
-                } else {
-                    lpr_readv_cache_cross_page++;
-                    const uint64_t first_len = LPR_FILED_PAGE_CACHE_BYTES - page_offset;
-                    const uint64_t second_len = requested - first_len;
-                    int first_hit = 0;
-                    int second_hit = 0;
-                    lpr_filed_page_cache_entry_t *first =
-                        lpr_page_cache_get(file, fd, offset, first_len, &first_hit);
-                    lpr_filed_page_cache_entry_t *second =
-                        first != 0 ? lpr_page_cache_get(
-                            file, fd, offset + first_len, second_len, &second_hit) : 0;
-                    if (first != 0 && second != 0) {
-                        uint8_t cache_scratch[LPR_FILED_PAGE_CACHE_BYTES];
-                        lpr_memcpy(
-                            cache_scratch,
-                            first->data + (offset - first->page_start),
-                            (size_t)first_len);
-                        lpr_memcpy(
-                            cache_scratch + first_len,
-                            second->data +
-                                (offset + first_len - second->page_start),
-                            (size_t)second_len);
-                        if (first_hit && second_hit) {
-                            lpr_readv_cache_hit++;
-                        } else {
-                            lpr_readv_cache_fill++;
-                        }
-                        (void)lpr_scatter_iov(iov, iov_count, cache_scratch, requested);
-                        lpr_filed_control_advance_offset(fd, offset, requested);
-                        file->pread_active = 1;
-                        lpr_state_unlock(&lpr_state.caches.page_lock_word);
-                        return (int64_t)requested;
-                    }
-                }
-                lpr_state_unlock(&lpr_state.caches.page_lock_word);
-            }
-            lpr_readv_cache_fallback++;
-            uint8_t scratch[FILED_IO_BYTES];
-            const int64_t n = lpr_filed_io_handle(
-                FILED_OP_VFS_PREAD,
-                file->handle,
-                (uint64_t)(uintptr_t)scratch,
-                requested,
-                offset);
-            if (n < 0) {
-                return n;
-            }
-            const uint64_t got = (uint64_t)n;
-            (void)lpr_scatter_iov(iov, iov_count, scratch, got);
-            lpr_filed_control_advance_offset(fd, offset, got);
-            file->pread_active = 1;
-            return (int64_t)got;
-        }
-        if (requested >= LPR_FILED_READV_TO_VMO_MIN && requested <= LPR_FILED_READV_TO_VMO_MAX) {
-            int vmo_fd = -1;
-            unsigned char *mapped = 0;
-            uint64_t map_len = 0;
-            lpr_state_lock(&lpr_state.filed_rpc.readv_lock_word);
-            if (lpr_readv_scratch_vmo(requested, &vmo_fd, &mapped, &map_len) == 0) {
-                lpr_readv_cache_to_vmo++;
-                lpr_trace_readv_size(fd, iov_count, requested, 2, lpr_filed_control_offset(fd));
-                const uint64_t offset = lpr_filed_control_offset(fd);
-                const int64_t n = lpr_linux_pread_to_vmo(
-                    fd,
-                    (uint64_t)(uint32_t)vmo_fd,
-                    0,
-                    requested,
-                    offset);
-                if (n >= 0) {
-                    const uint64_t got = (uint64_t)n;
-                    const unsigned char *src = mapped;
-                    (void)lpr_scatter_iov(iov, iov_count, src, got);
-                    if ((file->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) {
-                        lpr_filed_control_advance_offset(fd, offset, got);
-                        file->pread_active = 1;
-                    }
-                    lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
-                    return (int64_t)got;
-                }
-                lpr_trace_readv_to_vmo_status(fd, requested, n);
-            }
-            lpr_state_unlock(&lpr_state.filed_rpc.readv_lock_word);
-        }
-    }
-    lpr_trace_readv_size(
-        fd,
-        iov_count,
-        trace_requested,
-        0,
-        lpr_filed_control_offset(fd));
-    int64_t total = 0;
-    for (uint64_t i = 0; i < iov_count; i += 1) {
-        if (iov[i].len == 0) {
-            continue;
-        }
-        const int64_t n = lpr_backend_read(pin, iov[i].base, iov[i].len);
-        if (n < 0) {
-            return total != 0 ? total : n;
-        }
-        total += n;
-        if ((uint64_t)n < iov[i].len) {
-            break;
-        }
-    }
-    return total;
+    const lpr_filed_backend_t *file = pin->state;
+    const int64_t binding_status = lpr_filed_endpoint_ready();
+    if (binding_status) return binding_status;
+    return lpr_fs_iov(file->handle, iov_raw, iov_count, 0);
 }
 
 int64_t lpr_linux_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
+    if (lpr_block_backend(fd))
+        return lpr_block_io(fd, buf, count, offset, 0);
+    const int64_t binding_status = lpr_filed_fd_binding(fd);
+    if (binding_status) return binding_status;
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
     if (file == 0) {
         return -LPR_LINUX_EBADF;
     }
-    if (count > FILED_IO_BYTES) {
-        return lpr_filed_io_chunked(
-            FILED_OP_VFS_PREAD, file->handle, buf, count, offset);
-    }
     return lpr_filed_io_handle(
-        FILED_OP_VFS_PREAD, file->handle, buf, count, offset);
+        KB2_FILESYSTEM_OP_PREAD, file->handle, buf, count, offset);
 }
 
 int64_t lpr_linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
+    if (lpr_block_backend(fd))
+        return lpr_block_io(fd, buf, count, offset, 1);
     if ((int64_t)offset < 0) return -LPR_LINUX_EINVAL;
     if (fd > LPR_LINUX_FD_MAX) return -LPR_LINUX_EBADF;
     lpr_fd_pin_t pin;
@@ -826,6 +414,8 @@ int64_t lpr_linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t o
         result = -LPR_LINUX_EBADF;
     } else if (pin.ops_id != LPR_FD_OPS_FILED) {
         result = -LPR_LINUX_ESPIPE;
+    } else if ((result = lpr_filed_endpoint_ready()) != 0) {
+        /* Keep the pin alive while adoption updates its backend in place. */
     } else {
         const lpr_filed_backend_t *file = pin.state;
         if (lpr_memfd_write_is_sealed(file->reserved1)) {
@@ -834,27 +424,10 @@ int64_t lpr_linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t o
                    (count != 0 && buf > UINT64_MAX - (count - 1u))) {
             result = -LPR_LINUX_EFAULT;
         } else {
-            /* Linux caps each transfer; never let chunking wrap a signed offset. */
-            if (count > 0x7ffff000u) count = 0x7ffff000u;
-            if (count > (uint64_t)INT64_MAX - offset) {
-                result = -LPR_LINUX_EFBIG;
-            } else {
-                if (count != 0) lpr_page_cache_invalidate_handle(file->handle);
-                uint64_t total = 0;
-                do {
-                    const uint64_t remaining = count - total;
-                    const uint64_t chunk = remaining > FILED_IO_BYTES ? FILED_IO_BYTES : remaining;
-                    /* Filed's positional-write sentinel appends without changing
-                     * the shared open-file offset (Linux O_APPEND semantics). */
-                    const uint64_t at = (file->flags & LPR_LINUX_O_APPEND) ? UINT64_MAX : offset + total;
-                    const int64_t n = lpr_filed_io_handle(FILED_OP_VFS_PWRITE,
-                        file->handle, buf + total, chunk, at);
-                    if (n < 0) { result = total != 0 ? (int64_t)total : n; break; }
-                    total += (uint64_t)n;
-                    result = (int64_t)total;
-                    if ((uint64_t)n < chunk) break;
-                } while (total < count);
-            }
+            /* O_APPEND handling, sealing and positional-write limits are
+             * Linux file semantics; never invent an append sentinel. */
+            result = lpr_filed_io_handle(KB2_FILESYSTEM_OP_PWRITE,
+                file->handle, buf, count, offset);
         }
     }
     lpr_fd_unpin(&pin);
@@ -862,112 +435,21 @@ int64_t lpr_linux_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t o
 }
 
 int64_t lpr_linux_pread_to_vmo(
-    uint64_t fd,
-    uint64_t vmo_fd,
-    uint64_t vmo_offset,
-    uint64_t count,
-    uint64_t file_offset)
+    uint64_t fd, uint64_t vmo_fd, uint64_t vmo_offset,
+    uint64_t count, uint64_t file_offset)
 {
-    if (!lpr_fd_is_filed(fd)) {
-        return -LPR_LINUX_EBADF;
-    }
-    if (vmo_fd < 16) {
+    if (vmo_fd < 16 || vmo_offset > UINT64_MAX - count)
         return -LPR_LINUX_EINVAL;
-    }
-    if (vmo_offset + count < vmo_offset) {
-        return -LPR_LINUX_EINVAL;
-    }
-
-    void *page = 0;
-    const int page_fd = lpr_create_pread_vmo_wire_page(&page);
-    if (page_fd < 0) {
-        return page_fd;
-    }
-
-    filed_pread_vmo_t *pread_vmo = (filed_pread_vmo_t *)page;
-    lpr_memset(pread_vmo, 0, sizeof(*pread_vmo));
-    pread_vmo->handle = lpr_filed_backend(fd)->handle;
-    pread_vmo->file_offset = file_offset;
-    pread_vmo->vmo_offset = vmo_offset;
-    pread_vmo->length = count;
-
-    const int64_t ready = lpr_filed_endpoint_ready();
-    if (ready != 0) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
-        return ready;
-    }
-
-    struct pacha_ipc_fd fds[2];
-    struct pacha_ipc_msg request;
-    struct pacha_ipc_msg reply;
-    lpr_zero_bytes(fds, sizeof(fds));
-    lpr_zero_bytes(&request, sizeof(request));
-    lpr_zero_bytes(&reply, sizeof(reply));
-
-    fds[0].fd = (uint64_t)(uint32_t)page_fd;
-    fds[0].rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-    fds[1].fd = vmo_fd;
-    fds[1].rights =
-        PACHA_FD_RIGHT_CLOSE |
-        PACHA_FD_RIGHT_MAP_READ |
-        PACHA_FD_RIGHT_MAP_WRITE;
-
-    lpr_memmove((uint8_t *)page + PACHA_SERVICE_HEADER_BYTES, page, sizeof(*pread_vmo));
-    lpr_memset(page, 0, PACHA_SERVICE_HEADER_BYTES);
-    const uint64_t request_id = lpr_next_request_id(&lpr_request_id);
-    pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
-    header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
-    header->service_id = FILED_SERVICE_ID;
-    header->op = FILED_OP_VFS_PREAD_TO_VMO;
-    header->flags = PACHA_SERVICE_FLAG_PAGE_PAYLOAD;
-    header->request_id = request_id;
-    header->trace_id = request_id;
-    header->payload_size = sizeof(*pread_vmo);
-    header->fd_count = 1;
-    request.word0 = PACHA_SERVICE_REQUEST_MAGIC;
-    request.word1 = 0;
-    request.word3 = request_id;
-    request.fds = fds;
-    request.fd_count = 2;
-
-    const int64_t reply_fd = lpr_pacha_syscall2(
-        PACHAOS_SYSCALL_IPC_CALL,
-        lpr_filed_client_fd,
-        (uint64_t)(uintptr_t)&request);
-    if (reply_fd < 16) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
-        return lpr_pacha_status_to_errno(reply_fd);
-    }
-
-    const int64_t recv_status = lpr_native_ipc_recv_wait(
-        (uint64_t)(uint32_t)reply_fd,
-        &reply);
-    (void)lpr_pacha_syscall1(PACHAOS_SYSCALL_FD_CLOSE, (uint64_t)(uint32_t)reply_fd);
-    if (recv_status != 0) {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
-        return lpr_pacha_status_to_errno(recv_status);
-    }
-    const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
-    if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC ||
-        reply.word3 != request_id ||
-        reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
-        reply_header->service_id != FILED_SERVICE_ID ||
-        reply_header->op != FILED_OP_VFS_PREAD_TO_VMO ||
-        reply_header->request_id != request_id)
-    {
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
-        return -LPR_LINUX_EIO;
-    }
-    if (reply_header->status < 0) {
-        const int64_t status = reply_header->status;
-        lpr_destroy_pread_vmo_wire_page(page_fd, page);
-        return status;
-    }
-    const int64_t result = (int64_t)reply_header->result;
-    lpr_destroy_pread_vmo_wire_page(page_fd, page);
+    if (!count) return 0;
+    const uint64_t base = vmo_offset & ~4095ull;
+    const uint64_t prefix = vmo_offset - base;
+    const uint64_t mapped_bytes = lpr_page_align_up(prefix + count);
+    if (!mapped_bytes) return -LPR_LINUX_EOVERFLOW;
+    const int64_t mapped = lpr_pacha_syscall6(PACHAOS_SYSCALL_MMAP,
+        vmo_fd, 0, mapped_bytes, PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
+        PACHAOS_MMAP_SHARED, base);
+    if (mapped < 4096) return lpr_pacha_status_to_errno(mapped);
+    const int64_t result = lpr_linux_pread64(fd, mapped + prefix, count, file_offset);
+    (void)lpr_pacha_syscall2(PACHAOS_SYSCALL_MUNMAP, mapped, mapped_bytes);
     return result;
 }

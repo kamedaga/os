@@ -5,7 +5,8 @@
 #include "filed/payload.h"
 
 enum {
-    LPR_EXEC_SCRIPT_PREFIX_BYTES = 128,
+    /* Match the pinned Linux BINPRM_BUF_SIZE, not the old inline ABI budget. */
+    LPR_EXEC_SCRIPT_PREFIX_BYTES = 256,
     LPR_EXEC_SCRIPT_MAX_DEPTH = 4,
 };
 

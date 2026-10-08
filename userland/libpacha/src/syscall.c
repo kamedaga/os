@@ -1,4 +1,29 @@
 #include "pacha/syscall.h"
+#include "pacha/abi.h"
+
+long pacha_clock_read(uint64_t clock_id, uint64_t *nanoseconds) {
+    uint64_t status, value;
+    __asm__ volatile("syscall"
+        : "=a"(status), "=d"(value)
+        : "a"((uint64_t)PACHA_RUNTIME_SYSCALL_CLOCK_READ), "D"(clock_id)
+        : "rcx", "r11", "memory");
+    *nanoseconds = value;
+    return (long)status;
+}
+
+long pacha_futex_wake_wait(uint64_t wake_va, uint64_t wait_va,
+    uint32_t expected, uint64_t timeout_ticks, uint64_t *wake_count) {
+    uint64_t status, count;
+    register uint64_t r10 __asm__("r10") = expected;
+    register uint64_t r8 __asm__("r8") = timeout_ticks;
+    __asm__ volatile("syscall"
+        : "=a"(status), "=d"(count)
+        : "a"((uint64_t)PACHA_RUNTIME_SYSCALL_FUTEX_WAKE_WAIT),
+          "D"(wake_va), "S"(wait_va), "r"(r10), "r"(r8)
+        : "rcx", "r11", "memory");
+    *wake_count = count;
+    return (long)status;
+}
 
 long pacha_syscall0(uint64_t nr) {
     uint64_t ret;

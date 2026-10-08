@@ -11,9 +11,8 @@
 #define UNIX_SERVICE_MAGIC UINT64_C(0x3151455258494e55)
 #define UNIX_REPLY_MAGIC UINT64_C(0x3159505258494e55)
 #define UNIX_NOTIFY_MAGIC UINT64_C(0x315946544e495855)
-#define UNIX_SERVICE_VERSION 9u
 /* This reply guarantees that dispatch did not run. Retry the same request
- * once with its VMO attached. word1=version, word2=missing token. */
+ * once with its VMO attached. word1=0, word2=missing token. */
 #define UNIX_BUFFER_MISS_MAGIC UINT64_C(0x3153494d58494e55)
 #define UNIX_CONTROL_BYTES 8192u
 #define UNIX_PATH_BYTES 108u
@@ -150,7 +149,7 @@ struct unix_attachment {
 
 struct unix_control {
     uint64_t magic;
-    uint32_t version;
+    uint32_t size;
     uint32_t operation;
     uint64_t request;
     uint64_t socket;
@@ -217,7 +216,7 @@ struct unix_control {
 
 struct unix_boot_config {
     uint64_t magic;
-    uint64_t version;
+    uint64_t size;
     uint64_t admin_endpoint;
     uint64_t filed_path_channel;
     uint64_t ready_channel;

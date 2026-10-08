@@ -9,6 +9,7 @@ if(UNIXD_PROFILE)
 endif()
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(UNIXD_ELF "${CMAKE_BINARY_DIR}/unixd.elf")
 set(UNIXD_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/service.c
@@ -31,7 +32,7 @@ add_custom_command(
     "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libpacha/include"
     "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ ${UNIXD_PROFILE_FLAG}"
     bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${UNIXD_ELF}"
-  DEPENDS ${UNIXD_SOURCES}
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES} ${UNIXD_SOURCES}
     src/main.c src/service.h src/broker.h src/broker_internal.h src/rights.h src/escrow.h
     include/unixd/transfer.h
     ${REPO_ROOT}/userland/filed/include/filed/unix_path.h
@@ -39,7 +40,6 @@ add_custom_command(
     ${REPO_ROOT}/userland/libipc/include/pacha/ipc.h
     ${REPO_ROOT}/userland/libpacha/include/pacha/abi.h
     ${REPO_ROOT}/musl/pachaos/build/build-smokes.sh
-    ${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h
   WORKING_DIRECTORY "${REPO_ROOT}"
   VERBATIM)
 add_custom_target(unixd ALL DEPENDS "${UNIXD_ELF}")

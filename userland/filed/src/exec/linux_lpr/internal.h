@@ -8,7 +8,7 @@
 
 #include "filed/payload.h"
 #include "filed/runtime.h"
-#include "filed/vfs.h"
+#include "filed/storage.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 #include "script.h"
@@ -32,8 +32,7 @@ enum {
     LPR_EXEC_PF_R = 4,
     LPR_EXEC_SHT_SYMTAB = 2,
     LPR_EXEC_SHT_DYNSYM = 11,
-    LPR_EXEC_MAX_IMAGE_BYTES = 64ull * 1024ull * 1024ull,
-    LPR_EXEC_MAX_INTERP_BYTES = 256,
+    LPR_EXEC_MAX_INTERP_BYTES = 4096,
     LPR_EXEC_WALK_RIGHTS =
         FILED_RIGHT_LOOKUP |
         FILED_RIGHT_STAT |
@@ -45,15 +44,11 @@ _Static_assert(LPR_IMAGE_AT_BOOTSTRAP_FD == PACHA_AT_BOOTSTRAP_FD, "bootstrap au
 
 typedef struct lpr_exec_image {
     unsigned char *bytes;
-    uint64_t backend_object;
-    uint64_t object_generation;
     uint64_t size;
 } lpr_exec_image_t;
 
 typedef struct lpr_exec_file {
     filed_handle_id_t handle_id;
-    uint64_t backend_object;
-    uint64_t object_generation;
     uint64_t size;
 } lpr_exec_file_t;
 
@@ -81,9 +76,9 @@ typedef struct lpr_exec_loaded {
 } lpr_exec_loaded_t;
 
 typedef struct lpr_exec_pending_map_batch {
-    struct pacha_process_map_batch_entry entries[PACHA_PROCESS_MAP_BATCH_MAX_ENTRIES];
-    int close_fds[PACHA_PROCESS_MAP_BATCH_MAX_ENTRIES];
-    uint64_t count;
+    struct pacha_process_map_batch_entry *entries;
+    int *close_fds;
+    uint64_t count, capacity;
 } lpr_exec_pending_map_batch_t;
 
 typedef struct lpr_exec_plan {
@@ -145,35 +140,6 @@ static inline uint64_t lpr_exec_prot_from_elf_flags(uint32_t flags)
     return prot;
 }
 
-static inline int lpr_exec_status_to_errno(filed_status_t status)
-{
-    switch (status) {
-    case FILED_OK:
-        return 0;
-    case FILED_ERR_NOT_FOUND:
-        return -2;
-    case FILED_ERR_NOT_DIR:
-        return -20;
-    case FILED_ERR_IS_DIR:
-        return -21;
-    case FILED_ERR_DENIED:
-        return -13;
-    case FILED_ERR_FULL:
-    case FILED_ERR_OVERFLOW:
-        return -75;
-    case FILED_ERR_IO:
-        return -5;
-    case FILED_ERR_BAD_FORMAT:
-    case FILED_ERR_INVALID_IMAGE:
-        return -8;
-    case FILED_ERR_UNSUPPORTED:
-        return -95;
-    case FILED_ERR_INVALID:
-    default:
-        return -22;
-    }
-}
-
 int lpr_exec_read_full_image(filed_runtime_t *runtime, filed_handle_id_t handle_id, lpr_exec_image_t *out_image);
 int lpr_exec_read_full_file_image(
     filed_runtime_t *runtime,
@@ -222,12 +188,8 @@ int lpr_exec_patch_syscalls(
     unsigned char *bytes,
     uint64_t size,
     uint64_t *out_patched);
-void lpr_exec_image_dump_metrics(void);
 void lpr_exec_map_dump_metrics(void);
 
-void lpr_exec_invalidate_segment_vmo_cache(uint64_t backend_object);
-void lpr_exec_invalidate_runtime_image_cache(uint64_t backend_object);
-void lpr_exec_invalidate_interpreter_cache(filed_runtime_t *runtime, uint64_t backend_object);
 int lpr_exec_install_low_layout(int process_fd, uint64_t syscall_entry_va);
 int lpr_exec_load_image_into_process(
     int process_fd,

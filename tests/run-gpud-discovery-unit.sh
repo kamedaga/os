@@ -6,5 +6,8 @@ mkdir -p .artifacts/tests/gpud-discovery
   -fsanitize=address,undefined \
   -Iuserland/libipc/include -Iuserland/libpacha/include \
   -Iuserland/libcapsule/include -Iuserland/filed/include \
-  tests/gpud_discovery_unit.c -o .artifacts/tests/gpud-discovery/unit
+  -Iuserland/libfiled_client/include -Ikobox2/protocol/include \
+  -Ikobox2/protocol/generated/include \
+  tests/gpud_discovery_unit.c kobox2/protocol/src/filesystem.c \
+  -o .artifacts/tests/gpud-discovery/unit
 .artifacts/tests/gpud-discovery/unit

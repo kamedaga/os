@@ -5,9 +5,7 @@ pub const image_flag_present: u64 = 1 << 0;
 pub const image_flag_kernel_loaded: u64 = 1 << 1;
 
 pub const magic: u64 = 0x49425453; // "IBTS"
-pub const version: u64 = 20;
 pub const config_magic: u64 = 0x49425443; // "IBTC"
-pub const config_version: u64 = 1;
 pub const max_spawn_page_descriptors: usize = 8;
 pub const boot_display_shell_height: u64 = 624;
 pub const boot_log_user_page_va: u64 = process_abi.auxPageVa(1);
@@ -117,14 +115,14 @@ pub const BootArchiveDescriptor = extern struct {
 
 pub const ConfigPage = extern struct {
     magic: u64,
-    version: u64,
+    size: u64,
     descriptor_page_va: u64,
     reserved0: u64 = 0,
 };
 
 pub const DescriptorPage = extern struct {
     magic: u64,
-    version: u64,
+    size: u64,
     spawn_page_count: u64,
     boot_image_count: u64,
     _reserved_counts: [3]u64 = .{ 0, 0, 0 },
@@ -133,3 +131,9 @@ pub const DescriptorPage = extern struct {
     spawn_pages: [max_spawn_page_descriptors]SpawnPageDescriptor,
     boot_images: [max_boot_image_descriptors]BootImageDescriptor,
 };
+
+comptime {
+    if (@sizeOf(ConfigPage) != 32 or @sizeOf(DescriptorPage) != 616 or
+        @offsetOf(DescriptorPage, "boot_images") != 520)
+        @compileError("init bootstrap record layout mismatch");
+}

@@ -106,6 +106,86 @@ static int64_t hello(void)
     if (!error) assert(result == 1);
     return error;
 }
+static void kms_query_marshalling(void)
+{
+    const uint32_t commands[] = {GPUD_DRM_IOCTL_MODE_GETRESOURCES,
+        GPUD_DRM_IOCTL_MODE_GETPLANERESOURCES, GPUD_DRM_IOCTL_MODE_GETPLANE,
+        GPUD_DRM_IOCTL_MODE_GETPROPERTY, GPUD_DRM_IOCTL_MODE_OBJ_GETPROPERTIES};
+    for (unsigned int command = 0; command < 5; ++command) {
+        struct gpud_kms_query_shape shape;
+        assert(gpud_kms_query_shape(commands[command], &shape));
+        for (unsigned int large = 0; large < 2; ++large) {
+            unsigned char snapshot[64] = {0}, scalar[64] = {0};
+            uint64_t arrays[4][256], values[256];
+            memset(arrays, 0xcc, sizeof(arrays)); memset(values, 0xcc, sizeof(values));
+            gpud_drm_ioctl_request_t request = {0};
+            uint32_t capacities[4], offset = 0;
+            for (unsigned int i = 0; i < shape.vectors; ++i) {
+                const struct gpud_kms_vector *v = &shape.vector[i];
+                capacities[i] = large ? v->limit + 3 : 2;
+                uint64_t pointer = (uintptr_t)arrays[i], second_pointer = (uintptr_t)values;
+                memcpy(snapshot + v->count, &capacities[i], 4);
+                memcpy(snapshot + v->pointer, &pointer, 8);
+                if (v->second_pointer) memcpy(snapshot + v->second_pointer, &second_pointer, 8);
+            }
+            int fd = -1; void *mapping = NULL; uint64_t map_size = 0;
+            assert(!lpr_kms_query_prepare(&request, &shape, snapshot, 0, &fd, &mapping, &map_size));
+            assert(request.data_size == (large ? shape.scalar_size : shape.inline_size));
+            memcpy(scalar, request.data, shape.scalar_size);
+            for (unsigned int i = 0; i < shape.vectors; ++i) {
+                const struct gpud_kms_vector *v = &shape.vector[i];
+                uint64_t pointer;
+                memcpy(&pointer, scalar + v->pointer, 8); assert(!pointer);
+                if (v->second_pointer) {
+                    memcpy(&pointer, scalar + v->second_pointer, 8); assert(!pointer);
+                }
+                unsigned char *target = large ? (unsigned char *)mapping + offset : request.data + v->inline_array;
+                if (v->second_pointer) {
+                    for (uint32_t n = 0; n < capacities[i]; ++n) {
+                        uint32_t id = 100 + n; uint64_t value = 200 + n;
+                        memcpy(target + n * (large ? 16 : 4), &id, 4);
+                        memcpy(large ? target + n * 16 + 8 : request.data + v->second_array + n * 8, &value, 8);
+                    }
+                } else memset(target, 0x5a, capacities[i] * v->stride);
+                offset += capacities[i] * v->stride;
+            }
+            /* Insufficient whole vectors stay untouched; partial vectors
+             * expose only capacity, matching their individual Linux ioctl. */
+            for (unsigned int i = 0; i < shape.vectors; ++i) {
+                uint32_t required = capacities[i] + 1;
+                memcpy(request.data + shape.vector[i].count, &required, 4);
+            }
+            assert(!lpr_kms_query_reply(&request, &shape, snapshot, mapping, (uintptr_t)scalar));
+            for (unsigned int i = 0; i < shape.vectors; ++i) {
+                const struct gpud_kms_vector *v = &shape.vector[i];
+                assert(!memcmp(scalar + v->pointer, snapshot + v->pointer, 8));
+                const unsigned char *bytes = (const unsigned char *)arrays[i];
+                assert(bytes[0] == (v->partial ? v->second_pointer ? 100 : 0x5a : 0xcc));
+                assert(bytes[capacities[i] * (v->second_pointer ? 4 : v->stride)] == 0xcc);
+            }
+            /* Exact output copies every element but never overwrites tails. */
+            for (unsigned int i = 0; i < shape.vectors; ++i)
+                memcpy(request.data + shape.vector[i].count, &capacities[i], 4);
+            assert(!lpr_kms_query_reply(&request, &shape, snapshot, mapping, (uintptr_t)scalar));
+            for (unsigned int i = 0; i < shape.vectors; ++i)
+                assert(((unsigned char *)arrays[i])[0] == (shape.vector[i].second_pointer ? 100 : 0x5a));
+            if (large && shape.vector[0].second_pointer) {
+                uint32_t reserved = 1;
+                memcpy((unsigned char *)mapping + 4, &reserved, 4);
+                memset(arrays, 0xcc, sizeof(arrays));
+                assert(lpr_kms_query_reply(&request, &shape, snapshot, mapping, (uintptr_t)scalar) == -LPR_LINUX_EIO);
+                assert(((unsigned char *)arrays)[0] == 0xcc);
+            }
+            if (large) lpr_drm_aux_destroy(fd, mapping, map_size);
+            uint32_t excessive = 65537;
+            memcpy(snapshot + shape.vector[0].count, &excessive, 4);
+            assert(lpr_kms_query_prepare(&request, &shape, snapshot, 0,
+                &fd, &mapping, &map_size) == -LPR_LINUX_EINVAL);
+        }
+    }
+    puts("LPR KMS queries: pointer stripping/restoration, dynamic vectors, partial/exact copies and malformed records PASS");
+}
+
 int main(void)
 {
     assert(amdgpu_info_failure(22, 440, "validate", -22) == -22);
@@ -203,6 +283,54 @@ int main(void)
     chunks[1].chunk_id=5; ib.pad=1;
     assert(lpr_drm_prepare_amdgpu_cs((uintptr_t)&cs,0,&request,&tmp_fd,&tmp,&tmp_bytes)==-LPR_LINUX_EINVAL);
     assert(tmp_fd==-1 && !tmp && !tmp_bytes);
+    kms_query_marshalling();
+    {
+        /* Older libdrm owns only the original prefix; ASan must catch any
+         * accidental read of the newer num_entries/padding tail. */
+        struct { uint32_t handle, op; uint64_t value; } prefix = {
+            7, 0, UINT64_C(0x12345000)
+        };
+        _Static_assert(sizeof(prefix) == 16, "original Linux GEM_OP prefix");
+        gpud_drm_ioctl_request_t operation = {0};
+        uint64_t pointer = 0, extent = 0;
+        int view_fd = -1; void *view = NULL;
+        assert(!lpr_drm_prepare_amdgpu_gem_op(GPUD_DRM_IOCTL_AMDGPU_GEM_OP,
+            (uintptr_t)&prefix, 1, &operation, &pointer,
+            &view_fd, &view, &extent));
+        assert(pointer == prefix.value && operation.arg_size == sizeof(prefix));
+        lpr_drm_aux_destroy(view_fd, view, extent);
+    }
+    for (unsigned extended = 0; extended < 2; ++extended) {
+        gpud_drm_amdgpu_gem_op_t user = {.handle = 7, .op = 0,
+            .value = UINT64_C(0x12345000)};
+        uint64_t pointer = 0;
+        gpud_drm_ioctl_request_t operation = {0};
+        int view_fd = -1; void *view = NULL; uint64_t extent = 0;
+        const uint32_t command = extended ? GPUD_DRM_IOCTL_AMDGPU_GEM_OP_EXT :
+            GPUD_DRM_IOCTL_AMDGPU_GEM_OP;
+        assert(!lpr_drm_prepare_amdgpu_gem_op(command, (uintptr_t)&user, 1,
+            &operation, &pointer, &view_fd, &view, &extent));
+        gpud_drm_amdgpu_gem_op_t wire;
+        memcpy(&wire, operation.data, sizeof(wire));
+        assert(pointer == user.value && !wire.value && wire.handle == 7 &&
+            operation.aux_size == 32 && operation.data_size == 24 &&
+            operation.arg_size == (extended ? 24u : 16u));
+        lpr_drm_aux_destroy(view_fd, view, extent);
+        operation = (gpud_drm_ioctl_request_t){0};
+        view_fd = -1; view = NULL; extent = pointer = 0;
+        user.op = 1; user.value = 4;
+        assert(!lpr_drm_prepare_amdgpu_gem_op(command, (uintptr_t)&user, 1,
+            &operation, &pointer, &view_fd, &view, &extent));
+        memcpy(&wire, operation.data, sizeof(wire));
+        assert(wire.value == 4 && !pointer && !operation.aux_size && !view);
+        user.op = 0; user.value = 0;
+        assert(lpr_drm_prepare_amdgpu_gem_op(command, (uintptr_t)&user, 1,
+            &operation, &pointer, &view_fd, &view, &extent) == -LPR_LINUX_EFAULT);
+        user.op = 2;
+        assert(lpr_drm_prepare_amdgpu_gem_op(command, (uintptr_t)&user, 1,
+            &operation, &pointer, &view_fd, &view, &extent) == -LPR_LINUX_EOPNOTSUPP);
+    }
+    puts("LPR GEM_OP: both native sizes, pointer stripping, scalar placement and null rejection PASS");
     puts("LPR Mesa CS: multiple IBs, ignored BO fields, sync/fence, rejects and cleanup PASS");
     puts("LPR page connection: one bind, no VMO per call, loss/no replay, fork, errors PASS");
     puts("LPR auxiliary reuse: zeroing, bounded retention, temporary fallback, fork and errors PASS");

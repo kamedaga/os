@@ -3,6 +3,7 @@
 #define PACHA_GPUD_DRM_SERVICE_H
 
 #include "drm_files.h"
+#include "drm_translate.h"
 #include "gpu_rpc.h"
 #include "../../kobox2/linux-sandbox/kobox/boot/drm_limits.h"
 
@@ -68,7 +69,25 @@ struct gpud_drm_service {
     uint32_t profile_kind;
     int log_endpoint_fd;
     uint64_t backend_client, correlation, event_sequence;
+    /* Linux DRM grants the first primary open master implicitly. Track the
+     * owning frontend file so DROP/SET and last-close follow that lifetime. */
+    uint64_t master_handle;
+    /* Keep legacy and atomic display APIs distinct for one master tenure.
+     * The Linux DRM driver validates each commit, including TEST_ONLY; a
+     * previously tested property snapshot cannot authorize later flips. */
+    uint32_t kms_session_mode;
     uint64_t resource_creates, gem_closes, exec_submits;
+    /* Bound startup diagnostics per generation, not per client, so a busy
+     * renderer cannot turn the shared RAM log into a frame-by-frame trace. */
+    unsigned int startup_requests_logged, active_request_sequence;
+    /* Requests are serialized by this generation owner. Keep the admitted
+     * command and transfer snapshots out of the call stack: reply validation
+     * re-encodes the request and otherwise nests both large translations. */
+    struct {
+        struct gpud_drm_translation translation;
+        unsigned char request[KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE + GPUD_DRM_COMMAND_BYTES];
+        unsigned char reply[GPUD_GPU_CHANNEL_PAGE], output[GPUD_GPU_CHANNEL_PAGE];
+    } ioctl_workspace;
     struct gpud_drm_pending_fence *fences;
     struct gpud_drm_connection *connections;
     struct pacha_pollfd *pollfds;

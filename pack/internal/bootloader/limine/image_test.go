@@ -1,11 +1,125 @@
 package limine
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestInstallerDataPartitionReadback(t *testing.T) {
+	for _, tool := range []string{"sgdisk", "mformat", "mcopy"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s unavailable", tool)
+		}
+	}
+	dir := t.TempDir()
+	image := filepath.Join(dir, "installer.img")
+	payload := filepath.Join(dir, "rootfs.tar")
+	systemBootfs := filepath.Join(dir, "system.bootfs")
+	systemConfig := filepath.Join(dir, "limine.conf")
+	kernel := filepath.Join(dir, "kernel.elf")
+	init := filepath.Join(dir, "init.elf")
+	limineEFI := filepath.Join(dir, "limine.efi")
+	desktop := filepath.Join(dir, "desktop.tgz")
+	if err := os.WriteFile(payload, []byte("explicit installer archive fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(systemBootfs, []byte("ordinary storage boot archive"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(systemConfig, []byte("/PachaOS installed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(desktop, []byte("optional desktop fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range map[string]string{
+		kernel: "kernel", init: "init", limineEFI: "limine",
+	} {
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := createEmptyImage(image, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	bootBytes, err := imageSize(image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dataBytes := roundImageBytes(64 << 20)
+	if err := os.Truncate(image, bootBytes+dataBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := partitionImage(image, bootBytes, dataBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeInstallerPayload(image, bootBytes, dataBytes, payload,
+		systemBootfs, systemConfig, kernel, init, limineEFI); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDesktopPayload(image, bootBytes, desktop); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFATFile(image, bootBytes, "DESKTOP.TGZ", desktop); err != nil {
+		t.Fatal(err)
+	}
+	desktopDigest := filepath.Join(dir, "desktop.sha")
+	if out, err := exec.Command("mcopy", "-o", "-i",
+		image+"@@"+fmt.Sprint(bootBytes), "::/DESKTOP.SHA", desktopDigest).CombinedOutput(); err != nil {
+		t.Fatalf("read DESKTOP.SHA: %s: %v", out, err)
+	}
+	digestBytes, err := os.ReadFile(desktopDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDesktopDigest := fmt.Sprintf("%x  DESKTOP.TGZ\n", sha256.Sum256([]byte("optional desktop fixture")))
+	if string(digestBytes) != wantDesktopDigest {
+		t.Fatalf("unexpected desktop digest: %q", digestBytes)
+	}
+	metadata := filepath.Join(dir, "install.meta")
+	if out, err := exec.Command("mcopy", "-o", "-i",
+		image+"@@"+fmt.Sprint(bootBytes), "::/INSTALL.META", metadata).CombinedOutput(); err != nil {
+		t.Fatalf("read INSTALL.META: %s: %v", out, err)
+	}
+	metadataBytes, err := os.ReadFile(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMetadata := fmt.Sprintf("1 %d %d %d %d %d %d\n",
+		len("explicit installer archive fixture"),
+		len("ordinary storage boot archive"),
+		len("kernel"), len("init"), len("limine"),
+		len("/PachaOS installed\n"))
+	if string(metadataBytes) != wantMetadata {
+		t.Fatalf("INSTALL.META=%q, want %q", metadataBytes, wantMetadata)
+	}
+	if out, err := exec.Command("sgdisk", "--verify", image).CombinedOutput(); err != nil {
+		t.Fatalf("invalid GPT: %s: %v", out, err)
+	}
+	for number, name := range map[string]string{"2": "pacha-live-esp", "3": "pacha-install-data"} {
+		out, err := exec.Command("sgdisk", "--info="+number, image).CombinedOutput()
+		if err != nil || !strings.Contains(string(out), name) {
+			t.Fatalf("partition %s: %s: %v", number, out, err)
+		}
+	}
+	dataInfo, err := exec.Command("sgdisk", "--info=3", image).CombinedOutput()
+	if err != nil || !strings.Contains(string(dataInfo),
+		"Partition GUID code: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7") {
+		t.Fatalf("installer data must not masquerade as ESP: %s: %v", dataInfo, err)
+	}
+	// The installer must refuse a corrupted payload before it can write a target.
+	if err := os.WriteFile(payload, []byte("tampered"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyFATFile(image, bootBytes, "ROOTFS.TAR", payload); err == nil {
+		t.Fatal("accepted corrupted payload")
+	}
+}
 
 func TestLiveConfigHasOnlyNormalAndManualDiagnosticEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "limine.conf")

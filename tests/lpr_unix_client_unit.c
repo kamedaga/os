@@ -54,6 +54,10 @@ int64_t lpr_pacha_syscall1(uint64_t nr, uint64_t fd)
 
 int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
 {
+    if (nr == PACHAOS_SYSCALL_LOG) {
+        assert(a0 && a1 && a1 <= 256);
+        return 0;
+    }
     if (nr == PACHAOS_SYSCALL_FD_GET_INFO) {
         assert(a0 == 80 && live[80]);
         struct pacha_fd_info *info = (struct pacha_fd_info *)(uintptr_t)a1;
@@ -117,7 +121,7 @@ int64_t lpr_pacha_syscall2(uint64_t nr, uint64_t a0, uint64_t a1)
         assert(message->fds[page_caps].transfer_flags == PACHA_IPC_TRANSFER_PRIVATE);
         request->result = ++thread_registrations;
         break;
-    case UNIX_OP_HELLO: request->result = UNIX_SERVICE_VERSION; break;
+    case UNIX_OP_HELLO: request->result = 0; break;
     case UNIX_OP_SOCKETPAIR: {
         uint64_t pair[2];
         request->status = unix_broker_socketpair(broker, session,
@@ -191,7 +195,7 @@ int64_t lpr_pacha_syscall4(uint64_t nr, uint64_t fd, uint64_t address, uint64_t 
     if (mode == RECV_ERROR) return PACHA_SYSCALL_ERR_INVALID;
     const struct unix_control *request = (const struct unix_control *)unix_page;
     if (missed_token) {
-        reply->word0 = UNIX_BUFFER_MISS_MAGIC; reply->word1 = UNIX_SERVICE_VERSION;
+        reply->word0 = UNIX_BUFFER_MISS_MAGIC; reply->word1 = 0;
         reply->word2 = missed_token; reply->word3 = request->request + (mode == BAD_REPLY);
         reply->fd_count = 0;
         return 0;

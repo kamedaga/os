@@ -7,9 +7,8 @@
 #include <string.h>
 #include <time.h>
 
-#include "filed/backend_router.h"
+#include "filed/storage.h"
 #include "filed/runtime.h"
-#include "filed/page_cache.h"
 #include "pacha/abi.h"
 #include "pacha/ipc.h"
 #include "pacha/syscall.h"
@@ -40,8 +39,7 @@ enum {
     FILED_EXEC_AT_ENTRY = 9,
     FILED_EXEC_AT_RANDOM = 25,
     FILED_EXEC_AT_EXECFN = 31,
-    FILED_EXEC_MAX_IMAGE_BYTES = 64ull * 1024ull * 1024ull,
-    FILED_EXEC_MAX_INTERP_BYTES = 256,
+    FILED_EXEC_MAX_INTERP_BYTES = 4096,
     FILED_EXEC_DYN_MAIN_BASE = 0x10000000ull,
     FILED_EXEC_DYN_INTERP_BASE = 0x20000000ull,
     FILED_EXEC_WALK_RIGHTS =
@@ -179,266 +177,6 @@ static int filed_exec_validate_elf_ehdr_prefix(const unsigned char *bytes)
     return 0;
 }
 
-static const char *filed_exec_skip_slashes(const char *path)
-{
-    while (path != NULL && *path == '/') {
-        ++path;
-    }
-    return path;
-}
-
-static filed_vnode_kind_t filed_exec_kind_from_unix_type(uint64_t kind)
-{
-    switch (kind & 0170000u) {
-    case 0040000u:
-        return FILED_VNODE_DIRECTORY;
-    case 0120000u:
-        return FILED_VNODE_SYMLINK;
-    case 0010000u:
-        return FILED_VNODE_FIFO;
-    case 0100000u:
-    default:
-        return FILED_VNODE_REGULAR;
-    }
-}
-
-static int filed_exec_status_to_errno(filed_status_t status)
-{
-    switch (status) {
-    case FILED_OK:
-        return 0;
-    case FILED_ERR_NOT_FOUND:
-        return -2;
-    case FILED_ERR_NOT_DIR:
-        return -20;
-    case FILED_ERR_IS_DIR:
-        return -21;
-    case FILED_ERR_DENIED:
-        return -13;
-    case FILED_ERR_FULL:
-    case FILED_ERR_OVERFLOW:
-        return -75;
-    case FILED_ERR_IO:
-        return -5;
-    case FILED_ERR_BAD_FORMAT:
-    case FILED_ERR_INVALID_IMAGE:
-        return -8;
-    case FILED_ERR_UNSUPPORTED:
-        return -95;
-    case FILED_ERR_INVALID:
-    default:
-        return -22;
-    }
-}
-
-static void filed_exec_close_walk_handle(
-    filed_runtime_t *runtime,
-    filed_handle_id_t handle_id,
-    int owned)
-{
-    if (runtime != NULL &&
-        owned &&
-        handle_id != 0 &&
-        handle_id != runtime->root_handle_id)
-    {
-        (void)filed_vfs_close_handle(&runtime->vfs, handle_id);
-    }
-}
-
-static int filed_exec_lookup_and_open_component(
-    filed_runtime_t *runtime,
-    filed_handle_id_t parent_handle,
-    const char *name,
-    uint32_t rights,
-    uint32_t open_flags,
-    filed_vfs_open_result_t *out_open)
-{
-    filed_vfs_io_decision_t parent_decision;
-    uint64_t object_id = 0;
-    storage_statx_reply_t backend_stat;
-    filed_status_t status;
-    filed_backend_object_id_t cached_object = 0;
-    bool existing_vnode_owns_object = false;
-
-    if (runtime == NULL || name == NULL || out_open == NULL) {
-        return -22;
-    }
-    existing_vnode_owns_object =
-        filed_vfs_cached_child_backend_object(
-            &runtime->vfs,
-            parent_handle,
-            name,
-            &cached_object) == FILED_OK;
-
-    status = filed_vfs_lookup_prepare(&runtime->vfs, parent_handle, &parent_decision);
-    if (status != FILED_OK) {
-        return filed_exec_status_to_errno(status);
-    }
-
-    int result = filed_runtime_backend_lookup(
-        runtime,
-        parent_decision.backend_object,
-        name,
-        &object_id);
-    if (result != 0) {
-        return result;
-    }
-
-    memset(&backend_stat, 0, sizeof(backend_stat));
-    result = filed_runtime_backend_statx(runtime, object_id, &backend_stat);
-    if (result != 0) {
-        (void)filed_runtime_backend_release_object(runtime, object_id);
-        return result;
-    }
-
-    status = filed_vfs_open_backend_child(
-        &runtime->vfs,
-        parent_handle,
-        object_id,
-        filed_exec_kind_from_unix_type(backend_stat.kind),
-        name,
-        rights,
-        open_flags,
-        out_open);
-    if (status != FILED_OK ||
-        (existing_vnode_owns_object && cached_object == object_id))
-    {
-        (void)filed_runtime_backend_release_object(runtime, object_id);
-    }
-    return filed_exec_status_to_errno(status);
-}
-
-static int filed_exec_open_absolute_path(
-    filed_runtime_t *runtime,
-    const char *path,
-    uint32_t rights,
-    uint32_t open_flags,
-    filed_vfs_open_result_t *out_open)
-{
-    filed_handle_id_t current_handle;
-    int current_owned = 0;
-
-    if (runtime == NULL || path == NULL || path[0] != '/' || out_open == NULL) {
-        return -22;
-    }
-
-    path = filed_exec_skip_slashes(path);
-    if (*path == '\0') {
-        return -22;
-    }
-
-    memset(out_open, 0, sizeof(*out_open));
-    current_handle = runtime->root_handle_id;
-
-    for (;;) {
-        char component[FILED_NAME_BYTES];
-        const char *component_start;
-        const char *after_slashes;
-        size_t component_len;
-        int has_more;
-        int require_directory;
-        int final_component;
-
-        path = filed_exec_skip_slashes(path);
-        if (*path == '\0') {
-            filed_exec_close_walk_handle(runtime, current_handle, current_owned);
-            return -22;
-        }
-
-        component_start = path;
-        while (*path != '\0' && *path != '/') {
-            ++path;
-        }
-        component_len = (size_t)(path - component_start);
-        if (component_len == 0 || component_len >= sizeof(component)) {
-            filed_exec_close_walk_handle(runtime, current_handle, current_owned);
-            return -22;
-        }
-
-        after_slashes = filed_exec_skip_slashes(path);
-        has_more = *after_slashes != '\0';
-        require_directory = (*path == '/');
-        final_component = !has_more;
-
-        memset(component, 0, sizeof(component));
-        memcpy(component, component_start, component_len);
-
-        if (component_len == 1 && component[0] == '.') {
-            if (final_component) {
-                const filed_status_t status = filed_vfs_open_existing(
-                    &runtime->vfs,
-                    current_handle,
-                    rights,
-                    open_flags | (require_directory ? FILED_OPEN_DIRECTORY : 0),
-                    out_open);
-                filed_exec_close_walk_handle(runtime, current_handle, current_owned);
-                return filed_exec_status_to_errno(status);
-            }
-            path = after_slashes;
-            continue;
-        }
-
-        if (component_len == 2 && component[0] == '.' && component[1] == '.') {
-            filed_vfs_open_result_t parent_open;
-            const uint32_t next_rights = final_component ? rights : FILED_EXEC_WALK_RIGHTS;
-            const uint32_t next_flags =
-                final_component ?
-                    (open_flags | (require_directory ? FILED_OPEN_DIRECTORY : 0)) :
-                    FILED_OPEN_DIRECTORY;
-            filed_status_t status;
-
-            memset(&parent_open, 0, sizeof(parent_open));
-            status = filed_vfs_open_parent(
-                &runtime->vfs,
-                current_handle,
-                next_rights,
-                next_flags,
-                &parent_open);
-            filed_exec_close_walk_handle(runtime, current_handle, current_owned);
-            if (status != FILED_OK) {
-                return filed_exec_status_to_errno(status);
-            }
-            if (final_component) {
-                *out_open = parent_open;
-                return 0;
-            }
-            current_handle = parent_open.handle_id;
-            current_owned = 1;
-            path = after_slashes;
-            continue;
-        }
-
-        if (final_component) {
-            const int result = filed_exec_lookup_and_open_component(
-                runtime,
-                current_handle,
-                component,
-                rights,
-                open_flags | (require_directory ? FILED_OPEN_DIRECTORY : 0),
-                out_open);
-            filed_exec_close_walk_handle(runtime, current_handle, current_owned);
-            return result;
-        }
-
-        filed_vfs_open_result_t next_open;
-        const int result = filed_exec_lookup_and_open_component(
-            runtime,
-            current_handle,
-            component,
-            FILED_EXEC_WALK_RIGHTS,
-            FILED_OPEN_DIRECTORY,
-            &next_open);
-        filed_exec_close_walk_handle(runtime, current_handle, current_owned);
-        if (result != 0) {
-            return result;
-        }
-        current_handle = next_open.handle_id;
-        current_owned = 1;
-        path = after_slashes;
-    }
-}
-
-
 static void filed_exec_discard_process_fd(int process_fd)
 {
     if (process_fd >= 16) {
@@ -451,68 +189,21 @@ static void filed_exec_discard_process_fd(int process_fd)
 }
 
 
-static int filed_exec_read_range(
-    filed_runtime_t *runtime,
-    filed_handle_id_t handle_id,
-    uint64_t backend_object,
-    uint64_t file_size,
-    uint64_t start_offset,
-    unsigned char *buffer,
-    uint64_t length)
+static int filed_exec_read_range(filed_runtime_t *runtime,
+    uint64_t handle, uint64_t object, uint64_t size, uint64_t offset,
+    unsigned char *buffer, uint64_t length)
 {
-    filed_vfs_io_decision_t read_decision;
-    uint64_t got = 0;
-
-    if (runtime == NULL || buffer == NULL || start_offset > file_size ||
-        length > file_size - start_offset)
-    {
-        return -22;
-    }
-    if (length == 0) {
-        return 0;
-    }
-
-    const filed_status_t vfs_status = filed_vfs_pread_prepare(
-        &runtime->vfs,
-        handle_id,
-        start_offset,
-        length,
-        &read_decision);
-    if (vfs_status != FILED_OK) {
-        fprintf(stderr,
-            "[filed] exec read prepare failed handle=%u offset=%llu want=%llu status=%d\n",
-            (unsigned)handle_id,
-            (unsigned long long)start_offset,
-            (unsigned long long)length,
-            (int)vfs_status);
-        return -13;
-    }
-    if (read_decision.backend_object != backend_object) {
-        fprintf(stderr,
-            "[filed] exec read object changed expected=%llu actual=%llu\n",
-            (unsigned long long)backend_object,
-            (unsigned long long)read_decision.backend_object);
-        return -13;
-    }
-
-    const int status = filed_cached_pread(
-        runtime,
-        backend_object,
-        read_decision.offset,
-        buffer,
-        read_decision.length,
-        &got);
-    if (status != 0 || got != length) {
-        fprintf(stderr,
-            "[filed] exec pread failed object=%llu offset=%llu want=%llu decision_offset=%llu decision_length=%llu status=%d got=%llu\n",
-            (unsigned long long)backend_object,
-            (unsigned long long)start_offset,
-            (unsigned long long)length,
-            (unsigned long long)read_decision.offset,
-            (unsigned long long)read_decision.length,
-            status,
-            (unsigned long long)got);
-        return status != 0 ? status : -5;
+    (void)object;
+    if (!runtime || (length && !buffer) || offset > size ||
+        length > size-offset || length > SIZE_MAX) return -22;
+    size_t done = 0;
+    while (done < length) {
+        size_t got = 0;
+        int status = filed_storage_exec_pread(runtime,handle,offset+done,buffer+done,
+                                         (size_t)length-done,&got);
+        if (status) return status;
+        if (!got) return -8;
+        done += got;
     }
     return 0;
 }
@@ -522,63 +213,22 @@ static int filed_exec_read_image(
     filed_handle_id_t handle_id,
     filed_exec_image_t *out_image)
 {
-    filed_vfs_io_decision_t stat_decision;
-    filed_vfs_stat_snapshot_t snapshot;
-    storage_statx_reply_t stat;
-    filed_status_t vfs_status;
+    filed_storage_stat_t stat;
     unsigned char ehdr[FILED_EXEC_ELF64_EHDR_BYTES];
-    unsigned char *image;
-    int status;
-
-    if (runtime == NULL || out_image == NULL) {
-        return -22;
-    }
+    unsigned char *image = NULL;
+    if (!runtime || !out_image || !handle_id) return -22;
     memset(out_image, 0, sizeof(*out_image));
-
-    vfs_status = filed_vfs_stat_prepare(&runtime->vfs, handle_id, &stat_decision);
-    if (vfs_status != FILED_OK) {
-        return -13;
-    }
-    memset(&snapshot, 0, sizeof(snapshot));
-    vfs_status = filed_vfs_get_stat_snapshot(&runtime->vfs, handle_id, &snapshot);
-    if (vfs_status != FILED_OK) {
-        return -13;
-    }
-    memset(&stat, 0, sizeof(stat));
-    if (snapshot.valid) {
-        stat.inode_number = snapshot.inode_number;
-        stat.mode = snapshot.mode;
-        stat.size = snapshot.size;
-        stat.blocks = snapshot.blocks;
-        stat.nlink = snapshot.nlink;
-        stat.kind = snapshot.kind;
-    } else {
-        status = filed_runtime_backend_statx(runtime, stat_decision.backend_object, &stat);
-        if (status != 0) {
-            return status;
-        }
-        snapshot.valid = true;
-        snapshot.inode_number = stat.inode_number;
-        snapshot.mode = stat.mode;
-        snapshot.size = stat.size;
-        snapshot.blocks = stat.blocks;
-        snapshot.nlink = stat.nlink;
-        snapshot.kind = stat.kind;
-        (void)filed_vfs_update_stat_snapshot(
-            &runtime->vfs,
-            stat_decision.backend_object,
-            &snapshot);
-    }
-    if ((stat.kind & 0170000u) != 0100000u || stat.size < FILED_EXEC_ELF64_EHDR_BYTES ||
-        stat.size > FILED_EXEC_MAX_IMAGE_BYTES)
-    {
+    int status = filed_storage_exec_stat(runtime, handle_id, &stat);
+    if (status) return status;
+    if ((stat.mode & 0170000) != 0100000 ||
+        stat.size < FILED_EXEC_ELF64_EHDR_BYTES || stat.size > SIZE_MAX)
         return -8;
-    }
+    if (!(stat.mode & 0111)) return -13;
 
     status = filed_exec_read_range(
         runtime,
         handle_id,
-        stat_decision.backend_object,
+        handle_id,
         stat.size,
         0,
         ehdr,
@@ -600,7 +250,7 @@ static int filed_exec_read_image(
     }
     const uint64_t metadata_size =
         filed_exec_max_u64(e_phoff + phdr_bytes, FILED_EXEC_ELF64_EHDR_BYTES);
-    if (metadata_size > FILED_EXEC_MAX_IMAGE_BYTES || metadata_size > stat.size) {
+    if (metadata_size > SIZE_MAX || metadata_size > stat.size) {
         return -8;
     }
 
@@ -613,7 +263,7 @@ static int filed_exec_read_image(
         status = filed_exec_read_range(
             runtime,
             handle_id,
-            stat_decision.backend_object,
+            handle_id,
             stat.size,
             sizeof(ehdr),
             image + sizeof(ehdr),
@@ -654,7 +304,7 @@ static int filed_exec_read_image(
             }
         }
     }
-    if (needed_size < metadata_size || needed_size > FILED_EXEC_MAX_IMAGE_BYTES) {
+    if (needed_size < metadata_size || needed_size > SIZE_MAX) {
         free(image);
         return -8;
     }
@@ -669,7 +319,7 @@ static int filed_exec_read_image(
         status = filed_exec_read_range(
             runtime,
             handle_id,
-            stat_decision.backend_object,
+            handle_id,
             stat.size,
             metadata_size,
             image + metadata_size,
@@ -918,27 +568,13 @@ static int filed_exec_load_image_into_process(
     return 0;
 }
 
-static int filed_exec_read_interpreter(
-    filed_runtime_t *runtime,
-    const char *path,
-    filed_exec_image_t *out_image)
+static int filed_exec_read_interpreter(filed_runtime_t *runtime,
+    const char *path, filed_exec_image_t *out)
 {
-    filed_vfs_open_result_t open_result;
-    if (runtime == NULL || path == NULL || out_image == NULL) {
-        return -22;
-    }
-    memset(&open_result, 0, sizeof(open_result));
-    int status = filed_exec_open_absolute_path(
-        runtime,
-        path,
-        FILED_RIGHT_READ | FILED_RIGHT_EXEC | FILED_RIGHT_STAT,
-        0,
-        &open_result);
-    if (status != 0) {
-        return status;
-    }
-    status = filed_exec_read_image(runtime, open_result.handle_id, out_image);
-    (void)filed_vfs_close_handle(&runtime->vfs, open_result.handle_id);
+    uint64_t handle = 0;
+    int status=filed_storage_exec_open(runtime,0,path,&handle);
+    if (!status) status = filed_exec_read_image(runtime, handle, out);
+    if(handle) (void)filed_storage_exec_close(runtime, handle);
     return status;
 }
 
@@ -1077,18 +713,15 @@ static const char *filed_exec_request_arg(
     return request->path;
 }
 
-static int filed_exec_start_plan(
+static int filed_exec_start_plan_impl(
     filed_exec_plan_t *plan,
     const filed_exec_path_t *request,
-    int bootstrap_fd)
+    int bootstrap_fd, uint64_t *argv_va, uint64_t *envp_va)
 {
     if (plan == NULL || request == NULL || plan->process_fd < 16) {
         return -22;
     }
 
-    if (request->argc > FILED_EXEC_MAX_ARGS || request->envc > FILED_EXEC_MAX_ENVS) {
-        return -22;
-    }
 
     const uint64_t stack_rights =
         PACHA_FD_RIGHT_INSPECT |
@@ -1129,10 +762,6 @@ static int filed_exec_start_plan(
     uint64_t sp = PACHA_PROCESS_DEFAULT_STACK_SIZE;
     const uint64_t argc = filed_exec_request_argc(request);
     const uint64_t envc = request->envc;
-    uint64_t argv_va[FILED_EXEC_MAX_ARGS];
-    uint64_t envp_va[FILED_EXEC_MAX_ENVS];
-    memset(argv_va, 0, sizeof(argv_va));
-    memset(envp_va, 0, sizeof(envp_va));
 
     for (uint64_t i = envc; i > 0; --i) {
         const int status = filed_exec_copy_stack_string(
@@ -1259,6 +888,23 @@ static int filed_exec_start_plan(
     }
     plan->thread_fd = thread_fd;
     return 0;
+}
+
+
+static int filed_exec_start_plan(filed_exec_plan_t *plan,
+    const filed_exec_path_t *request, int bootstrap_fd)
+{
+    if (!request || request->argc > SIZE_MAX / sizeof(uint64_t) - 1 ||
+        request->envc > SIZE_MAX / sizeof(uint64_t)) return -7;
+    size_t argc = request->argc ? (size_t)request->argc : 1;
+    size_t envc = (size_t)request->envc;
+    if (argc > SIZE_MAX / sizeof(uint64_t) - envc) return -7;
+    uint64_t *vectors = calloc(argc + envc, sizeof(*vectors));
+    if (!vectors) return -12;
+    int status = filed_exec_start_plan_impl(plan,request,bootstrap_fd,
+                                vectors,vectors+argc);
+    free(vectors);
+    return status;
 }
 
 int filed_exec_native_handle(

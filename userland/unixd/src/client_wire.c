@@ -30,7 +30,7 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
     UP_BEGIN(serialize, UP_RPC, request->operation, UP_SERIALIZE);
     copy_bytes(page, request, sizeof(*request));
     page->magic = UNIX_SERVICE_MAGIC;
-    page->version = UNIX_SERVICE_VERSION;
+    page->size = sizeof(*page);
     page->status = 0;
     page->result = 0;
     page->buffer_token = 0;
@@ -61,7 +61,7 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
         UP_END(receive_time);
         UP_BEGIN(validate, UP_RPC, request->operation, UP_VALIDATE);
         if (status == 0 && reply.word0 == UNIX_BUFFER_MISS_MAGIC) {
-            if (token >= 2 && reply.word1 == UNIX_SERVICE_VERSION && reply.word2 == token &&
+            if (token >= 2 && reply.word1 == 0 && reply.word2 == token &&
                 reply.word3 == request->request && reply.fd_count == 0) *miss = 1;
             status = -EPROTO;
         }
@@ -69,7 +69,7 @@ static int exchange_page_once(const struct unix_client_io *io, int endpoint,
             struct unix_control result;
             copy_bytes(&result, page, sizeof(result));
             if (reply.word0 != UNIX_REPLY_MAGIC || reply.word3 != request->request ||
-                result.magic != UNIX_REPLY_MAGIC || result.version != UNIX_SERVICE_VERSION ||
+                result.magic != UNIX_REPLY_MAGIC || result.size != sizeof(result) ||
                 result.request != request->request || result.operation != request->operation ||
                 result.status != (int64_t)reply.word1 || result.result != reply.word2 ||
                 result.buffer_token == 1 || (token >= 2 && result.buffer_token != token) ||

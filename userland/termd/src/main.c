@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 int main(int argc, char **argv)
@@ -21,7 +22,7 @@ int main(int argc, char **argv)
     if (bootstrap_fd < 16 ||
         pacha_fd_read(bootstrap_fd, &config, sizeof(config)) != (long)sizeof(config) ||
         cfg->magic != TERMD_BOOT_CONFIG_MAGIC ||
-        cfg->version != TERMD_BOOT_CONFIG_VERSION ||
+        cfg->size != sizeof(*cfg) ||
         cfg->tty_endpoint_fd < 16 ||
         cfg->ready_channel_fd < 16) {
         pacha_trace0(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_BOOT_CONFIG_INVALID, PACHA_TRACE_CLASS_ERROR);
@@ -32,6 +33,11 @@ int main(int argc, char **argv)
     termd_service_t service;
     termd_service_init(&service, cfg, &tty_island);
 
+#ifdef TERMD_MODULE_DIAGNOSTICS
+    /* Enable the loader's existing diagnostics only in the explicit probe
+     * build; the termd linker adapter makes them independent of stream caps. */
+    (void)setenv("KOBOX_TRACE_MODULES", "1", 1);
+#endif
     const int island_status = termd_linux_tty_island_init(&tty_island, cfg);
     if (island_status != 0) {
         pacha_trace1(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_ISLAND_INIT, PACHA_TRACE_CLASS_ERROR, (uint64_t)island_status);
@@ -64,20 +70,27 @@ int main(int argc, char **argv)
     const int ready_status =
         island_status != 0 ? island_status :
         (tty_island.ready && tty_island.source_count != 0 ? 0 : TERMD_ERR_NODEV);
+    /* The launcher stops on a failing ready reply. Publish the actual island
+     * failure before that reply so it cannot hide module/bootstrap evidence. */
+    if (ready_status != 0) {
+        printf(
+            "[termd] startup failed status=%d load=%d init=%d devpts=%d modules=%u/%u device_fd=%llu\n",
+            ready_status, tty_island.load_status, tty_island.init_status,
+            tty_island.devpts_status, tty_island.loaded_module_count,
+            tty_island.configured_module_count,
+            (unsigned long long)cfg->device_fd);
+        (void)fflush(stdout);
+        /* Error trace records otherwise remain process-local. Dump through
+         * the native log syscall independently of the stdio transport. */
+        pacha_trace_dump_ring();
+    }
     const int ready_send_status =
         termd_service_send_boot_ready(&service, ready_status, tty_island.source_count);
     if (ready_send_status != 0) {
         pacha_trace2(PACHA_TRACE_COMPONENT_TERMD, PACHA_TRACE_EVENT_TERMD_BOOT_READY_SEND, PACHA_TRACE_CLASS_ERROR, (uint64_t)ready_send_status, (uint64_t)ready_status);
         return 1;
     }
-    if (ready_status != 0) {
-        fprintf(stderr,
-            "[termd] startup failed status=%d load=%d init=%d devpts=%d modules=%u/%u\n",
-            ready_status, tty_island.load_status, tty_island.init_status,
-            tty_island.devpts_status, tty_island.loaded_module_count,
-            tty_island.configured_module_count);
-        return 1;
-    }
+    if (ready_status != 0) return 1;
 
     for (;;) {
         if (tty_island.wake_irq_fd >= 16) {

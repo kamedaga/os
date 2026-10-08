@@ -2,10 +2,12 @@
 #include "input_bridge.h"
 
 #include <pacha/ipc.h>
+#include <pacha/syscall.h>
 #include <errno.h>
 #include <string.h>
 
-static int wait_reply(struct ph_ipc *ipc, int process_fd, uint64_t operation,
+static int wait_reply(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
+    int process_fd, uint64_t operation,
     uint64_t correlation) {
     for (;;) {
         struct ph_ipc_packet reply = {0};
@@ -24,8 +26,26 @@ static int wait_reply(struct ph_ipc *ipc, int process_fd, uint64_t operation,
         if (result) return result;
         result = reply.operation == operation &&
             reply.generation == ipc->generation &&
-            reply.correlation == correlation && !reply.fd_count ?
+            reply.correlation == correlation ?
             (int)(int64_t)reply.value : -EPROTO;
+        /* Only ATTACH may confer a doorbell. Take ownership after checking
+         * the actual capability, never a peer-supplied descriptor number. */
+        if (!result && operation == PH_USB_INPUT_ATTACH) {
+            struct pacha_fd_info info = {0};
+            const uint64_t rights = PACHA_FD_RIGHT_READ | PACHA_FD_RIGHT_WAIT |
+                PACHA_FD_RIGHT_POLL | PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_INSPECT;
+            if (reply.fd_count != 1 || bridge->event_fd >= 16 ||
+                pacha_syscall2(PACHA_FD_SYSCALL_GET_INFO,
+                    reply.fds[0].fd, (uintptr_t)&info) ||
+                info.kind != PACHA_FD_KIND_EVENT ||
+                !(info.flags & PACHA_FD_FLAG_NONBLOCK) ||
+                (info.rights & rights) != rights ||
+                (info.rights & PACHA_FD_RIGHT_WRITE)) result = -EPROTO;
+            else {
+                bridge->event_fd = (int)reply.fds[0].fd;
+                reply.fds[0].fd = PH_IPC_NO_FD;
+            }
+        } else if (reply.fd_count) result = -EPROTO;
         int closed = ph_ipc_packet_release(&reply);
         return closed ? closed : result;
     }
@@ -50,7 +70,7 @@ static int request(struct usbd_input_bridge *bridge, struct ph_ipc *ipc,
     }
     int result = ph_ipc_send(ipc, &packet);
     if (result) return result;
-    result = wait_reply(ipc, process_fd, operation, correlation);
+    result = wait_reply(bridge, ipc, process_fd, operation, correlation);
     if (result) return result;
     if (bridge->shared->magic != PH_USB_INPUT_SHARED_MAGIC ||
         bridge->shared->generation != bridge->generation ||
@@ -122,6 +142,10 @@ int usbd_input_bridge_close(struct usbd_input_bridge *bridge) {
         result = pacha_munmap(bridge->shared, PH_USB_INPUT_SHARED_BYTES);
     if (bridge->vmo_fd >= 16) {
         int closed = pacha_fd_close(bridge->vmo_fd);
+        if (!result) result = closed;
+    }
+    if (bridge->event_fd >= 16) {
+        int closed = pacha_fd_close(bridge->event_fd);
         if (!result) result = closed;
     }
     *bridge = (struct usbd_input_bridge){0};

@@ -6,6 +6,7 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(netd C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(NETD_ELF "${CMAKE_BINARY_DIR}/netd.elf")
 set(NETD_LIBUINET_ARCHIVE "${REPO_ROOT}/.artifacts/libuinet-pachaos/lib/libuinet.a")
 set(NETD_LIBUINET_INCLUDE "${REPO_ROOT}/.artifacts/libuinet-pachaos/include")
@@ -21,6 +22,7 @@ set(NETD_SOURCES
   ${REPO_ROOT}/userland/libpacha/src/log.c
   ${REPO_ROOT}/userland/libpacha/src/trace.c
   ${REPO_ROOT}/userland/gpud/launch.c
+  ${REPO_ROOT}/userland/kobox2_owner/boot.c
   ${REPO_ROOT}/userland/gpud/launch_native.c
   ${REPO_ROOT}/userland/gpud/arch/x86_64/launch_image.c
   ${REPO_ROOT}/userland/gpud/bootstrap.c
@@ -55,7 +57,7 @@ string(REPLACE ";" " " NETD_SOURCES_ENV "${NETD_SOURCES}")
 add_custom_command(
   OUTPUT "${NETD_LIBUINET_ARCHIVE}"
   COMMAND bash "${REPO_ROOT}/pack/scripts/build_libuinet_pachaos.sh"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
     "${REPO_ROOT}/pack/scripts/build_libuinet_pachaos.sh"
     "${REPO_ROOT}/pack/scripts/download_libuinet.sh"
     "${REPO_ROOT}/pack/scripts/apply_libuinet_pachaos_overlay.sh"
@@ -82,18 +84,22 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${NETD_SOURCES_ENV}"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${NETD_SOURCES_ENV} ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
       "PACHAOS_MUSL_EXTRA_LINK_INPUTS=${NETD_LIBUINET_ARCHIVE} ${NETD_MBEDTLS_ARCHIVE}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${NETD_LIBUINET_INCLUDE} ${NETD_MBEDTLS_INCLUDE} ${REPO_ROOT}/userland/gpud ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/kobox2/include ${REPO_ROOT}/kobox2/linux-sandbox/kobox ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${NETD_LIBUINET_INCLUDE} ${NETD_MBEDTLS_INCLUDE} ${REPO_ROOT}/userland/gpud ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/kobox2/include ${REPO_ROOT}/kobox2/linux-sandbox/kobox ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include"
       "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -DNETD_WITH_LIBUINET -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${NETD_ELF}"
   DEPENDS
+    "${REPO_ROOT}/userland/libfiled_client/src/client.c"
+    "${REPO_ROOT}/userland/libfiled_client/include/filed_client/client.h"
+    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+    "${REPO_ROOT}/kobox2/protocol/include/kobox2/filesystem.h"
+    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
     "${NETD_LIBUINET_ARCHIVE}"
     "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/log.h"
     "${REPO_ROOT}/userland/libpacha/src/log.c"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     "${NETD_MBEDTLS_ARCHIVE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/netd_internal.h"
@@ -102,6 +108,7 @@ add_custom_command(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox2_package.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox2_package.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox2_nic.c"
+    "${REPO_ROOT}/userland/kobox2_owner/boot.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/kobox2_nic.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dhcp.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/dhcp.h"

@@ -1,5 +1,5 @@
 From Stdlib Require Import Bool.Bool Lists.List ZArith.ZArith.
-From Pacha.Filed Require Import FiledTypes VfsModel ExecModel.
+From Pacha.Filed Require Import FiledTypes ExecModel.
 
 Import ListNotations.
 Open Scope Z_scope.
@@ -66,7 +66,7 @@ Theorem non_cloexec_handle_is_inherited :
   forall handles handle,
     In handle handles ->
     handle_has_cloexec handle = false ->
-    In (vh_id handle) (build_handle_inherit_plan handles).
+    In (eh_id handle) (build_handle_inherit_plan handles).
 Proof.
   intros handles handle Hin Hcloexec.
   unfold build_handle_inherit_plan.

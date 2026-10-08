@@ -6,11 +6,10 @@
 
 #define LOGD_BOOT_MAGIC UINT64_C(0x31544f4f42474f4c)
 #define LOGD_READY_MAGIC UINT64_C(0x31594452474f4c50)
-#define LOGD_BOOT_VERSION 1u
 
 struct logd_boot_config {
     uint64_t magic;
-    uint64_t version;
+    uint64_t size;
     uint64_t endpoint_fd;
     uint64_t filed_endpoint_fd;
     uint64_t ready_channel_fd;

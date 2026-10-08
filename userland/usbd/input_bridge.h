@@ -7,6 +7,7 @@
 
 struct usbd_input_bridge {
     int vmo_fd;
+    int event_fd;
     struct ph_usb_input_shared *shared;
     uint64_t generation;
     uint64_t next_correlation;

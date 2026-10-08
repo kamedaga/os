@@ -1,6 +1,7 @@
 #include "../lpr_filed_internal.h"
 #include "../support/browser_diag.h"
 #include "allocate.h"
+#include "device.h"
 
 #define LPR_BACKEND_SLAB_PAGE_BYTES 4096u
 #define LPR_BACKEND_SLAB_SLOT_BYTES 256u
@@ -134,6 +135,7 @@ uint64_t lpr_backend_state_bytes_for_ops(uint8_t ops_id)
     switch (ops_id) {
     case LPR_FD_OPS_FILED: return sizeof(lpr_filed_backend_t);
     case LPR_FD_OPS_DEVICE: return sizeof(lpr_device_backend_t);
+    case LPR_FD_OPS_INSTALL_DISK: return sizeof(lpr_block_backend_t);
     case LPR_FD_OPS_TTY: return sizeof(lpr_tty_backend_t);
     case LPR_FD_OPS_DRM: return sizeof(lpr_drm_backend_t);
     case LPR_FD_OPS_INPUT: return sizeof(lpr_input_backend_t);
@@ -158,6 +160,7 @@ static uint32_t lpr_backend_rights(uint8_t ops_id, uint64_t linux_flags)
     case LPR_FD_OPS_FILED:
         return common | readable | writable | LPR_FD_RIGHT_MMAP | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_DEVICE:
+    case LPR_FD_OPS_INSTALL_DISK:
     case LPR_FD_OPS_TTY:
         return common | readable | writable | LPR_FD_RIGHT_IOCTL;
     case LPR_FD_OPS_DRM:
@@ -338,6 +341,12 @@ lpr_device_backend_t *lpr_device_backend(uint64_t fd)
     return (lpr_device_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_DEVICE);
 }
 
+lpr_block_backend_t *lpr_block_backend(uint64_t fd)
+{
+    return (lpr_block_backend_t *)lpr_backend_state_for_fd(fd,
+        LPR_FD_OPS_INSTALL_DISK);
+}
+
 lpr_pipe_backend_t *lpr_pipe_backend(uint64_t fd)
 {
     return (lpr_pipe_backend_t *)lpr_backend_state_for_fd(fd, LPR_FD_OPS_PIPE);
@@ -424,12 +433,6 @@ int lpr_linux_sync_file_fd_active(uint64_t fd)
     return lpr_fd_ops_active(fd, LPR_FD_OPS_SYNC_FILE);
 }
 
-int lpr_fd_shadow_offset_eligible(uint64_t fd)
-{
-    const lpr_filed_backend_t *filed = lpr_filed_backend(fd);
-    return filed != 0 &&
-        (filed->flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY;
-}
 
 int lpr_linux_filed_fd_active(uint64_t fd)
 {
@@ -450,7 +453,10 @@ int lpr_runtime_reserved_fd(uint64_t fd)
         fd == LPR_GPUD_DRM_ENDPOINT_FD ||
         fd == LPR_INPUTD_INPUT_ENDPOINT_FD ||
         fd == LPR_BOOTSTRAP_FD ||
-        fd == LPR_SUPERVISOR_ENDPOINT_FD;
+        fd == LPR_SUPERVISOR_ENDPOINT_FD ||
+        fd == LPR_INSTALL_DISK_ENDPOINT_FD ||
+        fd == LPR_INSTALL_MEDIA_ENDPOINT_FD ||
+        fd == LPR_INSTALL_ROOT_ENDPOINT_FD;
 }
 
 int lpr_native_fd_info(uint64_t fd, struct pacha_fd_info *out)
@@ -601,10 +607,8 @@ int lpr_control_install_fd(
     case LPR_FD_OPS_FILED: {
         lpr_filed_backend_t *backend = (lpr_filed_backend_t *)state;
         backend->active = 1;
-        backend->offset_valid = 1;
         backend->flags = (uint32_t)linux_flags;
         backend->handle = backend_id;
-        backend->offset = offset;
         backend->lease_fd.raw = -1;
         break;
     }
@@ -614,6 +618,7 @@ int lpr_control_install_fd(
         backend->major = (uint8_t)(backend_id >> 32u);
         backend->minor = (uint8_t)backend_id;
         backend->flags = (uint32_t)linux_flags;
+        backend->description_fd.raw = -1;
         break;
     }
     case LPR_FD_OPS_TTY: {
@@ -719,16 +724,40 @@ int lpr_control_install_fd(
     return 0;
 }
 
+int64_t lpr_control_close_fd_status(uint64_t fd)
+{
+    lpr_fd_pin_t pin;
+    if (fd > LPR_LINUX_FD_MAX || lpr_fd_table_pin(
+            &lpr_control_fd_table, (uint32_t)fd, &pin) != 0)
+        return -LPR_LINUX_EBADF;
+    lpr_epoll_before_close(fd);
+    const int64_t binding_status = pin.ops_id == LPR_FD_OPS_FILED ?
+        lpr_filed_endpoint_ready() : 0;
+    lpr_fd_drop_t drop;
+    const int closed = lpr_fd_table_close_pinned(&lpr_control_fd_table, &pin, &drop);
+    if (binding_status && pin.ops_id == LPR_FD_OPS_FILED) {
+        lpr_fd_table_lock(&lpr_control_fd_table);
+        lpr_ofd_t *ofd = &lpr_control_fd_table.ofds[pin.ofd_index];
+        if (ofd->active && ofd->generation == pin.ofd_generation &&
+            ofd->closing && !ofd->refcount) {
+            /* Other IO pins may defer the final drop. Retire authority now,
+             * not only when this unpin happens to be the final one. Live
+             * dup aliases keep their state and may bind on later use. */
+            ((lpr_filed_backend_t *)pin.state)->handle = 0;
+        }
+        lpr_fd_table_unlock(&lpr_control_fd_table);
+    }
+    /* The pin prevents an early drop; release it even on binding failure or
+     * concurrent close/reuse. A failed close must still remove the old FD. */
+    (void)lpr_fd_table_unpin(&lpr_control_fd_table, &pin, &drop);
+    const int64_t drop_status = drop.ready ? lpr_backend_finish_drop(&drop) : 0;
+    return binding_status ? binding_status : closed ? -LPR_LINUX_EBADF : drop_status;
+}
+
 void lpr_control_close_fd(uint64_t fd)
 {
     lpr_browser_diag("control-close", fd, 0, 0);
-    if (fd < lpr_fd_table_capacity) {
-        lpr_epoll_before_close(fd);
-        lpr_fd_drop_t drop;
-        if (lpr_fd_table_close(&lpr_control_fd_table, (uint32_t)fd, &drop) == 0 && drop.ready) {
-            (void)lpr_backend_finish_drop(&drop);
-        }
-    }
+    (void)lpr_control_close_fd_status(fd);
 }
 
 int lpr_control_fd_active(uint64_t fd)
@@ -782,6 +811,7 @@ void lpr_control_sync_backend_flags(uint64_t fd)
     switch (pin.ops_id) {
     case LPR_FD_OPS_FILED: backend_flags = &((lpr_filed_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_DEVICE: backend_flags = &((lpr_device_backend_t *)pin.state)->flags; break;
+    case LPR_FD_OPS_INSTALL_DISK: backend_flags = &((lpr_block_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_TTY: backend_flags = &((lpr_tty_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_DRM: backend_flags = &((lpr_drm_backend_t *)pin.state)->flags; break;
     case LPR_FD_OPS_INPUT: backend_flags = &((lpr_input_backend_t *)pin.state)->flags; break;
@@ -832,6 +862,14 @@ int lpr_control_set_status_flags(uint64_t fd, uint64_t flags)
         const int status = lpr_unix_socket_flags(&pin, &socket_flags, 1);
         lpr_fd_unpin(&pin);
         return status;
+    }
+    if (pin.ops_id == LPR_FD_OPS_DEVICE) {
+        lpr_device_backend_t *device = pin.state;
+        lpr_fd_table_lock(&lpr_control_fd_table);
+        const uint32_t status = lpr_control_status_flags_from_linux(flags);
+        device->flags = lpr_control_merge_backend_flags(device->flags, 0, status);
+        lpr_device_description_set_flags(device, status);
+        lpr_fd_table_unlock(&lpr_control_fd_table);
     }
     lpr_fd_unpin(&pin);
     if (lpr_fd_table_set_status_flags(
@@ -889,6 +927,11 @@ int64_t lpr_control_get_status_flags(uint64_t fd, uint32_t access_mode)
         lpr_fd_unpin(&pin);
         return status ? status : (int64_t)socket_flags;
     }
+    if (pin.ops_id == LPR_FD_OPS_DEVICE) {
+        const uint32_t status = lpr_device_description_flags(pin.state);
+        lpr_fd_unpin(&pin);
+        return (int64_t)(access_mode | lpr_control_status_flags_to_linux(status));
+    }
     lpr_fd_unpin(&pin);
     uint32_t status_flags = 0;
     if (lpr_fd_table_get_status_flags(&lpr_control_fd_table, (uint32_t)fd, &status_flags) != 0) {
@@ -905,17 +948,12 @@ uint64_t lpr_filed_control_offset(uint64_t fd)
     {
         return offset;
     }
-    const lpr_filed_backend_t *filed = lpr_filed_backend(fd);
-    return filed != 0 ? filed->offset : 0;
+    return 0;
 }
 
 void lpr_filed_control_set_offset(uint64_t fd, uint64_t offset)
 {
     if (fd < lpr_fd_table_capacity) {
-        lpr_filed_backend_t *filed = lpr_filed_backend(fd);
-        if (filed != 0) {
-            filed->offset = offset;
-        }
         if (lpr_control_require_fd(fd) == 0) {
             (void)lpr_fd_table_set_offset(&lpr_control_fd_table, (uint32_t)fd, offset);
         }
@@ -926,12 +964,6 @@ void lpr_filed_control_advance_offset(uint64_t fd, uint64_t old_offset, uint64_t
 {
     const uint64_t new_offset = old_offset + amount;
     lpr_filed_control_set_offset(fd, new_offset);
-    if (new_offset < old_offset) {
-        lpr_filed_backend_t *filed = lpr_filed_backend(fd);
-        if (filed != 0) {
-            filed->offset_valid = 0;
-        }
-    }
 }
 
 int lpr_pipe_track_native_fd(
@@ -980,7 +1012,6 @@ int lpr_fd_alloc(uint64_t handle, uint64_t flags)
     if (filed == 0) return -LPR_LINUX_ENOMEM;
     *filed = (lpr_filed_backend_t){
         .active = 1,
-        .offset_valid = ((flags & LPR_LINUX_O_ACCMODE) == LPR_LINUX_O_RDONLY) ? 1u : 0u,
         .flags = (uint32_t)flags, .handle = handle, .lease_fd.raw = -1,
     };
     const lpr_fd_install_t install = {
@@ -1065,6 +1096,15 @@ static int lpr_manifest_install_first(
     void *state = lpr_backend_state_alloc(ofd->record_bytes);
     if (state == 0) return 0;
     lpr_memcpy(state, record, ofd->record_bytes);
+    if (ofd->backend_id == LPR_FD_OPS_DEVICE) {
+        lpr_device_backend_t *device = state;
+        /* A manifest belongs to the old address space, not this mapping. */
+        device->description_map = 0;
+        if (device->description_fd.raw >= 16 && lpr_device_description_map(device)) {
+            (void)lpr_backend_state_free(state, ofd->record_bytes);
+            return 0;
+        }
+    }
     const lpr_fd_install_t install = {
         .ops_id = (uint8_t)ofd->backend_id,
         .fd_flags = entry->fd_flags,
@@ -1076,6 +1116,10 @@ static int lpr_manifest_install_first(
         .backend_state_bytes = ofd->record_bytes,
     };
     if (lpr_fd_table_install_at(&lpr_control_fd_table, fd, &install) != 0) {
+        /* The manifest still owns its capability on installation failure;
+         * discard only the speculative mapping in this address space. */
+        if (ofd->backend_id == LPR_FD_OPS_DEVICE)
+            (void)lpr_device_description_unmap(state);
         (void)lpr_backend_state_free(state, ofd->record_bytes);
         return 0;
     }
@@ -1204,9 +1248,9 @@ void lpr_state_dump(const char *reason)
                 pacha_trace_name_id("lpr.fd.filed"),
                 fd,
                 ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->handle,
-                ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->offset,
-                ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->offset_valid,
-                lpr_page_cache_clock);
+                object->offset,
+                0,
+                ((lpr_filed_backend_t *)lpr_backend_state_from_ofd(object))->flags);
             break;
         case LPR_FD_OPS_PIPE:
             pacha_trace6(

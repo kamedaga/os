@@ -3,8 +3,10 @@
 #include "../support/unmap_profile.h"
 #include "../../../../../kobox2/linux-sandbox/kobox/boot/drm_limits.h"
 #include "../../../../../kobox2/protocol/generated/include/kobox2/gpu_drm_amdgpu_layout.h"
+#include "../../../../../kobox2/protocol/generated/include/kobox2/gpu_drm_mode_layout.h"
 #include "../../../../../kobox2/protocol/include/kobox2/amdgpu_info_bridge.h"
 #include "amdgpu_info.h"
+#include <gpud/drm_kms_query.h>
 #include "../../../../../kobox2/protocol/include/kobox2/amdgpu_cs_shape.h"
 
 static int64_t amdgpu_info_failure(uint32_t query, uint32_t bytes,
@@ -732,7 +734,7 @@ static int64_t lpr_gpud_drm_call_transfers_many(
     pacha_service_envelope_t *header = (pacha_service_envelope_t *)page;
     lpr_memset(header, 0, sizeof(*header));
     header->magic = PACHA_SERVICE_REQUEST_MAGIC;
-    header->abi_version = PACHA_SERVICE_ABI_VERSION;
+    header->header_size = sizeof(*header);
     header->service_id = GPUD_DRM_SERVICE_ID;
     header->op = op;
     header->flags = payload_size != 0 ? PACHA_SERVICE_FLAG_PAGE_PAYLOAD : 0;
@@ -797,6 +799,7 @@ static int64_t lpr_gpud_drm_call_transfers_many(
     const pacha_service_envelope_t *reply_header = (const pacha_service_envelope_t *)page;
     if (reply.word0 != PACHA_SERVICE_REPLY_MAGIC || reply.word3 != request_id ||
         reply_header->magic != PACHA_SERVICE_REPLY_MAGIC ||
+        reply_header->header_size != sizeof(*reply_header) ||
         reply_header->service_id != GPUD_DRM_SERVICE_ID ||
         reply_header->op != op || reply_header->request_id != request_id) {
         lpr_gpud_drm_drop_channel(endpoint);
@@ -1051,6 +1054,7 @@ static int lpr_drm_prepare_atomic(
     const lpr_drm_mode_atomic_t *atomic =
         (const lpr_drm_mode_atomic_t *)(uintptr_t)arg;
     if (atomic->reserved != 0 ||
+        (atomic->flags & ~GPUD_DRM_MODE_ATOMIC_FLAGS) != 0 ||
         atomic->count_objs > GPUD_DRM_ATOMIC_OBJECT_CAPACITY ||
         (atomic->count_objs != 0 &&
             (atomic->objs_ptr == 0 || atomic->count_props_ptr == 0))) {
@@ -1098,30 +1102,8 @@ static int lpr_drm_prepare_atomic(
             (uint64_t)total_props * sizeof(wire->prop_values[0]));
     }
 
-    int saw_in_fence = 0;
-    for (uint32_t i = 0; i < total_props; i++) {
-        if (wire->props[i] != GPUD_DRM_KMS_PLANE_IN_FENCE_FD_PROP_ID) continue;
-        if (saw_in_fence) {
-            if (*out_input_wait_fd >= 16) {
-                (void)lpr_close_native_fd_if_open(
-                    (uint64_t)(uint32_t)*out_input_wait_fd);
-            }
-            *out_input_wait_fd = -1;
-            return -LPR_LINUX_EINVAL;
-        }
-        saw_in_fence = 1;
-        if (wire->prop_values[i] == UINT64_MAX) continue;
-        if (wire->prop_values[i] > INT32_MAX ||
-            !lpr_linux_sync_file_fd_active(wire->prop_values[i])) {
-            return wire->prop_values[i] > INT32_MAX ?
-                -LPR_LINUX_EINVAL : -LPR_LINUX_EBADF;
-        }
-        const int wait_fd = lpr_sync_file_duplicate_wait(wire->prop_values[i]);
-        if (wait_fd < 0) return wait_fd;
-        *out_input_wait_fd = wait_fd;
-        /* Native capabilities are transported out-of-band. */
-        wire->prop_values[i] = 0;
-    }
+    /* Property IDs belong to the probed device, not the virtio KMS fixture.
+     * The sandbox checks pointer/FD property names before Linux sees values. */
     return 0;
 }
 
@@ -1688,6 +1670,137 @@ static int lpr_drm_prepare_amdgpu_cs(uint64_t arg, int reusable_aux,
     return 0;
 }
 
+static int lpr_kms_query_prepare(gpud_drm_ioctl_request_t *request,
+    const struct gpud_kms_query_shape *shape, const unsigned char *snapshot,
+    int reusable_aux, int *aux_fd, void **aux_mapping, uint64_t *aux_map_size)
+{
+    uint64_t bytes = 0;
+    int large = 0;
+    for (unsigned int i = 0; i < shape->vectors; ++i) {
+        const struct gpud_kms_vector *v = &shape->vector[i];
+        uint32_t count;
+        lpr_memcpy(&count, snapshot + v->count, 4);
+        if (count > 65536) return -LPR_LINUX_EINVAL;
+        large |= count > v->limit;
+        bytes += (uint64_t)count * v->stride;
+    }
+    if (large) {
+        int result = lpr_drm_aux_create(bytes, reusable_aux, aux_fd,
+            aux_mapping, aux_map_size);
+        if (result) return result;
+    }
+    lpr_memcpy(request->data, snapshot, shape->scalar_size);
+    for (unsigned int i = 0; i < shape->vectors; ++i) {
+        const struct gpud_kms_vector *v = &shape->vector[i];
+        lpr_memset(request->data + v->pointer, 0, 8);
+        if (v->second_pointer) lpr_memset(request->data + v->second_pointer, 0, 8);
+    }
+    request->arg_size = shape->scalar_size;
+    request->data_size = large ? shape->scalar_size : shape->inline_size;
+    request->aux_size = large ? bytes : 0;
+    return 0;
+}
+
+static int lpr_kms_query_reply(const gpud_drm_ioctl_request_t *request,
+    const struct gpud_kms_query_shape *shape, const unsigned char *snapshot,
+    const unsigned char *aux, uint64_t arg)
+{
+    const int large = request->data_size == shape->scalar_size;
+    if (request->arg_size != shape->scalar_size ||
+        (!large && request->data_size != shape->inline_size) ||
+        (large && !aux)) return -LPR_LINUX_EIO;
+    uint32_t copied[4] = {0}, offsets[4] = {0};
+    uint64_t pointers[4] = {0}, second[4] = {0};
+    unsigned char value[sizeof(gpud_drm_mode_card_res_t)];
+    lpr_memcpy(value, request->data, shape->scalar_size);
+    uint64_t expected_bytes = 0;
+    int expected_large = 0;
+    for (unsigned int i = 0; i < shape->vectors; ++i) {
+        uint32_t capacity;
+        lpr_memcpy(&capacity, snapshot + shape->vector[i].count, 4);
+        if (capacity > 65536) return -LPR_LINUX_EIO;
+        expected_large |= capacity > shape->vector[i].limit;
+        expected_bytes += (uint64_t)capacity * shape->vector[i].stride;
+    }
+    if (large != expected_large || request->aux_size != (large ? expected_bytes : 0))
+        return -LPR_LINUX_EIO;
+    uint32_t offset = 0;
+    /* Validate all split property records before exposing any result. */
+    for (unsigned int i = 0; i < shape->vectors; ++i) {
+        const struct gpud_kms_vector *v = &shape->vector[i];
+        uint32_t capacity, required;
+        lpr_memcpy(&capacity, snapshot + v->count, 4);
+        lpr_memcpy(&required, value + v->count, 4);
+        copied[i] = required <= capacity ? required : v->partial ? capacity : 0;
+        offsets[i] = offset;
+        offset += capacity * v->stride;
+        lpr_memcpy(&pointers[i], snapshot + v->pointer, 8);
+        lpr_memcpy(value + v->pointer, &pointers[i], 8);
+        if (v->second_pointer) {
+            lpr_memcpy(&second[i], snapshot + v->second_pointer, 8);
+            lpr_memcpy(value + v->second_pointer, &second[i], 8);
+        }
+        if (copied[i] && (!pointers[i] || (v->second_pointer && !second[i])))
+            return -LPR_LINUX_EFAULT;
+        if (large && v->second_pointer)
+            for (uint32_t n = 0; n < copied[i]; ++n) {
+                uint32_t reserved;
+                lpr_memcpy(&reserved, aux + offsets[i] + n * 16 + 4, 4);
+                if (reserved) return -LPR_LINUX_EIO;
+            }
+    }
+    for (unsigned int i = 0; i < shape->vectors; ++i) {
+        const struct gpud_kms_vector *v = &shape->vector[i];
+        if (!copied[i]) continue;
+        if (large && v->second_pointer) {
+            for (uint32_t n = 0; n < copied[i]; ++n) {
+                lpr_memcpy((void *)(uintptr_t)(pointers[i] + n * 4),
+                    aux + offsets[i] + n * 16, 4);
+                lpr_memcpy((void *)(uintptr_t)(second[i] + n * 8),
+                    aux + offsets[i] + n * 16 + 8, 8);
+            }
+        } else {
+            lpr_memcpy((void *)(uintptr_t)pointers[i],
+                large ? aux + offsets[i] : request->data + v->inline_array,
+                copied[i] * (v->second_pointer ? 4 : v->stride));
+            if (v->second_pointer)
+                lpr_memcpy((void *)(uintptr_t)second[i],
+                    request->data + v->second_array, copied[i] * 8);
+        }
+    }
+    lpr_memcpy((void *)(uintptr_t)arg, value, shape->scalar_size);
+    return 0;
+}
+
+static int lpr_drm_prepare_amdgpu_gem_op(uint32_t command, uint64_t arg,
+    int reusable_aux, gpud_drm_ioctl_request_t *request, uint64_t *output_pointer,
+    int *aux_fd, void **aux_mapping, uint64_t *aux_map_size)
+{
+    gpud_drm_amdgpu_gem_op_t wire = {0};
+    const uint32_t native_size = command == GPUD_DRM_IOCTL_AMDGPU_GEM_OP ? 16 : 24;
+    lpr_memcpy(&wire, (const void *)(uintptr_t)arg, native_size);
+    if (!wire.handle || wire.padding || wire.num_entries)
+        return -LPR_LINUX_EINVAL;
+    if (wire.op > 1) return -LPR_LINUX_EOPNOTSUPP;
+    if (wire.op == 0) {
+        if (!wire.value) return -LPR_LINUX_EFAULT;
+        const int error = lpr_drm_aux_create(32, reusable_aux,
+            aux_fd, aux_mapping, aux_map_size);
+        if (error) return error;
+        /* Only the caller's LPR sees the output pointer. SET_PLACEMENT's
+         * value is instead a scalar domain mask, not an address. */
+        *output_pointer = wire.value;
+        wire.value = 0;
+        request->aux_size = 32;
+    } else if (wire.value & ~UINT64_C(7)) {
+        return -LPR_LINUX_EINVAL;
+    }
+    lpr_memcpy(request->data, &wire, sizeof(wire));
+    request->arg_size = native_size;
+    request->data_size = sizeof(wire);
+    return 0;
+}
+
 int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
 #if defined(LPR_DRM_STARTUP_PROFILE) && LPR_DRM_STARTUP_PROFILE
@@ -1749,23 +1862,31 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     int output_notify_fd = -1;
     int output_sync_fd = -1;
     uint64_t event_token = 0;
+    uint64_t gamma_pointer[3] = {0};
+    uint32_t gamma_count = 0;
+    uint64_t blob_pointer = 0;
+    uint32_t blob_capacity = 0;
+    gpud_drm_mode_get_connector_t connector_input = {0};
+    struct gpud_kms_query_shape kms_shape;
+    const int kms_query = gpud_kms_query_shape(command, &kms_shape);
+    unsigned char kms_snapshot[sizeof(gpud_drm_mode_card_res_t)] = {0};
     uint64_t amdgpu_info_pointer = 0;
     uint32_t amdgpu_info_query = 0;
     uint32_t amdgpu_info_capacity = 0;
+    uint64_t amdgpu_gem_op_pointer = 0;
     enum {
         LPR_DRM_WIRE_GENERIC,
         LPR_DRM_WIRE_VERSION,
-        LPR_DRM_WIRE_RESOURCES,
         LPR_DRM_WIRE_CONNECTOR,
+        LPR_DRM_WIRE_CONNECTOR_AUX,
         LPR_DRM_WIRE_CRTC,
         LPR_DRM_WIRE_DIRTY_FB,
-        LPR_DRM_WIRE_PLANE_RES,
-        LPR_DRM_WIRE_PLANE,
-        LPR_DRM_WIRE_OBJECT_PROPERTIES,
-        LPR_DRM_WIRE_PROPERTY,
         LPR_DRM_WIRE_PROPERTY_BLOB,
+        LPR_DRM_WIRE_PROPERTY_BLOB_AUX,
         LPR_DRM_WIRE_CREATE_PROPERTY_BLOB,
         LPR_DRM_WIRE_ATOMIC,
+        LPR_DRM_WIRE_CRTC_QUEUE_SEQUENCE,
+        LPR_DRM_WIRE_GAMMA,
         LPR_DRM_WIRE_SYNCOBJ_FD_TO_HANDLE,
         LPR_DRM_WIRE_SYNCOBJ_HANDLE_TO_FD,
         LPR_DRM_WIRE_SYNCOBJ_WAIT,
@@ -1776,9 +1897,20 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         LPR_DRM_WIRE_VIRTGPU_EXECBUFFER,
         LPR_DRM_WIRE_VIRTGPU_CONTEXT_INIT,
         LPR_DRM_WIRE_AMDGPU_INFO,
+        LPR_DRM_WIRE_AMDGPU_GEM_OP,
         LPR_DRM_WIRE_AMDGPU_CS,
+        LPR_DRM_WIRE_KMS_QUERY,
     } wire_kind = LPR_DRM_WIRE_GENERIC;
-    if (command == LPR_DRM_IOCTL_SYNCOBJ_WAIT) {
+    if (kms_query) {
+        lpr_memcpy(kms_snapshot, (const void *)(uintptr_t)arg, kms_shape.scalar_size);
+        int result = lpr_kms_query_prepare(ioctl, &kms_shape, kms_snapshot,
+            reusable_aux, &aux_fd, &aux_mapping, &aux_map_size);
+        if (result) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return result;
+        }
+        wire_kind = LPR_DRM_WIRE_KMS_QUERY;
+    } else if (command == LPR_DRM_IOCTL_SYNCOBJ_WAIT) {
         gpud_drm_syncobj_wait_t wire;
         lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
         const uint64_t handles_bytes =
@@ -1832,18 +1964,68 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         ioctl->arg_size = sizeof(*version);
         ioctl->data_size = sizeof(*wire);
         wire_kind = LPR_DRM_WIRE_VERSION;
-    } else if (command == GPUD_DRM_IOCTL_MODE_GETRESOURCES) {
-        gpud_drm_kms_resources_wire_t *wire = (gpud_drm_kms_resources_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_RESOURCES;
+    } else if (command == GPUD_DRM_IOCTL_MODE_GETGAMMA ||
+        command == GPUD_DRM_IOCTL_MODE_SETGAMMA) {
+        gpud_drm_mode_crtc_lut_t wire;
+        lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
+        const uint64_t bytes = (uint64_t)wire.gamma_size * sizeof(uint16_t);
+        if (!wire.crtc_id || !wire.gamma_size || wire.gamma_size > 65536 ||
+            !wire.red || !wire.green || !wire.blue ||
+            lpr_drm_aux_create(bytes * 3, reusable_aux, &aux_fd,
+                &aux_mapping, &aux_map_size) != 0) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return -LPR_LINUX_EINVAL;
+        }
+        gamma_pointer[0] = wire.red;
+        gamma_pointer[1] = wire.green;
+        gamma_pointer[2] = wire.blue;
+        gamma_count = wire.gamma_size;
+        if (command == GPUD_DRM_IOCTL_MODE_SETGAMMA)
+            for (unsigned int i = 0; i < 3; ++i)
+                lpr_memcpy((uint8_t *)aux_mapping + i * bytes,
+                    (const void *)(uintptr_t)gamma_pointer[i], bytes);
+        wire.red = wire.green = wire.blue = 0;
+        lpr_memcpy(ioctl->data, &wire, sizeof(wire));
+        ioctl->arg_size = sizeof(wire);
+        ioctl->data_size = sizeof(wire);
+        ioctl->aux_size = bytes * 3;
+        wire_kind = LPR_DRM_WIRE_GAMMA;
     } else if (command == GPUD_DRM_IOCTL_MODE_GETCONNECTOR) {
-        gpud_drm_kms_connector_wire_t *wire = (gpud_drm_kms_connector_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_CONNECTOR;
+        lpr_memcpy(&connector_input, (const void *)(uintptr_t)arg,
+            sizeof(connector_input));
+        const int large = connector_input.count_modes > GPUD_DRM_KMS_MODE_CAPACITY ||
+            connector_input.count_props > GPUD_DRM_KMS_PROPERTY_CAPACITY ||
+            connector_input.count_encoders > GPUD_DRM_KMS_ENCODER_CAPACITY;
+        if (connector_input.count_modes > 65536 ||
+            connector_input.count_props > 65536 ||
+            connector_input.count_encoders > 65536) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return -LPR_LINUX_EINVAL;
+        }
+        gpud_drm_mode_get_connector_t value = connector_input;
+        value.encoders_ptr = value.modes_ptr = value.props_ptr =
+            value.prop_values_ptr = 0;
+        ioctl->arg_size = sizeof(value);
+        if (large) {
+            const uint64_t bytes = (uint64_t)value.count_modes * 68 +
+                (uint64_t)value.count_props * 16 +
+                (uint64_t)value.count_encoders * 4;
+            if (lpr_drm_aux_create(bytes, reusable_aux, &aux_fd,
+                    &aux_mapping, &aux_map_size) != 0) {
+                lpr_destroy_tty_wire_page(page_fd, page);
+                return -LPR_LINUX_EINVAL;
+            }
+            lpr_memcpy(ioctl->data, &value, sizeof(value));
+            ioctl->data_size = sizeof(value);
+            ioctl->aux_size = bytes;
+            wire_kind = LPR_DRM_WIRE_CONNECTOR_AUX;
+        } else {
+            gpud_drm_kms_connector_wire_t *wire =
+                (gpud_drm_kms_connector_wire_t *)ioctl->data;
+            wire->value = value;
+            ioctl->data_size = sizeof(*wire);
+            wire_kind = LPR_DRM_WIRE_CONNECTOR;
+        }
     } else if (command == GPUD_DRM_IOCTL_MODE_GETCRTC || command == GPUD_DRM_IOCTL_MODE_SETCRTC) {
         gpud_drm_kms_crtc_wire_t *wire = (gpud_drm_kms_crtc_wire_t *)ioctl->data;
         lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
@@ -1855,6 +2037,47 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         ioctl->arg_size = sizeof(wire->value);
         ioctl->data_size = sizeof(*wire);
         wire_kind = LPR_DRM_WIRE_CRTC;
+    } else if (command == GPUD_DRM_IOCTL_WAIT_VBLANK) {
+        gpud_drm_wait_vblank_t wire;
+        lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
+        if (wire.request.type & ~GPUD_DRM_VBLANK_FLAGS) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return -LPR_LINUX_EINVAL;
+        }
+        if (wire.request.type & GPUD_DRM_VBLANK_EVENT) {
+            const int cookie_status = lpr_drm_event_cookie_register(
+                drm->handle, wire.request.signal, &event_token);
+            if (cookie_status != 0) {
+                lpr_destroy_tty_wire_page(page_fd, page);
+                return cookie_status;
+            }
+            wire.request.signal = event_token;
+        } else {
+            wire.request.signal = 0;
+        }
+        lpr_memcpy(ioctl->data, &wire, sizeof(wire));
+        ioctl->arg_size = sizeof(wire);
+        ioctl->data_size = sizeof(wire);
+    } else if (command == GPUD_DRM_IOCTL_CRTC_QUEUE_SEQUENCE) {
+        gpud_drm_crtc_queue_sequence_t wire;
+        lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
+        if (!wire.crtc_id || (wire.flags &
+            ~(GPUD_DRM_CRTC_SEQUENCE_RELATIVE |
+              GPUD_DRM_CRTC_SEQUENCE_NEXT_ON_MISS))) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return -LPR_LINUX_EINVAL;
+        }
+        const int cookie_status = lpr_drm_event_cookie_register(
+            drm->handle, wire.user_data, &event_token);
+        if (cookie_status != 0) {
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return cookie_status;
+        }
+        wire.user_data = event_token;
+        lpr_memcpy(ioctl->data, &wire, sizeof(wire));
+        ioctl->arg_size = sizeof(wire);
+        ioctl->data_size = sizeof(wire);
+        wire_kind = LPR_DRM_WIRE_CRTC_QUEUE_SEQUENCE;
     } else if (command == GPUD_DRM_IOCTL_MODE_PAGE_FLIP) {
         gpud_drm_mode_crtc_page_flip_t wire;
         lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
@@ -1923,38 +2146,32 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         ioctl->aux_size =
             (uint64_t)wire.num_clips * sizeof(gpud_drm_mode_rectangle_t);
         wire_kind = LPR_DRM_WIRE_DIRTY_FB;
-    } else if (command == GPUD_DRM_IOCTL_MODE_GETPLANERESOURCES) {
-        gpud_drm_kms_plane_res_wire_t *wire = (gpud_drm_kms_plane_res_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_PLANE_RES;
-    } else if (command == GPUD_DRM_IOCTL_MODE_GETPLANE) {
-        gpud_drm_kms_plane_wire_t *wire = (gpud_drm_kms_plane_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_PLANE;
-    } else if (command == GPUD_DRM_IOCTL_MODE_OBJ_GETPROPERTIES) {
-        gpud_drm_kms_object_properties_wire_t *wire =
-            (gpud_drm_kms_object_properties_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_OBJECT_PROPERTIES;
-    } else if (command == GPUD_DRM_IOCTL_MODE_GETPROPERTY) {
-        gpud_drm_kms_property_wire_t *wire = (gpud_drm_kms_property_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_PROPERTY;
     } else if (command == GPUD_DRM_IOCTL_MODE_GETPROPBLOB) {
-        gpud_drm_kms_property_blob_wire_t *wire =
-            (gpud_drm_kms_property_blob_wire_t *)ioctl->data;
-        lpr_memcpy(&wire->value, (const void *)(uintptr_t)arg, sizeof(wire->value));
-        ioctl->arg_size = sizeof(wire->value);
-        ioctl->data_size = sizeof(*wire);
-        wire_kind = LPR_DRM_WIRE_PROPERTY_BLOB;
+        gpud_drm_mode_get_blob_t value;
+        lpr_memcpy(&value, (const void *)(uintptr_t)arg, sizeof(value));
+        if (value.length > GPUD_DRM_KMS_PROPERTY_BLOB_BYTES) {
+            if (!value.data || value.length > KB2_GPU_DRM_MODE_MAX_BLOB_BYTES ||
+                lpr_drm_aux_create(value.length, reusable_aux, &aux_fd,
+                    &aux_mapping, &aux_map_size) != 0) {
+                lpr_destroy_tty_wire_page(page_fd, page);
+                return -LPR_LINUX_EINVAL;
+            }
+            blob_pointer = value.data;
+            blob_capacity = value.length;
+            value.data = 0;
+            lpr_memcpy(ioctl->data, &value, sizeof(value));
+            ioctl->arg_size = ioctl->data_size = sizeof(value);
+            ioctl->aux_size = value.length;
+            wire_kind = LPR_DRM_WIRE_PROPERTY_BLOB_AUX;
+        } else {
+            gpud_drm_kms_property_blob_wire_t *wire =
+                (gpud_drm_kms_property_blob_wire_t *)ioctl->data;
+            wire->value = value;
+            wire->value.data = 0;
+            ioctl->arg_size = sizeof(wire->value);
+            ioctl->data_size = sizeof(*wire);
+            wire_kind = LPR_DRM_WIRE_PROPERTY_BLOB;
+        }
     } else if (command == GPUD_DRM_IOCTL_MODE_CREATEPROPBLOB) {
         const lpr_drm_mode_create_blob_t *create =
             (const lpr_drm_mode_create_blob_t *)(uintptr_t)arg;
@@ -2074,6 +2291,17 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             return cs_status;
         }
         wire_kind = LPR_DRM_WIRE_AMDGPU_CS;
+    } else if (command == GPUD_DRM_IOCTL_AMDGPU_GEM_OP ||
+        command == GPUD_DRM_IOCTL_AMDGPU_GEM_OP_EXT) {
+        const int error = lpr_drm_prepare_amdgpu_gem_op(command, arg,
+            reusable_aux, ioctl, &amdgpu_gem_op_pointer,
+            &aux_fd, &aux_mapping, &aux_map_size);
+        if (error) {
+            lpr_drm_aux_destroy(aux_fd, aux_mapping, aux_map_size);
+            lpr_destroy_tty_wire_page(page_fd, page);
+            return error;
+        }
+        wire_kind = LPR_DRM_WIRE_AMDGPU_GEM_OP;
     } else if (command == GPUD_DRM_IOCTL_AMDGPU_INFO) {
         gpud_drm_amdgpu_info_t wire;
         lpr_memcpy(&wire, (const void *)(uintptr_t)arg, sizeof(wire));
@@ -2361,80 +2589,101 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
             if (length > sizeof(wire->desc)) length = sizeof(wire->desc);
             lpr_memcpy((void *)(uintptr_t)version->desc, wire->desc, length);
         }
-    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_RESOURCES) {
-        gpud_drm_kms_resources_wire_t *wire = (gpud_drm_kms_resources_wire_t *)ioctl->data;
-        const gpud_drm_mode_card_res_t *user = (const gpud_drm_mode_card_res_t *)(uintptr_t)arg;
-        const uint32_t fb_capacity = user->count_fbs < GPUD_DRM_KMS_FB_CAPACITY ? user->count_fbs : GPUD_DRM_KMS_FB_CAPACITY;
-        const uint32_t crtc_capacity = user->count_crtcs < GPUD_DRM_KMS_CRTC_CAPACITY ? user->count_crtcs : GPUD_DRM_KMS_CRTC_CAPACITY;
-        const uint32_t connector_capacity = user->count_connectors < GPUD_DRM_KMS_CONNECTOR_CAPACITY ? user->count_connectors : GPUD_DRM_KMS_CONNECTOR_CAPACITY;
-        const uint32_t encoder_capacity = user->count_encoders < GPUD_DRM_KMS_ENCODER_CAPACITY ? user->count_encoders : GPUD_DRM_KMS_ENCODER_CAPACITY;
-        if (user->fb_id_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->fb_id_ptr, wire->fbs, fb_capacity * sizeof(uint32_t));
-        if (user->crtc_id_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->crtc_id_ptr, wire->crtcs, crtc_capacity * sizeof(uint32_t));
-        if (user->connector_id_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->connector_id_ptr, wire->connectors, connector_capacity * sizeof(uint32_t));
-        if (user->encoder_id_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->encoder_id_ptr, wire->encoders, encoder_capacity * sizeof(uint32_t));
-        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_KMS_QUERY) {
+        status = lpr_kms_query_reply(ioctl, &kms_shape, kms_snapshot,
+            aux_mapping, arg);
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_CONNECTOR) {
         gpud_drm_kms_connector_wire_t *wire = (gpud_drm_kms_connector_wire_t *)ioctl->data;
-        const gpud_drm_mode_get_connector_t *user = (const gpud_drm_mode_get_connector_t *)(uintptr_t)arg;
-        const uint32_t mode_capacity = user->count_modes < GPUD_DRM_KMS_MODE_CAPACITY ? user->count_modes : GPUD_DRM_KMS_MODE_CAPACITY;
-        const uint32_t encoder_capacity = user->count_encoders < GPUD_DRM_KMS_ENCODER_CAPACITY ? user->count_encoders : GPUD_DRM_KMS_ENCODER_CAPACITY;
-        const uint32_t prop_capacity = user->count_props < GPUD_DRM_KMS_PROPERTY_CAPACITY ?
-            user->count_props : GPUD_DRM_KMS_PROPERTY_CAPACITY;
-        if (user->modes_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->modes_ptr, wire->modes, mode_capacity * sizeof(gpud_drm_modeinfo_t));
-        if (user->encoders_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->encoders_ptr, wire->encoders, encoder_capacity * sizeof(uint32_t));
-        if (user->props_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->props_ptr, wire->props, prop_capacity * sizeof(uint32_t));
-        if (user->prop_values_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->prop_values_ptr, wire->prop_values, prop_capacity * sizeof(uint64_t));
-        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+        if (connector_input.count_modes >= wire->value.count_modes &&
+            connector_input.modes_ptr)
+            lpr_memcpy((void *)(uintptr_t)connector_input.modes_ptr,
+                wire->modes, wire->value.count_modes * sizeof(wire->modes[0]));
+        if (connector_input.count_encoders >= wire->value.count_encoders &&
+            connector_input.encoders_ptr)
+            lpr_memcpy((void *)(uintptr_t)connector_input.encoders_ptr,
+                wire->encoders, wire->value.count_encoders * sizeof(wire->encoders[0]));
+        if (connector_input.count_props >= wire->value.count_props) {
+            if (connector_input.props_ptr)
+                lpr_memcpy((void *)(uintptr_t)connector_input.props_ptr,
+                    wire->props, wire->value.count_props * sizeof(wire->props[0]));
+            if (connector_input.prop_values_ptr)
+                lpr_memcpy((void *)(uintptr_t)connector_input.prop_values_ptr,
+                    wire->prop_values,
+                    wire->value.count_props * sizeof(wire->prop_values[0]));
+        }
+        wire->value.encoders_ptr = connector_input.encoders_ptr;
+        wire->value.modes_ptr = connector_input.modes_ptr;
+        wire->value.props_ptr = connector_input.props_ptr;
+        wire->value.prop_values_ptr = connector_input.prop_values_ptr;
+        lpr_memcpy((void *)(uintptr_t)arg, &wire->value,
+            sizeof(wire->value));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_CONNECTOR_AUX) {
+        gpud_drm_mode_get_connector_t *value =
+            (gpud_drm_mode_get_connector_t *)ioctl->data;
+        const uint8_t *data = (const uint8_t *)aux_mapping;
+        const uint64_t prop_offset = (uint64_t)connector_input.count_modes * 68;
+        const uint64_t encoder_offset = prop_offset +
+            (uint64_t)connector_input.count_props * 16;
+        if (connector_input.count_props >= value->count_props)
+            for (uint32_t i = 0; i < value->count_props; ++i) {
+                uint32_t reserved;
+                lpr_memcpy(&reserved, data + prop_offset + i * 16 + 4, 4);
+                if (reserved != 0) {
+                    status = -LPR_LINUX_EIO;
+                    break;
+                }
+            }
+        if (status == 0 && connector_input.count_modes >= value->count_modes &&
+            connector_input.modes_ptr)
+            lpr_memcpy((void *)(uintptr_t)connector_input.modes_ptr,
+                data, value->count_modes * 68);
+        if (status == 0 && connector_input.count_props >= value->count_props)
+            for (uint32_t i = 0; i < value->count_props; ++i) {
+                uint32_t property;
+                uint64_t property_value;
+                lpr_memcpy(&property, data + prop_offset + i * 16, 4);
+                lpr_memcpy(&property_value, data + prop_offset + i * 16 + 8, 8);
+                if (connector_input.props_ptr)
+                    lpr_memcpy((void *)(uintptr_t)(connector_input.props_ptr +
+                        (uint64_t)i * 4), &property, 4);
+                if (connector_input.prop_values_ptr)
+                    lpr_memcpy((void *)(uintptr_t)(connector_input.prop_values_ptr +
+                        (uint64_t)i * 8), &property_value, 8);
+            }
+        if (status == 0 && connector_input.count_encoders >= value->count_encoders &&
+            connector_input.encoders_ptr)
+            lpr_memcpy((void *)(uintptr_t)connector_input.encoders_ptr,
+                data + encoder_offset, value->count_encoders * 4);
+        if (status == 0) {
+            value->encoders_ptr = connector_input.encoders_ptr;
+            value->modes_ptr = connector_input.modes_ptr;
+            value->props_ptr = connector_input.props_ptr;
+            value->prop_values_ptr = connector_input.prop_values_ptr;
+            lpr_memcpy((void *)(uintptr_t)arg, value, sizeof(*value));
+        }
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_CRTC) {
         gpud_drm_kms_crtc_wire_t *wire = (gpud_drm_kms_crtc_wire_t *)ioctl->data;
         lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_DIRTY_FB) {
         /* DIRTYFB has no output fields. Preserve the caller's clips pointer. */
-    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PLANE_RES) {
-        gpud_drm_kms_plane_res_wire_t *wire = (gpud_drm_kms_plane_res_wire_t *)ioctl->data;
-        const gpud_drm_mode_get_plane_res_t *user = (const gpud_drm_mode_get_plane_res_t *)(uintptr_t)arg;
-        const uint32_t capacity = user->count_planes < GPUD_DRM_KMS_PLANE_CAPACITY ? user->count_planes : GPUD_DRM_KMS_PLANE_CAPACITY;
-        if (user->plane_id_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->plane_id_ptr, wire->planes, capacity * sizeof(uint32_t));
-        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
-    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PLANE) {
-        gpud_drm_kms_plane_wire_t *wire = (gpud_drm_kms_plane_wire_t *)ioctl->data;
-        const gpud_drm_mode_get_plane_t *user = (const gpud_drm_mode_get_plane_t *)(uintptr_t)arg;
-        const uint32_t capacity = user->count_format_types < GPUD_DRM_KMS_FORMAT_CAPACITY ? user->count_format_types : GPUD_DRM_KMS_FORMAT_CAPACITY;
-        if (user->format_type_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->format_type_ptr, wire->formats, capacity * sizeof(uint32_t));
-        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
-    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_OBJECT_PROPERTIES) {
-        gpud_drm_kms_object_properties_wire_t *wire =
-            (gpud_drm_kms_object_properties_wire_t *)ioctl->data;
-        const gpud_drm_mode_obj_get_properties_t *user =
-            (const gpud_drm_mode_obj_get_properties_t *)(uintptr_t)arg;
-        const uint32_t capacity = user->count_props < GPUD_DRM_KMS_PROPERTY_CAPACITY ?
-            user->count_props : GPUD_DRM_KMS_PROPERTY_CAPACITY;
-        if (user->props_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->props_ptr,
-            wire->props, capacity * sizeof(uint32_t));
-        if (user->prop_values_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->prop_values_ptr,
-            wire->prop_values, capacity * sizeof(uint64_t));
-        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
-    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PROPERTY) {
-        gpud_drm_kms_property_wire_t *wire = (gpud_drm_kms_property_wire_t *)ioctl->data;
-        const gpud_drm_mode_get_property_t *user =
-            (const gpud_drm_mode_get_property_t *)(uintptr_t)arg;
-        const uint32_t value_capacity = user->count_values < GPUD_DRM_KMS_PROPERTY_VALUE_CAPACITY ?
-            user->count_values : GPUD_DRM_KMS_PROPERTY_VALUE_CAPACITY;
-        const uint32_t enum_capacity = user->count_enum_blobs < GPUD_DRM_KMS_PROPERTY_ENUM_CAPACITY ?
-            user->count_enum_blobs : GPUD_DRM_KMS_PROPERTY_ENUM_CAPACITY;
-        if (user->values_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->values_ptr,
-            wire->values, value_capacity * sizeof(uint64_t));
-        if (user->enum_blob_ptr != 0) lpr_memcpy((void *)(uintptr_t)user->enum_blob_ptr,
-            wire->enums, enum_capacity * sizeof(gpud_drm_mode_property_enum_t));
-        lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PROPERTY_BLOB) {
         gpud_drm_kms_property_blob_wire_t *wire =
             (gpud_drm_kms_property_blob_wire_t *)ioctl->data;
         const gpud_drm_mode_get_blob_t *user = (const gpud_drm_mode_get_blob_t *)(uintptr_t)arg;
-        uint32_t length = user->length < wire->value.length ? user->length : wire->value.length;
-        if (length > GPUD_DRM_KMS_PROPERTY_BLOB_BYTES) length = GPUD_DRM_KMS_PROPERTY_BLOB_BYTES;
-        if (user->data != 0) lpr_memcpy((void *)(uintptr_t)user->data, wire->data, length);
+        const uint64_t user_data = user->data;
+        if (user->length == wire->value.length && user->data != 0)
+            lpr_memcpy((void *)(uintptr_t)user->data, wire->data, user->length);
         lpr_memcpy((void *)(uintptr_t)arg, &wire->value, sizeof(wire->value));
+        ((gpud_drm_mode_get_blob_t *)(uintptr_t)arg)->data = user_data;
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_PROPERTY_BLOB_AUX) {
+        const gpud_drm_mode_get_blob_t *wire =
+            (const gpud_drm_mode_get_blob_t *)ioctl->data;
+        if (wire->length == blob_capacity)
+            lpr_memcpy((void *)(uintptr_t)blob_pointer,
+                aux_mapping, blob_capacity);
+        gpud_drm_mode_get_blob_t *user =
+            (gpud_drm_mode_get_blob_t *)(uintptr_t)arg;
+        user->length = wire->length;
     } else if (status == 0 &&
         wire_kind == LPR_DRM_WIRE_CREATE_PROPERTY_BLOB) {
         lpr_drm_mode_create_blob_t *user =
@@ -2457,6 +2706,15 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         user->first_signaled = wire->first_signaled;
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_SYNCOBJ_ARRAY) {
         /* RESET and SIGNAL have no output fields. */
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_GEM_OP) {
+        if (amdgpu_gem_op_pointer) {
+            if (!aux_mapping || ioctl->aux_size != 32)
+                status = -LPR_LINUX_EIO;
+            else
+                lpr_memcpy((void *)(uintptr_t)amdgpu_gem_op_pointer, aux_mapping, 32);
+        }
+        /* Neither operation changes native argument fields. In particular,
+         * never copy the pointer-free 24-byte plan over a 16-byte argument. */
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_INFO) {
         const gpud_drm_amdgpu_info_t *wire =
             (const gpud_drm_amdgpu_info_t *)ioctl->data;
@@ -2486,6 +2744,13 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         }
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_AMDGPU_CS) {
         lpr_memcpy((void *)(uintptr_t)arg, ioctl->data, sizeof(uint64_t));
+    } else if (status == 0 && wire_kind == LPR_DRM_WIRE_GAMMA) {
+        if (command == GPUD_DRM_IOCTL_MODE_GETGAMMA) {
+            const uint64_t bytes = (uint64_t)gamma_count * sizeof(uint16_t);
+            for (unsigned int i = 0; i < 3; ++i)
+                lpr_memcpy((void *)(uintptr_t)gamma_pointer[i],
+                    (const uint8_t *)aux_mapping + i * bytes, bytes);
+        }
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_VIRTGPU_GETPARAM) {
         const gpud_drm_virtgpu_getparam_t *user =
             (const gpud_drm_virtgpu_getparam_t *)(uintptr_t)arg;
@@ -2497,6 +2762,13 @@ int64_t lpr_drm_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
         const gpud_drm_virtgpu_get_caps_t *user =
             (const gpud_drm_virtgpu_get_caps_t *)(uintptr_t)arg;
         lpr_memcpy((void *)(uintptr_t)user->addr, aux_mapping, user->size);
+    } else if (status == 0 &&
+        wire_kind == LPR_DRM_WIRE_CRTC_QUEUE_SEQUENCE) {
+        gpud_drm_crtc_queue_sequence_t *user =
+            (gpud_drm_crtc_queue_sequence_t *)(uintptr_t)arg;
+        const gpud_drm_crtc_queue_sequence_t *wire =
+            (const gpud_drm_crtc_queue_sequence_t *)ioctl->data;
+        user->sequence = wire->sequence;
     } else if (status == 0 && wire_kind == LPR_DRM_WIRE_GENERIC) {
         lpr_memcpy((void *)(uintptr_t)arg, ioctl->data, ioctl->data_size);
     }
@@ -2663,7 +2935,9 @@ int64_t lpr_drm_read_events(uint64_t fd, uint64_t buf, uint64_t count)
             gpud_drm_event_vblank_t event;
             uint32_t header[2];
             lpr_memcpy(header, read->data + offset, sizeof(header));
-            if (header[0] == GPUD_DRM_EVENT_FLIP_COMPLETE &&
+            if ((header[0] == GPUD_DRM_EVENT_FLIP_COMPLETE ||
+                 header[0] == GPUD_DRM_EVENT_VBLANK ||
+                 header[0] == GPUD_DRM_EVENT_CRTC_SEQUENCE) &&
                 header[1] == sizeof(event)) {
                 uint64_t cookie = 0;
                 lpr_memcpy(&event, read->data + offset, sizeof(event));

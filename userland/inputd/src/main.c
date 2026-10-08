@@ -22,7 +22,6 @@ static uint64_t monotonic_ns(void)
 static int inputd_boot_config_validate(const struct inputd_boot_config *cfg)
 {
     if (cfg == NULL || cfg->magic != INPUTD_BOOT_CONFIG_MAGIC ||
-        cfg->version != INPUTD_BOOT_CONFIG_VERSION ||
         cfg->header_size != sizeof(*cfg) ||
         cfg->total_size > INPUTD_BOOT_CONFIG_MAX_BYTES ||
         cfg->input_endpoint_fd < 16 || cfg->ready_channel_fd < 16 ||

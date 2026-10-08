@@ -6,7 +6,15 @@ set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 project(termd C ASM)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+include("${REPO_ROOT}/userland/cmake/pachaos_native_dependencies.cmake")
 set(TERMD_ELF "${CMAKE_BINARY_DIR}/termd.elf")
+option(TERMD_MODULE_DIAGNOSTICS "Send legacy module loader diagnostics to native LOG" OFF)
+set(TERMD_DIAGNOSTIC_CFLAGS "")
+set(TERMD_DIAGNOSTIC_LINK_FLAGS "")
+if(TERMD_MODULE_DIAGNOSTICS)
+  set(TERMD_DIAGNOSTIC_CFLAGS "-DTERMD_MODULE_DIAGNOSTICS")
+  set(TERMD_DIAGNOSTIC_LINK_FLAGS "-Wl,--wrap=fprintf")
+endif()
 
 set(LINUX_TTY_SOURCES
   "${REPO_ROOT}/third_party/linux-6.8-tty/Makefile"
@@ -109,6 +117,9 @@ set(KOBOX_RUNTIME_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/src/null_device_backend.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/termd_service.c"
 )
+if(TERMD_MODULE_DIAGNOSTICS)
+  list(APPEND KOBOX_RUNTIME_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/module_diagnostics.c")
+endif()
 
 string(REPLACE ";" " " TERMD_EXTRA_SOURCES_ENV "${KOBOX_RUNTIME_SOURCES}")
 
@@ -117,15 +128,18 @@ add_custom_command(
   COMMAND
     ${CMAKE_COMMAND} -E env
       "PACHAOS_MUSL_APP_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-      "PACHAOS_MUSL_EXTRA_SOURCES=${TERMD_EXTRA_SOURCES_ENV}"
-      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src ${REPO_ROOT}/third_party/linux-6.8-tty"
-      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -DTERMD_WITH_KOBOX_TTY_ISLAND -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
+      "PACHAOS_MUSL_EXTRA_SOURCES=${TERMD_EXTRA_SOURCES_ENV} ${REPO_ROOT}/userland/libfiled_client/src/client.c ${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+      "PACHAOS_MUSL_EXTRA_INCLUDE_DIRS=${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${REPO_ROOT}/userland/filed/include ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/userland/lpr_supervisor/include ${REPO_ROOT}/userland/libipc/include ${REPO_ROOT}/userland/libcapsule/include ${REPO_ROOT}/userland/libpacha/include ${REPO_ROOT}/_kobox/include ${REPO_ROOT}/_kobox/src ${REPO_ROOT}/third_party/linux-6.8-tty ${REPO_ROOT}/userland/libfiled_client/include ${REPO_ROOT}/kobox2/protocol/include ${REPO_ROOT}/kobox2/protocol/generated/include"
+      "PACHAOS_MUSL_EXTRA_CFLAGS=-D__pachaos__ -DTERMD_WITH_KOBOX_TTY_ISLAND ${TERMD_DIAGNOSTIC_CFLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-sign-compare -Wno-pointer-sign -Wno-missing-field-initializers -Wno-deprecated-non-prototype"
+      "PACHAOS_MUSL_EXTRA_LINK_FLAGS=${TERMD_DIAGNOSTIC_LINK_FLAGS}"
       bash "${REPO_ROOT}/musl/pachaos/build/build-smokes.sh" "${TERMD_ELF}"
-  DEPENDS
+  DEPENDS ${PACHAOS_NATIVE_DEPENDENCIES}
+    "${REPO_ROOT}/userland/libfiled_client/src/client.c"
+    "${REPO_ROOT}/kobox2/protocol/src/filesystem.c"
+    "${REPO_ROOT}/kobox2/protocol/generated/include/kobox2/filesystem_layout.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/boot_config.h"
     "${REPO_ROOT}/userland/libpacha/include/pacha/abi.h"
     "${REPO_ROOT}/musl/pachaos/include/pachaos/abi.h"
-    "${REPO_ROOT}/musl/upstream/arch/pachaos/syscall_arch.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/termd/ipc_protocol.h"
     "${REPO_ROOT}/userland/lpr_supervisor/include/lpr_supervisor/ipc_protocol.h"
     "${REPO_ROOT}/userland/libipc/include/pacha/status.h"

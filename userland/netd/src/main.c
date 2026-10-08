@@ -25,7 +25,7 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
 {
     if (cfg == NULL ||
         cfg->magic != NETD_BOOT_CONFIG_MAGIC ||
-        cfg->version != NETD_BOOT_CONFIG_VERSION ||
+        cfg->size != sizeof(*cfg) ||
         cfg->device_fd < 16 ||
         cfg->filed_endpoint_fd < 16 ||
         cfg->socket_endpoint_fd < 16 ||
@@ -34,9 +34,9 @@ static int validate_boot_config(const struct netd_boot_config *cfg)
         (cfg->flags & ~(NETD_BOOT_FLAG_SMOKE | NETD_BOOT_FLAG_TRACE | NETD_BOOT_FLAG_METRIC)) != 0) {
         if (cfg != NULL) {
             fprintf(stderr,
-                "[netd] invalid boot config magic=0x%llx version=%llu fd=%llu socket_fd=%llu\n",
+                "[netd] invalid boot config magic=0x%llx size=%llu fd=%llu socket_fd=%llu\n",
                 (unsigned long long)cfg->magic,
-                (unsigned long long)cfg->version,
+                (unsigned long long)cfg->size,
                 (unsigned long long)cfg->device_fd,
                 (unsigned long long)cfg->socket_endpoint_fd);
         }

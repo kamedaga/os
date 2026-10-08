@@ -43,6 +43,7 @@ type Options struct {
 	NoBuild            bool
 	AuthorizedKeysPath string
 	OverlaySpecPath    string
+	InstallerMode      bool
 	OutputDir          string
 }
 
@@ -93,11 +94,18 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	overlays := []string{}
 	if opts.OverlaySpecPath != "" {
+		overlays = append(overlays, opts.OverlaySpecPath)
+	}
+	if opts.InstallerMode {
+		overlays = append(overlays, "pack/installer-bootfs.yaml")
+	}
+	for _, overlayPath := range overlays {
 		if opts.OutputDir == "" {
 			return Result{}, fmt.Errorf("live bootfs: an overlay requires a separate output directory")
 		}
-		overlay, err := LoadSpec(workspace.Path(opts.OverlaySpecPath))
+		overlay, err := LoadSpec(workspace.Path(overlayPath))
 		if err != nil {
 			return Result{}, err
 		}
@@ -171,6 +179,7 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 	available := make(map[string]bool, len(paths))
 	countedArtifact := make(map[string]bool, len(paths))
 	checkedDigest := make(map[string]bool, len(spec.SHA256))
+	checkedSource := make(map[string]bool, len(selected))
 	for _, destination := range paths {
 		app := selected[spec.Files[destination]]
 		artifact := workspace.ArtifactPath(app)
@@ -180,6 +189,12 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 		}
 		if !info.Mode().IsRegular() || info.Size() == 0 {
 			return Result{}, fmt.Errorf("live bootfs: %s must be a nonempty regular file", artifact)
+		}
+		if opts.NoBuild && !checkedSource[app.ID] {
+			if err := checkStagedSource(workspace, app, artifact); err != nil {
+				return Result{}, err
+			}
+			checkedSource[app.ID] = true
 		}
 		if expected := spec.SHA256[app.ID]; expected != "" && !checkedDigest[app.ID] {
 			data, err := os.ReadFile(artifact)
@@ -258,6 +273,34 @@ func Build(workspace *config.Workspace, opts Options) (Result, error) {
 		return Result{}, err
 	}
 	return Result{Manifest: manifestPath, Image: imagePath, Entries: image.Entries, Bytes: int64(image.Bytes)}, nil
+}
+
+// --no-build may reuse binaries without their compiler/source tree, but a
+// directly copied script still present in the workspace must match staging.
+// Otherwise packaging succeeds with an old script despite a source fix.
+func checkStagedSource(workspace *config.Workspace, app config.App, artifact string) error {
+	source, err := app.FileSource()
+	if err != nil {
+		return err
+	}
+	if len(source.Rebuild) != 0 {
+		return nil
+	}
+	current, err := os.ReadFile(workspace.Path(source.Path))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	staged, err := os.ReadFile(artifact)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(current, staged) {
+		return fmt.Errorf("live bootfs: stale staged file for %s; run pacgo build userland --no-rootfs %s before --no-build", app.ID, app.ID)
+	}
+	return nil
 }
 
 func validateAuthorizedKey(data []byte) error {

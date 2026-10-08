@@ -16,7 +16,8 @@ enum {
     LPR_FD_OPS_EPOLL = 10u,
     LPR_FD_OPS_DMABUF = 11u,
     LPR_FD_OPS_SYNC_FILE = 12u,
-    LPR_FD_OPS_COUNT = 13u,
+    LPR_FD_OPS_INSTALL_DISK = 13u,
+    LPR_FD_OPS_COUNT = 14u,
 
     LPR_FD_ENTRY_CLOEXEC = 1u << 0,
 
@@ -35,15 +36,6 @@ enum {
     /* Temporary D-Bus wait-path diagnostic marker. */
     LPR_SOCKET_DIAG_DBUS = 1u << 0,
 
-    /*
-     * Keep the name used to open a filed-backed OFD.  Linux exposes this
-     * through /proc/self/fd/N; gdk-pixbuf 2.44 uses that link to turn the
-     * FILE * passed to an image loader back into a GFile.
-     *
-     * Backend objects already occupy fixed 256-byte slab slots, so using the
-     * otherwise empty tail does not increase the slab footprint.
-     */
-    LPR_FILED_OPEN_PATH_BYTES = 192u,
 };
 
 typedef uint32_t lpr_linux_fd_t;
@@ -54,17 +46,13 @@ typedef struct lpr_native_fd {
 
 typedef struct lpr_filed_backend {
     uint8_t active;
-    uint8_t offset_valid;
-    uint8_t pread_active;
+    uint16_t reserved0;
     uint8_t reserved1;
     uint32_t flags;
     uint64_t handle;
-    uint64_t offset;
     lpr_native_fd_t lease_fd;
     uint32_t reserved2;
-    uint64_t stat_size;
-    uint64_t object_generation;
-    char open_path[LPR_FILED_OPEN_PATH_BYTES];
+    uint64_t lease_handle;
 } lpr_filed_backend_t;
 
 typedef struct lpr_pipe_backend {
@@ -122,7 +110,25 @@ typedef struct lpr_device_backend {
     uint8_t minor;
     uint8_t reserved0;
     uint32_t flags;
+    lpr_native_fd_t description_fd;
+    uint32_t reserved1;
+    uint64_t description_map;
 } lpr_device_backend_t;
+
+typedef struct lpr_block_backend {
+    uint8_t active;
+    uint8_t device_kind;
+    uint8_t reserved0[2];
+    uint32_t flags;
+    uint64_t size;
+} lpr_block_backend_t;
+
+enum {
+    LPR_INSTALL_DEVICE_TARGET = 0u,
+    LPR_INSTALL_DEVICE_MEDIA = 1u,
+    LPR_INSTALL_DEVICE_ROOT = 2u,
+    LPR_INSTALL_DEVICE_COUNT = 3u,
+};
 
 typedef struct lpr_drm_backend {
     uint8_t active;
@@ -344,6 +350,10 @@ int lpr_fd_table_close(
     lpr_fd_table_t *table,
     lpr_linux_fd_t fd,
     lpr_fd_drop_t *out_drop);
+/* A bind may block while another thread replaces the numeric descriptor.
+ * Detach only the OFD pinned before that bind, never the replacement. */
+int lpr_fd_table_close_pinned(lpr_fd_table_t *table,
+    const lpr_fd_pin_t *pin, lpr_fd_drop_t *out_drop);
 /* Reserve all resources before the broker consumes a rights-bearing record.
  * Reserved entries cannot be pinned, closed, duplicated or overwritten. */
 int lpr_fd_table_stage_batch(lpr_fd_table_t *table,
@@ -393,5 +403,8 @@ int lpr_fd_table_set_status_flags(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint
 int lpr_fd_table_get_offset(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint64_t *out_offset);
 int lpr_fd_table_set_offset(lpr_fd_table_t *table, lpr_linux_fd_t fd, uint64_t offset);
 int lpr_fd_table_get_refcount(const lpr_fd_table_t *table, lpr_linux_fd_t fd, uint32_t *out_refcount);
+/* 0: same open file description, 1: distinct, -1: invalid descriptor. */
+int lpr_fd_table_compare_ofd(const lpr_fd_table_t *table,
+    lpr_linux_fd_t first, lpr_linux_fd_t second);
 uint32_t lpr_fd_table_open_count(const lpr_fd_table_t *table);
 uint32_t lpr_fd_table_live_ofd_count(const lpr_fd_table_t *table);

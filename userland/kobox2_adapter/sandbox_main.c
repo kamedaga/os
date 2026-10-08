@@ -6,10 +6,14 @@
 #include "module_package.h"
 #include "package.h"
 #include "sandbox_config.h"
+#include "block_policy.h"
 #include "boot.h"
 #include "usb_input_service.h"
 #include "net_frame_service.h"
+#include "block_service.h"
+#include "usb_storage_service.h"
 #include "firmware_bundle.h"
+#include "fs_queue.h"
 #include <kobox2/module_progress.h>
 
 #ifndef PH_SANDBOX_DEVICE
@@ -24,13 +28,20 @@
 #ifndef PH_SANDBOX_AMDGPU
 #define PH_SANDBOX_AMDGPU 0
 #endif
+#ifndef PH_SANDBOX_BLOCK
+#define PH_SANDBOX_BLOCK 0
+#endif
+#ifndef PH_SANDBOX_FS
+#define PH_SANDBOX_FS 0
+#endif
 #define PH_SANDBOX_VIRTIO_GPU \
-    (PH_SANDBOX_DEVICE && !PH_SANDBOX_USB_HID && !PH_SANDBOX_NET && !PH_SANDBOX_AMDGPU)
+    (PH_SANDBOX_DEVICE && !PH_SANDBOX_USB_HID && !PH_SANDBOX_NET && \
+     !PH_SANDBOX_AMDGPU && !PH_SANDBOX_BLOCK && !PH_SANDBOX_FS)
 #define PH_SANDBOX_GPU (PH_SANDBOX_VIRTIO_GPU || PH_SANDBOX_AMDGPU)
 #if PH_SANDBOX_DEVICE
 #include "device.h"
 #include "device_grant.h"
-#if PH_SANDBOX_GPU
+#if PH_SANDBOX_GPU || PH_SANDBOX_FS
 #include "gpu_queue.h"
 #include <kobox2/virtqueue_x86_64.h>
 #endif
@@ -49,13 +60,31 @@ static struct kobox_linux_firmware_file firmware_files[KOBOX_FIRMWARE_MAX_FILES]
 static size_t firmware_count;
 #endif
 #if PH_SANDBOX_USB_HID
+#if PH_SANDBOX_BLOCK
+static struct ph_usb_storage_service usb_storage;
+#else
 static struct ph_usb_input_service usb_input;
+#endif
 #endif
 #if PH_SANDBOX_NET
 static struct ph_net_frame_service net_frames;
 #endif
+#if PH_SANDBOX_BLOCK && !PH_SANDBOX_USB_HID
+static struct ph_block_service block_io;
+#endif
+#if PH_SANDBOX_BLOCK
+static struct ph_block_write_policy block_write_policy;
+#endif
+#if PH_SANDBOX_FS
+static struct ph_fs_queue fs_queue;
+static struct kobox_linux_fs_mount_config fs_mount_config;
+static struct ph_device_grant *storage_grants;
+static struct ph_device *storage_devices;
+static struct kobox_linux_device_port_config *storage_ports;
+static size_t storage_device_count;
+#endif
 
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
 
 #if PH_SANDBOX_AMDGPU
 static void report_gpu_irq_ready(void);
@@ -123,8 +152,10 @@ static void report_device_fatal(const char *file, unsigned line, uint64_t result
 #endif
 
 #if PH_SANDBOX_DEVICE
+#if !PH_SANDBOX_FS
 static struct ph_device_grant device_grant;
 static struct ph_device device;
+#endif
 static uint64_t irq_cookie_sequence;
 #if PH_SANDBOX_AMDGPU
 static void report_gpu_irq_ready(void) {
@@ -133,7 +164,8 @@ static void report_gpu_irq_ready(void) {
         ph_boot_log_irq_ready(received, dispatched, acknowledged);
 }
 #endif
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET
+#if PH_SANDBOX_FS
+#elif PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK
 static struct kobox_linux_device_port_config pci_device_launch;
 #else
 static struct kobox_linux_device_launch device_launch;
@@ -147,19 +179,35 @@ static uint64_t gpu_channel_id;
 
 static void prepare_device(const struct kobox_linux_boot_layout *layout, void *context) {
     (void)context;
+#if PH_SANDBOX_FS
+    /* Every native grant has its own DMA/IRQ port and synthetic PCI domain.
+     * The domain is transport topology, never a guessed hardware identity. */
+    for (size_t i = 0; i < storage_device_count; ++i) {
+        const struct ph_device_config config = {
+            .device_fd = storage_grants[i].fd,
+            .generation = storage_grants[i].generation, .segment = (uint32_t)i,
+            .image = &ph_core, .memory = layout->task.memory,
+            .irq_cookie_sequence = &irq_cookie_sequence};
+        PH_OK(ph_device_init(&storage_devices[i], &config));
+        storage_ports[i] = (struct kobox_linux_device_port_config){
+            .size = sizeof(*storage_ports), .pci = &storage_devices[i].pci.host,
+            .dma = &storage_devices[i].dma.host, .irq = &storage_devices[i].irq.host};
+    }
+#else
     const struct ph_device_config config = {.device_fd = device_grant.fd,
                                             .generation = device_grant.generation,
                                             .image = &ph_core,
                                             .memory = layout->task.memory,
                                             .irq_cookie_sequence = &irq_cookie_sequence};
     PH_OK(ph_device_init(&device, &config));
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
     pci_device_launch = (struct kobox_linux_device_port_config){
         .size = sizeof(pci_device_launch),
         .pci = &device.pci.host,
         .dma = &device.dma.host,
         .irq = &device.irq.host,
-        .expected_class = PH_SANDBOX_NET ? 0x020000 : 0x0c0330,
+        .expected_class = PH_SANDBOX_USB_HID ? 0x0c0330 :
+            PH_SANDBOX_NET ? 0x020000 : 0x010802,
     };
 #else
     device_launch =
@@ -170,6 +218,7 @@ static void prepare_device(const struct kobox_linux_boot_layout *layout, void *c
 #if PH_SANDBOX_GPU
     device_launch.drm_events = &gpu_queue.event_host;
     device_launch.render_file_limit = GPUD_GPU_NATIVE_SESSION_LIMIT;
+#endif
 #endif
 #endif
 }
@@ -200,18 +249,40 @@ static void run_service(void *context) {
             modules.modules[i].parameters = "dyndbg=+p";
             firmware_loader_count++;
         } else if (!strcmp(modules.modules[i].name, "drm")) {
-            /* Upstream's delayed IB tests submit real work and wait on
-             * fences; enable their existing DRM_UT_CORE result messages. */
-            modules.modules[i].parameters = "debug=0x1";
+            /* DRM_UT_CORE prints every ioctl during sustained rendering.
+             * The 7 KiB RAM service ring then loses thermal and stop events;
+             * keep normal driver errors and the explicit inspection samples. */
+            modules.modules[i].parameters = "debug=0";
             drm_debug_count++;
         }
     }
     PH_CHECK(firmware_loader_count == 1 && drm_debug_count == 1);
 #endif
 #if PH_SANDBOX_DEVICE
-#if PH_SANDBOX_USB_HID
+#if PH_SANDBOX_FS
     struct ph_lifecycle_service service;
+    const struct ph_sandbox_config *config = (void *)PH_SANDBOX_CONFIG_ADDRESS;
+    struct ph_fs_channel_config data = {
+        .generation = bootstrap_ipc.generation, .channel_id = config->fs_channel_id,
+        .arena_bytes = config->fs_arena_bytes, .queue_size = config->fs_queue_size};
+    struct ph_fs_channel_config owner = data;
+    owner.channel_id = config->fs_owner_channel_id;
+    PH_OK(ph_fs_queue_init(&fs_queue, &ph_core, &data, &owner,
+        &kb2_vq_x86_64_atomics, &service));
+    PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
+#elif PH_SANDBOX_USB_HID
+    struct ph_lifecycle_service service;
+#if PH_SANDBOX_BLOCK
+    PH_OK(ph_usb_storage_service_init(&usb_storage, &ph_core,
+        bootstrap_ipc.generation, &service));
+#else
     PH_OK(ph_usb_input_service_init(&usb_input, &ph_core,
+        bootstrap_ipc.generation, &service));
+#endif
+    PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
+#elif PH_SANDBOX_BLOCK
+    struct ph_lifecycle_service service;
+    PH_OK(ph_block_service_init(&block_io, &ph_core,
         bootstrap_ipc.generation, &service));
     PH_OK(ph_lifecycle_start_service(&lifecycle, &bootstrap_ipc, &service));
 #elif PH_SANDBOX_NET
@@ -245,11 +316,40 @@ static void run_service(void *context) {
                                                .count = modules.count,
                                                .lifecycle = &lifecycle.port};
 #if PH_SANDBOX_DEVICE
-#if PH_SANDBOX_USB_HID
-    launch.pci_device = &pci_device_launch;
+#if PH_SANDBOX_FS
+    launch.pci_devices = storage_ports;
+    launch.pci_device_count = storage_device_count;
+    launch.filesystem = &fs_mount_config;
+    launch.progress = report_device_progress;
+    launch.progress_context = &bootstrap_ipc;
+#elif PH_SANDBOX_USB_HID
+    launch.pci_devices = &pci_device_launch;
+    launch.pci_device_count = 1;
     launch.capture_input = 1;
+    launch.capture_block = PH_SANDBOX_BLOCK;
+#if PH_SANDBOX_BLOCK
+    launch.block_write = (uint32_t)block_write_policy.enabled;
+    launch.block_write_key = (struct kobox_linux_block_key){
+        .diskseq = block_write_policy.diskseq,
+        .major = block_write_policy.major,
+        .minor = block_write_policy.minor};
+    launch.progress = report_device_progress;
+    launch.progress_context = &bootstrap_ipc;
+#endif
+#elif PH_SANDBOX_BLOCK
+    launch.pci_devices = &pci_device_launch;
+    launch.pci_device_count = 1;
+    launch.capture_block = 1;
+    launch.block_write = (uint32_t)block_write_policy.enabled;
+    launch.block_write_key = (struct kobox_linux_block_key){
+        .diskseq = block_write_policy.diskseq,
+        .major = block_write_policy.major,
+        .minor = block_write_policy.minor};
+    launch.progress = report_device_progress;
+    launch.progress_context = &bootstrap_ipc;
 #elif PH_SANDBOX_NET
-    launch.pci_device = &pci_device_launch;
+    launch.pci_devices = &pci_device_launch;
+    launch.pci_device_count = 1;
     launch.capture_network = 1;
     launch.progress = report_device_progress;
     launch.progress_context = &bootstrap_ipc;
@@ -270,7 +370,7 @@ static void run_service(void *context) {
     memcpy(&run, &symbol, sizeof(run));
     int result = run(&launch, &report);
     ph_lifecycle_finish(&lifecycle);
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
     if (result) {
         /* The native owner has no serial console on a live machine. Report
          * the upstream module-launch errno before fatal process exit. */
@@ -285,6 +385,9 @@ static void run_service(void *context) {
     }
 #endif
 #if PH_SANDBOX_DEVICE
+#if PH_SANDBOX_FS
+    PH_OK(ph_fs_queue_finish(&fs_queue));
+#endif
 #if PH_SANDBOX_GPU
     PH_OK(ph_gpu_queue_finish(&gpu_queue));
 #endif
@@ -297,7 +400,7 @@ static void run_service(void *context) {
     PH_CHECK(report.loaded == modules.count && report.unloaded == modules.count && !report.result &&
              !report.cleanup_result && lifecycle.token);
 #if PH_SANDBOX_DEVICE
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
     PH_CHECK(report.pci_bound && report.pci_detached);
 #elif PH_SANDBOX_AMDGPU
     PH_CHECK(report.device.bound && report.device.primary_major &&
@@ -322,10 +425,23 @@ static void run_service(void *context) {
            "canonical-completion\n");
 #endif
 #endif
+#if PH_SANDBOX_FS
+    PH_CHECK(report.pci_bound == storage_device_count &&
+        report.pci_detached == storage_device_count);
+    for (size_t i = storage_device_count; i--;) {
+        PH_OK(ph_device_finish(&storage_devices[i], storage_grants[i].generation));
+        PH_OK(ph_device_grant_close(&storage_grants[i], storage_grants[i].generation));
+    }
+#else
     PH_OK(ph_device_finish(&device, device_grant.generation));
     PH_OK(ph_device_grant_close(&device_grant, device_grant.generation));
-#if PH_SANDBOX_USB_HID
-    ph_log("NATIVE_USB_HID_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
+#endif
+#if PH_SANDBOX_FS
+    ph_log("NATIVE_FS_DEVICE_LIFECYCLE=PASS granted-pci uuid-root vfs quiesce unmount detach\n");
+#elif PH_SANDBOX_USB_HID
+    ph_log("NATIVE_USB_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
+#elif PH_SANDBOX_BLOCK
+    ph_log("NATIVE_BLOCK_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
 #elif PH_SANDBOX_NET
     ph_log("NATIVE_NET_DEVICE_LIFECYCLE=PASS granted-pci bound unload detach\n");
 #else
@@ -333,8 +449,12 @@ static void run_service(void *context) {
            "detach\n");
 #endif
 #endif
-#if PH_SANDBOX_USB_HID
-    ph_log("NATIVE_USB_HID_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
+#if PH_SANDBOX_FS
+    ph_log("NATIVE_FS_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
+#elif PH_SANDBOX_USB_HID
+    ph_log("NATIVE_USB_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
+#elif PH_SANDBOX_BLOCK
+    ph_log("NATIVE_BLOCK_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
 #elif PH_SANDBOX_NET
     ph_log("NATIVE_NET_MODULE_LIFECYCLE=PASS verified-closure ready quiesce unload\n");
 #else
@@ -354,12 +474,35 @@ static void service_main(const struct kobox_linux_task_report *report, void *con
 
 void ph_main(void) {
     const struct ph_sandbox_config *config = (void *)PH_SANDBOX_CONFIG_ADDRESS;
-    PH_CHECK(config->version == PH_SANDBOX_CONFIG_VERSION &&
-             ((PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_AMDGPU) ?
+    /* Reject a different launch extent before reading storage or device policy. */
+    PH_CHECK(config->size == sizeof(*config));
+#if PH_SANDBOX_FS
+    PH_CHECK(config->fs_channel_id && config->fs_owner_channel_id &&
+        config->fs_channel_id != config->fs_owner_channel_id &&
+        !config->storage_reserved && config->ram_bytes && config->ram_bytes <= SIZE_MAX);
+    ph_core.ram_size = (size_t)config->ram_bytes;
+    fs_mount_config = (struct kobox_linux_fs_mount_config){
+        .size = sizeof(fs_mount_config), .generation = config->identity.generation};
+    memcpy(fs_mount_config.root_uuid, config->root_uuid, sizeof(config->root_uuid));
+#endif
+#if PH_SANDBOX_BLOCK
+    const struct ph_block_write_policy *policy = (void *)PH_BLOCK_POLICY_ADDRESS;
+    PH_CHECK(policy->magic == PH_BLOCK_POLICY_MAGIC &&
+             policy->generation == config->identity.generation &&
+             policy->native_device == config->device.native_device &&
+             policy->enabled <= 1 &&
+             (policy->enabled ? policy->diskseq != 0 :
+              policy->diskseq == 0 && policy->major == 0 &&
+              policy->minor == 0));
+    block_write_policy = *policy;
+#endif
+    PH_CHECK(((PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_AMDGPU ||
+               PH_SANDBOX_BLOCK || PH_SANDBOX_FS) ?
               config->artifact_count >= 2 &&
               config->artifact_count <= PH_BOOTSTRAP_MAX_ARTIFACTS :
               config->artifact_count == (PH_SANDBOX_DEVICE ? 13u : 2u)) &&
-             config->resource_count == (PH_SANDBOX_DEVICE ? 1u : 0u));
+             config->resource_count == (PH_SANDBOX_FS ? config->storage_device_count :
+                PH_SANDBOX_DEVICE ? 1u : 0u));
 #if PH_SANDBOX_AMDGPU
     PH_CHECK(config->log_endpoint_fd == 0 ||
              config->log_endpoint_fd == PH_SANDBOX_LOG_FD);
@@ -379,7 +522,7 @@ void ph_main(void) {
              !memcmp(config->firmware_sha256, absent_sha256, 32));
 #endif
     PH_OK(ph_ipc_init(&bootstrap_ipc, PH_SANDBOX_CHANNEL_FD, config->identity.generation));
-#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU
+#if PH_SANDBOX_NET || PH_SANDBOX_AMDGPU || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
     ph_set_failure_reporter(report_device_fatal);
     ph_set_exception_reporter(report_device_exception);
 #endif
@@ -401,9 +544,29 @@ void ph_main(void) {
 #else
     PH_CHECK(!config->client_id && !config->gpu_channel_id);
 #endif
+#if PH_SANDBOX_FS
+    PH_CHECK(config->storage_devices_address == PH_SANDBOX_STORAGE_DEVICES_ADDRESS &&
+        config->storage_device_count && config->storage_device_count <= UINT16_MAX + UINT64_C(1) &&
+        config->storage_device_count <= SIZE_MAX / sizeof(*storage_devices));
+    storage_device_count = (size_t)config->storage_device_count;
+    const struct ph_device_authority *authorities =
+        (const void *)(uintptr_t)config->storage_devices_address;
+    storage_grants = ph_alloc(storage_device_count * sizeof(*storage_grants));
+    storage_devices = ph_alloc(storage_device_count * sizeof(*storage_devices));
+    storage_ports = ph_alloc(storage_device_count * sizeof(*storage_ports));
+    /* Validate the complete set before any Linux or bus-master import. The
+     * grant codec verifies logical uniqueness; native identities must also
+     * be distinct so two ports cannot own one physical function. */
+    for (size_t i = 0; i < storage_device_count; ++i) {
+        for (size_t j = 0; j < i; ++j)
+            PH_CHECK(authorities[j].native_device != authorities[i].native_device);
+        PH_OK(ph_device_grant_take(&storage_grants[i], &bundle, &package, &authorities[i]));
+    }
+#else
     PH_OK(ph_device_grant_take(&device_grant, &bundle, &package, &config->device));
-#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET
-    ph_log("NATIVE_USB_HID_DEVICE_GRANT=PASS native-identity attenuated-rights\n");
+#endif
+#if PH_SANDBOX_USB_HID || PH_SANDBOX_NET || PH_SANDBOX_BLOCK || PH_SANDBOX_FS
+    ph_log("NATIVE_PCI_DEVICE_GRANT=PASS native-identity attenuated-rights\n");
 #else
     ph_log(
         "NATIVE_GPUD_DEVICE_GRANT=PASS native-identity attenuated-rights private-child-import\n");

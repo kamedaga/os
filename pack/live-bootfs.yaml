@@ -19,8 +19,11 @@ files:
   /etc/shells: live_shells
   /etc/dropbear/README: live_dropbear_directory
   /etc/ssl/certs/ca-certificates.crt: ca_certificates
-  /lib/ld-musl-x86_64.so.1: pachaos_musl_ldso
-  /lib/libc.so: pachaos_musl_libc
+  /etc/ssl/cert.pem: ca_certificates
+  /usr/lib/pachaos/ld-musl-x86_64.so.1: pachaos_musl_ldso
+  /usr/lib/pachaos/libc.so: pachaos_musl_libc
+  /lib/ld-musl-x86_64.so.1: lpr_linux_musl_libc
+  /lib/libc.so: lpr_linux_musl_libc
   /lib/libc.musl-x86_64.so.1: lpr_linux_musl_libc
   /lib/linux/ld-musl-x86_64.so.1: lpr_linux_musl_libc
   /lib/linux/libc.so: lpr_linux_musl_libc
@@ -46,18 +49,23 @@ files:
   /srv/usbd.elf: usbd
   /srv/netd.elf: netd
   /srv/logd.elf: logd
-  /srv/kobox2/usb-hid/sandbox.elf: kobox2_usb_hid_sandbox
-  /srv/kobox2/usb-hid/core.so: kobox2_usb_hid_core
-  /srv/kobox2/usb-hid/closure.json: kobox2_usb_hid_closure
-  /srv/kobox2/usb-hid/modules/hid.ko: kobox2_usb_hid_hid
-  /srv/kobox2/usb-hid/modules/hid-generic.ko: kobox2_usb_hid_generic
-  /srv/kobox2/usb-hid/modules/evdev.ko: kobox2_usb_hid_evdev
-  /srv/kobox2/usb-hid/modules/usb-common.ko: kobox2_usb_hid_common
-  /srv/kobox2/usb-hid/modules/nls_base.ko: kobox2_usb_hid_nls
-  /srv/kobox2/usb-hid/modules/usbcore.ko: kobox2_usb_hid_usbcore
-  /srv/kobox2/usb-hid/modules/usbhid.ko: kobox2_usb_hid_usbhid
-  /srv/kobox2/usb-hid/modules/xhci-hcd.ko: kobox2_usb_hid_xhci_hcd
-  /srv/kobox2/usb-hid/modules/xhci-pci.ko: kobox2_usb_hid_xhci_pci
+  /srv/kobox2/usb-storage/sandbox.elf: kobox2_usb_storage_sandbox
+  /srv/kobox2/usb-storage/core.so: kobox2_usb_storage_core
+  /srv/kobox2/usb-storage/manifest.bin: kobox2_usb_storage_manifest
+  /srv/kobox2/usb-storage/modules/bsg.ko: kobox2_usb_storage_bsg
+  /srv/kobox2/usb-storage/modules/hid.ko: kobox2_usb_storage_hid
+  /srv/kobox2/usb-storage/modules/hid_generic.ko: kobox2_usb_storage_hid_generic
+  /srv/kobox2/usb-storage/modules/evdev.ko: kobox2_usb_storage_evdev
+  /srv/kobox2/usb-storage/modules/scsi_common.ko: kobox2_usb_storage_scsi_common
+  /srv/kobox2/usb-storage/modules/scsi_mod.ko: kobox2_usb_storage_scsi_mod
+  /srv/kobox2/usb-storage/modules/sd_mod.ko: kobox2_usb_storage_sd_mod
+  /srv/kobox2/usb-storage/modules/usb_common.ko: kobox2_usb_storage_usb_common
+  /srv/kobox2/usb-storage/modules/nls_base.ko: kobox2_usb_storage_nls_base
+  /srv/kobox2/usb-storage/modules/usbcore.ko: kobox2_usb_storage_usbcore
+  /srv/kobox2/usb-storage/modules/usbhid.ko: kobox2_usb_storage_usbhid
+  /srv/kobox2/usb-storage/modules/xhci_hcd.ko: kobox2_usb_storage_xhci_hcd
+  /srv/kobox2/usb-storage/modules/xhci_pci.ko: kobox2_usb_storage_xhci_pci
+  /srv/kobox2/usb-storage/modules/usb_storage.ko: kobox2_usb_storage_usb_storage
   /srv/kobox2/network/sandbox.elf: kobox2_network_sandbox
   /srv/kobox2/network/core.so: kobox2_network_core
   /srv/kobox2/network/manifest.bin: kobox2_network_manifest

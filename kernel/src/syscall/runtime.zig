@@ -8,6 +8,7 @@ const scheduler = @import("../scheduler.zig").connection;
 const smp = @import("../smp.zig");
 const sc = @import("numbers.zig");
 const perf = @import("../smp_perf.zig");
+const user_vm = @import("../memory/user_vm.zig");
 
 const runtime_abi = abi_root.runtime_abi;
 const TrapFrame = interrupts.TrapFrame;
@@ -45,6 +46,10 @@ const FutexWaiter = struct {
 
 var futex_waiters: [max_futex_waiters]FutexWaiter = [_]FutexWaiter{.{}} ** max_futex_waiters;
 var futex_waiters_lock: FutexSpinLock = .{};
+// The table stays fully available, but short waits must not scan its unused
+// tail under global exclusion. This is the active-record extent, not a count
+// of live scheduler tokens: timeout/signal may leave stale records behind.
+var futex_waiters_extent: usize = 0;
 
 fn staticStorageEnd(comptime T: type, ptr: *T) usize {
     return @intFromPtr(ptr) + @sizeOf(T);
@@ -58,6 +63,7 @@ pub fn kernelStaticStorageEndAddr() usize {
     var end: usize = 0;
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters), &futex_waiters));
     end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters_lock), &futex_waiters_lock));
+    end = maxStaticEnd(end, staticStorageEnd(@TypeOf(futex_waiters_extent), &futex_waiters_extent));
     end = maxStaticEnd(end, realtime_clock.kernelStaticStorageEndAddr());
     return end;
 }
@@ -157,6 +163,114 @@ fn clockGettime(h: anytype, proc: kernel.PrincipalId, clock_id: u64, out_va: u64
         },
         else => sc.syscall_err_invalid,
     };
+}
+
+const ClockReadSource = struct {
+    const monotonicNs = realtime_clock.monotonicNs;
+    const realtimeNs = realtime_clock.realtimeNs;
+    const publishedUnixTimeSeconds = realtime_clock.publishedUnixTimeSeconds;
+    const unixTimeSeconds = realtime_clock.unixTimeSeconds;
+    fn monotonicFallbackNs() u64 {
+        return scheduler.lapic_tick_count *| 1_000_000;
+    }
+};
+
+fn tryClockReadWithSource(comptime Source: type, frame: *TrapFrame) ?u64 {
+    frame.rdx = 0;
+    const value = switch (frame.rdi) {
+        runtime_abi.clock_monotonic => Source.monotonicNs() orelse Source.monotonicFallbackNs(),
+        runtime_abi.clock_realtime => Source.realtimeNs() orelse blk: {
+            // CMOS fallback is serialized by the generic KernelState path;
+            // do not introduce concurrent index/data reads on native APs.
+            const seconds = Source.publishedUnixTimeSeconds() orelse return null;
+            break :blk seconds *| 1_000_000_000;
+        },
+        else => return sc.syscall_err_invalid,
+    };
+    frame.rdx = value;
+    return sc.syscall_ok;
+}
+
+pub fn tryClockRead(frame: *TrapFrame) ?u64 {
+    return tryClockReadWithSource(ClockReadSource, frame);
+}
+
+/// The page is kernel-image memory published read-only. Its physical address
+/// is fixed for the kernel's lifetime, so every open shares one VMO.
+fn clockPageOpen(state: *kernel.KernelState, proc: kernel.PrincipalId, free_list: *kernel.FreePageList) u64 {
+    const paddr = realtime_clock.clockPagePaddr(@import("../arch/x86_64/platform.zig").kernelPointerPaddr) orelse
+        return sc.syscall_err_invalid;
+    user_vm.lockSharedVmObjects();
+    defer user_vm.unlockSharedVmObjects();
+    const fd = state.openKernelClockPageFd(proc, paddr, .{}, abi_root.fd_abi.first_dynamic_fd, free_list) catch |err|
+        return switch (err) {
+            kernel.KernelError.TableFull, kernel.KernelError.OutOfFreePages => sc.syscall_err_alloc,
+            else => sc.syscall_err_invalid,
+        };
+    return fd;
+}
+
+fn clockReadLockedWithSource(comptime Source: type, frame: *TrapFrame) u64 {
+    if (tryClockReadWithSource(Source, frame)) |result| return result;
+    frame.rdx = Source.unixTimeSeconds() *| 1_000_000_000;
+    return sc.syscall_ok;
+}
+
+fn clockReadLocked(frame: *TrapFrame) u64 {
+    return clockReadLockedWithSource(ClockReadSource, frame);
+}
+
+test "clock read register result keeps epochs and excludes RTC from fast path" {
+    const Source = struct {
+        var mono: ?u64 = 1234567890;
+        var real: ?u64 = 9876543210;
+        var seconds: ?u64 = 42;
+        var rtc_calls: usize = 0;
+        fn unixTimeSeconds() u64 {
+            rtc_calls += 1;
+            return 91;
+        }
+        fn monotonicNs() ?u64 {
+            return mono;
+        }
+        fn realtimeNs() ?u64 {
+            return real;
+        }
+        fn publishedUnixTimeSeconds() ?u64 {
+            return seconds;
+        }
+        fn monotonicFallbackNs() u64 {
+            return 12000000;
+        }
+    };
+    var frame = std.mem.zeroes(TrapFrame);
+    frame.rdi = runtime_abi.clock_monotonic;
+    try std.testing.expectEqual(@as(?u64, sc.syscall_ok), tryClockReadWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 1234567890), frame.rdx);
+    Source.mono = null;
+    try std.testing.expectEqual(@as(?u64, sc.syscall_ok), tryClockReadWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 12000000), frame.rdx);
+    frame.rdi = runtime_abi.clock_realtime;
+    try std.testing.expectEqual(@as(?u64, sc.syscall_ok), tryClockReadWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 9876543210), frame.rdx);
+    Source.real = null;
+    try std.testing.expectEqual(@as(?u64, sc.syscall_ok), tryClockReadWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 42000000000), frame.rdx);
+    Source.seconds = null;
+    try std.testing.expectEqual(@as(?u64, null), tryClockReadWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 0), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 0), Source.rtc_calls);
+    try std.testing.expectEqual(sc.syscall_ok, clockReadLockedWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 91000000000), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 1), Source.rtc_calls);
+    frame.rdi = 99;
+    frame.rdx = 123;
+    try std.testing.expectEqual(@as(?u64, sc.syscall_err_invalid), tryClockReadWithSource(Source, &frame));
+    try std.testing.expectEqual(@as(u64, 0), frame.rdx);
+    Source.mono = 1234567890;
+    Source.real = 9876543210;
+    Source.seconds = 42;
+    Source.rtc_calls = 0;
 }
 
 fn clockGetres(h: anytype, proc: kernel.PrincipalId, clock_id: u64, out_va: u64) u64 {
@@ -291,16 +405,22 @@ test "yield result preserves the selected frame and saves caller success" {
     try std.testing.expect(@import("lock_policy.zig").needsKernelStateLock(sc.syscall_yield));
 }
 
-fn reclaimStaleFutexWaitersLocked() void {
-    for (futex_waiters[0..]) |*waiter| {
+fn retireFutexWaiterLocked(waiter: *FutexWaiter) void {
+    waiter.* = .{};
+    while (futex_waiters_extent != 0 and !futex_waiters[futex_waiters_extent - 1].active)
+        futex_waiters_extent -= 1;
+}
+
+fn reclaimStaleFutexWaitersLocked(comptime is_current: anytype) void {
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
         if (!waiter.active) continue;
-        if (scheduler.waitTokenIsCurrent(
+        if (is_current(
             waiter.principal,
             waiter.thread_index,
             waiter.thread_generation,
             waiter.wait_token,
         )) continue;
-        waiter.* = .{};
+        retireFutexWaiterLocked(waiter);
     }
 }
 
@@ -311,7 +431,20 @@ fn recordFutexWaiterLocked(
     user_va: u64,
     wait_token: u64,
 ) bool {
-    for (futex_waiters[0..]) |*waiter| {
+    return recordFutexWaiterWithTokenCheckLocked(scheduler.waitTokenIsCurrent, proc, thread_index, thread_generation, user_va, wait_token);
+}
+
+fn recordFutexWaiterWithTokenCheckLocked(
+    comptime is_current: anytype,
+    proc: kernel.PrincipalId,
+    thread_index: usize,
+    thread_generation: u32,
+    user_va: u64,
+    wait_token: u64,
+) bool {
+    // An earlier hole must not hide this thread's registration at a higher
+    // slot. Finish the replacement search before inserting into a free slot.
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
         if (waiter.active and waiter.principal == proc and waiter.thread_index == thread_index) {
             waiter.* = .{
                 .active = true,
@@ -325,7 +458,7 @@ fn recordFutexWaiterLocked(
         }
     }
     if (recordFutexWaiterInFreeSlot(proc, thread_index, thread_generation, user_va, wait_token)) return true;
-    reclaimStaleFutexWaitersLocked();
+    reclaimStaleFutexWaitersLocked(is_current);
     return recordFutexWaiterInFreeSlot(proc, thread_index, thread_generation, user_va, wait_token);
 }
 
@@ -336,7 +469,7 @@ fn recordFutexWaiterInFreeSlot(
     user_va: u64,
     wait_token: u64,
 ) bool {
-    for (futex_waiters[0..]) |*waiter| {
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
         if (waiter.active) continue;
         waiter.* = .{
             .active = true,
@@ -348,7 +481,17 @@ fn recordFutexWaiterInFreeSlot(
         };
         return true;
     }
-    return false;
+    if (futex_waiters_extent == max_futex_waiters) return false;
+    futex_waiters[futex_waiters_extent] = .{
+        .active = true,
+        .principal = proc,
+        .thread_index = thread_index,
+        .thread_generation = thread_generation,
+        .user_va = user_va,
+        .wait_token = wait_token,
+    };
+    futex_waiters_extent += 1;
+    return true;
 }
 
 fn clearFutexWaiter(
@@ -359,15 +502,56 @@ fn clearFutexWaiter(
 ) void {
     futex_waiters_lock.lock();
     defer futex_waiters_lock.unlock();
-    for (futex_waiters[0..]) |*waiter| {
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
         if (!waiter.active) continue;
         if (waiter.principal != proc or
             waiter.thread_index != thread_index or
             waiter.thread_generation != thread_generation or
             waiter.wait_token != wait_token) continue;
-        waiter.* = .{};
+        retireFutexWaiterLocked(waiter);
         return;
     }
+}
+
+const FutexBlockProfile = struct {
+    original: ?scheduler.BeforeCurrentThreadLeaveCallback,
+    start: u64,
+    recorded: bool = false,
+
+    fn beforeLeave(context: *anyopaque) void {
+        const self: *FutexBlockProfile = @ptrCast(@alignCast(context));
+        if (self.original) |callback| callback.run(callback.context);
+        // AP block never returns through the syscall's C frame. Record at
+        // the real leave boundary; BSP return must not count it again. The
+        // interval includes the original KernelState lock-drop callback.
+        perf.runtimeElapsed(.futex_wait, .body_cycles, self.start);
+        perf.runtimeAdd(.futex_wait, .reserved, 1);
+        self.recorded = true;
+    }
+};
+
+test "futex block profile records the leave boundary before a nonreturning park" {
+    const Probe = struct {
+        fn release(context: *anyopaque) void {
+            const calls: *usize = @ptrCast(@alignCast(context));
+            calls.* += 1;
+        }
+    };
+    var calls: usize = 0;
+    var profile = FutexBlockProfile{
+        .original = .{ .context = &calls, .run = Probe.release },
+        .start = 0,
+    };
+    try std.testing.expect(!profile.recorded);
+    FutexBlockProfile.beforeLeave(&profile);
+    try std.testing.expect(profile.recorded);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    // The returning BSP path uses this same flag to avoid a second record.
+    if (!profile.recorded) FutexBlockProfile.beforeLeave(&profile);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    profile = .{ .original = null, .start = 0 };
+    FutexBlockProfile.beforeLeave(&profile);
+    try std.testing.expect(profile.recorded);
 }
 
 fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
@@ -386,37 +570,66 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
     // the two operations a single order: the waiter either observes the new
     // value or the subsequent wake observes the waiter.
     futex_waiters_lock.lock();
+    const copy_start = perf.runtimeTimestamp(.futex_wait);
     const current = readUserU32(h, proc, user_va) orelse {
+        perf.runtimeAdd(.futex_wait, .invalid, 1);
+        perf.runtimeAdd(.futex_wait, .copy_calls, 1);
+        perf.runtimeElapsed(.futex_wait, .copy_cycles, copy_start);
         futex_waiters_lock.unlock();
         return sc.syscall_err_invalid;
     };
+    perf.runtimeAdd(.futex_wait, .copy_calls, 1);
+    perf.runtimeElapsed(.futex_wait, .copy_cycles, copy_start);
     if (current != expected) {
+        perf.runtimeAdd(.futex_wait, .no_claim, 1);
         futex_waiters_lock.unlock();
         return sc.syscall_err_not_ready;
     }
+    const claim_start = perf.runtimeTimestamp(.futex_wait);
     const wait_token = scheduler.reserveCurrentWaitToken(thread_generation) orelse {
+        perf.runtimeAdd(.futex_wait, .invalid, 1);
         futex_waiters_lock.unlock();
         return sc.syscall_err_invalid;
     };
     if (!recordFutexWaiterLocked(proc, thread_index, thread_generation, user_va, wait_token)) {
+        perf.runtimeAdd(.futex_wait, .invalid, 1);
         futex_waiters_lock.unlock();
         scheduler.cancelCurrentWaitToken(thread_generation, wait_token);
         return sc.syscall_err_alloc;
     }
     futex_waiters_lock.unlock();
+    perf.runtimeAdd(.futex_wait, .claim_calls, 1);
+    perf.runtimeElapsed(.futex_wait, .claim_cycles, claim_start);
 
     const timeout_result = if (timeout_ticks == 0)
         sc.syscall_err_not_ready
     else
         runtime_abi.futex_wait_timed_out_status;
-    if (h.block_current_thread_for_event(
+    const block_start = perf.runtimeTimestamp(.futex_wait);
+    var block_profile = FutexBlockProfile{
+        .original = h.before_current_thread_leave,
+        .start = block_start,
+    };
+    const before_block = if (comptime perf.enabled)
+        scheduler.BeforeCurrentThreadLeaveCallback{ .context = &block_profile, .run = FutexBlockProfile.beforeLeave }
+    else
+        h.before_current_thread_leave;
+    perf.runtimeAdd(.futex_wait, .body_calls, 1);
+    const blocked = h.block_current_thread_for_event(
         frame,
         true,
         wait_token,
         timeout_ticks,
         timeout_result,
-        h.before_current_thread_leave,
-    )) return frame.rax;
+        before_block,
+    );
+    if (comptime perf.enabled) {
+        if (!block_profile.recorded) {
+            perf.runtimeElapsed(.futex_wait, .body_cycles, block_start);
+            perf.runtimeAdd(.futex_wait, if (blocked) .claimed else .invalid, 1);
+        }
+    }
+    if (blocked) return frame.rax;
     scheduler.cancelCurrentWaitToken(thread_generation, wait_token);
     // FUTEX_REQUEUE may have changed this waiter's key while it slept.  The
     // reserved token uniquely identifies the wait, so cleanup must not depend
@@ -426,18 +639,472 @@ fn futexWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
 }
 
 fn futexWake(proc: kernel.PrincipalId, user_va: u64, max_count: u64) u64 {
+    return futexWakeCollect(scheduler.wakeIfWaitingTokenGenerationWithRax, proc, user_va, max_count, null);
+}
+
+const WakeWaitScheduler = struct {
+    const currentThread = scheduler.currentThread;
+    const generationOfThread = scheduler.generationOfThread;
+    const reserveCurrentWaitToken = scheduler.reserveCurrentWaitToken;
+    const cancelCurrentWaitToken = scheduler.cancelCurrentWaitToken;
+    const waitTokenIsCurrent = scheduler.waitTokenIsCurrent;
+    const tryTransfer = scheduler.tryWakeWaitTransfer;
+    const wake = scheduler.wakeIfWaitingTokenGenerationWithRax;
+    const reselectBlocked = scheduler.resumeAfterWakeWaitInstallFailure;
+};
+
+const WakeWaitPeerResult = struct {
+    count: u64 = 0,
+    failed: bool = false,
+    transfer: ?bool = null,
+};
+
+fn wakeWaitPeerLocked(comptime Ops: type, proc: kernel.PrincipalId, wake_va: u64, frame: *TrapFrame, caller_id: usize, caller_generation: u32, caller_token: u64, registered: bool, timeout_ticks: u64, resume_rax: u64) WakeWaitPeerResult {
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
+        if (!waiter.active or waiter.principal != proc or waiter.user_va != wake_va) continue;
+        // Conceptual wake-before-own-wait ordering must survive alias keys:
+        // registering the caller early cannot let it consume its own wake.
+        if (caller_token != 0 and waiter.thread_index == caller_id and
+            waiter.thread_generation == caller_generation and waiter.wait_token == caller_token) continue;
+        if (registered) {
+            if (comptime perf.enabled) perf.runtimeAdd(.futex_wake_wait, .claim_calls, 1);
+            const transfer_start = perf.runtimeTimestamp(.futex_wake_wait);
+            const transferred = Ops.tryTransfer(frame, .{
+                .peer = waiter.thread_index,
+                .peer_generation = waiter.thread_generation,
+                .owner = proc,
+                .peer_token = waiter.wait_token,
+                .caller_token = caller_token,
+                .timeout_ticks = timeout_ticks,
+                .resume_rax = resume_rax,
+            });
+            // The live frame may now be the receiver. This measurement uses
+            // only the pre-transfer timestamp and returned result, not its args.
+            perf.runtimeElapsed(.futex_wake_wait, .body_cycles, transfer_start);
+            if (transferred) |installed| {
+                if (comptime perf.enabled) perf.runtimeAdd(.futex_wake_wait, if (installed) .claimed else .reserved, 1);
+                retireFutexWaiterLocked(waiter);
+                return .{ .count = 1, .transfer = installed };
+            }
+            if (comptime perf.enabled) perf.runtimeAdd(.futex_wake_wait, .no_claim, 1);
+        }
+        switch (Ops.wake(waiter.thread_index, waiter.thread_generation, proc, waiter.wait_token, sc.syscall_ok)) {
+            .woke => {
+                retireFutexWaiterLocked(waiter);
+                return .{ .count = 1 };
+            },
+            .stale => retireFutexWaiterLocked(waiter),
+            // No wake was committed. Retain the exact peer record and return
+            // failure rather than confusing publication failure with wake0.
+            .publish_failed => return .{ .failed = true },
+        }
+    }
+    return .{};
+}
+
+fn futexWakeWaitWithOps(comptime Ops: type, h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    // This denominator precedes every possible non-returning AP block tail.
+    // Columns 0..5 remain dispatcher timings, not frontend substage timings.
+    // Here body_calls=entered, copy_calls=registered, claim_calls=attempted,
+    // claimed=installed, reserved=install failed, no_claim=rejected,
+    // invalid=outbound publish failed. copy_cycles is checked-copy elapsed,
+    // claim_cycles is inclusive registration (including copy), body_cycles
+    // is inclusive backend transfer. Amortize copy/registration by entered,
+    // not successful registrations; transfer uses the attempt denominator.
+    if (comptime perf.enabled) perf.runtimeAdd(.futex_wake_wait, .body_calls, 1);
+    const registration_start = perf.runtimeTimestamp(.futex_wake_wait);
+    const wake_va = frame.rdi;
+    const wait_va = frame.rsi;
+    const expected: u32 = @truncate(frame.r10);
+    const timeout_ticks = frame.r8;
+    // RDX has no input role. The common entry also sets this before admission,
+    // so every failure has a defined outbound-completion result.
+    frame.rdx = std.math.maxInt(u64);
+    if (wake_va == 0 or (wake_va & 3) != 0) return sc.syscall_err_invalid;
+    const caller_id = Ops.currentThread();
+    const generation = Ops.generationOfThread(caller_id);
+    const caller_generation = generation orelse 0;
+    var caller_token: u64 = 0;
+    var registered = false;
+    var wait_status = sc.syscall_err_invalid;
+    const resume_rax = if (timeout_ticks == 0) sc.syscall_err_not_ready else runtime_abi.futex_wait_timed_out_status;
+
+    // Comparison, registration and outbound selection share the existing
+    // futex order. A concurrent wake either sees the new record or changes
+    // the checked word before publication; no transport/user bytes are reused.
+    futex_waiters_lock.lock();
+    if (wait_va != 0 and (wait_va & 3) == 0 and generation != null) {
+        const copy_start = perf.runtimeTimestamp(.futex_wake_wait);
+        const user_word = readUserU32(h, proc, wait_va);
+        perf.runtimeElapsed(.futex_wake_wait, .copy_cycles, copy_start);
+        if (user_word) |current| {
+            if (current != expected) {
+                wait_status = sc.syscall_err_not_ready;
+            } else if (Ops.reserveCurrentWaitToken(caller_generation)) |token| {
+                caller_token = token;
+                registered = recordFutexWaiterWithTokenCheckLocked(Ops.waitTokenIsCurrent, proc, caller_id, caller_generation, wait_va, token);
+                wait_status = if (registered) sc.syscall_ok else sc.syscall_err_alloc;
+            }
+        }
+    }
+    if (comptime perf.enabled) {
+        if (registered) perf.runtimeAdd(.futex_wake_wait, .copy_calls, 1);
+    }
+    // This interval ends before outbound selection can replace the frame or
+    // invoke a non-returning leave. It includes key-lock wait, copy and token.
+    perf.runtimeElapsed(.futex_wake_wait, .claim_cycles, registration_start);
+    // Wait-side failure must not suppress a valid outbound wake, nor invite a
+    // retry of this compound operation. Wake0 is a successful outbound step.
+    const peer = wakeWaitPeerLocked(Ops, proc, wake_va, frame, caller_id, caller_generation, caller_token, registered, timeout_ticks, resume_rax);
+    futex_waiters_lock.unlock();
+    if (peer.transfer) |installed| {
+        // A transfer has saved the caller's result and may have replaced the
+        // live frame with the receiver. Never overwrite that receiver's RDX.
+        if (h.before_current_thread_leave) |callback| callback.run(callback.context);
+        if (!installed) Ops.reselectBlocked(frame);
+        return frame.rax;
+    }
+    if (peer.failed or !registered) {
+        if (comptime perf.enabled) {
+            if (peer.failed) perf.runtimeAdd(.futex_wake_wait, .invalid, 1);
+        }
+        if (caller_token != 0) {
+            Ops.cancelCurrentWaitToken(caller_generation, caller_token);
+            if (registered) clearFutexWaiter(proc, caller_id, caller_generation, caller_token);
+        }
+        if (peer.failed) return sc.syscall_err_alloc;
+        frame.rdx = peer.count;
+        return wait_status;
+    }
+    frame.rdx = peer.count;
+    if (h.block_current_thread_for_event(frame, true, caller_token, timeout_ticks, resume_rax, h.before_current_thread_leave)) return frame.rax;
+    Ops.cancelCurrentWaitToken(caller_generation, caller_token);
+    // REQUEUE may have changed the key; completion ownership is this token,
+    // not the original wait address. Outbound wake is never sent again.
+    clearFutexWaiter(proc, caller_id, caller_generation, caller_token);
+    return sc.syscall_err_not_ready;
+}
+
+fn futexWakeWait(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    return futexWakeWaitWithOps(WakeWaitScheduler, h, proc, frame);
+}
+
+const WakeWaitProbe = struct {
+    const owner: kernel.PrincipalId = @enumFromInt(44);
+    var word: u32 = 0;
+    var copy_ok = true;
+    var generation: ?u32 = 7;
+    var reserve_ok = true;
+    var transfer: ?bool = null;
+    var publication_failed = false;
+    var stale_id: ?usize = null;
+    var block_mode: enum { interrupt, early, switch_context } = .interrupt;
+    var requeue_on_block = false;
+    var copies: usize = 0;
+    var reserves: usize = 0;
+    var cancels: usize = 0;
+    var wakes: usize = 0;
+    var transfers: usize = 0;
+    var blocks: usize = 0;
+    var leaves: usize = 0;
+    var reselects: usize = 0;
+    var observed_count: u64 = 99;
+    var saved_count: u64 = 99;
+    var peer_index: usize = 1;
+
+    fn reset() TrapFrame {
+        futex_waiters = [_]FutexWaiter{.{}} ** max_futex_waiters;
+        futex_waiters_extent = 3;
+        futex_waiters[1] = .{ .active = true, .principal = owner, .thread_index = 9, .thread_generation = 17, .user_va = 0x1000, .wait_token = 55 };
+        futex_waiters[2] = .{ .active = true, .principal = @enumFromInt(45), .thread_index = 99, .thread_generation = 18, .user_va = 0x1000, .wait_token = 56 };
+        word = 0;
+        copy_ok = true;
+        generation = 7;
+        reserve_ok = true;
+        transfer = null;
+        publication_failed = false;
+        stale_id = null;
+        block_mode = .interrupt;
+        requeue_on_block = false;
+        copies = 0;
+        reserves = 0;
+        cancels = 0;
+        wakes = 0;
+        transfers = 0;
+        blocks = 0;
+        leaves = 0;
+        reselects = 0;
+        observed_count = 99;
+        saved_count = 99;
+        peer_index = 1;
+        var frame = std.mem.zeroes(TrapFrame);
+        frame.rdi = 0x1000;
+        frame.rsi = 0x2000;
+        frame.r10 = 0;
+        frame.r8 = 0;
+        frame.rdx = 0xcccc;
+        return frame;
+    }
+    fn currentThread() usize {
+        return 4;
+    }
+    fn generationOfThread(id: usize) ?u32 {
+        std.debug.assert(id == 4);
+        return generation;
+    }
+    fn reserveCurrentWaitToken(gen: u32) ?u64 {
+        std.debug.assert(futex_waiters_lock.value == 1 and gen == 7);
+        reserves += 1;
+        return if (reserve_ok) 101 else null;
+    }
+    fn cancelCurrentWaitToken(gen: u32, token: u64) void {
+        std.debug.assert(futex_waiters_lock.value == 0 and gen == 7 and token == 101);
+        cancels += 1;
+    }
+    fn waitTokenIsCurrent(_: kernel.PrincipalId, _: usize, _: u32, _: u64) bool {
+        return true;
+    }
+    fn tryTransfer(frame: *TrapFrame, request: scheduler.WakeWaitTransfer) ?bool {
+        std.debug.assert(futex_waiters_lock.value == 1 and request.owner == owner and
+            request.peer != 4 and request.caller_token == 101);
+        transfers += 1;
+        if (transfer) |installed| {
+            saved_count = 1;
+            frame.rdx = 1;
+            if (installed) {
+                frame.rax = 0x7788;
+                frame.rdx = 0xef01;
+            }
+        }
+        return transfer;
+    }
+    fn wake(id: usize, gen: u32, principal: kernel.PrincipalId, token: u64, result: u64) scheduler.KeyedWakeResult {
+        std.debug.assert(futex_waiters_lock.value == 1 and principal == owner and result == 0);
+        std.debug.assert(!(id == 4 and gen == 7 and token == 101));
+        wakes += 1;
+        if (stale_id == id) return .stale;
+        return if (publication_failed) .publish_failed else .woke;
+    }
+    fn copy(_: kernel.PrincipalId, _: u64, bytes: []u8) bool {
+        std.debug.assert(futex_waiters_lock.value == 1 and bytes.len == 4);
+        copies += 1;
+        if (!copy_ok) return false;
+        std.mem.writeInt(u32, bytes[0..4], word, .little);
+        return true;
+    }
+    fn leave(context: *anyopaque) void {
+        const count: *usize = @ptrCast(@alignCast(context));
+        std.debug.assert(futex_waiters_lock.value == 0 and !futex_waiters[peer_index].active);
+        count.* += 1;
+    }
+    fn reselectBlocked(frame: *TrapFrame) void {
+        std.debug.assert(futex_waiters_lock.value == 0 and leaves == 1 and saved_count == 1);
+        reselects += 1;
+        frame.rax = 0x9988;
+        frame.rdx = 0xabcd;
+    }
+    fn block(frame: *TrapFrame, mailbox: bool, token: u64, _: u64, _: u64, callback: ?scheduler.BeforeCurrentThreadLeaveCallback) bool {
+        std.debug.assert(futex_waiters_lock.value == 0 and mailbox and token == 101);
+        blocks += 1;
+        observed_count = frame.rdx;
+        if (requeue_on_block) {
+            std.debug.assert(futexRequeueWithWake(wake, owner, 0x2000, 0, 1, 0x7000) == 1);
+            std.debug.assert(futex_waiters[0].user_va == 0x7000);
+        }
+        switch (block_mode) {
+            .interrupt => return false,
+            .early => {
+                // Model an early keyed wake retiring our record and storing
+                // RAX before block. Existing block leaves live RDX untouched.
+                clearFutexWaiter(owner, 4, 7, token);
+                frame.rax = 0;
+                return true;
+            },
+            .switch_context => {
+                saved_count = frame.rdx;
+                if (callback) |cb| cb.run(cb.context);
+                frame.rax = 0x9988;
+                frame.rdx = 0xabcd;
+                return true;
+            },
+        }
+    }
+    fn run(frame: *TrapFrame) u64 {
+        const callback: ?scheduler.BeforeCurrentThreadLeaveCallback = .{ .context = &leaves, .run = leave };
+        return futexWakeWaitWithOps(@This(), .{ .copy_user_bytes_from_va = copy, .before_current_thread_leave = callback, .block_current_thread_for_event = block }, owner, frame);
+    }
+};
+
+test "futex wake wait frontend alias exclusion and signal rejection retain completed wake" {
+    const saved = futex_waiters;
+    const extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = extent;
+    }
+    var frame = WakeWaitProbe.reset();
+    frame.rsi = frame.rdi;
+    try std.testing.expectEqual(sc.syscall_err_not_ready, WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 1), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.wakes);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.blocks);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.cancels);
+    try std.testing.expect(!futex_waiters[0].active and !futex_waiters[1].active);
+    try std.testing.expect(futex_waiters[2].active);
+    try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.leaves);
+}
+
+test "futex wake wait frontend signal rejection cancels requeued caller by token" {
+    const saved = futex_waiters;
+    const extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = extent;
+    }
+    var frame = WakeWaitProbe.reset();
+    WakeWaitProbe.requeue_on_block = true;
+    try std.testing.expectEqual(sc.syscall_err_not_ready, WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 1), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.wakes);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.cancels);
+    try std.testing.expect(!futex_waiters[0].active and !futex_waiters[1].active);
+    try std.testing.expect(futex_waiters[2].active);
+}
+
+test "futex wake wait frontend failure never suppresses valid wake or parks uncertain publication" {
+    const saved = futex_waiters;
+    const extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = extent;
+    }
+    for (0..7) |scenario| {
+        var frame = WakeWaitProbe.reset();
+        switch (scenario) {
+            0 => WakeWaitProbe.word = 1,
+            1 => WakeWaitProbe.copy_ok = false,
+            2 => frame.rsi += 1,
+            3 => WakeWaitProbe.generation = null,
+            4 => WakeWaitProbe.reserve_ok = false,
+            5 => WakeWaitProbe.publication_failed = true,
+            6 => frame.rdi += 1,
+            else => unreachable,
+        }
+        const status = WakeWaitProbe.run(&frame);
+        try std.testing.expectEqual(if (scenario == 0) sc.syscall_err_not_ready else if (scenario == 5)
+            sc.syscall_err_alloc
+        else
+            sc.syscall_err_invalid, status);
+        try std.testing.expectEqual(if (scenario >= 5) std.math.maxInt(u64) else @as(u64, 1), frame.rdx);
+        try std.testing.expectEqual(if (scenario == 6) @as(usize, 0) else @as(usize, 1), WakeWaitProbe.wakes);
+        try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.blocks);
+        try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.leaves);
+        try std.testing.expectEqual(scenario >= 5, futex_waiters[1].active);
+        try std.testing.expect(!futex_waiters[0].active and futex_waiters[2].active);
+        try std.testing.expectEqual(if (scenario == 5) @as(usize, 1) else @as(usize, 0), WakeWaitProbe.cancels);
+    }
+}
+
+test "futex wake wait frontend record exhaustion wakes once and cancels unpublished caller" {
+    const saved = futex_waiters;
+    const extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = extent;
+    }
+    var frame = WakeWaitProbe.reset();
+    for (&futex_waiters, 0..) |*entry, index| entry.* = .{ .active = true, .principal = WakeWaitProbe.owner, .thread_index = 10 + index, .thread_generation = 17, .user_va = 0x3000, .wait_token = 55 };
+    futex_waiters[0].user_va = frame.rdi;
+    futex_waiters_extent = max_futex_waiters;
+    try std.testing.expectEqual(sc.syscall_err_alloc, WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 1), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.wakes);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.cancels);
+    try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.blocks);
+    try std.testing.expect(!futex_waiters[0].active);
+    try std.testing.expectEqual(max_futex_waiters, futex_waiters_extent);
+}
+
+test "futex wake wait frontend transfer retires peer before leave and reselects failed install once" {
+    const saved = futex_waiters;
+    const extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = extent;
+    }
+    for ([_]bool{ true, false }) |installed| {
+        var frame = WakeWaitProbe.reset();
+        WakeWaitProbe.transfer = installed;
+        try std.testing.expectEqual(if (installed) @as(u64, 0x7788) else @as(u64, 0x9988), WakeWaitProbe.run(&frame));
+        try std.testing.expectEqual(if (installed) @as(u64, 0xef01) else @as(u64, 0xabcd), frame.rdx);
+        try std.testing.expectEqual(@as(u64, 1), WakeWaitProbe.saved_count);
+        try std.testing.expect(futex_waiters[0].active and !futex_waiters[1].active and futex_waiters[2].active);
+        try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.leaves);
+        try std.testing.expectEqual(if (installed) @as(usize, 0) else @as(usize, 1), WakeWaitProbe.reselects);
+        try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.wakes);
+        try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.blocks);
+        try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.cancels);
+    }
+}
+
+test "futex wake wait frontend early completion fallback wake0 and stale peer preserve frame ownership" {
+    const saved = futex_waiters;
+    const extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = extent;
+    }
+    var frame = WakeWaitProbe.reset();
+    WakeWaitProbe.block_mode = .early;
+    try std.testing.expectEqual(sc.syscall_ok, WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 1), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.leaves);
+    try std.testing.expect(!futex_waiters[0].active);
+
+    frame = WakeWaitProbe.reset();
+    WakeWaitProbe.block_mode = .switch_context;
+    try std.testing.expectEqual(@as(u64, 0x9988), WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 0xabcd), frame.rdx);
+    try std.testing.expectEqual(@as(u64, 1), WakeWaitProbe.saved_count);
+    try std.testing.expectEqual(@as(usize, 1), WakeWaitProbe.leaves);
+
+    frame = WakeWaitProbe.reset();
+    futex_waiters[1].active = false;
+    try std.testing.expectEqual(sc.syscall_err_not_ready, WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 0), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 0), WakeWaitProbe.wakes);
+
+    frame = WakeWaitProbe.reset();
+    futex_waiters[3] = futex_waiters[1];
+    futex_waiters[3].thread_index = 10;
+    futex_waiters_extent = 4;
+    WakeWaitProbe.stale_id = 9;
+    try std.testing.expectEqual(sc.syscall_err_not_ready, WakeWaitProbe.run(&frame));
+    try std.testing.expectEqual(@as(u64, 1), frame.rdx);
+    try std.testing.expectEqual(@as(usize, 2), WakeWaitProbe.wakes);
+    try std.testing.expect(!futex_waiters[1].active and !futex_waiters[3].active);
+}
+
+fn futexWakeCollect(
+    comptime wake: anytype,
+    proc: kernel.PrincipalId,
+    user_va: u64,
+    max_count: u64,
+    handoff_target: ?*?kernel.ThreadWakeTarget,
+) u64 {
+    if (handoff_target) |hint| hint.* = null;
     if (user_va == 0 or (user_va & 0x3) != 0) return sc.syscall_err_invalid;
     if (max_count == 0) return 0;
     futex_waiters_lock.lock();
     defer futex_waiters_lock.unlock();
     var woke: u64 = 0;
-    for (futex_waiters[0..]) |*waiter| {
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
         if (!waiter.active) continue;
         if (waiter.principal != proc or waiter.user_va != user_va) continue;
         const thread_index = waiter.thread_index;
         const thread_generation = waiter.thread_generation;
         const wait_token = waiter.wait_token;
-        switch (scheduler.wakeIfWaitingTokenGenerationWithRax(
+        switch (wake(
             thread_index,
             thread_generation,
             proc,
@@ -445,18 +1112,296 @@ fn futexWake(proc: kernel.PrincipalId, user_va: u64, max_count: u64) u64 {
             sc.syscall_ok,
         )) {
             .woke => {
-                waiter.* = .{};
+                retireFutexWaiterLocked(waiter);
                 woke += 1;
+                if (handoff_target) |hint| hint.* = .{
+                    .owner = proc,
+                    .thread_index = thread_index,
+                    .thread_generation = thread_generation,
+                };
                 if (max_count != runtime_abi.futex_wake_all and woke >= max_count) break;
             },
-            .stale => waiter.* = .{},
+            .stale => retireFutexWaiterLocked(waiter),
             .publish_failed => {},
         }
     }
     return woke;
 }
 
+const FutexWakeOneResult = struct { count: u64 = 0, handed_off: bool = false };
+
+fn futexWakeOneCollect(comptime wake_and_handoff: anytype, proc: kernel.PrincipalId, user_va: u64, frame: *TrapFrame) FutexWakeOneResult {
+    if (user_va == 0 or (user_va & 3) != 0) return .{ .count = sc.syscall_err_invalid };
+    futex_waiters_lock.lock();
+    defer futex_waiters_lock.unlock();
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
+        if (!waiter.active or waiter.principal != proc or waiter.user_va != user_va) continue;
+        const result = wake_and_handoff(frame, waiter.thread_index, waiter.thread_generation, proc, waiter.wait_token, sc.syscall_ok, 1);
+        switch (result.wake) {
+            .woke => {
+                // Context installation may have replaced the caller's frame,
+                // but the exact waiter remains pinned until this retirement.
+                // Never read a new key/count from that receiver frame.
+                retireFutexWaiterLocked(waiter);
+                return .{ .count = 1, .handed_off = result.handed_off };
+            },
+            .stale => retireFutexWaiterLocked(waiter),
+            .publish_failed => {},
+        }
+    }
+    return .{};
+}
+
+fn finishFutexWakeOne(frame: *TrapFrame, result: FutexWakeOneResult, before_leave: ?scheduler.BeforeCurrentThreadLeaveCallback) u64 {
+    if (result.handed_off) {
+        // TT and futex locks have been released and the waiter retired; the
+        // caller's KernelState lock remains held until this one callback.
+        if (before_leave) |callback| callback.run(callback.context);
+        perf.runtimeAdd(.futex_wake, .reserved, 1);
+        return frame.rax;
+    }
+    return result.count;
+}
+
+fn futexWakeAndHandoff(h: anytype, proc: kernel.PrincipalId, frame: *TrapFrame) u64 {
+    const user_va = frame.rdi;
+    const max_count = frame.rsi;
+    if (max_count != 1) {
+        const start = perf.runtimeTimestamp(.futex_wake);
+        const woke = futexWake(proc, user_va, max_count);
+        perf.runtimeAdd(.futex_wake, .claim_calls, 1);
+        perf.runtimeElapsed(.futex_wake, .claim_cycles, start);
+        return woke;
+    }
+    // The one-wake collector now includes context installation. Its claim
+    // interval is not comparable to the old collector-only diagnostic; body
+    // below measures only finish/lock-drop callback, not the scheduler switch.
+    const collect_start = perf.runtimeTimestamp(.futex_wake);
+    const result = futexWakeOneCollect(scheduler.wakeIfWaitingTokenGenerationWithRaxAndHandoff, proc, user_va, frame);
+    perf.runtimeAdd(.futex_wake, .claim_calls, 1);
+    perf.runtimeElapsed(.futex_wake, .claim_cycles, collect_start);
+    perf.runtimeAdd(.futex_wake, if (result.count == 1) .claimed else .no_claim, 1);
+    const handoff_start = perf.runtimeTimestamp(.futex_wake);
+    const returned = finishFutexWakeOne(frame, result, h.before_current_thread_leave);
+    perf.runtimeAdd(.futex_wake, .body_calls, 1);
+    perf.runtimeElapsed(.futex_wake, .body_cycles, handoff_start);
+    return returned;
+}
+
+test "futex handoff collector preserves failed publication and exact wake hint" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var fail: bool = true;
+        fn wake(_: usize, _: u32, _: kernel.PrincipalId, token: u64, result: u64) scheduler.KeyedWakeResult {
+            std.debug.assert(futex_waiters_lock.value == 1 and result == sc.syscall_ok);
+            calls += 1;
+            if (token == 1) return .stale;
+            return if (fail) .publish_failed else .woke;
+        }
+    };
+    // Host tests are serialized; restore the table rather than leaking fake
+    // registrations into subsequent runtime tests.
+    const saved = futex_waiters;
+    const saved_extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = saved_extent;
+    }
+    futex_waiters = [_]FutexWaiter{.{}} ** max_futex_waiters;
+    const owner: kernel.PrincipalId = @enumFromInt(7);
+    futex_waiters[0] = .{ .active = true, .principal = @enumFromInt(8), .user_va = 0x1000, .wait_token = 2 };
+    futex_waiters[1] = .{ .active = true, .principal = owner, .user_va = 0x2000, .wait_token = 2 };
+    futex_waiters[2] = .{ .active = true, .principal = owner, .user_va = 0x1000, .wait_token = 1 };
+    futex_waiters[3] = .{ .active = true, .principal = owner, .thread_index = 5, .thread_generation = 17, .user_va = 0x1000, .wait_token = 2 };
+    futex_waiters_extent = 4;
+    const pending = futex_waiters[3];
+    var hint: ?kernel.ThreadWakeTarget = null;
+    Probe.calls = 0;
+    Probe.fail = true;
+    try std.testing.expectEqual(@as(u64, 0), futexWakeCollect(Probe.wake, owner, 0x1000, 1, &hint));
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expect(hint == null and !futex_waiters[2].active);
+    try std.testing.expectEqualDeep(pending, futex_waiters[3]);
+    try std.testing.expect(futex_waiters[0].active and futex_waiters[1].active);
+    Probe.fail = false;
+    try std.testing.expectEqual(@as(u64, 1), futexWakeCollect(Probe.wake, owner, 0x1000, 1, &hint));
+    try std.testing.expectEqual(@as(usize, 5), hint.?.thread_index);
+    try std.testing.expectEqual(@as(u32, 17), hint.?.thread_generation);
+    try std.testing.expectEqual(owner, hint.?.owner);
+    try std.testing.expectEqual(@as(u8, 0), futex_waiters_lock.value);
+    try std.testing.expectEqual(@as(u64, 0), futexWakeCollect(Probe.wake, owner, 0x1000, 1, &hint));
+    try std.testing.expect(hint == null);
+    futex_waiters[3] = pending;
+    futex_waiters[4] = pending;
+    futex_waiters_extent = 5;
+    try std.testing.expectEqual(@as(u64, 0), futexWakeCollect(Probe.wake, owner, 0x1000, 0, null));
+    try std.testing.expectEqual(sc.syscall_err_invalid, futexWakeCollect(Probe.wake, owner, 0x1001, 1, null));
+    try std.testing.expectEqual(@as(u64, 2), futexWakeCollect(Probe.wake, owner, 0x1000, runtime_abi.futex_wake_all, null));
+}
+
+test "futex active extent retains full capacity and replaces above holes" {
+    const Probe = struct {
+        var stale: bool = false;
+        fn current(_: kernel.PrincipalId, thread: usize, _: u32, _: u64) bool {
+            return !(stale and thread == 3);
+        }
+    };
+    const saved = futex_waiters;
+    const saved_extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = saved_extent;
+    }
+    futex_waiters = [_]FutexWaiter{.{}} ** max_futex_waiters;
+    futex_waiters_extent = 0;
+    const owner: kernel.PrincipalId = @enumFromInt(7);
+    Probe.stale = false;
+    for (0..max_futex_waiters) |thread| {
+        try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, thread, 1, 0x1000, thread + 1));
+        try std.testing.expectEqual(thread + 1, futex_waiters_extent);
+    }
+    try std.testing.expect(!recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, max_futex_waiters, 1, 0x1000, 5000));
+    Probe.stale = true;
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, max_futex_waiters, 1, 0x1000, 5000));
+    try std.testing.expectEqual(max_futex_waiters, futex_waiters_extent);
+    try std.testing.expectEqual(max_futex_waiters, futex_waiters[3].thread_index);
+    clearFutexWaiter(owner, 0, 1, 1);
+    // Re-registration must replace the high record, not consume slot zero.
+    try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, max_futex_waiters - 1, 2, 0x2000, 6000));
+    try std.testing.expect(!futex_waiters[0].active);
+    try std.testing.expectEqual(@as(u64, 6000), futex_waiters[max_futex_waiters - 1].wait_token);
+    clearFutexWaiter(@enumFromInt(8), max_futex_waiters - 1, 2, 6000);
+    clearFutexWaiter(owner, max_futex_waiters - 1, 1, 6000);
+    clearFutexWaiter(owner, max_futex_waiters - 1, 2, 5999);
+    try std.testing.expectEqual(max_futex_waiters, futex_waiters_extent);
+    clearFutexWaiter(owner, max_futex_waiters - 1, 2, 6000);
+    try std.testing.expectEqual(max_futex_waiters - 1, futex_waiters_extent);
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| retireFutexWaiterLocked(waiter);
+    try std.testing.expectEqual(@as(usize, 0), futex_waiters_extent);
+    for (futex_waiters) |waiter| try std.testing.expect(!waiter.active);
+    try std.testing.expect(kernelStaticStorageEndAddr() >= staticStorageEnd(@TypeOf(futex_waiters_extent), &futex_waiters_extent));
+}
+
+test "futex active extent requeue and wake all preserve failed publication" {
+    const Probe = struct {
+        var fail: bool = true;
+        var calls: usize = 0;
+        fn current(_: kernel.PrincipalId, _: usize, _: u32, _: u64) bool {
+            return true;
+        }
+        fn wake(_: usize, _: u32, _: kernel.PrincipalId, token: u64, result: u64) scheduler.KeyedWakeResult {
+            std.debug.assert(futex_waiters_lock.value == 1 and result == sc.syscall_ok);
+            calls += 1;
+            return if (fail and token == 8) .publish_failed else .woke;
+        }
+    };
+    const saved = futex_waiters;
+    const saved_extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = saved_extent;
+    }
+    futex_waiters = [_]FutexWaiter{.{}} ** max_futex_waiters;
+    futex_waiters_extent = 0;
+    const owner: kernel.PrincipalId = @enumFromInt(7);
+    for (0..8) |thread| try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, thread, 3, 0x1000, thread + 1));
+    Probe.calls = 0;
+    Probe.fail = true;
+    try std.testing.expectEqual(@as(u64, 8), futexRequeueWithWake(Probe.wake, owner, 0x1000, 2, 6, 0x2000));
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expectEqual(@as(u64, 0), futexWakeCollect(Probe.wake, owner, 0x1000, runtime_abi.futex_wake_all, null));
+    clearFutexWaiter(owner, 6, 3, 7);
+    try std.testing.expectEqual(@as(u64, 4), futexWakeCollect(Probe.wake, owner, 0x2000, runtime_abi.futex_wake_all, null));
+    try std.testing.expectEqual(@as(usize, 8), futex_waiters_extent);
+    try std.testing.expect(futex_waiters[7].active);
+    Probe.fail = false;
+    try std.testing.expectEqual(@as(u64, 1), futexRequeueWithWake(Probe.wake, owner, 0x2000, 1, 0, 0x3000));
+    try std.testing.expectEqual(@as(usize, 0), futex_waiters_extent);
+    // Capture a nonempty slice, then retire every record while its bound shrinks.
+    for (0..8) |thread| try std.testing.expect(recordFutexWaiterWithTokenCheckLocked(Probe.current, owner, thread, 3, 0x1000, thread + 1));
+    try std.testing.expectEqual(@as(u64, 8), futexWakeCollect(Probe.wake, owner, 0x1000, runtime_abi.futex_wake_all, null));
+    try std.testing.expectEqual(@as(usize, 0), futex_waiters_extent);
+    for (futex_waiters) |waiter| try std.testing.expect(!waiter.active);
+}
+
+test "futex fused collector retires exact waiter before one leave callback" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var leave_calls: usize = 0;
+        var fail: bool = true;
+        var switched: bool = true;
+        fn wake(frame: *TrapFrame, thread: usize, generation: u32, owner: kernel.PrincipalId, token: u64, resumed_rax: u64, sender: u64) scheduler.KeyedWakeHandoffResult {
+            std.debug.assert(futex_waiters_lock.value == 1 and resumed_rax == 0 and sender == 1);
+            std.debug.assert(owner == @as(kernel.PrincipalId, @enumFromInt(7)));
+            calls += 1;
+            if (token == 1) return .{ .wake = .stale };
+            std.debug.assert(thread == 5 and generation == 17 and token == 2);
+            if (fail) return .{ .wake = .publish_failed };
+            if (switched) {
+                frame.rax = 123;
+                frame.rdi = 0x2000;
+                frame.rsi = 999;
+            }
+            return .{ .wake = .woke, .handed_off = switched };
+        }
+        fn leave(_: *anyopaque) void {
+            std.debug.assert(futex_waiters_lock.value == 0);
+            std.debug.assert(!futex_waiters[3].active and futex_waiters[4].active);
+            leave_calls += 1;
+        }
+    };
+    const saved = futex_waiters;
+    const saved_extent = futex_waiters_extent;
+    defer {
+        futex_waiters = saved;
+        futex_waiters_extent = saved_extent;
+    }
+    futex_waiters = [_]FutexWaiter{.{}} ** max_futex_waiters;
+    const owner: kernel.PrincipalId = @enumFromInt(7);
+    futex_waiters[0] = .{ .active = true, .principal = @enumFromInt(8), .user_va = 0x1000, .wait_token = 2 };
+    futex_waiters[1] = .{ .active = true, .principal = owner, .user_va = 0x2000, .wait_token = 2 };
+    futex_waiters[2] = .{ .active = true, .principal = owner, .user_va = 0x1000, .wait_token = 1 };
+    futex_waiters[3] = .{ .active = true, .principal = owner, .thread_index = 5, .thread_generation = 17, .user_va = 0x1000, .wait_token = 2 };
+    futex_waiters[4] = .{ .active = true, .principal = owner, .user_va = 0x2000, .wait_token = 9 };
+    futex_waiters_extent = 5;
+    const pending = futex_waiters[3];
+    var frame = std.mem.zeroes(TrapFrame);
+    Probe.calls = 0;
+    Probe.leave_calls = 0;
+    Probe.fail = true;
+    Probe.switched = true;
+    try std.testing.expectEqualDeep(FutexWakeOneResult{}, futexWakeOneCollect(Probe.wake, owner, 0x1000, &frame));
+    try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+    try std.testing.expect(!futex_waiters[2].active);
+    try std.testing.expectEqualDeep(pending, futex_waiters[3]);
+    Probe.fail = false;
+    const result = futexWakeOneCollect(Probe.wake, owner, 0x1000, &frame);
+    try std.testing.expectEqualDeep(FutexWakeOneResult{ .count = 1, .handed_off = true }, result);
+    try std.testing.expect(!futex_waiters[3].active and futex_waiters[4].active);
+    var context: usize = 0;
+    const callback = scheduler.BeforeCurrentThreadLeaveCallback{ .context = &context, .run = Probe.leave };
+    try std.testing.expectEqual(@as(u64, 123), finishFutexWakeOne(&frame, result, callback));
+    try std.testing.expectEqual(@as(usize, 1), Probe.leave_calls);
+    Probe.switched = false;
+    futex_waiters[3] = pending;
+    try std.testing.expectEqual(@as(u64, 1), finishFutexWakeOne(&frame, futexWakeOneCollect(Probe.wake, owner, 0x1000, &frame), callback));
+    try std.testing.expectEqual(@as(usize, 1), Probe.leave_calls);
+    try std.testing.expectEqual(@as(u64, sc.syscall_err_invalid), futexWakeOneCollect(Probe.wake, owner, 0x1001, &frame).count);
+    try std.testing.expectEqual(@as(usize, 4), Probe.calls);
+}
+
 fn futexRequeue(
+    proc: kernel.PrincipalId,
+    source_va: u64,
+    max_wake: u64,
+    max_requeue: u64,
+    target_va: u64,
+) u64 {
+    return futexRequeueWithWake(scheduler.wakeIfWaitingTokenGenerationWithRax, proc, source_va, max_wake, max_requeue, target_va);
+}
+
+fn futexRequeueWithWake(
+    comptime wake: anytype,
     proc: kernel.PrincipalId,
     source_va: u64,
     max_wake: u64,
@@ -480,12 +1425,12 @@ fn futexRequeue(
 
     var woke: u64 = 0;
     var requeued: u64 = 0;
-    for (futex_waiters[0..]) |*waiter| {
+    for (futex_waiters[0..futex_waiters_extent]) |*waiter| {
         if (!waiter.active) continue;
         if (waiter.principal != proc or waiter.user_va != source_va) continue;
 
         if (woke < max_wake) {
-            switch (scheduler.wakeIfWaitingTokenGenerationWithRax(
+            switch (wake(
                 waiter.thread_index,
                 waiter.thread_generation,
                 proc,
@@ -493,10 +1438,10 @@ fn futexRequeue(
                 sc.syscall_ok,
             )) {
                 .woke => {
-                    waiter.* = .{};
+                    retireFutexWaiterLocked(waiter);
                     woke += 1;
                 },
-                .stale => waiter.* = .{},
+                .stale => retireFutexWaiterLocked(waiter),
                 .publish_failed => {},
             }
             continue;
@@ -552,13 +1497,16 @@ pub fn dispatch(h: anytype, state: *kernel.KernelState, proc: kernel.PrincipalId
         // scheduler uses a zero-based internal slot, so expose a one-based
         // opaque TID rather than leaking slot 0 as an invalid userspace ID.
         sc.syscall_gettid => @as(u64, @intCast(scheduler.currentThread())) + 1,
+        sc.syscall_clock_read => clockReadLocked(frame),
         sc.syscall_system_info => systemInfo(h, proc, frame.rdi),
         sc.syscall_clock_gettime => clockGettime(h, proc, frame.rdi, frame.rsi),
         sc.syscall_clock_getres => clockGetres(h, proc, frame.rdi, frame.rsi),
+        sc.syscall_clock_page_open => clockPageOpen(state, proc, h.free_list),
         sc.syscall_yield => yieldThread(scheduler.handoffToBestReadyThreadWithRax, h, frame),
         sc.syscall_nanosleep => nanosleep(h, proc, frame),
         sc.syscall_futex_wait => futexWait(h, proc, frame),
-        sc.syscall_futex_wake => futexWake(proc, frame.rdi, frame.rsi),
+        sc.syscall_futex_wake => futexWakeAndHandoff(h, proc, frame),
+        sc.syscall_futex_wake_wait => futexWakeWait(h, proc, frame),
         sc.syscall_futex_requeue => futexRequeue(
             proc,
             frame.rdi,

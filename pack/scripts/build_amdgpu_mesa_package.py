@@ -37,6 +37,8 @@ ENTRY_PATHS = (
     "usr/share/pacha/mesa-virgl-build.txt",
 )
 EXTERNAL = {"libc.musl-x86_64.so.1"}
+GEARS_PATH = "usr/bin/amdgpu-mesa-gears.elf"
+GEARS_SOURCE = REPO / ".artifacts/amdgpu-mesa-gears-linux.elf"
 
 
 def digest(path: Path) -> str:
@@ -149,6 +151,12 @@ def stage(mesa: Path, clang: Path, output: Path, live_config: Path) -> dict:
     closure = Closure(mesa, clang)
     for relative in ENTRY_PATHS:
         closure.add(relative)
+    if not GEARS_SOURCE.is_file():
+        raise FileNotFoundError("Mesa gears client missing; build it first")
+    gears_needed = elf_needed(GEARS_SOURCE)
+    for soname in gears_needed:
+        if soname not in EXTERNAL:
+            closure.add_library(soname)
     if "usr/lib/libLLVM.so.20.1" not in closure.selected or \
             "usr/lib/libgallium-25.1.9.so" not in closure.selected:
         raise ValueError("radeonsi/LLVM closure is incomplete")
@@ -171,8 +179,15 @@ def stage(mesa: Path, clang: Path, output: Path, live_config: Path) -> dict:
             entries.append({"path": "/" + relative, "bytes": source.stat().st_size,
                             "sha256": digest(destination), "source": origin,
                             "needed": closure.needed[relative]})
+        gears_destination = temporary / "rootfs" / GEARS_PATH
+        gears_destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(GEARS_SOURCE, gears_destination)
+        entries.append({"path": "/" + GEARS_PATH,
+                        "bytes": GEARS_SOURCE.stat().st_size,
+                        "sha256": digest(gears_destination), "source": "pacha",
+                        "needed": gears_needed})
         manifest = {
-            "schema": 1, "profile": "amdgpu", "mesa_version": VERSION,
+            "profile": "amdgpu", "mesa_version": VERSION,
             "runtime_library_path": "/usr/lib:/lib",
             "external": sorted(EXTERNAL), "entries": entries,
             "total_bytes": sum(entry["bytes"] for entry in entries),
@@ -202,7 +217,7 @@ def stage(mesa: Path, clang: Path, output: Path, live_config: Path) -> dict:
 
 def verify(output: Path) -> dict:
     manifest = json.loads((output / "manifest.json").read_text())
-    if manifest.get("schema") != 1 or manifest.get("profile") != "amdgpu" or \
+    if "schema" in manifest or manifest.get("profile") != "amdgpu" or \
             manifest.get("mesa_version") != VERSION or \
             manifest.get("external") != sorted(EXTERNAL):
         raise ValueError("invalid AMDGPU Mesa manifest")
@@ -271,7 +286,7 @@ def build_archive(package: Path, destination: Path) -> str:
                 source = package / "rootfs" / relative
                 target = marker_target(source)
                 info = tarfile.TarInfo(relative)
-                info.mode = 0o644
+                info.mode = 0o755 if relative == GEARS_PATH else 0o644
                 if target is not None:
                     link_destination(relative, target)
                     info.type = tarfile.SYMTYPE

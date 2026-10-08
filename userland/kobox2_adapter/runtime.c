@@ -69,6 +69,14 @@ int memcmp(const void *left, const void *right, size_t length) {
     return 0;
 }
 
+void *memchr(const void *memory, int value, size_t length) {
+    const unsigned char *bytes = memory;
+    for (size_t i = 0; i < length; ++i)
+        if (bytes[i] == (unsigned char)value)
+            return (void *)(bytes + i);
+    return NULL;
+}
+
 size_t strlen(const char *text) {
     size_t length = 0;
 
@@ -164,8 +172,24 @@ void ph_free(void *base, size_t size) {
 }
 
 void ph_wait(atomic_uint *word, unsigned expected) {
+#if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
+    struct ph_task *task = ph_current_task();
+    uint64_t previous_wait = atomic_load_explicit(&task->diagnostic_wait_word,
+        memory_order_acquire);
+    uint64_t previous_expected = atomic_load_explicit(&task->diagnostic_wait_expected,
+        memory_order_relaxed);
+    /* The independent observer does not dereference this word: an address
+     * identifies the host wait without racing its eventual destruction. */
+    atomic_store_explicit(&task->diagnostic_wait_expected, expected, memory_order_relaxed);
+    atomic_store_explicit(&task->diagnostic_wait_word, (uintptr_t)word, memory_order_release);
+#endif
     long result = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
         (uintptr_t)word, expected, 0);
+#if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
+    /* A native notification may perform a nested wait on this same thread. */
+    atomic_store_explicit(&task->diagnostic_wait_expected, previous_expected, memory_order_relaxed);
+    atomic_store_explicit(&task->diagnostic_wait_word, previous_wait, memory_order_release);
+#endif
 
     /* NOT_READY means the producer changed the word before we could sleep. */
     if (result != 0 && result != PACHA_SYSCALL_ERR_NOT_READY)

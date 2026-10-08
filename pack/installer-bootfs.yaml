@@ -1,0 +1,27 @@
+schema: 1
+files:
+  /etc/pacha/installer-mode: installer_mode_marker
+  /sbin/mkfs.fat: installer_mkfs_fat
+  /sbin/mke2fs: installer_mke2fs
+  /sbin/e2fsck: installer_e2fsck
+  /sbin/pacha-install-runner: installer_runner
+  /sbin/pacha-live-import: live_desktop_import
+  /usr/bin/pacha-live-desktop: live_desktop_launcher
+  /usr/bin/pacha-pointer-profile: live_pointer_profile
+  /sbin/pacha-install-progress: installer_progress
+  /srv/installerd.elf: installerd
+  /usr/bin/mcopy: installer_mcopy
+  /usr/bin/mmd: installer_mmd
+  /usr/bin/mdir: installer_mdir
+  /etc/mke2fs.conf: installer_mke2fs_conf
+  /lib/libblkid.so.1: installer_libblkid
+  /lib/libeconf.so.0: installer_libeconf
+  /lib/libcom_err.so.2: installer_libcomerr
+  /lib/libe2p.so.2: installer_libe2p
+  /lib/libext2fs.so.2: installer_libext2fs
+  /lib/libuuid.so.1: installer_libuuid
+  /srv/kobox2/nvme/sandbox.elf: kobox2_nvme_sandbox
+  /srv/kobox2/nvme/core.so: kobox2_nvme_core
+  /srv/kobox2/nvme/manifest.bin: kobox2_nvme_manifest
+  /srv/kobox2/nvme/modules/nvme_core.ko: kobox2_nvme_core_module
+  /srv/kobox2/nvme/modules/nvme.ko: kobox2_nvme_module

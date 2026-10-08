@@ -2,10 +2,14 @@ schema: 1
 # The ordinary live bootfs remains unchanged. This optional image embeds only
 # the checked Mesa and driver closures. GPU probe remains explicitly manual.
 sha256:
-  amdgpu_mesa_runtime: d911b9bc22daf4ac44c373bbbaa0c72b36bd9bed2cf5bd04716d7c9fb3d4e457
+  amdgpu_mesa_runtime: b84084577c39907e135d19b5359a8ae6bbb6c96c1ac5c2f0c9e53afbffd2cd8c
 files:
   /etc/pacha/gpu-probe.conf: amdgpu_probe_policy
   /srv/gpud.elf: gpud
+  # These diagnostics are inert unless explicitly invoked with their scoped
+  # interposer; no normal desktop process inherits LD_PRELOAD.
+  /srv/frame-profile.tar.gz: live_frame_profile
+  /usr/bin/pacha-frame-profile: live_frame_runner
   /srv/amdgpu-mesa-runtime.tar.gz: amdgpu_mesa_runtime
   /srv/amdgpu-driver-package.tar.gz: amdgpu_driver_archive
   /srv/amdgpu-driver-package.tar.gz.sha256: amdgpu_driver_archive_digest

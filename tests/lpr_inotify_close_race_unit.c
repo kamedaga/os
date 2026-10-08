@@ -46,9 +46,14 @@ void lpr_state_lock(volatile uint32_t *word)
     assert(*word == 0); *word = 1;
 }
 void lpr_state_unlock(volatile uint32_t *word) { assert(*word == 1); *word = 0; }
-int64_t lpr_cwd_normalize(const char *path, char *out, uint64_t bytes)
+int64_t lpr_copy_path(char *out, uint64_t bytes, const char *path)
 {
-    assert(strlen(path) < bytes); strcpy(out, path); return 0;
+    if (strlen(path) >= bytes) return -LPR_LINUX_ENAMETOOLONG;
+    memset(out, 0, bytes); strcpy(out, path); return 0;
+}
+int64_t lpr_linux_getcwd(uint64_t out, uint64_t bytes)
+{
+    assert(bytes >= 10); strcpy((char *)(uintptr_t)out, "/real/cwd"); return 10;
 }
 int64_t lpr_linux_newfstatat(uint64_t dir, uint64_t path, uint64_t raw, uint64_t flags)
 {
@@ -120,6 +125,10 @@ int main(void)
     assert(lpr_linux_inotify_rm_watch(3, 7) == 0 && drops == 1);
 
     setup();
+    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"", LPR_IN_MODIFY) == -LPR_LINUX_ENOENT);
+    assert(lpr_linux_inotify_add_watch(3, (uintptr_t)"link/../file", LPR_IN_MODIFY) == 1);
+    assert(!strcmp(((lpr_inotify_instance_t *)(uintptr_t)event.counter)->watches[0].path,
+        "/real/cwd/link/../file"));
     assert(lpr_linux_inotify_read(3, 0, sizeof(out)) == -LPR_LINUX_EFAULT);
     assert(lpr_linux_inotify_add_watch(3, 0, LPR_IN_MODIFY) == -LPR_LINUX_EFAULT);
     assert(lpr_linux_inotify_rm_watch(3, UINT64_MAX) == -LPR_LINUX_EINVAL);

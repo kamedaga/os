@@ -8,5 +8,9 @@ clang -std=c11 -O2 -g -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-omit-frame-pointer \
   -I"$repo_root/userland/lpr_supervisor/include" -I"$repo_root/userland/libaccount/include" -I"$repo_root/userland/filed/include" -I"$repo_root/userland/unixd/include" \
   -I"$repo_root/userland/libipc/include" -I"$repo_root/userland/libpacha/include" \
-  "$repo_root/tests/lpr_supervisor_unix_session_unit.c" -o "$out_dir/unit"
+  -I"$repo_root/userland/libfiled_client/include" \
+  -I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" \
+  "$repo_root/tests/lpr_supervisor_unix_session_unit.c" \
+  "$repo_root/userland/libfiled_client/src/client.c" \
+  "$repo_root/kobox2/protocol/src/filesystem.c" -o "$out_dir/unit"
 "$out_dir/unit"

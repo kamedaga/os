@@ -12,7 +12,7 @@ struct gpud_discovery_entry {
 };
 struct gpud_discovery {
     struct gpud_discovery_entry entries[32];
-    size_t count, published;
+    size_t count, published, ancestor_count;
     uint32_t owned;
 };
 /* Snapshot only the granted PCI function. No driver/model selection. */

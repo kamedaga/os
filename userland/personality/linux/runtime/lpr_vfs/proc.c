@@ -203,10 +203,7 @@ static int64_t lpr_proc_snapshot_finish(
         return -LPR_LINUX_EIO;
     }
     snapshot->reserved1 = seal_state;
-    const size_t path_length = lpr_strnlen(path, sizeof(snapshot->open_path));
-    if (path_length < sizeof(snapshot->open_path)) {
-        lpr_memcpy(snapshot->open_path, path, path_length + 1u);
-    }
+    (void)path;
     (void)lpr_linux_close(staging_fd);
     return fd;
 }
@@ -829,13 +826,15 @@ int64_t lpr_linux_proc_getdents64(uint64_t fd, uint64_t buf, uint64_t count)
     };
     enum { LPR_PROC_PID_BATCH = 128u };
 
+    const int64_t binding_status = lpr_filed_fd_binding(fd);
+    if (binding_status) return binding_status;
     const lpr_filed_backend_t *file = lpr_filed_backend(fd);
-    if (file == 0 ||
-        (lpr_strcmp(file->open_path, "/proc") != 0 &&
-         lpr_strcmp(file->open_path, "/proc/") != 0))
-    {
+    if (!file) return -LPR_LINUX_ENOENT;
+    char current_path[7];
+    const int64_t path_bytes = lpr_filed_handle_path(file->handle,
+        current_path, sizeof(current_path), 0);
+    if (path_bytes != 5 || lpr_memcmp(current_path, "/proc", 5))
         return -LPR_LINUX_ENOENT;
-    }
     if (buf == 0 && count != 0) return -LPR_LINUX_EFAULT;
     if (count == 0) return 0;
 

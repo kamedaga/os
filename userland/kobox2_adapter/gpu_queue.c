@@ -249,7 +249,7 @@ static int next_request(void *context) {
     return 0;
 }
 
-static int prepare(void *context, const struct ph_ipc_packet *packet) {
+static int prepare(void *context, struct ph_ipc_packet *packet) {
     struct ph_gpu_queue *queue = context;
     if (packet->generation != queue->service.query.generation)
         return channel_fault(queue);

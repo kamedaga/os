@@ -70,6 +70,13 @@ fn reportRefusal(site: []const u8, err: kernel.KernelError) void {
         "mem: refused site={s} err={s} n={}\n",
         .{ site, @errorName(err), refusal_count },
     );
+    if (err == kernel.KernelError.TableFull) {
+        const store = kernel.vmObjectBackingStoreStats();
+        kernel_log.writeFmt(
+            "mem: backing store_used={} store_capacity={} store_free={}\n",
+            .{ store.used_entries, store.capacity, store.free_entries },
+        );
+    }
 }
 
 var ram_cache_refusal_count: u64 = 0;
@@ -1064,7 +1071,7 @@ fn createPageViewVmoFd(
                 return sc.syscall_err_invalid;
             };
         }
-        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count]) catch |err| {
+        state.installNativeVmoPages(view, page_offset, pages[0..chunk_count], h.free_list) catch |err| {
             reportPageViewRefusal("install", page_count_u64, page_offset, null, @errorName(err));
             state.releaseNativeVmoWithFreeList(view, h.free_list);
             return statusFromKernelError(err);
@@ -1114,6 +1121,9 @@ fn mapVmoFd(
             return sc.syscall_err_invalid;
         if (vmo.kind == .page_view and
             (!flags.shared or flags.private or prot.exec))
+            return sc.syscall_err_invalid;
+        if (vmo.kind == .kernel_page and
+            (!flags.shared or flags.private or prot.write or prot.exec))
             return sc.syscall_err_invalid;
     }
     if (!user_vm.lockVmTransaction(proc)) return sc.syscall_err_invalid;

@@ -831,7 +831,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     if (!scheduler.isBootstrapSchedulerCpu()) {
         if (user_mode) {
             if (!scheduler.apUserThreadCanContinue()) {
-                smp.returnCurrentApToIdleFromInterrupt();
+                smp.returnCurrentApAfterTimerInterrupt();
             }
             // Stage pending state in the outgoing frame before preemption
             // transfers CPU ownership. AP redispatch also stages signals
@@ -839,7 +839,7 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
             stagePendingSignalForUserReturn(frame);
             switch (scheduler.preemptApUserThread(boot_static.scheduler_slice_ticks, frame)) {
                 .continue_running => {},
-                .preempt, .invalid => smp.returnCurrentApToIdleFromInterrupt(),
+                .preempt, .invalid => smp.returnCurrentApAfterTimerInterrupt(),
             }
             _ = lapic.armTimer(lapic.timerInitialCount(boot_static.lapic_timer_initial_count) * @as(u32, @intCast(boot_static.scheduler_slice_ticks)));
             return;
@@ -854,10 +854,10 @@ pub export fn timerInterruptDispatch(frame: *TrapFrame) callconv(.winapi) void {
     const clock = @import("realtime_clock.zig");
     const clockevent = @import("clockevent.zig");
     const now_ns = clock.monotonicNs();
-    const next_tick = if (now_ns) |now| now / 1_000_000 else scheduler.lapic_tick_count +% 1;
+    const next_tick = if (now_ns) |now| now / 1_000_000 else clock.bootstrapFallbackTick(scheduler.lapic_tick_count);
     const tick_elapsed = next_tick > scheduler.lapic_tick_count;
     if (tick_elapsed) scheduler.lapic_tick_count = next_tick;
-    defer clockevent.rearm();
+    defer clockevent.rearmAfterTimerInterrupt();
     @import("realtime_clock.zig").updateFromBootstrapTimer();
     if (!kernel_runtime.kernel_state_ready) return;
     syscalls.completePendingTimerFdWaitersFromInterrupt(now_ns orelse next_tick *| 1_000_000);

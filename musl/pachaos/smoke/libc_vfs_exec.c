@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #ifdef __pachaos__
+extern int getdents(int, struct dirent *, size_t);
 #define smoke_getdents getdents
 #else
 extern ssize_t getdents64(int fd, void *buffer, size_t length);
@@ -145,1385 +146,280 @@ static int fail(const char *what)
     return 1;
 }
 
-#ifndef __pachaos__
 static int errno_is_unsupported(int value)
 {
     return value == ENOSYS || value == ENOTSUP || value == EOPNOTSUPP;
 }
-#endif
 
 #ifdef __pachaos__
-static void metric_total_avg_cycles(
-    const char *name,
-    unsigned long long total_cycles,
-    unsigned long long iterations)
+#include "../syscall/native_raw.h"
+#include "kobox2/filesystem.h"
+
+enum { SMOKE_FILED_ENDPOINT = 240 };
+static int raw_fail(const char *what,long status)
 {
-    unsigned long long avg = iterations > 0 ? total_cycles / iterations : 0;
-    printf(
-        "[libc-vfs-exec-smoke] metric op=%s iterations=%llu total_cycles=%llu avg_cycles=%llu\n",
-        name,
-        iterations,
-        total_cycles,
-        avg);
-    fflush(stdout);
-}
-
-enum {
-    PACHAOS_SYSCALL_FD_CLOSE = 39,
-    PACHAOS_SYSCALL_FD_WAIT_MANY = 49,
-    PACHAOS_SYSCALL_VMO_CREATE = 57,
-    PACHAOS_SYSCALL_MMAP = 62,
-    PACHAOS_SYSCALL_MUNMAP = 63,
-    PACHAOS_SYSCALL_IPC_CHANNEL_CREATE = 68,
-    PACHAOS_SYSCALL_IPC_SEND = 69,
-    PACHAOS_SYSCALL_IPC_RECV = 70,
-    PACHAOS_SYSCALL_IPC_CALL = 71,
-    PACHAOS_SYSCALL_IPC_RECV_WAIT = 73,
-
-    PACHAOS_FD_FLAG_CLOEXEC = 1,
-
-    PACHAOS_POLL_READABLE = 1,
-    PACHAOS_POLL_WRITABLE = 2,
-
-    PACHAOS_PROT_READ = 1,
-    PACHAOS_PROT_WRITE = 2,
-    PACHAOS_MMAP_SHARED = 8,
-
-    PACHAOS_FD_RIGHT_INSPECT = 1ull << 0,
-    PACHAOS_FD_RIGHT_TRANSFER = 1ull << 2,
-    PACHAOS_FD_RIGHT_WAIT = 1ull << 3,
-    PACHAOS_FD_RIGHT_POLL = 1ull << 4,
-    PACHAOS_FD_RIGHT_CLOSE = 1ull << 6,
-    PACHAOS_FD_RIGHT_SEND = 1ull << 7,
-    PACHAOS_FD_RIGHT_RECV = 1ull << 8,
-    PACHAOS_FD_RIGHT_MAP_READ = 1ull << 13,
-    PACHAOS_FD_RIGHT_MAP_WRITE = 1ull << 14,
-
-    PACHAOS_FILED_ENDPOINT_FD = 240,
-    PACHAOS_FILED_PAGE_BYTES = 8192,
-    PACHAOS_FILED_SESSION_PAGE_BYTES = 40960,
-    PACHAOS_FILED_FAST_VERSION = 1,
-    PACHAOS_FILED_FAST_REQUEST_CAPACITY = 8,
-    PACHAOS_FILED_FAST_COMPLETION_CAPACITY = 8,
-    PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT = 4,
-    PACHAOS_FILED_FAST_PAYLOAD_OFFSET = 4096,
-    PACHAOS_FILED_FAST_GENERATION_OFFSET =
-        PACHAOS_FILED_FAST_PAYLOAD_OFFSET +
-        PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT * PACHAOS_FILED_PAGE_BYTES,
-    PACHAOS_FILED_FAST_GENERATION_CAPACITY = 64,
-    PACHAOS_FILED_REQUEST_MAGIC = 0x31465152444c4946ull,
-    PACHAOS_FILED_REPLY_MAGIC = 0x31595052444c4946ull,
-    PACHAOS_FILED_FAST_MAGIC = 0x31545341464c4446ull,
-    PACHAOS_FILED_OP_HELLO = 1,
-    PACHAOS_FILED_OP_OPENAT = 4,
-    PACHAOS_FILED_OP_STAT = 5,
-    PACHAOS_FILED_OP_PREAD = 6,
-    PACHAOS_FILED_OP_GETDENTS = 7,
-    PACHAOS_FILED_OP_CLOSE = 8,
-    PACHAOS_FILED_OP_PWRITE = 14,
-    PACHAOS_FILED_OP_TRUNCATE = 17,
-    PACHAOS_FILED_OP_UNLINK = 18,
-    PACHAOS_FILED_OP_RENAME = 19,
-    PACHAOS_FILED_OP_MKDIR = 20,
-    PACHAOS_FILED_OP_RMDIR = 21,
-    PACHAOS_FILED_OP_CONNECT = 25,
-    PACHAOS_FILED_OP_PING = 26,
-    PACHAOS_FILED_OP_FAST_DOORBELL = 27,
-    PACHAOS_FILED_OP_VALIDATE_OPEN_CACHE = 28,
-
-    PACHAOS_FILED_NAME_BYTES = 96,
-    PACHAOS_FILED_IO_BYTES = 7680,
-    PACHAOS_FILED_RIGHT_LOOKUP = 1u << 0,
-    PACHAOS_FILED_RIGHT_READ = 1u << 1,
-    PACHAOS_FILED_RIGHT_WRITE = 1u << 2,
-    PACHAOS_FILED_RIGHT_EXEC = 1u << 3,
-    PACHAOS_FILED_RIGHT_STAT = 1u << 4,
-    PACHAOS_FILED_RIGHT_SETATTR = 1u << 5,
-    PACHAOS_FILED_RIGHT_GETDENTS = 1u << 6,
-    PACHAOS_FILED_RIGHT_CREATE = 1u << 7,
-    PACHAOS_FILED_RIGHT_REMOVE = 1u << 8,
-    PACHAOS_FILED_RIGHT_RENAME = 1u << 9,
-    PACHAOS_FILED_OPEN_CREATE = 1u << 0,
-    PACHAOS_FILED_OPEN_EXCLUSIVE = 1u << 1,
-    PACHAOS_FILED_OPEN_TRUNCATE = 1u << 2,
-    PACHAOS_FILED_OPEN_DIRECTORY = 1u << 3,
-    PACHAOS_FILED_OPEN_CLOEXEC = 1u << 5,
-};
-
-struct pachaos_raw_pollfd {
-    long fd;
-    long events;
-    long revents;
-};
-
-struct pachaos_raw_ipc_fd {
-    uint64_t fd;
-    uint64_t rights;
-    uint64_t flags;
-    uint64_t transfer_flags;
-};
-
-struct pachaos_raw_ipc_msg {
-    uint64_t word0;
-    uint64_t word1;
-    uint64_t word2;
-    uint64_t word3;
-    struct pachaos_raw_ipc_fd *fds;
-    uint64_t fd_count;
-    uint64_t fd_capacity;
-    uint64_t flags;
-};
-
-struct pachaos_filed_openat {
-    uint64_t dir_handle;
-    uint64_t rights;
-    uint64_t open_flags;
-    uint64_t object_generation;
-    uint64_t dir_generation;
-    uint64_t reserved0;
-    char name[PACHAOS_FILED_NAME_BYTES];
-};
-
-struct pachaos_filed_io {
-    uint64_t handle;
-    uint64_t offset;
-    uint64_t length;
-    uint8_t data[PACHAOS_FILED_IO_BYTES];
-};
-
-struct pachaos_filed_statx {
-    uint64_t handle;
-    uint64_t mode;
-    uint64_t size;
-    uint64_t blocks;
-    uint64_t nlink;
-    uint64_t kind;
-};
-
-struct pachaos_filed_truncate {
-    uint64_t handle;
-    uint64_t size;
-    uint64_t reserved0;
-    uint64_t reserved1;
-};
-
-struct pachaos_filed_unlink {
-    uint64_t dir_handle;
-    uint64_t reserved0;
-    char name[PACHAOS_FILED_NAME_BYTES];
-};
-
-struct pachaos_filed_mkdir {
-    uint64_t dir_handle;
-    uint64_t mode;
-    char name[PACHAOS_FILED_NAME_BYTES];
-};
-
-struct pachaos_filed_rmdir {
-    uint64_t dir_handle;
-    uint64_t reserved0;
-    char name[PACHAOS_FILED_NAME_BYTES];
-};
-
-struct pachaos_filed_rename {
-    uint64_t old_dir_handle;
-    uint64_t new_dir_handle;
-    char old_name[PACHAOS_FILED_NAME_BYTES];
-    char new_name[PACHAOS_FILED_NAME_BYTES];
-};
-
-struct pachaos_filed_fast_header {
-    uint64_t magic;
-    uint64_t version;
-    uint64_t flags;
-    uint64_t request_capacity;
-    uint64_t completion_capacity;
-    uint64_t payload_slot_count;
-    uint64_t payload_slot_size;
-    uint64_t payload_offset;
-    uint64_t request_head;
-    uint64_t request_tail;
-    uint64_t completion_head;
-    uint64_t completion_tail;
-    uint64_t doorbell_seq;
-    uint64_t completion_seq;
-    uint64_t generation_offset;
-    uint64_t generation_capacity;
-};
-
-struct pachaos_filed_fast_request {
-    uint64_t request_id;
-    uint64_t opcode;
-    uint64_t flags;
-    uint64_t handle;
-    uint64_t word2;
-    uint64_t offset;
-    uint64_t length;
-    uint64_t payload_slot;
-    uint64_t payload_length;
-    uint64_t timeout_ns;
-};
-
-struct pachaos_filed_fast_completion {
-    uint64_t request_id;
-    int64_t status;
-    uint64_t result;
-    uint64_t bytes;
-    uint64_t flags;
-};
-
-struct pachaos_filed_call_breakdown {
-    uint64_t enqueue_ns;
-    uint64_t send_ns;
-    uint64_t recv_ns;
-    uint64_t completion_ns;
-    uint64_t enqueue_cycles;
-    uint64_t send_cycles;
-    uint64_t recv_cycles;
-    uint64_t completion_cycles;
-};
-
-static long pachaos_raw1(long n, long a1)
-{
-    unsigned long ret;
-    __asm__ __volatile__("syscall" : "=a"(ret) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
-    return (long)ret;
-}
-
-static long pachaos_raw2(long n, long a1, long a2)
-{
-    unsigned long ret;
-    __asm__ __volatile__("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2) : "rcx", "r11", "memory");
-    return (long)ret;
-}
-
-static long pachaos_raw3(long n, long a1, long a2, long a3)
-{
-    unsigned long ret;
-    __asm__ __volatile__("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3) : "rcx", "r11", "memory");
-    return (long)ret;
-}
-
-static long pachaos_raw4(long n, long a1, long a2, long a3, long a4)
-{
-    unsigned long ret;
-    register long r10 __asm__("r10") = a4;
-    __asm__ __volatile__(
-        "syscall"
-        : "=a"(ret)
-        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10)
-        : "rcx", "r11", "memory");
-    return (long)ret;
-}
-
-static long pachaos_raw6(long n, long a1, long a2, long a3, long a4, long a5, long a6)
-{
-    unsigned long ret;
-    register long r10 __asm__("r10") = a4;
-    register long r8 __asm__("r8") = a5;
-    register long r9 __asm__("r9") = a6;
-    __asm__ __volatile__(
-        "syscall"
-        : "=a"(ret)
-        : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
-        : "rcx", "r11", "memory");
-    return (long)ret;
-}
-
-static void close_raw_fd(uint64_t fd)
-{
-    if (fd >= 16) {
-        (void)pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE, (long)fd);
-    }
-}
-
-static void unmap_raw(uint64_t addr, uint64_t len)
-{
-    if (addr >= 4096 && len != 0) {
-        (void)pachaos_raw2(PACHAOS_SYSCALL_MUNMAP, (long)addr, (long)len);
-    }
-}
-
-static int ipc_bench_fail(const char *what, long status)
-{
-    fprintf(stderr, "[libc-vfs-exec-smoke] %s failed status=%ld\n", what, status);
+    fprintf(stderr,"[libc-vfs-exec-smoke] %s failed status=%ld\n",what,status);
     return 1;
 }
-
-static long ipc_send_wait_timeout(uint64_t fd, const struct pachaos_raw_ipc_msg *msg, uint64_t timeout_ticks)
+static long raw_fs_call(kb2_fs_request_t *r,const char *path,const char *second,
+    const void *input,size_t input_size,void *output,size_t capacity,
+    kb2_fs_response_t *response)
 {
-    for (;;) {
-        long status = pachaos_raw2(PACHAOS_SYSCALL_IPC_SEND, (long)fd, (long)msg);
-        if (status == 0) return 0;
-        if (status != 2 && status != -2 && status != 5 && status != -5) return status;
-        struct pachaos_raw_pollfd wait_fd = {
-            .fd = (long)fd,
-            .events = PACHAOS_POLL_WRITABLE,
-            .revents = 0,
-        };
-        (void)pachaos_raw4(PACHAOS_SYSCALL_FD_WAIT_MANY, (long)&wait_fd, 1, (long)timeout_ticks, 0);
+    static uint64_t sequence;
+    size_t first=path ? strlen(path)+1 : 0,other=second ? strlen(second)+1 : 0;
+    if (first>SIZE_MAX-other || input_size>SIZE_MAX-first-other ||
+        first+other+input_size>SIZE_MAX-KB2_FILESYSTEM_REQUEST_SIZE ||
+        capacity>SIZE_MAX-KB2_FILESYSTEM_RESPONSE_SIZE ||
+        (input_size && !input) || (capacity && !output)) return -EINVAL;
+    size_t request_size=KB2_FILESYSTEM_REQUEST_SIZE+first+other+input_size;
+    size_t response_size=KB2_FILESYSTEM_RESPONSE_SIZE+capacity;
+    size_t size=request_size>response_size ? request_size : response_size;
+    if (size>SIZE_MAX-4095) return -EOVERFLOW;
+    size=(size+4095)&~(size_t)4095;
+    r->generation=1;
+    r->sequence=++sequence;
+    if (!r->sequence) return -EOVERFLOW;
+    uint64_t rights=PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_CLOSE|
+        PACHAOS_FD_RIGHT_MAP_READ|PACHAOS_FD_RIGHT_MAP_WRITE;
+    long fd=__pachaos_raw3(PACHAOS_SYSCALL_VMO_CREATE,size,
+        rights|PACHAOS_FD_RIGHT_TRANSFER,PACHAOS_FD_FLAG_CLOEXEC);
+    if (fd<16) return -ENOMEM;
+    unsigned char *bytes=(void *)__pachaos_raw6(PACHAOS_SYSCALL_MMAP,0,fd,size,
+        PACHAOS_PROT_READ|PACHAOS_PROT_WRITE,PACHAOS_MMAP_SHARED,0);
+    if ((uintptr_t)bytes<4096 || (intptr_t)bytes<0) {
+        (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,fd); return -ENOMEM;
     }
-}
-
-static long ipc_recv_wait_timeout(uint64_t fd, struct pachaos_raw_ipc_msg *msg, uint64_t timeout_ticks)
-{
-    (void)timeout_ticks;
-    for (;;) {
-        long status = pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT, (long)fd, (long)msg, (long)UINT64_MAX, 0);
-        if (status == 0) return 0;
-        if (status != 2 && status != -2 && status != 5 && status != -5) return status;
-    }
-}
-
-static long ipc_send_wait(uint64_t fd, const struct pachaos_raw_ipc_msg *msg)
-{
-    return ipc_send_wait_timeout(fd, msg, 1);
-}
-
-static long ipc_recv_wait(uint64_t fd, struct pachaos_raw_ipc_msg *msg)
-{
-    return ipc_recv_wait_timeout(fd, msg, 1);
-}
-
-static long filed_endpoint_hello_once(uint64_t request_id)
-{
-    struct pachaos_raw_ipc_msg request;
-    struct pachaos_raw_ipc_msg reply;
-    memset(&request, 0, sizeof(request));
-    memset(&reply, 0, sizeof(reply));
-    request.word0 = PACHAOS_FILED_REQUEST_MAGIC;
-    request.word1 = PACHAOS_FILED_OP_HELLO;
-    request.word3 = request_id;
-
-    long reply_fd = pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL, PACHAOS_FILED_ENDPOINT_FD, (long)&request);
-    if (reply_fd < 16) return -9;
-    long status = ipc_recv_wait((uint64_t)reply_fd, &reply);
-    close_raw_fd((uint64_t)reply_fd);
-    if (status != 0) return status;
-    if (reply.word0 != PACHAOS_FILED_REPLY_MAGIC ||
-        reply.word1 != 0 ||
-        reply.word2 != 1 ||
-        reply.word3 != request_id)
-    {
-        return -71;
-    }
-    return 0;
-}
-
-static long filed_session_connect_for_bench(uint64_t *out_fd, uint64_t *out_page_addr, uint64_t *out_page_fd)
-{
-    if (out_fd == NULL || out_page_addr == NULL || out_page_fd == NULL) return -22;
-    *out_fd = 0;
-    *out_page_addr = 0;
-    *out_page_fd = 0;
-
-    const uint64_t channel_rights =
-        PACHAOS_FD_RIGHT_INSPECT |
-        PACHAOS_FD_RIGHT_WAIT |
-        PACHAOS_FD_RIGHT_POLL |
-        PACHAOS_FD_RIGHT_CLOSE |
-        PACHAOS_FD_RIGHT_SEND |
-        PACHAOS_FD_RIGHT_RECV |
-        PACHAOS_FD_RIGHT_TRANSFER;
-    const uint64_t page_rights =
-        PACHAOS_FD_RIGHT_TRANSFER |
-        PACHAOS_FD_RIGHT_CLOSE |
-        PACHAOS_FD_RIGHT_MAP_READ |
-        PACHAOS_FD_RIGHT_MAP_WRITE;
-
-    uint64_t pair[2] = {0, 0};
-    long status = pachaos_raw3(
-        PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
-        (long)pair,
-        (long)channel_rights,
-        PACHAOS_FD_FLAG_CLOEXEC);
-    if (status != 0 || pair[0] < 16 || pair[1] < 16) {
-        close_raw_fd(pair[0]);
-        close_raw_fd(pair[1]);
-        return status != 0 ? status : -22;
-    }
-
-    long page_fd = pachaos_raw3(
-        PACHAOS_SYSCALL_VMO_CREATE,
-        PACHAOS_FILED_SESSION_PAGE_BYTES,
-        (long)page_rights,
-        0);
-    if (page_fd < 16) {
-        close_raw_fd(pair[0]);
-        close_raw_fd(pair[1]);
-        return -23;
-    }
-    long page_addr = pachaos_raw6(
-        PACHAOS_SYSCALL_MMAP,
-        page_fd,
-        0,
-        PACHAOS_FILED_SESSION_PAGE_BYTES,
-        PACHAOS_PROT_READ | PACHAOS_PROT_WRITE,
-        PACHAOS_MMAP_SHARED,
-        0);
-    if (page_addr < 4096) {
-        close_raw_fd((uint64_t)page_fd);
-        close_raw_fd(pair[0]);
-        close_raw_fd(pair[1]);
-        return -14;
-    }
-
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_SESSION_PAGE_BYTES);
-    struct pachaos_filed_fast_header *header = (struct pachaos_filed_fast_header *)(uintptr_t)page_addr;
-    header->magic = PACHAOS_FILED_FAST_MAGIC;
-    header->version = PACHAOS_FILED_FAST_VERSION;
-    header->request_capacity = PACHAOS_FILED_FAST_REQUEST_CAPACITY;
-    header->completion_capacity = PACHAOS_FILED_FAST_COMPLETION_CAPACITY;
-    header->payload_slot_count = PACHAOS_FILED_FAST_PAYLOAD_SLOT_COUNT;
-    header->payload_slot_size = PACHAOS_FILED_PAGE_BYTES;
-    header->payload_offset = PACHAOS_FILED_FAST_PAYLOAD_OFFSET;
-    header->generation_offset = PACHAOS_FILED_FAST_GENERATION_OFFSET;
-    header->generation_capacity = PACHAOS_FILED_FAST_GENERATION_CAPACITY;
-
-    struct pachaos_raw_ipc_fd request_fds[2];
-    struct pachaos_raw_ipc_msg request;
-    struct pachaos_raw_ipc_msg reply;
-    memset(request_fds, 0, sizeof(request_fds));
-    memset(&request, 0, sizeof(request));
-    memset(&reply, 0, sizeof(reply));
-
-    request_fds[0].fd = pair[1];
-    request_fds[0].rights =
-        PACHAOS_FD_RIGHT_CLOSE |
-        PACHAOS_FD_RIGHT_WAIT |
-        PACHAOS_FD_RIGHT_POLL |
-        PACHAOS_FD_RIGHT_SEND |
-        PACHAOS_FD_RIGHT_RECV;
-    request_fds[1].fd = (uint64_t)page_fd;
-    request_fds[1].rights = page_rights;
-    request.word0 = PACHAOS_FILED_REQUEST_MAGIC;
-    request.word1 = PACHAOS_FILED_OP_CONNECT;
-    request.word3 = 0x1000;
-    request.fds = request_fds;
-    request.fd_count = 2;
-
-    long reply_fd = pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL, PACHAOS_FILED_ENDPOINT_FD, (long)&request);
-    close_raw_fd(pair[1]);
-    if (reply_fd < 16) {
-        unmap_raw((uint64_t)page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-        close_raw_fd((uint64_t)page_fd);
-        close_raw_fd(pair[0]);
-        return -9;
-    }
-    status = ipc_recv_wait((uint64_t)reply_fd, &reply);
-    close_raw_fd((uint64_t)reply_fd);
-    if (status != 0 ||
-        reply.word0 != PACHAOS_FILED_REPLY_MAGIC ||
-        reply.word1 != 0 ||
-        reply.word3 != request.word3)
-    {
-        unmap_raw((uint64_t)page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-        close_raw_fd((uint64_t)page_fd);
-        close_raw_fd(pair[0]);
-        return status != 0 ? status : -71;
-    }
-
-    *out_fd = pair[0];
-    *out_page_addr = (uint64_t)page_addr;
-    *out_page_fd = (uint64_t)page_fd;
-    return 0;
-}
-
-static long filed_session_call_for_bench_timed(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t op,
-    uint64_t word2,
-    uint64_t request_id,
-    struct pachaos_raw_ipc_msg *reply,
-    struct pachaos_filed_call_breakdown *breakdown)
-{
-    if (session_page_addr < 4096) return -22;
-    struct pachaos_filed_fast_header *header =
-        (struct pachaos_filed_fast_header *)(uintptr_t)session_page_addr;
-    if (header->magic != PACHAOS_FILED_FAST_MAGIC ||
-        header->version != PACHAOS_FILED_FAST_VERSION ||
-        header->request_capacity != PACHAOS_FILED_FAST_REQUEST_CAPACITY ||
-        header->completion_capacity != PACHAOS_FILED_FAST_COMPLETION_CAPACITY ||
-        header->payload_offset != PACHAOS_FILED_FAST_PAYLOAD_OFFSET ||
-        header->generation_offset != PACHAOS_FILED_FAST_GENERATION_OFFSET ||
-        header->generation_capacity != PACHAOS_FILED_FAST_GENERATION_CAPACITY)
-    {
-        return -71;
-    }
-
-    struct pachaos_filed_fast_request *requests =
-        (struct pachaos_filed_fast_request *)(uintptr_t)(
-            session_page_addr + sizeof(struct pachaos_filed_fast_header));
-    struct pachaos_filed_fast_completion *completions =
-        (struct pachaos_filed_fast_completion *)(uintptr_t)(
-            session_page_addr +
-            sizeof(struct pachaos_filed_fast_header) +
-            sizeof(struct pachaos_filed_fast_request) * PACHAOS_FILED_FAST_REQUEST_CAPACITY);
-    if (header->request_tail - header->request_head >= header->request_capacity) {
-        return -11;
-    }
-
-    const uint64_t enqueue_start = now_ns();
-    const uint64_t enqueue_start_cycles = read_tsc();
-    uint64_t tail = header->request_tail;
-    struct pachaos_filed_fast_request *fast_request = &requests[tail % header->request_capacity];
-    memset(fast_request, 0, sizeof(*fast_request));
-    fast_request->request_id = request_id;
-    fast_request->opcode = op;
-    fast_request->word2 = word2;
-    fast_request->payload_slot = 0;
-    fast_request->payload_length = PACHAOS_FILED_PAGE_BYTES;
-    __sync_synchronize();
-    header->request_tail = tail + 1;
-    const uint64_t enqueue_end_cycles = read_tsc();
-    const uint64_t enqueue_end = now_ns();
-    if (breakdown != NULL && enqueue_end >= enqueue_start) {
-        breakdown->enqueue_ns += enqueue_end - enqueue_start;
-        if (enqueue_start_cycles != 0 && enqueue_end_cycles >= enqueue_start_cycles) {
-            breakdown->enqueue_cycles += enqueue_end_cycles - enqueue_start_cycles;
+    r->path=r->second_path=r->data=(kb2_fs_span_t){0};
+    size_t pos=KB2_FILESYSTEM_REQUEST_SIZE;
+    if (first) { r->path=(kb2_fs_span_t){pos,first}; memcpy(bytes+pos,path,first); pos+=first; }
+    if (other) { r->second_path=(kb2_fs_span_t){pos,other}; memcpy(bytes+pos,second,other); pos+=other; }
+    if (input_size) { r->data=(kb2_fs_span_t){pos,input_size}; memcpy(bytes+pos,input,input_size); }
+    long status=kb2_fs_request_encode(bytes,KB2_FILESYSTEM_REQUEST_SIZE,request_size,r);
+    struct __pachaos_ipc_fd source={.fd=fd,.rights=rights,.transfer_flags=2};
+    struct __pachaos_ipc_msg request={.word0=r->opcode,.word1=request_size,
+        .word2=response_size,.word3=r->sequence,.fds=&source,.fd_count=1};
+    struct __pachaos_ipc_fd received[2]={{0}};
+    struct __pachaos_ipc_msg reply={.fds=received,.fd_capacity=2};
+    if (!status) {
+        long reply_fd=__pachaos_raw2(PACHAOS_SYSCALL_IPC_CALL,SMOKE_FILED_ENDPOINT,(long)&request);
+        if (reply_fd<16) status=-EIO;
+        else {
+            do {
+                status=__pachaos_raw4(PACHAOS_SYSCALL_IPC_RECV_WAIT,reply_fd,(long)&reply,-1,0);
+            } while (status==2);
+            (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,reply_fd);
+            if (status>0) status=-EIO;
         }
     }
-
-    struct pachaos_raw_ipc_msg request;
-    memset(&request, 0, sizeof(request));
-    memset(reply, 0, sizeof(*reply));
-    request.word0 = PACHAOS_FILED_REQUEST_MAGIC;
-    request.word1 = PACHAOS_FILED_OP_FAST_DOORBELL;
-    request.word2 = ++header->doorbell_seq;
-    request.word3 = request_id;
-
-    const uint64_t send_start = now_ns();
-    const uint64_t send_start_cycles = read_tsc();
-    long status = ipc_send_wait(session_fd, &request);
-    const uint64_t send_end_cycles = read_tsc();
-    const uint64_t send_end = now_ns();
-    if (breakdown != NULL && send_end >= send_start) {
-        breakdown->send_ns += send_end - send_start;
-        if (send_start_cycles != 0 && send_end_cycles >= send_start_cycles) {
-            breakdown->send_cycles += send_end_cycles - send_start_cycles;
-        }
-    }
-    if (status != 0) return status;
-
-    const uint64_t recv_start = now_ns();
-    const uint64_t recv_start_cycles = read_tsc();
-    status = ipc_recv_wait(session_fd, reply);
-    const uint64_t recv_end_cycles = read_tsc();
-    const uint64_t recv_end = now_ns();
-    if (breakdown != NULL && recv_end >= recv_start) {
-        breakdown->recv_ns += recv_end - recv_start;
-        if (recv_start_cycles != 0 && recv_end_cycles >= recv_start_cycles) {
-            breakdown->recv_cycles += recv_end_cycles - recv_start_cycles;
-        }
-    }
-    if (status != 0) return status;
-    if (reply->word0 != PACHAOS_FILED_REPLY_MAGIC ||
-        reply->word1 != 0 ||
-        reply->word3 != request_id)
-    {
-        return -71;
-    }
-
-    const uint64_t completion_start = now_ns();
-    const uint64_t completion_start_cycles = read_tsc();
-    if (header->completion_head == header->completion_tail) return -71;
-    __sync_synchronize();
-    struct pachaos_filed_fast_completion *completion =
-        &completions[header->completion_head % header->completion_capacity];
-    if (completion->request_id != request_id) return -71;
-    reply->word0 = PACHAOS_FILED_REPLY_MAGIC;
-    reply->word1 = (uint64_t)completion->status;
-    reply->word2 = completion->result;
-    reply->word3 = completion->request_id;
-    header->completion_head++;
-    const uint64_t completion_end_cycles = read_tsc();
-    const uint64_t completion_end = now_ns();
-    if (breakdown != NULL && completion_end >= completion_start) {
-        breakdown->completion_ns += completion_end - completion_start;
-        if (completion_start_cycles != 0 && completion_end_cycles >= completion_start_cycles) {
-            breakdown->completion_cycles += completion_end_cycles - completion_start_cycles;
-        }
-    }
-    return (long)completion->status;
+    if (!status && (reply.word0!=r->opcode || reply.word3!=r->sequence ||
+        reply.word2<KB2_FILESYSTEM_RESPONSE_SIZE || reply.word2>response_size ||
+        kb2_fs_response_decode(bytes,reply.word2,response) ||
+        !kb2_fs_response_matches(response,r) ||
+        reply.word1!=(uint64_t)response->result || response->data_length>capacity ||
+        reply.fd_count)) status=-EPROTO;
+    for (size_t i=0;i<reply.fd_count && i<2;++i)
+        (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,(long)received[i].fd);
+    if (!status && response->data_length)
+        memcpy(output,bytes+KB2_FILESYSTEM_RESPONSE_SIZE,(size_t)response->data_length);
+    (void)__pachaos_raw2(PACHAOS_SYSCALL_MUNMAP,(long)bytes,size);
+    (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,fd);
+    return status ? status : response->result<0 ? (long)response->result : 0;
 }
-
-static long filed_session_call_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t op,
-    uint64_t word2,
-    uint64_t request_id,
-    struct pachaos_raw_ipc_msg *reply)
+static long raw_open(const char *path,uint64_t flags,uint64_t mode,uint64_t *handle)
 {
-    return filed_session_call_for_bench_timed(
-        session_fd,
-        session_page_addr,
-        op,
-        word2,
-        request_id,
-        reply,
-        NULL);
+    kb2_fs_request_t r={.opcode=KB2_FILESYSTEM_OP_OPENAT2,.flags=flags,.mode=mode,.umask=0022};
+    kb2_fs_response_t response;
+    long status=raw_fs_call(&r,path,NULL,NULL,0,NULL,0,&response);
+    if (!status) { if (!response.handle) return -EPROTO; *handle=response.handle; }
+    return status;
 }
-
-static long filed_raw_open_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t page_addr,
-    const char *path,
-    uint64_t rights,
-    uint64_t open_flags,
-    uint64_t *out_handle)
+static long raw_simple(uint32_t operation,uint64_t handle,int64_t offset,uint64_t flags)
 {
-    if (page_addr < 4096 || path == NULL || out_handle == NULL) return -22;
-    *out_handle = 0;
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-    struct pachaos_filed_openat *openat = (struct pachaos_filed_openat *)(uintptr_t)page_addr;
-    openat->dir_handle = 0;
-    openat->rights = rights;
-    openat->open_flags = open_flags | PACHAOS_FILED_OPEN_CLOEXEC;
-    snprintf(openat->name, sizeof(openat->name), "%s", path);
-
-    struct pachaos_raw_ipc_msg reply;
-    long status = filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_OPENAT,
-        0,
-        0x90000000u,
-        &reply);
-    if (status != 0) return status;
-    if (reply.word2 == 0) return -71;
-    *out_handle = reply.word2;
-    return 0;
+    kb2_fs_request_t r={.opcode=operation,.handle=handle,.offset=offset,.flags=flags};
+    kb2_fs_response_t response;
+    long status=raw_fs_call(&r,NULL,NULL,NULL,0,NULL,0,&response);
+    return status ? status : response.result;
 }
-
-static void filed_raw_close_for_bench(uint64_t session_fd, uint64_t session_page_addr, uint64_t handle)
+static long raw_io(uint32_t operation,uint64_t handle,int64_t offset,
+    void *bytes,size_t size)
 {
-    if (session_fd < 16 || handle == 0) return;
-    struct pachaos_raw_ipc_msg reply;
-    (void)filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_CLOSE,
-        handle,
-        0x90000001u,
-        &reply);
+    int write=operation==KB2_FILESYSTEM_OP_WRITE || operation==KB2_FILESYSTEM_OP_PWRITE;
+    kb2_fs_request_t r={.opcode=operation,.handle=handle,.offset=offset,.length=size};
+    kb2_fs_response_t response;
+    long status=raw_fs_call(&r,NULL,NULL,write ? bytes : NULL,write ? size : 0,
+        write ? NULL : bytes,write ? 0 : size,&response);
+    if (status) return status;
+    if (response.result<0 || (uint64_t)response.result>size ||
+        (!write && response.data_length!=(uint64_t)response.result)) return -EPROTO;
+    return response.result;
 }
-
-static long filed_raw_truncate_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t page_addr,
-    uint64_t handle,
-    uint64_t size,
-    uint64_t request_id)
+static long raw_path(uint32_t operation,const char *first,const char *second,uint64_t flags)
 {
-    if (page_addr < 4096 || handle == 0) return -22;
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-    struct pachaos_filed_truncate *truncate = (struct pachaos_filed_truncate *)(uintptr_t)page_addr;
-    truncate->handle = handle;
-    truncate->size = size;
-    struct pachaos_raw_ipc_msg reply;
-    return filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_TRUNCATE,
-        0,
-        request_id,
-        &reply);
+    kb2_fs_request_t r={.opcode=operation,.mode=0700,.umask=0022,.flags=flags};
+    kb2_fs_response_t response;
+    return raw_fs_call(&r,first,second,NULL,0,NULL,0,&response);
 }
-
-static long filed_raw_unlink_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t page_addr,
-    const char *path,
-    uint64_t request_id)
-{
-    if (page_addr < 4096 || path == NULL) return -22;
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-    struct pachaos_filed_unlink *unlink = (struct pachaos_filed_unlink *)(uintptr_t)page_addr;
-    unlink->dir_handle = 0;
-    snprintf(unlink->name, sizeof(unlink->name), "%s", path);
-    struct pachaos_raw_ipc_msg reply;
-    return filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_UNLINK,
-        0,
-        request_id,
-        &reply);
-}
-
-static long filed_raw_mkdir_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t page_addr,
-    const char *path,
-    uint64_t request_id)
-{
-    if (page_addr < 4096 || path == NULL) return -22;
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-    struct pachaos_filed_mkdir *mkdir = (struct pachaos_filed_mkdir *)(uintptr_t)page_addr;
-    mkdir->dir_handle = 0;
-    mkdir->mode = 040755u;
-    snprintf(mkdir->name, sizeof(mkdir->name), "%s", path);
-    struct pachaos_raw_ipc_msg reply;
-    return filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_MKDIR,
-        0,
-        request_id,
-        &reply);
-}
-
-static long filed_raw_rmdir_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t page_addr,
-    const char *path,
-    uint64_t request_id)
-{
-    if (page_addr < 4096 || path == NULL) return -22;
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-    struct pachaos_filed_rmdir *rmdir = (struct pachaos_filed_rmdir *)(uintptr_t)page_addr;
-    rmdir->dir_handle = 0;
-    snprintf(rmdir->name, sizeof(rmdir->name), "%s", path);
-    struct pachaos_raw_ipc_msg reply;
-    return filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_RMDIR,
-        0,
-        request_id,
-        &reply);
-}
-
-static long filed_raw_rename_for_bench(
-    uint64_t session_fd,
-    uint64_t session_page_addr,
-    uint64_t page_addr,
-    const char *old_path,
-    const char *new_path,
-    uint64_t request_id)
-{
-    if (page_addr < 4096 || old_path == NULL || new_path == NULL) return -22;
-    memset((void *)(uintptr_t)page_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-    struct pachaos_filed_rename *rename = (struct pachaos_filed_rename *)(uintptr_t)page_addr;
-    rename->old_dir_handle = 0;
-    rename->new_dir_handle = 0;
-    snprintf(rename->old_name, sizeof(rename->old_name), "%s", old_path);
-    snprintf(rename->new_name, sizeof(rename->new_name), "%s", new_path);
-    struct pachaos_raw_ipc_msg reply;
-    return filed_session_call_for_bench(
-        session_fd,
-        session_page_addr,
-        PACHAOS_FILED_OP_RENAME,
-        0,
-        request_id,
-        &reply);
-}
-
 static int run_filed_raw_operation_bench(const char *path)
 {
-    uint64_t session_fd = 0;
-    uint64_t session_page_addr = 0;
-    uint64_t session_page_fd = 0;
-    long status = filed_session_connect_for_bench(&session_fd, &session_page_addr, &session_page_fd);
-    if (status != 0) {
-        return ipc_bench_fail("filed raw bench connect", status);
-    }
-    const uint64_t payload_addr = session_page_addr + PACHAOS_FILED_FAST_PAYLOAD_OFFSET;
+    uint64_t handle=0,duplicate=0;
+    size_t created_directories=0;
+    int created_file=0;
+    long status=0;
+    unsigned long long t0=now_ns(),t1=t0,iterations=0;
+    do {
+        status=raw_open(path,O_RDONLY,0,&handle);
+        if (status) return raw_fail("raw open",status);
+        status=raw_simple(KB2_FILESYSTEM_OP_CLOSE,handle,0,0); handle=0;
+        if (status) return raw_fail("raw close",status);
+        ++iterations; t1=now_ns();
+    } while (!bench_done(t0,t1,iterations));
+    metric_avg("filed_raw_open_close_roundtrip",t0,t1,iterations);
 
-    printf("[libc-vfs-exec-smoke] filed raw bench start\n");
-    fflush(stdout);
-
-    unsigned long long t0 = now_ns();
-    unsigned long long t1 = t0;
-    unsigned long long open_close_iters = 0;
-    for (;;) {
-        uint64_t handle = 0;
-        status = filed_raw_open_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            path,
-            PACHAOS_FILED_RIGHT_READ | PACHAOS_FILED_RIGHT_WRITE | PACHAOS_FILED_RIGHT_STAT,
-            0,
-            &handle);
-        if (status != 0) {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw open", status);
-        }
-        filed_raw_close_for_bench(session_fd, session_page_addr, handle);
-        open_close_iters++;
-        t1 = now_ns();
-        if (bench_done(t0, t1, open_close_iters)) break;
-    }
-    metric_avg("filed_raw_open_close_roundtrip", t0, t1, open_close_iters);
-
-    uint64_t handle = 0;
-    status = filed_raw_open_for_bench(
-        session_fd,
-        session_page_addr,
-        payload_addr,
-        path,
-        PACHAOS_FILED_RIGHT_READ | PACHAOS_FILED_RIGHT_WRITE | PACHAOS_FILED_RIGHT_STAT,
-        0,
-        &handle);
-    if (status != 0) {
-        unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-        close_raw_fd(session_page_fd);
-        close_raw_fd(session_fd);
-        return ipc_bench_fail("filed raw open steady", status);
-    }
-
-    struct pachaos_raw_ipc_msg reply;
-    unsigned long long stat_iters = 0;
-    t0 = now_ns();
-    for (;;) {
-        memset((void *)(uintptr_t)payload_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-        struct pachaos_filed_statx *st = (struct pachaos_filed_statx *)(uintptr_t)payload_addr;
-        st->handle = handle;
-        status = filed_session_call_for_bench(
-            session_fd,
-            session_page_addr,
-            PACHAOS_FILED_OP_STAT,
-            0,
-            0x91000000u + stat_iters,
-            &reply);
-        if (status != 0 || st->size == 0) {
-            filed_raw_close_for_bench(session_fd, session_page_addr, handle);
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw stat", status != 0 ? status : -71);
-        }
-        stat_iters++;
-        t1 = now_ns();
-        if (bench_done(t0, t1, stat_iters)) break;
-    }
-    metric_avg("filed_raw_stat_roundtrip", t0, t1, stat_iters);
-
-    unsigned long long pread_iters = 0;
-    t0 = now_ns();
-    for (;;) {
-        memset((void *)(uintptr_t)payload_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-        struct pachaos_filed_io *io = (struct pachaos_filed_io *)(uintptr_t)payload_addr;
-        io->handle = handle;
-        io->offset = 0;
-        io->length = 5;
-        status = filed_session_call_for_bench(
-            session_fd,
-            session_page_addr,
-            PACHAOS_FILED_OP_PREAD,
-            0,
-            0x92000000u + pread_iters,
-            &reply);
-        if (status != 0 || reply.word2 != 5) {
-            filed_raw_close_for_bench(session_fd, session_page_addr, handle);
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw pread", status != 0 ? status : -71);
-        }
-        pread_iters++;
-        t1 = now_ns();
-        if (bench_done(t0, t1, pread_iters)) break;
-    }
-    metric_avg("filed_raw_pread_roundtrip", t0, t1, pread_iters);
-
-    const char *rewrite = "BETA\n";
-    unsigned long long pwrite_iters = 0;
-    t0 = now_ns();
-    for (;;) {
-        memset((void *)(uintptr_t)payload_addr, 0, PACHAOS_FILED_PAGE_BYTES);
-        struct pachaos_filed_io *io = (struct pachaos_filed_io *)(uintptr_t)payload_addr;
-        io->handle = handle;
-        io->offset = 6;
-        io->length = strlen(rewrite);
-        memcpy(io->data, rewrite, strlen(rewrite));
-        status = filed_session_call_for_bench(
-            session_fd,
-            session_page_addr,
-            PACHAOS_FILED_OP_PWRITE,
-            0,
-            0x93000000u + pwrite_iters,
-            &reply);
-        if (status != 0 || reply.word2 != strlen(rewrite)) {
-            filed_raw_close_for_bench(session_fd, session_page_addr, handle);
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw pwrite", status != 0 ? status : -71);
-        }
-        pwrite_iters++;
-        t1 = now_ns();
-        if (bench_done(t0, t1, pwrite_iters)) break;
-    }
-    metric_avg("filed_raw_pwrite_roundtrip", t0, t1, pwrite_iters);
-
-    filed_raw_close_for_bench(session_fd, session_page_addr, handle);
-
-    const unsigned long long mutation_iters = 8;
-    unsigned long long create_close_total_ns = 0;
-    unsigned long long truncate_total_ns = 0;
-    unsigned long long truncate_supported_iters = 0;
-    unsigned long long truncate_skipped = 0;
-    unsigned long long rename_total_ns = 0;
-    unsigned long long rename_supported_iters = 0;
-    unsigned long long rename_skipped = 0;
-    unsigned long long unlink_total_ns = 0;
-    unsigned long long unlink_supported_iters = 0;
-    unsigned long long unlink_skipped = 0;
-    const unsigned long long mutation_tag = now_ns();
-    for (unsigned long long i = 0; i < mutation_iters; ++i) {
-        char create_path[96];
-        char rename_path[96];
-        snprintf(create_path, sizeof(create_path), "/tmp/rawbench-file-%llx-%llu.tmp", mutation_tag, i);
-        snprintf(rename_path, sizeof(rename_path), "/tmp/rawbench-file-%llx-%llu.renamed", mutation_tag, i);
-        (void)filed_raw_unlink_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            create_path,
-            0x99000000u + i);
-        (void)filed_raw_unlink_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            rename_path,
-            0x99100000u + i);
-        uint64_t created = 0;
-        t0 = now_ns();
-        status = filed_raw_open_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            create_path,
-            PACHAOS_FILED_RIGHT_READ |
-                PACHAOS_FILED_RIGHT_WRITE |
-                PACHAOS_FILED_RIGHT_STAT |
-                PACHAOS_FILED_RIGHT_CREATE,
-            PACHAOS_FILED_OPEN_CREATE |
-                PACHAOS_FILED_OPEN_EXCLUSIVE |
-                PACHAOS_FILED_OPEN_TRUNCATE,
-            &created);
-        t1 = now_ns();
-        if (status != 0 || created == 0) {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw create", status != 0 ? status : -71);
-        }
-        create_close_total_ns += t1 - t0;
-
-        t0 = now_ns();
-        status = filed_raw_truncate_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            created,
-            4,
-            0x94000000u + i);
-        t1 = now_ns();
-        if (status != 0) {
-            if (status == -95) {
-                truncate_skipped++;
-            } else {
-                filed_raw_close_for_bench(session_fd, session_page_addr, created);
-                unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-                close_raw_fd(session_page_fd);
-                close_raw_fd(session_fd);
-                return ipc_bench_fail("filed raw truncate", status);
-            }
-        } else {
-            truncate_total_ns += t1 - t0;
-            truncate_supported_iters++;
-        }
-        filed_raw_close_for_bench(session_fd, session_page_addr, created);
-
-        t0 = now_ns();
-        status = filed_raw_rename_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            create_path,
-            rename_path,
-            0x95000000u + i);
-        t1 = now_ns();
-        const char *unlink_path = rename_path;
-        if (status == -95) {
-            rename_skipped++;
-            unlink_path = create_path;
-        } else if (status != 0) {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw rename", status);
-        } else {
-            rename_total_ns += t1 - t0;
-            rename_supported_iters++;
-        }
-
-        t0 = now_ns();
-        status = filed_raw_unlink_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            unlink_path,
-            0x96000000u + i);
-        t1 = now_ns();
-        if (status == -95) {
-            unlink_skipped++;
-        } else if (status != 0) {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw unlink", status);
-        } else {
-            unlink_total_ns += t1 - t0;
-            unlink_supported_iters++;
+    /* Private nested fixture crosses both former name and path widths while
+     * each component remains valid under the actual Linux NAME_MAX rule. */
+    size_t dir_count=5,component_size=120,root_size=80,filename_size=180;
+    char **directories=calloc(dir_count+1,sizeof(*directories));
+    char *long_path=calloc(1,root_size+dir_count*(component_size+1)+filename_size+16);
+    unsigned char *data=malloc(16384),*readback=malloc(16384);
+    if (!directories || !long_path || !data || !readback) { status=-ENOMEM; goto done; }
+    snprintf(long_path,root_size,"/tmp/libc-fs-raw-%llx",now_ns());
+    for (size_t i=0;i<=dir_count;++i) {
+        directories[i]=strdup(long_path);
+        if (!directories[i]) { status=-ENOMEM; goto done; }
+        status=raw_path(KB2_FILESYSTEM_OP_MKDIRAT,long_path,NULL,0);
+        if (status) goto done;
+        ++created_directories;
+        if (i<dir_count) {
+            size_t at=strlen(long_path); long_path[at++]='/';
+            memset(long_path+at,(int)('a'+i),component_size); long_path[at+component_size]=0;
         }
     }
-    metric_total_avg("filed_raw_create_open_roundtrip", create_close_total_ns, mutation_iters);
-    if (truncate_supported_iters > 0) {
-        metric_total_avg("filed_raw_truncate_roundtrip", truncate_total_ns, truncate_supported_iters);
+    size_t filename_offset=strlen(long_path);
+    long_path[filename_offset++]='/';
+    memset(long_path+filename_offset,'f',filename_size);
+    long_path[filename_offset+filename_size]=0;
+    status=raw_open(long_path,O_CREAT|O_EXCL|O_RDWR,0600,&handle);
+    if (status) goto done;
+    created_file=1;
+    for (size_t i=0;i<16384;++i) data[i]=(unsigned char)(i*17u);
+    if (raw_io(KB2_FILESYSTEM_OP_PWRITE,handle,0,data,16384)!=16384 ||
+        raw_io(KB2_FILESYSTEM_OP_PREAD,handle,0,readback,16384)!=16384 ||
+        memcmp(data,readback,16384)) { status=-EPROTO; goto done; }
+    kb2_fs_request_t dup={.opcode=KB2_FILESYSTEM_OP_DUP,.handle=handle};
+    kb2_fs_response_t response;
+    status=raw_fs_call(&dup,NULL,NULL,NULL,0,NULL,0,&response);
+    if (status) goto done;
+    duplicate=response.handle;
+    if (!duplicate || raw_io(KB2_FILESYSTEM_OP_READ,handle,0,readback,7)!=7 ||
+        memcmp(readback,data,7) ||
+        raw_io(KB2_FILESYSTEM_OP_READ,duplicate,0,readback,11)!=11 ||
+        memcmp(readback,data+7,11) ||
+        raw_simple(KB2_FILESYSTEM_OP_LSEEK,handle,0,SEEK_CUR)!=18) {
+        status=-EPROTO; goto done;
     }
-    printf("[libc-vfs-exec-smoke] metric op=filed_raw_truncate_skipped iterations=%llu total=%llu avg=%llu\n",
-        truncate_skipped,
-        truncate_skipped,
-        truncate_skipped == 0 ? 0ull : 1ull);
-    if (rename_supported_iters > 0) {
-        metric_total_avg("filed_raw_rename_roundtrip", rename_total_ns, rename_supported_iters);
+    data[0]=91;
+    if (raw_io(KB2_FILESYSTEM_OP_PWRITE,duplicate,0,data,1)!=1 ||
+        raw_io(KB2_FILESYSTEM_OP_PREAD,handle,0,readback,1)!=1 || readback[0]!=91 ||
+        raw_simple(KB2_FILESYSTEM_OP_LSEEK,duplicate,0,SEEK_CUR)!=18) {
+        status=-EPROTO; goto done;
     }
-    printf("[libc-vfs-exec-smoke] metric op=filed_raw_rename_skipped iterations=%llu total=%llu avg=%llu\n",
-        rename_skipped,
-        rename_skipped,
-        rename_skipped == 0 ? 0ull : 1ull);
-    if (unlink_supported_iters > 0) {
-        metric_total_avg("filed_raw_unlink_roundtrip", unlink_total_ns, unlink_supported_iters);
+    unsigned char statx[KB2_FILESYSTEM_STATX_SIZE];
+    kb2_fs_request_t stat={.opcode=KB2_FILESYSTEM_OP_STATX,.handle=handle,
+        .flags=0x1000,.mask=0x7ff};
+    status=raw_fs_call(&stat,"",NULL,NULL,0,statx,sizeof(statx),&response);
+    if (status || response.data_length!=sizeof(statx) ||
+        __pachaos_rd64(statx+KB2_FILESYSTEM_STATX_SIZE_OFFSET)!=16384) {
+        if (!status) status=-EPROTO;
+        goto done;
     }
-    printf("[libc-vfs-exec-smoke] metric op=filed_raw_unlink_skipped iterations=%llu total=%llu avg=%llu\n",
-        unlink_skipped,
-        unlink_skipped,
-        unlink_skipped == 0 ? 0ull : 1ull);
-
-    unsigned long long mkdir_total_ns = 0;
-    unsigned long long mkdir_supported_iters = 0;
-    unsigned long long mkdir_skipped = 0;
-    unsigned long long rmdir_total_ns = 0;
-    unsigned long long rmdir_supported_iters = 0;
-    unsigned long long rmdir_skipped = 0;
-    for (unsigned long long i = 0; i < mutation_iters; ++i) {
-        char dir_path[96];
-        snprintf(dir_path, sizeof(dir_path), "/tmp/rawbench-dir-%llx-%llu", mutation_tag, i);
-        (void)filed_raw_rmdir_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            dir_path,
-            0x99200000u + i);
-        t0 = now_ns();
-        status = filed_raw_mkdir_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            dir_path,
-            0x97000000u + i);
-        t1 = now_ns();
-        if (status == -95) {
-            mkdir_skipped++;
-            continue;
-        }
-        if (status != 0) {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw mkdir", status);
-        }
-        mkdir_total_ns += t1 - t0;
-        mkdir_supported_iters++;
-
-        t0 = now_ns();
-        status = filed_raw_rmdir_for_bench(
-            session_fd,
-            session_page_addr,
-            payload_addr,
-            dir_path,
-            0x98000000u + i);
-        t1 = now_ns();
-        if (status == -95) {
-            rmdir_skipped++;
-            continue;
-        }
-        if (status != 0) {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed raw rmdir", status);
-        }
-        rmdir_total_ns += t1 - t0;
-        rmdir_supported_iters++;
+    status=raw_simple(KB2_FILESYSTEM_OP_FTRUNCATE,handle,13,0);
+    if (status) goto done;
+    status=raw_fs_call(&stat,"",NULL,NULL,0,statx,sizeof(statx),&response);
+    if (status || response.data_length!=sizeof(statx) ||
+        __pachaos_rd64(statx+KB2_FILESYSTEM_STATX_SIZE_OFFSET)!=13) {
+        if (!status) status=-EPROTO;
+        goto done;
     }
-    if (mkdir_supported_iters > 0) {
-        metric_total_avg("filed_raw_mkdir_roundtrip", mkdir_total_ns, mkdir_supported_iters);
+    uint64_t directory=0;
+    status=raw_open(directories[dir_count],O_RDONLY|O_DIRECTORY,0,&directory);
+    if (status) goto done;
+    long entries=raw_io(KB2_FILESYSTEM_OP_GETDENTS64,directory,0,readback,16384);
+    long close_status=raw_simple(KB2_FILESYSTEM_OP_CLOSE,directory,0,0);
+    int saw_file=0;
+    if (entries<0) { status=entries; goto done; }
+    if (close_status) { status=close_status; goto done; }
+    for (size_t at=0;at<(size_t)entries;) {
+        if ((size_t)entries-at<19) { status=-EPROTO; goto done; }
+        unsigned reclen=__pachaos_rd16(readback+at+16);
+        if (reclen<20 || reclen>(size_t)entries-at ||
+            !memchr(readback+at+19,0,reclen-19)) { status=-EPROTO; goto done; }
+        if (!strcmp((char *)readback+at+19,long_path+filename_offset)) saw_file=1;
+        at+=reclen;
     }
-    printf("[libc-vfs-exec-smoke] metric op=filed_raw_mkdir_skipped iterations=%llu total=%llu avg=%llu\n",
-        mkdir_skipped,
-        mkdir_skipped,
-        mkdir_skipped == 0 ? 0ull : 1ull);
-    if (rmdir_supported_iters > 0) {
-        metric_total_avg("filed_raw_rmdir_roundtrip", rmdir_total_ns, rmdir_supported_iters);
+    if (!saw_file) { status=-EPROTO; goto done; }
+    char *renamed=malloc(strlen(long_path)+9);
+    if (!renamed) { status=-ENOMEM; goto done; }
+    sprintf(renamed,"%s.renamed",long_path);
+    status=raw_path(KB2_FILESYSTEM_OP_RENAMEAT2,long_path,renamed,0);
+    if (!status) strcpy(long_path,renamed);
+    free(renamed);
+    if (status) goto done;
+    printf("[libc-vfs-exec-smoke] raw ABI: long_path=%zu io_bytes=16384 shared_offsets=ok fresh_stat=ok\n",strlen(long_path));
+done:
+    if (duplicate) { long s=raw_simple(KB2_FILESYSTEM_OP_CLOSE,duplicate,0,0); if (!status) status=s; }
+    if (handle) { long s=raw_simple(KB2_FILESYSTEM_OP_CLOSE,handle,0,0); if (!status) status=s; }
+    if (created_file) (void)raw_path(KB2_FILESYSTEM_OP_UNLINKAT,long_path,NULL,0);
+    if (directories) for (size_t i=dir_count+1;i;--i) if (directories[i-1]) {
+        if (i<=created_directories)
+            (void)raw_path(KB2_FILESYSTEM_OP_UNLINKAT,directories[i-1],NULL,0x200);
+        free(directories[i-1]);
     }
-    printf("[libc-vfs-exec-smoke] metric op=filed_raw_rmdir_skipped iterations=%llu total=%llu avg=%llu\n",
-        rmdir_skipped,
-        rmdir_skipped,
-        rmdir_skipped == 0 ? 0ull : 1ull);
-
-    unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-    close_raw_fd(session_page_fd);
-    close_raw_fd(session_fd);
-    printf("[libc-vfs-exec-smoke] filed raw bench ok\n");
-    fflush(stdout);
-    return 0;
+    free(directories); free(long_path); free(data); free(readback);
+    return status ? raw_fail("raw ABI regression",status) : 0;
 }
-
 static int run_ipc_microbench(void)
 {
-    const uint64_t channel_rights =
-        PACHAOS_FD_RIGHT_INSPECT |
-        PACHAOS_FD_RIGHT_WAIT |
-        PACHAOS_FD_RIGHT_POLL |
-        PACHAOS_FD_RIGHT_CLOSE |
-        PACHAOS_FD_RIGHT_SEND |
-        PACHAOS_FD_RIGHT_RECV |
-        PACHAOS_FD_RIGHT_TRANSFER;
-
-    printf("[libc-vfs-exec-smoke] ipc bench start\n");
-    fflush(stdout);
-
-    volatile uint64_t sink = 0;
-    const int empty_iters = 8192;
-    unsigned long long t0 = now_ns();
-    for (int i = 0; i < empty_iters; ++i) {
-        sink += (uint64_t)i;
-    }
-    unsigned long long t1 = now_ns();
-    metric_avg("ipc_empty_loop", t0, t1, empty_iters);
-
-    const int create_iters = 256;
-    t0 = now_ns();
-    for (int i = 0; i < create_iters; ++i) {
-        uint64_t pair[2] = {0, 0};
-        long status = pachaos_raw3(
-            PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
-            (long)pair,
-            (long)channel_rights,
-            PACHAOS_FD_FLAG_CLOEXEC);
-        if (status != 0 || pair[0] < 16 || pair[1] < 16) {
-            close_raw_fd(pair[0]);
-            close_raw_fd(pair[1]);
-            return ipc_bench_fail("ipc channel create", status != 0 ? status : -22);
-        }
-        close_raw_fd(pair[0]);
-        close_raw_fd(pair[1]);
-    }
-    t1 = now_ns();
-    metric_avg("ipc_channel_create_close", t0, t1, create_iters);
-
-    uint64_t pair[2] = {0, 0};
-    long status = pachaos_raw3(
-        PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,
-        (long)pair,
-        (long)channel_rights,
+    uint64_t pair[2]={0};
+    uint64_t rights=PACHAOS_FD_RIGHT_INSPECT|PACHAOS_FD_RIGHT_CLOSE|
+        PACHAOS_FD_RIGHT_SEND|PACHAOS_FD_RIGHT_RECV|PACHAOS_FD_RIGHT_WAIT|
+        PACHAOS_FD_RIGHT_POLL;
+    long status=__pachaos_raw3(PACHAOS_SYSCALL_IPC_CHANNEL_CREATE,(long)pair,rights,
         PACHAOS_FD_FLAG_CLOEXEC);
-    if (status != 0 || pair[0] < 16 || pair[1] < 16) {
-        close_raw_fd(pair[0]);
-        close_raw_fd(pair[1]);
-        return ipc_bench_fail("ipc channel create steady", status != 0 ? status : -22);
-    }
-
-    struct pachaos_raw_ipc_msg request;
-    struct pachaos_raw_ipc_msg reply;
-    memset(&request, 0, sizeof(request));
-    memset(&reply, 0, sizeof(reply));
-
-    for (int i = 0; i < 16; ++i) {
-        request.word0 = 0x49504342454e4348ull;
-        request.word1 = (uint64_t)i;
-        status = pachaos_raw2(PACHAOS_SYSCALL_IPC_SEND, (long)pair[0], (long)&request);
-        if (status != 0) {
-            close_raw_fd(pair[0]);
-            close_raw_fd(pair[1]);
-            return ipc_bench_fail("ipc warm send", status);
-        }
-        memset(&reply, 0, sizeof(reply));
-        status = pachaos_raw2(PACHAOS_SYSCALL_IPC_RECV, (long)pair[1], (long)&reply);
-        if (status != 0 || reply.word1 != (uint64_t)i) {
-            close_raw_fd(pair[0]);
-            close_raw_fd(pair[1]);
-            return ipc_bench_fail("ipc warm recv", status != 0 ? status : -71);
-        }
-    }
-
-    const int msg_iters = 8192;
-    t0 = now_ns();
-    for (int i = 0; i < msg_iters; ++i) {
-        request.word0 = 0x49504342454e4348ull;
-        request.word1 = (uint64_t)i;
-        request.word2 = sink;
-        request.word3 = (uint64_t)(i ^ 0x5a5a);
-        status = pachaos_raw2(PACHAOS_SYSCALL_IPC_SEND, (long)pair[0], (long)&request);
-        if (status != 0) {
-            close_raw_fd(pair[0]);
-            close_raw_fd(pair[1]);
-            return ipc_bench_fail("ipc send", status);
-        }
-        memset(&reply, 0, sizeof(reply));
-        status = pachaos_raw2(PACHAOS_SYSCALL_IPC_RECV, (long)pair[1], (long)&reply);
-        if (status != 0 ||
-            reply.word0 != request.word0 ||
-            reply.word1 != request.word1 ||
-            reply.word2 != request.word2 ||
-            reply.word3 != request.word3)
-        {
-            close_raw_fd(pair[0]);
-            close_raw_fd(pair[1]);
-            return ipc_bench_fail("ipc recv", status != 0 ? status : -71);
-        }
-    }
-    t1 = now_ns();
-    metric_avg("ipc_send_recv_pair", t0, t1, msg_iters);
-    metric_avg("ipc_send_or_recv_syscall", t0, t1, msg_iters * 2);
-
-    close_raw_fd(pair[0]);
-    close_raw_fd(pair[1]);
-
-    const int hello_iters = 256;
-    t0 = now_ns();
-    for (int i = 0; i < hello_iters; ++i) {
-        status = filed_endpoint_hello_once((uint64_t)(0x1100 + i));
-        if (status != 0) {
-            return ipc_bench_fail("filed endpoint hello", status);
-        }
-    }
-    t1 = now_ns();
-    metric_avg("filed_endpoint_hello_roundtrip", t0, t1, hello_iters);
-
-    uint64_t session_fd = 0;
-    uint64_t session_page_addr = 0;
-    uint64_t session_page_fd = 0;
-    status = filed_session_connect_for_bench(&session_fd, &session_page_addr, &session_page_fd);
-    if (status != 0) {
-        return ipc_bench_fail("filed session connect", status);
-    }
-
-    const int ping_iters = 2048;
-    struct pachaos_filed_call_breakdown ping_breakdown;
-    memset(&ping_breakdown, 0, sizeof(ping_breakdown));
-    t0 = now_ns();
-    for (int i = 0; i < ping_iters; ++i) {
-        memset(&reply, 0, sizeof(reply));
-        const uint64_t ping_value = (uint64_t)(0x70000000u + i);
-        const uint64_t request_id = (uint64_t)(0x2100 + i);
-        status = filed_session_call_for_bench_timed(
-            session_fd,
-            session_page_addr,
-            PACHAOS_FILED_OP_PING,
-            ping_value,
-            request_id,
-            &reply,
-            &ping_breakdown);
-        if (status != 0 ||
-            reply.word0 != PACHAOS_FILED_REPLY_MAGIC ||
-            reply.word1 != 0 ||
-            reply.word2 != ping_value ||
-            reply.word3 != request_id)
-        {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed session ping", status != 0 ? status : -71);
-        }
-    }
-    t1 = now_ns();
-    metric_avg("filed_session_ping_roundtrip", t0, t1, ping_iters);
-    metric_avg("filed_session_ping_send_or_recv", t0, t1, ping_iters * 2);
-    metric_total_avg("filed_session_ping.enqueue", ping_breakdown.enqueue_ns, ping_iters);
-    metric_total_avg("filed_session_ping.send", ping_breakdown.send_ns, ping_iters);
-    metric_total_avg("filed_session_ping.recv", ping_breakdown.recv_ns, ping_iters);
-    metric_total_avg("filed_session_ping.completion", ping_breakdown.completion_ns, ping_iters);
-    metric_total_avg_cycles("filed_session_ping.enqueue_cycles", ping_breakdown.enqueue_cycles, ping_iters);
-    metric_total_avg_cycles("filed_session_ping.send_cycles", ping_breakdown.send_cycles, ping_iters);
-    metric_total_avg_cycles("filed_session_ping.recv_cycles", ping_breakdown.recv_cycles, ping_iters);
-    metric_total_avg_cycles("filed_session_ping.completion_cycles", ping_breakdown.completion_cycles, ping_iters);
-
-    struct pachaos_filed_call_breakdown ping_forever_breakdown;
-    memset(&ping_forever_breakdown, 0, sizeof(ping_forever_breakdown));
-    t0 = now_ns();
-    for (int i = 0; i < ping_iters; ++i) {
-        memset(&reply, 0, sizeof(reply));
-        const uint64_t ping_value = (uint64_t)(0x71000000u + i);
-        const uint64_t request_id = (uint64_t)(0x3100 + i);
-        status = filed_session_call_for_bench_timed(
-            session_fd,
-            session_page_addr,
-            PACHAOS_FILED_OP_PING,
-            ping_value,
-            request_id,
-            &reply,
-            &ping_forever_breakdown);
-        if (status != 0 ||
-            reply.word0 != PACHAOS_FILED_REPLY_MAGIC ||
-            reply.word1 != 0 ||
-            reply.word2 != ping_value ||
-            reply.word3 != request_id)
-        {
-            unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-            close_raw_fd(session_page_fd);
-            close_raw_fd(session_fd);
-            return ipc_bench_fail("filed session ping forever", status != 0 ? status : -71);
-        }
-    }
-    t1 = now_ns();
-    metric_avg("filed_session_ping_forever_roundtrip", t0, t1, ping_iters);
-    metric_avg("filed_session_ping_forever_send_or_recv", t0, t1, ping_iters * 2);
-    metric_total_avg("filed_session_ping_forever.enqueue", ping_forever_breakdown.enqueue_ns, ping_iters);
-    metric_total_avg("filed_session_ping_forever.send", ping_forever_breakdown.send_ns, ping_iters);
-    metric_total_avg("filed_session_ping_forever.recv", ping_forever_breakdown.recv_ns, ping_iters);
-    metric_total_avg("filed_session_ping_forever.completion", ping_forever_breakdown.completion_ns, ping_iters);
-    metric_total_avg_cycles("filed_session_ping_forever.enqueue_cycles", ping_forever_breakdown.enqueue_cycles, ping_iters);
-    metric_total_avg_cycles("filed_session_ping_forever.send_cycles", ping_forever_breakdown.send_cycles, ping_iters);
-    metric_total_avg_cycles("filed_session_ping_forever.recv_cycles", ping_forever_breakdown.recv_cycles, ping_iters);
-    metric_total_avg_cycles("filed_session_ping_forever.completion_cycles", ping_forever_breakdown.completion_cycles, ping_iters);
-
-    unmap_raw(session_page_addr, PACHAOS_FILED_SESSION_PAGE_BYTES);
-    close_raw_fd(session_page_fd);
-    close_raw_fd(session_fd);
-    printf("[libc-vfs-exec-smoke] ipc bench ok\n");
-    fflush(stdout);
+    if (status || pair[0]<16 || pair[1]<16) return raw_fail("IPC channel",status ? status : -EIO);
+    unsigned long long t0=now_ns(),t1=t0,iterations=0;
+    do {
+        struct __pachaos_ipc_msg sent={.word0=UINT64_C(0x49504342454e4348),.word1=iterations};
+        struct __pachaos_ipc_msg reply={0};
+        status=__pachaos_raw2(PACHAOS_SYSCALL_IPC_SEND,(long)pair[0],(long)&sent);
+        if (!status) status=__pachaos_raw2(PACHAOS_SYSCALL_IPC_RECV,(long)pair[1],(long)&reply);
+        if (!status && (reply.word0!=sent.word0 || reply.word1!=sent.word1)) status=-EPROTO;
+        ++iterations; t1=now_ns();
+    } while (!status && !bench_done(t0,t1,iterations));
+    (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,(long)pair[0]);
+    (void)__pachaos_raw1(PACHAOS_SYSCALL_FD_CLOSE,(long)pair[1]);
+    if (status) return raw_fail("IPC pair",status);
+    metric_avg("ipc_send_recv_pair",t0,t1,iterations);
+    uint8_t config[KB2_FILESYSTEM_QUEUE_CONFIG_SIZE];
+    t0=now_ns(); iterations=0;
+    do {
+        kb2_fs_request_t request={.opcode=KB2_FILESYSTEM_OP_HELLO,.flags=1};
+        kb2_fs_response_t response;
+        status=raw_fs_call(&request,NULL,NULL,NULL,0,config,sizeof(config),&response);
+        if (!status && (response.data_length!=sizeof(config) ||
+            __pachaos_rd64(config+KB2_FILESYSTEM_QUEUE_CONFIG_GENERATION_OFFSET)!=request.generation ||
+            !__pachaos_rd64(config+KB2_FILESYSTEM_QUEUE_CONFIG_CHANNEL_ID_OFFSET) ||
+            !__pachaos_rd64(config+KB2_FILESYSTEM_QUEUE_CONFIG_ARENA_BYTES_OFFSET) ||
+            !__pachaos_rd32(config+KB2_FILESYSTEM_QUEUE_CONFIG_QUEUE_SIZE_OFFSET) ||
+            __pachaos_rd32(config+KB2_FILESYSTEM_QUEUE_CONFIG_RESERVED_OFFSET))) status=-EPROTO;
+        ++iterations; t1=now_ns();
+    } while (!status && !bench_done(t0,t1,iterations));
+    if (status) return raw_fail("raw HELLO",status);
+    metric_avg("filed_raw_hello_roundtrip",t0,t1,iterations);
     return 0;
 }
 #else
-static int run_ipc_microbench(void)
-{
-    printf("[libc-vfs-exec-smoke] ipc bench skipped on linux\n");
-    fflush(stdout);
-    return 0;
-}
-
-static int run_filed_raw_operation_bench(const char *path)
-{
-    (void)path;
-    printf("[libc-vfs-exec-smoke] filed raw bench skipped on linux\n");
-    fflush(stdout);
-    return 0;
-}
+static int run_ipc_microbench(void) { return 0; }
+static int run_filed_raw_operation_bench(const char *path) { (void)path; return 0; }
 #endif
 
 static int run_child(int argc, char **argv, char **envp)
@@ -1531,12 +427,25 @@ static int run_child(int argc, char **argv, char **envp)
     unsigned long long child_start_ns = now_ns();
     printf("[libc-vfs-exec-smoke] child start\n");
     fflush(stdout);
-    if (argc != 2 || strcmp(argv[1], "--child") != 0) {
+    if (argc != 300 || strcmp(argv[1], "--child") != 0) {
         return fail("child argv");
     }
+    for (int i=5;i<argc;++i)
+        if (strcmp(argv[i],"argument-crossing-the-former-fixed-string-payload-budget"))
+            return fail("child large argv contents");
+    int inherited=atoi(argv[2]),shared=atoi(argv[3]),cloexec=atoi(argv[4]);
+    char bytes[4]={0};
+    struct stat info;
+    if (read(inherited,bytes,3)!=3 || memcmp(bytes,"cde",3) ||
+        read(shared,bytes,3)!=3 || memcmp(bytes,"fgh",3) ||
+        lseek(inherited,0,SEEK_CUR)!=8 || fstat(inherited,&info) || info.st_size!=10 ||
+        fstat(cloexec,&info)==0) return fail("child inherited handles / offsets / CLOEXEC");
+    if (close(inherited) || close(shared)) return fail("child inherited close");
     int saw_child = 0;
     int saw_exec_start = 0;
+    size_t environment_count=0;
     for (char **it = envp; it != NULL && *it != NULL; ++it) {
+        ++environment_count;
         const char *prefix = "PACHA_LIBC_VFS_EXEC_START_NS=";
         const size_t prefix_len = strlen(prefix);
         if (strncmp(*it, prefix, prefix_len) == 0) {
@@ -1550,7 +459,7 @@ static int run_child(int argc, char **argv, char **envp)
             saw_child = 1;
         }
     }
-    if (!saw_child) return fail("child env");
+    if (!saw_child || environment_count!=80) return fail("child large env");
     if (!saw_exec_start) {
         printf("[libc-vfs-exec-smoke] metric op=execve_to_child_start ns=missing\n");
         fflush(stdout);
@@ -2067,7 +976,6 @@ static int run_vfs(void)
         metric_total_avg("batch_openat_dirfd_close.close", openat_dir_close_ns, openat_dir_iters);
     }
 
-#ifndef __pachaos__
     unsigned long long fstatat_dir_iters = 0;
     t0 = now_ns();
     for (;;) {
@@ -2080,10 +988,6 @@ static int run_vfs(void)
         if (bench_done(t0, t1, fstatat_dir_iters)) break;
     }
     metric_avg("batch_fstatat_dirfd", t0, t1, fstatat_dir_iters);
-#else
-    printf("[libc-vfs-exec-smoke] metric op=batch_fstatat_dirfd_skipped iterations=1 total=1 avg=1\n");
-    fflush(stdout);
-#endif
     if (close(root_dir_fd) != 0) return fail("batch openat root close");
 
     int tmp_dir_fd = open("/tmp", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -2130,7 +1034,6 @@ static int run_vfs(void)
     }
     if (close(tmp_dir_fd) != 0) return fail("batch openat file dir close");
 
-#ifndef __pachaos__
     unsigned long long stat_path_iters = 0;
     t0 = now_ns();
     for (;;) {
@@ -2140,10 +1043,6 @@ static int run_vfs(void)
         if (bench_done(t0, t1, stat_path_iters)) break;
     }
     metric_avg("batch_stat_path", t0, t1, stat_path_iters);
-#else
-    printf("[libc-vfs-exec-smoke] metric op=batch_stat_path_skipped iterations=1 total=1 avg=1\n");
-    fflush(stdout);
-#endif
 
     unsigned long long stdio_iters = 0;
     unsigned long long stdio_fopen_ns = 0;
@@ -2414,7 +1313,6 @@ static int run_vfs(void)
     }
     metric_avg("batch_pwrite", t0, t1, pwrite_iters);
 
-#ifndef __pachaos__
     {
         char mutation_probe_path[128];
         snprintf(mutation_probe_path, sizeof(mutation_probe_path), "/tmp/libc-vfs-mutation-probe-%llu.tmp", now_ns());
@@ -2504,10 +1402,6 @@ static int run_vfs(void)
         }
     }
     }
-#else
-    printf("[libc-vfs-exec-smoke] metric op=batch_create_close_unlink_skipped iterations=1 total=1 avg=1\n");
-    fflush(stdout);
-#endif
 
     unsigned long long readv_iters = 0;
     unsigned long long readv_lseek_ns = 0;
@@ -2708,7 +1602,7 @@ int main(int argc, char **argv, char **envp)
 {
     calibrate_tsc_timebase();
 
-    if (argc == 2 && strcmp(argv[1], "--child") == 0) {
+    if (argc >= 2 && strcmp(argv[1], "--child") == 0) {
         return run_child(argc, argv, envp);
     }
 
@@ -2718,23 +1612,50 @@ int main(int argc, char **argv, char **envp)
 
     printf("[libc-vfs-exec-smoke] exec child\n");
     fflush(stdout);
-    char *const child_argv[] = {
+    /* An unlinked open file proves exec preserves live Linux references,
+     * rather than reopening saved names or serializing cached offsets. */
+    char inherit_path[128];
+    snprintf(inherit_path,sizeof(inherit_path),"/tmp/libc-exec-inherit-%llx",now_ns());
+    int inherited=open(inherit_path,O_CREAT|O_EXCL|O_RDWR,0600);
+    if (inherited<0) return fail("exec inherited open");
+    if (write(inherited,"abcdefghij",10)!=10 || lseek(inherited,2,SEEK_SET)!=2 ||
+        unlink(inherit_path)) { (void)close(inherited); return fail("exec inherited prepare"); }
+    int shared=fcntl(inherited,F_DUPFD,0);
+    int cloexec=fcntl(inherited,F_DUPFD_CLOEXEC,0);
+    if (shared<0 || cloexec<0) {
+        if (shared>=0) (void)close(shared);
+        if (cloexec>=0) (void)close(cloexec);
+        (void)close(inherited); return fail("exec inherited duplicate");
+    }
+    char fd_text[3][24];
+    snprintf(fd_text[0],sizeof(fd_text[0]),"%d",inherited);
+    snprintf(fd_text[1],sizeof(fd_text[1]),"%d",shared);
+    snprintf(fd_text[2],sizeof(fd_text[2]),"%d",cloexec);
+    char **child_argv=calloc(301,sizeof(*child_argv));
+    char **child_envp=calloc(81,sizeof(*child_envp));
+    if (!child_argv || !child_envp) {
+        free(child_argv); free(child_envp);
+        (void)close(inherited); (void)close(shared); (void)close(cloexec);
+        return fail("exec dynamic vectors");
+    }
+    child_argv[0]=
 #ifdef __linux__
-        argv[0],
+        argv[0];
 #else
-        "/cmd/libc_vfs_exec_smoke.elf",
+        "/cmd/libc_vfs_exec_smoke.elf";
 #endif
-        "--child",
-        NULL,
-    };
+    child_argv[1]="--child";
+    child_argv[2]=fd_text[0]; child_argv[3]=fd_text[1]; child_argv[4]=fd_text[2];
+    for (size_t i=5;i<300;++i)
+        child_argv[i]="argument-crossing-the-former-fixed-string-payload-budget";
     char exec_start_env[96];
     unsigned long long exec_start_ns = now_ns();
     snprintf(exec_start_env, sizeof(exec_start_env), "PACHA_LIBC_VFS_EXEC_START_NS=%llu", exec_start_ns);
-    char *const child_envp[] = {
-        "PACHA_LIBC_VFS_EXEC_CHILD=1",
-        exec_start_env,
-        NULL,
-    };
+    child_envp[0]="PACHA_LIBC_VFS_EXEC_CHILD=1";
+    child_envp[1]=exec_start_env;
+    for (size_t i=2;i<80;++i) child_envp[i]="FIXTURE_LARGE_ENV=value";
     execve(child_argv[0], child_argv, child_envp);
+    free(child_argv); free(child_envp);
+    (void)close(inherited); (void)close(shared); (void)close(cloexec);
     return fail("execve child");
 }

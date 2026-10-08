@@ -4,7 +4,7 @@ ulimit -c 0
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 out="$repo_root/.artifacts/tests/lpr-sync-file-install"
 mkdir -p "$out"
-includes=()
+includes=(-I"$repo_root/kobox2/protocol/include" -I"$repo_root/kobox2/protocol/generated/include" -I"$repo_root/userland")
 for module in libipc libpacha personality daemons/common filed termd gpud inputd netd unixd lpr_supervisor; do
   includes+=("-I$repo_root/userland/$module/include")
 done

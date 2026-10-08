@@ -61,6 +61,11 @@ common_cflags=(
   -Wextra
   -D__pachaos__
   -D_XOPEN_SOURCE=700
+  -I "$repo_root/musl/pachaos/syscall"
+  -I "$repo_root/userland/filed/include"
+  -I "$repo_root/userland/libipc/include"
+  -I "$repo_root/kobox2/protocol/include"
+  -I "$repo_root/kobox2/protocol/generated/include"
   -I "$upstream/arch/pachaos"
   -I "$upstream/arch/generic"
   -I "$obj_dir/src/internal"
@@ -184,6 +189,7 @@ libc_sources=(
   "$upstream/src/stdio/fputc.c"
   "$upstream/src/stdio/fputs.c"
   "$upstream/src/stdio/fwrite.c"
+  "$upstream/src/stdio/fopencookie.c"
   "$upstream/src/stdio/ofl.c"
   "$upstream/src/stdio/ofl_add.c"
   "$upstream/src/stdio/open_memstream.c"
@@ -335,7 +341,9 @@ libc_sources=(
   "$upstream/src/temp/mkstemp.c"
   "$upstream/src/setjmp/x86_64/setjmp.s"
   "$upstream/src/setjmp/x86_64/longjmp.s"
-  "$upstream/src/thread/pachaos/filed_runtime.c"
+  "$repo_root/musl/pachaos/syscall/native.c"
+  "$repo_root/kobox2/protocol/src/filesystem.c"
+  "$repo_root/userland/filed/src/exec_payload.c"
   "$repo_root/musl/pachaos/syscall/thread_area.c"
 )
 

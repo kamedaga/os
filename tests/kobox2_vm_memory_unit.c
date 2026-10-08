@@ -13,7 +13,7 @@ static int fail_process;
 static bool fail_allocation;
 static size_t allocations;
 static unsigned native_calls;
-struct ph_image ph_core;
+struct ph_image ph_core = {.ram_size = PH_RAM_SIZE};
 
 void *ph_alloc(size_t size) {
     void *result = calloc(1, size);

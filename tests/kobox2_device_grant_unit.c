@@ -21,25 +21,25 @@ static uint8_t manifest_bytes[4096], grant_bytes[4096];
 
 long pacha_syscall1(uint64_t nr, uint64_t fd) {
     ++calls;
-    assert(nr == PACHA_FD_SYSCALL_CLOSE && fd == 100);
+    assert(nr == PACHA_FD_SYSCALL_CLOSE && (fd == 100 || fd == 101));
     return close_result;
 }
 
 long pacha_syscall2(uint64_t nr, uint64_t fd, uint64_t output) {
     ++calls;
-    assert(nr == PACHA_FD_SYSCALL_GET_INFO && fd == 100);
+    assert(nr == PACHA_FD_SYSCALL_GET_INFO && (fd == 100 || fd == 101));
     *(struct pacha_fd_info *)(uintptr_t)output = info;
     return info_result;
 }
 
 long pacha_syscall3(uint64_t nr, uint64_t fd, uint64_t output, uint64_t words) {
     ++calls;
-    assert(nr == PACHA_CAPSULE_SYSCALL_QUERY && fd == 100 && words == 11);
+    assert(nr == PACHA_CAPSULE_SYSCALL_QUERY && (fd == 100 || fd == 101) && words == 11);
     *(struct pacha_capsule_info *)(uintptr_t)output = capsule;
     return query_result;
 }
 
-static void prepare(void) {
+static void prepare_count(unsigned count) {
     static const struct kobox_package_operations operations = {0};
     static const uint8_t schema[32] = KB2_PCI_FUNCTION_SCHEMA_SHA256_BYTES;
     kb2_closure_manifest_artifact_t artifact = {.node_id = 1,
@@ -48,7 +48,7 @@ static void prepare(void) {
         .content_size = 64, .namespace_name = {.data = "core", .length = 4}};
     memset(artifact.content_digest, 1, 32);
     kb2_closure_manifest_resource_t resource = {.slot_id = 1,
-        .type = KB2_CLOSURE_RESOURCE_DEVICE, .minimum_count = 1, .maximum_count = 1,
+        .type = KB2_CLOSURE_RESOURCE_DEVICE, .minimum_count = 1, .maximum_count = count,
         .required_rights = KB2_PCI_FUNCTION_REQUIRED_RIGHTS,
         .maximum_rights = KB2_PCI_FUNCTION_REQUIRED_RIGHTS,
         .flags = KB2_CLOSURE_RESOURCE_FLAG_REQUIRED};
@@ -63,12 +63,14 @@ static void prepare(void) {
     kb2_resource_grant_slot_source_t slot = {.slot_id = 1, .resource_type = KB2_CLOSURE_RESOURCE_DEVICE,
         .state = KB2_RESOURCE_GRANT_SLOT_PRESENT};
     memcpy(slot.interface_schema_digest, schema, 32);
-    kb2_resource_grant_object_source_t object = {.slot_id = 1, .object_id = 23,
-        .granted_rights = KB2_PCI_FUNCTION_REQUIRED_RIGHTS};
-    kb2_resource_grant_handle_binding_t handle = {.object_id = 23,
-        .role = KB2_PCI_FUNCTION_NATIVE_HANDLE_ROLE_DEVICE, .transfer_handle_index = 0};
+    kb2_resource_grant_object_source_t objects[2] = {
+        {.slot_id = 1, .object_id = 23, .granted_rights = KB2_PCI_FUNCTION_REQUIRED_RIGHTS},
+        {.slot_id = 1, .object_id = 24, .granted_rights = KB2_PCI_FUNCTION_REQUIRED_RIGHTS}};
+    kb2_resource_grant_handle_binding_t handles[2] = {
+        {.object_id = 23, .role = KB2_PCI_FUNCTION_NATIVE_HANDLE_ROLE_DEVICE, .transfer_handle_index = 0},
+        {.object_id = 24, .role = KB2_PCI_FUNCTION_NATIVE_HANDLE_ROLE_DEVICE, .transfer_handle_index = 1}};
     kb2_resource_grant_source_t grant = {.generation = 7, .slots = &slot, .slot_count = 1,
-        .objects = &object, .object_count = 1, .handle_bindings = &handle, .handle_binding_count = 1};
+        .objects = objects, .object_count = count, .handle_bindings = handles, .handle_binding_count = count};
     kb2_sha256(manifest_bytes, size, grant.closure_manifest_digest);
     assert(kb2_resource_grant_encode(grant_bytes, sizeof(grant_bytes), &size, &grant) == KB2_PROTOCOL_OK);
     assert(kb2_resource_grant_decode(grant_bytes, size, &package.common.grant) == KB2_PROTOCOL_OK);
@@ -76,8 +78,10 @@ static void prepare(void) {
     package.common.operations = &operations;
     package.common.artifact_count = 1;
     bundle = (struct ph_bootstrap_receiver){.generation = 7, .artifact_count = 1,
-        .resource_count = 1, .received = 4, .complete = 1};
+        .resource_count = count, .received = 3 + count, .complete = 1};
     bundle.items[3].capability = (struct pacha_ipc_fd){.fd = 100,
+        .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
+    if (count == 2) bundle.items[4].capability = (struct pacha_ipc_fd){.fd = 101,
         .rights = PH_DEVICE_FUNCTION_RIGHTS, .flags = PACHA_FD_FLAG_CLOEXEC};
     authority = (struct ph_device_authority){.generation = 7, .object_id = 23,
         .native_device = 42, .slot_id = 1, .node_id = 1};
@@ -88,6 +92,8 @@ static void prepare(void) {
     query_result = 11;
     calls = 0;
 }
+
+static void prepare(void) { prepare_count(1); }
 
 static void rejected(int error, unsigned int expected_calls) {
     struct ph_device_grant output = {0}, before = output;
@@ -128,6 +134,15 @@ int main(void) {
     assert(!ph_device_grant_close(&output, 7) && !output.fd && output.generation == 7);
     assert(ph_device_grant_take(&output, &bundle, &package, &authority) == -ESTALE);
     assert(!ph_device_grant_close(&output, 7) && calls == 4);
+    prepare_count(2);
+    struct ph_device_grant first = {0}, second = {0};
+    assert(!ph_device_grant_take(&first, &bundle, &package, &authority));
+    authority.object_id = 24; authority.native_device = 43; capsule.device = 43;
+    assert(!ph_device_grant_take(&second, &bundle, &package, &authority));
+    assert(first.fd == 100 && second.fd == 101 &&
+        bundle.items[3].capability.fd == PH_IPC_NO_FD &&
+        bundle.items[4].capability.fd == PH_IPC_NO_FD);
+    assert(!ph_device_grant_close(&first, 7) && !ph_device_grant_close(&second, 7));
     puts("kobox2 device grant import: PASS identity rights ownership failure-retention");
     return 0;
 }

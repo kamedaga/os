@@ -88,7 +88,7 @@ static int stop(void *context) {
     return result ? result : aux_result;
 }
 
-static int prepare(void *context, const struct ph_ipc_packet *packet) {
+static int prepare(void *context, struct ph_ipc_packet *packet) {
     struct ph_gpu_query *query = context;
     if (query->mapping || packet->operation != PH_GPU_QUERY_OPERATION ||
         packet->generation != query->generation || !packet->correlation ||
@@ -173,7 +173,7 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
             .bo_handle = map ? query->plan.mapping_handle : query->plan.prime_handle,
         };
         size_t page_count = 1;
-        if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID) {
+        if (query->profile_kind == KB2_GPU_PROFILE_AMDGPU) {
             uint64_t length = 0;
             int found = query->api.gem_size(file, resource.bo_handle, &length);
             if (found || !length || length % PH_PAGE_SIZE) {
@@ -193,7 +193,7 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         size_t bytes = page_count * sizeof(uint64_t);
         int error = allocate_aux(query, bytes);
         if (error) {
-            if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID)
+            if (query->profile_kind == KB2_GPU_PROFILE_AMDGPU)
                 ph_boot_log_gpu_map_failure(2, error,
                     resource.bo_handle, bytes);
             return error;
@@ -209,7 +209,7 @@ int ph_gpu_query_dispatch(struct ph_gpu_query *query,
         sizeof(query->reply) - KB2_PROTOCOL_MESSAGE_ENVELOPE_SIZE, &size,
         &query->result);
     if (result) {
-        if (query->plan.command_set_id == KB2_GPU_DRM_AMDGPU_SET_ID && map)
+        if (query->profile_kind == KB2_GPU_PROFILE_AMDGPU && map)
             ph_boot_log_gpu_map_failure(3, result,
                 query->plan.mapping_handle, query->plan.aux_size);
         return result;
@@ -318,7 +318,7 @@ int ph_gpu_query_publish_attachment(struct ph_gpu_query *query,
         /* Native PAGE_VIEW maps the parent's actual physical cache policy;
          * it must not create an independent WB alias of TTM's WC pages. */
         for (uint64_t index = 0; index < query->result.mapping_page_count; ++index)
-            if (pages[index] >= PH_RAM_SIZE / PH_PAGE_SIZE) return -EPROTO;
+            if (pages[index] >= ph_core.ram_size / PH_PAGE_SIZE) return -EPROTO;
         native_fd = pacha_syscall5(PACHA_FD_SYSCALL_VMO_CREATE_PAGE_VIEW,
             (uint64_t)(uint32_t)ph_core.ram_fd, (uintptr_t)pages,
             query->result.mapping_page_count, rights, PACHA_FD_FLAG_CLOEXEC);
@@ -421,9 +421,21 @@ int ph_gpu_query_init_profile(struct ph_gpu_query *query, uint64_t generation,
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_get_magic");
     if (!symbol) return -ENOENT;
     memcpy(&api.get_magic, &symbol, sizeof(api.get_magic));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_get_client");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.get_client, &symbol, sizeof(api.get_client));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_auth_magic");
     if (!symbol) return -ENOENT;
     memcpy(&api.auth_magic, &symbol, sizeof(api.auth_magic));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_wait_vblank");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.wait_vblank, &symbol, sizeof(api.wait_vblank));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_crtc_get_sequence");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.crtc_get_sequence, &symbol, sizeof(api.crtc_get_sequence));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_crtc_queue_sequence");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.crtc_queue_sequence, &symbol, sizeof(api.crtc_queue_sequence));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_resources");
     if (!symbol) return -ENOENT;
     memcpy(&api.resources, &symbol, sizeof(api.resources));
@@ -457,12 +469,51 @@ int ph_gpu_query_init_profile(struct ph_gpu_query *query, uint64_t generation,
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_remove_fb");
     if (!symbol) return -ENOENT;
     memcpy(&api.remove_fb, &symbol, sizeof(api.remove_fb));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_destroy_dumb");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.destroy_dumb, &symbol, sizeof(api.destroy_dumb));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_set_property");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.set_property, &symbol, sizeof(api.set_property));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_get_fb");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.get_fb, &symbol, sizeof(api.get_fb));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_get_fb2");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.get_fb2, &symbol, sizeof(api.get_fb2));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_set_plane");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.set_plane, &symbol, sizeof(api.set_plane));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_gamma");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.gamma, &symbol, sizeof(api.gamma));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_add_fb2");
     if (!symbol) return -ENOENT;
     memcpy(&api.add_fb2, &symbol, sizeof(api.add_fb2));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_object_properties");
     if (!symbol) return -ENOENT;
     memcpy(&api.object_properties, &symbol, sizeof(api.object_properties));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_plane_resources");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.plane_resources, &symbol, sizeof(api.plane_resources));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_plane");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.plane, &symbol, sizeof(api.plane));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_property");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.property, &symbol, sizeof(api.property));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_property_blob");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.property_blob, &symbol, sizeof(api.property_blob));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_create_property_blob");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.create_property_blob, &symbol, sizeof(api.create_property_blob));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_destroy_property_blob");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.destroy_property_blob, &symbol, sizeof(api.destroy_property_blob));
+    symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_atomic");
+    if (!symbol) return -ENOENT;
+    memcpy(&api.atomic, &symbol, sizeof(api.atomic));
     symbol = ph_image_lookup(&ph_core, "kobox_linux_drm_poll_events");
     if (!symbol) return -ENOENT;
     memcpy(&api.poll_events, &symbol, sizeof(api.poll_events));

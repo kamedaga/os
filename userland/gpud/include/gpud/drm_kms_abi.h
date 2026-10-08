@@ -16,11 +16,14 @@ enum {
     GPUD_DRM_IOCTL_MODE_GETCRTC = 0xc06864a1u,
     GPUD_DRM_IOCTL_MODE_SETCRTC = 0xc06864a2u,
     GPUD_DRM_IOCTL_MODE_CURSOR = 0xc01c64a3u,
+    GPUD_DRM_IOCTL_MODE_GETGAMMA = 0xc02064a4u,
+    GPUD_DRM_IOCTL_MODE_SETGAMMA = 0xc02064a5u,
     GPUD_DRM_IOCTL_MODE_GETENCODER = 0xc01464a6u,
     GPUD_DRM_IOCTL_MODE_GETCONNECTOR = 0xc05064a7u,
     GPUD_DRM_IOCTL_MODE_GETPROPERTY = 0xc04064aau,
     GPUD_DRM_IOCTL_MODE_SETPROPERTY = 0xc01064abu,
     GPUD_DRM_IOCTL_MODE_GETPROPBLOB = 0xc01064acu,
+    GPUD_DRM_IOCTL_MODE_GETFB = 0xc01c64adu,
     GPUD_DRM_IOCTL_MODE_ADDFB = 0xc01c64aeu,
     GPUD_DRM_IOCTL_MODE_RMFB = 0xc00464afu,
     GPUD_DRM_IOCTL_MODE_PAGE_FLIP = 0xc01864b0u,
@@ -30,6 +33,7 @@ enum {
     GPUD_DRM_IOCTL_MODE_DESTROY_DUMB = 0xc00464b4u,
     GPUD_DRM_IOCTL_MODE_GETPLANERESOURCES = 0xc01064b5u,
     GPUD_DRM_IOCTL_MODE_GETPLANE = 0xc02064b6u,
+    GPUD_DRM_IOCTL_MODE_SETPLANE = 0xc03064b7u,
     GPUD_DRM_IOCTL_MODE_ADDFB2 = 0xc06864b8u,
     GPUD_DRM_IOCTL_MODE_OBJ_GETPROPERTIES = 0xc02064b9u,
     GPUD_DRM_IOCTL_MODE_CURSOR2 = 0xc02464bbu,
@@ -41,6 +45,7 @@ enum {
     GPUD_DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD = 0xc01064c1u,
     GPUD_DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE = 0xc01064c2u,
     GPUD_DRM_IOCTL_MODE_CREATE_LEASE = 0xc01864c6u,
+    GPUD_DRM_IOCTL_MODE_GETFB2 = 0xc06864ceu,
     GPUD_DRM_IOCTL_SYNCOBJ_TRANSFER = 0xc02064ccu,
     GPUD_DRM_IOCTL_MODE_CLOSEFB = 0xc00864d0u,
     GPUD_DRM_IOCTL_SYNCOBJ_EVENTFD = 0xc01864cfu,
@@ -76,6 +81,7 @@ enum {
     GPUD_DRM_MODE_ATOMIC_NONBLOCK = 0x0200u,
     GPUD_DRM_MODE_ATOMIC_ALLOW_MODESET = 0x0400u,
     GPUD_DRM_MODE_ATOMIC_FLAGS = GPUD_DRM_MODE_PAGE_FLIP_EVENT |
+        GPUD_DRM_MODE_PAGE_FLIP_ASYNC |
         GPUD_DRM_MODE_ATOMIC_TEST_ONLY | GPUD_DRM_MODE_ATOMIC_NONBLOCK |
         GPUD_DRM_MODE_ATOMIC_ALLOW_MODESET,
 
@@ -123,19 +129,22 @@ enum {
     GPUD_DRM_VBLANK_NEXT_ON_MISS = 0x10000000u,
     GPUD_DRM_VBLANK_SECONDARY = 0x20000000u,
     GPUD_DRM_VBLANK_SIGNAL = 0x40000000u,
+    GPUD_DRM_VBLANK_FLAGS = GPUD_DRM_VBLANK_RELATIVE |
+        GPUD_DRM_VBLANK_HIGH_CRTC_MASK | GPUD_DRM_VBLANK_EVENT |
+        GPUD_DRM_VBLANK_NEXT_ON_MISS | GPUD_DRM_VBLANK_SECONDARY,
     GPUD_DRM_CRTC_SEQUENCE_RELATIVE = 0x00000001u,
     GPUD_DRM_CRTC_SEQUENCE_NEXT_ON_MISS = 0x00000002u,
 
     GPUD_DRM_KMS_FB_CAPACITY = 16u,
-    GPUD_DRM_KMS_CRTC_CAPACITY = 4u,
-    GPUD_DRM_KMS_CONNECTOR_CAPACITY = 4u,
-    GPUD_DRM_KMS_ENCODER_CAPACITY = 4u,
+    GPUD_DRM_KMS_CRTC_CAPACITY = 16u,
+    GPUD_DRM_KMS_CONNECTOR_CAPACITY = 16u,
+    GPUD_DRM_KMS_ENCODER_CAPACITY = 16u,
     GPUD_DRM_KMS_MODE_CAPACITY = 32u,
-    GPUD_DRM_KMS_PLANE_CAPACITY = 4u,
-    GPUD_DRM_KMS_FORMAT_CAPACITY = 4u,
-    GPUD_DRM_KMS_PROPERTY_CAPACITY = 16u,
+    GPUD_DRM_KMS_PLANE_CAPACITY = 32u,
+    GPUD_DRM_KMS_FORMAT_CAPACITY = 128u,
+    GPUD_DRM_KMS_PROPERTY_CAPACITY = 32u,
     GPUD_DRM_KMS_PROPERTY_VALUE_CAPACITY = 8u,
-    GPUD_DRM_KMS_PROPERTY_ENUM_CAPACITY = 8u,
+    GPUD_DRM_KMS_PROPERTY_ENUM_CAPACITY = 32u,
     GPUD_DRM_KMS_PROPERTY_BLOB_BYTES = 128u,
     GPUD_DRM_PROP_NAME_BYTES = 32u,
 };
@@ -164,8 +173,11 @@ enum {
     GPUD_DRM_KMS_PLANE_IN_FENCE_FD_PROP_ID = 117u,
     GPUD_DRM_KMS_IN_FORMATS_BLOB_ID = 201u,
 
-    GPUD_DRM_ATOMIC_OBJECT_CAPACITY = 4u,
-    GPUD_DRM_ATOMIC_PROPERTY_CAPACITY = 32u,
+    /* One atomic ioctl is indivisible. Keep the typed LPR-to-gpud snapshot
+     * large enough for multiple outputs and planes while fitting in the
+     * existing 3072-byte IPC data field. Both endpoints ship together. */
+    GPUD_DRM_ATOMIC_OBJECT_CAPACITY = 32u,
+    GPUD_DRM_ATOMIC_PROPERTY_CAPACITY = 192u,
 };
 
 typedef struct gpud_drm_modeinfo {
@@ -231,6 +243,11 @@ typedef struct gpud_drm_mode_get_blob {
     uint32_t length;
     uint64_t data;
 } gpud_drm_mode_get_blob_t;
+
+typedef struct gpud_drm_mode_crtc_lut {
+    uint32_t crtc_id, gamma_size;
+    uint64_t red, green, blue;
+} gpud_drm_mode_crtc_lut_t;
 
 typedef struct gpud_drm_mode_create_blob_wire {
     uint32_t length;
@@ -570,7 +587,7 @@ _Static_assert(sizeof(gpud_drm_mode_get_blob_t) == 16, "drm property blob ABI");
 _Static_assert(sizeof(gpud_drm_mode_cursor_t) == 28, "drm cursor ABI");
 _Static_assert(sizeof(gpud_drm_mode_cursor2_t) == 36, "drm cursor2 ABI");
 _Static_assert(sizeof(gpud_drm_mode_create_blob_wire_t) == 136, "drm create blob wire ABI");
-_Static_assert(sizeof(gpud_drm_mode_atomic_wire_t) == 440, "drm atomic wire ABI");
+_Static_assert(sizeof(gpud_drm_mode_atomic_wire_t) == 2584, "drm atomic wire ABI");
 _Static_assert(sizeof(gpud_drm_syncobj_create_t) == 8, "drm syncobj create ABI");
 _Static_assert(sizeof(gpud_drm_syncobj_destroy_t) == 8, "drm syncobj destroy ABI");
 _Static_assert(sizeof(gpud_drm_syncobj_handle_t) == 16, "drm syncobj handle ABI");

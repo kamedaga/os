@@ -787,6 +787,14 @@ size_t inputd_input_public_device_count(const struct inputd_input_island *island
     return island == NULL || island->registry == NULL ? 0 : island->device_count;
 }
 
+int inputd_input_device_snapshot(uint32_t event_index,
+    struct kb_input_device_snapshot *out)
+{
+    if (!out) return -22;
+    const inputd_registry_entry_t *entry = lookup_registry_by_event(event_index);
+    return entry ? lookup_device_by_id(entry->kobox_device_id, out) : -19;
+}
+
 int inputd_input_public_device(
     const struct inputd_input_island *island,
     size_t ordinal,

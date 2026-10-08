@@ -1,0 +1,8 @@
+# PachaOS installed-base BusyBox init policy.
+# Native seed0root owns hardware services; init owns the Linux user session.
+# BusyBox init creates a new session for each action.  Its standard leading
+# '-' form asks init to claim the inherited termd PTY as that session's
+# controlling terminal before exec, preserving interactive job control.
+::respawn:-/bin/ash
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/sync

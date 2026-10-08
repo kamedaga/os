@@ -1,17 +1,11 @@
 #define _GNU_SOURCE
 
-#include "bootfs_reader.h"
-#include "kobox/device_pachaos_capsule.h"
-#include "kobox/module.h"
-#include "kobox/shim.h"
-#include "linux_subsystem/block/block.h"
-#include "linux_subsystem/fs/fs.h"
 #include "pacha/abi.h"
-#include "pacha/capsule.h"
 #include "pacha/ipc.h"
 #include "pacha/launch.h"
 #include "storage/bootstrap.h"
 #include "storage_boot/boot_config.h"
+#include "../../kobox2_owner/bootfs.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -19,11 +13,6 @@
 #include <string.h>
 
 enum {
-    STORAGE_BOOT_FAKE_FILE_BYTES = 512,
-    STORAGE_BOOT_FAKE_KIOCB_BYTES = 128,
-    STORAGE_BOOT_FAKE_IOV_ITER_BYTES = 128,
-    STORAGE_BOOT_MAX_ROOTFS_ELF_BYTES = 16 * 1024 * 1024,
-    STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES = 1024 * 1024,
     STORAGE_BOOT_PAGE_SIZE = 4096,
     STORAGE_BOOT_USER_ASLR_BASE_VA = 0x0000010000000000ull,
     STORAGE_BOOT_USER_ASLR_END_VA = 0x0000010040000000ull,
@@ -62,117 +51,13 @@ enum {
     STORAGE_BOOT_AT_SECURE = 23,
     STORAGE_BOOT_AT_RANDOM = 25,
     STORAGE_BOOT_AT_EXECFN = 31,
-    STORAGE_BOOT_FD_RIGHT_INSPECT = 1ull << 0,
-    STORAGE_BOOT_FD_RIGHT_TRANSFER = 1ull << 2,
-    STORAGE_BOOT_FD_RIGHT_WAIT = 1ull << 3,
-    STORAGE_BOOT_FD_RIGHT_SET_FLAGS = 1ull << 5,
-    STORAGE_BOOT_FD_RIGHT_CLOSE = 1ull << 6,
-    STORAGE_BOOT_FD_RIGHT_MAP_READ = 1ull << 13,
-    STORAGE_BOOT_FD_RIGHT_MAP_WRITE = 1ull << 14,
-    STORAGE_BOOT_FD_RIGHT_MAP_EXEC = 1ull << 15,
-    STORAGE_BOOT_FD_RIGHT_SPAWN = 1ull << 20,
-    STORAGE_BOOT_FD_RIGHT_START = 1ull << 21,
-    STORAGE_BOOT_FD_RIGHT_KILL = 1ull << 22,
-    STORAGE_BOOT_FD_RIGHT_MAP_INTO = 1ull << 24,
-    STORAGE_BOOT_FD_RIGHT_SET_CONTEXT = 1ull << 25,
-    STORAGE_BOOT_FD_RIGHT_READ = 1ull << 42,
-    STORAGE_BOOT_FD_FCNTL_SET_FLAGS = 2,
-    STORAGE_BOOT_FD_FLAG_INHERIT = 1u << 2,
     STORAGE_BOOT_MMAP_SHARED = 1ull << 3,
     STORAGE_BOOT_PROT_READ = 1ull << 0,
     STORAGE_BOOT_PROT_WRITE = 1ull << 1,
     STORAGE_BOOT_PROT_EXEC = 1ull << 2,
-    STORAGE_BOOT_DENTRY_INODE_OFFSET = 0x30,
-    STORAGE_BOOT_INODE_MAPPING_OFFSET = 0x30,
-    STORAGE_BOOT_NATIVE_FILE_OP_OFFSET = 0x10,
-    STORAGE_BOOT_NATIVE_FILE_MAPPING_OFFSET = 0x18,
-    STORAGE_BOOT_NATIVE_FILE_INODE_OFFSET = 0x28,
-    STORAGE_BOOT_NATIVE_FILE_PATH_DENTRY_OFFSET = 0x48,
-    STORAGE_BOOT_KIOCB_FILE_OFFSET = 0x0,
-    STORAGE_BOOT_KIOCB_POS_OFFSET = 0x8,
-    STORAGE_BOOT_KIOCB_FLAGS_OFFSET = 0x20,
-    STORAGE_BOOT_IOV_ITER_COUNT_OFFSET = 0x18,
-    STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET = 0x20,
-    STORAGE_BOOT_IOV_ITER_BUFFER_CAPACITY_OFFSET = 0x78,
 };
 
-static const char storage_boot_ext4_file[] = "hello.txt";
-static const char storage_boot_seed0root_file[] = "sbin/seed0root.elf";
 static const char storage_boot_seed0root_argv0[] = "/sbin/seed0root.elf";
-static const char storage_boot_filed_file[] = "sbin/filed.elf";
-static const char storage_boot_ext4_initial[] = "storage_boot ext4 initial payload\n";
-static const char storage_boot_ext4_written[] = "storage_boot ext4 write_iter payload\n";
-
-typedef struct storage_boot_ext4_operations {
-    void *dir_operations;
-    void *file_operations;
-    void *dir_inode_operations;
-    void *readdir;
-    void *file_read_iter;
-    void *file_write_iter;
-    void *file_fsync;
-    void *lookup;
-    int file_operations_has_read_iter;
-    int file_operations_has_write_iter;
-    int file_operations_has_fsync;
-    int dir_inode_operations_has_lookup;
-    int dir_operations_has_readdir;
-} storage_boot_ext4_operations_t;
-
-struct storage_boot_module_image {
-    const char *name;
-    unsigned char *data;
-    uint64_t size;
-    int image_fd;
-};
-
-static const char *status_name(kb_status_t status);
-
-int pacha_thread_create(int process_fd, uint64_t entry_rip, uint64_t stack_rsp, uint64_t flags, uint64_t fs_base, uint64_t rights);
-int pacha_thread_start(int thread_fd);
-long pacha_process_map(int process_fd, int vmo_fd, uint64_t target_va, uint64_t size, uint64_t prot, uint64_t vmo_offset);
-int pacha_fd_close(int fd);
-long pacha_fd_read(int fd, void *buf, uint64_t len);
-long pacha_fd_fcntl(int fd, uint64_t cmd, uint64_t arg0, uint64_t arg1);
-int pacha_vmo_create(uint64_t size, uint64_t rights, uint32_t flags);
-void *pacha_mmap(int fd, uint64_t size, uint64_t prot, uint64_t flags, uint64_t offset);
-int pacha_munmap(void *addr, uint64_t size);
-long pacha_getrandom(void *buf, uint64_t len, uint64_t flags);
-
-static void write_pointer_field(void *base, size_t offset, void *value)
-{
-    memcpy((uint8_t *)base + offset, &value, sizeof(value));
-}
-
-static void *read_pointer_field(const void *base, size_t offset)
-{
-    void *value = NULL;
-    memcpy(&value, (const uint8_t *)base + offset, sizeof(value));
-    return value;
-}
-
-static void write_u32_field(void *base, size_t offset, uint32_t value)
-{
-    memcpy((uint8_t *)base + offset, &value, sizeof(value));
-}
-
-static void write_u64_field(void *base, size_t offset, uint64_t value)
-{
-    memcpy((uint8_t *)base + offset, &value, sizeof(value));
-}
-
-static int module_symbol(kb_module_t *module, const char *name, void **out_address)
-{
-    kb_status_t status = kb_module_find_symbol(module, name, out_address);
-    if (status != KB_OK || out_address == NULL || *out_address == NULL) {
-        fprintf(stderr, "[storage_boot] ext4 missing symbol %s status=%s(%d)\n",
-            name,
-            status_name(status),
-            status);
-        return 0;
-    }
-    return 1;
-}
 
 static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, const char *label)
 {
@@ -184,13 +69,13 @@ static int create_inherited_vmo_from_bytes(const void *data, uint64_t size, cons
     }
     const uint64_t map_size = (size + (STORAGE_BOOT_PAGE_SIZE - 1)) & ~(uint64_t)(STORAGE_BOOT_PAGE_SIZE - 1);
     const uint64_t rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_TRANSFER |
-        STORAGE_BOOT_FD_RIGHT_SET_FLAGS |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_READ |
-        STORAGE_BOOT_FD_RIGHT_MAP_READ |
-        STORAGE_BOOT_FD_RIGHT_MAP_WRITE;
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_SET_FLAGS |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_READ |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
     const int fd = pacha_vmo_create(map_size, rights, 0);
     if (fd < 16) {
         fprintf(stderr, "[storage_boot] %s: vmo_create failed status=%d\n", label, fd);
@@ -319,535 +204,6 @@ static uint64_t prot_from_elf_flags(uint32_t flags)
     return prot;
 }
 
-static int table_contains_pointer(const void *table, size_t bytes, const void *target)
-{
-    if (table == NULL || target == NULL || bytes < sizeof(void *)) {
-        return 0;
-    }
-    const uint8_t *cursor = (const uint8_t *)table;
-    for (size_t offset = 0; offset + sizeof(void *) <= bytes; offset += sizeof(void *)) {
-        void *entry = NULL;
-        memcpy(&entry, cursor + offset, sizeof(entry));
-        if (entry == target) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static const char *status_name(kb_status_t status)
-{
-    switch (status) {
-    case KB_OK:
-        return "KB_OK";
-    case KB_ERR_INVALID:
-        return "KB_ERR_INVALID";
-    case KB_ERR_NOT_FOUND:
-        return "KB_ERR_NOT_FOUND";
-    case KB_ERR_DENIED:
-        return "KB_ERR_DENIED";
-    case KB_ERR_NOMEM:
-        return "KB_ERR_NOMEM";
-    case KB_ERR_IO:
-        return "KB_ERR_IO";
-    case KB_ERR_UNSUPPORTED:
-        return "KB_ERR_UNSUPPORTED";
-    case KB_ERR_PCI_CONFIG:
-        return "KB_ERR_PCI_CONFIG";
-    default:
-        return "KB_ERR_UNKNOWN";
-    }
-}
-
-static int probe_ext4_operation_tables(
-    kb_module_t *module,
-    storage_boot_ext4_operations_t *out_ops)
-{
-    if (module == NULL || out_ops == NULL) {
-        return 0;
-    }
-    memset(out_ops, 0, sizeof(*out_ops));
-    if (!module_symbol(module, "ext4_dir_operations", &out_ops->dir_operations) ||
-        !module_symbol(module, "ext4_file_operations", &out_ops->file_operations) ||
-        !module_symbol(module, "ext4_dir_inode_operations", &out_ops->dir_inode_operations) ||
-        !module_symbol(module, "ext4_readdir", &out_ops->readdir) ||
-        !module_symbol(module, "ext4_file_read_iter", &out_ops->file_read_iter) ||
-        !module_symbol(module, "ext4_file_write_iter", &out_ops->file_write_iter) ||
-        !module_symbol(module, "ext4_sync_file", &out_ops->file_fsync) ||
-        !module_symbol(module, "ext4_lookup", &out_ops->lookup))
-    {
-        return 0;
-    }
-
-    out_ops->file_operations_has_read_iter =
-        table_contains_pointer(out_ops->file_operations, 256u, out_ops->file_read_iter);
-    out_ops->file_operations_has_write_iter =
-        table_contains_pointer(out_ops->file_operations, 256u, out_ops->file_write_iter);
-    out_ops->file_operations_has_fsync =
-        table_contains_pointer(out_ops->file_operations, 256u, out_ops->file_fsync);
-    out_ops->dir_inode_operations_has_lookup =
-        table_contains_pointer(out_ops->dir_inode_operations, 256u, out_ops->lookup);
-    out_ops->dir_operations_has_readdir =
-        table_contains_pointer(out_ops->dir_operations, 256u, out_ops->readdir);
-
-    return out_ops->file_operations_has_read_iter &&
-        out_ops->file_operations_has_write_iter &&
-        out_ops->file_operations_has_fsync &&
-        out_ops->dir_inode_operations_has_lookup &&
-        out_ops->dir_operations_has_readdir;
-}
-
-static int ext4_lookup_name_at(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    void *parent_inode,
-    void *parent_dentry,
-    const char *name,
-    void **out_inode,
-    void **out_dentry)
-{
-    if (module == NULL ||
-        ops == NULL ||
-        ops->lookup == NULL ||
-        parent_inode == NULL ||
-        parent_dentry == NULL ||
-        name == NULL ||
-        out_inode == NULL ||
-        out_dentry == NULL)
-    {
-        return -22;
-    }
-    *out_inode = NULL;
-    *out_dentry = NULL;
-
-    void *dentry = kb_fs_subsystem_d_alloc_name(parent_dentry, name);
-    if (dentry == NULL) {
-        return -12;
-    }
-
-    unsigned long old_gs = 0;
-    unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->lookup);
-    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
-    void *(*lookup_fn)(void *, void *, unsigned int) = NULL;
-    memcpy(&lookup_fn, &ops->lookup, sizeof(lookup_fn));
-    void *result = lookup_fn(parent_inode, dentry, 0);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
-
-    (void)result;
-    void *inode = read_pointer_field(dentry, STORAGE_BOOT_DENTRY_INODE_OFFSET);
-    if (inode != NULL) {
-        *out_inode = inode;
-        *out_dentry = dentry;
-        return 0;
-    }
-    kb_fs_subsystem_dput(dentry);
-    return -2;
-}
-
-static int ext4_lookup_root_name(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    const kb_fs_mount_path_probe_t *mount_probe,
-    const char *name,
-    void **out_inode,
-    void **out_dentry)
-{
-    if (mount_probe == NULL || out_inode == NULL || out_dentry == NULL) {
-        return -22;
-    }
-    return ext4_lookup_name_at(
-        module,
-        ops,
-        mount_probe->root_inode,
-        mount_probe->root_dentry,
-        name,
-        out_inode,
-        out_dentry);
-}
-
-static int ext4_lookup_path(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    const kb_fs_mount_path_probe_t *mount_probe,
-    const char *path,
-    void **out_inode)
-{
-    if (mount_probe == NULL || path == NULL || out_inode == NULL) {
-        return -22;
-    }
-    *out_inode = NULL;
-
-    const char *cursor = path;
-    while (*cursor == '/') {
-        cursor++;
-    }
-    if (*cursor == '\0') {
-        *out_inode = mount_probe->root_inode;
-        return 0;
-    }
-
-    void *parent_inode = mount_probe->root_inode;
-    void *parent_dentry = mount_probe->root_dentry;
-    void *owned_parent_dentry = NULL;
-
-    while (*cursor != '\0') {
-        const char *slash = strchr(cursor, '/');
-        const size_t name_len = slash == NULL ? strlen(cursor) : (size_t)(slash - cursor);
-        if (name_len == 0 || name_len >= STORAGE_STACK_MODULE_NAME_BYTES) {
-            kb_fs_subsystem_dput(owned_parent_dentry);
-            return -22;
-        }
-
-        char name[STORAGE_STACK_MODULE_NAME_BYTES];
-        memcpy(name, cursor, name_len);
-        name[name_len] = '\0';
-
-        void *child_inode = NULL;
-        void *child_dentry = NULL;
-        const int status = ext4_lookup_name_at(
-            module,
-            ops,
-            parent_inode,
-            parent_dentry,
-            name,
-            &child_inode,
-            &child_dentry);
-        if (status != 0) {
-            kb_fs_subsystem_dput(owned_parent_dentry);
-            return status;
-        }
-
-        if (owned_parent_dentry != NULL) {
-            kb_fs_subsystem_dput(owned_parent_dentry);
-        }
-        parent_inode = child_inode;
-        parent_dentry = child_dentry;
-        owned_parent_dentry = child_dentry;
-
-        if (slash == NULL) {
-            break;
-        }
-        cursor = slash + 1;
-        while (*cursor == '/') {
-            cursor++;
-        }
-    }
-
-    *out_inode = parent_inode;
-    kb_fs_subsystem_dput(owned_parent_dentry);
-    return 0;
-}
-
-static int ext4_prepare_native_file(
-    const storage_boot_ext4_operations_t *ops,
-    void *inode,
-    void *dentry,
-    void *file)
-{
-    if (ops == NULL || ops->file_operations == NULL || inode == NULL ||
-        dentry == NULL || file == NULL)
-    {
-        return -22;
-    }
-    void *mapping = read_pointer_field(inode, STORAGE_BOOT_INODE_MAPPING_OFFSET);
-    if (mapping == NULL) {
-        return -12;
-    }
-    memset(file, 0, STORAGE_BOOT_FAKE_FILE_BYTES);
-    write_pointer_field(file, STORAGE_BOOT_NATIVE_FILE_OP_OFFSET, ops->file_operations);
-    write_pointer_field(file, STORAGE_BOOT_NATIVE_FILE_MAPPING_OFFSET, mapping);
-    write_pointer_field(file, STORAGE_BOOT_NATIVE_FILE_INODE_OFFSET, inode);
-    write_pointer_field(
-        file,
-        STORAGE_BOOT_NATIVE_FILE_PATH_DENTRY_OFFSET,
-        dentry);
-    return 0;
-}
-
-static int ext4_file_read_iter(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    void *inode,
-    void *dentry,
-    const void *expected,
-    size_t expected_size,
-    uint64_t offset,
-    const char *label)
-{
-    if (module == NULL || ops == NULL || ops->file_read_iter == NULL ||
-        inode == NULL || dentry == NULL || expected == NULL || label == NULL)
-    {
-        return -22;
-    }
-
-    void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
-    void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
-    void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-    size_t read_capacity = expected_size + 1u;
-    if (read_capacity < 4096u) {
-        read_capacity = 4096u;
-    }
-    uint8_t *read_buffer = calloc(1, read_capacity);
-    if (file == NULL || kiocb == NULL || iter == NULL || read_buffer == NULL) {
-        free(read_buffer);
-        free(iter);
-        free(kiocb);
-        free(file);
-        return -12;
-    }
-    const int file_status = ext4_prepare_native_file(ops, inode, dentry, file);
-    if (file_status != 0) {
-        free(read_buffer);
-        free(iter);
-        free(kiocb);
-        free(file);
-        return file_status;
-    }
-    write_pointer_field(kiocb, STORAGE_BOOT_KIOCB_FILE_OFFSET, file);
-    write_u64_field(kiocb, STORAGE_BOOT_KIOCB_POS_OFFSET, offset);
-    write_u32_field(kiocb, STORAGE_BOOT_KIOCB_FLAGS_OFFSET, 0);
-    write_u64_field(iter, STORAGE_BOOT_IOV_ITER_COUNT_OFFSET, (uint64_t)expected_size);
-    write_pointer_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET, read_buffer);
-    write_u64_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_CAPACITY_OFFSET, (uint64_t)read_capacity);
-
-    unsigned long old_gs = 0;
-    unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_read_iter);
-    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
-    long (*read_iter_fn)(void *, void *) = NULL;
-    memcpy(&read_iter_fn, &ops->file_read_iter, sizeof(read_iter_fn));
-    long result = read_iter_fn(kiocb, iter);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
-
-    int ok = result == (long)expected_size &&
-        memcmp(read_buffer, expected, expected_size) == 0;
-
-    free(read_buffer);
-    free(iter);
-    free(kiocb);
-    free(file);
-    return ok ? 0 : -5;
-}
-
-static int ext4_file_read_alloc(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    void *inode,
-    void *dentry,
-    uint64_t offset,
-    size_t max_size,
-    unsigned char **out_data,
-    uint64_t *out_size,
-    const char *label)
-{
-    if (module == NULL || ops == NULL || ops->file_read_iter == NULL ||
-        inode == NULL || dentry == NULL || out_data == NULL || out_size == NULL || label == NULL ||
-        max_size == 0)
-    {
-        return -22;
-    }
-    *out_data = NULL;
-    *out_size = 0;
-
-    void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
-    void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
-    void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-    size_t capacity = max_size < STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES ? max_size : STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES;
-    if (capacity < 4096u) {
-        capacity = 4096u;
-    }
-    unsigned char *read_buffer = malloc(capacity);
-    if (file == NULL || kiocb == NULL || iter == NULL || read_buffer == NULL) {
-        free(read_buffer);
-        free(iter);
-        free(kiocb);
-        free(file);
-        return -12;
-    }
-
-    long (*read_iter_fn)(void *, void *) = NULL;
-    memcpy(&read_iter_fn, &ops->file_read_iter, sizeof(read_iter_fn));
-
-    uint64_t total = 0;
-    for (unsigned chunk_index = 0; chunk_index < 1024 && total < max_size; chunk_index++) {
-        if (total == capacity) {
-            size_t next_capacity = capacity + STORAGE_BOOT_READ_ALLOC_CHUNK_BYTES;
-            if (next_capacity > max_size) {
-                next_capacity = max_size;
-            }
-            unsigned char *next_buffer = realloc(read_buffer, next_capacity);
-            if (next_buffer == NULL) {
-                total = 0;
-                break;
-            }
-            read_buffer = next_buffer;
-            capacity = next_capacity;
-        }
-
-        const uint64_t remaining = max_size - total;
-        const uint64_t available = (uint64_t)capacity - total;
-        uint64_t request_size = remaining < available ? remaining : available;
-        if (request_size > STORAGE_BOOT_PAGE_SIZE) {
-            request_size = STORAGE_BOOT_PAGE_SIZE;
-        }
-        const int file_status = ext4_prepare_native_file(ops, inode, dentry, file);
-        if (file_status != 0) {
-            total = 0;
-            break;
-        }
-        memset(kiocb, 0, STORAGE_BOOT_FAKE_KIOCB_BYTES);
-        memset(iter, 0, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-
-        write_pointer_field(kiocb, STORAGE_BOOT_KIOCB_FILE_OFFSET, file);
-        write_u64_field(kiocb, STORAGE_BOOT_KIOCB_POS_OFFSET, offset + total);
-        write_u32_field(kiocb, STORAGE_BOOT_KIOCB_FLAGS_OFFSET, 0);
-        write_u64_field(iter, STORAGE_BOOT_IOV_ITER_COUNT_OFFSET, request_size);
-        write_pointer_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET, read_buffer + total);
-        write_u64_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_CAPACITY_OFFSET, request_size);
-
-        unsigned long old_gs = 0;
-        unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_read_iter);
-        int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
-        long result = read_iter_fn(kiocb, iter);
-        if (has_gs) {
-            kb_shim_leave_kernel_gs(old_gs);
-        }
-        if (result < 0 && total > 0) {
-            break;
-        }
-        if (result < 0 || (uint64_t)result > request_size) {
-            fprintf(stderr,
-                "[storage_boot] read failed label=%s chunk=%u offset=%llu request=%llu result=%ld total=%llu capacity=%zu\n",
-                label,
-                chunk_index,
-                (unsigned long long)(offset + total),
-                (unsigned long long)request_size,
-                result,
-                (unsigned long long)total,
-                capacity);
-            total = 0;
-            break;
-        }
-        if (result == 0) {
-            break;
-        }
-        total += (uint64_t)result;
-    }
-
-    free(iter);
-    free(kiocb);
-    free(file);
-
-    if (total == 0 || total == max_size) {
-        free(read_buffer);
-        return -5;
-    }
-
-    *out_data = read_buffer;
-    *out_size = total;
-    return 0;
-}
-
-static int ext4_file_write_iter(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    void *inode,
-    void *dentry,
-    const void *payload,
-    size_t payload_size,
-    uint64_t offset,
-    const char *label)
-{
-    if (module == NULL || ops == NULL || ops->file_write_iter == NULL ||
-        inode == NULL || dentry == NULL || payload == NULL || label == NULL)
-    {
-        return -22;
-    }
-
-    void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
-    void *kiocb = calloc(1, STORAGE_BOOT_FAKE_KIOCB_BYTES);
-    void *iter = calloc(1, STORAGE_BOOT_FAKE_IOV_ITER_BYTES);
-    if (file == NULL || kiocb == NULL || iter == NULL) {
-        free(iter);
-        free(kiocb);
-        free(file);
-        return -12;
-    }
-    const int file_status = ext4_prepare_native_file(ops, inode, dentry, file);
-    if (file_status != 0) {
-        free(iter);
-        free(kiocb);
-        free(file);
-        return file_status;
-    }
-    write_pointer_field(kiocb, STORAGE_BOOT_KIOCB_FILE_OFFSET, file);
-    write_u64_field(kiocb, STORAGE_BOOT_KIOCB_POS_OFFSET, offset);
-    write_u32_field(kiocb, STORAGE_BOOT_KIOCB_FLAGS_OFFSET, 0x2u);
-    write_u64_field(iter, STORAGE_BOOT_IOV_ITER_COUNT_OFFSET, (uint64_t)payload_size);
-    write_pointer_field(iter, STORAGE_BOOT_IOV_ITER_BUFFER_OFFSET, (void *)(uintptr_t)payload);
-
-    unsigned long old_gs = 0;
-    unsigned long kernel_gs = kb_module_kernel_gs_for_address(ops->file_write_iter);
-    int has_gs = kernel_gs != 0 && kb_shim_enter_kernel_gs(kernel_gs, &old_gs) == 0;
-    long (*write_iter_fn)(void *, void *) = NULL;
-    memcpy(&write_iter_fn, &ops->file_write_iter, sizeof(write_iter_fn));
-    long result = write_iter_fn(kiocb, iter);
-    if (has_gs) {
-        kb_shim_leave_kernel_gs(old_gs);
-    }
-
-    printf("[storage_boot] ext4 write_iter label=%s offset=%llu result=%ld sample=%.*s\n",
-        label,
-        (unsigned long long)offset,
-        result,
-        result > 0 ? (int)(result < 64 ? result : 64) : 0,
-        (const char *)payload);
-
-    free(iter);
-    free(kiocb);
-    free(file);
-    return result == (long)payload_size ? 0 : -5;
-}
-
-static int ext4_file_fsync(
-    kb_module_t *module,
-    const storage_boot_ext4_operations_t *ops,
-    void *inode,
-    void *dentry,
-    int64_t start,
-    int64_t end,
-    const char *label)
-{
-    if (module == NULL || ops == NULL || ops->file_fsync == NULL ||
-        inode == NULL || dentry == NULL || label == NULL)
-    {
-        return -22;
-    }
-
-    void *file = calloc(1, STORAGE_BOOT_FAKE_FILE_BYTES);
-    if (file == NULL) {
-        return -12;
-    }
-    const int file_status = ext4_prepare_native_file(ops, inode, dentry, file);
-    if (file_status != 0) {
-        free(file);
-        return file_status;
-    }
-    const int result = kb_fs_subsystem_vfs_fsync_range(file, start, end, 0);
-
-    printf("[storage_boot] ext4 fsync label=%s start=%lld end=%lld result=%d\n",
-        label,
-        (long long)start,
-        (long long)end,
-        result);
-
-    free(file);
-    return result == 0 ? 0 : -5;
-}
-
 struct storage_boot_loaded_process {
     int process_fd;
     uint64_t runtime_entry;
@@ -939,12 +295,12 @@ static int map_elf_segment(
     }
 
     const uint64_t vmo_rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_TRANSFER |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_MAP_READ |
-        STORAGE_BOOT_FD_RIGHT_MAP_WRITE |
-        STORAGE_BOOT_FD_RIGHT_MAP_EXEC;
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE |
+        PACHA_FD_RIGHT_MAP_EXEC;
     const int vmo_fd = pacha_vmo_create(map_size, vmo_rights, 0);
     if (vmo_fd < 16) {
         fprintf(stderr, "[storage_boot] exec: vmo_create failed segment=%u status=%d\n", index, vmo_fd);
@@ -1115,6 +471,7 @@ static int apply_elf_relative_relocations_to_window(
     uint64_t min_vaddr,
     uint64_t load_bias)
 {
+    (void)image_size;
     if (image == NULL || window == NULL || load_bias == 0) {
         return 0;
     }
@@ -1211,6 +568,7 @@ static int load_elf_process_single_window(
     uint64_t image_size,
     struct storage_boot_loaded_process *out)
 {
+    (void)path;
     const uint64_t e_entry = rd64(image + 24);
     const uint64_t e_phoff = rd64(image + 32);
     const uint16_t e_phentsize = rd16(image + 54);
@@ -1240,12 +598,12 @@ static int load_elf_process_single_window(
     }
     const uint64_t window_size = max_vaddr - min_vaddr;
     const uint64_t vmo_rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_TRANSFER |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_MAP_READ |
-        STORAGE_BOOT_FD_RIGHT_MAP_WRITE |
-        STORAGE_BOOT_FD_RIGHT_MAP_EXEC;
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE |
+        PACHA_FD_RIGHT_MAP_EXEC;
     const int vmo_fd = pacha_vmo_create(window_size, vmo_rights, 0);
     if (vmo_fd < 16) {
         return -2;
@@ -1366,16 +724,31 @@ static int load_elf_process(
     uint64_t load_bias = 0;
     const int use_aslr = e_type == STORAGE_BOOT_ELF_TYPE_DYN;
     const uint64_t process_rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_WAIT |
-        STORAGE_BOOT_FD_RIGHT_KILL |
-        STORAGE_BOOT_FD_RIGHT_SPAWN |
-        STORAGE_BOOT_FD_RIGHT_MAP_INTO |
-        STORAGE_BOOT_FD_RIGHT_SET_CONTEXT;
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_KILL |
+        PACHA_FD_RIGHT_SPAWN |
+        PACHA_FD_RIGHT_MAP_INTO |
+        PACHA_FD_RIGHT_SET_CONTEXT;
     const int process_fd = pacha_process_create(process_rights, 0, grants, grant_count);
     if (process_fd < 16) {
         fprintf(stderr, "[storage_boot] exec: process_create failed status=%d\n", process_fd);
+        for (uint64_t i = 0; i < grant_count; ++i) {
+            struct pacha_fd_info info;
+            memset(&info, 0, sizeof(info));
+            const int info_status = pacha_fd_get_info((int)grants[i].source_fd, &info);
+            fprintf(stderr,
+                "[storage_boot] exec: grant[%llu] source=%llu target=%llu info=%d kind=%llu actual=0x%llx requested=0x%llx flags=0x%llx\n",
+                (unsigned long long)i,
+                (unsigned long long)grants[i].source_fd,
+                (unsigned long long)grants[i].target_fd,
+                info_status,
+                (unsigned long long)info.kind,
+                (unsigned long long)info.rights,
+                (unsigned long long)grants[i].rights,
+                (unsigned long long)grants[i].flags);
+        }
         return -7;
     }
     out->process_fd = process_fd;
@@ -1464,11 +837,11 @@ static int start_loaded_process(
 
     const int process_fd = loaded->process_fd;
     const uint64_t stack_rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_TRANSFER |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_MAP_READ |
-        STORAGE_BOOT_FD_RIGHT_MAP_WRITE;
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_TRANSFER |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_MAP_READ |
+        PACHA_FD_RIGHT_MAP_WRITE;
     const int stack_fd = pacha_vmo_create(PACHA_PROCESS_DEFAULT_STACK_SIZE, stack_rights, 0);
     if (stack_fd < 16) {
         fprintf(stderr, "[storage_boot] exec: stack vmo_create failed status=%d\n", stack_fd);
@@ -1548,12 +921,12 @@ static int start_loaded_process(
     (void)pacha_fd_close(stack_fd);
 
     const uint64_t thread_rights =
-        STORAGE_BOOT_FD_RIGHT_INSPECT |
-        STORAGE_BOOT_FD_RIGHT_CLOSE |
-        STORAGE_BOOT_FD_RIGHT_WAIT |
-        STORAGE_BOOT_FD_RIGHT_KILL |
-        STORAGE_BOOT_FD_RIGHT_START |
-        STORAGE_BOOT_FD_RIGHT_SET_CONTEXT;
+        PACHA_FD_RIGHT_INSPECT |
+        PACHA_FD_RIGHT_CLOSE |
+        PACHA_FD_RIGHT_WAIT |
+        PACHA_FD_RIGHT_KILL |
+        PACHA_FD_RIGHT_START |
+        PACHA_FD_RIGHT_SET_CONTEXT;
     const int thread_fd = pacha_thread_create(process_fd, loaded->runtime_entry, stack_base + sp, 0, 0, thread_rights);
     if (thread_fd < 16) {
         fprintf(stderr, "[storage_boot] exec: thread_create failed status=%d\n", thread_fd);
@@ -1568,254 +941,21 @@ static int start_loaded_process(
     return 0;
 }
 
-static int run_ext4_file_ops_smoke(kb_module_t *ext4_module, const kb_fs_mount_path_probe_t *probe)
+static int launch_seed0root(const struct storage_boot_config *boot_config,
+    const struct ph_bootfs *archive, const uint8_t root_uuid[16],
+    const uint64_t storage_policy[3])
 {
-    storage_boot_ext4_operations_t ops;
-    if (!probe_ext4_operation_tables(ext4_module, &ops)) {
-        fprintf(stderr, "[storage_boot] ext4 operation table probe failed\n");
-        return 11;
-    }
-
-    void *inode = NULL;
-    void *dentry = NULL;
-    int op_status = ext4_lookup_root_name(
-        ext4_module,
-        &ops,
-        probe,
-        storage_boot_ext4_file,
-        &inode,
-        &dentry);
-    if (op_status != 0) {
-        fprintf(stderr, "[storage_boot] ext4 lookup failed file=%s status=%d\n",
-            storage_boot_ext4_file,
-            op_status);
-        return 12;
-    }
-
-    op_status = ext4_file_read_iter(
-        ext4_module,
-        &ops,
-        inode,
-        dentry,
-        storage_boot_ext4_initial,
-        sizeof(storage_boot_ext4_initial) - 1u,
-        0,
-        "initial");
-    if (op_status != 0) {
-        fprintf(stderr, "[storage_boot] ext4 initial read failed status=%d\n", op_status);
-        kb_fs_subsystem_dput(dentry);
-        return 13;
-    }
-
-    op_status = ext4_file_write_iter(
-        ext4_module,
-        &ops,
-        inode,
-        dentry,
-        storage_boot_ext4_written,
-        sizeof(storage_boot_ext4_written) - 1u,
-        0,
-        "overwrite");
-    if (op_status != 0) {
-        fprintf(stderr, "[storage_boot] ext4 write failed status=%d\n", op_status);
-        kb_fs_subsystem_dput(dentry);
-        return 14;
-    }
-
-    op_status = ext4_file_fsync(
-        ext4_module,
-        &ops,
-        inode,
-        dentry,
-        0,
-        (int64_t)(sizeof(storage_boot_ext4_written) - 2u),
-        "overwrite");
-    if (op_status != 0) {
-        fprintf(stderr, "[storage_boot] ext4 fsync failed status=%d\n", op_status);
-        kb_fs_subsystem_dput(dentry);
-        return 15;
-    }
-
-    op_status = ext4_file_read_iter(
-        ext4_module,
-        &ops,
-        inode,
-        dentry,
-        storage_boot_ext4_written,
-        sizeof(storage_boot_ext4_written) - 1u,
-        0,
-        "post-write");
-    if (op_status != 0) {
-        fprintf(stderr, "[storage_boot] ext4 post-write read failed status=%d\n", op_status);
-        kb_fs_subsystem_dput(dentry);
-        return 16;
-    }
-
-    kb_fs_subsystem_dput(dentry);
-    printf("[storage_boot] ext4 rootfs read/write OK\n");
-    return 0;
-}
-
-static void free_bootstrap_module_images(struct storage_boot_module_image *images, size_t count)
-{
-    if (images == NULL) {
-        return;
-    }
-    for (size_t i = 0; i < count; i++) {
-        free(images[i].data);
-        images[i].data = NULL;
-        images[i].size = 0;
-        if (images[i].image_fd >= 16) {
-            (void)pacha_fd_close(images[i].image_fd);
-            images[i].image_fd = -1;
-        }
-    }
-}
-
-static int launch_seed0root_from_ext4(
-    kb_module_t *ext4_module,
-    const kb_fs_mount_path_probe_t *probe,
-    uint64_t device_fd,
-    uint64_t ready_channel_fd,
-    uint64_t service_ready_channel_fd,
-    const struct storage_boot_module_image *module_images,
-    size_t module_count)
-{
-    if (ready_channel_fd < 16 ||
-        service_ready_channel_fd < 16 ||
-        module_images == NULL ||
-        module_count == 0 ||
-        module_count > STORAGE_STACK_MODULE_CAPACITY) {
-        return 21;
-    }
-    storage_boot_ext4_operations_t ops;
-    if (!probe_ext4_operation_tables(ext4_module, &ops)) {
-        fprintf(stderr, "[storage_boot] seed0root: ext4 operation table probe failed\n");
-        return 21;
-    }
-
-    void *sbin_inode = NULL;
-    void *sbin_dentry = NULL;
-    int status = ext4_lookup_name_at(
-        ext4_module,
-        &ops,
-        probe->root_inode,
-        probe->root_dentry,
-        "sbin",
-        &sbin_inode,
-        &sbin_dentry);
-    if (status != 0) {
-        fprintf(stderr, "[storage_boot] seed0root: lookup /sbin failed status=%d\n", status);
-        return 22;
-    }
-    fprintf(stderr, "[storage_boot] seed0root: lookup /sbin ok dentry=%p inode=%p\n", sbin_dentry, sbin_inode);
-
-    void *seed_inode = NULL;
-    void *seed_dentry = NULL;
-    status = ext4_lookup_name_at(
-        ext4_module,
-        &ops,
-        sbin_inode,
-        sbin_dentry,
-        "seed0root.elf",
-        &seed_inode,
-        &seed_dentry);
-    if (status != 0) {
-        kb_fs_subsystem_dput(sbin_dentry);
-        fprintf(stderr, "[storage_boot] seed0root: lookup %s failed status=%d\n",
-            storage_boot_seed0root_file,
-            status);
-        return 23;
-    }
-    fprintf(stderr, "[storage_boot] seed0root: lookup seed ok dentry=%p inode=%p\n", seed_dentry, seed_inode);
-
-    void *filed_inode = NULL;
-    void *filed_dentry = NULL;
-    status = ext4_lookup_name_at(
-        ext4_module,
-        &ops,
-        sbin_inode,
-        sbin_dentry,
-        "filed.elf",
-        &filed_inode,
-        &filed_dentry);
-    if (status != 0) {
-        kb_fs_subsystem_dput(seed_dentry);
-        kb_fs_subsystem_dput(sbin_dentry);
-        fprintf(stderr, "[storage_boot] seed0root: lookup %s failed status=%d\n",
-            storage_boot_filed_file,
-            status);
-        return 27;
-    }
-    fprintf(stderr, "[storage_boot] seed0root: lookup filed ok dentry=%p inode=%p\n", filed_dentry, filed_inode);
-
-    unsigned char *image = NULL;
-    uint64_t image_size = 0;
-    status = ext4_file_read_alloc(
-        ext4_module,
-        &ops,
-        seed_inode,
-        seed_dentry,
-        0,
-        STORAGE_BOOT_MAX_ROOTFS_ELF_BYTES,
-        &image,
-        &image_size,
-        "seed0root");
-    if (status != 0) {
-        kb_fs_subsystem_dput(filed_dentry);
-        kb_fs_subsystem_dput(seed_dentry);
-        kb_fs_subsystem_dput(sbin_dentry);
-        fprintf(stderr, "[storage_boot] seed0root: read %s failed status=%d\n",
-            storage_boot_seed0root_file,
-            status);
-        return 24;
-    }
-    unsigned char *filed_image = NULL;
-    uint64_t filed_image_size = 0;
-    status = ext4_file_read_alloc(
-        ext4_module,
-        &ops,
-        filed_inode,
-        filed_dentry,
-        0,
-        STORAGE_BOOT_MAX_ROOTFS_ELF_BYTES,
-        &filed_image,
-        &filed_image_size,
-        "filed");
-    if (status != 0) {
-        free(image);
-        kb_fs_subsystem_dput(filed_dentry);
-        kb_fs_subsystem_dput(seed_dentry);
-        kb_fs_subsystem_dput(sbin_dentry);
-        fprintf(stderr, "[storage_boot] seed0root: read %s failed status=%d\n",
-            storage_boot_filed_file,
-            status);
-        return 28;
-    }
-    kb_fs_subsystem_dput(filed_dentry);
-    kb_fs_subsystem_dput(seed_dentry);
-    kb_fs_subsystem_dput(sbin_dentry);
+    const unsigned char *image = NULL, *filed_image = NULL;
+    size_t image_size = 0, filed_image_size = 0;
+    int status = ph_bootfs_find(archive, "/sbin/seed0root.elf", &image, &image_size);
+    if (!status) status = ph_bootfs_find(archive, "/sbin/filed.elf", &filed_image, &filed_image_size);
+    if (status || !image_size || !filed_image_size) return status ? status : -22;
     const int filed_image_fd = create_inherited_vmo_from_bytes(filed_image, filed_image_size, "filed.elf");
-    if (filed_image_fd < 16) {
-        free(image);
-        free(filed_image);
-        return 28;
-    }
-
-    storage_module_image_desc_t module_table[module_count];
-    memset(module_table, 0, sizeof(module_table));
-    for (size_t i = 0; i < module_count; i++) {
-        if (module_images[i].name == NULL || module_images[i].image_fd < 16 || module_images[i].size == 0) {
-            free(image);
-            free(filed_image);
-            (void)pacha_fd_close(filed_image_fd);
-            return 30;
-        }
-        snprintf(module_table[i].name, sizeof(module_table[i].name), "%s", module_images[i].name);
-        module_table[i].image_fd = (uint64_t)(uint32_t)module_images[i].image_fd;
-        module_table[i].image_size = module_images[i].size;
-    }
-
+    if (filed_image_fd < 16) return filed_image_fd;
+    const uint64_t device_fd = boot_config->device_fd;
+    const uint64_t ready_channel_fd = boot_config->ready_channel_fd;
+    const uint64_t service_ready_channel_fd = boot_config->root_handoff_channel_fd;
+    const uint64_t power_channel_fd = boot_config->power_channel_fd;
     const storage_seed0root_bootstrap_t bootstrap = {
         .magic = STORAGE_SEED0ROOT_BOOTSTRAP_MAGIC,
         .device_fd = device_fd,
@@ -1823,20 +963,28 @@ static int launch_seed0root_from_ext4(
         .service_ready_channel_fd = service_ready_channel_fd,
         .filed_image_fd = (uint64_t)(uint32_t)filed_image_fd,
         .filed_image_size = filed_image_size,
-        .module_count = module_count,
+        .bootfs_fd = boot_config->bootfs_fd,
+        .bootfs_size = boot_config->bootfs_size,
+        .sandbox_ram_bytes = storage_policy[0],
+        .queue_size = storage_policy[1],
+        .queue_arena_bytes = storage_policy[2],
+        .power_channel_fd = power_channel_fd,
+        .framebuffer_paddr = boot_config->framebuffer_paddr,
+        .framebuffer_size = boot_config->framebuffer_size,
+        .framebuffer_width = boot_config->framebuffer_width,
+        .framebuffer_height = boot_config->framebuffer_height,
+        .framebuffer_pitch = boot_config->framebuffer_pitch,
     };
     storage_seed0root_bootstrap_t bootstrap_package = bootstrap;
-    memcpy(bootstrap_package.modules, module_table, sizeof(module_table));
-    free(filed_image);
+    memcpy(bootstrap_package.root_uuid, root_uuid, 16);
     const int bootstrap_fd = create_inherited_vmo_from_bytes(&bootstrap_package, sizeof(bootstrap_package), "seed0root bootstrap fd");
     if (bootstrap_fd < 16) {
-        free(image);
         (void)pacha_fd_close(filed_image_fd);
         return 32;
     }
 
     struct storage_boot_loaded_process loaded;
-    struct pacha_process_fd_grant grants[7 + STORAGE_STACK_MODULE_CAPACITY] = {
+    struct pacha_process_fd_grant grants[9] = {
         PACHA_LAUNCH_LOG_GRANTS(PACHA_FD_RIGHT_TRANSFER),
         PACHA_LAUNCH_GRANT(device_fd, device_fd,
             PACHA_LAUNCH_DEVICE_DRIVER | PACHA_FD_RIGHT_TRANSFER),
@@ -1845,15 +993,13 @@ static int launch_seed0root_from_ext4(
             PACHA_LAUNCH_SERVER | PACHA_LAUNCH_SIGNAL),
         PACHA_LAUNCH_GRANT(filed_image_fd, filed_image_fd, PACHA_LAUNCH_BLOB),
         PACHA_LAUNCH_GRANT(bootstrap_fd, bootstrap_fd, PACHA_LAUNCH_BLOB),
+        PACHA_LAUNCH_GRANT(power_channel_fd, power_channel_fd,
+            PACHA_LAUNCH_CLIENT | PACHA_FD_RIGHT_TRANSFER),
+        PACHA_LAUNCH_GRANT(boot_config->bootfs_fd, boot_config->bootfs_fd,
+            PACHA_LAUNCH_BLOB | PACHA_FD_RIGHT_TRANSFER),
     };
-    for (size_t i = 0; i < module_count; ++i) {
-        grants[7 + i] = (struct pacha_process_fd_grant)PACHA_LAUNCH_GRANT(
-            module_images[i].image_fd, module_images[i].image_fd,
-            PACHA_LAUNCH_BLOB | PACHA_FD_RIGHT_TRANSFER);
-    }
     status = load_elf_process(storage_boot_seed0root_argv0, image, image_size,
-        grants, 7 + module_count, &loaded);
-    free(image);
+        grants, 9, &loaded);
     if (status != 0) {
         (void)pacha_fd_close(bootstrap_fd);
         (void)pacha_fd_close(filed_image_fd);
@@ -1871,261 +1017,42 @@ static int launch_seed0root_from_ext4(
     return 0;
 }
 
-static int load_modules(
-    const struct storage_boot_config *cfg,
-    kb_device_backend_t *backend,
-    kb_module_t **out_ext4_module,
-    struct storage_boot_module_image *out_seed0root_modules,
-    size_t out_seed0root_module_count)
-{
-    kb_module_t *modules[STORAGE_STACK_MODULE_CAPACITY];
-    memset(modules, 0, sizeof(modules));
-    if (out_ext4_module != NULL) {
-        *out_ext4_module = NULL;
-    }
-    const uint64_t module_count = STORAGE_STACK_MODULE_COUNT;
-    if (out_seed0root_modules != NULL && out_seed0root_module_count < module_count) {
-        return 4;
-    }
-    for (uint64_t i = 0; i < module_count; i++) {
-        const storage_stack_module_spec_t *module_spec = &storage_stack_modules[i];
-        unsigned char *module_bytes = NULL;
-        uint64_t module_size = 0;
-        if (storage_bootfs_read_file((int)cfg->bootfs_fd, cfg->bootfs_size,
-                module_spec->bootfs_path, &module_bytes, &module_size) != 0 ||
-            module_bytes == NULL || module_size == 0) {
-            fprintf(stderr, "[storage_boot] bootfs module read failed path=%s\n",
-                module_spec->bootfs_path);
-            return 4;
-        }
-        if (out_seed0root_modules != NULL) {
-            out_seed0root_modules[i].name = module_spec->name;
-            out_seed0root_modules[i].data = NULL;
-            out_seed0root_modules[i].size = module_size;
-            out_seed0root_modules[i].image_fd = create_inherited_vmo_from_bytes(
-                module_bytes,
-                module_size,
-                module_spec->name);
-            if (out_seed0root_modules[i].image_fd < 16) {
-                free(module_bytes);
-                return 4;
-            }
-        }
-        const kb_module_image_t image = {
-            .data = module_bytes,
-            .size = (size_t)module_size,
-            .name = module_spec->name,
-        };
-        kb_status_t status = kb_module_open_image(&image, backend, &modules[i]);
-        if (status != KB_OK || modules[i] == NULL) {
-            fprintf(stderr, "[storage_boot] %s open failed status=%s(%d)\n",
-                module_spec->name,
-                status_name(status),
-                status);
-            free(module_bytes);
-            return 4;
-        }
-        if (out_ext4_module != NULL && module_spec->id == STORAGE_STACK_MODULE_EXT4) {
-            *out_ext4_module = modules[i];
-        }
-
-        int init_result = 0;
-        printf("[storage_boot] module starting name=%s source=bootfs\n", module_spec->name);
-        status = kb_module_call_init(modules[i], &init_result);
-        if (status == KB_ERR_NOT_FOUND &&
-            (module_spec->flags & STORAGE_STACK_MODULE_FLAG_ALLOW_MISSING_INIT) != 0) {
-            printf("[storage_boot] module ready name=%s init=missing\n", module_spec->name);
-            continue;
-        }
-        if (status != KB_OK || init_result != 0) {
-            fprintf(stderr,
-                "[storage_boot] %s init failed status=%s(%d) result=%d\n",
-                module_spec->name,
-                status_name(status),
-                status,
-                init_result);
-            return 5;
-        }
-        printf("[storage_boot] module ready name=%s\n", module_spec->name);
-    }
-    return 0;
-}
-
-static void *wait_for_first_disk(int device_fd)
-{
-    struct pacha_capsule_irq wake_irq;
-    memset(&wake_irq, 0, sizeof(wake_irq));
-    if (pacha_capsule_device_derive_irq(
-            device_fd, PACHA_CAPSULE_IRQ_AUTO, 0, 0, &wake_irq) != 0)
-        return NULL;
-    const uint64_t timer_rights = PACHA_FD_RIGHT_INSPECT |
-        PACHA_FD_RIGHT_WAIT | PACHA_FD_RIGHT_POLL |
-        PACHA_FD_RIGHT_CLOSE | PACHA_FD_RIGHT_READ;
-    const int deadline_fd = pacha_timerfd_create(
-        2048000000ull, 0, timer_rights, PACHA_FD_FLAG_CLOEXEC);
-    if (deadline_fd < 16) {
-        (void)pacha_fd_close(wake_irq.fd);
-        return NULL;
-    }
-
-    for (;;) {
-        kb_run_deferred_work();
-        (void)kb_handle_any_irq(0);
-        void *disk = kb_block_subsystem_first_registered_disk();
-        if (disk != NULL) {
-            (void)pacha_fd_close(deadline_fd);
-            (void)pacha_fd_close(wake_irq.fd);
-            return disk;
-        }
-        struct pacha_pollfd waits[2] = {
-            {
-                .fd = wake_irq.fd,
-                .events = PACHA_FD_EVENT_READABLE,
-            },
-            {
-                .fd = deadline_fd,
-                .events = PACHA_FD_EVENT_READABLE,
-            },
-        };
-        if (pacha_fd_wait_many(waits, 2, PACHA_FD_WAIT_FOREVER) < 0)
-            break;
-        if ((waits[1].revents & PACHA_FD_EVENT_READABLE) != 0)
-            break;
-        uint64_t next_count = 0;
-        if (pacha_capsule_irq_poll(
-                wake_irq.fd, wake_irq.count, &next_count) == 0)
-            wake_irq.count = next_count;
-    }
-    (void)pacha_fd_close(deadline_fd);
-    (void)pacha_fd_close(wake_irq.fd);
-    return NULL;
-}
-
 int main(int argc, char **argv)
 {
     (void)argc;
-
     int bootstrap_fd = -1;
-    if (find_bootstrap_fd(argv, &bootstrap_fd) != 0) {
-        fprintf(stderr, "[storage_boot] bootstrap fd missing\n");
-        return 2;
-    }
-    struct storage_boot_config cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    if (read_fd_exact(bootstrap_fd, &cfg, sizeof(cfg), "boot config") != 0 ||
-        cfg.magic != STORAGE_BOOT_CONFIG_MAGIC ||
-        cfg.version != STORAGE_BOOT_CONFIG_VERSION ||
-        cfg.device_fd < 16 ||
-        cfg.ready_channel_fd < 16 ||
-        cfg.root_handoff_channel_fd < 16 ||
-        cfg.bootfs_fd < 16 || cfg.bootfs_size < 104) {
-        fprintf(stderr,
-            "[storage_boot] invalid boot config magic=0x%llx version=%llu fd=%llu ready_fd=%llu handoff_fd=%llu bootfs_fd=%llu size=%llu\n",
-            (unsigned long long)cfg.magic,
-            (unsigned long long)cfg.version,
-            (unsigned long long)cfg.device_fd,
-            (unsigned long long)cfg.ready_channel_fd,
-            (unsigned long long)cfg.root_handoff_channel_fd,
-            (unsigned long long)cfg.bootfs_fd,
-            (unsigned long long)cfg.bootfs_size);
-        return 2;
-    }
+    if (find_bootstrap_fd(argv, &bootstrap_fd)) return 2;
+    struct storage_boot_config config = {0};
+    int error = read_fd_exact(bootstrap_fd, &config, sizeof(config), "boot config");
     (void)pacha_fd_close(bootstrap_fd);
-
-    const uint64_t module_count = STORAGE_STACK_MODULE_COUNT;
-    printf("[storage_boot] start modules=%llu source=bootfs\n",
-        (unsigned long long)module_count);
-
-    kb_device_backend_t *backend = NULL;
-    kb_status_t status = kb_pachaos_capsule_device_create(cfg.device_fd, &backend);
-    if (status != KB_OK || backend == NULL) {
-        fprintf(stderr, "[storage_boot] device backend create failed status=%s(%d)\n",
-            status_name(status),
-            status);
-        return 3;
+    if (error || config.magic != STORAGE_BOOT_CONFIG_MAGIC ||
+        config.size != sizeof(config) || config.device_fd < 16 ||
+        config.ready_channel_fd < 16 || config.root_handoff_channel_fd < 16 ||
+        config.power_channel_fd < 16 || config.bootfs_fd < 16) return 2;
+    struct ph_bootfs archive = {0};
+    error = ph_bootfs_open(&archive, (int)config.bootfs_fd, config.bootfs_size);
+    const unsigned char *bytes = NULL;
+    size_t size = 0;
+    uint8_t root_uuid[16];
+    uint64_t policy[3] = {0};
+    if (!error) error = ph_bootfs_find(&archive, "/etc/pacha/root-uuid", &bytes, &size);
+    if (!error && size == sizeof(root_uuid)) memcpy(root_uuid, bytes, sizeof(root_uuid));
+    else if (!error) error = -22;
+    if (!error && !storage_root_uuid_valid(root_uuid)) error = -22;
+    if (!error) error = ph_bootfs_find(&archive, "/etc/pacha/storage-policy", &bytes, &size);
+    if (!error && size != 24) error = -22;
+    if (!error) {
+        for (unsigned i = 0; i < 3; ++i) policy[i] = rd64(bytes + i * 8);
+        if (!policy[0] || policy[1] < 2 || policy[1] > 32768 ||
+            (policy[1] & (policy[1] - 1)) || !policy[2]) error = -22;
     }
-
-    kb_module_t *ext4_module = NULL;
-    struct storage_boot_module_image seed0root_modules[STORAGE_STACK_MODULE_CAPACITY];
-    memset(seed0root_modules, 0, sizeof(seed0root_modules));
-    int load_status = load_modules(
-        &cfg,
-        backend,
-        &ext4_module,
-        seed0root_modules,
-        STORAGE_STACK_MODULE_CAPACITY);
-    if (load_status != 0) {
-        free_bootstrap_module_images(seed0root_modules, module_count);
-        return load_status;
-    }
-    (void)pacha_fd_fcntl((int)cfg.bootfs_fd, STORAGE_BOOT_FD_FCNTL_SET_FLAGS,
-        0, STORAGE_BOOT_FD_FLAG_INHERIT);
-    (void)pacha_fd_close((int)cfg.bootfs_fd);
-    if (ext4_module == NULL) {
-        fprintf(stderr, "[storage_boot] ext4 module was not loaded\n");
-        free_bootstrap_module_images(seed0root_modules, module_count);
-        return 5;
-    }
-
-    printf("[storage_boot] modules ready\n");
-    kb_shim_set_device_backend(backend);
-    void *disk = wait_for_first_disk((int)cfg.device_fd);
-    if (disk == NULL) {
-        fprintf(stderr, "[storage_boot] NVMe module stack registered no disk\n");
-        return 6;
-    }
-
-    unsigned char sector[512];
-    memset(sector, 0, sizeof(sector));
-    int read_status = kb_block_subsystem_disk_read(disk, 0, sector, sizeof(sector));
-    if (read_status != 0) {
-        fprintf(stderr, "[storage_boot] NVMe disk read sector0 failed status=%d\n", read_status);
-        return 7;
-    }
-    printf("[storage_boot] disk ready\n");
-
-    kb_fs_block_device_t *root_device = NULL;
-    int fs_status = kb_fs_block_device_create_from_disk_gpt_partition(
-        STORAGE_STACK_ROOT_DEVICE_NAME,
-        disk,
-        STORAGE_STACK_ROOTFS_GPT_PARTITION_INDEX,
-        &root_device);
-    if (fs_status != 0 || root_device == NULL) {
-        fprintf(stderr, "[storage_boot] rootfs block device create failed status=%d\n", fs_status);
-        return 8;
-    }
-    fs_status = kb_fs_subsystem_set_mount_probe_block_device(root_device);
-    if (fs_status != 0) {
-        fprintf(stderr, "[storage_boot] rootfs mount probe device set failed status=%d\n", fs_status);
-        return 9;
-    }
-
-    kb_fs_mount_path_probe_t probe;
-    memset(&probe, 0, sizeof(probe));
-    fs_status = kb_fs_subsystem_probe_registered_mount_path("ext4", &probe);
-    (void)fs_status;
-    if (probe.fill_super_result != 0 || probe.observed_ext4_magic != 0xef53u) {
-        fprintf(stderr, "[storage_boot] ext4 rootfs probe failed\n");
-        return 10;
-    }
-
-    printf("[storage_boot] rootfs ready fs=ext4 reads=%u\n", probe.block_read_count);
-
-    int seed0root_status = launch_seed0root_from_ext4(
-        ext4_module,
-        &probe,
-        cfg.device_fd,
-        cfg.ready_channel_fd,
-        cfg.root_handoff_channel_fd,
-        seed0root_modules,
-        module_count);
-    free_bootstrap_module_images(seed0root_modules, module_count);
-    if (seed0root_status != 0) {
-        return seed0root_status;
-    }
-
-    printf("[storage_boot] done\n");
-    fflush(stdout);
-    fflush(stderr);
-    return 0;
+    /* Linux selects the UUID among the authorized PCI descendants. The
+     * bootstrap loader neither opens a disk nor guesses a GPT partition. */
+    if (!error) error = launch_seed0root(&config, &archive, root_uuid, policy);
+    int closed = ph_bootfs_close(&archive);
+    (void)pacha_fd_close((int)config.bootfs_fd);
+    if (!error) error = closed;
+    if (error) fprintf(stderr, "[storage_boot] bootfs launch failed status=%d\n", error);
+    else puts("[storage_boot] bootfs root launcher done");
+    return error ? 3 : 0;
 }
