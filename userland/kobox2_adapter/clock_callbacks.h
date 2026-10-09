@@ -3,6 +3,7 @@
 #define PACHA_KOBOX_CLOCK_CALLBACKS_H
 
 #include "arch/x86_64/fp_entry.h"
+#include "tail_trace.h"
 
 /* Linux may call these with its legacy FP bank live. The native syscall
  * retains that bank across signals and scheduling; every C entry and the
@@ -81,7 +82,10 @@ static KOBOX_GPR_LEAF int monotonic(uint64_t *nanoseconds) {
 #if !defined(PH_CLOCK_TIMESPEC_BENCH)
     if (!clock_page_monotonic(nanoseconds)) return 0;
 #endif
-    return clock_ns(PACHA_TIMERFD_CLOCK_MONOTONIC, nanoseconds);
+    uint64_t tail_begin = ph_tail_begin();
+    int status = clock_ns(PACHA_TIMERFD_CLOCK_MONOTONIC, nanoseconds);
+    ph_tail_end(5, PACHA_TIMERFD_CLOCK_MONOTONIC, tail_begin);
+    return status;
 }
 
 /* Map the kernel clock page read-only. Failure is not an error: reads keep

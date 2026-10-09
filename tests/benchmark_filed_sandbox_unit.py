@@ -8,6 +8,19 @@ from benchmark_filed_sandbox import (check_runtime_flags, parse, parse_guards, p
 
 
 class BenchTest(unittest.TestCase):
+    def test_matched_all_task_counts_are_complete(self):
+        marker = 'FS_MATCHED_SWITCHES all=2010\n'
+        text = ('FS_MATCHED_BENCH owned=1 scope=1 recycle=1 inline=0\n' +
+                self.fixture().replace('task_ns=500000000\n',
+                                       'task_ns=500000000\n' + marker))
+        opcodes = {24: 'stat', 19: 'pread', 21: 'pwrite'}
+        rows = parse(text, opcodes)
+        self.assertEqual(len(rows), 54)
+        self.assertEqual(summarize(rows)['ext4']['stat']['0']['all_linux_task_switches_per_op'], 2.01)
+        for bad in (text.replace(marker, '', 1), text.replace(marker, marker * 2, 1)):
+            with self.assertRaises(RuntimeError):
+                parse(bad, opcodes)
+
     def test_private_executor_requires_worker_control_and_no_owner_reclaim(self):
         text = ''.join(
             f'FS_INTERNAL_PUBLICATION fs={fs} opcode={opcode} depth={depth} '

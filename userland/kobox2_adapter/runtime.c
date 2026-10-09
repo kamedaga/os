@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Minimal support for the freestanding sandbox launcher, not Linux primitives. */
 #include "host.h"
+#include "tail_trace.h"
 #include <elf.h>
 
 /* Native init is relocated before normal C initialization. Do not use globals
@@ -172,6 +173,7 @@ void ph_free(void *base, size_t size) {
 }
 
 void ph_wait(atomic_uint *word, unsigned expected) {
+    uint64_t tail_begin = ph_tail_begin();
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
     struct ph_task *task = ph_current_task();
     uint64_t previous_wait = atomic_load_explicit(&task->diagnostic_wait_word,
@@ -185,6 +187,7 @@ void ph_wait(atomic_uint *word, unsigned expected) {
 #endif
     long result = pacha_syscall3(PACHA_RUNTIME_SYSCALL_FUTEX_WAIT,
         (uintptr_t)word, expected, 0);
+    ph_tail_end(2, (uintptr_t)word, tail_begin);
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
     /* A native notification may perform a nested wait on this same thread. */
     atomic_store_explicit(&task->diagnostic_wait_expected, previous_expected, memory_order_relaxed);
@@ -214,9 +217,11 @@ void ph_lock(atomic_uint *lock) {
     /* Keep state 2 when acquiring after contention, so our unlock also wakes
      * sleepers left behind by another owner. The futex expected-value check
      * handles release between publishing state 2 and entering the kernel. */
+    uint64_t tail_begin = ph_tail_begin();
     while (atomic_exchange_explicit(lock, 2, memory_order_acquire) != 0) {
         ph_wait(lock, 2);
     }
+    ph_tail_end(1, (uintptr_t)lock, tail_begin);
 }
 
 void ph_unlock(atomic_uint *lock) {

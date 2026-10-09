@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "boot.h"
 #include "host.h"
+#include "tail_trace.h"
 #ifndef PH_SANDBOX_AMDGPU
 #define PH_SANDBOX_AMDGPU 0
 #endif
@@ -343,6 +344,7 @@ void ph_boot_log_irq_ready(unsigned long received,
 static void console_write(void *context, const char *text, size_t length) {
     (void)context;
     (void)pacha_syscall2(1, (uintptr_t)text, length);
+    ph_tail_console(text, length);
 #if PH_SANDBOX_AMDGPU
     gpu_log_copy(text, length);
 #endif

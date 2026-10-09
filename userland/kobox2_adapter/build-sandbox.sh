@@ -22,6 +22,7 @@ fs_profile=0
 fs_owner_publish=0
 cache_preflight=0
 no_clock_page=0
+tail_trace=0
 for argument in "$@"; do
   case "$argument" in
     --foundation-gates) gates=1 ;;
@@ -39,6 +40,7 @@ for argument in "$@"; do
     --amdgpu) amdgpu=1 ;;
     --cache-preflight) cache_preflight=1 ;;
     --no-clock-page) no_clock_page=1 ;;
+    --tail-trace) tail_trace=1 ;;
     *) echo "Unknown sandbox build argument: $argument" >&2; exit 2 ;;
   esac
 done
@@ -76,6 +78,11 @@ if [[ "$dma_profile" == 1 ]]; then
 fi
 if [[ "$scheduler_diagnostic" == 1 ]]; then
   flags+=(-DPH_SCHED_DIAGNOSTIC=1)
+fi
+if [[ "$tail_trace" == 1 ]]; then
+  if [[ "$filesystem" != 1 ]]; then echo '--tail-trace requires --storage' >&2; exit 2; fi
+  flags+=(-DPH_TAIL_TRACE=1)
+  sources+=("$adapter/tail_trace.c")
 fi
 if [[ "$fs_profile" == 1 ]]; then
   if [[ "$filesystem" != 1 ]]; then echo '--fs-profile requires --storage' >&2; exit 2; fi

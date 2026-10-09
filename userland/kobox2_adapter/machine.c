@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "host.h"
+#include "tail_trace.h"
 #include "owner_wait.h"
 #include "arch/x86_64/fp_entry.h"
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
@@ -330,7 +331,9 @@ void ph_dispatch_notifications(void) {
         struct ph_cpu *entered_cpu = cpu;
         atomic_fetch_add_explicit(&entered_cpu->diagnostic_callbacks, 1, memory_order_relaxed);
 #endif
+        uint64_t tail_begin = ph_tail_begin();
         linux_notification_dispatch((uint32_t)index, linux_kinds[kind], count);
+        ph_tail_end(3, (uintptr_t)kind, tail_begin);
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
         atomic_fetch_add_explicit(&entered_cpu->diagnostic_callback_returns, 1, memory_order_relaxed);
 #endif
@@ -384,8 +387,10 @@ static int clockevent_arm(uint32_t index, uint64_t deadline_ns) {
     PH_OK(ph_notifications_save(&previous_mask));
     ph_lock(&cpu->timer_lock);
     cpu->deadline_ns = deadline_ns;
+    uint64_t tail_begin = ph_tail_begin();
     PH_OK(pacha_syscall4(PACHA_FD_SYSCALL_TIMERFD_SETTIME, cpu->timer_fd,
         PACHA_TIMERFD_ABSTIME, (uintptr_t)timer_spec, 0));
+    ph_tail_end(4, index, tail_begin);
     ph_unlock(&cpu->timer_lock);
 #if defined(PH_SCHED_DIAGNOSTIC) && PH_SCHED_DIAGNOSTIC
     atomic_fetch_add_explicit(&cpu->diagnostic_timer_arms, 1, memory_order_relaxed);

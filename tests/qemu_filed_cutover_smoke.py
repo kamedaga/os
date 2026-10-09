@@ -164,6 +164,9 @@ def smoke(args, disk, boot_image):
         "-chardev", f"socket,id=virtcon0,path={console},server=on,wait=off",
         "-device", "virtio-serial-pci,disable-legacy=on,iommu_platform=on,id=virtserial0",
         "-device", "virtconsole,chardev=virtcon0,name=org.pachaos.console.0"]
+    if getattr(args, 'nvme_trace', None):
+        command += ['-trace', f'events={args.nvme_trace.resolve()},file={args.out / "nvme-trace.log"}',
+                    '-msg', 'timestamp=on']
     (args.out / "pacha-command.json").write_text(json.dumps(command, indent=2) + "\n")
     guest = CutoverGuest(command, args.out / "pacha.log")
     try:
@@ -267,6 +270,8 @@ def main():
         help="stage boot image/fixtures but do not run any guest")
     parser.add_argument("--sandbox-bench-only", action="store_true",
         help="boot existing prepared COW; stop after mount-time sandbox benchmark, no client workloads")
+    parser.add_argument("--nvme-trace", type=Path,
+        help="diagnostic QEMU event list; trace output is saved separately from the guest transcript")
     parser.add_argument("--native-smoke", action="store_true",
         help="run the explicitly installed native filed ABI fixture before shell startup")
     parser.add_argument("--direct-smoke", action="store_true",

@@ -17,7 +17,7 @@ GPR = set('endbr64 push pop mov movabs lea xor test cmp xchg add sub and or '
 GPR |= set('lfence rdtsc mul shld shrd js jl jg cmova cmovb movsbl'.split())
 # A constant 64-bit integer memory store is printed as movq. MMX/SSE movq
 # still fails the operand register check below; the suffix alone is not SIMD.
-GPR.add('movq')
+GPR |= {'movq', 'xadd'}
 
 
 def symbol_copies(path, symbol):
@@ -146,7 +146,10 @@ for argument in sys.argv[1:]:
     report = {'path': str(path), 'entries': {}, 'symbol_copies': {}}
     if re.search(r'\b(?:monotonic|mono_call)$', names, re.M) and not re.search(r'\bkobox_posix_monotonic_ns$', names, re.M):
         specialized = set(re.findall(r'\b(clock_ns\.[\w.]+)$', names, re.M))
-        clock_allowed = specialized | {'clock_ns', 'pacha_clock_read', 'pacha_syscall2', 'clock_mock'}
+        clock_allowed = specialized | {'clock_ns', 'pacha_clock_read', 'pacha_syscall2', 'clock_mock', 'ph_tail_begin', 'ph_tail_end'}
+        for symbol in ('ph_tail_begin', 'ph_tail_end'):
+            if re.search(r'\b' + symbol + r'$', names, re.M):
+                report['entries'][symbol] = leaf(path, symbol, {'ph_current_cpu', 'ph_current_fiber'})
         for symbol in ('monotonic', 'realtime', 'clock_ns', 'mono_call', 'real_call', 'invalid_call', 'pacha_clock_read', 'pacha_syscall2', 'clock_mock'):
             if re.search(r'\b' + symbol + r'$', names, re.M):
                 report['entries'][symbol] = leaf(path, symbol, clock_allowed | {'ph_notifications_dispatch_preserved'}, syscall_leaf=symbol in ('pacha_clock_read', 'pacha_syscall2'))

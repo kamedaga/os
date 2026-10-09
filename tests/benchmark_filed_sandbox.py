@@ -135,6 +135,11 @@ def parse(text, opcodes, elapsed_only=False):
         row = {'fs': fs, 'phase': opcodes[opcode], 'depth': depth, 'trial': trial,
                'ops': ops, 'ticks': int(ticks), 'elapsed_ns': int(elapsed),
                'linux_task_ns': int(task)}
+        if 'FS_MATCHED_BENCH' in text:
+            counts = re.findall(r'^FS_MATCHED_SWITCHES all=(\d+)\r?$', tail, re.M)
+            if len(counts) != 1:
+                raise RuntimeError('missing/duplicate all-task switch count')
+            row['all_linux_task_switches'] = int(counts[0])
         if not elapsed_only:
             row['stages'] = dict(zip(('snapshot', 'auth', 'execute', 'release', 'task_work', 'queue'),
                                      map(int, profiles[0].groups()[2:])))
@@ -280,6 +285,9 @@ def summarize(rows):
         if all('linux_task_switches' in r for r in group):
             row['linux_task_switches_per_op'] = median(r['linux_task_switches'] / r['ops']
                                                       for r in group)
+        if all('all_linux_task_switches' in r for r in group):
+            row['all_linux_task_switches_per_op'] = median(r['all_linux_task_switches'] / r['ops']
+                                                          for r in group)
         if depth and all('metadata' in r for r in group):
             row['metadata_per_op'] = {key: median(r['metadata'][key] / r['ops'] for r in group)
                                       for key in group[0]['metadata']}
@@ -371,6 +379,9 @@ def collect(out, elapsed_only=False, handoff_only=False, publication_only=False,
     opcodes = {int(re.search(r'#define KB2_FILESYSTEM_OP_' + name + r' (\d+)u', header)[1]): phase
                for name, phase in (('STATX', 'stat'), ('PREAD', 'pread'), ('PWRITE', 'pwrite'))}
     log = (out / 'qemu/pacha.log').read_text()
+    matched = json.loads((out / 'inputs.json').read_text()).get('matched', False)
+    if matched and log.count('FS_MATCHED_BENCH owned=1 scope=1 recycle=1 inline=0') != 1:
+        raise RuntimeError('missing/duplicate matched request lifetime marker')
     rows = parse_publication(log, opcodes, executor_only) if publication_only else parse_handoff(log) if handoff_only else parse(log, opcodes, elapsed_only)
     guards = parse_guards(log)
     if (out / 'raw.json').exists() or (out / 'summary.json').exists():
@@ -421,6 +432,9 @@ def main():
                         help='compare sandbox-private owner/worker publication; no client workload')
     parser.add_argument('--executor-only', action='store_true',
                         help='compare private executor intake/recycle against worker submit/collect')
+    parser.add_argument('--matched', action='store_true',
+                        help='require matched owned lifetimes, forced workers, and sandbox-only run')
+    parser.add_argument('--linux-config', type=Path)
     args = parser.parse_args()
     if args.collect_only and args.verify_only:
         parser.error('--collect-only and --verify-only are mutually exclusive')
@@ -459,6 +473,16 @@ def main():
     if not all(json.loads((args.base_run / 'gates.json').read_text()).values()):
         raise RuntimeError('base normal cutover is not verified')
     flags = json.loads((args.runtime / 'linux-boot-inputs.json').read_text())['extra_cflags']
+    if ('-DKOBOX_FS_MATCHED_BENCH=1' in flags) != args.matched:
+        raise RuntimeError('matched measurement flag must agree with runtime')
+    if args.matched:
+        from benchmark_fs_cache_matrix import check_storage_config
+        identity = json.loads((args.runtime / 'linux-boot-inputs.json').read_text())['linux']
+        if (not args.linux_config or digest(args.linux_config) != identity['.config'] or
+                '-DKOBOX_FS_INLINE_DISABLED=1' not in flags or args.verify_only):
+            raise RuntimeError('matched run needs verified config and disabled inline')
+        check_storage_config(args.linux_config.read_text(),
+            (ROOT / 'kobox2/linux-sandbox/kobox/manifest/profiles/storage.config').read_text())
     check_runtime_flags(flags, args.verify_only, args.elapsed_only, args.handoff_only, args.publication_only, args.executor_only)
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / 'guest').mkdir()
@@ -487,7 +511,7 @@ def main():
                '--seed0root', selected['/sbin/seed0root.elf'], '--filed', selected['/sbin/filed.elf'],
                '--package', str(package),
                '--timeout', str(args.timeout)]
-    if args.publication_only:
+    if args.publication_only or args.matched:
         command += ['--sandbox-bench-only']
     else:
         command += ['--native-smoke', '--direct-smoke', '--multiflight-smoke']
@@ -509,11 +533,14 @@ def main():
                                  'image.c', 'entry.S', 'clock_callbacks.h')]
     snapshot = args.out / 'sources'
     snapshot.mkdir()
+    if args.matched:
+        shutil.copyfile(args.linux_config, snapshot / 'linux.config')
     for source in sources:
         destination = snapshot / source.relative_to(ROOT)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
     save(args.out / 'inputs.json', {'runtime_sha256': digest(args.runtime / 'linux-boot-runtime.so'),
+        'matched': args.matched,
         'kernel_source': str(kernel), 'kernel_sha256': digest(kernel),
         'adapter_source': str(adapter), 'adapter_sha256': digest(adapter),
         'runtime_inputs_sha256': digest(args.runtime / 'linux-boot-inputs.json'),
@@ -525,7 +552,9 @@ def main():
         'base_inputs_sha256': digest(args.base_run / 'inputs.json'),
         'config': json.loads((args.runtime / 'linux-boot-inputs.json').read_text())['linux'],
         'sources': [{'path': str(p), 'sha256': digest(p)} for p in sources],
-        'boundary': ('sandbox-private queue; worker submit/collect versus executor intake/recycle; worker-only control; full producer-to-drain/check wall time; no ring, IPC or LPR; depth8 is throughput'
+        'boundary': ('matched owned prepare/execute_scope/inspect/recycle versus forced-worker submit/collect/release; no ring, IPC or LPR; depth8 is throughput, not latency'
+                     if args.matched else
+                     'sandbox-private queue; worker submit/collect versus executor intake/recycle; worker-only control; full producer-to-drain/check wall time; no ring, IPC or LPR; depth8 is throughput'
                      if args.executor_only else
                      'sandbox-private sink; paired owner/worker publication timestamps; no ring, IPC or LPR; depth8 is throughput'
                      if args.publication_only else
