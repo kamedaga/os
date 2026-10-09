@@ -142,7 +142,7 @@ static int cpu_leave(uint32_t index) {
     struct ph_cpu *cpu = &cpus[index];
 
     PH_OK(ph_notifications_save(&previous_mask));
-    PH_CHECK(atomic_load(&cpu->domain.irq_depth) == 0);
+    PH_CHECK(atomic_load(cpu->domain.irq_depth) == 0);
     ph_lock(&cpu->owner_lock);
     kobox_machine_domain_release(&cpu->domain);
     fiber->logical_cpu = -1;
@@ -535,7 +535,7 @@ static void diagnostic_snapshot(unsigned index, uint64_t now) {
     }
     /* These counters are independent atomic observations, not a claimed
      * simultaneous Linux state. Explicit validity covers owner/frame data. */
-    values[5] = atomic_load_explicit(&cpu->domain.irq_depth, memory_order_acquire);
+    values[5] = atomic_load_explicit(cpu->domain.irq_depth, memory_order_acquire);
     values[18] = atomic_load_explicit(&cpu->timer_lock, memory_order_acquire);
     values[19] = atomic_load_explicit(&cpu->diagnostic_timer_arms, memory_order_relaxed);
     values[20] = atomic_load_explicit(&cpu->diagnostic_timer_expiries, memory_order_relaxed);
@@ -631,6 +631,8 @@ const struct kobox_linux_task_host_operations ph_task_ops = {
     .notifications_save = ph_notifications_save,
     .notifications_restore = ph_notifications_restore,
     .cpu_irq_disabled = irq_disabled,
+    .cpu_irq_bind = irq_bind,
+    .cpu_irq_deliver = irq_deliver,
     .cpu_notification_sequence = notification_sequence,
     .monotonic_ns = monotonic,
     .realtime_ns = realtime,
