@@ -373,6 +373,14 @@ static KOBOX_GPR_LEAF struct kobox_runtime_thread_state *thread_state(void *opaq
     return &ph_current_fiber()->runtime;
 }
 
+/* Linux per-CPU operations address this native thread's GS base, which the
+ * kernel keeps per thread across fiber switches. The core calls this through
+ * its FP-preserving host call when the thread takes a different logical CPU. */
+static void set_percpu_base(void *opaque, unsigned long base) {
+    (void)opaque;
+    PH_OK(pacha_syscall1(PACHA_THREAD_SYSCALL_SET_GS_BASE, base));
+}
+
 void *ph_image_lookup(void *opaque, const char *name) {
     struct ph_image *image = opaque;
     size_t offset;
@@ -496,6 +504,7 @@ static void bind_core_runtime(struct ph_image *image) {
         .size = sizeof(host),
         .context = image,
         .thread_state = thread_state,
+        .set_percpu_base = set_percpu_base,
     };
     PH_CHECK(kobox_boot_core_prepare(&image->core, image, ph_image_lookup, &host) ==
         KOBOX_BOOT_CORE_OK);

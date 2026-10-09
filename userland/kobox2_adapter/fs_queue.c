@@ -636,7 +636,16 @@ static int start(void *context, void *linux_service) {
     struct ph_fs_queue *queue = context;
     struct kobox_linux_io_service *io = linux_service;
     if (!io || !io->filesystem) return -EINVAL;
-    return queue->create(io->filesystem, &queue->worker_config, &queue->workers);
+    int error = queue->create(io->filesystem, &queue->worker_config, &queue->workers);
+    if (error) return error;
+    /* Lone requests run on the receiving task itself; a sleeping one lends
+     * reception to the lifecycle deputy instead of stopping this ring. */
+    error = queue->serve(queue->workers);
+    if (!error) return 0;
+    PH_OK(queue->close(queue->workers));
+    PH_OK(queue->destroy(queue->workers));
+    queue->workers = NULL;
+    return error;
 }
 
 static int advance(void *context, void *linux_service, struct ph_ipc *ipc, bool quiescing) {
@@ -812,6 +821,7 @@ int ph_fs_queue_init(struct ph_fs_queue *queue, void *core,
     LOAD(create, "kobox_linux_fs_workers_create");
     LOAD(submit, "kobox_linux_fs_workers_submit");
     LOAD(submit_control, "kobox_linux_fs_workers_submit_control");
+    LOAD(serve, "kobox_linux_fs_workers_serve");
     LOAD(collect, "kobox_linux_fs_workers_collect");
     LOAD(release_work, "kobox_linux_fs_workers_release");
     LOAD(close, "kobox_linux_fs_workers_close");

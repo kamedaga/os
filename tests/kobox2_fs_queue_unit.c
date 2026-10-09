@@ -274,6 +274,7 @@ static int linux_owner(struct kobox_linux_fs_service *service,
     return reply(bytes, size, out, capacity, used, 1);
 }
 
+static int mock_served;
 static int mock_create(struct kobox_linux_fs_service *service,
     const struct kobox_linux_fs_worker_config *config, struct kobox_linux_fs_workers **pool) {
     assert(service == (void *)1234 && config->workers >= 3 && config->control_bytes);
@@ -283,7 +284,7 @@ static int mock_create(struct kobox_linux_fs_service *service,
 }
 static int mock_submit_common(struct kobox_linux_fs_workers *pool, uint64_t client,
     const void *input, size_t size, size_t capacity, void *cookie, int owner) {
-    assert(pool == (void *)2468);
+    assert(pool == (void *)2468 && mock_served);
     if (mock_outstanding >= mock_limit) return -EAGAIN;
     struct fake_work *job = calloc(1, sizeof(*job)); assert(job);
     job->input = malloc(size); job->response = malloc(capacity); assert(job->input && job->response);
@@ -347,6 +348,9 @@ static int mock_release(struct kobox_linux_fs_workers *pool, struct kobox_linux_
     struct fake_work *job = (void *)work;
     free(job->input); free(job->response); free(job); --mock_outstanding; return 0;
 }
+static int mock_serve(struct kobox_linux_fs_workers *pool) {
+    assert(pool == (void *)2468 && !mock_jobs && !mock_outstanding); ++mock_served; return 0;
+}
 static int mock_close(struct kobox_linux_fs_workers *pool) { assert(pool == (void *)2468); return 0; }
 static int mock_destroy(struct kobox_linux_fs_workers *pool) {
     assert(pool == (void *)2468 && !mock_outstanding && !mock_jobs); return 0;
@@ -360,6 +364,7 @@ void *ph_image_lookup(void *core, const char *name) {
     EXPORT("kobox_linux_fs_workers_create", mock_create)
     EXPORT("kobox_linux_fs_workers_submit", mock_submit)
     EXPORT("kobox_linux_fs_workers_submit_control", mock_control)
+    EXPORT("kobox_linux_fs_workers_serve", mock_serve)
     EXPORT("kobox_linux_fs_workers_collect", mock_collect)
     EXPORT("kobox_linux_fs_workers_release", mock_release)
     EXPORT("kobox_linux_fs_workers_close", mock_close)

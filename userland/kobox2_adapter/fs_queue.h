@@ -47,6 +47,7 @@ struct ph_fs_queue {
     int (*submit)(struct kobox_linux_fs_workers *, uint64_t,
         const void *, size_t, size_t, void *);
     int (*submit_control)(struct kobox_linux_fs_workers *, const void *, size_t, size_t, void *);
+    int (*serve)(struct kobox_linux_fs_workers *);
     int (*collect)(struct kobox_linux_fs_workers *, struct kobox_linux_fs_work **,
         void **, const void **, size_t *, int *);
     int (*release_work)(struct kobox_linux_fs_workers *, struct kobox_linux_fs_work *);
